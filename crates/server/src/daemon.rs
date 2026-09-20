@@ -1134,6 +1134,18 @@ impl Daemon {
     })
   }
 
+  /// The candidate holders in the order the object's owner shard uses for its puts (§4.8),
+  /// including the committed failure domains. Observers must not reconstruct this order from
+  /// a neighbourhood alone: a member's domain may differ from its current voter identity.
+  pub fn placement_candidates(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Vec<slates_db::HostId>, ObserveError> {
+    self.observe(self.shard_of_object(object), move |s| {
+      s.fleet.configuration().place(object).candidates
+    })
+  }
+
   /// Like [`Self::placement_neighbourhood`] but read on the shard at `shard_index` rather than the control
   /// shard. The placement verbs (`place`/`region_placed`/`await_placed`/`host_epoch`) run on a volume's owner
   /// shard, which may not be the control shard, so every shard must read the committed configuration; this

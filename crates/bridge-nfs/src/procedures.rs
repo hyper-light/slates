@@ -56,8 +56,7 @@ pub const NFSPROC3_MKDIR: u32 = 9;
 /// Format: NFSPROC3_SYMLINK — create a symbolic link.
 pub const NFSPROC3_SYMLINK: u32 = 10;
 /// Format: NFSPROC3_MKNOD (RFC 1813 procedure 11) — create a special device, FIFO or socket node.
-/// slates is a RAM copy-on-write filesystem for regular files, directories and links; it does not
-/// create special nodes, so this is refused `NFS3ERR_NOTSUPP` (a typed refusal, not `PROC_UNAVAIL`).
+/// A-26 supports FIFO/socket names; block/character device creation remains refused.
 pub const NFSPROC3_MKNOD: u32 = 11;
 /// Format: NFSPROC3_LOOKUP — resolve a name in a directory to a handle.
 pub const NFSPROC3_LOOKUP: u32 = 3;
@@ -438,7 +437,7 @@ impl<'b> Export<'b> {
       NFSPROC3_CREATE => Some(self.create(args)),
       NFSPROC3_MKDIR => Some(self.mkdir(args)),
       NFSPROC3_SYMLINK => Some(self.symlink(args)),
-      NFSPROC3_MKNOD => Some(self.mknod_unsupported(args)),
+      NFSPROC3_MKNOD => Some(self.mknod(args)),
       NFSPROC3_ACCESS => Some(self.access(args)),
       NFSPROC3_READ => Some(self.read(args)),
       NFSPROC3_WRITE => Some(self.write(args)),
@@ -1326,24 +1325,65 @@ impl<'b> Export<'b> {
     }
   }
 
-  /// NFSPROC3_MKNOD: slates does not create special (device, FIFO or socket) nodes — it is a RAM
-  /// copy-on-write filesystem for regular files, directories, symbolic and hard links — so the
-  /// operation is refused `NFS3ERR_NOTSUPP` (the typed refusal per RFC 1813 §3.3.11, not the
-  /// `PROC_UNAVAIL` an unhandled procedure gives). The reply is the directory's `wcc_data`
-  /// (MKNOD3resfail); the leading handle is resolved for the directory's post-op attributes, and the
-  /// node type and attributes that follow it are not decoded — the refusal is unconditional.
-  pub fn mknod_unsupported(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+  /// Creates only FIFO/socket namespace metadata; the kernel owns transient IPC (A-26).
+  pub fn mknod(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let (status, made, dir_post) = self.do_mknod(args);
     let mut writer = XdrWriter::new();
-    Nfsstat3::Notsupp.encode(&mut writer);
-    let dir_post = match Nfsfh3::decode(args) {
-      Ok(fh) => match self.resolve_handle(&fh) {
-        Ok(identity) => self.attrs_of(&identity).ok().map(|node| self.fattr3(&node)),
-        Err(_) => None,
-      },
-      Err(_) => None,
-    };
-    encode_wcc(&mut writer, dir_post);
+    encode_create_reply(&mut writer, status, made, dir_post);
     writer.into_bytes()
+  }
+
+  fn do_mknod(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+    // MKNOD3args: where, type and the type-specific attributes (RFC 1813 §3.3.11).
+    let dir_fh = match Nfsfh3::decode(args) {
+      Ok(fh) => fh,
+      Err(_) => return (Nfsstat3::Badhandle, None, None),
+    };
+    let name = match args.string(NFS_MAXNAMELEN) {
+      Ok(n) => n.to_owned(),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let kind = match args.u32().map(Ftype3::from_wire) {
+      Ok(Some(Ftype3::Fifo)) => Kind::Fifo,
+      Ok(Some(Ftype3::Sock)) => Kind::Socket,
+      Ok(_) => return (Nfsstat3::Badtype, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, None),
+    };
+    let (changes, explicit_times) = match self.decode_sattr3(args) {
+      Ok(decoded) => decoded,
+      Err(status) => return (status, None, None),
+    };
+    let dir_identity = match self.resolve_handle(&dir_fh) {
+      Ok(id) => id,
+      Err(status) => return (status, None, None),
+    };
+    let cx = match self.op_context() {
+      Ok(cx) => cx,
+      Err(e) => return (nfsstat_of(&e), None, None),
+    };
+    let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
+    // POSIX: adding an entry needs write and search permission on the directory.
+    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
+      return (status, None, dir_post);
+    }
+    let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
+    let object = match self.bridge.mknod(parent, &cx, &name, mode, kind) {
+      Ok(node) => ObjectId::new(node.ino, node.generation),
+      Err(e) => {
+        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+        return (nfsstat_of(&e), None, dir_post);
+      }
+    };
+    // An IPC name has no size to set; apply the remaining fields (uid/gid/times).
+    let post_changes = SetAttr {
+      mode: None,
+      size: None,
+      ..changes
+    };
+    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
@@ -1882,6 +1922,8 @@ fn ftype3_of(kind: Kind) -> Ftype3 {
     Kind::File => Ftype3::Reg,
     Kind::Dir => Ftype3::Dir,
     Kind::Symlink => Ftype3::Lnk,
+    Kind::Fifo => Ftype3::Fifo,
+    Kind::Socket => Ftype3::Sock,
   }
 }
 
@@ -1906,6 +1948,7 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotEmpty => Nfsstat3::Notempty,
     VfsError::NoSpace => Nfsstat3::Nospc,
     VfsError::NotPermitted => Nfsstat3::Perm,
+    VfsError::SpecialFileOperation => Nfsstat3::Notsupp,
     VfsError::Invalid | VfsError::InvalidName => Nfsstat3::Inval,
     VfsError::StaleHandle => Nfsstat3::Stale,
     VfsError::BaseUnavailable(_) => Nfsstat3::Io,

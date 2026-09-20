@@ -5296,35 +5296,15 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
 /// before the hold ends, while a first round that waits out the hold itself does not.
 const HEDGE_STARVATION_NS: u64 = 3 * LIVENESS_BUDGET_NS;
 
-/// AC (§4.8 mechanism 1 — "content to `f + 1` candidates first, hedged to the remaining candidates after the
-/// measured p95 put latency"; §4.8 "Derived constants": "hedge delay = measured p95 put latency per class";
-/// §4.10 "a candidate holder slow: Masked (the hedge completes the put elsewhere)"): in a three-node `f = 1`
-/// fleet the owner A seals twice. The first seal's put to its first-round candidate is answered promptly and
-/// leaves **measured** put-latency readings on A. Then that candidate's control shard is held busy for
-/// [`HEDGE_STARVATION_NS`] and A seals again: the first content round to it cannot be acknowledged, so the
-/// put must be **hedged** to the remaining candidate after the measured p95 — a few milliseconds — and the
-/// seal places through that candidate **while the first is still held**. Non-vacuous three ways: the
-/// readings are shown to exist before the second seal (the trigger had something to measure), the second
-/// seal is shown placed before the hold ends (the hedge fired on the measured p95, not on the hold's end),
-/// and the held candidate is shown *not* to hold the second manifest at that moment (the placement came
-/// through the hedge, not the first round).
-/// The owner's two remote content candidates for `object` in the owner's own rendezvous order — exactly the
-/// set and order the owner's put computes (`candidates_for` over its placement neighbourhood, no domains
-/// declared in-process, `f = 1`): the first is the first-round candidate, the second the hedge. Returned as
-/// indexes into `hosts`.
+/// The owner's two remote content candidates, read in the exact order used by its
+/// owner shard, including committed failure domains. Return indexes into `hosts`:
+/// the first remote is the first-round target and the second is the hedge.
 fn remote_candidate_indexes(
   owner: &Daemon,
   hosts: &[HostId],
   object: ObjectId,
 ) -> Option<(usize, usize)> {
-  let neighbourhood = owner.placement_neighbourhood().ok()?;
-  let candidates = candidates_for(
-    hosts[0],
-    &neighbourhood,
-    &std::collections::BTreeMap::new(),
-    object,
-    Quorum { f: 1 },
-  );
+  let candidates = owner.placement_candidates(object).ok()?;
   let remote: Vec<usize> = candidates
     .into_iter()
     .filter(|host| *host != hosts[0])
@@ -5333,6 +5313,11 @@ fn remote_candidate_indexes(
   Some((*remote.first()?, *remote.get(1)?))
 }
 
+/// AC-8.12 / §4.8 / §4.10: measure a first seal's put, then pause its actual first
+/// candidate and seal again. The second seal must place before the pause ends, the
+/// other candidate must hold its content, and the successful put must add a latency
+/// reading. Candidate selection uses the owner's committed configuration, not a
+/// reconstruction without its failure domains.
 #[test]
 fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   let _serial = serialize_fleet_tests();

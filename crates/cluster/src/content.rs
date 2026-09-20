@@ -771,7 +771,7 @@ pub async fn put_content(
     chunks: archive.chunks.iter().map(|chunk| chunk.identity).collect(),
   }
   .encode();
-  let offered = match dispatch_round(
+  let (offered, offers_in_flight) = match dispatch_round(
     remote_holders
       .into_iter()
       .map(|(host, endpoint)| (host, endpoint, offer.clone()))
@@ -779,13 +779,13 @@ pub async fn put_content(
     CONTENT_OFFER_STREAM,
     deadline_ns,
   ) {
-    Ok(mut rx) => gather(&mut rx, budget).await,
+    Ok(mut rx) => (gather(&mut rx, budget).await, rx),
     Err((error, mut rx)) => {
-      // The tasks already started end with this task (children) after handing their sessions back.
+      // Keep the channels of tasks already admitted: their bounded replies return sessions.
       return ContentPlaced {
         outcome: Err(ClusterError::Runtime(error)),
         reusable: sessions_of(gather(&mut rx, budget).await),
-        stragglers: Stragglers::none(),
+        stragglers: Stragglers::pending(rx),
         latencies_ns: Vec::new(),
         refilled: Vec::new(),
       };
@@ -800,7 +800,7 @@ pub async fn put_content(
         placement: build(&acked),
       }),
       reusable,
-      stragglers: Stragglers::none(),
+      stragglers: Stragglers::pending(offers_in_flight),
       latencies_ns: Vec::new(),
       refilled: Vec::new(),
     };
@@ -815,7 +815,7 @@ pub async fn put_content(
       return ContentPlaced {
         outcome: Err(ClusterError::Runtime(error)),
         reusable,
-        stragglers: Stragglers::none(),
+        stragglers: Stragglers::two_rounds(offers_in_flight, rx),
         latencies_ns: Vec::new(),
         refilled: Vec::new(),
       };
@@ -841,7 +841,7 @@ pub async fn put_content(
   )
   .await;
   reusable.append(&mut returned);
-  let stragglers = Stragglers::pending(rx);
+  let stragglers = Stragglers::two_rounds(offers_in_flight, rx);
   let placement = build(&acked);
   let outcome = if placement.placed(quorum) {
     Ok(placement)

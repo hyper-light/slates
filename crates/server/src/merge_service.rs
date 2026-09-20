@@ -486,6 +486,7 @@ fn walk_origin(
             stack.push((path, child));
           }
         }
+        Kind::Fifo | Kind::Socket => return Err(slates_vfs::error::VfsError::SpecialFileOperation),
         Kind::Symlink => {
           let target = volume.readlink_in(store, snapshot, row.inode)?;
           origin.symlinks.push((path, target.into_string()));

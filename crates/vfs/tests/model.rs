@@ -547,6 +547,8 @@ fn real_state(vol: &Volume, store: &Store) -> AbstractState {
           files.insert(row.inode.counter(), read_all(vol, store, row.inode));
         }
         Kind::Symlink => {}
+        #[allow(clippy::panic)] // Harness invariant: these generated operations never create IPC.
+        Kind::Fifo | Kind::Socket => panic!("this history creates no IPC names"),
       }
     }
   }

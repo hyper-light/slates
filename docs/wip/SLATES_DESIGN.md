@@ -1298,6 +1298,19 @@ case on a laptop; a live base retains its source-host dependency in a fleet.
 
 ### 4.5 Namespace and content structures (D-4, D-5, D-6, D-25)
 
+**Special names (A-26).** FIFO and UNIX socket inodes carry names, permissions, owners,
+times and hard-link identity, but no file contents. Snapshots, clones, recovery, archives
+and merge preserve this metadata; they never capture pipe buffers, listeners, connections
+or passed descriptors. A clone has its own endpoint identity. Communication is local to
+the mounting kernel and its endpoint identity, never a distributed stream. The core's
+regular-file I/O refuses these kinds. Existing host special files remain excluded from
+the live base: importing a name must not connect the volume to a host endpoint.
+
+> **A-26 implementation status (2026-09-20).** The shared namespace, VFS deltas, snapshots,
+> clones, recovery and archives carry IPC metadata. Full merge-service integration remains
+> owed: its separate origin/engine protocol refuses IPC snapshots explicitly. The archive
+> retains its existing mtime/ctime fields; it does not encode atime or birth time.
+
 **Data model.**
 ```rust
 struct DirNode { born: Epoch, entries: DirEntries, parent: Option<InodeNo> /* resolved to the head's node through the inode table (A-7) */,
@@ -1305,7 +1318,7 @@ struct DirNode { born: Epoch, entries: DirEntries, parent: Option<InodeNo> /* re
                  base: BaseDirState /* None | Merged{listing: ListingRef} | Opaque */,
                  origin: Option<PathKey> /* redirect: the base path this directory was renamed from */ }
 enum DirEntries { Small(InlineArray<Entry, 2> /* names inline, the measured cut-over */), Indexed(Tree /* CoW B+-tree of 4 KiB slotted blocks in the store's block slab, keyed by (hash, folded name); A-7 */) }
-struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Whiteout */, child: Handle<DirNode> | InodeNo }
+struct Entry { name_hash: u64, name: NameRef /* into the node or the block */, kind: Kind /* Dir | File | Symlink | Fifo | Socket | Whiteout */, child: Handle<DirNode> | InodeNo }
 enum Body { …, Directory(Handle<DirNode>) /* a directory inode names its current node (A-7) */ }
 struct Inode { no: InodeNo, gen: u32, kind, mode, uid, gid, nlink, size, atime, mtime, ctime, btime,
                body: Body, identity: Option<Blake3>, born: Epoch, flags }
@@ -1425,6 +1438,13 @@ the verdict that every entry beneath still matches its listing fingerprint.
 **Laptop degenerate.** Identical.
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
+
+**Special names (A-26).** A bridge may create and report FIFO/socket inodes only with
+their real type. The kernel owns transient communication; unsupported platforms refuse
+typed rather than returning a regular file. Block and character devices remain unsupported;
+neither the server nor a mounted client is granted device activation by a volume operation.
+Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
+must exercise local communication and isolation between clones as well as namespace calls.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
@@ -1816,6 +1836,9 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 **Laptop degenerate.** Identical.
 
 ### 4.8 Metadata database, registers and configuration (D-14, D-18)
+
+**Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
+hard links and snapshot versions. No live kernel endpoint state is part of the image.
 
 > **Status (A-9, 2026-09-05).** Local records, replay/completion transactions and an
 > f-parameterized register core exist. `ledger`, `mirror` and `reconfig` are pure simulations
@@ -2340,6 +2363,20 @@ configuration group ≥ 10 × broadcast RTT p99 with the randomization span from
 SWIM period = max(k × RTT p99, scheduler quantum); gossip λ from measured convergence;
 tombstone retention = measured partition-heal p99; mirror shipping batch from the measured WAN
 bandwidth-delay product.
+
+> **Collection boundary correction (2026-09-20, AC-8.12).** A collector drains replies
+> before judging its deadline; after a polling sleep it always returns to the receive
+> loop. Judging with the pre-sleep count discarded healthy replies already queued and
+> delayed the Linux hedge to 3.195–4.487 s against a 3 s hold. Simulated content and
+> record histories each failed in 0.01 s before the shared correction. Content also
+> retains late offer sessions alongside late put sessions, in at most two reply
+> channels. This changes no deadline or extension budget. The fleet fault fixture
+> selects its first candidate from the object's owner-shard configuration, including
+> failure domains. Records: `docs/bugs/2026-09-20-collectors-expire-before-reading-queued-replies.md`
+> and `docs/bugs/2026-09-20-hedge-test-reconstructs-the-wrong-candidate.md`.
+> Verification: ten serial Linux io_uring hedge histories passed (281.630–506.180 ms);
+> the full workspace passed 1,524 tests with zero failures and 14 ignored, including
+> all 49 fleet histories. Strict Clippy and structural checks also passed.
 
 **Worked example.** Two zones, f=1, host A's neighbourhood {B, C, D}: an agent on A creates a
 volume; the create returns after the local append; the head record (epoch 1) goes to the two
@@ -2946,7 +2983,17 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 *Content-freedom.* No metric, span or health signal carries a path, a name or file content; the audit log carries the paths a landing touched and nothing else; a test in the observability crate asserts every emitted label against this rule.
 
+> **Telemetry oracle correction (2026-09-20, AC-0.11).** A drain request itself emits spans.
+> The daemon integration oracle now derives convergence from the reply quota minus the
+> maximum spans a drain emits, and checks progress on each batch. A four-span reply scenario
+> reproduced the old count-bound failure and passes after the correction. Production telemetry
+> behavior is unchanged; see `docs/bugs/2026-09-20-telemetry-drain-counts-its-own-spans.md`.
+
 ### 4.15 Disk as the source of truth: the base plane and landing under grant (D-25, D-26)
+
+**Special names (A-26).** A landing containing FIFO/socket creation refuses before its
+first host write. The current grant authorizes filesystem content, not new host IPC endpoints.
+No copy-up, hashing, archive or landing step opens a host special file as regular content.
 
 > **Containment correction (2026-09-19).** Scratch directories created by inode operations
 > belong in the diverged set even without a base. Whole-target staging is removed: its hidden
@@ -3227,6 +3274,10 @@ audit records), §4.10 (retained live base dependencies and complete captures), 
 granted-target exception).
 
 ### 4.16 The merge engine: green volumes, increments, canonical rebase, the deterministic verdict (D-27)
+
+**Special names (A-26).** FIFO/socket changes are explicit namespace/metadata operations,
+with kinds included in canonical identities and conflicts. They have no content hunks.
+Applying or replicating an increment cannot import a live endpoint from the work volume.
 
 **A-9 integration requirement.** The implemented pure merge core is not a user-facing green
 volume service. Green's immutable version chain starts from scratch or a complete immutable
@@ -5414,3 +5465,28 @@ its trace. Exact evidence and validation are in `docs/bugs/2026-09-19-linux-conf
 Applied in the same change to: §4.15 status and steps 1/10, its measurement references and
 Phase 1 requirement; `crates/vfs/src/base.rs`, the landing engine, target opener, callers and
 oracle/OS tests; the conformance tracer harness and matrix wording; GAPS §8c and TBD_FIXES.
+
+### A-26 — FIFO/socket metadata without host endpoint authority (2026-09-19)
+
+Ada accepted this boundary after reviewing the security consequences of special-file
+support. The previous three-kind model was intentional scope, not proof that every
+special file is unsafe. FIFO/socket namespace support is authorized; device creation and
+activation remain refused, with device-metadata preservation a separate decision.
+
+- Snapshots and fleet replication carry metadata only; local kernel communication is transient.
+- Clone endpoint identities are separate. The core neither brokers IPC nor reads special nodes.
+- Existing host special files remain excluded. Landing creation refuses before any write.
+- Evidence: [fifo(7)](https://man7.org/linux/man-pages/man7/fifo.7.html),
+  [unix(7)](https://man7.org/linux/man-pages/man7/unix.7.html),
+  [mknod(2)](https://man7.org/linux/man-pages/man2/mknod.2.html),
+  [mount(2)](https://man7.org/linux/man-pages/man2/mount.2.html).
+- Status (2026-09-20): shared namespace, snapshots/clones, recovery, archive and VFS deltas
+  implemented; NFS/FUSE type reporting and creation implemented, local FUSE IPC exercised.
+  The separate merge service still refuses IPC origins; its canonical metadata/history/conflict
+  and replay integration is owed. FSKit/WinFsp return explicit unsupported refusals.
+  The unchanged full NFS pjdfstest rerun: 6,970 passes, 1,800 failures, 28 TODO; 172,343 ms.
+  Residual failure review remains open; no expected-failure list expanded.
+- Applied in the same change to: §4.5, §4.6, §4.8, §4.15, §4.16, GAPS and TBD_FIXES;
+  `vfs`, `bridge-core`, `bridge-nfs`, `bridge-fuse`, `bridge-fskit`, `bridge-winfsp`, `land`
+  and server archive restoration, with the dated special-file bug record. No new privilege
+  or tool is authorized.

@@ -29,13 +29,14 @@ use crate::algebra::{ContentMap, ContentOp, Hunk};
 use crate::dir::Child;
 use crate::error::VfsError;
 use crate::ids::{InodeNo, SnapshotId};
+use crate::inode::{Attrs, Kind};
 use crate::journal::Op;
 use crate::volume::{Store, Volume};
 
 /// Format: the document's magic, version and the field widths of its encoding.
 const MAGIC: &[u8; 4] = b"SLOP";
 /// Format: the encoding version; bumped with any change to the layout below.
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 /// The base file whose bytes a delta's surviving runs come from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +69,63 @@ pub struct SymlinkDelta {
   pub target: Box<str>,
 }
 
+/// A metadata-only FIFO/socket at a touched post-state path (A-26).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecialDelta {
+  /// The post-state path.
+  pub path: Box<str>,
+  /// FIFO or socket; never a content-bearing kind.
+  pub kind: SpecialKind,
+  /// The canonical first name of the same inode, when this path is a further hard link.
+  pub link_to: Option<Box<str>>,
+  /// The post-state attributes, with zero size.
+  pub attrs: Attrs,
+}
+
+/// The two content-free kinds accepted by an IPC namespace delta (A-26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecialKind {
+  /// A local named pipe.
+  Fifo,
+  /// A local UNIX socket name.
+  Socket,
+}
+
+impl SpecialDelta {
+  /// Encodes only namespace identity and attributes; no IPC payload belongs in the document.
+  fn encode_into(&self, out: &mut Vec<u8>) {
+    put_str(out, &self.path);
+    out.push(match self.kind {
+      SpecialKind::Fifo => 0,
+      SpecialKind::Socket => 1,
+    });
+    match &self.link_to {
+      Some(path) => {
+        out.push(1);
+        put_str(out, path);
+      }
+      None => out.push(0),
+    }
+    for word in [
+      self.attrs.mode,
+      self.attrs.uid,
+      self.attrs.gid,
+      self.attrs.nlink,
+    ] {
+      out.extend_from_slice(&word.to_le_bytes());
+    }
+    out.extend_from_slice(&self.attrs.size.to_le_bytes());
+    for stamp in [
+      self.attrs.atime,
+      self.attrs.mtime,
+      self.attrs.ctime,
+      self.attrs.btime,
+    ] {
+      out.extend_from_slice(&stamp.to_le_bytes());
+    }
+  }
+}
+
 /// The ops document of an increment.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct OpsDocument {
@@ -83,6 +141,8 @@ pub struct OpsDocument {
   pub removed: Vec<Box<str>>,
   /// Symlinks of the post-state that are new or changed.
   pub symlinks: Vec<SymlinkDelta>,
+  /// FIFO/socket metadata, with no content hunks.
+  pub specials: Vec<SpecialDelta>,
   /// Files of the post-state that are new, moved or changed.
   pub files: Vec<FileDelta>,
 }
@@ -105,6 +165,10 @@ impl OpsDocument {
     for s in &self.symlinks {
       put_str(&mut out, &s.path);
       put_str(&mut out, &s.target);
+    }
+    put_count(&mut out, self.specials.len());
+    for special in &self.specials {
+      special.encode_into(&mut out);
     }
     put_count(&mut out, self.files.len());
     for f in &self.files {
@@ -141,6 +205,7 @@ impl OpsDocument {
       && self.dirs_removed.is_empty()
       && self.removed.is_empty()
       && self.symlinks.is_empty()
+      && self.specials.is_empty()
       && self.files.is_empty()
   }
 }
@@ -168,6 +233,7 @@ enum Entry {
   Dir(InodeNo),
   File(InodeNo),
   Symlink(InodeNo),
+  Special(InodeNo, SpecialKind),
 }
 
 fn classify(located: Result<crate::volume::Located, VfsError>) -> Entry {
@@ -176,6 +242,8 @@ fn classify(located: Result<crate::volume::Located, VfsError>) -> Entry {
       Child::Dir(_) => Entry::Dir(l.inode),
       Child::File(no) => Entry::File(no),
       Child::Symlink(no) => Entry::Symlink(no),
+      Child::Fifo(no) => Entry::Special(no, SpecialKind::Fifo),
+      Child::Socket(no) => Entry::Special(no, SpecialKind::Socket),
       Child::Whiteout => Entry::None,
     },
     Err(_) => Entry::None,
@@ -367,7 +435,10 @@ impl Deriver<'_> {
         }
       }
       (Entry::Dir(_), Entry::None) => doc.dirs_removed.push(path.into()),
-      (Entry::File(_) | Entry::Symlink(_), Entry::None) => doc.removed.push(path.into()),
+      (Entry::File(_) | Entry::Symlink(_) | Entry::Special(_, _), Entry::None) => {
+        doc.removed.push(path.into())
+      }
+      (_, Entry::Special(no, kind)) => self.special_delta(path, base, no, kind, doc)?,
       (_, Entry::Symlink(no)) => {
         let target = self.vol.readlink(self.store, no)?;
         let same = matches!(base, Entry::Symlink(b) if self.vol.readlink(self.store, b).as_deref() == Ok(&target));
@@ -376,7 +447,7 @@ impl Deriver<'_> {
             Entry::Dir(_) => doc.dirs_removed.push(path.into()),
             // A file gave way to a symlink; a symlink with another target is replaced by
             // the new one below.
-            Entry::File(_) => doc.removed.push(path.into()),
+            Entry::File(_) | Entry::Special(_, _) => doc.removed.push(path.into()),
             Entry::Symlink(_) | Entry::None => {}
           }
           doc.symlinks.push(SymlinkDelta {
@@ -389,7 +460,7 @@ impl Deriver<'_> {
         match base {
           Entry::Dir(_) => doc.dirs_removed.push(path.into()),
           // A symlink gave way to a file; a file is replaced through the delta's base.
-          Entry::Symlink(_) => doc.removed.push(path.into()),
+          Entry::Symlink(_) | Entry::Special(_, _) => doc.removed.push(path.into()),
           Entry::File(_) | Entry::None => {}
         }
         self.file_delta(path, base, no, doc)?;
@@ -398,9 +469,38 @@ impl Deriver<'_> {
     Ok(())
   }
 
+  /// A changed IPC name keeps its inode's first surviving name as the hard-link reference.
+  fn special_delta(
+    &self,
+    path: &str,
+    base: Entry,
+    no: InodeNo,
+    kind: SpecialKind,
+    doc: &mut OpsDocument,
+  ) -> Result<(), VfsError> {
+    let attrs = self.vol.stat(self.store, no)?;
+    let same = matches!(base, Entry::Special(old, old_kind)
+      if old == no && old_kind == kind && self.vol.stat_in(self.store, self.base, old)? == attrs);
+    if !same {
+      self.removed_side(base, path, doc);
+      doc.specials.push(SpecialDelta {
+        path: path.into(),
+        kind,
+        attrs,
+        link_to: self
+          .head_paths(no)
+          .into_iter()
+          .min()
+          .filter(|first| first != path)
+          .map(Into::into),
+      });
+    }
+    Ok(())
+  }
+
   fn removed_side(&self, base: Entry, path: &str, doc: &mut OpsDocument) {
     match base {
-      Entry::File(_) | Entry::Symlink(_) => doc.removed.push(path.into()),
+      Entry::File(_) | Entry::Symlink(_) | Entry::Special(_, _) => doc.removed.push(path.into()),
       Entry::Dir(_) => doc.dirs_removed.push(path.into()),
       Entry::None => {}
     }
@@ -508,6 +608,7 @@ pub fn derive(vol: &Volume, store: &Store, base: SnapshotId) -> Result<OpsDocume
   doc.dirs_removed.dedup();
   doc.removed.sort();
   doc.removed.dedup();
+  doc.specials.sort_by(|a, b| a.path.cmp(&b.path));
   doc.symlinks.sort_by(|a, b| a.path.cmp(&b.path));
   doc.files.sort_by(|a, b| a.path.cmp(&b.path));
   Ok(doc)
@@ -571,6 +672,8 @@ impl Deriver<'_> {
           crate::inode::Kind::Dir => Child::Whiteout,
           crate::inode::Kind::File => Child::File(r.inode),
           crate::inode::Kind::Symlink => Child::Symlink(r.inode),
+          Kind::Fifo => Child::Fifo(r.inode),
+          Kind::Socket => Child::Socket(r.inode),
         };
         (r.name.to_owned(), child, r.inode)
       })
@@ -591,7 +694,7 @@ impl Deriver<'_> {
             queue.push((head_path, mapping));
           }
         }
-        Child::File(_) | Child::Symlink(_) => {
+        Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
           let unchanged = base_path.as_deref().is_some_and(|bp| {
             !self.maps.contains_key(&no)
               && self
@@ -626,7 +729,9 @@ impl Deriver<'_> {
         let gone = format!("{}/{}", head_dir.trim_end_matches('/'), row.name);
         match row.kind {
           crate::inode::Kind::Dir => doc.dirs_removed.push(gone.into()),
-          crate::inode::Kind::File | crate::inode::Kind::Symlink => doc.removed.push(gone.into()),
+          crate::inode::Kind::File | crate::inode::Kind::Symlink | Kind::Fifo | Kind::Socket => {
+            doc.removed.push(gone.into())
+          }
         }
       }
     }

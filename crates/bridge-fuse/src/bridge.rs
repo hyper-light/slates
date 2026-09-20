@@ -37,6 +37,12 @@ const FUSE_ROOT_ID: u64 = 1;
 const DT_DIR: u32 = 4;
 const DT_REG: u32 = 8;
 const DT_LNK: u32 = 10;
+/// Format: POSIX directory entry type for a FIFO.
+const DT_FIFO: u32 = 1;
+/// Format: POSIX directory entry type for a socket.
+const DT_SOCK: u32 = 12;
+/// Format: Linux EOPNOTSUPP, a refused special-file operation.
+const EOPNOTSUPP: i32 = 95;
 // The Linux errno values the volume core's refusals map to (the FUSE ABI is Linux, so the
 // numbers are the kernel's regardless of the host the codec is tested on; the dispatch negates
 // them). Each is a Format constant.
@@ -108,6 +114,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     // kernel does not guarantee a FORGET per outstanding reference, §4.6 `sweep_attachment`) and the
     // reply is an empty success; it was ENOSYS before, so nothing was ever swept at unmount.
     Opcode::Destroy => serve_destroy(bridge, &request, cx, out),
+    Opcode::MkNod => serve_mknod(bridge, &request, cx, out),
     Opcode::MkDir => serve_mkdir(bridge, &request, cx, out),
     Opcode::Unlink => serve_unlink(bridge, &request, cx, false, out),
     Opcode::RmDir => serve_unlink(bridge, &request, cx, true, out),
@@ -118,9 +125,6 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::Rename2 => serve_rename(bridge, &request, cx, true, out),
     Opcode::SetAttr => serve_setattr(bridge, &request, cx, out),
     Opcode::StatFs => serve_statfs(bridge, &request, cx, out),
-    // The rest of the Bridge trait is dispatched as the driver grows; until then the kernel
-    // is told the operation is not implemented, never left waiting.
-    _ => write_or_drop(ReplyHeader::write_error(unique, ENOSYS, out), out),
   }
 }
 
@@ -149,6 +153,7 @@ fn errno(e: VfsError) -> i32 {
     VfsError::FileTooLarge => EFBIG,
     VfsError::TooManyLinks => EMLINK,
     VfsError::NotPermitted => EPERM,
+    VfsError::SpecialFileOperation => EOPNOTSUPP,
     VfsError::Invalid | VfsError::InvalidName => EINVAL,
     VfsError::BaseUnavailable(code) => code,
     // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
@@ -163,6 +168,8 @@ fn dtype(kind: Kind) -> u32 {
     Kind::Dir => DT_DIR,
     Kind::File => DT_REG,
     Kind::Symlink => DT_LNK,
+    Kind::Fifo => DT_FIFO,
+    Kind::Socket => DT_SOCK,
   }
 }
 
@@ -217,6 +224,8 @@ fn wire_mode(kind: Kind, permissions: u32) -> u32 {
     Kind::File => S_IFREG,
     Kind::Dir => S_IFDIR,
     Kind::Symlink => S_IFLNK,
+    Kind::Fifo => slates_vfs::export::MODE_FIFO,
+    Kind::Socket => slates_vfs::export::MODE_SOCKET,
   };
   kind_bits | (permissions & PERMISSION_BITS)
 }
@@ -687,6 +696,37 @@ fn serve_destroy(
     |()| Vec::new(),
     out,
   )
+}
+
+/// Linux fuse_mknod_in (four u32 words), followed by the NUL-terminated name (A-26).
+fn serve_mknod(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
+  /// Format: mode, rdev, umask, padding in Linux include/uapi/linux/fuse.h.
+  const HEAD: usize = 4 * size_of::<u32>();
+  let Some(head) = req.body.get(..HEAD) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let mode = u32::from_le_bytes(head[..4].try_into().unwrap_or_default());
+  let kind = match slates_vfs::export::kind_of_mode(mode) {
+    Some(kind @ (Kind::Fifo | Kind::Socket)) => kind,
+    _ => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
+  };
+  let Ok(name) = parse_name(&req.body[HEAD..]) else {
+    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  };
+  let parent = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(parent) => parent,
+    Err(error) => return reply_err(req.header.unique, error, out),
+  };
+  let result = bridge
+    .mknod(parent, cx, name, mode & PERMISSION_BITS, kind)
+    .and_then(|node| referenced(bridge, cx, node));
+  let result = entry_reply(bridge, cx, result);
+  reply(req.header.unique, result, |entry| entry.to_bytes(), out)
 }
 
 fn serve_mkdir(

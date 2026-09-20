@@ -691,7 +691,7 @@ impl Volume {
       .ok_or(VfsError::NotFound)?;
     let inode = match entry.child {
       Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
-      Child::File(no) | Child::Symlink(no) => no,
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => no,
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     Ok(Located {
@@ -727,6 +727,8 @@ impl Volume {
         ),
         Child::File(no) => (Kind::File, no),
         Child::Symlink(no) => (Kind::Symlink, no),
+        Child::Fifo(no) => (Kind::Fifo, no),
+        Child::Socket(no) => (Kind::Socket, no),
         Child::Whiteout => continue,
       };
       rows.push(DirRow {
@@ -895,6 +897,9 @@ impl Volume {
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
     let inode = self.inode(store, no)?;
+    if inode.kind.is_special() {
+      return Err(VfsError::SpecialFileOperation);
+    }
     if inode.kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
@@ -957,6 +962,33 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
+    self.create_leaf(store, dir, name, mode, Kind::File)
+  }
+
+  /// Creates a FIFO/socket name without a stream or listener (A-26).
+  pub fn mknod_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+    kind: Kind,
+  ) -> Result<InodeNo, VfsError> {
+    if !kind.is_special() {
+      return Err(VfsError::Invalid);
+    }
+    let dir = self.current_dir(store, dir_no)?;
+    self.create_leaf(store, dir, name, mode, kind)
+  }
+
+  fn create_leaf(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    mode: u32,
+    kind: Kind,
+  ) -> Result<InodeNo, VfsError> {
     self.live()?;
     names::check(name)?;
     let dir = self.make_current_dir(store, dir)?;
@@ -970,7 +1002,12 @@ impl Volume {
     }
     let no = self.next_no()?;
     let now = self.clock.wall_ns();
-    let mut inode = Inode::new(no, self.epoch, Kind::File, mode, Body::Inline(Vec::new()));
+    let body = if kind.is_special() {
+      Body::None
+    } else {
+      Body::Inline(Vec::new())
+    };
+    let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Some(Home {
       parent: store.dirs.get(dir)?.inode,
       hash: self.policy.hash(name),
@@ -978,10 +1015,24 @@ impl Volume {
     stamp_all(&mut inode.attrs, now);
     let handle = store.inodes.insert(inode)?;
     self.table_set(store, no, handle)?;
-    self.dir_insert(store, dir, name, Child::File(no))?;
+    let child = match kind {
+      Kind::Fifo => Child::Fifo(no),
+      Kind::Socket => Child::Socket(no),
+      _ => Child::File(no),
+    };
+    self.dir_insert(store, dir, name, child)?;
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Create, &path, Some(no), 0);
+    self.record(
+      if kind.is_special() {
+        Op::Mknod
+      } else {
+        Op::Create
+      },
+      &path,
+      Some(no),
+      0,
+    );
     Ok(no)
   }
 
@@ -1095,6 +1146,10 @@ impl Volume {
     let now = self.clock.wall_ns();
     let child = if kind == Kind::Symlink {
       Child::Symlink(target)
+    } else if kind == Kind::Fifo {
+      Child::Fifo(target)
+    } else if kind == Kind::Socket {
+      Child::Socket(target)
     } else {
       Child::File(target)
     };
@@ -1221,7 +1276,12 @@ impl Volume {
     // A replaced file's last name retains its content when a snapshot pins it (§4.2 retention):
     // secured before anything moves, so a refusal changes nothing.
     let retention = match target {
-      Some(t) if matches!(t.child, Child::File(_) | Child::Symlink(_)) => {
+      Some(t)
+        if matches!(
+          t.child,
+          Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_)
+        ) =>
+      {
         self.retention_of_drop(store, t.inode)?
       }
       _ => 0,
@@ -1263,7 +1323,9 @@ impl Volume {
           self.drop_link(store, t.inode)?;
           self.adjust_nlink(store, store.dirs.get(to_dir)?.inode, -1)?;
         }
-        Child::File(_) | Child::Symlink(_) => self.drop_link(store, t.inode)?,
+        Child::File(_) | Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
+          self.drop_link(store, t.inode)?
+        }
         Child::Whiteout => {}
       }
     }
@@ -1281,7 +1343,7 @@ impl Volume {
         }
         Child::Dir(moving)
       }
-      Child::File(no) | Child::Symlink(no) => {
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
         // The file's home follows it.
         let to_no = store.dirs.get(to_dir)?.inode;
         let handle = self.make_current_inode(store, no)?;
@@ -1320,15 +1382,18 @@ impl Volume {
     bytes: &[u8],
   ) -> Result<usize, VfsError> {
     self.live()?;
-    if bytes.is_empty() {
-      return Ok(0);
-    }
     let end = off
       .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
       .ok_or(VfsError::FileTooLarge)?;
     let kind = self.kind(store, no)?;
+    if kind.is_special() {
+      return Err(VfsError::SpecialFileOperation);
+    }
     if kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
+    }
+    if bytes.is_empty() {
+      return Ok(0);
     }
     let charge = self.write_charge(store, no, off, end)?;
     // The windows this write reopens retain their old chunks (§4.2 retention): secure those bytes
@@ -1386,6 +1451,9 @@ impl Volume {
   /// Truncates (or extends with a hole) to `len`.
   pub fn truncate(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
     self.live()?;
+    if self.kind(store, no)?.is_special() {
+      return Err(VfsError::SpecialFileOperation);
+    }
     if self.kind(store, no)? == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
@@ -1547,7 +1615,7 @@ impl Volume {
       .ok_or(VfsError::NotFound)?;
     let inode = match entry.child {
       Child::Dir(h) => store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
-      Child::File(no) | Child::Symlink(no) => no,
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => no,
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     Ok(Located {
@@ -1571,6 +1639,9 @@ impl Volume {
       .map_err(|_| VfsError::StaleHandle)?;
     let handle = trie::get(&store.tries, s.inode_root, no).ok_or(VfsError::NotFound)?;
     let inode = store.inodes.get(handle)?;
+    if inode.kind.is_special() {
+      return Err(VfsError::SpecialFileOperation);
+    }
     let size = inode.attrs.size;
     if off >= size {
       return Ok(0);
@@ -1785,7 +1856,9 @@ impl Volume {
       for e in node.iter(&store.blocks) {
         match e.child {
           Child::Dir(h) => stack.push((format!("{prefix}/{}", e.name), h)),
-          Child::File(n) | Child::Symlink(n) if n == no => out.push(format!("{prefix}/{}", e.name)),
+          Child::File(n) | Child::Symlink(n) | Child::Fifo(n) | Child::Socket(n) if n == no => {
+            out.push(format!("{prefix}/{}", e.name))
+          }
           _ => {}
         }
       }
@@ -1808,6 +1881,9 @@ impl Volume {
     bytes: &[u8],
   ) -> Result<(), VfsError> {
     self.live()?;
+    if self.kind(store, no)?.is_special() {
+      return Err(VfsError::SpecialFileOperation);
+    }
     if self.kind(store, no)? == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
@@ -1922,6 +1998,8 @@ impl Volume {
         ),
         Child::File(no) => (Kind::File, no),
         Child::Symlink(no) => (Kind::Symlink, no),
+        Child::Fifo(no) => (Kind::Fifo, no),
+        Child::Socket(no) => (Kind::Socket, no),
         Child::Whiteout => continue,
       };
       rows.push(DirRow {

@@ -18,6 +18,17 @@ pub enum Kind {
   Dir,
   /// A symbolic link.
   Symlink,
+  /// A named pipe; its transient stream belongs to the mounting kernel (A-26).
+  Fifo,
+  /// A UNIX socket name; listeners and connections are not volume content (A-26).
+  Socket,
+}
+
+impl Kind {
+  /// Whether regular-file I/O must refuse this metadata-only IPC name (A-26).
+  pub const fn is_special(self) -> bool {
+    matches!(self, Self::Fifo | Self::Socket)
+  }
 }
 
 /// POSIX attributes.

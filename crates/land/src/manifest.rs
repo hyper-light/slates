@@ -407,6 +407,7 @@ fn entry_for(
           witnessed: None,
           overlay: None,
         })),
+        Child::Fifo(_) | Child::Socket(_) => Err(VfsError::SpecialFileOperation),
         Child::File(no) => {
           let attrs = vol.stat(store, no)?;
           let mut bytes =

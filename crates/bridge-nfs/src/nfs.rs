@@ -56,6 +56,8 @@ pub enum Nfsstat3 {
   Toosmall = 10005,
   /// Format: NFS3ERR_SERVERFAULT — an error not covered by the protocol.
   ServerFault = 10006,
+  /// Format: NFS3ERR_BADTYPE — an unsupported or illegal MKNOD type (RFC 1813 §3.3.11).
+  Badtype = 10007,
   /// Format: NFS3ERR_JUKEBOX — the server cannot complete the request now; the client should retry
   /// later (RFC 1813 §2.6). Answered while the volume's owner lease is unconfirmed (§4.8 "Leases and
   /// reads"): the state may be served again within the bound, or its owner may have moved.

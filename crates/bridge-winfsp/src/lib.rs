@@ -66,6 +66,8 @@ const STATUS_DISK_FULL: Ntstatus = Ntstatus(0xC000_007F);
 const STATUS_MEDIA_WRITE_PROTECTED: Ntstatus = Ntstatus(0xC000_00A2);
 /// Format: `STATUS_FILE_IS_A_DIRECTORY` — a directory was found where a file was expected (`EISDIR`).
 const STATUS_FILE_IS_A_DIRECTORY: Ntstatus = Ntstatus(0xC000_00BA);
+/// Format: MS-ERREF `STATUS_NOT_SUPPORTED` — the adapter cannot perform this operation.
+const STATUS_NOT_SUPPORTED: Ntstatus = Ntstatus(0xC000_00BB);
 /// Format: `STATUS_NOT_SAME_DEVICE` — a rename would cross volumes (`EXDEV`).
 const STATUS_NOT_SAME_DEVICE: Ntstatus = Ntstatus(0xC000_00D4);
 /// Format: `STATUS_DIRECTORY_NOT_EMPTY` — the directory still has entries (`ENOTEMPTY`).
@@ -100,12 +102,13 @@ pub fn filetime_from_unix_ns(ns: i64) -> u64 {
 /// The Windows file-attribute bits for a node kind (§4.6) — a directory, an ordinary file, or a symlink
 /// (a reparse point, the form WinFsp represents links in). The FUSE bridge makes the same choice with
 /// the `DT_*` d_type; this is its Windows analogue.
-pub fn file_attributes(kind: Kind) -> u32 {
-  match kind {
+pub fn file_attributes(kind: Kind) -> Result<u32, VfsError> {
+  Ok(match kind {
     Kind::Dir => FILE_ATTRIBUTE_DIRECTORY,
     Kind::File => FILE_ATTRIBUTE_NORMAL,
     Kind::Symlink => FILE_ATTRIBUTE_REPARSE_POINT,
-  }
+    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+  })
 }
 
 /// The `NTSTATUS` WinFsp returns for a volume refusal (§4.6). The common, well-defined codes map
@@ -126,6 +129,7 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::CrossVolumeMove => STATUS_NOT_SAME_DEVICE,
     VfsError::StaleHandle => STATUS_INVALID_HANDLE,
     VfsError::Pinned => STATUS_MEDIA_WRITE_PROTECTED,
+    VfsError::SpecialFileOperation => STATUS_NOT_SUPPORTED,
     _ => STATUS_UNSUCCESSFUL,
   }
 }
@@ -159,6 +163,16 @@ pub(crate) fn status_buffer_overflow() -> i32 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-3.10 / A-26: an IPC inode is refused as unsupported, never projected as a disk file.
+  #[test]
+  fn ipc_names_report_unsupported() {
+    for kind in [Kind::Fifo, Kind::Socket] {
+      let error = file_attributes(kind).unwrap_err();
+      // Format: MS-ERREF STATUS_NOT_SUPPORTED.
+      assert_eq!(ntstatus(&error), Ntstatus(0xC000_00BB));
+    }
+  }
 
   /// Each mapped refusal returns its documented `NTSTATUS`, and an unmapped one falls to the generic
   /// failure — the refusal taxonomy WinFsp will hand the kernel (§4.6), confirmable with no Windows.
@@ -235,8 +249,14 @@ mod tests {
   /// symlink (a reparse point).
   #[test]
   fn each_kind_maps_to_its_file_attribute() {
-    assert_eq!(file_attributes(Kind::Dir), FILE_ATTRIBUTE_DIRECTORY);
-    assert_eq!(file_attributes(Kind::File), FILE_ATTRIBUTE_NORMAL);
-    assert_eq!(file_attributes(Kind::Symlink), FILE_ATTRIBUTE_REPARSE_POINT);
+    assert_eq!(
+      file_attributes(Kind::Dir).unwrap(),
+      FILE_ATTRIBUTE_DIRECTORY
+    );
+    assert_eq!(file_attributes(Kind::File).unwrap(), FILE_ATTRIBUTE_NORMAL);
+    assert_eq!(
+      file_attributes(Kind::Symlink).unwrap(),
+      FILE_ATTRIBUTE_REPARSE_POINT
+    );
   }
 }

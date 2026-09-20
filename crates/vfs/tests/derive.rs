@@ -359,7 +359,7 @@ fn a_fixed_history_has_a_golden_identity() {
 }
 
 /// Format: the identity of the fixed history above, recorded on 2026-09-05 (macOS, aarch64).
-const GOLDEN_IDENTITY: &str = "0899b4cbb4dfb4aac43d00de3d87c239e658d9bd7e5ee89f3f525a4acaeee531";
+const GOLDEN_IDENTITY: &str = "d69175fd995075ff3adc8df2abe0821f4aa9985b6456cb4f24f31b04650b7306";
 
 /// Runs `prefix` to a base snapshot and `suffix` to a head, derives, and applies the document with
 /// the reference applier; the applied files, symlinks and directory paths must equal the head's.

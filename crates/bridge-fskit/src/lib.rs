@@ -189,6 +189,8 @@ pub enum ShimError {
   BaseUnavailable,
   /// Any refusal without a dedicated tag (a forward-compatible catch-all).
   Other,
+  /// This adapter cannot represent this inode kind or operation.
+  NotSupported,
 }
 
 impl ShimError {
@@ -212,6 +214,7 @@ impl ShimError {
       VfsError::Destroying => ShimError::Destroying,
       VfsError::Pinned => ShimError::Pinned,
       VfsError::BaseUnavailable(_) => ShimError::BaseUnavailable,
+      VfsError::SpecialFileOperation => ShimError::NotSupported,
       _ => ShimError::Other,
     }
   }
@@ -861,7 +864,9 @@ fn reply<T>(result: Result<T, VfsError>, ok: impl FnOnce(T) -> Vec<u8>) -> Vec<u
 /// An OK reply carrying an encoded attribute.
 fn ok_attr(attr: &NodeAttr) -> Vec<u8> {
   let mut out = vec![STATUS_OK];
-  put_attr(&mut out, attr);
+  if let Err(error) = put_attr(&mut out, attr) {
+    return err_reply(&error);
+  }
   out
 }
 
@@ -901,7 +906,9 @@ fn ok_unit() -> Vec<u8> {
 /// An OK reply carrying an encoded attribute then a `u64` handle (a created-and-opened file).
 fn ok_attr_fh(attr: &NodeAttr, fh: u64) -> Vec<u8> {
   let mut out = vec![STATUS_OK];
-  put_attr(&mut out, attr);
+  if let Err(error) = put_attr(&mut out, attr) {
+    return err_reply(&error);
+  }
   out.extend_from_slice(&fh.to_le_bytes());
   out
 }
@@ -914,7 +921,10 @@ fn ok_entries(entries: &[DirEntry]) -> Vec<u8> {
   out.extend_from_slice(&count.to_le_bytes());
   for entry in entries {
     out.extend_from_slice(&entry.ino.to_le_bytes());
-    out.push(kind_tag(entry.kind));
+    match kind_tag(entry.kind) {
+      Ok(tag) => out.push(tag),
+      Err(error) => return err_reply(&error),
+    }
     put_bytes(&mut out, entry.name.as_bytes());
   }
   out
@@ -978,10 +988,10 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Appends an encoded attribute (the fields the read path needs), each little-endian; the kind is a tag.
-fn put_attr(out: &mut Vec<u8>, attr: &NodeAttr) {
+fn put_attr(out: &mut Vec<u8>, attr: &NodeAttr) -> Result<(), VfsError> {
   out.extend_from_slice(&attr.ino.to_le_bytes());
   out.extend_from_slice(&attr.generation.to_le_bytes());
-  out.push(kind_tag(attr.kind));
+  out.push(kind_tag(attr.kind)?);
   out.extend_from_slice(&attr.mode.to_le_bytes());
   out.extend_from_slice(&attr.nlink.to_le_bytes());
   out.extend_from_slice(&attr.uid.to_le_bytes());
@@ -990,15 +1000,17 @@ fn put_attr(out: &mut Vec<u8>, attr: &NodeAttr) {
   out.extend_from_slice(&attr.atime.to_le_bytes());
   out.extend_from_slice(&attr.mtime.to_le_bytes());
   out.extend_from_slice(&attr.ctime.to_le_bytes());
+  Ok(())
 }
 
 /// The wire tag for a node kind.
-fn kind_tag(kind: Kind) -> u8 {
-  match kind {
+fn kind_tag(kind: Kind) -> Result<u8, VfsError> {
+  Ok(match kind {
     Kind::File => KIND_FILE,
     Kind::Dir => KIND_DIR,
     Kind::Symlink => KIND_SYMLINK,
-  }
+    Kind::Fifo | Kind::Socket => return Err(VfsError::SpecialFileOperation),
+  })
 }
 
 /// Reads an object id (inode then generation) from the front of `rest`, advancing it.

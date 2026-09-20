@@ -318,6 +318,7 @@ impl<'v> VolumeBridge<'v> {
         }
       }
       Op::Create
+      | Op::Mknod
       | Op::Mkdir
       | Op::Unlink
       | Op::Rmdir
@@ -478,6 +479,13 @@ impl Bridge for VolumeBridge<'_> {
 
   fn open(&mut self, object: ObjectId, cx: &OpContext, _flags: u32) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
+    if self
+      .volume
+      .kind(self.store, InodeNo(object.inode))?
+      .is_special()
+    {
+      return Err(VfsError::SpecialFileOperation);
+    }
     // A directory is opened through opendir; open refuses it.
     if self.volume.kind(self.store, InodeNo(object.inode))? == Kind::Dir {
       return Err(VfsError::IsDirectory);
@@ -683,6 +691,29 @@ impl Bridge for VolumeBridge<'_> {
     self.authorize_read(cx)?;
     // No disk write: the data is already in the anchor segment (§4.6). Success.
     Ok(())
+  }
+
+  fn mknod(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    mode: u32,
+    kind: Kind,
+  ) -> Result<NodeAttr, VfsError> {
+    self.authorize_write(cx)?;
+    let parent_no = InodeNo(parent.inode);
+    let no = match self.host.as_mut() {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .mknod_no(self.store, parent_no, name, mode, kind),
+      None => self
+        .volume
+        .mknod_no(self.store, parent_no, name, mode, kind),
+    }?;
+    self.stamp_created_owner(no, parent_no, cx)?;
+    Ok(node_attr(no.0, kind, &self.volume.stat(self.store, no)?))
   }
 
   fn mkdir(

@@ -114,6 +114,64 @@ fn reply_nodeid(out: &[u8]) -> u64 {
   u64::from_le_bytes(out[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap())
 }
 
+/// AC-3.10 / A-26: Linux MKNOD vectors create real FIFO/socket names and reject a device.
+#[test]
+fn mknod_reports_ipc_types_and_refuses_device_nodes() {
+  let mut store = store();
+  let mut volume = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let mut out = vec![0; OUT_HEADER_LEN + EntryOut::LEN];
+  for (name, mode) in [("pipe", 0o010640u32), ("socket", 0o140640u32)] {
+    // Linux fuse_mknod_in: mode, rdev, umask, padding; followed by the name.
+    let mut body = mode.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0; 12]);
+    body.extend_from_slice(&name_body(name));
+    dispatch(&message(8, 1, 1, &body), &mut bridge, &mut out);
+    assert!(ok(&out), "{name} creation");
+    // fuse_entry_out has a 40-byte prefix; fuse_attr.mode is at byte 60.
+    let offset = OUT_HEADER_LEN + 40 + 60;
+    assert_eq!(
+      u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()),
+      mode
+    );
+    dispatch(&message(1, 2, 1, &name_body(name)), &mut bridge, &mut out);
+    assert!(ok(&out), "{name} lookup");
+    assert_eq!(
+      u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()),
+      mode
+    );
+  }
+  let mut body = 0o060600u32.to_le_bytes().to_vec();
+  body.extend_from_slice(&[0; 12]);
+  body.extend_from_slice(&name_body("device"));
+  dispatch(&message(8, 3, 1, &body), &mut bridge, &mut out);
+  assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -95);
+  dispatch(
+    &message(1, 4, 1, &name_body("device")),
+    &mut bridge,
+    &mut out,
+  );
+  assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -2);
+}
+
+/// T-3.1 / A-26: truncated MKNOD bodies cannot create a name, including a missing NUL terminator.
+#[test]
+fn truncated_mknod_never_changes_the_namespace() {
+  let mut store = store();
+  let mut volume = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut volume, &mut store);
+  let mut body = 0o010600u32.to_le_bytes().to_vec();
+  body.extend_from_slice(&[0; 12]);
+  body.extend_from_slice(&name_body("pipe"));
+  let mut out = vec![0; OUT_HEADER_LEN + EntryOut::LEN];
+  for end in 0..body.len() {
+    dispatch(&message(8, 1, 1, &body[..end]), &mut bridge, &mut out);
+    assert!(!ok(&out), "truncation at {end}");
+    dispatch(&message(1, 2, 1, &name_body("pipe")), &mut bridge, &mut out);
+    assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -2);
+  }
+}
+
 /// The file handle a CREATE reply names (the `fuse_open_out` after the entry).
 fn create_reply_fh(out: &[u8]) -> u64 {
   let at = OUT_HEADER_LEN + EntryOut::LEN;

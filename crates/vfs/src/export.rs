@@ -62,6 +62,10 @@ pub const MODE_FILE: u32 = 0o100_000;
 /// Format: POSIX `S_IFLNK`, the type bits a symlink's manifest mode carries (its bytes are the
 /// target).
 pub const MODE_SYMLINK: u32 = 0o120_000;
+/// Format: POSIX S_IFIFO, a metadata-only pipe name.
+pub const MODE_FIFO: u32 = 0o010_000;
+/// Format: POSIX S_IFSOCK, a metadata-only socket name.
+pub const MODE_SOCKET: u32 = 0o140_000;
 
 /// Format: the archive header's name-policy id for byte-exact names.
 const POLICY_EXACT: u32 = 0;
@@ -77,6 +81,8 @@ pub fn kind_of_mode(mode: u32) -> Option<Kind> {
     MODE_DIRECTORY => Some(Kind::Dir),
     MODE_FILE => Some(Kind::File),
     MODE_SYMLINK => Some(Kind::Symlink),
+    MODE_FIFO => Some(Kind::Fifo),
+    MODE_SOCKET => Some(Kind::Socket),
     _ => None,
   }
 }
@@ -293,6 +299,7 @@ impl SnapshotArchiver {
       Kind::Dir => self.enter_directory(volume, store, dir, next)?,
       Kind::File => self.begin_file(volume, store, next)?,
       Kind::Symlink => self.take_symlink(volume, store, next)?,
+      Kind::Fifo | Kind::Socket => self.take_special(volume, store, next)?,
     };
     Ok(Step::Worked(cost))
   }
@@ -413,6 +420,27 @@ impl SnapshotArchiver {
       })?;
     }
     Ok(len)
+  }
+
+  /// Records only the type and metadata of an IPC name, never kernel state (A-26).
+  fn take_special(
+    &mut self,
+    volume: &Volume,
+    store: &Store,
+    next: Pending,
+  ) -> Result<u64, VfsError> {
+    let type_bits = if next.kind == Kind::Fifo {
+      MODE_FIFO
+    } else {
+      MODE_SOCKET
+    };
+    let meta = meta_of(volume, store, self.snapshot, next.inode, type_bits)?;
+    self.push_entry(Entry {
+      name: next.name,
+      meta,
+      node: Node::File(Vec::new()),
+    })?;
+    Ok(u64::try_from(self.chunk_bytes).unwrap_or(u64::MAX))
   }
 
   /// Carries a symlink as a file of its target bytes under the link type bits.

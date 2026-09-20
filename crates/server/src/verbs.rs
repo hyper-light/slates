@@ -5028,7 +5028,8 @@ pub(crate) fn materialize_taken_over(
 /// Recreates a restored archive's tree in a fresh volume: directories parents-first (the restore's paths
 /// sort so), then each file's bytes under its mode and times, a symlink (a file under the link type bits,
 /// its bytes the target) as a link. The archive's own metadata carries the permission bits and times; the
-/// inode numbers are this volume's (identity across renames is per volume, not carried).
+/// inode numbers are this volume's; the source inode number groups hard links so a takeover keeps
+/// every name of one file or IPC endpoint attached to the same new inode (A-26).
 fn populate_restored(
   store: &mut slates_vfs::volume::Store,
   volume: &mut Volume,
@@ -5036,6 +5037,8 @@ fn populate_restored(
 ) -> Result<(), slates_vfs::VfsError> {
   use slates_vfs::export::{kind_of_mode, permissions_of_mode};
   use slates_vfs::inode::Kind;
+  validate_restored_nodes(restored)?;
+  let mut inodes = std::collections::BTreeMap::new();
   let mut directories: std::collections::BTreeMap<String, Handle<slates_vfs::dir::DirNode>> =
     std::collections::BTreeMap::new();
   directories.insert(String::new(), volume.root());
@@ -5060,21 +5063,51 @@ fn populate_restored(
   }
   for (path, bytes) in &restored.files {
     let (parent, name) = parent_of(&directories, path)?;
-    let meta = restored.metadata.get(path).copied().unwrap_or_default();
+    let meta = restored
+      .metadata
+      .get(path)
+      .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
+    if let Some(&no) = inodes.get(&meta.ino) {
+      volume.link(store, parent, &name, no)?;
+      continue;
+    }
     let no = match kind_of_mode(meta.mode) {
-      Some(Kind::Symlink) => {
-        let target = String::from_utf8_lossy(bytes);
-        volume.symlink(store, parent, &name, &target)?
+      Some(kind @ (Kind::Fifo | Kind::Socket)) => {
+        if !bytes.is_empty() {
+          return Err(slates_vfs::error::VfsError::RecoveryIncomplete);
+        }
+        let parent_no = store.dirs.get(parent)?.inode;
+        volume.mknod_no(
+          store,
+          parent_no,
+          &name,
+          permissions_of_mode(meta.mode),
+          kind,
+        )?
       }
-      _ => {
+      Some(Kind::Symlink) => {
+        let target =
+          std::str::from_utf8(bytes).map_err(|_| slates_vfs::VfsError::RecoveryIncomplete)?;
+        volume.symlink(store, parent, &name, target)?
+      }
+      Some(Kind::File) => {
         let no = volume.create_file(store, parent, &name, permissions_of_mode(meta.mode))?;
         if !bytes.is_empty() {
           volume.write(store, no, 0, bytes)?;
         }
         no
       }
+      Some(Kind::Dir) | None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
     };
-    restore_owner_and_times(store, volume, no, &meta)?;
+    inodes.insert(meta.ino, no);
+  }
+  // Linking changes ctime. Restore attributes only after the complete namespace exists.
+  for (path, meta) in &restored.metadata {
+    if restored.files.contains_key(path)
+      && let Some(&no) = inodes.get(&meta.ino)
+    {
+      restore_owner_and_times(store, volume, no, meta)?;
+    }
   }
   // The directories' owners and times last: populating a directory moves its times, and a directory
   // is only whole once its entries are in. Deepest first, so a parent's stamp follows its children's.
@@ -5090,6 +5123,36 @@ fn populate_restored(
   let root = volume.root_inode(store)?;
   volume.chmod(store, root, permissions_of_mode(restored.root.mode))?;
   restore_owner_and_times(store, volume, root, &restored.root)?;
+  Ok(())
+}
+
+/// Validates archived inode groups before touching the replacement volume. A repeated inode is a
+/// hard link only when kind, attributes and bytes agree; a hostile archive cannot alias unlike nodes.
+fn validate_restored_nodes(
+  restored: &slates_archive::Restored,
+) -> Result<(), slates_vfs::VfsError> {
+  use slates_vfs::{VfsError, export::kind_of_mode, inode::Kind};
+  let mut groups: std::collections::BTreeMap<u64, (&slates_archive::NodeMeta, &[u8], u32)> =
+    std::collections::BTreeMap::new();
+  for (path, bytes) in &restored.files {
+    let meta = restored
+      .metadata
+      .get(path)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    match kind_of_mode(meta.mode) {
+      Some(Kind::Fifo | Kind::Socket) if meta.size == 0 && bytes.is_empty() => {}
+      Some(Kind::File | Kind::Symlink) if meta.size == bytes.len() as u64 => {}
+      _ => return Err(VfsError::RecoveryIncomplete),
+    }
+    let group = groups.entry(meta.ino).or_insert((meta, bytes, 0));
+    if group.0 != meta || group.1 != bytes {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    group.2 = group.2.checked_add(1).ok_or(VfsError::RecoveryIncomplete)?;
+  }
+  if groups.values().any(|(meta, _, count)| meta.nlink != *count) {
+    return Err(VfsError::RecoveryIncomplete);
+  }
   Ok(())
 }
 
@@ -6296,6 +6359,103 @@ mod tests {
     HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// AC-5.2 / A-26: takeover reconstructs linked IPC names as one inode, including archived owners.
+  #[test]
+  fn archive_restore_preserves_ipc_hardlinks() {
+    crate::daemon::audit_on_shard(|state| {
+      let reply = super::dispatch(
+        state,
+        1,
+        &Principal::Uid { uid: 1234 },
+        super::RequestBody::Create {
+          name: "ipc-restore".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id } = reply else {
+        panic!("{reply:?}")
+      };
+      let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+      let slot = state.volumes.get_mut(handle).unwrap();
+      let meta = slates_archive::NodeMeta {
+        ino: 17,
+        mode: 0o010640,
+        nlink: 2,
+        uid: 1234,
+        gid: 456,
+        mtime_ns: 789,
+        ctime_ns: 890,
+        ..Default::default()
+      };
+      let restored = slates_archive::Restored {
+        files: [
+          ("pipe".to_owned(), Vec::new()),
+          ("pipe-link".to_owned(), Vec::new()),
+        ]
+        .into(),
+        metadata: [("pipe".to_owned(), meta), ("pipe-link".to_owned(), meta)].into(),
+        directories: Default::default(),
+        root: slates_archive::NodeMeta {
+          mode: 0o040755,
+          ..Default::default()
+        },
+      };
+      super::populate_restored(&mut state.store, &mut slot.volume, &restored).unwrap();
+      let first = slot.volume.resolve(&state.store, "pipe").unwrap().inode;
+      let linked = slot
+        .volume
+        .resolve(&state.store, "pipe-link")
+        .unwrap()
+        .inode;
+      assert_eq!(
+        first, linked,
+        "takeover retains the IPC endpoint's hard-link identity"
+      );
+      let attrs = slot.volume.stat(&state.store, first).unwrap();
+      assert_eq!(
+        (
+          attrs.mode,
+          attrs.uid,
+          attrs.gid,
+          attrs.nlink,
+          attrs.mtime,
+          attrs.ctime
+        ),
+        (0o640, 1234, 456, 2, 789, 890)
+      );
+      slot.volume.chmod(&mut state.store, linked, 0o600).unwrap();
+      assert_eq!(slot.volume.stat(&state.store, first).unwrap().mode, 0o600);
+      let before = slot
+        .volume
+        .to_image(&state.store, None)
+        .unwrap()
+        .to_content();
+      let mut malformed = restored.clone();
+      malformed.metadata.get_mut("pipe-link").unwrap().gid += 1;
+      assert_eq!(
+        super::populate_restored(&mut state.store, &mut slot.volume, &malformed),
+        Err(slates_vfs::VfsError::RecoveryIncomplete)
+      );
+      let mut malformed = restored;
+      malformed.files.get_mut("pipe").unwrap().push(1);
+      assert_eq!(
+        super::populate_restored(&mut state.store, &mut slot.volume, &malformed),
+        Err(slates_vfs::VfsError::RecoveryIncomplete)
+      );
+      assert_eq!(
+        slot
+          .volume
+          .to_image(&state.store, None)
+          .unwrap()
+          .to_content(),
+        before
+      );
+    });
+  }
 
   /// §4.13 (the root:wheel sibling, docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md): a
   /// volume's root directory is owned by the user who provisioned it — the uid of the principal, the

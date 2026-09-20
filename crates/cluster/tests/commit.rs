@@ -98,6 +98,19 @@ fn run_commit_full(
   serve: [bool; 2],
   holder_generation: u64,
 ) -> (Result<Placement, String>, Option<u64>) {
+  run_commit_with_budget(
+    serve,
+    holder_generation,
+    CommitBudget::hard(DEADLINE_NS, POLL_NS),
+  )
+}
+
+/// Runs the same wire history with a chosen collector budget.
+fn run_commit_with_budget(
+  serve: [bool; 2],
+  holder_generation: u64,
+  budget: CommitBudget,
+) -> (Result<Placement, String>, Option<u64>) {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   let id = sim.shard_ids()[0];
 
@@ -192,7 +205,7 @@ fn run_commit_full(
         &record(b"head@v1"),
         Quorum { f: 1 },
         remotes,
-        CommitBudget::hard(DEADLINE_NS, POLL_NS),
+        budget,
       )
       .await;
       let stale = committed.stale_version;
@@ -596,4 +609,16 @@ fn a_retry_reuses_the_connection_with_advancing_packet_numbers() {
     pn_2 > pn_1,
     "the reused connection's packet numbers advanced across the retry ({pn_1} -> {pn_2}), never reset"
   );
+}
+
+/// AC-8.12 / §4.8: a holder acknowledges during the final collection sleep;
+/// the queued acknowledgement must place the record before expiration is judged.
+#[test]
+fn an_acknowledgement_delivered_during_the_final_poll_places_the_record() {
+  let (outcome, _) = run_commit_with_budget(
+    [true, false],
+    GENERATION,
+    CommitBudget::hard(DEADLINE_NS, DEADLINE_NS),
+  );
+  assert!(outcome.unwrap().placed(Quorum { f: 1 }));
 }

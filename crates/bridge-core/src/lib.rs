@@ -248,6 +248,15 @@ pub trait Bridge {
     mode: u32,
     flags: u32,
   ) -> Result<(NodeAttr, u64), VfsError>;
+  /// Creates a FIFO/socket name, with no open reference or kernel endpoint (A-26).
+  fn mknod(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    mode: u32,
+    kind: Kind,
+  ) -> Result<NodeAttr, VfsError>;
   /// Release handle `fh` of `object`, under `cx`.
   fn release(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
   /// Takes one lookup reference on `object`, under `cx`: the transport is handed an object it may

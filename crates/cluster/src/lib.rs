@@ -265,17 +265,20 @@ impl DispatchWait {
     }
   }
 
-  /// Parks one poll interval, then reports whether the dispatch may keep waiting given how many distinct
-  /// acknowledgements it has gathered so far (`gathered`). Returns `false` when the dispatch has reached
-  /// its deadline and is stalled, or has spent its extension budget — the collection loop then stops and
-  /// the commit is reported uncertain. A dispatch below its deadline, or still filling its quorum near
-  /// it, keeps waiting.
+  /// Called after draining replies: judges whether the dispatch may keep waiting with the
+  /// current acknowledgement count, then parks one poll interval if it may. A completed
+  /// sleep always returns `true` so the caller drains replies delivered during that sleep
+  /// before judging expiration again. Otherwise a reply already in the channel loses to
+  /// the timer (§4.8; `docs/bugs/2026-09-20-collectors-expire-before-reading-queued-replies.md`).
   pub async fn keep_waiting(&mut self, gathered: usize) -> bool {
+    if !self.judge(gathered, now_ns()) {
+      return false;
+    }
     sleep(self.poll_interval_ns).await;
-    self.judge(gathered, now_ns())
+    true
   }
 
-  /// The decision [`keep_waiting`](DispatchWait::keep_waiting) takes once its poll interval has passed,
+  /// The decision [`keep_waiting`](DispatchWait::keep_waiting) takes before parking,
   /// pure in the clock: records `gathered` as the dispatch's progress at `now_ns` and asks the extender
   /// whether the dispatch may keep waiting. Separated from the sleep so the rule is testable at N=1
   /// against an injected clock — the way the extender and the witness are.
@@ -327,70 +330,72 @@ pub struct Reply(pub HostId, pub TimedReply, pub Box<Endpoint>);
 /// reply itself is not folded (the dispatch already resolved without it); a commit re-ships to that holder
 /// next period over the recovered session, idempotently. Empty when nothing was dispatched.
 pub struct Stragglers {
-  replies: Option<std::sync::mpsc::Receiver<Reply>>,
+  // At most two exchanges per dispatch: content offers followed by puts. All other
+  // dispatches use only the first slot; no user-scaled channel list is retained.
+  replies: [Option<std::sync::mpsc::Receiver<Reply>>; 2],
 }
 
 impl Stragglers {
-  /// No stragglers: nothing was dispatched (a local quorum at `f = 0`, or a spawn failure that cancelled the
-  /// tasks already started).
+  /// No stragglers: nothing was dispatched, as for a local quorum at `f = 0`.
   pub fn none() -> Self {
-    Self { replies: None }
+    Self {
+      replies: [None, None],
+    }
   }
 
-  /// The stragglers of a dispatch whose reply channel is `replies` — every task still running sends there.
-  /// Public so the daemon's consensus fan-out (`slates_server::fleet::broadcast`) hands its own stragglers
-  /// back the same way a record commit does, instead of dropping the channel and losing them.
+  /// Keeps a dispatch's reply channel until every task has returned its session.
   pub fn pending(replies: std::sync::mpsc::Receiver<Reply>) -> Self {
     Self {
-      replies: Some(replies),
+      replies: [Some(replies), None],
     }
   }
 
-  /// Recovers the sessions of the stragglers that have finished since the last call, and whether every
-  /// straggler is now accounted for (the channel has closed: no task still holds a session), after which
-  /// this is spent and can be dropped. Never blocks; a caller polls it each period.
+  /// Content has two exchanges. An offer still in flight when collection stops
+  /// returns its session here alongside put acknowledgements (§4.10).
+  pub(crate) fn two_rounds(
+    offers: std::sync::mpsc::Receiver<Reply>,
+    puts: std::sync::mpsc::Receiver<Reply>,
+  ) -> Self {
+    Self {
+      replies: [Some(offers), Some(puts)],
+    }
+  }
+
+  /// Recovers finished sessions and reports whether all dispatch tasks returned.
+  /// Never blocks; a caller polls each period and reuses the returned sessions.
   pub fn recover(&mut self) -> (Vec<(HostId, Endpoint)>, bool) {
-    let mut recovered = Vec::new();
-    let Some(replies) = self.replies.as_ref() else {
-      return (recovered, true);
-    };
-    loop {
-      match replies.try_recv() {
-        Ok(Reply(host, _, endpoint)) => recovered.push((host, *endpoint)),
-        Err(TryRecvError::Empty) => return (recovered, false),
-        Err(TryRecvError::Disconnected) => {
-          self.replies = None;
-          return (recovered, true);
-        }
-      }
-    }
+    let (replies, complete) = self.recover_replies();
+    (
+      replies
+        .into_iter()
+        .map(|(host, _, endpoint)| (host, endpoint))
+        .collect(),
+      complete,
+    )
   }
 
-  /// Like [`recover`](Stragglers::recover), but hands back each finished straggler's **reply** with its
-  /// session — for a caller whose late reply still means something. A consensus round is one: a late
-  /// `AppendReply` is the acknowledgement that advances the leader's match index toward a commit, a late
-  /// `VoteReply` the vote that elects, and Raft folds any response on arrival gated only by its term (the
-  /// leader rules of Figure 2 carry no timing condition; a stale-term or wrong-role reply is ignored on
-  /// fold). Dropping such a reply at the round's progress-aware stop would cost a slow-but-live voter its
-  /// acknowledgement every round — under sustained CPU starvation, forever. A record commit needs none of
-  /// this (it re-ships idempotently) and uses `recover`. A straggler that timed out reports an empty reply
-  /// with no round trip and still returns its session; one that answered late reports its round trip,
-  /// the tail the path estimate must see.
+  /// Recovers replies together with sessions so a late acknowledgement can still
+  /// advance its bound operation. The caller validates reply kind and identity:
+  /// a late content offer returns a session but is not a put acknowledgement.
+  /// A task that times out returns an empty reply and its session as usual.
   pub fn recover_replies(&mut self) -> (Vec<(HostId, TimedReply, Endpoint)>, bool) {
     let mut recovered = Vec::new();
-    let Some(replies) = self.replies.as_ref() else {
-      return (recovered, true);
-    };
-    loop {
-      match replies.try_recv() {
-        Ok(Reply(host, reply, endpoint)) => recovered.push((host, reply, *endpoint)),
-        Err(TryRecvError::Empty) => return (recovered, false),
-        Err(TryRecvError::Disconnected) => {
-          self.replies = None;
-          return (recovered, true);
+    for pending in &mut self.replies {
+      let Some(replies) = pending.as_ref() else {
+        continue;
+      };
+      loop {
+        match replies.try_recv() {
+          Ok(Reply(host, reply, endpoint)) => recovered.push((host, reply, *endpoint)),
+          Err(TryRecvError::Empty) => break,
+          Err(TryRecvError::Disconnected) => {
+            *pending = None;
+            break;
+          }
         }
       }
     }
+    (recovered, self.replies.iter().all(Option::is_none))
   }
 }
 

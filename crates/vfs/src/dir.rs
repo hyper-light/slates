@@ -47,6 +47,10 @@ pub enum Child {
   File(InodeNo),
   /// A symlink inode.
   Symlink(InodeNo),
+  /// A FIFO name (A-26).
+  Fifo(InodeNo),
+  /// A socket name (A-26).
+  Socket(InodeNo),
   /// A whiteout over a base-backed name (§4.5).
   Whiteout,
 }

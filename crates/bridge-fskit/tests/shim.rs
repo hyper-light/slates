@@ -81,6 +81,31 @@ fn oid(ino: u64) -> ObjectId {
   ObjectId::new(ino, 0)
 }
 
+/// AC-3.10 / A-26: FSKit refuses an unsupported IPC inode instead of reporting a regular file.
+#[test]
+fn lookup_of_ipc_name_reports_unsupported() {
+  let mut store = store();
+  let mut volume = volume(&mut store);
+  let root = volume.root_inode(&store).unwrap();
+  volume
+    .mknod_no(
+      &mut store,
+      root,
+      "pipe",
+      0o600,
+      slates_vfs::inode::Kind::Fifo,
+    )
+    .unwrap();
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut volume, &mut store);
+  let request = ShimRequest::Lookup {
+    parent: oid(root.0),
+    name: "pipe".to_owned(),
+  };
+  let reply = serve(&request.encode(), &mut bridge, &write_cx()).unwrap();
+  // Format: the first appended refusal after Other, mirrored by Swift's ShimErrorCode.
+  assert_eq!(reply, vec![STATUS_ERR, 17]);
+}
+
 /// Each request round-trips through its canonical bytes unchanged — the wire is stable.
 #[test]
 fn a_request_round_trips_through_its_bytes() {

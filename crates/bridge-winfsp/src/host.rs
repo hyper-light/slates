@@ -249,9 +249,9 @@ impl VolumeHost {
 
 /// Builds a [`FileInfo`] from the volume core's neutral attributes: the Windows attribute bits for the
 /// kind, the size for both file and allocation size (page-granular), and the times as `FILETIME`.
-fn file_info(attr: &NodeAttr) -> FileInfo {
-  FileInfo {
-    file_attributes: file_attributes(attr.kind),
+fn file_info(attr: &NodeAttr) -> Result<FileInfo, VfsError> {
+  Ok(FileInfo {
+    file_attributes: file_attributes(attr.kind)?,
     reparse_tag: 0,
     allocation_size: attr.size,
     file_size: attr.size,
@@ -262,7 +262,7 @@ fn file_info(attr: &NodeAttr) -> FileInfo {
     index_number: attr.ino,
     hard_links: 0,
     ea_size: 0,
-  }
+  })
 }
 
 /// Splits a WinFsp path (`\` or `\dir\file`, backslash-separated) into its non-empty components. The
@@ -310,7 +310,7 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
     Op::Resolve { path } => match resolve(bridge, cx, &path) {
       Ok(attr) => Reply::Object {
         object: ObjectId::new(attr.ino, attr.generation),
-        info: file_info(&attr),
+        info: file_info(&attr)?,
         is_dir: matches!(attr.kind, Kind::Dir),
         fh: 0,
       },
@@ -327,7 +327,7 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
       };
       Reply::Object {
         object,
-        info: file_info(&attr),
+        info: file_info(&attr)?,
         is_dir,
         fh,
       }
@@ -357,14 +357,14 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
       let attr = bridge.getattr(object, cx)?;
       Reply::Wrote {
         written,
-        info: file_info(&attr),
+        info: file_info(&attr)?,
       }
     }
     Op::Info { object } => {
       let attr = bridge.getattr(object, cx)?;
       Reply::Object {
         object,
-        info: file_info(&attr),
+        info: file_info(&attr)?,
         is_dir: matches!(attr.kind, Kind::Dir),
         fh: 0,
       }
@@ -384,7 +384,7 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
       )?;
       Reply::Object {
         object,
-        info: file_info(&attr),
+        info: file_info(&attr)?,
         is_dir: false,
         fh: 0,
       }
@@ -400,7 +400,7 @@ fn run(bridge: &mut VolumeBridge<'_>, cx: &OpContext, op: Op) -> Result<Reply, V
       )?;
       Reply::Object {
         object,
-        info: file_info(&attr),
+        info: file_info(&attr)?,
         is_dir: false,
         fh: 0,
       }
@@ -449,7 +449,7 @@ fn op_create(
     let fh = bridge.opendir(object, cx)?;
     Ok(Reply::Object {
       object,
-      info: file_info(&attr),
+      info: file_info(&attr)?,
       is_dir: true,
       fh,
     })
@@ -457,7 +457,7 @@ fn op_create(
     let (attr, fh) = bridge.create(parent_id, cx, name, DEFAULT_FILE_MODE, 0)?;
     Ok(Reply::Object {
       object: ObjectId::new(attr.ino, attr.generation),
-      info: file_info(&attr),
+      info: file_info(&attr)?,
       is_dir: false,
       fh,
     })
@@ -520,9 +520,9 @@ fn read_all_entries(
   let mut out = Vec::with_capacity(rows.len());
   for entry in rows {
     let info = match bridge.getattr(ObjectId::new(entry.ino, 0), cx) {
-      Ok(attr) => file_info(&attr),
+      Ok(attr) => file_info(&attr)?,
       Err(_) => FileInfo {
-        file_attributes: file_attributes(entry.kind),
+        file_attributes: file_attributes(entry.kind)?,
         ..FileInfo::default()
       },
     };

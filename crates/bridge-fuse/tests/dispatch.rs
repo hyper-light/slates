@@ -206,6 +206,17 @@ impl Bridge for Mock {
     Ok(())
   }
   // The operations below are not exercised by these dispatch tests; the mock refuses them.
+  fn mknod(
+    &mut self,
+    _parent: ObjectId,
+    _cx: &OpContext,
+    _name: &str,
+    _mode: u32,
+    _kind: Kind,
+  ) -> Result<NodeAttr, VfsError> {
+    Err(VfsError::SpecialFileOperation)
+  }
+
   fn mkdir(
     &mut self,
     _parent: ObjectId,

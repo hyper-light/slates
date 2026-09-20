@@ -12,6 +12,8 @@ use crate::ids::{Epoch, InodeNo};
 pub enum Op {
   /// A file created at `path`.
   Create,
+  /// A FIFO/socket namespace entry created (A-26); no stream state is journaled.
+  Mknod,
   /// A directory created.
   Mkdir,
   /// An entry unlinked.

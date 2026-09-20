@@ -76,6 +76,7 @@ enum ShimErrorCode: UInt8 {
   case pinned
   case baseUnavailable
   case other
+  case notSupported
 
   // The POSIX errno FSKit surfaces to the kernel for this refusal. Darwin's named constants carry
   // the numbers, so there is no magic here; the choices mirror the Rust `ShimError::to_errno`.
@@ -98,6 +99,7 @@ enum ShimErrorCode: UInt8 {
     case .pinned: return EBUSY
     case .baseUnavailable: return EIO
     case .other: return EIO
+    case .notSupported: return ENOTSUP
     }
   }
 }

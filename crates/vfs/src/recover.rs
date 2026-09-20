@@ -48,7 +48,8 @@ const IMAGE_MAGIC: u32 = u32::from_le_bytes(*b"SLR1");
 const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// Format: the image layout version, bumped with any change to the types below. 3 (2026-09-15): a
 /// file's body is its held runs at their offsets, not one vector of its logical length.
-const IMAGE_VERSION: u16 = 3;
+/// 4 (A-26): FIFO/socket kinds with empty bodies and zero size.
+const IMAGE_VERSION: u16 = 4;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -89,6 +90,10 @@ pub enum KindImage {
   Dir,
   /// A symbolic link.
   Symlink,
+  /// A FIFO name, without kernel stream state.
+  Fifo,
+  /// A socket name, without a listener or connection.
+  Socket,
 }
 
 /// POSIX attributes in an image (§4.5 `Attrs`); every field is fixed-width, so the encoding is
@@ -569,6 +574,8 @@ const fn kind_image(kind: Kind) -> KindImage {
     Kind::File => KindImage::File,
     Kind::Dir => KindImage::Dir,
     Kind::Symlink => KindImage::Symlink,
+    Kind::Fifo => KindImage::Fifo,
+    Kind::Socket => KindImage::Socket,
   }
 }
 
@@ -677,7 +684,10 @@ impl Volume {
     for handle in handles {
       let inode = store.inodes.get(handle)?;
       let no = inode.no;
-      if !matches!(inode.kind, Kind::File | Kind::Symlink) {
+      if !matches!(
+        inode.kind,
+        Kind::File | Kind::Symlink | Kind::Fifo | Kind::Socket
+      ) {
         // Directories are always carried in full; their entries are small and their structure is
         // this snapshot's own.
         inodes.push(self.image_of_inode(store, inode, Some(id))?);
@@ -801,6 +811,7 @@ impl Volume {
           _ => return Err(VfsError::RecoveryIncomplete),
         },
         Kind::File => self.file_body(store, inode, snapshot)?,
+        Kind::Fifo | Kind::Socket => BodyImage::Empty,
       }
     };
     Ok(InodeImage {
@@ -839,7 +850,7 @@ impl Volume {
     let mut entries = Vec::with_capacity(dir.len());
     for entry in dir.iter(&store.blocks) {
       let child = match entry.child {
-        Child::File(no) | Child::Symlink(no) => Some(no),
+        Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no),
         Child::Dir(handle) => Some(
           store
             .dirs
@@ -957,6 +968,8 @@ const fn kind_from_image(kind: KindImage) -> Kind {
     KindImage::File => Kind::File,
     KindImage::Dir => Kind::Dir,
     KindImage::Symlink => Kind::Symlink,
+    KindImage::Fifo => Kind::Fifo,
+    KindImage::Socket => Kind::Socket,
   }
 }
 
@@ -1562,6 +1575,12 @@ fn body_for(
       dirs.insert(image_inode.no, node);
       Ok(Body::Directory(node))
     }
+    KindImage::Fifo | KindImage::Socket => {
+      if !matches!(image_inode.body, BodyImage::Empty) || image_inode.attrs.size != 0 {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      Ok(Body::None)
+    }
     KindImage::Symlink => match &image_inode.body {
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
       _ => Err(VfsError::RecoveryIncomplete),
@@ -1600,6 +1619,8 @@ fn child_for(
   match kinds.get(&child).ok_or(VfsError::RecoveryIncomplete)? {
     KindImage::File => Ok(Child::File(child_no)),
     KindImage::Symlink => Ok(Child::Symlink(child_no)),
+    KindImage::Fifo => Ok(Child::Fifo(child_no)),
+    KindImage::Socket => Ok(Child::Socket(child_no)),
     KindImage::Dir => {
       let handle = *dirs.get(&child).ok_or(VfsError::RecoveryIncomplete)?;
       let node = store.dirs.get_mut(handle)?;

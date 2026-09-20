@@ -69,6 +69,35 @@ fn disk(host: &SimHost) -> Disk {
     .collect()
 }
 
+/// T-1.12 / A-26: planning a landing with IPC names refuses before any host write.
+#[test]
+fn ipc_names_refuse_landing_before_an_ordinary_file_can_be_written() {
+  for kind in [
+    slates_vfs::inode::Kind::Fifo,
+    slates_vfs::inode::Kind::Socket,
+  ] {
+    let mut store = store();
+    let mut volume = scratch(&mut store);
+    let root = volume.root_inode(&store).unwrap();
+    let file = volume
+      .create_file_no(&mut store, root, "ordinary", 0o600)
+      .unwrap();
+    volume
+      .write(&mut store, file, 0, b"must not escape")
+      .unwrap();
+    volume
+      .mknod_no(&mut store, root, "ipc", 0o600, kind)
+      .unwrap();
+    let mut host = SimHost::new();
+    let before = disk(&host);
+    assert!(matches!(
+      slates_land::manifest::plan(&mut volume, &mut store, &mut host, &Filter::default()),
+      Err(slates_vfs::VfsError::SpecialFileOperation)
+    ));
+    assert_eq!(disk(&host), before);
+  }
+}
+
 fn hidden_names(host: &SimHost) -> Vec<String> {
   host
     .paths()

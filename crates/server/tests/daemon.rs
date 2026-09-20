@@ -1332,9 +1332,22 @@ const ACK_EVERY: usize = 32;
 /// draining. Expect: the owner's next drain marks `shed_before > 0` and `dropped_total > 0`, carries at
 /// most the reply quota, and the batches until `remaining` is 0 add up to what the ring held.
 fn telemetry_scenario() {
+  telemetry_scenario_with_quota(None);
+  // One more slot than a drain can itself emit: convergence must still be bounded at this quota.
+  telemetry_scenario_with_quota(Some(DRAIN_SPANS_MAX + 1));
+}
+
+/// Shape: the three span producers a telemetry verb can exercise on its owner (§4.14).
+const DRAIN_SPANS_MAX: usize = ["ring.request", "shard.op", "log.append"].len();
+
+/// Exercises the wire at the machine's full reply quota or a smaller admissible quota.
+fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
   let profile = profile();
   let instance = format!("srv-telemetry-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  if let Some(reply_quota) = reply_quota {
+    config.telemetry_spans_per_reply = reply_quota;
+  }
   let ring_capacity = usize::try_from(config.region.slots).unwrap();
   let quota = config.telemetry_spans_per_reply;
   let daemon = Daemon::start(
@@ -1518,17 +1531,7 @@ fn overflow_and_drain(
   ring_capacity: usize,
   quota: usize,
 ) {
-  for count in 1..=ring_capacity {
-    let ReplyBody::Status { .. } = client.call(&RequestBody::Status { volume: id }) else {
-      panic!("status");
-    };
-    if count % ACK_EVERY == 0 {
-      let up_to = client.sequence;
-      let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge { up_to }) else {
-        panic!("acknowledge");
-      };
-    }
-  }
+  overflow_telemetry(client, id, ring_capacity);
   let first = drain(client, owner);
   assert!(
     first.shed_before > 0,
@@ -1545,18 +1548,31 @@ fn overflow_and_drain(
   let mut drained = first.spans.len();
   let mut remaining = first.remaining;
   let mut rounds = 0usize;
+  let net_progress = quota
+    .checked_sub(DRAIN_SPANS_MAX)
+    .filter(|net| *net > 0)
+    .expect("a drain reply holds more spans than the drain itself can emit");
+  let maximum_rounds = usize::try_from(remaining).unwrap().div_ceil(net_progress);
   while remaining > 0 {
     let more = drain(client, owner);
     assert_eq!(more.shed_before, 0, "no loss between back-to-back drains");
+    assert!(
+      more.remaining <= remaining.saturating_sub(net_progress as u64),
+      "each drain makes net progress: before={remaining}, after={}, quota={quota}",
+      more.remaining
+    );
     drained += more.spans.len();
     remaining = more.remaining;
     rounds += 1;
-    assert!(rounds <= held / quota.max(1) + 2, "the drain converges");
+    assert!(
+      rounds <= maximum_rounds,
+      "the drain converges after accounting for its own spans"
+    );
   }
   // The drains are verbs on the owner too, each leaving its own spans in the ring after draining it
   // (never more than one verb's spans between two drains), so the total is the held count plus those.
   assert!(
-    drained >= held && drained <= held + rounds * 3,
+    drained >= held && drained <= held + rounds * DRAIN_SPANS_MAX,
     "the batches add up to what the ring held (held {held}, drained {drained}, rounds {rounds})"
   );
   println!(
@@ -1565,6 +1581,21 @@ fn overflow_and_drain(
     first.dropped_total,
     rounds + 1
   );
+}
+
+/// Fills the owner's telemetry ring while acknowledging completions so the RIFL table stays bounded.
+fn overflow_telemetry(client: &mut Client, id: VolumeId, ring_capacity: usize) {
+  for count in 1..=ring_capacity {
+    let ReplyBody::Status { .. } = client.call(&RequestBody::Status { volume: id }) else {
+      panic!("status");
+    };
+    if count % ACK_EVERY == 0 {
+      let up_to = client.sequence;
+      let ReplyBody::Acknowledged = client.call(&RequestBody::Acknowledge { up_to }) else {
+        panic!("acknowledge");
+      };
+    }
+  }
 }
 
 /// Destroying a snapshot over the wire, and the clone pin around it (§4.5/§4.2): a snapshot a clone

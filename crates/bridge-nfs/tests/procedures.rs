@@ -1507,11 +1507,9 @@ fn a_link_over_the_export_makes_a_second_name() {
   }
 }
 
-/// MKNOD over the export is refused NFS3ERR_NOTSUPP — a typed refusal, not PROC_UNAVAIL (which a
-/// truly-unhandled procedure gives) — because a RAM copy-on-write filesystem does not create device,
-/// FIFO or socket nodes. The reply is framed as the directory's wcc_data, so the stream stays synced.
+/// AC-3.10 / A-26: devices remain refused even when FIFO/socket names are supported.
 #[test]
-fn a_mknod_over_the_export_is_notsupp() {
+fn device_mknod_is_refused_badtype() {
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
@@ -1546,11 +1544,113 @@ fn a_mknod_over_the_export_is_notsupp() {
   let mut r = XdrReader::new(&reply);
   assert_eq!(
     r.u32().unwrap(),
-    Nfsstat3::Notsupp.wire(),
-    "MKNOD is a typed NOTSUPP refusal, not PROC_UNAVAIL"
+    Nfsstat3::Badtype.wire(),
+    "Device MKNOD is a typed BADTYPE refusal, not PROC_UNAVAIL"
   );
   assert!(!r.bool().unwrap(), "wcc: no pre-op attributes");
   PostOpAttr::decode(&mut r).unwrap(); // the directory's post-op attributes
+}
+
+/// AC-3.10 / A-26: create FIFO/socket names over the wire and observe their real types and mode.
+#[test]
+fn mknod_creates_fifo_and_socket_names_with_their_real_types() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let id = VolumeId { bytes: [0x11; 16] };
+  let mut bridge = VolumeBridge::new(id, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    id,
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root = root_handle(&mut export);
+  for (name, kind) in [("pipe", 7), ("socket", 6)] {
+    let mut args = XdrWriter::new();
+    root.encode(&mut args);
+    args.opaque(name.as_bytes());
+    args.u32(kind);
+    args.bool(true);
+    args.u32(0o640);
+    for _ in 0..3 {
+      args.bool(false);
+    }
+    args.u32(0);
+    args.u32(0);
+    let reply = export
+      .serve_nfs(NFSPROC3_MKNOD, &mut XdrReader::new(args.as_slice()))
+      .unwrap();
+    let mut reader = XdrReader::new(&reply);
+    assert_eq!(
+      reader.u32().unwrap(),
+      Nfsstat3::Ok.wire(),
+      "{name} creation"
+    );
+    assert!(reader.bool().unwrap());
+    let handle = Nfsfh3::decode(&mut reader).unwrap();
+    let made = PostOpAttr::decode(&mut reader).unwrap().0.unwrap();
+    assert_eq!(made.kind as u32, kind);
+    assert_eq!(made.mode, 0o640);
+    let mut args = XdrWriter::new();
+    handle.encode(&mut args);
+    let reply = export.getattr(&mut XdrReader::new(args.as_slice()));
+    let mut reader = XdrReader::new(&reply);
+    assert_eq!(reader.u32().unwrap(), Nfsstat3::Ok.wire());
+    assert_eq!(Fattr3::decode(&mut reader).unwrap().kind as u32, kind);
+  }
+}
+
+/// T-3.1 / A-26: every truncated MKNOD request refuses without creating its name.
+#[test]
+fn truncated_mknod_has_no_namespace_effect() {
+  let mut store = store();
+  let mut volume = volume(&mut store);
+  let id = VolumeId { bytes: [0x11; 16] };
+  let mut bridge = VolumeBridge::new(id, &mut volume, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    id,
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root = root_handle(&mut export);
+  let mut args = XdrWriter::new();
+  root.encode(&mut args);
+  args.opaque(b"pipe");
+  args.u32(7); // Format: NF3FIFO.
+  for _ in 0..4 {
+    args.bool(false);
+  }
+  args.u32(0);
+  args.u32(0);
+  let mut lookup = XdrWriter::new();
+  root.encode(&mut lookup);
+  lookup.opaque(b"pipe");
+  for end in 0..args.as_slice().len() {
+    let reply = export
+      .serve_nfs(NFSPROC3_MKNOD, &mut XdrReader::new(&args.as_slice()[..end]))
+      .unwrap();
+    assert_ne!(
+      XdrReader::new(&reply).u32().unwrap(),
+      Nfsstat3::Ok.wire(),
+      "truncation at {end}"
+    );
+    let reply = export
+      .serve_nfs(NFSPROC3_LOOKUP, &mut XdrReader::new(lookup.as_slice()))
+      .unwrap();
+    assert_eq!(
+      XdrReader::new(&reply).u32().unwrap(),
+      Nfsstat3::Noent.wire()
+    );
+  }
 }
 
 /// PATHCONF over the export reports the volume's POSIX limits from its own policy: an exact-name

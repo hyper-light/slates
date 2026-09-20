@@ -561,7 +561,7 @@ impl Volume {
               stack.push((path, h));
             }
           }
-          Child::File(no) | Child::Symlink(no) => {
+          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
             let witnessed = self.base.as_ref().is_some_and(|b| b.is_witnessed(no));
             let is_base = matches!(self.inode(store, no).map(|i| &i.body), Ok(Body::Base(_)));
             if witnessed {
@@ -807,7 +807,9 @@ impl Overlay<'_> {
           changed.push((no, l.fingerprint));
         }
         (Some(_), _) => {}
-        (None, Child::File(no) | Child::Symlink(no)) if self.unloaded_file(store, no) => {
+        (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
+          if self.unloaded_file(store, no) =>
+        {
           gone.push(e.name.to_owned());
         }
         (None, Child::Dir(h)) => {
@@ -1154,7 +1156,9 @@ impl Overlay<'_> {
   /// Whether a located entry is an untouched base entry (unwitnessed, base-backed).
   fn is_unloaded(&self, store: &Store, located: &Located) -> bool {
     match located.child {
-      Child::File(no) | Child::Symlink(no) => self.unloaded_file(store, no),
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+        self.unloaded_file(store, no)
+      }
       Child::Dir(_) | Child::Whiteout => false,
     }
   }
@@ -1237,6 +1241,22 @@ impl Overlay<'_> {
       return Err(VfsError::AlreadyExists);
     }
     self.vol.create_file(store, dir, name, mode)
+  }
+
+  /// Creates a FIFO/socket name while respecting existing base names (A-26).
+  pub fn mknod_no(
+    &mut self,
+    store: &mut Store,
+    dir_no: InodeNo,
+    name: &str,
+    mode: u32,
+    kind: Kind,
+  ) -> Result<InodeNo, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    if self.exists(store, dir, name)? {
+      return Err(VfsError::AlreadyExists);
+    }
+    self.vol.mknod_no(store, dir_no, name, mode, kind)
   }
 
   /// `mkdir` that refuses a name the base holds; a directory created in an overlay volume is
@@ -1379,7 +1399,7 @@ impl Overlay<'_> {
     let from_base = self.base_entry(store, from_dir, from_name)?;
     let _ = self.base_entry(store, to_dir, to_name)?;
     let origin = match (source.child, &from_base) {
-      (Child::File(no) | Child::Symlink(no), Some(_)) => {
+      (Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no), Some(_)) => {
         self.copy_up(store, no, CopyUp::Metadata)?;
         None
       }
@@ -1807,7 +1827,9 @@ impl Overlay<'_> {
     let no = match located.child {
       Child::File(no) => no,
       Child::Dir(_) => return Err(VfsError::IsDirectory),
-      Child::Symlink(_) => return Err(VfsError::DigestNotClean),
+      Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) => {
+        return Err(VfsError::DigestNotClean);
+      }
       Child::Whiteout => return Err(VfsError::NotFound),
     };
     if !self.is_clean(store, no) {
@@ -2364,7 +2386,7 @@ impl Overlay<'_> {
           }
         }
       }
-      Child::File(no) | Child::Symlink(no) => {
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
         // The disk holds the bytes: the entry leaves the overlay. The next lookup reloads it
         // from the listing as an untouched base entry, and its cached bytes go with it — retained
         // (§4.2) when a snapshot still pins them, secured before anything changes.
@@ -2522,6 +2544,8 @@ impl Overlay<'_> {
                 },
                 Kind::File => Child::File(no),
                 Kind::Symlink => Child::Symlink(no),
+                Kind::Fifo => Child::Fifo(no),
+                Kind::Socket => Child::Socket(no),
               };
               stack.push(Located { child, inode: no });
             }
@@ -2532,7 +2556,7 @@ impl Overlay<'_> {
             self.pin_windows(store, no, 0, size)?;
             pinned += 1;
           }
-          Child::Symlink(_) | Child::Whiteout => {}
+          Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
         }
       }
     }
@@ -2702,7 +2726,11 @@ impl Overlay<'_> {
       stale.dirs.push(dir_no);
       for entry in store.dirs.get(dir)?.iter(&store.blocks) {
         let child = match entry.child {
-          Child::File(no) | Child::Symlink(no) if self.unloaded_file(store, no) => no,
+          Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no)
+            if self.unloaded_file(store, no) =>
+          {
+            no
+          }
           Child::Dir(handle) => match store.dirs.get(handle) {
             Ok(node) if node.base == BaseDirState::Merged => node.inode,
             _ => continue,

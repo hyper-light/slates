@@ -154,6 +154,17 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     self.inner.flush(object, cx, fh)
   }
 
+  fn mknod(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    mode: u32,
+    kind: slates_vfs::inode::Kind,
+  ) -> Result<NodeAttr, VfsError> {
+    self.inner.mknod(parent, cx, name, mode, kind)
+  }
+
   fn mkdir(
     &mut self,
     parent: ObjectId,

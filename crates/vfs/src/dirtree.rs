@@ -59,6 +59,10 @@ const KIND_SYMLINK: u8 = 2;
 const KIND_WHITEOUT: u8 = 3;
 /// Format: entry kind in an index block, a child block.
 const KIND_BLOCK: u8 = 4;
+/// Format: entry kind, FIFO inode (A-26).
+const KIND_FIFO: u8 = 5;
+/// Format: entry kind, socket inode (A-26).
+const KIND_SOCKET: u8 = 6;
 
 /// Format: bytes of one little-endian word of the entry layout.
 const WORD_BYTES: usize = 8;
@@ -138,6 +142,8 @@ impl Slot {
       KIND_DIR => Child::Dir(handle_from_word(self.child)),
       KIND_FILE => Child::File(InodeNo(self.child)),
       KIND_SYMLINK => Child::Symlink(InodeNo(self.child)),
+      KIND_FIFO => Child::Fifo(InodeNo(self.child)),
+      KIND_SOCKET => Child::Socket(InodeNo(self.child)),
       _ => Child::Whiteout,
     }
   }
@@ -147,6 +153,8 @@ impl Slot {
       Child::Dir(h) => (KIND_DIR, handle_word(h)),
       Child::File(no) => (KIND_FILE, no.0),
       Child::Symlink(no) => (KIND_SYMLINK, no.0),
+      Child::Fifo(no) => (KIND_FIFO, no.0),
+      Child::Socket(no) => (KIND_SOCKET, no.0),
       Child::Whiteout => (KIND_WHITEOUT, 0),
     };
     Self {

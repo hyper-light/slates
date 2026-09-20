@@ -20,6 +20,8 @@ pub enum VfsError {
   Invalid,
   /// `EPERM` (a hard link to a directory).
   NotPermitted,
+  /// `EOPNOTSUPP`: regular-file I/O or host landing on a FIFO/socket name (A-26).
+  SpecialFileOperation,
   /// `ENAMETOOLONG` or a name with a separator or NUL.
   InvalidName,
   /// `EMLINK`.
@@ -89,6 +91,7 @@ impl VfsError {
       Self::NotEmpty => "ENOTEMPTY",
       Self::Invalid => "EINVAL",
       Self::NotPermitted => "EPERM",
+      Self::SpecialFileOperation => "EOPNOTSUPP",
       Self::InvalidName => "ENAMETOOLONG",
       Self::TooManyLinks => "EMLINK",
       Self::NoSpace => "ENOSPC",
