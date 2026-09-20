@@ -595,7 +595,6 @@ fn serve_local(
   args: &[u8],
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
-  eprintln!("[DEBUG-fsstress] xid={xid} procedure={procedure} begin");
   // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
   // this shard's volumes, opened as a root — the kernel's call is the entry point of its trace. Its
   // request identity for replay is the RPC transaction id under the mount's port (an NFS client
@@ -632,7 +631,6 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
-  eprintln!("[DEBUG-fsstress] xid={xid} procedure={procedure} served");
   // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
   // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
   let result = if matches!(served.0, AcceptStatus::Success)
@@ -642,7 +640,6 @@ fn serve_local(
   } else {
     served
   };
-  eprintln!("[DEBUG-fsstress] xid={xid} procedure={procedure} durable");
   if let Some(open) = open {
     let _ = state::with_state(|s| {
       let end_ns = s.clock.monotonic_ns();
@@ -816,6 +813,7 @@ pub async fn serve(listener: TcpListener, port: u16) {
         crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
       }
     }
+    futures::yield_now().await;
   }
 }
 
@@ -900,6 +898,9 @@ async fn serve_one(stream: TcpStream, port: u16) {
           return;
         }
         buffer.drain(..consumed);
+        // A ready read/write does not yield. Bound a busy connection to one RPC per turn,
+        // so its successive durability barriers cannot starve the heartbeat (§4.3, D-18).
+        futures::yield_now().await;
       }
       None => match stream.read(&mut chunk).await {
         Ok(0) | Err(_) => return,
@@ -912,6 +913,62 @@ async fn serve_one(stream: TcpStream, port: u16) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-2.6 / T-4.3: queue two complete RPC calls on one connection. Serving the first must
+  /// give another task a turn before the second, even though neither socket direction blocks.
+  #[test]
+  fn queued_rpc_calls_yield_between_replies() {
+    use std::future::Future;
+    use std::io::{Read, Write};
+    use std::task::{Context, Poll, Waker};
+
+    let listener = TcpListener::bind(
+      slates_rt::tcp::SocketAddrV4::new(slates_rt::tcp::Ipv4Addr::LOCALHOST, 0),
+      1,
+    )
+    .unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut client = std::net::TcpStream::connect(address).unwrap();
+    client
+      .set_read_timeout(Some(std::time::Duration::from_nanos(
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )))
+      .unwrap();
+    let mut requests = Vec::new();
+    for xid in [1u32, 2] {
+      let mut body = Vec::new();
+      // ONC RPC call, version 2; NFS version 3 NULL; AUTH_NONE credential and verifier.
+      for field in [xid, 0, 2, NFS_PROGRAM, 3, 0, 0, 0, 0, 0] {
+        body.extend_from_slice(&field.to_be_bytes());
+      }
+      requests.extend_from_slice(&write_record(&body));
+    }
+    client.write_all(&requests).unwrap();
+    client.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut context = Context::from_waker(Waker::noop());
+    let Poll::Ready(Ok(stream)) = std::pin::pin!(listener.accept()).poll(&mut context) else {
+      panic!("the established connection must be ready to accept");
+    };
+    let mut server = std::pin::pin!(serve_one(stream, address.port()));
+    for xid in [1u32, 2] {
+      assert!(
+        server.as_mut().poll(&mut context).is_pending(),
+        "the connection drained the next request without yielding"
+      );
+      let expected = write_record(&reply_bytes(xid, AcceptStatus::Success, &[]));
+      let mut received = vec![0; expected.len()];
+      client.read_exact(&mut received).unwrap();
+      assert_eq!(received, expected);
+      client.set_nonblocking(true).unwrap();
+      assert_eq!(
+        client.peek(&mut [0]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the next RPC has not run yet"
+      );
+      client.set_nonblocking(false).unwrap();
+    }
+    assert!(server.as_mut().poll(&mut context).is_ready());
+  }
 
   /// Encodes a `MNT` `dirpath` argument (an XDR string) for a test.
   fn mnt_args(path: &str) -> Vec<u8> {

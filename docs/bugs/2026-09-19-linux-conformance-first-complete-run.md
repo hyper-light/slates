@@ -79,3 +79,32 @@ The original artifacts are downloaded outside the repository. Local reproduction
 are in progress. Do not mark this lane green from unit tests, a skipped mount, the successful
 startup regression, or an epoll-only container run. The complete mounted commands and their
 non-vacuity checks must pass, with the intended io_uring backend verified separately.
+
+### Local landing result
+
+The original generic stress-volume quota reserved the entire inode slab on the 4 GiB
+container. A snapshot was admitted, but its first divergent inode copy refused `NoSpace`;
+this happened after the six files/directories had reached disk. The traced workload now
+requests the quota of its maximum eight live inodes (`8 × size_of::<Inode>() = 2,112 bytes`),
+leaving unpromised capacity for retention. This does not change production admission.
+The post-write refusal and target-host lifetime need their own landing regressions (TBD_FIXES).
+
+The final real mounted run passes: six entries written, all bytes/kinds/symlink checked,
+22 inside-target calls, six exact manifest paths matched, zero unmatched, zero unresolved,
+zero outside. RAM-backed targets are attributed to their grant before the generic shared-memory
+exception; unnamed temporary paths are recognized from successful `O_TMPFILE` results, never
+just a filename prefix. The pure trace suite passes 44/44; the landing oracle passes 15/15
+(10.92 s), with the nested scratch test also passing after retaining a snapshot.
+Evidence: `/private/tmp/slates-mounted-hermeticity-attributed-green.log` and the archive of the
+same name under `/private/tmp/slates-mounted-evidence/`. Container: Rust 1.98.0, Debian 13,
+aarch64 Linux 6.12.76-linuxkit, four CPUs and 4 GiB. Records use UTC 2026-09-20 (local date
+2026-09-19). This is the Linux NFS adapter, not the FUSE transport.
+
+### Local fsstress reproduction
+
+The pinned 50 × four-process seed-1 prefix passes (200 logged operations). The original
+500 × four-process seed-1 history reproduces heartbeat kills within seconds; all four
+workers block while successive recovered daemons consume a CPU and lapse again. The run
+was stopped after preserving its anchor log instead of waiting for CI's 42-minute failure.
+`/private/tmp/slates-fsstress-live-diagnosis.log` records the process and restart evidence;
+`/private/tmp/slates-mounted-evidence/fsstress-500.tar.gz` keeps its scratch. Diagnosis continues.

@@ -5894,6 +5894,8 @@ impl Published {
 /// Efficiency gate: it re-images
 /// every volume on each call; an incremental publish is the owed refinement (docs/wip/recovery.md).
 pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  let diagnostic_start = std::time::Instant::now();
+  eprintln!("[DEBUG-fsstress] publish begin");
   let (start, end) = state.content_range;
   if state.content.is_none() || end <= start {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
@@ -5928,6 +5930,7 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
     }
   }
   let shard = ShardImage::new(keyed);
+  eprintln!("[DEBUG-fsstress] captured elapsed_us={}", diagnostic_start.elapsed().as_micros());
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };
@@ -5936,6 +5939,7 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   };
   match shard.write_to(slice) {
     Ok(frame_bytes) => {
+      eprintln!("[DEBUG-fsstress] published bytes={frame_bytes} elapsed_us={}", diagnostic_start.elapsed().as_micros());
       published.frame_bytes = frame_bytes;
       Ok(published)
     }

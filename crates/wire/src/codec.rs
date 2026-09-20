@@ -2,6 +2,8 @@
 //! `bool` and `Option` tags of exactly 0 or 1, `u32`-prefixed strings and vectors, raw byte
 //! arrays, canonical floats (no negative zero, one NaN). Every decoder checks the input before
 //! allocating and refuses a non-canonical byte, so a hostile body costs at most its own length.
+//! Byte sequences copy their already-canonical payload in bulk (§4.9): scalar dispatch accounted
+//! for 442 ms of a 487 ms recovery publication at 19 MB in the mounted fsstress trace (2026-09-19).
 
 use crate::error::WireError;
 
@@ -15,6 +17,24 @@ pub trait Wire: Sized {
   fn encode(&self, out: &mut Vec<u8>);
   /// Reads one value from the front of `input`, advancing it.
   fn decode(input: &mut &[u8]) -> Result<Self, WireError>;
+
+  /// Appends elements without a length prefix. Byte elements override this with a bulk copy;
+  /// structured elements retain their individual canonical encodings.
+  fn encode_slice(values: &[Self], out: &mut Vec<u8>) {
+    for value in values {
+      value.encode(out);
+    }
+  }
+
+  /// Decodes `len` elements after the caller has checked their length prefix. Reservation is
+  /// bounded by the input even for direct callers; byte elements override the scalar loop.
+  fn decode_vec(input: &mut &[u8], len: usize) -> Result<Vec<Self>, WireError> {
+    let mut values = Vec::with_capacity(len.min(input.len()));
+    for _ in 0..len {
+      values.push(Self::decode(input)?);
+    }
+    Ok(values)
+  }
 
   /// The whole encoding as bytes.
   fn to_bytes(&self) -> Vec<u8> {
@@ -76,7 +96,35 @@ macro_rules! integer {
   )*};
 }
 
-integer!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
+integer!(u16, u32, u64, u128, i8, i16, i32, i64, i128);
+
+#[cfg(test)]
+std::thread_local! {
+  // Test-only work counters: another libtest thread cannot change this measurement.
+  static BYTE_ENCODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+  static BYTE_DECODINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl Wire for u8 {
+  const SCHEMA: &'static str = "u8";
+  const SCHEMA_HASH: u64 = crate::schema::fnv64("u8");
+  fn encode(&self, out: &mut Vec<u8>) {
+    #[cfg(test)]
+    BYTE_ENCODINGS.set(BYTE_ENCODINGS.get() + 1);
+    out.push(*self);
+  }
+  fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
+    #[cfg(test)]
+    BYTE_DECODINGS.set(BYTE_DECODINGS.get() + 1);
+    Ok(take(input, 1)?[0])
+  }
+  fn encode_slice(values: &[Self], out: &mut Vec<u8>) {
+    out.extend_from_slice(values);
+  }
+  fn decode_vec(input: &mut &[u8], len: usize) -> Result<Vec<Self>, WireError> {
+    Ok(take(input, len)?.to_vec())
+  }
+}
 
 impl Wire for bool {
   const SCHEMA: &'static str = "bool";
@@ -144,17 +192,11 @@ impl<T: Wire> Wire for Vec<T> {
   const SCHEMA_HASH: u64 = crate::schema::mix(crate::schema::fnv64("Vec"), &[T::SCHEMA_HASH]);
   fn encode(&self, out: &mut Vec<u8>) {
     len_prefix(self.len(), out);
-    for item in self {
-      item.encode(out);
-    }
+    T::encode_slice(self, out);
   }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     let len = take_len(input)?;
-    let mut items = Vec::with_capacity(len.min(input.len()));
-    for _ in 0..len {
-      items.push(T::decode(input)?);
-    }
-    Ok(items)
+    T::decode_vec(input, len)
   }
 }
 
@@ -216,6 +258,33 @@ fn len_prefix(len: usize, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-2.12 / §4.9: recovery bodies encode all byte values unchanged, with no per-byte
+  /// scalar dispatch. Count the scalar path as well, so a dead counter cannot certify bulk work.
+  #[test]
+  fn byte_vectors_copy_their_payload_without_scalar_calls() {
+    let bytes: Vec<u8> = (u8::MIN..=u8::MAX).collect();
+    let mut expected = u32::try_from(bytes.len()).unwrap().to_le_bytes().to_vec();
+    expected.extend_from_slice(&bytes);
+    BYTE_ENCODINGS.set(0);
+    let encoded = bytes.to_bytes();
+    let encoded_scalars = BYTE_ENCODINGS.get();
+    BYTE_DECODINGS.set(0);
+    let decoded = Vec::<u8>::from_bytes(&encoded).unwrap();
+    let decoded_scalars = BYTE_DECODINGS.get();
+    assert_eq!(encoded, expected);
+    assert_eq!(decoded, bytes);
+    assert_eq!(encoded_scalars, 0, "encoding bulk bytes used the scalar loop");
+    assert_eq!(decoded_scalars, 0, "decoding bulk bytes used the scalar loop");
+
+    let scalar = 7u8.to_bytes();
+    assert_eq!(u8::from_bytes(&scalar).unwrap(), 7);
+    assert_eq!(BYTE_ENCODINGS.get(), 1, "the scalar probe must count work");
+    assert_eq!(BYTE_DECODINGS.get(), 1, "the scalar probe must count work");
+    assert_eq!(Vec::<u8>::from_bytes(&[0, 0, 0, 0]).unwrap(), Vec::<u8>::new());
+    assert!(matches!(Vec::<u8>::from_bytes(&[2, 0, 0, 0, 7]), Err(WireError::Truncated { .. })));
+    assert!(matches!(Vec::<u8>::from_bytes(&[0, 0, 0, 0, 7]), Err(WireError::TrailingBytes { .. })));
+  }
 
   #[test]
   fn primitives_round_trip_in_little_endian() {

@@ -84,8 +84,17 @@ Command (bounded Linux container, quantum image): `docker run --rm --network=non
   has 3,595 failures requiring a capability/correctness review; hermeticity finds four writes
   outside the target and a zero-write landing its harness did not reject. Reproduce each
   through the real Linux NFS adapter with io_uring available. Also cover strace's actual
-  deleted-descriptor annotation. Record:
+  deleted-descriptor annotation. The mounted hermeticity leg now passes with six entries
+  verified and traced, zero outside/unresolved/unmatched calls; fsstress reproduces locally
+  at 500 × four processes while its 50-operation prefix passes. Record:
   `docs/bugs/2026-09-19-linux-conformance-first-complete-run.md`.
+- [ ] **Landing advancement and snapshot authority (2026-09-19).** A saturated inode
+  reservation can refuse retention during `land_advance` after disk writes and syncs, returning
+  `NoSpace` instead of a truthful completed/partial report. Reserve advancement capacity before
+  writing and prove unchanged state on refusal. Also test that a requested snapshot, rather than
+  a subsequently changed head, supplies the manifest and bytes; preserve the target host's
+  descriptors after advancing a scratch volume to an overlay. These are separate from the
+  contained-writes and missing-directory regressions fixed in the current change.
 - [x] **Runtime test isolation (2026-09-19).** The registry contention fixture sent wakes to
   unrelated unit-test rings, and a driver test assumed its timed wait could receive no other
   kicks. The stress history now owns its integration-test process; timed waits retain one
@@ -210,11 +219,13 @@ can lag subsequent implementations; use their acceptance criteria and current so
   job reported **6202 unexpected pjdfstest failures / 8798 cases**; correcting sudo invocation
   does not prove all failures were caused by it. Diagnose residual failures without widening
   expected-failure lists to hide them.
-- [ ] Rerun full mounted hermeticity after the 2026-09-19 tracer repair. The shared boot clock
+- [x] Rerun full mounted hermeticity after the 2026-09-19 tracer repair. The shared boot clock
   alone did not fix startup: ordinary strace stopped even unselected allocator syscalls.
   `--seccomp-bpf` retains the filesystem trace selection and permits first-heartbeat startup;
   explicit `--kill-on-exit` ties tracee lifetime to the harness. The live Linux startup and
-  write-observation regression passes (1.37 s). Full mounted/landing evidence remains owed.
+  write-observation regression passes (1.37 s). The real Linux NFS-mounted lifecycle now
+  lands and verifies six entries, with all six matched in the trace and zero outside, unresolved
+  or unmatched writes (`2026-09-19-linux-conformance-first-complete-run.md`).
   Anchor format 3 intentionally rejects incompatible format-2 retained state.
 - [ ] Rerun affected CI on the final committed source. Local Linux compilation and targeted
   histories supplement, but do not replace, platform-specific mounted/driver gates.

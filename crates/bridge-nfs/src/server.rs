@@ -133,6 +133,9 @@ pub async fn serve_connection_async(
         };
         stream.write_all(&write_record(&reply)).await?;
         buffer.drain(..consumed);
+        // Readiness can remain true across many calls. One completed RPC is the cooperative
+        // work boundary even when neither direction reaches WouldBlock (§4.3, §4.6).
+        slates_rt::futures::yield_now().await;
       }
       Ok((None, consumed)) => {
         buffer.drain(..consumed);

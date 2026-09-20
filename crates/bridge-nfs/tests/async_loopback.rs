@@ -241,3 +241,56 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
   drop(stream);
   rt.shutdown();
 }
+
+/// T-3.4 / §4.3: two queued RPCs must leave a turn between replies, even when the socket
+/// stays ready. Otherwise an async connection can monopolize its shard until the peer stops.
+#[test]
+fn queued_calls_yield_between_replies() {
+  use std::future::Future;
+  use std::task::{Context, Poll, Waker};
+
+  use slates_bridge_nfs::rpc::{AcceptStatus, reply_bytes, write_record};
+
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let address = listener.local_addr().unwrap();
+  let mut client = TcpStream::connect(address).unwrap();
+  client
+    .set_read_timeout(Some(std::time::Duration::from_nanos(config().step_budget_ns)))
+    .unwrap();
+  let mut requests = Vec::new();
+  for xid in [1u32, 2] {
+    let mut body = Vec::new();
+    for field in [xid, 0, 2, NFS_PROGRAM, 3, 0, 0, 0, 0, 0] {
+      body.extend_from_slice(&field.to_be_bytes());
+    }
+    requests.extend_from_slice(&write_record(&body));
+  }
+  client.write_all(&requests).unwrap();
+  client.shutdown(std::net::Shutdown::Write).unwrap();
+  let mut context = Context::from_waker(Waker::noop());
+  let Poll::Ready(Ok(mut stream)) = std::pin::pin!(listener.accept()).poll(&mut context) else {
+    panic!("the established connection must be ready to accept");
+  };
+  let mut store = make_store();
+  let mut volume = make_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOL_ID, &mut volume, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VOL_ID,
+    Principal::Uid { uid: 0 },
+    Rights { read: true, write: true },
+  )
+  .unwrap();
+  let mut server = std::pin::pin!(serve_connection_async(&mut stream, &mut export, address.port()));
+  for xid in [1u32, 2] {
+    assert!(server.as_mut().poll(&mut context).is_pending());
+    let expected = write_record(&reply_bytes(xid, AcceptStatus::Success, &[]));
+    let mut received = vec![0; expected.len()];
+    client.read_exact(&mut received).unwrap();
+    assert_eq!(received, expected);
+    client.set_nonblocking(true).unwrap();
+    assert_eq!(client.peek(&mut [0]).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    client.set_nonblocking(false).unwrap();
+  }
+  assert!(matches!(server.as_mut().poll(&mut context), Poll::Ready(Ok(()))));
+}
