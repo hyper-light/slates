@@ -2221,6 +2221,59 @@ fn merge_declare_scenario() {
   daemon.stop();
 }
 
+/// AC-6.3 / AC-6.13 / A-26: declare IPC nodes over the ring, expect metadata-sensitive conflicts
+/// and a charged historical inode after unlink. No endpoint bytes enter the work content map.
+#[test]
+fn declared_ipc_metadata_merges_over_the_wire_and_retains_its_old_version() {
+  use slates_ipc::protocol::{IpcNode, IpcNodeKind, WorkOp};
+  let (daemon, instance) = daemon("merge-ipc");
+  let mut client = Client::connect(&instance);
+  let green = green(&mut client, "ipc-green", false);
+  let first = work_over(&mut client, green, "ipc-first");
+  let other = work_over(&mut client, green, "ipc-other");
+  for (work, uid) in [(first, 123), (other, 456)] {
+    declare(
+      &mut client,
+      work,
+      WorkOp::Mknod {
+        path: "/pipe".into(),
+        node: IpcNode {
+          kind: IpcNodeKind::Fifo,
+          mode: 0o640,
+          uid,
+          gid: 789,
+          atime: -1,
+          mtime: 2,
+          ctime: 3,
+          btime: 0,
+        },
+      },
+    );
+  }
+  submit_accepted(&mut client, first, 1);
+  let reply = client.call(&submit_of(other));
+  assert!(
+    matches!(reply, ReplyBody::Submitted { version: None, ref conflicts }
+    if conflicts.iter().any(|window| window.path == "pipe")),
+    "metadata differs: {reply:?}"
+  );
+  declare(
+    &mut client,
+    first,
+    WorkOp::Unlink {
+      path: "/pipe".into(),
+    },
+  );
+  submit_accepted(&mut client, first, 2);
+  let retained = daemon.merge_retention(green).unwrap();
+  assert_eq!(
+    retained.history,
+    size_of::<slates_merge::special::SpecialNode>() as u64
+  );
+  assert_balanced(&retained, 0);
+  daemon.stop();
+}
+
 /// Shape: the records room the metadata-ledger daemon gets above its slabs: 64 KiB — enough for a
 /// few 1 MiB volumes (each reserves its 1 % journal budget, its object and a page of snapshot
 /// slots, about 15 KiB), so the ledger binds within a handful of creates.

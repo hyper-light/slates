@@ -3337,6 +3337,27 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
   // path and the origin walk its entries; a symlink's target is a link string, kept as given.
   let key = |path: String| crate::merge_service::canonical_path(&path).to_owned();
   let volume_op = match op {
+    WorkOp::Mknod { path, node } => {
+      use slates_ipc::protocol::IpcNodeKind;
+      use slates_merge::special::{SpecialKind, SpecialNode};
+      let path = key(path);
+      VolumeOp::Mknod {
+        path,
+        mode: node.mode,
+        node: SpecialNode {
+          kind: match node.kind {
+            IpcNodeKind::Fifo => SpecialKind::Fifo,
+            IpcNodeKind::Socket => SpecialKind::Socket,
+          },
+          uid: node.uid,
+          gid: node.gid,
+          atime: node.atime,
+          mtime: node.mtime,
+          ctime: node.ctime,
+          btime: node.btime,
+        },
+      }
+    }
     WorkOp::Unlink { path } => {
       let path = key(path);
       w.content.remove(&path);
@@ -3407,7 +3428,9 @@ fn assemble_post_state(
     |kind: OpKind| matches!(kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
   let mut size = 0u64;
   for op in &doc.ops {
-    if op.src != u64::MAX && (is_file_content(op.kind) || op.kind == OpKind::SetXattr) {
+    if op.src != u64::MAX
+      && (is_file_content(op.kind) || matches!(op.kind, OpKind::SetXattr | OpKind::Mknod))
+    {
       size = size.max(op.src.saturating_add(op.len));
     }
   }
@@ -3419,12 +3442,26 @@ fn assemble_post_state(
     let Some(path) = doc.paths.path(op.path) else {
       continue;
     };
+    let encoded_node;
     // The bytes this op contributes, and the offset into them: a file's slice, or an xattr's value.
     let (source, source_at): (&[u8], u64) = if is_file_content(op.kind) {
       let Some(file) = content.get(path) else {
         continue;
       };
       (file.as_slice(), op.at)
+    } else if op.kind == OpKind::Mknod {
+      let Some(node) = journal.iter().rev().find_map(|entry| match entry {
+        VolumeOp::Mknod {
+          path: declared,
+          node,
+          ..
+        } if declared == path => Some(node),
+        _ => None,
+      }) else {
+        continue;
+      };
+      encoded_node = node.encode();
+      (&encoded_node, 0)
     } else if op.kind == OpKind::SetXattr {
       let Ok(name_index) = u16::try_from(op.at) else {
         continue;
@@ -3568,14 +3605,16 @@ fn submit(
   if let Err(e) = state.db.partition().check(&record, now) {
     return refused(refusal_of_db(&e));
   }
-  // The retention an accept can add — the values its content sets supersede, kept in the history for
-  // reconstruction — is at most the sealed post-state the increment carries; that much is **secured**
-  // against the shard's budget before the verdict (§4.2 all-cost admission, A-16: charged by the
-  // retaining operation before it mutates anything; AUD-16), refused typed when the budget cannot
-  // cover it, and trued up to what the commit actually retained by the settle below.
-  let secured = u64::try_from(inc.post_state.len()).unwrap_or(u64::MAX);
+  // Charge superseded values before the verdict. Incoming bytes do not bound the retained
+  // history: unlink carries none and a short overwrite retains the complete previous file.
+  let Some(engine) = state.greens.get(&green_id) else {
+    return refused(Refusal::NotFound);
+  };
+  let secured = u64::try_from(engine.history_reservation(&inc)).unwrap_or(u64::MAX);
   // Make room first: fold whatever the retention budget allows (never a live reader's version).
-  let _ = crate::merge_service::settle_green_retention(state, green_id);
+  if let Err(available) = crate::merge_service::settle_green_retention(state, green_id) {
+    return refused(Refusal::BudgetExceeded { available });
+  }
   if let Err(available) = crate::merge_service::secure_green_retention(state, green_id, secured) {
     report_first_budget_refusal(state, "retention", secured, available);
     return refused(Refusal::BudgetExceeded { available });

@@ -1018,6 +1018,44 @@ pub enum WorkOp {
     /// The attribute name.
     name: String,
   },
+  /// Create an IPC namespace inode with explicit metadata and no endpoint state.
+  Mknod {
+    /// The new path.
+    path: String,
+    /// The metadata recorded by the declaring volume.
+    node: IpcNode,
+  },
+}
+
+/// A-26: a declared IPC kind. Device nodes have no wire representation here.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpcNodeKind {
+  /// A named pipe without queued bytes.
+  Fifo,
+  /// A socket name without a listener or connection.
+  Socket,
+}
+
+/// Metadata supplied by a work's declared IPC creation (§4.16, A-26). These are volume
+/// metadata, not host credentials or endpoint authority. Replay never reads a local clock.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpcNode {
+  /// The IPC kind.
+  pub kind: IpcNodeKind,
+  /// Permission bits.
+  pub mode: u32,
+  /// Volume owner id.
+  pub uid: u32,
+  /// Volume group id.
+  pub gid: u32,
+  /// Last access time, in volume-clock nanoseconds.
+  pub atime: i64,
+  /// Last modification time.
+  pub mtime: i64,
+  /// Last metadata change time.
+  pub ctime: i64,
+  /// Creation time.
+  pub btime: i64,
 }
 
 /// A volume's placement (§4.8, D-18): every reply carries it from the first version, so the

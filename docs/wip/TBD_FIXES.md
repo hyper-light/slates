@@ -271,8 +271,17 @@ actual type reporting. Linux mounts exercise local pipe/socket communication and
 isolation. Landing refuses before writing; host special files stay excluded. Devices remain
 refused; device metadata is a separate decision. FSKit/WinFsp report explicit unsupported errors.
 
-Owed: the separate merge service's Origin/engine/work protocol still refuses IPC snapshots;
-canonical metadata/history/conflict/replay integration must land together. Review residual
+Merge integration (2026-09-20): origin format 2 and explicit `Mknod` declarations preserve
+IPC metadata through identity, conflicts, histories, replay and rebase. Snapshot aliases are
+preserved; alias reads and invalidations share the primary inode. Retention admission now
+reserves superseded values, including payload-free removals. Regression evidence:
+[merge IPC record](../bugs/2026-09-20-merge-ipc-origins-refused.md).
+
+Owed: the inode-aware merge namespace journal (IPC rename, metadata declarations through an
+alias, and primary-name unlink with aliases); mounted green/work volumes and dedicated
+Python/Node/CLI/MCP IPC creation convenience methods. Existing non-IPC removals retain stale
+mode/xattr values, and origin namespace validation needs hostile cross-table tests.
+Review residual
 pjdfstest failures, including cascades from deliberately unsupported devices and the two NFS
 limits. The full unchanged rerun improved from 5,175 passes / 3,595 failures to **6,970 passes /
 1,800 failures** in 172,343 ms. No expected-failure list has been expanded. Windows cross-check

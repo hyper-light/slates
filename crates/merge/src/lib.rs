@@ -45,3 +45,5 @@ pub use splice::{Extent, Source, splice};
 pub use verdict::{
   MergeConflictClass, PathVerdict, Verdict, compare_bytes, fast_path, path_verdict,
 };
+
+pub mod special;

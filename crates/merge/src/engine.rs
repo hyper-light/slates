@@ -35,6 +35,8 @@
 //! (owed). The per-path content history kept for base reconstruction is a full byte copy per change;
 //! the design's chain shares it copy-on-write, the measured optimization (owed).
 
+use crate::special::SpecialNode;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops_doc::{Op, OpKind, OpsDoc};
@@ -109,6 +111,9 @@ impl Increment {
     let doc = OpsDoc::decode(reader.bytes(doc_len)?)?;
     let post_len = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     let post_state = reader.bytes(post_len)?.to_vec();
+    for op in doc.ops.iter().filter(|op| op.kind == OpKind::Mknod) {
+      special_payload(&doc, &post_state, op)?;
+    }
     let evidence_count = usize::try_from(reader.u64()?).map_err(|_| DocDecodeError::Truncated)?;
     if evidence_count > reader.remaining() / EVIDENCE_BYTES {
       return Err(DocDecodeError::Truncated);
@@ -211,6 +216,11 @@ const IDENTITY_TAG_SYMLINK: &[u8] = b"S";
 const IDENTITY_TAG_HARDLINK: &[u8] = b"L";
 /// Format: see [`IDENTITY_TAG_FILE`].
 const IDENTITY_TAG_XATTR: &[u8] = b"X";
+/// Format: IPC metadata has a separate identity domain from regular files and links.
+const IDENTITY_TAG_SPECIAL: &[u8] = b"I";
+/// Derived: a retained IPC metadata payload occupies its Rust value's size, including alignment
+/// padding. Anchor: the actual `SpecialNode` layout on the target, measured by `size_of`.
+const SPECIAL_NODE_BYTES: usize = size_of::<SpecialNode>();
 
 /// A green volume's merge state. Each dimension is a current value plus the version it last changed
 /// at (the base-comparison index), and a per-path/key *history* of `(version, value)` entries so any
@@ -221,6 +231,9 @@ const IDENTITY_TAG_XATTR: &[u8] = b"X";
 pub struct Green {
   content: BTreeMap<String, Vec<u8>>,
   content_history: ContentHistory,
+  specials: BTreeMap<String, SpecialNode>,
+  special_history: ValueHistory<SpecialNode>,
+  special_changed: BTreeMap<String, u64>,
   dirs: BTreeSet<String>,
   modes: BTreeMap<String, u32>,
   symlinks: BTreeMap<String, String>,
@@ -258,7 +271,7 @@ pub struct Green {
   /// Rejected results evicted or never retained for want of budget — the non-vacuity counter the
   /// bound's regression asserts.
   rejected_evicted: u64,
-  /// The bytes the content history retains beyond the current files — every earlier value of every
+  /// The bytes the content and IPC histories retain beyond the current values — every earlier value of every
   /// path still held for reconstruction (`content_at`, `base_at`) — kept as a running total so the
   /// service can charge it as retention without walking the histories.
   history_bytes: usize,
@@ -286,9 +299,9 @@ fn rejected_entry_bytes(windows: &[ConflictWindow]) -> usize {
 /// cache. The service charges `history` and `rejected` as retention against the shard's budget.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RetainedBytes {
-  /// The current files' bytes.
+  /// Current file bytes and fixed IPC metadata payloads.
   pub content: usize,
-  /// The earlier values retained in the content history for reconstruction.
+  /// Earlier file content and IPC metadata retained for reconstruction.
   pub history: usize,
   /// The rejected-result cache's bytes.
   pub rejected: usize,
@@ -426,6 +439,8 @@ fn span_bytes(from: &[u8], src: u64, len: u64) -> &[u8] {
 struct Resolved {
   content: BTreeMap<String, Vec<Op>>,
   creates: BTreeSet<String>,
+  specials: BTreeMap<String, SpecialNode>,
+  invalid: BTreeSet<String>,
   unlinks: BTreeSet<String>,
   mkdirs: BTreeSet<String>,
   rmdirs: BTreeSet<String>,
@@ -452,12 +467,19 @@ impl Resolved {
   /// chmod'd (or xattr'd) in one increment is not a delete/modify conflict against the not-yet-
   /// committed path: the deriver composed them into one increment, so they belong together.
   fn establishes(&self, path: &str) -> bool {
-    self.creates.contains(path) || self.mkdirs.contains(path) || self.renames.contains_key(path)
+    self.creates.contains(path)
+      || self.mkdirs.contains(path)
+      || self.renames.contains_key(path)
+      || self.specials.contains_key(path)
   }
 }
 
 /// One accepted per-path effect to apply at commit.
 enum Effect {
+  /// Set an IPC inode without acquiring a live endpoint.
+  Special(String, SpecialNode),
+  /// Remove an IPC inode.
+  RemoveSpecial(String),
   /// Set the file to these bytes, recording these ops (head coordinates) as its content delta.
   SetContent(String, Vec<u8>, Vec<Op>),
   /// Remove the file.
@@ -499,6 +521,11 @@ impl Green {
     let mut green = Green::default();
     let mut canonical = origin.clone();
     canonical.canonicalize();
+    for (path, node) in canonical.specials {
+      green.specials.insert(path.clone(), node);
+      green.special_changed.insert(path.clone(), 0);
+      green.special_history.insert(path, vec![(0, Some(node))]);
+    }
     for (path, bytes) in canonical.files {
       green.content.insert(path.clone(), bytes.clone());
       green.last_changed.insert(path.clone(), 0);
@@ -552,6 +579,11 @@ impl Green {
       hasher.update(&(bytes.len() as u64).to_le_bytes());
       hasher.update(bytes);
     };
+    for (path, node) in &self.specials {
+      hasher.update(IDENTITY_TAG_SPECIAL);
+      field(&mut hasher, path.as_bytes());
+      field(&mut hasher, &node.encode());
+    }
     for (path, bytes) in &self.content {
       hasher.update(IDENTITY_TAG_FILE);
       field(&mut hasher, path.as_bytes());
@@ -593,6 +625,7 @@ impl Green {
   pub fn changed_between(&self, from: u64, to: u64) -> Vec<String> {
     let mut changed: BTreeSet<String> = BTreeSet::new();
     changed.extend(paths_changed_in(&self.content_history, from, to));
+    changed.extend(paths_changed_in(&self.special_history, from, to));
     changed.extend(paths_changed_in(&self.dir_history, from, to));
     changed.extend(paths_changed_in(&self.mode_history, from, to));
     changed.extend(paths_changed_in(&self.symlink_history, from, to));
@@ -604,6 +637,16 @@ impl Green {
         .filter(|(_, history)| history_touches(history, from, to))
         .map(|((path, _), _)| path.clone()),
     );
+    for (alias, history) in &self.hardlink_history {
+      let targets = [history_at(history, from), history_at(history, to)];
+      if targets
+        .iter()
+        .flatten()
+        .any(|target| self.special_history.contains_key(target) && changed.contains(target))
+      {
+        changed.insert(alias.clone());
+      }
+    }
     changed.into_iter().collect()
   }
 
@@ -614,6 +657,11 @@ impl Green {
   /// symlinks, hard links and xattrs at an older version are still owed there.)
   pub fn current_base(&self) -> crate::increment::Base {
     crate::increment::Base {
+      specials: self
+        .specials
+        .iter()
+        .map(|(path, node)| (path.clone(), *node))
+        .collect(),
       files: self
         .content
         .iter()
@@ -643,6 +691,21 @@ impl Green {
     }
   }
 
+  /// A FIFO/socket inode's captured metadata, or `None` for any other kind. A hard-link
+  /// alias refers to its primary inode; it does not hold an independent metadata copy.
+  pub fn special(&self, path: &str) -> Option<SpecialNode> {
+    self
+      .specials
+      .get(path)
+      .or_else(|| {
+        self
+          .hardlinks
+          .get(path)
+          .and_then(|target| self.specials.get(target))
+      })
+      .copied()
+  }
+
   /// A file's current bytes, or `None` when it is absent.
   pub fn content(&self, path: &str) -> Option<&[u8]> {
     self.content.get(path).map(Vec::as_slice)
@@ -662,9 +725,18 @@ impl Green {
     self.dirs.contains(path)
   }
 
+  /// IPC aliases share the primary inode's metadata; no independent value is stored at an alias.
+  fn metadata_path<'a>(&'a self, path: &'a str) -> &'a str {
+    self
+      .hardlinks
+      .get(path)
+      .filter(|target| self.specials.contains_key(*target))
+      .map_or(path, String::as_str)
+  }
+
   /// A path's current mode, or `None` when none has been set.
   pub fn mode(&self, path: &str) -> Option<u32> {
-    self.modes.get(path).copied()
+    self.modes.get(self.metadata_path(path)).copied()
   }
 
   /// A symbolic link's target at the path, or `None` when it is not a symlink.
@@ -681,7 +753,7 @@ impl Green {
   pub fn xattr(&self, path: &str, name: &str) -> Option<&[u8]> {
     self
       .xattrs
-      .get(&(path.to_owned(), name.to_owned()))
+      .get(&(self.metadata_path(path).to_owned(), name.to_owned()))
       .map(Vec::as_slice)
   }
 
@@ -756,6 +828,11 @@ impl Green {
       })
       .collect();
     crate::increment::Base {
+      specials: self
+        .special_history
+        .iter()
+        .filter_map(|(path, history)| history_at(history, version).map(|node| (path.clone(), node)))
+        .collect(),
       files,
       dirs,
       modes,
@@ -812,6 +889,14 @@ impl Green {
       let path = name(u64::from(op.path));
       match op.kind {
         _ if is_content(op.kind) => r.content.entry(path).or_default().push(*op),
+        OpKind::Mknod => match special_payload(&inc.doc, &inc.post_state, op) {
+          Ok(node) => {
+            r.specials.insert(path, node);
+          }
+          Err(_) => {
+            r.invalid.insert(path);
+          }
+        },
         OpKind::Create => {
           r.creates.insert(path);
         }
@@ -846,6 +931,19 @@ impl Green {
         }
       }
     }
+    for path in r.specials.keys() {
+      if r.creates.contains(path)
+        || r.content.contains_key(path)
+        || r.mkdirs.contains(path)
+        || r.symlinks.contains_key(path)
+        || r.hardlinks.contains_key(path)
+        || r.renames.contains_key(path)
+        || r.unlinks.contains(path)
+        || r.rmdirs.contains(path)
+      {
+        r.invalid.insert(path.clone());
+      }
+    }
     r
   }
 
@@ -856,6 +954,7 @@ impl Green {
       || self.dirs.iter().any(live)
       || self.symlinks.keys().any(live)
       || self.hardlinks.keys().any(live)
+      || self.specials.keys().any(live)
   }
 
   /// Whether an intervening change occupied `path` with any non-file kind.
@@ -863,6 +962,7 @@ impl Green {
     self.dirs.contains(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
+      || self.specials.contains_key(path)
   }
 
   /// Merges a file rename to `dst` from `from` (source content captured at merge time), collecting
@@ -932,6 +1032,19 @@ impl Green {
   /// a path that names nothing is a no-op (idempotent removal). A directory is not unlinked (rmdir
   /// removes directories); a path that is a directory falls through to the no-op.
   fn merge_unlink(&self, path: &str, base: u64) -> Result<Option<Effect>, ConflictWindow> {
+    if self.specials.contains_key(path) {
+      if self.special_changed.get(path).copied().unwrap_or(0) > base
+        || self.mode_changed.get(path).copied().unwrap_or(0) > base
+        || self
+          .xattr_changed
+          .iter()
+          .any(|((changed_path, _), version)| changed_path == path && *version > base)
+        || self.hardlinks.values().any(|target| target == path)
+      {
+        return Err(Green::window(path, MergeConflictClass::DeleteModify));
+      }
+      return Ok(Some(Effect::RemoveSpecial(path.to_owned())));
+    }
     if self.content.contains_key(path) {
       if self.last_changed.get(path).copied().unwrap_or(0) > base {
         return Err(Green::window(path, MergeConflictClass::DeleteModify));
@@ -1073,6 +1186,7 @@ impl Green {
     if self.content.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
+      || self.specials.contains_key(path)
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -1091,6 +1205,7 @@ impl Green {
     if self.content.contains_key(path)
       || self.symlinks.contains_key(path)
       || self.hardlinks.contains_key(path)
+      || self.specials.contains_key(path)
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -1104,6 +1219,27 @@ impl Green {
     Ok(Some(Effect::RemoveDir(path.to_owned())))
   }
 
+  /// Metadata on a former IPC inode cannot silently apply to another kind that now owns its
+  /// name, even when the replacement already has the requested value. An absent name is handled
+  /// by each verb's existing delete/idempotence rule.
+  fn special_kind_changed(&self, path: &str, base: u64) -> bool {
+    let current = self.specials.get(path).map(|node| node.kind);
+    if current.is_none()
+      && !self.content.contains_key(path)
+      && !self.dirs.contains(path)
+      && !self.symlinks.contains_key(path)
+      && !self.hardlinks.contains_key(path)
+    {
+      return false;
+    }
+    let previous = self
+      .special_history
+      .get(path)
+      .and_then(|history| history_at(history, base))
+      .map(|node| node.kind);
+    previous != current
+  }
+
   /// Merges a mode change.
   fn merge_setmode(
     &self,
@@ -1112,8 +1248,15 @@ impl Green {
     mode: u32,
     established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path) && !self.dirs.contains(path) && !established {
+    if !self.content.contains_key(path)
+      && !self.dirs.contains(path)
+      && !self.specials.contains_key(path)
+      && !established
+    {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
+    if !established && self.special_kind_changed(path, base) {
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     if self.mode_changed.get(path).copied().unwrap_or(0) > base {
       if self.modes.get(path).copied() == Some(mode) {
@@ -1136,6 +1279,7 @@ impl Green {
     if self.content.contains_key(path)
       || self.dirs.contains(path)
       || self.hardlinks.contains_key(path)
+      || self.specials.contains_key(path)
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -1160,6 +1304,7 @@ impl Green {
     if self.content.contains_key(path)
       || self.dirs.contains(path)
       || self.symlinks.contains_key(path)
+      || self.specials.contains_key(path)
     {
       return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
@@ -1181,8 +1326,15 @@ impl Green {
     value: &[u8],
     established: bool,
   ) -> Result<Option<Effect>, ConflictWindow> {
-    if !self.content.contains_key(path) && !self.dirs.contains(path) && !established {
+    if !self.content.contains_key(path)
+      && !self.dirs.contains(path)
+      && !self.specials.contains_key(path)
+      && !established
+    {
       return Err(Green::window(path, MergeConflictClass::DeleteModify));
+    }
+    if !established && self.special_kind_changed(path, base) {
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
     }
     let key = (path.to_owned(), name.to_owned());
     if self.xattr_changed.get(&key).copied().unwrap_or(0) > base {
@@ -1205,6 +1357,9 @@ impl Green {
     name: &str,
     base: u64,
   ) -> Result<Option<Effect>, ConflictWindow> {
+    if self.special_kind_changed(path, base) {
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
     let key = (path.to_owned(), name.to_owned());
     if !self.xattrs.contains_key(&key) {
       return Ok(None);
@@ -1215,10 +1370,50 @@ impl Green {
     Ok(Some(Effect::RemoveXattr(path.to_owned(), name.to_owned())))
   }
 
+  /// An IPC creation compares the complete captured metadata, without ever comparing stream
+  /// bytes. A different kind is a type conflict; a differing concurrent creation conflicts.
+  fn merge_special(
+    &self,
+    path: &str,
+    base: u64,
+    node: SpecialNode,
+  ) -> Result<Option<Effect>, ConflictWindow> {
+    if self.content.contains_key(path)
+      || self.dirs.contains(path)
+      || self.symlinks.contains_key(path)
+      || self.hardlinks.contains_key(path)
+    {
+      return Err(Green::window(path, MergeConflictClass::TypeChanged));
+    }
+    if let Some(current) = self.specials.get(path) {
+      if current.kind != node.kind {
+        return Err(Green::window(path, MergeConflictClass::TypeChanged));
+      }
+      if current == &node {
+        return Ok(None);
+      }
+    }
+    if self.special_changed.get(path).copied().unwrap_or(0) > base {
+      return Err(Green::window(path, MergeConflictClass::CreateCreate));
+    }
+    Ok(Some(Effect::Special(path.to_owned(), node)))
+  }
+
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&mut self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut effects = Vec::new();
-    let mut windows = Vec::new();
+    let mut windows: Vec<_> = r
+      .invalid
+      .iter()
+      .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
+      .collect();
+    for (path, node) in &r.specials {
+      record(
+        &mut effects,
+        &mut windows,
+        self.merge_special(path, inc.base, *node),
+      );
+    }
     self.decide_content(inc, r, &mut effects, &mut windows);
     self.decide_directories(r, &mut effects, &mut windows);
     self.decide_metadata(inc, r, &mut effects, &mut windows);
@@ -1316,6 +1511,55 @@ impl Green {
     }
   }
 
+  /// Keep the superseded IPC value for pinned readers before setting the new value.
+  fn commit_special(&mut self, path: String, node: SpecialNode, version: u64) {
+    if self.specials.insert(path.clone(), node).is_some() {
+      self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
+    }
+    self.special_changed.insert(path.clone(), version);
+    self
+      .special_history
+      .entry(path)
+      .or_default()
+      .push((version, Some(node)));
+  }
+
+  /// Remove the live inode and its metadata while retaining their historical values.
+  fn remove_special(&mut self, path: String, version: u64) {
+    if self.specials.remove(&path).is_some() {
+      self.history_bytes = self.history_bytes.saturating_add(SPECIAL_NODE_BYTES);
+    }
+    self.special_changed.insert(path.clone(), version);
+    if self.modes.remove(&path).is_some() {
+      self.mode_changed.insert(path.clone(), version);
+      self
+        .mode_history
+        .entry(path.clone())
+        .or_default()
+        .push((version, None));
+    }
+    let attributes: Vec<_> = self
+      .xattrs
+      .keys()
+      .filter(|(name, _)| name == &path)
+      .cloned()
+      .collect();
+    for key in attributes {
+      self.xattrs.remove(&key);
+      self.xattr_changed.insert(key.clone(), version);
+      self
+        .xattr_history
+        .entry(key)
+        .or_default()
+        .push((version, None));
+    }
+    self
+      .special_history
+      .entry(path)
+      .or_default()
+      .push((version, None));
+  }
+
   /// Applies the accepted effects, committing version `version`.
   fn commit(&mut self, effects: Vec<Effect>, version: u64) {
     let mut delta: BTreeMap<String, Vec<Op>> = BTreeMap::new();
@@ -1325,6 +1569,8 @@ impl Green {
     // same increment recreates or renames into at that path.
     for effect in effects {
       match effect {
+        Effect::Special(path, node) => self.commit_special(path, node, version),
+        Effect::RemoveSpecial(path) => self.remove_special(path, version),
         Effect::SetContent(path, bytes, ops) => set_content.push((path, bytes, ops)),
         Effect::RemoveContent(path) => removed_content.push(path),
         Effect::MakeDir(path) => {
@@ -1533,32 +1779,89 @@ impl Green {
     )
   }
 
+  /// The maximum old values this increment can retain. Admission charges the superseded values,
+  /// not the incoming payload: an unlink has no payload, and a one-byte overwrite can retain an
+  /// entire old file. Each path is counted once; rename sources and destinations both count.
+  pub fn history_reservation(&self, inc: &Increment) -> usize {
+    if self.accepted.contains_key(&inc.id) {
+      return 0;
+    }
+    let mut paths = BTreeSet::new();
+    for op in &inc.doc.ops {
+      if (is_content(op.kind)
+        || matches!(
+          op.kind,
+          OpKind::Create | OpKind::Unlink | OpKind::Rename | OpKind::Mknod
+        ))
+        && let Some(path) = inc.doc.paths.path(op.path)
+      {
+        paths.insert(path);
+      }
+      if op.kind == OpKind::Rename
+        && let Some(path) = u16::try_from(op.src)
+          .ok()
+          .and_then(|index| inc.doc.paths.path(index))
+      {
+        paths.insert(path);
+      }
+    }
+    paths.into_iter().fold(0usize, |total, path| {
+      total
+        .saturating_add(self.content.get(path).map_or(0, Vec::len))
+        .saturating_add(if self.specials.contains_key(path) {
+          SPECIAL_NODE_BYTES
+        } else {
+          0
+        })
+    })
+  }
+
   /// What the green holds in memory beyond its durable chain ([`RetainedBytes`]): read off running
   /// totals, never a walk.
   pub fn retained_bytes(&self) -> RetainedBytes {
     RetainedBytes {
-      content: self.content.values().map(Vec::len).sum(),
+      content: self
+        .content
+        .values()
+        .map(Vec::len)
+        .sum::<usize>()
+        .saturating_add(self.specials.len().saturating_mul(SPECIAL_NODE_BYTES)),
       history: self.history_bytes,
       rejected: self.rejected_bytes,
     }
   }
 
-  /// The content history's retained bytes **recounted** from the histories themselves — the oracle
+  /// The content and IPC histories' retained bytes **recounted** from the histories themselves — the oracle
   /// the running total is checked against (balanced accounting): every earlier value of every path,
   /// the current value excluded.
   pub fn history_bytes_recounted(&self) -> usize {
-    self
-      .content_history
+    let special_bytes: usize = self
+      .special_history
       .values()
       .map(|history| {
         history
           .iter()
           .rev()
           .skip(1)
-          .map(|(_, bytes)| bytes.as_ref().map_or(0, Vec::len))
-          .sum::<usize>()
+          .filter(|(_, node)| node.is_some())
+          .count()
+          .saturating_mul(SPECIAL_NODE_BYTES)
       })
-      .sum()
+      .sum();
+    special_bytes.saturating_add(
+      self
+        .content_history
+        .values()
+        .map(|history| {
+          history
+            .iter()
+            .rev()
+            .skip(1)
+            .map(|(_, bytes)| bytes.as_ref().map_or(0, Vec::len))
+            .sum::<usize>()
+        })
+        .sum::<usize>(),
+    )
   }
 
   /// The version below which the histories are folded.
@@ -1589,7 +1892,7 @@ impl Green {
   /// above the floor, and a version below it is no longer reconstructible. The service calls this
   /// with the oldest version a live reader can still name (a work's base, a pinned attachment), so
   /// nothing reachable is lost, and a file rewritten many times by small edits no longer keeps a
-  /// full copy per edit past what any reader needs. Returns the content bytes released. Idempotent;
+  /// full copy per edit past what any reader needs. Returns the content and IPC metadata bytes released. Idempotent;
   /// a floor below the current one is a no-op.
   pub fn fold_history_before(&mut self, floor: u64) -> usize {
     if floor <= self.folded_below {
@@ -1600,6 +1903,15 @@ impl Green {
     for history in self.content_history.values_mut() {
       released = released.saturating_add(fold_entries(history, floor, |bytes| {
         bytes.as_ref().map_or(0, Vec::len)
+      }));
+    }
+    for history in self.special_history.values_mut() {
+      released = released.saturating_add(fold_entries(history, floor, |node| {
+        if node.is_some() {
+          SPECIAL_NODE_BYTES
+        } else {
+          0
+        }
       }));
     }
     for history in self.mode_history.values_mut() {
@@ -1652,6 +1964,14 @@ impl Green {
     let mut journal: Vec<VolumeOp> = Vec::new();
     for effect in effects {
       match effect {
+        Effect::Special(path, node) => {
+          if self.specials.contains_key(&path) {
+            journal.push(VolumeOp::Unlink { path: path.clone() });
+          }
+          let mode = self.mode(&path).unwrap_or(0);
+          journal.push(VolumeOp::Mknod { path, node, mode });
+        }
+        Effect::RemoveSpecial(path) => journal.push(VolumeOp::Unlink { path }),
         Effect::SetContent(path, bytes, ops) => {
           if !self.content.contains_key(&path) {
             journal.push(VolumeOp::Create { path: path.clone() });
@@ -1756,4 +2076,20 @@ fn post_slice(post_state: &[u8], src: u64, len: u64) -> Vec<u8> {
     .saturating_add(usize::try_from(len).unwrap_or(0))
     .min(post_state.len());
   post_state[start..end].to_vec()
+}
+
+/// Read an IPC payload exactly. A saturated or truncated range must never become valid metadata.
+fn special_payload(
+  doc: &OpsDoc,
+  post: &[u8],
+  op: &Op,
+) -> Result<SpecialNode, crate::ops_doc::DocDecodeError> {
+  use crate::ops_doc::DocDecodeError;
+  if doc.paths.path(op.path).is_none() {
+    return Err(DocDecodeError::BadPath);
+  }
+  let start = usize::try_from(op.src).map_err(|_| DocDecodeError::Truncated)?;
+  let len = usize::try_from(op.len).map_err(|_| DocDecodeError::Truncated)?;
+  let end = start.checked_add(len).ok_or(DocDecodeError::Truncated)?;
+  SpecialNode::decode(post.get(start..end).ok_or(DocDecodeError::Truncated)?)
 }

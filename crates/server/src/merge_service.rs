@@ -486,7 +486,32 @@ fn walk_origin(
             stack.push((path, child));
           }
         }
-        Kind::Fifo | Kind::Socket => return Err(slates_vfs::error::VfsError::SpecialFileOperation),
+        Kind::Fifo | Kind::Socket => {
+          if let Some(first) = first_name.get(&row.inode) {
+            origin.hardlinks.push((path, first.clone()));
+            continue;
+          }
+          use slates_merge::special::{SpecialKind, SpecialNode};
+          let kind = if row.kind == Kind::Fifo {
+            SpecialKind::Fifo
+          } else {
+            SpecialKind::Socket
+          };
+          origin.modes.push((path.clone(), attrs.mode));
+          first_name.insert(row.inode, path.clone());
+          origin.specials.push((
+            path,
+            SpecialNode {
+              kind,
+              uid: attrs.uid,
+              gid: attrs.gid,
+              atime: attrs.atime,
+              mtime: attrs.mtime,
+              ctime: attrs.ctime,
+              btime: attrs.btime,
+            },
+          ));
+        }
         Kind::Symlink => {
           let target = volume.readlink_in(store, snapshot, row.inode)?;
           origin.symlinks.push((path, target.into_string()));
@@ -2036,6 +2061,77 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-6.8 / A-26: seed a green from a frozen FIFO/socket namespace without reading a stream.
+  #[test]
+  fn ipc_snapshot_seeds_a_replayable_green_origin() {
+    let encoded = {
+      let page = 4096;
+      let mut arena = slates_mem::arena::ChunkArena::new(page);
+      arena
+        .add_region(slates_mem::region::Region::map(page * 256, page, false).expect("RAM region"))
+        .expect("arena");
+      let mut store = Store::new(
+        &slates_vfs::volume::StoreConfig {
+          page,
+          cache_line: 64,
+          max_dirs: 64,
+          max_inodes: 64,
+          max_chunks: 64,
+          max_dir_blocks: 64,
+          dir_cutover: 4,
+        },
+        arena,
+        0,
+      );
+      let mut volume = Volume::create(
+        &mut store,
+        slates_vfs::volume::VolumeConfig {
+          prefix: 7,
+          names: slates_vfs::names::NameEquivalence::Exact,
+          quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 20 },
+          journal_bytes: 1 << 16,
+          clock: Box::new(slates_vfs::clock::StepClock::new(0, 1)),
+        },
+      )
+      .expect("create source");
+      let root = volume.root_inode(&store).expect("root");
+      for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
+        let inode = volume
+          .mknod_no(&mut store, root, name, 0o640, kind)
+          .expect("create IPC name");
+        volume.chown(&mut store, inode, 123, 456).expect("owner");
+        volume
+          .link_no(&mut store, root, &format!("{name}-link"), inode)
+          .expect("alias");
+      }
+      let snapshot = volume.snapshot(&mut store).expect("freeze");
+      walk_origin(&volume, &store, snapshot)
+        .expect("IPC metadata is a complete immutable origin")
+        .encode()
+    };
+    let origin = Origin::decode(&encoded).expect("decode origin");
+    assert!(
+      origin.files.is_empty(),
+      "no stream is represented as file bytes"
+    );
+    assert_eq!(origin.specials.len(), 2);
+    let green = Green::with_origin(&origin);
+    for (path, kind) in [
+      ("pipe", slates_merge::special::SpecialKind::Fifo),
+      ("socket", slates_merge::special::SpecialKind::Socket),
+    ] {
+      let node = green.special(path).expect("metadata survived capture");
+      assert_eq!((node.kind, node.uid, node.gid), (kind, 123, 456));
+      assert_eq!(green.special(&format!("{path}-link")), Some(node));
+    }
+    assert_eq!(origin.hardlinks.len(), 2);
+    assert_eq!(origin.encode(), encoded);
+    assert_eq!(
+      Green::with_origin(&origin).head_identity(),
+      Green::with_origin(&Origin::decode(&encoded).expect("holder origin")).head_identity()
+    );
+  }
 
   /// AC-8.19 / T-8.17, AUD-13: a record's inputs reached quorum without C. Expect to ship
   /// to B now and leave C waiting for inputs; after C holds them its record becomes dispatchable.

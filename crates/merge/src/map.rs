@@ -50,7 +50,8 @@ fn effect_of(op: &Op) -> Option<(u64, u64, u64)> {
     | OpKind::Symlink
     | OpKind::SetMode
     | OpKind::SetXattr
-    | OpKind::RemoveXattr => None,
+    | OpKind::RemoveXattr
+    | OpKind::Mknod => None,
   }
 }
 

@@ -508,6 +508,7 @@ fn making_a_new_directory_is_one_mkdir() {
 #[test]
 fn removing_a_base_directory_is_one_rmdir() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
@@ -549,6 +550,7 @@ fn mkdir_then_rmdir_cancels() {
 #[test]
 fn removing_then_recreating_a_base_directory_is_nothing() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
@@ -595,6 +597,7 @@ fn a_file_and_directory_at_one_path_refuses() {
 #[test]
 fn mkdir_over_a_base_directory_refuses() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: Vec::new(),
@@ -665,6 +668,7 @@ proptest! {
       .collect();
     let (journal, model) = simulate_dirs(&base_dirs, &raw);
     let base = Base {
+      specials: Vec::new(),
       files: Vec::new(),
       dirs: base_dirs.clone(),
       modes: Vec::new(),
@@ -693,6 +697,7 @@ proptest! {
 #[test]
 fn setting_a_base_file_mode_is_one_set_mode() {
   let base = Base {
+    specials: Vec::new(),
     files: vec![("f".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
@@ -721,6 +726,7 @@ fn setting_a_base_file_mode_is_one_set_mode() {
 #[test]
 fn setting_a_mode_to_the_base_mode_is_nothing() {
   let base = Base {
+    specials: Vec::new(),
     files: vec![("f".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
@@ -743,6 +749,7 @@ fn setting_a_mode_to_the_base_mode_is_nothing() {
 #[test]
 fn the_last_set_mode_wins() {
   let base = Base {
+    specials: Vec::new(),
     files: vec![("f".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("f".to_owned(), 0o644)],
@@ -776,6 +783,7 @@ fn the_last_set_mode_wins() {
 #[test]
 fn setting_a_base_directory_mode() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: vec!["d".to_owned()],
     modes: vec![("d".to_owned(), 0o755)],
@@ -843,6 +851,7 @@ fn set_mode_on_a_missing_path_refuses() {
 #[test]
 fn set_mode_then_rename_refuses() {
   let base = Base {
+    specials: Vec::new(),
     files: vec![("a".to_owned(), 4)],
     dirs: Vec::new(),
     modes: vec![("a".to_owned(), 0o644)],
@@ -916,6 +925,7 @@ fn symlink_then_unlink_cancels() {
 #[test]
 fn removing_a_base_symlink_is_one_unlink() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -940,6 +950,7 @@ fn removing_a_base_symlink_is_one_unlink() {
 #[test]
 fn retargeting_a_base_symlink_is_one_symlink() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -976,6 +987,7 @@ fn retargeting_a_base_symlink_is_one_symlink() {
 #[test]
 fn recreating_a_base_symlink_to_the_same_target_is_nothing() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -1003,6 +1015,7 @@ fn recreating_a_base_symlink_to_the_same_target_is_nothing() {
 #[test]
 fn symlink_over_an_existing_symlink_refuses() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -1042,6 +1055,7 @@ fn symlink_at_a_base_file_path_conflicts() {
 #[test]
 fn a_write_on_a_base_symlink_conflicts() {
   let base = Base {
+    specials: Vec::new(),
     files: Vec::new(),
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -1067,6 +1081,7 @@ fn a_write_on_a_base_symlink_conflicts() {
 /// Builds a base with one file and one xattr on it.
 fn base_with_xattr(path: &str, name: &str, value: &[u8]) -> Base {
   Base {
+    specials: Vec::new(),
     files: vec![(path.to_owned(), 4)],
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -1256,6 +1271,7 @@ fn hard_link_then_unlink_cancels() {
 #[test]
 fn removing_a_base_hard_link_is_one_unlink() {
   let base = Base {
+    specials: Vec::new(),
     files: vec![("a".to_owned(), 4)],
     dirs: Vec::new(),
     modes: Vec::new(),
@@ -1279,6 +1295,7 @@ fn removing_a_base_hard_link_is_one_unlink() {
 #[test]
 fn hard_link_over_an_existing_link_refuses() {
   let base = Base {
+    specials: Vec::new(),
     files: vec![("a".to_owned(), 4)],
     dirs: Vec::new(),
     modes: Vec::new(),

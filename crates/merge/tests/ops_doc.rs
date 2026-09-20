@@ -62,11 +62,11 @@ fn different_work_has_a_different_identity() {
 /// Every op kind round-trips through its wire value.
 #[test]
 fn op_kinds_round_trip() {
-  for value in 0u8..=14 {
+  for value in 0u8..=15 {
     let kind = OpKind::from_wire(value).unwrap();
     assert_eq!(kind.to_wire(), value);
   }
-  assert!(OpKind::from_wire(15).is_none());
+  assert!(OpKind::from_wire(16).is_none());
 }
 
 /// Interning is stable and deduplicated during building; canonicalize then sorts the table so

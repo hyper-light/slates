@@ -43,6 +43,8 @@ pub enum OpKind {
   SetXattr = 13,
   /// Format: an xattr removed.
   RemoveXattr = 14,
+  /// Format: a FIFO/socket node whose fixed metadata is at `src` for `len` bytes.
+  Mknod = 15,
 }
 
 impl OpKind {
@@ -74,6 +76,7 @@ const ALL_KINDS: &[OpKind] = &[
   OpKind::SetMode,
   OpKind::SetXattr,
   OpKind::RemoveXattr,
+  OpKind::Mknod,
 ];
 
 /// One declared operation (§4.16 `OpRecord`), naming a path (by index into the document's path
@@ -172,6 +175,18 @@ impl OpsDoc {
   pub fn canonicalize(&mut self) {
     let remap = self.paths.sort_and_remap();
     for op in &mut self.ops {
+      if matches!(op.kind, OpKind::Rename | OpKind::Link | OpKind::Symlink) {
+        op.src = usize::try_from(op.src)
+          .ok()
+          .and_then(|index| remap.get(index))
+          .map_or(u64::MAX, |index| u64::from(*index));
+      }
+      if matches!(op.kind, OpKind::SetXattr | OpKind::RemoveXattr) {
+        op.at = usize::try_from(op.at)
+          .ok()
+          .and_then(|index| remap.get(index))
+          .map_or(u64::MAX, |index| u64::from(*index));
+      }
       if let Some(new) = remap.get(usize::from(op.path)) {
         op.path = *new;
       }

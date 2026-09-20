@@ -21,7 +21,7 @@ use crate::ops_doc::{DocDecodeError, Reader};
 /// (an increment) is refused at the first word rather than misread.
 const MAGIC: u32 = u32::from_le_bytes(*b"GORG");
 /// Format: the origin encoding's version; a decoder refuses any other.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 /// Format: the smallest an entry of any table can be in the encoding — its length prefix (a `u32`)
 /// — the divisor a declared count is checked against before allocation.
 const ENTRY_MIN_BYTES: usize = size_of::<u32>();
@@ -40,6 +40,8 @@ pub struct Origin {
   pub symlinks: Vec<(String, String)>,
   /// Every hard link with the file it names (a namespace edge, as the engine merges it).
   pub hardlinks: Vec<(String, String)>,
+  /// Every FIFO/socket inode, without endpoint state. Aliases are hard-link edges.
+  pub specials: Vec<(String, crate::special::SpecialNode)>,
   /// Every extended attribute as `(path, name, value)`.
   pub xattrs: Vec<(String, String, Vec<u8>)>,
 }
@@ -53,11 +55,13 @@ impl Origin {
       && self.symlinks.is_empty()
       && self.hardlinks.is_empty()
       && self.xattrs.is_empty()
+      && self.specials.is_empty()
   }
 
   /// Sorts every table by its key and drops a repeated key (the last declared wins), so the
   /// encoding is one sequence whatever order the service walked the snapshot in.
   pub fn canonicalize(&mut self) {
+    dedup_by_key(&mut self.specials, |(path, _)| path.clone());
     dedup_by_key(&mut self.files, |(path, _)| path.clone());
     self.dirs.sort();
     self.dirs.dedup();
@@ -108,6 +112,11 @@ impl Origin {
       put_bytes(&mut out, name.as_bytes());
       put_bytes(&mut out, value);
     }
+    put_count(&mut out, canonical.specials.len());
+    for (path, node) in &canonical.specials {
+      put_bytes(&mut out, path.as_bytes());
+      out.extend_from_slice(&node.encode());
+    }
     out
   }
 
@@ -157,6 +166,11 @@ impl Origin {
       let name = take_str(&mut reader)?;
       let value = reader_bytes(&mut reader)?.to_vec();
       origin.xattrs.push((path, name, value));
+    }
+    for _ in 0..take_count(&mut reader)? {
+      let path = take_str(&mut reader)?;
+      let node = crate::special::SpecialNode::decode(reader.bytes(crate::special::ENCODED_BYTES)?)?;
+      origin.specials.push((path, node));
     }
     if !reader.is_empty() {
       return Err(DocDecodeError::TrailingBytes);

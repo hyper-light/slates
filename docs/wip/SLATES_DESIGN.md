@@ -1307,8 +1307,9 @@ regular-file I/O refuses these kinds. Existing host special files remain exclude
 the live base: importing a name must not connect the volume to a host endpoint.
 
 > **A-26 implementation status (2026-09-20).** The shared namespace, VFS deltas, snapshots,
-> clones, recovery and archives carry IPC metadata. Full merge-service integration remains
-> owed: its separate origin/engine protocol refuses IPC snapshots explicitly. The archive
+> clones, recovery and archives carry IPC metadata. The merge service also preserves it
+> through capture, creation, deletion, conflicts and replay; its inode-aware
+> namespace journal and mounted green/work volumes remain owed. The archive
 > retains its existing mtime/ctime fields; it does not encode atime or birth time.
 
 **Data model.**
@@ -3279,6 +3280,20 @@ granted-target exception).
 with kinds included in canonical identities and conflicts. They have no content hunks.
 Applying or replicating an increment cannot import a live endpoint from the work volume.
 
+> **Status (2026-09-20, A-26).** Origin format 2 captures IPC kind, owner, group and four
+> timestamps; modes remain independent. `Mknod` carries fixed canonical metadata in the
+> increment's post-state, with no content operations. The engine preserves it through identity,
+> conflicts, history, rebase and replay. Snapshot aliases share metadata and invalidation;
+> deletion clears live metadata and preserves old versions. The wire declaration is implemented.
+> IPC rename, alias metadata declarations and primary unlink with aliases remain typed refusals
+> under the existing path-based work journal; an inode-aware journal and mounted green/work
+> volumes remain owed. Device creation/activation remain refused. Evidence:
+> `docs/bugs/2026-09-20-merge-ipc-origins-refused.md`.
+>
+> Retention admission reserves the values a verdict can supersede, counting each affected path
+> once and both ends of a rename. Incoming bytes are not an upper bound on retained history:
+> short writes and payload-free unlinks retain previous values. Accepted retries reserve zero.
+
 **A-9 integration requirement.** The implemented pure merge core is not a user-facing green
 volume service. Green's immutable version chain starts from scratch or a complete immutable
 base, never an implicitly live host directory. Work volumes preserve that base and their
@@ -3365,7 +3380,7 @@ recomputation remain explicit integration gates; existing pure-core tests do not
 
 > **Status (2026-09-18, AUD-11: acceptance waits for the commit).** `submit` returned `Submitted{version}` on the owner's local append, with the version's merge record still pending on the record plane at `f > 0` — a version a surviving quorum might not hold, and a completion record saying otherwise. Now the acceptance **waits for the commit**: when `placed_version` has not reached the version, the verb registers the request as awaiting (`MergeShardState::awaiting`: the reply route and the completion key, bounded by the clients' credit) and `run_recorded` commits its effects with no completion and no reply; when `record_merge_acks` places the version at the quorum, `resolve_accepted` records the acceptance as each waiting request's completion on the owner partition (one durable step) and delivers the reply by a task on the request's shard. A retry while waiting joins the wait; a cross-node forward polls the completion within the liveness budget, else is refused retryable. At `f = 0` the append is the commit and nothing changes (R8). Regression: two-node `f = 1`, the holder withholding content puts, then acknowledgements (`MergeFault::refuse_records`) — no acceptance under either, the wait resolving once both lift, the retry answered from the record (`docs/bugs/2026-09-18-submit-acceptance-before-fleet-commit.md`). The retry after the owner's loss belongs to AUD-14's takeover recovery.
 
-> **Status (2026-09-18, AUD-16: merge memory is bounded and charged).** Two resident structures of the engine had fallen outside admission: the rejected-result cache (`seen` held every conflict's windows for good — a conflict is not in the chain, so nothing bounded it) and the content history's full copy of every superseded file (the acknowledged amplification, never charged: the service checked only the encoded increment against the chain's byte cap). Now the idempotency record splits into the chain-bounded `accepted` map and a **rejected-result cache bounded in bytes** — the derived green-chain cap (`rejected_cache_budget`: the cache of refused verdicts may hold at most what the durable chain of accepted ones may), oldest evicted first, every eviction counted; a retry of an evicted conflict is judged again (the verdict is deterministic in the increment, its base and the head). Retained history is **accounted** (a running total checked against a recount), **folded oldest-first only as far as the retention budget needs** — the same derived cap, so under an ample budget nothing folds and a reader may still re-pin any earlier version, while under pressure the oldest history goes first — never past the oldest version a live reader still names (a work's base or a pinned attachment, `reachable_floor`; the "delta retention before folding … capped by the delta memory budget" rule realized with the budget as the driver and the readers as the bound), with `advance` below the fold floor refused `UnknownBase`, and **charged** to the shard's budget as retention on the A-16 ledger: `submit` secures at most the increment's sealed post-state before the verdict (refused typed `BudgetExceeded`, nothing changed), the settle after it (and after a rebase, an advance, a pin's removal, a work's destroy, a rebuild) trues the charge to exactly `history + rejected`, and a conflict the budget cannot cover is dropped from the cache and counted. `Daemon::merge_retention` reports it all. Measured (engine): eight 4-byte edits to a 64 KiB file retained 512 KiB, folded to 0 at the head; a 40-increment conflict flood under a 256-byte budget never exceeded it. By use: `charged == history + rejected` at every step (`docs/bugs/2026-09-18-merge-rejected-results-and-retained-copies-unbounded.md`). Still owed: the copy-on-write chain that makes a superseded copy cost its changed extents rather than the file.
+> **Status (2026-09-18, AUD-16: merge memory is bounded and charged).** Two resident structures of the engine had fallen outside admission: the rejected-result cache (`seen` held every conflict's windows for good — a conflict is not in the chain, so nothing bounded it) and the content history's full copy of every superseded file (the acknowledged amplification, never charged: the service checked only the encoded increment against the chain's byte cap). Now the idempotency record splits into the chain-bounded `accepted` map and a **rejected-result cache bounded in bytes** — the derived green-chain cap (`rejected_cache_budget`: the cache of refused verdicts may hold at most what the durable chain of accepted ones may), oldest evicted first, every eviction counted; a retry of an evicted conflict is judged again (the verdict is deterministic in the increment, its base and the head). Retained history is **accounted** (a running total checked against a recount), **folded oldest-first only as far as the retention budget needs** — the same derived cap, so under an ample budget nothing folds and a reader may still re-pin any earlier version, while under pressure the oldest history goes first — never past the oldest version a live reader still names (a work's base or a pinned attachment, `reachable_floor`; the "delta retention before folding … capped by the delta memory budget" rule realized with the budget as the driver and the readers as the bound), with `advance` below the fold floor refused `UnknownBase`, and **charged** to the shard's budget as retention on the A-16 ledger: `submit` secures the old values its operations can supersede before the verdict (corrected 2026-09-20: incoming payload size does not bound retained history) (refused typed `BudgetExceeded`, nothing changed), the settle after it (and after a rebase, an advance, a pin's removal, a work's destroy, a rebuild) trues the charge to exactly `history + rejected`, and a conflict the budget cannot cover is dropped from the cache and counted. `Daemon::merge_retention` reports it all. Measured (engine): eight 4-byte edits to a 64 KiB file retained 512 KiB, folded to 0 at the head; a 40-increment conflict flood under a 256-byte budget never exceeded it. By use: `charged == history + rejected` at every step (`docs/bugs/2026-09-18-merge-rejected-results-and-retained-copies-unbounded.md`). Still owed: the copy-on-write chain that makes a superseded copy cost its changed extents rather than the file.
 
 > **Status (2026-09-14, AUD-12).** Merge holders validate authenticated ownership, generation,
 > epoch, position and sequence/version agreement before recomputing. An unauthorized origin used
@@ -3399,7 +3414,7 @@ struct Increment { id: IncrementId /* blake3(work_volume, base, post_state, ops_
                    base: (VolumeId, Version), post_state: SnapshotId, ops_doc: Blake3 /* a sealed chunk */, filter: FilterId,
                    evidence: SmallVec<Blake3> /* opaque to slates */ }
 #[repr(C)] struct OpRecord { kind: u8, flags: u8, path_idx: u16, reserved: u32, at: u64, len: u64, src: u64 }   // 32 bytes, little-endian
-enum OpKind { Overwrite, Extend, Truncate, Insert, Delete, Create, Unlink, Mkdir, Rmdir, Rename, Link, Symlink, SetMode, SetXattr, RemoveXattr }
+enum OpKind { Overwrite, Extend, Truncate, Insert, Delete, Create, Unlink, Mkdir, Rmdir, Rename, Link, Symlink, SetMode, SetXattr, RemoveXattr, Mknod }
 struct OpsDoc { header: WireHeader, paths: PathTable /* path_idx → path bytes, sorted */, ops: [OpRecord] }
 struct CanonicalDelta { version: Version, ops: Handle<OpsDoc>, effects: Art<PathKey, RangeSet> /* per path: ranges touched and size shifts */ }
 struct MergeRecord { green: VolumeId, version: Version, increment: IncrementId, verdict: VerdictSummary, manifest: Blake3, host_epoch: u64 }
@@ -5482,11 +5497,14 @@ activation remain refused, with device-metadata preservation a separate decision
   [mount(2)](https://man7.org/linux/man-pages/man2/mount.2.html).
 - Status (2026-09-20): shared namespace, snapshots/clones, recovery, archive and VFS deltas
   implemented; NFS/FUSE type reporting and creation implemented, local FUSE IPC exercised.
-  The separate merge service still refuses IPC origins; its canonical metadata/history/conflict
-  and replay integration is owed. FSKit/WinFsp return explicit unsupported refusals.
+  Merge origin format 2, explicit IPC creation declarations, canonical identity, history,
+  conflicts, replay and rebase are implemented. IPC rename, alias metadata declarations,
+  primary unlink with aliases, mounted green/work volumes and language/frontend conveniences
+  remain owed. See the 2026-09-20 merge IPC bug record for the exact supported boundary. FSKit/WinFsp return explicit unsupported refusals.
   The unchanged full NFS pjdfstest rerun: 6,970 passes, 1,800 failures, 28 TODO; 172,343 ms.
   Residual failure review remains open; no expected-failure list expanded.
 - Applied in the same change to: §4.5, §4.6, §4.8, §4.15, §4.16, GAPS and TBD_FIXES;
   `vfs`, `bridge-core`, `bridge-nfs`, `bridge-fuse`, `bridge-fskit`, `bridge-winfsp`, `land`
-  and server archive restoration, with the dated special-file bug record. No new privilege
+  and server archive restoration; `merge`, IPC declarations and server merge capture/sealing,
+  with the dated special-file and merge IPC bug records. No new privilege
   or tool is authorized.

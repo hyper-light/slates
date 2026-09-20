@@ -35,7 +35,10 @@
 //! in the path table), and extended attributes (`SetXattr`/`RemoveXattr`, composed against the
 //! base value; the value is laid out in the post-state after the file content, the name in the
 //! path table), and hard links (`Link`, composed like symlinks; the target file is named in the
-//! path table). Every §4.16 declared operation kind is now composed. The remaining edges — a
+//! path table). IPC creations (`Mknod`, A-26) carry canonical metadata without content; their
+//! modes compose independently and a create/unlink cancels. IPC renames, metadata declarations
+//! through aliases, and primary-name removal while aliases exist are typed refusals pending
+//! an inode-aware namespace journal. The remaining edges — a
 //! file/directory/symlink/link transition at one path, a metadata or link then a rename of that
 //! path, symlink rename, a write through a hard link, and the rare rename onto a base path already
 //! consumed this increment — are owed (GAPS §8f), each a typed [`DeriveError`]. An operation a valid volume could not
@@ -97,6 +100,15 @@ pub enum VolumeOp {
   Create {
     /// The file.
     path: String,
+  },
+  /// Create a FIFO or socket namespace inode, carrying metadata and no file contents.
+  Mknod {
+    /// The new name.
+    path: String,
+    /// The captured metadata; replay never consults a clock or live endpoint.
+    node: crate::special::SpecialNode,
+    /// Initial permission bits, composed in the independent mode dimension.
+    mode: u32,
   },
   /// The name `path` removed.
   Unlink {
@@ -177,7 +189,8 @@ impl VolumeOp {
       | VolumeOp::Symlink { .. }
       | VolumeOp::SetXattr { .. }
       | VolumeOp::RemoveXattr { .. }
-      | VolumeOp::Link { .. } => None,
+      | VolumeOp::Link { .. }
+      | VolumeOp::Mknod { .. } => None,
     }
   }
 
@@ -214,7 +227,8 @@ impl VolumeOp {
       | VolumeOp::Symlink { .. }
       | VolumeOp::SetXattr { .. }
       | VolumeOp::RemoveXattr { .. }
-      | VolumeOp::Link { .. } => None,
+      | VolumeOp::Link { .. }
+      | VolumeOp::Mknod { .. } => None,
     }
   }
 }
@@ -290,6 +304,8 @@ impl std::error::Error for DeriveError {}
 pub struct Base {
   /// The base files and their content lengths.
   pub files: Vec<(String, u64)>,
+  /// The base IPC inodes, without endpoint state.
+  pub specials: Vec<(String, crate::special::SpecialNode)>,
   /// The base directory paths.
   pub dirs: Vec<String>,
   /// The base mode of a path (file or directory), where known.
@@ -307,6 +323,7 @@ impl Base {
   pub fn of_files(files: Vec<(String, u64)>) -> Base {
     Base {
       files,
+      specials: Vec::new(),
       dirs: Vec::new(),
       modes: Vec::new(),
       symlinks: Vec::new(),
@@ -574,8 +591,14 @@ fn compose_modes(
 ) -> Result<Vec<(String, u32)>, DeriveError> {
   let mut final_mode: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
   for op in journal {
-    if let VolumeOp::SetMode { path, mode } = op {
-      final_mode.insert(path.clone(), *mode);
+    match op {
+      VolumeOp::SetMode { path, mode } => {
+        final_mode.insert(path.clone(), *mode);
+      }
+      VolumeOp::Mknod { path, mode, .. } if survivors.contains(path) => {
+        final_mode.insert(path.clone(), *mode);
+      }
+      _ => {}
     }
   }
   let mut emissions = Vec::new();
@@ -896,6 +919,7 @@ fn adds_content(kind: OpKind) -> bool {
 /// error. `base` gives the base content length of every path that existed at the increment's base
 /// version.
 pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, DeriveError> {
+  let specials = crate::special::Composition::of(base, journal)?;
   check_no_file_directory_collision(base, journal)?;
   let directories = compose_directories(base, journal)?;
   let sym_paths = symlink_paths(base, journal);
@@ -904,12 +928,15 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
   let hardlinks = compose_hardlinks(base, journal, &link_paths)?;
   let mut entities: Vec<Entity> = Vec::new();
   for op in journal {
-    if op.is_directory() || op.is_symlink() || op.is_link() {
+    if op.is_directory() || op.is_symlink() || op.is_link() || matches!(op, VolumeOp::Mknod { .. })
+    {
       continue;
     }
     // An unlink on a symlink or hard link path is that composition's removal, done above.
     if let VolumeOp::Unlink { path } = op
-      && (sym_paths.contains(path.as_str()) || link_paths.contains(path.as_str()))
+      && (sym_paths.contains(path.as_str())
+        || link_paths.contains(path.as_str())
+        || specials.paths.contains(path))
     {
       continue;
     }
@@ -931,6 +958,7 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
       survivors.insert(path.clone());
     }
   }
+  survivors.extend(specials.survivors.iter().cloned());
   let renamed_away: std::collections::BTreeSet<String> = entities
     .iter()
     .filter(|entity| entity.live)
@@ -942,14 +970,9 @@ pub fn compose_volume(base: &Base, journal: &[VolumeOp]) -> Result<OpsDoc, Deriv
   let present_dirs = present_directories(base, journal);
   let modes = compose_modes(base, journal, &survivors, &renamed_away, &present_dirs)?;
   let xattrs = compose_xattrs(base, journal, &survivors, &renamed_away, &present_dirs)?;
-  Ok(seal(
-    entities,
-    directories,
-    modes,
-    symlinks,
-    xattrs,
-    hardlinks,
-  ))
+  let mut doc = seal(entities, directories, modes, symlinks, xattrs, hardlinks);
+  specials.emit(&mut doc);
+  Ok(doc)
 }
 
 /// A directory the increment declares: a create or a remove.
@@ -965,6 +988,7 @@ enum DirectoryEmission {
 fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Result<(), DeriveError> {
   let sym_paths = symlink_paths(base, journal);
   let link_paths = hardlink_paths(base, journal);
+  let specials = crate::special::Composition::of(base, journal)?;
   let mut file_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   let mut dir_paths: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
   let mut sym_intent: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -986,7 +1010,9 @@ fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Resul
       }
       // An unlink on a symlink or hard link path is that removal, not a file operation.
       VolumeOp::Unlink { path }
-        if sym_paths.contains(path.as_str()) || link_paths.contains(path.as_str()) => {}
+        if sym_paths.contains(path.as_str())
+          || link_paths.contains(path.as_str())
+          || specials.paths.contains(path) => {}
       other => {
         if let Some(path) = other.single_path() {
           file_paths.insert(path);
@@ -998,6 +1024,19 @@ fn check_no_file_directory_collision(base: &Base, journal: &[VolumeOp]) -> Resul
   let base_dir = |path: &str| base.dirs.iter().any(|dir| dir == path);
   let base_sym = |path: &str| base.symlinks.iter().any(|(link, _)| link == path);
   let base_link = |path: &str| base.hardlinks.iter().any(|(link, _)| link == path);
+  for path in &specials.paths {
+    if file_paths.contains(path.as_str())
+      || dir_paths.contains(path.as_str())
+      || sym_intent.contains(path.as_str())
+      || link_intent.contains(path.as_str())
+      || base_file(path)
+      || base_dir(path)
+      || base_sym(path)
+      || base_link(path)
+    {
+      return Err(DeriveError::PathKindConflict(path.clone()));
+    }
+  }
   // A file operation must not fall on a base directory or symlink.
   for path in &file_paths {
     if dir_paths.contains(path) || base_dir(path) || base_sym(path) || base_link(path) {

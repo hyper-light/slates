@@ -23,6 +23,7 @@ fn fixed_origin() -> Origin {
       ("src/lib.rs".to_owned(), b"pub fn f() {}\n".to_vec()),
       ("README".to_owned(), b"hello\n".to_vec()),
     ],
+    specials: Vec::new(),
     dirs: vec!["src".to_owned()],
     modes: vec![("src/lib.rs".to_owned(), 0o644)],
     symlinks: vec![("link".to_owned(), "README".to_owned())],
