@@ -459,7 +459,12 @@ stopped at missing target C headers in zstd. The authorized Windows VM has been 
 its official ARM64 installation image is fully downloaded (7,994,415,104 bytes), with SHA-256
 `638aa2c88e94385b00f4f178d071e3df0b7d9e335577a83bd533b7f2eb65adf0` verified against Microsoft.
 Ada approved the Windows 11 Pro license; installation completed and the guest reached its
-first-start setup. Native Windows tests have not run. An ARM64 guest can exercise x64
+first-start setup. It is waiting for the network driver. Official UTM media is downloaded
+and attached (`/private/tmp/slates-utm-guest-tools.iso`, SHA-256
+`65b6a69b392ee01dd314c10f3dad9ebbf9c4160be43f5f0dd6bb715944d9095b`); its Windows ARM64
+NetKVM driver is version `100.100.104.27100`. Automatic approval review blocked the
+"Install driver" click under AGENTS §2.14; specific task-VM driver authorization is pending.
+No driver was installed. Native Windows tests have not run. An ARM64 guest can exercise x64
 user-mode binaries through Windows emulation, but
 does not establish equivalence to GitHub's x64 kernel.
 Record: [special-file investigation](../bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md).
