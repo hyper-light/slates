@@ -7,6 +7,98 @@ ledger. Historical audit findings below need closure evidence against current so
 blind reimplementation of their original baseline. No new test, install or deployment is
 authorized merely by appearing here.
 
+## Current CI repair checkpoint (2026-09-20)
+
+- [x] Replace the IPC ring fixture's scheduler assumptions with queued-reply and armed-wait
+  histories. Linux single-CPU stress: 192/192 test executions passed. Performance gates remain.
+- [x] Page the daemon report under the client's existing reply credit; retain one charged,
+  immutable capture per channel and validate every continuation. The original one-core fleet
+  regression passes in 1.58 s; real-ring fragmentation, mutation isolation, cancellation,
+  cross-client refusal, hostile pages and retention-release regressions pass.
+- [x] The earlier status-paging/ring-scheduling change passed Linux workspace **1,547/1,547**
+  and macOS **1,538/1,538**,
+  strict Clippy and xtask checks. Fleet: Linux 49/49, macOS 48/48. Those workspace
+  runs predate the later landing and lifecycle changes; the current reruns and additional
+  workflow steps below are separate obligations.
+- [x] Linux rerun after the landing/lifecycle changes: **1,554 passed, zero failed, 14
+  ignored**, all **49 fleet tests** in 255.76 s; strict Clippy and xtask checks passed.
+  Real non-root FUSE coherence/retry and local FIFO/socket isolation both passed afterward
+  (0.13 s and 0.01 s). Command wrapper and log:
+  `/private/tmp/slates-run-linux-lifecycle.sh`, `/private/tmp/slates-linux-lifecycle.log`.
+  The subsequently added identity-exhaustion case still needs its Linux run.
+- [x] Current macOS rerun: **1,546 passed, zero failed, 14 ignored**, all **48 fleet
+  tests** in 298.31 s; the five client histories include identity exhaustion. The real
+  CLI suite passes **10/10 in 28.85 s**, including Docker, daemon restart and exact detach
+  results. Commands: `/private/tmp/slates-run-macos-current.sh`; log:
+  `/private/tmp/slates-macos-current.log`. This does not make its subsequent ratchet green.
+- [ ] Finish every CI-equivalent local job, including million-operation/differential tests,
+  CLI and Swift steps, performance gates, conformance, SDK packaging, concurrency and KIND.
+  Reproduce Windows natively in the VM Ada authorized creating on 2026-09-20.
+- [x] The unchanged root pjdfstest rerun passes its first source-reviewed expected list:
+  6,970 passed, 1,800 expected failures, 28 TODO; zero unexpected, now-passing or absent
+  listed cases (174.353 s). fsx, fsstress, all nine workloads and hermeticity also pass.
+  No file wildcard or upstream assertion changed. The adapter remains LIMITED, native FUSE owed.
+- [x] Repair the host differential oracle's absolute-path escape from RAM scratch; its
+  deterministic root/nested alias regression and 2,000 generated histories pass in 0.29 s.
+  The million-operation model passed. The next real-host gate exposed an absolute digest
+  reuse-count assumption; measure the final read's counter delta and verify its bytes.
+- [ ] Sibling limits: page the other growing replies (`List`, grants, audit/content reads),
+  and complete a status scatter whose return task is lost. Expiring retained status bytes
+  alone does not complete that gather. See the status paging bug record.
+- [x] Fix landing exchange verification across its own ctime update and classify Linux
+  symlink containment refusals. Eighteen oracle cases and all five real Linux landing
+  tests pass; the crash-instruction oracle and same-timestamp outsider preservation pass.
+- [x] Complete the Linux CLI flow after repairing its GNU-incompatible mktemp template:
+  9/9 in 7.65 s. The million-file landing bench completes; the ratchet skips explicitly
+  because this machine has no recorded baseline. The latest complete workspace evidence
+  predates these additional landing changes; repeat affected checks before committing.
+- [x] The macOS OCI/CLI and Swift/FSKit steps pass after replacing the obsolete bare-export
+  matcher with the actual capability source format: eight pure checks and ten CLI tests,
+  including malformed sources, exact volume matching and bearer-token redaction. The later
+  crash/retirement changes require their current suite reruns; performance remains open below.
+- [x] **OCI ownership (2026-09-20).** Preserve the real CLI caller and exact detach outcome.
+  Bindings borrow a checked source-mount attachment, with atomic dependent removal.
+  The new regression covers client exit, daemon crash, fresh post-crash CLI calls, explicit
+  detach, parent unmount and read-only source refusal (7.90 s). Database recovery/refusal
+  and cross-platform regression runs continue below; no `NotFound` cleanup exception remains.
+- [ ] **Cross-shard attachment retirement (2026-09-20), implemented, validating.** The real OCI probe sees one
+  exited CLI's attachment reaped, while another survives on its volume's owner shard.
+  `reap_client` visits only its own partition, and `Consumer::Sdk` lacks origin-host scope.
+  The reaper now reserves dead seats, cancels unsent forwards, and gathers then removes
+  exact attachment ids across owners; refusals retain the seat for retry. The two-owner
+  SIGKILL regression passes in 3.81 s under its original lease limits and in the Linux
+  workspace rerun. Owed: queued-forward and refusal/cancellation histories. Cross-node attach is currently refused;
+  enabling it needs origin-scoped lifetime ownership, not a claimed proof on a nonexistent path.
+- [ ] **Restart admission identity (2026-09-20), implemented, validating.** The CLI crash
+  history exposed fresh client 13/sequence 1 receiving an old `Created` for `Status`.
+  A control-partition reservation and recovered allocation floor prevent reuse. The portable
+  restart case passed on macOS and Linux. The last-id/refused-fresh/restarted-session history
+  passed on macOS in 0.98 s; its Linux run and failed-publication coverage remain owed.
+- [ ] **macOS performance ratchet (2026-09-20).** Snapshot cost grew 24 ns against a
+  17 ns measured allowance in `/private/tmp/slates-macos-gates-lifecycle.log`. A controlled
+  same-tree experiment found journal turnover, not tree size: the million-file tree measured
+  53 ns during named-record eviction and 28 ns afterward. Normalize only the journal state
+  before sampling, retain the original allowance and reject failed operations. The corrected
+  snapshot comparison passed all three VFS runs in the current full ratchet.
+  Separate destroy overruns remain (296,417 ns / 146,250 ns, 368 units, no allocator free
+  time). Include the eager `Volume::destroy` preparation walk in the bounded-work proof;
+  the old benchmark starts its slice timer after that walk. Do not widen the gate.
+- [ ] **Nine remaining macOS ratchet failures (2026-09-20).** On the recorded Apple M5 Max
+  machine, the latest three-run ratchet still rejects small-file copy-up, database mutation,
+  simulated landing, buddy allocation, both namespace rows, burst create and both write rows.
+  Small-file copy-up medians are 96,625 / 97,042 / 104,958 ns against a 30,667 ns ceiling.
+  Its unpinned source directory has grown from the baseline's dozen entries to 69; determine
+  that contribution independently of production cost before changing the benchmark. The other
+  eight failures also need controlled comparisons. No ceilings were changed. Log:
+  `/private/tmp/slates-macos-current.log`.
+- [ ] **Lifecycle siblings (2026-09-20).** Plain `attach` without an OCI or host-mount
+  lifetime still creates a ring-owned root record from an exiting CLI. Client-id release
+  can be lost at control-channel saturation (`RELEASE_LOST`); safe cleanup must acknowledge
+  release without allowing a late retry to free a resumed client's identity. Green OCI/guest
+  requests formerly bypassed form establishment and now refuse instead of reporting a record
+  as a bound path. Source-mounted green support requires its own verified version semantics.
+
+
 ## 1. Immediate failure: fresh voter after a second loss — FIXED (2026-09-17)
 
 - [x] Diagnosed and fixed
@@ -283,9 +375,13 @@ Python/Node/CLI/MCP IPC creation convenience methods. Existing non-IPC removals 
 mode/xattr values, and origin namespace validation needs hostile cross-table tests.
 Review residual
 pjdfstest failures, including cascades from deliberately unsupported devices and the two NFS
-limits. The full unchanged rerun improved from 5,175 passes / 3,595 failures to **6,970 passes /
-1,800 failures** in 172,343 ms. No expected-failure list has been expanded. Windows cross-check
-is blocked by missing target C headers in the existing zstd dependency.
+limits. The first unchanged rerun improved from 5,175 passes / 3,595 failures to **6,970 passes /
+1,800 failures** in 172,343 ms. The subsequent source review and exact expected-failure rerun
+are recorded at the top of this ledger; no upstream assertion changed. Windows cross-compilation
+stopped at missing target C headers in zstd. The authorized Windows VM has been created;
+its official ARM64 installation image is partly downloaded, and native Windows tests have
+not run. An ARM64 guest can exercise x64 user-mode binaries through Windows emulation, but
+does not establish equivalence to GitHub's x64 kernel.
 Record: [special-file investigation](../bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md).
 
 ### 2026-09-20: telemetry drain oracle

@@ -22,6 +22,8 @@ use crate::config::DaemonConfig;
 
 /// One client the shard serves.
 pub struct ClientSlot {
+  /// One ephemeral, metadata-charged daemon status capture on this channel (§4.14).
+  pub(crate) status_pages: crate::status_pages::StatusPages,
   /// The ring ends.
   pub end: DaemonEnd,
   /// The principal established at rendezvous.
@@ -33,6 +35,8 @@ pub struct ClientSlot {
   /// When the client last wrote a slot (any kind); a client silent past the liveness budget
   /// is asked about.
   pub last_seen_ns: u64,
+  /// Dead ring admission is closed while its attachments are retired on all owner shards (§4.7).
+  pub(crate) retiring: bool,
   /// The control channel, where the platform has one (Linux: the socket whose close is how
   /// the daemon learns of a dead client, and whose peer end closing tells the client the
   /// daemon died; held for the client's life).
@@ -664,11 +668,13 @@ pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
 pub fn any_ring_ready() -> bool {
   with_state(|s| {
     s.clients.iter().any(|(_, c)| {
-      c.end
-        .region()
-        .cmd()
-        .depth(c.end.region().object())
-        .is_ok_and(|d| d > 0)
+      !c.retiring
+        && c
+          .end
+          .region()
+          .cmd()
+          .depth(c.end.region().object())
+          .is_ok_and(|d| d > 0)
     }) || !s.deferred.is_empty()
   })
   .unwrap_or(false)
@@ -681,6 +687,20 @@ pub fn deliver(client_index: u32, request: u64, reply: ReplyBody, recorded: bool
     // The origin's `ring.request` span (§4.14), opened at the slot read and kept while the request was
     // away on another shard; it ends when this reply is written into the client's ring.
     let ring = s.forwarded_rings.remove(&request);
+    let recipient = s
+      .clients
+      .generation_at(client_index)
+      .and_then(|generation| {
+        s.clients
+          .get(slates_mem::Handle::from_raw(client_index, generation))
+          .ok()
+      });
+    if !recipient.is_some_and(|client| {
+      !client.retiring
+        && client.client_id == slates_wire::request::RequestId::from_word(request).client
+    }) {
+      return None;
+    }
     s.deferred.push(Deferred {
       client_index,
       request,

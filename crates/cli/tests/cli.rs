@@ -1102,10 +1102,18 @@ impl Drop for ScratchDir {
 
 fn scratch_dir() -> ScratchDir {
   let out = Command::new("mktemp")
-    .args(["-d", "-t", &format!("slates-fleet-{}", std::process::id())])
+    .args([
+      "-d",
+      "-t",
+      &format!("slates-fleet-{}.XXXXXX", std::process::id()),
+    ])
     .output()
     .unwrap();
-  assert!(out.status.success(), "mktemp -d");
+  assert!(
+    out.status.success(),
+    "mktemp -d: {}",
+    String::from_utf8_lossy(&out.stderr)
+  );
   ScratchDir {
     path: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
   }
@@ -1977,11 +1985,154 @@ fn assert_not_a_mount_point_refused(instance: &str, id: &str) {
   );
 }
 
+/// Explicitly detach every binding created by the CLI workload. A missing binding is a failure:
+/// it means the attachment did not survive for the consumer that received it.
 fn detach_all(instance: &str, attachments: &[u64]) {
   for attachment in attachments {
     let (code, _, err) = run(instance, &["detach", &attachment.to_string()]);
     assert_eq!(code, 0, "detach: {err}");
   }
+}
+
+/// Wait for every completed CLI command to be retired. This SDK connection only observes;
+/// both bindings were created by the real CLI, whose processes have already exited.
+fn retire_cli_commands(observer: &mut slates_client::Client) {
+  assert!(
+    wait_for(|| {
+      observer
+        .daemon_status()
+        .unwrap()
+        .shards
+        .iter()
+        .map(|shard| u64::from(shard.clients))
+        .sum::<u64>()
+        == 1
+    }),
+    "only the observing connection remains after the commands exit"
+  );
+}
+
+/// Restart this fixture's daemon under its live anchor, retaining the source mount and
+/// its borrowers. The persistent observer must reconnect and see the replacement process.
+fn restart_binding_daemon(observer: &mut slates_client::Client) {
+  let previous = observer.daemon_status().unwrap().pid;
+  let killed = Command::new("kill")
+    .args(["-KILL", &previous.to_string()])
+    .status()
+    .unwrap();
+  assert!(killed.success(), "kill the fixture's daemon");
+  assert!(
+    wait_for(|| observer.daemon_status().unwrap().pid != previous),
+    "the anchor replaced the daemon"
+  );
+  assert!(
+    observer.reconnects() > 0,
+    "the observer crossed the daemon restart"
+  );
+}
+
+/// A read-only source cannot grant a writable bind even to the volume owner.
+fn assert_read_only_source_refuses_write_binding(instance: &str, id: &str, path: &str) {
+  let (code, _, err) = run(instance, &["mount", id, path, "--read-only"]);
+  assert_eq!(code, 0, "{err}");
+  let (code, _, err) = run(
+    instance,
+    &[
+      "attach",
+      id,
+      "--write",
+      "--oci-source",
+      path,
+      "--oci-destination",
+      "/work",
+      "--json",
+    ],
+  );
+  assert_eq!(code, 1, "a write binding of a read-only source must refuse");
+  let failure: serde_json::Value = serde_json::from_str(err.trim()).unwrap();
+  assert_eq!(failure["error"]["kind"], "refused");
+  assert!(
+    failure["error"]["message"]
+      .as_str()
+      .unwrap()
+      .contains("Forbidden"),
+    "{err}"
+  );
+  assert_eq!(
+    attachments_of(instance, id),
+    "1",
+    "the refused binding has no attachment"
+  );
+  let _reader = attach_oci(instance, id, path, "--read");
+  assert_eq!(
+    attachments_of(instance, id),
+    "2",
+    "a read binding remains usable"
+  );
+  unmount_and_check(instance, id, path);
+}
+
+/// AC-4.11 / T-4.13: the CLI hands off two bindings, exits, and is reaped. Both bindings
+/// must remain until explicitly detached; an additional binding must end with its source mount.
+#[test]
+fn oci_bindings_outlive_the_cli_and_end_with_detach_or_their_source_mount() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() || !mount_nfs_available() {
+    eprintln!("skipping OCI lifecycle: needs SLATES_TEST_CLI=1 and mount_nfs");
+    return;
+  }
+  let instance = format!("cli-oci-life-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut observer = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "oci-life", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  mount_and_check(&instance, &id, &mount_point.path);
+  let writer = attach_oci(&instance, &id, &mount_point.path, "--write");
+  let reader = attach_oci(&instance, &id, &mount_point.path, "--read");
+  retire_cli_commands(&mut observer);
+  assert_eq!(
+    attachments_of(&instance, &id),
+    "3",
+    "both bindings survive CLI retirement"
+  );
+  restart_binding_daemon(&mut observer);
+  assert_eq!(
+    attachments_of(&instance, &id),
+    "3",
+    "recovery keeps the source and both bindings"
+  );
+  detach_all(
+    &instance,
+    &[
+      writer["attachment"].as_u64().unwrap(),
+      reader["attachment"].as_u64().unwrap(),
+    ],
+  );
+  assert_eq!(
+    attachments_of(&instance, &id),
+    "1",
+    "explicit detach preserves the source mount"
+  );
+  roundtrip_a_file_through(&mount_point.path);
+  let _dependent = attach_oci(&instance, &id, &mount_point.path, "--read");
+  retire_cli_commands(&mut observer);
+  assert_eq!(attachments_of(&instance, &id), "2");
+  unmount_and_check(&instance, &id, &mount_point.path);
+  assert_read_only_source_refuses_write_binding(&instance, &id, &mount_point.path);
+  drop(observer);
+  drop(mount_point);
+  drop(anchor);
 }
 
 /// `slates unmount` after the containers ran, retried while the runtime's share holds the point
@@ -2037,6 +2188,11 @@ fn an_oci_container_consumes_the_host_attachment_through_the_runtime_bind() {
   });
   if let Some(attachments) = attachments {
     detach_all(&instance, &attachments);
+    assert_eq!(
+      attachments_of(&instance, &id),
+      "1",
+      "only the kernel mount's attachment remains after cleanup"
+    );
   }
   let unmounted = unmount_after_container(&instance, &path);
   eprintln!(

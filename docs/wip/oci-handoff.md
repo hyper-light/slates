@@ -1,5 +1,20 @@
 # The OCI namespace handoff and the attachment capability report (§4.6 A-9, RQ-20, AC-4.11 / T-4.13): design and measurement record
 
+> **Lifetime correction (2026-09-20, A-28).** A binding belongs to its verified source
+> mount, not the short-lived command that returns the recipe. The source token, live bridge
+> record, volume, principal and rights are checked before admission. The record survives
+> client exit and recovery, has no independent mount capability, and ends on explicit detach
+> or atomically with its source mount. The runtime must finish its bind use before detach;
+> the recipe record cannot unmount a container or flush its cache. The real CLI crash/rights
+> regression passes in 7.90 s with exact cleanup. The original Docker workload also passed
+> with strict detach; broader validation is tracked in GAPS and TBD_FIXES.
+
+> **Source correction (2026-09-20).** Real NFS mounts now carry the AUD-01 attachment
+> capability in their source. OCI verification matches that format and the exact volume
+> name; it returns the descriptive source without the bearer suffix. A bare export is no
+> longer accepted as evidence of an authorized volume mount. Eight pure checks pass;
+> the real macOS container rerun is recorded in the dated OCI verifier bug document.
+
 > Status (2026-09-14, branch `agent/oci-handoff`, four commits over `0ac7aad`). `attach` and
 > `status` now report, per host, every transport with the six facts of §4.6 A-9 (supported
 > transport, target-path constraints, read/write policy, sharing/cache semantics, residency boundary,

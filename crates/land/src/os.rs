@@ -14,12 +14,12 @@
 //! `renameatx_np`), each on a descriptor this host owns.
 //!
 //! Containment (§4.15 step 4, §4.13): [`OsLand::open_target`] opens the target path one
-//! component at a time with `O_DIRECTORY|O_NOFOLLOW`, so a symlink anywhere in it is `ELOOP`
-//! and refused as `EscapesTarget`; `..` is refused; the target must be owned by the effective
+//! component at a time with `O_DIRECTORY|O_NOFOLLOW`; an unfollowed symlink is classified
+//! as `EscapesTarget` even when the OS reports `ENOTDIR`. `..` is refused; the target must be owned by the effective
 //! user (`TargetNotOwned`). `TargetIsVolume` waits on the mount table of Phase 3 (GAPS §8c).
 
 use std::collections::BTreeMap;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::path::{Component, Path};
 
 use rustix::fs::{AtFlags, Mode, OFlags};
@@ -95,6 +95,28 @@ fn dir_flags() -> OFlags {
   OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
 }
 
+/// Linux may report ENOTDIR for O_DIRECTORY|O_NOFOLLOW on a symlink. Inspect only the
+/// refused component, without following it; every successful open still uses NOFOLLOW.
+fn target_component_refusal(
+  dir: BorrowedFd<'_>,
+  name: &str,
+  error: rustix::io::Errno,
+) -> TargetRefusal {
+  if error == rustix::io::Errno::LOOP {
+    return TargetRefusal::EscapesTarget;
+  }
+  if error == rustix::io::Errno::NOTDIR {
+    let stat = match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+      Ok(stat) => stat,
+      Err(error) => return TargetRefusal::Unavailable(refusal(error)),
+    };
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Symlink {
+      return TargetRefusal::EscapesTarget;
+    }
+  }
+  TargetRefusal::Unavailable(refusal(error))
+}
+
 impl OsLand {
   /// Opens an absolute target path with containment and the ownership check, and returns the
   /// writer with the target. Ancestor descriptors used to resolve it are closed on the way.
@@ -112,11 +134,8 @@ impl OsLand {
         Component::CurDir => continue,
         _ => return Err(TargetRefusal::EscapesTarget),
       };
-      let next =
-        rustix::fs::openat(&current, name, dir_flags(), Mode::empty()).map_err(|e| match e {
-          rustix::io::Errno::LOOP => TargetRefusal::EscapesTarget,
-          other => TargetRefusal::Unavailable(refusal(other)),
-        })?;
+      let next = rustix::fs::openat(&current, name, dir_flags(), Mode::empty())
+        .map_err(|error| target_component_refusal(current.as_fd(), name, error))?;
       key.push('/');
       key.push_str(name);
       current = next;

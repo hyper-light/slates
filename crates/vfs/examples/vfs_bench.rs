@@ -21,6 +21,7 @@ use slates_mem::Handle;
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
 use slates_mem::slab::Slab;
+use slates_vfs::VfsError;
 use slates_vfs::clock::HostClock;
 use slates_vfs::dir::{Child, DirNode, MEASURED_CUTOVER};
 use slates_vfs::dirtree::{BLOCK_BYTES, DirBlock, ENTRY_BYTES, Retired};
@@ -481,18 +482,48 @@ fn content_rows(tree: &mut Tree) -> Result<(), Box<dyn Error>> {
   Ok(())
 }
 
-/// Snapshot and clone cost at one tree size, returned for the AC-1.3 verdict.
+/// One successful snapshot lifecycle. A refusal fails the benchmark instead of timing a no-op.
+fn snapshot_cycle(store: &mut Store, volume: &mut Volume) -> Result<(), VfsError> {
+  let snapshot = volume.snapshot(store)?;
+  volume.destroy_snapshot(store, snapshot)
+}
+
+/// Snapshot and clone cost at one tree size, returned for the AC-1.3 verdict. Every size starts
+/// with the same journal state: full of snapshot records. Otherwise the convergence rule can
+/// stop inside named-record eviction at one size and after it at another, comparing different
+/// work. Same-tree evidence: 53 ns during turnover versus 28 ns afterward (2026-09-20;
+/// docs/bugs/2026-09-20-snapshot-benchmark-compares-different-journal-states.md).
 fn snapshot_rows(tree: &mut Tree) -> Result<(Measurement, Measurement), Box<dyn Error>> {
   let files = tree.files;
   let (store, vol) = (&mut tree.store, &mut tree.vol);
+  let prior_head = vol.op_log().head_seq();
+  let warmup_cycles = derived!(
+    JOURNAL_BYTES / size_of::<OpRecord>() + 1,
+    "journal byte budget / smallest record bytes + one record to evict the old tail",
+    ["JOURNAL_BYTES", "size_of::<OpRecord>()"]
+  )
+  .get();
+  for _ in 0..warmup_cycles {
+    snapshot_cycle(store, vol)?;
+  }
+  if vol
+    .op_log()
+    .since(0)
+    .next()
+    .is_some_and(|record| record.seq <= prior_head)
+  {
+    return Err("snapshot warmup did not replace the initial journal".into());
+  }
+  let mut outcome = Ok(());
   let snapshot = measure(
     || {
-      if let Ok(s) = vol.snapshot(store) {
-        let _ = vol.destroy_snapshot(store, s);
+      if outcome.is_ok() {
+        outcome = snapshot_cycle(store, vol);
       }
     },
     BUDGET,
   );
+  outcome?;
   report(
     &format!("snapshot and destroy it at {files} files"),
     &snapshot,

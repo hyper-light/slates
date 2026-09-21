@@ -256,7 +256,7 @@ pub static ACCEPTS_FAILED: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// when the caller runs on the control shard, otherwise as a forget task on it (sharing by move). A forget
 /// task the control shard's channel refuses is counted `RELEASE_LOST` and logged once — the id then holds a
 /// slot of the client bound until the daemon restarts, a visible fault rather than a silent one. The one
-/// release path for a reaped client (`verbs::reap_client`) and a lost admission ([`Admission`]).
+/// release path for a reaped client (`reap::finish`) and a lost admission ([`Admission`]).
 pub(crate) fn release_client_id(client_id: u32, control: u16) {
   if registry::current_shard() == Some(control) {
     state::with_handed(|handed| {
@@ -562,14 +562,19 @@ impl Daemon {
     let control = shards.first().copied().ok_or(ServerError::NotOnShard)?;
     let shard_ids = shards.clone();
     runtime.spawn_on(control, async move {
-      control_loop(
+      let task = futures::spawn(control_loop(
         listener,
         control_config,
         control_env,
         control_identity,
         shard_ids,
-      )
-      .await;
+      ));
+      // Construct the control future on its owning shard: recovery owns thread-local
+      // cross-shard reply registrations, which must never migrate between threads.
+      if task.and_then(futures::detach).is_err() {
+        INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
+        eprintln!("slates-server: the control loop could not be seated");
+      }
     })?;
     // In a fleet (§4.8, boot step 6): the control shard runs the membership loop over the fleet transport,
     // probing its peers, serving their probes, and folding the converged view into the `FleetNode` the
@@ -2075,16 +2080,12 @@ async fn reap_loop() {
   .get();
   loop {
     futures::sleep(cadence).await;
-    let reaped = state::with_state(|s| {
+    state::with_state(|s| {
       let _ = verbs::expire_leases(s);
-      verbs::reap_dead_clients(s, cadence)
-    })
-    .unwrap_or_default();
-    if reaped.clients > 0 {
-      CLIENTS_REAPED.fetch_add(
-        u64::try_from(reaped.clients).unwrap_or(u64::MAX),
-        Ordering::AcqRel,
-      );
+    });
+    let reaped = crate::reap::sweep(cadence).await;
+    if reaped > 0 {
+      CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
   }
 }
@@ -2127,6 +2128,72 @@ async fn serve_loop() {
   }
 }
 
+/// Restore allocation before any handoff. Every owner can retain local completion identities;
+/// the control partition additionally records ids whose client never ran a recorded verb.
+async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[ShardId]) -> bool {
+  let mut highest = 0;
+  for shard in shards {
+    let Some(retained) = crate::xshard::call_within(
+      origin,
+      shard.0,
+      |state| {
+        state
+          .db
+          .partition()
+          .client_id_high_water(state.origin_anchor.0)
+      },
+      LIVENESS_BUDGET_NS,
+    )
+    .await
+    else {
+      INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
+      eprintln!(
+        "slates-server: client identity recovery refused on shard {}",
+        shard.0
+      );
+      return false;
+    };
+    highest = highest.max(retained);
+  }
+  listener.resume_after(highest);
+  true
+}
+
+/// Persist admission before its region can reach the client. A refused publication or exhausted
+/// id space refuses the handoff; no new caller can inherit a retained completion identity (§4.9).
+fn reserve_client_identity(client: u32, instance: &str) -> Result<(), slates_ipc::IpcError> {
+  let unavailable = |why| slates_ipc::IpcError::DaemonUnavailable {
+    endpoint: instance.to_owned(),
+    why,
+  };
+  if client == 0 {
+    return Err(unavailable("client identity space exhausted"));
+  }
+  let reserved = state::with_state(|state| {
+    if client
+      <= state
+        .db
+        .partition()
+        .client_id_high_water(state.origin_anchor.0)
+    {
+      return Ok(());
+    }
+    let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+    state
+      .db
+      .mutate(
+        &mut state.segment,
+        &slates_db::Op::ClientIdReserved { client },
+        now,
+      )
+      .map(|_| ())
+  });
+  match reserved {
+    Some(Ok(())) => Ok(()),
+    _ => Err(unavailable("client identity reservation was not published")),
+  }
+}
+
 /// The control shard's loop: the rendezvous, the heartbeat, and a client handed to its shard
 /// as a spawned task (sharing by move).
 async fn control_loop(
@@ -2162,6 +2229,9 @@ async fn control_loop(
       crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
     }
   }
+  if !restore_client_ids(&mut listener, control, &shards).await {
+    return;
+  }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
   // by the daemon's client capacity, refused typed beyond it (AC-2.6). A client's shard is
   // its id's residue, so a client reconnecting under its old id after a restart lands on the
@@ -2180,6 +2250,7 @@ async fn control_loop(
           CLIENTS_REFUSED.fetch_add(1, Ordering::AcqRel);
           return Err(slates_ipc::IpcError::TooManyClients { limit: bound });
         }
+        reserve_client_identity(client_id, &config.instance)?;
         // The id is reserved in the live set **here**, at admission, not once the accept round returns:
         // an accept round serves every pending connection before it returns, so a burst of connects
         // inside one round was admitted against a live set that did not yet count the earlier ones —
@@ -2258,11 +2329,13 @@ async fn control_loop(
             let server = state::with_state(|s| {
               let last_seen_ns = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
               match s.clients.insert(ClientSlot {
+                status_pages: crate::status_pages::StatusPages::default(),
                 end,
                 principal,
                 client_id,
                 pid,
                 last_seen_ns,
+                retiring: false,
                 control,
                 revoked: false,
                 owner_route: None,

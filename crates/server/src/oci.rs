@@ -17,6 +17,47 @@ use slates_ipc::protocol::{AttachTransport, OciBinding, Refusal, UnsupportedReas
 #[cfg(unix)]
 use slates_ipc::protocol::{HostMountEvidence, HostPathReason};
 
+/// A verified bind recipe and the source mount's authority, kept inside the daemon. Only the
+/// recipe crosses the reply boundary; the source token is checked, never disclosed (§4.13).
+pub(crate) struct Binding {
+  /// The runtime's mount entry and descriptive evidence.
+  pub entry: OciBinding,
+  /// The live source mount this binding must borrow.
+  pub attachment: u64,
+  /// The source mount's token read from the kernel table.
+  pub token: [u8; 16],
+}
+
+impl Binding {
+  /// Check the actual mount before recording its borrower. A stale or foreign source cannot
+  /// create an orphan binding, and a bind cannot promise rights the source does not carry.
+  pub(crate) fn consumer(
+    &self,
+    partition: &slates_db::partition::Partition,
+    volume: slates_db::catalog::VolumeId,
+    principal: &slates_db::catalog::Principal,
+  ) -> Result<slates_db::catalog::Consumer, Refusal> {
+    use slates_db::catalog::Consumer;
+    let parent = partition
+      .attachment(self.attachment)
+      .filter(|parent| {
+        matches!(parent.consumer, Consumer::Bridge)
+          && parent.volume == volume
+          && parent.principal == *principal
+          && self.token != [0; 16]
+          && parent.token == self.token
+          && parent.rights.read
+          && (self.entry.read_only || parent.rights.write)
+      })
+      .ok_or(Refusal::Forbidden {
+        verb: "OCI source mount".to_owned(),
+      })?;
+    Ok(Consumer::Mount {
+      attachment: parent.id,
+    })
+  }
+}
+
 /// The verified binding of `source` (a mount point of the volume named `volume_name`) at
 /// `destination`, read-only or not.
 #[cfg(unix)]
@@ -25,7 +66,7 @@ pub(crate) fn bind(
   source: &str,
   destination: &str,
   read_only: bool,
-) -> Result<OciBinding, Refusal> {
+) -> Result<Binding, Refusal> {
   use slates_bridge_oci::binding::{DestinationRefusal, OciMountEntry};
   use slates_bridge_oci::mount_table::mount_table;
   use slates_bridge_oci::verify::{
@@ -62,16 +103,24 @@ pub(crate) fn bind(
   let entry = OciMountEntry::new(&verified, destination, read_only).map_err(|e| match e {
     DestinationRefusal::NotAbsolute => chosen(HostPathReason::DestinationNotAbsolute),
   })?;
-  Ok(OciBinding {
-    source: entry.source.clone(),
-    destination: entry.destination.clone(),
-    read_only,
-    mount_type: entry.mount_type().to_owned(),
-    options: entry.options(),
-    evidence: HostMountEvidence {
-      fstype: verified.fstype,
-      mount_source: verified.source,
-      names_volume: verified.names_volume,
+  let capability = verified.capability.ok_or(Refusal::AttachmentUnsupported {
+    transport: AttachTransport::Oci,
+    reason: UnsupportedReason::HostMountRequired,
+  })?;
+  Ok(Binding {
+    attachment: capability.attachment,
+    token: capability.token,
+    entry: OciBinding {
+      source: entry.source.clone(),
+      destination: entry.destination.clone(),
+      read_only,
+      mount_type: entry.mount_type().to_owned(),
+      options: entry.options(),
+      evidence: HostMountEvidence {
+        fstype: verified.fstype,
+        mount_source: verified.source,
+        names_volume: verified.names_volume,
+      },
     },
   })
 }
@@ -83,7 +132,7 @@ pub(crate) fn bind(
   _source: &str,
   _destination: &str,
   _read_only: bool,
-) -> Result<OciBinding, Refusal> {
+) -> Result<Binding, Refusal> {
   Err(Refusal::AttachmentUnsupported {
     transport: AttachTransport::Oci,
     reason: UnsupportedReason::HostPlatform,

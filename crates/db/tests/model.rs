@@ -83,6 +83,132 @@ fn open(segment: &mut AnchorSegment) -> Db {
   recover(segment, 0, caps(), 0).unwrap().0
 }
 
+/// AC-4.11 / T-4.13, §4.8: detach a source mount with two bindings, recover the database,
+/// and expect all three gone while another mount remains. Replayed removal is the same atom.
+#[test]
+fn removing_a_source_mount_removes_its_bindings_and_recovery_agrees() {
+  let mut segment = segment("slates-db-mount-dependency", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let volume = volume(1, "mounted");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  let parent = AttachmentRecord {
+    id: 1,
+    volume: volume.id,
+    consumer: Consumer::Bridge,
+    snapshot: None,
+    form: AttachForm::Root,
+    principal: principal(0),
+    rights: Rights {
+      read: true,
+      write: true,
+      admin: false,
+    },
+    token: [1; 16],
+  };
+  for record in [
+    parent.clone(),
+    AttachmentRecord {
+      id: 2,
+      ..parent.clone()
+    },
+    AttachmentRecord {
+      id: 3,
+      consumer: Consumer::Mount { attachment: 1 },
+      form: AttachForm::Oci {
+        source: "/mount".into(),
+        destination: "/work".into(),
+        read_only: false,
+      },
+      ..parent.clone()
+    },
+    AttachmentRecord {
+      id: 4,
+      consumer: Consumer::Mount { attachment: 1 },
+      form: AttachForm::Oci {
+        source: "/mount".into(),
+        destination: "/read".into(),
+        read_only: true,
+      },
+      rights: Rights {
+        read: true,
+        write: false,
+        admin: false,
+      },
+      ..parent
+    },
+  ] {
+    db.mutate(&mut segment, &Op::AttachmentAdded { record }, 0)
+      .unwrap();
+  }
+  db.snapshot(&mut segment).unwrap();
+  let restored = recover(&mut segment, 0, caps(), 0).unwrap().0;
+  assert_eq!(
+    restored.partition().attachments_of(volume.id),
+    db.partition().attachments_of(volume.id),
+    "recovery keeps the live mount and both bindings"
+  );
+  let child = db.partition().attachment(4).unwrap().clone();
+  for invalid in [
+    AttachmentRecord {
+      id: 5,
+      consumer: Consumer::Mount { attachment: 0 },
+      ..child.clone()
+    },
+    AttachmentRecord {
+      id: 5,
+      consumer: Consumer::Mount { attachment: 3 },
+      ..child.clone()
+    },
+    AttachmentRecord {
+      id: 5,
+      principal: principal(1),
+      ..child.clone()
+    },
+    AttachmentRecord {
+      id: 5,
+      form: AttachForm::Root,
+      ..child.clone()
+    },
+    AttachmentRecord {
+      id: 5,
+      rights: Rights {
+        read: true,
+        write: true,
+        admin: true,
+      },
+      ..child
+    },
+  ] {
+    assert_eq!(
+      db.mutate(&mut segment, &Op::AttachmentAdded { record: invalid }, 0),
+      Err(DbError::NotFound)
+    );
+    assert_eq!(
+      db.partition().attachments_of(volume.id).len(),
+      4,
+      "a refused dependency has no effect"
+    );
+  }
+  db.mutate(&mut segment, &Op::AttachmentRemoved { id: 1 }, 0)
+    .unwrap();
+  let recovered = recover(&mut segment, 0, caps(), 0).unwrap().0;
+  for partition in [db.partition(), recovered.partition()] {
+    let remaining: Vec<_> = partition
+      .attachments_of(volume.id)
+      .iter()
+      .map(|record| record.id)
+      .collect();
+    assert_eq!(remaining, vec![2], "only the unrelated mount remains");
+  }
+}
+
 fn vid(n: u64) -> VolumeId {
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&n.to_be_bytes());

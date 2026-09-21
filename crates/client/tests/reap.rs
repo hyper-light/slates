@@ -7,7 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -59,10 +59,12 @@ fn unhex(text: &str) -> VolumeId {
 /// The victim: connects, attaches for writing, prints its client id, and waits to be killed.
 fn victim() {
   let instance = std::env::var(ROLE_INSTANCE).unwrap();
-  let volume = unhex(&std::env::var(ROLE_VOLUME).unwrap());
+  let volumes = std::env::var(ROLE_VOLUME).unwrap();
   let mut client = Client::connect(&instance, deadlines()).unwrap();
-  let attached = client.attach(volume, None, Intent::Write).unwrap();
-  assert_eq!(attached.lease_epoch, Some(1));
+  for volume in volumes.split(',').map(unhex) {
+    let attached = client.attach(volume, None, Intent::Write).unwrap();
+    assert_eq!(attached.lease_epoch, Some(1));
+  }
   println!("victim-id: {}", client.client_id());
   loop {
     std::thread::park();
@@ -96,6 +98,90 @@ fn resume_when_free(instance: &str, client_id: u32) -> Result<Client, ClientErro
   }
 }
 
+/// Own the victim through every assertion, including failures before the deliberate kill.
+struct Victim(Child);
+
+impl Drop for Victim {
+  fn drop(&mut self) {
+    if self
+      .0
+      .try_wait()
+      .expect("inspect the owned victim")
+      .is_none()
+    {
+      self.0.kill().expect("kill the owned victim");
+      self.0.wait().expect("reap the owned victim");
+    }
+  }
+}
+
+fn start_victim(instance: &str, volumes: &[VolumeId]) -> (Victim, u32) {
+  let mut child = Victim(
+    Command::new(std::env::current_exe().unwrap())
+      .args([
+        "--exact",
+        "a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term",
+        "--nocapture",
+      ])
+      .env(ROLE, "victim")
+      .env(ROLE_INSTANCE, instance)
+      .env(
+        ROLE_VOLUME,
+        volumes
+          .iter()
+          .copied()
+          .map(hex)
+          .collect::<Vec<_>>()
+          .join(","),
+      )
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
+  // The harness prints its own banner first; the victim's line is tagged.
+  let victim_id = BufReader::new(child.0.stdout.take().unwrap())
+    .lines()
+    .map(|line| line.expect("read the victim's startup report"))
+    .find_map(|line| {
+      line
+        .strip_prefix("victim-id: ")
+        .map(|number| number.trim().parse().unwrap())
+    })
+    .expect("the victim printed its id");
+  (child, victim_id)
+}
+
+/// T-2.3: both owners reclaim the victim before its lease term ends, preserving the observer.
+fn assert_retired(
+  observer: &mut Client,
+  volume: VolumeId,
+  other_volume: VolumeId,
+  held_at: Instant,
+  reaped_before: u64,
+) {
+  // The reclaim: the attachment leaves, the lease stays for its term.
+  wait_until("the attachment is reclaimed", || {
+    let local = observer.status(volume).unwrap().attachments;
+    let other = observer.status(other_volume).unwrap().attachments;
+    local == 0 && other == 1
+  });
+  assert!(
+    held_at.elapsed() < Duration::from_nanos(LEASE_TERM_NS),
+    "the reclaim came inside the lease term: {:?}",
+    held_at.elapsed()
+  );
+  assert_eq!(
+    observer.status(volume).unwrap().lease_epoch,
+    Some(1),
+    "the lease keeps its term after the reclaim (a paused client is not a dead one)"
+  );
+  assert_eq!(
+    CLIENTS_REAPED.load(Ordering::Acquire),
+    reaped_before + 1,
+    "one client reaped"
+  );
+}
+
 /// The victim is killed; the daemon reclaims its attachment, region and id; the lease keeps
 /// its term and expires; the observing client is unaffected.
 #[test]
@@ -127,61 +213,42 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   let mut observer = Client::connect(&instance, deadlines()).unwrap();
   let volume = observer
     .create(&slates_client::CreateSpec {
-      name: "held".to_owned(),
+      name: "held-0".to_owned(),
       size: SizeClass::Bounded { limit: 1 << 20 },
       names: NamePolicy::Exact,
       require_locked: false,
       base: None,
     })
     .unwrap();
-  let mut child = Command::new(std::env::current_exe().unwrap())
-    .args([
-      "--exact",
-      "a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term",
-      "--nocapture",
-    ])
-    .env(ROLE, "victim")
-    .env(ROLE_INSTANCE, &instance)
-    .env(ROLE_VOLUME, hex(volume))
-    .stdout(Stdio::piped())
-    .spawn()
-    .unwrap();
-  // The harness prints its own banner first; the victim's line is tagged.
-  let victim_id: u32 = BufReader::new(child.stdout.take().unwrap())
-    .lines()
-    .map_while(Result::ok)
-    .find_map(|line| {
-      line
-        .strip_prefix("victim-id: ")
-        .map(|n| n.trim().parse().unwrap())
+  let other_volume = observer
+    .create(&slates_client::CreateSpec {
+      name: "held-1".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
     })
-    .expect("the victim printed its id");
+    .unwrap();
+  assert_ne!(
+    slates_server::verbs::owner_of(volume),
+    slates_server::verbs::owner_of(other_volume),
+    "the history must reach both owner partitions"
+  );
+  let observer_attachment = observer.attach(other_volume, None, Intent::Read).unwrap();
+  let (mut child, victim_id) = start_victim(&instance, &[volume, other_volume]);
   let held_at = Instant::now();
   let report = observer.status(volume).unwrap();
   assert_eq!(report.attachments, 1, "the victim holds its attachment");
   assert_eq!(report.lease_epoch, Some(1), "and the lease");
+  assert_eq!(
+    observer.status(other_volume).unwrap().attachments,
+    2,
+    "the victim and observer each hold an attachment on the other owner"
+  );
   let reaped_before = CLIENTS_REAPED.load(Ordering::Acquire);
-  child.kill().unwrap();
-  child.wait().unwrap();
-  // The reclaim: the attachment leaves, the lease stays for its term.
-  wait_until("the attachment is reclaimed", || {
-    observer.status(volume).unwrap().attachments == 0
-  });
-  assert!(
-    held_at.elapsed() < Duration::from_nanos(LEASE_TERM_NS),
-    "the reclaim came inside the lease term: {:?}",
-    held_at.elapsed()
-  );
-  assert_eq!(
-    observer.status(volume).unwrap().lease_epoch,
-    Some(1),
-    "the lease keeps its term after the reclaim (a paused client is not a dead one)"
-  );
-  assert_eq!(
-    CLIENTS_REAPED.load(Ordering::Acquire),
-    reaped_before + 1,
-    "one client reaped"
-  );
+  child.0.kill().unwrap();
+  child.0.wait().unwrap();
+  assert_retired(&mut observer, volume, other_volume, held_at, reaped_before);
   // The id is free again: a session under it resumes instead of being refused.
   assert!(resume_when_free(&instance, victim_id).is_ok());
   // The lease expires by its term, with nobody asking.
@@ -190,5 +257,11 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   });
   // The observer was served throughout; its counters say so.
   assert_eq!(observer.reconnects(), 0);
+  observer.detach(observer_attachment.attachment).unwrap();
+  assert_eq!(
+    observer.status(other_volume).unwrap().attachments,
+    0,
+    "the surviving client's attachment was retained until its exact detach"
+  );
   daemon.stop();
 }

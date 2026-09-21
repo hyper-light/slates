@@ -117,6 +117,12 @@ impl Listener {
     })
   }
 
+  /// Restore the daemon's durable allocation floor before accepting any connections (§4.9).
+  /// Zero is the exhausted sentinel, never a fresh identity; an old session can still resume.
+  pub fn resume_after(&mut self, highest: u32) {
+    self.next_client = highest.checked_add(1).unwrap_or(0);
+  }
+
   /// Serves every pending connection without blocking: for each, `make_region` builds the
   /// client's region (the daemon's derivation of its geometry and shard) for the id the
   /// daemon assigns (the peer's wanted id when `in_use` says it is free, else a fresh one),
@@ -128,21 +134,20 @@ impl Listener {
   ) -> Result<Vec<Accepted>, IpcError> {
     let mut out = Vec::new();
     loop {
-      let fresh = self.next_client;
       let mut assign = |wanted: u32| -> u32 {
-        if wanted != 0 && !in_use(wanted) {
+        let assigned = if wanted != 0 && !in_use(wanted) {
           wanted
         } else {
-          fresh
+          self.next_client
+        };
+        // Once selected, a fresh identity is consumed even if the handoff later fails.
+        if self.next_client != 0 && assigned >= self.next_client {
+          self.next_client = assigned.checked_add(1).unwrap_or(0);
         }
+        assigned
       };
       match self.inner.accept_one(&mut assign, make_region) {
         Ok(Some(accepted)) => {
-          if accepted.client_id == fresh {
-            self.next_client = self.next_client.wrapping_add(1);
-          } else if accepted.client_id >= self.next_client {
-            self.next_client = accepted.client_id.wrapping_add(1);
-          }
           out.push(accepted);
         }
         Ok(None) => break,

@@ -555,6 +555,10 @@ pub(crate) fn attach_green(
   if !rights_of(record, principal).read {
     return forbidden("attach");
   }
+  let consumer = match crate::verbs::consumer_of(form, client_id) {
+    Ok(consumer) => consumer,
+    Err(refusal) => return refused(refusal),
+  };
   let Some(engine) = state.greens.get(&record.id) else {
     return refused(Refusal::NotFound);
   };
@@ -575,7 +579,7 @@ pub(crate) fn attach_green(
       id: attachment,
       volume: record.id,
       // A host mount of the green is the bridge's attachment, as a plain volume's is (AUD-01).
-      consumer: crate::verbs::consumer_of(form, client_id),
+      consumer,
       snapshot: None,
       form: AttachForm::Root,
       principal: principal.clone(),

@@ -17,7 +17,7 @@ use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
 use slates_db::{DbError, DurabilityScope, Partition};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
-  FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, OciBinding, PlacedState, ReadAt,
+  FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt,
   ReadWritePolicy, Refusal, RefusalCount, ReplyBody, RequestBody, Scope, ShardReport, Signal,
   SizeClass, SnapshotId, StatusReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
   decode_body, encode_body, pack, unpack,
@@ -326,6 +326,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Detach { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
+    | RequestBody::DaemonStatusNext { .. }
     | RequestBody::Bootstrap { .. }
     | RequestBody::RecoveryPlan { .. }
     | RequestBody::Recover { .. }
@@ -1062,6 +1063,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       refused(Refusal::ConsumerRevoked),
     ));
   }
+  if let Some(reply) = status_on_channel(state, client, request.request, &body) {
+    return reply;
+  }
   if let RequestBody::Attest { consumer, proof } = body {
     return attest_on_channel(
       state,
@@ -1080,9 +1084,6 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   if let RequestBody::Grants = body {
     return scatter_grants(state, client.index(), request.request, principal);
-  }
-  if let RequestBody::DaemonStatus = body {
-    return scatter_status(state, client.index(), request.request);
   }
   if matches!(
     &body,
@@ -1279,6 +1280,38 @@ fn run_forwarded(
   let reply = run_recorded(state, origin, id, client_id, principal, body);
   state.current_span = None;
   reply
+}
+
+/// Applies the channel-local status cursor discipline before dispatching ordinary verbs.
+fn status_on_channel(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  request: u64,
+  body: &RequestBody,
+) -> Option<Served> {
+  let slot = state.clients.get_mut(client).ok()?;
+  if let RequestBody::DaemonStatusNext { snapshot, offset } = body {
+    let capacity = slates_ipc::status::page_capacity(slot.end.region());
+    let now = state.clock.monotonic_ns();
+    return Some(Served::Reply(
+      slot
+        .status_pages
+        .page(*snapshot, *offset, capacity, now, &mut state.store.metadata)
+        .unwrap_or_else(refused),
+    ));
+  }
+  slot.status_pages.clear(&mut state.store.metadata);
+  if matches!(body, RequestBody::DaemonStatus) {
+    let expires = state
+      .clock
+      .monotonic_ns()
+      .saturating_add(state.config.failover_slo_ns);
+    slot
+      .status_pages
+      .begin(request, expires, &mut state.store.metadata);
+    return Some(scatter_status(state, client.index(), request));
+  }
+  None
 }
 
 /// Records the completion (RIFL) and counts the refusal; the reply is then durable and may be
@@ -1688,7 +1721,8 @@ fn gather_status(request: u64, part: Option<ShardReport>) {
     shards.sort_by_key(|r| r.partition);
     let reply = crate::state::with_state(|s| daemon_report(s, shards))
       .unwrap_or_else(|| refused(Refusal::NotFound));
-    crate::state::deliver(client_index, request, reply, false);
+    // A status capture is ephemeral; paging never appends the full report to the op log.
+    crate::state::deliver(client_index, request, reply, true);
   }
 }
 
@@ -1910,7 +1944,7 @@ fn gather(request: u64, part: Vec<VolumeSummary>) {
   }
 }
 
-fn refusal_name(r: &Refusal) -> &'static str {
+pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
   match r {
     Refusal::NotFound => "not_found",
     Refusal::AlreadyExists { .. } => "already_exists",
@@ -2138,6 +2172,7 @@ fn dispatch_inner(
       let mine = shard_report(state);
       daemon_report(state, vec![mine])
     }
+    RequestBody::DaemonStatusNext { .. } => refused(Refusal::NotFound),
     RequestBody::Telemetry { partition } => crate::telemetry::drain_verb(state, partition),
     // `serve` routes this to the control shard (`promote_region_on_root`) before dispatch; this defensive arm
     // proposes on whatever shard reached it — correct on the control shard, refused `NotRootLeader` otherwise.
@@ -3996,15 +4031,20 @@ fn attach(
   if !allowed {
     return forbidden("attach");
   }
-  // Whose the attachment is (§4.6, §4.13; AUD-01): a host kernel mount's is the bridge's — it outlives
-  // this ring client and the daemon, ending with the kernel's `UMNT` — while every other form is this
-  // client's, reclaimed with it (`reap_client`) and at recovery (`reconcile_lost`).
-  let consumer = consumer_of(&form, client_id);
   let situation = crate::transports::situation(state, &rights);
   let binding = match establish_form(&record, &situation, snapshot, intent, &form) {
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
+  let consumer = binding.as_ref().map_or_else(
+    || consumer_of(&form, client_id),
+    |binding| binding.consumer(state.db.partition(), record.id, principal),
+  );
+  let consumer = match consumer {
+    Ok(consumer) => consumer,
+    Err(refusal) => return refused(refusal),
+  };
+  let borrows_mount = binding.is_some();
   let now = state.clock.monotonic_ns();
   let lease_epoch = match intent {
     Intent::Read => None,
@@ -4021,12 +4061,12 @@ fn attach(
     ),
     Some(binding) => (
       AttachForm::Oci {
-        source: binding.source.clone(),
-        destination: binding.destination.clone(),
-        read_only: binding.read_only,
+        source: binding.entry.source.clone(),
+        destination: binding.entry.destination.clone(),
+        read_only: binding.entry.read_only,
       },
       Established::OciBind {
-        binding: Box::new(binding),
+        binding: Box::new(binding.entry),
       },
       crate::transports::oci(&situation),
     ),
@@ -4037,7 +4077,12 @@ fn attach(
   // to the authorized consumer and presented at the NFS mount so the loopback edge authorizes the
   // connection as this consumer with the granted `rights`. Refused (never a weak token) if the platform's
   // secure random is unavailable, the same discipline the daemon applies to its issuer secret.
-  let Some(token) = mint_mount_token() else {
+  // A bind borrows the parent's authority; it must not mint an independent mount capability.
+  let Some(token) = (if borrows_mount {
+    Some([0; 16])
+  } else {
+    mint_mount_token()
+  }) else {
     return refused(Refusal::BadRequest {
       reason: "secure random unavailable for the mount capability token".to_owned(),
     });
@@ -4068,7 +4113,7 @@ fn attach(
     version: None,
     established,
     capability,
-    token: Some(token),
+    token: (!borrows_mount).then_some(token),
   }
 }
 
@@ -4086,14 +4131,20 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// host kernel mount's attachment is the OS filesystem bridge's (`Consumer::Bridge`) — it outlives the
 /// ring client that requested it (`slates mount` exits after `mount_nfs`) and the daemon (the anchor
 /// keeps the listener across a restart), ending with the kernel's `UMNT`, a `detach`, or the volume's
-/// destroy; every other form is the requesting ring client's (`Consumer::Sdk`), reclaimed when that
-/// client is found gone (`reap_client`) and at recovery (`reconcile_lost`).
-pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Consumer {
+/// destroy. A root record is the ring client's. OCI requires a verified source dependency,
+/// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
+pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consumer, Refusal> {
   match form {
-    AttachRequest::HostMount => Consumer::Bridge,
-    AttachRequest::Root | AttachRequest::Oci { .. } | AttachRequest::Guest { .. } => {
-      Consumer::Sdk { client: client_id }
-    }
+    AttachRequest::HostMount => Ok(Consumer::Bridge),
+    AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
+    AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Oci,
+      reason: UnsupportedReason::HostMountRequired,
+    }),
+    AttachRequest::Guest { transport } => Err(Refusal::AttachmentUnsupported {
+      transport: *transport,
+      reason: UnsupportedReason::SeamNotOnWire,
+    }),
   }
 }
 
@@ -4120,7 +4171,7 @@ fn establish_form(
   snapshot: Option<SnapshotId>,
   intent: Intent,
   form: &AttachRequest,
-) -> Result<Option<OciBinding>, Refusal> {
+) -> Result<Option<crate::oci::Binding>, Refusal> {
   let (source, destination) = match form {
     // The record forms: nothing to establish — the SDK's record, and the host mount the requesting
     // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
@@ -5389,8 +5440,12 @@ fn pin(
 pub fn serve_round(state: &mut ShardState) -> bool {
   let mut any = retry_forwards(state);
   any |= retry_deferred(state);
-  let handles: Vec<(u32, Handle<ClientSlot>)> =
-    state.clients.iter().map(|(h, _)| (h.index(), h)).collect();
+  let handles: Vec<(u32, Handle<ClientSlot>)> = state
+    .clients
+    .iter()
+    .filter(|(_, client)| !client.retiring)
+    .map(|(handle, _)| (handle.index(), handle))
+    .collect();
   // One clock read per round marks every client served in it (the reap's silence clock).
   let now = state.clock.monotonic_ns();
   for (index, handle) in handles {
@@ -5414,68 +5469,6 @@ pub fn expire_leases(state: &mut ShardState) -> usize {
   count
 }
 
-/// What one sweep for dead clients did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Reaped {
-  /// Clients found gone and reclaimed.
-  pub clients: usize,
-  /// Their attachments removed.
-  pub attachments: usize,
-}
-
-/// Asks about every client silent past `silence_ns` and reclaims the gone ones (§4.7 "Failure
-/// matrix"): its attachments leave the catalog as recorded operations, its region and control
-/// channel are dropped, its id is returned to the control shard's live set, and its leases
-/// keep their terms (a paused client is not a dead one; the term is the fence, D-16). Other
-/// clients are untouched.
-pub fn reap_dead_clients(state: &mut ShardState, silence_ns: u64) -> Reaped {
-  let now = state.clock.monotonic_ns();
-  let silent: Vec<(Handle<ClientSlot>, u32)> = state
-    .clients
-    .iter()
-    .filter(|(_, c)| now.saturating_sub(c.last_seen_ns) >= silence_ns)
-    .map(|(h, c)| (h, c.client_id))
-    .collect();
-  let mut reaped = Reaped::default();
-  for (handle, client_id) in silent {
-    let gone = state
-      .clients
-      .get(handle)
-      .is_ok_and(|c| crate::peer::peer_gone(c.control.as_ref(), c.pid));
-    if !gone {
-      continue;
-    }
-    reaped.attachments += reap_client(state, handle, client_id);
-    reaped.clients += 1;
-  }
-  reaped
-}
-
-/// Reclaims one client; its attachments removed, counted.
-fn reap_client(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) -> usize {
-  let now = state.clock.monotonic_ns();
-  let mut removed = 0;
-  for id in state.db.partition().attachments_of_client(client_id) {
-    if state
-      .db
-      .mutate(&mut state.segment, &Op::AttachmentRemoved { id }, now)
-      .is_ok()
-    {
-      removed += 1;
-    }
-  }
-  let index = handle.index();
-  state.deferred.retain(|d| d.client_index != index);
-  // The slot goes last: the region's mapping and the control channel close with it.
-  let _ = state.clients.remove(handle);
-  // The id returns to the control shard's live set (directly on it, or as a task there — sharing by
-  // move); a return the control shard's channel refuses is counted and logged, never dropped.
-  if let Some(control) = state.shards.first().copied() {
-    crate::daemon::release_client_id(client_id, control);
-  }
-  removed
-}
-
 /// Deferred replies first: a reply back from another shard (recorded as a completion here,
 /// the client's shard) or one whose completion ring was full and may have room now.
 fn retry_deferred(state: &mut ShardState) -> bool {
@@ -5495,7 +5488,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
     // ephemeral member id, or a retry of a deferred request finds no record and runs again; a cross-node
     // forward records on the owner under its authenticated origin instead.
     let origin = state.origin_anchor.0;
-    let reply = if recorded {
+    let mut reply = if recorded {
       reply
     } else {
       match state
@@ -5507,7 +5500,7 @@ fn retry_deferred(state: &mut ShardState) -> bool {
         _ => reply,
       }
     };
-    if send_reply(state, client_index, request, &reply) {
+    if send_reply(state, client_index, request, &mut reply) {
       any = true;
       // The `ring.request` span (§4.14) for a reply that was deferred (its ring was full, or it came
       // back from another shard) and is now written: from the slot read to the reply written.
@@ -5550,6 +5543,11 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     if let Ok(c) = state.clients.get_mut(handle) {
       c.last_seen_ns = now;
     }
+    if request.kind == SlotKind::Cancel
+      && let Ok(client) = state.clients.get_mut(handle)
+    {
+      client.status_pages.clear(&mut state.store.metadata);
+    }
     if matches!(request.kind, SlotKind::Heartbeat | SlotKind::Cancel) {
       continue;
     }
@@ -5567,8 +5565,8 @@ fn serve_client(state: &mut ShardState, index: u32, handle: Handle<ClientSlot>, 
     let served = serve(state, handle, &request);
     state.current_span = None;
     match served {
-      Served::Reply(reply) => {
-        if send_reply(state, index, request.request, &reply) {
+      Served::Reply(mut reply) => {
+        if send_reply(state, index, request.request, &mut reply) {
           // Written synchronously: the span ends at the reply written.
           let written_ns = state.clock.monotonic_ns();
           let label = u32::from(state.partition);
@@ -5613,7 +5611,12 @@ fn remember_forwarded_ring(
 
 /// Writes a reply into the client's completion ring; false when the ring is full (the reply
 /// is kept and retried; never dropped).
-fn send_reply(state: &mut ShardState, client_index: u32, request: u64, reply: &ReplyBody) -> bool {
+fn send_reply(
+  state: &mut ShardState,
+  client_index: u32,
+  request: u64,
+  reply: &mut ReplyBody,
+) -> bool {
   let Some(generation) = state.clients.generation_at(client_index) else {
     return true;
   };
@@ -5621,6 +5624,25 @@ fn send_reply(state: &mut ShardState, client_index: u32, request: u64, reply: &R
   let Ok(client) = state.clients.get_mut(handle) else {
     return true;
   };
+  if client.retiring || client.client_id != RequestId::from_word(request).client {
+    return true;
+  }
+  if matches!(reply, ReplyBody::DaemonStatus { .. }) {
+    let capacity = slates_ipc::status::snapshot_capacity(client.end.region());
+    let page = slates_ipc::status::page_capacity(client.end.region());
+    let now = state.clock.monotonic_ns();
+    // Replace the deferred reply itself: a full ring retries these exact page bytes,
+    // including the final page whose retained snapshot has already been released.
+    *reply = client
+      .status_pages
+      .capture(request, reply, capacity, &mut state.store.metadata)
+      .and_then(|()| {
+        client
+          .status_pages
+          .page(request, 0, page, now, &mut state.store.metadata)
+      })
+      .unwrap_or_else(refused);
+  }
   let index = client.end.next_reply_index();
   let slot = match pack(
     client.end.region_mut(),

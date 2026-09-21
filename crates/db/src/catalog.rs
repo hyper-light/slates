@@ -316,6 +316,13 @@ pub enum Consumer {
   Bridge,
   /// The launcher.
   Launcher,
+  /// An OCI binding borrowing a host mount (§4.6): it survives the issuing client and ends
+  /// with explicit detach, the source mount, or the volume. The parent must be a bridge
+  /// attachment of the same volume; dependencies cannot form chains or cycles.
+  Mount {
+    /// The owning host mount's attachment id.
+    attachment: u64,
+  },
 }
 
 /// The form of an attachment. Append-only.

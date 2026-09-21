@@ -102,6 +102,8 @@ pub struct PartitionSnapshot {
   pub green_chains: Vec<GreenChain>,
   /// The enrolled consumers, by id order (§4.13; appended for append-only evolution).
   pub consumers: Vec<ConsumerRecord>,
+  /// Highest client id reserved before handoff (§4.7); zero before the first admission.
+  pub client_id_high_water: u32,
 }
 
 /// The partition.
@@ -119,6 +121,8 @@ pub struct Partition {
   attachments: Slab<AttachmentRecord>,
   attachment_index: Art<Handle<AttachmentRecord>>,
   completions: BTreeMap<(u64, u32), ClientWindow<Vec<u8>>>,
+  /// A scalar reservation, retained even when a client ran no recorded verb.
+  client_id_high_water: u32,
   grants: BTreeMap<u64, GrantRecord>,
   /// The enrolled consumers, by id (§4.13; bounded by the enrollments a human makes, one durable record
   /// each — never grown by a workload).
@@ -172,6 +176,7 @@ impl Partition {
       attachments: Slab::new(caps.segment_slots, caps.attachments),
       attachment_index: Art::new(),
       completions: BTreeMap::new(),
+      client_id_high_water: 0,
       grants: BTreeMap::new(),
       consumers: BTreeMap::new(),
       landing_leases: Art::new(),
@@ -276,6 +281,37 @@ impl Partition {
       .collect()
   }
 
+  /// A binding borrows one live bridge mount of the same volume and principal, within its
+  /// rights (§4.6). This guard also prevents dependency chains and cycles before the append.
+  fn check_mount_dependency(&self, record: &AttachmentRecord) -> Result<(), DbError> {
+    let Consumer::Mount { attachment } = record.consumer else {
+      return Ok(());
+    };
+    let parent = self.attachment(attachment).ok_or(DbError::NotFound)?;
+    if !matches!(parent.consumer, Consumer::Bridge)
+      || parent.volume != record.volume
+      || parent.principal != record.principal
+      || !matches!(record.form, crate::catalog::AttachForm::Oci { .. })
+      || record.snapshot.is_some()
+      || (record.rights.read && !parent.rights.read)
+      || (record.rights.write && !parent.rights.write)
+      || record.rights.admin
+    {
+      return Err(DbError::NotFound);
+    }
+    Ok(())
+  }
+
+  /// Removes one already-checked attachment while applying its recorded transition.
+  fn remove_attachment(&mut self, id: u64) -> Result<(), DbError> {
+    let handle = self
+      .attachment_index
+      .remove(&id.to_be_bytes())
+      .ok_or(DbError::NotFound)?;
+    self.attachments.remove(handle)?;
+    Ok(())
+  }
+
   /// The highest attachment id the partition holds, or `None` when it holds none (a walk of the table,
   /// bounded by its cap; asked once at boot, so a fresh counter never re-mints a recovered id).
   pub fn highest_attachment(&self) -> Option<u64> {
@@ -307,6 +343,18 @@ impl Partition {
       .completions
       .get(&(origin, client))
       .and_then(ClientWindow::acknowledged_up_to)
+  }
+
+  /// The allocation floor after recovery: issued ids and this host's retained completion
+  /// identities. Foreign hosts' client numbers never advance the local allocator.
+  pub fn client_id_high_water(&self, origin: u64) -> u32 {
+    self
+      .completions
+      .range((origin, 0)..=(origin, u32::MAX))
+      .next_back()
+      .map_or(self.client_id_high_water, |((_, client), _)| {
+        self.client_id_high_water.max(*client)
+      })
   }
 
   /// The grants made for a principal (a walk of the table; a `slates grants` read, never a
@@ -414,6 +462,7 @@ impl Partition {
       Op::LeaseReleased { volume } => self.volume(*volume).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentAdded { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
+        self.check_mount_dependency(record)?;
         if self.attachment(record.id).is_some() {
           return Err(DbError::AlreadyExists {
             existing: record.volume.bytes,
@@ -439,7 +488,7 @@ impl Partition {
           Seen::New | Seen::Completed(_) => Ok(()),
         }
       }
-      Op::CompletionsAcknowledged { .. } => Ok(()),
+      Op::CompletionsAcknowledged { .. } | Op::ClientIdReserved { .. } => Ok(()),
       Op::GrantIssued { record } => {
         if self.grants.contains_key(&record.id) {
           return Err(DbError::AlreadyExists {
@@ -613,12 +662,28 @@ impl Partition {
         self.attachment_index.insert(&record.id.to_be_bytes(), h);
         Ok(())
       }
+      Op::ClientIdReserved { client } => {
+        self.client_id_high_water = self.client_id_high_water.max(*client);
+        Ok(())
+      }
       Op::AttachmentRemoved { id } => {
-        let h = self
-          .attachment_index
-          .remove(&id.to_be_bytes())
-          .ok_or(DbError::NotFound)?;
-        self.attachments.remove(h)?;
+        // One recorded transition removes the mount and its borrowers. A dependency is
+        // one level deep by admission, so no recursive walk or intermediate orphan exists.
+        let dependent: Vec<u64> = if self
+          .attachment(*id)
+          .is_some_and(|record| matches!(record.consumer, Consumer::Bridge))
+        {
+          self.attachments.iter()
+            .filter(|(_, record)| matches!(record.consumer, Consumer::Mount { attachment } if attachment == *id))
+            .map(|(_, record)| record.id)
+            .collect()
+        } else {
+          Vec::new()
+        };
+        for dependent in dependent {
+          self.remove_attachment(dependent)?;
+        }
+        self.remove_attachment(*id)?;
         Ok(())
       }
       Op::CompletionRecorded { record } => {
@@ -830,6 +895,7 @@ impl Partition {
   /// The whole state as one value, labelled with `seq`.
   pub fn to_snapshot(&self, seq: u64) -> PartitionSnapshot {
     PartitionSnapshot {
+      client_id_high_water: self.client_id_high_water,
       seq,
       volumes: self.volumes().into_iter().cloned().collect(),
       snapshots: self
@@ -906,6 +972,7 @@ impl Partition {
     now_ns: u64,
   ) -> Result<Partition, DbError> {
     let mut p = Partition::new(caps, now_ns);
+    p.client_id_high_water = snapshot.client_id_high_water;
     for v in &snapshot.volumes {
       p.insert_volume(v.clone())?;
     }

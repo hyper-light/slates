@@ -4446,6 +4446,9 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
   let pid = std::process::id();
   let (mut profile_a, host_a, identity_a) = fleet_node("bounded-a");
   profile_a.facts.memory.limit = Some(POD_MEMORY_BYTES);
+  // The node runs one shard. Derive its budgets from one core as well, so a larger host
+  // cannot make the per-shard peer population smaller than the container's.
+  profile_a.facts.cores.truncate(1);
   let (profile_b, host_b, identity_b) = fleet_node("bounded-b");
   let anchor_a = anchor_of(&profile_a);
   let anchor_b = anchor_of(&profile_b);
@@ -4582,6 +4585,17 @@ impl Client {
   }
 
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
+    if matches!(body, RequestBody::DaemonStatus) {
+      let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
+      return slates_ipc::status::collect::<IpcError>(capacity, |request| {
+        Ok(self.call_once(request))
+      })
+      .unwrap();
+    }
+    self.call_once(body)
+  }
+
+  fn call_once(&mut self, body: &RequestBody) -> ReplyBody {
     self.sequence += 1;
     self.send_at(self.sequence, body)
   }

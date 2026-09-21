@@ -3,22 +3,82 @@
   "suite": "workloads",
   "transport": "native-linux-fuse",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
-    "arch": "arm64",
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
-  "command": "",
-  "bound": "",
+  "date": "2026-09-20",
+  "command": "sh -c '<roster script>' in <host scratch>/<tool> and <mount>/<tool>, per tool of crates/conformance/src/workload.rs ROSTER; trees compared by manifest",
+  "bound": "9 tools run, one script each",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "lane",
-      "reason": "runs in the Linux lane, not on macOS"
+    "kind": "limited",
+    "adapter": "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS)",
+    "not_covered": "the FUSE bridge itself (crates/bridge-fuse): no daemon transport serves /dev/fuse (`crates/server` links the crate only as a dev-dependency) and `slates mount` is `mount_nfs`-only",
+    "counts": {
+      "suite": "workloads",
+      "tools": [
+        {
+          "name": "git",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "cargo",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "npm",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "python",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rg",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rsync",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "sqlite",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "editor",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "watcher",
+          "status": {
+            "kind": "identical"
+          }
+        }
+      ]
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "duration_ms": 11798,
+  "notes": [
+    "the volume was created with --fold=false to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s",
+    "the suite volume is 190MiB: 512MiB was refused BudgetExceeded with 265814016 bytes available on the daemon's shard, so it was sized to three quarters of that"
+  ]
 }

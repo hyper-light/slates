@@ -215,6 +215,12 @@ pub enum Op {
     /// The encoded origin.
     origin: Vec<u8>,
   },
+  /// Reserve a client identity before handoff (§4.7, §4.9). The control partition retains
+  /// the highest issued id so a restarted listener cannot reuse a completion identity.
+  ClientIdReserved {
+    /// The highest client id issued so far.
+    client: u32,
+  },
 }
 
 impl Op {
@@ -250,6 +256,7 @@ impl Op {
       Op::AuditAppended { .. } => "audit_appended",
       Op::GreenAdvanced { .. } => "green_advanced",
       Op::GreenOriginated { .. } => "green_originated",
+      Op::ClientIdReserved { .. } => "client_id_reserved",
     }
   }
 }

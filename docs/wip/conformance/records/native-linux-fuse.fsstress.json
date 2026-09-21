@@ -3,22 +3,33 @@
   "suite": "fsstress",
   "transport": "native-linux-fuse",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
-    "arch": "arm64",
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
-  "command": "",
-  "bound": "",
+  "date": "2026-09-20",
+  "command": "<scratch>/tools/ltp/fsstress -d <mount>/conformance-<pid>/fsstress -n 500 -p 4 -s 1 -v",
+  "bound": "500 operations per process × 4 processes, seed 1",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "lane",
-      "reason": "runs in the Linux lane, not on macOS"
+    "kind": "limited",
+    "adapter": "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS)",
+    "not_covered": "the FUSE bridge itself (crates/bridge-fuse): no daemon transport serves /dev/fuse (`crates/server` links the crate only as a dev-dependency) and `slates mount` is `mount_nfs`-only",
+    "counts": {
+      "suite": "fsstress",
+      "operations": 500,
+      "processes": 4,
+      "seed": 1,
+      "logged_operations": 2000,
+      "disabled_operations": [],
+      "ok": true
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "duration_ms": 95830,
+  "notes": [
+    "fsstress: linux-test-project/ltp@6af38cf testcases/kernel/fs/fsstress/fsstress.c (GPL-2.0), sha256 9a80bbe1f1ad933845b9272b5057776e74923503bbb6f392bf1e135c1744d644, built `cc -O2 -w -DNO_XFS -D_GNU_SOURCE -include shim/config.h` over the harness's shim config.h",
+    "the daemon answered `volume list` after the run: true",
+    "the suite volume is 190MiB: 512MiB was refused BudgetExceeded with 265814016 bytes available on the daemon's shard, so it was sized to three quarters of that"
+  ]
 }

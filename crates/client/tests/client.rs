@@ -246,7 +246,7 @@ fn assert_retry_meets_record(
     slates_ipc::protocol::ReplyBody::Created { id: kept },
     "the original reply, not a second create"
   );
-  wait_until_listed(client, &["kept"]);
+  wait_until_listed(client, &["before-restart", "kept"]);
 }
 
 /// A session outlives a daemon restart over the same segment (the test plays the anchor):
@@ -294,11 +294,28 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   let snapshot = client.snapshot(kept).unwrap();
   assert_eq!(client.status(kept).unwrap().snapshots, 1);
   let session = client.session();
+  let mut exited = connect(&instance);
+  let before_restart = exited.create(&scratch("before-restart")).unwrap();
+  let silent = connect(&instance);
+  let highest_issued = silent.client_id();
+  drop(exited);
+  drop(silent);
   first.stop();
   let second = Daemon::start(&profile, config, source()).unwrap();
   second
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
+  let mut fresh = connect(&instance);
+  assert_eq!(
+    fresh.status(kept).unwrap().snapshots,
+    1,
+    "the new status must not replay an old client's create completion"
+  );
+  assert_eq!(fresh.status(before_restart).unwrap().snapshots, 0);
+  assert!(
+    fresh.client_id() > highest_issued,
+    "even a client that ran no verb reserved its id before the restart"
+  );
   assert_served_after_restart(&mut client, kept, session, snapshot);
   assert_retry_meets_record(&mut client, kept, create_id);
   // New work continues under the session's sequence.
@@ -311,6 +328,73 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   ));
   second.stop();
   drop(segment);
+}
+
+/// AC-2.3 / AC-2.6: use the last fresh identity, refuse the next admission, restart, and
+/// expect the existing session to keep working while fresh admission remains refused.
+#[test]
+fn exhausted_client_id_space_refuses_fresh_callers_but_preserves_a_resuming_session() {
+  let profile = profile();
+  let instance = format!("cl-id-end-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  // The anchor keeps both content publication slots as well as metadata across the restart.
+  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap() * 2;
+  let mut segment = AnchorSegment::create(
+    "slates-seg-cl-id-end",
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content("slates-con-cl-id-end", content_bytes)
+  .unwrap();
+  // Build the retained admission history at the format boundary without billions of connects.
+  let (mut db, _) = slates_db::replay::recover(&mut segment, 0, config.caps, 0).unwrap();
+  db.mutate(
+    &mut segment,
+    &slates_db::Op::ClientIdReserved {
+      client: u32::MAX - 1,
+    },
+    0,
+  )
+  .unwrap();
+  db.snapshot(&mut segment).unwrap();
+  drop(db);
+  let source = || {
+    let (handoff, len) = segment.handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content: segment.content_handoff().unwrap(),
+    }
+  };
+  let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  first.bootstrap(true).unwrap();
+  let mut client = connect(&instance);
+  assert_eq!(client.client_id(), u32::MAX);
+  let kept = client.create(&scratch("last-identity")).unwrap();
+  assert_fresh_identity_refused(&instance);
+  assert_eq!(client.status(kept).unwrap().name, "last-identity");
+  first.stop();
+  let second = Daemon::start(&profile, config, source()).unwrap();
+  second.bootstrap(true).unwrap();
+  assert_eq!(client.status(kept).unwrap().name, "last-identity");
+  assert_eq!(client.client_id(), u32::MAX);
+  assert!(
+    client.reconnects() > 0,
+    "the existing session really resumed"
+  );
+  assert_fresh_identity_refused(&instance);
+  assert_eq!(client.status(kept).unwrap().name, "last-identity");
+  second.stop();
+}
+
+fn assert_fresh_identity_refused(instance: &str) {
+  assert!(matches!(
+    Client::connect(instance, deadlines()),
+    Err(ClientError::Ipc(
+      slates_ipc::IpcError::DaemonUnavailable { .. }
+    ))
+  ));
 }
 
 /// Commits two versions on a green: create `f`, then modify it, so the chain has versions 1 and 2.

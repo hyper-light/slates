@@ -48,8 +48,8 @@ struct HostRoot {
 }
 
 impl HostRoot {
-  fn create(base: &Path) -> io::Result<Self> {
-    let path = base.join(format!("slates-differential-{}", std::process::id()));
+  fn create(base: &Path, test: &str) -> io::Result<Self> {
+    let path = base.join(format!("slates-differential-{test}-{}", std::process::id()));
     if path.exists() {
       fs::remove_dir_all(&path)?;
     }
@@ -151,6 +151,15 @@ fn host_path(root: &Path, dir: &[String], name: &str) -> PathBuf {
   p
 }
 
+/// `head_state` uses absolute VFS paths; resolve them inside this case's RAM directory.
+fn selected_host_file(root: &Path, target: &str) -> PathBuf {
+  root.join(
+    target
+      .strip_prefix('/')
+      .expect("head_state paths start at the VFS root"),
+  )
+}
+
 fn apply_host(step: &Step, root: &Path, files: &[String]) -> Option<io::Result<()>> {
   Some(match step {
     Step::Create(p, n) => fs::File::create_new(host_path(root, p, n)).map(drop),
@@ -161,25 +170,25 @@ fn apply_host(step: &Step, root: &Path, files: &[String]) -> Option<io::Result<(
     Step::Rename(fp, fnm, tp, tn) => fs::rename(host_path(root, fp, fnm), host_path(root, tp, tn)),
     Step::Link(p, n, pick) => {
       let target = pick_file(files, *pick)?;
-      fs::hard_link(root.join(target), host_path(root, p, n))
+      fs::hard_link(selected_host_file(root, target), host_path(root, p, n))
     }
     Step::Write(pick, off, bytes) => {
       let target = pick_file(files, *pick)?;
       fs::OpenOptions::new()
         .write(true)
-        .open(root.join(target))
+        .open(selected_host_file(root, target))
         .and_then(|f| f.write_all_at(bytes, u64::from(*off)))
     }
     Step::Truncate(pick, len) => {
       let target = pick_file(files, *pick)?;
       fs::OpenOptions::new()
         .write(true)
-        .open(root.join(target))
+        .open(selected_host_file(root, target))
         .and_then(|f| f.set_len(u64::from(*len)))
     }
     Step::Edit(pick, at, del, bytes) => {
       let target = pick_file(files, *pick)?;
-      let path = root.join(target);
+      let path = selected_host_file(root, target);
       fs::read(&path).and_then(|mut content| {
         let at = usize::from(*at) % (content.len() + 1);
         let end = (at + usize::from(*del)).min(content.len());
@@ -276,6 +285,39 @@ fn cases() -> u32 {
     .unwrap_or(300)
 }
 
+/// AC-1.2: selected files and their aliases keep the same bytes and links at both depths.
+#[test]
+fn selected_files_and_aliases_agree_at_the_root_and_in_a_directory() {
+  let Some(base) = std::env::var_os(RAMDIR_VAR) else {
+    println!("differential: skipped — {RAMDIR_VAR} is not set (name a RAM-backed directory)");
+    return;
+  };
+  let root = HostRoot::create(Path::new(&base), "selected-files").unwrap();
+  let policy = probe_policy(&root.path);
+  for (case, directory) in [Vec::new(), vec!["directory".to_owned()]]
+    .into_iter()
+    .enumerate()
+  {
+    let mut history = Vec::new();
+    if let Some(name) = directory.first() {
+      history.push(Step::Mkdir(Vec::new(), name.clone()));
+    }
+    history.extend([
+      Step::Create(directory.clone(), "file".to_owned()),
+      Step::Link(directory.clone(), "file".to_owned(), 0),
+      Step::Write(0, 0, b"original".to_vec()),
+      Step::Link(directory.clone(), "alias".to_owned(), 0),
+      Step::Write(1, 0, b"changed".to_vec()),
+      Step::Truncate(0, 4),
+      Step::Edit(1, 1, 2, b"inserted".to_vec()),
+      Step::Unlink(directory, "file".to_owned()),
+      Step::Write(0, 0, b"survives".to_vec()),
+    ]);
+    let case_root = root.fresh_case(u64::try_from(case).unwrap()).unwrap();
+    run_case(&history, &case_root, policy);
+  }
+}
+
 /// AC-1.2: the volume and the host filesystem agree on every abstract state under the policy.
 #[test]
 fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
@@ -291,7 +333,7 @@ fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
     "{RAMDIR_VAR}={} is not a directory",
     base.display()
   );
-  let root = HostRoot::create(&base).unwrap();
+  let root = HostRoot::create(&base, "histories").unwrap();
   let policy = probe_policy(&root.path);
   println!(
     "differential: host {} folds names: {}",

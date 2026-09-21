@@ -74,6 +74,17 @@ impl Client {
 
   /// Sends `body` as the next request and waits for the reply.
   fn call(&mut self, body: &RequestBody) -> ReplyBody {
+    if matches!(body, RequestBody::DaemonStatus) {
+      let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
+      return slates_ipc::status::collect::<IpcError>(capacity, |request| {
+        Ok(self.call_once(request))
+      })
+      .unwrap();
+    }
+    self.call_once(body)
+  }
+
+  fn call_once(&mut self, body: &RequestBody) -> ReplyBody {
     self.sequence += 1;
     let id = RequestId {
       client: self.client,
@@ -135,6 +146,124 @@ fn scratch(name: &str) -> RequestBody {
     names: NamePolicy::Exact,
     require_locked: false,
     base: None,
+  }
+}
+
+/// AC-2.6, §4.14: a report spanning real ring slots remains frozen while another client
+/// mutates the daemon. Cursors are channel-scoped, cancelled by the next operation, and
+/// the typed client returns a complete report without exposing the page protocol.
+#[test]
+fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
+  let profile = profile();
+  let instance = format!("srv-status-pages-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  // Shape: deliberately short reply chunks, so the two-shard report must cross pages.
+  config.region.bulk_bytes = u64::from(config.region.slots) * 2 * 128;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon.bootstrap(true).unwrap();
+  let mut first = Client::connect(&instance);
+  let mut other = Client::connect(&instance);
+  let initial = first.call_once(&RequestBody::DaemonStatus);
+  let cursor = status_cursor(&initial);
+  assert_eq!(
+    other.call_once(&cursor),
+    ReplyBody::Refused {
+      refusal: Refusal::NotFound
+    }
+  );
+  assert!(matches!(
+    other.call(&scratch("created-between-pages")),
+    ReplyBody::Created { .. }
+  ));
+  let report = finish_status_capture(&mut first, initial);
+  assert_eq!(
+    report.shards.iter().map(|shard| shard.volumes).sum::<u64>(),
+    0,
+    "pages retain the view before the other client's create"
+  );
+  assert_eq!(
+    first.call_once(&cursor),
+    ReplyBody::Refused {
+      refusal: Refusal::NotFound
+    },
+    "completion releases the capture"
+  );
+  let cancelled = status_cursor(&first.call_once(&RequestBody::DaemonStatus));
+  assert!(matches!(
+    first.call(&RequestBody::List),
+    ReplyBody::Listed { .. }
+  ));
+  assert_eq!(
+    first.call_once(&cancelled),
+    ReplyBody::Refused {
+      refusal: Refusal::NotFound
+    },
+    "a new operation cancels the old capture"
+  );
+  let mut typed = slates_client::Client::connect(
+    &instance,
+    slates_client::Deadlines::derive(DEADLINE_NS, DEADLINE_NS).get(),
+  )
+  .unwrap();
+  let current = typed.daemon_status().unwrap();
+  assert_eq!(
+    current
+      .shards
+      .iter()
+      .map(|shard| shard.volumes)
+      .sum::<u64>(),
+    1
+  );
+  daemon.stop();
+}
+
+/// Assembles a capture whose first page was deliberately held across another operation.
+fn finish_status_capture(
+  first: &mut Client,
+  initial: ReplyBody,
+) -> Box<slates_ipc::protocol::DaemonReport> {
+  let mut initial = Some(initial);
+  let mut pages_read = 0;
+  let report = slates_ipc::status::collect::<IpcError>(
+    slates_ipc::status::snapshot_capacity(first.end.region()),
+    |request| {
+      pages_read += 1;
+      Ok(initial.take().unwrap_or_else(|| first.call_once(request)))
+    },
+  )
+  .unwrap();
+  let ReplyBody::DaemonStatus { report } = report else {
+    panic!("complete report");
+  };
+  assert!(pages_read > 1);
+  report
+}
+
+/// A partial status reply's continuation, checked through the real wire payload.
+fn status_cursor(reply: &ReplyBody) -> RequestBody {
+  let ReplyBody::DaemonStatusPage {
+    snapshot,
+    total,
+    bytes,
+    ..
+  } = reply
+  else {
+    panic!("expected a status page: {reply:?}");
+  };
+  assert!(
+    usize::try_from(*total).unwrap() > bytes.len(),
+    "the report crosses real slots"
+  );
+  RequestBody::DaemonStatusNext {
+    snapshot: *snapshot,
+    offset: bytes.len() as u64,
   }
 }
 

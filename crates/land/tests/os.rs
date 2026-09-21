@@ -230,6 +230,17 @@ fn a_target_path_that_escapes_is_refused() {
     Some(format!("{:?}", TargetRefusal::NotAbsolute))
   );
   assert!(OsLand::open_target(&ws.path.join("real")).is_ok());
+  seed_file(&ws.path.join("file"), b"ordinary file");
+  assert_eq!(
+    OsLand::open_target(&ws.path.join("file")).err(),
+    Some(TargetRefusal::Unavailable(
+      slates_vfs::host::HostError::NotDirectory
+    ))
+  );
+  assert_eq!(
+    OsLand::open_target(&ws.path.join("alias/child")).err(),
+    Some(TargetRefusal::EscapesTarget)
+  );
 }
 
 /// AC-1.10 / R1: a scratch landing preserves the real target directory and writes its tree

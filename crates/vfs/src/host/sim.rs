@@ -3,6 +3,8 @@
 //! place, replacements, deletions, renames) applied between the volume's steps, and a watcher
 //! that can be told to overflow. It is the "disk" leg of the (disk, overlay, witnesses) oracle
 //! (Phase 1 task 12, T-1.10 to T-1.13).
+//! Exchange changes both inodes' ctime (§4.15); the Linux tmpfs kill/restart test exposed
+//! the earlier simulation's missing metadata effect (2026-09-20 landing exchange record).
 
 use std::collections::BTreeMap;
 
@@ -853,12 +855,16 @@ impl LandFs for SimHost {
       return Err(HostError::Unavailable(SIM_EINVAL));
     }
     let parts = self.dir_parts(dir)?;
+    let now = self.now_ns;
     let Some(p) = self.node_mut(&parts) else {
       return Err(HostError::NotFound);
     };
-    let (Some(na), Some(nb)) = (p.children.remove(a), p.children.remove(b)) else {
+    let (Some(mut na), Some(mut nb)) = (p.children.remove(a), p.children.remove(b)) else {
       return Err(HostError::NotFound);
     };
+    // A namespace exchange changes both inodes' ctime, as the Linux tmpfs oracle does.
+    na.ctime_ns = now;
+    nb.ctime_ns = now;
     p.children.insert(a.into(), nb);
     p.children.insert(b.into(), na);
     self.touch_parent(&parts);

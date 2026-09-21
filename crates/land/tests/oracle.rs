@@ -323,6 +323,115 @@ struct Outsider {
   victims: Vec<&'static str>,
 }
 
+/// Advance the clock between validation and writing without changing the target bytes.
+struct ExchangeTick;
+
+impl Observer<SimHost> for ExchangeTick {
+  fn before_write(&mut self, host: &mut SimHost, _entry: &LandingEntry) {
+    host.advance_ns(1);
+  }
+}
+
+/// T-1.14/T-1.15: the landing's own exchange changes ctime without creating a conflict.
+#[test]
+fn an_exchange_after_the_witness_tick_lands_and_replans_empty() {
+  let mut host = SimHost::new();
+  host.replace_file("/file", b"original");
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"replacement");
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land_with(request(1), &mut ExchangeTick).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(setup.host.bytes("/file").unwrap(), b"replacement");
+  assert!(hidden_names(setup.host).is_empty());
+  assert!(setup.present(&request(2)).manifest.entries.is_empty());
+}
+
+/// An outsider changes equal-length bytes within one timestamp tick; exchange then changes ctime.
+struct SameTimestampOutsider;
+
+impl Observer<SimHost> for SameTimestampOutsider {
+  fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
+    host.write_in_place(&entry.path, b"outsider", 0);
+    host.advance_ns(1);
+  }
+}
+
+/// An outsider changes metadata before the landing; restoring the mode cannot restore ctime.
+struct MetadataOutsider;
+
+impl Observer<SimHost> for MetadataOutsider {
+  fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
+    let mode = host.fingerprint(&entry.path).unwrap().mode;
+    host.advance_ns(1);
+    host.chmod(&entry.path, mode);
+  }
+}
+
+/// T-1.14: a ctime change preceding our exchange remains a real witness conflict.
+#[test]
+fn an_exchange_does_not_hide_an_earlier_metadata_change() {
+  let mut host = SimHost::new();
+  host.replace_file("/file", b"original");
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"replacement");
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(request(1), &mut MetadataOutsider)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert_eq!(
+    *outcome_of(&report, "/file"),
+    Outcome::Undone(ConflictClass::TargetInUse)
+  );
+  assert_eq!(host.bytes("/file").unwrap(), b"original");
+}
+
+/// T-1.14: accepting the exchange's ctime change still requires the witnessed content.
+#[test]
+fn an_exchange_preserves_a_same_timestamp_outsider_write() {
+  let mut host = SimHost::new();
+  host.replace_file("/file", b"original");
+  let target = root_target(&mut host);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  write_file(&mut vol, &mut host, &mut store, "/file", b"replacement");
+  let mut session = Session::new();
+  let report = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .land_with(request(1), &mut SameTimestampOutsider)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Partial, "{report:?}");
+  assert_eq!(
+    *outcome_of(&report, "/file"),
+    Outcome::Undone(ConflictClass::TargetInUse)
+  );
+  assert_eq!(host.bytes("/file").unwrap(), b"outsider");
+  assert!(hidden_names(&host).is_empty());
+}
+
 impl Observer<SimHost> for Outsider {
   fn before_write(&mut self, host: &mut SimHost, entry: &LandingEntry) {
     if self.victims.contains(&entry.path.as_ref()) {

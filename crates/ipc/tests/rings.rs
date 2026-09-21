@@ -1,12 +1,12 @@
 //! The rings and the wake word (Phase 2 task 3; §4.7): a client end and a daemon end over two
-//! mappings of one region on two threads, the round trip spinning, the park and the wake when
+//! mappings of one region, the queued-reply fast path, the armed wait and wake when
 //! the reply is late, the ring's credit (`RingFull`, never a drop), a hostile slot released
 //! without wedging the ring, the deadline, and the doorbell when the daemon is parked.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use slates_ipc::region::{ClientRegion, RegionGeometry};
 use slates_ipc::slot::{PAYLOAD_BYTES, Slot, SlotKind};
@@ -16,8 +16,9 @@ use slates_ipc::{ClientEnd, DaemonEnd, IpcError};
 const SLOTS: u32 = 8;
 /// Shape: the spin window the daemon publishes here, microseconds' worth of nanoseconds.
 const SPIN_NS: u32 = 200_000;
-/// Shape: the pause the slow daemon takes before replying, well past the spin window.
-const LATE_MS: u64 = 20;
+/// Shape: the existing five-second reply deadline also bounds the peer's wait for the client
+/// to arm. It is a test hang guard, not a latency assertion or a production tuning value.
+const REPLY_DEADLINE_NS: u64 = 5_000_000_000;
 
 fn geometry() -> RegionGeometry {
   RegionGeometry {
@@ -38,66 +39,75 @@ fn pair(name: &str) -> (DaemonEnd, ClientEnd) {
   (DaemonEnd::new(region), ClientEnd::new(client))
 }
 
-/// A request is answered while the client spins; the request id and payload come back.
+/// AC-2.1/T-2.6: replies already available take the no-park path with intact ids and payloads.
+/// Performance is measured by the IPC/provisioning benchmarks; a new thread need not be
+/// scheduled within this fixture's spin window.
 #[test]
-fn a_round_trip_completes_while_the_client_spins() {
+fn queued_replies_complete_without_parking_the_client() {
   let (mut daemon, mut client) = pair("slates-ipc-rings-spin");
-  let handle = std::thread::spawn(move || {
-    let mut served = 0;
-    while served < 3 {
-      if let Some(req) = daemon.try_take().unwrap() {
-        let mut reply = req.payload.clone();
-        reply.reverse();
-        daemon
-          .reply(&Slot::inline(req.request, &reply).unwrap())
-          .unwrap();
-        served += 1;
-      } else {
-        std::hint::spin_loop();
-      }
-    }
-    daemon.wakes()
-  });
-  for n in 0..3u64 {
-    client.send(&Slot::inline(n, &[1, 2, 3]).unwrap()).unwrap();
+  for request in 0..3u64 {
+    client
+      .send(&Slot::inline(request, &[1, 2, 3]).unwrap())
+      .unwrap();
+    let received = daemon.try_take().unwrap().unwrap();
+    let mut payload = received.payload;
+    payload.reverse();
+    daemon
+      .reply(&Slot::inline(received.request, &payload).unwrap())
+      .unwrap();
+  }
+  for request in 0..3u64 {
     let reply = client.wait(Some(1_000_000_000)).unwrap();
-    assert_eq!(reply.request, n);
+    assert_eq!(reply.request, request);
     assert_eq!(reply.payload, vec![3, 2, 1]);
     assert_eq!(reply.kind, SlotKind::Inline);
   }
-  let wakes = handle.join().unwrap();
-  assert_eq!(wakes, 0, "the client never parked");
+  assert_eq!(daemon.wakes(), 0, "queued replies need no wake");
   assert_eq!(client.park_ratio(), (0, 3));
 }
 
-/// A late reply: the client spins its window, parks on the wake word, and is woken by the
-/// daemon's wake once the reply is written.
+/// AC-2.1/T-2.6: a reply withheld until the client arms its wait is delivered without a lost
+/// wake. It may arrive during the mandatory recheck or after a kernel wait; both are correct.
 #[test]
-fn a_late_reply_parks_the_client_and_the_daemon_wakes_it() {
+fn a_reply_after_the_client_arms_its_wait_is_not_lost() {
   let (mut daemon, mut client) = pair("slates-ipc-rings-park");
-  let handle = std::thread::spawn(move || {
-    loop {
-      if let Some(req) = daemon.try_take().unwrap() {
-        // The test harness delays the reply past the spin window (D-9: shipped code never
-        // sleeps).
-        #[allow(clippy::disallowed_methods)]
-        std::thread::sleep(Duration::from_millis(LATE_MS));
-        daemon
-          .reply(&Slot::inline(req.request, b"late").unwrap())
-          .unwrap();
-        return daemon.wakes();
-      }
-      std::hint::spin_loop();
-    }
-  });
   client.send(&Slot::inline(1, b"?").unwrap()).unwrap();
-  let reply = client.wait(Some(5_000_000_000)).unwrap();
+  let request = daemon.try_take().unwrap().unwrap();
+  let handle = std::thread::spawn(move || {
+    let started = Instant::now();
+    while daemon
+      .region()
+      .client_parked()
+      .unwrap()
+      .load(Ordering::Acquire)
+      == 0
+    {
+      assert!(
+        started.elapsed() < Duration::from_nanos(REPLY_DEADLINE_NS),
+        "the client did not arm its wait"
+      );
+      std::thread::yield_now();
+    }
+    daemon
+      .reply(&Slot::inline(request.request, b"late").unwrap())
+      .unwrap();
+    daemon.wakes()
+  });
+  let reply = client.wait(Some(REPLY_DEADLINE_NS));
+  let wakes = handle.join().unwrap();
+  let reply = reply.unwrap();
+  assert_eq!(reply.request, 1);
   assert_eq!(reply.payload, b"late");
-  assert_eq!(client.park_ratio(), (1, 1), "one park for one reply");
+  assert_eq!(client.park_ratio().1, 1, "one reply delivered");
+  assert!(wakes <= 1, "one reply can issue at most one wake");
   assert_eq!(
-    handle.join().unwrap(),
-    1,
-    "one wake issued for the parked client"
+    client
+      .region()
+      .client_parked()
+      .unwrap()
+      .load(Ordering::Acquire),
+    0,
+    "delivery disarms the wait"
   );
 }
 

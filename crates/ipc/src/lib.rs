@@ -36,6 +36,7 @@ pub mod region;
 pub mod rendezvous;
 
 pub mod slot;
+pub mod status;
 pub mod wake;
 
 pub use delivery::{Capability, Delivered, Delivery, DeliveryFault};

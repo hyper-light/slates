@@ -3,22 +3,36 @@
   "suite": "hermeticity",
   "transport": "native-linux-fuse",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
-    "arch": "arm64",
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
-  "command": "",
-  "bound": "",
+  "date": "2026-09-20",
+  "command": "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c 'printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp'`, snapshot, land, grant, land --grant",
+  "bound": "one lifecycle: one volume, one mount, four workload entries and their two parent directories landed and verified",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "lane",
-      "reason": "runs in the Linux lane, not on macOS"
+    "kind": "limited",
+    "adapter": "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS)",
+    "not_covered": "the FUSE bridge itself (crates/bridge-fuse): no daemon transport serves /dev/fuse (`crates/server` links the crate only as a dev-dependency) and `slates mount` is `mount_nfs`-only",
+    "counts": {
+      "suite": "hermeticity",
+      "write_calls": 199,
+      "inside_target": 22,
+      "ram_only": 89,
+      "standard_streams": 88,
+      "unresolved": 0,
+      "outside": 0,
+      "written_matched": 6,
+      "written_unmatched": 0
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "duration_ms": 1168,
+  "notes": [
+    "tracer: strace -f -y -qq -s 0 -e trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice -- <anchor>; 199 events parsed from 427 log lines; landing reported 6 written; 4 hidden siblings (.slates-*) seen inside the target",
+    "the granted target: /scratch/slates-scratch/land-target",
+    "volume quota: 2112 bytes, derived from 8 workload inodes",
+    "landing completeness: 6/6 entries reported; disk verification: Ok(())"
+  ]
 }

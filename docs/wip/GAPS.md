@@ -1,5 +1,60 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Snapshot measurement correction (2026-09-20).** A same-tree experiment separated journal
+> turnover (53 ns) from steady snapshot cost (28 ns); steady small/large trees measured 29/28 ns.
+> The AC-1.3 benchmark now prepares equal journal state, retains its allowance and fails on
+> refused operations. The separate destroy-slice overrun and the eager preparation walk outside
+> its old timer remain open. Evidence: the dated snapshot benchmark report; no performance
+> threshold was widened. The full local CI obligation remains open in TBD_FIXES.
+
+> **CI repair in validation (2026-09-20).** A real one-core fleet status exceeded its 4-KiB
+> reply slot. Bounded, client-owned status paging now preserves the complete report with
+> charged retention and checked cursors (§4.14); native regressions pass, including the
+> original fleet failure (1.58 s). A separate IPC fixture replaced an OS scheduling
+> assumption with observable queued/armed-wait behavior (192/192 Linux executions).
+> Records: `docs/bugs/2026-09-20-daemon-status-exceeds-a-reply-slot.md` and
+> `docs/bugs/2026-09-20-ipc-ring-test-assumes-thread-scheduling.md`. Full local CI and the
+> first root pjdfstest expectation review are tracked below; native Windows and complete
+> native FUSE conformance are not yet proven by these results.
+
+> **Additional local gates (2026-09-20).** The unchanged Linux NFS-adapter conformance run
+> passes its reviewed gate: 6,970 pjdfstest passes, 1,800 expected failures, 28 TODO,
+> no unexpected/stale exclusions; fsx, fsstress, nine workloads and hermeticity pass.
+> The records remain LIMITED to that adapter. The million-operation VFS model passes.
+> The RAM differential oracle dropped its root when selecting absolute VFS paths;
+> correcting that translation passes the deterministic alias regression and 2,000 histories
+> (0.29 s). The real-host digest test also assumed an earlier hash was inside the racy
+> window; its final-read assertion now measures reuse relative to the immediately prior
+> counters and checks the replacement bytes. Records: the 2026-09-20 differential-oracle,
+> host-digest-test and pjdfstest-device-fixture bug documents.
+
+> **Real landing gate (2026-09-20).** The Linux crash/resume run exposed the exchange's
+> own ctime update being mistaken for an outsider edit. The engine now verifies the actual
+> displaced name and hashes its witnessed content when ctime changed. The simulator models
+> that update; 18 landing oracle tests and all five real Linux landing tests pass (0.06 s
+> for the latter). Symlinks reported as ENOTDIR now receive the intended EscapesTarget
+> refusal. The next CLI gate exposed a BSD-only mktemp template; its repair is in validation.
+
+> **OCI source integration (2026-09-20).** The macOS CLI gate reaches a real capability
+> mount but the OCI verifier still expected the former bare source. Its matcher now checks
+> the exact volume and capability syntax, removing the bearer suffix from evidence and
+> refusals. Eight pure checks pass; the real container workload is being rerun. Record:
+> `docs/bugs/2026-09-20-oci-verifier-rejects-capability-mounts.md`.
+
+> **Attachment lifecycle repair (2026-09-20).** OCI bindings now borrow their checked
+> source mount, survive the issuing CLI and daemon restart, and end on explicit detach or
+> parent unmount. The strict crash/rights lifecycle passes in 7.90 s; the current real Docker
+> and CLI suite passes all 10 cases in 28.85 s, retaining exact detach assertions.
+> The two-owner SIGKILL regression passes in 3.81 s after moving SDK retirement across all
+> owner shards. Fresh client identities are now reserved durably before handoff: the crash
+> probe exposed a new `Status` receiving an old `Created` completion. Linux workspace:
+> 1,554 passed, zero failed, 14 ignored; macOS: 1,546 passed, zero failed, 14 ignored.
+> The later last-id restart history passed on macOS and still needs Linux. Queued-forward
+> and publication-refusal proofs remain owed. The corrected snapshot comparison passes;
+> nine other macOS performance ceilings remain red, and the intermittent destroy failure
+> remains open. Commands, scope and logs are recorded in TBD_FIXES.
+
+
 Rubric per item: research on file? spec section exists? test matrix? acceptance criteria? laptop
 degenerate stated? open decisions named? Classification: `undesigned | designed-unspecced |
 specced-untested | decision-open | drift (owed-and-forgotten)`. A stale ledger is itself a gap.

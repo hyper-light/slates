@@ -3,22 +3,41 @@
   "suite": "pjdfstest",
   "transport": "native-linux-fuse",
   "host": {
-    "os": "macOS 26.4.1 (25E253)",
-    "kernel": "Darwin 25.4.0",
-    "arch": "arm64",
-    "privilege": "unprivileged"
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "root"
   },
-  "date": "2026-09-14",
-  "command": "",
-  "bound": "",
+  "date": "2026-09-20",
+  "command": "sudo -n sh <each of 238 tests/**/*.t of pjd/pjdfstest@85a8aea> in a directory inside the mount; binary <scratch>/tools/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7/pjdfstest",
+  "bound": "every test file at the pinned commit (238 files), 300s per file",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "lane",
-      "reason": "runs in the Linux lane, not on macOS"
+    "kind": "limited",
+    "adapter": "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback export (the same serving code as macOS)",
+    "not_covered": "the FUSE bridge itself (crates/bridge-fuse): no daemon transport serves /dev/fuse (`crates/server` links the crate only as a dev-dependency) and `slates mount` is `mount_nfs`-only",
+    "counts": {
+      "suite": "pjdfstest",
+      "files": 238,
+      "cases": 8798,
+      "passed": 6970,
+      "failed": 1800,
+      "needs_root": 0,
+      "todo": 28,
+      "expected_failures": 1800,
+      "unexpected_failures": 0,
+      "listed_now_passing": 0
     }
   },
-  "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "expected_failure_list": {
+    "path": "docs/wip/conformance/expected-failures/native-linux-fuse.pjdfstest.txt",
+    "blake3": "cecd79690e3c7c906e0e896db57b47e01d75e65282336b0b5eb83e53a3618075",
+    "entries": 1800
+  },
+  "duration_ms": 174353,
+  "notes": [
+    "pjdfstest: pjd/pjdfstest@85a8aea (BSD-2-Clause), tarball sha256 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754, built `cc -O2 -w -I. pjdfstest.c` over a config.h the harness probed (HAVE_: FACCESSAT FCHMODAT FCHOWNAT FSTATAT LCHMOD LINKAT MKDIRAT MKFIFOAT MKNODAT OPENAT POSIX_FALLOCATE READLINKAT RENAMEAT SYMLINKAT UTIMENSAT SYS_SYSMACROS_H STRUCT_STAT_ST_ATIM STRUCT_STAT_ST_CTIM STRUCT_STAT_ST_MTIM)",
+    "1800 expected failures; 0 unlisted failures; 0 listed now passing; 0 listed absent",
+    "the suite volume is 190MiB: 512MiB was refused BudgetExceeded with 265814016 bytes available on the daemon's shard, so it was sized to three quarters of that",
+    "failures by shape (12 of 207 shapes; names folded to N, inode numbers to <inode>): 180 × lstat N/N inode, expected ENOENT, got <inode>; 150 × lchown N/N 65534 65534, expected 0, got ENOENT; 120 × mknod N/N b 0644 1 2, expected 0, got 527; 119 × mknod N/N c 0644 1 2, expected 0, got 527; 92 × unlink N/N, expected 0, got ENOENT; 80 × unlink N, expected 0, got ENOENT; 76 × -u 65534 -g 65534 rename N/N N/N, expected EACCES|EPERM, got ENOENT; 52 × test_check (a comparison of two values the script read; no message); 40 × -u 65534 -g 65534 rename N/N N/N, expected 0, got ENOENT; 40 × mknod N b 0644 1 2, expected 0, got 527; 38 × mknod N c 0644 1 2, expected 0, got 527; 36 × lstat N/N inode,uid,gid, expected ENOENT,65534,65534, got <inode>,65534,65534"
+  ]
 }

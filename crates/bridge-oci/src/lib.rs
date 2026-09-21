@@ -23,7 +23,8 @@
 //! shard that must answer is the one blocked in the syscall (measured hazard: the `soft,intr` mount
 //! would time the call out, seconds later), so the table is the only sound source. The table says
 //! whether the path is exactly a mount point, its filesystem type and its source: the loopback mount's
-//! source is `localhost:/<volume name>`, so on macOS the evidence names the volume; the FUSE mount's
+//! source is `localhost:/<volume name>@<attachment>.<token>` (§4.13), so on macOS the evidence
+//! names the volume after checking the capability's format and removing its secret. The FUSE mount's
 //! source is `slates` for every volume (`crates/bridge-fuse/src/mount.rs`), so there the evidence is
 //! the filesystem type alone, and the report says so (`names_volume`). The container's view is then
 //! exactly the host mount's; that it *works* is proven by use, never by the record — T-4.13 runs the

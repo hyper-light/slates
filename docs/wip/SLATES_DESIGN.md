@@ -1298,6 +1298,14 @@ case on a laptop; a live base retains its source-host dependency in a fleet.
 
 ### 4.5 Namespace and content structures (D-4, D-5, D-6, D-25)
 
+> **Measurement correction (2026-09-20, AC-1.3).** The snapshot size comparison prepares
+> the same bounded journal state at each size before timing the full snapshot/destroy cycle.
+> Previously the adaptive sampler could stop during named-record eviction at one size and
+> after eviction at another. On the same million-file tree, turnover measured 53 ns and the
+> steady operation 28 ns; unchanged small/large steady trees measured 29/28 ns. The original
+> convergence rule, tree sizes and acceptance allowance stay in force. Refused operations
+> fail the measurement. The dated snapshot benchmark report records the controlled experiment.
+
 **Special names (A-26).** FIFO and UNIX socket inodes carry names, permissions, owners,
 times and hard-link identity, but no file contents. Snapshots, clones, recovery, archives
 and merge preserve this metadata; they never capture pipe buffers, listeners, connections
@@ -1602,6 +1610,22 @@ semantics, residency boundary and conformance evidence. Requesting an unsupporte
 usable container path or guest device. No disk socket, image construction, target mkdir or
 privilege escalation is implicit in attaching a VFS volume.
 
+**Binding lifetime (A-28).** An OCI binding borrows the verified source mount's attachment.
+Before recording it, the daemon checks the kernel source's capability against that live
+bridge attachment, the requested volume, principal and rights. The binding survives the
+issuing CLI's exit and daemon recovery. Explicit detach removes the binding; source-mount
+removal removes its dependent bindings in the same recorded transition. A binding cannot
+own another binding or mint an independent mount capability. The existing attachment-table
+cap bounds these records. The runtime owns its container namespace and must finish its
+use before explicit detach; removing a recipe record does not unmount a container or
+establish its cache-flush boundary. A source the daemon cannot identify is refused.
+
+> **Status (2026-09-20).** The strict real-CLI lifecycle test fails before this fix with
+> two attachments instead of three after client retirement (3.57 s), then passes with
+> explicit detach and dependent unmount cleanup (5.62 s). The original Docker workload's
+> strict cleanup also passes in the full CLI suite (10 tests, 26.53 s). Record:
+> `docs/bugs/2026-09-20-oci-binding-lifetime-is-owned-by-an-exited-cli.md`.
+
 Device admission authenticates the consumer before creating a queue, mapping guest memory or
 publishing a tag. Queue descriptors, scatter/gather ranges, arithmetic and chained lengths are
 validated within derived caps before access. In-flight requests, mapped bytes, copy buffers and
@@ -1645,7 +1669,12 @@ until mapping isolation, pinning and teardown have been established for that VMM
 > `/proc/self/mountinfo`) — records the authorized binding (`AttachForm::Oci`) and returns the
 > runtime-specification `mounts` entry (`type: bind`, `rbind` + `ro`/`rw` by the attachment's policy)
 > with the table's evidence; the runtime binds; an unbound path is refused
-> `ChosenPathUnavailable{reason}`. T-4.13 is proven by use on macOS over Docker Desktop's share of the
+> `ChosenPathUnavailable{reason}`.
+> **2026-09-20 correction:** the source comparison accepts the current
+> `localhost:/<volume>@<attachment_hex>.<token_hex>` shape with an exact volume name and
+> well-formed capability. Evidence and refusals remove the bearer suffix. This describes
+> the kernel's mount; NFS continues to validate the capability on every request.
+> T-4.13 is proven by use on macOS over Docker Desktop's share of the
 > NFS-loopback mount (`crates/cli/tests/cli.rs`): the same workload on the host path and in the
 > container agrees byte for byte and in names and sizes, an edit on either side is the other's view,
 > the read-only bind refuses a write. Its Linux variant over a real FUSE mount
@@ -1733,6 +1762,22 @@ root-relative path as an explicit alternative; it does not report that the reque
 **Laptop degenerate.** Identical; one root mount.
 
 ### 4.7 IPC and the provisioning fast path (D-10)
+
+> **Status (2026-09-20, A-28).** Client retirement reserves the dead client's seat and id
+> until every owner shard has removed its SDK attachments. Unsent forwards are cancelled;
+> read-only gathers follow already-admitted synchronous attachment verbs, and removal names
+> frozen attachment ids so a delayed callback cannot remove a resumed session's new records.
+> Refused cleanup is counted and retried at the existing cadence; leases retain their terms.
+> The two-owner SIGKILL history passes in 3.81 s under the original lease and observation bounds.
+> Fresh client identities are reserved in the control partition before handoff. Startup recovers
+> the allocation floor across partitions before admitting callers; exhaustion or unpublished
+> reservation refuses admission. A daemon crash cannot give a new CLI the completion key of an
+> earlier CLI. The real CLI binding/crash/strict-detach history passes in 7.90 s, and the portable
+> restart history additionally covers a previously admitted client that submitted no verbs.
+> Both retirement and restart histories also pass in the Linux io_uring workspace run.
+> The last-id/refused-fresh/restarted-session history passes on macOS in 0.98 s; its Linux
+> run, queued-forward/cancellation histories and publication refusal remain tracked in
+> TBD_FIXES. The current macOS real CLI suite passes all ten cases in 28.85 s.
 
 > **Status (2026-09-05).** Implemented in `crates/ipc` and `crates/server` (GAPS §8d, Phase 2
 > tasks 3–6). As built, the failure matrix's client side: a client tells a dead daemon from a
@@ -2949,8 +2994,22 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > shard through one gather and now carry every shard's signals and telemetry. Owed: cross-node trace
 > propagation (the fleet envelope has no trace context; marked missing), the
 > `ship.record`/`consensus.step`/`archive.chunk` emitters with their subsystems, `(value, freshness)`
-> on the daemon-level counters, a deadline on the status scatter, and paging of the daemon report past
-> one chunk.
+> on the daemon-level counters and a deadline on the status scatter.
+
+> **Status paging (2026-09-20).** `DaemonStatus` captures one immutable schema-framed report
+> per client; `DaemonStatusNext` reads bounded byte pages under that original request identity.
+> The encoded report is capped by the client's reply-bulk credit and its retained allocation
+> capacity is charged to the shard's metadata ledger. Page payload is the actual slot
+> capacity less its encoded header. Completion, a subsequent operation, cancellation,
+> disconnect or the capture's absolute failover-SLO deadline releases the retention. A late
+> scatter cannot replace a newer capture. Continuations validate identity, exact contiguous
+> offsets, strict progress and total length before returning the unchanged `DaemonReport`.
+> An oversized capture refuses `BudgetExceeded`; a missing/expired capture refuses
+> `NotFound`. Captures are ephemeral observations, never durable completion-log entries;
+> a restart requires a new capture. The scalar API still returns the whole report. The
+> existing scatter samples each shard independently; paging freezes its completed result,
+> without promising a simultaneous cross-shard snapshot. The deadline on a lost scatter
+> task remains owed. Record: `docs/bugs/2026-09-20-daemon-status-exceeds-a-reply-slot.md`.
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through
@@ -3150,8 +3209,12 @@ entry either old or new, never torn).
    (`FICLONE`) instead of writev when the target filesystem supports it and an identical file
    already exists in the target tree (found through the landing's own hash index of the
    manifest, never by scanning the disk); `futimens` before the exchange so incremental builds
-   see the volume's mtime; then `fstat` the descriptor held on the displaced old file: if its
-   fingerprint is not the witnessed one, exchange back, remove the sibling, and record
+   see the volume's mtime. Require the complete witnessed fingerprint before exchange;
+   an earlier ctime change remains a conflict. Then open the displaced hidden name and verify its device, inode,
+   size, mtime and mode against the witness. The exchange itself can change ctime; a changed
+   ctime or racy witness requires a content hash equal to the witness and a fingerprint
+   unchanged across that bounded read. A descriptor opened before the exchange cannot prove
+   which inode was displaced. If verification fails, exchange back, remove the temporary, and record
    `Conflict(TargetInUse)` for the entry. macOS: a hidden sibling name, `pwritev` on a pool
    thread, `fcntl(F_BARRIERFSYNC)`, `renamex_np(RENAME_SWAP)`, the same verify-and-undo;
    `clonefile` for reflinks where `VOL_CAP_INT_CLONE` says so. Windows: open the target with
@@ -5502,9 +5565,42 @@ activation remain refused, with device-metadata preservation a separate decision
   primary unlink with aliases, mounted green/work volumes and language/frontend conveniences
   remain owed. See the 2026-09-20 merge IPC bug record for the exact supported boundary. FSKit/WinFsp return explicit unsupported refusals.
   The unchanged full NFS pjdfstest rerun: 6,970 passes, 1,800 failures, 28 TODO; 172,343 ms.
-  Residual failure review remains open; no expected-failure list expanded.
+  The first root expectation review is complete (2026-09-20): 1,800 exact device-fixture
+  dependencies and NFS limits are reviewed; the unchanged rerun has zero unexpected or
+  stale listed cases. Records remain LIMITED to the NFS adapter.
 - Applied in the same change to: §4.5, §4.6, §4.8, §4.15, §4.16, GAPS and TBD_FIXES;
   `vfs`, `bridge-core`, `bridge-nfs`, `bridge-fuse`, `bridge-fskit`, `bridge-winfsp`, `land`
   and server archive restoration; `merge`, IPC declarations and server merge capture/sealing,
   with the dated special-file and merge IPC bug records. No new privilege
   or tool is authorized.
+
+### A-27 — Verify displaced content across the exchange's own ctime update (2026-09-20)
+
+The real Linux RAM-filesystem gate showed every resumed replacement refused because
+`RENAME_EXCHANGE` changed ctime. Require the complete witness before exchange, then verify
+the actual displaced name, all other fingerprint
+fields, and content when ctime differs or the witness was racy; require a stable hash read.
+Do not delete an unknown hidden name after an exchange/undo error. The simulation now
+models the syscall's ctime effect. The deterministic clock-advance and same-timestamp
+outsider tests, crash oracle and real kill/restart test exercise this correction.
+
+Applied in the same change to: §4.15 step 6; `land` engine, target refusal classifier and
+oracle/OS tests; `vfs::host::SimHost`; GAPS and TBD_FIXES. Evidence:
+`docs/bugs/2026-09-20-landing-exchange-changes-the-witness-ctime.md`.
+
+### A-28 — Own bindings and client identities across caller exit and daemon restart (2026-09-20)
+
+An OCI binding borrows the particular verified source mount, with no independent bearer token.
+Client exit leaves that binding usable; explicit detach removes it, and removing the source mount
+atomically removes its dependents. The container runtime owns the namespace and must finish its
+use before explicit detach. A source that cannot prove its live attachment is refused.
+
+Dead SDK clients retain their seats until owner-shard cleanup completes. Fresh rendezvous identities
+are durably reserved before handoff and recovered before admission, including identities that have
+not yet issued a verb. These are admission/retirement operations, not per-write coordination.
+
+Applied in the same change to: §4.6 and §4.7; the database attachment dependency and client-id
+reservation records, OCI verifier, server attachment/retirement/admission paths, IPC allocation,
+real CLI and client restart/SIGKILL regressions; OCI handoff notes, GAPS and TBD_FIXES. Evidence:
+the three dated OCI lifetime, cross-shard retirement and restart identity bug reports. No new
+capability, consensus rule or model change is introduced.

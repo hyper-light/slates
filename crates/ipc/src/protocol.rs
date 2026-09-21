@@ -481,6 +481,13 @@ pub enum RequestBody {
     /// The human surface's capability proof over the reviewed plan.
     proof: [u8; 32],
   },
+  /// Continue this client's immutable daemon report (§4.14); offsets are encoded byte offsets.
+  DaemonStatusNext {
+    /// The request identity that captured the report.
+    snapshot: u64,
+    /// The first byte still needed.
+    offset: u64,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -1941,6 +1948,17 @@ pub enum ReplyBody {
     group: [u8; 32],
     /// Whether this node still has to fetch and join that group.
     joining: bool,
+  },
+  /// One bounded page of an immutable daemon status report (§4.14).
+  DaemonStatusPage {
+    /// The request identity that captured the report on this client channel.
+    snapshot: u64,
+    /// The first encoded byte in this page.
+    offset: u64,
+    /// The complete encoded length, bounded by the client's reply credit.
+    total: u64,
+    /// Schema-checked report bytes, never more than one reply slot holds.
+    bytes: Vec<u8>,
   },
 }
 

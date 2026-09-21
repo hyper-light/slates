@@ -318,8 +318,19 @@ fn assert_unrelated_change_hint_keeps_the_digest(
     "nothing beneath the kept digest changed"
   );
   assert_eq!(rechecked.cached, 1);
-  vol.with_host(host).digest(store, "/f").unwrap();
-  assert_eq!(digest_stats(vol).revalidated, 1, "reused after the hint");
+  let reused = vol.with_host(host).digest(store, "/f").unwrap();
+  assert_eq!(reused.identity, *blake3::hash(b"two").as_bytes());
+  assert_eq!(reused.size, 3);
+  let after = digest_stats(vol);
+  assert_eq!(
+    after.revalidated,
+    rechecked.revalidated + 1,
+    "reused after the hint"
+  );
+  assert_eq!(
+    after.computed, rechecked.computed,
+    "reuse did not hash again"
+  );
 }
 
 /// Over a RAM-backed directory: a held descriptor keeps serving a file replaced beneath it, a

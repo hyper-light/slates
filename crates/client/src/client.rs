@@ -581,6 +581,10 @@ impl Client {
     if up_to.wrapping_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
+    if matches!(body, RequestBody::DaemonStatus) {
+      let capacity = slates_ipc::status::snapshot_capacity(self.end.region());
+      return slates_ipc::status::collect(capacity, |request| self.call_plain(request));
+    }
     self.call_plain(body)
   }
 

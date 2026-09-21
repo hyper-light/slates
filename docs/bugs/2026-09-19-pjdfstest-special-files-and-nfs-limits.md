@@ -3,7 +3,12 @@
 Date: 2026-09-19 (execution records use UTC 2026-09-20).
 Design: §4.5 namespace, §4.6 mounted equivalence, §4.8 recovery, §4.16 merge.
 Status: FIFO/socket namespace, recovery and Linux bridge support implemented; full merge-service
-integration and the remaining conformance review are open. No failures have been allowlisted.
+integration and the remaining conformance review were open at this checkpoint.
+
+Update (2026-09-20): the first root review is now complete, with 1,800 individually
+explained device-fixture dependencies and two NFS limitations; the unchanged full suite
+passes that reviewed gate. No upstream assertions changed. See
+[the review and its passing rerun](2026-09-20-pjdfstest-device-fixture-cascades.md).
 
 ## Reproduction
 

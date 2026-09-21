@@ -13,8 +13,9 @@
 //!   written, given its mode and mtime, data-synced and only then linked at its name (a create)
 //!   or exchanged with the old file (a replacement);
 //! - a compare-and-swap lost to an outsider is undone and reported: after the exchange the
-//!   descriptor held on the displaced file is `fstat`ed; a fingerprint other than the witness
-//!   exchanges back, removes the temporary and records `Undone(TargetInUse)`; a create whose
+//!   file at the displaced name is opened and verified against the witness. An exchange's
+//!   own ctime change requires a stable content hash; a mismatch exchanges back, removes
+//!   the temporary and records `Undone(TargetInUse)`; a create whose
 //!   name appeared meanwhile fails the link with `EEXIST` and records `Conflict(TargetInUse)`;
 //! - a re-run is idempotent: the plan is by hash, and an entry the disk already holds is a
 //!   `Skip`, which advances without a write;
@@ -36,7 +37,7 @@ use std::time::Instant;
 use slates_vfs::base::BaseConfig;
 use slates_vfs::error::VfsError;
 use slates_vfs::host::{HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs};
-use slates_vfs::inode::Witness;
+use slates_vfs::inode::{Fingerprint, Witness};
 use slates_vfs::volume::{Store, Volume};
 
 use crate::grant::{
@@ -528,7 +529,7 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(file) => {
         let fingerprint = self.host.fstat(file)?;
         let identity = if hash {
-          Some(self.hash_file(file)?)
+          Some(self.hash_file(file, fingerprint.size)?)
         } else {
           None
         };
@@ -585,12 +586,16 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
-  fn hash_file(&mut self, file: HostFile) -> Result<[u8; 32], HostError> {
+  /// Hash at most the captured length, so an outsider growing the file cannot extend the work.
+  fn hash_file(&mut self, file: HostFile, length: u64) -> Result<[u8; 32], HostError> {
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; HASH_READ_BYTES];
     let mut off = 0u64;
-    loop {
-      let n = self.host.read_at(file, off, &mut buf)?;
+    while off < length {
+      let take = usize::try_from(length - off)
+        .unwrap_or(buf.len())
+        .min(buf.len());
+      let n = self.host.read_at(file, off, &mut buf[..take])?;
       if n == 0 {
         break;
       }
@@ -877,11 +882,9 @@ impl<H: LandFs> Landing<'_, H> {
         }
         Ok(w)
       }
-      Err(e) => {
-        // The temporary never reached the name: remove it if it has one.
-        let _ = self.host.unlink(dir, &hidden);
-        Err(e)
-      }
+      // After a failed exchange/undo, the hidden name may hold the displaced file. Leave
+      // it for recovery; unlinking it here could discard the original or an outsider's data.
+      Err(e) => Err(e),
     }
   }
 
@@ -983,6 +986,9 @@ impl<H: LandFs> Landing<'_, H> {
     name: &str,
     w: &Witness,
   ) -> Result<Written, WriteFailure> {
+    // Only our exchange may explain a changed ctime. An earlier metadata change is still
+    // a witness conflict, even when the outsider left the same mode and content behind.
+    let before = self.host.fstat(old)?;
     let started = Instant::now();
     match self.host.exchange(dir, hidden, name) {
       Ok(()) => {}
@@ -994,9 +1000,13 @@ impl<H: LandFs> Landing<'_, H> {
     }
     self.costs.exchange_ns.push(elapsed_ns(started));
     let verify_started = Instant::now();
-    let displaced = self.host.fstat(old)?;
+    let verified = if before == w.fingerprint {
+      self.verify_displaced(dir, hidden, w)
+    } else {
+      Ok(false)
+    };
     self.costs.verify_ns.push(elapsed_ns(verify_started));
-    if displaced == w.fingerprint {
+    if matches!(verified, Ok(true)) {
       self.host.unlink(dir, hidden)?;
       return Ok(Written {
         outcome: Outcome::Written,
@@ -1006,10 +1016,48 @@ impl<H: LandFs> Landing<'_, H> {
     // Lost to an outsider: the old file goes back, the temporary goes away.
     self.host.exchange(dir, hidden, name)?;
     self.host.unlink(dir, hidden)?;
+    verified?;
     Ok(Written {
       outcome: Outcome::Undone(ConflictClass::TargetInUse),
       window_ns: None,
     })
+  }
+
+  /// Open what the exchange actually displaced: a pre-exchange descriptor can still point
+  /// at an inode an outsider already replaced. Always close this new descriptor on refusal.
+  fn verify_displaced(
+    &mut self,
+    dir: HostDir,
+    hidden: &str,
+    witness: &Witness,
+  ) -> Result<bool, HostError> {
+    let file = match self.host.open_file(dir, hidden) {
+      Ok(file) => file,
+      Err(HostError::NotFound | HostError::NotFile) => return Ok(false),
+      Err(error) => return Err(error),
+    };
+    let result = self.displaced_matches(file, witness);
+    self.host.close_file(file);
+    result
+  }
+
+  /// An exchange can change ctime itself. All other fields must match; a changed ctime
+  /// or racy witness additionally requires the witnessed bytes and a stable read (§4.15).
+  fn displaced_matches(&mut self, file: HostFile, witness: &Witness) -> Result<bool, HostError> {
+    let before = self.host.fstat(file)?;
+    let preserved = Fingerprint {
+      ctime_ns: witness.fingerprint.ctime_ns,
+      ..before
+    };
+    if preserved != witness.fingerprint {
+      return Ok(false);
+    }
+    if before == witness.fingerprint && !witness.racy {
+      return Ok(true);
+    }
+    let identity = self.hash_file(file, before.size)?;
+    let after = self.host.fstat(file)?;
+    Ok(identity == witness.identity && after == before)
   }
 
   /// The exchange fallback (Degraded): verify the old file through its descriptor, then rename

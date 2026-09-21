@@ -29,9 +29,13 @@ fn macos_table() -> Vec<MountEntry> {
     entry(
       "/private/var/folders/1s/T/tmp.abc",
       "nfs",
-      "localhost:/work",
+      "localhost:/work@1.0123456789abcdef0123456789abcdef",
     ),
-    entry("/Users/me/other", "nfs", "localhost:/other"),
+    entry(
+      "/Users/me/other",
+      "nfs",
+      "localhost:/other@2.abcdef0123456789abcdef0123456789",
+    ),
   ]
 }
 
@@ -50,6 +54,36 @@ fn a_loopback_mount_of_the_volume_is_verified_and_names_it() {
   assert_eq!(verified.fstype, "nfs");
   assert_eq!(verified.source, "localhost:/work");
   assert!(verified.names_volume);
+  assert!(
+    !format!("{verified:?}").contains("0123456789abcdef"),
+    "debug evidence redacts authority too"
+  );
+}
+
+/// AC-4.11 / AUD-01: a bare, malformed or foreign source cannot identify this authorized mount;
+/// refusal evidence and successful evidence never reveal the bearer token.
+#[test]
+fn malformed_and_foreign_capability_sources_refuse_without_disclosing_the_token() {
+  let expected = expected_mount(HostMountKind::NfsLoopback, "work");
+  for source in [
+    "localhost:/work",
+    "localhost:/worker@1.0123456789abcdef0123456789abcdef",
+    "foreign:/work@1.0123456789abcdef0123456789abcdef",
+    "localhost:/work@.0123456789abcdef0123456789abcdef",
+    "localhost:/work@+1.0123456789abcdef0123456789abcdef",
+    "localhost:/work@10000000000000000.0123456789abcdef0123456789abcdef",
+    "localhost:/work@1.0123456789abcdef",
+    "localhost:/work@1.0123456789abcdef0123456789abcdeg",
+    "localhost:/work@1.0123456789abcdef0123456789abcdef/child",
+  ] {
+    let table = [entry("/mount", "nfs", source)];
+    let Err(HostPathRefusal::NotThisVolume { source: reported }) =
+      verify_host_mount(&table, "/mount", &expected)
+    else {
+      panic!("a malformed or foreign export must be refused");
+    };
+    assert_eq!(reported, source.split('@').next().unwrap());
+  }
 }
 
 /// Every refusal, in the order the checks consult the least: a relative path never reaches the
@@ -90,7 +124,11 @@ fn every_host_path_refusal_is_typed_and_reached() {
 #[test]
 fn the_last_mount_at_a_path_is_the_visible_one() {
   let mut table = macos_table();
-  table.push(entry("/Users/me/other", "nfs", "localhost:/work"));
+  table.push(entry(
+    "/Users/me/other",
+    "nfs",
+    "localhost:/work@3.0123456789abcdef0123456789abcdef",
+  ));
   let expected = expected_mount(HostMountKind::NfsLoopback, "work");
   let verified = verify_host_mount(&table, "/Users/me/other", &expected).unwrap();
   assert_eq!(verified.source, "localhost:/work");
