@@ -20,8 +20,10 @@
 //! unsupported forms are refused before the seam is touched at all; the consumer is authenticated
 //! (`seam.consumer()`, the §4.13 credential — an inherited endpoint's peer, or the in-process
 //! harness's own enrollment — never a per-request claim); the attachment is admitted into the
-//! authority registry ([`Attachments`], the same record every transport rides, so every effect the
-//! device makes is checked against it); only then are the queues read, the memory mapped and the
+//! **caller's** authority registry ([`Attachments`] — the owner shard's, the one record every
+//! transport on the volume rides, so every effect the device makes is checked against it and the
+//! owner's barriers close the device's generation with the mounts' (GAP-A9-4); the device keeps only
+//! its id, and every service pass and the terminal step take the registry from the caller); only then are the queues read, the memory mapped and the
 //! queues validated; and the tag is published last. A failure at any step releases the seam and
 //! returns it with the typed error, so nothing is left mapped or half-built.
 //!
@@ -311,7 +313,6 @@ pub struct AdmissionCounters {
 pub struct AdmittedDevice<S: VmmSeam> {
   seam: S,
   device: Device,
-  attachments: Attachments,
   attachment: AttachmentId,
   transport: GuestTransport,
   rights: Rights,
@@ -372,6 +373,7 @@ pub fn admit<S: VmmSeam>(
   config: DeviceConfig,
   credits: AttachmentCredits,
   rights: impl FnOnce(&Principal) -> Rights,
+  registry: &mut Attachments,
 ) -> Result<AdmittedDevice<S>, AdmissionRefused<S>> {
   if let Some(reason) = unsupported(&request) {
     return Err(refuse(
@@ -387,8 +389,7 @@ pub fn admit<S: VmmSeam>(
     Err(e) => return Err(refuse(seam, AdmissionError::ConsumerRefused(e))),
   };
   let granted = rights(&consumer);
-  let mut attachments = Attachments::new();
-  let attachment = match attachments.attach(request.volume, View::Current, consumer, granted) {
+  let attachment = match registry.attach(request.volume, View::Current, consumer, granted) {
     Ok(id) => id,
     Err(e) => return Err(refuse(seam, AdmissionError::Authority(e))),
   };
@@ -406,7 +407,6 @@ pub fn admit<S: VmmSeam>(
   Ok(AdmittedDevice {
     seam,
     device,
-    attachments,
     attachment,
     transport: request.transport,
     rights: granted,
@@ -469,8 +469,8 @@ impl<S: VmmSeam> AdmittedDevice<S> {
 
   /// The authenticated context an operation would run under, or the registry's refusal (after
   /// reclaim, `NotPermitted`).
-  pub fn context(&self) -> Result<OpContext, VfsError> {
-    self.attachments.context(self.attachment)
+  pub fn context(&self, registry: &Attachments) -> Result<OpContext, VfsError> {
+    registry.context(self.attachment)
   }
 
   /// The capability report for this attachment (§4.6: what `attach` and `status` say).
@@ -487,12 +487,15 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   /// charged before it is touched and released when its used element is published; a queue that
   /// completed work and asks for it is notified. Bounded by the request credit per queue. Refused
   /// typed — and nothing touched — once the device is revoked.
-  pub fn service(&mut self, bridge: &mut dyn Bridge) -> Result<Serviced, ServeError> {
+  pub fn service(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+  ) -> Result<Serviced, ServeError> {
     if self.state != AttachmentState::Live {
       return Err(ServeError::Revoked);
     }
-    let cx = self
-      .attachments
+    let cx = registry
       .context(self.attachment)
       .map_err(ServeError::Authority)?;
     let batch = self.ledger.credits().requests.get();
@@ -534,18 +537,21 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   /// The owned terminal step: sweeps the attachment's references through `bridge` under the
   /// still-valid authority, revokes and drains the attachment (no further context), restores the
   /// credits whole, and releases the seam last. Revokes first if the device is still live.
-  pub fn reclaim(&mut self, bridge: &mut dyn Bridge) -> Result<Reclaimed, ReclaimError> {
+  pub fn reclaim(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &mut Attachments,
+  ) -> Result<Reclaimed, ReclaimError> {
     if self.state == AttachmentState::Reclaimed {
       return Err(ReclaimError::AlreadyReclaimed);
     }
     let in_flight_at_revoke = self.revoke();
-    let cx = self
-      .attachments
+    let cx = registry
       .context(self.attachment)
       .map_err(ReclaimError::Authority)?;
     bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep)?;
-    self.attachments.revoke(self.attachment);
-    self.attachments.drain(self.attachment);
+    registry.revoke(self.attachment);
+    registry.drain(self.attachment);
     let _ = self.ledger.reclaim();
     let credits = self.ledger.credits();
     self.seam.release();

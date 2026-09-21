@@ -229,6 +229,21 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     };
     let mounted =
       crate::mount::establish(&report, (attachment.attachment, token), path, *read_only)?;
+    // The established mount point is reported back (§4.4 `Binding → Bound`), so the record names it
+    // and `status` shows it; a bind the daemon refuses takes the mount down again rather than leave a
+    // mount whose record says it is bound nowhere.
+    if let Err(e) = client.bind_mount(attachment.attachment, &mounted) {
+      let unmounted = crate::mount::unmount(&mounted);
+      let bind = failure_of(e, &request.instance);
+      return Err(match unmounted {
+        Ok(()) => bind,
+        Err(unmount) => Failure::Failed(format!(
+          "{}; and unmounting it again: {}",
+          failure_text(&bind),
+          failure_text(&unmount)
+        )),
+      });
+    }
     println!("mounted: {mounted}");
     return Ok(());
   }
@@ -568,12 +583,37 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
 
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
+/// A failure's text for a message that reports two of them at once.
+fn failure_text(failure: &Failure) -> String {
+  match failure {
+    Failure::Refused(text) | Failure::Failed(text) => text.clone(),
+    other => format!("{other:?}"),
+  }
+}
+
 fn emit_snapshot(client: &mut Client, volume: VolumeId, json: bool) -> Result<(), ClientError> {
-  let snapshot = client.snapshot(volume)?;
+  let (snapshot, coverage) = client.snapshot_with_coverage(volume)?;
+  // What the barrier could claim (§4.6 "Writeback and snapshot barrier"): `complete` when every write
+  // a consumer was told succeeded is in the snapshot, `server_visible` when a mounted kernel client
+  // may still hold acknowledged writes it has not sent (an NFS client before its COMMIT).
+  let boundary = match coverage.boundary {
+    slates_client::SnapshotBoundary::Complete => "complete",
+    slates_client::SnapshotBoundary::ServerVisible => "server_visible",
+  };
   if json {
-    println!("{}", serde_json::json!({ "snapshot": snapshot.value }));
+    println!(
+      "{}",
+      serde_json::json!({
+        "snapshot": snapshot.value,
+        "coverage": boundary,
+        "attachments_closed": coverage.attachments_closed,
+      })
+    );
   } else {
-    println!("snapshot: {}", snapshot.value);
+    println!(
+      "snapshot: {}\ncoverage: {boundary}\nattachments_closed: {}",
+      snapshot.value, coverage.attachments_closed
+    );
   }
   Ok(())
 }
@@ -1280,10 +1320,27 @@ fn status_text(report: &StatusReport) -> String {
     report.placed.region,
     option_text(report.placed.mirror_age_ns),
     report.placed.host_epoch
-  ) + &transports_text(&report.transports)
+  ) + &mounts_text(report)
+    + &transports_text(&report.transports)
 }
 
 /// The host's transport report as text (§4.6 A-9): the host facts, then one line per transport.
+/// The volume's bound host mounts (§4.4 `Bound`): one line per mount point with its attachment, and
+/// the count the report's budget did not carry.
+fn mounts_text(report: &StatusReport) -> String {
+  let mut out = String::new();
+  for mount in &report.mounts {
+    out.push_str(&format!(
+      "mount: {} (attachment {})\n",
+      mount.path, mount.attachment
+    ));
+  }
+  if report.mounts_elided > 0 {
+    out.push_str(&format!("mounts_elided: {}\n", report.mounts_elided));
+  }
+  out
+}
+
 fn transports_text(report: &slates_client::TransportReport) -> String {
   let mut text = format!(
     "os: {}\nkernel: {}\noci_runtime: {}\n",

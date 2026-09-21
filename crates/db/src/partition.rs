@@ -476,6 +476,7 @@ impl Partition {
         Ok(())
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
+      Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::CompletionRecorded { record } => {
         match self.completion(record.origin, record.client, record.sequence) {
           Seen::Acknowledged => Err(DbError::StaleCompletion {
@@ -664,6 +665,15 @@ impl Partition {
       }
       Op::ClientIdReserved { client } => {
         self.client_id_high_water = self.client_id_high_water.max(*client);
+        Ok(())
+      }
+      Op::AttachmentBound { id, path } => {
+        let h = *self
+          .attachment_index
+          .get(&id.to_be_bytes())
+          .ok_or(DbError::NotFound)?;
+        let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+        record.form = crate::catalog::AttachForm::ChosenPath { path: path.clone() };
         Ok(())
       }
       Op::AttachmentRemoved { id } => {

@@ -1711,6 +1711,38 @@ client `fsync` must reach the bridge and its declared durability boundary. Auto-
 server-visible writes reports that narrower boundary and cannot claim to include dirty guest
 pages. Mount setup and barrier latency are outside the O(1) root publication measurement.
 
+> **Status (2026-09-21, the barrier over one registry; GAP-A9-4).** The daemon holds **one attachment
+> registry per shard** (`ShardState::attachments`, the `slates-bridge-core` registry with generations
+> and in-flight pins) that every transport's request on the shard's volumes rides: a mount's request is
+> admitted under the registry attachment its capability maps to (`ShardState::mount_attachments`,
+> admitted on the capability's first request, revoked and drained when the catalog attachment ends —
+> a `detach`, the kernel's `UMNT`, a destroy), the NFS export serving it through `Export::over` the
+> shared registry rather than one it mints per request, and a guest device is admitted into the same
+> registry (`bridge-virtiofs::admission::admit` takes the owner's registry; the device keeps only its
+> id, and every service pass and its terminal step take the registry from the owner through
+> `BridgeAccess`). `snapshot` runs `Attachments::barrier` over the volume before it freezes the root:
+> every live attachment's generation closes — a request admitted before belongs to the snapshot, one
+> after to the next — and a request still in flight (a consumer lost mid-request) is the typed
+> `Refusal::BarrierIncomplete { attachment, generation }`, never a clean snapshot over it. The reply
+> **says what the snapshot covers** (`Snapshotted.coverage: SnapshotCoverage { boundary,
+> attachments_closed }`): `Complete` when no attachment could hold a write the daemon has not recorded
+> (ring clients; write-through transports), `ServerVisible` when a closed attachment rides a transport
+> whose kernel client buffers acknowledged writes it has not sent — the NFS client before its `COMMIT`
+> — the narrower boundary this paragraph says an auto-seal must report rather than claim dirty pages;
+> the FUSE writeback flush has no work left since writeback cache is refused at `FUSE_INIT` (the
+> 2026-09-19 correction under "Linux"). And the attachment record no longer stays `path: None`: a host
+> mount reports the mount point it established (`BindMount { attachment, path }` → `AttachForm::
+> ChosenPath`, §4.4 `Binding → Bound`; `slates mount` binds after `mount_nfs` and takes the mount down
+> again if the bind is refused), only its principal may bind it, an SDK attachment has no mount point
+> to bind, and `status` lists the bound mounts (bounded by a mount budget, the rest counted). Proven
+> by use over the real NFS socket (`crates/server/tests/nfs_mount.rs`: a snapshot before any mount is
+> complete and closes nothing, over the written mount it is server-visible and closes one, the mount
+> serves on under the next generation, and after the kernel's `UMNT` the next snapshot closes nothing
+> again; a bound mount point listed, another principal and an SDK attachment refused, the detach
+> unlisting it), by the device suites over the shared registry (`crates/bridge-virtiofs/tests`), and by
+> the live kernel-mount CLI flow (`status ID` names the mount point while mounted, none after
+> `umount`). Records: this entry, GAPS GAP-A9-4, `docs/wip/TBD_FIXES.md` §5.
+
 **POSIX and transparency acceptance.** The shared operation layer must preserve hardlinks,
 unlink-while-open, rename replacement/exchange/no-replace flags, symlinks, truncation/sparse
 files, permissions and ownership, timestamps, error codes, descriptor lifetime, `fsync`,

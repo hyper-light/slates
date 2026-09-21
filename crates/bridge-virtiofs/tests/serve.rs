@@ -18,7 +18,7 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use common::{SimDriver, SimVmm, message, reply_error, store, vid, volume};
-use slates_bridge_core::{Bridge, Rights, VolumeBridge};
+use slates_bridge_core::{Attachments, Bridge, Rights, VolumeBridge};
 use slates_bridge_fuse::abi::Opcode;
 use slates_bridge_virtiofs::admission::{
   AdmittedDevice, Doorbell, Drained, GuestAttachRequest, GuestTransport, SeamError, VmmSeam, admit,
@@ -168,12 +168,29 @@ fn pipe() -> (OwnedFd, OwnedFd) {
 struct OwnedVolume {
   store: Store,
   volume: Volume,
+  /// The owner's attachment registry the device is admitted into (GAP-A9-4).
+  registry: Attachments,
+}
+
+impl OwnedVolume {
+  fn fresh() -> OwnedVolume {
+    let mut store = store();
+    let volume = volume(&mut store);
+    OwnedVolume {
+      store,
+      volume,
+      registry: Attachments::new(),
+    }
+  }
 }
 
 impl BridgeAccess for OwnedVolume {
-  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> Result<R, VfsError> {
+  fn with_bridge<R>(
+    &mut self,
+    f: impl FnOnce(&mut dyn Bridge, &mut Attachments) -> R,
+  ) -> Result<R, VfsError> {
     let mut bridge = VolumeBridge::new(vid(), &mut self.volume, &mut self.store);
-    Ok(f(&mut bridge))
+    Ok(f(&mut bridge, &mut self.registry))
   }
 }
 
@@ -203,7 +220,7 @@ fn rw(_consumer: &Principal) -> Rights {
 
 /// Builds the guest and admits a device over a pipe seam; returns the admitted device and the
 /// guest's ends (the kick's write end, the call's read end).
-fn admitted_over_pipes() -> (AdmittedDevice<PipeVmm>, OwnedFd, OwnedFd) {
+fn admitted_over_pipes(registry: &mut Attachments) -> (AdmittedDevice<PipeVmm>, OwnedFd, OwnedFd) {
   let (kick_read, kick_write) = pipe();
   let (call_read, call_write) = pipe();
   GUEST.with(|guest| *guest.borrow_mut() = Some(SimDriver::new(&QUEUE_SIZES)));
@@ -219,6 +236,7 @@ fn admitted_over_pipes() -> (AdmittedDevice<PipeVmm>, OwnedFd, OwnedFd) {
     DeviceConfig::new(FsTag::new("slates").unwrap()),
     credits(),
     rw,
+    registry,
   )
   .unwrap();
   (admitted, kick_write, call_read)
@@ -258,12 +276,11 @@ fn the_loop_serves_kicks_through_the_driver_and_ends_on_hangup() {
   let (end_tx, end_rx) = channel::<ServeEnd>();
   let (guest_tx, guest_rx) = channel::<(Vec<i32>, u64)>();
   rt.spawn_on(shard, async move {
-    let (admitted, kick_write, call_read) = admitted_over_pipes();
+    let mut owned = OwnedVolume::fresh();
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
     let id = register(DEVICE_BOUND).unwrap();
-    let mut store = store();
-    let volume = volume(&mut store);
     let device_task = futures::spawn(async move {
-      let end = serve_loop(id, admitted, OwnedVolume { store, volume }).await;
+      let end = serve_loop(id, admitted, owned).await;
       let _ = end_tx.send(end);
     })
     .unwrap();
@@ -310,12 +327,11 @@ fn a_revoke_request_wakes_the_loop_and_reclaims() {
   let (end_tx, end_rx) = channel::<ServeEnd>();
   let (guest_tx, guest_rx) = channel::<(i32, bool, bool)>();
   rt.spawn_on(shard, async move {
-    let (admitted, kick_write, call_read) = admitted_over_pipes();
+    let mut owned = OwnedVolume::fresh();
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
     let id = register(DEVICE_BOUND).unwrap();
-    let mut store = store();
-    let volume = volume(&mut store);
     let device_task = futures::spawn(async move {
-      let end = serve_loop(id, admitted, OwnedVolume { store, volume }).await;
+      let end = serve_loop(id, admitted, owned).await;
       let _ = end_tx.send(end);
     })
     .unwrap();
@@ -356,19 +372,19 @@ fn a_seam_without_a_doorbell_ends_the_loop_at_once() {
   let (end_tx, end_rx) = channel::<ServeEnd>();
   rt.spawn_on(shard, async move {
     let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }));
+    let mut owned = OwnedVolume::fresh();
     let admitted = admit(
       request(),
       seam,
       DeviceConfig::new(FsTag::new("slates").unwrap()),
       credits(),
       rw,
+      &mut owned.registry,
     )
     .unwrap();
     let id = register(DEVICE_BOUND).unwrap();
-    let mut store = store();
-    let volume = volume(&mut store);
     let task = futures::spawn(async move {
-      let end = serve_loop(id, admitted, OwnedVolume { store, volume }).await;
+      let end = serve_loop(id, admitted, owned).await;
       let _ = end_tx.send(end);
     })
     .unwrap();

@@ -901,7 +901,7 @@ pub(crate) fn status_merge_volume(
     &rights_of(&record, principal),
   )));
   Some(ReplyBody::Status {
-    report: slates_ipc::protocol::StatusReport {
+    report: Box::new(slates_ipc::protocol::StatusReport {
       transports,
       id: volume,
       name: record.name.clone(),
@@ -917,7 +917,11 @@ pub(crate) fn status_merge_volume(
       nfs_port: u16::try_from(crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire))
         .ok()
         .filter(|port| *port != 0),
-    },
+      // A green has no host mount of its own to bind (§4.16: a green is served through pinned
+      // attachments, the record form).
+      mounts: Vec::new(),
+      mounts_elided: 0,
+    }),
   })
 }
 

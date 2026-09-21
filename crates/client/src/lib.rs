@@ -40,9 +40,9 @@ pub use slates_ipc::protocol::{
   FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostMountEvidence, HostPathReason,
   Intent, KernelCache, LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime,
   PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount, Residency, Rights, Scope,
-  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
-  VolumeSummary, WorkOp,
+  ShardReport, SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId,
+  SpanRecord, StatusReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

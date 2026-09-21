@@ -587,7 +587,7 @@ fn create_snapshot_clone(
     client.call(&scratch("one")),
     ReplyBody::Refused { refusal: Refusal::AlreadyExists { existing } } if existing == id
   ));
-  let ReplyBody::Snapshotted { id: snap } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snap, .. } = client.call(&RequestBody::Snapshot { volume: id })
   else {
     panic!("snapshot");
   };
@@ -888,7 +888,8 @@ fn present_landing(
   let ReplyBody::Created { id } = client.call(&scratch("granted")) else {
     panic!("create");
   };
-  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
   else {
     panic!("snapshot");
   };
@@ -1828,7 +1829,7 @@ fn snapshot_destroy_scenario() {
   let ReplyBody::Created { id } = client.call(&create("origin")) else {
     panic!("create");
   };
-  let ReplyBody::Snapshotted { id: snap } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snap, .. } = client.call(&RequestBody::Snapshot { volume: id })
   else {
     panic!("snapshot");
   };
@@ -2737,7 +2738,7 @@ fn snapshot_of(
   client: &mut Client,
   volume: slates_ipc::protocol::VolumeId,
 ) -> slates_ipc::protocol::SnapshotId {
-  let ReplyBody::Snapshotted { id } = client.call(&RequestBody::Snapshot { volume }) else {
+  let ReplyBody::Snapshotted { id, .. } = client.call(&RequestBody::Snapshot { volume }) else {
     panic!("snapshot");
   };
   id

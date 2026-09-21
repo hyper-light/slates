@@ -80,12 +80,20 @@ struct ShardBridge {
 }
 
 impl BridgeAccess for ShardBridge {
-  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> Result<R, VfsError> {
+  fn with_bridge<R>(
+    &mut self,
+    f: impl FnOnce(&mut dyn Bridge, &mut slates_bridge_core::Attachments) -> R,
+  ) -> Result<R, VfsError> {
     let volume = self.volume;
     let handles = &mut self.handles;
     state::with_state(|s| {
       let handle = *s.by_id.get(&volume)?;
-      let ShardState { store, volumes, .. } = s;
+      let ShardState {
+        store,
+        volumes,
+        attachments,
+        ..
+      } = s;
       let slot = volumes.get_mut(handle).ok()?;
       let mut bridge = VolumeBridge::attached(
         volume,
@@ -97,7 +105,7 @@ impl BridgeAccess for ShardBridge {
           .as_mut()
           .map(|host| host as &mut dyn slates_vfs::host::HostFs),
       );
-      Some(f(&mut bridge))
+      Some(f(&mut bridge, attachments))
     })
     .flatten()
     .ok_or(VfsError::NotFound)
@@ -139,10 +147,34 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
       write: granted.write,
     }
   };
-  let mut admitted = match admit(request, seam, DeviceConfig::new(tag), credits, rights) {
-    Ok(admitted) => admitted,
-    Err(refused) => {
+  // Admitted into the owner shard's attachment registry — the one every transport on the volume
+  // rides, so the owner's barriers close the device's generation with the mounts' (GAP-A9-4). The
+  // seam is held in a slot so that a shard whose state is out of reach still releases it.
+  let mut seam_slot = Some(seam);
+  let admission = state::with_state(|s| {
+    seam_slot.take().map(|seam| {
+      admit(
+        request,
+        seam,
+        DeviceConfig::new(tag),
+        credits,
+        rights,
+        &mut s.attachments,
+      )
+    })
+  })
+  .flatten();
+  let mut admitted = match admission {
+    Some(Ok(admitted)) => admitted,
+    Some(Err(refused)) => {
       on_end(GuestDeviceOutcome::Refused(refused.error));
+      return;
+    }
+    None => {
+      if let Some(mut seam) = seam_slot.take() {
+        seam.release();
+      }
+      on_end(GuestDeviceOutcome::VolumeUnknown);
       return;
     }
   };
@@ -154,7 +186,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
     Ok(id) => id,
     Err(refused) => {
       // The terminal step still runs: nothing admitted outlives a refused loop.
-      let _ = bridge.with_bridge(|b| admitted.reclaim(b));
+      let _ = bridge.with_bridge(|b, registry| admitted.reclaim(b, registry));
       on_end(GuestDeviceOutcome::LoopRefused(refused));
       return;
     }

@@ -123,6 +123,16 @@ impl RecordLink {
   }
 }
 
+/// A mount capability's place in the shard's attachment registry (GAP-A9-4).
+#[derive(Clone, Copy, Debug)]
+pub struct MountAttachment {
+  /// The registry attachment its requests are admitted under.
+  pub registry: slates_bridge_core::AttachmentId,
+  /// The boundary a snapshot over it can claim (§4.6): the NFS client buffers acknowledged writes
+  /// until its `COMMIT`, so the daemon's records are the server-visible boundary, never a complete one.
+  pub boundary: slates_ipc::protocol::SnapshotBoundary,
+}
+
 /// The shard's state.
 pub struct ShardState {
   /// The shard: the runtime's id, what messages are addressed to (process-local).
@@ -226,6 +236,17 @@ pub struct ShardState {
   pub next_prefix: u16,
   /// The next attachment id.
   pub next_attachment: u64,
+  /// The shard's attachment registry (§4.4, §4.6 "Writeback and snapshot barrier"; GAP-A9-4): the one
+  /// authority record every transport's request on this shard's volumes rides — a mount's request is
+  /// admitted (`begin`/`end`) under the registry attachment its capability maps to — so a barrier the
+  /// owner runs over a volume (a snapshot) sees every request the seam may still be applying and
+  /// closes every live attachment's generation. Bounded by the registry's own cap (a typed `SlabFull`
+  /// refusal past it).
+  pub attachments: slates_bridge_core::Attachments,
+  /// The registry attachment each mount capability's catalog attachment rides on, admitted on its
+  /// first request and revoked when the attachment ends (`verbs::end_attachment`). Bounded by the
+  /// partition's attachment cap: one entry per live catalog attachment at most.
+  pub mount_attachments: BTreeMap<u64, MountAttachment>,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,
   /// Requests served.

@@ -423,11 +423,18 @@ fn unmount_and_check(instance: &str, id: &str, path: &str) {
     !is_mounted(path),
     "the kernel mount table no longer lists it"
   );
-  // The kernel's own `UMNT` ended the mount's attachment (AUD-01): the volume reports none.
+  // The kernel's own `UMNT` ended the mount's attachment (AUD-01): the volume reports none, and no
+  // bound mount point remains.
   assert!(
     wait_for(|| attachments_of(instance, id) == "0"),
     "the kernel's UMNT ended the mount's attachment: {}",
     attachments_of(instance, id)
+  );
+  let (code, out, err) = run(instance, &["status", id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    !out.lines().any(|line| line.starts_with("mount: ")),
+    "no bound mount point remains after the unmount: {out}"
   );
 }
 
@@ -520,6 +527,15 @@ fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
     attachments_of(&instance, &id),
     "1",
     "the mount is the volume's one attachment (AUD-01)"
+  );
+  // The mount point is bound to the attachment (§4.4 `Bound`; GAP-A9-4): the status names it.
+  let (code, out, err) = run(&instance, &["status", &id]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out
+      .lines()
+      .any(|line| line.starts_with(&format!("mount: {} (attachment ", mount_point.path))),
+    "the status lists the bound mount point: {out}"
   );
   mount_root_is_owned_by_the_mounting_user(&mount_point.path);
   roundtrip_a_file_through(&mount_point.path);

@@ -799,6 +799,12 @@ pub fn status_json(r: &StatusReport) -> Value {
     "unique_bytes": r.unique_bytes,
     "lease_epoch": r.lease_epoch,
     "attachments": r.attachments,
+    "mounts": r
+      .mounts
+      .iter()
+      .map(|mount| serde_json::json!({ "attachment": mount.attachment, "path": mount.path }))
+      .collect::<Vec<_>>(),
+    "mounts_elided": r.mounts_elided,
     "head": r.head.value,
     "snapshots": r.snapshots,
     "watcher": r.watcher,

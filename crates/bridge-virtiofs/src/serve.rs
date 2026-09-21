@@ -24,6 +24,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
+use slates_bridge_core::Attachments;
 use slates_bridge_core::Bridge;
 use slates_rt::error::RtError;
 use slates_rt::futures;
@@ -146,8 +147,13 @@ impl Future for RegisterWaker {
 /// the shard's state; a test lends an owned volume. Refused typed when the volume is gone
 /// (destroyed under a live device), which ends the loop.
 pub trait BridgeAccess {
-  /// Runs `f` with the bridge, or refuses when there is no volume to bridge to.
-  fn with_bridge<R>(&mut self, f: impl FnOnce(&mut dyn Bridge) -> R) -> Result<R, VfsError>;
+  /// Runs `f` with the bridge and the owner's attachment registry — the one every transport on the
+  /// volume rides, so the owner's barriers see the device's requests (GAP-A9-4) — or refuses when
+  /// there is no volume to bridge to.
+  fn with_bridge<R>(
+    &mut self,
+    f: impl FnOnce(&mut dyn Bridge, &mut Attachments) -> R,
+  ) -> Result<R, VfsError>;
 }
 
 /// Why the loop ended.
@@ -189,7 +195,7 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
 ) -> Result<(), ServeError> {
   loop {
     let pass = bridge
-      .with_bridge(|b| admitted.service(b))
+      .with_bridge(|b, registry| admitted.service(b, registry))
       .map_err(ServeError::Authority)??;
     *passes = passes.saturating_add(1);
     if !pass.more_pending {
@@ -251,7 +257,7 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
     }
   };
   let reclaimed = bridge
-    .with_bridge(|b| admitted.reclaim(b))
+    .with_bridge(|b, registry| admitted.reclaim(b, registry))
     .unwrap_or_else(|gone| Err(ReclaimError::Authority(gone)));
   unregister(id);
   ServeEnd {

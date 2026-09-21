@@ -15,8 +15,8 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use slates_ipc::protocol::{
-  AttachRequest, Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass, VolumeId, pack,
-  unpack,
+  AttachRequest, Direction, Intent, NamePolicy, ReplyBody, RequestBody, SizeClass,
+  SnapshotBoundary, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::{MachineProfile, ProfileOptions};
@@ -351,6 +351,208 @@ fn the_host_root_listing_gathers_volumes_from_every_shard() {
   drop(stream);
   drop(client);
   drop(daemon);
+}
+
+/// AC-3.11 / T-3.14 (§4.6 "Writeback and snapshot barrier"; GAP-A9-4): a snapshot runs the barrier over
+/// the shard's attachment registry and reports what it covers. Before any mount the volume has no live
+/// attachment: the barrier closes none and the snapshot is **complete** (only ring writers, whose
+/// writes are recorded before they return). Once the volume is mounted under its capability and written
+/// through, the mount's requests ride a registry attachment: the barrier closes it (one attachment) and
+/// the snapshot is **server-visible** — the NFS client may still hold acknowledged writes before its
+/// `COMMIT`, which the reply must not claim. The mount keeps serving after the barrier (a write lands in
+/// the next generation), and the kernel's `UMNT` ends the registry attachment with the catalog's: the
+/// next snapshot closes none again. Non-vacuous: the closed count moves 0 → 1 → 0 with the mount's life.
+#[test]
+fn a_snapshot_over_a_mounted_volume_reports_the_barrier_it_closed() {
+  let (daemon, instance) = single_shard_daemon("snapbarrier");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id: volume } = client.call(&scratch("vol")) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+
+  let before = snapshot_coverage(&mut client, volume);
+
+  let path = capability_path(&daemon, "vol");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &path, 1);
+  let file = create(&mut stream, &root, "f", 2);
+  write(&mut stream, &file, b"before the snapshot\n", 3);
+  let mounted = snapshot_coverage(&mut client, volume);
+  // The mount serves on: a write after the barrier belongs to the next generation (longer than the
+  // first, so the whole file is the new bytes — a write at offset zero truncates nothing).
+  let after = b"after the snapshot: the next generation\n";
+  write(&mut stream, &file, after, 4);
+  assert_eq!(read(&mut stream, &file, 5), after);
+
+  umnt(&mut stream, &path, 6);
+  let unmounted = snapshot_coverage(&mut client, volume);
+  daemon.stop();
+
+  assert_eq!(
+    before,
+    (SnapshotBoundary::Complete, 0),
+    "no mount: the barrier closes nothing and the snapshot is complete"
+  );
+  assert_eq!(
+    mounted,
+    (SnapshotBoundary::ServerVisible, 1),
+    "the mount's attachment is closed by the barrier, and an NFS client may hold acknowledged writes"
+  );
+  assert_eq!(
+    unmounted,
+    (SnapshotBoundary::Complete, 0),
+    "the kernel's UMNT ended the registry attachment with the catalog's"
+  );
+}
+
+/// AC (§4.4 `Binding → Bound`; GAP-A9-4): a host mount's attachment is bound to the mount point the
+/// mounting process established, and the volume's status reports it. The owner attaches as a host
+/// mount and binds the path: `status` lists that mount with its attachment. A consumer that is not the
+/// attachment's principal cannot bind it (`Forbidden`); an SDK attachment, which establishes no host
+/// mount, cannot be bound (`BadRequest`); a `detach` ends the mount and the status lists it no more.
+/// Non-vacuous: the listing moves empty → one → empty with the attachment's life.
+#[test]
+fn a_host_mount_binds_its_mount_point_and_the_status_reports_it() {
+  // Two shards, and a volume the control shard does not own: the bind, the status and the detach all
+  // route to the attachment's owner over the cross-shard path, as `slates mount` on a real daemon does.
+  let (daemon, instance) = two_shard_daemon("bindmount");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = rustix::process::getuid().as_raw();
+  let mut owner = Client::connect(&instance);
+  let mut other = Client::connect(&instance);
+  enroll_consumer(&mut owner, &mut other, &secret, account);
+  let volume = remote_volume(&mut owner);
+  let before = mounts_reported(&mut owner, volume);
+
+  let (attachment, _token) = attach_host_mount(&mut owner, volume);
+  let path = "/Users/ada/projects/vol".to_owned();
+  let bound = matches!(
+    owner.call(&RequestBody::BindMount {
+      attachment,
+      path: path.clone(),
+    }),
+    ReplyBody::MountBound
+  );
+  let listed = mounts_reported(&mut owner, volume);
+  // Another principal cannot bind the owner's attachment; an SDK attachment has no mount point.
+  let (forged, unbound) = bind_refusals(&mut other, &mut owner, attachment, volume);
+  let detached = matches!(
+    owner.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  );
+  let after = mounts_reported(&mut owner, volume);
+  daemon.stop();
+
+  assert!(before.is_empty(), "nothing is bound before a mount");
+  assert!(bound, "the owner binds its mount");
+  assert_eq!(
+    listed,
+    vec![(attachment, path)],
+    "the status lists the bound mount with its attachment"
+  );
+  assert!(
+    refused_as(&forged, RefusalKind::Forbidden),
+    "another principal is refused: {forged:?}"
+  );
+  assert!(
+    refused_as(&unbound, RefusalKind::BadRequest),
+    "an SDK attachment binds no mount point: {unbound:?}"
+  );
+  assert!(detached, "the owner detaches its mount");
+  assert!(after.is_empty(), "a detached mount is listed no more");
+}
+
+/// Creates volumes until one lands on a partition other than the control shard's (0), and returns it:
+/// a volume every attachment-routed verb reaches over the cross-shard path.
+fn remote_volume(client: &mut Client) -> VolumeId {
+  for attempt in 0..32 {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("vol-{attempt}"))) else {
+      continue;
+    };
+    if slates_server::verbs::owner_of(id) != 0 {
+      return id;
+    }
+  }
+  panic!("no volume landed on the non-control shard in 32 attempts");
+}
+
+/// The refusal kinds the bind test tells apart.
+#[derive(Clone, Copy)]
+enum RefusalKind {
+  Forbidden,
+  BadRequest,
+}
+
+/// Whether `reply` is a refusal of `kind`.
+fn refused_as(reply: &ReplyBody, kind: RefusalKind) -> bool {
+  use slates_ipc::protocol::Refusal;
+  match kind {
+    RefusalKind::Forbidden => matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    RefusalKind::BadRequest => matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::BadRequest { .. }
+      }
+    ),
+  }
+}
+
+/// The two binds that must be refused: `other` (not the attachment's principal) binding the owner's
+/// host-mount `attachment`, and the owner binding an SDK attachment (the record form, which establishes
+/// no host mount). Returns the two replies.
+fn bind_refusals(
+  other: &mut Client,
+  owner: &mut Client,
+  attachment: u64,
+  volume: VolumeId,
+) -> (ReplyBody, ReplyBody) {
+  let forged = other.call(&RequestBody::BindMount {
+    attachment,
+    path: "/elsewhere".to_owned(),
+  });
+  let ReplyBody::Attached {
+    attachment: sdk, ..
+  } = owner.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Read,
+    form: AttachRequest::Root,
+  })
+  else {
+    panic!("the SDK attachment was refused");
+  };
+  let unbound = owner.call(&RequestBody::BindMount {
+    attachment: sdk,
+    path: "/elsewhere".to_owned(),
+  });
+  (forged, unbound)
+}
+
+/// The bound mounts a volume's status reports, as (attachment, path) pairs.
+fn mounts_reported(client: &mut Client, volume: VolumeId) -> Vec<(u64, String)> {
+  match client.call(&RequestBody::Status { volume }) {
+    ReplyBody::Status { report } => report
+      .mounts
+      .iter()
+      .map(|mount| (mount.attachment, mount.path.clone()))
+      .collect(),
+    other => panic!("the status was refused: {other:?}"),
+  }
+}
+
+/// Takes a snapshot of `volume` through the client and returns the barrier's account: the boundary and
+/// the attachments it closed.
+fn snapshot_coverage(client: &mut Client, volume: VolumeId) -> (SnapshotBoundary, u32) {
+  match client.call(&RequestBody::Snapshot { volume }) {
+    ReplyBody::Snapshotted { coverage, .. } => (coverage.boundary, coverage.attachments_closed),
+    other => panic!("the snapshot was refused: {other:?}"),
+  }
 }
 
 /// The NFS mount path carrying an owner mount capability for the volume named `name` on `daemon`

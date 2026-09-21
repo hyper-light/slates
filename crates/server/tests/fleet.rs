@@ -3745,7 +3745,8 @@ fn place_copyset_routing_case(
   let (id, name, candidates, successor, unrelated) =
     choose_copyset_routing_case(&mut local, owner, neighborhood, survivors);
   write_hello_over_nfs(&daemons[owner_index], &name);
-  let ReplyBody::Snapshotted { id: snapshot } = local.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    local.call(&RequestBody::Snapshot { volume: id })
   else {
     panic!("seal the selected volume")
   };
@@ -3795,10 +3796,10 @@ fn retry_snapshot_until_served(client: &mut Client, volume: VolumeId) -> ReplyBo
 }
 
 fn assert_same_snapshot_reply(first: ReplyBody, retry: ReplyBody) {
-  let ReplyBody::Snapshotted { id: first } = first else {
+  let ReplyBody::Snapshotted { id: first, .. } = first else {
     panic!("write not served: {first:?}")
   };
-  let ReplyBody::Snapshotted { id: retry } = retry else {
+  let ReplyBody::Snapshotted { id: retry, .. } = retry else {
     panic!("retry not served: {retry:?}")
   };
   assert_eq!(
@@ -3964,10 +3965,10 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   }
 
   assert!(ready, "b's cross-region forward path to region 0 came up");
-  let ReplyBody::Snapshotted { id: snap1 } = first else {
+  let ReplyBody::Snapshotted { id: snap1, .. } = first else {
     panic!("the forwarded Snapshot of a cross-region volume was not served: {first:?}");
   };
-  let ReplyBody::Snapshotted { id: snap2 } = retry else {
+  let ReplyBody::Snapshotted { id: snap2, .. } = retry else {
     panic!("the retried forwarded Snapshot was not served: {retry:?}");
   };
   assert_eq!(
@@ -5171,7 +5172,8 @@ fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result
     return Err("the volume was not created".to_owned());
   };
   write_hello_over_nfs(&daemons[0], name);
-  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
   else {
     return Err("the snapshot was not taken".to_owned());
   };
@@ -5269,7 +5271,8 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
   };
   let object = ObjectId(id.bytes);
   write_hello_over_nfs(&daemon_a, "sealed");
-  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
   else {
     daemon_a.stop();
     daemon_b.stop();
@@ -5372,7 +5375,8 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   write_hello_over_nfs(&daemons[0], "hedged");
   let hold = daemons[first_index].starve_control_shard(HEDGE_STARVATION_NS);
   let started = Instant::now();
-  let ReplyBody::Snapshotted { id: second } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: second, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
   else {
     for daemon in daemons {
       daemon.stop();
@@ -5664,7 +5668,7 @@ fn reseal_places(instance: &str, daemon: &Daemon, name: &str, volume: VolumeId) 
   write(&mut stream, &file_fh, CONTENT, 3);
   drop(stream);
   let mut client = Client::connect(instance);
-  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume })
+  let ReplyBody::Snapshotted { id: snapshot, .. } = client.call(&RequestBody::Snapshot { volume })
   else {
     return false;
   };
@@ -5734,7 +5738,8 @@ fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
   let on_other_shard = slates_server::verbs::owner_of(id) == OTHER_PARTITION;
   let object = ObjectId(id.bytes);
   write_hello_over_nfs(&daemon_a, &name);
-  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
   else {
     daemon_a.stop();
     daemon_b.stop();

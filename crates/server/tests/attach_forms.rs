@@ -136,7 +136,7 @@ fn status(client: &mut Client, volume: VolumeId) -> StatusReport {
   let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume }) else {
     panic!("status");
   };
-  report
+  *report
 }
 
 /// The report's entry for one transport; every transport is reported, supported or not.
@@ -383,7 +383,8 @@ fn assert_unbound_host_paths_are_refused_typed(client: &mut Client, id: VolumeId
 
 /// The host mount presents the volume's live head, so a snapshot cannot be bound through it.
 fn assert_a_snapshot_cannot_be_bound(client: &mut Client, id: VolumeId) {
-  let ReplyBody::Snapshotted { id: snapshot } = client.call(&RequestBody::Snapshot { volume: id })
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
   else {
     panic!("snapshot");
   };

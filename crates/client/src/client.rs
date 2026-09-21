@@ -10,8 +10,9 @@ use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
   AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
   GrantScope, GrantSummary, GreenBase, Intent, LandingOutcome, LandingSummary, MergeWindow,
-  NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass, SnapshotId,
-  StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp, pack, unpack,
+  NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
+  SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
+  pack, unpack,
 };
 use slates_ipc::{ClientEnd, Connected, IpcError, connect_as};
 use slates_machine::{Derived, derived};
@@ -256,7 +257,7 @@ fn extract_created(body: ReplyBody) -> Result<VolumeId, ClientError> {
 /// Extracts a snapshot's id from its reply, or a typed mismatch.
 fn extract_snapshotted(body: ReplyBody) -> Result<SnapshotId, ClientError> {
   match body {
-    ReplyBody::Snapshotted { id } => Ok(id),
+    ReplyBody::Snapshotted { id, .. } => Ok(id),
     _ => Err(ClientError::UnexpectedReply { verb: "snapshot" }),
   }
 }
@@ -264,7 +265,7 @@ fn extract_snapshotted(body: ReplyBody) -> Result<SnapshotId, ClientError> {
 /// Extracts a status report from its reply, or a typed mismatch.
 fn extract_status(body: ReplyBody) -> Result<StatusReport, ClientError> {
   match body {
-    ReplyBody::Status { report } => Ok(report),
+    ReplyBody::Status { report } => Ok(*report),
     _ => Err(ClientError::UnexpectedReply { verb: "status" }),
   }
 }
@@ -1424,8 +1425,17 @@ impl Client {
 
   /// Takes a snapshot; its id.
   pub fn snapshot(&mut self, volume: VolumeId) -> Result<SnapshotId, ClientError> {
+    self.snapshot_with_coverage(volume).map(|(id, _)| id)
+  }
+
+  /// Takes a snapshot and returns what it covers (§4.6 "Writeback and snapshot barrier"): the boundary
+  /// the barrier could claim and the attachments whose generation it closed.
+  pub fn snapshot_with_coverage(
+    &mut self,
+    volume: VolumeId,
+  ) -> Result<(SnapshotId, SnapshotCoverage), ClientError> {
     match self.call(&RequestBody::Snapshot { volume })? {
-      ReplyBody::Snapshotted { id } => Ok(id),
+      ReplyBody::Snapshotted { id, coverage } => Ok((id, coverage)),
       _ => Err(ClientError::UnexpectedReply { verb: "snapshot" }),
     }
   }
@@ -1723,6 +1733,19 @@ impl Client {
     }
   }
 
+  /// Binds a host mount's attachment to the path the mount was established at (§4.4 `Binding →
+  /// Bound`; GAP-A9-4): the record's form becomes the chosen path, which `status` then reports.
+  /// Refused for an attachment that is not a host mount's, or another principal's.
+  pub fn bind_mount(&mut self, attachment: u64, path: &str) -> Result<(), ClientError> {
+    match self.call(&RequestBody::BindMount {
+      attachment,
+      path: path.to_owned(),
+    })? {
+      ReplyBody::MountBound => Ok(()),
+      _ => Err(ClientError::UnexpectedReply { verb: "bind_mount" }),
+    }
+  }
+
   /// Resizes.
   pub fn resize(&mut self, volume: VolumeId, size: SizeClass) -> Result<(), ClientError> {
     match self.call(&RequestBody::Resize { volume, size })? {
@@ -1742,7 +1765,7 @@ impl Client {
   /// The status report.
   pub fn status(&mut self, volume: VolumeId) -> Result<StatusReport, ClientError> {
     match self.call(&RequestBody::Status { volume })? {
-      ReplyBody::Status { report } => Ok(report),
+      ReplyBody::Status { report } => Ok(*report),
       _ => Err(ClientError::UnexpectedReply { verb: "status" }),
     }
   }

@@ -260,7 +260,17 @@ fn with_export<R>(
 ) -> Option<R> {
   let handle = *s.by_id.get(&volume)?;
   let write_verifier = s.write_verifier;
-  let ShardState { store, volumes, .. } = s;
+  // The request is admitted under the registry attachment its mount capability rides on (§4.4; GAP-A9-4):
+  // admitted on the capability's first request, so a barrier the owner runs over the volume sees this
+  // request in flight and closes the mount's generation with the others. The subject is the attachment
+  // record's principal, never the request's uid.
+  let admitted = admit_mount(s, volume, capability, &subject, rights)?;
+  let ShardState {
+    store,
+    volumes,
+    attachments,
+    ..
+  } = s;
   let slot = volumes.get_mut(handle).ok()?;
   let mut handles = new_handle_store();
   let mut bridge = VolumeBridge::attached(
@@ -270,13 +280,50 @@ fn with_export<R>(
     &mut handles,
     slot.host.as_mut().map(|host| host as &mut dyn HostFs),
   );
-  let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
+  attachments.begin(admitted).ok()?;
+  let mut export = Export::over(&mut bridge, volume, subject, attachments, admitted);
   export.set_groups(groups);
   // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
   // learn its unstable writes were lost and re-send them.
   export.set_write_verifier(write_verifier);
   export.set_capability(capability);
-  Some(f(&mut export))
+  let served = f(&mut export);
+  drop(export);
+  attachments.end(admitted);
+  Some(served)
+}
+
+/// The registry attachment a mount capability's requests are admitted under: the one recorded for the
+/// capability's catalog attachment, or a fresh one admitted now with the record's principal and its
+/// granted rights (`NFS` mounts claim the server-visible boundary, §4.6: the kernel client buffers
+/// acknowledged writes until its `COMMIT`). `None` when the registry refuses (its bound).
+fn admit_mount(
+  s: &mut ShardState,
+  volume: VolumeId,
+  capability: MountCapability,
+  subject: &Principal,
+  rights: Rights,
+) -> Option<slates_bridge_core::AttachmentId> {
+  if let Some(mount) = s.mount_attachments.get(&capability.0) {
+    return Some(mount.registry);
+  }
+  let registry = s
+    .attachments
+    .attach(
+      volume,
+      slates_bridge_core::View::Current,
+      subject.clone(),
+      rights,
+    )
+    .ok()?;
+  s.mount_attachments.insert(
+    capability.0,
+    crate::state::MountAttachment {
+      registry,
+      boundary: slates_ipc::protocol::SnapshotBoundary::ServerVisible,
+    },
+  );
+  Some(registry)
 }
 
 /// Whether a served call's effect must be in the shard's recovery image before its reply goes out

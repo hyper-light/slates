@@ -111,6 +111,14 @@ pub enum Op {
     /// The attachment.
     id: u64,
   },
+  /// A host mount's attachment was bound to the path the mount was established at (§4.4
+  /// `Binding → Bound`; GAP-A9-4): its form becomes `ChosenPath { path }`. Appended.
+  AttachmentBound {
+    /// The attachment.
+    id: u64,
+    /// The mount point, as the mounting process established it.
+    path: String,
+  },
   /// A completion was recorded.
   CompletionRecorded {
     /// The record.
@@ -245,6 +253,7 @@ impl Op {
       Op::LeaseReleased { .. } => "lease_released",
       Op::AttachmentAdded { .. } => "attachment_added",
       Op::AttachmentRemoved { .. } => "attachment_removed",
+      Op::AttachmentBound { .. } => "attachment_bound",
       Op::CompletionRecorded { .. } => "completion_recorded",
       Op::CompletionsAcknowledged { .. } => "completions_acknowledged",
       Op::GrantIssued { .. } => "grant_issued",

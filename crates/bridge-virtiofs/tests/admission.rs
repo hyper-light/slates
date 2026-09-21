@@ -12,7 +12,7 @@
 mod common;
 
 use common::{SeamCall, SimVmm, message, reply_error, store, vid, volume};
-use slates_bridge_core::{Bridge, ObjectId, VolumeBridge};
+use slates_bridge_core::{Attachments, Bridge, ObjectId, VolumeBridge};
 use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
 use slates_bridge_virtiofs::admission::{
   AdmissionError, AdmittedDevice, GuestAttachRequest, GuestTransport, SeamError, ServeError,
@@ -85,6 +85,7 @@ fn config() -> DeviceConfig {
 /// mapping, no tag; the seam is released.
 #[test]
 fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
+  let mut registry = Attachments::new();
   let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
   let admitted = admit(
     request(GuestTransport::InProcess),
@@ -92,6 +93,7 @@ fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
     config(),
     roomy(),
     rw,
+    &mut registry,
   )
   .unwrap();
   assert_eq!(
@@ -106,7 +108,7 @@ fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
   );
   assert_eq!(admitted.seam().published().unwrap().tag.as_str(), "slates");
   assert_eq!(
-    admitted.context().unwrap().subject,
+    admitted.context(&registry).unwrap().subject,
     Principal::Uid { uid: 501 }
   );
 
@@ -117,6 +119,7 @@ fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
     config(),
     roomy(),
     rw,
+    &mut registry,
   )
   .unwrap_err();
   assert_eq!(
@@ -141,6 +144,7 @@ fn admission_authenticates_the_consumer_before_any_queue_memory_or_tag() {
 /// before the seam is touched at all.
 #[test]
 fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
+  let mut registry = Attachments::new();
   let dax = GuestAttachRequest {
     dax: true,
     ..request(GuestTransport::InProcess)
@@ -151,6 +155,7 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
     config(),
     roomy(),
     rw,
+    &mut registry,
   )
   .unwrap_err();
   assert_eq!(
@@ -172,7 +177,8 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
       SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
       config(),
       roomy(),
-      rw
+      rw,
+      &mut registry
     )
     .unwrap_err()
     .error,
@@ -189,6 +195,7 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
     config(),
     roomy(),
     rw,
+    &mut registry,
   )
   .unwrap_err();
   assert_eq!(
@@ -206,6 +213,7 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
 /// per pass, the ledger is balanced after each pass, and the guest is notified once per pass.
 #[test]
 fn requests_are_charged_against_the_credits_and_released_on_completion() {
+  let mut registry = Attachments::new();
   let seam = seam_with_requests(5);
   let mut admitted = admit(
     request(GuestTransport::InProcess),
@@ -213,13 +221,14 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
     config(),
     credits(2, 1 << 20),
     rw,
+    &mut registry,
   )
   .unwrap();
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
 
-  let first = admitted.service(&mut bridge).unwrap();
+  let first = admitted.service(&mut bridge, &registry).unwrap();
   assert_eq!((first.served, first.more_pending), (2, true));
   let ledger = admitted.ledger();
   assert_eq!(ledger.in_flight(), (0, 0), "released on completion");
@@ -227,9 +236,9 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
   assert_eq!(ledger.counters().released, 2);
   assert_eq!(admitted.seam().notified(), vec![FIRST_REQUEST_QUEUE]);
 
-  let second = admitted.service(&mut bridge).unwrap();
+  let second = admitted.service(&mut bridge, &registry).unwrap();
   assert_eq!((second.served, second.more_pending), (2, true));
-  let third = admitted.service(&mut bridge).unwrap();
+  let third = admitted.service(&mut bridge, &registry).unwrap();
   assert_eq!((third.served, third.more_pending), (1, false));
   assert_eq!(admitted.ledger().counters().charged, 5);
   assert_all_answered(&mut admitted, 5);
@@ -254,6 +263,7 @@ fn assert_all_answered(admitted: &mut AdmittedDevice<SimVmm>, count: usize) {
 /// buffer is accessed, and the refusal faults the device (the VMM resets it).
 #[test]
 fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device() {
+  let mut registry = Attachments::new();
   let mut seam = seam_with_requests(1);
   seam.guest_mut().memory.record_accesses(true);
   let mut admitted = admit(
@@ -262,13 +272,14 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
     config(),
     credits(4, 100),
     rw,
+    &mut registry,
   )
   .unwrap();
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
   let wanted = 40 + 16 + u64::from(REPLY_CAP);
-  let refused = admitted.service(&mut bridge).unwrap_err();
+  let refused = admitted.service(&mut bridge, &registry).unwrap_err();
   assert_eq!(
     refused,
     ServeError::Device(DeviceError::CreditRefused(CreditError::Exhausted {
@@ -289,7 +300,7 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
     "the refused chain's reply buffer was never touched"
   );
   assert_eq!(
-    admitted.service(&mut bridge).unwrap_err(),
+    admitted.service(&mut bridge, &registry).unwrap_err(),
     refused,
     "the fault persists until the driver reconfigures"
   );
@@ -302,6 +313,7 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
 /// further context, and the seam is released.
 #[test]
 fn revocation_refuses_before_access_and_the_terminal_step_reclaims() {
+  let mut registry = Attachments::new();
   let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 }));
   let mut admitted = admit(
     request(GuestTransport::InProcess),
@@ -309,24 +321,25 @@ fn revocation_refuses_before_access_and_the_terminal_step_reclaims() {
     config(),
     credits(1, 1 << 20),
     rw,
+    &mut registry,
   )
   .unwrap();
   let mut store = store();
   let mut vol = volume(&mut store);
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
   let probe = common::context();
-  let ino = create_and_unlink_orphan(&mut admitted, &mut bridge);
+  let ino = create_and_unlink_orphan(&mut admitted, &mut bridge, &registry);
   assert!(
     bridge.getattr(ObjectId::new(ino, 0), &probe).is_ok(),
     "alive: the guest still references it"
   );
   let pending = publish_pending_getattrs(&mut admitted, 2);
   admitted.revoke();
-  assert_revoked_touches_nothing(&mut admitted, &mut bridge, &pending);
-  let reclaimed = admitted.reclaim(&mut bridge).unwrap();
+  assert_revoked_touches_nothing(&mut admitted, &mut bridge, &registry, &pending);
+  let reclaimed = admitted.reclaim(&mut bridge, &mut registry).unwrap();
   assert!(reclaimed.references_swept);
   assert_eq!(reclaimed.credits_restored, (1, 1 << 20));
-  assert_reclaimed(&mut admitted, &mut bridge, ino, &probe);
+  assert_reclaimed(&mut admitted, &mut bridge, &registry, ino, &probe);
 }
 
 /// The guest creates a file and unlinks it without releasing or forgetting it, so only the
@@ -334,6 +347,7 @@ fn revocation_refuses_before_access_and_the_terminal_step_reclaims() {
 fn create_and_unlink_orphan(
   admitted: &mut AdmittedDevice<SimVmm>,
   bridge: &mut VolumeBridge<'_>,
+  registry: &Attachments,
 ) -> u64 {
   let rq = usize::from(FIRST_REQUEST_QUEUE);
   // fuse_create_in: flags, mode, umask, open_flags, then the name.
@@ -348,7 +362,7 @@ fn create_and_unlink_orphan(
     REPLY_CAP,
     1,
   );
-  assert_eq!(admitted.service(bridge).unwrap().served, 1);
+  assert_eq!(admitted.service(bridge, registry).unwrap().served, 1);
   let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
   assert_eq!(id, head);
   let created = admitted.seam().guest().reply_of(rq, head, len);
@@ -364,7 +378,7 @@ fn create_and_unlink_orphan(
     REPLY_CAP,
     1,
   );
-  assert_eq!(admitted.service(bridge).unwrap().served, 1);
+  assert_eq!(admitted.service(bridge, registry).unwrap().served, 1);
   let _ = admitted.seam_mut().guest_mut().reap(rq);
   ino
 }
@@ -394,10 +408,14 @@ fn publish_pending_getattrs(admitted: &mut AdmittedDevice<SimVmm>, count: u64) -
 fn assert_revoked_touches_nothing(
   admitted: &mut AdmittedDevice<SimVmm>,
   bridge: &mut VolumeBridge<'_>,
+  registry: &Attachments,
   pending: &[GuestRange],
 ) {
   admitted.seam_mut().guest_mut().memory.record_accesses(true);
-  assert_eq!(admitted.service(bridge).unwrap_err(), ServeError::Revoked);
+  assert_eq!(
+    admitted.service(bridge, registry).unwrap_err(),
+    ServeError::Revoked
+  );
   assert!(
     admitted.seam().guest().memory.accesses().is_empty(),
     "a revoked device touches nothing, not even the ring"
@@ -422,12 +440,13 @@ fn assert_revoked_touches_nothing(
 fn assert_reclaimed(
   admitted: &mut AdmittedDevice<SimVmm>,
   bridge: &mut VolumeBridge<'_>,
+  registry: &Attachments,
   ino: u64,
   probe: &slates_bridge_core::OpContext,
 ) {
   assert_eq!(admitted.ledger().in_flight(), (0, 0));
   assert_eq!(
-    admitted.context().unwrap_err(),
+    admitted.context(registry).unwrap_err(),
     VfsError::NotPermitted,
     "the attachment mints no further context"
   );
@@ -437,7 +456,10 @@ fn assert_reclaimed(
     VfsError::NotFound,
     "the sweep reclaimed the orphan the guest never forgot"
   );
-  assert_eq!(admitted.service(bridge).unwrap_err(), ServeError::Revoked);
+  assert_eq!(
+    admitted.service(bridge, registry).unwrap_err(),
+    ServeError::Revoked
+  );
 }
 
 /// The capability report says what is true (§4.6: "supported transport, target-path constraints,
@@ -447,6 +469,7 @@ fn assert_reclaimed(
 /// driver — never a claim of a live guest.
 #[test]
 fn the_capability_report_is_truthful() {
+  let mut registry = Attachments::new();
   let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }));
   let admitted = admit(
     request(GuestTransport::InProcess),
@@ -454,6 +477,7 @@ fn the_capability_report_is_truthful() {
     config(),
     roomy(),
     rw,
+    &mut registry,
   )
   .unwrap();
   let report = admitted.capability();

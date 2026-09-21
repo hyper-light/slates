@@ -488,6 +488,16 @@ pub enum RequestBody {
     /// The first byte still needed.
     offset: u64,
   },
+  /// Binds a host mount's attachment to the path the mount was established at (§4.4 `Binding →
+  /// Bound`; GAP-A9-4): the requesting process mounted under the capability `attach` returned and
+  /// reports where, so the record's form becomes the chosen path and `status` reports it. Refused for
+  /// an attachment that is not a host mount's, or another principal's. Appended.
+  BindMount {
+    /// The attachment (a host mount's).
+    attachment: u64,
+    /// The mount point, as established.
+    path: String,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -1110,6 +1120,20 @@ pub struct StatusReport {
   /// the caller's rights allow. Boxed: a cold report that would otherwise make every reply's move
   /// larger (the provisioning reply stays small, R9); the wire bytes are the report's own.
   pub transports: Box<TransportReport>,
+  /// The host mounts bound to a path (§4.4 `Bound`; GAP-A9-4), as many as the report's mount budget
+  /// carries; `mounts_elided` counts the rest. Appended.
+  pub mounts: Vec<MountReport>,
+  /// Bound mounts the budget did not carry. Appended.
+  pub mounts_elided: u32,
+}
+
+/// One host mount of a volume, bound to its mount point (§4.4 `Bound`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct MountReport {
+  /// The attachment.
+  pub attachment: u64,
+  /// The mount point the mounting process established and reported (`BindMount`).
+  pub path: String,
 }
 
 /// The transports an attachment can take (§4.6 A-9 "supported transport"; RQ-20: host processes, OCI
@@ -1732,6 +1756,43 @@ pub enum Refusal {
     /// The configuration version the refusing node has installed.
     version: u64,
   },
+  /// The snapshot's barrier could not close: an attachment of the volume still had a request in
+  /// flight — a consumer lost mid-request (§4.4 A-9, §4.6 "A failed participant gives a typed
+  /// incomplete barrier, not a clean snapshot"). Retry once the owner's failed-consumer cleanup has
+  /// drained it. Appended for append-only evolution.
+  BarrierIncomplete {
+    /// The attachment that could not close (the catalog id of a mount; a device's registry key).
+    attachment: u64,
+    /// The generation that could not close.
+    generation: u64,
+  },
+}
+
+/// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
+/// owner had **recorded** when the barrier closed the volume's attachments — the ring's, and a mount
+/// transport's that reached the daemon. What the reply cannot claim is said: a kernel client that
+/// buffers writes (the NFS client's unstable writes before its `COMMIT`, a guest's page cache) may hold
+/// some its process was told succeeded, so a snapshot over such a mount reports the server-visible
+/// boundary rather than a complete one. Application buffers a process never submitted are outside
+/// either.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotBoundary {
+  /// Every write any consumer was told succeeded is in the snapshot: no attachment of the volume can
+  /// hold a write the daemon has not recorded (ring clients, write-through transports).
+  Complete,
+  /// The writes the daemon had recorded: at least one attachment rides a transport whose kernel may
+  /// buffer acknowledged writes it has not sent yet.
+  ServerVisible,
+}
+
+/// The barrier's account of a snapshot (§4.6 "Writeback and snapshot barrier"; GAP-A9-4).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotCoverage {
+  /// The boundary the snapshot can claim.
+  pub boundary: SnapshotBoundary,
+  /// The live attachments of the volume whose generation the barrier closed — every request admitted
+  /// before it belongs to the snapshot's generation, every request after to the next.
+  pub attachments_closed: u32,
 }
 
 /// A reply body. (`Eq` is not derived: a [`Refusal`] may carry measured probabilities.)
@@ -1746,6 +1807,8 @@ pub enum ReplyBody {
   Snapshotted {
     /// The id.
     id: SnapshotId,
+    /// What the snapshot covers (§4.6 "Writeback and snapshot barrier"; GAP-A9-4). Appended.
+    coverage: SnapshotCoverage,
   },
   /// A snapshot was destroyed.
   SnapshotDestroyed,
@@ -1823,8 +1886,8 @@ pub enum ReplyBody {
   Destroyed,
   /// The status.
   Status {
-    /// The report.
-    report: StatusReport,
+    /// The report. Boxed: a cold, wide report that would otherwise size every reply's move.
+    report: Box<StatusReport>,
   },
   /// The listing.
   Listed {
@@ -1960,6 +2023,8 @@ pub enum ReplyBody {
     /// Schema-checked report bytes, never more than one reply slot holds.
     bytes: Vec<u8>,
   },
+  /// A host mount's attachment was bound to its mount point (`BindMount`). Appended.
+  MountBound,
 }
 
 /// A message body on the ring: the schema hash then the canonical encoding.

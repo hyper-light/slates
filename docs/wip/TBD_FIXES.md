@@ -369,8 +369,16 @@ can lag subsequent implementations; use their acceptance criteria and current so
 - [ ] **Root availability and rolling changes:** establish the intended root-voter redundancy
   and committed-admission readiness barrier. A region's f does not establish root-quorum
   survival. Demonstrate safe rolling replacement without automatic rebootstrap.
-- [ ] **Mounted snapshot barriers (GAP-A9-4):** one daemon-owned per-volume attachment registry,
-  ready-device binding, writeback retrieval/flush and complete coverage before snapshot success.
+- [x] **Mounted snapshot barriers (GAP-A9-4)** — **DONE 2026-09-21.** One shard-owned attachment
+  registry every transport rides (NFS mounts through `Export::over`, guest devices through `admit`
+  over the owner's registry); `snapshot` runs the barrier over it before freezing the root and reports
+  its coverage on the wire (`Snapshotted.coverage`: `Complete` / `ServerVisible`, attachments closed;
+  `BarrierIncomplete` typed); the FUSE writeback flush has no work left with writeback cache refused;
+  a host mount binds its mount point (`BindMount`, `status` lists bound mounts). Evidence:
+  `crates/server/tests/nfs_mount.rs` (coverage complete/0 → server-visible/1 → complete/0 across the
+  mount's life; the bound mount listed, another principal and an SDK attachment refused, the detach
+  unlisting it), `crates/bridge-virtiofs/tests` over the shared registry, the live CLI mount flow.
+  Design status under §4.6 "Writeback and snapshot barrier"; GAPS GAP-A9-4.
 - [ ] **Mounted Work/Green (GAP-A9-14):** VFS-backed work journals and green volumes, read-only
   enforcement, version-pinned attachments and the extent-backed retained chain; prove the mounted
   merge workflow, not just the service-level protocol.

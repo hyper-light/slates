@@ -196,6 +196,23 @@ struct ReaddirEntry {
   handle: Option<Nfsfh3>,
 }
 
+/// Where an export's attachment lives: its own registry (the standalone server, the examples and
+/// tests — one attachment per export) or the owner's shared one (the daemon's per-shard registry, so
+/// the owner's barriers see the export's requests; GAP-A9-4).
+enum Registry<'b> {
+  Owned(Attachments),
+  Shared(&'b mut Attachments),
+}
+
+impl Registry<'_> {
+  fn get(&self) -> &Attachments {
+    match self {
+      Registry::Owned(registry) => registry,
+      Registry::Shared(registry) => registry,
+    }
+  }
+}
+
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale. The export edge admits one
 /// attachment at mount time for the enrolled subject (§4.13), and every procedure rides the
@@ -205,7 +222,7 @@ pub struct Export<'b> {
   volume: VolumeId,
   /// The owner-side attachment registry for this export. A real daemon shares one registry across
   /// its exports; a single export holds its own, admitted at construction.
-  attachments: Attachments,
+  attachments: Registry<'b>,
   /// The attachment this export admitted for its mount. Every procedure builds its context from it.
   attachment: AttachmentId,
   /// The caller every request runs as, for the POSIX permission rules ([`crate::access`]): the uid of
@@ -248,8 +265,9 @@ impl<'b> Export<'b> {
       Principal::Uid { uid } => *uid,
       _ => access::INVALID_UID,
     };
-    let mut attachments = Attachments::new();
-    let attachment = attachments.attach(volume, View::Current, subject, rights)?;
+    let mut owned = Attachments::new();
+    let attachment = owned.attach(volume, View::Current, subject, rights)?;
+    let attachments = Registry::Owned(owned);
     let mut fsid = [0u8; size_of::<u64>()];
     fsid.copy_from_slice(&volume.bytes[..size_of::<u64>()]);
     Ok(Export {
@@ -264,6 +282,38 @@ impl<'b> Export<'b> {
       write_verifier: fsid,
       capability: (0, [0u8; 16]),
     })
+  }
+
+  /// An export over an attachment the caller already admitted into a **shared** registry — the
+  /// daemon's per-shard registry every transport rides (§4.4, §4.6 "Writeback and snapshot barrier";
+  /// GAP-A9-4), so a barrier the owner runs over the volume sees this export's requests and closes
+  /// their generation. The caller brackets each request with the registry's `begin`/`end`; the export
+  /// reads its context from the registry per operation, as the owned form does.
+  pub fn over(
+    bridge: &'b mut dyn Bridge,
+    volume: VolumeId,
+    subject: Principal,
+    attachments: &'b mut Attachments,
+    attachment: AttachmentId,
+  ) -> Export<'b> {
+    let caller_uid = match &subject {
+      Principal::Uid { uid } => *uid,
+      _ => access::INVALID_UID,
+    };
+    let mut fsid = [0u8; size_of::<u64>()];
+    fsid.copy_from_slice(&volume.bytes[..size_of::<u64>()]);
+    Export {
+      bridge,
+      volume,
+      attachments: Registry::Shared(attachments),
+      attachment,
+      caller: Caller {
+        uid: caller_uid,
+        groups: None,
+      },
+      write_verifier: fsid,
+      capability: (0, [0u8; 16]),
+    }
   }
 
   /// Sets the mount capability every handle this export mints carries (§4.13; AUD-01): the daemon
@@ -293,7 +343,7 @@ impl<'b> Export<'b> {
   /// attachment is revoked or fenced (a superseded owner epoch) — the export edge's "authority can
   /// no longer be established" case, which the caller maps to a `STALE`/`ACCES` NFS status.
   fn op_context(&self) -> Result<OpContext, VfsError> {
-    let mut context = self.attachments.context(self.attachment)?;
+    let mut context = self.attachments.get().context(self.attachment)?;
     // Overlay the caller's primary group onto the authenticated context: the attachment registry
     // carries only the authenticated identity (uid-only), and the group is file ownership the export
     // edge supplies.

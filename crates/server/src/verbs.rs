@@ -324,6 +324,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     RequestBody::Create { .. }
     | RequestBody::Advance { .. }
     | RequestBody::Detach { .. }
+    | RequestBody::BindMount { .. }
     | RequestBody::List
     | RequestBody::DaemonStatus
     | RequestBody::DaemonStatusNext { .. }
@@ -1129,9 +1130,9 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   }
   let owner = match &body {
     RequestBody::Create { name, .. } => Some(owner_of_name(name, state.shards.len())),
-    RequestBody::Detach { attachment } | RequestBody::Advance { attachment, .. } => {
-      Some(owner_of_attachment(*attachment))
-    }
+    RequestBody::Detach { attachment }
+    | RequestBody::Advance { attachment, .. }
+    | RequestBody::BindMount { attachment, .. } => Some(owner_of_attachment(*attachment)),
     // A grant is served where its landing was presented: the volume's owner shard, which the landing id
     // names — not the client's shard, where nothing is awaiting.
     RequestBody::Grant { landing, .. } => Some(owner_of_landing(*landing)),
@@ -1960,6 +1961,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::PolicyMismatch => "policy_mismatch",
     Refusal::BaseUnavailable { .. } => "base_unavailable",
     Refusal::DuplicateRequest => "duplicate_request",
+    Refusal::BarrierIncomplete { .. } => "barrier_incomplete",
     Refusal::Unsupported { .. } => "unsupported",
     Refusal::TooManyClients => "too_many_clients",
     Refusal::Overloaded { .. } => "overloaded",
@@ -2164,6 +2166,7 @@ fn dispatch_inner(
       form,
     } => attach(state, client_id, principal, volume, snapshot, intent, form),
     RequestBody::Detach { attachment } => detach(state, principal, attachment),
+    RequestBody::BindMount { attachment, path } => bind_mount(state, principal, attachment, &path),
     RequestBody::Resize { volume, size } => resize(state, principal, volume, size),
     RequestBody::Destroy { volume } => destroy(state, principal, volume),
     RequestBody::Status { volume } => status(state, principal, volume),
@@ -3027,6 +3030,24 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   if !rights_of(&record, principal).write {
     return forbidden("snapshot");
   }
+  // The barrier (§4.6 "Writeback and snapshot barrier"; GAP-A9-4): every live attachment of the
+  // volume in the shard's registry has its generation closed before the root is frozen, so every
+  // request admitted before belongs to this snapshot and every request after to the next; a request
+  // still in flight — a consumer lost mid-request — is the typed incomplete barrier, never a clean
+  // snapshot over it.
+  let coverage = match state.attachments.barrier(record.id) {
+    Ok(barrier) => snapshot_coverage(state, &barrier),
+    Err(slates_vfs::VfsError::BarrierIncomplete {
+      attachment,
+      generation,
+    }) => {
+      return refused(Refusal::BarrierIncomplete {
+        attachment: catalog_attachment_of(state, attachment),
+        generation,
+      });
+    }
+    Err(e) => return refused(refusal_of_vfs(&e)),
+  };
   let taken = match state.volumes.get_mut(handle) {
     Ok(slot) => slot.volume.snapshot(&mut state.store),
     Err(_) => return refused(Refusal::NotFound),
@@ -3058,7 +3079,42 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
       return refused(refusal_of_db(&e));
     }
   }
-  ReplyBody::Snapshotted { id }
+  ReplyBody::Snapshotted { id, coverage }
+}
+
+/// What a closed barrier lets the snapshot claim (§4.6): the attachments closed, and the narrowest
+/// boundary among them — a mount whose kernel client may still hold acknowledged writes (an NFS
+/// client before its `COMMIT`) makes the snapshot server-visible; ring clients and a barrier over
+/// no mount leave it complete.
+fn snapshot_coverage(
+  state: &ShardState,
+  barrier: &slates_bridge_core::Barrier,
+) -> slates_ipc::protocol::SnapshotCoverage {
+  use slates_ipc::protocol::SnapshotBoundary;
+  let server_visible = barrier.closed.iter().any(|(closed, _)| {
+    state
+      .mount_attachments
+      .values()
+      .any(|mount| mount.registry == *closed && mount.boundary == SnapshotBoundary::ServerVisible)
+  });
+  slates_ipc::protocol::SnapshotCoverage {
+    boundary: if server_visible {
+      SnapshotBoundary::ServerVisible
+    } else {
+      SnapshotBoundary::Complete
+    },
+    attachments_closed: u32::try_from(barrier.closed.len()).unwrap_or(u32::MAX),
+  }
+}
+
+/// The catalog attachment id a registry attachment (by its key) rides for (a mount's), or the registry
+/// key itself for one no catalog record maps (a guest device's).
+fn catalog_attachment_of(state: &ShardState, registry_key: u64) -> u64 {
+  state
+    .mount_attachments
+    .iter()
+    .find(|(_, mount)| mount.registry.key() == registry_key)
+    .map_or(registry_key, |(catalog, _)| *catalog)
 }
 
 fn destroy_snapshot_verb(
@@ -4272,6 +4328,86 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   }
 }
 
+/// Format: the longest mount point a bind may name (the OS path limit, Linux `PATH_MAX`; a longer one
+/// cannot be a mount point).
+const MOUNT_PATH_MAX: usize = 4096;
+
+/// Binds a host mount's attachment to the path the mounting process established it at (§4.4
+/// `Binding → Bound`; GAP-A9-4): the record's form becomes `ChosenPath { path }`, which `status` then
+/// reports. Only the attachment's principal may bind it, and only a host mount's attachment
+/// (`Consumer::Bridge`) has a mount point; a path that is empty, holds a NUL, or exceeds the OS limit
+/// is a bad request.
+fn bind_mount(
+  state: &mut ShardState,
+  principal: &Principal,
+  attachment: u64,
+  path: &str,
+) -> ReplyBody {
+  let Some(record) = state.db.partition().attachment(attachment).cloned() else {
+    return refused(Refusal::NotFound);
+  };
+  if &record.principal != principal {
+    return forbidden("bind_mount");
+  }
+  if !matches!(record.consumer, Consumer::Bridge) {
+    return refused(Refusal::BadRequest {
+      reason: "only a host mount's attachment binds a mount point".to_owned(),
+    });
+  }
+  if path.is_empty() || path.contains('\0') || path.len() > MOUNT_PATH_MAX {
+    return refused(Refusal::BadRequest {
+      reason: "a mount point is a non-empty path within the OS limit".to_owned(),
+    });
+  }
+  let now = state.clock.monotonic_ns();
+  match state.db.mutate(
+    &mut state.segment,
+    &Op::AttachmentBound {
+      id: attachment,
+      path: path.to_owned(),
+    },
+    now,
+  ) {
+    Ok(_) => ReplyBody::MountBound,
+    Err(e) => refused(refusal_of_db(&e)),
+  }
+}
+
+/// Derived: the bytes of mount points one status report carries — a quarter of the reply's bulk chunk
+/// (`BULK_CHUNK_BYTES` / 4), so the mounts never crowd the report's other fields out of the slot; the
+/// rest are counted (`mounts_elided`).
+const MOUNTS_REPORT_BYTES: usize = 1024;
+
+/// The volume's bound host mounts for its status (§4.4 `Bound`; GAP-A9-4): each `Consumer::Bridge`
+/// attachment whose form is a chosen path, as many as the mount budget carries (in id order), and the
+/// count of those it did not.
+fn mounts_of(
+  state: &ShardState,
+  volume: DbVolumeId,
+) -> (Vec<slates_ipc::protocol::MountReport>, u32) {
+  let mut mounts = Vec::new();
+  let mut elided = 0u32;
+  let mut carried = 0usize;
+  for record in state.db.partition().attachments_of(volume) {
+    let AttachForm::ChosenPath { path } = &record.form else {
+      continue;
+    };
+    if !matches!(record.consumer, Consumer::Bridge) {
+      continue;
+    }
+    if carried.saturating_add(path.len()) > MOUNTS_REPORT_BYTES {
+      elided = elided.saturating_add(1);
+      continue;
+    }
+    carried = carried.saturating_add(path.len());
+    mounts.push(slates_ipc::protocol::MountReport {
+      attachment: record.id,
+      path: path.clone(),
+    });
+  }
+  (mounts, elided)
+}
+
 /// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
 /// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
 /// when it was the holder's last attachment of the volume and the holder holds the write lease, the
@@ -4288,6 +4424,12 @@ pub(crate) fn end_attachment(
     now,
   )?;
   crate::merge_service::forget_attachment(state, record.id);
+  // The registry attachment a mount's requests rode ends with the record: revoked so no later request
+  // is admitted under it, drained so its slot is reused (GAP-A9-4).
+  if let Some(mount) = state.mount_attachments.remove(&record.id) {
+    state.attachments.revoke(mount.registry);
+    state.attachments.drain(mount.registry);
+  }
   // The last write attachment of the holder releases the lease.
   let holds_another = state
     .db
@@ -4623,6 +4765,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
     return forbidden("status");
   }
   let transports = crate::transports::report(&crate::transports::situation(state, &rights));
+  let (mounts, mounts_elided) = mounts_of(state, record.id);
   let Ok(slot) = state.volumes.get_mut(handle) else {
     return refused(Refusal::NotFound);
   };
@@ -4645,7 +4788,7 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
   };
   let attachments = state.db.partition().attachments_of(record.id).len();
   ReplyBody::Status {
-    report: StatusReport {
+    report: Box::new(StatusReport {
       id: volume,
       name: record.name.clone(),
       referenced_bytes: accounting.referenced_bytes,
@@ -4664,7 +4807,9 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
         .ok()
         .filter(|port| *port != 0),
       transports: Box::new(transports),
-    },
+      mounts,
+      mounts_elided,
+    }),
   }
 }
 

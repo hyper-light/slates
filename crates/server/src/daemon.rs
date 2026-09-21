@@ -1946,6 +1946,8 @@ fn init_shard(
       .saturating_mul(u16::try_from(config.caps.segment_slots).unwrap_or(u16::MAX))
       .max(1),
     next_attachment,
+    attachments: slates_bridge_core::Attachments::new(),
+    mount_attachments: std::collections::BTreeMap::new(),
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),
