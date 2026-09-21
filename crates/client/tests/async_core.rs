@@ -96,7 +96,7 @@ fn wait_readable(fd: RawFd, timeout_ns: u64) -> bool {
 fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
   let profile = profile();
   let instance = format!("cl-async-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let _daemon = Daemon::start(
     &profile,
     config,

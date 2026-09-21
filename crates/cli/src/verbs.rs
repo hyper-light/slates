@@ -1623,7 +1623,7 @@ mod harness_tests {
   fn run_spawns_the_workload_as_an_ephemeral_consumer_and_revokes_it_after() {
     let profile = crate::daemon::measure(true);
     let instance = format!("cli-run-{}", std::process::id());
-    let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+    let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
     let daemon = Daemon::start(
       &profile,
       config,

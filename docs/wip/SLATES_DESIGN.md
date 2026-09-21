@@ -826,6 +826,14 @@ Same code, zero modes.
 
 ### 4.2 Memory: arenas, slabs, handles, pages, RAM-only guarantees (D-8, D-12, D-13)
 
+> **Correction (2026-09-20).** An explicit shard count is applied before deriving any
+> per-shard capacity or anchor geometry. The previous post-derivation override stranded
+> capacity when reducing the count and promised more than the host limit when increasing it.
+> Real-daemon regressions prove eight SDK-sized admissions with one shard and bounded
+> aggregate backing with six shards on the same four-core, 4 GiB profile. Both failed before
+> the correction and pass afterward (1.42 s on macOS); the unchanged Linux SDK rerun is
+> recorded in TBD_FIXES. Construction takes the optional count; no later override remains.
+
 > **Status (A-9, 2026-09-05).** Allocator and quota components exist. The server does not
 > establish the reservation below: `require_locked` is recorded without locking its store,
 > mapped length can exceed buddy-allocatable length, and dynamic pressure does not account
@@ -1775,9 +1783,9 @@ root-relative path as an explicit alternative; it does not report that the reque
 > earlier CLI. The real CLI binding/crash/strict-detach history passes in 7.90 s, and the portable
 > restart history additionally covers a previously admitted client that submitted no verbs.
 > Both retirement and restart histories also pass in the Linux io_uring workspace run.
-> The last-id/refused-fresh/restarted-session history passes on macOS in 0.98 s; its Linux
-> run, queued-forward/cancellation histories and publication refusal remain tracked in
-> TBD_FIXES. The current macOS real CLI suite passes all ten cases in 28.85 s.
+> The last-id/refused-fresh/restarted-session history passes on macOS in 0.98 s and in the
+> five-case Linux client suite (1.51 s). Queued-forward/cancellation histories and publication
+> refusal remain tracked in TBD_FIXES. The current macOS real CLI suite passes all ten cases in 28.85 s.
 
 > **Status (2026-09-05).** Implemented in `crates/ipc` and `crates/server` (GAPS §8d, Phase 2
 > tasks 3–6). As built, the failure matrix's client side: a client tells a dead daemon from a

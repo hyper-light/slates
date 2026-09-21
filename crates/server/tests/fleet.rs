@@ -409,9 +409,8 @@ fn start_with_policy(
 ) -> Daemon {
   let pid = std::process::id();
   let instance = format!("fleet-{}-{pid}", this.host.0);
-  let config = DaemonConfig::derive(&this.profile, &instance)
-    .with_shards(shards)
-    .with_fleet(FleetMembership {
+  let config =
+    DaemonConfig::derive(&this.profile, &instance, Some(shards)).with_fleet(FleetMembership {
       quorum: Quorum { f: 1 },
       peers: vec![peer.host],
       host: this.host,
@@ -1351,9 +1350,8 @@ fn run_burst(
   let daemons = [&fleet.daemon_a, &fleet.daemon_b];
   let live_before = fleet.daemon_a.live_tasks();
   let before = fleet.daemon_a.fleet_demux_counters();
-  let burst_config = DaemonConfig::derive(&profile("burst"), &format!("burst-{pid}"))
-    .with_shards(1)
-    .runtime;
+  let burst_config =
+    DaemonConfig::derive(&profile("burst"), &format!("burst-{pid}"), Some(1)).runtime;
   let burst = slates_rt::runtime::Runtime::start(&burst_config).expect("the burst runtime starts");
   let burst_shard = burst.shard_ids()[0];
   let (report_tx, report_rx) = std::sync::mpsc::channel();
@@ -1659,18 +1657,16 @@ fn fleet_config(
   peers: &[FleetPeer],
   domains: &std::collections::BTreeMap<HostId, DomainId>,
 ) -> DaemonConfig {
-  DaemonConfig::derive(profile, instance)
-    .with_shards(1)
-    .with_fleet(FleetMembership {
-      quorum: Quorum { f: 1 },
-      peers: peers.iter().map(|peer| peer.host).collect(),
-      host,
-      origin_anchor: anchor,
-      domains: domains.clone(),
-      regions: std::collections::BTreeMap::new(),
-      durability: None,
-      region_mirrors: std::collections::BTreeMap::new(),
-    })
+  DaemonConfig::derive(profile, instance, Some(1)).with_fleet(FleetMembership {
+    quorum: Quorum { f: 1 },
+    peers: peers.iter().map(|peer| peer.host).collect(),
+    host,
+    origin_anchor: anchor,
+    domains: domains.clone(),
+    regions: std::collections::BTreeMap::new(),
+    durability: None,
+    region_mirrors: std::collections::BTreeMap::new(),
+  })
 }
 
 /// An anchor segment with two recorded starts, exercising the handoff restart path.
@@ -2559,9 +2555,8 @@ fn start_mesh_with(
         .collect();
       let member_peers: Vec<HostId> = (0..n).filter(|&j| j != i).map(|j| hosts[j]).collect();
       let instance = format!("fleet3-{}-{pid}", host.0);
-      let config = DaemonConfig::derive(&profile, &instance)
-        .with_shards(shards)
-        .with_fleet(FleetMembership {
+      let config =
+        DaemonConfig::derive(&profile, &instance, Some(shards)).with_fleet(FleetMembership {
           quorum: Quorum { f },
           peers: member_peers,
           host,
@@ -4455,8 +4450,7 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
   let instance_a = format!("bounded-{}-{pid}", host_a.0);
   let instance_b = format!("bounded-{}-{pid}", host_b.0);
   // The budget A derives for its clients alone (no fleet joined yet): the silent peers are sized from it.
-  let client_only_budget = DaemonConfig::derive(&profile_a, &instance_a)
-    .with_shards(1)
+  let client_only_budget = DaemonConfig::derive(&profile_a, &instance_a, Some(1))
     .runtime
     .tasks_per_shard;
   let serve = mesh_serve_ports(2);
@@ -7043,18 +7037,16 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
       .enumerate()
       .map(|(domain, anchor)| (member_id(*anchor, 0), u64::try_from(domain).unwrap()))
       .collect();
-    let config = DaemonConfig::derive(&profile, &instance)
-      .with_shards(1)
-      .with_fleet(FleetMembership {
-        quorum: Quorum { f: 1 },
-        peers: peers.iter().map(|peer| peer.host).collect(),
-        host: member_id(anchors[node], 0),
-        origin_anchor: anchors[node],
-        domains,
-        regions: std::collections::BTreeMap::new(),
-        durability: None,
-        region_mirrors: std::collections::BTreeMap::new(),
-      });
+    let config = DaemonConfig::derive(&profile, &instance, Some(1)).with_fleet(FleetMembership {
+      quorum: Quorum { f: 1 },
+      peers: peers.iter().map(|peer| peer.host).collect(),
+      host: member_id(anchors[node], 0),
+      origin_anchor: anchors[node],
+      domains,
+      regions: std::collections::BTreeMap::new(),
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+    });
     let transport = FleetTransport {
       identity,
       name: NAME.to_owned(),

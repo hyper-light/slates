@@ -64,7 +64,13 @@ jobs:
       # The end-to-end CLI flow spawns a real anchor and daemon; it needs the machine to
       # itself (a busy parallel suite starves the daemon), so it is its own step.
       - name: The slates CLI flow (anchor + daemon)
-        run: SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+        env:
+          SLATES_TEST_CLI: "1"
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            export SLATES_TEST_RAM=/dev/shm
+          fi
+          cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
       # The FSKit shim's Swift wire codec must agree with the Rust codec byte for byte (it shares the
       # golden vector). Compile and run its cross-check on the macOS runner, where swiftc lives.
       # ShimWire.swift is a pure library of the codec types; ShimWireMain.swift is the @main driver,

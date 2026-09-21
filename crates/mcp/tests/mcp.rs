@@ -563,7 +563,7 @@ fn assert_malformed(server: &mut McpServer) {
 fn the_mcp_surface_serves_the_tools() {
   let profile = profile();
   let instance = format!("mcp-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
+  let config = DaemonConfig::derive(&profile, &instance, Some(2));
   let daemon = Daemon::start(
     &profile,
     config,

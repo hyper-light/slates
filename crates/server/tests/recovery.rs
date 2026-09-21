@@ -109,7 +109,7 @@ fn scratch(name: &str) -> CreateSpec {
 fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees() {
   let profile = profile();
   let instance = format!("srv-unpublished-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("unpublished", &profile, &config);
 
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
@@ -169,7 +169,7 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
 fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
   let profile = profile();
   let instance = format!("srv-unpublished-ack-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("unpublished-ack", &profile, &config);
 
   let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
@@ -361,7 +361,7 @@ fn clone_name_on_origin_partition(origin_name: &str, stem: &str) -> String {
 fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte() {
   let profile = profile();
   let instance = format!("srv-recover-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("recover", &profile, &config);
 
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
@@ -676,7 +676,7 @@ fn assert_crash_state(run: &mut Run, daemon: &Daemon, k: usize, done: bool) {
 /// Built from its own clean run, never from a crashed state.
 fn reference(profile: &MachineProfile) -> Observed {
   let instance = format!("srv-crash-ref-{}", std::process::id());
-  let config = DaemonConfig::derive(profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("crash-ref", profile, &config);
   let daemon = Daemon::start(profile, config, source_of(&segment)).unwrap();
   daemon
@@ -740,7 +740,7 @@ fn a_crash_at_every_durable_step_recovers_and_the_resume_reaches_the_reference()
 fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, crash: Crash) {
   let name = format!("crash-{k}-{crash:?}");
   let instance = format!("srv-{name}-{}", std::process::id());
-  let config = DaemonConfig::derive(profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(profile, &instance, Some(TEST_SHARDS));
   let mut segment = anchor_segment(&name, profile, &config);
   let partitions = config.geometry.partitions;
 
@@ -799,7 +799,7 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
 fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_it() {
   let profile = profile();
   let instance = format!("srv-landctr-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("landctr", &profile, &config);
   let target = common::target::target_dir();
 
@@ -868,7 +868,7 @@ fn owner_partition(volume: VolumeId) -> u16 {
 fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart() {
   let profile = profile();
   let instance = format!("srv-pins-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let mut segment = anchor_segment("pins", &profile, &config);
 
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();

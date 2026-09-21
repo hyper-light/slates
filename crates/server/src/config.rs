@@ -299,14 +299,21 @@ pub struct DaemonConfig {
 pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
 impl DaemonConfig {
-  /// The configuration from a profile, for `instance`.
-  pub fn derive(profile: &MachineProfile, instance: &str) -> DaemonConfig {
+  /// The configuration from a profile, for `instance`. An explicit shard count is selected
+  /// before dividing the host's capacity (§4.2); otherwise the profile chooses the cores.
+  /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.
+  pub fn derive(profile: &MachineProfile, instance: &str, shards: Option<u16>) -> DaemonConfig {
     let mut derivations = Vec::new();
     let d = profile.derived();
     let admission = admission_limit(ASSUMED_REQUESTS_PER_SECOND, ASSUMED_SERVICE_P99_NS);
     derivations.push(note("requests_in_flight_per_shard", &admission));
     let mut runtime =
       RuntimeConfig::from_profile(profile, admission.get(), admission.get(), LATENCY_BUDGET_NS);
+    if let Some(shards) = shards {
+      runtime.shards = shards.max(1);
+      runtime.pin = false;
+      runtime.cores.clear();
+    }
     let shards = u64::from(runtime.shards.max(1));
     // §4.2 D-12 "honest degradation": the default provisioning reserve is the shard's share of the
     // machine's total RAM, not the OS lock LIMIT. A volume's arena is locked only when a client asks
@@ -649,16 +656,6 @@ impl DaemonConfig {
     )
   }
 
-  /// The same configuration over `shards` shards, unpinned (tests and benches that share a
-  /// machine with other daemons); the segment's partitions follow.
-  pub fn with_shards(mut self, shards: u16) -> DaemonConfig {
-    self.runtime.shards = shards.max(1);
-    self.runtime.pin = false;
-    self.runtime.cores = Vec::new();
-    self.geometry.partitions = shards.max(1);
-    self
-  }
-
   /// The same configuration joined to a fleet (§4.8, boot step 6): the placement authority, configuration
   /// group and owner acceptor are built over `membership` (its quorum and peers) at boot, rather than the
   /// solo degenerate. An operator sets this to deploy a fleet node; a laptop leaves it unset.
@@ -772,7 +769,7 @@ mod tests {
       core_matrix: false,
     });
     let quorum = Quorum { f: 1 }; // candidate floor 2f + 1 = 3
-    let config = DaemonConfig::derive(&profile, "scatter-test").with_shards(1);
+    let config = DaemonConfig::derive(&profile, "scatter-test", Some(1));
 
     assert_eq!(
       config.derived_scatter(quorum),
@@ -911,7 +908,7 @@ mod tests {
       codecs: false,
       core_matrix: false,
     });
-    let config = DaemonConfig::derive(&profile, "metadata-layout").with_shards(1);
+    let config = DaemonConfig::derive(&profile, "metadata-layout", Some(1));
     let page = config.page;
     let mut arena = ChunkArena::new(page);
     arena
@@ -962,18 +959,19 @@ mod tests {
       codecs: false,
       core_matrix: false,
     });
-    let solo = DaemonConfig::derive(&profile, "fleet-share-solo");
+    let solo = DaemonConfig::derive(&profile, "fleet-share-solo", None);
     let peers: Vec<HostId> = (1..=5).map(HostId).collect();
-    let fleet = DaemonConfig::derive(&profile, "fleet-share-fleet").with_fleet(FleetMembership {
-      quorum: Quorum { f: 2 },
-      peers: peers.clone(),
-      host: HostId(0),
-      origin_anchor: HostId(0),
-      domains: BTreeMap::new(),
-      regions: BTreeMap::new(),
-      durability: None,
-      region_mirrors: BTreeMap::new(),
-    });
+    let fleet =
+      DaemonConfig::derive(&profile, "fleet-share-fleet", None).with_fleet(FleetMembership {
+        quorum: Quorum { f: 2 },
+        peers: peers.clone(),
+        host: HostId(0),
+        origin_anchor: HostId(0),
+        domains: BTreeMap::new(),
+        regions: BTreeMap::new(),
+        durability: None,
+        region_mirrors: BTreeMap::new(),
+      });
     assert_eq!(
       fleet.fleet_sessions_per_plane,
       fleet.fleet_peer_capacity * SESSION_SLOTS_PER_PEER,
@@ -1016,7 +1014,7 @@ mod tests {
     });
     let total = profile.facts.memory.total;
     profile.facts.memory.limit = None;
-    let unbounded = DaemonConfig::derive(&profile, "bound-none");
+    let unbounded = DaemonConfig::derive(&profile, "bound-none", None);
     let shards = u64::from(unbounded.runtime.shards.max(1));
     assert_eq!(
       unbounded.reserve_per_shard,
@@ -1024,7 +1022,7 @@ mod tests {
       "no bound: the reserve is the share of total"
     );
     profile.facts.memory.limit = Some(total / 4);
-    let bounded = DaemonConfig::derive(&profile, "bound-quarter");
+    let bounded = DaemonConfig::derive(&profile, "bound-quarter", None);
     assert_eq!(
       bounded.reserve_per_shard,
       total / 4 / shards / MEMORY_CLASSES,
@@ -1037,7 +1035,7 @@ mod tests {
       total / 4
     );
     profile.facts.memory.limit = Some(total.saturating_mul(2));
-    let above = DaemonConfig::derive(&profile, "bound-above");
+    let above = DaemonConfig::derive(&profile, "bound-above", None);
     assert_eq!(
       above.reserve_per_shard,
       total / shards / MEMORY_CLASSES,

@@ -149,7 +149,7 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
 fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
   let profile = profile();
   let instance = format!("cl-life-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -258,7 +258,7 @@ fn assert_retry_meets_record(
 fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record() {
   let profile = profile();
   let instance = format!("cl-resume-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   // The test plays the anchor: it holds the segment and its content object across both daemons, so
   // anchor-owned volume storage survives the restart (§4.8). The content object is two reserve-sized
   // slots per shard (the recovery image is a double buffer — the committed image and the one being
@@ -336,7 +336,7 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
 fn exhausted_client_id_space_refuses_fresh_callers_but_preserves_a_resuming_session() {
   let profile = profile();
   let instance = format!("cl-id-end-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
   // The anchor keeps both content publication slots as well as metadata across the restart.
   let content_bytes = usize::try_from(config.reserve_per_shard).unwrap() * 2;
   let mut segment = AnchorSegment::create(
@@ -438,7 +438,7 @@ fn assert_green_recovered(client: &mut Client, green: slates_client::VolumeId) {
 fn a_green_chain_survives_a_daemon_restart() {
   let profile = profile();
   let instance = format!("cl-green-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
     * 2
     * usize::from(config.geometry.partitions.max(1));
@@ -593,7 +593,7 @@ fn assert_origin_recovered(client: &mut Client, green: slates_client::VolumeId) 
 fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
   let profile = profile();
   let instance = format!("cl-origin-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
     * 2
     * usize::from(config.geometry.partitions.max(1));

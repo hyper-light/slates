@@ -124,7 +124,7 @@ impl Client {
 fn daemon(name: &str) -> (Daemon, String) {
   let profile = profile();
   let instance = format!("srv-{name}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -149,6 +149,92 @@ fn scratch(name: &str) -> RequestBody {
   }
 }
 
+/// Shape: the four-core, 4 GiB container that exposed the SDK refusal. The default runtime
+/// uses three of those cores; the operator's explicit shard count must divide the same RAM.
+const SHARD_SELECTION_MEMORY: u64 = 4 * 1024 * 1024 * 1024;
+/// Shape: eight concurrent SDK requests, each asking for an 8 MiB volume.
+const SDK_CREATE_COUNT: usize = 8;
+/// Shape: the unchanged Python and Node SDK lifecycle quota.
+const SDK_VOLUME_BYTES: u64 = 8 * 1024 * 1024;
+
+fn shard_selection_daemon(name: &str, shards: u16) -> (Daemon, String) {
+  use slates_machine::facts::{CoreClass, CoreFacts};
+  let mut profile = profile();
+  profile.facts.memory.total = SHARD_SELECTION_MEMORY;
+  profile.facts.memory.limit = Some(SHARD_SELECTION_MEMORY);
+  profile.facts.cores = (0..4)
+    .map(|id| CoreFacts {
+      id,
+      class: CoreClass::Performance,
+      level: 0,
+      numa: 0,
+      l2_bytes: 0,
+    })
+    .collect();
+  let instance = format!("srv-shards-{name}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(shards));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  daemon.bootstrap(true).unwrap();
+  (daemon, instance)
+}
+
+/// AC-2.11 / §4.2: choose one shard on a four-core bounded host, then create the eight
+/// SDK volumes. Unused automatic shards must not retain any of the host's capacity.
+#[test]
+fn choosing_fewer_shards_keeps_the_hosts_capacity_available_for_admission() {
+  let (daemon, instance) = shard_selection_daemon("fewer", 1);
+  let mut client = Client::connect(&instance);
+  for sequence in 0..SDK_CREATE_COUNT {
+    let reply = client.call(&RequestBody::Create {
+      name: format!("sdk-{sequence}"),
+      size: SizeClass::Bounded {
+        limit: SDK_VOLUME_BYTES,
+      },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    });
+    assert!(
+      matches!(reply, ReplyBody::Created { .. }),
+      "create {sequence}: {reply:?}"
+    );
+  }
+  let ReplyBody::Listed { volumes } = client.call(&RequestBody::List) else {
+    panic!("list the admitted volumes");
+  };
+  assert_eq!(volumes.len(), SDK_CREATE_COUNT);
+  daemon.stop();
+}
+
+/// AC-0.10 / §4.2: choose more shards than the automatic core choice, then observe each
+/// shard's actual backing. Even content and metadata alone must fit the whole host limit.
+#[test]
+fn choosing_more_shards_does_not_multiply_the_hosts_capacity() {
+  let (daemon, instance) = shard_selection_daemon("more", 6);
+  let mut client = Client::connect(&instance);
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    panic!("observe the running daemon's capacity");
+  };
+  assert_eq!(report.shards.len(), 6);
+  let allocated_classes: u64 = report
+    .shards
+    .iter()
+    .map(|shard| shard.mapped_bytes + shard.metadata_bytes)
+    .sum();
+  assert!(
+    allocated_classes <= SHARD_SELECTION_MEMORY,
+    "content and metadata promise {allocated_classes} bytes from {SHARD_SELECTION_MEMORY}"
+  );
+  daemon.stop();
+}
+
 /// AC-2.6, §4.14: a report spanning real ring slots remains frozen while another client
 /// mutates the daemon. Cursors are channel-scoped, cancelled by the next operation, and
 /// the typed client returns a complete report without exposing the page protocol.
@@ -156,7 +242,7 @@ fn scratch(name: &str) -> RequestBody {
 fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   let profile = profile();
   let instance = format!("srv-status-pages-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   // Shape: deliberately short reply chunks, so the two-shard report must cross pages.
   config.region.bulk_bytes = u64::from(config.region.slots) * 2 * 128;
   let daemon = Daemon::start(
@@ -366,9 +452,8 @@ fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, Str
     slates_db::HostId(host.0.wrapping_add(1)),
     slates_db::HostId(host.0.wrapping_add(2)),
   ];
-  let config = DaemonConfig::derive(&profile, &instance)
-    .with_shards(TEST_SHARDS)
-    .with_fleet(FleetMembership {
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_fleet(FleetMembership {
       quorum: slates_db::register::Quorum { f: 1 },
       peers,
       host,
@@ -1273,7 +1358,7 @@ const LEAK_PROBES: usize = 24;
 fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
   let profile = profile();
   let instance = format!("srv-{name}-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   config.store.max_inodes = max_inodes;
   let daemon = Daemon::start(
     &profile,
@@ -1473,7 +1558,7 @@ const DRAIN_SPANS_MAX: usize = ["ring.request", "shard.op", "log.append"].len();
 fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
   let profile = profile();
   let instance = format!("srv-telemetry-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   if let Some(reply_quota) = reply_quota {
     config.telemetry_spans_per_reply = reply_quota;
   }
@@ -2420,7 +2505,7 @@ const RECORD_PROBES: usize = 16;
 fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
   let profile = profile();
   let instance = format!("srv-metadata-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   // The class holds the slabs' maximum footprint plus a few volumes' records, no more.
   config.store.metadata_class_bytes = slab_footprint_of(&config) + RECORDS_ROOM;
   let daemon = Daemon::start(
@@ -3166,7 +3251,7 @@ const REFUSAL_ANSWER: Duration = Duration::from_millis(500);
 fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
   let profile = profile();
   let instance = format!("srv-bound-{}", std::process::id());
-  let mut config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   config.clients_per_shard = 1;
   let daemon = Daemon::start(
     &profile,
@@ -3214,7 +3299,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
 fn bootstrap_is_explicit_and_its_request_cannot_reset_a_replacement() {
   let profile = profile();
   let instance = format!("bootstrap-member-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let start = || {
     Daemon::start(
       &profile,

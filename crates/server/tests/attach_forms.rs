@@ -100,7 +100,7 @@ impl Client {
 fn single_shard_daemon(name: &str) -> (Daemon, String) {
   let profile = profile();
   let instance = format!("srv-{name}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let daemon = Daemon::start(
     &profile,
     config,

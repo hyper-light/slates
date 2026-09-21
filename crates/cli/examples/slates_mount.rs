@@ -66,7 +66,7 @@ fn quick_profile() -> MachineProfile {
 /// A single-shard in-process daemon (R8, the laptop-degenerate case) named for this process.
 fn start_daemon(instance: &str) -> Daemon {
   let profile = quick_profile();
-  let config = DaemonConfig::derive(&profile, instance).with_shards(1);
+  let config = DaemonConfig::derive(&profile, instance, Some(1));
   let daemon = Daemon::start(
     &profile,
     config,

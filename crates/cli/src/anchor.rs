@@ -56,10 +56,7 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   signal::install().map_err(Failure::Failed)?;
   let profile: MachineProfile = measure(options.quick);
-  let mut config = DaemonConfig::derive(&profile, &options.instance);
-  if let Some(shards) = options.shards {
-    config = config.with_shards(shards);
-  }
+  let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   // The anchor-owned content object that holds each shard's recovery image (§4.8): one shard's
   // reserve times the partitions, lazily backed so its unused tail costs no RAM. The anchor holds
   // it across daemon restarts and hands it off, so an agent's writes survive a restart (BUG-11).

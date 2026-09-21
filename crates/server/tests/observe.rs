@@ -58,7 +58,7 @@ fn laptop(name: &str) -> Daemon {
     core_matrix: false,
   });
   let instance = format!("observe-{name}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
   Daemon::start(
     &profile,
     config,

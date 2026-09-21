@@ -74,11 +74,8 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
       },
     ),
   };
-  let mut config = DaemonConfig::derive(&profile, &options.instance);
+  let mut config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   config.recovery_key = crate::recovery_key::load()?;
-  if let Some(shards) = options.shards {
-    config = config.with_shards(shards);
-  }
   // A fleet node (§2.6 boot step 6): the shared manifest gives the membership the placement authority is
   // built over and the transport the membership loop drives; a laptop passes neither and runs the same
   // placement path, degenerate (R8).

@@ -221,7 +221,7 @@ fn main() {
   let instance = format!("provision-bench-{}", std::process::id());
   // The daemon as derived for this machine (its shard count and pinning), since AC-2.1 is
   // measured against the reference machine's own daemon.
-  let config = DaemonConfig::derive(&profile, &instance);
+  let config = DaemonConfig::derive(&profile, &instance, None);
   let shards = config.runtime.shards;
   let daemon = Daemon::start(
     &profile,

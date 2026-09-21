@@ -2506,7 +2506,7 @@ mod tests {
       std::process::id(),
       NEXT_AUDIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
-    let mut config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
+    let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     configure(&mut config);
     let daemon = super::Daemon::start(
       &profile,
@@ -2590,7 +2590,7 @@ mod tests {
       core_matrix: false,
     });
     let instance = format!("warm-votes-{}", std::process::id());
-    let config = crate::DaemonConfig::derive(&profile, &instance).with_shards(1);
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     let segment =
       AnchorSegment::create(&instance, &profile.facts.identity, config.geometry).unwrap();
     let source = || {

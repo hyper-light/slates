@@ -137,7 +137,7 @@ mod tests {
       core_matrix: false,
     });
     let instance = format!("conf-mount-{}", std::process::id());
-    let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
+    let config = DaemonConfig::derive(&profile, &instance, Some(2));
     let daemon = Daemon::start(
       &profile,
       config,

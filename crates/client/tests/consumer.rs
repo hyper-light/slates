@@ -243,7 +243,7 @@ fn a_spawned_consumer_binds_through_the_inherited_capability_and_a_sibling_witho
  {
   let profile = profile();
   let instance = format!("cl-consumer-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -344,7 +344,7 @@ fn assert_sibling_is_the_account(instance: &str, consumer: u64, volume: VolumeId
 fn a_client_holding_a_consumer_identity_binds_again_by_itself_after_a_daemon_restart() {
   let profile = profile();
   let instance = format!("cl-rebind-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(TEST_SHARDS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = restart_segment("cl-rebind", &profile, &config);
   let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
   first

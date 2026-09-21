@@ -1,7 +1,7 @@
 # Remaining fixes and verification
 
-Updated: **2026-09-17**. Checkpoint after `c885d50`, including the current uncommitted
-owner-location, shared SWIM gossip and editor-workload changes. This is the remaining-work
+Updated: **2026-09-20**. Checkpoint after `46ca485`, including the in-progress explicit
+shard-count and CI coverage corrections below. This is the remaining-work
 list for the audit/CI repair session; [GAPS.md](GAPS.md) remains the authoritative contract
 ledger. Historical audit findings below need closure evidence against current source, not
 blind reimplementation of their original baseline. No new test, install or deployment is
@@ -9,6 +9,39 @@ authorized merely by appearing here.
 
 ## Current CI repair checkpoint (2026-09-20)
 
+- [x] **Explicit shard counts.** The Linux Python 3.14 SDK
+  test fails because `--shards 1` keeps capacities already divided among three shards.
+  Serial/concurrent and fresh/after-destroy probes all admit five of the unchanged eight
+  8 MiB requests; destroy returns both committed counters to zero. Select the count before
+  deriving every capacity, replacing the late override. The two real-daemon regressions
+  fail before the fix and pass in 1.42 s afterward; the second also catches overcommit when
+  increasing the count. The unchanged Linux SDK suite now passes: five installed-wheel
+  Python cases (0.384 s), five direct Node cases and three installed npm cases (0.192 s),
+  zero skips. Wheel and sdist pass strict Twine checks. The Linux sweep passes **1,557
+  workspace cases**, zero failures, 14 existing exclusions, including all **49 fleet
+  histories in 271.81 s**. Strict Clippy, xtask, both non-root FUSE regressions and the
+  real CLI step also pass (10 functions, 8.36 s; platform-specific skips remain, while
+  the portable recovery-key history now executes). Command/log:
+  `/private/tmp/slates-run-linux-shard-selection.sh`, `/private/tmp/slates-linux-shard-selection.log`.
+  macOS passes **1,548 workspace cases**, zero failures, 14 existing exclusions, including
+  **48 fleet histories in 321.69 s**; strict lint/structural checks, the real CLI binding,
+  restart and strict-detach flow (10 functions, 28.19 s), and all 13 installed SDK cases pass.
+  The portable operator-key CLI history skips on macOS without its RAM directory; its Linux
+  execution is recorded above. Commands/log: `/private/tmp/slates-run-macos-shard-selection.sh`,
+  `/private/tmp/slates-macos-shard-selection.log`.
+  No test quota, concurrency, container memory or timeout changed.
+  Commands/log: `/private/tmp/slates-run-linux-sdk.sh`, `/private/tmp/slates-linux-sdk-ci-green.log`.
+  See the dated shard-count diagnosis.
+- [x] Linux ARM64 instruction-count command completes **14/14** at `46ca485`, using the
+  approved task-container profile that allows exactly `personality(PER_LINUX |
+  ADDR_NO_RANDOMIZE)` in addition to the earlier io_uring calls. Runner **0.16.1**;
+  command `cargo bench --offline --workspace --bench callgrind`; log:
+  `/private/tmp/slates-linux-callgrind-approved.log`. This first run had no saved baseline;
+  it establishes execution, not a regression comparison or x86-64 instruction equivalence.
+- [ ] **Instruction-count harness quality.** The memory/runtime/wire benches can discard
+  operation errors, and two setup failures spin forever. Require successful work and
+  observable completion. The workflow also needs a reproducible comparison baseline and
+  enforced regression policy; printing instruction counts alone does not enforce D-20.
 - [x] Replace the IPC ring fixture's scheduler assumptions with queued-reply and armed-wait
   histories. Linux single-CPU stress: 192/192 test executions passed. Performance gates remain.
 - [x] Page the daemon report under the client's existing reply credit; retain one charged,
@@ -25,12 +58,37 @@ authorized merely by appearing here.
   Real non-root FUSE coherence/retry and local FIFO/socket isolation both passed afterward
   (0.13 s and 0.01 s). Command wrapper and log:
   `/private/tmp/slates-run-linux-lifecycle.sh`, `/private/tmp/slates-linux-lifecycle.log`.
-  The subsequently added identity-exhaustion case still needs its Linux run.
+  The subsequent Linux delta run passes all five client cases, including identity exhaustion
+  (1.51 s), and all five real landing cases (0.05 s): `/private/tmp/slates-linux-delta.log`.
 - [x] Current macOS rerun: **1,546 passed, zero failed, 14 ignored**, all **48 fleet
   tests** in 298.31 s; the five client histories include identity exhaustion. The real
   CLI suite passes **10/10 in 28.85 s**, including Docker, daemon restart and exact detach
   results. Commands: `/private/tmp/slates-run-macos-current.sh`; log:
   `/private/tmp/slates-macos-current.log`. This does not make its subsequent ratchet green.
+- [x] macOS SDK packaging at `46ca485`: wheel and sdist pass `twine check --strict`;
+  installed-wheel Python tests **5/5 (2.297 s)**, direct Node addon **5/5 (1.116 s)**,
+  installed npm packages **3/3 (0.974 s)**, zero skips. Ada requested the existing Python
+  **3.14.3** instead of CI's 3.11; Twine **7.0.0** was installed only in the task venv.
+  Node **24.14.1**, npm **11.11.0**, napi **3.7.2**, maturin **1.14.1**. Commands/log:
+  `/private/tmp/slates-macos-sdk-ci.sh`, `/private/tmp/slates-macos-sdk-ci.log`.
+  This records 3.14 validation, not a claim to have run the 3.11 interpreter.
+- [x] Linux concurrency commands pass at `46ca485`: all five loom models (6 / 26 / 157 /
+  3,865 / 27 explored interleavings) and both shuttle histories (200 schedules each; merge
+  0.26 s, clones 0.09 s). Commands: `/private/tmp/slates-run-linux-delta.sh`; log:
+  `/private/tmp/slates-linux-delta.log`. Instruction counts remain a separate job.
+- [x] Miri at `46ca485`, interpreting the Linux x86-64 target from macOS: **82 passed,
+  11 existing ignored cases**. Memory (33) and wire (30) retain leak checks; runtime units
+  (17) and differential histories (2) use CI's existing intentional-leak exclusion.
+  Commands: `cargo +nightly miri test --offline --target x86_64-unknown-linux-gnu
+  -p slates-mem -p slates-wire --lib`, then `MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly
+  miri test --offline --target x86_64-unknown-linux-gnu -p slates-rt --lib --test differential`.
+  Logs: `/private/tmp/slates-miri-linux-target.log`, `/private/tmp/slates-miri-rt-linux-target.log`.
+  Miri's printed durations are simulated time. This is not a native Linux kernel check.
+- [x] Supply the Linux CLI step's missing RAM directory so its portable recovery-key
+  history executes. The exact real-CLI history passes in 0.42 s with absent/wrong/oversized
+  key refusals and successful/idempotent approval. The earlier Linux CLI total includes
+  this skip; its passing function count was not evidence for the history. See the dated
+  CLI CI coverage report and `/private/tmp/slates-linux-cli-recovery-key.log`.
 - [ ] Finish every CI-equivalent local job, including million-operation/differential tests,
   CLI and Swift steps, performance gates, conformance, SDK packaging, concurrency and KIND.
   Reproduce Windows natively in the VM Ada authorized creating on 2026-09-20.
@@ -73,7 +131,8 @@ authorized merely by appearing here.
   history exposed fresh client 13/sequence 1 receiving an old `Created` for `Status`.
   A control-partition reservation and recovered allocation floor prevent reuse. The portable
   restart case passed on macOS and Linux. The last-id/refused-fresh/restarted-session history
-  passed on macOS in 0.98 s; its Linux run and failed-publication coverage remain owed.
+  passed on macOS in 0.98 s and in the five-case Linux client suite (1.51 s).
+  Failed-publication coverage remains owed.
 - [ ] **macOS performance ratchet (2026-09-20).** Snapshot cost grew 24 ns against a
   17 ns measured allowance in `/private/tmp/slates-macos-gates-lifecycle.log`. A controlled
   same-tree experiment found journal turnover, not tree size: the million-file tree measured
@@ -91,6 +150,14 @@ authorized merely by appearing here.
   that contribution independently of production cost before changing the benchmark. The other
   eight failures also need controlled comparisons. No ceilings were changed. Log:
   `/private/tmp/slates-macos-current.log`.
+- [ ] **Copy-up benchmark diagnosis (2026-09-20).** An isolated `9344472` build, pointed
+  at exactly the current real input, also measures 94,667 / 98,584 / 96,583 ns; current
+  medians 99,709 / 100,500 / 98,000 ns have overlapping intervals. A separate probe confirms
+  sixteen successful samples retain 32 extra inodes and 16 directories; no refusal occurred
+  in that run. Fix the input definition, sample reclamation and ignored operation errors
+  before relying on this comparison. Keep `OsHost` and the original ceiling. The controlled
+  allocator comparison reaches 31–35 ns on both old/current code, so the earlier allocator
+  red is not by itself evidence of a source regression. See the dated copy-up benchmark report.
 - [ ] **Lifecycle siblings (2026-09-20).** Plain `attach` without an OCI or host-mount
   lifetime still creates a ring-owned root record from an exiting CLI. Client-id release
   can be lost at control-channel saturation (`RELEASE_LOST`); safe cleanup must acknowledge

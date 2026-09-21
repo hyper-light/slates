@@ -49,10 +49,29 @@
 > owner shards. Fresh client identities are now reserved durably before handoff: the crash
 > probe exposed a new `Status` receiving an old `Created` completion. Linux workspace:
 > 1,554 passed, zero failed, 14 ignored; macOS: 1,546 passed, zero failed, 14 ignored.
-> The later last-id restart history passed on macOS and still needs Linux. Queued-forward
+> The later last-id restart history passes on both hosts. Queued-forward
 > and publication-refusal proofs remain owed. The corrected snapshot comparison passes;
 > nine other macOS performance ceilings remain red, and the intermittent destroy failure
 > remains open. Commands, scope and logs are recorded in TBD_FIXES.
+
+> **CI coverage correction (2026-09-20).** The Linux CLI step now supplies `/dev/shm`
+> for the portable operator-key recovery test. It previously returned without executing;
+> with RAM supplied its unchanged real CLI history passes in 0.42 s. The native macOS
+> SDK packaging commands pass with Ada's requested Python 3.14.3 (five Python, five direct
+> Node and three packaged Node tests, no skips). Linux loom and shuttle pass too. Miri's
+> Linux x86-64 interpretation passes 82 cases with 11 existing exclusions; memory and
+> wire leak checks stay enabled. These results do not close instruction-count, KIND,
+> Windows or performance obligations.
+
+> **Shard-count correction (2026-09-20).** Choose an explicit shard count before deriving
+> capacities. The old override left a one-shard SDK daemon with a three-shard memory split
+> and allowed a six-shard daemon's content/metadata backing alone to exceed its 4 GiB bound.
+> Two live-daemon regressions fail before the fix and pass after it (1.42 s, macOS).
+> The unchanged Linux SDK packaging suite now passes all 13 cases with zero skips. The
+> Linux workspace passes 1,557 cases, including all 49 fleet histories; strict Clippy,
+> xtask, non-root FUSE and the real CLI step pass too. macOS passes 1,548 workspace cases,
+> all 48 fleet histories, the real CLI lifecycle and 13 installed SDK cases; see
+> [the diagnosis](../bugs/2026-09-20-explicit-shards-keep-the-automatic-memory-split.md).
 
 
 Rubric per item: research on file? spec section exists? test matrix? acceptance criteria? laptop

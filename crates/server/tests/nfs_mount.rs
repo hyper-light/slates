@@ -112,7 +112,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
   let instance = format!("srv-{name}-{}", std::process::id());
   // One shard, so every provisioned volume lands on the shard the NFS listener is served on (R8, the
   // laptop-degenerate case the daemon-side NFS serve covers; cross-shard is owed).
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(1);
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let daemon = Daemon::start(
     &profile,
     config,
@@ -132,7 +132,7 @@ fn two_shard_daemon(name: &str) -> (Daemon, String) {
   let instance = format!("srv-{name}-{}", std::process::id());
   // Two shards, so a volume can land on a shard other than the one the NFS listener is served on,
   // exercising the cross-shard bridge queue.
-  let config = DaemonConfig::derive(&profile, &instance).with_shards(2);
+  let config = DaemonConfig::derive(&profile, &instance, Some(2));
   let daemon = Daemon::start(
     &profile,
     config,

@@ -196,9 +196,7 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
     core_matrix: false,
   });
   let instance = format!("cl-reap-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance)
-    .with_shards(2)
-    .with_failover_slo(LEASE_TERM_NS);
+  let config = DaemonConfig::derive(&profile, &instance, Some(2)).with_failover_slo(LEASE_TERM_NS);
   let daemon = Daemon::start(
     &profile,
     config,
