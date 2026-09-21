@@ -1,13 +1,13 @@
 # Remaining fixes and verification
 
-Updated: **2026-09-20**. Checkpoint after `46ca485`, including the in-progress explicit
-shard-count and CI coverage corrections below. This is the remaining-work
+Updated: **2026-09-21**. Checkpoint after `2179cc2`, including the instruction-benchmark
+repair below. This is the remaining-work
 list for the audit/CI repair session; [GAPS.md](GAPS.md) remains the authoritative contract
 ledger. Historical audit findings below need closure evidence against current source, not
 blind reimplementation of their original baseline. No new test, install or deployment is
 authorized merely by appearing here.
 
-## Current CI repair checkpoint (2026-09-20)
+## Current CI repair checkpoint (2026-09-21)
 
 - [x] **Explicit shard counts.** The Linux Python 3.14 SDK
   test fails because `--shards 1` keeps capacities already divided among three shards.
@@ -38,10 +38,20 @@ authorized merely by appearing here.
   command `cargo bench --offline --workspace --bench callgrind`; log:
   `/private/tmp/slates-linux-callgrind-approved.log`. This first run had no saved baseline;
   it establishes execution, not a regression comparison or x86-64 instruction equivalence.
-- [ ] **Instruction-count harness quality.** The memory/runtime/wire benches can discard
-  operation errors, and two setup failures spin forever. Require successful work and
-  observable completion. The workflow also needs a reproducible comparison baseline and
+- [x] **Instruction-count harness quality.** Memory/runtime/wire benchmarks now require
+  successful operations and observable completion; setup refuses instead of substituting
+  fixtures or spinning. All four negative controls fail and all 14 valid benches pass in
+  the Linux ARM64 container. Explicit, non-inlined collection requests fix two measured
+  boundary defects: teardown being counted and a small encode reporting zero instructions.
+  Eightfold CRC verification leaves both profile totals at 2,653; doubling the encode
+  increases 34 instructions to 58. Strict instrumented Clippy and xtask checks pass on
+  isolated `2179cc2` plus the repair. The libclang install and new dependency cache remain
+  container-only; ordinary tests and Miri do not enable the benchmark feature. Evidence:
+  [the diagnosis](../bugs/2026-09-20-callgrind-reports-refused-work-as-success.md).
+- [ ] **Instruction regression gate.** The workflow needs a reproducible comparison baseline and
   enforced regression policy; printing instruction counts alone does not enforce D-20.
+  The ARM64 validation above does not establish GitHub x86-64 instruction equivalence or
+  integration with the separate snapshot-coverage task's concurrent edits.
 - [x] Replace the IPC ring fixture's scheduler assumptions with queued-reply and armed-wait
   histories. Linux single-CPU stress: 192/192 test executions passed. Performance gates remain.
 - [x] Page the daemon report under the client's existing reply credit; retain one charged,
@@ -446,8 +456,11 @@ limits. The first unchanged rerun improved from 5,175 passes / 3,595 failures to
 1,800 failures** in 172,343 ms. The subsequent source review and exact expected-failure rerun
 are recorded at the top of this ledger; no upstream assertion changed. Windows cross-compilation
 stopped at missing target C headers in zstd. The authorized Windows VM has been created;
-its official ARM64 installation image is partly downloaded, and native Windows tests have
-not run. An ARM64 guest can exercise x64 user-mode binaries through Windows emulation, but
+its official ARM64 installation image is fully downloaded (7,994,415,104 bytes), with SHA-256
+`638aa2c88e94385b00f4f178d071e3df0b7d9e335577a83bd533b7f2eb65adf0` verified against Microsoft.
+Ada approved the Windows 11 Pro license; installation completed and the guest reached its
+first-start setup. Native Windows tests have not run. An ARM64 guest can exercise x64
+user-mode binaries through Windows emulation, but
 does not establish equivalence to GitHub's x64 kernel.
 Record: [special-file investigation](../bugs/2026-09-19-pjdfstest-special-files-and-nfs-limits.md).
 

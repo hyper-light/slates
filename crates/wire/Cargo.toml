@@ -16,9 +16,15 @@ slates-wire-derive = { workspace = true }
 iai-callgrind = { workspace = true }
 trybuild = { workspace = true }
 
+# Only the instruction-count command builds Valgrind's client-request bindings. Ordinary
+# tests and Miri must not acquire a C binding-generator dependency from a benchmark.
+[features]
+instruction-counts = ["iai-callgrind/client_requests"]
+
 [[bench]]
 name = "callgrind"
 harness = false
+required-features = ["instruction-counts"]
 
 [lints]
 workspace = true

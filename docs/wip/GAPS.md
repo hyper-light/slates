@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Instruction benchmark repair (2026-09-21).** Result checks reject all four negative
+> controls; all 14 valid benchmarks pass. Explicit, non-inlined collection requests exclude
+> teardown on Linux ARM64: eightfold CRC verification leaves 2,653 instructions unchanged;
+> doubling header encoding increases 34 instructions to 58. Strict instrumented Clippy and
+> xtask checks pass against isolated `2179cc2` plus this repair. Container-only libclang is
+> authorized and installed; ordinary tests and Miri do not enable its benchmark feature.
+> D-20's saved comparison baseline and enforced regression policy remain owed.
+> See `docs/bugs/2026-09-20-callgrind-reports-refused-work-as-success.md` and TBD_FIXES.
+
 > **Snapshot measurement correction (2026-09-20).** A same-tree experiment separated journal
 > turnover (53 ns) from steady snapshot cost (28 ns); steady small/large trees measured 29/28 ns.
 > The AC-1.3 benchmark now prepares equal journal state, retains its allowance and fails on
@@ -359,9 +368,12 @@ are retained with their scope; no documentation edit is an implementation accept
   seeded schedules each; `docs/wip/concurrency.md`).
 - Instruction counts (D-20): `benches/callgrind.rs` in `mem`, `rt` and `wire` under iai-callgrind
   0.16.1, run by CI's `callgrind` lane on Ubuntu with valgrind (authorized 2026-09-05); valgrind
-  has no port for macOS on Apple silicon, so the lane is the only place they run. The benches
-  compile here (`cargo bench --workspace --bench callgrind --no-run`). The lane prints the counts;
-  the comparison against a recorded baseline is the next step once the first run exists.
+  has no port for macOS on Apple silicon. The authorized Linux ARM64 container now runs all
+  14 benches with successful-work and collection-boundary controls (2026-09-21, report above).
+  Use `cargo bench --workspace --bench callgrind --features
+  slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts`.
+  The feature isolates Valgrind's binding-generator dependency from ordinary tests and Miri.
+  The lane still needs a saved comparison baseline and an enforced regression policy.
 - New dependencies, accepted for the unsafe reduction: `rustix` 1.1 (the syscall surface named in
   the IPC research §2.4), `memmap2` 0.9 (maps, advice, locks), `toml` (xtask only),
   `iai-callgrind` (dev only; pulls `proc-macro-error2` 2.0.1, which rustc warns will be rejected

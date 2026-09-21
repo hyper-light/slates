@@ -4834,6 +4834,16 @@ may weaken an earlier phase's gates; ratchets only tighten.
 
 ## Part 6 — Test taxonomy, benchmark suite, and CI gates (D-20)
 
+> **Instruction benchmark correction (2026-09-21).** Benchmark success requires
+> the advertised operations to succeed, deliver their results and complete. Refusals must
+> fail the run; setup cannot substitute fixtures or spin forever. Verification belongs
+> outside the counted work. Four negative controls and 14 valid entries validate the result
+> checks on Linux ARM64. Explicit collection requests with real call boundaries keep eightfold
+> CRC verification at 2,653 instructions and count additional encode work (34 to 58).
+> Their build dependency is enabled only for instrumented benches. A reproducible comparison
+> baseline and enforced instruction regression policy are still owed; printed counts alone
+> do not meet this gate. See the dated Callgrind report and GAPS/TBD_FIXES.
+
 > **Editor workload correction (2026-09-17).** The host and mount must execute the same save
 > behavior even when their paths select different tool defaults. The Vim roster explicitly
 > clears `backupskip` and compares the backup's bytes as output. Its real-save regression checks

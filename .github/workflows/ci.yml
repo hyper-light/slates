@@ -289,13 +289,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: valgrind
         run: sudo apt-get update && sudo apt-get install -y valgrind
       - name: iai-callgrind-runner (the version pinned in Cargo.toml)
         run: cargo install iai-callgrind-runner --version 0.16.1 --locked
+      - name: Lint the instrumented benchmarks
+        run: cargo clippy -p slates-mem -p slates-rt -p slates-wire --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts -- -D warnings
       - name: Benches
-        run: cargo bench --workspace --bench callgrind
+        run: cargo bench --workspace --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts
 
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the
