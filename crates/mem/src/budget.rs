@@ -26,6 +26,12 @@ struct Ledger {
   reserve: u64,
   committed: u64,
   headroom: u64,
+  /// A pressure hold (§4.2, admission.md §5.5): capacity the control shard withholds from new
+  /// admission under real memory pressure, sampled from the host and set through [`ShardBudget::
+  /// set_hold`]. It never reaches below `committed` — it only shrinks `admittable`, so a raised hold
+  /// refuses a new reservation but touches no admitted claim (an admitted volume's within-entitlement
+  /// writes use their own committed reservation). Released as the pressure sample recovers.
+  hold: u64,
 }
 
 impl Ledger {
@@ -34,6 +40,7 @@ impl Ledger {
       reserve,
       committed: 0,
       headroom,
+      hold: 0,
     }
   }
 
@@ -42,6 +49,7 @@ impl Ledger {
       .reserve
       .saturating_sub(self.committed)
       .saturating_sub(self.headroom)
+      .saturating_sub(self.hold)
   }
 
   /// Commits `amount` whole or refuses, keeping the headroom free; returns the amount committed so
@@ -128,6 +136,20 @@ impl ShardBudget {
   /// reservation and a dynamic growth take only unpromised capacity and never eat the headroom.
   pub const fn admittable(&self) -> u64 {
     self.ledger.admittable()
+  }
+
+  /// The pressure hold now (§4.2): capacity withheld from new admission under memory pressure.
+  pub const fn hold(&self) -> u64 {
+    self.ledger.hold
+  }
+
+  /// Sets the pressure hold — capacity the control shard withholds from new admission while the host
+  /// is under memory pressure (§4.2; admission.md §5.5). It shrinks `admittable` only, never revoking
+  /// a committed claim: a within-entitlement write on an admitted volume uses its own reservation and
+  /// is unaffected, while a new reservation is refused `BudgetExceeded` until the hold is released as
+  /// the pressure sample recovers.
+  pub fn set_hold(&mut self, bytes: u64) {
+    self.ledger.hold = bytes;
   }
 
   /// Reserves `bytes` for a bounded volume, whole or not at all, keeping the operation headroom free.
@@ -443,6 +465,38 @@ mod tests {
     );
     b.grow(30).unwrap();
     assert!(matches!(b.grow(1), Err(MemError::BudgetExceeded { .. })));
+  }
+
+  /// The pressure hold withholds capacity from new admission without touching an admitted claim
+  /// (§4.2; admission.md §5.5): a raised hold shrinks `admittable` and refuses a new reservation, an
+  /// already-committed reservation is untouched (its bytes stay committed), and lowering the hold
+  /// releases the capacity for admission again.
+  #[test]
+  fn a_pressure_hold_withholds_admission_without_touching_a_committed_claim() {
+    let mut b = ShardBudget::new(100, 20);
+    let sacred = b.reserve(50).unwrap(); // an admitted volume's committed 50
+    assert_eq!(b.admittable(), 30, "100 − 50 committed − 20 headroom");
+
+    // Under pressure the control shard holds 25 of the remaining admittable.
+    b.set_hold(25);
+    assert_eq!(b.hold(), 25);
+    assert_eq!(b.admittable(), 5, "the hold shrinks admittable, 30 − 25");
+    assert_eq!(b.committed(), 50, "the hold touches no committed claim");
+    assert!(
+      matches!(
+        b.reserve(10),
+        Err(MemError::BudgetExceeded { available: 5, .. })
+      ),
+      "a new reservation past the held admittable is refused"
+    );
+    // The admitted volume keeps its reservation; a growth within its committed bytes is its own,
+    // not a new admission, so it is unaffected (the reservation stands).
+    assert_eq!(sacred.bytes, 50);
+
+    // As the sample recovers the hold releases and admission resumes.
+    b.set_hold(0);
+    assert_eq!(b.admittable(), 30, "the released hold restores admittable");
+    assert_eq!(b.reserve(10).unwrap().bytes, 10, "admission resumes");
   }
 
   /// The counted parallel of the byte reservation: the sum of reserved inode allowances can never

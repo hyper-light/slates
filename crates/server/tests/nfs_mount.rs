@@ -185,6 +185,70 @@ fn the_daemon_serves_a_provisioned_volume_over_nfs() {
   drop(daemon);
 }
 
+/// AC (§4.2 "admission stops under pressure"; admission.md §5.5; GAP-A9-1): a memory-pressure hold on
+/// the shard's byte budget refuses a **new** admission while an **admitted** volume's within-entitlement
+/// writes still land. A bounded volume is created and a file written through its mount (its reservation
+/// backs it). A hold that zeroes the shard's admittable is set (as the sampler would under real
+/// pressure); a new bounded create is refused `BudgetExceeded`, but the mounted volume's further write
+/// within its limit still lands — its reservation is committed and the hold touches no committed claim.
+/// The hold released, a new create succeeds again. Non-vacuous: the create is refused only while the
+/// hold stands, and the admitted volume's write never fails.
+#[test]
+fn a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writes() {
+  let (daemon, instance) = single_shard_daemon("pressure");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { .. } = client.call(&scratch("kept")) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability_path(&daemon, "kept"), 1);
+  let file = create(&mut stream, &root, "f", 2);
+  write(&mut stream, &file, b"before the hold\n", 3);
+
+  // Under memory pressure the control shard holds the whole admittable (the sampler's effect,
+  // driven directly here). A new bounded create is refused; the admitted volume is untouched.
+  daemon
+    .inject_pressure_hold(u64::MAX)
+    .expect("the hold is installed on every shard");
+  assert_eq!(
+    daemon.pressure_holds().expect("the shards answer"),
+    vec![u64::MAX],
+    "the hold stands on the shard"
+  );
+  let refused = client.call(&scratch("under-pressure"));
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::BudgetExceeded { .. }
+      }
+    ),
+    "a new admission is refused under the pressure hold: {refused:?}"
+  );
+  // The admitted volume's within-entitlement write still lands — its reservation is committed.
+  write(
+    &mut stream,
+    &file,
+    b"during the hold: still within entitlement\n",
+    4,
+  );
+  assert_eq!(
+    read(&mut stream, &file, 5),
+    b"during the hold: still within entitlement\n",
+    "the admitted volume serves through the hold"
+  );
+
+  // Released, admission resumes.
+  daemon
+    .inject_pressure_hold(0)
+    .expect("the hold is released on every shard");
+  let ReplyBody::Created { .. } = client.call(&scratch("after-pressure")) else {
+    panic!("a new volume is admitted once the hold is released");
+  };
+  daemon.stop();
+}
+
 /// The daemon serves a volume that lives on a shard OTHER than the one the NFS listener is on, over the
 /// cross-shard bridge queue: the request is routed to the volume's owning shard, served there against
 /// that shard's real state, and the reply routed back — a write over NFS reads back over NFS.

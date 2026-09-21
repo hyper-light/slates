@@ -387,9 +387,13 @@ can lag subsequent implementations; use their acceptance criteria and current so
   Retained overlay witnesses/images are already implemented; do not list them as missing again.
 - [ ] **Placement and repair (GAP-A9-8):** close verified reference-graph placement, real holder
   capacity, repair/healing and byte-complete cross-region/mirror service with time-based lag evidence.
-- [ ] **Memory/QoS (GAP-A9-1/-11):** pressure-driven admission stop, Windows job-object bounds,
-  guest/open-reference charges and bounded end-to-end large/unknown-length transfers, with
-  cancellation and resource release across shard/device/transport limits.
+- [ ] **Memory/QoS (GAP-A9-1/-11):** ~~pressure-driven admission stop~~ **DONE 2026-09-21** (the hold
+  on each shard's byte budget, sampled from `memory_available_now` at the liveness cadence and fanned
+  as the host shortfall's per-shard share; a raised hold refuses a new create `BudgetExceeded` while an
+  admitted volume's within-entitlement writes land — `crates/server/tests/nfs_mount.rs`, the pure
+  budget unit; admission.md §5.5). Still owed: Windows job-object bounds, guest/open-reference charges
+  and bounded end-to-end large/unknown-length transfers, with cancellation and resource release across
+  shard/device/transport limits.
 - [ ] **Telemetry (GAP-A9-12):** cross-node trace propagation and fleet/archive emitters with
   typed absence, freshness and loss. Local observation receipts are already implemented.
 - [ ] **Digests (GAP-A9-13):** cooperatively sliced hashing, sealed-content digests and SDK exposure.

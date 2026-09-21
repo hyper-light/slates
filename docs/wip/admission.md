@@ -292,14 +292,23 @@ status` prints `mapped=` before `reserve=`.
    memory limit (`QueryInformationJobObject`, Win32 FFI under the unsafe budget), and a boot-time
    typed refusal when a shard's mapped classes exceed the host bound (today the classes are derived
    from the bound, so the sum fits by construction; the check would guard a hand-edited config).
-5. ~~Entitlement through resize and recovery~~ — done (§4e). **Pressure** is owed: the design is a
-   hold on each shard's budget — `admittable = capacity − committed − headroom − hold`, the hold
-   never reaching below `committed` so no admitted claim is touched — applied by the control shard
-   from a sampled pressure source (Linux PSI `memory.some`, else `MemAvailable`/`host_statistics64`)
-   at the profile's cheap-refresh cadence, and released as the sample recovers; the by-use proof is
-   a raised hold refusing a new reservation while an admitted volume's within-entitlement writes
-   land. It is not built here because no sampler drives it yet on this branch (code without a real
-   caller would be untestable by use, R5); `Facts::memory_available_now` is the sampler to start from.
+5. ~~Entitlement through resize and recovery~~ — done (§4e). ~~**Pressure**~~ — **done 2026-09-21
+   (§5.5).** The hold is on each shard's byte budget — `admittable = capacity − committed − headroom
+   − hold` (`ShardBudget::set_hold`/`hold`, `crates/mem/src/budget.rs`) — and shrinks admittable
+   only, never revoking a committed claim, so no admitted volume's within-entitlement write is
+   touched. The daemon's reap loop samples `Facts::memory_available_now` at the liveness cadence (the
+   cheap refresh), captures a boot baseline, and fans the host-wide shortfall below it, divided
+   evenly among the shards, as each shard's hold (`daemon::refresh_pressure_hold` over
+   `xshard::run_on`); the hold releases to zero as the sample recovers, and a host with no sampler
+   leaves it at zero (admits exactly as before). Proven by use: a raised hold refuses a new bounded
+   create `BudgetExceeded` while an admitted volume's further write within its limit still lands
+   (`crates/server/tests/nfs_mount.rs::a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writes`,
+   with `Daemon::inject_pressure_hold`/`pressure_holds` driving the mechanism deterministically), and
+   by the pure ledger unit
+   (`crates/mem/src/budget.rs::a_pressure_hold_withholds_admission_without_touching_a_committed_claim`).
+   Still owed in this dimension (not the pressure hold): the finer pressure source (Linux PSI
+   `memory.some` where the kernel offers it, over the coarser `MemAvailable`), and the Windows
+   job-object memory limit sub-part of §5.4.
 
 ## 4e. Resize and recovery (piece 3)
 
