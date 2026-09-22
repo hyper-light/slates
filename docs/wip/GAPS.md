@@ -1,5 +1,16 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **Client ring sized by Little's law (2026-09-22).** A daemon's client seats followed one boot
+> measurement of the wake tail: `slots_per_ring` was `wake.p99 / syscall.median`, and the bulk area
+> scales with it, so pods of one image seated 1 to 1285 clients. A one-seat KIND pod refused the lane's
+> `bootstrap` while its readiness probe held the seat; CI's macOS runner seated two and refused the
+> restart test's third. The ring is now §4.7's Little's law, `requests_in_flight_per_shard` rounded to
+> a power of two; the regression fails before with CI's exact message and passes after; workspace,
+> server, fleet (48/48) and CLI-flow suites pass; every pod of a two-CPU fresh-cluster KIND run seats
+> 330. Owed: the wake probe's mixed events and unconverged p99 still feed the step budget, the spin
+> window and the runtime's inbound ring; the pressure hold follows host-wide memory.
+> Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
+
 > **KIND takeover: council seats (2026-09-22).** CI run 35615113353's KIND lane retired the killed
 > owner but never took its volume over. The council's voters were the lowest member ids up to
 > `2f + 1`: the owner's replacement, admitted beside its unretired predecessor, took the live

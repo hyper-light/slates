@@ -9,6 +9,16 @@ authorized merely by appearing here.
 
 ## Current CI repair checkpoint (2026-09-22)
 
+- [x] **Run 35791239154: client seats followed the wake tail.** `slots_per_ring` came from one boot
+  wake p99, so pods of one image seated 1 to 1285 clients (`too many clients (the bound is 1)` on a
+  KIND pod, `the bound is 2` on CI's macOS restart test). Size the ring by §4.7's Little's law; a
+  regression fails before and passes after; workspace, fleet and CLI-flow suites pass; every pod of a
+  two-CPU fresh-cluster run seats 330. See
+  `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
+- [ ] **The wake probe and the pressure hold.** Measure one well-defined wake event and converge the
+  statistic each derivation consumes (step budget, spin window, the runtime's inbound ring); replace
+  the pressure hold's boot-baseline shortfall with the design's hold above `committed` against the
+  memory this daemon can actually be given. Evidence in the same record.
 - [x] **Run 35615113353: KIND takeover never assigned.** The council seated its voters by
   lowest id, so the owner's replacement took the live leader's seat beside its unretired
   predecessor, then led without ever retiring it; no takeover was assigned. Seats now follow

@@ -1919,6 +1919,8 @@ stalled reply and the control channel reset, reconnect, and resend with the same
 (exactly-once by completion records). Ring full: the client blocks on the ring (credit), never
 drops.
 
+> **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the wake probe mixes an on-core handoff with a wake from sleep and stops on the median's convergence while its p99 is consumed (the runtime's inbound ring, the step budget, the spin window); `spin_ns` uses wake p50 where this section says p99; the admission value rests on two stated assumptions rather than measured rates. Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.p99; idle window = wake_ns.p99 ×
 measured spin-to-park ratio target.

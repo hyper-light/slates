@@ -3435,3 +3435,57 @@ fn assert_balanced(retention: &slates_server::merge_service::MergeRetention, flo
     "the fold floor: {retention:?}"
   );
 }
+
+/// Shape: the KIND lane's pod memory bound (`deploy/kind/values-lane.yaml`, `resources.memory: 1Gi`), the
+/// bound the pods that seated one client ran under.
+const POD_MEMORY_BYTES: u64 = 1 << 30;
+/// Shape: a wake p99 the boot probe reported for the lane's own image on two contended cores — one
+/// 64-sample run of `docker run --cpuset-cpus=0-1 slates:claudediag profile --json` (2026-09-22), where
+/// runs a minute apart reported 667 ns.
+const CONTENDED_WAKE_P99_NS: u64 = 511_042;
+/// Shape: the clients the restart history holds at once (the resumed session, the exited and the
+/// silent clients, and the fresh one) — the concurrency CI's macOS runner refused past two.
+const CONCURRENT_CLIENTS: usize = 4;
+
+/// AC-2.6, §4.7 "Derived constants" (ring depth is Little's law on the per-client request rate × p99
+/// service time): the client seats do not follow the machine's measured wake tail. A KIND pod measured
+/// a millisecond tail at boot, derived a 16384-slot ring whose bulk area took its whole client share,
+/// seated one client, and refused the lane's `bootstrap` while its readiness probe held that seat
+/// (`channel: too many clients (the bound is 1)`); CI's macOS runner seated two and refused the
+/// restart test's third (`the bound is 2`)
+/// (docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md). Do: derive a daemon
+/// under the pod's memory bound from a profile with a contended wake tail and connect four clients.
+/// Expect: every one is seated and served, and the daemon counts all four.
+#[test]
+fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
+  let mut profile = profile();
+  profile.facts.memory.limit = Some(POD_MEMORY_BYTES);
+  profile.wake.p99_ns = CONTENDED_WAKE_P99_NS;
+  let instance = format!("dm-seats-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+  )
+  .unwrap();
+  let mut clients: Vec<Client> = (0..CONCURRENT_CLIENTS)
+    .map(|_| Client::connect(&instance))
+    .collect();
+  let mut seated = 0;
+  for client in &mut clients {
+    let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+      panic!("a seated client is served");
+    };
+    seated = report.shards.iter().map(|shard| shard.clients).sum::<u32>();
+  }
+  drop(clients);
+  daemon.stop();
+  assert_eq!(
+    usize::try_from(seated).unwrap(),
+    CONCURRENT_CLIENTS,
+    "the daemon seats every concurrent client"
+  );
+}

@@ -359,12 +359,20 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("volumes_per_shard", &volumes));
+    // §4.7 "Derived constants": a client ring holds what one client may have in flight — Little's law
+    // on the request rate × p99 service time (`requests_in_flight_per_shard`, the admission value that
+    // sizes one client's in-flight work) — rounded up to a power of two. Until 2026-09-22 it was the
+    // runtime's inbound ring depth, `wake.p99 / syscall.median` from one boot probe: a contended boot
+    // measured a tail up to milliseconds, the ring and the bulk area that scales with it took the whole
+    // client share, and a KIND pod seated one client while a sibling pod of the same image seated 1285
+    // (docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md).
     let slots: Derived<u32> = derived!(
-      u32::try_from(d.ring_entries.get())
+      u32::try_from(admission.get())
         .unwrap_or(u32::MAX)
+        .max(1)
         .next_power_of_two(),
-      "the runtime's ring entries (Little's law), rounded up to a power of two",
-      ["rt.ring_entries"]
+      "requests one client may hold in flight (Little's law: request rate × p99 service time), rounded up to a power of two",
+      ["rt.request_rate", "rt.service_p99_ns"]
     );
     derivations.push(note("slots_per_ring", &slots));
     let spin: Derived<u32> = derived!(
