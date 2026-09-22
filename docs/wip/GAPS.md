@@ -35,10 +35,15 @@
 > regressions also pass (0.39 s and 0.01 s), followed by the real CLI gate (10 functions;
 > macOS-only branches skip), 50 conformance cases and six tracer lifecycle cases.
 > macOS tracing remains a distinct verification obligation.
-> The privileged macOS reproduction reached ENOSPC before fs_usage attached. The harness
-> now waits for an observed event, owns cancellation and requires successful draining
-> after observing daemon teardown. Native proof and the separate space refusal remain open
-> (`2026-09-22-fs-usage-startup-and-ownership.md`); no quota or landing assertion was relaxed.
+> The corrected macOS tracer captures 188 rows / 47,000 bytes, with empty stderr and no
+> surviving task process. ENOSPC was the fixture's eight-inode limit: client metadata
+> filled three extra slots. A measured page-based quota admits the full native workload
+> and snapshot; the oracle now compares every mounted entry with the landed tree, including
+> those metadata files, while retaining the known workload byte/kind checks. Linux passes
+> the complete NFS/strace lifecycle with 220 writes, six paths matched and no unresolved or
+> outside write. macOS still needs sound descriptor attribution; visible sidecars remain
+> failures in the independent workload-equivalence suite. Records: the dated fs_usage and
+> client-metadata fixture reports. No all-lanes closure.
 
 > **CI fixture correction (2026-09-21).** Run 35604717581 exposed channel waiting-state
 > allocation inside both allocator-counter fixtures and a status-paging fixture that shrank

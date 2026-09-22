@@ -18,9 +18,11 @@ use slates_conformance::record::Outcome;
 use slates_conformance::trace::{
   Policy, fs_usage_has_activity, judge, parse_fs_usage, parse_strace_with_cwd, strace_unnamed_paths,
 };
+use slates_conformance::workload::Manifest;
 
 use super::slates::{MOUNT_WAIT, Session, grant};
 use super::trace_process::{StopSignal, TraceProcess};
+use super::workloads::manifest_of;
 use super::{Run, SuiteResult, write_file};
 use crate::Failure;
 
@@ -259,6 +261,16 @@ fn verify_landing(target: &Path, work: &str) -> Result<(), Failure> {
   Ok(())
 }
 
+/// The complete mounted namespace is the independent oracle for what the landing must write.
+fn verify_manifest(mounted: &Manifest, landed: &Manifest) -> Result<(), Failure> {
+  if mounted != landed {
+    return Err(Failure(format!(
+      "the landed tree differs from the complete mounted tree: mounted={mounted:?}; landed={landed:?}"
+    )));
+  }
+  Ok(())
+}
+
 /// Runs the traced lifecycle and judges the log.
 pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let log = run.scratch.path().join("trace.log");
@@ -267,12 +279,21 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     HostOs::Macos => None,
     HostOs::Windows => return Err(Failure("no Windows tracer".to_owned())),
   };
-  // The trace creates four surviving entries, their two parents, the root and one temporary
-  // file. Reserve those eight inodes by the admission formula (§4.2), leaving the shard's
-  // unpromised versions available for the snapshot taken before landing. The general stress
-  // volume's byte quota can reserve the entire inode slab and legitimately refuse retention.
+  // Derived: one queried host page per peak workload entry. The macOS NFS client adds a
+  // 4096-byte AppleDouble file to each name; on the measured 16-KiB-page host, six surviving
+  // sidecars cost 98304 bytes (§4.2's allocated-page charge), plus eight inline workload bytes.
+  // Counting only Rust inodes admitted 2112 bytes and refused both the metadata and d/f2.
+  // Keep this fixture small enough to leave the shard's unpromised versions for its snapshot.
   let inode_count = LANDED_ENTRIES.len() + 2 + 1 + 1;
-  let size = (inode_count * std::mem::size_of::<slates_vfs::inode::Inode>()).to_string();
+  let page = slates_machine::facts::Facts::query().page.base;
+  if page == 0 {
+    return Err(Failure("the OS did not report its page size".to_owned()));
+  }
+  let size = u64::try_from(inode_count)
+    .ok()
+    .and_then(|count| count.checked_mul(page))
+    .ok_or_else(|| Failure("hermeticity workload quota overflow".to_owned()))?
+    .to_string();
   let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
   let fs_usage = match run.os {
     HostOs::Macos => Some(FsUsage::start(&session, &log)?),
@@ -294,20 +315,26 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       Err(error) => format!("listing the failed workload: {error}"),
     };
     return Err(Failure(format!(
-      "the mount workload failed (quota {size} bytes, {inode_count} inodes): {}\nmounted tree: {inspection}",
+      "the mount workload failed (quota {size} bytes, {inode_count} peak entries × {page}-byte page): {}\nmounted tree: {inspection}",
       String::from_utf8_lossy(&workload.stderr),
     )));
   }
+  let parent = format!("conformance-{}", std::process::id());
+  let work = format!("{parent}/traced");
+  // The known workload bytes/kinds must be correct independently of the observed manifest.
+  // The manifest then adds every client-created entry; it has no filename exclusions.
+  verify_landing(session.mount.path(), &work)?;
+  let mounted_tree = manifest_of(session.mount.path())?;
+  let expected = mounted_tree
+    .entries
+    .iter()
+    .map(|entry| entry.path.clone())
+    .collect::<Vec<_>>();
   let target = run.scratch.subdir("land-target")?;
   let target = std::fs::canonicalize(&target)?;
   let written = land_under_grant(run, &session, &target)?;
-  let parent = format!("conformance-{}", std::process::id());
-  let work = format!("{parent}/traced");
-  let expected = std::iter::once(parent)
-    .chain(std::iter::once(work.clone()))
-    .chain(LANDED_ENTRIES.iter().map(|entry| format!("{work}/{entry}")))
-    .collect::<Vec<_>>();
-  let verified = verify_landing(&target, &work);
+  let verified = verify_landing(&target, &work)
+    .and_then(|()| verify_manifest(&mounted_tree, &manifest_of(&target)?));
   let Session { mount, anchor, .. } = session;
   drop(mount);
   // Readiness is already established: keep observing through daemon teardown as well.
@@ -362,7 +389,9 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       text.lines().count()
     ),
     format!("the granted target: {}", target.display()),
-    format!("volume quota: {size} bytes, derived from {inode_count} workload inodes"),
+    format!(
+      "volume quota: {size} bytes, derived from {inode_count} peak workload entries × {page}-byte host page"
+    ),
     format!(
       "landing completeness: {written}/{} entries reported; disk verification: {verified:?}",
       expected.len()
@@ -413,7 +442,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
         "sudo fs_usage -w -f filesys -f network <daemon pid>; slates anchor/volume create/mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
       ),
     },
-    bound: "one lifecycle: one volume, one mount, four workload entries and their two parent directories landed and verified".to_owned(),
+    bound: "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified".to_owned(),
     expected_failure_list: None,
     notes,
     ok,
@@ -424,4 +453,39 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 #[allow(dead_code)]
 pub(crate) fn log_path(scratch: &Path) -> PathBuf {
   scratch.join("trace.log")
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use slates_conformance::workload::{Entry, EntryKind};
+
+  /// AC-4.5: client-generated entries must land with the same names, kinds, modes and bytes.
+  #[test]
+  fn landing_cannot_drop_add_or_change_a_client_metadata_file() {
+    let mounted = Manifest {
+      entries: vec![Entry {
+        path: "._file".to_owned(),
+        kind: EntryKind::File,
+        mode: 0o600,
+        size: 4,
+        digest: blake3::hash(b"meta").to_hex().to_string(),
+      }],
+    };
+    assert!(verify_manifest(&mounted, &mounted).is_ok());
+    assert!(
+      verify_manifest(&mounted, &Manifest::default()).is_err(),
+      "missing metadata"
+    );
+    assert!(
+      verify_manifest(&Manifest::default(), &mounted).is_err(),
+      "extra metadata"
+    );
+    let mut changed = mounted.clone();
+    changed.entries[0].digest = blake3::hash(b"lost").to_hex().to_string();
+    assert!(
+      verify_manifest(&mounted, &changed).is_err(),
+      "changed metadata bytes"
+    );
+  }
 }

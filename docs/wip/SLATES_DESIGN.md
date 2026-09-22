@@ -4992,8 +4992,15 @@ with the injection list; the benchmark write-up in the
    before mounted mutations begin. The harness owns its child, signals it on every early
    return, and drains it after observing daemon teardown. An unsuccessful exit or diagnostic
    (including lost trace events) refuses the evidence. Native mounted validation remains
-   open: the previous local run hit ENOSPC and recorded zero events before this correction
+   open: native readiness and early-error cleanup now record 188 rows / 47,000 bytes,
+   but IPC descriptor attribution still needs proof
    (`docs/bugs/2026-09-22-fs-usage-startup-and-ownership.md`).
+   The mounted fixture reserves one queried host page per peak workload entry, including
+   room for measured kernel-client metadata. Its oracle checks the known workload bytes
+   independently and compares the entire mounted manifest with the landed tree; every
+   visible client-generated entry contributes to Written and trace matching. This does
+   not close workload equivalence when a transport introduces visible sidecars
+   (`docs/bugs/2026-09-22-hermeticity-fixture-omits-client-metadata.md`).
 9. *Landing, concurrency.* Land a 500-entry delta into a tree while an outsider rewrites 50 of
    the targets at random moments. Expect: every outsider write that happened after validation is
    still on disk afterwards, every such entry is reported `Conflict(TargetInUse)` and remains in

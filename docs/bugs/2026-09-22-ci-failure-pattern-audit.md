@@ -80,7 +80,14 @@ timed out without starting a tracer. The third attempt ran the mounted workload:
 the daemon exited. The new barrier/ownership regressions first failed (two cases,
 0.05 s), then six real-process cases pass in 0.24 s. Fifty conformance parser/record
 cases pass; strict targeted Clippy passes. The mounted rerun must still establish
-real fs_usage readiness, and the separate space refusal remains unresolved.
+the complete tracing verdict. It now proves readiness and cleanup: 188 rows /
+47,000 bytes, empty stderr, no surviving task process. The space refusal is the
+fixture's exhausted eight-inode allowance (three extra client metadata files), with
+only four content bytes charged and no snapshot. A page-based fixture completes
+the native workload and snapshot; the complete-tree landing oracle includes all
+client metadata. The full Linux NFS/strace rerun passes with 220 write calls and
+zero unresolved/outside writes. macOS descriptor attribution remains open; see
+`2026-09-22-hermeticity-fixture-omits-client-metadata.md`.
 
 The native workload now creates its working directories successfully and runs
 eight installed tools. Four compare identical; git, Python, rsync and editor

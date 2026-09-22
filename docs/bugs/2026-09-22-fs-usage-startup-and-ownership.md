@@ -41,8 +41,11 @@ buffer loss on stderr, so a clean exit alone is insufficient evidence.
 - Exercise delayed readiness, early exit, terminal log output, and cancellation
   through real pipe-connected child processes, without privileged tools.
 
-Native mounted verification remains open until the corrected privileged command
-finishes. The separate ENOSPC refusal is not explained by this lifecycle fix.
+The corrected privileged command now records 188 rows / 47,000 bytes with empty
+stderr and no surviving task tracer or daemon. Startup and early-error cleanup are
+verified natively. The separate ENOSPC cause is recorded in
+`2026-09-22-hermeticity-fixture-omits-client-metadata.md`; complete macOS hermeticity
+still requires attribution of the shared-memory and pre-existing socket descriptors.
 
 ## Validation
 

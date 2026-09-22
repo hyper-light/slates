@@ -67,7 +67,7 @@ fn entry_of(root: &Path, path: &Path) -> Result<Entry, Failure> {
   let (kind, size, digest) = if file_type.is_symlink() {
     let target = std::fs::read_link(path)
       .map(|t| t.to_string_lossy().into_owned())
-      .unwrap_or_default();
+      .map_err(|error| Failure(format!("reading link {}: {error}", path.display())))?;
     (EntryKind::Symlink { target }, 0, String::new())
   } else if file_type.is_dir() {
     (EntryKind::Directory, 0, String::new())
@@ -96,7 +96,7 @@ fn entry_of(root: &Path, path: &Path) -> Result<Entry, Failure> {
 }
 
 /// The manifest of a tree, sorted by path.
-fn manifest_of(root: &Path) -> Result<Manifest, Failure> {
+pub(super) fn manifest_of(root: &Path) -> Result<Manifest, Failure> {
   let mut entries = Vec::new();
   let mut stack = vec![root.to_path_buf()];
   while let Some(dir) = stack.pop() {

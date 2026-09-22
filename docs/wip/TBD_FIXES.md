@@ -48,8 +48,19 @@ authorized merely by appearing here.
 - [ ] **Native tracer verification.** The authorized Terminal reproduction reached ENOSPC
   at `d/f2`, followed by `ktrace_start: No such process` and a zero-byte trace. Startup now
   requires a parsed event; owned cleanup covers errors and successful draining follows daemon teardown.
-  Real child-process regressions cover readiness and cleanup; rerun the mounted command.
-  The quota and exact landing assertions are unchanged. See the dated fs_usage ownership report.
+  The corrected native run captures 188 rows / 47,000 bytes, with empty stderr and no
+  surviving task process. Remaining: sound attribution for shared-memory descriptor
+  writes and the socket opened before tracing. A task-scoped DTrace probe is prepared,
+  not yet authorized or run; no SIP change is proposed. See the dated fs_usage ownership report.
+- [x] **Hermeticity workload admission and complete landing oracle.** Seven entries plus
+  the root exhaust the former eight-inode fixture; three entries are kernel-created
+  AppleDouble files. Four content bytes and no snapshots rule out a retained-byte leak.
+  Eight queried host pages admit the unchanged native workload and snapshot (131,072
+  bytes admitted, 98,312 referenced, 12 surviving entries). Every entry is now compared
+  by name/kind/mode/content with its landed counterpart; the core workload checks remain.
+  Linux passes 24 harness cases, structural checks and the full NFS/strace lifecycle:
+  220 writes, six paths matched, zero unresolved/outside. Strict Clippy passes on macOS;
+  the current Linux image lacks Clippy. See the dated client-metadata fixture report.
 - [ ] **Broader CI audit.** Follow `docs/bugs/2026-09-22-ci-failure-pattern-audit.md`:
   async acknowledgment/pending-reply bounds, fs_usage readiness and ownership, pjdfstest
   child errors, macOS NFS capability cases, and initial KIND formation A↔B↔C without A↔C.
