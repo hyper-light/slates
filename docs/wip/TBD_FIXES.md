@@ -60,8 +60,11 @@ authorized merely by appearing here.
   requires a parsed event; owned cleanup covers errors and successful draining follows daemon teardown.
   The corrected native run captures 188 rows / 47,000 bytes, with empty stderr and no
   surviving task process. Remaining: sound attribution for shared-memory descriptor
-  writes and the socket opened before tracing. A task-scoped DTrace probe is prepared,
-  not yet authorized or run; no SIP change is proposed. See the dated fs_usage ownership report.
+  writes and the socket opened before tracing. Task-scoped DTrace is explicitly authorized;
+  the prepared probe awaits Terminal sudo authentication. Descriptor attribution must also
+  handle replacement: Apple's filesys/network filter suppresses dup/dup2 rows, and the
+  parser currently ignores close_nocancel. A late descriptor snapshot cannot alone establish
+  which object an earlier write reached. See the dated fs_usage ownership report.
 - [x] **Hermeticity workload admission and complete landing oracle.** Seven entries plus
   the root exhaust the former eight-inode fixture; three entries are kernel-created
   AppleDouble files. Four content bytes and no snapshots rule out a retained-byte leak.

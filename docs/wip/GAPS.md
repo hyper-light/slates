@@ -55,6 +55,9 @@
 > outside write. macOS still needs sound descriptor attribution; visible sidecars remain
 > failures in the independent workload-equivalence suite. Records: the dated fs_usage and
 > client-metadata fixture reports. No all-lanes closure.
+> Task-scoped DTrace is now authorized; Terminal sudo authentication is pending. The
+> replacement attribution must account for descriptor reuse: fs_usage suppresses dup/dup2
+> rows in the selected mode, so later descriptor snapshots cannot prove earlier write targets.
 
 > **CI fixture correction (2026-09-21).** Run 35604717581 exposed channel waiting-state
 > allocation inside both allocator-counter fixtures and a status-paging fixture that shrank

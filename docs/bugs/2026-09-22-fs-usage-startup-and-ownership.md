@@ -64,3 +64,31 @@ Linux command script and log:
 `/private/tmp/slates-ci-35615970514-native-and-tracer-linux.{sh,log}`.
 The follow-up Terminal script uses the isolated `tracer-source`, keeps the original
 red log, and writes `slates-ci-35615970514-macos-trace-v2.log`.
+
+## Descriptor coverage follow-up (2026-09-22)
+
+The native trace has 23 ftruncate calls, 23 mmap calls, 92 reads and 50 writes.
+It has no shm_open or socket creation rows. Apple's
+[fs_usage source](https://github.com/apple-oss-distributions/system_cmds/blob/main/fs_usage/fs_usage.c)
+does not register shm_open in its syscall table. Its filesys/network filter also
+tracks dup/dup2 internally without emitting their rows. Therefore adding known
+descriptor numbers from a later lsof snapshot would not establish the object each
+earlier write reached: dup2 can replace a descriptor between the write and snapshot.
+The parser also handles close but currently ignores close_nocancel and guarded
+close. These are sibling attribution gaps, not evidence of an actual daemon disk
+write. No such writes have been reclassified to make the test pass.
+
+Task-scoped DTrace was explicitly authorized on 2026-09-22. The bounded probe is
+`bash /private/tmp/slates-ci-35615970514-dtrace-probe.sh`; it owns one disposable
+daemon, generates a real CLI session and requires a shm_open return event. It does
+not change SIP or host settings. At this checkpoint `sudo -n true` returns
+`sudo: a password is required`, and no probe log exists. Terminal authentication
+is pending; DTrace coverage is not yet established. Tests and builds remain idle
+for that probe.
+
+A complete replacement must preserve descriptor lifetimes, cover descriptors
+created before workload tracing, reject event loss, and retain tracing through
+teardown. Negative controls must include a descriptor replaced between writes,
+close variants, and a disk write outside the granted target. The native mounted
+lifecycle must then pass with zero unresolved or outside writes; a source review
+or a successful coverage probe alone cannot close that gate.
