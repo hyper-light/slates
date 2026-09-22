@@ -143,6 +143,40 @@ pub struct Digest {
   pub size: u64,
 }
 
+/// A digest hash in progress across cooperative slices (§4.15; clean-digest.md §7 "cooperative
+/// slicing"): a large clean base file is hashed a bounded slice per shard step ([`Overlay::
+/// digest_advance`]) rather than in one step, so the owner shard is never held for the whole file at
+/// the machine's BLAKE3 throughput. The state is **pure data** — the running BLAKE3 hasher, the byte
+/// offset reached, the file's inode and the fingerprint captured at [`Overlay::digest_begin`] — and
+/// holds no host resource, so a partial digest an abandoning client leaves behind is simply dropped.
+/// Each slice re-opens the file and re-checks the fingerprint, so an outsider edit part-way through is
+/// caught (`DigestUnverified`), never hashed into a torn identity.
+#[derive(Clone, Debug)]
+pub struct PartialDigest {
+  no: InodeNo,
+  fingerprint: Fingerprint,
+  size: u64,
+  done: u64,
+  hasher: blake3::Hasher,
+}
+
+impl PartialDigest {
+  /// The bytes hashed so far, and the total — a progress fraction for the operator.
+  pub fn progress(&self) -> (u64, u64) {
+    (self.done, self.size)
+  }
+}
+
+/// What [`Overlay::digest_begin`] resolved: a digest ready at once (a cache hit, or nothing to
+/// re-verify), or a hash to advance in slices.
+pub enum DigestStart {
+  /// The digest is known now (the reused cache entry).
+  Ready(Digest),
+  /// A hash to carry forward with [`Overlay::digest_advance`]; boxed, since its running BLAKE3 state
+  /// is kilobytes against the ready digest's forty bytes (one allocation per digest begun).
+  Pending(Box<PartialDigest>),
+}
+
 /// The digest verb's counters (§4.15: "validated by a counter and a byte oracle"): every path
 /// the verb and its cache can take, so a test asserts the one it drove moved and a silently dead
 /// reuse path can never pass as a working one.
@@ -1823,6 +1857,25 @@ impl Overlay<'_> {
   /// file changing under the hash refuses `DigestUnverified` rather than export a digest of torn
   /// bytes. A read, never a mutation: nothing is journaled and the entry does not diverge.
   pub fn digest(&mut self, store: &mut Store, path: &str) -> Result<Digest, VfsError> {
+    // The convenience form: begin, then hash the whole file in one call (the whole size as the
+    // slice budget). The daemon uses the cooperative [`Self::digest_begin`]/[`Self::digest_advance`]
+    // split instead, so a large file's hash yields the shard between slices.
+    match self.digest_begin(store, path)? {
+      DigestStart::Ready(digest) => Ok(digest),
+      DigestStart::Pending(mut partial) => loop {
+        if let Some(digest) = self.digest_advance(store, &mut partial, u64::MAX)? {
+          return Ok(digest);
+        }
+      },
+    }
+  }
+
+  /// Begins a clean-file digest (§4.15): resolves the path, refuses a non-clean or non-file entry,
+  /// verifies the file is current, and reuses a kept digest whose fingerprint the disk still matches
+  /// (`DigestStart::Ready`). Otherwise it returns the hash to advance in cooperative slices
+  /// (`DigestStart::Pending`), carrying the fingerprint the slices re-check against — no bytes are
+  /// hashed yet, so `begin` itself is O(1).
+  pub fn digest_begin(&mut self, store: &mut Store, path: &str) -> Result<DigestStart, VfsError> {
     let located = self.resolve(store, path)?;
     let no = match located.child {
       Child::File(no) => no,
@@ -1835,7 +1888,7 @@ impl Overlay<'_> {
     if !self.is_clean(store, no) {
       return Err(VfsError::DigestNotClean);
     }
-    let (file, fingerprint) = self.verify_current(store, no)?;
+    let (_file, fingerprint) = self.verify_current(store, no)?;
     // Discovery (§4.15): a kept digest is reused only after the disk re-verified the fingerprint
     // it was computed under — the fingerprint is the truth, the cache never is; a kept digest
     // the disk no longer matches is stale knowledge, dropped before anything else happens.
@@ -1847,26 +1900,101 @@ impl Overlay<'_> {
     if let Some(cached) = kept {
       if cached.fingerprint == fingerprint {
         self.plane()?.digest_stats.revalidated += 1;
-        return Ok(Digest {
+        return Ok(DigestStart::Ready(Digest {
           identity: cached.identity,
           size: fingerprint.size,
-        });
+        }));
       }
       if self.plane()?.forget_digest(store, no) {
         self.plane()?.digest_stats.stale += 1;
       }
     }
-    let identity = self.hash_file(store, file, fingerprint.size)?;
-    let after = self.host.fstat(file).map_err(host_refusal)?;
-    if after != fingerprint {
+    Ok(DigestStart::Pending(Box::new(PartialDigest {
+      no,
+      fingerprint,
+      size: fingerprint.size,
+      done: 0,
+      hasher: blake3::Hasher::new(),
+    })))
+  }
+
+  /// Advances a [`PartialDigest`] by up to `budget` bytes (§4.15; clean-digest.md §7): re-opens the
+  /// file and re-checks its fingerprint — an outsider edit part-way through the hash is
+  /// `DigestUnverified`, never hashed into a torn identity — then reads and hashes the next slice.
+  /// Returns the finished [`Digest`] once the whole file is hashed (re-verified and kept), or `None`
+  /// when more slices remain. A caller loops this with its own per-step budget so the hash of a
+  /// large file never holds the shard for the whole file at the machine's BLAKE3 throughput.
+  pub fn digest_advance(
+    &mut self,
+    store: &mut Store,
+    partial: &mut PartialDigest,
+    budget: u64,
+  ) -> Result<Option<Digest>, VfsError> {
+    let file = self.reopen_verified(store, partial.no, partial.fingerprint)?;
+    self.hash_slice(store, file, partial, budget)?;
+    if partial.done < partial.size {
+      return Ok(None);
+    }
+    // The whole file is hashed; re-verify once more against the disk and keep the identity.
+    self.reopen_verified(store, partial.no, partial.fingerprint)?;
+    let identity = *partial.hasher.finalize().as_bytes();
+    self.plane()?.digest_stats.computed += 1;
+    self.keep_digest(store, partial.no, partial.fingerprint, identity)?;
+    Ok(Some(Digest {
+      identity,
+      size: partial.size,
+    }))
+  }
+
+  /// Re-opens the file `no` names and refuses `DigestUnverified` (counted) unless its fingerprint
+  /// still equals `expected` — the disk, not the cache, is the authority across the slices of a
+  /// cooperative digest. The returned handle is the volume's cached descriptor, owned by the
+  /// descriptor cache (invalidated on a base change), never closed by the caller.
+  fn reopen_verified(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    expected: Fingerprint,
+  ) -> Result<HostFile, VfsError> {
+    let (file, fingerprint) = self.verify_current(store, no)?;
+    if fingerprint != expected {
       return Err(self.count_digest_refusal(VfsError::DigestUnverified));
     }
-    self.plane()?.digest_stats.computed += 1;
-    self.keep_digest(store, no, fingerprint, identity)?;
-    Ok(Digest {
-      identity,
-      size: fingerprint.size,
-    })
+    Ok(file)
+  }
+
+  /// Reads and hashes up to `budget` bytes of `file` from `partial.done`, updating the hasher and
+  /// the offset. A short read before the fingerprinted size is `DigestUnverified` (the file shrank
+  /// under the hash). One window per read, so the memory is bounded whatever the budget.
+  fn hash_slice(
+    &mut self,
+    store: &Store,
+    file: HostFile,
+    partial: &mut PartialDigest,
+    budget: u64,
+  ) -> Result<(), VfsError> {
+    let window = store.content.chunk_bytes().max(1);
+    let window_len = u64::try_from(window).unwrap_or(u64::MAX);
+    let mut buf = vec![0u8; window];
+    let mut hashed_this_slice: u64 = 0;
+    while partial.done < partial.size && hashed_this_slice < budget {
+      let remaining = partial.size - partial.done;
+      let want = usize::try_from(remaining.min(window_len).min(budget - hashed_this_slice))
+        .unwrap_or(window)
+        .min(window);
+      let n = self
+        .host
+        .read_at(file, partial.done, &mut buf[..want])
+        .map_err(host_refusal)?;
+      if n == 0 {
+        return Err(self.count_digest_refusal(VfsError::DigestUnverified));
+      }
+      partial.hasher.update(&buf[..n]);
+      let n = u64::try_from(n).unwrap_or(u64::MAX);
+      partial.done = partial.done.saturating_add(n);
+      hashed_this_slice = hashed_this_slice.saturating_add(n);
+    }
+    Ok(())
   }
 
   /// Keeps a freshly verified digest for reuse, unless the racy rule (§4.5) forbids it: a digest
@@ -1993,34 +2121,6 @@ impl Overlay<'_> {
     {
       l.entries = None;
     }
-  }
-
-  /// The BLAKE3 of an open file's first `size` bytes, read in windows of the store's chunk
-  /// size, so digesting a file costs one window of memory whatever its length (bounded work,
-  /// §4.3). A read that ends short of `size` means the file shrank under the hash:
-  /// `DigestUnverified`.
-  fn hash_file(&mut self, store: &Store, file: HostFile, size: u64) -> Result<[u8; 32], VfsError> {
-    let window = store.content.chunk_bytes().max(1);
-    let window_len = u64::try_from(window).unwrap_or(u64::MAX);
-    let mut buf = vec![0u8; usize::try_from(size.min(window_len)).unwrap_or(window)];
-    let mut hasher = blake3::Hasher::new();
-    let mut done: u64 = 0;
-    while done < size {
-      let want = usize::try_from((size - done).min(window_len)).unwrap_or(window);
-      let n = self
-        .host
-        .read_at(file, done, &mut buf[..want])
-        .map_err(host_refusal)?;
-      if n == 0 {
-        break;
-      }
-      hasher.update(&buf[..n]);
-      done = done.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
-    }
-    if done != size {
-      return Err(self.count_digest_refusal(VfsError::DigestUnverified));
-    }
-    Ok(*hasher.finalize().as_bytes())
   }
 
   /// Counts a digest refusal on the path it names and hands it back.

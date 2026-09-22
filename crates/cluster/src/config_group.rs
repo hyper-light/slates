@@ -23,14 +23,17 @@
 //! `slates_db::register` (`install_authority`/`prepare`) and [`crate`]
 //! (`promote_record`/`promote_under_configuration`), oracle-tested for Continuity and StaleNeverCommits.
 //!
-//! The **voter set follows the committed membership**: the council's voters are a pure function of its
-//! members ([`council_voters`] — the lowest ids up to the candidate floor `2f + 1`, "a small elected
-//! council per region"), so whenever a committed admit, retire or takeover changes the members, the leader
-//! moves the Raft voter set to match through the core's joint-consensus change
-//! ([`reconcile_voters`](RegionalCouncil::reconcile_voters)): a dead voter leaves the consensus set and
-//! stops counting toward every majority, and the next member in id order — a learner until then — is
-//! promoted in its place, so the council keeps tolerating `f` failures. Before this the voter set was fixed
-//! at boot and never shrank (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`).
+//! The **voter set follows the committed membership**: whenever a committed admit, retire or takeover frees
+//! or fills a seat, the leader moves the Raft voter set through the core's joint-consensus change
+//! ([`reconcile_voters`](RegionalCouncil::reconcile_voters)) to [`council_voters`] — up to the candidate
+//! floor `2f + 1` seats, "a small elected council per region": every sitting voter still a member keeps its
+//! seat, and a free seat goes only to a member the leader holds alive (the lowest id among them, a tiebreak
+//! with no other meaning). A voter taken over leaves the consensus set and stops counting toward every
+//! majority, and a live learner is promoted to its seat, so the council keeps tolerating `f` failures; an
+//! admission while every seat is held moves no voter. Before 2026-09-13 the voter set was fixed at boot and
+//! never shrank (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`); until 2026-09-22 it was the
+//! lowest member ids whatever their state, so a replacement admitted beside its unretired predecessor took
+//! a live voter's seat (`docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md`).
 //! Owed: the FencedRegister TLA+ revalidation for the per-host epoch fence (A-9, §4.8 lines 1710-1712).
 
 use std::mem::size_of;
@@ -167,19 +170,58 @@ pub enum Reconfiguration {
   TakeOver(HostId),
 }
 
-/// The council's voter set for the region `members` (§4.8, D-14 — "a small elected council per region"):
-/// the members with the lowest ids up to the candidate floor `2f + 1`, so the council tolerates `f` voter
-/// failures while staying small even in a large region; the members beyond it are **learners** that fetch
-/// the committed configuration rather than voting. Deterministic from the members (sorted by id), so every
-/// node computes the same voter set — the consensus group they all agree on. At `2f + 1` members or fewer
-/// every member votes (no learners), so a small fleet is unchanged. The boot-time voter set and the target
-/// the leader moves the Raft to after every committed membership change are both this function.
-pub fn council_voters(members: &[HostId], quorum: Quorum) -> Vec<HostId> {
-  let mut sorted = members.to_vec();
-  sorted.sort_unstable_by_key(|host| host.0);
-  sorted.dedup();
-  sorted.truncate(quorum.candidates().min(sorted.len()));
-  sorted
+/// The voter set the council moves to (§4.8, D-14 — "a small elected council per region"), in id order: up
+/// to the candidate floor `2f + 1` seats, so the council tolerates `f` voter failures while staying small in
+/// a large region; the members beyond it are **learners** that fetch the committed configuration rather than
+/// voting. At `2f + 1` members or fewer every member the leader holds alive votes.
+///
+/// - **A sitting voter keeps its seat while it is a member.** A seat is freed only by the member leaving the
+///   configuration — a confirmed, stable death taken over, or a retirement — never by a suspicion: moving the
+///   voter set on a revocable belief is the irreversible action the council's death-confirmation window
+///   exists to prevent (`docs/bugs/2026-09-17-council-retires-a-suspected-voter.md`).
+/// - **A free seat goes only to a member in `alive`** (the leader's authenticated-alive view), never to a
+///   suspected or dead one, so every promotion adds a voter that can vote.
+/// - **The id is only the tiebreak** among equally eligible members. A member id is derived from a
+///   certificate and a per-boot nonce, so it carries no meaning for voting: a replacement's fresh id lands
+///   anywhere in the order.
+///
+/// Until 2026-09-22 the voter set was the members with the lowest ids, whatever their state: a replacement
+/// admitted beside its not-yet-retired predecessor took a live voter's seat — the leader's own, in the KIND
+/// lane — while the dead predecessor kept one, and the replacement, which cannot observe its own
+/// predecessor's death, then led a council that never retired it
+/// (`docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md`). The voter set each node holds is
+/// the one committed through the Raft log's joint changes, so only the leader computes this target; it need
+/// not be a pure function of the members. More sitting members than seats (a lowered floor) keeps the ones
+/// the leader holds alive first, then the lowest ids. Cost: `O(n log n)` in the members, once per leader
+/// period.
+pub fn council_voters(
+  sitting: &[HostId],
+  members: &[HostId],
+  alive: &[HostId],
+  quorum: Quorum,
+) -> Vec<HostId> {
+  let seats = quorum.candidates();
+  let members: std::collections::BTreeSet<HostId> = members.iter().copied().collect();
+  let alive: std::collections::BTreeSet<HostId> = alive.iter().copied().collect();
+  let mut kept: Vec<HostId> = sitting
+    .iter()
+    .copied()
+    .filter(|host| members.contains(host))
+    .collect::<std::collections::BTreeSet<HostId>>()
+    .into_iter()
+    .collect();
+  kept.sort_by_key(|host| !alive.contains(host));
+  kept.truncate(seats);
+  let free = seats.saturating_sub(kept.len());
+  let promoted: Vec<HostId> = members
+    .iter()
+    .copied()
+    .filter(|host| alive.contains(host) && !kept.contains(host))
+    .take(free)
+    .collect();
+  kept.extend(promoted);
+  kept.sort_unstable_by_key(|host| host.0);
+  kept
 }
 
 /// The **regional configuration council** on one node (§4.8, D-14 — the "configuration master", a small
@@ -641,18 +683,19 @@ impl RegionalCouncil {
     self.raft.is_voter(node)
   }
 
-  /// **DRIVE** (leader): keeps the council's Raft voter set equal to [`council_voters`] of the committed
-  /// membership, one joint change at a time (Raft §6): when a committed admit, retire or takeover has moved
-  /// the members so that the target voter set differs from the one in force, the leader begins the joint
-  /// change to it; once that entry has committed (the log is caught up again) it completes the change; and
-  /// once `C_new` has committed the voters match the target and this is a no-op. Gated on
-  /// [`caught_up`](RegionalCouncil::caught_up) like [`reconcile_alive`](RegionalCouncil::reconcile_alive),
-  /// so a change in flight is never re-proposed. Returns whether it appended a configuration entry. A dead
-  /// voter thereby leaves the consensus set — it stops counting toward every majority — and the next member
-  /// in id order is promoted in its place, so the council keeps tolerating `f` failures; a leader the target
-  /// no longer names steps down once `C_new` commits (the core's rule) and the new voters elect among
-  /// themselves.
-  pub fn reconcile_voters(&mut self) -> bool {
+  /// **DRIVE** (leader): keeps the council's Raft voter set at [`council_voters`] of the committed membership,
+  /// the voters in force, and `alive` — this leader's authenticated-alive view — one joint change at a time
+  /// (Raft §6): when a committed admit, retire or takeover has freed or filled a seat so that the target
+  /// differs from the voter set in force, the leader begins the joint change to it; once that entry has
+  /// committed (the log is caught up again) it completes the change; and once `C_new` has committed the
+  /// voters match the target and this is a no-op. Gated on [`caught_up`](RegionalCouncil::caught_up) like
+  /// [`reconcile_alive`](RegionalCouncil::reconcile_alive), so a change in flight is never re-proposed.
+  /// Returns whether it appended a configuration entry. A voter taken over thereby leaves the consensus set —
+  /// it stops counting toward every majority — and a member the leader holds alive is promoted to its seat,
+  /// so the council keeps tolerating `f` failures; admitting a member while every seat is held moves no
+  /// voter. A leader the target no longer names (a lowered floor) steps down once `C_new` commits (the core's
+  /// rule) and the new voters elect among themselves.
+  pub fn reconcile_voters(&mut self, alive: &[HostId]) -> bool {
     if !self.is_leader() || !self.caught_up() {
       return false;
     }
@@ -660,8 +703,14 @@ impl RegionalCouncil {
       // The joint entry has committed: leave the joint phase for the new voter set alone.
       return self.raft.complete_membership_change();
     }
-    let target = council_voters(&self.configuration.members, self.configuration.quorum);
-    if target.is_empty() || target == self.raft.all_voters() {
+    let sitting = self.raft.all_voters();
+    let target = council_voters(
+      &sitting,
+      &self.configuration.members,
+      alive,
+      self.configuration.quorum,
+    );
+    if target.is_empty() || target == sitting {
       return false;
     }
     self.raft.begin_membership_change(target)
@@ -752,7 +801,10 @@ mod tests {
     groups.insert(C, joining);
     // Two configuration entries (joint, then final), each delivered and committed in two rounds.
     for _ in 0..(2 * 2) {
-      groups.get_mut(&OWNER).unwrap().reconcile_voters();
+      groups
+        .get_mut(&OWNER)
+        .unwrap()
+        .reconcile_voters(&[OWNER, A, C]);
       replicate_round(&mut groups, OWNER, &[OWNER, A, C]);
     }
     assert!(groups[&C].is_voter(C));
@@ -1215,7 +1267,7 @@ mod tests {
   /// ([`council_voters`]: the lowest ids up to the candidate floor of three).
   fn councils(members: &[HostId]) -> std::collections::BTreeMap<HostId, RegionalCouncil> {
     let quorum = Quorum { f: 1 };
-    let voters = council_voters(members, quorum);
+    let voters = council_voters(&[], members, members, quorum);
     members
       .iter()
       .map(|&node| {
@@ -1305,23 +1357,24 @@ mod tests {
 
   /// Drives the voter set to follow the committed membership through its three leader periods — begin the
   /// joint change, complete it once its entry committed, then find nothing more to do — with the
-  /// replication rounds each needs, returning what each period's `reconcile_voters` reported.
+  /// replication rounds each needs, the leader holding `alive` alive, returning what each period's
+  /// `reconcile_voters` reported.
   fn drive_voter_change(
     councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
     leader: HostId,
     reachable: &[HostId],
+    alive: &[HostId],
   ) -> [bool; 3] {
-    let began = councils
-      .get_mut(&leader)
-      .is_some_and(RegionalCouncil::reconcile_voters);
+    let period = |councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>| {
+      councils
+        .get_mut(&leader)
+        .is_some_and(|council| council.reconcile_voters(alive))
+    };
+    let began = period(councils);
     settle(councils, leader, reachable, 1);
-    let completed = councils
-      .get_mut(&leader)
-      .is_some_and(RegionalCouncil::reconcile_voters);
+    let completed = period(councils);
     settle(councils, leader, reachable, 2);
-    let more = councils
-      .get_mut(&leader)
-      .is_some_and(RegionalCouncil::reconcile_voters);
+    let more = period(councils);
     [began, completed, more]
   }
 
@@ -1363,7 +1416,7 @@ mod tests {
     // The voter set follows the committed membership: the joint change, then C_new, each committed by
     // the two survivors; then nothing more to do.
     assert_eq!(
-      drive_voter_change(&mut councils, OWNER, &survivors),
+      drive_voter_change(&mut councils, OWNER, &survivors, &survivors),
       [true, true, false],
       "began the joint change, completed it once committed, then settled"
     );
@@ -1396,8 +1449,132 @@ mod tests {
     );
   }
 
+  /// AC (§4.8, D-14; docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md): a replacement
+  /// admitted while its dead predecessor is still a member takes **no live voter's seat**. The KIND lane's
+  /// history, ids in its order (survivor < replacement < predecessor < leader): the owner's pod is killed, its
+  /// replacement authenticates under the same certificate with a fresh id and is admitted before the old id's
+  /// death has held for the confirmation window. No seat is free, so the voter set must not move; before the
+  /// fix it moved to the three lowest ids — the dead predecessor kept its seat and the live leader lost its
+  /// own, and the replacement, which can never observe its own predecessor's death, won the next election and
+  /// never retired it, so no takeover was ever assigned. Once the predecessor's death is confirmed and it is
+  /// taken over, its freed seat goes to the replacement and the leader keeps leading.
+  #[test]
+  fn a_replacement_admitted_before_its_predecessor_retires_takes_no_live_voters_seat() {
+    const SURVIVOR: HostId = HostId(10);
+    const REPLACEMENT: HostId = HostId(20);
+    const PREDECESSOR: HostId = HostId(30);
+    const LEADER: HostId = HostId(40);
+    let members = [SURVIVOR, PREDECESSOR, LEADER];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, LEADER, &members);
+    settle(&mut councils, LEADER, &members, 2);
+    assert!(councils[&LEADER].is_leader());
+
+    // The predecessor dies; its replacement is admitted first — alive, while the death is not yet confirmed.
+    let reachable = [SURVIVOR, LEADER];
+    let alive = [SURVIVOR, LEADER, REPLACEMENT];
+    let declared: Vec<(HostId, Option<DomainId>)> =
+      alive.iter().map(|host| (*host, None)).collect();
+    let admitted = councils
+      .get_mut(&LEADER)
+      .is_some_and(|leader| leader.reconcile_alive(&declared, &[]));
+    settle(&mut councils, LEADER, &reachable, 2);
+    let configured = &councils[&LEADER].configuration().members;
+    assert_eq!(
+      (
+        admitted,
+        configured.contains(&REPLACEMENT),
+        configured.contains(&PREDECESSOR)
+      ),
+      (true, true, true),
+      "the replacement is a member beside its unretired predecessor"
+    );
+
+    // No seat is free: every sitting voter is still a member, so the voter set stays where it is.
+    assert_eq!(
+      drive_voter_change(&mut councils, LEADER, &reachable, &alive),
+      [false, false, false],
+      "admitting a member moves no voter while every seat is held"
+    );
+    assert_eq!(
+      (
+        councils[&LEADER].is_leader(),
+        councils[&LEADER].is_voter(LEADER),
+        councils[&SURVIVOR].is_voter(LEADER),
+        councils[&LEADER].is_voter(REPLACEMENT),
+      ),
+      (true, true, true, false),
+      "the live leader keeps its seat and its leadership; the replacement waits as a learner"
+    );
+
+    // The predecessor's death is confirmed: it is taken over, and its freed seat goes to the replacement.
+    let retired = councils
+      .get_mut(&LEADER)
+      .is_some_and(|leader| leader.reconcile_alive(&declared, &[PREDECESSOR]));
+    settle(&mut councils, LEADER, &reachable, 2);
+    assert_eq!(
+      (
+        retired,
+        drive_voter_change(&mut councils, LEADER, &reachable, &alive)
+      ),
+      (true, [true, true, false]),
+      "the takeover committed, then the voter change began, completed and settled"
+    );
+    assert_eq!(
+      (
+        councils[&LEADER].is_leader(),
+        councils[&LEADER].voters(),
+        councils[&SURVIVOR].is_voter(PREDECESSOR),
+      ),
+      (true, vec![SURVIVOR, REPLACEMENT, LEADER], false),
+      "the replacement holds the predecessor's seat; the leader still leads; the dead id votes nowhere"
+    );
+  }
+
+  /// AC (§4.8, D-14; docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md): a seat freed by a
+  /// takeover goes only to a member the leader holds **alive** — never to one it merely suspects, whatever
+  /// its id. Four members at f=1: voters {OWNER, A, B}, learner C; B dies while C is suspected (in neither the
+  /// alive nor the dead set). The takeover frees B's seat and the voter set shrinks to the two live voters
+  /// rather than promoting C; once C's suspicion is refuted and it is alive again, it takes the free seat.
+  #[test]
+  fn a_free_seat_waits_for_a_member_the_leader_holds_alive() {
+    let members = [OWNER, A, B, C];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &[OWNER, A, B]);
+    settle(&mut councils, OWNER, &[OWNER, A, B], 2);
+    let survivors = [OWNER, A];
+    let declared: Vec<(HostId, Option<DomainId>)> =
+      survivors.iter().map(|host| (*host, None)).collect();
+    let taken_over = councils
+      .get_mut(&OWNER)
+      .is_some_and(|leader| leader.reconcile_alive(&declared, &[B]));
+    settle(&mut councils, OWNER, &survivors, 2);
+    assert_eq!(
+      (
+        taken_over,
+        drive_voter_change(&mut councils, OWNER, &survivors, &survivors)
+      ),
+      (true, [true, true, false]),
+      "B's takeover committed and the voter set moved once"
+    );
+    assert_eq!(
+      (councils[&OWNER].voters(), councils[&A].is_voter(C)),
+      (vec![OWNER, A], false),
+      "the freed seat stays empty while C is only suspected"
+    );
+
+    // C's suspicion is refuted: the leader holds it alive, so it takes the free seat.
+    let alive = [OWNER, A, C];
+    assert_eq!(
+      drive_voter_change(&mut councils, OWNER, &survivors, &alive),
+      [true, true, false],
+      "the live learner is promoted to the free seat"
+    );
+    assert_eq!(councils[&OWNER].voters(), vec![OWNER, A, C]);
+  }
+
   /// AC (§4.8, D-14 — "a small elected council"): beyond the candidate floor the extra members are learners;
-  /// when a voter dies the next member in id order is **promoted** to voter in its place, so the council
+  /// when a voter dies a learner the leader holds alive is **promoted** to voter in its place, so the council
   /// keeps tolerating `f` failures — and the promoted learner, which had *adopted* a fetched configuration
   /// as learners do, re-folds the committed log from the formed base, so its configuration equals the
   /// voters' exactly (members, version and the dead voter's fencing epoch, bumped once, not twice). Four
@@ -1430,9 +1607,9 @@ mod tests {
       "C was a learner beyond the candidate floor; B's takeover committed; C adopted the fetched configuration"
     );
 
-    // The voter set follows: C is the next member in id order, so it is promoted in B's place.
+    // The voter set follows: C is the one live learner, so it is promoted to B's freed seat.
     assert_eq!(
-      drive_voter_change(&mut councils, OWNER, &alive),
+      drive_voter_change(&mut councils, OWNER, &alive, &alive),
       [true, true, false]
     );
     assert_eq!(

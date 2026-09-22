@@ -4410,10 +4410,13 @@ async fn drive_config_council(
       // (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md). The window lets the refutation land first.
       let dead = stable_dead_council_members(s);
       s.council.reconcile_alive(&alive, &dead);
-      // The voter set follows the committed membership (Raft §6, one joint change at a time): a retired voter
-      // leaves the consensus set — it stops counting toward every majority — and the next member in id order
-      // is promoted in its place, so the council keeps tolerating `f` failures.
-      s.council.reconcile_voters()
+      // The voter set follows the committed membership (Raft §6, one joint change at a time): a voter taken
+      // over leaves the consensus set — it stops counting toward every majority — and a member this node
+      // holds alive is promoted to its seat, so the council keeps tolerating `f` failures; a sitting voter
+      // keeps its seat while it is a member, so an admission never displaces a live one
+      // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md).
+      let voting: Vec<HostId> = alive.iter().map(|(host, _)| *host).collect();
+      s.council.reconcile_voters(&voting)
     });
     drive_council_replication(&others, budget, in_flight).await;
     // CheckQuorum (Raft §6.2) on the election-timeout cadence: every derived base of leader periods the

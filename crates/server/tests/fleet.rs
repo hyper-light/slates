@@ -2643,11 +2643,21 @@ fn settle_initial_consensus(
     members.sort_unstable();
   }
   let root_voters: Vec<HostId> = regional.values().map(|members| members[0]).collect();
+  // Each region's council was created by its first daemon in `bootstrap_mesh`'s order.
+  let mut bootstrappers = std::collections::BTreeMap::<RegionId, &Daemon>::new();
+  for (daemon, region) in daemons.iter().zip(&assigned) {
+    bootstrappers.entry(*region).or_insert(daemon);
+  }
   let settled = audit_wait(|| {
+    let mut voters = std::collections::BTreeMap::<RegionId, Vec<HostId>>::new();
+    for (region, bootstrapper) in &bootstrappers {
+      let Some(settled) = region_voters(bootstrapper, &regional[region], quorum)? else {
+        return Ok(false);
+      };
+      voters.insert(*region, settled);
+    }
     all_hold(daemons.iter().zip(&assigned).map(|(daemon, region)| {
-      let members = &regional[region];
-      let voters = slates_cluster::config_group::council_voters(members, quorum);
-      initial_member_committed(daemon, members, &voters, &root_voters)
+      initial_member_committed(daemon, &regional[region], &voters[region], &root_voters)
     }))
   });
   assert!(
@@ -2667,6 +2677,26 @@ fn settle_initial_consensus(
       .collect::<Vec<_>>()
       .join("; ")
   );
+}
+
+/// The committed voter set of a region's council once its bootstrapper reports one of the rule's shape
+/// (§4.8, D-14): `min(2f + 1, members)` seats, every one a member, and the bootstrapper among them — a
+/// sitting voter keeps its seat. Which members took the other seats depends on the order the leader admitted
+/// them in (a free seat goes to a member it holds alive, the lowest id among those;
+/// docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md), so the set is read from the council,
+/// not predicted from the member ids. `None` until it has that shape.
+fn region_voters(
+  bootstrapper: &Daemon,
+  members: &[HostId],
+  quorum: Quorum,
+) -> Result<Option<Vec<HostId>>, ObserveError> {
+  let host = bootstrapper.member_identity()?;
+  let seats = quorum.candidates().min(members.len());
+  Ok(bootstrapper.council_voters()?.filter(|voters| {
+    voters.len() == seats
+      && voters.contains(&host)
+      && voters.iter().all(|voter| members.contains(voter))
+  }))
 }
 
 fn initial_member_committed(
@@ -4106,11 +4136,19 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
     .collect();
 
   assert_fleet_forms(&daemons, &hosts, &names);
-  // The council votes with the three lowest-id members (the candidate floor 2f+1 = 3); the other two are
-  // learners (hosts not among the three lowest ids).
-  let mut by_id = hosts.clone();
-  by_id.sort_by_key(|host| host.0);
-  let voters: Vec<HostId> = by_id.iter().take(3).copied().collect();
+  // The council votes with three members (the candidate floor 2f+1 = 3); the other two are learners. Which
+  // members hold the seats depends on the order the leader admitted them in — the bootstrapper keeps its
+  // seat and a free seat goes to a member the leader holds alive, the lowest id among those
+  // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md) — so the voters are read from the
+  // committed voter set, never predicted from the ids.
+  let mut voters: Vec<HostId> = Vec::new();
+  assert!(
+    audit_wait(|| daemons[0].council_voters().map(|committed| {
+      voters = committed.unwrap_or_default();
+      voters.len() == 3
+    })),
+    "the council's initial voter set committed: {voters:?}"
+  );
   let learner_hosts: Vec<HostId> = hosts
     .iter()
     .copied()

@@ -328,10 +328,12 @@ fn run_voter_removal_over_the_transport() -> RemovalOutcome {
       leader.reconcile_alive(&[(LEADER, None), (VOTER, None)], &[DEAD]);
       replicate(&mut leader, &mut endpoint).await;
       let dead_retired_at_leader = !leader.configuration().members.contains(&DEAD);
-      // The voter set follows: the joint change, then C_new, each committed by the live voter alone.
-      leader.reconcile_voters();
+      // The voter set follows: the joint change, then C_new, each committed by the live voter alone. The
+      // freed seat stays empty: no other member is alive to take it.
+      let alive = [LEADER, VOTER];
+      leader.reconcile_voters(&alive);
       replicate(&mut leader, &mut endpoint).await;
-      leader.reconcile_voters();
+      leader.reconcile_voters(&alive);
       replicate(&mut leader, &mut endpoint).await;
       // A further change commits under the new majority of two.
       leader.propose(Reconfiguration::Admit {
