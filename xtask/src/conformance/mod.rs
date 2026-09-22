@@ -28,6 +28,7 @@ mod hermeticity;
 mod mount;
 mod slates;
 mod suites;
+mod trace_process;
 mod workloads;
 
 use std::path::{Path, PathBuf};

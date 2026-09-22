@@ -10,17 +10,18 @@
 //! the CI macOS runner runs it.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 
 use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::Outcome;
 use slates_conformance::trace::{
-  Policy, judge, parse_fs_usage, parse_strace_with_cwd, strace_unnamed_paths,
+  Policy, fs_usage_has_activity, judge, parse_fs_usage, parse_strace_with_cwd, strace_unnamed_paths,
 };
 
-use super::slates::{Session, grant};
-use super::{Run, SuiteResult, pause, write_file};
+use super::slates::{MOUNT_WAIT, Session, grant};
+use super::trace_process::{StopSignal, TraceProcess};
+use super::{Run, SuiteResult, write_file};
 use crate::Failure;
 
 /// Format: the system calls strace traces: every call taking a path (`%file`) plus the
@@ -62,15 +63,21 @@ pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
 
 /// A running `sudo fs_usage` on one pid, writing to a log; stopped on drop.
 struct FsUsage {
-  child: Child,
+  process: TraceProcess,
+  errors: PathBuf,
 }
 
 impl FsUsage {
-  fn start(pid: u32, log: &Path) -> Result<FsUsage, Failure> {
+  fn start(session: &Session, log: &Path) -> Result<FsUsage, Failure> {
+    let pid = session.anchor.daemon_pid()?;
     #[allow(clippy::disallowed_methods)] // the development tool's own scratch log
     let file = std::fs::File::create(log)
       .map_err(|e| Failure(format!("creating {}: {e}", log.display())))?;
-    let child = Command::new("sudo")
+    let errors = log.with_extension("stderr.log");
+    #[allow(clippy::disallowed_methods)] // the development tool's own scratch diagnostics
+    let stderr = std::fs::File::create(&errors)?;
+    let mut command = Command::new("sudo");
+    command
       .args([
         "-n",
         "fs_usage",
@@ -83,22 +90,75 @@ impl FsUsage {
       ])
       .stdin(Stdio::null())
       .stdout(Stdio::from(file))
-      .stderr(Stdio::inherit())
+      .stderr(Stdio::from(stderr));
+    isolate_tracer(&mut command);
+    let child = command
       .spawn()
       .map_err(|e| Failure(format!("starting fs_usage: {e}")))?;
-    Ok(FsUsage { child })
+    let mut tracer = FsUsage {
+      process: TraceProcess::new(child, signal_tracer, MOUNT_WAIT),
+      errors,
+    };
+    let ready = tracer.process.wait_ready(|| {
+      // A new read-only CLI session generates shm/socket activity even when the mounted
+      // namespace is idle. The parsed event, rather than this CLI reply, proves attachment.
+      session
+        .binary
+        .run(&session.instance, &["volume", "list"])?
+        .expect_ok("tracer readiness probe")?;
+      Ok(fs_usage_has_activity(&std::fs::read_to_string(log)?))
+    });
+    tracer.check(ready)?;
+    eprintln!("hermeticity: fs_usage recorded activity from daemon {pid}");
+    Ok(tracer)
   }
 
-  fn stop(mut self) {
-    let _ = Command::new("sudo")
-      .args(["-n", "kill", "-INT", &self.child.id().to_string()])
-      .output();
-    let _ = self.child.wait();
+  fn stop(mut self) -> Result<(), Failure> {
+    let stopped = self.process.stop();
+    self.check(stopped)
+  }
+
+  fn check(&self, result: Result<(), Failure>) -> Result<(), Failure> {
+    let diagnostic = std::fs::read_to_string(&self.errors)?;
+    match result {
+      Err(error) => Err(Failure(format!("{error}; fs_usage: {}", diagnostic.trim()))),
+      Ok(()) if !diagnostic.trim().is_empty() => Err(Failure(format!(
+        "fs_usage diagnostic: {}",
+        diagnostic.trim()
+      ))),
+      Ok(()) => Ok(()),
+    }
   }
 }
 
-/// Shape: how long the tracer gets to flush after the lifecycle ends before the log is read.
-const TRACER_SETTLE_POLLS: u32 = 25;
+#[cfg(unix)]
+fn isolate_tracer(command: &mut Command) {
+  use std::os::unix::process::CommandExt;
+  command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn isolate_tracer(_command: &mut Command) {}
+
+/// sudo may supervise a distinct fs_usage child. Signal their owned process group so an
+/// early return cannot leave the privileged descendant tracing after its target is gone.
+fn signal_tracer(pid: u32, signal: StopSignal) -> Result<(), Failure> {
+  let signal = match signal {
+    StopSignal::Interrupt => "INT",
+    StopSignal::Kill => "KILL",
+  };
+  let output = Command::new("sudo")
+    .args(["-n", "/bin/kill", "-s", signal, "--", &format!("-{pid}")])
+    .output()?;
+  if !output.status.success() {
+    return Err(Failure(format!(
+      "signalling tracer group {pid}: {}: {}",
+      output.status,
+      String::from_utf8_lossy(&output.stderr).trim(),
+    )));
+  }
+  Ok(())
+}
 
 /// The landing flow through the CLI: snapshot, plan, grant, land; returns the written count.
 fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<u64, Failure> {
@@ -215,7 +275,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let size = (inode_count * std::mem::size_of::<slates_vfs::inode::Inode>()).to_string();
   let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
   let fs_usage = match run.os {
-    HostOs::Macos => Some(FsUsage::start(session.anchor.daemon_pid()?, &log)?),
+    HostOs::Macos => Some(FsUsage::start(&session, &log)?),
     _ => None,
   };
   let work = session.workdir("traced")?;
@@ -224,9 +284,18 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .current_dir(&work)
     .output()?;
   if !workload.status.success() {
+    let inspection = match Command::new("ls").arg("-laR").arg(&work).output() {
+      Ok(output) => format!(
+        "{}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+      ),
+      Err(error) => format!("listing the failed workload: {error}"),
+    };
     return Err(Failure(format!(
-      "the mount workload failed: {}",
-      String::from_utf8_lossy(&workload.stderr)
+      "the mount workload failed (quota {size} bytes, {inode_count} inodes): {}\nmounted tree: {inspection}",
+      String::from_utf8_lossy(&workload.stderr),
     )));
   }
   let target = run.scratch.subdir("land-target")?;
@@ -241,12 +310,10 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let verified = verify_landing(&target, &work);
   let Session { mount, anchor, .. } = session;
   drop(mount);
+  // Readiness is already established: keep observing through daemon teardown as well.
   anchor.stop();
   if let Some(tracer) = fs_usage {
-    tracer.stop();
-  }
-  for _ in 0..TRACER_SETTLE_POLLS {
-    pause();
+    tracer.stop()?;
   }
   let text = std::fs::read_to_string(&log)
     .map_err(|e| Failure(format!("reading {}: {e}", log.display())))?;

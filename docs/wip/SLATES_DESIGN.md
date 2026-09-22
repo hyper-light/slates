@@ -4988,6 +4988,12 @@ with the injection list; the benchmark write-up in the
    heartbeat. A real-process regression checks startup without a restart and that file creates,
    writes, renames and unlinks remain visible. This is not a replacement for the full mounted
    lifecycle verdict (`docs/bugs/2026-09-19-hermeticity-tracer-stops-unselected-syscalls.md`).
+   **macOS harness status (2026-09-22):** fs_usage must produce a complete parsed event
+   before mounted mutations begin. The harness owns its child, signals it on every early
+   return, and drains it after observing daemon teardown. An unsuccessful exit or diagnostic
+   (including lost trace events) refuses the evidence. Native mounted validation remains
+   open: the previous local run hit ENOSPC and recorded zero events before this correction
+   (`docs/bugs/2026-09-22-fs-usage-startup-and-ownership.md`).
 9. *Landing, concurrency.* Land a 500-entry delta into a tree while an outsider rewrites 50 of
    the targets at random moments. Expect: every outsider write that happened after validation is
    still on disk afterwards, every such entry is reported `Conflict(TargetInUse)` and remains in

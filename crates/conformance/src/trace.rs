@@ -679,10 +679,22 @@ fn read_row(raw: &str) -> Option<Row<'_>> {
   } else {
     TRAILING_TOKENS
   });
+  let elapsed = tokens.get(body_end)?.parse::<f64>().ok()?;
+  if !elapsed.is_finite() || elapsed < 0.0 {
+    return None;
+  }
   for token in tokens.get(2..body_end)? {
     read_token(token, &mut row);
   }
   Some(row)
+}
+
+/// Whether a complete fs_usage event has arrived, including read-only activity. Startup
+/// banners, diagnostics and a partially flushed final row do not establish attachment.
+pub fn fs_usage_has_activity(log: &str) -> bool {
+  log
+    .split_inclusive('\n')
+    .any(|line| line.ends_with('\n') && read_row(line).is_some())
 }
 
 fn read_token<'a>(token: &'a str, row: &mut Row<'a>) {
@@ -800,6 +812,22 @@ fn fs_usage_descriptor_event(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-4.5: only a complete event establishes tracer readiness, including read-only activity.
+  #[test]
+  fn fs_usage_readiness_requires_a_complete_event() {
+    let read = "08:20:01.000001 read F=5 B=0x4 0.000001 W slates.123";
+    for incomplete in [
+      "",
+      "fs_usage: buffer overrun\n",
+      "08:20:01.000001 write W slates.123\n",
+      read,
+    ] {
+      assert!(!fs_usage_has_activity(incomplete), "{incomplete}");
+    }
+    assert!(fs_usage_has_activity(&format!("{read}\n")));
+    assert!(parse_fs_usage(&format!("{read}\n")).is_empty());
+  }
 
   const TARGET: &str = "/scratch/land-target";
 

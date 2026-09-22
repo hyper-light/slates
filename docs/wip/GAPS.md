@@ -30,8 +30,15 @@
 > The repair batch now passes the Linux workspace (1,564 functions; opt-in gates still
 > need their dedicated runs), all 49 fleet histories, structural checks, and the full
 > mounted NFS adapter sequence: nine identical workloads, no unexpected pjdfstest failure,
-> and no unresolved or outside traced write. Native FUSE, macOS tracing and Linux Helm
-> remain distinct verification obligations; the separate parser fix passes 49 pure cases.
+> and no unresolved or outside traced write. Linux Helm 4.3.0 now separately passes its
+> four chart gates in 0.05 s after checksum verification. The dedicated native FUSE
+> regressions also pass (0.39 s and 0.01 s), followed by the real CLI gate (10 functions;
+> macOS-only branches skip), 50 conformance cases and six tracer lifecycle cases.
+> macOS tracing remains a distinct verification obligation.
+> The privileged macOS reproduction reached ENOSPC before fs_usage attached. The harness
+> now waits for an observed event, owns cancellation and requires successful draining
+> after observing daemon teardown. Native proof and the separate space refusal remain open
+> (`2026-09-22-fs-usage-startup-and-ownership.md`); no quota or landing assertion was relaxed.
 
 > **CI fixture correction (2026-09-21).** Run 35604717581 exposed channel waiting-state
 > allocation inside both allocator-counter fixtures and a status-paging fixture that shrank

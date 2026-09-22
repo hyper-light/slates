@@ -36,8 +36,20 @@ authorized merely by appearing here.
   Script/log: `/private/tmp/slates-ci-35615970514-linux{.sh,-validation.log}`.
   This adapter does not cover native FUSE. The workspace's opt-in steps still need their
   dedicated runs; in particular Helm was absent and returned through its environment gate.
-- [ ] **Linux Helm.** Container-only Helm 4.3.0 is authorized. Run the prepared checksum-
-  verifying `/private/tmp/slates-ci-35615970514-linux-helm.sh` after the macOS trace.
+- [x] **Linux Helm.** Checksum-verified Helm 4.3.0 passes all four chart tests in 0.05 s
+  inside the disposable Linux container. The deliberate golden writer remains ignored.
+  Script/log: `/private/tmp/slates-ci-35615970514-linux-helm.{sh,log}`.
+- [x] **Dedicated Linux FUSE and CLI rerun.** On `628962b` plus the tracer changes, both
+  ordinary-user FUSE mount regressions pass (0.39 s and 0.01 s). The real CLI command
+  returns 10 passed in 8.17 s; macOS-only branches explicitly skip, while the provisioned
+  recovery-key and three-process fleet histories execute. Six tracer lifecycle cases,
+  50 conformance cases and `xtask check` also pass under the io_uring-required container.
+  Script/log: `/private/tmp/slates-ci-35615970514-native-and-tracer-linux.{sh,log}`.
+- [ ] **Native tracer verification.** The authorized Terminal reproduction reached ENOSPC
+  at `d/f2`, followed by `ktrace_start: No such process` and a zero-byte trace. Startup now
+  requires a parsed event; owned cleanup covers errors and successful draining follows daemon teardown.
+  Real child-process regressions cover readiness and cleanup; rerun the mounted command.
+  The quota and exact landing assertions are unchanged. See the dated fs_usage ownership report.
 - [ ] **Broader CI audit.** Follow `docs/bugs/2026-09-22-ci-failure-pattern-audit.md`:
   async acknowledgment/pending-reply bounds, fs_usage readiness and ownership, pjdfstest
   child errors, macOS NFS capability cases, and initial KIND formation A↔B↔C without A↔C.
