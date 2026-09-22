@@ -106,9 +106,16 @@ change is still one joint change at a time, committed by majorities of both sets
 2. **Root-group representatives follow id order too.** `root_representatives` picks the lowest-id alive
    host per region, so a lower-id replacement moves the root voter. That is churn, not a stuck group:
    the new representative is alive. The same incumbency rule would remove it. Owed.
-3. **The KIND lane's failure report could not show this.** The takeover diagnostic asks `status <id>`,
-   which answers `NotFound`, instead of the daemon's counters, and neither the formation nor the
-   takeover report prints the council's committed voters. This diagnosis needed a live cluster.
+3. **The KIND lane's failure report could not show this.** The takeover diagnostic asked `status <id>`,
+   which answers `NotFound`, instead of the daemon's counters; neither the formation nor the takeover
+   report printed the council's committed voters; and the view's `resolve_refused` matched only the
+   unnamed `fleet.resolve` kind, so it read 0 whatever lookups failed. This diagnosis needed a live
+   cluster. **Fixed in the follow-up change:** every failed fleet wait and the takeover wait now report
+   each pod's node and IP, fleet and session counters, every refusal summed by kind, the committed
+   council voters and the last 80 log lines (`Lane::fleet_diagnostics`), and `resolve_refused` sums
+   every `fleet.resolve.*` kind (`kind::tests::a_views_resolve_refusals_sum_every_lookup_failure_kind`
+   failed before: 1 counted of 6). Exercised on the local cluster by scaling to two pods: the formation
+   wait failed at 180 s with every block present and slates-1 reporting 45 `fleet.resolve.refused`.
 4. **The initial-formation failure of run 35615970514** (slates-0 and slates-2 each probing only
    slates-1 for 180 s) is a different failure and was not reproduced here: 14 local formations
    (8 unfixed, 6 fixed), all formed in 0.2 to 0.3 s.

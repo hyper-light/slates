@@ -664,7 +664,10 @@ impl View {
               .unwrap_or_default()
           })
           .filter(|refusal| {
-            refusal.get("kind").and_then(serde_json::Value::as_str) == Some("fleet.resolve")
+            refusal
+              .get("kind")
+              .and_then(serde_json::Value::as_str)
+              .is_some_and(is_resolve_refusal)
           })
           .map(|refusal| u64_of(&refusal, "count"))
           .sum()
@@ -707,6 +710,42 @@ impl View {
       self.resolve_refused
     )
   }
+}
+
+/// A status document's fleet block (members, probe and session counters, council and root timing) and
+/// every refusal its shards counted, summed by kind — the counters a failed fleet wait is read by.
+fn status_counters(status: &serde_json::Value) -> String {
+  let mut refusals = std::collections::BTreeMap::<String, u64>::new();
+  for shard in status
+    .get("shards")
+    .and_then(serde_json::Value::as_array)
+    .into_iter()
+    .flatten()
+  {
+    for refusal in shard
+      .get("refusals")
+      .and_then(serde_json::Value::as_array)
+      .into_iter()
+      .flatten()
+    {
+      if let Some(kind) = refusal.get("kind").and_then(serde_json::Value::as_str) {
+        let total = refusals.entry(kind.to_owned()).or_insert(0);
+        *total = total.saturating_add(u64_of(refusal, "count"));
+      }
+    }
+  }
+  format!(
+    "fleet={} refusals={refusals:?}",
+    status.get("fleet").cloned().unwrap_or_default()
+  )
+}
+
+/// Whether a counted refusal is a name lookup that failed at a dial: the daemon counts each under its kind,
+/// `fleet.resolve.<kind>` (`timeout`, `refused`, `no-address`, `malformed`, `io`, `no-resolver`), and an
+/// unnamed one as `fleet.resolve`. Until 2026-09-22 the view matched only the unnamed one, so a formation
+/// report's `resolve_refused=0` said nothing about whether the peers' names resolved.
+fn is_resolve_refusal(kind: &str) -> bool {
+  kind == "fleet.resolve" || kind.starts_with("fleet.resolve.")
 }
 
 /// A member count as the fleet counts it.
@@ -1055,6 +1094,41 @@ impl Lane {
     pods.iter().map(|pod| self.view(pod)).collect()
   }
 
+  /// What a failed fleet wait leaves for diagnosis once the cluster is deleted: where every pod runs, and
+  /// for each pod its fleet and session counters, every refusal it counted (the dial, resolve, accept and
+  /// probe counters), the council's committed voters (`recovery-plan region`) and its last log lines — the
+  /// first occurrence of each dial or resolve failure is logged there by name. Before 2026-09-22 a failed
+  /// formation printed one summary line per pod and a failed takeover its volume refusal, and neither
+  /// could tell a pod-network or name failure from a council that never retired the dead owner
+  /// (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md). Best effort: a question a pod
+  /// cannot answer is reported as such, never allowed to hide the failure being reported.
+  fn fleet_diagnostics(&self, pods: &[String]) -> String {
+    /// Shape: the log lines kept per pod — the boot lines, the derived values and the first-occurrence
+    /// refusal lines a daemon writes.
+    const LOG_TAIL: &str = "80";
+    let answer = |outcome: Result<Outcome, Failure>| match outcome {
+      Ok(outcome) if outcome.code == 0 => outcome.stdout.trim().to_owned(),
+      Ok(outcome) => format!("(exit {}: {})", outcome.code, outcome.stderr.trim()),
+      Err(failure) => format!("({})", failure.0),
+    };
+    let mut out = format!(
+      "\n--- pods:\n{}",
+      answer(self.kubectl(&["get", "pods", "-o", "wide"]))
+    );
+    for pod in pods {
+      let status = answer(self.verb(pod, &["status"]));
+      let counters = serde_json::from_str::<serde_json::Value>(&status)
+        .map(|status| status_counters(&status))
+        .unwrap_or(status);
+      out.push_str(&format!(
+        "\n--- {pod} status: {counters}\n--- {pod} council: {}\n--- {pod} log (last {LOG_TAIL} lines):\n{}",
+        answer(self.verb(pod, &["recovery-plan", "region"])),
+        answer(self.kubectl(&["logs", pod, "--tail", LOG_TAIL]))
+      ));
+    }
+    out
+  }
+
   /// Polls `pods` until `formed` holds of their views or `bound` passes; returns the views and the time.
   fn wait_views(
     &self,
@@ -1075,8 +1149,9 @@ impl Lane {
           .map(|view| view.as_ref().map_or("(no answer)".to_owned(), View::line))
           .collect();
         return Err(Failure(format!(
-          "kind: {what} did not happen within {bound:?}:\n{}",
-          lines.join("\n")
+          "kind: {what} did not happen within {bound:?}:\n{}{}",
+          lines.join("\n"),
+          self.fleet_diagnostics(pods)
         )));
       }
       pause(POLL_CLUSTER);
@@ -1205,7 +1280,8 @@ impl Lane {
       "kind: both survivors retired the dead owner {owner_host} {:.1} s after the delete",
       retired_in.as_secs_f64()
     );
-    let (successor, served_in) = self.wait_successor(&survivors, &id, killed_at)?;
+    let every_pod: Vec<String> = (0..n).map(|index| self.pod(index)).collect();
+    let (successor, served_in) = self.wait_successor(&survivors, &every_pod, &id, killed_at)?;
     eprintln!(
       "kind: {successor} took the volume over and serves it placed {:.1} s after the delete",
       served_in.as_secs_f64()
@@ -1283,10 +1359,12 @@ impl Lane {
   }
 
   /// Polls the survivors' `volume stat` until one serves the volume placed; returns it and the time since
-  /// `since`.
+  /// `since`. On the bound, `diagnosed` (every pod, the replacement included) is reported with
+  /// [`Lane::fleet_diagnostics`].
   fn wait_successor(
     &self,
     survivors: &[String],
+    diagnosed: &[String],
     id: &str,
     since: Instant,
   ) -> Result<(String, Duration), Failure> {
@@ -1311,29 +1389,23 @@ impl Lane {
       }
       if since.elapsed() > TAKEOVER_WAIT {
         // Name why no survivor served, rather than only that none did: each survivor's `volume stat`
-        // refusal (a successor that never took over answers `NotFound`) and its daemon's counted
+        // refusal (a successor that never took over answers `NotFound`), then every pod's counted
         // refusals (`fleet.materialize` if `materialize_taken_over` refused — a budget or a malformed
-        // archive — so the next run reads the cause instead of a bare timeout).
+        // archive) and the council's committed voters — a takeover is assigned only once the council
+        // retires the dead owner, so a voter set still holding it is the cause to read first
+        // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md). Until 2026-09-22 this
+        // asked `status <id>` of the daemon, which answers `NotFound` for the volume, not its counters.
         let mut why = String::new();
         for survivor in survivors {
           let stat = self.verb(survivor, &["volume", "stat", id]);
-          let status = self.verb(survivor, &["status", id]);
           why.push_str(&format!(
-            "\n  {survivor}: volume stat -> {}; status refusals -> {}",
+            "\n  {survivor}: volume stat -> {}",
             stat.map_or_else(|e| e.0, |o| format!("exit {}: {}", o.code, o.stderr.trim())),
-            status.map_or_else(
-              |e| e.0,
-              |o| {
-                serde_json::from_str::<serde_json::Value>(&o.stdout)
-                  .ok()
-                  .and_then(|v| v.get("shards").cloned())
-                  .map_or_else(|| o.stderr.trim().to_owned(), |shards| shards.to_string())
-              }
-            )
           ));
         }
         return Err(Failure(format!(
-          "kind: no survivor served the volume within {TAKEOVER_WAIT:?} of the delete:{why}"
+          "kind: no survivor served the volume within {TAKEOVER_WAIT:?} of the delete:{why}{}",
+          self.fleet_diagnostics(diagnosed)
         )));
       }
       pause(POLL_CLUSTER);
@@ -1464,5 +1536,45 @@ impl Lane {
       )));
     }
     Ok(finding)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::View;
+
+  /// A `slates status --json` document with the fleet block the lane reads and one shard's refusals.
+  fn status_with_refusals(refusals: &[(&str, u64)]) -> serde_json::Value {
+    let refusals: Vec<serde_json::Value> = refusals
+      .iter()
+      .map(|(kind, count)| serde_json::json!({ "kind": kind, "count": count }))
+      .collect();
+    serde_json::json!({
+      "fleet": {
+        "host": 7,
+        "f": 1,
+        "members": [7],
+        "peers_probed": 0,
+        "council": { "leads": true, "base_periods": 10, "span_periods": 10 },
+      },
+      "shards": [{ "refusals": refusals }],
+    })
+  }
+
+  /// docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md (the lane's evidence): a pod whose
+  /// dials failed to resolve a peer's name reports it. The daemon counts each lookup failure under its kind
+  /// (`fleet.resolve.timeout`, `.refused`, `.no-address`, `.malformed`, `.io`, `.no-resolver`) and only an
+  /// unnamed one under `fleet.resolve`; the view sums them all, and counts nothing else.
+  #[test]
+  fn a_views_resolve_refusals_sum_every_lookup_failure_kind() {
+    let status = status_with_refusals(&[
+      ("fleet.resolve.timeout", 3),
+      ("fleet.resolve.refused", 2),
+      ("fleet.resolve", 1),
+      ("fleet.resolved_elsewhere", 100),
+      ("fleet.dial.redial", 40),
+    ]);
+    let view = View::parse("slates-0", &status).expect("the document parses");
+    assert_eq!(view.resolve_refused, 6);
   }
 }
