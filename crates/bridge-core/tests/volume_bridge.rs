@@ -274,6 +274,37 @@ fn a_created_object_takes_the_request_group_when_the_credential_names_one() {
   assert_eq!((link.uid, link.gid), (501, 20));
 }
 
+/// AC-3.10 / §4.6: one admitted mount can serve multiple Unix callers. All creation kinds
+/// take each request's owner and group while the attachment's enrolled principal stays fixed.
+#[test]
+fn every_created_kind_takes_the_current_requests_unix_owner() {
+  use slates_vfs::inode::Kind;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let mut cx = rw_cx_as(0);
+  let root = oid(bridge.root(&cx).unwrap());
+  for uid in [1001, 1002] {
+    cx.owner_uid = Some(uid);
+    cx.owner_gid = Some(uid);
+    let dir = bridge.mkdir(root, &cx, &format!("{uid}"), 0o700).unwrap();
+    let parent = oid(dir.ino);
+    let (file, handle) = bridge.create(parent, &cx, "file", 0o600, 0).unwrap();
+    let link = bridge.symlink(parent, &cx, "link", "file").unwrap();
+    let fifo = bridge
+      .mknod(parent, &cx, "fifo", 0o600, Kind::Fifo)
+      .unwrap();
+    let socket = bridge
+      .mknod(parent, &cx, "socket", 0o600, Kind::Socket)
+      .unwrap();
+    for node in [dir, file, link, fifo, socket] {
+      let attr = bridge.getattr(oid(node.ino), &cx).unwrap();
+      assert_eq!((attr.uid, attr.gid), (uid, uid), "{:?}", node.kind);
+    }
+    bridge.release(oid(file.ino), &cx, handle).unwrap();
+  }
+}
+
 /// `RENAME_NOREPLACE` fails onto an existing name and succeeds onto a free one — the flag is
 /// honored, not dropped and turned into an ordinary replacing rename (BUG-10).
 #[test]

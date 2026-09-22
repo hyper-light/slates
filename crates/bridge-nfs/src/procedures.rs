@@ -344,6 +344,9 @@ impl<'b> Export<'b> {
   /// no longer be established" case, which the caller maps to a `STALE`/`ACCES` NFS status.
   fn op_context(&self) -> Result<OpContext, VfsError> {
     let mut context = self.attachments.get().context(self.attachment)?;
+    // A shared attachment carries the mount's authority across requests. File ownership follows
+    // this request's Unix caller, which may differ from the user who issued MOUNT (§4.13).
+    context.owner_uid = (self.caller.uid != access::INVALID_UID).then_some(self.caller.uid);
     // Overlay the caller's primary group onto the authenticated context: the attachment registry
     // carries only the authenticated identity (uid-only), and the group is file ownership the export
     // edge supplies.
@@ -830,6 +833,16 @@ impl<'b> Export<'b> {
     // directory only the entry's owner, the directory's owner or the superuser may remove it.
     let dir_node = self.writable_directory(&dir_identity)?;
     let dir_attr = Some(self.fattr3(&dir_node));
+    // Dot components name directories that cannot be removed through these entries (§4.6).
+    // They are not stored names: a lookup would return NOENT, which NFS clients can interpret
+    // as a successful retry of RMDIR (Apple nfs3_vnop_rmdir), falsely reporting a removal.
+    if is_dir {
+      match name.as_str() {
+        "." => return Err((Nfsstat3::Inval, dir_attr)),
+        ".." => return Err((Nfsstat3::Notempty, dir_attr)),
+        _ => {}
+      }
+    }
     let entry = self
       .bridge
       .lookup(parent, &cx, &name)

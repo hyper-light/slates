@@ -144,6 +144,11 @@ pub struct OpContext {
   /// attachment's generation, so a request admitted before it and one admitted after carry
   /// different values and no write can straddle both.
   pub generation: u64,
+  /// The Unix uid to stamp on a created object, when the transport supplies a per-request
+  /// caller (NFS AUTH_SYS, or uid 0 for AUTH_NONE). This is ownership metadata, never attachment
+  /// authority: a shared mount can serve different users without changing its enrolled subject.
+  /// Without a Unix caller, creation uses the enrolled principal's account (§4.6, §4.13).
+  pub owner_uid: Option<u32>,
   /// The POSIX group a created object takes, when the request's credential names one (an NFS
   /// `AUTH_SYS` gid). `None` when it does not — for `AUTH_NONE`, and for transports with no such
   /// credential (FUSE, FSKit) — and the object then inherits its parent directory's group (the
@@ -310,6 +315,7 @@ impl Attachments {
       rights: attachment.rights,
       epoch: attachment.epoch,
       generation: attachment.generation,
+      owner_uid: None,
       // Set by the transport edge that has a credential group (the NFS export overlays the mounting
       // user's gid); the attachment registry itself carries no group.
       owner_gid: None,

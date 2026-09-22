@@ -264,7 +264,7 @@ fn with_export<R>(
   // admitted on the capability's first request, so a barrier the owner runs over the volume sees this
   // request in flight and closes the mount's generation with the others. The subject is the attachment
   // record's principal, never the request's uid.
-  let admitted = admit_mount(s, volume, capability, &subject, rights)?;
+  let admitted = admit_mount(s, volume, capability, rights)?;
   let ShardState {
     store,
     volumes,
@@ -301,20 +301,15 @@ fn admit_mount(
   s: &mut ShardState,
   volume: VolumeId,
   capability: MountCapability,
-  subject: &Principal,
   rights: Rights,
 ) -> Option<slates_bridge_core::AttachmentId> {
   if let Some(mount) = s.mount_attachments.get(&capability.0) {
     return Some(mount.registry);
   }
+  let subject = s.db.partition().attachment(capability.0)?.principal.clone();
   let registry = s
     .attachments
-    .attach(
-      volume,
-      slates_bridge_core::View::Current,
-      subject.clone(),
-      rights,
-    )
+    .attach(volume, slates_bridge_core::View::Current, subject, rights)
     .ok()?;
   s.mount_attachments.insert(
     capability.0,

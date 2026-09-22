@@ -249,6 +249,78 @@ fn a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writ
   daemon.stop();
 }
 
+/// MKDIR's directory, name and mode-only attributes; ownership comes from AUTH_SYS.
+fn mkdir_args(directory: &[u8], name: &str) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(directory, &mut args);
+  opaque(name.as_bytes(), &mut args);
+  for word in [1_u32, 0o700, 0, 0, 0, 0, 0] {
+    args.extend_from_slice(&word.to_be_bytes());
+  }
+  args
+}
+
+/// A Unix caller owns its new directory, can populate it, and excludes other callers.
+fn assert_creation_as(stream: &mut TcpStream, root: &[u8], uid: u32) {
+  use common::nfs::{NFS_PROGRAM, owner_and_mode, read_opaque};
+  let args = mkdir_args(root, &format!("user-{uid}"));
+  let reply = call_as(stream, NFS_PROGRAM, 9, &args, 3, uid);
+  assert_eq!(status(&reply), 0, "first MKDIR by uid {uid}");
+  let directory = read_opaque(&reply, 8).0;
+  let ownership = owner_and_mode(stream, &directory, 4);
+  assert_eq!(ownership, (0o700, uid, uid));
+  let nested = mkdir_args(&directory, "child");
+  assert_eq!(status(&call_as(stream, NFS_PROGRAM, 9, &nested, 5, uid)), 0);
+  assert_eq!(
+    status(&call_as(
+      stream,
+      NFS_PROGRAM,
+      9,
+      &mkdir_args(&directory, "foreign"),
+      6,
+      uid + 1
+    )),
+    NFS3ERR_ACCES,
+    "a different caller cannot create in the private directory"
+  );
+}
+
+/// AC-3.10 / §4.6: each creation takes the requesting Unix user's ownership, even when MOUNT
+/// admitted the shared attachment under another identity. The same mount serves multiple users;
+/// nested creation must work and another user must still be refused by its directory's mode.
+#[test]
+fn a_mount_preserves_each_requests_unix_owner_across_shards() {
+  use common::nfs::NFS_PROGRAM;
+  let (daemon, instance) = two_shard_daemon("nfs-request-owner");
+  let mut client = Client::connect(&instance);
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  stream.set_read_timeout(Some(CREDIT_WAIT)).unwrap();
+  stream.set_write_timeout(Some(CREDIT_WAIT)).unwrap();
+  // Shape: the two actual owner partitions, and two distinct ordinary Unix users.
+  for partition in 0..2 {
+    let name = (0..32)
+      .map(|suffix| format!("ownership-{suffix}"))
+      .find(|name| slates_server::verbs::owner_of_name(name, 2) == partition)
+      .expect("both owner partitions have a fixture name");
+    assert!(matches!(
+      client.call(&scratch(&name)),
+      ReplyBody::Created { .. }
+    ));
+    let root = mount(&mut stream, &capability_path(&daemon, &name), 1);
+    let mut chmod = Vec::new();
+    opaque(&root, &mut chmod);
+    for word in [1_u32, 0o777, 0, 0, 0, 0, 0, 0] {
+      chmod.extend_from_slice(&word.to_be_bytes());
+    }
+    assert_eq!(status(&call(&mut stream, NFS_PROGRAM, 2, &chmod, 2)), 0);
+    for uid in [1001_u32, 1002] {
+      assert_creation_as(&mut stream, &root, uid);
+    }
+  }
+  daemon.stop();
+}
+
 /// The daemon serves a volume that lives on a shard OTHER than the one the NFS listener is on, over the
 /// cross-shard bridge queue: the request is routed to the volume's owning shard, served there against
 /// that shard's real state, and the reply routed back — a write over NFS reads back over NFS.

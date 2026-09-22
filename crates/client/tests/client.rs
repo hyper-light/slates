@@ -226,14 +226,14 @@ fn assert_served_after_restart(
 /// Exactly-once across the restart: the retry answers from the replayed completion record.
 fn assert_retry_meets_record(
   client: &mut Client,
-  kept: slates_client::VolumeId,
+  uncertain: slates_client::VolumeId,
   create_id: slates_wire::request::RequestId,
 ) {
   let retried = client
     .retry(
       create_id,
       &RequestBody::Create {
-        name: "kept".to_owned(),
+        name: "uncertain".to_owned(),
         size: SizeClass::Bounded { limit: 1 << 20 },
         names: NamePolicy::Exact,
         require_locked: false,
@@ -243,22 +243,43 @@ fn assert_retry_meets_record(
     .unwrap();
   assert_eq!(
     retried,
-    slates_ipc::protocol::ReplyBody::Created { id: kept },
+    slates_ipc::protocol::ReplyBody::Created { id: uncertain },
     "the original reply, not a second create"
   );
-  wait_until_listed(client, &["before-restart", "kept"]);
+  assert_eq!(
+    client.reconnects(),
+    1,
+    "the retry reached the replacement daemon"
+  );
+  wait_until_listed(client, &["before-restart", "kept", "uncertain"]);
+}
+
+/// Lose the completed transport reply without acknowledging its durable completion. A subsequent
+/// retry must read the replacement daemon's record, with no old ring reply left to satisfy it.
+fn discard_reply(client: &mut Client, request: slates_wire::request::RequestId) {
+  let waiting = Instant::now();
+  while client.poll_reply(request).unwrap().is_none() {
+    assert!(
+      waiting.elapsed() < START_WAIT,
+      "the committed create must reply"
+    );
+    std::thread::yield_now();
+  }
 }
 
 /// A session outlives a daemon restart over the same segment (the test plays the anchor):
 /// the client's next call finds the daemon gone, reconnects under its id and is served by
 /// the restarted daemon, which recovered the volume and its snapshot from anchor-owned RAM; its
-/// retry of the create it made before meets the completion record (the same id, no second
-/// volume); a second client cannot take the live session.
+/// retry of a create whose reply was discarded without acknowledgment meets its completion (same id,
+/// no second volume), while an acknowledged create stays refused; a second client cannot
+/// take the live session. AC-2.3, §4.7: completions are retained until acknowledged.
 #[test]
 fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record() {
   let profile = profile();
   let instance = format!("cl-resume-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  // Shape: a small supported ring, so periodic acknowledgement runs during the scenario.
+  config.region.slots = 4;
   // The test plays the anchor: it holds the segment and its content object across both daemons, so
   // anchor-owned volume storage survives the restart (§4.8). The content object is two reserve-sized
   // slots per shard (the recovery image is a double buffer — the committed image and the one being
@@ -293,11 +314,34 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   let create_id = client.last_request();
   let snapshot = client.snapshot(kept).unwrap();
   assert_eq!(client.status(kept).unwrap().snapshots, 1);
-  let session = client.session();
+  client.acknowledge_all().unwrap();
   let mut exited = connect(&instance);
   let before_restart = exited.create(&scratch("before-restart")).unwrap();
   let silent = connect(&instance);
   let highest_issued = silent.client_id();
+  // Send without acknowledging its completion. A separate client observes the committed effect,
+  // so the restart must replay the completion rather than merely execute an unsent request.
+  let uncertain_request = client
+    .begin(&RequestBody::Create {
+      name: "uncertain".to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  wait_until_listed(&mut exited, &["before-restart", "kept", "uncertain"]);
+  let uncertain = exited
+    .list()
+    .unwrap()
+    .into_iter()
+    .find(|volume| volume.name == "uncertain")
+    .unwrap()
+    .id;
+  // Discard the old transport reply without acknowledging it. Leaving it on the old ring would
+  // let retry return that buffered reply and falsely certify recovery's completion record.
+  discard_reply(&mut client, uncertain_request);
+  let session = client.session();
   drop(exited);
   drop(silent);
   first.stop();
@@ -316,8 +360,21 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
     fresh.client_id() > highest_issued,
     "even a client that ran no verb reserved its id before the restart"
   );
+  assert_retry_meets_record(&mut client, uncertain, uncertain_request);
   assert_served_after_restart(&mut client, kept, session, snapshot);
-  assert_retry_meets_record(&mut client, kept, create_id);
+  assert!(matches!(
+    client.retry(
+      create_id,
+      &RequestBody::Create {
+        name: "kept".to_owned(),
+        size: SizeClass::Bounded { limit: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      }
+    ),
+    Err(ClientError::Refused(Refusal::DuplicateRequest))
+  ));
   // New work continues under the session's sequence.
   let more = client.create(&scratch("more")).unwrap();
   assert_ne!(more, kept);

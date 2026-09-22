@@ -80,27 +80,38 @@ fn the_hot_path_makes_zero_system_allocations() {
 /// even when the test binary contains only one test.
 #[test]
 fn an_allocation_measurement_excludes_another_threads_work() {
-  let (start, started) = std::sync::mpsc::sync_channel(0);
-  let (done, completed) = std::sync::mpsc::sync_channel(0);
-  let worker = std::thread::spawn(move || {
-    // The first handshake warms the channel's per-thread waiting state; the second is measured.
-    for _ in 0..2 {
-      started.recv().unwrap();
+  use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+  use std::time::{Duration, Instant};
+
+  // Shape: a failed handshake terminates after five seconds; elapsed time is not a verdict.
+  let deadline = Instant::now() + Duration::from_secs(5);
+  let start = AtomicBool::new(false);
+  let foreign_calls = AtomicUsize::new(0);
+  let wait = |ready: &dyn Fn() -> bool| {
+    while !ready() {
+      assert!(Instant::now() < deadline, "allocation handshake stalled");
+      std::thread::yield_now();
+    }
+  };
+  std::thread::scope(|scope| {
+    let worker = scope.spawn(|| {
+      wait(&|| start.load(Ordering::Acquire));
       let before = CALLS.get();
       drop(std::hint::black_box(Box::new(std::hint::black_box(42u64))));
-      done.send(CALLS.get() - before).unwrap();
-    }
+      let allocated = CALLS.get() - before;
+      assert!(allocated > 0, "the worker really allocated");
+      foreign_calls.store(allocated, Ordering::Release);
+    });
+    // Channels can lazily allocate their waiting state on this thread. The measurement
+    // must contain only the foreign allocation and synchronization that cannot allocate.
+    let before = CALLS.get();
+    start.store(true, Ordering::Release);
+    wait(&|| foreign_calls.load(Ordering::Acquire) != 0);
+    let local_calls = CALLS.get() - before;
+    worker.join().unwrap();
+    assert_eq!(
+      local_calls, 0,
+      "another thread cannot change this measurement"
+    );
   });
-  start.send(()).unwrap();
-  completed.recv().unwrap();
-  let before = CALLS.get();
-  start.send(()).unwrap();
-  let foreign_calls = completed.recv().unwrap();
-  let local_calls = CALLS.get() - before;
-  worker.join().unwrap();
-  assert!(foreign_calls > 0, "the worker really allocated");
-  assert_eq!(
-    local_calls, 0,
-    "another thread cannot change this measurement"
-  );
 }

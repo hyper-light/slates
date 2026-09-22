@@ -243,8 +243,11 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   let profile = profile();
   let instance = format!("srv-status-pages-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  // Shape: deliberately short reply chunks, so the two-shard report must cross pages.
-  config.region.bulk_bytes = u64::from(config.region.slots) * 2 * 128;
+  // Shape: CI derived eight slots; retain that ring's normal byte allowance on every host.
+  config.region.bulk_bytes = config.region.bulk_bytes / u64::from(config.region.slots) * 8;
+  // Shape: short reply chunks force paging while retaining the report's admitted credit.
+  // Shrinking bulk instead made an eight-slot CI host refuse the entire report at 1024 bytes.
+  config.region.slots = u32::try_from(config.region.bulk_bytes / (2 * 128)).unwrap();
   let daemon = Daemon::start(
     &profile,
     config,

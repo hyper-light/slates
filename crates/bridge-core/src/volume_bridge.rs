@@ -373,7 +373,8 @@ impl<'v> VolumeBridge<'v> {
   }
 
   /// Stamps a freshly created inode `new` with the owner a mount must show: its uid is the mounting
-  /// user — the request subject's uid — and its gid is the request's own group when its credential
+  /// user — the request's Unix uid, or its enrolled account without a Unix credential — and its
+  /// gid is the request's own group when its credential
   /// named one (an NFS `AUTH_SYS` gid, carried on [`OpContext::owner_gid`]), matching what a native
   /// NFS server stamps; otherwise it inherits the parent directory `parent`'s group, the BSD/macOS
   /// create rule (a new object takes the creating user and the parent's group). Without this the
@@ -389,12 +390,13 @@ impl<'v> VolumeBridge<'v> {
     parent: InodeNo,
     cx: &OpContext,
   ) -> Result<(), VfsError> {
-    let uid = match &cx.subject {
-      Principal::Uid { uid } => *uid,
+    let uid = match (cx.owner_uid, &cx.subject) {
+      (Some(uid), _) => uid,
+      (None, Principal::Uid { uid }) => *uid,
       // An enrolled consumer is a workload *within* its host account (§4.13): what it creates is the
       // account's, as the host filesystem will report it.
-      Principal::Consumer { account, .. } => *account,
-      Principal::Sid { .. } | Principal::Certificate { .. } => return Ok(()),
+      (None, Principal::Consumer { account, .. }) => *account,
+      (None, Principal::Sid { .. } | Principal::Certificate { .. }) => return Ok(()),
     };
     let gid = match cx.owner_gid {
       Some(gid) => gid,

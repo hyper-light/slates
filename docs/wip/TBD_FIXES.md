@@ -1,14 +1,47 @@
 # Remaining fixes and verification
 
-Updated: **2026-09-21**. Checkpoint after `2179cc2`, including the instruction-benchmark
+Updated: **2026-09-22**. Checkpoint against `3b38d15`, including the instruction-benchmark
 repair below. This is the remaining-work
 list for the audit/CI repair session; [GAPS.md](GAPS.md) remains the authoritative contract
 ledger. Historical audit findings below need closure evidence against current source, not
 blind reimplementation of their original baseline. No new test, install or deployment is
 authorized merely by appearing here.
 
-## Current CI repair checkpoint (2026-09-21)
+## Current CI repair checkpoint (2026-09-22)
 
+- [x] **Run 35615970514: mounted ownership.** A MOUNT under uid 0 caused later uid 1001
+  creations to retain owner 0. Preserve the catalog principal as attachment authority and
+  stamp each request's Unix ownership separately. Native mounted red reproduced; 9 NFS
+  daemon, 21 bridge-core and 42 NFS procedure tests pass, including dot-entry RMDIR refusals.
+- [x] **Run 35615970514: restart fixture and Helm.** The four-slot restart history
+  acknowledged create sequence 1 through watermark 4, then incorrectly required replay.
+  The revised oracle requires both acknowledged refusal and replay of a discarded, unacknowledged reply;
+  all 5 client lifecycle tests pass. Pin workspace Helm to KIND's 4.3.0, retaining exact
+  golden bytes; all 4 chart tests pass. Recheck both host workspaces after final edits.
+- [x] **Current targeted Linux validation.** The isolated NFS/restart/comparator corrections
+  pass 125 cases under io_uring plus `xtask check`; strict workspace Clippy passes on macOS.
+  Script/log: `/private/tmp/slates-ci-35615970514-linux-targeted.{sh,log}`. The full macOS
+  run was cancelled at the requested hold, with no recorded failure; a complete rerun is owed.
+- [ ] **Broader CI audit.** Follow `docs/bugs/2026-09-22-ci-failure-pattern-audit.md`:
+  async acknowledgment/pending-reply bounds, fs_usage readiness and ownership, pjdfstest
+  child errors, macOS NFS capability cases, and initial KIND formation A↔B↔C without A↔C.
+  The comparator's blanket `._*` filter has been removed; native provenance sidecars still
+  break real git/Python/rsync/editor histories. Do not add exclusions to conceal them.
+- [x] **Run 35604717581: allocation and paging fixtures.** Linux reproduces local channel
+  allocation in the memory test (trial 31; diagnostic trial 95) and its runtime sibling
+  (trial 61). Replace the measured channel waits with bounded stack-owned synchronization,
+  keeping exactly zero local allocations and requiring the foreign allocation. The memory
+  binary passes 100 Linux repetitions. The status fixture now preserves the report credit
+  while forcing small pages; CI's eight-slot allowance is explicit and passes natively in
+  0.75 s. Both allocation binaries and all 14 Linux daemon tests pass under io_uring. Full
+  workspace rerun passes 1,561 cases and `xtask check`; final strict checks and the later
+  NFS/replay changes still need validation in that container. See the dated fixture diagnosis.
+- [ ] **Run 35604717581: macOS conformance.** The downloaded artifacts contain 1,906
+  pjdfstest failures and a separate empty hermeticity trace (`ktrace_start: No such process`).
+  Review every failed history against the pinned suite and the NFS client; no assertions or
+  expected-failure entries have been changed. Task-scoped macOS tracing is authorized, but
+  this host requires interactive sudo authentication. Prepared local command:
+  `bash /private/tmp/slates-ci-35604717581-macos-trace.sh`. Windows work is paused.
 - [x] **Explicit shard counts.** The Linux Python 3.14 SDK
   test fails because `--shards 1` keeps capacities already divided among three shards.
   Serial/concurrent and fresh/after-destroy probes all admit five of the unchanged eight

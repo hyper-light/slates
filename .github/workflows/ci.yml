@@ -23,6 +23,11 @@ jobs:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The workspace runs the byte-for-byte chart golden too. Use its renderer, as in the
+      # KIND lane; the runner image's preinstalled Helm changes document-separator whitespace.
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.3.0
       # slates has no inherited code, so the format gate is appropriate from day one
       # (Appendix B.1). A red-forever check is worse than no check: never let it rot.
       - name: Format

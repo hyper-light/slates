@@ -1508,6 +1508,16 @@ must exercise local communication and isolation between clones as well as namesp
 > fragments cannot grow a connection buffer or trigger repeated prefix scans. Fourteen wire tests
 > pass, including the previously failing empty-fragment attack and maximum byte fragmentation.
 
+> **Status (2026-09-22, NFS shared-attachment ownership).** The registry's subject is the
+> validated catalog attachment's principal. The NFS caller's Unix uid and gid ride each
+> request as creation metadata, separately from that authority, so a MOUNT issued as root
+> cannot make subsequent users' creations root-owned. CREATE, MKDIR, SYMLINK and MKNOD
+> share the stamp; both owner shards and all created kinds are covered by use. RMDIR `.`
+> and `..` refuse explicitly before stored-entry lookup; NOENT could otherwise be treated
+> by the macOS client as successful retry. Dated bug reports: 2026-09-22 NFS ownership
+> and dot components. Full mounted conformance remains open; native provenance sidecars
+> still affect workloads, and the comparator no longer hides `._*` filenames.
+
 **Role.** Present the root mount and every attached volume to the kernel; translate kernel
 requests into shard operations by handle; emit invalidations; read base files for overlay
 volumes; never write to disk.
@@ -3050,6 +3060,12 @@ it uses content addressing. The RAM-only trust boundary and any allowed sharing 
 > existing scatter samples each shard independently; paging freezes its completed result,
 > without promising a simultaneous cross-shard snapshot. The deadline on a lost scatter
 > task remains owed. Record: `docs/bugs/2026-09-20-daemon-status-exceeds-a-reply-slot.md`.
+
+> **Paging fixture correction (2026-09-21).** The by-use test preserves the normal bulk
+> allowance for CI's eight-slot ring while dividing it into small pages. Previously it
+> reduced the entire capture allowance to 1024 bytes and correctly received `BudgetExceeded`.
+> The immutable-capture and cursor assertions are unchanged; the pinned regression passes
+> in 0.75 s. Record: `docs/bugs/2026-09-21-ci-fixtures-count-local-work-and-shrink-status-credit.md`.
 
 Chokepoint spans (bridge request, ring request, shard operation, log append, replication ship,
 consensus step, archive chunk) with the three-id law; spans emitted asynchronously through

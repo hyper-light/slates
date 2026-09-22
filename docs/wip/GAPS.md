@@ -1,5 +1,26 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **CI boundary audit (2026-09-22).** The shared NFS attachment cached MOUNT's uid and
+> stamped later callers' creations with it. The registry now retains the catalog principal;
+> Unix ownership rides each request separately. Nine daemon NFS tests, 21 shared-bridge
+> tests and 42 NFS procedure tests pass, including reserved RMDIR components. Five client
+> lifecycle tests now explicitly distinguish acknowledged refusal from replay after a lost
+> reply; the previous fixture retried a released completion on small rings. Workspace Helm
+> uses the KIND lane's pinned renderer; all four chart gates pass. The workload comparator's
+> blanket `._*` exclusion is removed. Mounted AppleDouble behavior, tracer startup/lifetime,
+> async acknowledgments, suite subprocess errors and KIND formation remain open in
+> `docs/bugs/2026-09-22-ci-failure-pattern-audit.md` and TBD_FIXES. No all-lanes closure.
+
+> **CI fixture correction (2026-09-21).** Run 35604717581 exposed channel waiting-state
+> allocation inside both allocator-counter fixtures and a status-paging fixture that shrank
+> the report allowance to 1024 bytes on an eight-slot host. Stack-owned synchronization
+> preserves the zero-allocation assertion; small pages now preserve CI's normal report credit.
+> The memory binary passes 100 Linux repetitions, the sibling runtime failure reproduces
+> independently and is corrected, and native status paging passes in 0.75 s. Full workspace
+> validation passes 1,561 Linux cases under io_uring plus `xtask check`; the separate mounted
+> conformance failures and subsequent corrections remain in progress in TBD_FIXES.
+> Record: `docs/bugs/2026-09-21-ci-fixtures-count-local-work-and-shrink-status-credit.md`.
+
 > **Instruction benchmark repair (2026-09-21).** Result checks reject all four negative
 > controls; all 14 valid benchmarks pass. Explicit, non-inlined collection requests exclude
 > teardown on Linux ARM64: eightfold CRC verification leaves 2,653 instructions unchanged;

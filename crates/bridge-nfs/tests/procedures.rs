@@ -839,6 +839,51 @@ fn a_rmdir_over_the_export_removes_the_directory() {
   );
 }
 
+/// AC-4.3 / §4.6: removing a directory's dot entries is refused without changing the tree.
+/// In particular, NOENT is not a refusal here: macOS treats it as a successful RMDIR retry.
+#[test]
+fn rmdir_refuses_dot_entries_and_preserves_the_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge.mkdir(oid(root_ino), &cx, "parent", 0o755).unwrap();
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root = root_handle(&mut export);
+  let parent = lookup_fh(&mut export, &root, "parent");
+  for (name, expected) in [("..", Nfsstat3::Notempty), (".", Nfsstat3::Inval)] {
+    let mut args = XdrWriter::new();
+    parent.encode(&mut args);
+    args.opaque(name.as_bytes());
+    let reply = export
+      .serve_nfs(NFSPROC3_RMDIR, &mut XdrReader::new(args.as_slice()))
+      .unwrap();
+    assert_eq!(status_of(&reply), expected.wire(), "RMDIR {name}");
+    assert_eq!(lookup_fh(&mut export, &root, "parent"), parent);
+  }
+  let mut args = XdrWriter::new();
+  root.encode(&mut args);
+  args.opaque(b"parent");
+  let reply = export
+    .serve_nfs(NFSPROC3_RMDIR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  assert_eq!(status_of(&reply), Nfsstat3::Ok.wire());
+  assert_eq!(
+    status_of(&lookup_reply(&mut export, &root, "parent")),
+    Nfsstat3::Noent.wire()
+  );
+}
+
 /// RENAME over the export moves an entry: the old name misses and the new name resolves to the same
 /// object (same fileid).
 #[test]

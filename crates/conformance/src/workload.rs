@@ -429,39 +429,11 @@ pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
   if let Some(difference) = first_output_difference(&host_output, &mount_output) {
     return WorkloadStatus::Differs { detail: difference };
   }
-  let host_tree = without_sidecars(host.manifest.without(workload.excluded));
-  let mount_tree = without_sidecars(mount.manifest.without(workload.excluded));
+  let host_tree = host.manifest.without(workload.excluded);
+  let mount_tree = mount.manifest.without(workload.excluded);
   match first_manifest_difference(&host_tree, &mount_tree) {
     Some(difference) => WorkloadStatus::Differs { detail: difference },
     None => WorkloadStatus::Identical,
-  }
-}
-
-/// Format: the prefix of a macOS AppleDouble sidecar (`._name`), the file the NFS client keeps an
-/// extended attribute in when the server cannot (docs/bugs/2026-09-14-nfs-appledouble-sidecars.md).
-const APPLEDOUBLE_PREFIX: &str = "._";
-
-/// Whether an entry is an AppleDouble sidecar by its base name.
-fn is_sidecar(entry: &Entry) -> bool {
-  entry
-    .path
-    .rsplit('/')
-    .next()
-    .is_some_and(|name| name.starts_with(APPLEDOUBLE_PREFIX))
-}
-
-/// A manifest with the macOS AppleDouble sidecars removed. The macOS NFS client writes an extended
-/// attribute into a `._name` file whenever the server cannot store it inline
-/// (docs/bugs/2026-09-14-nfs-appledouble-sidecars.md), so these files are an artifact of the mount
-/// transport, not workload behaviour or slates-fs state; like the per-workload excluded prefixes they are
-/// removed from both sides before the whole-tree comparison.
-fn without_sidecars(manifest: Manifest) -> Manifest {
-  Manifest {
-    entries: manifest
-      .entries
-      .into_iter()
-      .filter(|e| !is_sidecar(e))
-      .collect(),
   }
 }
 
@@ -535,10 +507,10 @@ mod tests {
     assert!(detail.contains("output line 1"), "{detail}");
   }
 
-  /// A tree that differs only by AppleDouble sidecars compares Identical — the sidecars are a mount
-  /// artifact, stripped from both sides — while a difference beyond them is still named.
+  /// AC-3.2 / AC-4.2: every visible name participates in the comparison, including `._` names.
+  /// A transport-created sidecar changes the tree; an application can also own such a name.
   #[test]
-  fn appledouble_sidecars_are_excluded_from_the_comparison() {
+  fn dot_underscore_names_are_compared_like_other_visible_files() {
     let workload = ROSTER[4];
     let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run(
@@ -546,7 +518,11 @@ mod tests {
       "same\n",
       vec![file("._a", "sidecar"), file("a", "aa")],
     );
-    assert_eq!(compare(&workload, &host, &mount), WorkloadStatus::Identical);
+    assert!(difference(compare(&workload, &host, &mount)).starts_with("tree entry"));
+    let host = run("/h", "same\n", vec![file("._user-file", "original")]);
+    let mount = run("/m", "same\n", vec![file("._user-file", "changed")]);
+    assert!(difference(compare(&workload, &host, &mount)).starts_with("tree entry"));
+    let host = run("/h", "same\n", vec![file("a", "aa")]);
     let mount = run(
       "/m",
       "same\n",
