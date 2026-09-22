@@ -679,7 +679,7 @@ fn read_row(raw: &str) -> Option<Row<'_>> {
   } else {
     TRAILING_TOKENS
   });
-  for token in &tokens[2..body_end] {
+  for token in tokens.get(2..body_end)? {
     read_token(token, &mut row);
   }
   Some(row)
@@ -983,6 +983,28 @@ not a row
       judged.written_inside,
       vec![".slates-tmp-1".to_owned(), "a.txt".to_owned()]
     );
+  }
+
+  /// AC-4.5/T-9.1: truncated or malformed tracer rows cannot crash the judgment, and a valid
+  /// violation after them is still reported. In particular, `W` needs an elapsed-time token
+  /// before it; counting it as a suffix must not move the row's end before its call name.
+  #[test]
+  fn malformed_fs_usage_wait_suffixes_do_not_hide_a_following_violation() {
+    let malformed = [
+      "08:20:01.000001 write W slates.123",
+      "08:20:01.000001 W slates.123",
+      "08:20:01.000001 write",
+    ];
+    let valid = "08:20:01.000002 mkdir /outside/proof 0.000010 W slates.123\n";
+    for prefix in malformed {
+      let log = format!("{prefix}\n{valid}");
+      let judged = judge(&parse_fs_usage(&log), &policy());
+      assert_eq!(
+        judged.outside, 1,
+        "the complete violation survives: {prefix}"
+      );
+      assert_eq!(judged.violations[0].path, "/outside/proof");
+    }
   }
 
   /// The containment rule: the target itself and its descendants are inside; a sibling with the

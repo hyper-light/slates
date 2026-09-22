@@ -1,5 +1,18 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **KIND takeover: council seats (2026-09-22).** CI run 35615113353's KIND lane retired the killed
+> owner but never took its volume over. The council's voters were the lowest member ids up to
+> `2f + 1`: the owner's replacement, admitted beside its unretired predecessor, took the live
+> leader's seat while the dead predecessor kept its own, and the replacement, which cannot observe
+> its own predecessor's death, then led a council that never retired it. A sitting voter now keeps
+> its seat while it is a member, and a freed seat goes only to a member the leader holds alive; the
+> id is only the tiebreak. Reproduced one failure in eight on a CPU-pinned local cluster; the fixed
+> image passed 6 of 6; two deterministic council regressions; 152 cluster unit tests and the fleet
+> suite pass. Owed: the replacement's blind spot after two overlapping faults, and root-group
+> representatives chosen by id order. KIND initial formation (run 35615970514) stays open and was
+> not reproduced (14 local formations, each within 0.3 s).
+> Record: `docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md`.
+
 > **CI boundary audit (2026-09-22).** The shared NFS attachment cached MOUNT's uid and
 > stamped later callers' creations with it. The registry now retains the catalog principal;
 > Unix ownership rides each request separately. Nine daemon NFS tests, 21 shared-bridge
@@ -10,6 +23,15 @@
 > blanket `._*` exclusion is removed. Mounted AppleDouble behavior, tracer startup/lifetime,
 > async acknowledgments, suite subprocess errors and KIND formation remain open in
 > `docs/bugs/2026-09-22-ci-failure-pattern-audit.md` and TBD_FIXES. No all-lanes closure.
+> The companion macOS NFS boundary report classifies the 117 additional pjdfstest
+> failures; it adds no expected-failure entries and leaves mounted proof open.
+> The fs_usage parser's malformed wait suffix is also guarded after a red regression
+> (`2026-09-22-fs-usage-wait-suffix-panics.md`); tracer readiness remains a separate issue.
+> The repair batch now passes the Linux workspace (1,564 functions; opt-in gates still
+> need their dedicated runs), all 49 fleet histories, structural checks, and the full
+> mounted NFS adapter sequence: nine identical workloads, no unexpected pjdfstest failure,
+> and no unresolved or outside traced write. Native FUSE, macOS tracing and Linux Helm
+> remain distinct verification obligations; the separate parser fix passes 49 pure cases.
 
 > **CI fixture correction (2026-09-21).** Run 35604717581 exposed channel waiting-state
 > allocation inside both allocator-counter fixtures and a status-paging fixture that shrank

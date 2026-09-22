@@ -18,9 +18,10 @@ this report does not claim all lanes pass.
 | Asynchronous acknowledgments | The watermark appears to follow sent requests rather than replies consumed by the caller. | Code audit of `Client::ack_watermark`; regression and correction pending. Also audit pending-reply eviction and sequence wrap. |
 | Golden tool input | Workspace and KIND use different Helm renderers for a byte-for-byte golden. | CI render differs in five separator blank lines; KIND's pinned 4.3.0 passes. Pin workspace to the same tool; no golden or assertion changes. |
 | Tracer startup/lifetime | fs_usage is spawned without an observed-readiness barrier, stopped after the daemon, and has no drop guard. | Prior CI: zero events, `ktrace_start: No such process`; next CI: early mount failure followed by orphaned tracer error. Native privileged reproduction awaits local authentication. |
+| Trace parser bounds | A malformed fs_usage wait suffix creates a backwards slice. | Regression panics in 0.00 s. Checked slice access preserves the following valid violation; all 49 conformance cases and strict crate Clippy pass. |
 | Suite subprocess errors | pjdfstest runner discards stderr, read errors, and exit status. | Audit of `xtask/src/conformance/suites.rs::run_test_file`. Structured failure capture and negative controls owed. |
 | Workload equivalence | The comparator filtered every `._*` name, including ordinary user files. | Added-name and changed-content histories fail before removing the filter and pass afterward. All 48 conformance cases pass on macOS and Linux. Native AppleDouble behavior remains unresolved; no new exclusions. |
-| macOS NFS capabilities | `_PC_PATH_MAX` is unsupported by Apple's client; FIFO access and several privilege cases differ from Linux. | Primary Apple NFS source and 117 failure IDs beyond the Linux list. Per-history review incomplete; no expected-failure list copied or expanded. |
+| macOS NFS capabilities | `_PC_PATH_MAX` is unsupported by Apple's client; FIFO access and several privilege cases differ from Linux. | The 117 additional failure IDs are classified in `2026-09-22-macos-nfs-conformance-boundaries.md`, with standard/client evidence and the mounted checks still owed. No expected-failure list copied or expanded. |
 | KIND membership | Formation remains a chain A↔B↔C after 180 s; endpoints each probe one peer. | Job 106386649727 diagnostics. Local isolated-cluster reproduction and session-formation diagnosis owed. |
 
 ## Validation completed and its limits
@@ -41,14 +42,39 @@ and 48 conformance cases, followed by `cargo xtask check`. Command script:
 `/private/tmp/slates-ci-35615970514-linux-targeted.sh`; log:
 `/private/tmp/slates-ci-35615970514-linux-targeted.log`.
 The full macOS workspace run was interrupted at Ada's hold request, with no
-failure recorded before cancellation; it is not a completed pass. A full Linux
-workspace and mounted-conformance rerun is in progress.
+failure recorded before cancellation; it is not a completed pass.
+
+The full Linux rerun subsequently passes **1,564 test functions, zero failed,
+14 ignored**, including all **49 fleet histories in 269.51 s**, followed by
+`cargo xtask check`. Helm was absent in this container, so its four functions
+returned through their environment gate; the Linux renderer check is still owed
+and its container-only installation is authorized. Other opt-in native tests
+also require their dedicated commands; the workspace total does not close them.
+
+The same container's mounted NFS conformance sequence passes:
+
+- fsx: 10,000 operations, seed 1.
+- fsstress: 500 operations in each of four processes, 2,000 logged, seed 1.
+- pjdfstest: 238 files, 8,798 cases; 6,970 passed, 1,800 reviewed expected failures,
+  zero unexpected failures, zero listed-now-passing, 28 TODO cases. No list edits.
+- Workloads: all nine compare Identical, including the stricter dot-underscore policy.
+- Hermeticity: 200 write-capable calls; 22 inside the target, all six landed paths
+  matched, 90 RAM-object calls, 88 standard-stream calls, zero unresolved or outside.
+
+Command script: `/private/tmp/slates-ci-35615970514-linux.sh`; log:
+`/private/tmp/slates-ci-35615970514-linux-validation.log`; kept artifact:
+`/private/tmp/slates-ci-35615970514-conformance.tar.gz`.
+This is the same **LIMITED Linux NFS adapter** as the linked conformance lane;
+it is not a native FUSE mount verdict. The mounted step completed at 21:52:34 UTC
+on 2026-09-22. This run predates the separate malformed-trace-row correction.
 
 The first Terminal trace attempt stopped during compilation and produced no
 tracing evidence. The rebuilt reproduction uses the isolated source and a fresh
 task-owned target directory; the existing shared build outputs include root-owned
 files and were left untouched. The script refuses to run Cargo as root and
 elevates only the existing tracer. The privileged reproduction is still pending.
+A second attempt reached the serial lock while the Linux run was active and
+timed out without starting a tracer. The next attempt is reserved an idle machine.
 
 The native workload now creates its working directories successfully and runs
 eight installed tools. Four compare identical; git, Python, rsync and editor

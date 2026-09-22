@@ -9,6 +9,13 @@ authorized merely by appearing here.
 
 ## Current CI repair checkpoint (2026-09-22)
 
+- [x] **Run 35615113353: KIND takeover never assigned.** The council seated its voters by
+  lowest id, so the owner's replacement took the live leader's seat beside its unretired
+  predecessor, then led without ever retiring it; no takeover was assigned. Seats now follow
+  incumbency and liveness, the id only a tiebreak. Pinned local cluster: 1 failure in 8 before,
+  6 of 6 after; two council regressions; cluster and fleet suites pass. Owed: the replacement's
+  blind spot after two overlapping faults; root representatives by id order. See
+  `docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md`.
 - [x] **Run 35615970514: mounted ownership.** A MOUNT under uid 0 caused later uid 1001
   creations to retain owner 0. Preserve the catalog principal as attachment authority and
   stamp each request's Unix ownership separately. Native mounted red reproduced; 9 NFS
@@ -22,11 +29,26 @@ authorized merely by appearing here.
   pass 125 cases under io_uring plus `xtask check`; strict workspace Clippy passes on macOS.
   Script/log: `/private/tmp/slates-ci-35615970514-linux-targeted.{sh,log}`. The full macOS
   run was cancelled at the requested hold, with no recorded failure; a complete rerun is owed.
+- [x] **Full Linux rerun of the repair batch.** `9c82f19`'s code passes 1,564 workspace
+  functions (zero failures, 14 ignored), all 49 fleet histories in 269.51 s, `xtask check`,
+  and the full mounted NFS conformance sequence. All nine workloads are Identical;
+  pjdfstest has zero unexpected failures; hermeticity has zero unresolved or outside writes.
+  Script/log: `/private/tmp/slates-ci-35615970514-linux{.sh,-validation.log}`.
+  This adapter does not cover native FUSE. The workspace's opt-in steps still need their
+  dedicated runs; in particular Helm was absent and returned through its environment gate.
+- [ ] **Linux Helm.** Container-only Helm 4.3.0 is authorized. Run the prepared checksum-
+  verifying `/private/tmp/slates-ci-35615970514-linux-helm.sh` after the macOS trace.
 - [ ] **Broader CI audit.** Follow `docs/bugs/2026-09-22-ci-failure-pattern-audit.md`:
   async acknowledgment/pending-reply bounds, fs_usage readiness and ownership, pjdfstest
   child errors, macOS NFS capability cases, and initial KIND formation A↔B↔C without A↔C.
   The comparator's blanket `._*` filter has been removed; native provenance sidecars still
   break real git/Python/rsync/editor histories. Do not add exclusions to conceal them.
+  The 117 additional macOS pjdfstest failures are grouped with evidence and the next
+  checks in `docs/bugs/2026-09-22-macos-nfs-conformance-boundaries.md`.
+- [x] **Trace parser hostile row.** A four-token fs_usage row with a wait suffix panicked
+  before later violations could be judged. The regression fails in 0.00 s; checked slice
+  access rejects the incomplete row and preserves the following outside-write violation.
+  All 49 conformance cases and strict crate Clippy pass after the correction.
 - [x] **Run 35604717581: allocation and paging fixtures.** Linux reproduces local channel
   allocation in the memory test (trial 31; diagnostic trial 95) and its runtime sibling
   (trial 61). Replace the measured channel waits with bounded stack-owned synchronization,
