@@ -255,13 +255,31 @@ jobs:
       # And the **consumer-capability delivery** (§4.13, GAP-A9-9): the re-invoked child is created by
       # `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming its one pipe handle, takes
       # the record from it, and must find the parent's inheritable decoy handle absent.
-      - name: Test the Win32 memory, wake, AFD readiness, rendezvous and delivery paths (native Windows)
-        run: |
-          cargo test -p slates-mem
-          cargo test -p slates-ipc --test rings
-          cargo test -p slates-ipc --test rendezvous
-          cargo test -p slates-ipc --test delivery
-          cargo test -p slates-rt --test udp
+      # Each Windows test binary is its own step with its own limit, run even when an earlier one failed
+      # or timed out: the job-level six-hour limit killed hung runs with no log kept (job 106959967584:
+      # BlobNotFound), and one step running five binaries could not say which hung. A step compiles one
+      # crate's tests and runs them; clippy of every crate here took 23-66 s over four runs (2026-09-25),
+      # so fifteen minutes is over ten times the slowest measured build, and a hang is cut with its log.
+      - name: Test the Win32 shared memory (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mem
+      - name: Test the rings and the Event wake (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rings
+      - name: Test the Win32 rendezvous (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rendezvous
+      - name: Test the consumer-capability delivery (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test delivery
+      - name: Test the AFD readiness over loopback UDP (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test udp
       # The full daemon lifecycle end to end on Windows: an in-process `slates-server` daemon starts,
       # a client finds it through the Win32 rendezvous bootstrap object, and drives create → duplicate
       # refused → snapshot → clone → attach/lease → status → list → detach → resize → destroy over the
@@ -271,6 +289,8 @@ jobs:
       # now that the rendezvous is proven above. The single in-process case (no cross-process anchor
       # restart) is the deterministic core; the restart/anchor path stays macOS/Linux.
       - name: Test the daemon lifecycle end to end (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
         run: cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
       # The live WinFsp mount (§4.6): mount a slates volume at a drive letter through the real kernel
       # FSD, then create/write/read/list/delete a file through the Windows filesystem and unmount. This
@@ -278,6 +298,8 @@ jobs:
       # trampolines, the owner-thread volume — end to end, the Windows analogue of the macOS FSKit and
       # `mount_nfs` live mounts. Gated by `WINFSP_TEST_MOUNT=1`; needs WinFsp (installed above).
       - name: Live WinFsp mount (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
         env:
           WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
           WINFSP_TEST_MOUNT: "1"
@@ -366,18 +388,39 @@ jobs:
       # (an in-process daemon a client reaches through the Win32 rendezvous, driving the whole verb set)
       # — no longer owed now that the rendezvous is proven; the cross-process anchor-restart path stays
       # macOS/Linux. WinFsp is installed above, so the live mount runs too.
-      - name: Test the Win32 memory, wake, AFD, rendezvous, daemon lifecycle, and WinFsp mount paths
+      # One step per binary, each limited and run even after an earlier failure: see the same note on
+      # the native Windows job (a hung binary is named by its step and cut with its log kept).
+      - name: Test the Win32 shared memory (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-mem
+      - name: Test the rings and the Event wake (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rings
+      - name: Test the Win32 rendezvous (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test rendezvous
+      - name: Test the consumer-capability delivery (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-ipc --test delivery
+      - name: Test the AFD readiness over loopback UDP (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-rt --test udp
+      - name: Test the daemon lifecycle end to end (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
+      - name: Test the live WinFsp mount (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
         env:
           WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
           WINFSP_TEST_MOUNT: "1"
-        run: |
-          cargo test -p slates-mem
-          cargo test -p slates-ipc --test rings
-          cargo test -p slates-ipc --test rendezvous
-          cargo test -p slates-ipc --test delivery
-          cargo test -p slates-rt --test udp
-          cargo test -p slates-client --test client the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed
-          cargo test -p slates-bridge-winfsp --test mount -- --nocapture
+        run: cargo test -p slates-bridge-winfsp --test mount -- --nocapture
 
   # Part 6 "Conformance" and "Real workloads", example 8 "Hermeticity"; AC-9.7/T-9.1 (GAP-A9-15): the
   # suites the design names — pjdfstest, fsx, fsstress — plus the workload suite and the filesystem-write
