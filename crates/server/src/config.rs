@@ -286,7 +286,7 @@ pub struct DaemonConfig {
   pub fleet_sessions_per_plane: usize,
   /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
   /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
-  /// memcpy bandwidth and the wake p99 as the kick round trip, with one request's worst case as the frame.
+  /// memcpy bandwidth and the mean wake as the kick round trip, with one request's worst case as the frame.
   /// Unix only, as the guest transport is.
   #[cfg(unix)]
   pub guest_credits: slates_bridge_virtiofs::credit::AttachmentCredits,
@@ -377,8 +377,8 @@ impl DaemonConfig {
     derivations.push(note("slots_per_ring", &slots));
     let spin: Derived<u32> = derived!(
       u32::try_from(d.spin_before_park_ns.get()).unwrap_or(u32::MAX),
-      "the measured wake cost p99 (the 2-competitive spin)",
-      ["wake.p99_ns"]
+      "the expected (mean) cost of parking, the 2-competitive spin threshold",
+      ["wake.mean_ns"]
     );
     derivations.push(note("spin_ns", &spin));
     let log_bytes: Derived<u64> = derived!(
@@ -550,7 +550,7 @@ impl DaemonConfig {
         .get()
         .saturating_mul(IDLE_WINDOW_RATIO),
       "spin_before_park_ns × IDLE_WINDOW_RATIO",
-      ["wake.p99_ns", "IDLE_WINDOW_RATIO"]
+      ["wake.mean_ns", "IDLE_WINDOW_RATIO"]
     );
     derivations.push(note("idle_window_ns", &idle_window));
     runtime.spin_ns = idle_window.get();
@@ -593,8 +593,8 @@ impl DaemonConfig {
 
 /// A guest device attachment's credits from the profile (§4.6 A-9, §4.9): the request credit is the
 /// shard's admission limit; the byte credit is the credit window over the measured memcpy bandwidth (the
-/// largest measured copy size, the streaming rate a request copy runs at) and the wake p99 (the floor of
-/// a kick's round trip through the driver), with one request's worst case — the device's readable cap
+/// largest measured copy size, the streaming rate a request copy runs at) and the mean wake (the expected
+/// round trip of a kick through the driver), with one request's worst case — the device's readable cap
 /// plus its writable cap — as the frame, under the provisioning latency budget.
 #[cfg(unix)]
 fn guest_credits(
@@ -619,10 +619,14 @@ fn guest_credits(
     &bandwidth_bytes_per_ns,
   ));
   let frame = readable_cap().get().saturating_add(writable_cap().get());
+  // The kick round trip of the byte window (bandwidth × round trip, a bandwidth-delay product) is the
+  // expected wake: a throughput window is sized to the mean round trip, and the p99 inflated it ten- to
+  // fifteenfold on a virtual machine (docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-
+  // unconverged-tail.md).
   let credits = AttachmentCredits::derive(
     requests_in_flight_per_shard,
     bandwidth_bytes_per_ns.get(),
-    profile.wake.p99_ns.max(1),
+    profile.wake.mean_ns.max(1),
     frame,
     LATENCY_BUDGET_NS,
   );

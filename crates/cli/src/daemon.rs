@@ -44,10 +44,23 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
   Failure::Failed(format!("{what}: {e}"))
 }
 
+/// What the anchor handed this daemon: nothing (run alone), its profile, or a profile written in another
+/// format version — an anchor that has run across an upgrade of the binary it spawns (§2.6).
+enum Published {
+  /// No anchor: this daemon runs alone and creates its own segment.
+  Alone,
+  /// The anchor's profile, in this build's format (boxed: a profile is kilobytes, the other answers a word).
+  Profile(Box<MachineProfile>),
+  /// The anchor's profile is in another format version: a field's meaning changed between the two, so the
+  /// daemon measures its own rather than derive from the wrong quantity, and still serves the anchor's
+  /// segment.
+  OtherFormat(u32),
+}
+
 /// The profile the anchor published, when this daemon is its child.
-fn published_profile() -> Result<Option<MachineProfile>, Failure> {
+fn published_profile() -> Result<Published, Failure> {
   if std::env::var_os(slates_anchor::segment::ENV_HANDOFF).is_none() {
-    return Ok(None);
+    return Ok(Published::Alone);
   }
   let identity = Facts::query().identity;
   let segment = AnchorSegment::attach_from_env(&identity).map_err(|e| failed("attach", e))?;
@@ -56,9 +69,14 @@ fn published_profile() -> Result<Option<MachineProfile>, Failure> {
     .map_err(|e| failed("profile", e))?
     .ok_or_else(|| Failure::Failed("the anchor published no profile".to_owned()))?;
   let text = String::from_utf8(json).map_err(|e| failed("profile", e))?;
-  MachineProfile::from_json(&text)
-    .map(Some)
-    .map_err(|e| failed("profile", e))
+  match MachineProfile::format_version(&text) {
+    Some(version) if version != slates_machine::profile::PROFILE_VERSION => {
+      Ok(Published::OtherFormat(version))
+    }
+    _ => MachineProfile::from_json(&text)
+      .map(|profile| Published::Profile(Box::new(profile)))
+      .map_err(|e| failed("profile", e)),
+  }
 }
 
 /// Runs the daemon.
@@ -66,8 +84,15 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   signal::install().map_err(Failure::Failed)?;
   let parent = ParentWatch::from_env();
   let (profile, source) = match published_profile()? {
-    Some(profile) => (profile, SegmentSource::FromEnv),
-    None => (
+    Published::Profile(profile) => (*profile, SegmentSource::FromEnv),
+    Published::OtherFormat(version) => {
+      eprintln!(
+        "slates daemon: the anchor's profile is format version {version}; this daemon reads version {}: measuring its own",
+        slates_machine::profile::PROFILE_VERSION
+      );
+      (measure(options.quick), SegmentSource::FromEnv)
+    }
+    Published::Alone => (
       measure(options.quick),
       SegmentSource::Create {
         name: segment_name(&options.instance),

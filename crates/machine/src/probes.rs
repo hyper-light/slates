@@ -1,6 +1,7 @@
-//! The microbenchmarks of §4.1: syscall cost, fault cost per page class, park/unpark latency,
-//! core-to-core ring round trip, memcpy throughput by size, hash throughput, codec throughput
-//! per candidate level, and the lock capacity the OS grants.
+//! The microbenchmarks of §4.1: syscall cost, fault cost per page class, core-to-core ring round
+//! trip, memcpy throughput by size, hash throughput, codec throughput per candidate level, and the
+//! lock capacity the OS grants. The park/unpark latency has its own module, [`crate::wake`]: its
+//! event, placement and statistic are a design of their own (2026-09-22).
 //!
 //! Method: lmbench's baselines-and-subtraction for the fault probe (the map/unmap cost is
 //! measured on its own and subtracted) [A: McVoy & Staelin, USENIX'96]; the Kalibera-Jones
@@ -10,14 +11,14 @@
 //!
 //! Every probe takes its wall budget from the caller and reports `quick` when it stopped early.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::bench::{Measurement, bytes_per_second, measure, nanos};
+use crate::bench::{Measurement, bytes_per_second, measure};
 use crate::facts::{CoreFacts, Facts, PageFacts};
-use crate::stats::{Percentile, Sample, Xorshift, bootstrap_interval, converged};
+use crate::stats::Xorshift;
 
 /// Fault costs per page class, in nanoseconds per page.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,23 +36,6 @@ pub struct FaultCosts {
   pub huge_ns: Option<u64>,
   /// How many base pages each region held.
   pub pages_per_region: u64,
-}
-
-/// Park/unpark latency: how long a parked thread takes to run again after its peer unparks it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WakeLatency {
-  /// Median, in nanoseconds.
-  pub p50_ns: u64,
-  /// p99, in nanoseconds.
-  pub p99_ns: u64,
-  /// The bootstrap interval's lower and upper edges around the median.
-  pub lower_ns: u64,
-  /// The upper edge.
-  pub upper_ns: u64,
-  /// How many wake-ups were timed.
-  pub samples: u32,
-  /// True when the budget ended before the interval converged.
-  pub quick: bool,
 }
 
 /// The ring round trip between two cores: one cache line handed back and forth.
@@ -136,9 +120,6 @@ pub const FAULT_REGION_PAGES: u64 = 256;
 /// (§4.1: "every core pair, or a sampled subset above 32 cores").
 pub const FULL_MATRIX_CORE_LIMIT: usize = 32;
 
-/// Shape: the wake probe checks convergence after every batch of this many round trips.
-const WAKE_BATCH: usize = 64;
-
 /// Shape: the zstd candidate levels the cost model chooses among: the fast preset, the default,
 /// the high preset, and the maximum (§4.11, D-13).
 pub const ZSTD_LEVELS: &[i32] = &[1, 3, 9, 19];
@@ -187,68 +168,6 @@ pub(crate) enum Touch {
   Every,
 }
 
-/// Measures park/unpark latency between two threads (both directions pooled).
-pub fn wake(budget: Duration) -> WakeLatency {
-  let stamp = AtomicU64::new(0);
-  let turn = AtomicU32::new(0);
-  let stop = AtomicBool::new(false);
-  let epoch = Instant::now();
-  let mut sample = Sample::new(Vec::new());
-  let mut rng = Xorshift::new(Xorshift::SEED);
-  let mut quick = false;
-  let main = std::thread::current();
-  std::thread::scope(|scope| {
-    let waiter = scope.spawn(|| {
-      loop {
-        while turn.load(Ordering::Acquire) != 1 {
-          if stop.load(Ordering::Acquire) {
-            return;
-          }
-          std::thread::park();
-        }
-        let woke = nanos(epoch.elapsed());
-        let sent = stamp.load(Ordering::Acquire);
-        stamp.store(woke.saturating_sub(sent), Ordering::Release);
-        turn.store(2, Ordering::Release);
-        main.unpark();
-      }
-    });
-    let started = Instant::now();
-    loop {
-      for _ in 0..WAKE_BATCH {
-        stamp.store(nanos(epoch.elapsed()), Ordering::Release);
-        turn.store(1, Ordering::Release);
-        waiter.thread().unpark();
-        while turn.load(Ordering::Acquire) != 2 {
-          std::thread::park();
-        }
-        sample.push(stamp.load(Ordering::Acquire));
-        turn.store(0, Ordering::Release);
-      }
-      if let Some(interval) = bootstrap_interval(&sample, &mut rng)
-        && converged(&interval)
-      {
-        break;
-      }
-      if started.elapsed() >= budget {
-        quick = true;
-        break;
-      }
-    }
-    stop.store(true, Ordering::Release);
-    waiter.thread().unpark();
-  });
-  let interval = bootstrap_interval(&sample, &mut rng);
-  WakeLatency {
-    p50_ns: sample.median().unwrap_or(0),
-    p99_ns: sample.percentile(Percentile::P99).unwrap_or(0),
-    lower_ns: interval.map_or(0, |i| i.lower),
-    upper_ns: interval.map_or(0, |i| i.upper),
-    samples: u32::try_from(sample.len()).unwrap_or(u32::MAX),
-    quick,
-  }
-}
-
 /// Measures the ring round trip for every core pair (or the sampled subset above the limit). Each pair
 /// pins the calling thread to one core; the affinity the thread came in with is put back when the matrix
 /// is done, because a process spawned afterwards inherits the calling thread's mask — the anchor measures
@@ -279,7 +198,8 @@ pub fn core_matrix(cores: &[CoreFacts], budget: Duration) -> (Vec<CorePairRtt>, 
   (out, pinning)
 }
 
-fn weaker(x: Pinning, y: Pinning) -> Pinning {
+/// The weaker of two placements: refused beats a hint beats a pin.
+pub(crate) fn weaker(x: Pinning, y: Pinning) -> Pinning {
   match (x, y) {
     (Pinning::Refused, _) | (_, Pinning::Refused) => Pinning::Refused,
     (Pinning::Hint, _) | (_, Pinning::Hint) => Pinning::Hint,
@@ -584,6 +504,23 @@ pub fn corpus(len: usize) -> Vec<u8> {
 /// hints (macOS), and reports which.
 pub fn pin_current_thread(core: u32) -> Pinning {
   platform::pin_current(core)
+}
+
+/// The calling thread's CPU affinity, kept so a probe that pins the thread can put it back: a process
+/// spawned afterwards inherits the calling thread's mask (the anchor measures, then spawns the daemon;
+/// docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
+pub(crate) struct SavedAffinity(Option<platform::Affinity>);
+
+impl SavedAffinity {
+  /// The calling thread's mask now.
+  pub(crate) fn of_calling_thread() -> SavedAffinity {
+    SavedAffinity(platform::current_affinity())
+  }
+
+  /// Puts the mask back; whether the OS took it (nothing to put back counts as done).
+  pub(crate) fn restore(&self) -> bool {
+    self.0.as_ref().is_none_or(platform::restore_affinity)
+  }
 }
 
 /// Queries the lock capacity: the OS's stated limit, confirmed with one small lock.
@@ -1013,13 +950,6 @@ mod tests {
     );
     assert!(f.base_ns > 0, "{f:?}");
     assert_eq!(f.pages_per_region, FAULT_REGION_PAGES);
-  }
-
-  #[test]
-  fn a_wake_is_timed_between_two_threads() {
-    let w = wake(short());
-    assert!(w.samples >= u32::try_from(WAKE_BATCH).unwrap(), "{w:?}");
-    assert!(w.p50_ns > 0 && w.p99_ns >= w.p50_ns, "{w:?}");
   }
 
   #[test]

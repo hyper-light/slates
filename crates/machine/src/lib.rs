@@ -23,6 +23,7 @@
 //! - [`bench`] — the measurement harness with batching for sub-timer-resolution operations.
 //! - [`facts`] — the fixed facts queried from the OS (pages, cache line, cores, memory, power).
 //! - [`probes`] — the microbenchmarks.
+//! - [`wake`] — the wake probe: the expected cost of parking, on the placement production runs under.
 //! - [`profile`] — the [`MachineProfile`] assembled from facts and probes, its JSON export with
 //!   derivations, and the derived-constants table of §4.1.
 //! - [`segment`] — the RAM-only cache of the profile keyed by host identity (a memory object that
@@ -40,6 +41,7 @@ pub mod probes;
 pub mod profile;
 pub mod segment;
 pub mod stats;
+pub mod wake;
 
 pub use derived::Derived;
 pub use error::MachineError;

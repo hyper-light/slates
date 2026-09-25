@@ -17,12 +17,14 @@ use crate::facts::Facts;
 use crate::facts::PowerState;
 use crate::probes::{
   CodecPoint, CorePairRtt, FaultCosts, HashThroughput, LockCapacity, MemcpyPoint, Pinning,
-  WakeLatency,
 };
-use crate::{derived, probes};
+use crate::wake::WakeLatency;
+use crate::{derived, probes, wake};
 
-/// Format: the profile format version; bumped when a field's meaning changes.
-pub const PROFILE_VERSION: u32 = 1;
+/// Format: the profile format version; bumped when a field's meaning changes. 2 (2026-09-22): the wake
+/// latency is the confirmed sleeper's wake on the production placement, reported by its mean with an
+/// interval, its rounds and their verdict ([`crate::wake`]); version 1's p50/p99 timed a different event.
+pub const PROFILE_VERSION: u32 = 2;
 
 /// How to take a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,7 +60,7 @@ pub struct MachineProfile {
   pub syscall: Measurement,
   /// Fault costs per page class.
   pub faults: FaultCosts,
-  /// Park/unpark latency.
+  /// The wake latency: the expected cost of parking ([`crate::wake`]).
   pub wake: WakeLatency,
   /// The core matrix.
   pub core_rtt: Vec<CorePairRtt>,
@@ -87,7 +89,7 @@ impl MachineProfile {
     let timer_overhead_ns = timer_overhead_ns();
     let syscall = probes::syscall(budget);
     let faults = probes::faults(&facts.page, budget);
-    let wake = probes::wake(budget);
+    let wake = wake::wake(budget, &facts.cores);
     let (core_rtt, pinning) = if options.core_matrix {
       probes::core_matrix(&facts.cores, budget)
     } else {
@@ -151,7 +153,7 @@ impl MachineProfile {
     self.facts.power = Facts::query().power;
     self.timer_overhead_ns = timer_overhead_ns();
     self.syscall = probes::syscall(budget);
-    self.wake = probes::wake(budget);
+    self.wake = wake::wake(budget, &self.facts.cores);
   }
 
   /// The profile as JSON with every interval.
@@ -159,9 +161,28 @@ impl MachineProfile {
     serde_json::to_string_pretty(self)
   }
 
-  /// A profile from its JSON.
+  /// A profile from its JSON, refused by name when it was written in another format version (a field's
+  /// meaning changed between them, so reading one as the other would derive from the wrong quantity).
   pub fn from_json(json: &str) -> Result<MachineProfile, serde_json::Error> {
-    serde_json::from_str(json)
+    match Self::format_version(json) {
+      Some(version) if version != PROFILE_VERSION => {
+        Err(<serde_json::Error as serde::de::Error>::custom(format!(
+          "profile format version {version}; this build reads version {PROFILE_VERSION}"
+        )))
+      }
+      _ => serde_json::from_str(json),
+    }
+  }
+
+  /// The format version a profile's JSON declares, `None` when the text names none — asked before
+  /// [`from_json`](Self::from_json) by a reader that measures afresh rather than fail on another version
+  /// (the daemon handed an anchor's profile across an upgrade).
+  pub fn format_version(json: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(json)
+      .ok()?
+      .get("version")?
+      .as_u64()
+      .and_then(|version| u32::try_from(version).ok())
   }
 
   /// The derived constants, recomputed from the measurements.
@@ -180,6 +201,11 @@ impl MachineProfile {
     }
     if self.wake.quick {
       out.push("wake");
+    }
+    // Rounds that measured different wakes (a mode, or the host's load drifting through the probe) make
+    // the measurement degraded even when each round converged; nothing is sized from the verdict itself.
+    if self.wake.rounds_agree == Some(false) {
+      out.push("wake.rounds");
     }
     if self.core_rtt.iter().any(|p| p.rtt.quick) {
       out.push("core_rtt");
@@ -249,27 +275,32 @@ fn codec_bytes(facts: &Facts) -> u64 {
 /// The constants of §4.1 that other crates consume, each with its formula and anchors.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct DerivedConstants {
-  /// How long a waiter spins before parking: the median park/unpark cost, the 2-competitive
-  /// bound of Karlin et al. (spin as long as the switch would cost, then park).
+  /// How long a waiter spins before parking: the expected (mean) cost of parking — the threshold of the
+  /// 2-competitive spin-then-park rule of Karlin et al. (spin as long as parking is expected to cost, then
+  /// park), with the tail included because it is a cost of parking, not noise ([`crate::wake`]).
   pub spin_before_park_ns: Derived<u64>,
   /// The arena region size: the size at which one map syscall is one percent of the faults it
   /// amortizes, rounded to a power of two and to the huge page where the huge class is cheaper.
   pub arena_region_bytes: Derived<u64>,
-  /// The timing wheel's tick: no shorter than a wake, and no shorter than the timer floor.
+  /// The timing wheel's tick: no shorter than the expected wake, and no shorter than the timer floor.
   pub timer_tick_ns: Derived<u64>,
-  /// The step budget a task may run before the watchdog counts it as starving its shard.
+  /// The cooperative quantum: how long one task step may run before the shard serves its other work (the
+  /// I/O harvest cadence, the slice of a destroy, an archive or a pre-fault, and the long-step count) —
+  /// the expected wake, so a step keeps a peer waiting no longer than parking would have.
   pub task_step_budget_ns: Derived<u64>,
   /// The size above which a remap beats a copy, from the memcpy curve and the fault cost.
   pub copy_versus_remap_bytes: Derived<u64>,
-  /// The inbound ring's entry count: enough that a producer can keep sending for a whole wake.
+  /// The inbound ring's entry count — Little's law at the ring's overflow target: a producer sending one
+  /// message per syscall for as long as the consumer's wake takes at its p99, so a producer spins on a full
+  /// ring in fewer than one wake in a hundred.
   pub ring_entries: Derived<u64>,
 }
 
 impl DerivedConstants {
   fn from_profile(p: &MachineProfile) -> DerivedConstants {
     let page = p.facts.page.base.max(1);
-    let wake_p50 = p.wake.p50_ns.max(1);
-    let wake_p99 = p.wake.p99_ns.max(wake_p50);
+    let wake_mean = p.wake.mean_ns.max(1);
+    let wake_p99 = p.wake.p99_ns.max(1);
     let syscall = p.syscall.median_ns().max(1);
     let fault = p.faults.base_ns.max(1);
     let timer_floor = p
@@ -278,9 +309,9 @@ impl DerivedConstants {
       .max(1);
     DerivedConstants {
       spin_before_park_ns: derived!(
-        wake_p50,
-        "wake.p50 (2-competitive spin bound)",
-        ["wake.p50_ns"]
+        wake_mean,
+        "wake.mean (the expected cost of parking: the 2-competitive spin-then-park threshold)",
+        ["wake.mean_ns"]
       ),
       arena_region_bytes: derived!(
         arena_region(p, page, syscall, fault),
@@ -294,14 +325,14 @@ impl DerivedConstants {
         ]
       ),
       timer_tick_ns: derived!(
-        wake_p50.max(timer_floor),
-        "max(wake.p50, 100 × timer overhead)",
-        ["wake.p50_ns", "timer_overhead_ns"]
+        wake_mean.max(timer_floor),
+        "max(wake.mean, 100 × timer overhead)",
+        ["wake.mean_ns", "timer_overhead_ns"]
       ),
       task_step_budget_ns: derived!(
-        wake_p99,
-        "wake.p99 (a step longer than a peer's wake starves the shard)",
-        ["wake.p99_ns"]
+        wake_mean,
+        "wake.mean (a step longer than a peer's expected wake starves the shard)",
+        ["wake.mean_ns"]
       ),
       copy_versus_remap_bytes: derived!(
         copy_versus_remap(p, page, fault),
@@ -310,7 +341,7 @@ impl DerivedConstants {
       ),
       ring_entries: derived!(
         (wake_p99 / syscall).max(1).next_power_of_two(),
-        "wake.p99 / syscall.median, rounded up to a power of two",
+        "Little's law at the overflow target: one message per syscall.median for a wake at its p99, rounded up to a power of two",
         ["wake.p99_ns", "syscall.median"]
       ),
     }
@@ -378,7 +409,7 @@ mod tests {
     assert_eq!(profile.version, PROFILE_VERSION);
     assert!(profile.syscall.median_ns() > 0);
     assert!(profile.faults.base_ns > 0);
-    assert!(profile.wake.p50_ns > 0);
+    assert!(profile.wake.mean_ns > 0);
     assert!(!profile.memcpy.is_empty());
     let json = profile.to_json().unwrap();
     assert!(json.contains("\"interval\""), "intervals are exported");
@@ -386,11 +417,30 @@ mod tests {
     assert_eq!(profile, back);
   }
 
+  /// A profile written in another format version is refused by name, never read as this one (version 1's
+  /// wake p50/p99 timed a different event than version 2's), and its version is readable first so a
+  /// reader can measure afresh instead (the daemon handed an older anchor's profile across an upgrade).
+  #[test]
+  fn a_profile_of_another_format_version_is_refused_by_name() {
+    let profile = MachineProfile::measure(quick_options());
+    let json = profile.to_json().unwrap();
+    assert_eq!(MachineProfile::format_version(&json), Some(PROFILE_VERSION));
+    let older = json.replacen(
+      &format!("\"version\": {PROFILE_VERSION}"),
+      "\"version\": 1",
+      1,
+    );
+    assert_eq!(MachineProfile::format_version(&older), Some(1));
+    let refused = MachineProfile::from_json(&older).unwrap_err().to_string();
+    assert!(refused.contains("format version 1"), "{refused}");
+  }
+
   #[test]
   fn every_derived_constant_has_a_formula_and_anchors_and_is_logged() {
     let profile = MachineProfile::measure(quick_options());
     let d = profile.derived();
-    assert_eq!(d.spin_before_park_ns.get(), profile.wake.p50_ns.max(1));
+    assert_eq!(d.spin_before_park_ns.get(), profile.wake.mean_ns.max(1));
+    assert_eq!(d.task_step_budget_ns.get(), profile.wake.mean_ns.max(1));
     assert!(d.arena_region_bytes.get() >= profile.facts.page.base);
     assert!(
       d.arena_region_bytes.get().is_power_of_two()
@@ -400,7 +450,7 @@ mod tests {
           .huge
           .contains(&d.arena_region_bytes.get())
     );
-    assert!(d.timer_tick_ns.get() >= profile.wake.p50_ns);
+    assert!(d.timer_tick_ns.get() >= profile.wake.mean_ns);
     assert!(d.ring_entries.get().is_power_of_two());
     let lines = d.lines();
     assert_eq!(lines.len(), 6);
@@ -413,7 +463,7 @@ mod tests {
     let faults = profile.faults.clone();
     profile.refresh_cheap(Duration::from_millis(20));
     assert_eq!(profile.faults, faults);
-    assert!(profile.wake.p50_ns > 0);
+    assert!(profile.wake.mean_ns > 0);
   }
 
   #[test]

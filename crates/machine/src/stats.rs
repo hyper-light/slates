@@ -231,6 +231,78 @@ pub fn converged(interval: &Interval) -> bool {
   interval.width_permille() <= CONVERGED_WIDTH_PERMILLE
 }
 
+/// A 95% bootstrap interval around a mean — for a measurement whose consumers need the expected
+/// value rather than the typical one (the wake probe, [`crate::wake`]: the spin-then-park threshold is
+/// the expected cost of parking).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MeanInterval {
+  /// The mean of the sample.
+  pub mean: u64,
+  /// The lower edge of the interval.
+  pub lower: u64,
+  /// The upper edge of the interval.
+  pub upper: u64,
+}
+
+impl MeanInterval {
+  /// The relative width of the interval as an integer per-mille of the mean (0 for a zero mean).
+  pub fn width_permille(&self) -> u64 {
+    if self.mean == 0 {
+      return 0;
+    }
+    let width = u128::from(self.upper.saturating_sub(self.lower));
+    let permille = width * u128::from(PERMILLE) / u128::from(self.mean);
+    u64::try_from(permille).unwrap_or(u64::MAX)
+  }
+
+  /// Whether the two intervals share a value.
+  pub fn overlaps(&self, other: &MeanInterval) -> bool {
+    self.lower <= other.upper && other.lower <= self.upper
+  }
+}
+
+/// The mean of `values`, rounded down (the sum is taken in `u128`, so it cannot overflow), or `None`
+/// when empty.
+pub fn mean(values: &[u64]) -> Option<u64> {
+  let count = u128::try_from(values.len()).ok().filter(|n| *n > 0)?;
+  let sum: u128 = values.iter().map(|v| u128::from(*v)).sum();
+  u64::try_from(sum / count).ok()
+}
+
+/// The 95% bootstrap interval around the mean of `values` (any order), or `None` when empty: the
+/// percentile bootstrap of [`BOOTSTRAP_RESAMPLES`] resampled means, the same seeded resampling as
+/// [`bootstrap_interval`], so a recorded sample reproduces its interval exactly.
+pub fn bootstrap_mean_interval(values: &[u64], rng: &mut Xorshift) -> Option<MeanInterval> {
+  let point = mean(values)?;
+  if values.len() == 1 {
+    return Some(MeanInterval {
+      mean: point,
+      lower: point,
+      upper: point,
+    });
+  }
+  let count = u128::try_from(values.len()).unwrap_or(u128::MAX);
+  let mut means: Vec<u64> = Vec::with_capacity(BOOTSTRAP_RESAMPLES);
+  for _ in 0..BOOTSTRAP_RESAMPLES {
+    let mut sum: u128 = 0;
+    for _ in 0..values.len() {
+      sum += u128::from(values[rng.below(values.len())]);
+    }
+    means.push(u64::try_from(sum / count).unwrap_or(u64::MAX));
+  }
+  means.sort_unstable();
+  Some(MeanInterval {
+    mean: point,
+    lower: means[Percentile::LOWER_95.index(means.len())],
+    upper: means[Percentile::UPPER_95.index(means.len())],
+  })
+}
+
+/// Whether a mean's interval satisfies the stopping rule ([`CONVERGED_WIDTH_PERMILLE`] of the mean).
+pub fn converged_mean(interval: &MeanInterval) -> bool {
+  interval.width_permille() <= CONVERGED_WIDTH_PERMILLE
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -277,6 +349,43 @@ mod tests {
     let a = bootstrap_interval(&s, &mut Xorshift::new(Xorshift::SEED)).unwrap();
     let b = bootstrap_interval(&s, &mut Xorshift::new(Xorshift::SEED)).unwrap();
     assert_eq!(a, b);
+  }
+
+  /// The mean by use: a known sample's mean is exact, the sum cannot overflow, an empty sample has none,
+  /// and a constant sample's interval is a point that converges.
+  #[test]
+  fn the_mean_is_exact_and_a_constant_sample_converges_to_a_point() {
+    assert_eq!(mean(&[1, 2, 3, 4]), Some(2));
+    assert_eq!(mean(&[u64::MAX, u64::MAX]), Some(u64::MAX));
+    assert_eq!(mean(&[]), None);
+    let flat = bootstrap_mean_interval(&[500; 64], &mut Xorshift::new(Xorshift::SEED)).unwrap();
+    assert_eq!((flat.lower, flat.mean, flat.upper), (500, 500, 500));
+    assert!(converged_mean(&flat));
+  }
+
+  /// The mean interval under a heavy tail — the shape of a wake from sleep, most wakes fast and a few held
+  /// up by the host: the mean sits above the typical value, the interval is too wide to converge, a fixed
+  /// seed reproduces it, and it shares no value with a point far below it.
+  #[test]
+  fn a_heavy_tail_raises_the_mean_and_widens_a_reproducible_interval() {
+    // One wake in thirty-two held up a hundredfold.
+    let tailed: Vec<u64> = (0..256)
+      .map(|k| if k % 32 == 0 { 100_000 } else { 1_000 })
+      .collect();
+    let a = bootstrap_mean_interval(&tailed, &mut Xorshift::new(Xorshift::SEED)).unwrap();
+    let b = bootstrap_mean_interval(&tailed, &mut Xorshift::new(Xorshift::SEED)).unwrap();
+    assert_eq!(a, b);
+    assert!(
+      a.mean > 1_000 && a.lower <= a.mean && a.mean <= a.upper,
+      "{a:?}"
+    );
+    assert!(!converged_mean(&a), "{a:?}");
+    let point = MeanInterval {
+      mean: 500,
+      lower: 500,
+      upper: 500,
+    };
+    assert!(a.overlaps(&b) && !point.overlaps(&a));
   }
 
   #[test]

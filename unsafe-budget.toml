@@ -13,6 +13,10 @@
 #   inherited the one-core mask: docs/bugs/2026-09-14-core-matrix-leaves-the-anchor-pinned-to-one-core.md).
 #   Raised 44 → 45 on 2026-09-17 for clock::monotonic_ns's QueryInterruptTimePrecise output pointer:
 #   one Win32 FFI query with no safe wrapper, a common boot origin for cross-process heartbeats.
+#   Raised 45 → 49 on 2026-09-22 for the wake probe (`wake.rs`, docs/bugs/2026-09-22-wake-probe-mixes-two-
+#   events-and-reports-an-unconverged-tail.md), which confirms a waiter asleep and learns each thread's CPU:
+#   macOS `pthread_cpu_number_np`, `pthread_mach_thread_np` and `thread_info` (3) and Windows
+#   `GetCurrentProcessorNumber` (1) — FFI with no safe wrapper; Linux uses rustix and `/proc` (none).
 # slates-mem (16): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
 #   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
@@ -113,7 +117,7 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 45
+slates-machine = 49
 slates-mem = 16
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3

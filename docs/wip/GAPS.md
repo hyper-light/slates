@@ -1,5 +1,17 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The wake probe measures one event and reports its mean (2026-09-25).** The profile's wake timed
+> every park/unpark round trip, mixing an on-CPU handoff (about 0.45 µs) with a real wake (about 10 µs),
+> so runs split between the two (median 416 ns or 10,041 ns on the same container cores), and it
+> converged the median while consumers read a p99 that was often the maximum of 64 samples. Now: the
+> waiter confirmed asleep, the pair placed as production is, the mean converged (the spin-then-park
+> threshold is the expected cost of parking; a spinning waiter never saw the tail, a parked one did),
+> five rounds compared by their medians. Quiet-host containers: median 8.9–10.8 µs over ten runs, mean
+> 15.1–17.6 µs on four CPUs; macOS mean 2.03–3.27 µs over nine. Spin window, step quantum and timer
+> tick read the mean; the inbound ring the p99 at its overflow target. Owed: the boot mean is quick on a
+> VM (the runtime's refinement from its own wakes, next), and the long-step count reads wall time.
+> Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
+
 > **Client ring sized by Little's law (2026-09-22).** A daemon's client seats followed one boot
 > measurement of the wake tail: `slots_per_ring` was `wake.p99 / syscall.median`, and the bulk area
 > scales with it, so pods of one image seated 1 to 1285 clients. A one-seat KIND pod refused the lane's

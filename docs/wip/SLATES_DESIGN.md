@@ -774,7 +774,7 @@ struct MachineProfile {
   core_latency_ns: Matrix<u32>,      // measured core-to-core ring round trip / 2
   memory: MemoryInfo,                // total, free at boot, lock capacity (probed), address-space size
   fault_ns: [u32; PageClass::N],     // measured minor-fault cost per page class
-  syscall_ns: u32, wake_ns: WakeStats, // measured: trivial syscall; park→unpark p50/p99
+  syscall_ns: u32, wake_ns: WakeStats, // measured: trivial syscall; a confirmed sleeper's wake: mean ± interval, p50, p99, rounds
   memcpy_bw: Curve,                  // bytes/s by size class
   hash_bw: u64, lz4_bw: u64, zstd_bw: [Codec; LEVELS], // bytes/s
   bridge_rtt_ns: [u32; Op::N],       // measured after the root mount is up
@@ -790,12 +790,15 @@ copy the few fields they use into per-shard constants at start (no cross-shard r
 falling back to 128 when the OS returns 0, the crossbeam rationale; cores and classes; NUMA;
 memory totals; address space on 32-bit targets). 2. Probe lock capacity by locking geometrically
 growing regions until refusal; record the largest success. 3. Time N iterations of each
-microbenchmark (fault per page class with and without pre-population; trivial syscall; park/unpark
-across two threads; ring round trip between every core pair, or a sampled subset above 32 cores;
+microbenchmark (fault per page class with and without pre-population; trivial syscall; the wake of a
+thread confirmed asleep in the kernel, woken from the core production wakes it from — the control
+core to a shard core where the OS pins, unpinned where it does not — in fresh-thread rounds
+compared by their medians; ring round trip between every core pair, or a sampled subset above 32 cores;
 memcpy at each size class; BLAKE3, LZ4, zstd per candidate level on a synthetic and, when
 available, a sampled real corpus) with `CLOCK_MONOTONIC`, reporting median and bootstrapped
-interval; N derives from the observed variance (stop when the interval is narrower than a fixed
-fraction of the median, per Kalibera & Jones), with an upper bound on wall time so a slow machine
+interval — the wake reports its mean, the statistic its consumers read, with the mean's interval;
+N derives from the observed variance (stop when the interval of the statistic reported is narrower
+than a fixed fraction of it, per Kalibera & Jones), with an upper bound on wall time so a slow machine
 still boots. 4. Write the profile to the segment with its identity. 5. Re-run steps 3's cheap
 subset (wake, memcpy, one hash size) on power-state notifications and on a slow cadence derived
 from the observed drift between consecutive runs.
@@ -808,16 +811,21 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 **Refusals.** `ProfileUnavailable` (segment unreadable), `ProfileStale` (identity mismatch while a
 volume requires a matching profile), `MeasurementTimeout`.
 
-**Derived constants.** Spin window = wake_ns.p99 (Karlin); shard count = performance-class
-physical cores minus one control core (minimum one); ring depth = ceil(arrival_rate × service_time
-× safety) from measured rates with a power-of-two round-up (Little's law); pre-fault batch = idle
+> **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. Owed: the boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven) — the runtime's refinement from its own wakes — and the long-step count still reads wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
+
+**Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
+expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
+step quantum = wake_ns.mean; shard count = performance-class physical cores minus one control core
+(minimum one); ring depth = ceil(arrival_rate × service_time × safety) from measured rates with a
+power-of-two round-up (Little's law) — for the runtime's inbound ring, one message per syscall for a
+wake at its p99, the overflow target; pre-fault batch = idle
 window / fault_ns; small chunk = smallest page multiple ≥ p90 sealed-file size; large chunk = size
 where per-chunk fixed cost / memcpy cost < a fixed fraction chosen from the measured curve's knee.
 
 **Worked example.** On the author's laptop the profile reads page 16 KiB, line 128 B, 18 cores in
 two classes, 128 GiB with 108.8 GiB lockable; the 6 "Super" cores become shards, 12
 "Performance" cores serve bridge work and the control shard; the spin window is the measured
-park/unpark p99. Failure case: a locked-down CI container refuses `mlock`; the profile records
+wake's mean. Failure case: a locked-down CI container refuses `mlock`; the profile records
 lock capacity 0, the diagnostic surface reports why residency cannot be established, and
 volume admission refuses `LockCapacityExceeded`; no unlocked content claim succeeds.
 
@@ -1087,7 +1095,8 @@ large clones) so this is a bug signal.
 
 **Derived constants.** Task arena size = admission limit (Little's law on measured request rate ×
 p99 service time); batch bound = latency budget / measured per-item cost; idle spin window =
-wake_ns.p99.
+wake_ns.mean × the spin-to-park ratio; the step quantum (the I/O harvest cadence, the slices of a
+destroy, an archive or a pre-fault, and the long-step count) = wake_ns.mean.
 
 **Laptop degenerate.** Shards = performance cores; same loop; the cluster rings exist with zero
 peers.
@@ -1919,10 +1928,10 @@ stalled reply and the control channel reset, reconnect, and resend with the same
 (exactly-once by completion records). Ring full: the client blocks on the ring (credit), never
 drops.
 
-> **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the wake probe mixes an on-core handoff with a wake from sleep and stops on the median's convergence while its p99 is consumed (the runtime's inbound ring, the step budget, the spin window); `spin_ns` uses wake p50 where this section says p99; the admission value rests on two stated assumptions rather than measured rates. Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
+> **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the admission value rests on two stated assumptions rather than measured rates. (The wake probe's two events and unconverged tail, and `spin_ns` reading the p50, were closed on 2026-09-25: §4.1's status.) Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
-service time, rounded to a power of two; `spin_ns` = wake_ns.p99; idle window = wake_ns.p99 ×
+service time, rounded to a power of two; `spin_ns` = wake_ns.mean; idle window = wake_ns.mean ×
 measured spin-to-park ratio target.
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
@@ -5702,3 +5711,20 @@ Applied in the same change to: §4.8 (status); `slates-cluster` `config_group` (
 `RegionalCouncil::reconcile_voters`) and its tests; the server's council drive and fleet tests; GAPS
 and TBD_FIXES. Evidence: `docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md`. No
 Raft safety rule, timeout or capability changes.
+
+### A-30 — The wake probe measures one event and every consumer reads the statistic it needs (2026-09-25)
+
+The profile's wake latency was a park/unpark round trip whose waiter could still be running or run on
+the waker's CPU, reported as a median whose interval stopped the probe while its consumers read an
+unconverged p99. Replace it: the wake of a thread confirmed asleep, on the placement production runs
+under, converged on its mean, in rounds compared by their medians. The spin window, the step quantum
+and the timer tick read the mean (the spin-then-park rule's threshold is the expected cost of parking,
+and the tail is part of it); the runtime's inbound ring reads the p99 at its overflow target; the guest
+credit's bandwidth-delay product reads the mean. The profile format goes to version 2 and another
+version is refused by name.
+
+Applied in the same change to: §4.1 (the profile's field, the boot algorithm, derived constants, the
+worked example, status), §4.3 and §4.7 derived constants; `slates-machine` (`wake`, `stats`, `probes`,
+`profile`), the server's derivations and the daemon's profile intake; unsafe-budget; GAPS and TBD_FIXES.
+Evidence: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`. No
+consensus rule, capability or on-wire format changes.

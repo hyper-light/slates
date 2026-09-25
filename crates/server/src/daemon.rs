@@ -2166,7 +2166,7 @@ async fn serve_loop() {
     derived!(
       u64::from(s.config.region.spin_ns).saturating_mul(crate::config::IDLE_WINDOW_RATIO),
       "spin_ns × IDLE_WINDOW_RATIO",
-      ["wake.p99_ns", "IDLE_WINDOW_RATIO"]
+      ["wake.mean_ns", "IDLE_WINDOW_RATIO"]
     )
     .get()
   })

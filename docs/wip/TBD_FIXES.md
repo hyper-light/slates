@@ -15,10 +15,17 @@ authorized merely by appearing here.
   regression fails before and passes after; workspace, fleet and CLI-flow suites pass; every pod of a
   two-CPU fresh-cluster run seats 330. See
   `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
-- [ ] **The wake probe and the pressure hold.** Measure one well-defined wake event and converge the
-  statistic each derivation consumes (step budget, spin window, the runtime's inbound ring); replace
-  the pressure hold's boot-baseline shortfall with the design's hold above `committed` against the
-  memory this daemon can actually be given. Evidence in the same record.
+- [x] **The wake probe.** One event (a confirmed sleeper on the production placement), its mean
+  converged, rounds compared by their medians; spin window, step quantum and timer tick read the mean,
+  the inbound ring the p99. Median 8.9–10.8 µs over ten quiet container runs where the old probe's
+  split 416 ns / 10,041 ns. See
+  `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
+- [ ] **The runtime's own wakes refine the estimate; long steps by CPU time.** The boot mean is quick
+  on a VM (±20–30 %); measure each kicked park and each client wake after boot and feed the spin
+  window and the quantum from it; count a long poll by its CPU time, not wall time.
+- [ ] **The pressure hold.** Replace the boot-baseline shortfall with the design's hold above
+  `committed` against the memory this daemon can actually be given (evidence in
+  `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`, sibling 4).
 - [x] **Run 35615113353: KIND takeover never assigned.** The council seated its voters by
   lowest id, so the owner's replacement took the live leader's seat beside its unretired
   predecessor, then led without ever retiring it; no takeover was assigned. Seats now follow
