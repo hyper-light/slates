@@ -32,7 +32,7 @@ use crate::attribution::{self, Attribution, Tracker};
 use crate::control::Control;
 use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
-use crate::parking::Woken;
+use crate::parking::{Parked, Woken};
 use crate::queue::LocalQueue;
 use crate::registry::{self, Entry, MAX_SHARDS};
 use crate::runtime::RuntimeConfig;
@@ -341,6 +341,9 @@ impl ShardContext {
       config.timers_per_shard,
       driver.now_ns(),
     );
+    // Only a shard that tracks an estimate on a real clock times its wakes; the simulation's parks and
+    // kicks read no host clock (D-20), so its instruction counts stay free of OS calls.
+    let times_wakes = config.wake_tracking.is_some() && driver.kind() != DriverKind::Simulation;
     let context = Box::into_raw(Box::new(ShardContext {
       id: seed.id,
       local: LocalQueue::new(config.tasks_per_shard),
@@ -382,6 +385,9 @@ impl ShardContext {
     }));
     let id = seed.id;
     registry::attach_context(id, context);
+    if times_wakes && let Some(entry) = registry::entry(id) {
+      entry.parking.time_wakes();
+    }
     // SAFETY: `context` came from `Box::into_raw` just above — valid, aligned, uniquely owned — and
     // is freed only by `registry::reclaim_context`, which this thread calls after its loop returned
     // and every reference derived here is gone.
@@ -970,7 +976,7 @@ impl ShardContext {
         // the read delays nothing.
         let learns = self.real_time && self.wake.get().is_some();
         let mut switches_before_wait = None;
-        let woken = entry.parking.park_unless_pending(
+        let parked = entry.parking.park_unless_pending(
           || self.has_inbound(),
           || {
             if learns {
@@ -979,7 +985,7 @@ impl ShardContext {
             lost = self.wait_in_driver(deadline_ns);
           },
         );
-        if let Some(woken) = woken {
+        if let Parked::Waited(Some(woken)) = parked {
           self.note_wake(entry, woken, switches_before_wait);
         }
       }
