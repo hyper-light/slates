@@ -3638,6 +3638,91 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   );
 }
 
+/// Shape: how long [`a_forward_waits_for_the_owners_session_while_it_is_out`] holds the session out — five
+/// of the fleet's poll intervals, so the forward surely meets it out and polls for it, and a twentieth of the
+/// forward's liveness budget, so it comes back well inside the deadline.
+const SESSION_HOLD_NS: u64 = 5 * (HEARTBEAT_NS / POLL_PER_PERIOD);
+
+/// §4.8 Lookup (docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md): a forward that
+/// finds the owner's record session out — on a coordinator dispatch or a discovery page — waits for it inside
+/// its deadline rather than refusing the client. Do: a volume homed on a (region 0); a client on b (region 1)
+/// reads it, so b has routed to a; b's record session to a is then held out for five poll intervals, as a
+/// dispatch holds it, and the client writes a snapshot through b meanwhile, then retries the same request.
+/// Expect: the write is served and its retry answers the same snapshot; b counted a forward meeting a session
+/// that was out (the non-vacuity count: the wait really happened) and none whose session never came back.
+/// Before the fix the write was refused `HomedElsewhere` at once.
+#[test]
+fn a_forward_waits_for_the_owners_session_while_it_is_out() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let serve = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client_a.call(&scratch("session-out")) else {
+    panic!("create on node a")
+  };
+  let mut client_b = Client::connect(daemons[1].instance());
+  let routed = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      Ok(matches!(
+        client_b.call(&RequestBody::Status { volume: id }),
+        ReplyBody::Status { .. }
+      ))
+    },
+  );
+  let held = routed.then(|| daemons[1].hold_record_session(hosts[0], SESSION_HOLD_NS));
+  let written = routed.then(|| client_b.call(&RequestBody::Snapshot { volume: id }));
+  let retry = routed.then(|| client_b.call_retry(&RequestBody::Snapshot { volume: id }));
+  let counters = daemons[1].fleet_refusals();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    routed,
+    "b routed the read to its owner on a before the hold"
+  );
+  assert_eq!(
+    held.map(|held| held.map_err(|refusal| refusal.to_string())),
+    Some(Ok(true)),
+    "b's session to a was held out"
+  );
+  assert_same_snapshot_reply(
+    written.expect("the write was sent"),
+    retry.expect("the retry was sent"),
+  );
+  let counters = counters.expect("b's counters were read");
+  assert!(
+    counters
+      .get("fleet.forward.session_out")
+      .copied()
+      .unwrap_or(0)
+      > 0,
+    "the forward met the held session and waited for it: {counters:?}"
+  );
+  assert_eq!(
+    counters.get("fleet.forward.session_never_returned"),
+    None,
+    "no forward outlived its deadline: {counters:?}"
+  );
+}
+
 /// AC-8.1 / §4.8 Lookup: a home region has more members than an object's copyset. After its
 /// owner dies, a foreign client must reach the copyset successor, even when rendezvous over all
 /// live home-region members ranks an unrelated node first. The remote snapshot retry stays exactly-once.
@@ -3723,8 +3808,18 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   let written = served.then(|| foreign.call(&RequestBody::Snapshot { volume: id }));
   let retry = served.then(|| foreign.call_retry(&RequestBody::Snapshot { volume: id }));
   let counters_after = foreign_daemon.fleet_refusals().unwrap();
+  trace::record(format_args!(
+    "owner-lookup written={written:?} retry={retry:?} foreign location counters before={:?} after={:?}",
+    location_counters(&counters_before),
+    location_counters(&counters_after)
+  ));
+  trace_routing_views(&daemons, ObjectId(id.bytes));
   let resumed = retry_snapshot_until_served(&mut interrupted, id);
   let resumed_retry = interrupted.call_retry(&RequestBody::Snapshot { volume: id });
+  trace::record(format_args!(
+    "owner-lookup resumed={resumed:?} resumed_retry={resumed_retry:?}"
+  ));
+  trace_routing_views(&daemons, ObjectId(id.bytes));
   for daemon in daemons {
     daemon.stop();
   }
@@ -3837,6 +3932,57 @@ fn assert_same_snapshot_reply(first: ReplyBody, retry: ReplyBody) {
     first, retry,
     "the resumed write executes once at its successor"
   );
+}
+
+/// The owner-location counters of a daemon's refusal map, for a routing trace line.
+fn location_counters(
+  counters: &std::collections::BTreeMap<&'static str, u64>,
+) -> Vec<(&'static str, u64)> {
+  counters
+    .iter()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.owner_location") || name.starts_with("fleet.forward.")
+    })
+    .map(|(name, count)| (*name, *count))
+    .collect()
+}
+
+/// Every daemon's view of the object's route, for the opt-in trace: its root and regional
+/// configuration versions (a cached route and a location answer are both bound to the root version),
+/// the owner it holds for the object, whether a takeover of it is pending there, the object's
+/// creator's liveness there, and its owner-location counters. Read only when tracing is on.
+fn trace_routing_views(daemons: &[Daemon], object: ObjectId) {
+  if !trace::enabled() {
+    return;
+  }
+  for daemon in daemons {
+    let view = daemon
+      .observation(
+        daemon.shards().first().copied(),
+        slates_server::daemon::OBSERVE_BUDGET_NS,
+        move |state: &mut slates_server::state::ShardState| {
+          (
+            state.root.configuration().version,
+            state.council.configuration().version,
+            state.fleet.configuration().version,
+            state.fleet.object_owner(object),
+            state.pending_takeovers.contains(&object),
+            state
+              .fleet
+              .membership()
+              .state(object.creator())
+              .map(|member| member.liveness),
+          )
+        },
+      )
+      .and_then(|pending| pending.wait());
+    let counters = daemon.fleet_refusals().map(|map| location_counters(&map));
+    trace::record(format_args!(
+      "owner-lookup view host={:?} (root, regional, fleet versions, owner, pending, creator liveness)={view:?} \
+       counters={counters:?}",
+      daemon.member_identity()
+    ));
+  }
 }
 
 /// Distinguishes a failed takeover prerequisite from the routing exchange this history tests.

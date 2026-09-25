@@ -854,12 +854,21 @@ fn forward_to_owner(
       };
       let bytes = match owner {
         Some(owner) => {
-          crate::fleet::forward_over_leader_session(
+          let forwarded = crate::fleet::forward_over_leader_session(
             owner,
             request_bytes,
             crate::daemon::LIVENESS_BUDGET_NS,
           )
-          .await
+          .await;
+          if forwarded.is_none() {
+            crate::state::with_state(|state| {
+              *state
+                .refusals
+                .entry("fleet.owner_location.forward_unsent")
+                .or_insert(0) += 1;
+            });
+          }
+          forwarded
         }
         None => None,
       };

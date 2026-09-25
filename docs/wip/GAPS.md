@@ -1,5 +1,14 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **A forward waits for the owner's session (2026-09-25, §4.8 Lookup).** A forward refused the client
+> `HomedElsewhere` at once whenever a coordinator dispatch or a discovery page had the owner's session out;
+> the copyset history failed about once in fourteen runs that way (CI run 36191789379). It now waits inside
+> its deadline and counts the cause; a deterministic test holds the session out and fails on the old
+> forward. Owed: the location round skips a peer whose session is out; a formation run left one member
+> outside its region's council (one full-suite run of two, Linux container), and a first placement never
+> converged in another — both need diagnostics that explain the next occurrence. Record:
+> `docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md`.
+
 > **The wake estimate learns after boot; a long poll is attributed (2026-09-25, A-31).** The boot mean
 > was frozen for the process's life although it is ±20–30 % on a VM, and the long-step count read wall
 > time, so every preemption of a correct poll counted as the task's bug. Now each shard and each client

@@ -35,6 +35,16 @@ authorized merely by appearing here.
 - [ ] **The archive walk's unit exceeds the quantum.** At least one file piece per slice, larger than
   the mean-wake quantum; size the unit by the slice (BLAKE3 hashes incrementally) (same record,
   found 3).
+- [x] **Run 36191789379: a forward refused while the owner's session was out.** The forward now waits
+  for the session inside its deadline; a deterministic test fails on the old forward with CI's refusal.
+  See `docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md`.
+- [ ] **Formation left a member outside its council** (one full-suite Linux run in two: region 0's
+  council seated three of four members; the fourth never received a configuration within the 30 s
+  wait). The formation wait writes no trace and its message omits membership and links: add both, then
+  reproduce (same record, found 2; the KIND lane's unexplained formation failure has the same shape).
+- [ ] **A first placement that never converged** kept `poll_until` waiting past twelve minutes while the
+  test polled `AwaitPlaced` about a thousand times a second (same record, found 3).
+- [ ] **The location round skips a peer whose session is out** (same record, found 1).
 - [ ] **The pressure hold.** Replace the boot-baseline shortfall with the design's hold above
   `committed` against the memory this daemon can actually be given (evidence in
   `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`, sibling 4).

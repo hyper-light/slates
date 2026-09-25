@@ -2387,6 +2387,21 @@ version.
 > forwarded-write test requires its retry to reach the owner. Evidence and limits:
 > `docs/bugs/2026-09-17-remote-lookup-guesses-outside-the-copyset.md`.
 
+> **A forward waits for the owner's session (2026-09-25).** A forward took the owner's record session once
+> and, when a coordinator dispatch or a discovery page had it out, refused the client `HomedElsewhere` at
+> once — though the owner was live and the route right (`fleet.owner_location.direct` counted each write),
+> and though the forward's own contract said the caller retries. Right after a takeover that session is
+> busiest: a write, or the retry of a write just served, was refused about once in fourteen runs of the
+> copyset history. The forward now waits for the session inside its one deadline (the liveness budget),
+> polled at the fleet's poll interval, and counts where a missing session was
+> (`fleet.forward.session_out`, `fleet.forward.no_session`, `fleet.forward.session_never_returned`);
+> the caller counts an unsent forward (`fleet.owner_location.forward_unsent`). Proven by
+> `a_forward_waits_for_the_owners_session_while_it_is_out`, which holds the session out as a dispatch does
+> and fails on the old forward with CI's refusal; the copyset history passed 45 of 45 after it, the wait
+> exercised in 7. Owed: the location round still skips a peer whose session is out (one round answers
+> `Unavailable`; a client retries past it). Record:
+> `docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md`.
+
 **Membership.** SWIM with Lifeguard: direct probe → k indirect proxies → SUSPECT → DEAD;
 suspicion timeout `max − (max−min)·log(C+1)/log(K+1)` with the originator excluded; peer
 confirmation before suspicion; gossip with λ·ln(n+1) rebroadcasts under the measured per-path

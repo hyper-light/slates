@@ -5321,19 +5321,56 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
 /// Forwards a request to one peer over its record session and returns the reply bytes (§4.8 "Lookup" — a verb
 /// a node cannot serve locally is sent to the node that can, over [`FORWARD_STREAM`]). Borrows the peer's
 /// session the same way a dispatch does ([`take_sessions`]/[`return_sessions`], so it does not corrupt the
-/// coordinator's use — whichever misses the session retries), returning it whatever the outcome
-/// ([`request_within`]). `None` when the peer has no live session here (the caller retries); an empty `Some`
-/// when the request timed out. Called from the control shard, where the record sessions live.
+/// coordinator's use), returning it whatever the outcome ([`request_within`]).
+///
+/// A session that is not there to borrow — out on a coordinator dispatch or a discovery page, or being
+/// re-established by its link task — is waited for, paced at the fleet's poll interval
+/// (`HEARTBEAT_NS / POLL_PER_PERIOD`), inside the one `deadline_ns` that also bounds the request: the peer
+/// is live and its session is out only for a moment. Refusing at the first miss turned that moment into a
+/// client-visible `HomedElsewhere` for a write — or its retry — whose owner was serving
+/// (docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md). The first miss is counted
+/// by where the session was (`fleet.forward.session_out`: the link holds none right now;
+/// `fleet.forward.no_session`: no link), and a wait that outlives the deadline once more
+/// (`fleet.forward.session_never_returned`). `None` then (the caller refuses); an empty `Some` when the
+/// request itself timed out. Called from the control shard, where the record sessions live.
 pub(crate) async fn forward_over_leader_session(
   peer: HostId,
   request: Vec<u8>,
   deadline_ns: u64,
 ) -> Option<Vec<u8>> {
-  let mut sessions = take_sessions(|host| host == peer);
-  let (_, endpoint) = sessions.pop()?;
-  let (reply, endpoint) = request_within(endpoint, FORWARD_STREAM, &request, deadline_ns).await;
-  return_sessions(vec![(peer, endpoint)]);
-  Some(reply.bytes)
+  let began = futures::now_ns();
+  let mut missed = false;
+  loop {
+    let waited = futures::now_ns().saturating_sub(began);
+    if let Some((_, endpoint)) = take_sessions(|host| host == peer).pop() {
+      let remaining = deadline_ns.saturating_sub(waited);
+      let (reply, endpoint) = request_within(endpoint, FORWARD_STREAM, &request, remaining).await;
+      return_sessions(vec![(peer, endpoint)]);
+      return Some(reply.bytes);
+    }
+    let first_miss = !missed;
+    missed = true;
+    let expired = waited >= deadline_ns;
+    state::with_state(|s| {
+      if first_miss {
+        let missing = if s.record_sessions.contains_key(&peer) {
+          "fleet.forward.session_out"
+        } else {
+          "fleet.forward.no_session"
+        };
+        *s.refusals.entry(missing).or_insert(0) += 1;
+      }
+      if expired {
+        *s.refusals
+          .entry("fleet.forward.session_never_returned")
+          .or_insert(0) += 1;
+      }
+    });
+    if expired {
+      return None;
+    }
+    futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+  }
 }
 
 /// The pending takeovers this node should drive: the objects it owes a takeover for

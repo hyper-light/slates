@@ -791,6 +791,71 @@ impl Daemon {
     }
   }
 
+  /// Test support: holds this daemon's record session to `peer` out of its link for `span_ns` and then puts
+  /// it back, exactly as a coordinator dispatch or a discovery page holds it (`fleet::take_sessions`,
+  /// `fleet::return_sessions`), so a test drives a forward into a session that is out (§4.8 "Lookup";
+  /// docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md). The hold is a task on the
+  /// control shard, where the record sessions live, and it sleeps on the shard's timer, so the shard keeps
+  /// serving meanwhile. Returns once the hold has run its take: `Ok(true)` when it took the session,
+  /// `Ok(false)` when the link had none to take; the typed refusal when the control shard could not take the
+  /// hold within the observe budget.
+  pub fn hold_record_session(
+    &self,
+    peer: slates_db::HostId,
+    span_ns: u64,
+  ) -> Result<bool, ObserveError> {
+    let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
+    let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
+    let (taken, took) = std::sync::mpsc::sync_channel::<bool>(1);
+    let receipt = runtime
+      .spawn_on_with_receipt(shard, async move {
+        let sessions = crate::fleet::take_sessions(|host| host == peer);
+        let _ = taken.send(!sessions.is_empty());
+        slates_rt::futures::sleep(span_ns).await;
+        crate::fleet::return_sessions(sessions);
+      })
+      .map_err(|refusal| ObserveError::Submission {
+        refusal,
+        attempts: 1,
+        waited_ns: 0,
+      })?;
+    let budget = std::time::Duration::from_nanos(OBSERVE_BUDGET_NS);
+    match receipt.wait(budget) {
+      Some(slates_rt::Admission::Admitted(_)) => {}
+      Some(slates_rt::Admission::Refused(refusal)) => {
+        return Err(ObserveError::Admission {
+          refusal,
+          attempts: 1,
+          waited_ns: 0,
+        });
+      }
+      Some(slates_rt::Admission::Terminated) => {
+        return Err(ObserveError::Terminated {
+          stage: ObserveStage::Admission,
+          attempts: 1,
+        });
+      }
+      None => {
+        return Err(ObserveError::Deadline {
+          stage: ObserveStage::Admission,
+          budget_ns: OBSERVE_BUDGET_NS,
+          attempts: 1,
+          waited_ns: OBSERVE_BUDGET_NS,
+          last_refusal: None,
+        });
+      }
+    }
+    took
+      .recv_timeout(budget)
+      .map_err(|_| ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        budget_ns: OBSERVE_BUDGET_NS,
+        attempts: 1,
+        waited_ns: OBSERVE_BUDGET_NS,
+        last_refusal: None,
+      })
+  }
+
   /// Test support: fills the control shard's task arena with tasks that park until the returned
   /// [`ArenaFill`] is dropped, so an observation's admission meets a full arena while the control channel
   /// stays receptive (§4.3 "Task arena full"). Each filler is submitted with an admission receipt and the
