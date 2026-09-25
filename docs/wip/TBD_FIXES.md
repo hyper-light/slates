@@ -43,6 +43,10 @@ authorized merely by appearing here.
   just-released serve ports (the left-out node recorded `fleet.bind` and saw foreign hosts). Serialized;
   the two tests together 8/8 after (1/6 failed before), the full suite 50/50 on Linux. See
   `docs/bugs/2026-09-25-an-unserialized-fleet-test-took-another-tests-ports.md`.
+- [x] **Run 36201084174: `slates-ipc --lib` aborted (an owned descriptor closed twice).** A delivery
+  test took a descriptor number it had already closed; a parallel test's pipe could hold it by then. The
+  test now proves the close by `EPIPE` on the kept write end. See
+  `docs/bugs/2026-09-25-a-delivery-test-took-a-descriptor-number-it-had-closed.md`.
 - [ ] **Serve ports are still bound-then-released.** A test's own dialers could take its next node's port;
   none traced yet. Allocate below the kernel's ephemeral range (same record, found 1).
 - [ ] **A first placement that never converged** kept `poll_until` waiting past twelve minutes while the

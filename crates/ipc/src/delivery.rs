@@ -1264,15 +1264,24 @@ mod tests {
       (read_end.into_raw_fd().to_string(), write_end)
     }
 
-    /// A whole record on a pipe takes; the descriptor is closed by the take (a second take of the same
-    /// number is `NotInherited`).
+    /// A whole record on a pipe takes, and the take closes the descriptor: the pipe's write end, kept
+    /// here, then meets a pipe with no reader (`EPIPE`; the Rust runtime ignores `SIGPIPE`). Proved on
+    /// the pipe, never by a second take of the same number: the kernel hands a closed number to the next
+    /// open, a parallel test's pipe or socket takes it, and a second take adopts and closes *that*
+    /// descriptor — whose owner then closes it again, which the runtime aborts on (CI run 36201084174:
+    /// "IO Safety violation: owned file descriptor already closed"; the sibling test below met the same
+    /// reuse on 2026-09-14).
     #[test]
     fn a_whole_record_takes_once_and_the_descriptor_is_closed() {
-      let name = pipe_holding(&encode(42, &[9u8; 32]));
+      let (name, write_end) = pipe_still_open(&encode(42, &[9u8; 32]));
       let delivered = take_named(&name).unwrap();
       assert_eq!(delivered.consumer, 42);
       assert_eq!(delivered.capability, [9u8; 32]);
-      assert_eq!(take_named(&name), Err(DeliveryFault::NotInherited));
+      assert_eq!(
+        rustix::io::write(&write_end, &[0]),
+        Err(rustix::io::Errno::PIPE),
+        "the take closed the pipe's only read end"
+      );
     }
 
     /// A short record — truncated with the write end closed, or not yet whole with it open — is
