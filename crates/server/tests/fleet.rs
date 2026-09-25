@@ -302,7 +302,8 @@ fn profile(node: &str) -> MachineProfile {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
     core_matrix: false,
-  });
+  })
+  .expect("the machine profile measures");
   profile.facts.identity.cpu = format!("fleet-node-{node}");
   profile
 }

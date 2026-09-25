@@ -63,6 +63,7 @@ fn profile() -> MachineProfile {
     codecs: false,
     core_matrix: false,
   })
+  .expect("the machine profile measures")
 }
 
 fn deadlines() -> Deadlines {

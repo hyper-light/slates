@@ -27,17 +27,19 @@ pub(crate) fn segment_name(instance: &str) -> String {
   format!("slates-seg-{clean}")
 }
 
-/// Measures the profile: full, or quick.
-pub(crate) fn measure(quick: bool) -> MachineProfile {
-  if quick {
-    MachineProfile::measure(ProfileOptions {
+/// Measures the profile: full, or quick. A probe that could not measure at all within its bound is the
+/// failure, named (`MeasurementTimeout`), never a profile carrying a fabricated value.
+pub(crate) fn measure(quick: bool) -> Result<MachineProfile, Failure> {
+  let options = if quick {
+    ProfileOptions {
       budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
       codecs: false,
       core_matrix: false,
-    })
+    }
   } else {
-    MachineProfile::measure(ProfileOptions::default())
-  }
+    ProfileOptions::default()
+  };
+  MachineProfile::measure(options).map_err(|refusal| failed("measure the machine profile", refusal))
 }
 
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
@@ -90,10 +92,10 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
         "slates daemon: the anchor's profile is format version {version}; this daemon reads version {}: measuring its own",
         slates_machine::profile::PROFILE_VERSION
       );
-      (measure(options.quick), SegmentSource::FromEnv)
+      (measure(options.quick)?, SegmentSource::FromEnv)
     }
     Published::Alone => (
-      measure(options.quick),
+      measure(options.quick)?,
       SegmentSource::Create {
         name: segment_name(&options.instance),
       },

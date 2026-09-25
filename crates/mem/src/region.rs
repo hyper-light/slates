@@ -330,7 +330,8 @@ mod tests {
       codecs: false,
       core_matrix: false,
     };
-    let mut profile = slates_machine::MachineProfile::measure(options);
+    let mut profile =
+      slates_machine::MachineProfile::measure(options).expect("the machine profile measures");
     profile.faults.base_ns = 1000;
     profile.faults.huge_ns = Some(100);
     assert!(huge_pages_beneficial(&profile).get());

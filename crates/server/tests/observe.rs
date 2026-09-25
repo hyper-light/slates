@@ -56,7 +56,8 @@ fn laptop(name: &str) -> Daemon {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
     core_matrix: false,
-  });
+  })
+  .expect("the machine profile measures");
   let instance = format!("observe-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   Daemon::start(

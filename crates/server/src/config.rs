@@ -808,7 +808,8 @@ mod tests {
       budget_per_probe: Duration::from_millis(1),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     let quorum = Quorum { f: 1 }; // candidate floor 2f + 1 = 3
     let config = DaemonConfig::derive(&profile, "scatter-test", Some(1));
 
@@ -948,7 +949,8 @@ mod tests {
       budget_per_probe: Duration::from_millis(1),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     let config = DaemonConfig::derive(&profile, "metadata-layout", Some(1));
     let page = config.page;
     let mut arena = ChunkArena::new(page);
@@ -999,7 +1001,8 @@ mod tests {
       budget_per_probe: Duration::from_millis(1),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     let solo = DaemonConfig::derive(&profile, "fleet-share-solo", None);
     let peers: Vec<HostId> = (1..=5).map(HostId).collect();
     let fleet =
@@ -1052,7 +1055,8 @@ mod tests {
       budget_per_probe: Duration::from_millis(1),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     let total = profile.facts.memory.total;
     profile.facts.memory.limit = None;
     let unbounded = DaemonConfig::derive(&profile, "bound-none", None);

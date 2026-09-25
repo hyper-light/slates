@@ -55,7 +55,7 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
 /// Runs the anchor until a stop is requested or the daemon loops.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   signal::install().map_err(Failure::Failed)?;
-  let profile: MachineProfile = measure(options.quick);
+  let profile: MachineProfile = measure(options.quick)?;
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
   // The anchor-owned content object that holds each shard's recovery image (§4.8): one shard's
   // reserve times the partitions, lazily backed so its unused tail costs no RAM. The anchor holds

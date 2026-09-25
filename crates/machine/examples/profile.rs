@@ -5,7 +5,7 @@
 use slates_machine::{MachineProfile, ProfileOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let profile = MachineProfile::measure(ProfileOptions::default());
+  let profile = MachineProfile::measure(ProfileOptions::default())?;
   println!("{}", profile.to_json()?);
   for line in profile.derived().lines() {
     eprintln!("{line}");

@@ -1496,7 +1496,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
 
 /// `slates profile`: the machine profile, as its derived constants or as JSON.
 pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
-  let profile = crate::daemon::measure(options.quick);
+  let profile = crate::daemon::measure(options.quick)?;
   if options.json {
     let json = profile
       .to_json()
@@ -1678,7 +1678,7 @@ mod harness_tests {
   /// enrollment kept, the same attest binds.
   #[test]
   fn run_spawns_the_workload_as_an_ephemeral_consumer_and_revokes_it_after() {
-    let profile = crate::daemon::measure(true);
+    let profile = crate::daemon::measure(true).expect("the machine profile measures");
     let instance = format!("cli-run-{}", std::process::id());
     let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
     let daemon = Daemon::start(

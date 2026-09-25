@@ -73,6 +73,7 @@ fn profile() -> MachineProfile {
     codecs: false,
     core_matrix: false,
   })
+  .expect("the machine profile measures")
 }
 
 // --- The client side of the daemon's own rendezvous (as in tests/nfs_mount.rs). ---

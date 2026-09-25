@@ -217,7 +217,8 @@ fn main() {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
     core_matrix: false,
-  });
+  })
+  .expect("the machine profile measures");
   let instance = format!("provision-bench-{}", std::process::id());
   // The daemon as derived for this machine (its shard count and pinning), since AC-2.1 is
   // measured against the reference machine's own daemon.

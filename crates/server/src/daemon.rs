@@ -2629,7 +2629,8 @@ mod tests {
       budget_per_probe: std::time::Duration::from_millis(5),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     // One instance name per fixture call, not per process: the name is the daemon's segment and
     // rendezvous object, and libtest runs these tests in parallel — with only the pid in the name,
     // two concurrent audits created the same segment and the second `Daemon::start` failed
@@ -2722,7 +2723,8 @@ mod tests {
       budget_per_probe: std::time::Duration::from_millis(5),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     let instance = format!("warm-votes-{}", std::process::id());
     let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     let segment =

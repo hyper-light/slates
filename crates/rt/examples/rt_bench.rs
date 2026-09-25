@@ -193,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     budget_per_probe: Duration::from_millis(50),
     codecs: false,
     core_matrix: false,
-  });
+  })?;
   let mut spinning = config(2);
   spinning.spin_ns = profile.derived().spin_before_park_ns.get();
   let two = Runtime::start(&spinning)?;

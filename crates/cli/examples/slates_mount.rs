@@ -61,6 +61,7 @@ fn quick_profile() -> MachineProfile {
     codecs: false,
     core_matrix: false,
   })
+  .expect("the machine profile measures")
 }
 
 /// A single-shard in-process daemon (R8, the laptop-degenerate case) named for this process.

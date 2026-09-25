@@ -42,6 +42,7 @@ fn profile() -> MachineProfile {
     codecs: false,
     core_matrix: false,
   })
+  .expect("the machine profile measures")
 }
 
 /// A client: its ring end and its request sequence.

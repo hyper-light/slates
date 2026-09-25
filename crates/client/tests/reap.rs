@@ -194,7 +194,8 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
     core_matrix: false,
-  });
+  })
+  .expect("the machine profile measures");
   let instance = format!("cl-reap-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(2)).with_failover_slo(LEASE_TERM_NS);
   let daemon = Daemon::start(

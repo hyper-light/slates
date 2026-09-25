@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::bench::{MIN_SAMPLES, nanos};
+use crate::error::MachineError;
 use crate::facts::CoreFacts;
 use crate::probes::{Pinning, SavedAffinity, pin_current_thread, weaker};
 use crate::stats::{
@@ -79,7 +80,8 @@ pub struct WakeLatency {
   /// Wakes whose waker and waiter ran on one CPU: dropped when the pair was pinned to two cores (a pin
   /// the OS did not honour is not the event), kept when the OS placed the threads itself.
   pub same_cpu_samples: u32,
-  /// Rounds measured, each with a fresh waiter thread.
+  /// Rounds measured, each with a fresh waiter thread: [`WAKE_ROUNDS`], or more when the planned rounds
+  /// kept fewer than [`MIN_SAMPLES`] between them ([`wake`]).
   pub rounds: u32,
   /// Whether every round's median interval reaches the pooled one within the probe's precision
   /// ([`rounds_agree`]); `None` when fewer than two rounds kept enough samples to judge.
@@ -193,22 +195,37 @@ const GO: u32 = 1;
 const DONE: u32 = 2;
 
 /// Measures the wake latency within `budget`, on the cores `cores` names (the profile's facts).
-pub fn wake(budget: Duration, cores: &[CoreFacts]) -> WakeLatency {
+///
+/// The [`WAKE_ROUNDS`] rounds share the budget. A round whose setup — a fresh waiter scheduled and
+/// confirmed asleep — outlasts its share on a loaded machine keeps nothing, and five such rounds once left
+/// the probe with no sample at all, reported as a zero mean that every consumer derives from (a zero spin
+/// window, a one-nanosecond step quantum; CI run 36201648573, a 30 ms budget on a macOS runner). So while
+/// the pooled sample is under the stopping rule's floor ([`MIN_SAMPLES`]), up to [`WAKE_ROUNDS`] more rounds
+/// run, each with twice the last one's budget: a slow machine gets exponentially more time, within
+/// `2 + 4 + 8 + 16 + 32 = 62` more shares. Short of the floor even then, the probe refuses
+/// `MeasurementTimeout` rather than report a mean it did not measure.
+pub fn wake(budget: Duration, cores: &[CoreFacts]) -> Result<WakeLatency, MachineError> {
   let pairs = core_pairs(cores);
   let saved = SavedAffinity::of_calling_thread();
-  let per_round = budget / WAKE_ROUNDS;
+  let mut round_budget = budget / WAKE_ROUNDS;
   let mut rng = Xorshift::new(Xorshift::SEED);
   let mut kept: Vec<u64> = Vec::new();
   let mut round_medians: Vec<Interval> = Vec::new();
   let mut placement = Pinning::Pinned;
   let mut same_cpu_samples = 0u32;
   let mut asleep_confirmed = true;
-  for round in 0..WAKE_ROUNDS {
-    let pair = usize::try_from(round)
+  let mut rounds = 0u32;
+  while rounds < WAKE_ROUNDS || (kept.len() < MIN_SAMPLES && rounds < WAKE_ROUNDS.saturating_mul(2))
+  {
+    if rounds >= WAKE_ROUNDS {
+      round_budget = round_budget.saturating_mul(2);
+    }
+    let pair = usize::try_from(rounds)
       .ok()
       .and_then(|round| pairs.get(round % pairs.len().max(1)))
       .copied();
-    let outcome = wake_round(pair, per_round, &mut rng);
+    rounds += 1;
+    let outcome = wake_round(pair, round_budget, &mut rng);
     placement = weaker(placement, outcome.placement);
     same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
     asleep_confirmed &= outcome.asleep_confirmed;
@@ -224,16 +241,22 @@ pub fn wake(budget: Duration, cores: &[CoreFacts]) -> WakeLatency {
     // can vouch for its placement, and the profile says so (the core matrix's rule).
     placement = Pinning::Refused;
   }
-  summarize(
+  let pooled = (kept.len() >= MIN_SAMPLES)
+    .then(|| bootstrap_mean_interval(&kept, &mut rng))
+    .flatten()
+    .ok_or(MachineError::MeasurementTimeout { probe: "wake" })?;
+  Ok(summarize(
     &kept,
+    pooled,
     &round_medians,
     Tally {
       placement,
       same_cpu_samples,
       asleep_confirmed,
+      rounds,
     },
     &mut rng,
-  )
+  ))
 }
 
 /// What the rounds found beside their samples.
@@ -241,20 +264,18 @@ struct Tally {
   placement: Pinning,
   same_cpu_samples: u32,
   asleep_confirmed: bool,
+  /// The rounds run: [`WAKE_ROUNDS`], or more when the planned ones stayed under the floor.
+  rounds: u32,
 }
 
 /// The pooled result: the mean with its interval, the quantiles for the record, and the rounds' verdict.
 fn summarize(
   kept: &[u64],
+  pooled: MeanInterval,
   round_medians: &[Interval],
   tally: Tally,
   rng: &mut Xorshift,
 ) -> WakeLatency {
-  let pooled = bootstrap_mean_interval(kept, rng).unwrap_or(MeanInterval {
-    mean: 0,
-    lower: 0,
-    upper: 0,
-  });
   let sorted = Sample::new(kept.to_vec());
   let pooled_median = bootstrap_interval(&sorted, rng);
   WakeLatency {
@@ -266,11 +287,11 @@ fn summarize(
     sd_ns: standard_deviation(kept).unwrap_or(0),
     samples: u32::try_from(kept.len()).unwrap_or(u32::MAX),
     same_cpu_samples: tally.same_cpu_samples,
-    rounds: WAKE_ROUNDS,
+    rounds: tally.rounds,
     rounds_agree: pooled_median.and_then(|pooled| rounds_agree(round_medians, &pooled)),
     placement: tally.placement,
     asleep_confirmed: tally.asleep_confirmed,
-    quick: kept.len() < MIN_SAMPLES || !converged_mean(&pooled),
+    quick: !converged_mean(&pooled),
   }
 }
 
@@ -771,19 +792,13 @@ mod tests {
   fn a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement() {
     let facts = Facts::query();
     let before = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let w = wake(Duration::from_millis(100), &facts.cores);
+    let w = wake(Duration::from_millis(100), &facts.cores).expect("the probe measures a wake");
     let after = std::thread::available_parallelism().map_or(1, |n| n.get());
     assert_eq!(
       after, before,
       "the calling thread's usable parallelism is unchanged"
     );
-    assert_eq!(w.rounds, WAKE_ROUNDS);
-    assert!(w.samples > 0, "{w:?}");
-    assert!(
-      w.mean_lower_ns <= w.mean_ns && w.mean_ns <= w.mean_upper_ns && w.mean_ns > 0,
-      "{w:?}"
-    );
-    assert!(w.p50_ns > 0 && w.p99_ns >= w.p50_ns, "{w:?}");
+    assert_a_measured_mean(&w);
     let pairs = core_pairs(&facts.cores);
     let pinnable = cfg!(any(target_os = "linux", windows));
     if pinnable && pairs.first().is_some_and(|(a, b)| a != b) && w.placement == Pinning::Pinned {
@@ -794,5 +809,33 @@ mod tests {
     if cfg!(any(target_os = "linux", target_os = "macos")) {
       assert!(w.asleep_confirmed, "{w:?}");
     }
+  }
+
+  /// A wake that was measured: at least the planned rounds, at least the stopping rule's floor of samples,
+  /// a positive mean inside its own interval, and quantiles in order.
+  fn assert_a_measured_mean(w: &WakeLatency) {
+    assert!(w.rounds >= WAKE_ROUNDS, "{w:?}");
+    assert!(w.samples >= u32::try_from(MIN_SAMPLES).unwrap(), "{w:?}");
+    assert!(
+      w.mean_lower_ns <= w.mean_ns && w.mean_ns <= w.mean_upper_ns && w.mean_ns > 0,
+      "{w:?}"
+    );
+    assert!(w.p50_ns > 0 && w.p99_ns >= w.p50_ns, "{w:?}");
+  }
+
+  /// §4.1 refusals: a probe that measured no wake reports none. Given no time, no round can confirm a
+  /// sleeper, the extension rounds (twice nothing is nothing) cannot either, and the probe refuses by name
+  /// rather than report a zero mean for its consumers to derive from; the calling thread's mask comes back
+  /// all the same.
+  #[test]
+  fn a_probe_that_measured_no_wake_refuses_rather_than_report_a_mean() {
+    let facts = Facts::query();
+    let before = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert_eq!(
+      wake(Duration::ZERO, &facts.cores),
+      Err(MachineError::MeasurementTimeout { probe: "wake" })
+    );
+    let after = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert_eq!(after, before);
   }
 }

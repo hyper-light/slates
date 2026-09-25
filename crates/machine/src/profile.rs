@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::{Measurement, PROBE_WALL_BUDGET, TIMER_OVERHEAD_FACTOR, timer_overhead_ns};
 use crate::derived::Derived;
+use crate::error::MachineError;
 use crate::facts::Facts;
 #[cfg(test)]
 use crate::facts::PowerState;
@@ -81,15 +82,16 @@ pub struct MachineProfile {
 }
 
 impl MachineProfile {
-  /// Measures the machine.
-  pub fn measure(options: ProfileOptions) -> MachineProfile {
+  /// Measures the machine; refused `MeasurementTimeout` when a probe could not measure at all within its
+  /// bound (the wake probe, [`wake::wake`]) rather than a profile carrying a fabricated value.
+  pub fn measure(options: ProfileOptions) -> Result<MachineProfile, MachineError> {
     let started = std::time::Instant::now();
     let facts = Facts::query();
     let budget = options.budget_per_probe;
     let timer_overhead_ns = timer_overhead_ns();
     let syscall = probes::syscall(budget);
     let faults = probes::faults(&facts.page, budget);
-    let wake = wake::wake(budget, &facts.cores);
+    let wake = wake::wake(budget, &facts.cores)?;
     let (core_rtt, pinning) = if options.core_matrix {
       probes::core_matrix(&facts.cores, budget)
     } else {
@@ -129,7 +131,7 @@ impl MachineProfile {
     };
     profile.quick = !profile.quick_probes().is_empty();
     profile.elapsed_ns = crate::bench::nanos(started.elapsed());
-    profile
+    Ok(profile)
   }
 
   /// Whether the machine's power state differs from the one the profile was measured under
@@ -138,22 +140,27 @@ impl MachineProfile {
     Facts::query().power != self.facts.power
   }
 
-  /// Re-measures the cheap subset if the power state changed; returns whether it did.
-  pub fn refresh_if_power_changed(&mut self, budget: Duration) -> bool {
+  /// Re-measures the cheap subset if the power state changed; returns whether it did (a refused wake
+  /// re-measure keeps the previous measurement and is the refusal).
+  pub fn refresh_if_power_changed(&mut self, budget: Duration) -> Result<bool, MachineError> {
     if !self.power_changed() {
-      return false;
+      return Ok(false);
     }
-    self.refresh_cheap(budget);
-    true
+    self.refresh_cheap(budget)?;
+    Ok(true)
   }
 
   /// Re-measures the cheap, power-sensitive subset (timer, syscall, wake) and the power state,
   /// for the daemon to call when the power state changes.
-  pub fn refresh_cheap(&mut self, budget: Duration) {
+  ///
+  /// A wake re-measure that is refused leaves the previous wake in place — it was measured, and a
+  /// refusal is no measurement to replace it with — and is returned.
+  pub fn refresh_cheap(&mut self, budget: Duration) -> Result<(), MachineError> {
     self.facts.power = Facts::query().power;
     self.timer_overhead_ns = timer_overhead_ns();
     self.syscall = probes::syscall(budget);
-    self.wake = wake::wake(budget, &self.facts.cores);
+    self.wake = wake::wake(budget, &self.facts.cores)?;
+    Ok(())
   }
 
   /// The profile as JSON with every interval.
@@ -405,7 +412,7 @@ mod tests {
 
   #[test]
   fn a_profile_measures_within_its_budget_and_round_trips_through_json() {
-    let profile = MachineProfile::measure(quick_options());
+    let profile = MachineProfile::measure(quick_options()).expect("the machine profile measures");
     assert_eq!(profile.version, PROFILE_VERSION);
     assert!(profile.syscall.median_ns() > 0);
     assert!(profile.faults.base_ns > 0);
@@ -422,7 +429,7 @@ mod tests {
   /// reader can measure afresh instead (the daemon handed an older anchor's profile across an upgrade).
   #[test]
   fn a_profile_of_another_format_version_is_refused_by_name() {
-    let profile = MachineProfile::measure(quick_options());
+    let profile = MachineProfile::measure(quick_options()).expect("the machine profile measures");
     let json = profile.to_json().unwrap();
     assert_eq!(MachineProfile::format_version(&json), Some(PROFILE_VERSION));
     let older = json.replacen(
@@ -437,7 +444,7 @@ mod tests {
 
   #[test]
   fn every_derived_constant_has_a_formula_and_anchors_and_is_logged() {
-    let profile = MachineProfile::measure(quick_options());
+    let profile = MachineProfile::measure(quick_options()).expect("the machine profile measures");
     let d = profile.derived();
     assert_eq!(d.spin_before_park_ns.get(), profile.wake.mean_ns.max(1));
     assert_eq!(d.task_step_budget_ns.get(), profile.wake.mean_ns.max(1));
@@ -459,21 +466,57 @@ mod tests {
 
   #[test]
   fn refreshing_the_cheap_subset_keeps_the_rest() {
-    let mut profile = MachineProfile::measure(quick_options());
+    let mut profile =
+      MachineProfile::measure(quick_options()).expect("the machine profile measures");
     let faults = profile.faults.clone();
-    profile.refresh_cheap(Duration::from_millis(20));
+    profile
+      .refresh_cheap(Duration::from_millis(20))
+      .expect("the cheap subset re-measures");
     assert_eq!(profile.faults, faults);
     assert!(profile.wake.mean_ns > 0);
   }
 
+  /// §4.1 refusals: a re-measure whose wake probe could not measure refuses by name and keeps the wake
+  /// the profile already measured, rather than replacing it with nothing.
+  #[test]
+  fn a_refused_wake_re_measure_keeps_the_measured_wake() {
+    let mut profile =
+      MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let measured = profile.wake;
+    assert_eq!(
+      profile.refresh_cheap(Duration::ZERO),
+      Err(MachineError::MeasurementTimeout { probe: "wake" })
+    );
+    assert_eq!(profile.wake, measured);
+  }
+
+  /// §4.1 refusals: a profile whose wake probe could not measure at all is refused by name, never a
+  /// profile carrying a zero wake for the daemon to derive its spin and its quantum from.
+  #[test]
+  fn a_profile_whose_wake_was_not_measured_is_refused() {
+    let refused = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: Duration::ZERO,
+      codecs: false,
+      core_matrix: false,
+    });
+    assert_eq!(
+      refused.err(),
+      Some(MachineError::MeasurementTimeout { probe: "wake" })
+    );
+  }
+
   #[test]
   fn a_power_state_change_is_detected_and_triggers_a_refresh() {
-    let mut profile = MachineProfile::measure(quick_options());
+    let mut profile =
+      MachineProfile::measure(quick_options()).expect("the machine profile measures");
     assert!(
       !profile.power_changed(),
       "the state has not moved since the profile"
     );
-    assert!(!profile.refresh_if_power_changed(Duration::from_millis(10)));
+    assert_eq!(
+      profile.refresh_if_power_changed(Duration::from_millis(10)),
+      Ok(false)
+    );
     // Pretend the profile was taken on the other source: the next check must refresh.
     profile.facts.power = match profile.facts.power {
       PowerState::Mains => PowerState::Battery,
@@ -481,7 +524,10 @@ mod tests {
     };
     let before = profile.syscall;
     assert!(profile.power_changed());
-    assert!(profile.refresh_if_power_changed(Duration::from_millis(10)));
+    assert_eq!(
+      profile.refresh_if_power_changed(Duration::from_millis(10)),
+      Ok(true)
+    );
     assert!(
       !profile.power_changed(),
       "the refresh recorded the current state"
@@ -491,7 +537,8 @@ mod tests {
 
   #[test]
   fn the_copy_versus_remap_threshold_follows_the_curve() {
-    let mut profile = MachineProfile::measure(quick_options());
+    let mut profile =
+      MachineProfile::measure(quick_options()).expect("the machine profile measures");
     profile.faults.base_ns = 1;
     let first = profile.memcpy.first().map(|p| p.bytes).unwrap();
     let d = profile.derived();

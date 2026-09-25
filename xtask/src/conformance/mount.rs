@@ -135,7 +135,8 @@ mod tests {
       budget_per_probe: Duration::from_millis(5),
       codecs: false,
       core_matrix: false,
-    });
+    })
+    .expect("the machine profile measures");
     let instance = format!("conf-mount-{}", std::process::id());
     let config = DaemonConfig::derive(&profile, &instance, Some(2));
     let daemon = Daemon::start(
