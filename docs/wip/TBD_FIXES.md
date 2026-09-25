@@ -38,12 +38,16 @@ authorized merely by appearing here.
 - [x] **Run 36191789379: a forward refused while the owner's session was out.** The forward now waits
   for the session inside its deadline; a deterministic test fails on the old forward with CI's refusal.
   See `docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md`.
-- [ ] **Formation left a member outside its council** (one full-suite Linux run in two: region 0's
-  council seated three of four members; the fourth never received a configuration within the 30 s
-  wait). The formation wait writes no trace and its message omits membership and links: add both, then
-  reproduce (same record, found 2; the KIND lane's unexplained formation failure has the same shape).
+- [x] **Formation left a member outside its council — runs 36191789379 and 36199796152.** Not the
+  product: the memory-bound fleet test ran unserialized and its dialers took the copyset test's
+  just-released serve ports (the left-out node recorded `fleet.bind` and saw foreign hosts). Serialized;
+  the two tests together 8/8 after (1/6 failed before), the full suite 50/50 on Linux. See
+  `docs/bugs/2026-09-25-an-unserialized-fleet-test-took-another-tests-ports.md`.
+- [ ] **Serve ports are still bound-then-released.** A test's own dialers could take its next node's port;
+  none traced yet. Allocate below the kernel's ephemeral range (same record, found 1).
 - [ ] **A first placement that never converged** kept `poll_until` waiting past twelve minutes while the
-  test polled `AwaitPlaced` about a thousand times a second (same record, found 3).
+  test polled `AwaitPlaced` about a thousand times a second; probably the same port collision, not
+  confirmed (the forward record's found 3).
 - [ ] **The location round skips a peer whose session is out** (same record, found 1).
 - [ ] **The pressure hold.** Replace the boot-baseline shortfall with the design's hold above
   `committed` against the memory this daemon can actually be given (evidence in

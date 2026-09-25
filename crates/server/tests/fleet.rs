@@ -2667,13 +2667,19 @@ fn settle_initial_consensus(
     daemons
       .iter()
       .map(|daemon| format!(
-        "host={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?}",
+        "host={:?} council={:?} voters={:?} root={:?} leaders={:?}/{:?} alive={:?} meshed={:?} \
+         record_links(host, out)={:?} council_state={:?} refusals={:?}",
         daemon.member_identity(),
         daemon.council_members(),
         daemon.council_voters(),
         daemon.root_voters(),
         daemon.council_leads(),
-        daemon.root_leads()
+        daemon.root_leads(),
+        daemon.fleet_members(),
+        daemon.fleet_meshed(),
+        daemon.fleet_record_links(),
+        daemon.council_debug(),
+        daemon.fleet_refusals(),
       ))
       .collect::<Vec<_>>()
       .join("; ")
@@ -4624,6 +4630,12 @@ const POD_MEMORY_BYTES: u64 = 1 << 30;
 /// (`DaemonConfig::with_fleet`, 2026-09-14, `docs/bugs/2026-09-14-fleet-tasks-admitted-against-the-clients-budget.md`).
 #[test]
 fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
+  // Serialized like every other fleet test: it binds and releases thousands of loopback ports
+  // (`free_ports`, two per silent peer) and its node dials each silent peer from ephemeral ports, so run
+  // beside another fleet test it took that test's just-released serve ports — a node there failed its bind
+  // (`fleet.bind`) and its peers reached this test's daemons instead (CI runs 36191789379 and 36199796152;
+  // docs/bugs/2026-09-25-an-unserialized-fleet-test-took-another-tests-ports.md).
+  let _serial = serialize_fleet_tests();
   let pid = std::process::id();
   let (mut profile_a, host_a, identity_a) = fleet_node("bounded-a");
   profile_a.facts.memory.limit = Some(POD_MEMORY_BYTES);
