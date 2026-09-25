@@ -556,9 +556,10 @@ impl Client {
     }
   }
 
-  /// Spins this long for a reply before parking (`None`: the daemon's published window, the
-  /// measured wake cost; the 2-competitive choice for CPU). A caller with a latency floor of
-  /// its own spins for it and never pays a wake when the daemon meets it.
+  /// Spins this long for a reply before parking (`None`: the client's wake estimate — seeded with
+  /// the daemon's published window, the measured wake cost, and refined from the client's own parks;
+  /// the 2-competitive choice for CPU). A caller with a latency floor of its own spins for it and
+  /// never pays a wake when the daemon meets it.
   pub fn spin_for(&mut self, spin_ns: Option<u64>) {
     self.end.set_spin_ns(spin_ns);
   }
@@ -913,7 +914,9 @@ impl Client {
   }
 
   /// The spin window the daemon published (nanoseconds): the async fast path spins this long taking
-  /// the reply before it arms and yields to its event loop.
+  /// the reply before it arms and yields to its event loop. The async path does not refine it: its wake
+  /// is the event loop's, which the client does not time (the sync wait's estimate is
+  /// `ClientEnd::wake_estimate_ns`).
   pub fn published_spin_ns(&self) -> u64 {
     u64::from(self.end.region().spin_ns())
   }
@@ -1384,7 +1387,7 @@ impl Client {
   fn reconnect(&mut self) -> Result<(), ClientError> {
     let started = Instant::now();
     let budget = self.deadlines.reconnect_ns;
-    let mut pause_ns = u64::from(self.end.region().spin_ns()).max(1);
+    let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
       match connect_as(&self.instance, self.client_id) {
         Ok(connected) => {

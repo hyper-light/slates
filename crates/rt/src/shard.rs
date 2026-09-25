@@ -7,8 +7,11 @@
 //! window while a client is active, and park in the driver until a kick, a completion or the
 //! next deadline. Cancellation is a message that guarantees a terminal completion: the future is
 //! dropped at the next poll boundary, the task's children are cancelled and joined, and whoever
-//! joins it sees `Cancelled`. The watchdog counts polls that exceed the step budget derived from
-//! the measured wake cost (a step longer than a peer's wake starves the shard).
+//! joins it sees `Cancelled`. The watchdog counts polls that exceed the step quantum — the expected wake
+//! (a step longer than a peer's wake starves the shard), which the shard refines from the kicked parks it
+//! pays (§4.3, the online wake estimate) — and attributes each to its task (past the quantum on the CPU,
+//! or waiting inside a call) or to the host (runnable and off the CPU), so a poll the operating system
+//! preempted is not counted as the task's bug ([`crate::attribution`]).
 //!
 //! Ownership: a context is built on its own thread from a [`ShardSeed`] and leaked, so every
 //! reference to it is `&'static` and the thread-local the wakers route through holds a plain
@@ -23,9 +26,13 @@ use std::task::{Context, Poll};
 
 use slates_mem::{Encoded, Handle, Slab, SpscRing};
 
+use slates_machine::wake::WakeEstimate;
+
+use crate::attribution::{self, Attribution, Tracker};
 use crate::control::Control;
-use crate::driver::{Completion, Driver, DriverSeed, Kick};
+use crate::driver::{Completion, Driver, DriverKind, DriverSeed, Kick};
 use crate::error::RtError;
+use crate::parking::Woken;
 use crate::queue::LocalQueue;
 use crate::registry::{self, Entry, MAX_SHARDS};
 use crate::runtime::RuntimeConfig;
@@ -66,10 +73,32 @@ pub struct Counters {
   pub steps: u64,
   /// Task polls.
   pub polls: u64,
-  /// Polls longer than the step budget.
+  /// Polls past the step quantum that were their task's own — the bounded-work rule's bug signal (§4.3):
+  /// past it on the CPU, or waiting inside a call past it ([`Counters::blocked_steps`]).
   pub long_steps: u64,
-  /// The longest poll, in nanoseconds.
+  /// Of `long_steps`, the polls that waited inside a call: blocked in the kernel (a voluntary context
+  /// switch, counted per thread on Linux) or yielded by the runtime to a full peer ring.
+  pub blocked_steps: u64,
+  /// Polls past the quantum by the wall clock that the host held: within it on the CPU and never waiting
+  /// inside a call — preempted by the operating system, or the virtual CPU stolen by the hypervisor.
+  pub preempted_steps: u64,
+  /// Polls past the quantum by the wall clock that could not be attributed: no window open yet, a window
+  /// whose earlier work leaves the poll's CPU undecided, off the CPU where the platform cannot tell a
+  /// block from a preemption (macOS), or no per-thread clock (Windows). With `long_steps` and
+  /// `preempted_steps`, every poll past the quantum by the wall clock.
+  pub unattributed_steps: u64,
+  /// The longest poll by the wall clock, in nanoseconds (how long the shard was held, whoever held it).
   pub longest_step_ns: u64,
+  /// Kicked parks whose kick-to-running latency fed the online wake estimate (a non-vacuity count).
+  pub wake_samples: u64,
+  /// Kick stamps that predated their park's announcement (a sender that saw an earlier park), dropped.
+  pub wake_stale: u64,
+  /// Kicks that found the shard not yet asleep, so no wake was measured: stamped while its park was being
+  /// set up, or (Linux, where the thread's voluntary switches are counted) answered by a wait that never
+  /// slept.
+  pub wake_unslept: u64,
+  /// The online wake estimate, nanoseconds (the step quantum while the shard tracks one).
+  pub wake_cost_ns: u64,
   /// Tasks admitted.
   pub spawns: u64,
   /// Tasks whose future returned.
@@ -235,6 +264,22 @@ pub struct ShardContext {
   /// The exponentially-forgetting maximum of how late a step ran after the wait before it, nanoseconds
   /// (the measurement [`Self::scheduler_overrun_ns`] describes).
   scheduler_overrun_ns: Cell<u64>,
+  /// The online wake estimate (§4.1, §4.3): seeded with the boot probe's mean and fed each kicked park's
+  /// kick-to-running latency ([`Self::note_wake`]); the step quantum and the idle spin follow it. `None`
+  /// when the configuration carries no measured prior to track ([`crate::runtime::WakeTracking`]).
+  wake: Cell<Option<WakeEstimate>>,
+  /// The idle spin window as a multiple of the wake estimate, while tracking.
+  idle_ratio: u64,
+  /// The configured step budget and idle spin, the quantum and the spin when not tracking.
+  fixed_quantum_ns: u64,
+  fixed_spin_ns: u64,
+  /// Whether the driver's clock is real time: the simulation's is not the kicker's clock nor the thread's
+  /// CPU clock, so a simulated shard neither measures its wakes nor judges polls by CPU time (it stays
+  /// deterministic).
+  real_time: bool,
+  /// Who held each long poll: the attribution windows and when the shard reads the thread's account
+  /// ([`crate::attribution::Tracker`]). Unused on a simulated shard, whose polls are the task's alone.
+  attribution: Cell<Tracker>,
   entry: Option<&'static Entry>,
   inner: RefCell<ShardInner>,
   /// Declared after `inner`, so it drops after the tasks: a task may hold a kept value.
@@ -308,6 +353,18 @@ impl ShardContext {
       nested_borrows: Cell::new(0),
       waited_for_ns: Cell::new(None),
       scheduler_overrun_ns: Cell::new(0),
+      wake: Cell::new(
+        config
+          .wake_tracking
+          .map(|tracking| WakeEstimate::new(tracking.prior_ns, tracking.shift)),
+      ),
+      idle_ratio: config
+        .wake_tracking
+        .map_or(1, |tracking| tracking.idle_ratio),
+      fixed_quantum_ns: config.step_budget_ns,
+      fixed_spin_ns: config.spin_ns,
+      real_time: driver.kind() != DriverKind::Simulation,
+      attribution: Cell::new(Tracker::default()),
       entry: registry::entry(seed.id),
       inner: RefCell::new(ShardInner {
         arena,
@@ -415,6 +472,7 @@ impl ShardContext {
     let mut c = self.with_inner(|inner| inner.counters).unwrap_or_default();
     c.nested_borrows = self.nested_borrows.get();
     c.scheduler_overrun_ns = self.scheduler_overrun_ns.get();
+    c.wake_cost_ns = self.wake_cost_ns();
     c
   }
 
@@ -511,6 +569,8 @@ impl ShardContext {
   /// state is borrowed (a wake from inside a borrow): the next turn drains.
   fn drain_while_waiting(&self) {
     let _ = self.with_inner(|inner| self.drain_inbound(inner));
+    // The poll waits for its peer here, not on the CPU: the window marks it (`attribution`).
+    self.update_attribution(Tracker::yielded_in_poll);
     std::thread::yield_now();
   }
 
@@ -690,10 +750,6 @@ impl ShardContext {
     // step budget (`step_budget_ns`, "a step longer than a peer's wake starves the shard" — §4.3) since
     // its last wait: I/O then keeps pace with tasks under any load, and an idle shard (which reaches
     // `park` every loop) pays nothing for it.
-    let step_budget_ns = self
-      .with_inner(|inner| inner.config.step_budget_ns)
-      .unwrap_or(0)
-      .max(1);
     let mut last_wait_ns = self.now_ns();
     loop {
       let outcome = self.step();
@@ -706,7 +762,7 @@ impl ShardContext {
       }
       if outcome.did_work {
         let now = self.now_ns();
-        if now.saturating_sub(last_wait_ns) >= step_budget_ns {
+        if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
           self.harvest_io();
           last_wait_ns = now;
         }
@@ -746,13 +802,21 @@ impl ShardContext {
   /// arrived or a timer fell due during the spin (either is work for the next step), false when
   /// the window ran out with nothing to do.
   fn spin_until_work(&self, deadline_ns: Option<u64>) -> bool {
-    let (spin_ns, now) = self
-      .with_inner(|inner| (inner.config.spin_ns, inner.driver.now_ns()))
-      .unwrap_or((0, 0));
+    let spin_ns = self.spin_window_ns();
+    let now = self.now_ns();
     if spin_ns == 0 {
       return false;
     }
-    let spin_end = now.saturating_add(spin_ns);
+    self.update_attribution(Tracker::wait_began);
+    let found = self.spin_for_work(now.saturating_add(spin_ns), deadline_ns);
+    if found {
+      self.wait_ended();
+    }
+    found
+  }
+
+  /// The spin itself: true when work arrived or `deadline_ns` fell due before `spin_end`.
+  fn spin_for_work(&self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
     loop {
       // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
       // when asked), so the spin wakes the pollers it finds ready rather than only reporting them:
@@ -825,6 +889,12 @@ impl ShardContext {
       };
     }
     registry::set_current(Some(self));
+    // While a long poll has gone unattributed, each step opens a window at its start, so the next long
+    // poll is judged by the step's own CPU alone; an unarmed shard reads nothing.
+    if self.real_time {
+      let now = self.now_ns();
+      self.update_attribution(|tracker| tracker.step_began(now, attribution::thread_account));
+    }
     let mut did_work = false;
     let (drained, batch) = self
       .with_inner(|inner| {
@@ -877,6 +947,7 @@ impl ShardContext {
     if exit {
       self.exited.set(true);
     }
+    self.update_attribution(|tracker| tracker.step_ended(did_work));
     StepOutcome {
       did_work,
       next_deadline_ns,
@@ -891,19 +962,134 @@ impl ShardContext {
   pub fn park(&'static self, deadline_ns: Option<u64>) {
     // What this wait is for; the next step measures how late it runs against it (`scheduler_overrun_ns`).
     self.waited_for_ns.set(deadline_ns);
+    self.update_attribution(Tracker::wait_began);
     let mut lost = false;
     match self.entry {
       Some(entry) => {
-        entry.parking.park_unless_pending(
+        // A tracking shard counts its voluntary switches as the wait begins, so a kicked park can tell a
+        // wait that slept from one that found the kick pending (`note_wake`); the shard is idle here, so
+        // the read delays nothing.
+        let learns = self.real_time && self.wake.get().is_some();
+        let mut switches_before_wait = None;
+        let woken = entry.parking.park_unless_pending(
           || self.has_inbound(),
-          || lost = self.wait_in_driver(deadline_ns),
+          || {
+            if learns {
+              switches_before_wait = attribution::voluntary_switches_now();
+            }
+            lost = self.wait_in_driver(deadline_ns);
+          },
         );
+        if let Some(woken) = woken {
+          self.note_wake(entry, woken, switches_before_wait);
+        }
       }
       None => lost = self.wait_in_driver(deadline_ns),
     }
+    self.wait_ended();
     if lost {
       self.fail_all();
     }
+  }
+
+  /// The step quantum now (§4.3, "a step longer than a peer's wake starves the shard"): the online wake
+  /// estimate while the shard tracks one, else the configured step budget. What the I/O harvest cadence,
+  /// the long-step count and the daemon's cooperative slices ([`crate::futures::step_budget_ns`]) read.
+  pub fn quantum_ns(&self) -> u64 {
+    self
+      .wake
+      .get()
+      .map_or(self.fixed_quantum_ns, |estimate| estimate.mean_ns())
+      .max(1)
+  }
+
+  /// The idle spin window now: the online wake estimate times the configured idle ratio while the shard
+  /// tracks one (the 2-competitive spin, §4.3), else the configured spin.
+  fn spin_window_ns(&self) -> u64 {
+    self.wake.get().map_or(self.fixed_spin_ns, |estimate| {
+      estimate.mean_ns().saturating_mul(self.idle_ratio)
+    })
+  }
+
+  /// The online wake estimate now, nanoseconds (the configured step budget when not tracking).
+  pub fn wake_cost_ns(&self) -> u64 {
+    self.quantum_ns()
+  }
+
+  /// Folds a park's measured wake into the online estimate (§4.3): the kick-to-running latency of a park
+  /// a kick ended asleep ([`Woken::latency_ns`]) — the event the boot probe times, a sleeper woken. A
+  /// stamp from before the park's announcement is counted stale; one from the park's setup, or (Linux) a
+  /// wait across which the thread never switched out (`switches_before_wait` against now), found the
+  /// shard awake and is counted unslept; both are dropped. A park a timer or a completion ended teaches
+  /// nothing. Only a tracking shard on a real clock learns: the simulation's clock is not the kicker's.
+  fn note_wake(&self, entry: &Entry, woken: Woken, switches_before_wait: Option<u64>) {
+    let Some(mut estimate) = self.wake.get() else {
+      return;
+    };
+    if !self.real_time {
+      return;
+    }
+    if woken.stale() {
+      self.with_inner(|inner| inner.counters.wake_stale += 1);
+      return;
+    }
+    let Some(latency) = woken.latency_ns() else {
+      if woken.early() {
+        self.with_inner(|inner| inner.counters.wake_unslept += 1);
+      }
+      return;
+    };
+    // Where the thread's voluntary switches are counted, a wait that never switched never slept: the
+    // kick was pending when the wait began (or landed before the kernel put the thread to sleep).
+    if let (Some(before), Some(after)) =
+      (switches_before_wait, attribution::voluntary_switches_now())
+      && after == before
+    {
+      self.with_inner(|inner| inner.counters.wake_unslept += 1);
+      return;
+    }
+    estimate.record(latency);
+    self.wake.set(Some(estimate));
+    let mean = estimate.mean_ns();
+    self.with_inner(|inner| {
+      inner.counters.wake_samples += 1;
+      inner.counters.wake_cost_ns = mean;
+    });
+    entry.pulse.record_wake_cost(mean);
+  }
+
+  /// Attributes a poll against the step quantum (§4.3's long-step count): within it by the wall clock it
+  /// is within; past it, the attribution windows decide whose it was ([`crate::attribution`]). A
+  /// simulated shard's clock is not the thread's, and nothing preempts a simulation, so its long polls
+  /// are the task's.
+  fn attribute_poll(&self, poll_started_ns: u64, ended_ns: u64) -> Option<Attribution> {
+    let quantum = self.quantum_ns();
+    if ended_ns.saturating_sub(poll_started_ns) <= quantum {
+      return None;
+    }
+    if !self.real_time {
+      return Some(Attribution::Long);
+    }
+    let end = attribution::thread_account();
+    let mut tracker = self.attribution.get();
+    let attributed = tracker.long_poll(poll_started_ns, ended_ns, end, quantum);
+    self.attribution.set(tracker);
+    Some(attributed)
+  }
+
+  /// A wait ended: while a long poll has gone unattributed, a window opens now.
+  fn wait_ended(&self) {
+    if self.real_time {
+      let now = self.now_ns();
+      self.update_attribution(|tracker| tracker.wait_ended(now, attribution::thread_account));
+    }
+  }
+
+  /// Applies `change` to the attribution tracker.
+  fn update_attribution(&self, change: impl FnOnce(&mut Tracker)) {
+    let mut tracker = self.attribution.get();
+    change(&mut tracker);
+    self.attribution.set(tracker);
   }
 
   /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions
@@ -1172,11 +1358,23 @@ impl ShardContext {
     self.current_task.set(Some(slot));
     let start = self.now_ns();
     let poll = future.as_mut().poll(&mut cx);
-    let elapsed = self.now_ns().saturating_sub(start);
+    let ended = self.now_ns();
     self.current_task.set(None);
     let done = matches!(poll, Poll::Ready(()));
-    let dropped =
-      self.with_inner(|inner| after_poll(inner, &self.local, slot, future, elapsed, done));
+    let attributed = self.attribute_poll(start, ended);
+    let dropped = self.with_inner(|inner| {
+      after_poll(
+        inner,
+        &self.local,
+        PollDone {
+          slot,
+          future,
+          elapsed: ended.saturating_sub(start),
+          done,
+          attributed,
+        },
+      )
+    });
     drop(dropped);
   }
 }
@@ -1215,20 +1413,30 @@ fn take_future(inner: &mut ShardInner, slot: u32) -> Option<(BoxedFuture, u32, b
   Some((future, handle.generation(), false))
 }
 
-/// Records the poll and either stores the future back or finishes the task; returns a future to
-/// drop outside the borrow, if any.
-fn after_poll(
-  inner: &mut ShardInner,
-  local: &LocalQueue,
+/// One finished poll, as `after_poll` records it.
+struct PollDone {
   slot: u32,
   future: BoxedFuture,
   elapsed: u64,
   done: bool,
-) -> Option<BoxedFuture> {
-  let budget = inner.config.step_budget_ns;
+  /// Who held it, when it ran past the step quantum by the wall clock ([`ShardContext::attribute_poll`]).
+  attributed: Option<Attribution>,
+}
+
+/// Records the poll and either stores the future back or finishes the task; returns a future to
+/// drop outside the borrow, if any.
+fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Option<BoxedFuture> {
+  let PollDone {
+    slot,
+    future,
+    elapsed,
+    done,
+    attributed,
+  } = poll;
+  let long = attributed.is_some_and(Attribution::is_tasks);
   inner.counters.polls += 1;
-  if elapsed > budget {
-    inner.counters.long_steps += 1;
+  if let Some(attributed) = attributed {
+    count_long_poll(&mut inner.counters, attributed);
   }
   inner.counters.longest_step_ns = inner.counters.longest_step_ns.max(elapsed);
   let Some(handle) = handle_at(&inner.arena, slot) else {
@@ -1238,7 +1446,7 @@ fn after_poll(
     return Some(future);
   };
   task.polls += 1;
-  if elapsed > budget {
+  if long {
     task.long_steps += 1;
   }
   task.longest_step_ns = task.longest_step_ns.max(elapsed);
@@ -1253,6 +1461,22 @@ fn after_poll(
   task.future = Some(future);
   task.state = State::Idle;
   None
+}
+
+/// Counts a poll past the step quantum by the wall clock under whoever held it.
+fn count_long_poll(counters: &mut Counters, attributed: Attribution) {
+  if attributed.is_tasks() {
+    counters.long_steps += 1;
+  }
+  if attributed == Attribution::Blocked {
+    counters.blocked_steps += 1;
+  }
+  if attributed == Attribution::Preempted {
+    counters.preempted_steps += 1;
+  }
+  if attributed.is_unattributed() {
+    counters.unattributed_steps += 1;
+  }
 }
 
 /// Moves a task to `Finishing`, joins its children (cancelling the live ones, reaping the done

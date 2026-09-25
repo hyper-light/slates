@@ -5134,7 +5134,7 @@ async fn run_record_period(
     origin,
     shard,
     move |s| {
-      let slice_bytes = s.config.archive_slice_bytes;
+      let slice_bytes = s.config.archive_slice_bytes();
       let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
       advance_seals(s, local, slice_bytes, created_unix, budget)
     },

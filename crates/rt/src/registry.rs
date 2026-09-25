@@ -121,6 +121,9 @@ pub struct Pulse {
   /// each wait it folds in, so a stall diagnosis on another thread can tell a shard the operating
   /// system is not scheduling (this climbs) from one held inside its own work (it does not).
   scheduler_overrun_ns: AtomicU64,
+  /// The shard's online wake estimate (`ShardContext::wake_cost_ns`), mirrored at each wake it folds
+  /// in, for a reader on another thread (the daemon's status, a stall diagnosis).
+  wake_cost_ns: AtomicU64,
 }
 
 impl Pulse {
@@ -134,6 +137,17 @@ impl Pulse {
   /// The shard's measured scheduler overrun, nanoseconds (see [`Pulse::record_scheduler_overrun`]).
   pub fn scheduler_overrun_ns(&self) -> u64 {
     self.scheduler_overrun_ns.load(Ordering::Relaxed)
+  }
+
+  /// The owning shard mirrors its online wake estimate after folding a wake into it.
+  pub fn record_wake_cost(&self, wake_cost_ns: u64) {
+    self.wake_cost_ns.store(wake_cost_ns, Ordering::Relaxed);
+  }
+
+  /// The shard's online wake estimate, nanoseconds; 0 until its first measured wake (see
+  /// [`Pulse::record_wake_cost`]).
+  pub fn wake_cost_ns(&self) -> u64 {
+    self.wake_cost_ns.load(Ordering::Relaxed)
   }
 
   /// The owning shard's application loop marks one period of forward progress.

@@ -39,6 +39,7 @@ fn config() -> RuntimeConfig {
     cores: Vec::new(),
     page_bytes: 4096,
     spin_ns: SPIN_NS,
+    wake_tracking: None,
   }
 }
 

@@ -33,11 +33,62 @@ use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 
-/// The shard's announcement that it is parked, and the count of kicks the announcement saved.
+/// The shard's announcement that it is parked, the count of kicks the announcement saved, and the
+/// stamp of the first kick sent to the current park (the shard's online wake estimate, §4.3).
 #[derive(Debug)]
 pub struct Parking {
   parked: AtomicBool,
   kicks_skipped: AtomicU64,
+  /// When the first kick of the current park was sent (host monotonic nanoseconds), 0 when none was;
+  /// the shard takes it after its wait. A measurement word, outside the protocol: its orders are
+  /// `Relaxed`, and a stamp lost to a race costs one sample, never a wake.
+  kicked_at: AtomicU64,
+}
+
+/// What a park that waited learned about its wake: when it announced itself parked, when it entered its
+/// wait, when the wait returned, and the stamp of the kick sent to it, if one was (§4.3, the shard's
+/// online wake estimate).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Woken {
+  /// When the shard announced it was parking (host monotonic nanoseconds).
+  pub announced_ns: u64,
+  /// When it entered the driver's blocking wait, after the re-check.
+  pub waiting_ns: u64,
+  /// When its wait returned — the moment it ran again.
+  pub returned_ns: u64,
+  /// The first kick's stamp during this park, if a kick came.
+  pub kicked_ns: Option<u64>,
+}
+
+impl Woken {
+  /// The kick-to-running latency this park measured: the kick's stamp falls between the wait's entry and
+  /// its return, so the kick found the shard asleep (or about to be) — the event the boot probe times.
+  /// `None` when no kick came (a timer or a completion woke it), when the stamp predates the announcement
+  /// (a sender that saw an earlier park — [`Woken::stale`]), when it landed while the park was being set up
+  /// (the wait then returned without sleeping — [`Woken::early`]; timing it would feed a wake that never
+  /// happened into the estimate and bias it low), or when it came after the wait had already returned (a
+  /// kick that did not wake this park).
+  pub fn latency_ns(&self) -> Option<u64> {
+    let kicked = self.kicked_ns?;
+    (self.waiting_ns <= kicked && kicked <= self.returned_ns)
+      .then(|| self.returned_ns.saturating_sub(kicked))
+  }
+
+  /// Whether the stamp found predates this park's announcement: a sender that read an earlier park's
+  /// announcement and stamped after it was withdrawn (counted, never measured).
+  pub fn stale(&self) -> bool {
+    self
+      .kicked_ns
+      .is_some_and(|kicked| kicked < self.announced_ns)
+  }
+
+  /// Whether the kick landed between the announcement and the wait's entry: the wait found it pending and
+  /// returned without sleeping (counted, never measured).
+  pub fn early(&self) -> bool {
+    self
+      .kicked_ns
+      .is_some_and(|kicked| self.announced_ns <= kicked && kicked < self.waiting_ns)
+  }
 }
 
 impl Default for Parking {
@@ -52,15 +103,23 @@ impl Parking {
     Self {
       parked: AtomicBool::new(false),
       kicks_skipped: AtomicU64::new(0),
+      kicked_at: AtomicU64::new(0),
     }
   }
 
   /// The sender's half, called after the message is published (a word in the ring, the control
   /// flag set): kicks the shard when it has announced parking, else counts the kick saved. The
-  /// fence orders the publication before the read of the announcement (the module doc).
+  /// fence orders the publication before the read of the announcement (the module doc). The first
+  /// kick of a park stamps when it was sent, so the woken shard can time its own wake.
   pub fn kick_if_parked(&self, kick: impl FnOnce()) {
     fence(Ordering::SeqCst);
     if self.parked.load(Ordering::SeqCst) {
+      let _ = self.kicked_at.compare_exchange(
+        0,
+        slates_machine::clock::monotonic_ns(),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+      );
       kick();
     } else {
       self.kicks_skipped.fetch_add(1, Ordering::Relaxed);
@@ -68,19 +127,35 @@ impl Parking {
   }
 
   /// The shard's half: announces parking, then asks `pending` whether a message already waits.
-  /// When one does, withdraws the announcement and returns `false` without waiting; otherwise
-  /// runs `wait` (the driver's blocking wait, which a kick ends), withdraws the announcement
-  /// afterwards, and returns `true`. The fence orders the announcement before the re-check.
-  pub fn park_unless_pending(&self, pending: impl FnOnce() -> bool, wait: impl FnOnce()) -> bool {
+  /// When one does, withdraws the announcement and returns `None` without waiting; otherwise
+  /// runs `wait` (the driver's blocking wait, which a kick ends), takes the kick's stamp, withdraws the
+  /// announcement afterwards, and returns what the park learned about its wake. The fence orders the
+  /// announcement before the re-check. The announcement's time is read before the announcement itself,
+  /// so every stamp a sender takes after reading it is at least that time; the wait's entry time is read
+  /// just before `wait`, so a stamp before it is a kick the wait will find pending.
+  pub fn park_unless_pending(
+    &self,
+    pending: impl FnOnce() -> bool,
+    wait: impl FnOnce(),
+  ) -> Option<Woken> {
+    let announced_ns = slates_machine::clock::monotonic_ns();
     self.parked.store(true, Ordering::SeqCst);
     fence(Ordering::SeqCst);
     if pending() {
       self.parked.store(false, Ordering::SeqCst);
-      return false;
+      return None;
     }
+    let waiting_ns = slates_machine::clock::monotonic_ns();
     wait();
+    let returned_ns = slates_machine::clock::monotonic_ns();
+    let kicked = self.kicked_at.swap(0, Ordering::Relaxed);
     self.parked.store(false, Ordering::SeqCst);
-    true
+    Some(Woken {
+      announced_ns,
+      waiting_ns,
+      returned_ns,
+      kicked_ns: (kicked != 0).then_some(kicked),
+    })
   }
 
   /// Kicks skipped because the shard had not announced parking (the saving, counted).
@@ -153,7 +228,10 @@ mod loom_tests {
         if let Some(word) = consumer.pop() {
           break word;
         }
-        if parking.park_unless_pending(|| !ring.is_empty(), || kick.wait()) {
+        if parking
+          .park_unless_pending(|| !ring.is_empty(), || kick.wait())
+          .is_some()
+        {
           waited = true;
         }
       };
@@ -176,5 +254,82 @@ mod loom_tests {
       WAITS.load(StdOrdering::Relaxed) > 0,
       "some interleaving made the shard wait"
     );
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Format: a park announced at 1 µs, waiting at 1.5 µs and returned at 5 µs, kicked at `kicked_ns`.
+  fn woken(kicked_ns: Option<u64>) -> Woken {
+    Woken {
+      announced_ns: 1_000,
+      waiting_ns: 1_500,
+      returned_ns: 5_000,
+      kicked_ns,
+    }
+  }
+
+  /// The shard's online wake estimate (§4.3) takes a sample only from a kick that woke this park asleep:
+  /// its stamp between the wait's entry and its return. A timer's or a completion's wake (no stamp), a
+  /// stamp from before the announcement, one from the park's setup (the wait found it pending and never
+  /// slept), and a kick that landed after the wait had returned yield none.
+  #[test]
+  fn a_wake_is_measured_only_from_the_kick_that_ended_this_park() {
+    assert_eq!(woken(Some(2_000)).latency_ns(), Some(3_000));
+    assert_eq!(woken(Some(1_500)).latency_ns(), Some(3_500));
+    assert_eq!(woken(None).latency_ns(), None);
+    assert_eq!(woken(Some(1_000)).latency_ns(), None);
+    assert_eq!(woken(Some(900)).latency_ns(), None);
+    assert_eq!(woken(Some(5_001)).latency_ns(), None);
+  }
+
+  /// A stamp the park did not measure is told apart: before the announcement it is stale (a sender that
+  /// saw an earlier park), from the park's setup it is early; a missing stamp and a late one are neither.
+  #[test]
+  fn an_unmeasured_stamp_is_told_stale_or_early() {
+    let class = |kicked_ns| {
+      let park = woken(kicked_ns);
+      (park.stale(), park.early())
+    };
+    assert_eq!(class(Some(900)), (true, false));
+    assert_eq!(class(Some(1_000)), (false, true));
+    assert_eq!(class(Some(1_499)), (false, true));
+    assert_eq!(class(Some(1_500)), (false, false));
+    assert_eq!(class(None), (false, false));
+    assert_eq!(class(Some(5_001)), (false, false));
+  }
+
+  /// A park kicked by another thread learns the kick's stamp; a park with a message already pending
+  /// never waits and learns nothing.
+  #[test]
+  fn a_kicked_park_learns_its_kicks_stamp() {
+    let parking = Parking::new();
+    assert_eq!(parking.park_unless_pending(|| true, || {}), None);
+    let woken = std::thread::scope(|scope| {
+      let (tx, rx) = std::sync::mpsc::channel::<()>();
+      let parked = &parking;
+      let kicker = scope.spawn(move || {
+        while !parked.parked() {
+          std::thread::yield_now();
+        }
+        parked.kick_if_parked(|| {
+          let _ = tx.send(());
+        });
+      });
+      let woken = parking.park_unless_pending(
+        || false,
+        || {
+          let _ = rx.recv();
+        },
+      );
+      let _ = kicker.join();
+      woken
+    });
+    let woken = woken.expect("the park waited");
+    assert!(woken.kicked_ns.is_some(), "{woken:?}");
+    assert!(woken.latency_ns().is_some(), "{woken:?}");
+    assert_eq!(parking.kicks_skipped(), 0);
   }
 }

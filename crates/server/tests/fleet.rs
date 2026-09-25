@@ -247,7 +247,7 @@ fn describe(daemons: &[&Daemon]) -> String {
         .map(|pulse| {
           format!(
             "{}:steps={} waits={} spawns={} done={} adm_refused={} longest_step_ms={} parked={} \
-             kicks_skipped={} ring_full={} overrun_ms={}",
+             kicks_skipped={} ring_full={} overrun_ms={} wake_us={}",
             pulse.shard,
             pulse.steps,
             pulse.waits,
@@ -258,7 +258,8 @@ fn describe(daemons: &[&Daemon]) -> String {
             pulse.parked,
             pulse.kicks_skipped,
             pulse.ring_full_events,
-            pulse.scheduler_overrun_ns / 1_000_000
+            pulse.scheduler_overrun_ns / 1_000_000,
+            pulse.wake_cost_ns / 1_000
           )
         })
         .collect();

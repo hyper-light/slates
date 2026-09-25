@@ -811,11 +811,14 @@ A microbenchmark exceeding its wall-time bound: Degraded, widened interval recor
 **Refusals.** `ProfileUnavailable` (segment unreadable), `ProfileStale` (identity mismatch while a
 volume requires a matching profile), `MeasurementTimeout`.
 
-> **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. Owed: the boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven) — the runtime's refinement from its own wakes — and the long-step count still reads wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
+> **Status (2026-09-25, the wake probe measures one event and reports its mean).** The probe timed every park/unpark round trip, so it mixed an on-CPU handoff (about 0.45 µs, the waiter still running or on the waker's CPU) with a real wake (about 10 µs); thread placement holds for a run, so runs split between the two (median 416 ns or 10,041 ns on the same two container cores, a minute apart), and it stopped on the median's interval while its consumers read the p99 — often the maximum of 64 samples (667 ns to 511,042 ns). Now the waiter is confirmed asleep (Linux `/proc` state, macOS `thread_info`; Windows the waiter's announcement, reported unconfirmed), the pair is placed as production is (the control core waking a shard core where the OS pins; unpinned on macOS, with the same-CPU share recorded), the probe converges the mean — the spin-then-park rule's threshold is the expected cost of parking, and a spinning waiter on the same pinned cores never saw the tail (p99 ≤ 209 ns) while a parked one did (285–639 µs) — and five fresh-thread rounds are compared by their medians (a disagreement lists the probe degraded, `wake.rounds`). Measured on a quiet host: the median held at 8.9–10.8 µs over ten container runs and the mean at 15.1–17.6 µs on four CPUs; macOS's mean held at 2.03–2.49 µs. The spin window, the step quantum and the timer tick now read the mean, the runtime's inbound ring the p99 at its overflow target, the guest credit's kick round trip the mean; a profile of another format version is refused by name, and a daemon handed one by an older anchor measures its own. The boot mean is quick on a virtual machine (±20–30 % in 250 ms at a coefficient of variation of five to seven); since A-31 (2026-09-25) it is only the prior of each shard's and each client's online estimate, refined from the confirmed wakes they pay (§4.3 and §4.7 status), and the long-step count attributes each long poll to its task or to the host rather than reading wall time. Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
 **Derived constants.** Spin window = wake_ns.mean (Karlin: the 2-competitive threshold is the
 expected cost of parking, and the wake's heavy tail is part of that cost, not noise); the cooperative
-step quantum = wake_ns.mean; shard count = performance-class physical cores minus one control core
+step quantum = wake_ns.mean — both as the prior of the online estimate a shard and a client refine
+from their own confirmed wakes (A-31), weighted over about 2^shift wakes with shift =
+⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉, the sample size at which the estimate is as
+precise as the probe asks of itself; shard count = performance-class physical cores minus one control core
 (minimum one); ring depth = ceil(arrival_rate × service_time × safety) from measured rates with a
 power-of-two round-up (Little's law) — for the runtime's inbound ring, one message per syscall for a
 wake at its p99, the overflow target; pre-fault batch = idle
@@ -1009,8 +1012,8 @@ ring and kicks the driver; a stale generation is ignored.
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
 run ready tasks to their next await; expire timers; store the loop generation (QSBR); if nothing
-is ready, spin for the measured idle-spin window (while any client is active), then park in the
-driver. Cancellation: dropping a future releases nothing it did not own (resources live in arenas
+is ready, spin for the idle-spin window (while any client is active) — a multiple of the shard's
+wake estimate — then park in the driver. Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
 completion.
@@ -1088,15 +1091,21 @@ cluster.
 
 > **Status (2026-09-17, admission receipts).** A spawn submitted to a shard from another thread was only ever a *submission*: `Runtime::spawn_on`'s `Ok` meant the request was in the control channel, and whether the shard then admitted it — or refused it for a full arena, or never drained it because it was shutting down — was known to nobody but a counter. A request may now carry an **admission receipt** (`SpawnRequest::with_receipt`, `Runtime::spawn_on_with_receipt`; `slates_rt::Admission`): the shard answers it once when it drains the request — admitted as a named task, refused with the runtime's own refusal, or terminated — and a request dropped undrained answers its own receipt `Terminated`, so a submitter that holds one always learns the request's fate. A shard that has begun shutting down admits nothing new (refused unadmitted, counted `refused_at_shutdown`), so its arena drains monotonically and the loop's exit is bounded by what it already holds. A submission can be **pinned to the registration** holding a shard's slot (`SlotHolder`, `runtime::submit_to_holder`): slots are reused by the next shard to register, and a message addressed by id alone after the shard exited would reach a stranger; the pin refuses it `ShardGone` instead. Found on the way, by the tests that fill a held shard's channel: `Runtime::shutdown` dropped a `ControlFull` refusal of its own shutdown message and then joined a thread that never received it — a shutdown against a full control channel hung for good; it now retries until the message lands or the shard is gone (`docs/bugs/2026-09-17-shutdown-send-lost-under-a-full-control-channel.md`). And `drain_control` cleared its pending flag before draining one bounded batch, so a burst of control messages larger than a batch sat undrained until some later send re-armed it — a spawn queued behind the burst was never admitted, and a shutdown refused by the still-full channel was retried against a shard parked for good; a whole batch drained now re-arms the flag (`crates/rt/tests/burst.rs`: 8 of 32 ran before the fix; `docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md`). Proven by use in `crates/rt/tests/admission.rs` (5 histories) and `burst.rs`, and consumed by the daemon's observations (§4.8 status of the same day).
 
+> **Status (2026-09-25, A-31: the shard learns its wake and attributes its long polls).** The boot probe's mean wake is `quick` on a virtual machine: at a coefficient of variation of five to seven, ±5 % needs 38,000–75,000 wakes where the 250 ms probe buys three to six thousand. A shard built from a profile now carries that mean as the prior of an online estimate (`WakeTracking`; `slates_machine::wake::WakeEstimate`, an exponentially weighted mean over about `2^shift` wakes, `shift` = ⌈log₂ (1.96 · sd / (0.05 · mean))²⌉ from the probe's own spread, kept in fixed point so no small correction rounds away) and folds in each wake it pays: the first sender to kick a park stamps the host clock, and the woken shard times the stamp to its own return. Only the probe's event counts — a sleeper woken: a stamp from before the park's announcement is stale, one from the park's setup found the shard awake, and on Linux a wait across which the thread's voluntary context switches (`getrusage(RUSAGE_THREAD)`) did not move never slept; each is counted (`wake_stale`, `wake_unslept`), none is measured. The step quantum, the idle spin (× the daemon's idle-window ratio), the I/O harvest cadence, the destroy and archive slices (`DaemonConfig::step_quantum_ns`) and the serve loop's idle window read the estimate live; the timer tick, fixed by the wheel's construction, keeps the boot mean. Each shard's estimate is mirrored in its pulse (`ShardPulse::wake_cost_ns`) and printed in the fleet suite's diagnostics. A poll past the quantum by the wall clock is now attributed (`slates_rt::attribution`): the task's when it ran past the quantum on the CPU or waited inside a call (the base plane's synchronous `pread`; the runtime's yield to a full peer ring), the host's when it stayed within the quantum on the CPU and never waited (preempted, or its virtual CPU stolen), else unattributed. The shard reads the thread's CPU clock and (Linux) its voluntary switches only at the end of a long poll and, while a long poll went unattributed, at each step's start and wait's end; a busy period with no long poll stops the reads. Measured in a Linux container on Apple silicon (2026-09-25, best of five rounds of 200,000 calls): `CLOCK_THREAD_CPUTIME_ID` 155–161 ns, `getrusage(RUSAGE_THREAD)` 130–134 ns. Proven by use in `crates/rt/tests/wake_estimate.rs` (a sleeping shard's kicks teach the estimate; a spinning poll is the task's; a sleeping poll is the task's on Linux and unattributed on macOS; a runnable poll held off its CPU by a pinned competitor is the host's, Linux) and the attribution module's cfg-free unit tests; 30 of 30 repeated runs on each platform. Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
 **Failure matrix.** Driver setup refused (seccomp): Masked (epoll). Task arena full: Refused
-(`TooManyTasks`, admission). A task exceeding the bounded-work rule (measured per-iteration budget
-exceeded N times): Degraded, counted, the offending operation is chunked by design (destroys,
-large clones) so this is a bug signal.
+(`TooManyTasks`, admission). A task exceeding the bounded-work rule (a poll past the step quantum on
+the CPU, or waiting inside a call past it): Degraded, counted (`long_steps`, `blocked_steps`), the
+offending operation is chunked by design (destroys, large clones) so this is a bug signal. A poll the
+host held off the CPU past the quantum: counted apart (`preempted_steps`), never the task's; one the
+platform cannot attribute (macOS off the CPU, Windows everywhere): counted unattributed.
 
 **Derived constants.** Task arena size = admission limit (Little's law on measured request rate ×
 p99 service time); batch bound = latency budget / measured per-item cost; idle spin window =
-wake_ns.mean × the spin-to-park ratio; the step quantum (the I/O harvest cadence, the slices of a
-destroy, an archive or a pre-fault, and the long-step count) = wake_ns.mean.
+the shard's wake estimate × the spin-to-park ratio; the step quantum (the I/O harvest cadence, the
+slices of a destroy, an archive or a pre-fault, and the long-step count) = the shard's wake estimate,
+seeded with wake_ns.mean and refined from the shard's own confirmed wakes over about 2^shift of them
+(shift from the probe's spread).
 
 **Laptop degenerate.** Shards = performance cores; same loop; the cluster rings exist with zero
 peers.
@@ -1884,7 +1893,8 @@ root-relative path as an explicit alternative; it does not report that the reque
 ```rust
 #[repr(C, align(64))] struct Slot { seq: AtomicU64, kind: u16, len: u16, payload: [u8; 44], pad: [u8; 4] }
 struct Ring { slots: [Slot; N], head: CachePadded<AtomicU64>, tail: CachePadded<AtomicU64> }
-struct ClientRegion { magic, version, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32, spin_ns: u32 }
+struct ClientRegion { magic, version /* 2 */, client_id, shard: u16, cmd: Ring, cpl: Ring, wake: WakeWord, parked: AtomicU32,
+                     spin_ns: u32, spin_shift: u32, reply_stamp: AtomicU64 /* bit 63: the wake found a sleeper */ }
 ```
 Ownership: the daemon creates the region (memfd / shm_open object / pagefile section), locks it,
 and hands it to one client; the client writes only `cmd` slots and the `parked` flag; the daemon
@@ -1913,11 +1923,16 @@ after a lost reply returns the original result; deadlines are remaining budgets;
 a slot kind.
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
-loop for `spin_ns` (the daemon-published measured wake cost), then set `parked = 1`, re-check the
+loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
+refined from the client's own parks, A-31), then clear the reply stamp, set `parked = 1`, re-check the
 reply (to close the race), and wait on the wake word (futex / `os_sync_wait_on_address(SHARED)` /
-the Event). Daemon: after writing a reply, read `parked`; if set, wake (futex wake / wake by
-address / `SetEvent`) and, for SDK event loops, signal the completion fd (eventfd / pipe / socket)
-so `add_reader`/`uv_poll` fires. Shards poll rings while any client has activity within the
+the Event). Daemon: after writing a reply, read `parked`; if set, stamp the host clock into
+`reply_stamp` (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
+mark the stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
+cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
+the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. The client folds a
+confirmed stamp inside its wait into its estimate (stamp to return). Shards poll rings while any
+client has activity within the
 measured idle window, then park in the driver; a parked shard is woken by the driver kick the
 client sends through the control fd.
 
@@ -1930,8 +1945,11 @@ drops.
 
 > **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the admission value rests on two stated assumptions rather than measured rates. (The wake probe's two events and unconverged tail, and `spin_ns` reading the p50, were closed on 2026-09-25: §4.1's status.) Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
 
+> **Status (2026-09-25, A-31: the client learns its own wake).** A client spun for the daemon's boot mean for its whole life. It now spins for an online estimate seeded with that mean (`spin_ns`, weighted over about `2^spin_shift` wakes) and refined from its own parks: the daemon stamps the host clock into the region's `reply_stamp` before it wakes a parked client, marks it confirmed when its wake call reports a sleeper found (`futex_wake`'s count; `os_sync_wake_by_address_any` refuses `ENOENT` when none), and the client folds a confirmed stamp inside its wait into the estimate (`ClientEnd::wait`, `wake_samples`); a confirmation that lands after the woken client read the stamp is settled at its next wait. The region's layout goes to version 2 (a client of another version is refused by name, as before). Confirmation is not decoration: without it, a daemon replying the instant the parked flag rose taught the client 611–974 ns on Apple silicon against the boot probe's 2.0–3.3 µs for confirmed sleepers, because such a reply lands while the client's wait is being set up and the wait returns without sleeping. The same evidence corrects a benchmark: `ipc_bench`'s `ring_round_trip_parked_and_woken` row (ratcheted at 1,233 ns here) is mostly that race — of 2,000 parked trips per run only 2, 18, 11, 1 and 1 slept on Apple silicon and 1–3 on Linux (503–545 ns, against a confirmed-sleeper mean of 15–17 µs there); the bench now prints the count, and `docs/wip/BENCHMARKS.md` records the correction. Proven by use in `crates/ipc/tests/rings.rs` (`a_client_learns_its_wake_from_the_parks_a_reply_ended`; a client that never parked learns nothing and keeps the published window). Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
-service time, rounded to a power of two; `spin_ns` = wake_ns.mean; idle window = wake_ns.mean ×
+service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
+= ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the shard's wake estimate ×
 measured spin-to-park ratio target.
 
 **Worked example.** From Python: `await client.create("scratch", bounded=4 GiB)`: the extension
@@ -5728,3 +5746,29 @@ worked example, status), §4.3 and §4.7 derived constants; `slates-machine` (`w
 `profile`), the server's derivations and the daemon's profile intake; unsafe-budget; GAPS and TBD_FIXES.
 Evidence: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`. No
 consensus rule, capability or on-wire format changes.
+
+### A-31 — The wake estimate learns after boot, and a long poll is attributed to its task or its host (2026-09-25)
+
+The boot probe's mean wake converges slowly under a virtual machine's heavy tail (38,000–75,000 wakes
+for ±5 %, where the probe buys a few thousand), yet every spin window and quantum froze it for the
+process's life; and the long-step count — the bounded-work rule's bug signal — read wall time, so with
+the quantum at the mean wake every preemption of a correct poll counted as the task's bug. Replace
+both: each shard and each client seed an online mean with the boot probe's and fold in the wakes they
+pay, counting only the probe's event — a sleeper woken, confirmed by the thread's voluntary switches
+(Linux shards) or by the waker's wake call finding a sleeper (clients on Linux and macOS), and bounded
+by the park's announcement where the platform cannot confirm; and a poll past the quantum by the wall
+clock is the task's when it ran past the quantum on the CPU or waited inside a call, the host's when
+it stayed within the quantum on the CPU and never waited, and unattributed otherwise. The step
+quantum, the idle spins and windows, the harvest cadence and the destroy and archive slices read the
+live estimate.
+
+Applied in the same change to: §4.1 (status, derived constants), §4.3 (loop, status, failure matrix,
+derived constants), §4.7 (data model, wake strategy, status, derived constants); `slates-machine`
+(`WakeEstimate`, `WakeLatency::estimate_window`/`estimate_shift`, the standard deviation), `slates-rt`
+(`WakeTracking`, the parking stamp, `attribution`, the shard's counters and quantum, the pulse),
+`slates-ipc` (region layout version 2: `spin_shift` and the confirmed `reply_stamp`; the wake word
+reports a sleeper found; the client's estimate), the server's derivations, slices, serve loop and
+shard pulses, the client's reconnect pause, `ipc_bench`; unsafe-budget; GAPS, TBD_FIXES and
+BENCHMARKS. Evidence: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+The client region's layout changes (a client and a daemon of different layout versions refuse each
+other by name); no consensus rule or capability changes.

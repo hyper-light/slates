@@ -19,6 +19,9 @@ const TRIPS: u64 = 20_000;
 const PARKED_TRIPS: u64 = 2_000;
 /// Shape: slots per ring.
 const SLOTS: u32 = 64;
+/// Shape: the client's wake estimate weighs about 1,024 wakes (it learns from the parked runs'
+/// confirmed sleeps; the bench chooses its own spin windows, so the estimate never moves a row).
+const SPIN_SHIFT: u32 = 10;
 
 fn pair(name: &str, spin_ns: u32) -> (DaemonEnd, ClientEnd) {
   let region = ClientRegion::create(
@@ -28,6 +31,7 @@ fn pair(name: &str, spin_ns: u32) -> (DaemonEnd, ClientEnd) {
     RegionGeometry {
       slots: SLOTS,
       spin_ns,
+      spin_shift: SPIN_SHIFT,
       bulk_bytes: 4096,
       page: 4096,
     },
@@ -86,6 +90,7 @@ fn serve(mut daemon: DaemonEnd, trips: u64, late: bool) -> std::thread::JoinHand
 
 fn main() {
   let mut spinning = Vec::new();
+  let mut slept = Vec::new();
   let mut parked = Vec::new();
   for run in 0..RUNS {
     // Spinning: a spin window far past any reply, so the client never parks.
@@ -101,8 +106,11 @@ fn main() {
     }
     spinning.push(ns(started.elapsed()) / TRIPS);
     assert_eq!(handle.join().unwrap(), 0);
-    // Parked: a zero spin window, and the daemon replies only once the client parked.
+    // Parked: a zero spin window, and the daemon replies only once the client parked. The window is
+    // chosen, not published: the client's wake estimate learns from these parks and would otherwise
+    // grow its spin into the measurement.
     let (daemon, mut client) = pair(&format!("slates-ipc-bench-park-{run}"), 0);
+    client.set_spin_ns(Some(0));
     let handle = serve(daemon, PARKED_TRIPS, true);
     let started = Instant::now();
     for n in 0..PARKED_TRIPS {
@@ -127,7 +135,16 @@ fn main() {
       "the parked path is what was measured ({} parks over {PARKED_TRIPS} trips)",
       client.park_ratio().0
     );
+    // How many of those parks actually slept: the daemon confirms a reply stamp only when its wake
+    // found the client asleep in the kernel, and the client counts the confirmed ones. A reply that
+    // races the park's setup returns the wait at once, so the row above times that race as often as a
+    // sleep and a wake (2026-09-25: a handful of the 2,000 trips slept, on Apple silicon).
+    slept.push(client.wake_samples());
   }
   row("ipc.ring_round_trip_spinning", spinning);
   row("ipc.ring_round_trip_parked_and_woken", parked);
+  println!(
+    "  ipc.parked_trips_that_slept: of {PARKED_TRIPS} per run, {slept:?} (confirmed by the daemon's \
+     wake finding the client asleep)"
+  );
 }

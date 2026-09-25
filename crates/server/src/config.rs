@@ -252,10 +252,9 @@ pub struct DaemonConfig {
   /// its link so recovery sizes a wider neighbourhood, until the network-empirical measurement (§4.10a,
   /// deferred: bandwidth "needs a real network to measure") supplies it. See [`DaemonConfig::derived_scatter`].
   pub rereplication_bytes_per_second: u64,
-  /// Derived: the bytes one archive-walk slice may hash — half the step budget at the machine's measured
-  /// BLAKE3 throughput — so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole
-  /// step from the clients.
-  pub archive_slice_bytes: u64,
+  /// Measured: the machine's BLAKE3 throughput, bytes per second, which sizes an archive-walk slice against
+  /// the shard's live step quantum ([`DaemonConfig::archive_slice_bytes`]).
+  pub blake3_bytes_per_second: u64,
   /// Derived: the compress-or-not cost model each sealed chunk is stored under (§4.11, D-17): the boot
   /// profile's measured codec points (LZ4 and each zstd level's compress and decompress throughput and
   /// ratio over the probe corpus) as the policy's candidates; a byte's neutral worth = its measured
@@ -393,15 +392,11 @@ impl DaemonConfig {
       ["table_bytes"]
     );
     derivations.push(note("snapshot_bytes_per_partition", &snapshot_bytes));
+    // The boot value, for the record: a shard sizes each slice by its live quantum, which follows its
+    // online wake estimate (`DaemonConfig::archive_slice_bytes`).
     let archive_slice_bytes: Derived<u64> = derived!(
-      (profile
-        .hash
-        .blake3_bytes_per_second
-        .saturating_mul(runtime.step_budget_ns)
-        / NANOS_PER_SECOND)
-        .saturating_mul(ARCHIVE_SLICE_PERMILLE)
-        / PERMILLE,
-      "blake3_bytes_per_second × step_budget_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000",
+      archive_slice_bytes(profile.hash.blake3_bytes_per_second, runtime.step_budget_ns),
+      "blake3_bytes_per_second × step_quantum_ns / 1e9 × ARCHIVE_SLICE_PERMILLE / 1000",
       ["hash.blake3_bytes_per_second", "rt.step_budget_ns"]
     );
     derivations.push(note("archive_slice_bytes", &archive_slice_bytes));
@@ -506,9 +501,17 @@ impl DaemonConfig {
       dir_cutover: DIR_CUTOVER,
       metadata_class_bytes: metadata_class.get(),
     };
+    let spin_shift: Derived<u32> = derived!(
+      profile.wake.estimate_shift(),
+      "⌈log₂ (1.96 × wake.sd_ns / (wake.mean_ns × 0.05))²⌉: the wakes a client's estimate weighs to hold the \
+       probe's ±5 % at 95 %",
+      ["wake.sd_ns", "wake.mean_ns"]
+    );
+    derivations.push(note("spin_shift", &spin_shift));
     let region = RegionGeometry {
       slots: slots.get(),
       spin_ns: spin.get(),
+      spin_shift: spin_shift.get(),
       bulk_bytes: u64::from(slots.get())
         .saturating_mul(2)
         .saturating_mul(BULK_CHUNK_BYTES),
@@ -554,6 +557,11 @@ impl DaemonConfig {
     );
     derivations.push(note("idle_window_ns", &idle_window));
     runtime.spin_ns = idle_window.get();
+    // A shard's spin follows its online wake estimate at the same multiple (§4.3); `spin_ns` is the boot
+    // value, kept by a runtime that tracks no estimate.
+    if let Some(tracking) = runtime.wake_tracking.as_mut() {
+      tracking.idle_ratio = IDLE_WINDOW_RATIO;
+    }
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
     DaemonConfig {
@@ -575,7 +583,7 @@ impl DaemonConfig {
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its
       // re-replication bandwidth (or the deferred network-empirical measurement supplies it).
       rereplication_bytes_per_second: 0,
-      archive_slice_bytes: archive_slice_bytes.get(),
+      blake3_bytes_per_second: profile.hash.blake3_bytes_per_second,
       codec,
       telemetry_spans_per_reply: telemetry_spans_per_reply.get(),
       // The laptop default: no fleet, `f = 0`, solo. An operator deploying a fleet sets this (with
@@ -635,7 +643,28 @@ fn guest_credits(
   credits
 }
 
+/// The bytes one archive-walk slice may hash within `quantum_ns`: half the quantum at `blake3_bytes_per_second`,
+/// so a seal (§4.10) is archived in bounded slices (§4.3) that never take the whole step from the clients.
+fn archive_slice_bytes(blake3_bytes_per_second: u64, quantum_ns: u64) -> u64 {
+  (blake3_bytes_per_second.saturating_mul(quantum_ns) / NANOS_PER_SECOND)
+    .saturating_mul(ARCHIVE_SLICE_PERMILLE)
+    / PERMILLE
+}
+
 impl DaemonConfig {
+  /// The calling shard's step quantum now (§4.3): its online wake estimate while its runtime tracks one
+  /// (`slates_rt::futures::step_budget_ns`); the configured step budget off a shard thread. What a
+  /// cooperative slice is sized by, so slices follow the quantum the shard actually keeps.
+  pub fn step_quantum_ns(&self) -> u64 {
+    slates_rt::futures::step_budget_ns().unwrap_or(self.runtime.step_budget_ns)
+  }
+
+  /// The bytes one archive-walk slice may hash on the calling shard now: half its live step quantum at the
+  /// machine's measured BLAKE3 throughput.
+  pub fn archive_slice_bytes(&self) -> u64 {
+    archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
+  }
+
   /// The same configuration with the operator's failover SLO (the lease term's ceiling).
   pub fn with_failover_slo(mut self, failover_slo_ns: u64) -> DaemonConfig {
     self.failover_slo_ns = failover_slo_ns.max(1);

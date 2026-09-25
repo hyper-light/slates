@@ -60,6 +60,7 @@ fn config(shards: u16) -> RuntimeConfig {
     cores: Vec::new(),
     page_bytes: 16384,
     spin_ns: 0,
+    wake_tracking: None,
   }
 }
 

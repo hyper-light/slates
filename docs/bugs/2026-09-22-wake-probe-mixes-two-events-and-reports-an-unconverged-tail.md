@@ -113,10 +113,13 @@ converged tightly and runs still differed 23×.
 
 ## Owed
 
-1. **The boot mean is quick on a virtual machine.** At a coefficient of variation of 5–7, ten percent
-   needs about twelve thousand wakes and 250 ms buys four thousand. The runtime refining the estimate
-   from its own wakes is the next change.
-2. **The long-step count still reads wall time.** A preempted poll counts as long.
+1. **The boot mean is quick on a virtual machine.** At a coefficient of variation of 5–7, an interval
+   ten percent wide (±5 %) needs 38,000–75,000 wakes, `(1.96 · cv / 0.05)²`, and 250 ms buys three to
+   six thousand. (An earlier draft said twelve thousand: that assumed ±10 %, twice the stopping rule's
+   precision.) Closed 2026-09-25 (A-31): shards and clients refine the estimate from the confirmed
+   wakes they pay (`2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`).
+2. **The long-step count still reads wall time.** A preempted poll counts as long. Closed 2026-09-25
+   (A-31): a long poll is attributed to its task, its host, or neither (same record).
 3. **Siblings.**
    - Linux core facts number cores `0..parallelism()`, which is wrong in a container whose cpuset does
      not start at 0. The probe falls back to unpinned when a pin is refused, but the runtime's own shard

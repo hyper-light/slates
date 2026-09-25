@@ -11,9 +11,11 @@
 //! length, so a partially written slot is never seen and no shared head or tail word sits on
 //! the hot path. The wake strategy is spin-then-park with the spin equal to the measured wake
 //! cost (Karlin's 2-competitive rule [A: Karlin et al. 1990]; Barrelfish's P = C
-//! [A: Baumann SOSP'09]): the client spins on the completion slot for `spin_ns`, sets the
-//! parked flag, re-checks the slot to close the race, and waits on the wake word; the daemon,
-//! after writing a reply, bumps the word and wakes only when the flag is set.
+//! [A: Baumann SOSP'09]): the client spins on the completion slot for its wake estimate (seeded
+//! with the daemon's published `spin_ns`, refined from the parks a reply ended by the daemon's
+//! reply stamp), sets the parked flag, re-checks the slot to close the race, and waits on the
+//! wake word; the daemon, after writing a reply, bumps the word and wakes only when the flag is
+//! set.
 //!
 //! Modules: [`protocol`] (the bodies and their framing), [`slot`] (the slot and the ring), [`region`] (the client region's layout over a
 //! shared object), [`wake`] (the wake word per OS), [`rendezvous`] (per OS), [`endpoint`]

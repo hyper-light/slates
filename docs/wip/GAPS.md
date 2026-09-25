@@ -1,5 +1,21 @@
 # The gap ledger (authoritative, kept current in the same change as any acceptance or tripwire)
 
+> **The wake estimate learns after boot; a long poll is attributed (2026-09-25, A-31).** The boot mean
+> was frozen for the process's life although it is ±20–30 % on a VM, and the long-step count read wall
+> time, so every preemption of a correct poll counted as the task's bug. Now each shard and each client
+> refine an online mean (seeded with the boot mean, weighted over 2^shift wakes from the probe's own
+> spread) from the wakes they pay, counting only a sleeper woken: Linux shards confirm by the thread's
+> voluntary switches, clients (Linux, macOS) by the daemon's wake finding a sleeper; macOS and Windows
+> shards and Windows clients are bounded by the park's announcement, unconfirmed. The quantum, the
+> spins, the idle windows and the destroy and archive slices read it live; the client region goes to
+> layout version 2. A long poll is the task's (past the quantum on the CPU, or blocked in a call), the
+> host's (runnable off the CPU), or unattributed (macOS off the CPU; Windows). Proven by use on both
+> hosts (30/30 repeats each); suites green on macOS and Linux; fleet 48/48. Found on the way and owed:
+> `ipc_bench`'s parked row times a park-setup race, not a wake (2–18 of 2,000 trips slept); a step costs
+> O(ready set), which makes `observe.rs`'s full-arena fill quadratic (95–97 s, before and after); the
+> archive walk's unit exceeds the quantum. Record:
+> `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
 > **The wake probe measures one event and reports its mean (2026-09-25).** The profile's wake timed
 > every park/unpark round trip, mixing an on-CPU handoff (about 0.45 µs) with a real wake (about 10 µs),
 > so runs split between the two (median 416 ns or 10,041 ns on the same container cores), and it
@@ -8,8 +24,8 @@
 > threshold is the expected cost of parking; a spinning waiter never saw the tail, a parked one did),
 > five rounds compared by their medians. Quiet-host containers: median 8.9–10.8 µs over ten runs, mean
 > 15.1–17.6 µs on four CPUs; macOS mean 2.03–3.27 µs over nine. Spin window, step quantum and timer
-> tick read the mean; the inbound ring the p99 at its overflow target. Owed: the boot mean is quick on a
-> VM (the runtime's refinement from its own wakes, next), and the long-step count reads wall time.
+> tick read the mean; the inbound ring the p99 at its overflow target. The boot mean being quick on a VM
+> and the long-step count reading wall time were closed by A-31 (the entry above).
 > Record: `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
 
 > **Client ring sized by Little's law (2026-09-22).** A daemon's client seats followed one boot

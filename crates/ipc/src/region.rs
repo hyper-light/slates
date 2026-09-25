@@ -4,7 +4,7 @@
 //! command ring's slots, its parked flag and the daemon-doorbell; the daemon writes only the
 //! completion ring's slots, the wake word and its own parked flag.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use slates_mem::{Handoff, SharedObject};
 
@@ -13,11 +13,12 @@ use crate::slot::Ring;
 
 /// Format: the region's magic, `SLCR` in little-endian ASCII.
 pub const MAGIC: u32 = 0x5243_4C53;
-/// Format: the layout version.
-pub const LAYOUT_VERSION: u32 = 1;
+/// Format: the layout version. Version 2 (2026-09-25) added the spin estimate's shift to the header and
+/// the reply stamp to the words block (§4.7, the client's online wake estimate).
+pub const LAYOUT_VERSION: u32 = 2;
 /// Format: the header's size (two cache lines): magic (4), version (4), client id (4), shard
 /// (2), padding (2), slots per ring (4), spin ns (4), command ring offset (8), completion
-/// ring offset (8), bulk offset (8), bulk length (8), padding.
+/// ring offset (8), bulk offset (8), bulk length (8), spin shift (4), padding.
 pub const HEADER_BYTES: usize = 128;
 /// Format: the magic's offset.
 const AT_MAGIC: usize = 0;
@@ -39,10 +40,13 @@ const AT_CPL: usize = 32;
 const AT_BULK: usize = 40;
 /// Format: the bulk length's offset.
 const AT_BULK_LEN: usize = 48;
+/// Format: the spin estimate's shift's offset.
+const AT_SPIN_SHIFT: usize = 56;
 /// Format: the words block after the header, one cache line each: the wake word (the daemon
 /// bumps it per reply), the client's parked flag, the daemon's parked flag (a shard parked
 /// in its driver), the client's doorbell (the client bumps it per request when the daemon is
-/// parked; the doorbell thread or the eventfd carries it on).
+/// parked; the doorbell thread or the eventfd carries it on), and the reply stamp (the host clock
+/// when the daemon first woke the parked client; the client clears it before it parks).
 pub const WORDS_OFFSET: usize = HEADER_BYTES;
 /// Format: the wake word's offset.
 const AT_WAKE: usize = WORDS_OFFSET;
@@ -52,8 +56,14 @@ const AT_CLIENT_PARKED: usize = WORDS_OFFSET + 64;
 const AT_DAEMON_PARKED: usize = WORDS_OFFSET + 128;
 /// Format: the doorbell's offset.
 const AT_DOORBELL: usize = WORDS_OFFSET + 192;
+/// Format: the reply stamp's offset.
+const AT_REPLY_STAMP: usize = WORDS_OFFSET + 256;
+/// Format: the reply stamp's confirmed bit, the top one: set by the daemon after its wake found the
+/// client asleep in its wait (the kernel had a sleeper to wake), so the stamp times a sleeper woken — the
+/// event the boot probe measures. The low 63 bits are the stamp's nanoseconds (292 years of uptime).
+pub const REPLY_STAMP_CONFIRMED: u64 = 1 << 63;
 /// Format: where the rings start.
-const RINGS_OFFSET: usize = WORDS_OFFSET + 256;
+const RINGS_OFFSET: usize = WORDS_OFFSET + 320;
 
 /// The region's geometry, the daemon's derivation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,8 +71,12 @@ pub struct RegionGeometry {
   /// Derived: slots per ring, a power of two from Little's law on the measured per-client
   /// request rate and the p99 service time (§4.7).
   pub slots: u32,
-  /// Measured: the spin window, the wake cost's p99.
+  /// Measured: the spin window, the expected (mean) wake — the 2-competitive spin threshold, and the
+  /// client's prior, which it refines from the wakes it pays (`ClientEnd::wait`).
   pub spin_ns: u32,
+  /// Derived: the client's wake estimate's weighting shift, about `2^spin_shift` wakes (the boot probe's
+  /// spread: `WakeLatency::estimate_shift`).
+  pub spin_shift: u32,
   /// Derived: the bulk area's bytes (the largest inline read the SDK offers, page-rounded).
   pub bulk_bytes: u64,
   /// Derived: the page the region is aligned to.
@@ -97,6 +111,7 @@ pub struct ClientRegion {
   client_id: u32,
   shard: u16,
   spin_ns: u32,
+  spin_shift: u32,
   cmd: Ring,
   cpl: Ring,
   bulk: (usize, usize),
@@ -183,12 +198,16 @@ impl ClientRegion {
         &u64::try_from(bulk.0).unwrap_or(0).to_le_bytes(),
       );
       put(bytes, AT_BULK_LEN, &geometry.bulk_bytes.to_le_bytes());
+      put(bytes, AT_SPIN_SHIFT, &geometry.spin_shift.to_le_bytes());
     }
     cmd.init(&object)?;
     cpl.init(&object)?;
     for at in [AT_WAKE, AT_CLIENT_PARKED, AT_DAEMON_PARKED, AT_DOORBELL] {
       object.atomic_u32(at)?.store(0, Ordering::Release);
     }
+    object
+      .atomic_u64(AT_REPLY_STAMP)?
+      .store(0, Ordering::Release);
     #[cfg(windows)]
     let wake_event = windows_wake_event(&object)?;
     Ok(ClientRegion {
@@ -196,6 +215,7 @@ impl ClientRegion {
       client_id,
       shard,
       spin_ns: geometry.spin_ns,
+      spin_shift: geometry.spin_shift,
       cmd,
       cpl,
       bulk,
@@ -238,6 +258,7 @@ impl ClientRegion {
     let client_id = read_u32(bytes, AT_CLIENT);
     let shard = u16::from_le_bytes([bytes[AT_SHARD], bytes[AT_SHARD + 1]]);
     let spin_ns = read_u32(bytes, AT_SPIN);
+    let spin_shift = read_u32(bytes, AT_SPIN_SHIFT);
     #[cfg(windows)]
     let wake_event = windows_wake_event(&object)?;
     Ok(ClientRegion {
@@ -245,6 +266,7 @@ impl ClientRegion {
       client_id,
       shard,
       spin_ns,
+      spin_shift,
       cmd: Ring::at(cmd_at, slots),
       cpl: Ring::at(cpl_at, slots),
       bulk: (bulk_at, bulk_len),
@@ -273,9 +295,14 @@ impl ClientRegion {
     self.shard
   }
 
-  /// The spin window the daemon published.
+  /// The spin window the daemon published: the expected wake, the client's prior.
   pub fn spin_ns(&self) -> u32 {
     self.spin_ns
+  }
+
+  /// The client's wake estimate's weighting shift the daemon published.
+  pub fn spin_shift(&self) -> u32 {
+    self.spin_shift
   }
 
   /// The command ring (client → daemon).
@@ -332,6 +359,13 @@ impl ClientRegion {
   /// The doorbell the client rings when the daemon is parked.
   pub fn doorbell(&self) -> Result<&AtomicU32, IpcError> {
     Ok(self.object.atomic_u32(AT_DOORBELL)?)
+  }
+
+  /// The reply stamp: the host clock (`slates_machine::clock::monotonic_ns`) when the daemon first woke
+  /// the parked client, with [`REPLY_STAMP_CONFIRMED`] set once that wake found the client asleep; zero
+  /// once the client has cleared it.
+  pub fn reply_stamp(&self) -> Result<&AtomicU64, IpcError> {
+    Ok(self.object.atomic_u64(AT_REPLY_STAMP)?)
   }
 
   /// The bulk area.

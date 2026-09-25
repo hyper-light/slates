@@ -185,6 +185,10 @@ pub struct ShardPulse {
   /// a shard the operating system is not scheduling shows it climbing; one held inside its own work
   /// does not (`longest_step_ns` climbs instead).
   pub scheduler_overrun_ns: u64,
+  /// The shard's online wake estimate, nanoseconds — what a wake costs it now, refined from the kicked
+  /// parks it paid (§4.3), which its step quantum and idle windows follow; 0 until its first measured
+  /// wake.
+  pub wake_cost_ns: u64,
 }
 
 /// One doorbell flag per control shard, indexed by the shard's registry id: set by the daemon's doorbell
@@ -889,6 +893,7 @@ impl Daemon {
           kicks_skipped: entry.parking.kicks_skipped(),
           ring_full_events: entry.ring_full_events.load(Ordering::Relaxed),
           scheduler_overrun_ns: entry.pulse.scheduler_overrun_ns(),
+          wake_cost_ns: entry.pulse.wake_cost_ns(),
         })
       })
       .collect()
@@ -2155,23 +2160,24 @@ fn refresh_pressure_hold() {
 
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
-/// any client has activity within the window), and idles past it.
+/// any client has activity within the window), and idles past it. The window is a multiple of what a
+/// wake costs the shard now — its online wake estimate (§4.3) — so it follows the wakes the shard
+/// actually pays rather than the boot probe's first guess.
 async fn serve_loop() {
   if let Some(task) = futures::current_task() {
     let _ =
       registry::with_current(|ctx| ctx.register_poller(task, Box::new(state::any_ring_ready)));
     state::with_state(|s| s.server_task = Some(task));
   }
-  let idle_window_ns = state::with_state(|s| {
-    derived!(
-      u64::from(s.config.region.spin_ns).saturating_mul(crate::config::IDLE_WINDOW_RATIO),
-      "spin_ns × IDLE_WINDOW_RATIO",
-      ["wake.mean_ns", "IDLE_WINDOW_RATIO"]
-    )
-    .get()
-  })
-  .unwrap_or(0);
   loop {
+    let idle_window_ns = derived!(
+      futures::wake_cost_ns()
+        .unwrap_or(0)
+        .saturating_mul(crate::config::IDLE_WINDOW_RATIO),
+      "the shard's wake estimate × IDLE_WINDOW_RATIO",
+      ["rt.wake_cost_ns", "IDLE_WINDOW_RATIO"]
+    )
+    .get();
     let (did, within_window) = state::with_state(|s| {
       let did = verbs::serve_round(s);
       let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
@@ -2988,6 +2994,7 @@ mod tests {
       cores: Vec::new(),
       page_bytes: 4096,
       spin_ns: 0,
+      wake_tracking: None,
     })
     .expect("a local runtime")
   }

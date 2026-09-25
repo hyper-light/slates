@@ -1,6 +1,6 @@
 # Remaining fixes and verification
 
-Updated: **2026-09-22**. Checkpoint against `3b38d15`, including the instruction-benchmark
+Updated: **2026-09-25**. Checkpoint against `3b38d15`, including the instruction-benchmark
 repair below. This is the remaining-work
 list for the audit/CI repair session; [GAPS.md](GAPS.md) remains the authoritative contract
 ledger. Historical audit findings below need closure evidence against current source, not
@@ -20,9 +20,21 @@ authorized merely by appearing here.
   the inbound ring the p99. Median 8.9–10.8 µs over ten quiet container runs where the old probe's
   split 416 ns / 10,041 ns. See
   `docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md`.
-- [ ] **The runtime's own wakes refine the estimate; long steps by CPU time.** The boot mean is quick
-  on a VM (±20–30 %); measure each kicked park and each client wake after boot and feed the spin
-  window and the quantum from it; count a long poll by its CPU time, not wall time.
+- [x] **The runtime's own wakes refine the estimate; long polls attributed (A-31).** Shards and
+  clients refine an online mean from confirmed sleeper wakes (Linux shards by voluntary switches,
+  clients by the daemon's wake finding a sleeper); quantum, spins, idle windows and slices read it
+  live; a long poll is the task's, the host's or unattributed. See
+  `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+- [ ] **`ipc_bench`'s parked row times a race, not a wake.** 2–18 of 2,000 parked trips slept (Apple
+  silicon), 1–3 on Linux; the row is ratcheted at 1,233 ns as "the cost the spin window is compared
+  against". Hold the bench daemon's reply until the client sleeps and gate the confirmed-sleeper
+  mean instead (same record, found 1).
+- [ ] **A step costs O(ready set).** `take_ready` swaps out every ready slot and `step` re-pushes each
+  unpolled one; `observe.rs`'s full-arena fill admits 82,245 yielding tasks on this Mac and runs
+  95–97 s, quadratic. Take at most `batch` per step, failing test first (same record, found 2).
+- [ ] **The archive walk's unit exceeds the quantum.** At least one file piece per slice, larger than
+  the mean-wake quantum; size the unit by the slice (BLAKE3 hashes incrementally) (same record,
+  found 3).
 - [ ] **The pressure hold.** Replace the boot-baseline shortfall with the design's hold above
   `committed` against the memory this daemon can actually be given (evidence in
   `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`, sibling 4).

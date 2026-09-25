@@ -298,6 +298,21 @@ pub fn bootstrap_mean_interval(values: &[u64], rng: &mut Xorshift) -> Option<Mea
   })
 }
 
+/// The population standard deviation of `values`, rounded down (sums in `u128`; an integer square
+/// root, no float), or `None` when empty.
+pub fn standard_deviation(values: &[u64]) -> Option<u64> {
+  let count = u128::try_from(values.len()).ok().filter(|n| *n > 0)?;
+  let centre = u128::from(mean(values)?);
+  let squares: u128 = values
+    .iter()
+    .map(|v| {
+      let d = u128::from(*v).abs_diff(centre);
+      d.saturating_mul(d)
+    })
+    .fold(0u128, u128::saturating_add);
+  u64::try_from((squares / count).isqrt()).ok()
+}
+
 /// Whether a mean's interval satisfies the stopping rule ([`CONVERGED_WIDTH_PERMILLE`] of the mean).
 pub fn converged_mean(interval: &MeanInterval) -> bool {
   interval.width_permille() <= CONVERGED_WIDTH_PERMILLE
@@ -386,6 +401,15 @@ mod tests {
       upper: 500,
     };
     assert!(a.overlaps(&b) && !point.overlaps(&a));
+  }
+
+  /// The standard deviation by use: a constant sample has none, a two-point sample its half-distance,
+  /// and an empty one none at all.
+  #[test]
+  fn the_standard_deviation_is_exact_in_integers() {
+    assert_eq!(standard_deviation(&[7, 7, 7]), Some(0));
+    assert_eq!(standard_deviation(&[10, 30]), Some(10));
+    assert_eq!(standard_deviation(&[]), None);
   }
 
   #[test]

@@ -46,6 +46,7 @@ fn config() -> RuntimeConfig {
     page_bytes: 4096,
     // No idle spin: every wait below is a park, measured against a real driver wake.
     spin_ns: 0,
+    wake_tracking: None,
   }
 }
 

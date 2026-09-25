@@ -4644,8 +4644,7 @@ fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
     .collect();
   let budget = state
     .config
-    .runtime
-    .step_budget_ns
+    .step_quantum_ns()
     .saturating_mul(DESTROY_SLICE_PERMILLE)
     / PERMILLE;
   for (id, handle) in &orphans {
@@ -4670,8 +4669,7 @@ fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
 pub fn step_destroys(state: &mut ShardState) -> bool {
   let budget = state
     .config
-    .runtime
-    .step_budget_ns
+    .step_quantum_ns()
     .saturating_mul(DESTROY_SLICE_PERMILLE)
     / PERMILLE;
   let destroying: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state

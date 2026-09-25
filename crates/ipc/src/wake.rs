@@ -25,8 +25,10 @@ pub fn wait(word: &AtomicU32, expected: u32, timeout_ns: Option<u64>) -> Result<
   platform::wait(word, expected, timeout_ns)
 }
 
-/// Wakes one waiter on the word.
-pub fn wake_one(word: &AtomicU32) -> Result<(), IpcError> {
+/// Wakes one waiter on the word; `Ok(true)` when the kernel found a thread asleep on it to wake, `Ok(false)`
+/// when none was (the waiter had not yet slept, or had already left) — what confirms a measured wake as
+/// the event the boot probe times, a sleeper woken (§4.1).
+pub fn wake_one(word: &AtomicU32) -> Result<bool, IpcError> {
   platform::wake_one(word)
 }
 
@@ -61,9 +63,9 @@ mod platform {
     }
   }
 
-  pub(super) fn wake_one(word: &AtomicU32) -> Result<(), IpcError> {
+  pub(super) fn wake_one(word: &AtomicU32) -> Result<bool, IpcError> {
     futex::wake(word, futex::Flags::empty(), 1)
-      .map(|_| ())
+      .map(|woken| woken > 0)
       .map_err(|e| IpcError::OsRefused {
         call: "futex_wake",
         code: Some(e.raw_os_error()),
@@ -116,7 +118,7 @@ mod platform {
     }
   }
 
-  pub(super) fn wake_one(word: &AtomicU32) -> Result<(), IpcError> {
+  pub(super) fn wake_one(word: &AtomicU32) -> Result<bool, IpcError> {
     let addr = word.as_ptr().cast::<std::ffi::c_void>();
     // SAFETY: `addr` is a live 4-byte word in a shared mapping; the call reads nothing but
     // the address.
@@ -128,11 +130,11 @@ mod platform {
       )
     };
     if rc >= 0 {
-      return Ok(());
+      return Ok(true);
     }
     match std::io::Error::last_os_error().raw_os_error() {
       // No waiter: nothing to wake.
-      Some(libc::ENOENT) => Ok(()),
+      Some(libc::ENOENT) => Ok(false),
       code => Err(IpcError::OsRefused {
         call: "os_sync_wake_by_address_any",
         code,
@@ -157,7 +159,7 @@ mod platform {
     })
   }
 
-  pub(super) fn wake_one(_word: &AtomicU32) -> Result<(), IpcError> {
+  pub(super) fn wake_one(_word: &AtomicU32) -> Result<bool, IpcError> {
     Err(IpcError::Unsupported {
       feature: "the cross-process wake word (a named Event per client on Windows)",
     })

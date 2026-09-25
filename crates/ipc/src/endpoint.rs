@@ -1,7 +1,10 @@
 //! The two ends of one client's rings (§4.7 "Protocol", "Wake strategy"): the client end
-//! writes requests and waits for replies, spinning for the daemon's published window before
-//! parking on the wake word; the daemon end drains requests and writes replies, waking a
-//! parked client. Each end owns its sequence cursors; the slots' sequence words carry the
+//! writes requests and waits for replies, spinning for its wake estimate before parking on the
+//! wake word; the daemon end drains requests and writes replies, waking a parked client. The
+//! estimate starts at the window the daemon published (its boot probe's mean wake) and learns
+//! from each park a reply ended: the daemon stamps the host clock just before it wakes a parked
+//! client, and the client times the stamp to its own return (§4.3's online estimate, the same
+//! rule as the shard's). Each end owns its sequence cursors; the slots' sequence words carry the
 //! protocol, so neither end touches a shared counter on the hot path.
 
 #[cfg(unix)]
@@ -11,8 +14,10 @@ use std::os::windows::io::RawSocket;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use slates_machine::wake::WakeEstimate;
+
 use crate::error::IpcError;
-use crate::region::ClientRegion;
+use crate::region::{ClientRegion, REPLY_STAMP_CONFIRMED};
 use crate::slot::{Slot, SlotKind};
 // The word-based wake serves Linux/macOS; Windows waits on and signals the region's named Event
 // instead (`ClientRegion::wake_wait`/`wake_signal`), so this import is dead there.
@@ -61,6 +66,15 @@ pub struct ClientEnd {
   parks: u64,
   /// Replies taken.
   replies: u64,
+  /// The client's online wake estimate, its spin window: seeded with the window the daemon published
+  /// and fed the wake of each park a reply ended, from the daemon's reply stamp to the client running
+  /// again ([`Self::wait`]).
+  wake: WakeEstimate,
+  /// Parks whose wake fed the estimate (a non-vacuity count).
+  wake_samples: u64,
+  /// A park a reply ended, as `(waiting_ns, returned_ns)`, whose stamp the daemon had not yet confirmed
+  /// when the client read it: settled at the next wait, before the stamp is cleared.
+  unsettled: Option<(u64, u64)>,
   /// The completion fd an async SDK event loop polls for reply-readiness (§4.7, D-19): the daemon
   /// makes it readable when it writes a reply to a parked client, so an `asyncio`/`uv_poll` loop wakes
   /// without spinning. `None` for the sync client (it parks on the wake word) and where the platform
@@ -95,7 +109,11 @@ impl std::fmt::Debug for ClientEnd {
 impl ClientEnd {
   /// The client's end over an opened region.
   pub fn new(region: ClientRegion) -> ClientEnd {
+    let wake = WakeEstimate::new(u64::from(region.spin_ns()), region.spin_shift());
     ClientEnd {
+      wake,
+      wake_samples: 0,
+      unsettled: None,
       region,
       doorbell: None,
       liveness: None,
@@ -351,9 +369,20 @@ impl ClientEnd {
     &mut self.region
   }
 
-  /// Chooses the spin window (`None`: the daemon's published one, the measured wake cost).
+  /// Chooses the spin window (`None`: the client's wake estimate, seeded with the daemon's published
+  /// window and refined from the client's own parks).
   pub fn set_spin_ns(&mut self, spin_ns: Option<u64>) {
     self.spin_override_ns = spin_ns;
+  }
+
+  /// The client's online wake estimate now, nanoseconds: its spin window unless one was chosen.
+  pub fn wake_estimate_ns(&self) -> u64 {
+    self.wake.mean_ns()
+  }
+
+  /// Parks whose measured wake fed the estimate.
+  pub fn wake_samples(&self) -> u64 {
+    self.wake_samples
   }
 
   /// Parks so far and replies so far (the measured spin-to-park ratio).
@@ -398,14 +427,13 @@ impl ClientEnd {
     }))
   }
 
-  /// Waits for the next reply: spins for the published window, then parks on the wake word
+  /// Waits for the next reply: spins for the wake estimate, then parks on the wake word
   /// (setting the parked flag and re-checking the slot to close the race), until the reply
-  /// arrives or `deadline_ns` (from the call) passes.
+  /// arrives or `deadline_ns` (from the call) passes. A park a reply ended teaches the estimate
+  /// its wake.
   pub fn wait(&mut self, deadline_ns: Option<u64>) -> Result<Reply, IpcError> {
     let started = Instant::now();
-    let spin_ns = self
-      .spin_override_ns
-      .unwrap_or_else(|| u64::from(self.region.spin_ns()));
+    let spin_ns = self.spin_override_ns.unwrap_or_else(|| self.wake.mean_ns());
     loop {
       if let Some(reply) = self.try_take()? {
         return Ok(reply);
@@ -420,7 +448,13 @@ impl ClientEnd {
       // Park: the flag first, the word's value (Linux/macOS), then the re-check that closes the race
       // with a reply written between the last poll and the wait. On Linux/macOS the wait returns at
       // once if the wake word moved past the value read here; on Windows the named auto-reset Event
-      // carries a signal made before the wait, so no separate value is needed.
+      // carries a signal made before the wait, so no separate value is needed. The reply stamp is
+      // cleared before the flag goes up (the flag's release orders it), so the stamp read after the
+      // wake is the first one the daemon took for this park; a previous park's unconfirmed stamp is
+      // settled first.
+      self.settle_wake()?;
+      self.unsettled = None;
+      self.region.reply_stamp()?.store(0, Ordering::Relaxed);
       self.region.client_parked()?.store(1, Ordering::Release);
       #[cfg(not(windows))]
       let expected = self.region.wake_word()?.load(Ordering::Acquire);
@@ -430,11 +464,17 @@ impl ClientEnd {
       }
       self.parks += 1;
       let remaining = deadline_ns.map(|d| d.saturating_sub(elapsed_ns(started)));
+      let waiting_ns = slates_machine::clock::monotonic_ns();
       #[cfg(windows)]
       let woken = self.region.wake_wait(remaining)?;
       #[cfg(not(windows))]
       let woken = wake::wait(self.region.wake_word()?, expected, remaining)?;
+      let returned_ns = slates_machine::clock::monotonic_ns();
       self.region.client_parked()?.store(0, Ordering::Release);
+      if woken {
+        self.unsettled = Some((waiting_ns, returned_ns));
+        self.settle_wake()?;
+      }
       if !woken && deadline_ns.is_some() {
         if let Some(reply) = self.try_take()? {
           return Ok(reply);
@@ -442,6 +482,40 @@ impl ClientEnd {
         return Err(IpcError::DeadlineExceeded);
       }
     }
+  }
+}
+
+/// Format: whether the daemon's wake reports finding the client asleep, so a stamp is learned only once
+/// confirmed. Windows' auto-reset Event cannot tell a signal that met a sleeper from one that will be
+/// consumed later, so there a stamp inside the wait is learned unconfirmed — the stand-in the boot probe
+/// uses there too (`WakeLatency::asleep_confirmed`).
+const WAKER_CONFIRMS: bool = !cfg!(windows);
+
+impl ClientEnd {
+  /// Folds the unsettled park's wake into the estimate once its stamp can be judged: the daemon's reply
+  /// stamp to the client's return, when the daemon confirmed its wake found the client asleep and the
+  /// stamp falls inside the wait — a sleeper woken, the event the boot probe times. A reply that landed
+  /// while the park was being set up met a waiter not yet asleep: its wake finds no sleeper and is never
+  /// confirmed, and timing it would teach a wake that never happened (measured: the bench's daemon,
+  /// replying the instant the flag rose, taught 611–974 ns against the boot probe's 2.0–3.3 µs, macOS,
+  /// 2026-09-25). A stamp not yet confirmed stays unsettled for the next wait: the daemon confirms after
+  /// its wake call returns, which the woken client can outrun.
+  fn settle_wake(&mut self) -> Result<(), IpcError> {
+    let Some((waiting_ns, returned_ns)) = self.unsettled else {
+      return Ok(());
+    };
+    let stamp = self.region.reply_stamp()?.load(Ordering::Acquire);
+    let confirmed = stamp & REPLY_STAMP_CONFIRMED != 0;
+    if WAKER_CONFIRMS && !confirmed {
+      return Ok(());
+    }
+    self.unsettled = None;
+    let sent_ns = stamp & !REPLY_STAMP_CONFIRMED;
+    if waiting_ns <= sent_ns && sent_ns <= returned_ns {
+      self.wake.record(returned_ns - sent_ns);
+      self.wake_samples += 1;
+    }
+    Ok(())
   }
 }
 
@@ -533,12 +607,28 @@ impl DaemonEnd {
     let word = self.region.wake_word()?;
     word.fetch_add(1, Ordering::AcqRel);
     if self.region.client_parked()?.load(Ordering::Acquire) != 0 {
+      // The first wake of this park stamps the host clock, so the client can time its own wake (§4.7);
+      // a later reply to the same park keeps the first stamp.
+      let stamp = self.region.reply_stamp()?;
+      let stamped = stamp
+        .compare_exchange(
+          0,
+          slates_machine::clock::monotonic_ns() & !REPLY_STAMP_CONFIRMED,
+          Ordering::Relaxed,
+          Ordering::Relaxed,
+        )
+        .is_ok();
       // Wake the parked client: the wake word on Linux/macOS (a spinning client never parked, so it
-      // pays no wake), the named auto-reset Event on Windows.
+      // pays no wake), the named auto-reset Event on Windows. Where the wake reports a sleeper found,
+      // the stamp it timed is confirmed for the client.
       #[cfg(windows)]
       self.region.wake_signal()?;
       #[cfg(not(windows))]
-      wake::wake_one(word)?;
+      if wake::wake_one(word)? && stamped {
+        stamp.fetch_or(REPLY_STAMP_CONFIRMED, Ordering::Release);
+      }
+      #[cfg(windows)]
+      let _ = stamped;
       self.wakes += 1;
       // Nudge the completion fd too, so an async SDK event loop polling it (D-19) wakes alongside a
       // futex-parked sync client. Both are under the same parked check, so a spinning client pays for
@@ -595,6 +685,7 @@ mod tests {
     RegionGeometry {
       slots: 8,
       spin_ns: 200_000,
+      spin_shift: 4,
       bulk_bytes: 4096,
       page: 4096,
     }

@@ -304,6 +304,33 @@ What it means: the ring's floor is under 0.3 µs of the 50 µs provisioning budg
 costs about a microsecond here, so the 2-competitive spin window keeps the parked path rare
 under load and cheap when taken.
 
+> **Correction (2026-09-25): the parked row does not time a wake.** The bench's daemon replies the
+> instant the client's parked flag rises, so the reply usually lands while the client's wait is being
+> set up and the wait returns without sleeping. Since A-31 the daemon confirms a reply stamp only
+> when its wake call finds the client asleep (`futex_wake`'s count; `os_sync_wake_by_address_any`'s
+> `ENOENT`), and the bench prints how many parked trips slept. Same command, release profile, five runs
+> of 2,000 parked trips each:
+>
+> | Host | Parked row (ns) | Trips that slept, per run | Load |
+> |---|---|---|---|
+> | Apple M5 Max, macOS 26.4.1 (2026-09-25) | 1,195–2,147 (median 1,437) | 2, 18, 11, 1, 1 | load average 3.2–3.8, not quiesced |
+> | Linux container on it (Docker, four CPUs, rust:1.98) | 503–545 (median 507) | 3, 2, 1, 2, 3 | same host |
+>
+> A confirmed sleeper's wake is 2.0–3.3 µs on this Mac and 15–17 µs mean in the container (the wake
+> probe, §4.1), so "a park costs about a microsecond" above was the setup race, not a park. The row's
+> ceiling in `ratchets.toml` (1,233 ns) gates that race; a row timing a sleeper woken — the reply held
+> until the client sleeps, the confirmed-stamp mean reported — is owed (TBD_FIXES). Without the
+> confirmation the client's own estimate learned the race too: 611–974 ns here
+> (`docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`).
+
+> **Measured (2026-09-25): the long-poll attribution's readings.** A Linux container on the M5 Max
+> (Docker, `--cpuset-cpus=0-3`), a scratch program outside the tree, best of five rounds of 200,000
+> calls: `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` 155–161 ns, `getrusage(RUSAGE_THREAD)` 130–134 ns,
+> `pread` of a kept `/proc/thread-self/schedstat` 217–223 ns. Measured-and-rejected: schedstat's run
+> delay (it misses hypervisor steal, which the guest excludes from CPU time without counting it as a
+> run-queue wait, so steal would read as a blocked call); the shard reads the first two, and only
+> around long polls (§4.3 status, A-31).
+
 ## Ratchets (2026-09-05)
 
 `ratchets.toml` holds the ceilings for this machine (identity `4c62b34d5f545407`, the Apple M5

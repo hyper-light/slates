@@ -53,6 +53,9 @@
 #   shape `arm_kick` already had. `register_readable`/`register_writable` were stubs returning
 #   `DriverRefused`, so async TCP and the UDP transport were dead the first time they awaited readiness
 #   on io_uring (docs/bugs/2026-09-16-io-uring-driver-carries-no-socket-readiness.md). 66 → 67.
+#   The long-poll attribution (`attribution.rs`, 2026-09-25, §4.3 A-31): Linux's per-thread voluntary
+#   context switches through `getrusage(RUSAGE_THREAD)` — rustix offers no `getrusage`, so one libc
+#   call over a zeroed `rusage` this frame owns (1, Linux only). The ceiling had the room (58 of 59).
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one

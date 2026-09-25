@@ -24,9 +24,11 @@
 //!
 //! Modules: [`error`], [`control`], [`waker`], [`registry`], [`parking`] (the kick-if-parked
 //! protocol and its loom model), [`task`], [`queue`], [`timer`], [`driver`], [`sim`], [`shard`],
-//! [`runtime`], [`futures`], the async sockets ([`udp`] everywhere and `tcp` on Unix — the NFS
-//! mount server's, over one shared readiness future), and the OS drivers.
+//! [`runtime`], [`futures`], `attribution` (who held a long poll: the task or the host), the async
+//! sockets ([`udp`] everywhere and `tcp` on Unix — the NFS mount server's, over one shared readiness
+//! future), and the OS drivers.
 
+mod attribution;
 pub mod control;
 pub mod driver;
 pub mod error;
@@ -62,7 +64,7 @@ pub mod uring;
 pub use driver::{Driver, DriverKind};
 pub use error::RtError;
 pub use registry::SlotHolder;
-pub use runtime::{Runtime, RuntimeConfig};
+pub use runtime::{Runtime, RuntimeConfig, WakeTracking};
 pub use shard::{ShardId, TaskId};
 pub use sim::SimRuntime;
 pub use task::Outcome;

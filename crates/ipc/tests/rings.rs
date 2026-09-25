@@ -1,7 +1,8 @@
 //! The rings and the wake word (Phase 2 task 3; §4.7): a client end and a daemon end over two
 //! mappings of one region, the queued-reply fast path, the armed wait and wake when
-//! the reply is late, the ring's credit (`RingFull`, never a drop), a hostile slot released
-//! without wedging the ring, the deadline, and the doorbell when the daemon is parked.
+//! the reply is late, the client's wake estimate learning from the parks a reply ended, the
+//! ring's credit (`RingFull`, never a drop), a hostile slot released without wedging the ring,
+//! the deadline, and the doorbell when the daemon is parked.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -16,6 +17,8 @@ use slates_ipc::{ClientEnd, DaemonEnd, IpcError};
 const SLOTS: u32 = 8;
 /// Shape: the spin window the daemon publishes here, microseconds' worth of nanoseconds.
 const SPIN_NS: u32 = 200_000;
+/// Shape: the client's wake estimate weighs about sixteen wakes here, so a handful of parks moves it.
+const SPIN_SHIFT: u32 = 4;
 /// Shape: the existing five-second reply deadline also bounds the peer's wait for the client
 /// to arm. It is a test hang guard, not a latency assertion or a production tuning value.
 const REPLY_DEADLINE_NS: u64 = 5_000_000_000;
@@ -24,6 +27,7 @@ fn geometry() -> RegionGeometry {
   RegionGeometry {
     slots: SLOTS,
     spin_ns: SPIN_NS,
+    spin_shift: SPIN_SHIFT,
     bulk_bytes: 4096,
     page: 4096,
   }
@@ -64,6 +68,11 @@ fn queued_replies_complete_without_parking_the_client() {
   }
   assert_eq!(daemon.wakes(), 0, "queued replies need no wake");
   assert_eq!(client.park_ratio(), (0, 3));
+  assert_eq!(
+    (client.wake_samples(), client.wake_estimate_ns()),
+    (0, u64::from(SPIN_NS)),
+    "a client that never parked learned nothing and spins for the published window"
+  );
 }
 
 /// AC-2.1/T-2.6: a reply withheld until the client arms its wait is delivered without a lost
@@ -111,6 +120,87 @@ fn a_reply_after_the_client_arms_its_wait_is_not_lost() {
   );
 }
 
+/// Shape: parked trips the learning test drives — past the estimate's half-life (eleven wakes at a
+/// shift of four) with room for trips a reply raced.
+const LEARNING_TRIPS: u64 = 32;
+/// Shape: the prior the learning client starts from, the most a header can publish (about 4.3 s) —
+/// unmistakably above any real wake, so an estimate that learned has left it.
+const LEARNING_PRIOR_NS: u32 = u32::MAX;
+/// Shape: how long the daemon holds a reply after the client raised its parked flag, so the client
+/// is asleep in its wait when the reply wakes it (a millisecond: hundreds of wakes).
+const ASLEEP_AFTER: Duration = Duration::from_millis(1);
+
+/// §4.7, §4.3 (A-31): a client parked in its wait and woken by a reply learns that wake — from the
+/// daemon's reply stamp to its own return — and its estimate, seeded with the published window, leaves
+/// that prior for the wakes it measured. Do: a client that always parks (a chosen zero spin) and a daemon
+/// that replies a millisecond after the client raised its flag, for 32 trips. Expect: most trips taught
+/// the estimate (the non-vacuity count), and the estimate fell below half its 4.3-second prior.
+#[test]
+fn a_client_learns_its_wake_from_the_parks_a_reply_ended() {
+  let region = ClientRegion::create(
+    "slates-ipc-rings-learn",
+    9,
+    0,
+    RegionGeometry {
+      spin_ns: LEARNING_PRIOR_NS,
+      ..geometry()
+    },
+  )
+  .unwrap();
+  let (handoff, len) = region.handoff().unwrap();
+  let mut daemon = DaemonEnd::new(region);
+  let mut client = ClientEnd::new(ClientRegion::open(&handoff, len).unwrap());
+  client.set_spin_ns(Some(0));
+  let server = std::thread::spawn(move || {
+    for _ in 0..LEARNING_TRIPS {
+      let request = loop {
+        if let Some(request) = daemon.try_take().unwrap() {
+          break request;
+        }
+        std::thread::yield_now();
+      };
+      let flagged = Instant::now();
+      while daemon
+        .region()
+        .client_parked()
+        .unwrap()
+        .load(Ordering::Acquire)
+        == 0
+      {
+        assert!(
+          flagged.elapsed() < Duration::from_nanos(REPLY_DEADLINE_NS),
+          "the client did not arm its wait"
+        );
+        std::thread::yield_now();
+      }
+      let raised = Instant::now();
+      while raised.elapsed() < ASLEEP_AFTER {
+        std::thread::yield_now();
+      }
+      daemon
+        .reply(&Slot::inline(request.request, b"late").unwrap())
+        .unwrap();
+    }
+  });
+  for trip in 0..LEARNING_TRIPS {
+    client.send(&Slot::inline(trip, b"?").unwrap()).unwrap();
+    let reply = client.wait(Some(REPLY_DEADLINE_NS)).unwrap();
+    assert_eq!(reply.request, trip);
+  }
+  server.join().unwrap();
+  assert!(
+    client.wake_samples() >= LEARNING_TRIPS / 2,
+    "most parked trips taught the estimate: {} of {LEARNING_TRIPS} (parks {:?})",
+    client.wake_samples(),
+    client.park_ratio()
+  );
+  assert!(
+    client.wake_estimate_ns() < u64::from(LEARNING_PRIOR_NS) / 2,
+    "the estimate left its prior for the measured wakes: {} ns",
+    client.wake_estimate_ns()
+  );
+}
+
 /// The ring's credit: with every slot holding an untaken request the next send refuses
 /// `RingFull`; once the daemon takes one, the send goes through; nothing was dropped.
 #[test]
@@ -141,9 +231,9 @@ fn a_full_ring_refuses_and_never_drops() {
   assert_eq!(seen, (1..u64::from(SLOTS)).chain([99]).collect::<Vec<_>>());
 }
 
-/// Format: where slot 1 of the command ring sits in the region (header 128, words 256, ring
-/// header 128, one slot 64).
-const SLOT_ONE_AT: usize = 128 + 256 + 128 + 64;
+/// Format: where slot 1 of the command ring sits in the region (header 128, words 320 — five
+/// cache-line words since layout version 2 added the reply stamp — ring header 128, one slot 64).
+const SLOT_ONE_AT: usize = 128 + 320 + 128 + 64;
 
 /// A hostile slot (an unknown kind, a length past the payload) is refused as `BadSlot`, the
 /// slot is released, and the next slot flows; an oversized payload is refused before the

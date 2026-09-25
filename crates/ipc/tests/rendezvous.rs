@@ -27,6 +27,7 @@ fn geometry() -> RegionGeometry {
   RegionGeometry {
     slots: SLOTS,
     spin_ns: 100_000,
+    spin_shift: 4,
     bulk_bytes: 4096,
     page: 4096,
   }

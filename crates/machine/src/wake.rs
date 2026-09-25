@@ -30,7 +30,8 @@
 //!   11–13 µs). The probe stops when the mean's 95 % bootstrap interval is within the crate's stopping-rule
 //!   width ([`crate::stats::CONVERGED_WIDTH_PERMILLE`]) — the statistic consumed, not the median — or at
 //!   its wall budget, reported `quick`. A heavy tail converges slowly (a coefficient of variation of five
-//!   to seven on a virtual machine needs about twelve thousand wakes for ten percent), which is why the
+//!   to seven on a virtual machine needs 38,000–75,000 wakes for an interval ten percent wide, where
+//!   250 ms buys three to six thousand), which is why the
 //!   runtime refines this estimate from its own wakes after boot (`slates-rt`'s wake-cost estimate).
 //! - **Rounds.** [`WAKE_ROUNDS`] rounds, each with a fresh waiter thread (and, pinned, its own shard core).
 //!   A run-long mode is invisible to a within-run interval — every old run converged tightly and runs still
@@ -54,7 +55,7 @@ use crate::facts::CoreFacts;
 use crate::probes::{Pinning, SavedAffinity, pin_current_thread, weaker};
 use crate::stats::{
   CONVERGED_WIDTH_PERMILLE, Interval, MeanInterval, Percentile, Sample, Xorshift,
-  bootstrap_interval, bootstrap_mean_interval, converged_mean,
+  bootstrap_interval, bootstrap_mean_interval, converged_mean, standard_deviation,
 };
 
 /// The wake latency the profile reports (§4.1) and every derivation reads.
@@ -70,6 +71,9 @@ pub struct WakeLatency {
   pub p50_ns: u64,
   /// The p99 of the kept samples: what the inbound ring is sized against at its overflow target.
   pub p99_ns: u64,
+  /// The population standard deviation of the kept samples: with the mean, how many wakes an online
+  /// estimate needs to reach the probe's precision ([`WakeLatency::estimate_shift`]).
+  pub sd_ns: u64,
   /// Samples kept, pooled over the rounds.
   pub samples: u32,
   /// Wakes whose waker and waiter ran on one CPU: dropped when the pair was pinned to two cores (a pin
@@ -87,6 +91,89 @@ pub struct WakeLatency {
   pub asleep_confirmed: bool,
   /// True when the budget ended before the pooled mean's interval converged.
   pub quick: bool,
+}
+
+/// Format: the standard normal quantile of the two-sided 95 % interval every probe reports
+/// ([`Percentile::LOWER_95`] and [`Percentile::UPPER_95`]), in thousandths: 1.960.
+const Z_95_PERMILLE: u128 = 1960;
+
+impl WakeLatency {
+  /// How many wakes an online estimate of the mean needs to reach the probe's own precision:
+  /// `N = (z · sd / (h · mean))²`, with `z` the 95 % normal quantile and `h` half the stopping-rule width
+  /// ([`CONVERGED_WIDTH_PERMILLE`]) — the sample size at which the mean's interval is as narrow as the
+  /// probe asks of itself. At least [`MIN_SAMPLES`]; a probe with no spread (or no mean) asks no more.
+  /// A coefficient of variation of six (a virtual machine's) needs about 55,000 wakes; one and a half
+  /// (Apple silicon) about 3,500.
+  pub fn estimate_window(&self) -> u64 {
+    let half_width_permille = u128::from(CONVERGED_WIDTH_PERMILLE / 2).max(1);
+    let spread = u128::from(self.sd_ns).saturating_mul(Z_95_PERMILLE);
+    let scale = u128::from(self.mean_ns).saturating_mul(half_width_permille);
+    let floor = u64::try_from(MIN_SAMPLES).unwrap_or(u64::MAX);
+    if scale == 0 {
+      return floor;
+    }
+    let ratio = spread.div_ceil(scale);
+    u64::try_from(ratio.saturating_mul(ratio))
+      .unwrap_or(u64::MAX)
+      .max(floor)
+  }
+
+  /// The exponential-weighting shift of an online estimate over [`estimate_window`](Self::estimate_window)
+  /// wakes: `⌈log₂ N⌉`, capped so the fixed-point accumulator of [`WakeEstimate`] (a mean shifted left by
+  /// it) fits 128 bits.
+  pub fn estimate_shift(&self) -> u32 {
+    let window = self.estimate_window();
+    let shift = window
+      .saturating_sub(1)
+      .checked_ilog2()
+      .map_or(0, |bits| bits + 1);
+    shift.min(WakeEstimate::MAX_SHIFT)
+  }
+}
+
+/// An online estimate of the mean wake (§4.1, §4.3, §4.7): an exponentially weighted mean over about
+/// `2^shift` wakes, seeded with the boot probe's mean and fed each wake the product measures afterwards
+/// (the runtime's kicked parks, a client's woken waits), so a machine whose neighbours change after boot
+/// is tracked rather than frozen at one 250 ms sample. Kept in fixed point — the accumulator is the mean
+/// shifted left by `shift` — so a small correction is never rounded away: an integer mean updated by
+/// `(sample − mean) >> shift` drops every deviation under `2^shift`, keeps the tail's large ones, and
+/// drifts upward.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeEstimate {
+  scaled: u128,
+  shift: u32,
+  samples: u64,
+}
+
+impl WakeEstimate {
+  /// Format: the largest shift whose accumulator — a `u64` mean shifted left — fits 128 bits.
+  pub const MAX_SHIFT: u32 = 63;
+
+  /// An estimate seeded with `prior_ns`, weighting about `2^shift` wakes.
+  pub fn new(prior_ns: u64, shift: u32) -> WakeEstimate {
+    let shift = shift.min(Self::MAX_SHIFT);
+    WakeEstimate {
+      scaled: u128::from(prior_ns) << shift,
+      shift,
+      samples: 0,
+    }
+  }
+
+  /// Folds one measured wake in.
+  pub fn record(&mut self, wake_ns: u64) {
+    self.scaled = self.scaled - (self.scaled >> self.shift) + u128::from(wake_ns);
+    self.samples = self.samples.saturating_add(1);
+  }
+
+  /// The estimated mean wake, nanoseconds.
+  pub fn mean_ns(&self) -> u64 {
+    u64::try_from(self.scaled >> self.shift).unwrap_or(u64::MAX)
+  }
+
+  /// Wakes folded in since the seed (a non-vacuity count).
+  pub fn samples(&self) -> u64 {
+    self.samples
+  }
 }
 
 /// Shape: the rounds a wake probe splits its budget into. Five, from the split it must expose: the
@@ -176,6 +263,7 @@ fn summarize(
     mean_upper_ns: pooled.upper,
     p50_ns: sorted.median().unwrap_or(0),
     p99_ns: sorted.percentile(Percentile::P99).unwrap_or(0),
+    sd_ns: standard_deviation(kept).unwrap_or(0),
     samples: u32::try_from(kept.len()).unwrap_or(u32::MAX),
     same_cpu_samples: tally.same_cpu_samples,
     rounds: WAKE_ROUNDS,
@@ -615,6 +703,62 @@ mod tests {
       rounds_agree(&[tight(10_000), tight(5_000)], &pooled),
       Some(false)
     );
+  }
+
+  /// The online estimate by use: a constant stream converges to its value exactly (no rounding drift);
+  /// from a stale prior it moves to the stream's mean; a stream with a rare large wake settles at the
+  /// stream's true mean, not above it (the drift an integer update without fixed point shows).
+  #[test]
+  fn the_online_estimate_tracks_the_mean_without_rounding_drift() {
+    let mut steady = WakeEstimate::new(10_000, 8);
+    for _ in 0..10_000 {
+      steady.record(10_000);
+    }
+    assert_eq!(steady.mean_ns(), 10_000);
+    let mut moved = WakeEstimate::new(1_000, 6);
+    for _ in 0..4_096 {
+      moved.record(50_000);
+    }
+    assert!(moved.mean_ns() > 49_000, "{}", moved.mean_ns());
+    // One wake in sixteen held up to 160 µs, the rest 10 µs: a true mean of 19,375 ns.
+    let mut tailed = WakeEstimate::new(10_000, 10);
+    for k in 0..400_000u64 {
+      tailed.record(if k % 16 == 0 { 160_000 } else { 10_000 });
+    }
+    let mean = tailed.mean_ns();
+    assert!((18_500..=20_500).contains(&mean), "{mean}");
+    assert_eq!(tailed.samples(), 400_000);
+  }
+
+  /// The window follows the probe's spread: `(1.96 · cv / 0.05)²` wakes, at least the probe's minimum,
+  /// its shift the ceiling of its binary logarithm.
+  #[test]
+  fn the_estimate_window_follows_the_probes_spread() {
+    let probe = |mean_ns, sd_ns| WakeLatency {
+      mean_ns,
+      mean_lower_ns: mean_ns,
+      mean_upper_ns: mean_ns,
+      p50_ns: mean_ns,
+      p99_ns: mean_ns,
+      sd_ns,
+      samples: 1,
+      same_cpu_samples: 0,
+      rounds: WAKE_ROUNDS,
+      rounds_agree: None,
+      placement: Pinning::Pinned,
+      asleep_confirmed: true,
+      quick: false,
+    };
+    // A coefficient of variation of six: (1.96 × 6 / 0.05)² = 235.2² → 236² = 55,696.
+    assert_eq!(probe(10_000, 60_000).estimate_window(), 55_696);
+    assert_eq!(probe(10_000, 60_000).estimate_shift(), 16);
+    // One and a half: 58.8² → 59² = 3,481.
+    assert_eq!(probe(2_000, 3_000).estimate_window(), 3_481);
+    assert_eq!(probe(2_000, 3_000).estimate_shift(), 12);
+    // No spread, or no mean: the probe's minimum.
+    let floor = u64::try_from(MIN_SAMPLES).unwrap();
+    assert_eq!(probe(10_000, 0).estimate_window(), floor);
+    assert_eq!(probe(0, 5_000).estimate_window(), floor);
   }
 
   /// §4.1 (docs/bugs/2026-09-22-wake-probe-mixes-two-events-and-reports-an-unconverged-tail.md) by use on

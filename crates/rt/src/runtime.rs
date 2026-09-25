@@ -62,6 +62,27 @@ pub struct RuntimeConfig {
   /// How long an idle shard spins checking its rings before parking, while a client is active
   /// (the 2-competitive bound: the measured wake cost).
   pub spin_ns: u64,
+  /// The wake estimate each shard refines from its own kicked parks (§4.1, §4.3): the boot probe's mean
+  /// as the prior, its window, and the idle window's multiple of it. While a shard tracks, its step
+  /// quantum and idle spin follow the estimate rather than the fixed `step_budget_ns` and `spin_ns`;
+  /// `None` is a hand-written configuration with no measured prior to track (a test harness's fixed
+  /// quanta, an internal helper runtime), which keeps its fixed values.
+  pub wake_tracking: Option<WakeTracking>,
+}
+
+/// What a shard needs to refine its wake estimate after boot (§4.1: the boot probe's mean converges
+/// slowly under a heavy tail — a virtual machine's needs 38,000–75,000 wakes where the probe's budget buys
+/// a few thousand — so the estimate a shard sizes its spin and its quantum by keeps learning from the
+/// wakes it actually pays).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WakeTracking {
+  /// The boot probe's mean wake, nanoseconds: the estimate's seed.
+  pub prior_ns: u64,
+  /// The estimate's weighting shift, about `2^shift` wakes ([`slates_machine::wake::WakeLatency::estimate_shift`]).
+  pub shift: u32,
+  /// The idle spin window as a multiple of the estimate (1 for the runtime's own spin-then-park; the
+  /// daemon's idle window sets its ratio).
+  pub idle_ratio: u64,
 }
 
 impl RuntimeConfig {
@@ -90,6 +111,11 @@ impl RuntimeConfig {
       cores,
       page_bytes: usize::try_from(profile.facts.page.base).unwrap_or(1),
       spin_ns: d.spin_before_park_ns.get(),
+      wake_tracking: Some(WakeTracking {
+        prior_ns: d.spin_before_park_ns.get(),
+        shift: profile.wake.estimate_shift(),
+        idle_ratio: 1,
+      }),
     };
     config.batch = config.calibrate_batch(latency_budget_ns).get();
     config

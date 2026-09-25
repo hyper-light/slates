@@ -224,7 +224,7 @@ impl Doorbell {
       Doorbell::Word { object, offset } => {
         let word = object.atomic_u32(*offset)?;
         word.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        crate::wake::wake_one(word)
+        crate::wake::wake_one(word).map(|_| ())
       }
     }
   }
