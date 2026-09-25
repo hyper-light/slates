@@ -195,10 +195,12 @@ impl Tracker {
     self.armed
   }
 
-  /// A step begins at `now_ns`: while armed, a window opens at the reading `read` takes (called only then).
-  pub(crate) fn step_began(&mut self, now_ns: u64, read: impl FnOnce() -> Option<ThreadAccount>) {
+  /// A step begins: while armed, a window opens at what `read` returns — the thread's account and the
+  /// shard clock — called only then, so an unarmed shard reads neither.
+  pub(crate) fn step_began(&mut self, read: impl FnOnce() -> Option<(ThreadAccount, u64)>) {
     if self.armed {
-      self.open(now_ns, read());
+      self.window_start = read();
+      self.yielded = false;
     }
   }
 
@@ -220,10 +222,11 @@ impl Tracker {
     }
   }
 
-  /// A wait ended at `now_ns`: while armed, a window opens at the reading `read` takes (called only then).
-  pub(crate) fn wait_ended(&mut self, now_ns: u64, read: impl FnOnce() -> Option<ThreadAccount>) {
+  /// A wait ended: while armed, a window opens at what `read` returns (called only then).
+  pub(crate) fn wait_ended(&mut self, read: impl FnOnce() -> Option<(ThreadAccount, u64)>) {
     if self.armed {
-      self.open(now_ns, read());
+      self.window_start = read();
+      self.yielded = false;
     }
   }
 
@@ -294,6 +297,11 @@ mod tests {
     })
   }
 
+  /// A reading taken at `now_ns`, as a step start or a wait end hands it over.
+  fn at(now_ns: u64, reading: Option<ThreadAccount>) -> Option<(ThreadAccount, u64)> {
+    reading.map(|account| (account, now_ns))
+  }
+
   /// §4.3, A-31: the poll's CPU lies between the window's CPU less the wall time before the poll and the
   /// window's CPU. Past the quantum at the least it is the task's; within it at the most, a wait inside a
   /// call makes it the task's and none makes it the host's; unknown waits stay unattributed; and a window
@@ -337,7 +345,7 @@ mod tests {
   #[test]
   fn the_tracker_arms_on_an_unattributed_poll_and_disarms_after_a_quiet_busy_period() {
     let mut tracker = Tracker::default();
-    tracker.step_began(0, || panic!("an unarmed shard reads nothing"));
+    tracker.step_began(|| panic!("an unarmed shard reads nothing"));
     assert_eq!(
       tracker.long_poll(0, QUANTUM_NS * 2, account(100, Some(0)), QUANTUM_NS),
       Attribution::NoWindow
@@ -356,16 +364,16 @@ mod tests {
     tracker.step_ended(true);
     // A busy period that ran a long poll keeps the arming across its wait.
     tracker.wait_began();
-    tracker.wait_ended(QUANTUM_NS * 6, || account(300, Some(1)));
+    tracker.wait_ended(|| at(QUANTUM_NS * 6, account(300, Some(1))));
     assert!(tracker.armed());
-    tracker.step_began(QUANTUM_NS * 6, || account(300, Some(1)));
+    tracker.step_began(|| at(QUANTUM_NS * 6, account(300, Some(1))));
     tracker.step_ended(true);
     // A spin that finds nothing, then a park: one wait, and the quiet busy period before it disarms.
     tracker.wait_began();
     tracker.wait_began();
     assert!(!tracker.armed());
-    tracker.wait_ended(QUANTUM_NS * 7, || panic!("a disarmed shard reads nothing"));
-    tracker.step_began(QUANTUM_NS * 7, || panic!("a disarmed shard reads nothing"));
+    tracker.wait_ended(|| panic!("a disarmed shard reads nothing"));
+    tracker.step_began(|| panic!("a disarmed shard reads nothing"));
   }
 
   /// §4.3, A-31: a wait closes the window, so the park's own block is never charged to the poll after it;
@@ -381,7 +389,7 @@ mod tests {
     tracker.step_ended(true);
     tracker.wait_began();
     // The park blocked (a voluntary switch) — then the next busy period opens a fresh window after it.
-    tracker.wait_ended(QUANTUM_NS * 100, || account(10, Some(5)));
+    tracker.wait_ended(|| at(QUANTUM_NS * 100, account(10, Some(5))));
     assert_eq!(
       tracker.long_poll(
         QUANTUM_NS * 100,
@@ -392,7 +400,7 @@ mod tests {
       Attribution::Preempted,
       "the park's switch is outside the window"
     );
-    tracker.step_began(QUANTUM_NS * 104, || account(30, None));
+    tracker.step_began(|| at(QUANTUM_NS * 104, account(30, None)));
     tracker.yielded_in_poll();
     assert_eq!(
       tracker.long_poll(

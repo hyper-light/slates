@@ -890,10 +890,9 @@ impl ShardContext {
     }
     registry::set_current(Some(self));
     // While a long poll has gone unattributed, each step opens a window at its start, so the next long
-    // poll is judged by the step's own CPU alone; an unarmed shard reads nothing.
+    // poll is judged by the step's own CPU alone; an unarmed shard reads neither clock.
     if self.real_time {
-      let now = self.now_ns();
-      self.update_attribution(|tracker| tracker.step_began(now, attribution::thread_account));
+      self.update_attribution(|tracker| tracker.step_began(|| self.account_now()));
     }
     let mut did_work = false;
     let (drained, batch) = self
@@ -1080,9 +1079,13 @@ impl ShardContext {
   /// A wait ended: while a long poll has gone unattributed, a window opens now.
   fn wait_ended(&self) {
     if self.real_time {
-      let now = self.now_ns();
-      self.update_attribution(|tracker| tracker.wait_ended(now, attribution::thread_account));
+      self.update_attribution(|tracker| tracker.wait_ended(|| self.account_now()));
     }
+  }
+
+  /// The thread's account and the shard clock now: an attribution window's start.
+  fn account_now(&self) -> Option<(attribution::ThreadAccount, u64)> {
+    attribution::thread_account().map(|account| (account, self.now_ns()))
   }
 
   /// Applies `change` to the attribution tracker.
