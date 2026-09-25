@@ -228,6 +228,9 @@ mod loom_tests {
   static SKIPS: AtomicU64 = AtomicU64::new(0);
   /// Waits the shard entered, across every explored interleaving.
   static WAITS: AtomicU64 = AtomicU64::new(0);
+  /// Timed parks whose kick's stamp fell inside the wait (a measured wake), across every explored
+  /// interleaving of the timed model.
+  static MEASURED: AtomicU64 = AtomicU64::new(0);
 
   /// AC-0.7 (the kick-if-parked protocol of `registry::send_foreign` and `shard::park`): a
   /// sender publishes a word into the shard's ring and kicks only if the shard announced
@@ -282,6 +285,55 @@ mod loom_tests {
     assert!(
       WAITS.load(StdOrdering::Relaxed) > 0,
       "some interleaving made the shard wait"
+    );
+  }
+
+  /// §4.3 (A-31): the same protocol with the shard timing its wakes. The kick's stamp is a measurement
+  /// word outside the protocol, so the word still arrives in every interleaving; and a park that waits
+  /// never reads a stale stamp, because a sender stamps only after publishing its word, so a stamp always
+  /// finds the word published and any later park's re-check skips the wait. Some interleaving measured a
+  /// wake (the stamp fell inside the wait), so the stamp's path is not vacuous. One word cannot reach a
+  /// stamp left over from an earlier park: that classification (`Woken::stale`, `Woken::early`), and the
+  /// announcement's time being read before the announcement, are held by the unit tests below — moving
+  /// that read after the announcement leaves this model passing (checked 2026-09-25).
+  #[test]
+  fn a_timed_park_never_loses_the_word_and_reads_only_its_own_stamp() {
+    loom_bounds::explore(
+      "parking: one sender against one timed parking shard",
+      || {
+        let ring: &'static MpscRing = Box::leak(Box::new(MpscRing::new(RING_CAPACITY).unwrap()));
+        let parking: &'static Parking = Box::leak(Box::new(Parking::new()));
+        parking.time_wakes();
+        let kick: &'static Notify = Box::leak(Box::new(Notify::new()));
+        let sender = loom::thread::spawn(move || {
+          ring.push(WORD).unwrap();
+          parking.kick_if_parked(|| kick.notify());
+        });
+        let mut consumer = ring.consumer();
+        let word = loop {
+          if let Some(word) = consumer.pop() {
+            break word;
+          }
+          if let Parked::Waited(woken) =
+            parking.park_unless_pending(|| !ring.is_empty(), || kick.wait())
+          {
+            let woken = woken.expect("a timed park that waited reports its wake");
+            assert!(
+              !woken.stale(),
+              "a park read another park's stamp: {woken:?}"
+            );
+            if woken.latency_ns().is_some() {
+              MEASURED.fetch_add(1, StdOrdering::Relaxed);
+            }
+          }
+        };
+        assert_eq!(word, WORD);
+        sender.join().unwrap();
+      },
+    );
+    assert!(
+      MEASURED.load(StdOrdering::Relaxed) > 0,
+      "some interleaving measured a wake"
     );
   }
 }
