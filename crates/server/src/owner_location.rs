@@ -201,28 +201,93 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
   })
   .unwrap_or_default();
   let request = query.to_bytes();
-  let requests = take_sessions(|peer| peers.contains(&peer))
-    .into_iter()
-    .map(|(peer, endpoint)| (peer, request.clone(), endpoint))
-    .collect();
   count("fleet.owner_location.round");
-  let budget = CommitBudget::hard(LIVENESS_BUDGET_NS, HEARTBEAT_NS / POLL_PER_PERIOD);
-  let (replies, mut stragglers) = broadcast(requests, STREAM, budget).await;
+  // One deadline for the whole round. A peer whose record session is out when the round starts (a
+  // coordinator dispatch or a discovery page has it, `fleet::take_sessions`) is asked once the session
+  // comes back, polled at the fleet's interval; a round that skipped it could miss the owner and refuse
+  // a lookup the owner would serve (docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md,
+  // found 1). A peer with no session at all is not waited for: the bounded neighbourhood keeps no session
+  // to most peers by design.
+  let began = slates_rt::futures::now_ns();
+  let poll_ns = HEARTBEAT_NS / POLL_PER_PERIOD;
+  let mut unasked = peers;
   let mut answers = Answers::default();
-  fold_replies(&mut answers, query, replies);
+  let mut met_out = false;
   loop {
-    let (replies, done) = stragglers.recover_replies();
-    fold_replies(&mut answers, query, replies);
-    if done {
+    let taken = take_sessions(|peer| unasked.contains(&peer));
+    for (peer, _) in &taken {
+      unasked.remove(peer);
+    }
+    if !taken.is_empty() {
+      let remaining =
+        LIVENESS_BUDGET_NS.saturating_sub(slates_rt::futures::now_ns().saturating_sub(began));
+      ask(&mut answers, query, &request, taken, remaining, poll_ns).await;
+    }
+    let out = sessions_out(&unasked);
+    if out.is_empty() {
       break;
     }
-    slates_rt::futures::sleep(budget.poll_interval_ns).await;
+    if !met_out {
+      met_out = true;
+      count("fleet.owner_location.session_out");
+    }
+    if slates_rt::futures::now_ns().saturating_sub(began) >= LIVENESS_BUDGET_NS {
+      count("fleet.owner_location.session_never_returned");
+      break;
+    }
+    unasked = out;
+    slates_rt::futures::sleep(poll_ns).await;
   }
   let result = answers.finish();
   if let Err(error) = result {
     count(error.counter());
   }
   result
+}
+
+/// Asks the peers whose sessions were `taken`, within `budget_ns`, folding every reply that arrives in
+/// time and returning each session.
+async fn ask(
+  answers: &mut Answers,
+  query: Query,
+  request: &[u8],
+  taken: Vec<(HostId, slates_transport::endpoint::Endpoint)>,
+  budget_ns: u64,
+  poll_ns: u64,
+) {
+  let requests = taken
+    .into_iter()
+    .map(|(peer, endpoint)| (peer, request.to_vec(), endpoint))
+    .collect();
+  let budget = CommitBudget::hard(budget_ns, poll_ns);
+  let (replies, mut stragglers) = broadcast(requests, STREAM, budget).await;
+  fold_replies(answers, query, replies);
+  loop {
+    let (replies, done) = stragglers.recover_replies();
+    fold_replies(answers, query, replies);
+    if done {
+      break;
+    }
+    slates_rt::futures::sleep(budget.poll_interval_ns).await;
+  }
+}
+
+/// The peers of `peers` whose record session exists but is out on loan now; a peer without a session is
+/// not among them.
+fn sessions_out(peers: &std::collections::BTreeSet<HostId>) -> std::collections::BTreeSet<HostId> {
+  state::with_state(|state| {
+    peers
+      .iter()
+      .copied()
+      .filter(|peer| {
+        state
+          .record_sessions
+          .get(peer)
+          .is_some_and(|link| link.endpoint.is_none())
+      })
+      .collect()
+  })
+  .unwrap_or_default()
 }
 
 fn fold_replies(

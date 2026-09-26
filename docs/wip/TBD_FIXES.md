@@ -91,7 +91,9 @@ authorized merely by appearing here.
 - [ ] **A first placement that never converged** kept `poll_until` waiting past twelve minutes while the
   test polled `AwaitPlaced` about a thousand times a second; probably the same port collision, not
   confirmed (the forward record's found 3).
-- [ ] **The location round skips a peer whose session is out** (same record, found 1).
+- [x] **The location round skips a peer whose session is out** (same record, found 1). The round now
+  asks such a peer once its session returns, inside one deadline. A deterministic test failed before
+  (`HomedElsewhere`); fleet 50/50 after.
 - [ ] **The pressure hold.** Replace the boot-baseline shortfall with the design's hold above
   `committed` against the memory this daemon can actually be given (evidence in
   `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`, sibling 4).

@@ -3723,6 +3723,94 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   );
 }
 
+/// §4.8 Lookup (docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md, found 1): a
+/// location round asks every admitted home-region peer, and a peer whose session is out when the round
+/// starts (a dispatch or a discovery page has it) is asked once it comes back, inside the round's one
+/// deadline. Do: after the owner dies and its copyset successor adopts, hold the foreign node's session to
+/// the successor out while a new foreign client looks the volume up. Expect: the lookup is served by the
+/// successor, the round counted the session it found out, and none outlived the deadline. Before the fix
+/// the round skipped the held peer, heard no owner, and refused the lookup `HomedElsewhere`.
+#[test]
+fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "foreign"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let regions = seeds
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
+    .collect();
+  let serve = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
+  let hosts: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let foreign_instance = daemons.last().unwrap().instance().to_owned();
+  let owner_index = (0..names.len() - 1)
+    .max_by_key(|index| hosts[*index])
+    .unwrap();
+  let owner = hosts[owner_index];
+  let neighborhood = daemons[owner_index].placement_neighbourhood().unwrap();
+  let survivors: Vec<_> = hosts[..names.len() - 1]
+    .iter()
+    .copied()
+    .filter(|host| *host != owner)
+    .collect();
+  let (id, successor, _unrelated) =
+    place_copyset_routing_case(&daemons, owner_index, owner, &neighborhood, &survivors);
+  daemons.remove(owner_index).stop();
+  let successor_daemon = daemons
+    .iter()
+    .find(|daemon| daemon.member_identity().unwrap() == successor)
+    .unwrap();
+  assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
+  assert!(audit_wait(|| Ok(status_answers_once(
+    successor_daemon.instance(),
+    id
+  ))));
+  let foreign_daemon = daemons
+    .iter()
+    .find(|daemon| daemon.instance() == foreign_instance)
+    .unwrap();
+  let held = foreign_daemon.hold_record_session(successor, SESSION_HOLD_NS);
+  let mut foreign = Client::connect(&foreign_instance);
+  let looked_up = foreign.call(&RequestBody::Status { volume: id });
+  let counters = foreign_daemon.fleet_refusals();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_eq!(
+    held.map_err(|refusal| refusal.to_string()),
+    Ok(true),
+    "the foreign node's session to the successor was held out"
+  );
+  assert!(
+    matches!(looked_up, ReplyBody::Status { .. }),
+    "the round asked the successor once its session returned: {looked_up:?}"
+  );
+  let counters = counters.expect("the foreign node's counters were read");
+  assert!(
+    counters
+      .get("fleet.owner_location.session_out")
+      .copied()
+      .unwrap_or(0)
+      > 0,
+    "the round met the held session and waited for it: {counters:?}"
+  );
+  assert_eq!(
+    counters.get("fleet.owner_location.session_never_returned"),
+    None,
+    "no session outlived the round's deadline: {counters:?}"
+  );
+}
+
 /// AC-8.1 / §4.8 Lookup: a home region has more members than an object's copyset. After its
 /// owner dies, a foreign client must reach the copyset successor, even when rendezvous over all
 /// live home-region members ranks an unrelated node first. The remote snapshot retry stays exactly-once.

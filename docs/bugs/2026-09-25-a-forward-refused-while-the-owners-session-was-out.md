@@ -77,6 +77,14 @@ so a wait stalls nothing else.
    round with no retries. A round that misses the owner that way answers `Unavailable` (seen once:
    `fleet.owner_location.unavailable: 1`). A client retries past it, but it is the same shape as this
    bug.
+   **Fixed 2026-09-26.**
+   - The round asks such a peer once its session returns, inside the round's one deadline.
+   - It counts `fleet.owner_location.session_out` and `.session_never_returned`.
+   - A peer with no session at all is not waited for, since the bounded neighbourhood keeps none to most
+     peers.
+   - `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns` failed before the fix with
+     `HomedElsewhere { region: 0 }`. It passes 3 of 3 after, and the fleet suite passes 50 of 50 on
+     macOS.
 2. **Formation left a member outside its council** in one full-suite run on Linux (267 s, 49 of 50
    passed). In region 0, three nodes agreed on a three-member council and the fourth had an empty
    council view: it was never admitted within the 30 s formation wait. The shards' learned wakes that
