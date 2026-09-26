@@ -235,6 +235,7 @@ impl Volume {
     inode.attrs.ctime = now;
     inode.version += 1;
     self.record(Op::SetXattr { name: name.into() }, "", Some(no), prev);
+    self.attribute_writes_in_place = self.attribute_writes_in_place.saturating_add(1);
     Ok(())
   }
 

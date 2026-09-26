@@ -1,6 +1,11 @@
 # Every entry created through the macOS NFS mount gets an AppleDouble `._` sidecar
 
-Status: **open — a declared limit of the NFS loopback transport, reported to its owner**
+Status: **fixed 2026-09-26 (A-33)**: the bridge serves `._name` as a view of `name`'s extended
+attributes in the volume's store, so no sidecar is ever a directory entry. See SLATES_DESIGN §4.6
+"Extended attributes over NFSv3" and
+`docs/bugs/2026-09-26-a-renamed-files-sidecar-used-its-old-name.md`.
+
+Original status: **open — a declared limit of the NFS loopback transport, reported to its owner**
 (`crates/bridge-nfs`, `crates/cli/src/mount.rs`); found by the conformance workload suite
 (`cargo xtask conformance run --suite workloads`, docs/wip/conformance.md) on 2026-09-14.
 

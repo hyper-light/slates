@@ -297,6 +297,13 @@ pub struct Volume {
   /// and starving others; unbounded (`u64::MAX`) until the admitting owner sets it, so tests and
   /// non-admitting callers are unaffected. Checked against the drift-free [`Volume::retained_versions`].
   pub(crate) retention_allowance: u64,
+  /// How many attribute writes landed in place ([`Volume::xattr_write_at`]): the non-vacuity
+  /// counter of the AppleDouble view's write-through fast path (§4.6), so a path that silently stops
+  /// being taken fails its test instead of passing through the whole-value reconcile.
+  pub(crate) attribute_writes_in_place: u64,
+  /// Each directory's most recent rename departure: the old name and the inode that left it
+  /// ([`Volume::departed`]). At most one per directory; transient.
+  pub(crate) departures: BTreeMap<InodeNo, (Box<str>, InodeNo)>,
   /// The retention bytes an in-progress operation has secured from the shard budget for the chunks
   /// it is about to retain (§4.2 retention, the byte dimension): charged before any mutation,
   /// consumed as each retained chunk lands on a deadlist, and any surplus returned when the
@@ -447,6 +454,8 @@ impl Volume {
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
+      attribute_writes_in_place: 0,
+      departures: BTreeMap::new(),
       retention_prepaid: 0,
       retention_charged: 0,
       versions_charged: 0,
@@ -510,6 +519,8 @@ impl Volume {
       live_entries: origin.live_entries,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
+      attribute_writes_in_place: 0,
+      departures: BTreeMap::new(),
       retention_prepaid: 0,
       retention_charged: 0,
       versions_charged: 0,
@@ -574,6 +585,8 @@ impl Volume {
       live_entries: 0,
       entry_allowance: u64::MAX,
       retention_allowance: u64::MAX,
+      attribute_writes_in_place: 0,
+      departures: BTreeMap::new(),
       retention_prepaid: 0,
       retention_charged: 0,
       versions_charged: 0,
@@ -1431,7 +1444,31 @@ impl Volume {
       Some(source.inode),
       0,
     );
+    let from_no = store.dirs.get(from_dir)?.inode;
+    self
+      .departures
+      .insert(from_no, (from_name.into(), source.inode));
     Ok(())
+  }
+
+  /// The inode that most recently left `name` in directory `dir` by a rename, while `name` names
+  /// nothing now: a rename's old name, which a macOS client still uses for the moved file's
+  /// AppleDouble sidecar until its rename syscall finishes (§4.6: after the main rename the kernel
+  /// stamps the file through its old vnode name, then renames `._old` to `._new`). One departure is
+  /// kept per directory, replaced by its next rename, so the record is bounded by the directory count;
+  /// it is transient, never recovered (a restart mid-rename loses nothing the client has not been
+  /// told). `None` when `name` exists again, the inode is gone, or another rename replaced it.
+  pub fn departed(&self, store: &Store, dir: InodeNo, name: &str) -> Option<InodeNo> {
+    let (left, no) = self.departures.get(&dir)?;
+    if !self.policy.same(left, name) || self.lookup_no(store, dir, name).is_ok() {
+      return None;
+    }
+    self.namespace_inode(store, *no).ok().map(|_| *no)
+  }
+
+  /// Forgets directory `dir`'s departure: its sidecar has followed it.
+  pub fn forget_departure(&mut self, dir: InodeNo) {
+    self.departures.remove(&dir);
   }
 
   // ------------------------------------------------------------------ content mutations
@@ -2496,6 +2533,12 @@ impl Volume {
     (self.live_inodes, self.inode_allowance)
   }
 
+  /// How many attribute writes have landed in place since the volume was built (the AppleDouble
+  /// view's write-through counter, §4.6).
+  pub const fn attribute_writes_in_place(&self) -> u64 {
+    self.attribute_writes_in_place
+  }
+
   /// The volume's live-entry count and its allowance (§4.2 namespace dimension).
   pub const fn entry_usage(&self) -> (u64, u64) {
     (self.live_entries, self.entry_allowance)
@@ -3253,6 +3296,8 @@ impl Volume {
     let born = store.inodes.get(handle)?.born;
     self.release_body(store, handle)?;
     self.table_remove(store, no)?;
+    // A directory's departure goes with it, so the record stays bounded by the live directories.
+    self.departures.remove(&no);
     self.retire(store, Dead::Inode(handle, born))?;
     // The number leaves the head: return its credit to the inode allowance (§4.2). The single
     // permanent-free site, matching `next_no`'s single charge.

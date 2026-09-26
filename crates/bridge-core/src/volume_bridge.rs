@@ -21,6 +21,8 @@
 //! — outsider edits, a controllable clock, a watcher that overflows — drives this bridge in the
 //! by-use tests (`tests/base_overlay.rs`) exactly as the real host does in the daemon.
 
+mod view;
+
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
@@ -478,6 +480,9 @@ impl Bridge for VolumeBridge<'_> {
 
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError> {
     self.authorize_read(cx)?;
+    if let Some(owner) = InodeNo(object.inode).derived_from() {
+      return self.view_getattr(owner);
+    }
     self.attr_of(object.inode)
   }
 
@@ -516,6 +521,9 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<(), VfsError> {
     self.authorize_read(cx)?;
     let want = usize::try_from(size).unwrap_or(0).min(self.max_read);
+    if let Some(owner) = InodeNo(object.inode).derived_from() {
+      return self.view_read(owner, offset, want, out);
+    }
     let mut buf = vec![0u8; want];
     let inode = InodeNo(object.inode);
     let read = match self.host.as_mut() {
@@ -540,6 +548,10 @@ impl Bridge for VolumeBridge<'_> {
     // effect (§4.6 EROFS/EACCES; the precise errno per case is a taxonomy refinement).
     self.authorize_write(cx)?;
     let inode = InodeNo(object.inode);
+    if let Some(owner) = inode.derived_from() {
+      let written = self.view_write(owner, offset, data)?;
+      return u32::try_from(written).map_err(|_| VfsError::FileTooLarge);
+    }
     // An overlay write copies the base up first (through the host); a scratch write does not.
     let written = match self.host.as_mut() {
       Some(host) => self
@@ -874,6 +886,9 @@ impl Bridge for VolumeBridge<'_> {
     self.authorize_write(cx)?;
     let ino = object.inode;
     let inode = InodeNo(ino);
+    if let Some(owner) = inode.derived_from() {
+      return self.view_setattr(owner, changes);
+    }
     // Every requested field is applied, never acknowledged and ignored (§4.6; audit BUG-8), and for
     // an overlay volume each goes through the overlay rules: a change to an untouched base file
     // copies its witness up first — content for a truncate, metadata-only for the rest (§4.5
@@ -1009,9 +1024,50 @@ impl Bridge for VolumeBridge<'_> {
 
   fn change_token(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.authorize_read(cx)?;
-    self
-      .volume
-      .change_version(self.store, InodeNo(object.inode))
+    // A view changes whenever its owner's attributes or working copy do; the owner's version moves
+    // with every attribute change, and the working copy's size and times with every write.
+    let inode = InodeNo(object.inode);
+    let owner = inode.derived_from().unwrap_or(inode);
+    self.volume.change_version(self.store, owner)
+  }
+
+  fn appledouble_lookup(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    owner_name: &str,
+  ) -> Result<NodeAttr, VfsError> {
+    self.view_lookup(parent, cx, owner_name)
+  }
+
+  fn appledouble_create(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    owner_name: &str,
+    exclusive: bool,
+  ) -> Result<NodeAttr, VfsError> {
+    self.view_create(parent, cx, owner_name, exclusive)
+  }
+
+  fn appledouble_remove(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    owner_name: &str,
+  ) -> Result<(), VfsError> {
+    self.view_remove(parent, cx, owner_name)
+  }
+
+  fn appledouble_rename(
+    &mut self,
+    from: ObjectId,
+    to: ObjectId,
+    cx: &OpContext,
+    from_owner: &str,
+    to_owner: &str,
+  ) -> Result<bool, VfsError> {
+    self.view_rename(from, to, cx, from_owner, to_owner)
   }
 
   fn statfs(&mut self, _object: ObjectId, cx: &OpContext) -> Result<FsStat, VfsError> {

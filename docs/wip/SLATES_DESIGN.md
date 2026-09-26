@@ -1643,6 +1643,38 @@ chosen-path form is a second mount of the same export at a user-owned directory.
 is also the differential oracle for the FSKit path: the same volume is mounted both ways in
 tests and the abstract states must agree.
 
+**Extended attributes over NFSv3 (A-33).** NFSv3 carries no extended attributes, so the macOS
+client stores them in an AppleDouble `._name` file beside `name`. The bridge serves that file as a
+*view* of `name`'s attributes in the volume's store (§4.5 "Extended attributes"):
+- **Naming.** A real entry always wins. A `._name` with no entry of its own, beside an existing
+  `name`, is the view. Its handle and file id are `name`'s derived inode number, which the volume
+  never issues, so the view needs no server table. READDIR never lists views.
+- **Reads** return the client's own bytes (a working copy kept in the store) or, when there is none,
+  a canonical encoding rendered on demand.
+- **Writes** land in the working copy, and the attributes are then reconciled with it:
+  - an incomplete file changes nothing;
+  - a write inside attribute values, with the layout unchanged, is written through in place;
+  - anything else sets every attribute the file names and removes every representable one it no
+    longer names.
+- **Create and remove.** CREATE and REMOVE of the view need write permission on `name`, not on the
+  directory: they change `name`'s attributes.
+- **Renames.** A rename leaves a *departure*: the vacated name still resolves to the moved inode's
+  view until the client's rename finishes. That is because xnu stamps the moved file through its
+  old vnode name before renaming `._old` onto `._new`. The trailing sidecar rename is then a no-op
+  on the same view. A real orphan sidecar created through a name no departure resolves is merged
+  into the owner, never replacing its other attributes.
+- **Evidence.** The format and its rules are xnu's (`vfs_xattr.c`, `kpi_vfs.c` at `xnu-12377`,
+  `xnu-10063`). Five sidecars that macOS 26.4.1 wrote decode, four of them re-encoding byte for
+  byte. Samba's `vfs_fruit` and Netatalk's `appledouble = ea` translate the same way.
+
+> **A-33 status (2026-09-26).** Implemented in `crates/bridge-core/src/appledouble.rs` (the
+> codec), `volume_bridge/view.rs` (the view) and `crates/bridge-nfs` (routing). It is proven by the
+> golden vectors, hostile input, by-use view tests (including the write-through counter) and live on
+> this Mac's mount. `xattr` set, read, list and delete work; no `._` entry appears; attributes
+> survive same- and cross-directory `mv`. The conformance workloads are all identical to APFS:
+> git, cargo, npm, python, rg, rsync, sqlite and vim, with the watcher skipped here for want of
+> `fswatch`. Found on the way: `docs/bugs/2026-09-26-a-renamed-files-sidecar-used-its-old-name.md`.
+
 **Windows (own thin WinFsp binding).** One WinFsp disk volume on a drive letter (object-namespace
 junction), `FileInfoTimeout = -1` with `FspFileSystemNotify` invalidations; requests handed to
 shards by handle and completed asynchronously; the chosen-path form is a second drive letter;
@@ -5836,3 +5868,19 @@ unjournaled attribute writes, reclaim of an owner's attributes, recovery image v
 and differential suites); the shared bridge's invalidation of an owner on an attribute op; GAPS and
 TBD_FIXES. The AppleDouble translation (§4.6), and the FUSE and WinFsp attribute calls, follow as
 their own changes. The recovery image format changes; no consensus rule or wire protocol changes.
+
+### A-33 — The NFSv3 bridge serves AppleDouble sidecars as views of the attribute store (2026-09-26)
+
+The macOS client writes every extended attribute over NFSv3 into a visible `._name` file. With the
+kernel stamping `com.apple.provenance` on every file a process creates, git, python, rsync and vim
+saw those files in their own output. The bridge now serves `._name` as a view of `name`'s
+attributes (§4.6 "Extended attributes over NFSv3"), and a rename leaves a per-directory departure
+so a moved file's sidecar, addressed through its old name, reaches the same view.
+
+Applied in the same change to: §4.6 (the view, status); `slates-bridge-core` (the AppleDouble codec,
+the view, the `Bridge` trait's `appledouble_*` verbs, the derived-number routing of getattr, read,
+write, setattr and change token); `slates-bridge-nfs` (LOOKUP, CREATE, REMOVE and RENAME routing, and
+the owner-permission rule); `slates-vfs` (the working copy, derived inode numbers, in-place
+attribute writes and their counter, rename departures, the namespace guard, recovery image v6); the
+conformance harness's npm path normalization; conformance.md; GAPS and TBD_FIXES. No wire or
+consensus change. The recovery image format changes.

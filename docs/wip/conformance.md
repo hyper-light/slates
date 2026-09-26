@@ -166,6 +166,12 @@ native 64-bit ones and `O_DIRECT` is defined 0, so the two direct-I/O operations
 
 ### 3.3 Workloads — four identical, four differ only by AppleDouble sidecars; two declared limits
 
+> **AppleDouble sidecars resolved (A-33, 2026-09-26).** The NFSv3 bridge serves `._name` as a view
+> of `name`'s extended attributes, so no sidecar reaches a tool. Local run on macOS 26.4.1: git,
+> cargo, npm, python, rg, rsync, sqlite and vim are all identical to the host, and the watcher is
+> skipped (no `fswatch`). The sidecar row below is kept as the record of what was found. Record:
+> `docs/bugs/2026-09-14-nfs-appledouble-sidecars.md`.
+
 > **Ubuntu editor correction (2026-09-17).** Job 105312670403 reported eight identical tools
 > and a missing mounted `note.txt~`. The roster now clears Vim's temporary-path `backupskip`
 > exclusion and reads the backup into the compared output; missing backups fail the script.

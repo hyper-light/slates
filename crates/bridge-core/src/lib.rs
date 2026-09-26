@@ -15,6 +15,7 @@
 //! which each transport maps to its wire error (a Linux errno, an `nfsstat3`); the neutral layer
 //! never invents an errno, so no transport inherits another's numbering.
 
+pub mod appledouble;
 pub mod authority;
 pub mod volume_bridge;
 
@@ -335,6 +336,57 @@ pub trait Bridge {
   /// calls this once when an attachment ends — a FUSE unmount, a lost connection — since FUSE does
   /// not guarantee a `FORGET` per outstanding reference. Idempotent.
   fn sweep_attachment(&mut self, cx: &OpContext) -> Result<(), VfsError>;
+
+  /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
+  /// "Extended attributes over NFSv3"): the `._owner_name` file a macOS NFSv3 client keeps
+  /// attributes in, served from the volume's attribute store. Its number is the owner's derived
+  /// number, and getattr, read, write and setattr on that number act on the view. `NotFound` when the
+  /// owner has no view. A bridge without extended attributes has no views.
+  fn appledouble_lookup(
+    &mut self,
+    _parent: ObjectId,
+    _cx: &OpContext,
+    _owner_name: &str,
+  ) -> Result<NodeAttr, VfsError> {
+    Err(VfsError::NotFound)
+  }
+
+  /// Creates `owner_name`'s AppleDouble view (a client's create of `._owner_name`), returning an
+  /// existing one unless `exclusive`, when it is refused `AlreadyExists`.
+  fn appledouble_create(
+    &mut self,
+    _parent: ObjectId,
+    _cx: &OpContext,
+    _owner_name: &str,
+    _exclusive: bool,
+  ) -> Result<NodeAttr, VfsError> {
+    Err(VfsError::NotFound)
+  }
+
+  /// A rename of `._from_owner` in `from` onto `._to_owner` in `to`: the rename a macOS client
+  /// issues to carry a sidecar along with a file it has just renamed. `Ok(true)` when the view
+  /// completed it (the sidecar already followed its owner, or an orphan sidecar was merged into the
+  /// owner); `Ok(false)` when it is an ordinary rename for the caller to perform.
+  fn appledouble_rename(
+    &mut self,
+    _from: ObjectId,
+    _to: ObjectId,
+    _cx: &OpContext,
+    _from_owner: &str,
+    _to_owner: &str,
+  ) -> Result<bool, VfsError> {
+    Ok(false)
+  }
+
+  /// Removes `owner_name`'s AppleDouble view and the attributes it carries.
+  fn appledouble_remove(
+    &mut self,
+    _parent: ObjectId,
+    _cx: &OpContext,
+    _owner_name: &str,
+  ) -> Result<(), VfsError> {
+    Err(VfsError::NotFound)
+  }
   /// How long the transport's kernel may cache `object`'s name and attributes (§4.6 "Cache
   /// posture"): forever unless the object follows a live base source. A transport stamps every
   /// entry and attribute reply with it. The default is forever, for a bridge with no live source.

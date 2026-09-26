@@ -576,10 +576,15 @@ impl<'b> Export<'b> {
     }
     let cx = self.op_context().map_err(|e| (nfsstat_of(&e), dir_attr))?;
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
-    let child = self
-      .bridge
-      .lookup(parent, &cx, name)
-      .map_err(|e| (nfsstat_of(&e), dir_attr))?;
+    // A real entry always wins; a missing `._name` is the AppleDouble view of `name`'s attributes.
+    let child = match self.bridge.lookup(parent, &cx, name) {
+      Err(VfsError::NotFound) => match appledouble_owner(name) {
+        Some(owner) => self.bridge.appledouble_lookup(parent, &cx, owner),
+        None => Err(VfsError::NotFound),
+      },
+      found => found,
+    }
+    .map_err(|e| (nfsstat_of(&e), dir_attr))?;
     let handle = self.handle_for(child.ino, child.generation);
     let object = self.fattr3(&child);
     Ok((handle, object, dir_attr))
@@ -843,10 +848,14 @@ impl<'b> Export<'b> {
         _ => {}
       }
     }
-    let entry = self
-      .bridge
-      .lookup(parent, &cx, &name)
-      .map_err(|e| (nfsstat_of(&e), dir_attr))?;
+    let entry = match self.bridge.lookup(parent, &cx, &name) {
+      Err(VfsError::NotFound) if !is_dir => match appledouble_owner(&name) {
+        Some(owner) => return self.remove_view(parent, &cx, owner, &dir_identity, dir_attr),
+        None => Err(VfsError::NotFound),
+      },
+      found => found,
+    }
+    .map_err(|e| (nfsstat_of(&e), dir_attr))?;
     if access::sticky_forbids(&self.caller, &dir_node, &entry) {
       return Err((Nfsstat3::Perm, dir_attr));
     }
@@ -858,6 +867,61 @@ impl<'b> Export<'b> {
     // The directory's post-op attributes (its new link count) go in the wcc whether the remove
     // succeeded or failed.
     let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    match outcome {
+      Ok(()) => dir_post.ok_or((Nfsstat3::ServerFault, None)),
+      Err(e) => Err((nfsstat_of(&e), dir_post)),
+    }
+  }
+
+  /// The AppleDouble view a CREATE of `name` makes, when `name` is `._owner` with no entry of its
+  /// own beside an existing `owner` (§4.6); `None` when it is an ordinary new name. Creating the view
+  /// changes `owner`'s attributes, so the caller needs write permission on `owner`, not on the
+  /// directory; a GUARDED create of an existing view is `Exist`.
+  fn create_view(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    name: &str,
+    mode_kind: u32,
+  ) -> Result<Option<ObjectId>, Nfsstat3> {
+    let Some(owner) = appledouble_owner(name) else {
+      return Ok(None);
+    };
+    let owner_node = match self.bridge.lookup(parent, cx, owner) {
+      Ok(node) => node,
+      Err(VfsError::NotFound) => return Ok(None),
+      Err(e) => return Err(nfsstat_of(&e)),
+    };
+    if !access::permits(&self.caller, &owner_node, Want::Write) {
+      return Err(Nfsstat3::Acces);
+    }
+    let exclusive = mode_kind == CREATE_GUARDED;
+    let view = self
+      .bridge
+      .appledouble_create(parent, cx, owner, exclusive)
+      .map_err(|e| nfsstat_of(&e))?;
+    Ok(Some(ObjectId::new(view.ino, view.generation)))
+  }
+
+  /// Removes the AppleDouble view of `owner`'s attributes (a client's REMOVE of `._owner`): the
+  /// attributes change, so the caller needs write permission on the owner, not on the directory.
+  fn remove_view(
+    &mut self,
+    parent: ObjectId,
+    cx: &OpContext,
+    owner: &str,
+    dir_identity: &FileHandle,
+    dir_attr: Option<Fattr3>,
+  ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
+    let owner_node = self
+      .bridge
+      .lookup(parent, cx, owner)
+      .map_err(|e| (nfsstat_of(&e), dir_attr))?;
+    if !access::permits(&self.caller, &owner_node, Want::Write) {
+      return Err((Nfsstat3::Acces, dir_attr));
+    }
+    let outcome = self.bridge.appledouble_remove(parent, cx, owner);
+    let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
     match outcome {
       Ok(()) => dir_post.ok_or((Nfsstat3::ServerFault, None)),
       Err(e) => Err((nfsstat_of(&e), dir_post)),
@@ -922,14 +986,18 @@ impl<'b> Export<'b> {
       let to_post = self.attrs_of(&to_identity).ok().map(|n| self.fattr3(&n));
       return (status, from_post, to_post);
     }
-    let outcome = self.bridge.rename(
-      from_parent,
-      to_parent,
-      &cx,
-      &from_name,
-      &to_name,
-      RenameFlags::default(),
-    );
+    let outcome = match self.adopt_sidecar(from_parent, to_parent, &cx, &from_name, &to_name) {
+      Ok(true) => Ok(()),
+      Ok(false) => self.bridge.rename(
+        from_parent,
+        to_parent,
+        &cx,
+        &from_name,
+        &to_name,
+        RenameFlags::default(),
+      ),
+      Err(e) => Err(e),
+    };
     let from_post = self.attrs_of(&from_identity).ok().map(|n| self.fattr3(&n));
     let to_post = self.attrs_of(&to_identity).ok().map(|n| self.fattr3(&n));
     let status = match outcome {
@@ -937,6 +1005,27 @@ impl<'b> Export<'b> {
       Err(e) => nfsstat_of(&e),
     };
     (status, from_post, to_post)
+  }
+
+  /// A rename of `._old` onto `._new`: the rename a macOS client issues to carry a sidecar along
+  /// with a file it has just renamed (§4.6), completed by the view when it is one (`Ok(true)`), an
+  /// ordinary rename otherwise (`Ok(false)`).
+  fn adopt_sidecar(
+    &mut self,
+    from: ObjectId,
+    to: ObjectId,
+    cx: &OpContext,
+    from_name: &str,
+    to_name: &str,
+  ) -> Result<bool, VfsError> {
+    let (Some(from_owner), Some(to_owner)) =
+      (appledouble_owner(from_name), appledouble_owner(to_name))
+    else {
+      return Ok(false);
+    };
+    self
+      .bridge
+      .appledouble_rename(from, to, cx, from_owner, to_owner)
   }
 
   /// The POSIX permission rules of a rename, checked before any effect: write and search permission
@@ -1169,7 +1258,10 @@ impl<'b> Export<'b> {
     let existing = match self.bridge.lookup(parent, &cx, &name) {
       Ok(node) if mode_kind == CREATE_UNCHECKED => Some(ObjectId::new(node.ino, node.generation)),
       Ok(_) => return (Nfsstat3::Exist, None, dir_post),
-      Err(VfsError::NotFound) => None,
+      Err(VfsError::NotFound) => match self.create_view(parent, &cx, &name, mode_kind) {
+        Ok(view) => view,
+        Err(status) => return (status, None, dir_post),
+      },
       Err(e) => return (nfsstat_of(&e), None, dir_post),
     };
     let object = match existing {
@@ -2002,6 +2094,14 @@ fn nfstime_of(ns: i64) -> Nfstime3 {
 
 /// Maps a volume refusal to the NFSv3 status a client expects. This is the NFS edge's vocabulary,
 /// the same neutral [`VfsError`] the FUSE edge maps to an errno.
+/// The owner a `._name` refers to when it is macOS's AppleDouble sidecar of `name` (§4.6): the name
+/// after the prefix, which must be non-empty. The mount root's own sidecar is `._.`.
+fn appledouble_owner(name: &str) -> Option<&str> {
+  /// Format: the prefix xnu names a sidecar with (`ATTR_FILE_PREFIX`).
+  const PREFIX: &str = "._";
+  name.strip_prefix(PREFIX).filter(|owner| !owner.is_empty())
+}
+
 fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
   match e {
     VfsError::NotFound => Nfsstat3::Noent,

@@ -344,13 +344,40 @@ pub struct Run {
 /// Format: the token both directory roots become in a normalized output.
 const ROOT_TOKEN: &str = "<dir>";
 
-/// The output with the run's directory (and its `/private` twin on macOS) replaced by one token.
+/// The output with the run's directory replaced by one token, in each spelling a tool prints it:
+/// as given, with its `/private` twin on macOS, and with every UUID-shaped path segment as `***`,
+/// which is how npm prints a path (it redacts UUIDs from its output; seen 2026-09-26 when the scratch
+/// directory's name was a UUID: `app@1.0.0 /private/tmp/.../***/scratchpad/...`).
 pub fn normalize_output(output: &str, directory: &str) -> String {
   let trimmed = directory.trim_end_matches('/');
-  let private = format!("/private{trimmed}");
-  output
-    .replace(&private, ROOT_TOKEN)
-    .replace(trimmed, ROOT_TOKEN)
+  let redacted = redact_uuids(trimmed);
+  let mut spellings = vec![format!("/private{trimmed}"), trimmed.to_owned()];
+  if redacted != trimmed {
+    spellings.insert(0, format!("/private{redacted}"));
+    spellings.insert(1, redacted);
+  }
+  spellings.iter().fold(output.to_owned(), |text, spelling| {
+    text.replace(spelling, ROOT_TOKEN)
+  })
+}
+
+/// A path with every UUID-shaped segment (8-4-4-4-12 hexadecimal digits) replaced by `***`.
+fn redact_uuids(path: &str) -> String {
+  /// Format: the lengths of a UUID's hyphen-separated groups (RFC 9562 §4).
+  const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+  let is_uuid = |segment: &str| {
+    let groups: Vec<&str> = segment.split('-').collect();
+    groups.len() == UUID_GROUPS.len()
+      && groups
+        .iter()
+        .zip(UUID_GROUPS)
+        .all(|(group, len)| group.len() == len && group.chars().all(|c| c.is_ascii_hexdigit()))
+  };
+  path
+    .split('/')
+    .map(|segment| if is_uuid(segment) { "***" } else { segment })
+    .collect::<Vec<_>>()
+    .join("/")
 }
 
 /// The first differing line of two texts, as a bounded detail.
@@ -440,6 +467,23 @@ pub fn compare(workload: &Workload, host: &Run, mount: &Run) -> WorkloadStatus {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-4.2 (workloads): npm prints a path with its UUID-shaped segments as `***`. Do normalize npm's
+  /// `ls` line from a run directory whose name is a UUID; expect the root token, as for any tool.
+  #[test]
+  fn a_path_npm_redacted_normalizes_to_the_root_token() {
+    let directory = "/tmp/claude/5bcbc28d-64b0-4c59-8918-79563c747af3/scratch/npm";
+    let npm = "app@1.0.0 /private/tmp/claude/***/scratch/npm/app\n";
+    assert_eq!(normalize_output(npm, directory), "app@1.0.0 <dir>/app\n");
+    assert_eq!(
+      normalize_output(
+        "x /tmp/claude/5bcbc28d-64b0-4c59-8918-79563c747af3/scratch/npm/y",
+        directory
+      ),
+      "x <dir>/y"
+    );
+    assert_eq!(redact_uuids("/a/not-a-uuid/b"), "/a/not-a-uuid/b");
+  }
 
   fn file(path: &str, digest: &str) -> Entry {
     Entry {

@@ -71,10 +71,11 @@ authorized merely by appearing here.
   `docs/bugs/2026-09-26-folding-renames-lost-the-hosts-spelling.md`.
 - [x] **The first macOS root pjdfstest review.** 1,905 cases listed by cause; 0 unlisted against CI run
   36202635768. See `docs/bugs/2026-09-26-macos-pjdfstest-root-review.md`.
-- [ ] **macOS workloads: cargo's `._target` AppleDouble sidecar** (NFSv3 has no xattrs; the client
-  stores cargo's backup-exclusion xattr as a visible file). Being fixed on NFSv3 (A-32; NFSv4 and
-  FSKit rejected): the volume's own extended-attribute store is done (model oracle; APFS and tmpfs
-  differentials). Next: the NFSv3 bridge serves `._name` as a view of `name`'s attributes.
+- [x] **macOS workloads: cargo's `._target` AppleDouble sidecar.** NFSv3 has no xattrs, so the
+  client stored cargo's backup-exclusion xattr as a visible file. Fixed by the volume's attribute
+  store (A-32) plus the NFSv3 bridge serving `._name` as a view of `name`'s attributes (A-33). All
+  eight workloads are identical locally. See
+  `docs/bugs/2026-09-26-a-renamed-files-sidecar-used-its-old-name.md`.
 - [x] **macOS hermeticity: 92 of 93 write-capable calls unresolved.** The tracer is eslogger
   (`docs/bugs/2026-09-26-hermeticity-tracer-moves-to-eslogger.md`): 0 unresolved and 0 outside, both on
   this Mac and on the runner (36275244114). Its stop raced its own stream and cut the landing out of one
