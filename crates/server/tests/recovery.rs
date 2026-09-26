@@ -460,10 +460,16 @@ enum Crash {
 
 /// Reads a ring's tail (its monotonic byte write offset) from the log region's header word.
 fn log_tail(segment: &AnchorSegment, partition: u16) -> u64 {
-  let ring = segment.region_bytes(RegionKind::Log(partition)).unwrap();
   let mut word = [0u8; size_of::<u64>()];
-  word
-    .copy_from_slice(&ring[slates_anchor::layout::RING_TAIL..slates_anchor::layout::RING_TAIL + 8]);
+  word.copy_from_slice(
+    segment
+      .region_read(
+        RegionKind::Log(partition),
+        slates_anchor::layout::RING_TAIL,
+        8,
+      )
+      .unwrap(),
+  );
   u64::from_le_bytes(word)
 }
 
@@ -472,8 +478,10 @@ fn log_tail(segment: &AnchorSegment, partition: u16) -> u64 {
 fn log_headers(segment: &AnchorSegment, partitions: u16) -> Vec<(u16, Vec<u8>)> {
   (0..partitions)
     .map(|p| {
-      let ring = segment.region_bytes(RegionKind::Log(p)).unwrap();
-      (p, ring[..slates_anchor::layout::RING_BYTES].to_vec())
+      let header = segment
+        .region_read(RegionKind::Log(p), 0, slates_anchor::layout::RING_BYTES)
+        .unwrap();
+      (p, header.to_vec())
     })
     .collect()
 }
@@ -483,8 +491,10 @@ fn log_headers(segment: &AnchorSegment, partitions: u16) -> Vec<(u16, Vec<u8>)> 
 /// before that record's durable commit would leave it.
 fn restore_log_headers(segment: &mut AnchorSegment, headers: &[(u16, Vec<u8>)]) {
   for (p, header) in headers {
-    let ring = segment.region_bytes_mut(RegionKind::Log(*p)).unwrap();
-    ring[..header.len()].copy_from_slice(header);
+    segment
+      .region_write(RegionKind::Log(*p), 0, header.len())
+      .unwrap()
+      .copy_from_slice(header);
   }
 }
 
@@ -936,10 +946,15 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
 /// does not wrap the ring.
 fn cut_log_after_one_record(segment: &mut AnchorSegment, partition: u16, from_tail: u64) {
   let capacity = {
-    let ring = segment.region_bytes(RegionKind::Log(partition)).unwrap();
     let mut word = [0u8; size_of::<u64>()];
     word.copy_from_slice(
-      &ring[slates_anchor::layout::RING_CAPACITY..slates_anchor::layout::RING_CAPACITY + 8],
+      segment
+        .region_read(
+          RegionKind::Log(partition),
+          slates_anchor::layout::RING_CAPACITY,
+          8,
+        )
+        .unwrap(),
     );
     u64::from_le_bytes(word)
   };
@@ -947,16 +962,22 @@ fn cut_log_after_one_record(segment: &mut AnchorSegment, partition: u16, from_ta
     + usize::try_from(from_tail % capacity.max(1)).unwrap_or(0)
     + RECORD_LEN_AT;
   let body_len = {
-    let ring = segment.region_bytes(RegionKind::Log(partition)).unwrap();
     let mut word = [0u8; size_of::<u32>()];
-    word.copy_from_slice(&ring[data_at..data_at + size_of::<u32>()]);
+    word.copy_from_slice(
+      segment
+        .region_read(RegionKind::Log(partition), data_at, size_of::<u32>())
+        .unwrap(),
+    );
     u64::from(u32::from_le_bytes(word))
   };
   let record_end =
     from_tail + u64::try_from(slates_db::record::RECORD_HEADER).unwrap_or(0) + body_len;
-  let ring = segment
-    .region_bytes_mut(RegionKind::Log(partition))
-    .unwrap();
-  ring[slates_anchor::layout::RING_TAIL..slates_anchor::layout::RING_TAIL + 8]
+  segment
+    .region_write(
+      RegionKind::Log(partition),
+      slates_anchor::layout::RING_TAIL,
+      8,
+    )
+    .unwrap()
     .copy_from_slice(&record_end.to_le_bytes());
 }

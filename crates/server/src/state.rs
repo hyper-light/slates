@@ -12,8 +12,8 @@ use slates_db::catalog::{Principal, VolumeId};
 use slates_db::register::{Acceptor, ObjectId};
 use slates_ipc::DaemonEnd;
 use slates_ipc::protocol::ReplyBody;
-use slates_mem::SharedObject;
 use slates_mem::Slab;
+use slates_mem::SparseObject;
 use slates_merge::engine::Green;
 use slates_merge::increment::VolumeOp;
 use slates_vfs::volume::{Store, Volume};
@@ -148,7 +148,7 @@ pub struct ShardState {
   /// range within it this shard owns (shards share one object, partitioned by index). `None` when
   /// the anchor provides no content object (a build or config without anchor-backed recovery); then
   /// a restart recreates content empty as before (BUG-11).
-  pub content: Option<SharedObject>,
+  pub content: Option<SparseObject>,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),

@@ -711,9 +711,8 @@ fn segment_with_a_torn_sixth_record() -> (
   .unwrap();
   let tail_after = seg.ring_words(RegionKind::Log(0)).unwrap()[1].load(Ordering::Acquire);
   drop(db);
-  let ring = seg.region_bytes_mut(RegionKind::Log(0)).unwrap();
   let at = slates_anchor::layout::RING_BYTES + usize::try_from(tail_before).unwrap() + 40;
-  ring[at] ^= 0xff;
+  seg.region_write(RegionKind::Log(0), at, 1).unwrap()[0] ^= 0xff;
   (seg, before, tail_before, tail_after)
 }
 
@@ -790,7 +789,6 @@ fn hostile_records_are_refused_without_a_panic() {
     let tail = seg.ring_words(RegionKind::Log(0)).unwrap()[1].load(Ordering::Acquire);
     let at = slates_anchor::layout::RING_BYTES + usize::try_from(tail).unwrap();
     {
-      let ring = seg.region_bytes_mut(RegionKind::Log(0)).unwrap();
       let mut header = [0u8; 32];
       header[0..4].copy_from_slice(&slates_db::record::RECORD_MAGIC.to_le_bytes());
       header[4..8].copy_from_slice(&64u32.to_le_bytes());
@@ -802,7 +800,10 @@ fn hostile_records_are_refused_without_a_panic() {
         _ => {}
       }
       let len = if poison == 4 { 12 } else { 32 + 64 };
-      ring[at..at + 32.min(len)].copy_from_slice(&header[..32.min(len)]);
+      seg
+        .region_write(RegionKind::Log(0), at, 32.min(len))
+        .unwrap()
+        .copy_from_slice(&header[..32.min(len)]);
     }
     let words = seg.ring_words(RegionKind::Log(0)).unwrap();
     let bump = if poison == 4 { 12 } else { 32 + 64 };

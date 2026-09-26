@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use slates_machine::facts::Identity;
-use slates_mem::{Handoff, SharedObject};
+use slates_mem::{Handoff, SparseObject};
 
 use crate::error::AnchorError;
 use crate::layout::{
@@ -29,15 +29,17 @@ pub const ENV_CONTENT: &str = "SLATES_ANCHOR_CONTENT";
 /// Format: the environment variable carrying the content object's length.
 pub const ENV_CONTENT_LEN: &str = "SLATES_ANCHOR_CONTENT_LEN";
 
-/// The mapped anchor segment.
+/// The mapped anchor segment: a sparse object (`slates_mem::SparseObject`), backed only where its
+/// regions are touched — a log ring's written span, a published slot — so a layout sized by the design's
+/// bounds costs RAM only for what it holds, on Windows as on Linux and macOS.
 pub struct AnchorSegment {
-  object: SharedObject,
+  object: SparseObject,
   geometry: Geometry,
   /// The content object the supervisor creates and holds so a shard's volume storage lives in
   /// anchor-owned RAM (§4.8): `Some` on the process that created it (the supervisor keeps it alive
   /// across daemon restarts), `None` on a process that only attached the metadata object — that
   /// process opens the content object from the handoff env ([`AnchorSegment::open_content`]).
-  content: Option<SharedObject>,
+  content: Option<SparseObject>,
 }
 
 impl std::fmt::Debug for AnchorSegment {
@@ -142,8 +144,8 @@ impl AnchorSegment {
     let total = usize::try_from(geometry.total_bytes()).map_err(|_| AnchorError::Geometry {
       reason: "total length overflows",
     })?;
-    let mut object = SharedObject::create(name, total)?;
-    let bytes = object.bytes_mut();
+    let mut object = SparseObject::create(name, total)?;
+    let bytes = object.range_mut(0, HEADER_BYTES.min(total))?;
     put(bytes, AT_GENERATION, &1u64.to_le_bytes());
     put(bytes, AT_MAGIC, &MAGIC.to_le_bytes());
     put(bytes, AT_VERSION, &LAYOUT_VERSION.to_le_bytes());
@@ -172,14 +174,14 @@ impl AnchorSegment {
     content_name: &str,
     content_bytes: usize,
   ) -> Result<AnchorSegment, AnchorError> {
-    self.content = Some(SharedObject::create(content_name, content_bytes.max(1))?);
+    self.content = Some(SparseObject::create(content_name, content_bytes.max(1))?);
     Ok(self)
   }
 
   /// Opens the content object the anchor handed off, read from the daemon's `env`, or `None` when
   /// none was provided (a build or config without anchor-backed storage). The parse mirrors the
   /// metadata handoff: a descriptor on Linux, a name elsewhere.
-  pub fn open_content(env: &[(String, String)]) -> Option<Result<SharedObject, AnchorError>> {
+  pub fn open_content(env: &[(String, String)]) -> Option<Result<SparseObject, AnchorError>> {
     let raw = env.iter().find(|(k, _)| k == ENV_CONTENT).map(|(_, v)| v)?;
     let len: usize = env
       .iter()
@@ -189,7 +191,7 @@ impl AnchorSegment {
       Ok(fd) if cfg!(target_os = "linux") => Handoff::Descriptor(fd),
       _ => Handoff::Name(raw.clone()),
     };
-    Some(SharedObject::open(&handoff, len).map_err(AnchorError::from))
+    Some(SparseObject::open(&handoff, len).map_err(AnchorError::from))
   }
 
   /// Attaches to a segment another process created, from its handoff and length, checking
@@ -199,13 +201,13 @@ impl AnchorSegment {
     len: usize,
     identity: &Identity,
   ) -> Result<AnchorSegment, AnchorError> {
-    let object = SharedObject::open(handoff, len)?;
-    let bytes = object.bytes();
-    if bytes.len() < HEADER_BYTES {
+    let object = SparseObject::open(handoff, len)?;
+    if object.len() < HEADER_BYTES {
       return Err(AnchorError::Layout {
         reason: "shorter than its header",
       });
     }
+    let bytes = object.range(0, HEADER_BYTES)?;
     if read_u32(bytes, AT_MAGIC) != MAGIC {
       return Err(AnchorError::Layout {
         reason: "wrong magic",
@@ -329,18 +331,13 @@ impl AnchorSegment {
 
   /// Adopts a content object a daemon opened from its handoff after attaching the segment, so the
   /// segment carries it into [`AnchorSegment::handoff_env`] for the daemon's shard children (§4.8).
-  pub fn adopt_content(&mut self, object: SharedObject) {
+  pub fn adopt_content(&mut self, object: SparseObject) {
     self.content = Some(object);
   }
 
   /// The content object, if any (a shard reads and publishes its recovery image through it).
-  pub fn content(&self) -> Option<&SharedObject> {
+  pub fn content(&self) -> Option<&SparseObject> {
     self.content.as_ref()
-  }
-
-  /// Locks the segment into RAM.
-  pub fn lock(&mut self) -> Result<(), AnchorError> {
-    Ok(self.object.lock()?)
   }
 
   fn spec(&self, kind: RegionKind) -> Result<RegionSpec, AnchorError> {
@@ -405,40 +402,60 @@ impl AnchorSegment {
     &mut self,
     secret: &[u8; ISSUER_SECRET_BYTES],
   ) -> Result<(), AnchorError> {
-    let bytes = self.region_bytes_mut(RegionKind::Supervision)?;
-    if bytes.len() < SUP_ISSUER + ISSUER_SECRET_BYTES {
-      return Err(AnchorError::Layout {
-        reason: "the supervision block has no room for the issuer secret",
-      });
-    }
-    put(bytes, SUP_ISSUER, secret);
+    self
+      .region_write(RegionKind::Supervision, SUP_ISSUER, ISSUER_SECRET_BYTES)?
+      .copy_from_slice(secret);
     Ok(())
   }
 
   /// The daemon's published grant-issuer secret, copied out of the supervision block; all zero until a
   /// daemon has started under this anchor (a fresh segment holds no authority, so no proof verifies).
   pub fn issuer_secret(&self) -> Result<[u8; ISSUER_SECRET_BYTES], AnchorError> {
-    let bytes = self.region_bytes(RegionKind::Supervision)?;
     let mut out = [0u8; ISSUER_SECRET_BYTES];
-    let Some(slice) = bytes.get(SUP_ISSUER..SUP_ISSUER + ISSUER_SECRET_BYTES) else {
-      return Err(AnchorError::Layout {
-        reason: "the supervision block has no room for the issuer secret",
-      });
-    };
-    out.copy_from_slice(slice);
+    out.copy_from_slice(self.region_read(
+      RegionKind::Supervision,
+      SUP_ISSUER,
+      ISSUER_SECRET_BYTES,
+    )?);
     Ok(out)
   }
 
-  /// The bytes of a region, for its single owner.
-  pub fn region_bytes(&self, kind: RegionKind) -> Result<&[u8], AnchorError> {
+  /// A region's length in bytes.
+  pub fn region_len(&self, kind: RegionKind) -> Result<usize, AnchorError> {
     let range = self.range(self.spec(kind)?)?;
-    Ok(&self.object.bytes()[range])
+    Ok(range.end - range.start)
   }
 
-  /// The bytes of a region, for its single owner.
-  pub fn region_bytes_mut(&mut self, kind: RegionKind) -> Result<&mut [u8], AnchorError> {
+  /// The `len` bytes at `at` within a region, for the region's single owner. Only these bytes are
+  /// backed (the segment is sparse); a span past the region is refused, never read from its neighbour.
+  pub fn region_read(&self, kind: RegionKind, at: usize, len: usize) -> Result<&[u8], AnchorError> {
+    let start = self.region_span(kind, at, len)?;
+    Ok(self.object.range(start, len)?)
+  }
+
+  /// The `len` bytes at `at` within a region, writable, for the region's single owner.
+  pub fn region_write(
+    &mut self,
+    kind: RegionKind,
+    at: usize,
+    len: usize,
+  ) -> Result<&mut [u8], AnchorError> {
+    let start = self.region_span(kind, at, len)?;
+    Ok(self.object.range_mut(start, len)?)
+  }
+
+  /// The segment offset of `[at, at + len)` inside a region, refused when it leaves the region.
+  fn region_span(&self, kind: RegionKind, at: usize, len: usize) -> Result<usize, AnchorError> {
     let range = self.range(self.spec(kind)?)?;
-    Ok(&mut self.object.bytes_mut()[range])
+    let past_region = AnchorError::Geometry {
+      reason: "a span past its region",
+    };
+    let start = range.start.checked_add(at).ok_or(past_region.clone())?;
+    let end = start.checked_add(len).ok_or(past_region.clone())?;
+    if end > range.end {
+      return Err(past_region);
+    }
+    Ok(start)
   }
 
   /// A ring region's head, tail, capacity and sequence-base words (a log or the audit).
@@ -488,15 +505,16 @@ impl AnchorSegment {
     let generation = self.word_at(spec, PAYLOAD_GENERATION)?;
     let start = generation.load(Ordering::Acquire);
     generation.store(start | 1, Ordering::Release);
-    let bytes = self.region_bytes_mut(kind)?;
-    put(
-      bytes,
-      PAYLOAD_LEN,
-      &u64::try_from(payload.len())
-        .unwrap_or(u64::MAX)
-        .to_le_bytes(),
-    );
-    put(bytes, PAYLOAD_BYTES, payload);
+    self
+      .region_write(kind, PAYLOAD_LEN, size_of::<u64>())?
+      .copy_from_slice(
+        &u64::try_from(payload.len())
+          .unwrap_or(u64::MAX)
+          .to_le_bytes(),
+      );
+    self
+      .region_write(kind, PAYLOAD_BYTES, payload.len())?
+      .copy_from_slice(payload);
     let generation = self.word_at(spec, PAYLOAD_GENERATION)?;
     generation.store((start | 1).wrapping_add(1), Ordering::Release);
     Ok(())
@@ -514,19 +532,22 @@ impl AnchorSegment {
     if !before.is_multiple_of(2) {
       return Err(AnchorError::PublicationInProgress);
     }
-    let bytes = self.region_bytes(kind)?;
-    let len = usize::try_from(read_u64(bytes, PAYLOAD_LEN)).map_err(|_| AnchorError::Layout {
+    let len = usize::try_from(read_u64(
+      self.region_read(kind, PAYLOAD_LEN, size_of::<u64>())?,
+      0,
+    ))
+    .map_err(|_| AnchorError::Layout {
       reason: "payload length overflows",
     })?;
     let end = PAYLOAD_BYTES.checked_add(len).ok_or(AnchorError::Layout {
       reason: "payload length overflows",
     })?;
-    if end > bytes.len() {
+    if end > self.region_len(kind)? {
       return Err(AnchorError::Layout {
         reason: "payload length exceeds its region",
       });
     }
-    let payload = bytes[PAYLOAD_BYTES..end].to_vec();
+    let payload = self.region_read(kind, PAYLOAD_BYTES, len)?.to_vec();
     if generation.load(Ordering::Acquire) != before {
       return Err(AnchorError::Layout {
         reason: "the payload changed while it was read",

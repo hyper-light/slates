@@ -325,12 +325,18 @@ mod tests {
       let target = RegionKind::Consensus(
         u8::try_from((state.consensus_generation + 1) % u64::from(SLOTS)).unwrap(),
       );
-      let saved_target =
-        state.segment.region_bytes(target).unwrap()[..PAYLOAD_BYTES + payload.len()].to_vec();
+      let saved_target = state
+        .segment
+        .region_read(target, 0, PAYLOAD_BYTES + payload.len())
+        .unwrap()
+        .to_vec();
       // Begin and commit are atomic words; the length and body can tear at any byte.
       for copied in 0..=payload.len() {
-        let bytes = state.segment.region_bytes_mut(target).unwrap();
-        bytes[..saved_target.len()].copy_from_slice(&saved_target);
+        let bytes = state
+          .segment
+          .region_write(target, 0, saved_target.len())
+          .unwrap();
+        bytes.copy_from_slice(&saved_target);
         bytes[PAYLOAD_GENERATION..PAYLOAD_GENERATION + size_of::<u64>()]
           .copy_from_slice(&1u64.to_le_bytes());
         bytes[PAYLOAD_LEN..PAYLOAD_LEN + size_of::<u64>()]
@@ -368,14 +374,19 @@ mod tests {
       retain_first_vote(state);
       let target =
         RegionKind::Consensus(u8::try_from(state.consensus_generation % u64::from(SLOTS)).unwrap());
-      let bytes = state.segment.region_bytes_mut(target).unwrap();
-      bytes[PAYLOAD_BYTES + CHECKSUM_BYTES] ^= 1;
+      state
+        .segment
+        .region_write(target, PAYLOAD_BYTES + CHECKSUM_BYTES, 1)
+        .unwrap()[0] ^= 1;
       assert!(matches!(
         load(&state.segment),
         Err(AnchorError::Layout { .. })
       ));
       // Repair only the test's injected corruption so the fixture can shut down normally.
-      state.segment.region_bytes_mut(target).unwrap()[PAYLOAD_BYTES + CHECKSUM_BYTES] ^= 1;
+      state
+        .segment
+        .region_write(target, PAYLOAD_BYTES + CHECKSUM_BYTES, 1)
+        .unwrap()[0] ^= 1;
     });
   }
 
@@ -387,11 +398,7 @@ mod tests {
       |state| {
         retain_first_vote(state);
         let (mut raft, base) = state.council.join_state().unwrap();
-        let capacity = state
-          .segment
-          .region_bytes(RegionKind::Consensus(0))
-          .unwrap()
-          .len();
+        let capacity = state.segment.region_len(RegionKind::Consensus(0)).unwrap();
         raft.log.push(slates_cluster::raft::LogEntry::command(
           raft.term,
           vec![0; capacity],

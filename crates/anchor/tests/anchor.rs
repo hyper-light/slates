@@ -432,7 +432,10 @@ fn the_content_object_survives_a_daemon_restart_through_the_handoff() {
   let mut daemon = AnchorSegment::open_content(&env).unwrap().unwrap();
   let offset = 8 * 4096;
   let written = b"agent content written before the crash";
-  daemon.bytes_mut()[offset..offset + written.len()].copy_from_slice(written);
+  daemon
+    .range_mut(offset, written.len())
+    .unwrap()
+    .copy_from_slice(written);
 
   // The daemon crashes: its mapping is gone. The supervisor still holds the object alive.
   drop(daemon);
@@ -440,7 +443,7 @@ fn the_content_object_survives_a_daemon_restart_through_the_handoff() {
   // The restarted daemon re-opens the content object from the same handoff; the bytes survive.
   let restarted = AnchorSegment::open_content(&env).unwrap().unwrap();
   assert_eq!(
-    &restarted.bytes()[offset..offset + written.len()],
+    restarted.range(offset, written.len()).unwrap(),
     written,
     "content in the anchor's content object survives a daemon restart"
   );

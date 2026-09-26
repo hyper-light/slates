@@ -505,7 +505,7 @@ impl Daemon {
       } => {
         let mut segment = AnchorSegment::attach(&handoff, len, &identity)?;
         if let Some((content_handoff, content_len)) = content {
-          let object = slates_mem::SharedObject::open(&content_handoff, content_len)
+          let object = slates_mem::SparseObject::open(&content_handoff, content_len)
             .map_err(slates_anchor::AnchorError::from)?;
           segment.adopt_content(object);
         }

@@ -75,8 +75,17 @@ authorized merely by appearing here.
   stores cargo's backup-exclusion xattr as a visible file). Open, as GAPS records.
 - [ ] **macOS hermeticity: 92 of 93 write-capable calls unresolved** (fs_usage cannot attribute
   descriptors; the DTrace attribution is authorized and owed). Open, as GAPS records.
-- [ ] **The anchor segment on Windows: `CreateFileMappingW` 1450.** 167–188 GB derived, which a
-  pagefile section is charged in full at creation. Reserve the section and commit on first use.
+- [x] **The anchor segment on Windows: `CreateFileMappingW` 1450.** 167–188 GB derived, which a
+  pagefile section is charged in full at creation. The segment and content object are now a
+  `SparseObject`: `SEC_RESERVE` on Windows, committed as ranges are reached, reached only by ranges.
+  Proof owed to the next Windows run. See
+  `docs/bugs/2026-09-26-windows-committed-the-whole-anchor-segment.md`.
+- [ ] **For Ada: the op-log ring is bounded by recovery time, not by memory.** 16.4 GB per partition on
+  a 128 GB Mac, 4 GB in a 1 GiB KIND pod; `trim` frees nothing, so a wrapping ring touches all of it
+  (same record).
+- [ ] **KIND scale-down formation chain** (run 36262457777): after 5 → 3, `slates-0` and `slates-2`
+  each saw only `slates-1` for 180 s, with NXDOMAIN for fresh pod names. This is the audit's open
+  "formation remains a chain" item; it passed the two runs before.
 - [ ] **Serve ports are still bound-then-released.** A test's own dialers could take its next node's port;
   none traced yet. Allocate below the kernel's ephemeral range (same record, found 1).
 - [ ] **A first placement that never converged** kept `poll_until` waiting past twelve minutes while the

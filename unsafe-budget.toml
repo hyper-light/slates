@@ -17,11 +17,15 @@
 #   events-and-reports-an-unconverged-tail.md), which confirms a waiter asleep and learns each thread's CPU:
 #   macOS `pthread_cpu_number_np`, `pthread_mach_thread_np` and `thread_info` (3) and Windows
 #   `GetCurrentProcessorNumber` (1) — FFI with no safe wrapper; Linux uses rustix and `/proc` (none).
-# slates-mem (16): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
+# slates-mem (19): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
 #   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
-#   the file-backed map of a memory object (1), the descriptor a child inherits (1), the two
-#   atomic views of mapped words (2), and the Windows section (create, open, view, drop, the two
-#   byte views and the lock: 8).
+#   the file-backed map of a memory object (1), the descriptor a child inherits (1), the one
+#   atomic word view both objects share (`word_view`, 1; it replaced the two per-width views
+#   2026-09-26), and the Windows section (create, open, view, drop, the two byte views and the
+#   lock: 8); the sparse object (2026-09-26, the anchor segment and content object on a
+#   `SEC_RESERVE` section — CI run 36202635768's 167 GB layout refused 1450 on a 16 GB runner):
+#   `GetSystemInfo` for the commit granule (1), `VirtualAlloc(MEM_COMMIT)` of a range (1), and the
+#   two committed-range views (2).
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -121,7 +125,7 @@
 
 [budget]
 slates-machine = 49
-slates-mem = 16
+slates-mem = 19
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous

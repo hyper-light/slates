@@ -6109,6 +6109,67 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
   );
 }
 
+/// A shard's slice of the anchor content object, read by ranges (§4.8): the object is sparse (backed
+/// only where it is touched), so the image is found and read without ever viewing the whole slice.
+struct ContentView<'a> {
+  object: &'a slates_mem::SparseObject,
+  start: usize,
+  len: usize,
+}
+
+impl slates_vfs::recover::ImageRead for ContentView<'_> {
+  fn image_len(&self) -> usize {
+    self.len
+  }
+
+  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], slates_vfs::VfsError> {
+    content_range(self.start, self.len, offset, len)
+      .and_then(|at| self.object.range(at, len).ok())
+      .ok_or(slates_vfs::VfsError::RecoveryIncomplete)
+  }
+}
+
+/// A shard's slice of the anchor content object, published by ranges (§4.8); only the frame written
+/// is backed.
+struct ContentSlots<'a> {
+  object: &'a mut slates_mem::SparseObject,
+  start: usize,
+  len: usize,
+}
+
+impl slates_vfs::recover::ImageRead for ContentSlots<'_> {
+  fn image_len(&self) -> usize {
+    self.len
+  }
+
+  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], slates_vfs::VfsError> {
+    content_range(self.start, self.len, offset, len)
+      .and_then(|at| self.object.range(at, len).ok())
+      .ok_or(slates_vfs::VfsError::RecoveryIncomplete)
+  }
+}
+
+impl slates_vfs::recover::ImageWrite for ContentSlots<'_> {
+  fn image_write(&mut self, offset: usize, len: usize) -> Result<&mut [u8], slates_vfs::VfsError> {
+    // A span past the slice, or memory the OS would not back (a Windows commit refused), is no space.
+    let at =
+      content_range(self.start, self.len, offset, len).ok_or(slates_vfs::VfsError::NoSpace)?;
+    self
+      .object
+      .range_mut(at, len)
+      .map_err(|_| slates_vfs::VfsError::NoSpace)
+  }
+}
+
+/// The object offset of `[offset, offset + len)` within a slice `[start, start + slice_len)`, or `None`
+/// when the span leaves the slice.
+fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> Option<usize> {
+  let end = offset.checked_add(len)?;
+  (end <= slice_len)
+    .then(|| start.checked_add(offset))
+    .flatten()
+}
+
 /// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id.
 /// A torn or malformed image logs and yields nothing for that shard (each volume then refuses as
 /// unrecoverable rather than presenting empty), matching §4.8's "never an empty success".
@@ -6120,7 +6181,12 @@ fn recover_images(state: &ShardState) -> std::collections::BTreeMap<[u8; 16], Vo
   if end <= start || end > object.len() {
     return std::collections::BTreeMap::new();
   }
-  match ShardImage::read_from(&object.bytes()[start..end]) {
+  let view = ContentView {
+    object,
+    start,
+    len: end - start,
+  };
+  match ShardImage::read_from(&view) {
     Ok(Some(shard)) => shard
       .volumes
       .into_iter()
@@ -6207,10 +6273,15 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };
-  let Some(slice) = object.bytes_mut().get_mut(start..end) else {
+  if end > object.len() {
     return Err(slates_vfs::VfsError::NoSpace);
+  }
+  let mut slots = ContentSlots {
+    object,
+    start,
+    len: end - start,
   };
-  match shard.write_to(slice) {
+  match shard.write_to(&mut slots) {
     Ok(frame_bytes) => {
       published.frame_bytes = frame_bytes;
       Ok(published)

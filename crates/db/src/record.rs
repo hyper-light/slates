@@ -141,16 +141,14 @@ impl LogRing {
       AT_CRC,
       &checksum(seq, LogEntry::SCHEMA_HASH, &body).to_le_bytes(),
     );
-    let ring = segment.region_bytes_mut(self.kind)?;
-    let ring = &mut ring[slates_anchor::layout::RING_BYTES..];
-    write_wrapping(ring, w.capacity, w.tail, &header);
-    write_wrapping(
-      ring,
+    self.write_wrapping(segment, w.capacity, w.tail, &header)?;
+    self.write_wrapping(
+      segment,
       w.capacity,
       w.tail
         .saturating_add(u64::try_from(RECORD_HEADER).unwrap_or(u64::MAX)),
       &body,
-    );
+    )?;
     let words = segment.ring_words(self.kind)?;
     if w.head == w.tail {
       words[3].store(seq, Ordering::Release);
@@ -163,13 +161,12 @@ impl LogRing {
   /// at or after `from_seq`; stops at the first record that does not verify.
   pub fn replay(&self, segment: &AnchorSegment, from_seq: u64) -> Result<Replayed, DbError> {
     let w = self.words(segment)?;
-    let ring = &segment.region_bytes(self.kind)?[slates_anchor::layout::RING_BYTES..];
     let mut at = w.head;
     let mut ops = Vec::new();
     let mut next_seq = w.seq_base;
     let mut torn = false;
     while at < w.tail {
-      match self.record_at(ring, w, at, next_seq) {
+      match self.record_at(segment, w, at, next_seq) {
         Ok((seq, op, size)) => {
           if seq >= from_seq {
             ops.push((seq, op));
@@ -195,7 +192,7 @@ impl LogRing {
   /// Decodes and verifies the record at `at`, expecting sequence `expect_seq`.
   fn record_at(
     &self,
-    ring: &[u8],
+    segment: &AnchorSegment,
     w: Words,
     at: u64,
     expect_seq: u64,
@@ -208,7 +205,7 @@ impl LogRing {
       });
     }
     let mut header = [0u8; RECORD_HEADER];
-    read_wrapping(ring, w.capacity, at, &mut header);
+    self.read_wrapping(segment, w.capacity, at, &mut header)?;
     if read_u32(&header, AT_MAGIC) != RECORD_MAGIC {
       return Err(DbError::Corrupt {
         seq: expect_seq,
@@ -237,7 +234,12 @@ impl LogRing {
       });
     }
     let mut body = vec![0u8; usize::try_from(len).unwrap_or(usize::MAX)];
-    read_wrapping(ring, w.capacity, at.saturating_add(header_len), &mut body);
+    self.read_wrapping(
+      segment,
+      w.capacity,
+      at.saturating_add(header_len),
+      &mut body,
+    )?;
     if read_u32(&header, AT_CRC) != checksum(seq, schema, &body) {
       return Err(DbError::Corrupt {
         seq,
@@ -264,12 +266,11 @@ impl LogRing {
   /// was published): the head walks forward over verified records.
   pub fn trim(&self, segment: &AnchorSegment, up_to_seq: u64) -> Result<u64, DbError> {
     let w = self.words(segment)?;
-    let ring = &segment.region_bytes(self.kind)?[slates_anchor::layout::RING_BYTES..];
     let mut at = w.head;
     let mut seq = w.seq_base;
     let mut released = 0u64;
     while at < w.tail && seq < up_to_seq {
-      let (_, _, size) = self.record_at(ring, w, at, seq)?;
+      let (_, _, size) = self.record_at(segment, w, at, seq)?;
       at = at.saturating_add(size);
       seq = seq.saturating_add(1);
       released = released.saturating_add(size);
@@ -293,28 +294,58 @@ fn position(capacity: u64, offset: u64) -> usize {
   usize::try_from(offset % capacity.max(1)).unwrap_or(0)
 }
 
-fn write_wrapping(ring: &mut [u8], capacity: u64, at: u64, bytes: &[u8]) {
-  let start = position(capacity, at);
-  let cap = usize::try_from(capacity)
-    .unwrap_or(ring.len())
-    .min(ring.len());
-  let first = bytes.len().min(cap.saturating_sub(start));
-  ring[start..start + first].copy_from_slice(&bytes[..first]);
-  if first < bytes.len() {
-    ring[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+impl LogRing {
+  /// The ring's usable bytes: its capacity word, held to the region past the ring words (a corrupted
+  /// word never reaches past the region).
+  fn ring_len(&self, segment: &AnchorSegment, capacity: u64) -> Result<usize, DbError> {
+    let region = segment
+      .region_len(self.kind)?
+      .saturating_sub(slates_anchor::layout::RING_BYTES);
+    Ok(usize::try_from(capacity).unwrap_or(region).min(region))
   }
-}
 
-fn read_wrapping(ring: &[u8], capacity: u64, at: u64, out: &mut [u8]) {
-  let start = position(capacity, at);
-  let cap = usize::try_from(capacity)
-    .unwrap_or(ring.len())
-    .min(ring.len());
-  let first = out.len().min(cap.saturating_sub(start));
-  out[..first].copy_from_slice(&ring[start..start + first]);
-  if first < out.len() {
-    let rest = out.len() - first;
-    out[first..].copy_from_slice(&ring[..rest]);
+  /// Writes `bytes` at ring offset `at`, wrapping at the capacity; only the spans written are backed
+  /// (the anchor segment is sparse).
+  fn write_wrapping(
+    &self,
+    segment: &mut AnchorSegment,
+    capacity: u64,
+    at: u64,
+    bytes: &[u8],
+  ) -> Result<(), DbError> {
+    let cap = self.ring_len(segment, capacity)?;
+    let start = position(capacity, at);
+    let first = bytes.len().min(cap.saturating_sub(start));
+    let base = slates_anchor::layout::RING_BYTES;
+    segment
+      .region_write(self.kind, base + start, first)?
+      .copy_from_slice(&bytes[..first]);
+    if first < bytes.len() {
+      segment
+        .region_write(self.kind, base, bytes.len() - first)?
+        .copy_from_slice(&bytes[first..]);
+    }
+    Ok(())
+  }
+
+  /// Reads `out.len()` bytes at ring offset `at`, wrapping at the capacity.
+  fn read_wrapping(
+    &self,
+    segment: &AnchorSegment,
+    capacity: u64,
+    at: u64,
+    out: &mut [u8],
+  ) -> Result<(), DbError> {
+    let cap = self.ring_len(segment, capacity)?;
+    let start = position(capacity, at);
+    let first = out.len().min(cap.saturating_sub(start));
+    let base = slates_anchor::layout::RING_BYTES;
+    out[..first].copy_from_slice(segment.region_read(self.kind, base + start, first)?);
+    if first < out.len() {
+      let rest = out.len() - first;
+      out[first..].copy_from_slice(segment.region_read(self.kind, base, rest)?);
+    }
+    Ok(())
   }
 }
 

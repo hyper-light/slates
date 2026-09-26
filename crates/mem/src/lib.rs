@@ -46,7 +46,7 @@ pub use mpsc::MpscRing;
 pub use region::Region;
 pub use ring::SpscRing;
 pub use segmented::Segmented;
-pub use shared::{Handoff, SharedObject};
+pub use shared::{Handoff, SharedObject, SparseObject};
 pub use slab::Slab;
 
 /// Tests that observe the OS's locked-byte counter run one at a time: the counter is
