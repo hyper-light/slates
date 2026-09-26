@@ -217,7 +217,6 @@ fn keep_slates_events(
   binary: &str,
 ) -> Result<Filtered, Failure> {
   use std::io::{BufRead, Write};
-  let quoted = format!("\"{binary}\"");
   let mut filtered = Filtered::default();
   let mut last_seq: Option<u64> = None;
   for line in std::io::BufReader::new(events).lines() {
@@ -239,7 +238,7 @@ fn keep_slates_events(
         continue;
       }
     }
-    if !line.contains(&quoted) {
+    if !names_binary(&line, binary) {
       continue;
     }
     let keep = serde_json::from_str::<serde_json::Value>(&line).map_or(true, |event| {
@@ -252,6 +251,15 @@ fn keep_slates_events(
   }
   out.flush()?;
   Ok(filtered)
+}
+
+/// Whether a raw eslogger line names `binary` anywhere, by byte search. eslogger's JSON escapes every
+/// `/` as `\/` (all 866 lines of the 2026-09-26 run), so the escaped spelling is the one searched, the
+/// plain one too for an encoder that does not escape.
+fn names_binary(line: &str, binary: &str) -> bool {
+  let plain = format!("\"{binary}\"");
+  let escaped = plain.replace('/', "\\/");
+  line.contains(&escaped) || line.contains(&plain)
 }
 
 /// The `global_seq_num` of an Endpoint Security JSON line, read without parsing the line.
@@ -641,6 +649,27 @@ pub(crate) fn log_path(scratch: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-4.5: the eslogger pre-filter finds the binary in a line as eslogger prints it, every `/`
+  /// escaped (the 2026-09-26 run's raw lines), and reads the client sequence without parsing.
+  #[test]
+  fn an_escaped_eslogger_line_names_its_binary_and_its_sequence() {
+    let line = r#"{"global_seq_num":16705,"process":{"executable":{"path":"\/Users\/u\/target\/debug\/slates"}},"event":{"close":{"modified":false}}}"#;
+    assert!(names_binary(line, "/Users/u/target/debug/slates"));
+    assert!(!names_binary(line, "/Users/u/target/debug/slat"));
+    assert!(names_binary(
+      r#"{"path":"/Users/u/target/debug/slates"}"#,
+      "/Users/u/target/debug/slates"
+    ));
+    assert_eq!(global_seq(line), Some(16705));
+    assert_eq!(global_seq("not json"), None);
+    let parsed: serde_json::Value = serde_json::from_str(line).expect("the line is JSON");
+    assert_eq!(
+      parsed["process"]["executable"]["path"].as_str(),
+      Some("/Users/u/target/debug/slates"),
+      "the exact check after the byte search sees the unescaped path"
+    );
+  }
   use slates_conformance::workload::{Entry, EntryKind};
 
   /// AC-4.5: client-generated entries must land with the same names, kinds, modes and bytes.
