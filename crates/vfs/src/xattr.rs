@@ -25,7 +25,7 @@
 
 use crate::error::VfsError;
 use crate::ids::{InodeNo, SnapshotId};
-use crate::inode::{Body, Inode, Kind, XattrTable};
+use crate::inode::{Attrs, Body, Inode, Kind, XattrTable};
 use crate::journal::Op;
 use crate::volume::{Store, Volume, stamp_all};
 
@@ -45,6 +45,17 @@ pub enum XattrSet {
   Create,
   /// Replace only: refuse `NoAttribute` when the name is not set.
   Replace,
+}
+
+/// What an attribute change does to the owner's working copy (`XattrTable::sidecar`): a change
+/// through any path but the working copy itself drops it, so a transport's next read encodes the
+/// attributes afresh; the transport that is reconciling its own working copy keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sidecar {
+  /// Drop the working copy (every attribute verb but a transport's own reconcile).
+  Drop,
+  /// Keep it: the change *is* the working copy's content.
+  Keep,
 }
 
 /// Checks an attribute name: non-empty, at most [`XATTR_NAME_MAX_BYTES`] bytes, no NUL (every host's
@@ -69,7 +80,7 @@ impl Volume {
   /// The length in bytes of attribute `name`'s value on inode `no` (`NoAttribute` when unset).
   pub fn xattr_len(&self, store: &Store, no: InodeNo, name: &[u8]) -> Result<u64, VfsError> {
     let attribute = self.xattr_inode(store, no, name)?;
-    Ok(self.stat(store, attribute)?.size)
+    Ok(self.inode(store, attribute)?.attrs.size)
   }
 
   /// Reads attribute `name`'s value on inode `no` from byte `off` into `buf`; returns the bytes read
@@ -83,7 +94,7 @@ impl Volume {
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
     let attribute = self.xattr_inode(store, no, name)?;
-    self.read(store, attribute, off, buf)
+    self.read_body(store, attribute, off, buf)
   }
 
   /// The attribute inode that holds `name`'s value on inode `no`: the handle a transport reads a
@@ -116,6 +127,19 @@ impl Volume {
     value: &[u8],
     mode: XattrSet,
   ) -> Result<(), VfsError> {
+    self.xattr_set_with(store, no, name, value, mode, Sidecar::Drop)
+  }
+
+  /// [`Volume::xattr_set`] with the working copy's fate chosen ([`Sidecar`]).
+  pub fn xattr_set_with(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    name: &[u8],
+    value: &[u8],
+    mode: XattrSet,
+    sidecar: Sidecar,
+  ) -> Result<(), VfsError> {
     self.live()?;
     check_name(name)?;
     let (existing, uid, gid) = {
@@ -135,11 +159,11 @@ impl Volume {
     if let Err(refusal) = self.write_unrecorded(store, fresh, 0, value) {
       return Err(self.abandon_attribute(store, fresh, refusal));
     }
-    let replaced = match self.name_attribute(store, no, name, fresh) {
-      Ok(replaced) => replaced,
+    let (replaced, dropped) = match self.name_attribute(store, no, name, fresh, sidecar) {
+      Ok(outcome) => outcome,
       Err(refusal) => return Err(self.abandon_attribute(store, fresh, refusal)),
     };
-    if let Some(old) = replaced {
+    for old in replaced.into_iter().chain(dropped) {
       self.drop_link(store, old)?;
     }
     Ok(())
@@ -153,24 +177,166 @@ impl Volume {
     no: InodeNo,
     name: &[u8],
   ) -> Result<(), VfsError> {
+    self.xattr_remove_with(store, no, name, Sidecar::Drop)
+  }
+
+  /// [`Volume::xattr_remove`] with the working copy's fate chosen ([`Sidecar`]).
+  pub fn xattr_remove_with(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    name: &[u8],
+    sidecar: Sidecar,
+  ) -> Result<(), VfsError> {
     self.live()?;
     self.xattr_inode(store, no, name)?;
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
     let prev = inode.version;
-    let removed = inode
-      .xattrs
-      .as_deref_mut()
-      .and_then(|table| table.remove(name))
-      .ok_or(VfsError::NoAttribute)?;
-    if inode.xattrs.as_deref().is_some_and(XattrTable::is_empty) {
+    let table = inode.xattrs.as_deref_mut().ok_or(VfsError::NoAttribute)?;
+    let removed = table.remove(name).ok_or(VfsError::NoAttribute)?;
+    let dropped = match sidecar {
+      Sidecar::Drop => table.sidecar.take(),
+      Sidecar::Keep => None,
+    };
+    if inode.xattrs.as_deref().is_some_and(XattrTable::is_vacant) {
       inode.xattrs = None;
     }
     inode.attrs.ctime = now;
     inode.version += 1;
     self.record(Op::RemoveXattr { name: name.into() }, "", Some(no), prev);
-    self.drop_link(store, removed)
+    for old in std::iter::once(removed).chain(dropped) {
+      self.drop_link(store, old)?;
+    }
+    Ok(())
+  }
+
+  /// Writes `bytes` into attribute `name`'s existing value on inode `no` at `off`, in place, keeping
+  /// the working copy: a transport's reconcile when its working copy's write landed wholly inside one
+  /// attribute's value (a resource fork written in pieces), so each piece costs its own length rather
+  /// than a whole-value rewrite. The value may grow; one `SetXattr` is journaled on the owner and its
+  /// change time advances. `NoAttribute` when unset.
+  pub fn xattr_write_at(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    name: &[u8],
+    off: u64,
+    bytes: &[u8],
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    let attribute = self.xattr_inode(store, no, name)?;
+    self.write_unrecorded(store, attribute, off, bytes)?;
+    let handle = self.make_current_inode(store, no)?;
+    let now = self.clock.wall_ns();
+    let inode = store.inodes.get_mut(handle)?;
+    let prev = inode.version;
+    inode.attrs.ctime = now;
+    inode.version += 1;
+    self.record(Op::SetXattr { name: name.into() }, "", Some(no), prev);
+    Ok(())
+  }
+
+  /// The attributes (size and times) of inode `no`'s working copy, if it has one.
+  pub fn sidecar_attrs(&self, store: &Store, no: InodeNo) -> Result<Option<Attrs>, VfsError> {
+    match self.sidecar_of(store, no)? {
+      Some(copy) => Ok(Some(self.inode(store, copy)?.attrs)),
+      None => Ok(None),
+    }
+  }
+
+  /// Reads inode `no`'s working copy from `off` (`NoAttribute` when it has none).
+  pub fn sidecar_read(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    let copy = self.sidecar_of(store, no)?.ok_or(VfsError::NoAttribute)?;
+    self.read_body(store, copy, off, buf)
+  }
+
+  /// Writes `bytes` into inode `no`'s working copy at `off`, creating an empty one first when it has
+  /// none. Charged to the quota like a file's bytes; not journaled (the reconcile that follows is).
+  pub fn sidecar_write(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    bytes: &[u8],
+  ) -> Result<usize, VfsError> {
+    self.live()?;
+    let copy = self.sidecar_or_create(store, no)?;
+    self.write_unrecorded(store, copy, off, bytes)
+  }
+
+  /// Sets inode `no`'s working copy to `len` bytes (a truncate, or an extension with zeros),
+  /// creating an empty one first when it has none.
+  pub fn sidecar_truncate(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    let copy = self.sidecar_or_create(store, no)?;
+    self.truncate_body(store, copy, len)
+  }
+
+  /// Drops inode `no`'s working copy; nothing when it has none.
+  pub fn sidecar_drop(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    self.live()?;
+    if self.sidecar_of(store, no)?.is_none() {
+      return Ok(());
+    }
+    let handle = self.make_current_inode(store, no)?;
+    let inode = store.inodes.get_mut(handle)?;
+    let dropped = inode
+      .xattrs
+      .as_deref_mut()
+      .and_then(|table| table.sidecar.take());
+    if inode.xattrs.as_deref().is_some_and(XattrTable::is_vacant) {
+      inode.xattrs = None;
+    }
+    match dropped {
+      Some(copy) => self.drop_link(store, copy),
+      None => Ok(()),
+    }
+  }
+
+  /// The working copy's attribute inode, if inode `no` has one.
+  fn sidecar_of(&self, store: &Store, no: InodeNo) -> Result<Option<InodeNo>, VfsError> {
+    Ok(
+      owner_of(self.namespace_inode(store, no)?)?
+        .xattrs
+        .as_deref()
+        .and_then(|table| table.sidecar),
+    )
+  }
+
+  /// The working copy's attribute inode, created empty when inode `no` has none.
+  fn sidecar_or_create(&mut self, store: &mut Store, no: InodeNo) -> Result<InodeNo, VfsError> {
+    if let Some(copy) = self.sidecar_of(store, no)? {
+      return Ok(copy);
+    }
+    let (uid, gid) = {
+      let owner = self.inode(store, no)?;
+      (owner.attrs.uid, owner.attrs.gid)
+    };
+    let fresh = self.new_attribute_inode(store, no, uid, gid)?;
+    let handle = match self.make_current_inode(store, no) {
+      Ok(handle) => handle,
+      Err(refusal) => return Err(self.abandon_attribute(store, fresh, refusal)),
+    };
+    store
+      .inodes
+      .get_mut(handle)?
+      .xattrs
+      .get_or_insert_with(Box::default)
+      .sidecar = Some(fresh);
+    Ok(fresh)
   }
 
   /// The names of inode `no`'s extended attributes as snapshot `id` holds them.
@@ -192,7 +358,7 @@ impl Volume {
     name: &[u8],
   ) -> Result<u64, VfsError> {
     let attribute = self.xattr_inode_in(store, id, no, name)?;
-    Ok(self.stat_in(store, id, attribute)?.size)
+    Ok(self.inode_in(store, id, attribute)?.attrs.size)
   }
 
   /// The attribute inode that holds `name`'s value on inode `no` as snapshot `id` holds it.
@@ -222,7 +388,7 @@ impl Volume {
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
     let attribute = self.xattr_inode_in(store, id, no, name)?;
-    self.read_in(store, id, attribute, off, buf)
+    self.read_in_body(store, id, attribute, off, buf)
   }
 
   /// A fresh, empty attribute inode for `owner`, owned as the owner is (its uid and gid) and
@@ -268,25 +434,29 @@ impl Volume {
 
   /// Names the attribute inode `fresh` as `name` in `owner`'s table, returning the inode it replaced.
   /// The owner's change time advances and one `SetXattr` is journaled on it.
+  /// Returns the replaced attribute inode and, under [`Sidecar::Drop`], the dropped working copy.
   fn name_attribute(
     &mut self,
     store: &mut Store,
     owner: InodeNo,
     name: &[u8],
     fresh: InodeNo,
-  ) -> Result<Option<InodeNo>, VfsError> {
+    sidecar: Sidecar,
+  ) -> Result<(Option<InodeNo>, Option<InodeNo>), VfsError> {
     let handle = self.make_current_inode(store, owner)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
     let prev = inode.version;
-    let replaced = inode
-      .xattrs
-      .get_or_insert_with(Box::default)
-      .insert(name, fresh);
+    let table = inode.xattrs.get_or_insert_with(Box::default);
+    let replaced = table.insert(name, fresh);
+    let dropped = match sidecar {
+      Sidecar::Drop => table.sidecar.take(),
+      Sidecar::Keep => None,
+    };
     inode.attrs.ctime = now;
     inode.version += 1;
     self.record(Op::SetXattr { name: name.into() }, "", Some(owner), prev);
-    Ok(replaced)
+    Ok((replaced, dropped))
   }
 
   /// Reclaims an attribute inode a set could not install, returning the set's refusal (or the

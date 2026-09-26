@@ -702,12 +702,27 @@ impl Volume {
 
   /// The attributes of an inode.
   pub fn stat(&self, store: &Store, no: InodeNo) -> Result<Attrs, VfsError> {
-    Ok(self.inode(store, no)?.attrs)
+    Ok(self.namespace_inode(store, no)?.attrs)
   }
 
   /// The kind of an inode.
   pub fn kind(&self, store: &Store, no: InodeNo) -> Result<Kind, VfsError> {
-    Ok(self.inode(store, no)?.kind)
+    Ok(self.namespace_inode(store, no)?.kind)
+  }
+
+  /// The inode `no` as a namespace object: an attribute inode (§4.5 "Extended attributes") is
+  /// refused `NotFound`, so no transport, SDK or forged handle carrying its number can read, write,
+  /// stat or reference an attribute's value except through its owner's attribute verbs.
+  pub(crate) fn namespace_inode<'s>(
+    &self,
+    store: &'s Store,
+    no: InodeNo,
+  ) -> Result<&'s Inode, VfsError> {
+    let inode = self.inode(store, no)?;
+    if inode.attribute_of.is_some() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(inode)
   }
 
   /// The entries of a directory in canonical order.
@@ -890,6 +905,18 @@ impl Volume {
 
   /// Reads up to `buf.len()` bytes at `off`; holes read as zeros; returns the bytes read.
   pub fn read(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    self.namespace_inode(store, no)?;
+    self.read_body(store, no, off, buf)
+  }
+
+  /// Reads any file-bodied inode, an attribute inode included: the attribute verbs' read.
+  pub(crate) fn read_body(
     &self,
     store: &Store,
     no: InodeNo,
@@ -1445,7 +1472,11 @@ impl Volume {
     let end = off
       .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
       .ok_or(VfsError::FileTooLarge)?;
-    let kind = self.kind(store, no)?;
+    // A journaled write is a namespace write; an unjournaled one is an attribute value's.
+    let kind = match recorded {
+      Recorded::Yes => self.kind(store, no)?,
+      Recorded::No => self.inode(store, no)?.kind,
+    };
     if kind.is_special() {
       return Err(VfsError::SpecialFileOperation);
     }
@@ -1513,24 +1544,53 @@ impl Volume {
 
   /// Truncates (or extends with a hole) to `len`.
   pub fn truncate(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
+    self.namespace_inode(store, no)?;
+    self.truncate_with(store, no, len, Recorded::Yes)
+  }
+
+  /// Truncates an attribute inode (a working copy's truncate), unjournaled: the reconcile that
+  /// follows journals the attribute change on the owner.
+  pub(crate) fn truncate_body(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    self.truncate_with(store, no, len, Recorded::No)
+  }
+
+  fn truncate_with(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    len: u64,
+    recorded: Recorded,
+  ) -> Result<(), VfsError> {
     self.live()?;
-    if self.kind(store, no)?.is_special() {
+    let kind = self.inode(store, no)?.kind;
+    if kind.is_special() {
       return Err(VfsError::SpecialFileOperation);
     }
-    if self.kind(store, no)? == Kind::Dir {
+    if kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.
     let retention = self.retention_of_truncate(store, no, len)?;
     self.secure_retention(store, retention)?;
-    let truncated = self.truncate_secured(store, no, len);
+    let truncated = self.truncate_secured(store, no, len, recorded);
     self.settle_retention(store);
     truncated
   }
 
   /// The truncate proper, under a secured retention.
-  fn truncate_secured(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
+  fn truncate_secured(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    len: u64,
+    recorded: Recorded,
+  ) -> Result<(), VfsError> {
     let handle = self.make_current_inode(store, no)?;
     let prev_version = store.inodes.get(handle)?.version;
     self.apply_truncate(store, handle, len)?;
@@ -1540,13 +1600,16 @@ impl Volume {
     inode.attrs.mtime = now;
     inode.attrs.ctime = now;
     inode.version += 1;
-    self.record(Op::Truncate { len }, "", Some(no), prev_version);
+    if recorded == Recorded::Yes {
+      self.record(Op::Truncate { len }, "", Some(no), prev_version);
+    }
     Ok(())
   }
 
   /// Sets the mode (the ownership fields follow the same path).
   pub fn chmod(&mut self, store: &mut Store, no: InodeNo, mode: u32) -> Result<(), VfsError> {
     self.live()?;
+    self.namespace_inode(store, no)?;
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -1569,6 +1632,7 @@ impl Volume {
     gid: u32,
   ) -> Result<(), VfsError> {
     self.live()?;
+    self.namespace_inode(store, no)?;
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -1605,6 +1669,7 @@ impl Volume {
     ctime: Option<i64>,
   ) -> Result<(), VfsError> {
     self.live()?;
+    self.namespace_inode(store, no)?;
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -1696,6 +1761,22 @@ impl Volume {
     off: u64,
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
+    if self.inode_in(store, id, no)?.attribute_of.is_some() {
+      return Err(VfsError::NotFound);
+    }
+    self.read_in_body(store, id, no, off, buf)
+  }
+
+  /// Reads any file-bodied inode as a snapshot holds it, an attribute inode included: the attribute
+  /// verbs' snapshot read.
+  pub(crate) fn read_in_body(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
     let s = self
       .snapshots
       .get(snapshot_handle(id))
@@ -1771,7 +1852,11 @@ impl Volume {
 
   /// The attributes of an inode as a snapshot holds them.
   pub fn stat_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Result<Attrs, VfsError> {
-    Ok(self.inode_in(store, id, no)?.attrs)
+    let inode = self.inode_in(store, id, no)?;
+    if inode.attribute_of.is_some() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(inode.attrs)
   }
 
   /// The inode record a snapshot holds for `no`.
@@ -2388,7 +2473,9 @@ impl Volume {
   /// number of empty files can exhaust the shard's inode capacity. The single number-issuing site,
   /// so the live count and the bound are maintained in one place.
   pub(crate) fn next_no(&mut self) -> Result<InodeNo, VfsError> {
-    if self.live_inodes >= self.inode_allowance {
+    // The counter never reaches the derived half (`InodeNo::DERIVED_BIT`), so a transport's derived
+    // number cannot name a real inode.
+    if self.live_inodes >= self.inode_allowance || self.next_counter >= InodeNo::DERIVED_BIT {
       return Err(VfsError::NoSpace);
     }
     let no = InodeNo::compose(self.prefix, self.next_counter);
@@ -3151,7 +3238,13 @@ impl Volume {
       .inode(store, no)?
       .xattrs
       .as_deref()
-      .map(|table| table.iter().map(|(_, attribute)| attribute).collect())
+      .map(|table| {
+        table
+          .iter()
+          .map(|(_, attribute)| attribute)
+          .chain(table.sidecar)
+          .collect()
+      })
       .unwrap_or_default();
     for attribute in attributes {
       self.drop_link(store, attribute)?;
@@ -3179,7 +3272,7 @@ impl Volume {
   /// recording which attachment owns it (for disconnect and restart cleanup), are owed with the
   /// interface change.
   pub fn reference(&mut self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
-    self.inode(store, no)?;
+    self.namespace_inode(store, no)?;
     let count = self.references.entry(no).or_insert(0);
     *count = count.checked_add(1).ok_or(VfsError::TooManyLinks)?;
     Ok(())

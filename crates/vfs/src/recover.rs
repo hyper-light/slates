@@ -49,8 +49,9 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// Format: the image layout version, bumped with any change to the types below. 3 (2026-09-15): a
 /// file's body is its held runs at their offsets, not one vector of its logical length.
 /// 4 (A-26): FIFO/socket kinds with empty bodies and zero size. 5 (§4.5, 2026-09-26): each inode's
-/// extended-attribute table and, for an attribute inode, its owner.
-const IMAGE_VERSION: u16 = 5;
+/// extended-attribute table and, for an attribute inode, its owner. 6 (§4.6): each inode's
+/// AppleDouble working copy.
+const IMAGE_VERSION: u16 = 6;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -235,6 +236,9 @@ pub struct InodeImage {
   pub xattrs: Vec<XattrImage>,
   /// For an attribute inode, the inode whose attribute it holds. Image version 5.
   pub attribute_of: Option<u64>,
+  /// The attribute inode holding a transport's working copy of this inode's attributes (the
+  /// AppleDouble `._` bytes a client wrote, §4.6). Image version 6.
+  pub sidecar: Option<u64>,
 }
 
 /// One extended attribute of an inode in an image: its name and the attribute inode (captured like
@@ -946,6 +950,11 @@ impl Volume {
         })
         .unwrap_or_default(),
       attribute_of: inode.attribute_of.map(|owner| owner.0),
+      sidecar: inode
+        .xattrs
+        .as_deref()
+        .and_then(|table| table.sidecar)
+        .map(|copy| copy.0),
     })
   }
 
@@ -1002,8 +1011,8 @@ impl Volume {
       while read < len {
         let at = offset.saturating_add(u64::try_from(read).map_err(|_| VfsError::FileTooLarge)?);
         let got = match snapshot {
-          Some(id) => self.read_in(store, id, inode.no, at, &mut bytes[read..])?,
-          None => self.read(store, inode.no, at, &mut bytes[read..])?,
+          Some(id) => self.read_in_body(store, id, inode.no, at, &mut bytes[read..])?,
+          None => self.read_body(store, inode.no, at, &mut bytes[read..])?,
         };
         if got == 0 {
           break;
@@ -1619,14 +1628,32 @@ impl Volume {
     }
     // Tables after every identity: an attribute inode is checked in the rebuilt table, where a
     // snapshot's shared attribute inode (in its `shared` list, not `inodes`) is also found.
-    for image_inode in inodes.iter().filter(|image| !image.xattrs.is_empty()) {
+    for image_inode in inodes
+      .iter()
+      .filter(|image| !image.xattrs.is_empty() || image.sidecar.is_some())
+    {
       let owner = InodeNo(image_inode.no);
-      let table = self.xattrs_from_image(store, &image_inode.xattrs, owner)?;
+      let mut table = self.xattrs_from_image(store, &image_inode.xattrs, owner)?;
+      if let Some(copy) = image_inode.sidecar {
+        let copy = InodeNo(copy);
+        if !self.attribute_of_owner(store, copy, owner) {
+          return Err(VfsError::RecoveryIncomplete);
+        }
+        table.sidecar = Some(copy);
+      }
       let handle =
         trie::get(&store.tries, self.inode_root, owner).ok_or(VfsError::RecoveryIncomplete)?;
       store.inodes.get_mut(handle)?.xattrs = Some(table);
     }
     Ok(())
+  }
+
+  /// Whether the rebuilt table holds `attribute` as an attribute inode of `owner`.
+  fn attribute_of_owner(&self, store: &Store, attribute: InodeNo, owner: InodeNo) -> bool {
+    trie::get(&store.tries, self.inode_root, attribute)
+      .and_then(|handle| store.inodes.get(handle).ok())
+      .and_then(|inode| inode.attribute_of)
+      == Some(owner)
   }
 
   /// An owner's attribute table from its image. Refuses `RecoveryIncomplete` when a name repeats or
@@ -1643,10 +1670,7 @@ impl Volume {
     for xattr in xattrs {
       crate::xattr::check_name(&xattr.name).map_err(|_| VfsError::RecoveryIncomplete)?;
       let attribute = InodeNo(xattr.attribute);
-      let held = trie::get(&store.tries, self.inode_root, attribute)
-        .and_then(|handle| store.inodes.get(handle).ok())
-        .and_then(|inode| inode.attribute_of);
-      if held != Some(owner) {
+      if !self.attribute_of_owner(store, attribute, owner) {
         return Err(VfsError::RecoveryIncomplete);
       }
       pairs.push((xattr.name.clone().into_boxed_slice(), attribute));

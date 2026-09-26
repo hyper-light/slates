@@ -25,6 +25,27 @@ impl InodeNo {
   /// Format: the volume prefix occupies the top bits, the counter the low ones.
   pub const COUNTER_BITS: u32 = 48;
 
+  /// Format: the counter bit that marks a *derived* number: a number no inode holds, which a
+  /// transport uses to name an object it derives from an inode (the AppleDouble view of an inode's
+  /// extended attributes, §4.6). The volume issues counters strictly below it and refuses at it
+  /// (`NoSpace`), so a derived number never names a real inode. Half the 48-bit counter space,
+  /// 2^47 inodes per volume, is far beyond any slab a machine can hold.
+  pub const DERIVED_BIT: u64 = 1 << (Self::COUNTER_BITS - 1);
+
+  /// The derived number of this inode (see [`Self::DERIVED_BIT`]).
+  pub const fn derived(self) -> InodeNo {
+    InodeNo(self.0 | Self::DERIVED_BIT)
+  }
+
+  /// The inode a derived number was derived from; `None` for a real inode's number.
+  pub const fn derived_from(self) -> Option<InodeNo> {
+    if self.0 & Self::DERIVED_BIT == 0 {
+      None
+    } else {
+      Some(InodeNo(self.0 & !Self::DERIVED_BIT))
+    }
+  }
+
   /// Composes a number from its prefix and counter.
   pub const fn compose(prefix: u16, counter: u64) -> InodeNo {
     InodeNo(((prefix as u64) << Self::COUNTER_BITS) | (counter & ((1 << Self::COUNTER_BITS) - 1)))

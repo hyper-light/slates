@@ -141,6 +141,11 @@ pub enum Body {
 pub struct XattrTable {
   /// `(name, attribute inode)`, ascending by name, names unique.
   entries: Vec<(Box<[u8]>, InodeNo)>,
+  /// A transport's working copy of an encoding of these attributes (the macOS AppleDouble `._`
+  /// file a client writes over NFSv3, §4.6): an attribute inode holding the bytes exactly as the
+  /// client last wrote them, so its reads are stable. Not an attribute; dropped whenever the
+  /// attributes change through any other path.
+  pub sidecar: Option<InodeNo>,
 }
 
 impl XattrTable {
@@ -191,6 +196,11 @@ impl XattrTable {
     self.entries.is_empty()
   }
 
+  /// Whether the table holds nothing at all: no attribute and no working copy, so it need not exist.
+  pub fn is_vacant(&self) -> bool {
+    self.entries.is_empty() && self.sidecar.is_none()
+  }
+
   /// A table from `(name, attribute inode)` pairs in any order (a recovery rebuild); `None` when a
   /// name repeats, which no volume produces.
   pub fn from_pairs(mut pairs: Vec<(Box<[u8]>, InodeNo)>) -> Option<Self> {
@@ -198,7 +208,10 @@ impl XattrTable {
     if pairs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
       return None;
     }
-    Some(Self { entries: pairs })
+    Some(Self {
+      entries: pairs,
+      sidecar: None,
+    })
   }
 }
 
