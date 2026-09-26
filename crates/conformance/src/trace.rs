@@ -17,7 +17,14 @@
 //! `openat` family path as `[dirfd]/name`, so the parser keeps a descriptor-to-path table from the
 //! process's own `open`/`openat` results — which is why the macOS tracer is scoped to one process
 //! (the daemon, the only writer by design), and why an unknown descriptor is `unresolved`, counted
-//! and shown, rather than trusted either way.
+//! and shown, rather than trusted either way. **eslogger** (macOS, root and Full Disk Access; Apple's
+//! Endpoint Security events as JSON lines, one event per line: `event_type`, `event: {<kind>: {...}}`,
+//! `process: {audit_token: {pid}, executable: {path}}`; `eslogger(1)`, evidence B): the kernel attaches the
+//! full path to every file an event names, so nothing is resolved through a descriptor table; an event of
+//! a write-capable kind whose path fields are absent or truncated is `unresolved`, never dropped. DTrace's
+//! syscall provider is absent under SIP ("probe description syscall::open*:entry does not match any
+//! probes. System Integrity Protection is on", 2026-09-26), and fs_usage cannot attribute descriptors
+//! it saw duplicated, which is why the macOS tracer is eslogger.
 
 use std::collections::HashMap;
 
@@ -58,6 +65,11 @@ pub struct Policy<'a> {
   pub target: &'a str,
   /// The traced process's working directory, for relative paths under `AT_FDCWD`.
   pub working_directory: &'a str,
+  /// Regular files that are the traced processes' own standard streams, named by path: the anchor's
+  /// log, which the harness hands the anchor and the daemon as stderr. A tracer that sees descriptor
+  /// numbers (strace, fs_usage) recognises streams by descriptor; Endpoint Security events carry only
+  /// the path.
+  pub streams: &'a [&'a str],
 }
 
 /// Shape: violations kept in the report (the first ones; the count carries the rest).
@@ -135,6 +147,9 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
     return Placement::StandardStream;
   }
   let path = event.path.as_str();
+  if policy.streams.contains(&path) {
+    return Placement::StandardStream;
+  }
   if inside(path, policy.target) {
     return Placement::InsideTarget;
   }
@@ -809,6 +824,125 @@ fn fs_usage_descriptor_event(
   event(line, row.call, path, row.descriptor)
 }
 
+// --- eslogger --------------------------------------------------------------------------------
+
+/// Format: the kernel open-file flags (`fflag`, `<sys/fcntl.h>`) that make an `open` event write-capable:
+/// `FWRITE` (0x2), `O_APPEND` (0x8), `O_CREAT` (0x200), `O_TRUNC` (0x400).
+const ES_WRITE_FFLAGS: i64 = 0x2 | 0x8 | 0x200 | 0x400;
+
+/// The path an Endpoint Security `es_file_t` names, `None` when absent or truncated by the kernel.
+fn es_file(value: &serde_json::Value) -> Option<String> {
+  if value
+    .get("path_truncated")
+    .and_then(serde_json::Value::as_bool)
+    == Some(true)
+  {
+    return None;
+  }
+  value
+    .get("path")
+    .and_then(serde_json::Value::as_str)
+    .map(str::to_owned)
+}
+
+/// A directory `es_file_t` and a name in it, joined.
+fn es_in_dir(dir: &serde_json::Value, name: Option<&serde_json::Value>) -> Option<String> {
+  let dir = es_file(dir)?;
+  let name = name?.as_str()?;
+  Some(format!("{}/{name}", dir.trim_end_matches('/')))
+}
+
+/// A destination union (`create`, `rename`): an existing file, or a new name in a directory.
+fn es_destination(destination: &serde_json::Value) -> Option<String> {
+  if let Some(existing) = destination.get("existing_file") {
+    return es_file(existing);
+  }
+  let new_path = destination.get("new_path")?;
+  es_in_dir(new_path.get("dir")?, new_path.get("filename"))
+}
+
+/// The write-capable paths one Endpoint Security event names, `None` when the kind is not
+/// write-capable (or an `open` without write flags, a `close` of an unmodified file); a path the kernel
+/// did not give is `Some(None)`, which the caller records unresolved.
+fn es_paths(kind: &str, event: &serde_json::Value) -> Option<Vec<Option<String>>> {
+  let file = |key: &str| event.get(key).and_then(es_file);
+  Some(match kind {
+    "open" => {
+      let flags = event.get("fflag").and_then(serde_json::Value::as_i64)?;
+      if flags & ES_WRITE_FFLAGS == 0 {
+        return None;
+      }
+      vec![file("file")]
+    }
+    "close" => {
+      if event.get("modified").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+      }
+      vec![file("target")]
+    }
+    "write" | "truncate" | "unlink" | "setextattr" | "deleteextattr" | "setmode" | "setowner"
+    | "setflags" | "utimes" | "setattrlist" | "setacl" => vec![file("target")],
+    "create" => vec![event.get("destination").and_then(es_destination)],
+    "rename" => vec![
+      file("source"),
+      event.get("destination").and_then(es_destination),
+    ],
+    "link" => vec![
+      event
+        .get("target_dir")
+        .and_then(|dir| es_in_dir(dir, event.get("target_filename"))),
+    ],
+    "clone" | "copyfile" => vec![file("target_file").or_else(|| {
+      event
+        .get("target_dir")
+        .and_then(|dir| es_in_dir(dir, event.get("target_name")))
+    })],
+    "exchangedata" => vec![file("file1"), file("file2")],
+    _ => return None,
+  })
+}
+
+/// Whether an eslogger log holds at least one complete event (the tracer has attached).
+pub fn eslogger_has_activity(log: &str) -> bool {
+  log.lines().any(|line| {
+    serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| v.get("event").is_some())
+  })
+}
+
+/// The write-capable events of an eslogger JSON-lines log. A line that is not a complete event is an
+/// unresolved event (a torn or foreign line cannot hide a write); an event of a write-capable kind
+/// without its path is unresolved.
+pub fn parse_eslogger(log: &str) -> Vec<WriteEvent> {
+  let mut out = Vec::new();
+  for (index, line) in log.lines().enumerate() {
+    let number = index + 1;
+    if line.trim().is_empty() {
+      continue;
+    }
+    let Some((kind, body)) = serde_json::from_str::<serde_json::Value>(line)
+      .ok()
+      .and_then(|value| {
+        let object = value.get("event")?.as_object()?;
+        let (kind, body) = object.iter().next()?;
+        Some((kind.clone(), body.clone()))
+      })
+    else {
+      out.push(event(
+        number,
+        "unparsed",
+        format!("{UNRESOLVED_PREFIX}line>"),
+        None,
+      ));
+      continue;
+    };
+    for path in es_paths(&kind, &body).unwrap_or_default() {
+      let path = path.unwrap_or_else(|| format!("{UNRESOLVED_PREFIX}{kind}>"));
+      out.push(event(number, &kind, path, None));
+    }
+  }
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -835,7 +969,59 @@ mod tests {
     Policy {
       target: TARGET,
       working_directory: "/scratch/cwd",
+      streams: &["/scratch/anchor.log"],
     }
+  }
+
+  /// Events in the shape `eslogger` prints (one JSON object per line, `event: {<kind>: {...}}`, each
+  /// file an `es_file_t` with its full path): the landing's writes inside the target, the daemon's
+  /// stderr log, a read-only open, an unmodified close, and violations of every write-capable kind.
+  #[test]
+  fn eslogger_events_are_placed_by_their_kernel_paths() {
+    let file = |path: &str| format!(r#"{{"path":"{path}","path_truncated":false}}"#);
+    let line = |kind: &str, body: String| {
+      format!(
+        r#"{{"event_type":0,"event":{{"{kind}":{body}}},"process":{{"audit_token":{{"pid":7}}}}}}"#
+      )
+    };
+    let log = [
+      line("open", format!(r#"{{"fflag":514,"file":{}}}"#, file("/scratch/land-target/.slates-tmp-1"))),
+      line("write", format!(r#"{{"target":{}}}"#, file("/scratch/land-target/.slates-tmp-1"))),
+      line("rename", format!(r#"{{"source":{},"destination_type":1,"destination":{{"new_path":{{"dir":{},"filename":"a.txt"}}}}}}"#, file("/scratch/land-target/.slates-tmp-1"), file("/scratch/land-target"))),
+      line("write", format!(r#"{{"target":{}}}"#, file("/scratch/anchor.log"))),
+      line("open", format!(r#"{{"fflag":1,"file":{}}}"#, file("/usr/lib/dyld"))),
+      line("close", format!(r#"{{"modified":false,"target":{}}}"#, file("/etc/hosts"))),
+      line("create", format!(r#"{{"destination_type":1,"destination":{{"new_path":{{"dir":{},"filename":"evil","mode":420}}}}}}"#, file("/etc"))),
+      line("unlink", format!(r#"{{"target":{},"parent_dir":{}}}"#, file("/Users/u/x"), file("/Users/u"))),
+      line("setextattr", format!(r#"{{"target":{},"extattr":"k"}}"#, file("/Users/u/y"))),
+      line("truncate", r#"{"target":{"path":"/scratch/land-target/b","path_truncated":true}}"#.to_owned()),
+      line("mmap", format!(r#"{{"source":{}}}"#, file("/usr/lib/libSystem.B.dylib"))),
+      "not json".to_owned(),
+    ]
+    .join("\n");
+    let events = parse_eslogger(&log);
+    let judged = judge(&events, &policy());
+    assert_eq!(
+      judged.inside_target, 4,
+      "open, write, rename's two names: {events:?}"
+    );
+    assert_eq!(
+      judged.written_inside,
+      vec![".slates-tmp-1".to_owned(), "a.txt".to_owned()]
+    );
+    assert_eq!(judged.standard_streams, 1, "the daemon's stderr log");
+    assert_eq!(
+      judged.outside, 3,
+      "create, unlink, setextattr: {:?}",
+      judged.violations
+    );
+    assert_eq!(judged.unresolved, 2, "the truncated path and the torn line");
+    assert_eq!(
+      judged.write_calls, 10,
+      "read-only opens, clean closes and mmaps are not writes"
+    );
+    assert!(eslogger_has_activity(&log));
+    assert!(!eslogger_has_activity("not json\n{}\n"));
   }
 
   const STRACE: &str = "\
@@ -918,6 +1104,7 @@ mod tests {
     let policy = Policy {
       target: "/dev/shm/target",
       working_directory: "/scratch",
+      streams: &[],
     };
     let judged = judge(&parse_strace(log), &policy);
     assert_eq!(judged.inside_target, 3);

@@ -5,9 +5,11 @@
 //! must fall inside the granted target (matched to what the landing reports written), on a
 //! RAM-only kernel object, or on the processes' own standard streams. On Linux the tracer is
 //! `strace -f -y` wrapping the anchor, so the anchor, the daemon and every child are in the log;
-//! on macOS it is `sudo fs_usage` on the daemon's pid (the only writer by design; fs_usage cannot
-//! separate same-named processes), which needs root, so this laptop records a privilege skip and
-//! the CI macOS runner runs it.
+//! on macOS it is `sudo eslogger` (Apple's Endpoint Security events, each file named by its full kernel
+//! path), kept to the events of the slates binary — anchor, daemon and every CLI call — from before the
+//! anchor starts until after it stops. It needs root and Full Disk Access for whatever runs it. DTrace's
+//! syscall provider is absent under SIP, and fs_usage could not attribute descriptors it saw duplicated
+//! (92 of 93 calls unresolved on CI, 2026-09-26).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -16,11 +18,11 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::Outcome;
 use slates_conformance::trace::{
-  Policy, fs_usage_has_activity, judge, parse_fs_usage, parse_strace_with_cwd, strace_unnamed_paths,
+  Policy, eslogger_has_activity, judge, parse_eslogger, parse_strace_with_cwd, strace_unnamed_paths,
 };
 use slates_conformance::workload::Manifest;
 
-use super::slates::{MOUNT_WAIT, Session, grant};
+use super::slates::{MOUNT_WAIT, Session, SlatesBinary, grant};
 use super::trace_process::{StopSignal, TraceProcess};
 use super::workloads::manifest_of;
 use super::{Run, SuiteResult, write_file};
@@ -63,74 +65,165 @@ pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
   ]
 }
 
-/// A running `sudo fs_usage` on one pid, writing to a log; stopped on drop.
-struct FsUsage {
+/// Format: the Endpoint Security events the macOS tracer asks `eslogger` for: every event that can
+/// create, write, move, remove or re-attribute a file (`eslogger --list-events`), and `open`/`close`,
+/// whose write flag and modified bit the parser reads.
+const ES_EVENTS: &[&str] = &[
+  "open",
+  "close",
+  "create",
+  "write",
+  "truncate",
+  "rename",
+  "unlink",
+  "link",
+  "clone",
+  "copyfile",
+  "exchangedata",
+  "setextattr",
+  "deleteextattr",
+  "setmode",
+  "setowner",
+  "setflags",
+  "utimes",
+  "setattrlist",
+  "setacl",
+];
+
+/// A running `sudo eslogger` over the whole machine, its events kept only when a slates process made
+/// them (the event's `process.executable.path` is the built binary: the anchor, the daemon and every CLI
+/// invocation), written to a log; stopped on drop. The filter runs as the events arrive, on a thread
+/// this value owns and joins, so the log holds the lifecycle's own events, not the machine's.
+struct EsLogger {
   process: TraceProcess,
+  filter: Option<std::thread::JoinHandle<Result<(), Failure>>>,
   errors: PathBuf,
 }
 
-impl FsUsage {
-  fn start(session: &Session, log: &Path) -> Result<FsUsage, Failure> {
-    let pid = session.anchor.daemon_pid()?;
-    #[allow(clippy::disallowed_methods)] // the development tool's own scratch log
-    let file = std::fs::File::create(log)
-      .map_err(|e| Failure(format!("creating {}: {e}", log.display())))?;
+impl EsLogger {
+  fn start(binary: &Path, log: &Path) -> Result<EsLogger, Failure> {
     let errors = log.with_extension("stderr.log");
     #[allow(clippy::disallowed_methods)] // the development tool's own scratch diagnostics
     let stderr = std::fs::File::create(&errors)?;
     let mut command = Command::new("sudo");
     command
-      .args([
-        "-n",
-        "fs_usage",
-        "-w",
-        "-f",
-        "filesys",
-        "-f",
-        "network",
-        &pid.to_string(),
-      ])
+      .arg("-n")
+      .arg("eslogger")
+      .args(ES_EVENTS)
       .stdin(Stdio::null())
-      .stdout(Stdio::from(file))
+      .stdout(Stdio::piped())
       .stderr(Stdio::from(stderr));
     isolate_tracer(&mut command);
-    let child = command
+    let mut child = command
       .spawn()
-      .map_err(|e| Failure(format!("starting fs_usage: {e}")))?;
-    let mut tracer = FsUsage {
-      process: TraceProcess::new(child, signal_tracer, MOUNT_WAIT),
+      .map_err(|e| Failure(format!("starting eslogger: {e}")))?;
+    let stdout = child
+      .stdout
+      .take()
+      .ok_or_else(|| Failure("eslogger has no stdout".to_owned()))?;
+    #[allow(clippy::disallowed_methods)] // the development tool's own scratch log
+    let file = std::fs::File::create(log)
+      .map_err(|e| Failure(format!("creating {}: {e}", log.display())))?;
+    let binary = binary.display().to_string();
+    let filter = std::thread::Builder::new()
+      .name("eslogger-filter".to_owned())
+      .spawn(move || keep_slates_events(stdout, file, &binary))
+      .map_err(|e| Failure(format!("starting the eslogger filter: {e}")))?;
+    Ok(EsLogger {
+      process: TraceProcess::new(child, signal_eslogger, MOUNT_WAIT),
+      filter: Some(filter),
       errors,
-    };
-    let ready = tracer.process.wait_ready(|| {
-      // A new read-only CLI session generates shm/socket activity even when the mounted
-      // namespace is idle. The parsed event, rather than this CLI reply, proves attachment.
-      session
-        .binary
-        .run(&session.instance, &["volume", "list"])?
-        .expect_ok("tracer readiness probe")?;
-      Ok(fs_usage_has_activity(&std::fs::read_to_string(log)?))
+    })
+  }
+
+  /// Waits until a slates process's event reached the log: `run` executes the binary, whose own
+  /// loading and reads are events.
+  fn wait_ready(
+    &mut self,
+    log: &Path,
+    mut run: impl FnMut() -> Result<(), Failure>,
+  ) -> Result<(), Failure> {
+    let ready = self.process.wait_ready(|| {
+      run()?;
+      Ok(eslogger_has_activity(&std::fs::read_to_string(log)?))
     });
-    tracer.check(ready)?;
-    eprintln!("hermeticity: fs_usage recorded activity from daemon {pid}");
-    Ok(tracer)
+    self.check(ready)
   }
 
   fn stop(mut self) -> Result<(), Failure> {
-    let stopped = self.process.stop();
-    self.check(stopped)
+    let stopped = self.process.stop_accepting(terminated_by_term);
+    let filtered = self
+      .filter
+      .take()
+      .map_or(Ok(()), |filter| match filter.join() {
+        Ok(result) => result,
+        Err(_) => Err(Failure("the eslogger filter panicked".to_owned())),
+      });
+    self.check(stopped.and(filtered))
   }
 
   fn check(&self, result: Result<(), Failure>) -> Result<(), Failure> {
     let diagnostic = std::fs::read_to_string(&self.errors)?;
     match result {
-      Err(error) => Err(Failure(format!("{error}; fs_usage: {}", diagnostic.trim()))),
-      Ok(()) if !diagnostic.trim().is_empty() => Err(Failure(format!(
-        "fs_usage diagnostic: {}",
+      Err(error) => Err(Failure(format!(
+        "{error}; eslogger: {} (it needs root and Full Disk Access for the terminal that runs it)",
         diagnostic.trim()
       ))),
       Ok(()) => Ok(()),
     }
   }
+}
+
+/// Copies to `out` every event line whose process is `binary`, and every line that is not a complete
+/// event (the parser records it unresolved, so a torn line cannot hide a write).
+fn keep_slates_events(
+  events: std::process::ChildStdout,
+  mut out: std::fs::File,
+  binary: &str,
+) -> Result<(), Failure> {
+  use std::io::{BufRead, Write};
+  for line in std::io::BufReader::new(events).lines() {
+    let line = line?;
+    let keep = match serde_json::from_str::<serde_json::Value>(&line) {
+      Ok(event) => {
+        event.get("event").is_none()
+          || event["process"]["executable"]["path"].as_str() == Some(binary)
+      }
+      Err(_) => !line.trim().is_empty(),
+    };
+    if keep {
+      writeln!(out, "{line}")?;
+    }
+  }
+  out.flush()?;
+  Ok(())
+}
+
+/// `eslogger` ends on `SIGTERM` (it ignored `SIGINT` in the 2026-09-26 probe), so its terminal status is
+/// that signal's, which `sudo` reports as an exit of 128 + 15.
+fn terminated_by_term(status: std::process::ExitStatus) -> bool {
+  /// Format: `SIGTERM`, and the exit code a shell or `sudo` reports for a child it ended (128 + 15).
+  const SIGTERM: i32 = 15;
+  const EXIT_ON_SIGTERM: i32 = 128 + SIGTERM;
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::ExitStatusExt;
+    if status.signal() == Some(SIGTERM) {
+      return true;
+    }
+  }
+  status.success() || status.code() == Some(EXIT_ON_SIGTERM)
+}
+
+/// Signals the `sudo eslogger` process group: its graceful stop is `SIGTERM`.
+fn signal_eslogger(pid: u32, signal: StopSignal) -> Result<(), Failure> {
+  signal_group(
+    pid,
+    match signal {
+      StopSignal::Interrupt => "TERM",
+      StopSignal::Kill => "KILL",
+    },
+  )
 }
 
 #[cfg(unix)]
@@ -142,13 +235,9 @@ fn isolate_tracer(command: &mut Command) {
 #[cfg(not(unix))]
 fn isolate_tracer(_command: &mut Command) {}
 
-/// sudo may supervise a distinct fs_usage child. Signal their owned process group so an
-/// early return cannot leave the privileged descendant tracing after its target is gone.
-fn signal_tracer(pid: u32, signal: StopSignal) -> Result<(), Failure> {
-  let signal = match signal {
-    StopSignal::Interrupt => "INT",
-    StopSignal::Kill => "KILL",
-  };
+/// sudo may supervise a distinct tracer child. Signal their owned process group so an early return
+/// cannot leave the privileged descendant tracing after its target is gone.
+fn signal_group(pid: u32, signal: &str) -> Result<(), Failure> {
   let output = Command::new("sudo")
     .args(["-n", "/bin/kill", "-s", signal, "--", &format!("-{pid}")])
     .output()?;
@@ -294,11 +383,21 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .and_then(|count| count.checked_mul(page))
     .ok_or_else(|| Failure("hermeticity workload quota overflow".to_owned()))?
     .to_string();
-  let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
-  let fs_usage = match run.os {
-    HostOs::Macos => Some(FsUsage::start(&session, &log)?),
+  // macOS: eslogger watches the whole lifecycle from before the anchor starts (daemon start-up
+  // included), attached once the binary's own events reach the log.
+  let eslogger = match run.os {
+    HostOs::Macos => {
+      let binary = SlatesBinary::build(run.root)?;
+      let mut tracer = EsLogger::start(binary.path(), &log)?;
+      tracer.wait_ready(&log, || {
+        binary.run("eslogger-readiness", &["--help"]).map(|_| ())
+      })?;
+      eprintln!("hermeticity: eslogger recorded the binary's events");
+      Some(tracer)
+    }
     _ => None,
   };
+  let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
   let work = session.workdir("traced")?;
   let workload = Command::new("sh")
     .args(["-c", MOUNT_WORKLOAD])
@@ -336,10 +435,11 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let verified = verify_landing(&target, &work)
     .and_then(|()| verify_manifest(&mounted_tree, &manifest_of(&target)?));
   let Session { mount, anchor, .. } = session;
+  let anchor_log = anchor.log_path().display().to_string();
   drop(mount);
   // Readiness is already established: keep observing through daemon teardown as well.
   anchor.stop();
-  if let Some(tracer) = fs_usage {
+  if let Some(tracer) = eslogger {
     tracer.stop()?;
   }
   let text = std::fs::read_to_string(&log)
@@ -347,11 +447,13 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let cwd = run.scratch.path().display().to_string();
   let events = match run.os {
     HostOs::Linux => parse_strace_with_cwd(&text, &cwd),
-    _ => parse_fs_usage(&text),
+    _ => parse_eslogger(&text),
   };
+  let streams = [anchor_log.as_str()];
   let policy = Policy {
     target: &target.display().to_string(),
     working_directory: &cwd,
+    streams: &streams,
   };
   let judged = judge(&events, &policy);
   let unnamed = strace_unnamed_paths(&text);
@@ -383,7 +485,10 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       "tracer: {}; {} events parsed from {} log lines; landing reported {written} written; {hidden} hidden siblings ({HIDDEN_PREFIX}*) seen inside the target",
       match run.os {
         HostOs::Linux => format!("strace -f -y -qq -s 0 -e {STRACE_TRACE} -- <anchor>"),
-        _ => "sudo fs_usage -w -f filesys -f network <daemon pid>".to_owned(),
+        _ => format!(
+          "sudo eslogger {} (kept: events of the slates binary)",
+          ES_EVENTS.join(" ")
+        ),
       },
       events.len(),
       text.lines().count()
@@ -439,7 +544,8 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
         "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
       ),
       _ => format!(
-        "sudo fs_usage -w -f filesys -f network <daemon pid>; slates anchor/volume create/mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
+        "sudo eslogger {} (events of the slates binary); slates anchor/volume create/mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant",
+        ES_EVENTS.join(" ")
       ),
     },
     bound: "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified".to_owned(),

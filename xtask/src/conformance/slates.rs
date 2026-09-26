@@ -224,6 +224,11 @@ impl Anchor {
     Ok(anchor)
   }
 
+  /// The anchor's log: its stderr and its daemon's, the processes' own standard stream.
+  pub(crate) fn log_path(&self) -> &Path {
+    &self.log
+  }
+
   /// The last `lines` lines of the anchor's log.
   pub(crate) fn log_tail(&self, lines: usize) -> String {
     let text = std::fs::read_to_string(&self.log).unwrap_or_default();

@@ -91,11 +91,16 @@ impl TraceProcess {
     }
   }
 
-  pub(super) fn stop(&mut self) -> Result<(), Failure> {
+  /// Stops the tracer with its graceful signal and requires an exit status `accept` allows (a tracer
+  /// that ends on its stop signal reports that signal, not success).
+  pub(super) fn stop_accepting(
+    &mut self,
+    accept: impl Fn(ExitStatus) -> bool,
+  ) -> Result<(), Failure> {
     self.require_running()?;
     (self.signal)(self.child.id(), StopSignal::Interrupt)?;
     let status = self.wait_exit()?;
-    if !status.success() {
+    if !accept(status) {
       return Err(Failure(format!("tracer exited {status}")));
     }
     Ok(())
@@ -235,7 +240,9 @@ mod tests {
     tracer
       .wait_ready(|| observed(&mut stdout, &mut output))
       .expect("ready");
-    tracer.stop().expect("stop and drain");
+    tracer
+      .stop_accepting(|status| status.success())
+      .expect("stop and drain");
     stdout.read_to_string(&mut output).expect("final log");
     assert_eq!(output, "ready\nfinal\n");
   }
@@ -251,7 +258,7 @@ mod tests {
       .expect("ready");
     assert!(
       tracer
-        .stop()
+        .stop_accepting(|status| status.success())
         .expect_err("tracer failed")
         .0
         .contains("exit status: 7")
