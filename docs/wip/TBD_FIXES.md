@@ -29,9 +29,9 @@ authorized merely by appearing here.
   silicon), 1–3 on Linux; the row is ratcheted at 1,233 ns as "the cost the spin window is compared
   against". Hold the bench daemon's reply until the client sleeps and gate the confirmed-sleeper
   mean instead (same record, found 1).
-- [ ] **A step costs O(ready set).** `take_ready` swaps out every ready slot and `step` re-pushes each
-  unpolled one; `observe.rs`'s full-arena fill admits 82,245 yielding tasks on this Mac and runs
-  95–97 s, quadratic. Take at most `batch` per step, failing test first (same record, found 2).
+- [x] **A step costs O(ready set).** `take_ready` swapped out every ready slot and `step` re-pushed each
+  unpolled one. A drain now takes at most its batch from a FIFO. `observe.rs` ran 95–97 s before and
+  12.6 s after. See `docs/bugs/2026-09-26-a-shard-step-cost-its-whole-ready-set.md`.
 - [ ] **The archive walk's unit exceeds the quantum.** At least one file piece per slice, larger than
   the mean-wake quantum; size the unit by the slice (BLAKE3 hashes incrementally) (same record,
   found 3).

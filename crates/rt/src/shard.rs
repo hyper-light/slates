@@ -929,16 +929,11 @@ impl ShardContext {
       })
       .unwrap_or((false, 1));
     did_work |= drained;
-    let ready = self.local.take_ready();
-    let batch = batch.max(1);
-    for (i, slot) in ready.iter().enumerate() {
-      if i < batch {
-        did_work = true;
-        self.poll_slot(*slot);
-      } else {
-        self.local.clear_pending(*slot);
-        self.local.push(*slot);
-      }
+    // At most one batch, oldest first: a step costs its batch, not the ready set (`LocalQueue`).
+    let ready = self.local.take_ready(batch.max(1));
+    for slot in &ready {
+      did_work = true;
+      self.poll_slot(*slot);
     }
     self.local.finish_drain(ready);
     let (exit, next_deadline_ns) = self
