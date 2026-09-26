@@ -46,11 +46,11 @@ const IMAGE_MAGIC: u32 = u32::from_le_bytes(*b"SLR1");
 /// Format: a shard image's magic (`"SLS1"` little-endian), distinct from a single volume's so one
 /// is never decoded as the other.
 const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
-/// Format: the image layout version, bumped with any change to the types below. 3 (2026-09-15): a
-/// file's body is its held runs at their offsets, not one vector of its logical length.
-/// 4 (A-26): FIFO/socket kinds with empty bodies and zero size. 5 (§4.5, 2026-09-26): each inode's
-/// extended-attribute table and, for an attribute inode, its owner. 6 (§4.6): each inode's
-/// AppleDouble working copy.
+/// The image layout's history: 3 (2026-09-15) a file's body is its held runs at their offsets, not
+/// one vector of its logical length; 4 (A-26) FIFO/socket kinds with empty bodies and zero size; 5
+/// (§4.5, 2026-09-26) each inode's extended-attribute table and, for an attribute inode, its owner;
+/// 6 (§4.6) each inode's AppleDouble working copy.
+/// Format: the image layout version, bumped with any change to the types below.
 const IMAGE_VERSION: u16 = 6;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).

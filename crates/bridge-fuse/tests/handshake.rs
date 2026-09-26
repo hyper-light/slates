@@ -45,7 +45,11 @@ fn trivial_handshake() -> Duration {
   helper.args(["-c", "true"]);
   // A helper that sends no descriptor ends as NoDevice, which is what a trivial run produces.
   let outcome = handshake(helper, Duration::from_secs(60));
-  assert!(matches!(outcome, Err(MountError::NoDevice { .. })));
+  assert!(
+    matches!(outcome, Err(MountError::NoDevice { .. })),
+    "a trivial helper ends without a descriptor: {outcome:?} after {:?}",
+    start.elapsed()
+  );
   start.elapsed()
 }
 

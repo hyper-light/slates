@@ -227,12 +227,14 @@ pub fn mount(
 /// libfuse avoids by clearing the flag between `fork` and `exec`. `helper` is consumed so this
 /// process's copy of the socket end closes with it the moment the child is running.
 pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, MountError> {
-  // The pair is made without close-on-exec, which not every Unix offers at creation (macOS has no
-  // `SOCK_CLOEXEC`), and both ends get it right after.
+  // Both ends are close-on-exec from birth where the kernel offers it (`SOCK_CLOEXEC`, Linux), so a
+  // helper another thread spawns concurrently cannot inherit this handshake's socket and hold it
+  // open past this helper's exit. Where it does not (macOS), both ends get it right after; the
+  // window between is the platform's (FUSE mounts are Linux-only in use).
   let (ours, theirs) = rustix::net::socketpair(
     AddressFamily::UNIX,
     SocketType::STREAM,
-    SocketFlags::empty(),
+    socketpair_flags(),
     None,
   )
   .map_err(|e| MountError::Socketpair {
@@ -263,7 +265,7 @@ pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, Mou
   // early return below drops the guard, which kills and reaps the helper rather than leaving it
   // a zombie or an orphan. The success path waits for it through `finish`.
   let mut guard = HelperGuard(Some(child));
-  match receive_device(&ours) {
+  match receive_within(&ours, deadline) {
     Ok(device) => {
       let status = guard.finish()?;
       if status.success() {
@@ -283,6 +285,31 @@ pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, Mou
     }),
     Err(Received::Refused(code)) => Err(MountError::Recv { code: Some(code) }),
   }
+}
+
+/// The receive's flags: the received descriptor is close-on-exec atomically where the kernel offers
+/// it (`MSG_CMSG_CLOEXEC`, Linux); elsewhere it is marked right after it is owned.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+fn receive_flags() -> RecvFlags {
+  RecvFlags::CMSG_CLOEXEC
+}
+
+/// The receive's flags: macOS offers no atomic close-on-exec for a received descriptor.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+fn receive_flags() -> RecvFlags {
+  RecvFlags::empty()
+}
+
+/// The socket pair's creation flags: close-on-exec at creation where the kernel offers it.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
+fn socketpair_flags() -> SocketFlags {
+  SocketFlags::CLOEXEC
+}
+
+/// The socket pair's creation flags: macOS offers no close-on-exec at creation.
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "freebsd")))]
+fn socketpair_flags() -> SocketFlags {
+  SocketFlags::empty()
 }
 
 /// Owns the spawned helper so it is always reaped (audit BUG-14, and Part 2 item 9: no spawned
@@ -349,6 +376,27 @@ enum Received {
   Refused(i32),
 }
 
+/// Receives the helper's answer within `deadline` of now. A receive a signal interrupts (`EINTR`:
+/// another thread's child exiting, any handled signal) is retried with the socket's timeout re-armed
+/// to the time left, so an interruption is neither a refusal nor an extension of the deadline
+/// (reproduced 2026-09-26: 1 of 40 Linux runs of `tests/handshake.rs` returned `Recv { code: 4 }`).
+fn receive_within(socket: &OwnedFd, deadline: Duration) -> Result<OwnedFd, Received> {
+  let started = std::time::Instant::now();
+  loop {
+    match receive_device(socket) {
+      Err(Received::Refused(code)) if code == rustix::io::Errno::INTR.raw_os_error() => {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+          return Err(Received::TimedOut);
+        }
+        set_socket_timeout(socket, Timeout::Recv, Some(left))
+          .map_err(|e| Received::Refused(e.raw_os_error()))?;
+      }
+      other => return other,
+    }
+  }
+}
+
 /// Receives the device descriptor the helper sends over the socket with `SCM_RIGHTS`. The
 /// received descriptor is marked close-on-exec as soon as it is owned (`MSG_CMSG_CLOEXEC` is
 /// Linux's alone), so a later spawn never inherits the mount's device.
@@ -360,7 +408,7 @@ fn receive_device(socket: &OwnedFd) -> Result<OwnedFd, Received> {
     socket,
     &mut [IoSliceMut::new(&mut byte)],
     &mut control,
-    RecvFlags::empty(),
+    receive_flags(),
   )
   .map_err(|e| match e {
     // `EAGAIN` (the same value as `EWOULDBLOCK` on every Unix): the receive timeout elapsed.

@@ -36,6 +36,25 @@ const AD_FINDERINFO: u32 = 9;
 const ENTRIES_AT: usize = 26;
 /// Format: one AppleDouble entry: type, offset, length, each a big-endian `u32`.
 const ENTRY_BYTES: usize = 12;
+/// Format: where the version sits in the AppleDouble header (after the magic).
+const VERSION_AT: usize = 4;
+/// Format: where the entry count sits (after the magic, the version and the 16-byte filler).
+const COUNT_AT: usize = 24;
+/// Format: within an entry, where its offset field sits (after the type).
+const ENTRY_OFFSET_AT: usize = 4;
+/// Format: within an entry, where its length field sits (after the type and the offset).
+const ENTRY_LEN_AT: usize = 8;
+/// Format: within the extended-attribute header, where `total_size` sits (after magic, debug tag).
+const ATTR_TOTAL_SIZE_AT: usize = 8;
+/// Format: within the extended-attribute header, where `data_start` sits.
+const ATTR_DATA_START_AT: usize = 12;
+/// Format: within the extended-attribute header, where `data_length` sits.
+const ATTR_DATA_LENGTH_AT: usize = 16;
+/// Format: within the extended-attribute header, where `num_attrs` sits (after three reserved
+/// words and the flags).
+const ATTR_COUNT_AT: usize = 34;
+/// Format: within an attribute entry, where its length field sits (after its offset).
+const ATTR_ENTRY_LEN_AT: usize = 4;
 /// Format: the most entries xnu accepts (`numEntries > 15` is refused).
 const MAX_ENTRIES: usize = 15;
 /// Format: the Finder Info's fixed size (xnu `FINDERINFOSIZE`).
@@ -162,10 +181,10 @@ fn decode_layout(prefix: &[u8], file_len: u64, read_at: ReadAt<'_>) -> Option<La
 /// The AppleDouble header's entries and where the entry array ends; `None` when the magic, version
 /// or count is wrong, or an entry starts inside the array, runs past the file or overlaps another.
 fn decode_entries(raw: &[u8], file_len: u64) -> Option<(Vec<(u32, Span)>, u64)> {
-  if be32(raw, 0)? != ADH_MAGIC || be32(raw, 4)? != ADH_VERSION {
+  if be32(raw, 0)? != ADH_MAGIC || be32(raw, VERSION_AT)? != ADH_VERSION {
     return None;
   }
-  let count = usize::from(be16(raw, 24)?);
+  let count = usize::from(be16(raw, COUNT_AT)?);
   if count == 0 || count > MAX_ENTRIES {
     return None;
   }
@@ -175,8 +194,8 @@ fn decode_entries(raw: &[u8], file_len: u64) -> Option<(Vec<(u32, Span)>, u64)> 
     let at = ENTRIES_AT + index * ENTRY_BYTES;
     let kind = be32(raw, at)?;
     let span = Span {
-      offset: u64::from(be32(raw, at + 4)?),
-      len: u64::from(be32(raw, at + 8)?),
+      offset: u64::from(be32(raw, at + ENTRY_OFFSET_AT)?),
+      len: u64::from(be32(raw, at + ENTRY_LEN_AT)?),
     };
     let overlaps = entries
       .iter()
@@ -226,10 +245,10 @@ fn decode_attributes(raw: &[u8], finder: Span) -> Option<(Vec<Named>, u64)> {
   if be32(raw, ATTR_HEADER_AT)? != ATTR_MAGIC {
     return None;
   }
-  let total_size = u64::from(be32(raw, ATTR_HEADER_AT + 8)?);
-  let data_start = u64::from(be32(raw, ATTR_HEADER_AT + 12)?);
-  let data_length = u64::from(be32(raw, ATTR_HEADER_AT + 16)?);
-  let count = usize::from(be16(raw, ATTR_HEADER_AT + 34)?);
+  let total_size = u64::from(be32(raw, ATTR_HEADER_AT + ATTR_TOTAL_SIZE_AT)?);
+  let data_start = u64::from(be32(raw, ATTR_HEADER_AT + ATTR_DATA_START_AT)?);
+  let data_length = u64::from(be32(raw, ATTR_HEADER_AT + ATTR_DATA_LENGTH_AT)?);
+  let count = usize::from(be16(raw, ATTR_HEADER_AT + ATTR_COUNT_AT)?);
   let data_end = data_start.checked_add(data_length)?;
   if total_size > finder.end()
     || data_start < ATTR_ENTRIES_AT as u64
@@ -281,7 +300,7 @@ fn decode_attribute_entry(
   }
   let span = Span {
     offset: u64::from(be32(raw, at)?),
-    len: u64::from(be32(raw, at + 4)?),
+    len: u64::from(be32(raw, at + ATTR_ENTRY_LEN_AT)?),
   };
   Some((
     name[..name_len - 1].to_vec(),
@@ -568,46 +587,71 @@ fn push_entry(head: &mut Vec<u8>, kind: u32, offset: u64, len: u64) {
   head.extend_from_slice(&be32_of(len));
 }
 
+/// Format: the placeholder resource fork's fields (xnu `rsrcfork_header_t`, 286 bytes): the file
+/// header's data and map offsets (0, 4) and map length (12); the 112 bytes of system data from 16
+/// (where the tag goes) and 128 of application data; then the map header's data and map offsets
+/// (256, 260), map length (268), mh_Next (272), mh_RefNum (276), two attribute bytes, and mh_Types
+/// (280), mh_Names (282) and typeCount (284).
+mod fork_field {
+  /// Format: the file header's data offset.
+  pub(super) const DATA_OFFSET: usize = 0;
+  /// Format: the file header's map offset.
+  pub(super) const MAP_OFFSET: usize = 4;
+  /// Format: the file header's map length.
+  pub(super) const MAP_LENGTH: usize = 12;
+  /// Format: the map header's data offset.
+  pub(super) const MAP_DATA_OFFSET: usize = 256;
+  /// Format: the map header's map offset.
+  pub(super) const MAP_MAP_OFFSET: usize = 260;
+  /// Format: the map header's map length.
+  pub(super) const MAP_MAP_LENGTH: usize = 268;
+  /// Format: the map's type-list offset (`mh_Types`).
+  pub(super) const TYPES: usize = 280;
+  /// Format: the map's name-list offset (`mh_Names`).
+  pub(super) const NAMES: usize = 282;
+  /// Format: the map's type count (`typeCount`).
+  pub(super) const TYPE_COUNT: usize = 284;
+}
+
 /// The placeholder resource fork xnu writes into a fresh AppleDouble file.
 fn placeholder_fork() -> Vec<u8> {
   let mut fork = vec![0u8; EMPTY_FORK_BYTES];
   let put32 = |fork: &mut Vec<u8>, at: usize, value: u32| {
-    fork[at..at + 4].copy_from_slice(&value.to_be_bytes());
+    fork[at..at + size_of::<u32>()].copy_from_slice(&value.to_be_bytes());
   };
-  put32(&mut fork, 0, FORK_FIRST_RESOURCE);
-  put32(&mut fork, 4, FORK_FIRST_RESOURCE);
-  put32(&mut fork, 12, FORK_NULL_MAP_LENGTH);
-  fork[EMPTY_FORK_TAG_AT..EMPTY_FORK_TAG_AT + EMPTY_FORK_TAG.len()].copy_from_slice(EMPTY_FORK_TAG);
-  // The map header (xnu `rsrcfork_header_t`): after the file header's four words, 112 bytes of
-  // system data and 128 of application data come mh_DataOffset, mh_MapOffset, mh_DataLength,
-  // mh_MapLength and mh_Next (256..276), mh_RefNum (276), two attribute bytes, then mh_Types (280),
-  // mh_Names (282) and typeCount (284).
-  put32(&mut fork, 256, FORK_FIRST_RESOURCE);
-  put32(&mut fork, 260, FORK_FIRST_RESOURCE);
-  put32(&mut fork, 268, FORK_NULL_MAP_LENGTH);
   let put16 = |fork: &mut Vec<u8>, at: usize, value: u16| {
-    fork[at..at + 2].copy_from_slice(&value.to_be_bytes());
+    fork[at..at + size_of::<u16>()].copy_from_slice(&value.to_be_bytes());
   };
+  put32(&mut fork, fork_field::DATA_OFFSET, FORK_FIRST_RESOURCE);
+  put32(&mut fork, fork_field::MAP_OFFSET, FORK_FIRST_RESOURCE);
+  put32(&mut fork, fork_field::MAP_LENGTH, FORK_NULL_MAP_LENGTH);
+  fork[EMPTY_FORK_TAG_AT..EMPTY_FORK_TAG_AT + EMPTY_FORK_TAG.len()].copy_from_slice(EMPTY_FORK_TAG);
+  put32(&mut fork, fork_field::MAP_DATA_OFFSET, FORK_FIRST_RESOURCE);
+  put32(&mut fork, fork_field::MAP_MAP_OFFSET, FORK_FIRST_RESOURCE);
+  put32(&mut fork, fork_field::MAP_MAP_LENGTH, FORK_NULL_MAP_LENGTH);
   let null_map = u16::try_from(FORK_NULL_MAP_LENGTH).unwrap_or(0);
-  put16(&mut fork, 280, null_map - 2);
-  put16(&mut fork, 282, null_map);
-  put16(&mut fork, 284, u16::MAX); // typeCount = -1
+  // mh_Types points just before the null map's end, mh_Names at it; typeCount is -1 (no types).
+  put16(&mut fork, fork_field::TYPES, null_map.saturating_sub(2));
+  put16(&mut fork, fork_field::NAMES, null_map);
+  put16(&mut fork, fork_field::TYPE_COUNT, u16::MAX);
   fork
 }
 
 /// A 32-bit big-endian field from a 64-bit value the encoder has already bounded to 32 bits.
-fn be32_of(value: u64) -> [u8; 4] {
+fn be32_of(value: u64) -> [u8; size_of::<u32>()] {
   u32::try_from(value).unwrap_or(u32::MAX).to_be_bytes()
 }
 
 fn be32(bytes: &[u8], at: usize) -> Option<u32> {
   bytes
-    .get(at..at + 4)
-    .map(|word| u32::from_be_bytes([word[0], word[1], word[2], word[3]]))
+    .get(at..at + size_of::<u32>())
+    .and_then(|word| word.try_into().ok())
+    .map(u32::from_be_bytes)
 }
 
 fn be16(bytes: &[u8], at: usize) -> Option<u16> {
   bytes
-    .get(at..at + 2)
-    .map(|word| u16::from_be_bytes([word[0], word[1]]))
+    .get(at..at + size_of::<u16>())
+    .and_then(|word| word.try_into().ok())
+    .map(u16::from_be_bytes)
 }

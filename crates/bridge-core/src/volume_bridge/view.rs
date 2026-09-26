@@ -39,6 +39,10 @@ use crate::{NodeAttr, ObjectId, OpContext, SetAttr};
 /// S_IWOTH`), so the client's own permission check on the view is the owner's.
 const VIEW_MODE_MASK: u32 = 0o666;
 
+/// Format: the permission bits of a mode (`S_ISUID | S_ISGID | S_ISVTX | 0o777`), which a `setattr`
+/// of a view's mode is compared on.
+const PERMISSION_BITS: u32 = 0o7777;
+
 /// An owner's representable attributes: each name and its value's length, in name order.
 type Held = Vec<(Box<[u8]>, u64)>;
 
@@ -253,7 +257,7 @@ impl VolumeBridge<'_> {
     let current = self.view_getattr(owner)?;
     let same_mode = changes
       .mode
-      .is_none_or(|mode| mode & 0o7777 == current.mode);
+      .is_none_or(|mode| mode & PERMISSION_BITS == current.mode);
     let same_owner = changes.uid.is_none_or(|uid| uid == current.uid)
       && changes.gid.is_none_or(|gid| gid == current.gid);
     let times = changes.atime.is_some() || changes.mtime.is_some() || changes.ctime.is_some();
