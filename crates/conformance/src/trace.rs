@@ -127,7 +127,15 @@ const KERNEL_OBJECT_PREFIXES: &[&str] = &[
   "shm:",
 ];
 /// Format: the character devices a daemon's streams and null sinks reach.
-const CHARACTER_DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/tty", "/dev/ptmx"];
+/// `/dev/dtracehelper` is the DTrace helper device macOS's dynamic loader opens read-write in every process
+/// it starts (seen once per slates process in the 2026-09-26 eslogger run).
+const CHARACTER_DEVICES: &[&str] = &[
+  "/dev/null",
+  "/dev/zero",
+  "/dev/tty",
+  "/dev/ptmx",
+  "/dev/dtracehelper",
+];
 /// Format: the prefix of the pseudo-path the parsers give a descriptor they could not resolve.
 const UNRESOLVED_PREFIX: &str = "<fd ";
 

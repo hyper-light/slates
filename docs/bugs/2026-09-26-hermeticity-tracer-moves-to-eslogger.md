@@ -48,3 +48,24 @@ unresolved (`2026-09-22-fs-usage-startup-and-ownership.md`).
   tests (6) and the conformance suite (47) pass.
 - The full traced lifecycle has not run yet. It needs root and Full Disk Access: here from Ada's
   Terminal, and on CI only if the runner grants Full Disk Access to its shell (not yet known).
+
+## First full run (Ada, 2026-09-26): the trace stopped early
+
+- The run completed: the landing reported 12 of 12 written and the disk verified. The judgement read
+  137 events: 94 standard streams, 0 unresolved, 43 outside.
+- The 43 were all `open /dev/dtracehelper`. macOS's dynamic loader opens that DTrace helper device
+  read-write in every process it starts. It is now in the character-device class.
+- The trace was not complete. Every kept event fell between 21:56:28.0 and 21:56:29.9, while the run
+  went on for seconds more. No event named the target, and no `create`/`rename`/`unlink` event appeared.
+  Endpoint Security had delivered 16,705 machine-wide events to the client in those 1.9 s (by
+  `global_seq_num`), and then the filter kept nothing.
+- The likely cause is backpressure: the harness parsed every machine-wide line as JSON in an
+  unoptimized build. This is not confirmed.
+- Changes:
+  - The filter tests a line for the binary's path as a substring before parsing it.
+  - It checks every line's `global_seq_num` for continuity; a gap fails the run with the count of
+    dropped events.
+  - Before stopping eslogger, the harness runs the binary once more and waits for that run's events, so
+    the stream is proven caught up past the daemon's teardown.
+- That run's record (written into `docs/wip/conformance/records` by `conformance run`) described a
+  partial trace and was not committed.

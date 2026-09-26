@@ -96,7 +96,7 @@ const ES_EVENTS: &[&str] = &[
 /// this value owns and joins, so the log holds the lifecycle's own events, not the machine's.
 struct EsLogger {
   process: TraceProcess,
-  filter: Option<std::thread::JoinHandle<Result<(), Failure>>>,
+  filter: Option<std::thread::JoinHandle<Result<Filtered, Failure>>>,
   errors: PathBuf,
 }
 
@@ -150,53 +150,119 @@ impl EsLogger {
     self.check(ready)
   }
 
-  fn stop(mut self) -> Result<(), Failure> {
-    let stopped = self.process.stop_accepting(terminated_by_term);
+  /// Stops eslogger once the stream is known to be caught up: `mark` runs the binary once more, and the
+  /// stop waits until that run's events are in the log, so every event before it (the daemon's teardown
+  /// included) was delivered and filtered. Fails when the kernel dropped any event for this client.
+  fn stop(
+    mut self,
+    log: &Path,
+    mut mark: impl FnMut() -> Result<(), Failure>,
+  ) -> Result<Filtered, Failure> {
+    let before = std::fs::read_to_string(log)?.lines().count();
+    mark()?;
+    let caught_up = self
+      .process
+      .wait_ready(|| Ok(std::fs::read_to_string(log)?.lines().count() > before));
+    let stopped = caught_up.and_then(|()| self.process.stop_accepting(terminated_by_term));
     let filtered = self
       .filter
       .take()
-      .map_or(Ok(()), |filter| match filter.join() {
+      .map_or(Ok(Filtered::default()), |filter| match filter.join() {
         Ok(result) => result,
         Err(_) => Err(Failure("the eslogger filter panicked".to_owned())),
       });
-    self.check(stopped.and(filtered))
+    let result = stopped.and(filtered).and_then(|filtered| {
+      if filtered.dropped > 0 {
+        return Err(Failure(format!(
+          "Endpoint Security dropped {} events for this client (gaps in global_seq_num); a partial trace is not judged",
+          filtered.dropped
+        )));
+      }
+      Ok(filtered)
+    });
+    result.map_err(|error| self.annotate(error))
   }
 
   fn check(&self, result: Result<(), Failure>) -> Result<(), Failure> {
-    let diagnostic = std::fs::read_to_string(&self.errors)?;
-    match result {
-      Err(error) => Err(Failure(format!(
-        "{error}; eslogger: {} (it needs root and Full Disk Access for the terminal that runs it)",
-        diagnostic.trim()
-      ))),
-      Ok(()) => Ok(()),
-    }
+    result.map_err(|error| self.annotate(error))
+  }
+
+  /// The failure with eslogger's own diagnostic attached.
+  fn annotate(&self, error: Failure) -> Failure {
+    let diagnostic = std::fs::read_to_string(&self.errors).unwrap_or_default();
+    Failure(format!(
+      "{error}; eslogger: {} (it needs root and Full Disk Access for the terminal that runs it)",
+      diagnostic.trim()
+    ))
   }
 }
 
+/// What the filter saw of the stream: the lines kept, and the events Endpoint Security dropped.
+#[derive(Clone, Copy, Debug, Default)]
+struct Filtered {
+  kept: u64,
+  dropped: u64,
+}
+
 /// Copies to `out` every event line whose process is `binary`, and every line that is not a complete
-/// event (the parser records it unresolved, so a torn line cannot hide a write).
+/// event (the parser records it unresolved, so a torn line cannot hide a write). Machine-wide events
+/// are thousands a second (16,705 in the first 1.9 s of the 2026-09-26 run, after which that run's
+/// live filter kept nothing more), so a line is first tested for the binary's path as a substring —
+/// a byte search — and parsed only when it names it. Every line's `global_seq_num`, the client's own
+/// sequence across all event types, is checked for continuity: a gap is events the kernel dropped for
+/// this client, counted so the run fails rather than judging a partial trace.
 fn keep_slates_events(
   events: std::process::ChildStdout,
   mut out: std::fs::File,
   binary: &str,
-) -> Result<(), Failure> {
+) -> Result<Filtered, Failure> {
   use std::io::{BufRead, Write};
+  let quoted = format!("\"{binary}\"");
+  let mut filtered = Filtered::default();
+  let mut last_seq: Option<u64> = None;
   for line in std::io::BufReader::new(events).lines() {
     let line = line?;
-    let keep = match serde_json::from_str::<serde_json::Value>(&line) {
-      Ok(event) => {
-        event.get("event").is_none()
-          || event["process"]["executable"]["path"].as_str() == Some(binary)
+    if line.trim().is_empty() {
+      continue;
+    }
+    match global_seq(&line) {
+      Some(seq) => {
+        if let Some(last) = last_seq {
+          filtered.dropped += seq.saturating_sub(last).saturating_sub(1);
+        }
+        last_seq = Some(seq);
       }
-      Err(_) => !line.trim().is_empty(),
-    };
+      None => {
+        // Not an event at all: kept, so the parser counts it unresolved.
+        writeln!(out, "{line}")?;
+        filtered.kept += 1;
+        continue;
+      }
+    }
+    if !line.contains(&quoted) {
+      continue;
+    }
+    let keep = serde_json::from_str::<serde_json::Value>(&line).map_or(true, |event| {
+      event["process"]["executable"]["path"].as_str() == Some(binary)
+    });
     if keep {
       writeln!(out, "{line}")?;
+      filtered.kept += 1;
     }
   }
   out.flush()?;
-  Ok(())
+  Ok(filtered)
+}
+
+/// The `global_seq_num` of an Endpoint Security JSON line, read without parsing the line.
+fn global_seq(line: &str) -> Option<u64> {
+  let (_, rest) = line.split_once("\"global_seq_num\":")?;
+  let digits: String = rest
+    .trim_start()
+    .chars()
+    .take_while(char::is_ascii_digit)
+    .collect();
+  digits.parse().ok()
 }
 
 /// `eslogger` ends on `SIGTERM` (it ignored `SIGINT` in the 2026-09-26 probe), so its terminal status is
@@ -385,9 +451,12 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .to_string();
   // macOS: eslogger watches the whole lifecycle from before the anchor starts (daemon start-up
   // included), attached once the binary's own events reach the log.
-  let eslogger = match run.os {
-    HostOs::Macos => {
-      let binary = SlatesBinary::build(run.root)?;
+  let binary_for_trace = match run.os {
+    HostOs::Macos => Some(SlatesBinary::build(run.root)?),
+    _ => None,
+  };
+  let eslogger = match &binary_for_trace {
+    Some(binary) => {
       let mut tracer = EsLogger::start(binary.path(), &log)?;
       tracer.wait_ready(&log, || {
         binary.run("eslogger-readiness", &["--help"]).map(|_| ())
@@ -395,7 +464,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       eprintln!("hermeticity: eslogger recorded the binary's events");
       Some(tracer)
     }
-    _ => None,
+    None => None,
   };
   let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
   let work = session.workdir("traced")?;
@@ -439,8 +508,15 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   drop(mount);
   // Readiness is already established: keep observing through daemon teardown as well.
   anchor.stop();
-  if let Some(tracer) = eslogger {
-    tracer.stop()?;
+  let mut trace_note = None;
+  if let (Some(tracer), Some(binary)) = (eslogger, &binary_for_trace) {
+    let filtered = tracer.stop(&log, || {
+      binary.run("eslogger-drain", &["--help"]).map(|_| ())
+    })?;
+    trace_note = Some(format!(
+      "eslogger: {} slates events kept, 0 dropped (global_seq_num continuous); stopped after a drain marker",
+      filtered.kept
+    ));
   }
   let text = std::fs::read_to_string(&log)
     .map_err(|e| Failure(format!("reading {}: {e}", log.display())))?;
@@ -503,6 +579,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
   ];
   notes.extend(session.size_note.clone());
+  notes.extend(trace_note);
   if !unmatched.is_empty() {
     notes.push(format!(
       "inside-target paths not among the landed entries: {}",
