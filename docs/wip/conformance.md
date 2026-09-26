@@ -1,5 +1,19 @@
 # Transport conformance evidence (AC-9.7 / T-9.1; GAP-A9-15)
 
+> **First macOS root expectation review (2026-09-26).** The CI macOS lane's root run (run
+> 36202635768, macOS 26.6.2) has 6,781 passes and 1,905 failures. The root list now names exactly
+> those 1,905 cases:
+> - 1,789 are the Linux list's own cases: A-26 device-fixture cascades, and the open-unlink
+>   silly-rename.
+> - 116 are macOS-only, each traced to its source: NFSv3 PATHCONF carries no PATH_MAX (74); two
+>   behaviours POSIX leaves optional, which pjdfstest marks `todo Linux` (14); the owner's truncate
+>   override every NFSv3 server grants (2); the macOS client's fifo open (10); and the macOS kernel's rename authorization (16), whose
+>   RENAMEs the server accepts in two new tests.
+>
+> Judged against the list, that run's outputs have zero unlisted failures and zero listed cases now
+> passing or absent. §3.4's unprivileged shapes are unchanged.
+> [Review](../bugs/2026-09-26-macos-pjdfstest-root-review.md).
+
 > **First root expectation review (2026-09-20).** The complete unchanged Linux NFS-adapter
 > run has 6,970 passes, 1,800 failures and 28 TODO cases. The first root review left open
 > in §3.4 now names exactly those 1,800 cases: deliberately refused block/character-device

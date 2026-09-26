@@ -2694,6 +2694,84 @@ fn readdir_needs_read_permission_on_the_directory() {
   assert_eq!(readdir_status(&mut root, &dir_fh), Nfsstat3::Ok.wire());
 }
 
+/// pjdfstest rename/09 (the macOS root run's cases 2279 and 2299): in a sticky directory the caller
+/// owns, the caller renames a directory it does not own onto its own empty directory, in the same
+/// directory. POSIX allows it: the caller owns the sticky directory, and the moved directory keeps its
+/// parent, so its `..` is not rewritten and no write permission on it is needed. Do: build that tree
+/// with the source owned by root and then by another user. Expect: `NFS3_OK` both times, and the
+/// source name gone.
+#[test]
+fn a_directory_it_does_not_own_is_renamed_over_the_callers_directory_in_its_own_sticky_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let sticky = bridge.mkdir(oid(root_ino), &cx, "n0", 0o1777).unwrap();
+  chown(&mut bridge, &cx, sticky.ino, 65534, 65534);
+  for (round, owner) in [0u32, 65533].into_iter().enumerate() {
+    let source_name = format!("n2-{round}");
+    let target_name = format!("n3-{round}");
+    let source = bridge
+      .mkdir(oid(sticky.ino), &cx, &source_name, 0o755)
+      .unwrap();
+    chown(&mut bridge, &cx, source.ino, owner, owner);
+    let target = bridge
+      .mkdir(oid(sticky.ino), &cx, &target_name, 0o755)
+      .unwrap();
+    chown(&mut bridge, &cx, target.ino, 65534, 65534);
+    let dir = fh_of(sticky.ino);
+    let mut caller = export_as(&mut bridge, 65534, 65534);
+    assert_eq!(
+      rename_status(&mut caller, &dir, &source_name, &dir, &target_name),
+      Nfsstat3::Ok.wire(),
+      "a directory owned by {owner} renamed over the caller's own in the caller's sticky directory"
+    );
+    drop(caller);
+    assert!(
+      bridge.lookup(oid(sticky.ino), &cx, &source_name).is_err(),
+      "the source name is gone"
+    );
+  }
+}
+
+/// pjdfstest rename/10 (the macOS root run's cases 2056 and 2063): the caller moves its own directory
+/// into a sticky directory it owns, onto an empty directory it does not own. POSIX allows it: the
+/// caller owns the sticky destination directory, and writes its own moved directory's `..`; no write
+/// permission on the replaced directory is needed. Do: build that tree with the replaced directory
+/// owned by root and then by another user. Expect: `NFS3_OK` both times.
+#[test]
+fn the_callers_directory_replaces_one_it_does_not_own_in_its_own_sticky_directory() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let from = bridge.mkdir(oid(root_ino), &cx, "n0", 0o755).unwrap();
+  chown(&mut bridge, &cx, from.ino, 65534, 65534);
+  let sticky = bridge.mkdir(oid(root_ino), &cx, "n1", 0o1777).unwrap();
+  chown(&mut bridge, &cx, sticky.ino, 65534, 65534);
+  for (round, owner) in [0u32, 65533].into_iter().enumerate() {
+    let source_name = format!("n2-{round}");
+    let target_name = format!("n3-{round}");
+    let source = bridge
+      .mkdir(oid(from.ino), &cx, &source_name, 0o755)
+      .unwrap();
+    chown(&mut bridge, &cx, source.ino, 65534, 65534);
+    let target = bridge
+      .mkdir(oid(sticky.ino), &cx, &target_name, 0o755)
+      .unwrap();
+    chown(&mut bridge, &cx, target.ino, owner, owner);
+    let (from_fh, to_fh) = (fh_of(from.ino), fh_of(sticky.ino));
+    let mut caller = export_as(&mut bridge, 65534, 65534);
+    assert_eq!(
+      rename_status(&mut caller, &from_fh, &source_name, &to_fh, &target_name),
+      Nfsstat3::Ok.wire(),
+      "the caller's directory replaces one owned by {owner} in the caller's sticky directory"
+    );
+  }
+}
+
 /// A rename needs write and search permission on both directories (`NFS3ERR_ACCES`), and the sticky
 /// bit of the source directory holds for the entry moved (`NFS3ERR_PERM`).
 #[test]
