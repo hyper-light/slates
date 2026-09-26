@@ -342,6 +342,15 @@ mod platform {
 mod tests {
   use super::*;
 
+  /// A segment name unique to this test and this process. A fixed name collided when two runs of
+  /// these tests overlapped (another worktree's, a second terminal's): the second `shm_open` met the
+  /// first's object and was refused `EEXIST`, or removed the first's name from under it
+  /// (2026-09-25, six concurrent runs). Short enough for macOS's 31-byte shm names with the uid the
+  /// platform appends.
+  fn test_name(test: &str) -> String {
+    format!("slpf-{test}-{}", std::process::id())
+  }
+
   fn identity(cores: u32) -> Identity {
     Identity {
       cpu: "cpu".into(),
@@ -357,7 +366,7 @@ mod tests {
   fn a_published_profile_reads_back_for_the_same_identity() {
     let id = identity(8);
     let payload = b"{\"profile\":true}";
-    let segment = Segment::publish("slates-profile-test-a", &id, payload).unwrap();
+    let segment = Segment::publish(&test_name("a"), &id, payload).unwrap();
     assert_eq!(segment.len(), HEADER_BYTES + payload.len());
     assert!(!segment.is_empty());
     assert_eq!(segment.read(&id).unwrap(), payload);
@@ -365,7 +374,7 @@ mod tests {
 
   #[test]
   fn a_different_identity_is_reported_stale_with_both_hashes() {
-    let segment = Segment::publish("slates-profile-test-b", &identity(8), b"x").unwrap();
+    let segment = Segment::publish(&test_name("b"), &identity(8), b"x").unwrap();
     match segment.read(&identity(9)) {
       Err(MachineError::ProfileStale { cached, current }) => {
         assert_ne!(cached, current);
@@ -378,7 +387,7 @@ mod tests {
   #[test]
   fn a_corrupted_header_is_unavailable_not_a_panic() {
     let id = identity(8);
-    let mut segment = Segment::publish("slates-profile-test-c", &id, b"payload").unwrap();
+    let mut segment = Segment::publish(&test_name("c"), &id, b"payload").unwrap();
     segment.bytes_mut()[AT_MAGIC] ^= 0xFF;
     assert!(matches!(
       segment.read(&id),
@@ -395,7 +404,7 @@ mod tests {
   #[test]
   fn an_odd_generation_means_a_writer_is_inside() {
     let id = identity(8);
-    let mut segment = Segment::publish("slates-profile-test-d", &id, b"payload").unwrap();
+    let mut segment = Segment::publish(&test_name("d"), &id, b"payload").unwrap();
     let generation = read_u64(segment.bytes(), AT_GENERATION);
     put(
       segment.bytes_mut(),

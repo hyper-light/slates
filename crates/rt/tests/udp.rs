@@ -16,6 +16,56 @@ use std::time::Duration;
 use slates_rt::runtime::{Runtime, RuntimeConfig};
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
+/// Shape: how long a test waits for the runtime to shut down before it reports the shard's state and
+/// fails, rather than hanging the binary. A shutdown cancels a handful of tasks: milliseconds.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+/// Shape: the gap between the two pulse reads a stalled shutdown reports, long enough for a running
+/// shard to step many times and a parked one to wake at least once for a timer.
+const PULSE_GAP: Duration = Duration::from_millis(200);
+
+/// One read of a shard's pulse: steps, waits, spawns, completions, and whether it has exited.
+fn pulse(shard: u16) -> String {
+  slates_rt::registry::entry(shard).map_or_else(
+    || "no entry".to_owned(),
+    |entry| {
+      format!(
+        "steps {} waits {} spawns {} completed {} exited {}",
+        entry.pulse.steps(),
+        entry.pulse.waits(),
+        entry.pulse.spawns(),
+        entry.pulse.completed(),
+        entry.exited.load(std::sync::atomic::Ordering::Acquire)
+      )
+    },
+  )
+}
+
+/// Shuts the runtime down, or reports the shard's pulse (read twice, [`PULSE_GAP`] apart: steps that
+/// climb are a shard spinning, waits that climb a shard parking and waking, neither a shard held inside
+/// one call) when the shutdown outlasts [`SHUTDOWN_WAIT`], instead of hanging the test binary.
+fn shutdown_within(rt: Runtime, context: &str) -> Result<(), String> {
+  let shard = rt.shard_ids()[0];
+  let (done_tx, done_rx) = channel();
+  let stopper = std::thread::spawn(move || {
+    let counters = rt.shutdown();
+    let _ = done_tx.send(counters);
+  });
+  if done_rx.recv_timeout(SHUTDOWN_WAIT).is_ok() {
+    stopper.join().unwrap();
+    return Ok(());
+  }
+  let first = pulse(shard.0);
+  // The gap is a wait on the stopper, so a shutdown that ends inside it is still a shutdown.
+  if done_rx.recv_timeout(PULSE_GAP).is_ok() {
+    stopper.join().unwrap();
+    return Ok(());
+  }
+  let second = pulse(shard.0);
+  Err(format!(
+    "{context}: the runtime did not shut down within {SHUTDOWN_WAIT:?}; pulse {first}, then {second}"
+  ))
+}
+
 fn config() -> RuntimeConfig {
   RuntimeConfig {
     shards: 1,
@@ -58,10 +108,11 @@ fn a_udp_datagram_is_received_through_the_driver() {
   // The sender waits a runtime tick (letting the receiver register read-readiness on the driver),
   // then sends from outside the runtime's socket set: the receiver's socket becomes readable, the
   // driver wakes it, and recv_from returns.
+  let (sent_tx, sent_rx) = channel();
   rt.spawn_on(id, async move {
     slates_rt::futures::sleep(5_000_000).await;
     let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let _ = sender.send_to(b"ping", target);
+    let _ = sent_tx.send(sender.send_to(b"ping", target));
   })
   .unwrap();
 
@@ -72,11 +123,13 @@ fn a_udp_datagram_is_received_through_the_driver() {
     }
     Ok(Err(e)) => panic!("recv_from failed: {e:?}"),
     Err(e) => {
-      let counters = rt.shutdown();
-      panic!("timed out ({e}); counters {counters:#?}");
+      let sent = sent_rx.try_recv();
+      let before = pulse(id.0);
+      let shutdown = shutdown_within(rt, "after the receive timed out");
+      panic!("timed out ({e}); the send: {sent:?}; pulse at the timeout: {before}; {shutdown:?}");
     }
   }
-  rt.shutdown();
+  shutdown_within(rt, "after the datagram arrived").unwrap();
 }
 
 /// AC (§4.3; docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md): a socket is awaited **again** after
@@ -109,12 +162,13 @@ fn a_second_receive_on_the_same_socket_registers_readiness_again() {
   })
   .unwrap();
   // Two sends, each after the receiver has blocked on its await (a runtime sleep apart).
+  let (sent_tx, sent_rx) = channel();
   rt.spawn_on(id, async move {
     let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     slates_rt::futures::sleep(5_000_000).await;
-    let _ = sender.send_to(b"first", target);
+    let _ = sent_tx.send(sender.send_to(b"first", target));
     slates_rt::futures::sleep(20_000_000).await;
-    let _ = sender.send_to(b"second", target);
+    let _ = sent_tx.send(sender.send_to(b"second", target));
   })
   .unwrap();
 
@@ -123,12 +177,16 @@ fn a_second_receive_on_the_same_socket_registers_readiness_again() {
       Ok(Ok(bytes)) => assert_eq!(bytes, expected),
       Ok(Err(e)) => panic!("recv_from of {expected:?} failed: {e:?}"),
       Err(e) => {
-        let counters = rt.shutdown();
-        panic!("timed out waiting for {expected:?} ({e}); counters {counters:#?}");
+        let sent: Vec<_> = sent_rx.try_iter().collect();
+        let before = pulse(id.0);
+        let shutdown = shutdown_within(rt, "after a receive timed out");
+        panic!(
+          "timed out waiting for {expected:?} ({e}); the sends: {sent:?}; pulse at the timeout: {before}; {shutdown:?}"
+        );
       }
     }
   }
-  rt.shutdown();
+  shutdown_within(rt, "after both datagrams arrived").unwrap();
 }
 
 /// The simulated UDP fabric delivers deterministically at N=1 (§4.10a "sim arm first"): a receiver

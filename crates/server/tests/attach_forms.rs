@@ -21,25 +21,15 @@ use slates_ipc::protocol::{
   TransportReport, UnsupportedReason, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
-use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
-/// Shape: the probe budget of the quick profile (milliseconds); an input to derivations, not a gate.
-const PROBE_MS: u64 = 5;
+mod common;
+
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
 /// Shape: how long a client waits for the daemon or a full ring before giving up.
 const CREDIT_WAIT: Duration = Duration::from_secs(5);
-
-fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
-}
 
 // --- The client side of the daemon's own rendezvous (as in tests/daemon.rs). ---
 
@@ -99,7 +89,7 @@ impl Client {
 }
 
 fn single_shard_daemon(name: &str) -> (Daemon, String) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let daemon = Daemon::start(

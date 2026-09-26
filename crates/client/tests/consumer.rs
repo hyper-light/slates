@@ -17,6 +17,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use slates_anchor::AnchorSegment;
@@ -24,7 +25,7 @@ use slates_client::{
   Capability, Client, ClientError, CreateSpec, Deadlines, NamePolicy, Refusal, SizeClass, VolumeId,
 };
 use slates_ipc::delivery::{Delivery, Output, delivered};
-use slates_machine::{MachineProfile, ProfileOptions};
+use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::landing::enroll_proof;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
@@ -34,7 +35,8 @@ const ROLE: &str = "SLATES_CONSUMER_TEST_ROLE";
 const ROLE_INSTANCE: &str = "SLATES_CONSUMER_TEST_INSTANCE";
 const ROLE_CONSUMER: &str = "SLATES_CONSUMER_TEST_CONSUMER";
 const ROLE_VOLUME: &str = "SLATES_CONSUMER_TEST_VOLUME";
-/// Shape: the probe budget of the quick profile these tests measure (milliseconds).
+/// Shape: each probe's wall budget for the tests' machine profile (milliseconds). The profile is
+/// measured once per test process ([`profile`]), so the budget is paid once.
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so the consumer's record is enrolled on one partition and
 /// attested from a channel on another (the cross-shard read of the attestation).
@@ -55,13 +57,22 @@ const EXIT_NOT_BOUND: i32 = 10;
 const EXIT_CAPABILITY_LEAKED: i32 = 11;
 const EXIT_VERB_FAILED: i32 = 12;
 
+/// The machine profile this binary's daemons derive from, measured once per process (§4.1), as
+/// production measures once at the anchor's boot. Measured afresh per daemon, the wake probe ran beside
+/// the other tests' probes and daemons and measured their load, or measured nothing and was refused
+/// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
 fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
+  static PROFILE: OnceLock<Result<MachineProfile, MachineError>> = OnceLock::new();
+  PROFILE
+    .get_or_init(|| {
+      MachineProfile::measure(ProfileOptions {
+        budget_per_probe: Duration::from_millis(PROBE_MS),
+        codecs: false,
+        core_matrix: false,
+      })
+    })
+    .clone()
+    .expect("the machine profile measures")
 }
 
 fn deadlines() -> Deadlines {

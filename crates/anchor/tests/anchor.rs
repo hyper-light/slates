@@ -34,6 +34,13 @@ const EXIT: i32 = 3;
 #[cfg(unix)]
 const CHILD_NFS_PORT: &str = "SLATES_ANCHOR_TEST_NFS_PORT";
 
+/// A segment name unique to this process: a fixed name collides when two runs of these tests overlap
+/// on a platform that names its shared objects (macOS, Windows), and the second run's create removes
+/// the first's name or meets its object. The re-invoked child learns the name from the handoff.
+fn unique_name(test: &str) -> String {
+  format!("{test}-{}", std::process::id())
+}
+
 fn identity() -> Identity {
   Identity {
     cpu: "test".into(),
@@ -76,7 +83,8 @@ fn handoff_of(segment: &AnchorSegment) -> (Handoff, usize) {
 #[test]
 fn a_segment_is_created_attached_and_read_through_the_seqlock() {
   let id = identity();
-  let mut created = AnchorSegment::create("slates-anchor-test-a", &id, geometry()).unwrap();
+  let mut created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-a"), &id, geometry()).unwrap();
   created
     .publish(RegionKind::Profile, b"{\"profile\":1}")
     .unwrap();
@@ -125,7 +133,8 @@ fn a_segment_is_created_attached_and_read_through_the_seqlock() {
 #[test]
 fn oversize_payloads_foreign_identities_and_wrong_lengths_are_refused() {
   let id = identity();
-  let mut created = AnchorSegment::create("slates-anchor-test-b", &id, geometry()).unwrap();
+  let mut created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-b"), &id, geometry()).unwrap();
   created
     .publish(RegionKind::Profile, b"{\"profile\":1}")
     .unwrap();
@@ -236,7 +245,12 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
   // Make the descriptor inheritable so the spawned child receives it across the exec.
   rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).unwrap();
 
-  let segment = AnchorSegment::create("slates-anchor-test-nfs", &identity(), geometry()).unwrap();
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-nfs"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
   let exe = std::env::current_exe()
     .unwrap()
     .to_string_lossy()
@@ -328,7 +342,12 @@ fn drive_until_crash_loop(
 /// state recorded for the health plane.
 #[test]
 fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_so() {
-  let segment = AnchorSegment::create("slates-anchor-test-sup", &identity(), geometry()).unwrap();
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-sup"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
   let exe = std::env::current_exe()
     .unwrap()
     .to_string_lossy()

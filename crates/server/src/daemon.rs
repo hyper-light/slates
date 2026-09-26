@@ -29,7 +29,7 @@ use slates_vfs::volume::{Store, StoreConfig};
 use slates_wire::observe::{Chokepoint, ChokepointRegistry};
 
 use crate::config::{DaemonConfig, DurabilityBound};
-use crate::doorbell::{DoorbellThread, Waits};
+use crate::doorbell::DoorbellThread;
 use crate::error::ServerError;
 use crate::observe::{Admitted, Observation, ObserveError, ObserveStage};
 use crate::state::{self, ClientSlot, ShardState, StateAccess};
@@ -553,13 +553,15 @@ impl Daemon {
       .iter()
       .filter_map(|s| registry::with_entry(s.0, |e| e.kick))
       .collect();
-    let doorbell = listener.doorbell_waiter()?.map(|(object, offset)| {
-      DoorbellThread::start(
-        Waits::Word { object, offset },
+    let doorbell = match (listener.doorbell_waiter()?, listener.doorbell_waiter()?) {
+      (Some(waiter), Some(waker)) => Some(DoorbellThread::start(
+        waiter,
+        waker,
         kicks,
         doorbell_flag(shards.first().map_or(0, |shard| shard.0)),
-      )
-    });
+      )?),
+      _ => None,
+    };
     let control_config = config.clone();
     let control_env = segment.handoff_env()?;
     let control_identity = identity.clone();
@@ -2604,12 +2606,41 @@ mod limits {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{audit_on_shard, audit_on_shard_configured};
+pub(crate) use tests::{audit_on_shard, audit_on_shard_configured, test_profile};
 
 #[cfg(test)]
 mod tests {
   use super::registered_chokepoints;
   use slates_wire::observe::Chokepoint;
+
+  /// Shape: each probe's wall budget for the unit tests' machine profile (milliseconds). The profile is
+  /// measured once per test process ([`test_profile`]), so the budget is paid once.
+  const PROBE_MS: u64 = 5;
+
+  /// The machine profile every unit test here derives a daemon from, measured once per test process
+  /// (§4.1). Production measures the machine once, at the anchor's boot, and derives every
+  /// configuration from that one profile; the fixture keeps that shape. When each fixture measured
+  /// its own, the wake probe ran beside every other fixture's probe and daemon. On an 18-core host
+  /// the concurrent measurements kept as few as 16 wakes, the floor, and their means ran from 1.6 µs
+  /// to 53 µs in one run. With six copies of this binary at once (a small CI runner's share of the
+  /// CPU), 33 measurements across 18 runs were refused `MeasurementTimeout`, and so was CI run
+  /// 36202635768 on its macOS runner
+  /// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
+  pub(crate) fn test_profile() -> slates_machine::MachineProfile {
+    static PROFILE: std::sync::OnceLock<
+      Result<slates_machine::MachineProfile, slates_machine::MachineError>,
+    > = std::sync::OnceLock::new();
+    PROFILE
+      .get_or_init(|| {
+        slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
+          budget_per_probe: std::time::Duration::from_millis(PROBE_MS),
+          codecs: false,
+          core_matrix: false,
+        })
+      })
+      .clone()
+      .expect("the machine profile measures")
+  }
 
   /// Runs an audit history on the daemon's real owning shard (§4.8, §4.16). The daemon owns and
   /// joins every task; only the result crosses back to the test thread.
@@ -2625,12 +2656,7 @@ mod tests {
     history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
     configure: impl FnOnce(&mut crate::DaemonConfig),
   ) -> T {
-    let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
-      budget_per_probe: std::time::Duration::from_millis(5),
-      codecs: false,
-      core_matrix: false,
-    })
-    .expect("the machine profile measures");
+    let profile = test_profile();
     // One instance name per fixture call, not per process: the name is the daemon's segment and
     // rendezvous object, and libtest runs these tests in parallel — with only the pid in the name,
     // two concurrent audits created the same segment and the second `Daemon::start` failed
@@ -2719,12 +2745,7 @@ mod tests {
     };
     use slates_cluster::root_group::RootGroup;
     use slates_db::register::{HostId, Quorum, RegionId};
-    let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
-      budget_per_probe: std::time::Duration::from_millis(5),
-      codecs: false,
-      core_matrix: false,
-    })
-    .expect("the machine profile measures");
+    let profile = test_profile();
     let instance = format!("warm-votes-{}", std::process::id());
     let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     let segment =

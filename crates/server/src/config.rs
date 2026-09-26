@@ -793,10 +793,6 @@ fn note<T: std::fmt::Debug>(name: &str, d: &Derived<T>) -> String {
 
 #[cfg(test)]
 mod tests {
-  use std::time::Duration;
-
-  use slates_machine::ProfileOptions;
-
   use super::*;
 
   /// AC (§4.8 "Placement", D-14): the derived scatter width is the recovery floor — the candidate floor
@@ -804,12 +800,7 @@ mod tests {
   /// restore the data budget within the recovery budget, and back at the floor when it is ample.
   #[test]
   fn the_derived_scatter_is_the_recovery_floor_above_the_candidate_floor() {
-    let profile = MachineProfile::measure(ProfileOptions {
-      budget_per_probe: Duration::from_millis(1),
-      codecs: false,
-      core_matrix: false,
-    })
-    .expect("the machine profile measures");
+    let profile = crate::daemon::test_profile();
     let quorum = Quorum { f: 1 }; // candidate floor 2f + 1 = 3
     let config = DaemonConfig::derive(&profile, "scatter-test", Some(1));
 
@@ -945,12 +936,7 @@ mod tests {
     use slates_mem::arena::ChunkArena;
     use slates_mem::region::Region;
     use slates_vfs::volume::{Store, StoreConfig};
-    let profile = MachineProfile::measure(ProfileOptions {
-      budget_per_probe: Duration::from_millis(1),
-      codecs: false,
-      core_matrix: false,
-    })
-    .expect("the machine profile measures");
+    let profile = crate::daemon::test_profile();
     let config = DaemonConfig::derive(&profile, "metadata-layout", Some(1));
     let page = config.page;
     let mut arena = ChunkArena::new(page);
@@ -997,12 +983,7 @@ mod tests {
   /// oversubscription, `docs/wip/fleet-under-load.md`).
   #[test]
   fn a_fleet_configuration_derives_its_own_task_share_from_the_peer_count() {
-    let profile = MachineProfile::measure(ProfileOptions {
-      budget_per_probe: Duration::from_millis(1),
-      codecs: false,
-      core_matrix: false,
-    })
-    .expect("the machine profile measures");
+    let profile = crate::daemon::test_profile();
     let solo = DaemonConfig::derive(&profile, "fleet-share-solo", None);
     let peers: Vec<HostId> = (1..=5).map(HostId).collect();
     let fleet =
@@ -1051,12 +1032,7 @@ mod tests {
   /// alone, a quarter-of-total bound leaves the reserve four times what the bound allows.
   #[test]
   fn a_memory_bound_below_total_caps_the_reserve() {
-    let mut profile = MachineProfile::measure(ProfileOptions {
-      budget_per_probe: Duration::from_millis(1),
-      codecs: false,
-      core_matrix: false,
-    })
-    .expect("the machine profile measures");
+    let mut profile = crate::daemon::test_profile();
     let total = profile.facts.memory.total;
     profile.facts.memory.limit = None;
     let unbounded = DaemonConfig::derive(&profile, "bound-none", None);

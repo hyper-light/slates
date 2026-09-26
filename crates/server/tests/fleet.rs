@@ -33,7 +33,7 @@ use slates_ipc::protocol::{
   pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
-use slates_machine::{MachineProfile, ProfileOptions};
+use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
 use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, host_id_of};
 use slates_server::deploy::member_id;
@@ -61,8 +61,6 @@ const CREDIT_WAIT: Duration = Duration::from_secs(5);
 
 /// The TLS server name every fleet node presents (a single fleet's shared name; the certificate pins who).
 const NAME: &str = "slates-fleet";
-/// Shape: the profile probe budget (milliseconds); an input to derivations, not a gate.
-const PROBE_MS: u64 = 5;
 /// Shape: how long to let the fleet form — the loops establish their sessions and exchange several probes,
 /// each confirming the other alive over the transport — before the peer is killed. Far past the handshake
 /// and a few protocol periods on loopback.
@@ -298,12 +296,7 @@ fn serialize_fleet_tests() -> std::sync::MutexGuard<'static, ()> {
 /// one fleet member. Only the identity string changes; the measured derivations (from memory, cores, page)
 /// are untouched.
 fn profile(node: &str) -> MachineProfile {
-  let mut profile = MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures");
+  let mut profile = common::machine_profile();
   profile.facts.identity.cpu = format!("fleet-node-{node}");
   profile
 }

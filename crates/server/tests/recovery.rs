@@ -26,16 +26,13 @@ use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, NamePolicy, SizeClass, SnapshotId, VolumeId,
 };
 use slates_ipc::protocol::{Filter, ReplyBody, RequestBody};
-use slates_machine::{MachineProfile, ProfileOptions};
+use slates_machine::MachineProfile;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
 mod common;
 use common::nfs::{create, fsstat, lookup, mount, read, write};
 
-/// Shape: the probe budget of the quick profile these tests measure (milliseconds); an input to
-/// derivations, not a gate.
-const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so the volume can live on a shard other than the control
 /// shard that accepts the NFS connection, and the cross-shard bridge route is on the recovery path.
 const TEST_SHARDS: u16 = 2;
@@ -56,15 +53,6 @@ const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta 
 /// [`BEFORE`] and written at offset zero, so the head's file is exactly these bytes.
 const AFTER: &[u8] =
   b"the bytes the head holds after the snapshot: golf hotel india juliet kilo lima mike november\n";
-
-fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
-}
 
 fn deadlines() -> Deadlines {
   Deadlines {
@@ -108,7 +96,7 @@ fn scratch(name: &str) -> CreateSpec {
 /// record, the commit, the reply — runs exactly as it would on a segment that cannot publish.
 #[test]
 fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-unpublished-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("unpublished", &profile, &config);
@@ -168,7 +156,7 @@ fn an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees
 /// is retried. Non-vacuous: before the fix the retry was refused `DuplicateRequest`.
 #[test]
 fn an_unpublished_verb_stays_retryable_across_the_clients_acknowledgement() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-unpublished-ack-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("unpublished-ack", &profile, &config);
@@ -360,7 +348,7 @@ fn clone_name_on_origin_partition(origin_name: &str, stem: &str) -> String {
 /// reads back the frozen bytes or nothing, and fails.
 #[test]
 fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-recover-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("recover", &profile, &config);
@@ -708,7 +696,7 @@ fn reference(profile: &MachineProfile) -> Observed {
 /// step 6 shows the image's larger capacity.
 #[test]
 fn a_crash_at_every_durable_step_recovers_and_the_resume_reaches_the_reference() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let reference = reference(&profile);
   let mut points = 0;
   for k in 1..=STEPS {
@@ -798,7 +786,7 @@ fn run_crash_point(profile: &MachineProfile, reference: &Observed, k: usize, cra
 /// the fix the second present re-minted the recovered record's id and was refused `AlreadyExists`.
 #[test]
 fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_it() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-landctr-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let segment = anchor_segment("landctr", &profile, &config);
@@ -867,7 +855,7 @@ fn owner_partition(volume: VolumeId) -> u16 {
 /// and the snapshot pinned.
 #[test]
 fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-pins-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let mut segment = anchor_segment("pins", &profile, &config);

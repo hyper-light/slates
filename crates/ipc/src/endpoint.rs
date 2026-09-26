@@ -681,6 +681,13 @@ mod tests {
   use crate::region::{ClientRegion, RegionGeometry};
   use crate::slot::Slot;
 
+  /// A region name unique to this process: a fixed name collides when two runs of these tests overlap
+  /// on a platform that names its shared objects (macOS), and the second run's create removes the
+  /// first's name or is refused `EEXIST`.
+  fn unique_name(test: &str) -> String {
+    format!("{test}-{}", std::process::id())
+  }
+
   fn geometry() -> RegionGeometry {
     RegionGeometry {
       slots: 8,
@@ -707,7 +714,8 @@ mod tests {
   /// before, carries the nudge after, and the reply is waiting for `try_take`.
   #[test]
   fn a_reply_to_a_parked_client_nudges_the_completion_fd() {
-    let region = ClientRegion::create("slates-endpoint-completion", 7, 0, geometry()).unwrap();
+    let region =
+      ClientRegion::create(&unique_name("slates-endpoint-completion"), 7, 0, geometry()).unwrap();
     let (handoff, len) = region.handoff().unwrap();
     let client_region = ClientRegion::open(&handoff, len).unwrap();
     let mut daemon = DaemonEnd::new(region);
@@ -780,7 +788,8 @@ mod tests {
   #[cfg(target_os = "macos")]
   #[test]
   fn the_completion_bridge_signals_only_an_armed_reply_and_stops_clean() {
-    let region = ClientRegion::create("slates-endpoint-bridge", 7, 0, geometry()).unwrap();
+    let region =
+      ClientRegion::create(&unique_name("slates-endpoint-bridge"), 7, 0, geometry()).unwrap();
     let (handoff, len) = region.handoff().unwrap();
     let client_region = ClientRegion::open(&handoff, len).unwrap();
     let mut daemon = DaemonEnd::new(region);

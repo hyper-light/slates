@@ -6,6 +6,7 @@
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use slates_anchor::AnchorSegment;
@@ -13,10 +14,11 @@ use slates_client::{
   Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass, Submitted,
 };
 use slates_ipc::protocol::{Refusal, RequestBody};
-use slates_machine::{MachineProfile, ProfileOptions};
+use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Shape: the probe budget of the quick profile these tests measure (milliseconds).
+/// Shape: each probe's wall budget for the tests' machine profile (milliseconds). The profile is
+/// measured once per test process ([`profile`]), so the budget is paid once.
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
@@ -28,13 +30,22 @@ const RECONNECT_NS: u64 = 5_000_000_000;
 /// Shape: how long a client retries the rendezvous while a daemon starts.
 const START_WAIT: Duration = Duration::from_secs(5);
 
+/// The machine profile this binary's daemons derive from, measured once per process (§4.1), as
+/// production measures once at the anchor's boot. Measured afresh per daemon, the wake probe ran beside
+/// the other tests' probes and daemons and measured their load, or measured nothing and was refused
+/// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
 fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
+  static PROFILE: OnceLock<Result<MachineProfile, MachineError>> = OnceLock::new();
+  PROFILE
+    .get_or_init(|| {
+      MachineProfile::measure(ProfileOptions {
+        budget_per_probe: Duration::from_millis(PROBE_MS),
+        codecs: false,
+        core_matrix: false,
+      })
+    })
+    .clone()
+    .expect("the machine profile measures")
 }
 
 fn deadlines() -> Deadlines {

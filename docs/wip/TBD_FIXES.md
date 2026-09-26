@@ -47,6 +47,22 @@ authorized merely by appearing here.
   test took a descriptor number it had already closed; a parallel test's pipe could hold it by then. The
   test now proves the close by `EPIPE` on the kept write end. See
   `docs/bugs/2026-09-25-a-delivery-test-took-a-descriptor-number-it-had-closed.md`.
+- [x] **Run 36201648573: the wake probe reported a zero mean.** Every round's setup outlasted a 6 ms
+  share on a loaded macOS runner. The probe now extends its rounds under the sample floor and refuses
+  `MeasurementTimeout` short of it. See
+  `docs/bugs/2026-09-25-the-wake-probe-reported-a-zero-mean-when-it-measured-nothing.md`.
+- [x] **Run 36202635768: a server unit test's fixture was refused `MeasurementTimeout`.** Fixtures measured
+  the machine beside each other: 33 refusals in 18 six-copy runs before, 0 in 30 after measuring once per
+  process. Fixed shared-object names in the same class now carry the process id. See
+  `docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`.
+- [x] **Run 36202635768: Windows claims and rings used the word wake, `Unsupported` there.** A `Bell`
+  per doorbell (a named Event on Windows) and one READY Event per claim slot; the doorbell thread no
+  longer spins. Proof owed to the next Windows run. See
+  `docs/bugs/2026-09-26-windows-rings-and-claims-used-the-unsupported-word-wake.md`.
+- [ ] **Windows UDP receive tests hang** (both, past 15 minutes, ending in an unbounded shutdown). The
+  tests now bound the shutdown and report the shard's pulse; diagnose from the next run's report.
+- [ ] **The anchor segment on Windows: `CreateFileMappingW` 1450.** 167–188 GB derived, which a
+  pagefile section is charged in full at creation. Reserve the section and commit on first use.
 - [ ] **Serve ports are still bound-then-released.** A test's own dialers could take its next node's port;
   none traced yet. Allocate below the kernel's ephemeral range (same record, found 1).
 - [ ] **A first placement that never converged** kept `poll_until` waiting past twelve minutes while the

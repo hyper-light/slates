@@ -178,10 +178,16 @@ impl Listener {
     self.inner.doorbell()
   }
 
-  /// A second mapping of the bootstrap object and the doorbell's offset, for the doorbell
-  /// thread to wait on (macOS, Windows); none on Linux.
-  pub fn doorbell_waiter(&self) -> Result<Option<(slates_mem::SharedObject, usize)>, IpcError> {
-    self.inner.doorbell_waiter()
+  /// A waiter on the daemon-wide doorbell for the doorbell thread (macOS, Windows): each call opens
+  /// its own mapping of the bootstrap object (and its own handle on the doorbell Event on Windows).
+  /// None on Linux.
+  pub fn doorbell_waiter(&self) -> Result<Option<DoorbellWaiter>, IpcError> {
+    Ok(
+      self
+        .inner
+        .doorbell_waiter()?
+        .map(|inner| DoorbellWaiter { inner }),
+    )
   }
 
   /// The listening socket's descriptor (Linux), for the owning control shard's readiness wait.
@@ -195,13 +201,10 @@ pub enum Doorbell {
   /// Write eight bytes to the shard's kick eventfd (Linux).
   #[cfg(target_os = "linux")]
   Eventfd(std::os::fd::OwnedFd),
-  /// Bump and wake the daemon-wide word in the bootstrap object (macOS, Windows).
-  Word {
-    /// The bootstrap object.
-    object: slates_mem::SharedObject,
-    /// The word's offset.
-    offset: usize,
-  },
+  /// Bump the daemon-wide word in the bootstrap object and wake the daemon's doorbell thread
+  /// (macOS, Windows).
+  #[cfg(any(target_os = "macos", windows))]
+  Word(platform::Bell),
 }
 
 impl std::fmt::Debug for Doorbell {
@@ -221,12 +224,46 @@ impl Doorbell {
           call: "eventfd write",
           code: Some(e.raw_os_error()),
         }),
-      Doorbell::Word { object, offset } => {
-        let word = object.atomic_u32(*offset)?;
-        word.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        crate::wake::wake_one(word).map(|_| ())
-      }
+      #[cfg(any(target_os = "macos", windows))]
+      Doorbell::Word(bell) => bell.ring(),
+      #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+      _ => Err(IpcError::Unsupported {
+        feature: "the doorbell",
+      }),
     }
+  }
+}
+
+/// What the daemon's doorbell thread waits on: on macOS and Windows its own mapping of the bootstrap
+/// object's doorbell word and, on Windows, the named doorbell Event clients signal, because the word's
+/// wake is process-local there (D-10). Linux has none: a client writes its shard's kick descriptor.
+/// A second waiter from [`Listener::doorbell_waiter`] is the handle the daemon rings to stop the thread.
+pub struct DoorbellWaiter {
+  inner: platform::DoorbellWaiter,
+}
+
+impl std::fmt::Debug for DoorbellWaiter {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("DoorbellWaiter")
+  }
+}
+
+impl DoorbellWaiter {
+  /// The doorbell word's value now: what the thread compares each later value against, so a ring
+  /// that lands between two waits shows as a change and is never lost.
+  pub fn current(&self) -> Result<u32, IpcError> {
+    self.inner.current()
+  }
+
+  /// Waits until the doorbell word differs from `seen`, or up to `timeout_ns`; the word's value then.
+  pub fn wait(&self, seen: u32, timeout_ns: u64) -> Result<u32, IpcError> {
+    self.inner.wait(seen, timeout_ns)
+  }
+
+  /// Rings the doorbell as a client does: bumps the word and wakes the waiting thread (the daemon
+  /// rings it to stop its own thread).
+  pub fn ring(&self) -> Result<(), IpcError> {
+    self.inner.ring()
   }
 }
 
@@ -340,6 +377,23 @@ pub mod platform {
   use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
+
+  /// No doorbell waiter on this platform: an uninhabited type, so no value of it exists.
+  pub enum DoorbellWaiter {}
+
+  impl DoorbellWaiter {
+    pub(super) fn current(&self) -> Result<u32, IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn wait(&self, _seen: u32, _timeout_ns: u64) -> Result<u32, IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn ring(&self) -> Result<(), IpcError> {
+      match *self {}
+    }
+  }
 
   /// Format: the handoff message: client id (4), region length (8).
   const HANDOFF_BYTES: usize = 12;
@@ -463,9 +517,7 @@ pub mod platform {
       None
     }
 
-    pub(super) fn doorbell_waiter(
-      &self,
-    ) -> Result<Option<(slates_mem::SharedObject, usize)>, IpcError> {
+    pub(super) fn doorbell_waiter(&self) -> Result<Option<DoorbellWaiter>, IpcError> {
       Ok(None)
     }
 
@@ -665,6 +717,7 @@ pub mod platform {
   use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
+  #[cfg(not(windows))]
   use crate::wake;
 
   /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
@@ -783,21 +836,97 @@ pub mod platform {
 
   pub(super) struct Listener {
     object: SharedObject,
-    /// The named Event a claiming client waits on for its slot to reach READY, signaled here once the
-    /// claim is served. `WaitOnAddress` on the slot word is process-local on Windows (D-10), so it
-    /// cannot wake a client in another process; the Event does. Without it a client still connects — it
-    /// re-checks READY on each claim-timeout — but not at the parked-wake latency. macOS's `__ulock`
-    /// wake reaches across processes, so the Event is Windows-only.
+    /// One named Event per claim slot, which the slot's claimant waits on for READY or REFUSED and
+    /// which is signaled here once the claim is answered. `WaitOnAddress` on the slot word is
+    /// process-local on Windows (D-10), so it cannot wake a client in another process; the Event
+    /// does. One Event per slot, not one per instance: an auto-reset Event wakes one waiter per
+    /// signal, so with one Event shared by concurrent claimants a signal could be consumed by a
+    /// claimant whose slot was not answered, and the answered one waited out its claim wait.
+    /// macOS's `__ulock` wake reaches across processes, so the Events are Windows-only.
     #[cfg(windows)]
-    ready_event: crate::wake::Event,
+    ready_events: Vec<crate::wake::Event>,
+    /// The daemon-wide doorbell Event, held for the daemon's life so its name exists from the
+    /// moment the bootstrap object does (Windows; [`Bell`]).
+    #[cfg(windows)]
+    _doorbell_event: crate::wake::Event,
+    /// The instance, for the doorbell waiters' own handles.
+    #[cfg(windows)]
+    instance: String,
   }
 
-  /// The name of the per-instance rendezvous READY Event (Windows), derived from the bootstrap
-  /// object's name so the daemon and every client name the one Event with no handle passing.
+  /// The name of claim slot `index`'s READY Event (Windows), derived from the bootstrap object's
+  /// name so the daemon and the claimant name the one Event with no handle passing.
   #[cfg(windows)]
-  fn ready_event_name(instance: &str) -> String {
-    format!("{}-rvz", rendezvous_name(instance))
+  fn ready_event_name(instance: &str, index: usize) -> String {
+    format!("{}-rvz{index}", rendezvous_name(instance))
   }
+
+  /// The name of the daemon-wide doorbell Event (Windows).
+  #[cfg(windows)]
+  fn doorbell_event_name(instance: &str) -> String {
+    format!("{}-bell", rendezvous_name(instance))
+  }
+
+  /// The daemon-wide doorbell (§4.7): the bootstrap object's word, which a ring bumps so the
+  /// doorbell thread sees a change against the value it last acted on (a ring between two of its
+  /// waits is never lost), and the wake that reaches the thread where it waits: the word itself
+  /// on macOS, whose wake crosses processes, or the named doorbell Event on Windows, where the
+  /// word's wake is process-local (D-10). A client rings it; the daemon's thread waits on it.
+  pub struct Bell {
+    object: SharedObject,
+    #[cfg(windows)]
+    event: crate::wake::Event,
+  }
+
+  impl Bell {
+    /// The doorbell of `instance` over a mapping of its bootstrap object.
+    fn new(object: SharedObject, instance: &str) -> Result<Bell, IpcError> {
+      #[cfg(not(windows))]
+      let _ = instance;
+      Ok(Bell {
+        object,
+        #[cfg(windows)]
+        event: crate::wake::Event::open(&doorbell_event_name(instance))?,
+      })
+    }
+
+    fn word(&self) -> Result<&AtomicU32, IpcError> {
+      Ok(self.object.atomic_u32(AT_DOORBELL)?)
+    }
+
+    /// Rings: bumps the word, then wakes the waiting thread.
+    pub(super) fn ring(&self) -> Result<(), IpcError> {
+      let word = self.word()?;
+      word.fetch_add(1, Ordering::AcqRel);
+      #[cfg(not(windows))]
+      wake::wake_one(word)?;
+      #[cfg(windows)]
+      self.event.signal()?;
+      Ok(())
+    }
+
+    /// The word's value now.
+    pub(super) fn current(&self) -> Result<u32, IpcError> {
+      Ok(self.word()?.load(Ordering::Acquire))
+    }
+
+    /// Waits until the word differs from `seen` or `timeout_ns` passes; the word's value then.
+    pub(super) fn wait(&self, seen: u32, timeout_ns: u64) -> Result<u32, IpcError> {
+      let word = self.word()?;
+      #[cfg(not(windows))]
+      wake::wait(word, seen, Some(timeout_ns))?;
+      // A ring bumps the word before it signals, so a word already past `seen` needs no wait; a
+      // signal left over from a ring already seen ends one wait early, and the caller compares.
+      #[cfg(windows)]
+      if word.load(Ordering::Acquire) == seen {
+        self.event.wait(Some(timeout_ns))?;
+      }
+      Ok(word.load(Ordering::Acquire))
+    }
+  }
+
+  /// The daemon's doorbell waiter is the bell itself.
+  pub type DoorbellWaiter = Bell;
 
   fn slot_at(index: usize) -> usize {
     HEADER_BYTES + index * SLOT_BYTES
@@ -825,18 +954,40 @@ pub mod platform {
       Ok(Listener {
         object,
         #[cfg(windows)]
-        ready_event: crate::wake::Event::open(&ready_event_name(instance))?,
+        ready_events: (0..SLOTS)
+          .map(|index| crate::wake::Event::open(&ready_event_name(instance, index)))
+          .collect::<Result<Vec<_>, _>>()?,
+        #[cfg(windows)]
+        _doorbell_event: crate::wake::Event::open(&doorbell_event_name(instance))?,
+        #[cfg(windows)]
+        instance: instance.to_owned(),
       })
+    }
+
+    /// Signals claim slot `index`'s claimant that its slot was answered (Windows).
+    #[cfg(windows)]
+    fn signal_ready(&self, index: usize) -> Result<(), IpcError> {
+      self
+        .ready_events
+        .get(index)
+        .ok_or(IpcError::Layout {
+          reason: "a claim slot past the bootstrap table",
+        })?
+        .signal()
     }
 
     pub(super) fn doorbell(&self) -> Option<&AtomicU32> {
       self.object.atomic_u32(AT_DOORBELL).ok()
     }
 
-    pub(super) fn doorbell_waiter(&self) -> Result<Option<(SharedObject, usize)>, IpcError> {
+    pub(super) fn doorbell_waiter(&self) -> Result<Option<DoorbellWaiter>, IpcError> {
       let handoff = self.object.handoff()?;
       let object = SharedObject::open(&handoff, self.object.len())?;
-      Ok(Some((object, AT_DOORBELL)))
+      #[cfg(windows)]
+      let instance = self.instance.as_str();
+      #[cfg(not(windows))]
+      let instance = "";
+      Ok(Some(Bell::new(object, instance)?))
     }
 
     pub(super) fn raw_fd(&self) -> Option<i32> {
@@ -878,9 +1029,12 @@ pub mod platform {
                   .copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
                 let word = state(&self.object, i)?;
                 word.store(REFUSED, Ordering::Release);
+                // Wake the claimant where it waits: on the word here (macOS), on the named ready Event
+                // on Windows, where the word-based wake is process-local and unsupported (D-10).
+                #[cfg(not(windows))]
                 wake::wake_one(word)?;
                 #[cfg(windows)]
-                let _ = self.ready_event.signal();
+                self.signal_ready(i)?;
                 return Err(e);
               }
             };
@@ -921,12 +1075,13 @@ pub mod platform {
             }
             let word = state(&self.object, i).map_err(lost)?;
             word.store(READY, Ordering::Release);
+            // Wake the claimant where it waits: the word here (macOS); on Windows the named auto-reset
+            // Event, since the word wake is process-local there and unsupported (D-10) — the Event holds
+            // a signal raised before the client waits, so a served-before-the-wait claim is not lost.
+            #[cfg(not(windows))]
             wake::wake_one(word).map_err(lost)?;
-            // Cross-process wake for the waiting client on Windows (the word wake above is
-            // process-local there, D-10); the auto-reset Event holds a signal raised before the
-            // client waits, so a served-before-the-wait claim is not lost.
             #[cfg(windows)]
-            let _ = self.ready_event.signal();
+            self.signal_ready(i).map_err(lost)?;
             return Ok(Some(Accepted {
               client_id,
               // The object's mode and per-user name are the authentication: whoever opened
@@ -1019,17 +1174,31 @@ pub mod platform {
       // The id the client wants back (zero: a fresh one); the daemon overwrites it with the
       // id it assigns.
       object.bytes_mut()[at + AT_CLIENT..at + AT_CLIENT + 4].copy_from_slice(&wanted.to_le_bytes());
-      // Ring the daemon-wide doorbell so a parked control shard sees the claim.
-      if let Ok(bell) = object.atomic_u32(AT_DOORBELL) {
-        bell.fetch_add(1, Ordering::AcqRel);
-        let _ = wake::wake_one(bell);
-      }
-      let word = state(&object, index)?;
-      // The Event the daemon signals when it marks this slot READY (Windows; the word wake is
-      // process-local there). Opened before the wait so a claim served in the gap is not missed —
-      // the auto-reset Event holds the signal until this first wait consumes it.
+      // The Event the daemon signals when it answers this slot (Windows; the word wake is
+      // process-local there). The daemon holds every slot's Event from its start, so a signal
+      // raised before this wait is kept until the wait consumes it.
       #[cfg(windows)]
-      let ready_event = crate::wake::Event::open(&ready_event_name(instance))?;
+      let ready_event = match crate::wake::Event::open(&ready_event_name(instance, index)) {
+        Ok(event) => event,
+        Err(error) => {
+          state(&object, index)?.store(FREE, Ordering::Release);
+          return Err(error);
+        }
+      };
+      // Ring the daemon-wide doorbell so a parked control shard sees the claim. The client's own
+      // doorbell for later rings is this bell, over its own mapping of the bootstrap object.
+      let bell = SharedObject::open(&handoff, HEADER_BYTES + SLOTS * SLOT_BYTES)
+        .map_err(IpcError::from)
+        .and_then(|mapping| Bell::new(mapping, instance));
+      let bell = match bell.and_then(|bell| bell.ring().map(|()| bell)) {
+        Ok(bell) => bell,
+        Err(error) => {
+          // The claim cannot be announced: give the slot back rather than leave it claimed.
+          state(&object, index)?.store(FREE, Ordering::Release);
+          return Err(error);
+        }
+      };
+      let word = state(&object, index)?;
       // Wait for READY (spin then wait on the word, or on the Event on Windows).
       let started = std::time::Instant::now();
       loop {
@@ -1079,10 +1248,7 @@ pub mod platform {
       state(&object, index)?.store(DONE, Ordering::Release);
       Ok(Connected {
         region,
-        doorbell: Doorbell::Word {
-          object,
-          offset: AT_DOORBELL,
-        },
+        doorbell: Doorbell::Word(bell),
         liveness: super::Liveness {
           inner: Liveness {
             instance: instance.to_owned(),
@@ -1102,6 +1268,23 @@ pub mod platform {
   use super::{Accepted, Connected, Prepared};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
+
+  /// No doorbell waiter on this platform: an uninhabited type, so no value of it exists.
+  pub enum DoorbellWaiter {}
+
+  impl DoorbellWaiter {
+    pub(super) fn current(&self) -> Result<u32, IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn wait(&self, _seen: u32, _timeout_ns: u64) -> Result<u32, IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn ring(&self) -> Result<(), IpcError> {
+      match *self {}
+    }
+  }
 
   /// No control channel.
   pub struct Control;
@@ -1146,9 +1329,7 @@ pub mod platform {
       None
     }
 
-    pub(super) fn doorbell_waiter(
-      &self,
-    ) -> Result<Option<(slates_mem::SharedObject, usize)>, IpcError> {
+    pub(super) fn doorbell_waiter(&self) -> Result<Option<DoorbellWaiter>, IpcError> {
       Ok(None)
     }
 

@@ -19,7 +19,6 @@ use slates_ipc::protocol::{
   SnapshotBoundary, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
-use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
@@ -29,8 +28,6 @@ use common::nfs::{
   write,
 };
 
-/// Shape: the probe budget of the quick profile (milliseconds); an input to derivations, not a gate.
-const PROBE_MS: u64 = 5;
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
 /// Shape: how long a client waits for the daemon or a full ring before giving up.
@@ -41,15 +38,6 @@ const MNT3ERR_NOENT: u32 = 2;
 /// Format: `NFS3ERR_ACCES` (RFC 1813 §2.6) — what a request through a handle whose capability does not
 /// authorize the volume answers (AUD-01).
 const NFS3ERR_ACCES: u32 = 13;
-
-fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
-}
 
 // --- The client side of the daemon's own rendezvous (as in tests/daemon.rs). ---
 
@@ -109,7 +97,7 @@ impl Client {
 }
 
 fn single_shard_daemon(name: &str) -> (Daemon, String) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   // One shard, so every provisioned volume lands on the shard the NFS listener is served on (R8, the
   // laptop-degenerate case the daemon-side NFS serve covers; cross-shard is owed).
@@ -129,7 +117,7 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
 }
 
 fn two_shard_daemon(name: &str) -> (Daemon, String) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   // Two shards, so a volume can land on a shard other than the one the NFS listener is served on,
   // exercising the cross-shard bridge queue.

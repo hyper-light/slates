@@ -19,15 +19,11 @@ use slates_ipc::protocol::{
   Refusal, ReplyBody, RequestBody, SizeClass, SpanRecord, TelemetryReport, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
-use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::daemon::host_id_of;
 use slates_server::deploy::member_id;
 use slates_server::{Daemon, DaemonConfig, DurabilityBound, FleetMembership, SegmentSource};
 use slates_wire::request::RequestId;
 
-/// Shape: the probe budget of the quick profile these tests measure (milliseconds); the
-/// numbers are inputs to derivations, not gates here.
-const PROBE_MS: u64 = 5;
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
 const DEADLINE_NS: u64 = 5_000_000_000;
 /// Shape: how long a client waits for a full ring to drain before giving up.
@@ -35,15 +31,6 @@ const CREDIT_WAIT: Duration = Duration::from_secs(5);
 /// Shape: shards per test daemon: two, so a client lands on a shard other than the control
 /// shard's and the cross-shard hand-off runs.
 const TEST_SHARDS: u16 = 2;
-
-fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
-}
 
 /// A client: its ring end and its request sequence.
 struct Client {
@@ -123,7 +110,7 @@ impl Client {
 }
 
 fn daemon(name: &str) -> (Daemon, String) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let daemon = Daemon::start(
@@ -160,7 +147,7 @@ const SDK_VOLUME_BYTES: u64 = 8 * 1024 * 1024;
 
 fn shard_selection_daemon(name: &str, shards: u16) -> (Daemon, String) {
   use slates_machine::facts::{CoreClass, CoreFacts};
-  let mut profile = profile();
+  let mut profile = common::machine_profile();
   profile.facts.memory.total = SHARD_SELECTION_MEMORY;
   profile.facts.memory.limit = Some(SHARD_SELECTION_MEMORY);
   profile.facts.cores = (0..4)
@@ -241,7 +228,7 @@ fn choosing_more_shards_does_not_multiply_the_hosts_capacity() {
 /// the typed client returns a complete report without exposing the page protocol.
 #[test]
 fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-status-pages-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   // Shape: CI derived eight slots; retain that ring's normal byte allowance on every host.
@@ -447,7 +434,7 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
 /// configured peers are unreachable, so only the bootstrap host is admitted. The durability
 /// calculation must not count those absent peers as replicas (§4.8, AUD-07).
 fn fleet_daemon(name: &str, durability: Option<DurabilityBound>) -> (Daemon, String) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let origin_anchor = slates_db::HostId(host_id_of(&profile.facts.identity));
   let host = member_id(origin_anchor, 0);
@@ -1361,7 +1348,7 @@ const LEAK_PROBES: usize = 24;
 /// shares the one version budget (with two shards, volumes route to separate budgets and never
 /// contend). Otherwise the derived config the other scenarios use.
 fn capped_daemon(name: &str, max_inodes: usize) -> (Daemon, String) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   config.store.max_inodes = max_inodes;
@@ -1561,7 +1548,7 @@ const DRAIN_SPANS_MAX: usize = ["ring.request", "shard.op", "log.append"].len();
 
 /// Exercises the wire at the machine's full reply quota or a smaller admissible quota.
 fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-telemetry-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   if let Some(reply_quota) = reply_quota {
@@ -2508,7 +2495,7 @@ const RECORD_PROBES: usize = 16;
 /// uncharged, every create here lands (the byte budget and the version slab are far larger).
 #[test]
 fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-metadata-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   // The class holds the slabs' maximum footprint plus a few volumes' records, no more.
@@ -2635,6 +2622,8 @@ fn wait_for_volume_count(client: &mut Client, count: usize) {
 // input retained. Folded into one serial test for the same reason as the lifecycle umbrella.
 
 use slates_ipc::protocol::{GreenBase, ReadAt};
+
+mod common;
 
 /// Creates a green from scratch.
 fn green(
@@ -3254,7 +3243,7 @@ const REFUSAL_ANSWER: Duration = Duration::from_millis(500);
 /// the bound was reached, not missing.
 #[test]
 fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("srv-bound-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
   config.clients_per_shard = 1;
@@ -3302,7 +3291,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
 /// request naming a lost member cannot bootstrap its replacement through the client wire.
 #[test]
 fn bootstrap_is_explicit_and_its_request_cannot_reset_a_replacement() {
-  let profile = profile();
+  let profile = common::machine_profile();
   let instance = format!("bootstrap-member-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
   let start = || {
@@ -3459,7 +3448,7 @@ const CONCURRENT_CLIENTS: usize = 4;
 /// Expect: every one is seated and served, and the daemon counts all four.
 #[test]
 fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
-  let mut profile = profile();
+  let mut profile = common::machine_profile();
   profile.facts.memory.limit = Some(POD_MEMORY_BYTES);
   profile.wake.p99_ns = CONTENDED_WAKE_P99_NS;
   let instance = format!("dm-seats-{}", std::process::id());

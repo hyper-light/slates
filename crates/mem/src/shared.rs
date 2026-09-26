@@ -568,7 +568,11 @@ mod tests {
   #[test]
   #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
   fn a_shared_object_is_seen_through_a_second_mapping() {
-    let mut a = SharedObject::create("slates-mem-shared-test-a", 4096).unwrap();
+    let mut a = SharedObject::create(
+      &format!("slates-mem-shared-test-a-{}", std::process::id()),
+      4096,
+    )
+    .unwrap();
     a.bytes_mut()[100..104].copy_from_slice(&[1, 2, 3, 4]);
     let word = a.atomic_u64(8).unwrap();
     word.store(0xdead_beef, Ordering::Release);

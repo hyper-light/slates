@@ -15,15 +15,12 @@ use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 use common::wait::{ProgressCharge, Verdict, verdict};
-use slates_machine::{MachineProfile, ProfileOptions};
 use slates_rt::RtError;
 use slates_server::daemon::{LIVENESS_BUDGET_NS, OBSERVE_BUDGET_NS};
 use slates_server::observe::{OBSERVE_LATE_REPLY, ObserveError, ObserveStage};
 use slates_server::state::ShardState;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Shape: the profile probe budget (milliseconds); an input to derivations, not a gate.
-const PROBE_MS: u64 = 5;
 /// Derived: how long a held control shard spins — two anchor liveness budgets ([`LIVENESS_BUDGET_NS`]),
 /// long past the short budget below, so a question submitted behind the hold is judged while the hold
 /// still stands, and short enough that a history stays a few seconds.
@@ -52,12 +49,7 @@ fn serialize() -> std::sync::MutexGuard<'static, ()> {
 
 /// A one-shard laptop daemon (no fleet) named for the history.
 fn laptop(name: &str) -> Daemon {
-  let profile = MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures");
+  let profile = common::machine_profile();
   let instance = format!("observe-{name}-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   Daemon::start(
