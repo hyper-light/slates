@@ -1,7 +1,15 @@
-//! Inodes: number, generation, birth epoch, POSIX attributes with nanosecond timestamps, and the
-//! body (§4.5). An inode is copy-on-write like a node: a version born in the current epoch is
-//! mutated in place; an older one is copied and the number's table entry re-pointed, so a
-//! snapshot keeps the old version and the number never changes (AC-1.6).
+//! Inodes: number, generation, birth epoch, POSIX attributes with nanosecond timestamps, the
+//! body, and the extended-attribute table (§4.5). An inode is copy-on-write like a node: a version
+//! born in the current epoch is mutated in place; an older one is copied and the number's table
+//! entry re-pointed, so a snapshot keeps the old version and the number never changes (AC-1.6).
+//!
+//! Extended attributes (§4.5 "Extended attributes"): each attribute's value is the body of an
+//! *attribute inode* — a file-bodied inode outside the namespace, named by the owner's
+//! [`XattrTable`] — so a value is content like any file's: chunked, sealed, deduplicated, charged to
+//! the quota, frozen by a snapshot at chunk granularity, and readable or writable at an offset (an
+//! NFSv4 named attribute is a file, RFC 8881 §5.3). Copying an owner for a new epoch copies only its
+//! table (names and numbers), never a value. The archive already records attribute values as chunks,
+//! not manifest bytes (`slates-archive` `NodeMeta::xattr_flags`).
 
 use slates_mem::Handle;
 
@@ -125,6 +133,75 @@ pub enum Body {
   Base(BaseBody),
 }
 
+/// An inode's extended attributes (§4.5): each name and the attribute inode that holds its value,
+/// sorted by name bytes so a lookup is a binary search and a listing is canonical. Names are byte
+/// strings, as the hosts' are (Linux names are C strings in a namespace, `user.x`; macOS names are
+/// UTF-8; an NFSv4 named attribute is a UTF-8 component), checked by [`crate::xattr::check_name`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct XattrTable {
+  /// `(name, attribute inode)`, ascending by name, names unique.
+  entries: Vec<(Box<[u8]>, InodeNo)>,
+}
+
+impl XattrTable {
+  /// The attribute inode holding `name`'s value, if the name is set.
+  pub fn get(&self, name: &[u8]) -> Option<InodeNo> {
+    self
+      .entries
+      .binary_search_by(|(held, _)| held.as_ref().cmp(name))
+      .ok()
+      .map(|at| self.entries[at].1)
+  }
+
+  /// Sets `name` to the attribute inode `no`, returning the inode it replaces.
+  pub fn insert(&mut self, name: &[u8], no: InodeNo) -> Option<InodeNo> {
+    match self
+      .entries
+      .binary_search_by(|(held, _)| held.as_ref().cmp(name))
+    {
+      Ok(at) => Some(std::mem::replace(&mut self.entries[at].1, no)),
+      Err(at) => {
+        self.entries.insert(at, (name.into(), no));
+        None
+      }
+    }
+  }
+
+  /// Removes `name`, returning the attribute inode that held its value.
+  pub fn remove(&mut self, name: &[u8]) -> Option<InodeNo> {
+    self
+      .entries
+      .binary_search_by(|(held, _)| held.as_ref().cmp(name))
+      .ok()
+      .map(|at| self.entries.remove(at).1)
+  }
+
+  /// The names and attribute inodes, ascending by name.
+  pub fn iter(&self) -> impl Iterator<Item = (&[u8], InodeNo)> {
+    self.entries.iter().map(|(name, no)| (name.as_ref(), *no))
+  }
+
+  /// How many attributes are set.
+  pub fn len(&self) -> usize {
+    self.entries.len()
+  }
+
+  /// Whether no attribute is set.
+  pub fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+
+  /// A table from `(name, attribute inode)` pairs in any order (a recovery rebuild); `None` when a
+  /// name repeats, which no volume produces.
+  pub fn from_pairs(mut pairs: Vec<(Box<[u8]>, InodeNo)>) -> Option<Self> {
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    if pairs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+      return None;
+    }
+    Some(Self { entries: pairs })
+  }
+}
+
 /// An inode version.
 #[derive(Clone, Debug)]
 pub struct Inode {
@@ -149,6 +226,13 @@ pub struct Inode {
   /// Whether the inode has ever had more than one link since it was made; then `home` names
   /// one of its paths and the deriver walks for the rest.
   pub multi: bool,
+  /// The extended attributes, `None` while the inode has none (most inodes: the table is never
+  /// allocated for them).
+  pub xattrs: Option<Box<XattrTable>>,
+  /// For an attribute inode, the inode whose attribute it holds; `None` for every namespace inode.
+  /// An attribute inode is in no directory, has one link (its owner's table) and is reclaimed with
+  /// its owner or when the attribute is removed or replaced.
+  pub attribute_of: Option<InodeNo>,
 }
 
 /// A file's place in the namespace: the parent directory's inode number and the hash of the
@@ -184,6 +268,8 @@ impl Inode {
       version: 0,
       home: None,
       multi: false,
+      xattrs: None,
+      attribute_of: None,
     }
   }
 }

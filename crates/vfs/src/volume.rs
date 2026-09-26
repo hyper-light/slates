@@ -1128,7 +1128,9 @@ impl Volume {
     self.live()?;
     names::check(name)?;
     let kind = self.kind(store, target)?;
-    if kind == Kind::Dir {
+    // A directory is never hard-linked; an attribute inode is in no directory and never enters one
+    // (§4.5 "Extended attributes").
+    if kind == Kind::Dir || self.is_attribute(store, target)? {
       return Err(VfsError::NotPermitted);
     }
     if self.inode(store, target)?.attrs.nlink >= LINK_MAX {
@@ -1416,6 +1418,29 @@ impl Volume {
     off: u64,
     bytes: &[u8],
   ) -> Result<usize, VfsError> {
+    self.write_with(store, no, off, bytes, Recorded::Yes)
+  }
+
+  /// A write whose content op is not journaled: the value of an attribute inode, whose owner's
+  /// `SetXattr` is the journaled change (§4.5 "Extended attributes").
+  pub(crate) fn write_unrecorded(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    bytes: &[u8],
+  ) -> Result<usize, VfsError> {
+    self.write_with(store, no, off, bytes, Recorded::No)
+  }
+
+  fn write_with(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    bytes: &[u8],
+    recorded: Recorded,
+  ) -> Result<usize, VfsError> {
     self.live()?;
     let end = off
       .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
@@ -1436,7 +1461,7 @@ impl Volume {
     // reopen does not consume returns at the end.
     let retention = self.retention_of_write(store, no, off, end)?;
     self.secure_retention(store, retention)?;
-    let written = self.write_secured(store, no, off, charge, bytes);
+    let written = self.write_secured(store, no, off, charge, bytes, recorded);
     self.settle_retention(store);
     written
   }
@@ -1450,6 +1475,7 @@ impl Volume {
     off: u64,
     charge: u64,
     bytes: &[u8],
+    recorded: Recorded,
   ) -> Result<usize, VfsError> {
     if !self
       .quota
@@ -1479,7 +1505,9 @@ impl Volume {
         len: u64::try_from(bytes.len()).unwrap_or(0),
       }
     };
-    self.record(op, "", Some(no), prev_version);
+    if recorded == Recorded::Yes {
+      self.record(op, "", Some(no), prev_version);
+    }
     Ok(bytes.len())
   }
 
@@ -2369,6 +2397,13 @@ impl Volume {
     Ok(no)
   }
 
+  /// Returns the most recently issued number's charge when its inode could not be installed (a slab
+  /// or table refusal right after [`Volume::next_no`]), so a refused create leaves the allowance as
+  /// it was. The counter is not rewound: a number is never issued twice within a volume.
+  pub(crate) fn unissue_no(&mut self) {
+    self.live_inodes = self.live_inodes.saturating_sub(1);
+  }
+
   /// The volume's live-inode count and its allowance (§4.2), for `statfs` and admission.
   pub const fn inode_usage(&self) -> (u64, u64) {
     (self.live_inodes, self.inode_allowance)
@@ -3107,7 +3142,20 @@ impl Volume {
 
   /// Reclaims an inode that has no links and no references: its content leaves the head's
   /// accounting, its number is freed and its version retired.
-  fn reclaim_inode(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+  ///
+  /// An owner's attributes go with it (§4.5 "Extended attributes"): each attribute inode its table
+  /// names loses its only link here (and is reclaimed, or kept as an orphan while a transport holds
+  /// it open).
+  pub(crate) fn reclaim_inode(&mut self, store: &mut Store, no: InodeNo) -> Result<(), VfsError> {
+    let attributes: Vec<InodeNo> = self
+      .inode(store, no)?
+      .xattrs
+      .as_deref()
+      .map(|table| table.iter().map(|(_, attribute)| attribute).collect())
+      .unwrap_or_default();
+    for attribute in attributes {
+      self.drop_link(store, attribute)?;
+    }
     let handle = self.make_current_inode(store, no)?;
     let born = store.inodes.get(handle)?.born;
     self.release_body(store, handle)?;
@@ -3597,6 +3645,14 @@ impl Volume {
       .journal
       .append(op, path, inode, self.epoch, at, prev_version);
   }
+}
+
+/// Whether a content write is journaled (a file's) or not (an attribute value's, whose owner's
+/// `SetXattr` is the journaled change).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recorded {
+  Yes,
+  No,
 }
 
 /// Head-reachable content bytes by birth epoch. `total` is `referenced_bytes`; `since(e)` is

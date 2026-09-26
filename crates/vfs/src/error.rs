@@ -18,6 +18,9 @@ pub enum VfsError {
   NotEmpty,
   /// `EINVAL` (a rename into its own subtree, an invalid argument).
   Invalid,
+  /// The extended attribute is not set: `ENOATTR` on macOS and the BSDs, `ENODATA` on Linux (the
+  /// same condition under each host's name; a bridge maps it to its host's code).
+  NoAttribute,
   /// `EPERM` (a hard link to a directory).
   NotPermitted,
   /// `EOPNOTSUPP`: regular-file I/O or host landing on a FIFO/socket name (A-26).
@@ -90,6 +93,7 @@ impl VfsError {
       Self::IsDirectory => "EISDIR",
       Self::NotEmpty => "ENOTEMPTY",
       Self::Invalid => "EINVAL",
+      Self::NoAttribute => "ENOATTR",
       Self::NotPermitted => "EPERM",
       Self::SpecialFileOperation => "EOPNOTSUPP",
       Self::InvalidName => "ENAMETOOLONG",

@@ -11,7 +11,8 @@ use slates_vfs::ids::{InodeNo, SnapshotId};
 use slates_vfs::inode::Kind;
 use slates_vfs::volume::{Store, Volume};
 
-use super::steps::Step;
+use super::steps::{Step, XattrMode};
+use slates_vfs::xattr::XattrSet;
 
 /// The directory at `path`, distinguishing a missing component (`ENOENT`) from one that is not
 /// a directory (`ENOTDIR`), as the kernel does.
@@ -105,16 +106,39 @@ pub(crate) fn apply_volume(
       })
     }
     Step::Snapshot => vol.snapshot(store).map(drop),
+    Step::SetXattr(pick, name, value, mode) => {
+      let target = pick_file(files, *pick)?;
+      file_at(vol, store, target)
+        .and_then(|no| vol.xattr_set(store, no, name.as_bytes(), value, xattr_set(*mode)))
+    }
+    Step::RemoveXattr(pick, name) => {
+      let target = pick_file(files, *pick)?;
+      file_at(vol, store, target).and_then(|no| vol.xattr_remove(store, no, name.as_bytes()))
+    }
   })
 }
 
+/// The volume's set mode for a generated one.
+pub(crate) fn xattr_set(mode: XattrMode) -> XattrSet {
+  match mode {
+    XattrMode::Either => XattrSet::Either,
+    XattrMode::Create => XattrSet::Create,
+    XattrMode::Replace => XattrSet::Replace,
+  }
+}
+
+/// A regular file's extended attributes: `(name, value)`, ascending by name.
+pub(crate) type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// A tree by paths: every directory with its sorted `(name, kind)` rows, every regular file's
-/// bytes and link count, every symlink's target.
+/// bytes and link count, every symlink's target, and every regular file's extended attributes
+/// (a file with none is absent).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PathState {
   pub(crate) dirs: Vec<(String, Vec<(String, char)>)>,
   pub(crate) files: BTreeMap<String, (Vec<u8>, u64)>,
   pub(crate) symlinks: BTreeMap<String, String>,
+  pub(crate) xattrs: BTreeMap<String, Xattrs>,
 }
 
 impl PathState {
@@ -170,6 +194,10 @@ fn walk(vol: &Volume, store: &Store, root: Handle<DirNode>, snap: Option<Snapsho
           }
         }
         Kind::File => {
+          let xattrs = xattr_rows(vol, store, snap, row.inode);
+          if !xattrs.is_empty() {
+            state.xattrs.insert(path.clone(), xattrs);
+          }
           state
             .files
             .insert(path, file_row(vol, store, snap, row.inode));
@@ -207,6 +235,31 @@ fn file_row(vol: &Volume, store: &Store, snap: Option<SnapshotId>, no: InodeNo) 
   };
   buf.truncate(n);
   (buf, u64::from(nlink))
+}
+
+fn xattr_rows(vol: &Volume, store: &Store, snap: Option<SnapshotId>, no: InodeNo) -> Xattrs {
+  let names = match snap {
+    Some(id) => vol.xattr_names_in(store, id, no).unwrap(),
+    None => vol.xattr_names(store, no).unwrap(),
+  };
+  names
+    .into_iter()
+    .map(|name| {
+      let len = match snap {
+        Some(id) => vol.xattr_len_in(store, id, no, &name).unwrap(),
+        None => vol.xattr_len(store, no, &name).unwrap(),
+      };
+      let mut value = vec![0u8; usize::try_from(len).unwrap()];
+      let n = match snap {
+        Some(id) => vol
+          .xattr_read_in(store, id, no, &name, 0, &mut value)
+          .unwrap(),
+        None => vol.xattr_read(store, no, &name, 0, &mut value).unwrap(),
+      };
+      value.truncate(n);
+      (name.to_vec(), value)
+    })
+    .collect()
 }
 
 fn symlink_row(vol: &Volume, store: &Store, snap: Option<SnapshotId>, no: InodeNo) -> String {

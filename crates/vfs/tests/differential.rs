@@ -35,8 +35,8 @@ use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
-use common::drive::{apply_volume, head_state, pick_file};
-use common::steps::{Step, step};
+use common::drive::{Xattrs, apply_volume, head_state, pick_file};
+use common::steps::{Step, XattrMode, step};
 use common::{store, volume_with};
 
 /// Format: the environment variable naming the RAM-backed directory.
@@ -89,6 +89,27 @@ fn probe_policy(root: &Path) -> NameEquivalence {
   }
 }
 
+/// Format: the attribute namespace the generated histories use (`common::steps::xattr_name`); the
+/// host's own attributes outside it (macOS stamps `com.apple.provenance` on files a process
+/// creates) are not the history's and are not compared (EQUIVALENCE §5).
+const XATTR_NAMESPACE: &[u8] = b"user.";
+
+/// Whether the host directory stores `user.` extended attributes: probed once, since a filesystem
+/// may not (tmpfs gained them in Linux 6.6). When it does not, the attribute steps of a history are
+/// not compared, and the run says so.
+fn probe_user_xattrs(root: &Path) -> bool {
+  let probe = root.join("probe-xattr");
+  fs::write(&probe, b"").unwrap();
+  let outcome = rustix::fs::setxattr(&probe, "user.probe", b"v", rustix::fs::XattrFlags::empty());
+  let _ = fs::remove_file(&probe);
+  match outcome {
+    Ok(()) => true,
+    Err(rustix::io::Errno::NOTSUP) => false,
+    #[allow(clippy::panic)] // A harness precondition: any other refusal is a broken host directory.
+    Err(other) => panic!("probing user xattrs on {}: {other}", root.display()),
+  }
+}
+
 /// A refusal as its errno name, or `OK`.
 fn host_outcome(r: io::Result<()>) -> String {
   match r {
@@ -119,6 +140,11 @@ fn errno_name(raw: i32) -> &'static str {
     libc::ENAMETOOLONG => "ENAMETOOLONG",
     libc::EXDEV => "EXDEV",
     libc::EACCES => "EACCES",
+    // The same condition under each host's name (VfsError::NoAttribute).
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    libc::ENOATTR => "ENOATTR",
+    #[cfg(target_os = "linux")]
+    libc::ENODATA => "ENOATTR",
     _ => "OTHER",
   }
 }
@@ -286,19 +312,67 @@ fn apply_host(step: &Step, root: &Path, files: &[String]) -> Option<io::Result<(
       })
     }
     Step::Snapshot => Ok(()),
+    Step::SetXattr(pick, name, value, mode) => {
+      let target = pick_file(files, *pick)?;
+      let flags = match mode {
+        XattrMode::Either => rustix::fs::XattrFlags::empty(),
+        XattrMode::Create => rustix::fs::XattrFlags::CREATE,
+        XattrMode::Replace => rustix::fs::XattrFlags::REPLACE,
+      };
+      rustix::fs::setxattr(
+        selected_host_file(root, target),
+        name.as_str(),
+        value,
+        flags,
+      )
+      .map_err(io::Error::from)
+    }
+    Step::RemoveXattr(pick, name) => {
+      let target = pick_file(files, *pick)?;
+      rustix::fs::removexattr(selected_host_file(root, target), name.as_str())
+        .map_err(io::Error::from)
+    }
   })
 }
 
+/// A host file's extended attributes in the history's namespace, ascending by name.
+fn host_xattrs(path: &Path) -> Xattrs {
+  let mut names = vec![0u8; rustix::fs::listxattr(path, &mut [0u8; 0][..]).unwrap()];
+  let listed = rustix::fs::listxattr(path, &mut names).unwrap();
+  names.truncate(listed);
+  let mut rows: Xattrs = names
+    .split(|byte| *byte == 0)
+    .filter(|name| name.starts_with(XATTR_NAMESPACE))
+    .map(|name| {
+      let name_str = std::str::from_utf8(name).unwrap();
+      let mut value = vec![0u8; rustix::fs::getxattr(path, name_str, &mut [0u8; 0][..]).unwrap()];
+      let read = rustix::fs::getxattr(path, name_str, &mut value).unwrap();
+      value.truncate(read);
+      (name.to_vec(), value)
+    })
+    .collect();
+  rows.sort();
+  rows
+}
+
+/// Whether a step is an extended-attribute step.
+fn is_xattr_step(step: &Step) -> bool {
+  matches!(step, Step::SetXattr(..) | Step::RemoveXattr(..))
+}
+
 /// The host's abstract state: per directory the sorted names with their kinds; per regular
-/// file its bytes and link count, by path.
+/// file its bytes and link count, by path; per regular file with any, its extended attributes in
+/// the history's namespace.
 type HostState = (
   Vec<(String, Vec<(String, char)>)>,
   BTreeMap<String, (Vec<u8>, u64)>,
+  BTreeMap<String, Xattrs>,
 );
 
 fn host_state(root: &Path) -> HostState {
   let mut dirs = Vec::new();
   let mut files = BTreeMap::new();
+  let mut xattrs = BTreeMap::new();
   let mut stack = vec![(String::new(), root.to_path_buf())];
   while let Some((prefix, dir)) = stack.pop() {
     let mut names = Vec::new();
@@ -321,6 +395,10 @@ fn host_state(root: &Path) -> HostState {
       if kind == 'd' {
         stack.push((path, entry.path()));
       } else if kind == 'f' {
+        let attributes = host_xattrs(&entry.path());
+        if !attributes.is_empty() {
+          xattrs.insert(path.clone(), attributes);
+        }
         files.insert(path, (fs::read(entry.path()).unwrap(), meta.nlink()));
       }
     }
@@ -328,7 +406,7 @@ fn host_state(root: &Path) -> HostState {
     dirs.push((prefix, names));
   }
   dirs.sort();
-  (dirs, files)
+  (dirs, files, xattrs)
 }
 
 // ------------------------------------------------------------------ the volume side
@@ -336,17 +414,24 @@ fn host_state(root: &Path) -> HostState {
 /// The volume's abstract state in the host's shape.
 fn volume_state(vol: &Volume, store: &Store) -> HostState {
   let s = head_state(vol, store);
-  (s.dirs, s.files)
+  (s.dirs, s.files, s.xattrs)
 }
 
 // ------------------------------------------------------------------ the run
 
 /// One history against both sides; a divergence is a test failure with the step named.
-fn run_case(steps: &[Step], case_root: &Path, policy: NameEquivalence) {
+/// `stores_xattrs` says whether the host stores `user.` attributes ([`probe_user_xattrs`]); when it does
+/// not, a history's attribute steps are applied to neither side. Returns how many attribute steps
+/// succeeded on both sides: the suite's non-vacuity counter for the attribute path.
+fn run_case(steps: &[Step], case_root: &Path, policy: NameEquivalence, stores_xattrs: bool) -> u64 {
+  let mut xattr_steps_applied = 0u64;
   let mut store = store();
   let mut vol = volume_with(&mut store, Quota::Bounded { limit: 1 << 40 }, policy);
   for step in steps {
-    let (dirs_before, files_before) = volume_state(&vol, &store);
+    if !stores_xattrs && is_xattr_step(step) {
+      continue;
+    }
+    let (dirs_before, files_before, _) = volume_state(&vol, &store);
     let refusals = rename_refusals(step, &dirs_before, policy);
     let files: Vec<String> = files_before.into_keys().collect();
     let (Some(host), Some(real)) = (
@@ -370,11 +455,16 @@ fn run_case(steps: &[Step], case_root: &Path, policy: NameEquivalence) {
       equivalent(&real, &host) || any_applicable_refusal,
       "outcome after {step:?}: volume {real}, host {host}"
     );
-    let (hd, hf) = host_state(case_root);
-    let (vd, vf) = volume_state(&vol, &store);
+    if is_xattr_step(step) && real == "OK" && host == "OK" {
+      xattr_steps_applied += 1;
+    }
+    let (hd, hf, hx) = host_state(case_root);
+    let (vd, vf, vx) = volume_state(&vol, &store);
     assert_eq!(vd, hd, "listings after {step:?}");
     assert_eq!(vf, hf, "files after {step:?}");
+    assert_eq!(vx, hx, "extended attributes after {step:?}");
   }
+  xattr_steps_applied
 }
 
 /// Measured: 300 cases of up to 40 steps run in about two seconds on tmpfs; CI raises the count
@@ -415,7 +505,7 @@ fn selected_files_and_aliases_agree_at_the_root_and_in_a_directory() {
       Step::Write(0, 0, b"survives".to_vec()),
     ]);
     let case_root = root.fresh_case(u64::try_from(case).unwrap()).unwrap();
-    run_case(&history, &case_root, policy);
+    run_case(&history, &case_root, policy, probe_user_xattrs(&root.path));
   }
 }
 
@@ -440,7 +530,7 @@ fn a_file_renamed_onto_a_non_empty_directory_may_report_either_refusal() {
     Step::Rename(b(), "C".to_owned(), Vec::new(), "b".to_owned()),
   ];
   let case_root = root.fresh_case(0).unwrap();
-  run_case(&history, &case_root, policy);
+  run_case(&history, &case_root, policy, probe_user_xattrs(&root.path));
 }
 
 /// AC-1.2: the volume and the host filesystem agree on every abstract state under the policy.
@@ -460,11 +550,18 @@ fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
   );
   let root = HostRoot::create(&base, "histories").unwrap();
   let policy = probe_policy(&root.path);
+  let host_xattrs = probe_user_xattrs(&root.path);
   println!(
-    "differential: host {} folds names: {}",
+    "differential: host {} folds names: {}; stores user xattrs: {host_xattrs}",
     base.display(),
     policy == NameEquivalence::Fold
   );
+  if !host_xattrs {
+    println!(
+      "differential: extended-attribute steps SKIPPED — {} does not store user.* attributes",
+      base.display()
+    );
+  }
   let mut runner = TestRunner::new(Config {
     cases: cases(),
     max_shrink_iters: 2000,
@@ -473,13 +570,14 @@ fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
     ..Config::default()
   });
   let counter = std::cell::Cell::new(0u64);
+  let xattr_steps = std::cell::Cell::new(0u64);
   let strategy = prop::collection::vec(step(), 1..40);
   let result = runner.run(&strategy, |steps| {
     let n = counter.get();
     counter.set(n + 1);
     let case_root = root.fresh_case(n).unwrap();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-      run_case(&steps, &case_root, policy);
+      xattr_steps.set(xattr_steps.get() + run_case(&steps, &case_root, policy, host_xattrs));
     }));
     let _ = fs::remove_dir_all(&case_root);
     outcome.map_err(|e| {
@@ -496,7 +594,12 @@ fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
     panic!("differential: {e}");
   }
   println!(
-    "differential: {} histories agreed with the host",
-    counter.get()
+    "differential: {} histories agreed with the host; {} extended-attribute steps succeeded on both sides",
+    counter.get(),
+    xattr_steps.get()
+  );
+  assert!(
+    !host_xattrs || xattr_steps.get() > 0,
+    "no extended-attribute step succeeded on both sides: the attribute path went unexercised"
   );
 }

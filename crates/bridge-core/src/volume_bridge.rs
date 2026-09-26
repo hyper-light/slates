@@ -311,6 +311,8 @@ impl<'v> VolumeBridge<'v> {
       | Op::Insert { .. }
       | Op::Delete { .. }
       | Op::Setattr
+      | Op::SetXattr { .. }
+      | Op::RemoveXattr { .. }
       | Op::Witness
       | Op::Drift => {
         if let Some(no) = inode {

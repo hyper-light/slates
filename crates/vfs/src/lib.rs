@@ -43,6 +43,7 @@ pub mod recover;
 pub mod snapshot;
 pub mod trie;
 pub mod volume;
+pub mod xattr;
 
 pub use error::VfsError;
 pub use ids::{Epoch, InodeNo, SnapshotId};

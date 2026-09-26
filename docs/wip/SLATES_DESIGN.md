@@ -1332,6 +1332,31 @@ case on a laptop; a live base retains its source-host dependency in a fleet.
 > convergence rule, tree sizes and acceptance allowance stay in force. Refused operations
 > fail the measurement. The dated snapshot benchmark report records the controlled experiment.
 
+**Extended attributes (A-32).** An inode holds a table of named attributes, sorted by name bytes.
+Each name maps to an *attribute inode*: a file-bodied inode in no directory whose body is the
+value. A value is therefore content like any file's. It is charged to the quota, sealed and
+deduplicated by the content store, frozen by a snapshot at chunk granularity, retained under the
+§4.2 rules, readable at an offset, and captured by recovery's inode walk. Copying an owner for a new
+epoch copies only its table, never a value.
+- Each attribute counts as one inode against the inode allowance (the §4.2 xattr dimension).
+- A set writes the value into a fresh attribute inode before the owner's table names it, so a
+  refusal leaves the old value in place.
+- A replaced or removed attribute inode loses its only link, and an owner that is reclaimed takes
+  its attributes with it; both follow the file rules for links and open references.
+- The journal records one `SetXattr`/`RemoveXattr` on the owner per verb. An attribute inode is
+  never linked into a directory and has no attributes of its own.
+- Rejected: values inline in the owner. Every copy-on-write of the owner would copy every value,
+  and a megabyte resource fork could be neither read at an offset nor deduplicated.
+
+> **A-32 status (2026-09-26).** The volume core is implemented (`crates/vfs/src/xattr.rs`, the
+> table in `inode.rs`, recovery image version 5). It is proven by the model oracle, which now
+> generates attribute steps charged by the file chunk rule, and by the host differential, which
+> compares every file's `user.*` attributes: APFS agreed on 3,000 histories (303 attribute steps
+> exercised in one run of 1,000) and Linux tmpfs on 1,000 (276 exercised). Owed: FUSE and WinFsp
+> serving the attribute calls, the macOS NFSv3 bridge translating AppleDouble sidecars into this
+> store (§4.6), export and archive carrying the values, landing writing them under a grant, and
+> the merge's attribute ops applied through this store.
+
 **Special names (A-26).** FIFO and UNIX socket inodes carry names, permissions, owners,
 times and hard-link identity, but no file contents. Snapshots, clones, recovery, archives
 and merge preserve this metadata; they never capture pipe buffers, listeners, connections
@@ -5787,3 +5812,27 @@ shard pulses, the client's reconnect pause, `ipc_bench`; unsafe-budget; GAPS, TB
 BENCHMARKS. Evidence: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
 The client region's layout changes (a client and a daemon of different layout versions refuse each
 other by name); no consensus rule or capability changes.
+
+### A-32 — The volume holds extended attributes; the macOS mount stays NFSv3 and translates AppleDouble sidecars (2026-09-26)
+
+The volume core held no extended attributes. FUSE answered `ENOSYS`, and macOS stored every attribute
+over the NFSv3 mount as a visible `._name` AppleDouble file: cargo's `._target` failed the workload
+suite against APFS. Two changes:
+
+1. **The volume holds attributes**, as attribute inodes named from a per-inode table (§4.5
+   "Extended attributes").
+2. **The macOS mount stays NFSv3.** The NFSv3 bridge presents `._name` as a view of `name`'s
+   attributes (§4.6), as Samba's `vfs_fruit` and Netatalk's `appledouble = ea` do.
+
+An NFSv4 replacement using named attributes was considered and rejected; D-2's rejection of NFSv4.0
+stands. The mount is loopback on one host, and agents' workloads are metadata-heavy and small-file,
+which is where v3 is the lighter protocol. v3 is also stateless, so a daemon restart or a fleet
+takeover under a live mount is a pause. Under v4, the in-RAM client and open state would be lost
+(R1 forbids persisting it), forcing a lease-long grace period (NFS4ERR_GRACE) and lease-loss errors.
+
+Applied in the same change to: §4.5 (extended attributes, status); `slates-vfs` (`xattr.rs`, the
+inode table and owner, `VfsError::NoAttribute`, the `SetXattr`/`RemoveXattr` journal ops,
+unjournaled attribute writes, reclaim of an owner's attributes, recovery image version 5, the model
+and differential suites); the shared bridge's invalidation of an owner on an attribute op; GAPS and
+TBD_FIXES. The AppleDouble translation (§4.6), and the FUSE and WinFsp attribute calls, follow as
+their own changes. The recovery image format changes; no consensus rule or wire protocol changes.

@@ -24,6 +24,25 @@ pub(crate) enum Step {
   /// up to this many bytes and insert these.
   Edit(u8, u16, u8, Vec<u8>),
   Snapshot,
+  /// Sets an extended attribute on a picked file: the name, the value, and how an existing
+  /// attribute is treated (§4.5 "Extended attributes").
+  SetXattr(u8, String, Vec<u8>, XattrMode),
+  /// Removes an extended attribute from a picked file.
+  RemoveXattr(u8, String),
+}
+
+/// How a generated set treats an existing attribute: `setxattr(2)`'s flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum XattrMode {
+  Either,
+  Create,
+  Replace,
+}
+
+/// Two attribute names in the `user.` namespace, the one every host accepts from an unprivileged
+/// process (Linux requires the prefix; macOS and APFS accept any name).
+pub(crate) fn xattr_name() -> impl Strategy<Value = String> {
+  prop_oneof![Just("user.a"), Just("user.b")].prop_map(str::to_owned)
 }
 
 /// Six names, two of them case variants of others, so folding policies are exercised.
@@ -70,5 +89,17 @@ pub(crate) fn step() -> impl Strategy<Value = Step> {
     )
       .prop_map(|(i, at, del, b)| Step::Edit(i, at, del, b)),
     Just(Step::Snapshot),
+    (
+      any::<u8>(),
+      xattr_name(),
+      prop::collection::vec(any::<u8>(), 0..40),
+      prop_oneof![
+        Just(XattrMode::Either),
+        Just(XattrMode::Create),
+        Just(XattrMode::Replace)
+      ]
+    )
+      .prop_map(|(i, n, v, m)| Step::SetXattr(i, n, v, m)),
+    (any::<u8>(), xattr_name()).prop_map(|(i, n)| Step::RemoveXattr(i, n)),
   ]
 }

@@ -20,6 +20,8 @@ unicode-normalization = { workspace = true }
 [dev-dependencies]
 libc = { workspace = true }
 proptest = { workspace = true }
+# The differential suite's host side sets, lists and removes extended attributes (§4.5).
+rustix = { workspace = true }
 
 # shuttle builds only under `RUSTFLAGS="--cfg shuttle"` for the randomized two-agent schedule of
 # T-1.6 (`tests/shuttle_clones.rs`); a dev-dependency, so nothing shipped links it.

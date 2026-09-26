@@ -17,12 +17,20 @@ use slates_vfs::inode::Kind;
 use slates_vfs::names::NameEquivalence;
 
 mod common;
-use common::steps::{Step, step};
+use common::steps::{Step, XattrMode, step};
 use common::{clone_config, store, volume};
 use slates_vfs::volume::{Store, Volume};
 
-/// Directory listings by path and file bytes by inode counter.
-type AbstractState = (Vec<(String, Vec<String>)>, BTreeMap<u64, Vec<u8>>);
+/// A file's extended attributes: `(name, value)`, ascending by name.
+type Xattrs = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Directory listings by path, file bytes by inode counter, and the extended attributes of every
+/// file that has any, by inode counter.
+type AbstractState = (
+  Vec<(String, Vec<String>)>,
+  BTreeMap<u64, Vec<u8>>,
+  BTreeMap<u64, Xattrs>,
+);
 
 // ------------------------------------------------------------------ the model
 
@@ -131,6 +139,9 @@ struct Model {
   root: BTreeMap<String, Node>,
   /// Inode contents by number (hard links share).
   files: BTreeMap<u64, ModelFile>,
+  /// Each file's extended attributes by name (§4.5): every value is an attribute inode's content,
+  /// charged by the same chunk rule as a file's.
+  xattrs: BTreeMap<u64, BTreeMap<String, ModelFile>>,
   links: BTreeMap<u64, u32>,
   next_ino: u64,
   quota: u64,
@@ -157,20 +168,107 @@ impl Model {
     }
   }
 
-  fn referenced(&self) -> u64 {
+  /// Every content body the head holds: the files and the attribute values.
+  fn bodies(&self) -> impl Iterator<Item = &ModelFile> {
     self
       .files
       .values()
+      .chain(self.xattrs.values().flat_map(BTreeMap::values))
+  }
+
+  fn referenced(&self) -> u64 {
+    self
+      .bodies()
       .map(|f| f.charged(self.page, self.chunk))
       .sum()
   }
 
   fn unique(&self) -> u64 {
     self
-      .files
-      .values()
+      .bodies()
       .map(|f| f.unique(self.last_snapshot, self.page, self.chunk))
       .sum()
+  }
+
+  /// Drops a file whose last link went: its content and its attributes with it (§4.5).
+  fn forget(&mut self, ino: u64) {
+    self.files.remove(&ino);
+    self.links.remove(&ino);
+    self.xattrs.remove(&ino);
+  }
+
+  /// Sets an extended attribute (§4.5 "Extended attributes"). The flags are checked first; past
+  /// them the attempt issues one inode number whatever follows (the counter never rewinds). The new
+  /// value is written into a fresh attribute body under the file chunk rule, admitted while the old
+  /// value is still charged; only then does it replace the old one. The owner's record is copied, so
+  /// its inline bytes are reborn.
+  fn set_xattr(
+    &mut self,
+    ino: u64,
+    name: &str,
+    value: &[u8],
+    mode: XattrMode,
+  ) -> Result<(), VfsError> {
+    if !self.files.contains_key(&ino) {
+      return Err(VfsError::NotFound);
+    }
+    let exists = self
+      .xattrs
+      .get(&ino)
+      .is_some_and(|set| set.contains_key(name));
+    match (mode, exists) {
+      (XattrMode::Create, true) => return Err(VfsError::AlreadyExists),
+      (XattrMode::Replace, false) => return Err(VfsError::NoAttribute),
+      _ => {}
+    }
+    self.next_ino += 1;
+    let epoch = self.epoch;
+    let mut fresh = ModelFile {
+      inline: true,
+      inline_born: epoch,
+      ..Default::default()
+    };
+    if !value.is_empty() {
+      let end = u64::try_from(value.len()).unwrap();
+      let windows = fresh.windows_after(0, end, self.chunk, self.inline, epoch);
+      let after = windows.as_ref().map_or(end, |w| self.charged_windows(w));
+      if self.referenced() + after > self.quota {
+        return Err(VfsError::NoSpace);
+      }
+      match windows {
+        Some(w) => {
+          fresh.windows = w;
+          fresh.inline = false;
+        }
+        None => fresh.inline_len = end,
+      }
+      fresh.bytes = value.to_vec();
+    }
+    self
+      .xattrs
+      .entry(ino)
+      .or_default()
+      .insert(name.to_owned(), fresh);
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.inline_born = epoch;
+    }
+    Ok(())
+  }
+
+  /// Removes an extended attribute; the owner's record is copied.
+  fn remove_xattr(&mut self, ino: u64, name: &str) -> Result<(), VfsError> {
+    if !self.files.contains_key(&ino) {
+      return Err(VfsError::NotFound);
+    }
+    let set = self.xattrs.get_mut(&ino).ok_or(VfsError::NoAttribute)?;
+    set.remove(name).ok_or(VfsError::NoAttribute)?;
+    if set.is_empty() {
+      self.xattrs.remove(&ino);
+    }
+    if let Some(f) = self.files.get_mut(&ino) {
+      f.inline_born = self.epoch;
+    }
+    Ok(())
   }
 
   /// The charge of a window map.
@@ -286,8 +384,7 @@ impl Model {
     let links = self.links.entry(ino).or_insert(1);
     *links -= 1;
     if *links == 0 {
-      self.files.remove(&ino);
-      self.links.remove(&ino);
+      self.forget(ino);
     } else if let Some(f) = self.files.get_mut(&ino) {
       // The surviving record is copied for its link count.
       f.inline_born = self.epoch;
@@ -472,8 +569,7 @@ impl Model {
       let links = self.links.entry(ino).or_insert(1);
       *links -= 1;
       if *links == 0 {
-        self.files.remove(&ino);
-        self.links.remove(&ino);
+        self.forget(ino);
       }
     }
     let fd = self.dir_mut(from_dir).unwrap();
@@ -540,6 +636,17 @@ impl Model {
         .iter()
         .map(|(k, f)| (*k, f.bytes.clone()))
         .collect(),
+      self
+        .xattrs
+        .iter()
+        .map(|(ino, set)| {
+          let rows = set
+            .iter()
+            .map(|(name, value)| (name.as_bytes().to_vec(), value.bytes.clone()))
+            .collect();
+          (*ino, rows)
+        })
+        .collect(),
     )
   }
 }
@@ -550,6 +657,7 @@ impl Model {
 fn real_state(vol: &Volume, store: &Store) -> AbstractState {
   let mut dirs = Vec::new();
   let mut files = BTreeMap::new();
+  let mut xattrs = BTreeMap::new();
   let mut stack = vec![(String::new(), vol.root())];
   while let Some((prefix, dir)) = stack.pop() {
     let rows = vol.readdir(store, dir).unwrap();
@@ -566,6 +674,10 @@ fn real_state(vol: &Volume, store: &Store) -> AbstractState {
         }
         Kind::File => {
           files.insert(row.inode.counter(), read_all(vol, store, row.inode));
+          let rows = read_xattrs(vol, store, row.inode);
+          if !rows.is_empty() {
+            xattrs.insert(row.inode.counter(), rows);
+          }
         }
         Kind::Symlink => {}
         #[allow(clippy::panic)] // Harness invariant: these generated operations never create IPC.
@@ -574,7 +686,22 @@ fn real_state(vol: &Volume, store: &Store) -> AbstractState {
     }
   }
   dirs.sort();
-  (dirs, files)
+  (dirs, files, xattrs)
+}
+
+fn read_xattrs(vol: &Volume, store: &Store, ino: InodeNo) -> Xattrs {
+  vol
+    .xattr_names(store, ino)
+    .unwrap()
+    .into_iter()
+    .map(|name| {
+      let len = vol.xattr_len(store, ino, &name).unwrap();
+      let mut value = vec![0u8; usize::try_from(len).unwrap()];
+      let n = vol.xattr_read(store, ino, &name, 0, &mut value).unwrap();
+      value.truncate(n);
+      (name.to_vec(), value)
+    })
+    .collect()
 }
 
 fn read_all(vol: &Volume, store: &Store, ino: InodeNo) -> Vec<u8> {
@@ -617,9 +744,13 @@ type Outcomes = (Result<(), VfsError>, Result<(), VfsError>);
 /// One step against both the volume and the model.
 fn apply(step: &Step, vol: &mut Volume, store: &mut Store, model: &mut Model) -> Option<Outcomes> {
   match step {
-    Step::Link(..) | Step::Write(..) | Step::Truncate(..) | Step::Edit(..) | Step::Snapshot => {
-      apply_content(step, vol, store, model)
-    }
+    Step::Link(..)
+    | Step::Write(..)
+    | Step::Truncate(..)
+    | Step::Edit(..)
+    | Step::Snapshot
+    | Step::SetXattr(..)
+    | Step::RemoveXattr(..) => apply_content(step, vol, store, model),
     _ => Some(apply_names(step, vol, store, model)),
   }
 }
@@ -715,6 +846,26 @@ fn apply_content(
       model.snapshot();
       (Ok(()), Ok(()))
     }
+    Step::SetXattr(pick, name, value, mode) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        vol.xattr_set(
+          store,
+          InodeNo::compose(7, ino),
+          name.as_bytes(),
+          value,
+          common::drive::xattr_set(*mode),
+        ),
+        model.set_xattr(ino, name, value, *mode),
+      )
+    }
+    Step::RemoveXattr(pick, name) => {
+      let ino = ino_of(model, *pick)?;
+      (
+        vol.xattr_remove(store, InodeNo::compose(7, ino), name.as_bytes()),
+        model.remove_xattr(ino, name),
+      )
+    }
     _ => (Ok(()), Ok(())),
   })
 }
@@ -747,10 +898,14 @@ fn run(steps: Vec<Step>, quota: u64) {
       continue;
     };
     assert_eq!(real, expected, "step {step:?}");
-    let (real_dirs, real_files) = real_state(&vol, &store);
-    let (model_dirs, model_files) = model.abstract_state();
+    let (real_dirs, real_files, real_xattrs) = real_state(&vol, &store);
+    let (model_dirs, model_files, model_xattrs) = model.abstract_state();
     assert_eq!(real_dirs, model_dirs, "listings after {step:?}");
     assert_eq!(real_files, model_files, "bytes after {step:?}");
+    assert_eq!(
+      real_xattrs, model_xattrs,
+      "extended attributes after {step:?}"
+    );
     assert_eq!(
       vol.accounting().referenced_bytes,
       model.referenced(),

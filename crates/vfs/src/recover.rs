@@ -48,8 +48,9 @@ const IMAGE_MAGIC: u32 = u32::from_le_bytes(*b"SLR1");
 const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// Format: the image layout version, bumped with any change to the types below. 3 (2026-09-15): a
 /// file's body is its held runs at their offsets, not one vector of its logical length.
-/// 4 (A-26): FIFO/socket kinds with empty bodies and zero size.
-const IMAGE_VERSION: u16 = 4;
+/// 4 (A-26): FIFO/socket kinds with empty bodies and zero size. 5 (§4.5, 2026-09-26): each inode's
+/// extended-attribute table and, for an attribute inode, its owner.
+const IMAGE_VERSION: u16 = 5;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -229,6 +230,21 @@ pub struct InodeImage {
   pub multi: bool,
   /// The body.
   pub body: BodyImage,
+  /// The extended attributes (§4.5): each name and the attribute inode holding its value, ascending
+  /// by name. Image version 5.
+  pub xattrs: Vec<XattrImage>,
+  /// For an attribute inode, the inode whose attribute it holds. Image version 5.
+  pub attribute_of: Option<u64>,
+}
+
+/// One extended attribute of an inode in an image: its name and the attribute inode (captured like
+/// any inode in the same image) that holds its value.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct XattrImage {
+  /// The attribute name.
+  pub name: Vec<u8>,
+  /// The attribute inode's number.
+  pub attribute: u64,
 }
 
 /// A snapshot's slot and generation in the image — the same pair a [`crate::ids::SnapshotId`]
@@ -916,6 +932,20 @@ impl Volume {
       }),
       multi: inode.multi,
       body,
+      xattrs: inode
+        .xattrs
+        .as_deref()
+        .map(|table| {
+          table
+            .iter()
+            .map(|(name, attribute)| XattrImage {
+              name: name.to_vec(),
+              attribute: attribute.0,
+            })
+            .collect()
+        })
+        .unwrap_or_default(),
+      attribute_of: inode.attribute_of.map(|owner| owner.0),
     })
   }
 
@@ -1585,8 +1615,45 @@ impl Volume {
         hash: h.hash,
       });
       inode.attrs = attrs_from_image(&image_inode.attrs);
+      inode.attribute_of = image_inode.attribute_of.map(InodeNo);
+    }
+    // Tables after every identity: an attribute inode is checked in the rebuilt table, where a
+    // snapshot's shared attribute inode (in its `shared` list, not `inodes`) is also found.
+    for image_inode in inodes.iter().filter(|image| !image.xattrs.is_empty()) {
+      let owner = InodeNo(image_inode.no);
+      let table = self.xattrs_from_image(store, &image_inode.xattrs, owner)?;
+      let handle =
+        trie::get(&store.tries, self.inode_root, owner).ok_or(VfsError::RecoveryIncomplete)?;
+      store.inodes.get_mut(handle)?.xattrs = Some(table);
     }
     Ok(())
+  }
+
+  /// An owner's attribute table from its image. Refuses `RecoveryIncomplete` when a name repeats or
+  /// is not a valid attribute name, or when a named inode is not in the rebuilt table as an attribute
+  /// of this owner: an image no volume could have written, so the rebuild refuses rather than present
+  /// attributes that are not the volume's (§4.8).
+  fn xattrs_from_image(
+    &self,
+    store: &Store,
+    xattrs: &[XattrImage],
+    owner: InodeNo,
+  ) -> Result<Box<crate::inode::XattrTable>, VfsError> {
+    let mut pairs = Vec::with_capacity(xattrs.len());
+    for xattr in xattrs {
+      crate::xattr::check_name(&xattr.name).map_err(|_| VfsError::RecoveryIncomplete)?;
+      let attribute = InodeNo(xattr.attribute);
+      let held = trie::get(&store.tries, self.inode_root, attribute)
+        .and_then(|handle| store.inodes.get(handle).ok())
+        .and_then(|inode| inode.attribute_of);
+      if held != Some(owner) {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      pairs.push((xattr.name.clone().into_boxed_slice(), attribute));
+    }
+    crate::inode::XattrTable::from_pairs(pairs)
+      .map(Box::new)
+      .ok_or(VfsError::RecoveryIncomplete)
   }
 }
 

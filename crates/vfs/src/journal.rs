@@ -64,6 +64,16 @@ pub enum Op {
   },
   /// Mode or ownership changed.
   Setattr,
+  /// The extended attribute `name` set on the inode (§4.5 "Extended attributes").
+  SetXattr {
+    /// The attribute name.
+    name: Box<[u8]>,
+  },
+  /// The extended attribute `name` removed from the inode.
+  RemoveXattr {
+    /// The attribute name.
+    name: Box<[u8]>,
+  },
   /// A whiteout written over a base-backed name.
   Whiteout,
   /// A base entry witnessed (copied up).
@@ -104,6 +114,7 @@ impl OpRecord {
     let paths = self.path.len()
       + match &self.op {
         Op::Rename { from } | Op::Redirect { from } => from.len(),
+        Op::SetXattr { name } | Op::RemoveXattr { name } => name.len(),
         _ => 0,
       };
     std::mem::size_of::<OpRecord>() + paths
