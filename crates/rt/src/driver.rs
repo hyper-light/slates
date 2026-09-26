@@ -58,9 +58,9 @@ pub enum Kick {
   /// Trigger the `EVFILT_USER` event on a kqueue (macOS / BSD).
   #[cfg(any(target_os = "macos", target_os = "freebsd"))]
   Kqueue(KickFd),
-  /// Post a completion packet to a port (Windows), by its exposed address.
+  /// Post a completion packet to a completion port (Windows) the registry owns.
   #[cfg(target_os = "windows")]
-  Iocp(usize),
+  Iocp(KickPort),
   /// Set the simulation's kicked flag.
   Sim(SlotHolder),
   /// No driver to kick (registry entries in tests).
@@ -95,6 +95,37 @@ impl KickFd {
   }
 }
 
+/// A copyable, generational name for a registry-owned completion port (Windows; §4.3, D-8): the
+/// counterpart of [`KickFd`]. The registry closes the port only after the shard's contexts ended and
+/// every foreign borrow of it returned, so a kick copied before retirement is a typed miss afterwards,
+/// never a packet posted to a handle value the process has since reused.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct KickPort {
+  holder: SlotHolder,
+}
+
+#[cfg(windows)]
+impl KickPort {
+  pub(crate) fn new(holder: SlotHolder) -> Self {
+    Self { holder }
+  }
+
+  /// Runs `f` with the port's raw handle value while this registration's port is pinned.
+  pub fn with<R>(&self, f: impl FnOnce(usize) -> R) -> Option<R> {
+    crate::registry::with_holder(self.holder, |entry| {
+      entry.kick_port.as_ref().map(|port| f(port.raw()))
+    })
+    .flatten()
+  }
+
+  /// The port's raw handle value, for the owning shard's driver: valid while the shard lives, since
+  /// its registration is retired only after its thread has ended.
+  pub fn raw(&self) -> Option<usize> {
+    self.with(|raw| raw)
+  }
+}
+
 impl Kick {
   /// A kick that does nothing.
   pub const fn none() -> Kick {
@@ -112,7 +143,9 @@ impl Kick {
       #[cfg(any(target_os = "macos", target_os = "freebsd"))]
       Kick::Kqueue(kq) => crate::kqueue::trigger(kq),
       #[cfg(target_os = "windows")]
-      Kick::Iocp(port) => crate::iocp::post_kick(*port),
+      Kick::Iocp(port) => {
+        let _ = port.with(crate::iocp::post_kick);
+      }
       Kick::Sim(holder) => {
         let _ = crate::registry::with_holder(*holder, |entry| {
           if let Some(shared) = &entry.sim_shared {
@@ -186,8 +219,11 @@ pub struct Prepared {
   /// kick is not a descriptor (Windows' completion port, the simulation).
   #[cfg(unix)]
   pub kick_fd: Option<std::os::fd::OwnedFd>,
-  /// Windows: no descriptor-owned kick; the port is the driver's.
-  #[cfg(not(unix))]
+  /// Windows: the completion port, which the slot owns and closes at retirement.
+  #[cfg(windows)]
+  pub kick_fd: Option<crate::iocp::Port>,
+  /// Elsewhere: no OS driver.
+  #[cfg(not(any(unix, windows)))]
   pub kick_fd: Option<()>,
   /// What was probed and chosen.
   pub notes: Vec<String>,
@@ -256,11 +292,16 @@ pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
 /// Prepares the OS driver for this platform.
 #[cfg(target_os = "windows")]
 pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
-  let port = crate::iocp::prepare()?;
   Ok(Prepared {
-    kick_fd: None,
-    seed: Box::new(move |_kick| {
-      Ok(Box::new(crate::iocp::IocpDriver::from_prepared(port)) as Box<dyn Driver>)
+    kick_fd: Some(crate::iocp::prepare()?),
+    seed: Box::new(|kick| match kick {
+      Kick::Iocp(port) => {
+        Ok(Box::new(crate::iocp::IocpDriver::from_prepared(port)?) as Box<dyn Driver>)
+      }
+      _ => Err(RtError::DriverRefused {
+        call: "IOCP driver without its completion port",
+        code: None,
+      }),
     }),
     notes: Vec::new(),
   })
@@ -308,7 +349,9 @@ mod tests {
     let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     eprintln!("driver {} notes {notes:?}", driver.kind().name());
-    let kick = driver.kick_handle();
+    // The registry's kick, the one every sender uses (`kick_if_parked`), not the driver's own
+    // handle: a registration whose kick reached nothing (Windows registered none until 2026-09-26)
+    // passed while the driver's handle was the one tested.
     let mut out = Vec::new();
     // A kick from another thread ends an unbounded wait.
     std::thread::scope(|scope| {

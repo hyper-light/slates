@@ -276,6 +276,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
+      # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
+      # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
+      - name: Test the IOCP driver's kick and no-op (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: 'cargo test -p slates-rt --lib driver::'
       - name: Test the AFD readiness over loopback UDP (native Windows)
         if: ${{ !cancelled() }}
         timeout-minutes: 15
@@ -406,6 +412,12 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-ipc --test delivery
+      # The IOCP driver woken by the registry's kick, the one every sender uses: a parked shard that no
+      # kick reached never ran a spawn or a shutdown (docs/bugs/2026-09-26-windows-shards-were-never-kicked.md).
+      - name: Test the IOCP driver's kick and no-op (Windows nightly)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: 'cargo test -p slates-rt --lib driver::'
       - name: Test the AFD readiness over loopback UDP (Windows nightly)
         if: ${{ !cancelled() }}
         timeout-minutes: 15

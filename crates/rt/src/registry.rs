@@ -69,6 +69,9 @@ pub struct Entry {
   /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
   #[cfg(unix)]
   pub(crate) kick_fd: Option<std::os::fd::OwnedFd>,
+  /// The completion port, closed after the owning contexts and foreign borrows end (Windows).
+  #[cfg(windows)]
+  pub(crate) kick_port: Option<crate::iocp::Port>,
   /// A simulated shard's flags, owned until its contexts and foreign kick borrows end.
   /// A copied kick carries the registration, never a reference to these flags.
   pub sim_shared: Option<Box<crate::sim::SimShared>>,
@@ -316,6 +319,8 @@ pub fn register(
       kick: Kick::None,
       #[cfg(unix)]
       kick_fd: None,
+      #[cfg(windows)]
+      kick_port: None,
       sim_shared: None,
       pair_rings: Vec::new(),
       ring_full_events: AtomicU64::new(0),
@@ -330,6 +335,11 @@ pub fn register(
         entry.kick_fd = Some(fd);
         form(KickFd::new(holder))
       }
+      #[cfg(windows)]
+      RegisterKick::Port(port) => {
+        entry.kick_port = Some(port);
+        Kick::Iocp(crate::driver::KickPort::new(holder))
+      }
       RegisterKick::Sim(shared) => {
         entry.sim_shared = Some(shared);
         Kick::Sim(holder)
@@ -343,15 +353,18 @@ pub fn register(
   Err(RtError::TooManyShards { max })
 }
 
-/// What a registration hands the slot for its kick: a ready [`Kick`] (the simulation's shared flag,
-/// Windows' completion port, or none), or a descriptor the slot takes ownership of together with the
-/// kick form to mint over it (Unix: an eventfd or a kqueue).
+/// What a registration hands the slot for its kick: a ready [`Kick`] (none), the simulation's shared
+/// flags, or an OS object the slot takes ownership of and mints the kick over (Unix: an eventfd or a
+/// kqueue descriptor with its kick form; Windows: the completion port).
 pub enum RegisterKick {
   /// A kick that owns nothing the slot must close.
   Kick(Kick),
   /// A descriptor the slot owns; the function mints the kick over the slot's owned form of it.
   #[cfg(unix)]
   Descriptor(std::os::fd::OwnedFd, fn(KickFd) -> Kick),
+  /// A completion port the slot owns (Windows); the kick is minted over the slot's owned port.
+  #[cfg(windows)]
+  Port(crate::iocp::Port),
   /// A simulated shard's driver flags, owned by the slot; the kick is minted over them.
   Sim(Box<crate::sim::SimShared>),
 }

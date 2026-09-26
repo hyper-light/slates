@@ -240,8 +240,8 @@ pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
   Ok(())
 }
 
-/// The slot's kick for an OS driver: its descriptor, owned by the slot (Unix), or none (Windows: the
-/// completion port is the driver's).
+/// The slot's kick for an OS driver: its descriptor (Unix) or its completion port (Windows), owned by
+/// the slot and closed when the slot retires the registration.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::RegisterKick {
   match fd {
@@ -258,7 +258,15 @@ pub(crate) fn register_kick(fd: Option<std::os::fd::OwnedFd>) -> registry::Regis
   }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn register_kick(port: Option<crate::iocp::Port>) -> registry::RegisterKick {
+  match port {
+    Some(port) => registry::RegisterKick::Port(port),
+    None => registry::RegisterKick::Kick(Kick::None),
+  }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
   registry::RegisterKick::Kick(Kick::None)
 }

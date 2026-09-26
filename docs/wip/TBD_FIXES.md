@@ -59,8 +59,11 @@ authorized merely by appearing here.
   per doorbell (a named Event on Windows) and one READY Event per claim slot; the doorbell thread no
   longer spins. Proof owed to the next Windows run. See
   `docs/bugs/2026-09-26-windows-rings-and-claims-used-the-unsupported-word-wake.md`.
-- [ ] **Windows UDP receive tests hang** (both, past 15 minutes, ending in an unbounded shutdown). The
-  tests now bound the shutdown and report the shard's pulse; diagnose from the next run's report.
+- [x] **Run 36260818113: Windows shards were never kicked.** The runtime registered `Kick::None` on
+  Windows, so a parked shard ran a spawn or a shutdown only when a timer or an I/O completion woke it.
+  The UDP tests' new pulse report showed it (steps and waits frozen). The registry now owns the
+  completion port with a generational `KickPort`. Proof owed to the next Windows run. See
+  `docs/bugs/2026-09-26-windows-shards-were-never-kicked.md`.
 - [ ] **The anchor segment on Windows: `CreateFileMappingW` 1450.** 167–188 GB derived, which a
   pagefile section is charged in full at creation. Reserve the section and commit on first use.
 - [ ] **Serve ports are still bound-then-released.** A test's own dialers could take its next node's port;

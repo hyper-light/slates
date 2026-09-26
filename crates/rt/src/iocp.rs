@@ -10,7 +10,7 @@ use windows_sys::Win32::System::IO::{
 };
 
 use crate::afd::{Afd, Block, READABLE_EVENTS, WRITABLE_EVENTS, base_socket};
-use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since};
+use crate::driver::{Completion, Driver, DriverKind, Kick, KickPort, nanos_since};
 use crate::error::RtError;
 
 /// Format: the completion key that marks a kick.
@@ -24,9 +24,35 @@ const AFD_KEY: usize = usize::MAX - 2;
 /// Shape: entries drained per wait (see the kqueue driver for the reasoning).
 const EVENTS_PER_WAIT: usize = 64;
 
-/// The driver.
+/// A completion port the registry slot owns (§4.3, D-8), closed when the slot retires its
+/// registration — after the shard's thread has ended and every foreign kick borrowing it has returned —
+/// so a late kick can never post to a handle value the process has since reused. Kept as its exposed
+/// address so it is `Send` without an unsafe impl.
+#[derive(Debug)]
+pub struct Port {
+  handle: usize,
+}
+
+impl Port {
+  /// The port's raw handle value.
+  pub(crate) fn raw(&self) -> usize {
+    self.handle
+  }
+}
+
+impl Drop for Port {
+  fn drop(&mut self) {
+    let handle: HANDLE = std::ptr::with_exposed_provenance_mut(self.handle);
+    // SAFETY: the port was created by `prepare` and is owned by this value alone; closed once here.
+    unsafe { CloseHandle(handle) };
+  }
+}
+
+/// The driver. It borrows its port from the registry slot (see [`Port`]) and never closes it.
 pub struct IocpDriver {
   port: HANDLE,
+  /// The registry's kick over this driver's port.
+  kick: KickPort,
   epoch: Instant,
   entries: Vec<OVERLAPPED_ENTRY>,
   /// The AFD readiness device, opened and associated with `port` on the first socket registration
@@ -43,30 +69,37 @@ impl std::fmt::Debug for IocpDriver {
   }
 }
 
-/// Creates the port with one concurrent thread (the shard); returns its exposed address, which
-/// the kick carries and the shard's thread builds the driver from.
-pub fn prepare() -> Result<usize, RtError> {
+/// Creates the port with one concurrent thread (the shard), for the registry slot to own.
+pub fn prepare() -> Result<Port, RtError> {
   // SAFETY: creating a fresh port; the result is checked.
   let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 1) };
   if port.is_null() {
     return Err(RtError::os("CreateIoCompletionPort"));
   }
-  Ok(port.expose_provenance())
+  Ok(Port {
+    handle: port.expose_provenance(),
+  })
 }
 
 impl IocpDriver {
-  /// Builds the driver over a prepared port, on the shard's thread.
-  pub fn from_prepared(port: usize) -> IocpDriver {
+  /// Builds the driver over the port the registry slot owns, on the shard's thread. Refused when the
+  /// registration no longer holds a port (it was retired).
+  pub fn from_prepared(kick: KickPort) -> Result<IocpDriver, RtError> {
+    let port = kick.raw().ok_or(RtError::DriverRefused {
+      call: "IOCP driver over a retired registration",
+      code: None,
+    })?;
     // SAFETY: an all-zero OVERLAPPED_ENTRY is a valid, empty record.
     let entries = (0..EVENTS_PER_WAIT)
       .map(|_| unsafe { std::mem::zeroed() })
       .collect();
-    IocpDriver {
+    Ok(IocpDriver {
       port: std::ptr::with_exposed_provenance_mut(port),
+      kick,
       epoch: Instant::now(),
       entries,
       afd: None,
-    }
+    })
   }
 
   /// The AFD readiness device, opened and associated with this port on first use (§4.6). Lazily,
@@ -104,18 +137,13 @@ impl IocpDriver {
   }
 }
 
-/// Posts a kick packet; safe from any thread.
+/// Posts a kick packet to `port`, a live port the caller has pinned ([`KickPort::with`]); safe from
+/// any thread. A failed post means the port is being torn down with its shard, the documented outcome
+/// of a kick to an exiting shard (`Kick::kick`).
 pub fn post_kick(port: usize) {
   let handle: HANDLE = std::ptr::with_exposed_provenance_mut(port);
-  // SAFETY: a valid port handle (a closed one fails harmlessly).
+  // SAFETY: the caller pinned the registration that owns this port, so the handle is open.
   unsafe { PostQueuedCompletionStatus(handle, 0, KICK_KEY, std::ptr::null_mut()) };
-}
-
-impl Drop for IocpDriver {
-  fn drop(&mut self) {
-    // SAFETY: ours to close.
-    unsafe { CloseHandle(self.port) };
-  }
 }
 
 impl Driver for IocpDriver {
@@ -124,7 +152,7 @@ impl Driver for IocpDriver {
   }
 
   fn kick_handle(&self) -> Kick {
-    Kick::Iocp(self.port.expose_provenance())
+    Kick::Iocp(self.kick)
   }
 
   fn now_ns(&self) -> u64 {
