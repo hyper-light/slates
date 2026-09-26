@@ -150,19 +150,22 @@ impl EsLogger {
     self.check(ready)
   }
 
-  /// Stops eslogger once the stream is known to be caught up: `mark` runs the binary once more, and the
-  /// stop waits until that run's events are in the log, so every event before it (the daemon's teardown
-  /// included) was delivered and filtered. Fails when the kernel dropped any event for this client.
-  fn stop(
-    mut self,
-    log: &Path,
-    mut mark: impl FnMut() -> Result<(), Failure>,
-  ) -> Result<Filtered, Failure> {
-    let before = std::fs::read_to_string(log)?.lines().count();
-    mark()?;
-    let caught_up = self
-      .process
-      .wait_ready(|| Ok(std::fs::read_to_string(log)?.lines().count() > before));
+  /// Stops eslogger once the stream is known to be caught up. The binary at `marker` runs once more, as a
+  /// child whose process id is known, and the stop waits until an event *of that process* is in the log.
+  /// Endpoint Security hands this client its events in `global_seq_num` order, and the filter fails the
+  /// run on any gap, so once the marker's event is logged every event before it (the landing and the
+  /// daemon's teardown included) was delivered and filtered. Waiting for the log merely to grow was a
+  /// race: a lagging older event grew it, eslogger was stopped at once, and the events it had not yet
+  /// written were lost (CI run 36275755772: the kept trace ended 11 ms after the landing plan, and none
+  /// of the landing's six creates was in it; docs/bugs/2026-09-26-the-eslogger-stop-raced-its-own-stream.md).
+  /// Fails when the kernel dropped any event for this client.
+  fn stop(mut self, log: &Path, marker: &Path) -> Result<Filtered, Failure> {
+    let marked = run_marker(marker);
+    let caught_up = marked.and_then(|pid| {
+      self
+        .process
+        .wait_ready(|| Ok(has_event_of_process(&std::fs::read_to_string(log)?, pid)))
+    });
     let stopped = caught_up.and_then(|()| self.process.stop_accepting(terminated_by_term));
     let filtered = self
       .filter
@@ -195,6 +198,36 @@ impl EsLogger {
       diagnostic.trim()
     ))
   }
+}
+
+/// Runs the binary once (`--help`, which touches nothing but its own loading) as the stream's drain
+/// marker, and returns its process id once it has exited.
+fn run_marker(marker: &Path) -> Result<u32, Failure> {
+  let mut child = Command::new(marker)
+    .arg("--help")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|e| Failure(format!("running the eslogger drain marker: {e}")))?;
+  let pid = child.id();
+  let status = child.wait()?;
+  if !status.success() {
+    return Err(Failure(format!(
+      "the eslogger drain marker ({} --help) exited {status}",
+      marker.display()
+    )));
+  }
+  Ok(pid)
+}
+
+/// Whether the eslogger log holds an event made by process `pid` (its `process.audit_token.pid`). Lines
+/// that are not events, and events of any other process, do not count.
+fn has_event_of_process(log: &str, pid: u32) -> bool {
+  log.lines().any(|line| {
+    serde_json::from_str::<serde_json::Value>(line)
+      .is_ok_and(|event| event["process"]["audit_token"]["pid"].as_u64() == Some(u64::from(pid)))
+  })
 }
 
 /// What the filter saw of the stream: the lines kept, and the events Endpoint Security dropped.
@@ -518,9 +551,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   anchor.stop();
   let mut trace_note = None;
   if let (Some(tracer), Some(binary)) = (eslogger, &binary_for_trace) {
-    let filtered = tracer.stop(&log, || {
-      binary.run("eslogger-drain", &["--help"]).map(|_| ())
-    })?;
+    let filtered = tracer.stop(&log, binary.path())?;
     trace_note = Some(format!(
       "eslogger: {} slates events kept, 0 dropped (global_seq_num continuous); stopped after a drain marker",
       filtered.kept
@@ -670,6 +701,29 @@ mod tests {
       "the exact check after the byte search sees the unescaped path"
     );
   }
+
+  /// AC-9.7 (the hermeticity tracer): the stop waits for the drain marker's own event, not for the log
+  /// to grow. Do: a log whose newest line is a lagging event of the daemon (CI run 36275755772's last
+  /// kept line, the landing plan's close), then the same log with the marker's event appended. Expect:
+  /// the first is not caught up for the marker's pid, the second is; a line that is not an event never
+  /// counts.
+  #[test]
+  fn the_eslogger_stop_waits_for_the_markers_own_event() {
+    let daemon_close = r#"{"global_seq_num":9325,"process":{"audit_token":{"pid":76534},"executable":{"path":"\/w\/slates"}},"event":{"close":{"modified":false}}}"#;
+    let marker_open = r#"{"global_seq_num":9340,"process":{"audit_token":{"pid":76710},"executable":{"path":"\/w\/slates"}},"event":{"open":{}}}"#;
+    let lagging = format!("{daemon_close}\n");
+    assert!(
+      !has_event_of_process(&lagging, 76710),
+      "a lagging event of another process is not the marker's arrival"
+    );
+    let caught_up = format!("{daemon_close}\n{marker_open}\n");
+    assert!(has_event_of_process(&caught_up, 76710));
+    assert!(!has_event_of_process(
+      "torn {\"process\":{\"audit_token\":{\"pid\":76710",
+      76710
+    ));
+  }
+
   use slates_conformance::workload::{Entry, EntryKind};
 
   /// AC-4.5: client-generated entries must land with the same names, kinds, modes and bytes.

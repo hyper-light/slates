@@ -72,9 +72,17 @@ authorized merely by appearing here.
 - [x] **The first macOS root pjdfstest review.** 1,905 cases listed by cause; 0 unlisted against CI run
   36202635768. See `docs/bugs/2026-09-26-macos-pjdfstest-root-review.md`.
 - [ ] **macOS workloads: cargo's `._target` AppleDouble sidecar** (NFSv3 has no xattrs; the client
-  stores cargo's backup-exclusion xattr as a visible file). Open, as GAPS records.
-- [ ] **macOS hermeticity: 92 of 93 write-capable calls unresolved** (fs_usage cannot attribute
-  descriptors; the DTrace attribution is authorized and owed). Open, as GAPS records.
+  stores cargo's backup-exclusion xattr as a visible file). Being fixed by replacing the macOS mount's
+  NFSv3 with NFSv4 and serving extended attributes as named attributes (`vers=4.x,namedattr`; Ada
+  2026-09-26: never FSKit). Its first piece is the volume's own extended-attribute store.
+- [x] **macOS hermeticity: 92 of 93 write-capable calls unresolved.** The tracer is eslogger
+  (`docs/bugs/2026-09-26-hermeticity-tracer-moves-to-eslogger.md`): 0 unresolved and 0 outside, both on
+  this Mac and on the runner (36275244114). Its stop raced its own stream and cut the landing out of one
+  runner trace (36275755772). The stop now waits for the drain marker's own event. See
+  `docs/bugs/2026-09-26-the-eslogger-stop-raced-its-own-stream.md`.
+- [x] **The fleet test's session hold raced the link's discovery page** (36275755772, macOS gates). The
+  hold now waits for the session as a forward does and reports a typed outcome. See
+  `docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md`.
 - [x] **The anchor segment on Windows: `CreateFileMappingW` 1450.** 167–188 GB derived, which a
   pagefile section is charged in full at creation. The segment and content object are now a
   `SparseObject`: `SEC_RESERVE` on Windows, committed as ranges are reached, reached only by ranges.

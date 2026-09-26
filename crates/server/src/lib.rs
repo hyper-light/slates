@@ -66,7 +66,7 @@ pub mod virtiofs;
 pub mod xshard;
 
 pub use config::{DaemonConfig, DurabilityBound, FleetMembership};
-pub use daemon::{Daemon, SegmentSource};
+pub use daemon::{Daemon, SegmentSource, SessionHold};
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
 pub use dns::Resolver;
 pub use fleet::{FleetPeer, FleetTransport};

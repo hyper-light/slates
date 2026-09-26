@@ -35,7 +35,7 @@ use slates_ipc::protocol::{
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::MachineProfile;
 use slates_rt::tcp::{Ipv4Addr, SocketAddrV4};
-use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, host_id_of};
+use slates_server::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS, SessionHold, host_id_of};
 use slates_server::deploy::member_id;
 use slates_server::head::HeadValue;
 use slates_server::observe::ObserveError;
@@ -3699,9 +3699,12 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
     "b routed the read to its owner on a before the hold"
   );
   assert_eq!(
-    held.map(|held| held.map_err(|refusal| refusal.to_string())),
+    held.as_ref().map(|held| held
+      .as_ref()
+      .map(|hold| matches!(hold, SessionHold::Took { .. }))
+      .map_err(|refusal| refusal.to_string())),
     Some(Ok(true)),
-    "b's session to a was held out"
+    "b's session to a was held out: {held:?}"
   );
   assert_same_snapshot_reply(
     written.expect("the write was sent"),
@@ -3787,9 +3790,12 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
     daemon.stop();
   }
   assert_eq!(
-    held.map_err(|refusal| refusal.to_string()),
+    held
+      .as_ref()
+      .map(|hold| matches!(hold, SessionHold::Took { .. }))
+      .map_err(|refusal| refusal.to_string()),
     Ok(true),
-    "the foreign node's session to the successor was held out"
+    "the foreign node's session to the successor was held out: {held:?}"
   );
   assert!(
     matches!(looked_up, ReplyBody::Status { .. }),

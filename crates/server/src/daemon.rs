@@ -51,6 +51,35 @@ pub const LIVENESS_BUDGET_NS: u64 = 1_000_000_000;
 /// Derived: ten liveness budgets ([`LIVENESS_BUDGET_NS`]).
 pub const OBSERVE_BUDGET_NS: u64 = 10 * LIVENESS_BUDGET_NS;
 
+/// Shape: how long [`Daemon::hold_record_session`] waits for a record session that is not in its link — one
+/// liveness budget. A live peer's session is out only for a dispatch, a discovery page or a re-dial, each far
+/// shorter; one still absent after a liveness budget names a real absence, which the hold reports rather than
+/// waits out. Derived: [`LIVENESS_BUDGET_NS`], a tenth of [`OBSERVE_BUDGET_NS`], so the report arrives
+/// inside the observation's budget.
+pub const SESSION_WAIT_NS: u64 = LIVENESS_BUDGET_NS;
+
+/// What [`Daemon::hold_record_session`] found: the session taken (and how long it waited for it), or, after
+/// [`SESSION_WAIT_NS`], why there was none — a link for the peer whose session never came back to it, or no
+/// link for the peer at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHold {
+  /// The session was taken after `waited_ns`, held for the span and put back.
+  Took {
+    /// How long the hold waited for the session to be in its link.
+    waited_ns: u64,
+  },
+  /// The link for the peer existed, but its session was out for the whole wait.
+  NeverInItsLink {
+    /// How long the hold waited.
+    waited_ns: u64,
+  },
+  /// This node kept no link to the peer for the whole wait.
+  NoLink {
+    /// How long the hold waited.
+    waited_ns: u64,
+  },
+}
+
 /// Where the segment comes from.
 #[derive(Clone, Debug)]
 pub enum SegmentSource {
@@ -798,23 +827,47 @@ impl Daemon {
   /// `fleet::return_sessions`), so a test drives a forward into a session that is out (§4.8 "Lookup";
   /// docs/bugs/2026-09-25-a-forward-refused-while-the-owners-session-was-out.md). The hold is a task on the
   /// control shard, where the record sessions live, and it sleeps on the shard's timer, so the shard keeps
-  /// serving meanwhile. Returns once the hold has run its take: `Ok(true)` when it took the session,
-  /// `Ok(false)` when the link had none to take; the typed refusal when the control shard could not take the
-  /// hold within the observe budget.
+  /// serving meanwhile. A session that is not in its link when the hold starts (out on a dispatch or a
+  /// discovery page, or being established by its link task after a membership change) is waited for, paced
+  /// at the fleet's poll interval, for at most [`SESSION_WAIT_NS`], as a forward waits for it
+  /// (`fleet::forward_over_leader_session`); taking only what is there at the first look made the hold a race
+  /// against those (CI run 36275755772, docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md). Returns
+  /// once the hold has run its take, with what it found ([`SessionHold`]); the typed refusal when the control
+  /// shard could not take the hold within the observe budget.
   pub fn hold_record_session(
     &self,
     peer: slates_db::HostId,
     span_ns: u64,
-  ) -> Result<bool, ObserveError> {
+  ) -> Result<SessionHold, ObserveError> {
     let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
-    let (taken, took) = std::sync::mpsc::sync_channel::<bool>(1);
+    let (taken, took) = std::sync::mpsc::sync_channel::<SessionHold>(1);
     let receipt = runtime
       .spawn_on_with_receipt(shard, async move {
-        let sessions = crate::fleet::take_sessions(|host| host == peer);
-        let _ = taken.send(!sessions.is_empty());
-        slates_rt::futures::sleep(span_ns).await;
-        crate::fleet::return_sessions(sessions);
+        let began = slates_rt::futures::now_ns();
+        let (sessions, outcome) = loop {
+          let waited_ns = slates_rt::futures::now_ns().saturating_sub(began);
+          let sessions = crate::fleet::take_sessions(|host| host == peer);
+          if !sessions.is_empty() {
+            break (sessions, SessionHold::Took { waited_ns });
+          }
+          if waited_ns >= SESSION_WAIT_NS {
+            let linked =
+              crate::state::with_state(|s| s.record_sessions.contains_key(&peer)).unwrap_or(false);
+            let outcome = if linked {
+              SessionHold::NeverInItsLink { waited_ns }
+            } else {
+              SessionHold::NoLink { waited_ns }
+            };
+            break (sessions, outcome);
+          }
+          slates_rt::futures::sleep(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+        };
+        let _ = taken.send(outcome);
+        if !sessions.is_empty() {
+          slates_rt::futures::sleep(span_ns).await;
+          crate::fleet::return_sessions(sessions);
+        }
       })
       .map_err(|refusal| ObserveError::Submission {
         refusal,
