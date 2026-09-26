@@ -80,7 +80,8 @@ authorized merely by appearing here.
   `SparseObject`: `SEC_RESERVE` on Windows, committed as ranges are reached, reached only by ranges.
   Proof owed to the next Windows run. See
   `docs/bugs/2026-09-26-windows-committed-the-whole-anchor-segment.md`.
-- [ ] **For Ada: the op-log ring is bounded by recovery time, not by memory.** 16.4 GB per partition on
+- [x] **The op-log ring is bounded by memory** (was recovery time × a 16 GB/s guess): now `table_bytes`.
+  See `docs/bugs/2026-09-26-the-op-log-ring-was-sized-past-memory.md`. Previously: **For Ada: the op-log ring is bounded by recovery time, not by memory.** 16.4 GB per partition on
   a 128 GB Mac, 4 GB in a 1 GiB KIND pod; `trim` frees nothing, so a wrapping ring touches all of it
   (same record).
 - [ ] **KIND scale-down formation chain** (run 36262457777): after 5 → 3, `slates-0` and `slates-2`

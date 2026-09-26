@@ -380,10 +380,17 @@ impl DaemonConfig {
       ["wake.mean_ns"]
     );
     derivations.push(note("spin_ns", &spin));
+    // The log holds only what the next snapshot absorbs: the cadence snapshots every `recovery budget ×
+    // measured replay rate` bytes, and a full ring snapshots and trims before the append retries
+    // (`Db::mutate`, `LogFull`). A ring larger than the tables it records buys nothing, and because the
+    // ring wraps, its whole capacity becomes resident RAM over a long run. Until 2026-09-26 it was
+    // `recovery_budget_us × one page per µs` (a 16 GB/s replay guess): 16.4 GB per partition on a 128 GB
+    // Mac, 4 GB in a 1 GiB KIND pod, past the memory the daemon is sized by
+    // (docs/bugs/2026-09-26-the-op-log-ring-was-sized-past-memory.md).
     let log_bytes: Derived<u64> = derived!(
-      slates_db::replay::RECOVERY_BUDGET_NS / 1_000 * page.max(1),
-      "recovery_budget_us × one page per microsecond of replay until the first replay measures",
-      ["recovery_budget_ns", "page"]
+      tables.get().max(page),
+      "table_bytes: the ring holds what the next snapshot absorbs, inside the shard's reserve",
+      ["table_bytes", "page"]
     );
     derivations.push(note("log_bytes_per_partition", &log_bytes));
     let snapshot_bytes: Derived<u64> = derived!(
@@ -1030,6 +1037,41 @@ mod tests {
   /// the shards never exceed what the host will let the process use; without a bound, or with one
   /// above total, the reserve is the share of total 1f40689 chose. Non-vacuous: derived from total
   /// alone, a quarter-of-total bound leaves the reserve four times what the bound allows.
+  /// D-12, §4.8 (docs/bugs/2026-09-26-the-op-log-ring-was-sized-past-memory.md): the anchor segment is a
+  /// sparse object, so a payload region (a snapshot or consensus slot) holds RAM only for what is
+  /// published in it, but a ring (a partition's log, the audit) wraps through its whole capacity over a
+  /// long run, and every byte of it becomes resident. Do: derive the configuration on this machine for one
+  /// to four shards, unbounded and under a 1 GiB container bound. Expect: the rings together fit in the
+  /// effective capacity. Before, one partition's log alone was 16.4 GB here and 4 GB under 1 GiB.
+  #[test]
+  fn the_rings_that_wrap_fit_in_the_memory_the_daemon_may_use() {
+    /// Shape: a small container's memory bound, the KIND lane's pod limit.
+    const POD_LIMIT: u64 = 1 << 30;
+    let mut profile = crate::daemon::test_profile();
+    for limit in [None, Some(POD_LIMIT)] {
+      profile.facts.memory.limit = limit;
+      let effective = slates_machine::facts::effective_capacity(profile.facts.memory.total, limit);
+      for shards in 1..=4 {
+        let geometry = DaemonConfig::derive(&profile, "rings-fit", Some(shards)).geometry;
+        let rings: u64 = geometry
+          .regions()
+          .iter()
+          .filter(|region| {
+            matches!(
+              region.kind,
+              slates_anchor::RegionKind::Log(_) | slates_anchor::RegionKind::Audit
+            )
+          })
+          .map(|region| region.len)
+          .sum();
+        assert!(
+          rings <= effective,
+          "{shards} shards, limit {limit:?}: {rings} bytes of rings over {effective} bytes"
+        );
+      }
+    }
+  }
+
   #[test]
   fn a_memory_bound_below_total_caps_the_reserve() {
     let mut profile = crate::daemon::test_profile();
