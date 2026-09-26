@@ -8,17 +8,30 @@
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
-  "command": "",
-  "bound": "",
+  "date": "2026-09-26",
+  "command": "sudo eslogger open close create write truncate rename unlink link clone copyfile exchangedata setextattr deleteextattr setmode setowner setflags utimes setattrlist setacl (events of the slates binary); slates anchor/volume create/mount, `sh -c 'printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp'`, snapshot, land, grant, land --grant",
+  "bound": "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "privilege",
-      "reason": "fs_usage needs root for the kernel tracing facility it uses (its manual); macOS has no unprivileged filesystem-write tracer; this host has no passwordless sudo (`sudo -n true` was refused)"
+    "kind": "ran",
+    "counts": {
+      "suite": "hermeticity",
+      "write_calls": 204,
+      "inside_target": 60,
+      "ram_only": 49,
+      "standard_streams": 95,
+      "unresolved": 0,
+      "outside": 0,
+      "written_matched": 12,
+      "written_unmatched": 0
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "duration_ms": 6222,
+  "notes": [
+    "tracer: sudo eslogger open close create write truncate rename unlink link clone copyfile exchangedata setextattr deleteextattr setmode setowner setflags utimes setattrlist setacl (kept: events of the slates binary); 204 events parsed from 1092 log lines; landing reported 12 written; 8 hidden siblings (.slates-*) seen inside the target",
+    "the granted target: /Users/adalundhe/slates-herm/scratch3/land-target",
+    "volume quota: 131072 bytes, derived from 8 peak workload entries × 16384-byte host page",
+    "landing completeness: 12/12 entries reported; disk verification: Ok(())",
+    "eslogger: 1092 slates events kept, 0 dropped (global_seq_num continuous); stopped after a drain marker"
+  ]
 }

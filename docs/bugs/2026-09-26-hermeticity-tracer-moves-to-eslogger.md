@@ -69,3 +69,20 @@ unresolved (`2026-09-22-fs-usage-startup-and-ownership.md`).
     the stream is proven caught up past the daemon's teardown.
 - That run's record (written into `docs/wip/conformance/records` by `conformance run`) described a
   partial trace and was not committed.
+
+## The passing run (Ada, 2026-09-26, from `e7eac87`)
+
+The second attempt found nothing: eslogger escapes every `/` as `\/`, and the pre-filter searched the
+plain spelling. That is fixed and tested; 866 of 866 lines of the first run match the escaped form.
+
+The third run passed, and the record is `records/native-macos-nfs.hermeticity.json`.
+
+| Check | Result |
+|---|---|
+| Stream | 1,092 slates events kept, 0 dropped (`global_seq_num` continuous), stopped after the drain marker |
+| Coverage | start-up, the mount, the landing (`create` 12, `link` 8, `unlink` 8, `setmode` 8, `setattrlist` 8), the daemon's teardown |
+| Write-capable calls | 204: 60 inside the granted target, 95 on the anchor log (the processes' stderr), 49 `/dev/dtracehelper`, 0 unresolved, 0 outside |
+| Landing | 12 of 12 entries reported and matched in the trace; disk verified |
+
+Owed: whether GitHub's macOS runner grants its shell the Full Disk Access eslogger needs (the CI lane's
+next run answers it).
