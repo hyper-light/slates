@@ -266,7 +266,9 @@ mod platform {
   use crate::error::MachineError;
   use memmap2::MmapMut;
   use std::ffi::c_void;
-  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+  use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+  };
   use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
   };
@@ -314,14 +316,28 @@ mod platform {
     if handle.is_null() {
       return Err(MachineError::os("CreateFileMappingW"));
     }
-    // SAFETY: a full read/write view of the section.
-    let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) };
-    if view.Value.is_null() {
-      let err = MachineError::os("MapViewOfFile");
+    // A name that already exists opens that section with `ERROR_ALREADY_EXISTS` set; two creators
+    // would share one profile segment silently, so it is refused with the OS code.
+    let existed =
+      std::io::Error::last_os_error().raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok();
+    // SAFETY: a full read/write view of the section (skipped for a section this call did not create).
+    let view = (!existed).then(|| unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) });
+    if existed || view.is_some_and(|view| view.Value.is_null()) {
+      let err = if existed {
+        MachineError::OsRefused {
+          call: "CreateFileMappingW (the name is already a live section)",
+          code: i32::try_from(ERROR_ALREADY_EXISTS).ok(),
+        }
+      } else {
+        MachineError::os("MapViewOfFile")
+      };
       // SAFETY: the handle is ours.
       unsafe { CloseHandle(handle) };
       return Err(err);
     }
+    let Some(view) = view else {
+      return Err(MachineError::os("MapViewOfFile"));
+    };
     // The section's view is exposed through an anonymous map copied on publish; a Windows-native
     // zero-copy view arrives with the anchor process in Phase 2.
     let map = MmapMut::map_anon(len).map_err(|e| MachineError::OsRefused {

@@ -1685,7 +1685,7 @@ mod harness_tests {
       &profile,
       config,
       SegmentSource::Create {
-        name: "slates-seg-cli-run".to_owned(),
+        name: format!("slates-seg-cli-run-{}", std::process::id()),
       },
     )
     .unwrap();

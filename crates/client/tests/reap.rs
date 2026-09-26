@@ -202,7 +202,7 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-cl-reap".to_owned(),
+      name: format!("slates-seg-cl-reap-{}", std::process::id()),
     },
   )
   .unwrap();

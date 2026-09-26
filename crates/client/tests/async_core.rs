@@ -102,7 +102,7 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-cl-async".to_owned(),
+      name: format!("slates-seg-cl-async-{}", std::process::id()),
     },
   )
   .unwrap();

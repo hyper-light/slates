@@ -166,7 +166,7 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-cl-life".to_owned(),
+      name: format!("slates-seg-cl-life-{}", std::process::id()),
     },
   )
   .unwrap();
@@ -301,12 +301,15 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
     * 2
     * usize::from(config.geometry.partitions.max(1));
   let segment = AnchorSegment::create(
-    "slates-seg-cl-resume",
+    &format!("slates-seg-cl-resume-{}", std::process::id()),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content("slates-con-cl-resume", content_bytes)
+  .with_content(
+    &format!("slates-con-cl-resume-{}", std::process::id()),
+    content_bytes,
+  )
   .unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
@@ -409,12 +412,15 @@ fn exhausted_client_id_space_refuses_fresh_callers_but_preserves_a_resuming_sess
   // The anchor keeps both content publication slots as well as metadata across the restart.
   let content_bytes = usize::try_from(config.reserve_per_shard).unwrap() * 2;
   let mut segment = AnchorSegment::create(
-    "slates-seg-cl-id-end",
+    &format!("slates-seg-cl-id-end-{}", std::process::id()),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content("slates-con-cl-id-end", content_bytes)
+  .with_content(
+    &format!("slates-con-cl-id-end-{}", std::process::id()),
+    content_bytes,
+  )
   .unwrap();
   // Build the retained admission history at the format boundary without billions of connects.
   let (mut db, _) = slates_db::replay::recover(&mut segment, 0, config.caps, 0).unwrap();
@@ -512,12 +518,15 @@ fn a_green_chain_survives_a_daemon_restart() {
     * 2
     * usize::from(config.geometry.partitions.max(1));
   let segment = AnchorSegment::create(
-    "slates-seg-cl-green",
+    &format!("slates-seg-cl-green-{}", std::process::id()),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content("slates-con-cl-green", content_bytes)
+  .with_content(
+    &format!("slates-con-cl-green-{}", std::process::id()),
+    content_bytes,
+  )
   .unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();
@@ -667,12 +676,15 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
     * 2
     * usize::from(config.geometry.partitions.max(1));
   let segment = AnchorSegment::create(
-    "slates-seg-cl-origin",
+    &format!("slates-seg-cl-origin-{}", std::process::id()),
     &profile.facts.identity,
     config.geometry,
   )
   .unwrap()
-  .with_content("slates-con-cl-origin", content_bytes)
+  .with_content(
+    &format!("slates-con-cl-origin-{}", std::process::id()),
+    content_bytes,
+  )
   .unwrap();
   let source = || {
     let (handoff, len) = segment.handoff().unwrap();

@@ -260,7 +260,7 @@ fn a_spawned_consumer_binds_through_the_inherited_capability_and_a_sibling_witho
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-cl-consumer".to_owned(),
+      name: format!("slates-seg-cl-consumer-{}", std::process::id()),
     },
   )
   .unwrap();

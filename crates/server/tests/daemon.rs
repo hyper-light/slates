@@ -1560,7 +1560,7 @@ fn telemetry_scenario_with_quota(reply_quota: Option<usize>) {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-telemetry".to_owned(),
+      name: format!("slates-seg-telemetry-{}", std::process::id()),
     },
   )
   .unwrap();
@@ -3251,7 +3251,7 @@ fn a_connect_past_the_client_bound_is_refused_typed_at_the_rendezvous() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-bound".to_owned(),
+      name: format!("slates-seg-bound-{}", std::process::id()),
     },
   )
   .unwrap();

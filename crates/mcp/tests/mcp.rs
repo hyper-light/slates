@@ -569,7 +569,7 @@ fn the_mcp_surface_serves_the_tools() {
     &profile,
     config,
     SegmentSource::Create {
-      name: "slates-seg-mcp".to_owned(),
+      name: format!("slates-seg-mcp-{}", std::process::id()),
     },
   )
   .unwrap();

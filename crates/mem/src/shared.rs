@@ -406,7 +406,9 @@ mod platform {
 mod platform {
   use std::ffi::c_void;
 
-  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+  use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, INVALID_HANDLE_VALUE,
+  };
   use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
     OpenFileMappingW, PAGE_READWRITE, UnmapViewOfFile, VirtualLock,
@@ -461,13 +463,18 @@ mod platform {
     }
   }
 
+  /// Closes a section handle this module created or opened and has not handed to an `Inner`.
+  fn close(handle: HANDLE) {
+    // SAFETY: the handle is ours, and nothing else holds or closes it.
+    unsafe { CloseHandle(handle) };
+  }
+
   fn view(handle: HANDLE, len: usize) -> Result<*mut c_void, MemError> {
     // SAFETY: a full read/write view of a section handle this module owns.
     let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) };
     if view.Value.is_null() {
       let err = os("MapViewOfFile");
-      // SAFETY: the handle is ours.
-      unsafe { CloseHandle(handle) };
+      close(handle);
       return Err(err);
     }
     Ok(view.Value)
@@ -498,6 +505,16 @@ mod platform {
     };
     if handle.is_null() {
       return Err(os("CreateFileMappingW"));
+    }
+    // A name that already exists opens that section, at its size, with `ERROR_ALREADY_EXISTS` set:
+    // two creators would share one object silently (two daemons writing one anchor segment). Refused
+    // with the OS code instead; the caller names its objects uniquely.
+    if std::io::Error::last_os_error().raw_os_error() == i32::try_from(ERROR_ALREADY_EXISTS).ok() {
+      close(handle);
+      return Err(MemError::OsRefused {
+        call: "CreateFileMappingW (the name is already a live section)",
+        code: i32::try_from(ERROR_ALREADY_EXISTS).ok(),
+      });
     }
     let view = view(handle, len)?;
     Ok(Inner {
