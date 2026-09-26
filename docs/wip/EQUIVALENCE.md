@@ -37,6 +37,23 @@ Operations and inputs outside that domain remain untested, rather than implicitl
 |---|---|---|---|---|
 | unlink of a directory | `EISDIR` | `EPERM` | macOS, BSD | POSIX permits either; Linux says `EISDIR` |
 | rename over a non-empty directory | `ENOTEMPTY` | `EEXIST` | some filesystems | POSIX permits either |
+| a rename meeting more than one refusal | any of them | any of them | every host | POSIX XSH 2.3: "any one of the possible errors may be returned, as the order of detection is undefined" |
+
+The last row is computed, not assumed. From the state before the step, the suite lists every refusal
+POSIX names for that rename (`rename_refusals`):
+- a missing source or path component, `ENOENT`;
+- a component that is not a directory, `ENOTDIR`;
+- a file onto a directory, `EISDIR`;
+- a directory onto a file, `ENOTDIR`;
+- a directory onto a non-empty one, `ENOTEMPTY` or `EEXIST`;
+- a directory into its own subtree, `EINVAL`.
+
+Only when two or more distinct refusals apply may the sides report different ones, and each must be
+one of them. The rule was added 2026-09-26 for three measured orderings:
+- A file onto a non-empty directory: Linux tmpfs says `ENOTEMPTY`, APFS and the volume `EISDIR` (CI run
+  36261369758).
+- A missing source into a path through a symlink: APFS says `ENOENT`, the volume `ENOTDIR`.
+- A directory moved into itself onto a file there: APFS says `ENOTDIR`, the volume `EINVAL`.
 
 Everything else must match exactly, including: `ENOENT` for a missing path component and
 `ENOTDIR` for a component that exists and is not a directory (the model suite resolves paths
@@ -52,6 +69,13 @@ harness creates `probe-a` and tries `PROBE-A` with `O_EXCL`; `EEXIST` means the 
 (tmpfs, ext4, NTFS in its POSIX mode). The generated names are six ASCII names, two of them
 case variants, so a folding host and a folding volume both refuse the variant and an exact pair
 both keep it.
+
+A folding volume keeps names as spelled, as APFS does, and the two renames that meet a folded name
+follow APFS (measured 2026-09-26; `docs/bugs/2026-09-26-folding-renames-lost-the-hosts-spelling.md`):
+- A rename to another spelling of the same entry (`readme` to `README`) respells it. Only the same
+  bytes change nothing.
+- A rename that replaces a different entry under a folded name (`d` onto `a` where `A` exists) keeps
+  the replaced entry's spelling, `A`.
 
 ## 5. Symlinks in paths
 

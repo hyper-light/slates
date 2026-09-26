@@ -140,6 +140,95 @@ fn equivalent(volume: &str, host: &str) -> bool {
     .any(|(v, hosts)| *v == volume && hosts.contains(&host))
 }
 
+/// The refusals a rename `step` meets in the state `dirs`, each one POSIX names for `rename(2)`: the
+/// source missing, or a component of either path missing (`ENOENT`) or not a directory (`ENOTDIR`); a
+/// non-directory onto a directory (`EISDIR`); a directory onto a non-directory (`ENOTDIR`); a directory
+/// onto a non-empty one (`ENOTEMPTY`, or `EEXIST`); a directory into its own subtree (`EINVAL`). When more than one applies, POSIX lets the
+/// implementation report any of them (XSH 2.3, "Error Numbers": "If more than one error occurs in
+/// processing a function call, any one of the possible errors may be returned, as the order of
+/// detection is undefined"), and hosts differ: renaming a file onto a non-empty directory is
+/// `ENOTEMPTY` on Linux's tmpfs and `EISDIR` on APFS and in the volume (CI run 36261369758); a missing
+/// source into a path through a symlink is `ENOENT` on APFS and `ENOTDIR` in the volume; a directory
+/// moved into itself onto a file there is `ENOTDIR` on APFS and `EINVAL` in the volume.
+fn rename_refusals(
+  step: &Step,
+  dirs: &[(String, Vec<(String, char)>)],
+  policy: NameEquivalence,
+) -> Vec<&'static str> {
+  let Step::Rename(from_dir, from_name, to_dir, to_name) = step else {
+    return Vec::new();
+  };
+  // Names compare as the volume compares them: folded on a folding host (APFS), exact elsewhere.
+  let same = |a: &str, b: &str| policy.fold(a) == policy.fold(b);
+  let names_in = |path: &str| {
+    dirs
+      .iter()
+      .find(|(listed, _)| listed == path)
+      .map(|(_, names)| names)
+  };
+  // The directory a path of components names, or the refusal its walk meets.
+  let walk = |dir: &[String]| -> Result<String, &'static str> {
+    let mut path = String::new();
+    for part in dir {
+      let kind = names_in(&path)
+        .and_then(|names| names.iter().find(|(name, _)| same(name, part)))
+        .map(|(name, kind)| (name.clone(), *kind));
+      match kind {
+        None => return Err("ENOENT"),
+        Some((name, 'd')) => path.push_str(&format!("/{name}")),
+        Some(_) => return Err("ENOTDIR"),
+      }
+    }
+    Ok(path)
+  };
+  let entry_in = |path: &str, name: &str| {
+    names_in(path)
+      .and_then(|names| names.iter().find(|(entry, _)| same(entry, name)))
+      .map(|(entry, kind)| (entry.clone(), *kind))
+  };
+  let mut refusals = Vec::new();
+  let source = match walk(from_dir) {
+    Ok(path) => {
+      let entry = entry_in(&path, from_name);
+      if entry.is_none() {
+        refusals.push("ENOENT");
+      }
+      entry.map(|(name, kind)| (format!("{path}/{name}"), kind))
+    }
+    Err(refusal) => {
+      refusals.push(refusal);
+      None
+    }
+  };
+  let target_parent = match walk(to_dir) {
+    Ok(path) => Some(path),
+    Err(refusal) => {
+      refusals.push(refusal);
+      None
+    }
+  };
+  // A directory moved into its own subtree: the new path's parent is the directory or below it.
+  if let (Some((source_path, 'd')), Some(parent)) = (&source, &target_parent)
+    && (parent == source_path || parent.starts_with(&format!("{source_path}/")))
+  {
+    refusals.push("EINVAL");
+  }
+  let target = target_parent
+    .as_ref()
+    .and_then(|path| entry_in(path, to_name).map(|(name, kind)| (format!("{path}/{name}"), kind)));
+  if let (Some((_, source)), Some((target_path, target))) = (&source, &target) {
+    match (*source == 'd', *target == 'd') {
+      (false, true) => refusals.push("EISDIR"),
+      (true, false) => refusals.push("ENOTDIR"),
+      _ => {}
+    }
+    if *target == 'd' && names_in(target_path).is_some_and(|names| !names.is_empty()) {
+      refusals.extend(["ENOTEMPTY", "EEXIST"]);
+    }
+  }
+  refusals
+}
+
 // ------------------------------------------------------------------ the host side
 
 fn host_path(root: &Path, dir: &[String], name: &str) -> PathBuf {
@@ -257,7 +346,9 @@ fn run_case(steps: &[Step], case_root: &Path, policy: NameEquivalence) {
   let mut store = store();
   let mut vol = volume_with(&mut store, Quota::Bounded { limit: 1 << 40 }, policy);
   for step in steps {
-    let files: Vec<String> = volume_state(&vol, &store).1.into_keys().collect();
+    let (dirs_before, files_before) = volume_state(&vol, &store);
+    let refusals = rename_refusals(step, &dirs_before, policy);
+    let files: Vec<String> = files_before.into_keys().collect();
     let (Some(host), Some(real)) = (
       apply_host(step, case_root, &files),
       apply_volume(step, &mut vol, &mut store, &files),
@@ -265,8 +356,18 @@ fn run_case(steps: &[Step], case_root: &Path, policy: NameEquivalence) {
       continue;
     };
     let (host, real) = (host_outcome(host), volume_outcome(real));
+    // Several refusals apply: either side may report any of them (see [`rename_refusals`]).
+    let distinct = {
+      let mut distinct = refusals.clone();
+      distinct.retain(|refusal| *refusal != "EEXIST");
+      distinct.sort_unstable();
+      distinct.dedup();
+      distinct.len()
+    };
+    let any_applicable_refusal =
+      distinct > 1 && refusals.contains(&real.as_str()) && refusals.contains(&host.as_str());
     assert!(
-      equivalent(&real, &host),
+      equivalent(&real, &host) || any_applicable_refusal,
       "outcome after {step:?}: volume {real}, host {host}"
     );
     let (hd, hf) = host_state(case_root);
@@ -316,6 +417,30 @@ fn selected_files_and_aliases_agree_at_the_root_and_in_a_directory() {
     let case_root = root.fresh_case(u64::try_from(case).unwrap()).unwrap();
     run_case(&history, &case_root, policy);
   }
+}
+
+/// AC-1.2: a file renamed onto a non-empty directory, the history CI run 36261369758 shrank to: `b/C`
+/// is a second link of `C`, and `b/C` is renamed onto `b` itself. Two refusals apply at once (the
+/// target is a directory; it is not empty) and POSIX lets either be reported. Linux's tmpfs reports
+/// `ENOTEMPTY`, the volume `EISDIR`. Do: run the history on both sides. Expect: agreement, the state
+/// unchanged on both.
+#[test]
+fn a_file_renamed_onto_a_non_empty_directory_may_report_either_refusal() {
+  let Some(base) = std::env::var_os(RAMDIR_VAR) else {
+    println!("differential: skipped — {RAMDIR_VAR} is not set (name a RAM-backed directory)");
+    return;
+  };
+  let root = HostRoot::create(Path::new(&base), "rename-onto-directory").unwrap();
+  let policy = probe_policy(&root.path);
+  let b = || vec!["b".to_owned()];
+  let history = [
+    Step::Mkdir(Vec::new(), "b".to_owned()),
+    Step::Create(Vec::new(), "C".to_owned()),
+    Step::Link(b(), "C".to_owned(), 0),
+    Step::Rename(b(), "C".to_owned(), Vec::new(), "b".to_owned()),
+  ];
+  let case_root = root.fresh_case(0).unwrap();
+  run_case(&history, &case_root, policy);
 }
 
 /// AC-1.2: the volume and the host filesystem agree on every abstract state under the policy.

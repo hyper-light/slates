@@ -422,6 +422,22 @@ impl Model {
     let node = fd.get(&from_key).cloned().unwrap();
     let to_key = Self::find_key(td, policy, to);
     if from_dir == to_dir && policy.same(from, to) {
+      // The same entry: the same bytes change nothing; another spelling respells it (EQUIVALENCE §4).
+      if from == to {
+        return Ok(());
+      }
+      let fd = self.dir_mut(from_dir).unwrap();
+      let node = fd.remove(&from_key).unwrap();
+      let moved_ino = match &node {
+        Node::File { ino } | Node::Symlink { ino, .. } => Some(*ino),
+        Node::Dir(_) => None,
+      };
+      fd.insert(to.to_owned(), node);
+      if let Some(ino) = moved_ino
+        && let Some(f) = self.files.get_mut(&ino)
+      {
+        f.inline_born = self.epoch;
+      }
       return Ok(());
     }
     let target = to_key.as_ref().and_then(|k| td.get(k)).cloned();
@@ -467,10 +483,15 @@ impl Model {
       Node::Dir(_) => None,
     };
     let td = self.dir_mut(to_dir).unwrap();
-    if let Some(k) = to_key {
-      td.remove(&k);
-    }
-    td.insert(to.to_owned(), node);
+    // Replacing another entry keeps its spelling on a folding volume, as APFS does (EQUIVALENCE §4).
+    let spelling = match to_key {
+      Some(k) => {
+        td.remove(&k);
+        k
+      }
+      None => to.to_owned(),
+    };
+    td.insert(spelling, node);
     // The moved file's record is copied (its home follows it), so its inline bytes are reborn.
     if let Some(ino) = moved_ino
       && let Some(f) = self.files.get_mut(&ino)
@@ -897,6 +918,56 @@ fn destroying_a_clone_releases_only_its_own_bytes() {
   );
   vol.unpin(s1).unwrap();
   assert_eq!(vol.destroy_snapshot(&mut store, s1), Ok(()));
+}
+
+/// T-1.2, EQUIVALENCE §4: a folding volume keeps names as spelled, as APFS and NTFS do, so a rename
+/// to another spelling of the same entry respells it and a rename to the same bytes changes nothing.
+/// Do: rename `readme` to `README`, then `README` to `README`. Expect: one entry, spelled `README`,
+/// the same inode; then no change.
+#[test]
+fn a_case_only_rename_respells_the_entry_on_a_folding_volume() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root();
+  let file = vol.create_file(&mut store, root, "readme", 0o644).unwrap();
+  assert_eq!(
+    vol.rename(&mut store, root, "readme", root, "README"),
+    Ok(())
+  );
+  let names: Vec<String> = vol
+    .readdir(&store, root)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name.to_string())
+    .collect();
+  assert_eq!(names, vec!["README".to_owned()], "respelled, one entry");
+  assert_eq!(vol.resolve(&store, "/README").unwrap().inode, file);
+  assert_eq!(
+    vol.rename(&mut store, root, "README", root, "README"),
+    Ok(())
+  );
+  assert_eq!(vol.readdir(&store, root).unwrap().len(), 1);
+}
+
+/// EQUIVALENCE §4: on a folding volume, a rename that replaces another entry keeps that entry's
+/// spelling, as APFS does. Do: create `A` and `d`, rename `d` onto `a`. Expect: one entry, spelled `A`,
+/// now `d`'s inode.
+#[test]
+fn a_rename_onto_another_spelling_keeps_the_replaced_entrys_spelling() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root();
+  vol.create_file(&mut store, root, "A", 0o644).unwrap();
+  let moved = vol.create_file(&mut store, root, "d", 0o644).unwrap();
+  assert_eq!(vol.rename(&mut store, root, "d", root, "a"), Ok(()));
+  let names: Vec<String> = vol
+    .readdir(&store, root)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name.to_string())
+    .collect();
+  assert_eq!(names, vec!["A".to_owned()], "the replaced entry's spelling");
+  assert_eq!(vol.resolve(&store, "/A").unwrap().inode, moved);
 }
 
 #[test]

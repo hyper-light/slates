@@ -64,6 +64,17 @@ authorized merely by appearing here.
   The UDP tests' new pulse report showed it (steps and waits frozen). The registry now owns the
   completion port with a generational `KickPort`. Proof owed to the next Windows run. See
   `docs/bugs/2026-09-26-windows-shards-were-never-kicked.md`.
+- [x] **Run 36261369758: the differential compared one of several refusals; folding renames lost the
+  host's spelling.** The suite now allows any refusal POSIX names when more than one applies (computed
+  from the pre-state). A folding volume respells a case-only rename and keeps a replaced entry's
+  spelling, as APFS does. APFS differential 10/10 × 1,000 after. See
+  `docs/bugs/2026-09-26-folding-renames-lost-the-hosts-spelling.md`.
+- [x] **The first macOS root pjdfstest review.** 1,905 cases listed by cause; 0 unlisted against CI run
+  36202635768. See `docs/bugs/2026-09-26-macos-pjdfstest-root-review.md`.
+- [ ] **macOS workloads: cargo's `._target` AppleDouble sidecar** (NFSv3 has no xattrs; the client
+  stores cargo's backup-exclusion xattr as a visible file). Open, as GAPS records.
+- [ ] **macOS hermeticity: 92 of 93 write-capable calls unresolved** (fs_usage cannot attribute
+  descriptors; the DTrace attribution is authorized and owed). Open, as GAPS records.
 - [ ] **The anchor segment on Windows: `CreateFileMappingW` 1450.** 167–188 GB derived, which a
   pagefile section is charged in full at creation. Reserve the section and commit on first use.
 - [ ] **Serve ports are still bound-then-released.** A test's own dialers could take its next node's port;

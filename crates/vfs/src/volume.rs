@@ -1249,7 +1249,19 @@ impl Volume {
     let source = self.lookup(store, from_dir, from_name)?;
     let target = self.lookup(store, to_dir, to_name).ok();
     if from_dir == to_dir && self.policy.same(from_name, to_name) {
-      return Ok(());
+      // The same entry. A folding volume keeps names as spelled, as APFS and NTFS do (EQUIVALENCE §4),
+      // so another spelling of it respells the entry: `readme` → `README` renames, the inode unchanged.
+      // The same bytes change nothing (POSIX: "the same existing directory entry").
+      if from_name == to_name {
+        return Ok(());
+      }
+      return self.rename_secured(
+        store,
+        (from_dir, from_name),
+        (to_dir, to_name),
+        source,
+        None,
+      );
     }
     if let Some(t) = target
       && t.inode == source.inode
@@ -1287,6 +1299,14 @@ impl Volume {
       _ => 0,
     };
     self.secure_retention(store, retention)?;
+    // Replacing another entry keeps the replaced entry's spelling on a folding volume, as APFS does:
+    // `d` renamed onto `a` where `A` exists leaves one entry, `A` (EQUIVALENCE §4). Under the exact
+    // policy the stored name is the requested one.
+    let replaced_spelling = match target {
+      Some(_) => Some(self.stored_name(store, to_dir, to_name)?),
+      None => None,
+    };
+    let to_name = replaced_spelling.as_deref().unwrap_or(to_name);
     let renamed = self.rename_secured(
       store,
       (from_dir, from_name),
@@ -1296,6 +1316,21 @@ impl Volume {
     );
     self.settle_retention(store);
     renamed
+  }
+
+  /// The spelling the directory stores for the entry `name` names under the volume's policy.
+  fn stored_name(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<String, VfsError> {
+    let dir = self.head_dir(store, dir)?;
+    let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
+    node
+      .lookup(&store.blocks, self.policy, name)
+      .map(|entry| entry.name.to_owned())
+      .ok_or(VfsError::NotFound)
   }
 
   /// The rename proper, under a secured retention for the replaced target.
