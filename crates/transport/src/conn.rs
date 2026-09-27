@@ -351,13 +351,23 @@ impl SentTracker {
   /// The send time of the most recent ack-eliciting packet still in flight — the anchor the probe
   /// timeout is armed from (RFC 9002 §6.2.1: `time_of_last_ack_eliciting_packet`).
   pub fn newest_sent_at(&self) -> Option<u64> {
-    self.in_flight.values().map(|flight| flight.sent_at).max()
+    // Packet numbers are assigned in send order on a monotonic clock, so the newest packet in flight is
+    // the highest-numbered one: an O(log n) lookup, not a scan of every packet in flight (a scan made the
+    // bake-off quadratic at a few thousand packets in flight, 2026-09-27).
+    self
+      .in_flight
+      .last_key_value()
+      .map(|(_, flight)| flight.sent_at)
   }
 
   /// Drops acknowledged send times older than the oldest packet still in flight (no future loss span can
   /// reach back past it), or all of them when nothing is in flight.
   fn prune_acked_sent_at(&mut self) {
-    match self.in_flight.values().map(|flight| flight.sent_at).min() {
+    match self
+      .in_flight
+      .first_key_value()
+      .map(|(_, flight)| flight.sent_at)
+    {
       Some(oldest) => self.acked_sent_at = self.acked_sent_at.split_off(&oldest),
       None => self.acked_sent_at.clear(),
     }

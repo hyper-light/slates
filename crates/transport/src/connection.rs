@@ -564,6 +564,7 @@ impl Connection {
       in_flight: self.in_flight,
       lost_total: self.delivery.lost(),
       persistent: self.persistent_congestion(&lost.packets),
+      srtt: self.rtt.smoothed_rtt_or_initial(),
     });
     self
       .controller
@@ -660,6 +661,7 @@ impl Connection {
         in_flight: self.in_flight,
         lost_total: self.delivery.lost(),
         persistent: self.persistent_congestion(&lost.packets),
+        srtt: self.rtt.smoothed_rtt_or_initial(),
       };
       self.controller.on_loss(&event);
       self.requeue_lost(lost);
@@ -886,10 +888,12 @@ mod tests {
   const MS: u64 = 1_000_000;
   /// Every control law in the bake-off; each oracle runs over all of them, since exact delivery must hold
   /// whichever law sets the window.
-  const LAWS: [ControllerKind; 3] = [
+  const LAWS: [ControllerKind; 5] = [
     ControllerKind::NewReno,
     ControllerKind::Cubic,
     ControllerKind::Bbr,
+    ControllerKind::Copa,
+    ControllerKind::CopaMeta,
   ];
 
   /// A connection framing at `cap` whose receive window stays at the initial window (the ceiling equals
@@ -1666,7 +1670,7 @@ mod tests {
     fn any_streams_any_loss_still_deliver(
       lens in prop::collection::vec(0usize..300, 1..4),
       drops in prop::collection::vec(0u64..150, 0..30),
-      law in 0usize..3,
+      law in 0usize..LAWS.len(),
     ) {
       let streams: Vec<(u64, Vec<u8>)> = lens
         .iter()
@@ -1684,7 +1688,7 @@ mod tests {
     fn any_streams_survive_loss_and_reorder(
       lens in prop::collection::vec(0usize..200, 1..4),
       drops in prop::collection::vec(0u64..120, 0..20),
-      law in 0usize..3,
+      law in 0usize..LAWS.len(),
     ) {
       let streams: Vec<(u64, Vec<u8>)> = lens
         .iter()

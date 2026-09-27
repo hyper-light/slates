@@ -461,6 +461,7 @@ mod tests {
       in_flight: 0,
       lost_total: MD,
       persistent: false,
+      srtt: 0,
     });
     assert_eq!(law.window(), 70 * MD, "cwnd × 0.7");
     assert_eq!(law.w_max, 85 * MD, "100 × (1 + 0.7) / 2");

@@ -14,6 +14,7 @@
 //! bytes in flight and the delivery-rate sampler (`crate::delivery`) and hands each law what it needs.
 
 pub mod bbr;
+pub mod copa;
 pub mod cubic;
 pub mod filter;
 pub mod newreno;
@@ -71,6 +72,8 @@ pub struct LossEvent<'a> {
   pub lost_total: u64,
   /// Whether these losses establish persistent congestion (RFC 9002 §7.6).
   pub persistent: bool,
+  /// The smoothed RTT (a law that acts at most once per round trip on loss reads it).
+  pub srtt: u64,
 }
 
 /// The control laws in the bake-off. Deleted, with the losers, once one is chosen.
@@ -82,7 +85,16 @@ pub enum ControllerKind {
   Cubic,
   /// draft-ietf-ccwg-bbr-06 (BBRv3).
   Bbr,
+  /// Copa (NSDI 2018) with the paper's default δ = 0.5.
+  Copa,
+  /// Copa with Meta's live-video δ = 0.04 (mvfst production setting).
+  CopaMeta,
 }
+
+/// Format: Copa §4.3 — the recommended default δ = 1/2, as the integer `1/δ`.
+const COPA_INV_DELTA: u64 = 2;
+/// Format: Meta's live-video δ = 0.04 (engineering.fb.com, 2019-11-17), as the integer `1/δ`.
+const COPA_META_INV_DELTA: u64 = 25;
 
 /// A connection's congestion controller.
 #[derive(Debug)]
@@ -93,6 +105,8 @@ pub enum Controller {
   Cubic(cubic::Cubic),
   /// BBR (boxed: its model is several times the others' size).
   Bbr(Box<bbr::Bbr>),
+  /// Copa, with its `1/δ` (distinguishing the two Copa kinds).
+  Copa(copa::Copa, ControllerKind),
 }
 
 impl Controller {
@@ -104,6 +118,10 @@ impl Controller {
       ControllerKind::NewReno => Controller::NewReno(newreno::NewReno::new(max_datagram)),
       ControllerKind::Cubic => Controller::Cubic(cubic::Cubic::new(max_datagram)),
       ControllerKind::Bbr => Controller::Bbr(Box::new(bbr::Bbr::new(max_datagram, now, seed))),
+      ControllerKind::Copa => Controller::Copa(copa::Copa::new(max_datagram, COPA_INV_DELTA), kind),
+      ControllerKind::CopaMeta => {
+        Controller::Copa(copa::Copa::new(max_datagram, COPA_META_INV_DELTA), kind)
+      }
     }
   }
 
@@ -120,6 +138,7 @@ impl Controller {
       Controller::NewReno(_) => ControllerKind::NewReno,
       Controller::Cubic(_) => ControllerKind::Cubic,
       Controller::Bbr(_) => ControllerKind::Bbr,
+      Controller::Copa(_, kind) => *kind,
     }
   }
 
@@ -130,6 +149,7 @@ impl Controller {
       Controller::NewReno(_) => {}
       Controller::Cubic(law) => law.on_sent(pn),
       Controller::Bbr(law) => law.on_transmit(now, in_flight, app_limited),
+      Controller::Copa(..) => {}
     }
   }
 
@@ -166,6 +186,12 @@ impl Controller {
         }
         law.on_ack(ack);
       }
+      Controller::Copa(law, _) => {
+        law.on_ack(ack);
+        if let Some(loss) = loss {
+          law.on_loss(loss);
+        }
+      }
     }
   }
 
@@ -175,6 +201,7 @@ impl Controller {
       Controller::NewReno(law) => law.on_loss(event),
       Controller::Cubic(law) => law.on_loss(event),
       Controller::Bbr(law) => law.on_loss(event),
+      Controller::Copa(law, _) => law.on_loss(event),
     }
   }
 
@@ -184,6 +211,7 @@ impl Controller {
       Controller::NewReno(law) => law.window(),
       Controller::Cubic(law) => law.window(),
       Controller::Bbr(law) => law.window(),
+      Controller::Copa(law, _) => law.window(),
     }
   }
 
@@ -193,6 +221,7 @@ impl Controller {
       Controller::NewReno(law) => loss_based_pacing_rate(law.window(), rtt),
       Controller::Cubic(law) => loss_based_pacing_rate(law.window(), rtt),
       Controller::Bbr(law) => law.pacing_rate(),
+      Controller::Copa(law, _) => law.pacing_rate(rtt.smoothed_rtt_or_initial()),
     }
   }
 
@@ -209,6 +238,7 @@ impl Controller {
       Controller::NewReno(law) => law.max_datagram(),
       Controller::Cubic(law) => law.max_datagram(),
       Controller::Bbr(law) => law.max_datagram(),
+      Controller::Copa(law, _) => law.max_datagram(),
     }
   }
 
@@ -219,6 +249,7 @@ impl Controller {
       Controller::NewReno(law) => law.in_slow_start(),
       Controller::Cubic(law) => law.in_slow_start(),
       Controller::Bbr(law) => law.in_startup(),
+      Controller::Copa(law, _) => law.in_slow_start(),
     }
   }
 }

@@ -138,6 +138,7 @@ mod tests {
       in_flight: 0,
       lost_total: 0,
       persistent,
+      srtt: 0,
     });
   }
 

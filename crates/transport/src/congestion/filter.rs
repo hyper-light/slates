@@ -80,6 +80,34 @@ impl WindowedMax {
   }
 }
 
+/// A windowed minimum filter: the same algorithm as [`WindowedMax`] over the negated order (Linux
+/// `minmax_running_min`) — the minimum of the samples over the last `window` time units in constant space.
+/// Copa's minimum-RTT, standing-RTT and mode-detection windows use it, as mvfst's Copa does [C].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowedMin {
+  inverted: WindowedMax,
+}
+
+impl WindowedMin {
+  /// A filter holding `value` at `time`.
+  pub fn new(time: u64, value: u64) -> WindowedMin {
+    WindowedMin {
+      inverted: WindowedMax::new(time, u64::MAX - value),
+    }
+  }
+
+  /// The current windowed minimum.
+  pub fn get(&self) -> u64 {
+    u64::MAX - self.inverted.get()
+  }
+
+  /// Folds in `value` taken at `time`, keeping the minimum over the last `window` time units, and returns
+  /// the new minimum.
+  pub fn update(&mut self, time: u64, window: u64, value: u64) -> u64 {
+    u64::MAX - self.inverted.update(time, window, u64::MAX - value)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -124,5 +152,19 @@ mod tests {
       "cycles 0–2 are within two units of cycle 2"
     );
     assert_eq!(filter.update(3, 2, 400), 600, "cycle 0 aged out");
+  }
+
+  /// The minimum filter tracks the smallest recent sample and forgets it once it ages out.
+  #[test]
+  fn the_minimum_filter_mirrors_the_maximum() {
+    let mut filter = WindowedMin::new(0, 100);
+    assert_eq!(filter.update(1, 10, 20), 20);
+    assert_eq!(filter.update(4, 10, 60), 20);
+    assert_eq!(filter.update(7, 10, 70), 20);
+    assert_eq!(
+      filter.update(12, 10, 80),
+      60,
+      "20 (t=1) aged out; 60 (t=4) is the least left"
+    );
   }
 }
