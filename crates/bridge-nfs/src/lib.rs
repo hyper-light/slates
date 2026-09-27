@@ -27,6 +27,7 @@ pub mod portmap;
 pub mod procedures;
 pub mod rpc;
 pub mod server;
+pub mod v4;
 pub mod xdr;
 
 pub use access::{Caller, Denial, UnixGroups, UnixIdentity, Want};
