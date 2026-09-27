@@ -106,6 +106,9 @@ authorized merely by appearing here.
   the macOS runner's host watcher missed the creation the mount's observed). Both forms now observe
   readiness — probe files until fswatch reports one; inotifywait's `Watches established.` — each wait
   bounded by the recorded watch time. Linux form verified 3/3 in a container; macOS on the next run.
+  The first Linux run over the mount then showed `grep: watch.log: No such file or directory` in the
+  output (CI 36284404440): the background job's redirect landed after the first poll over NFS. The
+  output files are now created before the watcher starts and the polls use `grep -s`.
 - [x] **The Linux adapter test asserted a capability `UMNT` detaches** (CI 36281600448): superseded by
   A-34; it now asserts a `UMNT` alone detaches nothing and the adapter's release does.
 - [x] **Linux lint wall: two macOS-only items unused off macOS** (`MOUNT_CALL_DEADLINE`, the test helper

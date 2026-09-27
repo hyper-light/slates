@@ -156,11 +156,13 @@ mkdir -p watched
 # Shape: FSEvents' coalescing latency (fswatch --latency), the resolution the watcher reports at, so
 # the waits poll at it.
 latency=0.1
+# The output file exists before the watcher starts, so no poll reads a file not yet created.
+: > events.txt
 fswatch --event Created --latency "$latency" watched > events.txt &
 watcher=$!
 deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
 probe=0
-until grep -q 'ready\.[0-9]' events.txt; do
+until grep -qs 'ready\.[0-9]' events.txt; do
   if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
   probe=$((probe + 1))
   : > "watched/ready.$probe"
@@ -169,7 +171,7 @@ done
 rm -f watched/ready.*
 printf 'x\n' > watched/new.txt
 deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
-until grep -q 'new\.txt' events.txt; do
+until grep -qs 'new\.txt' events.txt; do
   if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
   sleep "$latency"
 done
@@ -181,15 +183,20 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 /// The Linux watcher workload: inotifywait reports the creation of a file within [`ENV_WATCH_SECONDS`].
 /// As with the macOS form, the assertion is that the creation was observed, not the raw `events.txt`.
 /// The watcher's readiness is observed: inotifywait prints `Watches established.` once its watch is
-/// in place, and the file is created only after that line (bounded by the same wait).
+/// in place, and the file is created only after that line (bounded by the same wait). The output files
+/// are created before the watcher starts: over a network mount the background job's redirect can land
+/// after the first poll (CI 36284404440: `grep: watch.log: No such file or directory` in the output).
 const WATCHER_LINUX: &str = r#"
 mkdir -p watched
 # Shape: how often the watcher's readiness is checked, far below the recorded wait.
 poll=0.1
+# The output files exist before the watcher starts, so no poll reads a file not yet created.
+: > events.txt
+: > watch.log
 inotifywait -e create -t "$SLATES_WATCH_SECONDS" --format '%e %f' watched > events.txt 2> watch.log &
 watcher=$!
 deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
-until grep -q 'Watches established' watch.log; do
+until grep -qs 'Watches established' watch.log; do
   if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
   sleep "$poll"
 done
