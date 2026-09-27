@@ -180,7 +180,7 @@ const LATE_SERVE_BOUND_NS: u64 = 2 * DEADLINE_NS;
 fn run_probe(mode: TargetMode) -> ProbeResult {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   // A modelled path, so the round trip the probe measures is the path's, known to the nanosecond.
-  slates_rt::sim::sim_udp_set_delay(slates_rt::sim::SimDelay::in_order(PROBE_ONE_WAY_NS, 0));
+  slates_rt::sim::sim_udp_set_path(slates_rt::sim::SimPath::in_order(PROBE_ONE_WAY_NS, 0));
   let id = sim.shard_ids()[0];
 
   let prober_identity = self_signed(NAME);

@@ -30,7 +30,7 @@ use slates_cluster::{CommitBudget, Stragglers, TimedReply, broadcast, request_wi
 use slates_db::register::{HostId, Quorum};
 use slates_rt::futures::{now_ns, sleep};
 use slates_rt::runtime::RuntimeConfig;
-use slates_rt::sim::{SimDelay, SimRuntime, sim_udp_set_delay};
+use slates_rt::sim::{SimPath, SimRuntime, sim_udp_set_path};
 use slates_rt::udp::UdpSocket;
 use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
@@ -67,11 +67,11 @@ const ESTABLISH_ATTEMPTS: u32 = 4;
 /// Shape: the inter-region path — 80 ms one way ± 20 ms: Japan East → East US, published at a 162 ms P50
 /// round trip over the 30 days ending 2026-07-30 (Microsoft's "Azure network round-trip latency
 /// statistics"; the other pairs it stands beside are in `docs/wip/wan-timeout.md`).
-const INTER_REGION: SimDelay = SimDelay::in_order(80_000_000, 20_000_000);
+const INTER_REGION: SimPath = SimPath::in_order(80_000_000, 20_000_000);
 /// Shape: a geostationary-satellite class path — 500 ms one way ± 100 ms (two GEO hops; a single hop is
 /// ~250 ms one way from the 35,786 km orbit at the speed of light) — the profile at which a one-second
 /// election timeout is inside the leader's round, so the fixed timing campaigns against a live leader.
-const GEO_CLASS: SimDelay = SimDelay::in_order(500_000_000, 100_000_000);
+const GEO_CLASS: SimPath = SimPath::in_order(500_000_000, 100_000_000);
 
 /// The rule under test — the experiment's independent variable, applied to the same harness code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -759,13 +759,13 @@ impl Outcome {
 /// root task that spawns the node loops that own them, as the daemon's membership loop spawns its tasks.
 fn run_scenario(
   seed: u64,
-  profile: SimDelay,
+  profile: SimPath,
   rule: Rule,
   periods: u64,
   kill_leader_at_period: Option<u64>,
 ) -> Outcome {
   let mut sim = SimRuntime::new(&config(), seed).unwrap();
-  sim_udp_set_delay(profile);
+  sim_udp_set_path(profile);
   NODES.with(|nodes| {
     let mut nodes = nodes.borrow_mut();
     nodes.clear();
@@ -884,9 +884,9 @@ const KILL_AT_PERIOD: u64 = 150;
 /// the same to the nanosecond under both rules. The laptop and LAN fleet are unchanged by construction.
 #[test]
 fn at_the_lan_profile_the_derived_rule_is_the_fixed_rule_by_history() {
-  let fixed = run_scenario(11, SimDelay::NONE, FIXED, PERIODS, None);
+  let fixed = run_scenario(11, SimPath::NONE, FIXED, PERIODS, None);
   fixed.summary("LAN, fixed rule");
-  let derived = run_scenario(11, SimDelay::NONE, DERIVED, PERIODS, None);
+  let derived = run_scenario(11, SimPath::NONE, DERIVED, PERIODS, None);
   derived.summary("LAN, derived rule");
   assert!(
     !fixed.leader_events.is_empty(),
@@ -952,7 +952,7 @@ fn at_the_inter_region_profile_the_fixed_rule_never_elects_and_the_derived_rule_
 
 /// Every node's derived timing on a far path: the base above the floor, and the measured tail bounding
 /// the profile's round trip.
-fn assert_timing_is_above_the_floor(outcome: &Outcome, profile: SimDelay) {
+fn assert_timing_is_above_the_floor(outcome: &Outcome, profile: SimPath) {
   for report in &outcome.reports {
     assert!(
       report.timing.base_periods > ElectionTiming::floor().base_periods,

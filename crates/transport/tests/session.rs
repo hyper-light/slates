@@ -154,7 +154,7 @@ fn a_request_gets_a_reply_over_a_live_session() {
   let mut sim = SimRuntime::new(&config(), 1).unwrap();
   // A modelled half-millisecond each way, so the round trip the estimator must report is a known one
   // millisecond on the virtual clock rather than "some positive number" — an oracle, not a smoke test.
-  slates_rt::sim::sim_udp_set_delay(slates_rt::sim::SimDelay::in_order(HALF_MS_NS, 0));
+  slates_rt::sim::sim_udp_set_path(slates_rt::sim::SimPath::in_order(HALF_MS_NS, 0));
   let id = sim.shard_ids()[0];
 
   let request: Vec<u8> = (0..250u16)
@@ -273,7 +273,7 @@ const WAN_EXCHANGES: usize = 6;
 #[test]
 fn an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock() {
   let mut sim = SimRuntime::new(&config(), 3).unwrap();
-  slates_rt::sim::sim_udp_set_delay(slates_rt::sim::SimDelay::in_order(
+  slates_rt::sim::sim_udp_set_path(slates_rt::sim::SimPath::in_order(
     WAN_ONE_WAY_NS,
     WAN_JITTER_NS,
   ));

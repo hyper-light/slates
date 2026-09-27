@@ -1,6 +1,10 @@
 # NFS over thin and unstable links: TCP, QUIC, and where the transport belongs
 
-Status: research note and design proposal, **not ratified and not implemented** (2026-09-27). Ada
+Status: research note and design proposal, **ratified by Ada 2026-09-27** with these instructions:
+the placement (§8.1) stands; every §5 change is built, each contested choice decided by an end-to-end
+bake-off under stress, and the loser removed (no fallback kept); RPC-over-QUIC (§6) is built now and
+decided by the same kind of bake-off; the measurement lane (§9) is approved. The build ledger at the end
+records each slice as it lands. Ada
 asked whether slates' NFSv4.x should replace TCP with a QUIC-like UDP transport, because TCP holds
 up poorly on low-bandwidth or unstable links, and asked for the design to centre on low latency over
 limited bandwidth. This note records the evidence, answers the question, and proposes the design.
@@ -291,3 +295,15 @@ Each scenario measures:
   2026-07-15 — https://ratatoskr.run/linux-cifs/2026/07/17265232/t
 - Linux `nfs(5)` (`nconnect`) — https://www.man7.org/linux/man-pages/man5/nfs.5.html; Linux
   ip-sysctl (`tcp_allowed_congestion_control`) — https://docs.kernel.org/5.10/networking/ip-sysctl.html
+
+## Build ledger
+
+- **Slice 1 (2026-09-27): the network under test.** The simulated fabric (`crates/rt/src/sim.rs`) now
+  models a bottleneck link serializing at its rate into a bounded drop-tail queue that several flows
+  share (`SimLink`), Gilbert–Elliott random and burst loss (`SimLoss`), a path MTU, a bounded receive
+  buffer (the mailbox had been unbounded), and a NAT whose mapping expires and rebinds (`SimNat`), with
+  drop counters by cause (`SimFabricStats`). `SimDelay` became `SimPath` (replaced, not layered).
+  Proven by `crates/rt/tests/sim_path.rs`: closed-form serialization and queue arithmetic, binomial loss
+  bounds, burst run length, the MTU black hole, the buffer bound, NAT expiry and rebinding, and seed
+  replay. The first run found the model's own bug: an answer to an expired NAT port was counted as a
+  closed port's drop.

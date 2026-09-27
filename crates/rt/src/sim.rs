@@ -9,11 +9,13 @@
 //! Kicks carry a registration generation and pin the flags for their borrow; the owning
 //! driver borrows them until its context ends. The runtime owns the shared clock.
 //!
-//! The simulated UDP fabric below carries the fleet plane at N=1 and, since 2026-09-14, models a path's
-//! latency ([`SimDelay`]: a one-way delay with seeded jitter, in order per flow unless told otherwise) so
-//! the consensus timing rules of §4.8 — "election timeout ≥ 10 × broadcast RTT p99" — are provable on a
-//! WAN profile under this virtual clock rather than only on a loopback where every round trip sits inside
-//! one heartbeat (`docs/wip/wan-timeout.md`).
+//! The simulated UDP fabric below carries the fleet plane at N=1 and models the network under test
+//! ([`SimPath`]): a one-way delay with seeded jitter (since 2026-09-14, so the consensus timing rules of
+//! §4.8 are provable on a WAN profile, `docs/wip/wan-timeout.md`), and since 2026-09-27 a bottleneck link
+//! with a drop-tail queue shared by the flows through it ([`SimLink`]), Gilbert–Elliott random and burst
+//! loss ([`SimLoss`]), a path MTU, a bounded receive buffer, and a NAT whose mapping expires and rebinds
+//! ([`SimNat`]) — every condition the session plane's constrained-link design is proven against
+//! (`docs/wip/research/nfs-transport-constrained-links.md` §5, §9), deterministic from the seed.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -33,49 +35,203 @@ use std::collections::{BTreeMap, VecDeque};
 
 use slates_mem::Encoded;
 
-/// The latency profile of a modelled path on the simulated fabric (§4.8 A-9's required evidence:
-/// "independently delayed … and reordered messages"): a one-way delay, a symmetric jitter around it drawn
-/// from the simulation's seeded generator, and whether the path may hand a later datagram of one flow to
-/// its receiver before an earlier one. The fabric's default is the zero path — no delay, no jitter — on
-/// which a datagram is delivered the instant it is sent, exactly as the fabric always did (the model is
-/// additive: every simulation that never sets a profile runs unchanged, R8). A profile is data describing
-/// the network under test, never a mode of the code that runs over it.
+/// Format: parts per million, the unit every probability of the path model is stated in (an integer
+/// so a profile is exact, comparable and replayable; one million is certainty).
+pub const PPM: u32 = 1_000_000;
+
+/// Format: nanoseconds per second, for the serialization time of a datagram at a link's bit rate.
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// Format: bits per byte.
+const BITS_PER_BYTE: u128 = 8;
+
+/// A packet-loss process on a modelled path: the two-state Gilbert–Elliott channel [A: Gilbert, BSTJ
+/// 1960; Elliott, BSTJ 1963], the standard model of both independent loss (one state) and bursty loss
+/// (a "bad" state entered and left with the given per-datagram probabilities). Every probability is in
+/// parts per million ([`PPM`]); the state is kept per directed flow and drawn from the fabric's seeded
+/// generator, so a scenario replays exactly from its seed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct SimDelay {
-  /// The one-way delay of the path, nanoseconds.
-  one_way_ns: u64,
-  /// The half-width of the jitter, nanoseconds: each datagram's flight is `one_way ± jitter`, uniform.
-  jitter_ns: u64,
-  /// Whether a datagram may overtake an earlier one on the same directed flow. `false` — the path queues
-  /// in order: an arrival is clamped to no earlier than the previous datagram's on that flow, so jitter
-  /// spreads the gaps but never reorders. `true` — the jitter alone decides, so a later datagram can land
-  /// first, the reordering a consumer's dedup and reorder paths are exercised against.
-  reorders: bool,
+pub struct SimLoss {
+  /// Per-datagram probability of moving from the good state to the bad one.
+  good_to_bad_ppm: u32,
+  /// Per-datagram probability of moving from the bad state back to the good one.
+  bad_to_good_ppm: u32,
+  /// Loss probability of a datagram sent in the good state.
+  good_loss_ppm: u32,
+  /// Loss probability of a datagram sent in the bad state.
+  bad_loss_ppm: u32,
 }
 
-impl SimDelay {
-  /// The zero path: delivered at once (the fabric's default).
-  pub const NONE: SimDelay = SimDelay {
+impl SimLoss {
+  /// No loss.
+  pub const NONE: SimLoss = SimLoss {
+    good_to_bad_ppm: 0,
+    bad_to_good_ppm: PPM,
+    good_loss_ppm: 0,
+    bad_loss_ppm: 0,
+  };
+
+  /// Independent (Bernoulli) loss of `loss_ppm` per datagram.
+  pub const fn random(loss_ppm: u32) -> SimLoss {
+    SimLoss {
+      good_to_bad_ppm: 0,
+      bad_to_good_ppm: PPM,
+      good_loss_ppm: loss_ppm,
+      bad_loss_ppm: loss_ppm,
+    }
+  }
+
+  /// Bursty loss: the channel enters a burst with probability `enter_ppm` per datagram, leaves it with
+  /// `leave_ppm` (so a burst lasts `PPM / leave_ppm` datagrams on average), and loses `burst_loss_ppm`
+  /// of the datagrams sent inside a burst and none outside it.
+  pub const fn bursty(enter_ppm: u32, leave_ppm: u32, burst_loss_ppm: u32) -> SimLoss {
+    SimLoss {
+      good_to_bad_ppm: enter_ppm,
+      bad_to_good_ppm: leave_ppm,
+      good_loss_ppm: 0,
+      bad_loss_ppm: burst_loss_ppm,
+    }
+  }
+
+  /// Whether this process ever loses anything (so a loss-free path draws nothing from the generator).
+  const fn is_lossless(&self) -> bool {
+    self.good_loss_ppm == 0 && self.bad_loss_ppm == 0
+  }
+}
+
+/// A draw that succeeds with probability `ppm` parts per million.
+fn chance(rng: &mut Xorshift, ppm: u32) -> bool {
+  let bound = usize::try_from(PPM).unwrap_or(usize::MAX);
+  u32::try_from(rng.below(bound)).unwrap_or(PPM) < ppm
+}
+
+/// A bottleneck link on the simulated fabric: datagrams through it are serialized at its bit rate one
+/// after another, and wait in its drop-tail queue of `queue_bytes` while it is busy — a datagram that
+/// would overflow the queue is dropped (the congestion loss a sender's controller must react to, and the
+/// standing queue whose delay bufferbloat is). Several directed paths may name one link, so their flows
+/// compete for its capacity (the single-bottleneck "dumbbell" of congestion-control evaluation, RFC 5166).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimLink {
+  /// The link's capacity in bits per second.
+  pub rate_bits_per_second: u64,
+  /// The queue ahead of the link, in bytes; a datagram arriving when the backlog plus itself exceeds it
+  /// is dropped.
+  pub queue_bytes: u64,
+}
+
+/// A link added to this thread's fabric ([`sim_udp_add_link`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SimLinkId(u32);
+
+/// A link's running state: its configuration and the instant its transmitter is next free.
+#[derive(Debug)]
+struct LinkState {
+  link: SimLink,
+  busy_until_ns: u64,
+}
+
+impl LinkState {
+  /// The time `bytes` occupy the link at its rate, nanoseconds (rounded up, so a datagram always takes
+  /// time on a finite link).
+  fn serialization_ns(&self, bytes: usize) -> u64 {
+    let rate = u128::from(self.link.rate_bits_per_second.max(1));
+    let bits = (bytes as u128).saturating_mul(BITS_PER_BYTE);
+    u64::try_from((bits.saturating_mul(NANOS_PER_SECOND)).div_ceil(rate)).unwrap_or(u64::MAX)
+  }
+
+  /// The bytes waiting ahead of a datagram arriving at `now` — the backlog the transmitter still has to
+  /// send, from how long it stays busy at its rate.
+  fn backlog_bytes(&self, now: u64) -> u64 {
+    let busy_ns = u128::from(self.busy_until_ns.saturating_sub(now));
+    let bits =
+      busy_ns.saturating_mul(u128::from(self.link.rate_bits_per_second)) / NANOS_PER_SECOND;
+    u64::try_from(bits / BITS_PER_BYTE).unwrap_or(u64::MAX)
+  }
+}
+
+/// The model of one directed path on the simulated fabric (§4.8 A-9; §4.10a): a one-way propagation
+/// delay with seeded jitter (in order per flow unless told it may reorder), an optional bottleneck
+/// [`SimLink`] ahead of it, a [`SimLoss`] process, and an optional path MTU above which a datagram is
+/// dropped (the black hole a path-MTU prober must find, RFC 8899). The fabric's default is the zero
+/// path — delivered the instant it is sent, as the fabric always did — so a simulation that never sets
+/// a profile runs unchanged. A profile is data describing the network under test, never a mode of the
+/// code that runs over it (R8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimPath {
+  /// The one-way propagation delay of the path, nanoseconds.
+  one_way_ns: u64,
+  /// The half-width of the jitter, nanoseconds: each datagram's propagation is `one_way ± jitter`.
+  jitter_ns: u64,
+  /// Whether a datagram may overtake an earlier one on the same directed flow. `false` — an arrival is
+  /// clamped to no earlier than the previous datagram's on that flow; `true` — the jitter alone decides.
+  reorders: bool,
+  /// The loss process.
+  loss: SimLoss,
+  /// The largest datagram the path carries; a larger one is dropped. `None` — no limit.
+  mtu: Option<usize>,
+  /// The bottleneck the path's datagrams are serialized through, if any.
+  link: Option<SimLinkId>,
+}
+
+impl Default for SimPath {
+  fn default() -> SimPath {
+    SimPath::NONE
+  }
+}
+
+impl SimPath {
+  /// The zero path: delivered at once, nothing lost (the fabric's default).
+  pub const NONE: SimPath = SimPath {
     one_way_ns: 0,
     jitter_ns: 0,
     reorders: false,
+    loss: SimLoss::NONE,
+    mtu: None,
+    link: None,
   };
 
   /// A path of `one_way_ns ± jitter_ns` that keeps each flow in send order.
-  pub const fn in_order(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
-    SimDelay {
+  pub const fn in_order(one_way_ns: u64, jitter_ns: u64) -> SimPath {
+    SimPath {
       one_way_ns,
       jitter_ns,
       reorders: false,
+      loss: SimLoss::NONE,
+      mtu: None,
+      link: None,
     }
   }
 
   /// A path of `one_way_ns ± jitter_ns` whose jitter may reorder a flow.
-  pub const fn reordering(one_way_ns: u64, jitter_ns: u64) -> SimDelay {
-    SimDelay {
+  pub const fn reordering(one_way_ns: u64, jitter_ns: u64) -> SimPath {
+    SimPath {
       one_way_ns,
       jitter_ns,
       reorders: true,
+      loss: SimLoss::NONE,
+      mtu: None,
+      link: None,
+    }
+  }
+
+  /// This path, losing datagrams by `loss`.
+  pub const fn with_loss(self, loss: SimLoss) -> SimPath {
+    SimPath { loss, ..self }
+  }
+
+  /// This path, dropping every datagram longer than `mtu` bytes.
+  pub const fn with_mtu(self, mtu: usize) -> SimPath {
+    SimPath {
+      mtu: Some(mtu),
+      ..self
+    }
+  }
+
+  /// This path, serialized through `link` before it propagates.
+  pub const fn through(self, link: SimLinkId) -> SimPath {
+    SimPath {
+      link: Some(link),
+      ..self
     }
   }
 
@@ -89,9 +245,8 @@ impl SimDelay {
     self.jitter_ns
   }
 
-  /// One datagram's flight time: `one_way − jitter + U[0, 2·jitter]` from `rng` (uniform over the
-  /// symmetric span; saturating at zero), or exactly the one-way delay when there is no jitter — so a
-  /// jitter-free profile draws nothing and leaves the generator untouched.
+  /// One datagram's propagation time: `one_way − jitter + U[0, 2·jitter]` from `rng`, or exactly the
+  /// one-way delay when there is no jitter (drawing nothing).
   fn draw(&self, rng: &mut Xorshift) -> u64 {
     if self.jitter_ns == 0 {
       return self.one_way_ns;
@@ -105,6 +260,56 @@ impl SimDelay {
   }
 }
 
+/// A NAT in front of a fabric port (RFC 4787's endpoint-independent mapping): the port's outbound
+/// datagrams leave from an external port the NAT allocates; inbound datagrams to that external port reach
+/// the inside port only while the mapping is alive — refreshed by each outbound datagram and expired
+/// after `idle_timeout_ns` without one. The next outbound datagram after an expiry allocates a fresh
+/// external port: the address change a peer sees as a NAT rebinding (RFC 9000 §9.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SimNat {
+  /// How long a mapping survives without outbound traffic, nanoseconds.
+  pub idle_timeout_ns: u64,
+}
+
+/// A NAT's running state for one inside port.
+#[derive(Debug)]
+struct NatState {
+  nat: SimNat,
+  /// The current external port and the time of the last outbound datagram through it.
+  mapping: Option<(u16, u64)>,
+}
+
+/// What the fabric did with the datagrams sent on it — the non-vacuity counters of every stress
+/// scenario (a test of loss recovery asserts `dropped_loss` moved, of congestion `dropped_queue`, of
+/// path-MTU discovery `dropped_mtu`, of migration `dropped_nat`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimFabricStats {
+  /// Datagrams handed to a receiver's mailbox.
+  pub delivered: u64,
+  /// Datagrams dropped because a link's queue was full.
+  pub dropped_queue: u64,
+  /// Datagrams dropped by a path's loss process.
+  pub dropped_loss: u64,
+  /// Datagrams dropped for exceeding a path's MTU.
+  pub dropped_mtu: u64,
+  /// Datagrams dropped at a NAT whose mapping had expired or never existed.
+  pub dropped_nat: u64,
+  /// Datagrams dropped because the receiver's buffer was full.
+  pub dropped_receive_buffer: u64,
+  /// Datagrams addressed to a port no socket is bound to.
+  pub dropped_unbound: u64,
+  /// The largest backlog any link's queue held, in bytes.
+  pub peak_queue_bytes: u64,
+}
+
+/// A bound port's receive queue: the datagrams (bytes, source port) and the bytes they hold, bounded by
+/// [`SIM_RECV_BUFFER_BYTES`].
+#[derive(Debug, Default)]
+struct Mailbox {
+  queue: VecDeque<(Vec<u8>, u16)>,
+  held: usize,
+}
+
 /// A datagram the fabric holds until its arrival time.
 #[derive(Debug)]
 struct InFlight {
@@ -113,37 +318,49 @@ struct InFlight {
   from: u16,
 }
 
-/// The simulated UDP fabric (§4.10a): a deterministic, in-memory datagram switch so the fleet plane
+/// The simulated UDP fabric (§4.10a): a deterministic, in-memory datagram network so the fleet plane
 /// is testable at N=1 without the OS network — the "sim arm first" the design's phasing calls for.
 /// It is a thread-local because the simulation runs on one thread (so no `Send`/`Sync`, no lock), and
 /// wakes a waiting receiver through the registry, the same path a real driver completion takes.
 ///
-/// Latency (§4.8 A-9): every send is timed against the simulation clock the runtime installs
-/// ([`sim_fabric_reset`]) and the path's [`SimDelay`] — the directed pair's override, else the fabric-wide
-/// profile. A datagram whose arrival is now (the zero path) goes straight to its mailbox; one whose arrival
-/// is later waits in flight, ordered by arrival, and the simulation loop hands it over — and wakes its
-/// receiver — once the clock reaches it ([`SimRuntime::run_until_idle`] also treats the earliest arrival
-/// as a deadline the clock may advance to, so a fleet whose only pending event is a datagram in flight
-/// proceeds). With no clock installed (a fabric used without a `SimRuntime`) "now" is zero and only the
-/// zero path delivers — the latency model needs the clock that drives it.
+/// Every send is timed against the simulation clock the runtime installs ([`sim_fabric_reset`]) and the
+/// directed pair's [`SimPath`] (else the fabric-wide one): a datagram is dropped past the path MTU, is
+/// serialized through its bottleneck link (dropped if the link's queue is full), is lost by the path's
+/// loss process, then propagates. A datagram whose arrival is now goes straight to its mailbox; a later
+/// one waits in flight, ordered by arrival, and the simulation loop hands it over — and wakes its receiver
+/// — once the clock reaches it ([`SimRuntime::run_until_idle`] also treats the earliest arrival as a
+/// deadline the clock may advance to). A receiver's mailbox holds at most [`SIM_RECV_BUFFER_BYTES`], the
+/// bound a kernel socket buffer has, and drops past it. With no clock installed "now" is zero.
 #[derive(Debug)]
 pub struct SimFabric {
   next_port: u16,
-  mailboxes: BTreeMap<u16, VecDeque<(Vec<u8>, u16)>>,
+  /// Each bound port's queued datagrams.
+  mailboxes: BTreeMap<u16, Mailbox>,
   interests: BTreeMap<u16, u64>,
-  /// The seeded generator the jitter is drawn from — the fabric's own stream, so a profile's draws never
-  /// perturb the shards' generators and a run replays exactly from its seed.
+  /// The seeded generator the jitter and loss are drawn from — the fabric's own stream, so a profile's
+  /// draws never perturb the shards' generators and a run replays exactly from its seed.
   rng: Xorshift,
-  /// The profile of every path without a directed override.
-  default_delay: SimDelay,
-  /// Directed overrides, keyed `(from, dest)`.
-  pair_delays: BTreeMap<(u16, u16), SimDelay>,
+  /// The path of every directed pair without an override.
+  default_path: SimPath,
+  /// Directed overrides, keyed `(from, dest)` by the sockets' own ports.
+  pair_paths: BTreeMap<(u16, u16), SimPath>,
+  /// The bottleneck links, by id.
+  links: Vec<LinkState>,
+  /// Each directed flow's Gilbert–Elliott state: `true` while in the bad (burst) state.
+  loss_state: BTreeMap<(u16, u16), bool>,
+  /// NATs by inside port, and the current external→inside mappings.
+  nats: BTreeMap<u16, NatState>,
+  external: BTreeMap<u16, u16>,
+  /// Every external port a NAT has allocated, live or expired, so a datagram to an expired mapping is
+  /// counted as the NAT's drop rather than a closed port's. Bounded by the 16-bit port space.
+  nat_ports: std::collections::BTreeSet<u16>,
   /// Datagrams not yet arrived, keyed by arrival time then send sequence (so two arrivals at one instant
   /// keep send order and never collide).
   in_flight: BTreeMap<(u64, u64), InFlight>,
   next_sequence: u64,
   /// The latest arrival scheduled on each directed flow, the floor an in-order path clamps the next to.
   last_arrival: BTreeMap<(u16, u16), u64>,
+  stats: SimFabricStats,
 }
 
 /// Format: the salt that separates the fabric's generator stream from the shards' (both are seeded from
@@ -158,11 +375,17 @@ impl SimFabric {
       mailboxes: BTreeMap::new(),
       interests: BTreeMap::new(),
       rng: Xorshift::new(seed ^ FABRIC_SEED_SALT),
-      default_delay: SimDelay::NONE,
-      pair_delays: BTreeMap::new(),
+      default_path: SimPath::NONE,
+      pair_paths: BTreeMap::new(),
+      links: Vec::new(),
+      loss_state: BTreeMap::new(),
+      nats: BTreeMap::new(),
+      external: BTreeMap::new(),
+      nat_ports: std::collections::BTreeSet::new(),
       in_flight: BTreeMap::new(),
       next_sequence: 0,
       last_arrival: BTreeMap::new(),
+      stats: SimFabricStats::default(),
     }
   }
 
@@ -173,31 +396,131 @@ impl SimFabric {
     port
   }
 
-  /// Virtual now: the clock of the shard sending on this fabric (every send runs on a simulated shard,
-  /// whose driver holds the simulation clock), or zero off a shard. The fabric holds no clock of its
-  /// own, so it never outlives one: a simulation's clock is owned by its runtime.
+  /// Virtual now: the clock of the shard sending on this fabric, or zero off a shard.
   fn now_ns(&self) -> u64 {
     crate::futures::now_ns()
   }
 
-  /// Sends a datagram from `from` to `dest`: delivered now on the zero path (returning a waker word to
-  /// wake if a receiver was waiting), or scheduled for its drawn arrival on a delayed one.
-  fn send(&mut self, dest: u16, bytes: &[u8], from: u16) -> Option<u64> {
-    let now = self.now_ns();
-    let profile = self
-      .pair_delays
+  /// The source port a datagram from `from` carries on the wire: `from` itself, or its NAT's current
+  /// external port — allocating a fresh one when the mapping is absent or expired (a rebinding), and
+  /// refreshing the mapping either way.
+  fn translate_outbound(&mut self, from: u16, now: u64) -> u16 {
+    let Some((idle_timeout_ns, mapping)) = self
+      .nats
+      .get(&from)
+      .map(|state| (state.nat.idle_timeout_ns, state.mapping))
+    else {
+      return from;
+    };
+    let alive = mapping
+      .filter(|(_, last)| now.saturating_sub(*last) <= idle_timeout_ns)
+      .map(|(port, _)| port);
+    let port = match alive {
+      Some(port) => port,
+      None => {
+        if let Some((old, _)) = mapping {
+          self.external.remove(&old);
+        }
+        let fresh = self.bind();
+        self.mailboxes.remove(&fresh);
+        self.external.insert(fresh, from);
+        self.nat_ports.insert(fresh);
+        fresh
+      }
+    };
+    if let Some(state) = self.nats.get_mut(&from) {
+      state.mapping = Some((port, now));
+    }
+    port
+  }
+
+  /// The inside port a datagram addressed to `dest` reaches at `now`: `dest` itself when no NAT owns
+  /// it, the inside port behind a live mapping, or `None` when it names an expired or unknown mapping.
+  fn translate_inbound(&self, dest: u16, now: u64) -> Option<u16> {
+    let Some(&inside) = self.external.get(&dest) else {
+      // An inside port is reachable only through its NAT, and an expired external port reaches nothing.
+      return (!self.nats.contains_key(&dest) && !self.nat_ports.contains(&dest)).then_some(dest);
+    };
+    let state = self.nats.get(&inside)?;
+    let (port, last) = state.mapping?;
+    (port == dest && now.saturating_sub(last) <= state.nat.idle_timeout_ns).then_some(inside)
+  }
+
+  /// The path a datagram from `from` to `dest` takes (both the sockets' own ports).
+  fn path(&self, from: u16, dest: u16) -> SimPath {
+    self
+      .pair_paths
       .get(&(from, dest))
       .copied()
-      .unwrap_or(self.default_delay);
-    let mut arrival = now.saturating_add(profile.draw(&mut self.rng));
-    if !profile.reorders
-      && let Some(previous) = self.last_arrival.get(&(from, dest))
+      .unwrap_or(self.default_path)
+  }
+
+  /// Whether the flow's loss process drops the next datagram, advancing its Gilbert–Elliott state.
+  fn lose(&mut self, flow: (u16, u16), loss: SimLoss) -> bool {
+    if loss.is_lossless() {
+      return false;
+    }
+    let bad = self.loss_state.get(&flow).copied().unwrap_or(false);
+    let next = if bad {
+      !chance(&mut self.rng, loss.bad_to_good_ppm)
+    } else {
+      chance(&mut self.rng, loss.good_to_bad_ppm)
+    };
+    self.loss_state.insert(flow, next);
+    chance(
+      &mut self.rng,
+      if next {
+        loss.bad_loss_ppm
+      } else {
+        loss.good_loss_ppm
+      },
+    )
+  }
+
+  /// Sends a datagram from socket `from` to address port `dest`: returns the waker word of a receiver to
+  /// wake when it is delivered at once, or schedules (or drops) it per the path.
+  fn send(&mut self, dest: u16, bytes: &[u8], from: u16) -> Option<u64> {
+    let now = self.now_ns();
+    let wire_from = self.translate_outbound(from, now);
+    // The path is chosen by the two sockets, so a scenario configures it by the ports it bound; a
+    // datagram to a NAT's external port follows the path to the inside port behind it.
+    let path_dest = self.external.get(&dest).copied().unwrap_or(dest);
+    let path = self.path(from, path_dest);
+    if path.mtu.is_some_and(|mtu| bytes.len() > mtu) {
+      self.stats.dropped_mtu = self.stats.dropped_mtu.saturating_add(1);
+      return None;
+    }
+    let mut departure = now;
+    if let Some(SimLinkId(index)) = path.link
+      && let Some(link) = self
+        .links
+        .get_mut(usize::try_from(index).unwrap_or(usize::MAX))
+    {
+      let backlog = link.backlog_bytes(now);
+      if backlog.saturating_add(bytes.len() as u64) > link.link.queue_bytes {
+        self.stats.dropped_queue = self.stats.dropped_queue.saturating_add(1);
+        return None;
+      }
+      self.stats.peak_queue_bytes = self.stats.peak_queue_bytes.max(backlog);
+      departure = link
+        .busy_until_ns
+        .max(now)
+        .saturating_add(link.serialization_ns(bytes.len()));
+      link.busy_until_ns = departure;
+    }
+    if self.lose((from, path_dest), path.loss) {
+      self.stats.dropped_loss = self.stats.dropped_loss.saturating_add(1);
+      return None;
+    }
+    let mut arrival = departure.saturating_add(path.draw(&mut self.rng));
+    if !path.reorders
+      && let Some(previous) = self.last_arrival.get(&(from, path_dest))
     {
       arrival = arrival.max(*previous);
     }
-    self.last_arrival.insert((from, dest), arrival);
+    self.last_arrival.insert((from, path_dest), arrival);
     if arrival <= now {
-      return self.deliver(dest, bytes.to_vec(), from);
+      return self.arrive(dest, bytes.to_vec(), wire_from, now);
     }
     let sequence = self.next_sequence;
     self.next_sequence = self.next_sequence.saturating_add(1);
@@ -206,20 +529,32 @@ impl SimFabric {
       InFlight {
         dest,
         bytes: bytes.to_vec(),
-        from,
+        from: wire_from,
       },
     );
     None
   }
 
-  /// Puts a datagram in `dest`'s mailbox; returns the waker word of a receiver waiting on it.
-  fn deliver(&mut self, dest: u16, bytes: Vec<u8>, from: u16) -> Option<u64> {
-    self
-      .mailboxes
-      .entry(dest)
-      .or_default()
-      .push_back((bytes, from));
-    self.interests.remove(&dest)
+  /// A datagram reaching address port `dest` at `now`: through a NAT's live mapping to its inside port,
+  /// into the receiver's mailbox within its buffer bound; returns the waker word of a waiting receiver.
+  fn arrive(&mut self, dest: u16, bytes: Vec<u8>, from: u16, now: u64) -> Option<u64> {
+    let Some(inside) = self.translate_inbound(dest, now) else {
+      self.stats.dropped_nat = self.stats.dropped_nat.saturating_add(1);
+      return None;
+    };
+    let Some(Mailbox { queue, held }) = self.mailboxes.get_mut(&inside) else {
+      // No socket is bound there: the datagram is dropped, as the OS drops one to a closed port.
+      self.stats.dropped_unbound = self.stats.dropped_unbound.saturating_add(1);
+      return None;
+    };
+    if held.saturating_add(bytes.len()) > SIM_RECV_BUFFER_BYTES {
+      self.stats.dropped_receive_buffer = self.stats.dropped_receive_buffer.saturating_add(1);
+      return None;
+    }
+    *held = held.saturating_add(bytes.len());
+    queue.push_back((bytes, from));
+    self.stats.delivered = self.stats.delivered.saturating_add(1);
+    self.interests.remove(&inside)
   }
 
   /// Hands over every in-flight datagram whose arrival is at or before `now`, in arrival order, and
@@ -230,8 +565,9 @@ impl SimFabric {
       if entry.key().0 > now {
         break;
       }
+      let arrival = entry.key().0;
       let InFlight { dest, bytes, from } = entry.remove();
-      if let Some(word) = self.deliver(dest, bytes, from) {
+      if let Some(word) = self.arrive(dest, bytes, from, arrival) {
         wakes.push(word);
       }
     }
@@ -244,12 +580,19 @@ impl SimFabric {
   }
 
   fn recv(&mut self, port: u16) -> Option<(Vec<u8>, u16)> {
-    self.mailboxes.get_mut(&port)?.pop_front()
+    let mailbox = self.mailboxes.get_mut(&port)?;
+    let (bytes, from) = mailbox.queue.pop_front()?;
+    mailbox.held = mailbox.held.saturating_sub(bytes.len());
+    Some((bytes, from))
   }
 
   /// Records one-shot read interest; returns a waker word to wake now if a datagram already waits.
   fn register(&mut self, port: u16, word: u64) -> Option<u64> {
-    if self.mailboxes.get(&port).is_some_and(|q| !q.is_empty()) {
+    if self
+      .mailboxes
+      .get(&port)
+      .is_some_and(|mailbox| !mailbox.queue.is_empty())
+    {
       return Some(word);
     }
     self.interests.insert(port, word);
@@ -262,25 +605,82 @@ thread_local! {
 }
 
 /// Resets the thread's simulated UDP fabric for a fresh simulation: an empty network on the zero path,
-/// drawing its jitter from `seed`.
+/// drawing its jitter and loss from `seed`.
 pub(crate) fn sim_fabric_reset(seed: u64) {
   SIM_FABRIC.with(|f| *f.borrow_mut() = SimFabric::new(seed));
 }
 
-/// Sets the latency profile of every path on this thread's fabric that has no directed override — the
-/// whole modelled network at one profile (every node in its own region, the worst case for a council).
-/// Takes effect for datagrams sent from now on; call it after `SimRuntime::new` (which resets the fabric)
-/// and before the tasks that send.
-pub fn sim_udp_set_delay(delay: SimDelay) {
-  SIM_FABRIC.with(|f| f.borrow_mut().default_delay = delay);
+/// Sets the path of every directed pair on this thread's fabric that has no override — the whole
+/// modelled network at one profile. Takes effect for datagrams sent from now on; call it after
+/// `SimRuntime::new` (which resets the fabric) and before the tasks that send.
+pub fn sim_udp_set_path(path: SimPath) {
+  SIM_FABRIC.with(|f| f.borrow_mut().default_path = path);
 }
 
-/// Sets the latency profile of the directed path from port `from` to port `dest`, overriding the fabric's
-/// default for that pair only — a near pair inside a far fleet, or an asymmetric route.
-pub fn sim_udp_set_pair_delay(from: u16, dest: u16, delay: SimDelay) {
+/// Sets the path from socket port `from` to socket port `dest`, overriding the fabric's default for that
+/// directed pair only — a near pair inside a far fleet, an asymmetric route, or one flow's bottleneck.
+pub fn sim_udp_set_pair_path(from: u16, dest: u16, path: SimPath) {
   SIM_FABRIC.with(|f| {
-    f.borrow_mut().pair_delays.insert((from, dest), delay);
+    f.borrow_mut().pair_paths.insert((from, dest), path);
   });
+}
+
+/// Adds a bottleneck link to this thread's fabric; paths name it with [`SimPath::through`].
+pub fn sim_udp_add_link(link: SimLink) -> SimLinkId {
+  SIM_FABRIC.with(|f| {
+    let mut fabric = f.borrow_mut();
+    let id = SimLinkId(u32::try_from(fabric.links.len()).unwrap_or(u32::MAX));
+    fabric.links.push(LinkState {
+      link,
+      busy_until_ns: 0,
+    });
+    id
+  })
+}
+
+/// Changes a link's rate and queue from now on (a path whose capacity drops or recovers mid-run — the
+/// variable-bandwidth case a controller must follow); the backlog already queued drains at the old
+/// timing.
+pub fn sim_udp_set_link(id: SimLinkId, link: SimLink) {
+  SIM_FABRIC.with(|f| {
+    if let Some(state) = f
+      .borrow_mut()
+      .links
+      .get_mut(usize::try_from(id.0).unwrap_or(usize::MAX))
+    {
+      state.link = link;
+    }
+  });
+}
+
+/// Puts a NAT in front of socket port `inside`: its datagrams leave from an external port that expires
+/// after `nat.idle_timeout_ns` without outbound traffic.
+pub fn sim_udp_set_nat(inside: u16, nat: SimNat) {
+  SIM_FABRIC.with(|f| {
+    f.borrow_mut()
+      .nats
+      .insert(inside, NatState { nat, mapping: None });
+  });
+}
+
+/// Expires the NAT mapping in front of `inside` now, so its next datagram leaves from a fresh external
+/// port — an address change at a moment the scenario chooses (a Wi-Fi to cellular move, a NAT reboot).
+pub fn sim_udp_rebind(inside: u16) {
+  SIM_FABRIC.with(|f| {
+    let mut fabric = f.borrow_mut();
+    let old = fabric
+      .nats
+      .get_mut(&inside)
+      .and_then(|state| state.mapping.take());
+    if let Some((port, _)) = old {
+      fabric.external.remove(&port);
+    }
+  });
+}
+
+/// What the fabric has done so far (delivered and dropped datagrams by cause, the peak queue).
+pub fn sim_udp_stats() -> SimFabricStats {
+  SIM_FABRIC.with(|f| f.borrow().stats)
 }
 
 /// Hands over every in-flight datagram due by `now` and wakes the receivers waiting on them.
@@ -296,9 +696,10 @@ fn sim_fabric_earliest_arrival() -> Option<u64> {
   SIM_FABRIC.with(|f| f.borrow().earliest_arrival())
 }
 
-/// Shape: the receive buffer a simulated datagram socket reports (`UdpSocket::recv_buffer_bytes`) — the
-/// smaller of the default kernel datagram buffers on the machines this runs on (Linux 208 KiB, macOS
-/// 768 KiB), so a consumer sized from it in simulation is sized as it would be on the stricter host.
+/// Shape: the receive buffer of a simulated datagram socket — what its mailbox holds before dropping, and
+/// what `UdpSocket::recv_buffer_bytes` reports — the smaller of the default kernel datagram buffers on the
+/// machines this runs on (Linux 208 KiB, macOS 768 KiB), so a consumer is sized and stressed as it would
+/// be on the stricter host.
 pub const SIM_RECV_BUFFER_BYTES: usize = 208 * 1024;
 
 /// Binds a simulated UDP port on this thread's fabric.
@@ -306,9 +707,8 @@ pub fn sim_udp_bind() -> u16 {
   SIM_FABRIC.with(|f| f.borrow_mut().bind())
 }
 
-/// Sends a simulated datagram: on the zero path it is delivered at once and a waiting receiver is woken
-/// through the registry; on a delayed path it is scheduled for its drawn arrival and handed over by the
-/// simulation loop when the clock reaches it.
+/// Sends a simulated datagram along its path: delivered at once on the zero path (a waiting receiver is
+/// woken through the registry), scheduled for its arrival on a delayed one, or dropped as the path says.
 pub fn sim_udp_send(dest: u16, bytes: &[u8], from: u16) {
   let wake = SIM_FABRIC.with(|f| f.borrow_mut().send(dest, bytes, from));
   if let Some(word) = wake {

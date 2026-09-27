@@ -258,11 +258,11 @@ const FLOW_LENGTH: usize = 32;
 
 /// Sends `FLOW_LENGTH` datagrams `SEND_GAP_NS` apart, each stamped with its virtual send time, and returns
 /// each datagram's (arrival, stamp) pair as the receiver saw them, in arrival order.
-fn run_stamped_flow(seed: u64, delay: slates_rt::sim::SimDelay) -> Vec<(u64, u64)> {
-  use slates_rt::sim::{SimRuntime, sim_udp_set_delay};
+fn run_stamped_flow(seed: u64, delay: slates_rt::sim::SimPath) -> Vec<(u64, u64)> {
+  use slates_rt::sim::{SimRuntime, sim_udp_set_path};
 
   let mut sim = SimRuntime::new(&config(), seed).unwrap();
-  sim_udp_set_delay(delay);
+  sim_udp_set_path(delay);
   let id = sim.shard_ids()[0];
   let (port_tx, port_rx) = channel();
   let (result_tx, result_rx) = channel();
@@ -314,9 +314,9 @@ fn run_stamped_flow(seed: u64, delay: slates_rt::sim::SimDelay) -> Vec<(u64, u64
 /// otherwise). The zero-delay fabric is the test above, unchanged.
 #[test]
 fn a_delayed_simulated_datagram_arrives_within_its_jitter_and_in_order() {
-  use slates_rt::sim::SimDelay;
+  use slates_rt::sim::SimPath;
 
-  let arrivals = run_stamped_flow(7, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  let arrivals = run_stamped_flow(7, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
   assert_eq!(arrivals.len(), FLOW_LENGTH, "every datagram arrived");
   let mut seen_below_delay_floor = false;
   for (arrived, stamp) in &arrivals {
@@ -342,9 +342,9 @@ fn a_delayed_simulated_datagram_arrives_within_its_jitter_and_in_order() {
 /// so a consumer's reorder handling can be exercised deterministically.
 #[test]
 fn a_reordering_path_overtakes_within_one_flow() {
-  use slates_rt::sim::SimDelay;
+  use slates_rt::sim::SimPath;
 
-  let arrivals = run_stamped_flow(7, SimDelay::reordering(ONE_WAY_NS, JITTER_NS));
+  let arrivals = run_stamped_flow(7, SimPath::reordering(ONE_WAY_NS, JITTER_NS));
   assert_eq!(arrivals.len(), FLOW_LENGTH, "every datagram arrived");
   let stamps: Vec<u64> = arrivals.iter().map(|(_, stamp)| *stamp).collect();
   let overtakes = stamps.windows(2).filter(|pair| pair[1] < pair[0]).count();
@@ -359,11 +359,11 @@ fn a_reordering_path_overtakes_within_one_flow() {
 /// different sequence — a failure history replays exactly.
 #[test]
 fn the_jitter_is_seeded_so_a_run_replays_exactly() {
-  use slates_rt::sim::SimDelay;
+  use slates_rt::sim::SimPath;
 
-  let first = run_stamped_flow(7, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
-  let again = run_stamped_flow(7, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  let first = run_stamped_flow(7, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
+  let again = run_stamped_flow(7, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
   assert_eq!(first, again, "one seed, one history");
-  let other = run_stamped_flow(8, SimDelay::in_order(ONE_WAY_NS, JITTER_NS));
+  let other = run_stamped_flow(8, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
   assert_ne!(first, other, "another seed draws another jitter sequence");
 }
