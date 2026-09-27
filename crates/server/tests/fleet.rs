@@ -7380,6 +7380,23 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
       )
     }))
   });
+  if !joined {
+    // The evidence a CI failure needs (a bare timeout carries none): what each node holds as its
+    // voter set and mesh, its refusal counters, and its shards' pulse.
+    for daemon in &daemons {
+      eprintln!(
+        "enroll trace {}: voters={:?} meshed={:?} refusals={:?}",
+        daemon.config().instance,
+        daemon.council_voters(),
+        daemon.fleet_meshed(),
+        daemon.fleet_refusals(),
+      );
+    }
+    eprintln!(
+      "enroll trace pulses: {}",
+      describe(&daemons.iter().collect::<Vec<_>>())
+    );
+  }
   for daemon in daemons {
     daemon.stop();
   }

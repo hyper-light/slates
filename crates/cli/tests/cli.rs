@@ -342,7 +342,8 @@ fn mount_and_check(instance: &str, id: &str, path: &str) {
 const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
 
 /// The daemon's loopback NFS port for the mount at `path`, as any local user reads it: `nfsstat -m`
-/// prints each mount's `port=`.
+/// prints each mount's `port=`. macOS only, as the forged-unmount test that reads it is.
+#[cfg(target_os = "macos")]
 fn nfs_port_of(path: &str) -> Option<u16> {
   let out = Command::new("nfsstat").arg("-m").output().ok()?;
   let text = String::from_utf8_lossy(&out.stdout);

@@ -128,7 +128,9 @@ mod tests {
   }
 
   /// AC-9.7/T-9.1: the exact source the Linux adapter supplies mounts successfully; tearing down
-  /// or abandoning the mount removes its attachment and rejects reuse of the old source.
+  /// or abandoning the mount removes its attachment and rejects reuse of the old source. A `UMNT` of
+  /// the source removes nothing by itself (§4.6 A-34: any local process can send one); the adapter's
+  /// release after the kernel's unmount is what detaches.
   #[test]
   fn the_linux_adapter_mounts_with_authority_and_releases_it() {
     let profile = MachineProfile::measure(ProfileOptions {
@@ -194,10 +196,15 @@ mod tests {
     assert_eq!(mount_call(port, unmounted.source(), 3), None);
     assert_eq!(
       client.status(volume).unwrap().attachments,
-      0,
-      "kernel UMNT detached"
+      1,
+      "a UMNT alone detaches nothing"
     );
     drop(unmounted);
+    assert_eq!(
+      client.status(volume).unwrap().attachments,
+      0,
+      "the adapter's release detached"
+    );
     assert_eq!(
       client.status(volume).unwrap().lease_epoch,
       None,

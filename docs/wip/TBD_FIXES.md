@@ -93,8 +93,20 @@ authorized merely by appearing here.
   owner shard, bounds derived at boot; a v4.2 client writes a volume on another shard and NFSv3 reads
   it back. Next: a Linux kernel `vers=4.1`/`4.2` mount in CI, then locks, persisted state and the v4.2
   operations.
+- [x] **The watcher workloads assumed their watcher was live after a one-second sleep** (CI 36281600448:
+  the macOS runner's host watcher missed the creation the mount's observed). Both forms now observe
+  readiness — probe files until fswatch reports one; inotifywait's `Watches established.` — each wait
+  bounded by the recorded watch time. Linux form verified 3/3 in a container; macOS on the next run.
+- [x] **The Linux adapter test asserted a capability `UMNT` detaches** (CI 36281600448): superseded by
+  A-34; it now asserts a `UMNT` alone detaches nothing and the adapter's release does.
+- [x] **Linux lint wall: two macOS-only items unused off macOS** (`MOUNT_CALL_DEADLINE`, the test helper
+  `nfs_port_of`), now `cfg(target_os = "macos")`; the workspace lint is clean in a Linux container.
+- [ ] **`an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum` timed out once on the
+  macOS runner** (CI 36281600448, inside the full suite). Not reproduced: alone 3/3, six concurrent
+  copies 6/6, the full suite 50/50 locally. The test now prints each node's voters, mesh, refusal
+  counters and shard pulses when it fails, so the next occurrence carries its evidence.
 - [x] **Two daemon NFS tests asserted the pre-A-34 unmount rule** (a `UMNT` presenting the capability
-  ended the mount; red locally since 97c6b94). They now bind a mount point and send the kernel's form.
+  ended the mount; red on 97c6b94's macOS lane, job 108513277665). They now bind a mount point and send the kernel's form.
   See `docs/bugs/2026-09-26-nfs-mount-tests-asserted-the-pre-a34-unmount.md`.
 - [x] **The fleet test's session hold raced the link's discovery page** (36275755772, macOS gates). The
   hold now waits for the session as a forward does and reports a typed outcome. See

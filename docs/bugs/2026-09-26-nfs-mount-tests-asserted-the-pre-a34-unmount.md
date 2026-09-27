@@ -1,8 +1,8 @@
 # Two daemon NFS tests asserted the pre-A-34 unmount rule
 
-**Date:** 2026-09-26. **Found:** running `cargo test -p slates-server --test nfs_mount` locally while
-adding the daemon's NFSv4 routing. The CI test lane for 97c6b94 and 16ea027 stopped at an earlier
-failing binary (the fleet suite), so it never reached this one.
+**Date:** 2026-09-26. **Found:** red on the macOS test lane of 97c6b94 (CI run 36281224843, job
+108513277665: these two tests, 7 passed and 2 failed), and again locally while adding the daemon's
+NFSv4 routing.
 
 ## Description
 

@@ -148,7 +148,9 @@ pub(crate) fn establish(
 
 /// Derived: how long the CLI waits for the daemon's MOUNT service on each of connect, send and receive:
 /// one liveness budget (`slates_server::daemon::LIVENESS_BUDGET_NS`). A daemon that cannot answer one
-/// loopback call within the budget the anchor gives it to beat is not serving.
+/// loopback call within the budget the anchor gives it to beat is not serving. macOS only, as the
+/// `mount(2)` path that makes the call is.
+#[cfg(target_os = "macos")]
 const MOUNT_CALL_DEADLINE: std::time::Duration =
   std::time::Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
 

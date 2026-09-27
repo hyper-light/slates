@@ -141,18 +141,38 @@ cat note.txt~
 ls -A
 "#;
 
-/// The macOS watcher workload: fswatch reports the creation of a file (FSEvents/kqueue), given
-/// [`ENV_WATCH_SECONDS`] to notice it. The assertion is that the watcher *observed* the creation, not
-/// the raw `events.txt` — its exact bytes depend on the fs's event delivery (a network mount coalesces
-/// differently and fires an extra event for the AppleDouble sidecar the NFS client writes), which is the
-/// transport's behaviour, not the workload's; `events.txt` is excluded from the tree for the same reason.
+/// The macOS watcher workload: fswatch reports the creation of a file (FSEvents/kqueue). The assertion
+/// is that the watcher *observed* the creation, not the raw `events.txt` — its exact bytes depend on the
+/// fs's event delivery (a network mount coalesces differently and fires an extra event for the AppleDouble
+/// sidecar the NFS client writes), which is the transport's behaviour, not the workload's; `events.txt` is
+/// excluded from the tree for the same reason.
+///
+/// The watcher's readiness is observed, never assumed: FSEvents gives no signal that a stream is live,
+/// so probe files are created until the watcher reports one, and only then is `new.txt` created; each
+/// wait is bounded by [`ENV_WATCH_SECONDS`]. (A fixed one-second sleep before the creation let a loaded
+/// runner's host watcher miss it: CI 36281600448.) The probes are removed before the tree is compared.
 const WATCHER_MACOS: &str = r#"
 mkdir -p watched
-fswatch -1 --event Created watched > events.txt &
+# Shape: FSEvents' coalescing latency (fswatch --latency), the resolution the watcher reports at, so
+# the waits poll at it.
+latency=0.1
+fswatch --event Created --latency "$latency" watched > events.txt &
 watcher=$!
-sleep 1
+deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
+probe=0
+until grep -q 'ready\.[0-9]' events.txt; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+  probe=$((probe + 1))
+  : > "watched/ready.$probe"
+  sleep "$latency"
+done
+rm -f watched/ready.*
 printf 'x\n' > watched/new.txt
-sleep "$SLATES_WATCH_SECONDS"
+deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
+until grep -q 'new\.txt' events.txt; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+  sleep "$latency"
+done
 kill $watcher 2>/dev/null || true
 wait $watcher 2>/dev/null || true
 if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
@@ -160,11 +180,19 @@ if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else ech
 
 /// The Linux watcher workload: inotifywait reports the creation of a file within [`ENV_WATCH_SECONDS`].
 /// As with the macOS form, the assertion is that the creation was observed, not the raw `events.txt`.
+/// The watcher's readiness is observed: inotifywait prints `Watches established.` once its watch is
+/// in place, and the file is created only after that line (bounded by the same wait).
 const WATCHER_LINUX: &str = r#"
 mkdir -p watched
-inotifywait -q -e create -t "$SLATES_WATCH_SECONDS" --format '%e %f' watched > events.txt &
+# Shape: how often the watcher's readiness is checked, far below the recorded wait.
+poll=0.1
+inotifywait -e create -t "$SLATES_WATCH_SECONDS" --format '%e %f' watched > events.txt 2> watch.log &
 watcher=$!
-sleep 1
+deadline=$(( $(date +%s) + SLATES_WATCH_SECONDS ))
+until grep -q 'Watches established' watch.log; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then break; fi
+  sleep "$poll"
+done
 printf 'x\n' > watched/new.txt
 wait $watcher || true
 if grep -q 'new\.txt' events.txt; then echo "observed new.txt created"; else echo "missed new.txt"; fi
