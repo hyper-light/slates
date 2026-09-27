@@ -124,6 +124,13 @@ fn dispatch(
       let (status, results) = serve_v4(service, v4, principal, call.procedure, &mut args);
       reply_bytes(call.xid, status, &results)
     }
+    // The extension procedures (A-35) are the v4 front end's, never the wire's.
+    Ok((call, _))
+      if call.program == NFS_PROGRAM
+        && !crate::procedures::is_rfc1813_procedure(call.procedure) =>
+    {
+      reply_bytes(call.xid, AcceptStatus::ProcUnavail, &[])
+    }
     Ok((call, mut args)) => {
       let (status, results) = serve_call(
         service,

@@ -2,7 +2,8 @@
 //! in-process daemon is mounted with `mount -t nfs4 -o vers=4.1` and `vers=4.2` at a directory under
 //! the RAM test directory, driven through ordinary file calls — create, write, read, append, mkdir,
 //! rename, symlink, hard link, truncate, list, remove, and `flock` between two open files (the server's
-//! LOCK, LOCKT and LOCKU) — and read back over NFSv3 from the daemon, so the
+//! LOCK, LOCKT and LOCKU), and on 4.2 `lseek(SEEK_HOLE/SEEK_DATA)` and `copy_file_range` (the server's
+//! SEEK and COPY) — and read back over NFSv3 from the daemon, so the
 //! kernel's compounds are proved to land in the volume, not only to succeed.
 //!
 //! Gated: it needs Linux, root (or passwordless `sudo`) for `mount`, the `mount.nfs4` helper, and a
@@ -249,6 +250,54 @@ fn locks_conflict_across_open_files(file: &Path) {
   flock(&second, FlockOperation::Unlock).unwrap();
 }
 
+/// Shape: the gap between a sparse file's two writes: several chunk windows.
+#[cfg(target_os = "linux")]
+const GAP: u64 = 1 << 20;
+
+/// NFSv4.2 through the kernel (RFC 7862): `lseek(SEEK_HOLE)` on a file written at 0 and at [`GAP`] finds
+/// the hole between the writes — the kernel's own fallback, without the server's SEEK, would answer the
+/// end of the file, so a hole before the second write proves the server answered — and `SEEK_DATA`
+/// from it finds the second write; `copy_file_range` (the kernel's COPY) makes a byte-identical copy.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn sparse_seek_and_copy(root: &Path) {
+  use rustix::fs::{SeekFrom, copy_file_range, seek};
+  use std::os::unix::fs::FileExt;
+  let sparse = root.join("sparse");
+  // Read and write: `copy_file_range` reads the source through this descriptor.
+  let file = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .create_new(true)
+    .open(&sparse)
+    .unwrap();
+  file.write_all_at(b"head", 0).unwrap();
+  file.write_all_at(b"tail", GAP).unwrap();
+  file.sync_all().unwrap();
+  let hole = seek(&file, SeekFrom::Hole(0)).unwrap();
+  assert!(
+    (4..GAP).contains(&hole),
+    "the server's SEEK found the hole between the writes: {hole}"
+  );
+  assert_eq!(seek(&file, SeekFrom::Data(hole)).unwrap(), GAP);
+  let copy = std::fs::File::create(root.join("copy")).unwrap();
+  let length = GAP + 4;
+  // Explicit offsets: the seeks above moved the source descriptor's position.
+  let (mut from, mut to) = (0u64, 0u64);
+  while from < length {
+    let remaining = usize::try_from(length - from).unwrap();
+    let done = copy_file_range(&file, Some(&mut from), &copy, Some(&mut to), remaining).unwrap();
+    assert!(done > 0, "copy_file_range makes progress");
+  }
+  drop(copy);
+  assert!(
+    std::fs::read(root.join("copy")).unwrap() == std::fs::read(&sparse).unwrap(),
+    "the copy is byte-identical"
+  );
+  std::fs::remove_file(root.join("copy")).unwrap();
+  std::fs::remove_file(&sparse).unwrap();
+}
+
 /// §4.6 A-35: the Linux kernel's NFSv4.1 and NFSv4.2 clients mount a daemon volume through its
 /// capability and run ordinary file calls through it; NFSv3 reads what the kernel wrote.
 #[test]
@@ -267,6 +316,10 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
     {
       let mounted = kernel_mount(&source, port, minor);
       exercise(&mounted.path, &payload);
+      #[cfg(target_os = "linux")]
+      if minor == 2 {
+        sparse_seek_and_copy(&mounted.path);
+      }
     }
     let mut v3 = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let root = mount(&mut v3, &path, 1);

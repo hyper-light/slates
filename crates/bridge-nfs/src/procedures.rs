@@ -92,6 +92,30 @@ pub const NFSPROC3_COMMIT: u32 = 21;
 /// Format: NFSPROC3_PATHCONF (RFC 1813 procedure 20) — the POSIX pathconf limits of the filesystem an
 /// object lives in (name and link maxima, truncation, chown restriction, case behaviour).
 pub const NFSPROC3_PATHCONF: u32 = 20;
+
+/// Format: the procedures the NFSv4 front end serves through this dispatch beyond RFC 1813's (A-35):
+/// numbered past its last procedure, so no RFC 1813 number is reused, and never served from the wire
+/// ([`is_rfc1813_procedure`] is what the connection servers admit).
+pub mod extension {
+  /// Format: SEEK (RFC 7862 §15.11). Arguments: the file handle, the offset (`u64`), and what to find
+  /// (`u32`: 0 data, 1 hole). Result: the status; on success whether one was found (`bool`), its
+  /// offset (`u64`) and the file's size (`u64`).
+  pub const SEEK: u32 = 1024;
+}
+
+/// Format: SEEK's `what` values: data, and hole (RFC 7862 `data_content4`).
+pub mod seek_what {
+  /// Format: `NFS4_CONTENT_DATA`.
+  pub const DATA: u32 = 0;
+  /// Format: `NFS4_CONTENT_HOLE`.
+  pub const HOLE: u32 = 1;
+}
+
+/// Whether `procedure` is one of RFC 1813's NFSv3 procedures, the only ones a connection serves from the
+/// wire; the [`extension`] procedures are the NFSv4 front end's alone.
+pub fn is_rfc1813_procedure(procedure: u32) -> bool {
+  procedure <= NFSPROC3_COMMIT
+}
 /// Format: the maximum bytes in a filename slates resolves (§4.5's name cap), refused before
 /// allocating.
 pub const NFS_MAXNAMELEN: usize = 255;
@@ -504,6 +528,7 @@ impl<'b> Export<'b> {
       NFSPROC3_FSINFO => Some(self.fsinfo(args)),
       NFSPROC3_COMMIT => Some(self.commit(args)),
       NFSPROC3_PATHCONF => Some(self.pathconf(args)),
+      extension::SEEK => Some(self.seek(args)),
       _ => None,
     }
   }
@@ -675,6 +700,45 @@ impl<'b> Export<'b> {
     let eof = end >= node.size;
     let read = u32::try_from(data.len()).unwrap_or(u32::MAX);
     Ok((post, read, eof, data))
+  }
+
+  /// The SEEK extension (A-35, RFC 7862 §15.11): the first data or hole byte at or after an offset,
+  /// under the read permission a READ needs; the result carries whether one was found, its offset and
+  /// the file's size, from which the v4 front end answers `sr_eof` and `NFS4ERR_NXIO`.
+  pub fn seek(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.seek_result(args) {
+      Ok((found, size)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        writer.bool(found.is_some());
+        writer.u64(found.unwrap_or(size));
+        writer.u64(size);
+      }
+      Err(status) => status.encode(&mut writer),
+    }
+    writer.into_bytes()
+  }
+
+  fn seek_result(&mut self, args: &mut XdrReader<'_>) -> Result<(Option<u64>, u64), Nfsstat3> {
+    let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat3::Badhandle)?;
+    let offset = args.u64().map_err(|_| Nfsstat3::Inval)?;
+    let data = match args.u32().map_err(|_| Nfsstat3::Inval)? {
+      seek_what::DATA => true,
+      seek_what::HOLE => false,
+      _ => return Err(Nfsstat3::Inval),
+    };
+    let identity = self.resolve_handle(&handle)?;
+    let node = self.attrs_of(&identity)?;
+    if !access::permits_io(&self.caller, &node, Want::Read) {
+      return Err(Nfsstat3::Acces);
+    }
+    let cx = self.op_context().map_err(|e| nfsstat_of(&e))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let found = self
+      .bridge
+      .seek(object, &cx, offset, data)
+      .map_err(|e| nfsstat_of(&e))?;
+    Ok((found, node.size))
   }
 
   /// NFSPROC3_WRITE: write the request's data at `offset` to the file a handle names, over the

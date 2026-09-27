@@ -191,6 +191,8 @@ struct Client {
   clientid: u64,
   sessionid: [u8; 16],
   sequence: u32,
+  /// The minor version its compounds carry.
+  minor: u32,
 }
 
 impl Client {
@@ -246,6 +248,7 @@ impl Client {
       clientid,
       sessionid,
       sequence: 0,
+      minor: 1,
     }
   }
 
@@ -257,7 +260,7 @@ impl Client {
 
   /// A compound whose SEQUENCE carries `sequence` on slot 0 (a retry reuses the last one).
   fn sequenced_at(&self, sequence: u32, count: u32) -> XdrWriter {
-    let mut args = frame(1, count + 1);
+    let mut args = frame(self.minor, count + 1);
     args.u32(op::SEQUENCE);
     args.fixed(&self.sessionid);
     args.u32(sequence);
@@ -1002,7 +1005,8 @@ fn rpc(
 }
 
 /// Over a real socket, version 4 of the NFS program is served beside version 3 and any other version
-/// is `PROG_MISMATCH` naming 3–4; a session made on one connection carries on over the next, since the
+/// is `PROG_MISMATCH` naming 3–4; a v3 procedure outside RFC 1813's (the v4 front end's extensions) is
+/// `PROC_UNAVAIL`; a session made on one connection carries on over the next, since the
 /// listener, not the connection, holds the v4 state (RFC 8881 §2.10.3: a client reconnects and
 /// continues its session). A-35.
 #[test]
@@ -1041,6 +1045,20 @@ fn a_session_outlives_its_connection_and_other_versions_are_mismatched() {
     rpc(&mut first, NFS_PROGRAM, 3, 0, &[]).0,
     SUCCESS,
     "v3 NULL"
+  );
+  /// Format: `PROC_UNAVAIL` (RFC 5531).
+  const PROC_UNAVAIL: u32 = 3;
+  assert_eq!(
+    rpc(
+      &mut first,
+      NFS_PROGRAM,
+      3,
+      slates_bridge_nfs::procedures::extension::SEEK,
+      &[]
+    )
+    .0,
+    PROC_UNAVAIL,
+    "the v4 front end's extension procedures are not served from the wire"
   );
 
   let mut args = frame(2, 1);
@@ -1087,6 +1105,7 @@ fn a_session_outlives_its_connection_and_other_versions_are_mismatched() {
     clientid,
     sessionid,
     sequence: 0,
+    minor: 2,
   };
   let mut args = client.sequenced_at(1, 1);
   args.u32(op::PUTROOTFH);
@@ -1416,4 +1435,332 @@ fn a_lock_is_refused_outside_its_rules() {
     Client::call(&mut service, &mut server, free.as_slice()).status,
     Nfsstat4::LocksHeld.wire()
   );
+}
+
+/// `NFS4_CONTENT_DATA` and `NFS4_CONTENT_HOLE` (RFC 7862 `data_content4`).
+const CONTENT_DATA: u32 = 0;
+const CONTENT_HOLE: u32 = 1;
+/// Shape: the gap between a sparse file's two writes: several chunk windows.
+const GAP: u64 = 1 << 20;
+
+/// A file at the root with `head` at offset 0 and `tail` at [`GAP`], leaving a hole between.
+fn sparse_file(bridge: &mut VolumeBridge<'_>, name: &str) {
+  let cx = root_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (attr, _) = bridge
+    .create(ObjectId::new(root, 0), &cx, name, 0o644, 0)
+    .unwrap();
+  let file = ObjectId::new(attr.ino, attr.generation);
+  bridge.write(file, &cx, 0, b"head").unwrap();
+  bridge.write(file, &cx, GAP, b"tail").unwrap();
+}
+
+/// PUTROOTFH, LOOKUP `name`, then `op` built by `build`: the status and `op`'s body.
+fn at_root_file(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  name: &str,
+  build: impl FnOnce(&mut XdrWriter),
+) -> (u32, Vec<u8>) {
+  let mut args = client.sequenced(3);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::LOOKUP);
+  args.opaque(name.as_bytes());
+  build(&mut args);
+  let reply = Client::call(service, server, args.as_slice());
+  if reply.status != Nfsstat4::Ok.wire() {
+    return (reply.status, Vec::new());
+  }
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTROOTFH);
+  expect_ok(&mut body, op::LOOKUP);
+  body.fixed(8).unwrap();
+  (reply.status, body.rest().to_vec())
+}
+
+/// SEEK from `offset` for data or a hole: the status and `(sr_eof, sr_offset)`.
+fn seek(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  offset: u64,
+  what: u32,
+) -> (u32, Option<(bool, u64)>) {
+  let (status, body) = at_root_file(client, service, server, "sparse", |args| {
+    args.u32(op::SEEK);
+    Stateid::default().encode(args);
+    args.u64(offset);
+    args.u32(what);
+  });
+  if status != Nfsstat4::Ok.wire() {
+    return (status, None);
+  }
+  let mut body = XdrReader::new(&body);
+  (status, Some((body.bool().unwrap(), body.u64().unwrap())))
+}
+
+/// A-35 (RFC 7862 §15.11): over a file with data at 0 and at [`GAP`], SEEK finds the hole after the
+/// first write and the data at the second; the end of the file is a hole reported with `sr_eof`; an
+/// offset at or past the end is `NFS4ERR_NXIO`.
+#[test]
+fn seek_finds_the_holes_and_the_data_of_a_sparse_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  sparse_file(&mut bridge, "sparse");
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  client.minor = 2;
+  let size = GAP + 4;
+
+  let (_, hole) = seek(&mut client, &mut service, &mut server, 0, CONTENT_HOLE);
+  let (eof, hole) = hole.unwrap();
+  assert!(
+    !eof && (4..GAP).contains(&hole),
+    "the hole after the first write: {hole}"
+  );
+  let (_, data) = seek(&mut client, &mut service, &mut server, hole, CONTENT_DATA);
+  assert_eq!(data, Some((false, GAP)), "the data of the second write");
+  let (_, end) = seek(&mut client, &mut service, &mut server, GAP, CONTENT_HOLE);
+  assert_eq!(end, Some((true, size)), "the end is a hole, with sr_eof");
+  let (status, _) = seek(&mut client, &mut service, &mut server, size, CONTENT_DATA);
+  assert_eq!(status, Nfsstat4::Nxio.wire());
+}
+
+/// A-35 (RFC 7862 §15.10): READ_PLUS of the whole sparse file returns its contents in order — the first
+/// write's data, then the hole reported whole, then the second write's data — contiguous, with
+/// `rpr_eof` set only once the contents reach the end.
+#[test]
+fn read_plus_returns_data_and_whole_holes_in_order() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  sparse_file(&mut bridge, "sparse");
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  client.minor = 2;
+  let size = GAP + 4;
+  let mut at = 0u64;
+  let mut contents: Vec<(u32, u64, u64, Vec<u8>)> = Vec::new();
+  let mut eof = false;
+  while !eof {
+    let (status, body) = at_root_file(&mut client, &mut service, &mut server, "sparse", |args| {
+      args.u32(op::READ_PLUS);
+      Stateid::default().encode(args);
+      args.u64(at);
+      args.u32(u32::MAX);
+    });
+    assert_eq!(status, Nfsstat4::Ok.wire());
+    let mut body = XdrReader::new(&body);
+    eof = body.bool().unwrap();
+    for _ in 0..body.u32().unwrap() {
+      let kind = body.u32().unwrap();
+      let offset = body.u64().unwrap();
+      let (length, data) = match kind {
+        CONTENT_DATA => {
+          let data = body.opaque(1 << 20).unwrap().to_vec();
+          (u64::try_from(data.len()).unwrap(), data)
+        }
+        _ => (body.u64().unwrap(), Vec::new()),
+      };
+      assert_eq!(offset, at, "the contents are contiguous");
+      at = offset + length;
+      contents.push((kind, offset, length, data));
+    }
+    assert!(
+      eof || at < size,
+      "a reply short of the end does not claim it"
+    );
+  }
+  assert_eq!(at, size);
+  let data: Vec<u8> = contents
+    .iter()
+    .flat_map(|(_, _, _, data)| data.clone())
+    .collect();
+  assert!(
+    data.starts_with(b"head") && data.ends_with(b"tail"),
+    "both writes' bytes"
+  );
+  assert!(
+    contents
+      .iter()
+      .any(|(kind, offset, length, _)| *kind == CONTENT_HOLE
+        && *offset < GAP
+        && offset + length == GAP),
+    "the gap is one whole hole ending at the second write: {:?}",
+    contents
+      .iter()
+      .map(|(kind, offset, length, _)| (kind, offset, length))
+      .collect::<Vec<_>>()
+  );
+}
+
+/// A-35 (RFC 8881 §16.2.3): an NFSv4.2 operation in a 4.1 compound is `NFS4ERR_OP_ILLEGAL`.
+#[test]
+fn a_v4_2_operation_is_illegal_in_a_v4_1_compound() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  sparse_file(&mut bridge, "sparse");
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  let (status, _) = seek(&mut client, &mut service, &mut server, 0, CONTENT_DATA);
+  assert_eq!(status, Nfsstat4::OpIllegal.wire());
+}
+
+/// COPY of `count` bytes at `offset` from `source` to the same offset of `destination` (both at the
+/// root): the status and the bytes copied.
+fn copy(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  (source, destination): (&str, &str),
+  (offset, count): (u64, u64),
+) -> (u32, Option<u64>) {
+  let mut args = client.sequenced(6);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::LOOKUP);
+  args.opaque(source.as_bytes());
+  args.u32(op::SAVEFH);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::LOOKUP);
+  args.opaque(destination.as_bytes());
+  args.u32(op::COPY);
+  Stateid::default().encode(&mut args);
+  Stateid::default().encode(&mut args);
+  args.u64(offset);
+  args.u64(offset);
+  args.u64(count);
+  args.bool(true);
+  args.bool(true);
+  args.u32(0);
+  let reply = Client::call(service, server, args.as_slice());
+  if reply.status != Nfsstat4::Ok.wire() {
+    return (reply.status, None);
+  }
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  for opnum in [
+    op::PUTROOTFH,
+    op::LOOKUP,
+    op::SAVEFH,
+    op::PUTROOTFH,
+    op::LOOKUP,
+    op::COPY,
+  ] {
+    expect_ok(&mut body, opnum);
+  }
+  assert_eq!(
+    body.u32().unwrap(),
+    0,
+    "no callback id: the copy was synchronous"
+  );
+  (reply.status, Some(body.u64().unwrap()))
+}
+
+/// Copies all of `source` into `destination` the way `copy_file_range` does: the first COPY asks for
+/// everything (a count of zero), each further one continues from the bytes copied so far. Each must make
+/// progress, so the loop is bounded by the length. The bytes copied.
+fn copy_all(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  length: u64,
+) -> u64 {
+  let mut copied = 0u64;
+  for _ in 0..length {
+    if copied == length {
+      break;
+    }
+    let count = if copied == 0 { 0 } else { length - copied };
+    let (status, done) = copy(
+      client,
+      service,
+      server,
+      ("source", "destination"),
+      (copied, count),
+    );
+    assert_eq!(status, Nfsstat4::Ok.wire(), "COPY");
+    let done = done.unwrap();
+    assert!(done > 0, "each COPY makes progress");
+    copied += done;
+  }
+  copied
+}
+
+/// A-35 (RFC 7862 §15.2): COPY copies the source into the destination server-side, in as many COPYs as
+/// the per-COPY bound needs; the destination then reads the source's bytes. A copy of a file onto
+/// itself, and one reaching past the source's end, are `NFS4ERR_INVAL`.
+#[test]
+fn copy_moves_the_bytes_server_side_and_refuses_bad_ranges() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let cx = root_cx();
+  let root = bridge.root(&cx).unwrap();
+  let payload: Vec<u8> = (0..(3 * 1024 * 1024 / 7))
+    .flat_map(|n: u32| n.to_le_bytes())
+    .collect();
+  let (source, _) = bridge
+    .create(ObjectId::new(root, 0), &cx, "source", 0o644, 0)
+    .unwrap();
+  bridge
+    .write(
+      ObjectId::new(source.ino, source.generation),
+      &cx,
+      0,
+      &payload,
+    )
+    .unwrap();
+  let (destination, _) = bridge
+    .create(ObjectId::new(root, 0), &cx, "destination", 0o644, 0)
+    .unwrap();
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  client.minor = 2;
+  let length = u64::try_from(payload.len()).unwrap();
+  assert_eq!(
+    copy_all(&mut client, &mut service, &mut server, length),
+    length
+  );
+  let (status, _) = copy(
+    &mut client,
+    &mut service,
+    &mut server,
+    ("source", "source"),
+    (0, 0),
+  );
+  assert_eq!(status, Nfsstat4::Inval.wire(), "onto itself");
+  let (status, _) = copy(
+    &mut client,
+    &mut service,
+    &mut server,
+    ("source", "destination"),
+    (0, length + 1),
+  );
+  assert_eq!(status, Nfsstat4::Inval.wire(), "past the source's end");
+  drop(service);
+  let mut got = Vec::new();
+  let mut offset = 0u64;
+  while offset < length {
+    let before = got.len();
+    bridge
+      .read(
+        ObjectId::new(destination.ino, destination.generation),
+        &cx,
+        offset,
+        u32::MAX,
+        &mut got,
+      )
+      .unwrap();
+    assert!(got.len() > before, "the destination reads on");
+    offset = u64::try_from(got.len()).unwrap();
+  }
+  assert!(got == payload, "the destination holds the source's bytes");
 }

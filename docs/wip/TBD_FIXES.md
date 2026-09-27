@@ -93,8 +93,12 @@ authorized merely by appearing here.
   owner shard, bounds derived at boot; a v4.2 client writes a volume on another shard and NFSv3 reads
   it back. The Linux kernel's v4.1 and v4.2 clients mount it and run ordinary file calls through it
   (`tests/nfs_v4_kernel.rs`, in the Linux CI lane). Byte-range locks are served (the kernel's `flock`
-  across two open files conflicts and is granted after the unlock). Next: persisted and replicated
-  state, and the v4.2 operations.
+  across two open files conflicts and is granted after the unlock). The v4.2 SEEK, READ_PLUS, COPY
+  and IO_ADVISE are served (the kernel's `SEEK_HOLE` finds a mid-file hole through the server). Next:
+  persisted and replicated state, DEALLOCATE (a volume change), RFC 8276 xattrs.
+- [ ] **A v4 LOOKUP/CREATE of `._name` reaches the macOS AppleDouble view** (A-33), because the v4
+  front end reuses the v3 procedures. v4 clients carry attributes natively, so the view must not exist
+  for them; the fix is a v4-scoped lookup that skips views.
 - [x] **NFSv4 returned `NFS4ERR_RESOURCE`, which NFSv4.1 does not define** (RFC 7863), at the client,
   session and open bounds. Now DELAY, NOSPC and NOSPC per RFC 8881 §15.2. See
   `docs/bugs/2026-09-26-nfsv4-returned-a-status-v4-1-does-not-define.md`.

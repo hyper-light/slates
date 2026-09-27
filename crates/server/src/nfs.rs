@@ -1191,6 +1191,12 @@ async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
     )
     .await;
   }
+  // The extension procedures (A-35) are the v4 front end's, never the wire's.
+  if call.program == NFS_PROGRAM
+    && !slates_bridge_nfs::procedures::is_rfc1813_procedure(call.procedure)
+  {
+    return reply_bytes(call.xid, AcceptStatus::ProcUnavail, &[]);
+  }
   let capability = presented_capability(call.program, call.procedure, &mut call.args);
   let requester = call.requester.with_capability(capability);
   reply_for(

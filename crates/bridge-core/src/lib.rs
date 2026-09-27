@@ -220,6 +220,16 @@ pub trait Bridge {
     size: u32,
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError>;
+  /// The first offset at or after `offset`, before the end of `object`, that holds data (`data`) or
+  /// lies in a hole (`!data`), under the authenticated `cx` (which must allow reading); `None` when
+  /// there is none (RFC 7862 §15.11 SEEK; `slates_vfs::volume::Volume::seek`).
+  fn seek(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    data: bool,
+  ) -> Result<Option<u64>, VfsError>;
   /// Write `data` at `offset` to `object` under the authenticated `cx`; the bytes written. A write
   /// against a read-only attachment or a pinned view is refused before any effect.
   fn write(

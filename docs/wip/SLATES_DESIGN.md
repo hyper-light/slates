@@ -1696,8 +1696,29 @@ therefore one implementation shared by both versions.
   - A lock state id serves I/O.
   - Locks are advisory: READ and WRITE do not consult them.
   - A blocking lock request is answered as a non-blocking one; without callbacks the client polls.
-- **Not yet offered:** delegations and callbacks (never granted), state protection other than
-  `SP4_NONE`, and the v4.2 operations.
+- **NFSv4.2 operations** (RFC 7862; `v4/v42.rs`). Every 4.2 operation is `NFS4ERR_OP_ILLEGAL` in a
+  4.1 compound (RFC 8881 §16.2.3).
+  - **SEEK and READ_PLUS** run on the SEEK extension procedure, which asks the volume where data and
+    holes are (`Volume::seek`). Data is what chunks, the open extent or inline bytes hold. A zero
+    extent or a gap is a hole. A base-backed body counts as all data, which the protocol permits.
+    READ_PLUS returns holes whole, keeps its contents contiguous, and sets `rpr_eof` only when the
+    contents reach the end.
+  - **COPY** is intra-server and synchronous: the source is read and the destination written through
+    the v3 READ and WRITE, so the bytes never cross the wire. One COPY copies at most the session's
+    request size × its slots, the work the client could have in flight at once, and a short copy is
+    answered with its count.
+  - **IO_ADVISE** acts on no hints.
+  - **Not offered:**
+    - CLONE: cross-inode chunk sharing needs dedup's reference counts.
+    - ALLOCATE: no reservation holds under copy-on-write.
+    - DEALLOCATE: a punched hole puts one chunk under two extents, which is its own volume change.
+    - WRITE_SAME, the layout operations, and inter-server COPY.
+- **The extension procedures.** The operations the v3 layer has no procedure for are served through
+  the same v3 dispatch under numbers past RFC 1813's (`procedures::extension`), so the daemon's
+  handle routing, authorization and barrier apply unchanged. Both connection servers refuse any v3
+  procedure outside RFC 1813's range (`PROC_UNAVAIL`).
+- **Not yet offered:** delegations and callbacks (never granted), and state protection other than
+  `SP4_NONE`.
 - **The capability** is presented at the pseudo root as a LOOKUP of `<name>@<attachment>.<token>`, as
   an NFSv3 MNT path does, until an RPC-over-TLS or RPCSEC_GSS identity carries it.
 - **In the daemon.** The v4 state lives on the listener's shard and is created with the first v4
@@ -1721,10 +1742,15 @@ therefore one implementation shared by both versions.
     remove run through the mount, and NFSv3 reads back what the kernel wrote. Verified 2026-09-26 in a
     privileged Linux container (io_uring driver).
   The kernel's `flock` across two open files is served as LOCK/LOCKT/LOCKU, with no `local_lock`.
+  On a 4.2 mount the kernel's `lseek(SEEK_HOLE)` finds a hole between two writes, which only the
+  server's SEEK can answer: the kernel's fallback reports the end of the file. `SEEK_DATA` finds the
+  second write, and `copy_file_range` makes a byte-identical copy. Whether the kernel used COPY or its
+  own copy is not observed there. COPY itself is proved by use in `tests/v4.rs`.
   Owed:
   - the persisted and replicated open and lock state;
-  - the v4.2 operations (RFC 7862 SEEK, READ_PLUS, ALLOCATE, DEALLOCATE, COPY, CLONE, IO_ADVISE;
-    RFC 8276 extended attributes);
+  - DEALLOCATE (a volume change), CLONE (with dedup), and RFC 8276 extended attributes;
+  - a v4 LOOKUP or CREATE of `._name` reaches the macOS AppleDouble view (A-33), because v4 reuses the
+    v3 procedures; v4 clients carry attributes natively, so the view should not exist for them;
   - RPC-over-TLS;
   - pNFS flexfiles.
 
@@ -6020,3 +6046,10 @@ lock bound `config::nfs_v4_caps` `locks`), and the bound refusals replaced with 
 `docs/bugs/2026-09-26-nfsv4-returned-a-status-v4-1-does-not-define.md`). Applied to: §4.6;
 `slates-bridge-nfs`; `slates-server` (the lock bound); the kernel test (locks served, `flock` across two
 open files); GAPS and TBD_FIXES.
+
+Amended a fourth time the same day: the NFSv4.2 operations SEEK, READ_PLUS, COPY and IO_ADVISE
+(`v4/v42.rs`), the SEEK extension procedure and the wire's refusal of every procedure outside RFC
+1813's (`procedures::extension`, `is_rfc1813_procedure`), `Volume::seek` and `Bridge::seek`, and the
+minor-version gate on 4.2 operations. Applied to: §4.6; `slates-vfs` (`Volume::seek`, `Seek`);
+`slates-bridge-core` (`Bridge::seek`); `slates-bridge-nfs`; `slates-server` (the wire refusal); the
+kernel test (SEEK and `copy_file_range` on 4.2); GAPS and TBD_FIXES. No storage or consensus change.

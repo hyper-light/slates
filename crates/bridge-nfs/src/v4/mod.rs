@@ -33,6 +33,7 @@ pub mod session;
 pub mod status;
 pub mod types;
 pub mod v3call;
+pub mod v42;
 
 pub use status::Nfsstat4;
 

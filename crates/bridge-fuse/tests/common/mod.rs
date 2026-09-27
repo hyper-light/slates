@@ -103,6 +103,16 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     self.inner.read(object, cx, offset, size, out)
   }
 
+  fn seek(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    data: bool,
+  ) -> Result<Option<u64>, VfsError> {
+    self.inner.seek(object, cx, offset, data)
+  }
+
   fn write(
     &mut self,
     object: ObjectId,

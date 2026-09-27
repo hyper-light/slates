@@ -537,6 +537,29 @@ impl Bridge for VolumeBridge<'_> {
     Ok(())
   }
 
+  fn seek(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    data: bool,
+  ) -> Result<Option<u64>, VfsError> {
+    self.authorize_read(cx)?;
+    // An AppleDouble view (a derived number) is rendered, not stored: it has no inode to search, and
+    // only the macOS NFSv3 client addresses it.
+    if InodeNo(object.inode).derived_from().is_some() {
+      return Err(VfsError::Invalid);
+    }
+    let want = if data {
+      slates_vfs::volume::Seek::Data
+    } else {
+      slates_vfs::volume::Seek::Hole
+    };
+    self
+      .volume
+      .seek(self.store, InodeNo(object.inode), offset, want)
+  }
+
   fn write(
     &mut self,
     object: ObjectId,

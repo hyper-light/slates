@@ -138,6 +138,18 @@ pub mod op {
   pub const DESTROY_CLIENTID: u32 = 57;
   /// Format: `OP_RECLAIM_COMPLETE`.
   pub const RECLAIM_COMPLETE: u32 = 58;
+  /// Format: `OP_ALLOCATE` (RFC 7862).
+  pub const ALLOCATE: u32 = 59;
+  /// Format: `OP_COPY`.
+  pub const COPY: u32 = 60;
+  /// Format: `OP_DEALLOCATE`.
+  pub const DEALLOCATE: u32 = 62;
+  /// Format: `OP_IO_ADVISE`.
+  pub const IO_ADVISE: u32 = 63;
+  /// Format: `OP_READ_PLUS`.
+  pub const READ_PLUS: u32 = 68;
+  /// Format: `OP_SEEK`.
+  pub const SEEK: u32 = 69;
   /// Format: `OP_CLONE`, the highest operation number NFSv4.2 defines.
   pub const CLONE: u32 = 71;
   /// Format: `OP_ILLEGAL`: the reply's opnum for an operation number no operation has.
@@ -328,6 +340,11 @@ impl Server {
     self.opens.table.len()
   }
 
+  /// The bounds and offers the server runs under.
+  pub fn limits(&self) -> Limits {
+    self.limits
+  }
+
   /// How many lock states are recorded.
   pub fn lock_state_count(&self) -> usize {
     self.locks.state_count()
@@ -342,16 +359,16 @@ impl Server {
 }
 
 /// A compound's running state: the file handles and the client it runs for.
-struct Frame {
-  current: Option<Nfsfh3>,
-  saved: Option<Nfsfh3>,
-  clientid: Option<u64>,
+pub(super) struct Frame {
+  pub(super) current: Option<Nfsfh3>,
+  pub(super) saved: Option<Nfsfh3>,
+  pub(super) clientid: Option<u64>,
   /// The `LOCK4denied` body of a LOCK or LOCKT refused `NFS4ERR_DENIED`, which the result carries.
   denied: Option<Vec<u8>>,
 }
 
 /// What an operation produced: its result body on success, or the status it failed with.
-type Outcome = Result<Vec<u8>, Nfsstat4>;
+pub(super) type Outcome = Result<Vec<u8>, Nfsstat4>;
 
 /// Serves one `COMPOUND` call's arguments against `server` and `backend`, returning its encoded
 /// `COMPOUND4res`.
@@ -390,6 +407,13 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
     let Ok(opnum) = reader.u32() else {
       last = Nfsstat4::Badxdr;
       break;
+    };
+    // An operation the compound's minor version does not define is illegal in it (RFC 8881 §16.2.3):
+    // NFSv4.2's operations (RFC 7862) in a 4.1 compound.
+    let opnum = if minor < MINOR_HIGHEST && opnum > op::RECLAIM_COMPLETE && opnum <= op::CLONE {
+      op::ILLEGAL
+    } else {
+      opnum
     };
     let outcome = if index == 0 {
       if opnum == op::SEQUENCE {
@@ -818,6 +842,9 @@ async fn namespace_operation<B: Backend>(
     op::RENAME => rename(backend, reader, frame).await,
     op::LINK => link(backend, reader, frame).await,
     op::LOCK | op::LOCKT | op::LOCKU => lock_operation(backend, opnum, reader, frame).await,
+    op::SEEK | op::READ_PLUS | op::COPY | op::IO_ADVISE => {
+      super::v42::operation(backend, opnum, reader, frame).await
+    }
     _ => backend.with_v4(|server| state_operation(server, opnum, reader, frame))?,
   }
 }
@@ -893,12 +920,12 @@ fn state_operation(
 }
 
 /// The current file handle, or `NFS4ERR_NOFILEHANDLE`.
-fn current(frame: &Frame) -> Result<&Nfsfh3, Nfsstat4> {
+pub(super) fn current(frame: &Frame) -> Result<&Nfsfh3, Nfsstat4> {
   frame.current.as_ref().ok_or(Nfsstat4::Nofilehandle)
 }
 
 /// A v3 result, its status mapped to v4.
-fn v3<T>(result: Result<Result<T, Nfsstat3>, v3call::Malformed>) -> Result<T, Nfsstat4> {
+pub(super) fn v3<T>(result: Result<Result<T, Nfsstat3>, v3call::Malformed>) -> Result<T, Nfsstat4> {
   match result {
     Ok(Ok(value)) => Ok(value),
     Ok(Err(status)) => Err(Nfsstat4::of_v3(status)),
@@ -937,7 +964,7 @@ async fn lookup<B: Backend>(
 }
 
 /// The v3 attributes of `fh`.
-async fn attrs_of<B: Backend>(backend: &mut B, fh: &Nfsfh3) -> Result<Fattr3, Nfsstat4> {
+pub(super) async fn attrs_of<B: Backend>(backend: &mut B, fh: &Nfsfh3) -> Result<Fattr3, Nfsstat4> {
   let result = backend
     .call_v3(NFSPROC3_GETATTR, v3call::handle_only(fh))
     .await;
@@ -1003,7 +1030,7 @@ async fn getattr<B: Backend>(backend: &mut B, fh: &Nfsfh3, requested: &Bitmap) -
 /// Whether `stateid` may serve I/O on `fh` for `clientid`: a special state id, or an open or a lock
 /// state this server recorded of that file for that client at a current seqid (RFC 8881 §8.2.2,
 /// §9.1.4: READ, WRITE and SETATTR take either).
-fn check_stateid(
+pub(super) fn check_stateid(
   server: &Server,
   stateid: &Stateid,
   fh: &Nfsfh3,
@@ -1308,7 +1335,10 @@ async fn open_by_name<B: Backend>(
 
 /// Refuses an open of anything but a regular file: `NFS4ERR_ISDIR`, `NFS4ERR_SYMLINK`, or
 /// `NFS4ERR_WRONG_TYPE` (RFC 8881 §18.16.3).
-async fn check_open_kind<B: Backend>(backend: &mut B, fh: &Nfsfh3) -> Result<(), Nfsstat4> {
+pub(super) async fn check_open_kind<B: Backend>(
+  backend: &mut B,
+  fh: &Nfsfh3,
+) -> Result<(), Nfsstat4> {
   match attrs_of(backend, fh).await?.kind {
     Ftype3::Reg => Ok(()),
     Ftype3::Dir => Err(Nfsstat4::Isdir),

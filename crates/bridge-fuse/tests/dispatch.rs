@@ -112,6 +112,22 @@ impl Bridge for Mock {
       Err(VfsError::NotFound)
     }
   }
+  /// The mock's content has no holes: every byte before its end is data, and the end is the hole.
+  fn seek(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    offset: u64,
+    data: bool,
+  ) -> Result<Option<u64>, VfsError> {
+    let len = u64::try_from(self.content.len()).unwrap_or(u64::MAX);
+    Ok(match (offset < len, data) {
+      (false, _) => None,
+      (true, true) => Some(offset),
+      (true, false) => Some(len),
+    })
+  }
+
   fn read(
     &mut self,
     _object: ObjectId,

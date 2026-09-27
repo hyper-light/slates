@@ -1,0 +1,361 @@
+//! The NFSv4.2 operations (RFC 7862; A-35), each served through the v3 layer as the 4.1 operations
+//! are: SEEK and READ_PLUS on the SEEK extension procedure (`crate::procedures::extension::SEEK`),
+//! which asks the volume where data and holes are; COPY as a server-side copy through the v3 READ and
+//! WRITE procedures, so the bytes never cross the wire; IO_ADVISE, answered with no hints acted on.
+//!
+//! Not offered (`NFS4ERR_NOTSUPP`, each for its reason):
+//! - **CLONE**: a clone shares chunks between two files, and the volume releases a chunk by its one
+//!   owning inode's birth epoch (§4.5, D-6), so a chunk shared across inodes needs the reference
+//!   counts dedup brings (Phase 7).
+//! - **ALLOCATE**: a reservation that makes later writes immune to `ENOSPC` cannot hold under
+//!   copy-on-write, where a write into a snapshotted chunk takes new space.
+//! - **DEALLOCATE**: punching a hole splits chunk-backed extents so that one chunk sits under two
+//!   extents, which the volume's release accounting does not yet allow; it is its own volume change.
+//! - **WRITE_SAME**, the layout operations, and the inter-server copy (a COPY naming source servers).
+
+use super::Nfsstat4;
+use super::compound::{
+  Backend, Frame, Outcome, attrs_of, check_open_kind, check_stateid, current, op, v3,
+};
+use super::types::{Bitmap, Stateid};
+use super::v3call;
+use crate::nfs::Nfsfh3;
+use crate::procedures::{MAX_TRANSFER, NFSPROC3_READ, NFSPROC3_WRITE, extension, seek_what};
+use crate::xdr::{XdrReader, XdrWriter};
+
+/// Format: `stable_how4` `UNSTABLE4`: a COPY's writes are unstable, made stable by the client's
+/// COMMIT, as a client's own WRITEs would be (RFC 7862 §15.2.3 `wr_committed`).
+const UNSTABLE4: u32 = 0;
+/// Format: the bytes one READ_PLUS content entry costs beyond its data: the content type, the offset,
+/// and a length or an opaque's length word (RFC 7862 `read_plus_content`).
+const CONTENT_ENTRY_BYTES: usize = 4 + 8 + 8;
+
+/// One NFSv4.2 operation.
+pub(super) async fn operation<B: Backend>(
+  backend: &mut B,
+  opnum: u32,
+  reader: &mut XdrReader<'_>,
+  frame: &mut Frame,
+) -> Outcome {
+  match opnum {
+    op::SEEK => seek(backend, reader, frame).await,
+    op::READ_PLUS => read_plus(backend, reader, frame).await,
+    op::COPY => copy(backend, reader, frame).await,
+    _ => io_advise(reader, frame),
+  }
+}
+
+/// The volume's answer to "where is the next data (`data`) or hole at or after `offset`": whether one
+/// was found, its offset, and the file's size.
+async fn seek_in<B: Backend>(
+  backend: &mut B,
+  fh: &Nfsfh3,
+  offset: u64,
+  data: bool,
+) -> Result<(bool, u64, u64), Nfsstat4> {
+  let what = if data {
+    seek_what::DATA
+  } else {
+    seek_what::HOLE
+  };
+  let result = backend
+    .call_v3(extension::SEEK, v3call::seek_args(fh, offset, what))
+    .await;
+  v3(v3call::seek(&result))
+}
+
+/// SEEK (§15.11): an offset at or past the end is `NFS4ERR_NXIO`; data not found is `sr_eof`; the
+/// virtual hole at the end of the file is reported with `sr_eof` set.
+async fn seek<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &Frame) -> Outcome {
+  let bad = |_| Nfsstat4::Badxdr;
+  let stateid = Stateid::decode(reader).map_err(bad)?;
+  let offset = reader.u64().map_err(bad)?;
+  let data = match reader.u32().map_err(bad)? {
+    seek_what::DATA => true,
+    seek_what::HOLE => false,
+    _ => return Err(Nfsstat4::Badxdr),
+  };
+  let fh = current(frame)?.clone();
+  check_open_kind(backend, &fh).await?;
+  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
+  let (found, at, size) = seek_in(backend, &fh, offset, data).await?;
+  if offset >= size {
+    return Err(Nfsstat4::Nxio);
+  }
+  let mut body = XdrWriter::new();
+  body.bool(!found || at >= size);
+  body.u64(if found { at } else { size });
+  Ok(body.into_bytes())
+}
+
+/// READ_PLUS (§15.10): the requested range as contiguous data and hole contents, holes whole (they may
+/// start before and end after the request), data read through the v3 READ. The reply stops short of the
+/// request at the session's reply size; `rpr_eof` is set only when the contents reach the end of the
+/// file, so a short reply never claims the end.
+async fn read_plus<B: Backend>(
+  backend: &mut B,
+  reader: &mut XdrReader<'_>,
+  frame: &Frame,
+) -> Outcome {
+  let bad = |_| Nfsstat4::Badxdr;
+  let stateid = Stateid::decode(reader).map_err(bad)?;
+  let offset = reader.u64().map_err(bad)?;
+  let count = reader.u32().map_err(bad)?;
+  let fh = current(frame)?.clone();
+  check_open_kind(backend, &fh).await?;
+  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
+  let size = attrs_of(backend, &fh).await?.size;
+  let budget = usize::try_from(backend.with_v4(|server| server.limits().offer.max_response)?)
+    .unwrap_or(usize::MAX);
+  let end = offset
+    .saturating_add(u64::from(count.min(MAX_TRANSFER)))
+    .min(size);
+  let mut contents = Contents {
+    writer: XdrWriter::new(),
+    entries: 0,
+    at: offset,
+    budget,
+  };
+  while contents.at < end && contents.has_room() {
+    if !next_content(backend, &fh, &mut contents, size, end).await? {
+      break;
+    }
+  }
+  let mut body = XdrWriter::new();
+  body.bool(contents.at >= size);
+  body.u32(contents.entries);
+  body.fixed(contents.writer.as_slice());
+  Ok(body.into_bytes())
+}
+
+/// A READ_PLUS reply's contents as they are built: the encoded entries, their count, the next offset,
+/// and the reply size they must fit.
+struct Contents {
+  writer: XdrWriter,
+  entries: u32,
+  at: u64,
+  budget: usize,
+}
+
+impl Contents {
+  /// Whether one more entry's fixed fields fit the reply.
+  fn has_room(&self) -> bool {
+    self.writer.len() + CONTENT_ENTRY_BYTES < self.budget
+  }
+
+  /// The data bytes the next entry may carry within the reply.
+  fn room(&self) -> u64 {
+    u64::try_from(
+      self
+        .budget
+        .saturating_sub(self.writer.len() + CONTENT_ENTRY_BYTES),
+    )
+    .unwrap_or(0)
+  }
+}
+
+/// Appends the content at `contents.at`: a whole hole up to the next data, or the data up to the next
+/// hole (within `end` and the reply's room). `false` when nothing more can be added.
+async fn next_content<B: Backend>(
+  backend: &mut B,
+  fh: &Nfsfh3,
+  contents: &mut Contents,
+  size: u64,
+  end: u64,
+) -> Result<bool, Nfsstat4> {
+  let at = contents.at;
+  let (found, data_at, _) = seek_in(backend, fh, at, true).await?;
+  let data_at = if found { data_at } else { size };
+  if data_at > at {
+    // A hole from here to the next data (or the end), reported whole.
+    contents.writer.u32(seek_what::HOLE);
+    contents.writer.u64(at);
+    contents.writer.u64(data_at - at);
+    contents.entries += 1;
+    contents.at = data_at;
+    return Ok(true);
+  }
+  let (_, hole_at, _) = seek_in(backend, fh, at, false).await?;
+  let take = hole_at.min(end).saturating_sub(at).min(contents.room());
+  if take == 0 {
+    return Ok(false);
+  }
+  let result = backend
+    .call_v3(
+      NFSPROC3_READ,
+      v3call::read_args(fh, at, u32::try_from(take).unwrap_or(MAX_TRANSFER)),
+    )
+    .await;
+  let (_, data) = v3(v3call::read(&result))?;
+  if data.is_empty() {
+    return Ok(false);
+  }
+  contents.writer.u32(seek_what::DATA);
+  contents.writer.u64(at);
+  contents.writer.opaque(&data);
+  contents.entries += 1;
+  contents.at = at.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+  Ok(true)
+}
+
+/// COPY (§15.2), intra-server and synchronous: the saved file's range read and written to the current
+/// file through the v3 READ and WRITE, consecutively. One COPY copies at most what the client could
+/// have in flight over its session at once (the request size × the slots), so the server does no more
+/// work per compound than the client could ask of it while the wire carries none of the bytes; a
+/// shorter copy is answered with its count, and the client continues from there (as `copy_file_range`
+/// does). A failure after some bytes were copied answers the bytes copied.
+async fn copy<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &Frame) -> Outcome {
+  let request = CopyRequest::decode(reader)?;
+  let source = frame.saved.clone().ok_or(Nfsstat4::Nofilehandle)?;
+  let destination = current(frame)?.clone();
+  if source == destination {
+    return Err(Nfsstat4::Inval);
+  }
+  for fh in [&source, &destination] {
+    check_open_kind(backend, fh)
+      .await
+      .map_err(|_| Nfsstat4::WrongType)?;
+  }
+  backend.with_v4(|server| {
+    check_stateid(server, &request.source_stateid, &source, frame.clientid)?;
+    check_stateid(
+      server,
+      &request.destination_stateid,
+      &destination,
+      frame.clientid,
+    )
+  })??;
+  let size = attrs_of(backend, &source).await?.size;
+  let count = if request.count == 0 {
+    size.saturating_sub(request.source_offset)
+  } else {
+    request.count
+  };
+  if request.source_offset > size || request.source_offset.saturating_add(count) > size {
+    return Err(Nfsstat4::Inval);
+  }
+  let limits = backend.with_v4(|server| server.limits())?;
+  let bound =
+    u64::from(limits.offer.max_request).saturating_mul(u64::from(limits.offer.max_requests));
+  let (copied, verifier) = copy_range(
+    backend,
+    (&source, request.source_offset),
+    (&destination, request.destination_offset),
+    count.min(bound),
+  )
+  .await?;
+  let mut body = XdrWriter::new();
+  body.u32(0); // no callback id: the copy completed synchronously
+  body.u64(copied);
+  body.u32(UNSTABLE4);
+  body.fixed(&verifier);
+  body.bool(true); // consecutive
+  body.bool(true); // synchronous
+  Ok(body.into_bytes())
+}
+
+/// Copies up to `count` bytes from `source` to `destination` in transfer-sized pieces: the bytes copied
+/// and the last write verifier. The first failure ends the copy: before any byte it is the COPY's
+/// status, after some it answers the bytes copied.
+async fn copy_range<B: Backend>(
+  backend: &mut B,
+  (source, source_offset): (&Nfsfh3, u64),
+  (destination, destination_offset): (&Nfsfh3, u64),
+  count: u64,
+) -> Result<(u64, [u8; v3call::VERF_SIZE]), Nfsstat4> {
+  let mut copied = 0u64;
+  let mut verifier = [0u8; v3call::VERF_SIZE];
+  while copied < count {
+    let piece =
+      u32::try_from((count - copied).min(u64::from(MAX_TRANSFER))).unwrap_or(MAX_TRANSFER);
+    let step = copy_piece(
+      backend,
+      (source, source_offset + copied),
+      (destination, destination_offset + copied),
+      piece,
+    )
+    .await;
+    match step {
+      Ok((0, _)) => break,
+      Ok((written, written_verifier)) => {
+        copied += u64::from(written);
+        verifier = written_verifier;
+      }
+      Err(status) if copied == 0 => return Err(status),
+      Err(_) => break,
+    }
+  }
+  Ok((copied, verifier))
+}
+
+/// One READ of up to `piece` bytes from the source and its WRITE to the destination: the bytes
+/// written and the write verifier.
+async fn copy_piece<B: Backend>(
+  backend: &mut B,
+  (source, source_offset): (&Nfsfh3, u64),
+  (destination, destination_offset): (&Nfsfh3, u64),
+  piece: u32,
+) -> Result<(u32, [u8; v3call::VERF_SIZE]), Nfsstat4> {
+  let result = backend
+    .call_v3(
+      NFSPROC3_READ,
+      v3call::read_args(source, source_offset, piece),
+    )
+    .await;
+  let (_, data) = v3(v3call::read(&result))?;
+  if data.is_empty() {
+    return Ok((0, [0u8; v3call::VERF_SIZE]));
+  }
+  let result = backend
+    .call_v3(
+      NFSPROC3_WRITE,
+      v3call::write_args(destination, destination_offset, UNSTABLE4, &data),
+    )
+    .await;
+  let (written, _, verifier) = v3(v3call::write(&result))?;
+  Ok((written, verifier))
+}
+
+/// A decoded COPY.
+struct CopyRequest {
+  source_stateid: Stateid,
+  destination_stateid: Stateid,
+  source_offset: u64,
+  destination_offset: u64,
+  count: u64,
+}
+
+impl CopyRequest {
+  /// Reads COPY4args. A COPY naming source servers is an inter-server copy, which this server does not
+  /// offer (`NFS4ERR_NOTSUPP`).
+  fn decode(reader: &mut XdrReader<'_>) -> Result<CopyRequest, Nfsstat4> {
+    let bad = |_| Nfsstat4::Badxdr;
+    let request = CopyRequest {
+      source_stateid: Stateid::decode(reader).map_err(bad)?,
+      destination_stateid: Stateid::decode(reader).map_err(bad)?,
+      source_offset: reader.u64().map_err(bad)?,
+      destination_offset: reader.u64().map_err(bad)?,
+      count: reader.u64().map_err(bad)?,
+    };
+    let _consecutive = reader.bool().map_err(bad)?;
+    let _synchronous = reader.bool().map_err(bad)?;
+    if reader.u32().map_err(bad)? != 0 {
+      return Err(Nfsstat4::Notsupp);
+    }
+    Ok(request)
+  }
+}
+
+/// IO_ADVISE (§15.5): the hints are read and none is reported as acted on (an empty `ior_hints`), which
+/// the protocol permits: the hints are advisory.
+fn io_advise(reader: &mut XdrReader<'_>, frame: &Frame) -> Outcome {
+  let bad = |_| Nfsstat4::Badxdr;
+  let _stateid = Stateid::decode(reader).map_err(bad)?;
+  let _offset = reader.u64().map_err(bad)?;
+  let _count = reader.u64().map_err(bad)?;
+  let _hints = Bitmap::decode(reader).map_err(bad)?;
+  current(frame)?;
+  let mut body = XdrWriter::new();
+  Bitmap::default().encode(&mut body);
+  Ok(body.into_bytes())
+}

@@ -992,6 +992,52 @@ impl Volume {
     Ok(want)
   }
 
+  /// The first offset at or after `off`, before the end of the file, that holds data (`want` =
+  /// [`Seek::Data`]) or lies in a hole ([`Seek::Hole`]); `None` when there is none (RFC 7862 §15.11:
+  /// the end of the file is itself a hole, so a hole search from inside the file always finds one).
+  /// Data is what a chunk, the open extent or inline bytes hold; a zero extent and a gap between
+  /// extents are holes. A base-backed body's disk bytes are not inspected, so its whole length counts as
+  /// data, which the protocol permits (a server may report a hole as data, never data as a hole).
+  pub fn seek(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    want: Seek,
+  ) -> Result<Option<u64>, VfsError> {
+    self.namespace_inode(store, no)?;
+    let inode = self.inode(store, no)?;
+    if inode.kind.is_special() {
+      return Err(VfsError::SpecialFileOperation);
+    }
+    if inode.kind == Kind::Dir {
+      return Err(VfsError::IsDirectory);
+    }
+    let size = inode.attrs.size;
+    if off >= size {
+      return Ok(None);
+    }
+    let data = data_ranges(&inode.body, size);
+    Ok(match want {
+      Seek::Data => data
+        .iter()
+        .find(|(_, end)| *end > off)
+        .map(|(start, _)| (*start).max(off)),
+      Seek::Hole => {
+        let mut at = off;
+        for (start, end) in &data {
+          if *start > at {
+            break;
+          }
+          if *end > at {
+            at = *end;
+          }
+        }
+        Some(at.min(size))
+      }
+    })
+  }
+
   // ------------------------------------------------------------------ namespace mutations
 
   /// Creates an empty file.
@@ -4189,4 +4235,48 @@ pub(crate) fn body_chunks(store: &Store, body: &Body) -> Vec<Dead> {
       ExtentSrc::Zero => None,
     })
     .collect()
+}
+
+/// What [`Volume::seek`] looks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Seek {
+  /// The next byte that holds data.
+  Data,
+  /// The next byte in a hole (the end of the file counts as one).
+  Hole,
+}
+
+/// The byte ranges of a body that hold data, clipped to `size`, ascending and merged.
+fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
+  let mut ranges: Vec<(u64, u64)> = Vec::new();
+  let chunk_ranges = |extents: &[Extent], ranges: &mut Vec<(u64, u64)>| {
+    for extent in extents {
+      if matches!(extent.src, ExtentSrc::Chunk { .. }) {
+        ranges.push((extent.off, extent.off.saturating_add(extent.len)));
+      }
+    }
+  };
+  match body {
+    Body::Inline(bytes) => ranges.push((0, u64::try_from(bytes.len()).unwrap_or(u64::MAX))),
+    Body::Sealed(extents) => chunk_ranges(extents, &mut ranges),
+    Body::Open { open, sealed } => {
+      chunk_ranges(sealed, &mut ranges);
+      ranges.push((open.off, open.off.saturating_add(open.len)));
+    }
+    Body::Base(_) => ranges.push((0, size)),
+    Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+  }
+  ranges.sort_unstable();
+  let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+  for (start, end) in ranges {
+    let (start, end) = (start.min(size), end.min(size));
+    if start >= end {
+      continue;
+    }
+    match merged.last_mut() {
+      Some(last) if start <= last.1 => last.1 = last.1.max(end),
+      _ => merged.push((start, end)),
+    }
+  }
+  merged
 }

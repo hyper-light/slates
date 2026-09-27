@@ -193,6 +193,29 @@ pub fn read(result: &[u8]) -> Result<Result<(bool, Vec<u8>), Nfsstat3>, Malforme
   }
 }
 
+/// SEEK extension arguments (A-35, `crate::procedures::extension::SEEK`).
+pub fn seek_args(fh: &Nfsfh3, offset: u64, what: u32) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  fh.encode(&mut writer);
+  writer.u64(offset);
+  writer.u32(what);
+  writer.into_bytes()
+}
+
+/// A SEEK extension result: whether a match was found, its offset, and the file's size.
+pub fn seek(result: &[u8]) -> Result<Result<(bool, u64, u64), Nfsstat3>, Malformed> {
+  let mut reader = XdrReader::new(result);
+  match status(&mut reader)? {
+    Nfsstat3::Ok => {
+      let found = reader.bool().map_err(|_| Malformed)?;
+      let offset = reader.u64().map_err(|_| Malformed)?;
+      let size = reader.u64().map_err(|_| Malformed)?;
+      Ok(Ok((found, offset, size)))
+    }
+    other => Ok(Err(other)),
+  }
+}
+
 /// A v3 result: the procedure's value or its status, or `Malformed` if the reply did not decode.
 pub type Reply<T> = Result<Result<T, Nfsstat3>, Malformed>;
 
