@@ -32,6 +32,7 @@ use slates_bridge_core::{
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
+use slates_vfs::xattr::XattrSet;
 
 use crate::access::{self, Caller, Denial, UnixGroups, Want};
 use crate::handle::{FileHandle, FileHandleError};
@@ -101,6 +102,38 @@ pub mod extension {
   /// (`u32`: 0 data, 1 hole). Result: the status; on success whether one was found (`bool`), its
   /// offset (`u64`) and the file's size (`u64`).
   pub const SEEK: u32 = 1024;
+  /// Format: an extended attribute's value (RFC 8276 GETXATTR). Arguments: the file handle and the
+  /// name (opaque). Result: the status, then the value (opaque).
+  pub const XATTR_GET: u32 = 1025;
+  /// Format: set an extended attribute (RFC 8276 SETXATTR). Arguments: the file handle, how (`u32`:
+  /// 0 either, 1 create only, 2 replace only), the name and the value (opaques). Result: the status.
+  pub const XATTR_SET: u32 = 1026;
+  /// Format: the names of a file's extended attributes (RFC 8276 LISTXATTRS). Arguments: the file
+  /// handle. Result: the status, then a count and each name (opaque), ascending by bytes.
+  pub const XATTR_LIST: u32 = 1027;
+  /// Format: remove an extended attribute (RFC 8276 REMOVEXATTR). Arguments: the file handle and the
+  /// name. Result: the status.
+  pub const XATTR_REMOVE: u32 = 1028;
+}
+
+/// Format: XATTR_SET's `how` values, RFC 8276's `setxattr_option4`.
+pub mod setxattr_how {
+  /// Format: `SETXATTR4_EITHER`: create or replace.
+  pub const EITHER: u32 = 0;
+  /// Format: `SETXATTR4_CREATE`: create only (`NFS4ERR_EXIST` when set).
+  pub const CREATE: u32 = 1;
+  /// Format: `SETXATTR4_REPLACE`: replace only (`NFS4ERR_NOXATTR` when not set).
+  pub const REPLACE: u32 = 2;
+}
+
+/// Format: the extension procedures' two statuses with no NFSv3 counterpart, carried as their NFSv4
+/// values (every NFSv3 status the dispatch returns has the same value in NFSv4): `NFS4ERR_NOXATTR` and
+/// `NFS4ERR_XATTR2BIG` (RFC 8276 §8.3).
+pub mod extension_status {
+  /// Format: `NFS4ERR_NOXATTR`, the attribute is not set.
+  pub const NOXATTR: u32 = 10095;
+  /// Format: `NFS4ERR_XATTR2BIG`, the value or the file's attributes pass the volume's limit.
+  pub const XATTR2BIG: u32 = 10096;
 }
 
 /// Format: SEEK's `what` values: data, and hole (RFC 7862 `data_content4`).
@@ -556,6 +589,10 @@ impl<'b> Export<'b> {
       NFSPROC3_COMMIT => Some(self.commit(args)),
       NFSPROC3_PATHCONF => Some(self.pathconf(args)),
       extension::SEEK => Some(self.seek(args)),
+      extension::XATTR_GET
+      | extension::XATTR_SET
+      | extension::XATTR_LIST
+      | extension::XATTR_REMOVE => Some(self.xattr(procedure, args)),
       _ => None,
     }
   }
@@ -766,6 +803,103 @@ impl<'b> Export<'b> {
       .seek(object, &cx, offset, data)
       .map_err(|e| nfsstat_of(&e))?;
     Ok((found, node.size))
+  }
+
+  /// The extended attribute extensions (A-35, RFC 8276): get, set, list and remove, on a regular file
+  /// or a directory (the objects the user namespace covers), under the file's permissions: reading a
+  /// value needs read permission, setting or removing one write permission, listing only the handle.
+  pub fn xattr(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.xattr_result(procedure, args) {
+      Ok(XattrReply::Value(value)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        writer.opaque(&value);
+      }
+      Ok(XattrReply::Names(names)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        writer.u32(u32::try_from(names.len()).unwrap_or(u32::MAX));
+        for name in &names {
+          writer.opaque(name);
+        }
+      }
+      Ok(XattrReply::Done) => Nfsstat3::Ok.encode(&mut writer),
+      Err(status) => writer.u32(status),
+    }
+    writer.into_bytes()
+  }
+
+  fn xattr_result(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Result<XattrReply, u32> {
+    let wire = |status: Nfsstat3| status as u32;
+    let handle = Nfsfh3::decode(args).map_err(|_| wire(Nfsstat3::Badhandle))?;
+    let identity = self.resolve_handle(&handle).map_err(wire)?;
+    let node = self.attrs_of(&identity).map_err(wire)?;
+    if !matches!(node.kind, Kind::File | Kind::Dir) {
+      return Err(wire(Nfsstat3::Perm));
+    }
+    let want = match procedure {
+      extension::XATTR_GET => Some(Want::Read),
+      extension::XATTR_SET | extension::XATTR_REMOVE => Some(Want::Write),
+      _ => None,
+    };
+    if let Some(want) = want
+      && !access::permits_io(&self.caller, &node, want)
+    {
+      return Err(wire(Nfsstat3::Acces));
+    }
+    let cx = self.op_context().map_err(|e| wire(nfsstat_of(&e)))?;
+    let object = ObjectId::new(identity.inode, identity.generation);
+    let name = |args: &mut XdrReader<'_>| {
+      args
+        .opaque(slates_vfs::xattr::XATTR_NAME_MAX_BYTES)
+        .map(<[u8]>::to_vec)
+        .map_err(|_| wire(Nfsstat3::Nametoolong))
+    };
+    let refused = |e: VfsError| match e {
+      VfsError::NoAttribute => extension_status::NOXATTR,
+      VfsError::NoSpace | VfsError::FileTooLarge => extension_status::XATTR2BIG,
+      other => wire(nfsstat_of(&other)),
+    };
+    match procedure {
+      extension::XATTR_GET => {
+        let name = name(args)?;
+        self
+          .bridge
+          .xattr_get(object, &cx, &name)
+          .map(XattrReply::Value)
+          .map_err(refused)
+      }
+      extension::XATTR_SET => {
+        let how = match args.u32().map_err(|_| wire(Nfsstat3::Inval))? {
+          setxattr_how::EITHER => XattrSet::Either,
+          setxattr_how::CREATE => XattrSet::Create,
+          setxattr_how::REPLACE => XattrSet::Replace,
+          _ => return Err(wire(Nfsstat3::Inval)),
+        };
+        let name = name(args)?;
+        let value = args
+          .opaque(usize::try_from(MAX_TRANSFER).unwrap_or(usize::MAX))
+          .map_err(|_| extension_status::XATTR2BIG)?
+          .to_vec();
+        self
+          .bridge
+          .xattr_set(object, &cx, &name, &value, how)
+          .map(|()| XattrReply::Done)
+          .map_err(refused)
+      }
+      extension::XATTR_LIST => self
+        .bridge
+        .xattr_list(object, &cx)
+        .map(XattrReply::Names)
+        .map_err(refused),
+      _ => {
+        let name = name(args)?;
+        self
+          .bridge
+          .xattr_remove(object, &cx, &name)
+          .map(|()| XattrReply::Done)
+          .map_err(refused)
+      }
+    }
   }
 
   /// NFSPROC3_WRITE: write the request's data at `offset` to the file a handle names, over the
@@ -2207,4 +2341,14 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::BaseUnavailable(_) => Nfsstat3::Io,
     _ => Nfsstat3::ServerFault,
   }
+}
+
+/// What an extended attribute extension answers on success.
+enum XattrReply {
+  /// A value (get).
+  Value(Vec<u8>),
+  /// The names (list).
+  Names(Vec<Box<[u8]>>),
+  /// Nothing more (set, remove).
+  Done,
 }

@@ -164,6 +164,10 @@ pub enum Nfsstat4 {
   WrongCred = 10082,
   /// Format: `NFS4ERR_WRONG_TYPE` (RFC 7863 `nfsstat4`).
   WrongType = 10083,
+  /// Format: `NFS4ERR_NOXATTR` (RFC 8276 §8.3.1): the extended attribute is not set.
+  Noxattr = 10095,
+  /// Format: `NFS4ERR_XATTR2BIG` (RFC 8276 §8.3.2): the value, or the file's attributes, pass the limit.
+  Xattr2big = 10096,
   /// Format: `NFS4ERR_UNION_NOTSUPP` (RFC 7863 `nfsstat4`).
   UnionNotsupp = 10090,
 }

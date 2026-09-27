@@ -220,6 +220,31 @@ pub trait Bridge {
     size: u32,
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError>;
+  /// The value of `object`'s extended attribute `name`, under `cx` (which must allow reading);
+  /// `VfsError::NoAttribute` when it has none by that name (§4.5 "Extended attributes").
+  fn xattr_get(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+  ) -> Result<Vec<u8>, VfsError>;
+  /// Sets `object`'s extended attribute `name` to `value` as `how` allows (create, replace or either),
+  /// under `cx` (which must allow writing).
+  fn xattr_set(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+    value: &[u8],
+    how: slates_vfs::xattr::XattrSet,
+  ) -> Result<(), VfsError>;
+  /// The names of `object`'s extended attributes, ascending by bytes, under `cx` (which must allow
+  /// reading).
+  fn xattr_list(&mut self, object: ObjectId, cx: &OpContext) -> Result<Vec<Box<[u8]>>, VfsError>;
+  /// Removes `object`'s extended attribute `name` (`VfsError::NoAttribute` when it has none), under
+  /// `cx` (which must allow writing).
+  fn xattr_remove(&mut self, object: ObjectId, cx: &OpContext, name: &[u8])
+  -> Result<(), VfsError>;
   /// The first offset at or after `offset`, before the end of `object`, that holds data (`data`) or
   /// lies in a hole (`!data`), under the authenticated `cx` (which must allow reading); `None` when
   /// there is none (RFC 7862 §15.11 SEEK; `slates_vfs::volume::Volume::seek`).

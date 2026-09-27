@@ -150,8 +150,16 @@ pub mod op {
   pub const READ_PLUS: u32 = 68;
   /// Format: `OP_SEEK`.
   pub const SEEK: u32 = 69;
-  /// Format: `OP_CLONE`, the highest operation number NFSv4.2 defines.
+  /// Format: `OP_CLONE` (RFC 7862).
   pub const CLONE: u32 = 71;
+  /// Format: `OP_GETXATTR` (RFC 8276).
+  pub const GETXATTR: u32 = 72;
+  /// Format: `OP_SETXATTR`.
+  pub const SETXATTR: u32 = 73;
+  /// Format: `OP_LISTXATTRS`.
+  pub const LISTXATTRS: u32 = 74;
+  /// Format: `OP_REMOVEXATTR`, the highest operation number NFSv4.2 defines (with RFC 8276).
+  pub const REMOVEXATTR: u32 = 75;
   /// Format: `OP_ILLEGAL`: the reply's opnum for an operation number no operation has.
   pub const ILLEGAL: u32 = 10044;
 }
@@ -410,7 +418,8 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
     };
     // An operation the compound's minor version does not define is illegal in it (RFC 8881 §16.2.3):
     // NFSv4.2's operations (RFC 7862) in a 4.1 compound.
-    let opnum = if minor < MINOR_HIGHEST && opnum > op::RECLAIM_COMPLETE && opnum <= op::CLONE {
+    let opnum = if minor < MINOR_HIGHEST && opnum > op::RECLAIM_COMPLETE && opnum <= op::REMOVEXATTR
+    {
       op::ILLEGAL
     } else {
       opnum
@@ -496,7 +505,7 @@ fn record(
 
 /// Whether `opnum` names an operation (anything else is answered as `OP_ILLEGAL`).
 fn is_operation(opnum: u32) -> bool {
-  (op::ACCESS..=op::CLONE).contains(&opnum)
+  (op::ACCESS..=op::REMOVEXATTR).contains(&opnum)
 }
 
 /// A `COMPOUND4res`: the last status, the tag, the result count and the results.
@@ -842,9 +851,14 @@ async fn namespace_operation<B: Backend>(
     op::RENAME => rename(backend, reader, frame).await,
     op::LINK => link(backend, reader, frame).await,
     op::LOCK | op::LOCKT | op::LOCKU => lock_operation(backend, opnum, reader, frame).await,
-    op::SEEK | op::READ_PLUS | op::COPY | op::IO_ADVISE => {
-      super::v42::operation(backend, opnum, reader, frame).await
-    }
+    op::SEEK
+    | op::READ_PLUS
+    | op::COPY
+    | op::IO_ADVISE
+    | op::GETXATTR
+    | op::SETXATTR
+    | op::LISTXATTRS
+    | op::REMOVEXATTR => super::v42::operation(backend, opnum, reader, frame).await,
     _ => backend.with_v4(|server| state_operation(server, opnum, reader, frame))?,
   }
 }
@@ -872,7 +886,24 @@ async fn readlink<B: Backend>(backend: &mut B, frame: &Frame) -> Outcome {
   Ok(body.into_bytes())
 }
 
-/// ACCESS: every bit asked is one this server evaluates, so all are reported supported.
+/// Format: the ACCESS bits (RFC 8881 §18.1; RFC 8276 §8.5).
+mod access4 {
+  /// Format: `ACCESS4_READ`.
+  pub(super) const READ: u32 = 0x1;
+  /// Format: `ACCESS4_MODIFY`.
+  pub(super) const MODIFY: u32 = 0x4;
+  /// Format: the six bits NFSv3's ACCESS also defines (READ through EXECUTE).
+  pub(super) const V3_BITS: u32 = 0x3f;
+  /// Format: `ACCESS4_XAREAD`.
+  pub(super) const XAREAD: u32 = 0x40;
+  /// Format: `ACCESS4_XAWRITE`.
+  pub(super) const XAWRITE: u32 = 0x80;
+  /// Format: `ACCESS4_XALIST`.
+  pub(super) const XALIST: u32 = 0x100;
+}
+
+/// ACCESS: the bits this server evaluates are reported supported, and each granted as the file's
+/// permissions allow.
 async fn access<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
@@ -880,12 +911,31 @@ async fn access<B: Backend>(
 ) -> Outcome {
   let asked = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
   let fh = current(frame)?.clone();
+  // RFC 8276 §8.5: the extended attribute bits follow the file's permissions as the attribute
+  // operations do — reading a value needs read (`ACCESS4_READ`), changing one needs modify, and
+  // listing needs only the handle.
+  let mut v3_asked = asked & access4::V3_BITS;
+  if asked & access4::XAREAD != 0 {
+    v3_asked |= access4::READ;
+  }
+  if asked & access4::XAWRITE != 0 {
+    v3_asked |= access4::MODIFY;
+  }
   let result = backend
-    .call_v3(NFSPROC3_ACCESS, v3call::access_args(&fh, asked))
+    .call_v3(NFSPROC3_ACCESS, v3call::access_args(&fh, v3_asked))
     .await;
-  let granted = v3(v3call::access(&result))?;
+  let granted3 = v3(v3call::access(&result))?;
+  let mut granted = granted3 & asked & access4::V3_BITS;
+  if granted3 & access4::READ != 0 {
+    granted |= asked & access4::XAREAD;
+  }
+  if granted3 & access4::MODIFY != 0 {
+    granted |= asked & access4::XAWRITE;
+  }
+  granted |= asked & access4::XALIST;
+  let supported = asked & (access4::V3_BITS | access4::XAREAD | access4::XAWRITE | access4::XALIST);
   let mut body = XdrWriter::new();
-  body.u32(asked);
+  body.u32(supported);
   body.u32(granted);
   Ok(body.into_bytes())
 }
@@ -1990,7 +2040,7 @@ async fn link<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
 
 /// A `change_info4` that is not atomic: the directory's change attribute is not known to this layer
 /// before and after, so the client revalidates the directory.
-fn change_info() -> Vec<u8> {
+pub(super) fn change_info() -> Vec<u8> {
   let mut body = XdrWriter::new();
   body.bool(false);
   body.u64(0);

@@ -240,6 +240,16 @@ impl<'v> VolumeBridge<'v> {
     Ok(())
   }
 
+  /// The inode whose attributes an attribute verb on `object` names: the object itself. An AppleDouble
+  /// view (a derived number) is rendered from attributes, and holds none of its own.
+  fn xattr_owner(&self, object: ObjectId) -> Result<InodeNo, VfsError> {
+    let inode = InodeNo(object.inode);
+    if inode.derived_from().is_some() {
+      return Err(VfsError::Invalid);
+    }
+    Ok(inode)
+  }
+
   /// Refuses unless `cx`'s attachment binds this bridge's volume. The lifecycle operations
   /// (release, forget, flush) need no particular right — dropping a handle or a lookup reference is
   /// always the holder's to do — but they must still name this volume, so a context for another
@@ -535,6 +545,53 @@ impl Bridge for VolumeBridge<'_> {
     }?;
     out.extend_from_slice(&buf[..read]);
     Ok(())
+  }
+
+  fn xattr_get(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+  ) -> Result<Vec<u8>, VfsError> {
+    self.authorize_read(cx)?;
+    let owner = self.xattr_owner(object)?;
+    let len = self.volume.xattr_len(self.store, owner, name)?;
+    let mut value = vec![0u8; usize::try_from(len).map_err(|_| VfsError::FileTooLarge)?];
+    let read = self
+      .volume
+      .xattr_read(self.store, owner, name, 0, &mut value)?;
+    value.truncate(read);
+    Ok(value)
+  }
+
+  fn xattr_set(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+    value: &[u8],
+    how: slates_vfs::xattr::XattrSet,
+  ) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
+    let owner = self.xattr_owner(object)?;
+    self.volume.xattr_set(self.store, owner, name, value, how)
+  }
+
+  fn xattr_list(&mut self, object: ObjectId, cx: &OpContext) -> Result<Vec<Box<[u8]>>, VfsError> {
+    self.authorize_read(cx)?;
+    let owner = self.xattr_owner(object)?;
+    self.volume.xattr_names(self.store, owner)
+  }
+
+  fn xattr_remove(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+  ) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
+    let owner = self.xattr_owner(object)?;
+    self.volume.xattr_remove(self.store, owner, name)
   }
 
   fn seek(

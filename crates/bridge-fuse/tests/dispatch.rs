@@ -112,6 +112,40 @@ impl Bridge for Mock {
       Err(VfsError::NotFound)
     }
   }
+  /// The mock holds no extended attributes.
+  fn xattr_get(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    _name: &[u8],
+  ) -> Result<Vec<u8>, VfsError> {
+    Err(VfsError::NoAttribute)
+  }
+
+  fn xattr_set(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    _name: &[u8],
+    _value: &[u8],
+    _how: slates_vfs::xattr::XattrSet,
+  ) -> Result<(), VfsError> {
+    Err(VfsError::NotPermitted)
+  }
+
+  fn xattr_list(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<Vec<Box<[u8]>>, VfsError> {
+    Ok(Vec::new())
+  }
+
+  fn xattr_remove(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    _name: &[u8],
+  ) -> Result<(), VfsError> {
+    Err(VfsError::NoAttribute)
+  }
+
   /// The mock's content has no holes: every byte before its end is data, and the end is the hole.
   fn seek(
     &mut self,

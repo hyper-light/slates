@@ -1708,6 +1708,16 @@ therefore one implementation shared by both versions.
     request size × its slots, the work the client could have in flight at once, and a short copy is
     answered with its count.
   - **IO_ADVISE** acts on no hints.
+  - **Extended attributes** (RFC 8276): GETXATTR, SETXATTR, LISTXATTRS and REMOVEXATTR run on the
+    attribute extension procedures over the volume's attributes (§4.5).
+    - The protocol carries the user namespace only (§5). A key `k` is therefore the volume's
+      `user.k`, and LISTXATTRS lists the `user.` names without the prefix. An attribute set over NFSv4
+      has the same name through FUSE and on a landed Linux file.
+    - Reading a value needs read permission, changing one needs write permission, and listing needs
+      only the handle. Only regular files and directories carry user attributes.
+    - ACCESS maps `XAREAD` to read, `XAWRITE` to modify, and grants `XALIST`.
+    - `xattr_support` is reported true. It had been reported before the operations were served, and a
+      client that trusted it would have received `NFS4ERR_NOTSUPP`.
   - **Not offered:**
     - CLONE: cross-inode chunk sharing needs dedup's reference counts.
     - ALLOCATE: no reservation holds under copy-on-write.
@@ -1745,10 +1755,12 @@ therefore one implementation shared by both versions.
   On a 4.2 mount the kernel's `lseek(SEEK_HOLE)` finds a hole between two writes, which only the
   server's SEEK can answer: the kernel's fallback reports the end of the file. `SEEK_DATA` finds the
   second write, and `copy_file_range` makes a byte-identical copy. Whether the kernel used COPY or its
-  own copy is not observed there. COPY itself is proved by use in `tests/v4.rs`.
+  own copy is not observed there. COPY itself is proved by use in `tests/v4.rs`. The kernel's
+  `user.` extended attributes are set, read, listed and removed. `XATTR_CREATE` of a set name is
+  `EEXIST`, and a removed one reads `ENODATA`.
   Owed:
   - the persisted and replicated open and lock state;
-  - DEALLOCATE (a volume change), CLONE (with dedup), and RFC 8276 extended attributes;
+  - DEALLOCATE (a volume change) and CLONE (with dedup);
 
   - RPC-over-TLS;
   - pNFS flexfiles.
@@ -6064,3 +6076,10 @@ to an NFSv4 request, nor on another host — so a `._name` a v4 or Linux client 
 renames is an ordinary file and never another file's attributes (the view flag on `Export`, the
 `VolumeSet`/`NfsService` setters, the daemon's `Requester`). Applied to: §4.6 (A-33's view, the v4
 front end); `slates-bridge-nfs`; `slates-server`; `tests/v4.rs`; GAPS and TBD_FIXES.
+
+Amended a sixth time the same day: RFC 8276 extended attributes over NFSv4.2 (GETXATTR, SETXATTR,
+LISTXATTRS, REMOVEXATTR as keys of the volume's user namespace; the attribute extension procedures;
+`Bridge::xattr_get/set/list/remove`; ACCESS's extended attribute bits; the daemon's barrier on attribute
+changes). Applied to: §4.6; `slates-bridge-core` (the attribute verbs, which the FUSE and WinFsp
+attribute calls owed by A-32 will use); `slates-bridge-nfs`; `slates-server`; the kernel test; GAPS and
+TBD_FIXES.

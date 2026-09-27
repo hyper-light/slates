@@ -12,15 +12,22 @@
 //! - **DEALLOCATE**: punching a hole splits chunk-backed extents so that one chunk sits under two
 //!   extents, which the volume's release accounting does not yet allow; it is its own volume change.
 //! - **WRITE_SAME**, the layout operations, and the inter-server copy (a COPY naming source servers).
+//!
+//! The extended attribute operations (RFC 8276) run on the attribute extension procedures. The protocol
+//! carries the user namespace only (§5), so a key `k` is the volume's attribute `user.k`, and
+//! LISTXATTRS lists the `user.` attributes without the prefix: an attribute set over NFSv4 has the name
+//! a Linux host's `setfattr -n user.k` gives it, through FUSE or on a landed file.
 
 use super::Nfsstat4;
 use super::compound::{
-  Backend, Frame, Outcome, attrs_of, check_open_kind, check_stateid, current, op, v3,
+  Backend, Frame, Outcome, attrs_of, change_info, check_open_kind, check_stateid, current, op, v3,
 };
 use super::types::{Bitmap, Stateid};
 use super::v3call;
 use crate::nfs::Nfsfh3;
-use crate::procedures::{MAX_TRANSFER, NFSPROC3_READ, NFSPROC3_WRITE, extension, seek_what};
+use crate::procedures::{
+  MAX_TRANSFER, NFSPROC3_READ, NFSPROC3_WRITE, extension, extension_status, seek_what,
+};
 use crate::xdr::{XdrReader, XdrWriter};
 
 /// Format: `stable_how4` `UNSTABLE4`: a COPY's writes are unstable, made stable by the client's
@@ -30,7 +37,7 @@ const UNSTABLE4: u32 = 0;
 /// and a length or an opaque's length word (RFC 7862 `read_plus_content`).
 const CONTENT_ENTRY_BYTES: usize = 4 + 8 + 8;
 
-/// One NFSv4.2 operation.
+/// One NFSv4.2 operation (RFC 7862), or one of RFC 8276's extended attribute operations.
 pub(super) async fn operation<B: Backend>(
   backend: &mut B,
   opnum: u32,
@@ -41,7 +48,8 @@ pub(super) async fn operation<B: Backend>(
     op::SEEK => seek(backend, reader, frame).await,
     op::READ_PLUS => read_plus(backend, reader, frame).await,
     op::COPY => copy(backend, reader, frame).await,
-    _ => io_advise(reader, frame),
+    op::IO_ADVISE => io_advise(reader, frame),
+    _ => xattr_operation(backend, opnum, reader, frame).await,
   }
 }
 
@@ -357,5 +365,141 @@ fn io_advise(reader: &mut XdrReader<'_>, frame: &Frame) -> Outcome {
   current(frame)?;
   let mut body = XdrWriter::new();
   Bitmap::default().encode(&mut body);
+  Ok(body.into_bytes())
+}
+
+/// Format: the namespace NFSv4 extended attribute keys name (RFC 8276 §5): the user namespace.
+const USER_NAMESPACE: &[u8] = b"user.";
+/// Format: the bytes a LISTXATTRS reply spends beyond its names: the cookie, the name count and the
+/// end-of-list flag (RFC 8276 `LISTXATTRS4resok`).
+const LISTXATTRS_FIXED_BYTES: usize = 8 + 4 + 4;
+
+/// An RFC 8276 key read from the wire, as the volume's attribute name `user.<key>`.
+fn user_name(reader: &mut XdrReader<'_>) -> Result<Vec<u8>, Nfsstat4> {
+  let key = reader
+    .opaque(slates_vfs::xattr::XATTR_NAME_MAX_BYTES - USER_NAMESPACE.len())
+    .map_err(|_| Nfsstat4::Nametoolong)?;
+  if key.is_empty() {
+    return Err(Nfsstat4::Inval);
+  }
+  let mut name = USER_NAMESPACE.to_vec();
+  name.extend_from_slice(key);
+  Ok(name)
+}
+
+/// An attribute extension's status: OK, one of RFC 8276's two, or an NFSv3 status mapped.
+fn extension_result(reader: &mut XdrReader<'_>) -> Result<(), Nfsstat4> {
+  match reader.u32().map_err(|_| Nfsstat4::Serverfault)? {
+    0 => Ok(()),
+    extension_status::NOXATTR => Err(Nfsstat4::Noxattr),
+    extension_status::XATTR2BIG => Err(Nfsstat4::Xattr2big),
+    other => Err(
+      crate::nfs::Nfsstat3::from_wire(other)
+        .map(Nfsstat4::of_v3)
+        .unwrap_or(Nfsstat4::Serverfault),
+    ),
+  }
+}
+
+/// GETXATTR, SETXATTR, LISTXATTRS and REMOVEXATTR (RFC 8276 §8.4).
+async fn xattr_operation<B: Backend>(
+  backend: &mut B,
+  opnum: u32,
+  reader: &mut XdrReader<'_>,
+  frame: &mut Frame,
+) -> Outcome {
+  let fh = current(frame)?.clone();
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  let procedure = match opnum {
+    op::GETXATTR => {
+      args.opaque(&user_name(reader)?);
+      extension::XATTR_GET
+    }
+    op::SETXATTR => {
+      let how = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
+      let name = user_name(reader)?;
+      let limit = usize::try_from(backend.with_v4(|server| server.limits().offer.max_request)?)
+        .unwrap_or(usize::MAX);
+      let value = reader.opaque(limit).map_err(|_| Nfsstat4::Badxdr)?;
+      args.u32(how);
+      args.opaque(&name);
+      args.opaque(value);
+      extension::XATTR_SET
+    }
+    op::LISTXATTRS => return listxattrs(backend, reader, &fh).await,
+    _ => {
+      args.opaque(&user_name(reader)?);
+      extension::XATTR_REMOVE
+    }
+  };
+  let result = backend.call_v3(procedure, args.into_bytes()).await;
+  let mut result = XdrReader::new(&result);
+  extension_result(&mut result)?;
+  match opnum {
+    op::GETXATTR => {
+      let value = result
+        .opaque(usize::try_from(MAX_TRANSFER).unwrap_or(usize::MAX))
+        .map_err(|_| Nfsstat4::Serverfault)?;
+      let mut body = XdrWriter::new();
+      body.opaque(value);
+      Ok(body.into_bytes())
+    }
+    // SETXATTR and REMOVEXATTR answer a change_info4 that is not atomic: the client revalidates.
+    _ => Ok(change_info()),
+  }
+}
+
+/// LISTXATTRS (RFC 8276 §8.4.3): the `user.` attributes, prefix stripped, from the cookie (the index
+/// of the next name in the ascending listing) while they fit `maxcount`; a first name that cannot fit
+/// is `NFS4ERR_TOOSMALL`.
+async fn listxattrs<B: Backend>(
+  backend: &mut B,
+  reader: &mut XdrReader<'_>,
+  fh: &Nfsfh3,
+) -> Outcome {
+  let cookie = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
+  let maxcount = usize::try_from(reader.u32().map_err(|_| Nfsstat4::Badxdr)?).unwrap_or(usize::MAX);
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  let result = backend
+    .call_v3(extension::XATTR_LIST, args.into_bytes())
+    .await;
+  let mut result = XdrReader::new(&result);
+  extension_result(&mut result)?;
+  let count = result.u32().map_err(|_| Nfsstat4::Serverfault)?;
+  let mut keys: Vec<Vec<u8>> = Vec::new();
+  for _ in 0..count {
+    let name = result
+      .opaque(slates_vfs::xattr::XATTR_NAME_MAX_BYTES)
+      .map_err(|_| Nfsstat4::Serverfault)?;
+    if let Some(key) = name.strip_prefix(USER_NAMESPACE) {
+      keys.push(key.to_vec());
+    }
+  }
+  let start = usize::try_from(cookie)
+    .unwrap_or(usize::MAX)
+    .min(keys.len());
+  let mut names = XdrWriter::new();
+  let mut returned = 0u32;
+  let mut next = start;
+  for key in &keys[start..] {
+    let mut one = XdrWriter::new();
+    one.opaque(key);
+    if LISTXATTRS_FIXED_BYTES + names.len() + one.len() > maxcount {
+      break;
+    }
+    names.fixed(one.as_slice());
+    returned += 1;
+    next += 1;
+  }
+  if returned == 0 && next < keys.len() {
+    return Err(Nfsstat4::Toosmall);
+  }
+  let mut body = XdrWriter::new();
+  body.u64(u64::try_from(next).unwrap_or(u64::MAX));
+  body.u32(returned);
+  body.fixed(names.as_slice());
+  body.bool(next >= keys.len());
   Ok(body.into_bytes())
 }

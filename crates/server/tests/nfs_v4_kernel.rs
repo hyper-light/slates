@@ -3,7 +3,7 @@
 //! the RAM test directory, driven through ordinary file calls — create, write, read, append, mkdir,
 //! rename, symlink, hard link, truncate, list, remove, and `flock` between two open files (the server's
 //! LOCK, LOCKT and LOCKU), and on 4.2 `lseek(SEEK_HOLE/SEEK_DATA)` and `copy_file_range` (the server's
-//! SEEK and COPY) — and read back over NFSv3 from the daemon, so the
+//! SEEK and COPY) and `user.` extended attributes (RFC 8276) — and read back over NFSv3 from the daemon, so the
 //! kernel's compounds are proved to land in the volume, not only to succeed.
 //!
 //! Gated: it needs Linux, root (or passwordless `sudo`) for `mount`, the `mount.nfs4` helper, and a
@@ -250,6 +250,40 @@ fn locks_conflict_across_open_files(file: &Path) {
   flock(&second, FlockOperation::Unlock).unwrap();
 }
 
+/// RFC 8276 through the kernel's 4.2 client: `user.` attributes are set, read, listed and removed, and
+/// `XATTR_CREATE` of a set name is refused `EEXIST` (the server's `NFS4ERR_EXIST`), a missing one
+/// `ENODATA` (its `NFS4ERR_NOXATTR`).
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn user_attributes(root: &Path) {
+  use rustix::fs::{XattrFlags, getxattr, listxattr, removexattr, setxattr};
+  let file = root.join("attributed");
+  std::fs::write(&file, b"x").unwrap();
+  setxattr(&file, "user.origin", b"slates", XattrFlags::CREATE).unwrap();
+  assert_eq!(
+    setxattr(&file, "user.origin", b"again", XattrFlags::CREATE),
+    Err(rustix::io::Errno::EXIST)
+  );
+  let mut value = [0u8; 64];
+  let read = getxattr(&file, "user.origin", &mut value).unwrap();
+  assert_eq!(&value[..read], b"slates");
+  let mut names = [0u8; 256];
+  let listed = listxattr(&file, &mut names).unwrap();
+  assert!(
+    names[..listed]
+      .split(|byte| *byte == 0)
+      .any(|name| name == b"user.origin"),
+    "listed: {:?}",
+    String::from_utf8_lossy(&names[..listed])
+  );
+  removexattr(&file, "user.origin").unwrap();
+  assert_eq!(
+    getxattr(&file, "user.origin", &mut value),
+    Err(rustix::io::Errno::NODATA)
+  );
+  std::fs::remove_file(&file).unwrap();
+}
+
 /// Shape: the gap between a sparse file's two writes: several chunk windows.
 #[cfg(target_os = "linux")]
 const GAP: u64 = 1 << 20;
@@ -319,6 +353,7 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
       #[cfg(target_os = "linux")]
       if minor == 2 {
         sparse_seek_and_copy(&mounted.path);
+        user_attributes(&mounted.path);
       }
     }
     let mut v3 = TcpStream::connect(("127.0.0.1", port)).unwrap();

@@ -1823,3 +1823,218 @@ fn an_nfsv4_client_never_reaches_an_appledouble_view() {
     "the owner's attributes are untouched"
   );
 }
+
+/// PUTROOTFH, LOOKUP `name`, then one extended attribute operation built by `build`: the status and its
+/// body.
+fn xattr_call(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  name: &str,
+  build: impl FnOnce(&mut XdrWriter),
+) -> (u32, Vec<u8>) {
+  at_root_file(client, service, server, name, build)
+}
+
+/// SETXATTR of `key` to `value` with `how` (0 either, 1 create, 2 replace): the status.
+fn setxattr(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  how: u32,
+  key: &[u8],
+  value: &[u8],
+) -> u32 {
+  xattr_call(client, service, server, "tagged", |args| {
+    args.u32(op::SETXATTR);
+    args.u32(how);
+    args.opaque(key);
+    args.opaque(value);
+  })
+  .0
+}
+
+/// GETXATTR of `key`: the status and the value.
+fn getxattr(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  key: &[u8],
+) -> (u32, Vec<u8>) {
+  let (status, body) = xattr_call(client, service, server, "tagged", |args| {
+    args.u32(op::GETXATTR);
+    args.opaque(key);
+  });
+  if status != Nfsstat4::Ok.wire() {
+    return (status, Vec::new());
+  }
+  (
+    status,
+    XdrReader::new(&body).opaque(1 << 20).unwrap().to_vec(),
+  )
+}
+
+/// LISTXATTRS from `cookie` within `maxcount` bytes: the status, the next cookie, the keys and eof.
+fn listxattrs(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  cookie: u64,
+  maxcount: u32,
+) -> (u32, u64, Vec<Vec<u8>>, bool) {
+  let (status, body) = xattr_call(client, service, server, "tagged", |args| {
+    args.u32(op::LISTXATTRS);
+    args.u64(cookie);
+    args.u32(maxcount);
+  });
+  if status != Nfsstat4::Ok.wire() {
+    return (status, 0, Vec::new(), false);
+  }
+  let mut body = XdrReader::new(&body);
+  let next = body.u64().unwrap();
+  let keys = (0..body.u32().unwrap())
+    .map(|_| body.opaque(255).unwrap().to_vec())
+    .collect();
+  (status, next, keys, body.bool().unwrap())
+}
+
+/// SETXATTR in each mode, then GETXATTR: create refuses a set key, replace a missing one.
+fn set_in_each_mode(c: &mut Client, s: &mut Export<'_>, v: &mut Server) {
+  let set = |c: &mut Client, s: &mut Export<'_>, v: &mut Server, how, key: &[u8], value: &[u8]| {
+    setxattr(c, s, v, how, key, value)
+  };
+  let statuses = [
+    set(c, s, v, 1, b"alpha", b"one"),
+    set(c, s, v, 1, b"alpha", b"again"),
+    set(c, s, v, 2, b"missing", b"x"),
+    set(c, s, v, 2, b"alpha", b"two"),
+    set(c, s, v, 0, b"beta", b"three"),
+  ];
+  let ok = Nfsstat4::Ok.wire();
+  assert_eq!(
+    statuses,
+    [ok, Nfsstat4::Exist.wire(), Nfsstat4::Noxattr.wire(), ok, ok],
+    "create, create of a set key, replace of a missing key, replace, either"
+  );
+  assert_eq!(getxattr(c, s, v, b"alpha"), (ok, b"two".to_vec()));
+  assert_eq!(getxattr(c, s, v, b"gamma").0, Nfsstat4::Noxattr.wire());
+}
+
+/// LISTXATTRS: the user keys without the prefix; a `maxcount` that holds one name pages by the cookie;
+/// one that holds none is `NFS4ERR_TOOSMALL`.
+fn list_in_pages(c: &mut Client, s: &mut Export<'_>, v: &mut Server) {
+  let (status, _, keys, eof) = listxattrs(c, s, v, 0, 4096);
+  assert_eq!(
+    (status, keys, eof),
+    (
+      Nfsstat4::Ok.wire(),
+      vec![b"alpha".to_vec(), b"beta".to_vec()],
+      true
+    ),
+    "user keys only, prefix stripped"
+  );
+  let (_, next, first, eof) = listxattrs(c, s, v, 0, 16 + 12);
+  assert_eq!((first, eof), (vec![b"alpha".to_vec()], false));
+  let (_, _, second, eof) = listxattrs(c, s, v, next, 16 + 12);
+  assert_eq!((second, eof), (vec![b"beta".to_vec()], true));
+  assert_eq!(listxattrs(c, s, v, 0, 16).0, Nfsstat4::Toosmall.wire());
+}
+
+/// REMOVEXATTR of a set key, then of the same key again (`NFS4ERR_NOXATTR`).
+fn remove_twice(c: &mut Client, s: &mut Export<'_>, v: &mut Server) {
+  let remove = |c: &mut Client, s: &mut Export<'_>, v: &mut Server| {
+    xattr_call(c, s, v, "tagged", |args| {
+      args.u32(op::REMOVEXATTR);
+      args.opaque(b"alpha");
+    })
+    .0
+  };
+  let first = remove(c, s, v);
+  let second = remove(c, s, v);
+  assert_eq!(
+    (first, second),
+    (Nfsstat4::Ok.wire(), Nfsstat4::Noxattr.wire())
+  );
+}
+
+/// A-35 (RFC 8276 §8.4): the extended attribute operations over NFSv4.2. SETXATTR in its three modes
+/// (create refuses an existing key with `NFS4ERR_EXIST`, replace a missing one with `NFS4ERR_NOXATTR`),
+/// GETXATTR of a set and of a missing key, REMOVEXATTR; a key is the volume's `user.<key>`, so a
+/// non-user attribute set another way is not listed; LISTXATTRS pages by its cookie within `maxcount`.
+#[test]
+fn extended_attributes_are_set_read_listed_and_removed() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let tagged = vol
+    .create_file_no(&mut store, root, "tagged", 0o644)
+    .unwrap();
+  vol
+    .xattr_set(
+      &mut store,
+      tagged,
+      b"com.apple.provenance",
+      b"mac",
+      slates_vfs::xattr::XattrSet::Either,
+    )
+    .unwrap();
+  {
+    let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+    let mut service = export(&mut bridge, 0);
+    let mut server = Server::standalone();
+    let mut client = Client::connect(&mut service, &mut server, b"host-a");
+    client.minor = 2;
+    let (c, s, v) = (&mut client, &mut service, &mut server);
+    set_in_each_mode(c, s, v);
+    list_in_pages(c, s, v);
+    remove_twice(c, s, v);
+  }
+  let names: Vec<Vec<u8>> = vol
+    .xattr_names(&store, tagged)
+    .unwrap()
+    .into_iter()
+    .map(|name| name.to_vec())
+    .collect();
+  assert_eq!(
+    names,
+    [b"com.apple.provenance".to_vec(), b"user.beta".to_vec()],
+    "the volume holds the key under the user namespace, beside the untouched non-user attribute"
+  );
+}
+
+/// A-35 (RFC 8276 §8.5): ACCESS reports the extended attribute bits supported and grants them as the
+/// file's permissions allow: a read-only file of another owner grants reading and listing its
+/// attributes, not changing them.
+#[test]
+fn access_grants_the_extended_attribute_bits_by_the_file_permissions() {
+  /// Format: `ACCESS4_READ`, `ACCESS4_XAREAD`, `ACCESS4_XAWRITE`, `ACCESS4_XALIST`.
+  const READ_BIT: u32 = 0x1;
+  const XAREAD: u32 = 0x40;
+  const XAWRITE: u32 = 0x80;
+  const XALIST: u32 = 0x100;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let cx = root_cx();
+  let root = bridge.root(&cx).unwrap();
+  bridge
+    .create(ObjectId::new(root, 0), &cx, "tagged", 0o644, 0)
+    .unwrap();
+  let mut service = export(&mut bridge, 1000);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  client.minor = 2;
+  let asked = READ_BIT | XAREAD | XAWRITE | XALIST;
+  let (status, body) = xattr_call(&mut client, &mut service, &mut server, "tagged", |args| {
+    args.u32(op::ACCESS);
+    args.u32(asked);
+  });
+  assert_eq!(status, Nfsstat4::Ok.wire());
+  let mut body = XdrReader::new(&body);
+  assert_eq!(body.u32().unwrap(), asked, "every bit asked is evaluated");
+  assert_eq!(
+    body.u32().unwrap(),
+    READ_BIT | XAREAD | XALIST,
+    "not XAWRITE on another's read-only file"
+  );
+}

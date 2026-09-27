@@ -362,6 +362,9 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
     }
     NFSPROC3_SETATTR | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK | NFSPROC3_MKNOD
     | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK | NFSPROC3_COMMIT => true,
+    // The v4 front end's attribute changes (A-35) publish as any mutation does.
+    slates_bridge_nfs::procedures::extension::XATTR_SET
+    | slates_bridge_nfs::procedures::extension::XATTR_REMOVE => true,
     _ => false,
   }
 }

@@ -113,6 +113,39 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     self.inner.seek(object, cx, offset, data)
   }
 
+  fn xattr_get(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+  ) -> Result<Vec<u8>, VfsError> {
+    self.inner.xattr_get(object, cx, name)
+  }
+
+  fn xattr_set(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+    value: &[u8],
+    how: slates_vfs::xattr::XattrSet,
+  ) -> Result<(), VfsError> {
+    self.inner.xattr_set(object, cx, name, value, how)
+  }
+
+  fn xattr_list(&mut self, object: ObjectId, cx: &OpContext) -> Result<Vec<Box<[u8]>>, VfsError> {
+    self.inner.xattr_list(object, cx)
+  }
+
+  fn xattr_remove(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    name: &[u8],
+  ) -> Result<(), VfsError> {
+    self.inner.xattr_remove(object, cx, name)
+  }
+
   fn write(
     &mut self,
     object: ObjectId,
