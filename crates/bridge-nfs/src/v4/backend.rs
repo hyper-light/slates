@@ -5,6 +5,7 @@
 use std::future::{Future, Ready, ready};
 use std::task::{Context, Poll, Waker};
 
+use super::Nfsstat4;
 use super::compound::{self, Backend, Server};
 use crate::multi::NfsService;
 use crate::nfs::Nfsfh3;
@@ -63,8 +64,8 @@ impl Backend for ServiceBackend<'_> {
     self.now_ns
   }
 
-  fn with_v4<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R {
-    f(self.server)
+  fn with_v4<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> Result<R, Nfsstat4> {
+    Ok(f(self.server))
   }
 }
 

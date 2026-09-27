@@ -1688,12 +1688,29 @@ therefore one implementation shared by both versions.
   `SP4_NONE`, and the v4.2 operations.
 - **The capability** is presented at the pseudo root as a LOOKUP of `<name>@<attachment>.<token>`, as
   an NFSv3 MNT path does, until an RPC-over-TLS or RPCSEC_GSS identity carries it.
-- **Status (2026-09-26).** Built and tested by use over an `Export` and over a real socket
-  (`crates/bridge-nfs/tests/v4.rs`, 11 tests; `tests/v4_session.rs`, 7). The standalone connection
-  servers route version 4. Owed: the daemon's routing of v4 to each volume's owner shard with derived
-  limits, a Linux kernel `vers=4.1`/`4.2` mount in CI, then locks, the persisted and replicated open
-  state, the v4.2 operations (RFC 7862 SEEK, READ_PLUS, ALLOCATE, DEALLOCATE, COPY, CLONE, IO_ADVISE;
-  RFC 8276 extended attributes), RPC-over-TLS, and pNFS flexfiles.
+- **In the daemon.** The v4 state lives on the listener's shard and is created with the first v4
+  call. Each operation's v3 call presents the capability of the handle it names, and is routed to the
+  volume's owner shard exactly as an NFSv3 call is, barrier included. WRITE and COMMIT therefore carry
+  the owner's write verifier. The bounds are boot derivations (`config::nfs_v4_caps`):
+  - slots per session = the shard count;
+  - clients = the client share of the listener shard's reserve over one client's slot caches;
+  - opens = the store's inode bound × the shard count;
+  - the lease = the operator's failover SLO;
+  - a kept reply = one compound header.
+  A retry of a request still being served is answered `NFS4ERR_DELAY` (§2.10.6.1).
+- **Status (2026-09-26).** Built and tested by use:
+  - over an `Export` and over a real socket (`crates/bridge-nfs/tests/v4.rs`, 11 tests;
+    `tests/v4_session.rs`, 8);
+  - through the daemon, where a v4.2 client writes a volume on another shard and NFSv3 reads the same
+    bytes back (`crates/server/tests/nfs_mount.rs`).
+  Owed:
+  - a Linux kernel `vers=4.1`/`4.2` mount in CI;
+  - locks;
+  - the persisted and replicated open state;
+  - the v4.2 operations (RFC 7862 SEEK, READ_PLUS, ALLOCATE, DEALLOCATE, COPY, CLONE, IO_ADVISE;
+    RFC 8276 extended attributes);
+  - RPC-over-TLS;
+  - pNFS flexfiles.
 
 **Extended attributes over NFSv3 (A-33).** NFSv3 carries no extended attributes, so the macOS
 client stores them in an AppleDouble `._name` file beside `name`. The bridge serves that file as a
@@ -5969,3 +5986,13 @@ connection servers' version routing and caller-owned v4 state, `serve_call`'s `P
 naming 3–4 for any other version, the capability parse shared with MNT); the examples and tests that
 run the connection servers; GAPS and TBD_FIXES. The RPC surface gains version 4 of the NFS program;
 no consensus or storage format changes.
+
+Amended in a second change the same day: the daemon serves version 4 on its listener (the v4 state on
+the listener's shard; each operation's v3 call routed to the volume's owner shard; the bounds derived at
+boot, `config::nfs_v4_caps`), WRITE and COMMIT carry the owner's v3 write verifier, a retry of a request
+still in flight is `NFS4ERR_DELAY`, and the v4 state being unreachable is `NFS4ERR_SERVERFAULT` rather
+than assumed. Applied to: §4.6; `slates-server` (`nfs`: `reply_v4`, `RoutedBackend`, `serve_v3`, the
+version routing; `config`: `NfsV4Caps`; `state`: `nfs_v4`); `slates-bridge-nfs` (the slot's in-flight
+state, the fallible `Backend::with_v4`, the verifier pass-through); the daemon's NFS tests, two of
+which asserted the pre-A-34 unmount rule and now assert A-34's
+(`docs/bugs/2026-09-26-nfs-mount-tests-asserted-the-pre-a34-unmount.md`); GAPS and TBD_FIXES.

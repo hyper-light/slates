@@ -125,7 +125,6 @@ fn server_with(max_clients: usize, lease_ns: u64) -> Server {
       },
       lease_ns,
     },
-    [9; 8],
     64,
   )
 }

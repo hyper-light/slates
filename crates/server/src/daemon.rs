@@ -2083,6 +2083,8 @@ fn init_shard(
     content,
     content_range,
     write_verifier: now.to_be_bytes(),
+    #[cfg(unix)]
+    nfs_v4: None,
     db,
     fleet,
     durability_shortfall,

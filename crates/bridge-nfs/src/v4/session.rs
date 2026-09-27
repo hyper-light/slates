@@ -130,9 +130,12 @@ struct Client {
   reclaim_complete: bool,
 }
 
+/// One slot: its last sequence id, that request's kept reply, and whether that request is still being
+/// served (a compound can await another shard, so its retry may arrive before it finishes).
 struct Slot {
   seq: u32,
   reply: Option<Vec<u8>>,
+  in_flight: bool,
 }
 
 struct Session {
@@ -277,6 +280,7 @@ impl Sessions {
           .map(|_| Slot {
             seq: 0,
             reply: None,
+            in_flight: false,
           })
           .collect(),
       },
@@ -300,6 +304,11 @@ impl Sessions {
       return Err(Nfsstat4::BadHighSlot);
     }
     if args.sequenceid == slot.seq {
+      // A retry of the request still being served waits for it (§2.10.6.1: `NFS4ERR_DELAY`); one whose
+      // reply was not kept is refused so the client resends it as new.
+      if slot.in_flight {
+        return Err(Nfsstat4::Delay);
+      }
       return slot
         .reply
         .clone()
@@ -311,6 +320,7 @@ impl Sessions {
     }
     slot.seq = args.sequenceid;
     slot.reply = None;
+    slot.in_flight = true;
     let clientid = session.clientid;
     if let Some(client) = self.clients.get_mut(&clientid) {
       client.renewed_ns = now_ns;
@@ -321,7 +331,7 @@ impl Sessions {
     })
   }
 
-  /// Keeps the reply of the new request on `slot` of `sessionid` for its retries, when it fits the
+  /// Ends the new request on `slot` of `sessionid`, keeping its reply for its retries when it fits the
   /// session's negotiated cache size. A reply that does not fit is not kept; its retry is then refused
   /// `NFS4ERR_RETRY_UNCACHED_REP`, which a client handles by resending as new.
   pub fn store_reply(&mut self, sessionid: &SessionId, slotid: u32, reply: &[u8]) {
@@ -332,9 +342,11 @@ impl Sessions {
     if let Some(slot) = usize::try_from(slotid)
       .ok()
       .and_then(|slot| session.slots.get_mut(slot))
-      && fits
     {
-      slot.reply = Some(reply.to_vec());
+      slot.in_flight = false;
+      if fits {
+        slot.reply = Some(reply.to_vec());
+      }
     }
   }
 

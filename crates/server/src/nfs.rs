@@ -57,6 +57,12 @@
 //! §3.3.7). A refused publish replaces the reply with `NFS3ERR_IO` — the effect is in the volume but
 //! not stable, and the client is told so rather than promised survival.
 //!
+//! **NFSv4.1/4.2 (A-35).** Version 4 of the NFS program is served on the same listener: the v4 state
+//! (clients, sessions, opens) lives on the listener's shard, created with the first v4 call under the
+//! bounds `config::nfs_v4_caps` derives, and each operation of a `COMPOUND` becomes an NFSv3 call that
+//! [`serve_v3`] routes to the volume's owner shard as it routes any v3 call — authorization, the
+//! barrier and the write verifier included — so the two versions share one semantics.
+//!
 //! The §4.6 differential oracle (line 1368) is *not* owed here: it
 //! mounts the same volume via FSKit *and* via NFS and compares the abstract states — two real
 //! kernel mounts — so it is gated on the FSKit mount, hence on the Apple Developer entitlement that
@@ -75,6 +81,10 @@ use slates_bridge_nfs::procedures::{
   write_stable_how,
 };
 use slates_bridge_nfs::rpc::RecordReader;
+use slates_bridge_nfs::v4::compound::{self, Server as V4Server};
+use slates_bridge_nfs::v4::session::Limits;
+use slates_bridge_nfs::v4::types::ChannelAttrs;
+use slates_bridge_nfs::v4::{NFS_V4, NFSPROC4_COMPOUND, NFSPROC4_NULL, Nfsstat4};
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
@@ -950,14 +960,16 @@ pub async fn serve(listener: TcpListener, port: u16) {
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_SPAWN_REFUSED: &str = "nfs.serve_spawn";
 
-/// Produces the RPC reply payload for one parsed call, routing it locally, to a volume's owner shard
-/// over the bridge queue, or (a host-root listing) across every shard, all as `requester` (the
-/// mounting user, §4.13). A `program` of 0 is a garbage call whose reply carries xid 0.
+/// One call of the NFS program's `version`, MOUNT or portmap (every program but NFSv4, which
+/// [`reply_v4`] serves): its RPC reply payload. A `program` of 0 is a garbage call whose reply carries
+/// xid 0; an NFS version other than 3 or 4 is `PROG_MISMATCH` naming the versions served.
+#[allow(clippy::too_many_arguments)] // one RPC call's whole identity: where, its xid, who, program, version, procedure, args, port
 async fn reply_for(
   this: u16,
   xid: u32,
   requester: Requester,
   program: u32,
+  version: u32,
   procedure: u32,
   args: Vec<u8>,
   port: u16,
@@ -965,20 +977,232 @@ async fn reply_for(
   if program == 0 {
     return reply_bytes(0, AcceptStatus::GarbageArgs, &[]);
   }
+  if program == NFS_PROGRAM && version != NFS_VERSION {
+    let mismatch = AcceptStatus::ProgMismatch {
+      low: NFS_VERSION,
+      high: NFS_V4,
+    };
+    return reply_bytes(xid, mismatch, &[]);
+  }
+  let (status, results) = serve_v3(this, xid, requester, program, procedure, args, port).await;
+  reply_bytes(xid, status, &results)
+}
+
+/// Serves one NFSv3, MOUNT or portmap call, routing it locally, to a volume's owner shard over the
+/// bridge queue, or (a host-root listing) across every shard, all as `requester` (the mounting user,
+/// §4.13). The v4 front end serves each of its operations through here too, so both versions route,
+/// authorize and publish alike.
+async fn serve_v3(
+  this: u16,
+  xid: u32,
+  requester: Requester,
+  program: u32,
+  procedure: u32,
+  args: Vec<u8>,
+  port: u16,
+) -> (AcceptStatus, Vec<u8>) {
   if is_root_listing(program, procedure, &args) {
     // The host root lists the volume the presented capability authorizes, gathered over the bridge queue
     // (AUD-01: nothing is listed to a caller with no capability).
     let Some(entries) = gather_all_entries(requester.capability).await else {
-      return reply_bytes(xid, AcceptStatus::SystemErr, &[]);
+      return (AcceptStatus::SystemErr, Vec::new());
     };
-    let (status, results) = serve_root_listing(requester, procedure, &args, entries, port);
-    return reply_bytes(xid, status, &results);
+    return serve_root_listing(requester, procedure, &args, entries, port);
   }
-  let (status, results) = match route(program, procedure, &args) {
+  match route(program, procedure, &args) {
     Some(owner) => serve_remote(owner, this, requester, xid, program, procedure, args, port).await,
     None => serve_local(requester, xid, program, procedure, &args, port),
-  };
-  reply_bytes(xid, status, &results)
+  }
+}
+
+// ------------------------------------------------------------------------------ NFSv4 (A-35)
+
+/// One NFSv4 call (§4.6 A-35): `NULL`, or a `COMPOUND` served by the v4 front end over this shard's v4
+/// state, each of its operations becoming an NFSv3 call through [`serve_v3`].
+async fn reply_v4(
+  this: u16,
+  xid: u32,
+  requester: Requester,
+  procedure: u32,
+  args: Vec<u8>,
+  port: u16,
+) -> Vec<u8> {
+  match procedure {
+    NFSPROC4_NULL => reply_bytes(xid, AcceptStatus::Success, &[]),
+    NFSPROC4_COMPOUND => {
+      let mut backend = RoutedBackend {
+        this,
+        xid,
+        requester,
+        port,
+      };
+      let results = compound::serve(&mut backend, &args).await;
+      reply_bytes(xid, AcceptStatus::Success, &results)
+    }
+    _ => reply_bytes(xid, AcceptStatus::ProcUnavail, &[]),
+  }
+}
+
+/// The v4 front end's backend in the daemon: each v3 call it makes presents the capability of the
+/// handle it names and is routed to the volume's owner shard as an NFSv3 call is; the v4 state is this
+/// shard's, reached through [`state::with_state`] and borrowed only inside each closure.
+struct RoutedBackend {
+  this: u16,
+  xid: u32,
+  requester: Requester,
+  port: u16,
+}
+
+impl compound::Backend for RoutedBackend {
+  fn call_v3(
+    &mut self,
+    procedure: u32,
+    mut args: Vec<u8>,
+  ) -> impl std::future::Future<Output = Vec<u8>> {
+    let (this, xid, port) = (self.this, self.xid, self.port);
+    let requester = self.requester.clone();
+    async move {
+      let capability = presented_capability(NFS_PROGRAM, procedure, &mut args);
+      let requester = requester.with_capability(capability);
+      match serve_v3(this, xid, requester, NFS_PROGRAM, procedure, args, port).await {
+        (AcceptStatus::Success, results) => results,
+        // A call the v3 layer could not serve decodes as malformed, which the front end reports as
+        // `NFS4ERR_SERVERFAULT`.
+        _ => Vec::new(),
+      }
+    }
+  }
+
+  fn root_handle(&self) -> Nfsfh3 {
+    // The pseudo root with no capability: it lists and enters nothing until a LOOKUP presents one
+    // (§4.13; AUD-01).
+    slates_bridge_nfs::multi::root_handle_with(NO_CAPABILITY)
+  }
+
+  fn principal(&self) -> u32 {
+    match self.requester.subject {
+      Principal::Uid { uid } => uid,
+      _ => 0,
+    }
+  }
+
+  fn now_ns(&self) -> u64 {
+    futures::now_ns()
+  }
+
+  fn with_v4<R>(&mut self, f: impl FnOnce(&mut V4Server) -> R) -> Result<R, Nfsstat4> {
+    state::with_state(|s| {
+      if s.nfs_v4.is_none() {
+        s.nfs_v4 = Some(v4_server(s));
+      }
+      s.nfs_v4.as_mut().map(f)
+    })
+    .flatten()
+    .ok_or(Nfsstat4::Serverfault)
+  }
+}
+
+/// Format: the capability a handle carries when none was presented (attachment 0, an all-zero token),
+/// which authorizes nothing.
+const NO_CAPABILITY: MountCapability = (0, [0u8; 16]);
+
+/// This shard's v4 state under the configuration's derived bounds (§4.6 A-35, `config::nfs_v4_caps`):
+/// the instance id from the boot instant, so an id from a previous daemon is recognizably stale; the
+/// lease the operator's failover SLO (a client silent through a whole failover may be evicted when the
+/// table is full); requests and replies up to the v3 transfer ceiling plus one compound header, and a
+/// kept reply up to one compound header (a larger reply is an idempotent READ or READDIR, whose retry is
+/// resent as new).
+fn v4_server(s: &ShardState) -> V4Server {
+  let caps = s.config.nfs_v4;
+  let size = slates_bridge_nfs::procedures::MAX_TRANSFER + compound::COMPOUND_HEADER_BYTES;
+  let boot = u32::try_from((s.booted_ns ^ (s.booted_ns >> u32::BITS)) & u64::from(u32::MAX))
+    .unwrap_or(u32::MAX);
+  V4Server::new(
+    boot,
+    Limits {
+      max_clients: caps.clients,
+      max_sessions_per_client: crate::config::NFS_V4_SESSIONS_PER_CLIENT,
+      offer: ChannelAttrs {
+        header_pad: 0,
+        max_request: size,
+        max_response: size,
+        max_response_cached: compound::COMPOUND_HEADER_BYTES,
+        max_operations: size / compound::MIN_OPERATION_BYTES,
+        max_requests: caps.slots,
+      },
+      lease_ns: s.config.failover_slo_ns,
+    },
+    caps.opens,
+  )
+}
+
+/// One parsed RPC call, its data owned so the read buffer can drain while the call is served. A
+/// `program` of 0 marks a garbage call (no real program is 0), whose xid is unknown so the reply
+/// carries 0. The requester is the mounting user (subject and groups), from the `AUTH_SYS` credential.
+struct Call {
+  xid: u32,
+  requester: Requester,
+  program: u32,
+  version: u32,
+  procedure: u32,
+  args: Vec<u8>,
+}
+
+impl Call {
+  /// The call a record body holds, or a garbage call if its header does not parse.
+  fn parse(body: &[u8]) -> Call {
+    match parse_call(body) {
+      Ok((call, args)) => Call {
+        xid: call.xid,
+        requester: Requester::of(body),
+        program: call.program,
+        version: call.version,
+        procedure: call.procedure,
+        args: args.rest().to_vec(),
+      },
+      Err(_) => Call {
+        xid: 0,
+        requester: Requester::root(),
+        program: 0,
+        version: 0,
+        procedure: 0,
+        args: Vec::new(),
+      },
+    }
+  }
+}
+
+/// The RPC reply payload for one call. An NFSv4 call goes to the v4 front end, which presents a
+/// capability per operation inside the compound (A-35). Any other call presents its mount capability
+/// (AUD-01): a `MNT`'s from its path (`<name>@<attachment>.<token>`, rewritten to the bare name for the
+/// routing), every other call's from the file handle it names. It rides to the owner shard, which
+/// validates it against the attachment record; no state is kept per connection, so the kernel's later
+/// requests — on this connection or any other — self-authorize through the handles the mount returned.
+async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
+  if call.program == NFS_PROGRAM && call.version == NFS_V4 {
+    return reply_v4(
+      this,
+      call.xid,
+      call.requester,
+      call.procedure,
+      call.args,
+      port,
+    )
+    .await;
+  }
+  let capability = presented_capability(call.program, call.procedure, &mut call.args);
+  let requester = call.requester.with_capability(capability);
+  reply_for(
+    this,
+    call.xid,
+    requester,
+    call.program,
+    call.version,
+    call.procedure,
+    call.args,
+    port,
+  )
+  .await
 }
 
 /// Serves one accepted connection: reads RPC records, routes each call, and writes the framed reply,
@@ -991,21 +1215,8 @@ async fn serve_one(stream: TcpStream, port: u16) {
   let mut records = RecordReader::default();
   let mut chunk = [0u8; RECORD_CHUNK];
   loop {
-    // (xid, requester, program, procedure, args, consumed); a program of 0 marks a garbage call (no
-    // real program is 0), whose xid is unknown so the reply carries 0. The requester is the mounting
-    // user (subject and group), read from the one `AUTH_SYS` credential.
-    let parsed: Option<(u32, Requester, u32, u32, Vec<u8>, usize)> = match records.read(&buffer) {
-      Ok((Some(body), consumed)) => match parse_call(&body) {
-        Ok((call, args)) => Some((
-          call.xid,
-          Requester::of(&body),
-          call.program,
-          call.procedure,
-          args.rest().to_vec(),
-          consumed,
-        )),
-        Err(_) => Some((0, Requester::root(), 0, 0, Vec::new(), consumed)),
-      },
+    let parsed: Option<(Call, usize)> = match records.read(&buffer) {
+      Ok((Some(body), consumed)) => Some((Call::parse(&body), consumed)),
       Ok((None, consumed)) => {
         buffer.drain(..consumed);
         None
@@ -1013,15 +1224,8 @@ async fn serve_one(stream: TcpStream, port: u16) {
       Err(_) => return,
     };
     match parsed {
-      Some((xid, requester, program, procedure, mut args, consumed)) => {
-        // The call's mount capability (AUD-01): a `MNT`'s from its path (`<name>@<attachment>.<token>`,
-        // rewritten to the bare name for the routing), every other call's from the file handle it names.
-        // It rides to the owner shard, which validates it against the attachment record; no state is
-        // kept per connection, so the kernel's later requests — on this connection or any other —
-        // self-authorize through the handles the mount returned.
-        let capability = presented_capability(program, procedure, &mut args);
-        let requester = requester.with_capability(capability);
-        let reply = reply_for(this, xid, requester, program, procedure, args, port).await;
+      Some((call, consumed)) => {
+        let reply = reply_to(this, call, port).await;
         if stream.write_all(&write_record(&reply)).await.is_err() {
           return;
         }

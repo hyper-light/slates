@@ -159,6 +159,12 @@ pub struct ShardState {
   /// within a host's uptime, and a host reboot discards every client's unstable state with the
   /// anchor's RAM, so no older instance is ever confused with a newer one.
   pub write_verifier: [u8; size_of::<u64>()],
+  /// The NFSv4 state of the listener this shard runs (§4.6 A-35): its clients, sessions and opens,
+  /// created with the first v4 call under the configuration's derived bounds. A v4 client's session
+  /// outlives its connection, so the state is the listener's, not a connection's. `None` on a shard
+  /// that serves no v4 call.
+  #[cfg(unix)]
+  pub nfs_v4: Option<slates_bridge_nfs::v4::compound::Server>,
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership

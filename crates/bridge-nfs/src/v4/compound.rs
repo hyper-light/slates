@@ -47,7 +47,8 @@ pub trait Backend {
   fn now_ns(&self) -> u64;
   /// Runs `f` on the v4 server state. The state is borrowed only for the closure, never across an
   /// await, so compounds on other connections served by the same owner interleave with this one.
-  fn with_v4<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> R;
+  /// `NFS4ERR_SERVERFAULT` if the state cannot be reached (a daemon shard that is shutting down).
+  fn with_v4<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> Result<R, Nfsstat4>;
 }
 
 /// Format: the operation numbers (RFC 7863 `nfs_opnum4`).
@@ -216,8 +217,6 @@ pub struct Server {
   opens: Opens,
   limits: Limits,
   boot: u32,
-  /// The write verifier every WRITE and COMMIT reply carries (per server instance).
-  write_verifier: [u8; VERIFIER_SIZE],
 }
 
 /// One open: the client and open-owner that hold it, the file it opened, the share it holds and its
@@ -268,14 +267,10 @@ impl Opens {
 }
 
 impl Server {
-  /// A server instance named `boot`, under `limits`, with its per-instance write verifier and the most
-  /// opens it records at once.
-  pub fn new(
-    boot: u32,
-    limits: Limits,
-    write_verifier: [u8; VERIFIER_SIZE],
-    max_opens: usize,
-  ) -> Server {
+  /// A server instance named `boot`, under `limits`, recording at most `max_opens` opens at once. WRITE
+  /// and COMMIT carry the write verifier of the v3 layer that holds the data, so a restart of that
+  /// layer is what tells a client to re-send its unstable writes (RFC 8881 §18.32.3).
+  pub fn new(boot: u32, limits: Limits, max_opens: usize) -> Server {
     Server {
       sessions: Sessions::new(boot, limits),
       opens: Opens {
@@ -286,7 +281,6 @@ impl Server {
       },
       limits,
       boot,
-      write_verifier,
     }
   }
 
@@ -318,7 +312,6 @@ impl Server {
         },
         lease_ns: LEASE_NS,
       },
-      [0; VERIFIER_SIZE],
       OPENS,
     )
   }
@@ -361,7 +354,11 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
   let Ok(count) = reader.u32() else {
     return reply(Nfsstat4::Badxdr, &tag, 0, &[]);
   };
-  if count > backend.with_v4(|server| server.limits.offer.max_operations) {
+  let max_operations = match backend.with_v4(|server| server.limits.offer.max_operations) {
+    Ok(max_operations) => max_operations,
+    Err(status) => return reply(status, &tag, 0, &[]),
+  };
+  if count > max_operations {
     return reply(Nfsstat4::TooManyOps, &tag, 0, &[]);
   }
   let mut frame = Frame {
@@ -426,7 +423,13 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
   }
   let encoded = reply(last, &tag, done, results.as_slice());
   if let Some((sessionid, slotid)) = slot {
-    backend.with_v4(|server| server.sessions.store_reply(&sessionid, slotid, &encoded));
+    // A reply that cannot be kept for a retry is not sent as if it had been: the client is told the
+    // server failed rather than promised exactly-once (RFC 8881 §2.10.6.1).
+    if let Err(status) =
+      backend.with_v4(|server| server.sessions.store_reply(&sessionid, slotid, &encoded))
+    {
+      return reply(status, &tag, 0, &[]);
+    }
   }
   encoded
 }
@@ -478,7 +481,7 @@ fn outside_session<B: Backend>(
     op::DESTROY_SESSION => {
       let sessionid = decode_sessionid(reader).map_err(|_| Nfsstat4::Badxdr)?;
       backend
-        .with_v4(|server| server.sessions.destroy_session(&sessionid))
+        .with_v4(|server| server.sessions.destroy_session(&sessionid))?
         .map(|()| Vec::new())
     }
     op::DESTROY_CLIENTID => {
@@ -488,7 +491,7 @@ fn outside_session<B: Backend>(
           let destroyed = server.sessions.destroy_clientid(clientid);
           server.purge_opens();
           destroyed
-        })
+        })?
         .map(|()| Vec::new())
     }
     _ => bind_conn(backend, reader),
@@ -527,7 +530,7 @@ fn exchange_id<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outco
     let granted = server.sessions.exchange_id(&args, now);
     server.purge_opens();
     granted.map(|granted| (granted, server.boot))
-  })?;
+  })??;
   let mut body = XdrWriter::new();
   body.u64(granted.clientid);
   body.u32(granted.sequenceid);
@@ -558,7 +561,7 @@ fn create_session<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Ou
     back,
   };
   let now = backend.now_ns();
-  let granted = backend.with_v4(|server| server.sessions.create_session(&args, now))?;
+  let granted = backend.with_v4(|server| server.sessions.create_session(&args, now))??;
   let mut body = XdrWriter::new();
   body.fixed(&granted.sessionid);
   body.u32(granted.sequence);
@@ -616,7 +619,7 @@ fn bind_conn<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outcome
   let _dir = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
   let _rdma = reader.bool().map_err(|_| Nfsstat4::Badxdr)?;
   backend
-    .with_v4(|server| server.sessions.client_of(&sessionid))
+    .with_v4(|server| server.sessions.client_of(&sessionid))?
     .ok_or(Nfsstat4::Badsession)?;
   let mut body = XdrWriter::new();
   body.fixed(&sessionid);
@@ -656,7 +659,7 @@ fn sequence<B: Backend>(
     highest_slotid,
   };
   let now = backend.now_ns();
-  match backend.with_v4(|server| server.sessions.sequence(&args, now))? {
+  match backend.with_v4(|server| server.sessions.sequence(&args, now))?? {
     Sequenced::Replay(kept) => Ok(SequenceOutcome::Replay(kept)),
     Sequenced::New {
       clientid,
@@ -778,7 +781,7 @@ async fn namespace_operation<B: Backend>(
     op::REMOVE => remove(backend, reader, frame).await,
     op::RENAME => rename(backend, reader, frame).await,
     op::LINK => link(backend, reader, frame).await,
-    _ => backend.with_v4(|server| state_operation(server, opnum, reader, frame)),
+    _ => backend.with_v4(|server| state_operation(server, opnum, reader, frame))?,
   }
 }
 
@@ -919,7 +922,7 @@ async fn figures<B: Backend>(
 ) -> Result<FsFigures, Nfsstat4> {
   /// Format: nanoseconds per second.
   const NS_PER_SECOND: u64 = 1_000_000_000;
-  let limits = backend.with_v4(|server| server.limits);
+  let limits = backend.with_v4(|server| server.limits)?;
   let mut figures = FsFigures {
     fsid: (attrs.fsid, 0),
     lease_seconds: u32::try_from(limits.lease_ns / NS_PER_SECOND).unwrap_or(u32::MAX),
@@ -999,7 +1002,7 @@ async fn read<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   let offset = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
   let count = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
   let fh = current(frame)?.clone();
-  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))?;
+  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
   let result = backend
     .call_v3(NFSPROC3_READ, v3call::read_args(&fh, offset, count))
     .await;
@@ -1015,19 +1018,18 @@ async fn write<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
   let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
   let offset = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
   let stable = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
-  let limit = usize::try_from(backend.with_v4(|server| server.limits.offer.max_request))
+  let limit = usize::try_from(backend.with_v4(|server| server.limits.offer.max_request)?)
     .unwrap_or(usize::MAX);
   let data = reader.opaque(limit).map_err(|_| Nfsstat4::Badxdr)?;
   let fh = current(frame)?.clone();
-  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))?;
+  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
   let result = backend
     .call_v3(
       NFSPROC3_WRITE,
       v3call::write_args(&fh, offset, stable, data),
     )
     .await;
-  let (count, committed, _) = v3(v3call::write(&result))?;
-  let verifier = backend.with_v4(|server| server.write_verifier);
+  let (count, committed, verifier) = v3(v3call::write(&result))?;
   let mut body = XdrWriter::new();
   body.u32(count);
   body.u32(committed);
@@ -1043,8 +1045,7 @@ async fn commit<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   let result = backend
     .call_v3(NFSPROC3_COMMIT, v3call::commit_args(&fh, offset, count))
     .await;
-  v3(v3call::commit(&result))?;
-  let verifier = backend.with_v4(|server| server.write_verifier);
+  let verifier = v3(v3call::commit(&result))?;
   let mut body = XdrWriter::new();
   body.fixed(&verifier);
   Ok(body.into_bytes())
@@ -1156,7 +1157,8 @@ async fn open<B: Backend>(
   };
   let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
   let share = Share { access, deny };
-  let stateid = backend.with_v4(|server| server.record_open(clientid, owner, &opened.fh, share))?;
+  let stateid =
+    backend.with_v4(|server| server.record_open(clientid, owner, &opened.fh, share))??;
   let mut body = XdrWriter::new();
   stateid.encode(&mut body);
   body.fixed(&change_info());
@@ -1530,7 +1532,7 @@ async fn setattr<B: Backend>(
   let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
   let attrs = decode_fattr_set(reader)?;
   let fh = current(frame)?.clone();
-  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))?;
+  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
   let result = backend
     .call_v3(NFSPROC3_SETATTR, v3call::setattr_args(&fh, &attrs))
     .await;

@@ -485,8 +485,9 @@ fn the_host_root_listing_gathers_volumes_from_every_shard() {
 /// through, the mount's requests ride a registry attachment: the barrier closes it (one attachment) and
 /// the snapshot is **server-visible** — the NFS client may still hold acknowledged writes before its
 /// `COMMIT`, which the reply must not claim. The mount keeps serving after the barrier (a write lands in
-/// the next generation), and the kernel's `UMNT` ends the registry attachment with the catalog's: the
-/// next snapshot closes none again. Non-vacuous: the closed count moves 0 → 1 → 0 with the mount's life.
+/// the next generation), and the mount's end — its bound mount point confirmed empty after the
+/// kernel's `UMNT` on macOS, a `detach` elsewhere (§4.6 A-34) — ends the registry attachment with the
+/// catalog's: the next snapshot closes none again. Non-vacuous: the closed count moves 0 → 1 → 0 with the mount's life.
 #[test]
 fn a_snapshot_over_a_mounted_volume_reports_the_barrier_it_closed() {
   let (daemon, instance) = single_shard_daemon("snapbarrier");
@@ -510,7 +511,14 @@ fn a_snapshot_over_a_mounted_volume_reports_the_barrier_it_closed() {
   write(&mut stream, &file, after, 4);
   assert_eq!(read(&mut stream, &file, 5), after);
 
-  umnt(&mut stream, &path, 6);
+  let (name, capability) = path.rsplit_once('@').expect("a capability path");
+  end_host_mount(
+    &mut client,
+    &mut stream,
+    volume,
+    name,
+    attachment_of(capability),
+  );
   let unmounted = snapshot_coverage(&mut client, volume);
   daemon.stop();
 
@@ -527,7 +535,7 @@ fn a_snapshot_over_a_mounted_volume_reports_the_barrier_it_closed() {
   assert_eq!(
     unmounted,
     (SnapshotBoundary::Complete, 0),
-    "the kernel's UMNT ended the registry attachment with the catalog's"
+    "the mount's end removed the registry attachment with the catalog's"
   );
 }
 
@@ -702,9 +710,10 @@ fn root_capability_path(daemon: &Daemon, name: &str) -> String {
 /// presenting the attachment's token is served, a file written through it reads back on a connection
 /// that presented no token (the handle carries the capability), and the root scoped to the capability
 /// lists exactly that volume. The mount's attachment is the mount's: it holds the write lease, survives
-/// a `UMNT` of the scoped root, and ends with the kernel's `UMNT` of the mount path — the handle refused,
-/// the attachment gone, the lease released. Non-vacuous: this same private volume serves once the
-/// capability is presented, and stops once the mount is unmounted.
+/// a `UMNT` of the scoped root and a `UMNT` presenting the capability, and ends the platform's way
+/// (§4.6 A-34: the kernel's `UMNT` of `/<name>` with the bound mount point confirmed empty on macOS, a
+/// `detach` elsewhere) — the handle refused, the attachment gone, the lease released. Non-vacuous: this
+/// same private volume serves once the capability is presented, and stops once the mount has ended.
 #[test]
 fn a_consumer_private_volume_is_served_over_nfs_only_through_its_attachment_capability() {
   let (daemon, instance) = single_shard_daemon("aud01");
@@ -890,11 +899,14 @@ struct Unmounted {
   lease_mounted: Option<u64>,
   /// The READ status through the mount's handle after a `UMNT` of the capability-scoped root.
   read_after_root_umnt: u32,
-  /// The READ status through the mount's handle after the `UMNT` of the volume's mount path.
-  read_after_umnt: u32,
-  /// The volume's attachment count and lease after that `UMNT`.
-  attachments_after_umnt: u32,
-  lease_after_umnt: Option<u64>,
+  /// The READ status through the mount's handle after a `UMNT` that presents the capability in its
+  /// path (not the kernel's form since A-34: the mount source carries none).
+  read_after_capability_umnt: u32,
+  /// The READ status through the mount's handle once the mount has ended the platform's way.
+  read_after_end: u32,
+  /// The volume's attachment count and lease after the end.
+  attachments_after_end: u32,
+  lease_after_end: Option<u64>,
 }
 
 /// The volume's attachment count and write-lease epoch, as its consumer's `status` reports them.
@@ -905,9 +917,10 @@ fn attachments_and_lease(consumer: &mut Client, volume: VolumeId) -> (u32, Optio
   (report.attachments, report.lease_epoch)
 }
 
-/// Sends the kernel's unmount signals the way `umount` does — first for the capability-scoped root
-/// (a browse, which ends nothing), then for the volume's mount path (which ends the attachment) — and
-/// reads through the mount's handle after each, with the volume's status around them.
+/// Sends the unmount signals a client can send — a `UMNT` of the capability-scoped root (a browse) and
+/// one presenting the capability in its path, neither of which ends anything (§4.6 A-34) — then ends
+/// the mount the platform's way ([`end_host_mount`]), reading through the mount's handle after each,
+/// with the volume's status around them.
 fn unmount_lifetime(
   port: u16,
   consumer: &mut Client,
@@ -917,19 +930,80 @@ fn unmount_lifetime(
 ) -> Unmounted {
   let (attachments_mounted, lease_mounted) = attachments_and_lease(consumer, volume);
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let (_, capability) = capability_path.rsplit_once('@').expect("a capability path");
+  let (name, capability) = capability_path.rsplit_once('@').expect("a capability path");
   umnt(&mut stream, &format!("/@{capability}"), 1);
   let read_after_root_umnt = read_status(&mut stream, file, 2);
   umnt(&mut stream, capability_path, 3);
-  let read_after_umnt = read_status(&mut stream, file, 4);
-  let (attachments_after_umnt, lease_after_umnt) = attachments_and_lease(consumer, volume);
+  let read_after_capability_umnt = read_status(&mut stream, file, 4);
+  let attachment = attachment_of(capability);
+  end_host_mount(consumer, &mut stream, volume, name, attachment);
+  let read_after_end = read_status(&mut stream, file, 5);
+  let (attachments_after_end, lease_after_end) = attachments_and_lease(consumer, volume);
   Unmounted {
     attachments_mounted,
     lease_mounted,
     read_after_root_umnt,
-    read_after_umnt,
-    attachments_after_umnt,
-    lease_after_umnt,
+    read_after_capability_umnt,
+    read_after_end,
+    attachments_after_end,
+    lease_after_end,
+  }
+}
+
+/// The attachment id a capability `<attachment_hex>.<token_hex>` names.
+fn attachment_of(capability: &str) -> u64 {
+  let (attachment, _) = capability.split_once('.').expect("a capability");
+  u64::from_str_radix(attachment, 16).expect("a hexadecimal attachment id")
+}
+
+/// Ends a host mount's `attachment` the platform's way (§4.6 A-34). The attachment is bound to a mount
+/// point that holds no mount (a path this test never creates), and the kernel's `UMNT` of `/<name>` —
+/// the only form the kernel sends, the mount source carrying no capability — is sent. On macOS the
+/// daemon confirms against the kernel's mount table that the point no longer holds the mount, and the
+/// attachment ends. Elsewhere a `UMNT` is never proof of an unmount (a FUSE mount ends when the kernel
+/// closes the device), so the attachment still serves and is ended by a `detach`.
+fn end_host_mount(
+  owner: &mut Client,
+  stream: &mut TcpStream,
+  volume: VolumeId,
+  name: &str,
+  attachment: u64,
+) {
+  let mount_point = format!("/nonexistent-slates-test-{}/mnt", std::process::id());
+  assert!(
+    matches!(
+      owner.call(&RequestBody::BindMount {
+        attachment,
+        path: mount_point,
+      }),
+      ReplyBody::MountBound
+    ),
+    "the owner binds its mount's mount point"
+  );
+  let (attachments, _) = attachments_and_lease(owner, volume);
+  umnt(stream, name, 90);
+  if cfg!(target_os = "macos") {
+    let started = Instant::now();
+    while attachments_and_lease(owner, volume).0 >= attachments {
+      assert!(
+        started.elapsed() < CREDIT_WAIT,
+        "a UMNT whose bound mount point holds no mount ends its attachment"
+      );
+      std::thread::yield_now();
+    }
+  } else {
+    assert_eq!(
+      attachments_and_lease(owner, volume).0,
+      attachments,
+      "off macOS a UMNT alone ends nothing"
+    );
+    assert!(
+      matches!(
+        owner.call(&RequestBody::Detach { attachment }),
+        ReplyBody::Detached
+      ),
+      "the owner detaches its mount"
+    );
   }
 }
 
@@ -950,15 +1024,19 @@ fn assert_unmounted(unmounted: &Unmounted) {
     "a UMNT of the capability-scoped root ends nothing: the mount's handle still serves"
   );
   assert_eq!(
-    unmounted.read_after_umnt, NFS3ERR_ACCES,
-    "after the UMNT of the mount path the handle's capability authorizes nothing"
+    unmounted.read_after_capability_umnt, 0,
+    "a UMNT presenting the capability is not the kernel's form and ends nothing (A-34)"
   );
   assert_eq!(
-    unmounted.attachments_after_umnt, 0,
-    "the kernel's UMNT ended the mount's attachment"
+    unmounted.read_after_end, NFS3ERR_ACCES,
+    "once the mount has ended the handle's capability authorizes nothing"
   );
   assert_eq!(
-    unmounted.lease_after_umnt, None,
+    unmounted.attachments_after_end, 0,
+    "the end removed the mount's attachment"
+  );
+  assert_eq!(
+    unmounted.lease_after_end, None,
     "the holder's last write attachment released the lease"
   );
 }
@@ -1027,4 +1105,275 @@ fn mount_status(stream: &mut TcpStream, path: &str, xid: u32) -> u32 {
 /// Sixteen bytes as 32 lowercase hex digits — the mount capability token in a capability mount path.
 fn hex16(bytes: &[u8; 16]) -> String {
   bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// --- NFSv4.1/4.2 over the daemon's listener (§4.6 A-35). ---
+
+/// A hand-rolled NFSv4 client over one connection: its session, and slot 0's sequence.
+struct V4Client {
+  stream: TcpStream,
+  sessionid: [u8; 16],
+  sequence: u32,
+  xid: u32,
+}
+
+/// Format: `NFS4_OK`, `NFS4ERR_NOENT` and the operation numbers this test sends (RFC 7863).
+const NFS4_OK: u32 = 0;
+const NFS4ERR_NOENT: u32 = 2;
+const OP_CLOSE: u32 = 4;
+const OP_GETFH: u32 = 10;
+const OP_LOOKUP: u32 = 15;
+const OP_OPEN: u32 = 18;
+const OP_PUTFH: u32 = 22;
+const OP_PUTROOTFH: u32 = 24;
+const OP_READ: u32 = 25;
+const OP_WRITE: u32 = 38;
+const OP_EXCHANGE_ID: u32 = 42;
+const OP_CREATE_SESSION: u32 = 43;
+const OP_SEQUENCE: u32 = 53;
+
+impl V4Client {
+  /// One ONC RPC call of NFS version `version` (AUTH_SYS as uid 0): the accept status and the rest.
+  fn rpc(&mut self, version: u32, procedure: u32, args: &[u8]) -> (u32, Vec<u8>) {
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    use std::io::{Read, Write};
+    self.xid += 1;
+    let mut body = XdrWriter::new();
+    for field in [self.xid, 0, 2, 100_003, version, procedure, 0, 0, 0, 0] {
+      body.u32(field);
+    }
+    body.fixed(args);
+    let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+    self.stream.write_all(&marker.to_be_bytes()).unwrap();
+    self.stream.write_all(body.as_slice()).unwrap();
+    let mut marker = [0u8; 4];
+    self.stream.read_exact(&mut marker).unwrap();
+    let mut reply = vec![0u8; (u32::from_be_bytes(marker) & 0x7fff_ffff) as usize];
+    self.stream.read_exact(&mut reply).unwrap();
+    let mut reader = XdrReader::new(&reply);
+    reader.fixed(12).unwrap();
+    reader.u32().unwrap();
+    reader.opaque(400).unwrap();
+    let accept = reader.u32().unwrap();
+    (accept, reader.rest().to_vec())
+  }
+
+  /// A COMPOUND (minor version 2) of `ops` already encoded: the reply's status and its results after
+  /// the frame.
+  fn compound(&mut self, count: u32, ops: &[u8]) -> (u32, Vec<u8>) {
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    let mut args = XdrWriter::new();
+    args.opaque(b"");
+    args.u32(2);
+    args.u32(count);
+    args.fixed(ops);
+    let (accept, reply) = self.rpc(4, 1, args.as_slice());
+    assert_eq!(accept, 0, "the COMPOUND is accepted");
+    let mut reader = XdrReader::new(&reply);
+    let status = reader.u32().unwrap();
+    reader.opaque(1024).unwrap();
+    reader.u32().unwrap();
+    (status, reader.rest().to_vec())
+  }
+
+  /// EXCHANGE_ID and CREATE_SESSION over a new connection to `port`.
+  fn connect(port: u16) -> V4Client {
+    use slates_bridge_nfs::v4::types::ChannelAttrs;
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    let mut client = V4Client {
+      stream: TcpStream::connect(("127.0.0.1", port)).unwrap(),
+      sessionid: [0; 16],
+      sequence: 0,
+      xid: 0,
+    };
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_EXCHANGE_ID);
+    ops.fixed(&[1; 8]);
+    ops.opaque(b"v4-test-host");
+    ops.u32(0);
+    ops.u32(0);
+    ops.u32(0);
+    let (status, results) = client.compound(1, ops.as_slice());
+    assert_eq!(status, NFS4_OK, "EXCHANGE_ID");
+    let mut reader = XdrReader::new(&results);
+    reader.fixed(8).unwrap();
+    let clientid = reader.u64().unwrap();
+    let sequenceid = reader.u32().unwrap();
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_CREATE_SESSION);
+    ops.u64(clientid);
+    ops.u32(sequenceid);
+    ops.u32(0);
+    let asked = ChannelAttrs {
+      max_request: 1 << 20,
+      max_response: 1 << 20,
+      max_response_cached: 1 << 12,
+      max_operations: 16,
+      max_requests: 4,
+      ..ChannelAttrs::default()
+    };
+    asked.encode(&mut ops);
+    asked.encode(&mut ops);
+    ops.u32(0);
+    ops.u32(0);
+    let (status, results) = client.compound(1, ops.as_slice());
+    assert_eq!(status, NFS4_OK, "CREATE_SESSION");
+    client.sessionid.copy_from_slice(&results[8..8 + 16]);
+    client
+  }
+
+  /// SEQUENCE on slot 0 with the next sequence id, then `ops` (`count` of them): the status and the
+  /// results after the SEQUENCE result.
+  fn sequenced(&mut self, count: u32, ops: &[u8]) -> (u32, Vec<u8>) {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    /// Format: a SEQUENCE result's opnum and status words, then its body (session id, five words).
+    const SEQUENCE_RESULT_BYTES: usize = 8 + 16 + 5 * 4;
+    self.sequence += 1;
+    let mut all = XdrWriter::new();
+    all.u32(OP_SEQUENCE);
+    all.fixed(&self.sessionid);
+    all.u32(self.sequence);
+    all.u32(0);
+    all.u32(0);
+    all.bool(true);
+    all.fixed(ops);
+    let (status, results) = self.compound(count + 1, all.as_slice());
+    (
+      status,
+      results
+        .get(SEQUENCE_RESULT_BYTES..)
+        .unwrap_or_default()
+        .to_vec(),
+    )
+  }
+}
+
+/// §4.6 A-35: an NFSv4.2 client reaches a volume on another shard through the daemon's one listener:
+/// a LOOKUP of `<name>@<capability>` at the pseudo root enters the volume, OPEN creates a file, WRITE,
+/// READ and CLOSE run under the open's state id, and an NFSv3 mount of the same capability reads the
+/// same bytes back — both versions over one semantic layer, routed to the owner shard alike. Without
+/// the capability the name is no entry, and a version other than 3 or 4 is `PROG_MISMATCH` naming 3–4.
+#[test]
+fn an_nfsv4_client_reaches_a_volume_on_another_shard_through_its_capability() {
+  use slates_bridge_nfs::v4::types::{Bitmap, Stateid};
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  let (daemon, instance) = two_shard_daemon("nfsv4");
+  let mut client = Client::connect(&instance);
+  let name = remote_volume_name(&mut client);
+  let path = capability_path(&daemon, &name);
+  let component = path.trim_start_matches('/').to_owned();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v4 = V4Client::connect(port);
+
+  let (accept, range) = v4.rpc(2, 0, &[]);
+  assert_eq!(accept, 2, "PROG_MISMATCH");
+  assert_eq!(
+    range[..8],
+    [0, 0, 0, 3, 0, 0, 0, 4],
+    "the versions served: 3 to 4"
+  );
+
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTROOTFH);
+  ops.u32(OP_LOOKUP);
+  ops.opaque(name.as_bytes());
+  let (status, _) = v4.sequenced(2, ops.as_slice());
+  assert_eq!(
+    status, NFS4ERR_NOENT,
+    "a name without its capability is no entry"
+  );
+
+  let payload = b"written over NFSv4.2 into a volume on another shard\n";
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTROOTFH);
+  ops.u32(OP_LOOKUP);
+  ops.opaque(component.as_bytes());
+  ops.u32(OP_OPEN);
+  ops.u32(0); // seqid
+  ops.u32(3); // share access both
+  ops.u32(0); // deny none
+  ops.u64(0);
+  ops.opaque(b"owner-1");
+  ops.u32(1); // OPEN4_CREATE
+  ops.u32(1); // GUARDED4
+  Bitmap::of(&[33]).encode(&mut ops); // FATTR4_MODE
+  ops.opaque(&0o644u32.to_be_bytes());
+  ops.u32(0); // CLAIM_NULL
+  ops.opaque(b"v4.txt");
+  ops.u32(OP_GETFH);
+  let (status, results) = v4.sequenced(4, ops.as_slice());
+  assert_eq!(status, NFS4_OK, "LOOKUP of the capability, then OPEN");
+  let mut reader = XdrReader::new(&results);
+  reader.fixed(8 + 8).unwrap(); // PUTROOTFH and LOOKUP results
+  reader.fixed(8).unwrap(); // OPEN's opnum and status
+  let stateid = Stateid::decode(&mut reader).unwrap();
+  reader.fixed(4 + 8 + 8 + 4).unwrap();
+  Bitmap::decode(&mut reader).unwrap();
+  reader.u32().unwrap();
+  reader.fixed(8).unwrap(); // GETFH's opnum and status
+  let fh = reader.opaque(128).unwrap().to_vec();
+
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(&fh);
+  ops.u32(OP_WRITE);
+  stateid.encode(&mut ops);
+  ops.u64(0);
+  ops.u32(2); // FILE_SYNC4
+  ops.opaque(payload);
+  let (status, _) = v4.sequenced(2, ops.as_slice());
+  assert_eq!(status, NFS4_OK, "WRITE");
+
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(&fh);
+  ops.u32(OP_READ);
+  stateid.encode(&mut ops);
+  ops.u64(0);
+  ops.u32(4096);
+  let (status, results) = v4.sequenced(2, ops.as_slice());
+  assert_eq!(status, NFS4_OK, "READ");
+  let mut reader = XdrReader::new(&results);
+  reader.fixed(8 + 8).unwrap();
+  reader.u32().unwrap(); // eof
+  assert_eq!(reader.opaque(4096).unwrap(), payload);
+
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(&fh);
+  ops.u32(OP_CLOSE);
+  ops.u32(0);
+  stateid.encode(&mut ops);
+  assert_eq!(v4.sequenced(2, ops.as_slice()).0, NFS4_OK, "CLOSE");
+
+  let mut v3 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut v3, &path, 1);
+  let file = lookup(&mut v3, &root, "v4.txt", 2);
+  assert_eq!(
+    read(&mut v3, &file, 3),
+    payload,
+    "NFSv3 reads what NFSv4 wrote"
+  );
+
+  drop(v3);
+  drop(v4);
+  drop(client);
+  drop(daemon);
+}
+
+/// The friendly name of a volume provisioned on a shard other than the NFS listener's (partition 0).
+fn remote_volume_name(client: &mut Client) -> String {
+  /// Shape: provisioning attempts before a volume lands off the control shard (two shards: each lands
+  /// there with probability one half, so 32 misses are a 2^-32 event).
+  const ATTEMPTS: usize = 32;
+  let control_partition = 0;
+  for attempt in 0..ATTEMPTS {
+    let name = format!("v4vol-{attempt}");
+    if let ReplyBody::Created { id } = client.call(&scratch(&name))
+      && slates_server::verbs::owner_of(id) != control_partition
+    {
+      return name;
+    }
+  }
+  panic!("no volume provisioned on a non-control shard");
 }

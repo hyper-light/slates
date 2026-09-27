@@ -150,6 +150,25 @@ fn a_reply_past_the_cache_size_is_not_kept() {
   );
 }
 
+/// §2.10.6.1: do retry a request while it is still being served (its reply not yet stored); expect
+/// `NFS4ERR_DELAY`, and once it ends, the kept reply. A-35.
+#[test]
+fn a_retry_of_a_request_still_being_served_is_delayed() {
+  let mut sessions = Sessions::new(7, limits());
+  let (_, sessionid) = session(&mut sessions, "host-a");
+  sessions.sequence(&seq(sessionid, 2, 1), 1).unwrap();
+  assert_eq!(
+    sessions.sequence(&seq(sessionid, 2, 1), 2),
+    Err(Nfsstat4::Delay),
+    "the original is still in flight"
+  );
+  sessions.store_reply(&sessionid, 2, b"done");
+  assert_eq!(
+    sessions.sequence(&seq(sessionid, 2, 1), 3).unwrap(),
+    Sequenced::Replay(b"done".to_vec())
+  );
+}
+
 /// §18.36.4: do retry a `CREATE_SESSION`; expect its grant back, not a second session. A skipped
 /// sequence id is misordered.
 #[test]

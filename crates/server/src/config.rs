@@ -289,6 +289,9 @@ pub struct DaemonConfig {
   /// Unix only, as the guest transport is.
   #[cfg(unix)]
   pub guest_credits: slates_bridge_virtiofs::credit::AttachmentCredits,
+  /// Derived: the NFSv4 listener's table bounds (§4.6 A-35). Unix only, as the NFS transport is.
+  #[cfg(unix)]
+  pub nfs_v4: NfsV4Caps,
   /// Every derivation, for the boot log.
   pub derivations: Vec<String>,
 }
@@ -571,6 +574,13 @@ impl DaemonConfig {
     }
     #[cfg(unix)]
     let guest_credits = guest_credits(profile, admission.get(), &mut derivations);
+    #[cfg(unix)]
+    let nfs_v4 = nfs_v4_caps(
+      reserve.get(),
+      runtime.shards.max(1),
+      store.max_inodes,
+      &mut derivations,
+    );
     DaemonConfig {
       runtime,
       geometry,
@@ -601,8 +611,74 @@ impl DaemonConfig {
       fleet_sessions_per_plane: 0,
       #[cfg(unix)]
       guest_credits,
+      #[cfg(unix)]
+      nfs_v4,
       derivations,
     }
+  }
+}
+
+/// The NFSv4 listener's table bounds (§4.6 A-35): what its sessions, clients and opens may hold.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsV4Caps {
+  /// Derived: the requests one session keeps in flight (its slot count).
+  pub slots: u32,
+  /// Derived: the clients (mounting hosts) the listener holds state for.
+  pub clients: usize,
+  /// Derived: the opens the listener records at once.
+  pub opens: usize,
+}
+
+/// Shape: the sessions one NFSv4 client holds at once: the live one and its successor, which a client
+/// creates before destroying the old when it replaces a session (RFC 8881 §2.10.13); a client that
+/// trunks more connections binds them to one session (§2.10.3.1).
+#[cfg(unix)]
+pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
+
+/// The NFSv4 listener's table bounds from the listener shard's reserve, the shard count and the
+/// store's inode bound:
+/// - **slots** = the shard count: a session's requests are served by the volumes' owner shards, so more
+///   in flight than there are shards to serve them only queues;
+/// - **clients** = the client share of the listener shard's reserve over one client's slot caches (every
+///   session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
+/// - **opens** = the store's inode bound × the shard count: an open names a file, and every shard's
+///   store holds at most that many.
+#[cfg(unix)]
+fn nfs_v4_caps(
+  reserve_per_shard: u64,
+  shards: u16,
+  max_inodes: usize,
+  derivations: &mut Vec<String>,
+) -> NfsV4Caps {
+  let slots: Derived<u32> = derived!(u32::from(shards).max(1), "shards", ["shards"]);
+  derivations.push(note("nfs_v4_slots", &slots));
+  let client_bytes = u64::from(slots.get())
+    .saturating_mul(u64::try_from(NFS_V4_SESSIONS_PER_CLIENT).unwrap_or(u64::MAX))
+    .saturating_mul(u64::from(
+      slates_bridge_nfs::v4::compound::COMPOUND_HEADER_BYTES,
+    ))
+    .max(1);
+  let clients: Derived<usize> = derived!(
+    usize::try_from(
+      reserve_per_shard.saturating_mul(CLIENT_SHARE_PERMILLE) / PERMILLE / client_bytes
+    )
+    .unwrap_or(usize::MAX)
+    .max(1),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES)",
+    ["reserve_per_shard", "shards"]
+  );
+  derivations.push(note("nfs_v4_clients", &clients));
+  let opens: Derived<usize> = derived!(
+    max_inodes.saturating_mul(usize::from(shards.max(1))),
+    "max_inodes × shards",
+    ["max_inodes", "shards"]
+  );
+  derivations.push(note("nfs_v4_opens", &opens));
+  NfsV4Caps {
+    slots: slots.get(),
+    clients: clients.get(),
+    opens: opens.get(),
   }
 }
 

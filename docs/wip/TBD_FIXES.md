@@ -89,8 +89,13 @@ authorized merely by appearing here.
   RPC-over-TLS; bounded, sharded and replicated open state). The front end is designed (A-35) and
   built: sessions, the slot cache, open state with share reservations, and every file, directory and
   attribute operation over the v3 layer, 18 tests by use including a session surviving its
-  connection. Next: the daemon's routing to the owner shard with derived limits, then a Linux kernel
-  `vers=4.1`/`4.2` mount in CI, then locks, persisted state and the v4.2 operations.
+  connection. The daemon serves it: v4 state on the listener's shard, each operation routed to the
+  owner shard, bounds derived at boot; a v4.2 client writes a volume on another shard and NFSv3 reads
+  it back. Next: a Linux kernel `vers=4.1`/`4.2` mount in CI, then locks, persisted state and the v4.2
+  operations.
+- [x] **Two daemon NFS tests asserted the pre-A-34 unmount rule** (a `UMNT` presenting the capability
+  ended the mount; red locally since 97c6b94). They now bind a mount point and send the kernel's form.
+  See `docs/bugs/2026-09-26-nfs-mount-tests-asserted-the-pre-a34-unmount.md`.
 - [x] **The fleet test's session hold raced the link's discovery page** (36275755772, macOS gates). The
   hold now waits for the session as a forward does and reports a typed outcome. See
   `docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md`.
