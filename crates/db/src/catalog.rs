@@ -558,3 +558,70 @@ pub struct AuditRecord {
   /// The terminal state, for `LandingFinished`.
   pub outcome: Option<LandingState>,
 }
+
+/// An NFSv4 open held at its file's owner partition (§4.6 A-37): what `slates_bridge_nfs::v4::files`
+/// keeps for it, so a restart rebuilds the owner's file state and the client's state ids stay valid.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsOpenRecord {
+  /// The state id's `other`.
+  pub other: [u8; 12],
+  /// The client holding it.
+  pub clientid: u64,
+  /// The open-owner.
+  pub owner: Vec<u8>,
+  /// The file handle it opened.
+  pub fh: Vec<u8>,
+  /// The share access.
+  pub access: u32,
+  /// The share deny.
+  pub deny: u32,
+  /// The state id's current seqid.
+  pub seqid: u32,
+}
+
+/// One byte range of an NFSv4 lock state: `[start, end)`, `end == u64::MAX` reaching the file's end.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsLockRange {
+  /// The first byte.
+  pub start: u64,
+  /// One past the last byte, or `u64::MAX`.
+  pub end: u64,
+  /// A write (exclusive) lock; a read (shared) lock otherwise.
+  pub write: bool,
+}
+
+/// An NFSv4 lock state held at its file's owner partition (§4.6 A-37).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsLockRecord {
+  /// The state id's `other`.
+  pub other: [u8; 12],
+  /// The client holding it.
+  pub clientid: u64,
+  /// The lock-owner.
+  pub owner: Vec<u8>,
+  /// The file handle.
+  pub fh: Vec<u8>,
+  /// The open it was created from.
+  pub open: [u8; 12],
+  /// The state id's current seqid.
+  pub seqid: u32,
+  /// Its ranges, ascending.
+  pub ranges: Vec<NfsLockRange>,
+}
+
+/// An NFSv4 client held at the listener's partition (§4.6 A-37): its id, owner, verifier, principal
+/// and next CREATE_SESSION sequence, so a restarted listener still knows it and its state ids stay
+/// valid; its sessions are not kept (a client re-creates them after `NFS4ERR_BADSESSION`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsClientRecord {
+  /// The client id.
+  pub clientid: u64,
+  /// The client owner (`co_ownerid`).
+  pub owner: Vec<u8>,
+  /// Format: the owner's verifier, an NFSv4 `verifier4` (8 bytes, RFC 7863).
+  pub verifier: [u8; 8],
+  /// The principal that established it.
+  pub principal: u32,
+  /// The next CREATE_SESSION sequence it must send.
+  pub create_seq: u32,
+}

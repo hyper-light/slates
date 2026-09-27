@@ -8,7 +8,8 @@ use slates_wire::Wire;
 use crate::catalog::{
   AccessEntry, AttachmentRecord, AuditRecord, CompletionRecord, ConsumerRecord, GrantRecord,
   GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord, LineageEdge,
-  PlacementState, SizeClass, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
+  NfsClientRecord, NfsLockRecord, NfsOpenRecord, PlacementState, SizeClass, SnapshotId,
+  SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -229,6 +230,50 @@ pub enum Op {
     /// The highest client id issued so far.
     client: u32,
   },
+  /// An NFSv4 open was recorded or changed at its file's owner (§4.6 A-37). Appended at the end for
+  /// append-only evolution, as are the NFSv4 operations after it.
+  NfsOpenSet {
+    /// The record.
+    record: NfsOpenRecord,
+  },
+  /// An NFSv4 open was closed or freed.
+  NfsOpenCleared {
+    /// The state id's `other`.
+    other: [u8; 12],
+  },
+  /// An NFSv4 lock state was recorded or changed at its file's owner.
+  NfsLockSet {
+    /// The record.
+    record: NfsLockRecord,
+  },
+  /// An NFSv4 lock state was freed, or went with its open.
+  NfsLockCleared {
+    /// The state id's `other`.
+    other: [u8; 12],
+  },
+  /// Every open and lock state of an NFSv4 client at this owner was dropped (its lease lapsed, it
+  /// rebooted, or it was destroyed).
+  NfsClientStateCleared {
+    /// The client id.
+    clientid: u64,
+  },
+  /// An NFSv4 client was recorded or changed at the listener (§4.6 A-37).
+  NfsClientSet {
+    /// The record.
+    record: NfsClientRecord,
+  },
+  /// An NFSv4 client was dropped at the listener.
+  NfsClientCleared {
+    /// The client id.
+    clientid: u64,
+  },
+  /// This partition's NFSv4 instance advanced (§4.6 A-37): once per daemon life, before its first
+  /// NFSv4 id is minted, so every client, session and state id the partition mints names an instance
+  /// no earlier life used, and no id is ever minted twice.
+  NfsInstanceAdvanced {
+    /// The new instance.
+    instance: u32,
+  },
 }
 
 impl Op {
@@ -266,6 +311,14 @@ impl Op {
       Op::GreenAdvanced { .. } => "green_advanced",
       Op::GreenOriginated { .. } => "green_originated",
       Op::ClientIdReserved { .. } => "client_id_reserved",
+      Op::NfsOpenSet { .. } => "nfs_open_set",
+      Op::NfsOpenCleared { .. } => "nfs_open_cleared",
+      Op::NfsLockSet { .. } => "nfs_lock_set",
+      Op::NfsLockCleared { .. } => "nfs_lock_cleared",
+      Op::NfsClientStateCleared { .. } => "nfs_client_state_cleared",
+      Op::NfsClientSet { .. } => "nfs_client_set",
+      Op::NfsClientCleared { .. } => "nfs_client_cleared",
+      Op::NfsInstanceAdvanced { .. } => "nfs_instance_advanced",
     }
   }
 }

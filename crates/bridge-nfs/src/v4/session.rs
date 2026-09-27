@@ -128,6 +128,9 @@ struct Client {
   sessions: Vec<SessionId>,
   renewed_ns: u64,
   reclaim_complete: bool,
+  /// Rebuilt from a record after a restart and not yet given a session: its last CREATE_SESSION's
+  /// grant was not kept, so a retry of it is served afresh.
+  restored: bool,
 }
 
 /// One slot: its last sequence id, that request's kept reply, and whether that request is still being
@@ -158,6 +161,34 @@ pub struct Sessions {
   /// The clients dropped since the last [`Sessions::take_dropped`], whose state the owners must drop
   /// too; never more than the client table held.
   dropped: Vec<u64>,
+  /// The client changes since the last [`Sessions::take_changes`], for the listener's partition to
+  /// record, when the table is durable (`None` for a standalone server); drained after every compound.
+  changes: Option<Vec<ClientChange>>,
+}
+
+/// A client as a durable record carries it (§4.6 A-37): enough for a restarted listener to keep the
+/// client id valid. Its sessions are not kept: the client re-creates them after `NFS4ERR_BADSESSION`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClientRecord {
+  /// The client id.
+  pub clientid: u64,
+  /// The client owner.
+  pub owner: Vec<u8>,
+  /// The owner's verifier.
+  pub verifier: [u8; VERIFIER_SIZE],
+  /// The principal that established it.
+  pub principal: u32,
+  /// The next CREATE_SESSION sequence.
+  pub create_seq: u32,
+}
+
+/// One change to the client table, as the listener's partition records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClientChange {
+  /// A client was recorded or changed.
+  Set(ClientRecord),
+  /// A client was dropped.
+  Cleared(u64),
 }
 
 impl Sessions {
@@ -172,7 +203,64 @@ impl Sessions {
       owners: BTreeMap::new(),
       sessions: BTreeMap::new(),
       dropped: Vec::new(),
+      changes: None,
     }
+  }
+
+  /// A durable table (§4.6 A-37): every change is journaled for the listener's partition, and the
+  /// clients kept before a restart are back, their leases starting now. A kept client that had created
+  /// a session is confirmed; new client ids carry the new `boot`, so they never collide with kept ones.
+  pub fn restore(boot: u32, limits: Limits, records: Vec<ClientRecord>, now_ns: u64) -> Sessions {
+    let mut sessions = Sessions::new(boot, limits);
+    for record in records {
+      sessions
+        .owners
+        .insert(record.owner.clone(), record.clientid);
+      sessions.clients.insert(
+        record.clientid,
+        Client {
+          owner: record.owner,
+          verifier: record.verifier,
+          principal: record.principal,
+          confirmed: record.create_seq > 1,
+          create_seq: record.create_seq,
+          last_create: None,
+          sessions: Vec::new(),
+          renewed_ns: now_ns,
+          reclaim_complete: false,
+          restored: true,
+        },
+      );
+    }
+    sessions.changes = Some(Vec::new());
+    sessions
+  }
+
+  /// The changes since the last call, for the listener's partition to record; none for a standalone
+  /// server.
+  pub fn take_changes(&mut self) -> Vec<ClientChange> {
+    self
+      .changes
+      .as_mut()
+      .map(std::mem::take)
+      .unwrap_or_default()
+  }
+
+  /// Journals the current record of `clientid`, or its clearing.
+  fn journal_client(&mut self, clientid: u64) {
+    let Some(changes) = self.changes.as_mut() else {
+      return;
+    };
+    changes.push(match self.clients.get(&clientid) {
+      Some(client) => ClientChange::Set(ClientRecord {
+        clientid,
+        owner: client.owner.clone(),
+        verifier: client.verifier,
+        principal: client.principal,
+        create_seq: client.create_seq,
+      }),
+      None => ClientChange::Cleared(clientid),
+    });
   }
 
   /// `EXCHANGE_ID` (§18.35.5): the client id for an owner, created, repeated or replaced.
@@ -219,9 +307,11 @@ impl Sessions {
         sessions: Vec::new(),
         renewed_ns: now_ns,
         reclaim_complete: false,
+        restored: false,
       },
     );
     self.owners.insert(args.owner.clone(), clientid);
+    self.journal_client(clientid);
     Ok(self.granted(clientid))
   }
 
@@ -252,10 +342,14 @@ impl Sessions {
       .clients
       .get_mut(&args.clientid)
       .ok_or(Nfsstat4::StaleClientid)?;
-    if args.sequence == client.create_seq.wrapping_sub(1) {
-      return client.last_create.ok_or(Nfsstat4::SeqMisordered);
+    // A retry of the last CREATE_SESSION gets its grant back. A retry after a restart finds no kept
+    // grant (sessions are not durable, A-37): the client never received one, so the retry creates the
+    // session afresh without advancing the sequence a second time.
+    let retry = args.sequence == client.create_seq.wrapping_sub(1);
+    if retry && let Some(granted) = client.last_create {
+      return Ok(granted);
     }
-    if args.sequence != client.create_seq {
+    if (retry && !client.restored) || (!retry && args.sequence != client.create_seq) {
       return Err(Nfsstat4::SeqMisordered);
     }
     // `NFS4ERR_NOSPC`, the exhaustion status CREATE_SESSION allows (RFC 8881 §15.2).
@@ -276,10 +370,14 @@ impl Sessions {
       back,
     };
     client.confirmed = true;
-    client.create_seq = client.create_seq.wrapping_add(1);
+    client.restored = false;
+    if !retry {
+      client.create_seq = client.create_seq.wrapping_add(1);
+    }
     client.last_create = Some(granted);
     client.sessions.push(sessionid);
     client.renewed_ns = now_ns;
+    let clientid = args.clientid;
     let slots = usize::try_from(fore.max_requests).unwrap_or(1);
     self.sessions.insert(
       sessionid,
@@ -295,6 +393,7 @@ impl Sessions {
           .collect(),
       },
     );
+    self.journal_client(clientid);
     Ok(granted)
   }
 
@@ -439,6 +538,7 @@ impl Sessions {
         self.sessions.remove(&sessionid);
       }
       self.dropped.push(clientid);
+      self.journal_client(clientid);
     }
   }
 

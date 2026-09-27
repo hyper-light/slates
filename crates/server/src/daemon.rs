@@ -2087,6 +2087,8 @@ fn init_shard(
     nfs_v4: None,
     #[cfg(unix)]
     nfs_v4_files: None,
+    #[cfg(unix)]
+    nfs_v4_instance: None,
     db,
     fleet,
     durability_shortfall,

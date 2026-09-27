@@ -45,6 +45,8 @@ pub mod merge_service;
 // (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.
 #[cfg(unix)]
 pub mod nfs;
+#[cfg(unix)]
+mod nfs_state;
 pub mod observe;
 mod owner_location;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount

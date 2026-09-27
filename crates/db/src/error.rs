@@ -51,6 +51,12 @@ pub enum DbError {
     /// Which table.
     table: &'static str,
   },
+  /// An NFSv4 instance advance named an instance at or below the current one (§4.6 A-37): ids minted
+  /// under it could repeat ids an earlier life minted.
+  NfsInstanceRegressed {
+    /// The partition's current instance.
+    current: u32,
+  },
   /// A transaction could not be made durable — its record was not appended and the snapshot that
   /// would have carried its effects was not published — so the partition was **rolled back** to its
   /// durable state: the applied effects and the completion record are gone, exactly as a restart
@@ -86,6 +92,9 @@ impl fmt::Display for DbError {
       Self::LogFull { needed, free } => write!(f, "log full: {needed} bytes needed, {free} free"),
       Self::Corrupt { seq, reason } => write!(f, "record {seq} corrupt: {reason}"),
       Self::Capacity { table } => write!(f, "{table} at capacity"),
+      Self::NfsInstanceRegressed { current } => {
+        write!(f, "NFSv4 instance must advance past {current}")
+      }
       Self::Unpublished { seq, cause } => {
         write!(
           f,

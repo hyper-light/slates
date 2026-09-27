@@ -20,8 +20,8 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, Principal, SnapshotId,
-  SnapshotRecord, VolumeId, VolumeRecord,
+  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord, NfsLockRecord,
+  NfsOpenRecord, Principal, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -104,6 +104,15 @@ pub struct PartitionSnapshot {
   pub consumers: Vec<ConsumerRecord>,
   /// Highest client id reserved before handoff (§4.7); zero before the first admission.
   pub client_id_high_water: u32,
+  /// The NFSv4 opens held at this partition's files, by `other` (§4.6 A-37; appended for append-only
+  /// evolution, as are the two fields after it).
+  pub nfs_opens: Vec<NfsOpenRecord>,
+  /// The NFSv4 lock states held at this partition's files, by `other`.
+  pub nfs_locks: Vec<NfsLockRecord>,
+  /// The NFSv4 clients this partition's listener holds, by client id.
+  pub nfs_clients: Vec<NfsClientRecord>,
+  /// The partition's NFSv4 instance: the last one a daemon life advanced to (zero before any).
+  pub nfs_instance: u32,
 }
 
 /// The partition.
@@ -139,6 +148,13 @@ pub struct Partition {
   /// The total bytes held across all green chains, so a new increment can be refused at the cap
   /// before it is appended (bounded growth; checkpointing to fold old chain entries is owed).
   green_chain_bytes: usize,
+  /// The NFSv4 file state and clients (§4.6 A-37), each bounded before any operation is issued: the
+  /// owner's file state bounds its opens and locks, the listener's session table its clients, and a
+  /// replay reproduces only what they admitted.
+  nfs_opens: BTreeMap<[u8; 12], NfsOpenRecord>,
+  nfs_locks: BTreeMap<[u8; 12], NfsLockRecord>,
+  nfs_clients: BTreeMap<u64, NfsClientRecord>,
+  nfs_instance: u32,
 }
 
 impl std::fmt::Debug for Partition {
@@ -179,6 +195,10 @@ impl Partition {
       client_id_high_water: 0,
       grants: BTreeMap::new(),
       consumers: BTreeMap::new(),
+      nfs_opens: BTreeMap::new(),
+      nfs_locks: BTreeMap::new(),
+      nfs_clients: BTreeMap::new(),
+      nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
       audit: Vec::new(),
@@ -376,6 +396,62 @@ impl Partition {
   pub fn consumer(&self, id: u64) -> Option<&ConsumerRecord> {
     self.consumers.get(&id)
   }
+
+  /// The NFSv4 opens held at this partition's files (§4.6 A-37).
+  pub fn nfs_opens(&self) -> impl Iterator<Item = &NfsOpenRecord> {
+    self.nfs_opens.values()
+  }
+
+  /// The NFSv4 lock states held at this partition's files.
+  pub fn nfs_locks(&self) -> impl Iterator<Item = &NfsLockRecord> {
+    self.nfs_locks.values()
+  }
+
+  /// The NFSv4 clients this partition's listener holds.
+  pub fn nfs_clients(&self) -> impl Iterator<Item = &NfsClientRecord> {
+    self.nfs_clients.values()
+  }
+
+  /// The partition's NFSv4 instance: the last one a daemon life advanced to.
+  pub fn nfs_instance(&self) -> u32 {
+    self.nfs_instance
+  }
+
+  /// Applies one NFSv4 record operation (A-37): an upsert, a clear, or a client's purge.
+  fn apply_nfs(&mut self, op: &Op) {
+    match op {
+      Op::NfsOpenSet { record } => {
+        self.nfs_opens.insert(record.other, record.clone());
+      }
+      Op::NfsOpenCleared { other } => {
+        self.nfs_opens.remove(other);
+      }
+      Op::NfsLockSet { record } => {
+        self.nfs_locks.insert(record.other, record.clone());
+      }
+      Op::NfsLockCleared { other } => {
+        self.nfs_locks.remove(other);
+      }
+      Op::NfsClientStateCleared { clientid } => {
+        self
+          .nfs_opens
+          .retain(|_, record| record.clientid != *clientid);
+        self
+          .nfs_locks
+          .retain(|_, record| record.clientid != *clientid);
+      }
+      Op::NfsClientSet { record } => {
+        self.nfs_clients.insert(record.clientid, record.clone());
+      }
+      Op::NfsClientCleared { clientid } => {
+        self.nfs_clients.remove(clientid);
+      }
+      Op::NfsInstanceAdvanced { instance } => {
+        self.nfs_instance = self.nfs_instance.max(*instance);
+      }
+      _ => {}
+    }
+  }
 }
 
 /// A consumer id in the 16-byte `existing` shape `AlreadyExists` carries (the id in the low eight
@@ -490,6 +566,24 @@ impl Partition {
         }
       }
       Op::CompletionsAcknowledged { .. } | Op::ClientIdReserved { .. } => Ok(()),
+      // The NFSv4 records mirror state their owner already bounded and admitted (A-37).
+      Op::NfsOpenSet { .. }
+      | Op::NfsOpenCleared { .. }
+      | Op::NfsLockSet { .. }
+      | Op::NfsLockCleared { .. }
+      | Op::NfsClientStateCleared { .. }
+      | Op::NfsClientSet { .. }
+      | Op::NfsClientCleared { .. } => Ok(()),
+      // An instance only moves forward: an earlier one would let a new id repeat an old one.
+      Op::NfsInstanceAdvanced { instance } => {
+        if *instance > self.nfs_instance {
+          Ok(())
+        } else {
+          Err(DbError::NfsInstanceRegressed {
+            current: self.nfs_instance,
+          })
+        }
+      }
       Op::GrantIssued { record } => {
         if self.grants.contains_key(&record.id) {
           return Err(DbError::AlreadyExists {
@@ -665,6 +759,17 @@ impl Partition {
       }
       Op::ClientIdReserved { client } => {
         self.client_id_high_water = self.client_id_high_water.max(*client);
+        Ok(())
+      }
+      Op::NfsOpenSet { .. }
+      | Op::NfsOpenCleared { .. }
+      | Op::NfsLockSet { .. }
+      | Op::NfsLockCleared { .. }
+      | Op::NfsClientStateCleared { .. }
+      | Op::NfsClientSet { .. }
+      | Op::NfsClientCleared { .. }
+      | Op::NfsInstanceAdvanced { .. } => {
+        self.apply_nfs(op);
         Ok(())
       }
       Op::AttachmentBound { id, path } => {
@@ -942,6 +1047,10 @@ impl Partition {
       landings: self.landings.values().cloned().collect(),
       audit: self.audit.clone(),
       consumers: self.consumers.values().cloned().collect(),
+      nfs_opens: self.nfs_opens.values().cloned().collect(),
+      nfs_locks: self.nfs_locks.values().cloned().collect(),
+      nfs_clients: self.nfs_clients.values().cloned().collect(),
+      nfs_instance: self.nfs_instance,
       green_chains: {
         // Every green with a chain or an origin, in id order, so a base-seeded green with no
         // increment yet is carried too.
@@ -961,6 +1070,20 @@ impl Partition {
           .collect()
       },
     }
+  }
+
+  /// Restores the NFSv4 records and instance a snapshot carries (§4.6 A-37).
+  fn restore_nfs(&mut self, snapshot: &PartitionSnapshot) {
+    for record in &snapshot.nfs_opens {
+      self.nfs_opens.insert(record.other, record.clone());
+    }
+    for record in &snapshot.nfs_locks {
+      self.nfs_locks.insert(record.other, record.clone());
+    }
+    for record in &snapshot.nfs_clients {
+      self.nfs_clients.insert(record.clientid, record.clone());
+    }
+    self.nfs_instance = snapshot.nfs_instance;
   }
 
   fn restore_completions(&mut self, completions: &[ClientCompletions]) {
@@ -1010,6 +1133,7 @@ impl Partition {
     for chain in &snapshot.green_chains {
       p.restore_green_chain(chain);
     }
+    p.restore_nfs(snapshot);
     for c in &snapshot.consumers {
       p.consumers.insert(c.consumer, c.clone());
     }

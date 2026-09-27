@@ -478,7 +478,11 @@ jobs:
       # ordinary file calls through the mount, and an NFSv3 read-back of what the kernel wrote.
       - name: Linux kernel NFSv4.1/4.2 client
         if: runner.os == 'Linux'
-        run: SLATES_TEST_RAMDIR=/dev/shm SLATES_TEST_NFS4_KERNEL=1 cargo test -p slates-server --test nfs_v4_kernel -- --nocapture
+        run: |
+          SLATES_TEST_RAMDIR=/dev/shm SLATES_TEST_NFS4_KERNEL=1 cargo test -p slates-server --test nfs_v4_kernel -- --nocapture
+          # The real anchor, the kernel's v4.2 client, a held open file and lock, and a SIGKILL of the
+          # daemon: the descriptor must keep working and the lock keep binding (§4.6 A-37).
+          SLATES_TEST_RAMDIR=/dev/shm SLATES_TEST_NFS4_KERNEL=1 cargo test -p slates-cli --test nfs_v4_restart -- --nocapture
       # `--keep` leaves the scratch in place so pjdfstest's per-file TAP output survives the run: the
       # expected-failure list's own header names this lane's root run as the review input, and the
       # summary record cannot say which assertion failed with what. The output directory is uploaded

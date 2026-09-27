@@ -440,7 +440,7 @@ impl<'b> Export<'b> {
       },
       write_verifier: fsid,
       appledouble_views: true,
-      files: FileSlot::Owned(Box::new(FileState::standalone())),
+      files: FileSlot::Absent,
       capability: (0, [0u8; 16]),
     }
   }
@@ -473,24 +473,32 @@ impl<'b> Export<'b> {
     self.files = FileSlot::Lent(files);
   }
 
-  /// The NFSv4 file state this export serves.
-  pub fn file_states(&self) -> &FileState {
+  /// The NFSv4 file state this export serves, if it has one.
+  pub fn file_states(&self) -> Option<&FileState> {
     match &self.files {
-      FileSlot::Owned(files) => files,
-      FileSlot::Lent(files) => files,
+      FileSlot::Owned(files) => Some(files),
+      FileSlot::Lent(files) => Some(files),
+      FileSlot::Absent => None,
     }
   }
 
-  fn file_states_mut(&mut self) -> &mut FileState {
+  fn file_states_mut(&mut self) -> Option<&mut FileState> {
     match &mut self.files {
-      FileSlot::Owned(files) => files,
-      FileSlot::Lent(files) => files,
+      FileSlot::Owned(files) => Some(files),
+      FileSlot::Lent(files) => Some(files),
+      FileSlot::Absent => None,
     }
   }
 
   /// Serves an id-only NFSv4 state procedure on this export's file state (§4.6 A-36).
   pub fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
-    crate::v4::files::serve_by_id(self.file_states_mut(), procedure, args)
+    match self.file_states_mut() {
+      Some(files) => crate::v4::files::serve_by_id(files, procedure, args),
+      None => crate::v4::Nfsstat4::Serverfault
+        .wire()
+        .to_be_bytes()
+        .to_vec(),
+    }
   }
 
   /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33).
@@ -928,7 +936,12 @@ impl<'b> Export<'b> {
       writer.u32(crate::v4::Nfsstat4::Badhandle.wire());
       return writer.into_bytes();
     };
-    if let Err(status) = self.file_states().check_io(&stateid, &handle, clientid) {
+    let checked = self
+      .file_states()
+      .map_or(Err(crate::v4::Nfsstat4::Serverfault), |files| {
+        files.check_io(&stateid, &handle, clientid)
+      });
+    if let Err(status) = checked {
       writer.u32(status.wire());
       return writer.into_bytes();
     }
@@ -967,7 +980,7 @@ impl<'b> Export<'b> {
     let bad = |_| Nfsstat4::Badxdr;
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat4::Badhandle)?;
     let clientid = args.u64().map_err(bad)?;
-    let files = self.file_states_mut();
+    let files = self.file_states_mut().ok_or(Nfsstat4::Serverfault)?;
     match procedure {
       extension::STATE_OPEN | extension::STATE_CLOSE | extension::STATE_DOWNGRADE => {
         open_state(files, procedure, &handle, clientid, args)
@@ -2538,11 +2551,13 @@ enum XattrReply {
   Done,
 }
 
-/// Where an export's NFSv4 file state lives: its own (a standalone export), or the owner shard's, lent
-/// for one request.
+/// Where an export's NFSv4 file state lives: its own (a standalone export), the owner shard's, lent
+/// for one request, or none (a daemon export whose shard could not provide it, which refuses every
+/// state operation rather than keep a private table).
 enum FileSlot<'b> {
   Owned(Box<FileState>),
   Lent(&'b mut FileState),
+  Absent,
 }
 
 /// Appends the state ids an owner no longer holds: a count, then each `other`.

@@ -170,6 +170,10 @@ pub struct ShardState {
   /// derived bounds.
   #[cfg(unix)]
   pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
+  /// This daemon life's NFSv4 instance on the shard's partition (§4.6 A-37), advanced durably on first
+  /// use; every NFSv4 id the shard mints names it.
+  #[cfg(unix)]
+  pub nfs_v4_instance: Option<u32>,
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership

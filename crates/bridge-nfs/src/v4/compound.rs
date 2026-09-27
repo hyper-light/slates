@@ -264,6 +264,19 @@ impl Server {
     }
   }
 
+  /// A durable listener (§4.6 A-37): its client table rebuilt from the records kept before a restart
+  /// and journaled from now on (`Sessions::restore`).
+  pub fn restore(
+    boot: u32,
+    limits: Limits,
+    records: Vec<super::session::ClientRecord>,
+    now_ns: u64,
+  ) -> Server {
+    let mut server = Server::new(boot, limits);
+    server.sessions = Sessions::restore(boot, limits, records, now_ns);
+    server
+  }
+
   /// The state of the standalone server (the examples and tests, one connection at a time): one slot,
   /// since a blocking connection serves one request at a time; requests and replies up to the v3
   /// transfer ceiling plus one compound's header; a lease long enough never to lapse under a test.

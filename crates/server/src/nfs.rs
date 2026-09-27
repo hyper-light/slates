@@ -197,10 +197,17 @@ impl VolumeSet for ShardVolumeSet {
       let Some((capability, rights)) = authorized_rights(s, volume, capability) else {
         return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
       };
-      with_export(s, volume, subject, rights, groups, capability, |export| {
+      let reply = with_export(s, volume, subject, rights, groups, capability, |export| {
         export.set_appledouble_views(views);
         export.serve_nfs(procedure, args)
-      })
+      });
+      // A file state procedure's changes are durable before its reply leaves (§4.6 A-37); a change
+      // that could not be recorded has rebuilt the state from its records, and the call is refused.
+      if crate::nfs_state::record_files(s) {
+        reply
+      } else {
+        Some(Some(status_word(Nfsstat4::Serverfault)))
+      }
     })
     .flatten()
     .flatten()
@@ -297,7 +304,7 @@ fn with_export<R>(
   // record's principal, never the request's uid.
   let admitted = admit_mount(s, volume, capability, rights)?;
   if s.nfs_v4_files.is_none() {
-    s.nfs_v4_files = Some(v4_file_state(s));
+    s.nfs_v4_files = crate::nfs_state::file_state(s);
   }
   let ShardState {
     store,
@@ -1201,9 +1208,12 @@ impl compound::Backend for RoutedBackend {
   fn with_v4<R>(&mut self, f: impl FnOnce(&mut V4Server) -> R) -> Result<R, Nfsstat4> {
     state::with_state(|s| {
       if s.nfs_v4.is_none() {
-        s.nfs_v4 = Some(v4_server(s));
+        s.nfs_v4 = crate::nfs_state::server(s);
       }
-      s.nfs_v4.as_mut().map(f)
+      let result = s.nfs_v4.as_mut().map(f)?;
+      // The client table's changes are durable before the call goes on (§4.6 A-37); a change that
+      // could not be recorded has rebuilt the table from its records, and the call is refused.
+      crate::nfs_state::record_clients(s).then_some(result)
     })
     .flatten()
     .ok_or(Nfsstat4::Serverfault)
@@ -1214,32 +1224,27 @@ impl compound::Backend for RoutedBackend {
 /// which authorizes nothing.
 const NO_CAPABILITY: MountCapability = (0, [0u8; 16]);
 
-/// This shard's v4 state under the configuration's derived bounds (§4.6 A-35, `config::nfs_v4_caps`):
-/// the instance id from the boot instant, so an id from a previous daemon is recognizably stale; the
-/// lease the operator's failover SLO (a client silent through a whole failover may be evicted when the
-/// table is full); requests and replies up to the v3 transfer ceiling plus one compound header, and a
-/// kept reply up to one compound header (a larger reply is an idempotent READ or READDIR, whose retry is
-/// resent as new).
-fn v4_server(s: &ShardState) -> V4Server {
+/// The NFSv4 limits this shard's listener runs under (§4.6 A-35, `config::nfs_v4_caps`): the lease the
+/// operator's failover SLO (a client silent through a whole failover may be evicted when the table is
+/// full); requests and replies up to the v3 transfer ceiling plus one compound header, and a kept reply
+/// up to one compound header (a larger reply is an idempotent READ or READDIR, whose retry is resent as
+/// new).
+pub(crate) fn v4_limits(s: &ShardState) -> Limits {
   let caps = s.config.nfs_v4;
   let size = slates_bridge_nfs::procedures::MAX_TRANSFER + compound::COMPOUND_HEADER_BYTES;
-  let boot = v4_boot(s);
-  V4Server::new(
-    boot,
-    Limits {
-      max_clients: caps.clients,
-      max_sessions_per_client: crate::config::NFS_V4_SESSIONS_PER_CLIENT,
-      offer: ChannelAttrs {
-        header_pad: 0,
-        max_request: size,
-        max_response: size,
-        max_response_cached: compound::COMPOUND_HEADER_BYTES,
-        max_operations: size / compound::MIN_OPERATION_BYTES,
-        max_requests: caps.slots,
-      },
-      lease_ns: s.config.failover_slo_ns,
+  Limits {
+    max_clients: caps.clients,
+    max_sessions_per_client: crate::config::NFS_V4_SESSIONS_PER_CLIENT,
+    offer: ChannelAttrs {
+      header_pad: 0,
+      max_request: size,
+      max_response: size,
+      max_response_cached: compound::COMPOUND_HEADER_BYTES,
+      max_operations: size / compound::MIN_OPERATION_BYTES,
+      max_requests: caps.slots,
     },
-  )
+    lease_ns: s.config.failover_slo_ns,
+  }
 }
 
 /// Serves an id-only NFSv4 state procedure on this shard's file state (§4.6 A-36), created on first
@@ -1247,11 +1252,13 @@ fn v4_server(s: &ShardState) -> V4Server {
 fn serve_file_state_here(procedure: u32, args: &[u8]) -> Vec<u8> {
   state::with_state(|s| {
     if s.nfs_v4_files.is_none() {
-      s.nfs_v4_files = Some(v4_file_state(s));
+      s.nfs_v4_files = crate::nfs_state::file_state(s);
     }
-    s.nfs_v4_files.as_mut().map(|files| {
+    let reply = s.nfs_v4_files.as_mut().map(|files| {
       slates_bridge_nfs::v4::files::serve_by_id(files, procedure, &mut XdrReader::new(args))
-    })
+    })?;
+    // The changes are durable before the reply leaves (§4.6 A-37).
+    crate::nfs_state::record_files(s).then_some(reply)
   })
   .flatten()
   .unwrap_or_else(|| status_word(Nfsstat4::Serverfault))
@@ -1260,21 +1267,6 @@ fn serve_file_state_here(procedure: u32, args: &[u8]) -> Vec<u8> {
 /// A reply of only a status word.
 fn status_word(status: Nfsstat4) -> Vec<u8> {
   status.wire().to_be_bytes().to_vec()
-}
-
-/// This shard's NFSv4 file state (§4.6 A-36), its state ids tagged with the shard's partition and the
-/// boot instance (so ids from two owners, or from before a restart, never collide), bounded as the
-/// listener's index is (`config::nfs_v4_caps`).
-fn v4_file_state(s: &ShardState) -> slates_bridge_nfs::v4::files::FileState {
-  let caps = s.config.nfs_v4;
-  let tag = slates_bridge_nfs::v4::files::owner_tag(s.partition, v4_boot(s));
-  slates_bridge_nfs::v4::files::FileState::new(tag, caps.opens, caps.locks)
-}
-
-/// The boot instance NFSv4 ids carry: the boot instant folded to 32 bits.
-fn v4_boot(s: &ShardState) -> u32 {
-  u32::try_from((s.booted_ns ^ (s.booted_ns >> u32::BITS)) & u64::from(u32::MAX))
-    .unwrap_or(u32::MAX)
 }
 
 /// One parsed RPC call, its data owned so the read buffer can drain while the call is served. A

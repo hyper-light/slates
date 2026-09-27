@@ -106,6 +106,16 @@ impl OwnerRanges {
     &self.ranges
   }
 
+  /// Ranges rebuilt from a record (§4.6 A-37): each range locked in turn, so the result is disjoint,
+  /// ordered and merged whatever order the record held.
+  pub fn from_ranges(ranges: &[(Range, LockKind)]) -> OwnerRanges {
+    ranges
+      .iter()
+      .fold(OwnerRanges::default(), |held, (range, kind)| {
+        held.locked(*range, *kind)
+      })
+  }
+
   /// Whether the owner holds no lock.
   pub fn is_empty(&self) -> bool {
     self.ranges.is_empty()
@@ -423,6 +433,17 @@ impl LockTable {
     for other in &gone {
       self.drop_state(other);
     }
+  }
+
+  /// Puts back a kept lock state (§4.6 A-37) under its original id. A kept state was admitted, so it
+  /// comes back even past a bound derived smaller since; [`Self::state_for`] and
+  /// [`Self::set_ranges`] refuse new state until the charge is back under the bound.
+  pub fn restore_kept(&mut self, other: Other, state: LockState) {
+    self.by_owner.insert(
+      (state.fh.0.clone(), state.clientid, state.owner.clone()),
+      other,
+    );
+    self.table.insert(other, state);
   }
 
   fn drop_state(&mut self, other: &Other) {

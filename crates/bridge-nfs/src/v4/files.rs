@@ -275,6 +275,57 @@ pub struct Released {
   pub gone: Vec<Other>,
 }
 
+/// An open as a durable record carries it (§4.6 A-37).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenRecord {
+  /// The state id's `other`.
+  pub other: Other,
+  /// The client holding it.
+  pub clientid: u64,
+  /// The open-owner.
+  pub owner: Vec<u8>,
+  /// The file handle.
+  pub fh: Vec<u8>,
+  /// The share it holds.
+  pub share: Share,
+  /// The state id's current seqid.
+  pub seqid: u32,
+}
+
+/// A lock state as a durable record carries it (§4.6 A-37).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockRecord {
+  /// The state id's `other`.
+  pub other: Other,
+  /// The client holding it.
+  pub clientid: u64,
+  /// The lock-owner.
+  pub owner: Vec<u8>,
+  /// The file handle.
+  pub fh: Vec<u8>,
+  /// The open it was created from.
+  pub open: Other,
+  /// The state id's current seqid.
+  pub seqid: u32,
+  /// Its ranges, ascending.
+  pub ranges: Vec<(Range, LockKind)>,
+}
+
+/// One change to the file state, as the owner's partition records it (§4.6 A-37).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileChange {
+  /// An open was recorded or changed.
+  OpenSet(OpenRecord),
+  /// An open was closed or freed.
+  OpenCleared(Other),
+  /// A lock state was recorded or changed.
+  LockSet(LockRecord),
+  /// A lock state was freed or went with its open.
+  LockCleared(Other),
+  /// Every open and lock state of a client was dropped.
+  ClientCleared(u64),
+}
+
 /// One owner shard's NFSv4 file state: its opens and lock states, bounded.
 pub struct FileState {
   tag: OwnerTag,
@@ -283,6 +334,10 @@ pub struct FileState {
   opens: BTreeMap<Other, Open>,
   by_file: BTreeMap<OpenKey, Other>,
   locks: LockTable,
+  /// The changes since the last [`FileState::take_changes`], for the owner's partition to record, when
+  /// the state is durable (`None` for a standalone server, which records nothing). Drained after
+  /// every operation, so it holds one operation's changes at most.
+  changes: Option<Vec<FileChange>>,
 }
 
 impl FileState {
@@ -296,7 +351,102 @@ impl FileState {
       opens: BTreeMap::new(),
       by_file: BTreeMap::new(),
       locks: LockTable::new(tag, max_locks),
+      changes: None,
     }
+  }
+
+  /// Durable state (§4.6 A-37): an owner that records every change in its partition, rebuilt from the
+  /// records `opens` and `locks` it kept (before a restart, or after a record that failed and rolled the
+  /// partition back). Every kept record comes back, even past bounds derived smaller since: it was
+  /// admitted, and only new state is refused until the tables are back under their bounds. New state
+  /// ids carry the new `tag`, so they never collide with the kept ones.
+  pub fn restore(
+    tag: OwnerTag,
+    max_opens: usize,
+    max_locks: usize,
+    opens: Vec<OpenRecord>,
+    locks: Vec<LockRecord>,
+  ) -> FileState {
+    let mut state = FileState::new(tag, max_opens, max_locks);
+    for record in opens {
+      let fh = Nfsfh3(record.fh);
+      state.by_file.insert(
+        (fh.0.clone(), record.clientid, record.owner.clone()),
+        record.other,
+      );
+      state.opens.insert(
+        record.other,
+        Open {
+          clientid: record.clientid,
+          owner: record.owner,
+          fh,
+          share: record.share,
+          seqid: record.seqid,
+        },
+      );
+    }
+    for record in locks {
+      state.locks.restore_kept(
+        record.other,
+        super::lock::LockState {
+          clientid: record.clientid,
+          owner: record.owner,
+          fh: Nfsfh3(record.fh),
+          open: record.open,
+          seqid: record.seqid,
+          ranges: super::lock::OwnerRanges::from_ranges(&record.ranges),
+        },
+      );
+    }
+    state.changes = Some(Vec::new());
+    state
+  }
+
+  /// The changes since the last call, for the owner's partition to record (§4.6 A-37); none for a
+  /// standalone server.
+  pub fn take_changes(&mut self) -> Vec<FileChange> {
+    self
+      .changes
+      .as_mut()
+      .map(std::mem::take)
+      .unwrap_or_default()
+  }
+
+  /// Journals the current record of the open `other`, or its clearing.
+  fn journal_open(&mut self, other: &Other) {
+    let Some(changes) = self.changes.as_mut() else {
+      return;
+    };
+    changes.push(match self.opens.get(other) {
+      Some(open) => FileChange::OpenSet(OpenRecord {
+        other: *other,
+        clientid: open.clientid,
+        owner: open.owner.clone(),
+        fh: open.fh.0.clone(),
+        share: open.share,
+        seqid: open.seqid,
+      }),
+      None => FileChange::OpenCleared(*other),
+    });
+  }
+
+  /// Journals the current record of the lock state `other`, or its clearing.
+  fn journal_lock(&mut self, other: &Other) {
+    let Some(changes) = self.changes.as_mut() else {
+      return;
+    };
+    changes.push(match self.locks.state(other) {
+      Some(state) => FileChange::LockSet(LockRecord {
+        other: *other,
+        clientid: state.clientid,
+        owner: state.owner.clone(),
+        fh: state.fh.0.clone(),
+        open: state.open,
+        seqid: state.seqid,
+        ranges: state.ranges.ranges().to_vec(),
+      }),
+      None => FileChange::LockCleared(*other),
+    });
   }
 
   /// The state of a standalone server (the examples and tests): owner partition 0, boot 0.
@@ -343,10 +493,9 @@ impl FileState {
       open.share.access |= share.access;
       open.share.deny |= share.deny;
       open.seqid = next_seqid(open.seqid);
-      return Ok(Stateid {
-        seqid: open.seqid,
-        other,
-      });
+      let seqid = open.seqid;
+      self.journal_open(&other);
+      return Ok(Stateid { seqid, other });
     }
     if self.opens.len() >= self.max_opens {
       return Err(Nfsstat4::Nospc);
@@ -364,6 +513,7 @@ impl FileState {
       },
     );
     self.by_file.insert(key, other);
+    self.journal_open(&other);
     Ok(Stateid { seqid: 1, other })
   }
 
@@ -412,6 +562,7 @@ impl FileState {
     }
     let mut gone = self.locks.drop_under(&stateid.other);
     self.remove_open(&stateid.other);
+    self.journal_gone(&gone, &stateid.other);
     gone.push(stateid.other);
     Ok(Released {
       stateid: Stateid {
@@ -447,8 +598,10 @@ impl FileState {
     }
     open.share = share;
     open.seqid = next_seqid(open.seqid);
+    let seqid = open.seqid;
+    self.journal_open(&stateid.other);
     Ok(Stateid {
-      seqid: open.seqid,
+      seqid,
       other: stateid.other,
     })
   }
@@ -475,9 +628,13 @@ impl FileState {
         let owner = state.owner.clone();
         let next = state.ranges.locked(range, kind);
         if let Some(denied) = self.locks.conflict(fh, clientid, &owner, range, kind) {
+          // A lock state the request created stays (its owner may lock again), so it is recorded.
+          self.journal_lock(&other);
           return Err(LockRefused::Denied(denied));
         }
-        Ok(Some(self.locks.set_ranges(&other, next)?))
+        let stateid = self.locks.set_ranges(&other, next)?;
+        self.journal_lock(&other);
+        Ok(Some(stateid))
       }
       LockRequest::Test { kind, range, owner } => {
         match self.locks.conflict(fh, clientid, &owner, range, kind) {
@@ -494,7 +651,9 @@ impl FileState {
           .get(&stateid, fh, Some(clientid))?
           .ranges
           .unlocked(range);
-        Ok(Some(self.locks.set_ranges(&stateid.other, next)?))
+        let advanced = self.locks.set_ranges(&stateid.other, next)?;
+        self.journal_lock(&stateid.other);
+        Ok(Some(advanced))
       }
     }
   }
@@ -563,6 +722,7 @@ impl FileState {
     }
     if self.locks.contains(other) {
       self.locks.free(other)?;
+      self.journal_lock(other);
       return Ok(Released {
         stateid: Stateid::default(),
         gone: vec![*other],
@@ -573,6 +733,7 @@ impl FileState {
     }
     let mut gone = self.locks.drop_under(other);
     self.remove_open(other);
+    self.journal_gone(&gone, other);
     gone.push(*other);
     Ok(Released {
       stateid: Stateid::default(),
@@ -593,6 +754,17 @@ impl FileState {
       self.remove_open(other);
     }
     self.locks.purge(|holder| holder != clientid);
+    if let Some(changes) = self.changes.as_mut() {
+      changes.push(FileChange::ClientCleared(clientid));
+    }
+  }
+
+  /// Journals the clearing of an open and the lock states that went with it.
+  fn journal_gone(&mut self, locks: &[Other], open: &Other) {
+    for other in locks {
+      self.journal_lock(other);
+    }
+    self.journal_open(open);
   }
 
   fn remove_open(&mut self, other: &Other) {

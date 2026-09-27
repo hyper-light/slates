@@ -272,6 +272,14 @@ enum Step {
   Audit(u8),
   GreenAdvance(usize),
   GreenOriginate(usize),
+  NfsOpen(u8, u8, u32),
+  NfsOpenClear(usize),
+  NfsLock(usize, u64, u64, bool),
+  NfsLockClear(usize),
+  NfsClientPurge(u8),
+  NfsClient(u8, u32),
+  NfsClientClear(u8),
+  NfsInstance,
   Crash,
 }
 
@@ -300,6 +308,14 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..7u8).prop_map(Step::Audit),
     2 => (0..8usize).prop_map(Step::GreenAdvance),
     1 => (0..8usize).prop_map(Step::GreenOriginate),
+    2 => (0..4u8, 0..8u8, 1..4u32).prop_map(|(c, f, a)| Step::NfsOpen(c, f, a)),
+    1 => (0..8usize).prop_map(Step::NfsOpenClear),
+    2 => (0..8usize, 0..1_000u64, 1..1_000u64, any::<bool>()).prop_map(|(o, a, l, w)| Step::NfsLock(o, a, l, w)),
+    1 => (0..8usize).prop_map(Step::NfsLockClear),
+    1 => (0..4u8).prop_map(Step::NfsClientPurge),
+    1 => (0..4u8, 1..8u32).prop_map(|(c, q)| Step::NfsClient(c, q)),
+    1 => (0..4u8).prop_map(Step::NfsClientClear),
+    1 => Just(Step::NfsInstance),
     1 => Just(Step::Crash),
   ]
 }
@@ -315,6 +331,10 @@ struct Ids {
   next_grant: u64,
   next_landing: u64,
   audit_seq: u64,
+  next_nfs_state: u64,
+  nfs_opens: Vec<[u8; 12]>,
+  nfs_locks: Vec<[u8; 12]>,
+  nfs_instance: u32,
 }
 
 fn volume_state(n: u8) -> VolumeState {
@@ -508,6 +528,14 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::Audit(..)
     | Step::GreenAdvance(..)
     | Step::GreenOriginate(..)) => return op_for_service(step, ids, now_ns),
+    step @ (Step::NfsOpen(..)
+    | Step::NfsOpenClear(..)
+    | Step::NfsLock(..)
+    | Step::NfsLockClear(..)
+    | Step::NfsClientPurge(..)
+    | Step::NfsClient(..)
+    | Step::NfsClientClear(..)
+    | Step::NfsInstance) => return op_for_nfs(step, ids),
     Step::Crash => return None,
   })
 }
@@ -601,9 +629,82 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
   })
 }
 
+/// The NFSv4 record operations (§4.6 A-37), split from [`op_for`]: opens and lock states named by a
+/// counter, clears and purges of what exists, client records, and instance advances.
+fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
+  use slates_db::catalog::{NfsClientRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord};
+  let mint = |ids: &mut Ids| {
+    ids.next_nfs_state += 1;
+    let mut other = [0u8; 12];
+    other[4..].copy_from_slice(&ids.next_nfs_state.to_be_bytes());
+    other
+  };
+  Some(match step {
+    Step::NfsOpen(client, file, access) => Op::NfsOpenSet {
+      record: NfsOpenRecord {
+        other: mint(ids),
+        clientid: u64::from(*client),
+        owner: vec![*client, *file],
+        fh: vec![*file; 16],
+        access: *access,
+        deny: 0,
+        seqid: 1,
+      },
+    },
+    Step::NfsOpenClear(o) => Op::NfsOpenCleared {
+      other: pick(&ids.nfs_opens, *o)?,
+    },
+    Step::NfsLock(o, start, length, write) => {
+      let open = pick(&ids.nfs_opens, *o)?;
+      Op::NfsLockSet {
+        record: NfsLockRecord {
+          other: mint(ids),
+          clientid: u64::from(open[11] % 4),
+          owner: open.to_vec(),
+          fh: vec![open[11]; 16],
+          open,
+          seqid: 1,
+          ranges: vec![NfsLockRange {
+            start: *start,
+            end: start + length,
+            write: *write,
+          }],
+        },
+      }
+    }
+    Step::NfsLockClear(l) => Op::NfsLockCleared {
+      other: pick(&ids.nfs_locks, *l)?,
+    },
+    Step::NfsClientPurge(client) => Op::NfsClientStateCleared {
+      clientid: u64::from(*client),
+    },
+    Step::NfsClient(client, create_seq) => Op::NfsClientSet {
+      record: NfsClientRecord {
+        clientid: u64::from(*client),
+        owner: vec![*client],
+        verifier: [*client; 8],
+        principal: u32::from(*client),
+        create_seq: *create_seq,
+      },
+    },
+    Step::NfsClientClear(client) => Op::NfsClientCleared {
+      clientid: u64::from(*client),
+    },
+    Step::NfsInstance => Op::NfsInstanceAdvanced {
+      instance: ids.nfs_instance + 1,
+    },
+    _ => return None,
+  })
+}
+
 /// Keeps the interpreter's view of live ids in step with what the partition accepted.
 fn note_applied(op: &Op, ids: &mut Ids) {
   match op {
+    Op::NfsOpenSet { record } => ids.nfs_opens.push(record.other),
+    Op::NfsOpenCleared { other } => ids.nfs_opens.retain(|o| o != other),
+    Op::NfsLockSet { record } => ids.nfs_locks.push(record.other),
+    Op::NfsLockCleared { other } => ids.nfs_locks.retain(|o| o != other),
+    Op::NfsInstanceAdvanced { instance } => ids.nfs_instance = *instance,
     Op::VolumeCreated { record } => ids
       .live
       .push(u64::from_be_bytes(record.id.bytes[..8].try_into().unwrap())),

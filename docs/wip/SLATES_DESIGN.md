@@ -1694,8 +1694,24 @@ therefore one implementation shared by both versions.
     arguments come first, then the client id and state id. The owner checks the id and serves the
     procedure over the same bytes, and the daemon's barrier applies to the inner write as to a plain
     one.
-  - A state id's `other` is a 48-bit counter followed by the owner's partition and boot instance, so
+  - A state id's `other` is a 48-bit counter followed by the owner's partition and its instance, so
     two owners' ids, or one owner's across a restart, never collide.
+- **The state is durable (A-37).** A file's opens and locks are recorded in the owner's partition, and
+  the listener's clients in its own. The records are the owner and verifier, the principal, and the
+  next CREATE_SESSION sequence. Each call commits its changes as one transaction of the partition's
+  log, which the anchor segment keeps across a restart and the copyset replicates.
+  - A restarted daemon rebuilds the file state and the client table from those records. The client's
+    id and its state ids stay valid, so there is no grace period and no reclaim. The client re-creates
+    only its session: sessions are not durable, as RFC 8881 §2.10.13 allows. A CREATE_SESSION retried
+    across the restart, whose grant was not kept, is served afresh.
+  - Memory never runs ahead of the record. A transaction that cannot commit rolls the partition back
+    to its durable state (the database's own rule). The state in memory is then rebuilt from those
+    records, and the call is answered `NFS4ERR_SERVERFAULT`.
+  - Each daemon life advances each partition's NFSv4 instance durably, and forward only
+    (the typed `DbError::NfsInstanceRegressed` refuses a step back), before minting its first id. Every
+    client, session and state id therefore names an instance no earlier life used.
+  - Kept records come back even if a smaller bound was derived since; only new state is refused until
+    the tables are back under their bounds.
 - **Open state** (§9, kept at the file's owner): one state id per (client, open-owner, file), upgraded and advanced by a reopen;
   share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
   file and client, at its current seqid (`NFS4ERR_OLD_STATEID` for an earlier one, §8.2.2). OPEN of an
@@ -1777,8 +1793,10 @@ therefore one implementation shared by both versions.
   own copy is not observed there. COPY itself is proved by use in `tests/v4.rs`. The kernel's
   `user.` extended attributes are set, read, listed and removed. `XATTR_CREATE` of a set name is
   `EEXIST`, and a removed one reads `ENODATA`.
+  A file held open and locked through the kernel's v4.2 client keeps reading, writing and binding its
+  lock across a `SIGKILL` of the daemon under the real anchor (`crates/cli/tests/nfs_v4_restart.rs`).
+  With the restore disabled, the same test fails with `EIO`: the kernel's recovery finds no grace.
   Owed:
-  - the persisted and replicated open and lock state;
   - DEALLOCATE (a volume change) and CLONE (with dedup);
 
   - RPC-over-TLS;
@@ -6133,3 +6151,27 @@ state extension procedures, the id-routed `call_owner` and the purge queue, `Nfs
 set's lent state); `slates-server` (each shard's `FileState`, the barrier on state-carrying writes); the
 daemon NFS tests; GAPS and TBD_FIXES. Owed next: persisting and replicating the file state with its
 partition, and the client records with the listener's, so a daemon restart forces no grace period.
+
+### A-37 — NFSv4 state survives a daemon restart (2026-09-26)
+
+A restart is a designed event: the anchor keeps the listener and the segment, and NFSv3 clients resume
+transparently. NFSv4 clients lost their client id and their open and lock state, and a reclaim found no
+grace period, so an application holding a file open got `EIO`.
+
+The state is now durable (§4.6 "The state is durable"):
+- file state is recorded in the owner partition, and clients in the listener's;
+- each call commits its changes as one transaction;
+- memory is rebuilt from the records whenever a commit fails, so it never runs ahead of them;
+- each life advances a durable, forward-only instance before it mints an id.
+
+Evidence (E2E): `nfsv4_opens_and_locks_survive_a_daemon_restart`, with the real anchor, the Linux
+kernel's v4.2 client, and `SIGKILL` of the daemon. The held descriptor keeps reading and writing and its
+lock still binds. With the restore disabled, the same test fails with `EIO` (run 2026-09-26 in a
+privileged Linux container). The database oracle's generated histories, crashed and recovered at random
+points, carry the new records and recover them exactly (`crates/db/tests/model.rs`).
+
+Applied in the same change to: §4.6; `slates-db` (the NFSv4 records, operations, snapshot fields, the
+instance and its typed refusal, the model histories); `slates-bridge-nfs` (the file state's and client
+table's journals and restores; the kept-record bounds; the restored CREATE_SESSION retry; the absent
+file-state slot of a daemon export); `slates-server` (`nfs_state`: record or rebuild, the instance,
+building the state from records); the Linux CI step; GAPS and TBD_FIXES.
