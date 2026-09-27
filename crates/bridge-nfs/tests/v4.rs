@@ -1764,3 +1764,62 @@ fn copy_moves_the_bytes_server_side_and_refuses_bad_ranges() {
   }
   assert!(got == payload, "the destination holds the source's bytes");
 }
+
+/// §4.6 A-33, A-35: an NFSv4 client carries extended attributes itself, so a `._name` is an ordinary
+/// name to it, never the AppleDouble view of `name`'s attributes. Beside `notes` (which has an
+/// attribute), a LOOKUP of `._notes` is `NFS4ERR_NOENT`; an OPEN that creates `._notes` makes a real
+/// file, which a READDIR lists; and `notes`'s attribute is untouched.
+#[test]
+fn an_nfsv4_client_never_reaches_an_appledouble_view() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let notes = vol
+    .create_file_no(&mut store, root, "notes", 0o644)
+    .unwrap();
+  vol
+    .xattr_set(
+      &mut store,
+      notes,
+      b"user.tag",
+      b"kept",
+      slates_vfs::xattr::XattrSet::Either,
+    )
+    .unwrap();
+  {
+    let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+    let mut service = export(&mut bridge, 0);
+    let mut server = Server::standalone();
+    let mut client = Client::connect(&mut service, &mut server, b"host-a");
+    let (status, _) = at_root_file(&mut client, &mut service, &mut server, "._notes", |args| {
+      args.u32(op::GETFH);
+    });
+    assert_eq!(status, Nfsstat4::Noent.wire(), "no view is looked up");
+    let owner = client.owner.clone();
+    open_at_root(
+      &mut client,
+      &mut service,
+      &mut server,
+      &owner,
+      "._notes",
+      BOTH,
+      DENY_NONE,
+    )
+    .expect("a real `._notes` is created");
+    let mut names: Vec<String> = list_root(&mut client, &mut service, &mut server)
+      .into_iter()
+      .map(|(name, _)| name)
+      .collect();
+    names.sort();
+    assert_eq!(
+      names,
+      ["._notes", "notes"],
+      "the listing shows the real file"
+    );
+  }
+  assert_eq!(
+    vol.xattr_names(&store, notes).unwrap(),
+    vec![b"user.tag".to_vec().into_boxed_slice()],
+    "the owner's attributes are untouched"
+  );
+}

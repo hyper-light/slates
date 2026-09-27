@@ -114,6 +114,10 @@ const HEX_RADIX: u32 = 16;
 
 // ---------------------------------------------------------------------------- the shard's volumes
 
+/// Format: whether this daemon's NFSv3 loopback clients are the macOS NFS client, which stores extended
+/// attributes in AppleDouble `._name` files (§4.6 A-33): true on macOS only.
+const MACOS_CLIENT_STORES_APPLEDOUBLE: bool = cfg!(target_os = "macos");
+
 /// A mount capability as a request presents it (§4.13; AUD-01): the attachment id and the 16-byte token
 /// `attach` returned to the authorized consumer — in the `MNT` path for the mount itself, and in the file
 /// handle of every later request (the root handle a `MNT` returns and every handle derived from it carry
@@ -131,6 +135,8 @@ type MountCapability = (u64, [u8; 16]);
 #[derive(Clone, Copy, Default)]
 struct ShardVolumeSet {
   capability: Option<MountCapability>,
+  /// Whether the exports serve AppleDouble views: only for the macOS NFSv3 client (§4.6 A-33).
+  appledouble_views: bool,
 }
 
 impl VolumeSet for ShardVolumeSet {
@@ -168,6 +174,7 @@ impl VolumeSet for ShardVolumeSet {
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
     let capability = self.capability;
+    let views = self.appledouble_views;
     state::with_state(|s| {
       if !s.consensus_ready {
         return Some(io_failure_reply(procedure));
@@ -191,6 +198,7 @@ impl VolumeSet for ShardVolumeSet {
         return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
       };
       with_export(s, volume, subject, rights, groups, capability, |export| {
+        export.set_appledouble_views(views);
         export.serve_nfs(procedure, args)
       })
     })
@@ -217,6 +225,14 @@ impl VolumeSet for ShardVolumeSet {
     })
     .flatten()
     .flatten()
+  }
+
+  fn set_appledouble_views(&mut self, on: bool) {
+    self.appledouble_views = on;
+  }
+
+  fn appledouble_views(&self) -> bool {
+    self.appledouble_views
   }
 }
 
@@ -419,6 +435,11 @@ struct Requester {
   /// against the attachment record — the loopback edge's substitute for a peer credential. `None` when
   /// the call presented none; a call's `AUTH_SYS` uid never sets it.
   capability: Option<MountCapability>,
+  /// Whether the request may reach an AppleDouble view (§4.6 A-33): an NFSv3 request to a daemon on
+  /// macOS, whose loopback mounts are the macOS NFS client — the one client that stores attributes in
+  /// `._name` files. Never an NFSv4 request (its clients carry attributes themselves), and never on
+  /// another host, where a `._name` is an ordinary name.
+  appledouble_views: bool,
 }
 
 impl Requester {
@@ -432,6 +453,7 @@ impl Requester {
         subject: Principal::Uid { uid: identity.uid },
         groups: Some(identity.groups),
         capability: None,
+        appledouble_views: MACOS_CLIENT_STORES_APPLEDOUBLE,
       },
       None => Requester::root(),
     }
@@ -445,6 +467,7 @@ impl Requester {
       subject: Principal::Uid { uid: 0 },
       groups: None,
       capability: None,
+      appledouble_views: MACOS_CLIENT_STORES_APPLEDOUBLE,
     }
   }
 
@@ -754,6 +777,7 @@ fn serve_local(
   let mut service = MultiExport::new(
     ShardVolumeSet {
       capability: requester.capability,
+      appledouble_views: requester.appledouble_views,
     },
     requester.subject,
     mount_rights(),
@@ -821,6 +845,8 @@ async fn serve_remote(
 /// routes across shards (built). Only the listing needs this; every other root op is unchanged.
 struct GatheredVolumeSet {
   entries: Vec<(String, VolumeId)>,
+  /// Whether the exports serve AppleDouble views (§4.6 A-33).
+  appledouble_views: bool,
   /// The mount capability the request presented, carried so a served entry authorizes under it (AUD-01).
   capability: Option<MountCapability>,
 }
@@ -845,6 +871,7 @@ impl VolumeSet for GatheredVolumeSet {
   ) -> Option<Vec<u8>> {
     ShardVolumeSet {
       capability: self.capability,
+      appledouble_views: self.appledouble_views,
     }
     .serve(volume, subject, rights, groups, procedure, args)
   }
@@ -858,8 +885,17 @@ impl VolumeSet for GatheredVolumeSet {
   ) -> Option<(Nfsfh3, Fattr3)> {
     ShardVolumeSet {
       capability: self.capability,
+      appledouble_views: self.appledouble_views,
     }
     .root_object(volume, subject, rights, groups)
+  }
+
+  fn set_appledouble_views(&mut self, on: bool) {
+    self.appledouble_views = on;
+  }
+
+  fn appledouble_views(&self) -> bool {
+    self.appledouble_views
   }
 }
 
@@ -885,7 +921,13 @@ async fn gather_entries(
       // Each shard filters its own entries to what the presented mount capability authorizes (AUD-01).
       crate::xshard::call_on(origin, *shard, move || {
         state::with_state(|_| ())?;
-        Some(ShardVolumeSet { capability }.entries())
+        Some(
+          ShardVolumeSet {
+            capability,
+            appledouble_views: false,
+          }
+          .entries(),
+        )
       })
     })
     .collect::<Result<Vec<_>, _>>()
@@ -919,6 +961,7 @@ fn serve_root_listing(
     GatheredVolumeSet {
       entries,
       capability: requester.capability,
+      appledouble_views: requester.appledouble_views,
     },
     requester.subject,
     mount_rights(),
@@ -1030,6 +1073,11 @@ async fn reply_v4(
   match procedure {
     NFSPROC4_NULL => reply_bytes(xid, AcceptStatus::Success, &[]),
     NFSPROC4_COMPOUND => {
+      // An NFSv4 client carries attributes itself: a `._name` is an ordinary name to it (§4.6 A-33).
+      let requester = Requester {
+        appledouble_views: false,
+        ..requester
+      };
       let mut backend = RoutedBackend {
         this,
         xid,

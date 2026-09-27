@@ -43,12 +43,13 @@ impl<'a> ServiceBackend<'a> {
 impl Backend for ServiceBackend<'_> {
   fn call_v3(&mut self, procedure: u32, args: Vec<u8>) -> impl Future<Output = Vec<u8>> {
     let mut reader = XdrReader::new(&args);
-    let result: Ready<Vec<u8>> = ready(
-      self
-        .service
-        .serve_procedure(procedure, &mut reader)
-        .unwrap_or_default(),
-    );
+    // An NFSv4 client carries attributes itself: a `._name` is an ordinary name to it (§4.6 A-33). The
+    // service's own setting (its NFSv3 clients') is restored after the call.
+    let views = self.service.appledouble_views();
+    self.service.set_appledouble_views(false);
+    let served = self.service.serve_procedure(procedure, &mut reader);
+    self.service.set_appledouble_views(views);
+    let result: Ready<Vec<u8>> = ready(served.unwrap_or_default());
     result
   }
 

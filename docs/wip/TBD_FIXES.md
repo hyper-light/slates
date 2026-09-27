@@ -96,9 +96,10 @@ authorized merely by appearing here.
   across two open files conflicts and is granted after the unlock). The v4.2 SEEK, READ_PLUS, COPY
   and IO_ADVISE are served (the kernel's `SEEK_HOLE` finds a mid-file hole through the server). Next:
   persisted and replicated state, DEALLOCATE (a volume change), RFC 8276 xattrs.
-- [ ] **A v4 LOOKUP/CREATE of `._name` reaches the macOS AppleDouble view** (A-33), because the v4
-  front end reuses the v3 procedures. v4 clients carry attributes natively, so the view must not exist
-  for them; the fix is a v4-scoped lookup that skips views.
+- [x] **A v4 LOOKUP/CREATE of `._name` reached the macOS AppleDouble view** (A-33), because the v4
+  front end reuses the v3 procedures, so a v4 or Linux client's `touch ._x` / `rm ._x` beside `x`
+  changed `x`'s attributes. Views are now served only to the macOS NFSv3 client
+  (`an_nfsv4_client_never_reaches_an_appledouble_view`).
 - [x] **NFSv4 returned `NFS4ERR_RESOURCE`, which NFSv4.1 does not define** (RFC 7863), at the client,
   session and open bounds. Now DELAY, NOSPC and NOSPC per RFC 8881 §15.2. See
   `docs/bugs/2026-09-26-nfsv4-returned-a-status-v4-1-does-not-define.md`.

@@ -121,6 +121,13 @@ pub trait VolumeSet {
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>>;
 
+  /// Serves AppleDouble views (`on`) in every export the set builds, or treats every `._name` as an
+  /// ordinary name (§4.6 A-33): on only for the macOS NFSv3 client.
+  fn set_appledouble_views(&mut self, on: bool);
+
+  /// Whether the set's exports serve AppleDouble views.
+  fn appledouble_views(&self) -> bool;
+
   /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
   /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
   /// established. Carries `subject`/`rights`/`groups` as [`Self::serve`] does, though a root object
@@ -145,6 +152,11 @@ pub trait NfsService {
   fn serve_procedure(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>>;
   /// The root NFSv4's `PUTROOTFH` names (A-35): the export's own root.
   fn v4_root(&mut self) -> Nfsfh3;
+  /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33): on only
+  /// for the macOS NFSv3 client, off for NFSv4 and every other client.
+  fn set_appledouble_views(&mut self, on: bool);
+  /// Whether AppleDouble views are served.
+  fn appledouble_views(&self) -> bool;
 }
 
 impl NfsService for Export<'_> {
@@ -161,6 +173,14 @@ impl NfsService for Export<'_> {
       .root_object()
       .map(|(handle, _)| handle)
       .unwrap_or_else(|| Nfsfh3(Vec::new()))
+  }
+
+  fn set_appledouble_views(&mut self, on: bool) {
+    Export::set_appledouble_views(self, on);
+  }
+
+  fn appledouble_views(&self) -> bool {
+    Export::appledouble_views(self)
   }
 }
 
@@ -509,6 +529,14 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
   fn v4_root(&mut self) -> Nfsfh3 {
     root_handle_with(self.set.capability())
   }
+
+  fn set_appledouble_views(&mut self, on: bool) {
+    self.set.set_appledouble_views(on);
+  }
+
+  fn appledouble_views(&self) -> bool {
+    self.set.appledouble_views()
+  }
 }
 
 /// One volume of an [`OwnedVolumeSet`]: its mount name, id, the volume core object, and its overlay
@@ -528,6 +556,7 @@ pub struct OwnedVolume {
 pub struct OwnedVolumeSet {
   store: Store,
   volumes: Vec<OwnedVolume>,
+  appledouble_views: bool,
 }
 
 impl OwnedVolumeSet {
@@ -536,6 +565,7 @@ impl OwnedVolumeSet {
     OwnedVolumeSet {
       store,
       volumes: Vec::new(),
+      appledouble_views: true,
     }
   }
 
@@ -563,6 +593,7 @@ impl OwnedVolumeSet {
     let mut bridge = VolumeBridge::new(volume, &mut slot.volume, store);
     let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
     export.set_groups(groups);
+    export.set_appledouble_views(self.appledouble_views);
     Some(f(&mut export))
   }
 }
@@ -604,6 +635,14 @@ impl VolumeSet for OwnedVolumeSet {
         export.root_object()
       })
       .flatten()
+  }
+
+  fn set_appledouble_views(&mut self, on: bool) {
+    self.appledouble_views = on;
+  }
+
+  fn appledouble_views(&self) -> bool {
+    self.appledouble_views
   }
 }
 

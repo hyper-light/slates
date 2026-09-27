@@ -1749,8 +1749,7 @@ therefore one implementation shared by both versions.
   Owed:
   - the persisted and replicated open and lock state;
   - DEALLOCATE (a volume change), CLONE (with dedup), and RFC 8276 extended attributes;
-  - a v4 LOOKUP or CREATE of `._name` reaches the macOS AppleDouble view (A-33), because v4 reuses the
-    v3 procedures; v4 clients carry attributes natively, so the view should not exist for them;
+
   - RPC-over-TLS;
   - pNFS flexfiles.
 
@@ -1769,6 +1768,12 @@ client stores them in an AppleDouble `._name` file beside `name`. The bridge ser
     longer names.
 - **Create and remove.** CREATE and REMOVE of the view need write permission on `name`, not on the
   directory: they change `name`'s attributes.
+- **Who reaches a view.** Only the macOS NFSv3 client stores attributes in `._name` files. So views
+  are served only to an NFSv3 request to a daemon on macOS, whose loopback mounts are that client. An
+  NFSv4 request never reaches one, since its clients carry attributes themselves. Neither does a
+  request on another host, such as Linux's NFSv3 client. For them `._name` is an ordinary name, and
+  creating, removing or renaming one never touches another file's attributes
+  (`Export::set_appledouble_views`).
 - **Renames.** A rename leaves a *departure*: the vacated name still resolves to the moved inode's
   view until the client's rename finishes. That is because xnu stamps the moved file through its
   old vnode name before renaming `._old` onto `._new`. The trailing sidecar rename is then a no-op
@@ -6053,3 +6058,9 @@ Amended a fourth time the same day: the NFSv4.2 operations SEEK, READ_PLUS, COPY
 minor-version gate on 4.2 operations. Applied to: §4.6; `slates-vfs` (`Volume::seek`, `Seek`);
 `slates-bridge-core` (`Bridge::seek`); `slates-bridge-nfs`; `slates-server` (the wire refusal); the
 kernel test (SEEK and `copy_file_range` on 4.2); GAPS and TBD_FIXES. No storage or consensus change.
+
+Amended a fifth time the same day: AppleDouble views are served only to the macOS NFSv3 client — never
+to an NFSv4 request, nor on another host — so a `._name` a v4 or Linux client creates, removes or
+renames is an ordinary file and never another file's attributes (the view flag on `Export`, the
+`VolumeSet`/`NfsService` setters, the daemon's `Requester`). Applied to: §4.6 (A-33's view, the v4
+front end); `slates-bridge-nfs`; `slates-server`; `tests/v4.rs`; GAPS and TBD_FIXES.

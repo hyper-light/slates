@@ -262,6 +262,12 @@ pub struct Export<'b> {
   /// ([`Self::set_write_verifier`]); a standalone export, which has no restart to survive, keeps the
   /// volume-derived default.
   write_verifier: [u8; size_of::<u64>()],
+  /// Whether a missing `._name` beside `name` is served as the AppleDouble view of `name`'s
+  /// attributes (§4.6 A-33). Only the macOS NFSv3 client stores attributes that way, so only a request
+  /// from it may reach a view; for any other client a `._name` is an ordinary name, so creating,
+  /// removing or renaming one never touches another file's attributes. On by default (the macOS loopback
+  /// mount); the connection that knows its client sets it ([`Self::set_appledouble_views`]).
+  appledouble_views: bool,
   /// The mount capability every handle this export mints carries (§4.13; AUD-01): the attachment id
   /// and its token the daemon validated for this request, so a client's later request self-authorizes
   /// through the handle it holds — the root handle at `MNT`, and every child handle a `LOOKUP`,
@@ -304,6 +310,7 @@ impl<'b> Export<'b> {
         groups: None,
       },
       write_verifier: fsid,
+      appledouble_views: true,
       capability: (0, [0u8; 16]),
     })
   }
@@ -336,6 +343,7 @@ impl<'b> Export<'b> {
         groups: None,
       },
       write_verifier: fsid,
+      appledouble_views: true,
       capability: (0, [0u8; 16]),
     }
   }
@@ -361,6 +369,25 @@ impl<'b> Export<'b> {
   /// instances of the NFS version 3 protocol server, where uncommitted data may be lost").
   pub fn set_write_verifier(&mut self, verifier: [u8; size_of::<u64>()]) {
     self.write_verifier = verifier;
+  }
+
+  /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33).
+  pub fn set_appledouble_views(&mut self, on: bool) {
+    self.appledouble_views = on;
+  }
+
+  /// Whether AppleDouble views are served.
+  pub fn appledouble_views(&self) -> bool {
+    self.appledouble_views
+  }
+
+  /// The owner a `._name` is the AppleDouble view of, when views are served.
+  fn view_owner<'n>(&self, name: &'n str) -> Option<&'n str> {
+    if self.appledouble_views {
+      appledouble_owner(name)
+    } else {
+      None
+    }
   }
 
   /// The authenticated context for a request, built from the export's attachment. Refuses when the
@@ -603,7 +630,7 @@ impl<'b> Export<'b> {
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // A real entry always wins; a missing `._name` is the AppleDouble view of `name`'s attributes.
     let child = match self.bridge.lookup(parent, &cx, name) {
-      Err(VfsError::NotFound) => match appledouble_owner(name) {
+      Err(VfsError::NotFound) => match self.view_owner(name) {
         Some(owner) => self.bridge.appledouble_lookup(parent, &cx, owner),
         None => Err(VfsError::NotFound),
       },
@@ -913,7 +940,7 @@ impl<'b> Export<'b> {
       }
     }
     let entry = match self.bridge.lookup(parent, &cx, &name) {
-      Err(VfsError::NotFound) if !is_dir => match appledouble_owner(&name) {
+      Err(VfsError::NotFound) if !is_dir => match self.view_owner(&name) {
         Some(owner) => return self.remove_view(parent, &cx, owner, &dir_identity, dir_attr),
         None => Err(VfsError::NotFound),
       },
@@ -948,7 +975,7 @@ impl<'b> Export<'b> {
     name: &str,
     mode_kind: u32,
   ) -> Result<Option<ObjectId>, Nfsstat3> {
-    let Some(owner) = appledouble_owner(name) else {
+    let Some(owner) = self.view_owner(name) else {
       return Ok(None);
     };
     let owner_node = match self.bridge.lookup(parent, cx, owner) {
@@ -1082,8 +1109,7 @@ impl<'b> Export<'b> {
     from_name: &str,
     to_name: &str,
   ) -> Result<bool, VfsError> {
-    let (Some(from_owner), Some(to_owner)) =
-      (appledouble_owner(from_name), appledouble_owner(to_name))
+    let (Some(from_owner), Some(to_owner)) = (self.view_owner(from_name), self.view_owner(to_name))
     else {
       return Ok(false);
     };
