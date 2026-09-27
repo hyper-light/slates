@@ -53,6 +53,24 @@ impl Backend for ServiceBackend<'_> {
     result
   }
 
+  fn call_owner(
+    &mut self,
+    _owner: u16,
+    procedure: u32,
+    args: Vec<u8>,
+  ) -> impl Future<Output = Vec<u8>> {
+    // A standalone service holds one file state, which every owner name reaches.
+    let served = self
+      .service
+      .serve_file_state(procedure, &mut XdrReader::new(&args));
+    let result: Ready<Vec<u8>> = ready(served);
+    result
+  }
+
+  fn owners(&self) -> Vec<u16> {
+    vec![0]
+  }
+
   fn root_handle(&self) -> Nfsfh3 {
     self.root.clone()
   }

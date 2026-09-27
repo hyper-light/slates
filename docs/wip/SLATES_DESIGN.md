@@ -1681,11 +1681,13 @@ therefore one implementation shared by both versions.
   states live in a `FileState` on the owner shard of its volume (`v4/files.rs`), whichever listener
   or connection made them. So a share or lock check sees every open and lock of the file, and two
   listeners serving one volume (a fleet node each) share one lock table rather than enforcing two.
-  - The listener keeps client ids, sessions, slot caches and leases, plus a bounded index of each
-    client's state ids and the file each names.
-  - The index routes TEST_STATEID and FREE_STATEID, which name no file, to the owner. It also lets a
-    replaced, expired or destroyed client's state be purged at every owner holding it. An owner that
-    cannot be reached keeps its purge queued, retried on the next drop.
+  - The listener keeps only client ids, sessions, slot caches and leases.
+  - A state id names its owner: its `other` carries the owner's partition, as an attachment id
+    carries its owner (D-14). TEST_STATEID and FREE_STATEID, which name no file, are routed by the id
+    itself (`files::owner_of`, `Backend::call_owner`).
+  - A replaced, expired or destroyed client's state is purged at every owner partition, a bounded
+    broadcast (the shard count). An owner that cannot be reached keeps its purge queued, retried on
+    the next drop.
   - The front end reaches the owner through the state extension procedures (`STATE_*`), routed by the
     file handle as every v3 call is.
   - READ, WRITE and SETATTR carry their state id to the owner inside one call (`*_STATE`): the NFSv3
@@ -6113,18 +6115,21 @@ File state now lives at the owner of the file's volume (§4.6 "File state lives 
 - reached through state extension procedures routed by the file handle;
 - I/O state ids checked at the owner inside the I/O call itself.
 
-The listener keeps sessions and a bounded index of its clients' state ids, which routes the id-only
-operations and purges a dropped client's state at its owners. The ids route to owners as D-14 requires;
-no global table exists.
+The listener keeps only sessions. A state id carries its owner partition, so the operations that name
+only an id route by the id itself, and a dropped client's state is purged by a broadcast to the owner
+partitions (bounded by the shard count). The ids route to owners as D-14 requires; no index or global
+table exists. A first cut kept a listener index of each client's ids and files. It was replaced in
+the same change, because the id already names the owner and the index would have had to persist too.
 
-Evidence: by use, two NFSv4 clients over a volume on another shard meet one lock table
+Evidence: by use, two NFSv4 clients over a volume on another shard meet one lock table, and
+TEST_STATEID reaches the owner through the id for the holder and refuses the other client
 (`two_nfsv4_clients_meet_one_lock_table_at_the_files_owner`). The Linux kernel's v4.1 and v4.2
 clients (opens, `flock`, SEEK, COPY and xattrs) pass through the daemon unchanged
 (`nfs_v4_kernel.rs`). The standalone suites pass unchanged in behaviour (`tests/v4.rs` 20,
 `tests/v4_session.rs` 8).
 
 Applied in the same change to: §4.6; `slates-bridge-nfs` (`v4::files`, the lock table's owner tag, the
-state extension procedures, the listener's index and purge queue, `Nfsstat4::from_wire`, the owned
+state extension procedures, the id-routed `call_owner` and the purge queue, `Nfsstat4::from_wire`, the owned
 set's lent state); `slates-server` (each shard's `FileState`, the barrier on state-carrying writes); the
 daemon NFS tests; GAPS and TBD_FIXES. Owed next: persisting and replicating the file state with its
 partition, and the client records with the listener's, so a daemon restart forces no grace period.

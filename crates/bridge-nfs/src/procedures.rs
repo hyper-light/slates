@@ -141,13 +141,14 @@ pub mod extension {
   /// Format: LOCKU. Arguments: the client's `LOCKU4args` as sent. Result: the status, then the advanced
   /// lock state id.
   pub const STATE_LOCKU: u32 = 1045;
-  /// Format: TEST_STATEID of one state id. Arguments: the state id. Result: its status.
+  /// Format: TEST_STATEID of one state id, routed by the id to its owner (no file handle).
+  /// Arguments: the client id and the state id. Result: its status (`crate::v4::files::serve_by_id`).
   pub const STATE_TEST: u32 = 1046;
-  /// Format: FREE_STATEID. Arguments: the state id. Result: the status, then the count and each
-  /// `other` the owner no longer holds.
+  /// Format: FREE_STATEID, routed by the id to its owner (no file handle). Arguments: the client id and
+  /// the state id. Result: the status, then the count and each `other` the owner no longer holds.
   pub const STATE_FREE: u32 = 1047;
-  /// Format: drop all of a client's state at this owner. Arguments: none beyond the handle and client.
-  /// Result: the status.
+  /// Format: drop all of a client's state at an owner, sent to every owner (no file handle).
+  /// Arguments: the client id. Result: the status.
   pub const STATE_PURGE: u32 = 1048;
   /// Format: whether a state id may serve I/O on the file. Arguments: the state id. Result: its status.
   pub const STATE_CHECK: u32 = 1049;
@@ -487,6 +488,11 @@ impl<'b> Export<'b> {
     }
   }
 
+  /// Serves an id-only NFSv4 state procedure on this export's file state (§4.6 A-36).
+  pub fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    crate::v4::files::serve_by_id(self.file_states_mut(), procedure, args)
+  }
+
   /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33).
   pub fn set_appledouble_views(&mut self, on: bool) {
     self.appledouble_views = on;
@@ -679,7 +685,13 @@ impl<'b> Export<'b> {
       extension::READ_STATE | extension::WRITE_STATE | extension::SETATTR_STATE => {
         Some(self.state_io(procedure, args))
       }
-      extension::STATE_OPEN..=extension::STATE_CHECK => Some(self.file_state(procedure, args)),
+      extension::STATE_OPEN
+      | extension::STATE_CLOSE
+      | extension::STATE_DOWNGRADE
+      | extension::STATE_LOCK
+      | extension::STATE_LOCKT
+      | extension::STATE_LOCKU
+      | extension::STATE_CHECK => Some(self.file_state(procedure, args)),
       _ => None,
     }
   }
@@ -2609,35 +2621,15 @@ fn lock_state(
   Ok(body.into_bytes())
 }
 
-/// TEST_STATEID, FREE_STATEID, a client's purge, and an I/O check at the owner (§4.6 A-36): the result
-/// body.
+/// An I/O check at the owner (§4.6 A-36): the result body (empty).
 fn other_state(
   files: &mut FileState,
-  procedure: u32,
+  _procedure: u32,
   handle: &Nfsfh3,
   clientid: u64,
   args: &mut XdrReader<'_>,
 ) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
-  use crate::v4::Nfsstat4;
-  let bad = |_| Nfsstat4::Badxdr;
-  let mut body = XdrWriter::new();
-  match procedure {
-    extension::STATE_PURGE => files.purge(clientid),
-    extension::STATE_TEST => {
-      let stateid = Stateid::decode(args).map_err(bad)?;
-      let status = files.test(&stateid.other, clientid);
-      if status != Nfsstat4::Ok {
-        return Err(status.into());
-      }
-    }
-    extension::STATE_FREE => {
-      let stateid = Stateid::decode(args).map_err(bad)?;
-      encode_gone(&mut body, &files.free(&stateid.other, clientid)?.gone);
-    }
-    _ => {
-      let stateid = Stateid::decode(args).map_err(bad)?;
-      files.check_io(&stateid, handle, clientid)?;
-    }
-  }
-  Ok(body.into_bytes())
+  let stateid = Stateid::decode(args).map_err(|_| crate::v4::Nfsstat4::Badxdr)?;
+  files.check_io(&stateid, handle, clientid)?;
+  Ok(Vec::new())
 }

@@ -125,8 +125,6 @@ fn server_with(max_clients: usize, lease_ns: u64) -> Server {
       },
       lease_ns,
     },
-    64,
-    64,
   )
 }
 
@@ -506,9 +504,9 @@ fn a_client_opens_writes_reads_closes_and_lists_a_file() {
   let reply = Client::call(&mut service, &mut server, args.as_slice());
   assert_eq!(reply.status, Nfsstat4::Ok.wire(), "CLOSE");
   assert_eq!(
-    (service.file_states().open_count(), server.indexed_states()),
-    (0, 0),
-    "the close released the open at the owner and in the index"
+    service.file_states().open_count(),
+    0,
+    "the close released the open at the owner"
   );
 
   let names = list_root(&mut client, &mut service, &mut server);

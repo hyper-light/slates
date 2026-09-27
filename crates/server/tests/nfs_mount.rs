@@ -1386,8 +1386,11 @@ fn remote_volume_name(client: &mut Client) -> String {
   panic!("no volume provisioned on a non-control shard");
 }
 
-/// Format: `OP_LOCK` and `NFS4ERR_DENIED` / `NFS4ERR_LOCKS_HELD` (RFC 7863).
+/// Format: `OP_LOCK`, `OP_TEST_STATEID`, and `NFS4ERR_DENIED` / `NFS4ERR_LOCKS_HELD` /
+/// `NFS4ERR_BAD_STATEID` (RFC 7863).
 const OP_LOCK: u32 = 12;
+const OP_TEST_STATEID: u32 = 55;
+const NFS4ERR_BAD_STATEID: u32 = 10025;
 const NFS4ERR_DENIED: u32 = 10010;
 const NFS4ERR_LOCKS_HELD: u32 = 10037;
 
@@ -1430,6 +1433,21 @@ impl V4Client {
     (stateid, reader.opaque(128).unwrap().to_vec())
   }
 
+  /// TEST_STATEID of one state id: its status in the reply.
+  fn test_stateid(&mut self, stateid: slates_bridge_nfs::v4::types::Stateid) -> u32 {
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_TEST_STATEID);
+    ops.u32(1);
+    stateid.encode(&mut ops);
+    let (status, results) = self.sequenced(1, ops.as_slice());
+    assert_eq!(status, NFS4_OK, "TEST_STATEID itself");
+    let mut reader = XdrReader::new(&results);
+    reader.fixed(8).unwrap();
+    assert_eq!(reader.u32().unwrap(), 1);
+    reader.u32().unwrap()
+  }
+
   /// PUTFH `fh`, LOCK a write lock on `offset..offset+length` for the new lock-owner `owner` under
   /// the open `open`: the status and the lock operation's body.
   fn write_lock(
@@ -1461,8 +1479,9 @@ impl V4Client {
 
 /// §4.6 A-36: a file's opens and locks live at its owner, so two NFSv4 clients reach the same lock
 /// table whichever shard their listener is on. Over a volume on another shard, client A's write lock is
-/// granted; client B's overlapping lock is `NFS4ERR_DENIED`, naming A's client and range; and A's open
-/// cannot close while its lock is held (`NFS4ERR_LOCKS_HELD`).
+/// granted; client B's overlapping lock is `NFS4ERR_DENIED`, naming A's client and range; A's open
+/// cannot close while its lock is held (`NFS4ERR_LOCKS_HELD`); and TEST_STATEID, which names no file,
+/// reaches the owner through the state id itself.
 #[test]
 fn two_nfsv4_clients_meet_one_lock_table_at_the_files_owner() {
   use slates_bridge_nfs::xdr::XdrReader;
@@ -1495,6 +1514,15 @@ fn two_nfsv4_clients_meet_one_lock_table_at_the_files_owner() {
   ops.u32(0);
   open_a.encode(&mut ops);
   assert_eq!(a.sequenced(2, ops.as_slice()).0, NFS4ERR_LOCKS_HELD);
+
+  // TEST_STATEID names no file: the state id routes itself to its owner shard (D-14), which answers
+  // for the client that holds it and refuses any other.
+  assert_eq!(a.test_stateid(open_a), NFS4_OK, "A's open, tested by A");
+  assert_eq!(
+    b.test_stateid(open_a),
+    NFS4ERR_BAD_STATEID,
+    "A's open is not B's"
+  );
 
   drop((a, b, client));
   drop(daemon);

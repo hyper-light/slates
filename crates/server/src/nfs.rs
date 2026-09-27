@@ -234,6 +234,10 @@ impl VolumeSet for ShardVolumeSet {
   fn appledouble_views(&self) -> bool {
     self.appledouble_views
   }
+
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    serve_file_state_here(procedure, args.rest())
+  }
 }
 
 /// The mount capability and the rights an NFS request runs under for `volume`, or `None` if the caller
@@ -915,6 +919,10 @@ impl VolumeSet for GatheredVolumeSet {
   fn appledouble_views(&self) -> bool {
     self.appledouble_views
   }
+
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    serve_file_state_here(procedure, args.rest())
+  }
 }
 
 /// Gathers every owner's entries under one liveness budget (§4.8 lookup). Any failed admission,
@@ -1139,6 +1147,40 @@ impl compound::Backend for RoutedBackend {
     }
   }
 
+  fn call_owner(
+    &mut self,
+    owner: u16,
+    procedure: u32,
+    args: Vec<u8>,
+  ) -> impl std::future::Future<Output = Vec<u8>> {
+    let this = self.this;
+    async move {
+      // The owner partition a state id names is served by that partition's shard (D-14); a name no
+      // shard carries is a state id this daemon never minted.
+      let Some(shard) = state::with_state(|s| s.shards.get(usize::from(owner)).copied()).flatten()
+      else {
+        return status_word(Nfsstat4::BadStateid);
+      };
+      let Ok(call) = crate::xshard::call_on(this, shard, move || {
+        Some(serve_file_state_here(procedure, &args))
+      }) else {
+        return status_word(Nfsstat4::Delay);
+      };
+      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+        .await
+        .unwrap_or_else(|| status_word(Nfsstat4::Delay))
+    }
+  }
+
+  fn owners(&self) -> Vec<u16> {
+    state::with_state(|s| {
+      (0..s.shards.len())
+        .filter_map(|partition| u16::try_from(partition).ok())
+        .collect()
+    })
+    .unwrap_or_default()
+  }
+
   fn root_handle(&self) -> Nfsfh3 {
     // The pseudo root with no capability: it lists and enters nothing until a LOOKUP presents one
     // (§4.13; AUD-01).
@@ -1197,9 +1239,27 @@ fn v4_server(s: &ShardState) -> V4Server {
       },
       lease_ns: s.config.failover_slo_ns,
     },
-    caps.opens,
-    caps.locks,
   )
+}
+
+/// Serves an id-only NFSv4 state procedure on this shard's file state (§4.6 A-36), created on first
+/// use.
+fn serve_file_state_here(procedure: u32, args: &[u8]) -> Vec<u8> {
+  state::with_state(|s| {
+    if s.nfs_v4_files.is_none() {
+      s.nfs_v4_files = Some(v4_file_state(s));
+    }
+    s.nfs_v4_files.as_mut().map(|files| {
+      slates_bridge_nfs::v4::files::serve_by_id(files, procedure, &mut XdrReader::new(args))
+    })
+  })
+  .flatten()
+  .unwrap_or_else(|| status_word(Nfsstat4::Serverfault))
+}
+
+/// A reply of only a status word.
+fn status_word(status: Nfsstat4) -> Vec<u8> {
+  status.wire().to_be_bytes().to_vec()
 }
 
 /// This shard's NFSv4 file state (§4.6 A-36), its state ids tagged with the shard's partition and the

@@ -80,6 +80,59 @@ pub fn owner_tag(partition: u16, boot: u32) -> OwnerTag {
   tag
 }
 
+/// The owner partition a state id's `other` names (the first two bytes of its owner's tag): where
+/// an operation that names only the state id is routed (D-14, ids route to owners).
+pub fn owner_of(other: &Other) -> u16 {
+  u16::from_be_bytes([other[COUNTER_BYTES], other[COUNTER_BYTES + 1]])
+}
+
+/// Serves one of the id-only state procedures on `files` (A-36): TEST_STATEID and FREE_STATEID of a
+/// state id, and a client's purge, each routed to the owner by the id itself or sent to every owner.
+/// Arguments: the client id, then (TEST, FREE) the state id. Result: the status, then (FREE) the count
+/// and each `other` the owner no longer holds.
+pub fn serve_by_id(files: &mut FileState, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  match by_id(files, procedure, args) {
+    Ok(body) => {
+      writer.u32(Nfsstat4::Ok.wire());
+      writer.fixed(&body);
+    }
+    Err(status) => writer.u32(status.wire()),
+  }
+  writer.into_bytes()
+}
+
+/// The body of an id-only state procedure, or its refusal.
+fn by_id(
+  files: &mut FileState,
+  procedure: u32,
+  args: &mut XdrReader<'_>,
+) -> Result<Vec<u8>, Nfsstat4> {
+  use crate::procedures::extension;
+  let clientid = args.u64().map_err(|_| Nfsstat4::Badxdr)?;
+  let mut body = XdrWriter::new();
+  match procedure {
+    extension::STATE_PURGE => files.purge(clientid),
+    extension::STATE_TEST => {
+      let stateid = Stateid::decode(args).map_err(|_| Nfsstat4::Badxdr)?;
+      let status = files.test(&stateid.other, clientid);
+      if status != Nfsstat4::Ok {
+        return Err(status);
+      }
+    }
+    extension::STATE_FREE => {
+      let stateid = Stateid::decode(args).map_err(|_| Nfsstat4::Badxdr)?;
+      let gone = files.free(&stateid.other, clientid)?.gone;
+      body.u32(u32::try_from(gone.len()).unwrap_or(u32::MAX));
+      for other in &gone {
+        body.fixed(other);
+      }
+    }
+    _ => return Err(Nfsstat4::Serverfault),
+  }
+  Ok(body.into_bytes())
+}
+
 /// A state id's `other` from a counter and the owner's tag.
 pub fn mint(counter: u64, tag: OwnerTag) -> Other {
   let mut other = [0u8; OTHER_SIZE];

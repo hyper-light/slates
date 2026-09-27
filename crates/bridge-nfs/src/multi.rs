@@ -128,6 +128,9 @@ pub trait VolumeSet {
   /// Whether the set's exports serve AppleDouble views.
   fn appledouble_views(&self) -> bool;
 
+  /// Serves an id-only NFSv4 state procedure on the set's file state (§4.6 A-36).
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8>;
+
   /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
   /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
   /// established. Carries `subject`/`rights`/`groups` as [`Self::serve`] does, though a root object
@@ -157,6 +160,9 @@ pub trait NfsService {
   fn set_appledouble_views(&mut self, on: bool);
   /// Whether AppleDouble views are served.
   fn appledouble_views(&self) -> bool;
+  /// Serves an id-only NFSv4 state procedure (TEST_STATEID, FREE_STATEID, a client's purge) on the
+  /// file state this service holds (§4.6 A-36; `crate::v4::files::serve_by_id`).
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8>;
 }
 
 impl NfsService for Export<'_> {
@@ -181,6 +187,10 @@ impl NfsService for Export<'_> {
 
   fn appledouble_views(&self) -> bool {
     Export::appledouble_views(self)
+  }
+
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    Export::serve_file_state(self, procedure, args)
   }
 }
 
@@ -537,6 +547,10 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
   fn appledouble_views(&self) -> bool {
     self.set.appledouble_views()
   }
+
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    self.set.serve_file_state(procedure, args)
+  }
 }
 
 /// One volume of an [`OwnedVolumeSet`]: its mount name, id, the volume core object, and its overlay
@@ -648,6 +662,10 @@ impl VolumeSet for OwnedVolumeSet {
 
   fn appledouble_views(&self) -> bool {
     self.appledouble_views
+  }
+
+  fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    crate::v4::files::serve_by_id(&mut self.files, procedure, args)
   }
 }
 

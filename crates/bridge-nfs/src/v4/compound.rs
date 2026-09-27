@@ -13,17 +13,14 @@
 //! Byte-range locks are `NFS4ERR_NOTSUPP` for now (a Linux client mounted with `local_lock=all` keeps
 //! them itself); delegations are never granted.
 
-use std::collections::BTreeMap;
 use std::future::Future;
 
 use super::Nfsstat4;
 use super::attr::{self, FsFigures};
 use super::files::{LockRequest, share};
-use super::lock::Other;
 use super::session::{CreateSession, ExchangeId, Limits, Sequence, Sequenced, Sessions};
 use super::types::{
-  Bitmap, ChannelAttrs, FHSIZE, OPAQUE_LIMIT, OTHER_SIZE, SessionId, Stateid, VERIFIER_SIZE,
-  decode_sessionid,
+  Bitmap, ChannelAttrs, FHSIZE, OPAQUE_LIMIT, SessionId, Stateid, VERIFIER_SIZE, decode_sessionid,
 };
 use super::v3call::{self, Sattr3};
 use super::{MINOR_HIGHEST, MINOR_LOWEST};
@@ -40,6 +37,16 @@ use crate::xdr::{XdrReader, XdrWriter};
 pub trait Backend {
   /// Serves NFSv3 `procedure` with encoded `args`, returning its encoded result.
   fn call_v3(&mut self, procedure: u32, args: Vec<u8>) -> impl Future<Output = Vec<u8>>;
+  /// Serves an id-only file state procedure at the owner partition `owner` (§4.6 A-36: a state id
+  /// names its owner, `crate::v4::files::owner_of`), returning its encoded result.
+  fn call_owner(
+    &mut self,
+    owner: u16,
+    procedure: u32,
+    args: Vec<u8>,
+  ) -> impl Future<Output = Vec<u8>>;
+  /// Every owner partition this server's files may live at: where a dropped client's state is purged.
+  fn owners(&self) -> Vec<u16>;
   /// The pseudo-filesystem root `PUTROOTFH` names: the synthetic root, scoped to the connection's
   /// authority.
   fn root_handle(&self) -> Nfsfh3;
@@ -236,92 +243,21 @@ pub const MIN_OPERATION_BYTES: u32 = 8;
 pub struct Server {
   /// Client ids and sessions.
   pub sessions: Sessions,
-  index: StateIndex,
-  /// Purges an owner could not take, retried on the next drop: `(client, a file at that owner)`, never
-  /// more than the index held.
-  pending_purges: Vec<(u64, Nfsfh3)>,
+  /// Purges an owner could not take, retried on the next drop: `(client, owner partition)`, never more
+  /// than the clients the table held times the owners.
+  pending_purges: Vec<(u64, u16)>,
   limits: Limits,
   boot: u32,
 }
 
-/// The listener's index of the file state its clients hold at the files' owners (§4.6 A-36): each
-/// client's state ids and the file each names. It routes TEST_STATEID and FREE_STATEID, which name no
-/// file, to the owner, and tells a lapsed client's owners to drop its state. Bounded; an OPEN or LOCK
-/// that would pass the bound is refused before the owner records anything.
-struct StateIndex {
-  max: usize,
-  len: usize,
-  clients: BTreeMap<u64, BTreeMap<Other, Nfsfh3>>,
-}
-
-impl StateIndex {
-  /// Whether one more state id fits.
-  fn has_room(&self) -> bool {
-    self.len < self.max
-  }
-
-  /// Records that `clientid` holds `other` on `fh`.
-  fn insert(&mut self, clientid: u64, other: Other, fh: Nfsfh3) {
-    if self
-      .clients
-      .entry(clientid)
-      .or_default()
-      .insert(other, fh)
-      .is_none()
-    {
-      self.len += 1;
-    }
-  }
-
-  /// The file `clientid`'s `other` names.
-  fn file_of(&self, clientid: u64, other: &Other) -> Option<Nfsfh3> {
-    self.clients.get(&clientid)?.get(other).cloned()
-  }
-
-  /// Forgets the state ids an owner no longer holds.
-  fn forget(&mut self, clientid: u64, gone: &[Other]) {
-    if let Some(held) = self.clients.get_mut(&clientid) {
-      for other in gone {
-        if held.remove(other).is_some() {
-          self.len -= 1;
-        }
-      }
-      if held.is_empty() {
-        self.clients.remove(&clientid);
-      }
-    }
-  }
-
-  /// Takes a dropped client's entries: one file per volume it holds state in, the owners to purge.
-  fn take_client(&mut self, clientid: u64) -> Vec<Nfsfh3> {
-    let Some(held) = self.clients.remove(&clientid) else {
-      return Vec::new();
-    };
-    self.len -= held.len();
-    let mut by_volume: BTreeMap<Vec<u8>, Nfsfh3> = BTreeMap::new();
-    for fh in held.into_values() {
-      let volume = crate::handle::FileHandle::from_fh(&fh)
-        .map(|handle| handle.volume.bytes.to_vec())
-        .unwrap_or_else(|_| fh.0.clone());
-      by_volume.entry(volume).or_insert(fh);
-    }
-    by_volume.into_values().collect()
-  }
-}
-
 impl Server {
-  /// A listener's v4 server instance named `boot`, under `limits`, indexing at most `max_opens` opens
-  /// and `max_locks` lock states its clients hold at the files' owners (§4.6 A-36). WRITE and COMMIT
+  /// A listener's v4 server instance named `boot`, under `limits`: client ids, sessions and leases.
+  /// File state lives at the files' owners (§4.6 A-36). WRITE and COMMIT
   /// carry the write verifier of the v3 layer that holds the data, so a restart of that layer is what
   /// tells a client to re-send its unstable writes (RFC 8881 §18.32.3).
-  pub fn new(boot: u32, limits: Limits, max_opens: usize, max_locks: usize) -> Server {
+  pub fn new(boot: u32, limits: Limits) -> Server {
     Server {
       sessions: Sessions::new(boot, limits),
-      index: StateIndex {
-        max: max_opens.saturating_add(max_locks),
-        len: 0,
-        clients: BTreeMap::new(),
-      },
       pending_purges: Vec::new(),
       limits,
       boot,
@@ -336,10 +272,6 @@ impl Server {
     const CLIENTS: usize = 64;
     /// Shape: sessions per client in the standalone server.
     const SESSIONS: usize = 4;
-    /// Shape: opens the standalone server records.
-    const OPENS: usize = 4096;
-    /// Shape: lock ranges the standalone server records.
-    const LOCKS: usize = 4096;
     /// Shape: the standalone server's lease (an hour: a test never outlives it).
     const LEASE_NS: u64 = 3_600_000_000_000;
     let size = crate::procedures::MAX_TRANSFER + COMPOUND_HEADER_BYTES;
@@ -358,14 +290,7 @@ impl Server {
         },
         lease_ns: LEASE_NS,
       },
-      OPENS,
-      LOCKS,
     )
-  }
-
-  /// How many state ids the listener's index holds for its clients.
-  pub fn indexed_states(&self) -> usize {
-    self.index.len
   }
 
   /// The bounds and offers the server runs under.
@@ -373,16 +298,10 @@ impl Server {
     self.limits
   }
 
-  /// The files, one per volume, whose owners hold state for the clients the session table dropped
-  /// since the last call (replaced, expired or destroyed), as `(client, file)`.
-  fn take_dropped(&mut self) -> Vec<(u64, Nfsfh3)> {
-    let mut owners = Vec::new();
-    for clientid in self.sessions.take_dropped() {
-      for fh in self.index.take_client(clientid) {
-        owners.push((clientid, fh));
-      }
-    }
-    owners
+  /// The clients the session table dropped since the last call (replaced, expired or destroyed), whose
+  /// file state every owner must drop.
+  fn take_dropped(&mut self) -> Vec<u64> {
+    self.sessions.take_dropped()
   }
 }
 
@@ -1074,22 +993,6 @@ fn stateid_of(reader: &mut XdrReader<'_>) -> Result<Stateid, Nfsstat4> {
   Stateid::decode(reader).map_err(|_| Nfsstat4::Serverfault)
 }
 
-/// The state ids an owner reports it no longer holds.
-fn gone_of(reader: &mut XdrReader<'_>) -> Result<Vec<Other>, Nfsstat4> {
-  let count = reader.u32().map_err(|_| Nfsstat4::Serverfault)?;
-  let mut gone = Vec::new();
-  for _ in 0..count {
-    let mut other = [0u8; OTHER_SIZE];
-    other.copy_from_slice(
-      reader
-        .fixed(OTHER_SIZE)
-        .map_err(|_| Nfsstat4::Serverfault)?,
-    );
-    gone.push(other);
-  }
-  Ok(gone)
-}
-
 /// The operations on file state, served at the files' owners (§4.6 A-36), and the rest by family.
 async fn file_state_operation<B: Backend>(
   backend: &mut B,
@@ -1115,7 +1018,7 @@ async fn file_state_operation<B: Backend>(
   }
 }
 
-/// CLOSE (§18.2) at the file's owner; the lock states that went with the open leave the index too.
+/// CLOSE (§18.2) at the file's owner, which drops the lock states that held no lock with the open.
 async fn close<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &Frame) -> Outcome {
   let _seqid = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
   let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
@@ -1130,11 +1033,7 @@ async fn close<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
   )
   .await
   .map_err(|(status, _)| status)?;
-  let mut reader = XdrReader::new(&body);
-  let closed = stateid_of(&mut reader)?;
-  let gone = gone_of(&mut reader)?;
-  backend.with_v4(|server| server.index.forget(clientid, &gone))?;
-  Ok(stateid_bytes(&closed))
+  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?))
 }
 
 /// OPEN_DOWNGRADE (§18.18) at the file's owner.
@@ -1167,7 +1066,6 @@ async fn open_downgrade<B: Backend>(
 
 /// LOCK, LOCKT and LOCKU (§18.10–18.12): the arguments are checked here (an undefined type, an invalid
 /// range, a reclaim), then sent as they came to the file's owner, which keeps every lock of the file.
-/// A new lock state enters the index.
 async fn lock_operation<B: Backend>(
   backend: &mut B,
   opnum: u32,
@@ -1180,22 +1078,13 @@ async fn lock_operation<B: Backend>(
   let fh = current(frame)?.clone();
   check_open_kind(backend, &fh).await?;
   let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
-  if opnum == op::LOCK && !backend.with_v4(|server| server.index.has_room())? {
-    return Err(Nfsstat4::Delay);
-  }
   let procedure = match opnum {
     op::LOCK => extension::STATE_LOCK,
     op::LOCKT => extension::STATE_LOCKT,
     _ => extension::STATE_LOCKU,
   };
   match state_call(backend, procedure, &fh, clientid, &raw).await {
-    Ok(body) => {
-      if opnum == op::LOCK {
-        let stateid = stateid_of(&mut XdrReader::new(&body))?;
-        backend.with_v4(|server| server.index.insert(clientid, stateid.other, fh.clone()))?;
-      }
-      Ok(body)
-    }
+    Ok(body) => Ok(body),
     Err((Nfsstat4::Denied, denied)) => {
       frame.denied = Some(denied);
       Err(Nfsstat4::Denied)
@@ -1204,8 +1093,7 @@ async fn lock_operation<B: Backend>(
   }
 }
 
-/// TEST_STATEID (§18.48): each state id tested at the owner of the file the index names for it; one
-/// the index does not hold is `NFS4ERR_BAD_STATEID`.
+/// TEST_STATEID (§18.48): each state id tested at the owner its `other` names (D-14).
 async fn test_stateid<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
@@ -1222,28 +1110,25 @@ async fn test_stateid<B: Backend>(
   body.u32(count);
   for _ in 0..count {
     let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
-    let status = match backend.with_v4(|server| server.index.file_of(clientid, &stateid.other))? {
-      None => Nfsstat4::BadStateid,
-      Some(fh) => match state_call(
-        backend,
-        extension::STATE_TEST,
-        &fh,
-        clientid,
-        &stateid_bytes(&stateid),
-      )
-      .await
-      {
-        Ok(_) => Nfsstat4::Ok,
-        Err((status, _)) => status,
-      },
+    let owner = super::files::owner_of(&stateid.other);
+    let status = match owner_call(
+      backend,
+      owner,
+      extension::STATE_TEST,
+      clientid,
+      Some(&stateid),
+    )
+    .await
+    {
+      Ok(_) => Nfsstat4::Ok,
+      Err(status) => status,
     };
     body.u32(status.wire());
   }
   Ok(body.into_bytes())
 }
 
-/// FREE_STATEID (§18.38) at the owner of the file the index names; what the owner drops leaves the
-/// index.
+/// FREE_STATEID (§18.38) at the owner its `other` names (D-14).
 async fn free_stateid<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
@@ -1251,39 +1136,63 @@ async fn free_stateid<B: Backend>(
 ) -> Outcome {
   let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
   let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
-  let fh = backend
-    .with_v4(|server| server.index.file_of(clientid, &stateid.other))?
-    .ok_or(Nfsstat4::BadStateid)?;
-  let body = state_call(
+  let owner = super::files::owner_of(&stateid.other);
+  owner_call(
     backend,
+    owner,
     extension::STATE_FREE,
-    &fh,
     clientid,
-    &stateid_bytes(&stateid),
+    Some(&stateid),
   )
-  .await
-  .map_err(|(status, _)| status)?;
-  let gone = gone_of(&mut XdrReader::new(&body))?;
-  backend.with_v4(|server| server.index.forget(clientid, &gone))?;
+  .await?;
   Ok(Vec::new())
 }
 
-/// Tells the owners of every client the session table dropped to drop its file state. An owner that
+/// An id-only state procedure at the owner partition `owner`: the body after its status, or the
+/// status.
+async fn owner_call<B: Backend>(
+  backend: &mut B,
+  owner: u16,
+  procedure: u32,
+  clientid: u64,
+  stateid: Option<&Stateid>,
+) -> Result<Vec<u8>, Nfsstat4> {
+  let mut args = XdrWriter::new();
+  args.u64(clientid);
+  if let Some(stateid) = stateid {
+    stateid.encode(&mut args);
+  }
+  let result = backend
+    .call_owner(owner, procedure, args.into_bytes())
+    .await;
+  let mut reader = XdrReader::new(&result);
+  let status = reader.u32().map_err(|_| Nfsstat4::Serverfault)?;
+  match Nfsstat4::from_wire(status) {
+    Some(Nfsstat4::Ok) => Ok(reader.rest().to_vec()),
+    Some(refused) => Err(refused),
+    None => Err(Nfsstat4::Serverfault),
+  }
+}
+
+/// Tells every owner to drop the file state of each client the session table dropped. An owner that
 /// cannot be reached keeps its purge queued, retried on the next drop, so no dead client's state is
-/// forgotten while the index can still name its owner.
+/// forgotten.
 async fn purge_dropped<B: Backend>(backend: &mut B) -> Result<(), Nfsstat4> {
-  let owners = backend.with_v4(|server| {
-    let mut owners = std::mem::take(&mut server.pending_purges);
-    owners.extend(server.take_dropped());
-    owners
+  let owners = backend.owners();
+  let purges = backend.with_v4(|server| {
+    let mut purges = std::mem::take(&mut server.pending_purges);
+    for clientid in server.take_dropped() {
+      purges.extend(owners.iter().map(|owner| (clientid, *owner)));
+    }
+    purges
   })?;
   let mut failed = Vec::new();
-  for (clientid, fh) in owners {
-    if state_call(backend, extension::STATE_PURGE, &fh, clientid, &[])
+  for (clientid, owner) in purges {
+    if owner_call(backend, owner, extension::STATE_PURGE, clientid, None)
       .await
       .is_err()
     {
-      failed.push((clientid, fh));
+      failed.push((clientid, owner));
     }
   }
   backend.with_v4(|server| server.pending_purges.extend(failed))
@@ -1562,11 +1471,7 @@ async fn open<B: Backend>(
     _ => return Err(Nfsstat4::Notsupp),
   };
   let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
-  // The open is recorded at the file's owner (§4.6 A-36), and indexed here for the client; an index
-  // with no room refuses before the owner records anything.
-  if !backend.with_v4(|server| server.index.has_room())? {
-    return Err(Nfsstat4::Nospc);
-  }
+  // The open is recorded at the file's owner (§4.6 A-36).
   let mut extra = XdrWriter::new();
   extra.opaque(&owner);
   extra.u32(access);
@@ -1581,11 +1486,6 @@ async fn open<B: Backend>(
   .await
   .map_err(|(status, _)| status)?;
   let stateid = stateid_of(&mut XdrReader::new(&recorded))?;
-  backend.with_v4(|server| {
-    server
-      .index
-      .insert(clientid, stateid.other, opened.fh.clone())
-  })?;
   let mut body = XdrWriter::new();
   stateid.encode(&mut body);
   body.fixed(&change_info());
