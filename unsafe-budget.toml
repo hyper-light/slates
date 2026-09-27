@@ -109,7 +109,8 @@
 #   Unix (1), and on Windows the console control handler, an `unsafe extern` function by
 #   signature and its registration (2); the launcher's `unshare_unsafe` (`exec.rs`, Linux),
 #   marked unsafe because it changes every thread's namespace, sound in the single-threaded
-#   pre-exec launcher (1).
+#   pre-exec launcher (1); and the macOS mount (`mount.rs`, added 2026-09-26, §4.6 A-34):
+#   `mount(2)` with the XDR NFS arguments, which rustix does not wrap on macOS (1).
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
@@ -161,7 +162,7 @@ slates-ipc = 35
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 slates-server = 4
 slates-client = 0
-slates-cli = 4
+slates-cli = 5
 slates-wire = 4
 # slates-bridge-core (0): the operation layer is the trait, neutral data structs and the
 # volume-core implementation; no syscalls, no unsafe.

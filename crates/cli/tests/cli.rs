@@ -332,6 +332,81 @@ fn mount_and_check(instance: &str, id: &str, path: &str) {
     "the command reports the path it mounted"
   );
   assert!(is_mounted(path), "the kernel mount table lists the mount");
+  mount_table_hides_the_capability(path);
+}
+
+/// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
+/// confirmation deadline (`crates/server/src/nfs.rs`, `UNMOUNT_CONFIRM_NS`), so a loaded box's delay
+/// cannot hide an ended attachment.
+#[cfg(target_os = "macos")]
+const FORGED_UNMOUNT_WATCH: Duration = Duration::from_secs(3);
+
+/// The daemon's loopback NFS port for the mount at `path`, as any local user reads it: `nfsstat -m`
+/// prints each mount's `port=`.
+fn nfs_port_of(path: &str) -> Option<u16> {
+  let out = Command::new("nfsstat").arg("-m").output().ok()?;
+  let text = String::from_utf8_lossy(&out.stdout);
+  let section = text.split(path).nth(1)?;
+  let (_, rest) = section.split_once("port=")?;
+  rest
+    .split(|c: char| !c.is_ascii_digit())
+    .next()?
+    .parse()
+    .ok()
+}
+
+/// §4.6 A-34: a `UMNT` proves nothing by itself, since any local process can send one. Do send the
+/// daemon a forged `UMNT /<name>` while the volume is mounted, as another user could; expect the mount's
+/// attachment to survive past the daemon's confirmation deadline, and the mount to keep serving.
+#[cfg(target_os = "macos")]
+fn a_forged_unmount_ends_nothing(instance: &str, id: &str, name: &str, path: &str) {
+  use slates_bridge_nfs::client::{Credentials, exchange, umnt_call};
+  let port = nfs_port_of(path).expect("nfsstat -m names the mount's port");
+  let caller = Credentials {
+    uid: 0,
+    gid: 0,
+    gids: Vec::new(),
+  };
+  exchange(
+    port,
+    &umnt_call(1, &caller, &format!("/{name}")),
+    Duration::from_secs(5),
+  )
+  .expect("the daemon answers the forged UMNT");
+  // Watched past the daemon's confirmation deadline (one liveness budget), with room for a loaded box:
+  // the attachment must hold the whole time.
+  let watch_until = Instant::now() + FORGED_UNMOUNT_WATCH;
+  while Instant::now() < watch_until {
+    assert_eq!(
+      attachments_of(instance, id),
+      "1",
+      "a forged UMNT of a live mount ends nothing"
+    );
+    pause();
+  }
+  assert!(is_mounted(path), "the mount is still there");
+}
+
+/// §4.6 A-34 (NFSv3 hardening): the mount table, readable by every local user, names the volume but
+/// never its mount capability: on macOS the source is `slates:/<name>`, with no `@<attachment>.<token>`
+/// in it (the token once rode in `mount_nfs`'s export path, visible to `mount` and to `ps`).
+fn mount_table_hides_the_capability(path: &str) {
+  let out = Command::new("mount").output().unwrap();
+  let table = String::from_utf8_lossy(&out.stdout);
+  let line = table
+    .lines()
+    .find(|line| line.contains(path))
+    .expect("the mount is listed");
+  if cfg!(target_os = "macos") {
+    assert!(
+      line.starts_with("slates:/"),
+      "the source is the volume's name: {line}"
+    );
+    assert!(
+      !line.contains('@'),
+      "no capability in the mount table: {line}"
+    );
+  }
 }
 
 /// The mount's root directory is owned by the mounting user, not root:wheel
@@ -541,6 +616,8 @@ fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
   roundtrip_a_file_through(&mount_point.path);
   a_sparse_extension_through(&instance, &mount_point.path);
   mount_outlives_the_process_that_attached(&instance, &id, &mount_point.path);
+  #[cfg(target_os = "macos")]
+  a_forged_unmount_ends_nothing(&instance, &id, "mounted", &mount_point.path);
   unmount_and_check(&instance, &id, &mount_point.path);
 
   drop(mount_point);
@@ -1825,7 +1902,8 @@ fn assert_verified_binding(binding: &serde_json::Value, mount: &str, volume_name
   assert_eq!(binding["evidence"]["fstype"], "nfs");
   assert_eq!(
     binding["evidence"]["mount_source"],
-    format!("localhost:/{volume_name}")
+    format!("slates:/{volume_name}"),
+    "the mount's source names the volume and carries no capability (§4.6 A-34)"
   );
   assert_eq!(binding["evidence"]["names_volume"], true);
   let entry = &binding["mount"];
@@ -2193,6 +2271,8 @@ fn an_oci_container_consumes_the_host_attachment_through_the_runtime_bind() {
   };
   let path = mount_point.path.clone();
   mount_and_check(&instance, &id, &path);
+  #[cfg(target_os = "macos")]
+  a_forged_unmount_ends_nothing(&instance, &id, "mounted", &path);
 
   let attachments = bind_and_run_workloads(&instance, &id, &path).map(|writer| {
     let reader = assert_read_only_bind(&instance, &id, &path);

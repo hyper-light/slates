@@ -18,6 +18,7 @@
 //! file handles), and [`handle`] (slates' private encoding of a volume object's durable identity into an opaque file handle: `(volume, inode, gen)`). [`mount`] (the NFSv3 MOUNT protocol, RFC 1813 Appendix I — the `MNT` request and the `mountres3` reply that hands a client the export's root handle) and [`portmap`] (the minimal portmap responder, RFC 1833) are the two helper RPC programs the server answers alongside NFS.
 
 pub mod access;
+pub mod client;
 pub mod handle;
 pub mod mount;
 pub mod multi;

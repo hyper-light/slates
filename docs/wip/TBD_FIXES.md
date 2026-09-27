@@ -81,6 +81,12 @@ authorized merely by appearing here.
   this Mac and on the runner (36275244114). Its stop raced its own stream and cut the landing out of one
   runner trace (36275755772). The stop now waits for the drain marker's own event. See
   `docs/bugs/2026-09-26-the-eslogger-stop-raced-its-own-stream.md`.
+- [x] **The mount capability was world-readable** (`ps`, `mount`, `nfsstat -m`). macOS now mounts
+  through `mount(2)` with the handle fetched over loopback, a token-free UMNT is confirmed by the mount
+  table, and OCI binds are proven by the bound mount point (A-34). See
+  `docs/bugs/2026-09-26-the-mount-capability-was-world-readable.md`.
+- [ ] **NFSv4.1/4.2 server** (the direction in §4.6: one server, several versions; pNFS flexfiles;
+  RPC-over-TLS; bounded, sharded and replicated open state). Next: its design amendment, then build.
 - [x] **The fleet test's session hold raced the link's discovery page** (36275755772, macOS gates). The
   hold now waits for the session as a forward does and reports a typed outcome. See
   `docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md`.

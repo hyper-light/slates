@@ -42,6 +42,7 @@ pub(crate) enum MountBackend {
 /// Classifies the loopback mount mechanism from an injectable "is this command on the `PATH`" probe.
 /// Pure — no filesystem or process references — so every branch tests on any host without a live mount,
 /// exactly as sylk factors its detection into a predicate-injected `classifyDarwinFUSEBackend`.
+#[cfg(any(not(target_os = "macos"), test))]
 fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
   if command_exists("mount_nfs") {
     MountBackend::NfsLoopback
@@ -52,6 +53,7 @@ fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
 
 /// Whether `name` resolves to an executable on the `PATH` (the analogue of sylk's `commandAvailable`
 /// over `exec.LookPath`): a directory of the `PATH` holds an entry `name` the caller may execute.
+#[cfg(not(target_os = "macos"))]
 fn command_on_path(name: &str) -> bool {
   let Some(paths) = std::env::var_os("PATH") else {
     return false;
@@ -60,7 +62,15 @@ fn command_on_path(name: &str) -> bool {
     .any(|dir| rustix::fs::access(dir.join(name), rustix::fs::Access::EXEC_OK).is_ok())
 }
 
-/// The loopback mount mechanism this host offers, probing the real `PATH`.
+/// The loopback mount mechanism this host offers. macOS mounts through `mount(2)` itself (§4.6 A-34),
+/// always present; the other BSDs need `mount_nfs` on the real `PATH`.
+#[cfg(target_os = "macos")]
+pub(crate) fn backend() -> MountBackend {
+  MountBackend::NfsLoopback
+}
+
+/// The loopback mount mechanism this host offers, probing the real `PATH` for `mount_nfs`.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn backend() -> MountBackend {
   classify(command_on_path)
 }
@@ -76,6 +86,7 @@ pub(crate) fn backend() -> MountBackend {
 /// so `port` and `mountport` are the same. The export is
 /// `localhost:/<name>@<attachment_hex>.<token_hex>`, the volume's provisioned name under the synthetic
 /// host root with its capability.
+#[cfg(any(not(target_os = "macos"), test))]
 fn mount_args(
   port: u16,
   name: &str,
@@ -107,7 +118,7 @@ pub(crate) fn export_path(name: &str, capability: MountCapability) -> String {
   format!("/{name}@{attachment:x}.{token_hex}")
 }
 
-/// Runs `mount_nfs` to mount the volume `report` names at the existing user-owned `path` under the mount
+/// Mounts the volume `report` names at the existing user-owned `path` under the mount
 /// `capability` its attachment returned (`read_only` for a read-only mount), returning the mounted path.
 /// Refuses first (like sylk's `strictExecutionProbe`, naming what is missing) if the host has no loopback
 /// mount mechanism or the daemon is not serving NFS; then a typed failure if `mount_nfs` refuses (a
@@ -131,7 +142,91 @@ pub(crate) fn establish(
       "the daemon is not serving NFS (its loopback listener did not bind); cannot mount".to_owned(),
     )
   })?;
-  let args = mount_args(port, &report.name, capability, path, read_only);
+  mount_volume(port, &report.name, capability, path, read_only)?;
+  Ok(path.to_owned())
+}
+
+/// Derived: how long the CLI waits for the daemon's MOUNT service on each of connect, send and receive:
+/// one liveness budget (`slates_server::daemon::LIVENESS_BUDGET_NS`). A daemon that cannot answer one
+/// loopback call within the budget the anchor gives it to beat is not serving.
+const MOUNT_CALL_DEADLINE: std::time::Duration =
+  std::time::Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+
+/// Mounts the volume on macOS without the capability leaving this process (§4.6 A-34): the root handle
+/// comes from the daemon's MOUNT service over this process's own loopback socket, and goes to the
+/// kernel in `mount(2)`'s XDR arguments (`NFS_MATTR_FH`), with a source name that holds no secret
+/// (`slates:/<name>`). Nothing another user can read (`ps`, the mount table) carries the token.
+#[cfg(target_os = "macos")]
+fn mount_volume(
+  port: u16,
+  name: &str,
+  capability: MountCapability,
+  path: &str,
+  read_only: bool,
+) -> Result<(), Failure> {
+  use slates_bridge_nfs::client::{Credentials, MountArgs, fetch_root_handle};
+  let caller = Credentials {
+    uid: rustix::process::getuid().as_raw(),
+    gid: rustix::process::getgid().as_raw(),
+    gids: rustix::process::getgroups()
+      .map(|groups| groups.into_iter().map(|gid| gid.as_raw()).collect())
+      .unwrap_or_default(),
+  };
+  let handle = fetch_root_handle(
+    port,
+    &caller,
+    &export_path(name, capability),
+    MOUNT_CALL_DEADLINE,
+  )
+  .map_err(|e| Failure::Failed(format!("mounting {name}: {e}")))?;
+  let mut mnt_flags = libc::MNT_NOSUID;
+  if read_only {
+    mnt_flags |= libc::MNT_RDONLY;
+  }
+  let args = MountArgs {
+    port,
+    handle,
+    attr_cache_seconds: ATTR_CACHE_SECONDS,
+    mnt_flags: u32::try_from(mnt_flags).unwrap_or(0),
+    mnt_from: format!("slates:/{name}"),
+    path: vec![name.to_owned()],
+  }
+  .encode();
+  let kind = std::ffi::CString::new("nfs").map_err(|e| Failure::Failed(e.to_string()))?;
+  let dir = std::ffi::CString::new(path).map_err(|e| Failure::Failed(e.to_string()))?;
+  let mut data = args;
+  // SAFETY: `kind` and `dir` are NUL-terminated strings that outlive the call; `data` is the XDR
+  // argument buffer `mount(2)` reads for the "nfs" type (its length is encoded in its second word, which
+  // the kernel checks against its own bound before copying it in), alive for the call.
+  let result = unsafe {
+    libc::mount(
+      kind.as_ptr(),
+      dir.as_ptr(),
+      mnt_flags,
+      data.as_mut_ptr().cast::<libc::c_void>(),
+    )
+  };
+  if result != 0 {
+    // The failure names the volume, never its capability token (a secret).
+    return Err(Failure::Failed(format!(
+      "mounting {name} at {path}: {}",
+      std::io::Error::last_os_error()
+    )));
+  }
+  Ok(())
+}
+
+/// Mounts the volume with `mount_nfs` (the BSDs other than macOS, where the XDR arguments are not
+/// Apple's).
+#[cfg(not(target_os = "macos"))]
+fn mount_volume(
+  port: u16,
+  name: &str,
+  capability: MountCapability,
+  path: &str,
+  read_only: bool,
+) -> Result<(), Failure> {
+  let args = mount_args(port, name, capability, path, read_only);
   let status = Command::new("mount_nfs")
     .args(&args)
     .status()
@@ -139,11 +234,10 @@ pub(crate) fn establish(
   if !status.success() {
     // The failure names the volume, never its capability token (a secret).
     return Err(Failure::Failed(format!(
-      "mount_nfs localhost:/{}@… {path} failed ({status})",
-      report.name
+      "mount_nfs localhost:/{name}@… {path} failed ({status})"
     )));
   }
-  Ok(path.to_owned())
+  Ok(())
 }
 
 /// Unmounts the loopback bridge at `path` with `umount`, the lifecycle counterpart of [`establish`]

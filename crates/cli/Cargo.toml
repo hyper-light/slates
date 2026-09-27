@@ -25,6 +25,8 @@ slates-vfs = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+# The macOS mount fetches the root handle over loopback and passes it to mount(2) (§4.6 A-34).
+slates-bridge-nfs = { workspace = true }
 rustix = { workspace = true }
 slates-rt = { workspace = true }
 

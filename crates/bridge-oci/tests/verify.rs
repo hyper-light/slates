@@ -26,16 +26,8 @@ fn macos_table() -> Vec<MountEntry> {
     entry("/", "apfs", "/dev/disk3s1s1"),
     entry("/System/Volumes/Data", "apfs", "/dev/disk3s5"),
     entry("/dev", "devfs", "devfs"),
-    entry(
-      "/private/var/folders/1s/T/tmp.abc",
-      "nfs",
-      "localhost:/work@1.0123456789abcdef0123456789abcdef",
-    ),
-    entry(
-      "/Users/me/other",
-      "nfs",
-      "localhost:/other@2.abcdef0123456789abcdef0123456789",
-    ),
+    entry("/private/var/folders/1s/T/tmp.abc", "nfs", "slates:/work"),
+    entry("/Users/me/other", "nfs", "slates:/other"),
   ]
 }
 
@@ -52,37 +44,31 @@ fn a_loopback_mount_of_the_volume_is_verified_and_names_it() {
   .unwrap();
   assert_eq!(verified.mount_point, "/private/var/folders/1s/T/tmp.abc");
   assert_eq!(verified.fstype, "nfs");
-  assert_eq!(verified.source, "localhost:/work");
+  assert_eq!(verified.source, "slates:/work");
   assert!(verified.names_volume);
-  assert!(
-    !format!("{verified:?}").contains("0123456789abcdef"),
-    "debug evidence redacts authority too"
-  );
 }
 
-/// AC-4.11 / AUD-01: a bare, malformed or foreign source cannot identify this authorized mount;
-/// refusal evidence and successful evidence never reveal the bearer token.
+/// AC-4.11, §4.6 A-34: only the exact source names the volume. A prefix of another name, a foreign
+/// server, a trailing path or the old capability-bearing form is another volume's, and is refused with
+/// the table's source.
 #[test]
-fn malformed_and_foreign_capability_sources_refuse_without_disclosing_the_token() {
+fn only_the_exact_source_names_the_volume() {
   let expected = expected_mount(HostMountKind::NfsLoopback, "work");
   for source in [
-    "localhost:/work",
-    "localhost:/worker@1.0123456789abcdef0123456789abcdef",
-    "foreign:/work@1.0123456789abcdef0123456789abcdef",
-    "localhost:/work@.0123456789abcdef0123456789abcdef",
-    "localhost:/work@+1.0123456789abcdef0123456789abcdef",
-    "localhost:/work@10000000000000000.0123456789abcdef0123456789abcdef",
-    "localhost:/work@1.0123456789abcdef",
-    "localhost:/work@1.0123456789abcdef0123456789abcdeg",
-    "localhost:/work@1.0123456789abcdef0123456789abcdef/child",
+    "slates:/worker",
+    "slates:/wor",
+    "foreign:/work",
+    "slates:/work/child",
+    "localhost:/work@1.0123456789abcdef0123456789abcdef",
   ] {
     let table = [entry("/mount", "nfs", source)];
-    let Err(HostPathRefusal::NotThisVolume { source: reported }) =
-      verify_host_mount(&table, "/mount", &expected)
-    else {
-      panic!("a malformed or foreign export must be refused");
-    };
-    assert_eq!(reported, source.split('@').next().unwrap());
+    assert_eq!(
+      verify_host_mount(&table, "/mount", &expected),
+      Err(HostPathRefusal::NotThisVolume {
+        source: source.to_owned()
+      }),
+      "{source}"
+    );
   }
 }
 
@@ -115,7 +101,7 @@ fn every_host_path_refusal_is_typed_and_reached() {
   assert_eq!(
     verify_host_mount(&table, "/Users/me/other", &expected),
     Err(HostPathRefusal::NotThisVolume {
-      source: "localhost:/other".to_owned()
+      source: "slates:/other".to_owned()
     })
   );
 }
@@ -124,14 +110,10 @@ fn every_host_path_refusal_is_typed_and_reached() {
 #[test]
 fn the_last_mount_at_a_path_is_the_visible_one() {
   let mut table = macos_table();
-  table.push(entry(
-    "/Users/me/other",
-    "nfs",
-    "localhost:/work@3.0123456789abcdef0123456789abcdef",
-  ));
+  table.push(entry("/Users/me/other", "nfs", "slates:/work"));
   let expected = expected_mount(HostMountKind::NfsLoopback, "work");
   let verified = verify_host_mount(&table, "/Users/me/other", &expected).unwrap();
-  assert_eq!(verified.source, "localhost:/work");
+  assert_eq!(verified.source, "slates:/work");
 }
 
 /// Format: a Linux `mountinfo` text (proc(5)) with an escaped space in a mount point, a slates FUSE

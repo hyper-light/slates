@@ -1643,6 +1643,26 @@ chosen-path form is a second mount of the same export at a user-owned directory.
 is also the differential oracle for the FSKit path: the same volume is mounted both ways in
 tests and the abstract states must agree.
 
+**Mounting without exposing the capability (A-34).** On macOS, `slates mount` asks the daemon's MOUNT
+service for the export's root handle over its own loopback socket and passes it to `mount(2)` in
+Apple's XDR arguments (`NFS_MATTR_FH`). The mount's source is `slates:/<name>`. The capability
+therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every local user can read.
+- **Unmount.** The kernel's `UMNT` names only `/<name>` and proves nothing by itself. The daemon ends
+  the attachment of a host mount of that volume only once the kernel's mount table
+  (`getfsstat(MNT_NOWAIT)`) no longer lists the mount at its bound mount point.
+- **OCI binds.** The source mount's attachment is found by that same bound mount point in the
+  daemon's records.
+- **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
+  is validated per request; the capability lives only in the daemon, the CLI's memory and the kernel.
+
+**NFS versions (direction, 2026-09-26).** One NFS server speaks several versions over the shared
+bridge core: v3 as today, and v4.1 and v4.2 (RFC 8881, RFC 7862, RFC 8276, and pNFS flexfiles
+RFC 8435). The client negotiates; ONC RPC carries versions 3 and 4 of program 100003 side by side, so
+this is neither a mode switch nor a shim. A network-facing listener requires v4.1 or later with
+RPCSEC_GSS or RPC-over-TLS (RFC 9289); loopback may accept v3. Open state is bounded, sharded to the
+owner core, kept in the anchor segment, and replicated with the copyset, so neither a restart nor a
+takeover forces a grace period. The design of the v4 server is its own amendment, to follow.
+
 **Extended attributes over NFSv3 (A-33).** NFSv3 carries no extended attributes, so the macOS
 client stores them in an AppleDouble `._name` file beside `name`. The bridge serves that file as a
 *view* of `name`'s attributes in the volume's store (§4.5 "Extended attributes"):
@@ -5884,3 +5904,20 @@ the owner-permission rule); `slates-vfs` (the working copy, derived inode number
 attribute writes and their counter, rename departures, the namespace guard, recovery image v6); the
 conformance harness's npm path normalization; conformance.md; GAPS and TBD_FIXES. No wire or
 consensus change. The recovery image format changes.
+
+### A-34 — The macOS mount never exposes its capability; UMNT is confirmed by the mount table (2026-09-26)
+
+The mount capability rode in `mount_nfs`'s export path, visible in `ps`, `mount` and `nfsstat -m`
+to every local user, and every handle carries it
+(`docs/bugs/2026-09-26-the-mount-capability-was-world-readable.md`).
+- The CLI now fetches the root handle over its own loopback socket and calls `mount(2)` with it
+  (§4.6 "Mounting without exposing the capability").
+- The kernel's token-free `UMNT` is confirmed against the kernel's mount table.
+- OCI binds find their source attachment by its bound mount point.
+- The NFS versions direction (v3, and v4.1 and v4.2 on one server) is recorded in §4.6.
+
+Applied in the same change to: §4.6; `slates-bridge-nfs` (`client`: the MOUNT call, the reply parse,
+the XDR mount arguments); `slates-cli` (the macOS `mount(2)` path, the unsafe budget);
+`slates-server` (UMNT confirmation, OCI binding by mount point); `slates-bridge-oci` (exact
+`slates:/<name>` source, the bearer parsing removed); tests; GAPS and TBD_FIXES. The mount source
+format and the UMNT path change; no consensus change.

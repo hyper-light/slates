@@ -17,20 +17,21 @@ use slates_ipc::protocol::{AttachTransport, OciBinding, Refusal, UnsupportedReas
 #[cfg(unix)]
 use slates_ipc::protocol::{HostMountEvidence, HostPathReason};
 
-/// A verified bind recipe and the source mount's authority, kept inside the daemon. Only the
-/// recipe crosses the reply boundary; the source token is checked, never disclosed (§4.13).
+/// A verified bind recipe and the source mount it borrows, kept inside the daemon. Only the recipe
+/// crosses the reply boundary.
 pub(crate) struct Binding {
   /// The runtime's mount entry and descriptive evidence.
   pub entry: OciBinding,
-  /// The live source mount this binding must borrow.
-  pub attachment: u64,
-  /// The source mount's token read from the kernel table.
-  pub token: [u8; 16],
+  /// The source mount point the kernel's table vouches for (a `slates:/<name>` mount exactly there).
+  pub mount_point: String,
 }
 
 impl Binding {
-  /// Check the actual mount before recording its borrower. A stale or foreign source cannot
-  /// create an orphan binding, and a bind cannot promise rights the source does not carry.
+  /// The source mount's attachment, found in the daemon's own records: the host mount of this volume,
+  /// for this principal, bound (`BindMount`) to exactly the mount point the kernel's table vouches for
+  /// (§4.6 A-34: the table carries no capability, so the binding is proven by the record, not by a
+  /// secret read back from the table). A stale or foreign source cannot create an orphan binding, and a
+  /// bind cannot promise rights the source does not carry.
   pub(crate) fn consumer(
     &self,
     partition: &slates_db::partition::Partition,
@@ -39,13 +40,12 @@ impl Binding {
   ) -> Result<slates_db::catalog::Consumer, Refusal> {
     use slates_db::catalog::Consumer;
     let parent = partition
-      .attachment(self.attachment)
-      .filter(|parent| {
+      .attachments_of(volume)
+      .into_iter()
+      .find(|parent| {
         matches!(parent.consumer, Consumer::Bridge)
-          && parent.volume == volume
           && parent.principal == *principal
-          && self.token != [0; 16]
-          && parent.token == self.token
+          && matches!(&parent.form, slates_db::catalog::AttachForm::ChosenPath { path } if *path == self.mount_point)
           && parent.rights.read
           && (self.entry.read_only || parent.rights.write)
       })
@@ -103,13 +103,14 @@ pub(crate) fn bind(
   let entry = OciMountEntry::new(&verified, destination, read_only).map_err(|e| match e {
     DestinationRefusal::NotAbsolute => chosen(HostPathReason::DestinationNotAbsolute),
   })?;
-  let capability = verified.capability.ok_or(Refusal::AttachmentUnsupported {
-    transport: AttachTransport::Oci,
-    reason: UnsupportedReason::HostMountRequired,
-  })?;
+  if !verified.names_volume {
+    return Err(Refusal::AttachmentUnsupported {
+      transport: AttachTransport::Oci,
+      reason: UnsupportedReason::HostMountRequired,
+    });
+  }
   Ok(Binding {
-    attachment: capability.attachment,
-    token: capability.token,
+    mount_point: verified.mount_point.clone(),
     entry: OciBinding {
       source: entry.source.clone(),
       destination: entry.destination.clone(),

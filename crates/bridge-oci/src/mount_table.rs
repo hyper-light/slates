@@ -14,7 +14,7 @@ pub struct MountEntry {
   pub mount_point: String,
   /// Its filesystem type (`nfs`, `apfs`, `fuse.slates`, `ext4`, ...).
   pub fstype: String,
-  /// Its source (`localhost:/<name>`, `/dev/disk3s1`, `slates`, ...).
+  /// Its source (`slates:/<name>`, `/dev/disk3s1`, `slates`, ...).
   pub source: String,
 }
 
