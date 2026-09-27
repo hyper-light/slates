@@ -1125,7 +1125,12 @@ async fn dial_record_socket(
               &identity,
               &certificate,
               NAME,
-              FLEET_FRAME_CAP,
+              // A dialer that only completes its handshake: the fleet's frame cap, no window growth.
+              slates_transport::connection::ConnectionShape::for_frame_cap(
+                FLEET_FRAME_CAP,
+                slates_transport::connection::initial_receive_window(FLEET_FRAME_CAP),
+                slates_transport::congestion::ControllerKind::NewReno,
+              ),
             )
             .map_err(|e| format!("client: {e:?}"))
           });

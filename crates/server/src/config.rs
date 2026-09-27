@@ -36,6 +36,10 @@ const TABLE_SHARE_PERMILLE: u64 = 250;
 /// populated only as bodies need them, so the share bounds the worst case); ratified in GAPS
 /// §5 with the table share.
 const CLIENT_SHARE_PERMILLE: u64 = 250;
+/// Shape: the share of the control shard's reserve all fleet sessions' receive windows may hold at once
+/// (§4.10a; research note §5): each window auto-tunes toward its path's BDP within this bound, as the
+/// table and client shares bound theirs (GAPS §5); pages are touched only as data arrives.
+const FLEET_RECEIVE_SHARE_PERMILLE: u64 = 250;
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
 /// Shape: the archive walk's slice as a share of the shard's step budget, parts per thousand: half,
@@ -283,6 +287,10 @@ pub struct DaemonConfig {
   /// The transport owns the multiplier: one pending handshake plus a live/replaced authenticated
   /// pair. Admission and task/timer budgeting use the same peer capacity and shape. Zero on a laptop.
   pub fleet_sessions_per_plane: usize,
+  /// Derived: the most bytes one fleet session's receive window may grow to — the fleet's receive share
+  /// of the reserve over every fleet session (the accepted and the dialed, on both planes), never below
+  /// the initial window. Zero on a laptop.
+  pub fleet_session_receive_bytes: u64,
   /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
   /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
   /// memcpy bandwidth and the mean wake as the kick round trip, with one request's worst case as the frame.
@@ -609,6 +617,7 @@ impl DaemonConfig {
       recovery_key: None,
       fleet_peer_capacity: 0,
       fleet_sessions_per_plane: 0,
+      fleet_session_receive_bytes: 0,
       #[cfg(unix)]
       guest_credits,
       #[cfg(unix)]
@@ -823,6 +832,29 @@ impl DaemonConfig {
       .derivations
       .push(note("fleet_sessions_per_plane", &sessions_per_plane));
     self.fleet_sessions_per_plane = sessions_per_plane.get();
+    // Every fleet session on the control shard: the accepted ones (the pool per plane) and the ones this
+    // node dials (one per peer per plane).
+    let fleet_sessions = sessions_per_plane
+      .get()
+      .saturating_add(peers)
+      .saturating_mul(FLEET_PLANES)
+      .max(1);
+    let receive: Derived<u64> = derived!(
+      (self
+        .reserve_per_shard
+        .saturating_mul(FLEET_RECEIVE_SHARE_PERMILLE)
+        / PERMILLE
+        / u64::try_from(fleet_sessions).unwrap_or(u64::MAX))
+      .max(slates_transport::connection::initial_receive_window(
+        crate::fleet::FLEET_FRAME_CAP
+      )),
+      "reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES), at least the initial window",
+      ["reserve_per_shard", "fleet.peers"]
+    );
+    self
+      .derivations
+      .push(note("fleet_session_receive_bytes", &receive));
+    self.fleet_session_receive_bytes = receive.get();
     let fleet_tasks: Derived<usize> = derived!(
       peers
         .saturating_mul(FLEET_LOOPS_PER_PEER)

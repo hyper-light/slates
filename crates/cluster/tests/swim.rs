@@ -32,6 +32,19 @@ const NAME: &str = "slates-node";
 // trip it measures is the path's. At the previous 16-byte cap the acknowledgement fragmented across three
 // credit-gated windows and a 1 ms path measured 3 ms.
 const FRAME_CAP: usize = MIN_DATAGRAM_BYTES;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 const PROBER: HostId = HostId(1);
 const TARGET: HostId = HostId(2);
 // A change the target already knows, seeded so its acknowledgement carries gossip the prober learns.
@@ -204,7 +217,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         peer,
         &target_identity,
         std::slice::from_ref(&prober_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       endpoint.establish().await.unwrap();
@@ -288,15 +301,8 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
       let _ = prober_port_tx.send(socket.local_addr().unwrap().port());
       let target_port = recv_port(target_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, target_port);
-      let mut endpoint = Endpoint::client(
-        socket,
-        peer,
-        &prober_identity,
-        &target_cert,
-        NAME,
-        FRAME_CAP,
-      )
-      .unwrap();
+      let mut endpoint =
+        Endpoint::client(socket, peer, &prober_identity, &target_cert, NAME, shape()).unwrap();
       endpoint.establish().await.unwrap();
 
       let mut detector = Detector::new(PROBER, timing());

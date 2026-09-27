@@ -16,12 +16,13 @@
 //!
 //! Owed (the rest of the connection): timer-based tail-loss recovery (this detects loss only by the
 //! packet-reorder threshold, so a purely-tail drop needs the timer QUIC adds — the loop here keeps
-//! sending until in-flight drains, and [`SentTracker::probe_oldest`] is that recovery's mechanism), and
+//! sending until in-flight drains, and [`SentTracker::copy_oldest`] is that recovery's mechanism), and
 //! the packet header + `rustls::quic` record protection that wraps these frames on the wire.
 //! Congestion control is built ([`crate::congestion`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::delivery::RateSnapshot;
 use crate::session::{AckRange, Frame};
 
 /// Format: RFC 9002 §6.1.1 `kPacketThreshold` — three packets of reordering are tolerated before a
@@ -133,26 +134,47 @@ impl AckGenerator {
   }
 }
 
-/// One in-flight packet's carried frames, kept so a lost packet's data can be retransmitted.
+/// One in-flight packet: the frames it carried (kept so a lost packet's data can be retransmitted), when
+/// it was sent, the bytes it counts in flight, and the delivery state it was sent with.
 #[derive(Debug, Clone)]
 struct InFlight {
   frames: Vec<Frame>,
+  sent_at: u64,
+  bytes: u64,
+  rate: RateSnapshot,
+}
+
+/// What a packet that left flight was: its number, send time, bytes in flight, and delivery snapshot —
+/// what the delivery-rate sampler and the congestion controller read when it is acknowledged or lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentPacket {
+  /// The packet number.
+  pub pn: u64,
+  /// When it was sent (the caller's clock).
+  pub sent_at: u64,
+  /// The stream bytes it counted in flight.
+  pub bytes: u64,
+  /// The delivery state it was sent with.
+  pub rate: RateSnapshot,
 }
 
 /// What processing an ACK freed: the stream-data bytes newly acknowledged (for the congestion
-/// controller) and the packet numbers removed from flight (for ACK-of-ACK, so the connection can
-/// confirm which of its own acknowledgement-bearing packets the peer has now received).
+/// controller), the packet numbers removed from flight (for ACK-of-ACK, so the connection can confirm
+/// which of its own acknowledgement-bearing packets the peer has now received), and each freed packet's
+/// record (for the delivery-rate sample and the RTT).
 #[derive(Debug, Default)]
 pub struct Acked {
   /// The stream-data bytes newly acknowledged.
   pub bytes: u64,
   /// The packet numbers freed from flight by this acknowledgement.
   pub pns: Vec<u64>,
+  /// The freed packets, in packet-number order.
+  pub packets: Vec<SentPacket>,
 }
 
-/// What a loss-detection pass declared lost: the frames to retransmit, and the largest packet number
-/// among them (for the congestion controller's recovery-period guard, RFC 9002 §7.3.1). `highest_pn` is
-/// `None` when nothing was lost.
+/// What a loss-detection pass declared lost: the frames to retransmit, the largest packet number among
+/// them (for the congestion controller's recovery-period guard, RFC 9002 §7.3.1), and each lost packet's
+/// record. `highest_pn` is `None` when nothing was lost.
 #[derive(Debug, Default)]
 pub struct Lost {
   /// The frames of the lost packets, to retransmit.
@@ -162,6 +184,8 @@ pub struct Lost {
   pub pns: Vec<u64>,
   /// The largest packet number that was declared lost, if any.
   pub highest_pn: Option<u64>,
+  /// The lost packets, in packet-number order.
+  pub packets: Vec<SentPacket>,
 }
 
 /// The stream-data bytes a frame counts toward the in-flight congestion window: a `Stream` frame's
@@ -180,6 +204,11 @@ pub struct SentTracker {
   next_pn: u64,
   in_flight: BTreeMap<u64, InFlight>,
   largest_acked: Option<u64>,
+  /// The send times of acknowledged packets that could still fall inside a span of lost packets — the
+  /// evidence the persistent-congestion test needs (an acknowledgement inside the span refutes it).
+  /// Pruned below the oldest packet still in flight, since any future loss span starts at or after it,
+  /// so it holds at most the packets sent during one in-flight window.
+  acked_sent_at: BTreeSet<u64>,
 }
 
 impl SentTracker {
@@ -201,9 +230,19 @@ impl SentTracker {
     self.next_pn
   }
 
-  /// Records that packet `pn` carried `frames` (kept for possible retransmission).
-  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>) {
-    self.in_flight.insert(pn, InFlight { frames });
+  /// Records that packet `pn`, sent at `sent_at` with delivery snapshot `rate`, carried `frames` (kept for
+  /// possible retransmission) counting `bytes` in flight.
+  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>, sent_at: u64, rate: RateSnapshot) {
+    let bytes = frames.iter().map(tracked_bytes).sum();
+    self.in_flight.insert(
+      pn,
+      InFlight {
+        frames,
+        sent_at,
+        bytes,
+        rate,
+      },
+    );
   }
 
   /// Processes an ACK for `[largest - range, largest]`: removes acknowledged packets from flight and
@@ -218,13 +257,26 @@ impl SentTracker {
       .map(|(&pn, _)| pn)
       .collect();
     let mut bytes = 0u64;
+    let mut packets = Vec::with_capacity(pns.len());
     for &pn in &pns {
       if let Some(flight) = self.in_flight.remove(&pn) {
-        bytes = bytes.saturating_add(flight.frames.iter().map(tracked_bytes).sum());
+        bytes = bytes.saturating_add(flight.bytes);
+        self.acked_sent_at.insert(flight.sent_at);
+        packets.push(SentPacket {
+          pn,
+          sent_at: flight.sent_at,
+          bytes: flight.bytes,
+          rate: flight.rate,
+        });
       }
     }
     self.largest_acked = Some(self.largest_acked.map_or(largest, |l| l.max(largest)));
-    Acked { bytes, pns }
+    self.prune_acked_sent_at();
+    Acked {
+      bytes,
+      pns,
+      packets,
+    }
   }
 
   /// Processes a whole ACK frame: its first range `[largest - range, largest]`, then each additional
@@ -242,36 +294,72 @@ impl SentTracker {
       let more = self.on_ack(high, high.saturating_sub(low));
       acked.bytes = acked.bytes.saturating_add(more.bytes);
       acked.pns.extend(more.pns);
+      acked.packets.extend(more.packets);
       prev_low = low;
     }
     acked
   }
 
-  /// Removes and returns the frames of packets now declared lost — in flight and at least the
-  /// reorder threshold below the largest acknowledged packet (a gap that persisted past reordering) —
-  /// with the largest lost packet number (for the congestion recovery-period guard). Retransmit the
-  /// frames in a fresh packet.
-  pub fn take_lost(&mut self) -> Lost {
+  /// Removes and returns the packets now declared lost (RFC 9002 §6.1): in flight below the largest
+  /// acknowledged packet and either at least [`REORDER_THRESHOLD`] packets below it (§6.1.1) or sent at
+  /// least `loss_delay` before `now` (§6.1.2's time threshold — what recovers a loss the packet threshold
+  /// cannot see, and what keeps reordering within a round trip from reading as loss). Also returns when
+  /// the next such packet crosses the time threshold (`loss_time`, §6.1.2), for the connection's timer;
+  /// `None` when no unacknowledged packet sits below the largest acknowledged.
+  pub fn take_lost(&mut self, now: u64, loss_delay: u64) -> (Lost, Option<u64>) {
     let Some(largest) = self.largest_acked else {
-      return Lost::default();
+      return (Lost::default(), None);
     };
-    let lost: Vec<u64> = self
-      .in_flight
-      .iter()
-      .filter(|(pn, _)| pn.saturating_add(REORDER_THRESHOLD) <= largest)
-      .map(|(&pn, _)| pn)
-      .collect();
+    // Before the clock has run a whole loss delay, no packet can be old enough to be lost by time.
+    let lost_send_time = now.checked_sub(loss_delay);
+    let mut lost = Vec::new();
+    let mut loss_time: Option<u64> = None;
+    for (&pn, flight) in self.in_flight.range(..largest) {
+      let by_time = lost_send_time.is_some_and(|limit| flight.sent_at <= limit);
+      if pn.saturating_add(REORDER_THRESHOLD) <= largest || by_time {
+        lost.push(pn);
+      } else {
+        let due = flight.sent_at.saturating_add(loss_delay);
+        loss_time = Some(loss_time.map_or(due, |earliest| earliest.min(due)));
+      }
+    }
     let highest_pn = lost.iter().copied().max();
     let mut frames = Vec::new();
+    let mut packets = Vec::with_capacity(lost.len());
     for &pn in &lost {
       if let Some(flight) = self.in_flight.remove(&pn) {
+        packets.push(SentPacket {
+          pn,
+          sent_at: flight.sent_at,
+          bytes: flight.bytes,
+          rate: flight.rate,
+        });
         frames.extend(flight.frames);
       }
     }
-    Lost {
-      frames,
-      pns: lost,
-      highest_pn,
+    (
+      Lost {
+        frames,
+        pns: lost,
+        highest_pn,
+        packets,
+      },
+      loss_time,
+    )
+  }
+
+  /// The send time of the most recent ack-eliciting packet still in flight — the anchor the probe
+  /// timeout is armed from (RFC 9002 §6.2.1: `time_of_last_ack_eliciting_packet`).
+  pub fn newest_sent_at(&self) -> Option<u64> {
+    self.in_flight.values().map(|flight| flight.sent_at).max()
+  }
+
+  /// Drops acknowledged send times older than the oldest packet still in flight (no future loss span can
+  /// reach back past it), or all of them when nothing is in flight.
+  fn prune_acked_sent_at(&mut self) {
+    match self.in_flight.values().map(|flight| flight.sent_at).min() {
+      Some(oldest) => self.acked_sent_at = self.acked_sent_at.split_off(&oldest),
+      None => self.acked_sent_at.clear(),
     }
   }
 
@@ -289,17 +377,20 @@ impl SentTracker {
   pub fn forget_stream(&mut self, stream_id: u64) -> u64 {
     let mut dropped = 0u64;
     self.in_flight.retain(|_, packet| {
+      let mut from_packet = 0u64;
       packet.frames.retain(|frame| match frame {
         Frame::Stream {
           stream_id: id,
           data,
           ..
         } if *id == stream_id => {
-          dropped = dropped.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
+          from_packet = from_packet.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
           false
         }
         _ => true,
       });
+      packet.bytes = packet.bytes.saturating_sub(from_packet);
+      dropped = dropped.saturating_add(from_packet);
       !packet.frames.is_empty()
     });
     dropped
@@ -311,20 +402,33 @@ impl SentTracker {
     self.largest_acked
   }
 
-  /// Removes and returns the frames of the oldest in-flight packet, for a probe retransmission when the
-  /// reorder threshold cannot detect a loss — a lost *last* packet has no later acknowledged packets to
-  /// open a gap past it (RFC 9002 §6.2 handles this with a probe timeout; this is that recovery's
-  /// mechanism, driven when the connection would otherwise stall with packets still in flight). Returns
-  /// empty when nothing is in flight.
-  pub fn probe_oldest(&mut self) -> Vec<Frame> {
-    let Some((&pn, _)) = self.in_flight.iter().next() else {
-      return Vec::new();
-    };
+  /// A copy of the oldest in-flight packet's frames, for a probe (RFC 9002 §6.2.4): the probe carries the
+  /// data again in a new packet while the original stays in flight, to be acknowledged or declared lost by
+  /// the usual thresholds once the probe's acknowledgement arrives — so a tail loss recovered by a probe
+  /// is still reported as a loss to the congestion controller and to the persistent-congestion test.
+  /// Empty when nothing is in flight.
+  pub fn copy_oldest(&self) -> Vec<Frame> {
     self
       .in_flight
-      .remove(&pn)
-      .map(|flight| flight.frames)
+      .values()
+      .next()
+      .map(|flight| flight.frames.clone())
       .unwrap_or_default()
+  }
+
+  /// Whether `lost` establishes persistent congestion (RFC 9002 §7.6.2): two of its packets sent at
+  /// least `duration` apart with no packet sent between them acknowledged — the path delivered nothing
+  /// for longer than the probe timeouts that should have recovered it. (The RFC also requires an RTT
+  /// sample before the earliest of them; the connection checks that, holding the RTT estimator.)
+  pub fn persistent_congestion(&self, lost: &[SentPacket], duration: u64) -> bool {
+    let (Some(first), Some(last)) = (
+      lost.iter().map(|packet| packet.sent_at).min(),
+      lost.iter().map(|packet| packet.sent_at).max(),
+    ) else {
+      return false;
+    };
+    last.saturating_sub(first) >= duration
+      && self.acked_sent_at.range(first..=last).next().is_none()
   }
 }
 
@@ -440,6 +544,8 @@ mod tests {
           fin: false,
           data: vec![0u8],
         }],
+        0,
+        RateSnapshot::default(),
       );
     }
     // Received {0,1,2,4,5} (packet 3 dropped): the generator's ACK acknowledges both runs.
@@ -475,12 +581,17 @@ mod tests {
     for pn in 0..6 {
       let got = sent.next_pn();
       assert_eq!(got, pn);
-      sent.on_sent(pn, vec![Frame::MaxData { max: pn }]);
+      sent.on_sent(
+        pn,
+        vec![Frame::MaxData { max: pn }],
+        0,
+        RateSnapshot::default(),
+      );
     }
     // Acknowledge [2,5]; 0 and 1 remain in flight, both >= REORDER_THRESHOLD below largest (5).
     sent.on_ack(5, 3);
     assert_eq!(sent.in_flight_count(), 2, "0 and 1 still in flight");
-    let lost = sent.take_lost();
+    let lost = sent.take_lost(0, 1).0;
     assert_eq!(
       lost.frames.len(),
       2,
@@ -494,25 +605,36 @@ mod tests {
     );
   }
 
-  /// A probe removes the oldest in-flight packet's frames when no ACK-driven loss can be detected (a
-  /// lost tail), so the connection can retransmit and drain.
+  /// A probe copies the oldest in-flight packet's frames when no ACK-driven loss can be detected (a lost
+  /// tail), leaving the original in flight to be acknowledged or declared lost (RFC 9002 §6.2.4).
   #[test]
-  fn a_probe_takes_the_oldest_in_flight_packet() {
+  fn a_probe_copies_the_oldest_in_flight_packet() {
     let mut sent = SentTracker::new();
-    sent.on_sent(0, vec![Frame::MaxData { max: 7 }]);
-    sent.on_sent(1, vec![Frame::MaxData { max: 8 }]);
+    sent.on_sent(
+      0,
+      vec![Frame::MaxData { max: 7 }],
+      0,
+      RateSnapshot::default(),
+    );
+    sent.on_sent(
+      1,
+      vec![Frame::MaxData { max: 8 }],
+      0,
+      RateSnapshot::default(),
+    );
     // No ACK ever arrives (a tail loss), so `take_lost` finds nothing.
-    assert!(sent.take_lost().frames.is_empty());
-    // The probe frees the oldest (pn 0) for retransmission.
-    assert_eq!(sent.probe_oldest(), vec![Frame::MaxData { max: 7 }]);
-    assert_eq!(sent.in_flight_count(), 1, "only the oldest was taken");
-    assert_eq!(sent.probe_oldest(), vec![Frame::MaxData { max: 8 }]);
-    assert!(sent.probe_oldest().is_empty(), "nothing left to probe");
+    assert!(sent.take_lost(0, 1).0.frames.is_empty());
+    assert_eq!(sent.copy_oldest(), vec![Frame::MaxData { max: 7 }]);
+    assert_eq!(sent.in_flight_count(), 2, "the original stays in flight");
+    assert!(
+      SentTracker::new().copy_oldest().is_empty(),
+      "nothing to copy with nothing in flight"
+    );
   }
 
   /// Builds one packet's frames: the lost frames to retransmit first, then up to two fresh ones.
   fn build_packet(source: &mut StreamSender, sent: &mut SentTracker) -> Vec<Frame> {
-    let mut frames = sent.take_lost().frames;
+    let mut frames = sent.take_lost(0, 1).0.frames;
     for _ in 0..2 {
       match source.next_frame(1, 8) {
         Some(frame) => frames.push(frame),
@@ -581,7 +703,7 @@ mod tests {
         break; // nothing new and nothing lost — the non-tail drop never leaves this at completion.
       }
       let pn = sent.next_pn();
-      sent.on_sent(pn, frames.clone());
+      sent.on_sent(pn, frames.clone(), 0, RateSnapshot::default());
       // The lossy channel drops the second packet (pn 1) exactly once — a non-tail drop, so later
       // packets advance the largest-acked past the reorder threshold and the loss is detected.
       let drop_this = pn == 1 && !dropped_once;

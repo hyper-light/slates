@@ -18,6 +18,11 @@ use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
 
 /// Shape: distinct owner and holder identities at the smallest remote quorum, f=1.
+/// Shape: the receive ceiling the content test's sessions may auto-tune to — sixty-four initial windows at
+/// the minimum datagram, enough for an archive to flow at its path's rate.
+const CONTENT_RECEIVE_CEILING: u64 =
+  64 * (slates_transport::conn::REORDER_THRESHOLD + 1) * MIN_DATAGRAM_BYTES as u64;
+
 const OWNER: HostId = HostId(1);
 /// Shape: the only remote holder needed to join the owner's local acknowledgement.
 const HOLDER: HostId = HostId(2);
@@ -141,7 +146,11 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         owner_address,
         &holder_identity,
         &[owner_certificate],
-        MIN_DATAGRAM_BYTES,
+        slates_transport::connection::ConnectionShape::for_frame_cap(
+          MIN_DATAGRAM_BYTES,
+          CONTENT_RECEIVE_CEILING,
+          slates_transport::congestion::ControllerKind::NewReno,
+        ),
       )
       .unwrap();
       endpoint.establish().await.unwrap();
@@ -169,7 +178,11 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         &owner_identity,
         &holder_certificate,
         NAME,
-        MIN_DATAGRAM_BYTES,
+        slates_transport::connection::ConnectionShape::for_frame_cap(
+          MIN_DATAGRAM_BYTES,
+          CONTENT_RECEIVE_CEILING,
+          slates_transport::congestion::ControllerKind::NewReno,
+        ),
       )
       .unwrap();
       endpoint.establish().await.unwrap();

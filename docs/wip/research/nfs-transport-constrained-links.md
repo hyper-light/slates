@@ -307,3 +307,26 @@ Each scenario measures:
   bounds, burst run length, the MTU black hole, the buffer bound, NAT expiry and rebinding, and seed
   replay. The first run found the model's own bug: an answer to an expired NAT port was counted as a
   closed port's drop.
+- **Slice 2a (2026-09-27): the clocked connection and the three candidate controllers.**
+  - **Clock and time machinery.** The session-plane connection (`crates/transport/src/connection.rs`)
+    takes the caller's clock at every entry point. It owns the RTT estimator, and declares loss by both
+    RFC 9002 thresholds (the time threshold was missing). A single `next_timeout`/`on_timeout` pair drives
+    its timers: the loss timer; the probe timeout with backoff (held under the larger of the PTO and the
+    initial PTO, the endpoint's existing bound); and the pacer's release.
+  - **Probes are copies (RFC 9002 §6.2.4).** A probe now sends a copy of the oldest packet, which stays in
+    flight; the probe used to remove it and so hid tail losses from the controller
+    (`docs/bugs/2026-09-27-session-plane-probes-hid-tail-losses.md`). Persistent congestion (§7.6) is
+    detected.
+  - **Rate sampling and pacing.** Every acknowledgement produces a delivery-rate sample
+    (`crate::delivery`, draft-ietf-ccwg-bbr-06 §4.1.2). Ack-eliciting packets are paced
+    (`crate::pacer`, a token bucket of one send quantum).
+  - **Window auto-tuning.** The receive window auto-tunes, doubling when a window is read within two RTTs
+    (Chromium's rule), up to a derived per-session ceiling: `DaemonConfig::fleet_session_receive_bytes` =
+    a quarter of the control shard's reserve over every fleet session. It had been fixed at four frames.
+  - **The candidates.** The bake-off controllers are all built to their specifications:
+    `congestion::newreno` (RFC 9002 §7), `congestion::cubic` (RFC 9438 with HyStart++, RFC 9406), and
+    `congestion::bbr` (draft-ietf-ccwg-bbr-06). All use integer arithmetic, so a simulated history
+    replays exactly.
+  - **Tests.** The connection's oracle runs every loss, reorder, probe and multiplexing test under all
+    three controllers. The transport, cluster and rt suites and the fleet suite (50/50) pass. The fleet
+    keeps NewReno until the bake-off decides.

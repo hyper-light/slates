@@ -27,6 +27,19 @@ use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 const GENERATION: u64 = 0;
 const OWNER: HostId = HostId(1);
 const OBJECT: ObjectId = ObjectId::new(OWNER, 7);
@@ -210,7 +223,7 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
           peer,
           &holder_identity,
           std::slice::from_ref(&owner_cert),
-          FRAME_CAP,
+          shape(),
         )
         .unwrap();
         endpoint.establish().await.unwrap();
@@ -243,7 +256,7 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
         let holder_port = recv_port(holder_port_rx).await;
         let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, holder_port);
         let mut endpoint =
-          Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, FRAME_CAP).unwrap();
+          Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, shape()).unwrap();
         endpoint.establish().await.unwrap();
         remotes.push((holder_id(index), endpoint));
       }

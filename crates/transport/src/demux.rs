@@ -46,6 +46,7 @@ use std::task::{Context, Poll, Waker};
 use rustls::pki_types::CertificateDer;
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
 
+use crate::connection::ConnectionShape;
 use crate::endpoint::{
   ConnectionId, DATAGRAM_BYTES, Endpoint, EndpointError, MIN_DATAGRAM_BYTES, connection_id_of,
   is_short_header,
@@ -201,7 +202,8 @@ pub struct Demux {
   socket: UdpSocket,
   identity: &'static Identity,
   allowed: Vec<CertificateDer<'static>>,
-  frame_cap: usize,
+  /// The connection shape every session on this socket is built with.
+  shape: ConnectionShape,
   /// Derived: the datagrams one session's inbox holds — the socket's kernel receive buffer over the
   /// minimum datagram, the queue the per-peer socket this shares out used to give each peer.
   inbox_datagrams: usize,
@@ -224,7 +226,7 @@ impl Demux {
     socket: UdpSocket,
     identity: &'static Identity,
     allowed: Vec<CertificateDer<'static>>,
-    frame_cap: usize,
+    shape: ConnectionShape,
     peer_capacity: usize,
   ) -> Result<&'static Demux, EndpointError> {
     let max_sessions = peer_capacity
@@ -249,7 +251,7 @@ impl Demux {
       socket,
       identity,
       allowed,
-      frame_cap,
+      shape,
       inbox_datagrams,
       capacity: max_sessions,
       peer_capacity,
@@ -285,9 +287,9 @@ impl Demux {
     server_connection(self.identity, &self.allowed)
   }
 
-  /// The frame cap every session on this socket frames at.
-  pub(crate) fn frame_cap(&self) -> usize {
-    self.frame_cap
+  /// The connection shape every session on this socket is built with.
+  pub(crate) fn shape(&self) -> ConnectionShape {
+    self.shape
   }
 
   /// The socket's local address (the port peers dial).

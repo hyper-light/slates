@@ -40,6 +40,19 @@ const NAME: &str = "slates-fleet";
 /// Shape: the fleet's frame class — a whole council message or probe in one frame, as the daemon's cap
 /// derived from the RFC 9000 §14.1 minimum datagram gives it, so an exchange is one round trip.
 const FRAME_CAP: usize = MIN_DATAGRAM_BYTES;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 /// Shape: the daemon's coordinator period, `slates_server::daemon::HEARTBEAT_NS` (100 ms) — mirrored here
 /// so the harness's periods are the daemon's.
 const HEARTBEAT_NS: u64 = 100_000_000;
@@ -807,7 +820,7 @@ fn run_scenario(
               dial_addr,
               &identities[&peer],
               std::slice::from_ref(&certificates[&dialer]),
-              FRAME_CAP,
+              shape(),
             )
             .unwrap();
             let client = Endpoint::client(
@@ -816,7 +829,7 @@ fn run_scenario(
               &identities[&dialer],
               &certificates[&peer],
               NAME,
-              FRAME_CAP,
+              shape(),
             )
             .unwrap();
             let serve = slates_rt::futures::spawn(serve_session(peer, server, council)).unwrap();

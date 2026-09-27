@@ -23,6 +23,19 @@ use slates_transport::handshake::Identity;
 const NAME: &str = "slates-node";
 const STREAM_ID: u64 = 1;
 const FRAME_CAP: usize = 16;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 
 fn config() -> RuntimeConfig {
   RuntimeConfig {
@@ -97,7 +110,7 @@ fn a_stream_flows_over_a_live_session() {
           peer,
           &server_identity,
           std::slice::from_ref(&client_cert),
-          FRAME_CAP,
+          shape(),
         )
         .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
@@ -118,15 +131,8 @@ fn a_stream_flows_over_a_live_session() {
       let _ = client_port_tx.send(socket.local_addr().unwrap().port());
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-      let mut client = Endpoint::client(
-        socket,
-        peer,
-        &client_identity,
-        &server_cert,
-        NAME,
-        FRAME_CAP,
-      )
-      .unwrap();
+      let mut client =
+        Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape()).unwrap();
       client.establish().await.unwrap();
       client.send_stream(STREAM_ID, &content).await.unwrap();
     })
@@ -184,7 +190,7 @@ fn a_request_gets_a_reply_over_a_live_session() {
         peer,
         &server_identity,
         std::slice::from_ref(&client_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       server.establish().await.unwrap();
@@ -208,15 +214,9 @@ fn a_request_gets_a_reply_over_a_live_session() {
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut client = Endpoint::client(
-          socket,
-          peer,
-          &client_identity,
-          &server_cert,
-          NAME,
-          FRAME_CAP,
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        let mut client =
+          Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape())
+            .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         let reply = client
           .request(STREAM_ID, &request)
@@ -297,7 +297,7 @@ fn an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock() {
         peer,
         &server_identity,
         std::slice::from_ref(&client_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       server.establish().await.unwrap();
@@ -314,15 +314,9 @@ fn an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock() {
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut client = Endpoint::client(
-          socket,
-          peer,
-          &client_identity,
-          &server_cert,
-          NAME,
-          FRAME_CAP,
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        let mut client =
+          Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape())
+            .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         let mut exchange_times = Vec::with_capacity(WAN_EXCHANGES);
         for _ in 0..WAN_EXCHANGES {
@@ -392,7 +386,7 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
         peer,
         &server_identity,
         std::slice::from_ref(&client_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       server.establish().await.unwrap();
@@ -414,15 +408,9 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut client = Endpoint::client(
-          socket,
-          peer,
-          &client_identity,
-          &server_cert,
-          NAME,
-          FRAME_CAP,
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        let mut client =
+          Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape())
+            .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         let mut cursors = vec![client.tx_packet_number()];
         for exchange in 0..EXCHANGES {
@@ -534,7 +522,7 @@ fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
         peer,
         &server_identity,
         std::slice::from_ref(&client_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       server.establish().await.unwrap();
@@ -567,15 +555,9 @@ fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut client = Endpoint::client(
-          socket,
-          peer,
-          &client_identity,
-          &server_cert,
-          NAME,
-          FRAME_CAP,
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        let mut client =
+          Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape())
+            .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         let warm = within(EXCHANGE_BOUND_NS, client.request(STREAM_ID, b"warm-up"))
           .await
@@ -716,7 +698,7 @@ async fn dial_and_request(
     UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).map_err(|e| format!("{e:?}"))?;
   let server_port = recv_port(port_rx).await;
   let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-  let mut client = Endpoint::client(socket, peer, &identity, &server_cert, NAME, FRAME_CAP)
+  let mut client = Endpoint::client(socket, peer, &identity, &server_cert, NAME, shape())
     .map_err(|e| format!("{e:?}"))?;
   client.establish().await.map_err(|e| format!("{e:?}"))?;
   let mut replies = Vec::new();
@@ -761,14 +743,7 @@ async fn serve_shared_socket_on_shard(plan: ServerPlan) {
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
   let identity: &'static Identity =
     slates_rt::registry::with_current(|ctx| ctx.keep(plan.identity)).unwrap();
-  let demux = Demux::start(
-    socket,
-    identity,
-    plan.allowed,
-    FRAME_CAP,
-    plan.peer_capacity,
-  )
-  .unwrap();
+  let demux = Demux::start(socket, identity, plan.allowed, shape(), plan.peer_capacity).unwrap();
   let port = demux.local_addr().unwrap().port();
   for tx in plan.port_txs {
     let _ = tx.send(port);
@@ -1066,7 +1041,7 @@ fn a_packet_naming_no_session_is_dropped_and_counted_while_the_live_session_serv
       let server_port = recv_port(port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
       let outcome = async {
-        let mut endpoint = Endpoint::client(socket, peer, &client, &server_cert, NAME, FRAME_CAP)
+        let mut endpoint = Endpoint::client(socket, peer, &client, &server_cert, NAME, shape())
           .map_err(|e| format!("{e:?}"))?;
         endpoint.establish().await.map_err(|e| format!("{e:?}"))?;
         let before = endpoint
@@ -1245,7 +1220,7 @@ fn start_pool(
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
   let identity: &'static Identity =
     slates_rt::registry::with_current(|ctx| ctx.keep(identity)).unwrap();
-  let demux = Demux::start(socket, identity, allowed, FRAME_CAP, capacity).unwrap();
+  let demux = Demux::start(socket, identity, allowed, shape(), capacity).unwrap();
   let port = demux.local_addr().unwrap().port();
   for tx in port_txs {
     let _ = tx.send(port);
@@ -1550,15 +1525,8 @@ fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_
       let _ = client_port_tx.send(socket.local_addr().unwrap().port());
       let server_port = recv_port(server_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-      let mut client = Endpoint::client(
-        socket,
-        peer,
-        &client_identity,
-        &server_cert,
-        NAME,
-        FRAME_CAP,
-      )
-      .unwrap();
+      let mut client =
+        Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape()).unwrap();
       let first = client.establish().await;
       let _ = first_tx.send(matches!(first, Err(EndpointError::NotReady)));
       let _ = outwaited_tx.send(());
@@ -1592,7 +1560,7 @@ fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_
           peer,
           &server_identity,
           std::slice::from_ref(&client_cert),
-          FRAME_CAP,
+          shape(),
         )
         .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
@@ -1665,7 +1633,7 @@ fn an_issued_certificate_cannot_impersonate_another_leaf_under_the_same_authorit
         .unwrap();
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(client_port_rx).await);
       let mut endpoint =
-        Endpoint::server(socket, peer, &server_identity, &[authority], FRAME_CAP).unwrap();
+        Endpoint::server(socket, peer, &server_identity, &[authority], shape()).unwrap();
       let _ = endpoint.establish().await;
     })
     .unwrap();
@@ -1677,7 +1645,7 @@ fn an_issued_certificate_cannot_impersonate_another_leaf_under_the_same_authorit
         .unwrap();
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(server_port_rx).await);
       let mut endpoint =
-        Endpoint::client(socket, peer, &client_identity, &expected, NAME, FRAME_CAP).unwrap();
+        Endpoint::client(socket, peer, &client_identity, &expected, NAME, shape()).unwrap();
       result_tx.send(endpoint.establish().await).unwrap();
     })
     .unwrap();

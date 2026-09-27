@@ -103,6 +103,8 @@ use slates_db::register::{
 use slates_rt::futures;
 use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
+use slates_transport::congestion::ControllerKind;
+use slates_transport::connection::ConnectionShape;
 use slates_transport::demux::Demux;
 use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
@@ -1007,14 +1009,14 @@ pub async fn run_membership(transport: FleetTransport) {
       probe_socket,
       identity,
       allowed.clone(),
-      FLEET_FRAME_CAP,
+      fleet_shape(),
       peer_capacity,
     ),
     Demux::start(
       record_socket,
       identity,
       allowed,
-      FLEET_FRAME_CAP,
+      fleet_shape(),
       peer_capacity,
     ),
   ) else {
@@ -1180,7 +1182,14 @@ async fn client_for(
     }
   };
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-  Endpoint::client(socket, peer, identity, certificate, name, FLEET_FRAME_CAP).ok()
+  Endpoint::client(socket, peer, identity, certificate, name, fleet_shape()).ok()
+}
+
+/// The connection shape every fleet session is built with: the fleet frame cap, the derived receive
+/// ceiling (`DaemonConfig::fleet_session_receive_bytes`), and the session plane's congestion controller.
+fn fleet_shape() -> ConnectionShape {
+  let ceiling = state::with_state(|state| state.config.fleet_session_receive_bytes).unwrap_or(0);
+  ConnectionShape::for_frame_cap(FLEET_FRAME_CAP, ceiling, ControllerKind::NewReno)
 }
 
 /// The status refusal name for a failed name lookup: `fleet.resolve.<kind>` ([`dns::DnsError::kind`]).

@@ -25,6 +25,19 @@ use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 const LEADER: HostId = HostId(1);
 const VOTER: HostId = HostId(2);
 /// The two regions the root group starts with: `LOST` is the region that fails, `MIRROR` the one promoted to
@@ -125,7 +138,7 @@ fn run_distributed_promotion() -> Outcome {
         peer,
         &voter_identity,
         std::slice::from_ref(&leader_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       endpoint.establish().await.unwrap();
@@ -156,7 +169,7 @@ fn run_distributed_promotion() -> Outcome {
       let voter_port = recv_port(voter_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, voter_port);
       let mut endpoint =
-        Endpoint::client(socket, peer, &leader_identity, &voter_cert, NAME, FRAME_CAP).unwrap();
+        Endpoint::client(socket, peer, &leader_identity, &voter_cert, NAME, shape()).unwrap();
       endpoint.establish().await.unwrap();
 
       let mut leader = group(LEADER);

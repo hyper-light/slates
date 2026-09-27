@@ -1720,6 +1720,7 @@ dependencies = [
  "rustix",
  "rustls",
  "sha2",
+ "slates-machine",
  "slates-rt",
 ]
 

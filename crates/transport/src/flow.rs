@@ -19,21 +19,75 @@ use crate::session::Frame;
 
 /// The receive-side flow-control accounting: how far the application has consumed, per stream and for
 /// the connection, and the credit ceiling to advertise (consumed + a bounded window ahead).
+///
+/// The window auto-tunes (§4.10a §8 "BDP-autotuned"; the constrained-link design §5): it starts at the
+/// initial window both ends derive (R8) and doubles whenever the reader consumed a whole window in less
+/// than two round trips — the sign that the window, not the path, limited the transfer — up to the
+/// session's receive ceiling, the bound the daemon derives from its memory budget (Banned #8). The rule is
+/// Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize` [C]; the ceiling replaces Chromium's
+/// fixed maximum with a derived one (R3). Without it a session's window stayed at four frames — 4.8 kB,
+/// about 48 kB/s on a 100 ms path, whatever the congestion controller allowed.
 #[derive(Debug)]
 pub struct FlowController {
   window_ahead: u64,
+  /// The most the window may grow to (the session's receive budget).
+  ceiling: u64,
   connection_consumed: u64,
   stream_consumed: BTreeMap<u64, u64>,
+  /// The current tuning epoch: when it began and the connection's consumed bytes then.
+  epoch: Option<(u64, u64)>,
+  /// How many times the window has grown (the non-vacuity counter of the tuning path).
+  growths: u64,
 }
 
+/// Format: Chromium QUIC's auto-tuning trigger — a window consumed within two round trips.
+const AUTOTUNE_RTT_MULTIPLE: u64 = 2;
+/// Format: Chromium QUIC's auto-tuning step — the window doubles.
+const AUTOTUNE_GROWTH_FACTOR: u64 = 2;
+
 impl FlowController {
-  /// A controller advertising `window_ahead` bytes of credit beyond what the app has consumed.
-  pub fn new(window_ahead: u64) -> FlowController {
+  /// A controller advertising `window_ahead` bytes of credit beyond what the app has consumed, growing to
+  /// at most `ceiling` (never below the initial window).
+  pub fn new(window_ahead: u64, ceiling: u64) -> FlowController {
     FlowController {
       window_ahead,
+      ceiling: ceiling.max(window_ahead),
       connection_consumed: 0,
       stream_consumed: BTreeMap::new(),
+      epoch: None,
+      growths: 0,
     }
+  }
+
+  /// Auto-tunes the window at `now` given the smoothed RTT (see the type's doc): when a whole window has
+  /// been consumed since the epoch began, doubles it (up to the ceiling) if that took less than two round
+  /// trips, and starts a new epoch either way. Without an RTT sample nothing grows.
+  pub fn autotune(&mut self, now: u64, smoothed_rtt: Option<u64>) {
+    let (started, consumed_then) = *self.epoch.get_or_insert((now, self.connection_consumed));
+    if self.connection_consumed.saturating_sub(consumed_then) < self.window_ahead {
+      return;
+    }
+    if let Some(rtt) = smoothed_rtt
+      && now.saturating_sub(started) < rtt.saturating_mul(AUTOTUNE_RTT_MULTIPLE)
+      && self.window_ahead < self.ceiling
+    {
+      self.window_ahead = self
+        .window_ahead
+        .saturating_mul(AUTOTUNE_GROWTH_FACTOR)
+        .min(self.ceiling);
+      self.growths = self.growths.saturating_add(1);
+    }
+    self.epoch = Some((now, self.connection_consumed));
+  }
+
+  /// The current window (bytes ahead of consumed).
+  pub fn window(&self) -> u64 {
+    self.window_ahead
+  }
+
+  /// How many times the window has grown.
+  pub fn growths(&self) -> u64 {
+    self.growths
   }
 
   /// Forgets a completed stream's per-stream credit watermark, so a later stream that reuses the id
@@ -106,7 +160,7 @@ mod tests {
   /// The credit ceiling stays a fixed window ahead of what is consumed, never the whole object.
   #[test]
   fn credit_stays_a_window_ahead_of_consumed() {
-    let mut flow = FlowController::new(40);
+    let mut flow = FlowController::new(40, 40);
     assert_eq!(flow.stream_max(1), 40, "initial credit is one window");
     flow.on_stream_consumed(1, 100);
     assert_eq!(flow.stream_max(1), 140, "credit tracks consumed + window");
@@ -119,7 +173,7 @@ mod tests {
   /// never un-counts its bytes — the credit the sender relies on must not regress.
   #[test]
   fn connection_credit_sums_streams_and_never_regresses() {
-    let mut flow = FlowController::new(40);
+    let mut flow = FlowController::new(40, 40);
     assert_eq!(
       flow.connection_max(),
       40,
@@ -152,7 +206,7 @@ mod tests {
   /// stalling the connection-level credit ratchet (the bug the cluster's connection-reuse test caught).
   #[test]
   fn forgetting_a_stream_resets_its_watermark_but_keeps_the_connection_total() {
-    let mut flow = FlowController::new(40);
+    let mut flow = FlowController::new(40, 40);
     flow.on_stream_consumed(1, 100);
     assert_eq!(
       flow.stream_max(1),
@@ -204,7 +258,7 @@ mod tests {
     let mut source = StreamSender::new();
     source.write(&content);
     source.finish();
-    let flow = FlowController::new(WINDOW_AHEAD);
+    let flow = FlowController::new(WINDOW_AHEAD, WINDOW_AHEAD);
     let mut assembler = StreamAssembler::new(flow.stream_max(STREAM_ID));
     source.grant_credit(flow.stream_max(STREAM_ID));
 

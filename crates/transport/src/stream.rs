@@ -99,6 +99,18 @@ impl StreamSender {
     })
   }
 
+  /// Whether [`next_frame`](StreamSender::next_frame) would return a frame now: bytes within the credit
+  /// not yet framed, or the terminating `fin` due.
+  pub fn has_sendable(&self) -> bool {
+    let buffered = self.buffered.len() as u64;
+    let sendable_end = buffered.min(self.credit);
+    self.send_offset < sendable_end
+      || (self.finished
+        && !self.fin_framed
+        && self.send_offset == buffered
+        && self.send_offset <= self.credit)
+  }
+
   /// The absolute offset framed so far (bytes handed to `next_frame`).
   pub fn send_offset(&self) -> u64 {
     self.send_offset

@@ -36,11 +36,11 @@ use rustls::quic::{KeyChange, Keys};
 use slates_rt::futures::now_ns;
 use slates_rt::udp::UdpSocket;
 
-use crate::connection::{Connection, initial_receive_window};
+use crate::connection::{Connection, ConnectionShape};
 use crate::demux::{Demux, DemuxId, Slot, with_demux};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
-use crate::rtt::{GRANULARITY_NS, RttEstimator};
+use crate::rtt::GRANULARITY_NS;
 use crate::session::{Frame, decode_frames, encode_frames};
 
 /// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
@@ -148,11 +148,6 @@ const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
 /// Format: the exchange sequence the first exchange on a connection takes — one, so no exchange's stream
 /// id is ever the bare kind (sequence zero would make `exchange_stream_id(kind, 0) == kind`).
 const FIRST_EXCHANGE: u64 = 1;
-
-/// Format: the most doublings the probe-timeout backoff applies — enough that a timeout of the timer
-/// granularity (RFC 9002 §6.1.2, one millisecond) climbs past any initial PTO (`1 ms × 2^12 ≈ 4 s`), the
-/// ceiling the backed-off timeout is held under anyway; a shift no larger than this cannot overflow.
-const PTO_BACKOFF_SHIFT_CAP: u32 = 12;
 
 /// A refusal on the endpoint.
 #[derive(Debug)]
@@ -262,18 +257,15 @@ pub struct Endpoint {
   keys: Option<Keys>,
   /// The connection id, once derived from the completed handshake ([`Endpoint::connection_id`]).
   cid: Option<ConnectionId>,
+  /// The connection: streams, reliability, RTT, loss detection, congestion control, pacing and flow
+  /// control, driven on the runtime's clock — the clock every timeout below sleeps on, so under the
+  /// simulation driver a modelled path's delay is what the RTT measures
+  /// (`docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`).
   conn: Connection,
   rx_largest: u64,
   frame_cap: usize,
-  /// The RTT estimator (RFC 9002 §5.3), fed from this end's clock: when an acknowledgement newly frees
-  /// a packet, the round trip is `now` minus that packet's send time. Drives the probe timeout.
-  rtt: RttEstimator,
-  /// The send time of each ack-eliciting packet still awaiting acknowledgement, keyed by packet number,
-  /// for the RTT sample. Pruned as packets are acknowledged, so it stays within the in-flight window.
-  /// When each in-flight packet was sent, by packet number, on the runtime clock (nanoseconds) — the
-  /// clock the receive timeouts sleep on, so a sample is the path's round trip in the same time the probe
-  /// timeout is armed in.
-  send_times: BTreeMap<u64, u64>,
+  /// Whether the controller has been reseeded from the connection id (once, when it is first derived).
+  seeded: bool,
   /// A client's final handshake flight, kept after establishment: a raw handshake datagram arriving on
   /// an established session is a server still asking for it (its confirmation raced this end's exit
   /// from the handshake), and is answered by resending it. Empty on a server.
@@ -301,12 +293,6 @@ pub struct Endpoint {
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
   /// ran.
   discarded: u64,
-  /// Consecutive probe timeouts without an acknowledgement in between (RFC 9002 §6.2.1's PTO count):
-  /// each one doubles the next probe timeout, so a peer that has gone silent is retransmitted to at a
-  /// falling rate rather than every estimated round trip — on a loopback path a few hundred
-  /// microseconds, which would send thousands of retransmits a second into a dead port and starve the
-  /// shard's live sessions. Reset to zero by the next acknowledgement.
-  pto_count: u32,
   /// The exchange sequence the next [`request`](Endpoint::request) takes — one past the last allocated,
   /// so every exchange on this connection rides a fresh stream id ([`exchange_stream_id`]).
   next_exchange: u64,
@@ -336,14 +322,15 @@ impl Drop for Endpoint {
 
 impl Endpoint {
   /// The client end: presents its own `identity` (mutual authentication — the peer authenticates this
-  /// caller), pins the server's `pinned` certificate, talks to `peer` as `name`, framing at `frame_cap`.
+  /// caller), pins the server's `pinned` certificate, talks to `peer` as `name`, with the connection `shape`
+  /// (its frame cap, receive windows and congestion controller).
   pub fn client(
     socket: UdpSocket,
     peer: SocketAddrV4,
     identity: &Identity,
     pinned: &rustls::pki_types::CertificateDer<'static>,
     name: &str,
-    frame_cap: usize,
+    shape: ConnectionShape,
   ) -> Result<Endpoint, EndpointError> {
     let client = client_connection(identity, pinned, name).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
@@ -353,11 +340,10 @@ impl Endpoint {
       pinned: Some(pinned.clone()),
       keys: None,
       cid: None,
-      conn: Connection::new(initial_receive_window(frame_cap)),
+      conn: Connection::new(shape, now_ns(), 0),
       rx_largest: 0,
-      frame_cap,
-      rtt: RttEstimator::new(),
-      send_times: BTreeMap::new(),
+      frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+      seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
       reassembler: crate::flight::Reassembler::new(),
@@ -365,7 +351,6 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
-      pto_count: 0,
       next_exchange: FIRST_EXCHANGE,
       open_exchange: None,
       serve_floor: 0,
@@ -374,14 +359,14 @@ impl Endpoint {
   }
 
   /// The server end presenting `identity` and requiring a client certificate found among
-  /// `allowed_clients` (mutual authentication — it authenticates its caller), talking to `peer`,
-  /// framing at `frame_cap`.
+  /// `allowed_clients` (mutual authentication — it authenticates its caller), talking to `peer`, with the
+  /// connection `shape`.
   pub fn server(
     socket: UdpSocket,
     peer: SocketAddrV4,
     identity: &Identity,
     allowed_clients: &[rustls::pki_types::CertificateDer<'static>],
-    frame_cap: usize,
+    shape: ConnectionShape,
   ) -> Result<Endpoint, EndpointError> {
     let server = server_connection(identity, allowed_clients).map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
@@ -391,11 +376,10 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
-      conn: Connection::new(initial_receive_window(frame_cap)),
+      conn: Connection::new(shape, now_ns(), 0),
       rx_largest: 0,
-      frame_cap,
-      rtt: RttEstimator::new(),
-      send_times: BTreeMap::new(),
+      frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+      seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
       reassembler: crate::flight::Reassembler::new(),
@@ -403,7 +387,6 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
-      pto_count: 0,
       next_exchange: FIRST_EXCHANGE,
       open_exchange: None,
       serve_floor: 0,
@@ -424,7 +407,7 @@ impl Endpoint {
     on: &Demux,
   ) -> Result<Endpoint, EndpointError> {
     let server = on.server_connection().map_err(EndpointError::Handshake)?;
-    let frame_cap = on.frame_cap();
+    let shape = on.shape();
     Ok(Endpoint {
       link: Link::Shared { demux, slot },
       peer,
@@ -432,11 +415,10 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
-      conn: Connection::new(initial_receive_window(frame_cap)),
+      conn: Connection::new(shape, now_ns(), 0),
       rx_largest: 0,
-      frame_cap,
-      rtt: RttEstimator::new(),
-      send_times: BTreeMap::new(),
+      frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+      seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
       reassembler: crate::flight::Reassembler::new(),
@@ -444,7 +426,6 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
-      pto_count: 0,
       next_exchange: FIRST_EXCHANGE,
       open_exchange: None,
       serve_floor: 0,
@@ -470,6 +451,17 @@ impl Endpoint {
   /// the peer's certificate) in the demultiplexer, so the peer's packets route to this session — and
   /// replaces any session the same peer established before.
   pub fn connection_id(&mut self) -> Result<ConnectionId, EndpointError> {
+    let id = self.connection_id_inner()?;
+    if !self.seeded {
+      // The congestion controller's randomized timing is seeded from the session's connection id — unique
+      // per session and fixed once derived (see `ConnectionShape`).
+      self.seeded = true;
+      self.conn.reseed(u64::from_le_bytes(id));
+    }
+    Ok(id)
+  }
+
+  fn connection_id_inner(&mut self) -> Result<ConnectionId, EndpointError> {
     if let Some(cid) = self.cid {
       return Ok(cid);
     }
@@ -529,13 +521,13 @@ impl Endpoint {
   /// The smoothed round-trip time this end has estimated (nanoseconds), zero before any acknowledgement
   /// yields a sample (RFC 9002 §5.3). A live exchange feeds it through [`Endpoint::ingest`].
   pub fn smoothed_rtt(&self) -> u64 {
-    self.rtt.smoothed_rtt()
+    self.conn.rtt().smoothed_rtt()
   }
 
   /// The probe timeout this end would arm to recover a tail loss (RFC 9002 §6.2.1), from the estimated
   /// RTT; before any sample, twice the initial RTT. (Driving a timed receive from it is owed.)
   pub fn pto(&self) -> u64 {
-    self.rtt.pto(0)
+    self.conn.rtt().pto(0)
   }
 
   /// The next packet number the connection will assign — its packet-number cursor, monotonic across
@@ -640,7 +632,8 @@ impl Endpoint {
       // LAN commit to recover a dropped packet within its budget. A coalesced or split flight (or one that
       // followed a retransmit) makes this an approximation, which is all a seed needs to be.
       if let Some(flight) = sent_at.take() {
-        self.rtt.on_sample(now_ns().saturating_sub(flight), 0);
+        let now = now_ns();
+        self.conn.seed_rtt(now.saturating_sub(flight), now);
       }
       // The reassembler remembers this flight, so a peer retransmit of it rebuilds to `Repeat` above
       // rather than being fed to `read_hs` a second time.
@@ -949,12 +942,9 @@ impl Endpoint {
   fn flush(&mut self) -> Result<(), EndpointError> {
     let cid = self.connection_id()?;
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    while let Some((pn, frames)) = self.conn.poll_transmit(self.frame_cap) {
+    while let Some((pn, frames)) = self.conn.poll_transmit(now_ns(), self.frame_cap) {
       let datagram = protect_packet(keys, &cid, pn, self.conn.tx_largest_acked(), &frames)?;
       self.send(&datagram)?;
-      // Record the send time for the RTT sample; pruned when the packet is acknowledged. A pure
-      // acknowledgement packet's entry is never sampled and is swept when a later packet is acknowledged.
-      self.send_times.insert(pn, now_ns());
     }
     Ok(())
   }
@@ -1024,68 +1014,42 @@ impl Endpoint {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     let (pn, frames) = unprotect_packet(keys, &cid, self.rx_largest, datagram)?;
     self.rx_largest = self.rx_largest.max(pn);
-    if let Some(largest) = self.conn.handle_incoming(pn, &frames) {
-      // An acknowledgement ends a run of probe timeouts: the next timeout starts from the estimate again.
-      self.pto_count = 0;
-      if let Some(sent_at) = self.send_times.get(&largest) {
-        // This dialect does not carry the peer's reported ack delay yet, so it is zero.
-        self.rtt.on_sample(now.saturating_sub(*sent_at), 0);
-      }
-      // Prune the send times the acknowledgement covered, bounding the map to the in-flight window.
-      self.send_times.retain(|&sent_pn, _| sent_pn > largest);
-    }
+    self.conn.handle_incoming(now, pn, &frames);
     Ok(())
-  }
-
-  /// The probe timeout to arm a stalled reliable exchange against (RFC 9002 §6.2.1), from this end's RTT
-  /// estimator; before any sample it is twice the initial RTT, so a lost first packet is still recovered.
-  /// This dialect carries no peer ack-delay, so the max-ack-delay term is zero.
-  fn probe_timeout(&self) -> u64 {
-    self.rtt.pto(0)
   }
 
   /// The ceiling on the exponential-backoff retransmit interval *during the handshake* — the conservative
   /// initial PTO, not the estimated one. The first flight's round trip seeds a smoothed RTT that, on a
-  /// loopback or same-host peer, is a few microseconds, dropping [`probe_timeout`](Endpoint::probe_timeout)
+  /// loopback or same-host peer, is a few microseconds, dropping the probe timeout
   /// to about the timer granularity; capping the handshake's retry there would exhaust its retransmit
   /// budget in tens of milliseconds and abandon a peer whose shard is momentarily busy establishing the
   /// rest of a mesh. Establishing a connection stays patient against the initial PTO instead (RFC 9002
-  /// §6.2.2), while the post-handshake reliable exchanges still arm against the true estimate.
+  /// §6.2.2), while the post-handshake reliable exchanges arm against the connection's own timers.
   fn handshake_probe_ceiling(&self) -> u64 {
-    self.rtt.initial_pto()
+    self.conn.rtt().initial_pto()
   }
 
-  /// Waits for the next packet within the probe timeout; on a timeout, drives tail-loss recovery by probing
-  /// the oldest in-flight packet ([`Connection::probe`]) so the caller's next flush retransmits it. The
-  /// reliable exchanges call this in place of a bare receive, so a lost packet or a lost acknowledgement —
-  /// which a real datagram socket can drop and which no later acknowledgement would expose — cannot stall
-  /// them. A probe with nothing in flight is a no-op, so a timeout while merely waiting on the peer is free.
-  /// This wait is not self-bounded: a reliable exchange retransmits until it completes or its **caller**
-  /// stops it (the fleet probe races it against a deadline and cancels it — [`crate::endpoint`] callers own
-  /// the bound), which is what a peer that dies mid-exchange relies on to not strand the loop.
+  /// Waits for the next packet until the connection's next timer (the loss timer, the probe timeout, or
+  /// the pacer's release — [`Connection::next_timeout`]), then acts on any timer that fell due
+  /// ([`Connection::on_timeout`]): a loss declared, a probe owed, or paced data released — which the
+  /// caller's next flush sends. The reliable exchanges call this in place of a bare receive, so a lost
+  /// packet or a lost acknowledgement — which a real datagram socket can drop and which no later
+  /// acknowledgement would expose — cannot stall them. With no timer pending (nothing in flight, nothing
+  /// paced) the wait is the conservative initial PTO: an idle session wakes a few times a second, not
+  /// thousands, and the re-drive stays the safety net against a missed readiness wake. This wait is not
+  /// self-bounded: a reliable exchange retransmits until it completes or its **caller** stops it (the
+  /// fleet probe races it against a deadline and cancels it), which is what a peer that dies mid-exchange
+  /// relies on to not strand the loop.
   async fn receive_or_probe(&mut self) -> Result<(), EndpointError> {
-    // The probe timer is armed only while ack-eliciting packets are in flight (RFC 9002 §6.2.1): an idle
-    // session — a server between requests, a client between exchanges — has nothing to retransmit, so it
-    // waits at the conservative initial PTO instead of the estimated one, which on a loopback path is
-    // a few hundred microseconds and would wake every idle session thousands of times a second, starving
-    // the live exchanges on a busy shard. The long idle re-drive stays as the safety net against a
-    // missed readiness wake.
-    // With packets in flight the timeout backs off exponentially over consecutive expirations (RFC 9002
-    // §6.2.1: "the PTO period MUST be set to twice its current value" after each one), climbing from the
-    // estimate up to the conservative initial PTO the estimator started from — so a peer that has gone
-    // silent is retransmitted to a few times per second, not a few thousand.
-    let timeout = if self.conn.in_flight_count() == 0 {
-      self.rtt.initial_pto()
-    } else {
-      let doublings = 1u64 << self.pto_count.min(PTO_BACKOFF_SHIFT_CAP);
-      self
-        .probe_timeout()
-        .saturating_mul(doublings)
-        .min(self.rtt.initial_pto())
-    };
-    if !self.receive_and_ingest(timeout).await? {
-      self.conn.probe();
-      self.pto_count = self.pto_count.saturating_add(1);
+    let now = now_ns();
+    let timeout = self
+      .conn
+      .next_timeout()
+      .map_or(self.conn.rtt().initial_pto(), |due| due.saturating_sub(now));
+    let _ = self.receive_and_ingest(timeout).await?;
+    let now = now_ns();
+    if self.conn.next_timeout().is_some_and(|due| due <= now) {
+      self.conn.on_timeout(now);
     }
     Ok(())
   }
@@ -1118,7 +1082,7 @@ impl Endpoint {
       // Drain *before* flushing: reading slides the flow-control window forward, and the flush that
       // follows advertises credit reflecting what was just read. Flushing first would advertise a
       // round-stale window and stall a transfer larger than one window at the window boundary.
-      received.extend_from_slice(&self.conn.read_stream(stream_id));
+      received.extend_from_slice(&self.conn.read_stream(now_ns(), stream_id));
       self.flush()?;
       if self.conn.recv_stream_complete(stream_id) {
         self.conn.forget_stream(stream_id);
@@ -1159,8 +1123,8 @@ impl Endpoint {
       // drained, then flushed: the flush sends the request (opened above, still credited) and the
       // acknowledgement whose piggybacked credit reflects the reply bytes just read — so a reply larger
       // than one window keeps flowing. Flushing before the drain would advertise a round-stale window.
-      self.conn.discard_streams_below(stream_id);
-      reply.extend_from_slice(&self.conn.read_stream(stream_id));
+      self.conn.discard_streams_below(now_ns(), stream_id);
+      reply.extend_from_slice(&self.conn.read_stream(now_ns(), stream_id));
       self.flush()?;
       if self.conn.recv_stream_complete(stream_id) {
         self.conn.forget_stream(stream_id);
@@ -1236,7 +1200,7 @@ impl Endpoint {
       if let Some(id) = self.newest_complete_request() {
         let request = self.pending_requests.remove(&id).unwrap_or_default();
         self.serve_floor = id.saturating_add(1);
-        self.conn.discard_streams_below(self.serve_floor);
+        self.conn.discard_streams_below(now_ns(), self.serve_floor);
         self
           .pending_requests
           .retain(|&pending_id, _| pending_id >= self.serve_floor);
@@ -1279,9 +1243,9 @@ impl Endpoint {
   /// window forward, so a request larger than one window keeps flowing — and a request that arrives while
   /// a reply is still awaiting its acknowledgement can complete.
   fn drain_requests(&mut self) {
-    self.conn.discard_streams_below(self.serve_floor);
+    self.conn.discard_streams_below(now_ns(), self.serve_floor);
     for id in self.conn.recv_stream_ids() {
-      let chunk = self.conn.read_stream(id);
+      let chunk = self.conn.read_stream(now_ns(), id);
       if !chunk.is_empty() {
         self
           .pending_requests
@@ -1530,7 +1494,11 @@ mod tests {
             &identity,
             &identity.certificate(),
             "slates-node",
-            MIN_DATAGRAM_BYTES,
+            crate::connection::ConnectionShape::for_frame_cap(
+              MIN_DATAGRAM_BYTES,
+              crate::connection::initial_receive_window(MIN_DATAGRAM_BYTES),
+              crate::congestion::ControllerKind::NewReno,
+            ),
           )
           .unwrap();
           let mut server = Endpoint::server(
@@ -1538,7 +1506,11 @@ mod tests {
             client_address,
             &identity,
             &[identity.certificate()],
-            MIN_DATAGRAM_BYTES,
+            crate::connection::ConnectionShape::for_frame_cap(
+              MIN_DATAGRAM_BYTES,
+              crate::connection::initial_receive_window(MIN_DATAGRAM_BYTES),
+              crate::congestion::ControllerKind::NewReno,
+            ),
           )
           .unwrap();
           // Run the real TLS state machine synchronously to isolate confirmation from flight delivery.

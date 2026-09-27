@@ -29,11 +29,19 @@ const PTO_RTTVAR_MULTIPLIER: u64 = 4;
 /// Format: RFC 9002 §6.2.1 — before any RTT sample, the PTO is twice the initial RTT. A protocol
 /// constant (the "2 ×" of `2 * kInitialRtt`).
 const INITIAL_PTO_MULTIPLIER: u64 = 2;
+/// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the numerator. A protocol constant.
+const TIME_THRESHOLD_NUMERATOR: u64 = 9;
+/// Format: RFC 9002 §6.1.2 `kTimeThreshold` = 9/8, the denominator. A protocol constant.
+const TIME_THRESHOLD_DENOMINATOR: u64 = 8;
+/// Format: RFC 9002 §7.6.1 `kPersistentCongestionThreshold` = 3. A protocol constant.
+const PERSISTENT_CONGESTION_THRESHOLD: u64 = 3;
 
 /// The sender's RTT estimator (RFC 9002 §5.3): the minimum RTT seen, the smoothed RTT, and its
 /// variation, all in nanoseconds, plus whether a sample has been taken yet.
 #[derive(Debug, Default)]
 pub struct RttEstimator {
+  /// The most recent RTT sample (RFC 9002 §5.1's `latest_rtt`), the loss delay's other operand.
+  latest_rtt: u64,
   /// The smallest RTT sample seen (RFC 9002 §5.2), the ack-delay-removal floor.
   min_rtt: u64,
   /// The smoothed RTT (the exponential average).
@@ -56,6 +64,7 @@ impl RttEstimator {
   /// is removed from the sample only when doing so keeps it at or above the minimum RTT, so a spuriously
   /// large reported delay cannot drag the estimate below the path's floor.
   pub fn on_sample(&mut self, latest: u64, ack_delay: u64) {
+    self.latest_rtt = latest;
     self.min_rtt = if self.have_sample {
       self.min_rtt.min(latest)
     } else {
@@ -113,6 +122,50 @@ impl RttEstimator {
   /// The smoothed RTT (nanoseconds), for the connection's diagnostics and assertions.
   pub fn smoothed_rtt(&self) -> u64 {
     self.smoothed_rtt
+  }
+
+  /// The smoothed RTT, or the initial RTT (RFC 9002 §6.2.2 `kInitialRtt`) before any sample — the value a
+  /// rate derived from the RTT uses before the path has been measured.
+  pub fn smoothed_rtt_or_initial(&self) -> u64 {
+    if self.have_sample {
+      self.smoothed_rtt
+    } else {
+      INITIAL_RTT_NS
+    }
+  }
+
+  /// Whether any sample has been taken.
+  pub fn has_sample(&self) -> bool {
+    self.have_sample
+  }
+
+  /// The most recent sample (nanoseconds); zero before any.
+  pub fn latest_rtt(&self) -> u64 {
+    self.latest_rtt
+  }
+
+  /// The time-threshold loss delay (RFC 9002 §6.1.2): `kTimeThreshold × max(smoothed_rtt, latest_rtt)`,
+  /// at least the timer granularity — a packet sent that long before a later one was acknowledged is
+  /// lost. Before any sample, the initial RTT stands in.
+  pub fn loss_delay(&self) -> u64 {
+    let base = if self.have_sample {
+      self.smoothed_rtt.max(self.latest_rtt)
+    } else {
+      INITIAL_RTT_NS
+    };
+    base
+      .saturating_mul(TIME_THRESHOLD_NUMERATOR)
+      .div_ceil(TIME_THRESHOLD_DENOMINATOR)
+      .max(GRANULARITY_NS)
+  }
+
+  /// The persistent-congestion duration (RFC 9002 §7.6.1): the probe timeout (`smoothed_rtt +
+  /// max(4 · rttvar, granularity) + max_ack_delay`) times `kPersistentCongestionThreshold` — how long a
+  /// span of losses with nothing acknowledged must last before it means the path is gone, not merely lossy.
+  pub fn persistent_congestion_duration(&self, max_ack_delay: u64) -> u64 {
+    self
+      .pto(max_ack_delay)
+      .saturating_mul(PERSISTENT_CONGESTION_THRESHOLD)
   }
 
   /// The RTT variation (nanoseconds).

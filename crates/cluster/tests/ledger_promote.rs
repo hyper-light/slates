@@ -32,6 +32,19 @@ use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 const OBJECT: ObjectId = ObjectId::new(DEAD, 7);
 // The dead owner D and its two candidate holders (D, H2, H3 at f = 1). Two records committed under the
 // old owner: r0 to {D, H2, H3} and r1 to {D, H2}. So H2 holds the whole log [r0, r1]; H3 lagged and holds
@@ -160,7 +173,7 @@ fn run_promotion() -> Outcome {
         peer,
         &holder_identity,
         std::slice::from_ref(&successor_cert),
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       endpoint.establish().await.unwrap();
@@ -184,7 +197,7 @@ fn run_promotion() -> Outcome {
         &successor_identity,
         &holder_cert,
         NAME,
-        FRAME_CAP,
+        shape(),
       )
       .unwrap();
       endpoint.establish().await.unwrap();

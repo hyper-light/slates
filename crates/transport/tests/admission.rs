@@ -21,6 +21,19 @@ use slates_transport::handshake::Identity;
 const NAME: &str = "session-fairness";
 /// Shape: a short request fits in one frame; fragmentation is covered by session.rs.
 const FRAME_CAP: usize = 16;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 /// Shape: two distinct identities compete; the third dial belongs to the first identity.
 const PEERS: usize = 2;
 /// Shape: the first peer's live endpoint, its replacement, and one excess attempt.
@@ -111,7 +124,7 @@ impl Harness {
     let certificate = identity.certificate();
     let identity = slates_rt::registry::with_current(|context| context.keep(identity)).unwrap();
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let demux = Demux::start(socket, identity, allowed, FRAME_CAP, PEERS).unwrap();
+    let demux = Demux::start(socket, identity, allowed, shape(), PEERS).unwrap();
     let task = futures::spawn(async move {
       demux.run().await.unwrap();
     })
@@ -128,7 +141,7 @@ impl Harness {
       identity,
       &self.certificate,
       NAME,
-      FRAME_CAP,
+      shape(),
     )
     .unwrap();
     let (dialed, (server, accepted)) = together(client.establish(), async {
@@ -153,7 +166,7 @@ impl Harness {
       identity,
       &self.certificate,
       NAME,
-      FRAME_CAP,
+      shape(),
     )
     .unwrap()
   }

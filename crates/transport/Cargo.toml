@@ -21,6 +21,9 @@ rustls = { workspace = true }
 slates-rt = { workspace = true }
 # Address types for the UDP edge (via rustix::net, not std::net — the host-path wall's guard).
 rustix = { workspace = true }
+# The seeded xorshift generator the congestion controller's randomized probe timing draws from (the
+# same generator the runtime's simulation uses; already in the build through slates-rt).
+slates-machine = { workspace = true }
 
 [dev-dependencies]
 # Generative hostile-input fuzzing of the wire parsers (the hostile-input rule; D-20).

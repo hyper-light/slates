@@ -31,6 +31,19 @@ use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
 const FRAME_CAP: usize = 16;
+/// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
+/// room for the tuning path to run without any test holding more than a few kilobytes.
+const RECEIVE_CEILING_WINDOWS: u64 = 64;
+
+/// The connection shape every test session is built with: the frame cap, a ceiling of
+/// [`RECEIVE_CEILING_WINDOWS`] initial windows, and the session plane's controller.
+fn shape() -> slates_transport::connection::ConnectionShape {
+  slates_transport::connection::ConnectionShape::for_frame_cap(
+    FRAME_CAP,
+    RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
+    slates_transport::congestion::ControllerKind::NewReno,
+  )
+}
 const SURVIVOR: HostId = HostId(1);
 const DEAD: HostId = HostId(2);
 const GOSSIP_FANOUT: usize = 8;
@@ -126,7 +139,7 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
       let peer_port = recv_port(survivor_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer_port);
       let mut endpoint =
-        Endpoint::server(socket, peer, &dead_identity, &[survivor_cert], FRAME_CAP).unwrap();
+        Endpoint::server(socket, peer, &dead_identity, &[survivor_cert], shape()).unwrap();
       if endpoint.establish().await.is_ok() {
         // Handshaken, now silent: stay alive (socket open) across the survivor's one probe — long enough
         // that the probe times out because no `serve_probe` ever answers — then exit so the sim reaches
@@ -148,15 +161,9 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
       let dead_port = recv_port(dead_port_rx).await;
       let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, dead_port);
       let outcome = async {
-        let mut endpoint = Endpoint::client(
-          socket,
-          peer,
-          &survivor_identity,
-          &dead_cert,
-          NAME,
-          FRAME_CAP,
-        )
-        .map_err(|e| format!("{e:?}"))?;
+        let mut endpoint =
+          Endpoint::client(socket, peer, &survivor_identity, &dead_cert, NAME, shape())
+            .map_err(|e| format!("{e:?}"))?;
         endpoint.establish().await.map_err(|e| format!("{e:?}"))?;
 
         // The owner runtime: f=1 with the dead peer as its one neighbour, backing the peer's objects.
