@@ -91,7 +91,8 @@ authorized merely by appearing here.
   attribute operation over the v3 layer, 18 tests by use including a session surviving its
   connection. The daemon serves it: v4 state on the listener's shard, each operation routed to the
   owner shard, bounds derived at boot; a v4.2 client writes a volume on another shard and NFSv3 reads
-  it back. Next: a Linux kernel `vers=4.1`/`4.2` mount in CI, then locks, persisted state and the v4.2
+  it back. The Linux kernel's v4.1 and v4.2 clients mount it and run ordinary file calls through it
+  (`tests/nfs_v4_kernel.rs`, in the Linux CI lane). Next: locks, persisted state and the v4.2
   operations.
 - [x] **The watcher workloads assumed their watcher was live after a one-second sleep** (CI 36281600448:
   the macOS runner's host watcher missed the creation the mount's observed). Both forms now observe

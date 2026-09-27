@@ -474,6 +474,11 @@ jobs:
         run: |
           cargo build -p slates-cli
           SLATES_TEST_BINARY="$GITHUB_WORKSPACE/target/debug/slates" cargo test -p xtask conformance:: -- --test-threads=1 --nocapture
+      # The Linux kernel's own NFSv4.1 and NFSv4.2 clients against the daemon (§4.6 A-35): mount,
+      # ordinary file calls through the mount, and an NFSv3 read-back of what the kernel wrote.
+      - name: Linux kernel NFSv4.1/4.2 client
+        if: runner.os == 'Linux'
+        run: SLATES_TEST_RAMDIR=/dev/shm SLATES_TEST_NFS4_KERNEL=1 cargo test -p slates-server --test nfs_v4_kernel -- --nocapture
       # `--keep` leaves the scratch in place so pjdfstest's per-file TAP output survives the run: the
       # expected-failure list's own header names this lane's root run as the review input, and the
       # summary record cannot say which assertion failed with what. The output directory is uploaded

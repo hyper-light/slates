@@ -1702,9 +1702,13 @@ therefore one implementation shared by both versions.
   - over an `Export` and over a real socket (`crates/bridge-nfs/tests/v4.rs`, 11 tests;
     `tests/v4_session.rs`, 8);
   - through the daemon, where a v4.2 client writes a volume on another shard and NFSv3 reads the same
-    bytes back (`crates/server/tests/nfs_mount.rs`).
+    bytes back (`crates/server/tests/nfs_mount.rs`);
+  - by the Linux kernel's own NFSv4.1 and NFSv4.2 clients (`crates/server/tests/nfs_v4_kernel.rs`, run
+    in the Linux CI lane). The kernel mounts through the capability, and its table confirms the minor
+    version negotiated. Create, write, append, mkdir, rename, symlink, hard link, truncate, list and
+    remove run through the mount, and NFSv3 reads back what the kernel wrote. Verified 2026-09-26 in a
+    privileged Linux container (io_uring driver).
   Owed:
-  - a Linux kernel `vers=4.1`/`4.2` mount in CI;
   - locks;
   - the persisted and replicated open state;
   - the v4.2 operations (RFC 7862 SEEK, READ_PLUS, ALLOCATE, DEALLOCATE, COPY, CLONE, IO_ADVISE;
