@@ -292,10 +292,14 @@ fn with_export<R>(
   // request in flight and closes the mount's generation with the others. The subject is the attachment
   // record's principal, never the request's uid.
   let admitted = admit_mount(s, volume, capability, rights)?;
+  if s.nfs_v4_files.is_none() {
+    s.nfs_v4_files = Some(v4_file_state(s));
+  }
   let ShardState {
     store,
     volumes,
     attachments,
+    nfs_v4_files,
     ..
   } = s;
   let slot = volumes.get_mut(handle).ok()?;
@@ -314,6 +318,9 @@ fn with_export<R>(
   // learn its unstable writes were lost and re-send them.
   export.set_write_verifier(write_verifier);
   export.set_capability(capability);
+  if let Some(files) = nfs_v4_files.as_mut() {
+    export.lend_file_state(files);
+  }
   let served = f(&mut export);
   drop(export);
   attachments.end(admitted);
@@ -355,6 +362,14 @@ fn admit_mount(
 fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
   if program != NFS_PROGRAM || !nfs_ok(results) {
     return false;
+  }
+  // A state-carrying I/O (A-36) is its NFSv3 procedure behind a state status: with the state clear,
+  // the inner result and the NFSv3 arguments (a prefix of the call's) decide as the plain call would.
+  if let Some(inner) = slates_bridge_nfs::procedures::state_io_inner(procedure) {
+    let Some(inner_results) = results.get(size_of::<u32>()..) else {
+      return false;
+    };
+    return needs_barrier(program, inner, args, inner_results);
   }
   match procedure {
     NFSPROC3_WRITE => {
@@ -1166,8 +1181,7 @@ const NO_CAPABILITY: MountCapability = (0, [0u8; 16]);
 fn v4_server(s: &ShardState) -> V4Server {
   let caps = s.config.nfs_v4;
   let size = slates_bridge_nfs::procedures::MAX_TRANSFER + compound::COMPOUND_HEADER_BYTES;
-  let boot = u32::try_from((s.booted_ns ^ (s.booted_ns >> u32::BITS)) & u64::from(u32::MAX))
-    .unwrap_or(u32::MAX);
+  let boot = v4_boot(s);
   V4Server::new(
     boot,
     Limits {
@@ -1186,6 +1200,21 @@ fn v4_server(s: &ShardState) -> V4Server {
     caps.opens,
     caps.locks,
   )
+}
+
+/// This shard's NFSv4 file state (§4.6 A-36), its state ids tagged with the shard's partition and the
+/// boot instance (so ids from two owners, or from before a restart, never collide), bounded as the
+/// listener's index is (`config::nfs_v4_caps`).
+fn v4_file_state(s: &ShardState) -> slates_bridge_nfs::v4::files::FileState {
+  let caps = s.config.nfs_v4;
+  let tag = slates_bridge_nfs::v4::files::owner_tag(s.partition, v4_boot(s));
+  slates_bridge_nfs::v4::files::FileState::new(tag, caps.opens, caps.locks)
+}
+
+/// The boot instance NFSv4 ids carry: the boot instant folded to 32 bits.
+fn v4_boot(s: &ShardState) -> u32 {
+  u32::try_from((s.booted_ns ^ (s.booted_ns >> u32::BITS)) & u64::from(u32::MAX))
+    .unwrap_or(u32::MAX)
 }
 
 /// One parsed RPC call, its data owned so the read buffer can drain while the call is served. A

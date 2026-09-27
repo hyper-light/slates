@@ -557,6 +557,8 @@ pub struct OwnedVolumeSet {
   store: Store,
   volumes: Vec<OwnedVolume>,
   appledouble_views: bool,
+  /// The NFSv4 file state of the set's files (§4.6 A-36), lent to each transient export.
+  files: crate::v4::files::FileState,
 }
 
 impl OwnedVolumeSet {
@@ -566,6 +568,7 @@ impl OwnedVolumeSet {
       store,
       volumes: Vec::new(),
       appledouble_views: true,
+      files: crate::v4::files::FileState::standalone(),
     }
   }
 
@@ -589,11 +592,13 @@ impl OwnedVolumeSet {
     f: impl FnOnce(&mut Export<'_>) -> R,
   ) -> Option<R> {
     let store = &mut self.store;
+    let files = &mut self.files;
     let slot = self.volumes.iter_mut().find(|v| v.id == volume)?;
     let mut bridge = VolumeBridge::new(volume, &mut slot.volume, store);
     let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
     export.set_groups(groups);
     export.set_appledouble_views(self.appledouble_views);
+    export.lend_file_state(files);
     Some(f(&mut export))
   }
 }

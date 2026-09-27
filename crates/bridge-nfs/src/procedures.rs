@@ -34,6 +34,9 @@ use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 use slates_vfs::xattr::XattrSet;
 
+use crate::v4::files::FileState;
+use crate::v4::types::Stateid;
+
 use crate::access::{self, Caller, Denial, UnixGroups, Want};
 use crate::handle::{FileHandle, FileHandleError};
 use crate::mount::{MountReply, Mountstat3};
@@ -114,6 +117,61 @@ pub mod extension {
   /// Format: remove an extended attribute (RFC 8276 REMOVEXATTR). Arguments: the file handle and the
   /// name. Result: the status.
   pub const XATTR_REMOVE: u32 = 1028;
+
+  // The file state procedures (§4.6 A-36): the NFSv4 opens and locks of a file, kept at its owner
+  // (`crate::v4::files`). Each takes the file handle and the client id the listener's session names,
+  // then its own arguments; each result opens with an NFSv4 status word (every NFSv3 status the
+  // routing returns has the same value in NFSv4).
+
+  /// Format: record an open. Arguments: the open-owner (opaque), the share access and deny (`u32`
+  /// each). Result: the status, then the open's state id.
+  pub const STATE_OPEN: u32 = 1040;
+  /// Format: close an open. Arguments: its state id. Result: the status, then the advanced state id,
+  /// then the count and each `other` (12 bytes) the owner no longer holds.
+  pub const STATE_CLOSE: u32 = 1041;
+  /// Format: narrow an open's share. Arguments: its state id, then the share access and deny. Result:
+  /// the status, then the advanced state id.
+  pub const STATE_DOWNGRADE: u32 = 1042;
+  /// Format: LOCK. Arguments: the client's `LOCK4args` as sent. Result: the status, then the lock state
+  /// id, or on `NFS4ERR_DENIED` the `LOCK4denied`.
+  pub const STATE_LOCK: u32 = 1043;
+  /// Format: LOCKT. Arguments: the client's `LOCKT4args` as sent. Result: the status, then on
+  /// `NFS4ERR_DENIED` the `LOCK4denied`.
+  pub const STATE_LOCKT: u32 = 1044;
+  /// Format: LOCKU. Arguments: the client's `LOCKU4args` as sent. Result: the status, then the advanced
+  /// lock state id.
+  pub const STATE_LOCKU: u32 = 1045;
+  /// Format: TEST_STATEID of one state id. Arguments: the state id. Result: its status.
+  pub const STATE_TEST: u32 = 1046;
+  /// Format: FREE_STATEID. Arguments: the state id. Result: the status, then the count and each
+  /// `other` the owner no longer holds.
+  pub const STATE_FREE: u32 = 1047;
+  /// Format: drop all of a client's state at this owner. Arguments: none beyond the handle and client.
+  /// Result: the status.
+  pub const STATE_PURGE: u32 = 1048;
+  /// Format: whether a state id may serve I/O on the file. Arguments: the state id. Result: its status.
+  pub const STATE_CHECK: u32 = 1049;
+  /// Format: a READ under a state id. Arguments: the NFSv3 READ arguments, then the client id and the
+  /// state id. Result: the state status, then (when it is OK) the NFSv3 READ result.
+  pub const READ_STATE: u32 = 1050;
+  /// Format: a WRITE under a state id, laid out as [`READ_STATE`] over the NFSv3 WRITE.
+  pub const WRITE_STATE: u32 = 1051;
+  /// Format: a SETATTR under a state id, laid out as [`READ_STATE`] over the NFSv3 SETATTR.
+  pub const SETATTR_STATE: u32 = 1052;
+}
+
+/// Format: the bytes a state-carrying I/O procedure appends to its NFSv3 arguments: the client id (8)
+/// and a state id (a 4-byte seqid and its 12-byte `other`).
+pub const STATE_SUFFIX_BYTES: usize = 8 + 4 + crate::v4::types::OTHER_SIZE;
+
+/// The NFSv3 procedure a state-carrying I/O extension wraps, or `None` for any other procedure.
+pub fn state_io_inner(procedure: u32) -> Option<u32> {
+  match procedure {
+    extension::READ_STATE => Some(NFSPROC3_READ),
+    extension::WRITE_STATE => Some(NFSPROC3_WRITE),
+    extension::SETATTR_STATE => Some(NFSPROC3_SETATTR),
+    _ => None,
+  }
 }
 
 /// Format: XATTR_SET's `how` values, RFC 8276's `setxattr_option4`.
@@ -301,6 +359,9 @@ pub struct Export<'b> {
   /// removing or renaming one never touches another file's attributes. On by default (the macOS loopback
   /// mount); the connection that knows its client sets it ([`Self::set_appledouble_views`]).
   appledouble_views: bool,
+  /// The NFSv4 file state of the files this export serves (§4.6 A-36): its own for a standalone export,
+  /// or the owner shard's, lent for the request ([`Self::lend_file_state`]).
+  files: FileSlot<'b>,
   /// The mount capability every handle this export mints carries (§4.13; AUD-01): the attachment id
   /// and its token the daemon validated for this request, so a client's later request self-authorizes
   /// through the handle it holds — the root handle at `MNT`, and every child handle a `LOOKUP`,
@@ -344,6 +405,7 @@ impl<'b> Export<'b> {
       },
       write_verifier: fsid,
       appledouble_views: true,
+      files: FileSlot::Owned(Box::new(FileState::standalone())),
       capability: (0, [0u8; 16]),
     })
   }
@@ -377,6 +439,7 @@ impl<'b> Export<'b> {
       },
       write_verifier: fsid,
       appledouble_views: true,
+      files: FileSlot::Owned(Box::new(FileState::standalone())),
       capability: (0, [0u8; 16]),
     }
   }
@@ -402,6 +465,26 @@ impl<'b> Export<'b> {
   /// instances of the NFS version 3 protocol server, where uncommitted data may be lost").
   pub fn set_write_verifier(&mut self, verifier: [u8; size_of::<u64>()]) {
     self.write_verifier = verifier;
+  }
+
+  /// Lends the owner shard's NFSv4 file state to this export for the request (§4.6 A-36).
+  pub fn lend_file_state(&mut self, files: &'b mut FileState) {
+    self.files = FileSlot::Lent(files);
+  }
+
+  /// The NFSv4 file state this export serves.
+  pub fn file_states(&self) -> &FileState {
+    match &self.files {
+      FileSlot::Owned(files) => files,
+      FileSlot::Lent(files) => files,
+    }
+  }
+
+  fn file_states_mut(&mut self) -> &mut FileState {
+    match &mut self.files {
+      FileSlot::Owned(files) => files,
+      FileSlot::Lent(files) => files,
+    }
   }
 
   /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33).
@@ -593,6 +676,10 @@ impl<'b> Export<'b> {
       | extension::XATTR_SET
       | extension::XATTR_LIST
       | extension::XATTR_REMOVE => Some(self.xattr(procedure, args)),
+      extension::READ_STATE | extension::WRITE_STATE | extension::SETATTR_STATE => {
+        Some(self.state_io(procedure, args))
+      }
+      extension::STATE_OPEN..=extension::STATE_CHECK => Some(self.file_state(procedure, args)),
       _ => None,
     }
   }
@@ -803,6 +890,81 @@ impl<'b> Export<'b> {
       .seek(object, &cx, offset, data)
       .map_err(|e| nfsstat_of(&e))?;
     Ok((found, node.size))
+  }
+
+  /// A state-carrying I/O extension (§4.6 A-36): the client id and state id trail the NFSv3
+  /// arguments; the state id is checked against the file's state here at the owner, and the NFSv3
+  /// procedure is then served over the same argument bytes. The result is the state status, then (when
+  /// it is OK) the NFSv3 result.
+  pub fn state_io(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    let bytes = args.rest();
+    let Some((v3_args, suffix)) = bytes
+      .len()
+      .checked_sub(STATE_SUFFIX_BYTES)
+      .map(|split| bytes.split_at(split))
+    else {
+      writer.u32(crate::v4::Nfsstat4::Badxdr.wire());
+      return writer.into_bytes();
+    };
+    let mut suffix = XdrReader::new(suffix);
+    let (Ok(clientid), Ok(stateid)) = (suffix.u64(), Stateid::decode(&mut suffix)) else {
+      writer.u32(crate::v4::Nfsstat4::Badxdr.wire());
+      return writer.into_bytes();
+    };
+    let Ok(handle) = Nfsfh3::decode(&mut XdrReader::new(v3_args)) else {
+      writer.u32(crate::v4::Nfsstat4::Badhandle.wire());
+      return writer.into_bytes();
+    };
+    if let Err(status) = self.file_states().check_io(&stateid, &handle, clientid) {
+      writer.u32(status.wire());
+      return writer.into_bytes();
+    }
+    let inner = state_io_inner(procedure).unwrap_or(NFSPROC3_NULL);
+    writer.u32(crate::v4::Nfsstat4::Ok.wire());
+    let served = self
+      .serve_nfs(inner, &mut XdrReader::new(v3_args))
+      .unwrap_or_default();
+    writer.fixed(&served);
+    writer.into_bytes()
+  }
+
+  /// A file state extension (§4.6 A-36): the open or lock operation run on this owner's file state.
+  pub fn file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    match self.file_state_result(procedure, args) {
+      Ok(body) => {
+        writer.u32(crate::v4::Nfsstat4::Ok.wire());
+        writer.fixed(&body);
+      }
+      Err(crate::v4::files::LockRefused::Denied(denied)) => {
+        writer.u32(crate::v4::Nfsstat4::Denied.wire());
+        writer.fixed(&denied.encode());
+      }
+      Err(crate::v4::files::LockRefused::Status(status)) => writer.u32(status.wire()),
+    }
+    writer.into_bytes()
+  }
+
+  fn file_state_result(
+    &mut self,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
+    use crate::v4::Nfsstat4;
+    let bad = |_| Nfsstat4::Badxdr;
+    let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat4::Badhandle)?;
+    let clientid = args.u64().map_err(bad)?;
+    let files = self.file_states_mut();
+    match procedure {
+      extension::STATE_OPEN | extension::STATE_CLOSE | extension::STATE_DOWNGRADE => {
+        open_state(files, procedure, &handle, clientid, args)
+      }
+      extension::STATE_LOCK | extension::STATE_LOCKT | extension::STATE_LOCKU => {
+        lock_state(files, procedure, &handle, clientid, args)
+      }
+      _ => other_state(files, procedure, &handle, clientid, args),
+    }
   }
 
   /// The extended attribute extensions (A-35, RFC 8276): get, set, list and remove, on a regular file
@@ -2177,8 +2339,19 @@ pub fn is_unstable(stable_how: u32) -> bool {
 /// arms: `wcc_data` for SETATTR, WRITE, CREATE, MKDIR, SYMLINK, MKNOD, REMOVE, RMDIR and COMMIT;
 /// two `wcc_data` for RENAME; a `post_op_attr` and a `wcc_data` for LINK.
 pub fn io_failure_reply(procedure: u32) -> Option<Vec<u8>> {
+  // A state-carrying I/O extension (A-36) answers its state status (clear) around the NFSv3 failure.
+  if let Some(inner) = state_io_inner(procedure) {
+    let mut writer = XdrWriter::new();
+    writer.u32(0);
+    writer.fixed(&io_failure_reply(inner)?);
+    return Some(writer.into_bytes());
+  }
   let mut writer = XdrWriter::new();
   Nfsstat3::Io.encode(&mut writer);
+  // The attribute extensions (A-35) answer a bare status.
+  if matches!(procedure, extension::XATTR_SET | extension::XATTR_REMOVE) {
+    return Some(writer.into_bytes());
+  }
   match procedure {
     NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
     | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
@@ -2351,4 +2524,120 @@ enum XattrReply {
   Names(Vec<Box<[u8]>>),
   /// Nothing more (set, remove).
   Done,
+}
+
+/// Where an export's NFSv4 file state lives: its own (a standalone export), or the owner shard's, lent
+/// for one request.
+enum FileSlot<'b> {
+  Owned(Box<FileState>),
+  Lent(&'b mut FileState),
+}
+
+/// Appends the state ids an owner no longer holds: a count, then each `other`.
+fn encode_gone(body: &mut XdrWriter, gone: &[crate::v4::lock::Other]) {
+  body.u32(u32::try_from(gone.len()).unwrap_or(u32::MAX));
+  for other in gone {
+    body.fixed(other);
+  }
+}
+
+/// OPEN, CLOSE and OPEN_DOWNGRADE state at the owner (§4.6 A-36): the result body.
+fn open_state(
+  files: &mut FileState,
+  procedure: u32,
+  handle: &Nfsfh3,
+  clientid: u64,
+  args: &mut XdrReader<'_>,
+) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
+  use crate::v4::Nfsstat4;
+  use crate::v4::files::Share;
+  let bad = |_| Nfsstat4::Badxdr;
+  let mut body = XdrWriter::new();
+  match procedure {
+    extension::STATE_OPEN => {
+      let owner = args
+        .opaque(crate::v4::types::OPAQUE_LIMIT)
+        .map_err(bad)?
+        .to_vec();
+      let share = Share {
+        access: args.u32().map_err(bad)?,
+        deny: args.u32().map_err(bad)?,
+      };
+      files
+        .open(clientid, owner, handle, share)?
+        .encode(&mut body);
+    }
+    extension::STATE_CLOSE => {
+      let stateid = Stateid::decode(args).map_err(bad)?;
+      let released = files.close(&stateid, handle, clientid)?;
+      released.stateid.encode(&mut body);
+      encode_gone(&mut body, &released.gone);
+    }
+    _ => {
+      let stateid = Stateid::decode(args).map_err(bad)?;
+      let share = Share {
+        access: args.u32().map_err(bad)?,
+        deny: args.u32().map_err(bad)?,
+      };
+      files
+        .downgrade(&stateid, handle, clientid, share)?
+        .encode(&mut body);
+    }
+  }
+  Ok(body.into_bytes())
+}
+
+/// LOCK, LOCKT and LOCKU at the owner (§4.6 A-36), on the client's arguments as sent: the result body.
+fn lock_state(
+  files: &mut FileState,
+  procedure: u32,
+  handle: &Nfsfh3,
+  clientid: u64,
+  args: &mut XdrReader<'_>,
+) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
+  use crate::v4::files::{LockRequest, lock_op};
+  let opnum = match procedure {
+    extension::STATE_LOCK => lock_op::LOCK,
+    extension::STATE_LOCKT => lock_op::LOCKT,
+    _ => lock_op::LOCKU,
+  };
+  let request = LockRequest::decode(opnum, args)?;
+  let mut body = XdrWriter::new();
+  if let Some(stateid) = files.lock(request, handle, clientid)? {
+    stateid.encode(&mut body);
+  }
+  Ok(body.into_bytes())
+}
+
+/// TEST_STATEID, FREE_STATEID, a client's purge, and an I/O check at the owner (§4.6 A-36): the result
+/// body.
+fn other_state(
+  files: &mut FileState,
+  procedure: u32,
+  handle: &Nfsfh3,
+  clientid: u64,
+  args: &mut XdrReader<'_>,
+) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
+  use crate::v4::Nfsstat4;
+  let bad = |_| Nfsstat4::Badxdr;
+  let mut body = XdrWriter::new();
+  match procedure {
+    extension::STATE_PURGE => files.purge(clientid),
+    extension::STATE_TEST => {
+      let stateid = Stateid::decode(args).map_err(bad)?;
+      let status = files.test(&stateid.other, clientid);
+      if status != Nfsstat4::Ok {
+        return Err(status.into());
+      }
+    }
+    extension::STATE_FREE => {
+      let stateid = Stateid::decode(args).map_err(bad)?;
+      encode_gone(&mut body, &files.free(&stateid.other, clientid)?.gone);
+    }
+    _ => {
+      let stateid = Stateid::decode(args).map_err(bad)?;
+      files.check_io(&stateid, handle, clientid)?;
+    }
+  }
+  Ok(body.into_bytes())
 }

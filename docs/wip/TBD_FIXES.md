@@ -95,7 +95,8 @@ authorized merely by appearing here.
   (`tests/nfs_v4_kernel.rs`, in the Linux CI lane). Byte-range locks are served (the kernel's `flock`
   across two open files conflicts and is granted after the unlock). The v4.2 SEEK, READ_PLUS, COPY
   and IO_ADVISE are served (the kernel's `SEEK_HOLE` finds a mid-file hole through the server). Next:
-  persisted and replicated state, DEALLOCATE (a volume change). RFC 8276 extended attributes are
+  persisted and replicated state, DEALLOCATE (a volume change). File state (opens, locks) now lives
+  at the file's owner (A-36): two listeners serving one volume share one lock table. RFC 8276 extended attributes are
   served (the kernel's `user.` attributes round-trip); `xattr_support` had been reported before they
   were, now true in fact.
 - [x] **A v4 LOOKUP/CREATE of `._name` reached the macOS AppleDouble view** (A-33), because the v4

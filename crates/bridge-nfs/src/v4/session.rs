@@ -155,6 +155,9 @@ pub struct Sessions {
   clients: BTreeMap<u64, Client>,
   owners: BTreeMap<Vec<u8>, u64>,
   sessions: BTreeMap<SessionId, Session>,
+  /// The clients dropped since the last [`Sessions::take_dropped`], whose state the owners must drop
+  /// too; never more than the client table held.
+  dropped: Vec<u64>,
 }
 
 impl Sessions {
@@ -168,6 +171,7 @@ impl Sessions {
       clients: BTreeMap::new(),
       owners: BTreeMap::new(),
       sessions: BTreeMap::new(),
+      dropped: Vec::new(),
     }
   }
 
@@ -434,6 +438,12 @@ impl Sessions {
       for sessionid in client.sessions {
         self.sessions.remove(&sessionid);
       }
+      self.dropped.push(clientid);
     }
+  }
+
+  /// The clients dropped (replaced, expired or destroyed) since the last call.
+  pub fn take_dropped(&mut self) -> Vec<u64> {
+    std::mem::take(&mut self.dropped)
   }
 }

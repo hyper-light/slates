@@ -234,21 +234,19 @@ type LockKey = (Vec<u8>, u64, Vec<u8>);
 pub struct LockTable {
   max_ranges: usize,
   next: u64,
-  boot: u32,
+  tag: crate::v4::files::OwnerTag,
   table: BTreeMap<Other, LockState>,
   by_owner: BTreeMap<LockKey, Other>,
 }
 
-/// Format: the bit that marks a lock state id's counter, so lock and open state ids never collide.
-const LOCK_ID_BIT: u64 = 1 << 63;
-
 impl LockTable {
-  /// An empty table for server instance `boot`, holding at most `max_ranges` ranges and states.
-  pub fn new(boot: u32, max_ranges: usize) -> LockTable {
+  /// An empty table for the owner named by `tag` (`crate::v4::files::owner_tag`), holding at most
+  /// `max_ranges` ranges and states.
+  pub fn new(tag: crate::v4::files::OwnerTag, max_ranges: usize) -> LockTable {
     LockTable {
       max_ranges,
       next: 1,
-      boot,
+      tag,
       table: BTreeMap::new(),
       by_owner: BTreeMap::new(),
     }
@@ -309,9 +307,7 @@ impl LockTable {
     if self.charge() >= self.max_ranges {
       return Err(Nfsstat4::Delay);
     }
-    let mut other = [0u8; OTHER_SIZE];
-    other[..8].copy_from_slice(&(LOCK_ID_BIT | self.next).to_be_bytes());
-    other[8..].copy_from_slice(&self.boot.to_be_bytes());
+    let other = crate::v4::files::mint(crate::v4::files::LOCK_ID_BIT | self.next, self.tag);
     self.next = self.next.saturating_add(1);
     self.table.insert(
       other,
@@ -392,8 +388,8 @@ impl LockTable {
       .any(|state| state.open == *open && !state.ranges.is_empty())
   }
 
-  /// Drops the lock states created from the open `open` (none of which holds a lock).
-  pub fn drop_under(&mut self, open: &Other) {
+  /// Drops the lock states created from the open `open` (none of which holds a lock): the ids dropped.
+  pub fn drop_under(&mut self, open: &Other) -> Vec<Other> {
     let gone: Vec<Other> = self
       .table
       .iter()
@@ -403,6 +399,7 @@ impl LockTable {
     for other in &gone {
       self.drop_state(other);
     }
+    gone
   }
 
   /// `FREE_STATEID` of a lock state: `NFS4ERR_LOCKS_HELD` while it holds a lock (§18.38.3).

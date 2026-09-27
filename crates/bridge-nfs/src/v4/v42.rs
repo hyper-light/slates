@@ -20,7 +20,7 @@
 
 use super::Nfsstat4;
 use super::compound::{
-  Backend, Frame, Outcome, attrs_of, change_info, check_open_kind, check_stateid, current, op, v3,
+  Backend, Frame, Outcome, attrs_of, change_info, check_open_kind, check_state, current, op, v3,
 };
 use super::types::{Bitmap, Stateid};
 use super::v3call;
@@ -85,7 +85,7 @@ async fn seek<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   };
   let fh = current(frame)?.clone();
   check_open_kind(backend, &fh).await?;
-  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
+  check_state(backend, &fh, frame.clientid, &stateid).await?;
   let (found, at, size) = seek_in(backend, &fh, offset, data).await?;
   if offset >= size {
     return Err(Nfsstat4::Nxio);
@@ -111,7 +111,7 @@ async fn read_plus<B: Backend>(
   let count = reader.u32().map_err(bad)?;
   let fh = current(frame)?.clone();
   check_open_kind(backend, &fh).await?;
-  backend.with_v4(|server| check_stateid(server, &stateid, &fh, frame.clientid))??;
+  check_state(backend, &fh, frame.clientid, &stateid).await?;
   let size = attrs_of(backend, &fh).await?.size;
   let budget = usize::try_from(backend.with_v4(|server| server.limits().offer.max_response)?)
     .unwrap_or(usize::MAX);
@@ -224,15 +224,14 @@ async fn copy<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
       .await
       .map_err(|_| Nfsstat4::WrongType)?;
   }
-  backend.with_v4(|server| {
-    check_stateid(server, &request.source_stateid, &source, frame.clientid)?;
-    check_stateid(
-      server,
-      &request.destination_stateid,
-      &destination,
-      frame.clientid,
-    )
-  })??;
+  check_state(backend, &source, frame.clientid, &request.source_stateid).await?;
+  check_state(
+    backend,
+    &destination,
+    frame.clientid,
+    &request.destination_stateid,
+  )
+  .await?;
   let size = attrs_of(backend, &source).await?.size;
   let count = if request.count == 0 {
     size.saturating_sub(request.source_offset)

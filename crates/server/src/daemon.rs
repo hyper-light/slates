@@ -2085,6 +2085,8 @@ fn init_shard(
     write_verifier: now.to_be_bytes(),
     #[cfg(unix)]
     nfs_v4: None,
+    #[cfg(unix)]
+    nfs_v4_files: None,
     db,
     fleet,
     durability_shortfall,

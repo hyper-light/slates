@@ -505,7 +505,11 @@ fn a_client_opens_writes_reads_closes_and_lists_a_file() {
   stateid.encode(&mut args);
   let reply = Client::call(&mut service, &mut server, args.as_slice());
   assert_eq!(reply.status, Nfsstat4::Ok.wire(), "CLOSE");
-  assert_eq!(server.open_count(), 0, "the close released the open");
+  assert_eq!(
+    (service.file_states().open_count(), server.indexed_states()),
+    (0, 0),
+    "the close released the open at the owner and in the index"
+  );
 
   let names = list_root(&mut client, &mut service, &mut server);
   assert_eq!(
@@ -658,7 +662,7 @@ fn a_reopen_by_the_same_owner_shares_one_state_id_and_close_releases_it() {
   .unwrap();
   assert_eq!(second.other, first.other, "one state id per owner and file");
   assert_eq!(second.seqid, first.seqid + 1, "the upgrade advances it");
-  assert_eq!(server.open_count(), 1);
+  assert_eq!(service.file_states().open_count(), 1);
 
   assert_eq!(
     read(&mut client, &mut service, &mut server, &fh, first),
@@ -676,7 +680,7 @@ fn a_reopen_by_the_same_owner_shares_one_state_id_and_close_releases_it() {
     Client::call(&mut service, &mut server, args.as_slice()).status,
     Nfsstat4::Ok.wire()
   );
-  assert_eq!(server.open_count(), 0);
+  assert_eq!(service.file_states().open_count(), 0);
   assert_eq!(
     read(&mut client, &mut service, &mut server, &fh, second),
     Err(Nfsstat4::BadStateid.wire())
@@ -893,7 +897,7 @@ fn a_lapsed_client_makes_room_and_its_opens_go_with_it() {
     DENY_NONE,
   )
   .unwrap();
-  assert_eq!(lapsing.open_count(), 1);
+  assert_eq!(service.file_states().open_count(), 1);
   // At exactly one lease since its last request the client still holds its place.
   NOW_NS.with(|now| now.set(now.get() + LEASE_NS));
   let mut refused = frame(1, 1);
@@ -915,7 +919,11 @@ fn a_lapsed_client_makes_room_and_its_opens_go_with_it() {
     1,
     "the lapsed client made room"
   );
-  assert_eq!(lapsing.open_count(), 0, "and its open went with it");
+  assert_eq!(
+    service.file_states().open_count(),
+    0,
+    "and its open went with it, at the owner"
+  );
 }
 
 /// Hostile compounds are refused with a status, never a panic: truncated arguments, a length word of
@@ -1359,7 +1367,7 @@ fn a_lock_conflicts_with_another_owner_and_holds_its_open() {
     Nfsstat4::Ok.wire()
   );
   assert_eq!(
-    server.lock_state_count(),
+    service.file_states().lock_state_count(),
     0,
     "the lock states went with the open"
   );

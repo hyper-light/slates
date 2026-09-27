@@ -165,6 +165,11 @@ pub struct ShardState {
   /// that serves no v4 call.
   #[cfg(unix)]
   pub nfs_v4: Option<slates_bridge_nfs::v4::compound::Server>,
+  /// The NFSv4 file state of the files this shard owns (§4.6 A-36): their opens and locks, whichever
+  /// listener or connection made them, created with the first v4 state call under the configuration's
+  /// derived bounds.
+  #[cfg(unix)]
+  pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership

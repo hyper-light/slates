@@ -1112,6 +1112,7 @@ fn hex16(bytes: &[u8; 16]) -> String {
 /// A hand-rolled NFSv4 client over one connection: its session, and slot 0's sequence.
 struct V4Client {
   stream: TcpStream,
+  clientid: u64,
   sessionid: [u8; 16],
   sequence: u32,
   xid: u32,
@@ -1178,10 +1179,16 @@ impl V4Client {
 
   /// EXCHANGE_ID and CREATE_SESSION over a new connection to `port`.
   fn connect(port: u16) -> V4Client {
+    V4Client::connect_as(port, b"v4-test-host")
+  }
+
+  /// EXCHANGE_ID for the client owner `owner`, then CREATE_SESSION, over a new connection to `port`.
+  fn connect_as(port: u16, owner: &[u8]) -> V4Client {
     use slates_bridge_nfs::v4::types::ChannelAttrs;
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     let mut client = V4Client {
       stream: TcpStream::connect(("127.0.0.1", port)).unwrap(),
+      clientid: 0,
       sessionid: [0; 16],
       sequence: 0,
       xid: 0,
@@ -1189,7 +1196,7 @@ impl V4Client {
     let mut ops = XdrWriter::new();
     ops.u32(OP_EXCHANGE_ID);
     ops.fixed(&[1; 8]);
-    ops.opaque(b"v4-test-host");
+    ops.opaque(owner);
     ops.u32(0);
     ops.u32(0);
     ops.u32(0);
@@ -1198,6 +1205,7 @@ impl V4Client {
     let mut reader = XdrReader::new(&results);
     reader.fixed(8).unwrap();
     let clientid = reader.u64().unwrap();
+    client.clientid = clientid;
     let sequenceid = reader.u32().unwrap();
     let mut ops = XdrWriter::new();
     ops.u32(OP_CREATE_SESSION);
@@ -1376,4 +1384,118 @@ fn remote_volume_name(client: &mut Client) -> String {
     }
   }
   panic!("no volume provisioned on a non-control shard");
+}
+
+/// Format: `OP_LOCK` and `NFS4ERR_DENIED` / `NFS4ERR_LOCKS_HELD` (RFC 7863).
+const OP_LOCK: u32 = 12;
+const NFS4ERR_DENIED: u32 = 10010;
+const NFS4ERR_LOCKS_HELD: u32 = 10037;
+
+impl V4Client {
+  /// PUTROOTFH, LOOKUP of the capability component, OPEN (creating, unchecked) of `name` for this
+  /// client's open-owner, GETFH: the open's state id and the file handle.
+  fn open(
+    &mut self,
+    component: &str,
+    name: &str,
+  ) -> (slates_bridge_nfs::v4::types::Stateid, Vec<u8>) {
+    use slates_bridge_nfs::v4::types::{Bitmap, Stateid};
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTROOTFH);
+    ops.u32(OP_LOOKUP);
+    ops.opaque(component.as_bytes());
+    ops.u32(OP_OPEN);
+    ops.u32(0);
+    ops.u32(3);
+    ops.u32(0);
+    ops.u64(0);
+    ops.opaque(b"open-owner");
+    ops.u32(1); // OPEN4_CREATE
+    ops.u32(0); // UNCHECKED4
+    Bitmap::of(&[]).encode(&mut ops);
+    ops.opaque(&[]);
+    ops.u32(0); // CLAIM_NULL
+    ops.opaque(name.as_bytes());
+    ops.u32(OP_GETFH);
+    let (status, results) = self.sequenced(4, ops.as_slice());
+    assert_eq!(status, NFS4_OK, "OPEN");
+    let mut reader = XdrReader::new(&results);
+    reader.fixed(8 + 8 + 8).unwrap();
+    let stateid = Stateid::decode(&mut reader).unwrap();
+    reader.fixed(4 + 8 + 8 + 4).unwrap();
+    Bitmap::decode(&mut reader).unwrap();
+    reader.u32().unwrap();
+    reader.fixed(8).unwrap();
+    (stateid, reader.opaque(128).unwrap().to_vec())
+  }
+
+  /// PUTFH `fh`, LOCK a write lock on `offset..offset+length` for the new lock-owner `owner` under
+  /// the open `open`: the status and the lock operation's body.
+  fn write_lock(
+    &mut self,
+    fh: &[u8],
+    open: slates_bridge_nfs::v4::types::Stateid,
+    (offset, length): (u64, u64),
+    owner: &[u8],
+  ) -> (u32, Vec<u8>) {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_LOCK);
+    ops.u32(2); // WRITE_LT
+    ops.bool(false);
+    ops.u64(offset);
+    ops.u64(length);
+    ops.bool(true);
+    ops.u32(0);
+    open.encode(&mut ops);
+    ops.u32(0);
+    ops.u64(0);
+    ops.opaque(owner);
+    let (status, results) = self.sequenced(2, ops.as_slice());
+    (status, results.get(8 + 8..).unwrap_or_default().to_vec())
+  }
+}
+
+/// §4.6 A-36: a file's opens and locks live at its owner, so two NFSv4 clients reach the same lock
+/// table whichever shard their listener is on. Over a volume on another shard, client A's write lock is
+/// granted; client B's overlapping lock is `NFS4ERR_DENIED`, naming A's client and range; and A's open
+/// cannot close while its lock is held (`NFS4ERR_LOCKS_HELD`).
+#[test]
+fn two_nfsv4_clients_meet_one_lock_table_at_the_files_owner() {
+  use slates_bridge_nfs::xdr::XdrReader;
+  let (daemon, instance) = two_shard_daemon("nfsv4locks");
+  let mut client = Client::connect(&instance);
+  let name = remote_volume_name(&mut client);
+  let component = capability_path(&daemon, &name)
+    .trim_start_matches('/')
+    .to_owned();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut a = V4Client::connect_as(port, b"host-a");
+  let mut b = V4Client::connect_as(port, b"host-b");
+  let (open_a, fh) = a.open(&component, "shared.db");
+  let (open_b, fh_b) = b.open(&component, "shared.db");
+  assert_eq!(fh, fh_b, "both opened the same file");
+
+  let (status, _) = a.write_lock(&fh, open_a, (0, 10), b"a-locker");
+  assert_eq!(status, NFS4_OK, "A's lock is granted");
+  let (status, denied) = b.write_lock(&fh, open_b, (5, 1), b"b-locker");
+  assert_eq!(status, NFS4ERR_DENIED, "B meets A's lock at the owner");
+  let mut denied = XdrReader::new(&denied);
+  assert_eq!((denied.u64().unwrap(), denied.u64().unwrap()), (0, 10));
+  denied.u32().unwrap();
+  assert_eq!(denied.u64().unwrap(), a.clientid, "the holder is A");
+
+  let mut ops = slates_bridge_nfs::xdr::XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(&fh);
+  ops.u32(OP_CLOSE);
+  ops.u32(0);
+  open_a.encode(&mut ops);
+  assert_eq!(a.sequenced(2, ops.as_slice()).0, NFS4ERR_LOCKS_HELD);
+
+  drop((a, b, client));
+  drop(daemon);
 }

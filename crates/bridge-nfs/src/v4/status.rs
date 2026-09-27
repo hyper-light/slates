@@ -178,6 +178,11 @@ impl Nfsstat4 {
     self as u32
   }
 
+  /// The status a wire value names; `None` for a value `nfsstat4` does not define.
+  pub fn from_wire(value: u32) -> Option<Nfsstat4> {
+    ALL.iter().copied().find(|status| status.wire() == value)
+  }
+
   /// The v4 status for a v3 status the semantic layer answered with: the POSIX values carry over; a
   /// v3-only one maps to its v4 meaning.
   pub fn of_v3(status: Nfsstat3) -> Nfsstat4 {
@@ -208,3 +213,88 @@ impl Nfsstat4 {
     }
   }
 }
+
+/// Every status this enum defines, for [`Nfsstat4::from_wire`].
+const ALL: [Nfsstat4; 81] = [
+  Nfsstat4::Ok,
+  Nfsstat4::Perm,
+  Nfsstat4::Noent,
+  Nfsstat4::Io,
+  Nfsstat4::Nxio,
+  Nfsstat4::Access,
+  Nfsstat4::Exist,
+  Nfsstat4::Xdev,
+  Nfsstat4::Notdir,
+  Nfsstat4::Isdir,
+  Nfsstat4::Inval,
+  Nfsstat4::Fbig,
+  Nfsstat4::Nospc,
+  Nfsstat4::Rofs,
+  Nfsstat4::Mlink,
+  Nfsstat4::Nametoolong,
+  Nfsstat4::Notempty,
+  Nfsstat4::Dquot,
+  Nfsstat4::Stale,
+  Nfsstat4::Badhandle,
+  Nfsstat4::BadCookie,
+  Nfsstat4::Notsupp,
+  Nfsstat4::Toosmall,
+  Nfsstat4::Serverfault,
+  Nfsstat4::Badtype,
+  Nfsstat4::Delay,
+  Nfsstat4::Same,
+  Nfsstat4::Denied,
+  Nfsstat4::Expired,
+  Nfsstat4::Locked,
+  Nfsstat4::Grace,
+  Nfsstat4::ShareDenied,
+  Nfsstat4::Wrongsec,
+  Nfsstat4::ClidInuse,
+  Nfsstat4::Resource,
+  Nfsstat4::Nofilehandle,
+  Nfsstat4::MinorVersMismatch,
+  Nfsstat4::StaleClientid,
+  Nfsstat4::StaleStateid,
+  Nfsstat4::OldStateid,
+  Nfsstat4::BadStateid,
+  Nfsstat4::BadSeqid,
+  Nfsstat4::NotSame,
+  Nfsstat4::LockRange,
+  Nfsstat4::Symlink,
+  Nfsstat4::Restorefh,
+  Nfsstat4::Attrnotsupp,
+  Nfsstat4::NoGrace,
+  Nfsstat4::Badxdr,
+  Nfsstat4::LocksHeld,
+  Nfsstat4::Openmode,
+  Nfsstat4::Badowner,
+  Nfsstat4::Badchar,
+  Nfsstat4::Badname,
+  Nfsstat4::BadRange,
+  Nfsstat4::LockNotsupp,
+  Nfsstat4::OpIllegal,
+  Nfsstat4::Deadlock,
+  Nfsstat4::FileOpen,
+  Nfsstat4::Badsession,
+  Nfsstat4::Badslot,
+  Nfsstat4::CompleteAlready,
+  Nfsstat4::ConnNotBoundToSession,
+  Nfsstat4::SeqMisordered,
+  Nfsstat4::SequencePos,
+  Nfsstat4::ReqTooBig,
+  Nfsstat4::RepTooBig,
+  Nfsstat4::RepTooBigToCache,
+  Nfsstat4::RetryUncachedRep,
+  Nfsstat4::TooManyOps,
+  Nfsstat4::OpNotInSession,
+  Nfsstat4::ClientidBusy,
+  Nfsstat4::SeqFalseRetry,
+  Nfsstat4::BadHighSlot,
+  Nfsstat4::Deadsession,
+  Nfsstat4::NotOnlyOp,
+  Nfsstat4::WrongCred,
+  Nfsstat4::WrongType,
+  Nfsstat4::Noxattr,
+  Nfsstat4::Xattr2big,
+  Nfsstat4::UnionNotsupp,
+];
