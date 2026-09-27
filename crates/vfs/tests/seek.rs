@@ -83,6 +83,12 @@ fn a_gap_between_writes_is_found_as_a_hole() {
   vol.write(&mut store, file, 0, b"head").unwrap();
   vol.write(&mut store, file, SPAN, b"tail").unwrap();
   let hole = vol.seek(&store, file, 0, Seek::Hole).unwrap().unwrap();
-  assert!((4..SPAN).contains(&hole), "a hole between the writes: {hole}");
-  assert_eq!(vol.seek(&store, file, hole, Seek::Data).unwrap(), Some(SPAN));
+  assert!(
+    (4..SPAN).contains(&hole),
+    "a hole between the writes: {hole}"
+  );
+  assert_eq!(
+    vol.seek(&store, file, hole, Seek::Data).unwrap(),
+    Some(SPAN)
+  );
 }
