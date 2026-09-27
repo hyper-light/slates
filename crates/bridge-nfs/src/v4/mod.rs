@@ -25,9 +25,13 @@
 //! Evidence: RFC 8881 (NFSv4.1), RFC 7862 (NFSv4.2) and RFC 7863 (its XDR), read 2026-09-26; the
 //! numbers here are transcribed from RFC 7863's XDR.
 
+pub mod attr;
+pub mod backend;
+pub mod compound;
 pub mod session;
 pub mod status;
 pub mod types;
+pub mod v3call;
 
 pub use status::Nfsstat4;
 

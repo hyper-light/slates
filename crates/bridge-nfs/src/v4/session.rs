@@ -185,6 +185,11 @@ impl Sessions {
       // The client rebooted: its old record and sessions go (§18.35.5 case 5).
       self.drop_client(clientid);
     }
+    // Expiry is lazy (a courteous server, RFC 8881 §8.3): a lapsed client keeps its state until the
+    // table is full, when every lapsed client makes room before a new one is refused.
+    if self.clients.len() >= self.limits.max_clients {
+      self.expire(now_ns);
+    }
     if self.clients.len() >= self.limits.max_clients {
       return Err(Nfsstat4::Resource);
     }
@@ -393,6 +398,11 @@ impl Sessions {
   /// The fore channel a session negotiated.
   pub fn fore_channel(&self, sessionid: &SessionId) -> Option<ChannelAttrs> {
     self.sessions.get(sessionid).map(|session| session.fore)
+  }
+
+  /// Whether the table holds `clientid`.
+  pub fn holds_client(&self, clientid: u64) -> bool {
+    self.clients.contains_key(&clientid)
   }
 
   /// How many clients the table holds.

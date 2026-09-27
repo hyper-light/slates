@@ -205,7 +205,8 @@ fn spawn_two_volume_server() -> (u16, std::thread::JoinHandle<()>) {
     assert_eq!(multi.len(), 2);
 
     if let Ok((mut stream, _)) = listener.accept() {
-      serve_connection(&mut stream, &mut multi, port);
+      let mut v4 = slates_bridge_nfs::v4::compound::Server::standalone();
+      serve_connection(&mut stream, &mut multi, &mut v4, port);
     }
   });
   (port, server)

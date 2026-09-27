@@ -86,7 +86,11 @@ authorized merely by appearing here.
   table, and OCI binds are proven by the bound mount point (A-34). See
   `docs/bugs/2026-09-26-the-mount-capability-was-world-readable.md`.
 - [ ] **NFSv4.1/4.2 server** (the direction in §4.6: one server, several versions; pNFS flexfiles;
-  RPC-over-TLS; bounded, sharded and replicated open state). Next: its design amendment, then build.
+  RPC-over-TLS; bounded, sharded and replicated open state). The front end is designed (A-35) and
+  built: sessions, the slot cache, open state with share reservations, and every file, directory and
+  attribute operation over the v3 layer, 18 tests by use including a session surviving its
+  connection. Next: the daemon's routing to the owner shard with derived limits, then a Linux kernel
+  `vers=4.1`/`4.2` mount in CI, then locks, persisted state and the v4.2 operations.
 - [x] **The fleet test's session hold raced the link's discovery page** (36275755772, macOS gates). The
   hold now waits for the session as a forward does and reports a typed outcome. See
   `docs/bugs/2026-09-26-a-session-hold-raced-its-own-link.md`.

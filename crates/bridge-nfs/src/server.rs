@@ -14,7 +14,7 @@ use crate::mount::{
 };
 use crate::multi::NfsService;
 use crate::portmap::{PMAPPROC_GETPORT, PMAPPROC_NULL, PORTMAP_PROGRAM, getport_reply};
-use crate::procedures::NFS_PROGRAM;
+use crate::procedures::{NFS_PROGRAM, NFS_VERSION as NFS_V3};
 use crate::rpc::{AcceptStatus, RecordReader, parse_call};
 use crate::xdr::{XdrReader, XdrWriter};
 use crate::{reply_bytes, write_record};
@@ -33,9 +33,12 @@ const RECORD_READ_CHUNK: usize = 1 << 16;
 /// `GETPORT` (this server serves every program on one port). Public so a multi-shard daemon can run it
 /// both on the accepting shard (for a local volume) and, over the cross-shard bridge queue, on the
 /// owning shard (for a remote one) — the same engine either place.
+/// NFS calls are served for version 3 here; version 4 is the caller's to serve first
+/// ([`crate::v4`]), and any other version is refused `PROG_MISMATCH` naming the served range.
 pub fn serve_call(
   service: &mut dyn NfsService,
   program: u32,
+  version: u32,
   procedure: u32,
   args: &mut XdrReader<'_>,
   port: u16,
@@ -58,6 +61,13 @@ pub fn serve_call(
       MOUNTPROC3_UMNT => (AcceptStatus::Success, Vec::new()),
       _ => (AcceptStatus::ProcUnavail, Vec::new()),
     },
+    NFS_PROGRAM if version != NFS_V3 => (
+      AcceptStatus::ProgMismatch {
+        low: NFS_V3,
+        high: crate::v4::NFS_V4,
+      },
+      Vec::new(),
+    ),
     NFS_PROGRAM => match service.serve_procedure(procedure, args) {
       Some(results) => (AcceptStatus::Success, results),
       None => (AcceptStatus::ProcUnavail, Vec::new()),
@@ -67,24 +77,23 @@ pub fn serve_call(
 }
 
 /// Serves NFS/MOUNT/portmap RPC over one connected `stream` against `service`, until the client closes
-/// it. `port` is the port the server listens on (answered to a portmap `GETPORT`). Returns when the
-/// stream reaches end of file or a read/write fails; a malformed record ends the connection rather than
-/// risking a desynchronised stream.
-pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsService, port: u16) {
+/// it. `v4` is the listener's NFSv4 state: it outlives the connection, since a v4 client's session and
+/// opens continue on its next connection (RFC 8881 §2.10.3). `port` is the port the server listens on
+/// (answered to a portmap `GETPORT`). Returns when the stream reaches end of file or a read/write fails;
+/// a malformed record ends the connection rather than risking a desynchronised stream.
+pub fn serve_connection<S: Read + Write>(
+  stream: &mut S,
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  port: u16,
+) {
   let mut buffer: Vec<u8> = Vec::new();
   let mut records = RecordReader::default();
   let mut chunk = [0u8; RECORD_READ_CHUNK];
   loop {
     match records.read(&buffer) {
       Ok((Some(body), consumed)) => {
-        let reply = match parse_call(&body) {
-          Ok((call, mut args)) => {
-            let (status, results) =
-              serve_call(service, call.program, call.procedure, &mut args, port);
-            reply_bytes(call.xid, status, &results)
-          }
-          Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
-        };
+        let reply = dispatch(service, v4, &body, port);
         if stream.write_all(&write_record(&reply)).is_err() {
           return;
         }
@@ -102,6 +111,55 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsSe
   }
 }
 
+/// One RPC record's reply: an NFSv4 call served against `v4`, anything else through [`serve_call`].
+fn dispatch(
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  body: &[u8],
+  port: u16,
+) -> Vec<u8> {
+  match parse_call(body) {
+    Ok((call, mut args)) if call.program == NFS_PROGRAM && call.version == crate::v4::NFS_V4 => {
+      let principal = crate::rpc::auth_sys_uid(body).unwrap_or(0);
+      let (status, results) = serve_v4(service, v4, principal, call.procedure, &mut args);
+      reply_bytes(call.xid, status, &results)
+    }
+    Ok((call, mut args)) => {
+      let (status, results) = serve_call(
+        service,
+        call.program,
+        call.version,
+        call.procedure,
+        &mut args,
+        port,
+      );
+      reply_bytes(call.xid, status, &results)
+    }
+    Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
+  }
+}
+
+/// Serves one NFSv4 call over a synchronous service (A-35): `NULL`, or a `COMPOUND` against the v4 state.
+pub fn serve_v4(
+  service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
+  principal: u32,
+  procedure: u32,
+  args: &mut XdrReader<'_>,
+) -> (AcceptStatus, Vec<u8>) {
+  match procedure {
+    crate::v4::NFSPROC4_NULL => (AcceptStatus::Success, Vec::new()),
+    crate::v4::NFSPROC4_COMPOUND => {
+      let now_ns = crate::v4::backend::monotonic_ns();
+      match crate::v4::backend::serve_compound(service, v4, principal, now_ns, args.rest()) {
+        Some(reply) => (AcceptStatus::Success, reply),
+        None => (AcceptStatus::SystemErr, Vec::new()),
+      }
+    }
+    _ => (AcceptStatus::ProcUnavail, Vec::new()),
+  }
+}
+
 /// Serves NFS/MOUNT/portmap RPC over one connected runtime `stream` against `service`, until the client
 /// closes it — the async analogue of [`serve_connection`] for the production server, which multiplexes
 /// connections on slates's own runtime (§4.6). It shares the RPC engine ([`serve_call`]) and the record
@@ -115,6 +173,7 @@ pub fn serve_connection<S: Read + Write>(stream: &mut S, service: &mut dyn NfsSe
 pub async fn serve_connection_async(
   stream: &mut TcpStream,
   service: &mut dyn NfsService,
+  v4: &mut crate::v4::compound::Server,
   port: u16,
 ) -> Result<(), RtError> {
   let mut buffer: Vec<u8> = Vec::new();
@@ -123,14 +182,7 @@ pub async fn serve_connection_async(
   loop {
     match records.read(&buffer) {
       Ok((Some(body), consumed)) => {
-        let reply = match parse_call(&body) {
-          Ok((call, mut args)) => {
-            let (status, results) =
-              serve_call(service, call.program, call.procedure, &mut args, port);
-            reply_bytes(call.xid, status, &results)
-          }
-          Err(_) => reply_bytes(0, AcceptStatus::GarbageArgs, &[]),
-        };
+        let reply = dispatch(service, v4, &body, port);
         stream.write_all(&write_record(&reply)).await?;
         buffer.drain(..consumed);
         // Readiness can remain true across many calls. One completed RPC is the cooperative

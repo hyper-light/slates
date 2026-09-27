@@ -159,7 +159,8 @@ fn a_client_mounts_and_reads_a_file_over_a_real_socket() {
     )
     .unwrap();
     if let Ok((mut stream, _)) = listener.accept() {
-      serve_connection(&mut stream, &mut export, port);
+      let mut v4 = slates_bridge_nfs::v4::compound::Server::standalone();
+      serve_connection(&mut stream, &mut export, &mut v4, port);
     }
   });
 

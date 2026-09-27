@@ -191,7 +191,8 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
       .unwrap();
       // Serve the one connection the test makes; it returns at end of stream.
       if let Ok(mut stream) = listener.accept().await {
-        let _ = serve_connection_async(&mut stream, &mut export, port).await;
+        let mut v4 = slates_bridge_nfs::v4::compound::Server::standalone();
+        let _ = serve_connection_async(&mut stream, &mut export, &mut v4, port).await;
       }
     });
     if let Ok(task) = spawned {
@@ -287,9 +288,11 @@ fn queued_calls_yield_between_replies() {
     },
   )
   .unwrap();
+  let mut v4 = slates_bridge_nfs::v4::compound::Server::standalone();
   let mut server = std::pin::pin!(serve_connection_async(
     &mut stream,
     &mut export,
+    &mut v4,
     address.port()
   ));
   for xid in [1u32, 2] {

@@ -98,14 +98,14 @@ pub const NFS_MAXNAMELEN: usize = 255;
 /// Format: the maximum bytes in a symlink target the server accepts — POSIX `PATH_MAX` (4096). RFC
 /// 1813 leaves `nfspath3` unbounded, so the server caps it and refuses a longer target before
 /// allocating; the volume core does not yet enforce its own symlink-target cap (owed).
-const NFS_MAXPATHLEN: usize = 4096;
+pub(crate) const NFS_MAXPATHLEN: usize = 4096;
 /// Format: the `AUTH_SYS` authentication flavor (RFC 5531).
 const AUTH_SYS: u32 = 1;
 /// Format: the `AUTH_NONE` authentication flavor (RFC 5531).
 const AUTH_NONE: u32 = 0;
 /// Shape: the largest transfer the server offers, one arena chunk (256 KiB), matched to the volume
 /// core's read cap and the design's "readahead = large chunk size" (§4.6).
-const MAX_TRANSFER: u32 = 256 * 1024;
+pub const MAX_TRANSFER: u32 = 256 * 1024;
 /// Format: the transfer-size multiple the server prefers (one page).
 const TRANSFER_MULTIPLE: u32 = 4096;
 /// Format: FSF3_LINK, the filesystem supports hard links.

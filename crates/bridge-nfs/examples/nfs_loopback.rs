@@ -125,7 +125,8 @@ fn main() {
   let mut bridge = VolumeBridge::new(VOL_ID, &mut volume, &mut store);
   let mut export =
     Export::new(&mut bridge, VOL_ID, Principal::Uid { uid: 0 }, rights()).expect("export");
+  let mut v4 = slates_bridge_nfs::v4::compound::Server::standalone();
   for mut stream in listener.incoming().flatten() {
-    serve_connection(&mut stream, &mut export, port);
+    serve_connection(&mut stream, &mut export, &mut v4, port);
   }
 }

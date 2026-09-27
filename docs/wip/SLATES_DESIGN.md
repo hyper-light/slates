@@ -1661,7 +1661,39 @@ RFC 8435). The client negotiates; ONC RPC carries versions 3 and 4 of program 10
 this is neither a mode switch nor a shim. A network-facing listener requires v4.1 or later with
 RPCSEC_GSS or RPC-over-TLS (RFC 9289); loopback may accept v3. Open state is bounded, sharded to the
 owner core, kept in the anchor segment, and replicated with the copyset, so neither a restart nor a
-takeover forces a grace period. The design of the v4 server is its own amendment, to follow.
+takeover forces a grace period.
+
+**The NFSv4.1/4.2 front end (A-35).** `slates-bridge-nfs::v4` serves program 100003 version 4
+(`NULL`, `COMPOUND`, minor versions 1 and 2) as a front end over the NFSv3 semantic layer: each v4
+operation becomes the v3 procedure that means the same thing, answered by the same `NfsService`
+(`v4/compound.rs` over `v4/v3call.rs`). Handles, permission, name rules and the volume's refusals are
+therefore one implementation shared by both versions.
+- **Sessions** (`v4/session.rs`, RFC 8881 §2.10): client ids, sessions, and a per-slot reply cache that
+  answers a retried request with its kept reply byte for byte and never runs it twice. Every table is
+  bounded, with a typed refusal at its bound (`NFS4ERR_RESOURCE`, `NFS4ERR_TOO_MANY_OPS`,
+  `NFS4ERR_REQ_TOO_BIG`). Leases expire lazily (a courteous server, §8.3): a lapsed client keeps its
+  state until the client table is full, when every lapsed client makes room first.
+- **State belongs to the listener, not the connection.** A v4 client reconnects and continues its
+  session (§2.10.3), so the connection servers take the v4 state from their caller.
+- **Open state** (§9): one state id per (client, open-owner, file), upgraded and advanced by a reopen;
+  share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
+  file and client, at its current seqid (`NFS4ERR_OLD_STATEID` for an earlier one, §8.2.2). OPEN of an
+  existing file checks the caller's access for the share asked; a create needs none on the new file.
+  An `UNCHECKED` open of an existing name applies only the size (the `O_TRUNC`). The exclusive create
+  modes are served as guarded creates: the verifier made an exclusive create idempotent across
+  retransmission, and the slot cache now guarantees that for every request. Expired, replaced and
+  destroyed clients' opens are purged with them.
+- **Not yet offered:** byte-range locks (`NFS4ERR_NOTSUPP`; a Linux client mounted `local_lock=all`
+  keeps them itself), delegations and callbacks (never granted), state protection other than
+  `SP4_NONE`, and the v4.2 operations.
+- **The capability** is presented at the pseudo root as a LOOKUP of `<name>@<attachment>.<token>`, as
+  an NFSv3 MNT path does, until an RPC-over-TLS or RPCSEC_GSS identity carries it.
+- **Status (2026-09-26).** Built and tested by use over an `Export` and over a real socket
+  (`crates/bridge-nfs/tests/v4.rs`, 11 tests; `tests/v4_session.rs`, 7). The standalone connection
+  servers route version 4. Owed: the daemon's routing of v4 to each volume's owner shard with derived
+  limits, a Linux kernel `vers=4.1`/`4.2` mount in CI, then locks, the persisted and replicated open
+  state, the v4.2 operations (RFC 7862 SEEK, READ_PLUS, ALLOCATE, DEALLOCATE, COPY, CLONE, IO_ADVISE;
+  RFC 8276 extended attributes), RPC-over-TLS, and pNFS flexfiles.
 
 **Extended attributes over NFSv3 (A-33).** NFSv3 carries no extended attributes, so the macOS
 client stores them in an AppleDouble `._name` file beside `name`. The bridge serves that file as a
@@ -5921,3 +5953,19 @@ the XDR mount arguments); `slates-cli` (the macOS `mount(2)` path, the unsafe bu
 `slates-server` (UMNT confirmation, OCI binding by mount point); `slates-bridge-oci` (exact
 `slates:/<name>` source, the bearer parsing removed); tests; GAPS and TBD_FIXES. The mount source
 format and the UMNT path change; no consensus change.
+
+### A-35 — The NFSv4.1/4.2 front end over the NFSv3 semantic layer (2026-09-26)
+
+§4.6 recorded the direction of one NFS server speaking several versions. This amendment is the v4
+front end's design (§4.6 "The NFSv4.1/4.2 front end"): each v4 operation served through the v3
+procedure that means the same thing, so both versions share one semantics; sessions with an
+exactly-once slot cache; bounded tables with typed refusals; lazily expired leases; open state kept
+per (client, owner, file) with share reservations and state ids checked against file, client and
+seqid; state owned by the listener so a session survives its connection.
+
+Applied in the same change to: §4.6 (the front end, status); `slates-bridge-nfs` (`v4::compound`,
+`v4::attr`, `v4::v3call`, `v4::backend`, the session table's lazy expiry and `holds_client`, the
+connection servers' version routing and caller-owned v4 state, `serve_call`'s `PROG_MISMATCH`
+naming 3–4 for any other version, the capability parse shared with MNT); the examples and tests that
+run the connection servers; GAPS and TBD_FIXES. The RPC surface gains version 4 of the NFS program;
+no consensus or storage format changes.

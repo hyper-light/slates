@@ -74,6 +74,42 @@ impl Nfsstat3 {
   pub fn encode(self, writer: &mut XdrWriter) {
     writer.u32(self.wire());
   }
+
+  /// The status a wire value names; `None` for a value no NFSv3 status has.
+  pub fn from_wire(value: u32) -> Option<Nfsstat3> {
+    use Nfsstat3::*;
+    [
+      Ok,
+      Perm,
+      Noent,
+      Io,
+      Acces,
+      Exist,
+      Notdir,
+      Isdir,
+      Inval,
+      Nospc,
+      Rofs,
+      Nametoolong,
+      Notempty,
+      Stale,
+      Badhandle,
+      NotSync,
+      BadCookie,
+      Notsupp,
+      Toosmall,
+      ServerFault,
+      Badtype,
+      Jukebox,
+    ]
+    .into_iter()
+    .find(|status| status.wire() == value)
+  }
+
+  /// Reads a status, refusing a value no NFSv3 status has.
+  pub fn decode(reader: &mut XdrReader<'_>) -> Result<Nfsstat3, XdrError> {
+    Nfsstat3::from_wire(reader.u32()?).ok_or(XdrError::BadLength)
+  }
 }
 
 /// The type of a filesystem object (RFC 1813 `ftype3`); the wire value is the discriminant.

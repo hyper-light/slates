@@ -143,6 +143,8 @@ pub trait NfsService {
   /// Dispatch one NFSv3 procedure, returning the accepted reply's result bytes, or `None` for a
   /// procedure this service does not serve (the caller answers `PROC_UNAVAIL`).
   fn serve_procedure(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>>;
+  /// The root NFSv4's `PUTROOTFH` names (A-35): the export's own root.
+  fn v4_root(&mut self) -> Nfsfh3;
 }
 
 impl NfsService for Export<'_> {
@@ -152,6 +154,13 @@ impl NfsService for Export<'_> {
 
   fn serve_procedure(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>> {
     self.serve_nfs(procedure, args)
+  }
+
+  fn v4_root(&mut self) -> Nfsfh3 {
+    self
+      .root_object()
+      .map(|(handle, _)| handle)
+      .unwrap_or_else(|| Nfsfh3(Vec::new()))
   }
 }
 
@@ -496,6 +505,10 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
       None => Some(badhandle_for(procedure)),
     }
   }
+
+  fn v4_root(&mut self) -> Nfsfh3 {
+    root_handle_with(self.set.capability())
+  }
 }
 
 /// One volume of an [`OwnedVolumeSet`]: its mount name, id, the volume core object, and its overlay
@@ -594,9 +607,34 @@ impl VolumeSet for OwnedVolumeSet {
   }
 }
 
+/// A mount capability written `<attachment_hex>.<token_hex>` (§4.13; AUD-01): the attachment id (hex) and
+/// its 16-byte token (32 hex digits). `None` for anything else.
+pub fn parse_capability(text: &str) -> Option<(u64, [u8; 16])> {
+  /// Format: hexadecimal digits.
+  const HEX: u32 = 16;
+  let (attachment_hex, token_hex) = text.split_once('.')?;
+  let attachment = u64::from_str_radix(attachment_hex, HEX).ok()?;
+  let hex = token_hex.as_bytes();
+  if hex.len() != size_of::<[u8; 16]>() * 2 {
+    return None;
+  }
+  let mut token = [0u8; 16];
+  for (byte, [high, low]) in token.iter_mut().zip(hex.as_chunks::<2>().0) {
+    let high = char::from(*high).to_digit(HEX)?;
+    let low = char::from(*low).to_digit(HEX)?;
+    *byte = u8::try_from(high * HEX + low).ok()?;
+  }
+  Some((attachment, token))
+}
+
+/// Whether `fh` is the synthetic root's handle (with any capability).
+pub fn is_root_handle(fh: &Nfsfh3) -> bool {
+  FileHandle::from_fh(fh).is_ok_and(|decoded| decoded.volume == ROOT_VOLUME)
+}
+
 /// The file handle of the synthetic root directory, carrying the mount capability the browse is scoped
-/// to (§4.13; AUD-01).
-fn root_handle_with(capability: (u64, [u8; 16])) -> Nfsfh3 {
+/// to (§4.13; AUD-01): the MOUNT reply's root, and NFSv4's `PUTROOTFH`.
+pub fn root_handle_with(capability: (u64, [u8; 16])) -> Nfsfh3 {
   FileHandle {
     volume: ROOT_VOLUME,
     inode: ROOT_INODE,

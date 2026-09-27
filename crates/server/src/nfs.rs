@@ -68,10 +68,11 @@ use slates_bridge_core::{Rights, VolumeBridge, new_handle_store};
 use slates_bridge_nfs::mount::{MOUNT_PROGRAM, MOUNTPROC3_MNT, MOUNTPROC3_UMNT};
 use slates_bridge_nfs::nfs::{Fattr3, Nfsfh3};
 use slates_bridge_nfs::procedures::{
-  Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_LINK,
-  NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_READDIR, NFSPROC3_READDIRPLUS,
-  NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK,
-  NFSPROC3_WRITE, io_failure_reply, is_unstable, status_failure_reply, write_stable_how,
+  Export, NFS_MAXNAMELEN, NFS_PROGRAM, NFS_VERSION, NFSPROC3_COMMIT, NFSPROC3_CREATE,
+  NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_READDIR,
+  NFSPROC3_READDIRPLUS, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
+  NFSPROC3_SYMLINK, NFSPROC3_WRITE, io_failure_reply, is_unstable, status_failure_reply,
+  write_stable_how,
 };
 use slates_bridge_nfs::rpc::RecordReader;
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
@@ -748,9 +749,11 @@ fn serve_local(
     mount_rights(),
     requester.groups,
   );
+  // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
     &mut service,
     program,
+    NFS_VERSION,
     procedure,
     &mut XdrReader::new(args),
     port,
@@ -914,6 +917,7 @@ fn serve_root_listing(
   serve_call(
     &mut service,
     NFS_PROGRAM,
+    NFS_VERSION,
     procedure,
     &mut XdrReader::new(args),
     port,
