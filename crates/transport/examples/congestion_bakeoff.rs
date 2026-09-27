@@ -4,15 +4,16 @@
 //! each control law in turn, across the scenarios the research note names.
 //!
 //! One run: a bulk flow (a client sends `bulk_bytes` on one stream) and a ping flow (a request/reply of
-//! [`PING_BYTES`] every [`PING_GAP_NS`]) share one bottleneck toward the servers; the reverse direction is
+//! [`PING_BYTES`] at a gap holding its load to [`PING_LOAD_PERMILLE`] of the link) share one bottleneck toward the servers; the reverse direction is
 //! the propagation delay alone. The ping flow's request latency is the headline metric — how long a small
 //! request waits behind bulk data at the bottleneck (research note §5.3) — beside the bulk goodput against
 //! the link's capacity. Two-flow scenarios report Jain's fairness index of the flows' goodputs.
 //!
 //! The selection rule, fixed before any run (a winner chosen after peeking is not evidence):
 //! 1. disqualified if any run stalls, delivers wrongly, or (two flows of the law) scores Jain below 0.9;
-//! 2. primary: the ping p99 latency under load, as a geometric mean over scenarios of the law's p99 over
-//!    the best law's p99 in that scenario (lower is better);
+//! 2. primary: the steady-state ping p99 latency under load (over [`PINGS`] pings per run), as a geometric
+//!    mean over scenarios of the law's p99 over the best law's p99 in that scenario (lower is better), with
+//!    each law's worst scenario reported beside it — the p99 must be solid everywhere, not on average;
 //! 3. secondary: the bulk goodput, as the same geometric mean of the best law's goodput over the law's
 //!    (lower is better).
 //!
@@ -50,21 +51,25 @@ const PACKET_OVERHEAD: usize = 80;
 const FRAME_CAP: usize = MIN_DATAGRAM_BYTES - PACKET_OVERHEAD;
 /// Shape: the ping request and reply size — a small metadata operation.
 const PING_BYTES: usize = 64;
-/// Shape: the gap between pings, 50 ms: frequent enough for a p99 over a run, rare enough to be light.
-const PING_GAP_NS: u64 = 50_000_000;
+/// Shape: the steady-state pings each run collects — enough that the p99 is a percentile (the tenth-worst
+/// sample), not the second-worst of a hundred and fifty, which a single loss recovery decides (the first
+/// full grid, 2026-09-27, measured about 150 per run and could not rank the laws' tails).
+const PINGS: u64 = 1000;
+/// Shape: the ping flow's share of the link, per mille — light enough that it measures the bulk flow's
+/// queue rather than adding its own.
+const PING_LOAD_PERMILLE: u64 = 10;
+/// Shape: the warm-up before the steady window, in round trips (and at least [`MIN_WARMUP_NS`]) — past
+/// every law's startup.
+const WARMUP_RTTS: u64 = 20;
+/// Shape: the warm-up's floor, 5 s.
+const MIN_WARMUP_NS: u64 = 5_000_000_000;
 /// Shape: the server name the identities carry.
 const NAME: &str = "slates-bakeoff";
 /// Format: nanoseconds per millisecond.
 const MS: u64 = 1_000_000;
 /// Shape: the receive ceiling in BDPs — generous, so the controller, never flow control, is the limit.
 const CEILING_BDPS: u64 = 8;
-/// Shape: the smallest bulk transfer, 64 KiB.
-const MIN_BULK: u64 = 64 * 1024;
-/// Shape: the bulk transfer in seconds of link capacity — long enough that every law's steady state, not
-/// its startup, dominates the percentiles (a first run at 40 BDPs measured mostly startup).
-const BULK_SECONDS: u64 = 30;
-/// Shape: the largest bulk transfer, 128 MiB, bounding a fast link's run time.
-const MAX_BULK: u64 = 128 * 1024 * 1024;
+
 /// Shape: the seeds each scenario runs with.
 const SEEDS: [u64; 3] = [1, 2, 3];
 /// Shape: the fairness floor of the selection rule (Jain's index, 1 is perfectly fair).
@@ -106,10 +111,23 @@ impl Scenario {
     (u128::from(self.rate) * u128::from(self.rtt_ns) / (8 * 1_000_000_000)) as u64
   }
 
+  /// The gap between pings that holds their load (request and reply packets, each the ping plus the
+  /// packet overhead) to [`PING_LOAD_PERMILLE`] of the link.
+  fn ping_gap_ns(&self) -> u64 {
+    let bits_per_ping = 2 * (PING_BYTES + PACKET_OVERHEAD) as u64 * 8;
+    bits_per_ping * 1_000_000_000 * 1000 / (self.rate.max(1) * PING_LOAD_PERMILLE)
+  }
+
+  /// The warm-up before the steady window.
+  fn warmup_ns(&self) -> u64 {
+    (WARMUP_RTTS * self.rtt_ns).max(MIN_WARMUP_NS)
+  }
+
+  /// The bulk transfer: the link's capacity over the warm-up plus the time [`PINGS`] pings take, so the
+  /// bulk flow loads the link for every steady ping.
   fn bulk_bytes(&self) -> u64 {
-    (self.rate / 8)
-      .saturating_mul(BULK_SECONDS)
-      .clamp(MIN_BULK, MAX_BULK)
+    let duration = self.warmup_ns() + PINGS * self.ping_gap_ns();
+    (u128::from(self.rate / 8) * u128::from(duration) / 1_000_000_000) as u64
   }
 
   fn queue_bytes(&self) -> u64 {
@@ -264,11 +282,10 @@ fn run(law: ControllerKind, scenario: &Scenario, seed: u64) -> Outcome {
   for (flow, bytes, elapsed) in &finished {
     goodputs[*flow] = *bytes as f64 * 8.0 / (*elapsed as f64 / 1e9);
   }
-  let expected_ns = scenario.bulk_bytes() * 8 * 1_000_000_000 / scenario.rate.max(1);
   Outcome {
     goodputs,
     pings_ns: ping_rx.try_iter().collect(),
-    steady_from: (10 * scenario.rtt_ns).max(expected_ns / 4),
+    steady_from: scenario.warmup_ns(),
     peak_queue: stats.peak_queue_bytes,
     dropped_queue: stats.dropped_queue,
     dropped_loss: stats.dropped_loss,
@@ -394,6 +411,7 @@ async fn coordinator(
   })
   .unwrap();
   let run_start = slates_rt::futures::now_ns();
+  let ping_gap = scenario.ping_gap_ns();
   let ping_client_task = slates_rt::futures::spawn_child(async move {
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, ping_server);
     let mut endpoint = Endpoint::client(
@@ -411,7 +429,7 @@ async fn coordinator(
       let reply = endpoint.request(1, &[0x50u8; PING_BYTES]).await.unwrap();
       assert_eq!(reply.len(), PING_BYTES, "the ping echoed");
       let _ = pings.send((started - run_start, slates_rt::futures::now_ns() - started));
-      slates_rt::futures::sleep(PING_GAP_NS).await;
+      slates_rt::futures::sleep(ping_gap).await;
     }
   })
   .unwrap();
@@ -630,6 +648,7 @@ fn main() {
 fn rank(rows: &[(String, ControllerKind, Outcome)]) {
   let names: std::collections::BTreeSet<&String> = rows.iter().map(|(name, _, _)| name).collect();
   let mut latency_ratio = [0.0f64; LAWS.len()];
+  let mut worst_latency: Vec<(f64, String)> = vec![(1.0, String::new()); LAWS.len()];
   let mut goodput_ratio = [0.0f64; LAWS.len()];
   let mut disqualified: Vec<String> = vec![String::new(); LAWS.len()];
   let mut counted: f64 = 0.0;
@@ -651,7 +670,8 @@ fn rank(rows: &[(String, ControllerKind, Outcome)]) {
           disqualified[index] = format!("Jain {:.3} in {name}", outcome.jain());
         }
       }
-      p99[index] = runs.iter().map(|o| o.percentile(990)).sum::<f64>() / runs.len().max(1) as f64;
+      p99[index] =
+        runs.iter().map(|o| o.steady_percentile(990)).sum::<f64>() / runs.len().max(1) as f64;
       goodput[index] = runs
         .iter()
         .map(|o| o.goodputs.first().copied().unwrap_or(0.0))
@@ -661,18 +681,26 @@ fn rank(rows: &[(String, ControllerKind, Outcome)]) {
     let best_p99 = p99.iter().copied().fold(f64::INFINITY, f64::min).max(1e-9);
     let best_goodput = goodput.iter().copied().fold(0.0, f64::max).max(1e-9);
     for index in 0..LAWS.len() {
-      latency_ratio[index] += (p99[index].max(1e-9) / best_p99).ln();
+      let ratio = p99[index].max(1e-9) / best_p99;
+      if ratio > worst_latency[index].0 {
+        worst_latency[index] = (ratio, name.to_string());
+      }
+      latency_ratio[index] += ratio.ln();
       goodput_ratio[index] += (best_goodput / goodput[index].max(1e-9)).ln();
     }
     counted += 1.0;
   }
   println!();
-  println!("law,p99_latency_vs_best_geomean,goodput_shortfall_vs_best_geomean,disqualified");
+  println!(
+    "law,p99_latency_vs_best_geomean,worst_p99_vs_best,worst_scenario,goodput_shortfall_vs_best_geomean,disqualified"
+  );
   for (index, law) in LAWS.iter().enumerate() {
     println!(
-      "{:?},{:.3},{:.3},{}",
+      "{:?},{:.3},{:.3},{},{:.3},{}",
       law,
       (latency_ratio[index] / counted.max(1.0)).exp(),
+      worst_latency[index].0,
+      worst_latency[index].1,
       (goodput_ratio[index] / counted.max(1.0)).exp(),
       if disqualified[index].is_empty() {
         "no"
