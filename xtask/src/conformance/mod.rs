@@ -23,6 +23,7 @@
 //! client mount, pjdfstest's uid switches, macOS `fs_usage`) the harness asks `sudo -n` and
 //! records a privilege skip when it is refused, never a prompt.
 
+mod bench;
 mod fetch;
 mod hermeticity;
 mod mount;
@@ -88,6 +89,8 @@ pub(crate) struct Options {
   /// `tally`: who ran the outputs (`root` or `unprivileged`); this process's own identity when
   /// absent.
   privilege: Option<Privilege>,
+  /// `bench`: the rounds each phase runs over each transport.
+  rounds: u64,
   /// The exerciser bounds.
   bounds: Bounds,
 }
@@ -136,7 +139,7 @@ fn number<T: std::str::FromStr>(args: &[String], flag: &str, default: T) -> Resu
 /// Parses the arguments after `conformance`.
 pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
   let command = args.first().cloned().ok_or_else(|| {
-    Failure("conformance: a subcommand is needed: plan, run, all, matrix, tally".to_owned())
+    Failure("conformance: a subcommand is needed: plan, run, all, matrix, tally, bench".to_owned())
   })?;
   let privilege = match value_after(args, "--privilege") {
     Some("root") => Some(Privilege::Root),
@@ -168,6 +171,7 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
     write: args.iter().any(|a| a == "--write"),
     outputs: value_after(args, "--outputs").map(PathBuf::from),
     privilege,
+    rounds: number(args, "--rounds", bench::DEFAULT_ROUNDS)?,
     bounds: Bounds {
       fsx_operations: number(args, "--fsx-ops", defaults.fsx_operations)?,
       fsx_seed: number(args, "--fsx-seed", defaults.fsx_seed)?,
@@ -192,8 +196,9 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
     "all" => all(root, options),
     "matrix" => render_matrix(root, options),
     "tally" => tally(root, options),
+    "bench" => bench::run_bench(root, options, host_os()?),
     other => Err(Failure(format!(
-      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally"
+      "conformance: unknown subcommand `{other}`; plan, run, all, matrix, tally, bench"
     ))),
   }
 }
@@ -238,12 +243,18 @@ fn host_os() -> Result<HostOs, Failure> {
   }
 }
 
-/// The native transport this host offers.
+/// The native transport this host offers first (the one a tally of kept outputs reviews).
 fn native_transport(os: HostOs) -> Transport {
+  native_transports(os)[0]
+}
+
+/// Every native transport this host offers: on Linux the NFSv3 adapter and the daemon's NFSv4.2
+/// server, both through the kernel's own client.
+fn native_transports(os: HostOs) -> &'static [Transport] {
   match os {
-    HostOs::Macos => Transport::NativeMacosNfs,
-    HostOs::Linux => Transport::NativeLinuxFuse,
-    HostOs::Windows => Transport::NativeWindowsWinfsp,
+    HostOs::Macos => &[Transport::NativeMacosNfs],
+    HostOs::Linux => &[Transport::NativeLinuxFuse, Transport::NativeLinuxNfs4],
+    HostOs::Windows => &[Transport::NativeWindowsWinfsp],
   }
 }
 
@@ -371,11 +382,15 @@ pub(crate) struct Scratch {
 }
 
 impl Scratch {
-  fn open(options: &Options) -> Result<Scratch, Failure> {
+  /// The scratch of one transport's suites: `--scratch DIR`'s subdirectory named by the transport, so
+  /// two transports run on one host never share a host reference tree, a landing target or a trace (a
+  /// shared one let the second transport's host references start from the first's leftovers).
+  fn open(options: &Options, transport: Transport) -> Result<Scratch, Failure> {
     let path = match &options.scratch {
       Some(dir) => {
-        create_dir(dir)?;
-        dir.clone()
+        let dir = dir.join(transport.slug());
+        create_dir(&dir)?;
+        dir
       }
       None => {
         let made = stdout_of("mktemp", &["-d", "-t", "slates-conformance.XXXXXX"]);
@@ -593,10 +608,30 @@ pub(crate) struct SuiteResult {
   pub(crate) ok: bool,
 }
 
-/// `run --suite S`: one suite over this host's native transport.
+/// `run --suite S`: one suite over each of this host's native transports, continuing past a failed one.
 fn run_suite(root: &Path, options: &Options, suite: Suite) -> Result<(), Failure> {
   let os = host_os()?;
-  let transport = native_transport(os);
+  let mut failures = Vec::new();
+  for &transport in native_transports(os) {
+    if let Err(failure) = run_suite_on(root, options, os, transport, suite) {
+      failures.push(failure.0);
+    }
+  }
+  if failures.is_empty() {
+    Ok(())
+  } else {
+    Err(Failure(failures.join("; ")))
+  }
+}
+
+/// One suite over one transport.
+fn run_suite_on(
+  root: &Path,
+  options: &Options,
+  os: HostOs,
+  transport: Transport,
+  suite: Suite,
+) -> Result<(), Failure> {
   let root_available = match readiness(os, transport, suite) {
     Readiness::Ready { root } => root,
     Readiness::Skip(reason) => {
@@ -616,7 +651,7 @@ fn run_suite(root: &Path, options: &Options, suite: Suite) -> Result<(), Failure
     os,
     transport,
     root_available,
-    scratch: Scratch::open(options)?,
+    scratch: Scratch::open(options, transport)?,
   };
   let started = std::time::Instant::now();
   let result = match suite {

@@ -205,6 +205,23 @@ fn thread_time(since: Instant) -> Duration {
   }
 }
 
+thread_local! {
+  /// The held polls whose own thread CPU clock ran past the quantum: on a busy virtual machine a guest
+  /// may count time its virtual CPU was stolen while the thread ran as the thread's CPU (the macOS CI
+  /// runner, run 36289513559: a 3 ms sleep's poll counted past a 1 ms quantum), and then the rule —
+  /// past the quantum on the thread clock is the task's — rightly calls that poll the task's. The
+  /// shard runs on this thread, so a thread-local sees every poll.
+  static CPU_PAST_QUANTUM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes in [`CPU_PAST_QUANTUM`] a poll whose thread CPU, from its first to its last instruction
+/// (`cpu_began` to now), ran past the quantum.
+fn note_cpu(began: Instant, cpu_began: Duration) {
+  if thread_time(began).saturating_sub(cpu_began) > Duration::from_nanos(QUANTUM_NS) {
+    CPU_PAST_QUANTUM.with(|count| count.set(count.get() + 1));
+  }
+}
+
 /// A future whose every poll holds the thread for [`HOLD`] as `hold` says, then wakes itself, so its
 /// polls run back to back — one per step — in one busy period with no wait between them.
 struct HoldEachPoll {
@@ -220,6 +237,7 @@ impl Future for HoldEachPoll {
     }
     self.polls_left -= 1;
     let began = Instant::now();
+    let poll_cpu_began = thread_time(began);
     match self.hold {
       Hold::OnCpu => {
         let cpu_began = thread_time(began);
@@ -238,12 +256,16 @@ impl Future for HoldEachPoll {
       }
     }
     cx.waker().wake_by_ref();
+    // The whole poll's CPU, measured as late as the poll can: the shard's window closes on a reading
+    // taken just after it returns.
+    note_cpu(began, poll_cpu_began);
     Poll::Pending
   }
 }
 
 /// Runs one busy period of [`LONG_POLLS`] held polls and returns the shard's counters.
 fn one_busy_period(hold: Hold) -> slates_rt::shard::Counters {
+  CPU_PAST_QUANTUM.with(|count| count.set(0));
   let rt = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
   rt.spawn(HoldEachPoll {
     polls_left: LONG_POLLS,
@@ -291,17 +313,42 @@ fn a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks() {
 
 /// §4.3, A-31: a poll that blocked in a call past the quantum is its task's — the shard stalled on it just
 /// the same — where the platform counts a thread's voluntary switches (Linux). macOS cannot tell a block
-/// from a preemption, so there it is unattributed, as it is everywhere with no per-thread clock.
+/// from a preemption, so there it is unattributed, as it is everywhere with no per-thread clock. Every
+/// long poll is attributed once, and never to the host (nothing held the thread off the CPU but its own
+/// call). A poll whose own thread clock ran past the quantum (a guest counting stolen time as the
+/// thread's) is its task's by the rule, as a long run: the test counts those polls and allows exactly
+/// that many to move from blocked or unattributed to the task's long polls.
 #[test]
 #[cfg_attr(miri, ignore)] // the OS driver opens a kqueue or an eventfd, which Miri does not model
 fn a_poll_blocked_in_a_call_past_the_quantum_is_its_tasks_where_blocks_are_counted() {
   let counters = one_busy_period(Hold::InCall);
-  let expected = if cfg!(target_os = "linux") {
-    (LONG_POLLS - 1, LONG_POLLS - 1, 0, 1)
+  let clocked_long = CPU_PAST_QUANTUM.with(std::cell::Cell::get);
+  let (long, blocked, preempted, unattributed) = attributed(&counters);
+  assert_eq!(
+    long + unattributed,
+    LONG_POLLS,
+    "each long poll attributed once: {counters:?}"
+  );
+  assert_eq!(preempted, 0, "a block is never the host's: {counters:?}");
+  if cfg!(target_os = "linux") {
+    // The first long poll opens the first window; every later one is the task's, blocked unless its
+    // own clock ran past the quantum.
+    assert_eq!((long, unattributed), (LONG_POLLS - 1, 1), "{counters:?}");
+    assert!(
+      blocked + clocked_long >= LONG_POLLS - 1,
+      "a later poll is blocked unless its clock ran long ({clocked_long}): {counters:?}"
+    );
   } else {
-    (0, 0, 0, LONG_POLLS)
-  };
-  assert_eq!(attributed(&counters), expected, "{counters:?}");
+    assert_eq!(
+      blocked, 0,
+      "no platform but Linux counts blocks: {counters:?}"
+    );
+    assert!(
+      long <= clocked_long,
+      "a blocked poll is the task's only where its own clock ran past the quantum \
+       ({clocked_long}): {counters:?}"
+    );
+  }
 }
 
 /// Restores the calling thread's CPU affinity on drop, so a failed assertion leaves the test thread as

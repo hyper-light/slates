@@ -53,6 +53,9 @@ pub struct NodeAttr {
   pub mtime: i64,
   /// The change time.
   pub ctime: i64,
+  /// The change counter: it moves on every change to the object and never repeats, whatever the
+  /// wall clock does (A-38). A transport with a change attribute (NFSv4 `change`) serves it.
+  pub change: u64,
 }
 
 /// One entry of a directory listing: the child's inode number, its kind and its name.

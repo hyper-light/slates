@@ -32,13 +32,13 @@ use slates_vfs::volume::{Store, Volume};
 
 use crate::handle::FileHandle;
 use crate::mount::{MountReply, Mountstat3};
-use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
+use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3, V4Attrs};
 use crate::procedures::{
-  Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSINFO,
-  NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR,
-  NFSPROC3_MKNOD, NFSPROC3_NULL, NFSPROC3_PATHCONF, NFSPROC3_READ, NFSPROC3_READDIR,
-  NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
-  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE, PATHCONF_LINKMAX,
+  Dialect, Export, NFS_MAXNAMELEN, NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE,
+  NFSPROC3_FSINFO, NFSPROC3_FSSTAT, NFSPROC3_GETATTR, NFSPROC3_LINK, NFSPROC3_LOOKUP,
+  NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_NULL, NFSPROC3_PATHCONF, NFSPROC3_READ,
+  NFSPROC3_READDIR, NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME,
+  NFSPROC3_RMDIR, NFSPROC3_SETATTR, NFSPROC3_SYMLINK, NFSPROC3_WRITE, PATHCONF_LINKMAX,
 };
 use crate::xdr::{XdrReader, XdrWriter};
 
@@ -111,22 +111,17 @@ pub trait VolumeSet {
   /// none, and a created object then inherits its parent's group. `None` (the return) if the volume is
   /// not in the set (the router then answers the handle `NFS3ERR_STALE`). `args` is positioned at the
   /// procedure arguments.
+  #[allow(clippy::too_many_arguments)] // the request's identity, its dialect and the procedure
   fn serve(
     &mut self,
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
+    dialect: Dialect,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>>;
-
-  /// Serves AppleDouble views (`on`) in every export the set builds, or treats every `._name` as an
-  /// ordinary name (§4.6 A-33): on only for the macOS NFSv3 client.
-  fn set_appledouble_views(&mut self, on: bool);
-
-  /// Whether the set's exports serve AppleDouble views.
-  fn appledouble_views(&self) -> bool;
 
   /// Serves an id-only NFSv4 state procedure on the set's file state (§4.6 A-36).
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8>;
@@ -134,13 +129,14 @@ pub trait VolumeSet {
   /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
   /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
   /// established. Carries `subject`/`rights`/`groups` as [`Self::serve`] does, though a root object
-  /// creates nothing, so the groups only ride for uniformity.
+  /// creates nothing, so the groups only ride for uniformity. The attributes are in `dialect`.
   fn root_object(
     &mut self,
     volume: VolumeId,
     subject: Principal,
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
+    dialect: Dialect,
   ) -> Option<(Nfsfh3, Fattr3)>;
 }
 
@@ -150,16 +146,17 @@ pub trait VolumeSet {
 pub trait NfsService {
   /// MOUNT `MNT`: resolve an export path to a root file handle, or a typed mount refusal.
   fn serve_mount(&mut self, path: &str) -> MountReply;
-  /// Dispatch one NFSv3 procedure, returning the accepted reply's result bytes, or `None` for a
-  /// procedure this service does not serve (the caller answers `PROC_UNAVAIL`).
-  fn serve_procedure(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>>;
+  /// Dispatch one NFSv3 procedure answering for `dialect` — the wire client's, or the NFSv4 front
+  /// end's (A-38) — returning the accepted reply's result bytes, or `None` for a procedure this service
+  /// does not serve (the caller answers `PROC_UNAVAIL`).
+  fn serve_procedure(
+    &mut self,
+    dialect: Dialect,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>>;
   /// The root NFSv4's `PUTROOTFH` names (A-35): the export's own root.
   fn v4_root(&mut self) -> Nfsfh3;
-  /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33): on only
-  /// for the macOS NFSv3 client, off for NFSv4 and every other client.
-  fn set_appledouble_views(&mut self, on: bool);
-  /// Whether AppleDouble views are served.
-  fn appledouble_views(&self) -> bool;
   /// Serves an id-only NFSv4 state procedure (TEST_STATEID, FREE_STATEID, a client's purge) on the
   /// file state this service holds (§4.6 A-36; `crate::v4::files::serve_by_id`).
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8>;
@@ -170,7 +167,13 @@ impl NfsService for Export<'_> {
     self.mnt(path)
   }
 
-  fn serve_procedure(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>> {
+  fn serve_procedure(
+    &mut self,
+    dialect: Dialect,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>> {
+    self.set_dialect(dialect);
     self.serve_nfs(procedure, args)
   }
 
@@ -179,14 +182,6 @@ impl NfsService for Export<'_> {
       .root_object()
       .map(|(handle, _)| handle)
       .unwrap_or_else(|| Nfsfh3(Vec::new()))
-  }
-
-  fn set_appledouble_views(&mut self, on: bool) {
-    Export::set_appledouble_views(self, on);
-  }
-
-  fn appledouble_views(&self) -> bool {
-    Export::appledouble_views(self)
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
@@ -246,8 +241,9 @@ impl<V: VolumeSet> MultiExport<V> {
   // ---------------------------------------------------------------- the synthetic root directory
 
   /// The `fattr3` of the synthetic root directory: a directory owned by root, its link count one per
-  /// volume plus the two every directory has (itself and its parent), read-only, its own filesystem.
-  fn root_fattr3(&self) -> Fattr3 {
+  /// volume plus the two every directory has (itself and its parent), read-only, its own filesystem;
+  /// in the NFSv4 dialect, its change counter is the listing's digest ([`Self::root_listing_digest`]).
+  fn root_fattr3(&self, dialect: Dialect) -> Fattr3 {
     Fattr3 {
       kind: Ftype3::Dir,
       mode: ROOT_MODE,
@@ -262,37 +258,65 @@ impl<V: VolumeSet> MultiExport<V> {
       atime: Nfstime3::default(),
       mtime: Nfstime3::default(),
       ctime: Nfstime3::default(),
+      // The root's times are fixed (the epoch); its change is its listing's digest.
+      v4: dialect.carries_v4_attributes().then(|| V4Attrs {
+        change: self.root_listing_digest(),
+        atime_ns: 0,
+        mtime_ns: 0,
+        ctime_ns: 0,
+      }),
     }
   }
 
-  /// A cookie-verifier for the root listing: it changes when the set of volumes changes, so a client
-  /// continuing a listing across such a change is told to restart (a per-add/remove monotone token is
-  /// owed; the volume count catches the common add/remove).
+  /// A digest of the root's listing (each entry's name and volume id, in name order): equal for equal
+  /// listings and different for different ones (short of a 64-bit collision). The root has no stored
+  /// state to count changes in — the set is whatever the volumes and the presented capability make it
+  /// — so its change counter and its cookie verifier are the listing itself, digested: a client's
+  /// cached listing is kept exactly while it is still the listing (A-38).
+  fn root_listing_digest(&self) -> u64 {
+    let mut entries = self.set.entries();
+    entries.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (name, id) in &entries {
+      hasher.update(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes());
+      hasher.update(name.as_bytes());
+      hasher.update(&id.bytes);
+    }
+    let mut eight = [0u8; size_of::<u64>()];
+    eight.copy_from_slice(&hasher.finalize().as_bytes()[..size_of::<u64>()]);
+    u64::from_be_bytes(eight)
+  }
+
+  /// A cookie-verifier for the root listing: the listing's digest, so a client continuing a listing
+  /// across any change to it is told to restart.
   fn root_verf(&self) -> [u8; size_of::<u64>()] {
-    u64::try_from(self.set.entries().len())
-      .unwrap_or(0)
-      .to_be_bytes()
+    self.root_listing_digest().to_be_bytes()
   }
 
   /// Serves a request whose handle names the synthetic root: the read-only directory operations a
   /// client uses to mount `/` and browse the volumes, and a typed refusal for everything that would
   /// change the root (`NFS3ERR_ROFS`) or misread it (`READ`/`READLINK` of a directory).
-  fn serve_root(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>> {
+  fn serve_root(
+    &mut self,
+    dialect: Dialect,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>> {
     let reply = match procedure {
-      NFSPROC3_GETATTR => self.root_getattr(),
-      NFSPROC3_ACCESS => self.root_access(args),
-      NFSPROC3_LOOKUP => self.root_lookup(args),
-      NFSPROC3_READDIR => self.root_readdir(args, false),
-      NFSPROC3_READDIRPLUS => self.root_readdir(args, true),
-      NFSPROC3_FSINFO => self.root_fsinfo(),
-      NFSPROC3_FSSTAT => self.root_fsstat(),
+      NFSPROC3_GETATTR => self.root_getattr(dialect),
+      NFSPROC3_ACCESS => self.root_access(dialect, args),
+      NFSPROC3_LOOKUP => self.root_lookup(dialect, args),
+      NFSPROC3_READDIR => self.root_readdir(dialect, args, false),
+      NFSPROC3_READDIRPLUS => self.root_readdir(dialect, args, true),
+      NFSPROC3_FSINFO => self.root_fsinfo(dialect),
+      NFSPROC3_FSSTAT => self.root_fsstat(dialect),
       // COMMIT of the synthetic root: it holds no unwritten data, so it is a successful no-op.
       NFSPROC3_COMMIT => self.root_commit(),
       // PATHCONF of the synthetic root: its static POSIX limits.
-      NFSPROC3_PATHCONF => self.root_pathconf(),
+      NFSPROC3_PATHCONF => self.root_pathconf(dialect),
       // A directory cannot be read as a file or a symlink.
-      NFSPROC3_READ => post_attr_failure(Nfsstat3::Isdir, Some(self.root_fattr3())),
-      NFSPROC3_READLINK => post_attr_failure(Nfsstat3::Inval, Some(self.root_fattr3())),
+      NFSPROC3_READ => post_attr_failure(Nfsstat3::Isdir, Some(self.root_fattr3(dialect))),
+      NFSPROC3_READLINK => post_attr_failure(Nfsstat3::Inval, Some(self.root_fattr3(dialect))),
       // Everything that would change the root is refused: a volume appears by a metadata operation.
       NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
       | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_RENAME | NFSPROC3_LINK | NFSPROC3_MKNOD => {
@@ -307,10 +331,10 @@ impl<V: VolumeSet> MultiExport<V> {
   /// sees one uniform PATHCONF across the mount (RFC 1813 §3.3.20). The root is read-only and its names
   /// are volume ids, so it is case-sensitive; names are not truncated, chown is unrestricted, and case
   /// is preserved — the same shape a volume reports, with the shared [`PATHCONF_LINKMAX`].
-  fn root_pathconf(&self) -> Vec<u8> {
+  fn root_pathconf(&self, dialect: Dialect) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     Nfsstat3::Ok.encode(&mut writer);
-    PostOpAttr(Some(self.root_fattr3())).encode(&mut writer);
+    PostOpAttr(Some(self.root_fattr3(dialect))).encode(&mut writer);
     writer.u32(PATHCONF_LINKMAX); // linkmax
     writer.u32(u32::try_from(NFS_MAXNAMELEN).unwrap_or(u32::MAX)); // name_max
     writer.bool(true); // no_trunc
@@ -331,22 +355,22 @@ impl<V: VolumeSet> MultiExport<V> {
   }
 
   /// GETATTR of the root: its directory attributes.
-  fn root_getattr(&self) -> Vec<u8> {
+  fn root_getattr(&self, dialect: Dialect) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     Nfsstat3::Ok.encode(&mut writer);
-    self.root_fattr3().encode(&mut writer);
+    self.root_fattr3(dialect).encode(&mut writer);
     writer.into_bytes()
   }
 
   /// ACCESS of the root: it grants read, lookup and execute (search) among those requested — a
   /// read-only, listable, searchable directory.
-  fn root_access(&self, args: &mut XdrReader<'_>) -> Vec<u8> {
+  fn root_access(&self, dialect: Dialect, args: &mut XdrReader<'_>) -> Vec<u8> {
     let _fh = Nfsfh3::decode(args);
     let requested = args.u32().unwrap_or(0);
     let granted = (ACCESS3_READ | ACCESS3_LOOKUP | ACCESS3_EXECUTE) & requested;
     let mut writer = XdrWriter::new();
     Nfsstat3::Ok.encode(&mut writer);
-    PostOpAttr(Some(self.root_fattr3())).encode(&mut writer);
+    PostOpAttr(Some(self.root_fattr3(dialect))).encode(&mut writer);
     writer.u32(granted);
     writer.into_bytes()
   }
@@ -354,8 +378,8 @@ impl<V: VolumeSet> MultiExport<V> {
   /// LOOKUP of a name in the root: a mounted volume's name resolves to that volume's root handle and
   /// attributes (the same a direct mount gives), so a client `cd`s into the volume; any other name is
   /// `NFS3ERR_NOENT`.
-  fn root_lookup(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
-    let dir_attr = self.root_fattr3();
+  fn root_lookup(&mut self, dialect: Dialect, args: &mut XdrReader<'_>) -> Vec<u8> {
+    let dir_attr = self.root_fattr3(dialect);
     let _dir_fh = Nfsfh3::decode(args);
     let name = match args.string(NFS_MAXNAMELEN) {
       Ok(name) => name.to_owned(),
@@ -367,6 +391,7 @@ impl<V: VolumeSet> MultiExport<V> {
         self.subject.clone(),
         self.rights,
         self.groups.clone(),
+        dialect,
       )
     });
     match object {
@@ -385,8 +410,8 @@ impl<V: VolumeSet> MultiExport<V> {
   /// READDIR / READDIRPLUS of the root: the mounted volumes as entries, from the client's resume
   /// cookie, as many as the client's `count`/`maxcount` admits (each entry carries a resume cookie),
   /// then the end-of-directory flag. `NFS3ERR_TOOSMALL` if the budget cannot hold even one entry.
-  fn root_readdir(&mut self, args: &mut XdrReader<'_>, plus: bool) -> Vec<u8> {
-    let dir_attr = self.root_fattr3();
+  fn root_readdir(&mut self, dialect: Dialect, args: &mut XdrReader<'_>, plus: bool) -> Vec<u8> {
+    let dir_attr = self.root_fattr3(dialect);
     let verf = self.root_verf();
     let _dir_fh = Nfsfh3::decode(args);
     let cookie = args.u64().unwrap_or(0);
@@ -413,6 +438,7 @@ impl<V: VolumeSet> MultiExport<V> {
           self.subject.clone(),
           self.rights,
           self.groups.clone(),
+          dialect,
         )
       } else {
         None
@@ -444,10 +470,10 @@ impl<V: VolumeSet> MultiExport<V> {
   /// FSINFO of the root: static limits for the pseudo-filesystem. Transfers are one page (the root
   /// serves only listings), times are settable to a one-nanosecond granularity, and the filesystem is
   /// homogeneous; a real volume answers its own FSINFO once a client crosses into it.
-  fn root_fsinfo(&self) -> Vec<u8> {
+  fn root_fsinfo(&self, dialect: Dialect) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     Nfsstat3::Ok.encode(&mut writer);
-    PostOpAttr(Some(self.root_fattr3())).encode(&mut writer);
+    PostOpAttr(Some(self.root_fattr3(dialect))).encode(&mut writer);
     for value in [
       ROOT_TRANSFER, // rtmax
       ROOT_TRANSFER, // rtpref
@@ -466,10 +492,10 @@ impl<V: VolumeSet> MultiExport<V> {
   }
 
   /// FSSTAT of the root: an empty, read-only pseudo-filesystem — no space and no room to grow.
-  fn root_fsstat(&self) -> Vec<u8> {
+  fn root_fsstat(&self, dialect: Dialect) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     Nfsstat3::Ok.encode(&mut writer);
-    PostOpAttr(Some(self.root_fattr3())).encode(&mut writer);
+    PostOpAttr(Some(self.root_fattr3(dialect))).encode(&mut writer);
     writer.u64(0); // tbytes: total bytes in the filesystem
     writer.u64(0); // fbytes: free bytes
     writer.u64(0); // abytes: bytes available to the caller
@@ -483,6 +509,8 @@ impl<V: VolumeSet> MultiExport<V> {
 
 impl<V: VolumeSet> NfsService for MultiExport<V> {
   fn serve_mount(&mut self, path: &str) -> MountReply {
+    // MOUNT is an NFSv3-era protocol; the reply carries only the handle.
+    let dialect = Dialect::LOOPBACK_NFS3;
     let name = path.trim_matches('/');
     if name.is_empty() {
       // The host root: a client mounts `/` and browses the volumes as subdirectories — those the
@@ -500,6 +528,7 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
         self.subject.clone(),
         self.rights,
         self.groups.clone(),
+        dialect,
       )
     }) {
       Some((handle, _)) => MountReply::Ok {
@@ -510,13 +539,18 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
     }
   }
 
-  fn serve_procedure(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>> {
+  fn serve_procedure(
+    &mut self,
+    dialect: Dialect,
+    procedure: u32,
+    args: &mut XdrReader<'_>,
+  ) -> Option<Vec<u8>> {
     if procedure == NFSPROC3_NULL {
       return Some(Vec::new());
     }
     match peek_handle_volume(args) {
       // The synthetic root's own handle.
-      Some(volume) if volume == ROOT_VOLUME => self.serve_root(procedure, args),
+      Some(volume) if volume == ROOT_VOLUME => self.serve_root(dialect, procedure, args),
       // A volume's handle routes to that volume's transient serve; an unknown volume is stale.
       Some(volume) => Some(
         self
@@ -526,6 +560,7 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
             self.subject.clone(),
             self.rights,
             self.groups.clone(),
+            dialect,
             procedure,
             args,
           )
@@ -538,14 +573,6 @@ impl<V: VolumeSet> NfsService for MultiExport<V> {
 
   fn v4_root(&mut self) -> Nfsfh3 {
     root_handle_with(self.set.capability())
-  }
-
-  fn set_appledouble_views(&mut self, on: bool) {
-    self.set.set_appledouble_views(on);
-  }
-
-  fn appledouble_views(&self) -> bool {
-    self.set.appledouble_views()
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
@@ -570,7 +597,6 @@ pub struct OwnedVolume {
 pub struct OwnedVolumeSet {
   store: Store,
   volumes: Vec<OwnedVolume>,
-  appledouble_views: bool,
   /// The NFSv4 file state of the set's files (§4.6 A-36), lent to each transient export.
   files: crate::v4::files::FileState,
 }
@@ -581,7 +607,6 @@ impl OwnedVolumeSet {
     OwnedVolumeSet {
       store,
       volumes: Vec::new(),
-      appledouble_views: true,
       files: crate::v4::files::FileState::standalone(),
     }
   }
@@ -603,6 +628,7 @@ impl OwnedVolumeSet {
     subject: Principal,
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
+    dialect: Dialect,
     f: impl FnOnce(&mut Export<'_>) -> R,
   ) -> Option<R> {
     let store = &mut self.store;
@@ -611,7 +637,7 @@ impl OwnedVolumeSet {
     let mut bridge = VolumeBridge::new(volume, &mut slot.volume, store);
     let mut export = Export::new(&mut bridge, volume, subject, rights).ok()?;
     export.set_groups(groups);
-    export.set_appledouble_views(self.appledouble_views);
+    export.set_dialect(dialect);
     export.lend_file_state(files);
     Some(f(&mut export))
   }
@@ -632,11 +658,12 @@ impl VolumeSet for OwnedVolumeSet {
     subject: Principal,
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
+    dialect: Dialect,
     procedure: u32,
     args: &mut XdrReader<'_>,
   ) -> Option<Vec<u8>> {
     self
-      .with_export(volume, subject, rights, groups, |export| {
+      .with_export(volume, subject, rights, groups, dialect, |export| {
         export.serve_nfs(procedure, args)
       })
       .flatten()
@@ -648,20 +675,13 @@ impl VolumeSet for OwnedVolumeSet {
     subject: Principal,
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
+    dialect: Dialect,
   ) -> Option<(Nfsfh3, Fattr3)> {
     self
-      .with_export(volume, subject, rights, groups, |export| {
+      .with_export(volume, subject, rights, groups, dialect, |export| {
         export.root_object()
       })
       .flatten()
-  }
-
-  fn set_appledouble_views(&mut self, on: bool) {
-    self.appledouble_views = on;
-  }
-
-  fn appledouble_views(&self) -> bool {
-    self.appledouble_views
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {

@@ -1,0 +1,81 @@
+{
+  "schema": 1,
+  "suite": "workloads",
+  "transport": "native-linux-nfs4",
+  "host": {
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "root"
+  },
+  "date": "2026-09-27",
+  "command": "sh -c '<roster script>' in <host scratch>/<tool> and <mount>/<tool>, per tool of crates/conformance/src/workload.rs ROSTER; trees compared by manifest",
+  "bound": "9 tools run, one script each",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "workloads",
+      "tools": [
+        {
+          "name": "git",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "cargo",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "npm",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "python",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rg",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rsync",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "sqlite",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "editor",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "watcher",
+          "status": {
+            "kind": "identical"
+          }
+        }
+      ]
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 16092,
+  "notes": [
+    "the volume was created with --fold=false to match the host scratch's name policy; git identity and dates fixed; sqlite busy timeout 5000 ms; watcher wait 3 s"
+  ]
+}

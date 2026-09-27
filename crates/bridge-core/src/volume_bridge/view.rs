@@ -330,6 +330,7 @@ impl VolumeBridge<'_> {
       atime: mtime,
       mtime,
       ctime,
+      change: self.volume.view_change(self.store, owner)?,
     })
   }
 

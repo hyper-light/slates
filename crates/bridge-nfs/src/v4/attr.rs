@@ -1,7 +1,13 @@
 //! The NFSv4 attributes (`fattr4`, RFC 8881 §5.8; `xattr_support`, RFC 8276 §8.1): which the server
 //! supports, and the encoding of a requested set from an object's v3 attributes and the filesystem's
 //! figures. The values are encoded in ascending attribute number, as the attribute list requires.
+//!
+//! The supported set is every attribute this server encodes plus the two write-only times SETATTR
+//! and CREATE accept (`time_access_set`, `time_modify_set`): a client sets only what `supported_attrs`
+//! names — the Linux client drops `utimensat`'s explicit times otherwise — and a read of a write-only
+//! attribute is `NFS4ERR_INVAL` (§5.6), never a value.
 
+use super::Nfsstat4;
 use super::types::Bitmap;
 use crate::nfs::{Fattr3, Ftype3, Nfsfh3};
 use crate::xdr::XdrWriter;
@@ -84,18 +90,25 @@ pub mod number {
   pub const SPACE_USED: u32 = 45;
   /// Format: `FATTR4_TIME_ACCESS`.
   pub const TIME_ACCESS: u32 = 47;
+  /// Format: `FATTR4_TIME_ACCESS_SET` (write-only).
+  pub const TIME_ACCESS_SET: u32 = 48;
   /// Format: `FATTR4_TIME_DELTA`.
   pub const TIME_DELTA: u32 = 51;
   /// Format: `FATTR4_TIME_METADATA`.
   pub const TIME_METADATA: u32 = 52;
   /// Format: `FATTR4_TIME_MODIFY`.
   pub const TIME_MODIFY: u32 = 53;
+  /// Format: `FATTR4_TIME_MODIFY_SET` (write-only).
+  pub const TIME_MODIFY_SET: u32 = 54;
   /// Format: `FATTR4_MOUNTED_ON_FILEID`.
   pub const MOUNTED_ON_FILEID: u32 = 55;
   /// Format: `FATTR4_SUPPATTR_EXCLCREAT` (NFSv4.1, REQUIRED).
   pub const SUPPATTR_EXCLCREAT: u32 = 75;
-  /// Format: `FATTR4_XATTR_SUPPORT` (RFC 8276).
+  /// Format: `FATTR4_XATTR_SUPPORT` (RFC 8276, NFSv4.2).
   pub const XATTR_SUPPORT: u32 = 82;
+  /// Format: the highest attribute number NFSv4.1 defines (`suppattr_exclcreat`, RFC 8881 §5.8); every
+  /// higher one is NFSv4.2's.
+  pub const LAST_OF_MINOR_ONE: u32 = SUPPATTR_EXCLCREAT;
 }
 
 /// Format: `nfs_ftype4` values (RFC 8881 §3.3.4).
@@ -122,8 +135,6 @@ const FH4_PERSISTENT: u32 = 0;
 /// The filesystem-wide figures an attribute set may ask for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FsFigures {
-  /// The filesystem id (the export's `fsid`), as `(major, minor)`.
-  pub fsid: (u64, u64),
   /// The lease, in seconds.
   pub lease_seconds: u32,
   /// Whether names fold case (a folding volume, EQUIVALENCE §4).
@@ -142,10 +153,11 @@ pub struct FsFigures {
   pub max_io: u64,
 }
 
-/// The attributes this server supports: every number in [`number`].
-pub fn supported() -> Bitmap {
+/// The attributes this server supports in a compound of minor version `minor`: every number in
+/// [`number`], less NFSv4.2's in an NFSv4.1 compound (an attribute its version does not define).
+pub fn supported(minor: u32) -> Bitmap {
   use number::*;
-  Bitmap::of(&[
+  let all = [
     SUPPORTED_ATTRS,
     TYPE,
     FH_EXPIRE_TYPE,
@@ -184,13 +196,20 @@ pub fn supported() -> Bitmap {
     SPACE_TOTAL,
     SPACE_USED,
     TIME_ACCESS,
+    TIME_ACCESS_SET,
     TIME_DELTA,
     TIME_METADATA,
     TIME_MODIFY,
+    TIME_MODIFY_SET,
     MOUNTED_ON_FILEID,
     SUPPATTR_EXCLCREAT,
     XATTR_SUPPORT,
-  ])
+  ];
+  let defined: Vec<u32> = all
+    .into_iter()
+    .filter(|bit| minor >= super::MINOR_HIGHEST || *bit <= LAST_OF_MINOR_ONE)
+    .collect();
+  Bitmap::of(&defined)
 }
 
 /// Whether any of the attributes in `requested` needs the filesystem's figures (a v3 FSSTAT).
@@ -208,31 +227,73 @@ pub fn needs_fs_figures(requested: &Bitmap) -> bool {
   .any(|bit| requested.has(*bit))
 }
 
+/// The attributes SETATTR and a create set: size, mode, owner, group and the two times.
+pub fn settable() -> Bitmap {
+  use number::*;
+  Bitmap::of(&[
+    SIZE,
+    MODE,
+    OWNER,
+    OWNER_GROUP,
+    TIME_ACCESS_SET,
+    TIME_MODIFY_SET,
+  ])
+}
+
+/// `suppattr_exclcreat` (§5.8.1.14): what an EXCLUSIVE4_1 create sets — every settable attribute but
+/// the two times, which keep the create's verifier (§18.16.3 requires they be left out then). The Linux
+/// client sends in an exclusive create only the attributes named here and sets the rest afterwards
+/// (the times, but never the mode), so an empty set had left every `O_EXCL` file at the default mode.
+pub fn exclusive_create_settable() -> Bitmap {
+  use number::*;
+  Bitmap::of(&[SIZE, MODE, OWNER, OWNER_GROUP])
+}
+
+/// Refuses a read of `requested` that names an attribute that can be set and never read:
+/// `NFS4ERR_INVAL` (§5.6).
+pub fn check_readable(requested: &Bitmap) -> Result<(), Nfsstat4> {
+  let write_only = Bitmap::of(&[number::TIME_ACCESS_SET, number::TIME_MODIFY_SET]);
+  if requested.intersect(&write_only).is_empty() {
+    Ok(())
+  } else {
+    Err(Nfsstat4::Inval)
+  }
+}
+
 /// Encodes the attributes of `requested` this server supports, for an object with v3 attributes
-/// `attrs` and handle `handle`: the bitmap of those returned, then their values (`fattr4`).
+/// `attrs` and handle `handle`: the bitmap of those returned, then their values (`fattr4`). A request
+/// naming a write-only attribute is `NFS4ERR_INVAL` (§5.6) and writes nothing. `change` is the
+/// object's change counter, which the v3 layer carries in the front end's dialect (A-38): it moves on
+/// every change whatever the wall clock does, where the change time can repeat or step back; attributes
+/// without it did not come from that dialect, a server fault.
 pub fn encode(
-  requested: &Bitmap,
+  (requested, minor): (&Bitmap, u32),
   attrs: &Fattr3,
   handle: &Nfsfh3,
   fs: &FsFigures,
   writer: &mut XdrWriter,
-) {
+) -> Result<(), Nfsstat4> {
   use number::*;
-  let returned = requested.intersect(&supported());
+  check_readable(requested)?;
+  // The change counter and the full-range times ride after the `fattr3` fields in the front end's
+  // dialect; attributes without them are a server fault, never a guess from the 32-bit `fattr3`.
+  let v4 = attrs.v4.ok_or(Nfsstat4::Serverfault)?;
+  let returned = requested.intersect(&supported(minor));
   let mut values = XdrWriter::new();
   for bit in returned.bits() {
     match bit {
-      SUPPORTED_ATTRS => supported().encode(&mut values),
+      SUPPORTED_ATTRS => supported(minor).encode(&mut values),
       TYPE => values.u32(ftype4_of(attrs.kind)),
       FH_EXPIRE_TYPE => values.u32(FH4_PERSISTENT),
-      CHANGE => values.u64(change_of(attrs)),
+      CHANGE => values.u64(v4.change),
       SIZE => values.u64(attrs.size),
       LINK_SUPPORT | SYMLINK_SUPPORT | UNIQUE_HANDLES | CANSETTIME | CASE_PRESERVING
       | CHOWN_RESTRICTED | HOMOGENEOUS | NO_TRUNC | XATTR_SUPPORT => values.bool(true),
       NAMED_ATTR => values.bool(false),
       FSID => {
-        values.u64(fs.fsid.0);
-        values.u64(fs.fsid.1);
+        // The object's own filesystem: a volume root listed in the pseudo-root is its volume's.
+        values.u64(attrs.fsid);
+        values.u64(0);
       }
       LEASE_TIME => values.u32(fs.lease_seconds),
       RDATTR_ERROR => values.u32(0),
@@ -258,30 +319,42 @@ pub fn encode(
       SPACE_FREE => values.u64(fs.space.1),
       SPACE_TOTAL => values.u64(fs.space.2),
       SPACE_USED => values.u64(attrs.used),
-      TIME_ACCESS => time(&mut values, attrs.atime.seconds, attrs.atime.nseconds),
-      TIME_DELTA => time(&mut values, 0, 1),
-      TIME_METADATA => time(&mut values, attrs.ctime.seconds, attrs.ctime.nseconds),
-      TIME_MODIFY => time(&mut values, attrs.mtime.seconds, attrs.mtime.nseconds),
-      SUPPATTR_EXCLCREAT => Bitmap::default().encode(&mut values),
+      TIME_ACCESS => time(&mut values, v4.atime_ns),
+      TIME_DELTA => time(&mut values, 1),
+      TIME_METADATA => time(&mut values, v4.ctime_ns),
+      TIME_MODIFY => time(&mut values, v4.mtime_ns),
+      SUPPATTR_EXCLCREAT => exclusive_create_settable().encode(&mut values),
       _ => {}
     }
   }
   returned.encode(writer);
   writer.opaque(&values.into_bytes());
+  Ok(())
 }
 
-/// An `nfstime4`: signed seconds and nanoseconds.
-fn time(writer: &mut XdrWriter, seconds: u32, nseconds: u32) {
-  writer.u64(u64::from(seconds));
-  writer.u32(nseconds);
-}
-
-/// The `change` attribute: the change time in nanoseconds, which moves with every change to the
-/// object's data or attributes (the volume stamps `ctime` on each).
-fn change_of(attrs: &Fattr3) -> u64 {
+/// An `nfstime4` (RFC 8881 §3.3.1) of `ns` nanoseconds since the epoch: signed seconds, and the
+/// nanoseconds past them (never negative: a time before the epoch counts its seconds down).
+fn time(writer: &mut XdrWriter, ns: i64) {
   /// Format: nanoseconds per second.
-  const NS_PER_SECOND: u64 = 1_000_000_000;
-  u64::from(attrs.ctime.seconds) * NS_PER_SECOND + u64::from(attrs.ctime.nseconds)
+  const NS_PER_SECOND: i64 = 1_000_000_000;
+  writer.i64(ns.div_euclid(NS_PER_SECOND));
+  writer.u32(u32::try_from(ns.rem_euclid(NS_PER_SECOND)).unwrap_or(0));
+}
+
+/// The v3 file type a v4 one names; `None` for the v4-only named-attribute types (`NF4ATTRDIR`,
+/// `NF4NAMEDATTR`) and for values outside `nfs_ftype4`.
+pub(crate) fn ftype3_of(kind: u32) -> Option<Ftype3> {
+  [
+    Ftype3::Reg,
+    Ftype3::Dir,
+    Ftype3::Blk,
+    Ftype3::Chr,
+    Ftype3::Lnk,
+    Ftype3::Sock,
+    Ftype3::Fifo,
+  ]
+  .into_iter()
+  .find(|candidate| ftype4_of(*candidate) == kind)
 }
 
 /// The v4 file type of a v3 one.

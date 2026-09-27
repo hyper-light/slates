@@ -175,6 +175,33 @@ impl Nfstime3 {
   }
 }
 
+/// An NFSv4 timestamp (`nfstime4`, RFC 8881 §3.3.1): signed seconds since the Unix epoch and the
+/// nanoseconds past them. The front end's dialect carries client times this way inside a `sattr3`
+/// (A-38), so NFSv3's unsigned 32-bit seconds never limit an NFSv4 client.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Nfstime4 {
+  /// Signed seconds.
+  pub seconds: i64,
+  /// Nanoseconds, below one second.
+  pub nseconds: u32,
+}
+
+impl Nfstime4 {
+  /// Writes the timestamp.
+  pub fn encode(&self, writer: &mut XdrWriter) {
+    writer.i64(self.seconds);
+    writer.u32(self.nseconds);
+  }
+
+  /// Reads a timestamp.
+  pub fn decode(reader: &mut XdrReader<'_>) -> Result<Nfstime4, XdrError> {
+    Ok(Nfstime4 {
+      seconds: reader.i64()?,
+      nseconds: reader.u32()?,
+    })
+  }
+}
+
 /// A device's major/minor pair (`specdata3`); zero for a non-device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Specdata3 {
@@ -213,10 +240,30 @@ pub struct Fattr3 {
   pub mtime: Nfstime3,
   /// The last change time.
   pub ctime: Nfstime3,
+  /// What a reply to the NFSv4 front end carries after the `fattr3` fields (the
+  /// [`crate::procedures::Dialect::Nfs4`] dialect); `None` in an NFSv3 reply, which carries exactly RFC
+  /// 1813's structure (A-38).
+  pub v4: Option<V4Attrs>,
+}
+
+/// The attributes NFSv4 has and `fattr3` cannot hold, carried to the front end after the `fattr3`
+/// fields (A-38): the change counter, and the three times at the volume's full range and precision —
+/// nanoseconds in an `i64`, before 1970 and past 2106 included, where `nfstime3`'s seconds are an
+/// unsigned 32-bit count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V4Attrs {
+  /// The change counter.
+  pub change: u64,
+  /// The access time, nanoseconds since the Unix epoch.
+  pub atime_ns: i64,
+  /// The modification time.
+  pub mtime_ns: i64,
+  /// The change time.
+  pub ctime_ns: i64,
 }
 
 impl Fattr3 {
-  /// Writes the attributes in `fattr3` field order.
+  /// Writes the attributes in `fattr3` field order, then the change counter when it is carried.
   pub fn encode(&self, writer: &mut XdrWriter) {
     writer.u32(self.kind as u32);
     writer.u32(self.mode);
@@ -232,6 +279,25 @@ impl Fattr3 {
     self.atime.encode(writer);
     self.mtime.encode(writer);
     self.ctime.encode(writer);
+    if let Some(v4) = self.v4 {
+      writer.u64(v4.change);
+      writer.i64(v4.atime_ns);
+      writer.i64(v4.mtime_ns);
+      writer.i64(v4.ctime_ns);
+    }
+  }
+
+  /// Reads the attributes and what follows them in a reply to the NFSv4 front end
+  /// ([`crate::procedures::Dialect::Nfs4`], [`V4Attrs`]).
+  pub fn decode_with_change(reader: &mut XdrReader<'_>) -> Result<Fattr3, XdrError> {
+    let mut attrs = Fattr3::decode(reader)?;
+    attrs.v4 = Some(V4Attrs {
+      change: reader.u64()?,
+      atime_ns: reader.i64()?,
+      mtime_ns: reader.i64()?,
+      ctime_ns: reader.i64()?,
+    });
+    Ok(attrs)
   }
 
   /// Reads the attributes, refusing an unknown file type.
@@ -266,7 +332,78 @@ impl Fattr3 {
       atime,
       mtime,
       ctime,
+      v4: None,
     })
+  }
+}
+
+/// The attributes a `wcc_data` carries from before an operation (`wcc_attr`, RFC 1813 §2.6): the
+/// size and the two times a client compares with its cache, then — in a reply to the NFSv4 front end
+/// — the change counter, from which it builds an atomic `change_info4` (A-38).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WccAttr {
+  /// The size in bytes.
+  pub size: u64,
+  /// The last modification time.
+  pub mtime: Nfstime3,
+  /// The last change time.
+  pub ctime: Nfstime3,
+  /// The change counter, carried only in the NFSv4 dialect (as [`Fattr3::change`]).
+  pub change: Option<u64>,
+}
+
+/// A `wcc_data` (RFC 1813 §2.6): the object's attributes immediately before and after the
+/// operation. slates takes both inside the one call on the owner shard, so nothing else changed the
+/// object between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Wcc {
+  /// The attributes before (`pre_op_attr`), `None` when the operation refused before its effect.
+  pub pre: Option<WccAttr>,
+  /// The attributes after (`post_op_attr`).
+  pub post: Option<Fattr3>,
+}
+
+impl Wcc {
+  /// The `wcc_data` of a call that refused: the object's attributes as they are, and no pre-operation
+  /// half (the refusal changed nothing).
+  pub fn refused(post: Option<Fattr3>) -> Wcc {
+    Wcc { pre: None, post }
+  }
+
+  /// Writes the `wcc_data`.
+  pub fn encode(&self, writer: &mut XdrWriter) {
+    match &self.pre {
+      Some(pre) => {
+        writer.bool(true);
+        writer.u64(pre.size);
+        pre.mtime.encode(writer);
+        pre.ctime.encode(writer);
+        if let Some(change) = pre.change {
+          writer.u64(change);
+        }
+      }
+      None => writer.bool(false),
+    }
+    PostOpAttr(self.post).encode(writer);
+  }
+
+  /// Reads a `wcc_data` of a reply to the NFSv4 front end, change counters included.
+  pub fn decode_with_change(reader: &mut XdrReader<'_>) -> Result<Wcc, XdrError> {
+    let pre = if reader.bool()? {
+      let size = reader.u64()?;
+      let mtime = Nfstime3::decode(reader)?;
+      let ctime = Nfstime3::decode(reader)?;
+      Some(WccAttr {
+        size,
+        mtime,
+        ctime,
+        change: Some(reader.u64()?),
+      })
+    } else {
+      None
+    };
+    let post = PostOpAttr::decode_with_change(reader)?.0;
+    Ok(Wcc { pre, post })
   }
 }
 
@@ -291,6 +428,15 @@ impl PostOpAttr {
   pub fn decode(reader: &mut XdrReader<'_>) -> Result<PostOpAttr, XdrError> {
     if reader.bool()? {
       Ok(PostOpAttr(Some(Fattr3::decode(reader)?)))
+    } else {
+      Ok(PostOpAttr(None))
+    }
+  }
+
+  /// Reads the optional attributes of a reply to the NFSv4 front end, change counter included.
+  pub fn decode_with_change(reader: &mut XdrReader<'_>) -> Result<PostOpAttr, XdrError> {
+    if reader.bool()? {
+      Ok(PostOpAttr(Some(Fattr3::decode_with_change(reader)?)))
     } else {
       Ok(PostOpAttr(None))
     }

@@ -34,13 +34,15 @@ use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 use slates_vfs::xattr::XattrSet;
 
-use crate::v4::files::FileState;
+use crate::v4::files::{FileState, IoAuthority, IoWant};
 use crate::v4::types::Stateid;
 
 use crate::access::{self, Caller, Denial, UnixGroups, Want};
 use crate::handle::{FileHandle, FileHandleError};
 use crate::mount::{MountReply, Mountstat3};
-use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3};
+use crate::nfs::{
+  Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr, Specdata3, V4Attrs, Wcc, WccAttr,
+};
 use crate::xdr::{XdrReader, XdrWriter};
 
 /// Format: the NFS program number (RFC 1813).
@@ -96,6 +98,15 @@ pub const NFSPROC3_COMMIT: u32 = 21;
 /// Format: NFSPROC3_PATHCONF (RFC 1813 procedure 20) — the POSIX pathconf limits of the filesystem an
 /// object lives in (name and link maxima, truncation, chown restriction, case behaviour).
 pub const NFSPROC3_PATHCONF: u32 = 20;
+
+/// Format: the kind of I/O a STATE_CHECK extension asks about, after its state id (A-38; RFC 8881
+/// §9.1.2): a read, or a write-type operation.
+pub mod io_want {
+  /// Format: a read.
+  pub const READ: u32 = 0;
+  /// Format: a write-type operation.
+  pub const WRITE: u32 = 1;
+}
 
 /// Format: the procedures the NFSv4 front end serves through this dispatch beyond RFC 1813's (A-35):
 /// numbered past its last procedure, so no RFC 1813 number is reused, and never served from the wire
@@ -275,9 +286,28 @@ const NS_PER_SEC: i64 = 1_000_000_000;
 const CREATE_UNCHECKED: u32 = 0;
 /// Format: `createmode3` GUARDED: create the file, or fail `NFS3ERR_EXIST` if the name exists.
 const CREATE_GUARDED: u32 = 1;
-/// Format: `createmode3` EXCLUSIVE: an idempotent create keyed by an 8-byte verifier. slates keeps
-/// no create-verifier table yet, so it is refused `NFS3ERR_NOTSUPP` (owed); a client retries GUARDED.
+/// Format: `createmode3` EXCLUSIVE: an idempotent create keyed by an 8-byte verifier (`createverf3`),
+/// which the server keeps with the file so a retry of the same create succeeds (RFC 1813 §3.3.8; see
+/// [`exclusive_times`]).
 const CREATE_EXCLUSIVE: u32 = 2;
+/// Format: the size of a `createverf3` (RFC 1813 §2.5: `NFS3_CREATEVERFSIZE`).
+pub const CREATEVERF_SIZE: usize = 8;
+
+/// The times an exclusive create keeps its verifier in (RFC 1813 §3.3.8, RFC 8881 §18.16.3): the
+/// first four bytes as the modification time's seconds and the last four as the access time's, with no
+/// nanoseconds. The times are in the volume and its recovery image, so a create retried after a daemon
+/// restart still finds its verifier; the client sets the real times right after (a Linux v4 client
+/// because `suppattr_exclcreat` leaves the times out). `(mtime, atime)` in nanoseconds.
+pub fn exclusive_times(verifier: [u8; CREATEVERF_SIZE]) -> (i64, i64) {
+  let mut mtime = [0u8; size_of::<u32>()];
+  let mut atime = [0u8; size_of::<u32>()];
+  mtime.copy_from_slice(&verifier[..size_of::<u32>()]);
+  atime.copy_from_slice(&verifier[size_of::<u32>()..]);
+  (
+    i64::from(u32::from_be_bytes(mtime)) * NS_PER_SEC,
+    i64::from(u32::from_be_bytes(atime)) * NS_PER_SEC,
+  )
+}
 /// Format: the mode a CREATE falls back to when the client's `sattr3` omits one — a regular file,
 /// `rw-r--r--`. A client sets the mode in practice, so this is only a defensive default.
 const DEFAULT_FILE_MODE: u32 = 0o644;
@@ -329,6 +359,55 @@ impl Registry<'_> {
   }
 }
 
+/// The protocol a call to the NFSv3 semantic layer answers for. Both versions share one semantics
+/// (A-35); what differs is carried per call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dialect {
+  /// An NFSv3 client on the wire: replies carry exactly RFC 1813's structures.
+  Nfs3 {
+    /// Whether a missing `._name` beside `name` is served as the AppleDouble view of `name`'s
+    /// attributes (§4.6 A-33). Only the macOS NFSv3 client stores attributes that way, so only a
+    /// request from it may reach a view; for any other client a `._name` is an ordinary name, so
+    /// creating, removing or renaming one never touches another file's attributes.
+    appledouble_views: bool,
+  },
+  /// The NFSv4 front end: no AppleDouble views (a v4 client carries attributes itself); every `fattr3`
+  /// of the reply is followed by the object's change counter and full-range times, and every
+  /// `wcc_attr` by its counter, which the front end serves as `change`, `nfstime4` and `change_info4`;
+  /// and a `sattr3`'s client times are `nfstime4` (A-38). Only the front end speaks it; a wire call
+  /// never does.
+  Nfs4,
+}
+
+impl Dialect {
+  /// The macOS NFSv3 client, which stores attributes in `._name` files.
+  pub const MACOS_NFS3: Dialect = Dialect::Nfs3 {
+    appledouble_views: true,
+  };
+
+  /// Format: the NFSv3 client of a loopback mount on this host: the macOS client on macOS (AppleDouble
+  /// views served), any other host's client elsewhere, where a `._name` is an ordinary name (§4.6 A-33).
+  pub const LOOPBACK_NFS3: Dialect = Dialect::Nfs3 {
+    appledouble_views: cfg!(target_os = "macos"),
+  };
+
+  /// Whether a `._name` may be served as an AppleDouble view.
+  pub fn appledouble_views(self) -> bool {
+    matches!(
+      self,
+      Dialect::Nfs3 {
+        appledouble_views: true
+      }
+    )
+  }
+
+  /// Whether replies carry what NFSv4 has and NFSv3 cannot hold ([`crate::nfs::V4Attrs`]: the change
+  /// counter and full-range times) and client times come as `nfstime4`: the front end's dialect.
+  pub fn carries_v4_attributes(self) -> bool {
+    self == Dialect::Nfs4
+  }
+}
+
 /// An NFSv3 export of one volume over the shared operation layer. Handles it mints and accepts name
 /// objects of `volume`; a handle for another volume is refused stale. The export edge admits one
 /// attachment at mount time for the enrolled subject (§4.13), and every procedure rides the
@@ -354,12 +433,10 @@ pub struct Export<'b> {
   /// ([`Self::set_write_verifier`]); a standalone export, which has no restart to survive, keeps the
   /// volume-derived default.
   write_verifier: [u8; size_of::<u64>()],
-  /// Whether a missing `._name` beside `name` is served as the AppleDouble view of `name`'s
-  /// attributes (§4.6 A-33). Only the macOS NFSv3 client stores attributes that way, so only a request
-  /// from it may reach a view; for any other client a `._name` is an ordinary name, so creating,
-  /// removing or renaming one never touches another file's attributes. On by default (the macOS loopback
-  /// mount); the connection that knows its client sets it ([`Self::set_appledouble_views`]).
-  appledouble_views: bool,
+  /// The protocol the request being served answers for ([`Dialect`]): an NFSv3 client, and whether
+  /// it reaches AppleDouble views, or the NFSv4 front end. The NFSv3 macOS client by default (the
+  /// loopback mount); the connection that knows its client sets it ([`Self::set_dialect`]).
+  dialect: Dialect,
   /// The NFSv4 file state of the files this export serves (§4.6 A-36): its own for a standalone export,
   /// or the owner shard's, lent for the request ([`Self::lend_file_state`]).
   files: FileSlot<'b>,
@@ -405,7 +482,7 @@ impl<'b> Export<'b> {
         groups: None,
       },
       write_verifier: fsid,
-      appledouble_views: true,
+      dialect: Dialect::MACOS_NFS3,
       files: FileSlot::Owned(Box::new(FileState::standalone())),
       capability: (0, [0u8; 16]),
     })
@@ -439,7 +516,7 @@ impl<'b> Export<'b> {
         groups: None,
       },
       write_verifier: fsid,
-      appledouble_views: true,
+      dialect: Dialect::MACOS_NFS3,
       files: FileSlot::Absent,
       capability: (0, [0u8; 16]),
     }
@@ -501,19 +578,19 @@ impl<'b> Export<'b> {
     }
   }
 
-  /// Serves AppleDouble views (`on`) or treats every `._name` as an ordinary name (§4.6 A-33).
-  pub fn set_appledouble_views(&mut self, on: bool) {
-    self.appledouble_views = on;
+  /// Sets the protocol the next requests answer for ([`Dialect`]).
+  pub fn set_dialect(&mut self, dialect: Dialect) {
+    self.dialect = dialect;
   }
 
-  /// Whether AppleDouble views are served.
-  pub fn appledouble_views(&self) -> bool {
-    self.appledouble_views
+  /// The protocol the requests answer for.
+  pub fn dialect(&self) -> Dialect {
+    self.dialect
   }
 
   /// The owner a `._name` is the AppleDouble view of, when views are served.
   fn view_owner<'n>(&self, name: &'n str) -> Option<&'n str> {
-    if self.appledouble_views {
+    if self.dialect.appledouble_views() {
       appledouble_owner(name)
     } else {
       None
@@ -541,9 +618,9 @@ impl<'b> Export<'b> {
   fn writable_directory(
     &mut self,
     identity: &FileHandle,
-  ) -> Result<NodeAttr, (Nfsstat3, Option<Fattr3>)> {
+  ) -> Result<NodeAttr, (Nfsstat3, Option<NodeAttr>)> {
     let node = self.attrs_of(identity).map_err(|status| (status, None))?;
-    let attr = Some(self.fattr3(&node));
+    let attr = Some(node);
     if !access::permits(&self.caller, &node, Want::Search)
       || !access::permits(&self.caller, &node, Want::Write)
     {
@@ -623,6 +700,44 @@ impl<'b> Export<'b> {
       atime: nfstime_of(node.atime),
       mtime: nfstime_of(node.mtime),
       ctime: nfstime_of(node.ctime),
+      v4: self.dialect.carries_v4_attributes().then_some(V4Attrs {
+        change: node.change,
+        atime_ns: node.atime,
+        mtime_ns: node.mtime,
+        ctime_ns: node.ctime,
+      }),
+    }
+  }
+
+  /// The `wcc_attr` of an object as it is now, taken immediately before an operation changes it.
+  fn wcc_attr(&self, node: &NodeAttr) -> WccAttr {
+    WccAttr {
+      size: node.size,
+      mtime: nfstime_of(node.mtime),
+      ctime: nfstime_of(node.ctime),
+      change: self.dialect.carries_v4_attributes().then_some(node.change),
+    }
+  }
+
+  /// The `wcc_data` of a call that refused before its effect: the object's current attributes, and no
+  /// pre-operation half (nothing changed).
+  fn unchanged(&self, node: &NodeAttr) -> Wcc {
+    self.refused(Some(*node))
+  }
+
+  /// The `wcc_data` of a refusal carrying the object's attributes as they are (`node`, when read):
+  /// rendered here, once, so a refusal moves the neutral attributes and not an encoded `fattr3`.
+  fn refused(&self, node: Option<NodeAttr>) -> Wcc {
+    Wcc::refused(node.map(|node| self.fattr3(&node)))
+  }
+
+  /// The `wcc_data` of the object `identity` names after a call: `pre` as taken immediately before its
+  /// effect, and its attributes now. Both are read inside the one call on the owner shard, so nothing
+  /// else changed the object between them (A-38).
+  fn wcc_after(&mut self, pre: Option<WccAttr>, identity: &FileHandle) -> Wcc {
+    Wcc {
+      pre,
+      post: self.attrs_of(identity).ok().map(|node| self.fattr3(&node)),
     }
   }
 
@@ -741,7 +856,7 @@ impl<'b> Export<'b> {
       }
       Err((status, directory)) => {
         status.encode(&mut writer);
-        PostOpAttr(directory).encode(&mut writer);
+        PostOpAttr(directory.map(|node| self.fattr3(&node))).encode(&mut writer);
       }
     }
     writer.into_bytes()
@@ -751,7 +866,7 @@ impl<'b> Export<'b> {
   fn lookup_result(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> Result<(Nfsfh3, Fattr3, Option<Fattr3>), (Nfsstat3, Option<Fattr3>)> {
+  ) -> Result<(Nfsfh3, Fattr3, Option<Fattr3>), (Nfsstat3, Option<NodeAttr>)> {
     // `diropargs3`: the directory handle then the name.
     let dir_handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let name = args
@@ -765,7 +880,7 @@ impl<'b> Export<'b> {
     let dir_node = self
       .attrs_of(&dir_identity)
       .map_err(|status| (status, None))?;
-    let dir_attr = Some(self.fattr3(&dir_node));
+    let dir_attr = Some(dir_node);
     // POSIX: resolving a name needs search permission on the directory.
     if !access::permits(&self.caller, &dir_node, Want::Search) {
       return Err((Nfsstat3::Acces, dir_attr));
@@ -783,7 +898,7 @@ impl<'b> Export<'b> {
     .map_err(|e| (nfsstat_of(&e), dir_attr))?;
     let handle = self.handle_for(child.ino, child.generation);
     let object = self.fattr3(&child);
-    Ok((handle, object, dir_attr))
+    Ok((handle, object, dir_attr.map(|node| self.fattr3(&node))))
   }
 
   /// NFSPROC3_ACCESS: which requested operations the caller may perform on an object — the exact POSIX
@@ -821,8 +936,13 @@ impl<'b> Export<'b> {
   /// shared inode-addressed interface under the export's context. The reply carries the file's
   /// post-read attributes, the byte count, the end-of-file flag, and the data.
   pub fn read(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    self.read_as(args, IoAuthority::Mode)
+  }
+
+  /// READ under `authority`: the object's mode, or an NFSv4 open that authorized it (A-38).
+  fn read_as(&mut self, args: &mut XdrReader<'_>, authority: IoAuthority) -> Vec<u8> {
     let mut writer = XdrWriter::new();
-    match self.read_result(args) {
+    match self.read_result(args, authority) {
       Ok((post, count, eof, data)) => {
         Nfsstat3::Ok.encode(&mut writer);
         PostOpAttr(Some(post)).encode(&mut writer);
@@ -832,7 +952,7 @@ impl<'b> Export<'b> {
       }
       Err((status, post)) => {
         status.encode(&mut writer);
-        PostOpAttr(post).encode(&mut writer);
+        PostOpAttr(post.map(|node| self.fattr3(&node))).encode(&mut writer);
       }
     }
     writer.into_bytes()
@@ -842,7 +962,8 @@ impl<'b> Export<'b> {
   fn read_result(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> Result<(Fattr3, u32, bool, Vec<u8>), (Nfsstat3, Option<Fattr3>)> {
+    authority: IoAuthority,
+  ) -> Result<(Fattr3, u32, bool, Vec<u8>), (Nfsstat3, Option<NodeAttr>)> {
     // READ3args: the file handle, the offset, the byte count.
     let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
@@ -853,20 +974,20 @@ impl<'b> Export<'b> {
     let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
     let post = self.fattr3(&node);
     // POSIX: reading a file's bytes needs read permission (the owner reads its own file whatever the
-    // bits say — the I/O owner override, `crate::access`).
-    if !access::permits_io(&self.caller, &node, Want::Read) {
-      return Err((Nfsstat3::Acces, Some(post)));
+    // bits say — the I/O owner override, `crate::access`) unless an open authorized it.
+    if authority == IoAuthority::Mode && !access::permits_io(&self.caller, &node, Want::Read) {
+      return Err((Nfsstat3::Acces, Some(node)));
     }
     let cx = self
       .op_context()
-      .map_err(|e| (nfsstat_of(&e), Some(post)))?;
+      .map_err(|e| (nfsstat_of(&e), Some(node)))?;
     let object = ObjectId::new(identity.inode, identity.generation);
     let want = count.min(MAX_TRANSFER);
     let mut data = Vec::new();
     self
       .bridge
       .read(object, &cx, offset, want, &mut data)
-      .map_err(|e| (nfsstat_of(&e), Some(post)))?;
+      .map_err(|e| (nfsstat_of(&e), Some(node)))?;
     let end = offset.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
     let eof = end >= node.size;
     let read = u32::try_from(data.len()).unwrap_or(u32::MAX);
@@ -912,6 +1033,27 @@ impl<'b> Export<'b> {
     Ok((found, node.size))
   }
 
+  /// The kind of I/O a state-carrying procedure is (RFC 8881 §9.1.2): READ reads, WRITE writes, and a
+  /// SETATTR writes when it sets the size and otherwise touches attributes only.
+  fn io_want(&mut self, inner: u32, v3_args: &[u8]) -> Result<IoWant, crate::v4::Nfsstat4> {
+    match inner {
+      NFSPROC3_READ => Ok(IoWant::Read),
+      NFSPROC3_WRITE => Ok(IoWant::Write),
+      _ => {
+        let mut args = XdrReader::new(v3_args);
+        Nfsfh3::decode(&mut args).map_err(|_| crate::v4::Nfsstat4::Badxdr)?;
+        let (changes, _) = self
+          .decode_sattr3(&mut args)
+          .map_err(|_| crate::v4::Nfsstat4::Badxdr)?;
+        Ok(if changes.size.is_some() {
+          IoWant::Write
+        } else {
+          IoWant::Attributes
+        })
+      }
+    }
+  }
+
   /// A state-carrying I/O extension (§4.6 A-36): the client id and state id trail the NFSv3
   /// arguments; the state id is checked against the file's state here at the owner, and the NFSv3
   /// procedure is then served over the same argument bytes. The result is the state status, then (when
@@ -936,20 +1078,33 @@ impl<'b> Export<'b> {
       writer.u32(crate::v4::Nfsstat4::Badhandle.wire());
       return writer.into_bytes();
     };
+    let inner = state_io_inner(procedure).unwrap_or(NFSPROC3_NULL);
+    let want = match self.io_want(inner, v3_args) {
+      Ok(want) => want,
+      Err(status) => {
+        writer.u32(status.wire());
+        return writer.into_bytes();
+      }
+    };
     let checked = self
       .file_states()
       .map_or(Err(crate::v4::Nfsstat4::Serverfault), |files| {
-        files.check_io(&stateid, &handle, clientid)
+        files.check_io(&stateid, &handle, clientid, want)
       });
-    if let Err(status) = checked {
-      writer.u32(status.wire());
-      return writer.into_bytes();
-    }
-    let inner = state_io_inner(procedure).unwrap_or(NFSPROC3_NULL);
+    let authority = match checked {
+      Ok(authority) => authority,
+      Err(status) => {
+        writer.u32(status.wire());
+        return writer.into_bytes();
+      }
+    };
     writer.u32(crate::v4::Nfsstat4::Ok.wire());
-    let served = self
-      .serve_nfs(inner, &mut XdrReader::new(v3_args))
-      .unwrap_or_default();
+    let mut v3_args = XdrReader::new(v3_args);
+    let served = match inner {
+      NFSPROC3_READ => self.read_as(&mut v3_args, authority),
+      NFSPROC3_WRITE => self.write_as(&mut v3_args, authority),
+      _ => self.setattr_as(&mut v3_args, authority),
+    };
     writer.fixed(&served);
     writer.into_bytes()
   }
@@ -1009,7 +1164,10 @@ impl<'b> Export<'b> {
           writer.opaque(name);
         }
       }
-      Ok(XattrReply::Done) => Nfsstat3::Ok.encode(&mut writer),
+      Ok(XattrReply::Done(wcc)) => {
+        Nfsstat3::Ok.encode(&mut writer);
+        encode_wcc(&mut writer, wcc);
+      }
       Err(status) => writer.u32(status),
     }
     writer.into_bytes()
@@ -1035,6 +1193,8 @@ impl<'b> Export<'b> {
     }
     let cx = self.op_context().map_err(|e| wire(nfsstat_of(&e)))?;
     let object = ObjectId::new(identity.inode, identity.generation);
+    // A set or a removal answers the object's `wcc_data`, for the front end's `change_info4` (A-38).
+    let pre = Some(self.wcc_attr(&node));
     let name = |args: &mut XdrReader<'_>| {
       args
         .opaque(slates_vfs::xattr::XATTR_NAME_MAX_BYTES)
@@ -1070,8 +1230,8 @@ impl<'b> Export<'b> {
         self
           .bridge
           .xattr_set(object, &cx, &name, &value, how)
-          .map(|()| XattrReply::Done)
-          .map_err(refused)
+          .map_err(refused)?;
+        Ok(XattrReply::Done(self.wcc_after(pre, &identity)))
       }
       extension::XATTR_LIST => self
         .bridge
@@ -1083,8 +1243,8 @@ impl<'b> Export<'b> {
         self
           .bridge
           .xattr_remove(object, &cx, &name)
-          .map(|()| XattrReply::Done)
-          .map_err(refused)
+          .map_err(refused)?;
+        Ok(XattrReply::Done(self.wcc_after(pre, &identity)))
       }
     }
   }
@@ -1098,18 +1258,23 @@ impl<'b> Export<'b> {
   /// ([`io_failure_reply`]). A write against a read-only export or a pinned view is refused by the
   /// seam before any effect.
   pub fn write(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    self.write_as(args, IoAuthority::Mode)
+  }
+
+  /// WRITE under `authority`: the object's mode, or an NFSv4 open that authorized it (A-38).
+  fn write_as(&mut self, args: &mut XdrReader<'_>, authority: IoAuthority) -> Vec<u8> {
     let mut writer = XdrWriter::new();
-    match self.write_result(args) {
-      Ok((post, count, committed)) => {
+    match self.write_result(args, authority) {
+      Ok((wcc, count, committed)) => {
         Nfsstat3::Ok.encode(&mut writer);
-        encode_wcc(&mut writer, Some(post));
+        encode_wcc(&mut writer, wcc);
         writer.u32(count);
         writer.u32(committed);
         writer.fixed(&self.write_verifier);
       }
       Err((status, post)) => {
         status.encode(&mut writer);
-        encode_wcc(&mut writer, post);
+        encode_wcc(&mut writer, self.refused(post));
       }
     }
     writer.into_bytes()
@@ -1118,7 +1283,8 @@ impl<'b> Export<'b> {
   fn write_result(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> Result<(Fattr3, u32, u32), (Nfsstat3, Option<Fattr3>)> {
+    authority: IoAuthority,
+  ) -> Result<(Wcc, u32, u32), (Nfsstat3, Option<NodeAttr>)> {
     // WRITE3args: the file handle, the offset, the byte count, the requested stability, the data.
     // The count is advisory (the data length is authoritative); the stability decides the reply's
     // `committed` level. Both are decoded so a malformed request is a typed refusal, and the data
@@ -1135,9 +1301,10 @@ impl<'b> Export<'b> {
     let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
     // POSIX: writing a file's bytes needs write permission (the owner writes its own file whatever the
     // bits say — the I/O owner override, `crate::access`).
-    if !access::permits_io(&self.caller, &node, Want::Write) {
-      return Err((Nfsstat3::Acces, Some(self.fattr3(&node))));
+    if authority == IoAuthority::Mode && !access::permits_io(&self.caller, &node, Want::Write) {
+      return Err((Nfsstat3::Acces, Some(node)));
     }
+    let pre = Some(self.wcc_attr(&node));
     let cx = self.op_context().map_err(|e| (nfsstat_of(&e), None))?;
     let object = ObjectId::new(identity.inode, identity.generation);
     let written = self
@@ -1159,13 +1326,13 @@ impl<'b> Export<'b> {
         .map_err(|e| (nfsstat_of(&e), None))?;
     }
     // The post-op attributes reflect the file after the write (the wcc's post half).
-    let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
+    let wcc = self.wcc_after(pre, &identity);
     let committed = if stable == UNSTABLE {
       UNSTABLE
     } else {
       FILE_SYNC
     };
-    Ok((self.fattr3(&node), written, committed))
+    Ok((wcc, written, committed))
   }
 
   /// NFSPROC3_COMMIT: make a file's unstable writes stable (RFC 1813 §3.3.21). The bytes an
@@ -1179,14 +1346,14 @@ impl<'b> Export<'b> {
   pub fn commit(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.commit_result(args) {
-      Ok(post) => {
+      Ok(wcc) => {
         Nfsstat3::Ok.encode(&mut writer);
-        encode_wcc(&mut writer, Some(post));
+        encode_wcc(&mut writer, wcc);
         writer.fixed(&self.write_verifier);
       }
       Err((status, post)) => {
         status.encode(&mut writer);
-        encode_wcc(&mut writer, post);
+        encode_wcc(&mut writer, self.refused(post));
       }
     }
     writer.into_bytes()
@@ -1195,7 +1362,7 @@ impl<'b> Export<'b> {
   fn commit_result(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
+  ) -> Result<Wcc, (Nfsstat3, Option<NodeAttr>)> {
     // COMMIT3args: the file handle, the offset, the byte count. Both range fields are advisory — the
     // host's barrier publishes the whole shard image, so every byte of the file is made stable
     // regardless of the requested range — but they are decoded so a malformed request is a typed
@@ -1208,7 +1375,7 @@ impl<'b> Export<'b> {
       .map_err(|status| (status, None))?;
     // The commit changes nothing in the volume; the file's current attributes are the wcc's post half.
     let node = self.attrs_of(&identity).map_err(|status| (status, None))?;
-    Ok(self.fattr3(&node))
+    Ok(self.unchanged(&node))
   }
 
   /// NFSPROC3_REMOVE / NFSPROC3_RMDIR: remove a name from a directory over the shared interface
@@ -1218,13 +1385,13 @@ impl<'b> Export<'b> {
   pub fn remove(&mut self, args: &mut XdrReader<'_>, is_dir: bool) -> Vec<u8> {
     let mut writer = XdrWriter::new();
     match self.remove_result(args, is_dir) {
-      Ok(dir_post) => {
+      Ok(dir_wcc) => {
         Nfsstat3::Ok.encode(&mut writer);
-        encode_wcc(&mut writer, Some(dir_post));
+        encode_wcc(&mut writer, dir_wcc);
       }
       Err((status, dir_post)) => {
         status.encode(&mut writer);
-        encode_wcc(&mut writer, dir_post);
+        encode_wcc(&mut writer, self.refused(dir_post));
       }
     }
     writer.into_bytes()
@@ -1234,7 +1401,7 @@ impl<'b> Export<'b> {
     &mut self,
     args: &mut XdrReader<'_>,
     is_dir: bool,
-  ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
+  ) -> Result<Wcc, (Nfsstat3, Option<NodeAttr>)> {
     // `diropargs3`: the directory handle then the name.
     let dir_handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let name = args
@@ -1249,7 +1416,7 @@ impl<'b> Export<'b> {
     // POSIX: removing an entry needs write and search permission on the directory, and in a sticky
     // directory only the entry's owner, the directory's owner or the superuser may remove it.
     let dir_node = self.writable_directory(&dir_identity)?;
-    let dir_attr = Some(self.fattr3(&dir_node));
+    let dir_attr = Some(dir_node);
     // Dot components name directories that cannot be removed through these entries (§4.6).
     // They are not stored names: a lookup would return NOENT, which NFS clients can interpret
     // as a successful retry of RMDIR (Apple nfs3_vnop_rmdir), falsely reporting a removal.
@@ -1262,7 +1429,7 @@ impl<'b> Export<'b> {
     }
     let entry = match self.bridge.lookup(parent, &cx, &name) {
       Err(VfsError::NotFound) if !is_dir => match self.view_owner(&name) {
-        Some(owner) => return self.remove_view(parent, &cx, owner, &dir_identity, dir_attr),
+        Some(owner) => return self.remove_view(parent, &cx, owner, &dir_identity, dir_node),
         None => Err(VfsError::NotFound),
       },
       found => found,
@@ -1271,6 +1438,7 @@ impl<'b> Export<'b> {
     if access::sticky_forbids(&self.caller, &dir_node, &entry) {
       return Err((Nfsstat3::Perm, dir_attr));
     }
+    let pre = Some(self.wcc_attr(&dir_node));
     let outcome = if is_dir {
       self.bridge.rmdir(parent, &cx, &name)
     } else {
@@ -1278,17 +1446,22 @@ impl<'b> Export<'b> {
     };
     // The directory's post-op attributes (its new link count) go in the wcc whether the remove
     // succeeded or failed.
-    let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    let dir_now = self.attrs_of(&dir_identity).ok();
+    let dir_wcc = Wcc {
+      pre,
+      post: dir_now.map(|node| self.fattr3(&node)),
+    };
     match outcome {
-      Ok(()) => dir_post.ok_or((Nfsstat3::ServerFault, None)),
-      Err(e) => Err((nfsstat_of(&e), dir_post)),
+      Ok(()) if dir_now.is_some() => Ok(dir_wcc),
+      Ok(()) => Err((Nfsstat3::ServerFault, None)),
+      Err(e) => Err((nfsstat_of(&e), dir_now)),
     }
   }
 
   /// The AppleDouble view a CREATE of `name` makes, when `name` is `._owner` with no entry of its
   /// own beside an existing `owner` (§4.6); `None` when it is an ordinary new name. Creating the view
   /// changes `owner`'s attributes, so the caller needs write permission on `owner`, not on the
-  /// directory; a GUARDED create of an existing view is `Exist`.
+  /// directory; a GUARDED or EXCLUSIVE create of an existing view is `Exist`.
   fn create_view(
     &mut self,
     parent: ObjectId,
@@ -1307,7 +1480,8 @@ impl<'b> Export<'b> {
     if !access::permits(&self.caller, &owner_node, Want::Write) {
       return Err(Nfsstat3::Acces);
     }
-    let exclusive = mode_kind == CREATE_GUARDED;
+    // GUARDED and EXCLUSIVE both refuse an existing view; only UNCHECKED opens one.
+    let exclusive = mode_kind != CREATE_UNCHECKED;
     let view = self
       .bridge
       .appledouble_create(parent, cx, owner, exclusive)
@@ -1323,8 +1497,9 @@ impl<'b> Export<'b> {
     cx: &OpContext,
     owner: &str,
     dir_identity: &FileHandle,
-    dir_attr: Option<Fattr3>,
-  ) -> Result<Fattr3, (Nfsstat3, Option<Fattr3>)> {
+    dir_node: NodeAttr,
+  ) -> Result<Wcc, (Nfsstat3, Option<NodeAttr>)> {
+    let dir_attr = Some(dir_node);
     let owner_node = self
       .bridge
       .lookup(parent, cx, owner)
@@ -1332,11 +1507,17 @@ impl<'b> Export<'b> {
     if !access::permits(&self.caller, &owner_node, Want::Write) {
       return Err((Nfsstat3::Acces, dir_attr));
     }
+    let pre = Some(self.wcc_attr(&dir_node));
     let outcome = self.bridge.appledouble_remove(parent, cx, owner);
-    let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
+    let dir_now = self.attrs_of(dir_identity).ok();
+    let dir_wcc = Wcc {
+      pre,
+      post: dir_now.map(|node| self.fattr3(&node)),
+    };
     match outcome {
-      Ok(()) => dir_post.ok_or((Nfsstat3::ServerFault, None)),
-      Err(e) => Err((nfsstat_of(&e), dir_post)),
+      Ok(()) if dir_now.is_some() => Ok(dir_wcc),
+      Ok(()) => Err((Nfsstat3::ServerFault, None)),
+      Err(e) => Err((nfsstat_of(&e), dir_now)),
     }
   }
 
@@ -1345,11 +1526,11 @@ impl<'b> Export<'b> {
   /// destination — so the neutral call uses the default flags. The reply is the source and
   /// destination directories' `wcc_data`.
   pub fn rename(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
-    let (status, from_post, to_post) = self.do_rename(args);
+    let (status, from_wcc, to_wcc) = self.do_rename(args);
     let mut writer = XdrWriter::new();
     status.encode(&mut writer);
-    encode_wcc(&mut writer, from_post); // fromdir_wcc
-    encode_wcc(&mut writer, to_post); // todir_wcc
+    encode_wcc(&mut writer, from_wcc); // fromdir_wcc
+    encode_wcc(&mut writer, to_wcc); // todir_wcc
     writer.into_bytes()
   }
 
@@ -1358,46 +1539,51 @@ impl<'b> Export<'b> {
   /// path too (RFC 1813 answers RENAME with both dirs' wcc regardless), `None` only when a
   /// directory handle itself does not resolve. A tuple, not a `Result`, so the two-attribute
   /// payload is never a large `Err` variant.
-  fn do_rename(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>, Option<Fattr3>) {
+  fn do_rename(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Wcc, Wcc) {
     // Two `diropargs3`: the source directory and name, then the destination directory and name.
     // The names are owned because a second handle is decoded from `args` between them.
     let from_dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, Wcc::default(), Wcc::default()),
     };
     let from_name = match args.string(NFS_MAXNAMELEN) {
       Ok(name) => name.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, Wcc::default(), Wcc::default()),
     };
     let to_dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, Wcc::default(), Wcc::default()),
     };
     let to_name = match args.string(NFS_MAXNAMELEN) {
       Ok(name) => name.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, Wcc::default(), Wcc::default()),
     };
     let from_identity = match self.resolve_handle(&from_dir_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, Wcc::default(), Wcc::default()),
     };
     let to_identity = match self.resolve_handle(&to_dir_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, Wcc::default(), Wcc::default()),
     };
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), None, None),
+      Err(e) => return (nfsstat_of(&e), Wcc::default(), Wcc::default()),
     };
     let from_parent = ObjectId::new(from_identity.inode, from_identity.generation);
     let to_parent = ObjectId::new(to_identity.inode, to_identity.generation);
     if let Err(status) =
       self.rename_permission(&from_identity, &to_identity, &from_name, &to_name, &cx)
     {
-      let from_post = self.attrs_of(&from_identity).ok().map(|n| self.fattr3(&n));
-      let to_post = self.attrs_of(&to_identity).ok().map(|n| self.fattr3(&n));
-      return (status, from_post, to_post);
+      let from_wcc = self.wcc_after(None, &from_identity);
+      let to_wcc = self.wcc_after(None, &to_identity);
+      return (status, from_wcc, to_wcc);
     }
+    let from_pre = self
+      .attrs_of(&from_identity)
+      .ok()
+      .map(|n| self.wcc_attr(&n));
+    let to_pre = self.attrs_of(&to_identity).ok().map(|n| self.wcc_attr(&n));
     let outcome = match self.adopt_sidecar(from_parent, to_parent, &cx, &from_name, &to_name) {
       Ok(true) => Ok(()),
       Ok(false) => self.bridge.rename(
@@ -1410,13 +1596,13 @@ impl<'b> Export<'b> {
       ),
       Err(e) => Err(e),
     };
-    let from_post = self.attrs_of(&from_identity).ok().map(|n| self.fattr3(&n));
-    let to_post = self.attrs_of(&to_identity).ok().map(|n| self.fattr3(&n));
+    let from_wcc = self.wcc_after(from_pre, &from_identity);
+    let to_wcc = self.wcc_after(to_pre, &to_identity);
     let status = match outcome {
       Ok(()) => Nfsstat3::Ok,
       Err(e) => nfsstat_of(&e),
     };
-    (status, from_post, to_post)
+    (status, from_wcc, to_wcc)
   }
 
   /// A rename of `._old` onto `._new`: the rename a macOS client issues to carry a sidecar along
@@ -1489,69 +1675,81 @@ impl<'b> Export<'b> {
   /// the update conditional on the object's `ctime` — a compare-and-set the client uses to avoid a
   /// lost update — refused `NFS3ERR_NOT_SYNC` when the guard does not match.
   pub fn setattr(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
-    let (status, post) = self.do_setattr(args);
+    self.setattr_as(args, IoAuthority::Mode)
+  }
+
+  /// SETATTR under `authority`: a size change by the object's mode, or by an NFSv4 open that authorized
+  /// it (A-38).
+  fn setattr_as(&mut self, args: &mut XdrReader<'_>, authority: IoAuthority) -> Vec<u8> {
+    let (status, wcc) = self.do_setattr(args, authority);
     let mut writer = XdrWriter::new();
     status.encode(&mut writer);
-    encode_wcc(&mut writer, post);
+    encode_wcc(&mut writer, wcc);
     writer.into_bytes()
   }
 
-  fn do_setattr(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>) {
+  fn do_setattr(&mut self, args: &mut XdrReader<'_>, authority: IoAuthority) -> (Nfsstat3, Wcc) {
     // SETATTR3args: the object handle, the new attributes (sattr3), then the guard (sattr_guard3).
     let handle = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None),
+      Err(_) => return (Nfsstat3::Badhandle, Wcc::default()),
     };
     let (changes, explicit_times) = match self.decode_sattr3(args) {
       Ok(decoded) => decoded,
-      Err(status) => return (status, None),
+      Err(status) => return (status, Wcc::default()),
     };
     // sattr_guard3: a bool, then (if set) the ctime the object must currently have.
     let guarded = match args.bool() {
       Ok(b) => b,
-      Err(_) => return (Nfsstat3::Inval, None),
+      Err(_) => return (Nfsstat3::Inval, Wcc::default()),
     };
     let guard_ctime = if guarded {
       match Nfstime3::decode(args) {
         Ok(t) => Some(nfstime_to_ns(&t)),
-        Err(_) => return (Nfsstat3::Inval, None),
+        Err(_) => return (Nfsstat3::Inval, Wcc::default()),
       }
     } else {
       None
     };
     let identity = match self.resolve_handle(&handle) {
       Ok(id) => id,
-      Err(status) => return (status, None),
+      Err(status) => return (status, Wcc::default()),
     };
     let node = match self.attrs_of(&identity) {
       Ok(node) => node,
-      Err(status) => return (status, None),
+      Err(status) => return (status, Wcc::default()),
     };
     // The guard is a compare-and-set on the object's change time (a stale cache is refused).
     if let Some(guard) = guard_ctime
       && guard != node.ctime
     {
-      return (Nfsstat3::NotSync, Some(self.fattr3(&node)));
+      return (Nfsstat3::NotSync, self.unchanged(&node));
     }
     // The POSIX ownership and permission rules for each field the request sets: the mode and explicit
     // times need ownership, the owner and group follow `_POSIX_CHOWN_RESTRICTED`, the size needs write
     // permission — refused typed (`PERM`/`ACCES`) before any effect. An allowed change carries the
     // set-id side effects a non-superuser's chown or chmod has (`crate::access`).
-    if let Some(denial) = access::setattr_denial(&self.caller, &node, &changes, explicit_times) {
-      return (status_of_denial(denial), Some(self.fattr3(&node)));
+    if let Some(denial) =
+      access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority)
+    {
+      return (status_of_denial(denial), self.unchanged(&node));
     }
     let changes = access::with_setid_side_effects(&self.caller, &node, changes);
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), Some(self.fattr3(&node))),
+      Err(e) => return (nfsstat_of(&e), self.unchanged(&node)),
     };
     let object = ObjectId::new(identity.inode, identity.generation);
+    let pre = Some(self.wcc_attr(&node));
     match self.bridge.setattr(object, &cx, changes) {
-      Ok(updated) => (Nfsstat3::Ok, Some(self.fattr3(&updated))),
-      Err(e) => {
-        let post = self.attrs_of(&identity).ok().map(|n| self.fattr3(&n));
-        (nfsstat_of(&e), post)
-      }
+      Ok(updated) => (
+        Nfsstat3::Ok,
+        Wcc {
+          pre,
+          post: Some(self.fattr3(&updated)),
+        },
+      ),
+      Err(e) => (nfsstat_of(&e), self.wcc_after(pre, &identity)),
     }
   }
 
@@ -1560,6 +1758,27 @@ impl<'b> Export<'b> {
   /// volume's wall clock now (AC-3.10), so the seam receives explicit values and never has to guess.
   /// The second value says whether a time was `SET_TO_CLIENT_TIME` — an explicit time, which POSIX
   /// lets only the owner set, where "now" needs only write permission (`crate::access`).
+  /// A `SET_TO_CLIENT_TIME` time as the volume's nanoseconds: an `nfstime3` from an NFSv3 client, or
+  /// in the front end's dialect an `nfstime4` of signed 64-bit seconds (A-38), refused `NFS3ERR_INVAL`
+  /// past what the volume's `i64` nanoseconds hold or with a second's worth of nanoseconds.
+  fn decode_client_time(&self, args: &mut XdrReader<'_>) -> Result<i64, Nfsstat3> {
+    if !self.dialect.carries_v4_attributes() {
+      return Ok(nfstime_to_ns(
+        &Nfstime3::decode(args).map_err(|_| Nfsstat3::Inval)?,
+      ));
+    }
+    let time = crate::nfs::Nfstime4::decode(args).map_err(|_| Nfsstat3::Inval)?;
+    let nanos = i64::from(time.nseconds);
+    if nanos >= NS_PER_SEC {
+      return Err(Nfsstat3::Inval);
+    }
+    time
+      .seconds
+      .checked_mul(NS_PER_SEC)
+      .and_then(|ns| ns.checked_add(nanos))
+      .ok_or(Nfsstat3::Inval)
+  }
+
   fn decode_sattr3(&mut self, args: &mut XdrReader<'_>) -> Result<(SetAttr, bool), Nfsstat3> {
     let mode = decode_optional_u32(args)?;
     let uid = decode_optional_u32(args)?;
@@ -1571,17 +1790,13 @@ impl<'b> Export<'b> {
     };
     let atime_how = args.u32().map_err(|_| Nfsstat3::Inval)?;
     let atime_client = if atime_how == TIME_SET_TO_CLIENT {
-      Some(nfstime_to_ns(
-        &Nfstime3::decode(args).map_err(|_| Nfsstat3::Inval)?,
-      ))
+      Some(self.decode_client_time(args)?)
     } else {
       None
     };
     let mtime_how = args.u32().map_err(|_| Nfsstat3::Inval)?;
     let mtime_client = if mtime_how == TIME_SET_TO_CLIENT {
-      Some(nfstime_to_ns(
-        &Nfstime3::decode(args).map_err(|_| Nfsstat3::Inval)?,
-      ))
+      Some(self.decode_client_time(args)?)
     } else {
       None
     };
@@ -1619,40 +1834,56 @@ impl<'b> Export<'b> {
     writer.into_bytes()
   }
 
-  fn do_create(
+  /// Reads a `createhow3`: its mode, the attributes to set, whether its times are explicit, and for
+  /// EXCLUSIVE the `(mtime, atime)` its verifier is kept as — the attributes then being those times,
+  /// since EXCLUSIVE carries none of its own ([`exclusive_times`]).
+  #[allow(clippy::type_complexity)] // one decoded union, read once by its only caller
+  fn decode_createhow(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+  ) -> Result<(u32, SetAttr, bool, Option<(i64, i64)>), Nfsstat3> {
+    let mode_kind = args.u32().map_err(|_| Nfsstat3::Inval)?;
+    match mode_kind {
+      CREATE_UNCHECKED | CREATE_GUARDED => {
+        let (changes, explicit_times) = self.decode_sattr3(args)?;
+        Ok((mode_kind, changes, explicit_times, None))
+      }
+      CREATE_EXCLUSIVE => {
+        let mut verifier = [0u8; CREATEVERF_SIZE];
+        verifier.copy_from_slice(args.fixed(CREATEVERF_SIZE).map_err(|_| Nfsstat3::Inval)?);
+        let (mtime, atime) = exclusive_times(verifier);
+        let times = SetAttr {
+          atime: Some(atime),
+          mtime: Some(mtime),
+          ..SetAttr::default()
+        };
+        Ok((mode_kind, times, true, Some((mtime, atime))))
+      }
+      _ => Err(Nfsstat3::Inval),
+    }
+  }
+
+  fn do_create(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     // CREATE3args: where (diropargs3: dir handle then name), then how (createhow3).
     let dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, None, Wcc::default()),
     };
     let name = match args.string(NFS_MAXNAMELEN) {
       Ok(n) => n.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
-    let mode_kind = match args.u32() {
-      Ok(m) => m,
-      Err(_) => return (Nfsstat3::Inval, None, None),
-    };
-    let (changes, explicit_times) = match mode_kind {
-      CREATE_UNCHECKED | CREATE_GUARDED => match self.decode_sattr3(args) {
-        Ok(decoded) => decoded,
-        Err(status) => return (status, None, None),
-      },
-      // EXCLUSIVE's createverf3 is an 8-byte verifier slates does not yet persist to make the
-      // create idempotent; refuse it typed rather than silently degrade to a plain create.
-      CREATE_EXCLUSIVE => return (Nfsstat3::Notsupp, None, None),
-      _ => return (Nfsstat3::Inval, None, None),
+    let (mode_kind, changes, explicit_times, verifier) = match self.decode_createhow(args) {
+      Ok(how) => how,
+      Err(status) => return (status, None, Wcc::default()),
     };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), None, None),
+      Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // POSIX: resolving the name needs search permission on the directory; an existing name is then an
@@ -1660,14 +1891,23 @@ impl<'b> Export<'b> {
     // creating a new one needs write permission on the directory too.
     let dir_node = match self.attrs_of(&dir_identity) {
       Ok(node) => node,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
-    let dir_post = Some(self.fattr3(&dir_node));
+    let dir_post = self.unchanged(&dir_node);
+    // The directory as it is before any effect this call has (a new name, below).
+    let dir_pre = Some(self.wcc_attr(&dir_node));
     if !access::permits(&self.caller, &dir_node, Want::Search) {
       return (Nfsstat3::Acces, None, dir_post);
     }
     let existing = match self.bridge.lookup(parent, &cx, &name) {
       Ok(node) if mode_kind == CREATE_UNCHECKED => Some(ObjectId::new(node.ino, node.generation)),
+      // A retried exclusive create finds its own file: a regular file holding the verifier's times.
+      Ok(node)
+        if verifier == Some((node.mtime, node.atime))
+          && node.kind == slates_vfs::inode::Kind::File =>
+      {
+        Some(ObjectId::new(node.ino, node.generation))
+      }
       Ok(_) => return (Nfsstat3::Exist, None, dir_post),
       Err(VfsError::NotFound) => match self.create_view(parent, &cx, &name, mode_kind) {
         Ok(view) => view,
@@ -1693,8 +1933,7 @@ impl<'b> Export<'b> {
             object
           }
           Err(e) => {
-            let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
-            return (nfsstat_of(&e), None, dir_post);
+            return (nfsstat_of(&e), None, self.wcc_after(dir_pre, &dir_identity));
           }
         }
       }
@@ -1703,7 +1942,14 @@ impl<'b> Export<'b> {
       mode: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
+    self.finish_create(
+      object,
+      &dir_identity,
+      dir_pre,
+      &cx,
+      post_changes,
+      explicit_times,
+    )
   }
 
   /// NFSPROC3_MKDIR: create a directory in a parent over the shared interface under the export's
@@ -1715,42 +1961,39 @@ impl<'b> Export<'b> {
     writer.into_bytes()
   }
 
-  fn do_mkdir(
-    &mut self,
-    args: &mut XdrReader<'_>,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+  fn do_mkdir(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     // MKDIR3args: where (diropargs3), then the attributes (sattr3).
     let dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, None, Wcc::default()),
     };
     let name = match args.string(NFS_MAXNAMELEN) {
       Ok(n) => n.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     let (changes, explicit_times) = match self.decode_sattr3(args) {
       Ok(decoded) => decoded,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), None, None),
+      Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // POSIX: adding an entry needs write and search permission on the directory.
-    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
-      return (status, None, dir_post);
-    }
+    let dir_pre = match self.writable_directory(&dir_identity) {
+      Ok(node) => Some(self.wcc_attr(&node)),
+      Err((status, dir_post)) => return (status, None, self.refused(dir_post)),
+    };
     let mode = changes.mode.unwrap_or(DEFAULT_DIR_MODE);
     let object = match self.bridge.mkdir(parent, &cx, &name, mode) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
       Err(e) => {
-        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
-        return (nfsstat_of(&e), None, dir_post);
+        return (nfsstat_of(&e), None, self.wcc_after(dir_pre, &dir_identity));
       }
     };
     // A directory has no size to set; apply the remaining fields (uid/gid/times).
@@ -1759,7 +2002,14 @@ impl<'b> Export<'b> {
       size: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
+    self.finish_create(
+      object,
+      &dir_identity,
+      dir_pre,
+      &cx,
+      post_changes,
+      explicit_times,
+    )
   }
 
   /// NFSPROC3_SYMLINK: create a symbolic link in a directory over the shared interface under the
@@ -1772,46 +2022,43 @@ impl<'b> Export<'b> {
     writer.into_bytes()
   }
 
-  fn do_symlink(
-    &mut self,
-    args: &mut XdrReader<'_>,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+  fn do_symlink(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     // SYMLINK3args: where (diropargs3), then symlinkdata3 (the sattr3 attributes, then the target
     // path). The target is capped before allocating.
     let dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, None, Wcc::default()),
     };
     let name = match args.string(NFS_MAXNAMELEN) {
       Ok(n) => n.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     let (changes, explicit_times) = match self.decode_sattr3(args) {
       Ok(decoded) => decoded,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let target = match args.string(NFS_MAXPATHLEN) {
       Ok(t) => t.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), None, None),
+      Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // POSIX: adding an entry needs write and search permission on the directory.
-    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
-      return (status, None, dir_post);
-    }
+    let dir_pre = match self.writable_directory(&dir_identity) {
+      Ok(node) => Some(self.wcc_attr(&node)),
+      Err((status, dir_post)) => return (status, None, self.refused(dir_post)),
+    };
     let object = match self.bridge.symlink(parent, &cx, &name, &target) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
       Err(e) => {
-        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
-        return (nfsstat_of(&e), None, dir_post);
+        return (nfsstat_of(&e), None, self.wcc_after(dir_pre, &dir_identity));
       }
     };
     // A symlink's mode is fixed and it has no size to set; apply the ownership and times.
@@ -1820,7 +2067,14 @@ impl<'b> Export<'b> {
       size: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
+    self.finish_create(
+      object,
+      &dir_identity,
+      dir_pre,
+      &cx,
+      post_changes,
+      explicit_times,
+    )
   }
 
   /// NFSPROC3_LINK: create a hard link (RFC 1813 §3.3.15) — a second name `new_name` in a directory
@@ -1830,63 +2084,66 @@ impl<'b> Export<'b> {
   /// volume core (mapped to its `nfsstat3`), as NFSv3 requires. Without this a client's `ln` (a hard
   /// link) fails `PROC_UNAVAIL` even though the volume supports links.
   pub fn link(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
-    let (status, file_attr, dir_post) = self.do_link(args);
+    let (status, file_attr, dir_wcc) = self.do_link(args);
     let mut writer = XdrWriter::new();
     status.encode(&mut writer);
     PostOpAttr(file_attr).encode(&mut writer); // file_attributes
-    encode_wcc(&mut writer, dir_post); // linkdir_wcc
+    encode_wcc(&mut writer, dir_wcc); // linkdir_wcc
     writer.into_bytes()
   }
 
-  fn do_link(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>, Option<Fattr3>) {
+  fn do_link(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<Fattr3>, Wcc) {
     // LINK3args: the existing file handle, then diropargs3 (the target directory handle, the name).
     let file_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, None, Wcc::default()),
     };
     let dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, None, Wcc::default()),
     };
     let name = match args.string(NFS_MAXNAMELEN) {
       Ok(n) => n.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     let file_identity = match self.resolve_handle(&file_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
       Err(status) => {
         // The target file resolved; report its attributes even though the directory did not.
         let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
-        return (status, file_attr, None);
+        return (status, file_attr, Wcc::default());
       }
     };
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), None, None),
+      Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let target = ObjectId::new(file_identity.inode, file_identity.generation);
     let new_parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // POSIX: adding an entry needs write and search permission on the directory.
-    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
-      let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
-      return (status, file_attr, dir_post);
-    }
+    let dir_pre = match self.writable_directory(&dir_identity) {
+      Ok(node) => Some(self.wcc_attr(&node)),
+      Err((status, dir_post)) => {
+        let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
+        return (status, file_attr, self.refused(dir_post));
+      }
+    };
     let outcome = self.bridge.link(target, new_parent, &cx, &name);
     // The directory's post-op attributes go in the wcc either way, and they are read *after* the
     // link: the client caches them in place of a GETATTR, so the times before the link would keep
     // `stat` of the directory a whole attribute-cache period behind (pjdfstest `link/00.t` through
     // a live mount, 2026-09-15). REMOVE, RENAME, CREATE, MKDIR and SYMLINK read theirs after too.
-    let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
+    let dir_wcc = self.wcc_after(dir_pre, &dir_identity);
     match outcome {
       // The bridge returns the target's attributes with the incremented link count.
-      Ok(node) => (Nfsstat3::Ok, Some(self.fattr3(&node)), dir_post),
+      Ok(node) => (Nfsstat3::Ok, Some(self.fattr3(&node)), dir_wcc),
       Err(e) => {
         let file_attr = self.attrs_of(&file_identity).ok().map(|n| self.fattr3(&n));
-        (nfsstat_of(&e), file_attr, dir_post)
+        (nfsstat_of(&e), file_attr, dir_wcc)
       }
     }
   }
@@ -1899,48 +2156,45 @@ impl<'b> Export<'b> {
     writer.into_bytes()
   }
 
-  fn do_mknod(
-    &mut self,
-    args: &mut XdrReader<'_>,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+  fn do_mknod(&mut self, args: &mut XdrReader<'_>) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     // MKNOD3args: where, type and the type-specific attributes (RFC 1813 §3.3.11).
     let dir_fh = match Nfsfh3::decode(args) {
       Ok(fh) => fh,
-      Err(_) => return (Nfsstat3::Badhandle, None, None),
+      Err(_) => return (Nfsstat3::Badhandle, None, Wcc::default()),
     };
     let name = match args.string(NFS_MAXNAMELEN) {
       Ok(n) => n.to_owned(),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     let kind = match args.u32().map(Ftype3::from_wire) {
       Ok(Some(Ftype3::Fifo)) => Kind::Fifo,
       Ok(Some(Ftype3::Sock)) => Kind::Socket,
-      Ok(_) => return (Nfsstat3::Badtype, None, None),
-      Err(_) => return (Nfsstat3::Inval, None, None),
+      Ok(_) => return (Nfsstat3::Badtype, None, Wcc::default()),
+      Err(_) => return (Nfsstat3::Inval, None, Wcc::default()),
     };
     let (changes, explicit_times) = match self.decode_sattr3(args) {
       Ok(decoded) => decoded,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let dir_identity = match self.resolve_handle(&dir_fh) {
       Ok(id) => id,
-      Err(status) => return (status, None, None),
+      Err(status) => return (status, None, Wcc::default()),
     };
     let cx = match self.op_context() {
       Ok(cx) => cx,
-      Err(e) => return (nfsstat_of(&e), None, None),
+      Err(e) => return (nfsstat_of(&e), None, Wcc::default()),
     };
     let parent = ObjectId::new(dir_identity.inode, dir_identity.generation);
     // POSIX: adding an entry needs write and search permission on the directory.
-    if let Err((status, dir_post)) = self.writable_directory(&dir_identity) {
-      return (status, None, dir_post);
-    }
+    let dir_pre = match self.writable_directory(&dir_identity) {
+      Ok(node) => Some(self.wcc_attr(&node)),
+      Err((status, dir_post)) => return (status, None, self.refused(dir_post)),
+    };
     let mode = changes.mode.unwrap_or(DEFAULT_FILE_MODE);
     let object = match self.bridge.mknod(parent, &cx, &name, mode, kind) {
       Ok(node) => ObjectId::new(node.ino, node.generation),
       Err(e) => {
-        let dir_post = self.attrs_of(&dir_identity).ok().map(|n| self.fattr3(&n));
-        return (nfsstat_of(&e), None, dir_post);
+        return (nfsstat_of(&e), None, self.wcc_after(dir_pre, &dir_identity));
       }
     };
     // An IPC name has no size to set; apply the remaining fields (uid/gid/times).
@@ -1949,7 +2203,14 @@ impl<'b> Export<'b> {
       size: None,
       ..changes
     };
-    self.finish_create(object, &dir_identity, &cx, post_changes, explicit_times)
+    self.finish_create(
+      object,
+      &dir_identity,
+      dir_pre,
+      &cx,
+      post_changes,
+      explicit_times,
+    )
   }
 
   /// NFSPROC3_READLINK: read the target path of a symbolic link a handle names, over the shared
@@ -1965,7 +2226,7 @@ impl<'b> Export<'b> {
       }
       Err((status, attr)) => {
         status.encode(&mut writer);
-        PostOpAttr(attr).encode(&mut writer);
+        PostOpAttr(attr.map(|node| self.fattr3(&node))).encode(&mut writer);
       }
     }
     writer.into_bytes()
@@ -1974,7 +2235,7 @@ impl<'b> Export<'b> {
   fn readlink_result(
     &mut self,
     args: &mut XdrReader<'_>,
-  ) -> Result<(Fattr3, String), (Nfsstat3, Option<Fattr3>)> {
+  ) -> Result<(Fattr3, String), (Nfsstat3, Option<NodeAttr>)> {
     let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let identity = self
       .resolve_handle(&handle)
@@ -1983,16 +2244,16 @@ impl<'b> Export<'b> {
     let attr = self.fattr3(&node);
     // READLINK is meaningful only on a symbolic link (RFC 1813 §3.3.5).
     if node.kind != Kind::Symlink {
-      return Err((Nfsstat3::Inval, Some(attr)));
+      return Err((Nfsstat3::Inval, Some(node)));
     }
     let cx = self
       .op_context()
-      .map_err(|e| (nfsstat_of(&e), Some(attr)))?;
+      .map_err(|e| (nfsstat_of(&e), Some(node)))?;
     let object = ObjectId::new(identity.inode, identity.generation);
     let target = self
       .bridge
       .readlink(object, &cx)
-      .map_err(|e| (nfsstat_of(&e), Some(attr)))?;
+      .map_err(|e| (nfsstat_of(&e), Some(node)))?;
     Ok((attr, target))
   }
 
@@ -2152,40 +2413,45 @@ impl<'b> Export<'b> {
     &mut self,
     object: ObjectId,
     dir_identity: &FileHandle,
+    dir_pre: Option<WccAttr>,
     cx: &OpContext,
     post_changes: SetAttr,
     explicit_times: bool,
-  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Option<Fattr3>) {
+  ) -> (Nfsstat3, Option<(Nfsfh3, Fattr3)>, Wcc) {
     if post_changes != SetAttr::default() {
       let node = match self.bridge.getattr(object, cx) {
         Ok(node) => node,
         Err(e) => {
-          let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
-          return (nfsstat_of(&e), None, dir_post);
+          return (nfsstat_of(&e), None, self.wcc_after(dir_pre, dir_identity));
         }
       };
-      if let Some(denial) =
-        access::setattr_denial(&self.caller, &node, &post_changes, explicit_times)
-      {
-        let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
-        return (status_of_denial(denial), None, dir_post);
+      if let Some(denial) = access::setattr_denial(
+        &self.caller,
+        &node,
+        &post_changes,
+        explicit_times,
+        IoAuthority::Mode,
+      ) {
+        return (
+          status_of_denial(denial),
+          None,
+          self.wcc_after(dir_pre, dir_identity),
+        );
       }
       let post_changes = access::with_setid_side_effects(&self.caller, &node, post_changes);
       if let Err(e) = self.bridge.setattr(object, cx, post_changes) {
-        let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
-        return (nfsstat_of(&e), None, dir_post);
+        return (nfsstat_of(&e), None, self.wcc_after(dir_pre, dir_identity));
       }
     }
     let attr = match self.bridge.getattr(object, cx) {
       Ok(node) => self.fattr3(&node),
       Err(e) => {
-        let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
-        return (nfsstat_of(&e), None, dir_post);
+        return (nfsstat_of(&e), None, self.wcc_after(dir_pre, dir_identity));
       }
     };
     let handle = self.handle_for(object.inode, object.generation);
-    let dir_post = self.attrs_of(dir_identity).ok().map(|n| self.fattr3(&n));
-    (Nfsstat3::Ok, Some((handle, attr)), dir_post)
+    let dir_wcc = self.wcc_after(dir_pre, dir_identity);
+    (Nfsstat3::Ok, Some((handle, attr)), dir_wcc)
   }
 
   /// NFSPROC3_FSSTAT: the volume's dynamic statistics — space and file counts — from the shared
@@ -2329,13 +2595,12 @@ fn status_of_denial(denial: Denial) -> Nfsstat3 {
   }
 }
 
-/// Encodes an NFSv3 `wcc_data`: the pre-operation attributes (slates keeps none, so absent) then
-/// the post-operation attributes. A mutating reply (WRITE) carries it so the client updates its
-/// cache without a follow-up GETATTR; the absent pre-op half means the client cannot detect a
-/// racing outside change, which slates has none of on a head it owns (§4.6 cache posture).
-fn encode_wcc(writer: &mut XdrWriter, post: Option<Fattr3>) {
-  writer.bool(false);
-  PostOpAttr(post).encode(writer);
+/// Encodes an NFSv3 `wcc_data`: the attributes immediately before the operation, then after it. A
+/// mutating reply carries it so the client updates its cache without a follow-up GETATTR; when the
+/// pre-operation half matches what the client cached, it knows the only change was its own call and
+/// keeps its cached data and listings (RFC 1813 §2.6; A-38).
+fn encode_wcc(writer: &mut XdrWriter, wcc: Wcc) {
+  wcc.encode(writer);
 }
 
 /// The `stable_how` a WRITE call asks for (RFC 1813 §3.3.7: `UNSTABLE`, `DATA_SYNC` or
@@ -2380,15 +2645,15 @@ pub fn io_failure_reply(procedure: u32) -> Option<Vec<u8>> {
   match procedure {
     NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
     | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
-      encode_wcc(&mut writer, None)
+      encode_wcc(&mut writer, Wcc::default())
     }
     NFSPROC3_RENAME => {
-      encode_wcc(&mut writer, None);
-      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, Wcc::default());
+      encode_wcc(&mut writer, Wcc::default());
     }
     NFSPROC3_LINK => {
       PostOpAttr(None).encode(&mut writer);
-      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, Wcc::default());
     }
     _ => return None,
   }
@@ -2412,15 +2677,15 @@ pub fn status_failure_reply(status: Nfsstat3, procedure: u32) -> Vec<u8> {
     }
     NFSPROC3_SETATTR | NFSPROC3_WRITE | NFSPROC3_CREATE | NFSPROC3_MKDIR | NFSPROC3_SYMLINK
     | NFSPROC3_MKNOD | NFSPROC3_REMOVE | NFSPROC3_RMDIR | NFSPROC3_COMMIT => {
-      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, Wcc::default());
     }
     NFSPROC3_RENAME => {
-      encode_wcc(&mut writer, None);
-      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, Wcc::default());
+      encode_wcc(&mut writer, Wcc::default());
     }
     NFSPROC3_LINK => {
       PostOpAttr(None).encode(&mut writer);
-      encode_wcc(&mut writer, None);
+      encode_wcc(&mut writer, Wcc::default());
     }
     NFSPROC3_NULL => return Vec::new(),
     _ => {}
@@ -2435,7 +2700,7 @@ fn encode_create_reply(
   writer: &mut XdrWriter,
   status: Nfsstat3,
   made: Option<(Nfsfh3, Fattr3)>,
-  dir_post: Option<Fattr3>,
+  dir_wcc: Wcc,
 ) {
   status.encode(writer);
   if let Some((handle, attr)) = made {
@@ -2443,7 +2708,7 @@ fn encode_create_reply(
     handle.encode(writer);
     PostOpAttr(Some(attr)).encode(writer);
   }
-  encode_wcc(writer, dir_post);
+  encode_wcc(writer, dir_wcc);
 }
 
 /// The XDR-encoded byte length of a variable-length field of `len` bytes: a `u32` length prefix plus
@@ -2547,8 +2812,8 @@ enum XattrReply {
   Value(Vec<u8>),
   /// The names (list).
   Names(Vec<Box<[u8]>>),
-  /// Nothing more (set, remove).
-  Done,
+  /// The object's `wcc_data` around the change (set, remove).
+  Done(Wcc),
 }
 
 /// Where an export's NFSv4 file state lives: its own (a standalone export), the owner shard's, lent
@@ -2644,7 +2909,13 @@ fn other_state(
   clientid: u64,
   args: &mut XdrReader<'_>,
 ) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
-  let stateid = Stateid::decode(args).map_err(|_| crate::v4::Nfsstat4::Badxdr)?;
-  files.check_io(&stateid, handle, clientid)?;
+  let bad = |_| crate::v4::Nfsstat4::Badxdr;
+  let stateid = Stateid::decode(args).map_err(bad)?;
+  let want = match args.u32().map_err(bad)? {
+    io_want::READ => IoWant::Read,
+    io_want::WRITE => IoWant::Write,
+    _ => return Err(crate::v4::Nfsstat4::Badxdr.into()),
+  };
+  files.check_io(&stateid, handle, clientid, want)?;
   Ok(Vec::new())
 }

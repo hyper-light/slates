@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "suite": "fsx",
+  "transport": "native-linux-nfs4",
+  "host": {
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "root"
+  },
+  "date": "2026-09-27",
+  "command": "cd <mount>/conformance-<pid>/fsx && <scratch>/tools/fsx -N 10000 -S 1 -l 262144 -q -P <scratch>/fsx-logs fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": true
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 25882,
+  "notes": [
+    "fsx: freebsd/freebsd-src@42c6944 tools/regression/fsx/fsx.c (APSL 2.0), sha256 b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
+    "the exerciser's .fsxlog/.fsxgood files were kept outside the mount (-P)"
+  ]
+}

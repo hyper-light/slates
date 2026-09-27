@@ -1527,3 +1527,93 @@ fn two_nfsv4_clients_meet_one_lock_table_at_the_files_owner() {
   drop((a, b, client));
   drop(daemon);
 }
+
+/// The fsid of the object at the current handle after `ops` (their count `count`), from a trailing
+/// GETATTR of FSID: the major word.
+fn v4_fsid_after(v4: &mut V4Client, count: u32, ops: &[u8]) -> u64 {
+  use slates_bridge_nfs::v4::types::Bitmap;
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  /// Format: `OP_GETATTR`, `FATTR4_FSID`.
+  const OP_GETATTR: u32 = 9;
+  const FSID: u32 = 8;
+  let mut all = XdrWriter::new();
+  all.fixed(ops);
+  all.u32(OP_GETATTR);
+  Bitmap::of(&[FSID]).encode(&mut all);
+  let (status, results) = v4.sequenced(count + 1, all.as_slice());
+  assert_eq!(status, NFS4_OK, "the path and its GETATTR");
+  // Every op before the GETATTR here has an empty result body: its opnum and status only.
+  let mut reader = XdrReader::new(&results);
+  reader.fixed(8 * usize::try_from(count).unwrap()).unwrap();
+  reader.fixed(8).unwrap();
+  Bitmap::decode(&mut reader).unwrap();
+  XdrReader::new(reader.opaque(64).unwrap()).u64().unwrap()
+}
+
+/// §4.6 A-38: an NFSv4 client entering the pseudo-root scoped to a capability (`@<capability>`, as
+/// NFSv3's `/@<capability>`) lists the volume it authorizes. The volume is on another shard, so the
+/// gathered listing names it without attributes, and the front end fills them by a LOOKUP that routes
+/// to the owner rather than dropping the entry; the entry carries the volume's own fsid, not the
+/// pseudo-root's, so a client sees the filesystem boundary.
+#[test]
+fn an_nfsv4_scoped_browse_lists_a_volume_on_another_shard_with_its_own_fsid() {
+  use slates_bridge_nfs::v4::types::Bitmap;
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  /// Format: `OP_READDIR`, `FATTR4_FSID`.
+  const OP_READDIR: u32 = 26;
+  const FSID: u32 = 8;
+  /// Shape: the READDIR budgets, far above one entry.
+  const DIRCOUNT: u32 = 4096;
+  const MAXCOUNT: u32 = 16384;
+  let (daemon, instance) = two_shard_daemon("nfsv4-browse");
+  let mut client = Client::connect(&instance);
+  let name = remote_volume_name(&mut client);
+  let scoped = root_capability_path(&daemon, &name);
+  let scoped = scoped.trim_start_matches('/').to_owned();
+  let entered = capability_path(&daemon, &name)
+    .trim_start_matches('/')
+    .to_owned();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v4 = V4Client::connect(port);
+
+  let path = |component: &str| {
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTROOTFH);
+    ops.u32(OP_LOOKUP);
+    ops.opaque(component.as_bytes());
+    ops.into_bytes()
+  };
+  let root_fsid = v4_fsid_after(&mut v4, 2, &path(&scoped));
+  let volume_fsid = v4_fsid_after(&mut v4, 2, &path(&entered));
+  assert_ne!(root_fsid, volume_fsid, "the volume is its own filesystem");
+
+  let mut ops = XdrWriter::new();
+  ops.fixed(&path(&scoped));
+  ops.u32(OP_READDIR);
+  ops.u64(0);
+  ops.fixed(&[0; 8]);
+  ops.u32(DIRCOUNT);
+  ops.u32(MAXCOUNT);
+  Bitmap::of(&[FSID]).encode(&mut ops);
+  let (status, results) = v4.sequenced(3, ops.as_slice());
+  assert_eq!(status, NFS4_OK, "READDIR of the scoped pseudo-root");
+  let mut reader = XdrReader::new(&results);
+  reader.fixed(8 + 8 + 8).unwrap(); // PUTROOTFH, LOOKUP, READDIR's opnum and status
+  reader.fixed(8).unwrap(); // cookie verifier
+  let mut listed = Vec::new();
+  while reader.bool().unwrap() {
+    reader.u64().unwrap(); // cookie
+    let entry = String::from_utf8(reader.opaque(256).unwrap().to_vec()).unwrap();
+    Bitmap::decode(&mut reader).unwrap();
+    let fsid = XdrReader::new(reader.opaque(64).unwrap()).u64().unwrap();
+    listed.push((entry, fsid));
+  }
+  assert_eq!(
+    listed,
+    vec![(name, volume_fsid)],
+    "the authorized volume, on another shard, with its own fsid"
+  );
+  drop(v4);
+  drop(client);
+  drop(daemon);
+}

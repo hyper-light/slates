@@ -3,7 +3,7 @@
 //! the same procedure a v3 client would reach. Every decoder refuses a malformed result rather than
 //! guessing (the result comes from this server, so a malformed one is a server fault).
 
-use crate::nfs::{Fattr3, Nfsfh3, Nfsstat3, Nfstime3, PostOpAttr};
+use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime4, PostOpAttr, Specdata3, Wcc};
 use crate::xdr::{XdrReader, XdrWriter};
 
 /// Format: `NFS3_FHSIZE`, the largest v3 handle a result may carry.
@@ -20,7 +20,8 @@ pub const VERF_SIZE: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Malformed;
 
-/// The optional fields of a `sattr3` (RFC 1813 §2.5.3); `None` leaves a field as it is.
+/// The optional fields of a `sattr3` (RFC 1813 §2.5.3); `None` leaves a field as it is. A client time
+/// is an `nfstime4`, as the front end's dialect carries it (A-38).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Sattr3 {
   /// A new mode.
@@ -32,9 +33,9 @@ pub struct Sattr3 {
   /// A new size.
   pub size: Option<u64>,
   /// A new access time: `Some(None)` is "the server's time", `Some(Some(t))` a client time.
-  pub atime: Option<Option<Nfstime3>>,
+  pub atime: Option<Option<Nfstime4>>,
   /// A new modification time, as `atime`.
-  pub mtime: Option<Option<Nfstime3>>,
+  pub mtime: Option<Option<Nfstime4>>,
 }
 
 /// Format: `time_how` values of a `sattr3` (RFC 1813 §2.5.3).
@@ -103,37 +104,54 @@ fn status(reader: &mut XdrReader<'_>) -> Result<Nfsstat3, Malformed> {
   Nfsstat3::decode(reader).map_err(|_| Malformed)
 }
 
-/// Skips a `wcc_data` (a `pre_op_attr`, then a `post_op_attr`).
-fn skip_wcc(reader: &mut XdrReader<'_>) -> Result<(), Malformed> {
-  if reader.bool().map_err(|_| Malformed)? {
-    reader.u64().map_err(|_| Malformed)?;
-    Nfstime3::decode(reader).map_err(|_| Malformed)?;
-    Nfstime3::decode(reader).map_err(|_| Malformed)?;
-  }
-  PostOpAttr::decode(reader).map_err(|_| Malformed)?;
-  Ok(())
+/// Reads a `wcc_data` of the front end's dialect, change counters included (A-38).
+fn wcc(reader: &mut XdrReader<'_>) -> Result<Wcc, Malformed> {
+  Wcc::decode_with_change(reader).map_err(|_| Malformed)
+}
+
+/// Reads a `post_op_attr` of the front end's dialect, change counter included.
+fn post_op(reader: &mut XdrReader<'_>) -> Result<Option<Fattr3>, Malformed> {
+  Ok(
+    PostOpAttr::decode_with_change(reader)
+      .map_err(|_| Malformed)?
+      .0,
+  )
 }
 
 /// A GETATTR result: the attributes, or the status.
 pub fn getattr(result: &[u8]) -> Result<Result<Fattr3, Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   match status(&mut reader)? {
-    Nfsstat3::Ok => Ok(Ok(Fattr3::decode(&mut reader).map_err(|_| Malformed)?)),
+    Nfsstat3::Ok => Ok(Ok(
+      Fattr3::decode_with_change(&mut reader).map_err(|_| Malformed)?,
+    )),
     other => Ok(Err(other)),
   }
 }
 
-/// A LOOKUP result: the object's handle and attributes (when the server returned them), or the status.
-pub fn lookup(result: &[u8]) -> Result<Result<(Nfsfh3, Option<Fattr3>), Nfsstat3>, Malformed> {
+/// A LOOKUP result: the object's handle and attributes and the directory's (each when the server
+/// returned them), or the status.
+pub fn lookup(result: &[u8]) -> Reply<Looked> {
   let mut reader = XdrReader::new(result);
   match status(&mut reader)? {
     Nfsstat3::Ok => {
       let fh = Nfsfh3::decode(&mut reader).map_err(|_| Malformed)?;
-      let attrs = PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?.0;
-      Ok(Ok((fh, attrs)))
+      let attrs = post_op(&mut reader)?;
+      let dir = post_op(&mut reader)?;
+      Ok(Ok(Looked { fh, attrs, dir }))
     }
     other => Ok(Err(other)),
   }
+}
+
+/// What a LOOKUP found.
+pub struct Looked {
+  /// The object's handle.
+  pub fh: Nfsfh3,
+  /// The object's attributes, when returned.
+  pub attrs: Option<Fattr3>,
+  /// The directory's attributes, when returned.
+  pub dir: Option<Fattr3>,
 }
 
 /// ACCESS arguments.
@@ -148,7 +166,7 @@ pub fn access_args(fh: &Nfsfh3, access: u32) -> Vec<u8> {
 pub fn access(result: &[u8]) -> Result<Result<u32, Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?;
+  post_op(&mut reader)?;
   match status {
     Nfsstat3::Ok => Ok(Ok(reader.u32().map_err(|_| Malformed)?)),
     other => Ok(Err(other)),
@@ -159,7 +177,7 @@ pub fn access(result: &[u8]) -> Result<Result<u32, Nfsstat3>, Malformed> {
 pub fn readlink(result: &[u8]) -> Result<Result<String, Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?;
+  post_op(&mut reader)?;
   match status {
     Nfsstat3::Ok => Ok(Ok(
       reader.string(MAXPATH).map_err(|_| Malformed)?.to_owned(),
@@ -181,7 +199,7 @@ pub fn read_args(fh: &Nfsfh3, offset: u64, count: u32) -> Vec<u8> {
 pub fn read(result: &[u8]) -> Result<Result<(bool, Vec<u8>), Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?;
+  post_op(&mut reader)?;
   match status {
     Nfsstat3::Ok => {
       let _count = reader.u32().map_err(|_| Malformed)?;
@@ -234,7 +252,7 @@ pub fn write_args(fh: &Nfsfh3, offset: u64, stable: u32, data: &[u8]) -> Vec<u8>
 pub fn write(result: &[u8]) -> Reply<(u32, u32, [u8; VERF_SIZE])> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  skip_wcc(&mut reader)?;
+  wcc(&mut reader)?;
   match status {
     Nfsstat3::Ok => {
       let count = reader.u32().map_err(|_| Malformed)?;
@@ -260,7 +278,7 @@ pub fn commit_args(fh: &Nfsfh3, offset: u64, count: u32) -> Vec<u8> {
 pub fn commit(result: &[u8]) -> Result<Result<[u8; VERF_SIZE], Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  skip_wcc(&mut reader)?;
+  wcc(&mut reader)?;
   match status {
     Nfsstat3::Ok => {
       let mut verf = [0u8; VERF_SIZE];
@@ -271,21 +289,39 @@ pub fn commit(result: &[u8]) -> Result<Result<[u8; VERF_SIZE], Nfsstat3>, Malfor
   }
 }
 
-/// Format: CREATE's `createmode3` values (RFC 1813 §3.3.8).
-pub mod createmode {
-  /// Format: `UNCHECKED`.
-  pub const UNCHECKED: u32 = 0;
-  /// Format: `GUARDED`.
-  pub const GUARDED: u32 = 1;
+/// How a CREATE makes its file (`createhow3`, RFC 1813 §3.3.8).
+pub enum CreateHow {
+  /// Create, or open an existing file (`UNCHECKED`).
+  Unchecked(Sattr3),
+  /// Create; an existing name is `NFS3ERR_EXIST` (`GUARDED`).
+  Guarded(Sattr3),
+  /// Create keyed by a verifier (`EXCLUSIVE`).
+  Exclusive([u8; crate::procedures::CREATEVERF_SIZE]),
 }
 
-/// CREATE arguments: a regular file `name` in `dir`, `mode` one of [`createmode`].
-pub fn create_args(dir: &Nfsfh3, name: &str, mode: u32, attrs: &Sattr3) -> Vec<u8> {
+/// CREATE arguments: a regular file `name` in `dir`, made as `how` says.
+pub fn create_args(dir: &Nfsfh3, name: &str, how: &CreateHow) -> Vec<u8> {
+  /// Format: the `createmode3` values (RFC 1813 §3.3.8).
+  const UNCHECKED: u32 = 0;
+  const GUARDED: u32 = 1;
+  const EXCLUSIVE: u32 = 2;
   let mut writer = XdrWriter::new();
   dir.encode(&mut writer);
   writer.opaque(name.as_bytes());
-  writer.u32(mode);
-  attrs.encode(&mut writer);
+  match how {
+    CreateHow::Unchecked(attrs) => {
+      writer.u32(UNCHECKED);
+      attrs.encode(&mut writer);
+    }
+    CreateHow::Guarded(attrs) => {
+      writer.u32(GUARDED);
+      attrs.encode(&mut writer);
+    }
+    CreateHow::Exclusive(verifier) => {
+      writer.u32(EXCLUSIVE);
+      writer.fixed(verifier);
+    }
+  }
   writer.into_bytes()
 }
 
@@ -308,9 +344,34 @@ pub fn symlink_args(dir: &Nfsfh3, name: &str, attrs: &Sattr3, target: &str) -> V
   writer.into_bytes()
 }
 
-/// A CREATE, MKDIR or SYMLINK result: the new object's handle and attributes (when returned), or the
-/// status.
-pub fn created(result: &[u8]) -> Reply<(Option<Nfsfh3>, Option<Fattr3>)> {
+/// MKNOD arguments (`MKNOD3args`, RFC 1813 §3.3.11): a device carries its attributes and its
+/// `specdata3`, a FIFO or socket its attributes only.
+pub fn mknod_args(
+  dir: &Nfsfh3,
+  name: &str,
+  kind: Ftype3,
+  attrs: &Sattr3,
+  device: Specdata3,
+) -> Vec<u8> {
+  let mut writer = XdrWriter::new();
+  dir.encode(&mut writer);
+  writer.opaque(name.as_bytes());
+  writer.u32(kind as u32);
+  match kind {
+    Ftype3::Blk | Ftype3::Chr => {
+      attrs.encode(&mut writer);
+      writer.u32(device.specdata1);
+      writer.u32(device.specdata2);
+    }
+    Ftype3::Sock | Ftype3::Fifo => attrs.encode(&mut writer),
+    Ftype3::Reg | Ftype3::Dir | Ftype3::Lnk => {}
+  }
+  writer.into_bytes()
+}
+
+/// A CREATE, MKDIR, SYMLINK or MKNOD result: the new object's handle (when returned) and the
+/// directory's `wcc_data`, or the status.
+pub fn created(result: &[u8]) -> Reply<(Option<Nfsfh3>, Wcc)> {
   let mut reader = XdrReader::new(result);
   match status(&mut reader)? {
     Nfsstat3::Ok => {
@@ -320,17 +381,34 @@ pub fn created(result: &[u8]) -> Reply<(Option<Nfsfh3>, Option<Fattr3>)> {
       } else {
         None
       };
-      let attrs = PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?.0;
-      Ok(Ok((fh, attrs)))
+      let _attrs = post_op(&mut reader)?;
+      Ok(Ok((fh, wcc(&mut reader)?)))
     }
     other => Ok(Err(other)),
   }
 }
 
-/// A result that is a status then `wcc_data` (REMOVE, RMDIR, SETATTR), reduced to its status.
-pub fn wcc_status(result: &[u8]) -> Result<Nfsstat3, Malformed> {
+/// A result that is a status then one `wcc_data` (REMOVE, RMDIR, SETATTR): the status and the wcc.
+pub fn wcc_status(result: &[u8]) -> Result<(Nfsstat3, Wcc), Malformed> {
   let mut reader = XdrReader::new(result);
-  status(&mut reader)
+  let status = status(&mut reader)?;
+  Ok((status, wcc(&mut reader)?))
+}
+
+/// A RENAME result: the status and the source and destination directories' `wcc_data`.
+pub fn renamed(result: &[u8]) -> Result<(Nfsstat3, Wcc, Wcc), Malformed> {
+  let mut reader = XdrReader::new(result);
+  let status = status(&mut reader)?;
+  let from = wcc(&mut reader)?;
+  Ok((status, from, wcc(&mut reader)?))
+}
+
+/// A LINK result: the status and the directory's `wcc_data`.
+pub fn linked(result: &[u8]) -> Result<(Nfsstat3, Wcc), Malformed> {
+  let mut reader = XdrReader::new(result);
+  let status = status(&mut reader)?;
+  let _file = post_op(&mut reader)?;
+  Ok((status, wcc(&mut reader)?))
 }
 
 /// RENAME arguments.
@@ -410,7 +488,7 @@ pub fn readdirplus(
 ) -> Result<Result<Listing, Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?;
+  post_op(&mut reader)?;
   if status != Nfsstat3::Ok {
     return Ok(Err(status));
   }
@@ -424,7 +502,7 @@ pub fn readdirplus(
     let _fileid = reader.u64().map_err(|_| Malformed)?;
     let name = reader.string(MAXPATH).map_err(|_| Malformed)?.to_owned();
     let cookie = reader.u64().map_err(|_| Malformed)?;
-    let attrs = PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?.0;
+    let attrs = post_op(&mut reader)?;
     let fh = if reader.bool().map_err(|_| Malformed)? {
       Some(Nfsfh3(
         reader.opaque(FHSIZE3).map_err(|_| Malformed)?.to_vec(),
@@ -456,7 +534,7 @@ pub struct FsStat {
 pub fn fsstat(result: &[u8]) -> Result<Result<FsStat, Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?;
+  post_op(&mut reader)?;
   if status != Nfsstat3::Ok {
     return Ok(Err(status));
   }
@@ -482,7 +560,7 @@ pub struct PathConf {
 pub fn pathconf(result: &[u8]) -> Result<Result<PathConf, Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
-  PostOpAttr::decode(&mut reader).map_err(|_| Malformed)?;
+  post_op(&mut reader)?;
   if status != Nfsstat3::Ok {
     return Ok(Err(status));
   }

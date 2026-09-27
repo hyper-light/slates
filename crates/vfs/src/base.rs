@@ -959,10 +959,7 @@ impl Overlay<'_> {
   ) -> Result<(), VfsError> {
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
-    inode.attrs.size = fp.size;
-    inode.attrs.mode = fp.mode;
-    inode.attrs.mtime = fp.mtime_ns;
-    inode.attrs.ctime = fp.ctime_ns;
+    inode.adopt_observed(fp.size, Some(fp.mode), fp.mtime_ns, fp.ctime_ns);
     if let Body::Base(b) = &mut inode.body {
       b.base_len = fp.size;
     }
@@ -972,6 +969,16 @@ impl Overlay<'_> {
   /// The attributes of an inode, live for an unwitnessed base entry (its directory's listing
   /// validated and its descriptor `fstat`ed), as a bridge's `getattr` needs them.
   pub fn stat(&mut self, store: &mut Store, no: InodeNo) -> Result<crate::inode::Attrs, VfsError> {
+    Ok(self.observe(store, no)?.attrs)
+  }
+
+  /// The kind, attributes and change counter of an inode, live as [`Self::stat`] makes them: an
+  /// outsider's edit the refresh took has moved the counter (A-38).
+  pub fn observe(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+  ) -> Result<crate::volume::Observed, VfsError> {
     self.follow_live_disk(store, no)?;
     // A merged directory's link count is known once its listing is (`refresh_dir_nlink`).
     if let Body::Directory(dir) = self.vol.inode(store, no)?.body
@@ -979,7 +986,7 @@ impl Overlay<'_> {
     {
       self.load_listing(store, dir)?;
     }
-    self.vol.stat(store, no)
+    self.vol.observe(store, no)
   }
 
   /// For an unwitnessed base entry: validates the directory's listing (one `fstat` of the
@@ -1008,9 +1015,7 @@ impl Overlay<'_> {
     let fp = self.host.fstat(file).map_err(host_refusal)?;
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
-    inode.attrs.size = fp.size;
-    inode.attrs.mtime = fp.mtime_ns;
-    inode.attrs.ctime = fp.ctime_ns;
+    inode.adopt_observed(fp.size, None, fp.mtime_ns, fp.ctime_ns);
     if let Body::Base(b) = &mut inode.body {
       b.base_len = fp.size;
     }
@@ -1714,10 +1719,7 @@ impl Overlay<'_> {
     let prev = store.inodes.get(handle)?.version;
     {
       let inode = store.inodes.get_mut(handle)?;
-      inode.attrs.size = fp.size;
-      inode.attrs.mode = fp.mode;
-      inode.attrs.mtime = fp.mtime_ns;
-      inode.attrs.ctime = fp.ctime_ns;
+      inode.adopt_observed(fp.size, Some(fp.mode), fp.mtime_ns, fp.ctime_ns);
       if let Body::Base(b) = &mut inode.body {
         b.witness = Some(witness);
         b.base_len = fp.size;

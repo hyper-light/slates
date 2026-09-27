@@ -50,6 +50,11 @@ impl XdrWriter {
     self.out.extend_from_slice(&value.to_be_bytes());
   }
 
+  /// Writes a 64-bit signed integer (XDR `hyper`, RFC 4506 §4.5).
+  pub fn i64(&mut self, value: i64) {
+    self.out.extend_from_slice(&value.to_be_bytes());
+  }
+
   /// Writes a boolean as a 32-bit `1` or `0`.
   pub fn bool(&mut self, value: bool) {
     self.u32(u32::from(value));
@@ -148,6 +153,14 @@ impl<'a> XdrReader<'a> {
   pub fn u64(&mut self) -> Result<u64, XdrError> {
     let word = self.take(size_of::<u64>())?;
     Ok(u64::from_be_bytes(
+      word.try_into().map_err(|_| XdrError::Truncated)?,
+    ))
+  }
+
+  /// Reads a 64-bit signed integer (XDR `hyper`, RFC 4506 §4.5).
+  pub fn i64(&mut self) -> Result<i64, XdrError> {
+    let word = self.take(size_of::<i64>())?;
+    Ok(i64::from_be_bytes(
       word.try_into().map_err(|_| XdrError::Truncated)?,
     ))
   }

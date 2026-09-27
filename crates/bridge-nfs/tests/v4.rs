@@ -2044,3 +2044,904 @@ fn access_grants_the_extended_attribute_bits_by_the_file_permissions() {
     "not XAWRITE on another's read-only file"
   );
 }
+
+/// The two write-only times are in `supported_attrs` (so a client sends `utimensat`'s explicit times),
+/// a GETATTR or READDIR that asks for one is `NFS4ERR_INVAL` (RFC 8881 §5.6), and a SETATTR of them
+/// sets the times the next GETATTR reads. A-35.
+#[test]
+fn the_write_only_times_are_supported_settable_and_never_read() {
+  /// Format: `FATTR4_SUPPORTED_ATTRS`, `FATTR4_TIME_ACCESS_SET`, `FATTR4_TIME_MODIFY`,
+  /// `FATTR4_TIME_MODIFY_SET`; `SET_TO_CLIENT_TIME4`.
+  const SUPPORTED_ATTRS: u32 = 0;
+  const TIME_ACCESS_SET: u32 = 48;
+  const TIME_MODIFY: u32 = 53;
+  const TIME_MODIFY_SET: u32 = 54;
+  const SET_TO_CLIENT_TIME4: u32 = 1;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-times");
+  let owner = client.owner.clone();
+  let (stateid, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "times",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(&fh);
+  args.u32(op::GETATTR);
+  Bitmap::of(&[SUPPORTED_ATTRS]).encode(&mut args);
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  expect_ok(&mut body, op::GETATTR);
+  Bitmap::decode(&mut body).unwrap();
+  let mut values = XdrReader::new(body.opaque(1024).unwrap());
+  let supported = Bitmap::decode(&mut values).unwrap();
+  assert!(
+    supported.has(TIME_ACCESS_SET) && supported.has(TIME_MODIFY_SET),
+    "both write-only times are supported"
+  );
+
+  let root = root_handle(&mut client, &mut service, &mut server);
+  for request in [op::GETATTR, op::READDIR] {
+    let mut args = client.sequenced(2);
+    args.u32(op::PUTFH);
+    if request == op::GETATTR {
+      args.opaque(&fh);
+      args.u32(op::GETATTR);
+    } else {
+      args.opaque(&root);
+      args.u32(op::READDIR);
+      args.u64(0);
+      args.fixed(&[0; 8]);
+      args.u32(4096);
+      args.u32(4096);
+    }
+    Bitmap::of(&[TIME_MODIFY_SET]).encode(&mut args);
+    let reply = Client::call(&mut service, &mut server, args.as_slice());
+    assert_eq!(
+      reply.results.last(),
+      Some(&(request, Nfsstat4::Inval.wire())),
+      "a read of a write-only attribute is refused"
+    );
+  }
+
+  let mut args = client.sequenced(3);
+  args.u32(op::PUTFH);
+  args.opaque(&fh);
+  args.u32(op::SETATTR);
+  stateid.encode(&mut args);
+  Bitmap::of(&[TIME_MODIFY_SET]).encode(&mut args);
+  let mut values = XdrWriter::new();
+  values.u32(SET_TO_CLIENT_TIME4);
+  values.u64(1_100_000_000);
+  values.u32(456_000_000);
+  args.opaque(values.as_slice());
+  args.u32(op::GETATTR);
+  Bitmap::of(&[TIME_MODIFY]).encode(&mut args);
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(reply.status, Nfsstat4::Ok.wire(), "SETATTR then GETATTR");
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  expect_ok(&mut body, op::SETATTR);
+  assert!(
+    Bitmap::decode(&mut body).unwrap().has(TIME_MODIFY_SET),
+    "the reply names the time it set"
+  );
+  expect_ok(&mut body, op::GETATTR);
+  Bitmap::decode(&mut body).unwrap();
+  let mut values = XdrReader::new(body.opaque(1024).unwrap());
+  assert_eq!(
+    (values.u64().unwrap(), values.u32().unwrap()),
+    (1_100_000_000, 456_000_000),
+    "the modification time set is the one read"
+  );
+}
+
+/// The root's file handle, from PUTROOTFH then GETFH.
+fn root_handle(client: &mut Client, service: &mut Export<'_>, server: &mut Server) -> Vec<u8> {
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::GETFH);
+  let reply = Client::call(service, server, args.as_slice());
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTROOTFH);
+  expect_ok(&mut body, op::GETFH);
+  body.opaque(128).unwrap().to_vec()
+}
+
+/// A volume whose wall clock never moves: every stamp repeats, as a coarse or stepped-back clock's do.
+fn frozen_volume(store: &mut Store) -> Volume {
+  Volume::create(
+    store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(slates_vfs::clock::StepClock::new(1, 0)),
+    },
+  )
+  .unwrap()
+}
+
+/// The `change` attribute of `fh`.
+fn change_of(client: &mut Client, service: &mut Export<'_>, server: &mut Server, fh: &[u8]) -> u64 {
+  /// Format: `FATTR4_CHANGE`.
+  const CHANGE: u32 = 3;
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(fh);
+  args.u32(op::GETATTR);
+  Bitmap::of(&[CHANGE]).encode(&mut args);
+  let reply = Client::call(service, server, args.as_slice());
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  expect_ok(&mut body, op::GETATTR);
+  Bitmap::decode(&mut body).unwrap();
+  XdrReader::new(body.opaque(64).unwrap()).u64().unwrap()
+}
+
+/// Reads a `change_info4`: (atomic, before, after).
+fn change_info(body: &mut XdrReader<'_>) -> (bool, u64, u64) {
+  (
+    body.bool().unwrap(),
+    body.u64().unwrap(),
+    body.u64().unwrap(),
+  )
+}
+
+/// A-38: under a wall clock that never moves, `change` still moves on every write to a file (the
+/// change time repeats; the counter does not), so a client caching the file sees every write.
+#[test]
+fn change_moves_on_every_write_under_a_frozen_clock() {
+  let mut store = store();
+  let mut vol = frozen_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-change");
+  let owner = client.owner.clone();
+  let (stateid, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "counted",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+  let mut last = change_of(&mut client, &mut service, &mut server, &fh);
+  for round in 0..3u8 {
+    let mut args = client.sequenced(2);
+    args.u32(op::PUTFH);
+    args.opaque(&fh);
+    args.u32(op::WRITE);
+    stateid.encode(&mut args);
+    args.u64(0);
+    args.u32(FILE_SYNC);
+    args.opaque(&[round; 3]);
+    let reply = Client::call(&mut service, &mut server, args.as_slice());
+    assert_eq!(reply.status, Nfsstat4::Ok.wire(), "WRITE {round}");
+    let now = change_of(&mut client, &mut service, &mut server, &fh);
+    assert!(now > last, "write {round} moved change ({last} -> {now})");
+    last = now;
+  }
+}
+
+/// Runs one namespace operation (`op`, its arguments written by `args`) on the directory `dir` and
+/// returns its `change_info4` with the directory's `change` just before and just after the call.
+fn namespace_change(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  dir: &[u8],
+  (opnum, write_args): (u32, &dyn Fn(&mut XdrWriter)),
+) -> ((bool, u64, u64), u64, u64) {
+  let before = change_of(client, service, server, dir);
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(dir);
+  args.u32(opnum);
+  write_args(&mut args);
+  let reply = Client::call(service, server, args.as_slice());
+  assert_eq!(reply.status, Nfsstat4::Ok.wire(), "op {opnum}");
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  expect_ok(&mut body, opnum);
+  let cinfo = change_info(&mut body);
+  (cinfo, before, change_of(client, service, server, dir))
+}
+
+/// A-38: under a wall clock that never moves, a directory's CREATE and REMOVE answer an atomic
+/// `change_info4` whose `before` is the directory's `change` just before the call and whose `after`
+/// is the one the next GETATTR reads — so a client that cached the directory keeps its cache across
+/// its own change and sees every other.
+#[test]
+fn create_and_remove_answer_atomic_change_info_under_a_frozen_clock() {
+  /// Format: `NF4DIR`.
+  const NF4DIR: u32 = 2;
+  let mut store = store();
+  let mut vol = frozen_volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-cinfo");
+  let root = root_handle(&mut client, &mut service, &mut server);
+  let create = |args: &mut XdrWriter| {
+    args.u32(NF4DIR);
+    args.opaque(b"sub");
+    Bitmap::default().encode(args);
+    args.opaque(&[]);
+  };
+  let remove = |args: &mut XdrWriter| args.opaque(b"sub");
+  for (name, opnum, write_args) in [
+    ("CREATE", op::CREATE, &create as &dyn Fn(&mut XdrWriter)),
+    ("REMOVE", op::REMOVE, &remove),
+  ] {
+    let ((atomic, cinfo_before, cinfo_after), before, after) = namespace_change(
+      &mut client,
+      &mut service,
+      &mut server,
+      &root,
+      (opnum, write_args),
+    );
+    assert!(atomic, "{name}: the change info is atomic");
+    assert_eq!(
+      cinfo_before, before,
+      "{name}: before is the change before the call"
+    );
+    assert_eq!(
+      cinfo_after, after,
+      "{name}: after is the change the next GETATTR reads"
+    );
+    assert!(
+      after > before,
+      "{name}: the call moved the directory's change"
+    );
+  }
+}
+
+/// Runs PUTFH `fh` then one operation (`opnum`, its arguments written by `args`) and returns the
+/// compound's overall status (the operation's, as it is the last).
+fn one_op(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  opnum: u32,
+  write_args: &dyn Fn(&mut XdrWriter),
+) -> u32 {
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(fh);
+  args.u32(opnum);
+  write_args(&mut args);
+  Client::call(service, server, args.as_slice()).status
+}
+
+/// One operation to run, how to write its arguments, the status it must answer, and what it checks.
+type OpCase<'a> = (u32, &'a dyn Fn(&mut XdrWriter), Nfsstat4, &'a str);
+
+/// RFC 8881 §17's REQUIRED VERIFY and NVERIFY, which this server had answered `NFS4ERR_NOTSUPP`
+/// (A-35 audit): each compares the named attributes with the object's, answering `NFS4ERR_NOT_SAME` or
+/// `NFS4ERR_SAME` as it must, and a write-only attribute is `NFS4ERR_INVAL`.
+#[test]
+fn verify_and_nverify_compare_the_objects_attributes() {
+  /// Format: `FATTR4_MODE`, `FATTR4_TIME_MODIFY_SET`.
+  const MODE: u32 = 33;
+  const TIME_MODIFY_SET: u32 = 54;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-verify");
+  let owner = client.owner.clone();
+  let (_, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "verified",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+  let mode_is = |mode: u32| {
+    move |args: &mut XdrWriter| {
+      Bitmap::of(&[MODE]).encode(args);
+      let mut values = XdrWriter::new();
+      values.u32(mode);
+      args.opaque(values.as_slice());
+    }
+  };
+  let write_only = |args: &mut XdrWriter| {
+    Bitmap::of(&[TIME_MODIFY_SET]).encode(args);
+    args.opaque(&[0; 16]);
+  };
+  // `open_at_root` creates with mode 0o644.
+  let cases: [OpCase; 5] = [
+    (
+      op::VERIFY,
+      &mode_is(0o644),
+      Nfsstat4::Ok,
+      "VERIFY of the mode it has",
+    ),
+    (
+      op::VERIFY,
+      &mode_is(0o600),
+      Nfsstat4::NotSame,
+      "VERIFY of another mode",
+    ),
+    (
+      op::NVERIFY,
+      &mode_is(0o644),
+      Nfsstat4::Same,
+      "NVERIFY of the mode it has",
+    ),
+    (
+      op::NVERIFY,
+      &mode_is(0o600),
+      Nfsstat4::Ok,
+      "NVERIFY of another mode",
+    ),
+    (
+      op::VERIFY,
+      &write_only,
+      Nfsstat4::Inval,
+      "VERIFY of a write-only attribute",
+    ),
+  ];
+  for (opnum, write_args, expected, what) in cases {
+    let status = one_op(
+      &mut client,
+      &mut service,
+      &mut server,
+      &fh,
+      opnum,
+      write_args,
+    );
+    assert_eq!(status, expected.wire(), "{what}");
+  }
+}
+
+/// RFC 8881 §17's REQUIRED SECINFO, BACKCHANNEL_CTL and SET_SSV, which this server had answered
+/// `NFS4ERR_NOTSUPP` (A-35 audit): SECINFO names the flavors for an existing name and refuses a missing
+/// one, BACKCHANNEL_CTL accepts AUTH_SYS and refuses an RPCSEC_GSS handle it never issued, and SET_SSV
+/// is refused without SP4_SSV.
+#[test]
+fn secinfo_backchannel_ctl_and_set_ssv_are_served() {
+  /// Format: `AUTH_SYS` and `RPCSEC_GSS` flavors.
+  const AUTH_SYS: u32 = 1;
+  const RPCSEC_GSS: u32 = 6;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-secinfo-ops");
+  let root = root_handle(&mut client, &mut service, &mut server);
+  let owner = client.owner.clone();
+  open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "named",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+  let backchannel = |flavor: u32| {
+    move |args: &mut XdrWriter| {
+      args.u32(0x4000_0000); // callback program
+      args.u32(1);
+      args.u32(flavor);
+      if flavor == AUTH_SYS {
+        args.u32(0); // stamp
+        args.opaque(b"host"); // machine name
+        args.u32(0); // uid
+        args.u32(0); // gid
+        args.u32(0); // no supplementary groups
+      } else {
+        args.u32(1); // service
+        args.opaque(b"server handle");
+        args.opaque(b"client handle");
+      }
+    }
+  };
+  let set_ssv = |args: &mut XdrWriter| {
+    args.opaque(b"secret");
+    args.opaque(b"digest");
+  };
+  let cases: [OpCase; 5] = [
+    (
+      op::SECINFO,
+      &|args: &mut XdrWriter| args.opaque(b"named"),
+      Nfsstat4::Ok,
+      "SECINFO of an existing name",
+    ),
+    (
+      op::SECINFO,
+      &|args: &mut XdrWriter| args.opaque(b"absent"),
+      Nfsstat4::Noent,
+      "SECINFO of a missing name",
+    ),
+    (
+      op::BACKCHANNEL_CTL,
+      &backchannel(AUTH_SYS),
+      Nfsstat4::Ok,
+      "BACKCHANNEL_CTL with AUTH_SYS",
+    ),
+    (
+      op::BACKCHANNEL_CTL,
+      &backchannel(RPCSEC_GSS),
+      Nfsstat4::Noent,
+      "no RPCSEC_GSS handle was issued",
+    ),
+    (
+      op::SET_SSV,
+      &set_ssv,
+      Nfsstat4::Inval,
+      "SET_SSV without SP4_SSV",
+    ),
+  ];
+  for (opnum, write_args, expected, what) in cases {
+    let status = one_op(
+      &mut client,
+      &mut service,
+      &mut server,
+      &root,
+      opnum,
+      write_args,
+    );
+    assert_eq!(status, expected.wire(), "{what}");
+  }
+}
+
+/// SECINFO consumes the current file handle (RFC 8881 §2.6.3.1.1.8): a GETFH after it has none.
+#[test]
+fn secinfo_consumes_the_current_file_handle() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-secinfo");
+  let owner = client.owner.clone();
+  open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "named",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+  let mut args = client.sequenced(3);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::SECINFO);
+  args.opaque(b"named");
+  args.u32(op::GETFH);
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(
+    reply.results.last(),
+    Some(&(op::GETFH, Nfsstat4::Nofilehandle.wire())),
+    "the handle was consumed"
+  );
+}
+
+/// A WRITE of `data` at 0 of `fh` under `stateid`: the compound's status.
+fn write_status(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  stateid: Stateid,
+) -> u32 {
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(fh);
+  args.u32(op::WRITE);
+  stateid.encode(&mut args);
+  args.u64(0);
+  args.u32(FILE_SYNC);
+  args.opaque(b"w");
+  Client::call(service, server, args.as_slice()).status
+}
+
+/// A SETATTR of `fh` under `stateid` setting the size (`Some`) or the mode: the compound's status.
+fn setattr_status(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  (fh, stateid): (&[u8], Stateid),
+  size: Option<u64>,
+) -> u32 {
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(fh);
+  args.u32(op::SETATTR);
+  stateid.encode(&mut args);
+  let mut values = XdrWriter::new();
+  match size {
+    Some(size) => {
+      Bitmap::of(&[ATTR_SIZE]).encode(&mut args);
+      values.u64(size);
+    }
+    None => {
+      Bitmap::of(&[ATTR_MODE]).encode(&mut args);
+      values.u32(0o640);
+    }
+  }
+  args.opaque(values.as_slice());
+  Client::call(service, server, args.as_slice()).status
+}
+
+/// RFC 8881 §9.1.2 (A-38): a state id's access mode governs write-type operations — a read-only
+/// open's state id is refused a WRITE and a truncating SETATTR (`NFS4ERR_OPENMODE`, which the Linux
+/// client turns into `EACCES` for an `O_RDONLY|O_TRUNC` open) yet sets other attributes; and a special
+/// state id holds no share reservation, so another open's DENY_WRITE refuses its WRITE
+/// (`NFS4ERR_LOCKED`) while its READ still reads, and a write-only open's READ is refused past another
+/// open's DENY_READ.
+#[test]
+fn a_state_ids_access_mode_and_other_opens_denials_govern_io() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-modes");
+  let (reader_state, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    b"reader",
+    "governed",
+    READ,
+    DENY_NONE,
+  )
+  .unwrap();
+  assert_eq!(
+    write_status(&mut client, &mut service, &mut server, &fh, reader_state),
+    Nfsstat4::Openmode.wire(),
+    "a read-only open may not write"
+  );
+  let with = (fh.as_slice(), reader_state);
+  assert_eq!(
+    setattr_status(&mut client, &mut service, &mut server, with, Some(0)),
+    Nfsstat4::Openmode.wire(),
+    "nor truncate"
+  );
+  assert_eq!(
+    setattr_status(&mut client, &mut service, &mut server, with, None),
+    Nfsstat4::Ok.wire(),
+    "but may change the mode"
+  );
+
+  // Another owner denies writing: an anonymous WRITE is refused, an anonymous READ reads.
+  open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    b"denier",
+    "governed",
+    READ,
+    WRITE,
+  )
+  .unwrap();
+  assert_eq!(
+    write_status(
+      &mut client,
+      &mut service,
+      &mut server,
+      &fh,
+      Stateid::ANONYMOUS
+    ),
+    Nfsstat4::Locked.wire(),
+    "a special state id is refused past another open's DENY_WRITE"
+  );
+  assert!(
+    read(
+      &mut client,
+      &mut service,
+      &mut server,
+      &fh,
+      Stateid::ANONYMOUS
+    )
+    .is_ok(),
+    "an anonymous READ is not denied"
+  );
+
+  // A write-only open reads, until another open denies reading.
+  let (writer_state, other) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    b"writer",
+    "second",
+    WRITE,
+    DENY_NONE,
+  )
+  .unwrap();
+  assert!(
+    read(&mut client, &mut service, &mut server, &other, writer_state).is_ok(),
+    "a write-only open may read"
+  );
+  open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    b"read-denier",
+    "second",
+    WRITE,
+    READ,
+  )
+  .unwrap();
+  assert_eq!(
+    read(&mut client, &mut service, &mut server, &other, writer_state),
+    Err(Nfsstat4::Locked.wire()),
+    "a write-only open's READ is refused past another open's DENY_READ"
+  );
+}
+
+/// RFC 8881 §5.8 / RFC 8276 §8.1 (A-38): the supported attributes follow the compound's minor version
+/// — an NFSv4.1 compound is never told of `xattr_support`, which NFSv4.2 defines, and an NFSv4.2 one
+/// is — and a GETATTR of a 4.2 attribute in a 4.1 compound returns nothing for it.
+#[test]
+fn the_supported_attributes_follow_the_minor_version() {
+  /// Format: `FATTR4_SUPPORTED_ATTRS`, `FATTR4_XATTR_SUPPORT`.
+  const SUPPORTED_ATTRS: u32 = 0;
+  const XATTR_SUPPORT: u32 = 82;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-minor");
+  for (minor, offered) in [(1, false), (2, true)] {
+    client.minor = minor;
+    let mut args = client.sequenced(2);
+    args.u32(op::PUTROOTFH);
+    args.u32(op::GETATTR);
+    Bitmap::of(&[SUPPORTED_ATTRS, XATTR_SUPPORT]).encode(&mut args);
+    let reply = Client::call(&mut service, &mut server, args.as_slice());
+    assert_eq!(reply.status, Nfsstat4::Ok.wire(), "GETATTR in 4.{minor}");
+    let mut body = reply.walk();
+    skip_sequence(&mut body);
+    expect_ok(&mut body, op::PUTROOTFH);
+    expect_ok(&mut body, op::GETATTR);
+    let returned = Bitmap::decode(&mut body).unwrap();
+    let mut values = XdrReader::new(body.opaque(1024).unwrap());
+    let supported = Bitmap::decode(&mut values).unwrap();
+    assert_eq!(
+      supported.has(XATTR_SUPPORT),
+      offered,
+      "4.{minor} supported_attrs"
+    );
+    assert_eq!(
+      returned.has(XATTR_SUPPORT),
+      offered,
+      "4.{minor} returned bitmap"
+    );
+  }
+}
+
+/// An EXCLUSIVE4_1 OPEN (share both) of `name` at the root with `verifier` and `attrs` (a bitmap and
+/// its values), then GETFH: the compound's status and, on success, the file handle.
+fn exclusive_open(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  (name, verifier): (&str, [u8; 8]),
+  (bits, values): (&[u32], &[u8]),
+) -> (u32, Option<(Vec<u8>, Bitmap)>) {
+  /// Format: `OPEN4_CREATE`, `EXCLUSIVE4_1`, `CLAIM_NULL`.
+  const OPEN4_CREATE: u32 = 1;
+  const EXCLUSIVE4_1: u32 = 3;
+  const CLAIM_NULL: u32 = 0;
+  let mut args = client.sequenced(3);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::OPEN);
+  args.u32(0);
+  args.u32(BOTH);
+  args.u32(DENY_NONE);
+  args.u64(client.clientid);
+  args.opaque(&client.owner);
+  args.u32(OPEN4_CREATE);
+  args.u32(EXCLUSIVE4_1);
+  args.fixed(&verifier);
+  Bitmap::of(bits).encode(&mut args);
+  args.opaque(values);
+  args.u32(CLAIM_NULL);
+  args.opaque(name.as_bytes());
+  args.u32(op::GETFH);
+  let reply = Client::call(service, server, args.as_slice());
+  if reply.status != Nfsstat4::Ok.wire() {
+    return (reply.status, None);
+  }
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTROOTFH);
+  let (_, attrset) = open_result(&mut body);
+  expect_ok(&mut body, op::GETFH);
+  (
+    reply.status,
+    Some((body.opaque(128).unwrap().to_vec(), attrset)),
+  )
+}
+
+/// RFC 8881 §18.16.3 (A-38): an EXCLUSIVE4_1 create keeps its verifier in the new file's times and
+/// sets its other attributes; a retry of the same create — from a new server's session, as after a
+/// daemon restart, when the slot cache that made retries exactly-once is gone — opens the file it made,
+/// another verifier's create is `NFS4ERR_EXIST`, and times in the create's attributes are
+/// `NFS4ERR_INVAL`: `suppattr_exclcreat` names the mode and leaves the times out.
+#[test]
+fn an_exclusive_create_is_retried_after_a_restart_onto_its_own_file() {
+  /// Format: `FATTR4_SUPPATTR_EXCLCREAT`, `FATTR4_TIME_ACCESS_SET`, `FATTR4_TIME_MODIFY_SET`;
+  /// `SET_TO_SERVER_TIME4`.
+  const SUPPATTR_EXCLCREAT: u32 = 75;
+  const TIME_ACCESS_SET: u32 = 48;
+  const TIME_MODIFY_SET: u32 = 54;
+  const SET_TO_SERVER_TIME4: u32 = 0;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let verifier = [7, 6, 5, 4, 3, 2, 1, 0];
+  let mode = 0o600u32.to_be_bytes();
+  let first = {
+    let mut server = Server::standalone();
+    let mut client = Client::connect(&mut service, &mut server, b"host-exclusive");
+    let root = root_handle(&mut client, &mut service, &mut server);
+    let mut args = client.sequenced(2);
+    args.u32(op::PUTFH);
+    args.opaque(&root);
+    args.u32(op::GETATTR);
+    Bitmap::of(&[SUPPATTR_EXCLCREAT]).encode(&mut args);
+    let reply = Client::call(&mut service, &mut server, args.as_slice());
+    let mut body = reply.walk();
+    skip_sequence(&mut body);
+    expect_ok(&mut body, op::PUTFH);
+    expect_ok(&mut body, op::GETATTR);
+    Bitmap::decode(&mut body).unwrap();
+    let exclcreat = Bitmap::decode(&mut XdrReader::new(body.opaque(64).unwrap())).unwrap();
+    assert!(
+      exclcreat.has(ATTR_MODE),
+      "the mode is set by an exclusive create"
+    );
+    assert!(
+      !exclcreat.has(TIME_MODIFY_SET),
+      "the times hold the verifier"
+    );
+    let (status, fh) = exclusive_open(
+      &mut client,
+      &mut service,
+      &mut server,
+      ("once", verifier),
+      (&[ATTR_MODE], &mode),
+    );
+    assert_eq!(status, Nfsstat4::Ok.wire(), "the exclusive create");
+    let (fh, attrset) = fh.unwrap();
+    assert!(
+      attrset.has(ATTR_MODE) && attrset.has(TIME_MODIFY_SET) && attrset.has(TIME_ACCESS_SET),
+      "the reply names the mode it set and the times that hold the verifier, which the client resets"
+    );
+    fh
+  };
+
+  // A new server: the sessions and slot caches of the first are gone; the volume is not.
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-exclusive-again");
+  let (status, again) = exclusive_open(
+    &mut client,
+    &mut service,
+    &mut server,
+    ("once", verifier),
+    (&[ATTR_MODE], &mode),
+  );
+  assert_eq!(status, Nfsstat4::Ok.wire(), "the retried create opens");
+  assert_eq!(again.unwrap().0, first, "the file the first create made");
+  let (status, _) = exclusive_open(
+    &mut client,
+    &mut service,
+    &mut server,
+    ("once", [1; 8]),
+    (&[ATTR_MODE], &mode),
+  );
+  assert_eq!(status, Nfsstat4::Exist.wire(), "another verifier's create");
+  let (status, _) = exclusive_open(
+    &mut client,
+    &mut service,
+    &mut server,
+    ("twice", verifier),
+    (&[TIME_MODIFY_SET], &SET_TO_SERVER_TIME4.to_be_bytes()),
+  );
+  assert_eq!(
+    status,
+    Nfsstat4::Inval.wire(),
+    "times in an exclusive create's attributes"
+  );
+}
+
+/// RFC 8881 §3.3.1 (A-38): `nfstime4` carries signed 64-bit seconds, and the volume keeps nanoseconds in
+/// an `i64`, so a SETATTR of a time past 2^32 seconds (the year 2106) or before 1970 sets exactly that
+/// time and GETATTR reads it back — NFSv3's 32-bit `nfstime3` does not limit NFSv4.
+#[test]
+fn times_past_2106_and_before_1970_round_trip() {
+  /// Format: `FATTR4_TIME_ACCESS`, `FATTR4_TIME_ACCESS_SET`, `FATTR4_TIME_MODIFY`,
+  /// `FATTR4_TIME_MODIFY_SET`; `SET_TO_CLIENT_TIME4`.
+  const TIME_ACCESS: u32 = 47;
+  const TIME_ACCESS_SET: u32 = 48;
+  const TIME_MODIFY: u32 = 53;
+  const TIME_MODIFY_SET: u32 = 54;
+  const SET_TO_CLIENT_TIME4: u32 = 1;
+  /// Shape: 2^32 seconds (2106) and a day before the epoch.
+  const LATE: i64 = 1 << 32;
+  const EARLY: i64 = -86_400;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-y2106");
+  let owner = client.owner.clone();
+  let (stateid, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "timeless",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+  let mut args = client.sequenced(3);
+  args.u32(op::PUTFH);
+  args.opaque(&fh);
+  args.u32(op::SETATTR);
+  stateid.encode(&mut args);
+  Bitmap::of(&[TIME_ACCESS_SET, TIME_MODIFY_SET]).encode(&mut args);
+  let mut values = XdrWriter::new();
+  values.u32(SET_TO_CLIENT_TIME4);
+  values.i64(EARLY);
+  values.u32(250);
+  values.u32(SET_TO_CLIENT_TIME4);
+  values.i64(LATE);
+  values.u32(500);
+  args.opaque(values.as_slice());
+  args.u32(op::GETATTR);
+  Bitmap::of(&[TIME_ACCESS, TIME_MODIFY]).encode(&mut args);
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(reply.status, Nfsstat4::Ok.wire(), "SETATTR then GETATTR");
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  expect_ok(&mut body, op::SETATTR);
+  Bitmap::decode(&mut body).unwrap();
+  expect_ok(&mut body, op::GETATTR);
+  Bitmap::decode(&mut body).unwrap();
+  let mut values = XdrReader::new(body.opaque(64).unwrap());
+  let atime = (values.i64().unwrap(), values.u32().unwrap());
+  let mtime = (values.i64().unwrap(), values.u32().unwrap());
+  assert_eq!(atime, (EARLY, 250), "a time before 1970 reads back");
+  assert_eq!(mtime, (LATE, 500), "a time past 2106 reads back");
+}

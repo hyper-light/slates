@@ -1455,6 +1455,7 @@ dependencies = [
 name = "slates-bridge-nfs"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "proptest",
  "slates-bridge-core",
  "slates-db",

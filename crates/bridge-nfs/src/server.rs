@@ -14,7 +14,7 @@ use crate::mount::{
 };
 use crate::multi::NfsService;
 use crate::portmap::{PMAPPROC_GETPORT, PMAPPROC_NULL, PORTMAP_PROGRAM, getport_reply};
-use crate::procedures::{NFS_PROGRAM, NFS_VERSION as NFS_V3};
+use crate::procedures::{Dialect, NFS_PROGRAM, NFS_VERSION as NFS_V3};
 use crate::rpc::{AcceptStatus, RecordReader, parse_call};
 use crate::xdr::{XdrReader, XdrWriter};
 use crate::{reply_bytes, write_record};
@@ -33,10 +33,13 @@ const RECORD_READ_CHUNK: usize = 1 << 16;
 /// `GETPORT` (this server serves every program on one port). Public so a multi-shard daemon can run it
 /// both on the accepting shard (for a local volume) and, over the cross-shard bridge queue, on the
 /// owning shard (for a remote one) — the same engine either place.
-/// NFS calls are served for version 3 here; version 4 is the caller's to serve first
-/// ([`crate::v4`]), and any other version is refused `PROG_MISMATCH` naming the served range.
+/// NFS calls are served for version 3 here, answering for `dialect` (the wire client's, or the NFSv4
+/// front end's when it routes an operation's v3 call here, A-38); version 4 is the caller's to serve
+/// first ([`crate::v4`]), and any other version is refused `PROG_MISMATCH` naming the served range.
+#[allow(clippy::too_many_arguments)] // one decoded call: its dialect, program, version, procedure, args, port
 pub fn serve_call(
   service: &mut dyn NfsService,
+  dialect: Dialect,
   program: u32,
   version: u32,
   procedure: u32,
@@ -68,7 +71,7 @@ pub fn serve_call(
       },
       Vec::new(),
     ),
-    NFS_PROGRAM => match service.serve_procedure(procedure, args) {
+    NFS_PROGRAM => match service.serve_procedure(dialect, procedure, args) {
       Some(results) => (AcceptStatus::Success, results),
       None => (AcceptStatus::ProcUnavail, Vec::new()),
     },
@@ -134,6 +137,7 @@ fn dispatch(
     Ok((call, mut args)) => {
       let (status, results) = serve_call(
         service,
+        Dialect::LOOPBACK_NFS3,
         call.program,
         call.version,
         call.procedure,

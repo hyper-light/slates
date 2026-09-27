@@ -60,6 +60,30 @@ struct Open {
   seqid: u32,
 }
 
+/// The kind of I/O a state id is presented for (RFC 8881 §9.1.2): a READ, a write-type operation (a
+/// WRITE, or a SETATTR that sets the size), or a SETATTR of other attributes, which needs no access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoWant {
+  /// A READ.
+  Read,
+  /// A WRITE, or a SETATTR that sets the size.
+  Write,
+  /// A SETATTR that leaves the size.
+  Attributes,
+}
+
+/// What authorizes an I/O beyond the caller's identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoAuthority {
+  /// The object's mode, checked against the caller: an NFSv3 call, which carries no open (the owner
+  /// may write its own file whatever the bits say, standing in for the open the protocol cannot
+  /// show), or an NFSv4 special state id.
+  Mode,
+  /// An NFSv4 open whose access mode allows the I/O: it checked the caller's permission when it was
+  /// made, and a descriptor keeps its access whatever the mode becomes (POSIX).
+  Open,
+}
+
 /// The key an open is found by from its file: the file first, so every open of one file is one range.
 type OpenKey = (Vec<u8>, u64, Vec<u8>);
 
@@ -533,16 +557,69 @@ impl FileState {
     }
   }
 
-  /// Whether `stateid` may serve I/O on `fh` for `clientid`: a special state id, or an open or a lock
-  /// state of that file for that client at a current seqid (§8.2.2, §9.1.4).
-  pub fn check_io(&self, stateid: &Stateid, fh: &Nfsfh3, clientid: u64) -> Result<(), Nfsstat4> {
+  /// Whether `stateid` may serve I/O of kind `want` on `fh` for `clientid` (RFC 8881 §9.1.2), and what
+  /// authorizes it:
+  /// - an open or a lock state of that file for that client at a current seqid (§8.2.2), whose access
+  ///   mode (a lock state's is its open's) must allow a write-type operation (`NFS4ERR_OPENMODE`); a
+  ///   READ is allowed on a write-only open, as clients' write paths read, but not past another open's
+  ///   DENY_READ. Such an open authorizes the I/O: it checked the caller's permission when it was made,
+  ///   and a descriptor keeps its access whatever the mode becomes ([`IoAuthority::Open`]);
+  /// - a special state id, which holds no share reservation, so every other open's deny applies
+  ///   (`NFS4ERR_LOCKED`) and the object's mode decides ([`IoAuthority::Mode`]). The READ bypass id
+  ///   bypasses byte-range locks, which are advisory here, and not share reservations.
+  pub fn check_io(
+    &self,
+    stateid: &Stateid,
+    fh: &Nfsfh3,
+    clientid: u64,
+    want: IoWant,
+  ) -> Result<IoAuthority, Nfsstat4> {
     if stateid.is_special() {
-      return Ok(());
+      self.refuse_denied(fh, None, want)?;
+      return Ok(IoAuthority::Mode);
     }
-    if self.locks.contains(&stateid.other) {
-      return self.locks.get(stateid, fh, Some(clientid)).map(|_| ());
+    let (open_other, open) = if self.locks.contains(&stateid.other) {
+      let lock = self.locks.get(stateid, fh, Some(clientid))?;
+      let open = self.opens.get(&lock.open).ok_or(Nfsstat4::BadStateid)?;
+      (lock.open, open)
+    } else {
+      (stateid.other, self.check_open(stateid, fh, clientid)?)
+    };
+    match want {
+      IoWant::Write if open.share.access & share::WRITE == 0 => Err(Nfsstat4::Openmode),
+      IoWant::Read if open.share.access & share::READ == 0 => {
+        self.refuse_denied(fh, Some(&open_other), want)?;
+        Ok(IoAuthority::Open)
+      }
+      IoWant::Read | IoWant::Write => Ok(IoAuthority::Open),
+      IoWant::Attributes => Ok(IoAuthority::Mode),
     }
-    self.check_open(stateid, fh, clientid).map(|_| ())
+  }
+
+  /// `NFS4ERR_LOCKED` when an open of `fh` other than `except` denies the access `want` asks for.
+  fn refuse_denied(
+    &self,
+    fh: &Nfsfh3,
+    except: Option<&Other>,
+    want: IoWant,
+  ) -> Result<(), Nfsstat4> {
+    let denied = match want {
+      IoWant::Read => share::READ,
+      IoWant::Write => share::WRITE,
+      IoWant::Attributes => return Ok(()),
+    };
+    let refused = self
+      .by_file
+      .range((fh.0.clone(), 0, Vec::new())..)
+      .take_while(|((file, _, _), _)| *file == fh.0)
+      .filter(|(_, other)| Some(*other) != except)
+      .filter_map(|(_, other)| self.opens.get(other))
+      .any(|open| open.share.deny & denied != 0);
+    if refused {
+      Err(Nfsstat4::Locked)
+    } else {
+      Ok(())
+    }
   }
 
   /// CLOSE (§18.2): the open's state released, with its lock states holding no lock;

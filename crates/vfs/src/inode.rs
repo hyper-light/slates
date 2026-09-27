@@ -230,7 +230,10 @@ pub struct Inode {
   pub attrs: Attrs,
   /// The body.
   pub body: Body,
-  /// The per-inode version counter the journal records (`prev_version`).
+  /// The per-inode change counter: it moves on every change to the object — every stamp of
+  /// `ctime`, through [`Inode::stamp_change`] — whatever the wall clock reads, so a transport serves
+  /// it as a change attribute that never repeats (NFSv4 `change`, A-38). The journal records it
+  /// (`prev_version`).
   pub version: u64,
   /// Where a file or symlink hangs: its parent directory and the hash of its name there, so
   /// the deriver finds its path without walking the tree (§4.16). Kept current by create,
@@ -284,5 +287,41 @@ impl Inode {
       xattrs: None,
       attribute_of: None,
     }
+  }
+
+  /// Records a change to the object: its change time becomes `ctime` and its change counter moves.
+  /// Every change goes through here, so the counter moves wherever the change time is stamped, even
+  /// when the wall clock repeats or steps back (A-38).
+  pub(crate) fn stamp_change(&mut self, ctime: i64) {
+    self.attrs.ctime = ctime;
+    self.version += 1;
+  }
+
+  /// Moves the change counter by `by` with no change to the object's own attributes: its AppleDouble
+  /// working copy was made or dropped. A view's counter is its owner's plus its working copy's, so
+  /// the owner absorbs a dropped copy's counter (and one more) and a made copy's first step, and
+  /// the sum never repeats (A-38).
+  pub(crate) fn fold_counter(&mut self, by: u64) {
+    self.version += by;
+  }
+
+  /// Takes attributes observed on the host beneath an overlay (an outsider's edit, §4.5): the size,
+  /// the mode when the observation carries one, and the host's times. The change counter moves when
+  /// any of them differs from what the volume held, so a client caching by the counter sees the
+  /// edit, and stays where it is when none does, so an unchanged file's cache is kept (A-38).
+  pub(crate) fn adopt_observed(&mut self, size: u64, mode: Option<u32>, mtime: i64, ctime: i64) {
+    let changed = self.attrs.size != size
+      || mode.is_some_and(|mode| mode != self.attrs.mode)
+      || self.attrs.mtime != mtime
+      || self.attrs.ctime != ctime;
+    if !changed {
+      return;
+    }
+    self.attrs.size = size;
+    if let Some(mode) = mode {
+      self.attrs.mode = mode;
+    }
+    self.attrs.mtime = mtime;
+    self.stamp_change(ctime);
   }
 }

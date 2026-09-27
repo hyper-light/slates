@@ -105,6 +105,53 @@ authorized merely by appearing here.
   front end reuses the v3 procedures, so a v4 or Linux client's `touch ._x` / `rm ._x` beside `x`
   changed `x`'s attributes. Views are now served only to the macOS NFSv3 client
   (`an_nfsv4_client_never_reaches_an_appledouble_view`).
+- [x] **NFSv4 `change` was the change time; the volume's counter missed link-count changes and
+  outsider edits; `change_info4` was 0/0 and v3 `wcc_data` had no pre-op half** (A-38). `change` is now
+  the counter, moved at every ctime stamp; the v3 layer answers per call in a `Dialect` and carries the
+  counter to the front end; `wcc_data` carries pre-op attributes and `change_info4` is atomic from one
+  call. See `docs/bugs/2026-09-26-nfsv4-change-was-the-change-time.md`.
+- [x] **NFSv4 CREATE refused FIFOs and sockets; explicit times were dropped** (pjdfstest over the new
+  NFSv4.2 transport). CREATE of special names goes through MKNOD; the write-only times are supported.
+  See `docs/bugs/2026-09-26-nfsv4-create-refused-fifos-and-dropped-explicit-times.md`.
+- [x] **NFSv4 times were limited to NFSv3's 32-bit seconds** (pjdfstest `utimensat/09.t` bailed out
+  over v4: a SETATTR of 2^32 seconds was refused whole). The front end's dialect now carries
+  `nfstime4`'s signed 64-bit seconds both ways (`times_past_2106_and_before_1970_round_trip`; the kernel
+  test's `utimensat` of 2^31 and 2^32).
+- [x] **Exclusive creates were guarded creates, and NFSv3 `EXCLUSIVE` was `NOTSUPP`** (A-38): a retried
+  exclusive create after a daemon restart met `EXIST`. The verifier is kept in the new file's times;
+  the OPEN `attrset` names them so the client resets them; an unchecked OPEN that loses a create race
+  opens the file (`an_exclusive_create_keeps_its_verifier_and_a_retry_finds_its_own_file`,
+  `an_exclusive_create_is_retried_after_a_restart_onto_its_own_file`, the kernel test's
+  `exclusive_create_keeps_its_mode`).
+- [x] **The blocked-poll attribution test assumed no stolen CPU** (CI 36289513559, macOS runner: one of
+  three blocked polls counted as its task's). The runner's thread clock read past the quantum for a
+  sleeping poll (23 ms for a 3 ms sleep), and the rule rightly followed the clock. The test now records
+  each poll's own thread CPU and allows exactly those polls to count as the task's; every other
+  invariant is exact (`crates/rt/tests/wake_estimate.rs`).
+- [x] **NFSv4 READDIR dropped entries without attributes, and gave every entry the directory's fsid**:
+  a volume on another shard, listed at the pseudo-root, vanished; a listed volume root carried the
+  root's filesystem id, hiding the boundary. Entries are filled by a routed LOOKUP and fs figures are
+  taken per filesystem; a LOOKUP of `@<capability>` enters the scoped root as NFSv3's `/@<capability>`
+  does (`an_nfsv4_scoped_browse_lists_a_volume_on_another_shard_with_its_own_fsid`).
+- [x] **NFSv4 I/O ignored the state id's access mode and other opens' denials; exclusive creates lost
+  their mode** (pjdfstest `open/07.t`, `chmod/12.t`; git's hooks over NFSv4.2). See
+  `docs/bugs/2026-09-26-nfsv4-io-ignored-the-state-ids-access-mode.md`.
+- [x] **RFC 8881 §17's REQUIRED VERIFY, NVERIFY, SECINFO, BACKCHANNEL_CTL and SET_SSV answered
+  `NFS4ERR_NOTSUPP`** (A-38): now served (`verify_and_nverify_compare_the_objects_attributes`,
+  `secinfo_backchannel_ctl_and_set_ssv_are_served`, `secinfo_consumes_the_current_file_handle`).
+  PUTPUBFH was already served as the root.
+- [ ] **The change counter can repeat across a crash** (2026-09-26, found designing `change_attr_type`):
+  an `UNSTABLE` write's reply carries the counter before the recovery image is published, so a crash
+  can restore the counter below a value a client saw, and another client's change can then reach that
+  same value with different content (the first client re-sends its writes on the new verifier, but
+  holds a stale cache meanwhile). Fix: fold the owner partition's forward-only instance (A-37) into
+  `change` in the front end's dialect, so every value after a restart exceeds every value before;
+  then `change_attr_type` can be `NFS4_CHANGE_TYPE_IS_MONOTONIC_INCR` (the pseudo-root's digest stays
+  UNDEFINED). Not advertised until then (the Linux client treats its absence as UNDEFINED).
+- [ ] **NFSv4 audit, remaining** (2026-09-26): the
+  `OPEN4_RESULT_PRESERVE_UNLINKED` (keep an unlinked file while a v4 client holds it open, so the client
+  need not silly-rename it: pjdfstest `unlink/14.t:4` fails on v4 as on v3); the pseudo-root entry's
+  `mounted_on_fileid`.
 - [x] **NFSv4 returned `NFS4ERR_RESOURCE`, which NFSv4.1 does not define** (RFC 7863), at the client,
   session and open bounds. Now DELAY, NOSPC and NOSPC per RFC 8881 §15.2. See
   `docs/bugs/2026-09-26-nfsv4-returned-a-status-v4-1-does-not-define.md`.

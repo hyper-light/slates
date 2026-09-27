@@ -63,6 +63,11 @@ impl Bitmap {
     })
   }
 
+  /// Whether no bit is set.
+  pub fn is_empty(&self) -> bool {
+    self.0.iter().all(|word| *word == 0)
+  }
+
   /// The bits set in both.
   pub fn intersect(&self, other: &Bitmap) -> Bitmap {
     Bitmap(self.0.iter().zip(&other.0).map(|(a, b)| a & b).collect())

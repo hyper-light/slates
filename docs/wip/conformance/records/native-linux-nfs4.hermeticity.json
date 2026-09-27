@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "suite": "hermeticity",
+  "transport": "native-linux-nfs4",
+  "host": {
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "root"
+  },
+  "date": "2026-09-27",
+  "command": "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c 'printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp'`, snapshot, land, grant, land --grant",
+  "bound": "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "hermeticity",
+      "write_calls": 239,
+      "inside_target": 22,
+      "ram_only": 119,
+      "standard_streams": 98,
+      "unresolved": 0,
+      "outside": 0,
+      "written_matched": 6,
+      "written_unmatched": 0
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 670,
+  "notes": [
+    "tracer: strace -f -y -qq -s 0 -e trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice -- <anchor>; 239 events parsed from 862 log lines; landing reported 6 written; 4 hidden siblings (.slates-*) seen inside the target",
+    "the granted target: /tmp/conformance-scratch/native-linux-nfs4/land-target",
+    "volume quota: 32768 bytes, derived from 8 peak workload entries × 4096-byte host page",
+    "landing completeness: 6/6 entries reported; disk verification: Ok(())"
+  ]
+}

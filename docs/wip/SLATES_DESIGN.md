@@ -1716,10 +1716,27 @@ therefore one implementation shared by both versions.
   share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
   file and client, at its current seqid (`NFS4ERR_OLD_STATEID` for an earlier one, §8.2.2). OPEN of an
   existing file checks the caller's access for the share asked; a create needs none on the new file.
-  An `UNCHECKED` open of an existing name applies only the size (the `O_TRUNC`). The exclusive create
-  modes are served as guarded creates: the verifier made an exclusive create idempotent across
-  retransmission, and the slot cache now guarantees that for every request. Expired, replaced and
-  destroyed clients' opens are purged with them.
+  An `UNCHECKED` open of an existing name applies only the size (the `O_TRUNC`), also when another
+  client creates the name between the open's LOOKUP and its create. An exclusive create (EXCLUSIVE4,
+  EXCLUSIVE4_1, and NFSv3 `EXCLUSIVE`) keeps its verifier in the new file's modification and access
+  times (`procedures::exclusive_times`, RFC 1813 §3.3.8, RFC 8881 §18.16.3), which the volume and its
+  recovery image keep. So a retry of the same create finds its own file and opens it — after a daemon
+  restart too, when the slot cache is gone — while any other existing name is `EXIST`. The OPEN reply's
+  `attrset` names the times, and the client sets its own right after (the Linux v4 and macOS v3 clients
+  both do). `suppattr_exclcreat` names the size, mode, owner and group, not the times; a create that
+  sets a time is `NFS4ERR_INVAL` (A-38). Expired, replaced and destroyed clients' opens are purged with
+  them.
+- **I/O under a state id (RFC 8881 §9.1.2; A-38).** READ, WRITE and a SETATTR of the size present a
+  state id, checked at the file's owner for the access they need (`FileState::check_io`):
+  - an open's (or a lock state's open's) access mode must allow a write-type operation, else
+    `NFS4ERR_OPENMODE`; a READ runs on a write-only open unless another open denies reading;
+  - a special state id holds no share reservation, so another open's deny refuses its I/O
+    (`NFS4ERR_LOCKED`); the READ bypass id bypasses only byte-range locks, which are advisory;
+  - an open authorizes the I/O it allows: the v3 layer skips the mode check a wire call gets
+    (`IoAuthority::Open`), since the open checked the caller and a descriptor keeps its access whatever
+    the mode becomes. A special state id is judged by the mode, with the NFSv3 owner override;
+  - READ_PLUS and COPY read and write under their state ids in the same way, and SEEK, READ_PLUS and
+    COPY check them for the access they need.
 - **Byte-range locks** (§9, §18.10–18.12; `v4/lock.rs`): POSIX semantics per lock-owner and file (a
   lock replaces the owner's own ranges, an unlock splits them, touching ranges of one type merge), tested
   against a byte-level model on generated histories. Two owners conflict where their ranges overlap
@@ -1762,10 +1779,54 @@ therefore one implementation shared by both versions.
   the same v3 dispatch under numbers past RFC 1813's (`procedures::extension`), so the daemon's
   handle routing, authorization and barrier apply unchanged. Both connection servers refuse any v3
   procedure outside RFC 1813's range (`PROC_UNAVAIL`).
+- **The change attribute and change info (A-38).** `change` is the object's change counter
+  (`Volume::change_version`), never its change time. A wall clock can repeat a stamp (a microsecond
+  on macOS) or step back (a time adjustment), and a client keeps its cached data, attributes and
+  listing while `change` is the value it saw, so a ctime-based `change` served stale data.
+  - The volume moves the counter wherever it stamps ctime (`Inode::stamp_change`): writes, truncates,
+    attribute and link-count changes, directory entry changes, and extended attributes. An outsider's
+    edit beneath an overlay moves it when a stat takes the disk's new attributes, and an unchanged
+    stat leaves it (`Inode::adopt_observed`). An AppleDouble view's counter is its owner's plus its
+    working copy's; the owner absorbs a made or dropped copy's counter, so the sum never repeats.
+  - The v3 layer answers each call in a per-call dialect (`procedures::Dialect`): an NFSv3 wire client
+    (AppleDouble views only for this host's macOS client) or the v4 front end. In the front end's
+    dialect every `fattr3` and `wcc_attr` is followed by the counter. A wire call never speaks it.
+  - Every `wcc_data` now carries its pre-operation attributes, taken immediately before the effect
+    inside the one call on the owner shard; a refusal carries none. So an NFSv3 client whose cache
+    matches the pre half keeps it across its own change, and the front end builds an atomic
+    `change_info4` for CREATE, REMOVE, RENAME, LINK, OPEN with create, SETXATTR and REMOVEXATTR.
+    Atomic is claimed only where both halves come from one v3 call: an OPEN of an existing file
+    reports the directory's `change` from its LOOKUP, not atomic, since another client may change the
+    directory between the two calls.
+  - The pseudo-root has no stored state to count in; its `change` and its cookie verifier are a
+    digest of its listing, equal exactly while the listing is (short of a 64-bit collision).
+- **Every operation RFC 8881 §17 REQUIRES is served.** VERIFY and NVERIFY compare the encodings of
+  the named attributes with the server's own (as Linux's nfsd does). SECINFO performs the name's
+  LOOKUP, answers AUTH_SYS and consumes the current handle. PUTPUBFH names the root, as §18.20
+  recommends. With no callbacks made, BACKCHANNEL_CTL accepts AUTH_NONE and AUTH_SYS and answers
+  `NFS4ERR_NOENT` for an RPCSEC_GSS handle, none having been issued. SET_SSV is `NFS4ERR_INVAL`, since
+  only SP4_NONE is established. The five NFSv4.0 operations 4.1 forbids get `NFS4ERR_NOTSUPP`, as
+  §8.8 requires.
+- **Attributes by minor version.** `supported_attrs` names only what the compound's minor version
+  defines: NFSv4.2's attributes (`xattr_support`) are not offered, nor returned, in an NFSv4.1 compound.
+  `change_attr_type` is not offered until the counter is monotonic across a crash (TBD_FIXES: an
+  unstable write's counter can precede the recovery image).
+- **Special names and times.** CREATE makes FIFOs and socket names through the v3 MKNOD, which keeps
+  A-26's rule (block and character devices refused). `supported_attrs` names `time_access_set` and
+  `time_modify_set`, without which the Linux client drops `utimensat`'s explicit times; a GETATTR or
+  READDIR asking for either is `NFS4ERR_INVAL` (§5.6). Times have NFSv4's full range: `nfstime4`'s
+  signed 64-bit seconds reach the volume's `i64` nanoseconds both ways (the dialect carries them,
+  `nfs::V4Attrs` and `nfs::Nfstime4`), so a time before 1970 or past 2106 is set and read exactly, where
+  NFSv3's 32-bit `nfstime3` clamps; one beyond the volume's range is `NFS4ERR_INVAL`.
 - **Not yet offered:** delegations and callbacks (never granted), and state protection other than
   `SP4_NONE`.
 - **The capability** is presented at the pseudo root as a LOOKUP of `<name>@<attachment>.<token>`, as
-  an NFSv3 MNT path does, until an RPC-over-TLS or RPCSEC_GSS identity carries it.
+  an NFSv3 MNT path does, until an RPC-over-TLS or RPCSEC_GSS identity carries it. A LOOKUP of a bare
+  `@<attachment>.<token>` enters the root scoped to the capability, as NFSv3's `/@<capability>` does.
+- **READDIR never drops an entry.** An entry the v3 listing carries without attributes (the pseudo-root
+  names a volume on another shard by name only) is filled by a LOOKUP that routes to its owner. Every
+  entry's `fsid` is its own, and filesystem-wide figures are taken once per filesystem listed, so a
+  volume root listed at the pseudo-root shows the boundary.
 - **In the daemon.** The v4 state lives on the listener's shard and is created with the first v4
   call. Each operation's v3 call presents the capability of the handle it names, and is routed to the
   volume's owner shard exactly as an NFSv3 call is, barrier included. WRITE and COMMIT therefore carry
@@ -1796,6 +1857,8 @@ therefore one implementation shared by both versions.
   A file held open and locked through the kernel's v4.2 client keeps reading, writing and binding its
   lock across a `SIGKILL` of the daemon under the real anchor (`crates/cli/tests/nfs_v4_restart.rs`).
   With the restore disabled, the same test fails with `EIO`: the kernel's recovery finds no grace.
+  `mkfifo` and a socket's `bind` through the kernel make those names (a device is refused), and
+  `utimensat`'s explicit times are the ones read back (A-38 change, the same test).
   Owed:
   - DEALLOCATE (a volume change) and CLONE (with dedup);
 
@@ -6175,3 +6238,56 @@ instance and its typed refusal, the model histories); `slates-bridge-nfs` (the f
 table's journals and restores; the kept-record bounds; the restored CREATE_SESSION retry; the absent
 file-state slot of a daemon export); `slates-server` (`nfs_state`: record or rebuild, the instance,
 building the state from records); the Linux CI step; GAPS and TBD_FIXES.
+
+### A-38 — The change attribute is a counter; wcc_data and change_info4 are real (2026-09-26)
+
+NFSv4's `change` was the change time in nanoseconds. A wall clock repeats stamps within its resolution
+and can step back, so two changes could leave `change` unmoved and a client would keep a stale cache.
+The volume's per-inode counter (`Volume::change_version`) already promised "increases on every change
+… collision-free, unlike a clock", but link-count changes and an overlay's refresh of an outsider's
+edit stamped ctime without moving it. The front end also answered every `change_info4` as non-atomic
+0/0, and NFSv3 `wcc_data` carried no pre-operation attributes, so every client dropped its cached
+listing after its own create or remove.
+
+Now (§4.6 "The change attribute and change info"):
+- every ctime stamp moves the counter (`Inode::stamp_change`), and an outsider's edit moves it when
+  observed (`Inode::adopt_observed`); an AppleDouble view's counter is owner plus working copy;
+- the bridge carries it (`NodeAttr::change`, from `Volume::observe`, one lookup where `stat` and `kind`
+  took two);
+- the v3 layer answers in a per-call `Dialect` that replaces the AppleDouble toggle, and in the front
+  end's dialect appends the counter to each `fattr3` and `wcc_attr`;
+- `wcc_data` carries pre-operation attributes taken inside the call; the front end builds atomic
+  `change_info4` from one call's wcc and serves `change` from the counter;
+- the pseudo-root's `change` and cookie verifier are its listing's digest (the count had repeated after
+  a remove and an add).
+- times travel at full range in the dialect (`V4Attrs`' nanoseconds, `Nfstime4` client times): a
+  SETATTR of 2^32 seconds had been refused whole (pjdfstest `utimensat/09.t` bailed out over v4).
+
+In the same change, from pjdfstest and the workloads over the new NFSv4.2 conformance transport:
+CREATE of FIFOs and sockets (through MKNOD); `time_access_set`/`time_modify_set` in `supported_attrs`
+(write-only: `NFS4ERR_INVAL` on a read); `suppattr_exclcreat` naming the settable attributes (every
+`O_EXCL` file, git's hooks among them, had taken the default mode); and I/O checked against the state
+id's access mode and other opens' denials (§9.1.2: an owner's `O_RDONLY|O_TRUNC` of a file it may not
+write had truncated it). And from reading RFC 8881 §17: VERIFY, NVERIFY, SECINFO, BACKCHANNEL_CTL
+and SET_SSV, REQUIRED operations that had answered `NFS4ERR_NOTSUPP`.
+
+Evidence (by use): `crates/vfs/tests/change.rs` runs each generated history twice, under a stepping
+clock and a frozen one; wherever ctime moved in the first, the counter moved in the second (it failed
+first on a hard link). `crates/vfs/tests/base.rs` shows an outsider's edit moving the counter and a plain
+stat not. `crates/bridge-nfs/tests/v4.rs` shows `change` moving on each write under a frozen clock and
+CREATE/REMOVE answering atomic change info whose `before` and `after` equal GETATTRs taken around the
+call; the v3 tests assert each pre-op half equals a GETATTR taken just before. The Linux kernel's v4.2
+client makes a FIFO and a socket, is refused a device, reads back explicit times, and chowns files and
+directories (`crates/server/tests/nfs_v4_kernel.rs`); the restart test passes unchanged (privileged
+Linux container, 2026-09-26).
+
+Applied in the same change to: §4.6; `slates-vfs` (`Inode::stamp_change`, `adopt_observed`,
+`fold_counter`, `Volume::observe`, `view_change`); `slates-bridge-core` (`NodeAttr::change`);
+`slates-bridge-nfs` (`Dialect`, `Wcc`, `WccAttr`, the change-carrying `Fattr3`, pre-operation wcc in
+every mutating procedure, the xattr extensions' wcc, `serve_procedure`/`serve_call`/`VolumeSet` taking the
+dialect, the pseudo-root digest, v4 CREATE of special names, `change_info`, the write-only times,
+`suppattr_exclcreat`, `check_io`'s access and denials with `IoAuthority` through READ/WRITE/SETATTR,
+READ_PLUS and COPY under their state ids, READDIR's routed fill and per-filesystem figures, the
+`@<capability>` scoped root, VERIFY/NVERIFY/SECINFO/BACKCHANNEL_CTL/SET_SSV); `slates-server` (the
+requester's dialect); the tests named above and the kernel test's exclusive create and truncating
+opens as non-root processes; GAPS and TBD_FIXES.

@@ -66,6 +66,7 @@ impl Mock {
       atime: 0,
       mtime: self.mtime,
       ctime: self.ctime,
+      change: 0,
     }
   }
 }
@@ -100,6 +101,7 @@ impl Bridge for Mock {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        change: 0,
       }),
       2 => Ok(self.file_attr()),
       _ => Err(VfsError::NotFound),
@@ -238,6 +240,7 @@ impl Bridge for Mock {
         atime: 0,
         mtime: 0,
         ctime: 0,
+        change: 0,
       },
       8,
     ))

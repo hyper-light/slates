@@ -19,7 +19,10 @@
 //! so the shard reads only at the end of a poll that already ran long, and — while a long poll went
 //! unattributed for want of a window — at each step's start and each wait's end ([`Tracker`]); a busy
 //! period that runs no long poll stops the readings. macOS counts no per-thread voluntary switches, so a
-//! poll off the CPU there is unattributed unless the runtime itself yielded in it. Windows keeps
+//! poll off the CPU there is unattributed unless the runtime itself yielded in it. A virtual machine's
+//! guest may count time its virtual CPU was stolen while the thread ran as the thread's CPU; such a poll
+//! then reads as a long run and is the task's by this rule (the macOS CI runner, run 36289513559,
+//! 2026-09-27: a poll that slept 3 ms took 23 ms and read past a 1 ms quantum on the thread clock). Windows keeps
 //! per-thread times at the scheduler tick (about 15.6 ms), so no account is read there and every long
 //! poll is unattributed.
 //!

@@ -346,6 +346,18 @@ pub struct Located {
   pub inode: InodeNo,
 }
 
+/// What a transport reports of an object, from one lookup: its kind, its POSIX attributes and its
+/// change counter (A-38; [`Volume::change_version`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Observed {
+  /// The kind.
+  pub kind: Kind,
+  /// The POSIX attributes.
+  pub attrs: Attrs,
+  /// The change counter: it moves on every change to the object and never repeats.
+  pub change: u64,
+}
+
 /// A `readdir` row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirRow<'a> {
@@ -716,6 +728,17 @@ impl Volume {
   /// The attributes of an inode.
   pub fn stat(&self, store: &Store, no: InodeNo) -> Result<Attrs, VfsError> {
     Ok(self.namespace_inode(store, no)?.attrs)
+  }
+
+  /// The kind, attributes and change counter of an inode, from one lookup (what a transport's
+  /// attribute reply carries).
+  pub fn observe(&self, store: &Store, no: InodeNo) -> Result<Observed, VfsError> {
+    let inode = self.namespace_inode(store, no)?;
+    Ok(Observed {
+      kind: inode.kind,
+      attrs: inode.attrs,
+      change: inode.version,
+    })
   }
 
   /// The kind of an inode.
@@ -1606,8 +1629,7 @@ impl Volume {
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.size = inode.attrs.size.max(end);
     inode.attrs.mtime = now;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     let op = if off >= old_size {
       Op::Extend {
         at: old_size,
@@ -1681,8 +1703,7 @@ impl Volume {
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.size = len;
     inode.attrs.mtime = now;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     if recorded == Recorded::Yes {
       self.record(Op::Truncate { len }, "", Some(no), prev_version);
     }
@@ -1698,8 +1719,7 @@ impl Volume {
     let inode = store.inodes.get_mut(handle)?;
     let prev = inode.version;
     inode.attrs.mode = mode;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     self.record(Op::Setattr, "", Some(no), prev);
     Ok(())
   }
@@ -1722,8 +1742,7 @@ impl Volume {
     let prev = inode.version;
     inode.attrs.uid = uid;
     inode.attrs.gid = gid;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     self.record(Op::Setattr, "", Some(no), prev);
     Ok(())
   }
@@ -1763,8 +1782,7 @@ impl Volume {
     if let Some(mtime) = mtime {
       inode.attrs.mtime = mtime;
     }
-    inode.attrs.ctime = ctime.unwrap_or(now);
-    inode.version += 1;
+    inode.stamp_change(ctime.unwrap_or(now));
     self.record(Op::Setattr, "", Some(no), prev);
     Ok(())
   }
@@ -2179,8 +2197,7 @@ impl Volume {
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.size = end;
     inode.attrs.mtime = now;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     if delete_len > 0 {
       self.record(
         Op::Delete {
@@ -3266,8 +3283,7 @@ impl Volume {
     let handle = self.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.mtime = now;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     Ok(())
   }
 
@@ -3280,7 +3296,7 @@ impl Volume {
     let handle = self.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.nlink = u32::try_from(i64::from(inode.attrs.nlink) + i64::from(delta)).unwrap_or(0);
-    inode.attrs.ctime = self.clock.wall_ns();
+    inode.stamp_change(self.clock.wall_ns());
     Ok(())
   }
 
@@ -3296,7 +3312,7 @@ impl Volume {
     let nlink = {
       let inode = store.inodes.get_mut(handle)?;
       inode.attrs.nlink = inode.attrs.nlink.saturating_sub(1);
-      inode.attrs.ctime = now;
+      inode.stamp_change(now);
       inode.attrs.nlink
     };
     if nlink > 0 {

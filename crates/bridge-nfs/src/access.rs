@@ -37,6 +37,8 @@
 //! check is right.
 
 use slates_bridge_core::{NodeAttr, SetAttr};
+
+use crate::v4::files::IoAuthority;
 use slates_vfs::inode::Kind;
 
 /// Format: the superuser's uid (POSIX: "appropriate privileges" is uid 0 on every Unix here).
@@ -219,6 +221,7 @@ pub fn setattr_denial(
   node: &NodeAttr,
   changes: &SetAttr,
   explicit_times: bool,
+  authority: IoAuthority,
 ) -> Option<Denial> {
   if changes.mode.is_some() && !owner_or_root(caller, node) {
     return Some(Denial::NotOwner);
@@ -228,7 +231,11 @@ pub fn setattr_denial(
   {
     return Some(Denial::NotOwner);
   }
-  if changes.size.is_some() && !permits_io(caller, node, Want::Write) {
+  // A size change is a write: an NFSv4 open for writing authorized it; otherwise the mode decides.
+  if changes.size.is_some()
+    && authority == IoAuthority::Mode
+    && !permits_io(caller, node, Want::Write)
+  {
     return Some(Denial::NoAccess);
   }
   if changes.atime.is_some() || changes.mtime.is_some() {
@@ -293,6 +300,7 @@ mod tests {
       atime: 0,
       mtime: 0,
       ctime: 0,
+      change: 0,
     }
   }
 
@@ -443,39 +451,51 @@ mod tests {
       ..SetAttr::default()
     };
     assert_eq!(
-      setattr_denial(&other, &file, &chmod, false),
+      setattr_denial(&other, &file, &chmod, false, IoAuthority::Mode),
       Some(Denial::NotOwner)
     );
     assert_eq!(
-      setattr_denial(&user(1000, 1000, &[]), &file, &chmod, false),
+      setattr_denial(
+        &user(1000, 1000, &[]),
+        &file,
+        &chmod,
+        false,
+        IoAuthority::Mode
+      ),
       None
     );
-    assert_eq!(setattr_denial(&Caller::root(), &file, &chmod, false), None);
+    assert_eq!(
+      setattr_denial(&Caller::root(), &file, &chmod, false, IoAuthority::Mode),
+      None
+    );
     let truncate = SetAttr {
       size: Some(0),
       ..SetAttr::default()
     };
     assert_eq!(
-      setattr_denial(&other, &file, &truncate, false),
+      setattr_denial(&other, &file, &truncate, false, IoAuthority::Mode),
       Some(Denial::NoAccess)
     );
     let writable = node(Kind::File, 0o666, 1000, 1000);
-    assert_eq!(setattr_denial(&other, &writable, &truncate, false), None);
+    assert_eq!(
+      setattr_denial(&other, &writable, &truncate, false, IoAuthority::Mode),
+      None
+    );
     let times = SetAttr {
       mtime: Some(1),
       ..SetAttr::default()
     };
     assert_eq!(
-      setattr_denial(&other, &writable, &times, true),
+      setattr_denial(&other, &writable, &times, true, IoAuthority::Mode),
       Some(Denial::NotOwner)
     );
     assert_eq!(
-      setattr_denial(&other, &writable, &times, false),
+      setattr_denial(&other, &writable, &times, false, IoAuthority::Mode),
       None,
       "now needs only write"
     );
     assert_eq!(
-      setattr_denial(&other, &file, &times, false),
+      setattr_denial(&other, &file, &times, false, IoAuthority::Mode),
       Some(Denial::NoAccess)
     );
   }

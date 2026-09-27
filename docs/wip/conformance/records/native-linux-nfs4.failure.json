@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "suite": "failure",
+  "transport": "native-linux-nfs4",
+  "host": {
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "root"
+  },
+  "date": "2026-09-27",
+  "command": "",
+  "bound": "",
+  "outcome": {
+    "kind": "skipped",
+    "reason": {
+      "kind": "owed",
+      "reason": "no pressure or failure suite exists in the harness: Part 6's 'Fault injection on real processes' and 'Soak and scale' are Phase 9 work and have no runnable form yet"
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 0,
+  "notes": []
+}

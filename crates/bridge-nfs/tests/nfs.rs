@@ -31,6 +31,7 @@ fn sample_attr() -> Fattr3 {
       seconds: 1_700_000_002,
       nseconds: 3,
     },
+    v4: None,
   }
 }
 
@@ -110,4 +111,78 @@ fn status_and_time_are_golden() {
   let mut w = XdrWriter::new();
   time.encode(&mut w);
   assert_eq!(w.into_bytes(), [1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+/// A-38: an NFSv3 `fattr3` is exactly RFC 1813's 84 bytes; in the NFSv4 front end's dialect the change
+/// counter and the full-range times follow them and round-trip, and a `wcc_data` carries it in both halves; the v3 reader of a
+/// v3 reply is unchanged.
+#[test]
+fn the_front_end_dialect_carries_the_change_counter_and_nfsv3_is_unchanged() {
+  use slates_bridge_nfs::nfs::{V4Attrs, Wcc, WccAttr};
+  /// Format: the size of an RFC 1813 `fattr3`.
+  const FATTR3_BYTES: usize = 84;
+  let plain = sample_attr();
+  let mut writer = XdrWriter::new();
+  plain.encode(&mut writer);
+  assert_eq!(
+    writer.as_slice().len(),
+    FATTR3_BYTES,
+    "a v3 fattr3 is RFC 1813's structure"
+  );
+  assert_eq!(
+    Fattr3::decode(&mut XdrReader::new(writer.as_slice())).unwrap(),
+    plain
+  );
+
+  let counted = Fattr3 {
+    v4: Some(V4Attrs {
+      change: 0x0102_0304_0506_0708,
+      atime_ns: -1,
+      mtime_ns: 1 << 62,
+      ctime_ns: 0,
+    }),
+    ..plain
+  };
+  let mut writer = XdrWriter::new();
+  counted.encode(&mut writer);
+  assert_eq!(writer.as_slice().len(), FATTR3_BYTES + 4 * 8);
+  assert_eq!(
+    &writer.as_slice()[FATTR3_BYTES..],
+    &[
+      1, 2, 3, 4, 5, 6, 7, 8, // the change counter
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+      0xff, // atime: one nanosecond before the epoch
+      0x40, 0, 0, 0, 0, 0, 0, 0, // mtime: 2^62 nanoseconds
+      0, 0, 0, 0, 0, 0, 0, 0, // ctime: the epoch
+    ],
+    "the counter and the full-range times follow the fattr3 fields, big-endian"
+  );
+  assert_eq!(
+    Fattr3::decode_with_change(&mut XdrReader::new(writer.as_slice())).unwrap(),
+    counted
+  );
+
+  let wcc = Wcc {
+    pre: Some(WccAttr {
+      size: 4096,
+      mtime: plain.mtime,
+      ctime: plain.ctime,
+      change: Some(7),
+    }),
+    post: Some(Fattr3 {
+      v4: Some(V4Attrs {
+        change: 8,
+        atime_ns: 1,
+        mtime_ns: 2,
+        ctime_ns: 3,
+      }),
+      ..plain
+    }),
+  };
+  let mut writer = XdrWriter::new();
+  wcc.encode(&mut writer);
+  assert_eq!(
+    Wcc::decode_with_change(&mut XdrReader::new(writer.as_slice())).unwrap(),
+    wcc
+  );
 }

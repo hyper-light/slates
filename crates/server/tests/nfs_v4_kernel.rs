@@ -217,9 +217,221 @@ fn exercise(root: &Path, payload: &[u8]) {
     .collect();
   names.sort();
   assert_eq!(names, ["dir", "kernel.txt", "link"], "the listing");
+  owners_change_as_numbers(&root.join("dir"));
   std::fs::remove_dir(root.join("dir")).unwrap();
   std::fs::remove_file(root.join("link")).unwrap();
   locks_conflict_across_open_files(&file);
+  owners_change_as_numbers(&file);
+  exclusive_create_keeps_its_mode(root);
+  #[cfg(target_os = "linux")]
+  truncating_open_needs_write_permission(root);
+  #[cfg(target_os = "linux")]
+  special_names(root);
+  explicit_times(&file);
+}
+
+/// An `O_EXCL` create through the kernel client (an EXCLUSIVE4_1 OPEN) makes the file with the mode
+/// asked: the client sends in the create only the attributes `suppattr_exclcreat` names, and sets no
+/// mode afterwards, so a server naming none left every exclusive create at its default mode (git's
+/// hook templates, 0755, arrived 0644 — the workload differential over NFSv4.2). The verifier the
+/// server keeps in the times is replaced by the client's own times.
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn exclusive_create_keeps_its_mode(root: &Path) {
+  use std::os::unix::fs::OpenOptionsExt;
+  let path = root.join("exclusive");
+  let umask = rustix::process::umask(rustix::fs::Mode::empty());
+  rustix::process::umask(umask);
+  let started = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_secs();
+  let created = std::fs::OpenOptions::new()
+    .write(true)
+    .create_new(true)
+    .mode(0o755)
+    .open(&path)
+    .expect("an exclusive create");
+  drop(created);
+  // `Mode` and `st_mode` share the platform's mode width, so the comparison needs no conversion.
+  let expected = (rustix::fs::Mode::from_raw_mode(0o755) & !umask).as_raw_mode();
+  assert_eq!(
+    rustix::fs::stat(&path).unwrap().st_mode & 0o7777,
+    expected,
+    "the exclusive create's mode (less the umask)"
+  );
+  // The server kept the create's verifier in the times (RFC 8881 §18.16.3); the client then set the
+  // real ones, so the file's modification time is this create's, never the verifier's.
+  let modified = rustix::fs::stat(&path).unwrap().st_mtime;
+  assert!(
+    u64::try_from(modified).unwrap() >= started,
+    "the exclusive create's times are its own ({modified} before {started})"
+  );
+  std::fs::remove_file(&path).unwrap();
+}
+
+/// An `O_RDONLY|O_TRUNC` open by a caller whose class may read but not write is refused `EACCES` and
+/// truncates nothing (POSIX `open`; pjdfstest `open/07.t`), through the kernel client as real non-root
+/// processes: the owner of a file mode 0477 — whose truncate the server once let through, the kernel
+/// sending it as a SETATTR under the read-only open's state id (RFC 8881 §9.1.2: `NFS4ERR_OPENMODE`) —
+/// and a member of the file's group, mode 0747.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn truncating_open_needs_write_permission(root: &Path) {
+  use std::os::unix::fs::PermissionsExt;
+  use std::os::unix::process::CommandExt;
+  /// Format: the owner, a group member, and `EACCES` as the child's exit status.
+  const OWNER: u32 = 65534;
+  const MEMBER: u32 = 65533;
+  const EACCES: i32 = 13;
+  let path = root.join("guarded");
+  for (uid, mode) in [(OWNER, 0o477), (MEMBER, 0o747)] {
+    std::fs::write(&path, b"x").unwrap();
+    std::os::unix::fs::chown(&path, Some(OWNER), Some(OWNER)).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    // A child as `uid` opens the file O_RDONLY|O_TRUNC and exits with the errno (0 on success).
+    let status = Command::new("perl")
+      .args([
+        "-MFcntl",
+        "-e",
+        "sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)",
+      ])
+      .arg(&path)
+      .uid(uid)
+      .gid(OWNER)
+      .status()
+      .unwrap();
+    assert_eq!(
+      status.code(),
+      Some(EACCES),
+      "uid {uid}, mode {mode:o}: a truncating open without write permission is refused"
+    );
+    assert_eq!(
+      std::fs::metadata(&path).unwrap().len(),
+      1,
+      "uid {uid}, mode {mode:o}: nothing was truncated"
+    );
+    std::fs::remove_file(&path).unwrap();
+  }
+}
+
+/// `mkfifo` and a UNIX socket's `bind` create their names through the kernel client (NFSv4 CREATE of
+/// `NF4FIFO` and `NF4SOCK`, §4.6 A-26) and read back as those kinds; a block or character device is
+/// refused (A-26 keeps no device nodes) without creating a name.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn special_names(root: &Path) {
+  use std::os::unix::fs::FileTypeExt;
+  let fifo = root.join("fifo");
+  rustix::fs::mkfifoat(
+    rustix::fs::CWD,
+    &fifo,
+    rustix::fs::Mode::from_raw_mode(0o640),
+  )
+  .expect("mkfifo");
+  let metadata = std::fs::symlink_metadata(&fifo).unwrap();
+  assert!(metadata.file_type().is_fifo(), "a FIFO reads back as one");
+  assert_eq!(
+    std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777,
+    0o640,
+    "the FIFO's mode was set at creation"
+  );
+  std::fs::remove_file(&fifo).unwrap();
+
+  let socket_path = root.join("socket");
+  let listener = std::os::unix::net::UnixListener::bind(&socket_path).expect("bind");
+  assert!(
+    std::fs::symlink_metadata(&socket_path)
+      .unwrap()
+      .file_type()
+      .is_socket(),
+    "a socket name reads back as one"
+  );
+  drop(listener);
+  std::fs::remove_file(&socket_path).unwrap();
+
+  let device = root.join("device");
+  let refused = rustix::fs::mknodat(
+    rustix::fs::CWD,
+    &device,
+    rustix::fs::FileType::CharacterDevice,
+    rustix::fs::Mode::from_raw_mode(0o600),
+    rustix::fs::makedev(1, 3),
+  );
+  assert!(refused.is_err(), "a device node is refused (A-26)");
+  assert!(
+    std::fs::symlink_metadata(&device).is_err(),
+    "a refused device leaves no name"
+  );
+}
+
+/// `utimensat` with explicit times through the kernel client, including times past 2038 and 2106:
+/// the access and modification times set are the ones read back (the server advertises `time_access_set` and `time_modify_set`, without
+/// which the client drops the times, RFC 8881 §5.8.2.37 and §5.8.2.43).
+fn explicit_times(file: &Path) {
+  use std::os::unix::fs::MetadataExt;
+  let times = rustix::fs::Timestamps {
+    last_access: rustix::fs::Timespec {
+      tv_sec: 1_000_000_000,
+      tv_nsec: 123_000_000,
+    },
+    last_modification: rustix::fs::Timespec {
+      tv_sec: 1_100_000_000,
+      tv_nsec: 456_000_000,
+    },
+  };
+  rustix::fs::utimensat(rustix::fs::CWD, file, &times, rustix::fs::AtFlags::empty())
+    .expect("utimensat");
+  #[allow(clippy::disallowed_methods)] // the attribute read through the kernel mount under test
+  let metadata = std::fs::metadata(file).unwrap();
+  assert_eq!(
+    (metadata.atime(), metadata.atime_nsec()),
+    (1_000_000_000, 123_000_000),
+    "the access time set"
+  );
+  assert_eq!(
+    (metadata.mtime(), metadata.mtime_nsec()),
+    (1_100_000_000, 456_000_000),
+    "the modification time set"
+  );
+  // pjdfstest `utimensat/09.t`'s probe: 2^31 and 2^32 seconds, which NFSv4's 64-bit `nfstime4`
+  // carries (NFSv3's 32-bit `nfstime3` cannot).
+  let late = rustix::fs::Timestamps {
+    last_access: rustix::fs::Timespec {
+      tv_sec: 1 << 31,
+      tv_nsec: 0,
+    },
+    last_modification: rustix::fs::Timespec {
+      tv_sec: 1 << 32,
+      tv_nsec: 0,
+    },
+  };
+  rustix::fs::utimensat(rustix::fs::CWD, file, &late, rustix::fs::AtFlags::empty())
+    .expect("utimensat past 2038 and 2106");
+  let stat = rustix::fs::stat(file).unwrap();
+  assert_eq!(
+    (stat.st_atime, stat.st_mtime),
+    (1 << 31, 1 << 32),
+    "times past 2038 and 2106 read back"
+  );
+}
+
+/// `chown` of a file or a directory through the kernel client: the owner and group set are the ones
+/// read back, for ids with a
+/// passwd entry (root) and without, and the server never refuses an owner (a refused owner turns the
+/// client's numeric ids into names for the rest of the mount, RFC 8881 §5.9).
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn owners_change_as_numbers(file: &Path) {
+  use std::os::unix::fs::MetadataExt;
+  for (uid, gid) in [(65533, 65532), (0, 0), (65534, 65534), (123, 456)] {
+    std::os::unix::fs::chown(file, Some(uid), Some(gid))
+      .unwrap_or_else(|error| panic!("chown {uid}:{gid}: {error}"));
+    let metadata = std::fs::metadata(file).unwrap();
+    assert_eq!(
+      (metadata.uid(), metadata.gid()),
+      (uid, gid),
+      "chown {uid}:{gid}"
+    );
+  }
 }
 
 /// Two open file descriptions of one file are two lock-owners to the NFSv4 client, which sends a

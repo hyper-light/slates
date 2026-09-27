@@ -522,13 +522,14 @@ fn a_write_then_read_round_trips_over_the_export() {
   wargs.u32(count); // count (advisory; the data length is authoritative)
   wargs.u32(2); // stable = FILE_SYNC (advisory)
   wargs.opaque(payload);
+  let before = getattr_of(&mut export, &file_fh);
   let wreply = export
     .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
     .unwrap();
   let mut wr = XdrReader::new(&wreply);
   assert_eq!(wr.u32().unwrap(), Nfsstat3::Ok.wire(), "WRITE succeeded");
-  // wcc_data: pre_op_attr absent, then post_op_attr present with the new size.
-  assert!(!wr.bool().unwrap(), "no pre-op attributes");
+  // wcc_data: the file before the write, then after it with the new size.
+  assert_pre_op_is(&mut wr, &before, "WRITE");
   let post = PostOpAttr::decode(&mut wr).unwrap().0.expect("post attrs");
   assert_eq!(
     post.size,
@@ -598,12 +599,13 @@ fn a_commit_over_the_export_reports_the_write_stable() {
   wargs.u32(u32::try_from(payload.len()).unwrap()); // count
   wargs.u32(2); // stable = FILE_SYNC
   wargs.opaque(payload);
+  let before = getattr_of(&mut export, &file_fh);
   let wreply = export
     .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
     .unwrap();
   let mut wr = XdrReader::new(&wreply);
   assert_eq!(wr.u32().unwrap(), Nfsstat3::Ok.wire(), "WRITE succeeded");
-  assert!(!wr.bool().unwrap()); // wcc: no pre-op attributes
+  assert_pre_op_is(&mut wr, &before, "WRITE");
   PostOpAttr::decode(&mut wr).unwrap(); // post-op attributes
   wr.u32().unwrap(); // count
   wr.u32().unwrap(); // committed stability
@@ -661,7 +663,11 @@ fn a_commit_of_the_host_root_is_a_no_op() {
   cargs.u64(0); // offset
   cargs.u32(0); // count
   let creply = multi
-    .serve_procedure(NFSPROC3_COMMIT, &mut XdrReader::new(cargs.as_slice()))
+    .serve_procedure(
+      slates_bridge_nfs::procedures::Dialect::LOOPBACK_NFS3,
+      NFSPROC3_COMMIT,
+      &mut XdrReader::new(cargs.as_slice()),
+    )
     .expect("COMMIT of the root is answered");
   let mut cr = XdrReader::new(&creply);
   assert_eq!(
@@ -768,12 +774,13 @@ fn a_remove_over_the_export_unlinks_the_name() {
   let mut args = XdrWriter::new();
   root_fh.encode(&mut args);
   args.opaque("doomed".as_bytes());
+  let before = getattr_of(&mut export, &root_fh);
   let reply = export
     .serve_nfs(NFSPROC3_REMOVE, &mut XdrReader::new(args.as_slice()))
     .unwrap();
   let mut rr = XdrReader::new(&reply);
   assert_eq!(rr.u32().unwrap(), Nfsstat3::Ok.wire(), "REMOVE succeeded");
-  assert!(!rr.bool().unwrap(), "wcc: no pre-op attributes");
+  assert_pre_op_is(&mut rr, &before, "REMOVE");
   PostOpAttr::decode(&mut rr)
     .unwrap()
     .0
@@ -1003,12 +1010,13 @@ fn a_setattr_over_the_export_chmods() {
   args.u32(0); // atime DONT_CHANGE
   args.u32(0); // mtime DONT_CHANGE
   args.bool(false); // guard unset
+  let before = getattr_of(&mut export, &file_fh);
   let reply = export
     .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
     .unwrap();
   let mut r = XdrReader::new(&reply);
   assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "SETATTR succeeded");
-  assert!(!r.bool().unwrap(), "wcc: no pre-op attributes");
+  assert_pre_op_is(&mut r, &before, "SETATTR");
   let post = PostOpAttr::decode(&mut r).unwrap().0.expect("post attrs");
   assert_eq!(post.mode, 0o600, "the wcc reports the new mode");
 
@@ -1066,12 +1074,13 @@ fn a_setattr_sets_client_and_server_times() {
   args.u32(456); // atime nseconds
   args.u32(1); // mtime SET_TO_SERVER_TIME
   args.bool(false); // guard
+  let before = getattr_of(&mut export, &file_fh);
   let reply = export
     .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
     .unwrap();
   let mut r = XdrReader::new(&reply);
   assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire(), "SETATTR succeeded");
-  assert!(!r.bool().unwrap());
+  assert_pre_op_is(&mut r, &before, "SETATTR");
   let post = PostOpAttr::decode(&mut r).unwrap().0.expect("post attrs");
   assert_eq!(post.atime.seconds, 123, "atime is the client's value");
   assert_eq!(post.atime.nseconds, 456);
@@ -1511,11 +1520,11 @@ fn a_link_over_the_export_makes_a_second_name() {
     file_attr.nlink, 2,
     "the link count is two after a hard link"
   );
-  // linkdir_wcc: no pre-op attributes, then the directory's post-op attributes — which must be the
+  // linkdir_wcc: the directory before the link, then its post-op attributes — which must be the
   // directory *after* the link (its new ctime and mtime), because the client caches them in place of
   // a GETATTR; a stale set here keeps `stat .` behind for a whole attribute-cache period (found by
   // pjdfstest `link/00.t` through a live mount, 2026-09-15).
-  assert!(!r.bool().unwrap(), "no pre-op attributes");
+  assert_pre_op_is(&mut r, &dir_before, "LINK");
   let dir_post = PostOpAttr::decode(&mut r)
     .unwrap()
     .0
@@ -2277,6 +2286,23 @@ fn wait_until_the_clock_passes(stamp: slates_bridge_nfs::nfs::Nfstime3) {
 }
 
 /// GETATTR of a handle, decoded.
+/// Reads a `pre_op_attr` and asserts it is present and is `before` — the object's attributes as a
+/// GETATTR read them immediately before the call (RFC 1813 §2.6; A-38).
+fn assert_pre_op_is(reader: &mut XdrReader<'_>, before: &Fattr3, what: &str) {
+  assert!(
+    reader.bool().unwrap(),
+    "{what}: the pre-op attributes are present"
+  );
+  let size = reader.u64().unwrap();
+  let mtime = slates_bridge_nfs::nfs::Nfstime3::decode(reader).unwrap();
+  let ctime = slates_bridge_nfs::nfs::Nfstime3::decode(reader).unwrap();
+  assert_eq!(
+    (size, mtime, ctime),
+    (before.size, before.mtime, before.ctime),
+    "{what}: the pre-op attributes are the object's before the call"
+  );
+}
+
 fn getattr_of(export: &mut Export<'_>, fh: &Nfsfh3) -> Fattr3 {
   let mut args = XdrWriter::new();
   fh.encode(&mut args);
@@ -2808,5 +2834,81 @@ fn rename_checks_both_directories_and_the_sticky_source() {
     rename_status(&mut owner, &b, "g", &c, "h"),
     Nfsstat3::Acces.wire(),
     "no write permission on the destination directory"
+  );
+}
+
+/// An EXCLUSIVE CREATE of `name` at the root with `verifier`: the status and, on success, the handle.
+fn exclusive_create(
+  export: &mut Export<'_>,
+  root_fh: &Nfsfh3,
+  name: &str,
+  verifier: [u8; 8],
+) -> (u32, Option<Nfsfh3>) {
+  /// Format: `createmode3` EXCLUSIVE.
+  const EXCLUSIVE: u32 = 2;
+  let mut args = XdrWriter::new();
+  root_fh.encode(&mut args);
+  args.opaque(name.as_bytes());
+  args.u32(EXCLUSIVE);
+  args.fixed(&verifier);
+  let reply = export
+    .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  let mut r = XdrReader::new(&reply);
+  let status = r.u32().unwrap();
+  if status != Nfsstat3::Ok.wire() {
+    return (status, None);
+  }
+  assert!(r.bool().unwrap(), "a handle follows");
+  (status, Some(Nfsfh3::decode(&mut r).unwrap()))
+}
+
+/// RFC 1813 §3.3.8 (A-38): an EXCLUSIVE create keeps its verifier in the new file's times, so a retry
+/// of the same create finds its own file and succeeds with the same handle — however late, since the
+/// times are in the volume and its recovery image — while another verifier's create of the name is
+/// `NFS3ERR_EXIST`.
+#[test]
+fn an_exclusive_create_keeps_its_verifier_and_a_retry_finds_its_own_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = match export.mnt("/") {
+    MountReply::Ok { handle, .. } => handle,
+    MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+  };
+  let verifier = [0x12, 0x34, 0x56, 0x78, 0x0a, 0xbc, 0xde, 0xf0];
+  let (status, first) = exclusive_create(&mut export, &root_fh, "exclusive", verifier);
+  assert_eq!(status, Nfsstat3::Ok.wire(), "the exclusive create");
+  let first = first.unwrap();
+  let attrs = getattr_of(&mut export, &first);
+  assert_eq!(
+    (attrs.mtime.seconds, attrs.atime.seconds),
+    (0x1234_5678, 0x0abc_def0),
+    "the verifier is kept in the modification and access times"
+  );
+
+  let (status, again) = exclusive_create(&mut export, &root_fh, "exclusive", verifier);
+  assert_eq!(
+    status,
+    Nfsstat3::Ok.wire(),
+    "a retry of the same create succeeds"
+  );
+  assert_eq!(again.unwrap(), first, "on the file it made");
+
+  let (status, _) = exclusive_create(&mut export, &root_fh, "exclusive", [9; 8]);
+  assert_eq!(
+    status,
+    Nfsstat3::Exist.wire(),
+    "another verifier's create of the name"
   );
 }

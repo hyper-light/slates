@@ -24,12 +24,12 @@ use super::types::{
 };
 use super::v3call::{self, Sattr3};
 use super::{MINOR_HIGHEST, MINOR_LOWEST};
-use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime3};
+use crate::nfs::{Fattr3, Ftype3, Nfsfh3, Nfsstat3, Nfstime4, Specdata3, Wcc};
 use crate::procedures::{
   NFSPROC3_ACCESS, NFSPROC3_COMMIT, NFSPROC3_CREATE, NFSPROC3_FSSTAT, NFSPROC3_GETATTR,
-  NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_PATHCONF, NFSPROC3_READDIRPLUS,
-  NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR, NFSPROC3_SETATTR,
-  NFSPROC3_SYMLINK, extension,
+  NFSPROC3_LINK, NFSPROC3_LOOKUP, NFSPROC3_MKDIR, NFSPROC3_MKNOD, NFSPROC3_PATHCONF,
+  NFSPROC3_READDIRPLUS, NFSPROC3_READLINK, NFSPROC3_REMOVE, NFSPROC3_RENAME, NFSPROC3_RMDIR,
+  NFSPROC3_SETATTR, NFSPROC3_SYMLINK, extension,
 };
 use crate::xdr::{XdrReader, XdrWriter};
 
@@ -126,6 +126,8 @@ pub mod op {
   pub const VERIFY: u32 = 37;
   /// Format: `OP_WRITE`.
   pub const WRITE: u32 = 38;
+  /// Format: `OP_BACKCHANNEL_CTL`.
+  pub const BACKCHANNEL_CTL: u32 = 40;
   /// Format: `OP_BIND_CONN_TO_SESSION`.
   pub const BIND_CONN_TO_SESSION: u32 = 41;
   /// Format: `OP_EXCHANGE_ID`.
@@ -140,6 +142,8 @@ pub mod op {
   pub const SECINFO_NO_NAME: u32 = 52;
   /// Format: `OP_SEQUENCE`.
   pub const SEQUENCE: u32 = 53;
+  /// Format: `OP_SET_SSV`.
+  pub const SET_SSV: u32 = 54;
   /// Format: `OP_TEST_STATEID`.
   pub const TEST_STATEID: u32 = 55;
   /// Format: `OP_DESTROY_CLIENTID`.
@@ -198,13 +202,6 @@ mod claim {
   /// Format: `CLAIM_FH`: open the current file handle itself (NFSv4.1).
   pub(super) const FH: u32 = 4;
 }
-/// Format: `createtype4` values the CREATE operation accepts (`nfs_ftype4`).
-mod ftype4 {
-  /// Format: `NF4LNK`.
-  pub(super) const LNK: u32 = 5;
-  /// Format: `NF4DIR`.
-  pub(super) const DIR: u32 = 2;
-}
 /// Format: `channel_dir_from_server4` `CDFS4_FORE`: a bound connection carries the fore channel only.
 const CDFS4_FORE: u32 = 1;
 /// Format: the READDIR cookies 0, 1 and 2 are reserved (RFC 8881 §18.23.3), so a v3 cookie is shifted
@@ -215,21 +212,6 @@ const COOKIE_SHIFT: u64 = 2;
 const ENTRY_FIXED: u32 = 4 + 8 + 4 + 4 + 4;
 /// Format: `settime4` `SET_TO_CLIENT_TIME4`.
 const SET_TO_CLIENT_TIME4: u32 = 1;
-/// Format: the attribute numbers SETATTR accepts: size, mode, owner, group and the two settable times.
-mod settable {
-  /// Format: `FATTR4_SIZE`.
-  pub(super) const SIZE: u32 = 4;
-  /// Format: `FATTR4_MODE`.
-  pub(super) const MODE: u32 = 33;
-  /// Format: `FATTR4_OWNER`.
-  pub(super) const OWNER: u32 = 36;
-  /// Format: `FATTR4_OWNER_GROUP`.
-  pub(super) const OWNER_GROUP: u32 = 37;
-  /// Format: `FATTR4_TIME_ACCESS_SET`.
-  pub(super) const TIME_ACCESS_SET: u32 = 48;
-  /// Format: `FATTR4_TIME_MODIFY_SET`.
-  pub(super) const TIME_MODIFY_SET: u32 = 54;
-}
 
 /// Format: the bytes one compound's frame and operations may add to a READ or WRITE of the transfer
 /// ceiling: the tag, the minor version and count, and a handful of operations each carrying at most a
@@ -320,6 +302,8 @@ impl Server {
 
 /// A compound's running state: the file handles and the client it runs for.
 pub(super) struct Frame {
+  /// The compound's minor version.
+  pub(super) minor: u32,
   pub(super) current: Option<Nfsfh3>,
   pub(super) saved: Option<Nfsfh3>,
   pub(super) clientid: Option<u64>,
@@ -354,6 +338,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
     return reply(Nfsstat4::TooManyOps, &tag, 0, &[]);
   }
   let mut frame = Frame {
+    minor,
     current: None,
     saved: None,
     clientid: None,
@@ -588,7 +573,8 @@ fn create_session<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Ou
   let fore = ChannelAttrs::decode(reader).map_err(bad)?;
   let back = ChannelAttrs::decode(reader).map_err(bad)?;
   let _cb_program = reader.u32().map_err(bad)?;
-  skip_callback_sec(reader)?;
+  // No callbacks are made, so an RPCSEC_GSS callback handle is kept for none.
+  read_callback_sec(reader)?;
   let args = CreateSession {
     clientid,
     sequence,
@@ -606,9 +592,9 @@ fn create_session<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Ou
   Ok(body.into_bytes())
 }
 
-/// Reads past a `callback_sec_parms4<>` (the flavors this server would call back with; it makes no
-/// callbacks yet).
-fn skip_callback_sec(reader: &mut XdrReader<'_>) -> Result<(), Nfsstat4> {
+/// Reads a `callback_sec_parms4<>` (the flavors this server would call back with; it makes no
+/// callbacks yet): whether any entry names an RPCSEC_GSS handle.
+fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<bool, Nfsstat4> {
   /// Format: the most callback flavors read (a client offers one or two).
   const MAX_FLAVORS: u32 = 8;
   /// Format: `AUTH_NONE`, `AUTH_SYS` and `RPCSEC_GSS` flavor numbers.
@@ -621,6 +607,7 @@ fn skip_callback_sec(reader: &mut XdrReader<'_>) -> Result<(), Nfsstat4> {
   if count > MAX_FLAVORS {
     return Err(Nfsstat4::Badxdr);
   }
+  let mut names_gss = false;
   for _ in 0..count {
     match reader.u32().map_err(bad)? {
       AUTH_NONE => {}
@@ -638,6 +625,7 @@ fn skip_callback_sec(reader: &mut XdrReader<'_>) -> Result<(), Nfsstat4> {
         }
       }
       RPCSEC_GSS => {
+        names_gss = true;
         reader.u32().map_err(bad)?; // service
         reader.opaque(OPAQUE_LIMIT).map_err(bad)?; // handle from server
         reader.opaque(OPAQUE_LIMIT).map_err(bad)?; // handle from client
@@ -645,7 +633,7 @@ fn skip_callback_sec(reader: &mut XdrReader<'_>) -> Result<(), Nfsstat4> {
       _ => return Err(Nfsstat4::Badxdr),
     }
   }
-  Ok(())
+  Ok(names_gss)
 }
 
 /// `BIND_CONN_TO_SESSION` (§18.34): the connection carries the session's fore channel.
@@ -750,7 +738,7 @@ async fn operation<B: Backend>(
     op::LOOKUP => lookup_operation(backend, reader, frame).await,
     op::LOOKUPP => {
       let dir = current(frame)?.clone();
-      frame.current = Some(lookup(backend, &dir, "..").await?.0);
+      frame.current = Some(lookup(backend, &dir, "..").await?.fh);
       Ok(Vec::new())
     }
     _ => object_operation(backend, opnum, reader, frame).await,
@@ -758,7 +746,9 @@ async fn operation<B: Backend>(
 }
 
 /// LOOKUP. At the pseudo root, `<name>@<attachment>.<token>` presents a mount capability, as an NFSv3
-/// MNT path does (§4.13; AUD-01): the root is re-scoped to it and the bare name looked up.
+/// MNT path does (§4.13; AUD-01): the root is re-scoped to it and the bare name looked up. A bare
+/// `@<attachment>.<token>` enters the root scoped to the capability, as NFSv3's `/@<capability>` does,
+/// so a scoped browse lists what the capability authorizes.
 async fn lookup_operation<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
@@ -770,11 +760,15 @@ async fn lookup_operation<B: Backend>(
     Some((bare, capability)) if crate::multi::is_root_handle(&dir) => {
       let capability = crate::multi::parse_capability(capability).ok_or(Nfsstat4::Noent)?;
       dir = crate::multi::root_handle_with(capability);
+      if bare.is_empty() {
+        frame.current = Some(dir);
+        return Ok(Vec::new());
+      }
       bare.to_owned()
     }
     _ => name,
   };
-  frame.current = Some(lookup(backend, &dir, &name).await?.0);
+  frame.current = Some(lookup(backend, &dir, &name).await?.fh);
   Ok(Vec::new())
 }
 
@@ -789,15 +783,30 @@ async fn object_operation<B: Backend>(
     op::GETATTR => {
       let requested = Bitmap::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
       let fh = current(frame)?.clone();
-      getattr(backend, &fh, &requested).await
+      getattr(backend, &fh, (&requested, frame.minor)).await
     }
     op::ACCESS => access(backend, reader, frame).await,
-    op::SECINFO_NO_NAME => secinfo_no_name(reader, frame),
     op::READLINK => readlink(backend, frame).await,
     op::READ => read(backend, reader, frame).await,
     op::WRITE => write(backend, reader, frame).await,
     op::COMMIT => commit(backend, reader, frame).await,
     op::READDIR => readdir(backend, reader, frame).await,
+    _ => query_operation(backend, opnum, reader, frame).await,
+  }
+}
+
+/// The operations that ask about the current object without changing it: its security flavors and a
+/// comparison of its attributes.
+async fn query_operation<B: Backend>(
+  backend: &mut B,
+  opnum: u32,
+  reader: &mut XdrReader<'_>,
+  frame: &mut Frame,
+) -> Outcome {
+  match opnum {
+    op::SECINFO_NO_NAME => secinfo_no_name(reader, frame),
+    op::SECINFO => secinfo(backend, reader, frame).await,
+    op::VERIFY | op::NVERIFY => verify(backend, opnum, reader, frame).await,
     _ => namespace_operation(backend, opnum, reader, frame).await,
   }
 }
@@ -829,6 +838,80 @@ fn secinfo_no_name(reader: &mut XdrReader<'_>, frame: &mut Frame) -> Outcome {
   body.u32(1);
   body.u32(AUTH_SYS);
   Ok(body.into_bytes())
+}
+
+/// `SECINFO` (§18.29): the flavors that protect `name` in the current directory, which the name must
+/// exist in and the caller must be able to look it up in (the same LOOKUP, so its refusal is the
+/// same); on success the current file handle is consumed (§2.6.3.1.1.8).
+async fn secinfo<B: Backend>(
+  backend: &mut B,
+  reader: &mut XdrReader<'_>,
+  frame: &mut Frame,
+) -> Outcome {
+  let name = component(reader)?;
+  let dir = current(frame)?.clone();
+  lookup(backend, &dir, &name).await?;
+  frame.current = None;
+  let mut body = XdrWriter::new();
+  body.u32(1);
+  body.u32(AUTH_SYS);
+  Ok(body.into_bytes())
+}
+
+/// `VERIFY` (§18.31) and `NVERIFY` (§18.15): whether the attributes the client names equal the current
+/// object's. The server encodes its own values for the same bitmap and compares the encodings, as the
+/// attribute list is defined by them: VERIFY answers `NFS4ERR_NOT_SAME` on a difference, NVERIFY
+/// `NFS4ERR_SAME` on none. A write-only attribute or `rdattr_error` is `NFS4ERR_INVAL`, one the server
+/// does not support `NFS4ERR_ATTRNOTSUPP`.
+async fn verify<B: Backend>(
+  backend: &mut B,
+  opnum: u32,
+  reader: &mut XdrReader<'_>,
+  frame: &Frame,
+) -> Outcome {
+  let bad = |_| Nfsstat4::Badxdr;
+  let requested = Bitmap::decode(reader).map_err(bad)?;
+  // The list is borrowed from the received request, so the bytes that remain bound it.
+  let remaining = reader.rest().len();
+  let theirs = reader.opaque(remaining).map_err(bad)?;
+  attr::check_readable(&requested)?;
+  if requested.has(attr::number::RDATTR_ERROR) {
+    return Err(Nfsstat4::Inval);
+  }
+  if requested.intersect(&attr::supported(frame.minor)) != requested {
+    return Err(Nfsstat4::Attrnotsupp);
+  }
+  let fh = current(frame)?.clone();
+  let ours = getattr(backend, &fh, (&requested, frame.minor)).await?;
+  let mut ours = XdrReader::new(&ours);
+  Bitmap::decode(&mut ours).map_err(|_| Nfsstat4::Serverfault)?;
+  let encoded = ours.rest().len();
+  let same = ours.opaque(encoded).map_err(|_| Nfsstat4::Serverfault)? == theirs;
+  match (opnum == op::VERIFY, same) {
+    (true, true) | (false, false) => Ok(Vec::new()),
+    (true, false) => Err(Nfsstat4::NotSame),
+    (false, true) => Err(Nfsstat4::Same),
+  }
+}
+
+/// `BACKCHANNEL_CTL` (§18.33): the backchannel's program and security. This server makes no callbacks,
+/// so it holds no RPCSEC_GSS handle for one to name (`NFS4ERR_NOENT`); an `AUTH_NONE` or `AUTH_SYS`
+/// setting is accepted.
+fn backchannel_ctl(reader: &mut XdrReader<'_>) -> Outcome {
+  let _cb_program = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
+  if read_callback_sec(reader)? {
+    return Err(Nfsstat4::Noent);
+  }
+  Ok(Vec::new())
+}
+
+/// `SET_SSV` (§18.47): refused `NFS4ERR_INVAL`, as it must be for a client that did not choose SP4_SSV
+/// state protection — which no client of this server can (EXCHANGE_ID establishes SP4_NONE only).
+fn set_ssv(reader: &mut XdrReader<'_>) -> Outcome {
+  let bad = |_| Nfsstat4::Badxdr;
+  reader.opaque(OPAQUE_LIMIT).map_err(bad)?; // ssa_ssv
+  reader.opaque(OPAQUE_LIMIT).map_err(bad)?; // ssa_digest
+  Err(Nfsstat4::Inval)
 }
 
 /// READLINK.
@@ -913,6 +996,8 @@ fn state_operation(
         .reclaim_complete(clientid)
         .map(|()| Vec::new())
     }
+    op::BACKCHANNEL_CTL => backchannel_ctl(reader),
+    op::SET_SSV => set_ssv(reader),
     op::ILLEGAL => Err(Nfsstat4::OpIllegal),
     _ if is_operation(opnum) => Err(Nfsstat4::Notsupp),
     _ => Err(Nfsstat4::OpIllegal),
@@ -945,20 +1030,25 @@ async fn state_call<B: Backend>(
   }
 }
 
-/// Whether `stateid` may serve I/O on `fh` for the compound's client: a special state id needs no
-/// owner; any other is checked at the file's owner (§4.6 A-36).
+/// Whether `stateid` may serve I/O of kind `want` (`procedures::io_want`) on `fh` for the compound's
+/// client, checked at the file's owner (§4.6 A-36; RFC 8881 §9.1.2): the access mode of an open, and
+/// every other open's share deny for a special state id, which holds none of its own.
 pub(super) async fn check_state<B: Backend>(
   backend: &mut B,
   fh: &Nfsfh3,
   clientid: Option<u64>,
   stateid: &Stateid,
+  want: u32,
 ) -> Result<(), Nfsstat4> {
-  if stateid.is_special() {
-    return Ok(());
-  }
-  let clientid = clientid.ok_or(Nfsstat4::OpNotInSession)?;
+  // A special state id names no client's state, so no session client is needed to check it.
+  let clientid = match clientid {
+    Some(clientid) => clientid,
+    None if stateid.is_special() => 0,
+    None => return Err(Nfsstat4::OpNotInSession),
+  };
   let mut extra = XdrWriter::new();
   stateid.encode(&mut extra);
+  extra.u32(want);
   state_call(
     backend,
     extension::STATE_CHECK,
@@ -973,7 +1063,7 @@ pub(super) async fn check_state<B: Backend>(
 
 /// A state-carrying I/O at the file's owner (§4.6 A-36): the NFSv3 procedure's arguments with the
 /// client id and state id after them; the NFSv3 result, or the state refusal.
-async fn state_io<B: Backend>(
+pub(super) async fn state_io<B: Backend>(
   backend: &mut B,
   procedure: u32,
   mut v3_args: Vec<u8>,
@@ -1248,7 +1338,7 @@ async fn lookup<B: Backend>(
   backend: &mut B,
   dir: &Nfsfh3,
   name: &str,
-) -> Result<(Nfsfh3, Option<Fattr3>), Nfsstat4> {
+) -> Result<v3call::Looked, Nfsstat4> {
   let result = backend
     .call_v3(NFSPROC3_LOOKUP, v3call::dir_name(dir, name))
     .await;
@@ -1268,14 +1358,12 @@ pub(super) async fn attrs_of<B: Backend>(backend: &mut B, fh: &Nfsfh3) -> Result
 async fn figures<B: Backend>(
   backend: &mut B,
   fh: &Nfsfh3,
-  attrs: &Fattr3,
   requested: &Bitmap,
 ) -> Result<FsFigures, Nfsstat4> {
   /// Format: nanoseconds per second.
   const NS_PER_SECOND: u64 = 1_000_000_000;
   let limits = backend.with_v4(|server| server.limits)?;
   let mut figures = FsFigures {
-    fsid: (attrs.fsid, 0),
     lease_seconds: u32::try_from(limits.lease_ns / NS_PER_SECOND).unwrap_or(u32::MAX),
     max_file_size: u64::MAX,
     max_link: u32::MAX,
@@ -1311,11 +1399,15 @@ async fn figures<B: Backend>(
 }
 
 /// `GETATTR` (§18.7).
-async fn getattr<B: Backend>(backend: &mut B, fh: &Nfsfh3, requested: &Bitmap) -> Outcome {
+async fn getattr<B: Backend>(
+  backend: &mut B,
+  fh: &Nfsfh3,
+  (requested, minor): (&Bitmap, u32),
+) -> Outcome {
   let attrs = attrs_of(backend, fh).await?;
-  let figures = figures(backend, fh, &attrs, requested).await?;
+  let figures = figures(backend, fh, requested).await?;
   let mut body = XdrWriter::new();
-  attr::encode(requested, &attrs, fh, &figures, &mut body);
+  attr::encode((requested, minor), &attrs, fh, &figures, &mut body)?;
   Ok(body.into_bytes())
 }
 
@@ -1393,6 +1485,7 @@ async fn readdir<B: Backend>(
   let dircount = reader.u32().map_err(bad)?;
   let maxcount = reader.u32().map_err(bad)?;
   let requested = Bitmap::decode(reader).map_err(bad)?;
+  attr::check_readable(&requested)?;
   if cookie == 1 || cookie == 2 {
     return Err(Nfsstat4::BadCookie);
   }
@@ -1406,8 +1499,9 @@ async fn readdir<B: Backend>(
     .await;
   let max_entries = usize::try_from(maxcount / ENTRY_FIXED).unwrap_or(0).max(1);
   let listing = v3(v3call::readdirplus(&result, max_entries.saturating_mul(2)))?;
-  let dir_attrs = attrs_of(backend, &dir).await?;
-  let figures = figures(backend, &dir, &dir_attrs, &requested).await?;
+  // The filesystem-wide figures, once per filesystem the entries are on: a volume root listed in the
+  // pseudo-root is on its own volume, not the root's.
+  let mut figures_by_fsid: Vec<(u64, FsFigures)> = Vec::new();
   let mut entries = XdrWriter::new();
   let mut returned = 0usize;
   let mut all = true;
@@ -1416,14 +1510,20 @@ async fn readdir<B: Backend>(
     if entry.name == "." || entry.name == ".." {
       continue;
     }
-    let (Some(attrs), Some(fh)) = (&entry.attrs, &entry.fh) else {
-      continue;
+    let (attrs, fh) = entry_object(backend, &dir, entry).await?;
+    let figures = match figures_by_fsid.iter().find(|(fsid, _)| *fsid == attrs.fsid) {
+      Some((_, figures)) => *figures,
+      None => {
+        let figures = figures(backend, &fh, &requested).await?;
+        figures_by_fsid.push((attrs.fsid, figures));
+        figures
+      }
     };
     let mut one = XdrWriter::new();
     one.bool(true);
     one.u64(entry.cookie.saturating_add(COOKIE_SHIFT));
     one.opaque(entry.name.as_bytes());
-    attr::encode(&requested, attrs, fh, &figures, &mut one);
+    attr::encode((&requested, frame.minor), &attrs, &fh, &figures, &mut one)?;
     if entries.len() + one.len() + 2 * size_of::<u32>() + VERIFIER_SIZE > budget {
       all = false;
       break;
@@ -1440,6 +1540,25 @@ async fn readdir<B: Backend>(
   body.bool(false); // no more entries in this reply
   body.bool(listing.eof && all);
   Ok(body.into_bytes())
+}
+
+/// A listed entry's attributes and handle: as the listing carried them, or — for an entry it carried
+/// without (the pseudo-root lists a volume on another shard by name only) — from a LOOKUP of the name,
+/// which routes to the volume's owner as any call does. An entry is never dropped from a listing.
+async fn entry_object<B: Backend>(
+  backend: &mut B,
+  dir: &Nfsfh3,
+  entry: &v3call::Entry,
+) -> Result<(Fattr3, Nfsfh3), Nfsstat4> {
+  if let (Some(attrs), Some(fh)) = (&entry.attrs, &entry.fh) {
+    return Ok((*attrs, fh.clone()));
+  }
+  let looked = lookup(backend, dir, &entry.name).await?;
+  let attrs = match looked.attrs {
+    Some(attrs) => attrs,
+    None => attrs_of(backend, &looked.fh).await?,
+  };
+  Ok((attrs, looked.fh))
 }
 
 /// `OPEN` (§18.16): a name in the current directory (`CLAIM_NULL`), created if asked, or the current
@@ -1478,7 +1597,9 @@ async fn open<B: Backend>(
       check_open_access(backend, &dir, access).await?;
       Opened {
         fh: dir,
-        set: Sattr3::default(),
+        attrset: Bitmap::default(),
+        // No directory is named: the change info says nothing.
+        dir: Wcc::default(),
       }
     }
     _ => return Err(Nfsstat4::Notsupp),
@@ -1501,9 +1622,9 @@ async fn open<B: Backend>(
   let stateid = stateid_of(&mut XdrReader::new(&recorded))?;
   let mut body = XdrWriter::new();
   stateid.encode(&mut body);
-  body.fixed(&change_info());
+  body.fixed(&change_info(&opened.dir));
   body.u32(OPEN4_RESULT_LOCKTYPE_POSIX);
-  set_bits(&opened.set).encode(&mut body);
+  opened.attrset.encode(&mut body);
   body.u32(OPEN_DELEGATE_NONE);
   frame.current = Some(opened.fh);
   Ok(body.into_bytes())
@@ -1518,68 +1639,164 @@ mod access3 {
   pub(super) const MODIFY: u32 = 0x4;
 }
 
-/// What `OPEN` opened: the file, and the attributes the open itself set (its `attrset`).
+/// What `OPEN` opened: the file, the attributes the open itself set (its `attrset`), and its
+/// directory's `wcc_data` for the reply's `change_info4`.
 struct Opened {
   fh: Nfsfh3,
-  set: Sattr3,
+  attrset: Bitmap,
+  dir: Wcc,
 }
 
 /// Opens `name` in `dir`. A create that makes the file sets its attributes and needs no permission on
 /// the new file (POSIX: `open(O_CREAT|O_WRONLY)` of mode 0444 succeeds). An `UNCHECKED` create of a name
 /// that exists opens it, applying only the size (the truncate `O_TRUNC` asks for) after checking the
-/// access asked; a guarded or exclusive create of a name that exists is `NFS4ERR_EXIST`.
+/// access asked — also when another client creates the name between this open's LOOKUP and its create.
+/// A guarded create of a name that exists is `NFS4ERR_EXIST`. An exclusive create is decided by the v3
+/// layer in one call: its own earlier create (the verifier's times) opens, any other name is
+/// `NFS4ERR_EXIST`.
 async fn open_by_name<B: Backend>(
   backend: &mut B,
   dir: &Nfsfh3,
   name: &str,
-  create: Option<(u32, Sattr3)>,
+  create: Option<OpenCreate>,
   access: u32,
 ) -> Result<Opened, Nfsstat4> {
-  let existing = match lookup(backend, dir, name).await {
-    Ok((fh, _)) => Some(fh),
-    Err(Nfsstat4::Noent) if create.is_some() => None,
-    Err(status) => return Err(status),
+  let attrs = match create {
+    Some(OpenCreate::Exclusive { verifier, attrs }) => {
+      return exclusive_open(backend, dir, name, verifier, attrs).await;
+    }
+    Some(OpenCreate::Unchecked(attrs) | OpenCreate::Guarded(attrs)) => Some(attrs),
+    None => None,
   };
-  let (fh, set) = match (existing, create) {
-    (Some(_), Some((mode, _))) if mode == v3call::createmode::GUARDED => {
-      return Err(Nfsstat4::Exist);
+  let guarded = matches!(create, Some(OpenCreate::Guarded(_)));
+  match (lookup(backend, dir, name).await, attrs) {
+    (Ok(_), Some(_)) if guarded => Err(Nfsstat4::Exist),
+    (Ok(looked), attrs) => open_existing(backend, looked, access, attrs).await,
+    (Err(Nfsstat4::Noent), Some(attrs)) => {
+      create_or_open(backend, (dir, name), attrs, access, guarded).await
     }
-    (Some(fh), create) => {
-      check_open_kind(backend, &fh).await?;
-      check_open_access(backend, &fh, access).await?;
-      let truncate = Sattr3 {
-        size: create.and_then(|(_, attrs)| attrs.size),
-        ..Sattr3::default()
-      };
-      if truncate.size.is_some() {
-        let result = backend
-          .call_v3(NFSPROC3_SETATTR, v3call::setattr_args(&fh, &truncate))
-          .await;
-        let status = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
-        if status != Nfsstat3::Ok {
-          return Err(Nfsstat4::of_v3(status));
-        }
-      }
-      (fh, truncate)
+    (Err(status), _) => Err(status),
+  }
+}
+
+/// Creates `name` in `dir`, guarded; for an unchecked open, a name another client created since this
+/// open's LOOKUP is opened instead, as UNCHECKED4 requires (RFC 8881 §18.16.3), once — the name exists
+/// on that second look, or its LOOKUP's refusal is the answer.
+async fn create_or_open<B: Backend>(
+  backend: &mut B,
+  (dir, name): (&Nfsfh3, &str),
+  attrs: Sattr3,
+  access: u32,
+  guarded: bool,
+) -> Result<Opened, Nfsstat4> {
+  match create_new(backend, dir, name, attrs).await {
+    Err(Nfsstat4::Exist) if !guarded => {
+      let looked = lookup(backend, dir, name).await?;
+      open_existing(backend, looked, access, Some(attrs)).await
     }
-    (None, Some((_, attrs))) => {
-      // A guarded create: a racing creator of the same name makes this `NFS4ERR_EXIST`, which an
-      // unchecked open reports as it would any other failure of its single attempt.
-      let result = backend
-        .call_v3(
-          NFSPROC3_CREATE,
-          v3call::create_args(dir, name, v3call::createmode::GUARDED, &attrs),
-        )
-        .await;
-      let fh = match v3(v3call::created(&result))? {
-        (Some(fh), _) => fh,
-        (None, _) => lookup(backend, dir, name).await?.0,
-      };
-      (fh, attrs)
-    }
-    (None, None) => return Err(Nfsstat4::Noent),
+    made => made,
+  }
+}
+
+/// Opens an existing file: its kind and the caller's access checked, then the size an unchecked create
+/// carried applied (`O_TRUNC`). No directory changed, and the directory's attributes came from the
+/// LOOKUP, a call before this one: another client may have changed it since, so the change info is
+/// not atomic.
+async fn open_existing<B: Backend>(
+  backend: &mut B,
+  looked: v3call::Looked,
+  access: u32,
+  create: Option<Sattr3>,
+) -> Result<Opened, Nfsstat4> {
+  let fh = looked.fh;
+  check_open_kind(backend, &fh).await?;
+  check_open_access(backend, &fh, access).await?;
+  let truncate = Sattr3 {
+    size: create.and_then(|attrs| attrs.size),
+    ..Sattr3::default()
   };
-  Ok(Opened { fh, set })
+  if truncate.size.is_some() {
+    let result = backend
+      .call_v3(NFSPROC3_SETATTR, v3call::setattr_args(&fh, &truncate))
+      .await;
+    let (status, _) = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+    if status != Nfsstat3::Ok {
+      return Err(Nfsstat4::of_v3(status));
+    }
+  }
+  Ok(Opened {
+    fh,
+    attrset: set_bits(&truncate),
+    dir: Wcc {
+      pre: None,
+      post: looked.dir,
+    },
+  })
+}
+
+/// Creates `name` in `dir` with `attrs`, guarded: `NFS4ERR_EXIST` if the name exists.
+async fn create_new<B: Backend>(
+  backend: &mut B,
+  dir: &Nfsfh3,
+  name: &str,
+  attrs: Sattr3,
+) -> Result<Opened, Nfsstat4> {
+  let result = backend
+    .call_v3(
+      NFSPROC3_CREATE,
+      v3call::create_args(dir, name, &v3call::CreateHow::Guarded(attrs)),
+    )
+    .await;
+  let (fh, dir_wcc) = match v3(v3call::created(&result))? {
+    (Some(fh), dir_wcc) => (fh, dir_wcc),
+    (None, dir_wcc) => (lookup(backend, dir, name).await?.fh, dir_wcc),
+  };
+  Ok(Opened {
+    fh,
+    attrset: set_bits(&attrs),
+    dir: dir_wcc,
+  })
+}
+
+/// An exclusive create (EXCLUSIVE4 or EXCLUSIVE4_1): the v3 EXCLUSIVE create, which keeps the verifier
+/// in the new file's times and opens a retry's own file, then `attrs` applied (they exclude the times).
+async fn exclusive_open<B: Backend>(
+  backend: &mut B,
+  dir: &Nfsfh3,
+  name: &str,
+  verifier: [u8; VERIFIER_SIZE],
+  attrs: Sattr3,
+) -> Result<Opened, Nfsstat4> {
+  let result = backend
+    .call_v3(
+      NFSPROC3_CREATE,
+      v3call::create_args(dir, name, &v3call::CreateHow::Exclusive(verifier)),
+    )
+    .await;
+  let (fh, dir_wcc) = match v3(v3call::created(&result))? {
+    (Some(fh), dir_wcc) => (fh, dir_wcc),
+    (None, dir_wcc) => (lookup(backend, dir, name).await?.fh, dir_wcc),
+  };
+  if attrs != Sattr3::default() {
+    let result = backend
+      .call_v3(NFSPROC3_SETATTR, v3call::setattr_args(&fh, &attrs))
+      .await;
+    let (status, _) = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+    if status != Nfsstat3::Ok {
+      return Err(Nfsstat4::of_v3(status));
+    }
+  }
+  Ok(Opened {
+    fh,
+    // The times hold the verifier: naming them tells the client to set its own (§18.16.3).
+    attrset: Bitmap::of(
+      &set_bits(&attrs)
+        .bits()
+        .chain([attr::number::TIME_ACCESS_SET, attr::number::TIME_MODIFY_SET])
+        .collect::<Vec<_>>(),
+    ),
+    dir: dir_wcc,
+  })
 }
 
 /// Refuses an open of anything but a regular file: `NFS4ERR_ISDIR`, `NFS4ERR_SYMLINK`, or
@@ -1625,21 +1842,46 @@ async fn check_open_access<B: Backend>(
 /// as a guarded create: a verifier made an exclusive create idempotent across retransmission, which a
 /// session's slot reply cache now guarantees for every request (RFC 8881 §2.10.6), so a retried create
 /// is answered from the cache and a fresh one on an existing name is `NFS4ERR_EXIST`.
-fn open_createhow(reader: &mut XdrReader<'_>) -> Result<(u32, Sattr3), Nfsstat4> {
+fn open_createhow(reader: &mut XdrReader<'_>) -> Result<OpenCreate, Nfsstat4> {
   let bad = |_| Nfsstat4::Badxdr;
+  let verifier = |reader: &mut XdrReader<'_>| {
+    let mut verifier = [0u8; VERIFIER_SIZE];
+    verifier.copy_from_slice(reader.fixed(VERIFIER_SIZE).map_err(bad)?);
+    Ok::<_, Nfsstat4>(verifier)
+  };
   match reader.u32().map_err(bad)? {
-    createmode4::UNCHECKED => Ok((v3call::createmode::UNCHECKED, decode_fattr_set(reader)?)),
-    createmode4::GUARDED => Ok((v3call::createmode::GUARDED, decode_fattr_set(reader)?)),
-    createmode4::EXCLUSIVE => {
-      reader.fixed(VERIFIER_SIZE).map_err(bad)?;
-      Ok((v3call::createmode::GUARDED, Sattr3::default()))
-    }
+    createmode4::UNCHECKED => Ok(OpenCreate::Unchecked(decode_fattr_set(reader)?)),
+    createmode4::GUARDED => Ok(OpenCreate::Guarded(decode_fattr_set(reader)?)),
+    createmode4::EXCLUSIVE => Ok(OpenCreate::Exclusive {
+      verifier: verifier(reader)?,
+      attrs: Sattr3::default(),
+    }),
     createmode4::EXCLUSIVE_1 => {
-      reader.fixed(VERIFIER_SIZE).map_err(bad)?;
-      Ok((v3call::createmode::GUARDED, decode_fattr_set(reader)?))
+      let verifier = verifier(reader)?;
+      let attrs = decode_fattr_set(reader)?;
+      // The times hold the verifier, so `suppattr_exclcreat` leaves them out; setting one here is
+      // outside it (RFC 8881 §18.16.3).
+      if attrs.atime.is_some() || attrs.mtime.is_some() {
+        return Err(Nfsstat4::Inval);
+      }
+      Ok(OpenCreate::Exclusive { verifier, attrs })
     }
     _ => Err(Nfsstat4::Badxdr),
   }
+}
+
+/// How an OPEN creates (`createhow4`, RFC 8881 §18.16.1).
+enum OpenCreate {
+  /// Create, or open an existing file, applying only the size then (the `O_TRUNC`).
+  Unchecked(Sattr3),
+  /// Create; an existing name is `NFS4ERR_EXIST`.
+  Guarded(Sattr3),
+  /// Create keyed by the verifier (kept in the new file's times, `procedures::exclusive_times`), so a
+  /// retry of the same create — even after a daemon restart — opens the file it made; then set `attrs`.
+  Exclusive {
+    verifier: [u8; VERIFIER_SIZE],
+    attrs: Sattr3,
+  },
 }
 
 /// Derived: the largest encoded values of the attributes this server sets — size (8), mode (4), owner
@@ -1665,12 +1907,12 @@ fn decode_fattr_set(reader: &mut XdrReader<'_>) -> Result<Sattr3, Nfsstat4> {
   let mut attrs = Sattr3::default();
   for bit in bitmap.bits() {
     match bit {
-      settable::SIZE => attrs.size = Some(values.u64().map_err(bad)?),
-      settable::MODE => attrs.mode = Some(values.u32().map_err(bad)?),
-      settable::OWNER => attrs.uid = Some(numeric_id(&mut values)?),
-      settable::OWNER_GROUP => attrs.gid = Some(numeric_id(&mut values)?),
-      settable::TIME_ACCESS_SET => attrs.atime = Some(settime(&mut values)?),
-      settable::TIME_MODIFY_SET => attrs.mtime = Some(settime(&mut values)?),
+      attr::number::SIZE => attrs.size = Some(values.u64().map_err(bad)?),
+      attr::number::MODE => attrs.mode = Some(values.u32().map_err(bad)?),
+      attr::number::OWNER => attrs.uid = Some(numeric_id(&mut values)?),
+      attr::number::OWNER_GROUP => attrs.gid = Some(numeric_id(&mut values)?),
+      attr::number::TIME_ACCESS_SET => attrs.atime = Some(settime(&mut values)?),
+      attr::number::TIME_MODIFY_SET => attrs.mtime = Some(settime(&mut values)?),
       _ => return Err(Nfsstat4::Attrnotsupp),
     }
   }
@@ -1685,17 +1927,18 @@ fn numeric_id(values: &mut XdrReader<'_>) -> Result<u32, Nfsstat4> {
 }
 
 /// A `settime4`: `None` for the server's time, `Some(t)` for a client time.
-fn settime(values: &mut XdrReader<'_>) -> Result<Option<Nfstime3>, Nfsstat4> {
+fn settime(values: &mut XdrReader<'_>) -> Result<Option<Nfstime4>, Nfsstat4> {
+  /// Format: nanoseconds per second, the bound of `nfstime4`'s `nseconds`.
+  const NS_PER_SECOND: u32 = 1_000_000_000;
   let bad = |_| Nfsstat4::Badxdr;
   if values.u32().map_err(bad)? != SET_TO_CLIENT_TIME4 {
     return Ok(None);
   }
-  let seconds = values.u64().map_err(bad)?;
-  let nseconds = values.u32().map_err(bad)?;
-  Ok(Some(Nfstime3 {
-    seconds: u32::try_from(seconds).map_err(|_| Nfsstat4::Inval)?,
-    nseconds,
-  }))
+  let time = Nfstime4::decode(values).map_err(bad)?;
+  if time.nseconds >= NS_PER_SECOND {
+    return Err(Nfsstat4::Inval);
+  }
+  Ok(Some(time))
 }
 
 /// `SETATTR` (§18.30).
@@ -1715,7 +1958,7 @@ async fn setattr<B: Backend>(
     &stateid,
   )
   .await?;
-  let status = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+  let (status, _) = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
@@ -1728,12 +1971,12 @@ async fn setattr<B: Backend>(
 fn set_bits(attrs: &Sattr3) -> Bitmap {
   let mut set = Vec::new();
   for (present, bit) in [
-    (attrs.size.is_some(), settable::SIZE),
-    (attrs.mode.is_some(), settable::MODE),
-    (attrs.uid.is_some(), settable::OWNER),
-    (attrs.gid.is_some(), settable::OWNER_GROUP),
-    (attrs.atime.is_some(), settable::TIME_ACCESS_SET),
-    (attrs.mtime.is_some(), settable::TIME_MODIFY_SET),
+    (attrs.size.is_some(), attr::number::SIZE),
+    (attrs.mode.is_some(), attr::number::MODE),
+    (attrs.uid.is_some(), attr::number::OWNER),
+    (attrs.gid.is_some(), attr::number::OWNER_GROUP),
+    (attrs.atime.is_some(), attr::number::TIME_ACCESS_SET),
+    (attrs.mtime.is_some(), attr::number::TIME_MODIFY_SET),
   ] {
     if present {
       set.push(bit);
@@ -1742,35 +1985,65 @@ fn set_bits(attrs: &Sattr3) -> Bitmap {
   Bitmap::of(&set)
 }
 
-/// `CREATE` (§18.4): a directory or a symbolic link in the current directory, which becomes the new
-/// object.
+/// What a `CREATE` makes (`createtype4`, RFC 8881 §18.4.1).
+enum Creation {
+  /// A directory, through the v3 MKDIR.
+  Dir,
+  /// A symbolic link to the target, through the v3 SYMLINK.
+  Link(String),
+  /// A FIFO, socket, block or character device name, through the v3 MKNOD, which decides what the
+  /// volume keeps (§4.6 A-26: FIFO and socket names; no device nodes).
+  Node(Ftype3, Specdata3),
+}
+
+/// Reads a `createtype4`. A regular file is made by OPEN, never CREATE, and the named-attribute
+/// types are not served: both are `NFS4ERR_BADTYPE` (§18.4.3).
+fn decode_creation(reader: &mut XdrReader<'_>) -> Result<Creation, Nfsstat4> {
+  let bad = |_| Nfsstat4::Badxdr;
+  let kind = reader.u32().map_err(bad)?;
+  match attr::ftype3_of(kind) {
+    Some(Ftype3::Dir) => Ok(Creation::Dir),
+    Some(Ftype3::Lnk) => Ok(Creation::Link(
+      reader
+        .string(crate::procedures::NFS_MAXPATHLEN)
+        .map_err(bad)?
+        .to_owned(),
+    )),
+    Some(kind @ (Ftype3::Blk | Ftype3::Chr)) => {
+      let specdata1 = reader.u32().map_err(bad)?;
+      let specdata2 = reader.u32().map_err(bad)?;
+      Ok(Creation::Node(
+        kind,
+        Specdata3 {
+          specdata1,
+          specdata2,
+        },
+      ))
+    }
+    Some(kind @ (Ftype3::Sock | Ftype3::Fifo)) => Ok(Creation::Node(kind, Specdata3::default())),
+    Some(Ftype3::Reg) | None => Err(Nfsstat4::Badtype),
+  }
+}
+
+/// `CREATE` (§18.4): a directory, a symbolic link, or a FIFO, socket or device name in the current
+/// directory, which becomes the new object. The reply's `attrset` names the attributes applied: the
+/// v3 layer applies every requested one or refuses the call.
 async fn create<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
   frame: &mut Frame,
 ) -> Outcome {
-  let bad = |_| Nfsstat4::Badxdr;
-  let kind = reader.u32().map_err(bad)?;
-  let target = if kind == ftype4::LNK {
-    Some(
-      reader
-        .string(crate::procedures::NFS_MAXPATHLEN)
-        .map_err(bad)?
-        .to_owned(),
-    )
-  } else {
-    None
-  };
+  let creation = decode_creation(reader)?;
   let name = component(reader)?;
   let attrs = decode_fattr_set(reader)?;
   let dir = current(frame)?.clone();
-  let result = match (kind, &target) {
-    (ftype4::DIR, _) => {
+  let result = match &creation {
+    Creation::Dir => {
       backend
         .call_v3(NFSPROC3_MKDIR, v3call::mkdir_args(&dir, &name, &attrs))
         .await
     }
-    (ftype4::LNK, Some(target)) => {
+    Creation::Link(target) => {
       backend
         .call_v3(
           NFSPROC3_SYMLINK,
@@ -1778,19 +2051,25 @@ async fn create<B: Backend>(
         )
         .await
     }
-    _ => return Err(Nfsstat4::Badtype),
+    Creation::Node(kind, device) => {
+      backend
+        .call_v3(
+          NFSPROC3_MKNOD,
+          v3call::mknod_args(&dir, &name, *kind, &attrs, *device),
+        )
+        .await
+    }
   };
-  let fh = match v3(v3call::created(&result))? {
-    (Some(fh), _) => fh,
-    (None, _) => lookup(backend, &dir, &name).await?.0,
+  let (fh, dir_wcc) = match v3(v3call::created(&result))? {
+    (Some(fh), dir_wcc) => (fh, dir_wcc),
+    (None, dir_wcc) => (lookup(backend, &dir, &name).await?.fh, dir_wcc),
   };
   frame.current = Some(fh);
-  let mut body = XdrWriter::new();
-  body.bool(false); // change_info4: not atomic
-  body.u64(0);
-  body.u64(0);
-  Bitmap::default().encode(&mut body);
-  Ok(body.into_bytes())
+  let mut body = change_info(&dir_wcc);
+  let mut attrset = XdrWriter::new();
+  set_bits(&attrs).encode(&mut attrset);
+  body.extend(attrset.into_bytes());
+  Ok(body)
 }
 
 /// `REMOVE` (§18.25): a file or an empty directory.
@@ -1800,17 +2079,18 @@ async fn remove<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   let result = backend
     .call_v3(NFSPROC3_REMOVE, v3call::dir_name(&dir, &name))
     .await;
-  let mut status = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
-  if status == Nfsstat3::Isdir {
+  let mut removed = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+  if removed.0 == Nfsstat3::Isdir {
     let result = backend
       .call_v3(NFSPROC3_RMDIR, v3call::dir_name(&dir, &name))
       .await;
-    status = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+    removed = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
   }
+  let (status, dir_wcc) = removed;
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  Ok(change_info())
+  Ok(change_info(&dir_wcc))
 }
 
 /// `RENAME` (§18.26): the saved file handle's directory to the current one's.
@@ -1825,12 +2105,12 @@ async fn rename<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
       v3call::rename_args(&from_dir, &from, &to_dir, &to),
     )
     .await;
-  let status = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+  let (status, from_wcc, to_wcc) = v3call::renamed(&result).map_err(|_| Nfsstat4::Serverfault)?;
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  let mut body = change_info();
-  body.extend(change_info());
+  let mut body = change_info(&from_wcc);
+  body.extend(change_info(&to_wcc));
   Ok(body)
 }
 
@@ -1842,19 +2122,34 @@ async fn link<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   let result = backend
     .call_v3(NFSPROC3_LINK, v3call::link_args(&file, &dir, &name))
     .await;
-  let status = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+  let (status, dir_wcc) = v3call::linked(&result).map_err(|_| Nfsstat4::Serverfault)?;
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  Ok(change_info())
+  Ok(change_info(&dir_wcc))
 }
 
-/// A `change_info4` that is not atomic: the directory's change attribute is not known to this layer
-/// before and after, so the client revalidates the directory.
-pub(super) fn change_info() -> Vec<u8> {
+/// A `change_info4` (§3.3.6) from the `wcc_data` of the one v3 call that made the change. Atomic when
+/// both halves carry the change counter: the v3 layer took them inside that call on the owner shard,
+/// with nothing else able to change the object between them (A-38), so a client whose cached `change`
+/// equals `before` knows the only change was its own and keeps its cache. Otherwise it is not atomic,
+/// with what is known, and the client revalidates.
+pub(super) fn change_info(wcc: &Wcc) -> Vec<u8> {
+  let before = wcc.pre.and_then(|pre| pre.change);
+  let after = wcc.post.and_then(|post| post.v4).map(|v4| v4.change);
   let mut body = XdrWriter::new();
-  body.bool(false);
-  body.u64(0);
-  body.u64(0);
+  match (before, after) {
+    (Some(before), Some(after)) => {
+      body.bool(true);
+      body.u64(before);
+      body.u64(after);
+    }
+    _ => {
+      let known = after.or(before).unwrap_or(0);
+      body.bool(false);
+      body.u64(known);
+      body.u64(known);
+    }
+  }
   body.into_bytes()
 }

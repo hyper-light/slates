@@ -115,7 +115,9 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     (Transport::VirtioFs, _) => Availability::Owed(VIRTIOFS_OWED),
     (Transport::Oci, _) => Availability::Owed(OCI_OWED),
     (Transport::NativeMacosNfs, suite) => native_macos(suite),
-    (Transport::NativeLinuxFuse, suite) => native_linux(suite),
+    (Transport::NativeLinuxFuse, suite) => native_linux(suite, Some(LINUX_NFS_ADAPTER)),
+    // The daemon's own NFSv4.2 server under the kernel client: a transport, not an adapter.
+    (Transport::NativeLinuxNfs4, suite) => native_linux(suite, None),
     (Transport::NativeWindowsWinfsp, suite) => native_windows(suite),
   }
 }
@@ -157,9 +159,8 @@ fn native_macos(suite: Suite) -> Availability {
   }
 }
 
-fn native_linux(suite: Suite) -> Availability {
+fn native_linux(suite: Suite, adapter: Option<Adapter>) -> Availability {
   let on = HostOs::Linux;
-  let adapter = Some(LINUX_NFS_ADAPTER);
   match suite {
     Suite::Pjdfstest => Availability::Runnable {
       on,

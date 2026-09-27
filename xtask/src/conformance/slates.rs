@@ -13,6 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use slates_conformance::capability::HostOs;
+use slates_conformance::record::Transport;
 
 use super::{Run, create_dir, pause, stdout_of, tool_on_path};
 use crate::Failure;
@@ -48,6 +49,10 @@ const ENV_HANDOFF_LEN: &str = "SLATES_ANCHOR_LEN";
 /// a high source port, soft with a short retry so a wedged export is escapable, and the same
 /// one-second attribute cache `slates mount` asks for (`crates/cli/src/mount.rs`).
 const LINUX_NFS_OPTIONS: &str = "vers=3,tcp,nolock,noresvport,soft,timeo=10,retrans=2,actimeo=1";
+/// Format: the Linux mount options for the daemon's NFSv4.2 server (§4.6 A-35): version 4.2 over TCP,
+/// the explicit port (v4 has no MOUNT or portmap step), locks served by the server (no `local_lock`), a
+/// high source port, soft with the same short retry, and the same one-second attribute cache.
+const LINUX_NFS4_OPTIONS: &str = "vers=4.2,proto=tcp,noresvport,soft,timeo=10,retrans=2,actimeo=1";
 /// Format: the server address the Linux mount targets — the IPv4 loopback literal, not `localhost`.
 /// The daemon's NFS listener binds IPv4 `127.0.0.1` only (`slates_rt::tcp` is `SocketAddrV4`), while
 /// `localhost` on a dual-stack host resolves to IPv6 `::1` first (RFC 3484), so `mount -t nfs
@@ -109,8 +114,22 @@ impl Reply {
 impl SlatesBinary {
   /// Builds `slates-cli` and locates the executable cargo reports.
   pub(crate) fn build(root: &Path) -> Result<SlatesBinary, Failure> {
+    SlatesBinary::build_as(root, false)
+  }
+
+  /// Builds the CLI (and the daemon it runs) with the release profile, as a benchmark measures it
+  /// (CLAUDE.md §5: a benchmark is a release binary).
+  pub(crate) fn build_release(root: &Path) -> Result<SlatesBinary, Failure> {
+    SlatesBinary::build_as(root, true)
+  }
+
+  fn build_as(root: &Path, release: bool) -> Result<SlatesBinary, Failure> {
+    let mut args = vec!["build", "-p", "slates-cli", "--message-format=json"];
+    if release {
+      args.push("--release");
+    }
     let output = Command::new(env!("CARGO"))
-      .args(["build", "-p", "slates-cli", "--message-format=json"])
+      .args(&args)
       .current_dir(root)
       .output()?;
     if !output.status.success() {
@@ -477,9 +496,16 @@ pub(crate) fn mount_volume(
         LINUX_NFS_SERVER,
         mount_deadlines(),
       )?);
-      let options = format!("{LINUX_NFS_OPTIONS},port={port},mountport={port}");
+      let (kind, options) = if run.transport == Transport::NativeLinuxNfs4 {
+        ("nfs4", format!("{LINUX_NFS4_OPTIONS},port={port}"))
+      } else {
+        (
+          "nfs",
+          format!("{LINUX_NFS_OPTIONS},port={port},mountport={port}"),
+        )
+      };
       let output = Command::new("sudo")
-        .args(["-n", "mount", "-t", "nfs", "-o", &options])
+        .args(["-n", "mount", "-t", kind, "-o", &options])
         .arg(export.source())
         .arg(&mount.path)
         .output()?;
@@ -644,10 +670,20 @@ impl Session {
     fold: bool,
     tracer: Option<&[String]>,
   ) -> Result<Session, Failure> {
+    let binary = SlatesBinary::build(run.root)?;
+    Session::open_with(run, binary, (suite, size, fold), tracer)
+  }
+
+  /// [`Session::open`] over an already built `binary` (the benchmark's release build).
+  pub(crate) fn open_with(
+    run: &Run<'_>,
+    binary: SlatesBinary,
+    (suite, size, fold): (&str, &str, bool),
+    tracer: Option<&[String]>,
+  ) -> Result<Session, Failure> {
     if !tool_on_path("mktemp") {
       return Err(Failure("mktemp is needed".to_owned()));
     }
-    let binary = SlatesBinary::build(run.root)?;
     let instance = format!("conf-{suite}-{}", std::process::id());
     let anchor = Anchor::start(&binary, &instance, run.scratch.path(), tracer)?;
     // A fresh daemon serves no placement until its configuration group is bootstrapped (the

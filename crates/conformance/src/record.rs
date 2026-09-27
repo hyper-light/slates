@@ -26,7 +26,7 @@ pub const MAX_RECORD_BYTES: usize = 64 * 1024;
 /// stays readable and bounded whatever a suite prints.
 pub const DETAIL_CHARS: usize = 512;
 
-/// An offered transport (§4.6): the five the release must have evidence for (AC-9.7).
+/// An offered transport (§4.6): the ones the release must have evidence for (AC-9.7), and NFSv4.2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
@@ -34,6 +34,9 @@ pub enum Transport {
   NativeMacosNfs,
   /// Linux, the `/dev/fuse` bridge.
   NativeLinuxFuse,
+  /// Linux, the daemon's NFSv4.2 server under the kernel's `mount -t nfs4 -o vers=4.2` (§4.6 A-35):
+  /// sessions, opens, locks, SEEK, COPY and extended attributes through the real client.
+  NativeLinuxNfs4,
   /// Windows, the WinFsp volume host.
   NativeWindowsWinfsp,
   /// A Linux guest over the owned FUSE-over-virtio device.
@@ -44,9 +47,10 @@ pub enum Transport {
 
 impl Transport {
   /// Every transport, in the matrix's row order.
-  pub const ALL: [Transport; 5] = [
+  pub const ALL: [Transport; 6] = [
     Transport::NativeMacosNfs,
     Transport::NativeLinuxFuse,
+    Transport::NativeLinuxNfs4,
     Transport::NativeWindowsWinfsp,
     Transport::VirtioFs,
     Transport::Oci,
@@ -57,6 +61,7 @@ impl Transport {
     match self {
       Transport::NativeMacosNfs => "native-macos-nfs",
       Transport::NativeLinuxFuse => "native-linux-fuse",
+      Transport::NativeLinuxNfs4 => "native-linux-nfs4",
       Transport::NativeWindowsWinfsp => "native-windows-winfsp",
       Transport::VirtioFs => "virtio-fs",
       Transport::Oci => "oci",
@@ -68,6 +73,7 @@ impl Transport {
     match self {
       Transport::NativeMacosNfs => "native macOS (NFS loopback)",
       Transport::NativeLinuxFuse => "native Linux (FUSE)",
+      Transport::NativeLinuxNfs4 => "native Linux (NFSv4.2)",
       Transport::NativeWindowsWinfsp => "native Windows (WinFsp)",
       Transport::VirtioFs => "virtio-fs guest",
       Transport::Oci => "OCI container",

@@ -1430,3 +1430,34 @@ fn a_clone_of_an_overlay_snapshot_reads_the_same_base() {
   let _ = Kind::File;
   let _ = HostKind::File;
 }
+
+/// A-38: an outsider's edit beneath an overlay moves the file's change counter when a stat takes the
+/// disk's new attributes, and a stat of an unchanged file leaves it where it is, so a client caching
+/// by the counter sees the edit and keeps its cache otherwise.
+#[test]
+fn an_outsiders_edit_moves_the_change_counter_and_a_plain_stat_does_not() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"one");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let counter = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
+    let mut o = vol.with_host(host);
+    let no = o.resolve(store, "/f").unwrap().inode;
+    let size = o.stat(store, no).unwrap().size;
+    (size, vol.change_version(store, no).unwrap())
+  };
+  let (size, first) = counter(&mut vol, &mut host, &mut store);
+  assert_eq!(size, 3);
+  let (_, again) = counter(&mut vol, &mut host, &mut store);
+  assert_eq!(
+    again, first,
+    "a stat of an unchanged file does not move the counter"
+  );
+
+  host.write_in_place("/f", b"three", 5);
+  let (size, edited) = counter(&mut vol, &mut host, &mut store);
+  assert_eq!(size, 5, "the stat took the disk's new size");
+  assert!(edited > first, "the outsider's edit moved the counter");
+  let (_, settled) = counter(&mut vol, &mut host, &mut store);
+  assert_eq!(settled, edited, "and a further stat leaves it");
+}

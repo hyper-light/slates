@@ -28,9 +28,9 @@ use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::InodeNo;
-use slates_vfs::inode::{Attrs, Kind};
+use slates_vfs::inode::Kind;
 use slates_vfs::journal::Op;
-use slates_vfs::volume::{Store, Volume};
+use slates_vfs::volume::{Observed, Store, Volume};
 
 use crate::{
   Bridge, CacheLifetime, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr, ObjectId,
@@ -286,12 +286,11 @@ impl<'v> VolumeBridge<'v> {
   /// entry) and its kind (structural, always in the store).
   fn attr_of(&mut self, no: u64) -> Result<NodeAttr, VfsError> {
     let inode = InodeNo(no);
-    let attrs = match self.host.as_mut() {
-      Some(host) => self.volume.with_host(host).stat(self.store, inode),
-      None => self.volume.stat(self.store, inode),
+    let observed = match self.host.as_mut() {
+      Some(host) => self.volume.with_host(host).observe(self.store, inode),
+      None => self.volume.observe(self.store, inode),
     }?;
-    let kind = self.volume.kind(self.store, inode)?;
-    Ok(node_attr(no, kind, &attrs))
+    Ok(node_attr(no, &observed))
   }
 
   /// The kernel invalidations one journal record owes (§4.6): a content or attribute change on an
@@ -426,13 +425,14 @@ impl<'v> VolumeBridge<'v> {
   }
 }
 
-/// A neutral [`NodeAttr`] from the volume's attributes, kind and inode number. Generation is 0
-/// until generation-tracked reuse lands (§4.6 `(no, gen)`).
-fn node_attr(no: u64, kind: Kind, attrs: &Attrs) -> NodeAttr {
+/// A neutral [`NodeAttr`] from what the volume observes of inode `no`. Generation is 0 until
+/// generation-tracked reuse lands (§4.6 `(no, gen)`).
+fn node_attr(no: u64, observed: &Observed) -> NodeAttr {
+  let attrs = &observed.attrs;
   NodeAttr {
     ino: no,
     generation: 0,
-    kind,
+    kind: observed.kind,
     mode: attrs.mode,
     nlink: attrs.nlink,
     uid: attrs.uid,
@@ -441,6 +441,7 @@ fn node_attr(no: u64, kind: Kind, attrs: &Attrs) -> NodeAttr {
     atime: attrs.atime,
     mtime: attrs.mtime,
     ctime: attrs.ctime,
+    change: observed.change,
   }
 }
 
@@ -723,8 +724,7 @@ impl Bridge for VolumeBridge<'_> {
         .create_file_no(self.store, parent_no, name, mode),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
-    let attrs = self.volume.stat(self.store, no)?;
-    let entry = node_attr(no.0, Kind::File, &attrs);
+    let entry = node_attr(no.0, &self.volume.observe(self.store, no)?);
     // A create takes only an open reference (dropped by release); it does not implicitly take a
     // lookup reference — a transport that owns lookup references (FUSE) takes one through
     // `reference`, NFS takes none (§3). `open_handle` references then allocates, undoing on failure.
@@ -809,7 +809,7 @@ impl Bridge for VolumeBridge<'_> {
         .mknod_no(self.store, parent_no, name, mode, kind),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
-    Ok(node_attr(no.0, kind, &self.volume.stat(self.store, no)?))
+    Ok(node_attr(no.0, &self.volume.observe(self.store, no)?))
   }
 
   fn mkdir(
@@ -832,8 +832,7 @@ impl Bridge for VolumeBridge<'_> {
       None => self.volume.mkdir_no(self.store, parent_no, name, mode),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
-    let attrs = self.volume.stat(self.store, no)?;
-    let attr = node_attr(no.0, Kind::Dir, &attrs);
+    let attr = node_attr(no.0, &self.volume.observe(self.store, no)?);
     // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.
     Ok(attr)
   }
@@ -881,8 +880,7 @@ impl Bridge for VolumeBridge<'_> {
       None => self.volume.symlink_no(self.store, parent_no, name, target),
     }?;
     self.stamp_created_owner(no, parent_no, cx)?;
-    let attrs = self.volume.stat(self.store, no)?;
-    let attr = node_attr(no.0, Kind::Symlink, &attrs);
+    let attr = node_attr(no.0, &self.volume.observe(self.store, no)?);
     // No implicit lookup reference (see `lookup`): FUSE takes one through `reference`, NFS none.
     Ok(attr)
   }

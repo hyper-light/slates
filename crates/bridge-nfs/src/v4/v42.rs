@@ -20,14 +20,13 @@
 
 use super::Nfsstat4;
 use super::compound::{
-  Backend, Frame, Outcome, attrs_of, change_info, check_open_kind, check_state, current, op, v3,
+  Backend, Frame, Outcome, attrs_of, change_info, check_open_kind, check_state, current, op,
+  state_io, v3,
 };
 use super::types::{Bitmap, Stateid};
 use super::v3call;
-use crate::nfs::Nfsfh3;
-use crate::procedures::{
-  MAX_TRANSFER, NFSPROC3_READ, NFSPROC3_WRITE, extension, extension_status, seek_what,
-};
+use crate::nfs::{Nfsfh3, Wcc};
+use crate::procedures::{MAX_TRANSFER, extension, extension_status, io_want, seek_what};
 use crate::xdr::{XdrReader, XdrWriter};
 
 /// Format: `stable_how4` `UNSTABLE4`: a COPY's writes are unstable, made stable by the client's
@@ -85,7 +84,7 @@ async fn seek<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   };
   let fh = current(frame)?.clone();
   check_open_kind(backend, &fh).await?;
-  check_state(backend, &fh, frame.clientid, &stateid).await?;
+  check_state(backend, &fh, frame.clientid, &stateid, io_want::READ).await?;
   let (found, at, size) = seek_in(backend, &fh, offset, data).await?;
   if offset >= size {
     return Err(Nfsstat4::Nxio);
@@ -111,7 +110,7 @@ async fn read_plus<B: Backend>(
   let count = reader.u32().map_err(bad)?;
   let fh = current(frame)?.clone();
   check_open_kind(backend, &fh).await?;
-  check_state(backend, &fh, frame.clientid, &stateid).await?;
+  check_state(backend, &fh, frame.clientid, &stateid, io_want::READ).await?;
   let size = attrs_of(backend, &fh).await?.size;
   let budget = usize::try_from(backend.with_v4(|server| server.limits().offer.max_response)?)
     .unwrap_or(usize::MAX);
@@ -125,7 +124,15 @@ async fn read_plus<B: Backend>(
     budget,
   };
   while contents.at < end && contents.has_room() {
-    if !next_content(backend, &fh, &mut contents, size, end).await? {
+    if !next_content(
+      backend,
+      (&fh, frame.clientid, &stateid),
+      &mut contents,
+      size,
+      end,
+    )
+    .await?
+    {
       break;
     }
   }
@@ -166,7 +173,7 @@ impl Contents {
 /// hole (within `end` and the reply's room). `false` when nothing more can be added.
 async fn next_content<B: Backend>(
   backend: &mut B,
-  fh: &Nfsfh3,
+  (fh, clientid, stateid): (&Nfsfh3, Option<u64>, &Stateid),
   contents: &mut Contents,
   size: u64,
   end: u64,
@@ -188,12 +195,15 @@ async fn next_content<B: Backend>(
   if take == 0 {
     return Ok(false);
   }
-  let result = backend
-    .call_v3(
-      NFSPROC3_READ,
-      v3call::read_args(fh, at, u32::try_from(take).unwrap_or(MAX_TRANSFER)),
-    )
-    .await;
+  // The bytes are read under the READ_PLUS's state id at the owner, as a READ is (RFC 8881 §9.1.2).
+  let result = state_io(
+    backend,
+    extension::READ_STATE,
+    v3call::read_args(fh, at, u32::try_from(take).unwrap_or(MAX_TRANSFER)),
+    clientid,
+    stateid,
+  )
+  .await?;
   let (_, data) = v3(v3call::read(&result))?;
   if data.is_empty() {
     return Ok(false);
@@ -224,12 +234,20 @@ async fn copy<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
       .await
       .map_err(|_| Nfsstat4::WrongType)?;
   }
-  check_state(backend, &source, frame.clientid, &request.source_stateid).await?;
+  check_state(
+    backend,
+    &source,
+    frame.clientid,
+    &request.source_stateid,
+    io_want::READ,
+  )
+  .await?;
   check_state(
     backend,
     &destination,
     frame.clientid,
     &request.destination_stateid,
+    io_want::WRITE,
   )
   .await?;
   let size = attrs_of(backend, &source).await?.size;
@@ -246,8 +264,13 @@ async fn copy<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
     u64::from(limits.offer.max_request).saturating_mul(u64::from(limits.offer.max_requests));
   let (copied, verifier) = copy_range(
     backend,
-    (&source, request.source_offset),
-    (&destination, request.destination_offset),
+    frame.clientid,
+    (&source, request.source_offset, &request.source_stateid),
+    (
+      &destination,
+      request.destination_offset,
+      &request.destination_stateid,
+    ),
     count.min(bound),
   )
   .await?;
@@ -261,15 +284,23 @@ async fn copy<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   Ok(body.into_bytes())
 }
 
+/// One side of a COPY: the file, the offset, and the state id its I/O runs under.
+type CopySide<'a> = (&'a Nfsfh3, u64, &'a Stateid);
+
 /// Copies up to `count` bytes from `source` to `destination` in transfer-sized pieces: the bytes copied
-/// and the last write verifier. The first failure ends the copy: before any byte it is the COPY's
-/// status, after some it answers the bytes copied.
+/// and the last write verifier. Each piece reads and writes under the COPY's state ids at the files'
+/// owners, so the opens authorize them as they would a READ and a WRITE (RFC 8881 §9.1.2). The first
+/// failure ends the copy: before any byte it is the COPY's status, after some it answers the bytes
+/// copied.
 async fn copy_range<B: Backend>(
   backend: &mut B,
-  (source, source_offset): (&Nfsfh3, u64),
-  (destination, destination_offset): (&Nfsfh3, u64),
+  clientid: Option<u64>,
+  source: CopySide<'_>,
+  destination: CopySide<'_>,
   count: u64,
 ) -> Result<(u64, [u8; v3call::VERF_SIZE]), Nfsstat4> {
+  let (source, source_offset, source_stateid) = source;
+  let (destination, destination_offset, destination_stateid) = destination;
   let mut copied = 0u64;
   let mut verifier = [0u8; v3call::VERF_SIZE];
   while copied < count {
@@ -277,8 +308,13 @@ async fn copy_range<B: Backend>(
       u32::try_from((count - copied).min(u64::from(MAX_TRANSFER))).unwrap_or(MAX_TRANSFER);
     let step = copy_piece(
       backend,
-      (source, source_offset + copied),
-      (destination, destination_offset + copied),
+      clientid,
+      (source, source_offset + copied, source_stateid),
+      (
+        destination,
+        destination_offset + copied,
+        destination_stateid,
+      ),
       piece,
     )
     .await;
@@ -299,26 +335,31 @@ async fn copy_range<B: Backend>(
 /// written and the write verifier.
 async fn copy_piece<B: Backend>(
   backend: &mut B,
-  (source, source_offset): (&Nfsfh3, u64),
-  (destination, destination_offset): (&Nfsfh3, u64),
+  clientid: Option<u64>,
+  (source, source_offset, source_stateid): CopySide<'_>,
+  (destination, destination_offset, destination_stateid): CopySide<'_>,
   piece: u32,
 ) -> Result<(u32, [u8; v3call::VERF_SIZE]), Nfsstat4> {
-  let result = backend
-    .call_v3(
-      NFSPROC3_READ,
-      v3call::read_args(source, source_offset, piece),
-    )
-    .await;
+  let result = state_io(
+    backend,
+    extension::READ_STATE,
+    v3call::read_args(source, source_offset, piece),
+    clientid,
+    source_stateid,
+  )
+  .await?;
   let (_, data) = v3(v3call::read(&result))?;
   if data.is_empty() {
     return Ok((0, [0u8; v3call::VERF_SIZE]));
   }
-  let result = backend
-    .call_v3(
-      NFSPROC3_WRITE,
-      v3call::write_args(destination, destination_offset, UNSTABLE4, &data),
-    )
-    .await;
+  let result = state_io(
+    backend,
+    extension::WRITE_STATE,
+    v3call::write_args(destination, destination_offset, UNSTABLE4, &data),
+    clientid,
+    destination_stateid,
+  )
+  .await?;
   let (written, _, verifier) = v3(v3call::write(&result))?;
   Ok((written, verifier))
 }
@@ -444,8 +485,11 @@ async fn xattr_operation<B: Backend>(
       body.opaque(value);
       Ok(body.into_bytes())
     }
-    // SETXATTR and REMOVEXATTR answer a change_info4 that is not atomic: the client revalidates.
-    _ => Ok(change_info()),
+    // SETXATTR and REMOVEXATTR answer the file's change_info4, from the one call that changed it.
+    _ => {
+      let wcc = Wcc::decode_with_change(&mut result).map_err(|_| Nfsstat4::Serverfault)?;
+      Ok(change_info(&wcc))
+    }
   }
 }
 

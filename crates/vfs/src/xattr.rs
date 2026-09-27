@@ -190,6 +190,7 @@ impl Volume {
   ) -> Result<(), VfsError> {
     self.live()?;
     self.xattr_inode(store, no, name)?;
+    let folded = self.dropped_copy_counter(store, no)?;
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -203,8 +204,10 @@ impl Volume {
     if inode.xattrs.as_deref().is_some_and(XattrTable::is_vacant) {
       inode.xattrs = None;
     }
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    if dropped.is_some() {
+      inode.fold_counter(folded);
+    }
+    inode.stamp_change(now);
     self.record(Op::RemoveXattr { name: name.into() }, "", Some(no), prev);
     for old in std::iter::once(removed).chain(dropped) {
       self.drop_link(store, old)?;
@@ -232,8 +235,7 @@ impl Volume {
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
     let prev = inode.version;
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    inode.stamp_change(now);
     self.record(Op::SetXattr { name: name.into() }, "", Some(no), prev);
     self.attribute_writes_in_place = self.attribute_writes_in_place.saturating_add(1);
     Ok(())
@@ -292,6 +294,7 @@ impl Volume {
     if self.sidecar_of(store, no)?.is_none() {
       return Ok(());
     }
+    let folded = self.dropped_copy_counter(store, no)?;
     let handle = self.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
     let dropped = inode
@@ -300,6 +303,9 @@ impl Volume {
       .and_then(|table| table.sidecar.take());
     if inode.xattrs.as_deref().is_some_and(XattrTable::is_vacant) {
       inode.xattrs = None;
+    }
+    if dropped.is_some() {
+      inode.fold_counter(folded);
     }
     match dropped {
       Some(copy) => self.drop_link(store, copy),
@@ -331,13 +337,31 @@ impl Volume {
       Ok(handle) => handle,
       Err(refusal) => return Err(self.abandon_attribute(store, fresh, refusal)),
     };
-    store
-      .inodes
-      .get_mut(handle)?
-      .xattrs
-      .get_or_insert_with(Box::default)
-      .sidecar = Some(fresh);
+    let inode = store.inodes.get_mut(handle)?;
+    inode.xattrs.get_or_insert_with(Box::default).sidecar = Some(fresh);
+    // The view now shows the empty copy in place of the encoding: its counter moves.
+    inode.fold_counter(1);
     Ok(fresh)
+  }
+
+  /// What inode `no`'s owner absorbs when its working copy is dropped: the copy's counter and one
+  /// more, so the view's counter (owner plus copy) moves past every value it showed; 0 when it has
+  /// no copy.
+  fn dropped_copy_counter(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
+    match self.sidecar_of(store, no)? {
+      Some(copy) => Ok(self.inode(store, copy)?.version + 1),
+      None => Ok(0),
+    }
+  }
+
+  /// The change counter of inode `no`'s AppleDouble view: its own plus its working copy's, which
+  /// moves on every change to what the view shows and never repeats (A-38; `Inode::fold_counter`).
+  pub fn view_change(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
+    let own = owner_of(self.namespace_inode(store, no)?)?.version;
+    match self.sidecar_of(store, no)? {
+      Some(copy) => Ok(own + self.inode(store, copy)?.version),
+      None => Ok(own),
+    }
   }
 
   /// The names of inode `no`'s extended attributes as snapshot `id` holds them.
@@ -444,6 +468,7 @@ impl Volume {
     fresh: InodeNo,
     sidecar: Sidecar,
   ) -> Result<(Option<InodeNo>, Option<InodeNo>), VfsError> {
+    let folded = self.dropped_copy_counter(store, owner)?;
     let handle = self.make_current_inode(store, owner)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -454,8 +479,10 @@ impl Volume {
       Sidecar::Drop => table.sidecar.take(),
       Sidecar::Keep => None,
     };
-    inode.attrs.ctime = now;
-    inode.version += 1;
+    if dropped.is_some() {
+      inode.fold_counter(folded);
+    }
+    inode.stamp_change(now);
     self.record(Op::SetXattr { name: name.into() }, "", Some(owner), prev);
     Ok((replaced, dropped))
   }
