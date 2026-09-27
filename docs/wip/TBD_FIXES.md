@@ -1,6 +1,6 @@
 # Remaining fixes and verification
 
-Updated: **2026-09-25**. Checkpoint against `3b38d15`, including the instruction-benchmark
+Updated: **2026-09-26**. Checkpoint against `3b38d15`, including the instruction-benchmark
 repair below. This is the remaining-work
 list for the audit/CI repair session; [GAPS.md](GAPS.md) remains the authoritative contract
 ledger. Historical audit findings below need closure evidence against current source, not
@@ -140,6 +140,19 @@ authorized merely by appearing here.
   `NFS4ERR_NOTSUPP`** (A-38): now served (`verify_and_nverify_compare_the_objects_attributes`,
   `secinfo_backchannel_ctl_and_set_ssv_are_served`, `secinfo_consumes_the_current_file_handle`).
   PUTPUBFH was already served as the root.
+- [x] **The NFSv4 session advertised sizes it did not hold** (A-39): `maxwrite` was 4 KiB over the v3
+  layer's cap, so every full-size WRITE from the Linux client was `NFS4ERR_INVAL` (1 MiB writes `EIO`);
+  `NFS4ERR_REQ_TOO_BIG`/`TOO_MANY_OPS` were claimed in §4.6 and not checked, and replies were not held
+  to the negotiated sizes. See `docs/bugs/2026-09-26-nfsv4-sessions-advertised-sizes-they-did-not-hold.md`.
+- [x] **A spinning shard was blind to socket readiness** (A-39, every driver): a socket request waited
+  out the idle-spin window (loopback p90 1,311 µs → 30 µs). See
+  `docs/bugs/2026-09-26-a-spinning-shard-was-blind-to-socket-readiness.md`.
+- [x] **The io_uring zero-timeout harvest slept** (A-39): 0.3–1.0 ms per harvest, once or twice per NFS
+  request; the NFS bench's stat phase went 782 → 6.5 ms (v3) and 1,313 → 10.9 ms (v4.2). See
+  `docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`.
+- [ ] **Rename the Linux NFSv3 conformance lane's slug** (`native-linux-fuse` mounts `vers=3`, found
+  2026-09-26 reading the bench): the records, the expected-failure list and the matrix carry the old
+  name. Rename them together so no record is orphaned.
 - [ ] **The change counter can repeat across a crash** (2026-09-26, found designing `change_attr_type`):
   an `UNSTABLE` write's reply carries the counter before the recovery image is published, so a crash
   can restore the counter below a value a client saw, and another client's change can then reach that

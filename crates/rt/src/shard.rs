@@ -769,7 +769,7 @@ impl ShardContext {
       if outcome.did_work {
         let now = self.now_ns();
         if now.saturating_sub(last_wait_ns) >= self.quantum_ns() {
-          self.harvest_io();
+          let _ = self.harvest_io();
           last_wait_ns = now;
         }
         continue;
@@ -785,23 +785,29 @@ impl ShardContext {
   }
 
   /// Harvests the driver's ready I/O completions **without blocking** (a zero timeout) and queues their
-  /// tasks, for a continuously busy [`run`] that would otherwise never reach [`park`] where I/O is
-  /// harvested. Unlike `park` it does not set the parked flag: the shard is not waiting, so a concurrent
-  /// kick must not believe it is. A driver error other than loss is left for the next real wait to
-  /// surface; loss is likewise deferred (this is a best-effort poll, not the loop's liveness point).
-  fn harvest_io(&self) {
-    self.with_inner(|inner| {
-      let mut completions = std::mem::take(&mut inner.completions);
-      let result = inner.driver.wait(Some(0), &mut completions);
-      for c in completions.drain(..) {
-        inner.counters.completions += 1;
-        self.local.push(Encoded::from_word(c.user_data).slot());
-      }
-      inner.completions = completions;
-      if matches!(result, Err(RtError::DriverLost)) {
-        inner.counters.driver_lost += 1;
-      }
-    });
+  /// tasks: for a continuously busy [`run`] that would otherwise never reach [`park`] where I/O is
+  /// harvested, and on every turn of the idle spin ([`Self::spin_for_work`]), whose socket readiness
+  /// would otherwise wait out the window. True when a completion was queued. Unlike `park` it does not
+  /// set the parked flag: the shard is not waiting, so a concurrent kick must not believe it is. A
+  /// driver error other than loss is left for the next real wait to surface; loss is likewise deferred
+  /// (this is a best-effort poll, not the loop's liveness point).
+  fn harvest_io(&self) -> bool {
+    self
+      .with_inner(|inner| {
+        let mut completions = std::mem::take(&mut inner.completions);
+        let result = inner.driver.wait(Some(0), &mut completions);
+        let harvested = !completions.is_empty();
+        for c in completions.drain(..) {
+          inner.counters.completions += 1;
+          self.local.push(Encoded::from_word(c.user_data).slot());
+        }
+        inner.completions = completions;
+        if matches!(result, Err(RtError::DriverLost)) {
+          inner.counters.driver_lost += 1;
+        }
+        harvested
+      })
+      .unwrap_or(false)
   }
 
   /// Spins for the configured window watching the rings and the driver; true when something
@@ -821,7 +827,10 @@ impl ShardContext {
     found
   }
 
-  /// The spin itself: true when work arrived or `deadline_ns` fell due before `spin_end`.
+  /// The spin itself: true when work arrived or `deadline_ns` fell due before `spin_end`. Each turn
+  /// asks the rings, the pollers and the driver: a socket's readiness is work as much as a ring's
+  /// message, and no driver can tell it without a (non-blocking) poll — without one a request arriving
+  /// on a socket waited until the window ended and the shard parked (`tests/tcp.rs`).
   fn spin_for_work(&self, spin_end: u64, deadline_ns: Option<u64>) -> bool {
     loop {
       // A poller's question may consume its signal (the daemon's doorbell flag is swapped to false
@@ -831,6 +840,7 @@ impl ShardContext {
         || self
           .with_inner(|inner| inner.driver.has_pending() || self.wake_ready_pollers(inner))
           .unwrap_or(false)
+        || self.harvest_io()
       {
         self.with_inner(|inner| inner.counters.spin_hits += 1);
         return true;

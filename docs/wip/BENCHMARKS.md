@@ -441,3 +441,48 @@ was fixed the same day: `vfs_bench`'s size-independence check (ac-1.3) now allow
 measurements' own bootstrap-interval widths rather than the bare timer resolution, so a
 lucky-fast small-size sample under load no longer reads as per-file scaling; and `ipc_bench`'s
 parked round trip asserts at least one park per trip (a spurious futex wakeup can add one).
+
+## NFS transports (2026-09-26)
+
+One release-built daemon, mounted by the Linux kernel's own NFSv3 and NFSv4.2 clients with the same
+options, runs the same file calls. Each round alternates the transports, so a drift in the host's load
+falls on both (`xtask/src/conformance/bench.rs` states each phase). The Linux NFSv3 lane's slug is still
+`native-linux-fuse`, but it mounts `vers=3` (`xtask/src/conformance/slates.rs`).
+
+```
+docker run --rm --privileged -v slates-linux-target:/lt -e CARGO_TARGET_DIR=/lt -w /src -v $PWD:/src \
+  rust:1.98 bash -lc 'apt-get install -y sudo nfs-common procps &&
+  cargo xtask conformance bench --scratch /tmp/bench-scratch --rounds 5'
+```
+
+Hardware: Apple M5 Max host; Docker Desktop's Linux VM (18 CPUs, 62.7 GiB, kernel 6.12.76-linuxkit),
+with io_uring (a privileged container has no seccomp filter). The VM also runs the KIND lane's cluster:
+load average 10.27 at the start of the "after" run and 9.08 at its end, and about 9 during the "before"
+run. Times are milliseconds for the whole phase: 256 small files, or 32 MiB sequential. All five rounds
+are shown.
+
+"Before" is `2bf912e` with the v4 transfer-size fix in the working tree (without it the NFSv4.2
+`seq-write` fails with `EIO`), and neither runtime fix. "After" is A-39: the spin polls the driver, and
+the io_uring harvest never sleeps. The before rounds barely vary (±0.2 %) because each request carried
+a fixed sleep: the spin window, then an hrtimer wake per harvest.
+
+| transport | phase | before best | before rounds | after best | after rounds |
+|---|---|---|---|---|---|
+| NFSv3 | create | 1544.61 | 1547.02, 1544.61, 1546.17, 1544.77, 1544.83 | 212.19 | 214.66, 245.74, 227.37, 215.65, 212.19 |
+| NFSv3 | stat | 782.27 | 782.27, 785.13, 782.28, 784.50, 783.39 | 6.46 | 8.97, 9.34, 8.35, 6.46, 8.30 |
+| NFSv3 | read | 2329.23 | 2330.09, 2329.23, 2329.96, 2329.95, 2329.86 | 29.68 | 30.65, 30.91, 30.18, 30.04, 29.68 |
+| NFSv3 | unlink | 773.65 | 775.07, 774.00, 774.05, 774.02, 773.65 | 87.56 | 92.66, 101.61, 103.28, 87.76, 87.56 |
+| NFSv3 | seq-write | 418.28 | 418.68, 422.65, 423.23, 418.28, 419.23 | 65.70 | 65.70, 66.34, 67.10, 67.16, 66.03 |
+| NFSv3 | seq-read | 403.30 | 403.53, 404.07, 403.61, 403.36, 403.30 | 7.98 | 8.78, 9.00, 8.68, 7.98, 8.17 |
+| NFSv4.2 | create | 5413.93 | 5449.93, 5442.86, 5413.93, 5472.69, 5416.00 | 214.62 | 220.59, 214.62, 228.31, 220.83, 238.20 |
+| NFSv4.2 | stat | 1312.73 | 1312.73, 1313.02, 1312.90, 1313.01, 1313.05 | 10.93 | 11.18, 11.18, 11.03, 11.14, 10.93 |
+| NFSv4.2 | read | 5444.56 | 5445.73, 5444.56, 5445.45, 5445.19, 5445.05 | 47.27 | 48.60, 48.46, 47.27, 48.58, 53.66 |
+| NFSv4.2 | unlink | 773.75 | 774.04, 773.97, 774.03, 773.75, 773.96 | 82.19 | 90.17, 86.32, 87.50, 87.07, 82.19 |
+| NFSv4.2 | seq-write | 707.67 | 707.67, 710.73, 708.69, 710.08, 709.82 | 68.21 | 68.21, 70.28, 69.38, 68.39, 68.80 |
+| NFSv4.2 | seq-read | 425.54 | 426.11, 425.54, 426.33, 426.38, 425.60 | 12.49 | 12.75, 13.54, 14.32, 12.55, 12.49 |
+
+Per request after the fix: a stat (LOOKUP and GETATTR, the client's caches dropped first) is 25 µs over
+NFSv3 and 43 µs over NFSv4.2. NFSv4.2's `read` costs more than NFSv3's (47 against 30 ms) because each
+open and close is a stateful OPEN and CLOSE round trip that NFSv3 does not make. An in-process GETATTR
+through the kernel client measured 27 µs (epoll) and 999 µs (io_uring) after the spin fix alone. The
+io_uring gap was the harvest's sleep (`docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`).

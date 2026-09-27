@@ -62,11 +62,16 @@ fn session(sessions: &mut Sessions, name: &str) -> (u64, [u8; 16]) {
 }
 
 fn seq(sessionid: [u8; 16], slotid: u32, sequenceid: u32) -> Sequence {
+  /// Shape: a small request of one operation, inside any session's sizes.
+  const REQUEST_BYTES: usize = 128;
   Sequence {
     sessionid,
     sequenceid,
     slotid,
     highest_slotid: slotid,
+    request_bytes: REQUEST_BYTES,
+    operations: 1,
+    cache_this: false,
   }
 }
 
@@ -105,12 +110,12 @@ fn a_client_id_is_confirmed_by_its_first_session_and_the_channel_is_negotiated_d
 fn a_slot_runs_each_request_once_and_answers_its_retry_from_the_cache() {
   let mut sessions = Sessions::new(7, limits());
   let (clientid, sessionid) = session(&mut sessions, "host-a");
-  assert_eq!(
-    sessions.sequence(&seq(sessionid, 0, 1), 1).unwrap(),
-    Sequenced::New {
-      clientid,
-      highest_slotid: 3
-    }
+  assert!(
+    matches!(
+      sessions.sequence(&seq(sessionid, 0, 1), 1).unwrap(),
+      Sequenced::New { clientid: id, highest_slotid: 3, .. } if id == clientid
+    ),
+    "a new request"
   );
   sessions.store_reply(&sessionid, 0, b"reply one");
   assert_eq!(

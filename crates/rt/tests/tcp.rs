@@ -180,3 +180,64 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
   }
   rt.shutdown();
 }
+
+/// Shape: an idle spin window far longer than any round trip, so a reply that waited for the window to
+/// end is unmistakable (§4.3's 2-competitive spin runs for the idle window before a park).
+const LONG_SPIN_NS: u64 = 10_000_000_000;
+/// Shape: the reply's bound: a tenth of the spin window, so it cannot have waited the window out yet
+/// is thousands of loopback round trips on any host.
+const REPLY_WITHIN: Duration = Duration::from_millis(1_000);
+
+/// §4.3: a shard spinning in its idle window sees its driver's readiness, not only its rings: a request
+/// arriving on a socket while the shard spins is answered at once, not after the window ends and the
+/// shard parks. (The daemon keeps every shard with a client active, so each socket request had waited
+/// out up to one window — 1.3 ms in a container — per hop.)
+#[test]
+fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
+  let config = RuntimeConfig {
+    spin_ns: LONG_SPIN_NS,
+    ..config()
+  };
+  let rt = Runtime::start(&config).unwrap();
+  let id = rt.shard_ids()[0];
+  rt.set_active(id, true).unwrap();
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let addr = listener.local_addr().unwrap();
+  rt.spawn_on(id, async move {
+    if let Ok(stream) = listener.accept().await {
+      let mut buf = [0u8; 64];
+      while let Ok(n) = stream.read(&mut buf).await {
+        if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
+          break;
+        }
+      }
+    }
+  })
+  .unwrap();
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let outcome: Result<Duration, slates_rt::RtError> = async {
+      let stream = TcpStream::connect(addr).await?;
+      // The first exchange settles the connection; the timed one finds the server shard spinning.
+      let mut buf = [0u8; 64];
+      stream.write_all(REQUEST).await?;
+      stream.read(&mut buf).await?;
+      let started = std::time::Instant::now();
+      stream.write_all(REQUEST).await?;
+      stream.read(&mut buf).await?;
+      Ok(started.elapsed())
+    }
+    .await;
+    let _ = tx.send(outcome);
+  })
+  .unwrap();
+  let waited = rx
+    .recv_timeout(Duration::from_nanos(LONG_SPIN_NS * 3))
+    .expect("the exchange completed")
+    .expect("the exchange succeeded");
+  assert!(
+    waited < REPLY_WITHIN,
+    "the reply waited {waited:?}: a spinning shard must see socket readiness"
+  );
+  rt.shutdown();
+}

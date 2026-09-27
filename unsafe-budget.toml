@@ -60,6 +60,10 @@
 #   The long-poll attribution (`attribution.rs`, 2026-09-25, §4.3 A-31): Linux's per-thread voluntary
 #   context switches through `getrusage(RUSAGE_THREAD)` — rustix offers no `getrusage`, so one libc
 #   call over a zeroed `rusage` this frame owns (1, Linux only). The ceiling had the room (58 of 59).
+#   The io_uring non-blocking harvest (`uring.rs` `harvest_ready`, 2026-09-26, §4.3): one raw
+#   `io_uring_enter(GETEVENTS, min_complete = 0)` with no argument pointer — the crate's safe helpers set
+#   GETEVENTS only when waiting for a completion, and a zero-timeout wait for one slept the shard
+#   0.3–1.0 ms per harvest (docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md). 59 of 59.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one

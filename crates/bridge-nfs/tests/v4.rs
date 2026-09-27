@@ -196,8 +196,14 @@ struct Client {
 impl Client {
   fn call(service: &mut Export<'_>, server: &mut Server, args: &[u8]) -> Reply {
     decode_frame(
-      serve_compound(service, server, 0, NOW_NS.with(std::cell::Cell::get), args)
-        .expect("the compound completes in one poll"),
+      serve_compound(
+        service,
+        server,
+        0,
+        NOW_NS.with(std::cell::Cell::get),
+        (args, args.len()),
+      )
+      .expect("the compound completes in one poll"),
     )
   }
 
@@ -544,7 +550,7 @@ fn a_retried_request_gets_the_kept_reply_and_is_not_run_again() {
     &mut server,
     0,
     NOW_NS.with(std::cell::Cell::get),
-    args.as_slice(),
+    (args.as_slice(), args.len()),
   )
   .unwrap();
   assert_eq!(
@@ -560,7 +566,7 @@ fn a_retried_request_gets_the_kept_reply_and_is_not_run_again() {
     &mut server,
     0,
     NOW_NS.with(std::cell::Cell::get),
-    retry.as_slice(),
+    (retry.as_slice(), retry.len()),
   )
   .unwrap();
   assert_eq!(replayed, first, "the retry is answered from the slot cache");
@@ -2944,4 +2950,116 @@ fn times_past_2106_and_before_1970_round_trip() {
   let mtime = (values.i64().unwrap(), values.u32().unwrap());
   assert_eq!(atime, (EARLY, 250), "a time before 1970 reads back");
   assert_eq!(mtime, (LATE, 500), "a time past 2106 reads back");
+}
+
+/// RFC 8881 §2.10.6.4, §18.46.3 (A-39): the session's negotiated sizes are the contract. `maxread`
+/// and `maxwrite` are the transfer ceiling, and a WRITE of exactly that is served (the Linux client
+/// had been told 4 KiB more and every large write came back `NFS4ERR_INVAL`); a request past the
+/// negotiated request size is `NFS4ERR_REQ_TOO_BIG` and more operations than negotiated
+/// `NFS4ERR_TOO_MANY_OPS`, before the slot is used (the next sequence id still serves); a reply the
+/// client asked to be kept past the negotiated cache size is `NFS4ERR_REP_TOO_BIG_TO_CACHE` on the
+/// operation that would carry it there.
+#[test]
+fn the_sessions_negotiated_sizes_bound_requests_and_replies() {
+  /// Format: `FATTR4_MAXREAD`, `FATTR4_MAXWRITE`.
+  const MAXREAD: u32 = 30;
+  const MAXWRITE: u32 = 31;
+  /// Shape: the cache size this server offers: past a SEQUENCE and a PUTFH's result, short of a READ
+  /// of a page.
+  const CACHED: u32 = 512;
+  let transfer = slates_bridge_nfs::procedures::MAX_TRANSFER;
+  let size = transfer + COMPOUND_HEADER_BYTES;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::new(
+    7,
+    Limits {
+      max_clients: 4,
+      max_sessions_per_client: 1,
+      offer: ChannelAttrs {
+        header_pad: 0,
+        max_request: size,
+        max_response: size,
+        max_response_cached: CACHED,
+        max_operations: 8,
+        max_requests: 1,
+      },
+      lease_ns: u64::MAX,
+    },
+  );
+  let mut client = Client::connect(&mut service, &mut server, b"host-sizes");
+  let root = root_handle(&mut client, &mut service, &mut server);
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(&root);
+  args.u32(op::GETATTR);
+  Bitmap::of(&[MAXREAD, MAXWRITE]).encode(&mut args);
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  expect_ok(&mut body, op::GETATTR);
+  Bitmap::decode(&mut body).unwrap();
+  let mut values = XdrReader::new(body.opaque(64).unwrap());
+  let limits = (values.u64().unwrap(), values.u64().unwrap());
+  assert_eq!(
+    limits,
+    (u64::from(transfer), u64::from(transfer)),
+    "maxread and maxwrite are the transfer ceiling"
+  );
+
+  let owner = client.owner.clone();
+  let (stateid, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "sized",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap_or_else(|status| panic!("open: {status}"));
+  let write = |client: &mut Client, len: usize| {
+    let mut args = client.sequenced(2);
+    args.u32(op::PUTFH);
+    args.opaque(&fh);
+    args.u32(op::WRITE);
+    stateid.encode(&mut args);
+    args.u64(0);
+    args.u32(FILE_SYNC);
+    args.opaque(&vec![7u8; len]);
+    args
+  };
+  let args = write(&mut client, usize::try_from(transfer).unwrap());
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(reply.status, Nfsstat4::Ok.wire(), "a WRITE of maxwrite");
+
+  let args = write(&mut client, usize::try_from(size).unwrap());
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(
+    reply.status,
+    Nfsstat4::ReqTooBig.wire(),
+    "a request past the negotiated size"
+  );
+  // The refused request used no sequence id: the next one is the same number again.
+  client.sequence -= 1;
+  let mut args = client.sequenced(9);
+  for _ in 0..9 {
+    args.u32(op::PUTROOTFH);
+  }
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(
+    reply.status,
+    Nfsstat4::TooManyOps.wire(),
+    "more operations than negotiated"
+  );
+  client.sequence -= 1;
+
+  assert_eq!(
+    read(&mut client, &mut service, &mut server, &fh, stateid),
+    Err(Nfsstat4::RepTooBigToCache.wire()),
+    "a kept reply past the negotiated cache size"
+  );
 }

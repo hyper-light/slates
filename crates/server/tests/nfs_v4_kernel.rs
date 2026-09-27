@@ -415,6 +415,46 @@ fn explicit_times(file: &Path) {
   );
 }
 
+/// Shape: a sequential file of one-MiB writes: each past any one transfer, so the kernel client splits
+/// it into WRITEs of its negotiated size (the NFS bench found such writes refused `EINVAL`).
+const SEQUENTIAL_CHUNK: usize = 1 << 20;
+/// Shape: the sequential file's writes: 8 MiB, half the test volume's 16 MiB bound.
+const SEQUENTIAL_CHUNKS: usize = 8;
+
+/// Large sequential writes through the kernel client: one-MiB writes, `fsync`ed, read back byte for
+/// byte, as a build or a copy writes a file.
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn large_sequential_writes_round_trip(root: &Path) {
+  use std::io::{Read, Write};
+  let path = root.join("sequential");
+  let mut file = std::fs::File::create(&path).unwrap();
+  for index in 0..SEQUENTIAL_CHUNKS {
+    let chunk = vec![u8::try_from(index % 251).unwrap(); SEQUENTIAL_CHUNK];
+    file
+      .write_all(&chunk)
+      .unwrap_or_else(|error| panic!("write {index}: {error}"));
+  }
+  file.sync_all().expect("fsync of the sequential file");
+  drop(file);
+  let mut read = Vec::new();
+  std::fs::File::open(&path)
+    .unwrap()
+    .read_to_end(&mut read)
+    .unwrap();
+  assert_eq!(
+    read.len(),
+    SEQUENTIAL_CHUNK * SEQUENTIAL_CHUNKS,
+    "the whole file"
+  );
+  for (index, chunk) in read.chunks(SEQUENTIAL_CHUNK).enumerate() {
+    assert!(
+      chunk.iter().all(|byte| usize::from(*byte) == index % 251),
+      "chunk {index} read back"
+    );
+  }
+  std::fs::remove_file(&path).unwrap();
+}
+
 /// `chown` of a file or a directory through the kernel client: the owner and group set are the ones
 /// read back, for ids with a
 /// passwd entry (root) and without, and the server never refuses an owner (a refused owner turns the
@@ -562,6 +602,7 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
     {
       let mounted = kernel_mount(&source, port, minor);
       exercise(&mounted.path, &payload);
+      large_sequential_writes_round_trip(&mounted.path);
       #[cfg(target_os = "linux")]
       if minor == 2 {
         sparse_seek_and_copy(&mounted.path);

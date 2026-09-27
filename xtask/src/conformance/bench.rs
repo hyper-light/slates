@@ -107,21 +107,21 @@ fn one_round(
     .collect();
   let payload = vec![0xA5u8; SMALL_BYTES];
   let mut measured = Vec::with_capacity(PHASES.len());
-  measured.push(timed(|| {
+  measured.push(timed((transport, "create"), || {
     for path in &names {
       std::fs::File::create(path)?.write_all(&payload)?;
     }
     Ok(())
   })?);
   drop_caches()?;
-  measured.push(timed(|| {
+  measured.push(timed((transport, "stat"), || {
     for path in &names {
       std::fs::metadata(path)?;
     }
     Ok(())
   })?);
   drop_caches()?;
-  measured.push(timed(|| {
+  measured.push(timed((transport, "read"), || {
     let mut buffer = Vec::with_capacity(SMALL_BYTES);
     for path in &names {
       buffer.clear();
@@ -129,7 +129,7 @@ fn one_round(
     }
     Ok(())
   })?);
-  measured.push(timed(|| {
+  measured.push(timed((transport, "unlink"), || {
     for path in &names {
       std::fs::remove_file(path)?;
     }
@@ -137,7 +137,7 @@ fn one_round(
   })?);
   let sequential = dir.join("sequential");
   let chunk = vec![0x5Au8; SEQ_CHUNK];
-  measured.push(timed(|| {
+  measured.push(timed((transport, "seq-write"), || {
     let mut file = std::fs::File::create(&sequential)?;
     for _ in 0..SEQ_CHUNKS {
       file.write_all(&chunk)?;
@@ -145,7 +145,7 @@ fn one_round(
     file.sync_all()
   })?);
   drop_caches()?;
-  measured.push(timed(|| {
+  measured.push(timed((transport, "seq-read"), || {
     let mut buffer = vec![0u8; SEQ_CHUNK];
     let mut file = std::fs::File::open(&sequential)?;
     while file.read(&mut buffer)? != 0 {}
@@ -156,9 +156,12 @@ fn one_round(
 }
 
 /// How long `phase` took, or its I/O failure as the bench's.
-fn timed(phase: impl FnOnce() -> std::io::Result<()>) -> Result<Duration, Failure> {
+fn timed(
+  (transport, name): (Transport, &str),
+  phase: impl FnOnce() -> std::io::Result<()>,
+) -> Result<Duration, Failure> {
   let started = Instant::now();
-  phase().map_err(|e| Failure(format!("a bench phase failed: {e}")))?;
+  phase().map_err(|e| Failure(format!("bench {} {name}: {e}", transport.slug())))?;
   Ok(started.elapsed())
 }
 

@@ -96,10 +96,10 @@ pub fn serve_compound(
   server: &mut Server,
   principal: u32,
   now_ns: u64,
-  args: &[u8],
+  (args, request_bytes): (&[u8], usize),
 ) -> Option<Vec<u8>> {
   let mut backend = ServiceBackend::new(service, server, principal, now_ns);
-  let future = compound::serve(&mut backend, args);
+  let future = compound::serve(&mut backend, args, request_bytes);
   let mut future = std::pin::pin!(future);
   match future
     .as_mut()

@@ -99,6 +99,24 @@ pub struct Sequence {
   pub slotid: u32,
   /// The highest slot the client is using.
   pub highest_slotid: u32,
+  /// The whole request's encoded size, its RPC headers included (not its record marker), which the
+  /// session's `ca_maxrequestsize` bounds (RFC 8881 §18.36.3).
+  pub request_bytes: usize,
+  /// The compound's operation count, which `ca_maxoperations` bounds.
+  pub operations: u32,
+  /// Whether the client asks for the reply to be kept for a retry (`sa_cachethis`).
+  pub cache_this: bool,
+}
+
+/// The sizes a new request's reply must keep to (RFC 8881 §2.10.6.4): the session's
+/// `ca_maxresponsesize`, and — when the client asked for the reply to be kept — its
+/// `ca_maxresponsesize_cached`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplyLimits {
+  /// The most bytes a reply may take, its RPC header included.
+  pub max_response: usize,
+  /// The most bytes a reply the client asked to be kept may take; `None` when it did not ask.
+  pub max_cached: Option<usize>,
 }
 
 /// How a `SEQUENCE` is to proceed.
@@ -111,6 +129,8 @@ pub enum Sequenced {
     clientid: u64,
     /// The session's highest slot id.
     highest_slotid: u32,
+    /// The sizes the reply must keep to.
+    limits: ReplyLimits,
   },
   /// A retry of the last request on this slot: the cached reply, to send back as it is.
   Replay(Vec<u8>),
@@ -404,6 +424,21 @@ impl Sessions {
       .sessions
       .get_mut(&args.sessionid)
       .ok_or(Nfsstat4::Badsession)?;
+    // The negotiated sizes bound the request before its slot is touched, so a refused request consumes
+    // no sequence id and the client resends a smaller one (RFC 8881 §2.10.6.4, §18.46.3).
+    let max_request = usize::try_from(session.fore.max_request).unwrap_or(usize::MAX);
+    if args.request_bytes > max_request {
+      return Err(Nfsstat4::ReqTooBig);
+    }
+    if args.operations > session.fore.max_operations {
+      return Err(Nfsstat4::TooManyOps);
+    }
+    let limits = ReplyLimits {
+      max_response: usize::try_from(session.fore.max_response).unwrap_or(usize::MAX),
+      max_cached: args
+        .cache_this
+        .then(|| usize::try_from(session.fore.max_response_cached).unwrap_or(usize::MAX)),
+    };
     let highest = u32::try_from(session.slots.len().saturating_sub(1)).unwrap_or(0);
     let slot = usize::try_from(args.slotid)
       .ok()
@@ -437,6 +472,7 @@ impl Sessions {
     Ok(Sequenced::New {
       clientid,
       highest_slotid: highest,
+      limits,
     })
   }
 

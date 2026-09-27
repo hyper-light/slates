@@ -79,6 +79,11 @@ impl XdrWriter {
     &self.out
   }
 
+  /// Drops everything written past the first `len` bytes (a result that would not fit its reply).
+  pub fn truncate(&mut self, len: usize) {
+    self.out.truncate(len);
+  }
+
   /// The number of bytes written so far.
   pub fn len(&self) -> usize {
     self.out.len()

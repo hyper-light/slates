@@ -383,4 +383,67 @@ mod tests {
     drop(driver);
     drop(registration);
   }
+
+  /// Shape: zero-timeout harvests the test makes with nothing ready — enough that a harvest which
+  /// sleeps shows up as that many voluntary switches, far past any stray block of the test thread.
+  #[cfg(unix)]
+  const IDLE_HARVESTS: u64 = 256;
+
+  /// Format: the user word the test's readiness registration carries.
+  #[cfg(unix)]
+  const PIPE_TAG: u64 = 0x5EAD;
+
+  /// §4.3 (a spinning shard polls the driver without blocking): a zero-timeout wait — the harvest a
+  /// spinning or busy shard makes between tasks — delivers a readiness that is already there on its
+  /// first call and never puts the thread to sleep. io_uring asked for one completion with a zero
+  /// timeout, which sends the kernel down its sleeping path (arm a timer, schedule out, wake on
+  /// expiry): 0.3–1.0 ms per harvest on a loaded Linux VM, a millisecond on every NFS request
+  /// (`docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`). The sleep is observed as the
+  /// thread's voluntary context switches, where the OS counts them per thread (Linux).
+  #[test]
+  #[cfg(unix)]
+  #[cfg_attr(miri, ignore)]
+  fn a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps() {
+    let prepared = os_driver(64).unwrap();
+    let (shard, _control) =
+      crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let registration = RegisteredDriverSlot(shard);
+    let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
+    let mut driver = (prepared.seed)(kick).unwrap();
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    driver
+      .register_readable(std::os::fd::AsRawFd::as_raw_fd(&reader), PIPE_TAG)
+      .unwrap();
+    rustix::io::write(&writer, &[1]).unwrap();
+    let mut out = Vec::new();
+    driver.wait(Some(0), &mut out).unwrap();
+    assert!(
+      out
+        .iter()
+        .any(|completion| completion.user_data == PIPE_TAG),
+      "{}: a readiness already there was not delivered by one zero-timeout wait: {out:?}",
+      driver.kind().name()
+    );
+    out.clear();
+    let before = crate::attribution::voluntary_switches_now();
+    for _ in 0..IDLE_HARVESTS {
+      driver.wait(Some(0), &mut out).unwrap();
+    }
+    let after = crate::attribution::voluntary_switches_now();
+    match before.zip(after) {
+      Some((before, after)) => assert_eq!(
+        after - before,
+        0,
+        "{}: {IDLE_HARVESTS} zero-timeout waits blocked the thread {} times",
+        driver.kind().name(),
+        after - before
+      ),
+      None => eprintln!(
+        "SKIP (loud): {} — this OS counts no per-thread voluntary switches; delivery was checked",
+        driver.kind().name()
+      ),
+    }
+    drop(driver);
+    drop(registration);
+  }
 }

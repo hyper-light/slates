@@ -28,6 +28,12 @@ const POLL_READABLE: u32 = libc::POLLIN as u32;
 /// that has completed (`POLLOUT`).
 const POLL_WRITABLE: u32 = libc::POLLOUT as u32;
 
+/// Format: `IORING_ENTER_GETEVENTS`, the `io_uring_enter` flag that reaps completions (and, under
+/// `DEFER_TASKRUN`, runs the ring's deferred task work) — `1U << 0` in the kernel's
+/// `include/uapi/linux/io_uring.h` [B: io_uring_enter(2)]. The io-uring crate keeps its copy private
+/// and libc carries none.
+const ENTER_GETEVENTS: u32 = 1 << 0;
+
 /// The driver.
 pub struct UringDriver {
   ring: IoUring,
@@ -235,6 +241,28 @@ impl UringDriver {
     }
   }
 
+  /// Submits what is queued and posts every completion already due, without waiting: an
+  /// `io_uring_enter` with `GETEVENTS` and `min_complete = 0` (liburing's `io_uring_get_events`).
+  /// Under `DEFER_TASKRUN` a ready poll is task work the kernel runs only inside such an enter, so
+  /// this is how a spinning or busy shard sees a socket become ready. Asking for one completion
+  /// with a zero timeout instead sends the kernel down its sleeping path — it arms a timer,
+  /// schedules the thread out and wakes it on expiry — which cost 0.3–1.0 ms per harvest on a
+  /// loaded Linux VM and put that on every NFS request
+  /// (`docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`). The crate's helpers set
+  /// `GETEVENTS` only when waiting for at least one completion, hence the raw enter.
+  fn harvest_ready(&mut self) -> std::io::Result<usize> {
+    let queued = u32::try_from(self.ring.submission().len()).unwrap_or(u32::MAX);
+    // SAFETY: no argument pointer is passed (`None`, so the size is ignored by the kernel without
+    // `EXT_ARG`); every queued entry is a buffer-free poll or no-op built by this module (the
+    // `submit_entry` invariant), so submitting them borrows no userspace memory.
+    unsafe {
+      self
+        .ring
+        .submitter()
+        .enter::<libc::sigset_t>(queued, 0, ENTER_GETEVENTS, None)
+    }
+  }
+
   fn drain_kick(&self) {
     let mut word = [0u8; size_of::<u64>()];
     let _ = self.efd.with(|efd| rustix::io::read(efd, &mut word));
@@ -266,6 +294,7 @@ impl Driver for UringDriver {
 
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
     let outcome = match timeout_ns {
+      Some(0) => self.harvest_ready(),
       Some(ns) => {
         let ts = Timespec::new()
           .nsec(u32::try_from(ns % NANOS_PER_SECOND).unwrap_or(0))

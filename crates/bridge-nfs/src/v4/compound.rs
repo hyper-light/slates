@@ -18,9 +18,12 @@ use std::future::Future;
 use super::Nfsstat4;
 use super::attr::{self, FsFigures};
 use super::files::{LockRequest, share};
-use super::session::{CreateSession, ExchangeId, Limits, Sequence, Sequenced, Sessions};
+use super::session::{
+  CreateSession, ExchangeId, Limits, ReplyLimits, Sequence, Sequenced, Sessions,
+};
 use super::types::{
-  Bitmap, ChannelAttrs, FHSIZE, OPAQUE_LIMIT, SessionId, Stateid, VERIFIER_SIZE, decode_sessionid,
+  BITMAP_WORDS_MAX, Bitmap, ChannelAttrs, FHSIZE, OPAQUE_LIMIT, SESSIONID_SIZE, SessionId, Stateid,
+  VERIFIER_SIZE, decode_sessionid,
 };
 use super::v3call::{self, Sattr3};
 use super::{MINOR_HIGHEST, MINOR_LOWEST};
@@ -213,11 +216,45 @@ const ENTRY_FIXED: u32 = 4 + 8 + 4 + 4 + 4;
 /// Format: `settime4` `SET_TO_CLIENT_TIME4`.
 const SET_TO_CLIENT_TIME4: u32 = 1;
 
-/// Format: the bytes one compound's frame and operations may add to a READ or WRITE of the transfer
-/// ceiling: the tag, the minor version and count, and a handful of operations each carrying at most a
-/// v4 file handle (`NFS4_FHSIZE`) and its fixed fields; a compound that needs more is refused
-/// `NFS4ERR_REQ_TOO_BIG` by the size, never read past.
-pub const COMPOUND_HEADER_BYTES: u32 = 4 * 1024;
+/// Derived: the bytes a READ or WRITE compound adds to its transfer, RPC headers included — the most a
+/// request of the transfer ceiling needs beyond its data, so a session sized `MAX_TRANSFER` plus this
+/// carries every such request (RFC 8881 §18.36.3: the sizes count the RPC headers). The sum of:
+/// - the RPC call header at its largest: six words, then a credential and a verifier each of a flavor,
+///   a length and at most `MAX_AUTH_BYTES` (400, RFC 5531 §8.2);
+/// - the compound's frame: its tag (a length and at most [`OPAQUE_LIMIT`] bytes), minor version and
+///   operation count;
+/// - SEQUENCE (session id and four words), PUTFH (the largest v4 handle, [`FHSIZE`]), a WRITE's fixed
+///   fields (state id, offset, stability, data length), and a GETATTR of every bitmap word
+///   ([`BITMAP_WORDS_MAX`]), each after its operation number.
+///
+/// A READ or WRITE reply's fixed fields (the RPC reply header, the frame, SEQUENCE's, PUTFH's and
+/// READ's results) are fewer. A compound needing more is refused `NFS4ERR_REQ_TOO_BIG`.
+pub const COMPOUND_HEADER_BYTES: u32 = derived_compound_header_bytes();
+
+/// The sum stated on [`COMPOUND_HEADER_BYTES`].
+const fn derived_compound_header_bytes() -> u32 {
+  /// Format: an XDR word.
+  const WORD: usize = 4;
+  /// Format: `MAX_AUTH_BYTES` (RFC 5531 §8.2), the most a credential or verifier body holds.
+  const MAX_AUTH_BYTES: usize = 400;
+  /// Format: the RPC call header's fixed words: xid, message type, RPC version, program, version,
+  /// procedure.
+  const CALL_WORDS: usize = 6;
+  /// Format: a state id: a sequence word and twelve bytes.
+  const STATEID: usize = WORD + 12;
+  let rpc = CALL_WORDS * WORD + 2 * (2 * WORD + MAX_AUTH_BYTES);
+  let frame = WORD + OPAQUE_LIMIT + 2 * WORD;
+  let sequence = WORD + SESSIONID_SIZE + 4 * WORD;
+  let putfh = WORD + WORD + FHSIZE;
+  let write = WORD + STATEID + 2 * WORD + 2 * WORD;
+  let getattr = WORD + WORD + BITMAP_WORDS_MAX * WORD;
+  let total = rpc + frame + sequence + putfh + write + getattr;
+  // `u32::try_from` is not const: narrow, and fail the build if the round trip loses anything.
+  #[allow(clippy::cast_possible_truncation)]
+  let narrowed = total as u32;
+  assert!(narrowed as usize == total, "the compound header fits a u32");
+  narrowed
+}
 /// Format: the smallest encoded operation: its four-byte number and a four-byte argument.
 pub const MIN_OPERATION_BYTES: u32 = 8;
 
@@ -316,7 +353,7 @@ pub(super) type Outcome = Result<Vec<u8>, Nfsstat4>;
 
 /// Serves one `COMPOUND` call's arguments against `server` and `backend`, returning its encoded
 /// `COMPOUND4res`.
-pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
+pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usize) -> Vec<u8> {
   let mut reader = XdrReader::new(args);
   let Ok(tag) = reader.opaque(OPAQUE_LIMIT).map(<[u8]>::to_vec) else {
     return reply(Nfsstat4::Badxdr, &[], 0, &[]);
@@ -348,6 +385,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
   let mut done = 0u32;
   let mut last = Nfsstat4::Ok;
   let mut slot: Option<(SessionId, u32)> = None;
+  let mut limits: Option<ReplyLimits> = None;
   for index in 0..count {
     let Ok(opnum) = reader.u32() else {
       last = Nfsstat4::Badxdr;
@@ -356,15 +394,17 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
     let opnum = defined_in(minor, opnum);
     let outcome = if index == 0 {
       if opnum == op::SEQUENCE {
-        match sequence(backend, &mut reader) {
+        match sequence(backend, &mut reader, (request_bytes, count)) {
           Ok(SequenceOutcome::Replay(kept)) => return kept,
           Ok(SequenceOutcome::New {
             body,
             sessionid,
             slotid,
             clientid,
+            limits: reply_limits,
           }) => {
             slot = Some((sessionid, slotid));
+            limits = Some(reply_limits);
             frame.clientid = Some(clientid);
             Ok(body)
           }
@@ -377,7 +417,19 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
       later_operation(backend, opnum, &mut reader, &mut frame).await
     };
     done += 1;
-    if let Err(status) = record(&mut results, opnum, outcome, &mut frame) {
+    let before = results.len();
+    let recorded = record(&mut results, opnum, outcome, &mut frame);
+    // The result that would carry the reply past the session's sizes is replaced by the refusal that
+    // says so, and the compound ends there (RFC 8881 §2.10.6.4).
+    if let Some(too_big) =
+      limits.and_then(|limits| oversize(limits, reply_bytes_so_far(&tag, results.len())))
+    {
+      results.truncate(before);
+      let _ = record(&mut results, opnum, Err(too_big), &mut frame);
+      last = too_big;
+      break;
+    }
+    if let Err(status) = recorded {
       last = status;
       break;
     }
@@ -659,27 +711,55 @@ enum SequenceOutcome {
     sessionid: SessionId,
     slotid: u32,
     clientid: u64,
+    limits: ReplyLimits,
   },
   /// A retry: the kept reply, to send as it is.
   Replay(Vec<u8>),
 }
 
-/// `SEQUENCE` (§18.46).
+/// The size a compound reply with `results_len` bytes of results takes on the wire, its RPC reply
+/// header included: what the session's response sizes bound.
+fn reply_bytes_so_far(tag: &[u8], results_len: usize) -> usize {
+  /// Format: an XDR word.
+  const WORD: usize = 4;
+  let rpc = crate::rpc::reply_bytes(0, crate::rpc::AcceptStatus::Success, &[]).len();
+  let tag_padded = tag.len().div_ceil(WORD) * WORD;
+  rpc + WORD + WORD + tag_padded + WORD + results_len
+}
+
+/// The refusal a reply of `size` bytes earns under `limits`: past the response size,
+/// `NFS4ERR_REP_TOO_BIG`; within it but past the cache size the client asked to be kept to,
+/// `NFS4ERR_REP_TOO_BIG_TO_CACHE`.
+fn oversize(limits: ReplyLimits, size: usize) -> Option<Nfsstat4> {
+  if size > limits.max_response {
+    Some(Nfsstat4::RepTooBig)
+  } else if limits.max_cached.is_some_and(|cached| size > cached) {
+    Some(Nfsstat4::RepTooBigToCache)
+  } else {
+    None
+  }
+}
+
+/// `SEQUENCE` (§18.46), for a request of `request_bytes` carrying `operations` operations.
 fn sequence<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
+  (request_bytes, operations): (usize, u32),
 ) -> Result<SequenceOutcome, Nfsstat4> {
   let bad = |_| Nfsstat4::Badxdr;
   let sessionid = decode_sessionid(reader).map_err(bad)?;
   let sequenceid = reader.u32().map_err(bad)?;
   let slotid = reader.u32().map_err(bad)?;
   let highest_slotid = reader.u32().map_err(bad)?;
-  let _cachethis = reader.bool().map_err(bad)?;
+  let cache_this = reader.bool().map_err(bad)?;
   let args = Sequence {
     sessionid,
     sequenceid,
     slotid,
     highest_slotid,
+    request_bytes,
+    operations,
+    cache_this,
   };
   let now = backend.now_ns();
   match backend.with_v4(|server| server.sessions.sequence(&args, now))?? {
@@ -687,6 +767,7 @@ fn sequence<B: Backend>(
     Sequenced::New {
       clientid,
       highest_slotid: table_highest,
+      limits,
     } => {
       let mut body = XdrWriter::new();
       body.fixed(&sessionid);
@@ -700,6 +781,7 @@ fn sequence<B: Backend>(
         sessionid,
         slotid,
         clientid,
+        limits,
       })
     }
   }
@@ -1368,7 +1450,9 @@ async fn figures<B: Backend>(
     max_file_size: u64::MAX,
     max_link: u32::MAX,
     max_name: u32::try_from(slates_vfs::names::NAME_MAX).unwrap_or(u32::MAX),
-    max_io: u64::from(limits.offer.max_response),
+    // The v3 layer's transfer ceiling: what a READ or WRITE carries (the session is sized to hold one
+    // with its compound's overhead).
+    max_io: u64::from(crate::procedures::MAX_TRANSFER),
     ..FsFigures::default()
   };
   if attr::needs_fs_figures(requested) {

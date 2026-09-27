@@ -1068,14 +1068,15 @@ async fn serve_v3(
 
 /// One NFSv4 call (§4.6 A-35): `NULL`, or a `COMPOUND` served by the v4 front end over this shard's v4
 /// state, each of its operations becoming an NFSv3 call through [`serve_v3`].
-async fn reply_v4(
-  this: u16,
-  xid: u32,
-  requester: Requester,
-  procedure: u32,
-  args: Vec<u8>,
-  port: u16,
-) -> Vec<u8> {
+async fn reply_v4(this: u16, call: Call, port: u16) -> Vec<u8> {
+  let Call {
+    xid,
+    requester,
+    procedure,
+    args,
+    request_bytes,
+    ..
+  } = call;
   match procedure {
     NFSPROC4_NULL => reply_bytes(xid, AcceptStatus::Success, &[]),
     NFSPROC4_COMPOUND => {
@@ -1091,7 +1092,7 @@ async fn reply_v4(
         requester,
         port,
       };
-      let results = compound::serve(&mut backend, &args).await;
+      let results = compound::serve(&mut backend, &args, request_bytes).await;
       reply_bytes(xid, AcceptStatus::Success, &results)
     }
     _ => reply_bytes(xid, AcceptStatus::ProcUnavail, &[]),
@@ -1255,6 +1256,9 @@ struct Call {
   version: u32,
   procedure: u32,
   args: Vec<u8>,
+  /// The whole call's encoded size, its RPC headers included (not its record marker): what an NFSv4
+  /// session's request size bounds (RFC 8881 §18.36.3).
+  request_bytes: usize,
 }
 
 impl Call {
@@ -1268,6 +1272,7 @@ impl Call {
         version: call.version,
         procedure: call.procedure,
         args: args.rest().to_vec(),
+        request_bytes: body.len(),
       },
       Err(_) => Call {
         xid: 0,
@@ -1276,6 +1281,7 @@ impl Call {
         version: 0,
         procedure: 0,
         args: Vec::new(),
+        request_bytes: body.len(),
       },
     }
   }
@@ -1289,15 +1295,7 @@ impl Call {
 /// requests — on this connection or any other — self-authorize through the handles the mount returned.
 async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
   if call.program == NFS_PROGRAM && call.version == NFS_V4 {
-    return reply_v4(
-      this,
-      call.xid,
-      call.requester,
-      call.procedure,
-      call.args,
-      port,
-    )
-    .await;
+    return reply_v4(this, call, port).await;
   }
   // The extension procedures (A-35) are the v4 front end's, never the wire's.
   if call.program == NFS_PROGRAM

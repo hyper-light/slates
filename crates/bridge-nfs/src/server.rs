@@ -124,7 +124,13 @@ fn dispatch(
   match parse_call(body) {
     Ok((call, mut args)) if call.program == NFS_PROGRAM && call.version == crate::v4::NFS_V4 => {
       let principal = crate::rpc::auth_sys_uid(body).unwrap_or(0);
-      let (status, results) = serve_v4(service, v4, principal, call.procedure, &mut args);
+      let (status, results) = serve_v4(
+        service,
+        v4,
+        (principal, body.len()),
+        call.procedure,
+        &mut args,
+      );
       reply_bytes(call.xid, status, &results)
     }
     // The extension procedures (A-35) are the v4 front end's, never the wire's.
@@ -150,11 +156,13 @@ fn dispatch(
   }
 }
 
-/// Serves one NFSv4 call over a synchronous service (A-35): `NULL`, or a `COMPOUND` against the v4 state.
+/// Serves one NFSv4 call over a synchronous service (A-35): `NULL`, or a `COMPOUND` against the v4 state,
+/// from `principal` in a call of `request_bytes` (its RPC headers included, which the session's
+/// request size bounds).
 pub fn serve_v4(
   service: &mut dyn NfsService,
   v4: &mut crate::v4::compound::Server,
-  principal: u32,
+  (principal, request_bytes): (u32, usize),
   procedure: u32,
   args: &mut XdrReader<'_>,
 ) -> (AcceptStatus, Vec<u8>) {
@@ -162,7 +170,13 @@ pub fn serve_v4(
     crate::v4::NFSPROC4_NULL => (AcceptStatus::Success, Vec::new()),
     crate::v4::NFSPROC4_COMPOUND => {
       let now_ns = crate::v4::backend::monotonic_ns();
-      match crate::v4::backend::serve_compound(service, v4, principal, now_ns, args.rest()) {
+      match crate::v4::backend::serve_compound(
+        service,
+        v4,
+        principal,
+        now_ns,
+        (args.rest(), request_bytes),
+      ) {
         Some(reply) => (AcceptStatus::Success, reply),
         None => (AcceptStatus::SystemErr, Vec::new()),
       }

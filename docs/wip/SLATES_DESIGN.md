@@ -1013,7 +1013,10 @@ packets) into the run queue; drain inbound rings (client command rings, cross-sh
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
 run ready tasks to their next await; expire timers; store the loop generation (QSBR); if nothing
 is ready, spin for the idle-spin window (while any client is active) — a multiple of the shard's
-wake estimate — then park in the driver. Cancellation: dropping a future releases nothing it did not own (resources live in arenas
+wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
+readiness is known only to the driver, so the spin polls it without blocking; A-39), then park in
+the driver. Every non-blocking harvest is one that never sleeps: on io_uring that is `io_uring_enter`
+with `GETEVENTS` and `min_complete = 0`, which runs the deferred task work and returns (A-39). Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
 completion.
@@ -1672,7 +1675,11 @@ therefore one implementation shared by both versions.
   answers a retried request with its kept reply byte for byte and never runs it twice. Every table is
   bounded, with a refusal RFC 8881 §15.2 allows the operation at its bound: `NFS4ERR_DELAY` for a full
   client table (a lapsed client frees room), `NFS4ERR_NOSPC` for a client's sessions and for opens,
-  `NFS4ERR_DELAY` for locks, `NFS4ERR_TOO_MANY_OPS` and `NFS4ERR_REQ_TOO_BIG` for a compound.
+  `NFS4ERR_DELAY` for locks, `NFS4ERR_TOO_MANY_OPS` and `NFS4ERR_REQ_TOO_BIG` for a compound (checked
+  by SEQUENCE before the slot is used), `NFS4ERR_REP_TOO_BIG` and `NFS4ERR_REP_TOO_BIG_TO_CACHE` for a
+  reply past the negotiated sizes (A-39). `maxread`/`maxwrite` are `MAX_TRANSFER`, the ceiling the v3
+  layer holds; the session's request size adds `COMPOUND_HEADER_BYTES`, derived from the largest RPC
+  header and transfer compound.
   `NFS4ERR_RESOURCE` is never returned: it is not valid in NFSv4.1 (RFC 7863). Leases expire lazily (a courteous server, §8.3): a lapsed client keeps its
   state until the client table is full, when every lapsed client makes room first.
 - **State belongs to the listener, not the connection.** A v4 client reconnects and continues its
@@ -6291,3 +6298,42 @@ READ_PLUS and COPY under their state ids, READDIR's routed fill and per-filesyst
 `@<capability>` scoped root, VERIFY/NVERIFY/SECINFO/BACKCHANNEL_CTL/SET_SSV); `slates-server` (the
 requester's dialect); the tests named above and the kernel test's exclusive create and truncating
 opens as non-root processes; GAPS and TBD_FIXES.
+
+### A-39 — The session's sizes are held, and an idle shard sees its sockets without sleeping (2026-09-26)
+
+Measuring the NFS transports side by side (`cargo xtask conformance bench`, `docs/wip/BENCHMARKS.md`
+"NFS transports") found three defects, one in the NFSv4 contract and two in the runtime under it.
+
+- **The v4 session advertised sizes it did not hold** (§4.6). `maxread`/`maxwrite` were 4 KiB over the
+  v3 layer's `MAX_TRANSFER`, so every full-size WRITE from the Linux client was `NFS4ERR_INVAL`. §4.6's
+  `NFS4ERR_REQ_TOO_BIG`/`NFS4ERR_TOO_MANY_OPS` were never checked, and no reply was held to
+  `ca_maxresponsesize` or `ca_maxresponsesize_cached`. Now the transfer ceiling is `MAX_TRANSFER`, the
+  header allowance is derived (2,124 bytes), and SEQUENCE and the compound enforce all four refusals
+  where RFC 8881 §2.10.6.4 places them (`docs/bugs/2026-09-26-nfsv4-sessions-advertised-sizes-they-did-not-hold.md`).
+- **A spinning shard was blind to socket readiness** (§4.3 "Loop"). The idle spin asked the rings,
+  pollers and timers, never the driver, so a request arriving on a socket during the spin waited until
+  the window ended and the shard parked. Each NFS hop paid up to one window (1.3 ms in a container).
+  The spin now harvests the driver without blocking on each turn
+  (`docs/bugs/2026-09-26-a-spinning-shard-was-blind-to-socket-readiness.md`).
+- **The io_uring zero-timeout harvest slept** (§4.3 "Drivers"). `wait(Some(0))` asked the kernel for one
+  completion with a zero timeout, which arms a timer and schedules the thread out: 0.3–1.0 ms per
+  harvest on a loaded Linux VM, once or twice per request. It is now `io_uring_enter(GETEVENTS,
+  min_complete = 0)`, which under `DEFER_TASKRUN` runs the deferred task work and returns
+  (`docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`).
+
+Evidence (by use): `crates/bridge-nfs/tests/v4.rs` `the_sessions_negotiated_sizes_bound_requests_and_replies`;
+`crates/server/tests/nfs_v4_kernel.rs` `large_sequential_writes_round_trip` (8 × 1 MiB, `fsync`, read back,
+through the kernel's v4.1 and v4.2 clients; `EIO` before); `crates/rt/tests/tcp.rs`
+`a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window` (timed out before);
+`crates/rt/src/driver.rs` `a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps` (257 voluntary
+switches in 256 harvests before, 0 after, io_uring). The NFS bench on io_uring (Docker Desktop Linux VM
+on an Apple M5 Max, 2026-09-26), best of five: NFSv3 stat of 256 files 782 → 6.5 ms and read
+2,329 → 29.7 ms; NFSv4.2 stat 1,313 → 10.9 ms and read 5,445 → 47.3 ms.
+
+Applied in the same change to: §4.3 "Loop"; §4.6 (the front end's sessions); `slates-bridge-nfs`
+(`COMPOUND_HEADER_BYTES`, `max_io`, `Sequence`'s request size, operation count and `cache_this`,
+`ReplyLimits`, the compound's reply truncation, `XdrWriter::truncate`, `serve_compound` and `serve_v4`
+taking the call's length); `slates-server` (the call's length reaches the compound); `slates-rt`
+(`Shard::spin_for_work` and `harvest_io`, `UringDriver::harvest_ready`); `unsafe-budget.toml`;
+`xtask conformance bench` (errors name the transport and phase); `docs/wip/BENCHMARKS.md`; GAPS and
+TBD_FIXES.
