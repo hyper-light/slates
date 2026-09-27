@@ -150,6 +150,10 @@ authorized merely by appearing here.
 - [x] **The io_uring zero-timeout harvest slept** (A-39): 0.3–1.0 ms per harvest, once or twice per NFS
   request; the NFS bench's stat phase went 782 → 6.5 ms (v3) and 1,313 → 10.9 ms (v4.2). See
   `docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`.
+- [x] **CI 36296710241: the kernel NFSv4 test assumed a root caller** (`chown 65533:65532: EPERM` as the
+  runner's `runner` user; the privileged dev container ran as root). The server was right; the test's
+  root-only steps now go through `privileged` as `mount` did, and the device refusal is now the
+  server's, not the local `CAP_MKNOD` check. See `docs/bugs/2026-09-26-the-kernel-v4-test-assumed-a-root-caller.md`.
 - [ ] **Rename the Linux NFSv3 conformance lane's slug** (`native-linux-fuse` mounts `vers=3`, found
   2026-09-26 reading the bench): the records, the expected-failure list and the matrix carry the old
   name. Rename them together so no record is orphaned.

@@ -61,6 +61,37 @@ fn privileged(program: &str) -> Command {
   }
 }
 
+/// `program` as root (through [`privileged`]) with its real and effective ids dropped to `uid`/`gid`
+/// and no supplementary groups: a real non-root process, whatever this test runs as.
+#[cfg(target_os = "linux")]
+fn as_ids(uid: u32, gid: u32, program: &str) -> Command {
+  let mut command = privileged("setpriv");
+  command.args([
+    "--reuid",
+    &uid.to_string(),
+    "--regid",
+    &gid.to_string(),
+    "--clear-groups",
+    program,
+  ]);
+  command
+}
+
+/// A `chown uid:gid` of `path` through the kernel client by root: the caller POSIX lets give a file
+/// away. Asserts it succeeded.
+fn chown_as_root(path: &Path, uid: u32, gid: u32) {
+  let output = privileged("chown")
+    .arg(format!("{uid}:{gid}"))
+    .arg(path)
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "chown {uid}:{gid} as root: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+}
+
 /// A kernel mount: unmounted and its directory removed on drop, so a failed assertion leaves nothing.
 struct KernelMount {
   path: PathBuf,
@@ -278,26 +309,25 @@ fn exclusive_create_keeps_its_mode(root: &Path) {
 #[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
 fn truncating_open_needs_write_permission(root: &Path) {
   use std::os::unix::fs::PermissionsExt;
-  use std::os::unix::process::CommandExt;
   /// Format: the owner, a group member, and `EACCES` as the child's exit status.
   const OWNER: u32 = 65534;
   const MEMBER: u32 = 65533;
   const EACCES: i32 = 13;
-  let path = root.join("guarded");
   for (uid, mode) in [(OWNER, 0o477), (MEMBER, 0o747)] {
+    let path = root.join(format!("guarded-{uid}"));
+    // Made by this test's caller, who sets the mode as its owner; then given to `OWNER` by root (a
+    // gift of ownership is root's alone, and this test need not run as root).
     std::fs::write(&path, b"x").unwrap();
-    std::os::unix::fs::chown(&path, Some(OWNER), Some(OWNER)).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    chown_as_root(&path, OWNER, OWNER);
     // A child as `uid` opens the file O_RDONLY|O_TRUNC and exits with the errno (0 on success).
-    let status = Command::new("perl")
+    let status = as_ids(uid, OWNER, "perl")
       .args([
         "-MFcntl",
         "-e",
         "sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)",
       ])
       .arg(&path)
-      .uid(uid)
-      .gid(OWNER)
       .status()
       .unwrap();
     assert_eq!(
@@ -349,15 +379,14 @@ fn special_names(root: &Path) {
   drop(listener);
   std::fs::remove_file(&socket_path).unwrap();
 
+  // As root, so the local kernel's own `CAP_MKNOD` check passes and the refusal is the server's.
   let device = root.join("device");
-  let refused = rustix::fs::mknodat(
-    rustix::fs::CWD,
-    &device,
-    rustix::fs::FileType::CharacterDevice,
-    rustix::fs::Mode::from_raw_mode(0o600),
-    rustix::fs::makedev(1, 3),
-  );
-  assert!(refused.is_err(), "a device node is refused (A-26)");
+  let refused = privileged("mknod")
+    .arg(&device)
+    .args(["c", "1", "3"])
+    .output()
+    .unwrap();
+  assert!(!refused.status.success(), "a device node is refused (A-26)");
   assert!(
     std::fs::symlink_metadata(&device).is_err(),
     "a refused device leaves no name"
@@ -455,16 +484,22 @@ fn large_sequential_writes_round_trip(root: &Path) {
   std::fs::remove_file(&path).unwrap();
 }
 
-/// `chown` of a file or a directory through the kernel client: the owner and group set are the ones
-/// read back, for ids with a
-/// passwd entry (root) and without, and the server never refuses an owner (a refused owner turns the
-/// client's numeric ids into names for the rest of the mount, RFC 8881 §5.9).
+/// `chown` of a file or a directory through the kernel client by root: the owner and group set are the
+/// ones read back, for ids with a passwd entry (root) and without, and the server never refuses an
+/// owner (a refused owner turns the client's numeric ids into names for the rest of the mount, RFC 8881
+/// §5.9). The object is handed back to its owner, so this test's caller keeps working with it.
 #[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
 fn owners_change_as_numbers(file: &Path) {
   use std::os::unix::fs::MetadataExt;
-  for (uid, gid) in [(65533, 65532), (0, 0), (65534, 65534), (123, 456)] {
-    std::os::unix::fs::chown(file, Some(uid), Some(gid))
-      .unwrap_or_else(|error| panic!("chown {uid}:{gid}: {error}"));
+  let before = std::fs::metadata(file).unwrap();
+  for (uid, gid) in [
+    (65533, 65532),
+    (0, 0),
+    (65534, 65534),
+    (123, 456),
+    (before.uid(), before.gid()),
+  ] {
+    chown_as_root(file, uid, gid);
     let metadata = std::fs::metadata(file).unwrap();
     assert_eq!(
       (metadata.uid(), metadata.gid()),
