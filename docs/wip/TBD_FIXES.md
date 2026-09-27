@@ -92,8 +92,12 @@ authorized merely by appearing here.
   connection. The daemon serves it: v4 state on the listener's shard, each operation routed to the
   owner shard, bounds derived at boot; a v4.2 client writes a volume on another shard and NFSv3 reads
   it back. The Linux kernel's v4.1 and v4.2 clients mount it and run ordinary file calls through it
-  (`tests/nfs_v4_kernel.rs`, in the Linux CI lane). Next: locks, persisted state and the v4.2
-  operations.
+  (`tests/nfs_v4_kernel.rs`, in the Linux CI lane). Byte-range locks are served (the kernel's `flock`
+  across two open files conflicts and is granted after the unlock). Next: persisted and replicated
+  state, and the v4.2 operations.
+- [x] **NFSv4 returned `NFS4ERR_RESOURCE`, which NFSv4.1 does not define** (RFC 7863), at the client,
+  session and open bounds. Now DELAY, NOSPC and NOSPC per RFC 8881 §15.2. See
+  `docs/bugs/2026-09-26-nfsv4-returned-a-status-v4-1-does-not-define.md`.
 - [x] **The watcher workloads assumed their watcher was live after a one-second sleep** (CI 36281600448:
   the macOS runner's host watcher missed the creation the mount's observed). Both forms now observe
   readiness — probe files until fswatch reports one; inotifywait's `Watches established.` — each wait

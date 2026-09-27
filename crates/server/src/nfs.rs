@@ -1133,6 +1133,7 @@ fn v4_server(s: &ShardState) -> V4Server {
       lease_ns: s.config.failover_slo_ns,
     },
     caps.opens,
+    caps.locks,
   )
 }
 

@@ -16,6 +16,7 @@ slates-vfs = { workspace = true }
 
 [dev-dependencies]
 slates-mem = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true

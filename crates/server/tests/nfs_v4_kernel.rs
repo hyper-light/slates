@@ -1,7 +1,8 @@
 //! The Linux kernel's own NFSv4 client against the daemon (§4.6 A-35): a volume provisioned in an
 //! in-process daemon is mounted with `mount -t nfs4 -o vers=4.1` and `vers=4.2` at a directory under
 //! the RAM test directory, driven through ordinary file calls — create, write, read, append, mkdir,
-//! rename, symlink, hard link, truncate, list, remove — and read back over NFSv3 from the daemon, so the
+//! rename, symlink, hard link, truncate, list, remove, and `flock` between two open files (the server's
+//! LOCK, LOCKT and LOCKU) — and read back over NFSv3 from the daemon, so the
 //! kernel's compounds are proved to land in the volume, not only to succeed.
 //!
 //! Gated: it needs Linux, root (or passwordless `sudo`) for `mount`, the `mount.nfs4` helper, and a
@@ -132,9 +133,8 @@ fn kernel_mount(source: &str, port: u16, minor: u32) -> KernelMount {
   #[allow(clippy::disallowed_methods)] // the mount point, inside the RAM test directory
   std::fs::create_dir_all(&path).unwrap();
   let mount = KernelMount { path };
-  // Byte-range locks are kept by the client (`local_lock=all`) until the server offers them (A-35).
-  let options =
-    format!("vers=4.{minor},proto=tcp,port={port},soft,timeo=10,retrans=2,local_lock=all");
+  // Locks go to the server (the default `local_lock=none`): LOCK, LOCKT and LOCKU are served (A-35).
+  let options = format!("vers=4.{minor},proto=tcp,port={port},soft,timeo=10,retrans=2");
   let output = privileged("mount")
     .args(["-t", "nfs4", "-o", &options, source])
     .arg(&mount.path)
@@ -218,6 +218,35 @@ fn exercise(root: &Path, payload: &[u8]) {
   assert_eq!(names, ["dir", "kernel.txt", "link"], "the listing");
   std::fs::remove_dir(root.join("dir")).unwrap();
   std::fs::remove_file(root.join("link")).unwrap();
+  locks_conflict_across_open_files(&file);
+}
+
+/// Two open file descriptions of one file are two lock-owners to the NFSv4 client, which sends a
+/// `flock` as a whole-file byte-range LOCK: the second's non-blocking exclusive lock is refused
+/// (`EWOULDBLOCK`, the server's `NFS4ERR_DENIED`) until the first unlocks, then granted.
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn locks_conflict_across_open_files(file: &Path) {
+  use rustix::fs::{FlockOperation, flock};
+  let first = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .open(file)
+    .unwrap();
+  let second = std::fs::OpenOptions::new()
+    .read(true)
+    .write(true)
+    .open(file)
+    .unwrap();
+  flock(&first, FlockOperation::NonBlockingLockExclusive).expect("the first lock is granted");
+  assert_eq!(
+    flock(&second, FlockOperation::NonBlockingLockExclusive),
+    Err(rustix::io::Errno::WOULDBLOCK),
+    "the second owner is refused while the first holds the lock"
+  );
+  flock(&first, FlockOperation::Unlock).unwrap();
+  flock(&second, FlockOperation::NonBlockingLockExclusive)
+    .expect("granted once the first unlocked");
+  flock(&second, FlockOperation::Unlock).unwrap();
 }
 
 /// §4.6 A-35: the Linux kernel's NFSv4.1 and NFSv4.2 clients mount a daemon volume through its

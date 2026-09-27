@@ -193,11 +193,16 @@ impl Sessions {
     if self.clients.len() >= self.limits.max_clients {
       self.expire(now_ns);
     }
+    // `NFS4ERR_DELAY`: a lapsed client makes room later, and `NFS4ERR_RESOURCE` is not valid in
+    // NFSv4.1 (RFC 7863; EXCHANGE_ID's statuses, RFC 8881 §15.2).
     if self.clients.len() >= self.limits.max_clients {
-      return Err(Nfsstat4::Resource);
+      return Err(Nfsstat4::Delay);
     }
     let clientid = (u64::from(self.boot) << u32::BITS) | u64::from(self.next_client);
-    self.next_client = self.next_client.checked_add(1).ok_or(Nfsstat4::Resource)?;
+    self.next_client = self
+      .next_client
+      .checked_add(1)
+      .ok_or(Nfsstat4::Serverfault)?;
     self.clients.insert(
       clientid,
       Client {
@@ -249,8 +254,9 @@ impl Sessions {
     if args.sequence != client.create_seq {
       return Err(Nfsstat4::SeqMisordered);
     }
+    // `NFS4ERR_NOSPC`, the exhaustion status CREATE_SESSION allows (RFC 8881 §15.2).
     if client.sessions.len() >= limits.max_sessions_per_client {
-      return Err(Nfsstat4::Resource);
+      return Err(Nfsstat4::Nospc);
     }
     let fore = ChannelAttrs::negotiated(&args.fore, &limits.offer);
     let back = ChannelAttrs::negotiated(&args.back, &limits.offer);

@@ -1670,8 +1670,10 @@ operation becomes the v3 procedure that means the same thing, answered by the sa
 therefore one implementation shared by both versions.
 - **Sessions** (`v4/session.rs`, RFC 8881 §2.10): client ids, sessions, and a per-slot reply cache that
   answers a retried request with its kept reply byte for byte and never runs it twice. Every table is
-  bounded, with a typed refusal at its bound (`NFS4ERR_RESOURCE`, `NFS4ERR_TOO_MANY_OPS`,
-  `NFS4ERR_REQ_TOO_BIG`). Leases expire lazily (a courteous server, §8.3): a lapsed client keeps its
+  bounded, with a refusal RFC 8881 §15.2 allows the operation at its bound: `NFS4ERR_DELAY` for a full
+  client table (a lapsed client frees room), `NFS4ERR_NOSPC` for a client's sessions and for opens,
+  `NFS4ERR_DELAY` for locks, `NFS4ERR_TOO_MANY_OPS` and `NFS4ERR_REQ_TOO_BIG` for a compound.
+  `NFS4ERR_RESOURCE` is never returned: it is not valid in NFSv4.1 (RFC 7863). Leases expire lazily (a courteous server, §8.3): a lapsed client keeps its
   state until the client table is full, when every lapsed client makes room first.
 - **State belongs to the listener, not the connection.** A v4 client reconnects and continues its
   session (§2.10.3), so the connection servers take the v4 state from their caller.
@@ -1683,8 +1685,18 @@ therefore one implementation shared by both versions.
   modes are served as guarded creates: the verifier made an exclusive create idempotent across
   retransmission, and the slot cache now guarantees that for every request. Expired, replaced and
   destroyed clients' opens are purged with them.
-- **Not yet offered:** byte-range locks (`NFS4ERR_NOTSUPP`; a Linux client mounted `local_lock=all`
-  keeps them itself), delegations and callbacks (never granted), state protection other than
+- **Byte-range locks** (§9, §18.10–18.12; `v4/lock.rs`): POSIX semantics per lock-owner and file (a
+  lock replaces the owner's own ranges, an unlock splits them, touching ranges of one type merge), tested
+  against a byte-level model on generated histories. Two owners conflict where their ranges overlap
+  and either is a write lock. The refusal is `NFS4ERR_DENIED` carrying the holder's range, type,
+  client and owner, and LOCKT excludes the caller's own locks.
+  - A lock needs its open's mode (`NFS4ERR_OPENMODE`).
+  - A reclaim is `NFS4ERR_NO_GRACE`: no lock state survives a restart to be reclaimed.
+  - CLOSE and FREE_STATEID refuse `NFS4ERR_LOCKS_HELD` while a lock is held.
+  - A lock state id serves I/O.
+  - Locks are advisory: READ and WRITE do not consult them.
+  - A blocking lock request is answered as a non-blocking one; without callbacks the client polls.
+- **Not yet offered:** delegations and callbacks (never granted), state protection other than
   `SP4_NONE`, and the v4.2 operations.
 - **The capability** is presented at the pseudo root as a LOOKUP of `<name>@<attachment>.<token>`, as
   an NFSv3 MNT path does, until an RPC-over-TLS or RPCSEC_GSS identity carries it.
@@ -1708,9 +1720,9 @@ therefore one implementation shared by both versions.
     version negotiated. Create, write, append, mkdir, rename, symlink, hard link, truncate, list and
     remove run through the mount, and NFSv3 reads back what the kernel wrote. Verified 2026-09-26 in a
     privileged Linux container (io_uring driver).
+  The kernel's `flock` across two open files is served as LOCK/LOCKT/LOCKU, with no `local_lock`.
   Owed:
-  - locks;
-  - the persisted and replicated open state;
+  - the persisted and replicated open and lock state;
   - the v4.2 operations (RFC 7862 SEEK, READ_PLUS, ALLOCATE, DEALLOCATE, COPY, CLONE, IO_ADVISE;
     RFC 8276 extended attributes);
   - RPC-over-TLS;
@@ -6000,3 +6012,11 @@ version routing; `config`: `NfsV4Caps`; `state`: `nfs_v4`); `slates-bridge-nfs` 
 state, the fallible `Backend::with_v4`, the verifier pass-through); the daemon's NFS tests, two of
 which asserted the pre-A-34 unmount rule and now assert A-34's
 (`docs/bugs/2026-09-26-nfs-mount-tests-asserted-the-pre-a34-unmount.md`); GAPS and TBD_FIXES.
+
+Amended a third time the same day: byte-range locks (`v4/lock.rs`, the lock table and the LOCK, LOCKT
+and LOCKU handlers; LOCKS_HELD on CLOSE and FREE_STATEID; lock state ids valid for I/O; the derived
+lock bound `config::nfs_v4_caps` `locks`), and the bound refusals replaced with the statuses RFC 8881
+§15.2 allows each operation (`NFS4ERR_RESOURCE` is not valid in NFSv4.1;
+`docs/bugs/2026-09-26-nfsv4-returned-a-status-v4-1-does-not-define.md`). Applied to: §4.6;
+`slates-bridge-nfs`; `slates-server` (the lock bound); the kernel test (locks served, `flock` across two
+open files); GAPS and TBD_FIXES.

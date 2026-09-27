@@ -106,6 +106,8 @@ pub enum Nfsstat4 {
   NoGrace = 10033,
   /// Format: `NFS4ERR_BADXDR` (RFC 7863 `nfsstat4`).
   Badxdr = 10036,
+  /// Format: `NFS4ERR_LOCKS_HELD` (RFC 7863 `nfsstat4`).
+  LocksHeld = 10037,
   /// Format: `NFS4ERR_OPENMODE` (RFC 7863 `nfsstat4`).
   Openmode = 10038,
   /// Format: `NFS4ERR_BADOWNER` (RFC 7863 `nfsstat4`).

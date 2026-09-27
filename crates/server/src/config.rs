@@ -628,6 +628,8 @@ pub struct NfsV4Caps {
   pub clients: usize,
   /// Derived: the opens the listener records at once.
   pub opens: usize,
+  /// Derived: the byte-range lock ranges (and lock states holding none) the listener records at once.
+  pub locks: usize,
 }
 
 /// Shape: the sessions one NFSv4 client holds at once: the live one and its successor, which a client
@@ -643,7 +645,10 @@ pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
 /// - **clients** = the client share of the listener shard's reserve over one client's slot caches (every
 ///   session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
 /// - **opens** = the store's inode bound × the shard count: an open names a file, and every shard's
-///   store holds at most that many.
+///   store holds at most that many;
+/// - **locks** = the same bound: a lock range names a byte range of an open file, and one lock-owner's
+///   locks on a file merge into as few ranges as their gaps allow, so a range per file is the common
+///   case and each costs what an open costs.
 #[cfg(unix)]
 fn nfs_v4_caps(
   reserve_per_shard: u64,
@@ -675,10 +680,17 @@ fn nfs_v4_caps(
     ["max_inodes", "shards"]
   );
   derivations.push(note("nfs_v4_opens", &opens));
+  let locks: Derived<usize> = derived!(
+    max_inodes.saturating_mul(usize::from(shards.max(1))),
+    "max_inodes × shards",
+    ["max_inodes", "shards"]
+  );
+  derivations.push(note("nfs_v4_locks", &locks));
   NfsV4Caps {
     slots: slots.get(),
     clients: clients.get(),
     opens: opens.get(),
+    locks: locks.get(),
   }
 }
 

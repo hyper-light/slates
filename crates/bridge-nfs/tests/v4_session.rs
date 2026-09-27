@@ -212,7 +212,9 @@ fn a_rebooted_client_replaces_its_record_and_another_principal_cannot_take_it() 
   assert_eq!(sessions.exchange_id(&intruder, 0), Err(Nfsstat4::ClidInuse));
 }
 
-/// Bounds: do fill the client table and a client's sessions; expect `RESOURCE` past each bound.
+/// Bounds: do fill the client table and a client's sessions; expect `NFS4ERR_DELAY` past the client
+/// table's (a lapsed client frees room later) and `NFS4ERR_NOSPC` past a client's sessions — the
+/// statuses RFC 8881 §15.2 allows those operations; `NFS4ERR_RESOURCE` is not valid in NFSv4.1 (RFC 7863).
 #[test]
 fn the_tables_refuse_at_their_bounds() {
   let mut sessions = Sessions::new(7, limits());
@@ -220,7 +222,7 @@ fn the_tables_refuse_at_their_bounds() {
   session(&mut sessions, "host-b");
   assert_eq!(
     sessions.exchange_id(&owner("host-c", 1), 0),
-    Err(Nfsstat4::Resource)
+    Err(Nfsstat4::Delay)
   );
   let again = sessions.exchange_id(&owner("host-a", 1), 0).unwrap();
   assert_eq!(
@@ -233,7 +235,7 @@ fn the_tables_refuse_at_their_bounds() {
       },
       0
     ),
-    Err(Nfsstat4::Resource),
+    Err(Nfsstat4::Nospc),
     "one session per client in this offer"
   );
 }

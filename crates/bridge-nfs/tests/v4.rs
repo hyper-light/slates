@@ -126,6 +126,7 @@ fn server_with(max_clients: usize, lease_ns: u64) -> Server {
       lease_ns,
     },
     64,
+    64,
   )
 }
 
@@ -852,7 +853,7 @@ fn an_unchecked_open_of_an_existing_file_truncates_it_and_keeps_its_mode() {
 }
 
 /// A full client table makes room from the clients whose lease has lapsed, and their opens go with
-/// them; while every client's lease is live, a new client is `NFS4ERR_RESOURCE`. A-35; RFC 8881
+/// them; while every client's lease is live, a new client is `NFS4ERR_DELAY`. A-35; RFC 8881
 /// §8.3, §18.35.4.
 #[test]
 fn a_lapsed_client_makes_room_and_its_opens_go_with_it() {
@@ -872,7 +873,7 @@ fn a_lapsed_client_makes_room_and_its_opens_go_with_it() {
   args.u32(0);
   assert_eq!(
     Client::call(&mut service, &mut live, args.as_slice()).status,
-    Nfsstat4::Resource.wire()
+    Nfsstat4::Delay.wire()
   );
 
   const LEASE_NS: u64 = 1_000;
@@ -901,7 +902,7 @@ fn a_lapsed_client_makes_room_and_its_opens_go_with_it() {
   refused.u32(0);
   assert_eq!(
     Client::call(&mut service, &mut lapsing, refused.as_slice()).status,
-    Nfsstat4::Resource.wire(),
+    Nfsstat4::Delay.wire(),
     "a lease is not lapsed until it has passed"
   );
   NOW_NS.with(|now| now.set(now.get() + 1));
@@ -1098,4 +1099,321 @@ fn a_session_outlives_its_connection_and_other_versions_are_mismatched() {
   );
   drop(second);
   serving.join().unwrap();
+}
+
+/// `nfs_lock_type4` values and the lock operations' result bodies (RFC 7863).
+const READ_LT: u32 = 1;
+const WRITE_LT: u32 = 2;
+
+/// Appends a LOCK for `owner` under the open `open` (a lock-owner new to it), or under the lock state
+/// `existing`.
+fn lock_args(
+  args: &mut XdrWriter,
+  kind: u32,
+  offset: u64,
+  length: u64,
+  open: Stateid,
+  existing: Option<Stateid>,
+  owner: &[u8],
+) {
+  args.u32(op::LOCK);
+  args.u32(kind);
+  args.bool(false); // reclaim
+  args.u64(offset);
+  args.u64(length);
+  match existing {
+    None => {
+      args.bool(true);
+      args.u32(0);
+      open.encode(args);
+      args.u32(0);
+      args.u64(0); // ignored: the session names the client
+      args.opaque(owner);
+    }
+    Some(stateid) => {
+      args.bool(false);
+      stateid.encode(args);
+      args.u32(0);
+    }
+  }
+}
+
+/// Runs PUTFH `fh` then one lock operation built by `build`: the status and the lock operation's body.
+fn lock_call(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  build: impl FnOnce(&mut XdrWriter),
+) -> (u32, Vec<u8>) {
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTFH);
+  args.opaque(fh);
+  build(&mut args);
+  let reply = Client::call(service, server, args.as_slice());
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTFH);
+  body.u32().unwrap(); // the lock operation's number
+  body.u32().unwrap(); // and its status, which the frame already carries
+  (reply.status, body.rest().to_vec())
+}
+
+/// A LOCK of `(kind, offset, length)` for the lock-owner `owner`, new to the open `open`, which must be
+/// granted: its lock state id.
+fn grant(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  (kind, offset, length): (u32, u64, u64),
+  open: Stateid,
+  owner: &[u8],
+) -> Stateid {
+  let (status, body) = lock_call(client, service, server, fh, |args| {
+    lock_args(args, kind, offset, length, open, None, owner);
+  });
+  assert_eq!(status, Nfsstat4::Ok.wire(), "the lock is granted");
+  Stateid::decode(&mut XdrReader::new(&body)).unwrap()
+}
+
+/// A `LOCK4denied`: (offset, length, type, client, owner).
+fn denial(body: &[u8]) -> (u64, u64, u32, u64, Vec<u8>) {
+  let mut denied = XdrReader::new(body);
+  (
+    denied.u64().unwrap(),
+    denied.u64().unwrap(),
+    denied.u32().unwrap(),
+    denied.u64().unwrap(),
+    denied.opaque(1024).unwrap().to_vec(),
+  )
+}
+
+/// LOCKU of `range` under the lock state `held`: the status.
+fn unlock(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  held: Stateid,
+  (offset, length): (u64, u64),
+) -> u32 {
+  lock_call(client, service, server, fh, |args| {
+    args.u32(op::LOCKU);
+    args.u32(WRITE_LT);
+    args.u32(0);
+    held.encode(args);
+    args.u64(offset);
+    args.u64(length);
+  })
+  .0
+}
+
+/// CLOSE of the open `open` of `fh`: the status.
+fn close_status(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  open: Stateid,
+) -> u32 {
+  let mut close = client.sequenced(2);
+  close.u32(op::PUTFH);
+  close.opaque(fh);
+  close.u32(op::CLOSE);
+  close.u32(0);
+  open.encode(&mut close);
+  Client::call(service, server, close.as_slice()).status
+}
+
+/// LOCKT of a read lock on byte 5 for `owner`: the status.
+fn test_lock(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  fh: &[u8],
+  owner: &[u8],
+) -> u32 {
+  lock_call(client, service, server, fh, |args| {
+    args.u32(op::LOCKT);
+    args.u32(READ_LT);
+    args.u64(5);
+    args.u64(1);
+    args.u64(0);
+    args.opaque(owner);
+  })
+  .0
+}
+
+/// A-35 (RFC 8881 §9, §18.10–18.12): two lock-owners of one client on one file. The first holds a write
+/// lock; the second's LOCK over it is `NFS4ERR_DENIED`, reporting the holder's range, type, client and
+/// owner, and LOCKT answers the same, while the holder's own LOCKT is clear. After the holder's LOCKU
+/// the second's lock is granted. CLOSE of an open whose lock-owner still holds a lock is
+/// `NFS4ERR_LOCKS_HELD`; once unlocked it closes and its lock state goes with it.
+#[test]
+fn a_lock_conflicts_with_another_owner_and_holds_its_open() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  let owner = client.owner.clone();
+  let (open, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "db",
+    BOTH,
+    DENY_NONE,
+  )
+  .unwrap();
+
+  let held = grant(
+    &mut client,
+    &mut service,
+    &mut server,
+    &fh,
+    (WRITE_LT, 0, 10),
+    open,
+    b"writer",
+  );
+  let (status, body) = lock_call(&mut client, &mut service, &mut server, &fh, |args| {
+    lock_args(args, READ_LT, 5, 1, open, None, b"reader");
+  });
+  assert_eq!(
+    (status, denial(&body)),
+    (
+      Nfsstat4::Denied.wire(),
+      (0, 10, WRITE_LT, client.clientid, b"writer".to_vec())
+    ),
+    "the conflict reports the holder's range, type, client and owner"
+  );
+
+  assert_eq!(
+    test_lock(&mut client, &mut service, &mut server, &fh, b"reader"),
+    Nfsstat4::Denied.wire(),
+    "LOCKT reports the conflict"
+  );
+  assert_eq!(
+    test_lock(&mut client, &mut service, &mut server, &fh, b"writer"),
+    Nfsstat4::Ok.wire(),
+    "LOCKT excludes the caller's own locks"
+  );
+  assert_eq!(
+    close_status(&mut client, &mut service, &mut server, &fh, open),
+    Nfsstat4::LocksHeld.wire(),
+    "an open whose lock-owner holds a lock is not closed"
+  );
+  assert_eq!(
+    unlock(&mut client, &mut service, &mut server, &fh, held, (0, 10)),
+    Nfsstat4::Ok.wire(),
+    "LOCKU"
+  );
+  let reader_lock = grant(
+    &mut client,
+    &mut service,
+    &mut server,
+    &fh,
+    (READ_LT, 5, 1),
+    open,
+    b"reader",
+  );
+  assert!(
+    read(&mut client, &mut service, &mut server, &fh, reader_lock).is_ok(),
+    "a lock state id serves READ"
+  );
+  assert_eq!(
+    unlock(
+      &mut client,
+      &mut service,
+      &mut server,
+      &fh,
+      reader_lock,
+      (5, 1)
+    ),
+    Nfsstat4::Ok.wire()
+  );
+  assert_eq!(
+    close_status(&mut client, &mut service, &mut server, &fh, open),
+    Nfsstat4::Ok.wire()
+  );
+  assert_eq!(
+    server.lock_state_count(),
+    0,
+    "the lock states went with the open"
+  );
+}
+
+/// A-35 (RFC 8881 §18.10.3–18.10.4): a write lock under an open for reading is `NFS4ERR_OPENMODE`; a
+/// reclaim, with no grace period to run in, is `NFS4ERR_NO_GRACE`; a zero length and an end past the
+/// largest offset are `NFS4ERR_INVAL`; FREE_STATEID of a lock state holding a lock is
+/// `NFS4ERR_LOCKS_HELD`.
+#[test]
+fn a_lock_is_refused_outside_its_rules() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  let owner = client.owner.clone();
+  let (read_open, fh) = open_at_root(
+    &mut client,
+    &mut service,
+    &mut server,
+    &owner,
+    "f",
+    READ,
+    DENY_NONE,
+  )
+  .unwrap();
+  let (status, _) = lock_call(&mut client, &mut service, &mut server, &fh, |args| {
+    lock_args(args, WRITE_LT, 0, 1, read_open, None, b"o");
+  });
+  assert_eq!(status, Nfsstat4::Openmode.wire());
+
+  let (status, _) = lock_call(&mut client, &mut service, &mut server, &fh, |args| {
+    args.u32(op::LOCK);
+    args.u32(READ_LT);
+    args.bool(true); // reclaim
+    args.u64(0);
+    args.u64(1);
+    args.bool(true);
+    args.u32(0);
+    read_open.encode(args);
+    args.u32(0);
+    args.u64(0);
+    args.opaque(b"o");
+  });
+  assert_eq!(status, Nfsstat4::NoGrace.wire());
+
+  for (offset, length) in [(0, 0), (u64::MAX - 1, 2)] {
+    let (status, _) = lock_call(&mut client, &mut service, &mut server, &fh, |args| {
+      lock_args(args, READ_LT, offset, length, read_open, None, b"o");
+    });
+    assert_eq!(
+      status,
+      Nfsstat4::Inval.wire(),
+      "offset {offset} length {length}"
+    );
+  }
+
+  let (status, body) = lock_call(&mut client, &mut service, &mut server, &fh, |args| {
+    lock_args(args, READ_LT, 0, u64::MAX, read_open, None, b"o");
+  });
+  assert_eq!(
+    status,
+    Nfsstat4::Ok.wire(),
+    "a read lock to the end of the file"
+  );
+  let held = Stateid::decode(&mut XdrReader::new(&body)).unwrap();
+  let mut free = client.sequenced(1);
+  free.u32(op::FREE_STATEID);
+  held.encode(&mut free);
+  assert_eq!(
+    Client::call(&mut service, &mut server, free.as_slice()).status,
+    Nfsstat4::LocksHeld.wire()
+  );
 }

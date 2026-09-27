@@ -18,6 +18,7 @@ use std::future::Future;
 
 use super::Nfsstat4;
 use super::attr::{self, FsFigures};
+use super::lock::{LockKind, LockTable, Range};
 use super::session::{CreateSession, ExchangeId, Limits, Sequence, Sequenced, Sessions};
 use super::types::{
   Bitmap, ChannelAttrs, FHSIZE, OPAQUE_LIMIT, OTHER_SIZE, SessionId, Stateid, VERIFIER_SIZE,
@@ -210,11 +211,12 @@ pub const COMPOUND_HEADER_BYTES: u32 = 4 * 1024;
 /// Format: the smallest encoded operation: its four-byte number and a four-byte argument.
 pub const MIN_OPERATION_BYTES: u32 = 8;
 
-/// The v4 server's state: sessions, open state and the figures its attributes report.
+/// The v4 server's state: sessions, open and lock state, and the figures its attributes report.
 pub struct Server {
   /// Client ids and sessions.
   pub sessions: Sessions,
   opens: Opens,
+  locks: LockTable,
   limits: Limits,
   boot: u32,
 }
@@ -267,12 +269,14 @@ impl Opens {
 }
 
 impl Server {
-  /// A server instance named `boot`, under `limits`, recording at most `max_opens` opens at once. WRITE
-  /// and COMMIT carry the write verifier of the v3 layer that holds the data, so a restart of that
-  /// layer is what tells a client to re-send its unstable writes (RFC 8881 §18.32.3).
-  pub fn new(boot: u32, limits: Limits, max_opens: usize) -> Server {
+  /// A server instance named `boot`, under `limits`, recording at most `max_opens` opens and
+  /// `max_locks` lock ranges at once. WRITE and COMMIT carry the write verifier of the v3 layer that
+  /// holds the data, so a restart of that layer is what tells a client to re-send its unstable writes
+  /// (RFC 8881 §18.32.3).
+  pub fn new(boot: u32, limits: Limits, max_opens: usize, max_locks: usize) -> Server {
     Server {
       sessions: Sessions::new(boot, limits),
+      locks: LockTable::new(boot, max_locks),
       opens: Opens {
         max: max_opens,
         next: 1,
@@ -294,6 +298,8 @@ impl Server {
     const SESSIONS: usize = 4;
     /// Shape: opens the standalone server records.
     const OPENS: usize = 4096;
+    /// Shape: lock ranges the standalone server records.
+    const LOCKS: usize = 4096;
     /// Shape: the standalone server's lease (an hour: a test never outlives it).
     const LEASE_NS: u64 = 3_600_000_000_000;
     let size = crate::procedures::MAX_TRANSFER + COMPOUND_HEADER_BYTES;
@@ -313,6 +319,7 @@ impl Server {
         lease_ns: LEASE_NS,
       },
       OPENS,
+      LOCKS,
     )
   }
 
@@ -321,10 +328,16 @@ impl Server {
     self.opens.table.len()
   }
 
-  /// Drops the opens of every client the session table no longer holds.
+  /// How many lock states are recorded.
+  pub fn lock_state_count(&self) -> usize {
+    self.locks.state_count()
+  }
+
+  /// Drops the opens and locks of every client the session table no longer holds.
   fn purge_opens(&mut self) {
     let sessions = &self.sessions;
     self.opens.purge(|clientid| sessions.holds_client(clientid));
+    self.locks.purge(|clientid| sessions.holds_client(clientid));
   }
 }
 
@@ -333,6 +346,8 @@ struct Frame {
   current: Option<Nfsfh3>,
   saved: Option<Nfsfh3>,
   clientid: Option<u64>,
+  /// The `LOCK4denied` body of a LOCK or LOCKT refused `NFS4ERR_DENIED`, which the result carries.
+  denied: Option<Vec<u8>>,
 }
 
 /// What an operation produced: its result body on success, or the status it failed with.
@@ -365,6 +380,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
     current: None,
     saved: None,
     clientid: None,
+    denied: None,
   };
   let mut results = XdrWriter::new();
   let mut done = 0u32;
@@ -404,21 +420,9 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
       }
     };
     done += 1;
-    results.u32(if is_operation(opnum) {
-      opnum
-    } else {
-      op::ILLEGAL
-    });
-    match outcome {
-      Ok(body) => {
-        results.u32(Nfsstat4::Ok.wire());
-        results.fixed(&body);
-      }
-      Err(status) => {
-        results.u32(status.wire());
-        last = status;
-        break;
-      }
+    if let Err(status) = record(&mut results, opnum, outcome, &mut frame) {
+      last = status;
+      break;
     }
   }
   let encoded = reply(last, &tag, done, results.as_slice());
@@ -432,6 +436,38 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8]) -> Vec<u8> {
     }
   }
   encoded
+}
+
+/// Appends one operation's result: its number (`OP_ILLEGAL` for an unknown one), its status, and its
+/// body — on success, or the `LOCK4denied` of a refused LOCK or LOCKT. Returns the status that ends the
+/// compound, if it failed.
+fn record(
+  results: &mut XdrWriter,
+  opnum: u32,
+  outcome: Outcome,
+  frame: &mut Frame,
+) -> Result<(), Nfsstat4> {
+  results.u32(if is_operation(opnum) {
+    opnum
+  } else {
+    op::ILLEGAL
+  });
+  match outcome {
+    Ok(body) => {
+      results.u32(Nfsstat4::Ok.wire());
+      results.fixed(&body);
+      Ok(())
+    }
+    Err(status) => {
+      results.u32(status.wire());
+      if status == Nfsstat4::Denied
+        && let Some(denied) = frame.denied.take()
+      {
+        results.fixed(&denied);
+      }
+      Err(status)
+    }
+  }
 }
 
 /// Whether `opnum` names an operation (anything else is answered as `OP_ILLEGAL`).
@@ -781,6 +817,7 @@ async fn namespace_operation<B: Backend>(
     op::REMOVE => remove(backend, reader, frame).await,
     op::RENAME => rename(backend, reader, frame).await,
     op::LINK => link(backend, reader, frame).await,
+    op::LOCK | op::LOCKT | op::LOCKU => lock_operation(backend, opnum, reader, frame).await,
     _ => backend.with_v4(|server| state_operation(server, opnum, reader, frame))?,
   }
 }
@@ -847,13 +884,8 @@ fn state_operation(
     op::TEST_STATEID => test_stateid(server, reader),
     op::FREE_STATEID => {
       let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
-      server
-        .opens
-        .remove(&stateid.other)
-        .map(|_| Vec::new())
-        .ok_or(Nfsstat4::BadStateid)
+      server.free_stateid(&stateid.other).map(|()| Vec::new())
     }
-    op::LOCK | op::LOCKT | op::LOCKU => Err(Nfsstat4::Notsupp),
     op::ILLEGAL => Err(Nfsstat4::OpIllegal),
     _ if is_operation(opnum) => Err(Nfsstat4::Notsupp),
     _ => Err(Nfsstat4::OpIllegal),
@@ -968,9 +1000,9 @@ async fn getattr<B: Backend>(backend: &mut B, fh: &Nfsfh3, requested: &Bitmap) -
   Ok(body.into_bytes())
 }
 
-/// Whether `stateid` may serve I/O on `fh` for `clientid`: a special state id, or an open this server
-/// recorded of that file for that client whose seqid is current (0 means "the current one"); an
-/// earlier seqid is `NFS4ERR_OLD_STATEID`, anything else `NFS4ERR_BAD_STATEID` (RFC 8881 §8.2.2).
+/// Whether `stateid` may serve I/O on `fh` for `clientid`: a special state id, or an open or a lock
+/// state this server recorded of that file for that client at a current seqid (RFC 8881 §8.2.2,
+/// §9.1.4: READ, WRITE and SETATTR take either).
 fn check_stateid(
   server: &Server,
   stateid: &Stateid,
@@ -980,6 +1012,21 @@ fn check_stateid(
   if stateid.is_special() {
     return Ok(());
   }
+  if server.locks.contains(&stateid.other) {
+    return server.locks.get(stateid, fh, clientid).map(|_| ());
+  }
+  check_open_stateid(server, stateid, fh, clientid)
+}
+
+/// Whether `stateid` names an open this server recorded of `fh` for `clientid` whose seqid is current
+/// (0 means "the current one"); an earlier seqid is `NFS4ERR_OLD_STATEID`, anything else
+/// `NFS4ERR_BAD_STATEID` (RFC 8881 §8.2.2).
+fn check_open_stateid(
+  server: &Server,
+  stateid: &Stateid,
+  fh: &Nfsfh3,
+  clientid: Option<u64>,
+) -> Result<(), Nfsstat4> {
   let open = server
     .opens
     .table
@@ -1354,8 +1401,10 @@ impl Server {
         other,
       });
     }
+    // `NFS4ERR_NOSPC` at the table's bound: `NFS4ERR_RESOURCE` is not valid in NFSv4.1 (RFC 7863),
+    // and NOSPC is the exhaustion status OPEN allows (RFC 8881 §15.2).
     if self.opens.table.len() >= self.opens.max {
-      return Err(Nfsstat4::Resource);
+      return Err(Nfsstat4::Nospc);
     }
     let mut other = [0u8; OTHER_SIZE];
     other[..8].copy_from_slice(&self.opens.next.to_be_bytes());
@@ -1384,14 +1433,14 @@ fn next_seqid(seqid: u32) -> u32 {
 }
 
 /// The open `stateid` names, for `clientid` on `fh`, with a current seqid; else the refusal
-/// [`check_stateid`] states.
+/// [`check_open_stateid`] states.
 fn open_of<'a>(
   server: &'a mut Server,
   stateid: &Stateid,
   fh: &Nfsfh3,
   clientid: Option<u64>,
 ) -> Result<&'a mut Open, Nfsstat4> {
-  check_stateid(server, stateid, fh, clientid)?;
+  check_open_stateid(server, stateid, fh, clientid)?;
   server
     .opens
     .table
@@ -1408,6 +1457,12 @@ fn close(server: &mut Server, reader: &mut XdrReader<'_>, frame: &Frame) -> Outc
     return Err(Nfsstat4::BadStateid);
   }
   let seqid = next_seqid(open_of(server, &stateid, &fh, frame.clientid)?.seqid);
+  // An open whose lock-owners still hold locks is not closed (§18.2.4, `NFS4ERR_LOCKS_HELD`); its
+  // lock states holding none go with it.
+  if server.locks.held_under(&stateid.other) {
+    return Err(Nfsstat4::LocksHeld);
+  }
+  server.locks.drop_under(&stateid.other);
   server.opens.remove(&stateid.other);
   let mut body = XdrWriter::new();
   Stateid {
@@ -1445,6 +1500,238 @@ fn open_downgrade(server: &mut Server, reader: &mut XdrReader<'_>, frame: &Frame
   Ok(body.into_bytes())
 }
 
+impl Server {
+  /// `FREE_STATEID` (§18.38): a lock state holding no lock, or an open none of whose lock-owners holds
+  /// one (with its lock states); `NFS4ERR_LOCKS_HELD` otherwise.
+  fn free_stateid(&mut self, other: &[u8; OTHER_SIZE]) -> Result<(), Nfsstat4> {
+    if self.locks.contains(other) {
+      return self.locks.free(other);
+    }
+    if !self.opens.table.contains_key(other) {
+      return Err(Nfsstat4::BadStateid);
+    }
+    if self.locks.held_under(other) {
+      return Err(Nfsstat4::LocksHeld);
+    }
+    self.locks.drop_under(other);
+    self.opens.remove(other);
+    Ok(())
+  }
+}
+
+/// `LOCK`, `LOCKT` and `LOCKU` (§18.10–18.12): the current file must be a regular file; the operation
+/// then runs on the lock table.
+async fn lock_operation<B: Backend>(
+  backend: &mut B,
+  opnum: u32,
+  reader: &mut XdrReader<'_>,
+  frame: &mut Frame,
+) -> Outcome {
+  let request = LockRequest::decode(opnum, reader)?;
+  let fh = current(frame)?.clone();
+  check_open_kind(backend, &fh).await?;
+  let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
+  match backend.with_v4(|server| server.lock_request(request, &fh, clientid))? {
+    Ok(body) => Ok(body),
+    Err(LockRefused::Denied(denied)) => {
+      frame.denied = Some(denied.encode());
+      Err(Nfsstat4::Denied)
+    }
+    Err(LockRefused::Status(status)) => Err(status),
+  }
+}
+
+/// A decoded LOCK, LOCKT or LOCKU.
+enum LockRequest {
+  /// LOCK by a lock-owner new to the open (`open_to_lock_owner4`) or by an existing lock state.
+  Lock {
+    kind: LockKind,
+    range: Range,
+    locker: Locker,
+  },
+  /// LOCKT for `owner`.
+  Test {
+    kind: LockKind,
+    range: Range,
+    owner: Vec<u8>,
+  },
+  /// LOCKU of the lock state `stateid`.
+  Unlock { range: Range, stateid: Stateid },
+}
+
+/// A LOCK's `locker4`.
+enum Locker {
+  /// The first lock of `owner` under the open `open` (the lock-owner's client id is the session's,
+  /// §18.10.3, so the one on the wire is ignored, as are the seqids).
+  New { open: Stateid, owner: Vec<u8> },
+  /// A further lock of an existing lock state.
+  Existing { stateid: Stateid },
+}
+
+/// Why a lock request was refused: a conflict (whose description the result carries) or a status.
+enum LockRefused {
+  Denied(super::lock::Denied),
+  Status(Nfsstat4),
+}
+
+impl From<Nfsstat4> for LockRefused {
+  fn from(status: Nfsstat4) -> LockRefused {
+    LockRefused::Status(status)
+  }
+}
+
+impl LockRequest {
+  /// Reads the arguments of `opnum`. An undefined lock type is `NFS4ERR_BADXDR` (an enum out of
+  /// range); a zero length or an end past the largest offset is `NFS4ERR_INVAL` (§18.10.3).
+  fn decode(opnum: u32, reader: &mut XdrReader<'_>) -> Result<LockRequest, Nfsstat4> {
+    let bad = |_| Nfsstat4::Badxdr;
+    let kind = LockKind::from_wire(reader.u32().map_err(bad)?).ok_or(Nfsstat4::Badxdr)?;
+    match opnum {
+      op::LOCK => {
+        // A reclaim has no grace period to run in: this server keeps no lock state across a restart
+        // that could be reclaimed (§8.4.2, `NFS4ERR_NO_GRACE`).
+        let reclaim = reader.bool().map_err(bad)?;
+        let range = Self::range(reader)?;
+        let locker = if reader.bool().map_err(bad)? {
+          let _open_seqid = reader.u32().map_err(bad)?;
+          let open = Stateid::decode(reader).map_err(bad)?;
+          let _lock_seqid = reader.u32().map_err(bad)?;
+          let _clientid = reader.u64().map_err(bad)?;
+          let owner = reader.opaque(OPAQUE_LIMIT).map_err(bad)?.to_vec();
+          Locker::New { open, owner }
+        } else {
+          let stateid = Stateid::decode(reader).map_err(bad)?;
+          let _lock_seqid = reader.u32().map_err(bad)?;
+          Locker::Existing { stateid }
+        };
+        if reclaim {
+          return Err(Nfsstat4::NoGrace);
+        }
+        Ok(LockRequest::Lock {
+          kind,
+          range,
+          locker,
+        })
+      }
+      op::LOCKT => {
+        let range = Self::range(reader)?;
+        let _clientid = reader.u64().map_err(bad)?;
+        let owner = reader.opaque(OPAQUE_LIMIT).map_err(bad)?.to_vec();
+        Ok(LockRequest::Test { kind, range, owner })
+      }
+      _ => {
+        let _seqid = reader.u32().map_err(bad)?;
+        let stateid = Stateid::decode(reader).map_err(bad)?;
+        let range = Self::range(reader)?;
+        Ok(LockRequest::Unlock { range, stateid })
+      }
+    }
+  }
+
+  /// An `offset4` and `length4`.
+  fn range(reader: &mut XdrReader<'_>) -> Result<Range, Nfsstat4> {
+    let offset = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
+    let length = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
+    Range::of(offset, length).ok_or(Nfsstat4::Inval)
+  }
+}
+
+impl Server {
+  /// Runs a lock request on `fh` for `clientid`: its result body, or why it was refused.
+  fn lock_request(
+    &mut self,
+    request: LockRequest,
+    fh: &Nfsfh3,
+    clientid: u64,
+  ) -> Result<Vec<u8>, LockRefused> {
+    match request {
+      LockRequest::Lock {
+        kind,
+        range,
+        locker,
+      } => {
+        let other = self.lock_state(locker, fh, clientid, kind)?;
+        let state = self
+          .locks
+          .state(&other)
+          .ok_or(LockRefused::Status(Nfsstat4::BadStateid))?;
+        let owner = state.owner.clone();
+        let next = state.ranges.locked(range, kind);
+        if let Some(denied) = self.locks.conflict(fh, clientid, &owner, range, kind) {
+          return Err(LockRefused::Denied(denied));
+        }
+        let stateid = self.locks.set_ranges(&other, next)?;
+        let mut body = XdrWriter::new();
+        stateid.encode(&mut body);
+        Ok(body.into_bytes())
+      }
+      LockRequest::Test { kind, range, owner } => {
+        match self.locks.conflict(fh, clientid, &owner, range, kind) {
+          Some(denied) => Err(LockRefused::Denied(denied)),
+          None => Ok(Vec::new()),
+        }
+      }
+      LockRequest::Unlock { range, stateid } => {
+        if stateid.is_special() {
+          return Err(LockRefused::Status(Nfsstat4::BadStateid));
+        }
+        let next = self
+          .locks
+          .get(&stateid, fh, Some(clientid))?
+          .ranges
+          .unlocked(range);
+        let stateid = self.locks.set_ranges(&stateid.other, next)?;
+        let mut body = XdrWriter::new();
+        stateid.encode(&mut body);
+        Ok(body.into_bytes())
+      }
+    }
+  }
+
+  /// The lock state a LOCK runs under: an existing one named by its state id, or the lock-owner's on
+  /// this file created from the open. The open must allow the lock (§18.10.4, POSIX): a write lock
+  /// needs the file open for writing, a read lock open for reading (`NFS4ERR_OPENMODE`).
+  fn lock_state(
+    &mut self,
+    locker: Locker,
+    fh: &Nfsfh3,
+    clientid: u64,
+    kind: LockKind,
+  ) -> Result<[u8; OTHER_SIZE], Nfsstat4> {
+    let (open_other, lock_other) = match locker {
+      Locker::New { open, owner } => {
+        if open.is_special() {
+          return Err(Nfsstat4::BadStateid);
+        }
+        check_open_stateid(self, &open, fh, Some(clientid))?;
+        let other = self.locks.state_for(clientid, owner, fh, open.other)?;
+        (open.other, other)
+      }
+      Locker::Existing { stateid } => {
+        if stateid.is_special() {
+          return Err(Nfsstat4::BadStateid);
+        }
+        let state = self.locks.get(&stateid, fh, Some(clientid))?;
+        (state.open, stateid.other)
+      }
+    };
+    let access = self
+      .opens
+      .table
+      .get(&open_other)
+      .map(|open| open.access)
+      .ok_or(Nfsstat4::BadStateid)?;
+    let needed = match kind {
+      LockKind::Read => share::READ,
+      LockKind::Write => share::WRITE,
+    };
+    if access & needed == 0 {
+      return Err(Nfsstat4::Openmode);
+    }
+    Ok(lock_other)
+  }
+}
+
 /// `TEST_STATEID` (§18.48): each state id's validity.
 fn test_stateid(server: &Server, reader: &mut XdrReader<'_>) -> Outcome {
   /// Format: the most state ids one TEST_STATEID reads (a client tests a handful).
@@ -1457,7 +1744,8 @@ fn test_stateid(server: &Server, reader: &mut XdrReader<'_>) -> Outcome {
   body.u32(count);
   for _ in 0..count {
     let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
-    let valid = server.opens.table.contains_key(&stateid.other);
+    let valid =
+      server.opens.table.contains_key(&stateid.other) || server.locks.contains(&stateid.other);
     body.u32(if valid {
       Nfsstat4::Ok.wire()
     } else {

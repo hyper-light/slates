@@ -28,6 +28,7 @@
 pub mod attr;
 pub mod backend;
 pub mod compound;
+pub mod lock;
 pub mod session;
 pub mod status;
 pub mod types;
