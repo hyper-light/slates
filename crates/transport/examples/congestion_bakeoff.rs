@@ -247,7 +247,15 @@ fn run(law: ControllerKind, scenario: &Scenario, seed: u64) -> Outcome {
       coordinator(law, scenario_task, done_tx, ping_tx).await;
     })
     .unwrap();
+  let wall = std::time::Instant::now();
   let steps_run = sim.run_until_idle();
+  if std::env::var_os("BAKEOFF_PROGRESS").is_some() {
+    eprintln!(
+      "steps {steps_run} virtual {:.1}s wall {:.2}s",
+      sim.now_ns() as f64 / 1e9,
+      wall.elapsed().as_secs_f64()
+    );
+  }
   let flows = 1 + usize::from(scenario.second_flow.is_some());
   let finished: Vec<(usize, u64, u64)> = done_rx.try_iter().collect();
   let stats = sim_udp_stats();
@@ -327,9 +335,18 @@ async fn coordinator(
         let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
         let mut endpoint =
           Endpoint::server(server, peer, &server_identity, &[client_cert], flow_shape).unwrap();
-        endpoint.establish().await.unwrap();
+        if let Err(e) = endpoint.establish().await {
+          eprintln!("ROLE bulk server {index} establish: {e:?}");
+          return;
+        }
         let started = slates_rt::futures::now_ns();
-        let received = endpoint.recv_stream(1).await.unwrap();
+        let received = match endpoint.recv_stream(1).await {
+          Ok(received) => received,
+          Err(e) => {
+            eprintln!("ROLE bulk server {index} recv: {e:?}");
+            return;
+          }
+        };
         let elapsed = slates_rt::futures::now_ns() - started;
         assert_eq!(received.len(), expected, "the bulk stream arrived whole");
         let _ = done.send((index, received.len() as u64, elapsed));
@@ -398,10 +415,26 @@ async fn coordinator(
     }
   })
   .unwrap();
-  // Bandwidth steps, applied at their times while the flows run.
+  let flows = 1 + usize::from(scenario.second_flow.is_some());
+  wait_for_bulk(&scenario, link, flows, bulk_done_rx).await;
+  BULK_DONE.store(true, Ordering::Release);
+  let _ = slates_rt::futures::join(ping_client_task).await;
+  let _ = slates_rt::futures::cancel(ping_server_task);
+  for server in servers {
+    let _ = slates_rt::futures::cancel(server);
+  }
+}
+
+/// Waits until `flows` bulk flows have reported done, applying the scenario's bandwidth steps to `link` at
+/// their times meanwhile.
+async fn wait_for_bulk(
+  scenario: &Scenario,
+  link: slates_rt::sim::SimLinkId,
+  flows: usize,
+  bulk_done_rx: std::sync::mpsc::Receiver<()>,
+) {
   let start = slates_rt::futures::now_ns();
   let mut pending_steps = scenario.steps.clone();
-  let flows = 1 + usize::from(scenario.second_flow.is_some());
   let mut finished = 0;
   while finished < flows {
     if let Ok(()) = bulk_done_rx.try_recv() {
@@ -409,27 +442,26 @@ async fn coordinator(
       continue;
     }
     let now = slates_rt::futures::now_ns() - start;
+    if std::env::var_os("BAKEOFF_PROGRESS").is_some() && now % (10_000 * MS) < MS {
+      eprintln!(
+        "progress: {} s virtual, {finished} of {flows} flows done",
+        now / (1000 * MS)
+      );
+    }
     pending_steps.retain(|step| {
-      if step.at_ns <= now {
-        sim_udp_set_link(
-          link,
-          SimLink {
-            rate_bits_per_second: step.rate,
-            queue_bytes: scenario.queue_bytes(),
-          },
-        );
-        false
-      } else {
-        true
+      if step.at_ns > now {
+        return true;
       }
+      sim_udp_set_link(
+        link,
+        SimLink {
+          rate_bits_per_second: step.rate,
+          queue_bytes: scenario.queue_bytes(),
+        },
+      );
+      false
     });
     slates_rt::futures::sleep(MS).await;
-  }
-  BULK_DONE.store(true, Ordering::Release);
-  let _ = slates_rt::futures::join(ping_client_task).await;
-  let _ = slates_rt::futures::cancel(ping_server_task);
-  for server in servers {
-    let _ = slates_rt::futures::cancel(server);
   }
 }
 

@@ -163,6 +163,9 @@ pub struct Connection {
   sent_acks: BTreeMap<u64, u64>,
   /// Received packets discarded as duplicates of a packet number already processed (RFC 9000 §12.3).
   duplicates: u64,
+  /// Stream frames the peer sent in breach of flow control or a stream's final size (RFC 9000 §4.1,
+  /// §4.5), dropped and counted.
+  violations: u64,
 }
 
 /// Why fresh data stopped being framed in one `poll_transmit`.
@@ -213,6 +216,7 @@ impl Connection {
       peer_max_data: shape.initial_window,
       sent_acks: BTreeMap::new(),
       duplicates: 0,
+      violations: 0,
     }
   }
 
@@ -480,9 +484,12 @@ impl Connection {
             .entry(*stream_id)
             .or_insert_with(|| StreamAssembler::new(initial));
           // The window is the flow-control ceiling the sender could not exceed; a duplicate or
-          // reordered segment is deduped, and a refusal would mean the peer broke flow control.
+          // reordered segment is deduped. A refusal means the peer broke flow control or sent two final
+          // sizes (RFC 9000 §4.1, §4.5): the data is dropped and the violation counted, never ignored.
           assembler.grant_window(window);
-          let _ = assembler.offer(*offset, data, *fin);
+          if assembler.offer(*offset, data, *fin).is_err() {
+            self.violations = self.violations.saturating_add(1);
+          }
         }
         Frame::Ack {
           largest,
@@ -734,9 +741,10 @@ impl Connection {
   }
 
   /// Drains and discards every receive stream whose id is below `floor` — the late replies of exchanges
-  /// the caller has abandoned (a stream id is never reused within a connection, RFC 9000 §2.1). The bytes
-  /// are **read**, not dropped, so every byte the peer sent is credited back to it; a stream that has
-  /// reached its `fin` is then forgotten, and the stragglers below the floor are capped at
+  /// the caller has abandoned, or late copies of requests already served (a stream id is never reused
+  /// within a connection, RFC 9000 §2.1). The bytes are **read**, not dropped, so every byte the peer sent
+  /// is credited back to it; a stream that has reached its `fin` has its receive half forgotten (never its
+  /// send half: a reply may still be in flight on the id), and the stragglers below the floor are capped at
   /// [`LATE_REPLY_STREAMS`], the oldest forgotten first.
   pub fn discard_streams_below(&mut self, now: u64, floor: u64) {
     let late: Vec<u64> = self
@@ -748,7 +756,7 @@ impl Connection {
     for id in &late {
       let _ = self.read_stream(now, *id);
       if self.recv_stream_complete(*id) {
-        self.forget_stream(*id);
+        self.forget_recv_stream(*id);
       }
     }
     let mut lingering: Vec<u64> = self
@@ -759,8 +767,18 @@ impl Connection {
       .collect();
     while lingering.len() > LATE_REPLY_STREAMS {
       let oldest = lingering.remove(0);
-      self.forget_stream(oldest);
+      self.forget_recv_stream(oldest);
     }
+  }
+
+  /// Forgets the receive half of stream `stream_id` only — its reassembler and its per-stream receive
+  /// accounting — leaving whatever this end is still sending on the same id. A request and its reply share
+  /// one id (`Endpoint::serve_once`), so a late copy of a served request must never take the reply in
+  /// flight with it: the whole-stream forget did, and the reply was counted complete unacknowledged
+  /// (`docs/bugs/2026-09-27-a-late-request-copy-forgot-the-reply.md`).
+  fn forget_recv_stream(&mut self, stream_id: u64) {
+    self.recv_streams.remove(&stream_id);
+    self.flow.forget_stream(stream_id);
   }
 
   /// The sender's current congestion window in bytes.
@@ -839,6 +857,11 @@ impl Connection {
   /// How many frames this end has retransmitted — the non-vacuity counter for the loss-recovery path.
   pub fn retransmitted(&self) -> u64 {
     self.retransmitted
+  }
+
+  /// How many stream frames the peer sent in breach of flow control or a final size (dropped).
+  pub fn protocol_violations(&self) -> u64 {
+    self.violations
   }
 
   /// How many received packets were discarded as duplicates (RFC 9000 §12.3).
@@ -1700,5 +1723,78 @@ mod tests {
         prop_assert_eq!(received.get(id), Some(content));
       }
     }
+  }
+
+  /// A long transfer under steady random loss (5 % both ways, the bake-off's thin-link case) completes
+  /// under every law and many seeds — no deadlock between the sender's credit and the receiver's
+  /// acknowledgements.
+  #[test]
+  fn a_long_transfer_under_random_loss_completes() {
+    for law in LAWS {
+      for seed in 1..=20u64 {
+        let mut rng = slates_machine::stats::Xorshift::new(seed);
+        let drops: Vec<u64> = (0..20_000u64).filter(|_| rng.below(20) == 0).collect();
+        let streams = vec![(1u64, stream_content(7, 16 * 1024))];
+        let (received, sender) =
+          transfer_on(&streams, law, 64, Wire::new(10 * MS, Channel::new(drops)));
+        assert_eq!(
+          received.get(&1).map(Vec::len),
+          Some(16 * 1024),
+          "{law:?} seed {seed}: stalled with {} in flight, window {}, rtx {}",
+          sender.bytes_in_flight(),
+          sender.congestion_window(),
+          sender.retransmitted()
+        );
+      }
+    }
+  }
+
+  /// §4.8 request/reply on one stream id (`Endpoint::serve_once`): the server has served a request and
+  /// its reply is in flight on the same id; a late copy of the request then arrives (a probe the client
+  /// sent before it heard anything) and the server discards the stale request below its floor. Discarding
+  /// forgets the stale receive half only: the reply stays in flight and is still delivered. Regression:
+  /// the discard forgot the whole stream, so the reply left tracking unacknowledged, counted complete, and
+  /// the client waited forever (a 64 kbit/s, 5 %-loss bake-off run deadlocked; 2026-09-27).
+  #[test]
+  fn discarding_a_late_request_copy_keeps_the_reply_in_flight() {
+    let id = 7;
+    let mut client = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let mut server = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    client.open(id, &stream_content(1, 4));
+    let (request_pn, request) = client.poll_transmit(0, FRAME_CAP).expect("the request");
+    server.handle_incoming(0, request_pn, &request);
+    assert_eq!(
+      server.read_stream(0, id).len(),
+      4,
+      "the server read the request"
+    );
+    assert!(server.recv_stream_complete(id));
+    // The server replies on the same id; the reply packet is lost on the path.
+    server.open(id, &stream_content(2, 4));
+    let (_lost_pn, _lost_reply) = server.poll_transmit(0, FRAME_CAP).expect("the reply");
+    // The client, having heard nothing, probes: a copy of its request in a new packet reaches the server.
+    assert!(client.probe());
+    let (probe_pn, probe) = client.poll_transmit(MS, FRAME_CAP).expect("the probe");
+    server.handle_incoming(MS, probe_pn, &probe);
+    // The server's exchange floor has passed the id: the late copy is discarded.
+    server.discard_streams_below(MS, id + 1);
+    assert!(!server.send_complete(), "the reply is still owed");
+    assert_eq!(
+      server.in_flight_count(),
+      1,
+      "the reply packet is still in flight"
+    );
+    // The reply is eventually recovered and delivered: the probe timeout resends it.
+    let now = server.next_timeout().expect("the reply's probe timer");
+    assert!(server.on_timeout(now), "the probe timeout owes a probe");
+    while let Some((pn, frames)) = server.poll_transmit(now, FRAME_CAP) {
+      client.handle_incoming(now, pn, &frames);
+    }
+    assert_eq!(
+      client.read_stream(now, id),
+      stream_content(2, 4),
+      "the reply reached the client"
+    );
+    assert!(client.recv_stream_complete(id));
   }
 }

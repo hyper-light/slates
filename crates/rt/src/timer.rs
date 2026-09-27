@@ -47,6 +47,8 @@ pub struct Wheel {
   armed: usize,
   earliest: Option<u64>,
   earliest_exact: bool,
+  /// Ticks the wheel has examined (`expire_tick` calls) — the cost witness of `advance`.
+  visits: u64,
 }
 
 impl Wheel {
@@ -65,7 +67,13 @@ impl Wheel {
       armed: 0,
       earliest: None,
       earliest_exact: true,
+      visits: 0,
     }
+  }
+
+  /// Ticks examined so far — what `advance` cost, in the unit its work is done in.
+  pub const fn visits(&self) -> u64 {
+    self.visits
   }
 
   /// Nanoseconds per tick.
@@ -135,24 +143,16 @@ impl Wheel {
   }
 
   /// Advances to `now_ns`, collecting the words of every expired timer into `fired` in deadline
-  /// order within a tick.
+  /// order within a tick. Each step jumps straight to the next tick that has work — a level-0 slot to
+  /// fire, or a higher level's slot to cascade at its boundary ([`Wheel::next_event_tick`]) — so the cost
+  /// is per timer event, never per idle tick: a shard idle for 66,600 ticks between two timers examined
+  /// 66,595 of them before (every tick once any timer had fired), which made a simulated 64 kbit/s run
+  /// take minutes of CPU (2026-09-27).
   pub fn advance(&mut self, now_ns: u64, fired: &mut Vec<u64>) {
     let target = now_ns / self.tick_ns;
     let before = fired.len();
     while self.now_tick < target {
-      // Ticks before the earliest deadline hold nothing at level 0, but a higher level cascades
-      // at every multiple of the slot count, so a skip stops just before the next such boundary.
-      if let Some(earliest) = self.earliest
-        && self.earliest_exact
-        && earliest > self.now_tick + 1
-      {
-        let boundary = (self.now_tick | (SLOTS_PER_LEVEL as u64 - 1)) + 1;
-        let jump = (earliest - 1).min(target - 1).min(boundary - 1);
-        if jump > self.now_tick {
-          self.now_tick = jump;
-        }
-      }
-      self.now_tick += 1;
+      self.now_tick = self.next_event_tick(target);
       self.expire_tick(fired);
     }
     if fired.len() > before {
@@ -160,7 +160,34 @@ impl Wheel {
     }
   }
 
+  /// The next tick after `now_tick`, at most `target`, at which some level has an occupied slot to process:
+  /// for each level, the boundaries of its slots after `now_tick` (every tick at level 0, every `64^L`
+  /// ticks at level `L`) are scanned for a non-empty slot, at most one rotation (64 slots) per level. An
+  /// entry at level `L` lies less than one rotation of that level ahead (`level_and_slot`), and its slot's
+  /// boundary is after `now_tick` (its distance is at least `64^L`), so the scan always meets it.
+  fn next_event_tick(&self, target: u64) -> u64 {
+    let mut best = target;
+    for level in 0..LEVELS {
+      let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
+      let span = 1u64 << shift;
+      let mut boundary = ((self.now_tick >> shift) + 1) << shift;
+      for _ in 0..SLOTS_PER_LEVEL {
+        if boundary >= best {
+          break;
+        }
+        let slot = usize::try_from((boundary >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
+        if self.heads[level * SLOTS_PER_LEVEL + slot] != NONE {
+          best = boundary;
+          break;
+        }
+        boundary = boundary.saturating_add(span);
+      }
+    }
+    best
+  }
+
   fn expire_tick(&mut self, fired: &mut Vec<u64>) {
+    self.visits += 1;
     let tick = self.now_tick;
     // Level 0 slot for this tick fires; a higher level's slot that this tick enters cascades.
     for level in 0..LEVELS {
@@ -382,5 +409,28 @@ mod tests {
     assert!(fired.is_empty());
     wheel.advance(far, &mut fired);
     assert_eq!(fired, vec![42]);
+  }
+
+  /// §4.3 (a shard's wake cost must not grow with its idle time): after a timer has fired, advancing across
+  /// a long idle stretch to the next timer examines a number of ticks bounded by the wheel's levels and the
+  /// timers it passes — not one per tick, nor one per 64-tick boundary. A 10 µs tick and a 666 ms idle wait
+  /// (a session's idle re-drive) is 66,600 ticks; the wheel walked most of them after any firing.
+  #[test]
+  fn advancing_across_an_idle_stretch_costs_per_event_not_per_tick() {
+    let mut wheel = Wheel::new(1, 16, 0);
+    let mut fired = Vec::new();
+    wheel.insert(5, 1).unwrap();
+    wheel.advance(5, &mut fired);
+    assert_eq!(fired, vec![1], "the first timer fired");
+    let far = 66_600;
+    wheel.insert(far, 2).unwrap();
+    let before = wheel.visits();
+    wheel.advance(far, &mut fired);
+    assert_eq!(fired, vec![1, 2], "the far timer fired on time");
+    let visited = wheel.visits() - before;
+    assert!(
+      visited <= 2 * LEVELS as u64,
+      "{visited} ticks examined to reach one timer {far} ticks away"
+    );
   }
 }
