@@ -118,6 +118,56 @@ pub enum Frame {
     /// One past the highest stream sequence the peer may open.
     max: u64,
   },
+  /// The sender is blocked by the connection's credit at `limit` (RFC 9000 §19.12 `DATA_BLOCKED`).
+  /// Ack-eliciting and retransmitted on loss, so the receiver always answers with an acknowledgement,
+  /// which carries its current credit — the credit reaches a blocked sender even when the acknowledgement
+  /// that first carried it was lost.
+  DataBlocked {
+    /// The connection credit the sender is blocked at.
+    limit: u64,
+  },
+  /// The sender is blocked by stream `stream_id`'s credit at `limit` (RFC 9000 §19.13
+  /// `STREAM_DATA_BLOCKED`); the receiver answers with that stream's current credit.
+  StreamDataBlocked {
+    /// The blocked stream.
+    stream_id: u64,
+    /// The stream credit the sender is blocked at.
+    limit: u64,
+  },
+}
+
+/// Format: a `Stream` frame's bytes before its data — kind (1), stream id (8), offset (8), flags (1),
+/// data length (4).
+pub const STREAM_FRAME_HEADER_BYTES: usize = 1 + 8 + 8 + 1 + 4;
+/// Format: an `Ack` frame's bytes before its additional ranges — kind (1), largest (8), first range (8),
+/// range count (2).
+pub const ACK_FRAME_BASE_BYTES: usize = 1 + 8 + 8 + 2;
+/// Format: the bytes of each additional ACK range — gap (8), length (8).
+pub const ACK_RANGE_BYTES: usize = 8 + 8;
+/// Format: a frame of a kind byte and one `u64` (`MaxData`, `StopSending`, `MaxStreams`, `DataBlocked`).
+const ONE_WORD_FRAME_BYTES: usize = 1 + 8;
+/// Format: a frame of a kind byte and two `u64`s (`MaxStreamData`, `ResetStream`, `StreamDataBlocked`).
+const TWO_WORD_FRAME_BYTES: usize = 1 + 8 + 8;
+
+impl Frame {
+  /// The bytes this frame encodes to — exactly the length [`encode_frames`] writes for it, so a packet is
+  /// filled to its datagram budget and never past it.
+  pub fn encoded_len(&self) -> usize {
+    match self {
+      Frame::Stream { data, .. } => STREAM_FRAME_HEADER_BYTES.saturating_add(data.len()),
+      Frame::Ack { ranges, .. } => {
+        let count = ranges.len().min(usize::from(u16::MAX));
+        ACK_FRAME_BASE_BYTES.saturating_add(count.saturating_mul(ACK_RANGE_BYTES))
+      }
+      Frame::MaxData { .. }
+      | Frame::StopSending { .. }
+      | Frame::MaxStreams { .. }
+      | Frame::DataBlocked { .. } => ONE_WORD_FRAME_BYTES,
+      Frame::MaxStreamData { .. } | Frame::ResetStream { .. } | Frame::StreamDataBlocked { .. } => {
+        TWO_WORD_FRAME_BYTES
+      }
+    }
+  }
 }
 
 /// Format: RFC 9000 §19.1 — the PADDING frame is a single zero byte with no content; the decoder
@@ -138,6 +188,10 @@ const KIND_RESET_STREAM: u8 = 5;
 const KIND_STOP_SENDING: u8 = 6;
 /// Format: the stream-credit frame kind (RFC 9000 §19.11 `MAX_STREAMS`).
 const KIND_MAX_STREAMS: u8 = 7;
+/// Format: the connection-blocked frame kind (RFC 9000 §19.12 `DATA_BLOCKED`).
+const KIND_DATA_BLOCKED: u8 = 8;
+/// Format: the stream-blocked frame kind (RFC 9000 §19.13 `STREAM_DATA_BLOCKED`).
+const KIND_STREAM_DATA_BLOCKED: u8 = 9;
 
 /// Format: the `Stream` frame's `fin` flag bit; every other bit of the flags byte must be zero.
 const STREAM_FIN: u8 = 0b0000_0001;
@@ -203,6 +257,15 @@ impl Frame {
       Frame::MaxStreams { max } => {
         out.push(KIND_MAX_STREAMS);
         out.extend_from_slice(&max.to_le_bytes());
+      }
+      Frame::DataBlocked { limit } => {
+        out.push(KIND_DATA_BLOCKED);
+        out.extend_from_slice(&limit.to_le_bytes());
+      }
+      Frame::StreamDataBlocked { stream_id, limit } => {
+        out.push(KIND_STREAM_DATA_BLOCKED);
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        out.extend_from_slice(&limit.to_le_bytes());
       }
     }
   }
@@ -285,6 +348,13 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
       KIND_MAX_STREAMS => Frame::MaxStreams {
         max: reader.u64().map_err(|_| SessionError::Truncated)?,
       },
+      KIND_DATA_BLOCKED => Frame::DataBlocked {
+        limit: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
+      KIND_STREAM_DATA_BLOCKED => Frame::StreamDataBlocked {
+        stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
+        limit: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
       other => return Err(SessionError::UnknownFrame(other)),
     };
     frames.push(frame);
@@ -326,6 +396,11 @@ mod tests {
       },
       Frame::StopSending { stream_id: 12 },
       Frame::MaxStreams { max: 64 },
+      Frame::DataBlocked { limit: 1 << 18 },
+      Frame::StreamDataBlocked {
+        stream_id: 11,
+        limit: 4096,
+      },
     ]
   }
 
@@ -388,6 +463,12 @@ mod tests {
         0xAA, 0xBB, // data
       ]
     );
+  }
+
+  /// Golden vectors for the stream-control frames (the same contract as the data frames above): the exact
+  /// bytes each encodes to, little-endian per D-15.
+  #[test]
+  fn the_stream_control_frames_encode_to_their_golden_bytes() {
     // ResetStream: kind 5, stream id (3) u64 LE, final size (258 = 0x0102) u64 LE.
     assert_eq!(
       encode_frames(&[Frame::ResetStream {
@@ -406,6 +487,19 @@ mod tests {
       encode_frames(&[Frame::MaxStreams { max: 0x0105 }]),
       vec![7, 5, 1, 0, 0, 0, 0, 0, 0]
     );
+    // DataBlocked: kind 8, limit (0x0203) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::DataBlocked { limit: 0x0203 }]),
+      vec![8, 3, 2, 0, 0, 0, 0, 0, 0]
+    );
+    // StreamDataBlocked: kind 9, stream id (6) u64 LE, limit (0x0304) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::StreamDataBlocked {
+        stream_id: 6,
+        limit: 0x0304
+      }]),
+      vec![9, 6, 0, 0, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0, 0, 0]
+    );
     // PADDING is a single zero byte the decoder consumes with no frame produced.
     assert_eq!(decode_frames(&[0]), Ok(Vec::new()));
   }
@@ -419,6 +513,21 @@ mod tests {
     }]);
     let stop = encode_frames(&[Frame::StopSending { stream_id: 4 }]);
     let credit = encode_frames(&[Frame::MaxStreams { max: 0x0105 }]);
+    for blocked in [
+      encode_frames(&[Frame::DataBlocked { limit: 0x0203 }]),
+      encode_frames(&[Frame::StreamDataBlocked {
+        stream_id: 6,
+        limit: 0x0304,
+      }]),
+    ] {
+      for cut in 1..blocked.len() {
+        assert_eq!(
+          decode_frames(&blocked[..cut]),
+          Err(SessionError::Truncated),
+          "blocked cut at {cut}"
+        );
+      }
+    }
     for cut in 1..credit.len() {
       assert_eq!(
         decode_frames(&credit[..cut]),
@@ -438,6 +547,32 @@ mod tests {
         decode_frames(&stop[..cut]),
         Err(SessionError::Truncated),
         "stop cut at {cut}"
+      );
+    }
+  }
+
+  /// Every frame's `encoded_len` is exactly the bytes `encode_frames` writes for it — the packet builder
+  /// fills a datagram by these lengths, so a mismatch would overrun the path's floor (T-transport: a
+  /// packet that grew past its budget was truncated at the receiver and read as a loss, 2026-09-28).
+  #[test]
+  fn encoded_len_is_exactly_what_encoding_writes() {
+    let mut frames = sample();
+    frames.push(Frame::Stream {
+      stream_id: 1,
+      offset: 0,
+      fin: true,
+      data: Vec::new(),
+    });
+    frames.push(Frame::Ack {
+      largest: 9,
+      range: 0,
+      ranges: Vec::new(),
+    });
+    for frame in &frames {
+      assert_eq!(
+        frame.encoded_len(),
+        encode_frames(std::slice::from_ref(frame)).len(),
+        "{frame:?}"
       );
     }
   }

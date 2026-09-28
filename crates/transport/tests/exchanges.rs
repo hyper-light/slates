@@ -30,14 +30,14 @@ use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{
   ConnectionShape, Priority, StreamRefusal, initial_receive_window,
 };
-use slates_transport::endpoint::{Endpoint, EndpointCensus, EndpointError, MIN_DATAGRAM_BYTES};
+use slates_transport::endpoint::{
+  Endpoint, EndpointCensus, EndpointError, MAX_PACKET_PAYLOAD, MIN_DATAGRAM_BYTES,
+};
 use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
-/// Format: the fleet's per-packet overhead bound (`crates/server/src/fleet.rs` `FLEET_PACKET_OVERHEAD`).
-const PACKET_OVERHEAD: usize = 80;
-/// Format: the fleet's frame cap, so these sessions frame exactly as the daemon's do.
-const FRAME_CAP: usize = MIN_DATAGRAM_BYTES - PACKET_OVERHEAD;
+/// Format: the fleet's packet budget, so the bake-off frames exactly as the daemon does.
+const FRAME_CAP: usize = MAX_PACKET_PAYLOAD;
 /// Format: nanoseconds per millisecond and per second.
 const MS: u64 = 1_000_000;
 const NS_PER_SECOND: u64 = 1_000_000_000;
@@ -140,6 +140,7 @@ impl Net {
       None => SimPath::in_order(self.one_way_ns, 0),
     }
     .with_loss(self.loss)
+    .with_mtu(MIN_DATAGRAM_BYTES)
   }
 
   /// The failure-mode networks: 5 % random loss, burst loss, and reordering, on a 10 ms path.

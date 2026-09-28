@@ -46,6 +46,9 @@ use crate::session::{Frame, decode_frames, encode_frames};
 /// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
 /// frame cap and a receive queue's sizing derive from it.
 pub const MIN_DATAGRAM_BYTES: usize = 1200;
+/// Format: RFC 8446 §5.2 / RFC 9001 §5.3 — every TLS 1.3 AEAD (AES-GCM, ChaCha20-Poly1305) appends a
+/// 16-byte tag to a protected packet.
+const AEAD_TAG_BYTES: usize = 16;
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
 /// it clear is not a valid short header.
 const FIXED_BIT: u8 = 0x40;
@@ -74,6 +77,13 @@ const PACKET_NUMBER_OFFSET: usize = 1 + CONNECTION_ID_BYTES;
 /// length. Derived from the packet-number offset and the maximum field width.
 const HEADER_PROTECTION_SAMPLE_OFFSET: usize =
   PACKET_NUMBER_OFFSET + MAX_PACKET_NUMBER_BYTES as usize;
+/// The most encoded frame bytes a 1-RTT packet carries so that, with its short header (first byte,
+/// connection id, the longest packet number) and its AEAD tag, it fits the datagram floor every path must
+/// carry ([`MIN_DATAGRAM_BYTES`]). A session's packet budget (`ConnectionShape::max_datagram`) may not
+/// exceed it — a larger packet would be dropped by a path at the floor, or truncated by a receive buffer.
+/// Derived: `1200 − (1 + 8 + 4) − 16 = 1171`.
+pub const MAX_PACKET_PAYLOAD: usize =
+  MIN_DATAGRAM_BYTES - PACKET_NUMBER_OFFSET - MAX_PACKET_NUMBER_BYTES as usize - AEAD_TAG_BYTES;
 
 /// The largest datagram either end sends or reads — a handshake flight, or a 1-RTT packet (which never
 /// exceeds [`MIN_DATAGRAM_BYTES`]). A handshake flight is sent whole in one datagram and read into a
@@ -160,6 +170,37 @@ pub enum EndpointError {
   /// An exchange could not be opened or replied on (`crate::streams`): too many waiting past the peer's
   /// stream credit, the sequences exhausted, or a reply on a stream the peer never opened.
   Stream(crate::streams::StreamRefusal),
+  /// The session's packet budget (`ConnectionShape::max_datagram`) is outside what the packet format
+  /// allows: below the smallest packet a connection works with, or above what fits the datagram floor.
+  PacketBudget {
+    /// The budget asked for.
+    budget: u64,
+    /// The smallest allowed (`connection::MIN_PACKET_BUDGET`).
+    min: usize,
+    /// The largest allowed ([`MAX_PACKET_PAYLOAD`]).
+    max: usize,
+  },
+  /// A 1-RTT packet came out larger than the datagram floor — the packet builder's budget was broken.
+  /// Refused rather than sent, so the fault is loud instead of a packet a path silently drops.
+  DatagramTooLarge {
+    /// The packet's size.
+    bytes: usize,
+    /// The floor it had to fit.
+    cap: usize,
+  },
+}
+
+/// Checks a session's packet budget against the packet format (see [`EndpointError::PacketBudget`]).
+fn checked_budget(shape: &ConnectionShape) -> Result<usize, EndpointError> {
+  let min = crate::connection::MIN_PACKET_BUDGET;
+  usize::try_from(shape.max_datagram)
+    .ok()
+    .filter(|budget| (min..=MAX_PACKET_PAYLOAD).contains(budget))
+    .ok_or(EndpointError::PacketBudget {
+      budget: shape.max_datagram,
+      min,
+      max: MAX_PACKET_PAYLOAD,
+    })
 }
 
 /// Everything an endpoint holds per exchange and per stream ([`Endpoint::census`]).
@@ -337,7 +378,7 @@ impl Endpoint {
       cid: None,
       conn: Connection::new(shape, Role::Client, now_ns(), 0),
       rx_largest: 0,
-      frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+      frame_cap: checked_budget(&shape)?,
       seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
@@ -372,7 +413,7 @@ impl Endpoint {
       cid: None,
       conn: Connection::new(shape, Role::Server, now_ns(), 0),
       rx_largest: 0,
-      frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+      frame_cap: checked_budget(&shape)?,
       seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
@@ -410,7 +451,7 @@ impl Endpoint {
       cid: None,
       conn: Connection::new(shape, Role::Server, now_ns(), 0),
       rx_largest: 0,
-      frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+      frame_cap: checked_budget(&shape)?,
       seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
@@ -936,6 +977,12 @@ impl Endpoint {
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     while let Some((pn, frames)) = self.conn.poll_transmit(now_ns(), self.frame_cap) {
       let datagram = protect_packet(keys, &cid, pn, self.conn.tx_largest_acked(), &frames)?;
+      if datagram.len() > MIN_DATAGRAM_BYTES {
+        return Err(EndpointError::DatagramTooLarge {
+          bytes: datagram.len(),
+          cap: MIN_DATAGRAM_BYTES,
+        });
+      }
       self.send(&datagram)?;
     }
     Ok(())
@@ -1201,6 +1248,16 @@ impl Endpoint {
       }
       self.receive_or_probe().await?;
     }
+  }
+
+  /// The congestion window, bytes (for reports).
+  pub fn congestion_window(&self) -> u64 {
+    self.conn.congestion_window()
+  }
+
+  /// Why the connection's fresh sending stopped, counted (`Connection::send_stops`).
+  pub fn send_stops(&self) -> crate::connection::SendStops {
+    self.conn.send_stops()
   }
 
   /// Everything this end holds per exchange and per stream, counted — the leak witness: after a session
@@ -1488,8 +1545,8 @@ mod tests {
             &identity.certificate(),
             "slates-node",
             crate::connection::ConnectionShape::for_frame_cap(
-              MIN_DATAGRAM_BYTES,
-              crate::connection::initial_receive_window(MIN_DATAGRAM_BYTES),
+              MAX_PACKET_PAYLOAD,
+              crate::connection::initial_receive_window(MAX_PACKET_PAYLOAD),
               crate::congestion::ControllerKind::NewReno,
             ),
           )
@@ -1500,8 +1557,8 @@ mod tests {
             &identity,
             &[identity.certificate()],
             crate::connection::ConnectionShape::for_frame_cap(
-              MIN_DATAGRAM_BYTES,
-              crate::connection::initial_receive_window(MIN_DATAGRAM_BYTES),
+              MAX_PACKET_PAYLOAD,
+              crate::connection::initial_receive_window(MAX_PACKET_PAYLOAD),
               crate::congestion::ControllerKind::NewReno,
             ),
           )

@@ -84,7 +84,11 @@ impl StreamSender {
     let hi = lo
       .saturating_add(usize::try_from(want).unwrap_or(0))
       .min(self.buffered.len());
-    let data = self.buffered[lo..hi].to_vec();
+    let data = self
+      .buffered
+      .get(lo..hi)
+      .map(<[u8]>::to_vec)
+      .unwrap_or_default();
     self.send_offset = start + (hi - lo) as u64;
     // The fin rides the frame that carries the final byte (when the credit reaches the end).
     let fin = self.finished && self.send_offset == self.buffered.len() as u64;
@@ -109,6 +113,14 @@ impl StreamSender {
         && !self.fin_framed
         && self.send_offset == buffered
         && self.send_offset <= self.credit)
+  }
+
+  /// The credit limit this stream is blocked at: `Some(credit)` when every byte within the credit has
+  /// been framed and more remain beyond it — the sender can do nothing until the peer raises the stream's
+  /// credit (RFC 9000 §19.13 `STREAM_DATA_BLOCKED`). `None` while it can still send, or has nothing left.
+  pub fn blocked_at(&self) -> Option<u64> {
+    (self.send_offset >= self.credit && self.buffered.len() as u64 > self.credit)
+      .then_some(self.credit)
   }
 
   /// The absolute offset framed so far (bytes handed to `next_frame`).

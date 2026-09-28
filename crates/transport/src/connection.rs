@@ -41,7 +41,7 @@ use crate::delivery::DeliveryRate;
 use crate::flow::FlowController;
 use crate::pacer::Pacer;
 use crate::rtt::RttEstimator;
-use crate::session::Frame;
+use crate::session::{ACK_FRAME_BASE_BYTES, ACK_RANGE_BYTES, Frame, STREAM_FRAME_HEADER_BYTES};
 use crate::stream::{StreamAssembler, StreamSender};
 use crate::streams::{Arrival, ReplyAdmission, StreamSpace, priority};
 
@@ -57,8 +57,38 @@ const PTO_BACKOFF_SHIFT_CAP: u32 = 12;
 /// it lets the gap form. Anchored to `conn::REORDER_THRESHOLD` and the frame size. The window then
 /// auto-tunes toward the path's BDP (`crate::flow`), up to the session's receive ceiling.
 pub fn initial_receive_window(max_frame_len: usize) -> u64 {
-  (REORDER_THRESHOLD + 1).saturating_mul(max_frame_len as u64)
+  (REORDER_THRESHOLD + 1).saturating_mul(stream_bytes_per_packet(max_frame_len))
 }
+
+/// The most stream data one packet of `packet_budget` encoded frame bytes carries: the budget less one
+/// `Stream` frame's header.
+pub fn stream_bytes_per_packet(packet_budget: usize) -> u64 {
+  packet_budget
+    .saturating_sub(STREAM_FRAME_HEADER_BYTES)
+    .max(1) as u64
+}
+
+/// The smallest packet budget a connection works with: room for an acknowledgement with no extra ranges
+/// plus the connection credit that rides it, and for a `Stream` frame carrying at least one byte.
+/// Derived: `max(ACK base + MaxData, Stream header + 1)` from the frame formats (`crate::session`).
+pub const MIN_PACKET_BUDGET: usize = {
+  let ack = ACK_FRAME_BASE_BYTES + CREDIT_FRAME_BYTES;
+  let stream = STREAM_FRAME_HEADER_BYTES + 1;
+  if ack > stream { ack } else { stream }
+};
+/// The additional ACK ranges one acknowledgement carries at a packet budget of `packet_budget` bytes: the
+/// budget less the ACK's base and the connection credit riding with it, over the bytes each range costs.
+fn ack_ranges_for(packet_budget: u64) -> usize {
+  usize::try_from(packet_budget)
+    .unwrap_or(usize::MAX)
+    .saturating_sub(ACK_FRAME_BASE_BYTES + CREDIT_FRAME_BYTES)
+    / ACK_RANGE_BYTES
+}
+
+/// Format: a `MaxData` frame's bytes (kind, one `u64`).
+const CREDIT_FRAME_BYTES: usize = 1 + 8;
+/// Format: a `MaxStreamData` frame's bytes (kind, stream id, max).
+const STREAM_CREDIT_FRAME_BYTES: usize = 1 + 8 + 8;
 
 pub use crate::streams::{Priority, Role, StreamCensus, StreamRefusal};
 
@@ -137,6 +167,27 @@ pub struct ConnectionCensus {
   pub control: usize,
   /// Ack-eliciting packets in flight.
   pub in_flight: usize,
+  /// Receive streams whose last advertised credit is remembered.
+  pub credit_tracked: usize,
+  /// Send streams whose last blocked report is remembered.
+  pub blocked_tracked: usize,
+}
+
+/// Why fresh sending stopped, counted over the connection's life — the evidence for what limits a sender
+/// (its congestion window, the pacer, the peer's credit, or simply no data), read by the bake-offs and the
+/// tests that ask why a flow is slow.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendStops {
+  /// The packet budget was filled (the normal, unconstrained stop).
+  pub budget: u64,
+  /// The congestion window was full.
+  pub window: u64,
+  /// The pacer held the next packet.
+  pub pacer: u64,
+  /// The peer's connection credit was spent.
+  pub credit: u64,
+  /// No stream had data it could send (none at all, or none within its stream credit).
+  pub empty: u64,
 }
 
 /// How the sender chooses which stream fills the next frame. **Bake-off in progress (2026-09-27):** the
@@ -274,6 +325,26 @@ pub struct Connection {
   /// probe.
   probe_copies: VecDeque<u64>,
   probe_copy_pending: bool,
+  /// Why fresh sending stopped, counted ([`Connection::send_stops`]).
+  stops: SendStops,
+  /// The stream credit last advertised for each receive stream: a stream whose credit moved since is
+  /// advertised first. Held only for open receive streams (removed as each closes).
+  credit_sent: BTreeMap<u64, u64>,
+  /// The receive stream the rotating credit refresh reached last: every stream's credit is re-advertised
+  /// in turn as room allows, so a credit carried by a lost acknowledgement is always sent again.
+  credit_cursor: u64,
+  /// The connection credit limit a `DataBlocked` was last sent for, and each send stream's limit a
+  /// `StreamDataBlocked` was last sent for (held only for open send streams) — each is sent once per limit.
+  blocked_sent: Option<u64>,
+  stream_blocked_sent: BTreeMap<u64, u64>,
+}
+
+/// What one packet has used so far: its encoded frame bytes (against the datagram budget) and its stream
+/// data bytes (against the congestion window).
+#[derive(Clone, Copy, Debug, Default)]
+struct Packing {
+  used: u64,
+  data: u64,
 }
 
 /// Why fresh data stopped being framed in one `poll_transmit`.
@@ -305,14 +376,21 @@ impl Connection {
       weighted_turn: Priority::Control,
       control: VecDeque::new(),
       unacked: BTreeMap::new(),
-      // Derived: one stream per frame's worth of the session's receive budget — the receive ceiling over
-      // the frame cap — so the peer's open streams can never hold more than the budget in reassembly
-      // state; both ends derive the same limit from the same shape (R8).
-      streams: StreamSpace::new(role, shape.receive_ceiling / shape.max_datagram.max(1)),
+      // Derived: one stream per packet's worth of stream data within the session's receive budget — the
+      // receive ceiling over the stream bytes a packet carries — so the peer's open streams can never hold
+      // more than the budget in reassembly state; both ends derive the same limit from the same shape (R8).
+      streams: StreamSpace::new(
+        role,
+        shape.receive_ceiling
+          / stream_bytes_per_packet(usize::try_from(shape.max_datagram).unwrap_or(usize::MAX)),
+      ),
       sent: SentTracker::new(),
       retransmit: VecDeque::new(),
       recv_streams: BTreeMap::new(),
-      acks: AckGenerator::new(),
+      // The receive side holds as many ranges as one acknowledgement can report (its first range plus
+      // the additional ones that fit the packet budget): beyond them a range could never be acknowledged
+      // anyway, and the generator stays bounded however many packets arrive.
+      acks: AckGenerator::new(ack_ranges_for(shape.max_datagram).saturating_add(1)),
       flow: FlowController::new(shape.initial_window, shape.receive_ceiling),
       initial_window: shape.initial_window,
       ack_owed: false,
@@ -338,17 +416,12 @@ impl Connection {
       resets_owed: std::collections::BTreeSet::new(),
       probe_copies: VecDeque::new(),
       probe_copy_pending: false,
+      stops: SendStops::default(),
+      credit_sent: BTreeMap::new(),
+      credit_cursor: 0,
+      blocked_sent: None,
+      stream_blocked_sent: BTreeMap::new(),
     }
-  }
-
-  /// The most additional ACK ranges the acknowledgement frame may carry (RFC 9000 §19.3.1), derived so
-  /// the whole ACK fits one `max_frame_len`-byte frame: the frame cap, less the ACK header (kind byte,
-  /// largest, first range, range count), over the bytes each additional range costs (a gap and a
-  /// length). Beyond it, older received runs are retransmitted and deduped rather than acknowledged.
-  fn max_ack_ranges(max_frame_len: usize) -> usize {
-    let header = size_of::<u8>() + size_of::<u64>() + size_of::<u64>() + size_of::<u16>();
-    let per_range = size_of::<u64>() + size_of::<u64>();
-    max_frame_len.saturating_sub(header) / per_range.max(1)
   }
 
   /// Opens this end's next stream, of request `kind` in class `priority`, carrying the whole of `data`
@@ -456,23 +529,31 @@ impl Connection {
   /// current receive credit. An acknowledgement-only packet is neither paced nor window-limited.
   pub fn poll_transmit(&mut self, now: u64, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
     let budget = packet_budget as u64;
+    if self.sent.in_flight_count() == 0 {
+      self.note_blocked();
+    }
     let probe = self.probes_owed > 0;
-    // Stream control frames leave first and unpaced: a few bytes each, carrying no stream data (so they
-    // take no window), and each one ends a peer's wait (a reset, a stop, fresh stream credit).
-    let mut reliable: Vec<Frame> = self.control.drain(..).collect();
+    let mut packing = Packing::default();
+    // The acknowledgement leads (sized to fit, with the connection credit), then stream control frames,
+    // then retransmissions and fresh data, then as much stream credit as the room left holds — every frame
+    // counted by its encoded length, so the packet never exceeds its budget (the datagram's floor).
+    let mut frames = Vec::new();
+    let ack_largest = self.push_acknowledgement(&mut frames, &mut packing, budget);
+    let carries_ack = !frames.is_empty();
+    let mut reliable: Vec<Frame> = Vec::new();
+    self.take_control(&mut reliable, &mut packing, budget);
     let control_frames = reliable.len();
     let stop = match self.pacing_hold(now, budget, probe) {
       Some(release) => FreshStop::Pacer(release),
-      None => {
-        let mut packed = 0;
-        self
-          .take_retransmissions(budget, probe, &mut reliable, &mut packed)
-          .unwrap_or_else(|| self.take_fresh(budget, probe, &mut reliable, &mut packed))
-      }
+      None => self
+        .take_retransmissions(budget, probe, &mut reliable, &mut packing)
+        .unwrap_or_else(|| self.take_fresh(budget, probe, &mut reliable, &mut packing)),
     };
     self.note_stop(stop, reliable.len() == control_frames);
-    let mut frames = reliable.clone();
-    let ack_largest = self.push_acknowledgement(&mut frames, packet_budget);
+    frames.extend(reliable.iter().cloned());
+    if carries_ack || self.credit_moved() {
+      self.push_stream_credit(&mut frames, &mut packing, budget);
+    }
     if frames.is_empty() {
       return None;
     }
@@ -481,6 +562,53 @@ impl Connection {
       self.record_sent(now, pn, reliable, probe, ack_largest);
     }
     Some((pn, frames))
+  }
+
+  /// With nothing in flight no probe timer runs, so a sender blocked by credit would wait forever if the
+  /// acknowledgement that carried fresh credit was lost: it tells the peer instead (RFC 9000 §19.12-13),
+  /// with a reliable, ack-eliciting `DataBlocked` / `StreamDataBlocked`, whose acknowledgement carries the
+  /// credit. Each is sent once per limit; a raised limit that blocks again is reported again.
+  fn note_blocked(&mut self) {
+    let data_waiting = self
+      .send_streams
+      .iter()
+      .any(|(&stream_id, sender)| self.streams.sendable(stream_id) && !sender.is_drained());
+    if data_waiting
+      && self.connection_sent >= self.peer_max_data
+      && self.blocked_sent != Some(self.peer_max_data)
+    {
+      self.blocked_sent = Some(self.peer_max_data);
+      self.control.push_back(Frame::DataBlocked {
+        limit: self.peer_max_data,
+      });
+    }
+    let newly_blocked: Vec<(u64, u64)> = self
+      .send_streams
+      .iter()
+      .filter(|&(&stream_id, _)| self.streams.sendable(stream_id))
+      .filter_map(|(&stream_id, sender)| sender.blocked_at().map(|limit| (stream_id, limit)))
+      .filter(|(stream_id, limit)| self.stream_blocked_sent.get(stream_id) != Some(limit))
+      .collect();
+    for (stream_id, limit) in newly_blocked {
+      self.stream_blocked_sent.insert(stream_id, limit);
+      self
+        .control
+        .push_back(Frame::StreamDataBlocked { stream_id, limit });
+    }
+  }
+
+  /// Moves queued stream control frames into the packet while they fit.
+  fn take_control(&mut self, reliable: &mut Vec<Frame>, packing: &mut Packing, budget: u64) {
+    while let Some(front) = self.control.front() {
+      let bytes = front.encoded_len() as u64;
+      if packing.used.saturating_add(bytes) > budget {
+        return;
+      }
+      if let Some(frame) = self.control.pop_front() {
+        packing.used = packing.used.saturating_add(bytes);
+        reliable.push(frame);
+      }
+    }
   }
 
   /// When ack-eliciting data waits and no probe is owed: the pacer's release time if it holds the next
@@ -509,18 +637,23 @@ impl Connection {
     budget: u64,
     probe: bool,
     reliable: &mut Vec<Frame>,
-    packed: &mut u64,
+    packing: &mut Packing,
   ) -> Option<FreshStop> {
-    while *packed < budget {
-      let bytes = tracked_bytes(self.retransmit.front()?);
-      if !probe && !self.window_room(*packed, bytes) {
+    loop {
+      let front = self.retransmit.front()?;
+      let bytes = front.encoded_len() as u64;
+      let data = tracked_bytes(front);
+      if packing.used.saturating_add(bytes) > budget {
+        return Some(FreshStop::Budget);
+      }
+      if !probe && !self.window_room(packing.data, data) {
         return Some(FreshStop::Window);
       }
       let frame = self.retransmit.pop_front()?;
-      *packed = packed.saturating_add(bytes);
+      packing.used = packing.used.saturating_add(bytes);
+      packing.data = packing.data.saturating_add(data);
       reliable.push(frame);
     }
-    Some(FreshStop::Budget)
   }
 
   /// Frames fresh stream data into the packet while the budget, the window (a probe passes it) and the
@@ -530,33 +663,47 @@ impl Connection {
     budget: u64,
     probe: bool,
     reliable: &mut Vec<Frame>,
-    packed: &mut u64,
+    packing: &mut Packing,
   ) -> FreshStop {
-    while *packed < budget {
-      let room = budget - *packed;
+    loop {
+      let room = budget.saturating_sub(packing.used);
+      let Some(data_room) = room
+        .checked_sub(STREAM_FRAME_HEADER_BYTES as u64)
+        .filter(|&d| d > 0)
+      else {
+        return FreshStop::Budget;
+      };
       let connection_credit = self.peer_max_data.saturating_sub(self.connection_sent);
       if connection_credit == 0 {
         return FreshStop::Credit;
       }
-      if !probe && !self.window_room(*packed, room.min(connection_credit)) {
+      let cap = data_room.min(connection_credit);
+      if !probe && !self.window_room(packing.data, cap) {
         return FreshStop::Window;
       }
-      let fresh_cap = usize::try_from(room.min(connection_credit)).unwrap_or(usize::MAX);
-      let Some(frame) = self.next_fresh_frame(fresh_cap) else {
+      let Some(frame) = self.next_fresh_frame(usize::try_from(cap).unwrap_or(usize::MAX)) else {
         return FreshStop::Empty;
       };
-      let bytes = tracked_bytes(&frame);
-      self.connection_sent = self.connection_sent.saturating_add(bytes);
-      *packed = packed.saturating_add(bytes);
+      let data = tracked_bytes(&frame);
+      self.connection_sent = self.connection_sent.saturating_add(data);
+      packing.used = packing.used.saturating_add(frame.encoded_len() as u64);
+      packing.data = packing.data.saturating_add(data);
       reliable.push(frame);
     }
-    FreshStop::Budget
   }
 
   /// Records why sending stopped: a full window with data waiting marks the sender window-limited
   /// (`C.is_cwnd_limited`); running out of data marks it application-limited (draft §4.1.2.4); the pacer's
   /// hold is remembered as the next release.
   fn note_stop(&mut self, stop: FreshStop, nothing_packed: bool) {
+    let counter = match stop {
+      FreshStop::Budget => &mut self.stops.budget,
+      FreshStop::Window => &mut self.stops.window,
+      FreshStop::Pacer(_) => &mut self.stops.pacer,
+      FreshStop::Credit => &mut self.stops.credit,
+      FreshStop::Empty => &mut self.stops.empty,
+    };
+    *counter = counter.saturating_add(1);
     match stop {
       FreshStop::Window if self.has_fresh_data() || !self.retransmit.is_empty() => {
         self.window_full_at = Some(self.sent.peek_next_pn());
@@ -628,23 +775,82 @@ impl Connection {
   /// received stream's credit, piggybacked so a lost credit frame re-advertises with the next
   /// acknowledgement — to `frames`, clears the owed flag, and returns the largest packet number the
   /// acknowledgement covered (for ACK-of-ACK bookkeeping). `None` when none is owed or generated.
-  fn push_acknowledgement(&mut self, frames: &mut Vec<Frame>, max_frame_len: usize) -> Option<u64> {
+  fn push_acknowledgement(
+    &mut self,
+    frames: &mut Vec<Frame>,
+    packing: &mut Packing,
+    budget: u64,
+  ) -> Option<u64> {
     if !self.ack_owed {
       return None;
     }
-    let ack = self.acks.ack_frame(Self::max_ack_ranges(max_frame_len))?;
+    // As many additional ranges as fit beside the acknowledgement's base and the connection credit;
+    // beyond them older received runs are retransmitted and deduped rather than acknowledged.
+    let ack = self.acks.ack_frame(ack_ranges_for(budget))?;
     let largest = if let Frame::Ack { largest, .. } = ack {
       Some(largest)
     } else {
       None
     };
+    let credit = self.flow.connection_credit_frame();
+    packing.used = packing
+      .used
+      .saturating_add((ack.encoded_len() + credit.encoded_len()) as u64);
     frames.push(ack);
-    frames.push(self.flow.connection_credit_frame());
-    for &stream_id in self.recv_streams.keys() {
-      frames.push(self.flow.stream_credit_frame(stream_id));
-    }
+    frames.push(credit);
     self.ack_owed = false;
     largest
+  }
+
+  /// Whether any receive stream's credit moved since it was last advertised — such credit is sent even in
+  /// a packet of its own (a credit-only packet, like an acknowledgement, is not ack-eliciting), so a small
+  /// packet budget whose acknowledgement leaves no room beside it never strands a credit-blocked peer.
+  fn credit_moved(&self) -> bool {
+    self
+      .recv_streams
+      .keys()
+      .any(|&stream_id| self.credit_sent.get(&stream_id) != Some(&self.flow.stream_max(stream_id)))
+  }
+
+  /// Adds as much stream credit as the packet's room holds: first every receive stream whose credit moved
+  /// since it was last advertised, then the rest in rotation from where the last refresh stopped — so the
+  /// frames per packet stay bounded by the room, never by the number of open streams, and a credit carried
+  /// by a lost acknowledgement is re-advertised within a rotation.
+  fn push_stream_credit(&mut self, frames: &mut Vec<Frame>, packing: &mut Packing, budget: u64) {
+    let room = usize::try_from(budget.saturating_sub(packing.used)).unwrap_or(0);
+    let mut slots = room / STREAM_CREDIT_FRAME_BYTES;
+    if slots == 0 {
+      return;
+    }
+    let mut chosen: Vec<u64> = Vec::new();
+    for &stream_id in self.recv_streams.keys() {
+      if slots == 0 {
+        break;
+      }
+      if self.credit_sent.get(&stream_id) != Some(&self.flow.stream_max(stream_id)) {
+        chosen.push(stream_id);
+        slots -= 1;
+      }
+    }
+    let rotation: Vec<u64> = self
+      .recv_streams
+      .range(self.credit_cursor.saturating_add(1)..)
+      .chain(self.recv_streams.range(..=self.credit_cursor))
+      .map(|(&stream_id, _)| stream_id)
+      .filter(|stream_id| !chosen.contains(stream_id))
+      .take(slots)
+      .collect();
+    if let Some(&last) = rotation.last() {
+      self.credit_cursor = last;
+    }
+    for stream_id in chosen.into_iter().chain(rotation) {
+      let frame = self.flow.stream_credit_frame(stream_id);
+      self
+        .credit_sent
+        .insert(stream_id, self.flow.stream_max(stream_id));
+      packing.used = packing.used.saturating_add(frame.encoded_len() as u64);
+      frames.push(frame);
+    }
   }
 
   /// The next fresh stream frame to send, chosen by the scheduler, or `None` when no send stream has data
@@ -813,6 +1019,13 @@ impl Connection {
           ack_eliciting = true;
           self.streams.on_max_streams(*max);
         }
+        // A blocked peer (RFC 9000 §19.12-13): the acknowledgement this owes carries the connection
+        // credit; a blocked stream's credit is marked moved, so that acknowledgement carries it first.
+        Frame::DataBlocked { .. } => ack_eliciting = true,
+        Frame::StreamDataBlocked { stream_id, .. } => {
+          ack_eliciting = true;
+          self.credit_sent.remove(stream_id);
+        }
       }
     }
     if ack_eliciting {
@@ -950,6 +1163,17 @@ impl Connection {
       Frame::MaxStreams { max } => *max == self.streams.advertised(),
       // A reset another copy already had acknowledged is not resent.
       Frame::ResetStream { stream_id, .. } => self.resets_owed.contains(stream_id),
+      // A blocked report is resent only while the sender is still blocked at the same limit.
+      Frame::DataBlocked { limit } => {
+        *limit == self.peer_max_data && self.connection_sent >= self.peer_max_data
+      }
+      Frame::StreamDataBlocked { stream_id, limit } => {
+        self
+          .send_streams
+          .get(stream_id)
+          .and_then(StreamSender::blocked_at)
+          == Some(*limit)
+      }
       _ => true,
     }
   }
@@ -959,8 +1183,22 @@ impl Connection {
   fn mark_acknowledged(&mut self, frames: &[Frame]) {
     let mut touched = Vec::new();
     for frame in frames {
-      if let Frame::ResetStream { stream_id, .. } = frame {
-        self.resets_owed.remove(stream_id);
+      match frame {
+        Frame::ResetStream { stream_id, .. } => {
+          self.resets_owed.remove(stream_id);
+        }
+        // A blocked report the peer has acknowledged while this end is still blocked at the same limit is
+        // re-armed: its answering credit may have been lost, so the next poll reports again (at most once
+        // per round trip) until the credit rises.
+        Frame::DataBlocked { limit } if self.blocked_sent == Some(*limit) => {
+          self.blocked_sent = None
+        }
+        Frame::StreamDataBlocked { stream_id, limit }
+          if self.stream_blocked_sent.get(stream_id) == Some(limit) =>
+        {
+          self.stream_blocked_sent.remove(stream_id);
+        }
+        _ => {}
       }
       if let Frame::Stream {
         stream_id, offset, ..
@@ -1192,6 +1430,7 @@ impl Connection {
   fn forget_send_stream(&mut self, stream_id: u64) {
     self.send_streams.remove(&stream_id);
     self.unacked.remove(&stream_id);
+    self.stream_blocked_sent.remove(&stream_id);
     let class = priority(stream_id);
     self.send_order.get_mut(class).retain(|&id| id != stream_id);
     *self.send_cursor.get_mut(class) = 0;
@@ -1222,6 +1461,7 @@ impl Connection {
   /// this never touches the sending half (`docs/bugs/2026-09-27-a-late-request-copy-forgot-the-reply.md`).
   pub fn close_recv(&mut self, stream_id: u64) {
     self.recv_streams.remove(&stream_id);
+    self.credit_sent.remove(&stream_id);
     self.flow.forget_stream(stream_id);
     self.streams.close_receive(stream_id);
     self.advertise_streams();
@@ -1230,6 +1470,11 @@ impl Connection {
   /// Whether `stream_id`'s receiving half is open (not read through, discarded, or reset by the peer).
   pub fn receiving(&self, stream_id: u64) -> bool {
     self.streams.receiving(stream_id)
+  }
+
+  /// Why fresh sending stopped, counted over the connection's life.
+  pub fn send_stops(&self) -> SendStops {
+    self.stops
   }
 
   /// The role this end plays (which stream ids it opens).
@@ -1247,6 +1492,8 @@ impl Connection {
       retransmit: self.retransmit.len(),
       control: self.control.len(),
       in_flight: self.sent.in_flight_count(),
+      credit_tracked: self.credit_sent.len(),
+      blocked_tracked: self.stream_blocked_sent.len(),
     }
   }
 
@@ -1303,9 +1550,11 @@ mod tests {
   use super::*;
   use proptest::prelude::*;
 
-  /// Shape: the frame length cap the driver frames at in these tests — small, so a short stream spans
-  /// many packets and every loss, reorder and credit path runs.
-  const FRAME_CAP: usize = 8;
+  /// Shape: the stream data one small test packet carries — eight bytes, so a short stream spans many
+  /// packets and every loss, reorder and credit path runs.
+  const FRAME_DATA: usize = 8;
+  /// Shape: the packet budget of the small test packets — one `Stream` frame of [`FRAME_DATA`] bytes.
+  const FRAME_CAP: usize = STREAM_FRAME_HEADER_BYTES + FRAME_DATA;
   /// Shape: a packet budget of several frames for the multi-frame tests.
   const PACKET_BUDGET: usize = 4 * FRAME_CAP;
   /// Shape: a millisecond.
@@ -1443,6 +1692,13 @@ mod tests {
     ) -> usize {
       let mut batch = Vec::new();
       while let Some((pn, frames)) = from.poll_transmit(self.now, budget) {
+        // Every packet fits its budget exactly as encoded — acknowledgement, credit and control frames
+        // counted with the data (a packet past its budget crosses the datagram floor on a real path).
+        let encoded: usize = frames.iter().map(Frame::encoded_len).sum();
+        assert!(
+          encoded <= budget,
+          "a packet of {encoded} encoded bytes exceeded its {budget}-byte budget: {frames:?}"
+        );
         check(from);
         let stream_frames = frames
           .iter()
@@ -1629,7 +1885,7 @@ mod tests {
       frames,
       vec![Frame::ResetStream {
         stream_id: id,
-        final_size: FRAME_CAP as u64
+        final_size: FRAME_DATA as u64
       }],
       "only the reset is sent, never the stream's data; its final size is the one frame framed (RFC 9000 §4.5)"
     );
@@ -1653,8 +1909,10 @@ mod tests {
       "the first receipt delivered bytes"
     );
     assert_eq!(receiver.duplicates_discarded(), 0);
+    // The first receipt owes an acknowledgement (and, at this small budget, a separate packet with the
+    // stream credit its read moved): drain everything it owes.
     assert!(
-      receiver.poll_transmit(0, FRAME_CAP).is_some(),
+      drain(&mut receiver, 0) > 0,
       "the first receipt owes an acknowledgement"
     );
     receiver.handle_incoming(0, pn, &frames);
@@ -2086,11 +2344,17 @@ mod tests {
       }
     }
     assert_eq!(sends.len(), 6, "all six packets left");
-    // cwnd 10 kB over 100 ms at 1.25× is 125 kB/s: a 1000-byte packet every 8 ms after the quantum
-    // (the 2-packet floor) leaves.
+    // cwnd 10 kB over 100 ms at 1.25× is 125 kB/s. A 1000-byte packet budget carries 978 bytes of stream
+    // data (one `Stream` frame header), so a packet leaves every 978 / 125,000 s = 7.824 ms after the
+    // quantum (the 2-packet floor).
+    let pace = stream_bytes_per_packet(1000) * 1_000_000_000 / 125_000;
     assert_eq!(&sends[..2], &[0, 0], "the first quantum leaves at once");
     for pair in sends[2..].windows(2) {
-      assert_eq!(pair[1] - pair[0], 8 * MS, "then one packet per 8 ms");
+      assert_eq!(
+        pair[1] - pair[0],
+        pace,
+        "then one packet per data-sized interval"
+      );
     }
   }
 
@@ -2256,7 +2520,7 @@ mod tests {
     sender.seed_rtt(10 * MS, 0);
     // Two frames: the whole stream leaves in the first flight (the initial window holds more), so every
     // later packet is a probe copy and `originals` counts every original there will be.
-    let _ = open(&mut sender, &stream_content(3, 2 * FRAME_CAP));
+    let _ = open(&mut sender, &stream_content(3, 2 * FRAME_DATA));
     let mut now = 0;
     while sender.poll_transmit(now, FRAME_CAP).is_some() {}
     let originals = sender.in_flight_count();
@@ -2309,7 +2573,9 @@ mod tests {
     server
       .reply(id, &stream_content(2, 4))
       .expect("the request awaits its reply");
-    let (_lost_pn, _lost_reply) = server.poll_transmit(0, FRAME_CAP).expect("the reply");
+    // Everything the server sends now is lost: the acknowledgement of the request and the reply (at this
+    // small budget they leave in separate packets).
+    assert!(drain(&mut server, 0) > 0, "the reply left");
     // The client, having heard nothing, probes: a copy of its request in a new packet reaches the server.
     assert!(client.probe());
     let (probe_pn, probe) = client.poll_transmit(MS, FRAME_CAP).expect("the probe");
@@ -2330,6 +2596,15 @@ mod tests {
       "the reply reached the client"
     );
     assert!(client.recv_stream_complete(id));
+  }
+
+  /// Takes every packet `conn` has to send at `now` (dropping them) and returns how many there were.
+  fn drain(conn: &mut Connection, now: u64) -> usize {
+    let mut packets = 0;
+    while conn.poll_transmit(now, FRAME_CAP).is_some() {
+      packets += 1;
+    }
+    packets
   }
 
   /// Fires `sender`'s probe timeout and carries everything it then sends to `receiver`, returning what

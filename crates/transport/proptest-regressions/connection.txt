@@ -8,3 +8,5 @@ cc 19ade60d16537f04a79f987a3216f5a2b98e961a01996ba6a175475b69679351 # shrinks to
 cc 75d93093f0c498cbd805e912052b8bf0bfae0714b8d19a86d70d3b4e22eab3c1 # shrinks to lens = [49], drops = [], law = 0
 cc f0ba4d882457d380f107f78ae7bc83928c85525f2fcb8e23f0af4aac36ee2bd2 # shrinks to lens = [22, 43], drops = [4], law = 2
 cc 67ef85b0c3308544a962a58014cd8f8e1c1216d26797f9959c111b6c8c158839 # shrinks to lens = [71, 90], drops = [24], law = 2
+cc e68ccff1f18f90edc234fd12c3396562f5fd333abd05c3961babde2ec47ed2b4 # shrinks to lens = [16, 281], drops = [10, 29, 19, 13, 22, 29, 23], law = 0
+cc 75ea051a6bb951091f27728054dc9dd3631d4c5144b61d3618525e3221e07259 # shrinks to lens = [185], drops = [12, 12, 14, 12, 0, 12, 12, 0], law = 0

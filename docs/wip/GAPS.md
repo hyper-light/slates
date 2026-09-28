@@ -1924,3 +1924,18 @@ than excused:
   so no harness is built (`test = false`).
 
 The fleet suite passes 50/50 through cargo.
+
+### 2026-09-28: packets fit the datagram floor
+
+Found by the scheduler bake-off: 1-RTT packets could grow past the 1,200-byte floor, because the budget
+counted only stream data, and a receiver truncated them and read them as losses (17 % goodput on a lossless
+100 Mbit/s path). Fixed together with two siblings the exact accounting exposed: a credit-blocked sender
+could strand when the acknowledgement carrying its credit was lost, and the acknowledgement state grew one
+entry per packet on an acknowledgement-only receiver. Record:
+[packets past the floor](../bugs/2026-09-28-packets-grew-past-the-datagram-floor.md).
+
+Evidence: transport 130/130 unit tests (every connection oracle asserts each packet fits its budget),
+cluster (every binary), and fleet 50/50.
+
+Still owed, in order: the congestion grid on this code, then the scheduler bake-off with the winning
+controller.

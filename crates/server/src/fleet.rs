@@ -106,7 +106,7 @@ use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::Demux;
-use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
+use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
 use slates_transport::rtt::RttEstimator;
 use slates_vfs::clock::Clock;
@@ -120,23 +120,17 @@ use crate::state::{self, LearnedMember, ShardState};
 use crate::verbs;
 use crate::xshard::{call_within, run_on};
 
-/// An upper bound on one packet's non-payload bytes for the frame-cap derivation — the RFC 9000 §17.3
-/// short header (first byte + the eight-byte connection id + a packet number ≤ 4 bytes → 13), the RFC
-/// 9001 §5.3 AEAD tag (16), and one RFC 9000 §19.8 STREAM-frame header (type + stream-id + offset +
-/// length varints + fin, ≤ 43): 72, rounded up so a full-cap frame's packet never crosses
-/// [`MIN_DATAGRAM_BYTES`].
-/// Format: 13 + 16 + 43 = 72, rounded up to 80.
-const FLEET_PACKET_OVERHEAD: usize = 80;
-
-/// Derived: the largest stream-frame payload whose packet still fits within [`MIN_DATAGRAM_BYTES`] (§4.9
-/// "Frame caps per class from measured MTU and class budgets"; the frame cap is `Endpoint`'s
-/// `max_frame_len`, which also floors the initial receive window at `(REORDER_THRESHOLD + 1) × cap`). At
-/// this cap a whole fleet message — a SWIM probe, a register record, or its acknowledgement, each at most a
-/// few hundred bytes — rides a single frame inside one receive window, so a commit completes in one round
-/// trip. At the previous 16-byte cap a 68-byte record fragmented into five frames across a 64-byte window
-/// and needed ten credit-gated round trips, which lost the commit's deadline under core contention.
-/// Anchored to [`MIN_DATAGRAM_BYTES`] less [`FLEET_PACKET_OVERHEAD`].
-pub const FLEET_FRAME_CAP: usize = MIN_DATAGRAM_BYTES - FLEET_PACKET_OVERHEAD;
+/// Derived: the fleet session's packet budget — the most encoded frame bytes a 1-RTT packet carries and
+/// still fits within [`MIN_DATAGRAM_BYTES`](slates_transport::endpoint::MIN_DATAGRAM_BYTES) with its header and AEAD tag
+/// ([`slates_transport::endpoint::MAX_PACKET_PAYLOAD`], 1171). Every frame is counted against it (the
+/// acknowledgement, credit and control frames as well as stream data), so a packet never crosses the
+/// floor. At this budget a whole fleet message — a SWIM probe, a register record, or its acknowledgement,
+/// each at most a few hundred bytes — rides one frame inside one receive window, so a commit completes in
+/// one round trip (at the earlier 16-byte cap a 68-byte record fragmented into five frames and needed ten
+/// credit-gated round trips). Replaces the earlier `MIN_DATAGRAM_BYTES − 80` estimate, which counted only
+/// stream data and let acknowledgement and credit frames push packets past the floor (measured: up to
+/// 2,048 bytes, truncated at the receiver and read as losses, 2026-09-28).
+pub const FLEET_FRAME_CAP: usize = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
 
 /// Derived: SWIM's infection factor rounded to a per-bit integer weight for `λ·ln(n+1)` (§4.8; SWIM §4.1).
 /// `λ·ln(x) = λ·ln(2)·log2(x)`, and the bit-length of `x` is `⌊log2(x)⌋+1`, so with SWIM's high-probability

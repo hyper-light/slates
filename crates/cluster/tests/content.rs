@@ -164,7 +164,7 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         &holder_identity,
         &[owner_certificate],
         slates_transport::connection::ConnectionShape::for_frame_cap(
-          MIN_DATAGRAM_BYTES,
+          slates_transport::endpoint::MAX_PACKET_PAYLOAD,
           CONTENT_RECEIVE_CEILING,
           slates_transport::congestion::ControllerKind::NewReno,
         ),
@@ -198,7 +198,7 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         &holder_certificate,
         NAME,
         slates_transport::connection::ConnectionShape::for_frame_cap(
-          MIN_DATAGRAM_BYTES,
+          slates_transport::endpoint::MAX_PACKET_PAYLOAD,
           CONTENT_RECEIVE_CEILING,
           slates_transport::congestion::ControllerKind::NewReno,
         ),

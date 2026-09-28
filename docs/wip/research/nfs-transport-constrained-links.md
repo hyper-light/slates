@@ -362,3 +362,17 @@ Each scenario measures:
     and the congestion grid re-run on this code. The first grid's partial run (`3a0d86e`) predates this
     slice, and its harness had no per-run virtual deadline: one Copa run at 1 Mbit/s, 300 ms, 1 % loss
     spun for 2.5 h. The harness bounds every run and records a stall before the re-run.
+- **Slice 2c (2026-09-28): packets fit the floor; credit cannot strand a sender; bounded ack state.**
+  - **How it was found.** The first scheduler grid (`4a3f6d7`) disqualified every scheduler, which pointed
+    at a shared layer rather than scheduling. Two findings:
+    - At 100 Mbit/s and 1 % loss, NewReno held about 10 packets in flight against a BDP of about 1,100.
+      Control and metadata load alone exceeded the carried rate: congestion collapse, the congestion
+      bake-off's question. So the controller is decided first, and the scheduler bake-off re-runs with
+      the winner.
+    - At 100 Mbit/s with **no** loss, the strict and weighted schedulers got 17 % of the link. The
+      `SCHED_DIAG` trace showed spurious losses from truncated oversized datagrams: the packet budget had
+      counted only stream data.
+  - **Fixes.** Exact packing (`Frame::encoded_len`), the derived `MAX_PACKET_PAYLOAD` = 1,171 with typed
+    refusals for a bad budget or an oversized datagram, `DataBlocked`/`StreamDataBlocked` with re-armed
+    reports, bounded merged ack ranges, and every simulated path carrying the floor as its MTU. Record:
+    `docs/bugs/2026-09-28-packets-grew-past-the-datagram-floor.md`.

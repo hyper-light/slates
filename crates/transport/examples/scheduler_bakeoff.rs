@@ -20,6 +20,11 @@
 //!
 //! `cargo run --release -p slates-transport --example scheduler_bakeoff [scenario-filter]` prints one CSV
 //! row per run and the ranking.
+//!
+//! Every simulated path carries the datagram floor as its MTU (`MIN_DATAGRAM_BYTES`), as a real path at
+//! the floor does, so an oversized packet is dropped and counted rather than delivered. `SCHED_DIAG=1`
+//! traces each run every 100 virtual ms (open exchanges by class, the congestion window, why sending
+//! stopped, and the fabric's drops by cause) — the trace that found packets growing past the floor.
 
 // Benchmark harness: an unwrap here is a failed run, which is what it should be.
 #![allow(
@@ -43,13 +48,15 @@ use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{
   ConnectionShape, Priority, Scheduler, StreamRefusal, initial_receive_window,
 };
-use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
+use slates_transport::endpoint::{Endpoint, EndpointError, MAX_PACKET_PAYLOAD, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
+use slates_transport::session::STREAM_FRAME_HEADER_BYTES;
 
-/// Format: the fleet's per-packet overhead bound (`crates/server/src/fleet.rs` `FLEET_PACKET_OVERHEAD`).
-const PACKET_OVERHEAD: usize = 80;
-/// Format: the fleet's frame cap, so the bake-off frames exactly as the daemon does.
-const FRAME_CAP: usize = MIN_DATAGRAM_BYTES - PACKET_OVERHEAD;
+/// Derived: the wire bytes each packet adds around a frame's data — the short header and AEAD tag
+/// (`MIN_DATAGRAM_BYTES − MAX_PACKET_PAYLOAD`) and one `Stream` frame header — for sizing a class's load.
+const WIRE_OVERHEAD: usize = MIN_DATAGRAM_BYTES - MAX_PACKET_PAYLOAD + STREAM_FRAME_HEADER_BYTES;
+/// Format: the fleet's packet budget, so the bake-off frames exactly as the daemon does.
+const FRAME_CAP: usize = MAX_PACKET_PAYLOAD;
 /// Format: nanoseconds per millisecond and per second.
 const MS: u64 = 1_000_000;
 const NS_PER_SECOND: u64 = 1_000_000_000;
@@ -107,7 +114,7 @@ impl Scenario {
   /// overhead per frame) at `permille` of the link.
   fn gap_ns(&self, bytes: usize, permille: u64) -> u64 {
     let frames = bytes.div_ceil(FRAME_CAP) as u64;
-    let bits = 2 * (bytes as u64 + frames * PACKET_OVERHEAD as u64) * 8;
+    let bits = 2 * (bytes as u64 + frames * WIRE_OVERHEAD as u64) * 8;
     bits * NS_PER_SECOND * 1000 / (self.rate.max(1) * permille)
   }
 
@@ -232,7 +239,11 @@ async fn coordinate(scheduler: Scheduler, scenario: Scenario, report: Sender<Out
   let client_port = client_socket.local_addr().unwrap().port();
   let server_port = server_socket.local_addr().unwrap().port();
   let one_way = scenario.rtt_ns / 2;
-  sim_udp_set_path(SimPath::in_order(one_way, 0).with_loss(scenario.loss));
+  sim_udp_set_path(
+    SimPath::in_order(one_way, 0)
+      .with_loss(scenario.loss)
+      .with_mtu(MIN_DATAGRAM_BYTES),
+  );
   let link = sim_udp_add_link(SimLink {
     rate_bits_per_second: scenario.rate,
     queue_bytes: scenario.bdp().max(2 * MIN_DATAGRAM_BYTES as u64),
@@ -242,6 +253,7 @@ async fn coordinate(scheduler: Scheduler, scenario: Scenario, report: Sender<Out
     server_port,
     SimPath::in_order(one_way, 0)
       .with_loss(scenario.loss)
+      .with_mtu(MIN_DATAGRAM_BYTES)
       .through(link),
   );
   let server_identity = self_signed(NAME);
@@ -317,6 +329,7 @@ async fn drive(endpoint: &mut Endpoint, scenario: &Scenario) -> Outcome {
   let mut next_control = start;
   let mut next_metadata = start;
   let mut open: Vec<Open> = Vec::new();
+  let mut last_diag = u64::MAX;
   let mut outcome = Outcome {
     window_ns: window_until - window_from,
     ..Outcome::default()
@@ -345,6 +358,23 @@ async fn drive(endpoint: &mut Endpoint, scenario: &Scenario) -> Outcome {
         outcome.stalled = true;
         return outcome;
       }
+    }
+    if std::env::var_os("SCHED_DIAG").is_some() && now / (100 * MS) != last_diag {
+      last_diag = now / (100 * MS);
+      let by = |k: u64| open.iter().filter(|o| o.kind == k).count();
+      eprintln!(
+        "DIAG t={}ms open c={} m={} b={} done c={} m={} srtt={}ms cwnd={} stops={:?} fabric={:?}",
+        (now - start) / MS,
+        by(CONTROL),
+        by(METADATA),
+        by(BULK),
+        outcome.control_ns.len(),
+        outcome.metadata_ns.len(),
+        endpoint.smoothed_rtt() / MS,
+        endpoint.congestion_window(),
+        endpoint.send_stops(),
+        slates_rt::sim::sim_udp_stats()
+      );
     }
     let wait = next_control.min(next_metadata).saturating_sub(now).max(1);
     if let Some(Err(_)) = within(wait, endpoint.drive()).await {

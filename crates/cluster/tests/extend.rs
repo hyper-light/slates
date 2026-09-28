@@ -27,7 +27,9 @@ use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
 
 const NAME: &str = "slates-node";
-const FRAME_CAP: usize = 16;
+/// Shape: a small packet budget — sixteen bytes of stream data per frame — so a message spans several
+/// packets and the reassembly, credit and loss paths all run.
+const FRAME_CAP: usize = slates_transport::session::STREAM_FRAME_HEADER_BYTES + 16;
 /// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
 /// room for the tuning path to run without any test holding more than a few kilobytes.
 const RECEIVE_CEILING_WINDOWS: u64 = 64;

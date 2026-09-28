@@ -31,104 +31,126 @@ use crate::session::{AckRange, Frame};
 /// window of at least this many packets past a loss lets the gap form).
 pub const REORDER_THRESHOLD: u64 = 3;
 
-/// Receive-side acknowledgement state: which packet numbers have arrived, and the multi-range ACK to
-/// send back.
+/// Receive-side acknowledgement state: which packet numbers have arrived, as merged contiguous ranges,
+/// and the multi-range ACK to send back.
 ///
-/// The `received` set is bounded by ACK-of-ACK (RFC 9000 §13.2.4, [`AckGenerator::confirm`]): once the
-/// peer acknowledges one of our acknowledgement-bearing packets, it has that acknowledgement, so the
-/// packets it covered need never be acknowledged again and are dropped. So on a long-lived or reused
-/// connection the set stays within the recent unconfirmed window rather than growing without bound
-/// (Banned #8). The emitted ACK *frame* is separately bounded (see [`AckGenerator::ack_frame`]).
-#[derive(Debug, Default)]
+/// **Bounded by construction.** The received set is held as at most `max_ranges` ranges (a run of
+/// consecutive packets is one entry, however long), so its size is set by the gaps, not by how many
+/// packets arrived. Past the cap the oldest range is dropped and the duplicate floor raised to its top:
+/// a packet at or below the floor is treated as already seen, which is safe because a sender never reuses
+/// a packet number (a retransmission rides a fresh one, RFC 9000 §12.3). A late original arriving below
+/// the floor is discarded, and its frames have already been sent again. ACK-of-ACK (RFC 9000 §13.2.4,
+/// [`AckGenerator::confirm`]) shrinks the set further once the peer holds our acknowledgement. The
+/// earlier form held every packet number in a set and walked all of them for each acknowledgement: a
+/// receiver whose acknowledgements the peer never acknowledged (a pure bulk receiver) grew one entry per
+/// packet forever, measured at 353 tracked with a 40 bound, 2026-09-28.
+#[derive(Debug)]
 pub struct AckGenerator {
-  received: BTreeSet<u64>,
-  /// The highest packet number ACK-of-ACK has confirmed and dropped from `received`. A sender's packet
-  /// numbers only ever increase (a retransmission rides a *fresh* number, RFC 9000 §12.3), so any number
-  /// at or below this floor was seen and processed already — it is a duplicate even though it is no
-  /// longer in the bounded set. Without it, a network duplicate of a confirmed packet would look new.
+  /// Received ranges, `low -> high` inclusive, disjoint and never adjacent (adjacent ranges merge).
+  ranges: BTreeMap<u64, u64>,
+  /// The most ranges held.
+  max_ranges: usize,
+  /// Every packet number at or below this has been seen, or is treated as seen (see the type's doc).
   confirmed_floor: Option<u64>,
 }
 
 impl AckGenerator {
-  /// A generator that has seen nothing yet.
-  pub fn new() -> AckGenerator {
-    AckGenerator::default()
+  /// A generator that has seen nothing yet and holds at most `max_ranges` ranges (at least one).
+  pub fn new(max_ranges: usize) -> AckGenerator {
+    AckGenerator {
+      ranges: BTreeMap::new(),
+      max_ranges: max_ranges.max(1),
+      confirmed_floor: None,
+    }
   }
 
-  /// Whether packet number `pn` has already been received and processed — either still tracked in the
-  /// set, or at/below the confirmed floor (dropped by ACK-of-ACK but, since numbers only increase, never
-  /// legitimately reused). A duplicate's frames must not be applied again (RFC 9000 §12.3).
+  /// Whether packet number `pn` has already been received and processed — inside a held range, or at or
+  /// below the floor. A duplicate's frames must not be applied again (RFC 9000 §12.3).
   pub fn is_duplicate(&self, pn: u64) -> bool {
-    self.received.contains(&pn) || self.confirmed_floor.is_some_and(|floor| pn <= floor)
+    self.confirmed_floor.is_some_and(|floor| pn <= floor)
+      || self
+        .ranges
+        .range(..=pn)
+        .next_back()
+        .is_some_and(|(_, &high)| pn <= high)
   }
 
-  /// Records a received packet number.
+  /// Records a received packet number, merging it into its neighbours, and drops the oldest range when
+  /// the cap is passed.
   pub fn record(&mut self, pn: u64) {
-    self.received.insert(pn);
+    if self.is_duplicate(pn) {
+      return;
+    }
+    let mut low = pn;
+    let mut high = pn;
+    if let Some((&below_low, &below_high)) = self.ranges.range(..pn).next_back()
+      && below_high.checked_add(1) == Some(pn)
+    {
+      self.ranges.remove(&below_low);
+      low = below_low;
+    }
+    if let Some(above) = pn.checked_add(1)
+      && let Some(above_high) = self.ranges.remove(&above)
+    {
+      high = above_high;
+    }
+    self.ranges.insert(low, high);
+    while self.ranges.len() > self.max_ranges {
+      let Some((_, dropped_high)) = self.ranges.pop_first() else {
+        break;
+      };
+      self.raise_floor(dropped_high);
+    }
+  }
+
+  fn raise_floor(&mut self, to: u64) {
+    self.confirmed_floor = Some(self.confirmed_floor.map_or(to, |floor| floor.max(to)));
   }
 
   /// Confirms the peer has received an acknowledgement of ours covering packets up to `largest` (RFC
-  /// 9000 §13.2.4): those packets need never be acknowledged again — the peer has freed them and will
-  /// not ask for them — so drop them, which is what bounds this set. The confirmed floor advances to
-  /// `largest` so a later network duplicate of a dropped packet is recognized as the duplicate it is
-  /// ([`is_duplicate`](AckGenerator::is_duplicate)) rather than processed afresh.
+  /// 9000 §13.2.4): those packets need never be acknowledged again, so they leave the held ranges and the
+  /// floor rises to `largest` — a later network duplicate of one is still recognized
+  /// ([`is_duplicate`](AckGenerator::is_duplicate)).
   pub fn confirm(&mut self, largest: u64) {
-    self.confirmed_floor = Some(
-      self
-        .confirmed_floor
-        .map_or(largest, |floor| floor.max(largest)),
-    );
-    // Keep everything strictly above `largest`; drop `<= largest`.
-    self.received = self.received.split_off(&largest.saturating_add(1));
+    self.raise_floor(largest);
+    let above = largest.saturating_add(1);
+    let kept = self.ranges.split_off(&above);
+    // A range straddling the floor keeps only its part above it.
+    if let Some((_, &high)) = self.ranges.iter().next_back()
+      && high >= above
+    {
+      self.ranges = kept;
+      self.ranges.insert(above, high);
+    } else {
+      self.ranges = kept;
+    }
   }
 
-  /// How many packet numbers are still tracked for acknowledgement — the non-vacuity handle a test uses
-  /// to prove ACK-of-ACK actually bounds the set (it would grow without bound otherwise).
+  /// How many ranges are held — the handle a test uses to prove the state stays bounded.
   pub fn tracked(&self) -> usize {
-    self.received.len()
+    self.ranges.len()
   }
 
-  /// The multi-range ACK for the received packets (RFC 9000 §19.3), or `None` if none received: the
-  /// highest contiguous run as `(largest, range)`, then each further run below it as an [`AckRange`]
-  /// gap/length relative to the previous run (RFC 9000 §19.3.1), so a packet received below a gap is
-  /// acknowledged too — not left to a spurious retransmission. `max_ranges` bounds the additional
-  /// ranges so the frame fits its size budget; runs beyond it are simply not acknowledged here and the
-  /// sender retransmits them (the receiver dedups), which is the single-range fallback this replaces.
+  /// The multi-range ACK for the received packets (RFC 9000 §19.3), or `None` if none are held: the
+  /// highest run as `(largest, range)`, then up to `max_ranges` further runs below it as [`AckRange`]
+  /// gap/length pairs relative to the previous run (RFC 9000 §19.3.1), highest first. Runs beyond the
+  /// budget are not acknowledged here; the sender retransmits them and the receiver dedups.
   pub fn ack_frame(&self, max_ranges: usize) -> Option<Frame> {
-    if self.received.is_empty() {
-      return None;
-    }
-    // Collect contiguous runs as (high, low) inclusive, in descending order of packet number, stopping
-    // once the range budget is reached (the highest runs — the sender's most recent activity — first).
-    let mut runs: Vec<(u64, u64)> = Vec::new();
-    for &pn in self.received.iter().rev() {
-      match runs.last_mut() {
-        Some((_, low)) if *low == pn + 1 => *low = pn, // contiguous: extend the current run downward
-        _ => {
-          if runs.len() > max_ranges {
-            break; // one first range plus `max_ranges` additional; older runs fall back to retransmit
-          }
-          runs.push((pn, pn)); // a gap: start a new run
-        }
-      }
-    }
-    let (largest, first_low) = runs[0];
-    let range = largest - first_low;
-    // Each further run below the first: the count of unacknowledged packets since the previous run's
-    // low, then this run's length, both minus one (RFC 9000 §19.3.1). Consecutive runs are separated
-    // by at least one unacknowledged packet, so `prev_low - high >= 2` and neither subtraction wraps.
+    let mut runs = self.ranges.iter().rev();
+    let (&first_low, &largest) = runs.next()?;
     let mut ranges = Vec::new();
     let mut prev_low = first_low;
-    for &(high, low) in &runs[1..] {
+    for (&low, &high) in runs.take(max_ranges) {
+      // Ranges are disjoint and never adjacent, so `prev_low - high >= 2` and neither subtraction wraps.
       ranges.push(AckRange {
-        gap: prev_low - high - 2,
-        len: high - low,
+        gap: prev_low.saturating_sub(high).saturating_sub(2),
+        len: high.saturating_sub(low),
       });
       prev_low = low;
     }
     Some(Frame::Ack {
       largest,
-      range,
+      range: largest.saturating_sub(first_low),
       ranges,
     })
   }
@@ -479,6 +501,9 @@ mod tests {
   /// Shape: an additional-range budget larger than any gap these small tests create, so the ACK
   /// reports every run (the cap itself is exercised by `the_ack_range_budget_bounds_the_frame`).
   const AMPLE_RANGES: usize = 8;
+  /// Shape: the ranges the tests' generators hold — ample for every pattern below except where a test
+  /// sets its own cap.
+  const TEST_RANGES: usize = 64;
 
   /// A packet number is a duplicate once it has been received (RFC 9000 §12.3), and stays a duplicate
   /// after ACK-of-ACK prunes it from the tracked set: the confirmed floor recognizes it, since a
@@ -486,7 +511,7 @@ mod tests {
   /// higher, unseen number is not a duplicate.
   #[test]
   fn a_seen_or_confirmed_packet_number_is_a_duplicate() {
-    let mut acks = AckGenerator::new();
+    let mut acks = AckGenerator::new(TEST_RANGES);
     assert!(!acks.is_duplicate(5), "unseen before it arrives");
     acks.record(5);
     assert!(acks.is_duplicate(5), "seen and still tracked");
@@ -506,11 +531,86 @@ mod tests {
     assert!(!acks.is_duplicate(6), "a higher, unseen number is new");
   }
 
+  /// The received set is held as merged ranges, so a long in-order run costs one entry, and a gappy
+  /// arrival pattern costs at most the cap: the oldest range is dropped and the duplicate floor rises to
+  /// its top, so a packet from a dropped range still reads as a duplicate while a new higher one does not.
+  /// Regression: every packet number was held individually, and an acknowledgement-only receiver's set grew
+  /// one entry per packet (353 against a bound of 40, 2026-09-28). Do X (100,000 in-order packets, then
+  /// every other packet of a further 1,000), expect Y (one range, then never more than the cap).
+  #[test]
+  fn the_received_set_stays_bounded_however_many_packets_arrive() {
+    let mut acks = in_order_then(100_000);
+    let mut peak = 0;
+    for pn in (100_001..101_001u64).step_by(2) {
+      acks.record(pn);
+      peak = peak.max(acks.tracked());
+    }
+    assert_eq!(peak, CAP, "the gaps filled the cap and never passed it");
+    assert!(
+      acks.is_duplicate(50_000),
+      "a packet from a dropped range is a duplicate"
+    );
+    assert!(acks.is_duplicate(100_999), "a held packet is a duplicate");
+    assert!(
+      !acks.is_duplicate(101_000),
+      "an unseen packet between held ranges is new"
+    );
+    assert!(!acks.is_duplicate(101_001), "a higher unseen packet is new");
+    let Some(Frame::Ack {
+      largest, ranges, ..
+    }) = acks.ack_frame(AMPLE_RANGES)
+    else {
+      panic!("an ACK is owed");
+    };
+    assert_eq!(
+      largest, 100_999,
+      "the acknowledgement leads with the newest packet"
+    );
+    assert_eq!(ranges.len(), CAP - 1, "it reports every held range");
+  }
+
+  /// Shape: the range cap of the bounded-set test.
+  const CAP: usize = 4;
+
+  /// A generator of cap [`CAP`] that has received packets `0..count` in order — which is one range.
+  fn in_order_then(count: u64) -> AckGenerator {
+    let mut acks = AckGenerator::new(CAP);
+    for pn in 0..count {
+      acks.record(pn);
+    }
+    assert_eq!(acks.tracked(), 1, "an in-order run is one range");
+    acks
+  }
+
+  /// Filling a gap merges the ranges on both sides into one, and a confirmation that falls inside a range
+  /// keeps only the part above it.
+  #[test]
+  fn ranges_merge_across_a_filled_gap_and_confirmation_trims_a_straddling_range() {
+    let mut acks = AckGenerator::new(TEST_RANGES);
+    for pn in [1u64, 2, 3, 5, 6, 7] {
+      acks.record(pn);
+    }
+    assert_eq!(acks.tracked(), 2);
+    acks.record(4);
+    assert_eq!(acks.tracked(), 1, "the gap filled: [1, 7] is one range");
+    acks.confirm(4);
+    assert_eq!(
+      acks.ack_frame(AMPLE_RANGES),
+      Some(Frame::Ack {
+        largest: 7,
+        range: 2,
+        ranges: vec![],
+      }),
+      "only [5, 7] remains to acknowledge"
+    );
+    assert!(acks.is_duplicate(3), "below the confirmed floor");
+  }
+
   /// The ACK reports *every* contiguous run of received packet numbers as multiple ranges (RFC 9000
   /// §19.3), so a packet received below a gap is acknowledged, not only the top run.
   #[test]
   fn the_ack_reports_every_received_run() {
-    let mut acks = AckGenerator::new();
+    let mut acks = AckGenerator::new(TEST_RANGES);
     for pn in [0u64, 1, 2, 4, 5] {
       acks.record(pn);
     }
@@ -540,7 +640,7 @@ mod tests {
   /// runs are left for the sender to retransmit-and-dedup (the single-range fallback this generalizes).
   #[test]
   fn the_ack_range_budget_bounds_the_frame() {
-    let mut acks = AckGenerator::new();
+    let mut acks = AckGenerator::new(TEST_RANGES);
     // Received every even packet 0..=10: runs {10},{8},{6},{4},{2},{0} — six singleton runs.
     for pn in [0u64, 2, 4, 6, 8, 10] {
       acks.record(pn);
@@ -588,7 +688,7 @@ mod tests {
       );
     }
     // Received {0,1,2,4,5} (packet 3 dropped): the generator's ACK acknowledges both runs.
-    let mut acks = AckGenerator::new();
+    let mut acks = AckGenerator::new(TEST_RANGES);
     for pn in [0u64, 1, 2, 4, 5] {
       acks.record(pn);
     }
@@ -728,7 +828,7 @@ mod tests {
     source.finish();
 
     let mut sent = SentTracker::new();
-    let mut acks = AckGenerator::new();
+    let mut acks = AckGenerator::new(TEST_RANGES);
     let mut assembler = StreamAssembler::new(content.len() as u64);
     let mut received = Vec::new();
     let mut dropped_once = false;

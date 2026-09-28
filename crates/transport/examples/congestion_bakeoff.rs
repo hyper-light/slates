@@ -42,13 +42,15 @@ use slates_rt::sim::{
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{ConnectionShape, Priority, initial_receive_window};
-use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
+use slates_transport::endpoint::{Endpoint, MAX_PACKET_PAYLOAD, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
+use slates_transport::session::STREAM_FRAME_HEADER_BYTES;
 
-/// Format: the fleet's per-packet overhead bound (`crates/server/src/fleet.rs` `FLEET_PACKET_OVERHEAD`).
-const PACKET_OVERHEAD: usize = 80;
-/// Format: the fleet's frame cap, so the bake-off frames exactly as the daemon does.
-const FRAME_CAP: usize = MIN_DATAGRAM_BYTES - PACKET_OVERHEAD;
+/// Derived: the wire bytes each packet adds around a frame's data — the short header and AEAD tag
+/// (`MIN_DATAGRAM_BYTES − MAX_PACKET_PAYLOAD`) and one `Stream` frame header — for sizing a class's load.
+const WIRE_OVERHEAD: usize = MIN_DATAGRAM_BYTES - MAX_PACKET_PAYLOAD + STREAM_FRAME_HEADER_BYTES;
+/// Format: the fleet's packet budget, so the bake-off frames exactly as the daemon does.
+const FRAME_CAP: usize = MAX_PACKET_PAYLOAD;
 /// Shape: the ping request and reply size — a small metadata operation.
 const PING_BYTES: usize = 64;
 /// Shape: the steady-state pings each run collects — enough that the p99 is a percentile (the tenth-worst
@@ -119,7 +121,7 @@ impl Scenario {
   /// The gap between pings that holds their load (request and reply packets, each the ping plus the
   /// packet overhead) to [`PING_LOAD_PERMILLE`] of the link.
   fn ping_gap_ns(&self) -> u64 {
-    let bits_per_ping = 2 * (PING_BYTES + PACKET_OVERHEAD) as u64 * 8;
+    let bits_per_ping = 2 * (PING_BYTES + WIRE_OVERHEAD) as u64 * 8;
     bits_per_ping * 1_000_000_000 * 1000 / (self.rate.max(1) * PING_LOAD_PERMILLE)
   }
 
@@ -315,7 +317,9 @@ async fn coordinator(
   pings: Sender<(u64, u64)>,
 ) {
   let one_way = scenario.rtt_ns / 2;
-  let reverse = SimPath::in_order(one_way, 0).with_loss(scenario.loss);
+  let reverse = SimPath::in_order(one_way, 0)
+    .with_loss(scenario.loss)
+    .with_mtu(MIN_DATAGRAM_BYTES);
   sim_udp_set_path(reverse);
   let link = sim_udp_add_link(SimLink {
     rate_bits_per_second: scenario.rate,
@@ -327,7 +331,10 @@ async fn coordinator(
     } else {
       SimPath::in_order(rtt / 2, scenario.jitter_ns)
     };
-    base.with_loss(scenario.loss).through(link)
+    base
+      .with_loss(scenario.loss)
+      .with_mtu(MIN_DATAGRAM_BYTES)
+      .through(link)
   };
   let ping_pair = Pair::bind();
   let (ping_client, ping_server) = ping_pair.ports();
@@ -343,7 +350,9 @@ async fn coordinator(
       sim_udp_set_pair_path(
         server,
         client,
-        SimPath::in_order(rtt / 2, 0).with_loss(scenario.loss),
+        SimPath::in_order(rtt / 2, 0)
+          .with_loss(scenario.loss)
+          .with_mtu(MIN_DATAGRAM_BYTES),
       );
     }
   }

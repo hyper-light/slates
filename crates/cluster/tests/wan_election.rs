@@ -33,14 +33,14 @@ use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::{SimPath, SimRuntime, sim_udp_set_path};
 use slates_rt::udp::UdpSocket;
 use slates_transport::connection::Priority;
-use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
+use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
 use slates_transport::rtt::RttEstimator;
 
 const NAME: &str = "slates-fleet";
 /// Shape: the fleet's frame class — a whole council message or probe in one frame, as the daemon's cap
 /// derived from the RFC 9000 §14.1 minimum datagram gives it, so an exchange is one round trip.
-const FRAME_CAP: usize = MIN_DATAGRAM_BYTES;
+const FRAME_CAP: usize = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
 /// Shape: the receive ceiling the test sessions' windows may auto-tune to — sixty-four initial windows,
 /// room for the tuning path to run without any test holding more than a few kilobytes.
 const RECEIVE_CEILING_WINDOWS: u64 = 64;

@@ -746,6 +746,8 @@ pub fn outcome_of_request_error(error: &EndpointError) -> ProbeOutcome {
     EndpointError::Closed
     | EndpointError::Io(_)
     | EndpointError::Admission(_)
+    | EndpointError::PacketBudget { .. }
+    | EndpointError::DatagramTooLarge { .. }
     | EndpointError::Stream(StreamRefusal::SequencesExhausted) => ProbeOutcome::Broken,
     // A backlog past the peer's stream credit means the peer is not finishing this end's streams — a
     // missed probe, which the suspicion rule already weighs; the other refusals are serve-side only.
