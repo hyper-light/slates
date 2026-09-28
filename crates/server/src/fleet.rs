@@ -1660,12 +1660,18 @@ fn receive_indirect_ack(state: &mut ShardState, target: HostId, nonce: u64) {
 /// detector tracks the peer as alive and can detect a *future* death rather than carrying its stale death
 /// forever. Returns `true` to probe.
 fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut bool) -> bool {
-  let in_mesh = state::with_state(|s| keeps_direct_contact_with(s, peer_host)).unwrap_or(false);
+  let contact = state::with_state(|s| direct_contact(s, peer_host));
+  let in_mesh = contact.is_some_and(DirectContact::kept);
   if !in_mesh {
+    // Logged on the transition only (one line per idle), so a peer this node stops probing names its cause.
+    if !*was_idle {
+      eprintln!("slates-server: fleet: probe of {peer_host:?} idles: {contact:?}");
+    }
     *was_idle = true;
     return false;
   }
   if *was_idle {
+    eprintln!("slates-server: fleet: probe of {peer_host:?} resumes: {contact:?}");
     if let Some(state) = state::with_state(|s| s.fleet.membership().state(peer_host)).flatten() {
       detector.apply(peer_host, state);
     }
@@ -2072,6 +2078,10 @@ fn follow_current_id(
     return;
   }
   let old = peer.host;
+  eprintln!(
+    "slates-server: fleet: peer anchor {:?} is now member {current:?} (was {old:?})",
+    peer.anchor
+  );
   let death = MemberState {
     liveness: Liveness::Dead,
     incarnation: detector
@@ -3725,18 +3735,79 @@ pub(crate) fn count_refusal(kind: &'static str) -> u64 {
 /// time. A retired peer that comes back is re-admitted alive by its own probes ([`serve_peer_probes`]) and
 /// regains contact then — which is what reaching the surviving voters makes possible.
 pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> bool {
+  direct_contact(state, peer).kept()
+}
+
+/// Why this node keeps, or drops, direct contact with a peer — the one rule behind
+/// [`keeps_direct_contact_with`], with its reason, so a probe task's idle and resume transitions can be
+/// logged by cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectContact {
+  /// The fleet's consensus groups are not both initialized yet: everyone is contacted.
+  Forming,
+  /// Believed dead, but only as a manifest **seed** this node has not yet replaced by a learned id: the seed
+  /// was never a live incarnation, so its death (folded where a neighbour learned the peer's real id, and
+  /// gossiped here) says only that the peer has a real incarnation this node has not reached. Contact is
+  /// kept so this node dials the peer and learns that id itself; idling here stranded the peer for good,
+  /// since gossip never enrolls a stranger's id
+  /// (`docs/bugs/2026-09-28-a-gossiped-seed-death-stranded-an-unreached-peer.md`).
+  UnlearnedSeed,
+  /// Not a member of the council's committed configuration (a newcomer or an unknown id): contacted.
+  NotInCouncilConfiguration,
+  /// In this node's neighbourhood.
+  Neighbour,
+  /// A voter of the council or the root group.
+  Voter,
+  /// Dropped: this node believes the peer dead.
+  BelievedDead,
+  /// Dropped: a council member outside this node's neighbourhood and no voter.
+  OutsideNeighbourhood,
+}
+
+impl DirectContact {
+  fn kept(self) -> bool {
+    !matches!(self, Self::BelievedDead | Self::OutsideNeighbourhood)
+  }
+}
+
+fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
   let believed_dead = state
     .fleet
     .membership()
     .state(peer)
     .is_some_and(|belief| belief.liveness == Liveness::Dead);
-  !believed_dead
-    && (!state.council.initialized()
-      || !state.root.initialized()
-      || !state.council.configuration().members.contains(&peer)
-      || state.fleet.configuration().neighbourhood.contains(&peer)
-      || state.council.is_voter(peer)
-      || state.root.is_voter(peer))
+  if believed_dead {
+    if is_unlearned_seed(state, peer) {
+      DirectContact::UnlearnedSeed
+    } else {
+      DirectContact::BelievedDead
+    }
+  } else if !state.council.initialized() || !state.root.initialized() {
+    DirectContact::Forming
+  } else if !state.council.configuration().members.contains(&peer) {
+    DirectContact::NotInCouncilConfiguration
+  } else if state.fleet.configuration().neighbourhood.contains(&peer) {
+    DirectContact::Neighbour
+  } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
+    DirectContact::Voter
+  } else {
+    DirectContact::OutsideNeighbourhood
+  }
+}
+
+/// Whether `peer` is a manifest seed (`member_id(anchor, 0)` of a rostered peer) whose anchor this node has
+/// not learned a real id for. Bounded by the roster: one pass over the manifest's peers and the learned map.
+fn is_unlearned_seed(state: &ShardState, peer: HostId) -> bool {
+  let rostered = state
+    .config
+    .fleet
+    .as_ref()
+    .is_some_and(|fleet| fleet.peers.contains(&peer));
+  rostered
+    && !state
+      .learned_members
+      .keys()
+      .any(|anchor| crate::deploy::member_id(*anchor, 0) == peer)
 }
 
 /// Keeps one peer's client record session up for the coordinator (§4.8) — a candidate holder's, or a
@@ -5866,6 +5937,58 @@ mod tests {
       (true, false, 1),
       "a restart moves the link and drops the dial to the old incarnation, counted"
     );
+  }
+
+  /// AC-8.1 (§4.8 "Deployment", task #22; docs/bugs/2026-09-28-a-gossiped-seed-death-stranded-an-unreached-peer.md):
+  /// a peer this node has never reached is known only by its manifest seed. When a neighbour that did reach
+  /// it learns its real id, the seed is folded dead and that death gossips here — but it says only that the
+  /// peer has a real incarnation, so this node keeps direct contact (its probe and record link keep dialing
+  /// to learn that id itself). Once the real id is learned, a death of the real id drops contact as before.
+  #[test]
+  fn a_gossiped_seed_death_keeps_contact_until_the_real_id_is_learned() {
+    let (unreached, learned_seed, learned_real) = crate::daemon::audit_on_shard(|state| {
+      let anchor = HostId(0x5eed);
+      let seed = crate::deploy::member_id(anchor, 0);
+      let real = crate::deploy::member_id(anchor, 7);
+      state.config.fleet = Some(crate::config::FleetMembership {
+        quorum: Quorum { f: 1 },
+        peers: vec![seed],
+        host: state.fleet.host(),
+        origin_anchor: state.origin_anchor,
+        domains: std::collections::BTreeMap::new(),
+        regions: std::collections::BTreeMap::new(),
+        region_mirrors: std::collections::BTreeMap::new(),
+        durability: None,
+      });
+      let dead = MemberState {
+        liveness: Liveness::Dead,
+        incarnation: 0,
+      };
+      // A neighbour learned the peer's real id and gossiped its seed's death here.
+      apply_peer_state(&mut state.fleet, seed, Some(dead));
+      let unreached = keeps_direct_contact_with(state, seed);
+      // This node reaches the peer itself and learns its real id; then the real id dies.
+      state.learned_members.insert(
+        anchor,
+        LearnedMember {
+          boot_nonce: 7,
+          host: real,
+        },
+      );
+      let learned_seed = keeps_direct_contact_with(state, seed);
+      apply_peer_state(&mut state.fleet, real, Some(dead));
+      let learned_real = keeps_direct_contact_with(state, real);
+      (unreached, learned_seed, learned_real)
+    });
+    assert!(
+      unreached,
+      "a peer known only by its seed keeps contact when the seed's death is gossiped"
+    );
+    assert!(
+      !learned_seed,
+      "once the real id is learned, the seed is a retired placeholder"
+    );
+    assert!(!learned_real, "a learned peer's death drops contact");
   }
 
   /// AC-8.1 / T-8.12: an authenticated neighbor reports the death of a known member this node

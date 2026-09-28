@@ -7469,19 +7469,17 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
   );
 }
 
-/// Rejoin design item 3 (2026-09-14; `docs/bugs/2026-09-14-retirement-closes-the-same-id-restarts-serve-session.md`):
-/// a dial still in its handshake when its peer is retired is dropped with the probe session, so the
-/// peer's return is dialed **afresh** — at the address discovery holds for it by then, as a rescheduled
-/// pod's new IP is — instead of the pending flight being driven through the remaining handshake budgets
-/// at the stale address first. A starts with B named at addresses nobody serves, so its dial to B pends;
-/// B's death is injected (what a third node's gossip carries on a lane) and A retires B — the pending
-/// dial must be dropped, and is counted (`fleet.dial.stale_dropped`), the non-vacuity of this test; then
-/// B starts at **other** addresses under its certificate and announces them, and A must mesh to it under
-/// its fresh id. Whether A's first dial after the resume already finds the announced address or still
-/// the manifest's depends on which of B's first two exchanges lands first, so the re-dial count is not
-/// asserted; the drop is what the fix adds, and the mesh is what it must not break.
+/// AC-8.1 (§4.8 "Deployment"; `docs/bugs/2026-09-28-a-gossiped-seed-death-stranded-an-unreached-peer.md`,
+/// superseding the 2026-09-14 expectation of rejoin design item 3 for this case): A starts with B named at
+/// addresses nobody serves, so its dial to B pends and A knows B only by B's manifest **seed**. B's seed
+/// death then arrives (injected: what a third node gossips when it *learns* B's real id — the KIND lane's
+/// evidence). A seed was never a live incarnation, so A must **keep** its pending dial rather than retire B;
+/// retiring on it stranded the peer for good in the lane, since gossip never enrolls the real id. Then B
+/// starts at **other** addresses under its certificate and announces them, and A must still mesh to it under
+/// its fresh id — the kept dial at the stale manifest address is replaced within its bounded handshake
+/// budgets (`ESTABLISH_BUDGETS_BEFORE_REDIAL`), and the mesh time is printed as the measurement of that cost.
 #[test]
-fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_meshed() {
+fn a_gossiped_seed_death_keeps_the_pending_dial_and_the_peers_return_at_new_addresses_is_meshed() {
   let _serial = serialize_fleet_tests();
   let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let (_ports_again, [pb_probe_again, pb_record_again, _, _]) = four_free_ports();
@@ -7507,11 +7505,11 @@ fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_me
   };
   let b_seed = b.host;
   let daemon_a = start(a, peer_of_a);
-  // Nothing serves B's manifest addresses: A's dial to B stays in its handshake. B's death arrives
-  // (injected) and A retires it — with the pending dial.
+  // Nothing serves B's manifest addresses: A's dial to B stays in its handshake. B's seed death arrives
+  // (injected); A must keep the dial — it knows no incarnation of B that could have died.
   inject_death_into([&daemon_a], b_seed);
-  let dropped = poll_until(&[&daemon_a], RETIREMENT_DEADLINE, || {
-    refusal_count(&daemon_a, STALE_DIAL_DROPPED).map(|count| count >= 1)
+  let kept = holds_for(SEED_DEATH_HOLD, || {
+    refusal_count(&daemon_a, STALE_DIAL_DROPPED).map(|count| count == 0)
   });
   // B returns at other addresses (the same certificate, a fresh member id) and dials A, announcing
   // its addresses over the record plane; A must mesh to it there.
@@ -7521,6 +7519,7 @@ fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_me
     record_address: loopback(pb_record_again),
     ..b
   };
+  let returned = Instant::now();
   let daemon_b = start(b_again, peer_of_b);
   let b_new = daemon_b
     .member_identity()
@@ -7532,18 +7531,27 @@ fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_me
         && daemon_b.fleet_meshed()?,
     )
   });
+  eprintln!(
+    "B's return at new addresses meshed in {:.2} s",
+    returned.elapsed().as_secs_f64()
+  );
   let stale_dropped = refusal_count(&daemon_a, STALE_DIAL_DROPPED);
   daemon_a.stop();
   daemon_b.stop();
   assert!(
-    dropped,
-    "A dropped its pending dial to B when it retired B (counted {stale_dropped:?} × {STALE_DIAL_DROPPED})"
+    kept,
+    "A kept its pending dial to B through B's gossiped seed death (counted {stale_dropped:?} × {STALE_DIAL_DROPPED})"
   );
   assert!(
     meshed,
     "A meshed to B's return at its new addresses under B's fresh member id"
   );
 }
+
+/// Shape: how long A must keep its pending dial after B's seed death — twenty probe periods of the daemon's
+/// 100 ms heartbeat. Under the superseded rule the drop came at the probe loop's next period (the loop's
+/// retirement check runs at the top of every period), so a drop would land well inside this window.
+const SEED_DEATH_HOLD: Duration = Duration::from_secs(2);
 
 /// The refusal key A counts when it drops a dial still in its handshake at its peer's retirement
 /// (`fleet::DIAL_STALE_DROPPED`), under the keys `Daemon::fleet_refusals` reports.

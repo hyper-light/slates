@@ -1796,6 +1796,27 @@ in job 105312670519, not the other jobs still running in that workflow.
 Evidence and commands: [CLI gate](../bugs/2026-09-17-cli-process-gate.md).
 
 
+### 2026-09-28: a cleared control flag stranded a shutdown — fixed
+
+A full in-process fleet suite hung for over 90 minutes in `Daemon::stop` → `Runtime::shutdown`: a shard sent
+`Shutdown` was parked in `kevent` with no deadline. The control-pending flag's two halves were each unsound
+under the memory model — the shard cleared it with a load then a store (erasing a later sender's mark), and
+senders published with a plain store (ending the earlier sender's release sequence) — so a control message
+could sit undrained while the shard parked for good. Both are read-modify-writes now (`parking::ControlFlag`).
+A new loom model drives the real code: the old halves deadlock at interleavings 1 and 207; the fixed protocol
+passes 5,204 interleavings. [Bug record](../bugs/2026-09-28-a-cleared-control-flag-stranded-a-shutdown.md).
+
+
+### 2026-09-28: a gossiped seed death split a fresh fleet — fixed
+
+CI run 36462066595 (`fd4f0ef`) failed the KIND lane's five-replica formation, and the local lane reproduced
+it (2 of 5 and 1 of 3 scale runs). A node whose first dials to a peer failed (NXDOMAIN before the pod's DNS
+record was published) received that peer's **seed** death by gossip from a node that had reached it, idled
+its probe on the seed, and never dialed again; the other side did the same, so the pair never meshed. The
+direct-contact rule now keeps contact with an unlearned seed until the real id is learned. KIND scale: 10 of
+10 after the fix. [Bug record](../bugs/2026-09-28-a-gossiped-seed-death-stranded-an-unreached-peer.md).
+
+
 ### 2026-09-17: KIND rejoin status reconciled
 
 The original whole-pod session-formation gap was fixed by the retirement/re-dial lifecycle

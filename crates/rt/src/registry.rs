@@ -63,7 +63,7 @@ pub struct Entry {
   pub generation_base: u32,
   /// Set by a sender, cleared by the shard once the channel is drained: the shard polls the
   /// channel only when this says something was sent, one atomic load per step otherwise.
-  pub control_pending: AtomicBool,
+  pub control_pending: crate::parking::ControlFlag,
   /// The generational kick that wakes this registration's driver.
   pub kick: Kick,
   /// The kick descriptor, closed after the owning contexts and foreign borrows end (Unix).
@@ -315,7 +315,7 @@ pub fn register(
       inbound,
       control,
       generation_base: slot.arena_generation.load(Ordering::Acquire),
-      control_pending: AtomicBool::new(false),
+      control_pending: crate::parking::ControlFlag::new(),
       kick: Kick::None,
       #[cfg(unix)]
       kick_fd: None,
@@ -694,7 +694,7 @@ pub fn send_control(target: u16, message: Control) -> Result<(), RtError> {
 fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), RtError> {
   match entry.control.try_send(message) {
     Ok(()) => {
-      entry.control_pending.store(true, Ordering::SeqCst);
+      entry.control_pending.publish();
       entry.parking.kick_if_parked(|| entry.kick.kick());
       Ok(())
     }

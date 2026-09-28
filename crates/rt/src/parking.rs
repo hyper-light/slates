@@ -49,6 +49,58 @@ pub struct Parking {
   timed: AtomicBool,
 }
 
+/// A shard's control-pending flag: the sender's publication marker for its control channel, so the shard
+/// learns a control message waits without polling the channel every step, and so a parking shard's re-check
+/// sees one ([`Parking::park_unless_pending`]). A sender publishes after pushing its message; the shard takes
+/// the mark before draining, and re-arms it when a batch-limited drain may have left messages behind.
+#[derive(Debug, Default)]
+pub struct ControlFlag {
+  pending: AtomicBool,
+}
+
+impl ControlFlag {
+  /// Nothing pending.
+  pub fn new() -> Self {
+    Self {
+      pending: AtomicBool::new(false),
+    }
+  }
+
+  /// The sender's half, after its message is pushed: marks the channel pending — a read-modify-write, not a
+  /// store. Consecutive RMWs form one release sequence, so the shard's acquiring [`take`](Self::take) of the
+  /// latest mark synchronizes with **every** sender whose mark it absorbs, and the drain that follows sees
+  /// each of their messages. A plain store from a second sender would end the first sender's release
+  /// sequence (C++20 `[intro.races]`: a release sequence continues only through RMWs), leaving the first
+  /// sender's message unordered before the drain: loom's first interleaving drained neither message this
+  /// way — the flag cleared, both kicks skipped, the shard parked for good.
+  pub fn publish(&self) {
+    let _ = self.pending.swap(true, Ordering::SeqCst);
+  }
+
+  /// The shard's half, before draining: whether a message may wait, clearing the mark — one atomic
+  /// read-modify-write. The read and the clear must be one step: an RMW reads the latest mark in the flag's
+  /// modification order, so either it reads a concurrent sender's publication (and acquires its message,
+  /// which the drain that follows then finds) or that publication lands after it and stays set for the next
+  /// step. Until 2026-09-28 this was a load and then a store of `false`: the load could read an earlier
+  /// sender's mark, the store then overwrote a later sender's, and the drain could miss that sender's
+  /// message — a `Shutdown` stranded in the channel while the shard parked for good, since the later
+  /// sender's kick had coalesced into the wake the shard already took (loom: the first interleaving
+  /// explored; `docs/bugs/2026-09-28-a-cleared-control-flag-stranded-a-shutdown.md`).
+  pub fn take(&self) -> bool {
+    self.pending.swap(false, Ordering::AcqRel)
+  }
+
+  /// The shard re-arms the mark after a drain that stopped at its batch bound (messages may remain).
+  pub fn rearm(&self) {
+    self.pending.store(true, Ordering::Release);
+  }
+
+  /// The shard's park re-check: whether a message may wait.
+  pub fn is_pending(&self) -> bool {
+    self.pending.load(Ordering::Acquire)
+  }
+}
+
 /// What a park did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Parked {
@@ -284,6 +336,71 @@ mod loom_tests {
     );
     assert!(
       WAITS.load(StdOrdering::Relaxed) > 0,
+      "some interleaving made the shard wait"
+    );
+  }
+
+  /// Delivered control messages, across every explored interleaving of the control model.
+  static CONTROL_WAITS: AtomicU64 = AtomicU64::new(0);
+
+  /// AC-0.7 (the control path of `registry::send_control_to` and `shard::drain_control`): two senders each
+  /// push one control message into the shard's channel, publish the [`ControlFlag`], and kick the shard if
+  /// it announced parking; the shard takes the flag and drains the channel, and parks unless the flag is
+  /// pending. In every interleaving both messages are drained: a message whose publication the shard's
+  /// take cleared is either drained by that same drain or re-marked. A lost message leaves the shard parked
+  /// with nothing left to run, which loom reports as a deadlock. Some interleaving made the shard wait.
+  #[test]
+  fn a_control_message_published_while_the_shard_drains_is_never_lost() {
+    loom_bounds::explore(
+      "parking: two control senders against one draining, parking shard",
+      || {
+        let channel: &'static MpscRing = Box::leak(Box::new(MpscRing::new(RING_CAPACITY).unwrap()));
+        let flag: &'static ControlFlag = Box::leak(Box::new(ControlFlag::new()));
+        let parking: &'static Parking = Box::leak(Box::new(Parking::new()));
+        let kick: &'static Notify = Box::leak(Box::new(Notify::new()));
+        let send = move |word: u64| {
+          // `send_control_to`'s order: push, publish the flag, then kick if the shard is parked.
+          channel.push(word).unwrap();
+          flag.publish();
+          parking.kick_if_parked(|| kick.notify());
+        };
+        let first = loom::thread::spawn(move || send(WORD));
+        let second = loom::thread::spawn(move || send(WORD + 1));
+        let mut consumer = channel.consumer();
+        let mut received = 0;
+        let mut waited = false;
+        // The shard's loop: a step drains when the flag is taken; a step that drained loops again; an idle
+        // step parks unless the flag is pending.
+        while received < 2 {
+          let mut drained = 0;
+          if flag.take() {
+            while consumer.pop().is_some() {
+              drained += 1;
+            }
+          }
+          received += drained;
+          if received == 2 {
+            break;
+          }
+          if drained > 0 {
+            continue;
+          }
+          if matches!(
+            parking.park_unless_pending(|| flag.is_pending(), || kick.wait()),
+            Parked::Waited(_)
+          ) {
+            waited = true;
+          }
+        }
+        first.join().unwrap();
+        second.join().unwrap();
+        if waited {
+          CONTROL_WAITS.fetch_add(1, StdOrdering::Relaxed);
+        }
+      },
+    );
+    assert!(
+      CONTROL_WAITS.load(StdOrdering::Relaxed) > 0,
       "some interleaving made the shard wait"
     );
   }

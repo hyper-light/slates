@@ -447,9 +447,10 @@ impl ShardContext {
 
   /// Whether any inbound ring holds a word (a check without a syscall).
   pub fn has_inbound(&self) -> bool {
-    if self.entry.is_some_and(|e| {
-      !e.inbound.is_empty() || e.control_pending.load(std::sync::atomic::Ordering::Acquire)
-    }) {
+    if self
+      .entry
+      .is_some_and(|e| !e.inbound.is_empty() || e.control_pending.is_pending())
+    {
       return true;
     }
     self.inbound.iter().any(|ring| !ring.is_empty())
@@ -1159,17 +1160,11 @@ impl ShardContext {
     let Some(entry) = self.entry else {
       return false;
     };
-    if !entry
-      .control_pending
-      .load(std::sync::atomic::Ordering::Acquire)
-    {
+    // Take (read and clear in one atomic step) before draining: a send that lands during the drain
+    // publishes the flag again and is seen on the next step at the latest (`parking::ControlFlag`).
+    if !entry.control_pending.take() {
       return false;
     }
-    // Clear before draining: a send that lands during the drain sets the flag again and is
-    // seen on the next step at the latest.
-    entry
-      .control_pending
-      .store(false, std::sync::atomic::Ordering::Release);
     let batch = inner.config.batch.max(1);
     let mut drained = 0;
     while drained < batch {
@@ -1187,9 +1182,7 @@ impl ShardContext {
       // a spawn queued behind it was never admitted, and a shutdown refused by the still-full channel
       // was retried against a shard that had parked for good (`tests/burst.rs`,
       // `docs/bugs/2026-09-17-control-drain-forgets-a-burst-past-one-batch.md`).
-      entry
-        .control_pending
-        .store(true, std::sync::atomic::Ordering::Release);
+      entry.control_pending.rearm();
     }
     drained > 0
   }
