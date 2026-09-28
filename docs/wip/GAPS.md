@@ -1796,6 +1796,17 @@ in job 105312670519, not the other jobs still running in that workflow.
 Evidence and commands: [CLI gate](../bugs/2026-09-17-cli-process-gate.md).
 
 
+### 2026-09-28: consensus enhancements — explorer and leadership transfer built
+
+Ada's consensus goal (pre-vote, priority elections, parallel replication, learners, MLRaft, leader transfer,
+Fast Raft; `docs/wip/research/consensus-enhancements.md`). Built: the Raft safety explorer (CI runs it at full
+scale in release) and leadership transfer (thesis §3.10) in the core, the wire, both groups and the daemon's
+drive loops — council handoff 0.103 s against a 1.316 s leader-loss election (medians), root handoff across
+three regions 0.093 s. Open, in build order: pre-vote audit under partitions, learners with catch-up rounds,
+priority elections, ParallelRaft-CE, Fast Raft (counterexample first), MLRaft, and the graceful drain and
+WAN/KIND measurements.
+
+
 ### 2026-09-28: a cleared control flag stranded a shutdown — fixed
 
 A full in-process fleet suite hung for over 90 minutes in `Daemon::stop` → `Runtime::shutdown`: a shard sent

@@ -57,6 +57,8 @@ jobs:
         run: cargo test --workspace
       - name: AC-1.1 model suite over 10^6 generated operations
         run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
+      - name: T-8.13 Raft safety explorer at full scale
+        run: cargo test -p slates-cluster --release --test explore -- --ignored
       - name: AC-1.2 differential suite against tmpfs (Linux)
         if: runner.os == 'Linux'
         run: SLATES_TEST_RAMDIR=/dev/shm PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture

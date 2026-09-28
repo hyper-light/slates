@@ -125,6 +125,50 @@ pub struct VoteReply {
   pub granted: bool,
 }
 
+/// A leader's invitation to a caught-up voter to start an election at once (thesis §3.10, leadership
+/// transfer): sent only once the target's log matches the leader's, so the target wins the election it
+/// starts without waiting for its own timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeoutNow {
+  /// The leader's term; a target at another term ignores the invitation.
+  pub term: u64,
+  /// The leader sending the invitation.
+  pub leader: HostId,
+}
+
+/// Why a leadership transfer was refused (the closed taxonomy; thesis §3.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferRefusal {
+  /// Only the leader can hand leadership off.
+  NotLeader,
+  /// The target is the leader itself.
+  TargetIsSelf,
+  /// The target does not vote in the effective configuration, so it could not win.
+  TargetNotVoter,
+  /// A transfer to `target` is already in flight; one at a time.
+  InFlight {
+    /// The transfer's target.
+    target: HostId,
+  },
+}
+
+/// A leadership transfer in flight (thesis §3.10): its target, the term it was started in (it is void once
+/// this node no longer leads that term), how many CheckQuorum ticks it has waited through, and whether the
+/// invitation has gone out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Transfer {
+  target: HostId,
+  term: u64,
+  quorum_checks: u8,
+  invited: bool,
+}
+
+/// Derived: the CheckQuorum ticks a leadership transfer may wait through before the leader aborts it and
+/// accepts proposals again (thesis §3.10: abort "after about an election timeout"). The tick runs once per
+/// election timeout; a transfer started just before a tick has only a sliver of a timeout behind it at that
+/// tick, so the abort comes at the second tick — at least one whole election timeout, at most two.
+const TRANSFER_QUORUM_CHECKS: u8 = 2;
+
 /// A voter configuration (Raft §6): the base voter set and, during a membership change, the incoming
 /// set. A decision needs a majority of the base and — when `joint` is set — of the incoming set too.
 #[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
@@ -370,6 +414,10 @@ pub struct RaftNode {
   snapshot_index: u64,
   snapshot_term: u64,
   snapshot_data: Vec<u8>,
+  /// The leadership transfer in flight, while leading (thesis §3.10).
+  transfer: Option<Transfer>,
+  /// Transfers this node started that were aborted at their deadline (the non-vacuity counter).
+  transfers_aborted: u64,
 }
 
 impl RaftNode {
@@ -399,6 +447,8 @@ impl RaftNode {
       snapshot_index: 0,
       snapshot_term: 0,
       snapshot_data: Vec::new(),
+      transfer: None,
+      transfers_aborted: 0,
     }
   }
 
@@ -654,6 +704,7 @@ impl RaftNode {
     self.role = Role::Follower;
     self.leader_hint = None;
     self.votes.clear();
+    self.transfer = None;
   }
 
   /// Becomes leader if the votes gathered this election are a majority of the voters, initialising the
@@ -664,6 +715,7 @@ impl RaftNode {
       return;
     }
     self.role = Role::Leader;
+    self.transfer = None;
     // Start the CheckQuorum window already in contact with the voters that just elected it, so the first
     // check does not spuriously step a freshly-won leader down before its heartbeats have replied.
     self.contacts = self.votes.clone();
@@ -1008,7 +1060,9 @@ impl RaftNode {
   /// single-voter leader commits it at once (Raft §5.3, leader append). A non-leader ignores the append
   /// and reports `false` — only the leader proposes.
   pub fn append_command(&mut self, command: Vec<u8>) -> bool {
-    if self.role != Role::Leader {
+    // A leader handing off leadership stops accepting proposals (thesis §3.10), so the target's log can
+    // catch up to a fixed end and the election it starts is won by a log that holds every entry.
+    if self.role != Role::Leader || self.active_transfer().is_some() {
       return false;
     }
     self.retention_pending = true;
@@ -1142,6 +1196,7 @@ impl RaftNode {
     if self.role != Role::Leader {
       return;
     }
+    self.age_transfer();
     let mut reachable = self.contacts.clone();
     reachable.insert(self.id);
     if !self.is_majority(&reachable) {
@@ -1149,8 +1204,112 @@ impl RaftNode {
       self.role = Role::Follower;
       self.has_leader = false;
       self.leader_hint = None;
+      self.transfer = None;
     }
     self.contacts.clear();
+  }
+
+  /// One CheckQuorum tick of the transfer in flight: past [`TRANSFER_QUORUM_CHECKS`] ticks it is aborted
+  /// (counted) and the leader accepts proposals again (thesis §3.10).
+  fn age_transfer(&mut self) {
+    let Some(transfer) = self.active_transfer() else {
+      self.transfer = None;
+      return;
+    };
+    let quorum_checks = transfer.quorum_checks.saturating_add(1);
+    if quorum_checks >= TRANSFER_QUORUM_CHECKS {
+      self.transfer = None;
+      self.transfers_aborted = self.transfers_aborted.saturating_add(1);
+    } else {
+      self.transfer = Some(Transfer {
+        quorum_checks,
+        ..transfer
+      });
+    }
+  }
+
+  /// Starts a leadership transfer to `target` (thesis §3.10): from now until the transfer ends the leader
+  /// refuses new proposals, keeps replicating, and — once `target`'s log matches its own —
+  /// [`take_timeout_now`](RaftNode::take_timeout_now) yields the invitation that makes `target` campaign at
+  /// once. The transfer ends when this node stops leading (the target won, or anything else deposed it) or
+  /// is aborted at the second CheckQuorum tick. Refused, typed, when this node is not the leader, `target`
+  /// is itself or not a voter, or a transfer is already in flight.
+  pub fn transfer_leadership(&mut self, target: HostId) -> Result<(), TransferRefusal> {
+    if self.role != Role::Leader {
+      return Err(TransferRefusal::NotLeader);
+    }
+    if target == self.id {
+      return Err(TransferRefusal::TargetIsSelf);
+    }
+    if !self.is_voter(target) {
+      return Err(TransferRefusal::TargetNotVoter);
+    }
+    if let Some(transfer) = self.active_transfer() {
+      return Err(TransferRefusal::InFlight {
+        target: transfer.target,
+      });
+    }
+    self.transfer = Some(Transfer {
+      target,
+      term: self.current_term,
+      quorum_checks: 0,
+      invited: false,
+    });
+    Ok(())
+  }
+
+  /// The transfer in flight: one started in this node's current term while it still leads that term.
+  fn active_transfer(&self) -> Option<Transfer> {
+    self
+      .transfer
+      .filter(|transfer| self.role == Role::Leader && transfer.term == self.current_term)
+  }
+
+  /// The target of the leadership transfer in flight, if one is.
+  pub fn transferring_to(&self) -> Option<HostId> {
+    self.active_transfer().map(|transfer| transfer.target)
+  }
+
+  /// The invitation to send the transfer's target, once: `Some((target, TimeoutNow))` the first time it is
+  /// asked after the target's log matches the leader's (its `match_index` has reached the leader's last
+  /// index), `None` before that, after it was sent, and when no transfer is in flight. The caller ships it
+  /// with the replication that follows.
+  pub fn take_timeout_now(&mut self) -> Option<(HostId, TimeoutNow)> {
+    let transfer = self.active_transfer()?;
+    if transfer.invited {
+      return None;
+    }
+    let matched = self.match_index.get(&transfer.target).copied().unwrap_or(0);
+    if matched < self.last_log_index() {
+      return None;
+    }
+    self.transfer = Some(Transfer {
+      invited: true,
+      ..transfer
+    });
+    Some((
+      transfer.target,
+      TimeoutNow {
+        term: self.current_term,
+        leader: self.id,
+      },
+    ))
+  }
+
+  /// Handles a [`TimeoutNow`] (thesis §3.10): a voter at the inviting leader's term starts a real election at
+  /// once — no pre-vote, since the leader invited it — and returns the vote requests to send. An invitation
+  /// from another term, or to a node that leads or does not vote, is ignored (no messages).
+  pub fn on_timeout_now(&mut self, invitation: TimeoutNow) -> Vec<RequestVote> {
+    if invitation.term != self.current_term || self.role == Role::Leader || !self.is_voter(self.id)
+    {
+      return Vec::new();
+    }
+    self.start_election()
+  }
+
+  /// Leadership transfers this node started that were aborted at their deadline (thesis §3.10).
+  pub fn transfers_aborted(&self) -> u64 {
+    self.transfers_aborted
   }
 
   /// Starts one ReadIndex round after a current-term commit (Raft §6.4; AUD-09). The next
@@ -1214,6 +1373,7 @@ impl RaftNode {
   pub fn begin_membership_change(&mut self, new_voters: Vec<HostId>) -> bool {
     let current = self.effective_config();
     if self.role != Role::Leader
+      || self.active_transfer().is_some()
       || current.joint.is_some()
       || new_voters.is_empty()
       || self.latest_config_index() > self.commit_index
@@ -1965,6 +2125,148 @@ mod tests {
 
   /// ReadIndex (Raft §6.4): a leader serves a read only after committing in its current term. A lone
   /// leader has no read index until it commits an entry; then the read index is its commit index.
+  /// Delivers `invitation` to `target` and runs the election it starts: one vote request per other voter,
+  /// each answered, every reply folded by the target.
+  fn run_invited_election(
+    target: &mut RaftNode,
+    invitation: TimeoutNow,
+    voters: &mut [&mut RaftNode],
+  ) {
+    let requests = target.on_timeout_now(invitation);
+    assert_eq!(
+      requests.len(),
+      voters.len(),
+      "one vote request per other voter"
+    );
+    for (voter, request) in voters.iter_mut().zip(requests) {
+      let reply = voter.on_request_vote(request);
+      target.on_vote_reply(reply);
+    }
+  }
+
+  /// Thesis §3.10 (`docs/wip/research/consensus-enhancements.md` §3.2): a leader transferring leadership
+  /// refuses proposals, withholds the invitation until the target's log matches its own, and sends it once.
+  #[test]
+  fn a_transferring_leader_refuses_proposals_and_invites_a_caught_up_target_once() {
+    let voters = vec![A, B, C];
+    let mut a = elected_leader(A, voters.clone());
+    let mut b = RaftNode::new(B, voters);
+    assert!(a.append_command(b"one".to_vec()));
+    assert_eq!(a.transfer_leadership(B), Ok(()));
+    assert_eq!(a.transferring_to(), Some(B));
+    assert!(
+      !a.append_command(b"refused".to_vec()),
+      "no proposals while transferring"
+    );
+    assert!(
+      a.take_timeout_now().is_none(),
+      "no invitation before the target has caught up"
+    );
+    replicate_until_stuck(&mut a, &mut b, B);
+    let invited = a.take_timeout_now().map(|(target, _)| target);
+    assert_eq!(invited, Some(B), "the caught-up target is invited");
+    assert!(
+      a.take_timeout_now().is_none(),
+      "the invitation is sent once"
+    );
+  }
+
+  /// A leader A holding two entries mid-transfer to B, with B caught up: the three nodes and the invitation.
+  fn caught_up_transfer() -> (RaftNode, RaftNode, RaftNode, TimeoutNow) {
+    let voters = vec![A, B, C];
+    let mut a = elected_leader(A, voters.clone());
+    let mut b = RaftNode::new(B, voters.clone());
+    let c = RaftNode::new(C, voters);
+    assert!(a.append_command(b"one".to_vec()));
+    assert!(a.append_command(b"two".to_vec()));
+    assert_eq!(a.transfer_leadership(B), Ok(()));
+    replicate_until_stuck(&mut a, &mut b, B);
+    let (_, invitation) = a.take_timeout_now().expect("B has caught up");
+    (a, b, c, invitation)
+  }
+
+  /// Thesis §3.10: the invited voter campaigns at once (no pre-vote, no election timeout) and wins; the old
+  /// leader steps down on its vote request, which ends the transfer; the new leader holds every entry the
+  /// old one had.
+  #[test]
+  fn the_invited_voter_wins_and_the_old_leader_steps_down() {
+    let (mut a, mut b, mut c, invitation) = caught_up_transfer();
+    run_invited_election(&mut b, invitation, &mut [&mut a, &mut c]);
+    assert!(b.is_leader(), "the invited voter won its election");
+    assert_eq!(a.role(), Role::Follower, "the old leader stepped down");
+    assert_eq!(
+      a.transferring_to(),
+      None,
+      "the transfer ended with the leadership"
+    );
+    assert_eq!(b.last_log_index(), a.last_log_index());
+    assert_eq!(b.last_log_term(), a.last_log_term());
+  }
+
+  /// Thesis §3.10: a transfer that does not complete — its target never catches up — is aborted at the
+  /// second CheckQuorum tick (counted), and the leader accepts proposals again. The leader keeps its
+  /// quorum through the other voter all along, so the abort is the transfer's deadline, not a step-down.
+  #[test]
+  fn a_transfer_that_does_not_complete_is_aborted_and_proposals_resume() {
+    let mut a = elected_leader(A, vec![A, B, C]);
+    assert_eq!(a.transfer_leadership(C), Ok(()));
+    assert!(!a.append_command(b"held".to_vec()));
+    for tick in 1..=2 {
+      a.on_append_reply(AppendReply {
+        read_context: 0,
+        follower: B,
+        term: a.term(),
+        success: true,
+        match_index: 0,
+      });
+      a.check_quorum();
+      assert!(
+        a.is_leader(),
+        "the leader keeps its quorum through tick {tick}"
+      );
+    }
+    assert_eq!(a.transferring_to(), None, "aborted at the second tick");
+    assert_eq!(a.transfers_aborted(), 1);
+    assert!(a.append_command(b"resumed".to_vec()), "proposals resume");
+  }
+
+  /// Thesis §3.10: a transfer is refused by type — from a non-leader, to the leader itself, to a node that
+  /// does not vote, and while another is in flight.
+  #[test]
+  fn a_transfer_is_refused_by_type() {
+    let voters = vec![A, B, C];
+    let mut follower = RaftNode::new(B, voters.clone());
+    assert_eq!(
+      follower.transfer_leadership(A),
+      Err(TransferRefusal::NotLeader)
+    );
+    let mut a = elected_leader(A, voters);
+    assert_eq!(a.transfer_leadership(A), Err(TransferRefusal::TargetIsSelf));
+    assert_eq!(
+      a.transfer_leadership(D),
+      Err(TransferRefusal::TargetNotVoter)
+    );
+    assert_eq!(a.transfer_leadership(B), Ok(()));
+    assert_eq!(
+      a.transfer_leadership(C),
+      Err(TransferRefusal::InFlight { target: B })
+    );
+  }
+
+  /// Thesis §3.10: an invitation from another term is ignored — a delayed `TimeoutNow` cannot start an
+  /// election after the leadership it came from has moved on.
+  #[test]
+  fn an_invitation_from_another_term_is_ignored() {
+    let mut b = RaftNode::new(B, vec![A, B, C]);
+    b.observe_term(3);
+    assert!(
+      b.on_timeout_now(TimeoutNow { term: 2, leader: A })
+        .is_empty()
+    );
+    assert_eq!(b.role(), Role::Follower);
+    assert_eq!(b.term(), 3);
+  }
+
   #[test]
   fn a_leader_serves_a_read_index_after_committing_in_its_term() {
     let mut leader = elected_leader(A, vec![A]);

@@ -3108,6 +3108,184 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
   );
 }
 
+/// Thesis §3.10 (`docs/wip/research/consensus-enhancements.md` §3.2): the council leader hands leadership to a
+/// named voter over the transport, and that is faster than what a leader loss costs. The target comes to lead
+/// — exactly one daemon leads — within the council's election timeout; then the new leader is stopped and the
+/// two survivors elect one of themselves, which waits out that timeout before anyone campaigns. Both times are
+/// printed beside the timeout: the measurement of what a planned handoff saves.
+#[test]
+fn a_council_leader_hands_leadership_to_a_named_voter_faster_than_a_leader_loss_elects_one() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let elected = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || one_leader(&daemons),
+  );
+  let leader = leader_index(&daemons);
+  let target = leader.and_then(|lead| (0..daemons.len()).find(|&index| index != lead));
+  let mut measured = TransferMeasurement::default();
+  if let (Some(leader), Some(target)) = (leader, target) {
+    measured.timeout = daemons[target]
+      .council_timing()
+      .map(|timing| Duration::from_nanos(HEARTBEAT_NS * u64::from(timing.base_periods)))
+      .ok();
+    let started = Instant::now();
+    measured.accepted = Some(daemons[leader].transfer_council_leadership(hosts[target]));
+    measured.handed = poll_until(
+      &daemons.iter().collect::<Vec<_>>(),
+      COUNCIL_ELECTION_DEADLINE,
+      || Ok(daemons[target].council_leads()? && one_leader(&daemons)?),
+    );
+    measured.handoff = started.elapsed();
+    if measured.handed {
+      // The unplanned path, for comparison: the new leader goes away and the survivors must notice.
+      daemons.remove(target).stop();
+      let lost = Instant::now();
+      measured.reelected = poll_until(
+        &daemons.iter().collect::<Vec<_>>(),
+        COUNCIL_ELECTION_DEADLINE,
+        || one_leader(&daemons),
+      );
+      measured.loss_election = lost.elapsed();
+    }
+  }
+  eprintln!(
+    "council handoff {:.3} s; leader-loss election {:.3} s; election timeout {:?}",
+    measured.handoff.as_secs_f64(),
+    measured.loss_election.as_secs_f64(),
+    measured.timeout
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_handoff_beats_loss(elected, &measured);
+}
+
+/// Thesis §3.10 across regions: the **root group** leader hands leadership to a named root voter over the
+/// transport. Three hosts in three regions, so each region's representative — every host — votes in the root
+/// group; the target comes to lead the root group, alone, within the root group's election timeout.
+#[test]
+fn a_root_leader_hands_root_leadership_to_a_named_voter_across_regions() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .zip(0u64..)
+    .map(|(host, region)| (*host, RegionId(region)))
+    .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let elected = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || one_root_leader(&daemons),
+  );
+  let leader = daemons
+    .iter()
+    .position(|daemon| daemon.root_leads() == Ok(true));
+  let target = leader.and_then(|lead| (0..daemons.len()).find(|&index| index != lead));
+  let mut measured = TransferMeasurement::default();
+  if let (Some(leader), Some(target)) = (leader, target) {
+    measured.timeout = daemons[target]
+      .root_timing()
+      .map(|timing| Duration::from_nanos(HEARTBEAT_NS * u64::from(timing.base_periods)))
+      .ok();
+    let started = Instant::now();
+    measured.accepted = Some(daemons[leader].transfer_root_leadership(hosts[target]));
+    measured.handed = poll_until(
+      &daemons.iter().collect::<Vec<_>>(),
+      COUNCIL_ELECTION_DEADLINE,
+      || Ok(daemons[target].root_leads()? && one_root_leader(&daemons)?),
+    );
+    measured.handoff = started.elapsed();
+  }
+  eprintln!(
+    "root handoff {:.3} s; root election timeout {:?}",
+    measured.handoff.as_secs_f64(),
+    measured.timeout
+  );
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(elected, "the root group elected a leader");
+  assert_eq!(
+    measured.accepted,
+    Some(Ok(Ok(()))),
+    "the root leader accepted the transfer"
+  );
+  assert!(measured.handed, "the named root voter came to lead, alone");
+  let timeout = measured.timeout.expect("the root timing was observed");
+  assert!(
+    measured.handoff < timeout,
+    "the root handoff ({:?}) beat the root election timeout ({timeout:?})",
+    measured.handoff
+  );
+}
+
+/// What [`a_council_leader_hands_leadership_to_a_named_voter_faster_than_a_leader_loss_elects_one`] measured.
+#[derive(Default)]
+struct TransferMeasurement {
+  accepted: Option<Result<Result<(), slates_cluster::raft::TransferRefusal>, ObserveError>>,
+  handed: bool,
+  handoff: Duration,
+  reelected: bool,
+  loss_election: Duration,
+  timeout: Option<Duration>,
+}
+
+fn assert_handoff_beats_loss(elected: bool, measured: &TransferMeasurement) {
+  assert!(elected, "the council elected a leader");
+  assert_eq!(
+    measured.accepted,
+    Some(Ok(Ok(()))),
+    "the leader accepted the transfer"
+  );
+  assert!(measured.handed, "the named voter came to lead, alone");
+  let timeout = measured
+    .timeout
+    .expect("the target's council timing was observed");
+  assert!(
+    measured.handoff < timeout,
+    "the handoff ({:?}) beat the election timeout ({timeout:?})",
+    measured.handoff
+  );
+  assert!(
+    measured.reelected,
+    "the survivors elected a leader after the loss"
+  );
+  assert!(
+    measured.handoff < measured.loss_election,
+    "the handoff ({:?}) beat the leader-loss election ({:?})",
+    measured.handoff,
+    measured.loss_election
+  );
+}
+
 /// AC (§4.8, D-7 "one owning shard per volume"): the placement verbs (`place`/`region_placed`/`await_placed`/
 /// `host_epoch`) run on a volume's **owner** shard, which may not be the control shard that drives the
 /// council, so the committed configuration must reach **every** shard. Here each daemon runs two shards; when

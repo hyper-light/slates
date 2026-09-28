@@ -636,3 +636,25 @@ no real loss). RFC 9002's fixed thresholds read the reordering as loss and retra
   10 Mbit/s, 20 ms metadata p99 ×1.64. The parent `8700a7f` without the change gives the same 90.3 ms on
   every seed, so the move predates this change.
 - Raw rows: `docs/wip/research/data/2026-09-28-{congestion,class}-grid-20seeds-reorder.csv`.
+
+## Consensus: leadership transfer (2026-09-28)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GiB. **What:** in-process three-daemon fleets over real loopback
+sessions (the daemon's own transport, record plane and drive loops), heartbeat 100 ms, election timeout at its
+floor of ten periods (1 s; no WAN path measured). **Commands (the contract):**
+
+- `cargo test -p slates-server --test fleet a_council_leader_hands -- --nocapture` (council; prints the handoff,
+  then stops the new leader and prints the survivors' election)
+- `cargo test -p slates-server --test fleet a_root_leader_hands -- --nocapture` (root group, three regions)
+
+**What it buys: about 13× less leaderless time for a planned move.**
+
+| | runs | median |
+|---|---|---|
+| council handoff (transfer to a named voter) | 0.203 / 0.103 / 0.101 / 0.103 / 0.109 s | 0.103 s |
+| council election after the leader is stopped | 1.817 / 1.117 / 1.019 / 1.316 / 1.520 s | 1.316 s |
+| root-group handoff across three regions | 0.092 / 0.096 / 0.093 s | 0.093 s |
+
+The loss path waits out the election timeout (1 s here, ten times the measured broadcast tail on a WAN) before
+any follower campaigns, then runs a pre-vote and a vote round; the handoff runs one catch-up, one invitation
+and one vote round. On a WAN both grow with the round trip, the loss path by ten tails before it starts.

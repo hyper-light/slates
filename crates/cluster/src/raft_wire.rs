@@ -1,5 +1,6 @@
 //! The Raft wire (§4.8, §4.10a) — the on-the-wire encoding of the configuration group's Raft messages
-//! ([`RequestVote`], [`VoteReply`], [`AppendEntries`], [`AppendReply`]) so the dialect can be driven over
+//! ([`RequestVote`], [`VoteReply`], [`AppendEntries`], [`AppendReply`], [`PreVote`], [`PreVoteReply`],
+//! [`TimeoutNow`]) so the dialect can be driven over
 //! the fleet transport. The state machine ([`crate::raft`]) is sans-io and message-passing; this module
 //! is the pure codec that turns those messages into bytes and back.
 //!
@@ -18,8 +19,8 @@ use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
-  AppendEntries, AppendReply, LogEntry, PreVote, PreVoteReply, RaftNode, RequestVote, VoteReply,
-  VoterConfig,
+  AppendEntries, AppendReply, LogEntry, PreVote, PreVoteReply, RaftNode, RequestVote, TimeoutNow,
+  VoteReply, VoterConfig,
 };
 
 /// A Raft message on the wire.
@@ -38,6 +39,9 @@ pub enum RaftMessage {
   PreVote(PreVote),
   /// A pre-vote reply.
   PreVoteReply(PreVoteReply),
+  /// A leader's invitation to a caught-up voter to campaign at once (thesis §3.10, leadership transfer).
+  /// It has no reply: the invited voter's vote requests are its answer.
+  TimeoutNow(TimeoutNow),
 }
 
 /// A refusal to decode a Raft message from received bytes (the closed hostile-input taxonomy).
@@ -75,6 +79,8 @@ const TAG_APPEND_REPLY: u8 = 4;
 /// Format: the pre-election tag bytes, continuing the leading-tag sequence.
 const TAG_PRE_VOTE: u8 = 5;
 const TAG_PRE_VOTE_REPLY: u8 = 6;
+/// Format: the leadership-transfer invitation's tag byte, continuing the sequence.
+const TAG_TIMEOUT_NOW: u8 = 7;
 
 /// Shape: the largest entry count, command length or voter count a decoder accepts before allocating —
 /// a hostile datagram cannot force an unbounded allocation. Far above any real Raft batch or fleet size.
@@ -91,6 +97,7 @@ impl RaftMessage {
       Self::VoteReply(reply) => reply.voter,
       Self::PreVoteReply(reply) => reply.voter,
       Self::AppendReply(reply) => reply.follower,
+      Self::TimeoutNow(invitation) => invitation.leader,
     }
   }
 
@@ -156,6 +163,11 @@ impl RaftMessage {
         put_u64(&mut out, reply.voter.0);
         put_u64(&mut out, reply.term);
         out.push(u8::from(reply.granted));
+      }
+      RaftMessage::TimeoutNow(invitation) => {
+        out.push(TAG_TIMEOUT_NOW);
+        put_u64(&mut out, invitation.term);
+        put_u64(&mut out, invitation.leader.0);
       }
     }
     out
@@ -251,6 +263,15 @@ impl RaftMessage {
           voter: HostId(voter),
           term,
           granted,
+        }))
+      }
+      TAG_TIMEOUT_NOW => {
+        let (term, rest) = take_u64(rest)?;
+        let (leader, rest) = take_u64(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::TimeoutNow(TimeoutNow {
+          term,
+          leader: HostId(leader),
         }))
       }
       other => Err(RaftWireError::UnknownTag { tag: other }),
@@ -706,6 +727,7 @@ mod tests {
         term: 8,
         granted: false,
       }),
+      RaftMessage::TimeoutNow(TimeoutNow { term: 9, leader: A }),
     ];
     for message in messages {
       let bytes = message.encode();
@@ -724,6 +746,184 @@ mod tests {
         "round-trip is identity"
       );
     }
+  }
+
+  /// The encoding is fixed and little-endian: a golden vector per message kind pins it, spelled out byte by
+  /// byte rather than produced by the encoder, with every field a distinct value, so a change of field
+  /// order, width or byte order fails here even when encode and decode change together (a round trip alone
+  /// cannot see that).
+  #[test]
+  fn every_message_has_a_golden_encoding() {
+    let golden: [(RaftMessage, Vec<u8>); 7] = [
+      (
+        RaftMessage::RequestVote(RequestVote {
+          term: 7,
+          candidate: HostId(1),
+          last_log_index: 4,
+          last_log_term: 3,
+        }),
+        [
+          &[TAG_REQUEST_VOTE][..],
+          &[7, 0, 0, 0, 0, 0, 0, 0],
+          &[1, 0, 0, 0, 0, 0, 0, 0],
+          &[4, 0, 0, 0, 0, 0, 0, 0],
+          &[3, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::VoteReply(VoteReply {
+          voter: HostId(2),
+          term: 7,
+          granted: true,
+        }),
+        [
+          &[TAG_VOTE_REPLY][..],
+          &[2, 0, 0, 0, 0, 0, 0, 0],
+          &[7, 0, 0, 0, 0, 0, 0, 0],
+          &[1],
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::AppendEntries(AppendEntries {
+          read_context: 9,
+          term: 5,
+          leader: HostId(1),
+          prev_log_index: 3,
+          prev_log_term: 4,
+          entries: vec![
+            LogEntry::command(5, b"cm".to_vec()),
+            LogEntry::configuration(
+              6,
+              VoterConfig {
+                voters: vec![HostId(1), HostId(2)],
+                joint: None,
+              },
+            ),
+          ],
+          leader_commit: 2,
+        }),
+        [
+          &[TAG_APPEND_ENTRIES][..],
+          &[5, 0, 0, 0, 0, 0, 0, 0], // term
+          &[1, 0, 0, 0, 0, 0, 0, 0], // leader
+          &[3, 0, 0, 0, 0, 0, 0, 0], // prev_log_index
+          &[4, 0, 0, 0, 0, 0, 0, 0], // prev_log_term
+          &[2, 0, 0, 0, 0, 0, 0, 0], // leader_commit
+          &[9, 0, 0, 0, 0, 0, 0, 0], // read_context
+          &[2, 0, 0, 0],             // entry count
+          &[5, 0, 0, 0, 0, 0, 0, 0], // entry 1: term
+          &[2, 0, 0, 0],             // command length
+          b"cm",
+          &[0],                      // no configuration
+          &[6, 0, 0, 0, 0, 0, 0, 0], // entry 2: term
+          &[0, 0, 0, 0],             // empty command
+          &[1],                      // a configuration
+          &[2, 0, 0, 0],             // voter count
+          &[1, 0, 0, 0, 0, 0, 0, 0],
+          &[2, 0, 0, 0, 0, 0, 0, 0],
+          &[0], // no joint set
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::AppendReply(AppendReply {
+          read_context: 6,
+          follower: HostId(2),
+          term: 5,
+          success: true,
+          match_index: 4,
+        }),
+        [
+          &[TAG_APPEND_REPLY][..],
+          &[2, 0, 0, 0, 0, 0, 0, 0],
+          &[5, 0, 0, 0, 0, 0, 0, 0],
+          &[1],
+          &[4, 0, 0, 0, 0, 0, 0, 0],
+          &[6, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::PreVote(PreVote {
+          term: 8,
+          candidate: HostId(1),
+          last_log_index: 4,
+          last_log_term: 3,
+        }),
+        [
+          &[TAG_PRE_VOTE][..],
+          &[8, 0, 0, 0, 0, 0, 0, 0],
+          &[1, 0, 0, 0, 0, 0, 0, 0],
+          &[4, 0, 0, 0, 0, 0, 0, 0],
+          &[3, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::PreVoteReply(PreVoteReply {
+          voter: HostId(2),
+          term: 8,
+          granted: false,
+        }),
+        [
+          &[TAG_PRE_VOTE_REPLY][..],
+          &[2, 0, 0, 0, 0, 0, 0, 0],
+          &[8, 0, 0, 0, 0, 0, 0, 0],
+          &[0],
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::TimeoutNow(TimeoutNow {
+          term: 0x0102_0304_0506_0708,
+          leader: HostId(0x1112_1314_1516_1718),
+        }),
+        [
+          &[TAG_TIMEOUT_NOW][..],
+          &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+          &[0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11],
+        ]
+        .concat(),
+      ),
+    ];
+    for (message, bytes) in golden {
+      assert_eq!(
+        message.encode(),
+        bytes,
+        "{message:?} encodes to its golden bytes"
+      );
+      assert_eq!(
+        RaftMessage::decode(&bytes),
+        Ok(message),
+        "the golden bytes decode"
+      );
+    }
+  }
+
+  /// Hostile input on the leadership-transfer invitation: every truncation of a valid encoding is refused
+  /// `Truncated`, a trailing byte `LengthMismatch`, and a session cannot invite on another leader's behalf.
+  #[test]
+  fn a_hostile_timeout_now_is_refused() {
+    let bytes = RaftMessage::TimeoutNow(TimeoutNow { term: 3, leader: A }).encode();
+    for cut in 1..bytes.len() {
+      assert_eq!(
+        RaftMessage::decode(&bytes[..cut]),
+        Err(RaftWireError::Truncated),
+        "cut at {cut}"
+      );
+    }
+    let mut long = bytes.clone();
+    long.push(0);
+    assert_eq!(
+      RaftMessage::decode(&long),
+      Err(RaftWireError::LengthMismatch)
+    );
+    assert_eq!(
+      RaftMessage::decode_from(&bytes, B),
+      Err(RaftWireError::ForeignSender)
+    );
   }
 
   /// An empty input and an unknown tag are refused, not panicked.

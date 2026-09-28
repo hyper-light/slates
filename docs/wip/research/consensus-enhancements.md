@@ -179,4 +179,29 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
 
 ## Build ledger
 
-(empty)
+- **Slice 1 (2026-09-28): the safety explorer** — `crates/cluster/tests/explore.rs`. The real `RaftNode` under
+  a seeded adversarial network (loss, duplication, reordering, partitions, crash-restarts from what the node
+  retained), with Election Safety, Log Matching, Leader Completeness and State Machine Safety checked after
+  every step against the whole history. Adversarial stretches alternate with calm ones (a history that never
+  settles commits nothing, which left the first five-voter run vacuous: 108 entries over 400 seeds); a
+  network tick delivers one message per node (one per step saturated the bag and silently dropped 14,324
+  messages). The drive mirrors the council's: pre-vote first, the new leader's no-op, replication to the
+  **other** voters only — the first cut sent the leader its own append, which demoted it at the same term,
+  so leaders deposed themselves on most heartbeats until the filter (commits at three voters: 2,183 → 39,668
+  with the filter). Full scale (CI, release, `--ignored`): 400 seeds × 4,000 steps × 3 and 5 voters, no
+  violation. The workspace's debug run explores 24 seeds (about 10 s).
+- **Slice 2 (2026-09-28): leadership transfer** (thesis §3.10) — `RaftNode::transfer_leadership`,
+  `take_timeout_now`, `on_timeout_now` with the typed `TransferRefusal`; the leader refuses proposals and
+  membership changes while a transfer is in flight, invites the target once its `match_index` reaches the
+  leader's last index, and aborts at its second CheckQuorum tick (at least one whole election timeout, at most
+  two). `TimeoutNow` is wire tag 7 (golden vectors now pin all seven message kinds — the module doc claimed
+  them, none existed). Both groups record an invitation on the serve path and start the invited election in
+  the drive loop (the only place terms change and broadcasts leave); the vote round is shared by a won
+  pre-election and an invited campaign. Proven:
+  - explorer: at full scale, 10,249 transfers started at three voters, 7,714 invitations, 7,341 invited
+    elections; no safety violation;
+  - by use, in-process fleet over real loopback: the council handoff took 0.101–0.203 s (median 0.103 s,
+    five runs) against a leader-loss election of 1.019–1.817 s (median 1.316 s) under a 1 s election timeout;
+    the root group's handoff across three regions took 0.092–0.096 s (three runs).
+  - Owed from this slice: the users — a graceful drain (a stopping leader hands off first), priority
+    placement (3.4) and MLRaft balancing (3.6) — and the WAN/KIND measurement.

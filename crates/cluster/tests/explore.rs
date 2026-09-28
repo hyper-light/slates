@@ -17,6 +17,9 @@
 //! the step's messages count as sent, and a crash restores from the last publication — so a dialect that
 //! acknowledged an entry without asking for its retention would lose it here and fail State Machine Safety.
 //!
+//! Leadership transfers are explored too (thesis §3.10): a leader hands off to a random voter, the invitation
+//! rides a heartbeat once the target has caught up, and a delivered invitation starts the target's election.
+//!
 //! What is not explored yet: snapshots and install-snapshot, and membership changes (the conformance suite
 //! `tests/raft.rs` covers both by script). The model-level exploration of the Fast Raft and ParallelRaft log
 //! shapes extends this driver. Test by use (R5): the real core, the council's drive, observable outcomes.
@@ -30,10 +33,15 @@ use slates_cluster::raft::{LogEntry, RaftNode, SavedRaft};
 use slates_cluster::raft_wire::RaftMessage;
 use slates_db::register::HostId;
 
-/// Shape: the seeds each cluster size is explored under, and the steps each seed runs. Together they bound
-/// the run (every structure below is bounded by a step count), and the per-seed step count is long enough
-/// for many elections, commits and crash recoveries in one history.
-const SEEDS: u64 = 400;
+/// Shape: the seeds each cluster size is explored under at full scale — the `--ignored` run CI makes in
+/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes is 14 s there
+/// and 167 s in a debug build (measured 2026-09-28, Apple M5 Max), so the workspace's debug run explores
+/// [`SEEDS_QUICK`] instead.
+const SEEDS_FULL: u64 = 400;
+/// Shape: the seeds the workspace's debug run explores — about ten seconds of a debug build at 167 s per 400
+/// seeds, and still enough histories for every non-vacuity floor below (each is at least one event per seed;
+/// full scale counted 18 invited elections per seed at three voters).
+const SEEDS_QUICK: u64 = 24;
 /// Shape: the steps one seeded history runs.
 const STEPS: usize = 4_000;
 /// Shape: a history alternates adversarial and calm stretches of this many steps. In a calm stretch nothing
@@ -85,6 +93,12 @@ struct Counters {
   duplicated: u64,
   overflowed: u64,
   pre_votes_refused: u64,
+  /// Leadership transfers started (thesis §3.10).
+  transfers_started: u64,
+  /// Invitations sent (the target had caught up).
+  invitations_sent: u64,
+  /// Invitations that started an election at their target.
+  invited_elections: u64,
 }
 
 /// One explored cluster: the nodes, what each last retained, the network, the partition, and the history
@@ -183,11 +197,40 @@ impl Cluster {
   /// The leader at `at` replicates to every peer it replicates to (entries or a heartbeat).
   fn heartbeat(&mut self, at: usize) {
     let from = self.nodes[at].id();
-    let targets = self.nodes[at].replication_targets();
+    // `replication_targets` lists the voter set, the leader included; the council's drive replicates to the
+    // others only (`drive_config_council`'s `others`). Sending the leader its own current-term append
+    // demoted it to a follower at the same term (`on_append_entries` defers to a current-term leader), so
+    // until this filter the explorer's leaders deposed themselves on most heartbeats.
+    let targets: Vec<HostId> = self.nodes[at]
+      .replication_targets()
+      .into_iter()
+      .filter(|to| *to != from)
+      .collect();
     for to in targets {
       if let Some(append) = self.nodes[at].replicate_to(to) {
         self.send(from, to, RaftMessage::AppendEntries(append));
       }
+    }
+    // A transfer whose target has caught up: its invitation rides with the replication (thesis §3.10).
+    if let Some((to, invitation)) = self.nodes[at].take_timeout_now() {
+      self.counters.invitations_sent += 1;
+      self.send(from, to, RaftMessage::TimeoutNow(invitation));
+    }
+  }
+
+  /// The leader, if any, starts a leadership transfer to a voter `rng` picks (refusals — itself, a transfer
+  /// already in flight — are part of the exploration).
+  fn transfer(&mut self, rng: &mut Rng) {
+    let Some(at) = self.nodes.iter().position(RaftNode::is_leader) else {
+      return;
+    };
+    let voters = self.nodes[at].all_voters();
+    if voters.is_empty() {
+      return;
+    }
+    let target = voters[rng.below(voters.len())];
+    if self.nodes[at].transfer_leadership(target).is_ok() {
+      self.counters.transfers_started += 1;
     }
   }
 
@@ -220,6 +263,13 @@ impl Cluster {
       }
       RaftMessage::VoteReply(reply) => self.nodes[at].on_vote_reply(reply),
       RaftMessage::AppendReply(reply) => self.nodes[at].on_append_reply(reply),
+      RaftMessage::TimeoutNow(invitation) => {
+        let votes = self.nodes[at].on_timeout_now(invitation);
+        if !votes.is_empty() {
+          self.counters.invited_elections += 1;
+        }
+        outgoing.extend(votes.into_iter().map(RaftMessage::RequestVote));
+      }
     }
     self.finish_election(at, was_leader);
     self.retain(at);
@@ -267,20 +317,32 @@ impl Cluster {
       55..=57 => self.duplicate_one(rng),
       58..=65 => {
         let at = rng.below(self.nodes.len());
+        // In a calm stretch a node's election timer fires only when it has lost its leader, as a healthy
+        // timer does; an adversarial stretch fires it anywhere (a paused process, a skewed clock). Measured
+        // 2026-09-28 against firing anywhere in both stretches (three / five voters): transfer invitations
+        // 7,714 / 9,170 against 2,247 / 4,805, pre-vote refusals still 78,722 / 190,047 from the adversarial
+        // stretches.
+        if calm && self.nodes[at].leader().is_some() {
+          return;
+        }
         self.time_out(at);
       }
-      66..=79 => {
+      // Heartbeats against CheckQuorum ticks at 8:1 (16 : 2 of 100), near a deployment's ten heartbeats per
+      // election timeout; 3.5:1 (14 : 4) was the first setting. The measurement in the calm-timer comment
+      // above covers the two changes together.
+      66..=79 | 90..=91 => {
         if let Some(at) = self.nodes.iter().position(RaftNode::is_leader) {
           self.heartbeat(at);
         }
       }
       80..=87 => self.propose(),
-      88..=91 => self.check_quorum_everywhere(),
+      88..=89 => self.check_quorum_everywhere(),
       92..=94 => {
         let at = rng.below(self.nodes.len());
         self.crash(at);
       }
       95..=97 => self.isolate_or_heal(rng),
+      98..=99 => self.transfer(rng),
       _ => {}
     }
   }
@@ -444,10 +506,10 @@ fn check_log_matching(logs: &[(HostId, SavedRaft)], at: &str) {
   }
 }
 
-/// Explores `SEEDS` seeded histories of a cluster of `size` voters and returns what they counted.
-fn explore(size: u64) -> Counters {
+/// Explores `seeds` seeded histories of a cluster of `size` voters and returns what they counted.
+fn explore(size: u64, seeds: u64) -> Counters {
   let mut total = Counters::default();
-  for seed in 0..SEEDS {
+  for seed in 0..seeds {
     let mut rng = Rng(seed ^ (size << 32));
     let mut cluster = Cluster::new(size);
     for step in 0..STEPS {
@@ -463,22 +525,51 @@ fn explore(size: u64) -> Counters {
     total.duplicated += c.duplicated;
     total.overflowed += c.overflowed;
     total.pre_votes_refused += c.pre_votes_refused;
+    total.transfers_started += c.transfers_started;
+    total.invitations_sent += c.invitations_sent;
+    total.invited_elections += c.invited_elections;
   }
   total
 }
 
+/// Explores three and five voters over `seeds` histories each and holds every non-vacuity floor: each path
+/// the exploration claims to cover must have been reached at least once per explored seed.
+fn explore_and_check_coverage(seeds: u64) {
+  for size in [3, 5] {
+    let counted = explore(size, seeds);
+    eprintln!("explored {size} voters x {seeds} seeds x {STEPS} steps: {counted:?}");
+    assert!(counted.elections_won > seeds, "elections were won");
+    assert!(counted.commits > seeds, "entries committed");
+    assert!(counted.crashes > seeds, "nodes crashed and recovered");
+    assert!(counted.pre_votes_refused > seeds, "pre-votes were refused");
+    assert!(
+      counted.transfers_started > seeds,
+      "leadership transfers started"
+    );
+    assert!(
+      counted.invitations_sent > seeds,
+      "transfer invitations went out"
+    );
+    assert!(
+      counted.invited_elections > seeds,
+      "invitations started elections"
+    );
+  }
+}
+
 /// T-8.13 (§4.8 mechanism 2; `docs/wip/research/consensus-enhancements.md` §5): the dialect keeps Election
 /// Safety, Log Matching, Leader Completeness and State Machine Safety in every explored history of three
-/// and five voters under loss, duplication, reordering, partitions and crash-restarts — and the histories
-/// did exercise elections, commits, crashes and pre-vote refusals (non-vacuity).
+/// and five voters under loss, duplication, reordering, partitions, crash-restarts and leadership transfers
+/// (thesis §3.10) — and the histories did exercise elections, commits, crashes, pre-vote refusals, and
+/// transfers started, invited and elected (non-vacuity). The workspace's scale ([`SEEDS_QUICK`]).
 #[test]
 fn the_dialect_keeps_raft_safety_under_an_adversarial_network() {
-  for size in [3, 5] {
-    let counted = explore(size);
-    eprintln!("explored {size} voters x {SEEDS} seeds x {STEPS} steps: {counted:?}");
-    assert!(counted.elections_won > SEEDS, "elections were won");
-    assert!(counted.commits > SEEDS, "entries committed");
-    assert!(counted.crashes > SEEDS, "nodes crashed and recovered");
-    assert!(counted.pre_votes_refused > 0, "pre-votes were refused");
-  }
+  explore_and_check_coverage(SEEDS_QUICK);
+}
+
+/// T-8.13 at full scale ([`SEEDS_FULL`]), run by CI in release with `--ignored`.
+#[test]
+#[ignore = "full scale: CI runs it in release (`cargo test -p slates-cluster --release --test explore -- --ignored`)"]
+fn the_dialect_keeps_raft_safety_at_full_scale() {
+  explore_and_check_coverage(SEEDS_FULL);
 }

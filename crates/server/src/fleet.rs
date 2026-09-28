@@ -4498,6 +4498,191 @@ async fn drive_council_replication(
   return_sessions(recovered);
 }
 
+/// The consensus group a drive step addresses (§4.8 mechanism 2): the regional council or the root group.
+/// Both run the one Raft dialect, each over its own stream and late-reply fold, so the steps below are
+/// written once over both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+  Council,
+  Root,
+}
+
+impl Group {
+  fn is_root(self) -> bool {
+    matches!(self, Group::Root)
+  }
+
+  fn stream(self) -> u64 {
+    match self {
+      Group::Council => CONFIG_STREAM,
+      Group::Root => ROOT_STREAM,
+    }
+  }
+
+  fn late(self) -> LateReplies {
+    match self {
+      Group::Council => LateReplies::Council,
+      Group::Root => LateReplies::Root,
+    }
+  }
+
+  fn fold_reply(self, state: &mut ShardState, message: RaftMessage) -> Vec<RaftMessage> {
+    match self {
+      Group::Council => state.council.fold_reply(message),
+      Group::Root => state.root.fold_reply(message),
+    }
+  }
+
+  fn invited_campaign(self, state: &mut ShardState) -> Vec<RaftMessage> {
+    match self {
+      Group::Council => state.council.invited_campaign(),
+      Group::Root => state.root.invited_campaign(),
+    }
+  }
+
+  fn transferring_to(self, state: &ShardState) -> Option<HostId> {
+    match self {
+      Group::Council => state.council.transferring_to(),
+      Group::Root => state.root.transferring_to(),
+    }
+  }
+
+  fn take_timeout_now(self, state: &mut ShardState) -> Option<(HostId, RaftMessage)> {
+    match self {
+      Group::Council => state.council.take_timeout_now(),
+      Group::Root => state.root.take_timeout_now(),
+    }
+  }
+}
+
+/// The real vote round of an election over the borrowed voter `sessions` (Raft §5.2): the vote request goes
+/// to each, the replies are folded (this node leads once its majority grants), a late vote is folded when
+/// the coordinator settles the round, and every session is returned. Shared by a pre-election that won its
+/// pre-votes and by a leader-invited campaign (thesis §3.10), which skips the pre-votes.
+async fn drive_vote_round(
+  group: Group,
+  vote: RaftMessage,
+  sessions: Vec<(HostId, Endpoint)>,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let vote_bytes =
+    state::with_state(|s| crate::consensus::encode_message(s, group.is_root(), &vote))
+      .flatten()
+      .unwrap_or_default();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
+    .collect();
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, group.stream(), Priority::Control, budget).await;
+  let mut recovered = Vec::with_capacity(replied.len());
+  let mut vote_replies = Vec::with_capacity(replied.len());
+  for (host, reply, endpoint) in replied {
+    vote_replies.push((host, reply));
+    recovered.push((host, endpoint));
+  }
+  state::with_state(|s| {
+    sample_voter_paths(s, &vote_replies);
+    for (peer, reply) in vote_replies {
+      if let Ok(message) = crate::consensus::decode_message(s, group.is_root(), peer, &reply.bytes)
+      {
+        group.fold_reply(s, message);
+      }
+    }
+  });
+  // A late vote still counts when it arrives: the coordinator folds it as it settles the round.
+  in_flight.push(Dispatch::new(sent, &recovered, stragglers, group.late()));
+  return_sessions(recovered);
+}
+
+/// A campaign the leader invited (thesis §3.10, leadership transfer): when the serve path has recorded an
+/// invitation, starts the election it asks for — no pre-vote, the leader invited it — and runs its vote
+/// round over the other voters' sessions. The borrow that starts it publishes the new term and vote before
+/// any request leaves ([`crate::retention::retain`] closes every borrow). Returns whether a campaign ran, so
+/// the caller skips this period's timer. An invitation this node ignores (another term, or it leads or does
+/// not vote) runs nothing.
+async fn drive_invited_campaign(
+  group: Group,
+  others: &[HostId],
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) -> bool {
+  let votes = state::with_state(|s| group.invited_campaign(s)).unwrap_or_default();
+  let Some(vote) = votes.into_iter().next() else {
+    return false;
+  };
+  let sessions = take_sessions(|host| others.contains(&host));
+  if !sessions.is_empty() {
+    drive_vote_round(group, vote, sessions, budget, in_flight).await;
+  }
+  true
+}
+
+/// Runs this period's invited campaign, if the leader sent an invitation ([`drive_invited_campaign`]), and
+/// re-baselines the election timer after it, so the campaign is not immediately retriggered: a won election
+/// makes this node leader next period, a lost one waits out the timer again. Returns whether a campaign ran
+/// (the caller then skips this period's timer). A leader ignores an invitation (none runs).
+async fn campaign_if_invited(
+  group: Group,
+  others: &[HostId],
+  budget: CommitBudget,
+  timer: &mut ElectionTimer,
+  in_flight: &mut Vec<Dispatch>,
+) -> bool {
+  if !drive_invited_campaign(group, others, budget, in_flight).await {
+    return false;
+  }
+  let contact = state::with_state(|s| match group {
+    Group::Council => s.council.leader_contact(),
+    Group::Root => s.root.leader_contact(),
+  });
+  if let Some(contact) = contact {
+    timer.rebaseline(contact);
+  }
+  true
+}
+
+/// The leader's half of a leadership transfer (thesis §3.10): once the target has caught up, ships it the
+/// invitation over its borrowed session, once. The target answers nothing (its vote requests are the answer);
+/// the session is returned. A target with no live session is not reached this period, and the invitation is
+/// taken only when the session is in hand, so it is not lost.
+async fn drive_transfer_invitation(
+  group: Group,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let Some(target) = state::with_state(|s| group.transferring_to(s)).flatten() else {
+    return;
+  };
+  let sessions = take_sessions(|host| host == target);
+  if sessions.is_empty() {
+    return;
+  }
+  let bytes = state::with_state(|s| {
+    group
+      .take_timeout_now(s)
+      .and_then(|(_, message)| crate::consensus::encode_message(s, group.is_root(), &message))
+  })
+  .flatten();
+  let Some(bytes) = bytes else {
+    return_sessions(sessions);
+    return;
+  };
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, bytes.clone(), endpoint))
+    .collect();
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, group.stream(), Priority::Control, budget).await;
+  let recovered: Vec<(HostId, Endpoint)> = replied
+    .into_iter()
+    .map(|(host, _, endpoint)| (host, endpoint))
+    .collect();
+  in_flight.push(Dispatch::new(sent, &recovered, stragglers, group.late()));
+  return_sessions(recovered);
+}
+
 /// Drives an election as a **follower** whose leader contact has lapsed (Raft §9.6, the full pre-vote then
 /// real vote over the transport): begins the pre-election and broadcasts the pre-vote to every other voter;
 /// on a granted majority the real vote requests go out the same way, and folding their replies makes this
@@ -4563,37 +4748,7 @@ async fn drive_council_election(
     return;
   };
   // Phase two — the real vote round over the same sessions.
-  let vote_bytes = state::with_state(|s| crate::consensus::encode_message(s, false, &vote))
-    .flatten()
-    .unwrap_or_default();
-  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
-    .into_iter()
-    .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
-    .collect();
-  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, Priority::Control, budget).await;
-  let mut recovered = Vec::with_capacity(replied.len());
-  let mut vote_replies = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
-    vote_replies.push((host, reply));
-    recovered.push((host, endpoint));
-  }
-  state::with_state(|s| {
-    sample_voter_paths(s, &vote_replies);
-    for (peer, reply) in vote_replies {
-      if let Ok(message) = crate::consensus::decode_message(s, false, peer, &reply.bytes) {
-        s.council.fold_reply(message);
-      }
-    }
-  });
-  // A late vote still counts when it arrives: the coordinator folds it as it settles the round.
-  in_flight.push(Dispatch::new(
-    sent,
-    &recovered,
-    stragglers,
-    LateReplies::Council,
-  ));
-  return_sessions(recovered);
+  drive_vote_round(Group::Council, vote, sessions, budget, in_flight).await;
 }
 
 /// Whether this node's own SWIM membership view differs from the members of the configuration it has
@@ -4616,6 +4771,87 @@ fn membership_diverges_from_config(state: &ShardState) -> bool {
     .copied()
     .collect();
   alive != members
+}
+
+/// Reconciles the council's membership and voter set from this node's own SWIM view, as the region's
+/// configuration master (§4.8, D-14): proposes any admit or retire, which the replication that follows commits
+/// over the transport and applies on every voter. Only the leader proposes (`reconcile_alive`); it probes
+/// every member, so a follower's own detection need not. Each alive member is proposed with the failure domain
+/// its node declares, so an admission — a restarted node's new id among them (task #22) — carries the domain
+/// into the configuration.
+fn reconcile_council_membership(s: &mut ShardState) {
+  let alive: Vec<(HostId, Option<DomainId>)> = authenticated_alive(s)
+    .into_iter()
+    .filter(|host| same_region(s, *host))
+    .map(|host| (host, declared_domain(s, host)))
+    .collect();
+  // Retire only members this node's own SWIM view has confirmed **dead** AND kept dead for the
+  // death-confirmation window — never one merely suspected, and never one declared dead only transiently.
+  // A live voter briefly unreachable during a leader loss's re-election (a fresh joiner's just-formed
+  // sessions churning most of all) can reach `Dead` for a period or two before its refutation arrives;
+  // retiring it there is an irreversible consensus action on a revocable belief, and it drops a live
+  // member — leaving a later loss's survivors short of a majority
+  // (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md). The window lets the refutation land first.
+  let dead = stable_dead_council_members(s);
+  s.council.reconcile_alive(&alive, &dead);
+  // The voter set follows the committed membership (Raft §6, one joint change at a time): a voter taken
+  // over leaves the consensus set — it stops counting toward every majority — and a member this node
+  // holds alive is promoted to its seat, so the council keeps tolerating `f` failures; a sitting voter
+  // keeps its seat while it is a member, so an admission never displaces a live one
+  // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md).
+  let voting: Vec<HostId> = alive.iter().map(|(host, _)| *host).collect();
+  s.council.reconcile_voters(&voting);
+}
+
+/// One period as the council **leader**: reconcile the membership ([`reconcile_council_membership`]),
+/// replicate to every other voter, send a leadership transfer's invitation once its target has caught up
+/// (thesis §3.10), and — every derived base of leader periods — judge the quorum (CheckQuorum, Raft §6.2:
+/// a leader that heard from no majority since the previous check steps down rather than sitting on a term
+/// it can no longer hold; the window is fed by the append replies folded above, timely or late).
+async fn lead_council_period(
+  others: &[HostId],
+  budget: CommitBudget,
+  timer: &mut ElectionTimer,
+  timing: &ElectionTiming,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  state::with_state(reconcile_council_membership);
+  drive_council_replication(others, budget, in_flight).await;
+  drive_transfer_invitation(Group::Council, budget, in_flight).await;
+  if timer.leader_period(timing) {
+    state::with_state(|s| s.council.check_quorum());
+  }
+}
+
+/// Reconciles the root group's region membership and voter set from this node's own alive view, as the root
+/// master (§4.8, D-14): proposes admitting any newly-alive region and retiring any **mirror-less** region no
+/// host is alive in (a lost region with a mirror is left for a deliberate operator promotion — split-brain
+/// safety). The root voter set follows the committed regions and their live representatives (Raft §6, one
+/// joint change at a time): a dead representative leaves the root consensus set, and a region whose
+/// representative died is carried by its next live host.
+fn reconcile_root_membership(s: &mut ShardState) {
+  let alive = alive_regions(s);
+  s.root.reconcile_regions(&alive, &s.region_mirrors);
+  let representatives = alive_representatives(s);
+  s.root.reconcile_voters(&representatives);
+}
+
+/// One period as the **root** leader — the cross-region parallel of [`lead_council_period`]: reconcile the
+/// regions ([`reconcile_root_membership`]), replicate, send a transfer's invitation, and CheckQuorum on the
+/// election-timeout cadence.
+async fn lead_root_period(
+  others: &[HostId],
+  budget: CommitBudget,
+  timer: &mut ElectionTimer,
+  timing: &ElectionTiming,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  state::with_state(reconcile_root_membership);
+  drive_root_replication(others, budget, in_flight).await;
+  drive_transfer_invitation(Group::Root, budget, in_flight).await;
+  if timer.leader_period(timing) {
+    state::with_state(|s| s.root.check_quorum());
+  }
 }
 
 /// Drives this node's configuration council one period from the record-plane coordinator (§4.8, D-14). As
@@ -4680,44 +4916,13 @@ async fn drive_config_council(
   // constants"): ten times the slowest voter's round-trip tail, floored at ten periods — the floor on any
   // loopback, and what `Daemon::council_timing` reports.
   let timing = derive_group_timing(&others, |s, timing| s.council_timing = timing);
+  // A leader's invitation (thesis §3.10, leadership transfer) outranks this period's timer.
+  if campaign_if_invited(Group::Council, &others, budget, timer, in_flight).await {
+    return;
+  }
 
   if is_leader {
-    // As the region's configuration master, track its membership from this node's own SWIM view: propose
-    // any admit or retire, which the replication below commits over the transport and applies on every
-    // voter. Only the leader proposes (`reconcile_alive`); it probes every member, so a follower's own
-    // detection need not. Each alive member is proposed with the failure domain its node declares, so an
-    // admission — a restarted node's new id among them (task #22) — carries the domain into the configuration.
-    state::with_state(|s| {
-      let alive: Vec<(HostId, Option<DomainId>)> = authenticated_alive(s)
-        .into_iter()
-        .filter(|host| same_region(s, *host))
-        .map(|host| (host, declared_domain(s, host)))
-        .collect();
-      // Retire only members this node's own SWIM view has confirmed **dead** AND kept dead for the
-      // death-confirmation window — never one merely suspected, and never one declared dead only transiently.
-      // A live voter briefly unreachable during a leader loss's re-election (a fresh joiner's just-formed
-      // sessions churning most of all) can reach `Dead` for a period or two before its refutation arrives;
-      // retiring it there is an irreversible consensus action on a revocable belief, and it drops a live
-      // member — leaving a later loss's survivors short of a majority
-      // (docs/bugs/2026-09-17-council-retires-a-suspected-voter.md). The window lets the refutation land first.
-      let dead = stable_dead_council_members(s);
-      s.council.reconcile_alive(&alive, &dead);
-      // The voter set follows the committed membership (Raft §6, one joint change at a time): a voter taken
-      // over leaves the consensus set — it stops counting toward every majority — and a member this node
-      // holds alive is promoted to its seat, so the council keeps tolerating `f` failures; a sitting voter
-      // keeps its seat while it is a member, so an admission never displaces a live one
-      // (docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md).
-      let voting: Vec<HostId> = alive.iter().map(|(host, _)| *host).collect();
-      s.council.reconcile_voters(&voting)
-    });
-    drive_council_replication(&others, budget, in_flight).await;
-    // CheckQuorum (Raft §6.2) on the election-timeout cadence: every derived base of leader periods the
-    // council judges whether a majority was heard from (the append replies folded above, timely or late)
-    // and steps this node down if not — so a leader cut off from its followers yields rather than sitting
-    // on a term it can no longer hold.
-    if timer.leader_period(&timing) {
-      state::with_state(|s| s.council.check_quorum());
-    }
+    lead_council_period(&others, budget, timer, &timing, in_flight).await;
     return;
   }
   if others.is_empty() {
@@ -4824,28 +5029,13 @@ async fn drive_root_group(
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
   // This period's election timing over the paths to the other root voters, as the council's.
   let timing = derive_group_timing(&others, |s, timing| s.root_timing = timing);
+  // A leader's invitation (thesis §3.10, leadership transfer) outranks this period's timer.
+  if campaign_if_invited(Group::Root, &others, budget, timer, in_flight).await {
+    return;
+  }
 
   if is_leader {
-    // As the root master, reconcile the region membership from this node's own alive view: propose admitting
-    // any newly-alive region and retiring any **mirror-less** region no host is alive in (a lost region with a
-    // mirror is left for a deliberate operator promotion — §4.8, split-brain safety), committed over the
-    // transport by the replication below and applied on every root voter.
-    state::with_state(|s| {
-      let alive = alive_regions(s);
-      s.root.reconcile_regions(&alive, &s.region_mirrors);
-      // The root voter set follows the committed regions and their live representatives (Raft §6, one joint
-      // change at a time): a dead representative leaves the root consensus set, and a region whose
-      // representative died is carried by its next live host.
-      let representatives = alive_representatives(s);
-      s.root.reconcile_voters(&representatives)
-    });
-    drive_root_replication(&others, budget, in_flight).await;
-    // CheckQuorum (Raft §6.2) on the election-timeout cadence, as the council's above: every derived base
-    // of leader periods the root group judges whether a majority of its voters was heard from and steps
-    // this node down if not.
-    if timer.leader_period(&timing) {
-      state::with_state(|s| s.root.check_quorum());
-    }
+    lead_root_period(&others, budget, timer, &timing, in_flight).await;
     return;
   }
   if others.is_empty() {
@@ -4981,37 +5171,7 @@ async fn drive_root_election(
     return;
   };
   // Phase two — the real vote round over the same sessions.
-  let vote_bytes = state::with_state(|s| crate::consensus::encode_message(s, true, &vote))
-    .flatten()
-    .unwrap_or_default();
-  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
-    .into_iter()
-    .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
-    .collect();
-  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, Priority::Control, budget).await;
-  let mut recovered = Vec::with_capacity(replied.len());
-  let mut vote_replies = Vec::with_capacity(replied.len());
-  for (host, reply, endpoint) in replied {
-    vote_replies.push((host, reply));
-    recovered.push((host, endpoint));
-  }
-  state::with_state(|s| {
-    sample_voter_paths(s, &vote_replies);
-    for (peer, reply) in vote_replies {
-      if let Ok(message) = crate::consensus::decode_message(s, true, peer, &reply.bytes) {
-        s.root.fold_reply(message);
-      }
-    }
-  });
-  // A late vote still counts when it arrives: the coordinator folds it as it settles the round.
-  in_flight.push(Dispatch::new(
-    sent,
-    &recovered,
-    stragglers,
-    LateReplies::Root,
-  ));
-  return_sessions(recovered);
+  drive_vote_round(Group::Root, vote, sessions, budget, in_flight).await;
 }
 
 /// Drives a **root learner** one period: fetches the committed root configuration from the root voters it has

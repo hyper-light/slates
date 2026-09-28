@@ -2613,6 +2613,18 @@ reconnaissance because the touched partitions are named up front).
    candidates and is acknowledged at f+1.
 
 
+> **Consensus enhancements: the explorer and leadership transfer (2026-09-28;
+> `docs/wip/research/consensus-enhancements.md`).** The configuration groups' dialect is now explored
+> under an adversarial network by `crates/cluster/tests/explore.rs` (Election Safety, Log Matching, Leader
+> Completeness, State Machine Safety after every step; loss, duplication, reordering, partitions,
+> crash-restarts from retained state; 400 seeds × 4,000 steps × 3 and 5 voters in CI, no violation).
+> **Leadership transfer** (thesis §3.10) is built in both groups: the leader stops accepting proposals, brings
+> the target up to date, and sends `TimeoutNow` (wire tag 7); the target campaigns at once without a pre-vote;
+> a transfer that does not complete is aborted at the second CheckQuorum tick. Measured in-process over
+> loopback: a council handoff of 0.103 s (median of five) against a leader-loss election of 1.316 s under a
+> 1 s election timeout; a root handoff across three regions of 0.093 s. Its users — a graceful drain,
+> priority placement and multi-log balancing — are the next slices.
+
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
 > never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original

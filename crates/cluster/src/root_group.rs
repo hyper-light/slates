@@ -32,7 +32,9 @@ use std::mem::size_of;
 
 use slates_db::register::{HostId, OBJECT_BYTES, ObjectId, RegionId, RootConfiguration};
 
-use crate::raft::{AppendEntries, RaftNode, RaftRecoveryError, SavedRaft};
+use crate::raft::{
+  AppendEntries, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal,
+};
 use crate::raft_wire::RaftMessage;
 
 /// A root-configuration change as it rides the Raft log — the command a committed
@@ -190,6 +192,10 @@ pub struct RootGroup {
   /// contesting the election, so this node does not campaign; once it stalls for the election timeout, contact
   /// is presumed lost and a pre-election begins.
   leader_contact: u64,
+  /// A leader's invitation to campaign at once (thesis §3.10, leadership transfer), recorded by the serve
+  /// path and acted on by the drive loop ([`invited_campaign`](Self::invited_campaign)), which alone starts
+  /// elections and broadcasts — one slot, so bounded; a newer invitation replaces an older one.
+  invitation: Option<TimeoutNow>,
 }
 
 impl RootGroup {
@@ -318,6 +324,7 @@ impl RootGroup {
       view_pending: false,
       applied: 0,
       leader_contact: 0,
+      invitation: None,
     };
     group.finish_election(false);
     group
@@ -398,6 +405,46 @@ impl RootGroup {
   pub fn check_quorum(&mut self) {
     self.raft.check_quorum();
   }
+  /// **DRIVE**: the election a leader invited this node to start (thesis §3.10), if an invitation arrived
+  /// since the last call: the vote requests to broadcast, exactly as an election timeout's pre-votes are
+  /// broadcast — no pre-vote round, since the leader invited it. Empty when no invitation is pending, or when
+  /// the invitation is from another term or this node leads or does not vote (the core ignores it).
+  pub fn invited_campaign(&mut self) -> Vec<RaftMessage> {
+    let Some(invitation) = self.invitation.take() else {
+      return Vec::new();
+    };
+    let was_leader = self.is_leader();
+    let votes = self
+      .raft
+      .on_timeout_now(invitation)
+      .into_iter()
+      .map(RaftMessage::RequestVote)
+      .collect();
+    self.finish_election(was_leader);
+    votes
+  }
+
+  /// **DRIVE**: starts a leadership transfer to `target` (thesis §3.10); refused, typed, when this node does
+  /// not lead, `target` is itself or not a voter, or a transfer is already in flight. While it is in flight
+  /// the leader refuses proposals; [`take_timeout_now`](Self::take_timeout_now) yields the invitation once
+  /// the target has caught up; it ends when this node stops leading or is aborted after an election timeout.
+  pub fn transfer_leadership(&mut self, target: HostId) -> Result<(), TransferRefusal> {
+    self.raft.transfer_leadership(target)
+  }
+
+  /// **DRIVE**: the invitation to ship once the transfer's target has caught up — `(target, message)`, sent
+  /// once — or `None`.
+  pub fn take_timeout_now(&mut self) -> Option<(HostId, RaftMessage)> {
+    self
+      .raft
+      .take_timeout_now()
+      .map(|(target, invitation)| (target, RaftMessage::TimeoutNow(invitation)))
+  }
+
+  /// The target of the leadership transfer in flight, if one is.
+  pub fn transferring_to(&self) -> Option<HostId> {
+    self.raft.transferring_to()
+  }
 
   /// **SERVE**: answers a request received over the transport — a pre-vote, a vote request, or an append —
   /// returning the reply to ship back and applying whatever newly committed to the root configuration (a
@@ -440,6 +487,11 @@ impl RootGroup {
         self.apply_committed();
         Some(RaftMessage::AppendReply(reply))
       }
+      RaftMessage::TimeoutNow(invitation) => {
+        // No reply: the invited node's vote requests are its answer, broadcast by the drive loop.
+        self.invitation = Some(invitation);
+        None
+      }
       RaftMessage::VoteReply(_) | RaftMessage::PreVoteReply(_) | RaftMessage::AppendReply(_) => {
         None
       }
@@ -467,9 +519,10 @@ impl RootGroup {
         self.apply_committed();
         Vec::new()
       }
-      RaftMessage::PreVote(_) | RaftMessage::RequestVote(_) | RaftMessage::AppendEntries(_) => {
-        Vec::new()
-      }
+      RaftMessage::PreVote(_)
+      | RaftMessage::RequestVote(_)
+      | RaftMessage::AppendEntries(_)
+      | RaftMessage::TimeoutNow(_) => Vec::new(),
     };
     self.finish_election(was_leader);
     messages

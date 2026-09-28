@@ -1088,6 +1088,32 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.council.is_leader())
   }
 
+  /// Hands this daemon's council leadership to the voter `target` (thesis §3.10, leadership transfer;
+  /// `docs/wip/research/consensus-enhancements.md` §3.2): the council leader stops accepting proposals, brings
+  /// `target` up to date, and invites it to campaign at once, so leadership moves without the election timeout a
+  /// leader loss costs. The outer result is the observation (a control shard that could not be asked is its
+  /// typed refusal); the inner is the core's typed refusal — this daemon does not lead, `target` is itself or
+  /// not a voter, or a transfer is already in flight.
+  pub fn transfer_council_leadership(
+    &self,
+    target: slates_db::HostId,
+  ) -> Result<Result<(), slates_cluster::raft::TransferRefusal>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.council.transfer_leadership(target)
+    })
+  }
+
+  /// Hands this daemon's **root group** leadership to the root voter `target` (thesis §3.10) — the
+  /// cross-region counterpart of [`Self::transfer_council_leadership`], with the same two results.
+  pub fn transfer_root_leadership(
+    &self,
+    target: slates_db::HostId,
+  ) -> Result<Result<(), slates_cluster::raft::TransferRefusal>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.root.transfer_leadership(target)
+    })
+  }
+
   /// This daemon's council **leader-contact** counter (§4.8): the number of leader appends and granted votes
   /// its council has answered. A follower's counter advancing across periods is the proof that the leader's
   /// heartbeats are flowing over the transport — replication is live, not merely an election won (a
