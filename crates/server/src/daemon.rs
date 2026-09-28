@@ -276,6 +276,11 @@ pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// client reconnected under it, was told `SessionTaken`, and the node refused every client once the bound
 /// was consumed: `docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md`).
 pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Activations that could not reach a client's shard (its control channel full or gone when the
+/// `Control::Active` message was sent at the handoff): that shard then parks straight after each quiet
+/// step instead of spinning its idle window, so each of its client's requests pays a whole wake. Counted
+/// and logged once — before 2026-09-28 the send's refusal was discarded.
+pub static ACTIVATION_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Client ids that could not be given back to the control shard's live set after a lost handoff or a
 /// reaped client (the control shard's channel full or gone when the forget task was sent): each is a
 /// slot of the client bound held until the daemon restarts, counted here and logged once, never silent.
@@ -2319,9 +2324,13 @@ async fn serve_loop() {
     if did || within_window {
       futures::yield_now().await;
     } else {
-      state::with_state(|s| verbs::mark_parked(s, true));
-      futures::idle().await;
-      state::with_state(|s| verbs::mark_parked(s, false));
+      // Announce idle, fence, re-check (the doorbell protocol, `verbs::announce_idle`): a request found
+      // pending is served now; one published later is rung, and the ring wakes this poller.
+      let serve_instead = state::with_state(verbs::announce_idle).unwrap_or(false);
+      if !serve_instead {
+        futures::idle().await;
+      }
+      state::with_state(verbs::announce_polling);
     }
   }
 }
@@ -2565,7 +2574,7 @@ async fn control_loop(
             shard.0
           );
         }
-        let _ = registry::send_control(shard.0, Control::Active(true));
+        activate(shard);
       }
     }
     if let Err(error) = wait_for_rendezvous(&listener).await {
@@ -2589,6 +2598,19 @@ async fn wait_for_rendezvous(listener: &Listener) -> Result<(), slates_rt::RtErr
 async fn wait_for_rendezvous(_listener: &Listener) -> Result<(), slates_rt::RtError> {
   futures::idle().await;
   Ok(())
+}
+
+/// Tells `shard` a client is active there, so it spins its idle window before parking (§4.7); a refused
+/// message is counted ([`ACTIVATION_LOST`]) and logged once.
+fn activate(shard: ShardId) {
+  if let Err(e) = registry::send_control(shard.0, Control::Active(true))
+    && ACTIVATION_LOST.fetch_add(1, Ordering::AcqRel) == 0
+  {
+    eprintln!(
+      "slates-server: shard {} could not be told a client is active: {e}",
+      shard.0
+    );
+  }
 }
 
 /// The heartbeat: the anchor's `daemon.alive` input, beaten at a cadence inside its budget.

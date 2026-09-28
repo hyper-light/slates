@@ -348,13 +348,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # AC-0.7 / T-0.3: every loom model in the workspace — the one-producer ring, the two contending
       # producers, the lapping producer, the handle core (a handle crossing threads against its slot's
-      # reuse) and the runtime's kick-if-parked protocol — under the bounds `slates_mem::loom_bounds`
+      # reuse), the runtime's kick-if-parked protocol and the client/daemon doorbell protocol
+      # (`slates-ipc` `doorbell.rs`, 2026-09-28) — under the bounds `slates_mem::loom_bounds`
       # carries in code (a preemption bound of 2 and a 224-branch cap, each Derived: there), so this
       # lane sets no environment variable and explores exactly what a laptop run explores. The models
       # print the interleavings they explored (`--nocapture`), so the log carries the numbers
       # `docs/wip/concurrency.md` records.
-      - name: loom (every bounded interleaving of the rings, the handle core and the parking protocol)
-        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt --lib --release loom -- --nocapture
+      - name: loom (every bounded interleaving of the rings, the handle core, the parking and doorbell protocols)
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc --lib --release loom -- --nocapture
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri

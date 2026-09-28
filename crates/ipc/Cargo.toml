@@ -17,6 +17,11 @@ slates-wire = { workspace = true }
 # (`pure-hash` forwards the pure-Rust one for a Windows cross-lint from a host without MSVC).
 blake3 = { workspace = true }
 
+# loom builds only under `RUSTFLAGS="--cfg loom"` for the doorbell protocol's interleaving model
+# (`doorbell.rs`, AC-0.7), as the runtime's parking protocol is modeled.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 libc = { workspace = true }

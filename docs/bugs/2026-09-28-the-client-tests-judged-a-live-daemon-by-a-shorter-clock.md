@@ -68,3 +68,14 @@ remaining hand-picked deadlines to the derivation:
 No Rust client in the tree now builds its deadlines by hand. The Python and Node SDK tests pass 1 s and
 2 s, which equal the derived values. Six concurrent copies of the CLI binary's own tests ran 360 times
 after the fix with no failures.
+
+## The open question, investigated
+
+The investigation, recorded in `2026-09-28-a-client-request-waited-for-a-timer-after-a-lost-doorbell.md`:
+
+- **What it found:** a real lost-wake defect in the request doorbell, proven by loom and fixed. It was
+  the sibling the 2026-09-13 record had left open.
+- **What it did not find:** a local reproduction of the CI stall, even under x86 ordering (Rosetta) and
+  six-copy load. The largest first-`create` latency seen was 30 ms.
+- **Attribution:** the stall is attributed, unconfirmed, to the CI runner's resource limits (Ada,
+  2026-09-28). The derived 1 s deadline absorbs that. A stall at that deadline would be a daemon bug.

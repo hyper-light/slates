@@ -702,18 +702,21 @@ pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
 
 /// Whether any client ring on this thread holds a request (the poller's question).
 pub fn any_ring_ready() -> bool {
-  with_state(|s| {
-    s.clients.iter().any(|(_, c)| {
-      !c.retiring
-        && c
-          .end
-          .region()
-          .cmd()
-          .depth(c.end.region().object())
-          .is_ok_and(|d| d > 0)
-    }) || !s.deferred.is_empty()
-  })
-  .unwrap_or(false)
+  with_state(|s| ring_ready_in(s)).unwrap_or(false)
+}
+
+/// [`any_ring_ready`] over a state already borrowed: a live client's command ring holds a request, or
+/// deferred work waits — what the serve loop re-checks after announcing idle (`verbs::announce_idle`).
+pub fn ring_ready_in(s: &ShardState) -> bool {
+  s.clients.iter().any(|(_, c)| {
+    !c.retiring
+      && c
+        .end
+        .region()
+        .cmd()
+        .depth(c.end.region().object())
+        .is_ok_and(|d| d > 0)
+  }) || !s.deferred.is_empty()
 }
 
 /// A reply that came back from another shard (or a scatter's part): queued for the client's

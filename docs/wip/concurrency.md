@@ -34,7 +34,7 @@ execution here reaches) is the exhaustive run. CI sets no variable.
 Command for all of them (the CI step):
 
 ```
-RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p slates-mem -p slates-rt --lib --release loom -- --nocapture --test-threads=1
+RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p slates-mem -p slates-rt -p slates-ipc --lib --release loom -- --nocapture --test-threads=1
 ```
 
 | Model (file, test) | Threads, shape | What every explored interleaving must keep | Bounded (2 preemptions) | Exhaustive (`LOOM_MAX_PREEMPTIONS=255`) |
@@ -45,6 +45,7 @@ RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p slates-mem -p 
 | Handle core — `crates/mem/src/slab.rs`, `a_handle_returning_after_its_slot_was_reused_is_a_typed_miss_never_the_new_occupant` (AC-0.7 "handle cores"; T-0.1 under loom) | the owning shard and a peer; a one-slot slab; an SPSC ring out, an MPSC ring back | a request naming a handle either reads the occupant the handle was issued for or is refused `StaleHandle` with that handle's index and generation; it never reads the slot's new occupant; both outcomes reached in some interleaving | 6 interleavings | — (the two orders are the whole space) |
 | Kick-if-parked — `crates/rt/src/parking.rs`, `a_word_published_while_the_shard_parks_is_never_lost` (AC-0.7; the CLAUDE.md "kick a shard only when it is parked" pattern) | 1 sender, 1 parking shard; the shard's MPSC ring; loom's `Notify` as the driver's kick (sticky and spurious-capable, like an eventfd count or an `EVFILT_USER` trigger) | the shard always receives the word: it saw it before waiting or was kicked out of its wait; a lost wake is a shard blocked with nothing runnable, which loom reports as a deadlock; kicks, skipped kicks and waits each reached in some interleaving | 27 interleavings | 116 (measured 2026-09-25) |
 | Kick-if-parked, timed — `crates/rt/src/parking.rs`, `a_timed_park_never_loses_the_word_and_reads_only_its_own_stamp` (§4.3, A-31: the online wake estimate's kick stamp) | as above, the shard timing its wakes (`Parking::time_wakes`): the sender stamps the host clock on the first kick of a park, the shard takes the stamp after its wait | the shard always receives the word (the stamp is a `Relaxed` measurement word outside the protocol); a park that waited never reads a stale stamp (a sender stamps only after publishing, so a stamp always finds its word published and a later re-check skips the wait); a wake measured in some interleaving. One word cannot reach a stamp left from an earlier park: moving the announcement's time after the announcement leaves the model passing (checked 2026-09-25), so that ordering is held by the `Woken` unit tests | 22 interleavings | 83 (measured 2026-09-25) |
+| Doorbell — `crates/ipc/src/doorbell.rs`, `a_request_published_while_the_shard_goes_idle_is_never_lost` (§4.7 "Wake strategy"; AC-0.7) | 1 client, 1 serving shard; the command ring's depth, the shard's idle announcement (`daemon_parked`) and loom's `Notify` as the doorbell (sticky, like the Linux kick eventfd), both sides through the same fence functions the client and the serve loop call | the shard always serves the request: it saw it on its re-check or was rung out of its idle; a lost wake is reported as a deadlock; rings, skipped rings and idles each reached in some interleaving. Its witness, `the_unfenced_protocol_loses_a_wake` (`should_panic`), keeps the pre-2026-09-28 orderings and must deadlock (it does, at interleaving 1) | 47 interleavings | 151 (measured 2026-09-28; the longest honest execution passes a branch cap of 26 and fails 24) |
 
 Wall time for the five models under the bound: 0.12 s (mem, four models) + 0.00 s (rt) after the
 build; the build under `--cfg loom` is ≈ 14 s cold. The timed parking model (2026-09-25) adds 0.00 s
@@ -80,7 +81,10 @@ does not. Fixed by a `SeqCst` fence between the write and the read on both sides
 rule), in one seam both the senders and the shard drive. Fenced: 27 interleavings pass. Sibling sweep
 in the record: the ipc reply direction is safe by the kernel's word compare in `futex_wait`; the ipc
 request direction (`ClientEnd::send` → the daemon's `mark_parked`) has the same shape with `Release`
-and `Acquire` only and no re-check of the client rings after the announcement — reported, not fixed.
+and `Acquire` only and no re-check of the client rings after the announcement — reported then, **fixed
+2026-09-28** (`docs/bugs/2026-09-28-a-client-request-waited-for-a-timer-after-a-lost-doorbell.md`): the
+fences live in `slates-ipc` `doorbell.rs`, the serve loop announces, fences and re-checks its rings
+(`verbs::announce_idle`), and the doorbell model below proves it.
 
 ### Miri (unchanged commands)
 
@@ -137,10 +141,9 @@ restated as that, not as loom.
 - **TSan nightly** (the design's Part 6 row): needs the nightly toolchain's `-Zsanitizer=thread`
   on a Linux target (`RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --target
   x86_64-unknown-linux-gnu -p slates-mem -p slates-rt`); not added, a lane for a Linux host to own.
-- **The ipc request-direction parking sibling** (§1 above; the bug record's sibling sweep):
-  a failing by-use test first ("a poller that becomes ready between the loop's last look and the
-  park is woken without a driver wait"), then the fences and the extended pending check.
 - **shuttle over two transport endpoints** (§3).
-- **A loom model of the ipc rings' park/wake** is out of reach as written: the rings live in a
-  shared-memory region behind std atomics over mapped bytes, which loom cannot instrument; the
-  protocol's safety rests on the kernel's word compare, argued in the bug record.
+- **A loom model of the ipc reply direction's park/wake** is out of reach as written: the rings live
+  in a shared-memory region behind std atomics over mapped bytes, which loom cannot instrument, and that
+  direction's safety rests on the kernel's word compare, argued in the 2026-09-13 bug record. The
+  request direction's doorbell is modeled at the protocol level (`doorbell.rs`, §1), because its safety
+  rests on the two fences alone, which live in functions both the real code and the model call.

@@ -407,12 +407,15 @@ impl ClientEnd {
 
   /// Writes a request slot; `RingFull` when the daemon has not taken the slot the ring wraps
   /// onto (the caller blocks on credit and retries; nothing is dropped). Rings the doorbell
-  /// when the daemon's shard is parked.
+  /// when the daemon's shard has announced it is going idle — read after the doorbell protocol's
+  /// fence ([`crate::doorbell`]), so a shard that missed this request on its re-check is always rung.
   pub fn send(&mut self, slot: &Slot) -> Result<(), IpcError> {
     let cmd = self.region.cmd();
     cmd.push(self.region.object_mut(), self.next_request, slot)?;
     self.next_request = self.next_request.wrapping_add(1);
-    let parked = self.region.daemon_parked()?.load(Ordering::Acquire) != 0;
+    let announced = self.region.daemon_parked()?;
+    let parked =
+      crate::doorbell::after_publishing_idle_announced(|| announced.load(Ordering::Relaxed) != 0);
     if parked {
       self.region.doorbell()?.fetch_add(1, Ordering::AcqRel);
       if let Some(bell) = &self.doorbell {
@@ -664,8 +667,9 @@ impl DaemonEnd {
     }
   }
 
-  /// Marks the daemon's shard parked (true) or polling (false), so the client knows whether
-  /// to ring the doorbell.
+  /// Marks the daemon's shard going idle (true) or polling (false), so the client knows whether
+  /// to ring the doorbell. Announcing idle is half of the doorbell protocol: the shard must re-check its
+  /// rings through [`crate::doorbell::after_announcing_idle_pending`] before it idles.
   pub fn set_parked(&self, parked: bool) -> Result<(), IpcError> {
     self
       .region

@@ -1576,6 +1576,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "libc",
+ "loom",
  "rustix",
  "slates-machine",
  "slates-mem",

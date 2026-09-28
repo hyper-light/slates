@@ -1994,8 +1994,25 @@ parks again).
 - `ClientEnd` counts unanswered wakes, and a deterministic ring test proves the count.
 - Result: 0 failures in 900 six-copy runs after the fix, against 1 before.
 
-Still open: why the first `create` took more than 200 ms on that runner. There are no daemon logs of the
-run, and it did not reproduce locally. A stall at the derived deadline would be a real daemon bug.
+Investigated the same day:
+
+- The stall did not reproduce locally, including under x86 ordering through Rosetta and six-copy load,
+  where the largest first-`create` latency was 30 ms.
+- It is attributed, unconfirmed, to the CI runner's resource limits (4 vCPUs, five daemon-starting tests
+  at once).
+- On the way, the request doorbell's missing fences (the 2026-09-13 record's open sibling) were proven by
+  loom and fixed; see the next entry.
+
+### 2026-09-28: the request doorbell is fenced (the 2026-09-13 sibling closed)
+
+Closed: [a client request could wait for a timer after a lost doorbell](../bugs/2026-09-28-a-client-request-waited-for-a-timer-after-a-lost-doorbell.md).
+
+- **Evidence:** loom deadlocks the old `Release`/`Acquire` protocol at interleaving 1. The fenced one
+  passes 47 interleavings at the CI bound and 151 exhaustively.
+- **Fix:** the fences live in `slates-ipc` `doorbell.rs`, the serve loop announces, fences and re-checks
+  its rings, and CI's loom lane now runs `slates-ipc`.
+- **Swallowed errors fixed in the sweep:** `mark_parked`'s ignored `set_parked` result, now counted as
+  `ipc.idle_announce`, and a discarded `Control::Active` send, now counted as `ACTIVATION_LOST`.
 
 ### 2026-09-28: a seed id's replacement keeps the record link's pending dial
 

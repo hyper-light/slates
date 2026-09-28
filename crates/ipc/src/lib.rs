@@ -31,6 +31,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 pub mod completion;
 pub mod delivery;
+pub mod doorbell;
 pub mod endpoint;
 pub mod error;
 pub mod protocol;

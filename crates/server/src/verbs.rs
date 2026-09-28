@@ -5846,13 +5846,46 @@ pub fn owner_rights() -> AccessEntry {
   }
 }
 
-/// Whether the daemon's parked flag should be set on a client's region: exported for the
-/// server task.
-pub fn mark_parked(state: &ShardState, parked: bool) {
-  for (_, c) in state.clients.iter() {
-    let _ = c.end.set_parked(parked);
+/// The status refusal count of a client region whose idle announcement could not be written (§4.14:
+/// counted, never silent). The shard then keeps polling rather than idling, since that client would never
+/// ring it. A region's announcement word lies inside the mapping its creation checked, so this is a
+/// health signal that should stay at zero.
+const IDLE_ANNOUNCE_REFUSED: &str = "ipc.idle_announce";
+
+/// The shard's half of the doorbell protocol (§4.7 "Wake strategy", `slates_ipc::doorbell`): announces
+/// to every client that the shard is going idle, then — after the protocol's fence — re-checks the client
+/// rings. `true` when the shard must keep serving instead of idling: a request (or deferred work) is
+/// pending, or an announcement could not be written. A request the re-check misses was published after
+/// the fence, so its client reads the announcement and rings the doorbell; before 2026-09-28 the shard's
+/// last look came before any fence and such a request could wait a whole reap period for a timer
+/// (`docs/bugs/2026-09-28-a-client-request-waited-for-a-timer-after-a-lost-doorbell.md`).
+pub fn announce_idle(state: &mut ShardState) -> bool {
+  let refused = state
+    .clients
+    .iter()
+    .filter(|(_, c)| c.end.set_parked(true).is_err())
+    .count();
+  if refused > 0 {
+    let count = state.refusals.entry(IDLE_ANNOUNCE_REFUSED).or_insert(0);
+    *count = count.saturating_add(u64::try_from(refused).unwrap_or(u64::MAX));
   }
-  let _ = Ordering::Relaxed;
+  let pending =
+    slates_ipc::doorbell::after_announcing_idle_pending(|| crate::state::ring_ready_in(state));
+  pending || refused > 0
+}
+
+/// Withdraws the idle announcement once the shard is serving again, so clients stop ringing. A region
+/// that refuses the write is counted as the announcement is; its client only rings when it need not.
+pub fn announce_polling(state: &mut ShardState) {
+  let refused = state
+    .clients
+    .iter()
+    .filter(|(_, c)| c.end.set_parked(false).is_err())
+    .count();
+  if refused > 0 {
+    let count = state.refusals.entry(IDLE_ANNOUNCE_REFUSED).or_insert(0);
+    *count = count.saturating_add(u64::try_from(refused).unwrap_or(u64::MAX));
+  }
 }
 
 /// What recovery rebuilt on this shard (§2.6 step 2; §4.8 "replay on start").

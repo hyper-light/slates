@@ -101,7 +101,8 @@ nanoseconds in which a sender may kick a shard that is already awake (a spurious
   (`spin_until_work` → `wake_ready_pollers`), which runs only while a client is active and `spin_ns > 0`.
   Under the abstract model a request written between the loop's last poller check and the flag's
   visibility can find the flag unset and ring no doorbell, and the shard parks over it until its next
-  deadline or kick. **Not fixed here** (no failing test yet; the fix is a `SeqCst` fence after the slot
+  deadline or kick. **Fixed 2026-09-28**
+  (`docs/bugs/2026-09-28-a-client-request-waited-for-a-timer-after-a-lost-doorbell.md`). **Not fixed here** (no failing test yet; the fix is a `SeqCst` fence after the slot
   push in `send`, a `SeqCst` fence after `set_parked(true)`, and `park`'s pending check extended to
   `wake_ready_pollers`, which is a by-use test of "a poller that becomes ready between the loop's last
   look and the park is woken without a driver wait"). Reported to Ada for a decision.
