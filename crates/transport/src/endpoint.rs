@@ -86,18 +86,6 @@ const HEADER_PROTECTION_SAMPLE_OFFSET: usize =
 pub const MAX_PACKET_PAYLOAD: usize =
   MIN_DATAGRAM_BYTES - PACKET_NUMBER_OFFSET - MAX_PACKET_NUMBER_BYTES as usize - AEAD_TAG_BYTES;
 
-/// The largest datagram either end sends or reads — a handshake flight, or a 1-RTT packet (which never
-/// exceeds [`MIN_DATAGRAM_BYTES`]). A handshake flight is sent whole in one datagram and read into a
-/// buffer of this size, so a flight past it would be truncated on receipt and fault the peer's
-/// handshake: the sender refuses such a flight typed instead (`EndpointError::FlightTooLarge`), and the
-/// server keeps its flight roster-independent (`handshake::server_config` sends no
-/// certificate-authority hints). Fragmenting a flight into minimum-size datagrams (RFC 9000 §19.6 CRYPTO
-/// frames with offsets) is the owed general form.
-/// Measured: a mutual-TLS 1.3 server flight with one self-signed ECDSA P-256 certificate is 694 bytes
-/// (2026-09-14, `handshake::tests`); this holds that flight with a chain of two more such certificates
-/// (about 450 bytes each) and room for their extensions, and is the power of two above.
-pub const DATAGRAM_BYTES: usize = 2048;
-
 /// The handshake turn ceiling: the most drain-send-receive turns `establish` takes before it refuses
 /// a stuck handshake with `NotReady`, so the loop is bounded (banned item 8 — no unbounded loop). It
 /// caps only the failure path (a peer that never completes), so its exact value is not performance-
@@ -540,17 +528,28 @@ impl Endpoint {
   /// demultiplexer fills; `Closed` once the demultiplexer closed the session.
   async fn recv_within(
     &self,
-    buf: &mut [u8],
     timeout_ns: u64,
-  ) -> Result<Option<(usize, SocketAddrV4)>, EndpointError> {
+  ) -> Result<Option<(Vec<u8>, SocketAddrV4)>, EndpointError> {
     let outcome = match &self.link {
-      Link::Own(socket) => within(socket.recv_from(buf), timeout_ns)
-        .await
-        .map(|received| received.map_err(EndpointError::Io)),
+      // The shard's receive buffer is lent only for the synchronous read, never across the await
+      // (`crate::receive`), so one buffer of the largest UDP payload serves every session on the shard.
+      Link::Own(socket) => within(
+        async {
+          loop {
+            if let Some(datagram) = crate::receive::try_receive(socket)? {
+              return Ok(datagram);
+            }
+            socket.readable().await?;
+          }
+        },
+        timeout_ns,
+      )
+      .await
+      .map(|received| received.map_err(EndpointError::Io)),
       Link::Shared { demux, slot } => {
         within(
           std::future::poll_fn(|cx| {
-            with_demux(*demux, |d| d.poll_recv(*slot, buf, cx))
+            with_demux(*demux, |d| d.poll_recv(*slot, cx))
               .unwrap_or(Poll::Ready(Err(EndpointError::Closed)))
           }),
           timeout_ns,
@@ -691,7 +690,6 @@ impl Endpoint {
   /// asking). The retransmit interval backs off from the timer granularity toward the probe timeout; the
   /// count of timeouts, repeats and partial or malformed datagrams is bounded (banned item 8).
   async fn receive_flight(&mut self, last_flight: &[u8]) -> Result<Vec<u8>, EndpointError> {
-    let mut buf = [0u8; DATAGRAM_BYTES];
     let mut attempts = 0u32;
     // Datagrams received in this turn that did not complete a flight: a bound on a peer that sends
     // fragments which never complete, or garbage (banned item 8) — every fragment a flight can have,
@@ -700,8 +698,8 @@ impl Endpoint {
     let mut backoff = GRANULARITY_NS;
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
-      match self.recv_within(&mut buf, period).await? {
-        Some((rn, _from)) => match self.reassembler.push(buf.get(..rn).unwrap_or_default()) {
+      match self.recv_within(period).await? {
+        Some((datagram, _from)) => match self.reassembler.push(&datagram) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
           // A fragment that does not yet complete a flight is progress — the peer is alive and
@@ -783,7 +781,6 @@ impl Endpoint {
   /// the server is still waiting) until then. Bounded by the handshake retransmit ceiling (banned
   /// item 8).
   async fn confirm_as_client(&mut self, last_flight: &[u8]) -> Result<(), EndpointError> {
-    let mut buf = [0u8; DATAGRAM_BYTES];
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
     let deadline = self.confirmation_deadline();
@@ -794,11 +791,11 @@ impl Endpoint {
         return Err(EndpointError::NotReady);
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
-      match self.recv_within(&mut buf, period).await? {
-        Some((n, from)) => {
+      match self.recv_within(period).await? {
+        Some((datagram, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
-          if from == self.peer && self.ingest(buf.get(..n).unwrap_or_default()).is_ok() {
+          if from == self.peer && self.ingest(&datagram).is_ok() {
             return Ok(());
           }
           invalid += 1;
@@ -844,7 +841,6 @@ impl Endpoint {
   /// `docs/bugs/2026-09-14-transport-rtt-sampled-on-the-wall-clock.md`). Bounded overall by
   /// the absolute retry-time budget and the partial-fragment work budget (banned item 8).
   async fn confirm_as_server(&mut self) -> Result<(), EndpointError> {
-    let mut buf = [0u8; DATAGRAM_BYTES];
     self.send_confirm()?;
     let mut silent = 0u32;
     let mut backoff = GRANULARITY_NS;
@@ -856,13 +852,13 @@ impl Endpoint {
         return Err(EndpointError::NotReady);
       }
       let period = backoff.min(self.handshake_probe_ceiling()).min(remaining);
-      match self.recv_within(&mut buf, period).await? {
-        Some((n, from)) => {
+      match self.recv_within(period).await? {
+        Some((datagram, from)) => {
           // A datagram that unprotects under the 1-RTT keys is the client's own application traffic — it
           // has our confirmation and moved on, so the handshake is done. Ingest it, so the receive the
           // caller runs next finds it already in the connection rather than waiting a probe timeout for
           // the client's retransmit of it.
-          if from == self.peer && self.ingest(buf.get(..n).unwrap_or_default()).is_ok() {
+          if from == self.peer && self.ingest(&datagram).is_ok() {
             return Ok(());
           }
           invalid += 1;
@@ -1013,10 +1009,9 @@ impl Endpoint {
   /// [`drive`]: Endpoint::drive
   /// [`settle`]: Endpoint::settle
   async fn receive_and_ingest(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
-    let mut buf = [0u8; DATAGRAM_BYTES];
-    match self.recv_within(&mut buf, timeout_ns).await? {
-      Some((n, _from)) => {
-        self.fold_or_discard(buf.get(..n).unwrap_or_default())?;
+    match self.recv_within(timeout_ns).await? {
+      Some((datagram, _from)) => {
+        self.fold_or_discard(&datagram)?;
         Ok(true)
       }
       None => Ok(false),

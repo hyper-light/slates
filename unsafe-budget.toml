@@ -60,6 +60,10 @@
 #   The long-poll attribution (`attribution.rs`, 2026-09-25, §4.3 A-31): Linux's per-thread voluntary
 #   context switches through `getrusage(RUSAGE_THREAD)` — rustix offers no `getrusage`, so one libc
 #   call over a zeroed `rusage` this frame owns (1, Linux only). The ceiling had the room (58 of 59).
+#   Don't-fragment on every datagram socket (`netsys.rs` `set_dont_fragment`, 2026-09-28, RFC 8899 §3
+#   for path MTU discovery): one `setsockopt(IP_DONTFRAG)` on macOS, which rustix does not wrap (1), and
+#   one `setsockopt(IP_DONTFRAGMENT)` on Windows (1); Linux uses rustix's safe `set_ip_mtu_discover`.
+#   59 → 61.
 #   The io_uring non-blocking harvest (`uring.rs` `harvest_ready`, 2026-09-26, §4.3): one raw
 #   `io_uring_enter(GETEVENTS, min_complete = 0)` with no argument pointer — the crate's safe helpers set
 #   GETEVENTS only when waiting for a completion, and a zero-timeout wait for one slept the shard
@@ -158,7 +162,8 @@ slates-mem = 19
 # 2026-09-19 (-8): generational Unix/simulation kicks remove KickFd's UnsafeCell,
 # unsafe Send/Sync, escaping descriptor borrows, and self-references. Registry retirement
 # pins foreign borrows before closing. Forced-overlap regression fails before and passes after.
-slates-rt = 59
+# 2026-09-28 (+2): don't-fragment on datagram sockets (macOS `IP_DONTFRAG`, Windows `IP_DONTFRAGMENT`).
+slates-rt = 61
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

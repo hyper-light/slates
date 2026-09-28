@@ -73,7 +73,42 @@ mod imp {
     rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
       .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
     rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    set_dont_fragment(&fd)?;
     Ok(Socket { fd })
+  }
+
+  /// Sets the don't-fragment bit on every datagram the socket sends, and has the kernel leave the
+  /// sizing to the transport (RFC 8899 §3: a packetization layer that probes the path needs its probes
+  /// dropped, not fragmented, when too large; §4.4: a datagram larger than the local interface then
+  /// fails its send with `EMSGSIZE`). Linux: `IP_PMTUDISC_PROBE` sets DF and ignores the kernel's own
+  /// path-MTU cache, so the transport's probes decide.
+  #[cfg(target_os = "linux")]
+  fn set_dont_fragment(fd: &OwnedFd) -> Result<(), RtError> {
+    rustix::net::sockopt::set_ip_mtu_discover(fd, rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE)
+      .map_err(|e| refused("setsockopt(IP_MTU_DISCOVER)", e))
+  }
+
+  /// macOS: `IP_DONTFRAG` sets DF on each datagram (see the Linux arm).
+  #[cfg(target_os = "macos")]
+  fn set_dont_fragment(fd: &OwnedFd) -> Result<(), RtError> {
+    let on: libc::c_int = 1;
+    let len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap_or(libc::socklen_t::MAX);
+    // SAFETY: `IP_DONTFRAG` takes an `int`; the pointer and length name one live local `c_int`, and the
+    // descriptor is this socket's, open for the call.
+    let outcome = unsafe {
+      libc::setsockopt(
+        fd.as_raw_fd(),
+        libc::IPPROTO_IP,
+        libc::IP_DONTFRAG,
+        (&raw const on).cast::<libc::c_void>(),
+        len,
+      )
+    };
+    if outcome == 0 {
+      Ok(())
+    } else {
+      Err(RtError::os("setsockopt(IP_DONTFRAG)"))
+    }
   }
 
   pub(crate) fn bind(socket: &Socket, addr: SocketAddrV4) -> Result<(), RtError> {
@@ -92,6 +127,7 @@ mod imp {
     rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
       .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
     rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    set_dont_fragment(&fd)?;
     Ok(Socket { fd })
   }
 
@@ -140,10 +176,11 @@ mod imp {
   use std::sync::OnceLock;
 
   use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SO_RCVBUF, SO_TYPE,
-    SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAEINTR,
-    WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname,
-    getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, socket as ws_socket,
+    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_UDP,
+    SO_RCVBUF, SO_TYPE, SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET,
+    WSADATA, WSAEINTR, WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket,
+    getsockname, getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, setsockopt,
+    socket as ws_socket,
   };
 
   use super::{Io, Ipv4Addr, SocketAddrV4};
@@ -222,6 +259,7 @@ mod imp {
     }
     let socket = Socket { socket: raw };
     set_nonblocking(&socket)?;
+    set_dont_fragment(&socket)?;
     Ok(socket)
   }
 
@@ -231,6 +269,27 @@ mod imp {
     // SAFETY: FIONBIO takes one u32 by pointer; a live local suffices.
     if unsafe { ioctlsocket(socket.socket, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
       return Err(last("ioctlsocket(FIONBIO)"));
+    }
+    Ok(())
+  }
+
+  /// Sets the don't-fragment bit on every datagram the socket sends (`IP_DONTFRAGMENT`; RFC 8899 §3 — see
+  /// the Unix arms), so a path-MTU probe that is too large is dropped rather than fragmented.
+  fn set_dont_fragment(socket: &Socket) -> Result<(), RtError> {
+    let on: i32 = 1;
+    let len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: `IP_DONTFRAGMENT` takes a DWORD-sized `int`; the pointer and length name one live local.
+    let outcome = unsafe {
+      setsockopt(
+        socket.socket,
+        IPPROTO_IP,
+        IP_DONTFRAGMENT,
+        (&raw const on).cast::<u8>(),
+        len,
+      )
+    };
+    if outcome == SOCKET_ERROR {
+      return Err(last("setsockopt(IP_DONTFRAGMENT)"));
     }
     Ok(())
   }
@@ -309,6 +368,7 @@ mod imp {
       });
     }
     set_nonblocking(&socket)?;
+    set_dont_fragment(&socket)?;
     Ok(socket)
   }
 

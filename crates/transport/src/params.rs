@@ -107,11 +107,12 @@ impl std::fmt::Display for ParamsError {
 impl std::error::Error for ParamsError {}
 
 impl TransportParameters {
-  /// This end's parameters: it reads datagrams into [`DATAGRAM_BYTES`](crate::endpoint::DATAGRAM_BYTES)
-  /// buffers, so that is the largest UDP payload it declares.
+  /// This end's parameters: it reads every datagram into a buffer of the largest UDP payload
+  /// ([`crate::receive::RECEIVE_BUFFER_BYTES`]), so that is what it declares; path MTU discovery then finds
+  /// how much of it the path between the two ends carries.
   pub fn local() -> TransportParameters {
     TransportParameters {
-      max_udp_payload: u32::try_from(crate::endpoint::DATAGRAM_BYTES).unwrap_or(u32::MAX),
+      max_udp_payload: u32::try_from(crate::receive::RECEIVE_BUFFER_BYTES).unwrap_or(u32::MAX),
     }
   }
 

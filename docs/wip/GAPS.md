@@ -2032,8 +2032,12 @@ Built: the session plane's transport parameters (`crates/transport/src/params.rs
 - Decoded and checked by every endpoint when the handshake completes; a bad peer is refused typed.
 - Record: the research note's build ledger, slice 3a.
 
+Slice 3b, the same day:
+- Every end declares and reads the largest UDP payload through one lent buffer per shard.
+- `UdpSocket` gained `readable()` and `try_recv_from`.
+- Every datagram socket sets don't-fragment (rt unsafe budget 59 → 61).
+- Measured: macOS caps UDP datagrams at 9,216 bytes (`net.inet.udp.maxdgram`).
+
 Still owed for path MTU discovery (RFC 8899):
-- the declared limit and receive buffers derived from the host;
-- don't-fragment on real sockets;
 - the probe search, black-hole detection and raise timer;
 - the controller and frame cap following the discovered size, with its benchmark.

@@ -137,36 +137,46 @@ impl UdpSocket {
   }
 
   /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the
-  /// byte count and the sender's address.
+  /// byte count and the sender's address. The loop of [`UdpSocket::readable`] and
+  /// [`UdpSocket::try_recv_from`] — a caller whose buffer must not be held across the await (one buffer
+  /// shared by a shard's readers) drives those two itself.
   pub async fn recv_from(&self, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
+    loop {
+      if let Some(received) = self.try_recv_from(buf)? {
+        return Ok(received);
+      }
+      self.readable().await?;
+    }
+  }
+
+  /// Awaits the socket's read readiness through the driver: a datagram is waiting, or the wait ended
+  /// spuriously — so a caller follows it with [`UdpSocket::try_recv_from`] and loops on `None`.
+  pub async fn readable(&self) -> Result<(), RtError> {
     match &self.inner {
-      Inner::Real { socket } => Self::recv_real(socket, buf).await,
-      Inner::Sim { port } => Self::recv_sim(*port, buf).await,
+      Inner::Real { socket } => readable(socket.raw_id()).await,
+      Inner::Sim { port } => readable(i32::from(*port)).await,
     }
   }
 
-  /// The real receive loop: non-blocking `recvfrom` through the seam, awaiting driver readiness on
-  /// would-block.
-  async fn recv_real(socket: &Socket, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
-    loop {
-      match netsys::recv_from(socket, buf)? {
-        Io::Ready(out) => return Ok(out),
-        Io::WouldBlock => readable(socket.raw_id()).await?,
-        Io::Interrupted => continue,
-      }
-    }
-  }
-
-  /// The simulated receive loop: take from the fabric mailbox, awaiting the driver (fabric interest)
-  /// when it is empty.
-  async fn recv_sim(port: u16, buf: &mut [u8]) -> Result<(usize, SocketAddrV4), RtError> {
-    loop {
-      if let Some((bytes, from)) = crate::sim::sim_udp_recv(port) {
+  /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`
+  /// when nothing is waiting. A datagram longer than `buf` is truncated to it (size `buf` to the largest
+  /// datagram the caller reads).
+  pub fn try_recv_from(&self, buf: &mut [u8]) -> Result<Option<(usize, SocketAddrV4)>, RtError> {
+    match &self.inner {
+      Inner::Real { socket } => loop {
+        match netsys::recv_from(socket, buf)? {
+          Io::Ready(out) => return Ok(Some(out)),
+          Io::WouldBlock => return Ok(None),
+          Io::Interrupted => {}
+        }
+      },
+      Inner::Sim { port } => Ok(crate::sim::sim_udp_recv(*port).map(|(bytes, from)| {
         let n = bytes.len().min(buf.len());
-        buf[..n].copy_from_slice(&bytes[..n]);
-        return Ok((n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from)));
-      }
-      readable(i32::from(port)).await?;
+        if let (Some(into), Some(from_bytes)) = (buf.get_mut(..n), bytes.get(..n)) {
+          into.copy_from_slice(from_bytes);
+        }
+        (n, SocketAddrV4::new(Ipv4Addr::LOCALHOST, from))
+      })),
     }
   }
 }

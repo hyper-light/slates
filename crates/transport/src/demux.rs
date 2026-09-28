@@ -48,8 +48,7 @@ use slates_rt::udp::{SocketAddrV4, UdpSocket};
 
 use crate::connection::ConnectionShape;
 use crate::endpoint::{
-  ConnectionId, DATAGRAM_BYTES, Endpoint, EndpointError, MIN_DATAGRAM_BYTES, connection_id_of,
-  is_short_header,
+  ConnectionId, Endpoint, EndpointError, MIN_DATAGRAM_BYTES, connection_id_of, is_short_header,
 };
 use crate::handshake::{HandshakeError, Identity, server_connection};
 
@@ -335,10 +334,14 @@ impl Demux {
   /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket refuses;
   /// the caller owns the task (spawns it on this shard and cancels it at shutdown).
   pub async fn run(&'static self) -> Result<(), EndpointError> {
-    let mut buf = [0u8; DATAGRAM_BYTES];
     loop {
-      let (n, from) = self.socket.recv_from(&mut buf).await?;
-      self.route(buf.get(..n).unwrap_or_default(), from);
+      // Routed straight out of the shard's receive buffer (`crate::receive`), lent only for the read.
+      if crate::receive::with_datagram(&self.socket, |datagram, from| self.route(datagram, from))?
+        .is_none()
+      {
+        self.socket.readable().await?;
+        continue;
+      }
       // Yield between datagrams: a burst queued in the kernel would otherwise be routed whole before any
       // session task ran, filling an inbox the session had no chance to drain.
       slates_rt::futures::yield_now().await;
@@ -370,9 +373,8 @@ impl Demux {
   pub(crate) fn poll_recv(
     &self,
     slot: Slot,
-    buf: &mut [u8],
     cx: &mut Context<'_>,
-  ) -> Poll<Result<(usize, SocketAddrV4), EndpointError>> {
+  ) -> Poll<Result<(Vec<u8>, SocketAddrV4), EndpointError>> {
     let mut inner = self.inner.borrow_mut();
     let Some(inbox) = inner.inbox_mut(slot) else {
       return Poll::Ready(Err(EndpointError::Closed));
@@ -381,11 +383,7 @@ impl Demux {
       return Poll::Ready(Err(EndpointError::Closed));
     }
     if let Some(datagram) = inbox.queue.pop_front() {
-      let n = datagram.len().min(buf.len());
-      if let (Some(into), Some(from)) = (buf.get_mut(..n), datagram.get(..n)) {
-        into.copy_from_slice(from);
-      }
-      return Poll::Ready(Ok((n, inbox.peer)));
+      return Poll::Ready(Ok((datagram, inbox.peer)));
     }
     inbox.waker = Some(cx.waker().clone());
     Poll::Pending

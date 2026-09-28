@@ -132,6 +132,62 @@ fn a_udp_datagram_is_received_through_the_driver() {
   shutdown_within(rt, "after the datagram arrived").unwrap();
 }
 
+/// RFC 8899 §3 (§4.10a path MTU discovery) on macOS: every datagram socket the runtime makes sets the
+/// don't-fragment bit (`IP_DONTFRAG`), so a probe too large for the path is dropped rather than
+/// fragmented. No send on this host can show the bit by size: macOS caps a UDP datagram at
+/// `net.inet.udp.maxdgram` (9,216 bytes by default, measured 2026-09-28), below the loopback MTU (16,384),
+/// so an oversized send is refused `EMSGSIZE` with or without the bit. The test checks both: the option
+/// reads back set, and an oversized send is refused typed (`EMSGSIZE`, the local limit the prober reads as
+/// "too big here") while a floor-sized one sends.
+#[cfg(target_os = "macos")]
+#[test]
+fn every_datagram_socket_sets_dont_fragment_and_an_oversized_send_is_refused() {
+  /// Shape: larger than macOS's default UDP datagram cap (9,216).
+  const OVERSIZED: usize = 16_500;
+  /// Shape: the path floor every QUIC path carries (RFC 9000 §14.1).
+  const FLOOR: usize = 1_200;
+  let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let target = receiver.local_addr().unwrap();
+  let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  match sender.send_to(&vec![0u8; OVERSIZED], target) {
+    Err(slates_rt::error::RtError::DriverRefused { code, .. }) => {
+      assert_eq!(code, Some(libc::EMSGSIZE), "refused as too large")
+    }
+    other => panic!("an oversized datagram must be refused: {other:?}"),
+  }
+  assert_eq!(sender.send_to(&vec![0u8; FLOOR], target).unwrap(), FLOOR);
+  let fd = sender.into_owned().unwrap();
+  let mut set: libc::c_int = 0;
+  let mut len = libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap();
+  // SAFETY: `IP_DONTFRAG` is an `int`; the out pointer and its length name one live local `c_int`, and
+  // the descriptor is open for the call.
+  let outcome = unsafe {
+    libc::getsockopt(
+      std::os::fd::AsRawFd::as_raw_fd(&fd),
+      libc::IPPROTO_IP,
+      libc::IP_DONTFRAG,
+      (&raw mut set).cast::<libc::c_void>(),
+      &raw mut len,
+    )
+  };
+  assert_eq!(outcome, 0, "the option reads back");
+  assert_eq!(set, 1, "the don't-fragment bit is set");
+}
+
+/// RFC 8899 §3 on Linux: the runtime's datagram socket runs `IP_PMTUDISC_PROBE` — the don't-fragment bit
+/// set, the kernel's own path-MTU cache ignored so the transport's probes decide. Loopback's MTU (65,536)
+/// exceeds any UDP payload, so no size can show the refusal there; the option is read back instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn every_datagram_socket_probes_with_the_dont_fragment_bit() {
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  let fd = socket.into_owned().unwrap();
+  assert_eq!(
+    rustix::net::sockopt::ip_mtu_discover(&fd).unwrap(),
+    rustix::net::sockopt::Ipv4PathMtuDiscovery::PROBE
+  );
+}
+
 /// AC (§4.10a; docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md): a
 /// caller that binds a port and hands the runtime a duplicate of that socket keeps the port from the moment
 /// it learned it — no other socket can bind it while the caller's handle lives, even after the adopted

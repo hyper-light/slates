@@ -349,10 +349,11 @@ mod tests {
     Ok(())
   }
 
-  /// Shape: the largest handshake flight a fleet server may send, measured at the receiver's datagram
-  /// buffer (`crate::endpoint::DATAGRAM_BYTES`): a flight past it is truncated on receipt and faults the
-  /// peer's handshake; the assertion is against that bound, from the endpoint, not a copy.
-  const FLIGHT_BOUND: usize = crate::endpoint::DATAGRAM_BYTES;
+  /// Shape: the largest handshake flight a fleet server may send — the fragmenter's bound on a whole
+  /// flight (`crate::flight::MAX_FLIGHT_BYTES`), past which the sender refuses it typed
+  /// (`EndpointError::FlightTooLarge`); the assertion is against that bound, from the flight module, not
+  /// a copy.
+  const FLIGHT_BOUND: usize = crate::flight::MAX_FLIGHT_BYTES;
 
   /// A self-signed Ed25519 identity: its signatures are a fixed 64 bytes, so a flight it signs is the
   /// same size on every run — a measurement can compare two flights exactly (an ECDSA signature's DER
@@ -424,7 +425,7 @@ mod tests {
     let many = server_first_flight(&server_identity, &client_identity, 64);
     assert!(
       one <= FLIGHT_BOUND,
-      "a one-peer roster's server flight fits the receiver's datagram: {one} > {FLIGHT_BOUND}"
+      "a one-peer roster's server flight fits the flight bound: {one} > {FLIGHT_BOUND}"
     );
     assert_eq!(
       many, one,

@@ -423,3 +423,29 @@ Each scenario measures:
       simulated fabric's path MTU and black hole.
     - The controller, packet budget and fleet frame cap following the discovered size, with a goodput
       benchmark.
+- **Slice 3b (2026-09-28): every end reads what it declares; datagrams carry don't-fragment.**
+  - **Declared limit.** RFC 8899 finds the path's size by probing, not by asking interfaces, so an end
+    declares the largest UDP payload (65,527, RFC 9000 §18.2) and reads everything into a buffer of that
+    size. Loss of a probe then reports the path, never the reader.
+  - **One buffer per shard, not per session.** `crates/transport/src/receive.rs` lends one 64 KiB buffer
+    per shard thread to each synchronous read (`Cell<Option<Vec<u8>>>`: taken, used, returned; a nested
+    read gets its own, so lending cannot fail). A buffer per pooled session would cost 64 KiB times every
+    session of a large fleet.
+  - **The runtime primitive that makes that possible.** `slates_rt::udp::UdpSocket` gained `readable()`
+    and a non-blocking `try_recv_from`, and `recv_from` is now their loop. The endpoints' four 2,048-byte
+    stack buffers and `DATAGRAM_BYTES` are gone, replaced rather than layered. The demultiplexer routes
+    straight out of the lent buffer, and a session's inbox hands its `Vec` over without a copy.
+  - **Don't-fragment on every datagram socket** (RFC 8899 §3; `rt` `netsys.rs`, paired per platform):
+    Linux `IP_PMTUDISC_PROBE` (DF set, the kernel's path-MTU cache ignored so the transport's probes
+    decide), macOS `IP_DONTFRAG`, Windows `IP_DONTFRAGMENT`. The rt unsafe budget goes 59 → 61 for the
+    macOS and Windows `setsockopt` calls.
+  - **Measured on the way.** macOS caps a UDP datagram at `net.inet.udp.maxdgram`, 9,216 bytes by default,
+    below the 16,384-byte loopback MTU. A larger send is refused `EMSGSIZE` whether or not DF is set, so
+    the search must read `EMSGSIZE` as "too large here", whatever the cause (RFC 8899 §4.4 already
+    treats a local refusal so).
+  - **Tests.**
+    - A 9,000-byte datagram arrives whole through the lent buffer.
+    - A nested read gets its own buffer.
+    - The DF option reads back set (macOS `IP_DONTFRAG`, Linux `IP_PMTUDISC_PROBE`), and an oversized
+      macOS send is refused typed.
+    - The fleet suite passes 50/50 (230 s) and cluster 193/193.
