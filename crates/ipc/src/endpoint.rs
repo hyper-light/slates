@@ -66,6 +66,10 @@ pub struct ClientEnd {
   parks: u64,
   /// Replies taken.
   replies: u64,
+  /// Parks a wake ended with no reply in the ring — a spurious return from the OS wait, or a previous
+  /// reply's wake that landed after its reply was taken and found this park — so the client parked
+  /// again. Every park ends in a reply, one of these, or the deadline.
+  unanswered_wakes: u64,
   /// The client's online wake estimate, its spin window: seeded with the window the daemon published
   /// and fed the wake of each park a reply ended, from the daemon's reply stamp to the client running
   /// again ([`Self::wait`]).
@@ -122,6 +126,7 @@ impl ClientEnd {
       next_reply: 0,
       parks: 0,
       replies: 0,
+      unanswered_wakes: 0,
       #[cfg(unix)]
       completion: None,
       #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -390,6 +395,11 @@ impl ClientEnd {
     (self.parks, self.replies)
   }
 
+  /// Parks a wake ended with no reply waiting, so the client parked again (see the field).
+  pub fn unanswered_wakes(&self) -> u64 {
+    self.unanswered_wakes
+  }
+
   /// The ring index the next request takes (its bulk chunk is chosen by it).
   pub fn next_request_index(&self) -> u64 {
     self.next_request
@@ -474,6 +484,10 @@ impl ClientEnd {
       if woken {
         self.unsettled = Some((waiting_ns, returned_ns));
         self.settle_wake()?;
+        if let Some(reply) = self.try_take()? {
+          return Ok(reply);
+        }
+        self.unanswered_wakes = self.unanswered_wakes.saturating_add(1);
       }
       if !woken && deadline_ns.is_some() {
         if let Some(reply) = self.try_take()? {

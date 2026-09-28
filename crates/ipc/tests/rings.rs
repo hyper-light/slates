@@ -292,6 +292,79 @@ fn a_hostile_slot_is_refused_and_the_ring_keeps_flowing() {
   assert_eq!(daemon.try_take().unwrap().unwrap().payload, b"next");
 }
 
+/// Raises the region's wake with no reply behind it — what a spurious return from the OS wait, or a
+/// previous reply's wake landing late, looks like to a parked client.
+fn wake_without_reply(region: &ClientRegion) {
+  #[cfg(not(windows))]
+  {
+    let word = region.wake_word().unwrap();
+    word.fetch_add(1, Ordering::AcqRel);
+    slates_ipc::wake::wake_one(word).unwrap();
+  }
+  #[cfg(windows)]
+  region.wake_signal().unwrap();
+}
+
+/// Waits (bounded by the reply deadline, a hang guard) until `holds` is true of the region.
+fn await_region(region: &ClientRegion, what: &str, holds: impl Fn(&ClientRegion) -> bool) {
+  let started = Instant::now();
+  while !holds(region) {
+    assert!(
+      started.elapsed() < Duration::from_nanos(REPLY_DEADLINE_NS),
+      "{what}"
+    );
+    std::thread::yield_now();
+  }
+}
+
+/// AC-2.1 (§4.7 "Wake strategy"; docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md):
+/// a wake that brings no reply sends the client back to park and is counted, and the reply that follows
+/// still ends the wait. The peer wakes the parked client with nothing in the ring, waits until the client
+/// has parked again (its reply stamp cleared over the peer's marker), then replies: exactly one unanswered
+/// wake, the reply delivered, and every park accounted for by a reply or an unanswered wake. Non-vacuous
+/// for the client tests' park assertion, which counted a spurious wake as a broken rule before.
+#[test]
+fn a_wake_without_a_reply_is_counted_and_the_client_parks_again() {
+  let (mut daemon, mut client) = pair("slates-ipc-rings-unanswered");
+  client.set_spin_ns(Some(0));
+  let server = std::thread::spawn(move || {
+    let request = loop {
+      if let Some(request) = daemon.try_take().unwrap() {
+        break request;
+      }
+      std::thread::yield_now();
+    };
+    await_region(daemon.region(), "the client did not park", |region| {
+      region.client_parked().unwrap().load(Ordering::Acquire) == 1
+    });
+    // A marker the client overwrites with zero only when it parks again, after the unanswered wake.
+    daemon
+      .region()
+      .reply_stamp()
+      .unwrap()
+      .store(1, Ordering::Release);
+    wake_without_reply(daemon.region());
+    await_region(daemon.region(), "the client did not park again", |region| {
+      region.reply_stamp().unwrap().load(Ordering::Acquire) == 0
+        && region.client_parked().unwrap().load(Ordering::Acquire) == 1
+    });
+    daemon
+      .reply(&Slot::inline(request.request, b"after").unwrap())
+      .unwrap();
+  });
+  client.send(&Slot::inline(9, b"?").unwrap()).unwrap();
+  let reply = client.wait(Some(REPLY_DEADLINE_NS)).unwrap();
+  server.join().unwrap();
+  assert_eq!(reply.request, 9);
+  assert_eq!(reply.payload, b"after");
+  assert_eq!(client.unanswered_wakes(), 1, "the empty wake was counted");
+  let (parks, replies) = client.park_ratio();
+  assert!(
+    parks <= replies + client.unanswered_wakes(),
+    "every park ended in a reply or an unanswered wake: {parks} parks, {replies} replies"
+  );
+}
+
 /// No reply within the deadline: `DeadlineExceeded`, and the client is not left parked.
 #[test]
 fn a_missing_reply_ends_at_the_deadline() {

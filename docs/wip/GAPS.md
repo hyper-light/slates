@@ -1976,3 +1976,17 @@ Open sibling, for Ada's call: the CLI's multi-process fleet test (`crates/cli/te
 `free_port_block`) releases a port block before its child daemons bind it. The race-free fix is to pass
 inherited serve sockets to `slates daemon` (the systemd `LISTEN_FDS` protocol, on top of
 `UdpSocket::adopt`), which is a new deployment surface.
+
+### 2026-09-28: the client tests use the product's deadlines; unanswered wakes are counted
+
+Closed: [the client tests judged a live daemon by a shorter clock](../bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md).
+CI run 36404234656 failed with `Stalled` at a hand-picked 200 ms reply deadline, where the product derives
+1 s. A local six-copy run also found a park-count assertion that was never a design rule (a spurious wake
+parks again).
+
+- `client.rs` and `recovery.rs` now use `Deadlines::derive`.
+- `ClientEnd` counts unanswered wakes, and a deterministic ring test proves the count.
+- Result: 0 failures in 900 six-copy runs after the fix, against 1 before.
+
+Still open: why the first `create` took more than 200 ms on that runner. There are no daemon logs of the
+run, and it did not reproduce locally. A stall at the derived deadline would be a real daemon bug.

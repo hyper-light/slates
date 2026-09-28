@@ -36,12 +36,6 @@ use common::nfs::{create, fsstat, lookup, mount, read, write};
 /// Shape: shards per test daemon: two, so the volume can live on a shard other than the control
 /// shard that accepts the NFS connection, and the cross-shard bridge route is on the recovery path.
 const TEST_SHARDS: u16 = 2;
-/// Shape: the reply deadline of the test client (nanoseconds): a fifth of a second, far past any
-/// served verb and short enough that a stopped daemon is found quickly.
-const REPLY_NS: u64 = 200_000_000;
-/// Shape: the reconnect budget of the test client (nanoseconds): five seconds, the restarted
-/// daemon's start comfortably inside it.
-const RECONNECT_NS: u64 = 5_000_000_000;
 /// Shape: how long a client retries the rendezvous while a daemon starts.
 const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the content object's slots per shard — the recovery image is a double buffer (the committed
@@ -54,11 +48,15 @@ const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta 
 const AFTER: &[u8] =
   b"the bytes the head holds after the snapshot: golf hotel india juliet kilo lima mike november\n";
 
+/// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
+/// budget), never a shorter hand-picked reply clock that calls a live daemon stalled
+/// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
 fn deadlines() -> Deadlines {
-  Deadlines {
-    reply_ns: REPLY_NS,
-    reconnect_ns: RECONNECT_NS,
-  }
+  Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get()
 }
 
 fn connect(instance: &str) -> Client {

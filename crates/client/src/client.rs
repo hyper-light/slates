@@ -574,6 +574,11 @@ impl Client {
     self.end.park_ratio()
   }
 
+  /// Parks a wake ended with no reply waiting, so the client parked again.
+  pub fn unanswered_wakes(&self) -> u64 {
+    self.end.unanswered_wakes()
+  }
+
   /// Sends `body` as the next request and returns the reply body, refusals typed.
   pub fn call(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
     // Every `ack_every` replies, the client acknowledges them first (one request), so the

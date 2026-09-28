@@ -15,6 +15,7 @@ use slates_client::{
 };
 use slates_ipc::protocol::{Refusal, RequestBody};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
+use slates_server::daemon::LIVENESS_BUDGET_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: each probe's wall budget for the tests' machine profile (milliseconds). The profile is
@@ -22,11 +23,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: the reply deadline of the test client (nanoseconds): a fifth of a second, far past
-/// any served verb and short enough that a dead daemon is found quickly.
-const REPLY_NS: u64 = 200_000_000;
-/// Shape: the reconnect budget of the test client (nanoseconds): five seconds.
-const RECONNECT_NS: u64 = 5_000_000_000;
 /// Shape: how long a client retries the rendezvous while a daemon starts.
 const START_WAIT: Duration = Duration::from_secs(5);
 
@@ -48,11 +44,13 @@ fn profile() -> MachineProfile {
     .expect("the machine profile measures")
 }
 
+/// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
+/// budget), as the CLI and `reap.rs` use them. A shorter hand-picked reply deadline (200 ms until
+/// 2026-09-28) called a daemon stalled that its own contract still counted alive: on a loaded CI runner
+/// the first `create` after a start had no reply within 200 ms
+/// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
 fn deadlines() -> Deadlines {
-  Deadlines {
-    reply_ns: REPLY_NS,
-    reconnect_ns: RECONNECT_NS,
-  }
+  Deadlines::derive(LIVENESS_BUDGET_NS, slates_db::replay::RECOVERY_BUDGET_NS).get()
 }
 
 fn connect(instance: &str) -> Client {
@@ -205,10 +203,13 @@ fn the_typed_verbs_drive_the_lifecycle_and_refusals_are_typed() {
   );
   assert_eq!(client.reconnects(), 0, "nothing made the client reconnect");
   let (parks, replies) = client.park_ratio();
+  let unanswered = client.unanswered_wakes();
   assert!(replies >= 10, "every call was a reply: {replies}");
+  // Every park ends in a reply, in a wake that brought none (a spurious return from the OS wait, or a
+  // previous reply's late wake landing on this park), or at the deadline (none here: nothing stalled).
   assert!(
-    parks <= replies,
-    "parks never exceed replies: {parks}/{replies}"
+    parks <= replies + unanswered,
+    "every park is ended by a reply or counted as an unanswered wake: {parks} parks, {replies} replies, {unanswered} unanswered"
   );
   daemon.stop();
 }
