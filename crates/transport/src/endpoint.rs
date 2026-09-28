@@ -40,6 +40,7 @@ use crate::connection::{Connection, ConnectionCensus, ConnectionShape, Priority,
 use crate::demux::{Demux, DemuxId, Slot, with_demux};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
+use crate::params::{ParamsError, TransportParameters};
 use crate::rtt::GRANULARITY_NS;
 use crate::session::{Frame, decode_frames, encode_frames};
 
@@ -152,6 +153,9 @@ pub enum EndpointError {
   Header,
   /// The frames inside a packet did not decode.
   Frames(crate::session::SessionError),
+  /// The peer's transport parameters were refused (`crate::params`): malformed, of another dialect, or
+  /// declaring a datagram limit below the path floor.
+  PeerParameters(ParamsError),
   /// The demultiplexer closed this session: its peer established a new one (a re-dial after a loss),
   /// or the peer was retired. The reader ends its loop; nothing more arrives here.
   Closed,
@@ -298,6 +302,9 @@ pub struct Endpoint {
   keys: Option<Keys>,
   /// The connection id, once derived from the completed handshake ([`Endpoint::connection_id`]).
   cid: Option<ConnectionId>,
+  /// The peer's transport parameters (`crate::params`), decoded and checked when the connection id is
+  /// bound — the first thing every post-handshake use of the session does.
+  peer_params: Option<TransportParameters>,
   /// The connection: streams, reliability, RTT, loss detection, congestion control, pacing and flow
   /// control, driven on the runtime's clock — the clock every timeout below sleeps on, so under the
   /// simulation driver a modelled path's delay is what the RTT measures
@@ -366,7 +373,8 @@ impl Endpoint {
     name: &str,
     shape: ConnectionShape,
   ) -> Result<Endpoint, EndpointError> {
-    let client = client_connection(identity, pinned, name).map_err(EndpointError::Handshake)?;
+    let client = client_connection(identity, pinned, name, &TransportParameters::local())
+      .map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
       link: Link::Own(socket),
       peer,
@@ -374,6 +382,7 @@ impl Endpoint {
       pinned: Some(pinned.clone()),
       keys: None,
       cid: None,
+      peer_params: None,
       conn: Connection::new(shape, Role::Client),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
@@ -400,7 +409,8 @@ impl Endpoint {
     allowed_clients: &[rustls::pki_types::CertificateDer<'static>],
     shape: ConnectionShape,
   ) -> Result<Endpoint, EndpointError> {
-    let server = server_connection(identity, allowed_clients).map_err(EndpointError::Handshake)?;
+    let server = server_connection(identity, allowed_clients, &TransportParameters::local())
+      .map_err(EndpointError::Handshake)?;
     Ok(Endpoint {
       link: Link::Own(socket),
       peer,
@@ -408,6 +418,7 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
+      peer_params: None,
       conn: Connection::new(shape, Role::Server),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
@@ -445,6 +456,7 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
+      peer_params: None,
       conn: Connection::new(shape, Role::Server),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
@@ -489,13 +501,23 @@ impl Endpoint {
     if self.quic.is_handshaking() {
       return Err(EndpointError::NotReady);
     }
+    // The peer's parameters are authenticated by the handshake that just completed; a peer whose are
+    // malformed, of another dialect, or below the datagram floor is refused before any 1-RTT packet.
+    let peer_params = TransportParameters::decode(self.quic.quic_transport_parameters())
+      .map_err(EndpointError::PeerParameters)?;
     let cid = self.quic.export_connection_id()?;
     if let Link::Shared { demux, slot } = &self.link {
       let peer = self.quic.peer_certificate().map(|c| c.as_ref().to_vec());
       with_demux(*demux, |d| d.bind(*slot, cid, peer)).ok_or(EndpointError::Closed)??;
     }
     self.cid = Some(cid);
+    self.peer_params = Some(peer_params);
     Ok(cid)
+  }
+
+  /// The peer's transport parameters, once the handshake completed and they were accepted.
+  pub fn peer_parameters(&self) -> Option<TransportParameters> {
+    self.peer_params
   }
 
   /// Sends one datagram to the peer over this endpoint's link.

@@ -20,6 +20,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::quic::{ClientConnection, ServerConnection, Version};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
+use crate::params::TransportParameters;
+
 /// A refusal building or driving the handshake.
 #[derive(Debug)]
 pub enum HandshakeError {
@@ -241,10 +243,6 @@ pub fn client_config(
     .map_err(HandshakeError::from)
 }
 
-/// slates's QUIC transport parameters (opaque to rustls; the codec's own params are owed). A fixed
-/// non-empty value so both ends present some.
-const TRANSPORT_PARAMS: &[u8] = b"slates-quic-v1";
-
 /// Builds the mutually-authenticated client and server QUIC connections for `name`: the `client`
 /// presents its identity and pins the `server`'s cert, and the `server` pins the `client`'s cert.
 pub fn connect(
@@ -266,8 +264,17 @@ pub fn connect_with(
   name: &str,
 ) -> Result<(ClientConnection, ServerConnection), HandshakeError> {
   Ok((
-    client_connection(client, &server.certificate(), name)?,
-    server_connection(server, std::slice::from_ref(allowed_client))?,
+    client_connection(
+      client,
+      &server.certificate(),
+      name,
+      &TransportParameters::local(),
+    )?,
+    server_connection(
+      server,
+      std::slice::from_ref(allowed_client),
+      &TransportParameters::local(),
+    )?,
   ))
 }
 
@@ -277,13 +284,14 @@ pub fn client_connection(
   client_identity: &Identity,
   pinned_server: &CertificateDer<'static>,
   name: &str,
+  params: &TransportParameters,
 ) -> Result<ClientConnection, HandshakeError> {
   let cfg = client_config(pinned_server.clone(), client_identity)?;
   let server_name =
     ServerName::try_from(name.to_owned()).map_err(|e| HandshakeError::Setup(e.to_string()))?;
   // structural: allow — D-8 exception 2: rustls's `ClientConnection::new` takes `Arc` by signature.
   let cfg = Arc::new(cfg);
-  ClientConnection::new(cfg, Version::V1, server_name, TRANSPORT_PARAMS.to_vec())
+  ClientConnection::new(cfg, Version::V1, server_name, params.encode())
     .map_err(HandshakeError::from)
 }
 
@@ -292,11 +300,11 @@ pub fn client_connection(
 pub fn server_connection(
   identity: &Identity,
   allowed_clients: &[CertificateDer<'static>],
+  params: &TransportParameters,
 ) -> Result<ServerConnection, HandshakeError> {
   let cfg = server_config(identity, allowed_clients)?;
   // structural: allow — D-8 exception 2: rustls's `ServerConnection::new` takes `Arc` by signature.
-  ServerConnection::new(Arc::new(cfg), Version::V1, TRANSPORT_PARAMS.to_vec())
-    .map_err(HandshakeError::from)
+  ServerConnection::new(Arc::new(cfg), Version::V1, params.encode()).map_err(HandshakeError::from)
 }
 
 #[cfg(test)]
@@ -378,9 +386,11 @@ mod tests {
       client_identity,
       &server_identity.certificate(),
       "slates-fleet",
+      &TransportParameters::local(),
     )
     .unwrap();
-    let mut server = server_connection(server_identity, &roster).unwrap();
+    let mut server =
+      server_connection(server_identity, &roster, &TransportParameters::local()).unwrap();
     let mut hello = Vec::new();
     client.write_hs(&mut hello);
     server.read_hs(&hello).unwrap();
@@ -493,6 +503,44 @@ mod tests {
     assert_eq!(
       client.protocol_version(),
       Some(rustls::ProtocolVersion::TLSv1_3)
+    );
+  }
+
+  /// §4.10a (RFC 9000 §7.4): the parameters a peer presents cross the authenticated handshake unchanged,
+  /// and a peer speaking another dialect is refused by the decode every endpoint runs when the handshake
+  /// completes (`Endpoint::connection_id`) — not mis-read later. A real client presents raw parameters for
+  /// dialect 2; the server receives exactly those bytes and refuses them typed, and its own parameters,
+  /// read by the client, decode as this build's.
+  #[test]
+  fn a_peer_of_another_dialect_is_refused_at_the_handshake() {
+    let identity = self_signed("slates-node");
+    let foreign: Vec<u8> = vec![0x01, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let cfg = client_config(identity.certificate(), &identity).unwrap();
+    let server_name = ServerName::try_from("slates-node".to_owned()).unwrap();
+    // structural: allow — D-8 exception 2: rustls's `ClientConnection::new` takes `Arc` by signature.
+    let mut client =
+      ClientConnection::new(Arc::new(cfg), Version::V1, server_name, foreign.clone()).unwrap();
+    let mut server = server_connection(
+      &identity,
+      std::slice::from_ref(&identity.certificate()),
+      &TransportParameters::local(),
+    )
+    .unwrap();
+    drive(&mut client, &mut server).unwrap();
+    assert_eq!(
+      server.quic_transport_parameters(),
+      Some(foreign.as_slice()),
+      "the client's parameters crossed the handshake unchanged"
+    );
+    assert_eq!(
+      TransportParameters::decode(server.quic_transport_parameters()),
+      Err(crate::params::ParamsError::Dialect { version: 2 }),
+      "another dialect is refused typed"
+    );
+    assert_eq!(
+      TransportParameters::decode(client.quic_transport_parameters()),
+      Ok(TransportParameters::local()),
+      "this build's parameters decode as declared"
     );
   }
 

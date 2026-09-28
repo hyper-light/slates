@@ -20,6 +20,7 @@ use slates_transport::connection::Priority;
 use slates_transport::demux::{Demux, DemuxCounters};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
+use slates_transport::params::TransportParameters;
 
 const NAME: &str = "slates-node";
 const STREAM_ID: u64 = 1;
@@ -152,6 +153,71 @@ fn a_stream_flows_over_a_live_session() {
     ),
     other => panic!("the live session did not deliver the stream: {other:?}"),
   }
+}
+
+/// §4.10a (RFC 9000 §7.4, §18.2 in slates's dialect; the base of path MTU discovery, RFC 8899): each end
+/// of an established session holds the transport parameters its peer declared in the authenticated
+/// handshake — the dialect accepted and the largest datagram the peer reads — and they are exactly what
+/// the peer presented. Do an exchange, expect each side's view of the other to equal the other's own.
+#[test]
+fn each_end_holds_the_parameters_its_peer_declared() {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (server_view_tx, server_view_rx) = channel();
+  let (client_view_tx, client_view_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(client_port_rx).await);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        shape(),
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      let (request, _kind, _) = server.next_request().await.unwrap();
+      server.reply(request, &[]).unwrap();
+      server.settle().await.unwrap();
+      let _ = server_view_tx.send(server.peer_parameters());
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(server_port_rx).await);
+      let mut client =
+        Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape()).unwrap();
+      client.establish().await.unwrap();
+      client
+        .request(STREAM_ID, Priority::Control, b"parameters")
+        .await
+        .unwrap();
+      let _ = client_view_tx.send(client.peer_parameters());
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let declared = Some(TransportParameters::local());
+  assert_eq!(
+    server_view_rx.try_recv(),
+    Ok(declared),
+    "the server holds what the client declared"
+  );
+  assert_eq!(
+    client_view_rx.try_recv(),
+    Ok(declared),
+    "the client holds what the server declared"
+  );
 }
 
 /// A request/reply exchange completes over a live session, the server producing its reply

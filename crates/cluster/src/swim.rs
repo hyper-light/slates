@@ -748,6 +748,9 @@ pub fn outcome_of_request_error(error: &EndpointError) -> ProbeOutcome {
     | EndpointError::Admission(_)
     | EndpointError::PacketBudget { .. }
     | EndpointError::DatagramTooLarge { .. }
+    // A peer whose transport parameters were refused (another dialect, a datagram limit below the
+    // floor) can never carry a probe on this session.
+    | EndpointError::PeerParameters(_)
     | EndpointError::Stream(StreamRefusal::SequencesExhausted) => ProbeOutcome::Broken,
     // A backlog past the peer's stream credit means the peer is not finishing this end's streams — a
     // missed probe, which the suspicion rule already weighs; the other refusals are serve-side only.

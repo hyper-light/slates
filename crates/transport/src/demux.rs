@@ -284,7 +284,11 @@ impl Demux {
   /// A fresh TLS server state presenting this demultiplexer's identity and pinning its allowed peers —
   /// one per accepted session.
   pub(crate) fn server_connection(&self) -> Result<rustls::quic::ServerConnection, HandshakeError> {
-    server_connection(self.identity, &self.allowed)
+    server_connection(
+      self.identity,
+      &self.allowed,
+      &crate::params::TransportParameters::local(),
+    )
   }
 
   /// The connection shape every session on this socket is built with.

@@ -396,3 +396,30 @@ Each scenario measures:
     `congestion_bench`, and `scheduler_bakeoff` became `class_latency_bench`; each exits non-zero on a
     stall, starvation or unfairness. Record: `docs/wip/BENCHMARKS.md` "Session-plane congestion control
     and scheduling bake-offs", with the deciding rounds' raw rows under `docs/wip/research/data/`.
+- **Slice 3a (2026-09-28): transport parameters — the base of path MTU discovery.**
+  - **Why first.** RFC 8899 as applied to QUIC (RFC 9000 §14.3) needs a sender to know the largest
+    datagram its peer reads (`max_udp_payload_size`, RFC 9000 §18.2). Until now the handshake carried a
+    fixed tag (`b"slates-quic-v1"`), and the code noted the codec was owed.
+  - **What.** `crates/transport/src/params.rs` encodes a type-length-value list in slates's fixed-layout
+    little-endian dialect (D-15), carried by `rustls::quic` in the authenticated handshake. It holds a
+    required dialect version and the largest UDP payload the end reads. Unknown identifiers are skipped
+    (RFC 9000 §7.4.2); a repeated one, a wrong length, a truncation, another dialect, or a limit below
+    1,200 bytes is refused typed.
+  - **Endpoint.** Every endpoint decodes its peer's parameters where it binds the connection id, the
+    first thing any post-handshake use does, and refuses a bad peer with `EndpointError::PeerParameters`.
+    SWIM judges that `Broken`.
+  - **What each end declares.** Today it declares what it actually reads, its 2,048-byte receive buffer.
+    Deriving that from the host is the next slice.
+  - **Tests.**
+    - A golden vector.
+    - Hostile-input tests: missing, truncated, `u16::MAX` length, repeated, wrong length, no dialect,
+      foreign dialect, below the floor, plus every prefix and every bit flip.
+    - The handshake-level refusal of a dialect-2 peer, whose bytes cross unchanged.
+    - A live session in which each end holds exactly what its peer declared.
+  - **Next slices.**
+    - Receive buffers and the declared limit derived from the host, and don't-fragment on real sockets
+      (`rt` netsys, paired per platform).
+    - The RFC 8899 search, black-hole detection and raise timer in the connection, driven over the
+      simulated fabric's path MTU and black hole.
+    - The controller, packet budget and fleet frame cap following the discovered size, with a goodput
+      benchmark.

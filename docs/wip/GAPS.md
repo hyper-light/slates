@@ -2023,3 +2023,17 @@ Closed: [formation dropped a dial to the peer it was reaching](../bugs/2026-09-2
   longer drops the handshake in flight.
 - A real restart still drops the dial and counts it.
 - Boot nonces are never zero.
+
+### 2026-09-28: path MTU discovery, slice 3a — transport parameters
+
+Built: the session plane's transport parameters (`crates/transport/src/params.rs`).
+- A required dialect version and the largest UDP payload an end reads, carried in the authenticated
+  handshake.
+- Decoded and checked by every endpoint when the handshake completes; a bad peer is refused typed.
+- Record: the research note's build ledger, slice 3a.
+
+Still owed for path MTU discovery (RFC 8899):
+- the declared limit and receive buffers derived from the host;
+- don't-fragment on real sockets;
+- the probe search, black-hole detection and raise timer;
+- the controller and frame cap following the discovered size, with its benchmark.
