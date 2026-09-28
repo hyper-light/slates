@@ -1265,6 +1265,25 @@ impl RaftNode {
       .filter(|transfer| self.role == Role::Leader && transfer.term == self.current_term)
   }
 
+  /// The other voter whose log is furthest along by this leader's replication progress (`match_index`), ties
+  /// to the lowest id — the target a leader handing off should pick, since it needs the least catching up
+  /// before the invitation can go (thesis §3.10). `None` when this node does not lead or votes alone.
+  pub fn most_caught_up_voter(&self) -> Option<HostId> {
+    if self.role != Role::Leader {
+      return None;
+    }
+    self
+      .all_voters()
+      .into_iter()
+      .filter(|voter| *voter != self.id)
+      .max_by(|left, right| {
+        self
+          .match_of(*left)
+          .cmp(&self.match_of(*right))
+          .then(right.cmp(left))
+      })
+  }
+
   /// The target of the leadership transfer in flight, if one is.
   pub fn transferring_to(&self) -> Option<HostId> {
     self.active_transfer().map(|transfer| transfer.target)
@@ -2251,6 +2270,29 @@ mod tests {
       a.transfer_leadership(C),
       Err(TransferRefusal::InFlight { target: B })
     );
+  }
+
+  /// Thesis §3.10, the drain's target: the most caught-up other voter by the leader's replication progress,
+  /// ties to the lowest id; no target for a non-leader or a lone voter.
+  #[test]
+  fn the_most_caught_up_voter_is_the_drain_target() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    assert!(leader.append_command(b"one".to_vec()));
+    assert!(leader.append_command(b"two".to_vec()));
+    assert_eq!(leader.most_caught_up_voter(), Some(B), "a tie goes to the lowest id");
+    let term = leader.term();
+    for (follower, match_index) in [(B, 1), (C, 2)] {
+      leader.on_append_reply(AppendReply {
+        read_context: 0,
+        follower,
+        term,
+        success: true,
+        match_index,
+      });
+    }
+    assert_eq!(leader.most_caught_up_voter(), Some(C), "the furthest along wins");
+    assert_eq!(RaftNode::new(B, vec![A, B, C]).most_caught_up_voter(), None);
+    assert_eq!(elected_leader(A, vec![A]).most_caught_up_voter(), None);
   }
 
   /// Thesis §3.10: an invitation from another term is ignored — a delayed `TimeoutNow` cannot start an

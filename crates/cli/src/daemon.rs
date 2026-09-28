@@ -145,8 +145,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
     }
   );
   loop {
-    if signal::stop_requested() {
-      eprintln!("slates daemon: stop requested");
+    if signal::stop_requested() || daemon.stop_requested() {
+      // A planned stop: hand off any consensus leadership first, so the groups pay a handoff rather than the
+      // election timeout a leader loss waits out (bounded; the anchor holds the daemon to its declaration).
+      match daemon.drain_leadership() {
+        Ok(report) => eprintln!("slates daemon: stop requested; drained: {report:?}"),
+        Err(refusal) => eprintln!("slates daemon: stop requested; drain refused: {refusal}"),
+      }
       break;
     }
     if !parent.anchor_alive() {

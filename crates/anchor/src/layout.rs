@@ -57,6 +57,20 @@ pub const SUP_RESTARTS: usize = 24;
 pub const SUP_STATE: usize = 32;
 /// Format: when the current daemon was started, in the same host domain as its heartbeat.
 pub const SUP_STARTED: usize = 40;
+/// The anchor's **stop request** — when the owner asked the daemon to stop gracefully (§2.6, the consensus
+/// drain of `docs/wip/research/consensus-enhancements.md` §3.2), in the host domain of the heartbeat; zero
+/// while no stop is requested. The daemon reads it each loop tick, hands off any consensus leadership it
+/// holds, and exits. Zero in a block an older anchor wrote, so a newer daemon under it sees no request and
+/// behaves as before.
+/// Format: the seventh supervision word's offset.
+pub const SUP_STOP: usize = 48;
+/// The daemon's **declared stop deadline** — when, in the heartbeat's host domain, the daemon promises to
+/// have exited after seeing a stop request (its drain bound, derived from its election timing); zero until
+/// it acknowledges. The anchor kills a daemon that runs past it, as it kills one whose heartbeat lapses. Zero
+/// in a block an older daemon wrote, so a newer anchor over it kills it once the liveness budget passes
+/// unacknowledged — the old behaviour, delayed by that budget.
+/// Format: the eighth supervision word's offset.
+pub const SUP_STOP_BY: usize = 56;
 /// Format: the daemon's **grant-issuer secret** (§4.13 "only an authenticated human confirmation surface
 /// holds grant-issuer authority"): [`ISSUER_SECRET_BYTES`] of random the daemon mints at every start and
 /// writes here, after the supervision words. The segment is mapped only by the supervising anchor, the
@@ -65,8 +79,8 @@ pub const SUP_STARTED: usize = 40;
 /// or an SDK never maps this page, and a workload that merely *invokes* the CLI binary presents no proof
 /// unless it also holds the anchor. A grant request proves possession by a keyed hash over the exact
 /// landing it approves; the daemon recomputes it (`slates_server::landing::grant_proof`).
-/// Format: the byte offset inside the supervision block — the first cache-line boundary past the six
-/// supervision words (48 bytes), so the secret shares no line with the heartbeat the daemon beats.
+/// Format: the byte offset inside the supervision block — the first cache-line boundary past the eight
+/// supervision words (64 bytes), so the secret shares no line with the heartbeat the daemon beats.
 pub const SUP_ISSUER: usize = 64;
 /// Format: the issuer secret's width — 32 bytes, a 256-bit random value, the width of the BLAKE3 key
 /// that proves it (BLAKE3 §2.3: a 256-bit key).

@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, Supervisor};
+use slates_anchor::{AnchorSegment, RegionKind, RestartPolicy, Stopping, Supervisor};
 use slates_db::replay::RECOVERY_BUDGET_NS;
 use slates_machine::MachineProfile;
 use slates_server::DaemonConfig;
@@ -193,6 +193,31 @@ fn announce_issuer_surface(supervisor: &Supervisor) {
 #[cfg(target_os = "linux")]
 fn announce_issuer_surface(_supervisor: &Supervisor) {}
 
+/// Stops the daemon through the graceful protocol (`slates_anchor::layout::SUP_STOP`): asks it to stop, then
+/// steps the stop each heartbeat until it exits — on its own after handing off any consensus leadership it
+/// held, or killed when it does not acknowledge within the liveness budget, lets its heartbeat lapse, or
+/// outruns the deadline it declared ([`Supervisor::stop_step`]). Bounded by those three.
+fn stop_gracefully(supervisor: &mut Supervisor, clock: &mut HostClock) -> Result<(), Failure> {
+  supervisor
+    .request_stop(clock.monotonic_ns())
+    .map_err(|e| failed("stop", e))?;
+  loop {
+    match supervisor
+      .stop_step(clock.monotonic_ns(), LIVENESS_BUDGET_NS)
+      .map_err(|e| failed("stop", e))?
+    {
+      Stopping::Draining => std::thread::park_timeout(Duration::from_nanos(HEARTBEAT_NS)),
+      Stopping::Exited { exit_code, killed } => {
+        eprintln!(
+          "slates anchor: stopped (daemon exit {exit_code:?}{})",
+          if killed { ", killed" } else { "" }
+        );
+        return Ok(());
+      }
+    }
+  }
+}
+
 /// The observation loop.
 fn observe(
   supervisor: &mut Supervisor,
@@ -203,8 +228,7 @@ fn observe(
   let mut longest_start_ns = 0u64;
   loop {
     if signal::stop_requested() {
-      supervisor.stop().map_err(|e| failed("stop", e))?;
-      eprintln!("slates anchor: stopped");
+      stop_gracefully(supervisor, clock)?;
       return Ok(());
     }
     let now = clock.monotonic_ns();

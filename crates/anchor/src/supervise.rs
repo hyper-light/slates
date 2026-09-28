@@ -88,6 +88,22 @@ pub enum Step {
   Stopped,
 }
 
+/// What one step of a graceful stop found ([`Supervisor::stop_step`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stopping {
+  /// The daemon is still stopping: it acknowledged the request and is inside its declared deadline, or the
+  /// liveness budget has not yet passed without an acknowledgement.
+  Draining,
+  /// The daemon has exited and the stop is recorded (nothing restarts it).
+  Exited {
+    /// The exit code, when the OS reports one (a signal death has none).
+    exit_code: Option<i32>,
+    /// Whether the anchor had to kill it: no acknowledgement within the liveness budget, a heartbeat that
+    /// lapsed, or a declared deadline overrun by the budget.
+    killed: bool,
+  },
+}
+
 /// The supervisor.
 pub struct Supervisor {
   segment: AnchorSegment,
@@ -273,7 +289,81 @@ impl Supervisor {
     Ok(())
   }
 
-  /// Stops the daemon (the owner asked): kills it and records the stop.
+  /// Asks the daemon to stop **gracefully** (`layout::SUP_STOP`): the daemon hands off any consensus
+  /// leadership it holds, declares the deadline it will have exited by (`layout::SUP_STOP_BY`), and exits.
+  /// Returns at once; the owner then drives [`stop_step`](Supervisor::stop_step) each tick until it reports
+  /// the exit. A supervisor with no daemon has nothing to ask.
+  pub fn request_stop(&mut self, now_ns: u64) -> Result<(), AnchorError> {
+    if self.child.is_some() {
+      self.segment.supervision()?.request_stop(now_ns);
+    }
+    Ok(())
+  }
+
+  /// One step of a graceful stop, never blocking. `Exited` once the daemon has exited — the stop is recorded,
+  /// so no later step restarts it. Otherwise the anchor **kills** the daemon, and reports it killed, when it
+  /// has not acknowledged the request within `liveness_budget_ns`, when its heartbeat is older than that
+  /// budget (a wedged daemon), or when it has run past its own declared deadline by that budget; while none
+  /// of these holds it is `Draining`. Every bound is one the daemon declared or the liveness budget the
+  /// anchor already holds it to — none is new.
+  pub fn stop_step(
+    &mut self,
+    now_ns: u64,
+    liveness_budget_ns: u64,
+  ) -> Result<Stopping, AnchorError> {
+    let Some(child) = self.child.as_mut() else {
+      self.segment.supervision()?.record_exit(false);
+      return Ok(Stopping::Exited {
+        exit_code: None,
+        killed: false,
+      });
+    };
+    match child.try_wait() {
+      Ok(Some(status)) => {
+        self.child = None;
+        self.segment.supervision()?.record_exit(false);
+        return Ok(Stopping::Exited {
+          exit_code: status.code(),
+          killed: false,
+        });
+      }
+      Ok(None) => {}
+      Err(e) => {
+        return Err(AnchorError::Spawn {
+          code: e.raw_os_error(),
+        });
+      }
+    }
+    let give_up = {
+      let supervision = self.segment.supervision()?;
+      let requested = supervision.stop_requested_at().unwrap_or(now_ns);
+      let (alive, _) = supervision.alive(now_ns, liveness_budget_ns);
+      let overdue = match supervision.stop_by() {
+        None => now_ns.saturating_sub(requested) > liveness_budget_ns,
+        Some(deadline) => now_ns > deadline.saturating_add(liveness_budget_ns),
+      };
+      !alive || overdue
+    };
+    if !give_up {
+      return Ok(Stopping::Draining);
+    }
+    let exit_code = match self.child.take() {
+      Some(mut child) => {
+        let _ = child.kill();
+        child.wait().ok().and_then(|status| status.code())
+      }
+      None => None,
+    };
+    self.segment.supervision()?.record_exit(false);
+    Ok(Stopping::Exited {
+      exit_code,
+      killed: true,
+    })
+  }
+
+  /// Stops the daemon at once (the owner asked, or a caller wants a crash-like stop): kills it and records
+  /// the stop. The graceful path is [`request_stop`](Supervisor::request_stop) then
+  /// [`stop_step`](Supervisor::stop_step).
   pub fn stop(&mut self) -> Result<(), AnchorError> {
     if let Some(mut child) = self.child.take() {
       let _ = child.kill();

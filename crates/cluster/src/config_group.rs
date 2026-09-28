@@ -560,9 +560,21 @@ impl RegionalCouncil {
       .map(|(target, invitation)| (target, RaftMessage::TimeoutNow(invitation)))
   }
 
+  /// The leader this node knows for its current term — itself while it leads, else the leader whose append
+  /// it last accepted (a hint, never consulted for safety); `None` while none is known.
+  pub fn leader(&self) -> Option<HostId> {
+    self.raft.leader()
+  }
+
   /// The target of the leadership transfer in flight, if one is.
   pub fn transferring_to(&self) -> Option<HostId> {
     self.raft.transferring_to()
+  }
+
+  /// The voter a leader handing off should pick: the most caught-up other voter (thesis §3.10), or `None`
+  /// when this node does not lead or votes alone.
+  pub fn most_caught_up_voter(&self) -> Option<HostId> {
+    self.raft.most_caught_up_voter()
   }
 
   /// **SERVE**: answers a request received over the transport — a pre-vote, a vote request, or an append —

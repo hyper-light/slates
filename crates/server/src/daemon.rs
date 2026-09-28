@@ -123,6 +123,37 @@ impl std::fmt::Debug for Daemon {
   }
 }
 
+/// What a leadership drain ([`Daemon::drain_leadership`]) did for one consensus group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeadershipHandoff {
+  /// This daemon did not lead the group; nothing to hand off.
+  NotLeading,
+  /// Leadership moved: this daemon no longer leads, having invited `to`.
+  HandedOff {
+    /// The voter invited to take over.
+    to: slates_db::HostId,
+  },
+  /// This daemon still leads at the drain's deadline (the transfer was aborted or never completed).
+  StillLeading,
+  /// This daemon stepped down but saw no successor take office by the deadline (the group is mid-election).
+  SteppedDown,
+  /// This daemon leads a group with no other voter (the laptop's degenerate): there is nobody to hand to.
+  NoTarget,
+  /// The core refused the transfer (typed).
+  Refused(slates_cluster::raft::TransferRefusal),
+}
+
+/// What [`Daemon::drain_leadership`] did: each group's handoff and how long the drain waited.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrainReport {
+  /// The regional council.
+  pub council: LeadershipHandoff,
+  /// The root group.
+  pub root: LeadershipHandoff,
+  /// From the drain's start to the moment it returned.
+  pub took: std::time::Duration,
+}
+
 /// One shard's publication counters (`Daemon::db_publication_counters`; AUD-06): how its database has
 /// fared making transactions durable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1101,6 +1132,82 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       s.council.transfer_leadership(target)
     })
+  }
+
+  /// Whether this daemon's anchor has asked it to stop gracefully (the supervision block's stop request,
+  /// `slates_anchor::layout::SUP_STOP`). The daemon's loop reads it each tick, drains
+  /// ([`Self::drain_leadership`]) and stops.
+  pub fn stop_requested(&self) -> bool {
+    self
+      .segment
+      .supervision()
+      .ok()
+      .and_then(|supervision| supervision.stop_requested_at())
+      .is_some()
+  }
+
+  /// Hands off every consensus leadership this daemon holds before it stops (thesis §3.10;
+  /// `docs/wip/research/consensus-enhancements.md` §3.2), so a planned stop costs the group a handoff rather
+  /// than the election timeout a leader loss waits out. For each group it leads it invites the most
+  /// caught-up other voter, then waits — polling each heartbeat — until each successor is in office, or until
+  /// the bound: the core aborts a transfer at its second CheckQuorum tick, at most two CheckQuorum intervals
+  /// (`base_periods` each) of the slower group, so the drain waits no longer than that and one period more. The bound is declared to the anchor
+  /// first (`SUP_STOP_BY`), which kills a daemon that outruns it. A daemon that leads nothing returns at
+  /// once.
+  pub fn drain_leadership(&self) -> Result<DrainReport, ObserveError> {
+    let control = self.shards.first().copied();
+    let started = std::time::Instant::now();
+    let (council_timing, root_timing) =
+      self.observe(control, |s| (s.council_timing, s.root_timing))?;
+    // Derived: the core aborts a transfer at its second CheckQuorum tick, and a leader ticks CheckQuorum
+    // every `base_periods` (`ElectionTimer::leader_period`), so two base intervals of the slower group bound
+    // the handoff, and one period more covers the successor's first append reaching this daemon. (Counting
+    // the jitter span too would have declared about 32 s on the 350 ms-one-way KIND profile — past an
+    // orchestrator's default 30 s grace — for a bound of about 16 s.)
+    let base_periods = u64::from(council_timing.base_periods.max(root_timing.base_periods));
+    let bound_ns = HEARTBEAT_NS.saturating_mul(base_periods.saturating_mul(2).saturating_add(1));
+    if let Ok(supervision) = self.segment.supervision() {
+      let now = slates_vfs::clock::Clock::monotonic_ns(&mut HostClock::new());
+      supervision.declare_stop_by(now.saturating_add(bound_ns));
+    }
+    let (council, root) = self.observe(control, |s| {
+      (
+        start_handoff(
+          s.council.is_leader(),
+          s.council.most_caught_up_voter(),
+          |target| s.council.transfer_leadership(target),
+        ),
+        start_handoff(
+          s.root.is_leader(),
+          s.root.most_caught_up_voter(),
+          |target| s.root.transfer_leadership(target),
+        ),
+      )
+    })?;
+    let bound = std::time::Duration::from_nanos(bound_ns);
+    // Done when each started handoff's successor is in office: this daemon no longer leads **and** knows
+    // another leader (it learns one from the successor's first append). Stepping down alone is not enough —
+    // it happens on the target's vote request, before the target has won.
+    loop {
+      let (council_office, root_office) = self.observe(control, |s| {
+        (
+          Office::of(s.council.is_leader(), s.council.leader()),
+          Office::of(s.root.is_leader(), s.root.leader()),
+        )
+      })?;
+      let council_done = !matches!(council, LeadershipHandoff::HandedOff { .. })
+        || council_office == Office::Succeeded;
+      let root_done =
+        !matches!(root, LeadershipHandoff::HandedOff { .. }) || root_office == Office::Succeeded;
+      if (council_done && root_done) || started.elapsed() >= bound {
+        return Ok(DrainReport {
+          council: settle_handoff(council, council_office),
+          root: settle_handoff(root, root_office),
+          took: started.elapsed(),
+        });
+      }
+      std::thread::park_timeout(std::time::Duration::from_nanos(HEARTBEAT_NS));
+    }
   }
 
   /// Hands this daemon's **root group** leadership to the root voter `target` (thesis §3.10) — the
@@ -2640,6 +2747,57 @@ fn activate(shard: ShardId) {
 }
 
 /// The heartbeat: the anchor's `daemon.alive` input, beaten at a cadence inside its budget.
+/// Starts one group's handoff for a drain: nothing when this daemon does not lead it; a transfer to `target`
+/// (the most caught-up other voter) when there is one, reported `HandedOff` pending the wait; `NoTarget`
+/// for a lone voter; the core's typed refusal otherwise.
+fn start_handoff(
+  leads: bool,
+  target: Option<slates_db::HostId>,
+  transfer: impl FnOnce(slates_db::HostId) -> Result<(), slates_cluster::raft::TransferRefusal>,
+) -> LeadershipHandoff {
+  if !leads {
+    return LeadershipHandoff::NotLeading;
+  }
+  let Some(target) = target else {
+    return LeadershipHandoff::NoTarget;
+  };
+  match transfer(target) {
+    Ok(()) => LeadershipHandoff::HandedOff { to: target },
+    Err(refusal) => LeadershipHandoff::Refused(refusal),
+  }
+}
+
+/// Where a draining daemon stands in one group's leadership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Office {
+  /// It still leads.
+  Leading,
+  /// It stepped down and knows no leader yet (the successor has not won, or not yet sent its first append).
+  Vacant,
+  /// It stepped down and knows another leader: the successor is in office.
+  Succeeded,
+}
+
+impl Office {
+  fn of(leads: bool, known_leader: Option<slates_db::HostId>) -> Office {
+    match (leads, known_leader) {
+      (true, _) => Office::Leading,
+      (false, Some(_)) => Office::Succeeded,
+      (false, None) => Office::Vacant,
+    }
+  }
+}
+
+/// A started handoff's outcome at the drain's end: still leading, stepped down with no successor seen, or
+/// handed off.
+fn settle_handoff(started: LeadershipHandoff, office: Office) -> LeadershipHandoff {
+  match (started, office) {
+    (LeadershipHandoff::HandedOff { .. }, Office::Leading) => LeadershipHandoff::StillLeading,
+    (LeadershipHandoff::HandedOff { .. }, Office::Vacant) => LeadershipHandoff::SteppedDown,
+    (other, _) => other,
+  }
+}
+
 async fn heartbeat_loop(segment: AnchorSegment) {
   let mut clock = HostClock::new();
   loop {

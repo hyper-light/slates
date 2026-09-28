@@ -658,3 +658,17 @@ floor of ten periods (1 s; no WAN path measured). **Commands (the contract):**
 The loss path waits out the election timeout (1 s here, ten times the measured broadcast tail on a WAN) before
 any follower campaigns, then runs a pre-vote and a vote round; the handoff runs one catch-up, one invitation
 and one vote round. On a WAN both grow with the round trip, the loss path by ten tails before it starts.
+
+### The graceful drain (2026-09-28)
+
+**Commands:** `cargo test -p slates-server --test fleet a_draining_council_leader -- --nocapture` (in-process)
+and `SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli a_terminated_council_leader -- --nocapture`
+(three real `slates daemon --fleet` processes; `SIGTERM` to the council leader).
+
+| | runs |
+|---|---|
+| in-process drain, start to successor in office | 0.304 / 0.310 / 0.306 / 0.305 / 0.309 s |
+| real processes, `SIGTERM` to a survivor leading | 0.111 / 0.127 / 0.106 / 0.125 s (exit 0 each) |
+
+Before the drain the anchor killed the daemon at once, so the survivors waited out the 1 s election timeout
+before campaigning (the leader-loss elections above: median 1.316 s).

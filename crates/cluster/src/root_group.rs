@@ -446,6 +446,12 @@ impl RootGroup {
     self.raft.transferring_to()
   }
 
+  /// The voter a leader handing off should pick: the most caught-up other voter (thesis §3.10), or `None`
+  /// when this node does not lead or votes alone.
+  pub fn most_caught_up_voter(&self) -> Option<HostId> {
+    self.raft.most_caught_up_voter()
+  }
+
   /// **SERVE**: answers a request received over the transport — a pre-vote, a vote request, or an append —
   /// returning the reply to ship back and applying whatever newly committed to the root configuration (a
   /// follower applies on the append). A reply is not a request and is not answered here — its sender folds it

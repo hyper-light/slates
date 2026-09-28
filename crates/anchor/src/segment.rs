@@ -11,7 +11,7 @@ use crate::layout::{
   Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
   PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
   RING_TAIL, RegionKind, RegionSpec, SUP_GENERATION, SUP_HEARTBEAT, SUP_ISSUER, SUP_PID,
-  SUP_RESTARTS, SUP_STARTED, SUP_STATE, State,
+  SUP_RESTARTS, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
 
 /// Format: the words at the head of a ring region: head, tail, capacity, sequence base.
@@ -59,6 +59,8 @@ pub struct Supervision<'a> {
   restarts: &'a AtomicU64,
   state: &'a AtomicU64,
   started: &'a AtomicU64,
+  stop: &'a AtomicU64,
+  stop_by: &'a AtomicU64,
 }
 
 impl Supervision<'_> {
@@ -97,8 +99,32 @@ impl Supervision<'_> {
     self.started.load(Ordering::Acquire)
   }
 
-  /// The anchor records a start.
+  /// The anchor asks the daemon to stop gracefully (`layout::SUP_STOP`): `now_ns` in the heartbeat's host
+  /// domain, never zero (a zero reading is taken as one nanosecond), so the request always reads as made.
+  pub fn request_stop(&self, now_ns: u64) {
+    self.stop.store(now_ns.max(1), Ordering::Release);
+  }
+
+  /// When the anchor asked the daemon to stop, if it has since this daemon's start.
+  pub fn stop_requested_at(&self) -> Option<u64> {
+    Some(self.stop.load(Ordering::Acquire)).filter(|at| *at != 0)
+  }
+
+  /// The daemon acknowledges a stop request with the deadline it will have exited by
+  /// (`layout::SUP_STOP_BY`), in the heartbeat's host domain; never zero.
+  pub fn declare_stop_by(&self, deadline_ns: u64) {
+    self.stop_by.store(deadline_ns.max(1), Ordering::Release);
+  }
+
+  /// The deadline the daemon declared for its stop, once it has acknowledged one.
+  pub fn stop_by(&self) -> Option<u64> {
+    Some(self.stop_by.load(Ordering::Acquire)).filter(|at| *at != 0)
+  }
+
+  /// The anchor records a start. A new daemon starts with no stop requested or declared.
   pub fn record_start(&self, pid: u64, now_ns: u64, restart: bool) {
+    self.stop.store(0, Ordering::Release);
+    self.stop_by.store(0, Ordering::Release);
     self.pid.store(pid, Ordering::Release);
     self.started.store(now_ns, Ordering::Release);
     self.heartbeat.store(0, Ordering::Release);
@@ -390,6 +416,8 @@ impl AnchorSegment {
       restarts: self.word_at(spec, SUP_RESTARTS)?,
       state: self.word_at(spec, SUP_STATE)?,
       started: self.word_at(spec, SUP_STARTED)?,
+      stop: self.word_at(spec, SUP_STOP)?,
+      stop_by: self.word_at(spec, SUP_STOP_BY)?,
     })
   }
 

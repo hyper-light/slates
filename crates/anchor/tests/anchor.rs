@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use slates_anchor::layout::State;
 use slates_anchor::{
-  AnchorError, AnchorSegment, Geometry, RegionKind, RestartPolicy, Step, Supervisor,
+  AnchorError, AnchorSegment, Geometry, RegionKind, RestartPolicy, Step, Stopping, Supervisor,
 };
 use slates_machine::facts::Identity;
 use slates_mem::Handoff;
@@ -560,4 +560,191 @@ fn a_segment_with_process_relative_deadlines_is_refused_before_recovery() {
     ),
     "an old clock domain is incompatible: {result:?}"
   );
+}
+
+/// Shape: how long the graceful stopping child keeps beating after it acknowledges a stop before it exits —
+/// its "drain", long enough that an anchor which did not wait for it would be seen not to.
+const DRAIN_MS: u64 = 100;
+/// Shape: the liveness budget the stop tests hold the child to — far above the child's beat interval
+/// ([`POLL_US`]) and a loaded host's scheduling pauses, far below [`CHILD_WAIT_MS`].
+const STOP_LIVENESS_MS: u64 = 300;
+/// Shape: the deadline the wedged child declares — ten liveness budgets out, so a kill well before it proves
+/// the lapsed heartbeat, not the deadline, ended the stop.
+const WEDGED_DEADLINE_MS: u64 = 3_000;
+
+/// How a stopping child answers the anchor's stop request.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopRole {
+  /// Acknowledges with a deadline, keeps beating through a drain of [`DRAIN_MS`], and exits 0.
+  Graceful,
+  /// Keeps beating and never acknowledges (an older daemon, or a loop that stopped polling the request).
+  Deaf,
+  /// Acknowledges a distant deadline, then stops beating (a daemon wedged mid-drain).
+  Wedged,
+}
+
+/// A stopping child: attaches the segment, beats in the host clock domain, and answers the stop request as
+/// `role` says. It never outlives [`CHILD_WAIT_MS`]. Without the handoff in its environment (a plain
+/// `--ignored` run in process) it returns at once.
+fn stopping_child(role: StopRole) {
+  use slates_vfs::clock::{Clock, HostClock};
+  let Ok(segment) = AnchorSegment::attach_from_env(&identity()) else {
+    return;
+  };
+  let mut clock = HostClock::new();
+  let started = Instant::now();
+  let mut acknowledged: Option<Instant> = None;
+  while started.elapsed() < Duration::from_millis(CHILD_WAIT_MS) {
+    let now = clock.monotonic_ns();
+    let supervision = segment.supervision().unwrap();
+    if !(role == StopRole::Wedged && acknowledged.is_some()) {
+      supervision.beat(now);
+    }
+    if acknowledged.is_none() && supervision.stop_requested_at().is_some() {
+      match role {
+        StopRole::Graceful => {
+          supervision.declare_stop_by(now + DRAIN_MS * 1_000_000);
+          acknowledged = Some(Instant::now());
+        }
+        StopRole::Wedged => {
+          supervision.declare_stop_by(now + WEDGED_DEADLINE_MS * 1_000_000);
+          acknowledged = Some(Instant::now());
+        }
+        StopRole::Deaf => {}
+      }
+    }
+    if role == StopRole::Graceful
+      && acknowledged.is_some_and(|at| at.elapsed() >= Duration::from_millis(DRAIN_MS))
+    {
+      std::process::exit(0);
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_micros(POLL_US));
+  }
+  std::process::exit(EXIT);
+}
+
+/// The graceful stopping child (run by its test with `--ignored --exact`).
+#[test]
+#[ignore = "a stopping child; run by a_graceful_stop_... with --ignored"]
+fn graceful_stopping_child() {
+  stopping_child(StopRole::Graceful);
+}
+
+/// The deaf stopping child (run by its test with `--ignored --exact`).
+#[test]
+#[ignore = "a stopping child; run by a_daemon_that_never_acknowledges_... with --ignored"]
+fn deaf_stopping_child() {
+  stopping_child(StopRole::Deaf);
+}
+
+/// The wedged stopping child (run by its test with `--ignored --exact`).
+#[test]
+#[ignore = "a stopping child; run by a_daemon_whose_heartbeat_lapses_... with --ignored"]
+fn wedged_stopping_child() {
+  stopping_child(StopRole::Wedged);
+}
+
+/// Starts `child` under a supervisor, waits for its first heartbeat, asks it to stop gracefully, and steps
+/// the stop until it ends: what it ended as, how long after the request, and the supervision state after.
+/// `tag` names the test's segment apart from the others running beside it in this process (short: a macOS
+/// shared-memory name holds 31 bytes).
+fn stop_through_the_protocol(child: &str, tag: &str) -> (Stopping, Duration, State) {
+  use slates_vfs::clock::{Clock, HostClock};
+  let segment = AnchorSegment::create(&unique_name(tag), &identity(), geometry()).unwrap();
+  let exe = std::env::current_exe()
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    child.to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let budget_ns = CHILD_WAIT_MS * 1_000_000;
+  let mut supervisor = Supervisor::new(
+    segment,
+    &exe,
+    &args,
+    RestartPolicy::derive(budget_ns, budget_ns).get(),
+  );
+  let mut clock = HostClock::new();
+  supervisor.start(clock.monotonic_ns()).unwrap();
+  let wait = Instant::now();
+  while supervisor.segment().supervision().unwrap().heartbeat_ns() == 0
+    && wait.elapsed() < Duration::from_millis(CHILD_WAIT_MS)
+  {
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_micros(POLL_US));
+  }
+  let asked = Instant::now();
+  supervisor.request_stop(clock.monotonic_ns()).unwrap();
+  while asked.elapsed() < Duration::from_millis(CHILD_WAIT_MS) {
+    match supervisor
+      .stop_step(clock.monotonic_ns(), STOP_LIVENESS_MS * 1_000_000)
+      .unwrap()
+    {
+      Stopping::Draining => {
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      exited => {
+        let state = supervisor.segment().supervision().unwrap().state();
+        return (exited, asked.elapsed(), state);
+      }
+    }
+  }
+  panic!("the stop of {child} never ended");
+}
+
+/// §2.5 / the consensus drain (`docs/wip/research/consensus-enhancements.md` §3.2): a graceful stop waits for
+/// a daemon that acknowledges and drains — it exits on its own, with its own code, and is not killed — and
+/// the segment records the stop.
+#[test]
+fn a_graceful_stop_waits_for_the_daemon_to_drain_and_exit_without_a_kill() {
+  let (outcome, took, state) = stop_through_the_protocol("graceful_stopping_child", "sa-stop-g");
+  assert_eq!(
+    outcome,
+    Stopping::Exited {
+      exit_code: Some(0),
+      killed: false
+    }
+  );
+  assert!(
+    took >= Duration::from_millis(DRAIN_MS),
+    "the anchor waited out the drain ({took:?})"
+  );
+  assert_eq!(state, State::Stopped);
+}
+
+/// A daemon that never acknowledges the stop request (an older daemon, a loop no longer polling) is killed
+/// once the liveness budget has passed since the request — never before it.
+#[test]
+fn a_daemon_that_never_acknowledges_a_stop_is_killed_after_the_liveness_budget() {
+  let (outcome, took, state) = stop_through_the_protocol("deaf_stopping_child", "sa-stop-d");
+  assert!(
+    matches!(outcome, Stopping::Exited { killed: true, .. }),
+    "{outcome:?}"
+  );
+  assert!(
+    took >= Duration::from_millis(STOP_LIVENESS_MS),
+    "not killed before the budget ({took:?})"
+  );
+  assert_eq!(state, State::Stopped);
+}
+
+/// A daemon whose heartbeat lapses mid-drain is killed at the lapse, long before the deadline it declared.
+#[test]
+fn a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_deadline() {
+  let (outcome, took, state) = stop_through_the_protocol("wedged_stopping_child", "sa-stop-w");
+  assert!(
+    matches!(outcome, Stopping::Exited { killed: true, .. }),
+    "{outcome:?}"
+  );
+  assert!(
+    took < Duration::from_millis(WEDGED_DEADLINE_MS),
+    "killed at the lapse, before the declared deadline ({took:?})"
+  );
+  assert_eq!(state, State::Stopped);
 }

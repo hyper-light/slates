@@ -3247,6 +3247,77 @@ fn a_root_leader_hands_root_leadership_to_a_named_voter_across_regions() {
   );
 }
 
+/// The graceful drain (thesis §3.10; `docs/wip/research/consensus-enhancements.md` §3.2): a council leader
+/// told to stop hands its leadership off first. The drain reports the handoff once the successor is in office
+/// (the drained daemon has its first append), returns well inside an election timeout, and when the drained
+/// daemon then stops the two survivors already have their leader — no election to wait out, unlike the
+/// leader-loss path. (A first cut declared the handoff done when the old leader stepped down, which happens on
+/// the target's vote request before the target has won; two runs in three then found no leader at the stop.)
+#[test]
+fn a_draining_council_leader_hands_off_before_it_stops() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let elected = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_ELECTION_DEADLINE,
+    || one_leader(&daemons),
+  );
+  let leader = leader_index(&daemons);
+  let timeout = leader.and_then(|lead| {
+    daemons[lead]
+      .council_timing()
+      .ok()
+      .map(|timing| Duration::from_nanos(HEARTBEAT_NS * u64::from(timing.base_periods)))
+  });
+  let (report, survivors_led) = match leader {
+    Some(lead) => {
+      let report = daemons[lead].drain_leadership();
+      daemons.remove(lead).stop();
+      // Read at once: a survivor must already lead — no election timeout has been waited out.
+      let survivors_led = one_leader(&daemons);
+      (Some(report), survivors_led)
+    }
+    None => (None, Ok(false)),
+  };
+  eprintln!("council drain: {report:?}; election timeout {timeout:?}");
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(elected, "the council elected a leader");
+  let report = report
+    .expect("a leader was found")
+    .expect("the drain was observed");
+  let to = match report.council {
+    slates_server::LeadershipHandoff::HandedOff { to } => to,
+    other => panic!("the council leadership was handed off, not {other:?}"),
+  };
+  assert!(hosts.contains(&to), "handed to a member");
+  let timeout = timeout.expect("the council timing was observed");
+  assert!(
+    report.took < timeout,
+    "the drain ({:?}) returned inside an election timeout ({timeout:?})",
+    report.took
+  );
+  assert_eq!(
+    survivors_led,
+    Ok(true),
+    "the survivors led the moment the drained daemon stopped"
+  );
+}
+
 /// What [`a_council_leader_hands_leadership_to_a_named_voter_faster_than_a_leader_loss_elects_one`] measured.
 #[derive(Default)]
 struct TransferMeasurement {
@@ -7299,7 +7370,8 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
     .collect();
   assert!(
     audit_wait(|| audit_voters_match(&daemons, &survivors)),
-    "the restarted voters must commit a new retirement"
+    "the restarted voters must commit a new retirement: survivors {survivors:?}; {}",
+    council_state(&daemons)
   );
   assert!(
     daemons
@@ -7509,6 +7581,27 @@ fn audit_wait(mut condition: impl FnMut() -> Result<bool, ObserveError>) -> bool
 
 /// Every node has received the same committed voter set, with no joint transition remaining (a voter set
 /// still in transition is observed state, `Ok(false)`; a node that could not be observed is its refusal).
+/// Each daemon's consensus state, for a failed council assertion: its member id, whether it leads, its
+/// committed voters, the council's own dump (log with terms, voter set, joint flag, commit indexes), the
+/// members it holds alive, and its refusal counters.
+fn council_state(daemons: &[Daemon]) -> String {
+  daemons
+    .iter()
+    .map(|daemon| {
+      format!(
+        "[host={:?} leads={:?} voters={:?} members={:?} refusals={:?} council={:?}]",
+        daemon.member_identity(),
+        daemon.council_leads(),
+        daemon.council_voters(),
+        daemon.fleet_members(),
+        daemon.fleet_refusals(),
+        daemon.council_debug()
+      )
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 fn audit_voters_match(daemons: &[Daemon], voters: &[HostId]) -> Result<bool, ObserveError> {
   all_hold(daemons.iter().map(|daemon| {
     daemon.council_voters().map(|current| {

@@ -528,6 +528,18 @@ The health plane observes all of the above from the outside (host-observed, neve
 only) and refuses to serve until every chokepoint has registered (an unregistered emitter fails
 startup).
 
+> **Graceful stop (2026-09-28).** A stop the owner asks for (the anchor's `SIGTERM`/`SIGINT`, an
+> orchestrator deleting a pod) no longer kills the daemon at once. The anchor writes a stop request into the
+> supervision block (`SUP_STOP`); the daemon, reading it each tick (or its own `SIGTERM`), hands off every
+> consensus leadership it holds (§4.8, leadership transfer), declares the deadline it will have exited by
+> (`SUP_STOP_BY`: two CheckQuorum intervals of its slower group — the core's abort bound — and one period), and exits. The anchor kills it
+> only when it does not acknowledge within the liveness budget, lets its heartbeat lapse, or outruns its own
+> deadline by that budget — bounds it already held, none new. Both words are zero in blocks older processes
+> wrote, so either side alone behaves as before (a newer anchor over an older daemon kills it once the
+> budget passes unacknowledged). Measured by real processes: a council leader sent `SIGTERM` drained in
+> about 0.2 s and a survivor led 0.106–0.127 s after the signal (four runs), against a 1 s election timeout
+> that a kill would have had the survivors wait out first.
+
 > **Status (2026-09-05).** Steps 1, 2, 3 and 5 are implemented for one host (GAPS §8d):
 > `slates anchor` measures the profile, creates the segment, publishes the profile and
 > supervises `slates daemon` as a child with the segment in its environment; the daemon
@@ -2622,8 +2634,9 @@ reconnaissance because the touched partitions are named up front).
 > the target up to date, and sends `TimeoutNow` (wire tag 7); the target campaigns at once without a pre-vote;
 > a transfer that does not complete is aborted at the second CheckQuorum tick. Measured in-process over
 > loopback: a council handoff of 0.103 s (median of five) against a leader-loss election of 1.316 s under a
-> 1 s election timeout; a root handoff across three regions of 0.093 s. Its users — a graceful drain,
-> priority placement and multi-log balancing — are the next slices.
+> 1 s election timeout; a root handoff across three regions of 0.093 s. Its first user is the **graceful
+> drain** (§2.6 status): a stopping daemon hands off what it leads first. Priority placement and multi-log
+> balancing are the next users.
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,

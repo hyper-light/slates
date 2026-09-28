@@ -1796,13 +1796,26 @@ in job 105312670519, not the other jobs still running in that workflow.
 Evidence and commands: [CLI gate](../bugs/2026-09-17-cli-process-gate.md).
 
 
+### 2026-09-28: open — one CI failure of the warm-restart fleet test, unexplained
+
+CI run 36498699200 (`95f79ba`, macOS runner) failed `a_warm_fleet_restart_recovers_its_root_and_regional_quorums`
+at its second wait: the two restarted survivors did not commit the stopped root leader's retirement from the
+council's voters within 30 s. Not reproduced here: 4 of 4 full local suites, then 18 of 18 under six concurrent
+copies and 24 of 24 under twelve (about two daemons per core), each copy finishing in 12–14 s. The sampled
+earlier failed CI runs show no failure of this test. The assertion now prints every survivor's consensus state
+(leadership, committed voters, the council's log and commit indexes, members held alive, refusal counters), so
+the next occurrence names its cause; no cause is claimed until one does.
+
+
 ### 2026-09-28: consensus enhancements — explorer and leadership transfer built
 
 Ada's consensus goal (pre-vote, priority elections, parallel replication, learners, MLRaft, leader transfer,
 Fast Raft; `docs/wip/research/consensus-enhancements.md`). Built: the Raft safety explorer (CI runs it at full
 scale in release) and leadership transfer (thesis §3.10) in the core, the wire, both groups and the daemon's
 drive loops — council handoff 0.103 s against a 1.316 s leader-loss election (medians), root handoff across
-three regions 0.093 s. Open, in build order: pre-vote audit under partitions, learners with catch-up rounds,
+three regions 0.093 s. The graceful drain (its first user): the anchor's stop is a request through the
+supervision block, not a SIGKILL; a council leader sent `SIGTERM` is succeeded in 0.106–0.127 s by real
+processes. Open, in build order: pre-vote audit under partitions, learners with catch-up rounds,
 priority elections, ParallelRaft-CE, Fast Raft (counterexample first), MLRaft, and the graceful drain and
 WAN/KIND measurements.
 

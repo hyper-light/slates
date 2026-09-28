@@ -2631,3 +2631,186 @@ fn recovery_approval_uses_the_provisioned_node_key_across_processes() {
   );
   assert_eq!(run(&instance, &["volume", "list"]).0, 0);
 }
+
+/// How many voters `instance`'s regional council has committed (`recovery-plan region`'s `voters`), zero
+/// while it does not answer.
+fn council_voters(instance: &str) -> usize {
+  let (code, out, _) = run(instance, &["recovery-plan", "region", "--json"]);
+  if code != 0 {
+    return 0;
+  }
+  out
+    .split("\"voters\":[")
+    .nth(1)
+    .and_then(|rest| rest.split(']').next())
+    .map_or(0, |list| {
+      list
+        .split(',')
+        .filter(|item| !item.trim().is_empty())
+        .count()
+    })
+}
+
+/// Which of `instances` report leading the regional council right now (`fleet_council_leads: true`).
+fn council_leaders(instances: &[String]) -> Vec<usize> {
+  instances
+    .iter()
+    .enumerate()
+    .filter(|(_, instance)| {
+      let (code, out, _) = run(instance, &["status"]);
+      code == 0 && value_of(&out, "fleet_council_leads") == "true"
+    })
+    .map(|(index, _)| index)
+    .collect()
+}
+
+/// Shape: the poll interval while timing a council handoff — a tenth of the daemon's 100 ms heartbeat period,
+/// so the measurement resolves a single period.
+const HANDOFF_POLL_MS: u64 = 10;
+
+fn pause_for_handoff() {
+  // The test harness paces its polls; shipped code parks on its driver (D-9).
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(Duration::from_millis(HANDOFF_POLL_MS));
+}
+
+/// Starts three `slates daemon --fleet` processes named `cli-{tag}-{node}-{pid}` from one manifest, waits for
+/// their mesh, and bootstraps the fresh fleet once on the lowest member: the scratch directory (kept alive by
+/// the caller), the instances and the processes.
+fn start_formed_fleet(tag: &str) -> (ScratchDir, Vec<String>, Vec<FleetProcess>) {
+  let pid = std::process::id();
+  let scratch = scratch_dir();
+  for node in FLEET_NODES {
+    mint_identity(&scratch.path, node);
+  }
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&scratch.path, &bases);
+  let instances: Vec<String> = FLEET_NODES
+    .iter()
+    .map(|node| format!("cli-{tag}-{node}-{pid}"))
+    .collect();
+  let daemons: Vec<FleetProcess> = FLEET_NODES
+    .iter()
+    .zip(&instances)
+    .zip(&blocks)
+    .map(|((node, instance), held)| start_fleet_daemon(instance, &manifest, node, held))
+    .collect();
+  for instance in &instances {
+    wait_answers(instance);
+  }
+  let views = wait_fleet_views(
+    &instances,
+    FLEET_NODES.len(),
+    u32::try_from(FLEET_NODES.len() - 1).unwrap(),
+  );
+  assert_formed(&views);
+  let bootstrap = views
+    .iter()
+    .enumerate()
+    .min_by_key(|(_, view)| view.as_ref().unwrap().host.parse::<u64>().unwrap())
+    .map(|(index, _)| index)
+    .unwrap();
+  let (code, _, error) = run(&instances[bootstrap], &["bootstrap", "root"]);
+  assert_eq!(
+    code, 0,
+    "one explicit bootstrap of the fresh fleet: {error}"
+  );
+  (scratch, instances, daemons)
+}
+
+/// Waits for one council leader with every node a committed voter, and returns the leader's index. A fresh
+/// fleet's council starts as the bootstrapper alone and promotes the others as they are admitted, so a stop
+/// before that finds nobody to hand to (the drain reports `NoTarget`) and leaves learners that cannot elect.
+fn wait_for_full_council(instances: &[String]) -> usize {
+  let deadline = Instant::now() + FLEET_WAIT;
+  let mut leaders = council_leaders(instances);
+  while !(leaders.len() == 1 && council_voters(&instances[leaders[0]]) == FLEET_NODES.len())
+    && Instant::now() < deadline
+  {
+    pause();
+    leaders = council_leaders(instances);
+  }
+  assert_eq!(leaders.len(), 1, "one council leader: {leaders:?}");
+  assert_eq!(
+    council_voters(&instances[leaders[0]]),
+    FLEET_NODES.len(),
+    "every node votes in the council"
+  );
+  leaders[0]
+}
+
+/// Polls `survivors` from `asked` until exactly one leads the council (or the fleet wait passes): the leaders
+/// then, and how long after `asked`.
+fn time_the_successor(survivors: &[String], asked: Instant) -> (Vec<usize>, Duration) {
+  let mut handed = council_leaders(survivors);
+  while handed.len() != 1 && asked.elapsed() < FLEET_WAIT {
+    pause_for_handoff();
+    handed = council_leaders(survivors);
+  }
+  (handed, asked.elapsed())
+}
+
+/// Thesis §3.10 and the graceful drain (`docs/wip/research/consensus-enhancements.md` §3.2), by real
+/// processes: three `slates daemon --fleet` processes form a fleet; the council leader's process is sent
+/// `SIGTERM` (what an orchestrator sends a pod it deletes). It hands its leadership off before it goes: a
+/// survivor leads within the election timeout a leader loss would wait out before anyone campaigns, and the
+/// terminated daemon exits by itself, cleanly. Gated like the other process flows (`SLATES_TEST_CLI=1`).
+#[test]
+fn a_terminated_council_leader_process_hands_off_before_it_exits() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the fleet drain flow: set SLATES_TEST_CLI=1 to run it (three daemons; needs the machine to itself)"
+    );
+    return;
+  }
+  let (_scratch, instances, mut daemons) = start_formed_fleet("drain");
+  let leader = wait_for_full_council(&instances);
+  let (_, out, _) = run(&instances[leader], &["status"]);
+  let base_periods: u64 = value_of(&out, "fleet_council_base_periods")
+    .parse()
+    .unwrap();
+  let timeout = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS * base_periods);
+
+  // SIGTERM the leader's daemon, as an orchestrator deleting its pod would.
+  let mut terminated = daemons.remove(leader);
+  let asked = Instant::now();
+  let sent = Command::new("kill")
+    .args(["-TERM", &terminated.child.id().to_string()])
+    .status()
+    .unwrap();
+  assert!(sent.success(), "SIGTERM sent");
+  let survivors: Vec<String> = instances
+    .iter()
+    .enumerate()
+    .filter(|(index, _)| *index != leader)
+    .map(|(_, instance)| instance.clone())
+    .collect();
+  let (handed, handoff) = time_the_successor(&survivors, asked);
+  let exit = wait_exit(&mut terminated.child, FLEET_WAIT);
+  eprintln!(
+    "drain by SIGTERM: a survivor led after {handoff:?} (election timeout {timeout:?}); exit {exit:?}"
+  );
+  assert_eq!(handed.len(), 1, "a survivor leads after the drain");
+  assert!(
+    handoff < timeout,
+    "the handoff ({handoff:?}) beat the election timeout ({timeout:?}) a leader loss waits out"
+  );
+  assert_eq!(
+    exit.map(|status| status.success()),
+    Some(true),
+    "the terminated daemon exited by itself, cleanly"
+  );
+}
+
+/// Waits for `child` to exit, polling, up to `bound`; its status, or `None` if it had not exited by then.
+fn wait_exit(child: &mut Child, bound: Duration) -> Option<std::process::ExitStatus> {
+  let started = Instant::now();
+  while started.elapsed() < bound {
+    if let Ok(Some(status)) = child.try_wait() {
+      return Some(status);
+    }
+    pause();
+  }
+  None
+}

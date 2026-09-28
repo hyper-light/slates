@@ -205,3 +205,21 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     the root group's handoff across three regions took 0.092–0.096 s (three runs).
   - Owed from this slice: the users — a graceful drain (a stopping leader hands off first), priority
     placement (3.4) and MLRaft balancing (3.6) — and the WAN/KIND measurement.
+- **Slice 3 (2026-09-28): the graceful drain** — the first user of transfer. The anchor's stop was a SIGKILL,
+  so a planned stop of a council leader (a pod deletion, a rolling upgrade) cost a leader-loss election. Now
+  the anchor writes a stop request into the supervision block (`SUP_STOP`); the daemon hands off every
+  leadership it holds to the most caught-up voter, declares its deadline (`SUP_STOP_BY`: two CheckQuorum
+  intervals of its slower group — the core's abort bound — and one period) and exits; the anchor kills only on no acknowledgement within
+  the liveness budget, a lapsed heartbeat, or an overrun deadline. A drain completes when the successor is in
+  office (this daemon learned it from the successor's first append) — a first cut completed on stepping down,
+  which happens on the target's vote request before the target wins: two runs in three found no leader at
+  the stop. Proven:
+  - anchor, cross-process: a graceful child exits on its own after its drain (0.11 s, not killed); a deaf
+    child is killed at the 300 ms test budget; a wedged child is killed at its heartbeat lapse, long before
+    the 3 s deadline it declared;
+  - in-process fleet: the drain reports `HandedOff` in 0.305–0.310 s (five runs: catch-up, invitation and
+    the successor's first append, one 100 ms period each), and the survivors lead the moment it stops;
+  - real processes (`slates daemon --fleet` × 3, `SIGTERM` to the leader): a survivor led 0.111 / 0.127 /
+    0.106 / 0.125 s after the signal, the daemon exiting 0 each time, against a 1 s election timeout.
+  - Measured-and-open: the drain is three drive-loop periods; waking the loop on an invitation (instead of
+    the next tick) would cut it toward round trips — to be measured before it is built.
