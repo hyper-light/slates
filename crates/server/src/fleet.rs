@@ -226,38 +226,71 @@ pub struct ServeSockets {
   pub record: UdpSocket,
 }
 
-/// A serve socket that could not be bound: the plane, the address, and the runtime's refusal — the daemon
-/// does not start (an operator reads which address is in use or refused).
+/// A serve socket the daemon could not take up: the plane, the address its plan names, and why — the
+/// daemon does not start (an operator reads which address is in use, or what the supervisor handed over).
 #[derive(Debug)]
 pub struct ServeBindError {
   /// Which plane: `probe` or `record`.
   pub plane: &'static str,
-  /// The address the bind was refused at.
+  /// The address the node's plan serves this plane on.
   pub address: SocketAddrV4,
-  /// The runtime's refusal (the OS error code, when one exists).
-  pub refusal: slates_rt::error::RtError,
+  /// Why the socket could not be taken up.
+  pub fault: ServeFault,
+}
+
+/// Why a serve socket could not be taken up.
+#[derive(Debug)]
+pub enum ServeFault {
+  /// The runtime refused the bind (the address in use, or refused), or the adoption of an inherited
+  /// descriptor (not a datagram socket, not bound, not open).
+  Refused(slates_rt::error::RtError),
+  /// The supervisor handed over a socket bound somewhere other than the plan's address.
+  BoundElsewhere {
+    /// Where the inherited socket is bound.
+    bound: SocketAddrV4,
+  },
+  /// The supervisor's descriptor list ([`slates_anchor::ENV_FLEET_SERVE`]) is not two descriptor numbers.
+  Malformed,
 }
 
 impl std::fmt::Display for ServeBindError {
   fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    write!(
-      formatter,
-      "the {} serve socket could not bind {}: {:?}",
-      self.plane, self.address, self.refusal
-    )
+    match &self.fault {
+      ServeFault::Refused(refusal) => write!(
+        formatter,
+        "the {} serve socket could not be taken up at {}: {refusal:?}",
+        self.plane, self.address
+      ),
+      ServeFault::BoundElsewhere { bound } => write!(
+        formatter,
+        "the inherited {} serve socket is bound at {bound}, not at the planned {}",
+        self.plane, self.address
+      ),
+      ServeFault::Malformed => write!(
+        formatter,
+        "the inherited serve sockets ({}) are not two descriptor numbers",
+        slates_anchor::ENV_FLEET_SERVE
+      ),
+    }
   }
 }
 
 impl std::error::Error for ServeBindError {}
 
 impl ServeAddresses {
-  /// Binds both planes' serve sockets, or names the one refused.
+  /// Takes up both planes' serve sockets: the ones a supervisor holds and handed over
+  /// ([`slates_anchor::ENV_FLEET_SERVE`], checked against these addresses), or, when none were handed
+  /// over, bound here. Either way the sockets serve exactly the plan's addresses, or the start is refused
+  /// naming the plane.
   pub fn bind(self) -> Result<ServeSockets, ServeBindError> {
+    if let Some(inherited) = inherited_serve_sockets(self)? {
+      return Ok(inherited);
+    }
     let bind = |plane: &'static str, address: SocketAddrV4| {
       UdpSocket::bind(address).map_err(|refusal| ServeBindError {
         plane,
         address,
-        refusal,
+        fault: ServeFault::Refused(refusal),
       })
     };
     Ok(ServeSockets {
@@ -267,8 +300,78 @@ impl ServeAddresses {
   }
 }
 
+/// The serve sockets a supervisor handed over in [`slates_anchor::ENV_FLEET_SERVE`], adopted and checked
+/// against `planned`; `None` when the environment names none (a daemon started alone binds its own).
+#[cfg(unix)]
+fn inherited_serve_sockets(
+  planned: ServeAddresses,
+) -> Result<Option<ServeSockets>, ServeBindError> {
+  let Ok(value) = std::env::var(slates_anchor::ENV_FLEET_SERVE) else {
+    return Ok(None);
+  };
+  let malformed = ServeBindError {
+    plane: "probe",
+    address: planned.probe,
+    fault: ServeFault::Malformed,
+  };
+  let mut numbers = value
+    .split(',')
+    .map(|number| number.trim().parse::<std::os::fd::RawFd>());
+  let (Some(Ok(probe)), Some(Ok(record)), None) = (numbers.next(), numbers.next(), numbers.next())
+  else {
+    return Err(malformed);
+  };
+  if probe < 0 || record < 0 || probe == record {
+    return Err(malformed);
+  }
+  Ok(Some(ServeSockets {
+    probe: adopt_inherited("probe", probe, planned.probe)?,
+    record: adopt_inherited("record", record, planned.record)?,
+  }))
+}
+
+/// A daemon that is not Unix is never handed serve sockets (its supervisor does not spawn it with any):
+/// it binds its own.
+#[cfg(not(unix))]
+fn inherited_serve_sockets(
+  _planned: ServeAddresses,
+) -> Result<Option<ServeSockets>, ServeBindError> {
+  Ok(None)
+}
+
+/// Adopts the inherited descriptor `raw` as `plane`'s serve socket and checks it serves `planned`.
+#[cfg(unix)]
+fn adopt_inherited(
+  plane: &'static str,
+  raw: std::os::fd::RawFd,
+  planned: SocketAddrV4,
+) -> Result<UdpSocket, ServeBindError> {
+  use std::os::fd::FromRawFd;
+  let refused = |refusal| ServeBindError {
+    plane,
+    address: planned,
+    fault: ServeFault::Refused(refusal),
+  };
+  // SAFETY: the supervisor bound this socket and handed its descriptor across the spawn at this number
+  // (`ENV_FLEET_SERVE`, non-negative and distinct from the other plane's, checked above); this process
+  // adopts it once, at start, before anything else could claim the number, so the `OwnedFd` is its
+  // single owner and closes it on drop. The supervisor keeps its own copy of the socket.
+  let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+  let socket = UdpSocket::adopt(owned).map_err(refused)?;
+  let bound = socket.local_addr().map_err(refused)?;
+  if bound != planned {
+    return Err(ServeBindError {
+      plane,
+      address: planned,
+      fault: ServeFault::BoundElsewhere { bound },
+    });
+  }
+  Ok(socket)
+}
+
 impl FleetTransport<ServeAddresses> {
-  /// The planned transport with its serve sockets bound — the one step between a plan and a daemon.
+  /// The planned transport with its serve sockets taken up ([`ServeAddresses::bind`]: inherited from a
+  /// supervisor that holds them, or bound) — the one step between a plan and a daemon.
   pub fn bind(self) -> Result<FleetTransport, ServeBindError> {
     let FleetTransport {
       identity,
@@ -3718,11 +3821,32 @@ fn refresh_record_identity(
   client: &mut Option<Endpoint>,
   cursor: &mut crate::discovery::Cursor,
 ) -> HostId {
-  let current = current_member(anchor).unwrap_or(previous);
+  state::with_state(|state| refresh_record_identity_in(state, anchor, previous, client, cursor))
+    .unwrap_or(previous)
+}
+
+/// [`refresh_record_identity`] over the shard's state. The manifest's **seed** id (`member_id(anchor, 0)`,
+/// the routing placeholder) was never a live incarnation: the first fresh id learned for the peer names
+/// the same process the link is already dialing — at its manifest or discovered address, under its pinned
+/// certificate — so a dial in its handshake is kept and completes, rather than being dropped and redialed
+/// a period later (CI run 36408099369: `fleet.dial.stale_dropped: 3` counted while a three-process fleet
+/// formed; `docs/bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md`).
+fn refresh_record_identity_in(
+  state: &mut ShardState,
+  anchor: HostId,
+  previous: HostId,
+  client: &mut Option<Endpoint>,
+  cursor: &mut crate::discovery::Cursor,
+) -> HostId {
+  let current = state
+    .learned_members
+    .get(&anchor)
+    .map_or(previous, |learned| learned.host);
   if current != previous {
-    state::with_state(|state| state.record_sessions.remove(&previous));
-    if client.take().is_some() {
-      count_refusal(DIAL_STALE_DROPPED);
+    state.record_sessions.remove(&previous);
+    let previous_was_a_live_incarnation = previous != crate::deploy::member_id(anchor, 0);
+    if previous_was_a_live_incarnation && client.take().is_some() {
+      count_refusal_in(state, DIAL_STALE_DROPPED);
     }
     *cursor = crate::discovery::Cursor::default();
   }
@@ -5676,6 +5800,73 @@ fn highest_held_epoch(acceptor: &Acceptor, object: ObjectId) -> HostEpoch {
 mod tests {
   use super::*;
   use slates_cluster::DispatchWait;
+
+  /// A dial in its handshake to `anchor`'s peer: a real client endpoint on a loopback socket, its first
+  /// flight unsent — what the record link holds between periods while the peer has not answered yet.
+  fn pending_dial() -> Endpoint {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec!["fleet".to_owned()])
+      .unwrap()
+      .self_signed(&key)
+      .unwrap();
+    let der = certificate.der().clone();
+    let identity = Identity::from_der(
+      der.clone(),
+      rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    );
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9);
+    Endpoint::client(socket, peer, &identity, &der, "fleet", fleet_shape()).unwrap()
+  }
+
+  /// AC-8.1 (§4.8 "Deployment", task #22; docs/bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md):
+  /// when the first fresh id is learned for a peer the link knew only by its manifest seed, the dial in
+  /// its handshake is kept — it is reaching that same process — and nothing is counted; when a peer that
+  /// had a live incarnation restarts under a new id, the pending dial (to the old incarnation) is dropped
+  /// and counted as stale. Both cases move the link to the new id and restart its discovery sweep.
+  #[test]
+  fn a_seed_replaced_by_the_first_fresh_id_keeps_the_dial_but_a_restart_drops_it() {
+    let (seed_case, restart_case) = crate::daemon::audit_on_shard(|state| {
+      let anchor = HostId(0x5eed);
+      let seed = crate::deploy::member_id(anchor, 0);
+      let first = crate::deploy::member_id(anchor, 11);
+      let second = crate::deploy::member_id(anchor, 22);
+      let stale = |state: &ShardState| state.refusals.get(DIAL_STALE_DROPPED).copied().unwrap_or(0);
+
+      state.learned_members.insert(
+        anchor,
+        LearnedMember {
+          boot_nonce: 11,
+          host: first,
+        },
+      );
+      let mut client = Some(pending_dial());
+      let mut cursor = crate::discovery::Cursor::default();
+      let now = refresh_record_identity_in(state, anchor, seed, &mut client, &mut cursor);
+      let seed_case = (now == first, client.is_some(), stale(state));
+
+      state.learned_members.insert(
+        anchor,
+        LearnedMember {
+          boot_nonce: 22,
+          host: second,
+        },
+      );
+      let now = refresh_record_identity_in(state, anchor, first, &mut client, &mut cursor);
+      let restart_case = (now == second, client.is_some(), stale(state));
+      (seed_case, restart_case)
+    });
+    assert_eq!(
+      seed_case,
+      (true, true, 0),
+      "the first fresh id moves the link and keeps its pending dial, counting nothing"
+    );
+    assert_eq!(
+      restart_case,
+      (true, false, 1),
+      "a restart moves the link and drops the dial to the old incarnation, counted"
+    );
+  }
 
   /// AC-8.1 / T-8.12: an authenticated neighbor reports the death of a known member this node
   /// does not probe directly. The council's failure view must receive that death; old alive gossip

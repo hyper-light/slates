@@ -98,6 +98,12 @@ mod imp {
   /// The owned OS handle [`adopt`] takes: a file descriptor.
   pub(crate) type OwnedDatagram = OwnedFd;
 
+  /// Gives up the socket's descriptor — the counterpart to [`adopt`], for a supervisor that binds a
+  /// socket and hands it to the process it spawns.
+  pub(crate) fn into_owned(socket: Socket) -> OwnedDatagram {
+    socket.fd
+  }
+
   pub(crate) fn local_addr(socket: &Socket) -> Result<SocketAddrV4, RtError> {
     match SocketAddr::try_from(getsockname(&socket.fd).map_err(|e| refused("getsockname", e))?) {
       Ok(SocketAddr::V4(v4)) => Ok(v4),
@@ -398,6 +404,8 @@ mod imp {
   }
 }
 
+#[cfg(unix)]
+pub(crate) use imp::into_owned;
 pub(crate) use imp::{OwnedDatagram, Socket};
 pub(crate) use imp::{
   adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,

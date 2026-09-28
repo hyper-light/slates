@@ -31,6 +31,15 @@ pub const ENV_ANCHOR_PID: &str = "SLATES_ANCHOR_PID";
 /// daemon without it binds its own. The daemon adopts it through `slates_rt::tcp::TcpListener::from_fd`.
 pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 
+/// Format: the environment variable carrying a fleet node's two serve sockets (§4.8 "Deployment") as
+/// `PROBE_FD,RECORD_FD`, inherited across the spawn. A supervisor that holds its daemon's fleet ports binds
+/// them once and passes them to every daemon it spawns, so no port is released between a daemon's stop
+/// and its restart — or between a test harness learning a port and the daemon serving on it
+/// (`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). The daemon
+/// adopts them through `slates_server::FleetTransport::bind` and refuses a socket bound elsewhere than
+/// its plan says. Unix, as the NFS listener's descriptor is.
+pub const ENV_FLEET_SERVE: &str = "SLATES_ANCHOR_FLEET_SERVE";
+
 /// The restart policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartPolicy {
@@ -100,6 +109,11 @@ pub struct Supervisor {
   /// WinFsp), and the descriptor type is Unix's.
   #[cfg(unix)]
   nfs_listener: Option<OwnedFd>,
+  /// A fleet node's two serve sockets (probe, record), if this daemon is one (§4.8): bound once by the
+  /// anchor and handed to each daemon it spawns (via [`ENV_FLEET_SERVE`]), so the manifest's ports are
+  /// never free between a daemon's stop and its restart. Inheritable, as the NFS listener is.
+  #[cfg(unix)]
+  fleet_serve: Option<(OwnedFd, OwnedFd)>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -131,6 +145,8 @@ impl Supervisor {
       lifetime: lifetime::Tie::new(),
       #[cfg(unix)]
       nfs_listener: None,
+      #[cfg(unix)]
+      fleet_serve: None,
     }
   }
 
@@ -141,6 +157,14 @@ impl Supervisor {
   #[cfg(unix)]
   pub fn hold_nfs_listener(&mut self, fd: OwnedFd) {
     self.nfs_listener = Some(fd);
+  }
+
+  /// Holds a fleet node's two serve sockets — `probe` and `record`, bound where the node's plan says — and
+  /// hands them to every daemon this supervisor spawns (§4.8). Both must be inheritable (the caller clears
+  /// close-on-exec); the supervisor owns them for its life, past any one daemon.
+  #[cfg(unix)]
+  pub fn hold_fleet_serve(&mut self, probe: OwnedFd, record: OwnedFd) {
+    self.fleet_serve = Some((probe, record));
   }
 
   /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
@@ -170,6 +194,14 @@ impl Supervisor {
     #[cfg(unix)]
     if let Some(fd) = &self.nfs_listener {
       env.push((ENV_NFS_LISTENER.to_owned(), fd.as_raw_fd().to_string()));
+    }
+    // And the held fleet serve sockets, the same way: the daemon adopts them rather than binding (§4.8).
+    #[cfg(unix)]
+    if let Some((probe, record)) = &self.fleet_serve {
+      env.push((
+        ENV_FLEET_SERVE.to_owned(),
+        format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
+      ));
     }
     let child = Command::new(&self.program)
       .args(&self.args)

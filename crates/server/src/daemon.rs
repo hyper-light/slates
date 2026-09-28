@@ -1826,12 +1826,15 @@ pub fn host_id_of(identity: &Identity) -> u64 {
 
 /// This daemon's public boot nonce (§4.8, AUD-07), derived with a separate keyed-hash domain
 /// from the fresh secret minted once before its shards start. A reset supervision counter cannot
-/// repeat the old member identity. The secret itself never crosses the membership wire.
+/// repeat the old member identity. The secret itself never crosses the membership wire. Never zero:
+/// nonce zero names the manifest's routing placeholder (`deploy::member_id`), which a live incarnation
+/// must never equal — the record link keeps its pending dial across the placeholder's replacement on
+/// exactly that promise (`fleet::refresh_record_identity_in`). A zero digest word (odds 2⁻⁶⁴) becomes one.
 fn boot_incarnation(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> u64 {
   let digest = blake3::keyed_hash(secret, b"slates/member-incarnation/v1");
   let mut word = [0; size_of::<u64>()];
   word.copy_from_slice(&digest.as_bytes()[..size_of::<u64>()]);
-  u64::from_le_bytes(word)
+  u64::from_le_bytes(word).max(1)
 }
 
 /// The content object's name for a segment named `seg_name`: the segment name with its `seg`

@@ -141,8 +141,13 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   resolve is counted under the `fleet.resolve` refusal in `status` and dialed again next period. A
   named node binds its own two sockets on every interface. A manifest that names a node on a host
   with no IPv4 nameserver in `/etc/resolv.conf` stops the boot naming the file. Both sockets are
-  bound before the daemon starts: an address already in use stops the boot with
-  `fleet serve: the probe serve socket could not bind ADDRESS` (or `record`).
+  taken up before the daemon starts: an address already in use stops the boot with
+  `fleet serve: the probe serve socket could not be taken up at ADDRESS` (or `record`). Under
+  `slates anchor --fleet`, the anchor binds the two ports once and keeps them across daemon restarts,
+  so no other process can take them while a daemon restarts. A supervisor of your own can do the same:
+  pass the two bound sockets as inherited descriptors and name them in
+  `SLATES_ANCHOR_FLEET_SERVE=PROBE_FD,RECORD_FD`. A socket bound anywhere but the node's planned
+  address is refused by name.
 - `domain` and `region` are optional per-node non-negative integers, both unset by default and set
   only for a real topology. `domain` is the node's failure domain (a rack or zone id): placement forms
   each object's copyset across distinct domains, so nodes that share a `domain` are treated as

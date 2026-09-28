@@ -1250,45 +1250,74 @@ fn write_manifest(dir: &str, bases: &[u16]) -> String {
   path
 }
 
-/// A base port whose `count` consecutive UDP loopback ports are all free right now — bound together so
-/// the OS confirms the whole block, dropped before the daemons bind them — searched upward from `from`
-/// within the attempt bound. Tests may use `std::net` (as the server's fleet tests do); the daemon never
-/// links it (R1).
-fn free_port_block(from: u16, count: u16) -> u16 {
+/// A node's port block, held bound for the whole test: its base port and the socket on each of its
+/// ports, handed to the node's daemon ([`start_fleet_daemon`]) rather than released for it to rebind — so
+/// no other process can take a port between the test learning it and the daemon serving on it
+/// (`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`: three concurrent
+/// copies of this test, started with consecutive pids, searched overlapping ranges and one daemon's bind
+/// failed).
+struct HeldBlock {
+  base: u16,
+  sockets: Vec<std::net::UdpSocket>,
+}
+
+/// A block of `count` consecutive UDP loopback ports, bound together and **kept** bound, searched upward
+/// from `from` within the attempt bound. Tests may use `std::net` (as the server's fleet tests do); the
+/// daemon never links it (R1).
+fn free_port_block(from: u16, count: u16) -> HeldBlock {
   let mut base = from;
   for _ in 0..PORT_ATTEMPTS {
-    let sockets: Vec<Option<std::net::UdpSocket>> = (0..count)
+    let sockets: Option<Vec<std::net::UdpSocket>> = (0..count)
       .map(|k| {
         base
           .checked_add(k)
           .and_then(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).ok())
       })
       .collect();
-    if sockets.iter().all(Option::is_some) {
-      return base;
+    if let Some(sockets) = sockets {
+      return HeldBlock { base, sockets };
     }
     base = base.checked_add(count).unwrap_or(PORT_FLOOR);
   }
   panic!("no block of {count} free loopback UDP ports found from {from}");
 }
 
-/// One free port pair per node, disjoint, from a pid-derived start.
-fn port_blocks() -> Vec<u16> {
+/// One held port block per node, disjoint, from a pid-derived start.
+fn port_blocks() -> Vec<HeldBlock> {
   let block = PORTS_PER_NODE;
   let offset = std::process::id() % u32::from(PORT_SPAN);
   let start = u16::try_from(u32::from(PORT_FLOOR) + offset).unwrap();
-  let mut bases = Vec::with_capacity(FLEET_NODES.len());
+  let mut blocks = Vec::with_capacity(FLEET_NODES.len());
   let mut from = start;
   for _ in FLEET_NODES {
-    let base = free_port_block(from, block);
-    bases.push(base);
-    from = base.checked_add(block).unwrap_or(PORT_FLOOR);
+    let held = free_port_block(from, block);
+    from = held.base.checked_add(block).unwrap_or(PORT_FLOOR);
+    blocks.push(held);
   }
-  bases
+  blocks
 }
 
-/// Starts `slates daemon --fleet MANIFEST --node NODE` alone (no anchor) at `instance`.
-fn start_fleet_daemon(instance: &str, manifest: &str, node: &str) -> FleetProcess {
+/// A duplicate of `socket`'s descriptor that a spawned child inherits (close-on-exec cleared); the
+/// test's own socket keeps the port, and the duplicate is closed here once the child has it.
+fn inheritable(socket: &std::net::UdpSocket) -> std::os::fd::OwnedFd {
+  let duplicate: std::os::fd::OwnedFd = socket.try_clone().unwrap().into();
+  rustix::io::fcntl_setfd(&duplicate, rustix::io::FdFlags::empty()).unwrap();
+  duplicate
+}
+
+/// Starts `slates daemon --fleet MANIFEST --node NODE` alone (no anchor) at `instance`, handing it the
+/// node's held serve sockets as a supervisor would ([`slates_anchor::ENV_FLEET_SERVE`]).
+fn start_fleet_daemon(
+  instance: &str,
+  manifest: &str,
+  node: &str,
+  held: &HeldBlock,
+) -> FleetProcess {
+  use std::os::fd::AsRawFd;
+  let [probe, record] = held.sockets.as_slice() else {
+    panic!("a node's block is its probe and record ports");
+  };
+  let (probe, record) = (inheritable(probe), inheritable(record));
   let child = slates()
     .args([
       "--instance",
@@ -1302,11 +1331,203 @@ fn start_fleet_daemon(instance: &str, manifest: &str, node: &str) -> FleetProces
       "--node",
       node,
     ])
+    .env(
+      slates_anchor::ENV_FLEET_SERVE,
+      format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
+    )
     .stdout(Stdio::null())
     .stderr(Stdio::inherit())
     .spawn()
     .unwrap();
   FleetProcess { child }
+}
+
+/// The daemon's pid, from `status --json`, or `None` while no daemon answers.
+fn daemon_pid(instance: &str) -> Option<u32> {
+  let (code, out, _) = run(instance, &["status", "--json"]);
+  if code != 0 {
+    return None;
+  }
+  let after = out.split("\"pid\":").nth(1)?;
+  after
+    .trim_start()
+    .split(|c: char| !c.is_ascii_digit())
+    .next()?
+    .parse()
+    .ok()
+}
+
+/// Whether some other socket can bind 127.0.0.1:`port` right now (a probe of who holds it: bound and
+/// dropped at once, only ever on a port the test expects to be held).
+fn port_is_free(port: u16) -> bool {
+  std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok()
+}
+
+/// AC-8.1 (§4.8 "Deployment", §4.6's anchor-held listener applied to the fleet;
+/// docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md): an anchor that
+/// supervises a fleet node holds the node's two manifest ports across a daemon's death and restart —
+/// no other socket can take either port while the daemon is down — and the restarted daemon serves on
+/// them. The test hands the anchor its held block, then lets go of its own copies, so from there only the
+/// anchor holds the ports.
+#[test]
+fn a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the anchored fleet restart flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let scratch = scratch_dir();
+  let instance = format!("cli-fleet-anchor-{}", std::process::id());
+  let (_anchor, ports) = start_anchored_fleet_node(&scratch.path, &instance);
+  let first = await_daemon(&instance, None, &[]);
+  assert!(
+    ports.iter().all(|port| !port_is_free(*port)),
+    "the anchored node holds both manifest ports"
+  );
+  let killed = Command::new("kill")
+    .args(["-9", &first.to_string()])
+    .status()
+    .unwrap();
+  assert!(killed.success(), "the daemon was killed");
+  // Until a new daemon answers, the anchor alone holds the ports: nothing can take them in the gap.
+  let second = await_daemon(&instance, Some(first), &ports);
+  assert_ne!(second, first, "a new daemon serves");
+  let (code, out, err) = run(&instance, &["status"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    out.contains("fleet"),
+    "the restarted daemon runs as the fleet node on the held sockets: {out}"
+  );
+}
+
+/// Starts `slates anchor --fleet` for node `a` of a fresh three-node manifest in `dir`, handing the anchor
+/// the node's held port block, then lets go of the test's own copies — so from here only the anchor holds
+/// the node's two ports, which are returned.
+fn start_anchored_fleet_node(dir: &str, instance: &str) -> (AnchorProcess, [u16; 2]) {
+  use std::os::fd::AsRawFd;
+  for node in FLEET_NODES {
+    mint_identity(dir, node);
+  }
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(dir, &bases);
+  let [probe, record] = blocks[0].sockets.as_slice() else {
+    panic!("a node's block is its probe and record ports");
+  };
+  let (probe, record) = (inheritable(probe), inheritable(record));
+  let child = slates()
+    .args([
+      "--instance",
+      instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--fleet",
+      &manifest,
+      "--node",
+      FLEET_NODES[0],
+    ])
+    .env(
+      slates_anchor::ENV_FLEET_SERVE,
+      format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
+  (
+    AnchorProcess { child, drain: None },
+    [bases[0], bases[0] + 1],
+  )
+}
+
+/// Waits (bounded by the start wait) for a daemon other than `replaced` to answer at `instance`, and
+/// returns its pid; on every look before it answers, each of `held` must still be taken.
+fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
+  let started = Instant::now();
+  loop {
+    assert!(
+      held.iter().all(|port| !port_is_free(*port)),
+      "a manifest port was free while the daemon was down"
+    );
+    if let Some(pid) = daemon_pid(instance).filter(|pid| Some(*pid) != replaced) {
+      return pid;
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "a fleet daemon answered at {instance}"
+    );
+    pause();
+  }
+}
+
+/// AC-8.1 (§4.8 "Deployment"; typed refusals): a daemon handed serve sockets that are not what its plan
+/// says does not start, and says why — a socket bound at another port is refused naming both addresses,
+/// and a descriptor list that is not two numbers is refused naming the variable.
+#[test]
+fn a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the inherited-serve refusals: set SLATES_TEST_CLI=1 to run them (starts daemons)"
+    );
+    return;
+  }
+  use std::os::fd::AsRawFd;
+  let scratch = scratch_dir();
+  for node in FLEET_NODES {
+    mint_identity(&scratch.path, node);
+  }
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&scratch.path, &bases);
+  let refused = |value: String| {
+    slates()
+      .args([
+        "--instance",
+        &format!("cli-fleet-refuse-{}", std::process::id()),
+        "daemon",
+        "--quick",
+        "--shards",
+        SHARDS,
+        "--fleet",
+        &manifest,
+        "--node",
+        FLEET_NODES[0],
+      ])
+      .env(slates_anchor::ENV_FLEET_SERVE, value)
+      .output()
+      .unwrap()
+  };
+  // Node b's sockets handed to node a: bound, datagram, but at b's ports.
+  let [elsewhere_probe, elsewhere_record] = blocks[1].sockets.as_slice() else {
+    panic!("a node's block is its probe and record ports");
+  };
+  let (probe, record) = (inheritable(elsewhere_probe), inheritable(elsewhere_record));
+  let output = refused(format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()));
+  drop((probe, record));
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    !output.status.success(),
+    "the daemon did not start: {stderr}"
+  );
+  assert!(
+    stderr.contains(&format!("bound at 127.0.0.1:{}", bases[1]))
+      && stderr.contains(&format!("not at the planned 127.0.0.1:{}", bases[0])),
+    "the refusal names where the socket is and where it should be: {stderr}"
+  );
+  let output = refused("not-descriptors".to_owned());
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert!(
+    !output.status.success(),
+    "the daemon did not start: {stderr}"
+  );
+  assert!(
+    stderr.contains(slates_anchor::ENV_FLEET_SERVE)
+      && stderr.contains("not two descriptor numbers"),
+    "the refusal names the malformed variable: {stderr}"
+  );
 }
 
 /// Waits until the daemon at `instance` answers a verb, bounded by the start wait.
@@ -1619,7 +1840,9 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   for node in FLEET_NODES {
     mint_identity(&scratch.path, node);
   }
-  let manifest = write_manifest(&scratch.path, &port_blocks());
+  let blocks = port_blocks();
+  let bases: Vec<u16> = blocks.iter().map(|held| held.base).collect();
+  let manifest = write_manifest(&scratch.path, &bases);
   let instances: Vec<String> = FLEET_NODES
     .iter()
     .map(|node| format!("cli-fleet-{node}-{pid}"))
@@ -1627,7 +1850,8 @@ fn three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owner
   let mut daemons: Vec<FleetProcess> = FLEET_NODES
     .iter()
     .zip(&instances)
-    .map(|(node, instance)| start_fleet_daemon(instance, &manifest, node))
+    .zip(&blocks)
+    .map(|((node, instance), held)| start_fleet_daemon(instance, &manifest, node, held))
     .collect();
   for instance in &instances {
     wait_answers(instance);

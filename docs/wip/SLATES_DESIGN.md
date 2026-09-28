@@ -2721,7 +2721,13 @@ daemon), so an address already in use refuses the start by plane and address, ra
 daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
 instead (`UdpSocket::adopt`, the socket-activation pattern), so a port is never released between learning
 it and serving on it
-(`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). `status` reports the node's member id, `f`, host epoch,
+(`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). A supervising
+anchor is such a caller. It binds the node's two ports once and hands them to every daemon it spawns in
+`SLATES_ANCHOR_FLEET_SERVE` (as it hands over the NFS listener, §4.6), so the manifest's fixed ports are
+never free between a daemon's death and its restart. The daemon refuses an inherited socket bound elsewhere
+than its plan says. The manifest's seed id is a routing placeholder, never an incarnation: a record link
+that learns the peer's first fresh id keeps the dial it has in flight. Only a later id change, a restart,
+drops it. `status` reports the node's member id, `f`, host epoch,
 the members it holds alive and the peers it has probed. A laptop has no manifest: its member id is
 its machine identity's hash and it is its own one member at `f = 0` — the same code path (R8).
 (A-13, `crates/server/src/deploy.rs`; proven by three real daemon processes in

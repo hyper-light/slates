@@ -57,11 +57,34 @@ serving on it.
   counted `fleet.bind` from a running daemon. That daemon no longer exists, because the bind refuses the
   start.
 
-## Sibling found in the sweep, not fixed here
+## The multi-process sibling, fixed in the follow-up change
 
-`crates/cli/tests/cli.rs` `free_port_block` has the same pattern across real processes. It searches a port
-block in 20,000–50,000 and drops it, and then the child daemons bind it by number. That range overlaps
-Linux's ephemeral range (32,768–60,999), and two concurrent CLI test processes can pick the same block. The
-race-free fix for separate processes is to hand the child its bound sockets (inherited descriptors, the
-systemd `LISTEN_FDS` protocol), which `UdpSocket::adopt` now makes possible. That is a deployment feature
-(`slates daemon` taking inherited serve sockets), recorded in the gap ledger for Ada's call.
+`crates/cli/tests/cli.rs` `free_port_block` had the same pattern across real processes. It found a port
+block, dropped it, and let the child daemons bind it by number. First judged not yet seen failing, it was
+then reproduced: three concurrent copies of the three-process test, started with consecutive pids,
+searched overlapping ranges, and in 3 of 75 runs a daemon never came up ("came up: still 3"). The fix makes
+the manifest ports a held resource across processes too:
+
+- **The daemon adopts inherited serve sockets.** When `SLATES_ANCHOR_FLEET_SERVE` names two descriptors
+  (`PROBE_FD,RECORD_FD`), `FleetTransport::bind` adopts them instead of binding. It refuses a socket bound
+  anywhere but the plan's address (`ServeFault::BoundElsewhere`, naming both addresses) and a malformed
+  list (`ServeFault::Malformed`). This mirrors the NFS listener's `SLATES_ANCHOR_NFS`.
+- **The anchor holds a fleet node's ports.** `slates anchor --fleet` binds (or adopts) the node's two
+  sockets once and hands them to every daemon it spawns. The manifest's fixed ports are then never free
+  between a daemon's death and its restart. That is a production race too: during the restart gap, any
+  process on the host could have taken a port.
+- **The CLI test holds its blocks** (`HeldBlock`) and passes duplicates to each daemon.
+
+Tests:
+
+- `a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart`: after the test drops its
+  own copies, neither port can be bound, not even while the daemon is `kill -9`ed and restarting. The new
+  daemon serves.
+- `a_daemon_refuses_inherited_serve_sockets_bound_elsewhere_or_malformed`: both refusals are checked
+  through the real binary.
+- The three-copy hunt of the three-process test went from 4 failures in 75 runs to 0 in 75.
+
+Also found in the sweep: the anchor ignored a refusal to make the NFS listener inheritable
+(`let _ = fcntl_setfd`). If that call had failed, the daemon would have been handed a descriptor number it
+never inherited, and would have adopted whatever that number named in its own table. The anchor now logs the
+refusal and holds no listener, so the daemon binds its own.

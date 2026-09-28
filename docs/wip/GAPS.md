@@ -1972,10 +1972,14 @@ This was the fleet suite's rare 300 s freeze: a daemon stuck at `periods=0` with
 - The fleet fixtures hold every allocated port under a `PortLease` for the whole test, and give each daemon
   start (restarts included) a duplicate.
 
-Open sibling, for Ada's call: the CLI's multi-process fleet test (`crates/cli/tests/cli.rs`,
-`free_port_block`) releases a port block before its child daemons bind it. The race-free fix is to pass
-inherited serve sockets to `slates daemon` (the systemd `LISTEN_FDS` protocol, on top of
-`UdpSocket::adopt`), which is a new deployment surface.
+Closed in the follow-up change, the multi-process sibling. It was reproduced at 3 in 75 runs, with three
+concurrent copies of the three-process test searching overlapping port ranges.
+
+- A daemon adopts inherited serve sockets named in `SLATES_ANCHOR_FLEET_SERVE`. It refuses one bound
+  elsewhere, or a malformed list, by name.
+- `slates anchor --fleet` holds the node's two ports across daemon restarts, as it holds the NFS listener,
+  which also closes the production restart-gap race.
+- The CLI test holds its blocks: 0 failures in 75 runs, against 4.
 
 ### 2026-09-28: the client tests use the product's deadlines; unanswered wakes are counted
 
@@ -1990,3 +1994,13 @@ parks again).
 
 Still open: why the first `create` took more than 200 ms on that runner. There are no daemon logs of the
 run, and it did not reproduce locally. A stall at the derived deadline would be a real daemon bug.
+
+### 2026-09-28: a seed id's replacement keeps the record link's pending dial
+
+Closed: [formation dropped a dial to the peer it was reaching](../bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md)
+(CI run 36408099369, `fleet.dial.stale_dropped: 3` during formation).
+
+- The manifest seed id is a placeholder, never an incarnation, so its replacement by the first fresh id no
+  longer drops the handshake in flight.
+- A real restart still drops the dial and counts it.
+- Boot nonces are never zero.

@@ -43,9 +43,49 @@ fn hold_nfs_listener(supervisor: &mut Supervisor) {
   };
   let fd = listener.into_fd();
   // Clear close-on-exec so the daemon inherits the descriptor across the spawn (the anchor keeps its
-  // own copy, so the socket outlives any one daemon).
-  let _ = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty());
+  // own copy, so the socket outlives any one daemon). If that is refused the listener is not held at
+  // all: handing the daemon a descriptor number it will not inherit would have it adopt whatever that
+  // number names in its own table. The daemon then binds its own listener, as when the bind failed.
+  if let Err(e) = rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()) {
+    eprintln!(
+      "slates anchor: the NFS listener cannot be made inheritable ({e}); the daemon binds its own"
+    );
+    return;
+  }
   supervisor.hold_nfs_listener(fd);
+}
+
+/// Takes up the fleet node's two serve sockets at its plan's addresses (bound, or adopted when this
+/// anchor was itself handed them) and gives them to `supervisor` to hand to every daemon it spawns (§4.8,
+/// [`slates_anchor::ENV_FLEET_SERVE`]). Each descriptor is made inheritable across the spawn; the
+/// supervisor keeps its own copy for its life.
+#[cfg(unix)]
+fn hold_fleet_serve(
+  supervisor: &mut Supervisor,
+  selection: &crate::args::FleetSelection,
+) -> Result<(), Failure> {
+  let plan = crate::fleet::load(selection)?;
+  let serve = plan
+    .transport
+    .serve
+    .bind()
+    .map_err(|e| failed("fleet serve", e))?;
+  let inheritable = |socket: slates_rt::udp::UdpSocket, plane: &str| {
+    let fd = socket
+      .into_owned()
+      .map_err(|e| failed("fleet serve", format!("the {plane} socket: {e:?}")))?;
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).map_err(|e| {
+      failed(
+        "fleet serve",
+        format!("the {plane} socket cannot be made inheritable: {e}"),
+      )
+    })?;
+    Ok::<_, Failure>(fd)
+  };
+  let probe = inheritable(serve.probe, "probe")?;
+  let record = inheritable(serve.record, "record")?;
+  supervisor.hold_fleet_serve(probe, record);
+  Ok(())
 }
 
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
@@ -104,6 +144,14 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // it once and hand it to every daemon the supervisor spawns; the daemon adopts it.
   #[cfg(unix)]
   hold_nfs_listener(&mut supervisor);
+  // A fleet node's serve sockets are held the same way (§4.8): bound once here, at the plan's addresses,
+  // and handed to every daemon, so the manifest's ports are never free between a stop and a restart. A
+  // socket that cannot be bound refuses the anchor's start by name — a fleet node that cannot serve its
+  // planned ports must not run.
+  #[cfg(unix)]
+  if let Some(selection) = &options.fleet {
+    hold_fleet_serve(&mut supervisor, selection)?;
+  }
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();
   supervisor.start(now).map_err(|e| failed("start", e))?;
