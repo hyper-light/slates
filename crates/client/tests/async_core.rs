@@ -20,10 +20,6 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: the reply deadline (nanoseconds): a fifth of a second, far past any served verb.
-const REPLY_NS: u64 = 200_000_000;
-/// Shape: the reconnect budget (nanoseconds): five seconds.
-const RECONNECT_NS: u64 = 5_000_000_000;
 /// Shape: how long a client retries the rendezvous while a daemon starts.
 const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the fast-path spin budget (nanoseconds): a tenth of a second, well past a live daemon's
@@ -42,11 +38,15 @@ fn profile() -> MachineProfile {
   .expect("the machine profile measures")
 }
 
+/// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
+/// budget), never a shorter hand-picked reply clock that calls a live daemon stalled
+/// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
 fn deadlines() -> Deadlines {
-  Deadlines {
-    reply_ns: REPLY_NS,
-    reconnect_ns: RECONNECT_NS,
-  }
+  Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get()
 }
 
 fn connect(instance: &str) -> Client {
@@ -165,7 +165,7 @@ fn poll_until(client: &mut Client, id: RequestId) -> ReplyBody {
       return reply;
     }
     assert!(
-      u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX) < REPLY_NS,
+      u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX) < deadlines().reply_ns,
       "a reply for {id:?} arrived within the deadline"
     );
     std::hint::spin_loop();

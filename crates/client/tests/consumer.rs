@@ -41,11 +41,6 @@ const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so the consumer's record is enrolled on one partition and
 /// attested from a channel on another (the cross-shard read of the attestation).
 const TEST_SHARDS: u16 = 2;
-/// Shape: the reply deadline of the test client (nanoseconds): a fifth of a second, far past any
-/// served verb and short enough that a dead daemon is found quickly.
-const REPLY_NS: u64 = 200_000_000;
-/// Shape: the reconnect budget of the test client (nanoseconds): five seconds.
-const RECONNECT_NS: u64 = 5_000_000_000;
 /// Shape: how long a client retries the rendezvous while a daemon starts.
 const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the bytes of a workload's captured output the harness holds: a few tagged lines and the
@@ -75,11 +70,15 @@ fn profile() -> MachineProfile {
     .expect("the machine profile measures")
 }
 
+/// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
+/// budget), never a shorter hand-picked reply clock that calls a live daemon stalled
+/// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
 fn deadlines() -> Deadlines {
-  Deadlines {
-    reply_ns: REPLY_NS,
-    reconnect_ns: RECONNECT_NS,
-  }
+  Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get()
 }
 
 fn connect(instance: &str) -> Client {

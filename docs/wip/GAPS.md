@@ -1988,7 +1988,9 @@ CI run 36404234656 failed with `Stalled` at a hand-picked 200 ms reply deadline,
 1 s. A local six-copy run also found a park-count assertion that was never a design rule (a spurious wake
 parks again).
 
-- `client.rs` and `recovery.rs` now use `Deadlines::derive`.
+- `client.rs` and `recovery.rs` now use `Deadlines::derive`. A second sweep, after CI run 36413408328 hit
+  the same stall in the CLI harness, converted the four the first sweep missed, and the fifth in
+  `daemon.rs`. No Rust client builds its deadlines by hand now.
 - `ClientEnd` counts unanswered wakes, and a deterministic ring test proves the count.
 - Result: 0 failures in 900 six-copy runs after the fix, against 1 before.
 

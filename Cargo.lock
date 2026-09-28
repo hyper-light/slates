@@ -1618,6 +1618,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "slates-client",
+ "slates-db",
  "slates-ipc",
  "slates-machine",
  "slates-server",

@@ -286,7 +286,11 @@ fn status_pages_preserve_a_capture_and_refuse_foreign_or_cancelled_cursors() {
   );
   let mut typed = slates_client::Client::connect(
     &instance,
-    slates_client::Deadlines::derive(DEADLINE_NS, DEADLINE_NS).get(),
+    slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get(),
   )
   .unwrap();
   let current = typed.daemon_status().unwrap();

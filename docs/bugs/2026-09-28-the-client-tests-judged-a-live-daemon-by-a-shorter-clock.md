@@ -49,3 +49,22 @@ protocol.
   `a_wake_without_a_reply_is_counted_and_the_client_parks_again` (`crates/ipc/tests/rings.rs`): the peer
   wakes a parked client with an empty ring and waits until the client has parked again, then replies.
   Expected result: exactly one unanswered wake, and the reply delivered. It passed 300 of 300 runs.
+
+## The sweep, done twice
+
+The first sweep for siblings grepped for one spelling of the constructor, found only
+`server/tests/recovery.rs`, and missed four. CI run 36413408328 (`0fe5160`, macos-latest) then failed the
+same way, `Stalled { after_ns: 200000000 }`, in `verbs::harness_tests::run_spawns_the_workload_as_an_ephemeral_consumer_and_revokes_it_after`.
+
+The second sweep listed every `Deadlines { .. }` and `Deadlines::derive(..)` in the tree. It moved the
+remaining hand-picked deadlines to the derivation:
+
+- `cli/src/verbs.rs` harness tests (200 ms);
+- `client/tests/consumer.rs` (200 ms);
+- `client/tests/async_core.rs` (200 ms; its poll bound now reads the derived reply deadline);
+- `mcp/tests/mcp.rs` (5 s);
+- `server/tests/daemon.rs` (5 s).
+
+No Rust client in the tree now builds its deadlines by hand. The Python and Node SDK tests pass 1 s and
+2 s, which equal the derived values. Six concurrent copies of the CLI binary's own tests ran 360 times
+after the fix with no failures.

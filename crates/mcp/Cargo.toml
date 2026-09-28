@@ -15,6 +15,8 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 slates-server = { workspace = true }
+# The recovery budget the test clients derive their deadlines from, as the command does.
+slates-db = { workspace = true }
 slates-machine = { workspace = true }
 
 [lints]

@@ -24,10 +24,13 @@ fn profile() -> MachineProfile {
 }
 
 fn connect(instance: &str) -> Client {
-  let deadlines = Deadlines {
-    reply_ns: 5_000_000_000,
-    reconnect_ns: 5_000_000_000,
-  };
+  // The product's own deadlines, never a hand-picked reply clock
+  // (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
+  let deadlines = Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
   let started = Instant::now();
   loop {
     match Client::connect(instance, deadlines) {

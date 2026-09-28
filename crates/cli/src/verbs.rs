@@ -1542,18 +1542,14 @@ mod harness_tests {
   const WORKLOAD_ROLE: &str = "SLATES_CLI_TEST_WORKLOAD";
   /// Shape: how long a client retries the rendezvous while the daemon starts.
   const START_WAIT: Duration = Duration::from_secs(5);
-  /// Shape: the reply deadline of the test clients (nanoseconds): a fifth of a second.
-  const REPLY_NS: u64 = 200_000_000;
-  /// Shape: the reconnect budget of the test clients (nanoseconds): five seconds.
-  const RECONNECT_NS: u64 = 5_000_000_000;
   /// Shape: shards per test daemon: two, so the consumer's record and the attesting channel differ.
   const TEST_SHARDS: u16 = 2;
 
+  /// The product's own deadlines, as the command itself derives them — never a shorter hand-picked reply
+  /// clock that calls a live daemon stalled
+  /// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
   fn deadlines() -> Deadlines {
-    Deadlines {
-      reply_ns: REPLY_NS,
-      reconnect_ns: RECONNECT_NS,
-    }
+    Deadlines::derive(super::LIVENESS_BUDGET_NS, super::RECOVERY_BUDGET_NS).get()
   }
 
   fn connect_retrying(instance: &str) -> Client {
