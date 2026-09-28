@@ -2279,7 +2279,11 @@ mod tests {
     let mut leader = elected_leader(A, vec![A, B, C]);
     assert!(leader.append_command(b"one".to_vec()));
     assert!(leader.append_command(b"two".to_vec()));
-    assert_eq!(leader.most_caught_up_voter(), Some(B), "a tie goes to the lowest id");
+    assert_eq!(
+      leader.most_caught_up_voter(),
+      Some(B),
+      "a tie goes to the lowest id"
+    );
     let term = leader.term();
     for (follower, match_index) in [(B, 1), (C, 2)] {
       leader.on_append_reply(AppendReply {
@@ -2290,7 +2294,11 @@ mod tests {
         match_index,
       });
     }
-    assert_eq!(leader.most_caught_up_voter(), Some(C), "the furthest along wins");
+    assert_eq!(
+      leader.most_caught_up_voter(),
+      Some(C),
+      "the furthest along wins"
+    );
     assert_eq!(RaftNode::new(B, vec![A, B, C]).most_caught_up_voter(), None);
     assert_eq!(elected_leader(A, vec![A]).most_caught_up_voter(), None);
   }
