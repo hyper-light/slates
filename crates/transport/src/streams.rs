@@ -20,12 +20,16 @@
 //! partial stream that was never freed, and each one crept toward the concurrency limit.
 //!
 //! **Concurrency is credited.** A receiver holds state for at most [`StreamSpace::limit`] streams its
-//! peer opened: the peer may open only sequences below the credit this end advertised (`MaxStreams`),
-//! which is the number of the peer's streams this end has closed plus the limit. Both ends derive the
-//! same limit from the session's shape (R8), so each starts with the other's credit already known and a
-//! `MaxStreams` frame only ever raises it. A stream the sender opens past the credit waits, unsent, until
-//! credit arrives; at most one more limit's worth may wait before [`StreamSpace::open_local`] refuses
-//! typed. Before this, a peer past the receiver's stream limit had its frames dropped **but its packets
+//! peer opened: the peer may open only sequences below this end's credit — the number of the peer's
+//! streams this end has closed plus the limit — which rides every acknowledgement in a `MaxStreams`
+//! frame, as the connection credit does. Both ends derive the same limit from the session's shape (R8),
+//! so each starts with the other's credit already known and a `MaxStreams` frame only ever raises it. A
+//! stream the sender opens past the credit waits, unsent, until credit arrives (a sender with such a
+//! stream and nothing in flight reports `StreamsBlocked`, whose acknowledgement carries the credit); at
+//! most one more limit's worth may wait before [`StreamSpace::open_local`] refuses typed. The credit is
+//! never sent in an ack-eliciting packet of its own: a peer idle between exchanges acknowledges only when
+//! it next reads, so such a packet's round trip spanned the idle gap and inflated the RTT estimate — a
+//! server's probe timeout reached 6.6 s on a 100 ms path, and a lost reply cost 7 s (2026-09-28). Before this, a peer past the receiver's stream limit had its frames dropped **but its packets
 //! acknowledged**, so the sender counted the data delivered and the exchange waited forever.
 //!
 //! **Closing takes both halves.** A stream closes when its receiving half is done (read through,
@@ -204,8 +208,6 @@ pub struct StreamSpace {
   peer_awaited: BTreeSet<u64>,
   /// How many of the peer's streams this end has closed.
   peer_closed: u64,
-  /// The credit this end last advertised to the peer.
-  advertised: u64,
 }
 
 impl StreamSpace {
@@ -223,7 +225,6 @@ impl StreamSpace {
       peer_open: BTreeMap::new(),
       peer_awaited: BTreeSet::new(),
       peer_closed: 0,
-      advertised: limit,
     }
   }
 
@@ -315,11 +316,11 @@ impl StreamSpace {
       }
       return Arrival::Closed;
     }
-    if sequence >= self.advertised {
+    if sequence >= self.credit() {
       return Arrival::Violation;
     }
     // Every sequence between the highest seen and this one is implicitly opened (RFC 9000 §3.2); the
-    // credit bounds how many: `advertised - peer_next <= limit`.
+    // credit bounds how many: `credit - peer_next <= limit`.
     for awaited in self.peer_next..sequence {
       self.peer_awaited.insert(awaited);
     }
@@ -422,19 +423,16 @@ impl StreamSpace {
     }
   }
 
-  /// The credit to advertise, when closing the peer's streams has raised it past what was last advertised
-  /// (recorded as advertised): the caller sends it in a `MaxStreams` frame.
-  pub fn advertisement_due(&mut self) -> Option<u64> {
-    let credit = self.peer_closed.saturating_add(self.limit);
-    (credit > self.advertised).then(|| {
-      self.advertised = credit;
-      credit
-    })
+  /// The stream credit this end extends: the peer may open sequences below it — the number of the peer's
+  /// streams this end has closed plus the limit. It only rises, and rides every acknowledgement.
+  pub fn credit(&self) -> u64 {
+    self.peer_closed.saturating_add(self.limit)
   }
 
-  /// The credit last advertised — a lost `MaxStreams` carrying less is superseded and not resent.
-  pub fn advertised(&self) -> u64 {
-    self.advertised
+  /// The peer's credit this end is blocked at: `Some(credit)` while one of this end's streams waits past
+  /// it (RFC 9000 §19.14 `STREAMS_BLOCKED`), `None` otherwise.
+  pub fn waiting_limit(&self) -> Option<u64> {
+    (self.local_next > self.peer_credit).then_some(self.peer_credit)
   }
 
   /// Takes the peer's `MaxStreams` credit (it only ever rises; a stale, reordered one is ignored).
@@ -489,16 +487,15 @@ mod tests {
   }
 
   /// A peer that opens a stream beyond the credit is refused (the frame is a violation, holding no state),
-  /// and once this end closes one of the peer's streams and advertises, the next sequence is admitted.
+  /// and once this end closes one of the peer's streams its credit rises, the next sequence is admitted.
   #[test]
   fn the_credit_bounds_the_peers_open_streams_and_closing_raises_it() {
     let (mut server, [first, _, third]) = a_server_at_its_credit();
     server.close_receive(first);
-    assert_eq!(server.advertisement_due(), None, "the reply is still owed");
+    assert_eq!(server.credit(), 2, "the reply is still owed");
     assert_eq!(server.begin_reply(first), Ok(ReplyAdmission::Send));
     server.close_send(first);
-    assert_eq!(server.advertisement_due(), Some(3));
-    assert_eq!(server.advertisement_due(), None, "advertised once");
+    assert_eq!(server.credit(), 3, "closing the stream raised the credit");
     assert_eq!(server.arrive(third), Arrival::Open);
     assert_eq!(server.arrive(first), Arrival::Closed, "a late copy");
   }
@@ -538,10 +535,26 @@ mod tests {
         limit: 2
       })
     );
+    assert_eq!(
+      client.waiting_limit(),
+      Some(2),
+      "blocked at the peer's credit"
+    );
     client.on_max_streams(3);
     client.on_max_streams(1);
+    assert_eq!(
+      client.waiting_limit(),
+      Some(3),
+      "still one past the raised credit"
+    );
     assert!(ids.get(2).is_some_and(|&id| client.sendable(id)));
     assert!(ids.get(3).is_some_and(|&id| !client.sendable(id)));
+    client.on_max_streams(4);
+    assert_eq!(
+      client.waiting_limit(),
+      None,
+      "every stream is within the credit"
+    );
   }
 
   /// A frame on a local stream never opened, or with a kind differing from the stream's first frame, is a
@@ -638,7 +651,6 @@ mod tests {
             }
           }
         }
-        let _ = space.advertisement_due();
         let census = space.census();
         prop_assert!((census.peer_open + census.peer_awaited) as u64 <= limit);
         let model_open = opened.iter().filter(|s| !(receive_done.contains(s) && send_done.contains(s))).count();

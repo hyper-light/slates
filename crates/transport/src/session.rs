@@ -126,6 +126,13 @@ pub enum Frame {
     /// The connection credit the sender is blocked at.
     limit: u64,
   },
+  /// The sender has streams waiting past the peer's stream credit at `limit` (RFC 9000 §19.14
+  /// `STREAMS_BLOCKED`); the receiver answers with an acknowledgement, which carries its current stream
+  /// credit (`MaxStreams`).
+  StreamsBlocked {
+    /// The stream credit the sender is blocked at.
+    limit: u64,
+  },
   /// The sender is blocked by stream `stream_id`'s credit at `limit` (RFC 9000 §19.13
   /// `STREAM_DATA_BLOCKED`); the receiver answers with that stream's current credit.
   StreamDataBlocked {
@@ -162,7 +169,8 @@ impl Frame {
       Frame::MaxData { .. }
       | Frame::StopSending { .. }
       | Frame::MaxStreams { .. }
-      | Frame::DataBlocked { .. } => ONE_WORD_FRAME_BYTES,
+      | Frame::DataBlocked { .. }
+      | Frame::StreamsBlocked { .. } => ONE_WORD_FRAME_BYTES,
       Frame::MaxStreamData { .. } | Frame::ResetStream { .. } | Frame::StreamDataBlocked { .. } => {
         TWO_WORD_FRAME_BYTES
       }
@@ -192,6 +200,8 @@ const KIND_MAX_STREAMS: u8 = 7;
 const KIND_DATA_BLOCKED: u8 = 8;
 /// Format: the stream-blocked frame kind (RFC 9000 §19.13 `STREAM_DATA_BLOCKED`).
 const KIND_STREAM_DATA_BLOCKED: u8 = 9;
+/// Format: the streams-blocked frame kind (RFC 9000 §19.14 `STREAMS_BLOCKED`).
+const KIND_STREAMS_BLOCKED: u8 = 10;
 
 /// Format: the `Stream` frame's `fin` flag bit; every other bit of the flags byte must be zero.
 const STREAM_FIN: u8 = 0b0000_0001;
@@ -260,6 +270,10 @@ impl Frame {
       }
       Frame::DataBlocked { limit } => {
         out.push(KIND_DATA_BLOCKED);
+        out.extend_from_slice(&limit.to_le_bytes());
+      }
+      Frame::StreamsBlocked { limit } => {
+        out.push(KIND_STREAMS_BLOCKED);
         out.extend_from_slice(&limit.to_le_bytes());
       }
       Frame::StreamDataBlocked { stream_id, limit } => {
@@ -351,6 +365,9 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
       KIND_DATA_BLOCKED => Frame::DataBlocked {
         limit: reader.u64().map_err(|_| SessionError::Truncated)?,
       },
+      KIND_STREAMS_BLOCKED => Frame::StreamsBlocked {
+        limit: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
       KIND_STREAM_DATA_BLOCKED => Frame::StreamDataBlocked {
         stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
         limit: reader.u64().map_err(|_| SessionError::Truncated)?,
@@ -397,6 +414,7 @@ mod tests {
       Frame::StopSending { stream_id: 12 },
       Frame::MaxStreams { max: 64 },
       Frame::DataBlocked { limit: 1 << 18 },
+      Frame::StreamsBlocked { limit: 70 },
       Frame::StreamDataBlocked {
         stream_id: 11,
         limit: 4096,
@@ -492,6 +510,11 @@ mod tests {
       encode_frames(&[Frame::DataBlocked { limit: 0x0203 }]),
       vec![8, 3, 2, 0, 0, 0, 0, 0, 0]
     );
+    // StreamsBlocked: kind 10, limit (0x0405) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::StreamsBlocked { limit: 0x0405 }]),
+      vec![10, 5, 4, 0, 0, 0, 0, 0, 0]
+    );
     // StreamDataBlocked: kind 9, stream id (6) u64 LE, limit (0x0304) u64 LE.
     assert_eq!(
       encode_frames(&[Frame::StreamDataBlocked {
@@ -515,6 +538,7 @@ mod tests {
     let credit = encode_frames(&[Frame::MaxStreams { max: 0x0105 }]);
     for blocked in [
       encode_frames(&[Frame::DataBlocked { limit: 0x0203 }]),
+      encode_frames(&[Frame::StreamsBlocked { limit: 0x0405 }]),
       encode_frames(&[Frame::StreamDataBlocked {
         stream_id: 6,
         limit: 0x0304,
