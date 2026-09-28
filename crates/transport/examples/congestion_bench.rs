@@ -71,6 +71,8 @@ const MS: u64 = 1_000_000;
 /// Shape: the receive ceiling in BDPs — generous, so the controller, never flow control, is the limit.
 const CEILING_BDPS: u64 = 8;
 
+/// Shape: every simulated host's interface MTU — Ethernet (1,500 bytes). The path's own MTU stays the floor.
+const ETHERNET_INTERFACE_MTU: usize = 1_500;
 /// Shape: the seeds each scenario runs with.
 const SEEDS: [u64; 3] = [1, 2, 3];
 /// Shape: a run is recorded as stalled once it has taken this many times its transfer's ideal duration
@@ -306,6 +308,10 @@ async fn coordinator(
   pings: Sender<(u64, u64)>,
 ) {
   let one_way = scenario.rtt_ns / 2;
+  // Every host is Ethernet behind the floor path (a tunnel, a VPN): its interface refuses a datagram past
+  // 1,500 bytes at the send, as a real host with don't-fragment set does, so path MTU discovery pays only for
+  // the sizes the interface allows (RFC 8899 §4.4) — the floor path then bounds what crosses.
+  slates_rt::sim::sim_udp_set_interface_mtu(Some(ETHERNET_INTERFACE_MTU));
   let reverse = SimPath::in_order(one_way, 0)
     .with_loss(scenario.loss)
     .with_mtu(MIN_DATAGRAM_BYTES);

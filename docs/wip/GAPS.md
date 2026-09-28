@@ -2049,5 +2049,12 @@ Slice 3c, the same day: the search, probes and black holes are built.
   [a lone probe silenced the blocked report](../bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md);
   [a shrunken path deadlocked before its black hole was seen](../bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md).
 
-Still owed for path MTU discovery: the goodput benchmark of the discovered size against the floor, and the
-search's cost measured on real paths (Linux loopback climbs toward 65,527).
+Slice 3d, the same day: measured.
+- 4.8× goodput on real loopback: 1,625 → 7,840 Mbit/s.
+- Neutral on floor paths within the noise band (20-seed grids, 100-seed burst loss, a phase sweep).
+- Two changes the measurement drove: the raise rechecks the last failed size alone, and a refused probe
+  gives its packet number back.
+- Record: `docs/wip/BENCHMARKS.md`.
+
+Path MTU discovery is complete. The one remaining measurement belongs to the netem lane (research note §9):
+a real multi-hop path with a smaller MTU than the interface.

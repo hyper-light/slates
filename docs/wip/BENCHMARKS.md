@@ -546,3 +546,61 @@ The weighted scheduler completed zero control and zero metadata exchanges at 100
 three seeds. That is almost certainly a defect in its deficit accounting rather than the algorithm. It was not
 repaired: strict priority is optimal for the top class by construction and already sits within 1.15× of the
 best everywhere, so a correct deficit scheduler could win only the secondary goodput criterion.
+
+## Session-plane path MTU discovery (2026-09-28)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GiB. **Load:** 4–6 load average for the loopback runs (measured
+back to back, below); the simulated grids run in virtual time, so load does not change their numbers.
+**Commands (the contract):**
+
+- `cargo run --release -p slates-transport --example path_mtu_bench`: real endpoints on the real runtime and
+  real loopback sockets, a 256 MiB transfer between two shards, best of 5.
+- `cargo run --release -p slates-transport --example congestion_bench`
+- `cargo run --release -p slates-transport --example class_latency_bench`
+
+Each harness was run at 20 seeds rather than its usual 3, set in a scratch copy only.
+
+**What it buys: 4.8× on loopback.** Back to back at load 5. Before discovery (`ed613fe`) every packet is
+1,200 bytes. With discovery the search confirms 9,209 bytes, just under macOS's 9,216-byte UDP datagram cap
+(`net.inet.udp.maxdgram`). It takes 12 probes: 8 acknowledged, 4 refused locally at once (`EMSGSIZE`), none
+lost. Raw rows: `docs/wip/research/data/2026-09-28-path-mtu-bench-loopback{,-ed613fe}.csv`.
+
+| build | goodput, best of 5 | runs |
+|---|---|---|
+| `ed613fe` (floor) | 1,625 Mbit/s | 1,595 / 1,622 / 1,625 / 1,577 / 1,586 |
+| path MTU discovery | **7,840 Mbit/s** | 7,303 / 7,811 / 7,840 / 7,806 / 7,716 |
+
+**What it costs on a floor path: nothing measurable.**
+- **Setup.** The congestion and class grids model every path at the 1,200-byte floor, the worst case for a
+  prober, since every probe above the floor is lost. Each host is modelled as Ethernet: its interface
+  refuses datagrams over 1,500 bytes at the send, as a real host with don't-fragment set does
+  (`sim_udp_set_interface_mtu`, RFC 8899 §4.4).
+- **Congestion grid** (1,120 runs, against `ed613fe`): steady-state ping p99 geomean ×1.011, per-scenario
+  median ×1.000 (range 0.49–1.30), goodput ×0.999, no stalls.
+- **Class grid** (260 runs): control p99 ×1.013.
+- **Noise floor.** The same baseline build on two disjoint seed sets gives per-scenario median ratios of
+  0.79–1.22 (95 % within 0.79–1.17). The differences above are inside that band.
+- **Metadata p99 outliers are phase artifacts.** The two outliers were lossless paths, which are
+  deterministic, so each is a single sample of a bimodal p99 (157 exchanges: the second-worst one).
+  - 10 M/20 ms: shifting the baseline's metadata start by 1–3 ms reproduces the "regressed" value exactly
+    (80.3–83.0 ms against 81.8).
+  - 100 M/100 ms: over a 10-offset phase sweep the baseline spans 190–631 ms (median ≈ 387) and discovery
+    169–543 ms (median ≈ 270).
+- Raw rows: `docs/wip/research/data/2026-09-28-{congestion,class}-grid-20seeds-{ed613fe,pmtud}.csv`.
+
+**Measured and rejected (each replaced in the same change):**
+
+- **A raise that restarts the whole search from the peer's limit.** Every 600 s it spent about 36 lost probes
+  on an unchanged floor path. Each lost probe leaves a gap the peer reports as an extra ACK range, which
+  lengthened packets enough to shift a thin link's dynamics. The trace found the first divergence: an RTT
+  sample 1.5 ms higher at 64 kbit/s, the serialization time of one 16-byte range.
+  - 64 kbit/s, 300 ms, lossless ping p99: 483 → 587 ms.
+  - Overall steady p99 geomean: ×1.036.
+  - Replaced by a recheck that probes the last failed size alone (at most 3 probes per raise): 527 ms, and
+    geomean ×1.022.
+- **A refused probe that kept its packet number.** A burst of refusals left gaps.
+  - Burst-loss 10 M/100 ms over 100 seeds: p90 883 → 1,530 ms, and 12 → 17 seeds over 800 ms.
+  - Replaced by giving the number back (the datagram never left the host): median 132 ms, p75 222, p90 857,
+    mean 340, 10 seeds over 800 ms, against the baseline's 135 / 430 / 883 / 449 / 12.
+- **Probe acknowledgements as RTT samples.** A probe pokes a possibly idle peer, which acknowledges it at its
+  next wake: 1.1 ms on a 1 ms path. Probes now give no RTT sample.

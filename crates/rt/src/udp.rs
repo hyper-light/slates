@@ -130,6 +130,9 @@ impl UdpSocket {
     match &self.inner {
       Inner::Real { socket } => netsys::send_to(socket, buf, addr),
       Inner::Sim { port } => {
+        if crate::sim::sim_udp_exceeds_interface(buf.len()) {
+          return Err(RtError::message_too_large("sendto"));
+        }
         crate::sim::sim_udp_send(addr.port(), buf, *port);
         Ok(buf.len())
       }

@@ -1,0 +1,7 @@
+run,bytes,seconds,goodput_mbps,path_mtu,probes
+0,268435456,1.346,1595.2,None,"floor (pre-discovery)"
+1,268435456,1.324,1622.1,None,"floor (pre-discovery)"
+2,268435456,1.321,1625.1,None,"floor (pre-discovery)"
+3,268435456,1.362,1577.2,None,"floor (pre-discovery)"
+4,268435456,1.354,1586.3,None,"floor (pre-discovery)"
+best,268435456,,1625.1,,

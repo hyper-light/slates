@@ -495,3 +495,17 @@ Each scenario measures:
     - A goodput benchmark of the discovered size against the floor.
     - Measurement of the search's cost on a real path. On macOS loopback the 9,216-byte cap bounds it at
       once; on Linux loopback it climbs toward 65,527.
+- **Slice 3d (2026-09-28): measured — 4.8× on loopback, neutral on a floor path.** Record:
+  `docs/wip/BENCHMARKS.md` "Session-plane path MTU discovery".
+  - **Real loopback.** `path_mtu_bench` moves 256 MiB over real loopback: 1,625 Mbit/s at the floor
+    (`ed613fe`) against 7,840 Mbit/s at the discovered 9,209 bytes. The search took 12 probes, none lost.
+  - **Floor paths.** The congestion and class grids at 20 seeds are neutral within the measured noise band.
+  - **Two changes the measurement drove.**
+    - A raise now rechecks the last failed size alone (at most 3 probes), instead of restarting the search
+      from the peer's limit (about 36 lost probes per raise, each an ACK-range gap: +22 % p99 on a
+      64 kbit/s lossless path).
+    - A refused probe gives its packet number back (a burst of refusals had left gaps: burst-loss p90
+      883 → 1,530 ms over 100 seeds).
+  - **Modelled interface.** The simulated fabric now models a host interface
+    (`sim_udp_set_interface_mtu`): a datagram past it is refused at the send, as a real host with
+    don't-fragment set refuses it. The grids model Ethernet hosts behind the floor path.

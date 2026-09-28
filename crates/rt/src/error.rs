@@ -91,6 +91,15 @@ impl RtError {
     }
   }
 
+  /// The refusal a send too large for its interface gets (`EMSGSIZE`; Winsock's `WSAEMSGSIZE`) — what the
+  /// simulation's modelled interface returns, so a caller handles it as it handles the real one.
+  pub fn message_too_large(call: &'static str) -> Self {
+    Self::DriverRefused {
+      call,
+      code: Some(MESSAGE_TOO_LARGE),
+    }
+  }
+
   /// Whether this is a send the local stack refused as too large for a datagram (`EMSGSIZE`; Winsock's
   /// `WSAEMSGSIZE`): past the interface's MTU with don't-fragment set, or past the host's UDP datagram cap —
   /// the answer a path-MTU probe that is too large for this host gets at once (RFC 8899 §4.4).

@@ -7,7 +7,11 @@
 //! (`EMSGSIZE`: the interface's MTU, or macOS's UDP datagram cap), bounds the search from above. The
 //! search is a binary search between the confirmed size and that bound, and ends when what is left to
 //! gain is no more than one packet's fixed overhead ([`SEARCH_GRANULARITY`]). A completed search is
-//! resumed after [`RAISE_TIMER_NS`], because a path's MTU can grow.
+//! resumed after [`RAISE_TIMER_NS`], because a path's MTU can grow: it rechecks the smallest size that failed
+//! before, alone, and reopens the search upward only if that size now crosses — so an unchanged path costs at
+//! most [`MAX_PROBES`] lost probes per raise. Restarting the whole search from the peer's limit instead cost
+//! 36 lost probes per raise on a floor path, and each lost probe leaves a gap the peer reports as an extra
+//! ACK range; on a 64 kbit/s link that raised the ping p99 22 % (measured 2026-09-28, `congestion_bench`).
 //!
 //! Black holes (RFC 8899 §4.3): a path whose MTU shrank drops every packet above its new size, silently.
 //! [`BLACK_HOLE_LOSSES`] consecutive losses of packets above the floor, with no such packet acknowledged in
@@ -77,6 +81,11 @@ pub struct PathMtu {
   attempts: Option<(usize, u32)>,
   /// When a completed search resumes.
   raise_at: Option<u64>,
+  /// A resumed search's recheck: the smallest size that failed before, probed first and alone. Only if it
+  /// now crosses does the search reopen up to the peer's limit; a path that has not changed costs at most
+  /// [`MAX_PROBES`] lost probes per raise, not a whole search from the top (RFC 8899 §5.3: a raise searches
+  /// up from the current size).
+  recheck: Option<usize>,
   /// Consecutive losses of above-floor packets with none acknowledged between.
   large_losses: u32,
   stats: PathMtuStats,
@@ -95,6 +104,7 @@ impl PathMtu {
       probe: None,
       attempts: None,
       raise_at: None,
+      recheck: None,
       large_losses: 0,
       stats: PathMtuStats::default(),
     }
@@ -122,18 +132,25 @@ impl PathMtu {
     if self.probe.is_some() {
       return None;
     }
+    if let Some(size) = self.recheck {
+      return Some(size);
+    }
     if !self.searching() {
       match self.raise_at {
         Some(at) if now >= at => {
           self.raise_at = None;
-          let ceiling = self.local_cap.unwrap_or(self.peer_max.saturating_add(1));
-          self.too_large = ceiling.min(self.peer_max.saturating_add(1));
+          // The size that failed last is rechecked alone; one past the peer's limit or at a size the local
+          // stack refused, nothing larger could cross, and the search stays converged.
+          let bound = self.too_large;
+          let refused_here = self.local_cap.is_some_and(|cap| bound >= cap);
+          if bound > self.peer_max || refused_here {
+            return None;
+          }
+          self.recheck = Some(bound);
           self.attempts = None;
+          return Some(bound);
         }
         _ => return None,
-      }
-      if !self.searching() {
-        return None;
       }
     }
     // Retry a size whose probes were lost fewer than MAX_PROBES times; otherwise the midpoint.
@@ -181,6 +198,12 @@ impl PathMtu {
     if grew {
       self.confirmed = probe.size;
     }
+    if self.recheck.take().is_some() {
+      // The path grew past its old bound: reopen the search up to the peer's limit (and below any size the
+      // local stack refused).
+      let ceiling = self.local_cap.unwrap_or(self.peer_max.saturating_add(1));
+      self.too_large = ceiling.min(self.peer_max.saturating_add(1));
+    }
     self.large_losses = 0;
     self.arm_raise_if_done(now);
     grew
@@ -201,6 +224,7 @@ impl PathMtu {
     if lost >= MAX_PROBES {
       self.too_large = self.too_large.min(probe.size);
       self.attempts = None;
+      self.recheck = None;
       self.arm_raise_if_done(now);
     } else {
       self.attempts = Some((probe.size, lost));
@@ -216,6 +240,7 @@ impl PathMtu {
     self.probe = None;
     self.attempts = None;
     self.stats.probes_refused = self.stats.probes_refused.saturating_add(1);
+    self.recheck = None;
     self.too_large = self.too_large.min(probe.size);
     self.local_cap = Some(self.local_cap.map_or(probe.size, |cap| cap.min(probe.size)));
     self.arm_raise_if_done(now);
@@ -242,6 +267,7 @@ impl PathMtu {
     self.probe = None;
     self.attempts = None;
     self.raise_at = None;
+    self.recheck = None;
     self.stats.black_holes = self.stats.black_holes.saturating_add(1);
     self.arm_raise_if_done(now);
     true
@@ -436,6 +462,39 @@ mod tests {
       pmtu.current() <= 4_000 && 4_000 - pmtu.current() <= SEARCH_GRANULARITY,
       "bounded by the local cap: {}",
       pmtu.current()
+    );
+  }
+
+  /// RFC 8899 §5.3: a raise on a path that has not changed rechecks the size that failed before and nothing
+  /// else — at most `MAX_PROBES` probes, all at that size — and the search stays where it was.
+  #[test]
+  fn a_raise_on_an_unchanged_path_costs_at_most_max_probes() {
+    let path = Path {
+      mtu: BASE_PLPMTU,
+      local_cap: 65_527,
+    };
+    let mut pmtu = PathMtu::new(65_527);
+    converge(&mut pmtu, path, 0);
+    let confirmed = pmtu.current();
+    let sent_before = pmtu.stats().probes_sent;
+    let first = pmtu.next_probe(RAISE_TIMER_NS).unwrap();
+    assert!(
+      first - confirmed <= SEARCH_GRANULARITY + 1,
+      "the recheck is the old bound: {first}"
+    );
+    pmtu.on_probe_sent(1_000, first);
+    pmtu.on_probe_lost(1_000, RAISE_TIMER_NS);
+    let rest = converge(&mut pmtu, path, RAISE_TIMER_NS);
+    assert_eq!(pmtu.current(), confirmed);
+    let spent = pmtu.stats().probes_sent - sent_before;
+    assert!(
+      spent <= u64::from(MAX_PROBES),
+      "{spent} probes for a raise ({rest} after the first)"
+    );
+    assert_eq!(
+      pmtu.next_probe(RAISE_TIMER_NS + 1),
+      None,
+      "quiet until the next raise"
     );
   }
 

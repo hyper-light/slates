@@ -57,6 +57,8 @@ const FRAME_CAP: usize = MAX_PACKET_PAYLOAD;
 /// Format: nanoseconds per millisecond and per second.
 const MS: u64 = 1_000_000;
 const NS_PER_SECOND: u64 = 1_000_000_000;
+/// Shape: every simulated host's interface MTU — Ethernet (1,500 bytes). The path's own MTU stays the floor.
+const ETHERNET_INTERFACE_MTU: usize = 1_500;
 /// Shape: the request kinds.
 const CONTROL: u64 = 1;
 const METADATA: u64 = 2;
@@ -228,6 +230,9 @@ async fn coordinate(scenario: Scenario, report: Sender<Outcome>) {
   let client_port = client_socket.local_addr().unwrap().port();
   let server_port = server_socket.local_addr().unwrap().port();
   let one_way = scenario.rtt_ns / 2;
+  // Every host is Ethernet behind the floor path: its interface refuses a datagram past 1,500 bytes at the
+  // send, as a real host with don't-fragment set does (RFC 8899 §4.4; see `congestion_bench`).
+  slates_rt::sim::sim_udp_set_interface_mtu(Some(ETHERNET_INTERFACE_MTU));
   sim_udp_set_path(
     SimPath::in_order(one_way, 0)
       .with_loss(scenario.loss)

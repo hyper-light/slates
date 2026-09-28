@@ -413,9 +413,18 @@ impl SentTracker {
   }
 
   /// Forgets packet `pn` as never sent — the local stack refused its datagram (a path-MTU probe past the
-  /// interface, `crate::pmtud`), so it is neither in flight nor lost. `true` when it was tracked.
+  /// interface, `crate::pmtud`), so it is neither in flight nor lost — and gives its number back when it was
+  /// the latest assigned, so the next packet takes it and the peer sees no gap. A gap would be reported as
+  /// an extra acknowledgement range until confirmed; a burst of refused probes left such gaps and lengthened
+  /// the burst-loss tail (p90 883 → 1,530 ms over 100 seeds, measured 2026-09-28). Reusing the number is
+  /// safe: the refused datagram never left the host, so no ciphertext under that nonce was ever exposed.
+  /// `true` when it was tracked.
   pub fn forget_unsent(&mut self, pn: u64) -> bool {
-    self.in_flight.remove(&pn).is_some()
+    let tracked = self.in_flight.remove(&pn).is_some();
+    if tracked && self.next_pn == pn.saturating_add(1) {
+      self.next_pn = pn;
+    }
+    tracked
   }
 
   /// Drops stream `stream_id`'s data frames from every packet still in flight — the stream was

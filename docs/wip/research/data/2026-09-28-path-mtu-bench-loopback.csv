@@ -1,0 +1,7 @@
+run,bytes,seconds,goodput_mbps,path_mtu,probes
+0,268435456,0.294,7303.0,Some(9209),"Some(PathMtuStats { probes_sent: 12, probes_acked: 8, probes_lost: 0, probes_refused: 4, black_holes: 0 })"
+1,268435456,0.275,7811.0,Some(9209),"Some(PathMtuStats { probes_sent: 12, probes_acked: 8, probes_lost: 0, probes_refused: 4, black_holes: 0 })"
+2,268435456,0.274,7839.9,Some(9209),"Some(PathMtuStats { probes_sent: 12, probes_acked: 8, probes_lost: 0, probes_refused: 4, black_holes: 0 })"
+3,268435456,0.275,7805.9,Some(9209),"Some(PathMtuStats { probes_sent: 12, probes_acked: 8, probes_lost: 0, probes_refused: 4, black_holes: 0 })"
+4,268435456,0.278,7715.5,Some(9209),"Some(PathMtuStats { probes_sent: 12, probes_acked: 8, probes_lost: 0, probes_refused: 4, black_holes: 0 })"
+best,268435456,,7839.9,,

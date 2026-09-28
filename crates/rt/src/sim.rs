@@ -344,6 +344,10 @@ pub struct SimFabric {
   default_path: SimPath,
   /// Directed overrides, keyed `(from, dest)` by the sockets' own ports.
   pair_paths: BTreeMap<(u16, u16), SimPath>,
+  /// The sending host's interface MTU, when one is modelled: a datagram larger than it is refused at the
+  /// send, as a real host with don't-fragment set refuses it (`EMSGSIZE`) — before any path sees it. `None`:
+  /// no interface limit (every send reaches its path).
+  interface_mtu: Option<usize>,
   /// The bottleneck links, by id.
   links: Vec<LinkState>,
   /// Each directed flow's Gilbert–Elliott state: `true` while in the bad (burst) state.
@@ -377,6 +381,7 @@ impl SimFabric {
       rng: Xorshift::new(seed ^ FABRIC_SEED_SALT),
       default_path: SimPath::NONE,
       pair_paths: BTreeMap::new(),
+      interface_mtu: None,
       links: Vec::new(),
       loss_state: BTreeMap::new(),
       nats: BTreeMap::new(),
@@ -615,6 +620,19 @@ pub(crate) fn sim_fabric_reset(seed: u64) {
 /// `SimRuntime::new` (which resets the fabric) and before the tasks that send.
 pub fn sim_udp_set_path(path: SimPath) {
   SIM_FABRIC.with(|f| f.borrow_mut().default_path = path);
+}
+
+/// Models every sending host's interface MTU from now on (`None` removes it): a datagram larger than `mtu` is
+/// refused at the send with the OS's too-large code (`RtError::is_message_too_large`), as a real host with
+/// don't-fragment set refuses it — the refusal path MTU discovery reads as "too large here" at no network
+/// cost (RFC 8899 §4.4). An Ethernet host is 1,500.
+pub fn sim_udp_set_interface_mtu(mtu: Option<usize>) {
+  SIM_FABRIC.with(|f| f.borrow_mut().interface_mtu = mtu);
+}
+
+/// Whether a datagram of `bytes` exceeds the modelled interface MTU (the send is then refused).
+pub(crate) fn sim_udp_exceeds_interface(bytes: usize) -> bool {
+  SIM_FABRIC.with(|f| f.borrow().interface_mtu.is_some_and(|mtu| bytes > mtu))
 }
 
 /// Sets the path from socket port `from` to socket port `dest`, overriding the fabric's default for that

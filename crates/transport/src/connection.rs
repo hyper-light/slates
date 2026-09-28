@@ -1744,6 +1744,25 @@ mod tests {
     );
   }
 
+  /// §4.10a (RFC 8899 §4.4): a probe the local stack refuses was never sent, so it leaves nothing in flight
+  /// and gives its packet number back — the next packet takes it, and the peer sees no gap to report.
+  #[test]
+  fn a_refused_probe_gives_its_packet_number_back() {
+    let cap = FRAME_CAP;
+    let mut sender = fixed_window(cap);
+    sender.enable_path_mtu(9_000);
+    let (probe, _) = sender.poll_probe(1_000).expect("a probe is due");
+    sender.on_probe_refused(probe, 1_000);
+    assert_eq!(sender.census().path_probe, 0, "nothing is in flight");
+    assert_eq!(
+      sender.path_mtu_stats().map(|stats| stats.probes_refused),
+      Some(1)
+    );
+    open(&mut sender, b"after");
+    let (pn, _) = sender.poll_transmit(1_000, cap).expect("the data goes out");
+    assert_eq!(pn, probe, "the refused probe's packet number is reused");
+  }
+
   /// The dialing end of a [`fixed`] pair — the one that opens the streams.
   fn fixed_window(cap: usize) -> Connection {
     fixed(cap, Role::Client)

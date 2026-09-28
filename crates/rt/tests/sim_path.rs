@@ -457,3 +457,36 @@ fn a_lossy_bottleneck_scenario_replays_from_its_seed() {
     first.1
   );
 }
+
+/// RFC 8899 §4.4 (§4.10a path MTU discovery; `sim_udp_set_interface_mtu`): a modelled host interface
+/// refuses at the send any datagram larger than its MTU, with the same too-large refusal a real host with
+/// don't-fragment set returns — so a prober reads it identically — while a datagram within it is sent; with
+/// the model removed, every size is sent again. Do X (an Ethernet interface, 1,500), expect Y (1,400 bytes
+/// sent, 1,600 refused `is_message_too_large`, 1,600 sent once the model is removed).
+#[test]
+fn a_modelled_interface_refuses_a_datagram_past_its_mtu() {
+  /// Shape: an Ethernet interface's MTU.
+  const INTERFACE_MTU: usize = 1_500;
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (tx, rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let target = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socket.local_addr().unwrap().port());
+      slates_rt::sim::sim_udp_set_interface_mtu(Some(INTERFACE_MTU));
+      let within = socket.send_to(&[0u8; 1_400], target).map(|_| ());
+      let past = socket
+        .send_to(&[0u8; 1_600], target)
+        .map_err(|refusal| refusal.is_message_too_large());
+      slates_rt::sim::sim_udp_set_interface_mtu(None);
+      let unmodelled = socket.send_to(&[0u8; 1_600], target).map(|_| ());
+      let _ = tx.send((within, past, unmodelled));
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let (within, past, unmodelled) = rx.try_recv().unwrap();
+  assert!(within.is_ok(), "a datagram within the interface is sent");
+  assert_eq!(past, Err(true), "past the interface: refused as too large");
+  assert!(unmodelled.is_ok(), "without the model every size is sent");
+}
