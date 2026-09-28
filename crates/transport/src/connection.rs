@@ -23,8 +23,8 @@
 //! Time (the constrained-link design, research note §5.3; 2026-09-27): every entry point takes the caller's
 //! clock. The connection owns the RTT estimator (RFC 9002 §5), declares loss by both of RFC 9002 §6.1's
 //! thresholds (three packets, or 9/8 of the RTT), arms the probe timeout with its exponential backoff
-//! (§6.2), detects persistent congestion (§7.6), samples the delivery rate of every acknowledgement
-//! (`crate::delivery`), feeds a congestion controller (`crate::congestion`) that sets the window, the
+//! (§6.2), detects persistent congestion (§7.6), feeds each acknowledgement's RTT sample and acknowledged
+//! bytes to the congestion controller (`crate::congestion`, Copa) that sets the window, the
 //! pacing rate and the send quantum, and paces ack-eliciting packets (`crate::pacer`). [`next_timeout`]
 //! is the earliest of the loss timer, the probe timer and the pacing release; [`on_timeout`] acts on it.
 //! Flow control is the ratified dual-level credit law (`crate::flow`), its window auto-tuned toward the
@@ -35,9 +35,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::congestion::{AckEvent, Controller, ControllerKind, LossEvent};
+use crate::congestion::{AckEvent, Controller, LossEvent};
 use crate::conn::{AckGenerator, Lost, REORDER_THRESHOLD, SentPacket, SentTracker, tracked_bytes};
-use crate::delivery::DeliveryRate;
 use crate::flow::FlowController;
 use crate::pacer::Pacer;
 use crate::rtt::RttEstimator;
@@ -103,26 +102,6 @@ pub use crate::streams::{Priority, Role, StreamCensus, StreamRefusal};
 /// only sits between them. Measured: keeping one collapsed the span to the originals and missed a 450 ms
 /// blackout (`persistent_congestion_collapses_the_window`, 2026-09-28).
 const PROBE_COPIES_KEPT: usize = 2;
-
-/// The weighted scheduler's share for `class`: each class half the one above it (bulk 1, metadata 2,
-/// control 4), so no class starves and a more urgent one is served more.
-/// Shape: a halving per class, the weights deficit round-robin is usually run with (Shreedhar & Varghese).
-const fn class_weight(class: Priority) -> u64 {
-  match class {
-    Priority::Control => 4,
-    Priority::Metadata => 2,
-    Priority::Bulk => 1,
-  }
-}
-
-/// The class after `class` in the weighted scheduler's rotation.
-const fn next_class(class: Priority) -> Priority {
-  match class {
-    Priority::Control => Priority::Metadata,
-    Priority::Metadata => Priority::Bulk,
-    Priority::Bulk => Priority::Control,
-  }
-}
 
 /// One value per [`Priority`] class, reached by class without indexing (nothing here can go out of
 /// bounds).
@@ -192,22 +171,9 @@ pub struct SendStops {
   pub empty: u64,
 }
 
-/// How the sender chooses which stream fills the next frame. **Bake-off in progress (2026-09-27):** the
-/// loser is deleted with this selector once measured (research note, build ledger).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scheduler {
-  /// Every stream in turn, classes ignored (the connection's scheduler before this work).
-  RoundRobin,
-  /// The most urgent class with data first; round-robin within a class.
-  StrictPriority,
-  /// Deficit round-robin over classes by [`Priority::weight`]; round-robin within a class.
-  Weighted,
-}
-
 /// What a connection is built with: the packet budget it frames at (the datagram payload one packet
-/// carries), the initial receive window both ends derive, the ceiling that window may auto-tune to (the
-/// session's receive memory budget), and the congestion controller (the bake-off's choice; see
-/// `crate::congestion`).
+/// carries), the initial receive window both ends derive, and the ceiling that window may auto-tune to (the
+/// session's receive memory budget).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnectionShape {
   /// The most stream bytes one packet carries.
@@ -216,33 +182,23 @@ pub struct ConnectionShape {
   pub initial_window: u64,
   /// The receive window's ceiling, bytes.
   pub receive_ceiling: u64,
-  /// The congestion controller.
-  pub controller: ControllerKind,
-  /// The stream scheduler.
-  pub scheduler: Scheduler,
 }
 
 impl ConnectionShape {
-  /// The shape for frames of `max_frame_len` bytes: the derived initial window, a ceiling of
-  /// `receive_ceiling` bytes, and `controller`.
-  pub fn for_frame_cap(
-    max_frame_len: usize,
-    receive_ceiling: u64,
-    controller: ControllerKind,
-  ) -> ConnectionShape {
+  /// The shape for frames of `max_frame_len` bytes: the derived initial window and a ceiling of
+  /// `receive_ceiling` bytes.
+  pub fn for_frame_cap(max_frame_len: usize, receive_ceiling: u64) -> ConnectionShape {
     ConnectionShape {
       max_datagram: max_frame_len as u64,
       initial_window: initial_receive_window(max_frame_len),
       receive_ceiling,
-      controller,
-      scheduler: Scheduler::StrictPriority,
     }
   }
 }
 
 /// One end of a reliable, flow-controlled, congestion-controlled, paced, multi-stream connection. The send
-/// side is a set of streams (each a source bounded by the credit the peer advertises for it) served
-/// round-robin, plus the connection-wide in-flight tracker and retransmission queue; the receive side is
+/// side is a set of streams (each a source bounded by the credit the peer advertises for it) served in
+/// strict priority by class and round-robin within a class, plus the connection-wide in-flight tracker and retransmission queue; the receive side is
 /// a set of ordered reassemblers keyed by stream id, the acknowledgement generator, and the flow-control
 /// accounting that advertises each stream's credit a window ahead of what has been read from it.
 pub struct Connection {
@@ -250,13 +206,8 @@ pub struct Connection {
   send_streams: BTreeMap<u64, StreamSender>,
   /// Send stream ids by class, each in the order opened.
   send_order: PerClass<Vec<u64>>,
-  /// The round-robin cursor into each class's `send_order`, and one over every class for round-robin.
+  /// The round-robin cursor into each class's `send_order`.
   send_cursor: PerClass<usize>,
-  all_cursor: usize,
-  /// The scheduler, and the weighted scheduler's per-class frame deficits and turn.
-  scheduler: Scheduler,
-  deficits: PerClass<u64>,
-  weighted_turn: Priority,
   /// Stream control frames (`ResetStream`, `StopSending`, `MaxStreams`) awaiting their first
   /// transmission; each leaves in the next packet and is retransmitted on loss like stream data.
   control: VecDeque<Frame>,
@@ -291,8 +242,6 @@ pub struct Connection {
   rtt: RttEstimator,
   /// When the first RTT sample was taken (persistent congestion needs losses after it, §7.6.2).
   first_rtt_sample_at: Option<u64>,
-  /// The delivery-rate sampler (`crate::delivery`).
-  delivery: DeliveryRate,
   /// The pacer (`crate::pacer`).
   pacer: Pacer,
   /// When the pacer next releases a packet, while ack-eliciting data waits on it.
@@ -367,17 +316,12 @@ enum FreshStop {
 }
 
 impl Connection {
-  /// A fresh connection of `shape` whose clock reads `now`, drawing randomized controller timing from
-  /// `seed`.
-  pub fn new(shape: ConnectionShape, role: Role, now: u64, seed: u64) -> Connection {
+  /// A fresh connection of `shape`, playing `role`.
+  pub fn new(shape: ConnectionShape, role: Role) -> Connection {
     Connection {
       send_streams: BTreeMap::new(),
       send_order: PerClass::default(),
       send_cursor: PerClass::default(),
-      all_cursor: 0,
-      scheduler: shape.scheduler,
-      deficits: PerClass::default(),
-      weighted_turn: Priority::Control,
       control: VecDeque::new(),
       unacked: BTreeMap::new(),
       // Derived: one stream per packet's worth of stream data within the session's receive budget — the
@@ -399,11 +343,10 @@ impl Connection {
       initial_window: shape.initial_window,
       ack_owed: false,
       retransmitted: 0,
-      controller: Controller::new(shape.controller, shape.max_datagram, now, seed),
+      controller: Controller::new(shape.max_datagram),
       in_flight: 0,
       rtt: RttEstimator::new(),
       first_rtt_sample_at: None,
-      delivery: DeliveryRate::new(),
       pacer: Pacer::new(),
       pacing_release: None,
       loss_time: None,
@@ -500,12 +443,6 @@ impl Connection {
     self.control.push_back(Frame::StopSending { stream_id });
   }
 
-  /// Reseeds the congestion controller's randomized timing (the endpoint does so from the session's
-  /// connection id, once the handshake has derived it).
-  pub fn reseed(&mut self, seed: u64) {
-    self.controller.reseed(seed);
-  }
-
   /// Seeds the RTT estimator with a round trip measured outside the connection (the handshake's first
   /// flight, RFC 9002 §5.1), at `now`.
   pub fn seed_rtt(&mut self, sample: u64, now: u64) {
@@ -534,14 +471,13 @@ impl Connection {
     let carries_ack = !frames.is_empty();
     let mut reliable: Vec<Frame> = Vec::new();
     self.take_control(&mut reliable, &mut packing, budget);
-    let control_frames = reliable.len();
     let stop = match self.pacing_hold(now, budget, probe) {
       Some(release) => FreshStop::Pacer(release),
       None => self
         .take_retransmissions(budget, probe, &mut reliable, &mut packing)
         .unwrap_or_else(|| self.take_fresh(budget, probe, &mut reliable, &mut packing)),
     };
-    self.note_stop(stop, reliable.len() == control_frames);
+    self.note_stop(stop);
     frames.extend(reliable.iter().cloned());
     if carries_ack || self.credit_moved() {
       self.push_stream_credit(&mut frames, &mut packing, budget);
@@ -690,10 +626,9 @@ impl Connection {
     }
   }
 
-  /// Records why sending stopped: a full window with data waiting marks the sender window-limited
-  /// (`C.is_cwnd_limited`); running out of data marks it application-limited (draft §4.1.2.4); the pacer's
-  /// hold is remembered as the next release.
-  fn note_stop(&mut self, stop: FreshStop, nothing_packed: bool) {
+  /// Records why sending stopped: a full window with data waiting marks the sender window-limited (so the
+  /// controller may grow the window, RFC 9002 §7.8); the pacer's hold is remembered as the next release.
+  fn note_stop(&mut self, stop: FreshStop) {
     let counter = match stop {
       FreshStop::Budget => &mut self.stops.budget,
       FreshStop::Window => &mut self.stops.window,
@@ -705,11 +640,6 @@ impl Connection {
     match stop {
       FreshStop::Window if self.has_fresh_data() || !self.retransmit.is_empty() => {
         self.window_full_at = Some(self.sent.peek_next_pn());
-      }
-      FreshStop::Empty | FreshStop::Credit if nothing_packed && self.retransmit.is_empty() => {
-        self
-          .delivery
-          .check_app_limited(true, self.in_flight, self.controller.window());
       }
       _ => {}
     }
@@ -742,10 +672,6 @@ impl Connection {
         self.unacked.entry(*stream_id).or_default().insert(*offset);
       }
     }
-    self
-      .controller
-      .on_sent(now, pn, self.in_flight, self.delivery.is_app_limited());
-    let snapshot = self.delivery.on_sent(now, self.in_flight, bytes);
     if probe {
       if self.probe_copy_pending {
         self.probe_copies.push_back(pn);
@@ -758,7 +684,7 @@ impl Connection {
       self.pacer.on_sent(now, bytes, rate, quantum);
     }
     self.in_flight = self.in_flight.saturating_add(bytes);
-    self.sent.on_sent(pn, reliable, now, snapshot);
+    self.sent.on_sent(pn, reliable, now);
   }
 
   /// Whether any send stream has data it could frame within its credit.
@@ -857,16 +783,16 @@ impl Connection {
     }
   }
 
-  /// The next fresh stream frame to send, chosen by the scheduler, or `None` when no send stream has data
-  /// within its credit right now.
+  /// The next fresh stream frame to send, or `None` when no send stream has data within its credit right
+  /// now: the most urgent class with data first, round-robin within a class. Strict priority was chosen by
+  /// the scheduler bake-off (2026-09-28, `docs/wip/BENCHMARKS.md`): the control class's p99 within 1.15×
+  /// of the best scheduler in every scenario, against round-robin's 4.8×, and a weighted (deficit
+  /// round-robin) scheduler that starved the control and metadata classes outright. The losers were
+  /// deleted.
   fn next_fresh_frame(&mut self, max_frame_len: usize) -> Option<Frame> {
-    match self.scheduler {
-      Scheduler::RoundRobin => self.round_robin_all(max_frame_len),
-      Scheduler::StrictPriority => Priority::ALL
-        .iter()
-        .find_map(|&class| self.round_robin_class(class, max_frame_len)),
-      Scheduler::Weighted => self.weighted(max_frame_len),
-    }
+    Priority::ALL
+      .iter()
+      .find_map(|&class| self.round_robin_class(class, max_frame_len))
   }
 
   /// The next frame of `stream_id`, if the peer's stream credit covers it and it has data within its
@@ -879,26 +805,6 @@ impl Connection {
       .send_streams
       .get_mut(&stream_id)
       .and_then(|sender| sender.next_frame(stream_id, max_frame_len))
-  }
-
-  /// Round-robin over every stream, classes ignored.
-  fn round_robin_all(&mut self, max_frame_len: usize) -> Option<Frame> {
-    let order: Vec<u64> = Priority::ALL
-      .iter()
-      .flat_map(|&class| self.send_order.get(class).iter().copied())
-      .collect();
-    let count = order.len();
-    for step in 0..count {
-      let index = self.all_cursor.saturating_add(step) % count.max(1);
-      let Some(&stream_id) = order.get(index) else {
-        continue;
-      };
-      if let Some(frame) = self.frame_of(stream_id, max_frame_len) {
-        self.all_cursor = index.saturating_add(1) % count.max(1);
-        return Some(frame);
-      }
-    }
-    None
   }
 
   /// Round-robin within one class.
@@ -918,32 +824,8 @@ impl Connection {
     None
   }
 
-  /// Deficit round-robin over the classes (Shreedhar & Varghese, SIGCOMM 1995): each turn a class with data
-  /// earns its weight in frames of credit and spends one per frame; a class without data forfeits its turn.
-  fn weighted(&mut self, max_frame_len: usize) -> Option<Frame> {
-    // Two passes over the classes: a class may forfeit its turn in the first and be reached again after
-    // every other class has had one.
-    for _ in 0..2 * Priority::ALL.len() {
-      let class = self.weighted_turn;
-      if *self.deficits.get(class) == 0 {
-        *self.deficits.get_mut(class) = class_weight(class);
-      }
-      if let Some(frame) = self.round_robin_class(class, max_frame_len) {
-        let deficit = self.deficits.get_mut(class);
-        *deficit = deficit.saturating_sub(1);
-        if *deficit == 0 {
-          self.weighted_turn = next_class(class);
-        }
-        return Some(frame);
-      }
-      *self.deficits.get_mut(class) = 0;
-      self.weighted_turn = next_class(class);
-    }
-    None
-  }
-
   /// Takes a packet received at `now`: records its number for acknowledgement, demultiplexes each stream
-  /// frame to its reassembler, processes any acknowledgement (the RTT sample, the delivery-rate sample,
+  /// frame to its reassembler, processes any acknowledgement (the RTT sample,
   /// loss detection and the congestion controller), applies each stream's advertised send credit, and
   /// queues for retransmission whatever is declared lost. An acknowledgement-only packet does not oblige
   /// an acknowledgement in return (RFC 9002 §2).
@@ -1066,15 +948,15 @@ impl Connection {
     self.pto_count = 0;
     self.in_flight = self.in_flight.saturating_sub(acked.bytes);
     self.mark_acknowledged(&acked.frames);
-    self.delivery.begin_ack();
-    for packet in &acked.packets {
-      self
-        .delivery
-        .on_packet_acked(now, packet.pn, packet.bytes, &packet.rate);
-    }
     let lost = self.detect_losses(now);
-    let min_rtt = self.rtt.has_sample().then(|| self.rtt.min_rtt());
-    let sample = self.delivery.finish_ack(now, min_rtt);
+    // The acknowledgement's RTT sample for the controller: from the send of the most recently sent packet
+    // it newly acknowledged to now.
+    let rtt_sample = acked
+      .packets
+      .iter()
+      .map(|packet| packet.sent_at)
+      .max()
+      .map(|sent_at| now.saturating_sub(sent_at));
     let newest_acked = acked
       .packets
       .iter()
@@ -1084,42 +966,29 @@ impl Connection {
     let cwnd_limited = self.window_full_at.is_some_and(|full| full > newest_acked);
     let ack_event = AckEvent {
       now,
-      acked: &acked.packets,
-      sample,
-      in_flight: self.in_flight,
-      delivered: self.delivery.delivered(),
+      rtt_sample,
+      newly_acked: acked.bytes,
       cwnd_limited,
       rtt: &self.rtt,
     };
     let loss_event = (!lost.packets.is_empty()).then(|| LossEvent {
       now,
-      lost: &lost.packets,
-      largest_sent: self.sent.peek_next_pn().saturating_sub(1),
-      in_flight: self.in_flight,
-      lost_total: self.delivery.lost(),
       persistent: self.persistent_congestion(&lost.packets),
       srtt: self.rtt.smoothed_rtt_or_initial(),
     });
     self
       .controller
       .on_ack_and_loss(&ack_event, loss_event.as_ref());
-    if self.controller.take_app_limited() {
-      self.delivery.mark_app_limited(self.in_flight);
-    }
     self.requeue_lost(lost);
   }
 
-  /// Runs loss detection at `now` (RFC 9002 §6.1): removes the lost packets from flight and the sampler's
-  /// accounting, and re-arms the loss timer. The caller hands the packets to the controller and requeues
+  /// Runs loss detection at `now` (RFC 9002 §6.1): removes the lost packets from flight, and re-arms the loss timer. The caller hands the packets to the controller and requeues
   /// their frames.
   fn detect_losses(&mut self, now: u64) -> Lost {
     let (lost, loss_time) = self.sent.take_lost(now, self.rtt.loss_delay());
     self.loss_time = loss_time;
     let bytes: u64 = lost.packets.iter().map(|packet| packet.bytes).sum();
     self.in_flight = self.in_flight.saturating_sub(bytes);
-    if bytes > 0 {
-      self.delivery.on_lost(bytes);
-    }
     lost
   }
 
@@ -1285,10 +1154,6 @@ impl Connection {
       }
       let event = LossEvent {
         now,
-        lost: &lost.packets,
-        largest_sent: self.sent.peek_next_pn().saturating_sub(1),
-        in_flight: self.in_flight,
-        lost_total: self.delivery.lost(),
         persistent: self.persistent_congestion(&lost.packets),
         srtt: self.rtt.smoothed_rtt_or_initial(),
       };
@@ -1564,45 +1429,32 @@ mod tests {
   const PACKET_BUDGET: usize = 4 * FRAME_CAP;
   /// Shape: a millisecond.
   const MS: u64 = 1_000_000;
-  /// Every control law in the bake-off; each oracle runs over all of them, since exact delivery must hold
-  /// whichever law sets the window.
-  const LAWS: [ControllerKind; 5] = [
-    ControllerKind::NewReno,
-    ControllerKind::Cubic,
-    ControllerKind::Bbr,
-    ControllerKind::Copa,
-    ControllerKind::CopaMeta,
-  ];
 
   /// Shape: the request kind the tests' streams carry.
   const KIND: u64 = 1;
 
   /// A connection framing at `cap` whose receive window stays at the initial window (the ceiling equals
-  /// it), under `law`, playing `role`.
-  fn fixed(cap: usize, law: ControllerKind, role: Role) -> Connection {
+  /// it), playing `role`.
+  fn fixed(cap: usize, role: Role) -> Connection {
     let window = initial_receive_window(cap);
     Connection::new(
       ConnectionShape {
         max_datagram: cap as u64,
         initial_window: window,
         receive_ceiling: window,
-        controller: law,
-        scheduler: Scheduler::StrictPriority,
       },
       role,
-      0,
-      1,
     )
   }
 
   /// The dialing end of a [`fixed`] pair — the one that opens the streams.
-  fn fixed_window(cap: usize, law: ControllerKind) -> Connection {
-    fixed(cap, law, Role::Client)
+  fn fixed_window(cap: usize) -> Connection {
+    fixed(cap, Role::Client)
   }
 
   /// The accepting end of a [`fixed`] pair.
-  fn fixed_receiver(cap: usize, law: ControllerKind) -> Connection {
-    fixed(cap, law, Role::Server)
+  fn fixed_receiver(cap: usize) -> Connection {
+    fixed(cap, Role::Server)
   }
 
   /// Opens a stream carrying `content` on `sender` and returns its id.
@@ -1783,19 +1635,18 @@ mod tests {
     }
   }
 
-  /// Runs `streams` from a sender to a receiver under `law` over `wire`, framing at `budget`, and returns
+  /// Runs `streams` from a sender to a receiver over `wire`, framing at `budget`, and returns
   /// what the receiver reassembled per stream and the sender (for its counters). Asserts the
   /// never-whole-object invariant on every send.
   fn transfer_on(
     streams: &[(u64, Vec<u8>)],
-    law: ControllerKind,
     budget: usize,
     mut wire: Wire,
   ) -> (BTreeMap<u64, Vec<u8>>, Connection) {
     let window = initial_receive_window(budget);
-    let mut sender = fixed_window(budget, law);
+    let mut sender = fixed_window(budget);
     let ids = open_labelled(&mut sender, streams);
-    let mut receiver = fixed_receiver(budget, law);
+    let mut receiver = fixed_receiver(budget);
     let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut guard = 0u64;
     loop {
@@ -1836,12 +1687,7 @@ mod tests {
 
   /// Like [`transfer_on`] with no path delay.
   fn transfer(streams: &[(u64, Vec<u8>)], channel: Channel) -> (BTreeMap<u64, Vec<u8>>, u64) {
-    let (received, sender) = transfer_on(
-      streams,
-      ControllerKind::NewReno,
-      FRAME_CAP,
-      Wire::new(MS, channel),
-    );
+    let (received, sender) = transfer_on(streams, FRAME_CAP, Wire::new(MS, channel));
     (received, sender.retransmitted())
   }
 
@@ -1855,7 +1701,7 @@ mod tests {
   /// Sends one request and shows the probe path live: unacknowledged, a probe resends it (the retransmit
   /// counter moves). Returns the sender with the request still in flight, and the request's id.
   fn request_in_flight_and_probed() -> (Connection, u64) {
-    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let mut sender = fixed_window(FRAME_CAP);
     let id = open(&mut sender, &stream_content(9, 40));
     let (_pn, frames) = sender
       .poll_transmit(0, FRAME_CAP)
@@ -1918,8 +1764,8 @@ mod tests {
   /// frames are not applied again and it owes no fresh acknowledgement.
   #[test]
   fn a_duplicate_packet_number_is_discarded_not_processed_again() {
-    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut sender = fixed_window(FRAME_CAP);
+    let mut receiver = fixed_receiver(FRAME_CAP);
     let id = open(&mut sender, &stream_content(0xAB, 40));
     let (pn, frames) = sender
       .poll_transmit(0, FRAME_CAP)
@@ -1949,8 +1795,8 @@ mod tests {
   }
 
   /// AC (§4.9; RFC 9000 §12.2): a packet carries several frames when the budget allows, and multiplexed
-  /// streams still arrive exactly once, in order, under loss and reorder, under every law. Non-vacuous:
-  /// a packet carried more than one stream frame, and the loss path ran.
+  /// streams still arrive exactly once, in order, under loss and reorder. Non-vacuous: a packet carried
+  /// more than one stream frame, and the loss path ran.
   #[test]
   fn several_frames_per_packet_survive_loss_and_reorder() {
     let streams = vec![
@@ -1958,33 +1804,28 @@ mod tests {
       (3u64, stream_content(2, 20)),
       (7u64, stream_content(3, 300)),
     ];
-    for law in LAWS {
-      let (received, widest, retransmitted) = packed_transfer(law, &streams);
-      for (id, content) in &streams {
-        assert_eq!(
-          received.get(id),
-          Some(content),
-          "{law:?}: stream {id} arrived exactly"
-        );
-      }
-      assert!(
-        widest > 1,
-        "{law:?}: the widest packet carried {widest} stream frames"
+    let (received, widest, retransmitted) = packed_transfer(&streams);
+    for (id, content) in &streams {
+      assert_eq!(
+        received.get(id),
+        Some(content),
+        "stream {id} arrived exactly"
       );
-      assert!(retransmitted > 0, "{law:?}: the loss path ran");
     }
+    assert!(
+      widest > 1,
+      "the widest packet carried {widest} stream frames"
+    );
+    assert!(retransmitted > 0, "the loss path ran");
   }
 
-  /// Runs `streams` framed at [`PACKET_BUDGET`] under `law`, dropping the third and eleventh packets and
+  /// Runs `streams` framed at [`PACKET_BUDGET`], dropping the third and eleventh packets and
   /// reversing each sender batch; returns what arrived, the most stream frames one packet carried, and the
   /// frames retransmitted.
-  fn packed_transfer(
-    law: ControllerKind,
-    streams: &[(u64, Vec<u8>)],
-  ) -> (BTreeMap<u64, Vec<u8>>, usize, u64) {
-    let mut sender = fixed_window(PACKET_BUDGET, law);
+  fn packed_transfer(streams: &[(u64, Vec<u8>)]) -> (BTreeMap<u64, Vec<u8>>, usize, u64) {
+    let mut sender = fixed_window(PACKET_BUDGET);
     let ids = open_labelled(&mut sender, streams);
-    let mut receiver = fixed_receiver(PACKET_BUDGET, law);
+    let mut receiver = fixed_receiver(PACKET_BUDGET);
     let mut wire = Wire::new(MS, Channel::reordering(vec![3, 11]));
     let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for _ in 0..1_000_000 {
@@ -2002,7 +1843,7 @@ mod tests {
         break;
       }
       if moved == 0 {
-        assert!(wire.advance(&mut sender, &mut receiver), "{law:?}: stalled");
+        assert!(wire.advance(&mut sender, &mut receiver), "stalled");
       }
     }
     (relabel(received, &ids), wire.widest, sender.retransmitted())
@@ -2062,9 +1903,9 @@ mod tests {
     streams: &[(u64, Vec<u8>)],
     window: u64,
   ) -> (BTreeMap<u64, Vec<u8>>, u64) {
-    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let mut sender = fixed_window(FRAME_CAP);
     let ids = open_labelled(&mut sender, streams);
-    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut receiver = fixed_receiver(FRAME_CAP);
     let mut wire = Wire::new(MS, Channel::new(Vec::new()));
     let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut peak = 0u64;
@@ -2110,8 +1951,8 @@ mod tests {
     const EXCHANGES: u64 = 50;
     /// Shape: a few packets each way per exchange.
     const BODY: usize = 24;
-    let mut a = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut b = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut a = fixed_window(FRAME_CAP);
+    let mut b = fixed_receiver(FRAME_CAP);
     assert!(EXCHANGES > 4 * b.streams.limit(), "past the stream limit");
     let mut exchange = Lockstep {
       now: 0,
@@ -2159,8 +2000,8 @@ mod tests {
   /// and a lost reply cost 7 s (64 kbit/s, 100 ms, 1 % loss, 2026-09-28).
   #[test]
   fn a_finished_exchange_leaves_the_idle_peer_nothing_to_acknowledge() {
-    let mut a = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut b = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut a = fixed_window(FRAME_CAP);
+    let mut b = fixed_receiver(FRAME_CAP);
     let mut exchange = Lockstep {
       now: 0,
       peak_tracked: 0,
@@ -2268,27 +2109,17 @@ mod tests {
   }
 
   /// AC (§4.10a §8; RFC 9002 §6.2): a lone data packet that is dropped — a tail loss neither threshold
-  /// can see, since nothing after it is acknowledged — is recovered by the probe timeout, under every law.
+  /// can see, since nothing after it is acknowledged — is recovered by the probe timeout.
   #[test]
   fn a_single_packet_tail_loss_is_probed() {
     let streams = vec![(1u64, stream_content(4, 4))];
-    for law in LAWS {
-      let (received, sender) = transfer_on(
-        &streams,
-        law,
-        FRAME_CAP,
-        Wire::new(MS, Channel::new(vec![0])),
-      );
-      assert_eq!(
-        received.get(&1),
-        Some(&stream_content(4, 4)),
-        "{law:?}: the lone packet arrived"
-      );
-      assert!(
-        sender.retransmitted() >= 1,
-        "{law:?}: the probe recovered it"
-      );
-    }
+    let (received, sender) = transfer_on(&streams, FRAME_CAP, Wire::new(MS, Channel::new(vec![0])));
+    assert_eq!(
+      received.get(&1),
+      Some(&stream_content(4, 4)),
+      "the lone packet arrived"
+    );
+    assert!(sender.retransmitted() >= 1, "the probe recovered it");
   }
 
   /// RFC 9002 §5.1: the round trip is measured from the largest newly acknowledged packet's send to the
@@ -2297,7 +2128,6 @@ mod tests {
   fn the_rtt_is_measured_from_send_to_acknowledgement() {
     let (_, sender) = transfer_on(
       &[(1u64, stream_content(1, 24))],
-      ControllerKind::NewReno,
       FRAME_CAP,
       Wire::new(20 * MS, Channel::new(Vec::new())),
     );
@@ -2309,40 +2139,34 @@ mod tests {
     );
   }
 
-  /// AC (§4.10a §8): multiplexed streams all arrive exactly despite dropped packets, under every law.
+  /// AC (§4.10a §8): multiplexed streams all arrive exactly despite dropped packets.
   #[test]
   fn multiplexed_streams_survive_loss() {
     let streams = vec![
       (1u64, stream_content(1, 400)),
       (2u64, stream_content(9, 400)),
     ];
-    for law in LAWS {
-      let (received, sender) = transfer_on(
-        &streams,
-        law,
-        FRAME_CAP,
-        Wire::new(MS, Channel::forward(vec![3, 4])),
-      );
-      for (id, content) in &streams {
-        assert_eq!(
-          received.get(id),
-          Some(content),
-          "{law:?}: stream {id} arrived despite loss"
-        );
-      }
-      assert!(
-        sender.retransmitted() >= 1,
-        "{law:?}: the loss-recovery path ran"
+    let (received, sender) = transfer_on(
+      &streams,
+      FRAME_CAP,
+      Wire::new(MS, Channel::forward(vec![3, 4])),
+    );
+    for (id, content) in &streams {
+      assert_eq!(
+        received.get(id),
+        Some(content),
+        "stream {id} arrived despite loss"
       );
     }
+    assert!(sender.retransmitted() >= 1, "the loss-recovery path ran");
   }
 
   /// RFC 9002 §6.1.2: a packet lost behind fewer than three later packets is still declared lost once it
   /// is older than 9/8 of the RTT — by the loss timer, not a probe timeout — and retransmitted.
   #[test]
   fn the_time_threshold_declares_a_loss_the_packet_threshold_cannot() {
-    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut sender = fixed_window(FRAME_CAP);
+    let mut receiver = fixed_receiver(FRAME_CAP);
     sender.seed_rtt(10 * MS, 0);
     let _ = open(&mut sender, &stream_content(1, 3 * FRAME_CAP));
     let mut packets: Vec<(u64, Vec<Frame>)> = Vec::new();
@@ -2393,10 +2217,8 @@ mod tests {
       max_datagram: 1000,
       initial_window: 20_000,
       receive_ceiling: 20_000,
-      controller: ControllerKind::NewReno,
-      scheduler: Scheduler::StrictPriority,
     };
-    let mut sender = Connection::new(shape, Role::Client, 0, 1);
+    let mut sender = Connection::new(shape, Role::Client);
     sender.seed_rtt(100 * MS, 0);
     let _ = open(&mut sender, &vec![7u8; 20_000]);
     let mut sends = Vec::new();
@@ -2415,10 +2237,11 @@ mod tests {
       }
     }
     assert_eq!(sends.len(), 6, "all six packets left");
-    // cwnd 10 kB over 100 ms at 1.25× is 125 kB/s. A 1000-byte packet budget carries 978 bytes of stream
-    // data (one `Stream` frame header), so a packet leaves every 978 / 125,000 s = 7.824 ms after the
-    // quantum (the 2-packet floor).
-    let pace = stream_bytes_per_packet(1000) * 1_000_000_000 / 125_000;
+    // After the quantum (the 2-packet floor) a packet leaves every interval the controller's pacing rate
+    // gives its stream data: a 1000-byte packet budget carries 978 bytes (one `Stream` frame header). With
+    // Copa's 2 × cwnd / RTT — 10 kB over 100 ms — that is 978 / 200,000 s = 4.89 ms.
+    let rate = sender.controller().pacing_rate(sender.rtt());
+    let pace = crate::pacer::duration(stream_bytes_per_packet(1000), rate);
     assert_eq!(&sends[..2], &[0, 0], "the first quantum leaves at once");
     for pair in sends[2..].windows(2) {
       assert_eq!(
@@ -2433,8 +2256,8 @@ mod tests {
   /// the path went dark — collapse the window to the minimum.
   #[test]
   fn persistent_congestion_collapses_the_window() {
-    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut sender = fixed_window(FRAME_CAP);
+    let mut receiver = fixed_receiver(FRAME_CAP);
     sender.seed_rtt(10 * MS, 0);
     let _ = open(&mut sender, &stream_content(1, 20 * FRAME_CAP));
     // Everything sent in the first 500 ms is lost — the original flight and the probes the backed-off
@@ -2482,11 +2305,9 @@ mod tests {
       max_datagram: cap as u64,
       initial_window: initial,
       receive_ceiling: ceiling,
-      controller: ControllerKind::NewReno,
-      scheduler: Scheduler::StrictPriority,
     };
-    let mut sender = Connection::new(shape, Role::Client, 0, 1);
-    let mut receiver = Connection::new(shape, Role::Server, 0, 1);
+    let mut sender = Connection::new(shape, Role::Client);
+    let mut receiver = Connection::new(shape, Role::Server);
     // A receiver only acknowledges, which draws no RTT sample of its own; a session's handshake seeds both
     // ends' estimates (`Endpoint::establish`), which this does in its place.
     sender.seed_rtt(40 * MS, 0);
@@ -2515,38 +2336,36 @@ mod tests {
   }
 
   proptest! {
-    /// The behavioural oracle (R5): for any streams, any loss pattern, and every control law, the
-    /// receiver reassembles each stream exactly — in order, each byte once, never confused.
+    /// The behavioural oracle (R5): for any streams and any loss pattern, the receiver reassembles each
+    /// stream exactly — in order, each byte once, never confused.
     #[test]
     fn any_streams_any_loss_still_deliver(
       lens in prop::collection::vec(0usize..300, 1..4),
       drops in prop::collection::vec(0u64..150, 0..30),
-      law in 0usize..LAWS.len(),
     ) {
       let streams: Vec<(u64, Vec<u8>)> = lens
         .iter()
         .enumerate()
         .map(|(i, &len)| (u64::try_from(i * 2 + 1).unwrap_or(1), stream_content(u8::try_from(i).unwrap_or(0), len)))
         .collect();
-      let (received, _) = transfer_on(&streams, LAWS[law], FRAME_CAP, Wire::new(MS, Channel::new(drops)));
+      let (received, _) = transfer_on(&streams, FRAME_CAP, Wire::new(MS, Channel::new(drops)));
       for (id, content) in &streams {
         prop_assert_eq!(received.get(id), Some(content));
       }
     }
 
-    /// The reordering oracle: any streams, any loss, out-of-order delivery, every law — still exact.
+    /// The reordering oracle: any streams, any loss, out-of-order delivery — still exact.
     #[test]
     fn any_streams_survive_loss_and_reorder(
       lens in prop::collection::vec(0usize..200, 1..4),
       drops in prop::collection::vec(0u64..120, 0..20),
-      law in 0usize..LAWS.len(),
     ) {
       let streams: Vec<(u64, Vec<u8>)> = lens
         .iter()
         .enumerate()
         .map(|(i, &len)| (u64::try_from(i * 2 + 1).unwrap_or(1), stream_content(u8::try_from(i).unwrap_or(0), len)))
         .collect();
-      let (received, _) = transfer_on(&streams, LAWS[law], FRAME_CAP, Wire::new(MS, Channel::reordering(drops)));
+      let (received, _) = transfer_on(&streams, FRAME_CAP, Wire::new(MS, Channel::reordering(drops)));
       for (id, content) in &streams {
         prop_assert_eq!(received.get(id), Some(content));
       }
@@ -2554,26 +2373,22 @@ mod tests {
   }
 
   /// A long transfer under steady random loss (5 % both ways, the bake-off's thin-link case) completes
-  /// under every law and many seeds — no deadlock between the sender's credit and the receiver's
-  /// acknowledgements.
+  /// across many seeds — no deadlock between the sender's credit and the receiver's acknowledgements.
   #[test]
   fn a_long_transfer_under_random_loss_completes() {
-    for law in LAWS {
-      for seed in 1..=20u64 {
-        let mut rng = slates_machine::stats::Xorshift::new(seed);
-        let drops: Vec<u64> = (0..20_000u64).filter(|_| rng.below(20) == 0).collect();
-        let streams = vec![(1u64, stream_content(7, 16 * 1024))];
-        let (received, sender) =
-          transfer_on(&streams, law, 64, Wire::new(10 * MS, Channel::new(drops)));
-        assert_eq!(
-          received.get(&1).map(Vec::len),
-          Some(16 * 1024),
-          "{law:?} seed {seed}: stalled with {} in flight, window {}, rtx {}",
-          sender.bytes_in_flight(),
-          sender.congestion_window(),
-          sender.retransmitted()
-        );
-      }
+    for seed in 1..=20u64 {
+      let mut rng = slates_machine::stats::Xorshift::new(seed);
+      let drops: Vec<u64> = (0..20_000u64).filter(|_| rng.below(20) == 0).collect();
+      let streams = vec![(1u64, stream_content(7, 16 * 1024))];
+      let (received, sender) = transfer_on(&streams, 64, Wire::new(10 * MS, Channel::new(drops)));
+      assert_eq!(
+        received.get(&1).map(Vec::len),
+        Some(16 * 1024),
+        "seed {seed}: stalled with {} in flight, window {}, rtx {}",
+        sender.bytes_in_flight(),
+        sender.congestion_window(),
+        sender.retransmitted()
+      );
     }
   }
 
@@ -2587,7 +2402,7 @@ mod tests {
   fn a_silent_peer_costs_bounded_tracking_however_long_it_is_silent() {
     /// Shape: probe timeouts to run through — far past where the old growth was plain.
     const PROBE_TIMEOUTS: u64 = 1_000;
-    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let mut sender = fixed_window(FRAME_CAP);
     sender.seed_rtt(10 * MS, 0);
     // Two frames: the whole stream leaves in the first flight (the initial window holds more), so every
     // later packet is a probe copy and `originals` counts every original there will be.
@@ -2628,8 +2443,8 @@ mod tests {
   /// complete, and the client waited forever (a 64 kbit/s, 5 %-loss bake-off run deadlocked; 2026-09-27).
   #[test]
   fn a_late_request_copy_keeps_the_reply_in_flight() {
-    let mut client = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut server = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let mut client = fixed_window(FRAME_CAP);
+    let mut server = fixed_receiver(FRAME_CAP);
     let id = open(&mut client, &stream_content(1, 4));
     let (request_pn, request) = client.poll_transmit(0, FRAME_CAP).expect("the request");
     server.handle_incoming(0, request_pn, &request);

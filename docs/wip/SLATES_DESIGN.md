@@ -2715,7 +2715,13 @@ first, records on the second — each shared by every peer through the session p
 demultiplexer (§4.10a §8; a peer's re-dial after a lost session replaces the old session), and every
 peer dials it there, so both ends of every session are computed from the same file and can never
 disagree. A manifest with fewer than `f + 1` nodes, a repeated name or certificate, a base at the end
-of the port range, or an identity the TLS stack cannot use, is refused by name at boot. `status` reports the node's member id, `f`, host epoch,
+of the port range, or an identity the TLS stack cannot use, is refused by name at boot. The two serve
+sockets are bound once, before the daemon starts (`FleetTransport::bind`, between the pure plan and the
+daemon), so an address already in use refuses the start by plane and address, rather than leaving a
+daemon that can never be probed. A caller that already holds its ports hands the bound sockets over
+instead (`UdpSocket::adopt`, the socket-activation pattern), so a port is never released between learning
+it and serving on it
+(`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). `status` reports the node's member id, `f`, host epoch,
 the members it holds alive and the peers it has probed. A laptop has no manifest: its member id is
 its machine identity's hash and it is its own one member at `f = 0` — the same code path (R8).
 (A-13, `crates/server/src/deploy.rs`; proven by three real daemon processes in

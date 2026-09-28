@@ -26,7 +26,6 @@ use slates_rt::sim::{
   sim_udp_set_path,
 };
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{
   ConnectionShape, Priority, StreamRefusal, initial_receive_window,
 };
@@ -73,11 +72,7 @@ fn config() -> RuntimeConfig {
 /// A session shape at the fleet frame cap whose receive ceiling is `windows` initial windows — which also
 /// sets the stream limit (the ceiling over the frame cap, `crate::streams`).
 fn shape(windows: u64) -> ConnectionShape {
-  ConnectionShape::for_frame_cap(
-    FRAME_CAP,
-    windows * initial_receive_window(FRAME_CAP),
-    ControllerKind::NewReno,
-  )
+  ConnectionShape::for_frame_cap(FRAME_CAP, windows * initial_receive_window(FRAME_CAP))
 }
 
 /// The stream limit a [`shape`] of `windows` gives: the receive ceiling over the frame cap.

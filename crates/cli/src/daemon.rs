@@ -118,7 +118,14 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
         plan.membership.quorum.f
       );
       config = config.with_fleet(plan.membership);
-      Some(plan.transport)
+      // The serve sockets are bound here, before the daemon starts: an address in use refuses the start
+      // by name instead of leaving a daemon that can never be probed.
+      Some(
+        plan
+          .transport
+          .bind()
+          .map_err(|e| failed("fleet serve", e))?,
+      )
     }
     None => None,
   };

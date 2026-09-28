@@ -40,7 +40,7 @@ use slates_transport::handshake::Identity;
 
 use crate::config::{DurabilityBound, FleetMembership};
 use crate::dns::{self, Resolver};
-use crate::fleet::{FleetPeer, FleetTransport};
+use crate::fleet::{FleetPeer, FleetTransport, ServeAddresses};
 
 /// A node's advertised address as the manifest states it, with the node's **base** port: an IPv4 literal,
 /// or a DNS name the dialer resolves at every fresh dial ([`crate::dns`]).
@@ -181,8 +181,9 @@ pub struct FleetManifest {
 pub struct FleetPlan {
   /// The quorum, this node's member id, and its peers' ids — the config's fleet membership.
   pub membership: FleetMembership,
-  /// This node's identity, the fleet's TLS name, and each peer with its dial and serve addresses.
-  pub transport: FleetTransport,
+  /// This node's identity, the fleet's TLS name, each peer with its dial addresses, and this node's own
+  /// serve addresses — bound by [`FleetTransport::bind`] when the daemon starts, never by planning.
+  pub transport: FleetTransport<ServeAddresses>,
 }
 
 /// Which of a node's two serve sockets: the SWIM probe plane or the register record plane (the two ride
@@ -540,8 +541,10 @@ pub fn plan(
       enrollment_roots: manifest.enrollment_roots.clone(),
       identity,
       name: manifest.name.clone(),
-      probe_bind,
-      record_bind,
+      serve: ServeAddresses {
+        probe: probe_bind,
+        record: record_bind,
+      },
       peers,
       resolver,
     },
@@ -737,12 +740,12 @@ mod tests {
         let theirs = &plans[j].transport;
         assert_eq!(
           peer.address,
-          theirs.probe_bind.into(),
+          theirs.serve.probe.into(),
           "probe: dial == their bind"
         );
         assert_eq!(
           peer.record_address,
-          theirs.record_bind.into(),
+          theirs.serve.record.into(),
           "record: dial == their bind"
         );
       }
@@ -755,8 +758,8 @@ mod tests {
   fn the_port_layout_is_the_base_and_the_next() {
     let (manifest, keys) = manifest();
     let a = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a plan");
-    assert_eq!(a.transport.probe_bind.port(), 40_000);
-    assert_eq!(a.transport.record_bind.port(), 40_001);
+    assert_eq!(a.transport.serve.probe.port(), 40_000);
+    assert_eq!(a.transport.serve.record.port(), 40_001);
     let b_host = member_id(host_id_of_certificate(&manifest.nodes[1].certificate), 0);
     let to_b = a
       .transport
@@ -802,12 +805,12 @@ mod tests {
     );
     let a = plan(&manifest, "a", key_of(&keys, "a"), Some(resolver())).expect("a plan");
     assert_eq!(
-      a.transport.probe_bind,
+      a.transport.serve.probe,
       SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 7000),
       "a named node binds every interface on its base port"
     );
     assert_eq!(
-      a.transport.record_bind,
+      a.transport.serve.record,
       SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 7001)
     );
     assert_eq!(a.transport.resolver, Some(resolver()));

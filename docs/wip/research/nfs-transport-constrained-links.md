@@ -376,3 +376,23 @@ Each scenario measures:
     refusals for a bad budget or an oversized datagram, `DataBlocked`/`StreamDataBlocked` with re-armed
     reports, bounded merged ack ranges, and every simulated path carrying the floor as its MTU. Record:
     `docs/bugs/2026-09-28-packets-grew-past-the-datagram-floor.md`.
+- **Slice 2d (2026-09-28): the decisions — Copa and strict priority; the losers deleted.**
+  - **The congestion grid (57 scenarios, three seeds).** It took three rounds, each fixing the
+    transport or controller bug the previous round exposed:
+    - Copa's growth guard also blocked decreases, freezing an overshot window
+      (`docs/bugs/2026-09-28-copa-froze-an-overshot-window.md`).
+    - An idle peer's late acknowledgements of stream credit inflated the RTT, so a lost reply cost 7 s
+      (`docs/bugs/2026-09-28-idle-peer-acks-inflated-the-rtt.md`). Stream credit now rides every
+      acknowledgement, and `StreamsBlocked` (kind 10) is the liveness path.
+  - **Congestion control: Copa.** On the deciding round (`0def3b4`) it was the only law that never stalled
+    and stayed RTT-fair. It had the best goodput, with a shortfall geomean of 1.068 against NewReno's 15.8,
+    CUBIC's 14.0 and BBRv3's 2.56. Its ping p99 was within 3.05× of the best law in every scenario.
+  - **Scheduler: strict priority.** Its control p99 was within 1.15× of the best everywhere. Round-robin
+    reached 4.8×, and the weighted scheduler starved the control and metadata classes.
+  - **Deleted, not kept as a fallback.** `congestion::newreno`, `cubic` and `bbr`; `ControllerKind`;
+    Copa-Meta; the round-robin and weighted schedulers and `Scheduler`; and the delivery-rate sampler,
+    which only BBR used (Copa reads each acknowledgement's RTT sample and acknowledged bytes).
+  - **The harnesses remain as benchmarks of the chosen design.** `congestion_bakeoff` became
+    `congestion_bench`, and `scheduler_bakeoff` became `class_latency_bench`; each exits non-zero on a
+    stall, starvation or unfairness. Record: `docs/wip/BENCHMARKS.md` "Session-plane congestion control
+    and scheduling bake-offs", with the deciding rounds' raw rows under `docs/wip/research/data/`.

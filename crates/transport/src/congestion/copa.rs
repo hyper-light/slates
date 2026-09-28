@@ -129,12 +129,12 @@ impl Copa {
       .standing_rtt
       .map_or(fallback_rtt, |filter| filter.get())
       .max(1);
-    crate::delivery::rate(self.cwnd.saturating_mul(PACING_MULTIPLE), rtt)
+    crate::pacer::rate(self.cwnd.saturating_mul(PACING_MULTIPLE), rtt)
   }
 
   /// Processes an acknowledgement (§2.1, §2.2).
   pub fn on_ack(&mut self, event: &AckEvent<'_>) {
-    let Some(rtt) = event.sample.rtt else {
+    let Some(rtt) = event.rtt_sample else {
       return;
     };
     let now = event.now;
@@ -186,7 +186,7 @@ impl Copa {
       self.direction_mark = Some((now, self.cwnd));
     }
     // cwnd ± v/(δ·cwnd) packets per acknowledged packet, in bytes: acked · smss · v · (1/δ) / cwnd.
-    let numerator = u128::from(event.sample.newly_acked)
+    let numerator = u128::from(event.newly_acked)
       * u128::from(self.smss)
       * u128::from(self.velocity)
       * u128::from(self.inv_delta)
@@ -265,7 +265,7 @@ impl Copa {
   /// A loss: in the competitive mode, `1/δ` halves (at most once per RTT, never below the default); in the
   /// default mode a loss is not a signal (Copa is loss-insensitive, §1); persistent congestion collapses to
   /// the minimum window (mvfst).
-  pub fn on_loss(&mut self, event: &LossEvent<'_>) {
+  pub fn on_loss(&mut self, event: &LossEvent) {
     let srtt = event.srtt;
     if self.competitive && event.now.saturating_sub(self.last_loss_update) > srtt {
       self.inv_delta = (self.inv_delta / 2).max(self.default_inv_delta);
@@ -289,8 +289,6 @@ fn update_min(filter: &mut Option<WindowedMin>, now: u64, window: u64, value: u6
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::conn::SentPacket;
-  use crate::delivery::{RateSample, RateSnapshot};
   use crate::rtt::RttEstimator;
 
   /// Shape: a thousand-byte datagram.
@@ -311,22 +309,10 @@ mod tests {
     estimator: &RttEstimator,
     cwnd_limited: bool,
   ) {
-    let packets = [SentPacket {
-      pn: 0,
-      sent_at: now.saturating_sub(rtt),
-      bytes: acked,
-      rate: RateSnapshot::default(),
-    }];
     law.on_ack(&AckEvent {
       now,
-      acked: &packets,
-      sample: RateSample {
-        rtt: Some(rtt),
-        newly_acked: acked,
-        ..RateSample::default()
-      },
-      in_flight: 0,
-      delivered: 0,
+      rtt_sample: Some(rtt),
+      newly_acked: acked,
       cwnd_limited,
       rtt: estimator,
     });
@@ -435,10 +421,6 @@ mod tests {
     let raised = law.inv_delta;
     law.on_loss(&LossEvent {
       now: 3_000 * MS,
-      lost: &[],
-      largest_sent: 0,
-      in_flight: 0,
-      lost_total: MD,
       persistent: false,
       srtt: 100 * MS,
     });

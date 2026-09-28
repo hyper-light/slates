@@ -36,7 +36,6 @@ fn shape() -> slates_transport::connection::ConnectionShape {
   slates_transport::connection::ConnectionShape::for_frame_cap(
     FRAME_CAP,
     RECEIVE_CEILING_WINDOWS * slates_transport::connection::initial_receive_window(FRAME_CAP),
-    slates_transport::congestion::ControllerKind::NewReno,
   )
 }
 

@@ -1,25 +1,25 @@
-//! The session plane's congestion-control bake-off (§4.10a; the constrained-link design,
+//! The session plane's congestion benchmark (§4.10a; the constrained-link design,
 //! `docs/wip/research/nfs-transport-constrained-links.md` §5.3 and §9): real endpoints — TLS 1.3
-//! handshake, packet protection, the clocked connection — over the simulated network (`crates/rt/src/sim.rs`),
-//! each control law in turn, across the scenarios the research note names.
+//! handshake, packet protection, the clocked connection with its Copa controller — over the simulated
+//! network (`crates/rt/src/sim.rs`), across the scenarios the research note names.
+//!
+//! This grid decided the controller (the 2026-09-28 bake-off, `docs/wip/BENCHMARKS.md`: Copa over NewReno,
+//! CUBIC, BBRv3 and Copa-Meta, the losers deleted); it now records the chosen controller on the same grid,
+//! so a regression shows against the recorded numbers.
 //!
 //! One run: a bulk flow (a client sends `bulk_bytes` on one stream) and a ping flow (a request/reply of
-//! [`PING_BYTES`] at a gap holding its load to [`PING_LOAD_PERMILLE`] of the link) share one bottleneck toward the servers; the reverse direction is
-//! the propagation delay alone. The ping flow's request latency is the headline metric — how long a small
-//! request waits behind bulk data at the bottleneck (research note §5.3) — beside the bulk goodput against
-//! the link's capacity. Two-flow scenarios report Jain's fairness index of the flows' goodputs.
+//! [`PING_BYTES`] at a gap holding its load to [`PING_LOAD_PERMILLE`] of the link) share one bottleneck
+//! toward the servers; the reverse direction is the propagation delay alone. The ping flow's request
+//! latency is the headline metric — how long a small request waits behind bulk data at the bottleneck
+//! (research note §5.3) — beside the bulk goodput against the link's capacity. Two-flow scenarios report
+//! Jain's fairness index of the flows' goodputs.
 //!
-//! The selection rule, fixed before any run (a winner chosen after peeking is not evidence):
-//! 1. disqualified if any run stalls, delivers wrongly, or (two flows of the law) scores Jain below 0.9;
-//! 2. primary: the steady-state ping p99 latency under load (over [`PINGS`] pings per run), as a geometric
-//!    mean over scenarios of the law's p99 over the best law's p99 in that scenario (lower is better), with
-//!    each law's worst scenario reported beside it — the p99 must be solid everywhere, not on average;
-//! 3. secondary: the bulk goodput, as the same geometric mean of the best law's goodput over the law's
-//!    (lower is better).
+//! **Failures** (the process exits non-zero): any run that stalls past its bound
+//! ([`Scenario::stall_bound_ns`]), or a two-flow scenario scoring Jain below [`FAIRNESS_FLOOR`].
 //!
-//! `cargo run --release -p slates-transport --example congestion_bakeoff` prints one CSV row per run and
-//! the ranking. Deterministic from the seeds (the simulation's virtual clock), except TLS randomness,
-//! which reaches only the connection ids and so BBR's randomized probe timing — hence several seeds.
+//! `cargo run --release -p slates-transport --example congestion_bench [scenario-filter]` prints one CSV row
+//! per run, then the per-scenario summary. Deterministic from the seeds (the simulation's virtual clock).
+//! `BAKEOFF_PROGRESS=1` reports virtual progress; `BAKEOFF_TRACE=1` prints every ping.
 
 // Benchmark harness: an unwrap here is a failed run, which is what it should be.
 #![allow(
@@ -40,7 +40,6 @@ use slates_rt::sim::{
   sim_udp_set_pair_path, sim_udp_set_path, sim_udp_stats,
 };
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{ConnectionShape, Priority, initial_receive_window};
 use slates_transport::endpoint::{Endpoint, MAX_PACKET_PAYLOAD, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
@@ -49,24 +48,24 @@ use slates_transport::session::STREAM_FRAME_HEADER_BYTES;
 /// Derived: the wire bytes each packet adds around a frame's data — the short header and AEAD tag
 /// (`MIN_DATAGRAM_BYTES − MAX_PACKET_PAYLOAD`) and one `Stream` frame header — for sizing a class's load.
 const WIRE_OVERHEAD: usize = MIN_DATAGRAM_BYTES - MAX_PACKET_PAYLOAD + STREAM_FRAME_HEADER_BYTES;
-/// Format: the fleet's packet budget, so the bake-off frames exactly as the daemon does.
+/// Format: the fleet's packet budget, so the benchmark frames exactly as the daemon does.
 const FRAME_CAP: usize = MAX_PACKET_PAYLOAD;
 /// Shape: the ping request and reply size — a small metadata operation.
 const PING_BYTES: usize = 64;
 /// Shape: the steady-state pings each run collects — enough that the p99 is a percentile (the tenth-worst
 /// sample), not the second-worst of a hundred and fifty, which a single loss recovery decides (the first
-/// full grid, 2026-09-27, measured about 150 per run and could not rank the laws' tails).
+/// full grid, 2026-09-27, measured about 150 per run and could not resolve the tail).
 const PINGS: u64 = 1000;
 /// Shape: the ping flow's share of the link, per mille — light enough that it measures the bulk flow's
 /// queue rather than adding its own.
 const PING_LOAD_PERMILLE: u64 = 10;
 /// Shape: the warm-up before the steady window, in round trips (and at least [`MIN_WARMUP_NS`]) — past
-/// every law's startup.
+/// the controller's startup.
 const WARMUP_RTTS: u64 = 20;
 /// Shape: the warm-up's floor, 5 s.
 const MIN_WARMUP_NS: u64 = 5_000_000_000;
 /// Shape: the server name the identities carry.
-const NAME: &str = "slates-bakeoff";
+const NAME: &str = "slates-bench";
 /// Format: nanoseconds per millisecond.
 const MS: u64 = 1_000_000;
 /// Shape: the receive ceiling in BDPs — generous, so the controller, never flow control, is the limit.
@@ -79,17 +78,8 @@ const SEEDS: [u64; 3] = [1, 2, 3];
 /// the first grid (NewReno at 4 % of capacity, about 25× ideal, 2026-09-27), so only a genuine stall
 /// trips it; before this bound one Copa run spun for 2.5 h of wall time and held up the whole grid.
 const STALL_FACTOR: u64 = 100;
-/// Shape: the fairness floor of the selection rule (Jain's index, 1 is perfectly fair).
+/// Shape: the fairness floor (Jain's index, 1 is perfectly fair) — the bake-off's disqualification line.
 const FAIRNESS_FLOOR: f64 = 0.9;
-
-/// The laws in the bake-off.
-const LAWS: [ControllerKind; 5] = [
-  ControllerKind::NewReno,
-  ControllerKind::Cubic,
-  ControllerKind::Bbr,
-  ControllerKind::Copa,
-  ControllerKind::CopaMeta,
-];
 
 /// A bandwidth change during the run: at `at_ns`, the link becomes `rate` bits per second.
 #[derive(Clone, Copy, Debug)]
@@ -108,8 +98,8 @@ struct Scenario {
   loss: SimLoss,
   jitter_ns: u64,
   reorders: bool,
-  /// A second bulk flow's round trip (a fairness scenario), and the law it runs (`None`: the same law).
-  second_flow: Option<(u64, Option<ControllerKind>)>,
+  /// A second bulk flow's round trip (a fairness scenario).
+  second_flow: Option<u64>,
   steps: Vec<Step>,
 }
 
@@ -235,12 +225,12 @@ fn self_signed(name: &str) -> Identity {
   )
 }
 
-fn shape(law: ControllerKind, scenario: &Scenario) -> ConnectionShape {
+fn shape(scenario: &Scenario) -> ConnectionShape {
   let ceiling = scenario
     .bdp()
     .saturating_mul(CEILING_BDPS)
     .max(64 * initial_receive_window(FRAME_CAP));
-  ConnectionShape::for_frame_cap(FRAME_CAP, ceiling, law)
+  ConnectionShape::for_frame_cap(FRAME_CAP, ceiling)
 }
 
 static BULK_DONE: AtomicBool = AtomicBool::new(false);
@@ -268,8 +258,8 @@ impl Pair {
   }
 }
 
-/// Runs one scenario with one law and one seed.
-fn run(law: ControllerKind, scenario: &Scenario, seed: u64) -> Outcome {
+/// Runs one scenario with one seed.
+fn run(scenario: &Scenario, seed: u64) -> Outcome {
   BULK_DONE.store(false, Ordering::Release);
   let mut sim = SimRuntime::new(&config(), seed).unwrap();
   let shard = sim.shard_ids()[0];
@@ -278,7 +268,7 @@ fn run(law: ControllerKind, scenario: &Scenario, seed: u64) -> Outcome {
   let scenario_task = scenario.clone();
   sim
     .spawn_on(shard, async move {
-      coordinator(law, scenario_task, done_tx, ping_tx).await;
+      coordinator(scenario_task, done_tx, ping_tx).await;
     })
     .unwrap();
   let wall = std::time::Instant::now();
@@ -311,7 +301,6 @@ fn run(law: ControllerKind, scenario: &Scenario, seed: u64) -> Outcome {
 
 /// Builds the network, starts every role as a child task, waits for the bulk flows, then ends the rest.
 async fn coordinator(
-  law: ControllerKind,
   scenario: Scenario,
   done: Sender<(usize, u64, u64)>,
   pings: Sender<(u64, u64)>,
@@ -339,11 +328,11 @@ async fn coordinator(
   let ping_pair = Pair::bind();
   let (ping_client, ping_server) = ping_pair.ports();
   sim_udp_set_pair_path(ping_client, ping_server, forward_for(scenario.rtt_ns));
-  let mut flows = vec![(Pair::bind(), scenario.rtt_ns, law)];
-  if let Some((rtt, other)) = scenario.second_flow {
-    flows.push((Pair::bind(), rtt, other.unwrap_or(law)));
+  let mut flows = vec![(Pair::bind(), scenario.rtt_ns)];
+  if let Some(rtt) = scenario.second_flow {
+    flows.push((Pair::bind(), rtt));
   }
-  for (pair, rtt, _) in &flows {
+  for (pair, rtt) in &flows {
     let (client, server) = pair.ports();
     sim_udp_set_pair_path(client, server, forward_for(*rtt));
     if *rtt != scenario.rtt_ns {
@@ -360,8 +349,8 @@ async fn coordinator(
   let mut servers = Vec::new();
   let mut clients = Vec::new();
   let (bulk_done_tx, bulk_done_rx) = channel::<()>();
-  for (index, (pair, _, flow_law)) in flows.into_iter().enumerate() {
-    let flow_shape = shape(flow_law, &scenario);
+  for (index, (pair, _)) in flows.into_iter().enumerate() {
+    let flow_shape = shape(&scenario);
     let client_identity = self_signed(NAME);
     let server_identity = self_signed(NAME);
     let (client_port, server_port) = pair.ports();
@@ -422,7 +411,7 @@ async fn coordinator(
       .unwrap(),
     );
   }
-  let ping_shape = shape(law, &scenario);
+  let ping_shape = shape(&scenario);
   let ping_server_identity = self_signed(NAME);
   let ping_client_identity = self_signed(NAME);
   let ping_server_cert = ping_server_identity.certificate();
@@ -614,14 +603,14 @@ fn scenarios() -> Vec<Scenario> {
     },
   ];
   all.push(step);
-  // Fairness: two flows of the law, equal RTT and unequal RTT.
+  // Fairness: two flows, equal RTT and unequal RTT.
   let mut fair = base(
     "fair 2 flows rate=10M rtt=50ms".to_owned(),
     10_000_000,
     50,
     SimLoss::NONE,
   );
-  fair.second_flow = Some((50 * MS, None));
+  fair.second_flow = Some(50 * MS);
   all.push(fair);
   let mut rtt_fair = base(
     "rtt-fair 2 flows 20ms vs 100ms rate=10M".to_owned(),
@@ -629,26 +618,17 @@ fn scenarios() -> Vec<Scenario> {
     20,
     SimLoss::NONE,
   );
-  rtt_fair.second_flow = Some((100 * MS, None));
+  rtt_fair.second_flow = Some(100 * MS);
   all.push(rtt_fair);
-  // Coexistence with a loss-based (CUBIC) cross flow on the same link.
-  let mut coexist = base(
-    "coexist vs CUBIC rate=10M rtt=50ms".to_owned(),
-    10_000_000,
-    50,
-    SimLoss::NONE,
-  );
-  coexist.second_flow = Some((50 * MS, Some(ControllerKind::Cubic)));
-  all.push(coexist);
   all
 }
 
 fn main() {
   let filter = std::env::args().nth(1);
   println!(
-    "scenario,law,seed,goodput_mbps,capacity_share,ping_p50_ms,ping_p99_ms,ping_max_ms,steady_p50_ms,steady_p99_ms,pings,peak_queue_kb,dropped_queue,dropped_loss,jain,stalled"
+    "scenario,seed,goodput_mbps,capacity_share,ping_p50_ms,ping_p99_ms,ping_max_ms,steady_p50_ms,steady_p99_ms,pings,peak_queue_kb,dropped_queue,dropped_loss,jain,stalled"
   );
-  let mut rows: Vec<(String, ControllerKind, Outcome)> = Vec::new();
+  let mut rows: Vec<(String, Outcome)> = Vec::new();
   for scenario in scenarios() {
     if filter
       .as_ref()
@@ -656,117 +636,87 @@ fn main() {
     {
       continue;
     }
-    for law in LAWS {
-      for seed in SEEDS {
-        let outcome = run(law, &scenario, seed);
-        let goodput = outcome.goodputs.first().copied().unwrap_or(0.0);
-        println!(
-          "{},{:?},{},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{},{:.1},{},{},{:.3},{}",
-          scenario.name,
-          law,
-          seed,
-          goodput / 1e6,
-          goodput / scenario.rate as f64,
-          outcome.percentile(500),
-          outcome.percentile(990),
-          outcome.percentile(1000),
-          outcome.steady_percentile(500),
-          outcome.steady_percentile(990),
-          outcome.pings_ns.len(),
-          outcome.peak_queue as f64 / 1024.0,
-          outcome.dropped_queue,
-          outcome.dropped_loss,
-          outcome.jain(),
-          outcome.stalled
-        );
-        if std::env::var_os("BAKEOFF_TRACE").is_some() {
-          for (at, latency) in &outcome.pings_ns {
-            println!(
-              "trace,{},{:?},{},{:.1},{:.1}",
-              scenario.name,
-              law,
-              seed,
-              *at as f64 / MS as f64,
-              *latency as f64 / MS as f64
-            );
-          }
+    for seed in SEEDS {
+      let outcome = run(&scenario, seed);
+      let goodput = outcome.goodputs.first().copied().unwrap_or(0.0);
+      println!(
+        "{},{},{:.3},{:.3},{:.1},{:.1},{:.1},{:.1},{:.1},{},{:.1},{},{},{:.3},{}",
+        scenario.name,
+        seed,
+        goodput / 1e6,
+        goodput / scenario.rate as f64,
+        outcome.percentile(500),
+        outcome.percentile(990),
+        outcome.percentile(1000),
+        outcome.steady_percentile(500),
+        outcome.steady_percentile(990),
+        outcome.pings_ns.len(),
+        outcome.peak_queue as f64 / 1024.0,
+        outcome.dropped_queue,
+        outcome.dropped_loss,
+        outcome.jain(),
+        outcome.stalled
+      );
+      if std::env::var_os("BAKEOFF_TRACE").is_some() {
+        for (at, latency) in &outcome.pings_ns {
+          println!(
+            "trace,{},{},{:.1},{:.1}",
+            scenario.name,
+            seed,
+            *at as f64 / MS as f64,
+            *latency as f64 / MS as f64
+          );
         }
-        rows.push((scenario.name.clone(), law, outcome));
       }
+      rows.push((scenario.name.clone(), outcome));
     }
   }
-  rank(&rows);
+  if !report(&rows) {
+    std::process::exit(1);
+  }
 }
 
-/// Applies the selection rule stated in the module doc and prints the ranking.
-fn rank(rows: &[(String, ControllerKind, Outcome)]) {
-  let names: std::collections::BTreeSet<&String> = rows.iter().map(|(name, _, _)| name).collect();
-  let mut latency_ratio = [0.0f64; LAWS.len()];
-  let mut worst_latency: Vec<(f64, String)> = vec![(1.0, String::new()); LAWS.len()];
-  let mut goodput_ratio = [0.0f64; LAWS.len()];
-  // Every distinct disqualifying reason per law, so a verdict never hides a second failure.
-  let mut disqualified: Vec<std::collections::BTreeSet<String>> =
-    vec![std::collections::BTreeSet::new(); LAWS.len()];
-  let mut counted: f64 = 0.0;
+/// Prints each scenario's mean steady p99 and goodput share across its seeds, and every failure (a stall,
+/// or a two-flow scenario below the fairness floor); returns whether there were none.
+fn report(rows: &[(String, Outcome)]) -> bool {
+  let names: std::collections::BTreeSet<&String> = rows.iter().map(|(name, _)| name).collect();
+  let mut failures: Vec<String> = Vec::new();
+  println!();
+  println!("scenario,mean_steady_p99_ms,worst_steady_p99_ms,mean_capacity_share");
   for name in names {
-    let mut p99 = [0.0f64; LAWS.len()];
-    let mut goodput = [0.0f64; LAWS.len()];
-    for (index, law) in LAWS.iter().enumerate() {
-      let runs: Vec<&Outcome> = rows
-        .iter()
-        .filter(|(n, l, _)| n == name && l == law)
-        .map(|(_, _, o)| o)
-        .collect();
-      for outcome in &runs {
-        if outcome.stalled {
-          disqualified[index].insert(format!("stalled in {name}"));
-        }
-        let same_law_pair = outcome.goodputs.len() == 2 && !name.starts_with("coexist");
-        if same_law_pair && outcome.jain() < FAIRNESS_FLOOR {
-          disqualified[index].insert(format!("Jain {:.3} in {name}", outcome.jain()));
-        }
+    let runs: Vec<&Outcome> = rows
+      .iter()
+      .filter(|(n, _)| n == name)
+      .map(|(_, outcome)| outcome)
+      .collect();
+    for outcome in &runs {
+      if outcome.stalled {
+        failures.push(format!("stalled in {name}"));
       }
-      p99[index] =
-        runs.iter().map(|o| o.steady_percentile(990)).sum::<f64>() / runs.len().max(1) as f64;
-      goodput[index] = runs
-        .iter()
-        .map(|o| o.goodputs.first().copied().unwrap_or(0.0))
-        .sum::<f64>()
-        / runs.len().max(1) as f64;
-    }
-    let best_p99 = p99.iter().copied().fold(f64::INFINITY, f64::min).max(1e-9);
-    let best_goodput = goodput.iter().copied().fold(0.0, f64::max).max(1e-9);
-    for index in 0..LAWS.len() {
-      let ratio = p99[index].max(1e-9) / best_p99;
-      if ratio > worst_latency[index].0 {
-        worst_latency[index] = (ratio, name.to_string());
+      if outcome.goodputs.len() == 2 && outcome.jain() < FAIRNESS_FLOOR {
+        failures.push(format!("Jain {:.3} in {name}", outcome.jain()));
       }
-      latency_ratio[index] += ratio.ln();
-      goodput_ratio[index] += (best_goodput / goodput[index].max(1e-9)).ln();
     }
-    counted += 1.0;
+    let count = runs.len().max(1) as f64;
+    let p99s: Vec<f64> = runs.iter().map(|o| o.steady_percentile(990)).collect();
+    let mean_p99 = p99s.iter().sum::<f64>() / count;
+    let worst_p99 = p99s.iter().copied().fold(0.0, f64::max);
+    let rate = scenarios()
+      .iter()
+      .find(|scenario| &scenario.name == name)
+      .map_or(1.0, |scenario| scenario.rate as f64);
+    let share = runs
+      .iter()
+      .map(|o| o.goodputs.first().copied().unwrap_or(0.0) / rate)
+      .sum::<f64>()
+      / count;
+    println!("{name},{mean_p99:.1},{worst_p99:.1},{share:.3}");
   }
   println!();
-  println!(
-    "law,p99_latency_vs_best_geomean,worst_p99_vs_best,worst_scenario,goodput_shortfall_vs_best_geomean,disqualified"
-  );
-  for (index, law) in LAWS.iter().enumerate() {
-    println!(
-      "{:?},{:.3},{:.3},{},{:.3},{}",
-      law,
-      (latency_ratio[index] / counted.max(1.0)).exp(),
-      worst_latency[index].0,
-      worst_latency[index].1,
-      (goodput_ratio[index] / counted.max(1.0)).exp(),
-      if disqualified[index].is_empty() {
-        "no".to_owned()
-      } else {
-        disqualified[index]
-          .iter()
-          .cloned()
-          .collect::<Vec<_>>()
-          .join("; ")
-      }
-    );
+  if failures.is_empty() {
+    println!("failures: none");
+  } else {
+    println!("failures: {}", failures.join("; "));
   }
+  failures.is_empty()
 }

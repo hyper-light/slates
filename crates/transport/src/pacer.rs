@@ -9,7 +9,8 @@
 //! Sans-io: it reads the caller's clock and the controller's rate; the connection reports when the next
 //! paced packet may leave, and the endpoint sleeps until then.
 
-use crate::delivery;
+/// Format: nanoseconds per second, the unit conversion of a rate in bytes per second.
+pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// The pacer's state.
 #[derive(Debug, Default)]
@@ -33,7 +34,7 @@ impl Pacer {
       None => quantum,
       Some(then) => self
         .tokens
-        .saturating_add(delivery::volume(rate, now.saturating_sub(then)))
+        .saturating_add(volume(rate, now.saturating_sub(then)))
         .min(quantum),
     };
     self.refilled_at = Some(now);
@@ -47,7 +48,7 @@ impl Pacer {
     if self.tokens >= need {
       return now;
     }
-    now.saturating_add(delivery::duration(need - self.tokens, rate))
+    now.saturating_add(duration(need.saturating_sub(self.tokens), rate))
   }
 
   /// Spends `bytes` of tokens for a packet that left at `now`.
@@ -55,6 +56,34 @@ impl Pacer {
     self.refill(now, rate, quantum);
     self.tokens = self.tokens.saturating_sub(bytes);
   }
+}
+
+/// `bytes` over `interval_ns`, in bytes per second (saturating, never dividing by zero).
+pub fn rate(bytes: u64, interval_ns: u64) -> u64 {
+  if interval_ns == 0 {
+    return 0;
+  }
+  let scaled =
+    u128::from(bytes).saturating_mul(u128::from(NANOS_PER_SECOND)) / u128::from(interval_ns);
+  u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// The bytes a `rate` (bytes per second) carries in `interval_ns`.
+pub fn volume(rate: u64, interval_ns: u64) -> u64 {
+  let scaled =
+    u128::from(rate).saturating_mul(u128::from(interval_ns)) / u128::from(NANOS_PER_SECOND);
+  u64::try_from(scaled).unwrap_or(u64::MAX)
+}
+
+/// The time, nanoseconds, `bytes` take at `rate` bytes per second (rounded up; `u64::MAX` at rate zero).
+pub fn duration(bytes: u64, rate: u64) -> u64 {
+  if rate == 0 {
+    return u64::MAX;
+  }
+  let scaled = u128::from(bytes)
+    .saturating_mul(u128::from(NANOS_PER_SECOND))
+    .div_ceil(u128::from(rate));
+  u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -99,5 +128,14 @@ mod tests {
       later + MS,
       "the third packet after idle waits"
     );
+  }
+
+  /// The unit conversions agree with each other and with their definitions.
+  #[test]
+  fn rate_volume_and_duration_are_inverses() {
+    assert_eq!(rate(1_000_000, NANOS_PER_SECOND), 1_000_000);
+    assert_eq!(volume(1_000_000, 20 * MS), 20_000);
+    assert_eq!(duration(20_000, 1_000_000), 20 * MS);
+    assert_eq!(duration(1, 0), u64::MAX, "no rate, no finite time");
   }
 }

@@ -486,3 +486,63 @@ NFSv3 and 43 µs over NFSv4.2. NFSv4.2's `read` costs more than NFSv3's (47 agai
 open and close is a stateful OPEN and CLOSE round trip that NFSv3 does not make. An in-process GETATTR
 through the kernel client measured 27 µs (epoll) and 999 µs (io_uring) after the spin fix alone. The
 io_uring gap was the harvest's sleep (`docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md`).
+
+## Session-plane congestion control and scheduling bake-offs (2026-09-28)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GiB. **Load:** 2.8–4.4 load average (another project's tests were
+running; the runs are in simulated time, so the load does not change their numbers).
+**Commands (the contract):**
+
+- `cargo run --release -p slates-transport --example congestion_bakeoff`
+- `cargo run --release -p slates-transport --example scheduler_bakeoff`
+
+**Setup.** Real endpoints — TLS 1.3, packet protection, the clocked connection — over the simulated network
+(`crates/rt/src/sim.rs`): a bottleneck with a drop-tail queue of one BDP, random and burst loss, reordering,
+and the 1,200-byte floor as MTU. Three seeds per scenario. The selection rules were fixed in each harness's
+module doc before any run.
+
+**Congestion control — 57 scenarios, 5 laws.** The grid is rate {64 k, 1 M, 10 M, 100 M} × RTT
+{20, 100, 300 ms} × loss {0, 0.1, 1, 5 %}, plus buffer depths, reordering, burst loss, a bandwidth step,
+same-RTT and RTT fairness, and coexistence with CUBIC. Deciding round `0def3b4`, raw rows in
+`docs/wip/research/data/2026-09-28-congestion-grid-0def3b4.csv`:
+
+| law | ping p99 vs best (geomean) | worst p99 vs best | goodput shortfall (geomean) | verdict |
+|---|---|---|---|---|
+| **Copa** (NSDI'18, δ = 0.5) | 1.268 | 3.05 (1 M, 20 ms, 5 %) | **1.068** | **selected** |
+| NewReno (RFC 9002) | 1.207 | 3.86 | 15.83 | rejected: stalled at 100 M with 1 % and 5 % loss; RTT fairness Jain 0.893 |
+| CUBIC + HyStart++ (RFC 9438/9406) | 1.231 | 3.09 | 14.04 | rejected: stalled at 100 M with 1 % and 5 % loss |
+| BBRv3 (draft-06) | 1.343 | 10.81 | 2.56 | rejected: stalled at 100 M, 300 ms, 5 % |
+| Copa-Meta (δ = 0.04) | 1.450 | 3.46 | 1.083 | rejected: RTT fairness Jain 0.840 |
+
+Where Copa trails on p99, the better number usually comes from a loss-based law whose bulk flow collapsed:
+NewReno at 100 M, 0.1 % loss carries 3.6 % of the link, so its pings cross an idle path. Copa's genuine cost
+is thin links with little or no loss: at 64 kbit/s and no loss its p99 is 678 ms against NewReno's 289 ms,
+because Copa holds a small standing queue by design (about 1/δ packets, each 146 ms at that rate).
+
+**Earlier rounds** (their raw files were lost with the session scratchpad; the numbers below are this
+session's record and the bug records). Each round's anomaly was a transport or controller bug, not a
+property of a law:
+
+- `3a0d86e` (partial): one Copa run spun 2.5 h with no stall bound, so the harness gained a per-run bound.
+- `2e60c2f`: Copa's p99 at 100 M/20 ms was 103 ms with 92,500 queue drops per run
+  (`docs/bugs/2026-09-28-copa-froze-an-overshot-window.md`).
+- `8907c6f`: every law's thin-link p99 was about 7 s
+  (`docs/bugs/2026-09-28-idle-peer-acks-inflated-the-rtt.md`).
+
+The first scheduler grid (`4a3f6d7`) found packets past the datagram floor
+(`docs/bugs/2026-09-28-packets-grew-past-the-datagram-floor.md`).
+
+**Scheduler — 13 scenarios, 3 schedulers.** The grid is rate {1, 10, 100 M} × RTT {20, 100 ms} × loss
+{0, 1 %}, plus burst loss. Each session carries 4 bulk transfers, metadata at 5 % of the link and control at
+1 %, all under Copa. Raw rows in `docs/wip/research/data/2026-09-28-scheduler-grid-0def3b4.csv`:
+
+| scheduler | control p99 vs best (geomean) | worst | metadata p99 (geomean) | goodput shortfall | verdict |
+|---|---|---|---|---|---|
+| **strict priority** | **1.023** | **1.153** | **1.027** | 1.075 | **selected** |
+| round-robin | 1.222 | 4.822 | 1.219 | 1.081 | rejected: control tail 4.8× |
+| weighted (deficit round-robin) | — | — | — | 1.006 | rejected: starved control and metadata |
+
+The weighted scheduler completed zero control and zero metadata exchanges at 100 M, 100 ms, 0 % loss in all
+three seeds. That is almost certainly a defect in its deficit accounting rather than the algorithm. It was not
+repaired: strict priority is optimal for the top class by construction and already sits within 1.15× of the
+best everywhere, so a correct deficit scheduler could win only the secondary goodput criterion.

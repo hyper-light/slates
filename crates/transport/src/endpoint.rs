@@ -305,8 +305,6 @@ pub struct Endpoint {
   conn: Connection,
   rx_largest: u64,
   frame_cap: usize,
-  /// Whether the controller has been reseeded from the connection id (once, when it is first derived).
-  seeded: bool,
   /// A client's final handshake flight, kept after establishment: a raw handshake datagram arriving on
   /// an established session is a server still asking for it (its confirmation raced this end's exit
   /// from the handshake), and is answered by resending it. Empty on a server.
@@ -376,10 +374,9 @@ impl Endpoint {
       pinned: Some(pinned.clone()),
       keys: None,
       cid: None,
-      conn: Connection::new(shape, Role::Client, now_ns(), 0),
+      conn: Connection::new(shape, Role::Client),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
-      seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
       reassembler: crate::flight::Reassembler::new(),
@@ -411,10 +408,9 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
-      conn: Connection::new(shape, Role::Server, now_ns(), 0),
+      conn: Connection::new(shape, Role::Server),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
-      seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
       reassembler: crate::flight::Reassembler::new(),
@@ -449,10 +445,9 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
-      conn: Connection::new(shape, Role::Server, now_ns(), 0),
+      conn: Connection::new(shape, Role::Server),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
-      seeded: false,
       final_flight: Vec::new(),
       pending_flight: Vec::new(),
       reassembler: crate::flight::Reassembler::new(),
@@ -484,14 +479,7 @@ impl Endpoint {
   /// the peer's certificate) in the demultiplexer, so the peer's packets route to this session — and
   /// replaces any session the same peer established before.
   pub fn connection_id(&mut self) -> Result<ConnectionId, EndpointError> {
-    let id = self.connection_id_inner()?;
-    if !self.seeded {
-      // The congestion controller's randomized timing is seeded from the session's connection id — unique
-      // per session and fixed once derived (see `ConnectionShape`).
-      self.seeded = true;
-      self.conn.reseed(u64::from_le_bytes(id));
-    }
-    Ok(id)
+    self.connection_id_inner()
   }
 
   fn connection_id_inner(&mut self) -> Result<ConnectionId, EndpointError> {
@@ -1558,7 +1546,6 @@ mod tests {
             crate::connection::ConnectionShape::for_frame_cap(
               MAX_PACKET_PAYLOAD,
               crate::connection::initial_receive_window(MAX_PACKET_PAYLOAD),
-              crate::congestion::ControllerKind::NewReno,
             ),
           )
           .unwrap();
@@ -1570,7 +1557,6 @@ mod tests {
             crate::connection::ConnectionShape::for_frame_cap(
               MAX_PACKET_PAYLOAD,
               crate::connection::initial_receive_window(MAX_PACKET_PAYLOAD),
-              crate::congestion::ControllerKind::NewReno,
             ),
           )
           .unwrap();

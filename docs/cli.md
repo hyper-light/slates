@@ -140,7 +140,9 @@ slates anchor --fleet /etc/slates/fleet.json --node a
   under a new address (a rescheduled pod) is reached on the next re-dial; a name that does not
   resolve is counted under the `fleet.resolve` refusal in `status` and dialed again next period. A
   named node binds its own two sockets on every interface. A manifest that names a node on a host
-  with no IPv4 nameserver in `/etc/resolv.conf` stops the boot naming the file.
+  with no IPv4 nameserver in `/etc/resolv.conf` stops the boot naming the file. Both sockets are
+  bound before the daemon starts: an address already in use stops the boot with
+  `fleet serve: the probe serve socket could not bind ADDRESS` (or `record`).
 - `domain` and `region` are optional per-node non-negative integers, both unset by default and set
   only for a real topology. `domain` is the node's failure domain (a rack or zone id): placement forms
   each object's copyset across distinct domains, so nodes that share a `domain` are treated as

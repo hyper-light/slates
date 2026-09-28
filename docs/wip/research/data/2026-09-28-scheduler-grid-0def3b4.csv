@@ -1,0 +1,123 @@
+scenario,scheduler,seed,control_n,control_p50_ms,control_p99_ms,control_p999_ms,metadata_n,metadata_p50_ms,metadata_p99_ms,metadata_p999_ms,bulk_mbps,capacity_share,stalled
+rate=1000000 rtt=20ms loss=0,RoundRobin,1,999,92.5,258.7,426.9,156,246.1,389.4,410.1,0.912,0.912,false
+rate=1000000 rtt=20ms loss=0,RoundRobin,2,999,94.4,261.9,340.0,156,247.8,387.7,406.4,0.915,0.915,false
+rate=1000000 rtt=20ms loss=0,RoundRobin,3,999,84.7,230.5,361.4,156,254.3,391.3,425.4,0.912,0.912,false
+rate=1000000 rtt=20ms loss=0,StrictPriority,1,999,79.5,229.7,256.8,156,152.6,271.8,272.0,0.912,0.912,false
+rate=1000000 rtt=20ms loss=0,StrictPriority,2,999,79.5,229.7,256.8,156,152.6,271.8,272.0,0.912,0.912,false
+rate=1000000 rtt=20ms loss=0,StrictPriority,3,999,57.0,231.1,314.0,157,150.8,253.7,450.3,0.909,0.909,false
+rate=1000000 rtt=20ms loss=0,Weighted,1,999,49.3,238.6,311.7,156,148.9,260.4,343.8,0.906,0.906,false
+rate=1000000 rtt=20ms loss=0,Weighted,2,999,54.5,238.8,310.5,157,152.6,301.0,314.6,0.909,0.909,false
+rate=1000000 rtt=20ms loss=0,Weighted,3,999,54.3,237.0,290.2,156,164.4,315.6,414.6,0.909,0.909,false
+rate=1000000 rtt=20ms loss=1%,RoundRobin,1,999,87.0,280.5,429.0,156,246.5,476.5,513.4,0.898,0.898,false
+rate=1000000 rtt=20ms loss=1%,RoundRobin,2,999,96.3,271.9,343.7,156,263.3,438.1,441.5,0.898,0.898,false
+rate=1000000 rtt=20ms loss=1%,RoundRobin,3,999,87.7,263.5,435.7,156,243.8,378.8,382.3,0.898,0.898,false
+rate=1000000 rtt=20ms loss=1%,StrictPriority,1,999,51.8,238.1,361.7,156,154.9,307.3,314.3,0.886,0.886,false
+rate=1000000 rtt=20ms loss=1%,StrictPriority,2,999,52.2,233.5,366.9,157,150.2,308.5,328.3,0.889,0.889,false
+rate=1000000 rtt=20ms loss=1%,StrictPriority,3,999,55.1,273.4,325.3,157,158.3,320.6,385.5,0.889,0.889,false
+rate=1000000 rtt=20ms loss=1%,Weighted,1,999,51.8,240.2,507.3,156,150.2,262.5,301.9,0.892,0.892,false
+rate=1000000 rtt=20ms loss=1%,Weighted,2,999,57.7,234.7,306.4,157,152.7,285.5,287.2,0.895,0.895,false
+rate=1000000 rtt=20ms loss=1%,Weighted,3,999,58.1,280.1,464.7,156,158.1,325.6,351.6,0.886,0.886,false
+rate=1000000 rtt=100ms loss=0,RoundRobin,1,999,160.6,213.7,402.4,156,312.0,368.8,369.2,0.923,0.923,false
+rate=1000000 rtt=100ms loss=0,RoundRobin,2,999,160.0,210.2,402.4,156,314.5,368.8,369.3,0.923,0.923,false
+rate=1000000 rtt=100ms loss=0,RoundRobin,3,999,160.6,213.7,402.4,156,312.0,368.8,369.3,0.923,0.923,false
+rate=1000000 rtt=100ms loss=0,StrictPriority,1,999,148.9,200.4,202.3,156,195.1,406.7,443.8,0.920,0.920,false
+rate=1000000 rtt=100ms loss=0,StrictPriority,2,999,148.9,200.4,202.3,156,195.1,406.7,443.8,0.920,0.920,false
+rate=1000000 rtt=100ms loss=0,StrictPriority,3,999,148.9,200.4,202.3,156,195.1,406.7,443.8,0.920,0.920,false
+rate=1000000 rtt=100ms loss=0,Weighted,1,999,144.8,201.2,211.0,156,205.9,438.6,463.1,0.912,0.912,false
+rate=1000000 rtt=100ms loss=0,Weighted,2,999,144.8,201.2,211.0,156,205.9,438.6,463.1,0.912,0.912,false
+rate=1000000 rtt=100ms loss=0,Weighted,3,999,144.8,201.2,211.0,156,205.9,438.6,463.1,0.912,0.912,false
+rate=1000000 rtt=100ms loss=1%,RoundRobin,1,999,169.8,434.4,574.3,156,330.1,555.1,559.7,0.912,0.912,false
+rate=1000000 rtt=100ms loss=1%,RoundRobin,2,999,174.5,405.6,542.6,156,335.9,628.3,708.9,0.912,0.912,false
+rate=1000000 rtt=100ms loss=1%,RoundRobin,3,999,168.7,392.9,483.4,156,319.3,481.8,484.0,0.909,0.909,false
+rate=1000000 rtt=100ms loss=1%,StrictPriority,1,999,145.8,347.2,555.8,156,203.4,432.6,464.7,0.912,0.912,false
+rate=1000000 rtt=100ms loss=1%,StrictPriority,2,999,148.7,329.4,701.3,156,201.9,562.4,615.4,0.915,0.915,false
+rate=1000000 rtt=100ms loss=1%,StrictPriority,3,999,146.1,346.4,707.6,156,198.6,380.6,417.9,0.900,0.900,false
+rate=1000000 rtt=100ms loss=1%,Weighted,1,999,146.1,403.1,598.5,156,206.3,504.1,625.9,0.915,0.915,false
+rate=1000000 rtt=100ms loss=1%,Weighted,2,999,153.1,361.2,704.5,156,221.3,462.9,628.4,0.912,0.912,false
+rate=1000000 rtt=100ms loss=1%,Weighted,3,999,151.1,347.8,537.6,156,210.7,455.7,459.0,0.906,0.906,false
+rate=10000000 rtt=20ms loss=0,RoundRobin,1,998,26.8,41.6,70.9,156,43.1,59.6,80.7,9.204,0.920,false
+rate=10000000 rtt=20ms loss=0,RoundRobin,2,999,29.7,42.5,75.8,157,46.1,86.2,86.3,9.232,0.923,false
+rate=10000000 rtt=20ms loss=0,RoundRobin,3,998,26.8,41.6,70.9,156,43.1,59.6,80.7,9.204,0.920,false
+rate=10000000 rtt=20ms loss=0,StrictPriority,1,999,27.7,40.2,42.5,157,35.4,79.8,80.2,9.118,0.912,false
+rate=10000000 rtt=20ms loss=0,StrictPriority,2,999,27.7,40.2,42.5,157,35.4,79.8,80.2,9.147,0.915,false
+rate=10000000 rtt=20ms loss=0,StrictPriority,3,999,27.7,40.2,42.5,157,35.4,79.8,80.2,9.118,0.912,false
+rate=10000000 rtt=20ms loss=0,Weighted,1,999,25.9,40.2,41.4,157,34.7,77.0,78.7,9.232,0.923,false
+rate=10000000 rtt=20ms loss=0,Weighted,2,999,25.8,40.1,41.4,157,35.0,51.3,78.5,9.289,0.929,false
+rate=10000000 rtt=20ms loss=0,Weighted,3,999,25.9,40.2,41.4,157,34.7,77.0,78.7,9.232,0.923,false
+rate=10000000 rtt=20ms loss=1%,RoundRobin,1,999,27.3,63.5,77.3,157,45.2,79.7,91.1,9.004,0.900,false
+rate=10000000 rtt=20ms loss=1%,RoundRobin,2,999,26.2,52.7,78.2,157,43.2,79.8,97.9,9.033,0.903,false
+rate=10000000 rtt=20ms loss=1%,RoundRobin,3,999,26.0,52.7,87.9,157,41.5,64.8,66.3,9.061,0.906,false
+rate=10000000 rtt=20ms loss=1%,StrictPriority,1,999,25.2,63.9,89.9,157,32.4,68.7,76.6,9.004,0.900,false
+rate=10000000 rtt=20ms loss=1%,StrictPriority,2,999,25.6,65.0,79.8,156,33.4,68.2,77.8,8.919,0.892,false
+rate=10000000 rtt=20ms loss=1%,StrictPriority,3,999,25.3,62.5,77.5,156,32.2,62.7,101.8,9.061,0.906,false
+rate=10000000 rtt=20ms loss=1%,Weighted,1,999,25.7,58.7,83.2,157,33.6,77.3,84.4,9.004,0.900,false
+rate=10000000 rtt=20ms loss=1%,Weighted,2,999,24.8,55.2,80.8,157,34.6,77.6,79.3,9.061,0.906,false
+rate=10000000 rtt=20ms loss=1%,Weighted,3,999,24.6,58.9,105.5,157,33.0,69.8,98.9,9.118,0.912,false
+rate=10000000 rtt=100ms loss=0,RoundRobin,1,995,109.8,149.0,168.9,156,131.9,177.5,180.5,8.478,0.848,false
+rate=10000000 rtt=100ms loss=0,RoundRobin,2,995,109.8,149.0,168.9,156,131.9,177.5,180.5,8.478,0.848,false
+rate=10000000 rtt=100ms loss=0,RoundRobin,3,995,109.8,149.0,168.9,156,131.9,177.5,180.5,8.478,0.848,false
+rate=10000000 rtt=100ms loss=0,StrictPriority,1,995,107.2,144.8,156.8,156,122.5,167.5,170.2,8.478,0.848,false
+rate=10000000 rtt=100ms loss=0,StrictPriority,2,995,107.2,144.8,156.8,156,122.5,167.5,170.2,8.478,0.848,false
+rate=10000000 rtt=100ms loss=0,StrictPriority,3,995,107.2,144.8,156.8,156,122.5,167.5,170.2,8.478,0.848,false
+rate=10000000 rtt=100ms loss=0,Weighted,1,995,107.9,146.1,152.0,156,124.1,169.5,172.7,8.370,0.837,false
+rate=10000000 rtt=100ms loss=0,Weighted,2,995,107.9,146.1,152.0,156,124.1,169.5,172.7,8.370,0.837,false
+rate=10000000 rtt=100ms loss=0,Weighted,3,995,107.9,146.1,152.0,156,124.1,169.5,172.7,8.370,0.837,false
+rate=10000000 rtt=100ms loss=1%,RoundRobin,1,994,106.0,228.1,335.9,156,127.8,277.4,318.2,8.804,0.880,false
+rate=10000000 rtt=100ms loss=1%,RoundRobin,2,995,105.6,225.9,372.9,156,127.3,264.6,333.4,8.859,0.886,false
+rate=10000000 rtt=100ms loss=1%,RoundRobin,3,995,117.8,355.8,515.2,156,159.4,448.1,483.5,7.935,0.793,false
+rate=10000000 rtt=100ms loss=1%,StrictPriority,1,994,104.1,222.0,249.1,156,118.3,252.4,285.2,8.370,0.837,false
+rate=10000000 rtt=100ms loss=1%,StrictPriority,2,995,104.4,222.6,255.5,156,120.6,252.4,370.5,8.804,0.880,false
+rate=10000000 rtt=100ms loss=1%,StrictPriority,3,995,104.4,231.7,268.0,156,119.2,229.2,276.9,8.804,0.880,false
+rate=10000000 rtt=100ms loss=1%,Weighted,1,995,104.6,225.3,330.1,156,122.7,244.3,252.0,8.696,0.870,false
+rate=10000000 rtt=100ms loss=1%,Weighted,2,992,104.8,214.4,244.9,156,121.7,242.5,324.1,8.859,0.886,false
+rate=10000000 rtt=100ms loss=1%,Weighted,3,995,104.6,214.6,272.7,156,121.0,229.1,246.2,8.913,0.891,false
+rate=100000000 rtt=20ms loss=0,RoundRobin,1,989,20.7,24.7,25.9,155,23.6,27.7,27.9,89.130,0.891,false
+rate=100000000 rtt=20ms loss=0,RoundRobin,2,989,21.0,25.0,26.0,155,23.8,27.7,27.9,86.957,0.870,false
+rate=100000000 rtt=20ms loss=0,RoundRobin,3,989,20.7,24.7,25.9,155,23.6,27.7,27.9,89.130,0.891,false
+rate=100000000 rtt=20ms loss=0,StrictPriority,1,987,20.8,24.6,25.4,154,22.8,26.9,27.0,88.043,0.880,false
+rate=100000000 rtt=20ms loss=0,StrictPriority,2,988,21.0,24.6,25.2,155,23.2,26.9,27.0,86.957,0.870,false
+rate=100000000 rtt=20ms loss=0,StrictPriority,3,988,21.0,24.6,25.2,155,23.2,26.9,27.0,86.957,0.870,false
+rate=100000000 rtt=20ms loss=0,Weighted,1,988,20.8,24.6,25.4,154,22.9,27.0,27.2,89.130,0.891,false
+rate=100000000 rtt=20ms loss=0,Weighted,2,989,20.8,24.8,25.7,155,23.0,27.1,27.3,90.217,0.902,false
+rate=100000000 rtt=20ms loss=0,Weighted,3,989,20.8,24.8,25.7,155,23.0,27.1,27.3,90.217,0.902,false
+rate=100000000 rtt=20ms loss=1%,RoundRobin,1,988,20.6,41.7,47.7,155,23.3,48.6,48.7,88.043,0.880,false
+rate=100000000 rtt=20ms loss=1%,RoundRobin,2,982,32.1,87.6,128.0,153,45.2,117.8,153.5,65.217,0.652,false
+rate=100000000 rtt=20ms loss=1%,RoundRobin,3,988,20.6,43.7,65.2,155,23.1,50.2,63.4,86.957,0.870,false
+rate=100000000 rtt=20ms loss=1%,StrictPriority,1,989,20.5,41.5,63.2,155,22.5,43.9,45.5,86.957,0.870,false
+rate=100000000 rtt=20ms loss=1%,StrictPriority,2,989,20.5,42.1,48.9,155,22.4,45.9,46.0,88.043,0.880,false
+rate=100000000 rtt=20ms loss=1%,StrictPriority,3,989,20.5,42.0,62.6,155,22.4,43.5,64.0,89.130,0.891,false
+rate=100000000 rtt=20ms loss=1%,Weighted,1,986,20.5,42.3,74.5,154,22.5,57.2,75.9,81.522,0.815,false
+rate=100000000 rtt=20ms loss=1%,Weighted,2,989,20.5,42.5,50.5,155,22.5,49.4,49.7,85.870,0.859,false
+rate=100000000 rtt=20ms loss=1%,Weighted,3,989,20.5,41.1,51.4,155,22.5,45.2,46.0,85.870,0.859,false
+rate=100000000 rtt=100ms loss=0,RoundRobin,1,916,150.8,384.5,546.5,143,151.9,514.5,542.4,54.348,0.543,false
+rate=100000000 rtt=100ms loss=0,RoundRobin,2,946,187.7,1021.2,1429.7,148,510.7,1044.8,1338.4,43.478,0.435,false
+rate=100000000 rtt=100ms loss=0,RoundRobin,3,946,187.7,1021.2,1429.7,148,510.7,1044.8,1338.4,43.478,0.435,false
+rate=100000000 rtt=100ms loss=0,StrictPriority,1,933,107.0,167.6,172.5,146,126.4,483.3,483.6,43.478,0.435,false
+rate=100000000 rtt=100ms loss=0,StrictPriority,2,933,106.1,167.6,172.4,146,124.3,640.2,691.6,43.478,0.435,false
+rate=100000000 rtt=100ms loss=0,StrictPriority,3,933,122.1,168.1,172.9,146,124.1,526.9,530.6,48.913,0.489,false
+rate=100000000 rtt=100ms loss=0,Weighted,1,0,inf,inf,inf,0,inf,inf,inf,81.522,0.815,false
+rate=100000000 rtt=100ms loss=0,Weighted,2,0,inf,inf,inf,0,inf,inf,inf,86.957,0.870,false
+rate=100000000 rtt=100ms loss=0,Weighted,3,0,inf,inf,inf,0,inf,inf,inf,81.522,0.815,false
+rate=100000000 rtt=100ms loss=1%,RoundRobin,1,933,154.6,344.7,414.8,138,234.6,439.5,456.2,38.043,0.380,false
+rate=100000000 rtt=100ms loss=1%,RoundRobin,2,884,126.2,279.3,302.6,122,128.4,432.1,432.4,54.348,0.543,false
+rate=100000000 rtt=100ms loss=1%,RoundRobin,3,889,125.9,276.7,344.2,118,128.0,485.9,491.5,59.783,0.598,false
+rate=100000000 rtt=100ms loss=1%,StrictPriority,1,925,121.7,385.2,503.6,145,155.5,508.5,508.5,54.348,0.543,false
+rate=100000000 rtt=100ms loss=1%,StrictPriority,2,895,125.7,242.6,297.3,127,127.9,278.6,297.7,59.783,0.598,false
+rate=100000000 rtt=100ms loss=1%,StrictPriority,3,871,107.8,410.8,517.5,133,161.4,437.3,569.6,43.478,0.435,false
+rate=100000000 rtt=100ms loss=1%,Weighted,1,48,1673.8,1730.9,1730.9,0,inf,inf,inf,65.217,0.652,false
+rate=100000000 rtt=100ms loss=1%,Weighted,2,663,379.8,593.3,680.2,0,inf,inf,inf,76.087,0.761,false
+rate=100000000 rtt=100ms loss=1%,Weighted,3,1,1830.9,1830.9,1830.9,0,inf,inf,inf,59.783,0.598,false
+burst loss rate=10000000 rtt=100ms,RoundRobin,1,994,106.3,219.4,238.1,156,124.5,258.8,263.3,8.478,0.848,false
+burst loss rate=10000000 rtt=100ms,RoundRobin,2,994,106.7,232.0,322.8,155,128.5,260.1,332.4,8.370,0.837,false
+burst loss rate=10000000 rtt=100ms,RoundRobin,3,995,109.4,222.3,327.7,156,132.7,248.8,251.6,8.424,0.842,false
+burst loss rate=10000000 rtt=100ms,StrictPriority,1,995,105.4,226.6,337.2,156,120.2,255.7,257.1,8.533,0.853,false
+burst loss rate=10000000 rtt=100ms,StrictPriority,2,994,105.0,228.0,258.0,156,120.2,243.7,247.4,8.641,0.864,false
+burst loss rate=10000000 rtt=100ms,StrictPriority,3,994,104.6,216.3,276.5,156,119.3,240.6,255.0,8.315,0.832,false
+burst loss rate=10000000 rtt=100ms,Weighted,1,995,104.6,232.1,353.8,156,121.5,496.8,625.6,7.935,0.793,false
+burst loss rate=10000000 rtt=100ms,Weighted,2,995,105.6,222.9,254.8,156,121.6,251.5,272.6,8.750,0.875,false
+burst loss rate=10000000 rtt=100ms,Weighted,3,995,105.6,224.8,259.4,156,121.7,249.9,267.6,8.804,0.880,false
+
+scheduler,control_p99_vs_best_geomean,worst_control_p99_vs_best,worst_scenario,metadata_p99_vs_best_geomean,goodput_shortfall_vs_best_geomean,disqualified
+RoundRobin,1.222,4.822,rate=100000000 rtt=100ms loss=0,1.219,1.081,no
+StrictPriority,1.023,1.153,rate=100000000 rtt=100ms loss=1%,1.027,1.075,no
+Weighted,inf,inf,rate=100000000 rtt=100ms loss=0,inf,1.006,starved a class in rate=100000000 rtt=100ms loss=1%

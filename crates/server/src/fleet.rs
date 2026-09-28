@@ -103,7 +103,6 @@ use slates_db::register::{
 use slates_rt::futures;
 use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
-use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::Demux;
 use slates_transport::endpoint::{Endpoint, EndpointError};
@@ -182,7 +181,15 @@ pub struct FleetPeer {
 /// Clone-able [`DaemonConfig`](crate::config::DaemonConfig) because [`Identity`] is not `Clone` (it holds a
 /// private key): the membership *policy* (quorum + peers) lives in the config and builds the `FleetNode`;
 /// this *transport* material is handed to [`Daemon::start`](crate::Daemon) and moved to the control shard.
-pub struct FleetTransport {
+///
+/// `Serve` is where the node serves: a deployment plan carries the pure [`ServeAddresses`] (planning binds
+/// nothing), and the daemon takes the bound [`ServeSockets`] — [`FleetTransport::bind`] is the one step
+/// between, taken before the daemon starts, so an address in use refuses the start by name rather than
+/// ending the membership loop later. A caller that already holds its ports (a test fleet that learned
+/// them by binding) hands the held sockets over with [`slates_rt::udp::UdpSocket::adopt`] and never gives
+/// a port up between learning and serving on it
+/// (`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`).
+pub struct FleetTransport<Serve = ServeSockets> {
   /// This node's fleet TLS identity (operator-provisioned).
   pub identity: Identity,
   /// The address this node publishes to authenticated peers.
@@ -191,16 +198,97 @@ pub struct FleetTransport {
   pub enrollment_roots: Vec<CertificateDer<'static>>,
   /// The TLS server name this node presents and its peers pin.
   pub name: String,
-  /// This node's probe-serve address: the one socket every peer's SWIM probes arrive on.
-  pub probe_bind: SocketAddrV4,
-  /// This node's record-serve address: the one socket every peer's record commits, prepares and content
-  /// exchanges arrive on.
-  pub record_bind: SocketAddrV4,
+  /// This node's two serve points: the probe plane (every peer's SWIM probes arrive there) and the record
+  /// plane (every peer's record commits, prepares and content exchanges).
+  pub serve: Serve,
   /// The peers this node probes and is probed by, each with its dial addresses.
   pub peers: Vec<FleetPeer>,
   /// The host's resolver configuration, when any peer is addressed by a DNS name (the deployment plan
   /// refuses a named peer without one); `None` for a fleet of literal addresses.
   pub resolver: Option<Resolver>,
+}
+
+/// Where a node's two serve sockets bind — the deployment plan's pure form (planning binds nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServeAddresses {
+  /// The probe plane's address.
+  pub probe: SocketAddrV4,
+  /// The record plane's address.
+  pub record: SocketAddrV4,
+}
+
+/// A node's two bound serve sockets, one per plane — what the membership loop serves on.
+#[derive(Debug)]
+pub struct ServeSockets {
+  /// The probe plane's socket.
+  pub probe: UdpSocket,
+  /// The record plane's socket.
+  pub record: UdpSocket,
+}
+
+/// A serve socket that could not be bound: the plane, the address, and the runtime's refusal — the daemon
+/// does not start (an operator reads which address is in use or refused).
+#[derive(Debug)]
+pub struct ServeBindError {
+  /// Which plane: `probe` or `record`.
+  pub plane: &'static str,
+  /// The address the bind was refused at.
+  pub address: SocketAddrV4,
+  /// The runtime's refusal (the OS error code, when one exists).
+  pub refusal: slates_rt::error::RtError,
+}
+
+impl std::fmt::Display for ServeBindError {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      formatter,
+      "the {} serve socket could not bind {}: {:?}",
+      self.plane, self.address, self.refusal
+    )
+  }
+}
+
+impl std::error::Error for ServeBindError {}
+
+impl ServeAddresses {
+  /// Binds both planes' serve sockets, or names the one refused.
+  pub fn bind(self) -> Result<ServeSockets, ServeBindError> {
+    let bind = |plane: &'static str, address: SocketAddrV4| {
+      UdpSocket::bind(address).map_err(|refusal| ServeBindError {
+        plane,
+        address,
+        refusal,
+      })
+    };
+    Ok(ServeSockets {
+      probe: bind("probe", self.probe)?,
+      record: bind("record", self.record)?,
+    })
+  }
+}
+
+impl FleetTransport<ServeAddresses> {
+  /// The planned transport with its serve sockets bound — the one step between a plan and a daemon.
+  pub fn bind(self) -> Result<FleetTransport, ServeBindError> {
+    let FleetTransport {
+      identity,
+      advertise,
+      enrollment_roots,
+      name,
+      serve,
+      peers,
+      resolver,
+    } = self;
+    Ok(FleetTransport {
+      identity,
+      advertise,
+      enrollment_roots,
+      name,
+      serve: serve.bind()?,
+      peers,
+      resolver,
+    })
+  }
 }
 
 /// What this node dials to reach one peer on one plane: the peer's stable anchor and its seed member id (the
@@ -883,8 +971,8 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
-/// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). It binds this
-/// node's two serve sockets (one per plane, every peer on each through a demultiplexer) and spawns their
+/// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). It serves on
+/// this node's two bound sockets (one per plane, every peer on each through a demultiplexer) and spawns their
 /// receive and accept loops; for each peer it dials the peer's advertised addresses and spawns the probe and
 /// record-link tasks; then the one record-plane coordinator. A two-node fleet is the single-peer degenerate.
 /// Detached tasks: they live as long as the shard and are cancelled by the runtime's shutdown.
@@ -894,8 +982,10 @@ pub async fn run_membership(transport: FleetTransport) {
     enrollment_roots,
     identity,
     name,
-    probe_bind,
-    record_bind,
+    serve: ServeSockets {
+      probe: probe_socket,
+      record: record_socket,
+    },
     peers,
     resolver,
   } = transport;
@@ -903,6 +993,12 @@ pub async fn run_membership(transport: FleetTransport) {
     // No peers — nothing to probe; the placement path still runs the `FleetNode`, degenerate (R8).
     return;
   }
+  // The record port discovery publishes is the one the record socket is bound to; a socket that cannot
+  // say (the OS refusing `getsockname`) cannot be published, counted like a socket that would not bind.
+  let Ok(record_port) = record_socket.local_addr().map(|address| address.port()) else {
+    count_refusal(BIND_REFUSED);
+    return;
+  };
   // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
   // each task borrows it as `&'static`; it is dropped with the shard's context, after every task. Before
@@ -925,7 +1021,7 @@ pub async fn run_membership(transport: FleetTransport) {
       enrollment_roots.clone(),
       identity.certificate(),
       advertise,
-      record_bind.port(),
+      record_port,
       &peers,
     )?);
     crate::discovery::restore(state)
@@ -968,16 +1064,9 @@ pub async fn run_membership(transport: FleetTransport) {
     HEARTBEAT_NS,
   );
 
-  // One serve socket per plane, shared by every peer through a demultiplexer (bound here on the control
-  // shard, before the dials, so a peer's dial finds a listener). A serve socket that cannot be bound (the
-  // address in use, or refused) ends the membership loop — this node cannot be probed, so it cannot take
-  // part — counted, never silent, so an operator reading the status refusal counts sees why (banned item 9).
-  let (Ok(probe_socket), Ok(record_socket)) =
-    (UdpSocket::bind(probe_bind), UdpSocket::bind(record_bind))
-  else {
-    count_refusal(BIND_REFUSED);
-    return;
-  };
+  // One serve socket per plane, shared by every peer through a demultiplexer; both were bound before the
+  // daemon started (`FleetTransport::bind`, or adopted by a caller that holds its ports), so a peer's dial
+  // finds a listener and an address in use refused the start by name.
   // The roster: which peer a certificate names — mutual TLS admits only these, and the record serve side
   // resolves the peer it authenticated through it.
   let roster: Vec<Rostered> = peers
@@ -1183,7 +1272,7 @@ async fn client_for(
 /// ceiling (`DaemonConfig::fleet_session_receive_bytes`), and the session plane's congestion controller.
 fn fleet_shape() -> ConnectionShape {
   let ceiling = state::with_state(|state| state.config.fleet_session_receive_bytes).unwrap_or(0);
-  ConnectionShape::for_frame_cap(FLEET_FRAME_CAP, ceiling, ControllerKind::NewReno)
+  ConnectionShape::for_frame_cap(FLEET_FRAME_CAP, ceiling)
 }
 
 /// The status refusal name for a failed name lookup: `fleet.resolve.<kind>` ([`dns::DnsError::kind`]).
@@ -3368,8 +3457,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   });
 }
 
-/// The status refusal count under which the fleet loop records that its serve sockets could not be bound at
-/// boot (§4.14: a refusal is counted, never silent) — the node then takes no part in the fleet.
+/// The status refusal count under which the fleet loop records that it could not serve on its bound sockets
+/// at boot — the control shard would not keep its identity, a socket could not name its port, or a
+/// demultiplexer would not start (§4.14: a refusal is counted, never silent) — the node then takes no part
+/// in the fleet. A socket that could not be bound at all refused the daemon's start (`ServeBindError`).
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const BIND_REFUSED: &str = "fleet.bind";
 

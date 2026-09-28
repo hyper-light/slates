@@ -1,8 +1,11 @@
-//! The session plane's stream-scheduler bake-off (§4.10a; the constrained-link design,
+//! The session plane's class-latency benchmark (§4.10a; the constrained-link design,
 //! `docs/wip/research/nfs-transport-constrained-links.md` §5.3): real endpoints — TLS 1.3 handshake,
-//! packet protection, the clocked connection — over the simulated network, each scheduler in turn
-//! (`connection::Scheduler`: round-robin over every stream, strict priority by class, and deficit
-//! round-robin weighted by class).
+//! packet protection, the clocked connection with its strict-priority scheduler and Copa controller — over
+//! the simulated network.
+//!
+//! This grid decided the scheduler (the 2026-09-28 bake-off, `docs/wip/BENCHMARKS.md`: strict priority over
+//! round-robin and deficit round-robin, the losers deleted); it now records each class's tail under load,
+//! so a regression shows against the recorded numbers.
 //!
 //! One run: a single session crosses a bottleneck toward the server carrying all three classes at once,
 //! as a fleet record session does — bulk transfers ([`BULK_FLOWS`] at a time, each restarted as it
@@ -10,16 +13,11 @@
 //! [`METADATA_LOAD_PERMILLE`] of the link; control pings use [`CONTROL_LOAD_PERMILLE`]. Each class's
 //! latency and completions and the bulk goodput are measured over the steady window.
 //!
-//! The selection rule, fixed before any run (a winner chosen after peeking is not evidence):
-//! 1. disqualified if any run stalls or starves a class (a class completing nothing in the window);
-//! 2. primary: the control class's p99 latency, as a geometric mean over scenarios of the scheduler's p99
-//!    over the best scheduler's, with each scheduler's worst scenario reported beside it — the p99 must be
-//!    solid everywhere, not on average;
-//! 3. then the metadata class's p99, the same way;
-//! 4. then the bulk goodput shortfall, the same way.
+//! **Failures** (the process exits non-zero): any run that stalls, or starves a class (a class completing
+//! nothing in the window).
 //!
-//! `cargo run --release -p slates-transport --example scheduler_bakeoff [scenario-filter]` prints one CSV
-//! row per run and the ranking.
+//! `cargo run --release -p slates-transport --example class_latency_bench [scenario-filter]` prints one CSV
+//! row per run, then the per-scenario summary.
 //!
 //! Every simulated path carries the datagram floor as its MTU (`MIN_DATAGRAM_BYTES`), as a real path at
 //! the floor does, so an oversized packet is dropped and counted rather than delivered. `SCHED_DIAG=1`
@@ -44,9 +42,8 @@ use slates_rt::sim::{
   sim_udp_set_path,
 };
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use slates_transport::congestion::ControllerKind;
 use slates_transport::connection::{
-  ConnectionShape, Priority, Scheduler, StreamRefusal, initial_receive_window,
+  ConnectionShape, Priority, StreamRefusal, initial_receive_window,
 };
 use slates_transport::endpoint::{Endpoint, EndpointError, MAX_PACKET_PAYLOAD, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
@@ -55,7 +52,7 @@ use slates_transport::session::STREAM_FRAME_HEADER_BYTES;
 /// Derived: the wire bytes each packet adds around a frame's data — the short header and AEAD tag
 /// (`MIN_DATAGRAM_BYTES − MAX_PACKET_PAYLOAD`) and one `Stream` frame header — for sizing a class's load.
 const WIRE_OVERHEAD: usize = MIN_DATAGRAM_BYTES - MAX_PACKET_PAYLOAD + STREAM_FRAME_HEADER_BYTES;
-/// Format: the fleet's packet budget, so the bake-off frames exactly as the daemon does.
+/// Format: the fleet's packet budget, so the benchmark frames exactly as the daemon does.
 const FRAME_CAP: usize = MAX_PACKET_PAYLOAD;
 /// Format: nanoseconds per millisecond and per second.
 const MS: u64 = 1_000_000;
@@ -73,8 +70,8 @@ const METADATA_BYTES: usize = 3 * FRAME_CAP;
 /// the rest bulk, so the link is always full and the scheduler, not idle capacity, decides the latencies.
 const CONTROL_LOAD_PERMILLE: u64 = 10;
 const METADATA_LOAD_PERMILLE: u64 = 50;
-/// Shape: bulk transfers in flight at once — several, so a round-robin scheduler has more bulk streams
-/// than other classes to cycle through (the fleet's content plane runs several puts per session).
+/// Shape: bulk transfers in flight at once — several, so the bulk class has more streams than the others
+/// to cycle through (the fleet's content plane runs several puts per session).
 const BULK_FLOWS: usize = 4;
 /// Shape: the steady window's length in control pings — enough that the p99 is a percentile (the tenth
 /// worst), not one loss recovery.
@@ -88,13 +85,7 @@ const CEILING_BDPS: u64 = 8;
 const CEILING_FLOOR_WINDOWS: u64 = 64;
 /// Shape: the seeds each scenario runs with.
 const SEEDS: [u64; 3] = [1, 2, 3];
-/// The schedulers in the bake-off.
-const SCHEDULERS: [Scheduler; 3] = [
-  Scheduler::RoundRobin,
-  Scheduler::StrictPriority,
-  Scheduler::Weighted,
-];
-const NAME: &str = "slates-bakeoff";
+const NAME: &str = "slates-bench";
 
 /// One network under test.
 #[derive(Clone, Debug)]
@@ -189,14 +180,12 @@ fn self_signed(name: &str) -> Identity {
   )
 }
 
-fn shape(scheduler: Scheduler, scenario: &Scenario) -> ConnectionShape {
+fn shape(scenario: &Scenario) -> ConnectionShape {
   let ceiling = scenario
     .bdp()
     .saturating_mul(CEILING_BDPS)
     .max(CEILING_FLOOR_WINDOWS * initial_receive_window(FRAME_CAP));
-  let mut shape = ConnectionShape::for_frame_cap(FRAME_CAP, ceiling, ControllerKind::NewReno);
-  shape.scheduler = scheduler;
-  shape
+  ConnectionShape::for_frame_cap(FRAME_CAP, ceiling)
 }
 
 /// Runs `future` until it completes or `within_ns` of virtual time passes.
@@ -215,14 +204,14 @@ async fn within<F: std::future::Future>(within_ns: u64, future: F) -> Option<F::
   .await
 }
 
-fn run(scheduler: Scheduler, scenario: &Scenario, seed: u64) -> Outcome {
+fn run(scenario: &Scenario, seed: u64) -> Outcome {
   let mut sim = SimRuntime::new(&config(), seed).unwrap();
   let shard = sim.shard_ids()[0];
   let (tx, rx) = channel::<Outcome>();
   let scenario = scenario.clone();
   sim
     .spawn_on(shard, async move {
-      coordinate(scheduler, scenario, tx).await;
+      coordinate(scenario, tx).await;
     })
     .unwrap();
   sim.run_until_idle();
@@ -232,7 +221,7 @@ fn run(scheduler: Scheduler, scenario: &Scenario, seed: u64) -> Outcome {
   })
 }
 
-async fn coordinate(scheduler: Scheduler, scenario: Scenario, report: Sender<Outcome>) {
+async fn coordinate(scenario: Scenario, report: Sender<Outcome>) {
   let any = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0);
   let client_socket = UdpSocket::bind(any).unwrap();
   let server_socket = UdpSocket::bind(any).unwrap();
@@ -260,7 +249,7 @@ async fn coordinate(scheduler: Scheduler, scenario: Scenario, report: Sender<Out
   let client_identity = self_signed(NAME);
   let server_cert = server_identity.certificate();
   let client_cert = client_identity.certificate();
-  let session_shape = shape(scheduler, &scenario);
+  let session_shape = shape(&scenario);
   let server = slates_rt::futures::spawn_child(async move {
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
     let mut endpoint = Endpoint::server(
@@ -456,9 +445,9 @@ fn scenarios() -> Vec<Scenario> {
 fn main() {
   let filter = std::env::args().nth(1);
   println!(
-    "scenario,scheduler,seed,control_n,control_p50_ms,control_p99_ms,control_p999_ms,metadata_n,metadata_p50_ms,metadata_p99_ms,metadata_p999_ms,bulk_mbps,capacity_share,stalled"
+    "scenario,seed,control_n,control_p50_ms,control_p99_ms,control_p999_ms,metadata_n,metadata_p50_ms,metadata_p99_ms,metadata_p999_ms,bulk_mbps,capacity_share,stalled"
   );
-  let mut rows: Vec<(String, Scheduler, Outcome)> = Vec::new();
+  let mut rows: Vec<(String, Outcome)> = Vec::new();
   for scenario in scenarios() {
     if filter
       .as_ref()
@@ -466,110 +455,71 @@ fn main() {
     {
       continue;
     }
-    for scheduler in SCHEDULERS {
-      for seed in SEEDS {
-        let outcome = run(scheduler, &scenario, seed);
-        println!(
-          "{},{:?},{},{},{:.1},{:.1},{:.1},{},{:.1},{:.1},{:.1},{:.3},{:.3},{}",
-          scenario.name,
-          scheduler,
-          seed,
-          outcome.control_ns.len(),
-          percentile(&outcome.control_ns, 500),
-          percentile(&outcome.control_ns, 990),
-          percentile(&outcome.control_ns, 999),
-          outcome.metadata_ns.len(),
-          percentile(&outcome.metadata_ns, 500),
-          percentile(&outcome.metadata_ns, 990),
-          percentile(&outcome.metadata_ns, 999),
-          outcome.goodput() / 1e6,
-          outcome.goodput() / scenario.rate as f64,
-          outcome.stalled
-        );
-        rows.push((scenario.name.clone(), scheduler, outcome));
-      }
+    for seed in SEEDS {
+      let outcome = run(&scenario, seed);
+      println!(
+        "{},{},{},{:.1},{:.1},{:.1},{},{:.1},{:.1},{:.1},{:.3},{:.3},{}",
+        scenario.name,
+        seed,
+        outcome.control_ns.len(),
+        percentile(&outcome.control_ns, 500),
+        percentile(&outcome.control_ns, 990),
+        percentile(&outcome.control_ns, 999),
+        outcome.metadata_ns.len(),
+        percentile(&outcome.metadata_ns, 500),
+        percentile(&outcome.metadata_ns, 990),
+        percentile(&outcome.metadata_ns, 999),
+        outcome.goodput() / 1e6,
+        outcome.goodput() / scenario.rate as f64,
+        outcome.stalled
+      );
+      rows.push((scenario.name.clone(), outcome));
     }
   }
-  rank(&rows);
+  if !report(&rows) {
+    std::process::exit(1);
+  }
 }
 
-/// Applies the selection rule stated in the module doc and prints the ranking.
-fn rank(rows: &[(String, Scheduler, Outcome)]) {
-  let names: std::collections::BTreeSet<&String> = rows.iter().map(|(name, _, _)| name).collect();
-  let count = SCHEDULERS.len();
-  let mut control = vec![0.0f64; count];
-  let mut metadata = vec![0.0f64; count];
-  let mut goodput = vec![0.0f64; count];
-  let mut worst: Vec<(f64, String)> = vec![(1.0, String::new()); count];
-  let mut disqualified: Vec<String> = vec![String::new(); count];
-  let mut scenarios = 0.0f64;
+/// Prints each scenario's worst control and metadata p99 across its seeds and its mean bulk share, and
+/// every failure (a stall, or a class that completed nothing); returns whether there were none.
+fn report(rows: &[(String, Outcome)]) -> bool {
+  let names: std::collections::BTreeSet<&String> = rows.iter().map(|(name, _)| name).collect();
+  let mut failures: Vec<String> = Vec::new();
+  println!();
+  println!("scenario,worst_control_p99_ms,worst_metadata_p99_ms,mean_bulk_mbps");
   for name in names {
-    let mut c = vec![0.0f64; count];
-    let mut m = vec![0.0f64; count];
-    let mut g = vec![0.0f64; count];
-    for (index, scheduler) in SCHEDULERS.iter().enumerate() {
-      let runs: Vec<&Outcome> = rows
-        .iter()
-        .filter(|(n, s, _)| n == name && s == scheduler)
-        .map(|(_, _, o)| o)
-        .collect();
-      for outcome in &runs {
-        if outcome.stalled {
-          disqualified[index] = format!("stalled in {name}");
-        }
-        if outcome.control_ns.is_empty()
-          || outcome.metadata_ns.is_empty()
-          || outcome.bulk_bytes == 0
-        {
-          disqualified[index] = format!("starved a class in {name}");
-        }
+    let runs: Vec<&Outcome> = rows
+      .iter()
+      .filter(|(n, _)| n == name)
+      .map(|(_, outcome)| outcome)
+      .collect();
+    for outcome in &runs {
+      if outcome.stalled {
+        failures.push(format!("stalled in {name}"));
       }
-      let runs_n = runs.len().max(1) as f64;
-      c[index] = runs
-        .iter()
-        .map(|o| percentile(&o.control_ns, 990))
-        .sum::<f64>()
-        / runs_n;
-      m[index] = runs
-        .iter()
-        .map(|o| percentile(&o.metadata_ns, 990))
-        .sum::<f64>()
-        / runs_n;
-      g[index] = runs.iter().map(|o| o.goodput()).sum::<f64>() / runs_n;
-    }
-    let best_c = c.iter().copied().fold(f64::INFINITY, f64::min).max(1e-9);
-    let best_m = m.iter().copied().fold(f64::INFINITY, f64::min).max(1e-9);
-    let best_g = g.iter().copied().fold(0.0, f64::max).max(1e-9);
-    for index in 0..count {
-      let ratio = c[index].max(1e-9) / best_c;
-      if ratio > worst[index].0 {
-        worst[index] = (ratio, name.to_string());
+      if outcome.control_ns.is_empty() || outcome.metadata_ns.is_empty() || outcome.bulk_bytes == 0
+      {
+        failures.push(format!("starved a class in {name}"));
       }
-      control[index] += ratio.ln();
-      metadata[index] += (m[index].max(1e-9) / best_m).ln();
-      goodput[index] += (best_g / g[index].max(1e-9)).ln();
     }
-    scenarios += 1.0;
+    let worst = |pick: fn(&Outcome) -> &Vec<u64>| {
+      runs
+        .iter()
+        .map(|outcome| percentile(pick(outcome), 990))
+        .fold(0.0, f64::max)
+    };
+    let control = worst(|outcome| &outcome.control_ns);
+    let metadata = worst(|outcome| &outcome.metadata_ns);
+    let goodput =
+      runs.iter().map(|outcome| outcome.goodput()).sum::<f64>() / runs.len().max(1) as f64;
+    println!("{name},{control:.1},{metadata:.1},{:.3}", goodput / 1e6);
   }
   println!();
-  println!(
-    "scheduler,control_p99_vs_best_geomean,worst_control_p99_vs_best,worst_scenario,metadata_p99_vs_best_geomean,goodput_shortfall_vs_best_geomean,disqualified"
-  );
-  for (index, scheduler) in SCHEDULERS.iter().enumerate() {
-    let n = scenarios.max(1.0);
-    println!(
-      "{:?},{:.3},{:.3},{},{:.3},{:.3},{}",
-      scheduler,
-      (control[index] / n).exp(),
-      worst[index].0,
-      worst[index].1,
-      (metadata[index] / n).exp(),
-      (goodput[index] / n).exp(),
-      if disqualified[index].is_empty() {
-        "no"
-      } else {
-        &disqualified[index]
-      }
-    );
+  if failures.is_empty() {
+    println!("failures: none");
+  } else {
+    println!("failures: {}", failures.join("; "));
   }
+  failures.is_empty()
 }

@@ -21,6 +21,10 @@ use crate::registry;
 // a caller names an address without depending on the socket backend.
 pub use core::net::{Ipv4Addr, SocketAddrV4};
 
+/// The owned OS handle [`UdpSocket::adopt`] takes — a file descriptor on Unix, a Winsock socket on
+/// Windows; `std::net::UdpSocket` converts into either with `.into()`.
+pub type OwnedDatagram = netsys::OwnedDatagram;
+
 /// An async UDP socket: a real OS datagram socket, or a port on the simulation's in-memory fabric.
 /// The representation is hidden (the real/sim choice is the driver's, R8); a caller drives it through
 /// the methods below, never by matching a backend.
@@ -56,6 +60,32 @@ impl UdpSocket {
     }
     let socket = netsys::dgram_socket()?;
     netsys::bind(&socket, addr)?;
+    Ok(UdpSocket {
+      inner: Inner::Real { socket },
+    })
+  }
+
+  /// Adopts an already-bound OS datagram socket (a `std::net::UdpSocket` converts into
+  /// [`OwnedDatagram`]): the socket-activation shape, for a caller that must hold a port from the moment
+  /// it learns it until the runtime serves on it. Binding by number instead gives the port up between the
+  /// check and the use, and another socket can take it in between (the fleet fixtures' port race,
+  /// `docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). Refused when
+  /// the socket is not a datagram socket, is not bound to an IPv4 address and port, or when the current
+  /// shard runs the simulation driver (whose sockets are fabric ports, not OS handles).
+  pub fn adopt(socket: OwnedDatagram) -> Result<UdpSocket, RtError> {
+    if on_sim() {
+      return Err(RtError::BadConfig {
+        what: "an adopted OS socket on the simulation driver",
+      });
+    }
+    let socket = netsys::adopt(socket)?;
+    let bound = netsys::local_addr(&socket)?;
+    if bound.port() == 0 {
+      return Err(RtError::DriverRefused {
+        call: "adopt(unbound)",
+        code: None,
+      });
+    }
     Ok(UdpSocket {
       inner: Inner::Real { socket },
     })

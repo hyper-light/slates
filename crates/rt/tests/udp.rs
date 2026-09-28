@@ -132,6 +132,72 @@ fn a_udp_datagram_is_received_through_the_driver() {
   shutdown_within(rt, "after the datagram arrived").unwrap();
 }
 
+/// AC (§4.10a; docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md): a
+/// caller that binds a port and hands the runtime a duplicate of that socket keeps the port from the moment
+/// it learned it — no other socket can bind it while the caller's handle lives, even after the adopted
+/// socket is dropped — and the adopted socket receives through the driver like one the runtime bound. The
+/// race the adoption closes: learning a port by binding, releasing it, and binding it again by number.
+#[test]
+fn an_adopted_socket_receives_and_its_port_is_never_released_in_between() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+  let port = held.local_addr().unwrap().port();
+  let adopted = UdpSocket::adopt(held.try_clone().unwrap().into()).unwrap();
+  assert_eq!(
+    adopted.local_addr().unwrap().port(),
+    port,
+    "adopted as bound"
+  );
+  assert!(
+    std::net::UdpSocket::bind(("127.0.0.1", port)).is_err(),
+    "no other socket can take the port while it is held"
+  );
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let mut buf = [0u8; 64];
+    let outcome = adopted
+      .recv_from(&mut buf)
+      .await
+      .map(|(n, _)| buf.get(..n).map(<[u8]>::to_vec));
+    let _ = tx.send(outcome);
+  })
+  .unwrap();
+  rt.spawn_on(id, async move {
+    slates_rt::futures::sleep(5_000_000).await;
+    let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let _ = sender.send_to(b"adopted", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+  })
+  .unwrap();
+  let received = rx.recv_timeout(Duration::from_secs(5));
+  shutdown_within(rt, "after the adopted receive").unwrap();
+  assert_eq!(
+    received.unwrap().unwrap().as_deref(),
+    Some(&b"adopted"[..]),
+    "the adopted socket receives through the driver"
+  );
+  // The runtime (and the adopted socket with it) is gone; the caller's handle still holds the port.
+  assert!(
+    std::net::UdpSocket::bind(("127.0.0.1", port)).is_err(),
+    "the port stays held by the caller after the adopted socket closed"
+  );
+  drop(held);
+}
+
+/// AC (§4.10a, typed refusals): adoption takes only a bound datagram socket — a stream socket is refused
+/// by kind, not adopted and left to fail on its first receive.
+#[test]
+fn adopting_a_stream_socket_is_refused() {
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+  let owned: slates_rt::udp::OwnedDatagram = listener.into();
+  match UdpSocket::adopt(owned) {
+    Err(slates_rt::error::RtError::DriverRefused { call, .. }) => {
+      assert_eq!(call, "adopt(SO_TYPE)", "refused by the socket's kind")
+    }
+    other => panic!("a stream socket must be refused by kind, got {other:?}"),
+  }
+}
+
 /// AC (§4.3; docs/bugs/2026-09-14-epoll-readiness-re-add-eexist.md): a socket is awaited **again** after
 /// its first datagram — the shape of every receive loop (the fleet's serve sockets, a mount's stream) —
 /// and the driver re-arms its readiness rather than refusing the second registration. A receiver awaits

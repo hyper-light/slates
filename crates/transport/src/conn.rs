@@ -22,7 +22,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::delivery::RateSnapshot;
 use crate::session::{AckRange, Frame};
 
 /// Format: RFC 9002 §6.1.1 `kPacketThreshold` — three packets of reordering are tolerated before a
@@ -157,17 +156,16 @@ impl AckGenerator {
 }
 
 /// One in-flight packet: the frames it carried (kept so a lost packet's data can be retransmitted), when
-/// it was sent, the bytes it counts in flight, and the delivery state it was sent with.
+/// it was sent, and the bytes it counts in flight.
 #[derive(Debug, Clone)]
 struct InFlight {
   frames: Vec<Frame>,
   sent_at: u64,
   bytes: u64,
-  rate: RateSnapshot,
 }
 
-/// What a packet that left flight was: its number, send time, bytes in flight, and delivery snapshot —
-/// what the delivery-rate sampler and the congestion controller read when it is acknowledged or lost.
+/// What a packet that left flight was: its number, send time and bytes in flight — what the RTT sample,
+/// the congestion controller and the persistent-congestion test read when it is acknowledged or lost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SentPacket {
   /// The packet number.
@@ -176,14 +174,12 @@ pub struct SentPacket {
   pub sent_at: u64,
   /// The stream bytes it counted in flight.
   pub bytes: u64,
-  /// The delivery state it was sent with.
-  pub rate: RateSnapshot,
 }
 
 /// What processing an ACK freed: the stream-data bytes newly acknowledged (for the congestion
 /// controller), the packet numbers removed from flight (for ACK-of-ACK, so the connection can confirm
 /// which of its own acknowledgement-bearing packets the peer has now received), and each freed packet's
-/// record (for the delivery-rate sample and the RTT).
+/// record (for the RTT sample and the congestion controller).
 #[derive(Debug, Default)]
 pub struct Acked {
   /// The stream-data bytes newly acknowledged.
@@ -254,9 +250,9 @@ impl SentTracker {
     self.next_pn
   }
 
-  /// Records that packet `pn`, sent at `sent_at` with delivery snapshot `rate`, carried `frames` (kept for
-  /// possible retransmission) counting `bytes` in flight.
-  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>, sent_at: u64, rate: RateSnapshot) {
+  /// Records that packet `pn`, sent at `sent_at`, carried `frames` (kept for possible retransmission)
+  /// counting `bytes` in flight.
+  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>, sent_at: u64) {
     let bytes = frames.iter().map(tracked_bytes).sum();
     self.in_flight.insert(
       pn,
@@ -264,7 +260,6 @@ impl SentTracker {
         frames,
         sent_at,
         bytes,
-        rate,
       },
     );
   }
@@ -291,7 +286,6 @@ impl SentTracker {
           pn,
           sent_at: flight.sent_at,
           bytes: flight.bytes,
-          rate: flight.rate,
         });
         frames.extend(flight.frames);
       }
@@ -360,7 +354,6 @@ impl SentTracker {
           pn,
           sent_at: flight.sent_at,
           bytes: flight.bytes,
-          rate: flight.rate,
         });
         frames.extend(flight.frames);
       }
@@ -684,7 +677,6 @@ mod tests {
           data: vec![0u8],
         }],
         0,
-        RateSnapshot::default(),
       );
     }
     // Received {0,1,2,4,5} (packet 3 dropped): the generator's ACK acknowledges both runs.
@@ -720,12 +712,7 @@ mod tests {
     for pn in 0..6 {
       let got = sent.next_pn();
       assert_eq!(got, pn);
-      sent.on_sent(
-        pn,
-        vec![Frame::MaxData { max: pn }],
-        0,
-        RateSnapshot::default(),
-      );
+      sent.on_sent(pn, vec![Frame::MaxData { max: pn }], 0);
     }
     // Acknowledge [2,5]; 0 and 1 remain in flight, both >= REORDER_THRESHOLD below largest (5).
     sent.on_ack(5, 3);
@@ -749,18 +736,8 @@ mod tests {
   #[test]
   fn a_probe_copies_the_oldest_in_flight_packet() {
     let mut sent = SentTracker::new();
-    sent.on_sent(
-      0,
-      vec![Frame::MaxData { max: 7 }],
-      0,
-      RateSnapshot::default(),
-    );
-    sent.on_sent(
-      1,
-      vec![Frame::MaxData { max: 8 }],
-      0,
-      RateSnapshot::default(),
-    );
+    sent.on_sent(0, vec![Frame::MaxData { max: 7 }], 0);
+    sent.on_sent(1, vec![Frame::MaxData { max: 8 }], 0);
     // No ACK ever arrives (a tail loss), so `take_lost` finds nothing.
     assert!(sent.take_lost(0, 1).0.frames.is_empty());
     assert_eq!(sent.copy_oldest(), vec![Frame::MaxData { max: 7 }]);
@@ -842,7 +819,7 @@ mod tests {
         break; // nothing new and nothing lost — the non-tail drop never leaves this at completion.
       }
       let pn = sent.next_pn();
-      sent.on_sent(pn, frames.clone(), 0, RateSnapshot::default());
+      sent.on_sent(pn, frames.clone(), 0);
       // The lossy channel drops the second packet (pn 1) exactly once — a non-tail drop, so later
       // packets advance the largest-acked past the reorder threshold and the loss is detected.
       let drop_this = pn == 1 && !dropped_once;

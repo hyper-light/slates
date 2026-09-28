@@ -41,6 +41,7 @@ use slates_server::head::HeadValue;
 use slates_server::observe::ObserveError;
 use slates_server::{
   Daemon, DaemonConfig, DurabilityBound, FleetMembership, FleetPeer, FleetTransport, SegmentSource,
+  ServeAddresses, ServeSockets,
 };
 
 mod common;
@@ -261,10 +262,17 @@ fn describe(daemons: &[&Daemon]) -> String {
           )
         })
         .collect();
+      // The control shard's refusal counts (a bind that failed, a peer refused …), so a daemon whose fleet
+      // never started says why; an observation it could not make is shown as that refusal.
+      let refusals = match daemon.fleet_refusals() {
+        Ok(counts) => format!("{counts:?}"),
+        Err(refusal) => format!("unobserved({refusal:?})"),
+      };
       format!(
-        "{}[periods={} {}]",
+        "{}[periods={} refusals={} {}]",
         daemon.config().instance,
         daemon.fleet_progress(),
+        refusals,
         shards.join(" ")
       )
     })
@@ -315,21 +323,85 @@ fn self_signed() -> Identity {
   )
 }
 
-/// Two **distinct** free localhost UDP ports: both sockets are bound at once (so the OS gives two different
-/// ports) and dropped before the daemons rebind them — binding each separately could hand back the same
-/// port twice, which would make the two nodes collide on one address. Tests may use `std::net` (as
-/// `nfs_mount.rs` does); the daemon itself never links it (R1).
-fn four_free_ports() -> [u16; 4] {
-  // All four sockets bound at once, so the OS hands back four distinct ports; dropped before the daemons
-  // rebind them (each node needs a probe address and a record address).
-  let sockets: Vec<std::net::UdpSocket> = (0..4)
+/// The ports this test process holds, each bound to a socket for as long as the test that leased it runs —
+/// the test-harness exception to R2's no-`Mutex` rule (D-8 exception 3), recovered on poison like the fleet
+/// lock. A daemon never binds a held port by number: it adopts a duplicate of the held socket
+/// ([`held_serve_sockets`]), so no other socket — another test's allocator, another test binary — can take
+/// the port between the moment the test learned it and the moment the daemon serves on it, nor between a
+/// daemon's stop and its restart on the same address
+/// (`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`).
+#[allow(clippy::disallowed_types)]
+static HELD_PORTS: std::sync::Mutex<std::collections::BTreeMap<u16, std::net::UdpSocket>> =
+  std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The held-port table, recovered if a failed test poisoned it.
+#[allow(clippy::disallowed_types)]
+fn held_ports()
+-> std::sync::MutexGuard<'static, std::collections::BTreeMap<u16, std::net::UdpSocket>> {
+  HELD_PORTS
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A test's lease on the ports it allocated: they stay bound while the lease lives and are released when it
+/// drops (at the end of the test, after its daemons), so the table holds only running tests' ports.
+struct PortLease {
+  ports: Vec<u16>,
+}
+
+impl Drop for PortLease {
+  fn drop(&mut self) {
+    let mut held = held_ports();
+    for port in &self.ports {
+      held.remove(port);
+    }
+  }
+}
+
+/// `count` **distinct** localhost UDP ports, each held bound under the returned lease: all are bound at once
+/// (so the OS hands back distinct ports) and never released while the lease lives. Tests may use
+/// `std::net` (as `nfs_mount.rs` does); the daemon itself never links it (R1).
+fn free_ports(count: usize) -> (PortLease, Vec<u16>) {
+  let sockets: Vec<std::net::UdpSocket> = (0..count)
     .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
     .collect();
-  let mut ports = [0u16; 4];
-  for (slot, socket) in ports.iter_mut().zip(&sockets) {
-    *slot = socket.local_addr().unwrap().port();
+  let ports: Vec<u16> = sockets
+    .iter()
+    .map(|socket| socket.local_addr().unwrap().port())
+    .collect();
+  let mut held = held_ports();
+  for (port, socket) in ports.iter().zip(sockets) {
+    held.insert(*port, socket);
   }
-  ports
+  (
+    PortLease {
+      ports: ports.clone(),
+    },
+    ports,
+  )
+}
+
+/// Four held ports (each two-node test's probe and record address per node) — [`free_ports`] of four.
+fn four_free_ports() -> (PortLease, [u16; 4]) {
+  let (lease, ports) = free_ports(4);
+  let four = <[u16; 4]>::try_from(ports).unwrap();
+  (lease, four)
+}
+
+/// A daemon's serve sockets on two held ports: a duplicate of each held socket, adopted by the runtime —
+/// the held original keeps the port bound across this daemon's life, its stop, and any restart on it.
+fn held_serve_sockets(probe: SocketAddrV4, record: SocketAddrV4) -> ServeSockets {
+  let held = held_ports();
+  let adopt = |address: SocketAddrV4| {
+    let socket = held
+      .get(&address.port())
+      .unwrap_or_else(|| panic!("port {} is not held by a lease", address.port()));
+    slates_rt::udp::UdpSocket::adopt(socket.try_clone().unwrap().into()).unwrap()
+  };
+  ServeSockets {
+    probe: adopt(probe),
+    record: adopt(record),
+  }
 }
 
 /// A fleet node's whole setup: its profile (with a distinct identity), its host id, its fleet TLS identity,
@@ -420,8 +492,7 @@ fn start_with_policy(
     advertise: this.address.into(),
     enrollment_roots: Vec::new(),
     name: NAME.to_owned(),
-    probe_bind: this.address,
-    record_bind: this.record_address,
+    serve: held_serve_sockets(this.address, this.record_address),
     peers: vec![FleetPeer {
       anchor: peer.anchor,
       host: peer.host,
@@ -451,7 +522,7 @@ fn start_with_policy(
 #[test]
 fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   assert_ne!(
@@ -820,7 +891,7 @@ fn form_and_settle(daemons: &[&Daemon]) -> bool {
 #[test]
 fn a_falsely_retired_peer_rejoins_by_refutation() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let peer_of_a = Peer {
@@ -910,7 +981,7 @@ const STARVATION_NS: u64 = 3 * LIVENESS_BUDGET_NS;
 #[test]
 fn a_starved_but_live_peer_is_not_retired() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let peer_of_a = Peer {
@@ -994,7 +1065,7 @@ fn a_descheduled_observer_uses_its_quantum_and_keeps_its_live_peer() {
     return;
   }
   let _serial = serialize_fleet_tests();
-  let (daemon_a, daemon_b, _) = two_node_fleet();
+  let (_ports, daemon_a, daemon_b, _) = two_node_fleet();
   let host_a = daemon_a.member_identity().unwrap();
   let host_b = daemon_b.member_identity().unwrap();
   let before = [
@@ -1129,7 +1200,6 @@ async fn dial_record_socket(
               slates_transport::connection::ConnectionShape::for_frame_cap(
                 FLEET_FRAME_CAP,
                 slates_transport::connection::initial_receive_window(FLEET_FRAME_CAP),
-                slates_transport::congestion::ControllerKind::NewReno,
               ),
             )
             .map_err(|e| format!("client: {e:?}"))
@@ -1183,7 +1253,7 @@ async fn dial_record_socket(
 #[test]
 fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_addresses() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   // The restart presents B's certificate again (the operator-provisioned identity does not change) at B's
@@ -1252,6 +1322,8 @@ const BURST_DIALS: usize = 3;
 /// The two-node fleet a re-dial burst is run against: A (the target — its certificate, record address and
 /// instance name), B (whose certificate the burst presents), and the burst's own copies of B's identity.
 struct BurstFleet {
+  /// The lease holding the fleet's serve ports for as long as the fleet lives (a restart re-adopts them).
+  _ports: PortLease,
   daemon_a: Daemon,
   daemon_b: Daemon,
   host_b: HostId,
@@ -1264,7 +1336,7 @@ struct BurstFleet {
 
 /// Forms the burst test's two-node fleet, with `dials` copies of B's identity set aside for the burst.
 fn burst_fleet_forms(dials: usize, pid: u32) -> BurstFleet {
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   // B's certificate as many times as it is presented: once by daemon B, once per burst dial — the same
   // enrolled identity from a fresh socket each time, as a node that re-dials after a loss presents.
@@ -1295,6 +1367,7 @@ fn burst_fleet_forms(dials: usize, pid: u32) -> BurstFleet {
   let host_b = daemon_b.member_identity().unwrap();
   let formed = form_and_settle(&[&daemon_a, &daemon_b]);
   BurstFleet {
+    _ports,
     daemon_a,
     daemon_b,
     host_b,
@@ -1560,7 +1633,7 @@ fn a_peers_re_dial_burst_replaces_its_sessions_and_never_refuses_a_client() {
 #[test]
 fn a_restarted_peer_rejoins_under_a_new_member_id_and_the_old_is_retired() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let b_new = member_id(b.origin_anchor, 1); // B's member id after one restart (generation 1).
@@ -1712,8 +1785,7 @@ fn start_fleet_node(
     name: NAME.to_owned(),
     advertise: loopback(bind.0).into(),
     enrollment_roots: Vec::new(),
-    probe_bind: loopback(bind.0),
-    record_bind: loopback(bind.1),
+    serve: held_serve_sockets(loopback(bind.0), loopback(bind.1)),
     peers,
     resolver: None,
   };
@@ -1834,6 +1906,8 @@ struct ServedBy {
 /// what the restart of B needs (its profile, anchor, seed, second identity, peers and serve pair), the ids
 /// and instances the assertions read, the sealed volume, and the two facts observed before the restart.
 struct RestartFleet {
+  /// The lease holding the fleet's serve ports for as long as the fleet lives (a restart re-adopts them).
+  _ports: PortLease,
   survivors: Vec<Daemon>,
   host_a: HostId,
   host_c: HostId,
@@ -1890,7 +1964,7 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let anchor_a = anchor_of(&profile_a);
   let anchor_b = anchor_of(&profile_b);
   let anchor_c = anchor_of(&profile_c);
-  let serve = mesh_serve_ports(3);
+  let (_ports, serve) = mesh_serve_ports(3);
   let b_again_serve = serve[1];
   let cert_a = identity_a.certificate();
   let cert_b = b_first.certificate();
@@ -2001,6 +2075,7 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   let old_b = daemons.remove(0);
   old_b.stop();
   RestartFleet {
+    _ports,
     survivors: daemons,
     origin_owners,
     host_a,
@@ -2212,6 +2287,8 @@ fn a_forged_announcement_is_refused_and_counted() {
 /// present B's certificate need — its profile, two more copies of its identity, the entry for A they dial,
 /// and the serve pairs they bind.
 struct RefusalFleet {
+  /// The lease holding the fleet's serve ports for as long as the fleet lives (a restart re-adopts them).
+  _ports: PortLease,
   daemon_a: Daemon,
   daemon_b: Daemon,
   /// B's incarnation-one segment (the anchor recorded a restart on it), which outlives its daemon.
@@ -2238,7 +2315,7 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let identity_b = b_identities.pop().expect("B's identity three times");
   let anchor_a = anchor_of(&profile_a);
   let anchor_b = anchor_of(&profile_b);
-  let serve = mesh_serve_ports(4);
+  let (_ports, serve) = mesh_serve_ports(4);
   let cert_a = identity_a.certificate();
   let cert_b = identity_b.certificate();
   let peers_of_a = vec![fleet_peer_at(anchor_b, host_b, serve[1], &cert_b)];
@@ -2285,6 +2362,7 @@ fn refusal_fleet_forms(pid: u32) -> RefusalFleet {
   let b_new = daemon_b.member_identity().expect("B's live member");
   daemon_a.bootstrap(true).expect("explicit initial group");
   RefusalFleet {
+    _ports,
     daemon_a,
     daemon_b,
     segment_b,
@@ -2400,19 +2478,6 @@ fn assert_refused(refused: &Refused) {
   );
 }
 
-/// `count` distinct free localhost UDP ports, all bound at once so the OS hands back distinct ports, then
-/// dropped before the daemons rebind them (binding one at a time could repeat a port). The generalization of
-/// [`four_free_ports`] the N-node mesh needs.
-fn free_ports(count: usize) -> Vec<u16> {
-  let sockets: Vec<std::net::UdpSocket> = (0..count)
-    .map(|_| std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
-    .collect();
-  sockets
-    .iter()
-    .map(|s| s.local_addr().unwrap().port())
-    .collect()
-}
-
 /// A fleet node's identity parts (no addresses — an N-node node serves each peer on its own socket, so
 /// addresses are per ordered pair, allocated in the mesh below, not per node).
 fn fleet_node(name: &str) -> (MachineProfile, HostId, Identity) {
@@ -2433,10 +2498,14 @@ fn loopback(port: u16) -> SocketAddrV4 {
   SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
 }
 
-/// One (probe, record) serve port pair per node: `serve[i]` is what node `i` binds and every peer dials.
-fn mesh_serve_ports(n: usize) -> Vec<(u16, u16)> {
-  let flat = free_ports(2 * n);
-  flat.chunks(2).map(|pair| (pair[0], pair[1])).collect()
+/// One (probe, record) serve port pair per node, held under the returned lease: `serve[i]` is what node `i`
+/// serves on and every peer dials.
+fn mesh_serve_ports(n: usize) -> (PortLease, Vec<(u16, u16)>) {
+  let (lease, flat) = free_ports(2 * n);
+  (
+    lease,
+    flat.chunks(2).map(|pair| (pair[0], pair[1])).collect(),
+  )
 }
 
 /// Starts one daemon per node: node `i` serves every peer on its own pair `serve[i]` and dials peer `j` at
@@ -2571,8 +2640,7 @@ fn start_mesh_with(
         name: NAME.to_owned(),
         advertise: loopback(serve[i].0).into(),
         enrollment_roots: Vec::new(),
-        probe_bind: loopback(serve[i].0),
-        record_bind: loopback(serve[i].1),
+        serve: held_serve_sockets(loopback(serve[i].0), loopback(serve[i].1)),
         peers,
         resolver: None,
       };
@@ -2748,7 +2816,7 @@ fn three_daemons_form_a_full_mesh() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
 
   // Poll until every node's full direct mesh has formed (all six probe sessions established). Robust to CPU
@@ -2800,7 +2868,7 @@ fn three_daemons_elect_one_stable_council_leader_over_the_transport() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -2871,7 +2939,7 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -2981,7 +3049,7 @@ fn a_council_commits_a_membership_retirement_over_the_transport() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -3058,7 +3126,7 @@ fn a_committed_retirement_reaches_every_shards_placement_view() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let regions = std::collections::BTreeMap::new();
   let mirrors = std::collections::BTreeMap::new();
   // Two shards per daemon: the council runs on the control shard (index 0); shard index 1 is a non-control
@@ -3161,7 +3229,7 @@ fn the_root_group_commits_a_region_retirement_over_the_transport() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   // Each host is its own region, so all three are region representatives (root voters) and the root group
   // spans them; region i is `RegionId(i)`, aligned with the daemon index.
   let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
@@ -3246,7 +3314,7 @@ fn a_root_learner_fetches_the_committed_region_membership_over_the_transport() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   // Regions: hosts 0 and 1 in region 0 (so region 0 has a non-representative member — the learner); host 2 in
   // region 1; host 3 in region 2. Regions 1 and 2 are single-host, so losing either loses a whole region.
   let regions: std::collections::BTreeMap<HostId, RegionId> = [
@@ -3373,7 +3441,7 @@ fn an_operator_promotes_a_lost_regions_mirror_over_the_transport() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   // Each host is its own region; regions 1 and 2 both mirror to region 0, so whichever follower we lose is a
   // mirrored region that must await an operator promotion rather than being auto-retired.
   let regions: std::collections::BTreeMap<HostId, RegionId> = [
@@ -3498,7 +3566,7 @@ fn a_client_on_a_follower_promotes_a_region_by_forwarding_to_the_leader() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let regions: std::collections::BTreeMap<HostId, RegionId> = [
     (hosts[0], RegionId(0)),
     (hosts[1], RegionId(1)),
@@ -3585,7 +3653,7 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let regions: std::collections::BTreeMap<HostId, RegionId> = [
     (hosts[0], RegionId(0)),
     (hosts[1], RegionId(1)),
@@ -3665,7 +3733,7 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(names.len());
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
   let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
     .iter()
     .enumerate()
@@ -3753,7 +3821,7 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
     .enumerate()
     .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
     .collect();
-  let serve = mesh_serve_ports(names.len());
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
   let mut daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
   let hosts: Vec<_> = daemons
     .iter()
@@ -3840,7 +3908,7 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     .enumerate()
     .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
     .collect();
-  let serve = mesh_serve_ports(names.len());
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
   let mut daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
   let hosts: Vec<_> = daemons
     .iter()
@@ -4170,7 +4238,7 @@ fn a_client_writes_a_cross_region_volume_by_forwarding_to_its_owner() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let regions: std::collections::BTreeMap<HostId, RegionId> = [
     (hosts[0], RegionId(0)),
     (hosts[1], RegionId(1)),
@@ -4285,7 +4353,7 @@ fn a_committed_promotion_reaches_every_shards_lookup_view() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let regions: std::collections::BTreeMap<HostId, RegionId> = [
     (hosts[0], RegionId(0)),
     (hosts[1], RegionId(1)),
@@ -4374,7 +4442,7 @@ fn a_learner_fetches_the_councils_committed_configuration_over_the_transport() {
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 1);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -4492,7 +4560,7 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
     "the three machine identities give three distinct host ids"
   );
 
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let instances: Vec<String> = daemons
     .iter()
@@ -4563,7 +4631,7 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -4744,10 +4812,10 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
   let client_only_budget = DaemonConfig::derive(&profile_a, &instance_a, Some(1))
     .runtime
     .tasks_per_shard;
-  let serve = mesh_serve_ports(2);
+  let (_serve_lease, serve) = mesh_serve_ports(2);
   let cert_a = identity_a.certificate();
   let cert_b = identity_b.certificate();
-  let ports = free_ports(2 * client_only_budget);
+  let (_silent_lease, ports) = free_ports(2 * client_only_budget);
   let mut peers_of_a = vec![fleet_peer_at(anchor_b, host_b, serve[1], &cert_b)];
   peers_of_a.extend((0..client_only_budget).map(|index| {
     let silent_anchor = HostId(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1));
@@ -5014,7 +5082,7 @@ fn scratch(name: &str) -> RequestBody {
 #[test]
 fn a_provisioned_head_replicates_across_the_fleet() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let pid = std::process::id();
@@ -5095,7 +5163,7 @@ fn a_provisioned_head_replicates_across_the_fleet() {
 #[test]
 fn a_holder_durably_holds_the_owners_replicated_head() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let pid = std::process::id();
@@ -5211,7 +5279,7 @@ fn three_daemons_take_over_a_dead_owners_head() {
   let pid = std::process::id();
   // Node A (index 0) is the owner that will die; the client provisions the volume on it.
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -5324,7 +5392,7 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
   let pid = std::process::id();
   // Node A (index 0) is the owner that will die; the client provisions the volume on it.
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh_with_f(nodes, &hosts, &certs, &serve, 2);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -5527,7 +5595,7 @@ fn poll_snapshot_placed(
 #[test]
 fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let pid = std::process::id();
@@ -5631,7 +5699,7 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let pid = std::process::id();
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -5771,7 +5839,7 @@ fn a_holder_that_lost_placed_content_is_repaired_by_the_healer() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let pid = std::process::id();
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -5863,7 +5931,7 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let pid = std::process::id();
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -5992,7 +6060,7 @@ fn name_on_partition(prefix: &str, partition: u16, partitions: usize) -> String 
 #[test]
 fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let pid = std::process::id();
@@ -6055,10 +6123,11 @@ fn a_volume_on_a_non_control_shard_replicates_its_content_and_places() {
 }
 
 /// Starts a two-node `f = 1` fleet of two-shard daemons under one `durability` policy on both nodes and
-/// waits for its direct probe mesh to form; returns the daemons and A's instance name. The policy the two
+/// waits for its direct probe mesh to form; returns the lease holding its ports, the daemons and A's
+/// instance name. The policy the two
 /// durability tests below differ by is the only input that differs between them.
-fn start_policed_pair(durability: DurabilityBound) -> (Daemon, Daemon, String) {
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+fn start_policed_pair(durability: DurabilityBound) -> (PortLease, Daemon, Daemon, String) {
+  let (ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let instance_a = format!("fleet-{}-{}", a.host.0, std::process::id());
@@ -6084,7 +6153,7 @@ fn start_policed_pair(durability: DurabilityBound) -> (Daemon, Daemon, String) {
     daemon_b.stop();
     panic!("the fleet's direct probe mesh formed");
   }
-  (daemon_a, daemon_b, instance_a)
+  (ports, daemon_a, daemon_b, instance_a)
 }
 
 /// AC (§4.8 "Placement" — "the operator's accepted ε and the coincident-failure size are the durability policy
@@ -6098,7 +6167,7 @@ fn start_policed_pair(durability: DurabilityBound) -> (Daemon, Daemon, String) {
 #[test]
 fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durability() {
   let _serial = serialize_fleet_tests();
-  let (daemon_a, daemon_b, instance_a) = start_policed_pair(DurabilityBound {
+  let (_ports, daemon_a, daemon_b, instance_a) = start_policed_pair(DurabilityBound {
     accepted_loss: 0.0,
     coincident_failures: 2,
   });
@@ -6165,7 +6234,7 @@ fn a_fleet_refuses_a_write_its_configuration_cannot_hold_to_the_declared_durabil
 #[test]
 fn a_fleet_within_its_declared_durability_creates_and_seals() {
   let _serial = serialize_fleet_tests();
-  let (daemon_a, daemon_b, instance_a) = start_policed_pair(DurabilityBound {
+  let (_ports, daemon_a, daemon_b, instance_a) = start_policed_pair(DurabilityBound {
     accepted_loss: 0.0,
     coincident_failures: 1,
   });
@@ -6209,7 +6278,7 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
   let pid = std::process::id();
   let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh_with(
     nodes,
     &hosts,
@@ -6277,50 +6346,39 @@ fn a_takeover_successor_serves_a_volume_on_a_non_control_shard() {
   );
 }
 
-/// AC (§4.14; banned item 9 — no swallowed error): a fleet peer whose serve socket this node cannot bind at
-/// boot is not silently skipped — the refusal is **counted** in the daemon's status (`fleet.bind`), so an
-/// operator can see why the mesh never formed to that peer. A's probe serve port is already held by another
-/// socket when A boots, so A cannot serve B's probes: A's status must report the refusal. Non-vacuous:
-/// without the count, the status showed nothing and the only symptom was a mesh that never formed.
+/// AC (§4.14; banned item 9 — no swallowed error): a fleet node whose serve socket cannot be bound does not
+/// start at all — the bind is the one step between the deployment plan and the daemon
+/// (`FleetTransport::bind`), and its refusal names the plane and the address, so an operator reads which
+/// address is in use instead of a daemon that runs but can never be probed. A's probe port is held by
+/// another socket (the test's own lease) when A's planned transport is bound: the bind is refused on the
+/// probe plane (bound first) at that address.
 #[test]
-fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
-  let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
-  // Hold A's probe serve port before A boots, so A's bind of it fails (released when the test ends).
-  let _squatter = std::net::UdpSocket::bind(("127.0.0.1", pa_probe))
-    .expect("the port the allocator just released is free to hold");
-  let a = node("a", pa_probe, pa_record);
-  let b = node("b", pb_probe, pb_record);
-  let pid = std::process::id();
-  let instance_a = format!("fleet-{}-{pid}", a.host.0);
-  let peer_of_a = Peer {
-    anchor: b.origin_anchor,
-    host: b.host,
-    address: b.address,
-    record_address: b.record_address,
-    certificate: b.identity.certificate(),
+fn a_serve_socket_that_cannot_be_bound_refuses_the_start_by_name() {
+  let (_ports, [pa_probe, pa_record, _, _]) = four_free_ports();
+  let planned = ServeAddresses {
+    probe: loopback(pa_probe),
+    record: loopback(pa_record),
   };
-  let daemon_a = start(a, peer_of_a);
-
-  // The fleet loop counts the refusal on its first run on the control shard; poll the status for it,
-  // bounded, since that run and this client's request are queued on the same shard.
-  let mut client = Client::connect(&instance_a);
-  let counted = poll_until(&[&daemon_a], Duration::from_secs(5), || {
-    Ok(matches!(
-      client.call(&RequestBody::DaemonStatus),
-      ReplyBody::DaemonStatus { report }
-        if report
-          .shards
-          .iter()
-          .flat_map(|shard| shard.refusals.iter())
-          .any(|refusal| refusal.kind == "fleet.bind" && refusal.count >= 1)
-    ))
-  });
-  daemon_a.stop();
-  assert!(
-    counted,
-    "the serve socket A could not bind is counted as a `fleet.bind` refusal in A's status"
-  );
+  match planned.bind() {
+    Err(refusal) => {
+      assert_eq!(refusal.plane, "probe", "the refused plane is named");
+      assert_eq!(
+        refusal.address,
+        loopback(pa_probe),
+        "the refused address is named"
+      );
+      assert!(
+        refusal
+          .to_string()
+          .contains(&loopback(pa_probe).to_string()),
+        "the message an operator reads names the address: {refusal}"
+      );
+    }
+    Ok(ServeSockets { probe, .. }) => panic!(
+      "a held probe port was bound a second time at {:?}",
+      probe.local_addr()
+    ),
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -6333,9 +6391,10 @@ fn a_peer_whose_serve_socket_cannot_be_bound_is_counted_not_silently_skipped() {
 /// have (a two-node placement takes a few periods on loopback).
 const RECORD_HOLD_WINDOW: Duration = Duration::from_secs(2);
 
-/// A two-node `f = 1` fleet: A (the owner the client reaches) and B (the candidate holder).
-fn two_node_fleet() -> (Daemon, Daemon, String) {
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+/// A two-node `f = 1` fleet: A (the owner the client reaches) and B (the candidate holder), with the lease
+/// holding its ports.
+fn two_node_fleet() -> (PortLease, Daemon, Daemon, String) {
+  let (ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let pid = std::process::id();
@@ -6360,7 +6419,7 @@ fn two_node_fleet() -> (Daemon, Daemon, String) {
     form_and_settle(&[&daemon_a, &daemon_b]),
     "the merge fixture explicitly forms its groups"
   );
-  (daemon_a, daemon_b, instance_a)
+  (ports, daemon_a, daemon_b, instance_a)
 }
 
 /// Creates a green and a work over it on the owner, edits `f`, and submits: version 1 is committed on
@@ -6417,7 +6476,7 @@ fn submit_one_version(client: &mut Client) -> (VolumeId, VolumeId) {
 #[test]
 fn a_merge_record_is_issued_only_once_its_inputs_are_placed() {
   let _serial = serialize_fleet_tests();
-  let (daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
   let installed = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
     refuse_content_puts: true,
     corrupt_next_inputs: false,
@@ -6576,7 +6635,7 @@ fn assert_gate_lifted(gate: &InputsGate) {
 #[test]
 fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
   let _serial = serialize_fleet_tests();
-  let (daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
   let both = [&daemon_a, &daemon_b];
   let installed = daemon_b.inject_merge_fault(slates_server::merge_service::MergeFault {
     refuse_content_puts: false,
@@ -6636,7 +6695,7 @@ fn a_holder_whose_recomputation_mismatches_refuses_the_version_loudly() {
 #[test]
 fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let host_b = b.host;
@@ -6756,7 +6815,7 @@ fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss
     .iter()
     .map(|pair| pair[0].certificate())
     .collect();
-  let ports = mesh_serve_ports(profiles.len());
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
   let peers = |node: usize| -> Vec<FleetPeer> {
     profiles
       .iter()
@@ -6960,7 +7019,7 @@ fn a_warm_fleet_restart_recovers_its_root_and_regional_quorums() {
     .iter()
     .map(|pair| pair[0].certificate())
     .collect();
-  let ports = mesh_serve_ports(profiles.len());
+  let (_ports_lease, ports) = mesh_serve_ports(profiles.len());
   let peers = |node| {
     profiles
       .iter()
@@ -7291,7 +7350,7 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
   let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).unwrap();
   issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
   let issuer = issuer_params.self_signed(&issuer_key).unwrap();
-  let addresses = mesh_serve_ports(3);
+  let (_addresses_lease, addresses) = mesh_serve_ports(3);
   let mut identities = Vec::new();
   for domain in 0..addresses.len() {
     let key = rcgen::KeyPair::generate().unwrap();
@@ -7346,8 +7405,7 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
       identity,
       name: NAME.to_owned(),
       advertise: loopback(addresses[node].0).into(),
-      probe_bind: loopback(addresses[node].0),
-      record_bind: loopback(addresses[node].1),
+      serve: held_serve_sockets(loopback(addresses[node].0), loopback(addresses[node].1)),
       peers,
       resolver: None,
       enrollment_roots: vec![issuer.der().clone()],
@@ -7425,8 +7483,8 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
 #[test]
 fn a_retired_peers_pending_dial_is_dropped_and_its_return_at_new_addresses_is_meshed() {
   let _serial = serialize_fleet_tests();
-  let [pa_probe, pa_record, pb_probe, pb_record] = four_free_ports();
-  let [pb_probe_again, pb_record_again, _, _] = four_free_ports();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let (_ports_again, [pb_probe_again, pb_record_again, _, _]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
   let b = node("b", pb_probe, pb_record);
   let mut b_identities = same_identity(2).into_iter();
@@ -7509,7 +7567,7 @@ const DRAIN_NS: u64 = 100_000_000;
 #[test]
 fn a_submit_is_answered_only_once_its_record_commits_at_the_quorum() {
   let _serial = serialize_fleet_tests();
-  let (daemon_a, daemon_b, instance_a) = two_node_fleet();
+  let (_ports, daemon_a, daemon_b, instance_a) = two_node_fleet();
   daemon_b
     .inject_merge_fault(slates_server::merge_service::MergeFault {
       refuse_content_puts: true,
@@ -7717,7 +7775,7 @@ fn a_taken_over_green_serves_every_version_and_accepts_new_work_on_the_successor
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()
@@ -7805,7 +7863,7 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
   let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
   let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
     nodes.iter().map(|(_, _, id)| id.certificate()).collect();
-  let serve = mesh_serve_ports(n);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
   let daemons = start_mesh(nodes, &hosts, &certs, &serve);
   let hosts: Vec<HostId> = daemons
     .iter()

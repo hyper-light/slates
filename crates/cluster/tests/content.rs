@@ -166,7 +166,6 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         slates_transport::connection::ConnectionShape::for_frame_cap(
           slates_transport::endpoint::MAX_PACKET_PAYLOAD,
           CONTENT_RECEIVE_CEILING,
-          slates_transport::congestion::ControllerKind::NewReno,
         ),
       )
       .unwrap();
@@ -200,7 +199,6 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         slates_transport::connection::ConnectionShape::for_frame_cap(
           slates_transport::endpoint::MAX_PACKET_PAYLOAD,
           CONTENT_RECEIVE_CEILING,
-          slates_transport::congestion::ControllerKind::NewReno,
         ),
       )
       .unwrap();

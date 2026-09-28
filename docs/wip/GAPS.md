@@ -1939,3 +1939,40 @@ cluster (every binary), and fleet 50/50.
 
 Still owed, in order: the congestion grid on this code, then the scheduler bake-off with the winning
 controller.
+
+### 2026-09-28: session-plane controller and scheduler decided
+
+Both are closed: the session plane runs **Copa**, and schedules by **strict priority**. The losers were
+deleted (NewReno, CUBIC, BBRv3, Copa-Meta, round-robin, weighted, both selectors, and the delivery-rate
+sampler only BBR used). Record: `docs/wip/BENCHMARKS.md`, and the research note's slice 2d.
+
+Two bugs were fixed on the way, each test-first:
+
+- [Copa froze an overshot window](../bugs/2026-09-28-copa-froze-an-overshot-window.md) (ping p99 at
+  100 Mbit/s, 20 ms fell from 103 ms to 20.5 ms);
+- [an idle peer's late acknowledgements inflated the RTT](../bugs/2026-09-28-idle-peer-acks-inflated-the-rtt.md)
+  (a lost reply had cost 7 s; p99 at 64 kbit/s, 1 % loss now 0.62–0.79 s).
+
+Known cost, recorded rather than hidden: on thin links with little loss Copa holds a small standing queue
+by design. At 64 kbit/s with no loss its p99 is 678 ms against NewReno's 289 ms.
+
+Owed next on the transport (research note §5): DPLPMTUD, path validation and migration, NAT keepalive,
+batched I/O, compression, ACK frequency, the RPC-over-QUIC listener bake-off, and the netem lane. Then the
+no-panic sweep's remaining crates, and the consensus queue.
+
+### 2026-09-28: fleet serve sockets are bound before the daemon starts; test ports are held, never released
+
+Closed: [a released test port was taken before the daemon bound it](../bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md).
+This was the fleet suite's rare 300 s freeze: a daemon stuck at `periods=0` with `fleet.bind` counted.
+
+- `FleetTransport` now takes bound `ServeSockets`. A plan carries `ServeAddresses`, and `FleetTransport::bind`
+  is the one step between them. An address in use refuses the start with `ServeBindError`, which names the
+  plane and the address.
+- The runtime adopts an already-bound socket (`UdpSocket::adopt`, paired Unix and Windows seam).
+- The fleet fixtures hold every allocated port under a `PortLease` for the whole test, and give each daemon
+  start (restarts included) a duplicate.
+
+Open sibling, for Ada's call: the CLI's multi-process fleet test (`crates/cli/tests/cli.rs`,
+`free_port_block`) releases a port block before its child daemons bind it. The race-free fix is to pass
+inherited serve sockets to `slates daemon` (the systemd `LISTEN_FDS` protocol, on top of
+`UdpSocket::adopt`), which is a new deployment surface.

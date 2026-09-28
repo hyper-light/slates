@@ -80,6 +80,24 @@ mod imp {
     rx_bind(&socket.fd, &addr).map_err(|e| refused("bind", e))
   }
 
+  /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
+  /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
+  /// unless it is a datagram socket; made close-on-exec and non-blocking like one this seam created.
+  pub(crate) fn adopt(fd: OwnedDatagram) -> Result<Socket, RtError> {
+    let kind =
+      rustix::net::sockopt::socket_type(&fd).map_err(|e| refused("getsockopt(SO_TYPE)", e))?;
+    if kind != SocketType::DGRAM {
+      return Err(refused("adopt(SO_TYPE)", rustix::io::Errno::PROTOTYPE));
+    }
+    rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)
+      .map_err(|e| refused("fcntl(CLOEXEC)", e))?;
+    rustix::io::ioctl_fionbio(&fd, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    Ok(Socket { fd })
+  }
+
+  /// The owned OS handle [`adopt`] takes: a file descriptor.
+  pub(crate) type OwnedDatagram = OwnedFd;
+
   pub(crate) fn local_addr(socket: &Socket) -> Result<SocketAddrV4, RtError> {
     match SocketAddr::try_from(getsockname(&socket.fd).map_err(|e| refused("getsockname", e))?) {
       Ok(SocketAddr::V4(v4)) => Ok(v4),
@@ -112,13 +130,14 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
+  use std::os::windows::io::IntoRawSocket;
   use std::sync::OnceLock;
 
   use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SO_RCVBUF, SOCK_DGRAM,
-    SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAEINTR, WSAEWOULDBLOCK,
-    WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname, getsockopt,
-    ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, socket as ws_socket,
+    AF_INET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IPPROTO_UDP, SO_RCVBUF, SO_TYPE,
+    SOCK_DGRAM, SOCKADDR, SOCKADDR_IN, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSADATA, WSAEINTR,
+    WSAEWOULDBLOCK, WSAGetLastError, WSAStartup, bind as ws_bind, closesocket, getsockname,
+    getsockopt, ioctlsocket, recvfrom as ws_recvfrom, sendto as ws_sendto, socket as ws_socket,
   };
 
   use super::{Io, Ipv4Addr, SocketAddrV4};
@@ -196,32 +215,45 @@ mod imp {
       return Err(last("socket(DGRAM)"));
     }
     let socket = Socket { socket: raw };
-    let mut nonblocking: u32 = 1;
-    // SAFETY: FIONBIO takes one u32 by pointer; a live local suffices.
-    if unsafe { ioctlsocket(raw, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
-      return Err(last("ioctlsocket(FIONBIO)"));
-    }
+    set_nonblocking(&socket)?;
     Ok(socket)
   }
 
-  /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
-  pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
-    let mut bytes: i32 = 0;
+  /// Puts `socket` in non-blocking mode (`FIONBIO`), as every socket this seam drives must be.
+  fn set_nonblocking(socket: &Socket) -> Result<(), RtError> {
+    let mut nonblocking: u32 = 1;
+    // SAFETY: FIONBIO takes one u32 by pointer; a live local suffices.
+    if unsafe { ioctlsocket(socket.socket, FIONBIO, &mut nonblocking) } == SOCKET_ERROR {
+      return Err(last("ioctlsocket(FIONBIO)"));
+    }
+    Ok(())
+  }
+
+  /// One `int`-valued `SOL_SOCKET` option of `socket` (`SO_RCVBUF`, `SO_TYPE`); `call` names the query in a
+  /// refusal.
+  fn int_option(socket: &Socket, option: i32, call: &'static str) -> Result<i32, RtError> {
+    let mut value: i32 = 0;
     // The option is an `int`: its length is that type's size, which always fits an `i32`.
     let mut len: i32 = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
-    // SAFETY: `SO_RCVBUF` is an `int`; the out pointer and its length name one live local `i32`.
+    // SAFETY: the option is an `int`; the out pointer and its length name one live local `i32`.
     let outcome = unsafe {
       getsockopt(
         socket.socket,
         SOL_SOCKET,
-        SO_RCVBUF,
-        (&raw mut bytes).cast::<u8>(),
+        option,
+        (&raw mut value).cast::<u8>(),
         &raw mut len,
       )
     };
     if outcome == SOCKET_ERROR {
-      return Err(last("getsockopt(SO_RCVBUF)"));
+      return Err(last(call));
     }
+    Ok(value)
+  }
+
+  /// The socket's kernel receive buffer (`SO_RCVBUF`) in bytes.
+  pub(crate) fn recv_buffer_bytes(socket: &Socket) -> Result<usize, RtError> {
+    let bytes = int_option(socket, SO_RCVBUF, "getsockopt(SO_RCVBUF)")?;
     usize::try_from(bytes).map_err(|_| last("getsockopt(SO_RCVBUF)"))
   }
 
@@ -249,6 +281,33 @@ mod imp {
       u16::from_be(raw.sin_port),
     )
   }
+
+  /// An already-bound OS socket the caller hands over (the socket-activation shape): the port was never
+  /// released between the caller's bind and this adoption, so nothing can take it in between. Refused
+  /// unless it is a datagram socket; made non-blocking like one this seam created.
+  pub(crate) fn adopt(owned: OwnedDatagram) -> Result<Socket, RtError> {
+    ensure_started()?;
+    let Ok(raw) = SOCKET::try_from(owned.into_raw_socket()) else {
+      return Err(RtError::DriverRefused {
+        call: "adopt(SOCKET)",
+        code: None,
+      });
+    };
+    // Owned from here: the drop closes it once, on every refusal below too.
+    let socket = Socket { socket: raw };
+    let kind = int_option(&socket, SO_TYPE, "getsockopt(SO_TYPE)")?;
+    if kind != SOCK_DGRAM {
+      return Err(RtError::DriverRefused {
+        call: "adopt(SO_TYPE)",
+        code: Some(kind),
+      });
+    }
+    set_nonblocking(&socket)?;
+    Ok(socket)
+  }
+
+  /// The owned OS handle [`adopt`] takes: a Winsock socket.
+  pub(crate) type OwnedDatagram = std::os::windows::io::OwnedSocket;
 
   pub(crate) fn bind(socket: &Socket, addr: SocketAddrV4) -> Result<(), RtError> {
     let sa = sockaddr(addr);
@@ -339,5 +398,7 @@ mod imp {
   }
 }
 
-pub(crate) use imp::Socket;
-pub(crate) use imp::{bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to};
+pub(crate) use imp::{OwnedDatagram, Socket};
+pub(crate) use imp::{
+  adopt, bind, dgram_socket, local_addr, recv_buffer_bytes, recv_from, send_to,
+};
