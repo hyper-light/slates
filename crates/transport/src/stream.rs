@@ -163,6 +163,9 @@ pub struct StreamAssembler {
   buffered: BTreeMap<u64, Vec<u8>>,
   fin: Option<u64>,
   window: u64,
+  /// Buffered segments examined for overlap across every offer — the witness that an offer looks only at
+  /// the segments its range can touch (an ordered lookup), never at every buffered one.
+  examined: u64,
 }
 
 impl StreamAssembler {
@@ -173,7 +176,13 @@ impl StreamAssembler {
       buffered: BTreeMap::new(),
       fin: None,
       window,
+      examined: 0,
     }
+  }
+
+  /// Buffered segments examined for overlap across every offer so far.
+  pub fn segments_examined(&self) -> u64 {
+    self.examined
   }
 
   /// Offers a segment at absolute `offset`. Bytes below the read cursor and bytes already buffered
@@ -199,13 +208,23 @@ impl StreamAssembler {
       return Ok(());
     }
     // Fill only the gaps in [start, end) not already buffered, so overlaps dedup (QUIC guarantees
-    // consistent bytes on overlap, so keeping the first copy is correct).
-    let overlaps: Vec<(u64, u64)> = self
-      .buffered
-      .iter()
-      .map(|(&s, v)| (s, s + v.len() as u64))
+    // consistent bytes on overlap, so keeping the first copy is correct). Buffered segments are disjoint
+    // and keyed by their start, so the only ones that can overlap are the last one starting before
+    // `start` and those starting inside the range: an ordered lookup, O(log n + overlaps). Scanning every
+    // buffered segment made reassembly quadratic in the holes a long, lossy path leaves (found by the
+    // focal cross-check, 2026-09-28).
+    let before = self.buffered.range(..start).next_back();
+    let inside = self.buffered.range(start..end);
+    let overlaps: Vec<(u64, u64)> = before
+      .into_iter()
+      .chain(inside)
+      .map(|(&s, v)| (s, s.saturating_add(v.len() as u64)))
       .filter(|&(s, e)| s < end && e > start)
       .collect();
+    self.examined = self
+      .examined
+      .saturating_add(overlaps.len() as u64)
+      .saturating_add(1);
     let mut pos = start;
     for (seg_start, seg_end) in overlaps {
       if pos < seg_start {
@@ -407,6 +426,61 @@ mod tests {
     }
     assert_eq!(received, content, "send→receive reproduces the bytes");
     assert!(assembler.is_complete(), "the fin completed the stream");
+  }
+
+  /// §4.10a (the focal cross-check, 2026-09-28): an offer examines only the buffered segments its range can
+  /// touch. 4,000 segments arrive with a hole before each (every odd segment first, then the even ones fill
+  /// the holes), so up to 2,000 segments are buffered at once; the whole stream still reassembles, and the
+  /// segments examined grow linearly with the offers — a scan of every buffered segment would examine
+  /// about 2,000 per offer (millions in all).
+  #[test]
+  fn reassembly_with_many_holes_examines_only_neighbouring_segments() {
+    const SEGMENTS: u64 = 4_000;
+    const LEN: u64 = 100;
+    let content: Vec<u8> = (0..SEGMENTS * LEN).map(|at| (at % 251) as u8).collect();
+    let mut assembler = StreamAssembler::new(SEGMENTS * LEN);
+    let mut out = Vec::new();
+    for phase in [1u64, 0] {
+      for index in (phase..SEGMENTS).step_by(2) {
+        let from = usize::try_from(index * LEN).unwrap();
+        let to = usize::try_from((index + 1) * LEN).unwrap();
+        assembler
+          .offer(index * LEN, &content[from..to], index + 1 == SEGMENTS)
+          .unwrap();
+        out.extend_from_slice(&assembler.read());
+      }
+    }
+    assert_eq!(out, content);
+    assert!(
+      assembler.segments_examined() <= 4 * SEGMENTS,
+      "{} segments examined for {SEGMENTS} offers",
+      assembler.segments_examined()
+    );
+  }
+
+  proptest! {
+    /// The overlap oracle: arbitrary slices of a known stream — overlapping each other partially, duplicated,
+    /// in any order — reassemble to exactly the covered prefix; the first copy of every byte is kept, and a
+    /// segment straddling several buffered ones fills only the gaps between them.
+    #[test]
+    fn overlapping_slices_reassemble_exactly(
+      content in prop::collection::vec(any::<u8>(), 1..400),
+      slices in prop::collection::vec((0usize..400, 1usize..120), 1..60),
+    ) {
+      let len = content.len();
+      let mut s = StreamAssembler::new(len as u64);
+      let mut covered = vec![false; len];
+      let mut out = Vec::new();
+      for (at, width) in slices {
+        let from = at % len;
+        let to = (from + width).min(len);
+        s.offer(from as u64, &content[from..to], false).unwrap();
+        covered[from..to].iter_mut().for_each(|c| *c = true);
+        out.extend_from_slice(&s.read());
+      }
+      let prefix = covered.iter().take_while(|c| **c).count();
+      prop_assert_eq!(&out[..], &content[..prefix], "exactly the covered prefix, byte for byte");
+    }
   }
 
   proptest! {

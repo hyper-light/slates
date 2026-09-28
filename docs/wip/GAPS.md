@@ -2058,3 +2058,24 @@ Slice 3d, the same day: measured.
 
 Path MTU discovery is complete. The one remaining measurement belongs to the netem lane (research note §9):
 a real multi-hop path with a smaller MTU than the interface.
+
+### 2026-09-28: the focal cross-check's transport items
+
+Focal studies the same questions on quinn, in parallel. Its findings for slates' session plane, each to be
+root-caused and measured across laptop, single-cluster and multi-region deployments:
+
+- **Closed.** [Reassembly scanned every buffered segment](../bugs/2026-09-28-reassembly-scanned-every-buffered-segment.md):
+  it is now an ordered lookup, 4,000,000 → about 16,000 segment examinations for 4,000 holed arrivals.
+- **Open: spurious loss under reordering.** The reorder-jitter scenario (8 ms at 10 Mbit/s, 20 ms) carries
+  0.25 of the link, with 27,016 spurious retransmissions and no real drops. RFC 9002's fixed thresholds
+  (3 packets, 9/8 RTT) misread the reordering as loss. The next build is adaptive thresholds per RFC 8985
+  §6.2 (RACK).
+- **Open: Copa on long fat paths.** Traced at 100 Mbit/s, 300 ms. Slow start overshoots to 1.6× the BDP.
+  Then a queue of about 200 ms stands for about 4.5 s, because Copa drains 1/δ packets per RTT until its
+  velocity ramps. The velocity then collapses the window to 4 % of the BDP on feedback a round trip late.
+  A prototype steps straight to pipe + 1/δ packets whenever a queue stands. Over the 20-seed grids it cut
+  congestion steady p99 by 7.3 %, class metadata p99 by 24 %, and raised 100 M/300 ms capacity from 0.50 to
+  0.64. It is held until reordering is fixed, because a jitter-inflated standing RTT misleads it.
+- **Open: the thin-link tail** (Copa's standing queue on thin lossless links). The same prototype halved
+  the 64 kbit/s, 20 ms steady p99.
+
