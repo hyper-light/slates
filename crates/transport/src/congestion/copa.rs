@@ -148,17 +148,19 @@ impl Copa {
       None => self.mode_max.insert(WindowedMax::new(now, rtt)).get(),
     };
     self.update_mode(now, srtt, (rtt_min, recent_min, recent_max));
-    if !event.cwnd_limited {
-      // RFC 9002 §7.8: a window the sender is not using does not grow (Copa's delay signal would otherwise
-      // keep raising an idle flow's window without bound).
-      return;
-    }
     let queueing = standing.saturating_sub(rtt_min);
     // Increase when the current rate `cwnd/RTTstanding` is at or below the target `1/(δ·d_q)` (in bytes,
     // `inv_delta·smss/d_q`): `cwnd·d_q ≤ inv_delta·smss·RTTstanding`; an empty queue always increases.
     let increase = queueing == 0
       || u128::from(self.cwnd) * u128::from(queueing)
         <= u128::from(self.inv_delta) * u128::from(self.smss) * u128::from(standing);
+    if increase && !event.cwnd_limited {
+      // RFC 9002 §7.8: a window the sender is not using does not grow (Copa's delay signal would otherwise
+      // keep raising an idle flow's window without bound). It still shrinks: the guard once skipped every
+      // update, so a window slow start had overshot stayed frozen while losses kept the sender from looking
+      // window-limited — 1.5 MB at a 250 kB BDP, 92,500 queue drops per run at 100 Mbit/s (2026-09-28).
+      return;
+    }
     if self.slow_start && increase {
       match self.last_double {
         None => self.last_double = Some(now),
@@ -297,6 +299,18 @@ mod tests {
   const MS: u64 = 1_000_000;
 
   fn ack(law: &mut Copa, now: u64, rtt: u64, acked: u64, estimator: &RttEstimator) {
+    ack_with(law, now, rtt, acked, estimator, true);
+  }
+
+  /// [`ack`], stating whether the sender was window-limited when the acknowledged packet left.
+  fn ack_with(
+    law: &mut Copa,
+    now: u64,
+    rtt: u64,
+    acked: u64,
+    estimator: &RttEstimator,
+    cwnd_limited: bool,
+  ) {
     let packets = [SentPacket {
       pn: 0,
       sent_at: now.saturating_sub(rtt),
@@ -313,7 +327,7 @@ mod tests {
       },
       in_flight: 0,
       delivered: 0,
-      cwnd_limited: true,
+      cwnd_limited,
       rtt: estimator,
     });
   }
@@ -353,6 +367,50 @@ mod tests {
     }
     assert!(!law.in_slow_start(), "a decrease ends slow start");
     assert!(law.window() < before, "the window shrank");
+  }
+
+  /// RFC 9002 §7.8 bounds only growth: a window the sender is not filling does not grow, but a standing
+  /// queue still shrinks it. Do X (a queue past the target while the sender is not window-limited), expect
+  /// Y (the window shrinks); and with no queue, it does not grow. Regression: the guard skipped every
+  /// update, so a window slow start had overshot stayed frozen at 1.5 MB (six BDPs) while losses kept the
+  /// sender from looking window-limited — 92,500 queue drops per run and a 103 ms ping p99 on a 20 ms
+  /// path (2026-09-28).
+  #[test]
+  fn a_window_the_sender_is_not_filling_still_shrinks_but_never_grows() {
+    let mut law = Copa::new(MD, 2);
+    let mut estimator = RttEstimator::new();
+    estimator.on_sample(100 * MS, 0);
+    ack_with(&mut law, 0, 100 * MS, MD, &estimator, false);
+    let before = law.window();
+    for step in 1..=5u64 {
+      ack_with(
+        &mut law,
+        100 * MS + step * MS,
+        200 * MS,
+        MD,
+        &estimator,
+        false,
+      );
+    }
+    assert!(
+      law.window() < before,
+      "the standing queue shrank an unfilled window"
+    );
+    let shrunk = law.window();
+    for step in 1..=5u64 {
+      ack_with(
+        &mut law,
+        10_000 * MS + step * MS,
+        100 * MS,
+        MD,
+        &estimator,
+        false,
+      );
+    }
+    assert!(
+      law.window() <= shrunk,
+      "an empty queue did not grow an unfilled window"
+    );
   }
 
   /// §2.2: when the queue never nearly empties over four round trips (a buffer-filling competitor), Copa

@@ -334,7 +334,7 @@ impl Demux {
     let mut buf = [0u8; DATAGRAM_BYTES];
     loop {
       let (n, from) = self.socket.recv_from(&mut buf).await?;
-      self.route(&buf[..n], from);
+      self.route(buf.get(..n).unwrap_or_default(), from);
       // Yield between datagrams: a burst queued in the kernel would otherwise be routed whole before any
       // session task ran, filling an inbox the session had no chance to drain.
       slates_rt::futures::yield_now().await;
@@ -378,7 +378,9 @@ impl Demux {
     }
     if let Some(datagram) = inbox.queue.pop_front() {
       let n = datagram.len().min(buf.len());
-      buf[..n].copy_from_slice(&datagram[..n]);
+      if let (Some(into), Some(from)) = (buf.get_mut(..n), datagram.get(..n)) {
+        into.copy_from_slice(from);
+      }
       return Poll::Ready(Ok((n, inbox.peer)));
     }
     inbox.waker = Some(cx.waker().clone());

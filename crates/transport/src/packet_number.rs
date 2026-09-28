@@ -37,7 +37,7 @@ pub struct EncodedPacketNumber {
 impl EncodedPacketNumber {
   /// The significant bytes, big-endian — what goes in the packet-number field on the wire.
   pub fn as_slice(&self) -> &[u8] {
-    &self.bytes[..self.len]
+    self.bytes.get(..self.len).unwrap_or(&self.bytes)
   }
 
   /// How many bytes the field occupies (1–4); the value the first header byte's low bits encode.
@@ -74,10 +74,10 @@ pub fn encode_packet_number(full_pn: u64, largest_acked: Option<u64>) -> Encoded
   }
   // Take the least-significant `bytes` of the full number, big-endian.
   let all = full_pn.to_be_bytes();
-  let len = bytes as usize;
-  let start = all.len() - len;
+  let len = usize::try_from(bytes).unwrap_or(usize::MAX).min(all.len());
   let mut out = [0u8; MAX_PACKET_NUMBER_BYTES as usize];
-  out[..len].copy_from_slice(&all[start..]);
+  let significant = all.get(all.len().saturating_sub(len)..).unwrap_or_default();
+  crate::fill_from(&mut out, &[significant]);
   EncodedPacketNumber { bytes: out, len }
 }
 
@@ -93,7 +93,7 @@ pub fn decode_packet_number(largest_pn: u64, truncated: &[u8]) -> u64 {
     return largest_pn.saturating_add(1);
   }
   let mut truncated_pn: u64 = 0;
-  for &byte in &truncated[..len] {
+  for &byte in truncated.iter().take(len) {
     truncated_pn = (truncated_pn << 8) | u64::from(byte);
   }
   let pn_bits = len * (u8::BITS as usize);

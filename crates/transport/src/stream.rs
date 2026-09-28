@@ -227,14 +227,14 @@ impl StreamAssembler {
   /// `to` are within `[data_offset, data_offset + data.len()]` by construction, so the offsets into
   /// `data` fit `usize` (clamped for i686 safety — the u64→usize conversion is checked, D-24).
   fn buffer_gap(&mut self, data_offset: u64, from: u64, to: u64, data: &[u8]) {
-    let lo = usize::try_from(from - data_offset)
+    let lo = usize::try_from(from.saturating_sub(data_offset))
       .unwrap_or(0)
       .min(data.len());
-    let hi = usize::try_from(to - data_offset)
+    let hi = usize::try_from(to.saturating_sub(data_offset))
       .unwrap_or(data.len())
       .min(data.len());
-    if lo < hi {
-      self.buffered.insert(from, data[lo..hi].to_vec());
+    if let Some(gap) = data.get(lo..hi).filter(|gap| !gap.is_empty()) {
+      self.buffered.insert(from, gap.to_vec());
     }
   }
 

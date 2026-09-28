@@ -34,6 +34,18 @@
 //! typed [`FrameError`]/[`seal::SealError`], never a panic — the same discipline as `slates-merge`'s
 //! ops-document decode and `slates-bridge-fuse`'s ABI codec. The codec is pure and tested on every host.
 
+// The no-panic law (CLAUDE.md item 6), enforced here ahead of the workspace-wide lint: no indexing,
+// slicing or string slicing that can go out of bounds outside tests.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::panic_in_result_fn,
+    clippy::unwrap_in_result
+  )
+)]
+
 pub mod accept;
 pub mod congestion;
 pub mod conn;
@@ -53,6 +65,18 @@ pub mod seal;
 pub mod session;
 pub mod stream;
 pub mod streams;
+
+/// Fills `out` with `parts` laid end to end — how the fixed-layout byte arrays here (a key-derivation
+/// context, an AEAD's associated data, a nonce) are assembled from their fields without indexing. Each
+/// array is sized as the sum of its fields' sizes, so the parts fill it exactly.
+pub(crate) fn fill_from(out: &mut [u8], parts: &[&[u8]]) {
+  for (slot, byte) in out
+    .iter_mut()
+    .zip(parts.iter().flat_map(|part| part.iter()))
+  {
+    *slot = *byte;
+  }
+}
 
 /// The protocol version this build speaks (the floor; negotiation to higher versions is owed with the
 /// session plane).
@@ -257,7 +281,11 @@ impl<'a> Reader<'a> {
   }
 
   pub(crate) fn u8(&mut self) -> Result<u8, FrameError> {
-    Ok(self.bytes(size_of::<u8>())?[0])
+    self
+      .bytes(size_of::<u8>())?
+      .first()
+      .copied()
+      .ok_or(FrameError::Truncated)
   }
 
   pub(crate) fn u16(&mut self) -> Result<u16, FrameError> {

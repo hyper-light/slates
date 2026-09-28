@@ -78,10 +78,14 @@ impl KeySchedule {
   /// the two ends agree without exchanging keys.
   pub fn seal_key(&self, sender: u64, key_epoch: u32, direction: Direction) -> [u8; KEY_BYTES] {
     let mut context = [0u8; size_of::<u64>() + size_of::<u32>() + size_of::<u8>()];
-    context[..size_of::<u64>()].copy_from_slice(&sender.to_le_bytes());
-    context[size_of::<u64>()..size_of::<u64>() + size_of::<u32>()]
-      .copy_from_slice(&key_epoch.to_le_bytes());
-    context[size_of::<u64>() + size_of::<u32>()] = direction.tag();
+    crate::fill_from(
+      &mut context,
+      &[
+        &sender.to_le_bytes(),
+        &key_epoch.to_le_bytes(),
+        &[direction.tag()],
+      ],
+    );
     self.expand_label(SEAL_LABEL, &context)
   }
 

@@ -704,7 +704,9 @@ fn rank(rows: &[(String, ControllerKind, Outcome)]) {
   let mut latency_ratio = [0.0f64; LAWS.len()];
   let mut worst_latency: Vec<(f64, String)> = vec![(1.0, String::new()); LAWS.len()];
   let mut goodput_ratio = [0.0f64; LAWS.len()];
-  let mut disqualified: Vec<String> = vec![String::new(); LAWS.len()];
+  // Every distinct disqualifying reason per law, so a verdict never hides a second failure.
+  let mut disqualified: Vec<std::collections::BTreeSet<String>> =
+    vec![std::collections::BTreeSet::new(); LAWS.len()];
   let mut counted: f64 = 0.0;
   for name in names {
     let mut p99 = [0.0f64; LAWS.len()];
@@ -717,11 +719,11 @@ fn rank(rows: &[(String, ControllerKind, Outcome)]) {
         .collect();
       for outcome in &runs {
         if outcome.stalled {
-          disqualified[index] = format!("stalled in {name}");
+          disqualified[index].insert(format!("stalled in {name}"));
         }
         let same_law_pair = outcome.goodputs.len() == 2 && !name.starts_with("coexist");
         if same_law_pair && outcome.jain() < FAIRNESS_FLOOR {
-          disqualified[index] = format!("Jain {:.3} in {name}", outcome.jain());
+          disqualified[index].insert(format!("Jain {:.3} in {name}", outcome.jain()));
         }
       }
       p99[index] =
@@ -757,9 +759,13 @@ fn rank(rows: &[(String, ControllerKind, Outcome)]) {
       worst_latency[index].1,
       (goodput_ratio[index] / counted.max(1.0)).exp(),
       if disqualified[index].is_empty() {
-        "no"
+        "no".to_owned()
       } else {
-        &disqualified[index]
+        disqualified[index]
+          .iter()
+          .cloned()
+          .collect::<Vec<_>>()
+          .join("; ")
       }
     );
   }

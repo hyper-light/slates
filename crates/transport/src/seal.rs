@@ -89,9 +89,14 @@ impl std::error::Error for SealError {}
 /// these bytes and the tag fails.
 fn routing_aad(sender: u64, key_epoch: u32) -> [u8; AAD_BYTES] {
   let mut aad = [0u8; AAD_BYTES];
-  aad[0] = PROTOCOL_VERSION;
-  aad[size_of::<u8>()..size_of::<u8>() + size_of::<u64>()].copy_from_slice(&sender.to_le_bytes());
-  aad[size_of::<u8>() + size_of::<u64>()..].copy_from_slice(&key_epoch.to_le_bytes());
+  crate::fill_from(
+    &mut aad,
+    &[
+      &[PROTOCOL_VERSION],
+      &sender.to_le_bytes(),
+      &key_epoch.to_le_bytes(),
+    ],
+  );
   aad
 }
 
@@ -100,8 +105,10 @@ fn routing_aad(sender: u64, key_epoch: u32) -> [u8; AAD_BYTES] {
 /// no width is written as a literal.
 fn nonce_for(counter: u64, channel: u32) -> SealNonce {
   let mut nonce = SealNonce::default();
-  nonce[..size_of::<u64>()].copy_from_slice(&counter.to_le_bytes());
-  nonce[size_of::<u64>()..].copy_from_slice(&channel.to_le_bytes());
+  crate::fill_from(
+    &mut nonce,
+    &[&counter.to_le_bytes(), &channel.to_le_bytes()],
+  );
   nonce
 }
 

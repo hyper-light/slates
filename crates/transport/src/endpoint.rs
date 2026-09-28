@@ -691,7 +691,7 @@ impl Endpoint {
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(&mut buf, period).await? {
-        Some((rn, _from)) => match self.reassembler.push(&buf[..rn]) {
+        Some((rn, _from)) => match self.reassembler.push(buf.get(..rn).unwrap_or_default()) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
           // A fragment that does not yet complete a flight is progress — the peer is alive and
@@ -788,7 +788,7 @@ impl Endpoint {
         Some((n, from)) => {
           // A packet that unprotects under the 1-RTT keys is the server's confirmation: it has its keys,
           // so it received our final flight, and the handshake is complete both ways.
-          if from == self.peer && self.ingest(&buf[..n]).is_ok() {
+          if from == self.peer && self.ingest(buf.get(..n).unwrap_or_default()).is_ok() {
             return Ok(());
           }
           invalid += 1;
@@ -852,7 +852,7 @@ impl Endpoint {
           // has our confirmation and moved on, so the handshake is done. Ingest it, so the receive the
           // caller runs next finds it already in the connection rather than waiting a probe timeout for
           // the client's retransmit of it.
-          if from == self.peer && self.ingest(&buf[..n]).is_ok() {
+          if from == self.peer && self.ingest(buf.get(..n).unwrap_or_default()).is_ok() {
             return Ok(());
           }
           invalid += 1;
@@ -1006,7 +1006,7 @@ impl Endpoint {
     let mut buf = [0u8; DATAGRAM_BYTES];
     match self.recv_within(&mut buf, timeout_ns).await? {
       Some((n, _from)) => {
-        self.fold_or_discard(&buf[..n])?;
+        self.fold_or_discard(buf.get(..n).unwrap_or_default())?;
         Ok(true)
       }
       None => Ok(false),
@@ -1359,14 +1359,17 @@ fn protect_packet(
   packet.extend_from_slice(&payload);
   packet.extend_from_slice(tag.as_ref());
 
-  // Apply header protection: sample the ciphertext, mask the first byte and packet-number field.
-  let (head, tail) = packet.split_at_mut(HEADER_PROTECTION_SAMPLE_OFFSET);
-  let sample = &tail[..sample_len];
-  let (first, number) = head.split_at_mut(PACKET_NUMBER_OFFSET);
-  keys
-    .local
-    .header
-    .encrypt_in_place(sample, &mut first[0], number)?;
+  // Apply header protection: sample the ciphertext, mask the first byte and packet-number field. The
+  // padding above makes the packet long enough; a shorter one is refused, never indexed past its end.
+  let (head, tail) = packet
+    .split_at_mut_checked(HEADER_PROTECTION_SAMPLE_OFFSET)
+    .ok_or(EndpointError::NotReady)?;
+  let sample = tail.get(..sample_len).ok_or(EndpointError::NotReady)?;
+  let (first, number) = head
+    .split_at_mut_checked(PACKET_NUMBER_OFFSET)
+    .ok_or(EndpointError::NotReady)?;
+  let first = first.first_mut().ok_or(EndpointError::NotReady)?;
+  keys.local.header.encrypt_in_place(sample, first, number)?;
   Ok(packet)
 }
 
@@ -1394,26 +1397,34 @@ fn unprotect_packet(
 
   // Remove header protection: the packet-number field is unknown length, so hand the masker the full
   // maximum-width span; it unmasks the first byte, reads the length, and unmasks exactly that many.
-  let (head, tail) = packet.split_at_mut(HEADER_PROTECTION_SAMPLE_OFFSET);
-  let sample = &tail[..sample_len];
-  let (first, number) = head.split_at_mut(PACKET_NUMBER_OFFSET);
-  keys
-    .remote
-    .header
-    .decrypt_in_place(sample, &mut first[0], number)?;
+  let (head, tail) = packet
+    .split_at_mut_checked(HEADER_PROTECTION_SAMPLE_OFFSET)
+    .ok_or(EndpointError::NotReady)?;
+  let sample = tail.get(..sample_len).ok_or(EndpointError::NotReady)?;
+  let (first, number) = head
+    .split_at_mut_checked(PACKET_NUMBER_OFFSET)
+    .ok_or(EndpointError::NotReady)?;
+  let first = first.first_mut().ok_or(EndpointError::NotReady)?;
+  keys.remote.header.decrypt_in_place(sample, first, number)?;
 
   // Validate the now-plaintext short header.
-  let first_byte = packet[0];
+  let first_byte = *packet.first().ok_or(EndpointError::Header)?;
   if first_byte & FIXED_BIT == 0 || first_byte & SHORT_HEADER_RESERVED_MASK != 0 {
     return Err(EndpointError::Header);
   }
   let pn_len = usize::from((first_byte & PACKET_NUMBER_LENGTH_MASK) + 1);
   let header_len = PACKET_NUMBER_OFFSET + pn_len;
-  let pn = decode_packet_number(rx_largest, &packet[PACKET_NUMBER_OFFSET..header_len]);
+  let truncated = packet
+    .get(PACKET_NUMBER_OFFSET..header_len)
+    .ok_or(EndpointError::Header)?;
+  let pn = decode_packet_number(rx_largest, truncated);
 
   // AEAD-open the payload with the unmasked header as associated data.
-  let aad = packet[..header_len].to_vec();
-  let mut buf = packet[header_len..].to_vec();
+  let (aad, body) = packet
+    .split_at_checked(header_len)
+    .ok_or(EndpointError::Header)?;
+  let aad = aad.to_vec();
+  let mut buf = body.to_vec();
   let plaintext = keys.remote.packet.decrypt_in_place(pn, &aad, &mut buf)?;
   let frames = decode_frames(plaintext).map_err(EndpointError::Frames)?;
   Ok((pn, frames))

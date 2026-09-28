@@ -88,7 +88,7 @@ pub fn fragment(flight: &[u8], start: usize) -> Option<Vec<Vec<u8>>> {
     datagram.extend_from_slice(&start_word.to_le_bytes());
     datagram.extend_from_slice(&u16::try_from(within).ok()?.to_le_bytes());
     datagram.extend_from_slice(&total_word.to_le_bytes());
-    datagram.extend_from_slice(&flight[within..end]);
+    datagram.extend_from_slice(flight.get(within..end)?);
     out.push(datagram);
     within = end;
   }
@@ -162,7 +162,7 @@ impl Reassembler {
     // already fed; ahead of it cannot exist (the peer needs our reply to advance); exactly at it is the
     // flight awaited. A retransmit that would straddle the consumed prefix is corrupt.
     if start < self.consumed {
-      return if start + total <= self.consumed {
+      return if start.saturating_add(total) <= self.consumed {
         Reassembly::Repeat
       } else {
         Reassembly::Malformed
@@ -176,19 +176,26 @@ impl Reassembler {
       Some(seen) if seen != total => return Reassembly::Malformed,
       Some(_) => {}
     }
-    for (i, byte) in payload.iter().enumerate() {
-      let at = within + i;
-      if !self.present[at] {
-        self.present[at] = true;
-        self.bytes[at] = *byte;
-        self.filled += 1;
+    // `within + payload.len() <= total` was checked above and both buffers hold `total` bytes, so every
+    // slot exists; a missing one would be skipped, never indexed.
+    let slots = self
+      .present
+      .iter_mut()
+      .zip(self.bytes.iter_mut())
+      .skip(within)
+      .zip(payload);
+    for ((present, slot), byte) in slots {
+      if !*present {
+        *present = true;
+        *slot = *byte;
+        self.filled = self.filled.saturating_add(1);
       }
     }
     if self.filled < total {
       return Reassembly::Pending;
     }
     let flight = std::mem::take(&mut self.bytes);
-    self.consumed += total;
+    self.consumed = self.consumed.saturating_add(total);
     self.total = None;
     self.present = Vec::new();
     self.filled = 0;
@@ -210,12 +217,16 @@ fn parse(datagram: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
   if datagram.first() != Some(&FRAGMENT_TAG) || datagram.len() < FRAGMENT_HEADER {
     return None;
   }
-  let word = |at: usize| usize::from(u16::from_le_bytes([datagram[at], datagram[at + 1]]));
+  let word = |at: usize| {
+    let pair = datagram.get(at..at.checked_add(2)?)?;
+    let pair: [u8; 2] = pair.try_into().ok()?;
+    Some(usize::from(u16::from_le_bytes(pair)))
+  };
   Some((
-    word(AT_START),
-    word(AT_WITHIN),
-    word(AT_TOTAL),
-    &datagram[FRAGMENT_HEADER..],
+    word(AT_START)?,
+    word(AT_WITHIN)?,
+    word(AT_TOTAL)?,
+    datagram.get(FRAGMENT_HEADER..)?,
   ))
 }
 
