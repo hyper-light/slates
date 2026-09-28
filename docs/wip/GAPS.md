@@ -2066,16 +2066,21 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 
 - **Closed.** [Reassembly scanned every buffered segment](../bugs/2026-09-28-reassembly-scanned-every-buffered-segment.md):
   it is now an ordered lookup, 4,000,000 → about 16,000 segment examinations for 4,000 holed arrivals.
-- **Open: spurious loss under reordering.** The reorder-jitter scenario (8 ms at 10 Mbit/s, 20 ms) carries
+- **Closed: spurious loss under reordering.** The reorder-jitter scenario (8 ms at 10 Mbit/s, 20 ms) carried
   0.25 of the link, with 27,016 spurious retransmissions and no real drops. RFC 9002's fixed thresholds
-  (3 packets, 9/8 RTT) misread the reordering as loss. The next build is adaptive thresholds per RFC 8985
-  §6.2 (RACK).
+  (3 packets, 9/8 RTT) misread the reordering as loss. The tolerance now adapts
+  (`crates/transport/src/reorder.rs`, RFC 9002 §6.1.1, RFC 8985 §6.2). A spurious loss raises the packet
+  threshold to the distance it showed, and widens the time threshold by a quarter of the minimum RTT per
+  round trip. Both are bounded by the window and the smoothed RTT, and both reset after 16 quiet recoveries.
+  Result: 0.254 → 0.540 of the link over 20 seeds, neutral elsewhere (`docs/wip/BENCHMARKS.md`). The by-use
+  test fails without the adaptation (20,273 first-half against 20,907 second-half retransmissions).
 - **Open: Copa on long fat paths.** Traced at 100 Mbit/s, 300 ms. Slow start overshoots to 1.6× the BDP.
   Then a queue of about 200 ms stands for about 4.5 s, because Copa drains 1/δ packets per RTT until its
   velocity ramps. The velocity then collapses the window to 4 % of the BDP on feedback a round trip late.
   A prototype steps straight to pipe + 1/δ packets whenever a queue stands. Over the 20-seed grids it cut
   congestion steady p99 by 7.3 %, class metadata p99 by 24 %, and raised 100 M/300 ms capacity from 0.50 to
-  0.64. It is held until reordering is fixed, because a jitter-inflated standing RTT misleads it.
+  0.64. It was held until reordering was fixed, because a jitter-inflated standing RTT misleads it; it is
+  re-measured next on top of the adaptive tolerance.
 - **Open: the thin-link tail** (Copa's standing queue on thin lossless links). The same prototype halved
   the 64 kbit/s, 20 ms steady p99.
 

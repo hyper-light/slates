@@ -1317,6 +1317,11 @@ impl Endpoint {
     self.conn.congestion_window()
   }
 
+  /// Losses this end declared that the peer then acknowledged — reordering, not loss (`crate::reorder`).
+  pub fn spurious_losses(&self) -> u64 {
+    self.conn.spurious_losses()
+  }
+
   /// Why the connection's fresh sending stopped, counted (`Connection::send_stops`).
   pub fn send_stops(&self) -> crate::connection::SendStops {
     self.conn.send_stops()

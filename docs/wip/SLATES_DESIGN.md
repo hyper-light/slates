@@ -2348,6 +2348,16 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > - **Records.** The research note's slices 3a–3c, and
 >   `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md` and
 >   `docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`.
+> **Adaptive reordering tolerance, landed 2026-09-28** (RFC 9002 §6.1.1; RFC 8985 §6.2).
+> - **Why.** A reordering path had packets declared lost that then arrived. At 8 ms of jitter the session
+>   carried a quarter of the link.
+> - **The rule** (`crates/transport/src/reorder.rs`). A spurious loss (declared, then acknowledged) raises
+>   the packet threshold to the distance it showed, and widens the time threshold by a quarter of the minimum
+>   RTT per round trip. The packet threshold never exceeds a window's packets, and the time window never
+>   exceeds the smoothed RTT. After 16 loss recoveries with no spurious loss both return to the defaults.
+> - **Proven by use.** `a_reordering_path_teaches_the_loss_thresholds` reverses every run of 8 packets on
+>   the wire and requires the transfer's second half to retransmit a quarter or less of the first half's.
+>   It fails with the fixed thresholds. Measured: 0.254 → 0.540 of the link, neutral elsewhere.
 > Same day: the durability policy now gates writes. `DurabilityBound::shortfall` answers
 > `within_loss_bound(ε, F)` with its numbers at every configuration install (boot, council commit,
 > cross-shard fan — every shard measures, one change counts once), and `verbs::dispatch` refuses a create,

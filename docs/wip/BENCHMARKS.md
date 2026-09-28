@@ -604,3 +604,35 @@ lost. Raw rows: `docs/wip/research/data/2026-09-28-path-mtu-bench-loopback{,-ed6
     mean 340, 10 seeds over 800 ms, against the baseline's 135 / 430 / 883 / 449 / 12.
 - **Probe acknowledgements as RTT samples.** A probe pokes a possibly idle peer, which acknowledges it at its
   next wake: 1.1 ms on a 1 ms path. Probes now give no RTT sample.
+
+## Session-plane adaptive reordering tolerance (2026-09-28)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GiB. **Commands (the contract):**
+`cargo run --release -p slates-transport --example congestion_bench` and `... --example class_latency_bench`,
+each at 20 seeds (set in a scratch copy only). The baseline is the path-MTU-discovery grid above.
+
+**What it buys: 2.1× on a reordering path.** The reorder-jitter scenario (10 Mbit/s, 20 ms, 8 ms of jitter,
+no real loss). RFC 9002's fixed thresholds read the reordering as loss and retransmitted what had arrived.
+
+| build | capacity share, median (range) of 20 | goodput median | steady ping p99 median |
+|---|---|---|---|
+| path MTU discovery | 0.254 (0.253–0.258) | 2.54 Mbit/s | 29.6 ms |
+| adaptive reordering | **0.540** (0.522–0.554) | 5.39 Mbit/s | 29.3 ms |
+
+**What it costs elsewhere: nothing measurable.**
+- **Congestion grid** (1,120 runs): steady ping p99 geomean ×1.002 (worst scenario ×1.22 at the noise band's
+  edge), capacity share ×1.014, Jain fairness ×1.000, no stalls.
+- **Class grid** (260 runs): control p99 ×0.998, control p999 ×0.996, metadata p99 ×0.996 (every scenario
+  within 0.95–1.05).
+- **Why it is neutral.** The tolerance only moves after a spurious loss. The bulk sender counted **zero**
+  spurious losses in the lossless 100 Mbit/s, 20 ms scenario and in the lossy 1 Mbit/s, 20 ms scenarios (1 %
+  and 5 %), so there it runs RFC 9002's thresholds unchanged.
+- **The worst whole-run p99 (×1.49, 1 Mbit/s, 20 ms, 5 % loss) is run-to-run spread, not this change.**
+  The same build does not always give the same whole-run p99 for the same seed. `fd4f0ef` gave seed 2
+  833.3 ms on one run and 397.0 ms on the next. The parent `8700a7f` gave seed 3 424.1 ms, then 350.7 ms
+  twice. Whole-run p99 over a small seed set is read only against the measured noise band, never per seed.
+- **An earlier comparison against a stale baseline was wrong.** Against an older tree (before path MTU
+  discovery) the grid seemed to move the lossless 100 Mbit/s, 20 ms whole-run ping p99 ×2.26 and the
+  10 Mbit/s, 20 ms metadata p99 ×1.64. The parent `8700a7f` without the change gives the same 90.3 ms on
+  every seed, so the move predates this change.
+- Raw rows: `docs/wip/research/data/2026-09-28-{congestion,class}-grid-20seeds-reorder.csv`.

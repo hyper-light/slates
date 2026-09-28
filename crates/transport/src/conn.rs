@@ -221,6 +221,23 @@ pub fn tracked_bytes(frame: &Frame) -> u64 {
   }
 }
 
+/// The inclusive packet-number runs `(low, high)` an ACK frame acknowledges: its first run
+/// `[largest − range, largest]`, then each additional range relative to the previous run's low (RFC 9000
+/// §19.3.1: `high = prev_low − gap − 2`, `low = high − len`). Saturating, so a malformed frame from a hostile
+/// peer can only describe less, never panic.
+pub fn ack_runs(largest: u64, range: u64, ranges: &[AckRange]) -> Vec<(u64, u64)> {
+  let mut runs = Vec::with_capacity(ranges.len().saturating_add(1));
+  let mut prev_low = largest.saturating_sub(range);
+  runs.push((prev_low, largest));
+  for r in ranges {
+    let high = prev_low.saturating_sub(r.gap).saturating_sub(2);
+    let low = high.saturating_sub(r.len);
+    runs.push((low, high));
+    prev_low = low;
+  }
+  runs
+}
+
 /// Send-side tracking: assigns packet numbers, records what each in-flight packet carried, processes
 /// ACKs (freeing acknowledged packets), and declares loss by the reorder threshold.
 #[derive(Debug, Default)]
@@ -313,28 +330,30 @@ impl SentTracker {
   /// `high = prev_low - gap - 2`, `low = high - len`. Saturating arithmetic means a malformed range
   /// from a hostile peer can only under-acknowledge (a packet not in flight frees nothing), never panic.
   pub fn on_ack_frame(&mut self, largest: u64, range: u64, ranges: &[AckRange]) -> Acked {
-    let mut acked = self.on_ack(largest, range);
-    let mut prev_low = largest.saturating_sub(range);
-    for r in ranges {
-      let high = prev_low.saturating_sub(r.gap).saturating_sub(2);
-      let low = high.saturating_sub(r.len);
+    let mut acked = Acked::default();
+    for (low, high) in ack_runs(largest, range, ranges) {
       let more = self.on_ack(high, high.saturating_sub(low));
       acked.bytes = acked.bytes.saturating_add(more.bytes);
       acked.pns.extend(more.pns);
       acked.packets.extend(more.packets);
       acked.frames.extend(more.frames);
-      prev_low = low;
     }
     acked
   }
 
   /// Removes and returns the packets now declared lost (RFC 9002 §6.1): in flight below the largest
-  /// acknowledged packet and either at least [`REORDER_THRESHOLD`] packets below it (§6.1.1) or sent at
+  /// acknowledged packet and either at least `packet_threshold` packets below it (§6.1.1: [`REORDER_THRESHOLD`],
+  /// raised by the connection's adaptive reordering tolerance, `crate::reorder`) or sent at
   /// least `loss_delay` before `now` (§6.1.2's time threshold — what recovers a loss the packet threshold
   /// cannot see, and what keeps reordering within a round trip from reading as loss). Also returns when
   /// the next such packet crosses the time threshold (`loss_time`, §6.1.2), for the connection's timer;
   /// `None` when no unacknowledged packet sits below the largest acknowledged.
-  pub fn take_lost(&mut self, now: u64, loss_delay: u64) -> (Lost, Option<u64>) {
+  pub fn take_lost(
+    &mut self,
+    now: u64,
+    loss_delay: u64,
+    packet_threshold: u64,
+  ) -> (Lost, Option<u64>) {
     let Some(largest) = self.largest_acked else {
       return (Lost::default(), None);
     };
@@ -344,7 +363,7 @@ impl SentTracker {
     let mut loss_time: Option<u64> = None;
     for (&pn, flight) in self.in_flight.range(..largest) {
       let by_time = lost_send_time.is_some_and(|limit| flight.sent_at <= limit);
-      if pn.saturating_add(REORDER_THRESHOLD) <= largest || by_time {
+      if pn.saturating_add(packet_threshold) <= largest || by_time {
         lost.push(pn);
       } else {
         let due = flight.sent_at.saturating_add(loss_delay);
@@ -752,7 +771,7 @@ mod tests {
     // Acknowledge [2,5]; 0 and 1 remain in flight, both >= REORDER_THRESHOLD below largest (5).
     sent.on_ack(5, 3);
     assert_eq!(sent.in_flight_count(), 2, "0 and 1 still in flight");
-    let lost = sent.take_lost(0, 1).0;
+    let lost = sent.take_lost(0, 1, REORDER_THRESHOLD).0;
     assert_eq!(
       lost.frames.len(),
       2,
@@ -774,7 +793,7 @@ mod tests {
     sent.on_sent(0, vec![Frame::MaxData { max: 7 }], 0, 0);
     sent.on_sent(1, vec![Frame::MaxData { max: 8 }], 0, 0);
     // No ACK ever arrives (a tail loss), so `take_lost` finds nothing.
-    assert!(sent.take_lost(0, 1).0.frames.is_empty());
+    assert!(sent.take_lost(0, 1, REORDER_THRESHOLD).0.frames.is_empty());
     assert_eq!(sent.copy_oldest(), vec![Frame::MaxData { max: 7 }]);
     assert_eq!(sent.in_flight_count(), 2, "the original stays in flight");
     assert!(
@@ -785,7 +804,7 @@ mod tests {
 
   /// Builds one packet's frames: the lost frames to retransmit first, then up to two fresh ones.
   fn build_packet(source: &mut StreamSender, sent: &mut SentTracker) -> Vec<Frame> {
-    let mut frames = sent.take_lost(0, 1).0.frames;
+    let mut frames = sent.take_lost(0, 1, REORDER_THRESHOLD).0.frames;
     for _ in 0..2 {
       match source.next_frame(1, 8) {
         Some(frame) => frames.push(frame),

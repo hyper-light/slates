@@ -36,10 +36,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::congestion::{AckEvent, Controller, LossEvent};
-use crate::conn::{AckGenerator, Lost, REORDER_THRESHOLD, SentPacket, SentTracker, tracked_bytes};
+use crate::conn::{
+  AckGenerator, Lost, REORDER_THRESHOLD, SentPacket, SentTracker, ack_runs, tracked_bytes,
+};
 use crate::flow::FlowController;
 use crate::pacer::Pacer;
 use crate::pmtud::{BASE_PLPMTU, PathMtu, PathMtuStats};
+use crate::reorder::Reordering;
 use crate::rtt::RttEstimator;
 use crate::session::{ACK_FRAME_BASE_BYTES, ACK_RANGE_BYTES, Frame, STREAM_FRAME_HEADER_BYTES};
 use crate::stream::{StreamAssembler, StreamSender};
@@ -298,6 +301,8 @@ pub struct Connection {
   /// Path MTU discovery (`crate::pmtud`), once the peer's largest datagram is known
   /// ([`Connection::enable_path_mtu`]); until then the connection frames at its shape's budget.
   path_mtu: Option<PathMtu>,
+  /// The adaptive reordering tolerance (`crate::reorder`): the loss thresholds widened by spurious losses.
+  reordering: Reordering,
 }
 
 /// What one packet has used so far: its encoded frame bytes (against the datagram budget) and its stream
@@ -378,6 +383,7 @@ impl Connection {
       stream_blocked_sent: BTreeMap::new(),
       streams_blocked_sent: None,
       path_mtu: None,
+      reordering: Reordering::default(),
     }
   }
 
@@ -1063,6 +1069,16 @@ impl Connection {
     ranges: &[crate::session::AckRange],
   ) {
     let acked = self.sent.on_ack_frame(largest, range, ranges);
+    // A declared loss this acknowledgement covers was spurious: the tolerance widens to cover it.
+    if self.reordering.remembers_declared_losses() {
+      let window_packets = self.window_packets();
+      self.reordering.on_acknowledged(
+        &ack_runs(largest, range, ranges),
+        now,
+        self.rtt.smoothed_rtt_or_initial(),
+        window_packets,
+      );
+    }
     if acked.packets.is_empty() {
       return;
     }
@@ -1132,12 +1148,49 @@ impl Connection {
   /// Runs loss detection at `now` (RFC 9002 §6.1): removes the lost packets from flight, and re-arms the loss timer. The caller hands the packets to the controller and requeues
   /// their frames.
   fn detect_losses(&mut self, now: u64) -> Lost {
-    let (mut lost, loss_time) = self.sent.take_lost(now, self.rtt.loss_delay());
+    let srtt = self.rtt.smoothed_rtt_or_initial();
+    let loss_delay = self
+      .rtt
+      .loss_delay()
+      .saturating_add(self.reordering.extra_delay(self.rtt.min_rtt(), srtt));
+    let (mut lost, loss_time) =
+      self
+        .sent
+        .take_lost(now, loss_delay, self.reordering.packet_threshold());
     self.loss_time = loss_time;
     let bytes: u64 = lost.packets.iter().map(|packet| packet.bytes).sum();
     self.in_flight = self.in_flight.saturating_sub(bytes);
     self.note_mtu_losses(&mut lost, now);
+    // Remember the data packets declared lost, so a late acknowledgement shows them spurious and widens the
+    // tolerance (`crate::reorder`); a path-MTU probe is lost for its size, not its order, and is not counted.
+    let declared: Vec<u64> = lost.packets.iter().map(|packet| packet.pn).collect();
+    let largest = self.sent.largest_acked().unwrap_or(0);
+    let cap = usize::try_from(
+      self
+        .window_packets()
+        .saturating_mul(crate::reorder::MEMORY_SRTTS),
+    )
+    .unwrap_or(usize::MAX);
+    self
+      .reordering
+      .on_declared_lost(&declared, largest, now, srtt, cap);
     lost
+  }
+
+  /// The packets the congestion window holds at its current datagram size — what bounds the reordering
+  /// tolerance (a threshold past the window could never be met).
+  fn window_packets(&self) -> u64 {
+    (self.controller.window() / self.controller_datagram().max(1)).max(REORDER_THRESHOLD)
+  }
+
+  /// The datagram size the controller counts in.
+  fn controller_datagram(&self) -> u64 {
+    self.controller.copa().max_datagram()
+  }
+
+  /// Spurious losses the reordering tolerance has detected (a packet declared lost, acknowledged after).
+  pub fn spurious_losses(&self) -> u64 {
+    self.reordering.spurious()
   }
 
   /// Folds acknowledged packets into path MTU discovery: a probe confirms its size (the controller follows a
@@ -1761,6 +1814,86 @@ mod tests {
     open(&mut sender, b"after");
     let (pn, _) = sender.poll_transmit(1_000, cap).expect("the data goes out");
     assert_eq!(pn, probe, "the refused probe's packet number is reused");
+  }
+
+  /// §4.10a (RFC 9002 §6.1.1; RFC 8985 §6.2; `crate::reorder`): a path that reorders but loses nothing
+  /// teaches the loss thresholds. Each round the wire reverses every run of `DEPTH` packets in the sender's
+  /// batch, so packets arrive up to `DEPTH - 1` places out of order — more than RFC 9002's three. Early rounds
+  /// declare delivered packets lost (spurious); the tolerance widens to cover the distance, and the later half
+  /// of the transfer retransmits a quarter or less of what the first half did — while every byte arrives
+  /// exactly once, in order.
+  #[test]
+  fn a_reordering_path_teaches_the_loss_thresholds() {
+    /// Shape: how many consecutive packets the wire reverses — past RFC 9002's threshold of three.
+    const DEPTH: usize = 8;
+    let cap = FRAME_CAP;
+    let window = 64 * (cap as u64);
+    let shape = ConnectionShape {
+      max_datagram: cap as u64,
+      initial_window: window,
+      receive_ceiling: window,
+    };
+    let mut sender = Connection::new(shape, Role::Client);
+    let mut receiver = Connection::new(shape, Role::Server);
+    let content: Vec<u8> = (0..400_000u32).map(|at| (at % 251) as u8).collect();
+    let id = open(&mut sender, &content);
+    let mut now = 1_000_000u64;
+    let mut received = Vec::new();
+    let mut retransmitted_at_half = None;
+    for _round in 0..20_000 {
+      now = reordered_round(&mut sender, &mut receiver, id, now, DEPTH, &mut received);
+      if sender.next_timeout().is_some_and(|due| due <= now) {
+        sender.on_timeout(now);
+      }
+      if retransmitted_at_half.is_none() && received.len() >= content.len() / 2 {
+        retransmitted_at_half = Some(sender.retransmitted());
+      }
+      if received.len() == content.len() && !sender.owes_peer() {
+        break;
+      }
+    }
+    assert_eq!(received, content, "every byte once, in order");
+    let first_half = retransmitted_at_half.expect("the transfer passed its half");
+    let second_half = sender.retransmitted() - first_half;
+    assert!(
+      sender.spurious_losses() > 0,
+      "the reordering was seen as spurious loss"
+    );
+    assert!(
+      second_half * 4 <= first_half.max(1),
+      "the tolerance cut spurious retransmissions: {first_half} in the first half, {second_half} in the second"
+    );
+  }
+
+  /// One round over a reordering wire: everything `sender` may send goes out, every run of `depth` packets is
+  /// delivered reversed, and each packet is acknowledged as it arrives — so the sender sees a run's later
+  /// packets acknowledged first. Returns the clock after the round.
+  fn reordered_round(
+    sender: &mut Connection,
+    receiver: &mut Connection,
+    id: u64,
+    mut now: u64,
+    depth: usize,
+    received: &mut Vec<u8>,
+  ) -> u64 {
+    let cap = FRAME_CAP;
+    let mut batch = Vec::new();
+    while let Some(packet) = sender.poll_transmit(now, cap) {
+      batch.push(packet);
+    }
+    for run in batch.chunks_mut(depth) {
+      run.reverse();
+    }
+    now += 1_000_000;
+    for (pn, frames) in batch {
+      receiver.handle_incoming(now, pn, &frames);
+      received.extend(receiver.read_stream(now, id));
+      while let Some((ack_pn, ack_frames)) = receiver.poll_transmit(now, cap) {
+        sender.handle_incoming(now, ack_pn, &ack_frames);
+      }
+      now += 10_000;
+    }
+    now + 1_000_000
   }
 
   /// The dialing end of a [`fixed`] pair — the one that opens the streams.

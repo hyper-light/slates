@@ -61,6 +61,7 @@ pub mod packet_number;
 pub mod params;
 pub mod pmtud;
 pub mod receive;
+pub mod reorder;
 pub mod rtt;
 pub mod schedule;
 pub mod seal;

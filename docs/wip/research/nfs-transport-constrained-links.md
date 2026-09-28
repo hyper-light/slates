@@ -509,3 +509,15 @@ Each scenario measures:
   - **Modelled interface.** The simulated fabric now models a host interface
     (`sim_udp_set_interface_mtu`): a datagram past it is refused at the send, as a real host with
     don't-fragment set refuses it. The grids model Ethernet hosts behind the floor path.
+- **Slice 4a (2026-09-28): adaptive reordering tolerance — 2.1× on a reordering path, neutral elsewhere.**
+  Record: `docs/wip/BENCHMARKS.md` "Session-plane adaptive reordering tolerance".
+  - **The finding.** At 10 Mbit/s, 20 ms with 8 ms of jitter, the session carried 0.25 of the link and
+    retransmitted 27,016 frames with no real loss. RFC 9002's fixed thresholds declared late packets lost.
+  - **The build** (`crates/transport/src/reorder.rs`). RFC 9002 §6.1.1 lets an implementation adapt its
+    thresholds; RACK (RFC 8985 §6.2) gives the shape. A loss the peer later acknowledges is spurious, and
+    it shows how far out of order its packet arrived. The packet threshold rises to that distance plus one,
+    capped by the packets a window holds. The time threshold gains a quarter of the minimum RTT per round
+    trip that saw one, capped by the smoothed RTT. After 16 quiet loss recoveries both return to the RFC's
+    defaults. Declared losses are remembered for two smoothed RTTs, at most two windows' worth.
+  - **Measured.** 0.254 → 0.540 of the link over 20 seeds. The other scenarios counted no spurious losses,
+    so there the thresholds stay the RFC's; the grids are neutral within the noise band.
