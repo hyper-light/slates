@@ -510,12 +510,12 @@ mod tests {
   /// §4.10a (RFC 9000 §7.4): the parameters a peer presents cross the authenticated handshake unchanged,
   /// and a peer speaking another dialect is refused by the decode every endpoint runs when the handshake
   /// completes (`Endpoint::connection_id`) — not mis-read later. A real client presents raw parameters for
-  /// dialect 2; the server receives exactly those bytes and refuses them typed, and its own parameters,
+  /// dialect 9; the server receives exactly those bytes and refuses them typed, and its own parameters,
   /// read by the client, decode as this build's.
   #[test]
   fn a_peer_of_another_dialect_is_refused_at_the_handshake() {
     let identity = self_signed("slates-node");
-    let foreign: Vec<u8> = vec![0x01, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let foreign: Vec<u8> = vec![0x01, 0x00, 0x04, 0x00, 0x09, 0x00, 0x00, 0x00];
     let cfg = client_config(identity.certificate(), &identity).unwrap();
     let server_name = ServerName::try_from("slates-node".to_owned()).unwrap();
     // structural: allow — D-8 exception 2: rustls's `ClientConnection::new` takes `Arc` by signature.
@@ -535,7 +535,7 @@ mod tests {
     );
     assert_eq!(
       TransportParameters::decode(server.quic_transport_parameters()),
-      Err(crate::params::ParamsError::Dialect { version: 2 }),
+      Err(crate::params::ParamsError::Dialect { version: 9 }),
       "another dialect is refused typed"
     );
     assert_eq!(

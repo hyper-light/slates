@@ -39,6 +39,7 @@ use crate::congestion::{AckEvent, Controller, LossEvent};
 use crate::conn::{AckGenerator, Lost, REORDER_THRESHOLD, SentPacket, SentTracker, tracked_bytes};
 use crate::flow::FlowController;
 use crate::pacer::Pacer;
+use crate::pmtud::{BASE_PLPMTU, PathMtu, PathMtuStats};
 use crate::rtt::RttEstimator;
 use crate::session::{ACK_FRAME_BASE_BYTES, ACK_RANGE_BYTES, Frame, STREAM_FRAME_HEADER_BYTES};
 use crate::stream::{StreamAssembler, StreamSender};
@@ -150,6 +151,10 @@ pub struct ConnectionCensus {
   pub in_flight: usize,
   /// Receive streams whose last advertised credit is remembered.
   pub credit_tracked: usize,
+  /// The path-MTU probe in flight (`crate::pmtud`): at most one by construction — the search never sends a
+  /// second while one is out — and connection-level, not exchange state, so a quiescent session may hold it
+  /// (it resolves with the next traffic's acknowledgements). Not counted in `in_flight`.
+  pub path_probe: usize,
   /// Send streams whose last blocked report is remembered.
   pub blocked_tracked: usize,
 }
@@ -290,6 +295,9 @@ pub struct Connection {
   stream_blocked_sent: BTreeMap<u64, u64>,
   /// The peer's stream credit a `StreamsBlocked` was last sent for.
   streams_blocked_sent: Option<u64>,
+  /// Path MTU discovery (`crate::pmtud`), once the peer's largest datagram is known
+  /// ([`Connection::enable_path_mtu`]); until then the connection frames at its shape's budget.
+  path_mtu: Option<PathMtu>,
 }
 
 /// What one packet has used so far: its encoded frame bytes (against the datagram budget) and its stream
@@ -369,6 +377,61 @@ impl Connection {
       blocked_sent: None,
       stream_blocked_sent: BTreeMap::new(),
       streams_blocked_sent: None,
+      path_mtu: None,
+    }
+  }
+
+  /// Starts path MTU discovery (`crate::pmtud`) toward a peer that reads datagrams of up to `peer_max`
+  /// bytes (its transport parameters, `crate::params`). Idempotent: a search already running is kept.
+  pub fn enable_path_mtu(&mut self, peer_max: usize) {
+    if self.path_mtu.is_none() {
+      self.path_mtu = Some(PathMtu::new(peer_max));
+    }
+  }
+
+  /// The frame bytes a packet carries now: the confirmed path MTU's budget once discovery runs, never less
+  /// than `base` (the shape's budget, which fits the floor every path carries).
+  pub fn packet_budget(&self, base: usize) -> usize {
+    self.path_mtu.as_ref().map_or(base, |pmtu| {
+      crate::endpoint::packet_budget_for(pmtu.current()).max(base)
+    })
+  }
+
+  /// The confirmed path MTU, once discovery runs.
+  pub fn path_mtu(&self) -> Option<usize> {
+    self.path_mtu.as_ref().map(PathMtu::current)
+  }
+
+  /// What path MTU discovery has counted, once it runs.
+  pub fn path_mtu_stats(&self) -> Option<PathMtuStats> {
+    self.path_mtu.as_ref().map(PathMtu::stats)
+  }
+
+  /// The path-MTU probe due at `now`, as `(packet_number, datagram_bytes)`: a packet carrying one `Ping`,
+  /// which the caller pads to exactly that size. Tracked in flight (so its acknowledgement or loss is seen)
+  /// with no stream bytes, so it takes no room in the congestion window; its loss is kept out of the
+  /// controller (RFC 9000 §14.4). `None` when no probe is due.
+  pub fn poll_probe(&mut self, now: u64) -> Option<(u64, usize)> {
+    let size = self.path_mtu.as_mut()?.next_probe(now)?;
+    let pn = self.sent.next_pn();
+    self.sent.on_sent(
+      pn,
+      vec![Frame::Ping],
+      now,
+      u64::try_from(size).unwrap_or(u64::MAX),
+    );
+    if let Some(pmtu) = self.path_mtu.as_mut() {
+      pmtu.on_probe_sent(pn, size);
+    }
+    Some((pn, size))
+  }
+
+  /// The local stack refused the probe `pn`'s datagram as too large at `now`: it was never sent, and its
+  /// size bounds the search.
+  pub fn on_probe_refused(&mut self, pn: u64, now: u64) {
+    self.sent.forget_unsent(pn);
+    if let Some(pmtu) = self.path_mtu.as_mut() {
+      pmtu.on_probe_refused(pn, now);
     }
   }
 
@@ -458,7 +521,10 @@ impl Connection {
   /// current receive credit. An acknowledgement-only packet is neither paced nor window-limited.
   pub fn poll_transmit(&mut self, now: u64, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
     let budget = packet_budget as u64;
-    if self.sent.in_flight_count() == 0 {
+    // With nothing recoverable in flight no probe timer runs, so a blocked sender reports itself (a lone
+    // path-MTU probe carries nothing and does not count: it once silenced this report and deadlocked a
+    // credit-blocked session, `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md`).
+    if self.recoverable_in_flight() == 0 {
       self.note_blocked();
     }
     let probe = self.probes_owed > 0;
@@ -487,7 +553,12 @@ impl Connection {
     }
     let pn = self.sent.next_pn();
     if !reliable.is_empty() {
-      self.record_sent(now, pn, reliable, probe, ack_largest);
+      // The datagram's size on the wire: the frames plus the packet's fixed overhead (an upper bound — the
+      // packet number may encode shorter than its longest form).
+      let size = packing
+        .used
+        .saturating_add(crate::endpoint::PACKET_OVERHEAD_BYTES as u64);
+      self.record_sent(now, pn, reliable, probe, ack_largest, size);
     }
     Some((pn, frames))
   }
@@ -575,7 +646,18 @@ impl Connection {
   ) -> Option<FreshStop> {
     loop {
       let front = self.retransmit.front()?;
-      let bytes = front.encoded_len() as u64;
+      let mut bytes = front.encoded_len() as u64;
+      if bytes > budget {
+        // A frame no packet of this budget can hold — framed for a larger path MTU before a black hole
+        // fell the session back (`crate::pmtud`) — is split at a stream offset so the head fills this
+        // packet and the tail waits first in the queue; without the split it would stop every packet here.
+        self.split_front_retransmission(budget.saturating_sub(packing.used));
+        bytes = self
+          .retransmit
+          .front()
+          .map_or(0, |frame| frame.encoded_len() as u64);
+      }
+      let front = self.retransmit.front()?;
       let data = tracked_bytes(front);
       if packing.used.saturating_add(bytes) > budget {
         return Some(FreshStop::Budget);
@@ -587,6 +669,56 @@ impl Connection {
       packing.used = packing.used.saturating_add(bytes);
       packing.data = packing.data.saturating_add(data);
       reliable.push(frame);
+    }
+  }
+
+  /// Splits the queued retransmission at the front, a `Stream` frame, so its head fits `room` encoded bytes:
+  /// the head (the same offset, never the `fin`) stays first, the tail (the rest, with the `fin`) second.
+  /// The tail's offset is recorded as owed at once, so the stream is not taken for delivered when the head
+  /// is acknowledged before the tail is sent. Nothing changes for any other frame or a room too small to
+  /// carry a byte.
+  fn split_front_retransmission(&mut self, room: u64) {
+    let Some(head_len) = usize::try_from(room)
+      .ok()
+      .and_then(|room| room.checked_sub(STREAM_FRAME_HEADER_BYTES))
+      .filter(|&len| len > 0)
+    else {
+      return;
+    };
+    let Some(Frame::Stream {
+      stream_id,
+      offset,
+      fin,
+      data,
+    }) = self.retransmit.front()
+    else {
+      return;
+    };
+    if data.len() <= head_len {
+      return;
+    }
+    let (stream_id, offset, fin) = (*stream_id, *offset, *fin);
+    let (Some(head_bytes), Some(tail_bytes)) = (data.get(..head_len), data.get(head_len..)) else {
+      return;
+    };
+    let tail_offset = offset.saturating_add(u64::try_from(head_len).unwrap_or(u64::MAX));
+    let head = Frame::Stream {
+      stream_id,
+      offset,
+      fin: false,
+      data: head_bytes.to_vec(),
+    };
+    let tail = Frame::Stream {
+      stream_id,
+      offset: tail_offset,
+      fin,
+      data: tail_bytes.to_vec(),
+    };
+    self.retransmit.pop_front();
+    self.retransmit.push_front(tail);
+    self.retransmit.push_front(head);
+    if let Some(offsets) = self.unacked.get_mut(&stream_id) {
+      offsets.insert(tail_offset);
     }
   }
 
@@ -658,6 +790,7 @@ impl Connection {
     reliable: Vec<Frame>,
     probe: bool,
     ack_largest: Option<u64>,
+    size: u64,
   ) {
     if let Some(largest) = ack_largest {
       self.sent_acks.insert(pn, largest);
@@ -684,7 +817,7 @@ impl Connection {
       self.pacer.on_sent(now, bytes, rate, quantum);
     }
     self.in_flight = self.in_flight.saturating_add(bytes);
-    self.sent.on_sent(pn, reliable, now);
+    self.sent.on_sent(pn, reliable, now, size);
   }
 
   /// Whether any send stream has data it could frame within its credit.
@@ -895,6 +1028,8 @@ impl Connection {
             Arrival::Violation => self.violations = self.violations.saturating_add(1),
           }
         }
+        // A path-MTU probe asks only to be acknowledged (`crate::pmtud`).
+        Frame::Ping => ack_eliciting = true,
         Frame::StopSending { stream_id } => {
           ack_eliciting = true;
           // RFC 9000 §3.5: a STOP_SENDING is answered by resetting the stream (a peer's stream not yet
@@ -938,15 +1073,26 @@ impl Connection {
       }
     }
     // The RTT sample (RFC 9002 §5.1): the largest acknowledged packet, if this acknowledgement newly
-    // acknowledged it.
+    // acknowledged it — unless it is a path-MTU probe. A probe pokes a peer that may be idle, which acks it
+    // only at its next wake; the dialect carries no ack delay to subtract, so such a sample reads the
+    // peer's idleness as path delay (measured: 1.1 ms against a 1 ms path, 2026-09-28) — the same class as
+    // `docs/bugs/2026-09-28-idle-peer-acks-inflated-the-rtt.md`. RTT samples come only from packets the
+    // peer is actively answering.
+    let probe_pn = self
+      .path_mtu
+      .as_ref()
+      .and_then(|pmtu| acked.packets.iter().find(|packet| pmtu.is_probe(packet.pn)))
+      .map(|packet| packet.pn);
     if let Some(newest) = acked.packets.iter().max_by_key(|packet| packet.pn)
       && newest.pn == largest
+      && probe_pn != Some(newest.pn)
     {
       self.rtt.on_sample(now.saturating_sub(newest.sent_at), 0);
       self.first_rtt_sample_at.get_or_insert(now);
     }
     self.pto_count = 0;
     self.in_flight = self.in_flight.saturating_sub(acked.bytes);
+    self.note_mtu_acknowledged(&acked.packets, now);
     self.mark_acknowledged(&acked.frames);
     let lost = self.detect_losses(now);
     // The acknowledgement's RTT sample for the controller: from the send of the most recently sent packet
@@ -954,6 +1100,7 @@ impl Connection {
     let rtt_sample = acked
       .packets
       .iter()
+      .filter(|packet| probe_pn != Some(packet.pn))
       .map(|packet| packet.sent_at)
       .max()
       .map(|sent_at| now.saturating_sub(sent_at));
@@ -985,11 +1132,81 @@ impl Connection {
   /// Runs loss detection at `now` (RFC 9002 §6.1): removes the lost packets from flight, and re-arms the loss timer. The caller hands the packets to the controller and requeues
   /// their frames.
   fn detect_losses(&mut self, now: u64) -> Lost {
-    let (lost, loss_time) = self.sent.take_lost(now, self.rtt.loss_delay());
+    let (mut lost, loss_time) = self.sent.take_lost(now, self.rtt.loss_delay());
     self.loss_time = loss_time;
     let bytes: u64 = lost.packets.iter().map(|packet| packet.bytes).sum();
     self.in_flight = self.in_flight.saturating_sub(bytes);
+    self.note_mtu_losses(&mut lost, now);
     lost
+  }
+
+  /// Folds acknowledged packets into path MTU discovery: a probe confirms its size (the controller follows a
+  /// larger datagram), and any other packet above the floor shows the confirmed size still crosses.
+  fn note_mtu_acknowledged(&mut self, packets: &[SentPacket], now: u64) {
+    let Some(pmtu) = self.path_mtu.as_mut() else {
+      return;
+    };
+    let mut grew = false;
+    for packet in packets {
+      if pmtu.is_probe(packet.pn) {
+        grew |= pmtu.on_probe_acked(packet.pn, now);
+      } else if packet.size > BASE_PLPMTU as u64 {
+        pmtu.on_large_packet_acked();
+      }
+    }
+    if grew {
+      let size = pmtu.current();
+      self
+        .controller
+        .set_max_datagram(crate::endpoint::packet_budget_for(size) as u64);
+    }
+  }
+
+  /// A probe timeout fired with packets above the floor in flight and nothing acknowledged since (RFC 8899
+  /// §4.3): after a path shrinks, every packet at the old size is dropped, so no acknowledgement comes to
+  /// declare any of them lost — the timeout is the only evidence. It counts as one loss of an above-floor
+  /// packet; at the black-hole threshold the session falls to the floor, and the probe's copy is split to fit
+  /// it (`split_front_retransmission`). Without this a session whose path shrank retried full-size copies
+  /// forever (`docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`).
+  fn note_mtu_timeout(&mut self, now: u64) {
+    if !self.sent.any_in_flight_larger_than(BASE_PLPMTU as u64) {
+      return;
+    }
+    let Some(pmtu) = self.path_mtu.as_mut() else {
+      return;
+    };
+    if pmtu.on_large_packet_lost(now) {
+      self
+        .controller
+        .set_max_datagram(crate::endpoint::packet_budget_for(BASE_PLPMTU) as u64);
+    }
+  }
+
+  /// Takes path-MTU probes out of a loss pass before the controller sees it (RFC 9000 §14.4: a lost probe is
+  /// no congestion signal) and folds every loss into discovery: a lost probe counts against its size, and
+  /// losses of other above-floor packets are black-hole evidence — on a black hole the session falls to the
+  /// floor and the controller follows. A `Ping` is never retransmitted.
+  fn note_mtu_losses(&mut self, lost: &mut Lost, now: u64) {
+    let Some(pmtu) = self.path_mtu.as_mut() else {
+      return;
+    };
+    let mut fell = false;
+    lost.packets.retain(|packet| {
+      if pmtu.is_probe(packet.pn) {
+        pmtu.on_probe_lost(packet.pn, now);
+        return false;
+      }
+      if packet.size > BASE_PLPMTU as u64 {
+        fell |= pmtu.on_large_packet_lost(now);
+      }
+      true
+    });
+    lost.frames.retain(|frame| !matches!(frame, Frame::Ping));
+    if fell {
+      self
+        .controller
+        .set_max_datagram(crate::endpoint::packet_budget_for(BASE_PLPMTU) as u64);
+    }
   }
 
   /// Whether `lost` establishes persistent congestion (RFC 9002 §7.6.2): an RTT sample existed before the
@@ -1132,6 +1349,12 @@ impl Connection {
       // A probe is owed and not yet sent: the caller's next flush sends it; the timer re-arms from it.
       return None;
     }
+    // A path-MTU probe alone in flight arms no probe timeout: it carries nothing to recover, and its fate is
+    // read from the acknowledgements of the next traffic (RFC 8899 §5.1.1 lets a search wait on traffic).
+    // Without this an idle session would send copies of a lost probe's `Ping` to learn a size nothing needs.
+    if self.recoverable_in_flight() == 0 {
+      return None;
+    }
     let sent = self.sent.newest_sent_at()?;
     let pto = self.rtt.pto(0);
     let backoff = 1u64 << self.pto_count.min(PTO_BACKOFF_SHIFT_CAP);
@@ -1166,6 +1389,7 @@ impl Connection {
     }
     self.pto_count = self.pto_count.saturating_add(1);
     self.probes_owed = 1;
+    self.note_mtu_timeout(now);
     // The probe carries new data only if new data can actually leave now — a stream with data inside its
     // own credit but no connection credit left cannot, and a probe that sends nothing leaves the timer
     // firing at the same instant forever (found by the loss oracle, 2026-09-27).
@@ -1360,10 +1584,25 @@ impl Connection {
       unacked: self.unacked.len(),
       retransmit: self.retransmit.len(),
       control: self.control.len(),
-      in_flight: self.sent.in_flight_count(),
+      in_flight: self.recoverable_in_flight(),
+      path_probe: self.path_probes_in_flight(),
       credit_tracked: self.credit_sent.len(),
       blocked_tracked: self.stream_blocked_sent.len(),
     }
+  }
+
+  /// The path-MTU probes in flight: one while the search waits on its probe, else none.
+  fn path_probes_in_flight(&self) -> usize {
+    usize::from(self.path_mtu.as_ref().is_some_and(PathMtu::probe_in_flight))
+  }
+
+  /// The packets in flight that carry something to recover — every one but a lone path-MTU probe. What the
+  /// connection's liveness rules count: the probe timeout, and the blocked reports sent when nothing is.
+  fn recoverable_in_flight(&self) -> usize {
+    self
+      .sent
+      .in_flight_count()
+      .saturating_sub(self.path_probes_in_flight())
   }
 
   /// The next packet number this connection will assign — its packet-number cursor.
@@ -1445,6 +1684,64 @@ mod tests {
       },
       role,
     )
+  }
+
+  /// §4.10a (RFC 9000 §19.13; `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md`): a
+  /// sender whose stream credit is spent, with all its data acknowledged, still reports itself blocked when
+  /// the only packet it has in flight is a path-MTU probe — the probe carries nothing and must not stand in
+  /// for traffic. Do X (spend the credit, deliver everything, send a probe that is lost, and let the peer's
+  /// acknowledgement arrive without its credit), expect Y (the next packet carries a blocked report).
+  #[test]
+  fn a_blocked_sender_reports_even_with_a_path_probe_in_flight() {
+    let cap = FRAME_CAP;
+    let mut sender = fixed_window(cap);
+    let mut receiver = fixed_receiver(cap);
+    sender.enable_path_mtu(9_000);
+    let content = vec![7u8; usize::try_from(initial_receive_window(cap)).unwrap() * 2];
+    open(&mut sender, &content);
+    // Send until the connection credit is spent, past each pacing release.
+    let mut now = 1_000;
+    while sender.connection_sent < sender.peer_max_data {
+      match sender.poll_transmit(now, cap) {
+        Some((pn, frames)) => receiver.handle_incoming(now, pn, &frames),
+        None => now = sender.next_timeout().unwrap_or(now).max(now + 1),
+      }
+    }
+    let (probe, _) = sender.poll_probe(now).expect("a probe is due");
+    assert!(
+      sender
+        .path_mtu_stats()
+        .is_some_and(|stats| stats.probes_sent == 1)
+    );
+    // The receiver's acknowledgement reaches the sender without its credit frames; the probe never arrived.
+    let (pn, frames) = receiver
+      .poll_transmit(now, cap)
+      .expect("the receiver acknowledges");
+    let ack_only: Vec<Frame> = frames
+      .into_iter()
+      .filter(|frame| matches!(frame, Frame::Ack { .. }))
+      .collect();
+    sender.handle_incoming(now, pn, &ack_only);
+    assert_eq!(
+      sender.census().in_flight,
+      0,
+      "every data packet is acknowledged"
+    );
+    assert_eq!(
+      sender.census().path_probe,
+      1,
+      "the probe {probe} is the one packet out"
+    );
+    let (_, next) = sender
+      .poll_transmit(now, cap)
+      .expect("a blocked sender sends its report");
+    assert!(
+      next.iter().any(|frame| matches!(
+        frame,
+        Frame::DataBlocked { .. } | Frame::StreamDataBlocked { .. }
+      )),
+      "the report goes out: {next:?}"
+    );
   }
 
   /// The dialing end of a [`fixed`] pair — the one that opens the streams.

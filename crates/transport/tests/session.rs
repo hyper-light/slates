@@ -220,6 +220,128 @@ fn each_end_holds_the_parameters_its_peer_declared() {
   );
 }
 
+/// Shape: the path MTUs the discovery test moves between — a jumbo-frame LAN, then an Ethernet path.
+const JUMBO_MTU: usize = 9_000;
+/// Shape: an Ethernet path's MTU, the path shrinks to mid-session.
+const ETHERNET_MTU: usize = 1_500;
+/// Shape: each transfer's size — many packets at either MTU, so the search and the black hole both see
+/// traffic.
+const TRANSFER_BYTES: usize = 400_000;
+
+/// A digest the server replies with: the request's length and a position-weighted sum of its bytes, so a
+/// reordered, duplicated or truncated delivery answers differently.
+fn digest(bytes: &[u8]) -> Vec<u8> {
+  let sum = bytes.iter().enumerate().fold(0u64, |sum, (at, byte)| {
+    sum.wrapping_add(u64::from(*byte).wrapping_mul(at as u64 + 1))
+  });
+  let mut out = (bytes.len() as u64).to_le_bytes().to_vec();
+  out.extend_from_slice(&sum.to_le_bytes());
+  out
+}
+
+/// §4.10a (RFC 8899 as RFC 9000 §14.3 applies it; `crate::pmtud`): a session finds how large a datagram its
+/// path carries and sends at that size, and when the path shrinks under it — a black hole — falls back to
+/// the floor, finds the new size, and loses no data. Do X (a transfer over a 9,000-byte path; shrink the
+/// path to 1,500 bytes; another transfer), expect Y (after the first the confirmed size is within one
+/// packet overhead of 9,000; after the second it is at most 1,500 and within that granularity of it; a
+/// black hole was detected; both transfers arrive byte-exact). Non-vacuous: probes were lost as well as
+/// acknowledged (the path really bounded the search).
+#[test]
+fn a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks() {
+  let mut sim = SimRuntime::new(&config(), 7).unwrap();
+  let id = sim.shard_ids()[0];
+  slates_rt::sim::sim_udp_set_path(
+    slates_rt::sim::SimPath::in_order(1_000_000, 0).with_mtu(JUMBO_MTU),
+  );
+  let server_identity = self_signed(NAME);
+  let client_identity = self_signed(NAME);
+  let server_cert = server_identity.certificate();
+  let client_cert = client_identity.certificate();
+  let (server_port_tx, server_port_rx) = channel();
+  let (client_port_tx, client_port_rx) = channel();
+  let (result_tx, result_rx) = channel();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = server_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(client_port_rx).await);
+      let mut server = Endpoint::server(
+        socket,
+        peer,
+        &server_identity,
+        std::slice::from_ref(&client_cert),
+        shape(),
+      )
+      .unwrap();
+      server.establish().await.unwrap();
+      for _ in 0..2 {
+        let (request, _kind, received) = server.next_request().await.unwrap();
+        server.reply(request, &digest(&received)).unwrap();
+      }
+      server.settle().await.unwrap();
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let _ = client_port_tx.send(socket.local_addr().unwrap().port());
+      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(server_port_rx).await);
+      let mut client =
+        Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape()).unwrap();
+      client.establish().await.unwrap();
+      let first: Vec<u8> = (0..TRANSFER_BYTES)
+        .map(|at| u8::try_from(at % 251).unwrap_or(0))
+        .collect();
+      let first_reply = client
+        .request(STREAM_ID, Priority::Bulk, &first)
+        .await
+        .unwrap();
+      let after_first = client.path_mtu();
+      slates_rt::sim::sim_udp_set_path(
+        slates_rt::sim::SimPath::in_order(1_000_000, 0).with_mtu(ETHERNET_MTU),
+      );
+      let second: Vec<u8> = (0..TRANSFER_BYTES)
+        .map(|at| u8::try_from(at % 241).unwrap_or(0))
+        .collect();
+      let second_reply = client
+        .request(STREAM_ID, Priority::Bulk, &second)
+        .await
+        .unwrap();
+      let _ = result_tx.send((
+        first_reply == digest(&first),
+        second_reply == digest(&second),
+        after_first,
+        client.path_mtu(),
+        client.path_mtu_stats(),
+      ));
+    })
+    .unwrap();
+  sim.run_until_idle();
+  let (first_exact, second_exact, after_first, after_second, stats) = result_rx.try_recv().unwrap();
+  assert!(
+    first_exact && second_exact,
+    "both transfers arrived byte-exact"
+  );
+  let after_first = after_first.unwrap();
+  assert!(
+    after_first <= JUMBO_MTU
+      && JUMBO_MTU - after_first <= slates_transport::pmtud::SEARCH_GRANULARITY,
+    "the jumbo path was found: {after_first}"
+  );
+  let after_second = after_second.unwrap();
+  let stats = stats.unwrap();
+  assert!(
+    stats.black_holes >= 1,
+    "the shrink was detected as a black hole: {stats:?}"
+  );
+  assert!(
+    after_second <= ETHERNET_MTU
+      && ETHERNET_MTU - after_second <= slates_transport::pmtud::SEARCH_GRANULARITY,
+    "the shrunken path was found: {after_second} ({stats:?})"
+  );
+  assert!(stats.probes_lost > 0 && stats.probes_acked > 0, "{stats:?}");
+}
+
 /// A request/reply exchange completes over a live session, the server producing its reply
 /// **asynchronously** (`serve_once_async`, the shape a forwarded verb needs — its reply comes from another
 /// shard or await; here the handler yields before replying, exercising the pending-await path): the client

@@ -2038,6 +2038,16 @@ Slice 3b, the same day:
 - Every datagram socket sets don't-fragment (rt unsafe budget 59 → 61).
 - Measured: macOS caps UDP datagrams at 9,216 bytes (`net.inet.udp.maxdgram`).
 
-Still owed for path MTU discovery (RFC 8899):
-- the probe search, black-hole detection and raise timer;
-- the controller and frame cap following the discovered size, with its benchmark.
+Slice 3c, the same day: the search, probes and black holes are built.
+- `pmtud.rs`, with an oracle over 2,000 paths.
+- `Ping` frame, dialect 2.
+- Probes stay out of congestion and out of RTT samples.
+- Probe timeouts count as black-hole evidence.
+- Oversized retransmissions are split.
+- The session test finds a 9,000-byte path and falls back through a shrink to 1,500 with no data lost.
+- Two bugs fixed test-first before shipping:
+  [a lone probe silenced the blocked report](../bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md);
+  [a shrunken path deadlocked before its black hole was seen](../bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md).
+
+Still owed for path MTU discovery: the goodput benchmark of the discovered size against the floor, and the
+search's cost measured on real paths (Linux loopback climbs toward 65,527).

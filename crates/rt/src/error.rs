@@ -90,4 +90,18 @@ impl RtError {
       code: std::io::Error::last_os_error().raw_os_error(),
     }
   }
+
+  /// Whether this is a send the local stack refused as too large for a datagram (`EMSGSIZE`; Winsock's
+  /// `WSAEMSGSIZE`): past the interface's MTU with don't-fragment set, or past the host's UDP datagram cap —
+  /// the answer a path-MTU probe that is too large for this host gets at once (RFC 8899 §4.4).
+  pub fn is_message_too_large(&self) -> bool {
+    matches!(self, Self::DriverRefused { code: Some(code), .. } if *code == MESSAGE_TOO_LARGE)
+  }
 }
+
+/// Format: the OS error code of a datagram too large to send — `EMSGSIZE` on Unix.
+#[cfg(unix)]
+const MESSAGE_TOO_LARGE: i32 = libc::EMSGSIZE;
+/// Format: the OS error code of a datagram too large to send — `WSAEMSGSIZE` on Windows.
+#[cfg(windows)]
+const MESSAGE_TOO_LARGE: i32 = windows_sys::Win32::Networking::WinSock::WSAEMSGSIZE;

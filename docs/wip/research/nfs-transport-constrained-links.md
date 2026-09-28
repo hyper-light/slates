@@ -449,3 +449,49 @@ Each scenario measures:
     - The DF option reads back set (macOS `IP_DONTFRAG`, Linux `IP_PMTUDISC_PROBE`), and an oversized
       macOS send is refused typed.
     - The fleet suite passes 50/50 (230 s) and cluster 193/193.
+- **Slice 3c (2026-09-28): the search, the probes, black holes.**
+  - **The search** (`crates/transport/src/pmtud.rs`) is sans-io and clock-injected.
+    - It starts at the 1,200-byte floor and binary-searches up to the peer's declared limit.
+    - Each size gets `MAX_PROBES` = 3 lost probes before it is judged too large (RFC 8899 §5.1.2).
+    - A size the local stack refuses (`EMSGSIZE`: the interface, or macOS's 9,216-byte cap) bounds the
+      search at once, and every later raise too.
+    - It stops once the gap is at most one packet's fixed overhead (29 bytes).
+    - It resumes after `PMTU_RAISE_TIMER` = 600 s (RFC 8899 §5.1.1).
+  - **Black holes.** Three consecutive losses of above-floor packets with no such packet acknowledged in
+    between fall the session back to the floor, bounded by the size that stopped crossing.
+  - **Oracle.** 2,000 random paths (path MTU, local cap and peer limit): the search never confirms more
+    than the path carries, always ends within 29 bytes of the best, and spends at most `MAX_PROBES` probes
+    per halving.
+  - **Probes.**
+    - A probe is a new `Ping` frame (kind 11, dialect 2), padded to the size under test.
+    - It is tracked in flight but carries no stream bytes, so it takes no congestion window.
+    - Its loss is kept out of the controller and out of persistent congestion (RFC 9000 §14.4), and it is
+      never retransmitted.
+    - Its acknowledgement gives no RTT sample: a probe pokes a possibly idle peer, which acknowledged it at
+      its next wake, 1.1 ms on a 1 ms path. This is the idle-peer class of
+      `docs/bugs/2026-09-28-idle-peer-acks-inflated-the-rtt.md`.
+  - **The connection.**
+    - It frames at the confirmed size.
+    - The controller follows each size change (RFC 9002 §7.2).
+    - A queued retransmission larger than the whole budget (framed before a fallback) is split at a stream
+      offset, and the tail's offset is recorded as owed at once.
+  - **The endpoint.**
+    - It starts the search from the peer's declared limit.
+    - It pads each probe to exactly its size.
+    - It treats a refused send as a bound, not an error.
+    - It checks every datagram against the confirmed size.
+  - **Bugs found and fixed test-first before shipping.**
+    - A lone probe in flight silenced the credit-blocked report and deadlocked a session
+      (`docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md`).
+    - A shrunken path deadlocked before its black hole was seen, because a black hole returns no
+      acknowledgement to declare a loss by, so probe timeouts must count as evidence
+      (`docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`).
+  - **By-use proof** (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`).
+    - The session finds a 9,000-byte simulated path (8,989 confirmed), survives a mid-session shrink to
+      1,500, and finds the new size.
+    - Both 400 KB transfers arrive byte-exact.
+    - The transport suite passes, cluster 193/193, and fleet 50/50 (233 s).
+  - **Owed (slice 3d).**
+    - A goodput benchmark of the discovered size against the floor.
+    - Measurement of the search's cost on a real path. On macOS loopback the 9,216-byte cap bounds it at
+      once; on Linux loopback it climbs toward 65,527.

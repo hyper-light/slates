@@ -141,6 +141,10 @@ pub enum Frame {
     /// The stream credit the sender is blocked at.
     limit: u64,
   },
+  /// Asks for an acknowledgement and carries nothing else (RFC 9000 §19.2 `PING`): a path-MTU probe's one
+  /// frame (`crate::pmtud`), its packet padded to the size under test. Never retransmitted — a lost probe
+  /// is an answer, not data to recover.
+  Ping,
 }
 
 /// Format: a `Stream` frame's bytes before its data — kind (1), stream id (8), offset (8), flags (1),
@@ -155,6 +159,8 @@ pub const ACK_RANGE_BYTES: usize = 8 + 8;
 const ONE_WORD_FRAME_BYTES: usize = 1 + 8;
 /// Format: a frame of a kind byte and two `u64`s (`MaxStreamData`, `ResetStream`, `StreamDataBlocked`).
 const TWO_WORD_FRAME_BYTES: usize = 1 + 8 + 8;
+/// Format: a `Ping` frame's bytes (the kind alone).
+const PING_FRAME_BYTES: usize = 1;
 
 impl Frame {
   /// The bytes this frame encodes to — exactly the length [`encode_frames`] writes for it, so a packet is
@@ -174,6 +180,7 @@ impl Frame {
       Frame::MaxStreamData { .. } | Frame::ResetStream { .. } | Frame::StreamDataBlocked { .. } => {
         TWO_WORD_FRAME_BYTES
       }
+      Frame::Ping => PING_FRAME_BYTES,
     }
   }
 }
@@ -202,6 +209,8 @@ const KIND_DATA_BLOCKED: u8 = 8;
 const KIND_STREAM_DATA_BLOCKED: u8 = 9;
 /// Format: the streams-blocked frame kind (RFC 9000 §19.14 `STREAMS_BLOCKED`).
 const KIND_STREAMS_BLOCKED: u8 = 10;
+/// Format: the ping frame kind (RFC 9000 §19.2 `PING`), added with dialect 2 (`crate::params`).
+const KIND_PING: u8 = 11;
 
 /// Format: the `Stream` frame's `fin` flag bit; every other bit of the flags byte must be zero.
 const STREAM_FIN: u8 = 0b0000_0001;
@@ -281,6 +290,7 @@ impl Frame {
         out.extend_from_slice(&stream_id.to_le_bytes());
         out.extend_from_slice(&limit.to_le_bytes());
       }
+      Frame::Ping => out.push(KIND_PING),
     }
   }
 }
@@ -372,6 +382,7 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
         stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
         limit: reader.u64().map_err(|_| SessionError::Truncated)?,
       },
+      KIND_PING => Frame::Ping,
       other => return Err(SessionError::UnknownFrame(other)),
     };
     frames.push(frame);
@@ -413,6 +424,7 @@ mod tests {
       },
       Frame::StopSending { stream_id: 12 },
       Frame::MaxStreams { max: 64 },
+      Frame::Ping,
       Frame::DataBlocked { limit: 1 << 18 },
       Frame::StreamsBlocked { limit: 70 },
       Frame::StreamDataBlocked {
@@ -434,6 +446,9 @@ mod tests {
   /// which every peer and every future version must agree on — breaks this, not just a silent re-encode.
   #[test]
   fn the_frames_encode_to_their_golden_bytes() {
+    // Ping: the kind byte alone (11), and it decodes back — even inside padding, as a probe carries it.
+    assert_eq!(encode_frames(&[Frame::Ping]), vec![11]);
+    assert_eq!(decode_frames(&[11, 0, 0, 0]), Ok(vec![Frame::Ping]));
     // MaxData: kind 3, then the ceiling as u64 LE.
     assert_eq!(
       encode_frames(&[Frame::MaxData { max: 5 }]),

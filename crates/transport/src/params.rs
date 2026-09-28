@@ -26,8 +26,9 @@ use crate::endpoint::MIN_DATAGRAM_BYTES;
 pub const ID_DIALECT: u16 = 1;
 /// Format: the identifier of the largest-UDP-payload parameter (RFC 9000 §18.2 `max_udp_payload_size`).
 pub const ID_MAX_UDP_PAYLOAD: u16 = 2;
-/// Format: the session dialect this build speaks. Raised only by a change to the packet or frame format.
-pub const DIALECT_VERSION: u32 = 1;
+/// Format: the session dialect this build speaks. Raised only by a change to the packet or frame format:
+/// 2 added the `Ping` frame (kind 11) path-MTU probes carry (2026-09-28).
+pub const DIALECT_VERSION: u32 = 2;
 /// Format: RFC 9000 §18.2 — the `max_udp_payload_size` a peer that states none is taken to read, the
 /// largest UDP payload an IPv4 datagram carries (65,535 − 8 bytes of UDP header).
 pub const DEFAULT_MAX_UDP_PAYLOAD: u32 = 65_527;
@@ -218,7 +219,7 @@ mod tests {
     assert_eq!(
       encoded,
       [
-        0x01, 0x00, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, // dialect 1
+        0x01, 0x00, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00, // dialect 2
         0x02, 0x00, 0x04, 0x00, 0xdc, 0x05, 0x00, 0x00, // max UDP payload 1500
       ]
     );

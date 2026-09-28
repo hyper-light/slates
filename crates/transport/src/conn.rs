@@ -162,6 +162,7 @@ struct InFlight {
   frames: Vec<Frame>,
   sent_at: u64,
   bytes: u64,
+  size: u64,
 }
 
 /// What a packet that left flight was: its number, send time and bytes in flight — what the RTT sample,
@@ -174,6 +175,9 @@ pub struct SentPacket {
   pub sent_at: u64,
   /// The stream bytes it counted in flight.
   pub bytes: u64,
+  /// The datagram's size on the wire, bytes — what path MTU discovery reads when the packet is
+  /// acknowledged or lost (`crate::pmtud`: a lost packet above the floor is black-hole evidence).
+  pub size: u64,
 }
 
 /// What processing an ACK freed: the stream-data bytes newly acknowledged (for the congestion
@@ -250,9 +254,9 @@ impl SentTracker {
     self.next_pn
   }
 
-  /// Records that packet `pn`, sent at `sent_at`, carried `frames` (kept for possible retransmission)
-  /// counting `bytes` in flight.
-  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>, sent_at: u64) {
+  /// Records that packet `pn`, a `size`-byte datagram sent at `sent_at`, carried `frames` (kept for
+  /// possible retransmission) counting their stream bytes in flight.
+  pub fn on_sent(&mut self, pn: u64, frames: Vec<Frame>, sent_at: u64, size: u64) {
     let bytes = frames.iter().map(tracked_bytes).sum();
     self.in_flight.insert(
       pn,
@@ -260,6 +264,7 @@ impl SentTracker {
         frames,
         sent_at,
         bytes,
+        size,
       },
     );
   }
@@ -286,6 +291,7 @@ impl SentTracker {
           pn,
           sent_at: flight.sent_at,
           bytes: flight.bytes,
+          size: flight.size,
         });
         frames.extend(flight.frames);
       }
@@ -354,6 +360,7 @@ impl SentTracker {
           pn,
           sent_at: flight.sent_at,
           bytes: flight.bytes,
+          size: flight.size,
         });
         frames.extend(flight.frames);
       }
@@ -397,6 +404,18 @@ impl SentTracker {
   /// How many packets are unacknowledged and in flight.
   pub fn in_flight_count(&self) -> usize {
     self.in_flight.len()
+  }
+
+  /// Whether any packet in flight is larger than `size` bytes on the wire (`crate::pmtud`'s black-hole
+  /// evidence when a probe timeout fires with nothing acknowledged). A scan, made only on a probe timeout.
+  pub fn any_in_flight_larger_than(&self, size: u64) -> bool {
+    self.in_flight.values().any(|flight| flight.size > size)
+  }
+
+  /// Forgets packet `pn` as never sent — the local stack refused its datagram (a path-MTU probe past the
+  /// interface, `crate::pmtud`), so it is neither in flight nor lost. `true` when it was tracked.
+  pub fn forget_unsent(&mut self, pn: u64) -> bool {
+    self.in_flight.remove(&pn).is_some()
   }
 
   /// Drops stream `stream_id`'s data frames from every packet still in flight — the stream was
@@ -460,12 +479,18 @@ impl SentTracker {
   /// data again in a new packet while the original stays in flight, to be acknowledged or declared lost by
   /// the usual thresholds once the probe's acknowledgement arrives — so a tail loss recovered by a probe
   /// is still reported as a loss to the congestion controller and to the persistent-congestion test.
-  /// Empty when nothing is in flight.
+  /// A packet that carries only a `Ping` (a path-MTU probe, `crate::pmtud`) has nothing to recover and is
+  /// skipped. Empty when nothing recoverable is in flight.
   pub fn copy_oldest(&self) -> Vec<Frame> {
     self
       .in_flight
       .values()
-      .next()
+      .find(|flight| {
+        flight
+          .frames
+          .iter()
+          .any(|frame| !matches!(frame, Frame::Ping))
+      })
       .map(|flight| flight.frames.clone())
       .unwrap_or_default()
   }
@@ -677,6 +702,7 @@ mod tests {
           data: vec![0u8],
         }],
         0,
+        0,
       );
     }
     // Received {0,1,2,4,5} (packet 3 dropped): the generator's ACK acknowledges both runs.
@@ -712,7 +738,7 @@ mod tests {
     for pn in 0..6 {
       let got = sent.next_pn();
       assert_eq!(got, pn);
-      sent.on_sent(pn, vec![Frame::MaxData { max: pn }], 0);
+      sent.on_sent(pn, vec![Frame::MaxData { max: pn }], 0, 0);
     }
     // Acknowledge [2,5]; 0 and 1 remain in flight, both >= REORDER_THRESHOLD below largest (5).
     sent.on_ack(5, 3);
@@ -736,8 +762,8 @@ mod tests {
   #[test]
   fn a_probe_copies_the_oldest_in_flight_packet() {
     let mut sent = SentTracker::new();
-    sent.on_sent(0, vec![Frame::MaxData { max: 7 }], 0);
-    sent.on_sent(1, vec![Frame::MaxData { max: 8 }], 0);
+    sent.on_sent(0, vec![Frame::MaxData { max: 7 }], 0, 0);
+    sent.on_sent(1, vec![Frame::MaxData { max: 8 }], 0, 0);
     // No ACK ever arrives (a tail loss), so `take_lost` finds nothing.
     assert!(sent.take_lost(0, 1).0.frames.is_empty());
     assert_eq!(sent.copy_oldest(), vec![Frame::MaxData { max: 7 }]);
@@ -819,7 +845,7 @@ mod tests {
         break; // nothing new and nothing lost — the non-tail drop never leaves this at completion.
       }
       let pn = sent.next_pn();
-      sent.on_sent(pn, frames.clone(), 0);
+      sent.on_sent(pn, frames.clone(), 0, 0);
       // The lossy channel drops the second packet (pn 1) exactly once — a non-tail drop, so later
       // packets advance the largest-acked past the reorder threshold and the loss is detected.
       let drop_this = pn == 1 && !dropped_once;

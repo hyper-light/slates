@@ -83,8 +83,18 @@ const HEADER_PROTECTION_SAMPLE_OFFSET: usize =
 /// carry ([`MIN_DATAGRAM_BYTES`]). A session's packet budget (`ConnectionShape::max_datagram`) may not
 /// exceed it — a larger packet would be dropped by a path at the floor, or truncated by a receive buffer.
 /// Derived: `1200 − (1 + 8 + 4) − 16 = 1171`.
-pub const MAX_PACKET_PAYLOAD: usize =
-  MIN_DATAGRAM_BYTES - PACKET_NUMBER_OFFSET - MAX_PACKET_NUMBER_BYTES as usize - AEAD_TAG_BYTES;
+pub const MAX_PACKET_PAYLOAD: usize = MIN_DATAGRAM_BYTES - PACKET_OVERHEAD_BYTES;
+
+/// Format: a 1-RTT packet's bytes around its frames — the short header (first byte, connection id, the
+/// longest packet number) and the AEAD tag: `(1 + 8 + 4) + 16 = 29`. A datagram of `d` bytes carries
+/// `d − PACKET_OVERHEAD_BYTES` bytes of frames ([`packet_budget_for`]).
+pub const PACKET_OVERHEAD_BYTES: usize =
+  PACKET_NUMBER_OFFSET + MAX_PACKET_NUMBER_BYTES as usize + AEAD_TAG_BYTES;
+
+/// The frame bytes a datagram of `datagram` bytes carries (its size less [`PACKET_OVERHEAD_BYTES`]).
+pub fn packet_budget_for(datagram: usize) -> usize {
+  datagram.saturating_sub(PACKET_OVERHEAD_BYTES)
+}
 
 /// The handshake turn ceiling: the most drain-send-receive turns `establish` takes before it refuses
 /// a stuck handshake with `NotReady`, so the loop is bounded (banned item 8 — no unbounded loop). It
@@ -209,9 +219,13 @@ pub struct EndpointCensus {
 }
 
 impl EndpointCensus {
-  /// Whether nothing is held: no exchange, request, stream, retransmission or packet in flight.
+  /// Whether nothing is held: no exchange, request, stream, retransmission or packet in flight. The one
+  /// path-MTU probe a session may have out (`ConnectionCensus::path_probe`, at most one by construction)
+  /// is connection-level state that resolves with the next traffic, not a leak, so it is not counted here.
   pub fn is_quiescent(&self) -> bool {
-    *self == EndpointCensus::default()
+    let mut held = *self;
+    held.connection.path_probe = 0;
+    held == EndpointCensus::default()
   }
 }
 
@@ -500,6 +514,10 @@ impl Endpoint {
     }
     self.cid = Some(cid);
     self.peer_params = Some(peer_params);
+    // Path MTU discovery searches up to the largest datagram the peer declared it reads.
+    self
+      .conn
+      .enable_path_mtu(usize::try_from(peer_params.max_udp_payload).unwrap_or(usize::MAX));
     Ok(cid)
   }
 
@@ -910,7 +928,7 @@ impl Endpoint {
     let (pn, frames) = self.conn.emit_confirm();
     let largest_acked = self.conn.tx_largest_acked();
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames)?;
+    let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames, 0)?;
     self.send(&datagram)?;
     Ok(())
   }
@@ -981,15 +999,39 @@ impl Endpoint {
   fn flush(&mut self) -> Result<(), EndpointError> {
     let cid = self.connection_id()?;
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
-    while let Some((pn, frames)) = self.conn.poll_transmit(now_ns(), self.frame_cap) {
-      let datagram = protect_packet(keys, &cid, pn, self.conn.tx_largest_acked(), &frames)?;
-      if datagram.len() > MIN_DATAGRAM_BYTES {
+    // Packets are framed at the path MTU discovery has confirmed (the floor until it confirms more), and no
+    // datagram may exceed it.
+    let cap = self.conn.path_mtu().unwrap_or(MIN_DATAGRAM_BYTES);
+    let budget = self.conn.packet_budget(self.frame_cap);
+    while let Some((pn, frames)) = self.conn.poll_transmit(now_ns(), budget) {
+      let datagram = protect_packet(keys, &cid, pn, self.conn.tx_largest_acked(), &frames, 0)?;
+      if datagram.len() > cap {
         return Err(EndpointError::DatagramTooLarge {
           bytes: datagram.len(),
-          cap: MIN_DATAGRAM_BYTES,
+          cap,
         });
       }
       self.send(&datagram)?;
+    }
+    // Then the path-MTU probe, if one is due: a `Ping` padded to the size under test. A size the local stack
+    // refuses (`EMSGSIZE`: past the interface, or past the host's datagram cap) bounds the search at once and
+    // is not an error of the session.
+    if let Some((pn, size)) = self.conn.poll_probe(now_ns()) {
+      let datagram = protect_packet(
+        keys,
+        &cid,
+        pn,
+        self.conn.tx_largest_acked(),
+        &[Frame::Ping],
+        size,
+      )?;
+      match self.send(&datagram) {
+        Ok(()) => {}
+        Err(EndpointError::Io(refusal)) if refusal.is_message_too_large() => {
+          self.conn.on_probe_refused(pn, now_ns());
+        }
+        Err(error) => return Err(error),
+      }
     }
     Ok(())
   }
@@ -1255,6 +1297,21 @@ impl Endpoint {
     }
   }
 
+  /// The confirmed path MTU (`crate::pmtud`), once path MTU discovery runs (after the handshake).
+  pub fn path_mtu(&self) -> Option<usize> {
+    self.conn.path_mtu()
+  }
+
+  /// What path MTU discovery has counted, once it runs.
+  pub fn path_mtu_stats(&self) -> Option<crate::pmtud::PathMtuStats> {
+    self.conn.path_mtu_stats()
+  }
+
+  /// The earliest time the connection needs its timer (loss, probe timeout, pacing), for reports.
+  pub fn next_timeout(&self) -> Option<u64> {
+    self.conn.next_timeout()
+  }
+
   /// The congestion window, bytes (for reports).
   pub fn congestion_window(&self) -> u64 {
     self.conn.congestion_window()
@@ -1335,6 +1392,7 @@ fn protect_packet(
   pn: u64,
   largest_acked: Option<u64>,
   frames: &[Frame],
+  pad_to: usize,
 ) -> Result<Vec<u8>, EndpointError> {
   // The short header: fixed bit set, spin/reserved/key-phase zero, low bits = packet-number length; then
   // the connection id, then the packet number.
@@ -1350,8 +1408,16 @@ fn protect_packet(
   // The frame bytes, padded (RFC 9000 §19.1 PADDING = zero bytes) so the packet is long enough that
   // header protection can sample the ciphertext even without counting the tag.
   let sample_len = keys.local.header.sample_len();
+  // A path-MTU probe is padded further, to exactly `pad_to` bytes on the wire (`crate::pmtud`); every
+  // other packet passes zero and is only padded for the sample.
   let mut payload = encode_frames(frames);
-  let min_payload = (HEADER_PROTECTION_SAMPLE_OFFSET + sample_len).saturating_sub(header_len);
+  let min_payload = (HEADER_PROTECTION_SAMPLE_OFFSET + sample_len)
+    .saturating_sub(header_len)
+    .max(
+      pad_to
+        .saturating_sub(header_len)
+        .saturating_sub(AEAD_TAG_BYTES),
+    );
   if payload.len() < min_payload {
     payload.resize(min_payload, 0);
   }
@@ -1713,7 +1779,7 @@ mod tests {
     let mut any_masked = false;
     let mut rx_largest = 0u64;
     for pn in 0..8u64 {
-      let wire = protect_packet(&client_keys, &CID, pn, None, &frames).unwrap();
+      let wire = protect_packet(&client_keys, &CID, pn, None, &frames, 0).unwrap();
       let plain = plaintext_header(pn);
       if wire[..plain.len()] != plain[..] {
         any_masked = true;
@@ -1745,7 +1811,7 @@ mod tests {
       fin: true,
       data: b"payload".to_vec(),
     }];
-    let wire = protect_packet(&client_keys, &CID, 3, None, &frames).unwrap();
+    let wire = protect_packet(&client_keys, &CID, 3, None, &frames, 0).unwrap();
 
     // Flip the last byte (inside the AEAD tag): opening must fail.
     let mut tampered = wire.clone();

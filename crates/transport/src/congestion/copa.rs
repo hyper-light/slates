@@ -109,6 +109,16 @@ impl Copa {
     self.smss
   }
 
+  /// Follows a new datagram size (path MTU discovery confirmed a larger one, or a black hole fell back to
+  /// the floor; RFC 9002 §7.2): the window stays in bytes and is lifted to at least the minimum window at
+  /// the new size, so the window-to-datagram ratio never falls below what loss recovery needs.
+  pub fn set_max_datagram(&mut self, smss: u64) {
+    self.smss = smss.max(1);
+    self.cwnd = self
+      .cwnd
+      .max(MINIMUM_WINDOW_DATAGRAMS.saturating_mul(self.smss));
+  }
+
   /// Whether Copa is in slow start.
   pub fn in_slow_start(&self) -> bool {
     self.slow_start

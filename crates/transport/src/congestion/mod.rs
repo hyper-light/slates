@@ -90,6 +90,10 @@ impl Controller {
   pub fn window(&self) -> u64 {
     self.law.window()
   }
+  /// Follows a new datagram size (`crate::pmtud`; RFC 9002 §7.2).
+  pub fn set_max_datagram(&mut self, max_datagram: u64) {
+    self.law.set_max_datagram(max_datagram);
+  }
 
   /// The pacing rate, bytes per second: how fast the pacer releases data.
   pub fn pacing_rate(&self, rtt: &RttEstimator) -> u64 {

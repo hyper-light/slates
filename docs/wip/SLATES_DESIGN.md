@@ -2331,6 +2331,23 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > exposed that, once packet budget and frame cap separate, the congestion gate must ask about the next
 > frame — recorded for the next attempt
 > (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`).
+> **Landed 2026-09-28** (RFC 8899 as RFC 9000 §14.3 applies it).
+> - **Declaration.** Each end declares the largest datagram it reads in authenticated transport
+>   parameters (`crates/transport/src/params.rs`, dialect 2) and reads through one 64 KiB buffer per
+>   shard. Every datagram socket sets don't-fragment.
+> - **The search** (`crates/transport/src/pmtud.rs`) binary-searches from the 1,200-byte floor with
+>   `Ping` probes padded to size. It judges a size too large after three losses or at once on `EMSGSIZE`,
+>   stops within one packet overhead (29 bytes), and re-searches after 600 s.
+> - **Black holes.** Losses of above-floor packets, and probe timeouts while such packets are out, fall
+>   the session back to the floor.
+> - **Probes stay out of the controller.** Probes never enter congestion accounting or RTT samples.
+> - **The congestion gate.** It is sized by the controller following each datagram-size change: Copa's
+>   window is lifted to at least two datagrams at the new size, so the 2026-09-13 stall cannot recur.
+> - **Proven by use.** A session finds a 9,000-byte simulated path, falls back through a shrink to 1,500
+>   and loses nothing (`a_session_finds_its_paths_mtu_and_falls_back_when_the_path_shrinks`).
+> - **Records.** The research note's slices 3a–3c, and
+>   `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md` and
+>   `docs/bugs/2026-09-28-a-shrunken-path-deadlocked-before-its-black-hole-was-seen.md`.
 > Same day: the durability policy now gates writes. `DurabilityBound::shortfall` answers
 > `within_loss_bound(ε, F)` with its numbers at every configuration install (boot, council commit,
 > cross-shard fan — every shard measures, one change counts once), and `verbs::dispatch` refuses a create,
