@@ -122,6 +122,23 @@ fn budget() -> CommitBudget {
   CommitBudget::hard(DEADLINE_NS, POLL_NS)
 }
 
+/// Settles `endpoint`'s unacknowledged replies ([`Endpoint::settle`]), or gives up after `within_ns` (a
+/// peer that already gave up never acknowledges them): `true` when every reply was acknowledged in time.
+async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
+  let mut settle = std::pin::pin!(endpoint.settle());
+  let mut deadline = std::pin::pin!(slates_rt::futures::sleep(within_ns));
+  std::future::poll_fn(|cx| {
+    if let std::task::Poll::Ready(settled) = std::future::Future::poll(settle.as_mut(), cx) {
+      return std::task::Poll::Ready(settled.is_ok());
+    }
+    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+      return std::task::Poll::Ready(false);
+    }
+    std::task::Poll::Pending
+  })
+  .await
+}
+
 /// Serves one probe on `endpoint`, giving up after `within_ns` — so a target waiting for a probe that never
 /// comes ends, and the simulation runs idle instead of advancing time forever on the session's re-drive timer.
 async fn serve_within(endpoint: &mut Endpoint, detector: &mut Detector, within_ns: u64) -> bool {
@@ -291,6 +308,8 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         // An unserved target handshakes then leaves; the prober's probe must not block on it.
         TargetMode::Silent => {}
       }
+      // A served reply is in flight when the serve returns; settle it before the session drops.
+      let _ = settle_within(&mut endpoint, LATE_SERVE_BOUND_NS).await;
     })
     .unwrap();
 

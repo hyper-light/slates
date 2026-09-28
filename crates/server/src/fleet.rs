@@ -104,7 +104,7 @@ use slates_rt::futures;
 use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::congestion::ControllerKind;
-use slates_transport::connection::ConnectionShape;
+use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::Demux;
 use slates_transport::endpoint::{Endpoint, EndpointError, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
@@ -3797,7 +3797,8 @@ async fn exchange_discovery(
   };
   let span_ns = consensus_budget(slowest_path_tail_ns()).max_deadline_ns();
   let exchanged = {
-    let mut exchange = std::pin::pin!(session.request(crate::discovery::STREAM, &request));
+    let mut exchange =
+      std::pin::pin!(session.request(crate::discovery::STREAM, Priority::Metadata, &request));
     let mut timer = std::pin::pin!(futures::sleep(span_ns));
     std::future::poll_fn(|cx| {
       if !link_valid(anchor, expected) {
@@ -3824,7 +3825,9 @@ async fn exchange_discovery(
     Ok(reply) => reply,
     Err(fault) => {
       // The request future was dropped mid-exchange: abandoned, so its frames do not ride a later flush.
-      session.abandon_exchange();
+      if let Some(abandoned) = session.last_exchange() {
+        session.abandon(abandoned);
+      }
       count_refusal(fault.counter());
       return fault.outcome();
     }
@@ -4189,7 +4192,7 @@ async fn drive_council_replication(
     }
   }
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, budget).await;
+  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, Priority::Control, budget).await;
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -4245,7 +4248,7 @@ async fn drive_council_election(
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, budget).await;
+  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, Priority::Control, budget).await;
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -4288,7 +4291,7 @@ async fn drive_council_election(
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, budget).await;
+  let (replied, stragglers) = broadcast(requests, CONFIG_STREAM, Priority::Control, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -4614,7 +4617,7 @@ async fn drive_root_replication(
     }
   }
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, budget).await;
+  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, Priority::Control, budget).await;
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -4664,7 +4667,7 @@ async fn drive_root_election(
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, budget).await;
+  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, Priority::Control, budget).await;
   let mut sessions = Vec::with_capacity(replied.len());
   let mut pre_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -4706,7 +4709,7 @@ async fn drive_root_election(
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, budget).await;
+  let (replied, stragglers) = broadcast(requests, ROOT_STREAM, Priority::Control, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut vote_replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -4761,7 +4764,8 @@ async fn drive_root_learner_fetch(
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, ROOT_FETCH_STREAM, budget).await;
+  let (replied, stragglers) =
+    broadcast(requests, ROOT_FETCH_STREAM, Priority::Metadata, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::new();
   for (host, reply, endpoint) in replied {
@@ -4832,7 +4836,8 @@ async fn drive_learner_fetch(
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, CONFIG_FETCH_STREAM, budget).await;
+  let (replied, stragglers) =
+    broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::new();
   for (host, reply, endpoint) in replied {
@@ -5353,7 +5358,14 @@ pub(crate) async fn forward_over_leader_session(
     let waited = futures::now_ns().saturating_sub(began);
     if let Some((_, endpoint)) = take_sessions(|host| host == peer).pop() {
       let remaining = deadline_ns.saturating_sub(waited);
-      let (reply, endpoint) = request_within(endpoint, FORWARD_STREAM, &request, remaining).await;
+      let (reply, endpoint) = request_within(
+        endpoint,
+        FORWARD_STREAM,
+        Priority::Metadata,
+        &request,
+        remaining,
+      )
+      .await;
       return_sessions(vec![(peer, endpoint)]);
       return Some(reply.bytes);
     }

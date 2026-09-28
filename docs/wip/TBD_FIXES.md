@@ -689,6 +689,27 @@ can lag subsequent implementations; use their acceptance criteria and current so
   guarantees and schema/capability parity across the supported native/guest/container transports;
   verify each supported platform with the contract matrix rather than extrapolating from NFS.
 
+- [ ] **Session-plane transport (constrained-link design, slice 2b onward):**
+  - ~~Concurrent prioritized exchanges~~ **DONE 2026-09-28.** Several exchanges run on one session,
+    scheduled by class; stream concurrency is credited with `MaxStreams`; four bugs were fixed test-first
+    (`docs/bugs/2026-09-28-*.md`).
+  - **Still owed:**
+    - the scheduler bake-off (`crates/transport/examples/scheduler_bakeoff.rs`): pick the winner and delete
+      the losers;
+    - the congestion grid re-run on this code (the harness now records a stall past 100× ideal);
+    - DPLPMTUD;
+    - path validation and migration;
+    - NAT keepalive;
+    - batched I/O;
+    - compression;
+    - ACK frequency;
+    - the RPC-over-QUIC listener bake-off;
+    - the netem lane.
+- [ ] **No-panic sweep (CLAUDE.md item 6, 2026-09-27):** 634 indexing, slicing and string-slice sites
+  across the workspace's library and binary targets. Replace them with checked access and typed refusals,
+  then deny `indexing_slicing`, `string_slice`, `panic_in_result_fn` and `unwrap_in_result` in the lint
+  wall.
+
 ## 6. CI and deployment evidence still owed
 
 - [ ] Rerun native Ubuntu conformance after the effective-identity and workload fixes. The original

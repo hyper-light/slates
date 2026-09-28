@@ -152,7 +152,8 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    `Connection`** (4i): `send_stream`/`recv_stream` protect what it wants to send and feed it what
    arrives, so the live session delivers a stream *reliably* with acknowledgements flowing (proven over
    the lossless sim by `tests/session.rs`; the loss/probe paths are the oracle's, and driving the probe
-   from a real timeout is owed with the runtime timer). TLS session-resumption tickets are disabled on
+   from a real timeout is owed with the runtime timer). *(2026-09-28: `send_stream`/`recv_stream` are
+   gone; every transfer is an exchange — see the status below.)* TLS session-resumption tickets are disabled on
    the server (slates authenticates by enrolled identity, not TLS resumption; a post-handshake
    `NewSessionTicket` would otherwise reach the 1-RTT packet reader as unparseable CRYPTO bytes).
    **Flow control is enforced** (4j): the `Connection` runs the `flow.rs` credit law — the receiver
@@ -220,7 +221,19 @@ the crypto slice). This is pure and testable on every host, exactly like `bridge
    `Connection::discard_streams_below`, the server serving the newest complete request and yielding an
    abandoned reply to it) — the collision an abandoned exchange caused behind its unacknowledged reply
    is closed at the transport and the SWIM re-send it had forced is gone
-   (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`). Still owed: several
+   (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`).
+   **Status (2026-09-28): superseded by concurrent, prioritized exchanges.** The sequence floor
+   (`abandon_exchange`, `discard_streams_below`) and the one-exchange-at-a-time endpoint are gone. Each end
+   now allocates its own stream sequences, with the initiator and a `Priority` class carried in the id
+   (`crates/transport/src/streams.rs`). Many exchanges run at once on one session (`Endpoint::begin`,
+   `take_reply`, `abandon`, `drive`, `next_request`, `reply`, `settle`), and the sender fills each packet
+   from the most urgent class. Abandoning resets the request (`ResetStream`) and refuses the reply
+   (`StopSending`). A closed stream is known closed forever, from the ordered sequences, with no
+   tombstones. Concurrency is credited: the receiver advertises `MaxStreams`, and the sender refuses typed
+   past a limit's worth of waiting streams. Evidence: `crates/transport/tests/exchanges.rs` (head-of-line
+   bound, credit past the limit on lossy, bursty and reordering paths, abandonment, peer death; both ends
+   hold nothing once quiesced), and `docs/bugs/2026-09-28-*.md`.
+   Still owed: several
    frames per packet (the MTU budget), per-path MTU discovery (DPLPMTUD, RFC 8899 — the replacement for
    a fixed 1200-byte cap the research names), the timed tail-loss probe, and loom on the state machine.
    The acceptance enforcement order over a received datagram is **built** (`accept.rs`, slice 2c); its

@@ -150,6 +150,8 @@ fn run_distributed_membership_change() -> Outcome {
           .await
           .unwrap();
       }
+      // The reply is in flight when the serve returns; settle it before the session drops.
+      endpoint.settle().await.unwrap();
       let _ = voter_tx.send(voter.configuration().members.contains(&ADMITTED));
     })
     .unwrap();
@@ -291,6 +293,8 @@ fn run_voter_removal_over_the_transport() -> RemovalOutcome {
           .await
           .unwrap();
       }
+      // The reply is in flight when the serve returns; settle it before the session drops.
+      endpoint.settle().await.unwrap();
       let _ = voter_tx.send((
         voter.is_voter(DEAD),
         voter.configuration().members.contains(&ADMITTED),

@@ -52,6 +52,7 @@ pub mod schedule;
 pub mod seal;
 pub mod session;
 pub mod stream;
+pub mod streams;
 
 /// The protocol version this build speaks (the floor; negotiation to higher versions is owed with the
 /// session plane).

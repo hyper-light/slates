@@ -130,6 +130,8 @@ fn run_owner_commit() -> bool {
         },
       );
       serve_record(&mut endpoint, &mut acceptor).await.unwrap();
+      // The reply is in flight when the serve returns; settle it before the session drops.
+      endpoint.settle().await.unwrap();
     })
     .unwrap();
 

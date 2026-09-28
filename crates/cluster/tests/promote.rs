@@ -162,6 +162,8 @@ fn run_promotion() -> Outcome {
       endpoint.establish().await.unwrap();
       let mut acceptor = survivor(other, successor);
       serve_promotion(&mut endpoint, &mut acceptor).await.unwrap();
+      // The reply is in flight when the serve returns; settle it before the session drops.
+      endpoint.settle().await.unwrap();
     })
     .unwrap();
 

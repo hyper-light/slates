@@ -36,7 +36,7 @@ use rustls::quic::{KeyChange, Keys};
 use slates_rt::futures::now_ns;
 use slates_rt::udp::UdpSocket;
 
-use crate::connection::{Connection, ConnectionShape};
+use crate::connection::{Connection, ConnectionCensus, ConnectionShape, Priority, Role};
 use crate::demux::{Demux, DemuxId, Slot, with_demux};
 use crate::handshake::{HandshakeError, Identity, client_connection, server_connection};
 use crate::packet_number::{MAX_PACKET_NUMBER_BYTES, decode_packet_number, encode_packet_number};
@@ -46,25 +46,6 @@ use crate::session::{Frame, decode_frames, encode_frames};
 /// Format: RFC 9000 §14.1 — the smallest datagram every QUIC path must carry (1200 bytes); the fleet's
 /// frame cap and a receive queue's sizing derive from it.
 pub const MIN_DATAGRAM_BYTES: usize = 1200;
-/// The low bits of a stream id carry the request **kind** the server dispatches on (a record commit, a
-/// promotion, a content put, a probe … each a small constant its caller names); the bits above carry a
-/// per-connection exchange sequence, so every exchange rides a **fresh** id (RFC 9000 §2.1: a stream id
-/// is never reused within a connection).
-/// Format: eight kind bits — the tree names eleven kinds, 256 leaves room, and the 56-bit sequence above
-/// them is more exchanges than any session could make.
-pub const STREAM_KIND_BITS: u32 = 8;
-
-/// The request kind a stream id carries — the low [`STREAM_KIND_BITS`] — the value a server dispatches on
-/// and a client passed to [`Endpoint::request`].
-pub fn stream_kind(stream_id: u64) -> u64 {
-  stream_id & ((1u64 << STREAM_KIND_BITS) - 1)
-}
-
-/// The stream id of the `sequence`-th exchange of `kind` on a connection: the kind in the low bits, the
-/// sequence above them. The sequence starts at one, so no exchange's id is ever the bare kind.
-pub fn exchange_stream_id(kind: u64, sequence: u64) -> u64 {
-  (sequence << STREAM_KIND_BITS) | stream_kind(kind)
-}
 /// Format: RFC 9000 §17.3 — bit 6 of a short-header first byte, always 1 ("fixed bit"); a packet with
 /// it clear is not a valid short header.
 const FIXED_BIT: u8 = 0x40;
@@ -145,10 +126,6 @@ const MAX_PARTIAL_FRAGMENTS_PER_TURN: usize =
 /// round trip, so a handful of silent timeouts is conclusive; the exact value is not performance-tuned.
 const HANDSHAKE_CONFIRM_SILENCE: u32 = 3;
 
-/// Format: the exchange sequence the first exchange on a connection takes — one, so no exchange's stream
-/// id is ever the bare kind (sequence zero would make `exchange_stream_id(kind, 0) == kind`).
-const FIRST_EXCHANGE: u64 = 1;
-
 /// A refusal on the endpoint.
 #[derive(Debug)]
 pub enum EndpointError {
@@ -180,6 +157,29 @@ pub enum EndpointError {
     /// The bound on a whole flight.
     cap: usize,
   },
+  /// An exchange could not be opened or replied on (`crate::streams`): too many waiting past the peer's
+  /// stream credit, the sequences exhausted, or a reply on a stream the peer never opened.
+  Stream(crate::streams::StreamRefusal),
+}
+
+/// Everything an endpoint holds per exchange and per stream ([`Endpoint::census`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EndpointCensus {
+  /// The connection's per-stream state.
+  pub connection: ConnectionCensus,
+  /// Open exchanges (requests sent, replies not taken).
+  pub exchanges: usize,
+  /// The peer's requests still arriving.
+  pub arriving: usize,
+  /// The peer's complete requests not yet served.
+  pub ready: usize,
+}
+
+impl EndpointCensus {
+  /// Whether nothing is held: no exchange, request, stream, retransmission or packet in flight.
+  pub fn is_quiescent(&self) -> bool {
+    *self == EndpointCensus::default()
+  }
 }
 
 impl From<rustls::Error> for EndpointError {
@@ -293,21 +293,16 @@ pub struct Endpoint {
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
   /// ran.
   discarded: u64,
-  /// The exchange sequence the next [`request`](Endpoint::request) takes — one past the last allocated,
-  /// so every exchange on this connection rides a fresh stream id ([`exchange_stream_id`]).
-  next_exchange: u64,
-  /// The stream id of the client exchange currently open (a request sent, its reply not yet complete),
-  /// if any — what [`abandon_exchange`](Endpoint::abandon_exchange) forgets.
-  open_exchange: Option<u64>,
-  /// The server side's receive floor: every stream id below it belongs to an exchange this end has
-  /// already served or the peer abandoned; frames arriving for them are late and are drained and
-  /// discarded ([`Connection::discard_streams_below`]), never served.
-  serve_floor: u64,
-  /// The server side's partial requests, kept **across** [`serve_once`](Endpoint::serve_once) calls: a
-  /// request whose bytes arrived while the previous reply was being acknowledged is served next, not lost
-  /// with the call that drained them. Bounded by the peer's flow-control window (a stream cannot carry
-  /// more than its credit) times the late-reply cap.
-  pending_requests: BTreeMap<u64, Vec<u8>>,
+  /// This end's open exchanges (requests sent, replies not yet taken), each with the reply bytes read so
+  /// far — bounded by the stream credit (`crate::streams`: a limit's worth in flight and a limit's worth
+  /// waiting) and each reply by its flow-control window.
+  exchanges: BTreeMap<u64, Vec<u8>>,
+  /// The peer's requests still arriving, by stream id, with the bytes read so far — bounded by the stream
+  /// credit this end extends and the flow-control window.
+  arriving: BTreeMap<u64, Vec<u8>>,
+  /// The peer's complete requests not yet handed to the caller, by stream id (each still holds its credit
+  /// until replied to, so the peer cannot outrun the caller).
+  ready: BTreeMap<u64, Vec<u8>>,
 }
 
 impl Drop for Endpoint {
@@ -340,7 +335,7 @@ impl Endpoint {
       pinned: Some(pinned.clone()),
       keys: None,
       cid: None,
-      conn: Connection::new(shape, now_ns(), 0),
+      conn: Connection::new(shape, Role::Client, now_ns(), 0),
       rx_largest: 0,
       frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
       seeded: false,
@@ -351,10 +346,9 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
-      next_exchange: FIRST_EXCHANGE,
-      open_exchange: None,
-      serve_floor: 0,
-      pending_requests: BTreeMap::new(),
+      exchanges: BTreeMap::new(),
+      arriving: BTreeMap::new(),
+      ready: BTreeMap::new(),
     })
   }
 
@@ -376,7 +370,7 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
-      conn: Connection::new(shape, now_ns(), 0),
+      conn: Connection::new(shape, Role::Server, now_ns(), 0),
       rx_largest: 0,
       frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
       seeded: false,
@@ -387,10 +381,9 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
-      next_exchange: FIRST_EXCHANGE,
-      open_exchange: None,
-      serve_floor: 0,
-      pending_requests: BTreeMap::new(),
+      exchanges: BTreeMap::new(),
+      arriving: BTreeMap::new(),
+      ready: BTreeMap::new(),
     })
   }
 
@@ -415,7 +408,7 @@ impl Endpoint {
       pinned: None,
       keys: None,
       cid: None,
-      conn: Connection::new(shape, now_ns(), 0),
+      conn: Connection::new(shape, Role::Server, now_ns(), 0),
       rx_largest: 0,
       frame_cap: usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
       seeded: false,
@@ -426,10 +419,9 @@ impl Endpoint {
       hs_sent: 0,
       handshake_budgets_spent: 0,
       discarded: 0,
-      next_exchange: FIRST_EXCHANGE,
-      open_exchange: None,
-      serve_floor: 0,
-      pending_requests: BTreeMap::new(),
+      exchanges: BTreeMap::new(),
+      arriving: BTreeMap::new(),
+      ready: BTreeMap::new(),
     })
   }
 
@@ -951,7 +943,7 @@ impl Endpoint {
 
   /// Receives one packet, but waits at most `timeout_ns` for it, and folds it into the connection:
   /// `Ok(false)` if the timer wins (no packet arrived in time). This is the loss-recovery clock the
-  /// reliable exchanges ([`request`], [`serve_once`], [`send_stream`], [`recv_stream`]) drive — over the
+  /// reliable exchanges ([`request`], [`serve_once`], [`drive`], [`settle`]) drive — over the
   /// lossless simulation fabric a packet always arrives, but over a real datagram socket a lost packet
   /// (or a lost acknowledgement) would otherwise stall the exchange forever, since a dropped tail leaves
   /// no later acknowledgement to expose the gap. On a timeout the caller probes ([`Connection::probe`])
@@ -961,8 +953,8 @@ impl Endpoint {
   ///
   /// [`request`]: Endpoint::request
   /// [`serve_once`]: Endpoint::serve_once
-  /// [`send_stream`]: Endpoint::send_stream
-  /// [`recv_stream`]: Endpoint::recv_stream
+  /// [`drive`]: Endpoint::drive
+  /// [`settle`]: Endpoint::settle
   async fn receive_and_ingest(&mut self, timeout_ns: u64) -> Result<bool, EndpointError> {
     let mut buf = [0u8; DATAGRAM_BYTES];
     match self.recv_within(&mut buf, timeout_ns).await? {
@@ -1054,219 +1046,219 @@ impl Endpoint {
     Ok(())
   }
 
-  /// Sends `data` as stream `stream_id` **reliably**: drives a [`Connection`] that frames the data,
-  /// sends it, and — receiving the peer's acknowledgements — considers the transfer done only when
-  /// every packet has been acknowledged. Over the lossless simulation fabric no retransmission is
-  /// needed; the loss-recovery path (and its probe for a lost tail, which over a real network needs a
-  /// timeout the runtime's timer will drive) is exercised by the `connection` oracle.
-  pub async fn send_stream(&mut self, stream_id: u64, data: &[u8]) -> Result<(), EndpointError> {
-    self.conn.open(stream_id, data);
-    loop {
-      self.flush()?;
-      if self.conn.send_complete() {
-        self.conn.forget_stream(stream_id);
-        return Ok(());
-      }
-      self.receive_or_probe().await?;
+  /// Begins an exchange: sends `request` on this end's next stream, of `kind` in class `priority`, and
+  /// returns its id; the reply arrives on the same id and is taken with [`take_reply`](Endpoint::take_reply)
+  /// once complete, while [`drive`](Endpoint::drive) runs the session. Several exchanges run at once, each
+  /// scheduled by its class — a record commit is never queued behind a content put on the same session. An
+  /// exchange past the peer's stream credit waits unsent; a limit's worth waiting is refused typed.
+  pub fn begin(
+    &mut self,
+    kind: u64,
+    priority: Priority,
+    request: &[u8],
+  ) -> Result<u64, EndpointError> {
+    let stream_id = self
+      .conn
+      .open_exchange(kind, priority, request)
+      .map_err(EndpointError::Stream)?;
+    self.exchanges.insert(stream_id, Vec::new());
+    Ok(stream_id)
+  }
+
+  /// The reply of exchange `id` if it has arrived whole, taking it (the exchange is then finished and its
+  /// receiving half closed); `None` while it is still arriving or for an unknown exchange. A receive
+  /// stream counts complete only once every byte through its `fin` has been read, so the reply taken is
+  /// always whole.
+  pub fn take_reply(&mut self, id: u64) -> Option<Vec<u8>> {
+    self.drain();
+    if !self.conn.recv_stream_complete(id) {
+      return None;
+    }
+    let reply = self.exchanges.remove(&id)?;
+    self.conn.close_recv(id);
+    Some(reply)
+  }
+
+  /// Abandons exchange `id`: its request stops sending (`ResetStream`) and its reply is refused
+  /// (`StopSending`), so the path stops carrying either; the session's other exchanges are untouched.
+  pub fn abandon(&mut self, id: u64) {
+    if self.exchanges.remove(&id).is_some() {
+      self.conn.reset_stream(id);
+      self.conn.stop_sending(id);
     }
   }
 
-  /// Receives stream `stream_id` **reliably**, acknowledging what arrives and returning its bytes once
-  /// the stream's `fin` completes. Drives a [`Connection`]: each received packet is acknowledged (the
-  /// acknowledgement flushed before the next receive) so the sender learns of delivery, and the final
-  /// acknowledgement is flushed after completion so the sender can finish.
-  pub async fn recv_stream(&mut self, stream_id: u64) -> Result<Vec<u8>, EndpointError> {
-    let mut received = Vec::new();
-    loop {
-      self.receive_or_probe().await?;
-      // Drain *before* flushing: reading slides the flow-control window forward, and the flush that
-      // follows advertises credit reflecting what was just read. Flushing first would advertise a
-      // round-stale window and stall a transfer larger than one window at the window boundary.
-      received.extend_from_slice(&self.conn.read_stream(now_ns(), stream_id));
-      self.flush()?;
-      if self.conn.recv_stream_complete(stream_id) {
-        self.conn.forget_stream(stream_id);
-        return Ok(received);
-      }
-    }
+  /// Runs the session one turn: reads what the open exchanges and arriving requests received, sends what
+  /// is due, and waits for the next packet or timer. Cancel-safe: dropped while waiting, nothing is lost
+  /// (a packet is either folded in whole or still in the socket).
+  pub async fn drive(&mut self) -> Result<(), EndpointError> {
+    self.drain();
+    self.flush()?;
+    self.receive_or_probe().await?;
+    self.drain();
+    self.flush()
   }
 
-  /// The client side of a **request/reply** exchange over the session (§4.8 "lookups route by id to
-  /// the current owner"): sends `request` reliably on a **fresh** stream whose id carries `kind` in its
-  /// low bits and this connection's next exchange sequence above them ([`exchange_stream_id`]), then
-  /// receives the peer's reply on that same id (the reply travels the other direction), returning its
-  /// bytes. One [`Connection`] carries both — the request as this end's send stream, the reply as its
-  /// receive stream — so a lost frame either way is recovered. The reply's completion is the exchange's
-  /// completion; the final acknowledgement of the reply rides the flush before this returns, so the peer's
-  /// [`serve_once`] finishes too.
-  ///
-  /// A stream id is never reused within a connection (RFC 9000 §2.1). Before this, every exchange of a
-  /// kind reused one id, and an exchange abandoned at its caller's deadline collided with the next: at
-  /// the peer the next request's offset-0 frame was a duplicate of the abandoned request's completed
-  /// stream (deduplicated — never served) while the peer's reply to the abandoned one awaited an
-  /// acknowledgement that never came; at this end that late reply was read as the next exchange's. A
-  /// still-open exchange is abandoned first ([`abandon_exchange`](Endpoint::abandon_exchange)), and any
-  /// late reply to an earlier one arriving on its own, older id is drained below the floor and discarded
-  /// ([`Connection::discard_streams_below`]) — read, so its bytes are credited back, never mistaken.
-  /// (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`.)
-  ///
-  /// [`serve_once`]: Endpoint::serve_once
-  pub async fn request(&mut self, kind: u64, request: &[u8]) -> Result<Vec<u8>, EndpointError> {
-    self.abandon_exchange();
-    let stream_id = exchange_stream_id(kind, self.next_exchange);
-    self.next_exchange = self.next_exchange.saturating_add(1);
-    self.open_exchange = Some(stream_id);
-    self.conn.open(stream_id, request);
-    let mut reply = Vec::new();
+  /// A client exchange run to completion: [`begin`](Endpoint::begin), then [`drive`](Endpoint::drive)
+  /// until its reply is taken. A caller that bounds the wait races this against its deadline and
+  /// [`abandon`](Endpoint::abandon)s the exchange (whose id it learns from
+  /// [`last_exchange`](Endpoint::last_exchange)) when the deadline wins.
+  pub async fn request(
+    &mut self,
+    kind: u64,
+    priority: Priority,
+    request: &[u8],
+  ) -> Result<Vec<u8>, EndpointError> {
+    let id = self.begin(kind, priority, request)?;
     loop {
-      // Late replies to abandoned exchanges (older ids) are drained and discarded; this exchange's reply is
-      // drained, then flushed: the flush sends the request (opened above, still credited) and the
-      // acknowledgement whose piggybacked credit reflects the reply bytes just read — so a reply larger
-      // than one window keeps flowing. Flushing before the drain would advertise a round-stale window.
-      self.conn.discard_streams_below(now_ns(), stream_id);
-      reply.extend_from_slice(&self.conn.read_stream(now_ns(), stream_id));
-      self.flush()?;
-      if self.conn.recv_stream_complete(stream_id) {
-        self.conn.forget_stream(stream_id);
-        self.open_exchange = None;
+      if let Some(reply) = self.take_reply(id) {
+        self.flush()?;
         return Ok(reply);
       }
+      self.flush()?;
       self.receive_or_probe().await?;
     }
   }
 
-  /// Abandons the client exchange currently open, if any: its request's in-flight frames are dropped
-  /// (never retransmitted) and its receive state released, so nothing of it rides the next flush on this
-  /// reused session. A caller that races [`request`](Endpoint::request) against its own deadline and keeps
-  /// the session for reuse (the fleet's `request_within`, the SWIM probe) calls this when the deadline
-  /// wins; [`request`](Endpoint::request) also calls it first, so a dropped exchange never lingers. The
-  /// abandoned exchange's reply, should it still arrive, does so on its own — now older — stream id and is
-  /// drained below the next exchange's floor and discarded; it can never be read as another's.
-  pub fn abandon_exchange(&mut self) {
-    if let Some(stream_id) = self.open_exchange.take() {
-      self.conn.forget_stream(stream_id);
+  /// The id of the exchange [`begin`](Endpoint::begin) most recently started, if it is still open.
+  pub fn last_exchange(&self) -> Option<u64> {
+    self
+      .exchanges
+      .keys()
+      .copied()
+      .max_by_key(|&id| crate::streams::sequence(id))
+  }
+
+  /// Abandons every open exchange (a caller dropping a session's pending work).
+  pub fn abandon_all(&mut self) {
+    let ids: Vec<u64> = self.exchanges.keys().copied().collect();
+    for id in ids {
+      self.abandon(id);
     }
   }
 
-  /// The server side of one request/reply exchange: receives a request stream, passes its **kind**
-  /// ([`stream_kind`] of its stream id) and bytes to `handler`, and sends the reply back on the request's
-  /// own stream id, returning once the reply is acknowledged. The kind is what a session carrying several
-  /// RPCs dispatches on (a record commit, a promotion, a content put each name their own), so a server
-  /// never guesses a message's kind from its bytes. Drives one [`Connection`]: phase one receives and
-  /// acknowledges the request until its `fin`; phase two frames the reply and completes when the peer has
-  /// acknowledged all of it.
+  /// The next complete request as `(stream id, kind, bytes)`, driving the session until one is ready: the
+  /// most urgent class first, then the oldest. Its receiving half is closed (a late copy of it is dropped,
+  /// never served twice); answer it with [`reply`](Endpoint::reply).
+  pub async fn next_request(&mut self) -> Result<(u64, u64, Vec<u8>), EndpointError> {
+    loop {
+      self.drain();
+      self.flush()?;
+      if let Some(id) = self.most_urgent_ready() {
+        let request = self.ready.remove(&id).unwrap_or_default();
+        return Ok((id, crate::streams::kind(id), request));
+      }
+      self.receive_or_probe().await?;
+    }
+  }
+
+  /// Replies to request `id` with `reply`, in the class the request came in. The reply is sent while the
+  /// caller goes on to the next request — it keeps flowing on every later turn until acknowledged; a
+  /// server that stops serving [`settle`](Endpoint::settle)s first. A reply to a request the peer has
+  /// since abandoned is dropped (`Ok`); one to a stream the peer never opened is refused typed.
+  pub fn reply(&mut self, id: u64, reply: &[u8]) -> Result<(), EndpointError> {
+    self.conn.reply(id, reply).map_err(EndpointError::Stream)?;
+    self.flush()
+  }
+
+  /// Serves one request with a synchronous `handler` (given the request's kind and bytes): the next
+  /// request is taken and its reply sent, which keeps flowing while the caller serves the next.
   pub async fn serve_once<H>(&mut self, handler: H) -> Result<(), EndpointError>
   where
     H: FnOnce(u64, Vec<u8>) -> Vec<u8>,
   {
-    // The synchronous handler is the common case (a record commit, a prepare, a config step — served in a
-    // brief `with_state` borrow); it is the async form with a ready reply, so the two share one body.
-    self
-      .serve_once_async(|id, request| core::future::ready(handler(id, request)))
-      .await
+    let (id, kind, request) = self.next_request().await?;
+    let reply = handler(kind, request);
+    self.reply(id, &reply)
   }
 
-  /// Serves one request whose reply is produced **asynchronously** — the shape a forwarded verb needs, where
-  /// the reply comes from another shard (`xshard` to the volume's owner) or another await (§4.8 "Lookup").
-  /// Identical to [`serve_once`] but the handler returns a future: the request is received and acknowledged
-  /// (phase one) before the handler is awaited, so the peer is simply waiting for the reply while the handler
-  /// runs — no retransmission, no protocol change. The reply then goes out on the same stream (phase two).
+  /// Serves one request whose reply is produced asynchronously — a forwarded verb whose reply comes from
+  /// another shard (§4.8 "Lookup"). The request is acknowledged as it arrives, so the peer simply waits
+  /// for the reply while the handler runs; replies already sent keep flowing meanwhile.
   pub async fn serve_once_async<H, F>(&mut self, handler: H) -> Result<(), EndpointError>
   where
     H: FnOnce(u64, Vec<u8>) -> F,
     F: core::future::Future<Output = Vec<u8>>,
   {
-    // Phase one: receive one request in full, acknowledging and *draining* as it arrives — draining is
-    // what slides the flow-control window forward, so a request larger than one window keeps flowing
-    // (without it the credit never grows past the initial window and the sender stalls). Every exchange
-    // rides its own stream id, and the bytes of each are kept apart in `pending_requests` keyed by id and
-    // kept **across** calls: a request that completed while the previous reply was being acknowledged
-    // (the peer moved on to it) is found complete before any datagram is awaited, not left for the idle
-    // re-drive. The peer runs one exchange at a time, so when several are complete the **newest** is the
-    // live one — every older one was abandoned at the peer's deadline, and answering it would only send a
-    // reply the peer discards — so the newest is served and the floor raised past it, which drains and
-    // forgets the rest (their bytes credited back). Frames below the floor that arrive later are late
-    // retransmits of exchanges already served or abandoned and are discarded the same way, never served
-    // twice. (`docs/bugs/2026-09-13-reused-stream-id-collides-behind-an-unacked-reply.md`.)
-    let (request_id, request) = loop {
-      // Drain first, so a request already in the connection — ingested while the handshake was being
-      // confirmed, or while the previous reply awaited its acknowledgement — is found complete before any
-      // datagram is awaited; then flush *after* draining, so the acknowledgement advertises credit that
-      // reflects what was just read — draining slides the flow-control window, and advertising before it
-      // would lag a round and stall a request larger than one window at the window boundary (the flush
-      // also carries the final ACK of the datagram just received, and is a no-op with nothing to send).
-      self.drain_requests();
-      self.flush()?;
-      if let Some(id) = self.newest_complete_request() {
-        let request = self.pending_requests.remove(&id).unwrap_or_default();
-        self.serve_floor = id.saturating_add(1);
-        self.conn.discard_streams_below(now_ns(), self.serve_floor);
-        self
-          .pending_requests
-          .retain(|&pending_id, _| pending_id >= self.serve_floor);
-        break (id, request);
-      }
-      self.receive_or_probe().await?;
-    };
-
-    // Phase two: send the reply on the request's own stream id until the peer has acknowledged it whole.
-    // This is an active exchange (a reply is in flight awaiting acknowledgement), so it carries the stall
-    // bound — a peer that stops acknowledging is abandoned rather than retransmitted into forever. The
-    // peer runs one exchange at a time, so a **newer** request completing while this reply awaits its
-    // acknowledgement means the peer abandoned this exchange at its deadline and moved on: the reply is
-    // dropped (it would only be retransmitted into a peer that discards it, with the live request waiting
-    // behind it until the retransmits gave up) and this call returns, so the caller's serve loop re-enters
-    // and serves the newer request at once. The stream bytes that arrive meanwhile are drained so that
-    // newer request can complete here at all.
-    let reply = handler(stream_kind(request_id), request).await;
-    self.conn.open(request_id, &reply);
-    loop {
-      self.flush()?;
-      if self.conn.send_complete() {
-        self.conn.forget_stream(request_id);
-        return Ok(());
-      }
-      self.receive_or_probe().await?;
-      self.drain_requests();
-      if self
-        .newest_complete_request()
-        .is_some_and(|newer| newer > request_id)
-      {
-        self.conn.forget_stream(request_id);
-        return Ok(());
-      }
-    }
+    let (id, kind, request) = self.next_request().await?;
+    let reply = handler(kind, request).await;
+    self.reply(id, &reply)
   }
 
-  /// Drains every receive stream's newly contiguous bytes into the pending requests (each keyed by its
-  /// stream id), and discards what sits below the serve floor. Reading is what slides the flow-control
-  /// window forward, so a request larger than one window keeps flowing — and a request that arrives while
-  /// a reply is still awaiting its acknowledgement can complete.
-  fn drain_requests(&mut self) {
-    self.conn.discard_streams_below(now_ns(), self.serve_floor);
-    for id in self.conn.recv_stream_ids() {
-      let chunk = self.conn.read_stream(now_ns(), id);
-      if !chunk.is_empty() {
-        self
-          .pending_requests
-          .entry(id)
-          .or_default()
-          .extend_from_slice(&chunk);
-      }
-    }
-  }
-
-  /// The highest-numbered receive stream that has reached its `fin` at or above the serve floor — the
-  /// peer's live request, when several complete requests are waiting (see [`serve_once_async`]).
+  /// Drives the session until everything it has sent — every reply and request byte, every reset and
+  /// credit frame — is acknowledged. A server that stops serving calls this before it drops the session:
+  /// [`reply`] returns while the reply is still in flight, so dropping the endpoint straight after it
+  /// would leave the last reply undelivered (its retransmissions die with the endpoint). Not self-bounded,
+  /// like every reliable wait here: the caller races it against a deadline when the peer may be gone.
   ///
-  /// [`serve_once_async`]: Endpoint::serve_once_async
-  fn newest_complete_request(&self) -> Option<u64> {
+  /// [`reply`]: Endpoint::reply
+  pub async fn settle(&mut self) -> Result<(), EndpointError> {
+    loop {
+      self.drain();
+      self.flush()?;
+      if !self.conn.owes_peer() {
+        return Ok(());
+      }
+      self.receive_or_probe().await?;
+    }
+  }
+
+  /// Everything this end holds per exchange and per stream, counted — the leak witness: after a session
+  /// quiesces every count returns to zero.
+  pub fn census(&self) -> EndpointCensus {
+    EndpointCensus {
+      connection: self.conn.census(),
+      exchanges: self.exchanges.len(),
+      arriving: self.arriving.len(),
+      ready: self.ready.len(),
+    }
+  }
+
+  /// How many stream frames the peer sent in breach of the stream rules, flow control or a final size
+  /// (dropped and counted; a peer keeping the rules never causes one).
+  pub fn protocol_violations(&self) -> u64 {
+    self.conn.protocol_violations()
+  }
+
+  /// Reads every receive stream's newly contiguous bytes: an open exchange's reply bytes into its entry,
+  /// anything else as a request arriving (a server's); a request that reached its `fin` moves to `ready`
+  /// with its receiving half closed. Reading is what slides the flow-control window forward.
+  fn drain(&mut self) {
+    let now = now_ns();
+    let role = self.conn.role();
+    for id in self.conn.recv_stream_ids() {
+      let chunk = self.conn.read_stream(now, id);
+      if crate::streams::initiator(id) == role {
+        // A reply to this end's exchange. One no longer open (taken or abandoned) is already closed at the
+        // connection, so its frames never reach here; should one, it is refused, never read as a request.
+        match self.exchanges.get_mut(&id) {
+          Some(reply) => reply.extend_from_slice(&chunk),
+          None => self.conn.stop_sending(id),
+        }
+        continue;
+      }
+      let request = self.arriving.entry(id).or_default();
+      request.extend_from_slice(&chunk);
+      if self.conn.recv_stream_complete(id) {
+        let whole = self.arriving.remove(&id).unwrap_or_default();
+        self.ready.insert(id, whole);
+        self.conn.close_recv(id);
+      }
+    }
+    // A request the peer reset (or abandoned) mid-arrival has its receiving half closed at the connection;
+    // its partial bytes go too, so an abandoned exchange never leaves a request behind here (found by
+    // `an_abandoned_exchange_frees_everything_on_both_ends`: one leaked entry per abandoned exchange).
+    let conn = &self.conn;
+    self.arriving.retain(|&id, _| conn.receiving(id));
+  }
+
+  /// The ready request to serve next: the most urgent class, then the oldest (lowest sequence).
+  fn most_urgent_ready(&self) -> Option<u64> {
     self
-      .conn
-      .recv_stream_ids()
-      .into_iter()
-      .filter(|&id| id >= self.serve_floor && self.conn.recv_stream_complete(id))
-      .max()
+      .ready
+      .keys()
+      .copied()
+      .min_by_key(|&id| (crate::streams::priority(id), crate::streams::sequence(id)))
   }
 }
 
@@ -1410,6 +1402,7 @@ mod tests {
   use rustls::pki_types::PrivateKeyDer;
 
   use super::*;
+
   use crate::handshake::{Identity, connect};
 
   /// A fresh self-signed identity, minted with `ring` via `rcgen`.

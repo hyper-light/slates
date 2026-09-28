@@ -330,3 +330,35 @@ Each scenario measures:
   - **Tests.** The connection's oracle runs every loss, reorder, probe and multiplexing test under all
     three controllers. The transport, cluster and rt suites and the fleet suite (50/50) pass. The fleet
     keeps NewReno until the bake-off decides.
+- **Slice 2b (2026-09-28): concurrent, prioritized exchanges — the tail's head-of-line cause.**
+  - **Why.** The first bake-off grid (45 scenarios, `837142a`) showed tail latency dominated by a single
+    session running one exchange at a time: a small request waited behind a whole transfer. This is the
+    §5.3 priority-class design, built.
+  - **Streams.** `crates/transport/src/streams.rs` owns the stream-id space. The kind, the `Priority`
+    class, the initiator and a per-initiator sequence are packed into each id. Each end opens its own
+    streams without collision, and a closed stream is known closed forever with no tombstones.
+    Concurrency is credited with `MaxStreams` (frame kind 7, RFC 9000 §19.11). A sender past the limit
+    waits, then refuses typed (`StreamRefusal::Backlogged`).
+  - **Connection.** It schedules fresh data by class. The scheduler is a bake-off selector:
+    `RoundRobin`, `StrictPriority` and `Weighted` (deficit round-robin). It resets and stops streams
+    (`ResetStream`, `StopSending`), and reports a leak census.
+  - **Endpoint.** `begin`, `take_reply`, `abandon`, `drive`, `next_request`, `reply` and `settle` run many
+    exchanges at once. `settle` waits only for what the peer needs (stream data and resets).
+  - **Fleet classes.** Records, consensus and SWIM run as `Control`; forwarded verbs, discovery and
+    catch-up fetches as `Metadata`; content as `Bulk`.
+  - **Measured.** `tests/exchanges.rs` exercises one session through a 1 Mbit/s bottleneck with a one-BDP
+    queue that a 250 kB transfer keeps full. Every control ping completes within RTT + one queue drain +
+    four packet times (the single-exchange session made each wait about 2 s). Exchanges past the stream
+    limit survive 5 % random loss, burst loss and reordering over 4 seeds with no protocol violation.
+    Abandonment and peer death leave nothing behind, and every run is bounded by a virtual deadline.
+  - **Bugs found and fixed test-first.** Data past the receiver's stream limit was dropped but
+    acknowledged, a deadlock. An abandoned request's bytes stayed in the endpoint. `settle` waited on
+    credit frames. Probe copies toward a silent peer grew by one tracked packet per PTO (136,106 after
+    90,640 virtual seconds); now bounded at the originals plus two copies. Records:
+    `docs/bugs/2026-09-28-*.md`.
+  - **Measured and rejected.** A transport user timeout (RFC 5482) killed live pooled sessions: 136 false
+    kills in `wan_election`.
+  - **Still to run.** The scheduler bake-off (p99 of the control and metadata classes under bulk load),
+    and the congestion grid re-run on this code. The first grid's partial run (`3a0d86e`) predates this
+    slice, and its harness had no per-run virtual deadline: one Copa run at 1 Mbit/s, 300 ms, 1 % loss
+    spun for 2.5 h. The harness bounds every run and records a stall before the re-run.

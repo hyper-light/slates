@@ -8,6 +8,7 @@
 use slates_cluster::membership::Liveness;
 use slates_cluster::{CommitBudget, broadcast};
 use slates_db::register::{HostId, ObjectId, RegionId};
+use slates_transport::connection::Priority;
 use slates_wire::Wire;
 
 use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
@@ -260,7 +261,7 @@ async fn ask(
     .map(|(peer, endpoint)| (peer, request.to_vec(), endpoint))
     .collect();
   let budget = CommitBudget::hard(budget_ns, poll_ns);
-  let (replies, mut stragglers) = broadcast(requests, STREAM, budget).await;
+  let (replies, mut stragglers) = broadcast(requests, STREAM, Priority::Metadata, budget).await;
   fold_replies(answers, query, replies);
   loop {
     let (replies, done) = stragglers.recover_replies();

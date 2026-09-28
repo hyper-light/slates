@@ -170,6 +170,8 @@ pub struct Acked {
   pub pns: Vec<u64>,
   /// The freed packets, in packet-number order.
   pub packets: Vec<SentPacket>,
+  /// The frames the freed packets carried (the connection marks their stream ranges acknowledged).
+  pub frames: Vec<Frame>,
 }
 
 /// What a loss-detection pass declared lost: the frames to retransmit, the largest packet number among
@@ -258,6 +260,7 @@ impl SentTracker {
       .collect();
     let mut bytes = 0u64;
     let mut packets = Vec::with_capacity(pns.len());
+    let mut frames = Vec::new();
     for &pn in &pns {
       if let Some(flight) = self.in_flight.remove(&pn) {
         bytes = bytes.saturating_add(flight.bytes);
@@ -268,6 +271,7 @@ impl SentTracker {
           bytes: flight.bytes,
           rate: flight.rate,
         });
+        frames.extend(flight.frames);
       }
     }
     self.largest_acked = Some(self.largest_acked.map_or(largest, |l| l.max(largest)));
@@ -276,6 +280,7 @@ impl SentTracker {
       bytes,
       pns,
       packets,
+      frames,
     }
   }
 
@@ -295,6 +300,7 @@ impl SentTracker {
       acked.bytes = acked.bytes.saturating_add(more.bytes);
       acked.pns.extend(more.pns);
       acked.packets.extend(more.packets);
+      acked.frames.extend(more.frames);
       prev_low = low;
     }
     acked
@@ -403,6 +409,29 @@ impl SentTracker {
       dropped = dropped.saturating_add(from_packet);
       !packet.frames.is_empty()
     });
+    dropped
+  }
+
+  /// Drops from in-flight packet `pn` every frame equal to one of `copied` — they have just been sent again
+  /// in a newer probe, so this older copy is redundant — and forgets the packet if nothing else remains in
+  /// it; its other frames stay tracked. Returns the stream bytes dropped, for the caller's in-flight count.
+  /// Nothing happens for a packet no longer in flight.
+  pub fn drop_copied(&mut self, pn: u64, copied: &[Frame]) -> u64 {
+    let Some(packet) = self.in_flight.get_mut(&pn) else {
+      return 0;
+    };
+    let mut dropped = 0u64;
+    packet.frames.retain(|frame| {
+      let redundant = copied.contains(frame);
+      if redundant {
+        dropped = dropped.saturating_add(tracked_bytes(frame));
+      }
+      !redundant
+    });
+    packet.bytes = packet.bytes.saturating_sub(dropped);
+    if packet.frames.is_empty() {
+      self.in_flight.remove(&pn);
+    }
     dropped
   }
 

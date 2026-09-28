@@ -10,8 +10,10 @@
 //!   a `fin` marking the stream's end (the ordered-log archetype).
 //! - `Ack`     — acknowledges packet numbers `[largest - range, largest]`.
 //! - `MaxData` / `MaxStreamData` — the connection's and a stream's **absolute** flow-control credit
-//!   (the ratified dual-level credit law; the accounting that enforces it is owed with the state
-//!   machine).
+//!   (the ratified dual-level credit law).
+//! - `ResetStream` / `StopSending` — a sender abandoning its half of a stream, and a receiver asking the
+//!   sender to stop (RFC 9000 §19.4, §19.5): how a multiplexed session abandons one exchange without
+//!   disturbing the others.
 //!
 //! Owed (later sub-slices): the connection state machine (packet numbers, ack/loss recovery, the
 //! credit accounting), the `rustls::quic` handshake, and the wiring onto `rt`'s UDP driver. This is a
@@ -94,6 +96,28 @@ pub enum Frame {
     /// The absolute byte ceiling for that stream.
     max: u64,
   },
+  /// The sender abandons its half of a stream (RFC 9000 §19.4): nothing more will be sent on it, and the
+  /// receiver discards what it holds. `final_size` is how far the sender had framed, so the receiver's
+  /// connection credit accounts for the bytes that will never be read.
+  ResetStream {
+    /// The stream.
+    stream_id: u64,
+    /// The bytes the sender had framed on it.
+    final_size: u64,
+  },
+  /// The receiver no longer wants a stream (RFC 9000 §19.5): the sender stops sending on it — an
+  /// abandoned exchange's reply stops costing the path.
+  StopSending {
+    /// The stream.
+    stream_id: u64,
+  },
+  /// The cumulative stream credit (RFC 9000 §19.11 `MAX_STREAMS`): the peer may open streams whose
+  /// sequence is below `max`. Raised as this end closes the peer's streams, so a sender never opens more
+  /// streams than the receiver holds state for (`crate::streams`).
+  MaxStreams {
+    /// One past the highest stream sequence the peer may open.
+    max: u64,
+  },
 }
 
 /// Format: RFC 9000 §19.1 — the PADDING frame is a single zero byte with no content; the decoder
@@ -108,6 +132,12 @@ const KIND_ACK: u8 = 2;
 const KIND_MAX_DATA: u8 = 3;
 /// Format: the stream-credit frame kind.
 const KIND_MAX_STREAM_DATA: u8 = 4;
+/// Format: the stream-reset frame kind (RFC 9000 §19.4 `RESET_STREAM`).
+const KIND_RESET_STREAM: u8 = 5;
+/// Format: the stop-sending frame kind (RFC 9000 §19.5 `STOP_SENDING`).
+const KIND_STOP_SENDING: u8 = 6;
+/// Format: the stream-credit frame kind (RFC 9000 §19.11 `MAX_STREAMS`).
+const KIND_MAX_STREAMS: u8 = 7;
 
 /// Format: the `Stream` frame's `fin` flag bit; every other bit of the flags byte must be zero.
 const STREAM_FIN: u8 = 0b0000_0001;
@@ -156,6 +186,22 @@ impl Frame {
       Frame::MaxStreamData { stream_id, max } => {
         out.push(KIND_MAX_STREAM_DATA);
         out.extend_from_slice(&stream_id.to_le_bytes());
+        out.extend_from_slice(&max.to_le_bytes());
+      }
+      Frame::ResetStream {
+        stream_id,
+        final_size,
+      } => {
+        out.push(KIND_RESET_STREAM);
+        out.extend_from_slice(&stream_id.to_le_bytes());
+        out.extend_from_slice(&final_size.to_le_bytes());
+      }
+      Frame::StopSending { stream_id } => {
+        out.push(KIND_STOP_SENDING);
+        out.extend_from_slice(&stream_id.to_le_bytes());
+      }
+      Frame::MaxStreams { max } => {
+        out.push(KIND_MAX_STREAMS);
         out.extend_from_slice(&max.to_le_bytes());
       }
     }
@@ -229,6 +275,16 @@ pub fn decode_frames(bytes: &[u8]) -> Result<Vec<Frame>, SessionError> {
         stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
         max: reader.u64().map_err(|_| SessionError::Truncated)?,
       },
+      KIND_RESET_STREAM => Frame::ResetStream {
+        stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
+        final_size: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
+      KIND_STOP_SENDING => Frame::StopSending {
+        stream_id: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
+      KIND_MAX_STREAMS => Frame::MaxStreams {
+        max: reader.u64().map_err(|_| SessionError::Truncated)?,
+      },
       other => return Err(SessionError::UnknownFrame(other)),
     };
     frames.push(frame);
@@ -264,6 +320,12 @@ mod tests {
         fin: true,
         data: Vec::new(),
       },
+      Frame::ResetStream {
+        stream_id: 11,
+        final_size: 300,
+      },
+      Frame::StopSending { stream_id: 12 },
+      Frame::MaxStreams { max: 64 },
     ]
   }
 
@@ -326,8 +388,58 @@ mod tests {
         0xAA, 0xBB, // data
       ]
     );
+    // ResetStream: kind 5, stream id (3) u64 LE, final size (258 = 0x0102) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::ResetStream {
+        stream_id: 3,
+        final_size: 258
+      }]),
+      vec![5, 3, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 0, 0, 0]
+    );
+    // StopSending: kind 6, stream id (4) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::StopSending { stream_id: 4 }]),
+      vec![6, 4, 0, 0, 0, 0, 0, 0, 0]
+    );
+    // MaxStreams: kind 7, max (0x0105) u64 LE.
+    assert_eq!(
+      encode_frames(&[Frame::MaxStreams { max: 0x0105 }]),
+      vec![7, 5, 1, 0, 0, 0, 0, 0, 0]
+    );
     // PADDING is a single zero byte the decoder consumes with no frame produced.
     assert_eq!(decode_frames(&[0]), Ok(Vec::new()));
+  }
+
+  /// A truncated reset or stop-sending frame is a typed truncation, never a panic or a partial frame.
+  #[test]
+  fn truncated_stream_control_frames_refuse() {
+    let reset = encode_frames(&[Frame::ResetStream {
+      stream_id: 3,
+      final_size: 258,
+    }]);
+    let stop = encode_frames(&[Frame::StopSending { stream_id: 4 }]);
+    let credit = encode_frames(&[Frame::MaxStreams { max: 0x0105 }]);
+    for cut in 1..credit.len() {
+      assert_eq!(
+        decode_frames(&credit[..cut]),
+        Err(SessionError::Truncated),
+        "stream credit cut at {cut}"
+      );
+    }
+    for cut in 1..reset.len() {
+      assert_eq!(
+        decode_frames(&reset[..cut]),
+        Err(SessionError::Truncated),
+        "reset cut at {cut}"
+      );
+    }
+    for cut in 1..stop.len() {
+      assert_eq!(
+        decode_frames(&stop[..cut]),
+        Err(SessionError::Truncated),
+        "stop cut at {cut}"
+      );
+    }
   }
 
   /// An empty payload decodes to no frames.

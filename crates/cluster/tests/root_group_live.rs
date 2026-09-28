@@ -157,6 +157,8 @@ fn run_distributed_promotion() -> Outcome {
           .await
           .unwrap();
       }
+      // The reply is in flight when the serve returns; settle it before the session drops.
+      endpoint.settle().await.unwrap();
       let _ = voter_tx.send(promoted(&voter));
     })
     .unwrap();

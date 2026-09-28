@@ -43,16 +43,7 @@ use crate::pacer::Pacer;
 use crate::rtt::RttEstimator;
 use crate::session::Frame;
 use crate::stream::{StreamAssembler, StreamSender};
-
-/// The most receive reassemblers kept for streams below the exchange floor — late replies of abandoned
-/// exchanges still arriving ([`Connection::discard_streams_below`]).
-/// Derived: `REORDER_THRESHOLD + 1`, one in-flight packet window — a peer serves one exchange at a time
-/// and this end abandons at most one per deadline, so more stragglers than fit one loss-detection window
-/// can only be a peer replaying the past; the oldest is forgotten first. Anchored to `conn::REORDER_THRESHOLD`.
-// The threshold is a small count (three); it cannot truncate on any pointer width, and `usize::try_from`
-// is not usable in a const.
-#[allow(clippy::cast_possible_truncation)]
-pub const LATE_REPLY_STREAMS: usize = (REORDER_THRESHOLD + 1) as usize;
+use crate::streams::{Arrival, ReplyAdmission, StreamSpace, priority};
 
 /// Format: RFC 9002 §6.2.1 — the probe timeout doubles after each consecutive expiry; the most doublings
 /// applied, enough that a one-millisecond timeout climbs past any initial PTO (`1 ms × 2^12 ≈ 4 s`), and
@@ -69,6 +60,97 @@ pub fn initial_receive_window(max_frame_len: usize) -> u64 {
   (REORDER_THRESHOLD + 1).saturating_mul(max_frame_len as u64)
 }
 
+pub use crate::streams::{Priority, Role, StreamCensus, StreamRefusal};
+
+/// How many of the most recent probe copies stay tracked while a peer is silent
+/// ([`Connection::queue_probe_copy`]).
+/// Derived: two — persistent congestion (RFC 9002 §7.6.2) is judged from the span between the earliest and
+/// the latest **lost** packets. When the path returns, the newest probe is the one acknowledged and the
+/// one before it is the latest lost, so keeping those two keeps the span's endpoints — the originals (the
+/// earliest) and that previous probe (the latest lost) — exactly as the RFC computes them; any older copy
+/// only sits between them. Measured: keeping one collapsed the span to the originals and missed a 450 ms
+/// blackout (`persistent_congestion_collapses_the_window`, 2026-09-28).
+const PROBE_COPIES_KEPT: usize = 2;
+
+/// The weighted scheduler's share for `class`: each class half the one above it (bulk 1, metadata 2,
+/// control 4), so no class starves and a more urgent one is served more.
+/// Shape: a halving per class, the weights deficit round-robin is usually run with (Shreedhar & Varghese).
+const fn class_weight(class: Priority) -> u64 {
+  match class {
+    Priority::Control => 4,
+    Priority::Metadata => 2,
+    Priority::Bulk => 1,
+  }
+}
+
+/// The class after `class` in the weighted scheduler's rotation.
+const fn next_class(class: Priority) -> Priority {
+  match class {
+    Priority::Control => Priority::Metadata,
+    Priority::Metadata => Priority::Bulk,
+    Priority::Bulk => Priority::Control,
+  }
+}
+
+/// One value per [`Priority`] class, reached by class without indexing (nothing here can go out of
+/// bounds).
+#[derive(Clone, Debug, Default)]
+struct PerClass<T> {
+  control: T,
+  metadata: T,
+  bulk: T,
+}
+
+impl<T> PerClass<T> {
+  fn get(&self, class: Priority) -> &T {
+    match class {
+      Priority::Control => &self.control,
+      Priority::Metadata => &self.metadata,
+      Priority::Bulk => &self.bulk,
+    }
+  }
+
+  fn get_mut(&mut self, class: Priority) -> &mut T {
+    match class {
+      Priority::Control => &mut self.control,
+      Priority::Metadata => &mut self.metadata,
+      Priority::Bulk => &mut self.bulk,
+    }
+  }
+}
+
+/// Everything a connection holds per stream, counted — the leak witness the tests assert returns to zero
+/// once a session quiesces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConnectionCensus {
+  /// The stream-id space's open and awaited streams.
+  pub streams: StreamCensus,
+  /// Send halves still sending or awaiting acknowledgement.
+  pub send_streams: usize,
+  /// Receive halves still reassembling.
+  pub recv_streams: usize,
+  /// Send streams with unacknowledged frames tracked.
+  pub unacked: usize,
+  /// Frames queued for retransmission.
+  pub retransmit: usize,
+  /// Stream control frames awaiting their first transmission.
+  pub control: usize,
+  /// Ack-eliciting packets in flight.
+  pub in_flight: usize,
+}
+
+/// How the sender chooses which stream fills the next frame. **Bake-off in progress (2026-09-27):** the
+/// loser is deleted with this selector once measured (research note, build ledger).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scheduler {
+  /// Every stream in turn, classes ignored (the connection's scheduler before this work).
+  RoundRobin,
+  /// The most urgent class with data first; round-robin within a class.
+  StrictPriority,
+  /// Deficit round-robin over classes by [`Priority::weight`]; round-robin within a class.
+  Weighted,
+}
+
 /// What a connection is built with: the packet budget it frames at (the datagram payload one packet
 /// carries), the initial receive window both ends derive, the ceiling that window may auto-tune to (the
 /// session's receive memory budget), and the congestion controller (the bake-off's choice; see
@@ -83,6 +165,8 @@ pub struct ConnectionShape {
   pub receive_ceiling: u64,
   /// The congestion controller.
   pub controller: ControllerKind,
+  /// The stream scheduler.
+  pub scheduler: Scheduler,
 }
 
 impl ConnectionShape {
@@ -98,6 +182,7 @@ impl ConnectionShape {
       initial_window: initial_receive_window(max_frame_len),
       receive_ceiling,
       controller,
+      scheduler: Scheduler::StrictPriority,
     }
   }
 }
@@ -110,10 +195,25 @@ impl ConnectionShape {
 pub struct Connection {
   /// The send streams, keyed by id (each framed only within the credit the peer has advertised for it).
   send_streams: BTreeMap<u64, StreamSender>,
-  /// Send stream ids in the order opened, with a cursor, for round-robin scheduling.
-  send_order: Vec<u64>,
-  /// The round-robin cursor into `send_order`.
-  send_cursor: usize,
+  /// Send stream ids by class, each in the order opened.
+  send_order: PerClass<Vec<u64>>,
+  /// The round-robin cursor into each class's `send_order`, and one over every class for round-robin.
+  send_cursor: PerClass<usize>,
+  all_cursor: usize,
+  /// The scheduler, and the weighted scheduler's per-class frame deficits and turn.
+  scheduler: Scheduler,
+  deficits: PerClass<u64>,
+  weighted_turn: Priority,
+  /// Stream control frames (`ResetStream`, `StopSending`, `MaxStreams`) awaiting their first
+  /// transmission; each leaves in the next packet and is retransmitted on loss like stream data.
+  control: VecDeque<Frame>,
+  /// Each send stream's frames not yet acknowledged, by offset: a frame's acknowledgement (through any copy
+  /// of it — a retransmission or a probe) removes it, a lost copy of an acknowledged frame is not resent,
+  /// and a drained stream with none left is complete and released.
+  unacked: BTreeMap<u64, std::collections::BTreeSet<u64>>,
+  /// The stream-id space: which streams are open or closed, and the stream credit each end extends
+  /// (`crate::streams`).
+  streams: StreamSpace,
   /// Connection-wide in-flight packet tracking and loss detection (packet numbers are per-connection).
   sent: SentTracker,
   /// Frames freed by loss detection or a probe, awaiting retransmission.
@@ -166,6 +266,14 @@ pub struct Connection {
   /// Stream frames the peer sent in breach of flow control or a stream's final size (RFC 9000 §4.1,
   /// §4.5), dropped and counted.
   violations: u64,
+  /// Streams this end has reset whose `ResetStream` the peer has not yet acknowledged — owed to the peer
+  /// as much as unacknowledged stream data is (the peer is waiting on the stream until it learns).
+  resets_owed: std::collections::BTreeSet<u64>,
+  /// The probe packets that carried the most recent copies of the oldest packet, oldest first — at most
+  /// [`PROBE_COPIES_KEPT`] ([`Connection::queue_probe_copy`]) — and whether a copy is queued for the next
+  /// probe.
+  probe_copies: VecDeque<u64>,
+  probe_copy_pending: bool,
 }
 
 /// Why fresh data stopped being framed in one `poll_transmit`.
@@ -186,11 +294,21 @@ enum FreshStop {
 impl Connection {
   /// A fresh connection of `shape` whose clock reads `now`, drawing randomized controller timing from
   /// `seed`.
-  pub fn new(shape: ConnectionShape, now: u64, seed: u64) -> Connection {
+  pub fn new(shape: ConnectionShape, role: Role, now: u64, seed: u64) -> Connection {
     Connection {
       send_streams: BTreeMap::new(),
-      send_order: Vec::new(),
-      send_cursor: 0,
+      send_order: PerClass::default(),
+      send_cursor: PerClass::default(),
+      all_cursor: 0,
+      scheduler: shape.scheduler,
+      deficits: PerClass::default(),
+      weighted_turn: Priority::Control,
+      control: VecDeque::new(),
+      unacked: BTreeMap::new(),
+      // Derived: one stream per frame's worth of the session's receive budget — the receive ceiling over
+      // the frame cap — so the peer's open streams can never hold more than the budget in reassembly
+      // state; both ends derive the same limit from the same shape (R8).
+      streams: StreamSpace::new(role, shape.receive_ceiling / shape.max_datagram.max(1)),
       sent: SentTracker::new(),
       retransmit: VecDeque::new(),
       recv_streams: BTreeMap::new(),
@@ -217,6 +335,9 @@ impl Connection {
       sent_acks: BTreeMap::new(),
       duplicates: 0,
       violations: 0,
+      resets_owed: std::collections::BTreeSet::new(),
+      probe_copies: VecDeque::new(),
+      probe_copy_pending: false,
     }
   }
 
@@ -230,18 +351,88 @@ impl Connection {
     max_frame_len.saturating_sub(header) / per_range.max(1)
   }
 
-  /// Opens send stream `stream_id` carrying the whole of `data`, and finishes it. The send side starts
-  /// with the initial window of credit (both ends derive the same window, R8); more is granted only as
-  /// the peer's `MaxStreamData` for this stream arrives, so the sender never races more than a window
-  /// ahead of that stream's reader.
-  pub fn open(&mut self, stream_id: u64, data: &[u8]) {
+  /// Opens this end's next stream, of request `kind` in class `priority`, carrying the whole of `data`
+  /// (finished), and returns its id; the peer's reply arrives on the same id. The stream waits unsent
+  /// while the peer's stream credit does not cover it, and a limit's worth waiting is a typed refusal
+  /// (`crate::streams`). The send side starts with the initial window of credit (both ends derive the
+  /// same window, R8); more is granted only as the peer's `MaxStreamData` for it arrives.
+  pub fn open_exchange(
+    &mut self,
+    kind: u64,
+    priority: Priority,
+    data: &[u8],
+  ) -> Result<u64, StreamRefusal> {
+    let stream_id = self.streams.open_local(kind, priority)?;
+    self.install_sender(stream_id, data);
+    Ok(stream_id)
+  }
+
+  /// Replies on the peer's stream `stream_id` with the whole of `data`, in the class the stream carries.
+  /// A stream the peer has already stopped or reset takes the reply as moot (dropped, `Ok`); a stream the
+  /// peer never opened, or a second reply, is a typed refusal.
+  pub fn reply(&mut self, stream_id: u64, data: &[u8]) -> Result<(), StreamRefusal> {
+    match self.streams.begin_reply(stream_id)? {
+      ReplyAdmission::Send => {
+        self.install_sender(stream_id, data);
+        Ok(())
+      }
+      ReplyAdmission::Moot => Ok(()),
+    }
+  }
+
+  fn install_sender(&mut self, stream_id: u64, data: &[u8]) {
     let mut sender = StreamSender::new();
     sender.write(data);
     sender.grant_credit(self.initial_window);
     sender.finish();
     if self.send_streams.insert(stream_id, sender).is_none() {
-      self.send_order.push(stream_id);
+      self.send_order.get_mut(priority(stream_id)).push(stream_id);
     }
+  }
+
+  /// Abandons this end's sending half of `stream_id` (RFC 9000 §3.1, §19.4): nothing more of it is sent
+  /// or retransmitted, its bytes leave flight, and a `ResetStream` tells the peer to discard what it holds.
+  /// A peer's stream this end has not replied on yet is reset at size zero, so the peer stops waiting for
+  /// a reply that will not come. Nothing happens for a half already done.
+  pub fn reset_stream(&mut self, stream_id: u64) {
+    if !self.streams.send_open(stream_id) {
+      return;
+    }
+    let final_size = self
+      .send_streams
+      .get(&stream_id)
+      .map_or(0, StreamSender::send_offset);
+    self.forget_send_stream(stream_id);
+    self.resets_owed.insert(stream_id);
+    self.control.push_back(Frame::ResetStream {
+      stream_id,
+      final_size,
+    });
+    self.streams.close_send(stream_id);
+    self.advertise_streams();
+  }
+
+  /// Abandons this end's receiving half of `stream_id` (RFC 9000 §3.5, §19.5): what arrived is discarded,
+  /// its credit returned, and a `StopSending` asks the peer to stop sending — an abandoned exchange's reply
+  /// stops costing the path. Nothing happens for a half already done.
+  pub fn stop_sending(&mut self, stream_id: u64) {
+    if !self.streams.receiving(stream_id) {
+      return;
+    }
+    self.discard_recv(stream_id, None);
+    self.control.push_back(Frame::StopSending { stream_id });
+  }
+
+  /// Queues a `MaxStreams` when closing the peer's streams has raised the credit, replacing one still
+  /// waiting to leave (only the newest credit matters).
+  fn advertise_streams(&mut self) {
+    let Some(max) = self.streams.advertisement_due() else {
+      return;
+    };
+    self
+      .control
+      .retain(|frame| !matches!(frame, Frame::MaxStreams { .. }));
+    self.control.push_back(Frame::MaxStreams { max });
   }
 
   /// Reseeds the congestion controller's randomized timing (the endpoint does so from the session's
@@ -266,7 +457,10 @@ impl Connection {
   pub fn poll_transmit(&mut self, now: u64, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
     let budget = packet_budget as u64;
     let probe = self.probes_owed > 0;
-    let mut reliable: Vec<Frame> = Vec::new();
+    // Stream control frames leave first and unpaced: a few bytes each, carrying no stream data (so they
+    // take no window), and each one ends a peer's wait (a reset, a stop, fresh stream credit).
+    let mut reliable: Vec<Frame> = self.control.drain(..).collect();
+    let control_frames = reliable.len();
     let stop = match self.pacing_hold(now, budget, probe) {
       Some(release) => FreshStop::Pacer(release),
       None => {
@@ -276,7 +470,7 @@ impl Connection {
           .unwrap_or_else(|| self.take_fresh(budget, probe, &mut reliable, &mut packed))
       }
     };
-    self.note_stop(stop, reliable.is_empty());
+    self.note_stop(stop, reliable.len() == control_frames);
     let mut frames = reliable.clone();
     let ack_largest = self.push_acknowledgement(&mut frames, packet_budget);
     if frames.is_empty() {
@@ -394,12 +588,25 @@ impl Connection {
       self.sent_acks.insert(pn, largest);
     }
     let bytes: u64 = reliable.iter().map(tracked_bytes).sum();
+    for frame in &reliable {
+      if let Frame::Stream {
+        stream_id, offset, ..
+      } = frame
+        && self.send_streams.contains_key(stream_id)
+      {
+        self.unacked.entry(*stream_id).or_default().insert(*offset);
+      }
+    }
     self
       .controller
       .on_sent(now, pn, self.in_flight, self.delivery.is_app_limited());
     let snapshot = self.delivery.on_sent(now, self.in_flight, bytes);
     if probe {
-      self.probes_owed -= 1;
+      if self.probe_copy_pending {
+        self.probe_copies.push_back(pn);
+        self.probe_copy_pending = false;
+      }
+      self.probes_owed = self.probes_owed.saturating_sub(1);
     } else {
       let rate = self.controller.pacing_rate(&self.rtt).max(1);
       let quantum = self.controller.send_quantum(&self.rtt);
@@ -411,7 +618,10 @@ impl Connection {
 
   /// Whether any send stream has data it could frame within its credit.
   fn has_fresh_data(&self) -> bool {
-    self.send_streams.values().any(StreamSender::has_sendable)
+    self
+      .send_streams
+      .iter()
+      .any(|(&stream_id, sender)| self.streams.sendable(stream_id) && sender.has_sendable())
   }
 
   /// If an acknowledgement is owed, appends it — followed by the connection-wide credit and each
@@ -437,20 +647,87 @@ impl Connection {
     largest
   }
 
-  /// The next fresh stream frame to send, chosen round-robin across the send streams so none starves,
-  /// or `None` when no send stream has data within its credit right now. Advances the round-robin
-  /// cursor past the stream served.
+  /// The next fresh stream frame to send, chosen by the scheduler, or `None` when no send stream has data
+  /// within its credit right now.
   fn next_fresh_frame(&mut self, max_frame_len: usize) -> Option<Frame> {
-    let count = self.send_order.len();
+    match self.scheduler {
+      Scheduler::RoundRobin => self.round_robin_all(max_frame_len),
+      Scheduler::StrictPriority => Priority::ALL
+        .iter()
+        .find_map(|&class| self.round_robin_class(class, max_frame_len)),
+      Scheduler::Weighted => self.weighted(max_frame_len),
+    }
+  }
+
+  /// The next frame of `stream_id`, if the peer's stream credit covers it and it has data within its
+  /// flow-control credit.
+  fn frame_of(&mut self, stream_id: u64, max_frame_len: usize) -> Option<Frame> {
+    if !self.streams.sendable(stream_id) {
+      return None;
+    }
+    self
+      .send_streams
+      .get_mut(&stream_id)
+      .and_then(|sender| sender.next_frame(stream_id, max_frame_len))
+  }
+
+  /// Round-robin over every stream, classes ignored.
+  fn round_robin_all(&mut self, max_frame_len: usize) -> Option<Frame> {
+    let order: Vec<u64> = Priority::ALL
+      .iter()
+      .flat_map(|&class| self.send_order.get(class).iter().copied())
+      .collect();
+    let count = order.len();
     for step in 0..count {
-      let index = (self.send_cursor + step) % count;
-      let stream_id = self.send_order[index];
-      if let Some(sender) = self.send_streams.get_mut(&stream_id)
-        && let Some(frame) = sender.next_frame(stream_id, max_frame_len)
-      {
-        self.send_cursor = (index + 1) % count;
+      let index = self.all_cursor.saturating_add(step) % count.max(1);
+      let Some(&stream_id) = order.get(index) else {
+        continue;
+      };
+      if let Some(frame) = self.frame_of(stream_id, max_frame_len) {
+        self.all_cursor = index.saturating_add(1) % count.max(1);
         return Some(frame);
       }
+    }
+    None
+  }
+
+  /// Round-robin within one class.
+  fn round_robin_class(&mut self, class: Priority, max_frame_len: usize) -> Option<Frame> {
+    let count = self.send_order.get(class).len();
+    let cursor = *self.send_cursor.get(class);
+    for step in 0..count {
+      let index = cursor.saturating_add(step) % count.max(1);
+      let Some(&stream_id) = self.send_order.get(class).get(index) else {
+        continue;
+      };
+      if let Some(frame) = self.frame_of(stream_id, max_frame_len) {
+        *self.send_cursor.get_mut(class) = index.saturating_add(1) % count.max(1);
+        return Some(frame);
+      }
+    }
+    None
+  }
+
+  /// Deficit round-robin over the classes (Shreedhar & Varghese, SIGCOMM 1995): each turn a class with data
+  /// earns its weight in frames of credit and spends one per frame; a class without data forfeits its turn.
+  fn weighted(&mut self, max_frame_len: usize) -> Option<Frame> {
+    // Two passes over the classes: a class may forfeit its turn in the first and be reached again after
+    // every other class has had one.
+    for _ in 0..2 * Priority::ALL.len() {
+      let class = self.weighted_turn;
+      if *self.deficits.get(class) == 0 {
+        *self.deficits.get_mut(class) = class_weight(class);
+      }
+      if let Some(frame) = self.round_robin_class(class, max_frame_len) {
+        let deficit = self.deficits.get_mut(class);
+        *deficit = deficit.saturating_sub(1);
+        if *deficit == 0 {
+          self.weighted_turn = next_class(class);
+        }
+        return Some(frame);
+      }
+      *self.deficits.get_mut(class) = 0;
+      self.weighted_turn = next_class(class);
     }
     None
   }
@@ -477,6 +754,17 @@ impl Connection {
           data,
         } => {
           ack_eliciting = true;
+          match self.streams.arrive(*stream_id) {
+            // A late copy for a stream this end already closed: dropped, never reopening it.
+            Arrival::Closed => continue,
+            // A stream the peer may not open (past the credit it was given, or an id it never had):
+            // dropped and counted. A peer that keeps to its credit never meets this.
+            Arrival::Violation => {
+              self.violations = self.violations.saturating_add(1);
+              continue;
+            }
+            Arrival::Open => {}
+          }
           let window = self.flow.stream_max(*stream_id);
           let initial = self.initial_window;
           let assembler = self
@@ -503,6 +791,27 @@ impl Connection {
         }
         Frame::MaxData { max } => {
           self.peer_max_data = self.peer_max_data.max(*max);
+        }
+        Frame::ResetStream {
+          stream_id,
+          final_size,
+        } => {
+          ack_eliciting = true;
+          match self.streams.arrive(*stream_id) {
+            Arrival::Open => self.discard_recv(*stream_id, Some(*final_size)),
+            Arrival::Closed => {}
+            Arrival::Violation => self.violations = self.violations.saturating_add(1),
+          }
+        }
+        Frame::StopSending { stream_id } => {
+          ack_eliciting = true;
+          // RFC 9000 §3.5: a STOP_SENDING is answered by resetting the stream (a peer's stream not yet
+          // replied on is reset at size zero, so its reply is never sent).
+          self.reset_stream(*stream_id);
+        }
+        Frame::MaxStreams { max } => {
+          ack_eliciting = true;
+          self.streams.on_max_streams(*max);
         }
       }
     }
@@ -539,6 +848,7 @@ impl Connection {
     }
     self.pto_count = 0;
     self.in_flight = self.in_flight.saturating_sub(acked.bytes);
+    self.mark_acknowledged(&acked.frames);
     self.delivery.begin_ack();
     for packet in &acked.packets {
       self
@@ -618,7 +928,76 @@ impl Connection {
     if let Some(largest_acked) = self.sent.largest_acked() {
       self.sent_acks = self.sent_acks.split_off(&largest_acked);
     }
-    self.queue_retransmit(lost.frames);
+    let frames = lost
+      .frames
+      .into_iter()
+      .filter(|frame| self.still_owed(frame))
+      .collect();
+    self.queue_retransmit(frames);
+  }
+
+  /// Whether a lost frame still needs resending: a stream frame whose range another copy already had
+  /// acknowledged, or whose stream was forgotten, does not; every other frame does.
+  fn still_owed(&self, frame: &Frame) -> bool {
+    match frame {
+      Frame::Stream {
+        stream_id, offset, ..
+      } => self
+        .unacked
+        .get(stream_id)
+        .is_some_and(|offsets| offsets.contains(offset)),
+      // A newer stream credit supersedes a lost older one (it is resent only if it is still the newest).
+      Frame::MaxStreams { max } => *max == self.streams.advertised(),
+      // A reset another copy already had acknowledged is not resent.
+      Frame::ResetStream { stream_id, .. } => self.resets_owed.contains(stream_id),
+      _ => true,
+    }
+  }
+
+  /// Marks the stream ranges `frames` carried acknowledged, and releases every send stream that is now
+  /// drained with nothing unacknowledged: its exchange's data has been delivered.
+  fn mark_acknowledged(&mut self, frames: &[Frame]) {
+    let mut touched = Vec::new();
+    for frame in frames {
+      if let Frame::ResetStream { stream_id, .. } = frame {
+        self.resets_owed.remove(stream_id);
+      }
+      if let Frame::Stream {
+        stream_id, offset, ..
+      } = frame
+        && let Some(offsets) = self.unacked.get_mut(stream_id)
+      {
+        offsets.remove(offset);
+        touched.push(*stream_id);
+      }
+    }
+    for stream_id in touched {
+      let complete = self
+        .unacked
+        .get(&stream_id)
+        .is_none_or(std::collections::BTreeSet::is_empty)
+        && self
+          .send_streams
+          .get(&stream_id)
+          .is_some_and(StreamSender::is_drained);
+      if complete {
+        self.forget_send_stream(stream_id);
+        self.streams.close_send(stream_id);
+      }
+    }
+    self.advertise_streams();
+  }
+
+  /// Whether the peer is still owed anything it needs: stream data not yet acknowledged, or a reset it has
+  /// not acknowledged. Credit frames (`MaxStreams`, `MaxData`) and `StopSending` are not owed: they matter
+  /// only to a peer that goes on using a live session, which keeps acknowledging them.
+  pub fn owes_peer(&self) -> bool {
+    !self.send_streams.is_empty() || !self.resets_owed.is_empty()
+  }
+
+  /// Whether this end is still sending stream `stream_id` (framing it, or awaiting acknowledgements).
+  pub fn sending(&self, stream_id: u64) -> bool {
+    self.send_streams.contains_key(&stream_id)
   }
 
   /// The earliest time this connection needs [`on_timeout`](Connection::on_timeout): the loss timer, the
@@ -687,8 +1066,7 @@ impl Connection {
       // No new data: the probe carries a copy of the oldest in-flight packet's frames (RFC 9002 §6.2.4);
       // the original stays in flight until acknowledged or declared lost. A probe is not a congestion
       // signal; a loss it later reveals is.
-      let frames = self.sent.copy_oldest();
-      self.queue_retransmit(frames);
+      self.queue_probe_copy();
     }
     true
   }
@@ -698,13 +1076,33 @@ impl Connection {
   /// Returns whether anything was queued. Prefer [`on_timeout`](Connection::on_timeout), which arms it
   /// from the RTT.
   pub fn probe(&mut self) -> bool {
-    let frames = self.sent.copy_oldest();
-    let probed = !frames.is_empty();
+    let probed = self.queue_probe_copy();
     if probed {
       self.probes_owed = 1;
     }
-    self.queue_retransmit(frames);
     probed
+  }
+
+  /// Queues a copy of the oldest in-flight packet's frames as a probe (RFC 9002 §6.2.4; the original stays
+  /// tracked for loss accounting). Of the earlier probes' copies only the most recent
+  /// [`PROBE_COPIES_KEPT`] stay tracked; the duplicate frames of any older one leave tracking (its other
+  /// frames stay) — an acknowledgement of the original or of a newer copy settles them. A peer that stays
+  /// silent therefore costs the originals plus that many copies, never one more tracked packet per probe
+  /// timeout: without this a silent peer's session grew by 136,106 tracked packets over 90,640 virtual
+  /// seconds (measured 2026-09-28). Returns whether anything was queued.
+  fn queue_probe_copy(&mut self) -> bool {
+    let frames = self.sent.copy_oldest();
+    while self.probe_copies.len() >= PROBE_COPIES_KEPT {
+      let Some(oldest) = self.probe_copies.pop_front() else {
+        break;
+      };
+      let dropped = self.sent.drop_copied(oldest, &frames);
+      self.in_flight = self.in_flight.saturating_sub(dropped);
+    }
+    let copied = !frames.is_empty();
+    self.probe_copy_pending = copied;
+    self.queue_retransmit(frames);
+    copied
   }
 
   /// Allocates the next packet number and a bare, decryptable payload — a re-advertisement of the
@@ -738,47 +1136,6 @@ impl Connection {
   /// The stream ids seen on the receive side so far (a frame has arrived for each).
   pub fn recv_stream_ids(&self) -> Vec<u64> {
     self.recv_streams.keys().copied().collect()
-  }
-
-  /// Drains and discards every receive stream whose id is below `floor` — the late replies of exchanges
-  /// the caller has abandoned, or late copies of requests already served (a stream id is never reused
-  /// within a connection, RFC 9000 §2.1). The bytes are **read**, not dropped, so every byte the peer sent
-  /// is credited back to it; a stream that has reached its `fin` has its receive half forgotten (never its
-  /// send half: a reply may still be in flight on the id), and the stragglers below the floor are capped at
-  /// [`LATE_REPLY_STREAMS`], the oldest forgotten first.
-  pub fn discard_streams_below(&mut self, now: u64, floor: u64) {
-    let late: Vec<u64> = self
-      .recv_streams
-      .keys()
-      .copied()
-      .filter(|&id| id < floor)
-      .collect();
-    for id in &late {
-      let _ = self.read_stream(now, *id);
-      if self.recv_stream_complete(*id) {
-        self.forget_recv_stream(*id);
-      }
-    }
-    let mut lingering: Vec<u64> = self
-      .recv_streams
-      .keys()
-      .copied()
-      .filter(|&id| id < floor)
-      .collect();
-    while lingering.len() > LATE_REPLY_STREAMS {
-      let oldest = lingering.remove(0);
-      self.forget_recv_stream(oldest);
-    }
-  }
-
-  /// Forgets the receive half of stream `stream_id` only — its reassembler and its per-stream receive
-  /// accounting — leaving whatever this end is still sending on the same id. A request and its reply share
-  /// one id (`Endpoint::serve_once`), so a late copy of a served request must never take the reply in
-  /// flight with it: the whole-stream forget did, and the reply was counted complete unacknowledged
-  /// (`docs/bugs/2026-09-27-a-late-request-copy-forgot-the-reply.md`).
-  fn forget_recv_stream(&mut self, stream_id: u64) {
-    self.recv_streams.remove(&stream_id);
-    self.flow.forget_stream(stream_id);
   }
 
   /// The sender's current congestion window in bytes.
@@ -824,29 +1181,73 @@ impl Connection {
     self.sent.in_flight_count()
   }
 
-  /// Whether every send stream has originated its whole data and every ack-eliciting packet has been
-  /// acknowledged (nothing buffered to retransmit, nothing in flight).
+  /// Whether every send stream has been delivered — framed whole and every frame acknowledged, so each was
+  /// released — and no stream control frame waits to leave.
   pub fn send_complete(&self) -> bool {
-    self.retransmit.is_empty()
-      && self.sent.in_flight_count() == 0
-      && self.send_streams.values().all(StreamSender::is_drained)
+    self.send_streams.is_empty() && self.control.is_empty()
   }
 
-  /// Forgets a completed or abandoned stream's send and receive state; nothing of it is retransmitted
-  /// afterwards, its in-flight bytes leave the window, and the connection credit they took is refunded
-  /// (see the notes kept on the `SentTracker` and `FlowController` methods this calls).
-  pub fn forget_stream(&mut self, stream_id: u64) {
+  /// Forgets this end's sending half of `stream_id`: nothing of it is retransmitted afterwards, its
+  /// in-flight bytes leave the window, and the connection credit they took is refunded.
+  fn forget_send_stream(&mut self, stream_id: u64) {
     self.send_streams.remove(&stream_id);
-    self.send_order.retain(|&id| id != stream_id);
-    self.send_cursor = 0;
-    self.recv_streams.remove(&stream_id);
+    self.unacked.remove(&stream_id);
+    let class = priority(stream_id);
+    self.send_order.get_mut(class).retain(|&id| id != stream_id);
+    *self.send_cursor.get_mut(class) = 0;
     self
       .retransmit
       .retain(|frame| !matches!(frame, Frame::Stream { stream_id: id, .. } if *id == stream_id));
     let dropped = self.sent.forget_stream(stream_id);
     self.in_flight = self.in_flight.saturating_sub(dropped);
     self.connection_sent = self.connection_sent.saturating_sub(dropped);
+  }
+
+  /// Discards this end's receiving half of `stream_id`: whatever arrived is dropped unread, the peer's
+  /// connection credit is returned for it — through `final_size` when the peer reset the stream (RFC 9000
+  /// §4.5: a reset stream's final size is consumed) — and the half is forgotten.
+  fn discard_recv(&mut self, stream_id: u64, final_size: Option<u64>) {
+    let received = self
+      .recv_streams
+      .get(&stream_id)
+      .map_or(0, StreamAssembler::highest_offset);
+    let consumed = final_size.unwrap_or(received).max(received);
+    self.flow.on_stream_consumed(stream_id, consumed);
+    self.close_recv(stream_id);
+  }
+
+  /// Closes this end's receiving half of `stream_id` — its bytes read through, discarded or reset. The
+  /// stream-id space then knows it closed, so a late frame for it (a retransmission or probe copy still in
+  /// flight, however late) is dropped rather than reopening it. A request and its reply share an id, so
+  /// this never touches the sending half (`docs/bugs/2026-09-27-a-late-request-copy-forgot-the-reply.md`).
+  pub fn close_recv(&mut self, stream_id: u64) {
+    self.recv_streams.remove(&stream_id);
     self.flow.forget_stream(stream_id);
+    self.streams.close_receive(stream_id);
+    self.advertise_streams();
+  }
+
+  /// Whether `stream_id`'s receiving half is open (not read through, discarded, or reset by the peer).
+  pub fn receiving(&self, stream_id: u64) -> bool {
+    self.streams.receiving(stream_id)
+  }
+
+  /// The role this end plays (which stream ids it opens).
+  pub fn role(&self) -> Role {
+    self.streams.role()
+  }
+
+  /// Everything the connection holds per stream, counted (the leak witness).
+  pub fn census(&self) -> ConnectionCensus {
+    ConnectionCensus {
+      streams: self.streams.census(),
+      send_streams: self.send_streams.len(),
+      recv_streams: self.recv_streams.len(),
+      unacked: self.unacked.len(),
+      retransmit: self.retransmit.len(),
+      control: self.control.len(),
+      in_flight: self.sent.in_flight_count(),
+    }
   }
 
   /// The next packet number this connection will assign — its packet-number cursor.
@@ -919,9 +1320,12 @@ mod tests {
     ControllerKind::CopaMeta,
   ];
 
+  /// Shape: the request kind the tests' streams carry.
+  const KIND: u64 = 1;
+
   /// A connection framing at `cap` whose receive window stays at the initial window (the ceiling equals
-  /// it), under `law`.
-  fn fixed_window(cap: usize, law: ControllerKind) -> Connection {
+  /// it), under `law`, playing `role`.
+  fn fixed(cap: usize, law: ControllerKind, role: Role) -> Connection {
     let window = initial_receive_window(cap);
     Connection::new(
       ConnectionShape {
@@ -929,10 +1333,46 @@ mod tests {
         initial_window: window,
         receive_ceiling: window,
         controller: law,
+        scheduler: Scheduler::StrictPriority,
       },
+      role,
       0,
       1,
     )
+  }
+
+  /// The dialing end of a [`fixed`] pair — the one that opens the streams.
+  fn fixed_window(cap: usize, law: ControllerKind) -> Connection {
+    fixed(cap, law, Role::Client)
+  }
+
+  /// The accepting end of a [`fixed`] pair.
+  fn fixed_receiver(cap: usize, law: ControllerKind) -> Connection {
+    fixed(cap, law, Role::Server)
+  }
+
+  /// Opens a stream carrying `content` on `sender` and returns its id.
+  fn open(sender: &mut Connection, content: &[u8]) -> u64 {
+    sender
+      .open_exchange(KIND, Priority::Metadata, content)
+      .expect("the stream credit covers the test's streams")
+  }
+
+  /// Opens each labelled stream of `streams` on `sender`, returning `(label, id)` pairs: a test names its
+  /// streams by label, the connection allocates their ids.
+  fn open_labelled(sender: &mut Connection, streams: &[(u64, Vec<u8>)]) -> Vec<(u64, u64)> {
+    streams
+      .iter()
+      .map(|(label, content)| (*label, open(sender, content)))
+      .collect()
+  }
+
+  /// `received`, keyed by id, re-keyed by the labels `ids` maps them from.
+  fn relabel(received: BTreeMap<u64, Vec<u8>>, ids: &[(u64, u64)]) -> BTreeMap<u64, Vec<u8>> {
+    ids
+      .iter()
+      .filter_map(|(label, id)| received.get(id).map(|bytes| (*label, bytes.clone())))
+      .collect()
   }
 
   /// Which transmissions the wire drops (counted across both directions, from zero) and whether it
@@ -1077,18 +1517,16 @@ mod tests {
   ) -> (BTreeMap<u64, Vec<u8>>, Connection) {
     let window = initial_receive_window(budget);
     let mut sender = fixed_window(budget, law);
-    for (id, content) in streams {
-      sender.open(*id, content);
-    }
-    let mut receiver = fixed_window(budget, law);
+    let ids = open_labelled(&mut sender, streams);
+    let mut receiver = fixed_receiver(budget, law);
     let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut guard = 0u64;
     loop {
       guard += 1;
       assert!(guard < 1_000_000, "the connection must make progress");
-      let reads: Vec<(u64, u64)> = streams
+      let reads: Vec<(u64, u64)> = ids
         .iter()
-        .map(|(id, _)| (*id, receiver.read_offset(*id)))
+        .map(|(_, id)| (*id, receiver.read_offset(*id)))
         .collect();
       let mut moved = wire.send(&mut sender, true, budget, |from| {
         for (id, read) in &reads {
@@ -1108,9 +1546,7 @@ mod tests {
       }
       moved += wire.send(&mut receiver, false, budget, |_| {});
       moved += wire.deliver(&mut sender, &mut receiver);
-      let all_recv = streams
-        .iter()
-        .all(|(id, _)| receiver.recv_stream_complete(*id));
+      let all_recv = ids.iter().all(|(_, id)| receiver.recv_stream_complete(*id));
       if sender.send_complete() && all_recv {
         break;
       }
@@ -1118,7 +1554,7 @@ mod tests {
         break;
       }
     }
-    (received, sender)
+    (relabel(received, &ids), sender)
   }
 
   /// Like [`transfer_on`] with no path delay.
@@ -1139,18 +1575,18 @@ mod tests {
       .collect()
   }
 
-  /// Sends one request on stream 1 and shows the probe path live: unacknowledged, a probe resends it
-  /// (the retransmit counter moves). Returns the sender with the request still in flight.
-  fn request_in_flight_and_probed() -> Connection {
+  /// Sends one request and shows the probe path live: unacknowledged, a probe resends it (the retransmit
+  /// counter moves). Returns the sender with the request still in flight, and the request's id.
+  fn request_in_flight_and_probed() -> (Connection, u64) {
     let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    sender.open(1, &stream_content(9, 40));
+    let id = open(&mut sender, &stream_content(9, 40));
     let (_pn, frames) = sender
       .poll_transmit(0, FRAME_CAP)
       .expect("the request goes out");
     assert!(
       frames
         .iter()
-        .any(|f| matches!(f, Frame::Stream { stream_id: 1, .. }))
+        .any(|f| matches!(f, Frame::Stream { stream_id, .. } if *stream_id == id))
     );
     assert_eq!(sender.in_flight_count(), 1);
     assert!(sender.probe(), "a probe finds the packet in flight");
@@ -1160,20 +1596,20 @@ mod tests {
     assert!(
       resent
         .iter()
-        .any(|f| matches!(f, Frame::Stream { stream_id: 1, .. }))
+        .any(|f| matches!(f, Frame::Stream { stream_id, .. } if *stream_id == id))
     );
     assert!(sender.retransmitted() >= 1, "the retransmit path ran");
-    sender
+    (sender, id)
   }
 
-  /// AC (§4.8 "Membership" — a probe abandoned at its deadline; RFC 9000 §2.4): once a stream is
-  /// forgotten, none of its data is ever retransmitted and its bytes leave the in-flight accounting.
-  /// Non-vacuous: before the forget, the same probe resends the packet.
+  /// AC (§4.8 "Membership" — a probe abandoned at its deadline; RFC 9000 §3.1, §19.4): once a stream is
+  /// reset, none of its data is ever retransmitted, its bytes leave the in-flight accounting, and the
+  /// next packet carries the `ResetStream` — the only thing the stream still sends. Non-vacuous: before
+  /// the reset, the same probe resends the packet.
   #[test]
-  fn a_forgotten_streams_frames_are_never_retransmitted() {
-    let mut sender = request_in_flight_and_probed();
-    let retransmitted_before = sender.retransmitted();
-    sender.forget_stream(1);
+  fn a_reset_streams_frames_are_never_retransmitted() {
+    let (mut sender, id) = request_in_flight_and_probed();
+    sender.reset_stream(id);
     assert_eq!(
       sender.in_flight_count(),
       0,
@@ -1185,10 +1621,19 @@ mod tests {
       "its bytes left the in-flight accounting"
     );
     assert!(!sender.probe(), "a probe finds nothing to resend");
-    assert!(
-      sender.poll_transmit(0, FRAME_CAP).is_none(),
-      "no frame of the forgotten stream is retransmitted"
+    let retransmitted_before = sender.retransmitted();
+    let (_pn, frames) = sender
+      .poll_transmit(0, FRAME_CAP)
+      .expect("the reset leaves");
+    assert_eq!(
+      frames,
+      vec![Frame::ResetStream {
+        stream_id: id,
+        final_size: FRAME_CAP as u64
+      }],
+      "only the reset is sent, never the stream's data; its final size is the one frame framed (RFC 9000 §4.5)"
     );
+    assert!(sender.poll_transmit(0, FRAME_CAP).is_none());
     assert_eq!(sender.retransmitted(), retransmitted_before);
   }
 
@@ -1197,14 +1642,14 @@ mod tests {
   #[test]
   fn a_duplicate_packet_number_is_discarded_not_processed_again() {
     let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut receiver = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    sender.open(7, &stream_content(0xAB, 40));
+    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let id = open(&mut sender, &stream_content(0xAB, 40));
     let (pn, frames) = sender
       .poll_transmit(0, FRAME_CAP)
       .expect("the request goes out");
     receiver.handle_incoming(0, pn, &frames);
     assert!(
-      !receiver.read_stream(0, 7).is_empty(),
+      !receiver.read_stream(0, id).is_empty(),
       "the first receipt delivered bytes"
     );
     assert_eq!(receiver.duplicates_discarded(), 0);
@@ -1215,7 +1660,7 @@ mod tests {
     receiver.handle_incoming(0, pn, &frames);
     assert_eq!(receiver.duplicates_discarded(), 1);
     assert!(
-      receiver.read_stream(0, 7).is_empty(),
+      receiver.read_stream(0, id).is_empty(),
       "the duplicate delivered no further bytes"
     );
     assert!(
@@ -1259,10 +1704,8 @@ mod tests {
     streams: &[(u64, Vec<u8>)],
   ) -> (BTreeMap<u64, Vec<u8>>, usize, u64) {
     let mut sender = fixed_window(PACKET_BUDGET, law);
-    for (id, content) in streams {
-      sender.open(*id, content);
-    }
-    let mut receiver = fixed_window(PACKET_BUDGET, law);
+    let ids = open_labelled(&mut sender, streams);
+    let mut receiver = fixed_receiver(PACKET_BUDGET, law);
     let mut wire = Wire::new(MS, Channel::reordering(vec![3, 11]));
     let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     for _ in 0..1_000_000 {
@@ -1276,18 +1719,14 @@ mod tests {
       }
       moved += wire.send(&mut receiver, false, PACKET_BUDGET, |_| {});
       moved += wire.deliver(&mut sender, &mut receiver);
-      if sender.send_complete()
-        && streams
-          .iter()
-          .all(|(id, _)| receiver.recv_stream_complete(*id))
-      {
+      if sender.send_complete() && ids.iter().all(|(_, id)| receiver.recv_stream_complete(*id)) {
         break;
       }
       if moved == 0 {
         assert!(wire.advance(&mut sender, &mut receiver), "{law:?}: stalled");
       }
     }
-    (received, wire.widest, sender.retransmitted())
+    (relabel(received, &ids), wire.widest, sender.retransmitted())
   }
 
   /// AC (§4.10a §8): three streams multiplexed over one connection each arrive exactly, in order, with no
@@ -1343,20 +1782,15 @@ mod tests {
     window: u64,
   ) -> (BTreeMap<u64, Vec<u8>>, u64) {
     let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    for (id, content) in streams {
-      sender.open(*id, content);
-    }
-    let mut receiver = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let ids = open_labelled(&mut sender, streams);
+    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
     let mut wire = Wire::new(MS, Channel::new(Vec::new()));
     let mut received: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
     let mut peak = 0u64;
     for _ in 0..1_000_000 {
-      let reads: u64 = streams
-        .iter()
-        .map(|(id, _)| receiver.read_offset(*id))
-        .sum();
+      let reads: u64 = ids.iter().map(|(_, id)| receiver.read_offset(*id)).sum();
       let mut moved = wire.send(&mut sender, true, FRAME_CAP, |from| {
-        let sent: u64 = streams.iter().map(|(id, _)| from.send_offset(*id)).sum();
+        let sent: u64 = ids.iter().map(|(_, id)| from.send_offset(*id)).sum();
         peak = peak.max(sent - reads);
         assert!(
           sent <= reads + window,
@@ -1372,79 +1806,136 @@ mod tests {
       }
       moved += wire.send(&mut receiver, false, FRAME_CAP, |_| {});
       moved += wire.deliver(&mut sender, &mut receiver);
-      if sender.send_complete()
-        && streams
-          .iter()
-          .all(|(id, _)| receiver.recv_stream_complete(*id))
-      {
+      if sender.send_complete() && ids.iter().all(|(_, id)| receiver.recv_stream_complete(*id)) {
         break;
       }
       if moved == 0 {
         assert!(wire.advance(&mut sender, &mut receiver), "stalled");
       }
     }
-    (received, peak)
+    (relabel(received, &ids), peak)
   }
 
-  /// AC (§4.10a §8, RFC 9000 §13.2.4 ACK-of-ACK): on a connection reused across many exchanges the
-  /// receive-side acknowledgement set stays bounded while every exchange still delivers exactly.
+  /// AC (§4.10a §8, RFC 9000 §13.2.4 ACK-of-ACK; RFC 9000 §4.6 stream credit): on a connection reused
+  /// across many more request/reply exchanges than its stream limit, the receive-side acknowledgement set
+  /// stays bounded, every exchange delivers exactly, the stream credit keeps flowing (the server's
+  /// `MaxStreams` after each close), and nothing leaks: once the last exchange ends, both ends hold no
+  /// stream state at all. Non-vacuous: the exchanges outnumber the limit many times over, so they complete
+  /// only if the credit is raised.
   #[test]
-  fn ack_of_ack_bounds_the_receive_set_over_a_reused_connection() {
-    /// Shape: enough exchanges that an unpruned set would dwarf the bound below.
+  fn many_exchanges_reuse_a_connection_with_bounded_state_and_flowing_credit() {
+    /// Shape: enough exchanges that an unpruned set would dwarf the bound below, and many times the
+    /// stream limit.
     const EXCHANGES: u64 = 50;
     /// Shape: a few packets each way per exchange.
     const BODY: usize = 24;
     let mut a = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut b = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut now = 0u64;
-    let mut peak_tracked = 0usize;
+    let mut b = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    assert!(EXCHANGES > 4 * b.streams.limit(), "past the stream limit");
+    let mut exchange = Lockstep {
+      now: 0,
+      peak_tracked: 0,
+    };
     for i in 0..EXCHANGES {
-      let sid = i * 2 + 1;
-      a.open(sid, &stream_content(u8::try_from(i % 7).unwrap_or(0), BODY));
-      b.open(
-        sid,
-        &stream_content(u8::try_from(i % 5).unwrap_or(0).wrapping_add(100), BODY),
+      let request = stream_content(u8::try_from(i % 7).unwrap_or(0), BODY);
+      let reply = stream_content(u8::try_from(i % 5).unwrap_or(0).wrapping_add(100), BODY);
+      let (received_request, received_reply) = exchange.run(&mut a, &mut b, &request, &reply);
+      assert_eq!(
+        received_request, request,
+        "exchange {i}: the request arrived exactly"
       );
-      for guard in 0..100_000 {
-        assert!(guard < 99_999, "the exchange must make progress");
-        // One packet each way per step, so each data packet also carries the pending acknowledgement.
-        let a_sent = a.poll_transmit(now, FRAME_CAP);
-        if let Some((pn, frames)) = &a_sent {
-          b.handle_incoming(now, *pn, frames);
-        }
-        let _ = b.read_stream(now, sid);
-        let b_sent = b.poll_transmit(now, FRAME_CAP);
-        if let Some((pn, frames)) = &b_sent {
-          a.handle_incoming(now, *pn, frames);
-        }
-        let _ = a.read_stream(now, sid);
-        peak_tracked = peak_tracked.max(a.acks_tracked()).max(b.acks_tracked());
-        if a.recv_stream_complete(sid)
-          && b.recv_stream_complete(sid)
-          && a.send_complete()
-          && b.send_complete()
-        {
-          break;
-        }
-        if a_sent.is_none() && b_sent.is_none() {
-          now = [a.next_timeout(), b.next_timeout()]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(now + MS)
-            .max(now);
-          a.on_timeout(now);
-          b.on_timeout(now);
-        }
-      }
-      a.forget_stream(sid);
-      b.forget_stream(sid);
+      assert_eq!(
+        received_reply, reply,
+        "exchange {i}: the reply arrived exactly"
+      );
     }
+    let peak_tracked = exchange.peak_tracked;
     assert!(peak_tracked > 0, "exchanges actually ran and were tracked");
     assert!(
       peak_tracked < 40,
       "ACK-of-ACK kept the receive set bounded (peak {peak_tracked})"
     );
+    for (end, census) in [("client", a.census()), ("server", b.census())] {
+      assert_eq!(
+        (
+          census.streams,
+          census.send_streams,
+          census.recv_streams,
+          census.unacked
+        ),
+        (StreamCensus::default(), 0, 0, 0),
+        "the {end} holds no stream state once every exchange ended: {census:?}"
+      );
+    }
+  }
+
+  /// A lossless request/reply driver stepping two connections one packet each way per step, so each data
+  /// packet also carries the pending acknowledgement; its clock jumps to the next timer when nothing moves.
+  struct Lockstep {
+    now: u64,
+    /// The most packet numbers either end tracked for acknowledgement at once.
+    peak_tracked: usize,
+  }
+
+  impl Lockstep {
+    /// Runs one exchange: `a` sends `request`, `b` answers with `reply` once the request is whole, and the
+    /// run ends when `a` has taken the reply and both ends' sends are acknowledged. Returns what each end
+    /// received.
+    fn run(
+      &mut self,
+      a: &mut Connection,
+      b: &mut Connection,
+      request: &[u8],
+      reply: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
+      let sid = open(a, request);
+      let (mut received_request, mut received_reply) = (Vec::new(), Vec::new());
+      for guard in 0..100_000 {
+        assert!(guard < 99_999, "the exchange must make progress");
+        let a_sent = self.carry(a, b);
+        received_request.extend(b.read_stream(self.now, sid));
+        if b.recv_stream_complete(sid) {
+          b.close_recv(sid);
+          b.reply(sid, reply)
+            .expect("the request's stream awaits its reply");
+        }
+        let b_sent = self.carry(b, a);
+        received_reply.extend(a.read_stream(self.now, sid));
+        if a.recv_stream_complete(sid) {
+          a.close_recv(sid);
+        }
+        self.peak_tracked = self
+          .peak_tracked
+          .max(a.acks_tracked())
+          .max(b.acks_tracked());
+        let reply_taken = !a.receiving(sid) && !received_reply.is_empty();
+        if reply_taken && a.send_complete() && b.send_complete() && a.in_flight_count() == 0 {
+          break;
+        }
+        if !a_sent && !b_sent {
+          self.now = [a.next_timeout(), b.next_timeout()]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(self.now + MS)
+            .max(self.now);
+          a.on_timeout(self.now);
+          b.on_timeout(self.now);
+        }
+      }
+      (received_request, received_reply)
+    }
+
+    /// Carries one packet from `from` to `to`, if `from` has one; whether it did.
+    fn carry(&self, from: &mut Connection, to: &mut Connection) -> bool {
+      match from.poll_transmit(self.now, FRAME_CAP) {
+        Some((pn, frames)) => {
+          to.handle_incoming(self.now, pn, &frames);
+          true
+        }
+        None => false,
+      }
+    }
   }
 
   /// AC (§4.10a §8; RFC 9002 §6.2): a lone data packet that is dropped — a tail loss neither threshold
@@ -1522,9 +2013,9 @@ mod tests {
   #[test]
   fn the_time_threshold_declares_a_loss_the_packet_threshold_cannot() {
     let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut receiver = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
     sender.seed_rtt(10 * MS, 0);
-    sender.open(1, &stream_content(1, 3 * FRAME_CAP));
+    let _ = open(&mut sender, &stream_content(1, 3 * FRAME_CAP));
     let mut packets: Vec<(u64, Vec<Frame>)> = Vec::new();
     let mut sent_at = 0;
     while packets.len() < 3 {
@@ -1574,10 +2065,11 @@ mod tests {
       initial_window: 20_000,
       receive_ceiling: 20_000,
       controller: ControllerKind::NewReno,
+      scheduler: Scheduler::StrictPriority,
     };
-    let mut sender = Connection::new(shape, 0, 1);
+    let mut sender = Connection::new(shape, Role::Client, 0, 1);
     sender.seed_rtt(100 * MS, 0);
-    sender.open(1, &vec![7u8; 20_000]);
+    let _ = open(&mut sender, &vec![7u8; 20_000]);
     let mut sends = Vec::new();
     let mut now = 0;
     for _ in 0..1000 {
@@ -1607,9 +2099,9 @@ mod tests {
   #[test]
   fn persistent_congestion_collapses_the_window() {
     let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut receiver = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    let mut receiver = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
     sender.seed_rtt(10 * MS, 0);
-    sender.open(1, &stream_content(1, 20 * FRAME_CAP));
+    let _ = open(&mut sender, &stream_content(1, 20 * FRAME_CAP));
     // Everything sent in the first 500 ms is lost — the original flight and the probes the backed-off
     // timeout sends at about 31, 91, 211 and 451 ms — then the last probe gets through and is
     // acknowledged: the lost packets span 1–211 ms, past three PTOs (3 × 30 ms), with nothing acknowledged
@@ -1656,24 +2148,25 @@ mod tests {
       initial_window: initial,
       receive_ceiling: ceiling,
       controller: ControllerKind::NewReno,
+      scheduler: Scheduler::StrictPriority,
     };
-    let mut sender = Connection::new(shape, 0, 1);
-    let mut receiver = Connection::new(shape, 0, 1);
+    let mut sender = Connection::new(shape, Role::Client, 0, 1);
+    let mut receiver = Connection::new(shape, Role::Server, 0, 1);
     // A receiver only acknowledges, which draws no RTT sample of its own; a session's handshake seeds both
     // ends' estimates (`Endpoint::establish`), which this does in its place.
     sender.seed_rtt(40 * MS, 0);
     receiver.seed_rtt(40 * MS, 0);
     let content = vec![5u8; 4 << 20];
-    sender.open(1, &content);
+    let stream = open(&mut sender, &content);
     let mut wire = Wire::new(20 * MS, Channel::new(Vec::new()));
     let mut received = Vec::new();
     for _ in 0..10_000_000 {
       let mut moved = wire.send(&mut sender, true, cap, |_| {});
       moved += wire.deliver(&mut sender, &mut receiver);
-      received.extend(receiver.read_stream(wire.now, 1));
+      received.extend(receiver.read_stream(wire.now, stream));
       moved += wire.send(&mut receiver, false, cap, |_| {});
       moved += wire.deliver(&mut sender, &mut receiver);
-      if receiver.recv_stream_complete(1) && sender.send_complete() {
+      if receiver.recv_stream_complete(stream) && sender.send_complete() {
         break;
       }
       if moved == 0 {
@@ -1749,18 +2242,60 @@ mod tests {
     }
   }
 
+  /// RFC 9002 §6.2.4 (probes are copies; the original stays tracked): a peer that never answers costs the
+  /// originals plus [`PROBE_COPIES_KEPT`] tracked copies, however long it stays silent — a later probe's
+  /// copy makes an older one redundant. Do X (send to a peer that never acknowledges and run every timer
+  /// across many probe timeouts), expect Y (the probes keep going, and the tracked packets never exceed the
+  /// originals plus the copies kept). Regression: each probe timeout added a tracked copy for as long as the session was held —
+  /// 136,106 packets after 90,640 virtual seconds (2026-09-28). Non-vacuous: many probes were sent.
+  #[test]
+  fn a_silent_peer_costs_bounded_tracking_however_long_it_is_silent() {
+    /// Shape: probe timeouts to run through — far past where the old growth was plain.
+    const PROBE_TIMEOUTS: u64 = 1_000;
+    let mut sender = fixed_window(FRAME_CAP, ControllerKind::NewReno);
+    sender.seed_rtt(10 * MS, 0);
+    // Two frames: the whole stream leaves in the first flight (the initial window holds more), so every
+    // later packet is a probe copy and `originals` counts every original there will be.
+    let _ = open(&mut sender, &stream_content(3, 2 * FRAME_CAP));
+    let mut now = 0;
+    while sender.poll_transmit(now, FRAME_CAP).is_some() {}
+    let originals = sender.in_flight_count();
+    assert_eq!(originals, 2, "the whole stream left in the first flight");
+    assert!(originals > 0, "the stream is in flight");
+    let mut peak = originals;
+    let mut fired = 0u64;
+    while fired < PROBE_TIMEOUTS {
+      now = sender
+        .next_timeout()
+        .expect("data is owed, so a timer is armed");
+      if sender.on_timeout(now) {
+        fired += 1;
+      }
+      while sender.poll_transmit(now, FRAME_CAP).is_some() {}
+      peak = peak.max(sender.in_flight_count());
+    }
+    assert!(
+      sender.retransmitted() >= PROBE_TIMEOUTS,
+      "the probes kept going ({} frames resent)",
+      sender.retransmitted()
+    );
+    assert!(
+      peak <= originals + PROBE_COPIES_KEPT,
+      "tracking stayed bounded: peak {peak} packets for {originals} originals over {PROBE_TIMEOUTS} probe timeouts"
+    );
+  }
+
   /// §4.8 request/reply on one stream id (`Endpoint::serve_once`): the server has served a request and
   /// its reply is in flight on the same id; a late copy of the request then arrives (a probe the client
-  /// sent before it heard anything) and the server discards the stale request below its floor. Discarding
-  /// forgets the stale receive half only: the reply stays in flight and is still delivered. Regression:
-  /// the discard forgot the whole stream, so the reply left tracking unacknowledged, counted complete, and
-  /// the client waited forever (a 64 kbit/s, 5 %-loss bake-off run deadlocked; 2026-09-27).
+  /// sent before it heard anything). The copy meets a closed receiving half and is dropped — it neither
+  /// reopens the stream nor touches the reply, which stays in flight and is still delivered. Regression:
+  /// discarding the copy forgot the whole stream, so the reply left tracking unacknowledged, counted
+  /// complete, and the client waited forever (a 64 kbit/s, 5 %-loss bake-off run deadlocked; 2026-09-27).
   #[test]
-  fn discarding_a_late_request_copy_keeps_the_reply_in_flight() {
-    let id = 7;
+  fn a_late_request_copy_keeps_the_reply_in_flight() {
     let mut client = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    let mut server = fixed_window(FRAME_CAP, ControllerKind::NewReno);
-    client.open(id, &stream_content(1, 4));
+    let mut server = fixed_receiver(FRAME_CAP, ControllerKind::NewReno);
+    let id = open(&mut client, &stream_content(1, 4));
     let (request_pn, request) = client.poll_transmit(0, FRAME_CAP).expect("the request");
     server.handle_incoming(0, request_pn, &request);
     assert_eq!(
@@ -1769,32 +2304,42 @@ mod tests {
       "the server read the request"
     );
     assert!(server.recv_stream_complete(id));
+    server.close_recv(id);
     // The server replies on the same id; the reply packet is lost on the path.
-    server.open(id, &stream_content(2, 4));
+    server
+      .reply(id, &stream_content(2, 4))
+      .expect("the request awaits its reply");
     let (_lost_pn, _lost_reply) = server.poll_transmit(0, FRAME_CAP).expect("the reply");
     // The client, having heard nothing, probes: a copy of its request in a new packet reaches the server.
     assert!(client.probe());
     let (probe_pn, probe) = client.poll_transmit(MS, FRAME_CAP).expect("the probe");
     server.handle_incoming(MS, probe_pn, &probe);
-    // The server's exchange floor has passed the id: the late copy is discarded.
-    server.discard_streams_below(MS, id + 1);
+    assert!(
+      !server.recv_stream_ids().contains(&id),
+      "the late copy did not reopen the closed receiving half"
+    );
     assert!(!server.send_complete(), "the reply is still owed");
     assert_eq!(
       server.in_flight_count(),
       1,
       "the reply packet is still in flight"
     );
-    // The reply is eventually recovered and delivered: the probe timeout resends it.
-    let now = server.next_timeout().expect("the reply's probe timer");
-    assert!(server.on_timeout(now), "the probe timeout owes a probe");
-    while let Some((pn, frames)) = server.poll_transmit(now, FRAME_CAP) {
-      client.handle_incoming(now, pn, &frames);
-    }
     assert_eq!(
-      client.read_stream(now, id),
+      recover_by_probe(&mut server, &mut client, id),
       stream_content(2, 4),
       "the reply reached the client"
     );
     assert!(client.recv_stream_complete(id));
+  }
+
+  /// Fires `sender`'s probe timeout and carries everything it then sends to `receiver`, returning what
+  /// `receiver` reads on stream `id` — the lost packet's recovery.
+  fn recover_by_probe(sender: &mut Connection, receiver: &mut Connection, id: u64) -> Vec<u8> {
+    let now = sender.next_timeout().expect("the probe timer is armed");
+    assert!(sender.on_timeout(now), "the probe timeout owes a probe");
+    while let Some((pn, frames)) = sender.poll_transmit(now, FRAME_CAP) {
+      receiver.handle_incoming(now, pn, &frames);
+    }
+    receiver.read_stream(now, id)
   }
 }

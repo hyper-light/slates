@@ -11,6 +11,7 @@
 // Test harness: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used)]
 
+use std::future::Future;
 use std::sync::mpsc::{Receiver, channel};
 
 use rustix::net::{Ipv4Addr, SocketAddrV4};
@@ -145,6 +146,23 @@ async fn recv_port(rx: Receiver<u16>) -> u16 {
   }
 }
 
+/// Settles `endpoint`'s unacknowledged replies ([`Endpoint::settle`]), or gives up after `within_ns`:
+/// `Some` when every reply was acknowledged in time.
+async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> Option<()> {
+  let mut settle = std::pin::pin!(endpoint.settle());
+  let mut deadline = std::pin::pin!(slates_rt::futures::sleep(within_ns));
+  std::future::poll_fn(|cx| {
+    if let std::task::Poll::Ready(result) = settle.as_mut().poll(cx) {
+      return std::task::Poll::Ready(result.ok());
+    }
+    if deadline.as_mut().poll(cx).is_ready() {
+      return std::task::Poll::Ready(None);
+    }
+    std::task::Poll::Pending
+  })
+  .await
+}
+
 fn authority() -> Authority {
   Authority {
     generation: GENERATION,
@@ -234,6 +252,9 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
           // holder whose owner has already given up serves into a closed connection, which simply fails.
           let _ = serve_record(&mut endpoint, &mut acceptor).await;
         }
+        // The last acknowledgement is in flight when `serve_record` returns; settle it, bounded by the
+        // keepalive — an owner that already gave up never acknowledges it.
+        let _ = settle_within(&mut endpoint, KEEPALIVE_NS).await;
         // A non-serving holder has now stayed alive for its keepalive; it exits, closing its socket.
       })
       .unwrap();

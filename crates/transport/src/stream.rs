@@ -250,6 +250,20 @@ impl StreamAssembler {
     self.read_offset
   }
 
+  /// The highest absolute offset any received byte reached (read or buffered) — what a discarded stream's
+  /// credit accounting counts as consumed (RFC 9000 §4.5).
+  pub fn highest_offset(&self) -> u64 {
+    self
+      .buffered
+      .iter()
+      .next_back()
+      .map_or(self.read_offset, |(start, bytes)| {
+        start + bytes.len() as u64
+      })
+      .max(self.read_offset)
+      .max(self.fin.unwrap_or(0))
+  }
+
   /// Whether every byte through `fin` has been delivered by `read`.
   pub fn is_complete(&self) -> bool {
     self.fin == Some(self.read_offset)

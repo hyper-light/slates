@@ -14,6 +14,7 @@ use slates_db::register::{
   DomainId, HostEpoch, HostId, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum, RegionId,
   RegionalConfiguration, RootConfiguration,
 };
+use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
@@ -392,8 +393,9 @@ fn expect_end(rest: &[u8]) -> Result<(), RaftWireError> {
   }
 }
 
-/// Format: a Raft RPC rides one stream per peer connection; the server's `serve_once` accepts whichever
-/// stream arrives, so the exact id is a fixed label, not a tunable.
+/// Format: the Raft RPC's request **kind** (the low bits of each exchange's fresh stream id); the server's
+/// `serve_once` serves it whatever the sequence above, so the value is a label, not a tunable. Raft RPCs
+/// ride the `Control` class.
 const RAFT_STREAM: u64 = 1;
 
 /// Serves one incoming Raft request on `node` over `endpoint` (§4.8): a received vote request or append
@@ -424,7 +426,9 @@ pub async fn request_raft(
   endpoint: &mut Endpoint,
   message: &RaftMessage,
 ) -> Result<Option<RaftMessage>, EndpointError> {
-  let reply = endpoint.request(RAFT_STREAM, &message.encode()).await?;
+  let reply = endpoint
+    .request(RAFT_STREAM, Priority::Control, &message.encode())
+    .await?;
   Ok(RaftMessage::decode(&reply).ok())
 }
 

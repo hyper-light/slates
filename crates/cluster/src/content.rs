@@ -7,10 +7,11 @@
 //! set is the resumption unit (§4.11: "resumable by missing set; the same container is the
 //! replication transfer unit and the clone-from-archive source").
 //!
-//! Three exchanges, each one request/reply on its own stream of the holder's record session
+//! Three exchanges, each one request/reply of its own kind on the holder's record session
 //! ([`CONTENT_OFFER_STREAM`], [`CONTENT_PUT_STREAM`], [`CONTENT_FETCH_STREAM`] — so the holder's
-//! `serve_once` dispatches by kind, never by guessing at bytes, and the exchanges of one round, which
-//! follow each other back to back, never reuse a stream the holder is still closing):
+//! `serve_once` dispatches by kind, never by guessing at bytes; every exchange rides a fresh stream id
+//! in the `Bulk` class, so a content transfer never queues a record commit or a probe sharing the
+//! session behind it):
 //! - **`Offer` → `Missing`**: the owner names the object, sequence, manifest and every chunk identity
 //!   the archive holds; the holder answers with the identities it lacks — a chunk already present on
 //!   a candidate is never transferred again.
@@ -48,6 +49,7 @@ use slates_archive::{Archive, ContentStore, Node, chunks_for};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
 use slates_rt::error::RtError;
 use slates_rt::futures::{detach, now_ns, spawn_child};
+use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
 use crate::{
@@ -631,7 +633,8 @@ fn dispatch_round(
   for (host, endpoint, bytes) in requests {
     let reply_tx = tx.clone();
     let spawned = spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, stream, &bytes, deadline_ns).await;
+      let (reply, endpoint) =
+        request_within(endpoint, stream, Priority::Bulk, &bytes, deadline_ns).await;
       let _ = reply_tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
@@ -869,8 +872,14 @@ pub async fn fetch_content(
   deadline_ns: u64,
 ) -> (Option<Archive>, Endpoint) {
   let request = ContentMessage::Fetch { manifest }.encode();
-  let (reply, endpoint) =
-    request_within(endpoint, CONTENT_FETCH_STREAM, &request, deadline_ns).await;
+  let (reply, endpoint) = request_within(
+    endpoint,
+    CONTENT_FETCH_STREAM,
+    Priority::Bulk,
+    &request,
+    deadline_ns,
+  )
+  .await;
   let archive = match ContentMessage::decode(&reply.bytes) {
     Ok(ContentMessage::Have { archive }) => Archive::decode(&archive)
       .ok()

@@ -10,6 +10,12 @@ description = "The #[derive(Wire)] macro: canonical encode and decode with a com
 
 [lib]
 proc-macro = true
+# The macro has no unit tests of its own: it is tested where it is used (`crates/wire/tests` — the
+# canonical round trips and the compile-fail refusals). Its test harness would be empty and, being a
+# proc-macro linked against the compiler's dynamic `libstd`, cannot even load outside `cargo test` (macOS:
+# `dyld: Library not loaded: @rpath/libstd-*.dylib`), so none is built.
+test = false
+doctest = false
 
 [dependencies]
 syn = { workspace = true }

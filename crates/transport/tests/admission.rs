@@ -13,6 +13,7 @@ use slates_rt::futures;
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use slates_transport::connection::Priority;
 use slates_transport::demux::{Demux, SessionRefusal};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
@@ -189,7 +190,7 @@ impl Harness {
 
 async fn echo(client: &mut Endpoint, server: &mut Endpoint, bytes: &[u8]) {
   let (reply, served) = together(
-    client.request(1, bytes),
+    client.request(1, Priority::Control, bytes),
     server.serve_once(|_, request| request.to_vec()),
   )
   .await;

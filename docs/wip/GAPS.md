@@ -1892,3 +1892,35 @@ Final serial Linux verification: strict workspace Clippy and `cargo xtask check`
 **1,524 workspace tests passed, zero failed, 14 ignored**, including all 49 fleet histories.
 The original hedge passed ten additional serial trials (281.630–506.180 ms placement).
 This does not close the 1,800 remaining pjdfstest failures or the A-26 merge-service work.
+
+### 2026-09-28: concurrent prioritized exchanges on the session plane
+
+Closed the session plane's one-exchange-at-a-time head-of-line blocking: many exchanges run at once on one
+session, scheduled by priority class, with stream concurrency credited by `MaxStreams` (research note,
+slice 2b). Four bugs fixed test-first, each with a record:
+
+- [data past the stream limit dropped but acknowledged](../bugs/2026-09-28-past-the-stream-limit-data-was-dropped-but-acknowledged.md);
+- [an abandoned request's bytes left behind](../bugs/2026-09-28-an-abandoned-request-left-its-bytes-behind.md);
+- [probe copies toward a silent peer grew without bound, and settle waited on credit](../bugs/2026-09-28-silent-peer-probe-copies-grew-without-bound.md).
+
+Open, owed in this workstream:
+
+- **Scheduler bake-off.** Pick the winner and delete the loser selector.
+- **Congestion grid re-run.** Re-run on this code, with a per-run virtual deadline added to the harness first.
+- **No-panic sweep.** 634 indexing, slicing and string-slice sites across the workspace's library and binary
+  targets (clippy `indexing_slicing`/`string_slice`, 2026-09-27) before those lints are denied (CLAUDE.md
+  item 6).
+
+Whole-workspace verification (2026-09-28): all 175 test binaries run directly, each under a timeout. Before
+the fixes below, 173 passed and 2 failed; both failed only outside `cargo test`, and both are fixed rather
+than excused:
+
+- **`crates/wire/tests/compile_fail.rs`.** trybuild found the crate through `CARGO_MANIFEST_DIR` and the
+  working directory, so it built against the workspace manifest. The test now names its crate and working
+  directory itself, and passes started from `/`, `/tmp`, the repository root, another crate's directory, and
+  through cargo.
+- **`slates-wire-derive`.** Its empty unit-test harness (a proc-macro, dynamically linked to the compiler's
+  `libstd`) could not load outside cargo. The crate has no unit tests (the derive is tested in `crates/wire`),
+  so no harness is built (`test = false`).
+
+The fleet suite passes 50/50 through cargo.

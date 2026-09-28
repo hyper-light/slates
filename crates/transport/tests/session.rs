@@ -16,6 +16,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
+use slates_transport::connection::Priority;
 use slates_transport::demux::{Demux, DemuxCounters};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
@@ -114,10 +115,10 @@ fn a_stream_flows_over_a_live_session() {
         )
         .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
-        server
-          .recv_stream(STREAM_ID)
-          .await
-          .map_err(|e| format!("{e:?}"))
+        let (id, _kind, received) = server.next_request().await.map_err(|e| format!("{e:?}"))?;
+        server.reply(id, &[]).map_err(|e| format!("{e:?}"))?;
+        server.settle().await.map_err(|e| format!("{e:?}"))?;
+        Ok::<_, String>(received)
       }
       .await;
       let _ = result_tx.send(outcome);
@@ -134,7 +135,10 @@ fn a_stream_flows_over_a_live_session() {
       let mut client =
         Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape()).unwrap();
       client.establish().await.unwrap();
-      client.send_stream(STREAM_ID, &content).await.unwrap();
+      client
+        .request(STREAM_ID, Priority::Bulk, &content)
+        .await
+        .unwrap();
     })
     .unwrap();
 
@@ -203,6 +207,8 @@ fn a_request_gets_a_reply_over_a_live_session() {
         })
         .await
         .unwrap();
+      // The reply is in flight when `serve_once_async` returns; a server that stops settles it first.
+      server.settle().await.unwrap();
     })
     .unwrap();
 
@@ -219,7 +225,7 @@ fn a_request_gets_a_reply_over_a_live_session() {
             .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         let reply = client
-          .request(STREAM_ID, &request)
+          .request(STREAM_ID, Priority::Control, &request)
           .await
           .map_err(|e| format!("{e:?}"))?;
         // The server acknowledged the request (its acknowledgement rode the reply's data packets), so
@@ -304,6 +310,7 @@ fn an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock() {
       for _ in 0..WAN_EXCHANGES {
         server.serve_once(|_, req| req).await.unwrap();
       }
+      server.settle().await.unwrap();
     })
     .unwrap();
 
@@ -322,7 +329,7 @@ fn an_endpoint_measures_the_paths_round_trip_on_the_runtime_clock() {
         for _ in 0..WAN_EXCHANGES {
           let started = slates_rt::futures::now_ns();
           client
-            .request(STREAM_ID, b"far")
+            .request(STREAM_ID, Priority::Control, b"far")
             .await
             .map_err(|e| format!("{e:?}"))?;
           exchange_times.push(slates_rt::futures::now_ns() - started);
@@ -396,6 +403,7 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
           .await
           .unwrap();
       }
+      server.settle().await.unwrap();
     })
     .unwrap();
 
@@ -418,7 +426,7 @@ fn repeated_exchanges_never_reuse_packet_numbers() {
             .map(|b| b.wrapping_add(u8::try_from(exchange).unwrap_or(0)))
             .collect();
           let reply = client
-            .request(exchange + 1, &request)
+            .request(exchange + 1, Priority::Control, &request)
             .await
             .map_err(|e| format!("{e:?}"))?;
           let expected: Vec<u8> = request.iter().map(|b| b.wrapping_add(7)).collect();
@@ -543,6 +551,7 @@ fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
           break;
         }
       }
+      let _ = within(EXCHANGE_BOUND_NS, server.settle()).await;
     })
     .unwrap();
 
@@ -559,10 +568,13 @@ fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
           Endpoint::client(socket, peer, &client_identity, &server_cert, NAME, shape())
             .map_err(|e| format!("{e:?}"))?;
         client.establish().await.map_err(|e| format!("{e:?}"))?;
-        let warm = within(EXCHANGE_BOUND_NS, client.request(STREAM_ID, b"warm-up"))
-          .await
-          .ok_or_else(|| "the warm-up exchange never completed".to_owned())?
-          .map_err(|e| format!("{e:?}"))?;
+        let warm = within(
+          EXCHANGE_BOUND_NS,
+          client.request(STREAM_ID, Priority::Control, b"warm-up"),
+        )
+        .await
+        .ok_or_else(|| "the warm-up exchange never completed".to_owned())?
+        .map_err(|e| format!("{e:?}"))?;
         if warm
           != b"warm-up"
             .iter()
@@ -571,13 +583,19 @@ fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
         {
           return Err("the warm-up reply was wrong".to_owned());
         }
-        let completed_early = poll_once_then_abandon(client.request(STREAM_ID, b"request A")).await;
-        client.abandon_exchange();
+        let completed_early =
+          poll_once_then_abandon(client.request(STREAM_ID, Priority::Control, b"request A")).await;
+        if let Some(abandoned) = client.last_exchange() {
+          client.abandon(abandoned);
+        }
         slates_rt::futures::sleep(SETTLE_NS).await;
-        let reply_b = within(EXCHANGE_BOUND_NS, client.request(STREAM_ID, b"request B"))
-          .await
-          .ok_or_else(|| "request B was never answered within the bound".to_owned())?
-          .map_err(|e| format!("{e:?}"))?;
+        let reply_b = within(
+          EXCHANGE_BOUND_NS,
+          client.request(STREAM_ID, Priority::Control, b"request B"),
+        )
+        .await
+        .ok_or_else(|| "request B was never answered within the bound".to_owned())?
+        .map_err(|e| format!("{e:?}"))?;
         Ok::<_, String>((completed_early, reply_b))
       }
       .await;
@@ -666,7 +684,11 @@ async fn serve_up_to(
   let ended = match session.establish().await {
     Ok(()) => loop {
       if requests >= max_requests {
-        break "done".to_owned();
+        // The last reply is in flight when `serve_once` returns; settle it before the session drops.
+        break match session.settle().await {
+          Ok(()) => "done".to_owned(),
+          Err(e) => format!("settle: {e:?}"),
+        };
       }
       match session
         .serve_once(|_, req| req.iter().map(|b| b.wrapping_add(add)).collect())
@@ -705,7 +727,7 @@ async fn dial_and_request(
   for request in &requests {
     replies.push(
       client
-        .request(STREAM_ID, request)
+        .request(STREAM_ID, Priority::Control, request)
         .await
         .map_err(|e| format!("{e:?}"))?,
     );
@@ -1045,7 +1067,7 @@ fn a_packet_naming_no_session_is_dropped_and_counted_while_the_live_session_serv
           .map_err(|e| format!("{e:?}"))?;
         endpoint.establish().await.map_err(|e| format!("{e:?}"))?;
         let before = endpoint
-          .request(STREAM_ID, b"before the stray")
+          .request(STREAM_ID, Priority::Control, b"before the stray")
           .await
           .map_err(|e| format!("{e:?}"))?;
         // The stray: a short header (fixed bit set) naming an id no session has, from a third socket.
@@ -1061,7 +1083,7 @@ fn a_packet_naming_no_session_is_dropped_and_counted_while_the_live_session_serv
         // Let the demultiplexer see it before the next request.
         slates_rt::futures::sleep(1_000_000).await;
         let after = endpoint
-          .request(STREAM_ID, b"after the stray")
+          .request(STREAM_ID, Priority::Control, b"after the stray")
           .await
           .map_err(|e| format!("{e:?}"))?;
         Ok::<_, String>((before, after))
@@ -1533,8 +1555,9 @@ fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_
       let outcome = async {
         client.establish().await.map_err(|e| format!("{e:?}"))?;
         client
-          .send_stream(STREAM_ID, &content)
+          .request(STREAM_ID, Priority::Bulk, &content)
           .await
+          .map(|_| ())
           .map_err(|e| format!("{e:?}"))
       }
       .await;
@@ -1564,10 +1587,10 @@ fn a_dialer_that_outwaited_an_absent_peer_completes_the_handshake_once_the_peer_
         )
         .map_err(|e| format!("{e:?}"))?;
         server.establish().await.map_err(|e| format!("{e:?}"))?;
-        server
-          .recv_stream(STREAM_ID)
-          .await
-          .map_err(|e| format!("{e:?}"))
+        let (id, _kind, received) = server.next_request().await.map_err(|e| format!("{e:?}"))?;
+        server.reply(id, &[]).map_err(|e| format!("{e:?}"))?;
+        server.settle().await.map_err(|e| format!("{e:?}"))?;
+        Ok::<_, String>(received)
       }
       .await;
       let _ = result_tx_server.send(outcome);

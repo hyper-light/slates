@@ -97,6 +97,23 @@ async fn address_from(receiver: Receiver<SocketAddrV4>) -> SocketAddrV4 {
   }
 }
 
+/// Settles `endpoint`'s unacknowledged replies ([`Endpoint::settle`]), or gives up after `within_ns` (a
+/// peer that already gave up never acknowledges them): `true` when every reply was acknowledged in time.
+async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
+  let mut settle = std::pin::pin!(endpoint.settle());
+  let mut deadline = std::pin::pin!(slates_rt::futures::sleep(within_ns));
+  std::future::poll_fn(|cx| {
+    if let std::task::Poll::Ready(settled) = std::future::Future::poll(settle.as_mut(), cx) {
+      return std::task::Poll::Ready(settled.is_ok());
+    }
+    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+      return std::task::Poll::Ready(false);
+    }
+    std::task::Poll::Pending
+  })
+  .await
+}
+
 /// Serves one exchange with a virtual deadline, so a missing put fails instead of
 /// keeping the simulation alive forever after the collector incorrectly drops its offer.
 async fn serve_bounded(endpoint: &mut Endpoint, held: &mut ContentHold) -> bool {
@@ -161,6 +178,8 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
           break;
         }
       }
+      // The put's reply is in flight when the serve returns; settle it before the session drops.
+      let _ = settle_within(&mut endpoint, COLLECTION_NS * 2).await;
       held_tx
         .send(held.holds_manifest(&archive().manifest_identity()))
         .unwrap();

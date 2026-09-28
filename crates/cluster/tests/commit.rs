@@ -185,6 +185,8 @@ fn run_commit_with_budget(
             },
           );
           serve_record(&mut endpoint, &mut acceptor).await.unwrap();
+          // The acknowledgement is in flight when `serve_record` returns; settle it before leaving.
+          endpoint.settle().await.unwrap();
         }
         // An unavailable holder handshakes then leaves without serving; the owner must not block on it.
       })
@@ -542,6 +544,7 @@ fn a_retry_reuses_the_connection_with_advancing_packet_numbers() {
       let mut acceptor = Acceptor::new(HostId(2), authority());
       serve_record(&mut endpoint, &mut acceptor).await.unwrap();
       serve_record(&mut endpoint, &mut acceptor).await.unwrap();
+      endpoint.settle().await.unwrap();
     })
     .unwrap();
 

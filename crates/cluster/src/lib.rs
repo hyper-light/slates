@@ -56,13 +56,15 @@ use slates_db::register::{
 };
 use slates_rt::error::RtError;
 use slates_rt::futures::{cancel, detach, now_ns, sleep, spawn_child};
+use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
 use crate::progress::{DeadlineExtender, ExtensionOutcome, ProgressWitness};
 
 /// The stream a record request rides on a holder connection.
-/// Format: the register-ship RPC uses one stream per connection; the holder's `serve_once` accepts
-/// whichever stream arrives, so the exact id is a fixed label, not a tunable.
+/// Format: a request **kind** (the low bits of each exchange's fresh stream id,
+/// `slates_transport::streams::compose`); the holder's `serve_once` dispatches on it, so the
+/// value is a label distinct from the plane's other kinds, not a tunable. Records ride the `Control` class.
 pub const RECORD_STREAM: u64 = 1;
 
 /// A refusal committing a record across the cluster.
@@ -415,12 +417,13 @@ impl Stragglers {
 pub async fn request_within(
   mut endpoint: Endpoint,
   stream_id: u64,
+  priority: Priority,
   request: &[u8],
   deadline_ns: u64,
 ) -> (TimedReply, Endpoint) {
   let sent_ns = now_ns();
   let reply = {
-    let mut exchange = std::pin::pin!(endpoint.request(stream_id, request));
+    let mut exchange = std::pin::pin!(endpoint.request(stream_id, priority, request));
     let mut timer = std::pin::pin!(sleep(deadline_ns));
     std::future::poll_fn(|cx| {
       // Prefer a delivered reply over the deadline when both are ready.
@@ -437,9 +440,11 @@ pub async fn request_within(
   if reply.is_none() {
     // The deadline won: the `request` future was dropped mid-exchange. Abandon the exchange so its
     // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an
-    // unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`); its late reply,
-    // arriving on its own now-older stream id, is discarded below the next exchange's floor.
-    endpoint.abandon_exchange();
+    // unrelated request (`docs/bugs/2026-09-10-abandoned-request-retransmit-lockstep.md`); the peer is told
+    // to stop its reply (`StopSending`), and any late copy of it is dropped by the closed stream's tombstone.
+    if let Some(abandoned) = endpoint.last_exchange() {
+      endpoint.abandon(abandoned);
+    }
   }
   // The round trip is measured only for an exchange the peer answered (Karn's rule): a reply that came
   // back is a sample of the path, however empty; a deadline or a transport error is not.
@@ -480,6 +485,7 @@ pub async fn request_within(
 pub async fn broadcast(
   requests: Vec<(HostId, Vec<u8>, Endpoint)>,
   stream: u64,
+  priority: Priority,
   budget: CommitBudget,
 ) -> (Vec<(HostId, TimedReply, Endpoint)>, Stragglers) {
   if requests.is_empty() {
@@ -491,7 +497,8 @@ pub async fn broadcast(
   for (host, request, endpoint) in requests {
     let tx = tx.clone();
     if let Ok(task) = spawn_child(async move {
-      let (reply, endpoint) = request_within(endpoint, stream, &request, deadline_ns).await;
+      let (reply, endpoint) =
+        request_within(endpoint, stream, priority, &request, deadline_ns).await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     }) {
       tasks.push(task);
@@ -711,7 +718,8 @@ pub async fn commit_record_on(
       // Bounded by the collection loop's full span, and hands the endpoint back whatever the outcome, so a
       // straggler that never replies still returns its session rather than having it dropped when this task
       // is cancelled — the caller can then retry a load-timed-out commit over the same warm session.
-      let (reply, endpoint) = request_within(endpoint, stream, &bytes, deadline_ns).await;
+      let (reply, endpoint) =
+        request_within(endpoint, stream, Priority::Control, &bytes, deadline_ns).await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
@@ -1003,7 +1011,14 @@ pub async fn promote_record(
     let spawned = spawn_child(async move {
       // Bounded and endpoint-preserving (see `request_within`): a holder that does not promise in time still
       // returns its session, so the new owner can retry the takeover over the same warm session.
-      let (reply, endpoint) = request_within(endpoint, PROMOTE_STREAM, &bytes, deadline_ns).await;
+      let (reply, endpoint) = request_within(
+        endpoint,
+        PROMOTE_STREAM,
+        Priority::Control,
+        &bytes,
+        deadline_ns,
+      )
+      .await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {
@@ -1270,8 +1285,14 @@ pub async fn promote_ledger_record(
     let bytes = prepare_bytes.clone();
     let spawned = spawn_child(async move {
       // Bounded and endpoint-preserving (see `request_within`), so a holder's session survives a timeout.
-      let (reply, endpoint) =
-        request_within(endpoint, LEDGER_PROMOTE_STREAM, &bytes, deadline_ns).await;
+      let (reply, endpoint) = request_within(
+        endpoint,
+        LEDGER_PROMOTE_STREAM,
+        Priority::Control,
+        &bytes,
+        deadline_ns,
+      )
+      .await;
       let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
     });
     match spawned {

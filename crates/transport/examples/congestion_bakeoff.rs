@@ -41,7 +41,7 @@ use slates_rt::sim::{
 };
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use slates_transport::congestion::ControllerKind;
-use slates_transport::connection::{ConnectionShape, initial_receive_window};
+use slates_transport::connection::{ConnectionShape, Priority, initial_receive_window};
 use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
 
@@ -72,6 +72,11 @@ const CEILING_BDPS: u64 = 8;
 
 /// Shape: the seeds each scenario runs with.
 const SEEDS: [u64; 3] = [1, 2, 3];
+/// Shape: a run is recorded as stalled once it has taken this many times its transfer's ideal duration
+/// at link rate — it delivered under 1 % of the link's capacity. Far past the worst healthy result in
+/// the first grid (NewReno at 4 % of capacity, about 25× ideal, 2026-09-27), so only a genuine stall
+/// trips it; before this bound one Copa run spun for 2.5 h of wall time and held up the whole grid.
+const STALL_FACTOR: u64 = 100;
 /// Shape: the fairness floor of the selection rule (Jain's index, 1 is perfectly fair).
 const FAIRNESS_FLOOR: f64 = 0.9;
 
@@ -128,6 +133,15 @@ impl Scenario {
   fn bulk_bytes(&self) -> u64 {
     let duration = self.warmup_ns() + PINGS * self.ping_gap_ns();
     (u128::from(self.rate / 8) * u128::from(duration) / 1_000_000_000) as u64
+  }
+
+  /// The virtual time past which a run is recorded as stalled: [`STALL_FACTOR`] times the transfer's
+  /// ideal duration at the link's rate, plus the warm-up.
+  fn stall_bound_ns(&self) -> u64 {
+    let ideal_ns = u128::from(self.bulk_bytes()) * 8 * 1_000_000_000 / u128::from(self.rate.max(1));
+    u64::try_from(ideal_ns.saturating_mul(u128::from(STALL_FACTOR)))
+      .unwrap_or(u64::MAX)
+      .saturating_add(self.warmup_ns())
   }
 
   fn queue_bytes(&self) -> u64 {
@@ -335,6 +349,7 @@ async fn coordinator(
   }
   let bulk = vec![0xB5u8; usize::try_from(scenario.bulk_bytes()).unwrap()];
   let mut servers = Vec::new();
+  let mut clients = Vec::new();
   let (bulk_done_tx, bulk_done_rx) = channel::<()>();
   for (index, (pair, _, flow_law)) in flows.into_iter().enumerate() {
     let flow_shape = shape(flow_law, &scenario);
@@ -357,8 +372,8 @@ async fn coordinator(
           return;
         }
         let started = slates_rt::futures::now_ns();
-        let received = match endpoint.recv_stream(1).await {
-          Ok(received) => received,
+        let (id, received) = match endpoint.next_request().await {
+          Ok((id, _kind, received)) => (id, received),
           Err(e) => {
             eprintln!("ROLE bulk server {index} recv: {e:?}");
             return;
@@ -368,25 +383,35 @@ async fn coordinator(
         assert_eq!(received.len(), expected, "the bulk stream arrived whole");
         let _ = done.send((index, received.len() as u64, elapsed));
         let _ = bulk_done_tx.send(());
+        // Acknowledge the transfer and keep the session driven until the coordinator ends the run.
+        if let Err(e) = endpoint.reply(id, &[]) {
+          eprintln!("ROLE bulk server {index} reply: {e:?}");
+          return;
+        }
+        let _ = endpoint.settle().await;
       })
       .unwrap(),
     );
     let data = bulk.clone();
-    let _client_task = slates_rt::futures::spawn_child(async move {
-      let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
-      let mut endpoint = Endpoint::client(
-        client,
-        peer,
-        &client_identity,
-        &server_cert,
-        NAME,
-        flow_shape,
-      )
-      .unwrap();
-      endpoint.establish().await.unwrap();
-      endpoint.send_stream(1, &data).await.unwrap();
-    })
-    .unwrap();
+    clients.push(
+      slates_rt::futures::spawn_child(async move {
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port);
+        let mut endpoint = Endpoint::client(
+          client,
+          peer,
+          &client_identity,
+          &server_cert,
+          NAME,
+          flow_shape,
+        )
+        .unwrap();
+        endpoint.establish().await.unwrap();
+        if let Err(e) = endpoint.request(1, Priority::Bulk, &data).await {
+          eprintln!("ROLE bulk client: {e:?}");
+        }
+      })
+      .unwrap(),
+    );
   }
   let ping_shape = shape(law, &scenario);
   let ping_server_identity = self_signed(NAME);
@@ -426,7 +451,10 @@ async fn coordinator(
     endpoint.establish().await.unwrap();
     while !BULK_DONE.load(Ordering::Acquire) {
       let started = slates_rt::futures::now_ns();
-      let reply = endpoint.request(1, &[0x50u8; PING_BYTES]).await.unwrap();
+      let reply = endpoint
+        .request(1, Priority::Control, &[0x50u8; PING_BYTES])
+        .await
+        .unwrap();
       assert_eq!(reply.len(), PING_BYTES, "the ping echoed");
       let _ = pings.send((started - run_start, slates_rt::futures::now_ns() - started));
       slates_rt::futures::sleep(ping_gap).await;
@@ -434,9 +462,17 @@ async fn coordinator(
   })
   .unwrap();
   let flows = 1 + usize::from(scenario.second_flow.is_some());
-  wait_for_bulk(&scenario, link, flows, bulk_done_rx).await;
+  let completed = wait_for_bulk(&scenario, link, flows, bulk_done_rx).await;
   BULK_DONE.store(true, Ordering::Release);
-  let _ = slates_rt::futures::join(ping_client_task).await;
+  if completed {
+    let _ = slates_rt::futures::join(ping_client_task).await;
+  } else {
+    // A stalled run: every role may be mid-exchange forever, so each is cancelled, not joined.
+    let _ = slates_rt::futures::cancel(ping_client_task);
+    for client in clients {
+      let _ = slates_rt::futures::cancel(client);
+    }
+  }
   let _ = slates_rt::futures::cancel(ping_server_task);
   for server in servers {
     let _ = slates_rt::futures::cancel(server);
@@ -444,17 +480,25 @@ async fn coordinator(
 }
 
 /// Waits until `flows` bulk flows have reported done, applying the scenario's bandwidth steps to `link` at
-/// their times meanwhile.
+/// their times meanwhile; `false` when the run passed its stall bound first ([`Scenario::stall_bound_ns`]).
 async fn wait_for_bulk(
   scenario: &Scenario,
   link: slates_rt::sim::SimLinkId,
   flows: usize,
   bulk_done_rx: std::sync::mpsc::Receiver<()>,
-) {
+) -> bool {
   let start = slates_rt::futures::now_ns();
   let mut pending_steps = scenario.steps.clone();
   let mut finished = 0;
   while finished < flows {
+    if slates_rt::futures::now_ns().saturating_sub(start) > scenario.stall_bound_ns() {
+      eprintln!(
+        "STALL {}: {finished} of {flows} flows done at the {} s bound",
+        scenario.name,
+        scenario.stall_bound_ns() / (1000 * MS)
+      );
+      return false;
+    }
     if let Ok(()) = bulk_done_rx.try_recv() {
       finished += 1;
       continue;
@@ -481,6 +525,7 @@ async fn wait_for_bulk(
     });
     slates_rt::futures::sleep(MS).await;
   }
+  true
 }
 
 fn scenarios() -> Vec<Scenario> {

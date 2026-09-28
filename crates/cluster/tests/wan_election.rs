@@ -32,6 +32,7 @@ use slates_rt::futures::{now_ns, sleep};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::{SimPath, SimRuntime, sim_udp_set_path};
 use slates_rt::udp::UdpSocket;
+use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, MIN_DATAGRAM_BYTES};
 use slates_transport::handshake::Identity;
 use slates_transport::rtt::RttEstimator;
@@ -304,7 +305,8 @@ async fn probe_peer(owner: HostId, peer: HostId, endpoint: Endpoint) {
         .unwrap_or(initial)
         .max(HEARTBEAT_NS)
     });
-    let (reply, returned) = request_within(endpoint, PROBE_KIND, b"ping", deadline).await;
+    let (reply, returned) =
+      request_within(endpoint, PROBE_KIND, Priority::Control, b"ping", deadline).await;
     endpoint = returned;
     if let Some(round_trip_ns) = reply.round_trip_ns {
       with_node(owner, |n| {
@@ -427,7 +429,7 @@ async fn drive_replication(owner: HostId, others: &[HostId], budget: CommitBudge
     }
   }
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, COUNCIL_KIND, budget).await;
+  let (replied, stragglers) = broadcast(requests, COUNCIL_KIND, Priority::Control, budget).await;
   let mut recovered = kept;
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -465,7 +467,7 @@ async fn drive_election(owner: HostId, others: &[HostId], budget: CommitBudget) 
     .map(|(host, endpoint)| (host, pre_bytes.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, COUNCIL_KIND, budget).await;
+  let (replied, stragglers) = broadcast(requests, COUNCIL_KIND, Priority::Control, budget).await;
   let mut sessions = Vec::with_capacity(replied.len());
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -492,7 +494,7 @@ async fn drive_election(owner: HostId, others: &[HostId], budget: CommitBudget) 
     .map(|(host, endpoint)| (host, vote_bytes.clone(), endpoint))
     .collect();
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
-  let (replied, stragglers) = broadcast(requests, COUNCIL_KIND, budget).await;
+  let (replied, stragglers) = broadcast(requests, COUNCIL_KIND, Priority::Control, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
   let mut replies = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {

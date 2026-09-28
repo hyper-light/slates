@@ -21,6 +21,7 @@ use std::mem::size_of;
 use slates_db::register::HostId;
 use slates_rt::error::RtError;
 use slates_rt::futures::{now_ns, sleep};
+use slates_transport::connection::{Priority, StreamRefusal};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::CommitBudget;
@@ -553,8 +554,8 @@ fn liveness_from_byte(byte: u8) -> Result<Liveness, SwimWireError> {
   }
 }
 
-/// Format: a SWIM probe rides one stream per peer connection; the target's `serve_once` accepts whichever
-/// stream arrives, so the exact id is a fixed label, not a tunable.
+/// Format: the probe's request **kind** (the low bits of each exchange's fresh stream id); a probe session
+/// carries only probes, so the value is a label, not a tunable. Probes ride the `Control` class.
 const PROBE_STREAM: u64 = 1;
 
 /// The outcome of one live probe over the transport.
@@ -670,9 +671,9 @@ pub async fn probe_once(
 /// One request on the probe stream raced against the caller's deadline: `Some(result)` when the exchange
 /// completed (a reply, or a transport error), `None` when the deadline won. Driven inline; on the deadline
 /// the request future is dropped (releasing the borrow of `endpoint`) and the exchange is **abandoned** on
-/// the still-owned endpoint, so nothing of it rides the next exchange's flush and its late reply, if any,
-/// is discarded below the next exchange's floor — the reliable exchange is not self-bounded, so this
-/// deadline is the caller-owned bound it relies on. A delivered reply is preferred over the deadline when
+/// the still-owned endpoint, so nothing of it rides the next exchange's flush, the peer is told to stop its
+/// reply (`StopSending`), and a late copy is dropped by the closed stream's tombstone — the reliable
+/// exchange is not self-bounded, so this deadline is the caller-owned bound it relies on. A delivered reply is preferred over the deadline when
 /// both are ready, so an exchange that just made it is not traded for a timeout. Shared by the direct probe
 /// ([`probe_once`]) and the indirect-probe traffic ([`deliver_once`]).
 async fn race_reply(
@@ -681,7 +682,7 @@ async fn race_reply(
   budget: CommitBudget,
 ) -> Option<Result<Vec<u8>, EndpointError>> {
   let received = {
-    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, bytes));
+    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, Priority::Control, bytes));
     let mut deadline = std::pin::pin!(sleep(budget.deadline_ns));
     std::future::poll_fn(|cx| {
       if let std::task::Poll::Ready(result) = std::future::Future::poll(request.as_mut(), cx) {
@@ -694,8 +695,10 @@ async fn race_reply(
     })
     .await
   };
-  if received.is_none() {
-    endpoint.abandon_exchange();
+  if received.is_none()
+    && let Some(abandoned) = endpoint.last_exchange()
+  {
+    endpoint.abandon(abandoned);
   }
   received
 }
@@ -740,10 +743,14 @@ pub async fn deliver_once(
 /// on a session that may still carry the next probe, a miss. Pure, so it is tested by itself.
 pub fn outcome_of_request_error(error: &EndpointError) -> ProbeOutcome {
   match error {
-    EndpointError::Closed | EndpointError::Io(_) | EndpointError::Admission(_) => {
-      ProbeOutcome::Broken
-    }
-    EndpointError::Handshake(_)
+    EndpointError::Closed
+    | EndpointError::Io(_)
+    | EndpointError::Admission(_)
+    | EndpointError::Stream(StreamRefusal::SequencesExhausted) => ProbeOutcome::Broken,
+    // A backlog past the peer's stream credit means the peer is not finishing this end's streams — a
+    // missed probe, which the suspicion rule already weighs; the other refusals are serve-side only.
+    EndpointError::Stream(_)
+    | EndpointError::Handshake(_)
     | EndpointError::Tls(_)
     | EndpointError::NotReady
     | EndpointError::Header
