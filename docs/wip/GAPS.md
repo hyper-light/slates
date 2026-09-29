@@ -1862,6 +1862,29 @@ replies; the implementation runs per-object rounds from a successor that must al
 that round, with the deterministic test (kept out of the suite until then) as its failing test first.
 [Bug record](../bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md).
 
+**Update, the same day — the fix is designed and being built.** Letting a holder with nothing promise is
+safe only if every survivor agrees on each object's candidate set and that set holds the newest record at
+`f + 1`. The implementation guarantees neither:
+- a holder remembers the cohort of the last record it accepted, so after a neighbourhood change survivors rank
+  different successors;
+- a neighbourhood change in flight can leave the newest record short of `f + 1` in the owner's latest cohort;
+- a successor that dies mid-takeover splits the lineage.
+
+The bug record works through each, and gives the design's own answer (§4.8 is Vertical Paxos II): settled
+neighbourhoods with joint writes, retirement records, one batched phase-one round per departed host over the
+agreed cohorts, and confirmed shares.
+
+Built so far: the configuration state (step 1 of 3).
+- Each neighbourhood keeps the version its host set last changed at.
+- Each member keeps its settled neighbourhood, with its hosts' domains.
+- Each retirement records the settled neighbourhood, the confirmed survivors and the unconfirmed lineages.
+- The commands are `Settle` and `Confirm`.
+- The configuration names each object's recovery cohorts and its successor from itself alone.
+- Retirements are bounded by the members (`k ≤ n − k` for `k ≤ f`), oldest dropped first.
+- The codec checks every count.
+
+Owed: the owner's joint writes and settlement report, then the takeover itself.
+
 **Built for it:** status now reports the control shard's held record copies, pending takeovers and installed
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
 stalled takeover shows in any node's status.

@@ -13,7 +13,7 @@ use std::mem::size_of;
 
 use slates_db::register::{
   DomainId, HostEpoch, HostId, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum, RegionId,
-  RegionalConfiguration, RootConfiguration,
+  RegionalConfiguration, Retirement, RootConfiguration, Settled,
 };
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
@@ -727,15 +727,100 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_u64(&mut out, host.0);
     put_u64(&mut out, epoch.0);
   }
+  encode_domains(&mut out, &config.domains);
   put_u32(
     &mut out,
-    u32::try_from(config.domains.len()).unwrap_or(u32::MAX),
+    u32::try_from(config.settled.len()).unwrap_or(u32::MAX),
   );
-  for (host, domain) in &config.domains {
+  for (owner, settled) in &config.settled {
+    put_u64(&mut out, owner.0);
+    encode_settled(&mut out, settled);
+  }
+  put_u32(
+    &mut out,
+    u32::try_from(config.retired.len()).unwrap_or(u32::MAX),
+  );
+  for (host, retirement) in &config.retired {
     put_u64(&mut out, host.0);
-    put_u64(&mut out, *domain);
+    put_u64(&mut out, retirement.version);
+    encode_settled(&mut out, &retirement.settled);
+    encode_hosts(&mut out, &retirement.confirmed);
+    encode_hosts(&mut out, &retirement.unconfirmed);
   }
   out
+}
+
+/// Encodes a domains map: its count, then each `(host, domain)`.
+fn encode_domains(out: &mut Vec<u8>, domains: &std::collections::BTreeMap<HostId, DomainId>) {
+  put_u32(out, u32::try_from(domains.len()).unwrap_or(u32::MAX));
+  for (host, domain) in domains {
+    put_u64(out, host.0);
+    put_u64(out, *domain);
+  }
+}
+
+/// Encodes a settled neighbourhood: its generation, its hosts, then its hosts' declared domains.
+fn encode_settled(out: &mut Vec<u8>, settled: &Settled) {
+  put_u64(out, settled.generation);
+  encode_hosts(out, &settled.hosts);
+  encode_domains(out, &settled.domains);
+}
+
+/// Decodes a settled neighbourhood ([`encode_settled`]), bounding every count.
+fn decode_settled(bytes: &[u8]) -> Result<(Settled, &[u8]), RaftWireError> {
+  let (generation, rest) = take_u64(bytes)?;
+  let (hosts, rest) = decode_hosts(rest)?;
+  let (domains, rest) = decode_domains(rest)?;
+  Ok((
+    Settled {
+      hosts,
+      generation,
+      domains,
+    },
+    rest,
+  ))
+}
+
+/// Decodes the settled map (count, then each `(owner, settled)`), bounding the count.
+fn decode_settled_map(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, Settled>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut settled = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (owner, tail) = take_u64(rest)?;
+    let (neighbourhood, tail) = decode_settled(tail)?;
+    settled.insert(HostId(owner), neighbourhood);
+    rest = tail;
+  }
+  Ok((settled, rest))
+}
+
+/// Decodes the retirements map (count, then each `(host, version, settled, confirmed, unconfirmed)`), bounding
+/// every count.
+fn decode_retired(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<HostId, Retirement>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut retired = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (host, tail) = take_u64(rest)?;
+    let (version, tail) = take_u64(tail)?;
+    let (settled, tail) = decode_settled(tail)?;
+    let (confirmed, tail) = decode_hosts(tail)?;
+    let (unconfirmed, tail) = decode_hosts(tail)?;
+    retired.insert(
+      HostId(host),
+      Retirement {
+        version,
+        settled,
+        confirmed,
+        unconfirmed,
+      },
+    );
+    rest = tail;
+  }
+  Ok((retired, rest))
 }
 
 /// Decodes a [`RegionalConfiguration`], or a typed refusal for hostile or truncated bytes — every declared
@@ -749,6 +834,8 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (neighbourhoods, rest) = decode_neighbourhoods(rest)?;
   let (epochs, rest) = decode_epochs(rest)?;
   let (domains, rest) = decode_domains(rest)?;
+  let (settled, rest) = decode_settled_map(rest)?;
+  let (retired, rest) = decode_retired(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
     version,
@@ -758,6 +845,8 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     domains,
     quorum: Quorum { f },
     has_mirror,
+    settled,
+    retired,
   })
 }
 
@@ -1604,14 +1693,65 @@ mod tests {
     use slates_db::register::RegionalConfiguration;
     let mut domains = std::collections::BTreeMap::new();
     domains.insert(A, 7);
-    let config =
+    let mut config =
       RegionalConfiguration::formed(vec![A, B, HostId(3)], Quorum { f: 1 }, domains, 3, true);
     let bytes = encode_regional_configuration(&config);
     assert_eq!(
       decode_regional_configuration(&bytes),
-      Ok(config),
+      Ok(config.clone()),
       "round-trip is identity"
     );
+    // A change in flight (an admission moved the neighbourhoods) and a retirement with a confirmation and an
+    // unconfirmed lineage: every settled neighbourhood, domain and retirement field survives the round trip.
+    assert!(config.admit(HostId(4), Some(9), 3));
+    config.take_over(A, 3);
+    let survivor = config
+      .recovery_hosts(A)
+      .into_iter()
+      .find(|host| config.owes_confirmation(A, *host))
+      .unwrap();
+    assert!(config.confirm(A, survivor));
+    config.take_over(HostId(4), 3);
+    assert!(!config.retired.is_empty());
+    let bytes = encode_regional_configuration(&config);
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Ok(config),
+      "round-trip is identity with retirements and a change in flight"
+    );
+  }
+
+  /// A retirement whose confirmed-host count lies — more ids than the bytes back — is refused before
+  /// allocating, and a configuration cut short inside its retirements is refused as truncated.
+  #[test]
+  fn a_lying_retirement_count_is_refused() {
+    use slates_db::register::RegionalConfiguration;
+    let mut config = RegionalConfiguration::formed(
+      vec![A, B, HostId(3)],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    config.take_over(A, 3);
+    let bytes = encode_regional_configuration(&config);
+    // The last retirement ends with its confirmed ids (a count, none here) and its unconfirmed ids (a count,
+    // none here): make the confirmed count claim every id there is.
+    let confirmed_count_at = bytes.len() - 2 * size_of::<u32>();
+    let mut lying = bytes.clone();
+    lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]
+      .copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      decode_regional_configuration(&lying),
+      Err(RaftWireError::LengthMismatch),
+      "a count beyond the bytes is refused"
+    );
+    for cut in 1..=2 * size_of::<u32>() {
+      assert!(
+        decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
+        "a configuration cut {cut} bytes short is refused"
+      );
+    }
   }
 
   /// A regional configuration whose leading (members) count lies — more entries than the bytes back — is

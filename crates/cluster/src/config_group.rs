@@ -88,12 +88,34 @@ pub enum ConfigCommand {
     /// The failed host being taken over.
     dead: HostId,
   },
+  /// An owner reports every object it owns placed at `f + 1` of the cohorts of its neighbourhood fixed at
+  /// `generation` (§4.8 "Neighbourhood changes"): that neighbourhood becomes its settled one, retiring the old
+  /// set ([`RegionalConfiguration::settle`]).
+  Settle {
+    /// The reporting owner.
+    owner: HostId,
+    /// The version its reported neighbourhood was fixed at.
+    generation: u64,
+  },
+  /// A survivor confirms its share of a retired host's takeover (§4.8 "only then serves under confirmed
+  /// authority"): every object of `departed` that ranks it first is adopted and placed under its own placement
+  /// ([`RegionalConfiguration::confirm`]).
+  Confirm {
+    /// The retired host whose takeover the share belongs to.
+    departed: HostId,
+    /// The confirming survivor.
+    successor: HostId,
+  },
 }
 
 /// Format: a config command is a one-byte tag followed by its little-endian fields; these are the tags.
 const COMMAND_ADMIT: u8 = 0;
 const COMMAND_RETIRE: u8 = 1;
 const COMMAND_TAKE_OVER: u8 = 2;
+/// Format: the tag of an owner's settlement report ([`ConfigCommand::Settle`]).
+const COMMAND_SETTLE: u8 = 3;
+/// Format: the tag of a survivor's takeover confirmation ([`ConfigCommand::Confirm`]).
+const COMMAND_CONFIRM: u8 = 4;
 /// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
 /// the domain id follows as a little-endian u64.
 const DOMAIN_ABSENT: u8 = 0;
@@ -124,6 +146,19 @@ impl ConfigCommand {
         out.push(COMMAND_TAKE_OVER);
         out.extend_from_slice(&dead.0.to_le_bytes());
       }
+      ConfigCommand::Settle { owner, generation } => {
+        out.push(COMMAND_SETTLE);
+        out.extend_from_slice(&owner.0.to_le_bytes());
+        out.extend_from_slice(&generation.to_le_bytes());
+      }
+      ConfigCommand::Confirm {
+        departed,
+        successor,
+      } => {
+        out.push(COMMAND_CONFIRM);
+        out.extend_from_slice(&departed.0.to_le_bytes());
+        out.extend_from_slice(&successor.0.to_le_bytes());
+      }
     }
     out
   }
@@ -147,6 +182,21 @@ impl ConfigCommand {
       COMMAND_TAKE_OVER => Some(ConfigCommand::TakeOver {
         dead: take_host(rest)?.0,
       }),
+      COMMAND_SETTLE => {
+        let (owner, rest) = take_host(rest)?;
+        let (generation, rest) = take_word(rest)?;
+        rest
+          .is_empty()
+          .then_some(ConfigCommand::Settle { owner, generation })
+      }
+      COMMAND_CONFIRM => {
+        let (departed, rest) = take_host(rest)?;
+        let (successor, rest) = take_host(rest)?;
+        rest.is_empty().then_some(ConfigCommand::Confirm {
+          departed,
+          successor,
+        })
+      }
       _ => None,
     }
   }
@@ -189,6 +239,21 @@ pub enum Reconfiguration {
   /// old epoch are refused `StaleEpoch`. This is what the leader proposes for a SWIM-confirmed death, the
   /// per-host counterpart of a clean [`Retire`](Reconfiguration::Retire).
   TakeOver(HostId),
+  /// Record an owner's report that every object it owns is placed at `f + 1` of the cohorts of its
+  /// neighbourhood fixed at `generation` ([`ConfigCommand::Settle`]).
+  Settle {
+    /// The reporting owner.
+    owner: HostId,
+    /// The version its reported neighbourhood was fixed at.
+    generation: u64,
+  },
+  /// Record a survivor's confirmation of its share of a retired host's takeover ([`ConfigCommand::Confirm`]).
+  Confirm {
+    /// The retired host.
+    departed: HostId,
+    /// The confirming survivor.
+    successor: HostId,
+  },
 }
 
 /// The voter set the council moves to (§4.8, D-14 — "a small elected council per region"), in id order: up
@@ -773,6 +838,20 @@ impl RegionalCouncil {
         ConfigCommand::TakeOver { dead: host },
         self.fold.state().members.contains(&host),
       ),
+      Reconfiguration::Settle { owner, generation } => (
+        ConfigCommand::Settle { owner, generation },
+        self.fold.state().settles(owner, generation),
+      ),
+      Reconfiguration::Confirm {
+        departed,
+        successor,
+      } => (
+        ConfigCommand::Confirm {
+          departed,
+          successor,
+        },
+        self.fold.state().owes_confirmation(departed, successor),
+      ),
     };
     if !would_change {
       return false;
@@ -981,6 +1060,15 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     Some(ConfigCommand::TakeOver { dead }) => {
       configuration.take_over(dead, scatter);
     }
+    Some(ConfigCommand::Settle { owner, generation }) => {
+      configuration.settle(owner, generation);
+    }
+    Some(ConfigCommand::Confirm {
+      departed,
+      successor,
+    }) => {
+      configuration.confirm(departed, successor);
+    }
     None => {}
   }
 }
@@ -1102,12 +1190,38 @@ mod tests {
       },
       ConfigCommand::Retire(B),
       ConfigCommand::TakeOver { dead: OWNER },
+      ConfigCommand::Settle {
+        owner: A,
+        generation: 7,
+      },
+      ConfigCommand::Confirm {
+        departed: OWNER,
+        successor: B,
+      },
     ];
     for command in commands {
       assert_eq!(
         ConfigCommand::decode(&command.encode()),
         Some(command),
         "round-trip is identity"
+      );
+      let mut trailing = command.encode();
+      trailing.push(0);
+      if matches!(
+        command,
+        ConfigCommand::Settle { .. } | ConfigCommand::Confirm { .. }
+      ) {
+        assert_eq!(
+          ConfigCommand::decode(&trailing),
+          None,
+          "a report with trailing bytes decodes to nothing"
+        );
+      }
+      let truncated = command.encode();
+      assert_eq!(
+        ConfigCommand::decode(truncated.get(..truncated.len() - 1).unwrap()),
+        None,
+        "a truncated command decodes to nothing"
       );
     }
     assert_eq!(
@@ -1940,6 +2054,15 @@ mod tests {
       }
       Reconfiguration::TakeOver(host) => {
         oracle.take_over(*host, 3);
+      }
+      Reconfiguration::Settle { owner, generation } => {
+        oracle.settle(*owner, *generation);
+      }
+      Reconfiguration::Confirm {
+        departed,
+        successor,
+      } => {
+        oracle.confirm(*departed, *successor);
       }
     }
   }

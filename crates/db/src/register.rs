@@ -1444,15 +1444,75 @@ impl Configuration {
 }
 
 /// A host's bounded neighbourhood as the regional council fixes it (§4.8, D-14): the scatter set across
-/// failure domains, and the **generation** it was fixed at — so a membership change moves only the hosts
-/// whose rendezvous rank crossed the cut ("add before remove", stable), and a stale writer's neighbourhood
-/// is told from the current one.
+/// failure domains, and the **generation** at which that host set last changed — so a membership change moves
+/// only the hosts whose rendezvous rank crossed the cut ("add before remove", stable), and an owner can tell
+/// whether its neighbourhood moved since the neighbourhood its records are all placed on ([`Settled`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Neighbourhood {
   /// The owner plus its scatter-width co-holders across failure domains (the owner heads it).
   pub hosts: Vec<HostId>,
-  /// The configuration generation this neighbourhood was fixed at.
+  /// The configuration version at which this host set was last changed: a refix that leaves the set as it
+  /// was keeps the version it had, so a neighbourhood whose version is unchanged is the same set.
   pub generation: u64,
+}
+
+/// A neighbourhood an owner's records are all placed on (§4.8 "Neighbourhood changes"; Vertical Paxos II's
+/// complete configuration [A: Lamport, Malkhi, Zhou, "Vertical Paxos and Primary-Backup Replication", PODC
+/// 2009]): while an owner's current neighbourhood differs from it, the owner writes jointly to both, and the
+/// council moves it forward only on the owner's report that every object it owns is placed at `f + 1` of the
+/// new cohort ([`RegionalConfiguration::settle`]). So every record an owner ever committed is held by `f + 1` of
+/// its settled cohort, and a takeover recovers through that cohort. It keeps each host's failure domain, so the
+/// cohorts drawn from it are recomputed exactly after some of its hosts retired and left the domain map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settled {
+  /// The neighbourhood's hosts, the owner among them.
+  pub hosts: Vec<HostId>,
+  /// The configuration version at which this host set was fixed ([`Neighbourhood::generation`]).
+  pub generation: u64,
+  /// The declared failure domain of each of those hosts that has one; a host absent is its own domain, as in
+  /// [`candidates_for`].
+  pub domains: std::collections::BTreeMap<HostId, DomainId>,
+}
+
+impl Settled {
+  /// The settled form of `neighbourhood`: its hosts and version, with the declared domain of each host.
+  fn of(
+    neighbourhood: &Neighbourhood,
+    domains: &std::collections::BTreeMap<HostId, DomainId>,
+  ) -> Settled {
+    Settled {
+      hosts: neighbourhood.hosts.clone(),
+      generation: neighbourhood.generation,
+      domains: neighbourhood
+        .hosts
+        .iter()
+        .filter_map(|host| domains.get(host).map(|domain| (*host, *domain)))
+        .collect(),
+    }
+  }
+
+  /// The cohort `owner` placed `object` on in this neighbourhood: the same [`candidates_for`] the owner
+  /// computed when it wrote, over the same hosts and domains.
+  pub fn cohort(&self, owner: HostId, object: ObjectId, quorum: Quorum) -> Vec<HostId> {
+    candidates_for(owner, &self.hosts, &self.domains, object, quorum)
+  }
+}
+
+/// A retired host's retirement (§4.8 "Promotion and takeover"): what the region needs to recover its objects
+/// the same way on every survivor, kept until every survivor that could own a share of them has confirmed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Retirement {
+  /// The configuration version that retired the host.
+  pub version: u64,
+  /// The neighbourhood its records were all placed on when it retired: its objects' recovery cohort.
+  pub settled: Settled,
+  /// The surviving hosts of `settled` that have confirmed their share of this takeover — every object of the
+  /// retired host that ranks them first adopted and placed under their own placement — in id order.
+  pub confirmed: Vec<HostId>,
+  /// The retired hosts whose takeover this host had not confirmed its share of when it retired, in id order:
+  /// an object it was taking over from one of them may not have been re-committed under it yet, so its own
+  /// objects are recovered jointly with those hosts' cohorts ([`RegionalConfiguration::recovery_owners`]).
+  pub unconfirmed: Vec<HostId>,
 }
 
 /// The **regional configuration** the council agrees on (§4.8, D-14 — the "configuration master", a small
@@ -1479,6 +1539,14 @@ pub struct RegionalConfiguration {
   pub quorum: Quorum,
   /// Whether a mirror region exists.
   pub has_mirror: bool,
+  /// Each member's settled neighbourhood ([`Settled`]): the set its records are all placed on — its current
+  /// neighbourhood outside a change in flight, the previous one until it reports the change placed
+  /// ([`settle`](RegionalConfiguration::settle)). Bounded by the members.
+  pub settled: std::collections::BTreeMap<HostId, Settled>,
+  /// Each retired host's [`Retirement`], kept until every survivor that could own a share of its objects has
+  /// confirmed that share ([`confirm`](RegionalConfiguration::confirm)), and never more than
+  /// [`retirement_bound`](RegionalConfiguration::retirement_bound) of them.
+  pub retired: std::collections::BTreeMap<HostId, Retirement>,
 }
 
 impl RegionalConfiguration {
@@ -1503,20 +1571,34 @@ impl RegionalConfiguration {
       domains,
       quorum,
       has_mirror,
+      settled: std::collections::BTreeMap::new(),
+      retired: std::collections::BTreeMap::new(),
     };
     config.fix_neighbourhoods(scatter);
+    // A formed region owns nothing yet: every member's first neighbourhood is already settled.
+    config.settled = config
+      .neighbourhoods
+      .iter()
+      .map(|(owner, neighbourhood)| (*owner, Settled::of(neighbourhood, &config.domains)))
+      .collect();
     config
   }
 
   /// Fixes every member's bounded neighbourhood from the current membership (`select_neighbourhood`): the
-  /// owner plus its scatter-width co-holders by rendezvous, at the current version's generation.
+  /// owner plus its scatter-width co-holders by rendezvous. A neighbourhood whose host set the change left as it
+  /// was keeps the version it was fixed at; one that moved takes the current version.
   fn fix_neighbourhoods(&mut self, scatter: u64) {
-    let generation = self.version;
+    let version = self.version;
     let members = self.members.clone();
+    let previous = std::mem::take(&mut self.neighbourhoods);
     self.neighbourhoods = members
       .iter()
       .map(|&owner| {
         let hosts = select_neighbourhood(owner, &members, scatter);
+        let generation = previous
+          .get(&owner)
+          .filter(|unchanged| unchanged.hosts == hosts)
+          .map_or(version, |unchanged| unchanged.generation);
         (owner, Neighbourhood { hosts, generation })
       })
       .collect();
@@ -1553,6 +1635,12 @@ impl RegionalConfiguration {
     }
     self.version = self.version.saturating_add(1);
     self.fix_neighbourhoods(scatter);
+    // An admitted member owns nothing yet, so its first neighbourhood is settled at once. The members whose
+    // neighbourhoods it entered keep their settled ones until they report the change placed.
+    if let Some(neighbourhood) = self.neighbourhoods.get(&member) {
+      let settled = Settled::of(neighbourhood, &self.domains);
+      self.settled.insert(member, settled);
+    }
     true
   }
 
@@ -1560,23 +1648,243 @@ impl RegionalConfiguration {
   /// advances the version. Its epoch is kept, so a record from the retired host under an old epoch is still
   /// fenced if it returns; its failure domain is dropped — only members are placed across domains, and an
   /// admission carries a returning node's domain afresh — so the domain map stays bounded to the members
-  /// while every restart admits a new member id (task #22; banned item 8). Returns whether the membership
-  /// changed.
+  /// while every restart admits a new member id (task #22; banned item 8). Its settled neighbourhood moves into
+  /// a [`Retirement`], with the takeovers it had not confirmed its share of, so its objects are recovered the
+  /// same way on every survivor. Returns whether the membership changed.
   pub fn retire(&mut self, member: HostId, scatter: u64) -> bool {
     if !self.members.contains(&member) {
       return false;
     }
+    let settled = self.settled.remove(&member).or_else(|| {
+      self
+        .neighbourhoods
+        .get(&member)
+        .map(|neighbourhood| Settled::of(neighbourhood, &self.domains))
+    });
+    let unconfirmed: Vec<HostId> = self
+      .retired
+      .keys()
+      .copied()
+      .filter(|departed| self.owes_confirmation(*departed, member))
+      .collect();
     self.members.retain(|host| *host != member);
     self.neighbourhoods.remove(&member);
     self.domains.remove(&member);
     self.version = self.version.saturating_add(1);
     self.fix_neighbourhoods(scatter);
+    if let Some(settled) = settled {
+      self.retired.insert(
+        member,
+        Retirement {
+          version: self.version,
+          settled,
+          confirmed: Vec::new(),
+          unconfirmed,
+        },
+      );
+    }
+    self.prune_retirements();
+    self.bound_retirements();
     true
   }
 
+  /// Records that `owner` reports every object it owns placed at `f + 1` of the cohorts of its neighbourhood
+  /// fixed at `generation` (§4.8 "the group retires the old set only after the owner has acknowledged the new
+  /// configuration and the newest committed record is held by f+1 of the new candidates"): that neighbourhood
+  /// becomes its settled one and the version advances, so every node learns the old set is retired. A report
+  /// for a neighbourhood that has moved on since, from a non-member, or already recorded changes nothing.
+  /// Returns whether the configuration changed.
+  pub fn settle(&mut self, owner: HostId, generation: u64) -> bool {
+    if !self.settles(owner, generation) {
+      return false;
+    }
+    let Some(neighbourhood) = self.neighbourhoods.get(&owner) else {
+      return false;
+    };
+    let settled = Settled::of(neighbourhood, &self.domains);
+    self.settled.insert(owner, settled);
+    self.version = self.version.saturating_add(1);
+    true
+  }
+
+  /// Whether `owner`'s report of its neighbourhood fixed at `generation` would move its settled neighbourhood
+  /// ([`settle`](RegionalConfiguration::settle)): `owner` is a member, its current neighbourhood is still the one
+  /// fixed at `generation`, and that is not already its settled one.
+  pub fn settles(&self, owner: HostId, generation: u64) -> bool {
+    self
+      .neighbourhoods
+      .get(&owner)
+      .is_some_and(|neighbourhood| neighbourhood.generation == generation)
+      && self
+        .settled
+        .get(&owner)
+        .is_none_or(|settled| settled.generation != generation)
+  }
+
+  /// Records that `successor` confirms its share of `departed`'s takeover: every object of `departed` that
+  /// ranks it first ([`successor`](RegionalConfiguration::successor)) is adopted and placed under its own
+  /// placement. The version advances, so every node learns that those objects no longer need `departed`'s
+  /// cohort, and the retirement is dropped once every survivor that owes a confirmation has given one. A
+  /// confirmation from a non-member, from a host that owes none, or already recorded changes nothing. Returns
+  /// whether the configuration changed.
+  pub fn confirm(&mut self, departed: HostId, successor: HostId) -> bool {
+    if !self.owes_confirmation(departed, successor) {
+      return false;
+    }
+    let Some(retirement) = self.retired.get_mut(&departed) else {
+      return false;
+    };
+    let position = retirement
+      .confirmed
+      .partition_point(|host| host.0 < successor.0);
+    retirement.confirmed.insert(position, successor);
+    self.version = self.version.saturating_add(1);
+    self.prune_retirements();
+    true
+  }
+
+  /// Whether `host` still owes a confirmation of its share of `departed`'s takeover: `departed` is retired,
+  /// `host` is a member other than `departed` among the hosts its objects are recovered through
+  /// ([`recovery_hosts`](RegionalConfiguration::recovery_hosts)), and `host` has not confirmed yet.
+  pub fn owes_confirmation(&self, departed: HostId, host: HostId) -> bool {
+    host != departed
+      && self.members.contains(&host)
+      && self
+        .retired
+        .get(&departed)
+        .is_some_and(|retirement| !retirement.confirmed.contains(&host))
+      && self.recovery_hosts(departed).contains(&host)
+  }
+
+  /// The retired owners whose settled cohorts `departed`'s objects are recovered through: `departed` itself
+  /// and, transitively, every retired host whose takeover it had not confirmed its share of when it retired —
+  /// an object it was taking over from one of them may not have been re-committed under it, so it is still
+  /// held only by that host's cohort. In id order; empty if `departed` has no retirement kept.
+  pub fn recovery_owners(&self, departed: HostId) -> Vec<HostId> {
+    let mut owners: Vec<HostId> = Vec::new();
+    let mut frontier = vec![departed];
+    while let Some(owner) = frontier.pop() {
+      if owners.contains(&owner) {
+        continue;
+      }
+      let Some(retirement) = self.retired.get(&owner) else {
+        continue;
+      };
+      owners.push(owner);
+      frontier.extend(retirement.unconfirmed.iter().copied());
+    }
+    owners.sort_unstable_by_key(|host| host.0);
+    owners
+  }
+
+  /// Every host of the settled neighbourhoods `departed`'s objects are recovered through
+  /// ([`recovery_owners`](RegionalConfiguration::recovery_owners)), retired ones included, in id order: the
+  /// hosts that may hold a record of them, and among whose members a takeover of them runs its round.
+  pub fn recovery_hosts(&self, departed: HostId) -> Vec<HostId> {
+    let mut hosts: Vec<HostId> = self
+      .recovery_owners(departed)
+      .iter()
+      .filter_map(|owner| self.retired.get(owner))
+      .flat_map(|retirement| retirement.settled.hosts.iter().copied())
+      .collect();
+    hosts.sort_unstable_by_key(|host| host.0);
+    hosts.dedup();
+    hosts
+  }
+
+  /// The cohorts `object` of the retired `departed` is recovered through: for each of its recovery owners, the
+  /// cohort that owner placed `object` on in its settled neighbourhood. A takeover adopts only once `f + 1`
+  /// survivors of **each** have promised, so it meets every record any of them committed. Empty if `departed`
+  /// has no retirement kept.
+  pub fn recovery_cohorts(&self, departed: HostId, object: ObjectId) -> Vec<Vec<HostId>> {
+    self
+      .recovery_owners(departed)
+      .iter()
+      .filter_map(|owner| {
+        self
+          .retired
+          .get(owner)
+          .map(|retirement| retirement.settled.cohort(*owner, object, self.quorum))
+      })
+      .collect()
+  }
+
+  /// The member that takes `object` of the retired `departed` over: the one rendezvous ranks first among the
+  /// members of its recovery cohorts ([`recovery_cohorts`](RegionalConfiguration::recovery_cohorts)). Every
+  /// node computes it from the committed configuration alone, so every node names the same one. `None` if no
+  /// member of those cohorts survives, or `departed` has no retirement kept.
+  pub fn successor(&self, departed: HostId, object: ObjectId) -> Option<HostId> {
+    let mut survivors: Vec<HostId> = self
+      .recovery_cohorts(departed, object)
+      .into_iter()
+      .flatten()
+      .filter(|host| self.members.contains(host))
+      .collect();
+    survivors.sort_unstable_by_key(|host| host.0);
+    survivors.dedup();
+    rendezvous_first(&survivors, object)
+  }
+
+  /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
+  /// only until its survivors confirm their shares, which each does once its round and adoptions finish. With
+  /// `k` retirements outstanding in a region formed at `n ≥ 2f + 1` members, `n − k` remain, and `k ≤ n − k`
+  /// holds for every `k ≤ f`: a region never drops a takeover it can still complete while it has lost no more
+  /// hosts than it tolerates. Past that the oldest goes first. This bounds the map at the order of the
+  /// per-member neighbourhoods and domains while every restart retires an id (banned item 8), and never below
+  /// one, so the newest retirement is always kept.
+  pub fn retirement_bound(&self) -> usize {
+    self.members.len().max(1)
+  }
+
+  /// Drops every retirement whose takeover is done: every survivor that owed a confirmation of it has given
+  /// one or left, and no kept retirement still recovers through it. Repeated to a fixed point, since dropping
+  /// one can release another it held.
+  fn prune_retirements(&mut self) {
+    loop {
+      let done = self.retired.keys().copied().find(|departed| {
+        let referenced = self
+          .retired
+          .values()
+          .any(|retirement| retirement.unconfirmed.contains(departed));
+        !referenced
+          && !self
+            .recovery_hosts(*departed)
+            .iter()
+            .any(|host| self.owes_confirmation(*departed, *host))
+      });
+      match done {
+        Some(departed) => {
+          self.retired.remove(&departed);
+        }
+        None => break,
+      }
+    }
+  }
+
+  /// Keeps at most [`retirement_bound`](RegionalConfiguration::retirement_bound) retirements, dropping the
+  /// oldest (by the version that retired it, the id breaking a tie) beyond it. A takeover whose retirement is
+  /// dropped this way can no longer name its successors, so its objects stay unowned; a node sees the loss as a
+  /// recovery owner that names a retirement no longer kept.
+  fn bound_retirements(&mut self) {
+    while self.retired.len() > self.retirement_bound() {
+      let oldest = self
+        .retired
+        .iter()
+        .min_by_key(|(host, retirement)| (retirement.version, host.0))
+        .map(|(host, _)| *host);
+      match oldest {
+        Some(host) => {
+          self.retired.remove(&host);
+        }
+        None => break,
+      }
+    }
+  }
+
   /// Takes over a dead host (§4.8): bumps its fencing epoch (so its in-flight records are refused as
-  /// `StaleEpoch`), retires it, and refixes the neighbourhoods. The dead host's objects are reassigned by
-  /// rendezvous over the survivors (the routing view), not stored here. Returns the host's new epoch.
+  /// `StaleEpoch`), retires it, and refixes the neighbourhoods. The dead host's objects are not stored here:
+  /// its [`Retirement`] names the cohorts they are recovered through, and every node ranks each object's
+  /// successor from it ([`successor`](RegionalConfiguration::successor)). Returns the host's new epoch.
   pub fn take_over(&mut self, dead: HostId, scatter: u64) -> HostEpoch {
     let bumped = {
       let epoch = self.epochs.entry(dead).or_insert(FIRST_EPOCH);
@@ -2505,6 +2813,256 @@ mod tests {
       regional.epochs.get(&HostId(2)),
       Some(&bumped),
       "the bumped epoch is kept, so a returning stale host is still fenced"
+    );
+  }
+
+  /// Shape: a region wider than its scatter width, so a membership change moves some neighbourhoods and not
+  /// others (five members, three hosts to a neighbourhood at `f = 1`).
+  fn wide_region() -> (RegionalConfiguration, u64) {
+    let scatter = 3;
+    let regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    (regional, scatter)
+  }
+
+  /// §4.8 "Neighbourhood changes": a neighbourhood keeps the version its host set was fixed at while a change
+  /// leaves that set as it was, and takes the new version when the set moves — so an owner can tell whether its
+  /// neighbourhood moved since the one its records are all placed on.
+  #[test]
+  fn a_neighbourhood_keeps_its_version_until_its_host_set_moves() {
+    let (mut regional, scatter) = wide_region();
+    let owner = HostId(1);
+    let before = regional.neighbourhoods[&owner].clone();
+    let outside = regional
+      .members
+      .iter()
+      .copied()
+      .find(|host| !before.hosts.contains(host))
+      .expect("a five-member region has a host outside a three-host neighbourhood");
+    assert!(regional.retire(outside, scatter));
+    assert_eq!(
+      regional.neighbourhoods[&owner], before,
+      "retiring a host outside the neighbourhood leaves its set and version as they were"
+    );
+    let inside = before
+      .hosts
+      .iter()
+      .copied()
+      .find(|host| *host != owner)
+      .expect("a neighbourhood holds hosts besides its owner");
+    assert!(regional.retire(inside, scatter));
+    let after = &regional.neighbourhoods[&owner];
+    assert_ne!(
+      after.hosts, before.hosts,
+      "retiring a neighbour moves the set"
+    );
+    assert_eq!(
+      after.generation, regional.version,
+      "a moved set takes the version that moved it"
+    );
+  }
+
+  /// §4.8 "Neighbourhood changes" (Vertical Paxos II): a formed region and an admitted member own nothing, so
+  /// their first neighbourhoods are settled at once.
+  #[test]
+  fn a_formed_or_admitted_member_starts_settled() {
+    let (mut regional, scatter) = wide_region();
+    for (owner, neighbourhood) in &regional.neighbourhoods {
+      assert_eq!(
+        regional.settled[owner].hosts, neighbourhood.hosts,
+        "a formed member's first neighbourhood is settled"
+      );
+    }
+    let joiner = HostId(6);
+    assert!(regional.admit(joiner, None, scatter));
+    assert_eq!(
+      regional.settled[&joiner].hosts, regional.neighbourhoods[&joiner].hosts,
+      "an admitted member owns nothing, so its first neighbourhood is settled"
+    );
+  }
+
+  /// §4.8 "Neighbourhood changes" (Vertical Paxos II): a member whose neighbourhood an admission moved keeps its
+  /// settled set until it reports the new one placed, and only a report of its current neighbourhood's version
+  /// moves it, once.
+  #[test]
+  fn a_settled_neighbourhood_moves_only_on_its_owners_report_of_the_current_set() {
+    let (mut regional, scatter) = wide_region();
+    let joiner = HostId(6);
+    assert!(regional.admit(joiner, None, scatter));
+    let moved = regional
+      .members
+      .iter()
+      .copied()
+      .find(|owner| regional.neighbourhoods[owner].hosts.contains(&joiner) && *owner != joiner)
+      .expect("the joiner entered some neighbourhood");
+    let current = regional.neighbourhoods[&moved].generation;
+    assert_ne!(
+      regional.settled[&moved].generation, current,
+      "the neighbourhood the joiner entered is not settled until its owner reports it"
+    );
+    let version = regional.version;
+    assert!(
+      !regional.settle(moved, current - 1),
+      "a report of a set that has moved on since changes nothing"
+    );
+    assert!(
+      regional.settle(moved, current),
+      "the owner's report settles it"
+    );
+    assert_eq!(
+      regional.settled[&moved].hosts,
+      regional.neighbourhoods[&moved].hosts
+    );
+    assert_eq!(
+      regional.version,
+      version + 1,
+      "every node learns the old set is retired"
+    );
+    assert!(
+      !regional.settle(moved, current),
+      "a repeated report changes nothing"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover": a retirement records the owner's **settled** neighbourhood, not the one a
+  /// change in flight moved it to, since the owner's records are all placed only on the settled one; every node
+  /// then names the same successor for each object from the configuration alone, never a retired host.
+  #[test]
+  fn a_retirement_recovers_through_the_settled_neighbourhood_and_names_one_successor() {
+    let (mut regional, scatter) = wide_region();
+    let owner = HostId(1);
+    let joiner = HostId(6);
+    assert!(regional.admit(joiner, None, scatter));
+    let settled = regional.settled[&owner].clone();
+    regional.take_over(owner, scatter);
+    let retirement = &regional.retired[&owner];
+    assert_eq!(
+      retirement.settled, settled,
+      "the settled set is what the owner's records are on"
+    );
+    assert_eq!(retirement.version, regional.version);
+    assert!(retirement.confirmed.is_empty() && retirement.unconfirmed.is_empty());
+    let object = ObjectId::new(owner, 7);
+    let cohorts = regional.recovery_cohorts(owner, object);
+    assert_eq!(
+      cohorts,
+      vec![settled.cohort(owner, object, regional.quorum)],
+      "one cohort: the one the owner placed the object on"
+    );
+    let successor = regional
+      .successor(owner, object)
+      .expect("the cohort has survivors");
+    assert!(
+      cohorts[0].contains(&successor) && regional.members.contains(&successor),
+      "the successor is a surviving member of the cohort"
+    );
+    let decoded = regional.clone();
+    assert_eq!(
+      decoded.successor(owner, object),
+      Some(successor),
+      "the successor is a function of the configuration alone"
+    );
+  }
+
+  /// §4.8 "only then serves under confirmed authority": a retirement is kept until every surviving host of its
+  /// recovery neighbourhoods has confirmed its share, and dropped with the last confirmation; a confirmation
+  /// from a host that owes none changes nothing.
+  #[test]
+  fn a_retirement_is_dropped_once_every_survivor_confirms_its_share() {
+    let (mut regional, scatter) = wide_region();
+    let departed = HostId(1);
+    regional.take_over(departed, scatter);
+    let owing: Vec<HostId> = regional
+      .recovery_hosts(departed)
+      .into_iter()
+      .filter(|host| regional.owes_confirmation(departed, *host))
+      .collect();
+    assert!(
+      !owing.is_empty(),
+      "the departed host's neighbours owe confirmations"
+    );
+    assert!(
+      !regional.confirm(departed, departed),
+      "the departed host owes nothing"
+    );
+    let (last, first) = owing.split_last().expect("some host owes");
+    for host in first {
+      assert!(regional.confirm(departed, *host));
+      assert!(
+        regional.retired.contains_key(&departed),
+        "kept while a survivor owes"
+      );
+    }
+    assert!(regional.confirm(departed, *last));
+    assert!(
+      !regional.retired.contains_key(&departed),
+      "dropped with the last confirmation"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover", repeated: a survivor that retires before confirming its share of an earlier
+  /// takeover carries that takeover into its own — its objects are recovered jointly through both settled
+  /// cohorts, since one it was taking over may not have been re-committed under it — and the earlier retirement
+  /// is kept while the later one recovers through it.
+  #[test]
+  fn a_survivor_retiring_unconfirmed_carries_the_earlier_takeover_into_its_own() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    regional.take_over(first, scatter);
+    let second = regional
+      .recovery_hosts(first)
+      .into_iter()
+      .find(|host| regional.owes_confirmation(first, *host))
+      .expect("a survivor owes a confirmation");
+    regional.take_over(second, scatter);
+    assert_eq!(regional.retired[&second].unconfirmed, vec![first]);
+    let mut owners = vec![first, second];
+    owners.sort_unstable_by_key(|host| host.0);
+    assert_eq!(regional.recovery_owners(second), owners);
+    let object = ObjectId::new(second, 3);
+    assert_eq!(
+      regional.recovery_cohorts(second, object).len(),
+      2,
+      "recovered through both cohorts"
+    );
+    for host in regional.recovery_hosts(first) {
+      regional.confirm(first, host);
+    }
+    assert!(
+      regional.retired.contains_key(&first),
+      "kept while the later retirement recovers through it"
+    );
+    for host in regional.recovery_hosts(second) {
+      regional.confirm(second, host);
+    }
+    assert!(
+      regional.retired.is_empty(),
+      "both dropped once both are confirmed"
+    );
+  }
+
+  /// Banned item 8: retirements nobody confirms stay bounded by the members, the oldest dropped first, however
+  /// many transient members come and go.
+  #[test]
+  fn retirements_stay_bounded_by_the_members() {
+    let (mut regional, scatter) = wide_region();
+    // Shape: far more transient members than the region holds.
+    let transients = 64;
+    for index in 0..transients {
+      let host = HostId(100 + index);
+      assert!(regional.admit(host, None, scatter));
+      assert!(regional.retire(host, scatter));
+      assert!(regional.retired.len() <= regional.retirement_bound());
+    }
+    let newest = HostId(100 + transients - 1);
+    assert!(
+      regional.retired.contains_key(&newest),
+      "the newest retirement is always kept"
     );
   }
 
