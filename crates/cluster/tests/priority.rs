@@ -182,3 +182,110 @@ fn a_returning_central_region_takes_leadership_back() {
   );
   assert!(by_priority.transfers >= SEEDS, "by transfers");
 }
+
+/// What a loss of the leader cost on each seed, among the first `regions` regions: whichever region leads at
+/// `DOWN_FROM_NS` is cut off for `DOWN_FOR_NS`. Per seed: milliseconds from the loss to a successor, the
+/// campaigns begun in between, the successor's region and its quorum round trip, and the proposal stream's
+/// longest gap.
+fn leader_loss(
+  regions: usize,
+  seeds: u64,
+  order: ElectionOrder,
+) -> Vec<(u64, usize, &'static str, u64, u64)> {
+  (0..seeds)
+    .map(|seed| {
+      let hosts = placement(regions, seed);
+      let outcome = run(Scenario {
+        voters: u64::try_from(regions).unwrap(),
+        profile: profile(&hosts, JITTER_NS, 0),
+        faults: vec![Fault::IsolateLeader {
+          from_ns: DOWN_FROM_NS,
+          until_ns: DOWN_FROM_NS + DOWN_FOR_NS,
+        }],
+        duration_ns: DURATION_NS,
+        propose_every_ns: PROPOSE_EVERY_NS,
+        propose_from_ns: PROPOSE_FROM_NS,
+        campaign: Campaign::PreVote,
+        order,
+        seed,
+        window: Window::Bytes(0),
+        proposer: Proposer::Leader,
+        fast_track: false,
+      });
+      let (_, lost) = *outcome.isolated.first().expect("the cut found a leader");
+      let (at, successor, _) = *outcome
+        .leader_events
+        .iter()
+        .find(|(at, node, _)| *at >= DOWN_FROM_NS && *node != lost)
+        .expect("a successor");
+      let campaigns = outcome
+        .campaign_events
+        .iter()
+        .filter(|(when, node)| *when >= DOWN_FROM_NS && *when <= at && *node != lost)
+        .count();
+      let region = hosts.iter().position(|host| *host == successor).unwrap();
+      (
+        (at - DOWN_FROM_NS) / MS,
+        campaigns,
+        REGIONS[region],
+        quorum_round_trip_ms(region, regions),
+        outcome.longest_gap_ns / MS,
+      )
+    })
+    .collect()
+}
+
+/// §3.4 with thesis §4.2.3 (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`): among
+/// three regions, when the leader — East US, by priority — is lost, the most central survivor, West Europe,
+/// succeeds it on every seed at its first campaign, within an election timeout: Japan East, which it
+/// outranks, yields its own timeout and grants its pre-vote. Before the fix Japan East, holding its lost
+/// leader's lease until its own campaign, refused it and was elected instead a timeout later, on 195 seeds
+/// of 200 (6,766 ms median; 3,322 ms since, measured 2026-09-29, `docs/wip/BENCHMARKS.md`).
+#[test]
+fn a_lost_leader_passes_to_the_most_central_survivor() {
+  let losses = leader_loss(3, SEEDS, ElectionOrder::ByPriority);
+  eprintln!("(ms, campaigns, region, quorum ms, gap ms) per seed: {losses:?}");
+  for (seed, loss) in losses.iter().enumerate() {
+    assert_eq!(loss.2, "West Europe", "seed {seed}: {loss:?}");
+    assert_eq!(loss.1, 1, "seed {seed}: at its first campaign: {loss:?}");
+  }
+}
+
+/// The 50th, 90th and 99th percentiles and the maximum of `values` (non-empty).
+fn spread_of(values: &mut [u64]) -> [u64; 4] {
+  values.sort_unstable();
+  let at = |p: usize| values[p * (values.len() - 1) / 100];
+  [at(50), at(90), at(99), values[values.len() - 1]]
+}
+
+/// A measurement tool: [`leader_loss`] under both orders, among three and five regions, over
+/// `SLATES_LEADER_LOSS_SEEDS` seeds (twenty without it).
+#[test]
+#[ignore = "a measurement tool, run by hand"]
+fn a_leader_loss_measured() {
+  let seeds = std::env::var("SLATES_LEADER_LOSS_SEEDS")
+    .ok()
+    .and_then(|seeds| seeds.parse::<u64>().ok())
+    .unwrap_or(SEEDS);
+  for regions in [3, 5] {
+    for (name, order) in [
+      ("by priority", ElectionOrder::ByPriority),
+      ("by timeout", ElectionOrder::ByTimeout),
+    ] {
+      let losses = leader_loss(regions, seeds, order);
+      let mut successor_ms: Vec<u64> = losses.iter().map(|loss| loss.0).collect();
+      let mut gaps: Vec<u64> = losses.iter().map(|loss| loss.4).collect();
+      let campaigns: usize = losses.iter().map(|loss| loss.1).sum();
+      let mut successors: BTreeMap<&str, u64> = BTreeMap::new();
+      for loss in &losses {
+        *successors.entry(loss.2).or_default() += 1;
+      }
+      eprintln!(
+        "{regions} regions {name}: successor ms p50/p90/p99/max {:?}; longest gap ms {:?}; campaigns {campaigns} \
+         over {seeds} seeds; successors {successors:?}",
+        spread_of(&mut successor_ms),
+        spread_of(&mut gaps),
+      );
+    }
+  }
+}

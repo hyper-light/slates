@@ -88,7 +88,7 @@ use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{Delivery, ProbeOutcome, SwimMessage, deliver_once, probe_once};
 use slates_cluster::timing::{
-  ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, quorum_priority, round_budget,
+  ElectionTimer, ElectionTiming, FollowerStep, PathRtt, RoundAnchors, quorum_priority, round_budget,
 };
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, TimedReply, broadcast,
@@ -4978,14 +4978,21 @@ async fn drive_config_council(
     return;
   }
   // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
-  // jittered timeout under this period's derived timing and campaigns there.
-  if timer.follower_period(contact, &timing, local, rank) {
-    drive_council_election(&others, budget, in_flight).await;
-    // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
-    // makes this node leader next period; a lost one waits out the timer again.
-    if let Some(contact) = state::with_state(|s| s.council.leader_contact()) {
-      timer.rebaseline(contact);
+  // jittered timeout under this period's derived timing and campaigns there. Silent past the minimum
+  // election timeout, it forgets its leader so the voter it yields to wins its pre-vote (thesis §4.2.3).
+  match timer.follower_period(contact, &timing, local, rank) {
+    FollowerStep::Campaign => {
+      drive_council_election(&others, budget, in_flight).await;
+      // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
+      // makes this node leader next period; a lost one waits out the timer again.
+      if let Some(contact) = state::with_state(|s| s.council.leader_contact()) {
+        timer.rebaseline(contact);
+      }
     }
+    FollowerStep::LeaderLapsed => {
+      let _ = state::with_state(|s| s.council.forget_leader());
+    }
+    FollowerStep::Follow => {}
   }
 }
 
@@ -5117,12 +5124,19 @@ async fn drive_root_group(
     return;
   }
   // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
-  // jittered timeout under this period's derived timing and campaigns there.
-  if timer.follower_period(contact, &timing, local, rank) {
-    drive_root_election(&others, budget, in_flight).await;
-    if let Some(contact) = state::with_state(|s| s.root.leader_contact()) {
-      timer.rebaseline(contact);
+  // jittered timeout under this period's derived timing and campaigns there. Silent past the minimum
+  // election timeout, it forgets its leader so the voter it yields to wins its pre-vote (thesis §4.2.3).
+  match timer.follower_period(contact, &timing, local, rank) {
+    FollowerStep::Campaign => {
+      drive_root_election(&others, budget, in_flight).await;
+      if let Some(contact) = state::with_state(|s| s.root.leader_contact()) {
+        timer.rebaseline(contact);
+      }
     }
+    FollowerStep::LeaderLapsed => {
+      let _ = state::with_state(|s| s.root.forget_leader());
+    }
+    FollowerStep::Follow => {}
   }
 }
 

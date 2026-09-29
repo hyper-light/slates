@@ -265,13 +265,31 @@ fn periods_of(span_ns: u64, heartbeat_ns: u64) -> u32 {
   u32::try_from(periods).unwrap_or(u32::MAX)
 }
 
+/// What a follower's period asks of its node ([`ElectionTimer::follower_period`]).
+#[must_use = "a lapsed leader must be forgotten and a campaign run, or the group elects late"]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FollowerStep {
+  /// A leader made contact within the minimum election timeout: keep following.
+  Follow,
+  /// No leader contact for the minimum election timeout — the base, `ElectionTiming::base_periods`
+  /// (thesis §4.2.3: a server refuses a vote only "within the minimum election timeout of hearing from a
+  /// current leader"). The node forgets its leader (`RaftNode::forget_leader`), so it grants a candidate's
+  /// pre-vote, but does not campaign: its own jittered timeout has not come, or it yields it to a voter that
+  /// outranks it (§3.4).
+  LeaderLapsed,
+  /// Campaign now (`RaftNode::on_election_timeout`, which forgets the leader too).
+  Campaign,
+}
+
 /// A group's election timer as its coordinator counts it — one tick per period, persisting across periods:
-/// the follower's age since leader contact, the last contact value it saw, its jitter rotation, and the
-/// timeouts it has yielded to more central voters (`docs/wip/research/consensus-enhancements.md` §3.4). The
-/// daemon's council and root group each own one; the fabric harness drives the same type.
+/// the follower's age since leader contact (reset at each of its own timeouts) and its silence (not reset
+/// there), the last contact value it saw, its jitter rotation, and the timeouts it has yielded to more
+/// central voters (`docs/wip/research/consensus-enhancements.md` §3.4). The daemon's council and root group
+/// each own one; the fabric harness drives the same type.
 #[derive(Debug, Default)]
 pub struct ElectionTimer {
   idle_periods: u32,
+  silent_periods: u32,
   seen_contact: u64,
   attempt: u32,
   yielded: u32,
@@ -284,39 +302,52 @@ impl ElectionTimer {
   }
 
   /// A **follower's** period. `contact` is the group's leader-contact count (Raft Figure 2's two follower
-  /// timer-resets: a leader's append answered, a vote granted); while it advances the age resets, the
-  /// yielded timeouts clear, and no campaign runs. Otherwise the timer ages one period and, once at this
-  /// node's jittered timeout under `timing` ([`ElectionTiming::timeout_periods`]), rotates the attempt and
-  /// resets the age — and returns `true`, campaign now, when this node's election `rank` (how many live
-  /// voters outrank it, `RaftNode::election_rank`) is within the timeouts it has already yielded since it
-  /// last heard a leader. Otherwise it yields this timeout to the more central voters and admits the next
-  /// rank (SOFAJRaft's decaying target priority, in ranks): an election waits at most one timeout per live
-  /// voter that outranks this one, and none when the best live voter is up. Rank zero — no measurements, or
-  /// nothing outranks this node — campaigns at every timeout, exactly as without priorities.
+  /// timer-resets: a leader's append answered, a vote granted); while it advances the age and the silence
+  /// reset, the yielded timeouts clear, and the node follows. Otherwise the timer ages one period and, once
+  /// at this node's jittered timeout under `timing` ([`ElectionTiming::timeout_periods`]), rotates the
+  /// attempt and resets the age — and campaigns ([`FollowerStep::Campaign`]) when this node's election `rank`
+  /// (how many live voters outrank it, `RaftNode::election_rank`) is within the timeouts it has already
+  /// yielded since it last heard a leader. Otherwise it yields this timeout to the more central voters and
+  /// admits the next rank (SOFAJRaft's decaying target priority, in ranks): an election waits at most one
+  /// timeout per live voter that outranks this one, and none when the best live voter is up. Rank zero — no
+  /// measurements, or nothing outranks this node — campaigns at every timeout, exactly as without
+  /// priorities.
+  ///
+  /// Short of a campaign, a node silent for the minimum election timeout has lost its leader's lease
+  /// ([`FollowerStep::LeaderLapsed`]), whatever its own jitter and rank: the voter a yielding node yields to
+  /// must win its pre-vote. Until 2026-09-29 the lease lasted until the node's own campaign, so a node that
+  /// yielded refused the pre-vote of the voter it yielded to, and a lost leader cost one campaign per voter
+  /// outranking the winner — who was then the least central, not the most
+  /// (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`).
   pub fn follower_period(
     &mut self,
     contact: u64,
     timing: &ElectionTiming,
     local: HostId,
     rank: usize,
-  ) -> bool {
+  ) -> FollowerStep {
     if contact != self.seen_contact {
       self.seen_contact = contact;
       self.idle_periods = 0;
+      self.silent_periods = 0;
       self.yielded = 0;
-      return false;
+      return FollowerStep::Follow;
     }
     self.idle_periods = self.idle_periods.saturating_add(1);
-    if self.idle_periods < timing.timeout_periods(local, self.attempt) {
-      return false;
-    }
-    self.attempt = self.attempt.saturating_add(1);
-    self.idle_periods = 0;
-    if u32::try_from(rank).unwrap_or(u32::MAX) > self.yielded {
+    self.silent_periods = self.silent_periods.saturating_add(1);
+    if self.idle_periods >= timing.timeout_periods(local, self.attempt) {
+      self.attempt = self.attempt.saturating_add(1);
+      self.idle_periods = 0;
+      if u32::try_from(rank).unwrap_or(u32::MAX) <= self.yielded {
+        return FollowerStep::Campaign;
+      }
       self.yielded = self.yielded.saturating_add(1);
-      return false;
     }
-    true
+    if self.silent_periods >= timing.base_periods {
+      FollowerStep::LeaderLapsed
+    } else {
+      FollowerStep::Follow
+    }
   }
 
   /// The timeouts this follower has yielded to more central voters since it last heard a leader.
@@ -325,8 +356,10 @@ impl ElectionTimer {
   }
 
   /// A **leader's** period: ages one period and returns `true` every `base_periods` — judge the quorum now
-  /// (Raft §6.2 CheckQuorum on the election-timeout cadence) — resetting the age.
+  /// (Raft §6.2 CheckQuorum on the election-timeout cadence) — resetting the age. A leader is its own
+  /// contact, so its silence as a follower starts over.
   pub fn leader_period(&mut self, timing: &ElectionTiming) -> bool {
+    self.silent_periods = 0;
     self.idle_periods = self.idle_periods.saturating_add(1);
     if self.idle_periods < timing.base_periods.max(1) {
       return false;
@@ -335,9 +368,11 @@ impl ElectionTimer {
     true
   }
 
-  /// Resets the age — the sole voter's period (it self-elects with no messages), or a role change.
+  /// Resets the age and the silence — the sole voter's period (it self-elects with no messages), or a role
+  /// change.
   pub fn reset(&mut self) {
     self.idle_periods = 0;
+    self.silent_periods = 0;
   }
 
   /// Re-baselines the contact after a campaign, so the campaign's own vote and append echoes do not
@@ -559,7 +594,7 @@ mod tests {
     local: HostId,
     periods: u32,
   ) -> bool {
-    (0..periods).all(|_| !timer.follower_period(contact, timing, local, 0))
+    (0..periods).all(|_| timer.follower_period(contact, timing, local, 0) != FollowerStep::Campaign)
   }
 
   /// A follower campaigns once it has aged past its jittered timeout with no leader contact — the base and
@@ -575,8 +610,9 @@ mod tests {
       ages_without_firing(&mut timer, 0, &timing, local, timeout - 1),
       "inside the timeout nothing fires"
     );
-    assert!(
+    assert_eq!(
       timer.follower_period(0, &timing, local, 0),
+      FollowerStep::Campaign,
       "the timeout's own period fires"
     );
     assert_eq!(timer.attempts(), 1);
@@ -597,13 +633,15 @@ mod tests {
       local,
       first - 1
     ));
-    assert!(
+    assert_eq!(
       timer.follower_period(0, &timing, local, 0),
+      FollowerStep::Campaign,
       "the first campaign"
     );
     assert!(ages_without_firing(&mut timer, 0, &timing, local, 5));
-    assert!(
-      !timer.follower_period(1, &timing, local, 0),
+    assert_eq!(
+      timer.follower_period(1, &timing, local, 0),
+      FollowerStep::Follow,
       "contact advanced: reset"
     );
     assert_eq!(timer.idle_periods(), 0);
@@ -615,8 +653,9 @@ mod tests {
       local,
       second - 1
     ));
-    assert!(
+    assert_eq!(
       timer.follower_period(1, &timing, local, 0),
+      FollowerStep::Campaign,
       "the second attempt's timeout fires"
     );
   }
@@ -723,7 +762,7 @@ mod tests {
       let mut periods = 0;
       loop {
         periods += 1;
-        let campaign = timer.follower_period(0, &timing, local, 2);
+        let campaign = timer.follower_period(0, &timing, local, 2) == FollowerStep::Campaign;
         if campaign || timer.idle_periods() == 0 {
           fired.push(campaign);
           break;
@@ -736,14 +775,58 @@ mod tests {
       vec![false, false, true],
       "two yields, then a campaign"
     );
-    assert!(!timer.follower_period(1, &timing, local, 2), "contact");
+    assert_eq!(
+      timer.follower_period(1, &timing, local, 2),
+      FollowerStep::Follow,
+      "contact"
+    );
     assert_eq!(timer.yielded(), 0, "contact clears the yields");
     let mut rank_zero = ElectionTimer::new();
     let mut periods = 0;
-    while !rank_zero.follower_period(0, &timing, local, 0) {
+    while rank_zero.follower_period(0, &timing, local, 0) != FollowerStep::Campaign {
       periods += 1;
       assert!(periods < 1_000, "rank zero campaigns at its first timeout");
     }
+  }
+
+  /// Thesis §4.2.3: a follower silent for the minimum election timeout has lost its leader's lease — at the
+  /// base, whatever its jitter, and every period after while it yields to voters that outrank it — and any
+  /// contact restores it. Rank two at the floor: nothing before the base, the lapse at it, and the yields that
+  /// follow never hide the lapse; a campaign comes only at the third timeout.
+  #[test]
+  fn a_followers_lease_lapses_at_the_minimum_election_timeout() {
+    let timing = ElectionTiming::floor();
+    let local = HostId(9);
+    let mut timer = ElectionTimer::new();
+    let steps: Vec<FollowerStep> = (1..=timing.base_periods)
+      .map(|_| timer.follower_period(0, &timing, local, 2))
+      .collect();
+    let (last, before) = steps.split_last().unwrap();
+    assert!(
+      before.iter().all(|step| *step == FollowerStep::Follow),
+      "inside the base the leader holds its lease: {before:?}"
+    );
+    assert_eq!(*last, FollowerStep::LeaderLapsed, "at the base it lapses");
+    let mut periods = timing.base_periods;
+    loop {
+      periods += 1;
+      match timer.follower_period(0, &timing, local, 2) {
+        FollowerStep::Campaign => break,
+        step => assert_eq!(step, FollowerStep::LeaderLapsed, "period {periods}"),
+      }
+      assert!(periods < 1_000, "a campaign comes");
+    }
+    assert_eq!(timer.yielded(), 2, "after two yields");
+    assert_eq!(
+      timer.follower_period(1, &timing, local, 2),
+      FollowerStep::Follow,
+      "contact restores the lease"
+    );
+    assert_eq!(
+      timer.follower_period(1, &timing, local, 2),
+      FollowerStep::Follow,
+      "and the silence starts over"
+    );
   }
 
   /// §3.4's measure: the quorum round trip is the `⌊n/2⌋`-th smallest measured path to the other voters,

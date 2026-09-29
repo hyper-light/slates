@@ -53,6 +53,13 @@ leader; a symmetric partition heals without a disruptive election; and the pre-v
 interplay (a leader stepping down under CheckQuorum must not leave every peer refusing pre-votes forever:
 the refusal window is the minimum election timeout, never longer).
 
+**Corrected 2026-09-29 (slice 14).** The code held the refusal window longer than this: a follower forgot its
+leader only at its own campaign, so for its own jittered timeout, and a voter yielding its timeout to a more
+central one (§3.4) refused that voter's pre-vote. The timer now reports the lapse at the minimum election
+timeout (`FollowerStep::LeaderLapsed`), and the drive calls `forget_leader`. In a three-region group the
+outranked region had won 195 losses of 200, a timeout late
+(`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`).
+
 ### 3.2 Leader transfer (thesis §3.10)
 The leader stops accepting new proposals, brings the target's log up to date, then sends `TimeoutNow`;
 the target starts an election at once, skipping pre-vote (it was invited), and wins because its log is
@@ -93,6 +100,15 @@ averages 160 ms; the East US leader gives 117. With three regions (East US, West
   its rank is within the timeouts it has yielded since it last heard a leader. Otherwise it yields this one,
   and each yield admits the next rank. So an election waits at most one timeout per more-central live voter,
   and none when the best live voter is up.
+  - A yielding voter must grant the pre-vote of the voter it yields to. Until 2026-09-29 it did not (§3.1's
+    correction). Measured with the fix over 200 seeds, the leader cut off: among three regions the most
+    central survivor succeeds on every seed at its first campaign, at a 3,322 ms median, where the outranked
+    one had won 195 of 200 at 6,766 ms.
+  - Ties are left to Raft's randomized retry. Among five regions, three survivors tie within their spread,
+    and 11 losses of 200 split their vote and take about 6.4 s (p99 6,472 ms). Three mitigations were measured
+    and rejected (the bug record): a span of the base, a strict order among tied voters (Ongaro & Ousterhout
+    2014 §5.2 abandoned ranking for the availability cost measured here), and deferring a campaign after
+    granting a pre-vote.
 - **Transfer** (3.2). A leader that has led for a full CheckQuorum window hands off to a caught-up, live
   voter whose interval lies wholly below its own. It does so at most once per leadership that aborts, since
   proposals are refused while a transfer is in flight and a failing target must not cost the group its
@@ -136,6 +152,48 @@ leader, spread leadership and let independent takeovers commit concurrently. Ope
 (a membership change, which every log must observe) go through a designated log with a barrier every
 other log orders itself after. n is derived (not hand-set); at `n = 1` the design is today's single log
 (R8: the laptop and the one-log case are the same code with `n = 1`).
+
+**Built, measured and decided (slice 14; `crates/cluster/src/multilog.rs`).**
+- **The merge.** A command is keyed (it writes one key's state) or global. Keyed commands go to the log their
+  key hashes to; global ones to log 0. Each other log's leader appends a barrier once its replica of log 0
+  commits a global command.
+  - Every replica applies a keyed command in its log's order, in the epoch its log's last barrier opened.
+  - A global command applies only when every other log has reached a barrier naming it, so every entry
+    those logs ordered before it has applied first.
+  - Keyed commands of different logs touch different keys and commute, so every replica reaches one state,
+    whatever order the commits arrive in.
+- **Leaders spread**: log k's preferred voter (the k-th best by quorum round trip) advertises the least
+  measurable priority there, and priority elections and transfers move the log to it.
+- **The premise, corrected.** The council's commands do not partition: Admit, Retire and TakeOver all change
+  the member set, which every placement reads, so every one is global. The root group's `MoveHome` (per
+  volume) and `PromoteRegion` (per region) are keyed; region admission and retirement are global.
+- **Measured** on the five Azure regions (20 seeds, each log's preferred voter crashed for 20 s in turn).
+  With five logs led apart:
+  - A crash of log 0's leader pauses the keyed stream 463 ms, where one log pauses it for its election,
+    4,484 ms.
+  - A crash of any other log's leader stalls every log's keyed commands, 3,713–6,312 ms. Log 0 goes on
+    committing global commands, each waits for the lost log's barrier, and the keyed commands behind every
+    other log's barriers wait for them. So four region losses in five pause everything, where with one log
+    only the leader's region's loss does.
+  - A log that lost its leader pauses its own keyed commands 4,004–6,525 ms, no less than one log's
+    election.
+  - Steady keyed commands are slower, 174 → 302 ms median, since logs are led from less central regions.
+  - Global commands wait for every log's barrier: 199 → 839 ms.
+  - Messages grow fivefold.
+- **Decided: both groups keep one log.**
+  - The council's commands are all global, so more logs only cost.
+  - The root group's failure-path command, a region's promotion, is keyed, but gains nothing in
+    expectation. It is proposed as one of the five regions is lost, each alike. Its log's leader was in the
+    lost region in one case of five, and it waits out that crash's pause of its log's keyed commands;
+    otherwise it commits at the steady median. Averaged over the logs, as measured:
+    - one log: (4,484 + 4 × 174) / 5 ≈ 1,036 ms;
+    - two, three and five logs: 1,333, 1,399 and 1,301 ms.
+  - CI's gate holds the inequality on its own run (2 seeds; 6,813 against 5,809 ms as five times the
+    expectation), with the stall of every other log's crash.
+  - A log per region pays across the WAN on every period. More than one log also needs compaction across
+    logs (owed before any group could run it; GAPS).
+  - The measurement found the lease defect of §3.1: before its fix, one log's pause was 4,615 ms, and a
+    non-designated log's election took 8.7 s on the traced seed.
 
 ### 3.7 Fast Raft
 The fast track: a proposer sends its entry straight to every member; a follower inserts it at the
@@ -673,4 +731,40 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
   - **Decided:** the groups keep the fast track closed (§3.7): their proposals all come from their leader, where
     it only costs.
   - **Next.** MLRaft (§3.6), and the KIND lane's measurement of the groups under a burst.
+- **Slice 14 (2026-09-29): MLRaft — built, verified, measured, and one log kept; its measurement found a voter
+  refusing the voter it yielded to.**
+  - **Built** (`crates/cluster/src/multilog.rs`; §3.6): `n` Raft logs over one voter set, the routing (a keyed
+    command to its key's log, a global one to log 0), the barrier, the merge, and leaders spread by priority.
+    Log `k` prefers the `k`-th best voter by quorum round trip, which advertises the least measurable priority
+    there. At `n = 1` it is the single log.
+  - **Found and fixed on the way:** the preferred voter first advertised a zero round trip. That is the unknown
+    priority, which outranks nothing, so no log ever handed off. The test checks the hand-off itself
+    (`each_log_hands_off_to_its_preferred_voter`), and failed before the fix.
+  - **Verified** (`crates/cluster/tests/multilog.rs`). The explorer drives every node's real logs over one
+    adversarial network: loss, duplication, reordering, partitions, crash-restarts, keyed and global
+    proposals, barriers. It checks each log's Raft safety, and the merge: every node's application is a
+    prefix of one history, across nodes and restarts. That covers each key's commands in order with the
+    epoch each saw, and the global commands in order.
+    - At full scale (200 seeds × 3,000 steps; three voters × three logs, and five × two; 1.40 s in release),
+      with no violation:
+      - keyed commands applied: 99,499 and 62,858;
+      - global commands applied: 18,483 and 13,180;
+      - barriers: 3,398 and 1,142;
+      - crash-restarts: 9,714 and 9,597, with 46,551 and 20,077 restarted replays matched.
+    - A mutation, a global command applied without waiting for the other logs' barriers, is caught at seed
+      0, step 1,072.
+  - **Measured and decided** (§3.6; `crates/cluster/tests/multilog_timed.rs`, whose `n = 1` case measures what
+    the single-log simulation does: 174 against 171 ms). Both groups keep one log. A keyed command proposed as
+    a region is lost expects 1,036 ms with one log, and 1,301–1,399 ms with two, three or five. A crash of any
+    non-designated log's leader stalls every log's keyed commands.
+  - **Found and fixed: a yielding voter refused the voter it yielded to** (§3.1, §3.4). In a five-log group, a
+    crash of log 1's leader took 8.7 s to elect a successor. The trace showed the most central survivor
+    refused by every voter: each was yielding its own timeout to it and still held its lost leader's lease.
+    - The lease now lapses at the minimum election timeout, as thesis §4.2.3 sets.
+    - Three regions, 200 seeds: the most central survivor succeeds on every seed at its first campaign
+      (3,322 ms median), where the outranked region had won 195 at 6,766 ms.
+    - Five regions: the median falls from 4,430 to 4,158 ms. Ties then split 11 losses in 200 (p99 4,828 →
+      6,472 ms), which the bug had serialized. Three mitigations were measured and rejected (the bug record).
+    - The daemon's fleet suite passes 53 of 53.
+  - **Next.** The KIND lane's measurement of the groups under a burst.
 

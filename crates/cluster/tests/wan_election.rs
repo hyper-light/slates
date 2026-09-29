@@ -25,7 +25,9 @@ use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use slates_cluster::config_group::RegionalCouncil;
 use slates_cluster::raft_wire::RaftMessage;
-use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, round_budget};
+use slates_cluster::timing::{
+  ElectionTimer, ElectionTiming, FollowerStep, PathRtt, RoundAnchors, round_budget,
+};
 use slates_cluster::{CommitBudget, Stragglers, TimedReply, broadcast, request_within};
 use slates_db::register::{HostId, Quorum};
 use slates_rt::futures::{now_ns, sleep};
@@ -647,10 +649,16 @@ async fn follow_or_campaign(
     });
     return;
   }
-  if !with_node(owner, |n| {
+  let step = with_node(owner, |n| {
     n.timer.follower_period(contact, timing, owner, 0)
-  }) {
-    return;
+  });
+  match step {
+    FollowerStep::Follow => return,
+    FollowerStep::LeaderLapsed => {
+      with_node(owner, |n| n.council.forget_leader());
+      return;
+    }
+    FollowerStep::Campaign => {}
   }
   with_node(owner, |n| n.campaigns += 1);
   CAMPAIGN_EVENTS.with(|events| events.borrow_mut().push((now_ns(), owner)));

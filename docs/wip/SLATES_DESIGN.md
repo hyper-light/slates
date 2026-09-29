@@ -2636,7 +2636,7 @@ reconnaissance because the touched partitions are named up front).
 > loopback: a council handoff of 0.103 s (median of five) against a leader-loss election of 1.316 s under a
 > 1 s election timeout; a root handoff across three regions of 0.093 s. Its first user is the **graceful
 > drain** (§2.6 status): a stopping daemon hands off what it leads first. Priority placement and multi-log
-> balancing are the next users.
+> balancing are the next users (both built since; multi-log is measured and left at one log, below).
 
 > **Consensus log compaction and bounded replication (2026-09-28;
 > `docs/wip/research/consensus-enhancements.md`, slice 5).** Until this change neither group compacted: every
@@ -2687,6 +2687,14 @@ reconnaissance because the touched partitions are named up front).
 > Overlapping intervals tie, so a single host, or an unmeasured group, behaves exactly as before. Across
 > Microsoft's published five-region matrix, the fastest-committing region leads every seed, where the first
 > timeout picked it on 14 of 20, and takes leadership back after an outage.
+>
+> **Corrected 2026-09-29 (slice 14).** A yielding voter held its lost leader's lease until its own campaign,
+> so it refused the pre-vote of the voter it yielded to. The timer now reports the lapse at the minimum
+> election timeout (thesis §4.2.3; `FollowerStep::LeaderLapsed`), and each drive forgets the leader there.
+> Among three regions the most central survivor now succeeds every leader loss at its first campaign
+> (3,322 ms median over 200 seeds), where the outranked region had won 195 of 200 at 6,766 ms. Ties among
+> equally central voters are left to Raft's randomized retry, after three mitigations were measured and
+> rejected (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`).
 
 > **The fast track's recovery, verified before it is built (2026-09-28; `docs/wip/research/
 > consensus-enhancements.md`, slice 8).** Parallel replication and the fast track let a follower hold slots
@@ -2725,8 +2733,15 @@ reconnaissance because the touched partitions are named up front).
 > in every measured case. The fast track's crossover is measured (research record §3.7). It pays up to 37 % for
 > a proposer far from the leader below 4 % loss, costs a proposer beside the leader (a fast quorum is larger),
 > and costs every proposer at 10 % loss. Both groups propose only at their leader, so both keep it closed. A
-> leader fills an index lost votes stalled its fast track at, so the track stays live under loss. Owed: MLRaft
-> (§3.6).
+> leader fills an index lost votes stalled its fast track at, so the track stays live under loss.
+>
+> **MLRaft (2026-09-29, slice 14; research record §3.6).** `n` Raft logs over one voter set, merged into one
+> application order by barriers after the designated log's global commands, leaders spread by priority, are
+> built (`slates_cluster::multilog`). The explorer holds per-log safety and the merge at full scale in CI.
+> Measured across five regions, a keyed command proposed as a region is lost expects 1,036 ms with one log
+> and 1,301–1,399 ms with more. With more than one log, a crash of any non-designated log's leader stalls
+> every log's keyed commands. The council's commands are all global, so both groups keep one log; compaction
+> across logs is owed before any group could run more.
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,

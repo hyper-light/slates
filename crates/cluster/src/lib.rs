@@ -40,6 +40,7 @@ pub mod fleet;
 mod fold;
 mod gossip;
 pub mod membership;
+pub mod multilog;
 pub mod progress;
 pub mod raft;
 pub mod raft_wire;

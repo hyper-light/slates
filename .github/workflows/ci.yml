@@ -61,6 +61,8 @@ jobs:
       # which a bare `--ignored` swept in (CI run 36511884967).
       - name: T-8.13 Raft safety explorer at full scale
         run: cargo test -p slates-cluster --release --test explore -- --ignored --exact the_dialect_keeps_raft_safety_at_full_scale
+      - name: The multi-log explorer at full scale (MLRaft's merge, research record §3.6)
+        run: cargo test -p slates-cluster --release --test multilog -- --ignored --exact the_multi_log_merges_alike_at_full_scale
       # By exact name, one at a time: each search spreads over every core and holds up to 4 GiB, and the file's
       # third ignored test is a measurement tool.
       - name: The slot model's exhaustive searches (the fast track's recovery, research record §3.7 and §4)

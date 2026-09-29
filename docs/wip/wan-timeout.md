@@ -175,3 +175,12 @@ loss.
 - The coordinator serializes its rounds within a period (council, root, then each shard's ships); on a far
   path a period grows by one round trip per sequential round. Not a defect of the timing law (the timer
   counts periods), but a latency the KIND lane will see on `fleet_progress`.
+
+## 8. Re-run 2026-09-29: the pre-vote's lease
+
+The killed-leader row above (6.37 s, after one split) is 2026-09-14's. On `462b63d` the same test elects the
+second candidate at 3.25 s after the death: the first, node 1 at 17.45 s, was refused by node 3, which still
+held its dead leader's lease until its own campaign at 17.61 s. With the lease lapsing at the minimum election
+timeout (thesis §4.2.3), node 1's first campaign wins, at 3.05 s. The GEO-class row is unchanged by it (its
+first leader at 23.1 s on both trees; the 21.3 s above is 2026-09-14's).
+(`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`.)

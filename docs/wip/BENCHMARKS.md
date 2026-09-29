@@ -685,6 +685,10 @@ three voters; heartbeat 100 ms; election timing derived from the modelled round 
 | isolated follower, pre-vote: longest commit gap | 100 ms (the proposal cadence) | 168–284 ms |
 | isolated leader: successor elected after | 1.42–1.59 s | 3.0–3.6 s (one seed 8.3 s) |
 | isolated leader, before the jitter fix | — | 3.0–3.4 s typically; 12.0, 19.3 and 19.9 s on three seeds |
+| isolated leader, after the lease fix (2026-09-29) | 1.24–1.39 s | 2.80–3.25 s (one seed 8.3 s: two tied survivors split) |
+
+Re-run 2026-09-29 after the lease fix (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`):
+every other row is unchanged except the multi-region pre-vote commit gap, 168–281 ms.
 
 ### Consensus log compaction and bounded replication (2026-09-28)
 
@@ -752,6 +756,9 @@ hosts by a seed-dependent permutation).
 
 About half a 100 ms period of every commit latency is the drive's cadence: a proposal waits for the next
 period before it is replicated.
+
+Re-run 2026-09-29 after the lease fix: every row is unchanged but the outage's. By priority, East US 20 with 26
+transfers (201 ms); by first timeout, Brazil South 2, Japan East 6, Southeast Asia 5, West Europe 7 (234 ms).
 
 ### The slot model: exhaustive searches of the fast track's recovery (2026-09-28)
 
@@ -904,6 +911,66 @@ followers acknowledge nothing, each thousand proposals timed. Hardware as above.
 | 4,000 | 12.1 ms | — |
 | 5,000 | 20.0 ms | 96 ns |
 | 10,000 to 50,000 | not reached | 61 ns to 67 ns |
+
+### A leader loss across published inter-region round trips: the lease fix (2026-09-29)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1, rustc 1.98.0, release; deterministic simulation.
+**Command:** `SLATES_LEADER_LOSS_SEEDS=200 cargo test -p slates-cluster --release --test priority -- --ignored
+--exact a_leader_loss_measured --nocapture` (0.4 s). "Before" is the same tool against `HEAD` `462b63d` in a
+scratch export.
+
+**Setup:** the first three or five published Azure regions, 5 ms jitter, a proposal every 50 ms, the leader cut
+off at 20 s for 20 s. Per seed: the time from the loss to a successor, and the campaigns in between.
+
+| Regions, order | Before: successor p50 / p90 / p99 / max, ms | After | Campaigns (before → after) | Successors after |
+|---|---|---|---|---|
+| 3, priority | 6,766 / 6,989 / 12,109 / 12,143 | 3,322 / 3,549 / 3,680 / 6,063 | 562 → 201 | West Europe 200 (before: Japan East 195) |
+| 3, first timeout | 3,529 / 3,620 / 9,410 / 14,809 | 3,085 / 3,371 / 9,410 / 14,809 | 417 → 332 | Japan East 85, West Europe 115 |
+| 5, priority | 4,430 / 4,777 / 4,828 / 8,616 | 4,158 / 4,773 / 6,472 / 7,103 | 602 → 507 | Japan East 111, Southeast Asia 68, West Europe 21 |
+| 5, first timeout | 4,307 / 4,803 / 8,452 / 9,794 | 4,090 / 6,435 / 8,452 / 9,888 | 740 → 640 | Japan East 81, Southeast Asia 53, Brazil South 44, West Europe 13, East US 9 |
+
+The five-region p99 under priority is 11 seeds of 200 near 6.4 s. Each is a split vote among survivors whose
+priorities tie within their spread; the unfixed lease had serialized them, and it had serialized the
+unprioritized control too, whose p90 rises from 4,803 to 6,435 ms.
+
+**Measured and rejected** (the same 200 seeds, after the fix):
+
+| Mitigation | 3 regions, priority | 5 regions, priority | 5 regions, first timeout |
+|---|---|---|---|
+| none (the fix alone) | 3,322 / 3,549 / 3,680 / 6,063 | 4,158 / 4,773 / 6,472 / 7,103 | 4,090 / 6,435 / 8,452 / 9,888 |
+| a span of the base (`[T, 2T]`) | 4,009 / 4,548 / 4,611 / 4,705 | 4,321 / 5,931 / 7,824 / 15,316 | 4,318 / 5,032 / 7,985 / 9,324 |
+| a strict order among tied voters | 3,322 / 3,549 / 3,680 / 6,063 | 4,177 / 7,295 / 7,563 / 7,640 | — |
+| deferring a campaign after granting a pre-vote | 3,321 / 3,544 / 3,612 / 6,063 | 4,408 / 4,807 / 6,529 / 6,681 | 4,186 / 4,629 / 8,368 / 10,855 |
+
+Each loses on the order the daemon runs. The strict order costs a whole yield when the first voter cannot win
+(Ongaro & Ousterhout 2014 §5.2 abandoned ranking for this).
+
+### MLRaft: one to five logs across five regions (2026-09-29)
+
+**Hardware:** as above. **Command:** `SLATES_MULTILOG_SEEDS=20 cargo test -p slates-cluster --release --test
+multilog_timed -- --ignored --exact multi_log_on_the_failure_path --nocapture` (36 s).
+
+**Setup:** the five published regions, 5 ms jitter, `n` logs led apart by priority, a keyed stream of 20
+commands a second over 64 keys and a global stream of two a second, from 10 s for 60 s. The crash runs take
+each log's preferred voter down from 30 s to 50 s in turn. Median over seeds of each seed's median / p99;
+gaps are the longest time without an application.
+
+| Logs | Steady keyed / global, ms | Messages | Log 0's leader crashed: keyed stream gap | Another log's leader crashed: keyed stream gap | A keyed command's expectation as a region is lost |
+|---|---|---|---|---|---|
+| 1 | 174/223 / 199/202 | 107,633 | 4,484 ms | — | 1,036 ms |
+| 2 | 298/737 / 785/790 | 215,310 | 498 ms | 6,295 ms | 1,333 ms |
+| 3 | 301/737 / 786/790 | 322,872 | 428 ms | 6,254–6,354 ms | 1,399 ms |
+| 5 | 302/784 / 839/841 | 538,144 | 463 ms | 3,713–6,312 ms | 1,301 ms |
+
+The expectation averages, over the logs, one fifth of the pause that log's crash leaves its own keyed commands
+and four fifths of the steady median. Both groups keep one log (research record §3.6).
+
+**The explorer** (`cargo test -p slates-cluster --release --test multilog -- --ignored --exact
+the_multi_log_merges_alike_at_full_scale --nocapture`, 1.40 s): 200 seeds × 3,000 steps for three voters × three
+logs and five × two, with no violation. It applied 99,499 and 62,858 keyed commands and 18,483 and 13,180
+global ones, appended 3,398 and 1,142 barriers, and matched 46,551 and 20,077 restarted replays across 9,714
+and 9,597 crash-restarts. The mutation that applies a global command without waiting for the other logs'
+barriers is caught at seed 0, step 1,072.
 
 ### The prefix model, corrected: a slot goes only under a classic commit (2026-09-29)
 

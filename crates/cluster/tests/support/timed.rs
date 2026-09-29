@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use slates_cluster::raft::{ElectionPriority, RaftNode, TimeoutNow};
 use slates_cluster::raft_wire::{RaftMessage, append_batch_bytes};
 use slates_cluster::timing::{
-  ElectionTimer, ElectionTiming, PathRtt, REPAIR_ROUND_TRIPS, quorum_priority,
+  ElectionTimer, ElectionTiming, FollowerStep, PathRtt, REPAIR_ROUND_TRIPS, quorum_priority,
 };
 use slates_db::register::HostId;
 use slates_transport::endpoint::MAX_PACKET_PAYLOAD;
@@ -826,12 +826,17 @@ impl Sim {
     let contact = node.contact;
     let rank = node.raft.election_rank(&alive);
     let yielded = node.timer.yielded();
-    let campaign = node.timer.follower_period(contact, timing, id, rank);
+    let step = node.timer.follower_period(contact, timing, id, rank);
     if node.timer.yielded() > yielded {
       self.outcome.yields += 1;
     }
-    if !campaign {
-      return;
+    match step {
+      FollowerStep::Follow => return,
+      FollowerStep::LeaderLapsed => {
+        node.raft.forget_leader();
+        return;
+      }
+      FollowerStep::Campaign => {}
     }
     let node = self.nodes.get_mut(&id).unwrap();
     self.outcome.campaigns += 1;

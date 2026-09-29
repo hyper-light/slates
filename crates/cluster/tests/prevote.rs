@@ -19,6 +19,11 @@
 
 mod support;
 
+use std::collections::BTreeMap;
+
+use slates_cluster::raft::{ElectionPriority, RaftNode};
+use slates_cluster::timing::{ElectionTimer, ElectionTiming, FollowerStep};
+use slates_db::register::HostId;
 use support::timed::{
   Campaign, ElectionOrder, Fault, MS, Outcome, Profile, Proposer, Scenario, Window, run,
 };
@@ -247,4 +252,135 @@ fn survivors_of_a_leader_loss_elect_within_a_few_election_timeouts() {
     }
     eprintln!("{name}: successor elected after ms {took_ms:?}");
   }
+}
+
+/// The lease rule's three voters: the leader, the most central survivor, and a survivor it outranks.
+const LEADER: HostId = HostId(1);
+const CENTRAL: HostId = HostId(2);
+const OUTRANKED: HostId = HostId(3);
+/// The voters left once the leader stops.
+const SURVIVORS: [HostId; 2] = [CENTRAL, OUTRANKED];
+
+/// Three voters over the real nodes, and the leader-contact count each survivor's drive keeps (Raft Figure
+/// 2's timer resets: a leader's append accepted, a vote granted).
+struct Lockstep {
+  nodes: BTreeMap<HostId, RaftNode>,
+  contacts: BTreeMap<HostId, u64>,
+}
+
+impl Lockstep {
+  /// `LEADER` elected, with `CENTRAL` and `LEADER` distinguishably ahead of `OUTRANKED`, and its priority
+  /// table handed to both followers: the first round teaches the leader their priorities, the second hands
+  /// them its table.
+  fn led() -> Lockstep {
+    let voters = vec![LEADER, CENTRAL, OUTRANKED];
+    let mut group = Lockstep {
+      nodes: voters
+        .iter()
+        .map(|id| (*id, RaftNode::new(*id, voters.clone())))
+        .collect(),
+      contacts: SURVIVORS.iter().map(|id| (*id, 0)).collect(),
+    };
+    for (id, quorum_ms) in [(LEADER, 10), (CENTRAL, 20), (OUTRANKED, 80)] {
+      group.node(id).set_priority(ElectionPriority {
+        quorum_ns: quorum_ms * MS,
+        spread_ns: 0,
+      });
+    }
+    group.campaign(LEADER, CENTRAL);
+    assert!(group.nodes[&LEADER].is_leader(), "the first leader");
+    group.node(LEADER).append_command(Vec::new());
+    for _ in 0..2 {
+      for follower in SURVIVORS {
+        let append = group
+          .node(LEADER)
+          .replicate_to(follower, usize::MAX)
+          .expect("an append");
+        let reply = group.node(follower).on_append_entries(append);
+        *group.contacts.get_mut(&follower).unwrap() += 1;
+        group.node(LEADER).on_append_reply(reply);
+      }
+    }
+    group
+  }
+
+  fn node(&mut self, id: HostId) -> &mut RaftNode {
+    self.nodes.get_mut(&id).unwrap()
+  }
+
+  /// `candidate` campaigns (pre-vote, then the real vote) with `voter`, every message delivered at once.
+  fn campaign(&mut self, candidate: HostId, voter: HostId) {
+    let pre_votes = self.node(candidate).on_election_timeout();
+    let reply = self.nodes[&voter].on_pre_vote(pre_votes[0]);
+    let Some(votes) = self.node(candidate).on_pre_vote_reply(reply) else {
+      return;
+    };
+    let answer = self.node(voter).on_request_vote(votes[0]);
+    if answer.granted {
+      *self.contacts.get_mut(&voter).unwrap() += 1;
+    }
+    self.node(candidate).on_vote_reply(answer);
+  }
+
+  /// One period at both survivors, as the drives run it: each timer runs — a survivor whose leader lapsed
+  /// forgets it — and then those whose timer fired campaign with the other. Returns who campaigned.
+  fn period(
+    &mut self,
+    timers: &mut BTreeMap<HostId, ElectionTimer>,
+    timing: &ElectionTiming,
+  ) -> Vec<HostId> {
+    let mut campaigners = Vec::new();
+    for id in SURVIVORS {
+      let rank = self.nodes[&id].election_rank(&SURVIVORS);
+      let timer = timers.get_mut(&id).unwrap();
+      match timer.follower_period(self.contacts[&id], timing, id, rank) {
+        FollowerStep::Follow => {}
+        FollowerStep::LeaderLapsed => self.node(id).forget_leader(),
+        FollowerStep::Campaign => campaigners.push(id),
+      }
+    }
+    for id in &campaigners {
+      let other = if *id == CENTRAL { OUTRANKED } else { CENTRAL };
+      self.campaign(*id, other);
+      timers.get_mut(id).unwrap().rebaseline(self.contacts[id]);
+    }
+    campaigners
+  }
+}
+
+/// Thesis §4.2.3 ("if a server receives a RequestVote request within the minimum election timeout of hearing
+/// from a current leader, it does not update its term or grant its vote") with §3.4's priorities: once the
+/// leader is lost, a survivor that has heard from no leader for the minimum election timeout grants the
+/// pre-vote of a survivor that outranks it — whether or not its own jittered timeout has come, and whether
+/// it campaigns there or yields it — so the most central survivor wins at its first campaign. Three voters
+/// over the real nodes and the real election timer, ticking in the same instant; the leader replicates, then
+/// stops (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`: before the fix the
+/// central survivor was refused at periods 10 and 26, and the outranked one led from period 32).
+#[test]
+fn the_most_central_survivor_wins_its_first_campaign() {
+  let mut group = Lockstep::led();
+  assert_eq!(group.nodes[&CENTRAL].election_rank(&SURVIVORS), 0);
+  assert_eq!(group.nodes[&OUTRANKED].election_rank(&SURVIVORS), 1);
+  let timing = ElectionTiming::floor();
+  let mut timers: BTreeMap<HostId, ElectionTimer> = SURVIVORS
+    .iter()
+    .map(|id| (*id, ElectionTimer::new()))
+    .collect();
+  let mut campaigns = Vec::new();
+  for period in 0..5 * (timing.base_periods + timing.span_periods) {
+    let campaigners = group.period(&mut timers, &timing);
+    campaigns.extend(campaigners.into_iter().map(|id| (period, id)));
+    if SURVIVORS.iter().any(|id| group.nodes[id].is_leader()) {
+      break;
+    }
+  }
+  assert!(
+    group.nodes[&CENTRAL].is_leader(),
+    "the most central survivor leads; campaigns (period, node): {campaigns:?}"
+  );
+  assert_eq!(
+    campaigns.len(),
+    1,
+    "at its first campaign; campaigns (period, node): {campaigns:?}"
+  );
 }

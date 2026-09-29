@@ -1826,6 +1826,42 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: MLRaft — built, verified, measured, one log kept; a yielding voter refused the voter it yielded to — fixed
+
+**MLRaft** (`crates/cluster/src/multilog.rs`; research record §3.6, slice 14). `n` Raft logs over one voter set:
+keyed commands route by key, global ones go to log 0, and each other log's leader appends a barrier after each
+committed global command. The merge applies each key's commands in its log's order and a global command only
+once every log has reached a barrier naming it. Leaders are spread by priority. At `n = 1` it is the single
+log.
+- The explorer at full scale drives every node's real logs over an adversarial network with crash-restarts
+  (99,499 and 62,858 keyed commands applied), with no violation; a mutation that skips the barrier wait is
+  caught at seed 0, step 1,072. CI runs it in the full-scale step.
+- Measured across five Azure regions (20 seeds): a keyed command proposed as a region is lost expects
+  1,036 ms with one log and 1,301–1,399 ms with two, three or five. With more than one log, a crash of any
+  non-designated log's leader stalls every log's keyed commands (3,713–6,312 ms at five logs).
+- **Decided:** both groups keep one log. The council's commands are all global. The root group's region
+  promotion is keyed but gains nothing in expectation.
+- **Owed only if a group ever runs `n > 1`:** compaction across logs. A log's snapshot must not pass entries
+  the merge has not applied, so log 0's snapshot waits until every other log has reached a barrier at or past
+  it, and the others' snapshots carry an epoch floor. Today a restored multi-log node replays from each log's
+  snapshot, which holds only while nothing is compacted.
+
+**Found by its measurement, and fixed: the pre-vote's lease outlived the minimum election timeout.** A follower
+forgot its leader only at its own campaign, so a voter yielding its timeout to a more central one (§3.4)
+refused that voter's pre-vote. In a three-region group the outranked region won 195 losses of 200 after two
+timeouts (6,766 ms median); now the most central survivor wins every one at its first campaign (3,322 ms).
+The timer reports the lapse at the minimum election timeout (thesis §4.2.3), and every drive — the council,
+the root group, the simulations — forgets the leader there.
+[Bug record](../bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md).
+- Accepted with evidence: among five regions three survivors tie within their spread, and 11 losses in 200
+  split their vote (p99 4,828 → 6,472 ms; the bug had serialized them). A span of the base, a strict order
+  among tied voters, and deferring a campaign after a granted pre-vote were measured and rejected
+  (`docs/wip/BENCHMARKS.md`).
+- The daemon's in-process fleet suite passes 53 of 53. The fast-track and pipelining measurements are
+  byte-identical before and after (no leader is lost in them).
+
+**Owed:** the KIND lane's measurement of the groups under a burst.
+
 ### 2026-09-29: pipelined replication — built and measured; a leader's per-message cost grew with its backlog — fixed
 
 **Built** (`RaftNode::replicate_to`; `docs/wip/research/consensus-enhancements.md` §3.5, slice 11).
@@ -1863,7 +1899,8 @@ where one batch gives 260 / 458 ms).
   At 4 % loss every proposer commits as many commands as on the classic track.
 
 **Owed:**
-- MLRaft, and the KIND lane's measurement of the fleet under a burst.
+- MLRaft (built, measured and decided the same day: one log; the entry above), and the KIND lane's measurement
+  of the fleet under a burst.
 - The fast track's vote routing in the fleet, when a group has proposers away from its leader.
 
 ### 2026-09-29: the fast track and the window are built in the core — the design's sync rule lost chosen values; fixed

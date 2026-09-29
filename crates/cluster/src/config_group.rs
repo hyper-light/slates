@@ -520,6 +520,13 @@ impl RegionalCouncil {
     )
   }
 
+  /// **DRIVE**: the election timer heard no leader for the minimum election timeout
+  /// (`crate::timing::FollowerStep::LeaderLapsed`): forget it, so a candidate's pre-vote is granted, without
+  /// campaigning (`RaftNode::forget_leader`, thesis §4.2.3).
+  pub fn forget_leader(&mut self) {
+    self.raft.forget_leader();
+  }
+
   /// **DRIVE**: begins a **pre-election** on an election timeout (Raft §9.6), returning the [`PreVote`]s to
   /// ship to the other voters — asked *without inflating the term*, so a partitioned node cannot disrupt a
   /// healthy leader. A lone voter proceeds straight to leading with no messages (the `f = 0` degenerate).

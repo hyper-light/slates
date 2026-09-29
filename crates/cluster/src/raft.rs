@@ -257,7 +257,7 @@ struct Staging {
 /// (§3.4): two — the first tick after an election may come a sliver after it, so the second is the first
 /// to span a whole election timeout of leading, over which every voter's reply has refreshed its priority
 /// in the leader's table.
-const PRIORITY_WINDOWS: u8 = 2;
+pub(crate) const PRIORITY_WINDOWS: u8 = 2;
 
 /// Derived: the whole CheckQuorum windows (election timeouts) a staged member's lag may go without
 /// shrinking before its staging is aborted (thesis §4.2.1: "the leader should also abort the change if the
@@ -979,10 +979,23 @@ impl RaftNode {
       .collect()
   }
 
+  /// The caller's timer has heard no leader for the minimum election timeout (thesis §4.2.3;
+  /// `crate::timing::FollowerStep::LeaderLapsed`): a follower forgets its belief in a leader — so it grants a
+  /// candidate's pre-vote (§9.6) — without campaigning, as when it yields its own timeout to a voter that
+  /// outranks it (§3.4). Changes nothing retained, and nothing at a leader or a candidate, which believe in no
+  /// other leader.
+  pub fn forget_leader(&mut self) {
+    if self.role == Role::Follower {
+      self.has_leader = false;
+      self.leader_hint = None;
+    }
+  }
+
   /// Answers a received [`PreVote`] (Raft §9.6) **without changing this node's term, vote or role** — a
   /// pre-vote is non-binding. The node would grant a real vote only if it does not currently believe a
-  /// leader is alive (it has not heard from one since its own election timeout), it is not itself the
-  /// leader, the pre-vote's term is ahead of its own, and the candidate's log is at least as up-to-date.
+  /// leader is alive (it has heard from none for the minimum election timeout,
+  /// [`forget_leader`](Self::forget_leader), or it has campaigned since), it is not itself the leader, the
+  /// pre-vote's term is ahead of its own, and the candidate's log is at least as up-to-date.
   /// Because the term is never touched, a partitioned node's inflated term cannot force a step-down here.
   pub fn on_pre_vote(&self, request: PreVote) -> PreVoteReply {
     let granted = self.is_voter(self.id)
