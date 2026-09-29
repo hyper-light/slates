@@ -1985,7 +1985,16 @@ visible to clients.
   trip at p50 16 µs. The quiet-host record of 2026-09-05 was p50 ~9 µs and p99 ~25 µs. That the create is
   36 µs dearer than a status round trip points at the create path itself: the per-verb shard publish
   re-images every volume and writes the frame (docs/wip/recovery.md owes the incremental publish).
-  - Owed: a profile of the create path, the cause fixed, and the histogram recorded on a quiet host.
+  - **Profiled 2026-09-29** (`sample`, 4 s of the bench, `afeed36`):
+    - The serving shard spent 1,030 of its 2,375 samples (43 %) in `harvest_io`'s zero-timeout `kevent`.
+      §4.3 sets the I/O harvest cadence to the step quantum, which follows the wake estimate since A-31
+      (about 2.7 µs on this Mac), and A-39 harvests on every spin turn. So a busy or spinning shard pays
+      a syscall every few microseconds, a cost the cadence's derivation leaves out.
+    - The rest of the create path: the forwarded verb 451 samples (a new volume's owner is its name's
+      hash, so most creates cross shards), the reply's wake 153, the publish about 90, the log commit 70.
+    - Leads, not a proven cause. Owed: the harvest cadence derived with the harvest's own measured cost,
+      an A/B under one load, then the forward and publish costs in turn, and the histogram recorded on a
+      quiet host.
 
 **Open, explained — retired peers' seed ids held alive.** Explained by the restarts above (a restarted
 daemon's fresh fleet node seeds every manifest peer alive and re-learns only the peers that reach it); owed:
