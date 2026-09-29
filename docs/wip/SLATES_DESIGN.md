@@ -2703,7 +2703,14 @@ reconnaissance because the touched partitions are named up front).
 > - the fast track opens only at free indices.
 >
 > An exhaustive search of the log model found no fault up to 23,552,907 classes (five nodes, four terms).
-> Status: the model is verified; the dialect does not have windows, the fast track or this recovery yet.
+>
+> The dialect's design around it is verified too (slice 9). Raft's log is unchanged. A window above it
+> holds out-of-order entries and fast votes, accepted only once a follower's log holds its leader's
+> post-recovery no-op. Recovery reads windows only, so a classic leader never resurrects stale entries. A
+> slot is kept until a sync to a newer term. Commitment stays in order: counting windows loses a committed
+> entry in 12 steps.
+>
+> Status: both models verified; the dialect does not have windows, the fast track or this recovery yet.
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,

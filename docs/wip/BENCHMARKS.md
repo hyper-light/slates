@@ -793,3 +793,27 @@ Measured and rejected:
   1,556 MB at the widest level of (5, 1, 2, 4), while the process held 2,689 MB: the buckets' and frontiers'
   doubling capacities, and pages the allocator retains. The ceiling check now multiplies the counted bytes
   by the measured ratio, rounded up to 2.
+
+### The prefix model: the dialect's design, searched exhaustively (2026-09-28)
+
+**Hardware:** as the slot model above (Apple M5 Max, 18 cores, 128 GB; other sessions' builds alongside, so
+wall times are upper bounds; state counts are exact). **Commands:** `cargo test -p slates-cluster --release
+--test prefix_model -- --ignored --test-threads=1 --exact the_design_keeps_agreement_at_full_scope
+each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one --nocapture`. One scope:
+`SLATES_PREFIX_SCOPE=3,3,2,3 [SLATES_PREFIX_VARIANT=drop-covered|commit-from-windows|report-logs-too]
+cargo test -p slates-cluster --release --test prefix_model -- --ignored --exact
+one_scope_from_the_environment --nocapture`.
+
+| Variant | Scope (nodes, indices, values, terms) | Classes | Result | Wall | Peak |
+|---|---|---|---|---|---|
+| design | 3, 3, 1, 2 (default suite; 1.2 s in debug) | 331,522 | no fault | — | — |
+| design | 3, 3, 1, 3 | 2,228,602 | no fault | 0.85 s | 377 MB |
+| design | 3, 3, 2, 3 | 14,625,406 | no fault | 4.5 s | 1,887 MB |
+| design | 4, 2, 2, 3 | 1,220,407 | no fault | 0.52 s | 221 MB |
+| design | 3, 2, 2, 4 | 515,747 | no fault | 0.21 s | 100 MB |
+| commits counted from windows | 3, 3, 1, 3 | 175,596 through the faulting level (the serial search's shortest history: 232,363) | a committed entry lost after 12 steps | 0.48 s | 165 MB |
+| window slots dropped once covered | 3, 3, 2, 3 | 2,773,326 through the faulting level (serial: 2,983,719) | a committed entry lost after 17 steps | 8.3 s | 1,338 MB |
+| voters report their logs too | 3, 3, 2, 3 | 14,648,981 | no fault; 104,206 recoveries resurrect a deposed leader's entry | 4.4 s | 1,896 MB |
+| design | 4, 3, 1, 3 and 5, 2, 1, 3 | over 22,016,505 and 11,870,838 | past the 4 GiB ceiling, stopped | 8.8 s, 7.1 s | 2.7 GB, 2.5 GB |
+
+The whole full-scale set runs in 18.4 s here and holds 2.43 GB at its peak.

@@ -68,6 +68,11 @@ jobs:
           cargo test -p slates-cluster --release --test slot_model -- --ignored --test-threads=1 --exact
           the_ballot_recovery_keeps_agreement_at_full_scope
           the_published_recovery_loses_agreement_when_its_leader_decides_by_votes
+      - name: The prefix model's exhaustive searches (the dialect's design and its rejected alternatives, §4)
+        run: >-
+          cargo test -p slates-cluster --release --test prefix_model -- --ignored --test-threads=1 --exact
+          the_design_keeps_agreement_at_full_scope
+          each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one
       - name: AC-1.2 differential suite against tmpfs (Linux)
         if: runner.os == 'Linux'
         run: SLATES_TEST_RAMDIR=/dev/shm PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture

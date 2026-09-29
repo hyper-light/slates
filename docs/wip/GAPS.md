@@ -1843,9 +1843,16 @@ lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-ow
 searches in release (17 s here, 2.65 GB peak, under a 4 GiB ceiling derived from the measured cost of a
 state).
 
-**Owed:** the dialect. Windows, sync terms, the recovery, the fast track and out-of-order acknowledgement are
-not in `RaftNode` yet, and the randomized explorer must cover them on the real code. Then the measurement of
-the fast track's crossover (loss, proposer placement), which decides whether it is on by default.
+**The dialect's design is verified too** (`crates/cluster/tests/prefix_model.rs`, slice 9): Raft's log
+unchanged, a window of slots above it, syncing, windows-only recovery, slots kept until a sync, and in-order
+commitment. It holds up to 14,625,406 classes, and each rejected alternative is kept as a variant that fails
+or misbehaves: commits counted from windows (12 steps), slots dropped once covered (17 steps), voters
+reporting their logs too (safe, but it resurrects stale entries).
+
+**Owed:** the dialect. Windows, syncing, the recovery, the fast track and out-of-order acknowledgement are not
+in `RaftNode` yet, and the randomized explorer must cover them on the real code. Then the measurement of the
+fast track's crossover (loss, proposer placement), which decides whether it is on by default. Four nodes with
+three indices, and five nodes, exceed the 4 GiB ceiling for the prefix model.
 
 ### 2026-09-28: priority elections — built; the explorer's diagnosis tool broke CI's `--ignored` run — fixed
 

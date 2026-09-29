@@ -107,10 +107,16 @@ ParallelRaft-CE, keeps a per-node **sync number** (the term whose entries it cur
 the previous term's entries Paxos-style over a majority before a new leader takes office, and advances a
 follower's sync number only once it has acknowledged every entry of the older term.
 
-The mapping: out-of-order **acknowledgement and commitment** within a term; **in-order application**
-(the configuration state machine is order-dependent, so execution stays sequential — ParallelRaft-SE's
-semantics, which Gu et al. refine to Multi-Paxos; ghost entries cannot break sequential execution). The
-commit index exposed to the state machine is the contiguous committed prefix.
+The mapping, as verified (slice 9): out-of-order **acknowledgement** within a term — a synced follower
+buffers the leader's entries that arrive ahead of a hole in its window, so they are not sent again and
+commit the moment the hole fills — with **in-order commitment and application**.
+
+**Out-of-order commitment was measured and rejected.** The prefix model found a 12-step history. A leader
+commits an index out of order from a window's copy. Recovery by the next leader fills the uncommitted index
+below it with a no-op. That no-op conflicts with the old leader's log, and Raft's truncation deletes the old
+leader's replica of the committed entry. A later leader, elected without the one node still holding it,
+loses it. Nothing in slates would use out-of-order commitment: the configuration applies in order, and the
+leader proposes only once its log is fully committed.
 
 ### 3.6 Multi-log (MLRaft)
 The abstract: the single log is divided into n logs, a leader is elected per log, leaders are spread by
@@ -167,11 +173,25 @@ their self-approved entries with their vote, and the new leader re-runs the vote
 
 ## 4. Composition
 
-- **One log model.** A slot is empty, self-approved (entry, the term it was voted in), or leader-approved
-  (entry, term). ParallelRaft's holes and Fast Raft's overwritable slots are the same generalization:
-  both need a recovery phase over a majority before a new leader takes office, so there is **one**
-  recovery: per index above the leader's contiguous committed prefix, the highest-term report decides
-  (Paxos phase one), with Fast Paxos's rule when that term's reports are fast votes.
+- **One log model, as built** (verified by the prefix model, slice 9). Raft's log keeps every rule it has:
+  in-order appends with the consistency check and truncation, Raft's election rule, and commitment by a
+  majority's logs at the current term. Above the log, each follower keeps a **window** of slots:
+  - the leader's entries that arrived out of order;
+  - fast votes, each with the term it was accepted in.
+
+  A follower accepts either only once it is **synced** to its term's leader, meaning its log holds the
+  no-op that leader appends after its recovery. On syncing, it drops the slots of older terms.
+
+  **Recovery.** Voters report their window slots with their votes. For each index above the candidate's
+  last log entry, the highest ballot decides as in §3.7, and the leader appends the recovered values at
+  its term, a no-op at each free index below the last of them, and then its own no-op. Three choices are
+  each backed by a search:
+  - **Reports are windows only.** The candidate's own log is kept (Raft's election rule makes it safe),
+    and voters' log entries are not reported. That keeps a classic leader from resurrecting a deposed
+    leader's uncommitted entries, which Raft discards.
+  - **A window slot outlives the log entry that covers it.** It is dropped only at a sync; dropping it
+    earlier loses a committed entry in 17 steps.
+  - **Commitment stays in order** (§3.5).
 - **Application stays in order** for every mechanism (the configuration state machine is sequential).
 - **Pre-vote and priority** gate *starting* an election; **transfer** starts one deliberately; none
   changes the vote rule.
@@ -418,4 +438,38 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     was synced to), windows above the Raft prefix, the recovery, and a sync append that truncates stale
     tails. Membership changes stay classic and in order, with no windows or fast votes open while one is
     pending.
+- **Slice 9 (2026-09-28): the prefix model — the dialect's design, verified before it is built**
+  (`crates/cluster/tests/prefix_model.rs`, on the search machinery the models now share,
+  `tests/support/exhaustive.rs`). The slot model has no order. The dialect keeps Raft's log, so two
+  steps of the design fall outside the slot model's proof:
+  - the candidate's own log is kept;
+  - a synced follower forgets older slots.
+
+  This model has Raft's logs, appends with truncation, Raft's election rule, windows, syncing, and the
+  recovery (§4). After every step it checks agreement, P2c, log matching, election safety and leader
+  completeness.
+  - **Found and fixed on the way.** The first design counted a window's copy toward a commit. The model
+    found a 12-step history losing a committed entry (§3.5), so commitment is in order. It also showed that
+    a window slot must survive the log entry that covers it.
+  - **The design** holds at every scope searched, and every path it has was taken:
+
+    | Nodes, indices, values, terms | Classes | Fast commits | Recoveries of a possible fast choice | Slots dropped at a sync |
+    |---|---|---|---|---|
+    | 3, 3, 1, 2 (the default suite) | 331,522 | 886 | 18,178 | 9,467 |
+    | 3, 3, 1, 3 | 2,228,602 | 1,347 | 125,506 | 49,934 |
+    | 3, 3, 2, 3 | 14,625,406 | 6,666 | 784,136 | 546,068 |
+    | 4, 2, 2, 3 | 1,220,407 | 484 | 32,178 | 4,632 |
+    | 3, 2, 2, 4 | 515,747 | 24 | 8,836 | 3,360 |
+
+  - **Rejected alternatives,** kept as executable variants:
+    - **Commits counted from windows:** loses a committed entry in 12 steps.
+    - **Window slots dropped once the log covers them:** loses one in 17. A fast quorum commits at
+      index 2. A new leader's append covers one voter's log there, so the voter drops its vote; the next
+      append conflicts below and truncates the entry; a later leader, elected with the one voter still
+      holding a vote, finds one vote short of the threshold and fills the index with a no-op.
+    - **Voters reporting their logs too:** safe (14,648,981 classes), but its recoveries resurrected a
+      deposed leader's entry 104,206 times. Classic Raft never does that, and the design never needs to.
+  - **Next.** The dialect (`RaftNode`): the window and sync term in `SavedRaft`, window reports in
+    `VoteReply`, the sync point and fast-track opening in `AppendEntries`, the fast track's messages, and
+    the randomized explorer extended to all of it.
 

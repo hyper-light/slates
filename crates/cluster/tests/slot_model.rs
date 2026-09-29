@@ -61,10 +61,12 @@
 // Test harness: an unwrap, expect or panic here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashSet, VecDeque};
+mod support;
+
 use std::fmt;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{Hash, Hasher};
+
+use support::exhaustive::{self, MEMORY_CEILING_BYTES, Model, Packer, Step, least_over_ties};
 
 /// Shape: the most nodes a scope here models.
 const MAX_NODES: usize = 5;
@@ -76,30 +78,6 @@ const MAX_TERMS: u8 = 4;
 const MAX_VALUES: u8 = 3;
 /// Format: the 64-bit words a packed state takes — at most 37 bits a node and 20 more for the whole state.
 const WORDS: usize = 4;
-/// Shape: the resident memory a search may hold. GitHub's smallest runner (the macOS image, 7 GB) runs the
-/// full-scale step alone after the build; this leaves it 3 GB.
-const MEMORY_CEILING_BYTES: usize = 4 << 30;
-/// Derived: resident memory over the bytes the parallel search accounts for — measured 2,689 MB resident
-/// against 1,556 MB accounted at the widest level of five nodes and four terms (2026-09-28): the buckets'
-/// and frontiers' doubling capacities and the allocator's retained pages, which no field count sees. Rounded
-/// up.
-const RESIDENT_PER_ACCOUNTED: usize = 2;
-/// Derived: the bytes one state costs the breadth-first search at the peak, measured — 186.8 MB of
-/// resident memory for 968,767 states (193 bytes each) and 404.6 MB for 2,855,567 (142 each), release,
-/// 2026-09-28: its packed key in the visited set and again in the id table, its parent's id and its place in
-/// the queue, with the set and the table briefly holding both their old and new storage as they grow.
-/// Rounded up.
-const BYTES_PER_STATE: usize = 200;
-/// Derived: the most states the breadth-first search may visit before it fails.
-const STATE_BUDGET: usize = MEMORY_CEILING_BYTES / BYTES_PER_STATE;
-/// Derived: the bytes a visited class costs the parallel search at its peak: a 16-byte fingerprint and a
-/// control byte per bucket, the set at 7/8 load, and — while a shard grows — its old table beside the new one
-/// of twice the buckets: `17 × 8/7 × 3`. Rounded up.
-const VISITED_BYTES: usize = (16 + 1) * 8 * 3 / 7 + 1;
-/// Format: the bytes a frontier entry costs (one packed state).
-const FRONTIER_BYTES: usize = size_of::<Key>();
-/// Format: the bytes a bucketed successor costs (its fingerprint and packed state).
-const BUCKET_BYTES: usize = size_of::<(u128, Key)>();
 
 /// How Fast Raft's decision loop is read. Its §IV-B loop — "while there exists a k = commitIndex + 1 for
 /// which at least a classic quorum of votes has been received: insert entry e from possibleEntries[k] with
@@ -262,8 +240,6 @@ impl State {
 /// One atomic step of the model.
 #[derive(Clone, Copy, Debug)]
 enum Action {
-  /// The initial state.
-  Start,
   /// A node times out: it enters the next term and votes for itself.
   Timeout { node: usize },
   /// A node learns the term of a leader from its append or heartbeat, without voting. (A candidate's vote
@@ -322,7 +298,6 @@ fn names(mask: u8) -> String {
 impl fmt::Display for Action {
   fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
     match *self {
-      Action::Start => write!(out, "start"),
       Action::Timeout { node } => write!(out, "{} times out", NAMES[node]),
       Action::Learn { node, term } => write!(out, "{} learns term {term}", NAMES[node]),
       Action::Elect { node, quorum } => {
@@ -384,13 +359,13 @@ enum Fault {
 }
 
 /// The paths a step took, as bits of a mask (the non-vacuity counters' keys).
-const FAST_COMMIT: u8 = 1;
-const CLASSIC_COMMIT: u8 = 2;
-const RECOVERED_DECISION: u8 = 4;
-const RECOVERED_FAST_CHOICE: u8 = 8;
-const DECIDED_FROM_VOTES: u8 = 16;
-const OVERWROTE_STALE: u8 = 32;
-const OUT_OF_ORDER_COMMIT: u8 = 64;
+const FAST_COMMIT: u64 = 1;
+const CLASSIC_COMMIT: u64 = 2;
+const RECOVERED_DECISION: u64 = 4;
+const RECOVERED_FAST_CHOICE: u64 = 8;
+const DECIDED_FROM_VOTES: u64 = 16;
+const OVERWROTE_STALE: u64 = 32;
+const OUT_OF_ORDER_COMMIT: u64 = 64;
 /// Format: each path's name, in bit order.
 const PATHS: [&str; 7] = [
   "fast commits",
@@ -405,21 +380,7 @@ const PATHS: [&str; 7] = [
 const OUT_OF_ORDER_PATH: usize = 6;
 
 /// The result of one step.
-struct Next {
-  state: State,
-  fault: Option<Fault>,
-  paths: u8,
-}
-
-impl Next {
-  fn plain(state: State) -> Next {
-    Next {
-      state,
-      fault: None,
-      paths: 0,
-    }
-  }
-}
+type Next = Step<State, Fault>;
 
 fn bit(node: usize) -> u8 {
   1 << node
@@ -507,7 +468,6 @@ fn leader_candidates(scope: Scope, leader: usize, out: &mut Vec<Action>) {
 /// `action` applied to `state`, or `None` when it is not enabled there or changes nothing.
 fn apply(scope: Scope, state: &State, action: Action) -> Option<Next> {
   let next = match action {
-    Action::Start => None,
     Action::Timeout { node } => timeout(scope, state, node),
     Action::Learn { node, term } => learn(scope, state, node, term),
     Action::Elect { node, quorum } => elect(scope, state, node, quorum),
@@ -544,7 +504,7 @@ fn timeout(scope: Scope, state: &State, node: usize) -> Option<Next> {
   candidate.term += 1;
   candidate.voted_for = Some(id(node));
   candidate.leading = None;
-  Some(Next::plain(next))
+  Some(Step::plain(next))
 }
 
 fn learn(scope: Scope, state: &State, node: usize, term: u8) -> Option<Next> {
@@ -556,7 +516,7 @@ fn learn(scope: Scope, state: &State, node: usize, term: u8) -> Option<Next> {
   learner.term = term;
   learner.voted_for = None;
   learner.leading = None;
-  Some(Next::plain(next))
+  Some(Step::plain(next))
 }
 
 /// The last leader-approved entry of `node`, as Fast Raft's election compares it: its index counted from one
@@ -603,7 +563,7 @@ fn elect(scope: Scope, state: &State, node: usize, quorum: u8) -> Option<Next> {
   {
     return None;
   }
-  let mut next = Next::plain(*state);
+  let mut next = Step::plain(*state);
   for voter in members(quorum, scope.nodes) {
     let elector = &mut next.state.nodes[voter];
     elector.term = running.term;
@@ -628,7 +588,7 @@ fn constrained(
   state: &State,
   quorum: u8,
   index: usize,
-) -> Result<Option<(u8, u8)>, Fault> {
+) -> Result<Option<(u8, u64)>, Fault> {
   let reports: Vec<Slot> = members(quorum, scope.nodes)
     .filter_map(|voter| state.nodes[voter].slots[index])
     .collect();
@@ -709,7 +669,7 @@ fn insert(state: &State, node: usize, index: usize, value: u8) -> Option<Next> {
     classic: false,
     value,
   });
-  Some(Next::plain(next))
+  Some(Step::plain(next))
 }
 
 fn accept(state: &State, node: usize, index: usize, value: u8) -> Option<Next> {
@@ -722,7 +682,7 @@ fn accept(state: &State, node: usize, index: usize, value: u8) -> Option<Next> {
   if held.is_some_and(|slot| slot.ballot() >= (term, false)) {
     return None;
   }
-  let mut next = Next::plain(*state);
+  let mut next = Step::plain(*state);
   next.state.nodes[node].slots[index] = Some(Slot {
     term,
     classic: false,
@@ -742,7 +702,7 @@ fn open(state: &State, leader: usize, index: usize) -> Option<Next> {
   }
   leading.phase[index] = Phase::Opened;
   next.opened[usize::from(state.nodes[leader].term)][index] = true;
-  Some(Next::plain(next))
+  Some(Step::plain(next))
 }
 
 fn propose(state: &State, leader: usize, index: usize, value: u8) -> Option<Next> {
@@ -750,7 +710,7 @@ fn propose(state: &State, leader: usize, index: usize, value: u8) -> Option<Next
   if state.nodes[leader].leading?.phase[index] != Phase::Free {
     return None;
   }
-  let mut next = Next::plain(*state);
+  let mut next = Step::plain(*state);
   guard(&mut next, index, value, term);
   let proposer = &mut next.state.nodes[leader];
   proposer.slots[index] = Some(Slot {
@@ -799,7 +759,7 @@ fn decide(
   if !allowed {
     return None;
   }
-  let mut next = Next::plain(*state);
+  let mut next = Step::plain(*state);
   guard(&mut next, index, value, deciding.term);
   let decided = Slot {
     term: deciding.term,
@@ -885,7 +845,7 @@ fn replicate(
   if node == leader || target.term > source.term {
     return None;
   }
-  let mut next = Next::plain(*state);
+  let mut next = Step::plain(*state);
   guard(&mut next, index, slot.value, source.term);
   let follower = &mut next.state.nodes[node];
   if follower.term < source.term {
@@ -908,7 +868,7 @@ fn commit(scope: Scope, state: &State, leader: usize, index: usize) -> Option<Ne
   if leading.committed[index] || size(leading.acks[index] | bit(leader)) < scope.majority() {
     return None;
   }
-  let mut next = Next::plain(*state);
+  let mut next = Step::plain(*state);
   next.state.nodes[leader].leading.as_mut()?.committed[index] = true;
   record_commit(&mut next, index, slot.value, source.term, CLASSIC_COMMIT);
   Some(next)
@@ -916,7 +876,7 @@ fn commit(scope: Scope, state: &State, leader: usize, index: usize) -> Option<Ne
 
 /// Records `value` committed at `index` in `term` in the history, or the disagreement when another value
 /// was.
-fn record_commit(next: &mut Next, index: usize, value: u8, term: u8, path: u8) {
+fn record_commit(next: &mut Next, index: usize, value: u8, term: u8, path: u64) {
   next.paths |= path;
   if index > 0 && next.state.chosen[index - 1].is_none() {
     next.paths |= OUT_OF_ORDER_COMMIT;
@@ -1012,33 +972,6 @@ fn arranged(scope: Scope, state: &State, order: &[usize]) -> Key {
   pack(&representative)
 }
 
-/// Visits every order of `order[at..end]` for the first run in `runs`, then the orders of the runs after it.
-fn permute_run(
-  order: &mut [usize],
-  at: usize,
-  end: usize,
-  runs: &[(usize, usize)],
-  visit: &mut dyn FnMut(&[usize]),
-) {
-  if at + 1 >= end {
-    each_tie_order(order, runs, visit);
-    return;
-  }
-  for swap in at..end {
-    order.swap(at, swap);
-    permute_run(order, at + 1, end, runs, visit);
-    order.swap(at, swap);
-  }
-}
-
-/// Visits every order that permutes `order` only within the `runs` of equal signatures.
-fn each_tie_order(order: &mut [usize], runs: &[(usize, usize)], visit: &mut dyn FnMut(&[usize])) {
-  match runs.split_first() {
-    None => visit(order),
-    Some((&(start, end), rest)) => permute_run(order, start, end, rest, visit),
-  }
-}
-
 /// The representative of `state`'s class, the same for every renaming of its nodes and values: nodes sorted
 /// by [`Signature`], and among the orders that permute only nodes of equal signature, the one whose packed
 /// state is least.
@@ -1047,26 +980,7 @@ fn canonical(scope: Scope, state: &State) -> Key {
     .node_ids()
     .map(|node| signature(scope, state, node))
     .collect();
-  let mut order: Vec<usize> = scope.node_ids().collect();
-  order.sort_by_key(|node| signatures[*node]);
-  let mut runs = Vec::new();
-  let mut start = 0;
-  for end in 1..=order.len() {
-    if end == order.len() || signatures[order[end]] != signatures[order[start]] {
-      if end - start > 1 {
-        runs.push((start, end));
-      }
-      start = end;
-    }
-  }
-  let mut least: Option<Key> = None;
-  each_tie_order(&mut order, &runs, &mut |candidate| {
-    let key = arranged(scope, state, candidate);
-    if least.is_none_or(|least| key < least) {
-      least = Some(key);
-    }
-  });
-  least.unwrap()
+  least_over_ties(&signatures, &mut |order| arranged(scope, state, order))
 }
 
 /// Renumbers the values of `state` by first appearance (slots node by node, then the history).
@@ -1111,92 +1025,13 @@ impl Hash for Key {
   }
 }
 
-/// A multiplicative hasher for the visited sets (FxHash's mixing step): their keys are packed words or
-/// fingerprints hashed millions of times, and SipHash's resistance to chosen keys buys nothing here.
-#[derive(Default)]
-struct Mix(u64);
-
-impl Hasher for Mix {
-  fn finish(&self) -> u64 {
-    self.0
-  }
-
-  fn write(&mut self, bytes: &[u8]) {
-    for byte in bytes {
-      self.write_u64(u64::from(*byte));
-    }
-  }
-
-  fn write_u64(&mut self, word: u64) {
-    /// Format: FxHash's multiplier (`rustc-hash`).
-    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
-    self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(MULTIPLIER);
-  }
-
-  fn write_u128(&mut self, word: u128) {
-    self.write_u64(u64::try_from(word >> 64).unwrap());
-    self.write_u64(u64::try_from(word & u128::from(u64::MAX)).unwrap());
-  }
-}
-
-/// A 128-bit fingerprint of a packed state: SipHash-1-3 (`DefaultHasher`, fixed keys) over the state with a
-/// domain byte, twice.
-fn fingerprint(key: Key) -> u128 {
-  let lane = |domain: u8| {
-    let mut hasher = DefaultHasher::new();
-    domain.hash(&mut hasher);
-    key.0.hash(&mut hasher);
-    hasher.finish()
-  };
-  (u128::from(lane(0)) << 64) | u128::from(lane(1))
-}
-
-/// Packs fields of known widths into words, least significant bit first.
-struct Packer {
-  words: [u64; WORDS],
-  at: usize,
-}
-
-impl Packer {
-  fn put(&mut self, width: usize, value: u64) {
-    let (word, place) = (self.at / 64, self.at % 64);
-    self.words[word] |= value << place;
-    if place + width > 64 {
-      self.words[word + 1] |= value >> (64 - place);
-    }
-    self.at += width;
-  }
-
-  fn take(&mut self, width: usize) -> u64 {
-    let (word, place) = (self.at / 64, self.at % 64);
-    let mut value = self.words[word] >> place;
-    if place + width > 64 {
-      value |= self.words[word + 1] << (64 - place);
-    }
-    self.at += width;
-    value & ((1 << width) - 1)
-  }
-
-  fn small(&mut self, width: usize) -> u8 {
-    u8::try_from(self.take(width)).unwrap()
-  }
-}
-
 /// Format: the widths of a packed field — a term, a node number plus one, a value plus one, a phase.
 const TERM_BITS: usize = 3;
 const NODE_BITS: usize = 3;
 const VALUE_BITS: usize = 2;
 const PHASE_BITS: usize = 2;
 
-fn pack_option(packer: &mut Packer, width: usize, value: Option<u8>) {
-  packer.put(width, value.map_or(0, |value| u64::from(value) + 1));
-}
-
-fn take_option(packer: &mut Packer, width: usize) -> Option<u8> {
-  packer.small(width).checked_sub(1)
-}
-
-fn pack_slot(packer: &mut Packer, slot: Option<Slot>) {
+fn pack_slot(packer: &mut Packer<WORDS>, slot: Option<Slot>) {
   packer.put(1, u64::from(slot.is_some()));
   if let Some(slot) = slot {
     packer.put(VALUE_BITS, u64::from(slot.value));
@@ -1205,7 +1040,7 @@ fn pack_slot(packer: &mut Packer, slot: Option<Slot>) {
   }
 }
 
-fn take_slot(packer: &mut Packer) -> Option<Slot> {
+fn take_slot(packer: &mut Packer<WORDS>) -> Option<Slot> {
   (packer.take(1) == 1).then(|| Slot {
     value: packer.small(VALUE_BITS),
     term: packer.small(TERM_BITS),
@@ -1213,7 +1048,7 @@ fn take_slot(packer: &mut Packer) -> Option<Slot> {
   })
 }
 
-fn pack_leading(packer: &mut Packer, leading: &Leading) {
+fn pack_leading(packer: &mut Packer<WORDS>, leading: &Leading) {
   for index in 0..MAX_INDICES {
     packer.put(MAX_NODES, u64::from(leading.acks[index]));
     let phase = match leading.phase[index] {
@@ -1226,7 +1061,7 @@ fn pack_leading(packer: &mut Packer, leading: &Leading) {
   }
 }
 
-fn take_leading(packer: &mut Packer) -> Leading {
+fn take_leading(packer: &mut Packer<WORDS>) -> Leading {
   let mut leading = Leading::new();
   for index in 0..MAX_INDICES {
     leading.acks[index] = packer.small(MAX_NODES);
@@ -1241,13 +1076,10 @@ fn take_leading(packer: &mut Packer) -> Leading {
 }
 
 fn pack(state: &State) -> Key {
-  let mut packer = Packer {
-    words: [0; WORDS],
-    at: 0,
-  };
+  let mut packer = Packer::<WORDS>::new();
   for node in &state.nodes {
     packer.put(TERM_BITS, u64::from(node.term));
-    pack_option(&mut packer, NODE_BITS, node.voted_for);
+    packer.put_option(NODE_BITS, node.voted_for);
     for slot in node.slots {
       pack_slot(&mut packer, slot);
     }
@@ -1260,21 +1092,18 @@ fn pack(state: &State) -> Key {
     packer.put(1, u64::from(*opened));
   }
   for chosen in state.chosen {
-    pack_option(&mut packer, VALUE_BITS, chosen.map(|chosen| chosen.value));
+    packer.put_option(VALUE_BITS, chosen.map(|chosen| chosen.value));
     packer.put(TERM_BITS, chosen.map_or(0, |chosen| u64::from(chosen.term)));
   }
-  Key(packer.words)
+  Key(packer.words())
 }
 
 fn unpack(key: Key) -> State {
-  let mut packer = Packer {
-    words: key.0,
-    at: 0,
-  };
+  let mut packer = Packer::<WORDS>::over(key.0);
   let mut state = State::initial();
   for node in &mut state.nodes {
     node.term = packer.small(TERM_BITS);
-    node.voted_for = take_option(&mut packer, NODE_BITS);
+    node.voted_for = packer.take_option(NODE_BITS);
     for slot in &mut node.slots {
       *slot = take_slot(&mut packer);
     }
@@ -1284,307 +1113,11 @@ fn unpack(key: Key) -> State {
     *opened = packer.take(1) == 1;
   }
   for chosen in &mut state.chosen {
-    let value = take_option(&mut packer, VALUE_BITS);
+    let value = packer.take_option(VALUE_BITS);
     let term = packer.small(TERM_BITS);
     *chosen = value.map(|value| Chosen { value, term });
   }
   state
-}
-
-/// What one search found: the classes it reached, how often each path was taken, the first fault that
-/// stopped it (with the history that reached it), and the first fault it recorded and went past.
-struct Report {
-  states: usize,
-  paths: [u64; PATHS.len()],
-  stopped: Option<(Vec<Action>, Fault)>,
-  passed: Option<(Vec<Action>, Fault)>,
-}
-
-fn tally(paths: &mut [u64; PATHS.len()], taken: u8) {
-  for (path, count) in paths.iter_mut().enumerate() {
-    *count += u64::from(taken >> path & 1);
-  }
-}
-
-/// The concrete actions that lead from `start` along the chain of representatives ending at `id`, then to a
-/// step with a fault of `fault`'s kind — replayed, since each representative renames its state.
-fn replay(
-  scope: Scope,
-  start: State,
-  keys: &[Key],
-  parents: &[u32],
-  id: u32,
-  fault: Fault,
-) -> Vec<Action> {
-  let mut chain = vec![id];
-  while *chain.last().unwrap() != 0 {
-    chain.push(parents[usize::try_from(*chain.last().unwrap()).unwrap()]);
-  }
-  chain.reverse();
-  let mut state = start;
-  let mut actions = vec![Action::Start];
-  let mut tried = Vec::new();
-  for step in chain.iter().skip(1) {
-    let key = keys[usize::try_from(*step).unwrap()];
-    tried.clear();
-    candidates(scope, &state, &mut tried);
-    let (action, next) = tried
-      .iter()
-      .find_map(|action| {
-        apply(scope, &state, *action)
-          .filter(|next| canonical(scope, &next.state) == key)
-          .map(|next| (*action, next.state))
-      })
-      .expect("a step to the next representative on the path");
-    actions.push(action);
-    state = next;
-  }
-  tried.clear();
-  candidates(scope, &state, &mut tried);
-  let last = tried
-    .iter()
-    .find(|action| {
-      apply(scope, &state, **action).is_some_and(|next| {
-        next
-          .fault
-          .is_some_and(|found| std::mem::discriminant(&found) == std::mem::discriminant(&fault))
-      })
-    })
-    .expect("the faulting step");
-  actions.push(*last);
-  actions
-}
-
-/// Breadth-first search from the initial state until every reachable class is visited or a fault `stops`
-/// accepts is found; the first other fault is recorded, and the search goes on past it.
-fn search(scope: Scope, stops: fn(&Fault) -> bool) -> Report {
-  search_from(scope, State::initial(), stops)
-}
-
-/// [`search`], from `start`.
-fn search_from(scope: Scope, start: State, stops: fn(&Fault) -> bool) -> Report {
-  let scope = scope.checked();
-  let initial = canonical(scope, &start);
-  let mut visited: HashSet<Key, BuildHasherDefault<Mix>> = HashSet::default();
-  visited.insert(initial);
-  let mut keys = vec![initial];
-  let mut parents = vec![0_u32];
-  let mut queue = VecDeque::from([0_u32]);
-  let mut report = Report {
-    states: 0,
-    paths: [0; PATHS.len()],
-    stopped: None,
-    passed: None,
-  };
-  let mut tried = Vec::new();
-  while let Some(id) = queue.pop_front() {
-    let state = unpack(keys[usize::try_from(id).unwrap()]);
-    tried.clear();
-    candidates(scope, &state, &mut tried);
-    for next in tried
-      .iter()
-      .filter_map(|action| apply(scope, &state, *action))
-    {
-      tally(&mut report.paths, next.paths);
-      if let Some(fault) = next.fault {
-        let found = Some((replay(scope, start, &keys, &parents, id, fault), fault));
-        if stops(&fault) {
-          report.stopped = found;
-          report.states = visited.len();
-          return report;
-        }
-        if report.passed.is_none() {
-          report.passed = found;
-        }
-      }
-      let key = canonical(scope, &next.state);
-      if visited.insert(key) {
-        assert!(
-          keys.len() < STATE_BUDGET,
-          "{scope:?} exceeds the breadth-first budget of {STATE_BUDGET} states"
-        );
-        queue.push_back(u32::try_from(keys.len()).unwrap());
-        keys.push(key);
-        parents.push(id);
-      }
-    }
-  }
-  report.states = visited.len();
-  report
-}
-
-/// The workers a parallel search runs on: the machine's parallelism.
-fn workers() -> usize {
-  std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
-}
-
-/// The shard of `shards` that owns fingerprint `print`.
-fn shard_of(print: u128, shards: usize) -> usize {
-  usize::try_from(print % u128::try_from(shards).unwrap()).unwrap()
-}
-
-/// What one worker made of its part of a frontier: its successors not yet visited, bucketed by the shard
-/// that owns their fingerprints; how often it took each path; and the first fault it met, with the state it
-/// stepped from and the step.
-struct Expansion {
-  buckets: Vec<Vec<(u128, Key)>>,
-  paths: [u64; PATHS.len()],
-  fault: Option<(State, Action, Fault)>,
-}
-
-/// Expands `part` of a frontier against a read-only view of the visited shards, bucketing at most
-/// `allowance` successors (`None` once it would take more).
-fn expand(
-  scope: Scope,
-  part: &[Key],
-  visited: &[HashSet<u128, BuildHasherDefault<Mix>>],
-  allowance: usize,
-) -> Option<Expansion> {
-  let mut expansion = Expansion {
-    buckets: vec![Vec::new(); visited.len()],
-    paths: [0; PATHS.len()],
-    fault: None,
-  };
-  let mut bucketed = 0_usize;
-  let mut actions = Vec::new();
-  for key in part {
-    let state = unpack(*key);
-    actions.clear();
-    candidates(scope, &state, &mut actions);
-    for action in &actions {
-      let Some(next) = apply(scope, &state, *action) else {
-        continue;
-      };
-      tally(&mut expansion.paths, next.paths);
-      if let Some(fault) = next.fault {
-        expansion.fault = Some((state, *action, fault));
-        return Some(expansion);
-      }
-      let representative = canonical(scope, &next.state);
-      let print = fingerprint(representative);
-      let shard = shard_of(print, visited.len());
-      if !visited[shard].contains(&print) {
-        bucketed += 1;
-        if bucketed > allowance {
-          return None;
-        }
-        expansion.buckets[shard].push((print, representative));
-      }
-    }
-  }
-  Some(expansion)
-}
-
-/// Inserts into one shard the successors every worker bucketed for it, returning those it had not seen.
-fn settle(
-  shard: &mut HashSet<u128, BuildHasherDefault<Mix>>,
-  buckets: Vec<&Vec<(u128, Key)>>,
-) -> Vec<Key> {
-  let mut fresh = Vec::new();
-  for (print, key) in buckets.into_iter().flatten() {
-    if shard.insert(*print) {
-      fresh.push(*key);
-    }
-  }
-  fresh
-}
-
-/// A fault the parallel search met, with the state it was met from and the step that raised it.
-type Met = (State, Action, Fault);
-
-/// Breadth-first search, level by level across every core, over fingerprints of representatives: each
-/// worker expands a slice of the frontier; then each shard of the visited set takes the new successors
-/// that hash to it. Every reachable class is visited once. Stops at the first level with a fault, reporting
-/// the step that met it (the serial [`search`] gives the whole shortest history, where it fits).
-fn explore(scope: Scope, ceiling_bytes: usize, print_levels: bool) -> (Report, Option<Met>) {
-  let scope = scope.checked();
-  let workers = workers();
-  let mut visited: Vec<HashSet<u128, BuildHasherDefault<Mix>>> =
-    (0..workers).map(|_| HashSet::default()).collect();
-  let initial = canonical(scope, &State::initial());
-  let print = fingerprint(initial);
-  visited[shard_of(print, workers)].insert(print);
-  let mut frontier = vec![initial];
-  let mut report = Report {
-    states: 1,
-    paths: [0; PATHS.len()],
-    stopped: None,
-    passed: None,
-  };
-  while !frontier.is_empty() {
-    let held = report.states * VISITED_BYTES + frontier.len() * FRONTIER_BYTES;
-    let allowance =
-      (ceiling_bytes / RESIDENT_PER_ACCOUNTED).saturating_sub(held) / BUCKET_BYTES / workers;
-    let part = frontier.len().div_ceil(workers);
-    let expansions: Vec<Expansion> = std::thread::scope(|threads| {
-      let running: Vec<_> = frontier
-        .chunks(part)
-        .map(|slice| threads.spawn(|| expand(scope, slice, &visited, allowance)))
-        .collect();
-      running
-        .into_iter()
-        .map(|worker| worker.join().unwrap())
-        .collect::<Vec<_>>()
-    })
-    .into_iter()
-    .collect::<Option<_>>()
-    .unwrap_or_else(|| {
-      panic!(
-        "{scope:?} exceeds {ceiling_bytes} bytes at {} classes and a frontier of {}",
-        report.states,
-        frontier.len()
-      )
-    });
-    for expansion in &expansions {
-      for (count, more) in report.paths.iter_mut().zip(expansion.paths) {
-        *count += more;
-      }
-    }
-    if let Some(met) = expansions.iter().find_map(|expansion| expansion.fault) {
-      report.states = visited.iter().map(HashSet::len).sum();
-      return (report, Some(met));
-    }
-    // The expanded level is done with; free it before the next is gathered.
-    frontier = Vec::new();
-    let fresh: Vec<Vec<Key>> = std::thread::scope(|threads| {
-      let running: Vec<_> = visited
-        .iter_mut()
-        .enumerate()
-        .map(|(shard, set)| {
-          let buckets: Vec<&Vec<(u128, Key)>> = expansions
-            .iter()
-            .map(|expansion| &expansion.buckets[shard])
-            .collect();
-          threads.spawn(move || settle(set, buckets))
-        })
-        .collect();
-      running
-        .into_iter()
-        .map(|shard| shard.join().unwrap())
-        .collect()
-    });
-    let bucketed: usize = expansions
-      .iter()
-      .flat_map(|expansion| expansion.buckets.iter().map(Vec::len))
-      .sum();
-    if print_levels {
-      eprintln!(
-        "level: visited {} frontier {} bucketed {} accounted {} MB",
-        report.states,
-        part * workers,
-        bucketed,
-        (report.states * VISITED_BYTES + part * workers * FRONTIER_BYTES + bucketed * BUCKET_BYTES)
-          >> 20
-      );
-    }
-    drop(expansions);
-    frontier.reserve_exact(fresh.iter().map(Vec::len).sum());
-    for part in fresh {
-      frontier.extend(part);
-    }
-    report.states = visited.iter().map(HashSet::len).sum();
-  }
-  (report, None)
 }
 
 /// A node's slots, as a history prints them: `v1@3L` is value 1 at term 3, leader-approved (`S` when
@@ -1604,66 +1137,74 @@ fn slots_of(scope: Scope, node: &Node) -> String {
     .join(",")
 }
 
-/// Replays `actions` (the first is [`Action::Start`]) from the initial state and prints each step with every
-/// node's term and slots after it.
-fn print_trace(scope: Scope, actions: &[Action]) {
-  let mut state = State::initial();
-  for (step, action) in actions.iter().enumerate().skip(1) {
-    state = apply(scope, &state, *action).unwrap().state;
-    let nodes: Vec<String> = scope
+/// The slot model at one scope, as the exhaustive searches run it.
+struct SlotModel {
+  scope: Scope,
+}
+
+impl SlotModel {
+  fn at(scope: Scope) -> SlotModel {
+    SlotModel {
+      scope: scope.checked(),
+    }
+  }
+
+  /// The scope as a report's label.
+  fn label(&self) -> String {
+    let scope = self.scope;
+    format!(
+      "{:?}, {} nodes, {} indices, {} values, {} terms",
+      scope.rule, scope.nodes, scope.indices, scope.values, scope.terms
+    )
+  }
+}
+
+impl Model for SlotModel {
+  type State = State;
+  type Action = Action;
+  type Fault = Fault;
+  type Key = Key;
+
+  fn paths(&self) -> &'static [&'static str] {
+    &PATHS
+  }
+
+  fn initial(&self) -> State {
+    State::initial()
+  }
+
+  fn candidates(&self, state: &State, out: &mut Vec<Action>) {
+    candidates(self.scope, state, out);
+  }
+
+  fn apply(&self, state: &State, action: Action) -> Option<Next> {
+    apply(self.scope, state, action)
+  }
+
+  fn canonical(&self, state: &State) -> Key {
+    canonical(self.scope, state)
+  }
+
+  fn unpack(&self, key: Key) -> State {
+    unpack(key)
+  }
+
+  fn describe(&self, state: &State) -> String {
+    self
+      .scope
       .node_ids()
       .map(|node| {
         let held = &state.nodes[node];
-        format!("{}:t{} {}", NAMES[node], held.term, slots_of(scope, held))
+        format!(
+          "{}:t{} {}",
+          NAMES[node],
+          held.term,
+          slots_of(self.scope, held)
+        )
       })
-      .collect();
-    eprintln!("  {step:>2}. {action:<32} | {}", nodes.join("  "));
-  }
-}
-
-fn print_report(scope: Scope, report: &Report) {
-  eprintln!(
-    "{:?}, {} nodes, {} indices, {} values, {} terms: {} states; {}",
-    scope.rule,
-    scope.nodes,
-    scope.indices,
-    scope.values,
-    scope.terms,
-    report.states,
-    PATHS
-      .iter()
-      .zip(report.paths)
-      .map(|(name, count)| format!("{name} {count}"))
       .collect::<Vec<_>>()
-      .join(", ")
-  );
-  for (label, found) in [
-    ("stopped by", &report.stopped),
-    ("went past", &report.passed),
-  ] {
-    if let Some((actions, fault)) = found {
-      eprintln!("{label} {fault:?} after {} steps:", actions.len() - 1);
-      print_trace(scope, actions);
-    }
+      .join("  ")
   }
-}
-
-/// Replays `actions` from the initial state under `scope`, requiring each to be enabled where it is taken;
-/// returns the state they reach and the fault the last one raised.
-fn run_script(scope: Scope, actions: &[Action]) -> (State, Option<Fault>) {
-  let mut state = State::initial();
-  let mut fault = None;
-  for action in actions {
-    let next = apply(scope, &state, *action).unwrap_or_else(|| panic!("{action} is not enabled"));
-    fault = next.fault;
-    state = next.state;
-  }
-  (state, fault)
-}
-
-/// The fault the last of `actions` raised, replayed as [`run_script`] does.
-fn replay_script(scope: Scope, actions: &[Action]) -> Option<Fault> {
-  run_script(scope, actions).1
 }
 
 /// Format: the nodes of the scripted history, and its two values.
@@ -1695,8 +1236,7 @@ fn five_nodes_lose_a_fast_committed_entry_under_the_published_recovery() {
     values: 2,
     terms: 4,
     rule: Rule::Published(Reading::OncePerTerm),
-  }
-  .checked();
+  };
   let history = [
     Action::Timeout { node: A },
     Action::Elect {
@@ -1805,11 +1345,13 @@ fn five_nodes_lose_a_fast_committed_entry_under_the_published_recovery() {
       index: 0,
     },
   ];
-  let everything = [&[Action::Start][..], &history, &overwrite, &commit_w].concat();
-  print_trace(scope, &everything);
-  assert_eq!(replay_script(scope, &history), None);
+  let model = SlotModel::at(scope);
+  let start = State::initial();
+  let everything = [&history[..], &overwrite, &commit_w].concat();
+  exhaustive::print_trace(&model, start, &everything);
+  assert_eq!(exhaustive::run_script(&model, start, &history).1, None);
   assert_eq!(
-    replay_script(scope, &[&history[..], &overwrite].concat()),
+    exhaustive::run_script(&model, start, &[&history[..], &overwrite].concat()).1,
     Some(Fault::OverwroteChosen {
       index: 0,
       chosen: V,
@@ -1818,7 +1360,7 @@ fn five_nodes_lose_a_fast_committed_entry_under_the_published_recovery() {
     })
   );
   assert_eq!(
-    replay_script(scope, &everything[1..]),
+    exhaustive::run_script(&model, start, &everything).1,
     Some(Fault::Disagreement {
       index: 0,
       first: V,
@@ -1847,10 +1389,13 @@ fn the_published_recovery_loses_agreement_when_its_leader_decides_by_votes() {
       terms: 4,
       rule: Rule::Published(reading),
     };
-    let report = search(scope, |fault| matches!(fault, Fault::Disagreement { .. }));
-    print_report(scope, &report);
+    let model = SlotModel::at(scope);
+    let report = exhaustive::search(&model, State::initial(), &|fault| {
+      matches!(fault, Fault::Disagreement { .. })
+    });
+    exhaustive::print_report(&model, &model.label(), State::initial(), &report);
     assert!(
-      report.paths[0] > 0,
+      report.taken(&model, PATHS[0]) > 0,
       "{reading:?}: no fast commit was reached"
     );
     let lost = report.stopped.is_some();
@@ -1864,14 +1409,13 @@ fn the_published_recovery_loses_agreement_when_its_leader_decides_by_votes() {
 /// it is not of B's term. Every future of that state is searched: nothing ever commits again.
 #[test]
 fn keeping_leader_approved_entries_stalls_the_log_after_one_crash() {
-  let scope = Scope {
+  let model = SlotModel::at(Scope {
     nodes: 4,
     indices: 1,
     values: 2,
     terms: 4,
     rule: Rule::Published(Reading::KeepLeaderApproved),
-  }
-  .checked();
+  });
   let history = [
     Action::Timeout { node: A },
     Action::Elect {
@@ -1926,17 +1470,17 @@ fn keeping_leader_approved_entries_stalls_the_log_after_one_crash() {
       index: 0,
     },
   ];
-  print_trace(scope, &[&[Action::Start][..], &history].concat());
-  let (stuck, fault) = run_script(scope, &history);
+  exhaustive::print_trace(&model, State::initial(), &history);
+  let (stuck, fault) = exhaustive::run_script(&model, State::initial(), &history);
   assert_eq!(fault, None);
-  let futures = search_from(scope, stuck, |_| true);
-  print_report(scope, &futures);
+  let futures = exhaustive::search(&model, stuck, &|_| true);
+  exhaustive::print_report(&model, &model.label(), stuck, &futures);
   assert!(
     futures.states > 1,
     "the stalled state has futures to search"
   );
   assert_eq!(
-    futures.paths[0] + futures.paths[1],
+    futures.taken(&model, PATHS[0]) + futures.taken(&model, PATHS[1]),
     0,
     "some future of the stalled state commits"
   );
@@ -1945,16 +1489,18 @@ fn keeping_leader_approved_entries_stalls_the_log_after_one_crash() {
 /// Runs the ballot rule at `scope`: no fault, and every path taken. A fault is printed with the step that met
 /// it, and with the whole shortest history when the serial search affords it.
 fn ballots_hold(scope: Scope) {
-  let (report, met) = explore(scope, MEMORY_CEILING_BYTES, false);
-  print_report(scope, &report);
+  let model = SlotModel::at(scope);
+  let (report, met) = exhaustive::explore(&model, MEMORY_CEILING_BYTES, false);
+  exhaustive::print_report(&model, &model.label(), State::initial(), &report);
   if let Some((from, action, fault)) = met {
     eprintln!("{fault:?} met by {action} from {from:?}");
-    print_report(scope, &search(scope, |_| true));
+    let shortest = exhaustive::search(&model, State::initial(), &|_| true);
+    exhaustive::print_report(&model, &model.label(), State::initial(), &shortest);
     panic!("the ballot rule failed at {scope:?}: {fault:?}");
   }
-  for (path, (name, count)) in PATHS.iter().zip(report.paths).enumerate() {
+  for (path, (name, count)) in PATHS.iter().zip(&report.paths).enumerate() {
     let reachable = scope.indices > 1 || path != OUT_OF_ORDER_PATH;
-    assert!(!reachable || count > 0, "{name} never ran at {scope:?}");
+    assert!(!reachable || *count > 0, "{name} never ran at {scope:?}");
   }
 }
 
@@ -2018,7 +1564,8 @@ fn one_scope_from_the_environment() {
     gigabytes.parse::<usize>().unwrap() << 30
   });
   let levels = std::env::var("SLATES_SLOT_LEVELS").is_ok();
-  let (report, met) = explore(scope, ceiling, levels);
-  print_report(scope, &report);
+  let model = SlotModel::at(scope);
+  let (report, met) = exhaustive::explore(&model, ceiling, levels);
+  exhaustive::print_report(&model, &model.label(), State::initial(), &report);
   assert!(met.is_none(), "{met:?}");
 }
