@@ -134,15 +134,32 @@ their self-approved entries with their vote, and the new leader re-runs the vote
   fast-chosen entry must have the most votes in every classic quorum the leader may hear from, i.e.
   `2|F| + |Q| > 2n` with `|Q| = ⌊n/2⌋ + 1`. slates derives `|F|` as the smallest size satisfying that
   inequality and checks it exhaustively against ⌈3n/4⌉ (they agree for every n checked by hand, 3–7).
-- **Suspected hole in the recovery rule, to be tested before building on it.** The election compares
-  leader-approved entries only, and a self-approved vote carries no term. A candidate whose last
-  leader-approved entry is w at index i (term t−1) can win term t+1 even though v was fast-committed at i
-  in term t (the leader of t held v leader-approved; the fast quorum held v self-approved, and their last
-  leader-approved entries may be older than w). If the new leader keeps w by the classic rule, a committed
-  entry is lost. The fix Fast Paxos implies: every self-approved vote records the term it was cast in;
-  recovery takes, per index, the highest term among the reports; a leader-approved entry at that term
-  wins; otherwise (fast votes only) the value that could have been fast-chosen wins. The simulation must
-  find the paper-rule counterexample (a failing test) before the corrected rule is built.
+- **The published recovery is unsafe, as suspected; the ballot rule replaces it** (slice 8,
+  `crates/cluster/tests/slot_model.rs`). The election compares leader-approved entries only, and a
+  self-approved vote carries no term. An exhaustive search of the log model found where that breaks.
+  - **Under the two readings in which the leader decides by votes** (the pseudocode as written, and a
+    leader deciding each index once per term), two values commit at one index; the shortest histories take
+    15 and 18 steps with four nodes. In the second, a leader holding a leader-approved entry from term 1
+    wins term 4 with two voters that hold only self-approved copies of the value committed in term 3. Two
+    votes are short of a classic quorum, so the leader's own stale entry stands, overwrites theirs and
+    commits. With five nodes, where a fast quorum (four) is larger than a classic one (three), the history
+    derived by hand from this hypothesis replays step for step.
+  - **Under the reading that keeps a leader's leader-approved entries,** as the paper's prose says ("treated
+    the same as they are treated in classic Raft"), the searched scope has no fault. But one leader crash
+    between a decision and its commit then stalls the log for good. The next leader may not decide over the
+    inherited entry, and may not commit it, since it is not of its own term.
+  - **The ballot rule** (Fast Paxos's, in terms of Raft's):
+    - Every slot records its ballot: its term, and within a term a leader's decision outranks a fast vote.
+    - Recovery takes, per index, the highest ballot among a majority's reports, the new leader's own
+      included. A decision is re-proposed as it is. At a fast ballot, the value with at least
+      `|Q| + |F| − n` of the reports is re-proposed, and otherwise the index is free.
+    - Recovered values are re-proposed at the new term, so the new leader can commit them, which is what
+      the third reading lacks.
+    - The fast track opens only at free indices, and a leader decides from fast votes of its own term,
+      once per index.
+
+    It holds at every scope searched, up to 23,552,907 classes with five nodes and four terms, and the
+    election needs no log comparison for safety.
 - **Measured trade-off.** The paper: about half of classic Raft's latency below 4 % loss on five AWS
   sites, worse above (the classic track costs an extra round after a failed fast attempt). slates
   measures the same crossover on its own profiles and decides from the data whether the fast track is
@@ -349,3 +366,56 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
       election, since the timer's jitter is a draw from the node's id.
     - The fleet's Vivaldi coordinates are not fed coherently: engines are per probe task, and the announced
       coordinate comes from an unfed engine. Priority therefore uses measured paths.
+- **Slice 8 (2026-09-28): the slot model.** Fast Raft's published recovery loses committed entries, and the
+  ballot rule does not (`crates/cluster/tests/slot_model.rs`; §3.7 above). The model is the log that the
+  fast track and parallel replication share: every index above the committed prefix is a single-decree
+  instance. Its actions are atomic, as a TLA+ specification's would be: a term bump, an election won with a
+  chosen majority and its recovery, a proposal landing at a node, a leader's decision from a chosen
+  majority's votes, one replication, and a commit. After every step it checks:
+  - agreement (Fast Raft's Definition 2.1);
+  - P2c: no leader of a term at or after a commit sends another value there, which is the claim of Fast
+    Raft's Lemma 2;
+  - one leader per term;
+  - one decision per classic ballot.
+  - **The published rule, four nodes, one index, two values, four terms.** Its decision loop is searched
+    under three readings:
+
+    | Reading | Classes searched | Result |
+    |---|---|---|
+    | as written | 1,049,232 | a committed value overwritten at step 13; two values committed at step 15 |
+    | once per term | 1,199,113 | overwritten at step 16; two values committed at step 18 |
+    | keeping leader-approved entries | 999,583 | no fault, but the log stalls: after a 12-step history with one crash, all 225 futures within four terms commit nothing |
+
+    With five nodes, a scripted 27-step history commits two values. That fault needs no fast commit:
+    breadth-first search found a 16-step five-node history in which a leader decides by votes over its own
+    classically committed entry.
+  - **The ballot rule.** No fault at any scope searched, and every path was taken at every scope:
+
+    | Nodes, indices, values, terms | Classes | Fast commits | Recoveries a possible fast choice constrained | Commits above an uncommitted index |
+    |---|---|---|---|---|
+    | 4, 1, 2, 3 (the default suite) | 56,971 | 626 | 8,684 | — |
+    | 4, 1, 2, 4 | 463,715 | 2,003 | 72,856 | — |
+    | 4, 1, 3, 4 | 642,654 | 2,003 | 86,443 | — |
+    | 5, 1, 2, 4 | 23,552,907 | 6,269 | 6,082,739 | — |
+    | 3, 2, 2, 2 | 639,871 | 6,290 | 12,742 | 84,071 |
+
+    One index proves every index count. Each action touches one index or the shared terms and votes, so a
+    history over several indices projects onto a valid one-index history.
+  - **The search.** Each state is stored as the representative of its class under renaming nodes and
+    values. The ballot rule is searched breadth first over 128-bit fingerprints, level by level across
+    every core (a skipped state needs a fingerprint collision, below 10⁻²¹ at a billion states). The
+    published rule is searched breadth first on one core with whole keys, which yields the shortest
+    counterexample.
+  - **Measured and rejected** (`docs/wip/BENCHMARKS.md`):
+    - A model that kept each leader's vote tally, searched without symmetry reduction. It held 18 GB after
+      300 s without finishing, and it had no memory bound.
+    - A depth-first search. On the same scope it visited the identical 463,715 classes in 1.16 s against
+      the serial breadth-first search's 1.13 s, and held 38 MB against 94 MB. It saves memory but no time,
+      loses the shortest counterexample, and does not spread across cores. The parallel breadth-first
+      search takes 0.16 s.
+  - **Next.** Build the ballot rule into the dialect, and explore the real code with the randomized
+    explorer. The rule becomes sync terms (a node accepts out-of-order and fast slots only of the term it
+    was synced to), windows above the Raft prefix, the recovery, and a sync append that truncates stale
+    tails. Membership changes stay classic and in order, with no windows or fast votes open while one is
+    pending.
+

@@ -1,0 +1,2024 @@
+//! The log model that parallel replication and the fast track share (`docs/wip/research/
+//! consensus-enhancements.md` §3.5, §3.7 and §4), checked by an exhaustive search over every interleaving of
+//! its actions at small scope, before any of it is built into the dialect.
+//!
+//! **What is modelled.** Each index above the committed prefix is a single-decree instance. Under parallel
+//! replication a follower accepts the leader's entry at an index before the entries below it arrive; under
+//! the fast track it accepts a proposer's entry straight from the proposer. Either way a new leader cannot
+//! trust its own log above the committed prefix the way a Raft leader can: it must recover every such index
+//! from a majority before it proposes there. The actions are atomic, as in a TLA+ specification: a term
+//! bump (a timeout, or a term learnt from a leader's message), an election won with a chosen majority (and
+//! the recovery its rule runs), a proposal landing at a node, a leader's decision from the votes of a chosen
+//! majority, one replication, a commit. A lost or late message is an action not taken, or taken later; a
+//! crashed node is one that takes no more actions.
+//!
+//! **The two recoveries.** *Published* is Fast Raft as its authors give it (Castiglia, Goldberg and
+//! Patterson, arXiv:2004.06215 §IV): an entry is self-approved (inserted from a proposer into an empty
+//! slot) or leader-approved (sent by a leader, which overwrites); the election compares only the last
+//! leader-approved entry; the leader decides an index by the entries its followers hold there (every
+//! follower answers a proposal with the entry it holds, and the self-approved entries a new leader's voters
+//! send it are the same votes). Its decision loop can be read three ways ([`Reading`]); all three are
+//! searched. *Ballots* is the rule §4 of the research record states: every slot records the ballot it was
+//! accepted at — its term, and within a term a leader's decision outranks a fast vote — and per index the
+//! highest ballot among the majority's reports decides. A leader's decision is re-proposed as it is. At a
+//! fast ballot, the value a fast quorum could have chosen is re-proposed: the one with at least
+//! `|Q| + |F| − n` of the reports (Lamport, *Fast Paxos*, 2006). Otherwise the index is free, and only a free
+//! index is opened to the fast track.
+//!
+//! **The checks.** Every commit must commit the value committed before at its index, if any (agreement:
+//! Fast Raft's Definition 2.1). No leader of the term a value was chosen in, or of a later term, may send
+//! another value at its index (Paxos's P2c, which Fast Raft's Lemma 2 claims: "a follower never overwrites a
+//! chosen entry"). The search also faults on two leaders in one term, and on two different decisions at one
+//! classic ballot. The published rule fails under every reading, and the search prints the shortest
+//! counterexample of each. The ballot rule must pass at every scope. Every path it has — fast commits,
+//! classic commits, both kinds of constrained recovery, a leader's decision from its fast votes, a stale
+//! value overwritten, a commit above an uncommitted index — must be taken at least once, so that a
+//! silently dead path cannot pass for a proof.
+//!
+//! **Why one index proves every index count, for the ballot rule.** Every action touches one index, or the
+//! terms and votes all indices share; a replication to a node that raises its term does to the shared state
+//! exactly what the node learning that term from its leader does. So a history over several indices
+//! projects, index by index, onto a valid history over one: drop the other indices' steps, turning a
+//! replication there that raised a term into the [`Action::Learn`] it implies. A fault at any index would
+//! appear in the one-index search. The two-index scope only shows that a commit above an uncommitted index
+//! is reachable. (The published rule does not project, since its leader decides only at `commitIndex + 1`.)
+//!
+//! **The search.** A state is packed into four words. Nodes are interchangeable and so are values, so each
+//! state is stored as the representative of its class: nodes ordered by a signature that renaming leaves
+//! unchanged, ties broken by trying every order within them and keeping the least packed state, values
+//! renumbered by first appearance. The published rule is searched breadth first on one core with whole keys
+//! and parents, which yields the shortest counterexample. The ballot rule, expected to pass, is searched
+//! breadth first level by level across every core over 128-bit fingerprints of the representatives: two
+//! states share a fingerprint with probability 2⁻¹²⁸, so some pair among `n` does with probability below
+//! `n²/2¹²⁹` (under 10⁻²¹ for a billion states), and only then could a state be skipped. Traversal order does
+//! not change the work: a breadth-first and a depth-first search of the same scope both visited the same
+//! 463,715 classes, in 1.13 s and 1.16 s, holding 94 MB and 38 MB (2026-09-28); the cost is the classes
+//! times the work per step, dominated by finding each successor's representative, so the lever is cores.
+//! The first search, which kept every leader's vote tally and every labelling, held 18 GB after 300 s
+//! without finishing (2026-09-28); every search now has a budget derived from the measured cost of a state
+//! and fails rather than exhausting the machine.
+
+// Test harness: an unwrap, expect or panic here is a failed test.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, VecDeque};
+use std::fmt;
+use std::hash::{BuildHasherDefault, Hash, Hasher};
+
+/// Shape: the most nodes a scope here models.
+const MAX_NODES: usize = 5;
+/// Shape: the most log indices a scope here models.
+const MAX_INDICES: usize = 2;
+/// Shape: the highest term a scope here reaches; a term packs into three bits.
+const MAX_TERMS: u8 = 4;
+/// Shape: the most distinct proposed values a scope here models; a value packs into two bits beside "none".
+const MAX_VALUES: u8 = 3;
+/// Format: the 64-bit words a packed state takes — at most 37 bits a node and 20 more for the whole state.
+const WORDS: usize = 4;
+/// Shape: the resident memory a search may hold. GitHub's smallest runner (the macOS image, 7 GB) runs the
+/// full-scale step alone after the build; this leaves it 3 GB.
+const MEMORY_CEILING_BYTES: usize = 4 << 30;
+/// Derived: resident memory over the bytes the parallel search accounts for — measured 2,689 MB resident
+/// against 1,556 MB accounted at the widest level of five nodes and four terms (2026-09-28): the buckets'
+/// and frontiers' doubling capacities and the allocator's retained pages, which no field count sees. Rounded
+/// up.
+const RESIDENT_PER_ACCOUNTED: usize = 2;
+/// Derived: the bytes one state costs the breadth-first search at the peak, measured — 186.8 MB of
+/// resident memory for 968,767 states (193 bytes each) and 404.6 MB for 2,855,567 (142 each), release,
+/// 2026-09-28: its packed key in the visited set and again in the id table, its parent's id and its place in
+/// the queue, with the set and the table briefly holding both their old and new storage as they grow.
+/// Rounded up.
+const BYTES_PER_STATE: usize = 200;
+/// Derived: the most states the breadth-first search may visit before it fails.
+const STATE_BUDGET: usize = MEMORY_CEILING_BYTES / BYTES_PER_STATE;
+/// Derived: the bytes a visited class costs the parallel search at its peak: a 16-byte fingerprint and a
+/// control byte per bucket, the set at 7/8 load, and — while a shard grows — its old table beside the new one
+/// of twice the buckets: `17 × 8/7 × 3`. Rounded up.
+const VISITED_BYTES: usize = (16 + 1) * 8 * 3 / 7 + 1;
+/// Format: the bytes a frontier entry costs (one packed state).
+const FRONTIER_BYTES: usize = size_of::<Key>();
+/// Format: the bytes a bucketed successor costs (its fingerprint and packed state).
+const BUCKET_BYTES: usize = size_of::<(u128, Key)>();
+
+/// How Fast Raft's decision loop is read. Its §IV-B loop — "while there exists a k = commitIndex + 1 for
+/// which at least a classic quorum of votes has been received: insert entry e from possibleEntries[k] with
+/// highest number of votes" — decides again as votes arrive; its §IV-C prose says leader-approved entries
+/// "are treated the same as they are treated in classic Raft". Each reading is searched, so the failure is
+/// no artifact of one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+  /// As written: the loop decides whenever a classic quorum of votes is in.
+  Literal,
+  /// A leader decides an index at most once in its term.
+  OncePerTerm,
+  /// Once per term, and never by votes where the leader already holds a leader-approved entry, which it
+  /// replicates as classic Raft would.
+  KeepLeaderApproved,
+}
+
+/// Which recovery a newly elected leader runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rule {
+  /// Fast Raft as published, under one reading of its decision loop.
+  Published(Reading),
+  /// The ballot rule of the research record's §4.
+  Ballots,
+}
+
+/// The bounds of one search.
+#[derive(Clone, Copy, Debug)]
+struct Scope {
+  nodes: usize,
+  indices: usize,
+  values: u8,
+  terms: u8,
+  rule: Rule,
+}
+
+impl Scope {
+  fn majority(self) -> usize {
+    self.nodes / 2 + 1
+  }
+
+  /// The fast quorum: the smallest `f` with `2f + q > 2n` for the classic quorum `q` — the size at which a
+  /// value a fast quorum accepted has the most votes in every classic quorum (Fast Paxos's requirement, which
+  /// Fast Raft states as ⌈3n/4⌉; [`Scope::checked`] asserts the two agree).
+  fn fast_quorum(self) -> usize {
+    let majority = self.majority();
+    (1..=self.nodes)
+      .find(|fast| 2 * fast + majority > 2 * self.nodes)
+      .unwrap()
+  }
+
+  /// This scope, after checking it fits the packed state and that the derived fast quorum is Fast Raft's.
+  fn checked(self) -> Scope {
+    assert!(self.nodes <= MAX_NODES && self.indices <= MAX_INDICES);
+    assert!(self.values <= MAX_VALUES && self.terms <= MAX_TERMS);
+    assert_eq!(self.fast_quorum(), (3 * self.nodes).div_ceil(4));
+    self
+  }
+
+  fn node_ids(self) -> std::ops::Range<usize> {
+    0..self.nodes
+  }
+
+  fn published(self) -> bool {
+    matches!(self.rule, Rule::Published(_))
+  }
+}
+
+/// A node's slot at one index: the value, the term it was accepted at, and whether a leader decided it (a
+/// leader-approved entry, or under the ballot rule a classic ballot) rather than it arriving straight from a
+/// proposer (a self-approved entry, or a fast vote).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Slot {
+  term: u8,
+  classic: bool,
+  value: u8,
+}
+
+impl Slot {
+  /// The slot's ballot under the ballot rule: its term, and within a term a decision outranks a fast vote.
+  fn ballot(self) -> (u8, bool) {
+    (self.term, self.classic)
+  }
+}
+
+/// What a leader may still do at an index in its term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Phase {
+  /// Nothing decided there yet (under the ballot rule, recovery found nothing that could have been chosen).
+  Free,
+  /// The fast track is open there (the ballot rule).
+  Opened,
+  /// The leader decided there.
+  Decided,
+}
+
+/// A leader's volatile state for its term. It keeps no tally of votes: a decision reads the votes of the
+/// majority it is taken from at once (see [`Action::Decide`]), which is the tally a leader holds when every
+/// vote it counted is still the voter's entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Leading {
+  /// Per index, the nodes that acknowledged the leader's current entry there.
+  acks: [u8; MAX_INDICES],
+  /// Per index, what the leader may still do there.
+  phase: [Phase; MAX_INDICES],
+  /// Per index, whether this leader committed there.
+  committed: [bool; MAX_INDICES],
+}
+
+impl Leading {
+  fn new() -> Leading {
+    Leading {
+      acks: [0; MAX_INDICES],
+      phase: [Phase::Free; MAX_INDICES],
+      committed: [false; MAX_INDICES],
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Node {
+  term: u8,
+  voted_for: Option<u8>,
+  slots: [Option<Slot>; MAX_INDICES],
+  leading: Option<Leading>,
+}
+
+/// A value committed at an index, and the term it was committed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Chosen {
+  value: u8,
+  term: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct State {
+  nodes: [Node; MAX_NODES],
+  /// Under the ballot rule, whether the leader of each term opened the fast track at each index.
+  opened: [[bool; MAX_INDICES]; MAX_TERMS as usize + 1],
+  /// What was committed at each index first, the history the checks read.
+  chosen: [Option<Chosen>; MAX_INDICES],
+}
+
+impl State {
+  fn initial() -> State {
+    let node = Node {
+      term: 0,
+      voted_for: None,
+      slots: [None; MAX_INDICES],
+      leading: None,
+    };
+    State {
+      nodes: [node; MAX_NODES],
+      opened: [[false; MAX_INDICES]; MAX_TERMS as usize + 1],
+      chosen: [None; MAX_INDICES],
+    }
+  }
+}
+
+/// One atomic step of the model.
+#[derive(Clone, Copy, Debug)]
+enum Action {
+  /// The initial state.
+  Start,
+  /// A node times out: it enters the next term and votes for itself.
+  Timeout { node: usize },
+  /// A node learns the term of a leader from its append or heartbeat, without voting. (A candidate's vote
+  /// request needs no step of its own: a node it reaches either votes, which [`Action::Elect`] covers, or
+  /// takes no action that matters, which not stepping covers.)
+  Learn { node: usize, term: u8 },
+  /// A candidate wins its term with the votes of `quorum` (a bit per node), and runs its rule's recovery.
+  Elect { node: usize, quorum: u8 },
+  /// Published: a proposal lands in a node's empty slot, self-approved.
+  Insert {
+    node: usize,
+    index: usize,
+    value: u8,
+  },
+  /// Ballots: a node accepts a proposal at an index its term's leader opened, as a fast vote.
+  Accept {
+    node: usize,
+    index: usize,
+    value: u8,
+  },
+  /// Ballots: a leader opens a free index to the fast track.
+  Open { leader: usize, index: usize },
+  /// Ballots: a leader proposes its own value at a free index (parallel replication's new entry).
+  Propose {
+    leader: usize,
+    index: usize,
+    value: u8,
+  },
+  /// A leader decides an index from the votes of `voters` (a bit per node): each voter's entry there.
+  Decide {
+    leader: usize,
+    index: usize,
+    value: u8,
+    voters: u8,
+  },
+  /// A leader's decided entry reaches one node, which acknowledges it.
+  Replicate {
+    leader: usize,
+    node: usize,
+    index: usize,
+  },
+  /// A leader commits its entry at an index once a majority acknowledged it.
+  Commit { leader: usize, index: usize },
+}
+
+/// Format: the letters nodes print as.
+const NAMES: [char; MAX_NODES] = ['A', 'B', 'C', 'D', 'E'];
+
+fn names(mask: u8) -> String {
+  (0..MAX_NODES)
+    .filter(|node| mask & bit(*node) != 0)
+    .map(|node| NAMES[node])
+    .collect()
+}
+
+impl fmt::Display for Action {
+  fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match *self {
+      Action::Start => write!(out, "start"),
+      Action::Timeout { node } => write!(out, "{} times out", NAMES[node]),
+      Action::Learn { node, term } => write!(out, "{} learns term {term}", NAMES[node]),
+      Action::Elect { node, quorum } => {
+        write!(out, "{} is elected by {}", NAMES[node], names(quorum))
+      }
+      Action::Insert { node, index, value } => {
+        write!(out, "{} inserts v{value} at {index}", NAMES[node])
+      }
+      Action::Accept { node, index, value } => {
+        write!(out, "{} fast-accepts v{value} at {index}", NAMES[node])
+      }
+      Action::Open { leader, index } => write!(out, "{} opens {index}", NAMES[leader]),
+      Action::Propose {
+        leader,
+        index,
+        value,
+      } => write!(out, "{} proposes v{value} at {index}", NAMES[leader]),
+      Action::Decide {
+        leader,
+        index,
+        value,
+        voters,
+      } => write!(
+        out,
+        "{} decides v{value} at {index} from {}",
+        NAMES[leader],
+        names(voters)
+      ),
+      Action::Replicate {
+        leader,
+        node,
+        index,
+      } => write!(
+        out,
+        "{} replicates {index} to {}",
+        NAMES[leader], NAMES[node]
+      ),
+      Action::Commit { leader, index } => write!(out, "{} commits {index}", NAMES[leader]),
+    }
+  }
+}
+
+/// Why a search stopped, or what it recorded on the way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+  /// Two values committed at one index.
+  Disagreement { index: usize, first: u8, second: u8 },
+  /// A leader of the term a value was committed in, or of a later term, sent another value at its index.
+  OverwroteChosen {
+    index: usize,
+    chosen: u8,
+    sent: u8,
+    term: u8,
+  },
+  /// Two leaders in one term.
+  TwoLeaders { term: u8 },
+  /// Two different decisions at one classic ballot.
+  TwoDecisions { index: usize, term: u8 },
+}
+
+/// The paths a step took, as bits of a mask (the non-vacuity counters' keys).
+const FAST_COMMIT: u8 = 1;
+const CLASSIC_COMMIT: u8 = 2;
+const RECOVERED_DECISION: u8 = 4;
+const RECOVERED_FAST_CHOICE: u8 = 8;
+const DECIDED_FROM_VOTES: u8 = 16;
+const OVERWROTE_STALE: u8 = 32;
+const OUT_OF_ORDER_COMMIT: u8 = 64;
+/// Format: each path's name, in bit order.
+const PATHS: [&str; 7] = [
+  "fast commits",
+  "classic commits",
+  "recoveries a decision constrained",
+  "recoveries a possible fast choice constrained",
+  "decisions from fast votes",
+  "stale values overwritten",
+  "commits above an uncommitted index",
+];
+/// Format: the position of [`OUT_OF_ORDER_COMMIT`] in [`PATHS`], a path only a scope of two indices has.
+const OUT_OF_ORDER_PATH: usize = 6;
+
+/// The result of one step.
+struct Next {
+  state: State,
+  fault: Option<Fault>,
+  paths: u8,
+}
+
+impl Next {
+  fn plain(state: State) -> Next {
+    Next {
+      state,
+      fault: None,
+      paths: 0,
+    }
+  }
+}
+
+fn bit(node: usize) -> u8 {
+  1 << node
+}
+
+fn id(node: usize) -> u8 {
+  u8::try_from(node).unwrap()
+}
+
+fn members(mask: u8, nodes: usize) -> impl Iterator<Item = usize> {
+  (0..nodes).filter(move |node| mask & bit(*node) != 0)
+}
+
+fn size(mask: u8) -> usize {
+  usize::try_from(mask.count_ones()).unwrap()
+}
+
+/// Every set of at least a majority of the nodes, as masks.
+fn majorities(scope: Scope) -> impl Iterator<Item = u8> {
+  let everyone = u8::try_from((1_usize << scope.nodes) - 1).unwrap();
+  (1..=everyone).filter(move |mask| size(*mask) >= scope.majority())
+}
+
+/// The node leading `term`, if one does.
+fn leader_of(scope: Scope, state: &State, term: u8) -> Option<usize> {
+  scope
+    .node_ids()
+    .find(|node| state.nodes[*node].term == term && state.nodes[*node].leading.is_some())
+}
+
+/// Every action worth trying from `state` (each is checked for being enabled when applied).
+fn candidates(scope: Scope, state: &State, out: &mut Vec<Action>) {
+  for node in scope.node_ids() {
+    out.push(Action::Timeout { node });
+    out.extend((1..=scope.terms).map(|term| Action::Learn { node, term }));
+    out.extend(
+      majorities(scope)
+        .filter(|quorum| quorum & bit(node) != 0)
+        .map(|quorum| Action::Elect { node, quorum }),
+    );
+    for index in 0..scope.indices {
+      out.extend((0..scope.values).map(|value| match scope.rule {
+        Rule::Published(_) => Action::Insert { node, index, value },
+        Rule::Ballots => Action::Accept { node, index, value },
+      }));
+    }
+    if state.nodes[node].leading.is_some() {
+      leader_candidates(scope, node, out);
+    }
+  }
+}
+
+fn leader_candidates(scope: Scope, leader: usize, out: &mut Vec<Action>) {
+  for index in 0..scope.indices {
+    out.push(Action::Commit { leader, index });
+    if scope.rule == Rule::Ballots {
+      out.push(Action::Open { leader, index });
+      out.extend((0..scope.values).map(|value| Action::Propose {
+        leader,
+        index,
+        value,
+      }));
+    }
+    for value in 0..scope.values {
+      out.extend(majorities(scope).map(|voters| Action::Decide {
+        leader,
+        index,
+        value,
+        voters,
+      }));
+    }
+    out.extend(
+      scope
+        .node_ids()
+        .filter(|node| *node != leader)
+        .map(|node| Action::Replicate {
+          leader,
+          node,
+          index,
+        }),
+    );
+  }
+}
+
+/// `action` applied to `state`, or `None` when it is not enabled there or changes nothing.
+fn apply(scope: Scope, state: &State, action: Action) -> Option<Next> {
+  let next = match action {
+    Action::Start => None,
+    Action::Timeout { node } => timeout(scope, state, node),
+    Action::Learn { node, term } => learn(scope, state, node, term),
+    Action::Elect { node, quorum } => elect(scope, state, node, quorum),
+    Action::Insert { node, index, value } => insert(state, node, index, value),
+    Action::Accept { node, index, value } => accept(state, node, index, value),
+    Action::Open { leader, index } => open(state, leader, index),
+    Action::Propose {
+      leader,
+      index,
+      value,
+    } => propose(state, leader, index, value),
+    Action::Decide {
+      leader,
+      index,
+      value,
+      voters,
+    } => decide(scope, state, leader, index, value, voters),
+    Action::Replicate {
+      leader,
+      node,
+      index,
+    } => replicate(scope, state, leader, node, index),
+    Action::Commit { leader, index } => commit(scope, state, leader, index),
+  }?;
+  (next.state != *state || next.fault.is_some()).then_some(next)
+}
+
+fn timeout(scope: Scope, state: &State, node: usize) -> Option<Next> {
+  if state.nodes[node].term >= scope.terms {
+    return None;
+  }
+  let mut next = *state;
+  let candidate = &mut next.nodes[node];
+  candidate.term += 1;
+  candidate.voted_for = Some(id(node));
+  candidate.leading = None;
+  Some(Next::plain(next))
+}
+
+fn learn(scope: Scope, state: &State, node: usize, term: u8) -> Option<Next> {
+  if term <= state.nodes[node].term || leader_of(scope, state, term).is_none() {
+    return None;
+  }
+  let mut next = *state;
+  let learner = &mut next.nodes[node];
+  learner.term = term;
+  learner.voted_for = None;
+  learner.leading = None;
+  Some(Next::plain(next))
+}
+
+/// The last leader-approved entry of `node`, as Fast Raft's election compares it: its index counted from one
+/// (zero when there is none) and its term.
+fn last_leader_approved(scope: Scope, node: &Node) -> (usize, u8) {
+  (0..scope.indices)
+    .rev()
+    .find_map(|index| {
+      node.slots[index]
+        .filter(|slot| slot.classic)
+        .map(|slot| (index + 1, slot.term))
+    })
+    .unwrap_or((0, 0))
+}
+
+/// Whether `voter` grants `candidate` its vote for the candidate's term. The ballot rule's recovery needs no
+/// log comparison for safety, so it is searched with none — every majority may elect any candidate, which
+/// covers any comparison an implementation adds.
+fn grants(scope: Scope, state: &State, voter: usize, candidate: usize) -> bool {
+  let (elector, running) = (state.nodes[voter], state.nodes[candidate]);
+  let term_allows = elector.term < running.term
+    || (elector.term == running.term
+      && elector
+        .voted_for
+        .is_none_or(|choice| usize::from(choice) == candidate));
+  if !term_allows || !scope.published() {
+    return term_allows;
+  }
+  // Fast Raft §IV-C: "candLastLogIndex ≥ lastLeaderIndex and candLastLogTerm ≥ log[lastLeaderIndex].term, or
+  // candLastLogTerm > lastLeaderIndex.term".
+  let (candidate_index, candidate_term) = last_leader_approved(scope, &running);
+  let (voter_index, voter_term) = last_leader_approved(scope, &elector);
+  (candidate_index >= voter_index && candidate_term >= voter_term) || candidate_term > voter_term
+}
+
+fn elect(scope: Scope, state: &State, node: usize, quorum: u8) -> Option<Next> {
+  let running = state.nodes[node];
+  if quorum & bit(node) == 0 || running.leading.is_some() || running.voted_for != Some(id(node)) {
+    return None;
+  }
+  if !members(quorum, scope.nodes)
+    .filter(|voter| *voter != node)
+    .all(|voter| grants(scope, state, voter, node))
+  {
+    return None;
+  }
+  let mut next = Next::plain(*state);
+  for voter in members(quorum, scope.nodes) {
+    let elector = &mut next.state.nodes[voter];
+    elector.term = running.term;
+    elector.voted_for = Some(id(node));
+    elector.leading = None;
+  }
+  if leader_of(scope, state, running.term).is_some() {
+    next.fault = Some(Fault::TwoLeaders { term: running.term });
+    return Some(next);
+  }
+  next.state.nodes[node].leading = Some(Leading::new());
+  if scope.rule == Rule::Ballots {
+    ballot_recovery(scope, state, node, quorum, &mut next);
+  }
+  Some(next)
+}
+
+/// The value the ballot rule constrains a new leader to at `index`, given the reports of `quorum`, with the
+/// path that constrained it — or `Ok(None)` when nothing could have been chosen there.
+fn constrained(
+  scope: Scope,
+  state: &State,
+  quorum: u8,
+  index: usize,
+) -> Result<Option<(u8, u8)>, Fault> {
+  let reports: Vec<Slot> = members(quorum, scope.nodes)
+    .filter_map(|voter| state.nodes[voter].slots[index])
+    .collect();
+  let Some(highest) = reports.iter().map(|slot| slot.ballot()).max() else {
+    return Ok(None);
+  };
+  let at_highest: Vec<u8> = reports
+    .iter()
+    .filter(|slot| slot.ballot() == highest)
+    .map(|slot| slot.value)
+    .collect();
+  let (term, classic) = highest;
+  if classic {
+    let value = at_highest[0];
+    if at_highest.iter().any(|other| *other != value) {
+      return Err(Fault::TwoDecisions { index, term });
+    }
+    return Ok(Some((value, RECOVERED_DECISION)));
+  }
+  let threshold = size(quorum) + scope.fast_quorum() - scope.nodes;
+  Ok(
+    (0..scope.values)
+      .find(|value| at_highest.iter().filter(|vote| **vote == *value).count() >= threshold)
+      .map(|value| (value, RECOVERED_FAST_CHOICE)),
+  )
+}
+
+/// The ballot rule's recovery: every index the reports constrain is re-proposed at the new term's classic
+/// ballot; every other index is free.
+fn ballot_recovery(scope: Scope, state: &State, node: usize, quorum: u8, next: &mut Next) {
+  let term = state.nodes[node].term;
+  for index in 0..scope.indices {
+    match constrained(scope, state, quorum, index) {
+      Err(fault) => next.fault = Some(fault),
+      Ok(None) => {}
+      Ok(Some((value, path))) => {
+        guard(next, index, value, term);
+        let leader = &mut next.state.nodes[node];
+        leader.slots[index] = Some(Slot {
+          term,
+          classic: true,
+          value,
+        });
+        if let Some(leading) = leader.leading.as_mut() {
+          leading.phase[index] = Phase::Decided;
+          leading.acks[index] = bit(node);
+        }
+        next.paths |= path;
+      }
+    }
+  }
+}
+
+/// Faults a leader of `term` sending `value` at `index` when another value was committed there in `term` or
+/// before — the step Paxos's P2c forbids.
+fn guard(next: &mut Next, index: usize, value: u8, term: u8) {
+  if let Some(chosen) = next.state.chosen[index]
+    && term >= chosen.term
+    && value != chosen.value
+    && next.fault.is_none()
+  {
+    next.fault = Some(Fault::OverwroteChosen {
+      index,
+      chosen: chosen.value,
+      sent: value,
+      term,
+    });
+  }
+}
+
+fn insert(state: &State, node: usize, index: usize, value: u8) -> Option<Next> {
+  if state.nodes[node].slots[index].is_some() {
+    return None;
+  }
+  let mut next = *state;
+  next.nodes[node].slots[index] = Some(Slot {
+    term: state.nodes[node].term,
+    classic: false,
+    value,
+  });
+  Some(Next::plain(next))
+}
+
+fn accept(state: &State, node: usize, index: usize, value: u8) -> Option<Next> {
+  let acceptor = state.nodes[node];
+  let term = acceptor.term;
+  if !state.opened[usize::from(term)][index] {
+    return None;
+  }
+  let held = acceptor.slots[index];
+  if held.is_some_and(|slot| slot.ballot() >= (term, false)) {
+    return None;
+  }
+  let mut next = Next::plain(*state);
+  next.state.nodes[node].slots[index] = Some(Slot {
+    term,
+    classic: false,
+    value,
+  });
+  if held.is_some_and(|slot| slot.value != value) {
+    next.paths |= OVERWROTE_STALE;
+  }
+  Some(next)
+}
+
+fn open(state: &State, leader: usize, index: usize) -> Option<Next> {
+  let mut next = *state;
+  let leading = next.nodes[leader].leading.as_mut()?;
+  if leading.phase[index] != Phase::Free {
+    return None;
+  }
+  leading.phase[index] = Phase::Opened;
+  next.opened[usize::from(state.nodes[leader].term)][index] = true;
+  Some(Next::plain(next))
+}
+
+fn propose(state: &State, leader: usize, index: usize, value: u8) -> Option<Next> {
+  let term = state.nodes[leader].term;
+  if state.nodes[leader].leading?.phase[index] != Phase::Free {
+    return None;
+  }
+  let mut next = Next::plain(*state);
+  guard(&mut next, index, value, term);
+  let proposer = &mut next.state.nodes[leader];
+  proposer.slots[index] = Some(Slot {
+    term,
+    classic: true,
+    value,
+  });
+  let leading = proposer.leading.as_mut()?;
+  leading.phase[index] = Phase::Decided;
+  leading.acks[index] = bit(leader);
+  Some(next)
+}
+
+/// The votes of `voters` at `index` as a leader of `term` hears them — each voter's entry there — or `None`
+/// when one of them cannot vote: it is not in the term, holds nothing there, or (under the ballot rule)
+/// holds something other than a fast vote of the term.
+fn votes_of(scope: Scope, state: &State, term: u8, index: usize, voters: u8) -> Option<Vec<u8>> {
+  members(voters, scope.nodes)
+    .map(|voter| {
+      let elector = state.nodes[voter];
+      let slot = elector.slots[index].filter(|_| elector.term == term)?;
+      let fast_vote_of_term = slot.term == term && !slot.classic;
+      (scope.published() || fast_vote_of_term).then_some(slot.value)
+    })
+    .collect()
+}
+
+fn decide(
+  scope: Scope,
+  state: &State,
+  leader: usize,
+  index: usize,
+  value: u8,
+  voters: u8,
+) -> Option<Next> {
+  let deciding = state.nodes[leader];
+  let leading = deciding.leading?;
+  let votes = votes_of(scope, state, deciding.term, index, voters)?;
+  let count = |candidate: u8| votes.iter().filter(|vote| **vote == candidate).count();
+  let allowed = match scope.rule {
+    Rule::Published(reading) => {
+      published_allows(scope, reading, &deciding, index, count(value), &count)
+    }
+    Rule::Ballots => ballot_allows(scope, &leading, index, value, votes.len(), &count),
+  };
+  if !allowed {
+    return None;
+  }
+  let mut next = Next::plain(*state);
+  guard(&mut next, index, value, deciding.term);
+  let decided = Slot {
+    term: deciding.term,
+    classic: true,
+    value,
+  };
+  let changed = deciding.slots[index] != Some(decided);
+  next.state.nodes[leader].slots[index] = Some(decided);
+  let leading = next.state.nodes[leader].leading.as_mut()?;
+  if changed {
+    leading.acks[index] = bit(leader);
+  }
+  leading.phase[index] = Phase::Decided;
+  if scope.rule == Rule::Ballots {
+    next.paths |= DECIDED_FROM_VOTES;
+  }
+  if count(value) >= scope.fast_quorum() && !leading.committed[index] {
+    leading.committed[index] = true;
+    record_commit(&mut next, index, value, deciding.term, FAST_COMMIT);
+  }
+  Some(next)
+}
+
+/// Fast Raft §IV-B: only at `commitIndex + 1`, the entry with the most votes, ties broken arbitrarily (so
+/// each tied value is its own branch) — restricted as `reading` reads the loop.
+fn published_allows(
+  scope: Scope,
+  reading: Reading,
+  deciding: &Node,
+  index: usize,
+  for_value: usize,
+  count: &dyn Fn(u8) -> usize,
+) -> bool {
+  let Some(leading) = deciding.leading else {
+    return false;
+  };
+  let next_to_commit = (0..scope.indices).find(|earlier| !leading.committed[*earlier]);
+  let most = (0..scope.values).map(count).max().unwrap_or(0);
+  let decided = leading.phase[index] == Phase::Decided;
+  let holds_leader_approved = deciding.slots[index].is_some_and(|slot| slot.classic);
+  let reading_allows = match reading {
+    Reading::Literal => true,
+    Reading::OncePerTerm => !decided,
+    Reading::KeepLeaderApproved => !decided && !holds_leader_approved,
+  };
+  next_to_commit == Some(index) && for_value == most && reading_allows
+}
+
+/// The ballot rule within a term: an index opened to the fast track is decided once, and when a value could
+/// have been chosen by a fast quorum — at least `heard + |F| − n` of the heard votes — it is that value.
+fn ballot_allows(
+  scope: Scope,
+  leading: &Leading,
+  index: usize,
+  value: u8,
+  heard: usize,
+  count: &dyn Fn(u8) -> usize,
+) -> bool {
+  if leading.phase[index] != Phase::Opened {
+    return false;
+  }
+  let threshold = heard + scope.fast_quorum() - scope.nodes;
+  let forced = (0..scope.values).find(|other| count(*other) >= threshold);
+  forced.is_none_or(|forced| forced == value)
+}
+
+fn replicate(
+  scope: Scope,
+  state: &State,
+  leader: usize,
+  node: usize,
+  index: usize,
+) -> Option<Next> {
+  let source = state.nodes[leader];
+  source.leading?;
+  let slot = source.slots[index].filter(|slot| slot.classic)?;
+  // The ballot rule replicates only this term's decisions (recovered ones are re-proposed at this term);
+  // Fast Raft's leader sends every leader-approved entry from `nextIndex` on.
+  if scope.rule == Rule::Ballots && slot.term != source.term {
+    return None;
+  }
+  let target = state.nodes[node];
+  if node == leader || target.term > source.term {
+    return None;
+  }
+  let mut next = Next::plain(*state);
+  guard(&mut next, index, slot.value, source.term);
+  let follower = &mut next.state.nodes[node];
+  if follower.term < source.term {
+    follower.term = source.term;
+    follower.voted_for = None;
+    follower.leading = None;
+  }
+  follower.slots[index] = Some(slot);
+  next.state.nodes[leader].leading.as_mut()?.acks[index] |= bit(node);
+  if target.slots[index].is_some_and(|held| held.value != slot.value) {
+    next.paths |= OVERWROTE_STALE;
+  }
+  Some(next)
+}
+
+fn commit(scope: Scope, state: &State, leader: usize, index: usize) -> Option<Next> {
+  let source = state.nodes[leader];
+  let leading = source.leading?;
+  let slot = source.slots[index].filter(|slot| slot.classic && slot.term == source.term)?;
+  if leading.committed[index] || size(leading.acks[index] | bit(leader)) < scope.majority() {
+    return None;
+  }
+  let mut next = Next::plain(*state);
+  next.state.nodes[leader].leading.as_mut()?.committed[index] = true;
+  record_commit(&mut next, index, slot.value, source.term, CLASSIC_COMMIT);
+  Some(next)
+}
+
+/// Records `value` committed at `index` in `term` in the history, or the disagreement when another value
+/// was.
+fn record_commit(next: &mut Next, index: usize, value: u8, term: u8, path: u8) {
+  next.paths |= path;
+  if index > 0 && next.state.chosen[index - 1].is_none() {
+    next.paths |= OUT_OF_ORDER_COMMIT;
+  }
+  match next.state.chosen[index] {
+    None => next.state.chosen[index] = Some(Chosen { value, term }),
+    Some(first) if first.value != value => {
+      next.fault = Some(Fault::Disagreement {
+        index,
+        first: first.value,
+        second: value,
+      });
+    }
+    Some(_) => {}
+  }
+}
+
+/// The shape of a leader's state, without the nodes its acknowledgements name.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct LeadingShape {
+  phase: [Phase; MAX_INDICES],
+  committed: [bool; MAX_INDICES],
+  acks: [u32; MAX_INDICES],
+}
+
+/// What the representative orders nodes by: a node's fields that name neither another node nor a value,
+/// and the counts of references to it — all unchanged by renaming nodes or values.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Signature {
+  term: u8,
+  candidate: Option<bool>,
+  votes_received: usize,
+  slots: [Option<(u8, bool)>; MAX_INDICES],
+  leading: Option<LeadingShape>,
+  acked_by: [usize; MAX_INDICES],
+}
+
+fn signature(scope: Scope, state: &State, me: usize) -> Signature {
+  let node = &state.nodes[me];
+  let acked_by = std::array::from_fn(|index| {
+    scope
+      .node_ids()
+      .filter(|leader| {
+        state.nodes[*leader]
+          .leading
+          .is_some_and(|leading| leading.acks[index] & bit(me) != 0)
+      })
+      .count()
+  });
+  Signature {
+    term: node.term,
+    candidate: node.voted_for.map(|choice| usize::from(choice) == me),
+    votes_received: scope
+      .node_ids()
+      .filter(|other| state.nodes[*other].voted_for == Some(id(me)))
+      .count(),
+    slots: node
+      .slots
+      .map(|slot| slot.map(|slot| (slot.term, slot.classic))),
+    leading: node.leading.map(|leading| LeadingShape {
+      phase: leading.phase,
+      committed: leading.committed,
+      acks: leading.acks.map(u8::count_ones),
+    }),
+    acked_by,
+  }
+}
+
+/// `mask` with each node renumbered by `renumber`.
+fn remap(mask: u8, renumber: &[usize; MAX_NODES], nodes: usize) -> u8 {
+  members(mask, nodes).fold(0, |out, node| out | bit(renumber[node]))
+}
+
+/// `state` with its nodes placed in `order` (the node at `order[k]` becomes node `k`), its values renumbered
+/// by first appearance, packed.
+fn arranged(scope: Scope, state: &State, order: &[usize]) -> Key {
+  let mut renumber = [0; MAX_NODES];
+  for (new, old) in order.iter().enumerate() {
+    renumber[*old] = new;
+  }
+  let mut representative = *state;
+  for (new, old) in order.iter().enumerate() {
+    let mut node = state.nodes[*old];
+    node.voted_for = node
+      .voted_for
+      .map(|choice| id(renumber[usize::from(choice)]));
+    if let Some(leading) = node.leading.as_mut() {
+      leading.acks = leading.acks.map(|acks| remap(acks, &renumber, scope.nodes));
+    }
+    representative.nodes[new] = node;
+  }
+  renumber_values(scope, &mut representative);
+  pack(&representative)
+}
+
+/// Visits every order of `order[at..end]` for the first run in `runs`, then the orders of the runs after it.
+fn permute_run(
+  order: &mut [usize],
+  at: usize,
+  end: usize,
+  runs: &[(usize, usize)],
+  visit: &mut dyn FnMut(&[usize]),
+) {
+  if at + 1 >= end {
+    each_tie_order(order, runs, visit);
+    return;
+  }
+  for swap in at..end {
+    order.swap(at, swap);
+    permute_run(order, at + 1, end, runs, visit);
+    order.swap(at, swap);
+  }
+}
+
+/// Visits every order that permutes `order` only within the `runs` of equal signatures.
+fn each_tie_order(order: &mut [usize], runs: &[(usize, usize)], visit: &mut dyn FnMut(&[usize])) {
+  match runs.split_first() {
+    None => visit(order),
+    Some((&(start, end), rest)) => permute_run(order, start, end, rest, visit),
+  }
+}
+
+/// The representative of `state`'s class, the same for every renaming of its nodes and values: nodes sorted
+/// by [`Signature`], and among the orders that permute only nodes of equal signature, the one whose packed
+/// state is least.
+fn canonical(scope: Scope, state: &State) -> Key {
+  let signatures: Vec<Signature> = scope
+    .node_ids()
+    .map(|node| signature(scope, state, node))
+    .collect();
+  let mut order: Vec<usize> = scope.node_ids().collect();
+  order.sort_by_key(|node| signatures[*node]);
+  let mut runs = Vec::new();
+  let mut start = 0;
+  for end in 1..=order.len() {
+    if end == order.len() || signatures[order[end]] != signatures[order[start]] {
+      if end - start > 1 {
+        runs.push((start, end));
+      }
+      start = end;
+    }
+  }
+  let mut least: Option<Key> = None;
+  each_tie_order(&mut order, &runs, &mut |candidate| {
+    let key = arranged(scope, state, candidate);
+    if least.is_none_or(|least| key < least) {
+      least = Some(key);
+    }
+  });
+  least.unwrap()
+}
+
+/// Renumbers the values of `state` by first appearance (slots node by node, then the history).
+fn renumber_values(scope: Scope, state: &mut State) {
+  let mut appearing: Vec<u8> = Vec::new();
+  for node in scope.node_ids() {
+    appearing.extend(
+      state.nodes[node].slots[..scope.indices]
+        .iter()
+        .flatten()
+        .map(|slot| slot.value),
+    );
+  }
+  appearing.extend(state.chosen.iter().flatten().map(|chosen| chosen.value));
+  appearing.extend(0..scope.values);
+  let mut seen: Vec<u8> = Vec::new();
+  for value in appearing {
+    if !seen.contains(&value) {
+      seen.push(value);
+    }
+  }
+  let label = |value: u8| id(seen.iter().position(|old| *old == value).unwrap());
+  for node in scope.node_ids() {
+    for slot in state.nodes[node].slots.iter_mut().flatten() {
+      slot.value = label(slot.value);
+    }
+  }
+  for chosen in state.chosen.iter_mut().flatten() {
+    chosen.value = label(chosen.value);
+  }
+}
+
+/// A state packed into [`WORDS`] words.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Key([u64; WORDS]);
+
+impl Hash for Key {
+  fn hash<H: Hasher>(&self, hasher: &mut H) {
+    for word in self.0 {
+      hasher.write_u64(word);
+    }
+  }
+}
+
+/// A multiplicative hasher for the visited sets (FxHash's mixing step): their keys are packed words or
+/// fingerprints hashed millions of times, and SipHash's resistance to chosen keys buys nothing here.
+#[derive(Default)]
+struct Mix(u64);
+
+impl Hasher for Mix {
+  fn finish(&self) -> u64 {
+    self.0
+  }
+
+  fn write(&mut self, bytes: &[u8]) {
+    for byte in bytes {
+      self.write_u64(u64::from(*byte));
+    }
+  }
+
+  fn write_u64(&mut self, word: u64) {
+    /// Format: FxHash's multiplier (`rustc-hash`).
+    const MULTIPLIER: u64 = 0x517c_c1b7_2722_0a95;
+    self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(MULTIPLIER);
+  }
+
+  fn write_u128(&mut self, word: u128) {
+    self.write_u64(u64::try_from(word >> 64).unwrap());
+    self.write_u64(u64::try_from(word & u128::from(u64::MAX)).unwrap());
+  }
+}
+
+/// A 128-bit fingerprint of a packed state: SipHash-1-3 (`DefaultHasher`, fixed keys) over the state with a
+/// domain byte, twice.
+fn fingerprint(key: Key) -> u128 {
+  let lane = |domain: u8| {
+    let mut hasher = DefaultHasher::new();
+    domain.hash(&mut hasher);
+    key.0.hash(&mut hasher);
+    hasher.finish()
+  };
+  (u128::from(lane(0)) << 64) | u128::from(lane(1))
+}
+
+/// Packs fields of known widths into words, least significant bit first.
+struct Packer {
+  words: [u64; WORDS],
+  at: usize,
+}
+
+impl Packer {
+  fn put(&mut self, width: usize, value: u64) {
+    let (word, place) = (self.at / 64, self.at % 64);
+    self.words[word] |= value << place;
+    if place + width > 64 {
+      self.words[word + 1] |= value >> (64 - place);
+    }
+    self.at += width;
+  }
+
+  fn take(&mut self, width: usize) -> u64 {
+    let (word, place) = (self.at / 64, self.at % 64);
+    let mut value = self.words[word] >> place;
+    if place + width > 64 {
+      value |= self.words[word + 1] << (64 - place);
+    }
+    self.at += width;
+    value & ((1 << width) - 1)
+  }
+
+  fn small(&mut self, width: usize) -> u8 {
+    u8::try_from(self.take(width)).unwrap()
+  }
+}
+
+/// Format: the widths of a packed field — a term, a node number plus one, a value plus one, a phase.
+const TERM_BITS: usize = 3;
+const NODE_BITS: usize = 3;
+const VALUE_BITS: usize = 2;
+const PHASE_BITS: usize = 2;
+
+fn pack_option(packer: &mut Packer, width: usize, value: Option<u8>) {
+  packer.put(width, value.map_or(0, |value| u64::from(value) + 1));
+}
+
+fn take_option(packer: &mut Packer, width: usize) -> Option<u8> {
+  packer.small(width).checked_sub(1)
+}
+
+fn pack_slot(packer: &mut Packer, slot: Option<Slot>) {
+  packer.put(1, u64::from(slot.is_some()));
+  if let Some(slot) = slot {
+    packer.put(VALUE_BITS, u64::from(slot.value));
+    packer.put(TERM_BITS, u64::from(slot.term));
+    packer.put(1, u64::from(slot.classic));
+  }
+}
+
+fn take_slot(packer: &mut Packer) -> Option<Slot> {
+  (packer.take(1) == 1).then(|| Slot {
+    value: packer.small(VALUE_BITS),
+    term: packer.small(TERM_BITS),
+    classic: packer.take(1) == 1,
+  })
+}
+
+fn pack_leading(packer: &mut Packer, leading: &Leading) {
+  for index in 0..MAX_INDICES {
+    packer.put(MAX_NODES, u64::from(leading.acks[index]));
+    let phase = match leading.phase[index] {
+      Phase::Free => 0,
+      Phase::Opened => 1,
+      Phase::Decided => 2,
+    };
+    packer.put(PHASE_BITS, phase);
+    packer.put(1, u64::from(leading.committed[index]));
+  }
+}
+
+fn take_leading(packer: &mut Packer) -> Leading {
+  let mut leading = Leading::new();
+  for index in 0..MAX_INDICES {
+    leading.acks[index] = packer.small(MAX_NODES);
+    leading.phase[index] = match packer.take(PHASE_BITS) {
+      0 => Phase::Free,
+      1 => Phase::Opened,
+      _ => Phase::Decided,
+    };
+    leading.committed[index] = packer.take(1) == 1;
+  }
+  leading
+}
+
+fn pack(state: &State) -> Key {
+  let mut packer = Packer {
+    words: [0; WORDS],
+    at: 0,
+  };
+  for node in &state.nodes {
+    packer.put(TERM_BITS, u64::from(node.term));
+    pack_option(&mut packer, NODE_BITS, node.voted_for);
+    for slot in node.slots {
+      pack_slot(&mut packer, slot);
+    }
+    packer.put(1, u64::from(node.leading.is_some()));
+    if let Some(leading) = &node.leading {
+      pack_leading(&mut packer, leading);
+    }
+  }
+  for opened in state.opened.iter().flatten() {
+    packer.put(1, u64::from(*opened));
+  }
+  for chosen in state.chosen {
+    pack_option(&mut packer, VALUE_BITS, chosen.map(|chosen| chosen.value));
+    packer.put(TERM_BITS, chosen.map_or(0, |chosen| u64::from(chosen.term)));
+  }
+  Key(packer.words)
+}
+
+fn unpack(key: Key) -> State {
+  let mut packer = Packer {
+    words: key.0,
+    at: 0,
+  };
+  let mut state = State::initial();
+  for node in &mut state.nodes {
+    node.term = packer.small(TERM_BITS);
+    node.voted_for = take_option(&mut packer, NODE_BITS);
+    for slot in &mut node.slots {
+      *slot = take_slot(&mut packer);
+    }
+    node.leading = (packer.take(1) == 1).then(|| take_leading(&mut packer));
+  }
+  for opened in state.opened.iter_mut().flatten() {
+    *opened = packer.take(1) == 1;
+  }
+  for chosen in &mut state.chosen {
+    let value = take_option(&mut packer, VALUE_BITS);
+    let term = packer.small(TERM_BITS);
+    *chosen = value.map(|value| Chosen { value, term });
+  }
+  state
+}
+
+/// What one search found: the classes it reached, how often each path was taken, the first fault that
+/// stopped it (with the history that reached it), and the first fault it recorded and went past.
+struct Report {
+  states: usize,
+  paths: [u64; PATHS.len()],
+  stopped: Option<(Vec<Action>, Fault)>,
+  passed: Option<(Vec<Action>, Fault)>,
+}
+
+fn tally(paths: &mut [u64; PATHS.len()], taken: u8) {
+  for (path, count) in paths.iter_mut().enumerate() {
+    *count += u64::from(taken >> path & 1);
+  }
+}
+
+/// The concrete actions that lead from `start` along the chain of representatives ending at `id`, then to a
+/// step with a fault of `fault`'s kind — replayed, since each representative renames its state.
+fn replay(
+  scope: Scope,
+  start: State,
+  keys: &[Key],
+  parents: &[u32],
+  id: u32,
+  fault: Fault,
+) -> Vec<Action> {
+  let mut chain = vec![id];
+  while *chain.last().unwrap() != 0 {
+    chain.push(parents[usize::try_from(*chain.last().unwrap()).unwrap()]);
+  }
+  chain.reverse();
+  let mut state = start;
+  let mut actions = vec![Action::Start];
+  let mut tried = Vec::new();
+  for step in chain.iter().skip(1) {
+    let key = keys[usize::try_from(*step).unwrap()];
+    tried.clear();
+    candidates(scope, &state, &mut tried);
+    let (action, next) = tried
+      .iter()
+      .find_map(|action| {
+        apply(scope, &state, *action)
+          .filter(|next| canonical(scope, &next.state) == key)
+          .map(|next| (*action, next.state))
+      })
+      .expect("a step to the next representative on the path");
+    actions.push(action);
+    state = next;
+  }
+  tried.clear();
+  candidates(scope, &state, &mut tried);
+  let last = tried
+    .iter()
+    .find(|action| {
+      apply(scope, &state, **action).is_some_and(|next| {
+        next
+          .fault
+          .is_some_and(|found| std::mem::discriminant(&found) == std::mem::discriminant(&fault))
+      })
+    })
+    .expect("the faulting step");
+  actions.push(*last);
+  actions
+}
+
+/// Breadth-first search from the initial state until every reachable class is visited or a fault `stops`
+/// accepts is found; the first other fault is recorded, and the search goes on past it.
+fn search(scope: Scope, stops: fn(&Fault) -> bool) -> Report {
+  search_from(scope, State::initial(), stops)
+}
+
+/// [`search`], from `start`.
+fn search_from(scope: Scope, start: State, stops: fn(&Fault) -> bool) -> Report {
+  let scope = scope.checked();
+  let initial = canonical(scope, &start);
+  let mut visited: HashSet<Key, BuildHasherDefault<Mix>> = HashSet::default();
+  visited.insert(initial);
+  let mut keys = vec![initial];
+  let mut parents = vec![0_u32];
+  let mut queue = VecDeque::from([0_u32]);
+  let mut report = Report {
+    states: 0,
+    paths: [0; PATHS.len()],
+    stopped: None,
+    passed: None,
+  };
+  let mut tried = Vec::new();
+  while let Some(id) = queue.pop_front() {
+    let state = unpack(keys[usize::try_from(id).unwrap()]);
+    tried.clear();
+    candidates(scope, &state, &mut tried);
+    for next in tried
+      .iter()
+      .filter_map(|action| apply(scope, &state, *action))
+    {
+      tally(&mut report.paths, next.paths);
+      if let Some(fault) = next.fault {
+        let found = Some((replay(scope, start, &keys, &parents, id, fault), fault));
+        if stops(&fault) {
+          report.stopped = found;
+          report.states = visited.len();
+          return report;
+        }
+        if report.passed.is_none() {
+          report.passed = found;
+        }
+      }
+      let key = canonical(scope, &next.state);
+      if visited.insert(key) {
+        assert!(
+          keys.len() < STATE_BUDGET,
+          "{scope:?} exceeds the breadth-first budget of {STATE_BUDGET} states"
+        );
+        queue.push_back(u32::try_from(keys.len()).unwrap());
+        keys.push(key);
+        parents.push(id);
+      }
+    }
+  }
+  report.states = visited.len();
+  report
+}
+
+/// The workers a parallel search runs on: the machine's parallelism.
+fn workers() -> usize {
+  std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// The shard of `shards` that owns fingerprint `print`.
+fn shard_of(print: u128, shards: usize) -> usize {
+  usize::try_from(print % u128::try_from(shards).unwrap()).unwrap()
+}
+
+/// What one worker made of its part of a frontier: its successors not yet visited, bucketed by the shard
+/// that owns their fingerprints; how often it took each path; and the first fault it met, with the state it
+/// stepped from and the step.
+struct Expansion {
+  buckets: Vec<Vec<(u128, Key)>>,
+  paths: [u64; PATHS.len()],
+  fault: Option<(State, Action, Fault)>,
+}
+
+/// Expands `part` of a frontier against a read-only view of the visited shards, bucketing at most
+/// `allowance` successors (`None` once it would take more).
+fn expand(
+  scope: Scope,
+  part: &[Key],
+  visited: &[HashSet<u128, BuildHasherDefault<Mix>>],
+  allowance: usize,
+) -> Option<Expansion> {
+  let mut expansion = Expansion {
+    buckets: vec![Vec::new(); visited.len()],
+    paths: [0; PATHS.len()],
+    fault: None,
+  };
+  let mut bucketed = 0_usize;
+  let mut actions = Vec::new();
+  for key in part {
+    let state = unpack(*key);
+    actions.clear();
+    candidates(scope, &state, &mut actions);
+    for action in &actions {
+      let Some(next) = apply(scope, &state, *action) else {
+        continue;
+      };
+      tally(&mut expansion.paths, next.paths);
+      if let Some(fault) = next.fault {
+        expansion.fault = Some((state, *action, fault));
+        return Some(expansion);
+      }
+      let representative = canonical(scope, &next.state);
+      let print = fingerprint(representative);
+      let shard = shard_of(print, visited.len());
+      if !visited[shard].contains(&print) {
+        bucketed += 1;
+        if bucketed > allowance {
+          return None;
+        }
+        expansion.buckets[shard].push((print, representative));
+      }
+    }
+  }
+  Some(expansion)
+}
+
+/// Inserts into one shard the successors every worker bucketed for it, returning those it had not seen.
+fn settle(
+  shard: &mut HashSet<u128, BuildHasherDefault<Mix>>,
+  buckets: Vec<&Vec<(u128, Key)>>,
+) -> Vec<Key> {
+  let mut fresh = Vec::new();
+  for (print, key) in buckets.into_iter().flatten() {
+    if shard.insert(*print) {
+      fresh.push(*key);
+    }
+  }
+  fresh
+}
+
+/// A fault the parallel search met, with the state it was met from and the step that raised it.
+type Met = (State, Action, Fault);
+
+/// Breadth-first search, level by level across every core, over fingerprints of representatives: each
+/// worker expands a slice of the frontier; then each shard of the visited set takes the new successors
+/// that hash to it. Every reachable class is visited once. Stops at the first level with a fault, reporting
+/// the step that met it (the serial [`search`] gives the whole shortest history, where it fits).
+fn explore(scope: Scope, ceiling_bytes: usize, print_levels: bool) -> (Report, Option<Met>) {
+  let scope = scope.checked();
+  let workers = workers();
+  let mut visited: Vec<HashSet<u128, BuildHasherDefault<Mix>>> =
+    (0..workers).map(|_| HashSet::default()).collect();
+  let initial = canonical(scope, &State::initial());
+  let print = fingerprint(initial);
+  visited[shard_of(print, workers)].insert(print);
+  let mut frontier = vec![initial];
+  let mut report = Report {
+    states: 1,
+    paths: [0; PATHS.len()],
+    stopped: None,
+    passed: None,
+  };
+  while !frontier.is_empty() {
+    let held = report.states * VISITED_BYTES + frontier.len() * FRONTIER_BYTES;
+    let allowance =
+      (ceiling_bytes / RESIDENT_PER_ACCOUNTED).saturating_sub(held) / BUCKET_BYTES / workers;
+    let part = frontier.len().div_ceil(workers);
+    let expansions: Vec<Expansion> = std::thread::scope(|threads| {
+      let running: Vec<_> = frontier
+        .chunks(part)
+        .map(|slice| threads.spawn(|| expand(scope, slice, &visited, allowance)))
+        .collect();
+      running
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>()
+    })
+    .into_iter()
+    .collect::<Option<_>>()
+    .unwrap_or_else(|| {
+      panic!(
+        "{scope:?} exceeds {ceiling_bytes} bytes at {} classes and a frontier of {}",
+        report.states,
+        frontier.len()
+      )
+    });
+    for expansion in &expansions {
+      for (count, more) in report.paths.iter_mut().zip(expansion.paths) {
+        *count += more;
+      }
+    }
+    if let Some(met) = expansions.iter().find_map(|expansion| expansion.fault) {
+      report.states = visited.iter().map(HashSet::len).sum();
+      return (report, Some(met));
+    }
+    // The expanded level is done with; free it before the next is gathered.
+    frontier = Vec::new();
+    let fresh: Vec<Vec<Key>> = std::thread::scope(|threads| {
+      let running: Vec<_> = visited
+        .iter_mut()
+        .enumerate()
+        .map(|(shard, set)| {
+          let buckets: Vec<&Vec<(u128, Key)>> = expansions
+            .iter()
+            .map(|expansion| &expansion.buckets[shard])
+            .collect();
+          threads.spawn(move || settle(set, buckets))
+        })
+        .collect();
+      running
+        .into_iter()
+        .map(|shard| shard.join().unwrap())
+        .collect()
+    });
+    let bucketed: usize = expansions
+      .iter()
+      .flat_map(|expansion| expansion.buckets.iter().map(Vec::len))
+      .sum();
+    if print_levels {
+      eprintln!(
+        "level: visited {} frontier {} bucketed {} accounted {} MB",
+        report.states,
+        part * workers,
+        bucketed,
+        (report.states * VISITED_BYTES + part * workers * FRONTIER_BYTES + bucketed * BUCKET_BYTES)
+          >> 20
+      );
+    }
+    drop(expansions);
+    frontier.reserve_exact(fresh.iter().map(Vec::len).sum());
+    for part in fresh {
+      frontier.extend(part);
+    }
+    report.states = visited.iter().map(HashSet::len).sum();
+  }
+  (report, None)
+}
+
+/// A node's slots, as a history prints them: `v1@3L` is value 1 at term 3, leader-approved (`S` when
+/// self-approved), and `-` an empty slot.
+fn slots_of(scope: Scope, node: &Node) -> String {
+  (0..scope.indices)
+    .map(|index| match node.slots[index] {
+      None => "-".to_owned(),
+      Some(slot) => format!(
+        "v{}@{}{}",
+        slot.value,
+        slot.term,
+        if slot.classic { 'L' } else { 'S' }
+      ),
+    })
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+/// Replays `actions` (the first is [`Action::Start`]) from the initial state and prints each step with every
+/// node's term and slots after it.
+fn print_trace(scope: Scope, actions: &[Action]) {
+  let mut state = State::initial();
+  for (step, action) in actions.iter().enumerate().skip(1) {
+    state = apply(scope, &state, *action).unwrap().state;
+    let nodes: Vec<String> = scope
+      .node_ids()
+      .map(|node| {
+        let held = &state.nodes[node];
+        format!("{}:t{} {}", NAMES[node], held.term, slots_of(scope, held))
+      })
+      .collect();
+    eprintln!("  {step:>2}. {action:<32} | {}", nodes.join("  "));
+  }
+}
+
+fn print_report(scope: Scope, report: &Report) {
+  eprintln!(
+    "{:?}, {} nodes, {} indices, {} values, {} terms: {} states; {}",
+    scope.rule,
+    scope.nodes,
+    scope.indices,
+    scope.values,
+    scope.terms,
+    report.states,
+    PATHS
+      .iter()
+      .zip(report.paths)
+      .map(|(name, count)| format!("{name} {count}"))
+      .collect::<Vec<_>>()
+      .join(", ")
+  );
+  for (label, found) in [
+    ("stopped by", &report.stopped),
+    ("went past", &report.passed),
+  ] {
+    if let Some((actions, fault)) = found {
+      eprintln!("{label} {fault:?} after {} steps:", actions.len() - 1);
+      print_trace(scope, actions);
+    }
+  }
+}
+
+/// Replays `actions` from the initial state under `scope`, requiring each to be enabled where it is taken;
+/// returns the state they reach and the fault the last one raised.
+fn run_script(scope: Scope, actions: &[Action]) -> (State, Option<Fault>) {
+  let mut state = State::initial();
+  let mut fault = None;
+  for action in actions {
+    let next = apply(scope, &state, *action).unwrap_or_else(|| panic!("{action} is not enabled"));
+    fault = next.fault;
+    state = next.state;
+  }
+  (state, fault)
+}
+
+/// The fault the last of `actions` raised, replayed as [`run_script`] does.
+fn replay_script(scope: Scope, actions: &[Action]) -> Option<Fault> {
+  run_script(scope, actions).1
+}
+
+/// Format: the nodes of the scripted history, and its two values.
+const A: usize = 0;
+const B: usize = 1;
+const C: usize = 2;
+const D: usize = 3;
+const E: usize = 4;
+const W: u8 = 0;
+const V: u8 = 1;
+
+/// The mask of `nodes`.
+fn of(nodes: &[usize]) -> u8 {
+  nodes.iter().fold(0, |mask, node| mask | bit(*node))
+}
+
+/// §3.7, with five nodes, where a fast quorum (four) is larger than a classic one (three): the
+/// counterexample the research record predicted, derived by hand and replayed step by step under Fast
+/// Raft's published rules (read so that a leader decides an index once in its term). A leads term 1 and
+/// decides w from a three-way vote; B leads term 2 and decides v, which reaches C; C leads term 3, and B, C,
+/// D and E answer with v — a fast quorum, so v commits. A, whose last leader-approved entry is w from term 1,
+/// wins term 4 with D and E, who hold only self-approved v: their two votes are short of a classic quorum,
+/// so A's own w stands, overwrites theirs, and commits.
+#[test]
+fn five_nodes_lose_a_fast_committed_entry_under_the_published_recovery() {
+  let scope = Scope {
+    nodes: 5,
+    indices: 1,
+    values: 2,
+    terms: 4,
+    rule: Rule::Published(Reading::OncePerTerm),
+  }
+  .checked();
+  let history = [
+    Action::Timeout { node: A },
+    Action::Elect {
+      node: A,
+      quorum: of(&[A, B, C]),
+    },
+    Action::Insert {
+      node: A,
+      index: 0,
+      value: W,
+    },
+    Action::Insert {
+      node: B,
+      index: 0,
+      value: W,
+    },
+    Action::Insert {
+      node: C,
+      index: 0,
+      value: V,
+    },
+    Action::Decide {
+      leader: A,
+      index: 0,
+      value: W,
+      voters: of(&[A, B, C]),
+    },
+    Action::Timeout { node: B },
+    Action::Elect {
+      node: B,
+      quorum: of(&[B, C, D]),
+    },
+    Action::Insert {
+      node: D,
+      index: 0,
+      value: V,
+    },
+    Action::Learn { node: E, term: 2 },
+    Action::Insert {
+      node: E,
+      index: 0,
+      value: V,
+    },
+    Action::Decide {
+      leader: B,
+      index: 0,
+      value: V,
+      voters: of(&[B, C, D, E]),
+    },
+    Action::Replicate {
+      leader: B,
+      node: C,
+      index: 0,
+    },
+    Action::Timeout { node: C },
+    Action::Elect {
+      node: C,
+      quorum: of(&[C, D, E]),
+    },
+    Action::Learn { node: B, term: 3 },
+    // A fast quorum: v commits.
+    Action::Decide {
+      leader: C,
+      index: 0,
+      value: V,
+      voters: of(&[B, C, D, E]),
+    },
+    Action::Timeout { node: A },
+    Action::Timeout { node: A },
+    Action::Timeout { node: A },
+    Action::Elect {
+      node: A,
+      quorum: of(&[A, D, E]),
+    },
+  ];
+  // A replicates its stale w over D's and E's v: the step Fast Raft's Lemma 2 says never happens.
+  let overwrite = [Action::Replicate {
+    leader: A,
+    node: D,
+    index: 0,
+  }];
+  let commit_w = [
+    Action::Replicate {
+      leader: A,
+      node: E,
+      index: 0,
+    },
+    Action::Decide {
+      leader: A,
+      index: 0,
+      value: W,
+      voters: of(&[A, D, E]),
+    },
+    Action::Replicate {
+      leader: A,
+      node: D,
+      index: 0,
+    },
+    Action::Replicate {
+      leader: A,
+      node: E,
+      index: 0,
+    },
+    Action::Commit {
+      leader: A,
+      index: 0,
+    },
+  ];
+  let everything = [&[Action::Start][..], &history, &overwrite, &commit_w].concat();
+  print_trace(scope, &everything);
+  assert_eq!(replay_script(scope, &history), None);
+  assert_eq!(
+    replay_script(scope, &[&history[..], &overwrite].concat()),
+    Some(Fault::OverwroteChosen {
+      index: 0,
+      chosen: V,
+      sent: W,
+      term: 4
+    })
+  );
+  assert_eq!(
+    replay_script(scope, &everything[1..]),
+    Some(Fault::Disagreement {
+      index: 0,
+      first: V,
+      second: W
+    })
+  );
+}
+
+/// §3.7: Fast Raft's published recovery commits two values at one index under the two readings that let a
+/// leader decide by votes over an entry it holds — as written, and once per term — and the search prints
+/// the shortest history of each (the research record carries them). Under the third reading, which keeps a
+/// leader's leader-approved entries as classic Raft does, the scope holds no fault; that reading fails
+/// liveness instead ([`keeping_leader_approved_entries_stalls_the_log_after_one_crash`]).
+#[test]
+#[ignore = "exhaustive; CI's full-scale step runs it in release"]
+fn the_published_recovery_loses_agreement_when_its_leader_decides_by_votes() {
+  for reading in [
+    Reading::Literal,
+    Reading::OncePerTerm,
+    Reading::KeepLeaderApproved,
+  ] {
+    let scope = Scope {
+      nodes: 4,
+      indices: 1,
+      values: 2,
+      terms: 4,
+      rule: Rule::Published(reading),
+    };
+    let report = search(scope, |fault| matches!(fault, Fault::Disagreement { .. }));
+    print_report(scope, &report);
+    assert!(
+      report.paths[0] > 0,
+      "{reading:?}: no fast commit was reached"
+    );
+    let lost = report.stopped.is_some();
+    assert_eq!(lost, reading != Reading::KeepLeaderApproved, "{reading:?}");
+  }
+}
+
+/// §3.7: under the reading that keeps a leader's leader-approved entries, one leader crash between a
+/// decision and its commit stalls the log for good. A decides w and crashes with only B holding it; B leads
+/// term 2 and replicates w to everyone, but may not decide over it by votes, and may not commit it, since
+/// it is not of B's term. Every future of that state is searched: nothing ever commits again.
+#[test]
+fn keeping_leader_approved_entries_stalls_the_log_after_one_crash() {
+  let scope = Scope {
+    nodes: 4,
+    indices: 1,
+    values: 2,
+    terms: 4,
+    rule: Rule::Published(Reading::KeepLeaderApproved),
+  }
+  .checked();
+  let history = [
+    Action::Timeout { node: A },
+    Action::Elect {
+      node: A,
+      quorum: of(&[A, B, C]),
+    },
+    Action::Insert {
+      node: A,
+      index: 0,
+      value: W,
+    },
+    Action::Insert {
+      node: B,
+      index: 0,
+      value: W,
+    },
+    Action::Insert {
+      node: C,
+      index: 0,
+      value: V,
+    },
+    Action::Decide {
+      leader: A,
+      index: 0,
+      value: W,
+      voters: of(&[A, B, C]),
+    },
+    // Only B acknowledges before A crashes: short of a majority.
+    Action::Replicate {
+      leader: A,
+      node: B,
+      index: 0,
+    },
+    Action::Timeout { node: B },
+    Action::Elect {
+      node: B,
+      quorum: of(&[B, C, D]),
+    },
+    Action::Replicate {
+      leader: B,
+      node: A,
+      index: 0,
+    },
+    Action::Replicate {
+      leader: B,
+      node: C,
+      index: 0,
+    },
+    Action::Replicate {
+      leader: B,
+      node: D,
+      index: 0,
+    },
+  ];
+  print_trace(scope, &[&[Action::Start][..], &history].concat());
+  let (stuck, fault) = run_script(scope, &history);
+  assert_eq!(fault, None);
+  let futures = search_from(scope, stuck, |_| true);
+  print_report(scope, &futures);
+  assert!(
+    futures.states > 1,
+    "the stalled state has futures to search"
+  );
+  assert_eq!(
+    futures.paths[0] + futures.paths[1],
+    0,
+    "some future of the stalled state commits"
+  );
+}
+
+/// Runs the ballot rule at `scope`: no fault, and every path taken. A fault is printed with the step that met
+/// it, and with the whole shortest history when the serial search affords it.
+fn ballots_hold(scope: Scope) {
+  let (report, met) = explore(scope, MEMORY_CEILING_BYTES, false);
+  print_report(scope, &report);
+  if let Some((from, action, fault)) = met {
+    eprintln!("{fault:?} met by {action} from {from:?}");
+    print_report(scope, &search(scope, |_| true));
+    panic!("the ballot rule failed at {scope:?}: {fault:?}");
+  }
+  for (path, (name, count)) in PATHS.iter().zip(report.paths).enumerate() {
+    let reachable = scope.indices > 1 || path != OUT_OF_ORDER_PATH;
+    assert!(!reachable || count > 0, "{name} never ran at {scope:?}");
+  }
+}
+
+/// §4: the ballot rule keeps agreement and P2c with four nodes, one index, two values and three terms — the
+/// scope the default suite affords; the full scopes run in release.
+#[test]
+fn the_ballot_recovery_keeps_agreement() {
+  ballots_hold(Scope {
+    nodes: 4,
+    indices: 1,
+    values: 2,
+    terms: 3,
+    rule: Rule::Ballots,
+  });
+}
+
+/// §4 at full scope: where the published rule fails (four nodes, four terms), with five nodes and four
+/// terms (a fast quorum larger than a classic one), with three values (three-way splits of a fast round),
+/// and with two indices (a commit above an uncommitted index).
+#[test]
+#[ignore = "exhaustive; CI's full-scale step runs it in release"]
+fn the_ballot_recovery_keeps_agreement_at_full_scope() {
+  for (nodes, indices, values, terms) in [(4, 1, 2, 4), (5, 1, 2, 4), (4, 1, 3, 4), (3, 2, 2, 2)] {
+    ballots_hold(Scope {
+      nodes,
+      indices,
+      values,
+      terms,
+      rule: Rule::Ballots,
+    });
+  }
+}
+
+/// Runs one scope of the ballot rule named by the environment — the command behind the measurements in the
+/// research record and `docs/wip/BENCHMARKS.md`:
+///
+/// `SLATES_SLOT_SCOPE=nodes,indices,values,terms [SLATES_SLOT_CEILING_GB=n] [SLATES_SLOT_LEVELS=1]
+/// cargo test --release -p slates-cluster --test slot_model -- --ignored --exact one_scope_from_the_environment
+/// --nocapture`
+///
+/// Skips, saying so, without `SLATES_SLOT_SCOPE`.
+#[test]
+#[ignore = "a measurement tool; runs only with SLATES_SLOT_SCOPE set"]
+fn one_scope_from_the_environment() {
+  let Ok(named) = std::env::var("SLATES_SLOT_SCOPE") else {
+    eprintln!("skipping: set SLATES_SLOT_SCOPE=nodes,indices,values,terms to run one scope");
+    return;
+  };
+  let numbers: Vec<usize> = named.split(',').map(|part| part.parse().unwrap()).collect();
+  let [nodes, indices, values, terms] = numbers[..] else {
+    panic!("SLATES_SLOT_SCOPE is nodes,indices,values,terms; got {named}");
+  };
+  let scope = Scope {
+    nodes,
+    indices,
+    values: u8::try_from(values).unwrap(),
+    terms: u8::try_from(terms).unwrap(),
+    rule: Rule::Ballots,
+  };
+  let ceiling = std::env::var("SLATES_SLOT_CEILING_GB").map_or(MEMORY_CEILING_BYTES, |gigabytes| {
+    gigabytes.parse::<usize>().unwrap() << 30
+  });
+  let levels = std::env::var("SLATES_SLOT_LEVELS").is_ok();
+  let (report, met) = explore(scope, ceiling, levels);
+  print_report(scope, &report);
+  assert!(met.is_none(), "{met:?}");
+}

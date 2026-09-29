@@ -1826,6 +1826,27 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-28: Fast Raft's published recovery is unsafe — the ballot rule is verified; the dialect is owed
+
+**Model** (`crates/cluster/tests/slot_model.rs`; `docs/wip/research/consensus-enhancements.md` §3.7, slice
+8). An exhaustive search of the log model that parallel replication and the fast track share.
+
+**Fast Raft as published** (arXiv:2004.06215 §IV):
+- The two readings in which a leader decides an index by votes (the pseudocode as written, and once per
+  term) commit two values at one index, in 15 and 18 steps with four nodes; with five nodes a scripted
+  history does so in 27.
+- The reading that keeps a leader's leader-approved entries has no fault at that scope, but one leader crash
+  between a decision and its commit stalls the log for good (all 225 futures commit nothing).
+
+**The ballot rule** (Fast Paxos's recovery, in terms of Raft's) has no fault at any searched scope, up to
+23,552,907 classes (five nodes, four terms), and every path it has was taken. CI's full-scale step runs the
+searches in release (17 s here, 2.65 GB peak, under a 4 GiB ceiling derived from the measured cost of a
+state).
+
+**Owed:** the dialect. Windows, sync terms, the recovery, the fast track and out-of-order acknowledgement are
+not in `RaftNode` yet, and the randomized explorer must cover them on the real code. Then the measurement of
+the fast track's crossover (loss, proposer placement), which decides whether it is on by default.
+
 ### 2026-09-28: priority elections — built; the explorer's diagnosis tool broke CI's `--ignored` run — fixed
 
 **Priority** (`docs/wip/research/consensus-enhancements.md` §3.4). A voter's priority is its measured quorum

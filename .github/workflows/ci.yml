@@ -61,6 +61,13 @@ jobs:
       # which a bare `--ignored` swept in (CI run 36511884967).
       - name: T-8.13 Raft safety explorer at full scale
         run: cargo test -p slates-cluster --release --test explore -- --ignored --exact the_dialect_keeps_raft_safety_at_full_scale
+      # By exact name, one at a time: each search spreads over every core and holds up to 4 GiB, and the file's
+      # third ignored test is a measurement tool.
+      - name: The slot model's exhaustive searches (the fast track's recovery, research record §3.7 and §4)
+        run: >-
+          cargo test -p slates-cluster --release --test slot_model -- --ignored --test-threads=1 --exact
+          the_ballot_recovery_keeps_agreement_at_full_scope
+          the_published_recovery_loses_agreement_when_its_leader_decides_by_votes
       - name: AC-1.2 differential suite against tmpfs (Linux)
         if: runner.os == 'Linux'
         run: SLATES_TEST_RAMDIR=/dev/shm PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture

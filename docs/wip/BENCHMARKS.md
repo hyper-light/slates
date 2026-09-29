@@ -752,3 +752,44 @@ hosts by a seed-dependent permutation).
 
 About half a 100 ms period of every commit latency is the drive's cadence: a proposal waits for the next
 period before it is replicated.
+
+### The slot model: exhaustive searches of the fast track's recovery (2026-09-28)
+
+**Hardware:** Apple M5 Max (18 cores: 6 performance, 12 efficiency), 128 GB, macOS 26.4.1, rustc 1.98.0,
+release. Other sessions' builds ran beside it (load average 11–12), so wall times are upper bounds; the
+state counts are exact.
+
+**Commands:** `cargo test -p slates-cluster --release --test slot_model -- --ignored --test-threads=1
+--exact the_ballot_recovery_keeps_agreement_at_full_scope
+the_published_recovery_loses_agreement_when_its_leader_decides_by_votes --nocapture`. One scope:
+`SLATES_SLOT_SCOPE=5,1,2,4 cargo test -p slates-cluster --release --test slot_model -- --ignored --exact
+one_scope_from_the_environment --nocapture` (`SLATES_SLOT_LEVELS=1` prints each level's accounting).
+
+| Search | Scope (nodes, indices, values, terms) | Classes | Wall | Peak resident |
+|---|---|---|---|---|
+| ballot rule, parallel breadth-first, fingerprints | 4, 1, 2, 4 | 463,715 | 0.16 s | 69 MB |
+| same | 5, 1, 2, 3 | 1,586,398 | 0.65 s | 216 MB |
+| same | 5, 1, 2, 4 | 23,552,907 | 10.6 s (161 s CPU) | 2,722 MB |
+| same | 4, 1, 3, 4 | 642,654 | 0.22 s | 96 MB |
+| published rule, serial breadth-first, whole keys, to the first disagreement | 4, 1, 2, 4, as written | 1,049,232 | — | — |
+| same | once per term | 1,199,113 | — | — |
+| same, whole space (no disagreement) | keeping leader-approved entries | 999,583 | — | — |
+| whole model suite, full scope | all of the above | — | 17.3 s | 2,650 MB |
+
+Measured and rejected:
+
+- **The first model** kept each leader's tally of votes and stored every labelling of a state. It held
+  18,064,834,560 bytes after 300 s without finishing the published rule's scope (4, 1, 2, 4), and was
+  stopped by an alarm. Replacing the tally with decisions that read a chosen majority's current entries,
+  and storing one representative per class (nodes and values renamed), brought the same scope to 1,072,719
+  classes, 2.2 s and 184 MB.
+- **Depth-first search.** On the same model and scope (4, 1, 2, 4), depth-first over fingerprints visited
+  the same 463,715 classes as breadth-first over whole keys: 1.16 s and 38 MB, against 1.13 s and 94 MB.
+  The traversal order does not change the work, since each class is visited once and each action is tried
+  once. What costs is finding each successor's representative. Depth-first saves memory but no time, loses
+  the shortest counterexample, and does not spread across cores. The parallel breadth-first search does
+  the same scope in 0.16 s.
+- **The memory ceiling from counted bytes alone.** Counting fingerprints, frontier and buckets gave
+  1,556 MB at the widest level of (5, 1, 2, 4), while the process held 2,689 MB: the buckets' and frontiers'
+  doubling capacities, and pages the allocator retains. The ceiling check now multiplies the counted bytes
+  by the measured ratio, rounded up to 2.

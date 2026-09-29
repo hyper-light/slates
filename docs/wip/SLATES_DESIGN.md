@@ -2688,6 +2688,23 @@ reconnaissance because the touched partitions are named up front).
 > Microsoft's published five-region matrix, the fastest-committing region leads every seed, where the first
 > timeout picked it on 14 of 20, and takes leadership back after an outage.
 
+> **The fast track's recovery, verified before it is built (2026-09-28; `docs/wip/research/
+> consensus-enhancements.md`, slice 8).** Parallel replication and the fast track let a follower hold slots
+> above its prefix that no leader placed in order. So a new leader must recover every index above the
+> committed prefix from a majority before proposing there. Fast Raft's published recovery
+> (arXiv:2004.06215 §IV) fails this:
+> - read as written, or once per term, two values commit at one index (15 and 18 steps, four nodes);
+> - read as keeping leader-approved entries, one crash stalls the log for good.
+>
+> The rule slates adopts is Fast Paxos's, in terms of Raft's:
+> - every slot records its ballot (a term, and within it a decision outranks a fast vote);
+> - recovery re-proposes, per index, the highest ballot's decision, or the value a fast quorum could have
+>   chosen (at least `|Q| + |F| − n` of the reports);
+> - the fast track opens only at free indices.
+>
+> An exhaustive search of the log model found no fault up to 23,552,907 classes (five nodes, four terms).
+> Status: the model is verified; the dialect does not have windows, the fast track or this recovery yet.
+
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
 > never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original
