@@ -131,8 +131,9 @@ runtime" is written where it applies; it is a design finding, not a gap.
   rule set in Part 4.6 without writing to disk.
 - **Daemon**: the slates server process on a host. Owns all volumes on that host, the bridge, the
   local metadata database, and the IPC rendezvous.
-- **Shard**: one pinned OS thread with its own single-threaded executor and its own share of state.
-  Shards never share mutable state; they exchange messages.
+- **Shard**: one OS thread with its own single-threaded executor and its own share of state, fixed to
+  a core when the process owns its cores (§4.3 "Placement"). Shards never share mutable state; they
+  exchange messages.
 - **Handle (generational)**: a small copyable id (index + generation) that names an object in an
   arena. A stale handle is detected and refused; it can never dangle.
 - **Arena**: a pre-sized region of memory from which objects of one kind are carved; freeing is
@@ -799,7 +800,8 @@ copy the few fields they use into per-shard constants at start (no cross-shard r
 
 **Algorithm (boot).** 1. Query fixed facts (page size via `sysconf(_SC_PAGESIZE)` / `vm_page_size`
 / `GetSystemInfo`; cache line via sysfs / `hw.cachelinesize` / `GetLogicalProcessorInformationEx`,
-falling back to 128 when the OS returns 0, the crossbeam rationale; cores and classes; NUMA;
+falling back to 128 when the OS returns 0, the crossbeam rationale; the cores this process may run on
+— its affinity mask, by the OS's ids — with their classes; the CPU budget a cgroup grants it; NUMA;
 memory totals; address space on 32-bit targets). 2. Probe lock capacity by locking geometrically
 growing regions until refusal; record the largest success. 3. Time N iterations of each
 microbenchmark (fault per page class with and without pre-population; trivial syscall; the wake of a
@@ -1121,6 +1123,28 @@ the shard's wake estimate × the spin-to-park ratio; the step quantum (the I/O h
 slices of a destroy, an archive or a pre-fault, and the long-step count) = the shard's wake estimate,
 seeded with wake_ns.mean and refined from the shard's own confirmed wakes over about 2^shift of them
 (shift from the probe's spread).
+
+**Placement.** One rule places the shards (`slates_machine::placement`), and the wake probe places its
+pair by it (§4.1). Shards = the fastest class's cores the process may run on that its CPU budget runs at
+once, less one kept for control and the OS, at least one. They are fixed to those cores only when the
+budget buys every core the process may run on: no quota, or a quota that covers the cpuset, as Kubernetes'
+static CPU manager gives a Guaranteed pod with integer CPUs [B: Kubernetes, "Control CPU Management
+Policies on the Node"]. A quota below the cpuset is a share of time on a pool other tenants share. There
+the OS places the shards, because fixed cores would stack every such daemon on the same CPUs. Seastar draws
+the same line with an operator's `overprovisioned` flag [C: seastar reactor_config.hh]; slates derives it
+from the facts. A refused pin is counted per shard and logged once where the OS pins. Two daemons given one
+cpuset with no quota between them still share its cores, which the facts cannot show: give each daemon its
+own machine, cpuset or quota.
+
+> **Status (2026-09-29, A-41: shards are fixed only to cores the process owns).** The facts listed a Linux
+> process's cores as `0..available_parallelism()`, a count a CPU quota lowers and that names no core. Every
+> daemon under the KIND lane's two-CPU quota pinned its one shard to CPU 1: eight shards on one of 18
+> virtual CPUs, 78–81 % CPU pressure while the VM idled 90 %, and anchor kills every minute or two (319
+> lapse lines and 15 restarts in 180 s of an idle fleet). Now the cores are the affinity mask, the budget
+> is a fact, and the placement rule above decides. The same fleet ran 180 s with 0 lapses, 0 restarts and
+> 0.00 % CPU pressure, each shard allowed on all 18 CPUs. Failing tests first in `crates/rt/tests/placement.rs`
+> (Linux, `--cpus=2` and `--cpuset-cpus=2,3`). Record:
+> `docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md`.
 
 **Laptop degenerate.** Shards = performance cores; same loop; the cluster rings exist with zero
 peers.
@@ -6685,3 +6709,27 @@ Applied in the same change to: §4.8 (Membership — the rejoin of A-15), the `s
   heal, every time.
 - What it does not change: the configuration group as the membership authority; re-admission by incarnation
   refutation only; the record link's idling (it resumes when the probe plane re-admits the peer).
+
+### A-41 — Shards are fixed only to cores the process owns (2026-09-29)
+Applied in the same change to: the glossary ("Shard"), §4.1 (boot step 1: the cores this process may run
+on and its CPU budget), §4.3 ("Placement" and its status), `slates-machine` (`facts.rs`: the affinity-mask
+core list and `CpuBudget`; `placement.rs`; `wake.rs`: the probe placed by the same rule, `Pinning::Scheduled`;
+`PROFILE_VERSION` 3), `slates-rt` (`shard_cores`, a refused pin counted and logged), the provisioning bench,
+the chart's values, `docs/wip/kind-lane.md` and GAPS.
+- Why: "one pinned OS thread" assumed the process owns its cores. Under a CPU quota it does not. A quota
+  is a share of time on a pool, and the facts turned the quota-lowered count into core ids, so every
+  daemon in a pool pinned to the same CPU. On the KIND lane, eight shards sat on CPU 1 of 18 at 78–81 % CPU
+  pressure while the VM idled 90 %, and the anchors killed the daemons every minute or two
+  (`docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md`).
+- The rule: the core list is the process's affinity mask; the cgroup CPU budget is a fact.
+  - The shard count is the fastest class's cores the budget runs at once, less one, at least one.
+  - Shards are fixed to cores only when the budget covers the whole cpuset.
+  - Otherwise the OS places them, and the wake probe measures that placement (`Scheduled`).
+  - A refused pin is counted, never discarded.
+- Evidence: two failing tests on Linux before the fix pass after it (`--cpus=2`: a shard confined to CPU
+  1; `--cpuset-cpus=2,3`: a pin outside the set refused unseen). The placement oracle covers 676 cpuset
+  masks × 5 quotas. On KIND the idle fleet went from 319 lapse lines and 15 restarts in 180 s to none, with
+  0.00 % CPU pressure.
+- What it does not change: thread-per-core ownership; pinning on a machine or cpuset the daemon owns (the
+  §4.3 worked example still fixes five shards to five Super cores); the machine identity's meaning (the
+  count of cores the process may use, now counted from the mask).

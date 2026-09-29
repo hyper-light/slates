@@ -21,7 +21,10 @@
 //! - [`stats`] — medians, percentiles by integer rationals, bootstrap intervals with a seeded
 //!   generator, and the stopping rule.
 //! - [`bench`] — the measurement harness with batching for sub-timer-resolution operations.
-//! - [`facts`] — the fixed facts queried from the OS (pages, cache line, cores, memory, power).
+//! - [`facts`] — the fixed facts queried from the OS (pages, cache line, the cores this process may run
+//!   on, its CPU budget, memory, power).
+//! - [`placement`] — where the shards run: how many, and whether they are fixed to cores the process
+//!   owns; the runtime and the wake probe both place by it.
 //! - [`probes`] — the microbenchmarks.
 //! - [`wake`] — the wake probe: the expected cost of parking, on the placement production runs under.
 //! - [`profile`] — the [`MachineProfile`] assembled from facts and probes, its JSON export with
@@ -37,6 +40,7 @@ pub mod clock;
 pub mod derived;
 pub mod error;
 pub mod facts;
+pub mod placement;
 pub mod probes;
 pub mod profile;
 pub mod segment;

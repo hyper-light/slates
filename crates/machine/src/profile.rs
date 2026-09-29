@@ -16,16 +16,22 @@ use crate::error::MachineError;
 use crate::facts::Facts;
 #[cfg(test)]
 use crate::facts::PowerState;
+use crate::placement::Placement;
 use crate::probes::{
   CodecPoint, CorePairRtt, FaultCosts, HashThroughput, LockCapacity, MemcpyPoint, Pinning,
 };
 use crate::wake::WakeLatency;
 use crate::{derived, probes, wake};
 
-/// Format: the profile format version; bumped when a field's meaning changes. 2 (2026-09-22): the wake
-/// latency is the confirmed sleeper's wake on the production placement, reported by its mean with an
-/// interval, its rounds and their verdict ([`crate::wake`]); version 1's p50/p99 timed a different event.
-pub const PROFILE_VERSION: u32 = 2;
+/// The profile format version; bumped when a field's meaning changes. 2 (2026-09-22): the wake latency is
+/// the confirmed sleeper's wake on the production placement, reported by its mean with an interval, its
+/// rounds and their verdict ([`crate::wake`]); version 1's p50/p99 timed a different event. 3 (2026-09-29):
+/// the facts' cores are the ones this process may run on, by the OS's ids, beside the CPU budget a cgroup
+/// grants it, and the wake probe is placed by [`crate::placement`] (unpinned, `Scheduled`, where the
+/// process shares its cores in time); version 2 listed `0..available_parallelism()`
+/// (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md).
+/// Format: the version this build writes and the only one it reads.
+pub const PROFILE_VERSION: u32 = 3;
 
 /// How to take a profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +97,7 @@ impl MachineProfile {
     let timer_overhead_ns = timer_overhead_ns();
     let syscall = probes::syscall(budget);
     let faults = probes::faults(&facts.page, budget);
-    let wake = wake::wake(budget, &facts.cores)?;
+    let wake = wake::wake(budget, &Placement::of(&facts.cores, facts.cpu_budget))?;
     let (core_rtt, pinning) = if options.core_matrix {
       probes::core_matrix(&facts.cores, budget)
     } else {
@@ -159,7 +165,10 @@ impl MachineProfile {
     self.facts.power = Facts::query().power;
     self.timer_overhead_ns = timer_overhead_ns();
     self.syscall = probes::syscall(budget);
-    self.wake = wake::wake(budget, &self.facts.cores)?;
+    self.wake = wake::wake(
+      budget,
+      &Placement::of(&self.facts.cores, self.facts.cpu_budget),
+    )?;
     Ok(())
   }
 

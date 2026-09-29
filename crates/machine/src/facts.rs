@@ -99,6 +99,94 @@ fn tightest(bounds: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
   bounds.into_iter().flatten().min()
 }
 
+/// The CPU time a cgroup grants the process: `quota_us` microseconds of CPU in every `period_us`
+/// microseconds (cgroup v2 `cpu.max`; v1 `cpu.cfs_quota_us` over `cpu.cfs_period_us`) [B: kernel
+/// Documentation/admin-guide/cgroup-v2.rst "cpu.max"; Documentation/scheduler/sched-bwc.rst].
+///
+/// It is a share of time on the cores the process may run on, not a claim on any one of them (§4.3): a
+/// container given two CPUs of an eighteen-CPU pool may run on all eighteen and shares every one with
+/// the pool's other tenants. So it bounds how many shards can run at once without being throttled, and it
+/// says whether the process owns its cores at all ([`CpuBudget::covers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CpuBudget {
+  /// Microseconds of CPU time the process's threads may use together in each period.
+  pub quota_us: u64,
+  /// The accounting period, microseconds.
+  pub period_us: u64,
+}
+
+impl CpuBudget {
+  /// Whether the budget buys `cores` CPUs at once (`quota ≥ period × cores`): whether every core of a set
+  /// that size can run a thread of this process for the whole period without the quota stopping it. A
+  /// product past `u128` covers nothing.
+  pub fn covers(&self, cores: usize) -> bool {
+    let Ok(cores) = u128::try_from(cores) else {
+      return false;
+    };
+    u128::from(self.period_us)
+      .checked_mul(cores)
+      .is_some_and(|needed| u128::from(self.quota_us) >= needed)
+  }
+
+  /// The whole CPUs the budget buys at once, `⌊quota / period⌋`: the threads that can run together through
+  /// a whole period. A zero period (never written by a kernel; hostile) grants no bound.
+  pub fn whole_cpus(&self) -> u64 {
+    self
+      .quota_us
+      .checked_div(self.period_us)
+      .unwrap_or(u64::MAX)
+  }
+
+  /// The tighter of two budgets: the smaller share of time, compared by cross-multiplying so no rounding
+  /// decides it.
+  // Only the Linux cgroup walk and the tests call it; the other platforms keep it compiled.
+  #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+  fn tighter(self, other: CpuBudget) -> CpuBudget {
+    let mine = u128::from(self.quota_us) * u128::from(other.period_us);
+    let theirs = u128::from(other.quota_us) * u128::from(self.period_us);
+    if theirs < mine { other } else { self }
+  }
+}
+
+/// A cgroup v2 `cpu.max` file's text as a budget: `QUOTA PERIOD`, two decimal microsecond counts. `max`
+/// (no quota), a missing period, a zero, and hostile text (signs, suffixes, a number past `u64`, a third
+/// field) are no budget — never a guessed one.
+pub fn parse_cpu_max(text: &str) -> Option<CpuBudget> {
+  let mut fields = text.split_whitespace();
+  let (Some(quota), Some(period), None) = (fields.next(), fields.next(), fields.next()) else {
+    return None;
+  };
+  cpu_budget_of(quota, period)
+}
+
+/// A cgroup v1 pair of `cpu.cfs_quota_us` and `cpu.cfs_period_us` texts as a budget; a quota of `-1` (no
+/// quota) or any text `parse_cpu_max` refuses is no budget.
+pub fn parse_cfs_budget(quota: &str, period: &str) -> Option<CpuBudget> {
+  cpu_budget_of(quota.trim(), period.trim())
+}
+
+/// A budget from two decimal microsecond counts, both non-zero.
+fn cpu_budget_of(quota: &str, period: &str) -> Option<CpuBudget> {
+  let count = |text: &str| {
+    text
+      .bytes()
+      .all(|b| b.is_ascii_digit())
+      .then(|| text.parse::<u64>().ok())
+      .flatten()
+      .filter(|value| *value > 0)
+  };
+  Some(CpuBudget {
+    quota_us: count(quota)?,
+    period_us: count(period)?,
+  })
+}
+
+/// The tightest of several optional budgets (a parent cgroup's quota binds its children).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn tightest_budget(budgets: impl IntoIterator<Item = Option<CpuBudget>>) -> Option<CpuBudget> {
+  budgets.into_iter().flatten().reduce(CpuBudget::tighter)
+}
+
 /// A finite `RLIMIT_AS` or `RLIMIT_DATA` on this process (the smaller), as a memory bound; none
 /// when both are unlimited or the query is refused.
 #[cfg(unix)]
@@ -168,8 +256,14 @@ pub struct Facts {
   pub page: PageFacts,
   /// The cache line in bytes.
   pub cache_line: u64,
-  /// The cores.
+  /// The cores this process may run on, by the OS's ids (its affinity mask where the OS keeps one:
+  /// `sched_getaffinity` on Linux, the process affinity mask on Windows; every core on macOS, which keeps
+  /// none), each with its class. Not `0..available_parallelism()`: that count is lowered by a CPU quota and
+  /// names no core (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md).
   pub cores: Vec<CoreFacts>,
+  /// The CPU time a cgroup grants the process, when one bounds it ([`CpuBudget`]); `None` when nothing
+  /// does (no quota, macOS, and Windows, whose job-object CPU rate limit is owed like its memory limit).
+  pub cpu_budget: Option<CpuBudget>,
   /// Memory.
   pub memory: MemoryFacts,
   /// The power state at the time of the query.
@@ -181,6 +275,10 @@ pub struct Facts {
 /// The macOS `sysctlbyname` reader, shared with the probes.
 #[cfg(target_os = "macos")]
 pub(crate) use platform::sysctl_u64;
+
+/// The Windows process affinity mask, shared with the probes that give a pinned thread its mask back.
+#[cfg(windows)]
+pub(crate) use platform::process_affinity_mask;
 
 impl Facts {
   /// Queries every fact from the OS.
@@ -196,6 +294,7 @@ impl Facts {
     let page = platform::page(&mut notes);
     let cache_line = platform::cache_line(&mut notes);
     let cores = platform::cores(&mut notes);
+    let cpu_budget = platform::cpu_budget(&mut notes);
     let mut memory = platform::memory(&mut notes);
     memory.limit = tightest([platform::cgroup_bound(&mut notes), rlimit_bound()]);
     let power = platform::power(&mut notes);
@@ -213,10 +312,20 @@ impl Facts {
       page,
       cache_line,
       cores,
+      cpu_budget,
       memory,
       power,
       notes,
     }
+  }
+
+  /// How many threads of this process can run at once: its cores, capped by the whole CPUs its budget buys
+  /// ([`CpuBudget::whole_cpus`]) — a quota below the cpuset runs fewer threads than the cpuset has cores.
+  pub fn cpus_at_once(&self) -> usize {
+    let buys = self.cpu_budget.map_or(usize::MAX, |budget| {
+      usize::try_from(budget.whole_cpus()).unwrap_or(usize::MAX)
+    });
+    self.cores.len().min(buys)
   }
 
   /// The largest L2 any core reports (0 when unknown).
@@ -236,7 +345,10 @@ pub fn locked_bytes() -> Option<u64> {
 /// only when the OS refuses to say; crossbeam's `CachePadded` uses the same fallback reasoning.
 pub const CACHE_LINE_FALLBACK: u64 = 128;
 
-/// The number of logical cores the OS lets this process use.
+/// The number of logical cores the OS lets this process use: macOS's core list when its performance
+/// levels are refused (macOS keeps no affinity mask, so every logical CPU number is one the process may
+/// run on). Never a source of core ids elsewhere: a CPU quota lowers the count and it names no core.
+#[cfg(target_os = "macos")]
 fn parallelism() -> u32 {
   std::thread::available_parallelism()
     .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
@@ -427,6 +539,12 @@ mod platform {
     None
   }
 
+  /// macOS has no CPU quota a process can be placed under (no cgroups; `taskpolicy` changes priority,
+  /// not time): nothing bounds the process's CPU time.
+  pub(super) fn cpu_budget(_notes: &mut Vec<String>) -> Option<super::CpuBudget> {
+    None
+  }
+
   // libc marks mach_host_self deprecated in favour of the mach2 crate; one declaration here
   // keeps the dependency set small (the symbol is in libSystem on every macOS we build for).
   unsafe extern "C" {
@@ -567,7 +685,7 @@ mod platform {
 #[cfg(target_os = "linux")]
 mod platform {
   use super::{
-    CACHE_LINE_FALLBACK, CoreClass, CoreFacts, MemoryFacts, PageFacts, PowerState, parallelism,
+    CACHE_LINE_FALLBACK, CoreClass, CoreFacts, CpuBudget, MemoryFacts, PageFacts, PowerState,
     parse_size,
   };
   use std::path::Path;
@@ -619,11 +737,12 @@ mod platform {
   }
 
   pub(super) fn cores(notes: &mut Vec<String>) -> Vec<CoreFacts> {
-    let count = parallelism();
+    let allowed = allowed_cores(notes);
     let atom = cpu_list("/sys/devices/cpu_atom/cpus");
     let core = cpu_list("/sys/devices/cpu_core/cpus");
     let mut unknown = 0u32;
-    let cores = (0..count)
+    let cores = allowed
+      .into_iter()
       .map(|id| {
         let base = format!("/sys/devices/system/cpu/cpu{id}");
         let class = class_of(id, &base, &atom, &core);
@@ -645,6 +764,80 @@ mod platform {
       ));
     }
     cores
+  }
+
+  /// The CPUs the calling thread may run on, by the kernel's ids: its affinity mask, which a cpuset
+  /// narrows and a CPU quota does not [B: sched_getaffinity(2); cgroup-v2.rst "cpuset"]. The facts are
+  /// queried before any probe pins the thread, so this is the process's own set. A kernel with more
+  /// possible CPUs than the mask holds (`CpuSet::MAX_CPU`, 1,024) refuses the query; that host is outside
+  /// the design's envelope (§2: 32–192 cores), and its facts then name no core, so nothing is pinned and
+  /// one shard runs — said in a note, never a guessed id.
+  fn allowed_cores(notes: &mut Vec<String>) -> Vec<u32> {
+    use rustix::thread::{CpuSet, sched_getaffinity};
+    match sched_getaffinity(None) {
+      Ok(set) => (0..CpuSet::MAX_CPU)
+        .filter(|&index| set.is_set(index))
+        .filter_map(|index| u32::try_from(index).ok())
+        .collect(),
+      Err(e) => {
+        notes.push(format!(
+          "sched_getaffinity refused ({e}); recorded no core, so no shard is pinned"
+        ));
+        Vec::new()
+      }
+    }
+  }
+
+  /// The tightest cgroup CPU budget over this process ([`CpuBudget`]): the process's cgroup path from
+  /// `/proc/self/cgroup`, then `cpu.max` (v2) or `cpu.cfs_quota_us` with `cpu.cfs_period_us` (v1) at that
+  /// cgroup and every ancestor up to the root — a parent's quota binds its children — the smallest share
+  /// found. None when no controller bounds the process, or the files cannot be read (a query refused is no
+  /// budget, never a guessed one). The walk mirrors [`cgroup_bound`].
+  pub(super) fn cpu_budget(notes: &mut Vec<String>) -> Option<CpuBudget> {
+    let cgroup = read("/proc/self/cgroup")?;
+    let mut budgets = Vec::new();
+    for line in cgroup.lines() {
+      // Format: `id:controllers:path`, split at most three ways (a hostile path cannot add fields).
+      let mut fields = line.splitn(3, ':');
+      let (Some(_), Some(controllers), Some(path)) = (fields.next(), fields.next(), fields.next())
+      else {
+        continue;
+      };
+      let v1 = !controllers.is_empty();
+      if v1 && !controllers.split(',').any(|c| c == "cpu") {
+        continue;
+      }
+      let mut dir = path.trim_end_matches('/').to_owned();
+      loop {
+        budgets.push(budget_at(&dir, v1));
+        match dir.rfind('/') {
+          Some(0) | None => break,
+          Some(cut) => dir.truncate(cut),
+        }
+      }
+      budgets.push(budget_at("", v1));
+    }
+    let budget = super::tightest_budget(budgets);
+    if let Some(budget) = budget {
+      notes.push(format!(
+        "cgroup CPU budget {} µs per {} µs",
+        budget.quota_us, budget.period_us
+      ));
+    }
+    budget
+  }
+
+  /// The budget one cgroup directory states: v2 `cpu.max`, or v1's quota over its period.
+  fn budget_at(dir: &str, v1: bool) -> Option<CpuBudget> {
+    if v1 {
+      let root = "/sys/fs/cgroup/cpu";
+      super::parse_cfs_budget(
+        &read(&format!("{root}{dir}/cpu.cfs_quota_us"))?,
+        &read(&format!("{root}{dir}/cpu.cfs_period_us"))?,
+      )
+    } else {
+      super::parse_cpu_max(&read(&format!("/sys/fs/cgroup{dir}/cpu.max"))?)
+    }
   }
 
   fn class_of(id: u32, base: &str, atom: &[u32], core: &[u32]) -> CoreClass {
@@ -855,9 +1048,7 @@ mod platform {
     None
   }
 
-  use super::{
-    CACHE_LINE_FALLBACK, CoreClass, CoreFacts, MemoryFacts, PageFacts, PowerState, parallelism,
-  };
+  use super::{CACHE_LINE_FALLBACK, CoreClass, CoreFacts, MemoryFacts, PageFacts, PowerState};
   use windows_sys::Win32::System::Memory::GetLargePageMinimum;
   use windows_sys::Win32::System::Power::GetSystemPowerStatus;
   use windows_sys::Win32::System::Power::SYSTEM_POWER_STATUS;
@@ -866,6 +1057,7 @@ mod platform {
     MEMORYSTATUSEX, RelationCache, RelationNumaNode, SYSTEM_INFO,
     SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
   };
+  use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
 
   fn system_info() -> SYSTEM_INFO {
     // SAFETY: an all-zero SYSTEM_INFO is a valid, if empty, value for the call below to fill.
@@ -942,16 +1134,29 @@ mod platform {
     }
     let numa_of = |id: u32| -> u32 {
       for entry in &info {
-        if entry.Relationship == RelationNumaNode && (entry.ProcessorMask >> id) & 1 == 1 {
+        if entry.Relationship == RelationNumaNode
+          && entry
+            .ProcessorMask
+            .checked_shr(id)
+            .is_some_and(|bits| bits & 1 == 1)
+        {
           // SAFETY: the relationship says the union holds the NUMA descriptor.
           return unsafe { entry.Anonymous.NumaNode.NodeNumber };
         }
       }
       0
     };
+    // The cores this process may run on are its affinity mask's bits, not `0..available_parallelism()`
+    // (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md).
+    let Some(mask) = process_affinity_mask() else {
+      notes
+        .push("GetProcessAffinityMask refused; recorded no core, so no shard is pinned".to_owned());
+      return Vec::new();
+    };
     notes
       .push("core classes are not queried on Windows in this phase; recorded unknown".to_owned());
-    (0..parallelism())
+    (0..usize::BITS)
+      .filter(|&id| mask.checked_shr(id).is_some_and(|bits| bits & 1 == 1))
       .map(|id| CoreFacts {
         id,
         class: CoreClass::Unknown,
@@ -960,6 +1165,24 @@ mod platform {
         l2_bytes: l2,
       })
       .collect()
+  }
+
+  /// The process's affinity mask: the logical processors of its group it may run on, one bit each (up to
+  /// 64), or `None` when the query is refused or names none [B: GetProcessAffinityMask, Microsoft Learn].
+  /// The core facts' source, and the mask the core matrix and the wake probe give the calling thread back
+  /// after pinning it.
+  pub(crate) fn process_affinity_mask() -> Option<usize> {
+    let mut process: usize = 0;
+    let mut system: usize = 0;
+    // SAFETY: the current process pseudo-handle and two writable usize outputs.
+    let ok =
+      unsafe { GetProcessAffinityMask(GetCurrentProcess(), &raw mut process, &raw mut system) };
+    (ok != 0 && process != 0).then_some(process)
+  }
+
+  /// Windows has no cgroups; a job object's CPU rate limit is the counterpart, owed with its memory limit.
+  pub(super) fn cpu_budget(_notes: &mut Vec<String>) -> Option<super::CpuBudget> {
+    None
   }
 
   pub(super) fn memory(notes: &mut Vec<String>) -> MemoryFacts {
@@ -1051,6 +1274,78 @@ mod tests {
     ] {
       assert_eq!(parse_cgroup_limit(hostile), None, "{hostile:?}");
     }
+  }
+
+  /// A cgroup CPU budget is read only from the kernel's exact forms: v2 `cpu.max` as `QUOTA PERIOD`, v1 as
+  /// a quota and a period; `max`, v1's `-1`, a missing or third field, a zero, and hostile text (signs,
+  /// suffixes, hex, a number past `u64`) are no budget at all — never a guessed one (§4.3: a budget read
+  /// wrong would fix shards on a shared pool or run more than the quota buys).
+  #[test]
+  fn a_cpu_budget_is_read_only_from_the_kernels_exact_forms() {
+    let two = Some(CpuBudget {
+      quota_us: 200_000,
+      period_us: 100_000,
+    });
+    assert_eq!(parse_cpu_max("200000 100000\n"), two);
+    assert_eq!(parse_cfs_budget("200000\n", " 100000 "), two);
+    for hostile in [
+      "max 100000",
+      "",
+      "200000",
+      "200000 100000 7",
+      "0 100000",
+      "200000 0",
+      "-200000 100000",
+      "+200000 100000",
+      "2e5 100000",
+      "0x30d40 100000",
+      "18446744073709551616 100000",
+    ] {
+      assert_eq!(parse_cpu_max(hostile), None, "{hostile:?}");
+    }
+    assert_eq!(parse_cfs_budget("-1", "100000"), None);
+    assert_eq!(parse_cfs_budget("200000", "max"), None);
+  }
+
+  /// A budget covers a set of cores when it buys them all at once, rounds its whole CPUs down, and the
+  /// tightest of several is the smallest share, decided without rounding (a parent's 1.5 CPUs binds a
+  /// child's 2); arithmetic past `u128` covers nothing, and a hostile zero period is no bound.
+  #[test]
+  fn a_budget_covers_what_it_buys_and_the_tightest_share_binds() {
+    let budget = |quota_us, period_us| CpuBudget {
+      quota_us,
+      period_us,
+    };
+    assert!(budget(200_000, 100_000).covers(2));
+    assert!(!budget(200_000, 100_000).covers(3));
+    assert!(!budget(u64::MAX, u64::MAX).covers(usize::MAX));
+    assert_eq!(budget(250_000, 100_000).whole_cpus(), 2);
+    assert_eq!(budget(50_000, 100_000).whole_cpus(), 0);
+    assert_eq!(budget(1, 0).whole_cpus(), u64::MAX);
+    assert_eq!(
+      tightest_budget([
+        Some(budget(200_000, 100_000)),
+        None,
+        Some(budget(150_000, 100_000)),
+        Some(budget(400_000, 200_000)),
+      ]),
+      Some(budget(150_000, 100_000))
+    );
+    assert_eq!(tightest_budget([None, None]), None);
+  }
+
+  /// The facts count the threads that run at once as the cores capped by the budget's whole CPUs.
+  #[test]
+  fn the_cpus_at_once_are_the_cores_capped_by_the_budget() {
+    let mut facts = Facts::query();
+    let cores = facts.cores.len();
+    facts.cpu_budget = None;
+    assert_eq!(facts.cpus_at_once(), cores);
+    facts.cpu_budget = Some(CpuBudget {
+      quota_us: 100_000,
+      period_us: 100_000,
+    });
+    assert_eq!(facts.cpus_at_once(), cores.min(1));
   }
 
   /// The effective capacity is the physical memory clamped to a bound set below it; a bound above

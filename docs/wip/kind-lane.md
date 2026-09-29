@@ -358,12 +358,18 @@ fresh fleets):
 
 Medians: led 8.76 s, retired 24.66 s, resolved 29.90 s after the cut; one election each.
 
+**These numbers ran on daemons that restarted every minute or two, and are owed again.** Every pod's one
+shard was fixed to CPU 1 of the VM's 18 (a two-CPU quota's count taken for core ids), so the anchors killed
+the daemons for late heartbeats: 319 lapse lines and 15 restarts in 180 s of an idle fleet. Fixed by A-41
+(§4.3 "Placement"; `docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md`): the
+same idle fleet then ran 180 s with no lapse, no restart and 0.00 % CPU pressure.
+
 **Found by it, before it could measure.**
 - **The detector view is not the council's.** The first criterion for "resolved" used the lane's formation
   check, which reads each node's detector. After the council had retired both cut voters and resolved at
   version 23, every survivor's detector still held five members alive, the two extra being the cut pods'
-  manifest seed ids. The step judges by the council's committed membership now. The revived seeds are open
-  (GAPS, 2026-09-29).
+  manifest seed ids. The step judges by the council's committed membership now. The revived seeds were the
+  restarting daemons re-seeding every manifest peer alive (GAPS, 2026-09-29); the re-run is owed.
 - **A council seats fewer voters than its `f` for a while after formation.** One trial cut a fleet whose five
   members were all admitted and settled 2.2 s after formation. Its council's committed voters were the
   bootstrap alone: the promotions, catch-up rounds and then the joint change, had not committed. The cut took

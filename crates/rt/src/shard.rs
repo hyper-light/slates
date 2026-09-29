@@ -141,6 +141,10 @@ pub struct Counters {
   pub spin_deadlines: u64,
   /// The measured scheduler overrun, nanoseconds ([`ShardContext::scheduler_overrun_ns`]).
   pub scheduler_overrun_ns: u64,
+  /// 1 when the OS refused the core the shard's placement fixed it to, so the shard runs wherever the
+  /// scheduler puts it: a fault on Linux and Windows, where the placement names only cores the process
+  /// owns (`slates_machine::placement`); on macOS the affinity hint Apple silicon refuses by design.
+  pub pin_refused: u64,
 }
 
 /// Shape: the exponential-forgetting shift of the measured scheduler overrun — a wait's overrun that
@@ -472,6 +476,11 @@ impl ShardContext {
     self
       .with_inner(|inner| inner.arena.generation_high())
       .unwrap_or(0)
+  }
+
+  /// Records that the OS refused the core this shard's placement fixed it to ([`Counters::pin_refused`]).
+  pub fn note_pin_refused(&self) {
+    self.with_inner(|inner| inner.counters.pin_refused = 1);
   }
 
   /// The counters.

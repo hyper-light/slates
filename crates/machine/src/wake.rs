@@ -13,15 +13,17 @@
 //!   still running or asleep, and on the waker's CPU or another, so it mixed an on-CPU handoff (about
 //!   0.45 µs) with a real wake (about 10 µs); thread placement holds for a whole run, so whole runs split
 //!   between the two (a median of 417 ns and of 10,041 ns on the same two cores, a minute apart).
-//! - **The placement production runs under.** Where the runtime pins its shards (Linux, Windows) the waiter
-//!   is pinned to a shard core and the waker to the control core — the cores `slates-rt`'s `shard_cores`
-//!   picks: the fastest class, its first core for control — one shard core per round; a sample the OS still
-//!   ran on one CPU is not the event and is dropped (counted). Pinned this way, on a quiet host, the
-//!   probe's median held at 8.9–10.8 µs over ten container runs (two and four CPUs, 2026-09-25) where the
-//!   old probe's flipped between 416 ns and 10,041 ns. Where the OS will not pin (macOS: an affinity hint, refused on
-//!   Apple silicon) production is unpinned too, so every sample is kept and the same-CPU share is recorded
-//!   (63–92 % of wakes on Apple silicon ran on the waker's CPU across the prototype's and the probe's runs;
-//!   the probe's pooled mean held at 2.03–2.49 µs over five runs).
+//! - **The placement production runs under** ([`crate::placement`], the rule the runtime places its shards
+//!   by). Where the runtime fixes its shards — the process owns its cores and the OS pins (Linux, Windows)
+//!   — the waiter is pinned to a shard core and the waker to the control core, one shard core per round; a
+//!   sample the OS still ran on one CPU is not the event and is dropped (counted). Pinned this way, on a
+//!   quiet host, the probe's median held at 8.9–10.8 µs over ten container runs (two and four CPUs,
+//!   2026-09-25) where the old probe's flipped between 416 ns and 10,041 ns. Where production is not fixed
+//!   — the process shares its cores in time (a CPU quota below its cpuset), or the OS will not pin (macOS:
+//!   an affinity hint, refused on Apple silicon) — the OS places the pair as it places the shards, so every
+//!   sample is kept and the same-CPU share is recorded (63–92 % of wakes on Apple silicon ran on the
+//!   waker's CPU across the prototype's and the probe's runs; the probe's pooled mean held at 2.03–2.49 µs
+//!   over five runs).
 //! - **The mean, not the median.** The spin-then-park rule spins for the expected cost of parking [A:
 //!   Karlin, Manasse, McGeoch & Owicki, "Competitive randomized algorithms for nonuniform problems",
 //!   Algorithmica 1994], and the heavy tail is part of that cost: on the same two pinned cores a spinning
@@ -52,8 +54,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::bench::{MIN_SAMPLES, nanos};
 use crate::error::MachineError;
-use crate::facts::CoreFacts;
-use crate::probes::{Pinning, SavedAffinity, pin_current_thread, weaker};
+use crate::placement::Placement;
+use crate::probes::{
+  Pinning, SavedAffinity, pin_current_thread, pinning_code, pinning_from_code, weaker,
+};
 use crate::stats::{
   CONVERGED_WIDTH_PERMILLE, Interval, MeanInterval, Percentile, Sample, Xorshift,
   bootstrap_interval, bootstrap_mean_interval, converged_mean, standard_deviation,
@@ -194,7 +198,7 @@ const IDLE: u32 = 0;
 const GO: u32 = 1;
 const DONE: u32 = 2;
 
-/// Measures the wake latency within `budget`, on the cores `cores` names (the profile's facts).
+/// Measures the wake latency within `budget`, placed as `placement` places the shards (the profile's facts).
 ///
 /// The [`WAKE_ROUNDS`] rounds share the budget. A round whose setup — a fresh waiter scheduled and
 /// confirmed asleep — outlasts its share on a loaded machine keeps nothing, and five such rounds once left
@@ -204,8 +208,8 @@ const DONE: u32 = 2;
 /// run, each with twice the last one's budget: a slow machine gets exponentially more time, within
 /// `2 + 4 + 8 + 16 + 32 = 62` more shares. Short of the floor even then, the probe refuses
 /// `MeasurementTimeout` rather than report a mean it did not measure.
-pub fn wake(budget: Duration, cores: &[CoreFacts]) -> Result<WakeLatency, MachineError> {
-  let pairs = core_pairs(cores);
+pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, MachineError> {
+  let pairs = core_pairs(placement);
   let saved = SavedAffinity::of_calling_thread();
   let mut round_budget = budget / WAKE_ROUNDS;
   let mut rng = Xorshift::new(Xorshift::SEED);
@@ -318,22 +322,17 @@ pub fn rounds_agree(round_medians: &[Interval], pooled: &Interval) -> Option<boo
 /// Format: parts per thousand.
 const PERMILLE: u64 = 1000;
 
-/// The (waker, waiter) core pairs, one per round in turn: the waker on the fastest class's first core
-/// (the control core), the waiter on each of the class's other cores (the shard cores), or on that one
-/// core when the class has only one (production shares it then). Empty when the facts name no core.
-pub fn core_pairs(cores: &[CoreFacts]) -> Vec<(u32, u32)> {
-  let best = cores.iter().map(|core| core.level).min();
-  let mut class: Vec<u32> = cores
-    .iter()
-    .filter(|core| Some(core.level) == best)
-    .map(|core| core.id)
-    .collect();
-  class.sort_unstable();
-  match class.split_first() {
-    None => Vec::new(),
-    Some((control, [])) => vec![(*control, *control)],
-    Some((control, shards)) => shards.iter().map(|shard| (*control, *shard)).collect(),
-  }
+/// The (waker, waiter) core pairs, one per round in turn, where production fixes its shards: the waker on
+/// the control core, the waiter on each shard core (both on the one core a one-core class shares). Empty
+/// where production does not fix them: the OS then places the pair as it places the shards.
+pub fn core_pairs(placement: &Placement) -> Vec<(u32, u32)> {
+  placement.fixed.as_ref().map_or_else(Vec::new, |fixed| {
+    fixed
+      .shards
+      .iter()
+      .map(|shard| (fixed.control, *shard))
+      .collect()
+  })
 }
 
 /// One round's outcome.
@@ -366,7 +365,7 @@ struct Shared {
 /// converges or `budget` ends.
 fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) -> Round {
   let started = Instant::now();
-  let waker_pin = pair.map_or(Pinning::Refused, |(waker, _)| pin_current_thread(waker));
+  let waker_pin = pair.map_or(Pinning::Scheduled, |(waker, _)| pin_current_thread(waker));
   let shared = Shared {
     stamp: AtomicU64::new(0),
     turn: AtomicU32::new(IDLE),
@@ -374,7 +373,7 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
     parking: AtomicBool::new(false),
     waiter: AtomicU64::new(UNPUBLISHED),
     waiter_cpu: AtomicU32::new(UNKNOWN_CPU),
-    waiter_pin: AtomicU32::new(pin_code(Pinning::Refused)),
+    waiter_pin: AtomicU32::new(pinning_code(Pinning::Refused)),
   };
   let epoch = Instant::now();
   let waker = std::thread::current();
@@ -391,7 +390,7 @@ fn wake_round(pair: Option<(u32, u32)>, budget: Duration, rng: &mut Xorshift) ->
       waiter.thread().unpark();
       return;
     };
-    let waiter_pin = pin_from_code(shared.waiter_pin.load(Ordering::Acquire));
+    let waiter_pin = pinning_from_code(shared.waiter_pin.load(Ordering::Acquire));
     round.placement = weaker(waker_pin, waiter_pin);
     // Only a pair pinned to two distinct cores defines the event as cross-CPU; unpinned (or one core),
     // wherever the OS ran the waiter is the placement production gets.
@@ -435,8 +434,10 @@ fn waiter_loop(
   epoch: Instant,
   waker: &std::thread::Thread,
 ) {
-  let pin = pair.map_or(Pinning::Refused, |(_, waiter)| pin_current_thread(waiter));
-  shared.waiter_pin.store(pin_code(pin), Ordering::Release);
+  let pin = pair.map_or(Pinning::Scheduled, |(_, waiter)| pin_current_thread(waiter));
+  shared
+    .waiter_pin
+    .store(pinning_code(pin), Ordering::Release);
   shared
     .waiter
     .store(platform::thread_id(), Ordering::Release);
@@ -522,22 +523,6 @@ fn time_one_wake(
   shared.turn.store(IDLE, Ordering::Release);
   let one_cpu = waker_cpu.is_some_and(|cpu| cpu != UNKNOWN_CPU && cpu == woke_on);
   Some((latency, one_cpu))
-}
-
-fn pin_code(pinning: Pinning) -> u32 {
-  match pinning {
-    Pinning::Pinned => 0,
-    Pinning::Hint => 1,
-    Pinning::Refused => 2,
-  }
-}
-
-fn pin_from_code(code: u32) -> Pinning {
-  match code {
-    0 => Pinning::Pinned,
-    1 => Pinning::Hint,
-    _ => Pinning::Refused,
-  }
 }
 
 #[cfg(target_os = "linux")]
@@ -658,7 +643,7 @@ mod platform {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::facts::{CoreClass, Facts};
+  use crate::facts::{CoreClass, CoreFacts, CpuBudget, Facts};
 
   fn core(id: u32, level: u32) -> CoreFacts {
     CoreFacts {
@@ -670,16 +655,39 @@ mod tests {
     }
   }
 
-  /// §4.1, D-10 (the placement production runs under): the waker takes the fastest class's first core
-  /// (the control core) and the waiter each other core of that class in turn (the shard cores), as the
-  /// runtime's `shard_cores` places them; a one-core class shares its core; slower classes are never
-  /// used; no facts, no pairs.
+  /// The placement the profile measures the wake under: the facts' own.
+  fn placement_of(facts: &Facts) -> Placement {
+    Placement::of(&facts.cores, facts.cpu_budget)
+  }
+
+  /// §4.1, D-10 (the placement production runs under): where the process owns its cores, the waker takes
+  /// the fastest class's first core (the control core) and the waiter each other core of that class in
+  /// turn (the shard cores), as the runtime places them; a one-core class shares its core; slower classes
+  /// are never used. Where the process shares its cores in time (a quota below its cpuset) production
+  /// fixes nothing, so neither does the probe; no facts, no pairs.
   #[test]
   fn the_pairs_follow_the_runtimes_shard_placement() {
     let mixed = [core(4, 1), core(2, 0), core(0, 0), core(5, 1), core(1, 0)];
-    assert_eq!(core_pairs(&mixed), vec![(0, 1), (0, 2)]);
-    assert_eq!(core_pairs(&[core(3, 0), core(1, 1)]), vec![(3, 3)]);
-    assert_eq!(core_pairs(&[]), Vec::<(u32, u32)>::new());
+    assert_eq!(
+      core_pairs(&Placement::of(&mixed, None)),
+      vec![(0, 1), (0, 2)]
+    );
+    assert_eq!(
+      core_pairs(&Placement::of(&[core(3, 0), core(1, 1)], None)),
+      vec![(3, 3)]
+    );
+    let shared = CpuBudget {
+      quota_us: 200_000,
+      period_us: 100_000,
+    };
+    assert_eq!(
+      core_pairs(&Placement::of(&mixed, Some(shared))),
+      Vec::<(u32, u32)>::new()
+    );
+    assert_eq!(
+      core_pairs(&Placement::of(&[], None)),
+      Vec::<(u32, u32)>::new()
+    );
   }
 
   /// The rounds' verdict by use: rounds drawn from one distribution agree; a round stuck in another mode
@@ -792,14 +800,20 @@ mod tests {
   fn a_wake_is_a_confirmed_sleepers_wake_on_the_production_placement() {
     let facts = Facts::query();
     let before = std::thread::available_parallelism().map_or(1, |n| n.get());
-    let w = wake(Duration::from_millis(100), &facts.cores).expect("the probe measures a wake");
+    let placement = placement_of(&facts);
+    let w = wake(Duration::from_millis(100), &placement).expect("the probe measures a wake");
     let after = std::thread::available_parallelism().map_or(1, |n| n.get());
     assert_eq!(
       after, before,
       "the calling thread's usable parallelism is unchanged"
     );
     assert_a_measured_mean(&w);
-    let pairs = core_pairs(&facts.cores);
+    let pairs = core_pairs(&placement);
+    if pairs.is_empty() {
+      // Production fixes nothing here (a pool shared in time), so the probe pinned nothing and says so,
+      // rather than calling the OS's placement a refusal.
+      assert_eq!(w.placement, Pinning::Scheduled, "{w:?}");
+    }
     let pinnable = cfg!(any(target_os = "linux", windows));
     if pinnable && pairs.first().is_some_and(|(a, b)| a != b) && w.placement == Pinning::Pinned {
       // A hard pin to two distinct cores leaves the waiter no way onto the waker's CPU: no wake the
@@ -832,7 +846,7 @@ mod tests {
     let facts = Facts::query();
     let before = std::thread::available_parallelism().map_or(1, |n| n.get());
     assert_eq!(
-      wake(Duration::ZERO, &facts.cores),
+      wake(Duration::ZERO, &placement_of(&facts)),
       Err(MachineError::MeasurementTimeout { probe: "wake" })
     );
     let after = std::thread::available_parallelism().map_or(1, |n| n.get());

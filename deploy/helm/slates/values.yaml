@@ -56,8 +56,12 @@ resources:
   # daemon's effective capacity (§4.2) clamps to exactly this cgroup bound — a RAM-only service must not
   # be evicted or reclaimed under it. The daemon fits its arenas to the bound at boot.
   memory: 1Gi
-  # Shape: the CPUs each node is given, requests equal to limits likewise; the daemon derives its shard
-  # count (one thread per core) from the cgroup quota.
+  # Shape: the CPUs each node is given, requests equal to limits likewise. The daemon runs as many shards
+  # as the cgroup quota buys (one thread per core, one kept for control). It fixes them to cores only when
+  # the quota covers the pod's cpuset — Kubernetes' static CPU manager gives a Guaranteed pod with integer
+  # CPUs exclusive cores — and otherwise leaves them to the kernel: under the default CPU manager the pod
+  # shares the node's cores in time, and fixed cores would stack every pod's shards on the same CPUs
+  # (§4.3 "Placement"; docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md).
   cpu: 2
 
 # The nodes a fleet runs on must not swap: a swapped page of a RAM-only service is a disk write the

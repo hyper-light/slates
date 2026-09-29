@@ -243,7 +243,7 @@ fn main() {
   // those than the machine has cores past the shards measures the scheduler oversubscribing,
   // not the provisioning path, so its row is informational and its p99 is not gated (AC-2.1
   // is measured on the reference machine, whose cores hold the concurrency).
-  let cores = profile.facts.cores.len();
+  let cores = profile.facts.cpus_at_once();
   let runnable = cores.saturating_sub(usize::from(shards)).max(1);
   let mut failed = false;
   for clients in CLIENT_COUNTS {

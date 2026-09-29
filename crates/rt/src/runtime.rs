@@ -3,8 +3,11 @@
 //! ring wiring both share with the simulation (§4.3).
 
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
+use slates_machine::placement::Placement;
+use slates_machine::probes::Pinning;
 use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::SpscRing;
 
@@ -107,7 +110,8 @@ impl RuntimeConfig {
       step_budget_ns: d.task_step_budget_ns.get(),
       timer_tick_ns: d.timer_tick_ns.get(),
       batch: ring_entries,
-      pin: true,
+      // Fixed only to cores the process owns ([`shard_cores`]); none means the OS places the shards.
+      pin: !cores.is_empty(),
       cores,
       page_bytes: usize::try_from(profile.facts.page.base).unwrap_or(1),
       spin_ns: d.spin_before_park_ns.get(),
@@ -151,36 +155,34 @@ impl RuntimeConfig {
   }
 }
 
-/// The shard count and the cores they pin to: every core of the fastest class the OS reports,
-/// less one kept for the control shard and the OS (§4.3 "Shards = performance cores"; the design's
-/// worked example: 6 Super cores give 5 shards); at least one shard.
+/// The shard count and the cores they are fixed to, by the machine's placement rule
+/// ([`slates_machine::placement`], §4.3 "Shards = performance cores"): every core of the fastest class the
+/// process may run on that its CPU budget runs at once, less one kept for control and the OS, at least one
+/// (the design's worked example: six Super cores give five shards) — fixed to those cores only when the
+/// process owns them, and left to the OS (no cores) when it shares them in time under a CPU quota below its
+/// cpuset (docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md).
 pub fn shard_cores(profile: &MachineProfile) -> (Derived<u16>, Vec<u32>) {
-  let best_level = profile
-    .facts
-    .cores
-    .iter()
-    .map(|c| c.level)
-    .min()
-    .unwrap_or(0);
-  let mut cores: Vec<u32> = profile
-    .facts
-    .cores
-    .iter()
-    .filter(|c| c.level == best_level)
-    .map(|c| c.id)
-    .collect();
-  if cores.len() > 1 {
-    cores.remove(0);
+  let placement = Placement::of(&profile.facts.cores, profile.facts.cpu_budget);
+  let cores = placement
+    .fixed
+    .map(|fixed| fixed.shards)
+    .unwrap_or_default();
+  (placement.shards, cores)
+}
+
+/// Logs, once per process, a shard whose fixed core the OS refused where the OS pins (Linux, Windows): the
+/// placement names only cores the process may run on, so a refusal means its mask changed after the facts
+/// were read — a fault to show, not to swallow; the shard then runs where the scheduler places it and its
+/// counters say so ([`Counters::pin_refused`]). macOS takes affinity as a hint that Apple silicon refuses by
+/// design, so there a refusal is counted, not logged.
+fn log_pin_refused(shard: u16, core: u32) {
+  static LOGGED: AtomicBool = AtomicBool::new(false);
+  if cfg!(any(target_os = "linux", windows)) && !LOGGED.swap(true, Ordering::AcqRel) {
+    eprintln!(
+      "slates-rt: shard {shard} could not be fixed to CPU {core} (the OS refused); it runs where the \
+       scheduler places it (first occurrence; each shard counts its own)"
+    );
   }
-  let count = u16::try_from(cores.len()).unwrap_or(u16::MAX).max(1);
-  (
-    derived!(
-      count,
-      "cores of the fastest class minus one for control, at least one",
-      ["cores.class", "cores.level"]
-    ),
-    cores,
-  )
 }
 
 /// Measures the cost of one loop item on a simulated shard: spawn a trivial task, run it to
@@ -312,12 +314,16 @@ impl Runtime {
       let thread = std::thread::Builder::new()
         .name(format!("slates-shard-{}", seed.id))
         .spawn(move || {
-          if let Some(core) = core {
-            let _ = slates_machine::probes::pin_current_thread(core);
-          }
+          // Fixed before the context is built, so the arena and rings are first touched on the shard's own
+          // core (and NUMA node).
+          let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
           let Ok(ctx) = ShardContext::build(seed) else {
             return Counters::default();
           };
+          if let Some((core, Pinning::Refused)) = pinned {
+            ctx.note_pin_refused();
+            log_pin_refused(ctx.id, core);
+          }
           let id = ctx.id;
           ctx.run();
           let counters = ctx.counters();

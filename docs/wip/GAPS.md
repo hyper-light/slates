@@ -1948,34 +1948,32 @@ never elect again, the documented lost-quorum case. The lane now waits for the s
 seating time measured, and whether serving at `f = 2` before the council can tolerate `f` losses should be
 visible to clients.
 
-**Found, open — the daemons on the lane's pods are killed by their anchors every minute or two.**
-- **The measurement is contaminated.** The burst numbers above ran on such a fleet.
-- **At rest.** An idle five-replica fleet under the `wan` profile, with no cut and 180 s idle, logged 31–181
-  heartbeat lapses and 1–3 daemon restarts per pod.
-- **Not a regression.** An image from before the day's changes did the same (0–95 lapses, 0–4 restarts
-  per pod).
-- **Not the runtime at rest.** A lone idle node of the same image, in plain Docker with the same epoll
-  driver, logged none in 171 s.
-- **The near misses.** The daemon now logs any heartbeat late by half the 1 s budget or more, with the
-  shard's pulse. None was one long step (the longest 0–126 ms), and they were of two kinds:
-  - three woke 623–893 ms past their timer (late wakeups: the shard thread not run);
-  - two waited 561–731 ms with no timer overrun and no long step, a ready timer task left unpolled while
-    other short tasks ran.
-- **Suspects, unproven.** Whether the late wakeups are the VM's CPU contention (other sessions' clusters and
-  model checks share its 18 CPUs) or a park computed past the due timer; whether the unpolled timer task is
-  a fairness gap in the shard's step. `Shard::step` expires timers once per step and polls one batch, so the
-  gap is not in that order.
-- **This explains the revived seeds.** A restarted daemon builds a fresh fleet node, which seeds every
-  manifest peer alive without a fold. It re-learns, and folds dead, only the peers that reach it, and a cut
-  pod never does.
+**Found and fixed (A-41) — the daemons on the lane's pods were killed by their anchors every minute or two.**
+- **The cause.** The machine facts listed a Linux process's cores as `0..available_parallelism()`, which a
+  CPU quota lowers. Under the chart's two-CPU quota every daemon fixed its one shard to CPU 1. The kind
+  node containers showed all eight slates shard threads in the VM (five here, three in a second cluster) at
+  `Cpus_allowed_list: 1`, the VM 90 % idle, the containers' `cpu.pressure` at 78–81 % and `nr_throttled` at
+  0.
+- **The phase.** The late beats were phase-locked to the readiness probe's `slates status`, every 5 s, in
+  phase on all pods from the parallel start. The probe's client work was what a starved shard could not
+  absorb.
+- **The fix.** The core list is the affinity mask, the cgroup CPU budget is a fact, and shards are fixed to
+  cores only when the budget covers the cpuset (§4.3 "Placement").
+- **Measured.** The same idle fleet over 180 s: 0 lapse lines, 0 restarts and 0 late beats (319, 15 and 9
+  before); every shard allowed on all 18 CPUs; `cpu.pressure` 0.00 %.
+- **Record.** `docs/bugs/2026-09-29-every-daemon-under-a-cpu-quota-pinned-its-shard-to-cpu-1.md`.
 - **Owed:**
-  - a reproduction at the scale of one pod;
-  - the shard's park deadline logged against its due timer;
-  - the anchor's budget made the operator's input it is documented to become;
-  - the lane asserting `restarts: 0`.
+  - the burst measurement above, again, on a fleet that does not restart;
+  - the lane asserting `restarts: 0`;
+  - the anchor's budget made the operator's input it is documented to become.
+- **Found by the same measurement, open.** An idle shard spins before every park for good once any client
+  has connected: `activate` sets the flag at a handoff and nothing clears it. The fixed fleet's idle shards
+  used 28–62 s of CPU in 190 s, 15–32 % of a core each.
 
-**Open — retired peers' seed ids held alive.** After the council retired both cut voters, every survivor's
-detector listed five alive members, 300 s on and with no pod restarted: itself, the other two survivors, and
+**Open, explained — retired peers' seed ids held alive.** Explained by the restarts above (a restarted
+daemon's fresh fleet node seeds every manifest peer alive and re-learns only the peers that reach it); owed:
+the burst re-run on the fixed fleet showing the seeds settle. After the council retired both cut voters, every survivor's
+detector listed five alive members, 300 s on and with no pod restarted (the daemons inside them were): itself, the other two survivors, and
 the two cut pods' *manifest seed* ids (`member_id(anchor, 0)`). The seeds had been folded dead when each
 pod's fresh id was learned at formation, so something revived them after the retirement. Status reports them
 as members held alive, and a detector-view check never settled. Reading the probe task's idle path and the

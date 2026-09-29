@@ -49,13 +49,17 @@ pub struct CorePairRtt {
   pub rtt: Measurement,
 }
 
-/// How threads were placed for the core matrix.
+/// How a probe's threads were placed (the core matrix's, the wake probe's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Pinning {
   /// The OS pinned each thread to its core.
   Pinned,
   /// The OS took the placement as a hint only (macOS).
   Hint,
+  /// Nothing was pinned by design: production does not fix its threads here (the process shares its
+  /// cores in time, [`crate::placement::Placement`]), so the OS placed the probe's threads as it places the
+  /// shards — the placement production runs under, not a refusal.
+  Scheduled,
   /// Pinning was refused; threads ran wherever the scheduler put them.
   Refused,
 }
@@ -203,6 +207,7 @@ pub(crate) fn weaker(x: Pinning, y: Pinning) -> Pinning {
   match (x, y) {
     (Pinning::Refused, _) | (_, Pinning::Refused) => Pinning::Refused,
     (Pinning::Hint, _) | (_, Pinning::Hint) => Pinning::Hint,
+    (Pinning::Scheduled, _) | (_, Pinning::Scheduled) => Pinning::Scheduled,
     _ => Pinning::Pinned,
   }
 }
@@ -275,18 +280,25 @@ fn ring_round_trip(a: u32, b: u32, budget: Duration) -> (Measurement, Pinning) {
   )
 }
 
-fn pinning_code(p: Pinning) -> u32 {
+/// A placement as the word a probe thread publishes it in (the core matrix's partner, the wake probe's
+/// waiter).
+pub(crate) fn pinning_code(p: Pinning) -> u32 {
   match p {
     Pinning::Pinned => 0,
     Pinning::Hint => 1,
     Pinning::Refused => 2,
+    // Format: the next word after the three a published placement had before `Scheduled`.
+    Pinning::Scheduled => 3,
   }
 }
 
-fn pinning_from_code(c: u32) -> Pinning {
+/// The placement a published word names; an unknown word is a refusal (nothing vouches for it).
+pub(crate) fn pinning_from_code(c: u32) -> Pinning {
   match c {
     0 => Pinning::Pinned,
     1 => Pinning::Hint,
+    // Format: `Scheduled`'s word ([`pinning_code`]).
+    3 => Pinning::Scheduled,
     _ => Pinning::Refused,
   }
 }
@@ -793,8 +805,8 @@ mod platform {
     VirtualUnlock,
   };
   use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask,
-    GetProcessWorkingSetSize, SetEvent, SetThreadAffinityMask,
+    CreateEventW, GetCurrentProcess, GetCurrentThread, GetProcessWorkingSetSize, SetEvent,
+    SetThreadAffinityMask,
   };
 
   fn event() -> HANDLE {
@@ -880,12 +892,7 @@ mod platform {
   pub(super) struct Affinity(usize);
 
   pub(super) fn current_affinity() -> Option<Affinity> {
-    let mut process: usize = 0;
-    let mut system: usize = 0;
-    // SAFETY: the current process pseudo-handle and two writable usize outputs.
-    let ok =
-      unsafe { GetProcessAffinityMask(GetCurrentProcess(), &raw mut process, &raw mut system) };
-    (ok != 0 && process != 0).then_some(Affinity(process))
+    crate::facts::process_affinity_mask().map(Affinity)
   }
 
   pub(super) fn restore_affinity(affinity: &Affinity) -> bool {
