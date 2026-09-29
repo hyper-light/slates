@@ -233,10 +233,26 @@ impl FleetNode {
   /// the leader's committed configuration comes back to it. At `f = 0` the sole-voter council is its own
   /// leader, so the view still drives the configuration through the same path (R8). It never removes this
   /// host — the owner is never retired.
+  ///
+  /// A member becoming alive — a join, a refutation of a suspicion or a death, a rejoin — is logged with the
+  /// call site that folded it (`#[track_caller]` through the folds below): a handful per node's life, and the
+  /// evidence a revival the design does not expect is traced by (GAPS 2026-09-29: retired peers' manifest seed
+  /// ids held alive).
+  #[track_caller]
   pub fn observe(&mut self, subject: HostId, update: MemberState) -> bool {
+    let prior = self.membership.state(subject);
     let changed = self.membership.apply(subject, update).is_some();
     if changed && let Some(state) = self.membership.state(subject) {
       self.gossip.record(subject, state);
+      if prior.is_none_or(|prior| prior.liveness != Liveness::Alive)
+        && state.liveness == Liveness::Alive
+      {
+        eprintln!(
+          "slates-cluster: fleet: {:?} holds {subject:?} alive: {prior:?} -> {state:?}, folded at {}",
+          self.host,
+          std::panic::Location::caller()
+        );
+      }
     }
     changed
   }
@@ -285,6 +301,7 @@ impl FleetNode {
 /// changed. The configuration is the council's (D-14), so this only advances the failure view the council
 /// leader reconciles from — a death's takeovers come from [`install_configuration`](FleetNode::install_configuration)
 /// once the council commits the retirement. Idempotent: a view already matching is a no-op.
+#[track_caller]
 pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> bool {
   let mut changed = false;
   // Deaths: a host this node believes alive that the view now confirms dead.
@@ -312,6 +329,7 @@ pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> bool {
 /// ordering prevents stale alive reports from reversing a death. Returns
 /// whether the membership changed (the takeovers a death produces come from
 /// [`install_configuration`](FleetNode::install_configuration) once the council commits the retirement).
+#[track_caller]
 pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> bool {
   apply_peer_state(fleet, peer, view.state(peer))
 }
@@ -324,6 +342,7 @@ pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> bool
 /// (a suspect is still a member until a confirmed death). Returns whether the membership changed — the
 /// takeovers a death produces come from [`install_configuration`](FleetNode::install_configuration) once the
 /// council commits the retirement.
+#[track_caller]
 pub fn apply_peer_state(fleet: &mut FleetNode, peer: HostId, state: Option<MemberState>) -> bool {
   if peer == fleet.host() {
     return false;

@@ -1948,6 +1948,32 @@ never elect again, the documented lost-quorum case. The lane now waits for the s
 seating time measured, and whether serving at `f = 2` before the council can tolerate `f` losses should be
 visible to clients.
 
+**Found, open — the daemons on the lane's pods are killed by their anchors every minute or two.**
+- **The measurement is contaminated.** The burst numbers above ran on such a fleet.
+- **At rest.** An idle five-replica fleet under the `wan` profile, with no cut and 180 s idle, logged 31–181
+  heartbeat lapses and 1–3 daemon restarts per pod.
+- **Not a regression.** An image from before the day's changes did the same (0–95 lapses, 0–4 restarts
+  per pod).
+- **Not the runtime at rest.** A lone idle node of the same image, in plain Docker with the same epoll
+  driver, logged none in 171 s.
+- **The near misses.** The daemon now logs any heartbeat late by half the 1 s budget or more, with the
+  shard's pulse. None was one long step (the longest 0–126 ms), and they were of two kinds:
+  - three woke 623–893 ms past their timer (late wakeups: the shard thread not run);
+  - two waited 561–731 ms with no timer overrun and no long step, a ready timer task left unpolled while
+    other short tasks ran.
+- **Suspects, unproven.** Whether the late wakeups are the VM's CPU contention (other sessions' clusters and
+  model checks share its 18 CPUs) or a park computed past the due timer; whether the unpolled timer task is
+  a fairness gap in the shard's step. `Shard::step` expires timers once per step and polls one batch, so the
+  gap is not in that order.
+- **This explains the revived seeds.** A restarted daemon builds a fresh fleet node, which seeds every
+  manifest peer alive without a fold. It re-learns, and folds dead, only the peers that reach it, and a cut
+  pod never does.
+- **Owed:**
+  - a reproduction at the scale of one pod;
+  - the shard's park deadline logged against its due timer;
+  - the anchor's budget made the operator's input it is documented to become;
+  - the lane asserting `restarts: 0`.
+
 **Open — retired peers' seed ids held alive.** After the council retired both cut voters, every survivor's
 detector listed five alive members, 300 s on and with no pod restarted: itself, the other two survivors, and
 the two cut pods' *manifest seed* ids (`member_id(anchor, 0)`). The seeds had been folded dead when each
@@ -2848,7 +2874,7 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
-The [dated audit](../audit/2026-09-29_audit.md) records 32 open findings against
+The [dated audit](../audit/2026-09-29_audit.md) records 40 open findings against
 ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently changing working tree.
 It is a review, not an implementation change or acceptance closure. It preserves the
 existing gap classifications and historical measurements rather than treating them as
@@ -2863,6 +2889,19 @@ current-tree passes.
 | AUD-29-19–24 | SDK admission and completion must remain async, bounded and terminal under cancellation/channel loss; request ids must never wrap into old completions; MCP input and HTTP caller authority must be bounded and verified (§4.7, §4.9, §4.12–§4.13). |
 | AUD-29-25–30 | Landing and bulk work must not starve owner/control progress; Raft term exhaustion must refuse; packet numbers must not repeat; configuration fan-out and consensus retention need admitted, measured costs (§4.3, §4.8–§4.10a, §4.15). |
 | AUD-29-31–32 | Structural enforcement must substantiate its stated syscall-boundary claim; capabilities, ratchets, cadence and platform evidence must describe what is actually enforced (R1–R5, R8/R9, Part 6). |
+| AUD-29-33–36 | Every admitted queue geometry must preserve unread work; stream final sizes and aggregate receive/reset credit must be checked before buffering or consumption, without panic or exceeding admitted session memory (§4.2–§4.3, §4.9–§4.10a). |
+| AUD-29-37–38 | Raft report recovery must preserve chosen values with bounded admitted gap work; every accepted live transition must produce restorable state, with semantic and authenticated-sender validation (§4.8–§4.9). |
+| AUD-29-39–40 | Exhausted timers must refuse rather than report elapsed time; refused namespace mutations must return reservations and leave names, links, journal and all resource charges unchanged (§4.2–§4.3, §4.5). |
+
+The second pass uses baseline 16c847b4a9191e6601bfe93ad026d1a2f2165560 plus
+concurrent CLI/IPC/MCP/server/KIND edits. Compiled-library probes reproduced all
+eight new findings. Bounded tests passed 230 cluster, 18 VFS and 93 merge cases;
+one cluster and one VFS case were ignored. Transport passed 140 cases and failed
+two loopback fixtures at bind (OS error 1). Database model fixtures were blocked
+by shm_open (OS error 1); the selected publication executable did not run. These
+environment refusals are not claimed as either implementation regressions or
+recovery passes. The first pass was incorrectly called complete; no acceptance
+closure follows from either pass.
 
 Bounded source-inclusion probes on Darwin arm64, rustc 1.98.0 (2026-09-29), reproduced
 invalid buddy free/accounting, stale slab-handle revival, oversized allocation panic,
