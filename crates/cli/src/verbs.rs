@@ -1408,16 +1408,30 @@ fn telemetry_text(batch: &TelemetryReport) -> String {
 }
 
 /// A consensus group's lines of the status (§4.8): `fleet_<group>_leads`, the derived election timing in
-/// coordinator periods, the measured tail and spread it came from, and the samples behind it.
+/// coordinator periods, the measured tail and spread it came from, the samples behind it, and the node's
+/// election state — term, priority, rank, lease and the campaigns it began.
 fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
   format!(
-    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\n",
+    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\nfleet_{group}_term: {}\nfleet_{group}_priority_ns: {}\nfleet_{group}_priority_spread_ns: {}\nfleet_{group}_rank: {}\nfleet_{group}_leader_lease: {}\nfleet_{group}_pre_elections: {}\nfleet_{group}_elections: {}\nfleet_{group}_pre_votes_granted: {}\nfleet_{group}_pre_votes_refused: {}\nfleet_{group}_refused_role: {}\nfleet_{group}_refused_leased: {}\nfleet_{group}_refused_term: {}\nfleet_{group}_refused_log: {}\n",
     report.leads,
     report.base_periods,
     report.span_periods,
     report.rtt_tail_ns,
     report.rtt_spread_ns,
-    report.samples
+    report.samples,
+    report.term,
+    report.priority_ns,
+    report.priority_spread_ns,
+    report.rank,
+    report.leader_lease,
+    report.pre_elections,
+    report.elections,
+    report.pre_votes_granted,
+    report.pre_votes_refused,
+    report.refused_role,
+    report.refused_leased,
+    report.refused_term,
+    report.refused_log
   )
 }
 

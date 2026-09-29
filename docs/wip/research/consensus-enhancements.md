@@ -767,4 +767,28 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
       6,472 ms), which the bug had serialized. Three mitigations were measured and rejected (the bug record).
     - The daemon's fleet suite passes 53 of 53.
   - **Next.** The KIND lane's measurement of the groups under a burst.
+- **Slice 15 (2026-09-29): the priority election on real pods, and a round budget that cut off the far
+  voter.**
+  - **The measurement** (`cargo xtask kind succession`; `docs/wip/kind-lane.md`, Piece 6). Three pods on
+    KIND, pod 0's egress 80 ms and pod 1's 20 ms. A central leader's egress is cut, and the survivors are timed
+    to a successor. It is slice 14's three-region case on real daemons, real sockets and `tc netem`.
+  - **Every node's status now reports its election state** — term, priority, rank, lease, the campaigns it
+    began, and the pre-vote replies it drew and refused by reason. With those, the first runs were read
+    rather than guessed at.
+  - **Found and fixed: a round with nothing gathered stopped at its lookahead.** The collection loop took the
+    extender's "no extension" at three quarters of the deadline for "stop now". A candidate whose one live
+    voter answered in the last quarter never collected it: on KIND, 7 and 14 empty pre-elections, and 13.4
+    and 25.4 s to a successor. The loop now gives such a round its whole deadline, unextended, as the
+    budget's contract says; a round that gathered and stalled stops as before
+    (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
+  - **Measured** (six fresh fleets each):
+    - with the lease and round fixes, the central survivor succeeds 6 of 6 (1.57–4.96 s, median 3.08 s);
+    - without the lease fix, the outranked pod succeeds 6 of 6 (median 6.47 s), after refusing the central
+      candidate's pre-votes as leased.
+    The simulation of the same profile had predicted both successors, 200 of 200 each way, and CI now gates
+    its prediction.
+  - **Open.** A symmetric partition never heals: neither side probes a peer it believes dead, so a healed
+    node stays out until it restarts. And a late pre-vote reply is dropped: 4 in 10 of the successors'
+    pre-elections cost a timeout for a reply just past the deadline. Both are in GAPS.
+  - **Next.** The partition heal, then the late pre-vote reply.
 

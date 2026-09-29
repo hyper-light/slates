@@ -1203,8 +1203,8 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
   })
 }
 
-/// A consensus group's block of the fleet status as JSON (§4.8): whether this node leads it and the
-/// election timing it derived — the same fields the text form's `fleet_<group>_*` lines print.
+/// A consensus group's block of the fleet status as JSON (§4.8): whether this node leads it, the election
+/// timing it derived, and its election state — the same fields the text form's `fleet_<group>_*` lines print.
 fn group_json(g: &GroupReport) -> Value {
   json!({
     "leads": g.leads,
@@ -1213,6 +1213,19 @@ fn group_json(g: &GroupReport) -> Value {
     "rtt_tail_ns": g.rtt_tail_ns,
     "rtt_spread_ns": g.rtt_spread_ns,
     "samples": g.samples,
+    "term": g.term,
+    "priority_ns": g.priority_ns,
+    "priority_spread_ns": g.priority_spread_ns,
+    "rank": g.rank,
+    "leader_lease": g.leader_lease,
+    "pre_elections": g.pre_elections,
+    "elections": g.elections,
+    "pre_votes_granted": g.pre_votes_granted,
+    "pre_votes_refused": g.pre_votes_refused,
+    "refused_role": g.refused_role,
+    "refused_leased": g.refused_leased,
+    "refused_term": g.refused_term,
+    "refused_log": g.refused_log,
   })
 }
 

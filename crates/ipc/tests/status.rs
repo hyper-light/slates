@@ -16,6 +16,19 @@ fn report() -> ReplyBody {
     rtt_tail_ns: 0,
     rtt_spread_ns: 0,
     samples: 0,
+    term: 41,
+    priority_ns: 43,
+    priority_spread_ns: 47,
+    rank: 2,
+    leader_lease: false,
+    pre_elections: 53,
+    elections: 59,
+    pre_votes_granted: 61,
+    pre_votes_refused: 67,
+    refused_role: 71,
+    refused_leased: 73,
+    refused_term: 79,
+    refused_log: 83,
   };
   ReplyBody::DaemonStatus {
     report: Box::new(DaemonReport {

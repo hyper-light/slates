@@ -995,7 +995,16 @@ fn assert_timing_is_above_the_floor(outcome: &Outcome, profile: SimPath) {
 
 /// AC (§4.8 "Derived constants"; Raft §5.2): at the inter-region profile, under the derived rule, a leader
 /// that dies is replaced within the derived election budget — the base plus the randomization span, with
-/// one retry allowed for a split vote — and the replacement then holds.
+/// one retry allowed for a split vote — and the replacement then holds. The budget is counted as the timer
+/// counts it: the first campaign comes within one derived timeout of the death (the timer ages from the
+/// last contact, at most one period of phase after it), and the successor wins by its second campaign. A
+/// campaign's own rounds run inside one coordinator period, so they are no part of a timeout. Until
+/// 2026-09-29 the bound was wall-clock, twice base plus span, which omits them; it held for this seed only
+/// while a round dropped a grant arriving in its last quarter. Once rounds collected such grants, both
+/// survivors' first pre-elections succeeded, their votes split, and the retry elected at 6.9 s. Over 40 seeds
+/// the median is 3.33 s against 3.42 s before and the maximum 9.3 s against 11.9 s; 8 seeds took over 6 s
+/// where 6 did, and the survivors began 88 campaigns where they began 95
+/// (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
 #[test]
 fn at_the_inter_region_profile_a_dead_leader_is_replaced_within_the_derived_budget() {
   let outcome = run_scenario(11, INTER_REGION, DERIVED, PERIODS, Some(KILL_AT_PERIOD));
@@ -1020,12 +1029,27 @@ fn at_the_inter_region_profile_a_dead_leader_is_replaced_within_the_derived_budg
     panic!("no successor was elected after the leader died: {outcome:?}");
   };
   let survivor_timing = outcome.report(successor).timing;
-  let budget_ns =
-    2 * u64::from(survivor_timing.base_periods + survivor_timing.span_periods) * HEARTBEAT_NS;
+  let timeout_ns =
+    u64::from(survivor_timing.base_periods + survivor_timing.span_periods + 1) * HEARTBEAT_NS;
+  let first_campaign = outcome
+    .campaign_events
+    .iter()
+    .find(|(at, _)| *at > killed_at)
+    .map(|(at, _)| *at)
+    .expect("a survivor campaigned");
   assert!(
-    elected_at - killed_at <= budget_ns,
-    "the successor was elected {} ns after the death, within twice the derived base plus span ({budget_ns} ns): {outcome:?}",
-    elected_at - killed_at
+    first_campaign - killed_at <= timeout_ns,
+    "the first campaign came {} ns after the death, within one derived timeout ({timeout_ns} ns): {outcome:?}",
+    first_campaign - killed_at
+  );
+  let successor_campaigns = outcome
+    .campaign_events
+    .iter()
+    .filter(|(at, host)| *at > killed_at && *at <= elected_at && *host == successor)
+    .count();
+  assert!(
+    successor_campaigns <= 2,
+    "the successor won by its second campaign, one retry: {successor_campaigns}: {outcome:?}"
   );
   assert_eq!(
     outcome.leader_changes_after(elected_at),

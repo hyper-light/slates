@@ -398,6 +398,68 @@ impl ElectionPriority {
   }
 }
 
+/// Why a node refused a pre-vote: thesis §9.6's conditions, in the order [`RaftNode::on_pre_vote`] checks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreVoteRefusal {
+  /// It is not a voter, or it leads.
+  Role,
+  /// It holds a leader's lease: it has heard from one within the minimum election timeout.
+  Leased,
+  /// The pre-vote's term is not ahead of its own.
+  Term,
+  /// The candidate's log is behind its own.
+  Log,
+}
+
+/// The pre-vote outcomes a node has seen since it started (volatile; `status`): as a candidate, the replies to
+/// its own pre-elections, granted and refused; as a voter, the pre-votes it refused, by reason.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreVoteTally {
+  /// Replies to its own current pre-election that granted.
+  pub granted: u64,
+  /// Replies to its own current pre-election that refused.
+  pub refused: u64,
+  /// Pre-votes it refused as a non-voter or the leader.
+  pub refused_role: u64,
+  /// Pre-votes it refused while it held a leader's lease.
+  pub refused_leased: u64,
+  /// Pre-votes it refused whose term was not ahead of its own.
+  pub refused_term: u64,
+  /// Pre-votes it refused from a candidate whose log is behind its own.
+  pub refused_log: u64,
+}
+
+impl PreVoteTally {
+  fn count(&mut self, refusal: PreVoteRefusal) {
+    let counter = match refusal {
+      PreVoteRefusal::Role => &mut self.refused_role,
+      PreVoteRefusal::Leased => &mut self.refused_leased,
+      PreVoteRefusal::Term => &mut self.refused_term,
+      PreVoteRefusal::Log => &mut self.refused_log,
+    };
+    *counter = counter.saturating_add(1);
+  }
+}
+
+/// A node's election state as an observer reads it (`status`; §3.4 and thesis §4.2.3): its term, its own
+/// priority, whether it holds a leader's lease, the campaigns it has begun since it started, and what became
+/// of the pre-votes it asked for and answered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ElectionView {
+  /// The node's current term.
+  pub term: u64,
+  /// Its own election priority, as its caller last measured it.
+  pub priority: ElectionPriority,
+  /// Whether it believes a leader alive, and so refuses pre-votes: its lost leader's lease has not lapsed.
+  pub leader_lease: bool,
+  /// The pre-elections (pre-vote rounds) it has begun.
+  pub pre_elections: u64,
+  /// The elections (a term of its own asked for) it has begun, after a pre-election or on an invitation.
+  pub elections: u64,
+  /// The pre-vote outcomes it has seen.
+  pub pre_votes: PreVoteTally,
+}
+
 /// A slot in a node's **window** above its log (`docs/wip/research/consensus-enhancements.md` §4): the
 /// leader's entry that arrived ahead of a hole in the log, or a fast vote for a proposer's entry. A node
 /// accepts either only once it is synced to its term's leader, keeps it until it syncs to a newer term's
@@ -712,6 +774,11 @@ pub struct RaftNode {
   priority_transfer_failed: bool,
   /// ElectionPriority transfers started (the non-vacuity counter).
   priority_transfers: u64,
+  /// Pre-elections and elections this node has begun, and the pre-vote outcomes it has seen (volatile; for
+  /// [`election_view`](Self::election_view)).
+  pre_elections: u64,
+  elections: u64,
+  pre_vote_tally: PreVoteTally,
   /// The window above the log (`docs/wip/research/consensus-enhancements.md` §4): the leader's entries that
   /// arrived out of order and fast votes, by index. Retained; bounded by [`window_budget`](Self::window_budget)
   /// bytes.
@@ -819,6 +886,9 @@ impl RaftNode {
       priority_transfer_pending: false,
       priority_transfer_failed: false,
       priority_transfers: 0,
+      pre_elections: 0,
+      elections: 0,
+      pre_vote_tally: PreVoteTally::default(),
       window: BTreeMap::new(),
       synced_term: 0,
       window_budget: 0,
@@ -960,6 +1030,7 @@ impl RaftNode {
     self.has_leader = false;
     self.leader_hint = None;
     self.role = Role::PreCandidate;
+    self.pre_elections = self.pre_elections.saturating_add(1);
     self.pre_votes = BTreeSet::from([self.id]);
     if self.is_majority(&self.pre_votes) {
       self.start_election();
@@ -997,16 +1068,30 @@ impl RaftNode {
   /// [`forget_leader`](Self::forget_leader), or it has campaigned since), it is not itself the leader, the
   /// pre-vote's term is ahead of its own, and the candidate's log is at least as up-to-date.
   /// Because the term is never touched, a partitioned node's inflated term cannot force a step-down here.
-  pub fn on_pre_vote(&self, request: PreVote) -> PreVoteReply {
-    let granted = self.is_voter(self.id)
-      && !self.has_leader
-      && self.role != Role::Leader
-      && request.term > self.current_term
-      && self.candidate_log_is_current(request.last_log_index, request.last_log_term);
+  pub fn on_pre_vote(&mut self, request: PreVote) -> PreVoteReply {
+    let refusal = self.pre_vote_refusal(&request);
+    if let Some(refusal) = refusal {
+      self.pre_vote_tally.count(refusal);
+    }
     PreVoteReply {
       voter: self.id,
       term: request.term,
-      granted,
+      granted: refusal.is_none(),
+    }
+  }
+
+  /// Why this node would refuse `request`, or `None` to grant it (thesis §9.6; [`on_pre_vote`](Self::on_pre_vote)).
+  fn pre_vote_refusal(&self, request: &PreVote) -> Option<PreVoteRefusal> {
+    if !self.is_voter(self.id) || self.role == Role::Leader {
+      Some(PreVoteRefusal::Role)
+    } else if self.has_leader {
+      Some(PreVoteRefusal::Leased)
+    } else if request.term <= self.current_term {
+      Some(PreVoteRefusal::Term)
+    } else if !self.candidate_log_is_current(request.last_log_index, request.last_log_term) {
+      Some(PreVoteRefusal::Log)
+    } else {
+      None
     }
   }
 
@@ -1015,10 +1100,16 @@ impl RaftNode {
   /// its term now, having confirmed it can win) and returns the [`RequestVote`] to send. Otherwise
   /// `None`.
   pub fn on_pre_vote_reply(&mut self, reply: PreVoteReply) -> Option<Vec<RequestVote>> {
-    if self.role != Role::PreCandidate
-      || reply.term != self.current_term.saturating_add(1)
-      || !reply.granted
-    {
+    if self.role != Role::PreCandidate || reply.term != self.current_term.saturating_add(1) {
+      return None;
+    }
+    let tally = if reply.granted {
+      &mut self.pre_vote_tally.granted
+    } else {
+      &mut self.pre_vote_tally.refused
+    };
+    *tally = tally.saturating_add(1);
+    if !reply.granted {
       return None;
     }
     self.pre_votes.insert(reply.voter);
@@ -1038,6 +1129,7 @@ impl RaftNode {
     }
     self.retention_pending = true;
     self.current_term = self.current_term.saturating_add(1);
+    self.elections = self.elections.saturating_add(1);
     self.read_round = None;
     self.role = Role::Candidate;
     self.voted_for = Some(self.id);
@@ -2625,6 +2717,18 @@ impl RaftNode {
     self.priority_transfers
   }
 
+  /// This node's election state, for an observer ([`ElectionView`]).
+  pub fn election_view(&self) -> ElectionView {
+    ElectionView {
+      term: self.current_term,
+      priority: self.own_priority,
+      leader_lease: self.has_leader,
+      pre_elections: self.pre_elections,
+      elections: self.elections,
+      pre_votes: self.pre_vote_tally,
+    }
+  }
+
   /// One CheckQuorum tick of the transfer in flight: past [`TRANSFER_QUORUM_CHECKS`] ticks it is aborted
   /// (counted) and the leader accepts proposals again (thesis §3.10).
   fn age_transfer(&mut self) {
@@ -3557,7 +3661,7 @@ mod tests {
   #[test]
   fn a_behind_candidate_is_refused_a_pre_vote() {
     // A leaderless peer at term 5.
-    let node = node_with_uncommitted_log(A, vec![A, B, C], 5, None, Vec::new());
+    let mut node = node_with_uncommitted_log(A, vec![A, B, C], 5, None, Vec::new());
     let reply = node.on_pre_vote(PreVote {
       term: 3,
       candidate: B,

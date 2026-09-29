@@ -184,3 +184,10 @@ held its dead leader's lease until its own campaign at 17.61 s. With the lease l
 timeout (thesis §4.2.3), node 1's first campaign wins, at 3.05 s. The GEO-class row is unchanged by it (its
 first leader at 23.1 s on both trees; the 21.3 s above is 2026-09-14's).
 (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`.)
+
+The same day a consensus round with nothing gathered stopped giving up at three quarters of its deadline
+(`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`). Both survivors' first
+pre-elections then collected each other's late grants and split the vote, so this seed now elects at 6.9 s,
+on the retry. Over seeds 0–39 the median is 3.33 s against 3.42 s before, and the maximum 9.3 s against
+11.9 s. The test asserts the budget as the timer counts it: the first campaign within one derived timeout,
+and one retry.

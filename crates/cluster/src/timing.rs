@@ -410,10 +410,11 @@ pub struct RoundAnchors {
 }
 
 /// The consensus round's collection budget for one period (§4.8 "late work"), derived from the same
-/// measured tail as the election timing: the **base deadline** is `max(heartbeat, tail)` — a round is
-/// given the slowest voter's round-trip tail before it can be judged stalled with no reply at all (the
-/// witness has not advanced, so the extender expires it at the lookahead point: a fixed one-period base
-/// expired every WAN round at 75 ms with every reply still in flight); the **stall window** is
+/// measured tail as the election timing: the **base deadline** is `max(heartbeat, tail)` — a round with no
+/// reply at all is given the whole of it, the slowest voter's round-trip tail, for a first reply, and is not
+/// extended (`DispatchWait::judge`; a fixed one-period base expired every WAN round at 75 ms with every reply
+/// still in flight, and until 2026-09-29 a round with nothing gathered stopped at three quarters of its
+/// base, cutting off a voter answering in the last quarter); the **stall window** is
 /// `max(stall_periods × heartbeat, tail)` (a reply within one tail is progress); each **extension** is one
 /// heartbeat, up to [`ELECTION_MARGIN`] grants — the election-timeout cap, so a round is never extended past
 /// the timeout the election timer would displace the leader over; **polled** `polls_per_period` times a

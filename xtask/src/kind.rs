@@ -15,6 +15,10 @@
 //! - `scale` — `replicas=5` and back to 3: the configuration group's membership change, re-forming each time.
 //! - `netem` — the WAN profiles of §4.8's owed measurement: 80 ms ± 20 ms, the same with 1 % loss, and
 //!   the handshake ceiling at 350 ms; each pod's council timing and the leader's stability over a window.
+//! - `succession [--trials N]` — the council's leader lost under an asymmetric profile (pod 0's egress
+//!   80 ms, pod 1's 20 ms, pod 2 unshaped): the settled leader's egress is cut from an ephemeral
+//!   `NET_ADMIN` container, the survivors are polled until one leads, and the cut heals. The outranked
+//!   pod must never succeed a central one (research record §3.4; thesis §4.2.3).
 //! - `down` — deletes the cluster. `all` runs every step in order and deletes the cluster at the end,
 //!   also on failure, unless `--keep`.
 //!
@@ -103,6 +107,31 @@ const NETEM_PROFILES: [(&str, &str, &str, &str); 3] = [
   ("ceiling", "350ms", "0ms", "0%"),
 ];
 
+/// Shape: the succession measurement's profile (docs/wip/kind-lane.md, "Piece 6"): pod 0's egress delayed
+/// 80 ms and pod 1's 20 ms, each ± [`SUCCESSION_JITTER`], pod 2 unshaped. Pods 1 and 2 then commit in about
+/// 20 ms and tie, and pod 0, every path of which is at least 80 ms, is outranked by both — the three-region
+/// case of the research record §3.4 on real pods.
+const SUCCESSION_DELAYS: [(u64, &str); 2] = [(0, "80ms"), (1, "20ms")];
+/// Shape: the jitter on each shaped pod's egress.
+const SUCCESSION_JITTER: &str = "5ms";
+/// Shape: the pod every other pod outranks under the succession profile.
+const SUCCESSION_OUTRANKED: u64 = 0;
+/// Shape: the leader losses a succession run measures unless `--trials` says otherwise.
+const SUCCESSION_TRIALS: u64 = 10;
+/// Shape: how long a cut leader stays cut — several election timeouts at these paths' 1–1.3 s base, so the
+/// survivors elect and settle before it returns.
+const SUCCESSION_CUT: Duration = Duration::from_secs(15);
+/// Shape: consecutive samples one leader must hold, every pod formed, before a cut: settled, past any
+/// priority transfer.
+const SETTLED_SAMPLES: u32 = 5;
+/// Shape: how long a settled leader is waited for before a cut.
+const SETTLE_WAIT: Duration = Duration::from_secs(180);
+/// Shape: how long a successor is waited for after a cut.
+const SUCCESSION_WAIT: Duration = Duration::from_secs(60);
+/// Format: the ephemeral cut container's security context (`kubectl debug --custom`): root with
+/// `NET_ADMIN`, as the chart's netem init container runs, over the pod's non-root default.
+const CUT_CONTAINER: &str = r#"{"securityContext":{"runAsNonRoot":false,"runAsUser":0,"capabilities":{"add":["NET_ADMIN"]}}}"#;
+
 /// What the lane was asked to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -114,6 +143,7 @@ pub(crate) enum Step {
   Prove,
   Scale,
   Netem,
+  Succession,
   Down,
   All,
 }
@@ -133,10 +163,56 @@ pub(crate) struct Options {
   pub(crate) identities: Option<PathBuf>,
   /// `install`: a netem profile `(delay, jitter, loss)`.
   pub(crate) netem: Option<(String, String, String)>,
+  /// `succession`: how many leader losses.
+  pub(crate) trials: u64,
+}
+
+/// A netem profile for an install: every shaped pod's delay, jitter and loss, and per-pod delay overrides
+/// (the chart's `netem.delays`).
+#[derive(Debug, Clone)]
+struct Shaping {
+  delay: String,
+  jitter: String,
+  loss: String,
+  delays: Vec<(u64, String)>,
+}
+
+impl Shaping {
+  /// One delay, jitter and loss for every shaped pod.
+  fn uniform(delay: &str, jitter: &str, loss: &str) -> Shaping {
+    Shaping {
+      delay: delay.to_owned(),
+      jitter: jitter.to_owned(),
+      loss: loss.to_owned(),
+      delays: Vec::new(),
+    }
+  }
+
+  /// The succession profile ([`SUCCESSION_DELAYS`]).
+  fn succession() -> Shaping {
+    Shaping {
+      delays: SUCCESSION_DELAYS
+        .iter()
+        .map(|(ordinal, delay)| (*ordinal, (*delay).to_owned()))
+        .collect(),
+      ..Shaping::uniform("0ms", SUCCESSION_JITTER, "0%")
+    }
+  }
+
+  /// The `tc` command that restores pod `ordinal`'s shaping after a cut: its delay, or no qdisc at all.
+  fn restore(&self, ordinal: u64) -> String {
+    match self.delays.iter().find(|(shaped, _)| *shaped == ordinal) {
+      Some((_, delay)) => format!(
+        "tc qdisc replace dev eth0 root netem delay {delay} {} loss {}",
+        self.jitter, self.loss
+      ),
+      None => "tc qdisc del dev eth0 root".to_owned(),
+    }
+  }
 }
 
 /// Parses `kind STEP [--tag TAG] [--cluster NAME] [--keep] [--replicas N] [--out FILE]
-/// [--identities FILE] [--netem DELAY JITTER LOSS]`.
+/// [--identities FILE] [--netem DELAY JITTER LOSS] [--trials N]`.
 pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
   let step = match args.first().map(String::as_str) {
     Some("image") => Step::Image,
@@ -147,11 +223,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
     Some("prove") => Step::Prove,
     Some("scale") => Step::Scale,
     Some("netem") => Step::Netem,
+    Some("succession") => Step::Succession,
     Some("down") => Step::Down,
     Some("all") => Step::All,
     other => {
       return Err(Failure(format!(
-        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, down, all"
+        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, down, all"
       )));
     }
   };
@@ -164,6 +241,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
     out: None,
     identities: None,
     netem: None,
+    trials: SUCCESSION_TRIALS,
   };
   let mut rest = args[1..].iter();
   while let Some(arg) = rest.next() {
@@ -186,6 +264,11 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
       "--identities" => options.identities = Some(PathBuf::from(value("--identities")?)),
       "--netem" => {
         options.netem = Some((value("--netem")?, value("--netem")?, value("--netem")?));
+      }
+      "--trials" => {
+        options.trials = value("--trials")?
+          .parse()
+          .map_err(|_| Failure("kind: --trials needs a number".to_owned()))?;
       }
       other => return Err(Failure(format!("kind: unknown option `{other}`"))),
     }
@@ -634,6 +717,23 @@ struct View {
   rtt_tail_ns: u64,
   rtt_spread_ns: u64,
   samples: u64,
+  /// The council's election state (zero from an image that predates it): term, own priority and its spread,
+  /// rank, lease, and the pre-elections and elections begun.
+  term: u64,
+  priority_ns: u64,
+  priority_spread_ns: u64,
+  rank: u64,
+  leader_lease: bool,
+  pre_elections: u64,
+  elections: u64,
+  /// The replies its pre-elections drew, granted and refused, and the pre-votes it refused as a voter by
+  /// reason: lease, term, log, role.
+  pre_votes_granted: u64,
+  pre_votes_refused: u64,
+  refused_leased: u64,
+  refused_term: u64,
+  refused_log: u64,
+  refused_role: u64,
   /// The `fleet.resolve` refusals summed over the shards: a peer's name that did not resolve at a dial.
   resolve_refused: u64,
 }
@@ -688,6 +788,22 @@ impl View {
       rtt_tail_ns: u64_of(council, "rtt_tail_ns"),
       rtt_spread_ns: u64_of(council, "rtt_spread_ns"),
       samples: u64_of(council, "samples"),
+      term: u64_of(council, "term"),
+      priority_ns: u64_of(council, "priority_ns"),
+      priority_spread_ns: u64_of(council, "priority_spread_ns"),
+      rank: u64_of(council, "rank"),
+      leader_lease: council
+        .get("leader_lease")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false),
+      pre_elections: u64_of(council, "pre_elections"),
+      elections: u64_of(council, "elections"),
+      pre_votes_granted: u64_of(council, "pre_votes_granted"),
+      pre_votes_refused: u64_of(council, "pre_votes_refused"),
+      refused_leased: u64_of(council, "refused_leased"),
+      refused_term: u64_of(council, "refused_term"),
+      refused_log: u64_of(council, "refused_log"),
+      refused_role: u64_of(council, "refused_role"),
       resolve_refused,
     })
   }
@@ -695,7 +811,7 @@ impl View {
   /// One line of the view, for the record.
   fn line(&self) -> String {
     format!(
-      "{}: host={} f={} members={:?} peers_probed={} leads={} base={} span={} tail_ns={} spread_ns={} samples={} resolve_refused={}",
+      "{}: host={} f={} members={:?} peers_probed={} leads={} base={} span={} tail_ns={} spread_ns={} samples={} term={} priority_ns={}±{} rank={} lease={} pre_elections={} elections={} resolve_refused={}",
       self.pod,
       self.host,
       self.f,
@@ -707,6 +823,13 @@ impl View {
       self.rtt_tail_ns,
       self.rtt_spread_ns,
       self.samples,
+      self.term,
+      self.priority_ns,
+      self.priority_spread_ns,
+      self.rank,
+      self.leader_lease,
+      self.pre_elections,
+      self.elections,
       self.resolve_refused
     )
   }
@@ -779,7 +902,8 @@ struct Lane {
   keep: bool,
   identities: PathBuf,
   replicas: u64,
-  netem: Option<(String, String, String)>,
+  netem: Option<Shaping>,
+  trials: u64,
 }
 
 impl Lane {
@@ -802,7 +926,11 @@ impl Lane {
       keep: options.keep,
       identities,
       replicas: options.replicas,
-      netem: options.netem.clone(),
+      netem: options
+        .netem
+        .as_ref()
+        .map(|(delay, jitter, loss)| Shaping::uniform(delay, jitter, loss)),
+      trials: options.trials,
     })
   }
 
@@ -820,6 +948,7 @@ impl Lane {
       Step::Prove => self.prove(),
       Step::Scale => self.scale(),
       Step::Netem => self.netem_profiles(),
+      Step::Succession => self.succession(self.trials),
       Step::All => self.all(),
       Step::Image | Step::Smoke | Step::Certs | Step::Down => Ok(()),
     }
@@ -899,17 +1028,18 @@ impl Lane {
 
   /// `install`: the chart installed or upgraded at `replicas`, with a netem profile when given, then the
   /// rollout waited for (readiness is `slates status` on every pod). Returns the elapsed time.
-  fn install(
-    &self,
-    replicas: u64,
-    netem: Option<&(String, String, String)>,
-  ) -> Result<Duration, Failure> {
+  fn install(&self, replicas: u64, netem: Option<&Shaping>) -> Result<Duration, Failure> {
     let started = Instant::now();
     let chart = self.root.join("deploy/helm/slates");
     let lane_values = self.root.join("deploy/kind/values-lane.yaml");
     let netem_values = self.root.join("deploy/kind/values-netem.yaml");
     let context = format!("kind-{}", self.cluster);
     let replicas_set = format!("replicas={replicas}");
+    // The image the lane built and loaded (`--tag`), not the lane values' default: a custom tag would
+    // otherwise be loaded and never run, and an older `slates:lane` run in its place.
+    let (repository, tag) = self.tag.rsplit_once(':').unwrap_or((&self.tag, "latest"));
+    let repository_set = format!("image.repository={repository}");
+    let tag_set = format!("image.tag={tag}");
     let mut args: Vec<String> = [
       "upgrade",
       "--install",
@@ -926,21 +1056,31 @@ impl Lane {
       &self.identities.to_string_lossy(),
       "--set",
       &replicas_set,
+      "--set",
+      &repository_set,
+      "--set",
+      &tag_set,
     ]
     .iter()
     .map(|s| (*s).to_owned())
     .collect();
-    if let Some((delay, jitter, loss)) = netem {
+    if let Some(shaping) = netem {
       args.extend([
         "-f".to_owned(),
         netem_values.to_string_lossy().into_owned(),
         "--set".to_owned(),
-        format!("netem.delay={delay}"),
+        format!("netem.delay={}", shaping.delay),
         "--set".to_owned(),
-        format!("netem.jitter={jitter}"),
+        format!("netem.jitter={}", shaping.jitter),
         "--set".to_owned(),
-        format!("netem.loss={loss}"),
+        format!("netem.loss={}", shaping.loss),
       ]);
+      for (ordinal, delay) in &shaping.delays {
+        args.extend([
+          "--set".to_owned(),
+          format!("netem.delays.{ordinal}={delay}"),
+        ]);
+      }
     }
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     stream("helm", &borrowed)?;
@@ -1053,11 +1193,7 @@ impl Lane {
 
   /// A **fresh** install at `replicas` (optionally shaped): uninstall, then install, so the whole fleet
   /// boots together. Returns the rollout time.
-  fn fresh_install(
-    &self,
-    replicas: u64,
-    netem: Option<&(String, String, String)>,
-  ) -> Result<Duration, Failure> {
+  fn fresh_install(&self, replicas: u64, netem: Option<&Shaping>) -> Result<Duration, Failure> {
     self.uninstall()?;
     let elapsed = self.install(replicas, netem)?;
     self.bootstrap()?;
@@ -1448,7 +1584,7 @@ impl Lane {
   fn netem_profiles(&self) -> Result<(), Failure> {
     let mut findings = Vec::new();
     for (name, delay, jitter, loss) in NETEM_PROFILES {
-      let profile = (delay.to_owned(), jitter.to_owned(), loss.to_owned());
+      let profile = Shaping::uniform(delay, jitter, loss);
       // A fresh install so the whole fleet boots together under the shaping (a rolling upgrade onto a
       // running fleet would hit the rejoin gap; a fresh simultaneous boot forms cleanly).
       let elapsed = self.fresh_install(LANE_REPLICAS, Some(&profile))?;
@@ -1537,6 +1673,289 @@ impl Lane {
     }
     Ok(finding)
   }
+}
+
+/// One leader loss the succession step measured: which pod led and which succeeded it, how long after the cut,
+/// and the survivors' election state before and at the succession.
+struct Succession {
+  trial: u64,
+  lost: String,
+  successor: String,
+  took: Duration,
+  before: Vec<View>,
+  after: Vec<View>,
+}
+
+impl Succession {
+  /// The record's line: who was lost and who succeeded, when, and each survivor's rank, priority and the
+  /// campaigns it began in between.
+  fn line(&self) -> String {
+    let survivors: Vec<String> = self
+      .after
+      .iter()
+      .map(|after| {
+        let before = self.before.iter().find(|view| view.pod == after.pod);
+        let began = |field: fn(&View) -> u64| field(after).saturating_sub(before.map_or(0, field));
+        format!(
+          "{} rank {} priority {} ± {} ms, {} pre-elections ({} granted, {} refused replies) and {} elections begun, refused {} leased / {} term / {} log / {} role{}",
+          after.pod,
+          after.rank,
+          milliseconds(after.priority_ns),
+          milliseconds(after.priority_spread_ns),
+          began(|view| view.pre_elections),
+          began(|view| view.pre_votes_granted),
+          began(|view| view.pre_votes_refused),
+          began(|view| view.elections),
+          began(|view| view.refused_leased),
+          began(|view| view.refused_term),
+          began(|view| view.refused_log),
+          began(|view| view.refused_role),
+          if after.leads { ", leads" } else { "" }
+        )
+      })
+      .collect();
+    format!(
+      "trial {}: {} lost; {} leads {:.2} s after the cut; {}",
+      self.trial,
+      self.lost,
+      self.successor,
+      self.took.as_secs_f64(),
+      survivors.join("; ")
+    )
+  }
+}
+
+/// A pod's ordinal: the number after its name's last `-`.
+fn ordinal_of(pod: &str) -> Option<u64> {
+  pod
+    .rsplit_once('-')
+    .and_then(|(_, ordinal)| ordinal.parse().ok())
+}
+
+impl Lane {
+  /// `succession`: the council's leader lost under [`Shaping::succession`], `trials` times (the module doc;
+  /// research record §3.4; thesis §4.2.3). Each trial waits for a settled leader, cuts its egress, polls the
+  /// survivors until one of them leads, and heals the cut. The outranked pod must never succeed a central
+  /// leader.
+  fn succession(&self, trials: u64) -> Result<(), Failure> {
+    let shaping = Shaping::succession();
+    let custom = self._scratch.path.join("cut.json");
+    write_scratch(&custom, CUT_CONTAINER.as_bytes())?;
+    let mut measured = Vec::new();
+    for trial in 0..trials {
+      // Each trial on a fresh fleet, so no trial inherits another's cut.
+      let elapsed = self.fresh_install(LANE_REPLICAS, Some(&shaping))?;
+      eprintln!(
+        "kind: trial {trial}: succession profile {SUCCESSION_DELAYS:?} ± {SUCCESSION_JITTER} installed in {:.1} s",
+        elapsed.as_secs_f64()
+      );
+      self.wait_formed(
+        LANE_REPLICAS,
+        "the fleet formed under the succession profile",
+      )?;
+      let before = self.settled_views()?;
+      let succession = self.lose_leader(trial, before, &custom, &shaping)?;
+      eprintln!("kind: {}", succession.line());
+      measured.push(succession);
+    }
+    self.report_successions(&measured)
+  }
+
+  /// Every pod's view once one central leader — any pod but [`SUCCESSION_OUTRANKED`], where priority moves
+  /// leadership — has held for [`SETTLED_SAMPLES`] consecutive samples with the fleet formed, bounded by
+  /// [`SETTLE_WAIT`]; a leader that priority never moves off the outranked pod fails the wait.
+  fn settled_views(&self) -> Result<Vec<View>, Failure> {
+    let pods: Vec<String> = (0..LANE_REPLICAS).map(|index| self.pod(index)).collect();
+    let started = Instant::now();
+    let mut held = (0_u64, 0_u32);
+    loop {
+      let views = self.views(&pods)?;
+      let leader = views
+        .iter()
+        .flatten()
+        .find(|view| view.leads && view.pod != self.pod(SUCCESSION_OUTRANKED))
+        .map(|view| view.host);
+      held = match leader {
+        Some(host) if Self::formed_at(LANE_REPLICAS, &views) && host == held.0 => {
+          (host, held.1.saturating_add(1))
+        }
+        Some(host) if Self::formed_at(LANE_REPLICAS, &views) => (host, 1),
+        _ => (0, 0),
+      };
+      if held.1 >= SETTLED_SAMPLES {
+        return Ok(views.into_iter().flatten().collect());
+      }
+      if started.elapsed() > SETTLE_WAIT {
+        return Err(Failure(format!(
+          "kind: no leader settled within {SETTLE_WAIT:?}:{}",
+          self.fleet_diagnostics(&pods)
+        )));
+      }
+      pause(POLL_CLUSTER);
+    }
+  }
+
+  /// The VM's clock against this host's: an instant here and the VM's `/proc/uptime` at it (the midpoint of
+  /// the read), so a time a pod reads there converts to an instant here. Every kind node and pod shares the
+  /// VM's kernel, so its uptime is theirs.
+  fn vm_clock(&self) -> Result<(Instant, f64), Failure> {
+    let node = format!("{}-control-plane", self.cluster);
+    let before = Instant::now();
+    let uptime = must("docker", &["exec", &node, "cat", "/proc/uptime"])?;
+    let read = before.elapsed();
+    let seconds = uptime_seconds(&uptime)?;
+    Ok((before + read / 2, seconds))
+  }
+
+  /// Runs `script` as root with `NET_ADMIN` in pod `pod`'s network namespace, from an ephemeral container
+  /// named `name` (`kubectl debug`; the pod's own containers hold no capability).
+  fn in_pod_network(
+    &self,
+    pod: &str,
+    name: &str,
+    custom: &Path,
+    script: &str,
+  ) -> Result<(), Failure> {
+    let custom = format!("--custom={}", custom.to_string_lossy());
+    let container = format!("--container={name}");
+    let image = format!("--image={NETEM_TAG}");
+    let outcome = self.kubectl(&[
+      "debug",
+      pod,
+      &image,
+      "--image-pull-policy=Never",
+      "--profile=netadmin",
+      &custom,
+      &container,
+      "--attach=false",
+      "--",
+      "sh",
+      "-c",
+      script,
+    ])?;
+    if outcome.code != 0 {
+      return Err(Failure(format!(
+        "kind: {name} in {pod}: {}",
+        outcome.stderr.trim()
+      )));
+    }
+    Ok(())
+  }
+
+  /// One trial: the settled leader in `before` is cut off, the survivors are polled until one of them leads,
+  /// the cut holds for [`SUCCESSION_CUT`], and it heals to `shaping`'s profile.
+  fn lose_leader(
+    &self,
+    trial: u64,
+    before: Vec<View>,
+    custom: &Path,
+    shaping: &Shaping,
+  ) -> Result<Succession, Failure> {
+    let lost = before
+      .iter()
+      .find(|view| view.leads)
+      .map(|view| view.pod.clone())
+      .ok_or_else(|| Failure("kind: a settled fleet reports no leader".to_owned()))?;
+    let survivors: Vec<String> = before
+      .iter()
+      .map(|view| view.pod.clone())
+      .filter(|pod| *pod != lost)
+      .collect();
+    let (anchor, anchor_uptime) = self.vm_clock()?;
+    let cut = format!("cut-{trial}");
+    self.in_pod_network(
+      &lost,
+      &cut,
+      custom,
+      "tc qdisc replace dev eth0 root netem loss 100% && cut -d' ' -f1 /proc/uptime",
+    )?;
+    let (after, found_at) = self.await_successor(&survivors)?;
+    let logged = self.kubectl(&["logs", &lost, "-c", &cut])?;
+    let offset = uptime_seconds(&logged.stdout)? - anchor_uptime;
+    if !(0.0..=SUCCESSION_WAIT.as_secs_f64()).contains(&offset) {
+      return Err(Failure(format!(
+        "kind: the cut in {lost} logged {} against the VM's {anchor_uptime} before it",
+        logged.stdout.trim()
+      )));
+    }
+    let cut_at = anchor + Duration::from_secs_f64(offset);
+    let successor = after
+      .iter()
+      .find(|view| view.leads)
+      .map(|view| view.pod.clone())
+      .unwrap_or_default();
+    pause(SUCCESSION_CUT.saturating_sub(cut_at.elapsed()));
+    let ordinal =
+      ordinal_of(&lost).ok_or_else(|| Failure(format!("kind: {lost} names no ordinal")))?;
+    self.in_pod_network(
+      &lost,
+      &format!("heal-{trial}"),
+      custom,
+      &shaping.restore(ordinal),
+    )?;
+    Ok(Succession {
+      trial,
+      lost,
+      successor,
+      took: found_at.saturating_duration_since(cut_at),
+      before,
+      after,
+    })
+  }
+
+  /// Polls `survivors` until one of them leads, bounded by [`SUCCESSION_WAIT`]; returns their views then and
+  /// the instant it was seen.
+  fn await_successor(&self, survivors: &[String]) -> Result<(Vec<View>, Instant), Failure> {
+    let started = Instant::now();
+    loop {
+      let views: Vec<View> = self.views(survivors)?.into_iter().flatten().collect();
+      if views.iter().any(|view| view.leads) {
+        return Ok((views, Instant::now()));
+      }
+      if started.elapsed() > SUCCESSION_WAIT {
+        return Err(Failure(format!(
+          "kind: no survivor led within {SUCCESSION_WAIT:?} of the cut:{}",
+          self.fleet_diagnostics(survivors)
+        )));
+      }
+      pause(POLL);
+    }
+  }
+
+  /// The run's record — who succeeded whom, and how long each took — and its gate: the outranked pod never
+  /// succeeds a central leader.
+  fn report_successions(&self, measured: &[Succession]) -> Result<(), Failure> {
+    let outranked = self.pod(SUCCESSION_OUTRANKED);
+    let mut took: Vec<f64> = measured.iter().map(|one| one.took.as_secs_f64()).collect();
+    took.sort_by(f64::total_cmp);
+    let median = took.get(took.len() / 2).copied().unwrap_or(0.0);
+    let wrong: Vec<&Succession> = measured
+      .iter()
+      .filter(|one| one.lost != outranked && one.successor == outranked)
+      .collect();
+    eprintln!(
+      "kind: succession: {} losses; successor within {median:.2} s median ({took:.2?} s); {} succeeded by the outranked {outranked}",
+      measured.len(),
+      wrong.len()
+    );
+    if wrong.is_empty() {
+      return Ok(());
+    }
+    let lines: Vec<String> = wrong.iter().map(|one| one.line()).collect();
+    Err(Failure(format!(
+      "kind: the outranked {outranked} succeeded a central leader:\n{}",
+      lines.join("\n")
+    )))
+  }
+}
+
+/// The first field of a `/proc/uptime` line: seconds since the VM booted.
+fn uptime_seconds(line: &str) -> Result<f64, Failure> {
+  line
+    .split_whitespace()
+    .next()
+    .and_then(|seconds| seconds.parse().ok())
+    .ok_or_else(|| Failure(format!("kind: not an uptime: {line:?}")))
 }
 
 #[cfg(test)]

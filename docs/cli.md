@@ -181,8 +181,17 @@ this node is the regional configuration council's elected leader), `fleet_counci
 `⌈10 × max(broadcast RTT tail, heartbeat) / heartbeat⌉`, the span the same over the RTT variation),
 `fleet_council_rtt_tail_ns` and `fleet_council_rtt_spread_ns` (the measured tail and spread they
 came from; zero before any sample) and `fleet_council_samples` (the round trips behind them — a
-loopback fleet derives the ten-period floor from its samples, a WAN fleet a larger base), and the
-same six `fleet_root_*` lines for the root group across regions. A single daemon shows the same
+loopback fleet derives the ten-period floor from its samples, a WAN fleet a larger base); then its
+election state — `fleet_council_term`, `fleet_council_priority_ns` and
+`fleet_council_priority_spread_ns` (its measured quorum round trip, the election priority; zero while a
+needed path is unmeasured), `fleet_council_rank` (how many voters it holds alive outrank it: the
+timeouts it yields before campaigning), `fleet_council_leader_lease` (whether it still believes a leader
+alive, and so refuses pre-votes), `fleet_council_pre_elections` and `fleet_council_elections` (the
+campaigns it has begun since it started), `fleet_council_pre_votes_granted` and
+`fleet_council_pre_votes_refused` (the replies its pre-elections drew), and `fleet_council_refused_role`,
+`_refused_leased`, `_refused_term` and `_refused_log` (the pre-votes it refused as a voter, by reason: it
+leads or does not vote, it holds a lease, the term is not ahead, the candidate's log is behind) — and the
+same nineteen `fleet_root_*` lines for the root group across regions. A single daemon shows the same
 lines, degenerate: `f` 0, itself the one member, leading both groups after explicit bootstrap,
 at the floor with no sample.
 

@@ -3004,15 +3004,24 @@ fn council_reports_over_the_wire(daemons: &[Daemon]) -> Vec<slates_ipc::protocol
 }
 
 /// Exactly one node reports itself the leader over the wire, and every node's status carries measured
-/// samples and the derived timing at `floor`.
+/// samples and the derived timing at `floor` — and the election state that elected it: the leader began an
+/// election, every node reports its term, every follower holds its lease, and on one host every measured
+/// priority ties, so no node is outranked (research record §3.4: the gate is a no-op there).
 fn assert_status_carries_the_council(
   reported: &[slates_ipc::protocol::GroupReport],
   floor: &slates_cluster::timing::ElectionTiming,
 ) {
+  let leaders: Vec<&slates_ipc::protocol::GroupReport> =
+    reported.iter().filter(|group| group.leads).collect();
   assert_eq!(
-    reported.iter().filter(|group| group.leads).count(),
+    leaders.len(),
     1,
     "exactly one node reports itself the council's leader over the wire: {reported:?}"
+  );
+  let leader = leaders[0];
+  assert!(
+    leader.elections >= 1 && leader.term >= 1,
+    "the leader began the election it won: {reported:?}"
   );
   for group in reported {
     assert!(
@@ -3023,6 +3032,15 @@ fn assert_status_carries_the_council(
       (group.base_periods, group.span_periods),
       (floor.base_periods, floor.span_periods),
       "the status carries the derived timing: {reported:?}"
+    );
+    assert_eq!(group.term, leader.term, "one term: {reported:?}");
+    assert!(
+      group.priority_ns > 0 && group.rank == 0,
+      "a measured priority, tied on one host: {reported:?}"
+    );
+    assert!(
+      group.leads || group.leader_lease,
+      "a follower holds its leader's lease: {reported:?}"
     );
   }
 }

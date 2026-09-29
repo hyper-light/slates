@@ -1826,6 +1826,44 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: KIND succession — a round with no reply yet gave up at its lookahead — fixed; a symmetric partition never heals — open
+
+**Built.** The KIND lane's succession measurement (`cargo xtask kind succession`; `docs/wip/kind-lane.md`,
+Piece 6). The council's leader is lost under unequal paths: pod 0's egress 80 ms, pod 1's 20 ms, pod 2
+unshaped. Its egress is cut from an ephemeral `NET_ADMIN` container, and the survivors are timed to a
+successor. It runs on real daemons, so it checks the lease fix below where the simulation cannot.
+- Every node's status now carries its groups' election state: term, priority, rank, lease, the
+  pre-elections and elections it began, the pre-vote replies it drew, and the pre-votes it refused, by
+  reason (`GroupReport`; `docs/cli.md`).
+- The lane now installs the image tag it built and loaded; the lane values' `slates:lane` had been
+  installed whatever was loaded.
+
+**Found and fixed: a round with no reply yet gave up at its lookahead.**
+- `DispatchWait::judge` stopped a dispatch at three quarters of its deadline when it had gathered nothing,
+  against the budget's documented contract.
+- A central candidate whose one live voter answered in the round's last quarter failed every pre-election.
+  On KIND: 7 and 14 unanswered pre-elections, and successors after 13.4 and 25.4 s.
+- A dispatch with nothing gathered is now given its whole deadline, unextended. Two failing tests came
+  first, by use over the fabric.
+- With both fixes the central survivor succeeds 6 of 6 (median 3.08 s). Without the lease fix the outranked
+  pod succeeds 6 of 6 (6.47 s).
+[Bug record](../bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md).
+
+**Open — a symmetric partition never heals.** A council leader cut off for 15 s and healed never rejoined in
+180 s:
+- its peers held only each other alive, and it held only itself;
+- it began 175 pre-elections at a stale term;
+- each side's probe to the other idled as `BelievedDead`.
+Re-admission waits for the dead-believed peer's own probe (`resume_if_in_mesh`, A-15). After a symmetric
+partition neither side probes, so only a restart rejoins. Owed: bounded, backed-off contact attempts to
+believed-dead members (Serf's reconnect), with a failing test first.
+
+**Open — a late pre-vote reply is dropped.** With both fixes, 4 of the KIND successors' 10 pre-elections drew
+no reply within their deadline (one logged at over 127 ms against 124 ms), and each costs a whole election
+timeout. Raft counts a vote whenever it arrives within the candidacy, so a late grant folded while the
+pre-election is current would cost a period instead. Owed: measure and decide. Until then the succession
+step stays out of `kind all`, since its gate would turn on how often the retry repeats.
+
 ### 2026-09-29: MLRaft — built, verified, measured, one log kept; a yielding voter refused the voter it yielded to — fixed
 
 **MLRaft** (`crates/cluster/src/multilog.rs`; research record §3.6, slice 14). `n` Raft logs over one voter set:

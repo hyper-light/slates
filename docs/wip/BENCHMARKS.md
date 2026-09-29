@@ -945,6 +945,30 @@ unprioritized control too, whose p90 rises from 4,803 to 6,435 ms.
 Each loses on the order the daemon runs. The strict order costs a whole yield when the first voter cannot win
 (Ongaro & Ousterhout 2014 §5.2 abandoned ranking for this).
 
+### A leader loss on real pods: KIND succession (2026-09-29)
+
+**Hardware:** Apple M5 Max, macOS 26.4.1; Docker 29.3.1 (18 CPUs); kind v0.33.0, one control plane and five
+workers; the release image built from the tree named. **Command:** `cargo xtask kind succession --cluster
+slates-succession --tag TAG --trials 6` (about 3 min 45 s). The daemons are real processes on real pods,
+their paths shaped by `tc netem` (pod 0 egress 80 ms, pod 1 20 ms, each ± 5 ms, pod 2 unshaped). A trial
+cuts a settled central leader's egress and times the survivors' first leader from the cut's own
+`/proc/uptime` (`docs/wip/kind-lane.md`, Piece 6).
+
+| Daemon | Successor | Seconds to a successor, each trial |
+|---|---|---|
+| the lease fix and the round fix | the central survivor, 6 of 6 | 1.57, 1.98, 2.33, 3.08, 3.81, 4.96 (median 3.08) |
+| the round fix only (`462b63d` + the fix) | the outranked pod 0, 6 of 6 | 4.97, 5.38, 6.08, 6.47, 7.21, 7.58 (median 6.47) |
+| the lease fix only (`cf76129`) | pod 0, then pod 1 | 13.4, 25.4 |
+
+The simulation of the same profile predicted the first two rows' successors exactly: the central survivor
+200 of 200 with the lease fix (1,524 / 2,083 / 3,197 ms p50 / p90 / p99), the outranked pod 200 of 200
+without (3,976 ms median). It runs the timed simulation's directional delays over 200 seeds, the "KIND
+profile" line of `SLATES_LEADER_LOSS_SEEDS=200 cargo test -p slates-cluster --release --test priority --
+--ignored --exact a_leader_loss_measured --nocapture`; the unfixed figure is the same tool on a `462b63d`
+export. CI gates the successor's identity (`on_the_kind_profile_a_central_leader_passes_to_the_other_central_pod`). It does not model the round budget, so it could not see the
+third row's defect. Real pods run about twice the simulation's time to a successor: 4 in 10 of the
+successors' pre-elections drew no reply within their deadline.
+
 ### MLRaft: one to five logs across five regions (2026-09-29)
 
 **Hardware:** as above. **Command:** `SLATES_MULTILOG_SEEDS=20 cargo test -p slates-cluster --release --test

@@ -1831,8 +1831,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     committed_metadata: state.store.metadata.committed(),
     mapped_bytes: u64::try_from(state.store.content.mapped_bytes()).unwrap_or(u64::MAX),
     control: is_control_shard(state),
-    council: group_report(state.council.is_leader(), state.council_timing),
-    root: group_report(state.root.is_leader(), state.root_timing),
+    council: council_report(state),
+    root: root_report(state),
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
   }
@@ -1844,8 +1844,39 @@ fn is_control_shard(state: &ShardState) -> bool {
   state.shards.first() == Some(&state.shard)
 }
 
-/// A consensus group's status line: whether this node leads it, and the election timing it derived.
-fn group_report(leads: bool, timing: slates_cluster::timing::ElectionTiming) -> GroupReport {
+/// The regional council's status line ([`group_report`]).
+fn council_report(state: &ShardState) -> GroupReport {
+  group_report(
+    state.council.is_leader(),
+    state.council_timing,
+    state.council.election_view(),
+    state
+      .council
+      .election_rank(&crate::fleet::authenticated_alive(state)),
+  )
+}
+
+/// The root group's status line ([`group_report`]).
+fn root_report(state: &ShardState) -> GroupReport {
+  group_report(
+    state.root.is_leader(),
+    state.root_timing,
+    state.root.election_view(),
+    state
+      .root
+      .election_rank(&crate::fleet::authenticated_alive(state)),
+  )
+}
+
+/// A consensus group's status line: whether this node leads it, the election timing it derived, and its
+/// election state — term, priority, lease and campaigns — with its `rank` among the voters it holds alive, as
+/// its drive ranks it.
+fn group_report(
+  leads: bool,
+  timing: slates_cluster::timing::ElectionTiming,
+  view: slates_cluster::raft::ElectionView,
+  rank: usize,
+) -> GroupReport {
   GroupReport {
     leads,
     base_periods: timing.base_periods,
@@ -1853,6 +1884,19 @@ fn group_report(leads: bool, timing: slates_cluster::timing::ElectionTiming) -> 
     rtt_tail_ns: timing.broadcast_rtt_tail_ns,
     rtt_spread_ns: timing.broadcast_rtt_spread_ns,
     samples: timing.samples,
+    term: view.term,
+    priority_ns: view.priority.quorum_ns,
+    priority_spread_ns: view.priority.spread_ns,
+    rank: u32::try_from(rank).unwrap_or(u32::MAX),
+    leader_lease: view.leader_lease,
+    pre_elections: view.pre_elections,
+    elections: view.elections,
+    pre_votes_granted: view.pre_votes.granted,
+    pre_votes_refused: view.pre_votes.refused,
+    refused_role: view.pre_votes.refused_role,
+    refused_leased: view.pre_votes.refused_leased,
+    refused_term: view.pre_votes.refused_term,
+    refused_log: view.pre_votes.refused_log,
   }
 }
 
@@ -1863,14 +1907,8 @@ fn group_report(leads: bool, timing: slates_cluster::timing::ElectionTiming) -> 
 fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let configuration = state.fleet.configuration();
   let control = shards.iter().find(|shard| shard.control);
-  let council = control.map_or_else(
-    || group_report(state.council.is_leader(), state.council_timing),
-    |shard| shard.council.clone(),
-  );
-  let root = control.map_or_else(
-    || group_report(state.root.is_leader(), state.root_timing),
-    |shard| shard.root.clone(),
-  );
+  let council = control.map_or_else(|| council_report(state), |shard| shard.council.clone());
+  let root = control.map_or_else(|| root_report(state), |shard| shard.root.clone());
   FleetReport {
     host: state.fleet.host().0,
     f: configuration.quorum.f,

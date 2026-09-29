@@ -2695,6 +2695,15 @@ reconnaissance because the touched partitions are named up front).
 > (3,322 ms median over 200 seeds), where the outranked region had won 195 of 200 at 6,766 ms. Ties among
 > equally central voters are left to Raft's randomized retry, after three mitigations were measured and
 > rejected (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`).
+>
+> **On real pods (2026-09-29, slice 15).** The KIND lane's succession step cuts a central council leader
+> under unequal `netem` paths. The central survivor succeeds 6 of 6 (median 3.08 s), where the daemon without
+> the lease fix handed leadership to the outranked pod 6 of 6. The step also found a consensus round with
+> nothing gathered stopping at three quarters of its deadline, which cut off a far voter's reply; such a
+> round now waits its whole deadline, unextended
+> (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`). Status now reports each
+> group's election state. Open: a symmetric partition does not heal, since neither side probes a peer it
+> believes dead (GAPS).
 
 > **The fast track's recovery, verified before it is built (2026-09-28; `docs/wip/research/
 > consensus-enhancements.md`, slice 8).** Parallel replication and the fast track let a follower hold slots

@@ -16,13 +16,14 @@ use std::sync::mpsc::{Receiver, channel};
 
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
-use slates_cluster::{ClusterError, CommitBudget, commit_record, serve_record};
+use slates_cluster::{ClusterError, CommitBudget, broadcast, commit_record, serve_record};
 use slates_db::register::{
   Acceptor, Authority, HostEpoch, HostId, ObjectId, Placement, Quorum, Record,
 };
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
+use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
 
@@ -496,5 +497,139 @@ fn an_early_quorums_straggler_hands_its_session_back_and_it_is_reused() {
     recommitted.placed(Quorum { f: 1 }) && recommitted.acked.contains(&straggler),
     "the recovered session is live: the straggler's acknowledgement over it is the only second one the \
      commit could get — {recommitted:?}"
+  );
+}
+
+/// Format: the stream a consensus round's requests ride in [`run_broadcast`] (any stream a holder serves).
+const ROUND_STREAM: u64 = 7;
+/// Shape: when the one answering voter of a round replies — in the last quarter of [`BASE_DEADLINE_NS`], past
+/// the lookahead (three quarters of it) and before the deadline: the round trip of the one live voter a
+/// lost leader leaves a candidate, on KIND's asymmetric profile an 80 ms reply against a 100 ms base
+/// (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
+const LATE_FIRST_REPLY_NS: u64 = 13_000_000;
+
+/// Runs one consensus round — [`broadcast`] from an owner to one holder per plan, under `budget` — over the
+/// sim fabric. A holder with `serves` answers that many requests after its planned delay; one with none
+/// stays alive to its keepalive, silent. Returns the holders whose replies the round collected and how
+/// long it ran.
+fn run_broadcast(budget: CommitBudget, plans: &[HolderPlan]) -> (Vec<HostId>, u64) {
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let owner_identity = self_signed(NAME);
+  let owner_cert = owner_identity.certificate();
+  let mut dial = Vec::new();
+  for (index, plan) in plans.iter().copied().enumerate() {
+    let holder_identity = self_signed(NAME);
+    let holder_cert = holder_identity.certificate();
+    let (owner_port_tx, owner_port_rx) = channel::<u16>();
+    let (holder_port_tx, holder_port_rx) = channel::<u16>();
+    let owner_cert = owner_cert.clone();
+    sim
+      .spawn_on(id, async move {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _ = holder_port_tx.send(socket.local_addr().unwrap().port());
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(owner_port_rx).await);
+        let mut endpoint = Endpoint::server(
+          socket,
+          peer,
+          &holder_identity,
+          std::slice::from_ref(&owner_cert),
+          shape(),
+        )
+        .unwrap();
+        endpoint.establish().await.unwrap();
+        slates_rt::futures::sleep(plan.at_ns).await;
+        for _ in 0..plan.serves {
+          let _ = endpoint.serve_once(|_, _| b"granted".to_vec()).await;
+        }
+        let _ = settle_within(&mut endpoint, KEEPALIVE_NS).await;
+      })
+      .unwrap();
+    dial.push((holder_id(index), holder_cert, owner_port_tx, holder_port_rx));
+  }
+  let (result_tx, result_rx) = channel::<(Vec<HostId>, u64)>();
+  sim
+    .spawn_on(id, async move {
+      let mut requests = Vec::new();
+      for (holder, holder_cert, owner_port_tx, holder_port_rx) in dial {
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let _ = owner_port_tx.send(socket.local_addr().unwrap().port());
+        let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, recv_port(holder_port_rx).await);
+        let mut endpoint =
+          Endpoint::client(socket, peer, &owner_identity, &holder_cert, NAME, shape()).unwrap();
+        endpoint.establish().await.unwrap();
+        requests.push((holder, b"pre-vote".to_vec(), endpoint));
+      }
+      let started = slates_rt::futures::now_ns();
+      let (replied, _stragglers) =
+        broadcast(requests, ROUND_STREAM, Priority::Control, budget).await;
+      let elapsed = slates_rt::futures::now_ns().saturating_sub(started);
+      let replied: Vec<HostId> = replied
+        .iter()
+        .filter(|(_, reply, _)| !reply.bytes.is_empty())
+        .map(|(host, _, _)| *host)
+        .collect();
+      let _ = result_tx.send((replied, elapsed));
+    })
+    .unwrap();
+  sim.run_until_idle();
+  result_rx.try_recv().unwrap()
+}
+
+/// The extension budget the round tests run under: the constants above, as [`a_stalled_commit_expires_and_is_reported_uncertain`] uses them.
+fn round_budget() -> CommitBudget {
+  CommitBudget::with_extension(
+    BASE_DEADLINE_NS,
+    POLL_NS,
+    LOOKAHEAD_NUM,
+    LOOKAHEAD_DEN,
+    EXTENSION_NS,
+    MAX_EXTENSIONS,
+    STALL_WINDOW_NS,
+  )
+}
+
+/// §4.8 "late work" (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`): a round
+/// that has gathered no reply by its lookahead is not judged stalled there — it is given its whole base
+/// deadline for a first reply. One voter is silent, as a lost leader is, and the other answers in the last
+/// quarter of the base deadline; the round collects that answer. On KIND a candidate whose only live voter
+/// answered there failed every pre-election, and the outranked voter, whose base was longer, won instead.
+#[test]
+fn a_round_is_given_its_whole_base_deadline_for_a_first_reply() {
+  let (replied, elapsed_ns) = run_broadcast(
+    round_budget(),
+    &[
+      HolderPlan {
+        serves: 0,
+        at_ns: KEEPALIVE_NS,
+      },
+      HolderPlan {
+        serves: 1,
+        at_ns: LATE_FIRST_REPLY_NS,
+      },
+    ],
+  );
+  assert_eq!(
+    replied,
+    vec![holder_id(1)],
+    "the late first reply was collected (the round ran {elapsed_ns} ns)"
+  );
+}
+
+/// §4.8 "late work": a round that gathers nothing at all is not extended — it ends at its base deadline, so
+/// a dead voter never holds a round past it (`docs/bugs/2026-09-12-broadcast-waits-out-dead-voter.md`).
+#[test]
+fn a_round_with_no_reply_at_all_ends_at_its_base_deadline() {
+  let (replied, elapsed_ns) = run_broadcast(
+    round_budget(),
+    &[HolderPlan {
+      serves: 0,
+      at_ns: KEEPALIVE_NS,
+    }],
+  );
+  assert!(replied.is_empty(), "nothing replied: {replied:?}");
+  assert!(
+    (BASE_DEADLINE_NS..BASE_DEADLINE_NS + EXTENSION_NS).contains(&elapsed_ns),
+    "ended at its base deadline, unextended: {elapsed_ns} ns against {BASE_DEADLINE_NS} ns"
   );
 }

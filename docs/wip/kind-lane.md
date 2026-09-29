@@ -99,7 +99,11 @@ cluster is `slates-lane` (created and deleted by the lane; the box's `desktop`/`
 ```
 cargo xtask kind all                 # image → up → install → prove → scale → netem → delete cluster
 cargo xtask kind image | smoke | up | install | prove | scale | netem | down | certs --out FILE
+cargo xtask kind succession [--trials N] [--tag TAG] [--cluster NAME]   # a recorded measurement, not in `all`
 ```
+
+`--tag` names the image the lane builds and loads, and since 2026-09-29 the one its installs run: the lane
+values' `slates:lane` had been installed whatever tag was loaded, so a custom tag was loaded and never run.
 
 Deliverables: `Dockerfile` (+ `.dockerignore`); `deploy/helm/slates/` (chart) and its gate
 `xtask/tests/helm_chart.rs`; `deploy/kind/{cluster,values-lane,values-netem}.yaml` and `netem.Dockerfile`;
@@ -248,6 +252,55 @@ image: **5 replicas installed and formed in 7.5 s** — every pod Ready, `f = 2`
 five members, `peers_probed 4` on every pod, one leader, `rtt_tail_ns` 10 µs–1.0 ms (the un-netem'd pod
 path); then the fresh 3-replica reinstall **installed and formed in 7.5 s**, formation 0.2 s. The
 five-replica node that could not admit a client at 1 GiB admits it now.
+
+## Piece 6 — succession: the council's leader lost under unequal paths (built 2026-09-29; run under `succession`)
+
+`cargo xtask kind succession [--trials N]` measures what a leader's loss costs where the voters' priorities
+differ. It is the three-region case of the research record §3.4 on real pods.
+
+- **The profile.** Pod 0's egress is delayed 80 ms and pod 1's 20 ms, each ± 5 ms, and pod 2 is unshaped
+  (the chart's lane-only `netem.delays`). Pods 1 and 2 commit in about 20 ms and tie; pod 0, every path of
+  which is at least 80 ms, is outranked by both.
+- **A trial.** A fresh fleet, and a wait until a central leader has held for five samples. Then its egress
+  is cut: 100 % loss, from an ephemeral container (`kubectl debug --profile=netadmin`, root with
+  `NET_ADMIN` in the pod's network namespace; lane-only). The two survivors are polled until one leads, and
+  the cut heals 15 s later.
+- **Timing.** The cut container prints the VM's `/proc/uptime` as it cuts, mapped to the host's clock by one
+  read at the trial's start, so a container's start delay is not counted.
+- **The gate.** The outranked pod never succeeds a central leader.
+- **What each trial reads.** Every pod's status carries its council election state since the same day:
+  term, priority, rank, lease, pre-elections and elections begun, pre-vote replies granted and refused, and
+  refusals by reason (`docs/cli.md`).
+
+**Measured 2026-09-29** (this box: Apple M5 Max, Docker 29.3.1 with 18 CPUs; kind v0.33.0; one fresh fleet
+per trial):
+
+| Daemon | Successor | Successor latency | What the counters show |
+|---|---|---|---|
+| lease fix and round fix (`cf76129` and this change) | the central survivor, 6 of 6 | 1.57, 1.98, 2.33, 3.08, 3.81, 4.96 s | the successor's first to third pre-election won; pod 0 yielded throughout |
+| round fix only (`462b63d` with it applied) | the outranked pod 0, 6 of 6 | 4.97, 5.38, 6.08, 6.47, 7.21, 7.58 s | pod 0 refused the central candidate's pre-votes as *leased*, 1–2 each trial, then won |
+| lease fix only (`cf76129`) | pod 0 once, pod 1 once | 13.4 and 25.4 s | the successor's 5 and 14 pre-elections drew no reply at all |
+
+Two defects were found, and both are fixed in the daemon:
+- the lease outlived the minimum election timeout, so a yielding voter refused the voter it yielded to
+  (`docs/bugs/2026-09-29-a-yielding-voter-refused-the-voter-it-yielded-to.md`);
+- a round with no reply yet gave up at three quarters of its deadline, so the far live voter's reply was
+  always cut off (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
+
+Its outcome is statistical, so the step is not part of `all`. With both fixes, 4 of the successors' 10
+pre-elections still drew no reply within their deadline (one logged at over 127 ms against 124 ms). A late
+pre-vote reply is dropped, so the candidate campaigns again a timeout later. A gate on "never" would then
+turn on how often that repeats.
+
+**Found by it, open: a symmetric partition never heals.** The first runs reused one fleet across trials.
+The cut leader, healed after 15 s, never rejoined.
+- Its peers held only each other alive, and it held only itself.
+- It began 175 pre-elections at term 2 while they led at term 3.
+- Each side's probe to the other logged `idles: BelievedDead`.
+The design re-admits a believed-dead peer when *its* probe reaches a node (`resume_if_in_mesh`,
+`serve_peer_probes`; A-15). After a partition both sides believe the other dead, neither probes, and no
+refutation can happen: only a restart rejoins it. Serf solves this with periodic reconnection attempts to
+failed members. Owed (GAPS).
 
 ## The one gap left — a whole-pod restart does not rejoin (open; not the cause first recorded)
 

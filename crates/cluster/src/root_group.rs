@@ -34,7 +34,8 @@ use slates_db::register::{HostId, OBJECT_BYTES, ObjectId, RegionId, RootConfigur
 
 use crate::fold::{Fold, Snapshotted};
 use crate::raft::{
-  CatchUp, ElectionPriority, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal,
+  CatchUp, ElectionPriority, ElectionView, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow,
+  TransferRefusal,
 };
 use crate::raft_wire::{RaftMessage, decode_root_configuration, encode_root_configuration};
 
@@ -769,6 +770,11 @@ impl RootGroup {
   /// [`RaftNode::election_rank`]): the timer yields one timeout per rank.
   pub fn election_rank(&self, alive: &[HostId]) -> usize {
     self.raft.election_rank(alive)
+  }
+
+  /// This node's election state, for `status` ([`RaftNode::election_view`]).
+  pub fn election_view(&self) -> ElectionView {
+    self.raft.election_view()
   }
 
   /// Hands leadership to a live, caught-up voter that outranks this leader, when one does (§3.4 with thesis

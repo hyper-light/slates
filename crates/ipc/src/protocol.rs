@@ -700,7 +700,9 @@ pub struct RefusalCount {
 /// randomization span from RTT variance"*): whether this node currently leads it, and the election timing
 /// it last derived — the base and span in coordinator periods, the measured round-trip tail and spread
 /// they came from, and the samples behind them, so an observer tells a measured timing from the floor it
-/// would default to. The regional council and the root group each report one.
+/// would default to — and its election state: term, priority, rank, lease and the campaigns it began, so an
+/// observer can tell why a group elected whom it did (`docs/wip/kind-lane.md`). The regional council and
+/// the root group each report one.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct GroupReport {
   /// Whether this node believes itself the group's elected leader.
@@ -715,6 +717,34 @@ pub struct GroupReport {
   pub rtt_spread_ns: u64,
   /// The round trips measured across the voter paths that fed the derivation.
   pub samples: u64,
+  /// This node's current term in the group.
+  pub term: u64,
+  /// This node's election priority as it last measured it (§3.4): its quorum round trip, nanoseconds; zero
+  /// while a needed path is unmeasured.
+  pub priority_ns: u64,
+  /// The spread of the path that sets the priority, nanoseconds.
+  pub priority_spread_ns: u64,
+  /// How many voters it holds alive outrank it: the timeouts its timer yields before it campaigns (§3.4).
+  pub rank: u32,
+  /// Whether it holds a leader's lease — it believes a leader alive, and so refuses pre-votes (thesis
+  /// §4.2.3).
+  pub leader_lease: bool,
+  /// The pre-elections (pre-vote rounds) it has begun since it started.
+  pub pre_elections: u64,
+  /// The elections it has begun since it started: after a won pre-election, or on a leader's invitation.
+  pub elections: u64,
+  /// Replies to its own pre-elections that granted.
+  pub pre_votes_granted: u64,
+  /// Replies to its own pre-elections that refused.
+  pub pre_votes_refused: u64,
+  /// Pre-votes it refused as a voter (thesis §9.6) because it does not vote or it leads.
+  pub refused_role: u64,
+  /// Pre-votes it refused because it held a leader's lease.
+  pub refused_leased: u64,
+  /// Pre-votes it refused because their term was not ahead of its own.
+  pub refused_term: u64,
+  /// Pre-votes it refused because the candidate's log was behind its own.
+  pub refused_log: u64,
 }
 
 /// One shard's part of the daemon's status.

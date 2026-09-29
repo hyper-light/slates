@@ -83,7 +83,11 @@ spec:
             - |
               case "$POD_NAME" in
               {{- range .Values.netem.pods }}
-                {{ include "slates.fullname" $ }}-{{ . }}) tc qdisc add dev eth0 root netem delay {{ $.Values.netem.delay }} {{ $.Values.netem.jitter }} loss {{ $.Values.netem.loss }} && echo "netem on $POD_NAME: delay {{ $.Values.netem.delay }} {{ $.Values.netem.jitter }} loss {{ $.Values.netem.loss }}" ;;
+              {{- $delay := $.Values.netem.delay }}
+              {{- if hasKey $.Values.netem.delays (toString .) }}
+              {{- $delay = index $.Values.netem.delays (toString .) }}
+              {{- end }}
+                {{ include "slates.fullname" $ }}-{{ . }}) tc qdisc add dev eth0 root netem delay {{ $delay }} {{ $.Values.netem.jitter }} loss {{ $.Values.netem.loss }} && echo "netem on $POD_NAME: delay {{ $delay }} {{ $.Values.netem.jitter }} loss {{ $.Values.netem.loss }}" ;;
               {{- end }}
                 *) echo "no netem on $POD_NAME" ;;
               esac

@@ -571,8 +571,9 @@ fn declared_domain(state: &ShardState, host: HostId) -> Option<DomainId> {
 }
 
 /// Only identities learned over authenticated contact may enter a voter configuration.
-/// Manifest seeds locate certificates and addresses; optimistic SWIM seeding is not admission.
-fn authenticated_alive(state: &ShardState) -> Vec<HostId> {
+/// Manifest seeds locate certificates and addresses; optimistic SWIM seeding is not admission. The groups'
+/// drives rank their elections against it, and `status` reports the same rank (`verbs::group_report`).
+pub(crate) fn authenticated_alive(state: &ShardState) -> Vec<HostId> {
   state
     .fleet
     .membership()

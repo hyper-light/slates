@@ -100,3 +100,6 @@ netem:
   loss: 0%
   # The ordinals shaped (the others stay on the unshaped path).
   pods: [0, 1]
+  # Per-ordinal delay overrides (`"0": 80ms`); a shaped pod without one takes `delay`. The lane's succession
+  # measurement shapes pods unequally so their election priorities differ (docs/wip/kind-lane.md).
+  delays: {}

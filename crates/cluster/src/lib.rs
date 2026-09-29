@@ -193,7 +193,8 @@ impl CommitBudget {
   /// A progress-extending budget (§4.8 "late work"): a dispatch still gathering acknowledgements as it
   /// passes the `lookahead_numerator / lookahead_denominator` fraction of its deadline is granted up to
   /// `max_extensions` extensions of `extension_ns` each, provided its acknowledged set advanced within
-  /// `stall_window_ns`; a stalled dispatch is left to time out at the current deadline. Every value is
+  /// `stall_window_ns`; one that stalled after gathering stops there, and one that has gathered nothing is
+  /// left to time out at the current deadline, unextended ([`DispatchWait::judge`]). Every value is
   /// the caller's to derive from the operation's class (its measured per-holder RTT and quorum width);
   /// nothing here is a hidden constant.
   pub fn with_extension(
@@ -286,15 +287,24 @@ impl DispatchWait {
   /// pure in the clock: records `gathered` as the dispatch's progress at `now_ns` and asks the extender
   /// whether the dispatch may keep waiting. Separated from the sleep so the rule is testable at N=1
   /// against an injected clock — the way the extender and the witness are.
+  ///
+  /// A dispatch that has gathered nothing is given its whole current deadline for a first reply: the
+  /// extender's lookahead is where an extension is decided, and nothing gathered is no evidence of a stall,
+  /// so such a dispatch is never extended but is not stopped before its deadline either. One that gathered
+  /// and then went a stall window without more stops where the extender judges it. Until 2026-09-29 a
+  /// dispatch with nothing gathered stopped at the lookahead, three quarters of its deadline: a consensus
+  /// round whose one live voter answered in the last quarter never collected it, so after a leader's loss
+  /// the candidate nearest that voter failed every pre-election
+  /// (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
   pub fn judge(&mut self, gathered: usize, now_ns: u64) -> bool {
     self
       .witness
       .observe(u64::try_from(gathered).unwrap_or(u64::MAX), now_ns);
     let elapsed = now_ns.saturating_sub(self.started_ns);
-    !matches!(
-      self.extender.evaluate(elapsed, &self.witness, now_ns),
-      ExtensionOutcome::Expire
-    )
+    match self.extender.evaluate(elapsed, &self.witness, now_ns) {
+      ExtensionOutcome::Expire => gathered == 0 && elapsed < self.extender.deadline_ns(),
+      ExtensionOutcome::Continue | ExtensionOutcome::Extend { .. } => true,
+    }
   }
 
   /// The dispatch's progress witness, for a test to feed an acknowledgement it observed at a given time.

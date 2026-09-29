@@ -251,6 +251,73 @@ fn a_lost_leader_passes_to_the_most_central_survivor() {
   }
 }
 
+/// Shape: the KIND lane's succession profile (`docs/wip/kind-lane.md`, Piece 6; `xtask/src/kind.rs`
+/// `SUCCESSION_DELAYS`): each pod's egress delay in milliseconds — pod 0 80, pod 1 20, pod 2 unshaped — with
+/// the pod network's own one-way delay under all of them.
+const KIND_EGRESS_MS: [u64; 3] = [80, 20, 0];
+/// Shape: the pod network's one-way delay, 0.2 ms.
+const KIND_POD_NETWORK_NS: u64 = 200_000;
+
+/// The lane's profile as the timed simulation's directional pair delays: a datagram from pod `i` takes pod
+/// `i`'s egress delay plus the pod network's, ± the lane's 5 ms jitter.
+fn kind_profile(hosts: &[HostId]) -> support::timed::Profile {
+  let mut profile = support::timed::Profile::uniform(KIND_POD_NETWORK_NS, JITTER_NS, 0);
+  for (from, from_host) in hosts.iter().enumerate() {
+    for to_host in hosts.iter().filter(|to| *to != from_host) {
+      profile.pairs.insert(
+        (*from_host, *to_host),
+        (KIND_EGRESS_MS[from] * MS + KIND_POD_NETWORK_NS, JITTER_NS),
+      );
+    }
+  }
+  profile
+}
+
+/// The KIND lane's succession measurement in simulation (`docs/wip/kind-lane.md`, Piece 6): on its profile,
+/// a central leader lost is succeeded by the other central pod on every seed, never by the outranked pod 0
+/// — the lane's gate, predicted before it ran. Before the lease fix the outranked pod succeeded on every seed
+/// (200 of 200, 3,976 ms median); with it the central one does (200 of 200, 1,524 ms median; measured
+/// 2026-09-29 over 200 seeds, `docs/wip/BENCHMARKS.md`). The lane then measured the same on real pods, where
+/// the round budget's defect (which this simulation does not model) had also to be fixed.
+#[test]
+fn on_the_kind_profile_a_central_leader_passes_to_the_other_central_pod() {
+  let hosts: Vec<HostId> = (1..=3).map(HostId).collect();
+  let outranked = hosts[0];
+  for seed in 0..SEEDS {
+    let outcome = run(Scenario {
+      voters: 3,
+      profile: kind_profile(&hosts),
+      faults: vec![Fault::IsolateLeader {
+        from_ns: DOWN_FROM_NS,
+        until_ns: DOWN_FROM_NS + DOWN_FOR_NS,
+      }],
+      duration_ns: DURATION_NS,
+      propose_every_ns: PROPOSE_EVERY_NS,
+      propose_from_ns: PROPOSE_FROM_NS,
+      campaign: Campaign::PreVote,
+      order: ElectionOrder::ByPriority,
+      seed,
+      window: Window::Bytes(0),
+      proposer: Proposer::Leader,
+      fast_track: false,
+    });
+    let (_, lost) = *outcome.isolated.first().expect("the cut found a leader");
+    assert_ne!(
+      lost, outranked,
+      "seed {seed}: priority put the leader on a central pod"
+    );
+    let (_, successor, _) = *outcome
+      .leader_events
+      .iter()
+      .find(|(at, node, _)| *at >= DOWN_FROM_NS && *node != lost)
+      .expect("a successor");
+    assert_ne!(
+      successor, outranked,
+      "seed {seed}: the outranked pod succeeded a central leader"
+    );
+  }
+}
+
 /// The 50th, 90th and 99th percentiles and the maximum of `values` (non-empty).
 fn spread_of(values: &mut [u64]) -> [u64; 4] {
   values.sort_unstable();
@@ -288,4 +355,44 @@ fn a_leader_loss_measured() {
       );
     }
   }
+  kind_leader_loss_measured(seeds);
+}
+
+/// The leader-loss tool's KIND block: on the lane's succession profile ([`kind_profile`]), the time to a
+/// successor and which pod it was, over `seeds` seeds.
+fn kind_leader_loss_measured(seeds: u64) {
+  let hosts: Vec<HostId> = (1..=3).map(HostId).collect();
+  let mut successor_ms = Vec::new();
+  let mut successors: BTreeMap<u64, u64> = BTreeMap::new();
+  for seed in 0..seeds {
+    let outcome = run(Scenario {
+      voters: 3,
+      profile: kind_profile(&hosts),
+      faults: vec![Fault::IsolateLeader {
+        from_ns: DOWN_FROM_NS,
+        until_ns: DOWN_FROM_NS + DOWN_FOR_NS,
+      }],
+      duration_ns: DURATION_NS,
+      propose_every_ns: PROPOSE_EVERY_NS,
+      propose_from_ns: PROPOSE_FROM_NS,
+      campaign: Campaign::PreVote,
+      order: ElectionOrder::ByPriority,
+      seed,
+      window: Window::Bytes(0),
+      proposer: Proposer::Leader,
+      fast_track: false,
+    });
+    let (_, lost) = *outcome.isolated.first().expect("the cut found a leader");
+    let (at, successor, _) = *outcome
+      .leader_events
+      .iter()
+      .find(|(at, node, _)| *at >= DOWN_FROM_NS && *node != lost)
+      .expect("a successor");
+    successor_ms.push((at - DOWN_FROM_NS) / MS);
+    *successors.entry(successor.0 - 1).or_default() += 1;
+  }
+  eprintln!(
+    "the KIND profile: successor ms p50/p90/p99/max {:?} over {seeds} seeds; successors by pod {successors:?}",
+    spread_of(&mut successor_ms)
+  );
 }
