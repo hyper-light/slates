@@ -176,16 +176,19 @@ mod linux {
   fn read_pseudo_file(path: &str, cap: usize) -> Result<String, MountTableError> {
     let fd =
       rustix::fs::open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).map_err(errno_of)?;
-    let page = rustix::param::page_size();
+    let mut page = vec![0u8; rustix::param::page_size()];
     let mut text: Vec<u8> = Vec::new();
     loop {
-      let start = text.len();
-      text.resize(start + page, 0);
-      let read = rustix::io::read(&fd, &mut text[start..]).map_err(errno_of)?;
-      text.truncate(start + read);
-      if read == 0 {
+      let read = rustix::io::read(&fd, &mut page).map_err(errno_of)?;
+      // `read` never exceeds the buffer it was given; a count past it would be the kernel's bug, refused
+      // as a malformed read rather than trusted.
+      let got = page
+        .get(..read)
+        .ok_or(MountTableError::Malformed { line: 0 })?;
+      if got.is_empty() {
         break;
       }
+      text.extend_from_slice(got);
       if text.len() > cap {
         return Err(MountTableError::TooLarge { cap });
       }
@@ -253,16 +256,21 @@ pub fn parse_mountinfo(text: &str) -> Result<Vec<MountEntry>, MountTableError> {
       continue;
     }
     let fields: Vec<&str> = line.split(' ').collect();
-    let malformed = MountTableError::Malformed { line: index + 1 };
+    let malformed = MountTableError::Malformed {
+      line: index.saturating_add(1),
+    };
     let mount_point = fields.get(MOUNT_POINT_FIELD).ok_or(malformed.clone())?;
+    let after_mount_point = MOUNT_POINT_FIELD.saturating_add(1);
     let separator = fields
       .iter()
-      .skip(MOUNT_POINT_FIELD + 1)
+      .skip(after_mount_point)
       .position(|f| *f == MOUNTINFO_SEPARATOR)
-      .map(|p| p + MOUNT_POINT_FIELD + 1)
+      .map(|p| p.saturating_add(after_mount_point))
       .ok_or(malformed.clone())?;
-    let fstype = fields.get(separator + 1).ok_or(malformed.clone())?;
-    let source = fields.get(separator + 2).ok_or(malformed)?;
+    let fstype = fields
+      .get(separator.saturating_add(1))
+      .ok_or(malformed.clone())?;
+    let source = fields.get(separator.saturating_add(2)).ok_or(malformed)?;
     entries.push(MountEntry {
       mount_point: unescape(mount_point),
       fstype: unescape(fstype),

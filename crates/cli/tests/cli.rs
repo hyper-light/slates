@@ -1771,7 +1771,8 @@ fn assert_retired(views: &[Option<FleetView>], dead: &str) {
 }
 
 /// Polls the survivors' `volume stat ID` until one serves the volume (the successor materialized it under
-/// its id, named and placed) or the fleet wait passes; returns the successor's instance.
+/// its id, named and placed) or the fleet wait passes; returns the successor's instance. A wait that runs out
+/// fails with every survivor's status and its last answer for the volume, so the failure names its state.
 fn wait_successor(instances: &[String], id: &str) -> String {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
@@ -1783,10 +1784,23 @@ fn wait_successor(instances: &[String], id: &str) -> String {
         return instance.clone();
       }
     }
-    assert!(
-      Instant::now() < deadline,
-      "a survivor took the volume over and serves it within the fleet wait"
-    );
+    if Instant::now() >= deadline {
+      let states: Vec<String> = instances
+        .iter()
+        .map(|instance| {
+          let (status_code, status, status_err) = run(instance, &["status"]);
+          let (stat_code, _, stat_err) = run(instance, &["volume", "stat", id]);
+          format!(
+            "--- {instance}: volume stat exit {stat_code}: {}\n--- {instance}: status exit {status_code}:\n{status}{status_err}",
+            stat_err.trim()
+          )
+        })
+        .collect();
+      panic!(
+        "a survivor took the volume over and serves it within the fleet wait:\n{}",
+        states.join("\n")
+      );
+    }
     pause();
   }
 }

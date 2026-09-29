@@ -551,7 +551,10 @@ fn command_after(rest: &[String]) -> Result<Vec<String>, ParseError> {
   let Some(split) = rest.iter().position(|a| a == "--") else {
     return Err(ParseError::Missing("`--` then the command"));
   };
-  let command = rest[split + 1..].to_vec();
+  let command = rest
+    .get(split.saturating_add(1)..)
+    .map(<[String]>::to_vec)
+    .unwrap_or_default();
   if command.is_empty() {
     return Err(ParseError::Missing("a command after `--`"));
   }
@@ -789,9 +792,9 @@ fn manifest_hash(text: &str) -> Result<[u8; MANIFEST_BYTES], ParseError> {
   }
   let mut out = [0u8; MANIFEST_BYTES];
   let (pairs, _) = bytes.as_chunks::<HEX_CHARS_PER_BYTE>();
-  for (index, pair) in pairs.iter().enumerate() {
+  for (byte, pair) in out.iter_mut().zip(pairs) {
     let hex = std::str::from_utf8(pair).map_err(|_| bad("hexadecimal"))?;
-    out[index] = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad("hexadecimal"))?;
+    *byte = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad("hexadecimal"))?;
   }
   Ok(out)
 }
@@ -1000,7 +1003,10 @@ fn parse_submit(taken: &Taken, work: &str) -> Result<Command, ParseError> {
 /// Parses the arguments (without the program name).
 pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
   let boundary = arguments.iter().position(|argument| argument == "--");
-  let taken = take(&arguments[..boundary.unwrap_or(arguments.len())])?;
+  let before_boundary = arguments
+    .get(..boundary.unwrap_or(arguments.len()))
+    .unwrap_or(arguments);
+  let taken = take(before_boundary)?;
   let words: Vec<&str> = taken.words.iter().map(String::as_str).collect();
   match words.first().copied() {
     Some("run") => return parse_run(&taken, arguments),
@@ -1024,7 +1030,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         shards: shards_of(&taken)?,
         fleet: fleet_of(&taken)?,
       };
-      Ok(if words[0] == "anchor" {
+      Ok(if words.first() == Some(&"anchor") {
         Command::Anchor(options)
       } else {
         Command::Daemon(options)

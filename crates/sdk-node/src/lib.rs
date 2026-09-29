@@ -17,6 +17,17 @@
 //! made only by a human at the CLI or a confirmation surface, never by an agent answering its own
 //! question.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
 // napi-rs's `#[napi]` macros generate `unsafe fn` bodies that call napi's own unsafe helpers without an
 // inner `unsafe` block, identity conversions, and undocumented public registration functions —
 // patterns the workspace's edition-2024 strict lints reject in *generated* code. This crate's own code
@@ -90,11 +101,11 @@ fn parse_volume(hex: &str) -> Result<VolumeId> {
     )));
   }
   let mut bytes = [0u8; VOLUME_ID_BYTES];
-  for (index, byte) in bytes.iter_mut().enumerate() {
-    // Two hex digits per byte; the length is checked above, so the slice is always in bounds.
-    let start = index * 2;
-    let pair = &hex[start..start + 2];
-    *byte = u8::from_str_radix(pair, HEX_RADIX)
+  // Two hex digits per byte, taken as bytes: the length is checked above, and a pair that is not two ASCII
+  // hex digits (a multi-byte character among them) is refused, never sliced through.
+  for (byte, pair) in bytes.iter_mut().zip(hex.as_bytes().chunks(2)) {
+    let digits = std::str::from_utf8(pair).unwrap_or_default();
+    *byte = u8::from_str_radix(digits, HEX_RADIX)
       .map_err(|_| Error::from_reason(format!("not a hex byte: {pair:?}")))?;
   }
   Ok(VolumeId { bytes })
@@ -230,7 +241,7 @@ pub struct LandingResult {
 
 /// Format: a 32-byte manifest hash rendered as lowercase hex (64 characters), two digits per byte.
 fn hex32(bytes: &[u8; 32]) -> String {
-  let mut out = String::with_capacity(bytes.len() * 2);
+  let mut out = String::with_capacity(bytes.len().saturating_mul(2));
   for byte in bytes {
     out.push_str(&format!("{byte:02x}"));
   }

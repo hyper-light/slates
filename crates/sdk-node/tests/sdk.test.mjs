@@ -114,6 +114,15 @@ test('lifecycle round trip over a live daemon', async (t) => {
     const snapshot = client.snapshot(volume);
     assert.equal(typeof snapshot, 'number');
 
+    // A hostile volume id (the hostile-input rule for every parser of external bytes): 32 bytes whose first
+    // pair splits a multi-byte character is refused as a JS error, and the process lives on. Before
+    // 2026-09-29 the parser sliced the string through the character and panicked.
+    assert.throws(
+      () => client.status('a\u20ac' + '0'.repeat(28)),
+      /not a hex byte/,
+      'a volume id that is not two hex digits a byte is a typed refusal, not a crash',
+    );
+
     // status → the volume's real fields, read back over the same rings.
     const status = client.status(volume);
     assert.equal(status.id, volume);

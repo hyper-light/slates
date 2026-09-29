@@ -151,10 +151,20 @@ impl OsHost {
       files: BTreeMap::new(),
       next: 1,
     };
-    let h = host.next;
-    host.next += 1;
+    let h = host.allocate()?;
     host.dirs.insert(h, path.to_path_buf());
     Ok((host, HostDir(h)))
+  }
+
+  /// The next handle id. Ids are never reused, so one is never recycled onto a handle still held; once the
+  /// id space is spent the host refuses as it would past its handle limit (`ERROR_TOO_MANY_OPEN_FILES`).
+  /// (At one open a nanosecond, a `u64` lasts 584 years.)
+  fn allocate(&mut self) -> Result<u64, HostError> {
+    let h = self.next;
+    self.next = h.checked_add(1).ok_or(HostError::Unavailable(
+      i32::try_from(windows_sys::Win32::Foundation::ERROR_TOO_MANY_OPEN_FILES).unwrap_or(i32::MAX),
+    ))?;
+    Ok(h)
   }
 
   fn dir(&self, dir: HostDir) -> Result<&PathBuf, HostError> {
@@ -163,7 +173,7 @@ impl OsHost {
 
   /// Open handles, for leak checks.
   pub fn open_handles(&self) -> usize {
-    self.dirs.len() + self.files.len()
+    self.dirs.len().saturating_add(self.files.len())
   }
 }
 
@@ -225,8 +235,7 @@ impl HostFs for OsHost {
     if !meta.is_dir() || meta.file_type().is_symlink() {
       return Err(HostError::NotDirectory);
     }
-    let h = self.next;
-    self.next += 1;
+    let h = self.allocate()?;
     self.dirs.insert(h, path);
     Ok(HostDir(h))
   }
@@ -238,8 +247,7 @@ impl HostFs for OsHost {
       return Err(HostError::NotFile);
     }
     let file = std::fs::File::open(&path).map_err(|e| refusal(&e))?;
-    let h = self.next;
-    self.next += 1;
+    let h = self.allocate()?;
     self.files.insert(h, file);
     Ok(HostFile(h))
   }

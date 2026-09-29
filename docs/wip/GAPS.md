@@ -1826,6 +1826,52 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: open — the three-process CLI fleet test's takeover wait ran out once on CI
+
+CI run 36576662318 (`38c987e`, Ubuntu) failed
+`three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death` at `wait_successor`:
+neither survivor served the dead owner's volume within the fleet wait. Reproduced once in 6 runs in Linux
+Docker with io_uring (`seccomp=unconfined`). The next 44 runs passed, as did 8 of 8 on macOS. The failing
+run's state was not kept, so no cause is claimed. The wait now dumps each survivor's status and its last
+answer for the volume when it runs out, and a longer Docker loop is running to catch the next failure.
+
+### 2026-09-29: the no-panic sweep — ratcheted per crate, 8 of 29 crates clean; the SDKs' id parser panicked — fixed
+
+CLAUDE.md (banned item 6) forbids panics in shipped code: out-of-bounds indexing or slicing, string slicing
+off a character boundary, and overflowing arithmetic among them. The workspace lints deny `unwrap`,
+`expect`, `panic!`, `todo!`, `unimplemented!` and `unreachable!`. They did **not** deny `indexing_slicing`,
+`string_slice` or `arithmetic_side_effects`, though CLAUDE.md names them as enforced.
+
+**Measured 2026-09-29 on this host** (other platforms' `cfg` code aside), in library and binary code:
+- 285 indexing sites, 243 slicing sites and 39 string slices;
+- 1,077 arithmetic operations that can overflow;
+- 3 run-time `assert!`s, plus one compile-time `const` assert, which cannot panic.
+
+**The ratchet.** A clean crate's root carries
+`#![cfg_attr(not(test), deny(clippy::indexing_slicing, clippy::string_slice, clippy::arithmetic_side_effects))]`.
+Shipped builds are held to it and test builds are exempt. `cargo xtask structural` checks it: every shipped
+crate carries it unless it is on `NO_PANIC_PENDING`, and a pending crate that carries it fails, so the list
+only shrinks.
+
+Each crate is linted for all three platforms before it leaves the list:
+- macOS natively;
+- Linux in Docker;
+- Windows in a local image with the pinned toolchain and MinGW-w64, which also type-checks `cfg(windows)`
+  code this Mac cannot build (`zstd-sys`).
+
+**Clean (batch 1):** `base`, `bridge-oci`, `bridge-winfsp`, `cli`, `client`, `mcp`, `sdk-node`, `sdk-python`.
+- **The SDKs' volume-id parser panicked** on a 32-byte id holding a multi-byte character: string slicing
+  through the character. It would abort a user's Node or Python process in release. Failing tests came
+  first, in both SDK suites. [Bug record](../bugs/2026-09-29-the-sdks-sliced-a-volume-id-through-a-character.md).
+- The host's handle ids are allocated checked. An id space spent refuses as `EMFILE`
+  (`ERROR_TOO_MANY_OPEN_FILES` on Windows); it never wraps onto a live handle.
+- A WinFsp name scan stops at the longest name Windows can hold. A directory entry whose record would not
+  fit its `u16` size field is refused `STATUS_NAME_TOO_LONG`, where it was written with a clamped, wrong
+  size.
+- The Linux mount-table reader appends what it read and no longer slices at computed offsets.
+
+**Owed:** the 21 crates on the pending list, `xtask`, and then the workspace lint itself.
+
 ### 2026-09-29: a campaign asked no one while a session was out — fixed; exclusive session lending — open
 
 **Fixed.** The campaign counters (next entry) named the KIND lane's unanswered pre-elections. Over ten trials,

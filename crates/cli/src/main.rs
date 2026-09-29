@@ -16,6 +16,18 @@
 //! every flag is listed in one place with what it takes. No grant verb exists here yet: the
 //! grant surface of §4.13 arrives with Phase 2 task 8, and the ring channel refuses the kind.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
+
 use std::process::ExitCode;
 
 mod anchor;

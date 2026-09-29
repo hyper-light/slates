@@ -96,15 +96,25 @@ impl OsHost {
       next: 1,
       watcher: watch::Watcher::new(),
     };
-    let root = host.keep_dir(fd);
+    let root = host.keep_dir(fd)?;
     Ok((host, root))
   }
 
-  fn keep_dir(&mut self, fd: OwnedFd) -> HostDir {
+  /// The next handle id. Ids are never reused, so one is never recycled onto a handle still held; once the
+  /// id space is spent the host refuses as it would past its descriptor limit (`EMFILE`). (At one open a
+  /// nanosecond, a `u64` lasts 584 years.)
+  fn allocate(&mut self) -> Result<u64, HostError> {
     let h = self.next;
-    self.next += 1;
+    self.next = h.checked_add(1).ok_or(HostError::Unavailable(
+      rustix::io::Errno::MFILE.raw_os_error(),
+    ))?;
+    Ok(h)
+  }
+
+  fn keep_dir(&mut self, fd: OwnedFd) -> Result<HostDir, HostError> {
+    let h = self.allocate()?;
     self.dirs.insert(h, fd);
-    HostDir(h)
+    Ok(HostDir(h))
   }
 
   fn dir(&self, dir: HostDir) -> Result<&OwnedFd, HostError> {
@@ -117,7 +127,7 @@ impl OsHost {
 
   /// Open handles, for leak checks.
   pub fn open_handles(&self) -> usize {
-    self.dirs.len() + self.files.len()
+    self.dirs.len().saturating_add(self.files.len())
   }
 
   /// The descriptor behind a directory handle, for the landing crate's write verbs.
@@ -130,17 +140,18 @@ impl OsHost {
     self.file(file).map(AsFd::as_fd)
   }
 
-  /// Takes ownership of a directory descriptor the caller opened (with containment).
-  pub fn adopt_dir(&mut self, fd: OwnedFd) -> HostDir {
+  /// Takes ownership of a directory descriptor the caller opened (with containment); refused `EMFILE` once
+  /// the handle ids are spent ([`OsHost::allocate`]).
+  pub fn adopt_dir(&mut self, fd: OwnedFd) -> Result<HostDir, HostError> {
     self.keep_dir(fd)
   }
 
-  /// Takes ownership of a file descriptor the caller opened (a temporary).
-  pub fn adopt_file(&mut self, fd: OwnedFd) -> HostFile {
-    let h = self.next;
-    self.next += 1;
+  /// Takes ownership of a file descriptor the caller opened (a temporary); refused `EMFILE` once the
+  /// handle ids are spent ([`OsHost::allocate`]).
+  pub fn adopt_file(&mut self, fd: OwnedFd) -> Result<HostFile, HostError> {
+    let h = self.allocate()?;
     self.files.insert(h, fd);
-    HostFile(h)
+    Ok(HostFile(h))
   }
 }
 
@@ -213,7 +224,7 @@ impl HostFs for OsHost {
       rustix::io::Errno::LOOP => HostError::NotDirectory,
       other => refusal(other),
     })?;
-    Ok(self.keep_dir(fd))
+    self.keep_dir(fd)
   }
 
   fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
@@ -228,8 +239,7 @@ impl HostFs for OsHost {
     if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
       return Err(HostError::NotFile);
     }
-    let h = self.next;
-    self.next += 1;
+    let h = self.allocate()?;
     self.files.insert(h, fd);
     Ok(HostFile(h))
   }

@@ -595,14 +595,19 @@ unsafe fn wide_to_string(wide: Pwstr) -> String {
     return String::new();
   }
   let mut len = 0usize;
-  // SAFETY: `wide` is a NUL-terminated UTF-16 string per the contract; we scan to the NUL.
+  // SAFETY: `wide` is a NUL-terminated UTF-16 string per the contract; we scan to the NUL, and never past
+  // the longest string Windows can hand a file system (`MAX_WIDE_UNITS`).
   unsafe {
-    while *wide.add(len) != 0 {
-      len += 1;
+    while len < MAX_WIDE_UNITS && *wide.add(len) != 0 {
+      len = len.saturating_add(1);
     }
     String::from_utf16_lossy(std::slice::from_raw_parts(wide, len))
   }
 }
+
+/// Format: the most UTF-16 units a Windows path or name can hold — a `UNICODE_STRING` counts its length
+/// in bytes in a `u16`, so 32,767 units — where a scan of a WinFsp string stops, NUL or not.
+const MAX_WIDE_UNITS: usize = 32_767;
 
 extern "C" fn get_volume_info(fs: *mut FileSystem, out: *mut VolumeInfo) -> Ntstatus {
   // SAFETY: WinFsp passes our live file system and a writable VolumeInfo.
@@ -1031,20 +1036,31 @@ unsafe fn fill_directory(
       continue;
     }
     let name_utf16: Vec<u16> = name.encode_utf16().collect();
-    // FSP_FSCTL_DIR_INFO: the 104-byte head then the name bytes, `Size` covering both.
+    // FSP_FSCTL_DIR_INFO: the 104-byte head then the name bytes, `Size` covering both in a `u16`. A name
+    // whose record would not fit that field cannot be listed truthfully, so the listing is refused.
     let head = std::mem::size_of::<DirInfo>();
-    let size = head + name_utf16.len() * std::mem::size_of::<u16>();
+    let Some((name_bytes, size, record_size)) = name_utf16
+      .len()
+      .checked_mul(std::mem::size_of::<u16>())
+      .and_then(|name_bytes| {
+        let size = name_bytes.checked_add(head)?;
+        Some((name_bytes, size, u16::try_from(size).ok()?))
+      })
+    else {
+      return crate::status_name_too_long();
+    };
     let mut scratch = vec![0u8; size];
-    // SAFETY: `scratch` is `size` bytes, at least the DirInfo head; we write the head then the name.
+    // SAFETY: `scratch` is `size` bytes, the DirInfo head plus the name's bytes; we write the head then
+    // the name.
     unsafe {
       let dir_info = scratch.as_mut_ptr().cast::<DirInfo>();
-      (*dir_info).size = u16::try_from(size).unwrap_or(u16::MAX);
+      (*dir_info).size = record_size;
       (*dir_info).file_info = *info;
       (*dir_info).padding = [0u8; 24];
       std::ptr::copy_nonoverlapping(
         name_utf16.as_ptr().cast::<u8>(),
         scratch.as_mut_ptr().add(head),
-        name_utf16.len() * std::mem::size_of::<u16>(),
+        name_bytes,
       );
       if ffi::FspFileSystemAddDirInfo(
         scratch.as_mut_ptr().cast::<DirInfo>(),

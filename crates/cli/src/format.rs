@@ -54,10 +54,8 @@ pub(crate) fn parse_volume_id(text: &str) -> Result<VolumeId, String> {
     ));
   }
   let mut bytes = [0u8; 16];
-  for (index, byte) in bytes.iter_mut().enumerate() {
-    let pair = text
-      .get(index * 2..index * 2 + 2)
-      .ok_or_else(|| format!("`{text}` is not hexadecimal"))?;
+  for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+    let pair = std::str::from_utf8(pair).map_err(|_| format!("`{text}` is not hexadecimal"))?;
     *byte =
       u8::from_str_radix(pair, HEX_RADIX).map_err(|_| format!("`{text}` is not hexadecimal"))?;
   }

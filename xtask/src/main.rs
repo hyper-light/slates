@@ -412,6 +412,74 @@ mod structural {
 
   const WRITE_ALLOWED: &[&str] = &["slates-land"];
 
+  /// The shipped crates the no-panic sweep has not reached yet (CLAUDE.md banned item 6; GAPS 2026-09-29).
+  /// Every other shipped crate's root carries [`NO_PANIC_ATTRIBUTE`]. The list only shrinks: a crate on it
+  /// that already carries the attribute fails too, so a crate leaves the list in the change that cleans it.
+  const NO_PANIC_PENDING: &[&str] = &[
+    "slates-anchor",
+    "slates-archive",
+    "slates-bridge-core",
+    "slates-bridge-fskit",
+    "slates-bridge-fuse",
+    "slates-bridge-nfs",
+    "slates-bridge-virtiofs",
+    "slates-cluster",
+    "slates-conformance",
+    "slates-db",
+    "slates-ipc",
+    "slates-land",
+    "slates-machine",
+    "slates-mem",
+    "slates-merge",
+    "slates-rt",
+    "slates-server",
+    "slates-transport",
+    "slates-vfs",
+    "slates-wire",
+    "slates-wire-derive",
+  ];
+
+  /// Format: the crate-root attribute of the no-panic law, whitespace removed: outside test builds, deny
+  /// indexing or slicing that can fall out of bounds, string slicing off a character boundary, and
+  /// arithmetic that can overflow or divide by zero.
+  const NO_PANIC_ATTRIBUTE: &str = "#![cfg_attr(not(test),deny(clippy::indexing_slicing,clippy::string_slice,clippy::arithmetic_side_effects))]";
+
+  /// Whether `package`'s crate root (`src/lib.rs`, else `src/main.rs`) carries [`NO_PANIC_ATTRIBUTE`], and
+  /// a violation when that disagrees with [`NO_PANIC_PENDING`].
+  fn check_no_panic_ratchet(
+    package: &Package,
+    violations: &mut Vec<String>,
+  ) -> Result<(), Failure> {
+    let crate_dir = Path::new(&package.manifest_path)
+      .parent()
+      .ok_or_else(|| Failure(format!("{}: manifest has no directory", package.name)))?;
+    let root = [crate_dir.join("src/lib.rs"), crate_dir.join("src/main.rs")]
+      .into_iter()
+      .find(|path| path.is_file());
+    let Some(root) = root else {
+      return Ok(());
+    };
+    let compact: String = std::fs::read_to_string(&root)?
+      .chars()
+      .filter(|c| !c.is_whitespace())
+      .collect();
+    let carries = compact.contains(NO_PANIC_ATTRIBUTE);
+    let pending = NO_PANIC_PENDING.contains(&package.name.as_str());
+    if pending && carries {
+      violations.push(format!(
+        "{}: its root carries the no-panic attribute; remove it from NO_PANIC_PENDING",
+        package.name
+      ));
+    } else if !pending && !carries {
+      violations.push(format!(
+        "{}: its root ({}) lacks the no-panic attribute `{NO_PANIC_ATTRIBUTE}` (CLAUDE.md banned item 6)",
+        package.name,
+        root.display()
+      ));
+    }
+    Ok(())
+  }
+
   /// Runs the structural test over every shipped crate.
   pub(super) fn run() -> Result<(), Failure> {
     let root = workspace_root()?;
@@ -420,6 +488,7 @@ mod structural {
     for package in shipped_crates(&metadata) {
       check_dependencies(&metadata, package, &mut violations);
       check_sources(package, &mut violations)?;
+      check_no_panic_ratchet(package, &mut violations)?;
     }
     if violations.is_empty() {
       println!(

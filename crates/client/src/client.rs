@@ -688,7 +688,7 @@ impl Client {
         None => {}
         Some(ReplyBody::Attested) => {
           self.bound = true;
-          self.rebinds += 1;
+          self.rebinds = self.rebinds.saturating_add(1);
         }
         Some(ReplyBody::Refused { refusal }) => return Err(ClientError::Refused(refusal)),
         Some(_) => return Err(ClientError::UnexpectedReply { verb: "attest" }),
@@ -1401,7 +1401,7 @@ impl Client {
             return Err(ClientError::SessionTaken { assigned });
           }
           self.end = ClientEnd::connected(connected);
-          self.reconnects += 1;
+          self.reconnects = self.reconnects.saturating_add(1);
           self.bound = false;
           return Ok(());
         }

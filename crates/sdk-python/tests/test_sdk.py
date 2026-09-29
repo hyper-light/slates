@@ -149,6 +149,13 @@ class SlatesSdkRoundTrip(unittest.TestCase):
             snapshot = client.snapshot(volume)
             self.assertIsInstance(snapshot, int)
 
+            # A hostile volume id (the hostile-input rule for every parser of external bytes): 32 bytes whose
+            # first pair splits a multi-byte character is refused as SlatesError, and the process lives on.
+            # Before 2026-09-29 the parser sliced the string through the character and panicked.
+            with self.assertRaises(slates.SlatesError) as caught:
+                client.status("a\u20ac" + "0" * 28)
+            self.assertIn("not a hex byte", str(caught.exception))
+
             # status → the volume's real fields, read back over the same rings.
             status = client.status(volume)
             self.assertEqual(status["id"], volume)

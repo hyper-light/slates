@@ -19,6 +19,18 @@
 //! block (the same, rendered), the shape MCP clients expect. Volume ids cross the wire as lowercase
 //! hex, opaque to the agent and echoed back on every result.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
+
 use serde_json::{Value, json};
 use slates_client::{
   AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
@@ -1085,9 +1097,9 @@ fn hex_identity(text: &str) -> Result<[u8; 32], McpError> {
     return Err(bad());
   }
   let mut out = [0u8; 32];
-  for (index, pair) in text.as_bytes().chunks(2).enumerate() {
+  for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks(2)) {
     let hex = std::str::from_utf8(pair).map_err(|_| bad())?;
-    out[index] = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad())?;
+    *byte = u8::from_str_radix(hex, HEX_RADIX).map_err(|_| bad())?;
   }
   Ok(out)
 }
@@ -1362,12 +1374,11 @@ fn id_hex(id: VolumeId) -> String {
 /// Parses a volume id from 32 hex characters, or `None` when it is malformed.
 fn id_from_hex(text: &str) -> Option<VolumeId> {
   let mut bytes = [0u8; 16];
-  if text.len() != bytes.len() * 2 {
+  if text.len() != bytes.len().saturating_mul(2) {
     return None;
   }
-  for (i, byte) in bytes.iter_mut().enumerate() {
-    let pair = text.get(i * 2..i * 2 + 2)?;
-    *byte = u8::from_str_radix(pair, HEX_RADIX).ok()?;
+  for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
+    *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, HEX_RADIX).ok()?;
   }
   Some(VolumeId { bytes })
 }

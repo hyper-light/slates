@@ -20,6 +20,18 @@
 //!   delete through the Windows kernel, unmount — runs on the native Windows CI runner, the way the
 //!   FSKit handler's live mount runs on macOS.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
+
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
 
@@ -74,6 +86,10 @@ const STATUS_NOT_SAME_DEVICE: Ntstatus = Ntstatus(0xC000_00D4);
 const STATUS_DIRECTORY_NOT_EMPTY: Ntstatus = Ntstatus(0xC000_0101);
 /// Format: `STATUS_NOT_A_DIRECTORY` — a file was found where a directory was expected (`ENOTDIR`).
 const STATUS_NOT_A_DIRECTORY: Ntstatus = Ntstatus(0xC000_0103);
+/// Format: `STATUS_NAME_TOO_LONG` — a name longer than the call can carry (`ENAMETOOLONG`). Windows-only,
+/// as its one user, the mount host's directory listing.
+#[cfg(windows)]
+const STATUS_NAME_TOO_LONG: Ntstatus = Ntstatus(0xC000_0106);
 
 /// Format: the offset from the Windows `FILETIME` epoch (1601-01-01) to the Unix epoch (1970-01-01),
 /// in 100-nanosecond intervals — 11 644 473 600 seconds × 10^7. A `FILETIME` is 100-ns ticks since 1601,
@@ -96,7 +112,7 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// tick count), exactly as the FUSE bridge clamps a negative time to zero.
 pub fn filetime_from_unix_ns(ns: i64) -> u64 {
   let ns = u64::try_from(ns).unwrap_or(0);
-  ns / FILETIME_TICK_NS + FILETIME_UNIX_EPOCH_OFFSET
+  (ns / FILETIME_TICK_NS).saturating_add(FILETIME_UNIX_EPOCH_OFFSET)
 }
 
 /// The Windows file-attribute bits for a node kind (§4.6) — a directory, an ordinary file, or a symlink
@@ -139,6 +155,13 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
 #[cfg(windows)]
 pub(crate) fn status_unsuccessful() -> i32 {
   STATUS_UNSUCCESSFUL.as_i32()
+}
+
+/// `STATUS_NAME_TOO_LONG` as the FFI `i32` (a directory entry whose record would not fit the size field
+/// WinFsp's `FSP_FSCTL_DIR_INFO` gives it).
+#[cfg(windows)]
+pub(crate) fn status_name_too_long() -> i32 {
+  STATUS_NAME_TOO_LONG.as_i32()
 }
 
 /// `STATUS_OBJECT_NAME_NOT_FOUND` as the FFI `i32` (a lookup of a name that does not exist).

@@ -145,7 +145,9 @@ impl OsLand {
       return Err(TargetRefusal::TargetNotOwned);
     }
     let (mut host, _) = OsHost::open_root(Path::new("/")).map_err(TargetRefusal::Unavailable)?;
-    let dir = host.adopt_dir(current);
+    let dir = host
+      .adopt_dir(current)
+      .map_err(TargetRefusal::Unavailable)?;
     let target = LandingTarget {
       dir,
       key: if key.is_empty() {
@@ -185,7 +187,7 @@ impl OsLand {
       mode_bits(TEMP_MODE),
     )
     .map_err(refusal)?;
-    let file = self.host.adopt_file(fd);
+    let file = self.host.adopt_file(fd)?;
     self.temps.insert(
       file.0,
       Temp {
@@ -207,7 +209,7 @@ impl OsLand {
     );
     match opened {
       Ok(fd) => {
-        let file = self.host.adopt_file(fd);
+        let file = self.host.adopt_file(fd)?;
         self.temps.insert(
           file.0,
           Temp {

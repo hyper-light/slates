@@ -515,7 +515,7 @@ fn print_windows(windows: &[slates_ipc::protocol::MergeWindow]) {
       "  {} [{}..{}] class {}",
       window.path,
       window.at,
-      window.at + window.len,
+      window.at.saturating_add(window.len),
       window.class
     );
   }
