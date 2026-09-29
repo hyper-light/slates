@@ -47,7 +47,7 @@ use slates_server::{
 mod common;
 use std::net::TcpStream;
 
-use common::nfs::{create, lookup, mount, owner_and_mode, read, write};
+use common::nfs::{create, lookup, mount, owner_and_mode, read, read_status, write};
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
 use slates_server::fleet::{FLEET_FRAME_CAP, POLL_PER_PERIOD};
@@ -8330,6 +8330,242 @@ fn isolate_owner_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId]) {
   daemons[2]
     .inject_probe_deafness(&[hosts[0]])
     .expect("C stops answering A");
+}
+
+/// Format: `NFS3_OK` (RFC 1813 §2.6) — a READ served.
+const NFS3_OK: u32 = 0;
+/// Format: `NFS3ERR_ACCES` (RFC 1813 §2.6) — what a request through a handle whose capability does not
+/// authorize the volume answers (AUD-01).
+const NFS3ERR_ACCES: u32 = 13;
+/// Format: `NFS3ERR_STALE` (RFC 1813 §2.6) — what a handle to a volume the node's set does not hold answers.
+const NFS3ERR_STALE: u32 = 70;
+/// Format: `NFS3ERR_JUKEBOX` (RFC 1813 §2.6) — the retry-later status the mount answers while the owner lease
+/// is unconfirmed (§4.8 "Leases and reads"; AUD-08).
+const NFS3ERR_JUKEBOX: u32 = 10008;
+
+/// AC (§4.8 "Leases and reads"; AUD-08; §4.13 AUD-01): the owner-lease gate answers only for what a node
+/// holds, and only to a caller it authorizes. In a three-node `f = 1` fleet A holds a volume mounted over NFS
+/// under two capabilities, one of which it then ends, and a second volume it mounted and then destroyed; B
+/// holds a volume of its own. A is then isolated on the probe plane until its lease lapses. Before the lapse
+/// and after it alike:
+/// - a status of B's volume on A answers `NotFound`: A holds none of it;
+/// - a read through the destroyed volume's handle answers `NFS3ERR_STALE`: the volume is not in A's set;
+/// - a read through the ended capability's handle answers `NFS3ERR_ACCES`: authorization comes before the
+///   lease, so a lapse tells an unauthorized caller nothing about what A holds.
+///
+/// Non-vacuous: after the lapse the held volume's status refuses `LeaseUnconfirmed` and a read through its
+/// live capability answers `NFS3ERR_JUKEBOX`, where before it both served. Before the fix the three answers
+/// above all became the lease's refusal (the 2026-09-29 three-process failure: a peer that had not yet
+/// installed a configuration refused `LeaseUnconfirmed` for a volume it never held).
+#[test]
+fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let scene = set_the_lease_scene(&daemons);
+  let held = ObjectId(scene.held.bytes);
+  let confirmed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(held)
+  });
+  let before = observe_the_gate(&daemons[0], &scene);
+  isolate_owner_on_the_probe_plane(&daemons, &hosts);
+  let lapsed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(held).map(|holds| !holds)
+  });
+  let after = observe_the_gate(&daemons[0], &scene);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(confirmed, "A's lease was confirmed before the isolation");
+  assert!(lapsed, "A's lease lapsed once no holder confirmed it");
+  let answered_alike = GateView {
+    held_status: Answer::Served,
+    live_read: NFS3_OK,
+    ended_read: NFS3ERR_ACCES,
+    destroyed_read: NFS3ERR_STALE,
+    elsewhere_status: Answer::NotFound,
+  };
+  assert_eq!(
+    before, answered_alike,
+    "before the lapse A served what it holds"
+  );
+  assert_eq!(
+    after,
+    GateView {
+      held_status: Answer::LeaseUnconfirmed,
+      live_read: NFS3ERR_JUKEBOX,
+      ..answered_alike
+    },
+    "after the lapse the gate refused only the held, authorized reads"
+  );
+}
+
+/// The volumes and handles [`a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`] asks about.
+struct LeaseScene {
+  /// A volume A holds.
+  held: VolumeId,
+  /// A file handle in `held` under a capability that stays live.
+  live: Vec<u8>,
+  /// A file handle in `held` under a capability A has ended.
+  ended: Vec<u8>,
+  /// A file handle in a volume A mounted and then destroyed.
+  destroyed: Vec<u8>,
+  /// A volume B holds, which A does not.
+  elsewhere: VolumeId,
+}
+
+/// Sets the scene on A (`daemons[0]`) and B (`daemons[1]`): the held volume with `hello.txt` written through
+/// one capability and looked up through a second, which is then detached; a volume mounted, written and
+/// destroyed, waited out until A answers `NotFound` for it; and a volume B creates.
+fn set_the_lease_scene(daemons: &[Daemon]) -> LeaseScene {
+  let owner = &daemons[0];
+  let held = created_on(owner, "gate-held");
+  let live = hello_handle_over_nfs(owner, &capability_path(owner, "gate-held"), true);
+  let ended_path = capability_path(owner, "gate-held");
+  let ended = hello_handle_over_nfs(owner, &ended_path, false);
+  let mut client = Client::connect(owner.instance());
+  assert_eq!(
+    client.call(&RequestBody::Detach {
+      attachment: attachment_of(&ended_path),
+    }),
+    ReplyBody::Detached,
+    "the second capability's attachment ends"
+  );
+  let gone = created_on(owner, "gate-destroyed");
+  let destroyed = hello_handle_over_nfs(owner, &capability_path(owner, "gate-destroyed"), true);
+  assert_eq!(
+    client.call(&RequestBody::Destroy { volume: gone }),
+    ReplyBody::Destroyed,
+    "the mounted volume is destroyed"
+  );
+  let destroy_done = poll_until(&[owner], PLACEMENT_DEADLINE, || {
+    Ok(status_reply(owner, gone) == refused_with(Refusal::NotFound))
+  });
+  assert!(
+    destroy_done,
+    "the destroy completed: A holds the volume no longer"
+  );
+  let elsewhere = created_on(&daemons[1], "gate-elsewhere");
+  LeaseScene {
+    held,
+    live,
+    ended,
+    destroyed,
+    elsewhere,
+  }
+}
+
+/// What A answered, by path, for each part of the [`LeaseScene`].
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct GateView {
+  /// A status of the held volume.
+  held_status: Answer,
+  /// The NFS status of a READ through the held volume's live capability.
+  live_read: u32,
+  /// The NFS status of a READ through the capability A ended.
+  ended_read: u32,
+  /// The NFS status of a READ through the destroyed volume's handle.
+  destroyed_read: u32,
+  /// A status of B's volume on A.
+  elsewhere_status: Answer,
+}
+
+/// A verb's answer, as far as the owner-lease gate is concerned.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Answer {
+  /// Served with a report.
+  Served,
+  /// Refused `NotFound`.
+  NotFound,
+  /// Refused `LeaseUnconfirmed`.
+  LeaseUnconfirmed,
+  /// Anything else (the assertion then fails naming the view).
+  Other,
+}
+
+/// Asks `daemon` about every part of `scene`, over the client and over NFS.
+fn observe_the_gate(daemon: &Daemon, scene: &LeaseScene) -> GateView {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  GateView {
+    held_status: answer_of(&status_reply(daemon, scene.held)),
+    live_read: read_status(&mut stream, &scene.live, 1),
+    ended_read: read_status(&mut stream, &scene.ended, 2),
+    destroyed_read: read_status(&mut stream, &scene.destroyed, 3),
+    elsewhere_status: answer_of(&status_reply(daemon, scene.elsewhere)),
+  }
+}
+
+/// Classifies a reply for [`GateView`].
+fn answer_of(reply: &ReplyBody) -> Answer {
+  match reply {
+    ReplyBody::Status { .. } => Answer::Served,
+    ReplyBody::Refused {
+      refusal: Refusal::NotFound,
+    } => Answer::NotFound,
+    ReplyBody::Refused {
+      refusal: Refusal::LeaseUnconfirmed { .. },
+    } => Answer::LeaseUnconfirmed,
+    _ => Answer::Other,
+  }
+}
+
+/// Mounts `capability_path` on `daemon`'s NFS port and returns the handle of `hello.txt` in it: created and
+/// written with [`CONTENT`] when `create`, else looked up.
+fn hello_handle_over_nfs(daemon: &Daemon, capability_path: &str, create_it: bool) -> Vec<u8> {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, capability_path, 1);
+  if create_it {
+    let file_fh = create(&mut stream, &root_fh, "hello.txt", 2);
+    write(&mut stream, &file_fh, CONTENT, 3);
+    file_fh
+  } else {
+    lookup(&mut stream, &root_fh, "hello.txt", 2)
+  }
+}
+
+/// The attachment id the capability in `/<name>@<attachment_hex>.<token_hex>` names.
+fn attachment_of(capability_path: &str) -> u64 {
+  let (_, capability) = capability_path.rsplit_once('@').expect("a capability path");
+  let (attachment, _) = capability.split_once('.').expect("a capability");
+  u64::from_str_radix(attachment, 16).expect("a hexadecimal attachment id")
+}
+
+/// Creates a scratch volume named `name` on `daemon` through a fresh public client and returns its id.
+fn created_on(daemon: &Daemon, name: &str) -> VolumeId {
+  let mut client = Client::connect(daemon.instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create {name} on {}", daemon.instance());
+  };
+  id
+}
+
+/// The reply to one `Status` of `volume` on `daemon`, through a fresh public client; a missed deadline is
+/// kept as the refusal it produced, so the assertion names it.
+fn status_reply(daemon: &Daemon, volume: VolumeId) -> ReplyBody {
+  let mut client = Client::connect(daemon.instance());
+  client
+    .try_call(&RequestBody::Status { volume }, DEADLINE_NS)
+    .unwrap_or_else(|e| refused_placeholder(&e))
+}
+
+/// The reply refusing with `refusal`.
+fn refused_with(refusal: Refusal) -> ReplyBody {
+  ReplyBody::Refused { refusal }
 }
 
 /// The owner-lease contract on the isolated owner (§4.8 "Leases and reads"; AUD-08): before isolation it

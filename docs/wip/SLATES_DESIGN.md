@@ -2812,6 +2812,14 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > and the `lease.rs` unit tests. Owed: forwarding a node's own created volumes to their successors
 > after a same-id re-admission is the broader ledger transfer (GAP-A9-7); the A-9 `FencedRegister`
 > TLA+ revalidation still stands separately.
+>
+> **Status (2026-09-29).** The gate covers only what the node holds. The verb gate asks only about a
+> volume in the partition's catalog. The mount gate first authorizes the request's capability, then asks
+> only about a volume in the shard's set. A volume the node does not hold answers `NotFound`, or
+> `NFS3ERR_STALE` at the mount, and an unauthorized mount request answers `NFS3ERR_ACCES`, whatever the
+> lease's state (`docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md`;
+> regression `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`). Open: the mount's
+> synthetic root returns a volume root's attributes, at `LOOKUP` and `READDIRPLUS`, without the gate (GAPS).
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the

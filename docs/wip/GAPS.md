@@ -1826,6 +1826,26 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: the lease gate refused volumes the node did not hold — fixed; the synthetic root serves attributes ungated — open
+
+**Fixed.** CI run 36560510107 (`5836a8c`, Ubuntu) failed the three-process CLI fleet test. A survivor answered
+`LeaseUnconfirmed { version: 0 }` for a volume it never held, where the answer is `NotFound`. It had no
+configuration installed yet, and the owner-lease gate (AUD-08) asked about any volume a latest-state verb
+named, held or not.
+- The verb gate now applies only to a volume the partition's catalog holds.
+- The mount gate now authorizes first, then gates only a volume in the shard's set. An unauthorized request
+  answers `NFS3ERR_ACCES` and a destroyed volume's handle `NFS3ERR_STALE`, whatever the lease's state. A
+  lapse had turned both into `NFS3ERR_JUKEBOX`, which a hard mount retries without end.
+- The failing test came first (`a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`), and the
+  fleet suite passes 55 of 55.
+[Bug record](../bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
+
+**Open — the synthetic root returns a volume root's attributes without the lease.** Its `LOOKUP` of a volume's
+name and its `READDIRPLUS` entries go through `root_object`, which no lease gate covers. Only handle-based
+procedures meet the gate. RFC 1813 makes the object attributes in both replies optional, so a lapsed owner
+could return the handle alone and let the client's next `GETATTR` meet the gate. Owed: the seam change and a
+failing test first.
+
 ### 2026-09-29: KIND succession — a round with no reply yet gave up at its lookahead — fixed; a symmetric partition never healed — fixed; a survivor's record session drops after a leader's loss — open
 
 **Built.** The KIND lane's succession measurement (`cargo xtask kind succession`; `docs/wip/kind-lane.md`,

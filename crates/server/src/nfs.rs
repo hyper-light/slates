@@ -173,24 +173,31 @@ impl VolumeSet for ShardVolumeSet {
       if !s.consensus_ready {
         return Some(io_failure_reply(procedure));
       }
-      // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): the mount serves the volume's **live tree**
-      // — its latest state — so while this node's authority over the object is unconfirmed (cut off, paused
-      // past the lease bound, or superseded by a newer configuration) every procedure answers `NFS3ERR_JUKEBOX`,
-      // the retry-later status, rather than a stale view a successor may have advanced. This runs on the
-      // owner shard (`with_export` serves only a volume this shard holds), so the lease read here is the
-      // owner's; a client mounting elsewhere reaches this owner through `serve_remote`.
-      if crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_some() {
-        return Some(Some(status_failure_reply(Nfsstat3::Jukebox, procedure)));
-      }
       // The authorization gate (§4.13; AUD-01): the request runs under the rights its mount capability
       // was granted — the attachment `attach` created after checking the volume's access list for the
       // caller's principal — validated here against the attachment record for *this* volume. A request
       // with no capability, a wrong or forged one, or one for another volume — an unbound TCP client, a
       // wrong consumer, any uid — is refused `NFS3ERR_ACCES` before any effect, where the edge used to
-      // fabricate unconditional read/write from the uid alone.
+      // fabricate unconditional read/write from the uid alone. It comes first, before the lease: an
+      // unauthorized caller is told the same thing whatever the lease's state, so a lapse cannot tell it
+      // which volumes this node holds.
       let Some((capability, rights)) = authorized_rights(s, volume, capability) else {
         return Some(Some(status_failure_reply(Nfsstat3::Acces, procedure)));
       };
+      // The owner-lease gate (§4.8 "Leases and reads"; AUD-08): the mount serves the volume's **live tree**
+      // — its latest state — so while this node's authority over the object is unconfirmed (cut off, paused
+      // past the lease bound, or superseded by a newer configuration) every procedure answers `NFS3ERR_JUKEBOX`,
+      // the retry-later status, rather than a stale view a successor may have advanced. This runs on the
+      // owner shard, so the lease read here is the owner's; a client mounting elsewhere reaches this owner
+      // through `serve_remote`. Only a volume in this shard's set is gated: `with_export` serves nothing else,
+      // and the router answers such a handle `NFS3ERR_STALE` (a destroyed volume's), which a lapse must not
+      // turn into a retry-later
+      // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
+      if s.by_id.contains_key(&volume)
+        && crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_some()
+      {
+        return Some(Some(status_failure_reply(Nfsstat3::Jukebox, procedure)));
+      }
       let requester = (subject, groups, dialect);
       let reply = with_export(s, volume, requester, rights, capability, |export| {
         export.serve_nfs(procedure, args)

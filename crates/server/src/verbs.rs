@@ -2108,7 +2108,14 @@ fn dispatch(
   // is **not** gated (`serves_latest_state` returns `None`) — it keeps its separate contract. Placement
   // writes are separately gated by durability and, at `f > 0`, do not publish acceptance until the record
   // commits at the quorum (AUD-11), so they cannot return a stale success.
+  //
+  // Only an object this partition's catalog holds is gated: every latest-state verb answers from that
+  // catalog record, so a volume with none is `NotFound` whatever the lease says, and this node has no
+  // latest state of it to serve stale. A holder that keeps a peer's records but not its volume, or a node
+  // that has not yet installed a configuration, answers `NotFound` for it, never `LeaseUnconfirmed`
+  // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
   if let Some(volume) = serves_latest_state(&body)
+    && state.db.partition().volume(to_db_volume(volume)).is_some()
     && let Some(version) = lease_unconfirmed(state, ObjectId(volume.bytes))
   {
     return refused(Refusal::LeaseUnconfirmed { version });
