@@ -1971,10 +1971,21 @@ visible to clients.
   idle shards used 28–62 s of CPU in 190 s, 15–32 % of a core each. Now client work opens the idle window
   and the shard spins out only what is left of it. The same fleet's shards used 2.3–3.6 s in 190 s
   (`docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md`).
-- **Found while measuring, open — the provisioning histogram cannot run.** `provision_bench`, the R9 gate,
-  aborts at its create-destroy loop with `Refused(BudgetExceeded { available: 1478 })` after 51 "a volume
-  was not imaged, skipped: ESTALE" lines. It does the same at `fd7b7b0`, before A-42, so the cause is
-  older. The last recorded run is 2026-09-05. Owed: the cause, a fix, and the histogram re-recorded.
+- **Found while measuring, and fixed — the provisioning histogram could not run.** `provision_bench`, the
+  R9 gate, aborted at its create-destroy loop with `Refused(BudgetExceeded { available: 1478 })`: 832
+  volumes it had destroyed still held partition 0's version slots.
+  - A destroy forwarded to a shard with no client of its own was never stepped: slices ran only in that
+    shard's serve rounds.
+  - Every publish imaged the volumes mid-destroy and logged ESTALE for each.
+  - Now the destroy wakes its owner's serve loop, the reaper's cadence steps destroys too, and a publish
+    leaves out volumes being destroyed
+    (`docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md`).
+- **Open — the provisioning path is slower than R9's floor.** The histogram runs again, and fails the floor
+  on a loaded host (load 10–14): one spinning client's create at p50 52 µs and p99 177 µs, a status round
+  trip at p50 16 µs. The quiet-host record of 2026-09-05 was p50 ~9 µs and p99 ~25 µs. That the create is
+  36 µs dearer than a status round trip points at the create path itself: the per-verb shard publish
+  re-images every volume and writes the frame (docs/wip/recovery.md owes the incremental publish).
+  - Owed: a profile of the create path, the cause fixed, and the histogram recorded on a quiet host.
 
 **Open, explained — retired peers' seed ids held alive.** Explained by the restarts above (a restarted
 daemon's fresh fleet node seeds every manifest peer alive and re-learns only the peers that reach it); owed:

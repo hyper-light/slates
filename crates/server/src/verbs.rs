@@ -2228,7 +2228,9 @@ fn dispatch(
     match publish_shard(state) {
       Ok(published)
         if touched.is_some_and(|volume| {
-          state.by_id.contains_key(&volume) && !published.captured(volume)
+          state.by_id.contains_key(&volume)
+            && !published.captured(volume)
+            && !published.destroying(volume)
         }) =>
       {
         return refused(refusal_of_vfs(&slates_vfs::VfsError::RecoveryIncomplete));
@@ -4761,6 +4763,14 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
   {
     return refused(refusal_of_vfs(&e));
   }
+  // The destroy is stepped in this shard's serve rounds (`step_destroys`), which otherwise run only for
+  // this shard's own clients: a destroy forwarded here from another shard's client would wait, its
+  // reservation held, until one of this shard's clients spoke
+  // (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md). The round, woken, keeps
+  // running while any destroy is unfinished.
+  if let Some(task) = state.server_task {
+    slates_rt::registry::wake(task.0);
+  }
   ReplyBody::Destroyed
 }
 
@@ -4823,7 +4833,6 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     .collect();
   let mut any = false;
   for (id, handle) in destroying {
-    any = true;
     let done = match state.volumes.get_mut(handle) {
       Ok(slot) => matches!(
         slot.volume.destroy_step(&mut state.store, budget.max(1)),
@@ -4831,6 +4840,8 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
       ),
       Err(_) => true,
     };
+    // A slice ran; the round goes on while it has more (the serve loop keeps stepping).
+    any |= !done;
     if done {
       // If this volume is a clone, capture its pin on the origin snapshot before the record goes, so
       // the pin can be released once its destroy completes (§4.5): the origin can then reclaim that
@@ -4841,9 +4852,21 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         .lineage(id)
         .map(|e| (e.origin_volume, e.origin_snapshot));
       let now = state.clock.monotonic_ns();
-      let _ = state
+      if let Err(e) = state
         .db
-        .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now);
+        .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
+      {
+        // Not recorded: the volume keeps its slot and credits, counted by the refusal's name, and is
+        // recorded again at the reaper's next cadence (`reap_loop` steps destroys), not in a busy round
+        // — before 2026-09-29 the refusal was discarded and the tables let go of a volume the catalog
+        // still held.
+        *state
+          .refusals
+          .entry(refusal_name(&refusal_of_db(&e)))
+          .or_insert(0) += 1;
+        continue;
+      }
+      any = true;
       if let Some((origin_volume, origin_snapshot)) = origin_pin
         && let Some(origin_handle) = state.by_id.get(&origin_volume).copied()
       {
@@ -6372,8 +6395,12 @@ pub struct Published {
   /// inferred captured from an empty omission list (AUD-05).
   pub volumes: Vec<DbVolumeId>,
   /// Volumes skipped because they could not be imaged (an overlay with base-backed inodes, whose base
-  /// recovery is its own gate); every other volume of the shard is in the committed image.
+  /// recovery is its own gate); every other volume of the shard is in the committed image or being
+  /// destroyed.
   pub skipped: Vec<DbVolumeId>,
+  /// Volumes left out because they are being destroyed: their catalog record says so and recovery
+  /// completes a recorded destroy without an image (`complete_recovered_destroys`), so none is owed.
+  pub destroying: Vec<DbVolumeId>,
   /// The committed frame's bytes (the image plus its slot header), what the slot now holds.
   pub frame_bytes: usize,
 }
@@ -6383,6 +6410,11 @@ impl Published {
   /// data-plane mutation touched.
   pub fn captured(&self, volume: DbVolumeId) -> bool {
     self.volumes.contains(&volume)
+  }
+
+  /// Whether `volume` was left out because it is being destroyed (nothing of it is owed to recovery).
+  pub fn destroying(&self, volume: DbVolumeId) -> bool {
+    self.destroying.contains(&volume)
   }
 }
 
@@ -6406,6 +6438,17 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
   for handle in handles {
     let slot = state.volumes.get_mut(handle)?;
+    // A volume being destroyed carries nothing to recover, and its destroy slices release its tree as
+    // they go: imaging it walked released nodes (ESTALE), counted a false skip and printed a line on
+    // every publish while a destroy ran — 31,378 in one provisioning histogram, each inside a verb
+    // (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md).
+    if matches!(
+      slot.volume.state(),
+      slates_vfs::volume::VolumeState::Destroying | slates_vfs::volume::VolumeState::Destroyed
+    ) {
+      published.destroying.push(slot.id);
+      continue;
+    }
     match slot.volume.to_image(
       &state.store,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
@@ -6421,11 +6464,15 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       // touched volume against the returned coverage; an omitted volume never receives a stable
       // acknowledgement, and recovery refuses it instead of rebuilding empty (§4.8, AUD-05).
       Err(e) => {
-        crate::daemon::PUBLISH_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        eprintln!(
-          "slates-server: partition {}: a volume was not imaged, skipped: {e}",
-          state.partition
-        );
+        // Counted every time and logged once: the publish runs inside every mutating verb, so a line
+        // per volume per publish was an unbounded log on a verb's latency path.
+        if crate::daemon::PUBLISH_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+          eprintln!(
+            "slates-server: partition {}: a volume was not imaged, skipped: {e} (first occurrence; \
+             later ones are counted)",
+            state.partition
+          );
+        }
         published.skipped.push(slot.id);
       }
     }
@@ -6804,6 +6851,54 @@ mod tests {
     HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// §4.8 (the recovery image) and §4.4 (destroy): a volume being destroyed has nothing to recover —
+  /// recovery completes a recorded destroy from the catalog — so a shard publish leaves it out rather
+  /// than image a tree its destroy slices have released. Before 2026-09-29 every publish during a destroy
+  /// walked the released tree, failed `ESTALE`, counted the volume skipped and printed a line: 31,378
+  /// lines in one provisioning histogram, each inside a verb's latency
+  /// (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md). Do: create a volume,
+  /// destroy it through the verb (whose own barrier must still accept), run one destroy slice so its tree
+  /// is released while it is still being destroyed, then publish. Expect: nothing skipped, and the volume
+  /// neither captured nor refused.
+  #[test]
+  fn a_publish_leaves_out_a_volume_being_destroyed() {
+    crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid { uid: 1234 };
+      let reply = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Create {
+          name: "tearing-down".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id } = reply else {
+        panic!("{reply:?}")
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Destroy { volume: id },
+      );
+      assert!(
+        matches!(reply, super::ReplyBody::Destroyed),
+        "the destroy's own barrier accepts: {reply:?}"
+      );
+      assert!(
+        super::step_destroys(state),
+        "one slice ran and the destroy is not yet recorded"
+      );
+      let published = super::publish_shard(state).expect("the shard publishes");
+      assert!(published.skipped.is_empty(), "{published:?}");
+      assert!(!published.captured(super::to_db_volume(id)));
+    });
+  }
 
   /// AC-5.2 / A-26: takeover reconstructs linked IPC names as one inode, including archived owners.
   #[test]

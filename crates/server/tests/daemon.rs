@@ -434,6 +434,66 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
   drop(daemon);
 }
 
+/// Shape: volumes the destroy test creates — enough hashed names that both of the fixture's shards own
+/// some (checked, not assumed).
+const DESTROY_SPREAD: usize = 8;
+
+/// Each shard's live volumes and committed bytes, from the daemon's status.
+fn shard_holdings(client: &mut Client) -> Vec<(u64, u64)> {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    panic!("status");
+  };
+  report
+    .shards
+    .iter()
+    .map(|shard| (shard.volumes, shard.committed_bytes))
+    .collect()
+}
+
+/// §4.3 "bounded work" and §4.4 "destroy": a destroy is stepped to completion on the volume's owner shard
+/// whether or not that shard has a client of its own. Before 2026-09-29 an owner stepped destroys only in
+/// its serve loop's rounds, which run for its own clients' rings, so a destroy forwarded to a shard with no
+/// client stayed `Destroying` with its reservation held: the provisioning histogram left 832 undestroyed
+/// 1 MiB volumes on one partition, exhausted its version slots and could not run
+/// (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md). Do: create volumes
+/// whose names place them on every shard, destroy them all, then read each shard's holdings. Expect: every
+/// shard back to no volume and no committed byte within the credit wait.
+#[test]
+fn a_destroy_completes_on_an_owner_shard_that_has_no_client() {
+  let (daemon, instance) = daemon("destroy-owner");
+  let mut client = Client::connect(&instance);
+  let mut ids = Vec::new();
+  for n in 0..DESTROY_SPREAD {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("spread-{n}"))) else {
+      panic!("create spread-{n}");
+    };
+    ids.push(id);
+  }
+  let spread = shard_holdings(&mut client);
+  assert!(
+    spread.iter().all(|(volumes, _)| *volumes > 0),
+    "the names place volumes on every shard: {spread:?}"
+  );
+  for id in ids {
+    assert!(matches!(
+      client.call(&RequestBody::Destroy { volume: id }),
+      ReplyBody::Destroyed
+    ));
+  }
+  let started = Instant::now();
+  loop {
+    let holdings = shard_holdings(&mut client);
+    if holdings.iter().all(|held| *held == (0, 0)) {
+      break;
+    }
+    assert!(
+      started.elapsed() < CREDIT_WAIT,
+      "a destroy never completed on its owner: {holdings:?} (volumes, committed bytes per shard)"
+    );
+  }
+  drop(daemon);
+}
+
 /// §4.7 "Shards poll rings while any client has activity within the measured idle window" (A-42): a shard
 /// spins before it parks only within the window its clients' last activity opened. Before 2026-09-29 the
 /// first client's handoff set its shard spinning before every park for good: an idle solo daemon went

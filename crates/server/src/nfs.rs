@@ -1493,6 +1493,7 @@ mod tests {
     let published = crate::verbs::Published {
       volumes: vec![captured],
       skipped: vec![omitted],
+      destroying: Vec::new(),
       frame_bytes: 1,
     };
     let success = || {

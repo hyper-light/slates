@@ -157,7 +157,10 @@ volume.
    carries the content handoff so a daemon that attaches by handoff (the restart test) adopts it too.
    `init_shard` opens the object and takes this shard's slice (`ShardState.content`/`content_range`).
    A control mutation that changes the volume set or roots (create, clone, resize, destroy) republishes
-   the shard's `ShardImage` into its slice (`publish_shard`); `rebuild_recovered` reads it back and
+   the shard's `ShardImage` into its slice (`publish_shard`), leaving out any volume being destroyed —
+   its record says so and recovery completes it from the catalog (2026-09-29; imaging one mid-destroy
+   walked released nodes, `docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md`);
+   `rebuild_recovered` reads it back and
    rebuilds each recovered volume through `from_image` (its prefix, tree and content restored — fixing
    BUG-11's empty recreate and prefix reassignment), refusing `RecoveryIncomplete` for a db volume with
    no image rather than presenting it empty. Gated by the existing client restart test, now threading

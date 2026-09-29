@@ -1264,7 +1264,12 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
   grant through the CLI or a confirmation surface; the landing then runs and the report lists
   every entry's outcome. The only verb that writes a host path.
 - destroy(volume): mark Destroying, refuse new attachments, recall leases, walk deadlists and
-  unique chunks in cooperative slices, release quota, tombstone; the base directory is untouched.
+  unique chunks in cooperative slices on the owner shard — driven there whether or not the owner has a
+  client of its own (the verb wakes the owner's serve rounds; the reaper's cadence retries a refused
+  record) — release quota, tombstone; the base directory is untouched. A volume being destroyed is left
+  out of the shard's recovery image (its record says Destroying; recovery completes it). Before 2026-09-29
+  a destroy forwarded to a shard without a client was never stepped
+  (`docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md`).
 - move/rename across volumes: refused (`CrossVolumeMove`); the SDK offers clone-subtree + unlink.
 - Merge verbs (D-27, §4.16): `submit(work_volume, evidence?) → Accepted{version} | Conflict{windows}`
   (seal, compose, send the increment to the green's owner, park, resume with the verdict);

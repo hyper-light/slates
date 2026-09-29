@@ -2457,6 +2457,9 @@ async fn reap_loop() {
     futures::sleep(cadence).await;
     state::with_state(|s| {
       let _ = verbs::expire_leases(s);
+      // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
+      // (`verbs::step_destroys`), rather than in a busy serve round.
+      let _ = verbs::step_destroys(s);
     });
     let reaped = crate::reap::sweep(cadence).await;
     if reaped > 0 {
