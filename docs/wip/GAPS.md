@@ -1826,7 +1826,7 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
-### 2026-09-29: the three-process CLI fleet test's takeover wait ran out — a member that missed its promotion refused every election, fixed; a takeover stalled when a survivor never received the head, open
+### 2026-09-29: the three-process CLI fleet test's takeover wait ran out — a member that missed its promotion refused every election, fixed; a takeover stalled when a survivor never received the head, fixed
 
 CI run 36576662318 (`38c987e`, Ubuntu) failed
 `three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death` at `wait_successor`:
@@ -1898,7 +1898,19 @@ Built next: the owner's side (step 2 of 3).
   re-placed, so its owner stays unsettled (safe: joint writes go on); and a node re-admitted under its old id
   never settles its stale volumes.
 
-Owed: the takeover itself (step 3).
+Built last: the takeover itself (step 3 of 3), replacing the per-object path.
+- Each retirement freezes the members its successors are ranked among, so installs taken in any order agree.
+- Holders resolve each object by the configuration's lineage, through a successor that retired before
+  confirming.
+- A retired id is not admitted again while a kept retirement names it.
+- Each owing survivor runs one paged phase-one round per retired host (stream 16). A holder that holds
+  nothing answers too, and its complete answer is its empty promise.
+- An object is adopted once `f + 1` of each recovery cohort promised, then re-committed under the successor's
+  placement.
+- Survivors confirm their shares, and stale copies are reclaimed.
+- CI run 36593853664 had failed on this stall: the survivor holding the head had a takeover pending, the
+  other held nothing.
+- The deterministic test that failed in 61.8 s passes in 8.67 s, covering both successors in one run.
 
 **Built for it:** status now reports the control shard's held record copies, pending takeovers and installed
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a

@@ -32,18 +32,18 @@
 //!   socket each period and re-establishing a lost one — per peer, so one slow link never stalls the rest;
 //! - the one **record-plane coordinator** ([`run_record_plane`]) borrows those sessions for each dispatch,
 //!   so each period it ships each unplaced head to **all** its candidate holders in one commit (§4.8 "records
-//!   are sent to all candidates; committed at `f + 1`") and **drives any owed takeover** over **all** the
-//!   object's surviving holders — the `f + 1` promise quorum a takeover needs, several holders at `f > 1` —
-//!   and recovers the sessions of holders still in flight past an early quorum ([`Stragglers`]).
+//!   are sent to all candidates; committed at `f + 1`") and **drives any owed takeover**, one batched round
+//!   per retired host ([`crate::takeover`]), and recovers the sessions of holders still in flight past an
+//!   early quorum ([`Stragglers`]).
 //!
-//! **Takeover phase-one recovery** (§4.8 "Promotion and takeover"): when a peer dies, the probe loop records
-//! the objects `sync_peer` reassigns to this node ([`ShardState::pending_takeovers`]) and brings every held
-//! acceptor's authority into step with the routing view ([`reconcile_held_authority`] — the successor is
-//! installed, so a holder answers the new owner's prepare and accepts its re-commit); the coordinator then
-//! promotes the object over all surviving candidate holders and re-commits the adopted head under the new
-//! epoch, recording the placement so the verbs read the head owned and region-placed. The serve loop answers
-//! a `Prepare` from the same durable hold ([`serve_held_promotion`]). This is the general `f`-tolerant form
-//! (proven at `f = 1` over three nodes and `f = 2` over five, the promotion spanning a multi-holder quorum).
+//! **Takeover** (§4.8 "Promotion and takeover"; [`crate::takeover`]): when the council retires a host, every
+//! holder resolves each object it holds to the successor the committed configuration's lineage names
+//! ([`crate::takeover::resolve_held_objects`]) and brings its acceptor's authority into step
+//! ([`reconcile_held_authority`]); each survivor that owes a confirmation runs one phase-one round for the
+//! retired host across its recovery neighbourhoods — holders answering in pages, a holder that holds nothing
+//! answering too — adopts each object once its cohorts have promised, re-commits it under its own placement at
+//! the round's epoch, and confirms its share to the council. The serve loop answers a page from the same
+//! durable holds ([`crate::takeover::serve_host_prepare`]).
 //!
 //! **Content replication and serve** (§4.10 "Content replication"; §4.8 mechanism 1): each owned volume's
 //! newest snapshot is archived in bounded slices ([`advance_seals`], the vfs `SnapshotArchiver`), its
@@ -93,16 +93,16 @@ use slates_cluster::timing::{
   quorum_priority, round_budget,
 };
 use slates_cluster::{
-  ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, TimedReply, broadcast,
-  commit_record, promote_record, request_within,
+  ClusterError, CommitBudget, RECORD_STREAM, Stragglers, TimedReply, broadcast, commit_record,
+  request_within,
 };
 use slates_db::Op;
 use slates_db::catalog::{
   PlacementState, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord,
 };
 use slates_db::register::{
-  Acceptor, Authority, DomainId, FIRST_EPOCH, HostEpoch, HostId, ObjectId, Placement, Prepare,
-  Quorum, Record, RegionId, RegisterError, candidates_for, encode_refusal,
+  Acceptor, Authority, DomainId, HostEpoch, HostId, ObjectId, Placement, Quorum, Record, RegionId,
+  RegisterError, encode_refusal,
 };
 use slates_rt::futures;
 use slates_rt::udp::UdpSocket;
@@ -2604,18 +2604,14 @@ async fn serve_peer_records(
                 })
               })
               .unwrap_or_default(),
-            PROMOTE_STREAM => Prepare::decode(&request)
-              .ok()
-              .and_then(|prepare| {
-                state::with_state(|s| {
-                  let peer_host = s
-                    .learned_members
-                    .get(&peer_anchor)
-                    .map_or(seed, |learned| learned.host);
-                  serve_held_promotion(s, peer_host, &prepare)
-                })
-              })
-              .unwrap_or_default(),
+            crate::takeover::TAKEOVER_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::takeover::serve_host_prepare(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
             stream if is_content_stream(stream) => state::with_state(|s| {
               // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
               // refuses every content put, counted, so an owner's record is shown to wait on it.
@@ -2699,61 +2695,10 @@ async fn serve_peer_records(
   }
 }
 
-/// Answers a new owner's phase-one [`Prepare`] from this node's durable hold of the object (§4.8 "every
-/// holder raises its fence for that host to the new epoch and reports the highest record it holds"): runs
-/// the prepare through the object's acceptor — which authorizes the new owner and generation the takeover
-/// installed ([`reconcile_held_authority`]), raises the fence to the prepare's epoch, and reports the
-/// highest record this node holds for the object — and replies with the binding [`Promise`], or an empty
-/// reply if this node holds nothing for the object or the acceptor refuses (a foreign generation, an
-/// unauthorized owner, or an epoch below the fence), so the new owner counts nothing.
-///
-/// **The departed owner's lease first** (§4.8 "Leases and reads", AUD-08). The owner's lease needs
-/// `others − f` fresh confirmations so that every `f + 1` promotion quorum contains a holder that confirmed it
-/// ([`crate::lease::confirmations_needed`]); that intersection protects a read only if **every** promising holder
-/// refuses while its own answers may still feed the lease, not only the successor. So a holder that answered
-/// the departed owner's probe within the membership horizon, and has not heard that owner acknowledge its
-/// retirement, promises nothing yet ([`crate::lease::AnswersGiven::promotion_open`]), counted
-/// [`PROMOTION_DEFERRED`]; the successor retries next period. Before 2026-09-29 only the successor applied the
-/// gate, so an owner cut off from all but one holder kept its lease on that holder's answers while that holder
-/// promised the successor.
-pub(crate) fn serve_held_promotion(
-  state: &mut ShardState,
-  peer_host: HostId,
-  prepare: &Prepare,
-) -> Vec<u8> {
-  if prepare.owner != peer_host {
-    return encode_refusal(&RegisterError::Unauthorized);
-  }
-  if let Some(departed) = state.departed_owners.get(&prepare.object)
-    && !state.answers_given.promotion_open(
-      departed.owner,
-      departed.since_version,
-      slates_machine::clock::monotonic_ns(),
-    )
-  {
-    *state.refusals.entry(PROMOTION_DEFERRED).or_insert(0) += 1;
-    return Vec::new();
-  }
-  match state.holder_records.get_mut(&prepare.object) {
-    Some(acceptor) => match acceptor.prepare(prepare) {
-      Ok(promise) => promise.encode(),
-      Err(_) => Vec::new(),
-    },
-    None => Vec::new(),
-  }
-}
-
 /// The status refusal count under which a holder records a register record it refused because a test told
 /// it to refuse that owner's records ([`crate::daemon::Daemon::inject_record_refusal`]); never in production.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
-
-/// The status refusal count under which a holder records a successor's prepare it deferred because its own
-/// answers to the departed owner's probes may still feed that owner's lease ([`serve_held_promotion`]; §4.8
-/// "Leases and reads", AUD-08). It rises for at most the membership horizon after the holder last answered the
-/// departed owner; the successor retries each period.
-/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
-const PROMOTION_DEFERRED: &str = "fleet.promotion.deferred";
 
 /// Brings every held acceptor's authority into step with the routing view (§4.8 "distributing the
 /// taken-over authority to the holders"): for each object this node holds a copy of, installs the object's
@@ -4829,7 +4774,7 @@ async fn report_settlement(
 /// the council, else sent to every voter it holds a session to over [`REPORT_STREAM`], where the leader
 /// proposes it. Counted [`REPORT_SENT`]. The sessions return with the replies; a late reply is dropped (the
 /// caller reports again next period if the configuration does not show it).
-async fn send_council_report(
+pub(crate) async fn send_council_report(
   command: slates_cluster::config_group::ConfigCommand,
   local: HostId,
   budget: CommitBudget,
@@ -5985,54 +5930,29 @@ fn sync_config_from_council(local: HostId) {
         .as_ref()
         .and_then(|membership| membership.durability),
     );
-    // The owner each held object had *before* this install, and the version that is retiring some of them,
-    // so a takeover this install produces records who departed and when — the holder-side promotion gate
-    // (§4.8 "Leases and reads", AUD-08) reads it to keep a successor from promoting an object before the
-    // departed owner's lease can have expired.
-    let since_version = configuration.version;
-    let pre_owners: std::collections::BTreeMap<ObjectId, HostId> = s
-      .holder_records
-      .keys()
-      .filter_map(|object| s.fleet.object_owner(*object).map(|owner| (*object, owner)))
-      .collect();
     // This node installed a newer configuration: any supersession it learned is resolved at or below it,
     // so its own lease can hold again once holders confirm it under the new version; the bounded startup
     // allowance restarts from now (a takeover under this version cannot yet have committed).
     s.lease
       .installed(configuration.version, slates_machine::clock::monotonic_ns());
-    for reassignment in s.fleet.install_configuration(configuration, &members) {
-      s.pending_takeovers.insert(reassignment.object);
-    }
-    // Every held object whose owner this install retired keeps its departed owner, at **every** holder and not
-    // only at the successor: each holder gates its own promise on that owner's lease
-    // ([`serve_held_promotion`]), and the successor gates its takeover on the same record ([`takeovers`]).
-    for (object, owner) in pre_owners {
-      let reassigned = s
-        .fleet
-        .object_owner(object)
-        .is_some_and(|successor| successor != owner);
-      if reassigned && !members.contains(&owner) {
-        s.departed_owners.insert(
-          object,
-          crate::lease::DepartedOwner {
-            owner,
-            since_version,
-          },
-        );
-      }
-    }
+    s.fleet.install_configuration(configuration, &members);
     // Raise the fence for every held object to its owner's committed fencing epoch (§4.8 "every holder
     // raises its fence for that host to the new epoch"). A failed owner's epoch was bumped by the council's
     // takeover, so this fences a resumed stale owner `StaleEpoch` across all its objects **at once** — done
-    // before `reconcile_held_authority` re-owns those objects to the successor, so the fence is read against
-    // the *departed* owner. Monotonic (a live owner's unchanged epoch is a no-op), additive on top of the
-    // configuration-generation fence. (The FencedRegister per-host model this realizes, A-9, still owes its
-    // TLA+ revalidation before the modeled StaleNeverCommits result formally applies; design §4.8.)
+    // before the objects move to their successors below, so the fence is read against the *departed* owner.
+    // Monotonic (a live owner's unchanged epoch is a no-op), additive on top of the configuration-generation
+    // fence. (The FencedRegister per-host model this realizes, A-9, still owes its TLA+ revalidation before the
+    // modeled StaleNeverCommits result formally applies; design §4.8.)
     for acceptor in s.holder_records.values_mut() {
       if let Some(epoch) = epochs.get(&acceptor.owner()) {
         acceptor.raise_fence(*epoch);
       }
     }
+    // Every held object whose owner a kept retirement names moves to the successor the configuration's
+    // lineage ranks — at every holder, the successor included, each keeping the retired host whose round lists
+    // the object and whose lease its promise is gated on — and a stale copy is reclaimed (§4.8; the takeover
+    // module).
+    crate::takeover::resolve_held_objects(s, local);
     reconcile_held_authority(s);
   });
 }
@@ -6095,7 +6015,7 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
           .as_ref()
           .and_then(|membership| membership.durability)
           .and_then(|bound| bound.shortfall(&placement));
-        let _ = s.fleet.install_configuration(placement, &members);
+        s.fleet.install_configuration(placement, &members);
       }
       s.root.adopt(root);
       s.consensus_ready = ready;
@@ -6189,13 +6109,11 @@ async fn run_record_plane(local: HostId) {
       )
       .await;
     }
-    // Drive each owed takeover over all this object's surviving candidate holders (phase-one recovery). A
-    // drive that does not place leaves the object pending, so the next period retries. The holds and the
-    // takeovers are this node's (they arrive over this shard's sessions), so this runs here.
-    let owed = state::with_state(|s| takeovers(s, local)).unwrap_or_default();
-    for object in owed {
-      in_flight.extend(drive_takeover(object, local, budget).await);
-    }
+    // Drive each takeover this node owes a confirmation of: one batched phase-one round per retired host
+    // across its recovery neighbourhoods, adopting each object once its cohorts have promised and confirming
+    // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
+    // this node's (they arrive over this shard's sessions), so this runs here.
+    in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
     // Serve the content of each adopted head, from what this node holds or a recorded holder, on the
     // shard the taken-over id routes to.
     materialize_adopted_objects(origin, budget).await;
@@ -6504,200 +6422,6 @@ pub(crate) async fn forward_over_leader_session(
     }
     futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD).await;
   }
-}
-
-/// The pending takeovers this node should drive: the objects it owes a takeover for
-/// ([`ShardState::pending_takeovers`]) whose surviving candidate set — computed the same way every node
-/// computes placement ([`candidates_for`] over the current neighbourhood) — contains this node, the new owner
-/// `sync_peer` reassigned them to, **and** whose departed owner's lease can no longer hold (§4.8 "Leases and
-/// reads", AUD-08): the holder-side promotion gate ([`AnswersGiven::promotion_open`]) — this node has not
-/// answered the departed owner's probe for the membership horizon (so any lease it fed has expired) or the
-/// owner has announced it saw the retiring configuration (so it refuses its own clients now). Without a
-/// recorded departed owner the gate is open (a re-driven takeover whose record has been cleared; the council's
-/// own death-confirmation window already exceeds the horizon). The coordinator drives each object over **all**
-/// its surviving candidate holders, so the `f > 1` promotion quorum (this node plus `f` holders) is reached
-/// over the several sessions it owns. Read under `with_state`.
-fn takeovers(state: &ShardState, local: HostId) -> Vec<ObjectId> {
-  let config = state.fleet.configuration();
-  let now = slates_machine::clock::monotonic_ns();
-  state
-    .pending_takeovers
-    .iter()
-    .copied()
-    .filter(|object| {
-      candidates_for(
-        local,
-        &config.neighbourhood,
-        &config.domains,
-        *object,
-        config.quorum,
-      )
-      .contains(&local)
-    })
-    .filter(|object| {
-      state.departed_owners.get(object).is_none_or(|departed| {
-        state
-          .answers_given
-          .promotion_open(departed.owner, departed.since_version, now)
-      })
-    })
-    .collect()
-}
-
-/// Drives one object's takeover over **all** its surviving candidate holders (§4.8 "Promotion and takeover":
-/// one batched phase-one round, then safe adoption). This node is the survivor rendezvous ranked first for
-/// `object`, so it promotes the object's head over its own hold plus every surviving candidate holder the
-/// coordinator has a session to and, on a quorum of promises, re-commits the adopted head under the new epoch,
-/// records the placement, and clears the pending takeover so the verbs read the head as owned and
-/// region-placed. At `f = 1` the quorum is this node plus one holder; at `f > 1` it is this node plus `f`
-/// holders, reached over the several sessions the coordinator owns — the generalization a per-peer ship task
-/// could not make. The object's hold is removed for the promotion and re-commit (nothing else touches a dead
-/// owner's object's hold here) and re-inserted after, now under this node's authority. Short of quorum, or on
-/// lost sessions, the object stays pending and the next period retries — self-healing across the window while
-/// every survivor brings its holds' authority into step.
-async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -> Vec<Dispatch> {
-  let mut dispatches = Vec::new();
-  // Read the takeover parameters and take exclusive hold of the object's acceptor. Nothing to drive if this
-  // node does not hold the object or is not a candidate for it.
-  let prepared = state::with_state(|s| {
-    let config = s.fleet.configuration();
-    // The adoption commits under this node's own placement of the object — joined with its settled cohort
-    // while its own neighbourhood change is in flight, as every record it commits is.
-    let shape = Placement {
-      acked: Vec::new(),
-      ..config.place(object)
-    };
-    let candidates = shape.candidates.clone();
-    if !candidates.contains(&local) {
-      return None;
-    }
-    let quorum = config.quorum;
-    let generation = config.version;
-    let recovery = s.fleet.recovery_cohort(object)?.clone();
-    let mut acceptor = s.holder_records.remove(&object)?;
-    // The new epoch: one above the highest this node holds for the object, so the promotion raises the
-    // holders' fence above the epoch the dead owner committed under (§4.8 "serves under the bumped epoch").
-    let epoch = HostEpoch(highest_held_epoch(&acceptor, object).0.saturating_add(1));
-    // Install this node as the object's owner under the current generation, so its own promise and the
-    // adoption re-commit are authorized (the configuration group's taken-over authority, applied locally).
-    let _ = acceptor.install_authority(Authority {
-      generation,
-      owner: local,
-    });
-    Some((acceptor, recovery, shape, quorum, generation, epoch))
-  })
-  .flatten();
-  let Some((mut acceptor, recovery, shape, quorum, generation, epoch)) = prepared else {
-    return dispatches;
-  };
-  let candidates = shape.candidates.clone();
-
-  let prepare = Prepare {
-    owner: local,
-    object,
-    epoch,
-    generation,
-  };
-  // Phase one: promise locally through this node's hold and over every surviving candidate holder; adopt the
-  // newest record across the quorum of promises.
-  let holders = take_sessions(|host| recovery.candidates.contains(&host));
-  let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
-  let promoted = promote_record(
-    local,
-    &mut acceptor,
-    &recovery.candidates,
-    &prepare,
-    recovery.quorum,
-    holders,
-    budget,
-  )
-  .await;
-  dispatches.push(Dispatch::new(
-    taken,
-    &promoted.reusable,
-    promoted.stragglers,
-    LateReplies::Discard,
-  ));
-  return_sessions(promoted.reusable);
-  // Safe adoption: re-commit the adopted head under the new epoch over the holders, reaching the quorum.
-  let mut placed = None;
-  if let Ok(promotion) = promoted.outcome
-    && let Some(adoption) = promotion.adoption_record(&prepare)
-  {
-    let holders = take_sessions(|host| candidates.contains(&host));
-    let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
-    let committed = commit_record(
-      local,
-      &mut acceptor,
-      &shape,
-      &adoption,
-      quorum,
-      holders,
-      budget,
-    )
-    .await;
-    dispatches.push(Dispatch::new(
-      taken,
-      &committed.reusable,
-      committed.stragglers,
-      LateReplies::Discard,
-    ));
-    return_sessions(committed.reusable);
-    if let Ok(placement) = committed.outcome
-      && placement.placed(quorum)
-    {
-      placed = Some((adoption.sequence, adoption.value.clone(), placement));
-    }
-  }
-  // Re-insert the hold (now under this node's authority) and, when the adoption placed, record the placement
-  // and clear the pending takeover so the head is served as owned — and queue the head's content to be
-  // materialized and served (§4.10); otherwise the object stays pending.
-  state::with_state(|s| {
-    s.holder_records.insert(object, acceptor);
-    if let Some((sequence, value, placement)) = placed {
-      s.fleet.record_adopted_placement(
-        object,
-        local,
-        slates_cluster::routing::RecoveryCohort {
-          generation,
-          candidates,
-          quorum,
-        },
-      );
-      s.placed_heads.insert(
-        object,
-        PlacedHead {
-          sequence,
-          epoch: prepare.epoch,
-          placement,
-        },
-      );
-      s.pending_takeovers.remove(&object);
-      // The object is owned here now; its departed-owner promotion gate has served its purpose.
-      s.departed_owners.remove(&object);
-      if let Some(head) = HeadValue::from_record_bytes(&value) {
-        s.pending_materializations.insert(object, head);
-      } else if let Some(merge) = crate::merge_service::MergeRecordValue::from_record_bytes(&value)
-      {
-        // A green: its newest merge record was adopted; the owned green is rebuilt from this node's
-        // accepted chain and held inputs on the shard its id routes to (AUD-14).
-        s.pending_green_materializations.insert(object, merge);
-      }
-    }
-  });
-  dispatches
-}
-
-/// The highest epoch this node holds for `object` in `acceptor`, or the first epoch if it holds nothing —
-/// the anchor the takeover's new epoch is bumped one above.
-fn highest_held_epoch(acceptor: &Acceptor, object: ObjectId) -> HostEpoch {
-  let (_, positions) = acceptor.persisted();
-  positions
-    .into_iter()
-    .filter(|(held, _, _, _)| *held == object)
-    .map(|(_, _, epoch, _)| epoch)
-    .max_by_key(|epoch| epoch.0)
-    .unwrap_or(FIRST_EPOCH)
 }
 
 #[cfg(test)]

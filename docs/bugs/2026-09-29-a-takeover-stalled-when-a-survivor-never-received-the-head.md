@@ -1,9 +1,9 @@
-# A takeover stalled when a survivor never received the head (open; fix being built)
+# A takeover stalled when a survivor never received the head
 
 Date: 2026-09-29. Scope: the takeover's phase one (§4.8 "Promotion and takeover"): `drive_takeover`,
 `takeovers` and `serve_held_promotion` in `crates/server/src/fleet.rs`, the routing view
 (`crates/cluster/src/routing.rs`), and the regional configuration (`crates/db/src/register.rs`). Status:
-**open**, reproduced deterministically; the fix is designed below and being built in steps.
+**fixed** in three steps (below); the takeover now runs in `crates/server/src/takeover.rs`.
 
 ## Symptom
 
@@ -156,8 +156,42 @@ It replaces, not layers:
      and the survivor holds the head.
    - Checked by hand: with the readiness check forced true, the owner settled two periods after the
      retirement and the test failed.
-3. The takeover: the per-host round, the agreed successor, adoption, confirmation, and reclaiming holds,
-   replacing the per-object path.
+3. **Built.** The takeover itself.
+   - Each retirement freezes its **survivors**: the members of its recovery neighbourhoods when it retired.
+     A retired host's objects rank their successors only among those, so a node that installed two
+     retirements at once ranks the same successor as one that installed them in turn.
+   - A holder resolves each object it holds by walking the configuration's lineage
+     (`RegionalConfiguration::lineage`). A successor that itself retired before confirming carries the object
+     into its own takeover, and a line ending in a dropped retirement marks the copy stale.
+   - A retired id is not admitted again while a kept retirement names it (`admits`). Otherwise a returning
+     host would read as the successor that never left.
+   - Each survivor that owes a confirmation runs one round per retired host (`crate::takeover`). It asks every
+     member of the recovery neighbourhoods for pages of the records it holds of the host's objects whose
+     successor is the asker (new wire types `HostPrepare`/`HostPromise`, stream 16). The page budget is a
+     fresh session's first credit.
+   - A holder applies the lease gate, installs the asker's authority, raises each listed object's fence to
+     the round's epoch, and reports a fence above it, which sends the next round higher. Its complete answer
+     is also its empty promise for everything it does not list.
+   - The successor adopts an object once `f + 1` members of each recovery cohort have promised. It
+     re-commits the newest record under its own placement and serves it. It confirms its share when every
+     page is complete and every learned object is adopted or lost.
+   - The successor's own copy counts toward `f + 1` only once its lease gate is open, as a holder's answer
+     does (`a_successor_counts_its_own_copy_only_once_its_gate_is_open`). The per-object drive gated only
+     the successor; the round gates every promiser.
+   - Holders drop stale copies: a line ending in a done takeover, or a successor that confirmed while this
+     holder is outside its placement.
+   - Replaced, not layered: the per-object `drive_takeover`/`serve_held_promotion`, the pending-takeover
+     set, the routing's remembered cohorts (`Routing` is now object → owner), and the cluster crate's
+     per-object promotion driver (`promote_record` and its test). Stream 2 is retired.
+   - **The failing test now passes:** `a_takeover_completes_when_one_survivor_never_received_the_head`, which
+     failed in 61.8 s, passes in 8.67 s. It now covers both successors in one run: it makes volumes until one
+     falls to each survivor (the chance all 21 allowed fall to one is 2^-20), so one successor needs the
+     other's empty promise and the other learns the object from the first's answer.
+   - New tests: frozen survivors, the lineage through a successor that retired before confirming (the same
+     member resolved from either retired host), a confirmed takeover settling the lineage and freeing the id,
+     a lost object, the wire types' round trip and hostile input, a page bound to its authenticated asker,
+     and the holder and successor gates.
+   - Fleet suite 59/59 (259.3 s).
 
 Found and fixed on the way (step 2):
 - **A destroyed green's owner-side placement state stayed forever.** Destroying a green removed its engine but

@@ -1015,6 +1015,294 @@ impl Promise {
   }
 }
 
+/// A successor's phase-one request for one page of a retired host's objects (§4.8 "Promotion and takeover":
+/// "each new owner runs phase one in one batched round per register class across the neighbourhood: every
+/// holder raises its fence for that host to the new epoch and reports the highest record it holds for each
+/// object"): the retired host, the asking successor, the epoch it will write the objects under, the
+/// configuration generation the round runs under, and the object after which this page starts (`None` for the
+/// first). One round per retired host replaces a round per object: a holder answers for all of that host's
+/// objects whose successor is the asker, and a holder that holds nothing answers too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostPrepare {
+  /// The retired host whose objects are taken over.
+  pub departed: HostId,
+  /// The successor asking.
+  pub owner: HostId,
+  /// The epoch the successor writes the adopted objects under — the ballot the holder promises.
+  pub epoch: HostEpoch,
+  /// The configuration generation the round runs under; a holder on another refuses.
+  pub generation: u64,
+  /// The object after which this page starts, `None` for the first page.
+  pub after: Option<ObjectId>,
+}
+
+/// Format: an absent optional field on the takeover wire.
+const FIELD_ABSENT: u8 = 0;
+/// Format: a present optional field on the takeover wire; its value follows.
+const FIELD_PRESENT: u8 = 1;
+
+/// Format: the widest [`HostPrepare`]: departed, owner, epoch, generation (u64 LE each), then the page start's
+/// presence byte and object.
+const HOST_PREPARE_BYTES: usize = 4 * size_of::<u64>() + 1 + OBJECT_BYTES;
+
+impl HostPrepare {
+  /// The canonical bytes: departed, owner, epoch, generation (each u64 LE), then a presence byte and, when
+  /// present, the page's starting object.
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HOST_PREPARE_BYTES);
+    out.extend_from_slice(&self.departed.0.to_le_bytes());
+    out.extend_from_slice(&self.owner.0.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    put_optional_object(&mut out, self.after);
+    out
+  }
+
+  /// Reconstructs a request from its bytes, or [`RegisterError::MalformedRecord`] for anything short, long, or
+  /// carrying an unknown presence byte (a message that crossed the network — hostile input).
+  pub fn decode(bytes: &[u8]) -> Result<HostPrepare, RegisterError> {
+    let mut reader = WireReader::new(bytes);
+    let departed = HostId(reader.word()?);
+    let owner = HostId(reader.word()?);
+    let epoch = HostEpoch(reader.word()?);
+    let generation = reader.word()?;
+    let after = reader.optional_object()?;
+    reader.finish()?;
+    Ok(HostPrepare {
+      departed,
+      owner,
+      epoch,
+      generation,
+      after,
+    })
+  }
+}
+
+/// A holder's answer to one page of a [`HostPrepare`]: the objects of the retired host it holds whose successor
+/// is the asker, each with the highest record it holds — its fence raised to the epoch and the asker's
+/// authority installed before this answer was formed — where the next page starts if the holder has more, and
+/// the highest fence it found above the epoch on an object it therefore could not promise, so the asker retries
+/// above it. A holder's **complete** answer (every page, until `next` is `None`) promises the asker every object
+/// of the retired host whose successor it is: those it lists, and — by listing nothing more — every one it holds
+/// nothing of. That empty promise binds as a listed one does: the retired host is no member, so no holder
+/// accepts its records, and the successor is the only member the configuration names for the object.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPromise {
+  /// The answering holder.
+  pub holder: HostId,
+  /// The retired host (echoes the request).
+  pub departed: HostId,
+  /// The epoch promised (echoes the request).
+  pub epoch: HostEpoch,
+  /// The generation the holder answered under (echoes the request).
+  pub generation: u64,
+  /// The objects on this page, each with the highest record the holder holds for it.
+  pub entries: Vec<(ObjectId, Accepted)>,
+  /// The object after which the next page starts, `None` when this page completes the answer.
+  pub next: Option<ObjectId>,
+  /// The highest fence above the epoch on an object this holder could not promise, if any.
+  pub fenced: Option<HostEpoch>,
+}
+
+/// Format: the fixed width of one [`HostPromise`] entry before its value: the object (16 bytes), the record's
+/// sequence and epoch (u64 LE each), and the value's length (u32 LE).
+pub const HOST_PROMISE_ENTRY_BYTES: usize = OBJECT_BYTES + 2 * size_of::<u64>() + size_of::<u32>();
+
+/// Format: the widest [`HostPromise`] header: holder, departed, epoch, generation (u64 LE each), the next
+/// page's presence byte and object, the fence's presence byte and epoch, and the entry count (u32 LE).
+pub const HOST_PROMISE_HEADER_BYTES: usize =
+  4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>() + size_of::<u32>();
+
+impl HostPromise {
+  /// Whether this answers `prepare`: the same retired host, epoch and generation, so an answer to another
+  /// round cannot be counted for this one.
+  pub fn binds(&self, prepare: &HostPrepare) -> bool {
+    self.departed == prepare.departed
+      && self.epoch == prepare.epoch
+      && self.generation == prepare.generation
+  }
+
+  /// The bytes one entry holding `accepted` adds to an answer — what a holder paging its answer counts against
+  /// the frame it must fit in.
+  pub fn entry_bytes(accepted: &Accepted) -> usize {
+    HOST_PROMISE_ENTRY_BYTES.saturating_add(accepted.value.len())
+  }
+
+  /// The canonical bytes: the header words, the next page's and the fence's optional fields, the entry count,
+  /// then each entry (object, sequence, epoch, value length, value).
+  pub fn encode(&self) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HOST_PROMISE_HEADER_BYTES);
+    out.extend_from_slice(&self.holder.0.to_le_bytes());
+    out.extend_from_slice(&self.departed.0.to_le_bytes());
+    out.extend_from_slice(&self.epoch.0.to_le_bytes());
+    out.extend_from_slice(&self.generation.to_le_bytes());
+    put_optional_object(&mut out, self.next);
+    match self.fenced {
+      None => out.push(FIELD_ABSENT),
+      Some(fence) => {
+        out.push(FIELD_PRESENT);
+        out.extend_from_slice(&fence.0.to_le_bytes());
+      }
+    }
+    let count = u32::try_from(self.entries.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+    for (object, accepted) in &self.entries {
+      out.extend_from_slice(&object.0);
+      out.extend_from_slice(&accepted.sequence.to_le_bytes());
+      out.extend_from_slice(&accepted.epoch.0.to_le_bytes());
+      let value_len = u32::try_from(accepted.value.len()).unwrap_or(u32::MAX);
+      out.extend_from_slice(&value_len.to_le_bytes());
+      out.extend_from_slice(&accepted.value);
+    }
+    out
+  }
+
+  /// Reconstructs an answer from its bytes, checking every length against what remains before reading or
+  /// allocating — an entry count beyond what the bytes could hold, a value length past the end, an unknown
+  /// presence byte, or trailing bytes are [`RegisterError::MalformedRecord`], never a panic or an over-read.
+  pub fn decode(bytes: &[u8]) -> Result<HostPromise, RegisterError> {
+    let mut reader = WireReader::new(bytes);
+    let holder = HostId(reader.word()?);
+    let departed = HostId(reader.word()?);
+    let epoch = HostEpoch(reader.word()?);
+    let generation = reader.word()?;
+    let next = reader.optional_object()?;
+    let fenced = match reader.byte()? {
+      FIELD_ABSENT => None,
+      FIELD_PRESENT => Some(HostEpoch(reader.word()?)),
+      _ => return Err(RegisterError::MalformedRecord),
+    };
+    let count = usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
+    if count > reader.remaining() / HOST_PROMISE_ENTRY_BYTES {
+      return Err(RegisterError::MalformedRecord);
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+      let object = reader.object()?;
+      let sequence = reader.word()?;
+      let entry_epoch = HostEpoch(reader.word()?);
+      let value_len =
+        usize::try_from(reader.half()?).map_err(|_| RegisterError::MalformedRecord)?;
+      let value = reader.take(value_len)?.to_vec();
+      entries.push((
+        object,
+        Accepted {
+          sequence,
+          epoch: entry_epoch,
+          value,
+        },
+      ));
+    }
+    reader.finish()?;
+    Ok(HostPromise {
+      holder,
+      departed,
+      epoch,
+      generation,
+      entries,
+      next,
+      fenced,
+    })
+  }
+}
+
+/// Appends an optional object: a presence byte, then the object when present.
+fn put_optional_object(out: &mut Vec<u8>, object: Option<ObjectId>) {
+  match object {
+    None => out.push(FIELD_ABSENT),
+    Some(object) => {
+      out.push(FIELD_PRESENT);
+      out.extend_from_slice(&object.0);
+    }
+  }
+}
+
+/// A bounds-checked reader over bytes that crossed the network: every read checks what remains first, so a
+/// short or lying message is [`RegisterError::MalformedRecord`], never a panic or an over-read.
+struct WireReader<'a> {
+  rest: &'a [u8],
+}
+
+impl<'a> WireReader<'a> {
+  /// A reader over `bytes`.
+  fn new(bytes: &'a [u8]) -> WireReader<'a> {
+    WireReader { rest: bytes }
+  }
+
+  /// The next `len` bytes.
+  fn take(&mut self, len: usize) -> Result<&'a [u8], RegisterError> {
+    let (head, rest) = self
+      .rest
+      .split_at_checked(len)
+      .ok_or(RegisterError::MalformedRecord)?;
+    self.rest = rest;
+    Ok(head)
+  }
+
+  /// The next little-endian u64.
+  fn word(&mut self) -> Result<u64, RegisterError> {
+    let bytes = self.take(size_of::<u64>())?;
+    Ok(u64::from_le_bytes(
+      bytes
+        .try_into()
+        .map_err(|_| RegisterError::MalformedRecord)?,
+    ))
+  }
+
+  /// The next little-endian u32.
+  fn half(&mut self) -> Result<u32, RegisterError> {
+    let bytes = self.take(size_of::<u32>())?;
+    Ok(u32::from_le_bytes(
+      bytes
+        .try_into()
+        .map_err(|_| RegisterError::MalformedRecord)?,
+    ))
+  }
+
+  /// The next byte.
+  fn byte(&mut self) -> Result<u8, RegisterError> {
+    let (&byte, rest) = self
+      .rest
+      .split_first()
+      .ok_or(RegisterError::MalformedRecord)?;
+    self.rest = rest;
+    Ok(byte)
+  }
+
+  /// The next object id.
+  fn object(&mut self) -> Result<ObjectId, RegisterError> {
+    let bytes = self.take(OBJECT_BYTES)?;
+    Ok(ObjectId(
+      bytes
+        .try_into()
+        .map_err(|_| RegisterError::MalformedRecord)?,
+    ))
+  }
+
+  /// The next optional object: a presence byte, then the object when present.
+  fn optional_object(&mut self) -> Result<Option<ObjectId>, RegisterError> {
+    match self.byte()? {
+      FIELD_ABSENT => Ok(None),
+      FIELD_PRESENT => Ok(Some(self.object()?)),
+      _ => Err(RegisterError::MalformedRecord),
+    }
+  }
+
+  /// The bytes left to read.
+  fn remaining(&self) -> usize {
+    self.rest.len()
+  }
+
+  /// Refuses bytes left over after the message.
+  fn finish(self) -> Result<(), RegisterError> {
+    if self.rest.is_empty() {
+      Ok(())
+    } else {
+      Err(RegisterError::MalformedRecord)
+    }
+  }
+}
+
 /// The per-position acceptor a holder runs (§4.8 "distinguish a holder's promised epoch from its
 /// accepted `(epoch, value)`"): the holder's id and authority, the highest epoch it has promised (the
 /// fence), and the value it has accepted at each ledger position. Acceptance is synchronous and
@@ -1590,13 +1878,36 @@ pub struct Retirement {
   pub version: u64,
   /// The neighbourhood its records were all placed on when it retired: its objects' recovery cohort.
   pub settled: Settled,
-  /// The surviving hosts of `settled` that have confirmed their share of this takeover — every object of the
-  /// retired host that ranks them first adopted and placed under their own placement — in id order.
+  /// The members of its recovery neighbourhoods when it retired, itself excluded, in id order: the hosts its
+  /// objects' successors are ranked among, fixed at the retirement so every node ranks them the same whatever
+  /// it has installed since, and the hosts that owe a confirmation of their share while they remain members.
+  pub survivors: Vec<HostId>,
+  /// The survivors that have confirmed their share of this takeover — every object of the retired host that
+  /// ranks them first adopted and placed under their own placement — in id order.
   pub confirmed: Vec<HostId>,
   /// The retired hosts whose takeover this host had not confirmed its share of when it retired, in id order:
   /// an object it was taking over from one of them may not have been re-committed under it yet, so its own
   /// objects are recovered jointly with those hosts' cohorts ([`RegionalConfiguration::recovery_owners`]).
   pub unconfirmed: Vec<HostId>,
+}
+
+/// Where a retired owner's object belongs ([`RegionalConfiguration::lineage`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lineage {
+  /// `successor`, a member, takes the object over as part of `departed`'s takeover — `departed` the last
+  /// retired owner in the object's line, the one whose round the successor adopts it in.
+  Successor {
+    /// The retired host whose takeover the object is recovered in.
+    departed: HostId,
+    /// The member that takes it over.
+    successor: HostId,
+  },
+  /// No survivor of the object's recovery cohorts was ranked: nothing can recover it.
+  Lost,
+  /// A retirement in the object's line is no longer kept: its takeover is done — every survivor confirmed its
+  /// share, so the object was adopted elsewhere — or the retirement was dropped past the bound, beyond the
+  /// failures the region tolerates. A holder's copy of it is stale.
+  Settled,
 }
 
 /// The **regional configuration** the council agrees on (§4.8, D-14 — the "configuration master", a small
@@ -1710,10 +2021,11 @@ impl RegionalConfiguration {
   }
 
   /// Admits `member` to the region (a join the council agrees on) with the failure `domain` its node
-  /// declares, if any (`None` leaves it unique-per-host): a no-op if already a member. Refixes the
-  /// neighbourhoods and advances the version. Returns whether the membership changed.
+  /// declares, if any (`None` leaves it unique-per-host): a no-op if already a member, or while a kept
+  /// retirement still names it ([`admits`](RegionalConfiguration::admits)). Refixes the neighbourhoods and
+  /// advances the version. Returns whether the membership changed.
   pub fn admit(&mut self, member: HostId, domain: Option<DomainId>, scatter: u64) -> bool {
-    if self.members.contains(&member) {
+    if !self.admits(member) {
       return false;
     }
     self.members.push(member);
@@ -1756,17 +2068,36 @@ impl RegionalConfiguration {
       .copied()
       .filter(|departed| self.owes_confirmation(*departed, member))
       .collect();
+    // The hosts the retiring member's objects may be held by — its settled neighbourhood and those of the
+    // takeovers it carries — that are members now: its successors are ranked among these for good.
+    let survivors = settled.as_ref().map(|settled| {
+      let mut survivors: Vec<HostId> = settled
+        .hosts
+        .iter()
+        .copied()
+        .chain(
+          unconfirmed
+            .iter()
+            .flat_map(|carried| self.recovery_hosts(*carried)),
+        )
+        .filter(|host| *host != member && self.members.contains(host))
+        .collect();
+      survivors.sort_unstable_by_key(|host| host.0);
+      survivors.dedup();
+      survivors
+    });
     self.members.retain(|host| *host != member);
     self.neighbourhoods.remove(&member);
     self.domains.remove(&member);
     self.version = self.version.saturating_add(1);
     self.fix_neighbourhoods(scatter);
-    if let Some(settled) = settled {
+    if let (Some(settled), Some(survivors)) = (settled, survivors) {
       self.retired.insert(
         member,
         Retirement {
           version: self.version,
           settled,
+          survivors,
           confirmed: Vec::new(),
           unconfirmed,
         },
@@ -1832,17 +2163,37 @@ impl RegionalConfiguration {
     true
   }
 
-  /// Whether `host` still owes a confirmation of its share of `departed`'s takeover: `departed` is retired,
-  /// `host` is a member other than `departed` among the hosts its objects are recovered through
-  /// ([`recovery_hosts`](RegionalConfiguration::recovery_hosts)), and `host` has not confirmed yet.
+  /// Whether `host` still owes a confirmation of its share of `departed`'s takeover: `departed`'s retirement is
+  /// kept, `host` was one of its survivors ([`Retirement::survivors`]) and is still a member, and `host` has not
+  /// confirmed yet. A survivor that retired before confirming owes nothing here: its own retirement carries
+  /// the takeover ([`Retirement::unconfirmed`]).
   pub fn owes_confirmation(&self, departed: HostId, host: HostId) -> bool {
-    host != departed
-      && self.members.contains(&host)
-      && self
+    self.members.contains(&host)
+      && self.retired.get(&departed).is_some_and(|retirement| {
+        retirement.survivors.contains(&host) && !retirement.confirmed.contains(&host)
+      })
+  }
+
+  /// The survivors of `departed`'s retirement ([`Retirement::survivors`]), or none when it is not kept.
+  pub fn survivors_of(&self, departed: HostId) -> Vec<HostId> {
+    self
+      .retired
+      .get(&departed)
+      .map(|retirement| retirement.survivors.clone())
+      .unwrap_or_default()
+  }
+
+  /// Whether `member` may be admitted: it is not a member, and no kept retirement names it — as the retired
+  /// host, or as one of a retirement's survivors. A host a kept retirement names is ranked in that takeover's
+  /// lineage ([`lineage`](RegionalConfiguration::lineage)); admitting it again under the same id before every
+  /// such takeover is done would let a later node read the returning host as the successor that never left.
+  /// It is admitted once those retirements are dropped (a restart rejoins at once, under a fresh id).
+  pub fn admits(&self, member: HostId) -> bool {
+    !self.members.contains(&member)
+      && !self
         .retired
-        .get(&departed)
-        .is_some_and(|retirement| !retirement.confirmed.contains(&host))
-      && self.recovery_hosts(departed).contains(&host)
+        .iter()
+        .any(|(departed, retirement)| *departed == member || retirement.survivors.contains(&member))
   }
 
   /// The retired owners whose settled cohorts `departed`'s objects are recovered through: `departed` itself
@@ -1903,15 +2254,45 @@ impl RegionalConfiguration {
   /// node computes it from the committed configuration alone, so every node names the same one. `None` if no
   /// member of those cohorts survives, or `departed` has no retirement kept.
   pub fn successor(&self, departed: HostId, object: ObjectId) -> Option<HostId> {
-    let mut survivors: Vec<HostId> = self
+    let retirement = self.retired.get(&departed)?;
+    let mut ranked: Vec<HostId> = self
       .recovery_cohorts(departed, object)
       .into_iter()
       .flatten()
-      .filter(|host| self.members.contains(host))
+      .filter(|host| retirement.survivors.contains(host))
       .collect();
-    survivors.sort_unstable_by_key(|host| host.0);
-    survivors.dedup();
-    rendezvous_first(&survivors, object)
+    ranked.sort_unstable_by_key(|host| host.0);
+    ranked.dedup();
+    rendezvous_first(&ranked, object)
+  }
+
+  /// Where `object`, last owned by the retired `owner`, belongs now (§4.8 "Promotion and takeover"), from the
+  /// configuration alone. The walk follows successors: a successor that has itself retired while its
+  /// retirement is kept carries the object into its own takeover (it may not have re-committed the object
+  /// yet, and if it did, the object is its own); one that is a member is where the object belongs. Each step
+  /// moves to a host that was a member when the previous one retired, so the walk ends within the kept
+  /// retirements, and two nodes that installed the same configuration by different paths resolve alike.
+  pub fn lineage(&self, owner: HostId, object: ObjectId) -> Lineage {
+    let mut departed = owner;
+    for _ in 0..=self.retired.len() {
+      if !self.retired.contains_key(&departed) {
+        return Lineage::Settled;
+      }
+      let Some(successor) = self.successor(departed, object) else {
+        return Lineage::Lost;
+      };
+      if self.retired.contains_key(&successor) {
+        departed = successor;
+      } else if self.members.contains(&successor) {
+        return Lineage::Successor {
+          departed,
+          successor,
+        };
+      } else {
+        return Lineage::Settled;
+      }
+    }
+    Lineage::Settled
   }
 
   /// Derived: the most retirements the configuration keeps — one per remaining member. A retirement is kept
@@ -3242,6 +3623,276 @@ mod tests {
     );
     assert!(settled.place(object).joint.is_empty());
     assert_eq!(settled.recovery_cohort(object), new);
+  }
+
+  /// A retired host's successor for `object` in `regional`, which must exist.
+  fn successor_of(regional: &RegionalConfiguration, departed: HostId, object: ObjectId) -> HostId {
+    regional
+      .successor(departed, object)
+      .expect("a retirement with survivors ranks a successor")
+  }
+
+  /// §4.8 "Promotion and takeover": a retirement ranks its objects' successors among the members it left, fixed
+  /// at the retirement — a member that joins later is never ranked, and a survivor that retires later is still
+  /// the one ranked, so the object's line runs through its own retirement.
+  #[test]
+  fn a_retirement_ranks_successors_among_the_members_it_left() {
+    let (mut regional, scatter) = wide_region();
+    let departed = HostId(1);
+    let survivors_before: Vec<HostId> = regional.neighbourhoods[&departed]
+      .hosts
+      .iter()
+      .copied()
+      .filter(|host| *host != departed)
+      .collect();
+    regional.take_over(departed, scatter);
+    assert_eq!(regional.retired[&departed].survivors, survivors_before);
+    let object = ObjectId::new(departed, 11);
+    let successor = successor_of(&regional, departed, object);
+    assert!(regional.admit(HostId(7), None, scatter));
+    assert_eq!(
+      successor_of(&regional, departed, object),
+      successor,
+      "a later joiner is never ranked"
+    );
+    regional.take_over(successor, scatter);
+    assert_eq!(
+      successor_of(&regional, departed, object),
+      successor,
+      "a survivor that retired later is still the one ranked"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover", repeated: an object whose successor retired before confirming is recovered
+  /// in the successor's takeover, and a holder that last saw the object under the first owner resolves the same
+  /// member as one that saw it under the successor — the lineage is the configuration's, not the order a node
+  /// installed it in.
+  #[test]
+  fn a_lineage_follows_a_successor_that_retired_before_confirming() {
+    let (mut regional, scatter) = wide_region();
+    let first = HostId(1);
+    regional.take_over(first, scatter);
+    let object = (0..64u64)
+      .map(|index| ObjectId::new(first, index))
+      .find(|object| {
+        regional
+          .survivors_of(first)
+          .contains(&successor_of(&regional, first, *object))
+      })
+      .expect("an object of the first owner");
+    let carrier = successor_of(&regional, first, object);
+    regional.take_over(carrier, scatter);
+    assert_eq!(regional.retired[&carrier].unconfirmed, vec![first]);
+    let resolved = regional.lineage(first, object);
+    let Lineage::Successor {
+      departed,
+      successor,
+    } = resolved
+    else {
+      panic!("the object has a surviving successor: {resolved:?}")
+    };
+    assert_eq!(departed, carrier, "recovered in the carrier's takeover");
+    assert!(regional.members.contains(&successor));
+    assert_eq!(
+      regional.lineage(carrier, object),
+      resolved,
+      "a holder that saw the object under the carrier resolves the same"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover": once every survivor has confirmed its share the retirement is dropped, a
+  /// holder's copy of one of its objects resolves as settled (stale), and the retired host may be admitted again
+  /// — never before, while its retirement still ranks successors.
+  #[test]
+  fn a_confirmed_takeover_settles_the_lineage_and_frees_the_id() {
+    let (mut regional, scatter) = wide_region();
+    let departed = HostId(1);
+    regional.take_over(departed, scatter);
+    let object = ObjectId::new(departed, 5);
+    assert!(matches!(
+      regional.lineage(departed, object),
+      Lineage::Successor { .. }
+    ));
+    assert!(
+      !regional.admits(departed),
+      "a retired id is not admitted while its retirement is kept"
+    );
+    for host in regional.survivors_of(departed) {
+      regional.confirm(departed, host);
+    }
+    assert!(!regional.retired.contains_key(&departed));
+    assert_eq!(regional.lineage(departed, object), Lineage::Settled);
+    assert!(
+      regional.admit(departed, None, scatter),
+      "admitted once its takeover is done"
+    );
+  }
+
+  /// §4.8 "Promotion and takeover": an object whose recovery cohort lost every survivor is lost — the lineage
+  /// says so rather than naming a host that never held it — while the retirement is kept for the survivors of
+  /// its other cohorts, who still owe their confirmations. A neighbourhood wider than one copyset makes the
+  /// case: two of one copyset's hosts retire before its owner does.
+  #[test]
+  fn an_object_whose_cohort_has_no_survivor_is_lost() {
+    // Shape: a neighbourhood of every member, wide enough to hold two copysets of three at `f = 1`.
+    let scatter = 5;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    let owner = HostId(1);
+    let object = ObjectId::new(owner, 3);
+    let cohort = regional.settled[&owner].cohort(owner, object, regional.quorum);
+    let others: Vec<HostId> = cohort
+      .iter()
+      .copied()
+      .filter(|host| *host != owner)
+      .collect();
+    // The two retire first and their takeovers complete, so the owner carries neither into its own.
+    for host in &others {
+      regional.take_over(*host, scatter);
+      for survivor in regional.survivors_of(*host) {
+        regional.confirm(*host, survivor);
+      }
+      assert!(!regional.retired.contains_key(host));
+    }
+    regional.take_over(owner, scatter);
+    assert!(regional.retired[&owner].unconfirmed.is_empty());
+    assert!(
+      !regional.survivors_of(owner).is_empty(),
+      "the owner's other copysets have survivors"
+    );
+    assert_eq!(regional.lineage(owner, object), Lineage::Lost);
+  }
+
+  /// A sample answer to a takeover page: two objects' records, a next page and a fence above the epoch.
+  fn sample_host_promise() -> HostPromise {
+    HostPromise {
+      holder: HostId(2),
+      departed: HostId(1),
+      epoch: HostEpoch(4),
+      generation: 9,
+      entries: vec![
+        (
+          ObjectId::new(HostId(1), 3),
+          Accepted {
+            sequence: 2,
+            epoch: HostEpoch(3),
+            value: b"head".to_vec(),
+          },
+        ),
+        (
+          ObjectId::new(HostId(1), 8),
+          Accepted {
+            sequence: 0,
+            epoch: HostEpoch(1),
+            value: Vec::new(),
+          },
+        ),
+      ],
+      next: Some(ObjectId::new(HostId(1), 8)),
+      fenced: Some(HostEpoch(6)),
+    }
+  }
+
+  /// §4.8 "Promotion and takeover": a takeover page request and its answer round-trip their wire forms, with
+  /// and without their optional fields, and an answer binds only the request it echoes.
+  #[test]
+  fn a_takeover_page_round_trips_and_binds_its_request() {
+    let prepare = HostPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      after: Some(ObjectId::new(HostId(1), 3)),
+    };
+    let first_page = HostPrepare {
+      after: None,
+      ..prepare
+    };
+    for request in [prepare, first_page] {
+      assert_eq!(HostPrepare::decode(&request.encode()), Ok(request));
+    }
+    let answer = sample_host_promise();
+    assert_eq!(HostPromise::decode(&answer.encode()), Ok(answer.clone()));
+    let bare = HostPromise {
+      entries: Vec::new(),
+      next: None,
+      fenced: None,
+      ..answer.clone()
+    };
+    assert_eq!(HostPromise::decode(&bare.encode()), Ok(bare));
+    assert!(answer.binds(&prepare));
+    assert!(!answer.binds(&HostPrepare {
+      epoch: HostEpoch(5),
+      ..prepare
+    }));
+    assert!(!answer.binds(&HostPrepare {
+      departed: HostId(7),
+      ..prepare
+    }));
+    assert_eq!(
+      answer.encode().len(),
+      HOST_PROMISE_HEADER_BYTES
+        + answer
+          .entries
+          .iter()
+          .map(|(_, accepted)| HostPromise::entry_bytes(accepted))
+          .sum::<usize>(),
+      "the paging arithmetic counts exactly what the encoding writes"
+    );
+  }
+
+  /// Hostile input: a takeover request or answer cut short at any length, carrying trailing bytes, an unknown
+  /// presence byte, or an entry count beyond what its bytes could hold decodes to a typed refusal, never a
+  /// panic or an over-read.
+  #[test]
+  fn a_hostile_takeover_page_is_refused() {
+    let request = HostPrepare {
+      departed: HostId(1),
+      owner: HostId(3),
+      epoch: HostEpoch(4),
+      generation: 9,
+      after: Some(ObjectId::new(HostId(1), 3)),
+    }
+    .encode();
+    let answer = sample_host_promise().encode();
+    for cut in 0..request.len() {
+      assert_eq!(
+        HostPrepare::decode(&request[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
+    for cut in 0..answer.len() {
+      assert_eq!(
+        HostPromise::decode(&answer[..cut]),
+        Err(RegisterError::MalformedRecord)
+      );
+    }
+    let mut trailing = answer.clone();
+    trailing.push(0);
+    assert_eq!(
+      HostPromise::decode(&trailing),
+      Err(RegisterError::MalformedRecord)
+    );
+    let mut flag = request.clone();
+    flag[4 * size_of::<u64>()] = 2;
+    assert_eq!(
+      HostPrepare::decode(&flag),
+      Err(RegisterError::MalformedRecord)
+    );
+    // The entry count sits after the header words, the next page (presence byte and object) and the fence
+    // (presence byte and epoch); claim every count there is.
+    let count_at = 4 * size_of::<u64>() + 1 + OBJECT_BYTES + 1 + size_of::<u64>();
+    let mut lying = answer.clone();
+    lying[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      HostPromise::decode(&lying),
+      Err(RegisterError::MalformedRecord)
+    );
   }
 
   /// Banned item 8: retirements nobody confirms stay bounded by the members, the oldest dropped first, however

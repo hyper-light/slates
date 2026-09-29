@@ -2,11 +2,12 @@
 //! probes a peer it backs over a real mutually-authenticated session; the peer is silent (it completes the
 //! handshake, then never answers a probe), so the real timeout drives the survivor's failure detector to
 //! declare it dead; `sync_membership` folds that converged view into the survivor's `FleetNode` membership,
-//! and installing the configuration the council commits for the retirement (the region without the dead
-//! peer) hands the survivor the peer's objects that rendezvous now ranks first to it. This joins the pieces
+//! and the configuration the council commits for the takeover (the peer retired, its settled neighbourhood
+//! and survivors recorded) names, for each of the peer's objects, the survivor as its successor
+//! (`RegionalConfiguration::lineage`), which the survivor's routing then records. This joins the pieces
 //! proven separately — the SWIM probe over the transport (`swim.rs`), the detector's suspect→dead aging
-//! (the detector's own tests), the detector→membership fold and the install-driven routing takeover
-//! (`fleet.rs`) — into the live path a fleet node's control-shard loop runs. The council's own
+//! (the detector's own tests), the detector→membership fold, and the configuration's lineage (the register's
+//! own tests) — into the live path a fleet node's control-shard loop runs. The council's own
 //! reconcile-and-commit of that retirement over the transport is proven in `config_group_live`. Test by use
 //! (R5); real multi-node process deployment is a further gate.
 
@@ -22,7 +23,7 @@ use slates_cluster::detector::{Detector, DetectorTiming};
 use slates_cluster::fleet::{FleetNode, sync_membership};
 use slates_cluster::membership::Liveness;
 use slates_cluster::swim::{ProbeOutcome, SwimMessage, probe_once};
-use slates_db::register::{Configuration, HostId, ObjectId, Quorum, RegionalConfiguration};
+use slates_db::register::{Configuration, HostId, Lineage, ObjectId, Quorum};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
@@ -210,31 +211,37 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
           detector.tick();
           sync_membership(detector.membership(), &mut fleet);
           if fleet.membership().state(DEAD).map(|s| s.liveness) == Some(Liveness::Dead) {
-            let retired = RegionalConfiguration::formed(
-              vec![SURVIVOR],
-              Quorum { f: 1 },
-              std::collections::BTreeMap::new(),
-              3,
-              false,
-            )
-            .configuration_for(SURVIVOR)
-            .unwrap_or_else(|| Configuration::solo(SURVIVOR));
-            let takeovers = fleet.install_configuration(retired, &[SURVIVOR]);
-            for reassignment in &takeovers {
-              if reassignment.new_owner != SURVIVOR {
-                return Err("a takeover was not assigned to the survivor".to_owned());
+            let mut retired = placement.clone();
+            retired.take_over(DEAD, 3);
+            let configuration = retired
+              .configuration_for(SURVIVOR)
+              .unwrap_or_else(|| Configuration::solo(SURVIVOR));
+            fleet.install_configuration(configuration, &retired.members);
+            let mut taken = 0;
+            for i in 0..BACKED_OBJECTS {
+              let object = ObjectId::new(DEAD, i);
+              match retired.lineage(DEAD, object) {
+                Lineage::Successor {
+                  departed: DEAD,
+                  successor: SURVIVOR,
+                } => {
+                  fleet.track_object_owner(object, SURVIVOR);
+                  taken += 1;
+                }
+                other => {
+                  return Err(format!(
+                    "{object:?} was not handed to the survivor: {other:?}"
+                  ));
+                }
               }
-              if fleet.object_owner(reassignment.object) != Some(SURVIVOR) {
+              if fleet.object_owner(object) != Some(SURVIVOR) {
                 return Err("a taken object is not owned by the survivor".to_owned());
               }
             }
             if fleet.configuration().neighbourhood.contains(&DEAD) {
               return Err("the dead peer was not retired from the neighbourhood".to_owned());
             }
-            if takeovers.is_empty() {
-              return Err("the survivor took over none of the dead peer's objects".to_owned());
-            }
-            return Ok(takeovers.len());
+            return Ok(taken);
           }
         }
         Err("the peer was never declared dead within the tick ceiling".to_owned())

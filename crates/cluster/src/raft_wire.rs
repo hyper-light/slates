@@ -744,6 +744,7 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     put_u64(&mut out, host.0);
     put_u64(&mut out, retirement.version);
     encode_settled(&mut out, &retirement.settled);
+    encode_hosts(&mut out, &retirement.survivors);
     encode_hosts(&mut out, &retirement.confirmed);
     encode_hosts(&mut out, &retirement.unconfirmed);
   }
@@ -796,8 +797,8 @@ fn decode_settled_map(
   Ok((settled, rest))
 }
 
-/// Decodes the retirements map (count, then each `(host, version, settled, confirmed, unconfirmed)`), bounding
-/// every count.
+/// Decodes the retirements map (count, then each `(host, version, settled, survivors, confirmed, unconfirmed)`),
+/// bounding every count.
 fn decode_retired(
   bytes: &[u8],
 ) -> Result<(std::collections::BTreeMap<HostId, Retirement>, &[u8]), RaftWireError> {
@@ -807,6 +808,7 @@ fn decode_retired(
     let (host, tail) = take_u64(rest)?;
     let (version, tail) = take_u64(tail)?;
     let (settled, tail) = decode_settled(tail)?;
+    let (survivors, tail) = decode_hosts(tail)?;
     let (confirmed, tail) = decode_hosts(tail)?;
     let (unconfirmed, tail) = decode_hosts(tail)?;
     retired.insert(
@@ -814,6 +816,7 @@ fn decode_retired(
       Retirement {
         version,
         settled,
+        survivors,
         confirmed,
         unconfirmed,
       },

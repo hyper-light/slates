@@ -135,7 +135,7 @@ pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, Locatio
       generation: regional.version,
       serves: regional.members.contains(&local)
         && state.fleet.object_owner(ObjectId(query.object)) == Some(local)
-        && !state.pending_takeovers.contains(&ObjectId(query.object)),
+        && !state.departed_owners.contains_key(&ObjectId(query.object)),
     }
     .to_bytes(),
   )

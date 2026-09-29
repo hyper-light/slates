@@ -2782,6 +2782,28 @@ commit quorum. It drops its role on `StaleEpoch`. The historical `FencedRegister
 its modeled TotalOrder, Continuity, StaleNeverCommits and ReadSafety transitions; A-9 requires
 refinement and revalidation before those results can be applied to the corrected implementation.
 
+> **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
+> The takeover is built as written, one batched round per retired host (`crates/server/src/takeover.rs`).
+> It replaces a per-object round that a successor ran only for objects it already held, which stalled for
+> good when a surviving candidate had never received the object.
+>
+> - Everything is decided from the committed configuration. A retirement records the retired host's
+>   settled neighbourhood and freezes its **survivors**, the members its successors are ranked among, so
+>   installs taken in any order rank alike.
+> - A successor that retires before confirming its share carries the takeover into its own. Its objects are
+>   then recovered jointly through both settled cohorts (`RegionalConfiguration::lineage`,
+>   `recovery_cohorts`).
+> - A retired id is not admitted again while a kept retirement names it.
+> - Every holder answers the round in pages of a fresh session's first credit, after the lease gate. A
+>   holder that holds nothing answers too, and its complete answer is its promise for every object it does
+>   not list. The retired host is no member, and the successor is the only member named for the object.
+> - An object is adopted once `f + 1` members of each recovery cohort have promised. It is re-committed
+>   under the successor's placement at the round's epoch, then served.
+> - A survivor confirms its share to the council, and a retirement is dropped once all have. Stale copies
+>   are reclaimed.
+> - Regression `a_takeover_completes_when_one_survivor_never_received_the_head` covers both successors in
+>   one run: the one holding the head, and the one holding nothing.
+
 **Neighbourhood changes.** A host's neighbourhood changes only through the group (a member
 left, a fresh member joined, a rebalancing). While a change is in flight the owner writes to a
 quorum of the old candidates and a quorum of the new ones (joint writes); the group retires the

@@ -65,8 +65,8 @@ use std::sync::mpsc::{TryRecvError, channel};
 
 use slates_db::ledger::{self, LedgerAcceptor, LedgerPromise};
 use slates_db::register::{
-  Accepted, Acceptor, Ack, Configuration, HostId, ObjectId, Placement, Prepare, Promise, Promotion,
-  Quorum, Record, Refusal, candidates_for, decode_refusal, encode_refusal,
+  Acceptor, Ack, Configuration, HostId, Placement, Prepare, Quorum, Record, Refusal,
+  decode_refusal, encode_refusal,
 };
 use slates_rt::error::RtError;
 use slates_rt::futures::{cancel, detach, now_ns, sleep, spawn_child};
@@ -256,7 +256,7 @@ impl CommitBudget {
 }
 
 /// The dispatch collection loop's wait-and-decide step (§4.8 "late work"), shared by the commit
-/// ([`collect_acks`]) and promotion ([`collect_promises`]) loops so both age a slow dispatch the same
+/// ([`collect_acks`]) and ledger promotion loops so both age a slow dispatch the same
 /// way. It parks one poll interval, then judges from the dispatch's own progress — the size of its
 /// acknowledged (or promised) set — whether a dispatch that has reached its deadline is still filling
 /// its quorum (extend) or has stalled / spent its extension budget (time out). The [`hard`] budget's
@@ -850,301 +850,18 @@ fn spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Committed {
   }
 }
 
-// ── Phase one: promotion over the transport (§4.8 "Promotion and takeover") ──────────────────────
+// ── Phase one of a single-value register's takeover ──────────────────────────────────────────────────
 //
-// The symmetric counterpart of the commit driver above: when the configuration group has taken over a
-// dead owner's object (bumping the host epoch, advancing the generation, assigning the object to the
-// surviving candidate the rendezvous ranks first), the new owner must run phase one before it serves —
-// a batched round that raises each holder's fence to the new epoch and adopts the newest record held
-// under the old one, so nothing that ever committed is lost (Continuity) and a resumed stale owner can
-// no longer reach quorum (StaleNeverCommits). The register protocol (`slates-db`) owns the synchronous
-// per-holder step ([`Acceptor::prepare`]) and the adoption rule; this drives it asynchronously over the
-// transport, the same ownership split and the same dispatch shape as the commit round. The caller
-// supplies acceptors whose authority the configuration group already advanced (owner = the successor,
-// generation = the new version) — the config distribution that precedes the takeover.
+// A single-value register's phase one (volume heads, merge records) runs one batched round per retired host in
+// the daemon (`slates_server::takeover`), which holds the per-object state it needs — the holds, the retired
+// hosts' lineage, the lease gate — and drives it over these sessions. The per-object promotion this module
+// once drove (one round per object, run by a successor that already held it) could not take over an object a
+// surviving candidate never received, and is gone
+// (`docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`). Stream id 2, its
+// wire kind, is retired and not reused.
 
-/// The stream a phase-one prepare request rides on a holder connection — distinct from the commit
-/// stream so a holder can tell a promotion from a write.
-/// Format: the register-promote RPC uses its own stream id per connection; a fixed label, not a tunable.
-pub const PROMOTE_STREAM: u64 = 2;
-
-/// Serves one phase-one prepare on a holder: receives the [`Prepare`] over the transport, runs it
-/// through the holder's [`Acceptor`] (which checks the installed generation and owner, raises the fence
-/// to the new epoch, and reports the highest record it holds for the object), and replies with the
-/// binding [`Promise`] — or an empty reply if the acceptor refuses (a foreign generation, an
-/// unauthorized owner, or an epoch below the fence), so the new owner counts nothing. The holder loops
-/// this for successive prepares; the `acceptor` is its persistent store, shared with [`serve_record`].
-pub async fn serve_promotion(
-  endpoint: &mut Endpoint,
-  acceptor: &mut Acceptor,
-) -> Result<(), slates_transport::endpoint::EndpointError> {
-  endpoint
-    .serve_once(|_, request| match Prepare::decode(&request) {
-      Ok(prepare) => match acceptor.prepare(&prepare) {
-        Ok(promise) => promise.encode(),
-        Err(_) => Vec::new(),
-      },
-      Err(_) => Vec::new(),
-    })
-    .await
-}
-
-/// A promotion's outcome and the holder connections still open for reuse — the phase-one counterpart of
-/// [`Committed`]. On a quorum of promises the [`Promotion`] (the promising set and the adopted record);
-/// on the deadline [`ClusterError::Uncertain`] with an empty placement (the promotion did not confirm);
-/// short of quorum [`ClusterError::NotPlaced`]. The new owner completes the takeover by re-committing
-/// [`Promotion::adoption_record`] with [`commit_record`] and only then serving.
-pub struct Promoted {
-  /// The promotion result: a quorum-backed [`Promotion`], or why it did not confirm.
-  pub outcome: Result<Promotion, ClusterError>,
-  /// The holder connections still open, for the adoption re-commit that follows.
-  pub reusable: Vec<(HostId, Endpoint)>,
-  /// The holders still in flight at the return, whose sessions the caller recovers later.
-  pub stragglers: Stragglers,
-}
-
-/// Collects promises until a quorum promised or the deadline: records each distinct, binding promise
-/// into `promised`, folds the newest reported record into `adopted` (the same order the sans-io
-/// [`promote_over_holders`] uses), keeps every replying holder's endpoint for reuse, and returns the
-/// reusable endpoints and whether the deadline was reached. Recovers the endpoints of tasks that
-/// finished after the loop.
-async fn collect_promises(
-  rx: &mut std::sync::mpsc::Receiver<Reply>,
-  prepare: &Prepare,
-  candidates: &[HostId],
-  quorum: Quorum,
-  budget: CommitBudget,
-  promised: &mut Vec<HostId>,
-  adopted: &mut Option<Accepted>,
-) -> (Vec<(HostId, Endpoint)>, bool) {
-  let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
-  let mut timed_out = false;
-  let mut wait = DispatchWait::new(budget, now_ns());
-  while !quorum.committed(promised.len()) {
-    match rx.try_recv() {
-      Ok(Reply(host, reply, endpoint)) => {
-        reusable.push((host, *endpoint));
-        if let Ok(promise) = Promise::decode(&reply.bytes)
-          && promise.holder == host
-          && promise.binds(prepare)
-          && candidates.contains(&host)
-          && !promised.contains(&host)
-        {
-          promised.push(host);
-          fold_adopted(adopted, promise.highest);
-        }
-      }
-      // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
-      // promotion at its deadline is still filling its quorum (keep waiting) or has stalled (time out).
-      Err(TryRecvError::Empty) => {
-        if !wait.keep_waiting(promised.len()).await {
-          timed_out = true;
-          break;
-        }
-      }
-      Err(TryRecvError::Disconnected) => break,
-    }
-  }
-  while let Ok(Reply(host, _, endpoint)) = rx.try_recv() {
-    reusable.push((host, *endpoint));
-  }
-  (reusable, timed_out)
-}
-
-/// Keeps the newer of the running adoption and a holder's reported record (§4.8 "adopts the newest
-/// reported record per object"): a higher position, or the same position under a higher epoch, wins.
-fn fold_adopted(adopted: &mut Option<Accepted>, reported: Option<Accepted>) {
-  if let Some(reported) = reported {
-    let keep = match adopted {
-      Some(best) => reported.newer_than(best),
-      None => true,
-    };
-    if keep {
-      *adopted = Some(reported);
-    }
-  }
-}
-
-/// Runs phase one for `prepare` across its `candidates` (§4.8 "each new owner runs phase one in one
-/// batched round"). The new owner (`new_owner`) promises locally through `owner_acceptor` (it is a
-/// candidate — the surviving holder the takeover named); the `remote_holders` are each sent the prepare
-/// concurrently — one task per holder, so a slow holder never serializes the others — and the loop
-/// collects **distinct, binding** promises until a quorum promised or the budget's deadline expires (a
-/// promotion still filling its quorum near the deadline earns the budget's progress extension, the same
-/// §4.8 "late work" policy the commit uses), folding the newest adopted record as it goes. It returns a
-/// [`Promoted`]: on a quorum the [`Promotion`] (safe to
-/// serve — `f + 1` promises intersect every prior `f + 1` commit, so the adoption covers the committed
-/// prefix); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`] —
-/// with the replying holders' connections handed back for the adoption re-commit. Holders still in flight
-/// at the return are not cancelled but hand their sessions back through [`Promoted::stragglers`]. The
-/// budget is the caller's to derive (owed — a measured RTT budget); nothing here is a
-/// hidden constant.
-pub async fn promote_record(
-  new_owner: HostId,
-  owner_acceptor: &mut Acceptor,
-  candidates: &[HostId],
-  prepare: &Prepare,
-  quorum: Quorum,
-  remote_holders: Vec<(HostId, Endpoint)>,
-  budget: CommitBudget,
-) -> Promoted {
-  let mut promised: Vec<HostId> = Vec::new();
-  let mut adopted: Option<Accepted> = None;
-  // The new owner's own hold: it promises to itself, raising its fence and reporting its highest record.
-  if let Ok(local) = owner_acceptor.prepare(prepare)
-    && candidates.contains(&new_owner)
-  {
-    promised.push(new_owner);
-    fold_adopted(&mut adopted, local.highest);
-  }
-
-  // A local promise may already be a quorum (f = 0: one candidate, the new owner) — no dispatch needed.
-  if quorum.committed(promised.len()) {
-    return Promoted {
-      outcome: Ok(Promotion { promised, adopted }),
-      reusable: Vec::new(),
-      stragglers: Stragglers::none(),
-    };
-  }
-
-  // Dispatch each remote holder in its own task, reporting to one channel; the collection loop below
-  // bounds the wait itself (its progress-extension policy), so no deadline task is needed. Children of
-  // the calling task, so they end with it (no orphans), and each is bounded by the dispatch's span.
-  let (tx, mut rx) = channel::<Reply>();
-  let prepare_bytes = prepare.encode();
-  let deadline_ns = budget.max_deadline_ns();
-  let mut tasks = Vec::new();
-  for (host, endpoint) in remote_holders {
-    let tx = tx.clone();
-    let bytes = prepare_bytes.clone();
-    let spawned = spawn_child(async move {
-      // Bounded and endpoint-preserving (see `request_within`): a holder that does not promise in time still
-      // returns its session, so the new owner can retry the takeover over the same warm session.
-      let (reply, endpoint) = request_within(
-        endpoint,
-        PROMOTE_STREAM,
-        Priority::Control,
-        &bytes,
-        deadline_ns,
-      )
-      .await;
-      let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
-    });
-    match spawned {
-      Ok(task) => tasks.push(task),
-      Err(e) => return promote_spawn_failed(&tasks, e),
-    }
-  }
-  drop(tx); // so the channel disconnects once every task has ended
-
-  let (reusable, timed_out) = collect_promises(
-    &mut rx,
-    prepare,
-    candidates,
-    quorum,
-    budget,
-    &mut promised,
-    &mut adopted,
-  )
-  .await;
-
-  // Detach every dispatch task so its slot is reaped on termination, not held (joinable) until this
-  // perpetual caller finishes — an un-detached slot would leak, one per holder per takeover (banned item 8).
-  // Detaching does not cancel: a straggler still promising self-reaps on completion, having handed its
-  // session back over the channel `stragglers` drains.
-  for task in &tasks {
-    let _ = detach(*task);
-  }
-
-  // Whatever is still running is left to finish (bounded by the dispatch's span) and hands its session
-  // back through the channel — recovered by the caller from `stragglers`, never dropped.
-  let stragglers = Stragglers::pending(rx);
-
-  let promotion = Promotion {
-    promised: promised.clone(),
-    adopted,
-  };
-  let outcome = if quorum.committed(promised.len()) {
-    Ok(promotion)
-  } else if timed_out {
-    Err(ClusterError::Uncertain {
-      placement: Placement {
-        candidates: candidates.to_vec(),
-        acked: promised,
-        mirror_acked: None,
-        joint: Vec::new(),
-      },
-    })
-  } else {
-    Err(ClusterError::NotPlaced {
-      placement: Placement {
-        candidates: candidates.to_vec(),
-        acked: promised,
-        mirror_acked: None,
-        joint: Vec::new(),
-      },
-    })
-  };
-  Promoted {
-    outcome,
-    reusable,
-    stragglers,
-  }
-}
-
-/// The [`Promoted`] returned when a dispatch task could not be spawned: the runtime error, the tasks
-/// already started cancelled, and no endpoints recoverable (they moved into the spawned futures).
-fn promote_spawn_failed(tasks: &[slates_rt::TaskId], error: RtError) -> Promoted {
-  for task in tasks {
-    let _ = cancel(*task);
-  }
-  Promoted {
-    outcome: Err(ClusterError::Runtime(error)),
-    reusable: Vec::new(),
-    stragglers: Stragglers::none(),
-  }
-}
-
-/// Runs phase one using a validated post-takeover [`Configuration`] as the authority interface (§4.8
-/// "epoch allocation derives from configuration authority") — the counterpart of
-/// [`commit_under_configuration`]. The new owner, the bumped epoch, the generation and the candidate
-/// holders (rendezvous over the configuration's neighbourhood for `object`) all come from it, so the
-/// prepare is consistent with the configuration the holders have installed. This is where the
-/// configuration group (owed) publishes the taken-over [`Configuration`] this reads.
-pub async fn promote_under_configuration(
-  configuration: &Configuration,
-  object: ObjectId,
-  owner_acceptor: &mut Acceptor,
-  remote_holders: Vec<(HostId, Endpoint)>,
-  budget: CommitBudget,
-) -> Promoted {
-  let prepare = Prepare {
-    owner: configuration.owner,
-    object,
-    epoch: configuration.host_epoch,
-    generation: configuration.version,
-  };
-  let candidates = candidates_for(
-    configuration.owner,
-    &configuration.neighbourhood,
-    &configuration.domains,
-    object,
-    configuration.quorum,
-  );
-  promote_record(
-    configuration.owner,
-    owner_acceptor,
-    &candidates,
-    &prepare,
-    configuration.quorum,
-    remote_holders,
-    budget,
-  )
-  .await
-}
-
-/// The stream a *ledger* phase-one prepare rides on a holder connection — distinct from the single-value
-/// promotion's [`PROMOTE_STREAM`] so a holder serving both tells them apart.
+/// The stream a *ledger* phase-one prepare rides on a holder connection — distinct from every other RPC kind on
+/// the connection, so a holder serving several tells them apart.
 /// Format: one stream id per RPC kind on a connection; the holder's serve accepts whichever arrives.
 const LEDGER_PROMOTE_STREAM: u64 = 3;
 
@@ -1159,8 +876,7 @@ pub struct LedgerPromotion {
   pub adopted: Vec<[u8; 32]>,
 }
 
-/// A ledger promotion's outcome and the holder connections still open for reuse — the multi-entry
-/// counterpart of [`Promoted`]. On a quorum of promises the [`LedgerPromotion`] (the adopted log and the
+/// A ledger promotion's outcome and the holder connections still open for reuse. On a quorum of promises the [`LedgerPromotion`] (the adopted log and the
 /// promising set); on the deadline [`ClusterError::Uncertain`]; short of quorum [`ClusterError::NotPlaced`].
 /// The new owner completes the takeover by re-committing the adopted log and only then serving.
 pub struct LedgerPromoted {
@@ -1240,7 +956,7 @@ async fn collect_ledger_promises(
 }
 
 /// Runs ledger phase one for `prepare` across its `candidates` (§4.8 "each new owner runs phase one in one
-/// batched round"), the multi-entry counterpart of [`promote_record`]. The new owner (`new_owner`)
+/// batched round"), for a ledger register (a green's merge-record log). The new owner (`new_owner`)
 /// promises locally through `owner_acceptor` (it is a candidate — the surviving holder the takeover
 /// named); the `remote_holders` are each sent the prepare concurrently — one task per holder — and the
 /// loop collects distinct, binding promises, each a holder's whole log, until a quorum promised or the

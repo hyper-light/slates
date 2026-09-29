@@ -56,6 +56,7 @@ pub mod peer;
 mod reap;
 pub mod state;
 mod status_pages;
+pub mod takeover;
 pub mod telemetry;
 // The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
 // on this host); pure over one platform seam, so it compiles and tests everywhere.

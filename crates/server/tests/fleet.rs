@@ -4693,7 +4693,7 @@ fn trace_routing_views(daemons: &[Daemon], object: ObjectId) {
             state.council.configuration().version,
             state.fleet.configuration().version,
             state.fleet.object_owner(object),
-            state.pending_takeovers.contains(&object),
+            state.departed_owners.contains_key(&object),
             state
               .fleet
               .membership()
@@ -6260,6 +6260,125 @@ fn settled_now(daemon: &Daemon, owner: HostId) -> Result<bool, ObserveError> {
   daemon
     .council_settlement(owner)
     .map(|settlement| settlement.is_some_and(|(settled, current)| settled == current))
+}
+
+/// Shape: how long [`a_takeover_completes_when_one_survivor_never_received_the_head`] holds the owner's record
+/// session to one survivor out — the placement deadline, longer than the placements and the owner's stop it
+/// has to cover; the hold ends with the owner in any case.
+const MISSED_HEAD_HOLD: Duration = PLACEMENT_DEADLINE;
+
+/// Shape: the most volumes [`a_takeover_completes_when_one_survivor_never_received_the_head`] creates to find one
+/// whose successor is each survivor. A volume's successor is either survivor with probability one half,
+/// independently of the others, so the chance that twenty-one volumes all fall to one survivor is 2^-20 — under
+/// one in a million.
+const SUCCESSOR_SEARCH: usize = 21;
+
+/// §4.8 "Promotion and takeover" (Paxos phase one: an acceptor that accepted nothing still promises;
+/// `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`): heads the owner
+/// committed at `f + 1` — itself and one survivor — while the other survivor never received them (the owner's
+/// record session to it held out) survive the owner's death, whichever survivor the configuration names each
+/// one's successor: the one holding the head (it needs the other's empty promise) and the one holding nothing
+/// (it learns the object from the other's answer). Non-vacuous: before the death the second survivor holds
+/// every head and the third holds none, and volumes of both kinds were made. Found by the three-process CLI
+/// fleet test, whose owner died right after placing at `f + 1` (CI run 36593853664: the survivor holding the
+/// head with a takeover pending, the other holding nothing).
+#[test]
+fn a_takeover_completes_when_one_survivor_never_received_the_head() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  // The owner's records cannot reach the third node: its record session is held out from before the
+  // volumes exist, so the third node never holds any record of them.
+  let held = daemons[0].hold_record_session(
+    hosts[2],
+    u64::try_from(MISSED_HEAD_HOLD.as_nanos()).unwrap_or(u64::MAX),
+  );
+  let volumes = volumes_for_each_successor(&daemons, &hosts);
+  let third_held: Vec<Result<bool, ObserveError>> = volumes
+    .iter()
+    .map(|(id, _)| {
+      daemons[2]
+        .fleet_holder_head(ObjectId(id.bytes))
+        .map(|head| head.is_some())
+    })
+    .collect();
+
+  // The owner dies; a survivor must take every volume over and serve it.
+  daemons.remove(0).stop();
+  let survivors: Vec<&Daemon> = daemons.iter().collect();
+  let started = Instant::now();
+  let served = poll_until(&survivors, SERVE_DEADLINE, || {
+    let all = volumes.iter().all(|(id, _)| {
+      daemons
+        .iter()
+        .any(|daemon| status_answers_once(daemon.instance(), *id))
+    });
+    Ok(all || started.elapsed() >= SERVE_DEADLINE)
+  }) && started.elapsed() < SERVE_DEADLINE;
+  let counters: Vec<_> = daemons.iter().map(Daemon::fleet_refusals).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    matches!(held, Ok(SessionHold::Took { .. })),
+    "the owner's record session to the third node was held out: {held:?}"
+  );
+  let successors: std::collections::BTreeSet<HostId> =
+    volumes.iter().map(|(_, successor)| *successor).collect();
+  assert_eq!(
+    successors.len(),
+    2,
+    "volumes whose successor is each survivor were made: {volumes:?}"
+  );
+  assert!(
+    third_held.iter().all(|held| matches!(held, Ok(false))),
+    "the third node never received any head: {third_held:?}"
+  );
+  assert!(
+    served,
+    "a survivor took every volume over and serves it within {SERVE_DEADLINE:?}: {counters:?}"
+  );
+}
+
+/// Creates, snapshots and places volumes on `daemons[0]` — each head held by `daemons[1]` — until one's
+/// successor among the two survivors is each of them (at most [`SUCCESSOR_SEARCH`]): the volumes and their
+/// successors. The successor is the one rendezvous ranks first among the owner's surviving cohort, which in a
+/// three-member region at `f = 1` is both survivors. Panics (the test fails) if a volume does not place.
+fn volumes_for_each_successor(daemons: &[Daemon], hosts: &[HostId]) -> Vec<(VolumeId, HostId)> {
+  let survivors = [hosts[1], hosts[2]];
+  let mut client = Client::connect(daemons[0].instance());
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut volumes = Vec::new();
+  for attempt in 0..SUCCESSOR_SEARCH {
+    let ReplyBody::Created { id } = client.call(&scratch(&format!("missed-head-{attempt}"))) else {
+      panic!("create on the owner")
+    };
+    let ReplyBody::Snapshotted { id: snapshot, .. } =
+      client.call(&RequestBody::Snapshot { volume: id })
+    else {
+      panic!("snapshot on the owner")
+    };
+    let object = ObjectId(id.bytes);
+    assert!(
+      poll_snapshot_placed(&observed, &mut client, id, snapshot),
+      "volume {attempt} placed"
+    );
+    assert!(
+      poll_until(&observed, PLACEMENT_DEADLINE, || {
+        daemons[1]
+          .fleet_holder_head(object)
+          .map(|head| head.is_some())
+      }),
+      "the second node holds volume {attempt}'s head"
+    );
+    let successor = rendezvous_first(&survivors, object).unwrap();
+    volumes.push((id, successor));
+    let seen: std::collections::BTreeSet<HostId> =
+      volumes.iter().map(|(_, successor)| *successor).collect();
+    if seen.len() == survivors.len() {
+      break;
+    }
+  }
+  volumes
 }
 
 /// Polls `status` for `volume` at the daemon reached at `instance` until it answers with a report (the

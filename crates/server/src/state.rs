@@ -418,15 +418,12 @@ pub struct ShardState {
   /// carried the message. The acceptor's authority owner is the socket's TLS-authenticated peer, so a
   /// record whose owner field is not that peer is refused. Empty on a laptop (no fleet loop runs).
   pub holder_records: BTreeMap<ObjectId, Acceptor>,
-  /// The objects this node must **take over** — an owner died and rendezvous ranked this node first among
-  /// the survivors for the object (§4.8 "Promotion and takeover"), recorded here by the probe loop
-  /// ([`crate::fleet::probe_peer`] via `sync_peer`) for the record-ship task to drive: it promotes the
-  /// object's head over the surviving candidate holders (phase one, adopting the newest committed record),
-  /// re-commits the adopted head under the new epoch, and records the placement — then removes the object.
-  /// An object stays until its takeover places (the drive retries each period, self-healing across the
-  /// window while every survivor brings its holds' authority into step). Empty on a laptop (no fleet loop
-  /// runs) and whenever no takeover is outstanding.
-  pub pending_takeovers: std::collections::BTreeSet<ObjectId>,
+  /// This node's takeovers in progress (§4.8 "Promotion and takeover"; [`crate::takeover`]): for each kept
+  /// retirement whose survivors include this node and that it has not confirmed its share of yet, the round —
+  /// its epoch, each asked member's progress, the objects learned and adopted. Only the control shard drives it;
+  /// bounded by the kept retirements, each entry dropped once this node no longer owes a confirmation. Empty on
+  /// a laptop (no fleet loop runs) and whenever no takeover is outstanding.
+  pub host_takeovers: BTreeMap<slates_db::HostId, crate::takeover::HostTakeover>,
   /// A learner has evidence its configuration is behind the region and should refresh from a voter next
   /// period (§4.8 the reactive piggyback). Set when this node **received** a record naming a newer
   /// configuration generation than its own (the holder-behind case, [`crate::fleet::accept_held_record`]),
@@ -502,16 +499,16 @@ pub struct ShardState {
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder
-  /// (`fleet::serve_held_promotion`, `fleet::drive_takeover`). Only the control shard writes it; bounded
-  /// by the members.
+  /// (`takeover::serve_host_prepare`). Only the control shard writes it; bounded by the members.
   pub answers_given: crate::lease::AnswersGiven,
   /// The held objects whose owner a committed configuration retired and whose successor has not yet
   /// re-committed them here: the departed owner and the version that retired it, so the promotion gate knows
   /// whom this node answered and what that owner must have seen. Kept at **every** holder of such an object,
-  /// not only its successor, because every promising holder applies the gate (`fleet::serve_held_promotion`;
-  /// the successor also gates its own drive, `fleet::takeovers`). Set at the configuration install
-  /// (`fleet::sync_config_from_council`), removed when this holder accepts a record of the object from its
-  /// new owner (`fleet::accept_held_record`) or the successor places it (`fleet::drive_takeover`). Bounded by
+  /// not only its successor, because every promising holder applies the gate (`takeover::serve_host_prepare`),
+  /// and it names the retired host whose takeover round lists the object. Set at the configuration install
+  /// (`takeover::resolve_held_objects`), removed when this holder accepts a record of the object from its new
+  /// owner (`fleet::accept_held_record`), when the successor adopts it (`takeover::record_adoption`), or when a
+  /// stale copy is reclaimed. Bounded by
   /// the held objects; only the control shard touches it.
   pub departed_owners: BTreeMap<ObjectId, crate::lease::DepartedOwner>,
   /// The configuration council's election timing as derived this period from the paths to its other

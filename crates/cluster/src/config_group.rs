@@ -19,9 +19,10 @@
 //! the drive lives there. A **small** elected voter set carries the consensus; the wider region's members
 //! that do not vote are **learners** that fetch the committed configuration (`is_voter`/`adopt`). Taking
 //! over a failed host bumps that host's fencing epoch ([`ConfigCommand::TakeOver`]), so a resumed stale
-//! owner is refused `StaleEpoch`; the phase-one recovery and adoption the new owner then runs live in
-//! `slates_db::register` (`install_authority`/`prepare`) and [`crate`]
-//! (`promote_record`/`promote_under_configuration`), oracle-tested for Continuity and StaleNeverCommits.
+//! owner is refused `StaleEpoch`; the phase-one recovery and adoption the successors then run are decided from
+//! the retirement this configuration records (`RegionalConfiguration::lineage`), with the per-object step in
+//! `slates_db::register` (`install_authority`/`prepare`, oracle-tested for Continuity and StaleNeverCommits)
+//! and the batched round in the daemon (`slates_server::takeover`).
 //!
 //! The **voter set follows the committed membership**: whenever a committed admit, retire or takeover frees
 //! or fills a seat, the leader moves the Raft voter set through the core's joint-consensus change
@@ -873,7 +874,7 @@ impl RegionalCouncil {
     let (command, would_change) = match change {
       Reconfiguration::Admit { host, domain } => (
         ConfigCommand::Admit { host, domain },
-        !self.fold.state().members.contains(&host),
+        self.fold.state().admits(host),
       ),
       Reconfiguration::Retire(host) => (
         ConfigCommand::Retire(host),

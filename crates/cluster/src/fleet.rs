@@ -35,13 +35,13 @@ use std::collections::BTreeMap;
 
 use slates_db::register::{
   Acceptor, Authority, Configuration, HostId, ObjectId, Quorum, Record, RegionalConfiguration,
-  RegisterError, candidates_for,
+  RegisterError,
 };
 use slates_transport::endpoint::Endpoint;
 
 use crate::gossip::Gossip;
 use crate::membership::{Liveness, MemberState, Membership};
-use crate::routing::{Reassignment, RecoveryCohort, Routing};
+use crate::routing::Routing;
 use crate::{CommitBudget, Committed, commit_under_configuration};
 
 /// The owner runtime on one node: the SWIM view, this node's **current configuration** (the view the
@@ -99,7 +99,7 @@ impl FleetNode {
       configuration,
       members,
       acceptor,
-      routing: Routing::new(host),
+      routing: Routing::new(),
     }
   }
 
@@ -129,47 +129,30 @@ impl FleetNode {
 
   /// Installs the configuration the regional council has committed for this owner, given the region's
   /// `members` it was derived from (§4.8, D-14 — the council is the authority; this node places under the
-  /// configuration it agreed). Sets it as this node's current configuration, brings the owner's acceptor
+  /// configuration it agreed). Sets it as this node's current configuration and brings the owner's acceptor
   /// authority into step (the generation is the configuration's version, so the owner writes its next records
-  /// under the current generation, which a holder on the new configuration requires), and returns the objects
-  /// this node must now **take over**: for every owner that **left the region**, the held objects whose
-  /// remembered candidates rank this node first among current survivors. Membership changes do not
-  /// replace that record's placement with the new neighborhood (`routing.take_over`).
-  /// Idempotent — re-installing an unchanged membership retires no one and returns nothing, so the daemon may
-  /// call it every period.
-  pub fn install_configuration(
-    &mut self,
-    configuration: Configuration,
-    members: &[HostId],
-  ) -> Vec<Reassignment> {
-    let retired: Vec<HostId> = self
-      .members
-      .iter()
-      .copied()
-      .filter(|member| !members.contains(member))
-      .collect();
-    let takeovers: Vec<Reassignment> = retired
-      .iter()
-      .flat_map(|dead| self.routing.take_over(*dead, members))
-      .collect();
-    // This node's **own** fencing epoch advanced: the council took this host over while it was away
-    // (retired, then re-admitted under the same id — a false death, or an isolation that healed). Every
-    // object it holds a routing entry for and still names itself the owner of was reassigned by the
-    // survivors exactly as a dead host's are, so its routing yields them the same way — to the survivor
-    // rendezvous ranks first among each object's remembered candidates — and later lookups forward there
-    // rather than serving its stale copy (§4.8 "Leases and reads", AUD-08; "Authority scope": the bumped
-    // epoch fences every object owned by that host). The owner-lease gate refuses the stale copy's latest
-    // state in the meantime; forwarding an owned volume with no routing entry to its successor is the
-    // broader ledger-transfer contract (GAP-A9-7).
+  /// under the current generation, which a holder on the new configuration requires). Who takes a retired
+  /// owner's objects over is the configuration's to name ([`RegionalConfiguration::lineage`]); the node that
+  /// installs it moves each held object to its successor ([`track_object_owner`](FleetNode::track_object_owner)).
+  /// Idempotent, so the daemon may call it every period.
+  ///
+  /// This node's **own** fencing epoch advanced: the council took this host over while it was away (retired,
+  /// then re-admitted under the same id — a false death, or an isolation that healed). A retired id is
+  /// admitted again only once no kept retirement names it ([`RegionalConfiguration::admits`]), so that
+  /// takeover is done and every object this node owned belongs to a successor now: its entries naming itself
+  /// are stale and are forgotten, and later lookups forward to the successors rather than serving a stale copy
+  /// (§4.8 "Leases and reads", AUD-08; "Authority scope": the bumped epoch fences every object owned by that
+  /// host). Forwarding an owned volume with no routing entry to its successor is the broader ledger-transfer
+  /// contract (GAP-A9-7).
+  pub fn install_configuration(&mut self, configuration: Configuration, members: &[HostId]) {
     if configuration.host_epoch.0 > self.configuration.host_epoch.0 {
-      let _ = self.routing.take_over(self.host, members);
+      self.routing.forget_owned_by(self.host);
     }
     self.members = members.to_vec();
     self.configuration = configuration;
     let _ = self
       .acceptor
       .install_authority(Self::authority(&self.configuration));
-    takeovers
   }
 
   /// The current configuration (the authority the async register drivers carry): the owner, the host
@@ -194,56 +177,24 @@ impl FleetNode {
     &self.membership
   }
 
-  /// Remembers the placement of an accepted record under `regional` (§4.8). The caller validates that
-  /// the record names this configuration generation before accepting it. Derive the copyset from its
-  /// owner's neighborhood, not this holder's, and keep it through later membership changes. Repeated
-  /// acceptance in the same generation reuses the entry; a nonmember owner is refused typed.
+  /// Records that `owner`, the author of a record this node accepted under `regional` (§4.8), owns
+  /// `object`. A non-member owner is refused typed ([`RegisterError::Unauthorized`]): only a member writes.
   pub fn track_object(
     &mut self,
     object: ObjectId,
     owner: HostId,
     regional: &RegionalConfiguration,
   ) -> Result<(), RegisterError> {
-    let neighbourhood = regional
-      .neighbourhoods
-      .get(&owner)
-      .ok_or(RegisterError::Unauthorized)?;
-    if !self.routing.tracked_at(object, owner, regional.version) {
-      let candidates = candidates_for(
-        owner,
-        &neighbourhood.hosts,
-        &regional.domains,
-        object,
-        regional.quorum,
-      );
-      self.routing.track(
-        object,
-        owner,
-        RecoveryCohort {
-          generation: regional.version,
-          candidates,
-          quorum: regional.quorum,
-        },
-      );
+    if !regional.members.contains(&owner) {
+      return Err(RegisterError::Unauthorized);
     }
+    self.routing.track(object, owner);
     Ok(())
   }
 
-  /// The candidate set and quorum that accepted this object's held record. Retirement changes its
-  /// owner but keeps this recovery obligation until the adopted record is placed under its successor.
-  pub fn recovery_cohort(&self, object: ObjectId) -> Option<&RecoveryCohort> {
-    self.routing.recovery_cohort(object)
-  }
-
-  /// Records the successor's completed re-commit using the exact placement captured for that round.
-  /// Membership may have advanced while it awaited replies; never infer a different cohort afterward.
-  pub fn record_adopted_placement(
-    &mut self,
-    object: ObjectId,
-    owner: HostId,
-    cohort: RecoveryCohort,
-  ) {
-    self.routing.track(object, owner, cohort);
+  /// Moves `object` to `owner`: the successor a retirement names for it, or this node once it adopted it.
+  pub fn track_object_owner(&mut self, object: ObjectId, owner: HostId) {
+    self.routing.track(object, owner);
   }
 
   /// Forgets `object` (destroyed, or no longer held here).
@@ -470,33 +421,21 @@ mod tests {
     .unwrap_or_else(|| Configuration::solo(owner))
   }
 
-  fn track(node: &mut FleetNode, object: ObjectId, owner: HostId) {
-    let quorum = node.configuration().quorum;
-    let regional = RegionalConfiguration::formed(
-      node.members().to_vec(),
-      quorum,
-      std::collections::BTreeMap::new(),
-      u64::try_from(quorum.candidates()).unwrap(),
-      false,
-    );
-    node.track_object(object, owner, &regional).unwrap();
-  }
-
   /// Installs a council configuration built from `members` at `quorum` into `node` (deriving its owner view
-  /// and passing the region members), returning the takeovers — the shape the daemon's council sync gives.
-  fn install(node: &mut FleetNode, members: &[HostId], quorum: Quorum) -> Vec<Reassignment> {
+  /// and passing the region members) — the shape the daemon's council sync gives.
+  fn install(node: &mut FleetNode, members: &[HostId], quorum: Quorum) {
     let configuration = config(node.host(), members, quorum);
-    node.install_configuration(configuration, members)
+    node.install_configuration(configuration, members);
   }
 
   /// Installs `regional`'s view for `node`'s owner (used where the version must advance through real
-  /// admits/retires on the regional configuration), returning the takeovers.
-  fn install_regional(node: &mut FleetNode, regional: &RegionalConfiguration) -> Vec<Reassignment> {
+  /// admits/retires on the regional configuration).
+  fn install_regional(node: &mut FleetNode, regional: &RegionalConfiguration) {
     let owner = node.host();
     let configuration = regional
       .configuration_for(owner)
       .unwrap_or_else(|| Configuration::solo(owner));
-    node.install_configuration(configuration, &regional.members)
+    node.install_configuration(configuration, &regional.members);
   }
 
   /// The invariants the owner runtime holds at *every* scale (checked identically at N=1 and in a fleet —
@@ -715,138 +654,60 @@ mod tests {
     }
   }
 
-  /// AC (§4.8 takeover, driven by the council's configuration): when the council retires an owner this node
-  /// backs, installing the new configuration reassigns the retired owner's objects and returns the ones that
-  /// fall to this node — rendezvous over surviving candidates of the accepted placement.
-  /// Non-vacuous: this node takes some of the retired owner's objects and the other survivor takes the rest.
+  /// §4.8 "Promotion and takeover": this node's own epoch advancing means the council took it over while it was
+  /// away and has since re-admitted it — which it does only once that takeover is done — so every entry naming
+  /// itself the owner is stale and forgotten, while the peers' objects it backs stay.
   #[test]
-  fn installing_a_retirement_hands_this_node_the_objects_that_fall_to_it() {
-    let mut node = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
-    install(&mut node, &[SELF, A, B], Quorum { f: 1 });
-    // This node holds a copy of many of A's objects (it backs them as a candidate).
-    let a_objects: Vec<ObjectId> = (0..64u64).map(|i| ObjectId::new(A, i)).collect();
-    for &object in &a_objects {
-      track(&mut node, object, A);
-    }
-
-    // The council retires A: install the configuration without it. The install hands back A's objects that
-    // now rendezvous first to this node.
-    let takeovers = install(&mut node, &[SELF, B], Quorum { f: 1 });
-    for reassignment in &takeovers {
-      assert_eq!(reassignment.new_owner, SELF);
-      assert_eq!(node.object_owner(reassignment.object), Some(SELF));
-      assert!(a_objects.contains(&reassignment.object));
-    }
-    // Non-vacuity: this node took some but not all — the other survivor (B) took the rest.
-    assert!(
-      !takeovers.is_empty(),
-      "this node took over some of A's objects"
-    );
-    assert!(
-      takeovers.len() < a_objects.len(),
-      "the other survivor took the rest (a real split)"
-    );
-  }
-
-  /// AC-8.1 / §4.8: a fresh learner joins before, or in the same observed update as, the old
-  /// owner's retirement. It has accepted none of that owner's records and cannot take them over.
-  /// The winner remains the first-ranked surviving candidate from the original placement.
-  #[test]
-  fn a_fresh_member_cannot_displace_a_surviving_holder_during_takeover() {
-    let replacement = HostId(4);
-    let old_members = [SELF, A, B];
-    let new_members = [SELF, B, replacement];
-    for join_first in [false, true] {
-      let mut node = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
-      install(&mut node, &old_members, Quorum { f: 1 });
-      let objects: Vec<_> = (0..64).map(|sequence| ObjectId::new(A, sequence)).collect();
-      for &object in &objects {
-        track(&mut node, object, A);
-      }
-      if join_first {
-        install(&mut node, &[SELF, A, B, replacement], Quorum { f: 1 });
-      }
-      install(&mut node, &new_members, Quorum { f: 1 });
-      for object in objects {
-        let expected = slates_db::register::rendezvous_first(&[SELF, B], object);
-        let actual = node.object_owner(object);
-        assert_eq!(
-          actual, expected,
-          "join_first={join_first}, object={object:?}: a replacement with no record cannot win over its surviving holders"
-        );
-      }
-    }
-  }
-
-  /// AC-8.18 / §4.8: above the candidate floor, a holder's neighborhood differs from the dead
-  /// owner's. Remember the owner's copyset and exclude all simultaneous retirements before ranking;
-  /// joining nodes and the holder's own unrelated neighbors never become owners of an unheld record.
-  #[test]
-  fn a_wide_takeover_uses_the_records_owner_copyset_and_all_surviving_members() {
+  fn a_re_admitted_node_forgets_the_objects_it_owned() {
     let quorum = Quorum { f: 1 };
-    let members: Vec<_> = (1..=9).map(HostId).collect();
     let mut regional = RegionalConfiguration::formed(
-      members.clone(),
+      vec![SELF, A, B],
       quorum,
       std::collections::BTreeMap::new(),
-      5,
+      3,
       false,
     );
-    let original = regional.configuration_for(A).unwrap();
-    let holder = original
-      .place(ObjectId::new(A, 0))
-      .candidates
-      .into_iter()
-      .find(|host| *host != A && *host != B)
-      .unwrap();
-    let peers: Vec<_> = members
-      .iter()
-      .copied()
-      .filter(|host| *host != holder)
-      .collect();
-    let mut node = FleetNode::new(holder, quorum, &peers);
+    let mut node = FleetNode::new(SELF, quorum, &[A, B]);
     install_regional(&mut node, &regional);
-    let mut held = Vec::new();
-    for sequence in 0..128 {
-      let object = ObjectId::new(A, sequence);
-      let candidates = original.place(object).candidates;
-      if candidates.contains(&holder) {
-        node.track_object(object, A, &regional).unwrap();
-        held.push((object, candidates));
-      }
+    let own = ObjectId::new(SELF, 1);
+    let backed = ObjectId::new(A, 1);
+    node.track_object_owner(own, SELF);
+    node.track_object(backed, A, &regional).unwrap();
+    regional.take_over(SELF, 3);
+    for survivor in regional.survivors_of(SELF) {
+      regional.confirm(SELF, survivor);
     }
     assert!(
-      !held.is_empty(),
-      "this holder accepted real records from the owner's copysets"
+      regional.admit(SELF, None, 3),
+      "re-admitted once its takeover is done"
     );
-    regional.admit(HostId(10), None, 5);
     install_regional(&mut node, &regional);
-    regional.retire(A, 5);
-    regional.retire(B, 5);
-    install_regional(&mut node, &regional);
-    for (object, candidates) in held {
-      let survivors: Vec<_> = candidates
-        .into_iter()
-        .filter(|host| regional.members.contains(host))
-        .collect();
-      assert_eq!(
-        node.object_owner(object),
-        slates_db::register::rendezvous_first(&survivors, object)
-      );
-    }
+    assert_eq!(
+      node.object_owner(own),
+      None,
+      "its own object belongs to a successor now"
+    );
+    assert_eq!(node.object_owner(backed), Some(A), "a backed object stays");
   }
 
-  /// The R8 degenerate of takeover: at `f = 0` (the laptop) this node backs no peer's object, so installing
-  /// its (unchanged) configuration yields no takeover — the same code path a fleet drives, exercised trivially.
+  /// §4.8: only a member writes, so a record's owner that is not a member is never tracked.
   #[test]
-  fn the_solo_runtime_takes_over_nothing() {
-    let mut node = FleetNode::solo(SELF);
-    track(&mut node, ObjectId::new(SELF, 0), SELF);
-    let takeovers = install(&mut node, &[SELF], Quorum { f: 0 });
-    assert!(
-      takeovers.is_empty(),
-      "the laptop takes over nothing (it backs no peer's object, and no owner departed)"
+  fn tracking_refuses_an_owner_that_is_not_a_member() {
+    let quorum = Quorum { f: 1 };
+    let regional = RegionalConfiguration::formed(
+      vec![SELF, A],
+      quorum,
+      std::collections::BTreeMap::new(),
+      3,
+      false,
     );
+    let mut node = FleetNode::new(SELF, quorum, &[A]);
+    let object = ObjectId::new(B, 1);
+    assert_eq!(
+      node.track_object(object, B, &regional),
+      Err(RegisterError::Unauthorized)
+    );
+    assert_eq!(node.object_owner(object), None);
   }
 
   /// AC (§4.8, the probe-loop bridge): `sync_membership` folds a detector's converged SWIM view into the

@@ -588,6 +588,17 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
   }
 }
 
+/// The objects this node's takeovers have learned and not yet adopted (§4.8 "Promotion and takeover"; the
+/// takeover module): what a status report shows as pending, so a stalled takeover shows in any node's status.
+fn takeovers_pending(state: &ShardState) -> u64 {
+  let pending: usize = state
+    .host_takeovers
+    .values()
+    .map(crate::takeover::HostTakeover::outstanding)
+    .sum();
+  u64::try_from(pending).unwrap_or(u64::MAX)
+}
+
 /// Whether this node's authority over `object`'s latest state is **not** confirmed right now, and the
 /// configuration version it would refuse with (§4.8 "Leases and reads"; AUD-08). Reads the fanned owner
 /// lease against the object's candidate holders under the installed configuration and the host clock, so a
@@ -1830,7 +1841,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     council: council_report(state),
     root: root_report(state),
     held_records: u64::try_from(state.holder_records.len()).unwrap_or(u64::MAX),
-    takeovers_pending: u64::try_from(state.pending_takeovers.len()).unwrap_or(u64::MAX),
+    takeovers_pending: takeovers_pending(state),
     configuration_version: state.fleet.configuration().version,
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
@@ -1912,7 +1923,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     || {
       (
         u64::try_from(state.holder_records.len()).unwrap_or(u64::MAX),
-        u64::try_from(state.pending_takeovers.len()).unwrap_or(u64::MAX),
+        takeovers_pending(state),
         configuration.version,
       )
     },

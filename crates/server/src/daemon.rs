@@ -2227,7 +2227,7 @@ fn init_shard(
   if let Some(configuration) = council.configuration().configuration_for(host) {
     let counts = config_shards.first() == Some(&shard);
     durability_shortfall = boot_durability(config, &configuration, counts);
-    let _ = fleet.install_configuration(configuration, &council_members);
+    fleet.install_configuration(configuration, &council_members);
   }
   // The root group across regions (§4.8, D-14): the regions the fleet spans and the representative host of
   // each (the root voters), driven over the transport by the control shard's config plane
@@ -2327,7 +2327,7 @@ fn init_shard(
     enrolled: Vec::new(),
     demuxes: Vec::new(),
     holder_records: std::collections::BTreeMap::new(),
-    pending_takeovers: std::collections::BTreeSet::new(),
+    host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
     record_sessions: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
@@ -3274,115 +3274,196 @@ mod tests {
     );
   }
 
-  /// AC-2.5, §4.8 takeover; AUD-10 sibling: a forged prepare must not raise the promise. The
-  /// configuration-authorized successor can still prepare and commit after the refused forgery.
-  #[test]
-  fn a_takeover_prepare_binds_its_owner_to_the_authenticated_peer() {
-    use slates_db::register::{
-      Acceptor, Ack, Authority, HostEpoch, HostId, ObjectId, Prepare, Promise, Record,
-    };
-    let (spoofed, promised, committed) = audit_on_shard(|state| {
-      // The sole surviving configured member takes over a departed peer's record. Its authority
-      // and its placement both name a real member; the forged transport principal is the old owner.
-      let successor = state.fleet.host();
-      let owner = HostId(successor.0 ^ 1);
-      let object = ObjectId([19; 16]);
-      let generation = state.fleet.configuration().version;
-      let mut acceptor = Acceptor::new(successor, Authority { generation, owner });
-      acceptor
-        .install_authority(Authority {
-          generation,
-          owner: successor,
-        })
-        .unwrap();
-      state.holder_records.insert(object, acceptor);
-      let prepare = Prepare {
-        owner: successor,
+  /// Installs the audit node's council configuration into its placement view, as the coordinator's council
+  /// sync does each period.
+  fn install_council(state: &mut crate::state::ShardState) {
+    let local = state.fleet.host();
+    let regional = state.council.configuration().clone();
+    let configuration = regional.configuration_for(local).unwrap();
+    state
+      .fleet
+      .install_configuration(configuration, &regional.members);
+  }
+
+  /// Makes the audit node one of three members of an `f = 1` region whose council it alone votes in, holding
+  /// one record of `object` written by the second member; then retires that member and installs the result, so
+  /// the object resolves to its successor among the two survivors. Returns the retired member and the successor.
+  fn retire_the_owner_of_a_held_object(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+  ) -> (slates_db::HostId, slates_db::HostId) {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
+    let local = state.fleet.host();
+    let departed = HostId(local.0 ^ 1);
+    let third = HostId(local.0 ^ 2);
+    state.council = RegionalCouncil::new(
+      local,
+      vec![local, departed, third],
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    install_council(state);
+    let generation = state.fleet.configuration().version;
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: departed,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: departed,
         object,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: b"head".to_vec(),
+      })
+      .unwrap();
+    state.holder_records.insert(object, acceptor);
+    state.fleet.track_object_owner(object, departed);
+    assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+    install_council(state);
+    crate::takeover::resolve_held_objects(state, local);
+    let successor = state.fleet.object_owner(object).unwrap();
+    (departed, successor)
+  }
+
+  /// AC-2.5, §4.8 takeover; AUD-10 sibling: a takeover page whose asker is not the session's authenticated peer
+  /// promises nothing; the configuration's successor, asking over its own session, is promised the record and
+  /// can then commit its adoption through this holder.
+  #[test]
+  fn a_takeover_page_binds_its_asker_to_the_authenticated_peer() {
+    use slates_db::register::{Ack, HostEpoch, HostPrepare, HostPromise, ObjectId, Record};
+    let (spoofed, promised, committed) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let object = ObjectId([19; 16]);
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let generation = state.fleet.configuration().version;
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
         epoch: HostEpoch(2),
         generation,
+        after: None,
       };
-      let forgery = Prepare {
-        epoch: HostEpoch(3),
-        ..prepare
-      };
-      let spoofed = crate::fleet::serve_held_promotion(state, owner, &forgery);
-      let promised = crate::fleet::serve_held_promotion(state, successor, &prepare);
+      let spoofed = crate::takeover::serve_host_prepare(state, local, departed, &prepare.encode());
+      let promised =
+        crate::takeover::serve_host_prepare(state, local, successor, &prepare.encode());
       let record = Record {
         owner: successor,
         object,
         sequence: 0,
         epoch: prepare.epoch,
         generation,
-        value: Vec::new(),
+        value: b"head".to_vec(),
       };
-      let committed = crate::fleet::accept_held_record(state, successor, successor, &record);
+      let committed = crate::fleet::accept_held_record(state, local, successor, &record);
       (spoofed, promised, committed)
     });
-    assert!(spoofed.is_empty());
-    assert!(Promise::decode(&promised).is_ok());
-    assert!(Ack::decode(&committed).is_ok());
+    assert!(spoofed.is_empty(), "a forged asker is promised nothing");
+    let promise = HostPromise::decode(&promised).expect("the successor is promised");
+    assert_eq!(promise.entries.len(), 1, "the held record is listed");
+    assert!(promise.next.is_none(), "one page answers in full");
+    assert!(
+      Ack::decode(&committed).is_ok(),
+      "the successor's adoption commits here"
+    );
   }
 
-  /// §4.8 "Leases and reads"; AUD-08: a holder answers a successor's prepare for a departed owner's object only
-  /// once that owner's lease — which this holder's own answers to its probes may still be feeding — can have
-  /// lapsed. The owner's lease needs `others − f` fresh confirmations so that every `f + 1` promotion quorum
-  /// contains a confirming holder; that is safe only if every promising holder applies the gate, not only the
-  /// successor. While this holder has answered the departed owner within the membership horizon it promises
-  /// nothing; once it has not, it promises.
+  /// §4.8 "Leases and reads"; AUD-08: a holder answers a successor's takeover page only once the retired owner's
+  /// lease — which this holder's own answers to its probes may still be feeding — can have lapsed. The owner's
+  /// lease needs `others − f` fresh confirmations so that every `f + 1` promotion quorum contains a confirming
+  /// holder; that is safe only if every promising holder applies the gate, not only the successor. While this
+  /// holder has answered the retired owner within the membership horizon it promises nothing; once it has not,
+  /// it promises.
   #[test]
   fn a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease() {
-    use slates_db::register::{Acceptor, Authority, HostEpoch, HostId, ObjectId, Prepare, Promise};
+    use slates_db::register::{HostEpoch, HostPrepare, HostPromise, ObjectId};
     let (fed, lapsed) = audit_on_shard(|state| {
-      let successor = state.fleet.host();
-      let departed = HostId(successor.0 ^ 1);
+      let local = state.fleet.host();
       let object = ObjectId([23; 16]);
-      let generation = state.fleet.configuration().version;
-      let mut acceptor = Acceptor::new(
-        successor,
-        Authority {
-          generation,
-          owner: departed,
-        },
-      );
-      acceptor
-        .install_authority(Authority {
-          generation,
-          owner: successor,
-        })
-        .unwrap();
-      state.holder_records.insert(object, acceptor);
-      state.departed_owners.insert(
-        object,
-        crate::lease::DepartedOwner {
-          owner: departed,
-          since_version: generation,
-        },
-      );
+      let (departed, successor) = retire_the_owner_of_a_held_object(state, object);
+      let prepare = HostPrepare {
+        departed,
+        owner: successor,
+        epoch: HostEpoch(2),
+        generation: state.fleet.configuration().version,
+        after: None,
+      }
+      .encode();
       let now = slates_machine::clock::monotonic_ns();
       state.answers_given.answered_alive(departed, now);
-      let prepare = Prepare {
-        owner: successor,
-        object,
-        epoch: HostEpoch(2),
-        generation,
-      };
-      let fed = crate::fleet::serve_held_promotion(state, successor, &prepare);
-      // This holder's last answer to the departed owner is now older than the horizon.
+      let fed = crate::takeover::serve_host_prepare(state, local, successor, &prepare);
+      // This holder's last answer to the retired owner is now older than the horizon.
       state
         .answers_given
         .alive_answers
         .insert(departed, now - crate::lease::horizon_ns() - 1);
-      let lapsed = crate::fleet::serve_held_promotion(state, successor, &prepare);
+      let lapsed = crate::takeover::serve_host_prepare(state, local, successor, &prepare);
       (fed, lapsed)
     });
     assert!(
-      Promise::decode(&fed).is_err(),
-      "a holder that answered the departed owner within the horizon promises nothing"
+      HostPromise::decode(&fed).is_err(),
+      "a holder that answered the retired owner within the horizon promises nothing"
     );
     assert!(
-      Promise::decode(&lapsed).is_ok(),
+      HostPromise::decode(&lapsed).is_ok(),
       "once its answers can no longer feed the owner's lease, the holder promises"
+    );
+  }
+
+  /// §4.8 "Leases and reads"; AUD-08: the successor's own copy counts toward a cohort's `f + 1` only once its
+  /// gate is open, as a holder's answer does — while this node has answered the retired owner within the horizon
+  /// its round learns nothing from itself; once it has not, its copy is learned.
+  #[test]
+  fn a_successor_counts_its_own_copy_only_once_its_gate_is_open() {
+    use slates_db::register::ObjectId;
+    let (while_fed, once_lapsed) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      // An object whose successor is this node (the successor is one of two survivors, by rendezvous).
+      let (departed, object) = (0..=u8::MAX)
+        .find_map(|seed| {
+          let object = ObjectId([seed; 16]);
+          let departed = slates_db::HostId(local.0 ^ 1);
+          let third = slates_db::HostId(local.0 ^ 2);
+          let mut probe = slates_db::register::RegionalConfiguration::formed(
+            vec![local, departed, third],
+            slates_db::register::Quorum { f: 1 },
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          );
+          probe.take_over(departed, 3);
+          (probe.successor(departed, object) == Some(local)).then_some((departed, object))
+        })
+        .unwrap();
+      let (retired, successor) = retire_the_owner_of_a_held_object(state, object);
+      assert_eq!((retired, successor), (departed, local));
+      let now = slates_machine::clock::monotonic_ns();
+      state.answers_given.answered_alive(departed, now);
+      crate::takeover::begin_round(state, departed, local).unwrap();
+      let while_fed = state.host_takeovers[&departed].outstanding();
+      state
+        .answers_given
+        .alive_answers
+        .insert(departed, now - crate::lease::horizon_ns() - 1);
+      crate::takeover::begin_round(state, departed, local).unwrap();
+      let once_lapsed = state.host_takeovers[&departed].outstanding();
+      (while_fed, once_lapsed)
+    });
+    assert_eq!(
+      while_fed, 0,
+      "a successor fed the retired owner's lease promises nothing of its own"
+    );
+    assert_eq!(
+      once_lapsed, 1,
+      "once its answers can no longer feed the lease, its copy is learned"
     );
   }
 

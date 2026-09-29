@@ -77,7 +77,7 @@ pub(crate) fn bootstrap(state: &mut ShardState, root: bool, member: u64) -> Repl
       .as_ref()
       .and_then(|fleet| fleet.durability)
       .and_then(|bound| bound.shortfall(&configuration));
-    let _ = state.fleet.install_configuration(configuration, &[local]);
+    state.fleet.install_configuration(configuration, &[local]);
   }
   if let Some((raft, base)) = state.council.join_state() {
     state.council_group =
@@ -296,7 +296,7 @@ impl Publication {
         .as_ref()
         .and_then(|fleet| fleet.durability)
         .and_then(|bound| bound.shortfall(&self.placement));
-      let _ = state
+      state
         .fleet
         .install_configuration(self.placement, &self.members);
       state.consensus_ready = self.ready;
