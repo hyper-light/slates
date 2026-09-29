@@ -56,57 +56,92 @@ fn current_exe() -> OsString {
 
 /// A descriptor the parent holds that the child must **not** inherit: a pipe end that is
 /// close-on-exec, as every descriptor of the parent is (Unix), or an inheritable one (Windows, where
-/// the handle list is what keeps it out). Returns its name for the child and what keeps it open.
+/// the handle list is what keeps it out). Returns its **identity** for the child — the number *and* what
+/// proves the object at that number is this very decoy — and what keeps it open. The number alone was not
+/// enough: numbers are process-local and reused, so a handle of the child's own at the same value read as
+/// "the decoy came along" (Windows CI run 36500813478, exit 13 with nothing inherited).
 #[cfg(unix)]
 fn decoy() -> (String, (std::os::fd::OwnedFd, std::os::fd::OwnedFd)) {
   use std::os::fd::AsRawFd;
   let (read_end, write_end) = rustix::pipe::pipe().unwrap();
   rustix::io::fcntl_setfd(&read_end, rustix::io::FdFlags::CLOEXEC).unwrap();
   rustix::io::fcntl_setfd(&write_end, rustix::io::FdFlags::CLOEXEC).unwrap();
-  (read_end.as_raw_fd().to_string(), (read_end, write_end))
+  let stat = rustix::fs::fstat(&read_end).unwrap();
+  // The device and inode travel as their decimal text: their integer types differ across Unixes, and the
+  // child compares its own fstat's fields formatted the same way.
+  (
+    format!("{}:{}:{}", read_end.as_raw_fd(), stat.st_dev, stat.st_ino),
+    (read_end, write_end),
+  )
 }
 
-/// Whether the descriptor `name` names is open in this process.
+/// Whether the decoy `identity` names is open in this process: a descriptor at its number that is the same
+/// pipe (device and inode), not merely some descriptor that happens to have that number.
 #[cfg(unix)]
-fn is_open(name: &str) -> bool {
-  let number: i32 = name.parse().unwrap();
+fn decoy_is_here(identity: &str) -> bool {
+  let (number, pipe) = identity.split_once(':').unwrap();
+  let number: i32 = number.parse().unwrap();
   // SAFETY: a borrow for one fstat; a number that is not open fails EBADF and touches nothing.
   let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(number) };
-  rustix::fs::fstat(borrowed).is_ok()
+  rustix::fs::fstat(borrowed).is_ok_and(|stat| format!("{}:{}", stat.st_dev, stat.st_ino) == pipe)
 }
 
+/// The Windows decoy: an inheritable handle to a uniquely **named** event, so the child can open the same
+/// object by name and compare it with whatever sits at the decoy's handle value (`CompareObjectHandles`,
+/// Windows 10 1607 / Server 2016 and later).
 #[cfg(windows)]
-fn decoy() -> (String, (usize, usize)) {
+fn decoy() -> (String, usize) {
   use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
-  use windows_sys::Win32::System::Pipes::CreatePipe;
+  use windows_sys::Win32::System::Threading::CreateEventW;
   let attributes = SECURITY_ATTRIBUTES {
     nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap(),
     lpSecurityDescriptor: std::ptr::null_mut(),
     bInheritHandle: 1,
   };
-  let mut read = std::ptr::null_mut();
-  let mut write = std::ptr::null_mut();
-  // SAFETY: two out-pointers to locals the call fills; the attributes make both ends inheritable,
-  // which is the point of the decoy (only the handle list keeps them from the child).
-  let ok = unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) };
-  assert_ne!(ok, 0, "CreatePipe");
-  // The handles are leaked for the test's life; their values are what matter.
-  (
-    read.expose_provenance().to_string(),
-    (read.expose_provenance(), write.expose_provenance()),
-  )
+  let nonce = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .unwrap()
+    .as_nanos();
+  let name = format!(
+    "Local\\slates-delivery-decoy-{}-{nonce}",
+    std::process::id()
+  );
+  let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+  // SAFETY: the attributes and the NUL-terminated name outlive the call; the attributes make the handle
+  // inheritable, which is the point of the decoy (only the handle list keeps it from the child).
+  let event = unsafe { CreateEventW(&attributes, 1, 0, wide.as_ptr()) };
+  assert!(!event.is_null(), "CreateEventW");
+  // The handle is leaked for the test's life; its value and its object's name are what matter.
+  let value = event.expose_provenance();
+  (format!("{value}:{name}"), value)
 }
 
+/// Whether the decoy `identity` names is open in this process: a handle at its value that refers to the
+/// very event the parent created (opened here by name and compared), not merely some handle of the child's
+/// own that happens to have that value.
 #[cfg(windows)]
-fn is_open(name: &str) -> bool {
-  use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, GetLastError};
-  use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_UNKNOWN, GetFileType};
-  let number: usize = name.parse().unwrap();
-  let handle = std::ptr::with_exposed_provenance_mut(number);
-  // SAFETY: `GetFileType` answers for any handle value or fails with ERROR_INVALID_HANDLE.
-  let kind = unsafe { GetFileType(handle) };
-  // SAFETY: a thread-local read with no preconditions.
-  !(kind == FILE_TYPE_UNKNOWN && unsafe { GetLastError() } == ERROR_INVALID_HANDLE)
+fn decoy_is_here(identity: &str) -> bool {
+  use windows_sys::Win32::Foundation::{CloseHandle, CompareObjectHandles, GetHandleInformation};
+  use windows_sys::Win32::System::Threading::{OpenEventW, SYNCHRONIZATION_SYNCHRONIZE};
+  let (value, name) = identity.split_once(':').unwrap();
+  let value: usize = value.parse().unwrap();
+  let handle = std::ptr::with_exposed_provenance_mut(value);
+  let mut flags = 0u32;
+  // SAFETY: `GetHandleInformation` answers for any handle value, failing for one that is not open.
+  if unsafe { GetHandleInformation(handle, &mut flags) } == 0 {
+    return false;
+  }
+  let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+  // SAFETY: the NUL-terminated name outlives the call; a missing object returns null.
+  let by_name = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide.as_ptr()) };
+  if by_name.is_null() {
+    return false;
+  }
+  // SAFETY: both handles are open in this process (checked above and just opened).
+  let same = unsafe { CompareObjectHandles(handle, by_name) } != 0;
+  // SAFETY: the handle this function opened, closed once.
+  unsafe { CloseHandle(by_name) };
+  same
 }
 
 /// The consumer child: takes the delivery, checks it is the one the parent made, that the decoy did
@@ -136,7 +171,11 @@ fn delivery_consumer_child() {
   if capability_hash(&taken.capability) != expected_hash {
     std::process::exit(EXIT_WRONG_CAPABILITY);
   }
-  if is_open(&std::env::var(DECOY).unwrap()) {
+  let decoy = std::env::var(DECOY).unwrap();
+  if decoy_is_here(&decoy) {
+    eprintln!(
+      "consumer child: the parent's decoy {decoy} is open here, the same object — inherited"
+    );
     std::process::exit(EXIT_DECOY_INHERITED);
   }
   // Taken once: a second look is the same answer, and the descriptor itself is closed.

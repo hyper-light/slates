@@ -1809,6 +1809,19 @@ jitter kept two congruent survivors in lockstep (split votes every round; fixed 
 both timers — unconfirmed until a failure's dump shows the lockstep.
 
 
+### 2026-09-28: the delivery test read a reused handle value as the decoy — fixed; the take's sibling open
+
+CI run 36500813478's Windows nightly job failed the delivery test with exit 13 ("the decoy came along"), one
+failure in five nightly runs of unchanged ipc code. The child checked only that *some* handle was open at the
+decoy's value, and its own handles fill the same small values. The child now confirms the object's identity
+(Windows: the named event compared with `CompareObjectHandles`; Unix: the live decoy pipe's device and
+inode). Open sibling, the production take: `take_named` adopts, reads and closes whatever pipe or socket sits
+at the number `SLATES_CONSUMER_FD` names. A consumer's subprocess inherits the variable but not the
+descriptor, so it would take and close its own descriptor. On macOS a dead pipe's `(st_dev, st_ino)` is
+reused by the next pipe 1,999 times in 2,000 (measured), so the fix needs a stronger identity than that.
+[Bug record](../bugs/2026-09-28-the-delivery-test-read-a-reused-handle-value-as-the-decoy.md).
+
+
 ### 2026-09-28: open — the consensus groups' logs are never compacted, and an append carries the whole lag
 
 Found while designing learner catch-up (`docs/wip/research/consensus-enhancements.md` §3.3). The council and
