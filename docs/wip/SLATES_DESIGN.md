@@ -2722,8 +2722,11 @@ reconnaissance because the touched partitions are named up front).
 > Azure regions a window of one batch keeps a group committing 2,000 proposals a second at a 172 ms median
 > where none is overloaded, and changes nothing at a low rate. The council and the root group set their
 > window each period from their measured paths (Derived constants below), which matched the best fixed window
-> in every measured case. Owed: the fast track's crossover measurement, which decides whether a group opens
-> it, and its votes' routing to the leader in the fleet; until then no group opens it.
+> in every measured case. The fast track's crossover is measured (research record §3.7). It pays up to 37 % for
+> a proposer far from the leader below 4 % loss, costs a proposer beside the leader (a fast quorum is larger),
+> and costs every proposer at 10 % loss. Both groups propose only at their leader, so both keep it closed. A
+> leader fills an index lost votes stalled its fast track at, so the track stays live under loss. Owed: MLRaft
+> (§3.6).
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,

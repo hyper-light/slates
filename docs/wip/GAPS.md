@@ -1853,10 +1853,18 @@ paths (a batch for each period a lost batch takes to repair: ⌈2 × tail / hear
 the simulation it matched the best fixed window in every case (201 / 321 ms at 2,000 a second with 1 % loss,
 where one batch gives 260 / 458 ms).
 
+**Update, the same day — the fast track's crossover is measured and decided.**
+- On five Azure regions a proposer far from the leader commits up to 37 % sooner on it below 4 % loss.
+- A proposer beside the leader commits later (a fast quorum of four is larger than a classic three).
+- At 10 % loss it is slower for every proposer.
+- The groups' proposals all come from their leader, so both keep it closed.
+- Found and fixed on the way: under loss the fast track stalled for good behind an index its votes left short
+  of a quorum; the leader now fills it with a no-op on its own fast track (Fast Paxos's coordinator-run round).
+  At 4 % loss every proposer commits as many commands as on the classic track.
+
 **Owed:**
-- The fast track's crossover measurement and its votes' routing to the leader in the fleet. Until then no
-  group opens it.
 - MLRaft, and the KIND lane's measurement of the fleet under a burst.
+- The fast track's vote routing in the fleet, when a group has proposers away from its leader.
 
 ### 2026-09-29: the fast track and the window are built in the core — the design's sync rule lost chosen values; fixed
 

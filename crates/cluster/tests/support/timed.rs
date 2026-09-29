@@ -22,7 +22,9 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use slates_cluster::raft::{ElectionPriority, RaftNode, TimeoutNow};
 use slates_cluster::raft_wire::{RaftMessage, append_batch_bytes};
-use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, quorum_priority};
+use slates_cluster::timing::{
+  ElectionTimer, ElectionTiming, PathRtt, REPAIR_ROUND_TRIPS, quorum_priority,
+};
 use slates_db::register::HostId;
 use slates_transport::endpoint::MAX_PACKET_PAYLOAD;
 
@@ -157,6 +159,23 @@ pub(crate) struct Scenario {
   /// How every node's window is set (`RaftNode::set_window_budget`): what a follower can hold ahead of a hole,
   /// and so how far a leader sends ahead of acknowledgements.
   pub(crate) window: Window,
+  /// Who proposes the stream.
+  pub(crate) proposer: Proposer,
+  /// Whether a new leader opens its term's fast track after its no-op (research record §3.7).
+  pub(crate) fast_track: bool,
+}
+
+/// Who proposes the stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Proposer {
+  /// The leader, whoever it is: each proposal is appended at the leader's tick, and a new leader's stream
+  /// restarts; its latency runs to the leader's commit.
+  Leader,
+  /// A fixed node, as a client beside it would: each proposal goes to its leader (classic) or, once the fast
+  /// track is open to it, to every voter (§3.7), and is sent again when not committed within
+  /// [`REPAIR_ROUND_TRIPS`] round trips of its slowest voter path; its latency runs to when that node learns
+  /// the commit — the leader's commit and the leader's one-way path to it.
+  At(HostId),
 }
 
 /// How every node's window is set.
@@ -199,6 +218,8 @@ pub(crate) struct Outcome {
   /// Batches leaders sent ahead of acknowledgements (pipelined), over every node's life since its last
   /// restart.
   pub(crate) sent_ahead: u64,
+  /// Stalled fast-track indices a leader filled (`RaftNode::fill_hole`).
+  pub(crate) holes_filled: u64,
   /// Timeouts followers yielded to voters that outranked them.
   pub(crate) yields: u64,
 }
@@ -281,6 +302,11 @@ struct Flight {
 enum Event {
   Tick(HostId),
   Deliver(Flight),
+  /// A proposal a node forwarded to its leader (the classic path), arriving at `to`.
+  Forward {
+    to: HostId,
+    command: Vec<u8>,
+  },
   /// A probe's acknowledgement arriving back at `at`, timing the round trip to `peer`.
   ProbeAck {
     at: HostId,
@@ -301,6 +327,8 @@ struct Node {
   invitation: Option<TimeoutNow>,
   down_until: Option<u64>,
   retained: slates_cluster::raft::SavedRaft,
+  /// While leading with the fast track open: the index it is stalled at and since when.
+  stalled: Option<(u64, u64)>,
 }
 
 struct Sim {
@@ -314,6 +342,9 @@ struct Sim {
   outcome: Outcome,
   /// Proposals in flight: log index at the leader → the time it was proposed.
   proposed: BTreeMap<u64, u64>,
+  /// A fixed proposer's proposals not yet committed: the time each was proposed → when it was last sent (zero
+  /// when not yet).
+  outstanding: BTreeMap<u64, u64>,
   next_proposal_ns: u64,
   last_commit_ns: u64,
   /// The highest index whose commit has been measured.
@@ -342,6 +373,7 @@ impl Sim {
             invitation: None,
             down_until: None,
             retained,
+            stalled: None,
           },
         )
       })
@@ -358,6 +390,7 @@ impl Sim {
       rng,
       outcome: Outcome::default(),
       proposed: BTreeMap::new(),
+      outstanding: BTreeMap::new(),
       next_proposal_ns,
       last_commit_ns: next_proposal_ns,
       measured_through: 0,
@@ -509,6 +542,9 @@ impl Sim {
     let node = self.nodes.get_mut(&id).unwrap();
     if !was_leader && node.raft.is_leader() {
       node.raft.append_command(Vec::new());
+      if self.scenario.fast_track {
+        node.raft.open_fast_track();
+      }
       let term = node.raft.term();
       self.outcome.leader_events.push((self.now, id, term));
       // Proposals the old leader held are abandoned; the stream restarts at the new leader.
@@ -553,6 +589,9 @@ impl Sim {
         .unwrap()
         .raft
         .set_window_budget(window);
+    }
+    if self.scenario.proposer == Proposer::At(id) {
+      self.propose_at(id, &timing);
     }
     if self.nodes[&id].raft.is_leader() {
       self.lead(id, &timing);
@@ -602,7 +641,10 @@ impl Sim {
   }
 
   fn lead(&mut self, id: HostId, timing: &ElectionTiming) {
-    self.propose_due(id);
+    if self.scenario.proposer == Proposer::Leader {
+      self.propose_due(id);
+    }
+    self.fill_a_stalled_hole(id, timing);
     let budget = batch_budget(self.nodes[&id].raft.all_voters().len());
     for peer in self.others(id) {
       let raft = &mut self.nodes.get_mut(&id).unwrap().raft;
@@ -629,6 +671,112 @@ impl Sim {
     if let Some((to, invitation)) = invitation {
       self.send(id, to, RaftMessage::TimeoutNow(invitation), self.now);
     }
+  }
+
+  /// A fixed proposer's period: every command due since its last period joins the outstanding ones, and each
+  /// outstanding command not sent within [`REPAIR_ROUND_TRIPS`] round trips of its slowest voter path (at
+  /// least a period) is sent: on the fast track when it is open to this node — to every voter, its own vote
+  /// cast here — and otherwise to its leader.
+  fn propose_at(&mut self, id: HostId, timing: &ElectionTiming) {
+    let every = self.scenario.propose_every_ns;
+    if every > 0 {
+      while self.next_proposal_ns <= self.now {
+        self.outstanding.insert(self.next_proposal_ns, 0);
+        self.next_proposal_ns += every;
+      }
+    }
+    let resend_after = timing
+      .broadcast_rtt_tail_ns
+      .saturating_mul(REPAIR_ROUND_TRIPS)
+      .max(HEARTBEAT_NS);
+    let now = self.now;
+    let due: Vec<u64> = self
+      .outstanding
+      .iter()
+      .filter(|(_, sent)| **sent == 0 || now.saturating_sub(**sent) >= resend_after)
+      .map(|(proposed, _)| *proposed)
+      .collect();
+    for proposed in due {
+      self.outstanding.insert(proposed, now);
+      let command = proposed.to_le_bytes().to_vec();
+      let node = self.nodes.get_mut(&id).unwrap();
+      if let Some(proposal) = node.raft.propose_fast(command.clone()) {
+        let others = self.others(id);
+        for voter in others {
+          self.send(id, voter, RaftMessage::FastPropose(proposal.clone()), 0);
+        }
+        let node = self.nodes.get_mut(&id).unwrap();
+        if let Some(vote) = node.raft.on_fast_propose(proposal) {
+          self.route_vote(id, vote);
+        }
+      } else if node.raft.is_leader() {
+        node.raft.append_command(command);
+      } else if let Some(leader) = node.raft.leader() {
+        self.forward(id, leader, command);
+      }
+    }
+  }
+
+  /// The leader's fast track, stalled at an index for as long as a lost vote takes to be sent again
+  /// ([`REPAIR_ROUND_TRIPS`] round trips of its slowest voter path, at least a period), is filled there: the
+  /// leader proposes a no-op at the index to every voter, its own vote cast here (`RaftNode::fill_hole`).
+  fn fill_a_stalled_hole(&mut self, id: HostId, timing: &ElectionTiming) {
+    let now = self.now;
+    let repair = timing
+      .broadcast_rtt_tail_ns
+      .saturating_mul(REPAIR_ROUND_TRIPS)
+      .max(HEARTBEAT_NS);
+    let node = self.nodes.get_mut(&id).unwrap();
+    let Some(index) = node.raft.stalled_index() else {
+      node.stalled = None;
+      return;
+    };
+    match node.stalled {
+      Some((at, since)) if at == index && now.saturating_sub(since) >= repair => {}
+      Some((at, _)) if at == index => return,
+      _ => {
+        node.stalled = Some((index, now));
+        return;
+      }
+    }
+    node.stalled = Some((index, now));
+    let Some(fill) = node.raft.fill_hole(index) else {
+      return;
+    };
+    self.outcome.holes_filled += 1;
+    for voter in self.others(id) {
+      self.send(id, voter, RaftMessage::FastPropose(fill.clone()), 0);
+    }
+    let node = self.nodes.get_mut(&id).unwrap();
+    if let Some(vote) = node.raft.on_fast_propose(fill) {
+      self.route_vote(id, vote);
+    }
+  }
+
+  /// Sends a fast vote cast at `voter` to its leader — the leader tallies its own at once.
+  fn route_vote(&mut self, voter: HostId, vote: slates_cluster::raft::FastVote) {
+    let Some(leader) = self.nodes[&voter].raft.leader() else {
+      return;
+    };
+    if leader == voter {
+      self.nodes.get_mut(&voter).unwrap().raft.on_fast_vote(vote);
+      self.measure_commits(voter);
+    } else {
+      self.send(voter, leader, RaftMessage::FastVote(vote), 0);
+    }
+  }
+
+  /// Forwards a proposal from `from` to its leader `to`, over the path between them (lossy, as any message).
+  fn forward(&mut self, from: HostId, to: HostId, command: Vec<u8>) {
+    self.outcome.messages += 1;
+    if self.partitioned(from, to)
+      || self.rng.below(1_000_000) < u64::from(self.scenario.profile.loss_ppm)
+    {
+      return;
+    }
+    let (one_way, jitter) = self.scenario.profile.latency(from, to);
+    let delay = one_way + self.rng.below(jitter);
+    self.schedule(self.now + delay, Event::Forward { to, command });
   }
 
   /// The leader proposes every command due since its last proposal (bounded by the stream's cadence).
@@ -715,6 +863,7 @@ impl Sim {
     }
     let was_leader = self.nodes[&to].raft.is_leader();
     let answers_a_request = matches!(flight.message_kind(), Kind::Reply);
+    let proposal = matches!(flight.message, RaftMessage::FastPropose(_));
     let node = self.nodes.get_mut(&to).unwrap();
     let (reply, follow_on) = answer(node, flight.message);
     // A reply's round trip samples the path to the peer that answered (the daemon samples the same round
@@ -731,8 +880,11 @@ impl Sim {
         .on_sample(round_trip);
     }
     self.finish_election(to, was_leader);
-    if let Some(reply) = reply {
-      self.send(to, flight.from, reply, flight.sent_ns);
+    match reply {
+      // A fast vote goes to the voter's leader, whoever proposed (§3.7).
+      Some(RaftMessage::FastVote(vote)) if proposal => self.route_vote(to, vote),
+      Some(reply) => self.send(to, flight.from, reply, flight.sent_ns),
+      None => {}
     }
     if !follow_on.is_empty() {
       self.broadcast(to, follow_on);
@@ -744,6 +896,10 @@ impl Sim {
   fn measure_commits(&mut self, id: HostId) {
     let node = &self.nodes[&id];
     if !node.raft.is_leader() {
+      return;
+    }
+    if let Proposer::At(proposer) = self.scenario.proposer {
+      self.measure_commits_for(id, proposer);
       return;
     }
     let committed = node.raft.commit_index();
@@ -772,6 +928,46 @@ impl Sim {
     self.measured_through = committed;
   }
 
+  /// The leader `id`'s commits, fast ones included, of a fixed proposer's commands: each command carries the
+  /// time it was proposed, so its latency is known wherever it landed — to the leader's commit and on along the
+  /// leader's one-way path to the proposer, which learns it then.
+  fn measure_commits_for(&mut self, id: HostId, proposer: HostId) {
+    let node = &self.nodes[&id];
+    let through = node.raft.committed_through();
+    if through <= self.measured_through {
+      return;
+    }
+    let base = node.raft.snapshot_index();
+    let from = usize::try_from(self.measured_through.saturating_sub(base)).unwrap();
+    let times: Vec<u64> = node
+      .raft
+      .committed_entries()
+      .get(from..)
+      .unwrap_or(&[])
+      .iter()
+      .filter_map(|entry| <[u8; 8]>::try_from(entry.command.as_slice()).ok())
+      .map(u64::from_le_bytes)
+      .collect();
+    let back = if proposer == id {
+      0
+    } else {
+      self.scenario.profile.latency(id, proposer).0
+    };
+    for proposed in times {
+      if self.outstanding.remove(&proposed).is_some() {
+        let learnt = self.now.saturating_add(back);
+        self
+          .outcome
+          .commit_latencies_ns
+          .push(learnt.saturating_sub(proposed));
+        let gap = learnt.saturating_sub(self.last_commit_ns);
+        self.outcome.longest_gap_ns = self.outcome.longest_gap_ns.max(gap);
+        self.last_commit_ns = self.last_commit_ns.max(learnt);
+      }
+    }
+    self.measured_through = through;
+  }
+
   fn run(mut self) -> Outcome {
     let ids: Vec<HostId> = self.nodes.keys().copied().collect();
     for id in ids {
@@ -795,7 +991,13 @@ impl Sim {
           node.paths.entry(peer).or_default().on_sample(round_trip);
           node.heard.insert(peer, now);
         }
-        Some(Event::ProbeAck { .. }) | None => {}
+        Some(Event::Forward { to, command }) if !self.down(to) => {
+          let node = self.nodes.get_mut(&to).unwrap();
+          if node.raft.is_leader() {
+            node.raft.append_command(command);
+          }
+        }
+        Some(Event::ProbeAck { .. } | Event::Forward { .. }) | None => {}
       }
     }
     for (id, node) in &self.nodes {

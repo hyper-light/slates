@@ -1811,6 +1811,42 @@ impl RaftNode {
     })
   }
 
+  /// The index this leader's fast track is stalled at, if any (§3.7): its next undecided index, while votes wait
+  /// at or above it and too few voters have voted there for a decision. The caller fills it
+  /// ([`fill_hole`](Self::fill_hole)) once it has stalled as long as a lost vote takes to be sent again.
+  pub fn stalled_index(&self) -> Option<u64> {
+    if self.role != Role::Leader || self.open_from == 0 || self.active_transfer().is_some() {
+      return None;
+    }
+    let next = self.last_log_index().saturating_add(1);
+    let waiting = self
+      .fast_votes
+      .keys()
+      .next_back()
+      .is_some_and(|index| *index >= next);
+    let heard: BTreeSet<HostId> = self
+      .fast_votes
+      .get(&next)
+      .map(|votes| votes.keys().copied().collect())
+      .unwrap_or_default();
+    (waiting && !self.is_majority(&heard)).then_some(next)
+  }
+
+  /// The no-op this leader proposes at its stalled index `index` on its own fast track, to send every voter —
+  /// Fast Paxos's coordinator-run round for an instance its fast round left undecided (Lamport, *Fast Paxos*,
+  /// 2006, §3.3): a voter that voted there sends its vote again, and one that did not votes the no-op, so the
+  /// leader hears a classic quorum and decides by the ballot rule. The ballot rule does not look at what is
+  /// proposed, so this is safe as any proposal is. Its own vote is cast like any voter's, when the caller hands
+  /// it the proposal. `None` unless `index` is stalled.
+  pub fn fill_hole(&mut self, index: u64) -> Option<FastPropose> {
+    (self.stalled_index() == Some(index)).then(|| FastPropose {
+      term: self.current_term,
+      proposer: self.id,
+      index,
+      command: Vec::new(),
+    })
+  }
+
   /// Handles a fast proposal as a voter: a voter synced to this term's leader, at an index the leader opened,
   /// above its log and within its window's span and budget, votes the command — unless it already voted there
   /// this term (its vote stands, and is sent again) or holds this term's decision there. Returns the vote to
@@ -5232,6 +5268,66 @@ mod tests {
     let mut nodes = fast_group(&[A, B, C]);
     assert!(!nodes[0].append_command(b"x".to_vec()));
     assert!(!nodes[0].begin_membership_change(vec![A, B]));
+  }
+
+  /// §3.7, liveness under loss: a proposal that reached too few voters leaves its index short of a classic
+  /// quorum of votes, and the leader decides in order, so every later index waits behind it — the proposer's
+  /// resend goes to a new index and never fills it. The leader fills the hole itself (Fast Paxos's
+  /// coordinator-run round): it proposes a no-op there on its own fast track, a voter that voted re-sends its
+  /// vote and one that did not votes the no-op, and the classic quorum it then hears decides by the ballot rule.
+  /// Until 2026-09-29 nothing filled it: at 4 % loss across five regions a proposer lost up to half its
+  /// commands.
+  #[test]
+  fn a_leader_fills_a_hole_its_votes_left() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let short = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    let vote = nodes[1].on_fast_propose(short).unwrap();
+    nodes[0].on_fast_vote(vote);
+    let whole = nodes[1].propose_fast(b"y".to_vec()).unwrap();
+    assert_eq!(whole.index, 3);
+    let votes: Vec<FastVote> = nodes
+      .iter_mut()
+      .filter_map(|node| node.on_fast_propose(whole.clone()))
+      .collect();
+    for vote in votes {
+      nodes[0].on_fast_vote(vote);
+    }
+    assert_eq!(
+      nodes[0].last_log_index(),
+      1,
+      "index 2 has one vote of the two a decision needs"
+    );
+    assert_eq!(nodes[0].stalled_index(), Some(2));
+    let fill = nodes[0].fill_hole(2).unwrap();
+    assert_eq!((fill.index, fill.command.as_slice()), (2, b"".as_slice()));
+    let votes: Vec<FastVote> = nodes
+      .iter_mut()
+      .filter_map(|node| node.on_fast_propose(fill.clone()))
+      .collect();
+    for vote in votes {
+      nodes[0].on_fast_vote(vote);
+    }
+    assert_eq!(
+      nodes[0].last_log_index(),
+      3,
+      "both decided: the hole, then y behind it"
+    );
+    assert_eq!(nodes[0].stalled_index(), None);
+    // The no-op carried two votes of three, so it commits classically, and y's fast commit with it.
+    let (leader, followers) = nodes.split_first_mut().unwrap();
+    let mut reached: Vec<(HostId, &mut RaftNode)> =
+      followers.iter_mut().map(|node| (node.id(), node)).collect();
+    replicate_once(leader, &mut reached);
+    let commands: Vec<Vec<u8>> = leader
+      .committed_entries()
+      .iter()
+      .map(|entry| entry.command.clone())
+      .collect();
+    assert_eq!(
+      commands,
+      vec![Vec::new(), Vec::new(), b"y".to_vec()],
+      "the no-op in the hole, then y"
+    );
   }
 
   /// §4, the bounds: a voter votes only within its window's span above its log, and only while the window's

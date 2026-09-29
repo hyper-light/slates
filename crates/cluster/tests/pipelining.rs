@@ -17,7 +17,9 @@ use std::time::Instant;
 use slates_cluster::raft::RaftNode;
 use slates_db::register::HostId;
 use support::azure::{placement, profile};
-use support::timed::{Campaign, ElectionOrder, MS, Outcome, Scenario, Window, batch_budget, run};
+use support::timed::{
+  Campaign, ElectionOrder, MS, Outcome, Proposer, Scenario, Window, batch_budget, run,
+};
 
 /// Shape: the regions the group spans — all five of the matrix, so the leader's quorum round trip (83 to 185
 /// ms) is at or past the 100 ms period.
@@ -47,6 +49,8 @@ fn scenario(
     order: ElectionOrder::ByPriority,
     seed,
     window,
+    proposer: Proposer::Leader,
+    fast_track: false,
   })
 }
 

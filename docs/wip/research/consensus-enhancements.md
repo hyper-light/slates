@@ -181,6 +181,19 @@ their self-approved entries with their vote, and the new leader re-runs the vote
   measures the same crossover on its own profiles and decides from the data whether the fast track is
   always on or chosen per group from the measured loss.
 
+  **Measured (slice 13), on five Azure regions with derived windows** (a proposer in each region, 20 a
+  second):
+  - A proposer far from the leader commits up to 37 % sooner on the fast track below 4 % loss (Southeast
+    Asia 435 → 275 ms at the median with no loss, 473 → 322 ms at 4 %).
+  - A proposer beside the leader commits later (East US, which leads by priority, 156 → 201 ms): a fast
+    quorum of four is larger than a classic three.
+  - At 10 % loss the fast track is slower for every proposer (medians 199–479 → 448–598 ms).
+
+  **Decided:** a group opens the fast track only when its proposals come from away from its leader, at a loss
+  below the crossover. The council's and the root group's proposals all come from their leader, where the
+  track only costs, so both keep it closed; it is built, verified and measured, and waits for a group whose
+  proposers are elsewhere.
+
 ## 4. Composition
 
 - **One log model, as built** (verified by the prefix model, slices 9 and 10; built in `RaftNode`, slice 10).
@@ -637,4 +650,27 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     - At every other rate and loss it matches one batch or four, whichever is better.
   - **Next.** The fast track's crossover — proposers away from the leader, loss, placement — which decides
     whether a group opens it, and its votes' routing to the leader in the fleet.
+- **Slice 13 (2026-09-29): the fast track's crossover, and a leader that fills the holes lost votes leave.**
+  - **The measurement** (`crates/cluster/tests/fast_track.rs`, on the timed simulation):
+    - A proposer can sit in any region. Classic, it forwards each command to its leader; on the fast track, it
+      sends to every voter, and each voter's vote goes to its leader.
+    - It sends again when a command is not committed within two round trips of its slowest path.
+    - Latency runs to when the proposer learns the commit: the leader's commit and the leader's one-way path
+      back.
+    - The table is in §3.7 and `docs/wip/BENCHMARKS.md`. CI gates the three facts the decision rests on
+      (0.48 s in debug).
+  - **Found and fixed: a fast track under loss stalled for good.** A leader decides fast-track indices in
+    order, and an index whose votes fell short of a classic quorum — a proposal or votes lost — held up every
+    index behind it: the proposer's resend goes to a new index and never fills the old one. At 4 % loss a
+    proposer lost up to half its commands (348 of about 780 committed).
+    - The fix is Fast Paxos's coordinator-run round: the leader proposes a no-op at the stalled index on its own
+      fast track (`RaftNode::stalled_index`, `fill_hole`). A voter that voted there re-sends its vote, one that
+      did not votes the no-op, and the classic quorum it then hears decides by the ballot rule, which does not
+      look at what is proposed.
+    - The drive fills an index once it has stalled for a repair's two round trips. At 4 % loss every proposer
+      commits as many commands as on the classic track (18–35 fills per region over 20 seeds).
+    - The explorer drives it as an adversarial move: 208 and 206 fills at full scale, with no violation.
+  - **Decided:** the groups keep the fast track closed (§3.7): their proposals all come from their leader, where
+    it only costs.
+  - **Next.** MLRaft (§3.6), and the KIND lane's measurement of the groups under a burst.
 

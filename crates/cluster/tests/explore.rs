@@ -43,7 +43,8 @@
 //! whose place it has confirmed — each heartbeat move sends the next batch before the last is acknowledged,
 //! as far as that window holds — and a follower buffers what arrives ahead of a hole; a leader may open its
 //! term's fast track at any step; a client's command then reaches any node, which proposes it to every
-//! voter, and each voter's vote goes to its own leader. A ghost of every vote cast — the Paxos acceptors' state, counted from
+//! voter, and each voter's vote goes to its own leader; and a leader may fill the index its fast track
+//! stalled at, when lost votes left it short of a quorum. A ghost of every vote cast — the Paxos acceptors' state, counted from
 //! the moment a vote is cast, whatever becomes of its message — marks each index a fast quorum chose, and
 //! the checks take the dialect's form around it:
 //!
@@ -70,10 +71,10 @@ use slates_cluster::raft_wire::RaftMessage;
 use slates_db::register::HostId;
 
 /// Shape: the seeds each cluster size is explored under at full scale — the `--ignored` run CI makes in
-/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 25.9 s with
-/// the fast track, pipelining and windows of three sizes explored (measured 2026-09-29, Apple M5 Max, release;
-/// 27.7 s on 2026-09-28 with compaction and membership changes, 14 s before them), so the workspace's debug
-/// run explores [`SEEDS_QUICK`] instead.
+/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 26.1 s with
+/// the fast track, its filled holes, pipelining and windows of three sizes explored (measured 2026-09-29, Apple
+/// M5 Max, release; 27.7 s on 2026-09-28 with compaction and membership changes, 14 s before them), so the
+/// workspace's debug run explores [`SEEDS_QUICK`] instead.
 const SEEDS_FULL: u64 = 400;
 /// Shape: the seeds the workspace's debug run explores — 18.6 s of a debug build (2026-09-29), and still
 /// enough histories for every non-vacuity floor below (each is at least one event per seed but the three
@@ -105,10 +106,10 @@ const MIN_VOTERS: usize = 3;
 /// each: term, length, an eight-byte command, the configuration flag) — so catching a follower up takes
 /// several batches and every batch boundary is explored.
 const APPEND_BUDGET: usize = 48;
-/// Shape: the actions one step chooses among — the hundred of the original mix and nine more: three for a
+/// Shape: the actions one step chooses among — the hundred of the original mix and ten more: three for a
 /// compaction, one for corrupting a snapshot in flight, four for a reconfiguration period, one for the leader
-/// opening its fast track.
-const ACTIONS: usize = 109;
+/// opening its fast track, one for the leader filling the index its fast track stalled at.
+const ACTIONS: usize = 110;
 /// Shape: the windows a node may hold, in wire bytes: one, one and a half and two of the append budget — the
 /// groups set a window from the measured paths, so windows differ across a group — each a span of 3, 5 or 7
 /// indices above a node's log and room for two, three or four of the explorer's command entries (21 wire bytes
@@ -190,6 +191,8 @@ struct Counters {
   fast_votes_cast: u64,
   /// Fast votes whose voter knew no leader to send them to.
   fast_votes_unrouted: u64,
+  /// Indices a leader's fast track stalled at, filled by the leader (`RaftNode::fill_hole`).
+  stalled_fills: u64,
   /// Indices a fast quorum chose (the ghost the checks read).
   fast_choices: u64,
   /// Indices committed under two terms — a fast choice committed by its leader and re-proposed by a successor
@@ -537,6 +540,26 @@ impl Cluster {
       .insert(vote.voter, vote.command.clone());
   }
 
+  /// The leader, if any, fills the index its fast track stalled at, if it has one: a no-op proposed there to
+  /// every voter, itself included (the drive does this once a stall has lasted a repair's round trips; here
+  /// the adversary chooses when).
+  fn fill_a_stalled_hole(&mut self) {
+    let Some(at) = self.nodes.iter().position(RaftNode::is_leader) else {
+      return;
+    };
+    let Some(index) = self.nodes[at].stalled_index() else {
+      return;
+    };
+    let Some(fill) = self.nodes[at].fill_hole(index) else {
+      return;
+    };
+    self.counters.stalled_fills += 1;
+    let from = self.nodes[at].id();
+    for to in self.nodes[at].all_voters() {
+      self.send(from, to, RaftMessage::FastPropose(fill.clone()));
+    }
+  }
+
   /// The leader, if any, opens its term's fast track (refusals — no sync point yet, a configuration not yet
   /// committed, a transfer in flight, already open — are part of the exploration), and the explorer records
   /// the voters its votes are counted against.
@@ -752,6 +775,7 @@ impl Cluster {
       103 => self.corrupt_snapshot(),
       104..=107 => self.reconfigure(rng),
       108 => self.open_fast_track(),
+      109 => self.fill_a_stalled_hole(),
       _ => {}
     }
   }
@@ -1211,6 +1235,7 @@ fn explore(size: u64, seeds: u64) -> Counters {
     total.fast_proposals += c.fast_proposals;
     total.fast_votes_cast += c.fast_votes_cast;
     total.fast_votes_unrouted += c.fast_votes_unrouted;
+    total.stalled_fills += c.stalled_fills;
     total.fast_choices += c.fast_choices;
     total.re_proposed_commits += c.re_proposed_commits;
     add_window(&mut total.window, c.window);
@@ -1224,8 +1249,11 @@ fn explore(size: u64, seeds: u64) -> Counters {
 /// Explores three and five voters over `seeds` histories each and holds every non-vacuity floor: each path
 /// the exploration claims to cover must have been reached at least once per explored seed.
 fn explore_and_check_coverage(seeds: u64) {
+  let (mut re_proposed, mut beyond_reach) = (0, 0);
   for size in [3, 5] {
     let counted = explore(size, seeds);
+    re_proposed += counted.re_proposed_commits;
+    beyond_reach += counted.window.recovered_beyond_reach;
     eprintln!("explored {size} voters x {seeds} seeds x {STEPS} steps: {counted:?}");
     let floors = [
       (counted.elections_won, "elections were won"),
@@ -1289,13 +1317,12 @@ fn explore_and_check_coverage(seeds: u64) {
       );
     }
     // Five paths are rarer than one event per seed, so each is floored at once per exploration. A staging
-    // aborts only when its member is cut off for a whole CheckQuorum window. A recovery fills a hole only when
-    // a value it re-proposes sits above an index its reports leave free. A command commits under two terms
-    // only when a leader fast-commits it and a successor that lacks it re-proposes it. And a leader sends a
-    // batch ahead only when its backlog to a follower is more than one resend carries, so a follower buffers
-    // ahead of a hole only then. Measured 2026-09-29 over 24 seeds, three / five voters: 8 / 8 aborts, 19 / 25
-    // holes, 2 / 4 such commits, 41 / 70 buffered and 38 / 63 absorbed (over 400 seeds: 569 / 1,052 buffered,
-    // 511 / 960 absorbed, and 10 / 0 recoveries of a buffered decision).
+    // aborts only when its member is cut off for a whole CheckQuorum window. A leader sends a batch ahead only
+    // when its backlog to a follower is more than one resend carries, so a follower buffers ahead of a hole
+    // only then. A recovery fills a hole only when a value it re-proposes sits above an index its reports leave
+    // free. And a leader fills an index its fast track stalled at only when lost votes left it short of a
+    // quorum. Measured 2026-09-29 over 24 seeds, three / five voters: 4 / 11 aborts, 31 / 70 buffered and
+    // 27 / 63 absorbed, 19 / 13 holes, 7 / 10 stalled indices filled.
     let rare = [
       (counted.stagings_aborted, "a staging aborted"),
       (
@@ -1307,24 +1334,28 @@ fn explore_and_check_coverage(seeds: u64) {
         "buffered entries joined the log when the hole filled",
       ),
       (counted.window.holes_filled, "a recovery filled a hole"),
-      (
-        counted.re_proposed_commits,
-        "a fast commit was re-proposed by a successor",
-      ),
+      (counted.stalled_fills, "a leader filled a stalled index"),
     ];
     for (count, path) in rare {
       assert!(count > 0, "{size} voters: {path}");
     }
-    // A recovery takes a value past its own window's reach only when a voter whose window reaches further
-    // helped choose it and the new leader's is the smaller: 2 / 25 times over 400 seeds, three / five voters,
-    // and none in the quick run's 24 seeds at three (2026-09-29). Floored at full scale; the unit test
-    // `a_recovery_reads_every_report_beyond_its_own_reach` holds it on every run.
-    if seeds >= SEEDS_FULL {
-      assert!(
-        counted.window.recovered_beyond_reach > 0,
-        "{size} voters: a recovery took a value past its own window's reach"
-      );
-    }
+  }
+  // Two paths are rarer still, so each is floored over both sizes together. A command commits under two terms
+  // only when a leader fast-commits it and a successor that lacks it re-proposes it: 3 / 0 over 24 seeds, three
+  // / five voters. A recovery takes a value past its own window's reach only when a voter whose window reaches
+  // further reported it and the new leader's is the smaller; with three voters only a buffered decision can,
+  // since a fast choice there needs two reports and one voter reports: 0 / 16 over 400 seeds, and none in the
+  // quick run, so it is floored at full scale — the unit test `a_recovery_reads_every_report_beyond_its_own_reach`
+  // holds it on every run. Measured 2026-09-29.
+  assert!(
+    re_proposed > 0,
+    "a fast commit was re-proposed by a successor"
+  );
+  if seeds >= SEEDS_FULL {
+    assert!(
+      beyond_reach > 0,
+      "a recovery took a value past its own window's reach"
+    );
   }
 }
 

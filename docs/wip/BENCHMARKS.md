@@ -822,6 +822,33 @@ The whole full-scale set runs in 18.4 s here and holds 2.43 GB at its peak.
 that loses a chosen value at a scope the table never reached (three indices with four terms). The corrected
 design and its numbers follow.
 
+### The fast track's crossover across five regions (2026-09-29)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1, rustc 1.98.0, release; deterministic simulation.
+**Command:** `SLATES_FAST_SEEDS=20 SLATES_FAST_STREAM_S=30 cargo test -p slates-cluster --release --test
+fast_track -- --ignored --exact the_fast_track_across_regions_and_loss --nocapture` (9.7 s).
+
+**Setup:** the five published Azure regions (`support::azure`), 5 ms jitter, elections by priority, windows
+derived as the daemon derives them, a proposer placed in each region in turn proposing 20 commands a second for
+30 s (about 11,900 per 20 seeds). Classic: forwarded to the leader. Fast: to every voter, each vote to the
+leader, the leader filling a stalled index after two round trips. Latency to when the proposer learns the
+commit. Median / p99 in ms (the median over 20 seeds of each seed's):
+
+| Proposer | No loss, classic → fast | 1 % | 4 % | 10 % |
+|---|---|---|---|---|
+| East US | 156/206 → 201/250 | 197/244 → 243/314 | 198/255 → 246/642 | 199/303 → 448/1,798 |
+| West Europe | 276/325 → 272/321 | 318/443 → 312/328 | 318/820 → 315/764 | 320/1,003 → 598/5,455 |
+| Japan East | 377/426 → 274/324 | 417/481 → 315/356 | 419/1,026 → 318/635 | 420/1,142 → 486/2,055 |
+| Southeast Asia | 435/485 → 275/325 | 472/593 → 318/434 | 473/1,179 → 322/816 | 479/1,277 → 584/2,318 |
+| Brazil South | 317/366 → 300/349 | 358/451 → 342/422 | 359/1,062 → 346/799 | 362/1,144 → 525/1,798 |
+
+At 10 % loss the fast track also commits fewer (9,585–11,382 against 11,831–11,925) and fills 436–570
+stalled indices; at 4 %, 18–35.
+
+**Measured and rejected:** a fast track with nothing to fill a stalled index. At 4 % loss (4 seeds, 10 s
+streams) proposers committed 348 (Southeast Asia), 372, 589, 682 and 716 of about 780, since every index behind
+an unfilled one waited for the next election.
+
 ### Pipelined replication across five regions (2026-09-29)
 
 **Hardware:** Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1, rustc 1.98.0, release. The timed simulation is
