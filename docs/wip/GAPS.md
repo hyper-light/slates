@@ -2898,8 +2898,9 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
-The [dated audit](../audit/2026-09-29_audit.md) records 63 open findings across three
-passes, beginning at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
+The [dated audit](../audit/2026-09-29_audit.md) records 78 findings across four
+passes; 01 has the separately recorded closure below, leaving 77 without a recorded
+closure. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
 changing working tree.
 It is a review, not an implementation change or acceptance closure. It preserves the
 existing gap classifications and historical measurements rather than treating them as
@@ -2926,6 +2927,43 @@ current-tree passes.
 | AUD-29-59 | Remote holder ACKs require complete closure publication into admitted protected anchor RAM and recovery before the holder serves/counts it; eventual healing is insufficient (§4.8, §4.10). |
 | AUD-29-60–61 | Address changes need bounded authenticated validation and new-path measurements; local UDP backpressure needs owned pending-send/readiness state and accurate acceptance timing (§4.3, §4.10a). |
 | AUD-29-62–63 | Windows base access must retain contained directory handles; fixtures, trace output and property-failure persistence must prove RAM-backed ownership before writes (§4.5, R1/R8, Part 6). |
+| AUD-29-64–67 | Production Linux OCI needs a served FUSE export and volume-specific live source authority; recursive mount topology/rights, identity-preserving runtime handoff and runtime/namespace capability evidence must be verified (§4.6 A-9/A-28, R1/R10). |
+| AUD-29-68–70 | A real VMM binding and durable guest authority/lifetime are owed; refused admission, cancellation and failed reclamation must retain one terminal owner and return registry, view, reference and seam resources (§4.6, §4.13). |
+| AUD-29-71–73 | Native guest memory must establish complete queue ownership and publication ordering; consumer revocation must fence admitted devices before its acknowledgement (§4.6, §4.13, AC-4.12/T-4.14). |
+| AUD-29-74–76 | Container identity/group/security semantics, authenticated Pod publication/teardown, access modes and immutable/subtree exports need supported profiles and typed refusals for unavailable forms (§4.6, §4.13, AC-4.11/T-4.13). |
+| AUD-29-77–78 | RAM admission/residency must include actual runtime/VMM/cache/mapped/retained-copy boundaries; the 14 skipped OCI/virtio-fs records and capability evidence require reconciliation and real consumer tests (R1, §4.2, §4.6, Part 6). |
+
+The fourth pass uses baseline b455527a4887ef309335e3f5e42a947b179a50da and primary
+OCI runtime-spec v1.3.0, VIRTIO 1.2, Docker, Kubernetes, CSI and VMM documentation
+checked on 2026-09-29. The audit's §13 distinguishes mount interoperability, Docker
+engine behavior, Pod storage lifecycle and native filesystem devices; none is
+certified merely by a runtime name. Production Linux OCI is blocked by both daemon
+FUSE wiring and the volume-identity check. No Kubernetes volume publication or real
+VMM binding is implemented. Optional DAX/packed-ring support is not a baseline
+compliance requirement, and lack of CSI is an integration gap rather than invalid
+OCI mount syntax. No disk socket/image/directory, privilege or fallback is authorized.
+
+Eight OCI verification and 28 simulated guest tests passed under 20-second command
+bounds. The public-API driver (§7.5, 20-second compile / three-second run bounds)
+reproduced five boundaries: absent Linux volume source identity, a live registry
+attachment after refused guest setup, absent seam release/live registry state after
+dropping an admitted device, identical queue layouts accepted, and a writable buffer
+pointing at another queue's ring accepted. Its binary was removed. Source inspection
+also found that acknowledged consumer revocation marks client channels without
+fencing guest registry/device authority. All 14 OCI/virtio-fs conformance records are
+skipped, with stale OCI reasons. The 24 new O-case families extend the 30 E-cases;
+native runtime/Pod/VMM and strict RAM evidence remain owed. No service, mount,
+container, cluster or guest was launched and no implementation repair is accepted.
+
+Concurrent commit 7836621 records the grant-binding repair/closure of AUD-29-01
+during this review; the audit preserves its recorded evidence and does not claim
+to have rerun the landing tests. All 15 fourth-pass findings remain open.
+
+This adds explicit open tripwires to GAP-A9-5 (guest and OCI integration),
+GAP-A9-9 (consumer authority reaches devices), GAP-A9-11 (actual retained/mapped
+costs) and GAP-A9-15 (transport evidence). Earlier by-use histories remain evidence
+for their exact profiles; they do not close these boundaries. No acceptance row or
+design decision changes in this audit.
 
 **Closed 2026-09-29 — AUD-29-01 (P0): a grant binds its consumer, volume, snapshot and target identity at
 use.**
