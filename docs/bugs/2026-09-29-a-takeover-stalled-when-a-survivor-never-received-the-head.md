@@ -136,12 +136,43 @@ It replaces, not layers:
 
 ## Steps
 
-1. Configuration: neighbourhood change versions, settled neighbourhoods, retirement records, `Settle` and
-   `Confirm`, their codec and bounds.
-2. The owner's side: joint writes while unsettled, re-placement, the settlement report, and the council's
-   `Settle`.
-3. The takeover: the per-host round, the agreed successor, adoption, confirmation, reclaiming holds, and the
-   lease over the settled cohort, replacing the per-object path.
+1. **Built (`156850e`).** Configuration: neighbourhood change versions, settled neighbourhoods, retirement
+   records, `Settle` and `Confirm`, their codec and bounds.
+2. **Built.** The owner's side:
+   - A record of an object whose cohort a change in flight moved goes to both cohorts and commits at `f + 1`
+     of each (`Placement::joint`, `Configuration::place`). Content keeps its one current cohort
+     (`place_content`), since the head names its holders.
+   - The record plane re-ships heads to the new candidates.
+   - Each period the coordinator asks every shard, under the very configuration version it would report,
+     whether all it owns is held by `f + 1` of each cohort of its current placement. That covers volume heads
+     and each green's newest merge record. When all are, it sends `Settle` over a new report stream (15);
+     the council's leader proposes it (`RegionalCouncil::report`, only about the reporter itself, only when
+     caught up, only once).
+   - The owner lease counts over the settled cohort (`Configuration::recovery_cohort`).
+   - Regression `an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`. One
+     survivor refuses the owner's records (a new holder-side fault, `Daemon::inject_record_refusal`, which
+     leaves council and report traffic flowing), so the head places with the node about to die. After that
+     node's retirement the owner stays unsettled for five periods; once the fault lifts, the owner settles
+     and the survivor holds the head.
+   - Checked by hand: with the readiness check forced true, the owner settled two periods after the
+     retirement and the test failed.
+3. The takeover: the per-host round, the agreed successor, adoption, confirmation, and reclaiming holds,
+   replacing the per-object path.
+
+Found and fixed on the way (step 2):
+- **A destroyed green's owner-side placement state stayed forever.** Destroying a green removed its engine but
+  left its `merge.placed` and `merge.pending` entries, which is unbounded over green churn (banned item 8). They
+  now go with the green, and so does the new `placed_holders` record.
+
+Found and left open with a record:
+- **A green whose new cohort lacks `f + 1` holders of its history cannot be re-placed.** A holder accepts a
+  merge record only once it holds every version before it, and a new candidate holds none. Such an owner stays
+  unsettled, which is safe: its joint writes go on and the settled cohort stays the recovery cohort. It settles
+  once the owed ledger-prefix transfer ships the history (GAP-A9-7). In the common case (one host of a cohort
+  replaced) the remaining holders already make `f + 1`.
+- **A node re-admitted under its old id keeps its stale volumes.** They can never place again (the holders'
+  authority names their successors), so such a node never settles. This is the same ledger transfer
+  (GAP-A9-7).
 
 Owed with it:
 - the register and cluster model tests, extended with empty holders, neighbourhood changes and repeated

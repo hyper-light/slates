@@ -561,16 +561,6 @@ pub async fn broadcast(
   (replies, Stragglers::pending(rx))
 }
 
-/// Whether `acked` (distinct candidates) commits under `quorum` for `candidates`.
-fn is_placed(candidates: &[HostId], acked: &[HostId], quorum: Quorum) -> bool {
-  Placement {
-    candidates: candidates.to_vec(),
-    acked: acked.to_vec(),
-    mirror_acked: None,
-  }
-  .placed(quorum)
-}
-
 /// What a quorum collection gathered: the replying holders' endpoints for reuse, whether the deadline
 /// was reached, and the **latency** of every binding acknowledgement — the time from the round's
 /// dispatch to that holder's acknowledgement, the reading the design's hedge trigger is measured from
@@ -593,7 +583,7 @@ pub(crate) struct Collected {
 /// content) so the binding-and-quorum discipline is one.
 pub(crate) async fn collect_bound(
   rx: &mut std::sync::mpsc::Receiver<Reply>,
-  candidates: &[HostId],
+  shape: &Placement,
   quorum: Quorum,
   budget: CommitBudget,
   dispatched_ns: u64,
@@ -604,11 +594,11 @@ pub(crate) async fn collect_bound(
   let mut latencies_ns = Vec::new();
   let mut timed_out = false;
   let mut wait = DispatchWait::new(budget, dispatched_ns);
-  while !is_placed(candidates, acked, quorum) {
+  while !shape.placed_with(acked, quorum) {
     match rx.try_recv() {
       Ok(Reply(host, reply, endpoint)) => {
         reusable.push((host, *endpoint));
-        if candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply.bytes) {
+        if shape.candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply.bytes) {
           acked.push(host);
           latencies_ns.push((host, now_ns().saturating_sub(dispatched_ns)));
         }
@@ -672,7 +662,7 @@ pub struct Committed {
 pub async fn commit_record(
   owner: HostId,
   owner_acceptor: &mut Acceptor,
-  candidates: &[HostId],
+  placement: &Placement,
   record: &Record,
   quorum: Quorum,
   remote_holders: Vec<(HostId, Endpoint)>,
@@ -682,7 +672,7 @@ pub async fn commit_record(
     RECORD_STREAM,
     owner,
     owner_acceptor,
-    candidates,
+    placement,
     record,
     quorum,
     remote_holders,
@@ -700,7 +690,7 @@ pub async fn commit_record_on(
   stream: u64,
   owner: HostId,
   owner_acceptor: &mut Acceptor,
-  candidates: &[HostId],
+  placement: &Placement,
   record: &Record,
   quorum: Quorum,
   remote_holders: Vec<(HostId, Endpoint)>,
@@ -708,18 +698,19 @@ pub async fn commit_record_on(
 ) -> Committed {
   let mut acked: Vec<HostId> = Vec::new();
   // The owner's local hold — it is a candidate among the holders (§4.8 "the owner among them").
-  if owner_acceptor.accept(record).is_ok() && candidates.contains(&owner) {
+  if owner_acceptor.accept(record).is_ok() && placement.candidates.contains(&owner) {
     acked.push(owner);
   }
 
   let build = |acked: &[HostId]| Placement {
-    candidates: candidates.to_vec(),
+    candidates: placement.candidates.clone(),
     acked: acked.to_vec(),
     mirror_acked: None,
+    joint: placement.joint.clone(),
   };
 
   // A local hold may already commit (f = 0: one candidate, the owner) — then no dispatch is needed.
-  if is_placed(candidates, &acked, quorum) {
+  if placement.placed_with(&acked, quorum) {
     return Committed {
       outcome: Ok(build(&acked)),
       reusable: Vec::new(),
@@ -766,7 +757,7 @@ pub async fn commit_record_on(
     latencies_ns: _,
   } = collect_bound(
     &mut rx,
-    candidates,
+    placement,
     quorum,
     budget,
     now_ns(),
@@ -832,17 +823,11 @@ pub async fn commit_under_configuration(
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> Committed {
-  let candidates = candidates_for(
-    configuration.owner,
-    &configuration.neighbourhood,
-    &configuration.domains,
-    record.object,
-    configuration.quorum,
-  );
+  let placement = configuration.place(record.object);
   commit_record(
     configuration.owner,
     owner_acceptor,
-    &candidates,
+    &placement,
     record,
     configuration.quorum,
     remote_holders,
@@ -1087,6 +1072,7 @@ pub async fn promote_record(
         candidates: candidates.to_vec(),
         acked: promised,
         mirror_acked: None,
+        joint: Vec::new(),
       },
     })
   } else {
@@ -1095,6 +1081,7 @@ pub async fn promote_record(
         candidates: candidates.to_vec(),
         acked: promised,
         mirror_acked: None,
+        joint: Vec::new(),
       },
     })
   };
@@ -1360,6 +1347,7 @@ pub async fn promote_ledger_record(
         candidates: candidates.to_vec(),
         acked: promised,
         mirror_acked: None,
+        joint: Vec::new(),
       },
     })
   } else {
@@ -1368,6 +1356,7 @@ pub async fn promote_ledger_record(
         candidates: candidates.to_vec(),
         acked: promised,
         mirror_acked: None,
+        joint: Vec::new(),
       },
     })
   };

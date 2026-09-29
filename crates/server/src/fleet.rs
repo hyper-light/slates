@@ -77,6 +77,7 @@
 
 use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
+use slates_cluster::config_group::ReportOutcome;
 use slates_cluster::content::{
   CONTENT_PUT_STREAM, ContentMessage, fetch_content, is_content_stream, put_content,
 };
@@ -2653,6 +2654,14 @@ async fn serve_peer_records(
             CONFIG_FETCH_STREAM => {
               state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
             }
+            REPORT_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |member| member.host);
+              serve_council_report(s, peer_host, &request)
+            })
+            .unwrap_or_default(),
             ROOT_STREAM => state::with_state(|s| {
               serve_root(
                 s,
@@ -2734,6 +2743,11 @@ pub(crate) fn serve_held_promotion(
   }
 }
 
+/// The status refusal count under which a holder records a register record it refused because a test told
+/// it to refuse that owner's records ([`crate::daemon::Daemon::inject_record_refusal`]); never in production.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const RECORD_REFUSED_BY_FAULT: &str = "fleet.record.refused_by_fault";
+
 /// The status refusal count under which a holder records a successor's prepare it deferred because its own
 /// answers to the departed owner's probes may still feed that owner's lease ([`serve_held_promotion`]; §4.8
 /// "Leases and reads", AUD-08). It rises for at most the membership horizon after the holder last answered the
@@ -2779,6 +2793,11 @@ pub(crate) fn accept_held_record(
   peer_host: HostId,
   record: &Record,
 ) -> Vec<u8> {
+  // A test's injected refusal: this holder behaves as one that never received the owner's records.
+  if state.record_refused_from.contains(&peer_host) {
+    *state.refusals.entry(RECORD_REFUSED_BY_FAULT).or_insert(0) += 1;
+    return Vec::new();
+  }
   if let Err(error) = check_held_record(state, local, peer_host, record) {
     return encode_refusal(&error);
   }
@@ -2877,7 +2896,9 @@ struct Head {
   shard: u16,
   object: ObjectId,
   record: Record,
-  candidates: Vec<HostId>,
+  /// The placement the head commits against: its candidates — the settled and the current cohorts joined
+  /// while this owner's neighbourhood change is in flight — with nothing acknowledged.
+  shape: Placement,
   acked: Vec<HostId>,
   quorum: Quorum,
 }
@@ -2940,7 +2961,10 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
         generation: config.version,
         value: value.to_record_bytes(),
       },
-      candidates: placement.candidates,
+      shape: Placement {
+        acked: Vec::new(),
+        ..placement
+      },
       acked,
       quorum: config.quorum,
     });
@@ -3194,7 +3218,9 @@ fn start_seal(
     *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
     return false;
   };
-  let mut content = state.fleet.configuration().place(object);
+  // Content places on the current cohort alone (§4.10): the head names its holders, so a change in flight
+  // never needs it joined.
+  let mut content = state.fleet.configuration().place_content(object);
   content.acked = if content.candidates.contains(&local) {
     vec![local]
   } else {
@@ -4648,6 +4674,12 @@ const ROOT_FETCH_STREAM: u64 = 10;
 /// encoded `RequestBody`, the reply an encoded `ReplyBody` ([`slates_ipc::protocol::encode_body`]).
 const FORWARD_STREAM: u64 = 11;
 
+/// Format: the stream id a member's **report** to the council rides on a record session (§4.8 "Neighbourhood
+/// changes", "Promotion and takeover"): a settlement or a takeover confirmation the member makes about itself,
+/// as an encoded [`ConfigCommand`], answered with a [`ReportOutcome`]. Distinct from every other stream the
+/// session multiplexes (1–14), so `serve_peer_records` dispatches it by its stream.
+const REPORT_STREAM: u64 = 15;
+
 /// Answers one configuration-council Raft message a peer shipped on [`CONFIG_STREAM`] (§4.8, D-14): the
 /// council serves a pre-vote, a vote request, or an append — applying whatever an append newly commits to
 /// the regional configuration and refreshing this node's leader contact — and returns the reply to ship
@@ -4686,6 +4718,154 @@ fn serve_root(state: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
 /// member receives the common base and retained prefix; later fetches name the group and version.
 fn serve_root_fetch(state: &ShardState, request: &[u8]) -> Vec<u8> {
   crate::consensus::serve_fetch(state, true, request).unwrap_or_default()
+}
+
+/// Answers a member's report to the council on [`REPORT_STREAM`] (§4.8 "Neighbourhood changes", "Promotion and
+/// takeover"): the council takes a settlement or a takeover confirmation the reporting member makes about
+/// itself — the session's authenticated peer is the only member a report may name — and a caught-up leader
+/// proposes it ([`slates_cluster::config_group::RegionalCouncil::report`]). The reply is the
+/// [`ReportOutcome`]; a member keeps reporting each period until its installed configuration reflects it, so a
+/// follower's answer, or a proposal a lost leadership dropped, costs one more period. A refused report is
+/// counted [`REPORT_REFUSED`]: an honest member never sends one.
+fn serve_council_report(state: &mut ShardState, peer_host: HostId, request: &[u8]) -> Vec<u8> {
+  let outcome = match slates_cluster::config_group::ConfigCommand::decode(request) {
+    Some(command) => state.council.report(peer_host, command),
+    None => ReportOutcome::Refused,
+  };
+  if outcome == ReportOutcome::Refused {
+    *state.refusals.entry(REPORT_REFUSED).or_insert(0) += 1;
+  }
+  outcome.encode()
+}
+
+/// The status refusal count under which a council voter records a member's report it refused: bytes that are
+/// no command, a membership change sent as a report, or a report naming a host other than the session's peer.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const REPORT_REFUSED: &str = "fleet.report.refused";
+
+/// The status count under which a member records a report it sent to the council (§4.8 "Neighbourhood
+/// changes"): it rises once a period while the member's report is not yet in its installed configuration.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const REPORT_SENT: &str = "fleet.report.sent";
+
+/// This node's neighbourhood change the council has not settled yet (§4.8 "Neighbourhood changes"): the
+/// council's configuration version and the version its current neighbourhood was fixed at, when it differs from
+/// its settled one and this node has installed that configuration; `None` when settled, or while this node's
+/// placement is behind the council's (its shards would judge against an older neighbourhood).
+fn unsettled_neighbourhood(state: &ShardState, local: HostId) -> Option<(u64, u64)> {
+  let regional = state.council.configuration();
+  let current = regional.neighbourhoods.get(&local)?;
+  let settled = regional.settled.get(&local)?;
+  (settled.generation != current.generation
+    && state.fleet.configuration().version == regional.version)
+    .then_some((regional.version, current.generation))
+}
+
+/// Whether every record this shard owns is held by `f + 1` of each cohort of its current placement (§4.8 "the
+/// newest committed record is held by f+1 of the new candidates"): each volume's newest head, by the
+/// acknowledgements the record plane recorded for it, and each green's newest merge record
+/// ([`crate::merge_service::greens_placed_on_current_cohort`]). While this owner's neighbourhood change is in
+/// flight, its placement joins the settled and the current cohorts, so a head placed only on the settled one
+/// is not yet counted; the record plane re-ships it to the new candidates. True with nothing owned.
+fn records_placed_on_current_neighbourhood(state: &ShardState) -> bool {
+  let config = state.fleet.configuration();
+  let heads = state.volumes.iter().all(|(_, slot)| {
+    let object = ObjectId(slot.id.bytes);
+    state.placed_heads.get(&object).is_some_and(|head| {
+      config
+        .place(object)
+        .placed_with(&head.placement.acked, config.quorum)
+    })
+  });
+  heads && crate::merge_service::greens_placed_on_current_cohort(state)
+}
+
+/// Reports this node's neighbourhood change placed, once it is (§4.8 "Neighbourhood changes"; Vertical Paxos
+/// II's state transfer before the old configuration retires): while the council's current neighbourhood for
+/// this node differs from its settled one, every shard is asked whether all it owns is held by `f + 1` of each
+/// cohort of its current placement ([`records_placed_on_current_neighbourhood`]) under the very configuration
+/// version the report names; when all are, `Settle` for that neighbourhood's version goes to the council
+/// ([`send_council_report`]). Repeated each period until the installed configuration shows it settled; a report
+/// for a neighbourhood that moved on meanwhile changes nothing (the fold checks the version).
+async fn report_settlement(
+  origin: u16,
+  shards: &[u16],
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let Some((version, generation)) =
+    state::with_state(|s| unsettled_neighbourhood(s, local)).flatten()
+  else {
+    return;
+  };
+  for shard in shards.iter().copied() {
+    let placed = call_within(
+      origin,
+      shard,
+      move |s| {
+        s.fleet.configuration().version == version && records_placed_on_current_neighbourhood(s)
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    if placed != Some(true) {
+      return;
+    }
+  }
+  send_council_report(
+    slates_cluster::config_group::ConfigCommand::Settle {
+      owner: local,
+      generation,
+    },
+    local,
+    budget,
+    in_flight,
+  )
+  .await;
+}
+
+/// Sends a report this node makes about itself to the council (§4.8): proposed at once when this node leads
+/// the council, else sent to every voter it holds a session to over [`REPORT_STREAM`], where the leader
+/// proposes it. Counted [`REPORT_SENT`]. The sessions return with the replies; a late reply is dropped (the
+/// caller reports again next period if the configuration does not show it).
+async fn send_council_report(
+  command: slates_cluster::config_group::ConfigCommand,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let voters = state::with_state(|s| {
+    *s.refusals.entry(REPORT_SENT).or_insert(0) += 1;
+    if s.council.is_leader() {
+      let _ = s.council.report(local, command);
+      return Vec::new();
+    }
+    s.council.voters()
+  })
+  .unwrap_or_default();
+  let sessions = take_sessions(|host| host != local && voters.contains(&host));
+  if sessions.is_empty() {
+    return;
+  }
+  let request = command.encode();
+  let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
+    .into_iter()
+    .map(|(host, endpoint)| (host, request.clone(), endpoint))
+    .collect();
+  let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
+  let (replied, stragglers) = broadcast(requests, REPORT_STREAM, Priority::Metadata, budget).await;
+  let recovered: Vec<(HostId, Endpoint)> = replied
+    .into_iter()
+    .map(|(host, _, endpoint)| (host, endpoint))
+    .collect();
+  in_flight.push(Dispatch::new(
+    sent,
+    &recovered,
+    stragglers,
+    LateReplies::Discard,
+  ));
+  return_sessions(recovered);
 }
 
 /// Answers a learner's configuration fetch on [`CONFIG_FETCH_STREAM`] (§4.8, D-14). Initial
@@ -5989,24 +6169,15 @@ async fn run_record_plane(local: HostId) {
     // Drive the root group across regions on the same coordinator (§4.8, D-14): a brief borrow of the
     // root-voter sessions, sequential with the council's and the record ships, so it never contends.
     drive_root_group(local, budget, &mut root_timer, &mut in_flight).await;
-    // Install the configuration the council has agreed into this node's placement view, and take over any
-    // object whose owner the council has now retired (§4.8, D-14 — the council is the authority; a departed
-    // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
-    // recovery, driven below).
-    sync_config_from_council(local);
-    // Fan the committed placement and root configurations out to every other shard, every period, so a client
-    // reads the same placement and cross-region home wherever it lands (§4.8 "Lookup", D-7). Re-fanned every
-    // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
-    // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
-    fan_configs_to_shards(origin, &shards);
-    // Keep the owner's hold writing under the current configuration generation: the version advances on
-    // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
-    // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without
-    // this, no head provisioned after a membership change could ever place. Never refused: the version only
-    // advances, and `install_authority` accepts an equal-or-higher generation.
-    if let Some(authority) = owner_authority(local) {
-      let _ = owner_acceptor.install_authority(authority);
-    }
+    follow_configuration(
+      origin,
+      &shards,
+      local,
+      budget,
+      &mut owner_acceptor,
+      &mut in_flight,
+    )
+    .await;
     for shard in shards.iter().copied() {
       run_record_period(
         origin,
@@ -6029,6 +6200,41 @@ async fn run_record_plane(local: HostId) {
     // shard the taken-over id routes to.
     materialize_adopted_objects(origin, budget).await;
     futures::sleep(HEARTBEAT_NS).await;
+  }
+}
+
+/// One period of following the council's configuration on the coordinator (§4.8, D-14): install what the
+/// council has agreed into this node's placement view — taking over any object whose owner it retired —, fan
+/// the committed configurations to every other shard, report this node's neighbourhood change placed once it
+/// is, and keep the owner's hold writing under the current generation.
+async fn follow_configuration(
+  origin: u16,
+  shards: &[u16],
+  local: HostId,
+  budget: CommitBudget,
+  owner_acceptor: &mut Acceptor,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  // Install the configuration the council has agreed into this node's placement view, and take over any
+  // object whose owner the council has now retired (§4.8, D-14 — the council is the authority; a departed
+  // owner's objects that rendezvous first to this node over the new neighbourhood are owed a phase-one
+  // recovery, driven below).
+  sync_config_from_council(local);
+  // Fan the committed placement and root configurations out to every other shard, every period, so a client
+  // reads the same placement and cross-region home wherever it lands (§4.8 "Lookup", D-7). Re-fanned every
+  // period so a dispatch a full control channel refused self-heals; the receiving install/adopt are
+  // version-gated, so an unchanged configuration is a no-op there (see `fan_configs_to_shards`).
+  fan_configs_to_shards(origin, shards);
+  // Report this node's neighbourhood change placed once every shard holds all it owns at `f + 1` of each
+  // cohort of its current placement, so the council retires the old set (§4.8 "Neighbourhood changes").
+  report_settlement(origin, shards, local, budget, in_flight).await;
+  // Keep the owner's hold writing under the current configuration generation: the version advances on
+  // every join or retirement (`FleetNode::observe` keeps the node's own acceptor in step the same way), and
+  // a record under a stale generation is refused `ForeignGeneration` by the owner's own hold — so without
+  // this, no head provisioned after a membership change could ever place. Never refused: the version only
+  // advances, and `install_authority` accepts an equal-or-higher generation.
+  if let Some(authority) = owner_authority(local) {
+    let _ = owner_acceptor.install_authority(authority);
   }
 }
 
@@ -6105,7 +6311,7 @@ async fn ship_head(
   budget: CommitBudget,
 ) -> Option<Dispatch> {
   let holders =
-    take_sessions(|host| head.candidates.contains(&host) && !head.acked.contains(&host));
+    take_sessions(|host| head.shape.candidates.contains(&host) && !head.acked.contains(&host));
   if holders.is_empty() {
     return None; // No live session to a candidate that still needs the head; retry next period.
   }
@@ -6113,7 +6319,7 @@ async fn ship_head(
   let committed = commit_record(
     local,
     owner_acceptor,
-    &head.candidates,
+    &head.shape,
     &head.record,
     head.quorum,
     holders,
@@ -6173,9 +6379,8 @@ fn record_acks_in(
       sequence,
       epoch,
       placement: Placement {
-        candidates: placement.candidates.clone(),
         acked: Vec::new(),
-        mirror_acked: None,
+        ..placement.clone()
       },
     });
   if entry.sequence > sequence {
@@ -6183,9 +6388,12 @@ fn record_acks_in(
   }
   if entry.sequence < sequence {
     entry.sequence = sequence;
-    entry.placement.candidates = placement.candidates.clone();
     entry.placement.acked.clear();
   }
+  // The round's candidates and cohorts are the owner's current placement of the head; the acknowledgements
+  // of earlier rounds of the same head stay, each a durable hold of the same record.
+  entry.placement.candidates = placement.candidates.clone();
+  entry.placement.joint = placement.joint.clone();
   entry.epoch = entry.epoch.max(epoch);
   for host in placement.acked {
     if !entry.placement.acked.contains(&host) {
@@ -6353,13 +6561,13 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
   // node does not hold the object or is not a candidate for it.
   let prepared = state::with_state(|s| {
     let config = s.fleet.configuration();
-    let candidates = candidates_for(
-      local,
-      &config.neighbourhood,
-      &config.domains,
-      object,
-      config.quorum,
-    );
+    // The adoption commits under this node's own placement of the object — joined with its settled cohort
+    // while its own neighbourhood change is in flight, as every record it commits is.
+    let shape = Placement {
+      acked: Vec::new(),
+      ..config.place(object)
+    };
+    let candidates = shape.candidates.clone();
     if !candidates.contains(&local) {
       return None;
     }
@@ -6376,12 +6584,13 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
       generation,
       owner: local,
     });
-    Some((acceptor, recovery, candidates, quorum, generation, epoch))
+    Some((acceptor, recovery, shape, quorum, generation, epoch))
   })
   .flatten();
-  let Some((mut acceptor, recovery, candidates, quorum, generation, epoch)) = prepared else {
+  let Some((mut acceptor, recovery, shape, quorum, generation, epoch)) = prepared else {
     return dispatches;
   };
+  let candidates = shape.candidates.clone();
 
   let prepare = Prepare {
     owner: local,
@@ -6420,7 +6629,7 @@ async fn drive_takeover(object: ObjectId, local: HostId, budget: CommitBudget) -
     let committed = commit_record(
       local,
       &mut acceptor,
-      &candidates,
+      &shape,
       &adoption,
       quorum,
       holders,

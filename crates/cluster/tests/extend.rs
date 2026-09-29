@@ -289,7 +289,7 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
       let committed = commit_record(
         OWNER,
         &mut owner_acceptor,
-        &candidates,
+        &Placement::of(&candidates),
         &record(0, b"head@v1"),
         QUORUM,
         remotes,
@@ -310,7 +310,7 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
         commit_record(
           OWNER,
           &mut owner_acceptor,
-          &candidates,
+          &Placement::of(&candidates),
           &record(1, b"head@v2"),
           quorum,
           sessions,

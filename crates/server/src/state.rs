@@ -486,6 +486,11 @@ pub struct ShardState {
   /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions
   /// that are out for a moment. `None` in production (`Daemon::inject_campaign_session_hold`).
   pub campaign_session_hold: Option<(std::collections::BTreeSet<slates_db::HostId>, u64)>,
+  /// Test support (never reachable from the wire): owners whose register records this holder refuses, as a
+  /// holder that never received them would — no acknowledgement, counted — while the owner's council and
+  /// report traffic on the same session still flows (`fleet::accept_held_record`). Empty in production
+  /// (`Daemon::inject_record_refusal`).
+  pub record_refused_from: std::collections::BTreeSet<slates_db::HostId>,
   /// This node's owner-lease evidence (§4.8 "Leases and reads"; AUD-08): each peer's latest direct
   /// acknowledgement that reported this node alive under the installed configuration version, and any
   /// newer version a peer announced. Written on the control shard by the probe tasks

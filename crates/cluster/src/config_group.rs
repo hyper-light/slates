@@ -220,6 +220,53 @@ fn take_word(bytes: &[u8]) -> Option<(u64, &[u8])> {
   Some((u64::from_le_bytes(word), rest))
 }
 
+/// What the council did with a member's report ([`RegionalCouncil::report`]); its wire form is one byte
+/// ([`ReportOutcome::encode`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportOutcome {
+  /// The leader proposed it; it takes effect once committed.
+  Proposed,
+  /// It would change nothing: already recorded, or the neighbourhood or the takeover it names moved on.
+  Unchanged,
+  /// This node is not a caught-up leader; the member sends the report again.
+  NotLeader,
+  /// Not a report a member makes about itself: a membership change, a report naming another host, or bytes
+  /// that are no command at all.
+  Refused,
+}
+
+/// Format: the one-byte wire tags of a [`ReportOutcome`].
+const OUTCOME_PROPOSED: u8 = 0;
+/// Format: the tag of [`ReportOutcome::Unchanged`].
+const OUTCOME_UNCHANGED: u8 = 1;
+/// Format: the tag of [`ReportOutcome::NotLeader`].
+const OUTCOME_NOT_LEADER: u8 = 2;
+/// Format: the tag of [`ReportOutcome::Refused`].
+const OUTCOME_REFUSED: u8 = 3;
+
+impl ReportOutcome {
+  /// The outcome's one-byte wire form.
+  pub fn encode(self) -> Vec<u8> {
+    vec![match self {
+      ReportOutcome::Proposed => OUTCOME_PROPOSED,
+      ReportOutcome::Unchanged => OUTCOME_UNCHANGED,
+      ReportOutcome::NotLeader => OUTCOME_NOT_LEADER,
+      ReportOutcome::Refused => OUTCOME_REFUSED,
+    }]
+  }
+
+  /// Decodes an outcome, or `None` for anything but exactly one known tag (a reply that crossed the network).
+  pub fn decode(bytes: &[u8]) -> Option<ReportOutcome> {
+    match bytes {
+      [OUTCOME_PROPOSED] => Some(ReportOutcome::Proposed),
+      [OUTCOME_UNCHANGED] => Some(ReportOutcome::Unchanged),
+      [OUTCOME_NOT_LEADER] => Some(ReportOutcome::NotLeader),
+      [OUTCOME_REFUSED] => Some(ReportOutcome::Refused),
+      _ => None,
+    }
+  }
+}
+
 /// A proposed change to the configuration — the vocabulary the SWIM view and takeover speak to the
 /// group. Applied locally at `f = 0`; carried through consensus at `f > 0` (owed).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -876,6 +923,38 @@ impl RegionalCouncil {
     self.raft.last_log_index() == self.raft.commit_index()
   }
 
+  /// Takes a member's report about **itself** to the council (§4.8 "Neighbourhood changes": "the group retires
+  /// the old set only after the owner has acknowledged the new configuration"; "Promotion and takeover": the
+  /// new owner "only then serves under confirmed authority"): a settlement whose `owner`, or a takeover
+  /// confirmation whose `successor`, is `reporter` — the session's authenticated peer — so no member reports
+  /// for another, and a membership change is never a report (the leader's own reconciliation decides those).
+  /// Only a caught-up leader proposes it ([`caught_up`](RegionalCouncil::caught_up)), and only when it would
+  /// change the configuration, so a report the member repeats while its proposal is in flight is not
+  /// appended twice; any other node answers [`ReportOutcome::NotLeader`] and the member sends it again.
+  pub fn report(&mut self, reporter: HostId, command: ConfigCommand) -> ReportOutcome {
+    let change = match command {
+      ConfigCommand::Settle { owner, generation } if owner == reporter => {
+        Reconfiguration::Settle { owner, generation }
+      }
+      ConfigCommand::Confirm {
+        departed,
+        successor,
+      } if successor == reporter => Reconfiguration::Confirm {
+        departed,
+        successor,
+      },
+      _ => return ReportOutcome::Refused,
+    };
+    if !self.is_leader() || !self.caught_up() {
+      return ReportOutcome::NotLeader;
+    }
+    if self.propose(change) {
+      ReportOutcome::Proposed
+    } else {
+      ReportOutcome::Unchanged
+    }
+  }
+
   /// Reconciles the regional membership with this leader's SWIM view **as the leader** (§4.8 "the
   /// configuration master decides membership"): proposes admitting every `alive` host not yet a member, and
   /// taking over — an epoch bump plus a retirement — every `dead` host still a member, each through the
@@ -1234,6 +1313,109 @@ mod tests {
       None,
       "an unknown tag decodes to nothing"
     );
+  }
+
+  /// A three-voter council led by `OWNER` that has committed a fourth member's admission, and a member whose
+  /// neighbourhood the admission moved, with the version its current neighbourhood was fixed at.
+  fn council_with_a_moved_neighbourhood() -> (
+    std::collections::BTreeMap<HostId, RegionalCouncil>,
+    HostId,
+    u64,
+  ) {
+    let mut groups = councils(&[OWNER, A, B]);
+    elect_among(&mut groups, OWNER, &[OWNER, A, B]);
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert!(leader.propose(Reconfiguration::Admit {
+      host: HostId(4),
+      domain: None
+    }));
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    let configuration = groups[&OWNER].configuration().clone();
+    let moved = [OWNER, A, B]
+      .into_iter()
+      .find(|owner| {
+        configuration.settled[owner].generation != configuration.neighbourhoods[owner].generation
+      })
+      .expect("an admission into a full three-host neighbourhood moves one");
+    let generation = configuration.neighbourhoods[&moved].generation;
+    (groups, moved, generation)
+  }
+
+  /// §4.8 "Neighbourhood changes": the council takes a report only about the reporter itself — never one
+  /// naming another member, and never a membership change sent as a report.
+  #[test]
+  fn a_report_is_taken_only_about_its_reporter() {
+    let (mut groups, moved, generation) = council_with_a_moved_neighbourhood();
+    let settle = ConfigCommand::Settle {
+      owner: moved,
+      generation,
+    };
+    let other = [OWNER, A, B]
+      .into_iter()
+      .find(|host| *host != moved)
+      .unwrap();
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(
+      leader.report(other, settle),
+      ReportOutcome::Refused,
+      "no member reports for another"
+    );
+    assert_eq!(
+      leader.report(moved, ConfigCommand::Retire(A)),
+      ReportOutcome::Refused,
+      "a membership change is never a report"
+    );
+  }
+
+  /// §4.8 "Neighbourhood changes": a settlement report is proposed only by a caught-up leader and only once,
+  /// a follower answers that it is not the leader (so the member sends it again), and once committed it
+  /// settles the reporter's neighbourhood on every voter.
+  #[test]
+  fn a_settlement_report_settles_its_reporter_through_the_leader_once() {
+    let (mut groups, moved, generation) = council_with_a_moved_neighbourhood();
+    let settle = ConfigCommand::Settle {
+      owner: moved,
+      generation,
+    };
+    let leader = groups.get_mut(&OWNER).unwrap();
+    assert_eq!(leader.report(moved, settle), ReportOutcome::Proposed);
+    assert_eq!(
+      leader.report(moved, settle),
+      ReportOutcome::NotLeader,
+      "while its proposal is in flight the leader is not caught up, so it is not appended twice"
+    );
+    let follower = groups.get_mut(&A).unwrap();
+    assert_eq!(follower.report(moved, settle), ReportOutcome::NotLeader);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
+    for voter in [OWNER, A, B] {
+      assert_eq!(
+        groups[&voter].configuration().settled[&moved].generation,
+        generation,
+        "the committed report settled the reporter's neighbourhood on {voter:?}"
+      );
+    }
+    assert_eq!(
+      groups.get_mut(&OWNER).unwrap().report(moved, settle),
+      ReportOutcome::Unchanged,
+      "a report already recorded changes nothing"
+    );
+  }
+
+  /// A report's outcome round-trips its one-byte wire form, and anything else decodes to nothing.
+  #[test]
+  fn a_report_outcome_round_trips() {
+    for outcome in [
+      ReportOutcome::Proposed,
+      ReportOutcome::Unchanged,
+      ReportOutcome::NotLeader,
+      ReportOutcome::Refused,
+    ] {
+      assert_eq!(ReportOutcome::decode(&outcome.encode()), Some(outcome));
+    }
+    assert_eq!(ReportOutcome::decode(&[]), None);
+    assert_eq!(ReportOutcome::decode(&[OUTCOME_REFUSED, 0]), None);
   }
 
   /// Sends one request from `from` to `to`: `to` answers it (serve) and `from` folds the answer (drive),

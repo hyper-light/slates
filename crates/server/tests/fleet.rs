@@ -6112,6 +6112,156 @@ fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result
   }
 }
 
+/// Shape: the coordinator periods [`an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`]
+/// watches the owner stay unsettled while its head is short of the new cohort — each period the owner judges
+/// its records and would report a placed change, so several periods without a settlement show it waited.
+const UNSETTLED_PERIODS: u32 = 5;
+
+/// §4.8 "Neighbourhood changes" (Vertical Paxos II: the old set retires only once the newest committed record
+/// is held by `f + 1` of the new candidates): a retirement moves the owner's neighbourhood, and the owner
+/// reports the change placed — the council settles the new neighbourhood — only once its head is held by
+/// `f + 1` of the new cohort. One survivor refuses the owner's records (an injected fault that leaves the
+/// council's and the report's traffic flowing), so the head places on the owner and the node about to die.
+/// After that node is retired the owner stays unsettled for as long as the survivor refuses; once the fault is
+/// lifted the head reaches the survivor and the owner settles. Non-vacuous: before the death the survivor holds
+/// nothing of the volume, the owner's neighbourhood moves, and a readiness check forced true settles at once
+/// (checked by hand when the test was written).
+#[test]
+fn an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, mut daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let (owner, victim) = (hosts[0], hosts[2]);
+  let formed = daemons[0].council_settlement(owner);
+  let refusing = daemons[1].inject_record_refusal(&[owner]);
+  let placement = head_placed_past_one_survivor(&daemons, "settles");
+  daemons.remove(2).stop();
+  let remaining: Vec<&Daemon> = daemons.iter().collect();
+  let retired = poll_until(&remaining, RETIREMENT_DEADLINE, || {
+    daemons[0]
+      .council_members()
+      .map(|members| !members.contains(&victim))
+  });
+  // The owner judges its records every period; while the survivor refuses the head it must not settle.
+  let unsettled = settlement_samples(&daemons[0], owner, UNSETTLED_PERIODS);
+  let lifted = daemons[1].inject_record_refusal(&[]);
+  let settled = poll_until(&remaining, PLACEMENT_DEADLINE, || {
+    settled_now(&daemons[0], owner)
+  });
+  let survivor_holds = placement
+    .as_ref()
+    .ok()
+    .and_then(|(object, _)| daemons[1].fleet_holder_head(*object).ok())
+    .map(|head| head.is_some());
+  let after = daemons[0].council_settlement(owner);
+  let counters: Vec<_> = daemons.iter().map(Daemon::fleet_refusals).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    refusing.is_ok() && lifted.is_ok(),
+    "the survivor's refusal was injected and lifted: {refusing:?}, {lifted:?}"
+  );
+  assert!(
+    placement.is_ok(),
+    "the head placed with the node about to die and not the survivor: {placement:?}"
+  );
+  assert!(retired, "the council retired the dead node");
+  assert!(
+    unsettled.iter().all(moved_unsettled),
+    "the owner's neighbourhood moved and stayed unsettled while the survivor refused the head: {unsettled:?}"
+  );
+  assert!(
+    settled && survivor_holds == Some(true),
+    "the owner settled once its head reached the survivor (settled={settled}, the survivor holds it={survivor_holds:?}): {after:?}, {counters:?}"
+  );
+  assert!(
+    matches!((&formed, &after), (Ok(Some((before, _))), Ok(Some((now, _)))) if now > before),
+    "the settled neighbourhood moved forward: {formed:?} then {after:?}"
+  );
+}
+
+/// Starts a mesh of one daemon per name and waits for it to form: the port lease the daemons serve on (kept
+/// for the test's life), the daemons, and their member ids.
+fn formed_mesh(names: &[&str]) -> (PortLease, Vec<Daemon>, Vec<HostId>) {
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, names);
+  (serve_lease, daemons, hosts)
+}
+
+/// Whether a settlement sample shows the owner's neighbourhood moved and not yet settled.
+fn moved_unsettled(settlement: &Result<Option<(u64, u64)>, ObserveError>) -> bool {
+  matches!(settlement, Ok(Some((settled, current))) if settled != current)
+}
+
+/// Creates and snapshots a volume on `daemons[0]` and waits for its head to place with `daemons[2]` while
+/// `daemons[1]` refuses the owner's records: the object and its snapshot on success, else what did not hold.
+fn head_placed_past_one_survivor(
+  daemons: &[Daemon],
+  name: &str,
+) -> Result<(ObjectId, SnapshotId), String> {
+  let mut client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err("create on the owner".to_owned());
+  };
+  let object = ObjectId(id.bytes);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    return Err("snapshot on the owner".to_owned());
+  };
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_snapshot_placed(&observed, &mut client, id, snapshot);
+  let placed_with = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    daemons[2]
+      .fleet_holder_head(object)
+      .map(|head| head.is_some())
+  });
+  let survivor_held = daemons[1]
+    .fleet_holder_head(object)
+    .map(|head| head.is_some());
+  if placed && placed_with && survivor_held == Ok(false) {
+    Ok((object, snapshot))
+  } else {
+    Err(format!(
+      "placed={placed}, the node about to die holds it={placed_with}, the survivor held it={survivor_held:?}"
+    ))
+  }
+}
+
+/// `daemon`'s view of `owner`'s settlement, sampled once a coordinator period for `periods` periods; the
+/// test thread parks between samples on a channel nobody sends on.
+fn settlement_samples(
+  daemon: &Daemon,
+  owner: HostId,
+  periods: u32,
+) -> Vec<Result<Option<(u64, u64)>, ObserveError>> {
+  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+  (0..periods)
+    .map(|_| {
+      let sample = daemon.council_settlement(owner);
+      let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+      sample
+    })
+    .collect()
+}
+
+/// Whether `owner`'s settled neighbourhood is its current one, as `daemon`'s council sees it.
+fn settled_now(daemon: &Daemon, owner: HostId) -> Result<bool, ObserveError> {
+  daemon
+    .council_settlement(owner)
+    .map(|settlement| settlement.is_some_and(|(settled, current)| settled == current))
+}
+
 /// Polls `status` for `volume` at the daemon reached at `instance` until it answers with a report (the
 /// volume is served there) or the serve deadline passes; returns whether it did.
 fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) -> bool {

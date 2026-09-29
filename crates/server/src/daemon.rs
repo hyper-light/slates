@@ -858,6 +858,34 @@ impl Daemon {
     }
   }
 
+  /// Test support: makes this node, as a holder, refuse every register record from `owners` — no
+  /// acknowledgement, counted `fleet.record.refused_by_fault` — as a holder that never received them would,
+  /// while the owners' council and report traffic on the same sessions still flows; so a test keeps a head off
+  /// one candidate without touching consensus. Replaces any earlier set; an empty `owners` restores full
+  /// service. `Ok` once installed, else the typed refusal.
+  pub fn inject_record_refusal(&self, owners: &[slates_db::HostId]) -> Result<(), ObserveError> {
+    let owners: std::collections::BTreeSet<slates_db::HostId> = owners.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.record_refused_from = owners;
+    })
+  }
+
+  /// Test support: the version at which the council's configuration fixed `member`'s settled neighbourhood
+  /// and the version its current neighbourhood was fixed at (§4.8 "Neighbourhood changes"): equal once the
+  /// member has reported its change placed and the council settled it; `None` for a non-member. A one-shot
+  /// control-shard question; the typed refusal when the shard could not answer.
+  pub fn council_settlement(
+    &self,
+    member: slates_db::HostId,
+  ) -> Result<Option<(u64, u64)>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let regional = s.council.configuration();
+      let settled = regional.settled.get(&member)?.generation;
+      let current = regional.neighbourhoods.get(&member)?.generation;
+      Some((settled, current))
+    })
+  }
+
   /// Test support: holds this daemon's record session to `peer` out of its link for `span_ns` and then puts
   /// it back, exactly as a coordinator dispatch or a discovery page holds it (`fleet::take_sessions`,
   /// `fleet::return_sessions`), so a test drives a forward into a session that is out (§4.8 "Lookup";
@@ -2309,6 +2337,7 @@ fn init_shard(
     indirect: crate::fleet::IndirectProbes::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     campaign_session_hold: None,
+    record_refused_from: std::collections::BTreeSet::new(),
     // The owner lease starts its bounded startup allowance at boot (§4.8 "Leases and reads", AUD-08): the
     // node has just installed its initial configuration, so within the first membership horizon it serves
     // its objects while its first probe acks accumulate, and no takeover can yet have committed.

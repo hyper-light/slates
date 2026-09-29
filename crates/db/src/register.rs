@@ -184,12 +184,18 @@ pub enum DurabilityScope {
 /// acknowledged its newest committed record. At `f = 0` both are the owner alone.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placement {
-  /// The candidate holders (`2f + 1`), the owner among them.
+  /// The candidate holders the record is sent to: its `2f + 1` candidates, the owner among them — and, while
+  /// the owner's neighbourhood change is in flight, the union of its settled and its current cohorts.
   pub candidates: Vec<HostId>,
   /// The candidates that acknowledged, recorded in the head so a reader learns the copies.
   pub acked: Vec<HostId>,
   /// The mirror candidates that acknowledged, when the record was shipped to the mirror.
   pub mirror_acked: Option<Vec<HostId>>,
+  /// While the owner's neighbourhood change is in flight (§4.8 "the owner writes to a quorum of the old
+  /// candidates and a quorum of the new ones (joint writes)"), the two cohorts the record must reach `f + 1`
+  /// of **each** — the settled one first, then the current one. Empty outside a change, and for an object
+  /// whose cohort the change left as it was: `candidates` is then the one cohort.
+  pub joint: Vec<Vec<HostId>>,
 }
 
 impl Placement {
@@ -213,15 +219,42 @@ impl Placement {
       candidates,
       acked,
       mirror_acked: None,
+      joint: Vec::new(),
     }
   }
 
-  /// Whether the region commit holds (`f + 1` regional acknowledgements). Counts each **candidate**
-  /// once: a duplicate acknowledgement from one holder, or an acknowledgement bearing a host id that
-  /// is not a candidate for this object, cannot manufacture a quorum (a two-count `f = 1` commit must
-  /// be two *distinct* candidates). The vector length alone is not the count.
+  /// Whether the region commit holds (`f + 1` regional acknowledgements) — of **each** cohort while a change
+  /// is in flight ([`joint`](Placement::joint)). Counts each **candidate** once: a duplicate acknowledgement
+  /// from one holder, or an acknowledgement bearing a host id that is not a candidate for this object (or not
+  /// in the cohort being counted), cannot manufacture a quorum (a two-count `f = 1` commit must be two
+  /// *distinct* candidates). The vector length alone is not the count.
   pub fn placed(&self, quorum: Quorum) -> bool {
-    quorum.committed(self.distinct_candidate_acks(&self.acked))
+    self.placed_with(&self.acked, quorum)
+  }
+
+  /// Whether `acked` would place a record under this placement's candidates and cohorts — [`placed`] for an
+  /// acknowledging set gathered apart from it, as a dispatch does while it collects replies.
+  ///
+  /// [`placed`]: Placement::placed
+  pub fn placed_with(&self, acked: &[HostId], quorum: Quorum) -> bool {
+    if self.joint.is_empty() {
+      return quorum.committed(self.distinct_candidate_acks(acked));
+    }
+    self
+      .joint
+      .iter()
+      .all(|cohort| quorum.committed(distinct_acks_within(cohort, acked)))
+  }
+
+  /// The single-cohort placement of `candidates` that nothing has acknowledged yet — the shape a dispatch to
+  /// one candidate set (content, a laptop, a test) commits against.
+  pub fn of(candidates: &[HostId]) -> Placement {
+    Placement {
+      candidates: candidates.to_vec(),
+      acked: Vec::new(),
+      mirror_acked: None,
+      joint: Vec::new(),
+    }
   }
 
   /// Whether the mirror commit holds — the same distinct-candidate counting as [`Placement::placed`].
@@ -235,12 +268,17 @@ impl Placement {
   /// The number of distinct candidates in `acks`: dedups the host ids and drops any that are not a
   /// candidate for this object, so only eligible, once-counted acknowledgements count toward a quorum.
   fn distinct_candidate_acks(&self, acks: &[HostId]) -> usize {
-    acks
-      .iter()
-      .filter(|host| self.candidates.contains(host))
-      .collect::<std::collections::BTreeSet<&HostId>>()
-      .len()
+    distinct_acks_within(&self.candidates, acks)
   }
+}
+
+/// The number of distinct hosts of `cohort` in `acks`: dedups the host ids and drops any outside `cohort`.
+fn distinct_acks_within(cohort: &[HostId], acks: &[HostId]) -> usize {
+  acks
+    .iter()
+    .filter(|host| cohort.contains(host))
+    .collect::<std::collections::BTreeSet<&HostId>>()
+    .len()
 }
 
 /// The candidate holders for `object`: the owner plus the co-holders of the one **copyset** the object
@@ -1226,6 +1264,7 @@ pub fn commit_over_holders(
     candidates: candidates.to_vec(),
     acked,
     mirror_acked: None,
+    joint: Vec::new(),
   }
 }
 
@@ -1344,6 +1383,11 @@ pub struct Configuration {
   pub quorum: Quorum,
   /// Whether a mirror region exists.
   pub has_mirror: bool,
+  /// While this owner's neighbourhood change is in flight, the neighbourhood its records are all placed on
+  /// ([`Settled`]): its records commit at `f + 1` of both cohorts ([`place`](Configuration::place)) until the
+  /// council settles the current one, and a takeover recovers through this one. `None` once its current
+  /// neighbourhood is settled — always on a laptop.
+  pub settled: Option<Settled>,
 }
 
 impl Configuration {
@@ -1359,6 +1403,7 @@ impl Configuration {
       domains: std::collections::BTreeMap::new(),
       quorum: Quorum { f: 0 },
       has_mirror: false,
+      settled: None,
     }
   }
 
@@ -1373,8 +1418,31 @@ impl Configuration {
     Ok(())
   }
 
-  /// The placement an object takes when the owner first holds it (`Placement::local`).
+  /// The placement a **record** of `object` takes when the owner first holds it (`Placement::local`): its
+  /// cohort in the current neighbourhood — and, while a change is in flight and moved this object's cohort,
+  /// the settled cohort too, joined (§4.8 "joint writes"): the record goes to both and commits at `f + 1` of
+  /// each, so every record the owner commits stays at `f + 1` of the cohort a takeover recovers through
+  /// ([`recovery_cohort`](Configuration::recovery_cohort)).
   pub fn place(&self, object: ObjectId) -> Placement {
+    let mut placement = self.place_content(object);
+    if let Some(settled) = &self.settled {
+      let old = settled.cohort(self.owner, object, self.quorum);
+      if old != placement.candidates {
+        let current = placement.candidates.clone();
+        for host in &old {
+          if !placement.candidates.contains(host) {
+            placement.candidates.push(*host);
+          }
+        }
+        placement.joint = vec![old, current];
+      }
+    }
+    placement
+  }
+
+  /// The placement **content** of `object` takes (§4.10): its cohort in the current neighbourhood alone. Content
+  /// is fetched by identity from the holders the head names, so it needs no joint placement across a change.
+  pub fn place_content(&self, object: ObjectId) -> Placement {
     Placement::local(
       self.owner,
       self.quorum,
@@ -1382,6 +1450,22 @@ impl Configuration {
       &self.domains,
       object,
     )
+  }
+
+  /// The cohort a takeover of this owner would recover `object` through: the settled cohort while a change is
+  /// in flight, else the current one. Every record the owner commits is at `f + 1` of it, so the owner lease
+  /// counts confirmations over it (the successor's promotion quorum is drawn from it).
+  pub fn recovery_cohort(&self, object: ObjectId) -> Vec<HostId> {
+    match &self.settled {
+      Some(settled) => settled.cohort(self.owner, object, self.quorum),
+      None => candidates_for(
+        self.owner,
+        &self.neighbourhood,
+        &self.domains,
+        object,
+        self.quorum,
+      ),
+    }
   }
 
   /// The number of distinct **copysets** this owner's objects spread over under the current neighbourhood
@@ -1617,6 +1701,11 @@ impl RegionalConfiguration {
       domains: self.domains.clone(),
       quorum: self.quorum,
       has_mirror: self.has_mirror,
+      settled: self
+        .settled
+        .get(&owner)
+        .filter(|settled| settled.generation != neighbourhood.generation)
+        .cloned(),
     })
   }
 
@@ -2076,6 +2165,7 @@ mod tests {
       domains: std::collections::BTreeMap::new(),
       quorum: Quorum { f: 1 },
       has_mirror: false,
+      settled: None,
     };
     for object in 0..64u64 {
       let laptop_place = write(&laptop, object, FIRST_EPOCH);
@@ -2622,6 +2712,7 @@ mod tests {
       domains: std::collections::BTreeMap::new(),
       quorum: Quorum { f: 1 },
       has_mirror: false,
+      settled: None,
     };
     assert_eq!(
       floor.copyset_count(),
@@ -2677,6 +2768,7 @@ mod tests {
         domains: Default::default(),
         quorum,
         has_mirror: false,
+        settled: None,
       };
       assert!(configuration.within_loss_bound(0.0, 0));
       assert!(!configuration.within_loss_bound(0.0, 1));
@@ -3044,6 +3136,112 @@ mod tests {
       regional.retired.is_empty(),
       "both dropped once both are confirmed"
     );
+  }
+
+  /// A wide region in which an admission moved some member's neighbourhood: the region, that member, its
+  /// placement configuration while the change is in flight, and the objects whose cohorts the change moved and
+  /// did not move.
+  fn change_in_flight() -> (
+    RegionalConfiguration,
+    HostId,
+    Configuration,
+    Vec<ObjectId>,
+    Vec<ObjectId>,
+  ) {
+    let (mut regional, scatter) = wide_region();
+    let joiner = HostId(6);
+    assert!(regional.admit(joiner, None, scatter));
+    let owner = regional
+      .members
+      .iter()
+      .copied()
+      .find(|owner| {
+        *owner != joiner
+          && regional.settled[owner].generation != regional.neighbourhoods[owner].generation
+      })
+      .expect("the joiner entered some neighbourhood");
+    let configuration = regional.configuration_for(owner).unwrap();
+    let settled = configuration
+      .settled
+      .clone()
+      .expect("a change in flight carries the settled neighbourhood");
+    let (moved, kept) = (0..64u64)
+      .map(|index| ObjectId::new(owner, index))
+      .partition(|object| {
+        settled.cohort(owner, *object, configuration.quorum)
+          != configuration.place_content(*object).candidates
+      });
+    (regional, owner, configuration, moved, kept)
+  }
+
+  /// §4.8 "Neighbourhood changes" (joint writes): while an owner's change is in flight, a record of an object
+  /// whose cohort the change moved goes to both cohorts and commits only at `f + 1` of **each**, and the cohort
+  /// a takeover recovers through — the one the lease counts over — is the settled one.
+  #[test]
+  fn a_change_in_flight_commits_a_moved_objects_records_on_both_cohorts() {
+    let (_, owner, configuration, moved, _) = change_in_flight();
+    let quorum = configuration.quorum;
+    let object = *moved
+      .first()
+      .expect("the change moved some object's cohort");
+    let old = configuration
+      .settled
+      .as_ref()
+      .unwrap()
+      .cohort(owner, object, quorum);
+    let new = configuration.place_content(object).candidates;
+    let placement = configuration.place(object);
+    assert_eq!(placement.joint, vec![old.clone(), new.clone()]);
+    assert!(
+      old
+        .iter()
+        .chain(&new)
+        .all(|host| placement.candidates.contains(host)),
+      "the record goes to both cohorts"
+    );
+    let gained = *new.iter().find(|host| !old.contains(host)).unwrap();
+    let lost = *old.iter().find(|host| !new.contains(host)).unwrap();
+    assert!(
+      !placement.placed_with(&[owner, gained], quorum),
+      "f + 1 of the new cohort alone does not commit"
+    );
+    assert!(
+      !placement.placed_with(&[owner, lost], quorum),
+      "f + 1 of the settled cohort alone does not commit"
+    );
+    assert!(
+      placement.placed_with(&[owner, gained, lost], quorum),
+      "f + 1 of each commits"
+    );
+    assert_eq!(
+      configuration.recovery_cohort(object),
+      old,
+      "a takeover recovers through the settled cohort"
+    );
+  }
+
+  /// §4.8 "Neighbourhood changes": an object whose cohort a change left as it was keeps its one cohort, and
+  /// once the council settles the new neighbourhood every record is placed on one cohort again — the new one,
+  /// which a takeover then recovers through.
+  #[test]
+  fn a_settled_change_places_every_record_on_one_cohort_again() {
+    let (mut regional, owner, configuration, moved, kept) = change_in_flight();
+    if let Some(unmoved) = kept.first() {
+      assert!(
+        configuration.place(*unmoved).joint.is_empty(),
+        "an object whose cohort did not move keeps its one cohort"
+      );
+    }
+    let object = *moved.first().unwrap();
+    let new = configuration.place_content(object).candidates;
+    assert!(regional.settle(owner, regional.neighbourhoods[&owner].generation));
+    let settled = regional.configuration_for(owner).unwrap();
+    assert!(
+      settled.settled.is_none(),
+      "a settled neighbourhood carries no second cohort"
+    );
+    assert!(settled.place(object).joint.is_empty());
+    assert_eq!(settled.recovery_cohort(object), new);
   }
 
   /// Banned item 8: retirements nobody confirms stay bounded by the members, the oldest dropped first, however

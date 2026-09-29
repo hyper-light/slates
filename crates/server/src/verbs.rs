@@ -597,13 +597,9 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
 /// bridge ([`crate::nfs`]).
 pub(crate) fn lease_unconfirmed(state: &ShardState, object: ObjectId) -> Option<u64> {
   let config = state.fleet.configuration();
-  let candidates = slates_db::register::candidates_for(
-    config.owner,
-    &config.neighbourhood,
-    &config.domains,
-    object,
-    config.quorum,
-  );
+  // The cohort a successor's promotion quorum is drawn from: the settled one while this owner's neighbourhood
+  // change is in flight (every record it commits is at `f + 1` of it), else the current one.
+  let candidates = config.recovery_cohort(object);
   let now = slates_machine::clock::monotonic_ns();
   let holds = state.lease.holds(
     now,

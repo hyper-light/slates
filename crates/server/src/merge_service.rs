@@ -70,6 +70,10 @@ pub struct MergeShardState {
   /// The highest version of each owned green whose merge record placed at `f + 1` (`await placed`
   /// answers from it; at `f = 0` every appended version).
   pub placed: BTreeMap<ObjectId, u64>,
+  /// The holders that acknowledged the version `placed` names, per owned green: whether this owner may report
+  /// its neighbourhood change placed reads them (§4.8 "the newest committed record is held by f+1 of the new
+  /// candidates"; [`placed_on_current_cohort`]). Bounded by the owned greens, dropped with the green.
+  pub placed_holders: BTreeMap<ObjectId, (u64, Vec<HostId>)>,
   /// This holder's replica of each green it backs (§4.16 "Apply on holders"): the engine the
   /// holder recomputes every version into before accepting the record that names it. Empty on a
   /// laptop (no records arrive).
@@ -858,6 +862,12 @@ pub(crate) fn destroy_merge_volume(
   if state.greens.remove(&id).is_some() {
     state.merge.attachments.retain(|_, pin| pin.green != id);
     release_green_retention(state, id);
+    // Nothing of a destroyed green is left to place: its owner-side placement state goes with it, so the
+    // maps stay bounded by the greens this shard owns (banned item 8).
+    let object = ObjectId(id.bytes);
+    state.merge.pending.remove(&object);
+    state.merge.placed.remove(&object);
+    state.merge.placed_holders.remove(&object);
   }
   Some(ReplyBody::Destroyed)
 }
@@ -1204,7 +1214,10 @@ pub(crate) fn enqueue_record(
   let config = state.fleet.configuration();
   let local = state.fleet.host();
   let quorum = config.quorum;
-  let candidates = config.place(object).candidates;
+  // The record's placement: joined with the settled cohort while this owner's neighbourhood change is in
+  // flight (§4.8 "joint writes"), so every version it commits stays at `f + 1` of the cohort a takeover
+  // recovers through.
+  let shape = config.place(object);
   let identity = state
     .greens
     .get(&green)
@@ -1232,14 +1245,20 @@ pub(crate) fn enqueue_record(
     })
     .unwrap_or_else(|| (String::new(), false, Principal::Uid { uid: 0 }));
   let local_hold = Placement {
-    candidates: candidates.clone(),
     acked: vec![local],
     mirror_acked: None,
+    ..shape.clone()
   };
   if local_hold.placed(quorum) {
     // The laptop degenerate (R8): the owner is the quorum, the append was the commit.
     let placed = state.merge.placed.entry(object).or_insert(version);
     *placed = (*placed).max(version);
+    if *placed == version {
+      state
+        .merge
+        .placed_holders
+        .insert(object, (version, local_hold.acked));
+    }
     return;
   }
   state.merge.pending.entry(object).or_default().insert(
@@ -1258,9 +1277,9 @@ pub(crate) fn enqueue_record(
       },
       inputs: local_hold,
       record: Placement {
-        candidates,
         acked: Vec::new(),
         mirror_acked: None,
+        ..shape
       },
     },
   );
@@ -1357,8 +1376,9 @@ pub(crate) enum MergeWork {
     record: Record,
     /// The candidates to reach this period (in order behind the version before).
     targets: Vec<HostId>,
-    /// Every candidate.
-    candidates: Vec<HostId>,
+    /// The placement the record commits against: every candidate, and the cohorts joined while the owner's
+    /// neighbourhood change is in flight, with nothing acknowledged.
+    shape: Placement,
     /// The quorum.
     quorum: Quorum,
   },
@@ -1437,7 +1457,10 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
           value: pending.value.to_record_bytes(),
         },
         targets: ready,
-        candidates: pending.record.candidates.clone(),
+        shape: Placement {
+          acked: Vec::new(),
+          ..pending.record.clone()
+        },
         quorum: config.quorum,
       });
     }
@@ -1487,7 +1510,7 @@ pub(crate) async fn run_merge_period(
         version,
         record,
         targets,
-        candidates,
+        shape,
         quorum,
       } => {
         ship_record(
@@ -1499,7 +1522,7 @@ pub(crate) async fn run_merge_period(
           version,
           record,
           targets,
-          candidates,
+          shape,
           quorum,
           budget,
         )
@@ -1589,7 +1612,7 @@ async fn ship_record(
   version: u64,
   record: Record,
   targets: Vec<HostId>,
-  candidates: Vec<HostId>,
+  shape: Placement,
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
@@ -1602,7 +1625,7 @@ async fn ship_record(
     MERGE_RECORD_STREAM,
     local,
     owner_acceptor,
-    &candidates,
+    &shape,
     &record,
     quorum,
     holders,
@@ -1625,6 +1648,37 @@ async fn ship_record(
     record_merge_acks(s, local, object, version, placement, quorum);
   });
   Some(dispatch)
+}
+
+/// Whether every green this shard owns has its newest version's merge record held by `f + 1` of each cohort of
+/// its current placement (§4.8 "the newest committed record is held by f+1 of the new candidates"): by the
+/// holders that acknowledged the version [`MergeShardState::placed`] names, or — for a green this node took
+/// over — by the acknowledgements of its adoption the record plane recorded. A green whose newest version has
+/// not placed yet is not. A holder can accept a merge record only once it holds every version before it
+/// (§4.16 "Apply on holders"), and a new candidate holds none, so a green whose current cohort has fewer than
+/// `f + 1` holders of its history keeps its owner's change unsettled — joint writes go on, the settled cohort
+/// stays the one a takeover recovers through — until the owed ledger-prefix transfer (GAP-A9-7) ships the
+/// history. True with no green.
+pub(crate) fn greens_placed_on_current_cohort(state: &ShardState) -> bool {
+  let config = state.fleet.configuration();
+  state.greens.iter().all(|(id, green)| {
+    let object = ObjectId(id.bytes);
+    let head = green.head();
+    let holders = state
+      .merge
+      .placed_holders
+      .get(&object)
+      .filter(|(version, _)| *version == head)
+      .map(|(_, holders)| holders.as_slice())
+      .or_else(|| {
+        state
+          .placed_heads
+          .get(&object)
+          .filter(|placed| placed.sequence == head)
+          .map(|placed| placed.placement.acked.as_slice())
+      });
+    holders.is_some_and(|holders| config.place(object).placed_with(holders, config.quorum))
+  })
 }
 
 /// Merges a round's acknowledgements into the version's pending record (never overwriting them: each
@@ -1665,6 +1719,13 @@ fn record_merge_acks(
     let placed = state.merge.placed.entry(object).or_insert(version);
     *placed = (*placed).max(version);
     newly_placed = Some(*placed);
+    // The holders of the newest placed version: every acknowledgement of it so far, each a durable hold.
+    if *placed == version {
+      state
+        .merge
+        .placed_holders
+        .insert(object, (version, pending.record.acked.clone()));
+    }
   }
   if everyone {
     pending_green.records.remove(&version);
@@ -2164,11 +2225,13 @@ mod tests {
         candidates: candidates.clone(),
         acked: vec![local, second],
         mirror_acked: None,
+        joint: Vec::new(),
       },
       record: Placement {
         candidates,
         acked: Vec::new(),
         mirror_acked: None,
+        joint: Vec::new(),
       },
     };
     assert_eq!(
@@ -2211,11 +2274,13 @@ mod tests {
               candidates: candidates.clone(),
               acked: candidates.clone(),
               mirror_acked: None,
+              joint: Vec::new(),
             },
             record: Placement {
               candidates: candidates.clone(),
               acked: Vec::new(),
               mirror_acked: None,
+              joint: Vec::new(),
             },
           },
         );
@@ -2224,6 +2289,7 @@ mod tests {
         candidates: candidates.clone(),
         acked,
         mirror_acked: None,
+        joint: Vec::new(),
       };
       record_merge_acks(
         state,

@@ -218,7 +218,7 @@ fn run_commit_with_budget(
       let committed = commit_record(
         OWNER,
         &mut owner_acceptor,
-        &candidates,
+        &Placement::of(&candidates),
         &record(b"head@v1"),
         Quorum { f: 1 },
         remotes,
@@ -323,7 +323,7 @@ fn live_tasks_after_a_parked_commit() -> usize {
       let _committed = commit_record(
         OWNER,
         &mut owner_acceptor,
-        &candidates,
+        &Placement::of(&candidates),
         &record(b"head@v1"),
         Quorum { f: 1 },
         remotes,
@@ -372,7 +372,7 @@ fn f0_commits_locally_with_no_dispatch() {
       let outcome = commit_record(
         OWNER,
         &mut owner_acceptor,
-        &[OWNER],
+        &Placement::of(&[OWNER]),
         &record(b"head@v1"),
         Quorum { f: 0 },
         Vec::new(),
@@ -570,7 +570,7 @@ fn a_retry_reuses_the_connection_with_advancing_packet_numbers() {
         let first = commit_record(
           OWNER,
           &mut owner_acceptor,
-          &candidates,
+          &Placement::of(&candidates),
           &rec,
           Quorum { f: 1 },
           vec![(HostId(2), endpoint)],
@@ -591,7 +591,7 @@ fn a_retry_reuses_the_connection_with_advancing_packet_numbers() {
         let second = commit_record(
           OWNER,
           &mut owner_acceptor,
-          &candidates,
+          &Placement::of(&candidates),
           &rec,
           Quorum { f: 1 },
           first.reusable,

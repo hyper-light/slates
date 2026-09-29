@@ -2791,6 +2791,25 @@ nothing until its generation and retained state are validated. The historical `R
 model checks modeled ReadSafety and NoLoss; byte/capacity publication and delayed-message
 integration still require the A-9 tests.
 
+> **Status (2026-09-29; `docs/bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md`).**
+> Built as written.
+>
+> - The regional configuration keeps, per member, the version its neighbourhood's host set last changed at,
+>   and a **settled** neighbourhood (with its hosts' domains): the old set.
+> - While they differ, a record whose cohort moved is sent to both cohorts and commits at `f + 1` of each
+>   (`Placement::joint`). Content stays on its current cohort: the head names its holders.
+> - The record plane re-ships heads to the new candidates.
+> - Once every shard holds all it owns at `f + 1` of each current cohort, judged under the very version the
+>   report names, the owner reports `Settle` over the report stream. The council's leader proposes it (only a
+>   report about the reporter itself, only when caught up, only once), and the old set retires.
+> - The owner lease counts over the settled cohort, the one a successor recovers through.
+> - A retirement keeps the settled neighbourhood in a retirement record for the takeover, which is built next.
+> - Regression `an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`.
+>
+> Open under GAP-A9-7: a green whose new cohort lacks `f + 1` holders of its history cannot be re-placed
+> until the ledger-prefix transfer ships the history, so its owner stays unsettled (safe: the joint writes go
+> on).
+
 **Leases and reads.** Epoch fencing alone does not authorize linearizable owner-local reads.
 Use the explicit lease safety obligations above: only an owner with a currently confirmed,
 conservatively bounded lease may serve the latest head locally. Expiry/uncertainty stops those

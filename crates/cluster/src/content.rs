@@ -53,7 +53,7 @@ use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
 
 use crate::{
-  ClusterError, Collected, CommitBudget, DispatchWait, Reply, Stragglers, collect_bound, is_placed,
+  ClusterError, Collected, CommitBudget, DispatchWait, Reply, Stragglers, collect_bound,
   request_within,
 };
 
@@ -754,12 +754,14 @@ pub async fn put_content(
   } else {
     Vec::new()
   };
+  // Content places on its one current cohort (§4.10): it is fetched by identity from the holders the head
+  // names, so a neighbourhood change in flight never needs it joined.
+  let shape = Placement::of(candidates);
   let build = |acked: &[HostId]| Placement {
-    candidates: candidates.to_vec(),
     acked: acked.to_vec(),
-    mirror_acked: None,
+    ..shape.clone()
   };
-  if is_placed(candidates, &acked, quorum) {
+  if shape.placed_with(&acked, quorum) {
     return ContentPlaced {
       outcome: Ok(build(&acked)),
       reusable: Vec::new(),
@@ -834,7 +836,7 @@ pub async fn put_content(
     latencies_ns,
   } = collect_bound(
     &mut rx,
-    candidates,
+    &shape,
     quorum,
     budget,
     dispatched_ns,

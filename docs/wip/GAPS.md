@@ -1883,7 +1883,22 @@ Built so far: the configuration state (step 1 of 3).
 - Retirements are bounded by the members (`k ≤ n − k` for `k ≤ f`), oldest dropped first.
 - The codec checks every count.
 
-Owed: the owner's joint writes and settlement report, then the takeover itself.
+Built next: the owner's side (step 2 of 3).
+- While a change is in flight, a record whose cohort moved commits at `f + 1` of both cohorts; content stays
+  on its current cohort.
+- The record plane re-ships heads to the new candidates.
+- The coordinator reports `Settle` over a new report stream once every shard holds all it owns at `f + 1` of
+  each current cohort, under the version it reports. The council's leader proposes it only about the reporter,
+  only when caught up, and only once.
+- The owner lease counts over the settled cohort.
+- Regression `an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort` (non-vacuous:
+  with readiness forced true it fails).
+- Found on the way and fixed: a destroyed green's `merge.placed` and `merge.pending` entries stayed forever.
+- Recorded open, under GAP-A9-7: a green whose new cohort lacks `f + 1` holders of its history cannot be
+  re-placed, so its owner stays unsettled (safe: joint writes go on); and a node re-admitted under its old id
+  never settles its stale volumes.
+
+Owed: the takeover itself (step 3).
 
 **Built for it:** status now reports the control shard's held record copies, pending takeovers and installed
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
