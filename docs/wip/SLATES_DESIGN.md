@@ -2818,8 +2818,15 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > only about a volume in the shard's set. A volume the node does not hold answers `NotFound`, or
 > `NFS3ERR_STALE` at the mount, and an unauthorized mount request answers `NFS3ERR_ACCES`, whatever the
 > lease's state (`docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md`;
-> regression `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`). Open: the mount's
-> synthetic root returns a volume root's attributes, at `LOOKUP` and `READDIRPLUS`, without the gate (GAPS).
+> regression `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`). The mount's synthetic
+> root answers a `LOOKUP` or `READDIRPLUS` of a volume's name with the volume root's stable handle, and
+> withholds its attributes while the lease is unconfirmed (RFC 1813 carries them as optional), so the
+> client's next `GETATTR` meets the gate. The confirmations needed are the intersection bound over the
+> object's actual candidates, `others − f` (saturating): `f` at the `2f + 1` floor, fewer below it, and none
+> once no successor could gather the `f + 1` promises a takeover needs. Demanding `f` everywhere had refused
+> a lone owner (one node in its region at `f = 1`) its own objects once its startup allowance ran out
+> (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`; regression
+> `a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance`).
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the

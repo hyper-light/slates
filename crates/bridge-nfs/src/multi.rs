@@ -126,10 +126,14 @@ pub trait VolumeSet {
   /// Serves an id-only NFSv4 state procedure on the set's file state (§4.6 A-36).
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8>;
 
-  /// The root file handle and attributes of `volume`, for the synthetic root's `LOOKUP` and
+  /// The root file handle of `volume`, and its attributes, for the synthetic root's `LOOKUP` and
   /// `READDIRPLUS` of the volume's name. `None` if the volume is not in the set or its root cannot be
-  /// established. Carries `subject`/`rights`/`groups` as [`Self::serve`] does, though a root object
-  /// creates nothing, so the groups only ride for uniformity. The attributes are in `dialect`.
+  /// established. The attributes are `None` while the set may not serve the volume's latest state (a
+  /// daemon whose owner lease is unconfirmed, §4.8 "Leases and reads"): the handle names the volume and is
+  /// stable, but the attributes are its state, and both replies carry them as optional (RFC 1813
+  /// `post_op_attr`), so the client's next `GETATTR` is answered by the volume's own gate. Carries
+  /// `subject`/`rights`/`groups` as [`Self::serve`] does, though a root object creates nothing, so the
+  /// groups only ride for uniformity. The attributes are in `dialect`.
   fn root_object(
     &mut self,
     volume: VolumeId,
@@ -137,7 +141,7 @@ pub trait VolumeSet {
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
     dialect: Dialect,
-  ) -> Option<(Nfsfh3, Fattr3)>;
+  ) -> Option<(Nfsfh3, Option<Fattr3>)>;
 }
 
 /// What the loopback server serves NFS and MOUNT over: a single-volume [`Export`], or a [`MultiExport`]
@@ -399,7 +403,7 @@ impl<V: VolumeSet> MultiExport<V> {
         let mut writer = XdrWriter::new();
         Nfsstat3::Ok.encode(&mut writer);
         handle.encode(&mut writer);
-        PostOpAttr(Some(attr)).encode(&mut writer);
+        PostOpAttr(attr).encode(&mut writer);
         PostOpAttr(Some(dir_attr)).encode(&mut writer);
         writer.into_bytes()
       }
@@ -676,12 +680,13 @@ impl VolumeSet for OwnedVolumeSet {
     rights: Rights,
     groups: Option<crate::access::UnixGroups>,
     dialect: Dialect,
-  ) -> Option<(Nfsfh3, Fattr3)> {
+  ) -> Option<(Nfsfh3, Option<Fattr3>)> {
     self
       .with_export(volume, subject, rights, groups, dialect, |export| {
         export.root_object()
       })
       .flatten()
+      .map(|(handle, attr)| (handle, Some(attr)))
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
@@ -820,7 +825,7 @@ fn encode_readdir_entry(
   fileid: u64,
   index: usize,
   plus: bool,
-  plus_object: Option<(Nfsfh3, Fattr3)>,
+  plus_object: Option<(Nfsfh3, Option<Fattr3>)>,
 ) -> Vec<u8> {
   let mut entry = XdrWriter::new();
   entry.bool(true); // an entry follows
@@ -828,7 +833,7 @@ fn encode_readdir_entry(
   entry.opaque(name.as_bytes());
   entry.u64(u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1)); // resume cookie
   if plus {
-    let attr = plus_object.as_ref().map(|(_, attr)| *attr);
+    let attr = plus_object.as_ref().and_then(|(_, attr)| *attr);
     PostOpAttr(attr).encode(&mut entry); // name_attributes
     match plus_object {
       Some((handle, _)) => {

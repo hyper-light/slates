@@ -11,11 +11,11 @@
 //! not a lease grant; a majority observation must belong to the relevant authority generation."
 //!
 //! **The lease.** An object's latest state is served while, within the last [`lease_bound_ns`] on this
-//! host's clock, `f` of the object's **other candidate holders** (its copyset under the configuration it
+//! host's clock, enough of the object's **other candidate holders** (its copyset under the configuration it
 //! was placed under) each **answered this node's direct probe**, the answer reporting this node **alive at
 //! its current incarnation** and announcing the **same configuration version** this node has installed.
-//! The owner is itself one of the `2f + 1` candidates, so with `f` others it holds `f + 1` — a quorum of
-//! the copyset ([`OwnerLease::holds`]).
+//! Enough is `f` at the candidate floor: the owner is itself one of the `2f + 1` candidates, so with `f`
+//! others it holds `f + 1` — a quorum of the copyset ([`OwnerLease::holds`], [`confirmations_needed`]).
 //!
 //! **Why that is safe (the intersection).** A successor serves an object only after phase one over the
 //! object's surviving candidates — `f + 1` promises out of the `2f` survivors. A holder answers a
@@ -24,7 +24,10 @@
 //! retired it (then the owner refuses everything itself, and yields its objects on re-admission). Any
 //! `f + 1` of the `2f` survivors intersect any `f` of them, so while the owner's lease holds, at least one
 //! holder of every possible promotion quorum is still refusing the promotion: no successor adopts, so no
-//! stale answer is possible. The owner's bound is the holder's less the clock-rate tolerance (twice
+//! stale answer is possible. Below the floor — a region of fewer than `2f + 1` members, so an object with
+//! fewer other candidates — the same intersection needs fewer: `others − f`, and none once `f + 1` promises
+//! cannot be gathered at all. Demanding `f` there refused a lone owner its own objects for good once its
+//! startup allowance ran out, though no successor could ever adopt them (2026-09-29). The owner's bound is the holder's less the clock-rate tolerance (twice
 //! RFC 5905's 500 ppm: its own clock slow, the holder's fast), measured from the probe's **send** time —
 //! before the holder formed its answer.
 //!
@@ -163,7 +166,8 @@ impl OwnerLease {
   /// The decision: whether this node may serve the latest state of an object whose candidate holders
   /// are `candidates` (this node among them) at `now_ns` — not superseded, and either within the bounded
   /// startup allowance of the current configuration ([`OwnerLease::configuration_installed_ns`]) or with
-  /// `f` of the other candidates having confirmed it within [`lease_bound_ns`] under the installed `version`.
+  /// enough of the other candidates having confirmed it within [`lease_bound_ns`] under the installed
+  /// `version` ([`confirmations_needed`]: `f` at the `2f + 1` floor, fewer below it).
   pub fn holds(
     &self,
     now_ns: u64,
@@ -175,11 +179,10 @@ impl OwnerLease {
     if self.superseded.is_some() {
       return false;
     }
-    let needed = usize::try_from(quorum.f).unwrap_or(usize::MAX);
+    let others = candidates.iter().filter(|host| **host != local);
+    let needed = confirmations_needed(others.clone().count(), quorum);
     let bound = lease_bound_ns();
-    let fresh = candidates
-      .iter()
-      .filter(|host| **host != local)
+    let fresh = others
       .filter(|host| {
         self.confirmations.get(host).is_some_and(|confirmation| {
           confirmation.version == version && now_ns.saturating_sub(confirmation.sent_ns) <= bound
@@ -196,6 +199,20 @@ impl OwnerLease {
       .configuration_installed_ns
       .is_some_and(|installed| now_ns.saturating_sub(installed) <= horizon_ns())
   }
+}
+
+/// Derived: how many of an object's `others` (its candidate holders other than the owner) must have freshly
+/// confirmed the owner for its lease to hold: as many as leave no promotion quorum without one. A successor
+/// adopts only on `f + 1` promises from the surviving candidates (§4.8 "Promotion"; `collect_promises`), and a
+/// holder that confirmed the owner refuses to promise until that lease can have lapsed
+/// ([`AnswersGiven::promotion_open`]), so the owner needs `others − f` confirmations: then any `f + 1` of the
+/// others include one of them. At the candidate floor, `2f` others, that is `f`; with `f` or fewer others no
+/// `f + 1` promises can be gathered, no successor can adopt, and the owner needs none — a region smaller than
+/// the floor (one node at `f = 1`), where demanding `f` refused the owner its own objects for good once its
+/// startup allowance ran out (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`). `f = 0` (the
+/// laptop) needs none by the same arithmetic (R8).
+pub fn confirmations_needed(others: usize, quorum: Quorum) -> usize {
+  others.saturating_sub(usize::try_from(quorum.f).unwrap_or(usize::MAX))
 }
 
 /// The holder side of the lease: when this node last answered each peer's direct probe — a lease-confirming
@@ -313,6 +330,46 @@ mod tests {
     assert!(
       !lease.holds(now + 1, LOCAL, 4, two, &five),
       "f = 2 needs two fresh: X has lapsed"
+    );
+  }
+
+  /// Below the candidate floor fewer confirmations are needed, by the same intersection: a successor needs
+  /// `f + 1` promises from the object's other candidates, so the owner needs as many fresh confirmations as
+  /// leave no `f + 1` of them unconfirmed — none once there are `f` or fewer, since no promotion can then be
+  /// gathered at all (a region smaller than the floor). At the floor it is `f`, as before. The configuration
+  /// was installed long ago, so the startup allowance never applies here.
+  #[test]
+  fn below_the_candidate_floor_the_intersection_needs_fewer_confirmations() {
+    let one = Quorum { f: 1 };
+    let two = Quorum { f: 2 };
+    let mut lease = OwnerLease::default();
+    let now = 10 * lease_bound_ns();
+    lease.configuration_installed_ns = Some(0);
+    assert!(
+      lease.holds(now, LOCAL, 4, one, &[LOCAL]),
+      "alone at f = 1: no successor can be promoted"
+    );
+    assert!(
+      lease.holds(now, LOCAL, 4, one, &[LOCAL, X]),
+      "one other candidate cannot give the f + 1 = 2 promises a promotion needs"
+    );
+    assert!(
+      !lease.holds(now, LOCAL, 4, one, &[LOCAL, X, Y]),
+      "at the floor f = 1 still needs one"
+    );
+    let four = [LOCAL, X, Y, HostId(4)];
+    assert!(
+      !lease.holds(now, LOCAL, 4, two, &four),
+      "three others at f = 2: any 3 promises include all of them, so one must confirm"
+    );
+    lease.confirm(Y, now, 4);
+    assert!(
+      lease.holds(now, LOCAL, 4, two, &four),
+      "one fresh of the three others intersects every promotion quorum"
+    );
+    assert!(
+      !lease.holds(now, LOCAL, 4, two, &[LOCAL, X, Y, HostId(4), HostId(5)]),
+      "at the floor f = 2 needs two"
     );
   }
 

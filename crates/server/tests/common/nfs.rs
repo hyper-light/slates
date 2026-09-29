@@ -92,6 +92,27 @@ pub(crate) fn read_status(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> u
   status(&call(stream, NFS_PROGRAM, 6, &args, xid))
 }
 
+/// NFS LOOKUP `name` in `dir_fh` → the status, and whether the reply carried the object's attributes
+/// (`obj_attributes`, a `post_op_attr`: RFC 1813 §3.3.3) — without asserting it succeeded.
+pub(crate) fn lookup_carries_attributes(
+  stream: &mut TcpStream,
+  dir_fh: &[u8],
+  name: &str,
+  xid: u32,
+) -> (u32, bool) {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name.as_bytes(), &mut args);
+  let reply = call(stream, NFS_PROGRAM, 3, &args, xid);
+  let looked = status(&reply);
+  if looked != 0 {
+    return (looked, false);
+  }
+  let (_, after_handle) = read_opaque(&reply, 4);
+  let follows = u32::from_be_bytes(reply[after_handle..after_handle + 4].try_into().unwrap());
+  (looked, follows == 1)
+}
+
 /// NFS LOOKUP `name` in `dir_fh` → the child's file handle.
 pub(crate) fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
   let mut args = Vec::new();

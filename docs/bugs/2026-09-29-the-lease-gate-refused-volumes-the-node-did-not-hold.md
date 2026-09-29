@@ -92,11 +92,16 @@ After the fix:
 
 - **`Daemon::fleet_lease_holds`**, the test observation, still reads the lease for any object, held or not.
   It is a question about the lease, not a served read, so it is unchanged.
-- **Open, recorded in GAPS: the synthetic root has no lease gate.** Its `LOOKUP` of a volume's name and its
-  `READDIRPLUS` entries return the volume root's attributes (`root_object`), which are part of its latest
-  state. Only a handle-based procedure passes the gate. `root_object`'s seam returns attributes as
-  mandatory. RFC 1813 makes both replies' object attributes optional (`post_op_attr`). During a lapse the
-  root could return the handle without attributes, so the client's next `GETATTR` meets the gate.
+- **Fixed the same day: the synthetic root had no lease gate.** Its `LOOKUP` of a volume's name and its
+  `READDIRPLUS` entries returned the volume root's attributes (`root_object`), which are part of its latest
+  state. Only handle-based procedures passed the gate. The seam now returns the attributes as optional
+  (`VolumeSet::root_object`, `crates/bridge-nfs/src/multi.rs`), as RFC 1813 carries them in both replies
+  (`post_op_attr`). The daemon's set withholds them while the owner lease is unconfirmed; the handle is
+  stable and is still returned. The client's next `GETATTR` through it meets the gate in `serve`. The NFSv4
+  front end already handles an entry without attributes: its `READDIR` looks the name up and asks for the
+  attributes, which the gate answers. The same test, extended, failed first: after the lapse the root's
+  `LOOKUP` still carried the attributes (`root_lookup: (0, true)`); it now answers `(0, false)`, and
+  `(0, true)` before the lapse.
 - **Observed, not changed: destroy treats attachments differently by volume kind.** A plain volume's
   destroy leaves its attachment records (`destroy`, `step_destroys`). A merge volume's destroy removes them
   (`destroy_merge_volume`). So a destroyed plain volume's mount handle answers `STALE` (its capability still

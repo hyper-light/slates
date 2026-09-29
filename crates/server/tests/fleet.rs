@@ -47,7 +47,9 @@ use slates_server::{
 mod common;
 use std::net::TcpStream;
 
-use common::nfs::{create, lookup, mount, owner_and_mode, read, read_status, write};
+use common::nfs::{
+  create, lookup, lookup_carries_attributes, mount, owner_and_mode, read, read_status, write,
+};
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
 use slates_server::fleet::{FLEET_FRAME_CAP, POLL_PER_PERIOD};
@@ -4041,16 +4043,7 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   // Polled: it turns from a transient refusal (the root configuration not yet formed on b, so the lookup guard
   // does not fire and b routes locally, or the b→a session not yet up) into the served Status.
   let mut client_b = Client::connect(&instances[1].clone());
-  let served = poll_until(
-    &daemons.iter().collect::<Vec<_>>(),
-    COUNCIL_RETIRE_DEADLINE,
-    || {
-      Ok(matches!(
-        client_b.call(&RequestBody::Status { volume: id }),
-        ReplyBody::Status { .. }
-      ))
-    },
-  );
+  let (served, last) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
 
   for daemon in daemons {
     daemon.stop();
@@ -4058,8 +4051,118 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
   assert!(
     served,
     "a client on region 1 read a volume homed in region 0 — the read was forwarded to its owner and served, \
-     so the cross-region lookup is a served request, not a refusal"
+     so the cross-region lookup is a served request, not a refusal (last reply: {last:?})"
   );
+}
+
+/// Polls a `Status` of `volume` through `client` until it is served or `within` passes: whether it was, and the
+/// last reply, so a wait that fails names what the node answered.
+fn poll_status_served(
+  daemons: &[Daemon],
+  client: &mut Client,
+  volume: VolumeId,
+  within: Duration,
+) -> (bool, Option<ReplyBody>) {
+  let mut last = None;
+  let served = poll_until(&daemons.iter().collect::<Vec<_>>(), within, || {
+    let reply = client.call(&RequestBody::Status { volume });
+    let served = matches!(reply, ReplyBody::Status { .. });
+    last = Some(reply);
+    Ok(served)
+  });
+  (served, last)
+}
+
+/// AC (§4.8 "Leases and reads"; AUD-08): an owner alone in its region at `f = 1` — the three-region fleet of the
+/// cross-region forwarding tests, one node per region — serves its own volume's latest state for as long as it
+/// runs, not only within the startup allowance after a configuration install: its region holds no other
+/// candidate, so no successor can gather the `f + 1` promises a takeover needs, and there is no stale read for
+/// its lease to prevent. Do: create a volume on a; once b (region 1) has forwarded one status of it to a, ask
+/// a directly and b through its forward, every poll interval, for three membership horizons. Expect: every
+/// answer served, over at least as many rounds as the span holds poll intervals halved (non-vacuous). Before
+/// the fix the lease demanded `f` confirmations whatever the candidate set: it lapsed about half a second after
+/// formation and a refused its own volume `LeaseUnconfirmed { version: 0 }` for good, so the forwarding tests
+/// passed only when their first read landed inside that window (CI run 36567187754).
+#[test]
+fn a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let mut client_a = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = client_a.call(&scratch("lone-owner")) else {
+    panic!("create on node a")
+  };
+  let mut client_b = Client::connect(daemons[1].instance());
+  let (routed, first) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
+  let sustained = routed.then(|| status_served_throughout(&mut client_a, &mut client_b, id));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    routed,
+    "b forwarded a status of a's volume to a and it was served (last reply: {first:?})"
+  );
+  let (rounds, refused) = sustained.unwrap_or_default();
+  let span_ns = LONE_OWNER_HORIZONS * slates_server::lease::horizon_ns();
+  let paced_rounds = span_ns / (HEARTBEAT_NS / POLL_PER_PERIOD);
+  assert!(
+    rounds >= paced_rounds / 2,
+    "the span was sampled: {rounds} rounds against {paced_rounds} poll intervals"
+  );
+  assert_eq!(
+    refused,
+    Vec::<String>::new(),
+    "a served its volume's latest state throughout, directly and through b's forward"
+  );
+}
+
+/// Shape: how many membership horizons [`a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance`]
+/// keeps asking for — three, so the span runs well past the startup allowance (one horizon after an install).
+const LONE_OWNER_HORIZONS: u64 = 3;
+
+/// Asks for a status of `volume` directly through `local` and through `forwarded` every poll interval for
+/// [`LONE_OWNER_HORIZONS`] membership horizons: the rounds asked, and every answer that was not served.
+fn status_served_throughout(
+  local: &mut Client,
+  forwarded: &mut Client,
+  volume: VolumeId,
+) -> (u64, Vec<String>) {
+  let span = Duration::from_nanos(LONE_OWNER_HORIZONS * slates_server::lease::horizon_ns());
+  // The pace between rounds is a timed wait on a channel nobody sends on: the test thread parks.
+  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+  let started = Instant::now();
+  let mut rounds = 0;
+  let mut refused = Vec::new();
+  while started.elapsed() < span {
+    for (path, client) in [("a", &mut *local), ("b's forward", &mut *forwarded)] {
+      let reply = client.call(&RequestBody::Status { volume });
+      if !matches!(reply, ReplyBody::Status { .. }) {
+        refused.push(format!(
+          "{path} at {:.2} s: {reply:?}",
+          started.elapsed().as_secs_f64()
+        ));
+      }
+    }
+    rounds += 1;
+    let _ = pace.recv_timeout(UNAVAILABLE_PACE);
+  }
+  (rounds, refused)
 }
 
 /// Shape: how long [`a_forward_waits_for_the_owners_session_while_it_is_out`] holds the session out — five
@@ -4101,16 +4204,7 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
     panic!("create on node a")
   };
   let mut client_b = Client::connect(daemons[1].instance());
-  let routed = poll_until(
-    &daemons.iter().collect::<Vec<_>>(),
-    COUNCIL_RETIRE_DEADLINE,
-    || {
-      Ok(matches!(
-        client_b.call(&RequestBody::Status { volume: id }),
-        ReplyBody::Status { .. }
-      ))
-    },
-  );
+  let (routed, last) = poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
   let held = routed.then(|| daemons[1].hold_record_session(hosts[0], SESSION_HOLD_NS));
   let written = routed.then(|| client_b.call(&RequestBody::Snapshot { volume: id }));
   let retry = routed.then(|| client_b.call_retry(&RequestBody::Snapshot { volume: id }));
@@ -4120,7 +4214,7 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   }
   assert!(
     routed,
-    "b routed the read to its owner on a before the hold"
+    "b routed the read to its owner on a before the hold (last reply: {last:?})"
   );
   assert_eq!(
     held.as_ref().map(|held| held
@@ -8357,6 +8451,11 @@ const NFS3ERR_JUKEBOX: u32 = 10008;
 /// live capability answers `NFS3ERR_JUKEBOX`, where before it both served. Before the fix the three answers
 /// above all became the lease's refusal (the 2026-09-29 three-process failure: a peer that had not yet
 /// installed a configuration refused `LeaseUnconfirmed` for a volume it never held).
+///
+/// The mount's synthetic root answers a `LOOKUP` of the held volume's name before and after the lapse, with
+/// the volume root's attributes before it and without them after: the name's handle is stable, but its
+/// attributes are the volume's latest state, which the lapsed owner must not serve (RFC 1813 makes them
+/// optional, so the client's next `GETATTR` meets the gate).
 #[test]
 fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
   let _serial = serialize_fleet_tests();
@@ -8397,6 +8496,7 @@ fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
     ended_read: NFS3ERR_ACCES,
     destroyed_read: NFS3ERR_STALE,
     elsewhere_status: Answer::NotFound,
+    root_lookup: (NFS3_OK, true),
   };
   assert_eq!(
     before, answered_alike,
@@ -8407,6 +8507,7 @@ fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
     GateView {
       held_status: Answer::LeaseUnconfirmed,
       live_read: NFS3ERR_JUKEBOX,
+      root_lookup: (NFS3_OK, false),
       ..answered_alike
     },
     "after the lapse the gate refused only the held, authorized reads"
@@ -8425,6 +8526,8 @@ struct LeaseScene {
   destroyed: Vec<u8>,
   /// A volume B holds, which A does not.
   elsewhere: VolumeId,
+  /// The synthetic root's mount path under the live capability (`/@<capability>`).
+  root_path: String,
 }
 
 /// Sets the scene on A (`daemons[0]`) and B (`daemons[1]`): the held volume with `hello.txt` written through
@@ -8433,7 +8536,10 @@ struct LeaseScene {
 fn set_the_lease_scene(daemons: &[Daemon]) -> LeaseScene {
   let owner = &daemons[0];
   let held = created_on(owner, "gate-held");
-  let live = hello_handle_over_nfs(owner, &capability_path(owner, "gate-held"), true);
+  let live_path = capability_path(owner, "gate-held");
+  let live = hello_handle_over_nfs(owner, &live_path, true);
+  let (_, live_capability) = live_path.rsplit_once('@').expect("a capability path");
+  let root_path = format!("/@{live_capability}");
   let ended_path = capability_path(owner, "gate-held");
   let ended = hello_handle_over_nfs(owner, &ended_path, false);
   let mut client = Client::connect(owner.instance());
@@ -8465,6 +8571,7 @@ fn set_the_lease_scene(daemons: &[Daemon]) -> LeaseScene {
     ended,
     destroyed,
     elsewhere,
+    root_path,
   }
 }
 
@@ -8481,6 +8588,9 @@ struct GateView {
   destroyed_read: u32,
   /// A status of B's volume on A.
   elsewhere_status: Answer,
+  /// The NFS status of the synthetic root's `LOOKUP` of the held volume's name, and whether it carried the
+  /// volume root's attributes.
+  root_lookup: (u32, bool),
 }
 
 /// A verb's answer, as far as the owner-lease gate is concerned.
@@ -8506,6 +8616,10 @@ fn observe_the_gate(daemon: &Daemon, scene: &LeaseScene) -> GateView {
     ended_read: read_status(&mut stream, &scene.ended, 2),
     destroyed_read: read_status(&mut stream, &scene.destroyed, 3),
     elsewhere_status: answer_of(&status_reply(daemon, scene.elsewhere)),
+    root_lookup: {
+      let root = mount(&mut stream, &scene.root_path, 4);
+      lookup_carries_attributes(&mut stream, &root, "gate-held", 5)
+    },
   }
 }
 

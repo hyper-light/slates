@@ -739,6 +739,50 @@ struct View {
   resolve_refused: u64,
   /// How its record links fared (zero from an image that predates a counter).
   links: LinkCounters,
+  /// Its campaigns' voters not asked, by why, and the pre-vote grants dropped for arriving late (zero from
+  /// an image that predates a counter).
+  asked: CampaignCounters,
+}
+
+/// A view's campaign counters, each summed over the shards under the name the daemon counts it by
+/// (`crates/server/src/fleet.rs`): the voters a campaign's round could not ask — no record link, its session
+/// lent to a dispatch, or held by the link task — and the pre-vote grants dropped for arriving after their
+/// round (GAPS, 2026-09-29).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CampaignCounters {
+  no_link: u64,
+  session_lent: u64,
+  session_held: u64,
+  late_grants: u64,
+}
+
+impl CampaignCounters {
+  fn parse(status: &serde_json::Value) -> CampaignCounters {
+    let named = |name: &str| refusals_where(status, |kind| kind == name);
+    CampaignCounters {
+      no_link: named("fleet.election.no_link"),
+      session_lent: named("fleet.election.session_lent"),
+      session_held: named("fleet.election.session_held"),
+      late_grants: named("fleet.election.late_pre_vote_grant"),
+    }
+  }
+
+  /// How far each counter moved from `before` to `self`.
+  fn since(self, before: CampaignCounters) -> CampaignCounters {
+    CampaignCounters {
+      no_link: self.no_link.saturating_sub(before.no_link),
+      session_lent: self.session_lent.saturating_sub(before.session_lent),
+      session_held: self.session_held.saturating_sub(before.session_held),
+      late_grants: self.late_grants.saturating_sub(before.late_grants),
+    }
+  }
+
+  fn line(self) -> String {
+    format!(
+      "voters not asked: {} no link / {} session lent / {} session held by its link, {} late pre-vote grants dropped",
+      self.no_link, self.session_lent, self.session_held, self.late_grants
+    )
+  }
 }
 
 /// A view's record-link counters, each summed over the shards under the name the daemon counts it by
@@ -871,6 +915,7 @@ impl View {
       refused_role: u64_of(council, "refused_role"),
       resolve_refused,
       links: LinkCounters::parse(status),
+      asked: CampaignCounters::parse(status),
     })
   }
 
@@ -1769,8 +1814,11 @@ impl Succession {
         let links = after
           .links
           .since(before.map_or_else(LinkCounters::default, |view| view.links));
+        let asked = after
+          .asked
+          .since(before.map_or_else(CampaignCounters::default, |view| view.asked));
         format!(
-          "{} rank {} priority {} ± {} ms, {} pre-elections ({} granted, {} refused replies) and {} elections begun, refused {} leased / {} term / {} log / {} role; links: {}{}",
+          "{} rank {} priority {} ± {} ms, {} pre-elections ({} granted, {} refused replies) and {} elections begun, refused {} leased / {} term / {} log / {} role; {}; links: {}{}",
           after.pod,
           after.rank,
           milliseconds(after.priority_ns),
@@ -1783,6 +1831,7 @@ impl Succession {
           began(|view| view.refused_term),
           began(|view| view.refused_log),
           began(|view| view.refused_role),
+          asked.line(),
           links.line(),
           if after.leads { ", leads" } else { "" }
         )
@@ -2043,7 +2092,7 @@ fn uptime_seconds(line: &str) -> Result<f64, Failure> {
 
 #[cfg(test)]
 mod tests {
-  use super::{LinkCounters, View};
+  use super::{CampaignCounters, LinkCounters, View};
 
   /// A `slates status --json` document with the fleet block the lane reads and one shard's refusals.
   fn status_with_refusals(refusals: &[(&str, u64)]) -> serde_json::Value {
@@ -2101,6 +2150,7 @@ mod tests {
     ]);
     let before = View::parse("slates-0", &before).expect("the document parses");
     let after = View::parse("slates-0", &after).expect("the document parses");
+    assert_eq!(after.asked.since(before.asked), CampaignCounters::default());
     assert_eq!(
       after.links.since(before.links),
       LinkCounters {
@@ -2110,6 +2160,31 @@ mod tests {
         redials: 3,
         dial_faults: 5,
         stale_returns: 6,
+      }
+    );
+  }
+
+  /// GAPS 2026-09-29 (a campaign that asked no one; a late pre-vote grant): a view reads each campaign
+  /// counter by the name the daemon counts it under, and a trial reports how far each moved.
+  #[test]
+  fn a_views_campaign_counters_are_read_by_name_and_moved_between_views() {
+    let before = status_with_refusals(&[("fleet.election.session_held", 1)]);
+    let after = status_with_refusals(&[
+      ("fleet.election.no_link", 2),
+      ("fleet.election.session_lent", 3),
+      ("fleet.election.session_held", 5),
+      ("fleet.election.late_pre_vote_grant", 7),
+      ("fleet.discovery.deadline", 11),
+    ]);
+    let before = View::parse("slates-0", &before).expect("the document parses");
+    let after = View::parse("slates-0", &after).expect("the document parses");
+    assert_eq!(
+      after.asked.since(before.asked),
+      CampaignCounters {
+        no_link: 2,
+        session_lent: 3,
+        session_held: 4,
+        late_grants: 7,
       }
     );
   }

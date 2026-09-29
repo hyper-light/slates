@@ -3854,6 +3854,17 @@ const DISCOVERY_TRANSPORT: &str = "fleet.discovery.transport";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
+/// Why a campaign's round did not ask a voter ([`take_campaign_sessions`]), counted per voter per round: no
+/// record link to it (never established, or removed at its retirement), its session lent to a coordinator
+/// dispatch, or its session held by the link task itself (a discovery page, or a dial after one ended). So a
+/// campaign that asked no one says why (GAPS 2026-09-29, a survivor's record session after a leader's loss).
+const ELECTION_NO_LINK: &str = "fleet.election.no_link";
+const ELECTION_SESSION_LENT: &str = "fleet.election.session_lent";
+const ELECTION_SESSION_HELD: &str = "fleet.election.session_held";
+/// A pre-vote grant that arrived after its round ended ([`late_raft_reply`]): dropped, as the design has it
+/// (the next campaign re-runs its pre-vote), and counted, so how often a campaign loses a grant to its
+/// deadline is measured (GAPS 2026-09-29, a late pre-vote reply is dropped).
+const ELECTION_LATE_PRE_VOTE_GRANT: &str = "fleet.election.late_pre_vote_grant";
 const RESOLVE_REFUSED: &str = "fleet.resolve";
 const RESOLVE_NO_RESOLVER: &str = "fleet.resolve.no-resolver";
 const RESOLVE_TIMEOUT: &str = "fleet.resolve.timeout";
@@ -4535,15 +4546,22 @@ fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
 /// A late Raft reply worth folding: a vote or an append reply, each of which folds with no follow-on
 /// message and is exactly the acknowledgement a slow voter would otherwise cost. A late **pre-vote** reply
 /// is dropped: completing a pre-election here would owe follow-on vote requests a settle cannot ship, and
-/// the next campaign simply re-runs its pre-vote.
+/// the next campaign simply re-runs its pre-vote. A dropped grant is counted
+/// ([`ELECTION_LATE_PRE_VOTE_GRANT`]).
 fn late_raft_reply(
-  state: &ShardState,
+  state: &mut ShardState,
   root: bool,
   bytes: &[u8],
   peer: HostId,
 ) -> Option<RaftMessage> {
   match crate::consensus::decode_message(state, root, peer, bytes) {
-    Ok(RaftMessage::PreVoteReply(_)) | Err(_) => None,
+    Ok(RaftMessage::PreVoteReply(reply)) => {
+      if reply.granted {
+        count_refusal_in(state, ELECTION_LATE_PRE_VOTE_GRANT);
+      }
+      None
+    }
+    Err(_) => None,
     Ok(message) => Some(message),
   }
 }
@@ -4806,6 +4824,27 @@ async fn drive_vote_round(
   return_sessions(recovered);
 }
 
+/// Borrows the sessions of the other voters a campaign's round asks ([`take_sessions`]), and counts each
+/// voter it cannot ask by why: no link ([`ELECTION_NO_LINK`]), its session lent to a dispatch
+/// ([`ELECTION_SESSION_LENT`]), or its session held by the link task ([`ELECTION_SESSION_HELD`]).
+fn take_campaign_sessions(others: &[HostId]) -> Vec<(HostId, Endpoint)> {
+  let sessions = take_sessions(|host| others.contains(&host));
+  let _ = state::with_state(|s| {
+    for voter in others
+      .iter()
+      .filter(|voter| !sessions.iter().any(|(host, _)| host == *voter))
+    {
+      let why = match s.record_sessions.get(voter) {
+        None => ELECTION_NO_LINK,
+        Some(link) if link.borrowed.is_some() => ELECTION_SESSION_LENT,
+        Some(_) => ELECTION_SESSION_HELD,
+      };
+      count_refusal_in(s, why);
+    }
+  });
+  sessions
+}
+
 /// A campaign the leader invited (thesis §3.10, leadership transfer): when the serve path has recorded an
 /// invitation, starts the election it asks for — no pre-vote, the leader invited it — and runs its vote
 /// round over the other voters' sessions. The borrow that starts it publishes the new term and vote before
@@ -4822,7 +4861,7 @@ async fn drive_invited_campaign(
   let Some(vote) = votes.into_iter().next() else {
     return false;
   };
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_campaign_sessions(others);
   if !sessions.is_empty() {
     drive_vote_round(group, vote, sessions, budget, in_flight).await;
   }
@@ -4910,7 +4949,7 @@ async fn drive_council_election(
   else {
     return;
   };
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_campaign_sessions(others);
   if sessions.is_empty() {
     return;
   }
@@ -5412,7 +5451,7 @@ async fn drive_root_election(
   else {
     return;
   };
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_campaign_sessions(others);
   if sessions.is_empty() {
     return;
   }

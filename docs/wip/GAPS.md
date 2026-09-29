@@ -1826,6 +1826,33 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
+
+**Fixed.** CI run 36567187754 (`2c6c034`, Ubuntu) failed a cross-region forwarding test, and a local full suite
+failed its sibling. Both tests' fleets are three regions of one node each at `f = 1`. The owner lease
+demanded `f` fresh confirmations from the object's other candidates, and a lone node has none. So its lease
+held only for the startup allowance (0.9 s) and never again. Sampled every 0.5 s for 10 s, owner a refused
+its own volume `LeaseUnconfirmed { version: 0 }` from 0.51 s on, directly and through b's forward. No
+successor could ever adopt: a takeover needs `f + 1` promises from other candidates.
+- The lease now needs the intersection bound, `others − f`: `f` at the `2f + 1` floor as before, fewer below
+  it, and none once `f + 1` promises cannot be gathered.
+- Two failing tests came first: a lease unit test below the floor, and
+  `a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance` (served throughout three
+  horizons; unfixed, refused from 0.14 s).
+- The forwarding tests now record the last reply.
+[Bug record](../bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md).
+
+**Built for the open KIND items (measurement pending).** Six succession trials on `2c6c034` gave successors in
+2.01–5.76 s, none by the outranked pod. In 3 of 6 trials the central survivor's first pre-elections drew no
+reply at all. Every survivor's only link event was one discovery deadline. The counter does not name the peer; the page
+to the cut leader is the likely one. There were no re-dials, transport faults or invalidations. The daemon now counts, per campaign
+round:
+- each voter it could not ask, by why: `fleet.election.no_link`, `fleet.election.session_lent`,
+  `fleet.election.session_held`;
+- each pre-vote grant dropped for arriving after its round (`fleet.election.late_pre_vote_grant`).
+
+The lane's trial line reports both, beside the record-link counters it gained in `2c6c034`.
+
 ### 2026-09-29: a suite's departing daemon wrote into the next suite's trace — fixed
 
 CI run 36565560556 (`38ff5b5`, macOS conformance) failed hermeticity on 2 writes "outside". Both were the
@@ -1840,7 +1867,7 @@ next suite's `eslogger` trace, which keeps every slates process's events.
   before, 0 of 3 after.
 [Bug record](../bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md).
 
-### 2026-09-29: the lease gate refused volumes the node did not hold — fixed; the synthetic root serves attributes ungated — open
+### 2026-09-29: the lease gate refused volumes the node did not hold — fixed; the synthetic root served attributes ungated — fixed
 
 **Fixed.** CI run 36560510107 (`5836a8c`, Ubuntu) failed the three-process CLI fleet test. A survivor answered
 `LeaseUnconfirmed { version: 0 }` for a volume it never held, where the answer is `NotFound`. It had no
@@ -1854,11 +1881,12 @@ named, held or not.
   fleet suite passes 55 of 55.
 [Bug record](../bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
 
-**Open — the synthetic root returns a volume root's attributes without the lease.** Its `LOOKUP` of a volume's
-name and its `READDIRPLUS` entries go through `root_object`, which no lease gate covers. Only handle-based
-procedures meet the gate. RFC 1813 makes the object attributes in both replies optional, so a lapsed owner
-could return the handle alone and let the client's next `GETATTR` meet the gate. Owed: the seam change and a
-failing test first.
+**Fixed the same day — the synthetic root returned a volume root's attributes without the lease.** Its
+`LOOKUP` of a volume's name and its `READDIRPLUS` entries went through `root_object`, which no lease gate
+covered. The seam now returns the attributes as optional, as RFC 1813 carries them. The daemon withholds
+them while the owner lease is unconfirmed and still returns the stable handle, so the client's next `GETATTR`
+meets the gate. The same test, extended, failed first (after the lapse the root's `LOOKUP` still carried
+them).
 
 ### 2026-09-29: KIND succession — a round with no reply yet gave up at its lookahead — fixed; a symmetric partition never healed — fixed; a survivor's record session drops after a leader's loss — open
 

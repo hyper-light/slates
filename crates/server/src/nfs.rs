@@ -221,7 +221,7 @@ impl VolumeSet for ShardVolumeSet {
     _rights: Rights,
     groups: Option<UnixGroups>,
     dialect: Dialect,
-  ) -> Option<(Nfsfh3, Fattr3)> {
+  ) -> Option<(Nfsfh3, Option<Fattr3>)> {
     let capability = self.capability;
     state::with_state(|s| {
       // Establishing the volume's root at `MNT`/`LOOKUP` is itself gated (AUD-01): a caller without the
@@ -229,11 +229,17 @@ impl VolumeSet for ShardVolumeSet {
       // root handle returned carries the capability, so every later request self-authorizes.
       let (capability, rights) = authorized_rights(s, volume, capability)?;
       let requester = (subject, groups, dialect);
-      with_export(s, volume, requester, rights, capability, |export| {
+      let (handle, attr) = with_export(s, volume, requester, rights, capability, |export| {
         export.root_object()
-      })
+      })??;
+      // The owner-lease gate (§4.8 "Leases and reads"; AUD-08), as `serve` applies it: the root's
+      // attributes are the volume's latest state, withheld while this node's authority over it is
+      // unconfirmed; the handle is not state, and the client's `GETATTR` through it meets `serve`'s gate
+      // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md). `with_export`
+      // answered, so the volume is in this shard's set.
+      let serves_latest = crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_none();
+      Some((handle, serves_latest.then_some(attr)))
     })
-    .flatten()
     .flatten()
   }
 
@@ -905,7 +911,7 @@ impl VolumeSet for GatheredVolumeSet {
     rights: Rights,
     groups: Option<UnixGroups>,
     dialect: Dialect,
-  ) -> Option<(Nfsfh3, Fattr3)> {
+  ) -> Option<(Nfsfh3, Option<Fattr3>)> {
     ShardVolumeSet {
       capability: self.capability,
     }
