@@ -560,6 +560,8 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
           issued_ns: now_ns,
           expires_ns: now_ns + 1_000,
           state: GrantState::Issued,
+          target_device: 0,
+          target_inode: 0,
         },
       }
     }

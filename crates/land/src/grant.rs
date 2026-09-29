@@ -183,6 +183,14 @@ impl Grants {
     Some(id)
   }
 
+  /// Restores a grant a durable record holds, under its own id and in its recorded state (a restarted
+  /// shard's rebuild, AUD-29-06); the next grant issued takes an id past every restored one, so an id is
+  /// never issued twice across a restart. A record whose id is already held is ignored.
+  pub fn restore(&mut self, record: GrantRecord) {
+    self.next = self.next.max(record.id.0);
+    self.records.entry(record.id).or_insert(record);
+  }
+
   /// Revokes a grant.
   pub fn revoke(&mut self, id: GrantId) {
     if let Some(g) = self.records.get_mut(&id) {
@@ -416,6 +424,46 @@ mod tests {
     assert_eq!(
       grants.check(Some(id3), &bound, [4; 32], 110),
       Err(GrantRefusal::GrantRefused)
+    );
+  }
+
+  /// AUD-29-06: a restored grant keeps its id and state, the next grant issued takes an id past it, and a
+  /// record whose id is already held does not replace it.
+  #[test]
+  fn restored_grants_keep_their_state_and_new_ids_pass_them() {
+    let mut grants = Grants::default();
+    let bound = binding();
+    let restored = GrantRecord {
+      id: GrantId(5),
+      surface: Surface::Cli,
+      manifest: [9; 32],
+      binding: bound.clone(),
+      scope: GrantScope::Once,
+      issued_ns: 100,
+      expires_ns: 150,
+      state: GrantState::Consumed,
+    };
+    grants.restore(restored.clone());
+    assert_eq!(
+      grants.check(Some(GrantId(5)), &bound, [9; 32], 110),
+      Err(GrantRefusal::GrantExpired),
+      "a spent grant stays spent"
+    );
+    grants.restore(GrantRecord {
+      state: GrantState::Issued,
+      ..restored
+    });
+    assert_eq!(
+      grants.get(GrantId(5)).map(|g| g.state),
+      Some(GrantState::Consumed)
+    );
+    let next = grants
+      .issue(Surface::Cli, [1; 32], bound, GrantScope::Once, 100, 50)
+      .expect("a grant id");
+    assert_eq!(
+      next,
+      GrantId(6),
+      "a new grant's id passes every restored one"
     );
   }
 

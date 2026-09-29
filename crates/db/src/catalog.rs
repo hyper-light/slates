@@ -456,6 +456,13 @@ pub struct GrantRecord {
   pub expires_ns: u64,
   /// The state.
   pub state: GrantState,
+  /// The target directory's device when the landing was presented: with `principal` (the consumer),
+  /// `volume`, `snapshot` and `target`, the grant's whole binding (§4.13 "Grants": the target identity), so
+  /// a grant rebuilt after a restart binds the directory the human approved and not whatever holds its path
+  /// then (AUD-29-01, AUD-29-06; appended for append-only evolution, as is the field after it).
+  pub target_device: u64,
+  /// The target directory's inode on that device.
+  pub target_inode: u64,
 }
 
 /// The landing lease on a canonical target.

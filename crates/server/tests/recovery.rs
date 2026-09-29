@@ -821,6 +821,138 @@ fn a_landing_presented_before_a_restart_does_not_block_the_first_landing_after_i
   drop(segment);
 }
 
+/// Shape: the grant term of the restart test's approvals — a minute, far past the test's length.
+const GRANT_TERM_NS: u64 = 60_000_000_000;
+
+/// Presents a landing of `snapshot` into `target` and approves it under `scope`, as the human's surface does
+/// (the proof under the daemon's issuer secret); the grant id.
+fn approve(
+  client: &mut Client,
+  secret: &[u8; 32],
+  volume: VolumeId,
+  snapshot: SnapshotId,
+  target: &str,
+  scope: slates_ipc::protocol::GrantScope,
+) -> u64 {
+  let presented = client.land(volume, Some(snapshot), target, Filter::default(), None);
+  let Ok(slates_client::Landing::GrantRequired {
+    landing, manifest, ..
+  }) = presented
+  else {
+    panic!("the landing was not presented: {presented:?}");
+  };
+  let proof = slates_server::landing::grant_proof(secret, landing, &manifest, scope, GRANT_TERM_NS);
+  client
+    .grant(landing, manifest, scope, GRANT_TERM_NS, proof)
+    .expect("the approval issues a grant")
+}
+
+/// AUD-29-06 (§4.15 step 3: a session grant covers later landings for its session; §4.8 recovery): a session
+/// grant covers its binding across a daemon restart, a single-use grant stays spent across one, and a grant
+/// issued after a restart takes an id no earlier grant had. Before 2026-09-29 a restarted shard rebuilt no
+/// runtime grant (every grant was lost at a restart, and the first grant after it re-minted a recorded id,
+/// refused `AlreadyExists`), and every landing recorded its grant consumed, a session grant included. Do:
+/// land under a single-use grant; approve a session grant for another volume; restart the daemon over the
+/// same segment; land twice under the session grant; list the grants; approve a new landing. Expect: both
+/// session landings land; the single-use grant is listed consumed and the session grant issued; the new
+/// grant's id is neither earlier one.
+#[test]
+fn a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent() {
+  use slates_ipc::protocol::GrantScope;
+  let profile = common::machine_profile();
+  let instance = format!("srv-grantrst-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("grantrst", &profile, &config);
+  let target = common::target::target_dir();
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let secret = first.segment().issuer_secret().unwrap();
+  let mut client = connect(&instance);
+  let spent = client.create(&scratch("spent")).unwrap();
+  let spent_snapshot = client.snapshot(spent).unwrap();
+  let once = approve(
+    &mut client,
+    &secret,
+    spent,
+    spent_snapshot,
+    &target.path,
+    GrantScope::Once,
+  );
+  let landed = client.land(
+    spent,
+    Some(spent_snapshot),
+    &target.path,
+    Filter::default(),
+    Some(once),
+  );
+  assert!(
+    matches!(landed, Ok(slates_client::Landing::Landed(_))),
+    "{landed:?}"
+  );
+  let kept = client.create(&scratch("kept")).unwrap();
+  let kept_snapshot = client.snapshot(kept).unwrap();
+  let session = approve(
+    &mut client,
+    &secret,
+    kept,
+    kept_snapshot,
+    &target.path,
+    GrantScope::Session,
+  );
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for round in 0..2 {
+    let landed = client.land(
+      kept,
+      Some(kept_snapshot),
+      &target.path,
+      Filter::default(),
+      Some(session),
+    );
+    assert!(
+      matches!(landed, Ok(slates_client::Landing::Landed(_))),
+      "round {round} under the session grant after the restart: {landed:?}"
+    );
+  }
+  let states: std::collections::BTreeMap<u64, String> = client
+    .grants()
+    .unwrap()
+    .into_iter()
+    .map(|grant| (grant.id, grant.state))
+    .collect();
+  assert_eq!(
+    states.get(&once).map(String::as_str),
+    Some("consumed"),
+    "{states:?}"
+  );
+  assert_eq!(
+    states.get(&session).map(String::as_str),
+    Some("issued"),
+    "{states:?}"
+  );
+  let fresh = client.create(&scratch("fresh")).unwrap();
+  let fresh_snapshot = client.snapshot(fresh).unwrap();
+  let renewed = approve(
+    &mut client,
+    &second.segment().issuer_secret().unwrap(),
+    fresh,
+    fresh_snapshot,
+    &target.path,
+    GrantScope::Once,
+  );
+  assert!(
+    renewed != once && renewed != session,
+    "the grant after the restart re-minted an earlier id: {renewed} against {once} and {session}"
+  );
+  second.stop();
+  drop(target);
+  drop(segment);
+}
+
 /// Presents a landing of `snapshot` into `target` with no grant and returns its landing id — the
 /// `GrantRequired` reply; anything else (a refusal) is the failure the test names.
 fn present_landing(

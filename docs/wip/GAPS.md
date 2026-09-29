@@ -2980,7 +2980,18 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 04–07.
+- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 04, 05, 07
+  (06 is closed below).
+
+**Closed 2026-09-29 — AUD-29-06: a session grant was recorded consumed, and a restart lost every grant.**
+- **Transitions.** `finish` records only the transition the engine made: a single-use grant consumed by a
+  finished landing, never a session grant.
+- **Restart.** A restarted shard rebuilds its runtime grants from the durable records, in their states,
+  with each binding intact: the record now carries the target identity. New grant ids pass every recorded
+  one, where the first grant after a restart used to be refused `AlreadyExists`.
+- **Evidence.** `a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent`, red with either
+  part disabled
+  (`docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`).
 
 **Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:

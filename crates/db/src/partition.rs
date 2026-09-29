@@ -392,6 +392,11 @@ impl Partition {
     self.grants.get(&id)
   }
 
+  /// Every grant, by id order: what a restarted shard rebuilds its runtime grants from (AUD-29-06).
+  pub fn grants(&self) -> impl Iterator<Item = &GrantRecord> {
+    self.grants.values()
+  }
+
   /// An enrolled consumer's record (§4.13), or `None` if no such consumer was ever enrolled.
   pub fn consumer(&self, id: u64) -> Option<&ConsumerRecord> {
     self.consumers.get(&id)

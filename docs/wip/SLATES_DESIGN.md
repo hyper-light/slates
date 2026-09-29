@@ -3617,6 +3617,13 @@ server, not inferred from command names.
 > use compared only the manifest, which is equal for any same-content create-only plan. Record:
 > `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
 
+> **Status (2026-09-29, AUD-29-06).** A grant's durable record carries its whole binding: the consumer as
+> its principal, the volume, snapshot, target, and the target directory's identity. A restarted shard
+> rebuilds its runtime grants from those records, in their recorded states. The durable state follows the
+> engine's transition, so only a finished single-use landing consumes its grant. Before, a restart lost
+> every grant and a session grant was recorded spent at its first landing. Record:
+> `docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`.
+
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
 carried through §4.4's operation refusal taxonomy. A-9 adds these requirements without claiming

@@ -34,9 +34,12 @@ use slates_land::engine::Audit;
 use slates_land::engine::{AuditKind, AuditRecord};
 #[cfg(unix)]
 use slates_land::engine::{LandingRefusal, LandingReport, LandingRequest, Observer, land};
+use slates_land::grant::{
+  GrantBinding, GrantRecord as LandGrantRecord, GrantScope as LandScope,
+  GrantState as LandGrantState, Grants, Leases, Surface, TargetIdentity,
+};
 #[cfg(unix)]
 use slates_land::grant::{GrantId, GrantRefusal};
-use slates_land::grant::{GrantScope as LandScope, Grants, Leases, Surface};
 #[cfg(unix)]
 use slates_land::manifest::{Filter, LandingEntry, Manifest};
 #[cfg(unix)]
@@ -492,7 +495,16 @@ fn finish(
       });
     }
   }
-  if let Some(id) = grant {
+  // The grant's transition as it happened (AUD-29-06): the engine consumes a single-use grant whose landing
+  // finished and never a session grant, and a landing it aborted leaves either grant usable for the resume;
+  // the durable state follows the runtime one. Until 2026-09-29 every grant presented was recorded consumed.
+  if let Some(id) = grant
+    && state
+      .landing
+      .grants
+      .get(slates_land::grant::GrantId(id))
+      .is_some_and(|g| g.state == LandGrantState::Consumed)
+  {
     ops.push(Op::GrantStateChanged {
       id,
       state: DbGrantState::Consumed,
@@ -685,6 +697,8 @@ pub fn issue_grant(
     issued_ns: now,
     expires_ns: now.saturating_add(term_ns),
     state: DbGrantState::Issued,
+    target_device: awaiting.binding.target.device,
+    target_inode: awaiting.binding.target.inode,
   };
   let audit = DbAuditRecord {
     seq: 0,
@@ -706,6 +720,48 @@ pub fn issue_grant(
       .map_err(|e| crate::error::refusal_of_db(&e))?;
   }
   Ok(id.0)
+}
+
+/// Rebuilds the runtime grants from the durable records a restarted shard recovered (AUD-29-06): each grant in
+/// its recorded state and bound as it was approved — the consumer by the principal it was made for, the
+/// volume, snapshot and target by their recorded identities — so a session grant stays usable for exactly its
+/// binding across a restart, a spent or revoked one stays spent, and the next grant takes an id past every
+/// recorded one. Before 2026-09-29 the runtime table started empty: every grant was lost at a restart and the
+/// first grant after it re-minted a recorded id, refused `AlreadyExists`.
+pub fn restore_grants(state: &mut ShardState) {
+  let records: Vec<DbGrantRecord> = state.db.partition().grants().cloned().collect();
+  for record in records {
+    state.landing.grants.restore(LandGrantRecord {
+      id: slates_land::grant::GrantId(record.id),
+      surface: match record.surface {
+        GrantSurface::Cli => Surface::Cli,
+        GrantSurface::Confirmation { .. } => Surface::Confirmation,
+      },
+      manifest: record.manifest,
+      binding: GrantBinding {
+        consumer: record.principal.key().into_boxed_slice(),
+        volume: record.volume.bytes,
+        snapshot: record.snapshot.value,
+        target: TargetIdentity {
+          key: record.target.as_str().into(),
+          device: record.target_device,
+          inode: record.target_inode,
+        },
+      },
+      scope: match record.scope {
+        DbGrantScope::Once => LandScope::Once,
+        DbGrantScope::Session { .. } => LandScope::Session,
+      },
+      issued_ns: record.issued_ns,
+      expires_ns: record.expires_ns,
+      state: match record.state {
+        DbGrantState::Issued => LandGrantState::Issued,
+        DbGrantState::Consumed => LandGrantState::Consumed,
+        DbGrantState::Expired => LandGrantState::Expired,
+        DbGrantState::Revoked => LandGrantState::Revoked,
+      },
+    });
+  }
 }
 
 /// The caller's grants, from the durable records.
