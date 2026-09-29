@@ -41,7 +41,8 @@ use slates_vfs::inode::{Fingerprint, Witness};
 use slates_vfs::volume::{Store, Volume};
 
 use crate::grant::{
-  GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLeaseHeld, Leases,
+  GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLeaseHeld, Leases,
+  TargetIdentity,
 };
 use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary, plan};
 use crate::ramp::{Ramp, StepSample};
@@ -241,6 +242,8 @@ pub struct Presented {
   pub manifest: Manifest,
   /// The preliminary verdict pass (no writes).
   pub preliminary: Vec<EntryReport>,
+  /// Who lands what where: the binding a grant for this presentation must carry (§4.13 "Grants").
+  pub binding: GrantBinding,
 }
 
 /// Why a landing was refused before any write.
@@ -356,6 +359,12 @@ pub struct LandingRequest {
   pub landing_id: u64,
   /// The session holding the lease.
   pub holder: u64,
+  /// The consumer landing: its exact principal identity (the server's principal key), which a grant binds.
+  pub consumer: Box<[u8]>,
+  /// The volume landed, by its id.
+  pub volume: [u8; 16],
+  /// The snapshot landed.
+  pub snapshot: u64,
   /// The grant, when the human issued one.
   pub grant: Option<GrantId>,
   /// The filter.
@@ -1549,14 +1558,17 @@ pub fn land<H: LandFs>(
     manifest: manifest.hash,
     outcome: None,
   });
-  // Grant.
-  let grant = match grants.check(request.grant, manifest.hash, request.now_ns) {
+  // Grant: the landing's own binding — the consumer, the volume and snapshot, and the target as opened now —
+  // must be the one the grant was approved for (§4.13 "Grants"), before any write-capable step.
+  let binding = binding_of(host, target, request)?;
+  let grant = match grants.check(request.grant, &binding, manifest.hash, request.now_ns) {
     Ok(g) => g,
     Err(GrantRefusal::GrantRequired) => {
       let preliminary = preliminary_verdicts(host, target, request, &manifest)?;
       return Err(LandingRefusal::GrantRequired(Box::new(Presented {
         manifest,
         preliminary,
+        binding,
       })));
     }
     Err(e) => return Err(LandingRefusal::Grant(e)),
@@ -1581,6 +1593,29 @@ pub fn land<H: LandFs>(
     grants.consume(grant.id);
   }
   result
+}
+
+/// The binding a landing presents: its consumer, volume and snapshot, and its target identified by the
+/// directory the landing opened (the host's `fingerprint_dir`: device and inode), so a directory replaced
+/// at the target's path is another target.
+fn binding_of<H: LandFs>(
+  host: &mut H,
+  target: &LandingTarget,
+  request: &LandingRequest,
+) -> Result<GrantBinding, LandingRefusal> {
+  let identity = host
+    .fingerprint_dir(target.dir)
+    .map_err(LandingRefusal::Target)?;
+  Ok(GrantBinding {
+    consumer: request.consumer.clone(),
+    volume: request.volume,
+    snapshot: request.snapshot,
+    target: TargetIdentity {
+      key: target.key.clone(),
+      device: identity.dev,
+      inode: identity.ino,
+    },
+  })
 }
 
 /// The preliminary verdict pass a `GrantRequired` reply carries (reads only).

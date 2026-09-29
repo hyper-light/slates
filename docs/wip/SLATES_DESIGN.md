@@ -3609,6 +3609,14 @@ grants refuse before writing. Refusal to issue a grant never changes the propose
 The control transport and the VFS consumer channel have different authority, verified by the
 server, not inferred from command names.
 
+> **Status (2026-09-29, AUD-29-01).** The use of a grant now enforces what issuing it verified. A grant
+> binds the landing it was presented for — the consumer by its exact principal key, the volume, the
+> snapshot, and the target by its key and the opened directory's identity — and a landing whose own binding
+> differs is refused (`GrantMismatch`, counted `grant_unbound.<field>`) before any write. A session grant
+> covers later snapshots and manifests of its volume into its target, nothing wider. Before, the check at
+> use compared only the manifest, which is equal for any same-content create-only plan. Record:
+> `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
+
 *Refusals added.* `Forbidden{verb}`, `GrantChannelRefused{channel}`,
 `ConsumerNotEnrolled`, `ConsumerRevoked`, `GrantIssuerUnverified`; all are closed variants
 carried through §4.4's operation refusal taxonomy. A-9 adds these requirements without claiming

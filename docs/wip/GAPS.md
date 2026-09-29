@@ -2927,6 +2927,24 @@ current-tree passes.
 | AUD-29-60–61 | Address changes need bounded authenticated validation and new-path measurements; local UDP backpressure needs owned pending-send/readiness state and accurate acceptance timing (§4.3, §4.10a). |
 | AUD-29-62–63 | Windows base access must retain contained directory handles; fixtures, trace output and property-failure persistence must prove RAM-backed ownership before writes (§4.5, R1/R8, Part 6). |
 
+**Closed 2026-09-29 — AUD-29-01 (P0): a grant binds its consumer, volume, snapshot and target identity at
+use.**
+- **The binding.** A grant carries what it was presented for: the consumer by its exact principal key, the
+  volume, the snapshot, and the target by its key and the opened directory's device and inode
+  (`slates_land::grant::GrantBinding`).
+- **The check.** The engine builds the landing's own binding before any write-capable step, and
+  `Grants::check` refuses `Unbound { field }` when they differ. A session grant may differ only in
+  snapshot and manifest. The server answers `GrantMismatch` and counts `grant_unbound.<field>`.
+- **The durable record.** It now names the consumer it was made for and that consumer's session, not the
+  issuer.
+- **Failing tests first.** `crates/land/tests/grant_binding.rs`: a same-manifest plan landed into another
+  directory, into a directory that replaced the target at its path, and for another consumer. All three
+  now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
+  refuses a retarget end to end.
+- **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
+- **Still open in this row.** 02 (the snapshot is still the live volume's), 03 (the lease is per shard and
+  per path string), 04–07.
+
 The third pass uses baseline 8ab25deb7c31bfca77a33cc681ce120bac76e7d1 plus concurrent
 fleet/heartbeat diagnostics; those diagnostics were subsequently committed in ca60bd9
 and continued changing during the review. They are not accepted here as repairs.

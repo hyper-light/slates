@@ -1121,6 +1121,7 @@ fn a_mismatched_grant_and_a_held_lease_refuse() {
     .issue(
       Surface::Cli,
       presented.manifest.hash,
+      presented.binding.clone(),
       GrantScope::Once,
       1,
       TERM_NS,
@@ -1175,6 +1176,7 @@ fn a_held_lease_refuses_and_a_single_use_grant_is_consumed() {
     .issue(
       Surface::Cli,
       presented.manifest.hash,
+      presented.binding.clone(),
       GrantScope::Once,
       1,
       TERM_NS,
@@ -1227,6 +1229,7 @@ fn a_session_grant_covers_the_next_landing() {
     .issue(
       Surface::Confirmation,
       presented.manifest.hash,
+      presented.binding.clone(),
       GrantScope::Session,
       1,
       TERM_NS,

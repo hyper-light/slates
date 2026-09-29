@@ -80,6 +80,9 @@ pub struct LandingState {
 pub struct Awaiting {
   /// The manifest hash the grant must bind.
   pub manifest: [u8; 32],
+  /// Who lands what where, as presented: the consumer, the volume and snapshot, and the target's identity
+  /// when it was opened. The grant binds exactly this (§4.13 "Grants"; AUD-29-01).
+  pub binding: slates_land::grant::GrantBinding,
   /// The volume.
   pub volume: DbVolumeId,
   /// The snapshot.
@@ -257,6 +260,11 @@ fn land_verb_unix(
   let request = LandingRequest {
     landing_id,
     holder: session_of(principal),
+    // The grant binds the caller by its exact principal (its key), never by the session number several
+    // principals can share, and the volume and snapshot this landing names (AUD-29-01).
+    consumer: principal.key().into_boxed_slice(),
+    volume: db_volume.bytes,
+    snapshot: db_snapshot.value,
     grant: grant.map(GrantId),
     filter: to_land_filter(filter),
     now_ns: now,
@@ -298,9 +306,13 @@ fn land_verb_unix(
   };
   match outcome {
     Ok(report) => finish(state, principal, &ids, &report, grant),
-    Err(LandingRefusal::GrantRequired(presented)) => {
-      present(state, principal, &ids, &presented.manifest)
-    }
+    Err(LandingRefusal::GrantRequired(presented)) => present(
+      state,
+      principal,
+      &ids,
+      &presented.manifest,
+      &presented.binding,
+    ),
     Err(LandingRefusal::Conflict(entries)) => refused(Refusal::LandingConflict {
       entries: entries.iter().map(|e| e.path.to_string()).collect(),
     }),
@@ -308,6 +320,15 @@ fn land_verb_unix(
       holder: held.holder,
     }),
     Err(LandingRefusal::Grant(GrantRefusal::GrantMismatch { .. })) => {
+      refused(Refusal::GrantMismatch)
+    }
+    // A grant approved for another consumer, volume, snapshot or target: the landing is not the one the
+    // human approved, refused before any write and counted by the field that differed.
+    Err(LandingRefusal::Grant(GrantRefusal::Unbound { field })) => {
+      *state
+        .refusals
+        .entry(unbound_refusal_name(field))
+        .or_insert(0) += 1;
       refused(Refusal::GrantMismatch)
     }
     Err(LandingRefusal::Grant(_)) => refused(Refusal::GrantInvalid),
@@ -318,6 +339,18 @@ fn land_verb_unix(
   }
 }
 
+/// The refusal-ledger name of a landing refused for a grant bound elsewhere, by the field that differed.
+#[cfg(unix)]
+fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str {
+  use slates_land::grant::BindingField;
+  match field {
+    BindingField::Consumer => "grant_unbound.consumer",
+    BindingField::Volume => "grant_unbound.volume",
+    BindingField::Snapshot => "grant_unbound.snapshot",
+    BindingField::Target => "grant_unbound.target",
+  }
+}
+
 /// Records the planned landing (AwaitingGrant) and its audit, and replies `GrantRequired`.
 #[cfg(unix)]
 fn present(
@@ -325,6 +358,7 @@ fn present(
   principal: &Principal,
   ids: &LandingIds<'_>,
   manifest: &Manifest,
+  binding: &slates_land::grant::GrantBinding,
 ) -> ReplyBody {
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
@@ -333,6 +367,7 @@ fn present(
     landing_id,
     Awaiting {
       manifest: hash,
+      binding: binding.clone(),
       volume: ids.volume,
       snapshot: ids.snapshot,
       target: ids.target.to_owned(),
@@ -577,21 +612,32 @@ pub fn issue_grant(
     GrantScope::Session => LandScope::Session,
   };
   // A grant id is never reused; once the id space is spent (2^64 grants — memory runs out first, one record
-  // per grant) the grant is refused as a spent capacity.
+  // per grant) the grant is refused as a spent capacity. The grant binds the presented landing: its consumer,
+  // volume, snapshot and target identity (AUD-29-01).
   let id = state
     .landing
     .grants
-    .issue(Surface::Cli, awaiting.manifest, land_scope, now, term_ns)
+    .issue(
+      Surface::Cli,
+      awaiting.manifest,
+      awaiting.binding.clone(),
+      land_scope,
+      now,
+      term_ns,
+    )
     .ok_or(Refusal::NoSpace)?;
+  // The durable record names the principal the grant was made for — the consumer the landing was presented
+  // to, and a session grant that consumer's session — not the human who issued it (the surface records
+  // that); until 2026-09-29 it recorded the issuer for both.
   let record = DbGrantRecord {
     id: id.0,
-    principal: principal.clone(),
+    principal: awaiting.principal.clone(),
     surface: GrantSurface::Cli,
     volume: awaiting.volume,
     snapshot: awaiting.snapshot,
     target: awaiting.target.clone(),
     manifest: awaiting.manifest,
-    scope: db_grant_scope(scope, session_of(principal)),
+    scope: db_grant_scope(scope, session_of(&awaiting.principal)),
     issued_ns: now,
     expires_ns: now.saturating_add(term_ns),
     state: DbGrantState::Issued,

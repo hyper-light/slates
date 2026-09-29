@@ -83,6 +83,9 @@ fn request(id: u64) -> LandingRequest {
   LandingRequest {
     landing_id: id,
     holder: 1,
+    consumer: b"bench".as_slice().into(),
+    volume: [0; 16],
+    snapshot: 0,
     grant: None,
     filter: Filter::default(),
     now_ns: 1,
@@ -137,6 +140,7 @@ fn land_once<H: LandFs>(
   req.grant = grants.issue(
     Surface::Cli,
     presented.manifest.hash,
+    presented.binding.clone(),
     GrantScope::Once,
     1,
     TERM_NS,

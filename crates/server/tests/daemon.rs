@@ -928,11 +928,31 @@ fn target_dir() -> TargetDir {
 fn grant_scenario() {
   let (daemon, instance) = daemon("grant");
   let target = target_dir();
+  let elsewhere = target_dir();
   let mut client = Client::connect(&instance);
   let (id, snapshot, landing, manifest) = present_landing(&mut client, &target.path);
   forged_approval_is_refused(&mut client, landing, manifest);
   let secret = daemon.segment().issuer_secret().unwrap();
   let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
+  // AUD-29-01: the grant binds the approved target. The same plan into another empty directory has the same
+  // manifest, and is refused before any write: that directory stays empty.
+  assert!(matches!(
+    client.call(&RequestBody::Land {
+      volume: id,
+      snapshot: Some(snapshot),
+      target: elsewhere.path.clone(),
+      filter: Filter::default(),
+      grant: Some(grant),
+    }),
+    ReplyBody::Refused {
+      refusal: Refusal::GrantMismatch
+    }
+  ));
+  assert_eq!(
+    std::fs::read_dir(&elsewhere.path).unwrap().count(),
+    0,
+    "a grant for one target wrote into another"
+  );
   // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
   // the volume's owner shard, not necessarily the client's).
   assert!(matches!(

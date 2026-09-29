@@ -68,10 +68,20 @@ pub(crate) fn scratch(store: &mut Store) -> Volume {
   Volume::create(store, config()).unwrap()
 }
 
+/// Shape: the consumer these tests land as (its principal identity bytes).
+pub(crate) const CONSUMER: &[u8] = b"consumer-one";
+/// Shape: the id of the volume these tests land.
+pub(crate) const VOLUME: [u8; 16] = [7; 16];
+/// Shape: the snapshot these tests land.
+pub(crate) const SNAPSHOT: u64 = 1;
+
 pub(crate) fn request(landing_id: u64) -> LandingRequest {
   LandingRequest {
     landing_id,
     holder: 1,
+    consumer: CONSUMER.into(),
+    volume: VOLUME,
+    snapshot: SNAPSHOT,
     grant: None,
     filter: Filter::default(),
     now_ns: 1,
@@ -153,6 +163,7 @@ impl<H: LandFs> Setup<'_, H> {
     req.grant = self.session.grants.issue(
       Surface::Cli,
       presented.manifest.hash,
+      presented.binding.clone(),
       GrantScope::Once,
       req.now_ns,
       TERM_NS,

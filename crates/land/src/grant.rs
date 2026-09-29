@@ -1,7 +1,14 @@
-//! Grants and the landing lease (§4.15, D-26) as in-process records: a grant is bound to a
-//! manifest's hash and consumed by one landing (or good for a session); the lease has one
-//! holder per canonical target with a fencing generation. Phase 2 makes them database records
-//! through the control shard; the shapes are the design's.
+//! Grants and the landing lease (§4.15, D-26) as in-process records: a grant is bound to what the human
+//! approved — the manifest's hash, and the consumer, volume, snapshot and target identity it was presented
+//! for ([`GrantBinding`], §4.13 "Grants": "the exact manifest hash, target identity, intended consumer,
+//! scope and validity") — and consumed by one landing (or good for its session); the lease has one holder
+//! per canonical target with a fencing generation. Phase 2 makes them database records through the control
+//! shard; the shapes are the design's.
+//!
+//! Until 2026-09-29 a grant carried only its manifest, so a grant approved for one landing could land a
+//! same-content plan into another directory, from another volume or for another consumer, and a session
+//! grant covered any plan on its shard (AUD-29-01,
+//! docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md).
 
 use std::collections::BTreeMap;
 
@@ -40,6 +47,60 @@ pub enum GrantState {
   Revoked,
 }
 
+/// A landing target's identity: its canonical key and the target directory's identity on its device
+/// (the host's `fingerprint_dir`) when the landing opened it, so a directory replaced at the same path is
+/// not the target a grant names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetIdentity {
+  /// The canonical target the lease names.
+  pub key: Box<str>,
+  /// The directory's device.
+  pub device: u64,
+  /// The directory's inode on that device.
+  pub inode: u64,
+}
+
+/// What a grant binds besides its manifest (§4.13 "Grants"; §4.15's `GrantRecord`): who lands what,
+/// where. A landing presents its own binding and a grant covers it only when they agree
+/// ([`Grants::check`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantBinding {
+  /// The intended consumer: the principal the landing was presented to, by its exact identity bytes (the
+  /// server's principal key), never a number several principals could share.
+  pub consumer: Box<[u8]>,
+  /// The volume landed.
+  pub volume: [u8; 16],
+  /// The snapshot landed (a session grant covers later snapshots of the same volume).
+  pub snapshot: u64,
+  /// The target landed into.
+  pub target: TargetIdentity,
+}
+
+/// The bound field a landing did not match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingField {
+  /// Another consumer than the grant's.
+  Consumer,
+  /// Another volume.
+  Volume,
+  /// Another snapshot, for a single-use grant.
+  Snapshot,
+  /// Another target: another path, or the same path naming another directory.
+  Target,
+}
+
+impl BindingField {
+  /// The field's name, for the refusal ledger.
+  pub const fn name(self) -> &'static str {
+    match self {
+      BindingField::Consumer => "consumer",
+      BindingField::Volume => "volume",
+      BindingField::Snapshot => "snapshot",
+      BindingField::Target => "target",
+    }
+  }
+}
+
 /// A grant record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrantRecord {
@@ -49,6 +110,8 @@ pub struct GrantRecord {
   pub surface: Surface,
   /// The manifest hash it binds.
   pub manifest: [u8; 32],
+  /// Who lands what where, as the human approved it.
+  pub binding: GrantBinding,
   /// The scope.
   pub scope: GrantScope,
   /// Issued at, monotonic ns.
@@ -75,6 +138,11 @@ pub enum GrantRefusal {
   GrantExpired,
   /// Revoked.
   GrantRefused,
+  /// The landing is not the one the grant binds: another consumer, volume, snapshot or target.
+  Unbound {
+    /// The first bound field that differed.
+    field: BindingField,
+  },
 }
 
 /// The grants table.
@@ -92,6 +160,7 @@ impl Grants {
     &mut self,
     surface: Surface,
     manifest: [u8; 32],
+    binding: GrantBinding,
     scope: GrantScope,
     now_ns: u64,
     term_ns: u64,
@@ -104,6 +173,7 @@ impl Grants {
         id,
         surface,
         manifest,
+        binding,
         scope,
         issued_ns: now_ns,
         expires_ns: now_ns.saturating_add(term_ns),
@@ -120,10 +190,11 @@ impl Grants {
     }
   }
 
-  /// Checks that `id` covers `manifest` now.
+  /// Checks that `id` covers the landing `binding` describes, writing `manifest`, now.
   pub fn check(
     &mut self,
     id: Option<GrantId>,
+    binding: &GrantBinding,
     manifest: [u8; 32],
     now_ns: u64,
   ) -> Result<GrantRecord, GrantRefusal> {
@@ -139,6 +210,11 @@ impl Grants {
       GrantState::Revoked => return Err(GrantRefusal::GrantRefused),
       GrantState::Expired | GrantState::Consumed => return Err(GrantRefusal::GrantExpired),
       GrantState::Issued => {}
+    }
+    // Who lands what where must be what the human approved, whatever the manifest: a create-only plan has
+    // the same manifest in every empty directory and from every volume with the same content.
+    if let Some(field) = unbound_field(&g.binding, binding, g.scope) {
+      return Err(GrantRefusal::Unbound { field });
     }
     // A single-use grant binds exactly the manifest the human saw; a session grant covers the
     // later landings of the same volume into the same target (§4.15 step 3), each of which
@@ -165,6 +241,27 @@ impl Grants {
   /// A grant record.
   pub fn get(&self, id: GrantId) -> Option<&GrantRecord> {
     self.records.get(&id)
+  }
+}
+
+/// The first field in which a landing's binding differs from the one its grant was approved for: the
+/// consumer, the volume and the target always; the snapshot only for a single-use grant, since a session
+/// grant covers the later landings (later snapshots) of its volume into its target (§4.15 step 3).
+fn unbound_field(
+  granted: &GrantBinding,
+  landing: &GrantBinding,
+  scope: GrantScope,
+) -> Option<BindingField> {
+  if granted.consumer != landing.consumer {
+    Some(BindingField::Consumer)
+  } else if granted.volume != landing.volume {
+    Some(BindingField::Volume)
+  } else if granted.target != landing.target {
+    Some(BindingField::Target)
+  } else if scope == GrantScope::Once && granted.snapshot != landing.snapshot {
+    Some(BindingField::Snapshot)
+  } else {
+    None
   }
 }
 
@@ -244,44 +341,80 @@ impl Leases {
 mod tests {
   use super::*;
 
+  /// A binding for the unit tests: one consumer, volume, snapshot and target.
+  fn binding() -> GrantBinding {
+    GrantBinding {
+      consumer: b"consumer".as_slice().into(),
+      volume: [1; 16],
+      snapshot: 1,
+      target: TargetIdentity {
+        key: "/t".into(),
+        device: 1,
+        inode: 2,
+      },
+    }
+  }
+
   #[test]
   fn a_grant_binds_one_manifest() {
     let mut grants = Grants::default();
+    let bound = binding();
     let id = grants
-      .issue(Surface::Cli, [1; 32], GrantScope::Once, 100, 50)
+      .issue(
+        Surface::Cli,
+        [1; 32],
+        bound.clone(),
+        GrantScope::Once,
+        100,
+        50,
+      )
       .expect("a grant id");
     assert_eq!(
-      grants.check(None, [1; 32], 110),
+      grants.check(None, &bound, [1; 32], 110),
       Err(GrantRefusal::GrantRequired)
     );
     assert!(matches!(
-      grants.check(Some(id), [2; 32], 110),
+      grants.check(Some(id), &bound, [2; 32], 110),
       Err(GrantRefusal::GrantMismatch { .. })
     ));
-    assert!(grants.check(Some(id), [1; 32], 110).is_ok());
+    assert!(grants.check(Some(id), &bound, [1; 32], 110).is_ok());
     assert_eq!(
-      grants.check(Some(id), [1; 32], 200),
+      grants.check(Some(id), &bound, [1; 32], 200),
       Err(GrantRefusal::GrantExpired)
     );
     let id2 = grants
-      .issue(Surface::Confirmation, [3; 32], GrantScope::Once, 100, 50)
+      .issue(
+        Surface::Confirmation,
+        [3; 32],
+        bound.clone(),
+        GrantScope::Once,
+        100,
+        50,
+      )
       .expect("a grant id");
     grants.consume(id2);
     assert_eq!(
-      grants.check(Some(id2), [3; 32], 110),
+      grants.check(Some(id2), &bound, [3; 32], 110),
       Err(GrantRefusal::GrantExpired)
     );
     let id3 = grants
-      .issue(Surface::Cli, [4; 32], GrantScope::Session, 100, 50)
+      .issue(
+        Surface::Cli,
+        [4; 32],
+        bound.clone(),
+        GrantScope::Session,
+        100,
+        50,
+      )
       .expect("a grant id");
     grants.consume(id3);
     assert!(
-      grants.check(Some(id3), [4; 32], 110).is_ok(),
+      grants.check(Some(id3), &bound, [4; 32], 110).is_ok(),
       "a session grant survives a landing"
     );
     grants.revoke(id3);
     assert_eq!(
-      grants.check(Some(id3), [4; 32], 110),
+      grants.check(Some(id3), &bound, [4; 32], 110),
       Err(GrantRefusal::GrantRefused)
     );
   }
