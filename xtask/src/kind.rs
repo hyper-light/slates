@@ -737,6 +737,92 @@ struct View {
   refused_role: u64,
   /// The `fleet.resolve` refusals summed over the shards: a peer's name that did not resolve at a dial.
   resolve_refused: u64,
+  /// How its record links fared (zero from an image that predates a counter).
+  links: LinkCounters,
+}
+
+/// A view's record-link counters, each summed over the shards under the name the daemon counts it by
+/// (`crates/server/src/fleet.rs`): the link task's discovery pages that ended without a reply — at their
+/// deadline, invalidated, or on a transport fault, each of which releases the link's session to be dialled
+/// again — the re-dials and dial faults, and the borrowed sessions whose return found their slot taken. A
+/// succession trial reports how each moved across a leader's loss, the window in which a survivor's link to
+/// the other survivor was seen down (GAPS, 2026-09-29).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct LinkCounters {
+  discovery_deadline: u64,
+  discovery_invalidated: u64,
+  discovery_transport: u64,
+  redials: u64,
+  dial_faults: u64,
+  stale_returns: u64,
+}
+
+impl LinkCounters {
+  fn parse(status: &serde_json::Value) -> LinkCounters {
+    let named = |name: &str| refusals_where(status, |kind| kind == name);
+    LinkCounters {
+      discovery_deadline: named("fleet.discovery.deadline"),
+      discovery_invalidated: named("fleet.discovery.invalidated"),
+      discovery_transport: named("fleet.discovery.transport"),
+      redials: named("fleet.dial.redial"),
+      dial_faults: named("fleet.dial.fault"),
+      stale_returns: named("fleet.link.stale_return"),
+    }
+  }
+
+  /// How far each counter moved from `before` to `self`.
+  fn since(self, before: LinkCounters) -> LinkCounters {
+    LinkCounters {
+      discovery_deadline: self
+        .discovery_deadline
+        .saturating_sub(before.discovery_deadline),
+      discovery_invalidated: self
+        .discovery_invalidated
+        .saturating_sub(before.discovery_invalidated),
+      discovery_transport: self
+        .discovery_transport
+        .saturating_sub(before.discovery_transport),
+      redials: self.redials.saturating_sub(before.redials),
+      dial_faults: self.dial_faults.saturating_sub(before.dial_faults),
+      stale_returns: self.stale_returns.saturating_sub(before.stale_returns),
+    }
+  }
+
+  fn line(self) -> String {
+    format!(
+      "discovery ended {} at its deadline / {} invalidated / {} on a transport fault, {} re-dials, {} dial faults, {} stale returns",
+      self.discovery_deadline,
+      self.discovery_invalidated,
+      self.discovery_transport,
+      self.redials,
+      self.dial_faults,
+      self.stale_returns
+    )
+  }
+}
+
+/// The count of every refusal whose kind `wanted` accepts, summed over the status document's shards.
+fn refusals_where(status: &serde_json::Value, wanted: impl Fn(&str) -> bool) -> u64 {
+  status
+    .get("shards")
+    .and_then(serde_json::Value::as_array)
+    .into_iter()
+    .flatten()
+    .flat_map(|shard| {
+      shard
+        .get("refusals")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    })
+    .filter(|refusal| {
+      refusal
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(&wanted)
+    })
+    .map(|refusal| u64_of(refusal, "count"))
+    .fold(0, u64::saturating_add)
 }
 
 impl View {
@@ -751,29 +837,7 @@ impl View {
       .map(|list| list.iter().filter_map(serde_json::Value::as_u64).collect())
       .unwrap_or_default();
     members.sort_unstable();
-    let resolve_refused = status
-      .get("shards")
-      .and_then(serde_json::Value::as_array)
-      .map(|shards| {
-        shards
-          .iter()
-          .flat_map(|shard| {
-            shard
-              .get("refusals")
-              .and_then(serde_json::Value::as_array)
-              .cloned()
-              .unwrap_or_default()
-          })
-          .filter(|refusal| {
-            refusal
-              .get("kind")
-              .and_then(serde_json::Value::as_str)
-              .is_some_and(is_resolve_refusal)
-          })
-          .map(|refusal| u64_of(&refusal, "count"))
-          .sum()
-      })
-      .unwrap_or(0);
+    let resolve_refused = refusals_where(status, is_resolve_refusal);
     Ok(View {
       pod: pod.to_owned(),
       host: u64_of(fleet, "host"),
@@ -806,6 +870,7 @@ impl View {
       refused_log: u64_of(council, "refused_log"),
       refused_role: u64_of(council, "refused_role"),
       resolve_refused,
+      links: LinkCounters::parse(status),
     })
   }
 
@@ -1701,8 +1766,11 @@ impl Succession {
       .map(|after| {
         let before = self.before.iter().find(|view| view.pod == after.pod);
         let began = |field: fn(&View) -> u64| field(after).saturating_sub(before.map_or(0, field));
+        let links = after
+          .links
+          .since(before.map_or_else(LinkCounters::default, |view| view.links));
         format!(
-          "{} rank {} priority {} ± {} ms, {} pre-elections ({} granted, {} refused replies) and {} elections begun, refused {} leased / {} term / {} log / {} role{}",
+          "{} rank {} priority {} ± {} ms, {} pre-elections ({} granted, {} refused replies) and {} elections begun, refused {} leased / {} term / {} log / {} role; links: {}{}",
           after.pod,
           after.rank,
           milliseconds(after.priority_ns),
@@ -1715,6 +1783,7 @@ impl Succession {
           began(|view| view.refused_term),
           began(|view| view.refused_log),
           began(|view| view.refused_role),
+          links.line(),
           if after.leads { ", leads" } else { "" }
         )
       })
@@ -1974,7 +2043,7 @@ fn uptime_seconds(line: &str) -> Result<f64, Failure> {
 
 #[cfg(test)]
 mod tests {
-  use super::View;
+  use super::{LinkCounters, View};
 
   /// A `slates status --json` document with the fleet block the lane reads and one shard's refusals.
   fn status_with_refusals(refusals: &[(&str, u64)]) -> serde_json::Value {
@@ -2009,5 +2078,39 @@ mod tests {
     ]);
     let view = View::parse("slates-0", &status).expect("the document parses");
     assert_eq!(view.resolve_refused, 6);
+  }
+
+  /// GAPS 2026-09-29 (a survivor's record session drops after a leader's loss): a view reads each record-link
+  /// counter by the name the daemon counts it under, summed over the shards, and a trial reports how far each
+  /// moved.
+  #[test]
+  fn a_views_link_counters_are_read_by_name_and_moved_between_views() {
+    let before = status_with_refusals(&[
+      ("fleet.discovery.deadline", 1),
+      ("fleet.dial.redial", 4),
+      ("fleet.resolve", 9),
+    ]);
+    let after = status_with_refusals(&[
+      ("fleet.discovery.deadline", 3),
+      ("fleet.discovery.invalidated", 2),
+      ("fleet.discovery.transport", 1),
+      ("fleet.dial.redial", 7),
+      ("fleet.dial.fault", 5),
+      ("fleet.link.stale_return", 6),
+      ("fleet.resolve", 9),
+    ]);
+    let before = View::parse("slates-0", &before).expect("the document parses");
+    let after = View::parse("slates-0", &after).expect("the document parses");
+    assert_eq!(
+      after.links.since(before.links),
+      LinkCounters {
+        discovery_deadline: 2,
+        discovery_invalidated: 2,
+        discovery_transport: 1,
+        redials: 3,
+        dial_faults: 5,
+        stale_returns: 6,
+      }
+    );
   }
 }

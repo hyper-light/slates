@@ -548,7 +548,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let anchor_log = anchor.log_path().display().to_string();
   drop(mount);
   // Readiness is already established: keep observing through daemon teardown as well.
-  anchor.stop();
+  anchor.stop()?;
   let mut trace_note = None;
   if let (Some(tracer), Some(binary)) = (eslogger, &binary_for_trace) {
     let filtered = tracer.stop(&log, binary.path())?;

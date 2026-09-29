@@ -1826,6 +1826,20 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: a suite's departing daemon wrote into the next suite's trace — fixed
+
+CI run 36565560556 (`38ff5b5`, macOS conformance) failed hermeticity on 2 writes "outside". Both were the
+workloads suite's daemon writing its last log line and closing its log. That suite's stop had killed and
+reaped only the anchor. The orphaned daemon left about 150 ms later (126–163 ms measured here), inside the
+next suite's `eslogger` trace, which keeps every slates process's events.
+- A stopped anchor now waits until no process runs its daemon's command line, killing one that overstays
+  the start wait.
+- `stop` refuses typed when the daemon will not leave, so that suite fails with its reason rather than
+  polluting the next.
+- The failing test came first (`stopping_an_anchor_leaves_no_daemon_of_its_instance_running`): 3 of 3
+  before, 0 of 3 after.
+[Bug record](../bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md).
+
 ### 2026-09-29: the lease gate refused volumes the node did not hold — fixed; the synthetic root serves attributes ungated — open
 
 **Fixed.** CI run 36560510107 (`5836a8c`, Ubuntu) failed the three-process CLI fleet test. A survivor answered

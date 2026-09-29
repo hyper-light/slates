@@ -280,9 +280,15 @@ impl Anchor {
     }
   }
 
+  /// The command line this instance's daemon runs under, which names it among every process on the host:
+  /// a pid can be reused once the daemon leaves, and the instance is this run's own.
+  fn daemon_command(&self) -> String {
+    format!("slates --instance {} daemon", self.instance)
+  }
+
   /// The daemon's pid: the process running `slates --instance <instance> daemon`.
   pub(crate) fn daemon_pid(&self) -> Result<u32, Failure> {
-    let pattern = format!("slates --instance {} daemon", self.instance);
+    let pattern = self.daemon_command();
     let listed = stdout_of("pgrep", &["-f", &pattern]);
     listed
       .lines()
@@ -299,17 +305,58 @@ impl Anchor {
       })
   }
 
-  /// Kills and reaps the anchor (the daemon leaves with it).
-  pub(crate) fn stop(mut self) {
+  /// Kills and reaps the anchor, then waits for its daemon to leave ([`Anchor::end`]); refused when the
+  /// daemon was still running after it was killed too.
+  pub(crate) fn stop(mut self) -> Result<(), Failure> {
+    if self.end() {
+      Ok(())
+    } else {
+      Err(Failure(format!(
+        "the daemon of {} was still running {START_WAIT:?} after it was killed",
+        self.instance
+      )))
+    }
+  }
+
+  /// Kills and reaps the anchor, then waits until no process runs its daemon's command line. Orphaned by the
+  /// kill, the daemon cannot be reaped here: it leaves in its own time, writing its last lines to and closing
+  /// the log it shares with the anchor. One still running after [`START_WAIT`] is killed, and waited for as
+  /// long again. So no process of one suite outlives it: CI run 36565560556's hermeticity trace, which keeps
+  /// every slates process's events, took the workloads suite's departing daemon's last write and close of
+  /// its log for its own violations
+  /// (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`). Whether the
+  /// daemon left.
+  fn end(&mut self) -> bool {
     let _ = self.child.kill();
     let _ = self.child.wait();
+    let daemon = self.daemon_command();
+    if none_running(&daemon) {
+      return true;
+    }
+    let _ = Command::new("pkill")
+      .args(["-KILL", "-f", &daemon])
+      .status();
+    none_running(&daemon)
+  }
+}
+
+/// Polls until no process runs `command`, for at most [`START_WAIT`]; whether none does.
+fn none_running(command: &str) -> bool {
+  let started = Instant::now();
+  loop {
+    if stdout_of("pgrep", &["-f", command]).is_empty() {
+      return true;
+    }
+    if started.elapsed() > START_WAIT {
+      return false;
+    }
+    pause();
   }
 }
 
 impl Drop for Anchor {
   fn drop(&mut self) {
-    let _ = self.child.kill();
-    let _ = self.child.wait();
+    let _ = self.end();
   }
 }
 
@@ -739,6 +786,53 @@ impl Session {
 mod tests {
   use super::{admitted_size, available_of_refusal};
 
+  /// CI run 36565560556 (`docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`):
+  /// stopping an anchor leaves no daemon of its instance running, so no process of one suite outlives it into
+  /// the next suite's trace. Non-vacuous: the daemon ran before the stop. Skips loudly without a built CLI.
+  #[test]
+  #[allow(clippy::unwrap_used)]
+  fn stopping_an_anchor_leaves_no_daemon_of_its_instance_running() {
+    use super::*;
+    use crate::conformance::stdout_of;
+
+    let Some(binary) = std::env::var_os("SLATES_TEST_BINARY") else {
+      eprintln!("SKIP: set SLATES_TEST_BINARY to a built slates CLI to stop a real anchor");
+      return;
+    };
+    let instance = format!("conf-stop-test-{}", std::process::id());
+    /// The test's scratch directory (`mktemp -d`, named with the process id), removed when dropped.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+      fn drop(&mut self) {
+        let _ = Command::new("rm").arg("-rf").arg(&self.0).status();
+      }
+    }
+    let scratch = Scratch(PathBuf::from(stdout_of(
+      "mktemp",
+      &["-d", "-t", &format!("{instance}.XXXXXX")],
+    )));
+    let binary = SlatesBinary {
+      path: binary.into(),
+    };
+    let anchor = Anchor::start(&binary, &instance, &scratch.0, None).unwrap();
+    let daemon = format!("slates --instance {instance} daemon");
+    assert!(
+      !stdout_of("pgrep", &["-f", &daemon]).is_empty(),
+      "the anchor's daemon ran"
+    );
+    let stopping = Instant::now();
+    anchor.stop().unwrap();
+    eprintln!(
+      "the stop returned {:?} after the anchor's kill, its daemon gone",
+      stopping.elapsed()
+    );
+    assert_eq!(
+      stdout_of("pgrep", &["-f", &daemon]),
+      "",
+      "no daemon of the instance outlived the stop"
+    );
+  }
+
   /// The refusal the CI macOS runner's daemon printed (2026-09-16) yields its available bytes; any
   /// other refusal, or a malformed number, yields none — so only a budget refusal is answered with
   /// a smaller volume.
@@ -812,7 +906,7 @@ mod tests {
       !log.contains("killing it"),
       "startup did not require a restart: {log}"
     );
-    anchor.stop();
+    anchor.stop().unwrap();
     let text = std::fs::read_to_string(&trace).unwrap();
     let cwd = scratch.0.to_str().unwrap();
     let events = parse_strace_with_cwd(&text, cwd);

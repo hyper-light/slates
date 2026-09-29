@@ -81,6 +81,11 @@ authorized merely by appearing here.
   this Mac and on the runner (36275244114). Its stop raced its own stream and cut the landing out of one
   runner trace (36275755772). The stop now waits for the drain marker's own event. See
   `docs/bugs/2026-09-26-the-eslogger-stop-raced-its-own-stream.md`.
+- [x] **macOS hermeticity: a previous suite's daemon in the trace.** The workloads suite's daemon, orphaned
+  by its anchor's kill, wrote its last log line and closed its log about 150 ms later, inside the
+  hermeticity trace, which keeps every slates process's events (CI run 36565560556: 2 "outside"). A stopped
+  anchor now waits until no process runs its daemon's command line, and kills one that overstays. See
+  `docs/bugs/2026-09-29-a-suites-departing-daemon-wrote-into-the-next-suites-trace.md`.
 - [x] **The mount capability was world-readable** (`ps`, `mount`, `nfsstat -m`). macOS now mounts
   through `mount(2)` with the handle fetched over loopback, a token-free UMNT is confirmed by the mount
   table, and OCI binds are proven by the bound mount point (A-34). See
