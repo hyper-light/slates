@@ -2980,8 +2980,19 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 (the snapshot is still the live volume's), 03 (the lease is per shard and
-  per path string), 04–07.
+- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 04–07.
+
+**Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
+- **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:
+  nothing but snapshots journaled since, no record dropped). A head changed since is refused `Unsupported`
+  before any host access, and a snapshot the volume never had is `NotFound`
+  (`docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md`).
+- **Owed.**
+  - Exact landing of an older snapshot, which needs the base plane's witnesses (file, whiteout, redirect)
+    frozen per snapshot: a §4.5/§4.15 amendment.
+  - The engine's source made explicit through plan, validate, write and advance, with advancement
+    guarded by the head still equalling what landed.
+  - A source field in the durable landing and grant records, which needs a catalog format version.
 
 The third pass uses baseline 8ab25deb7c31bfca77a33cc681ce120bac76e7d1 plus concurrent
 fleet/heartbeat diagnostics; those diagnostics were subsequently committed in ca60bd9

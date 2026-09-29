@@ -6900,6 +6900,103 @@ mod tests {
     });
   }
 
+  /// §4.15 (AUD-29-02): a landing of a named snapshot lands that snapshot's state, never the live head's.
+  /// Exact landing of an older snapshot is owed (the base plane's witnesses are the head's, not frozen per
+  /// snapshot), so a named snapshot lands only while the head is still exactly it, and is refused before any
+  /// host access otherwise; a snapshot the volume does not hold is `NotFound`. Before 2026-09-29 the engine
+  /// planned and wrote the live head while the record named the snapshot. Do: snapshot a volume holding "v1"
+  /// and land it; write "v2" at the head and land the snapshot again; land a snapshot the volume never had.
+  /// Expect: the first goes on to the target (whose path does not exist: `TargetUnavailable`, no write); the
+  /// second and third refuse before the target is reached.
+  #[test]
+  fn a_landing_of_a_named_snapshot_never_lands_a_head_changed_since() {
+    crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid { uid: 1234 };
+      let reply = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Create {
+          name: "landed".to_owned(),
+          size: super::SizeClass::Bounded { limit: 1 << 20 },
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id } = reply else {
+        panic!("{reply:?}")
+      };
+      let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+      let file = {
+        let slot = state.volumes.get_mut(handle).unwrap();
+        let root = slot.volume.root();
+        let file = slot
+          .volume
+          .create_file(&mut state.store, root, "f", 0o644)
+          .unwrap();
+        slot.volume.write(&mut state.store, file, 0, b"v1").unwrap();
+        file
+      };
+      let reply = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Snapshot { volume: id },
+      );
+      let super::ReplyBody::Snapshotted { id: snapshot, .. } = reply else {
+        panic!("{reply:?}")
+      };
+      let land = |state: &mut crate::state::ShardState, snapshot| {
+        crate::landing::land_verb(
+          state,
+          &principal,
+          id,
+          Some(snapshot),
+          "/nonexistent/slates/aud-29-02",
+          &slates_ipc::protocol::Filter::default(),
+          None,
+        )
+      };
+      assert!(
+        matches!(
+          land(state, snapshot),
+          super::ReplyBody::Refused {
+            refusal: Refusal::TargetUnavailable { .. }
+          }
+        ),
+        "the head is still the snapshot: the landing goes on to its target"
+      );
+      {
+        let slot = state.volumes.get_mut(handle).unwrap();
+        slot.volume.write(&mut state.store, file, 0, b"v2").unwrap();
+      }
+      let changed = land(state, snapshot);
+      assert!(
+        matches!(
+          &changed,
+          super::ReplyBody::Refused {
+            refusal: Refusal::Unsupported { .. }
+          }
+        ),
+        "a head changed since the snapshot must not be landed as it: {changed:?}"
+      );
+      let never = super::SnapshotId {
+        value: snapshot.value.wrapping_add(1 << u32::BITS),
+      };
+      let unknown = land(state, never);
+      assert!(
+        matches!(
+          &unknown,
+          super::ReplyBody::Refused {
+            refusal: Refusal::NotFound
+          }
+        ),
+        "a snapshot the volume does not hold: {unknown:?}"
+      );
+    });
+  }
+
   /// AC-5.2 / A-26: takeover reconstructs linked IPC names as one inode, including archived owners.
   #[test]
   fn archive_restore_preserves_ipc_hardlinks() {

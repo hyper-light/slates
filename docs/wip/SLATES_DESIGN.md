@@ -3838,6 +3838,14 @@ No copy-up, hashing, archive or landing step opens a host special file as regula
 > sibling audit), and restart does not yet recover complete volume contents (BUG-11).
 > Historical tests in GAPS §8c/§8d were not rerun for this amendment.
 
+> **Status (2026-09-29, AUD-29-02).** A landing of a named snapshot lands it only while the head is still
+> exactly its state: nothing but snapshots journaled since, with no record dropped
+> (`Volume::unchanged_since`). A head changed since is refused `Unsupported` before any host access, and a
+> snapshot the volume never had is `NotFound`. The engine plans the head. Landing an older snapshot exactly
+> needs the base plane's witnesses frozen per snapshot, and today they are the head's: owed, with the
+> advancement rule that keeps later live edits private. Record:
+> `docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md`.
+
 **Live source and complete capture (A-9).** Creating a live overlay opens and identifies its
 source without walking it. Untouched paths resolve the source's current names, metadata and
 bytes through validated reads; copied-up/pinned entries retain their witnessed version and

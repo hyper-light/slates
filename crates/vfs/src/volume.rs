@@ -2268,6 +2268,27 @@ impl Volume {
     crate::derive::derive(self, store, base)
   }
 
+  /// Whether the head still holds exactly snapshot `id`'s state: nothing but snapshots has been journaled
+  /// since it was taken (§4.5 "Journal": every mutation appends a declared operation, a snapshot included).
+  /// `false` when retention has dropped any record since, because then nothing vouches for the head. A
+  /// landing of a named snapshot lands the head only when this holds (AUD-29-02).
+  pub fn unchanged_since(&self, id: SnapshotId) -> Result<bool, VfsError> {
+    let snap = self
+      .snapshots
+      .get(snapshot_handle(id))
+      .map_err(|_| VfsError::StaleHandle)?;
+    let first_after = snap.seq.saturating_add(1);
+    if self.journal.head_seq() >= first_after && self.journal.oldest_retained_seq() > first_after {
+      return Ok(false);
+    }
+    Ok(
+      self
+        .journal
+        .since(snap.seq)
+        .all(|record| record.op == crate::journal::Op::Snapshot),
+    )
+  }
+
   /// The op log records after a snapshot (the deriver's input).
   pub fn records_since(&self, id: SnapshotId) -> Result<Vec<crate::journal::OpRecord>, VfsError> {
     let snap = self

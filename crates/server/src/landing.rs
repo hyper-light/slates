@@ -246,6 +246,12 @@ fn land_verb_unix(
   }
   let db_volume = to_db_volume(volume);
   let db_snapshot = snapshot.map_or(record.head, to_db_snapshot);
+  // A named snapshot is what lands, before any host access (AUD-29-02).
+  if let Some(named) = snapshot
+    && let Err(refusal) = named_snapshot_is_head(state, handle, &record, named)
+  {
+    return refused(refusal);
+  }
   // Open the target: this is the only place the server touches a host path for writing, and
   // only under the grant checked below (R1, R10). A path that cannot be opened, or that
   // escapes containment, is a typed refusal with no write.
@@ -348,6 +354,44 @@ fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str
     BindingField::Volume => "grant_unbound.volume",
     BindingField::Snapshot => "grant_unbound.snapshot",
     BindingField::Target => "grant_unbound.target",
+  }
+}
+
+/// Whether a landing of the named `snapshot` may land the head: the catalog must hold the snapshot for this
+/// volume (`NotFound` for one it never had, another volume's included) and the head must still be exactly
+/// its state — nothing but snapshots journaled since (`Volume::unchanged_since`). The engine plans and writes
+/// the head; landing an older snapshot exactly needs the base plane's witnesses as the snapshot froze them,
+/// which are the head's today, so a head changed since the snapshot is refused `Unsupported` before any host
+/// access rather than landed under the snapshot's name (AUD-29-02,
+/// docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md).
+#[cfg(unix)]
+fn named_snapshot_is_head(
+  state: &ShardState,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  record: &slates_db::catalog::VolumeRecord,
+  snapshot: SnapshotId,
+) -> Result<(), Refusal> {
+  let db_snapshot = to_db_snapshot(snapshot);
+  if state
+    .db
+    .partition()
+    .snapshot(record.id, db_snapshot)
+    .is_none()
+  {
+    return Err(Refusal::NotFound);
+  }
+  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  let vfs_snapshot = slates_vfs::ids::SnapshotId {
+    index: u32::try_from(db_snapshot.value >> u32::BITS).map_err(|_| Refusal::NotFound)?,
+    generation: u32::try_from(db_snapshot.value & u64::from(u32::MAX))
+      .map_err(|_| Refusal::NotFound)?,
+  };
+  match slot.volume.unchanged_since(vfs_snapshot) {
+    Ok(true) => Ok(()),
+    Ok(false) => Err(Refusal::Unsupported {
+      feature: "landing a snapshot the volume has changed since".to_owned(),
+    }),
+    Err(_) => Err(Refusal::NotFound),
   }
 }
 
