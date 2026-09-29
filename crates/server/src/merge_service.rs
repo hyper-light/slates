@@ -1650,8 +1650,9 @@ async fn ship_record(
   Some(dispatch)
 }
 
-/// Whether every green this shard owns has its newest version's merge record held by `f + 1` of each cohort of
-/// its current placement (§4.8 "the newest committed record is held by f+1 of the new candidates"): by the
+/// Whether every green this shard owns has its newest version's merge record held by `f + 1` of its cohort in
+/// the current neighbourhood (§4.8 "the newest committed record is held by f+1 of the new candidates";
+/// [`slates_db::register::Configuration::placed_on_current`]): by the
 /// holders that acknowledged the version [`MergeShardState::placed`] names, or — for a green this node took
 /// over — by the acknowledgements of its adoption the record plane recorded. A green whose newest version has
 /// not placed yet is not. A holder can accept a merge record only once it holds every version before it
@@ -1677,7 +1678,7 @@ pub(crate) fn greens_placed_on_current_cohort(state: &ShardState) -> bool {
           .filter(|placed| placed.sequence == head)
           .map(|placed| placed.placement.acked.as_slice())
       });
-    holders.is_some_and(|holders| config.place(object).placed_with(holders, config.quorum))
+    holders.is_some_and(|holders| config.placed_on_current(object, holders))
   })
 }
 

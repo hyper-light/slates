@@ -194,7 +194,7 @@ impl VolumeSet for ShardVolumeSet {
       // turn into a retry-later
       // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
       if s.by_id.contains_key(&volume)
-        && crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_some()
+        && crate::verbs::lease_refusal(s, ObjectId(volume.bytes)).is_some()
       {
         return Some(Some(status_failure_reply(Nfsstat3::Jukebox, procedure)));
       }
@@ -237,7 +237,7 @@ impl VolumeSet for ShardVolumeSet {
       // unconfirmed; the handle is not state, and the client's `GETATTR` through it meets `serve`'s gate
       // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md). `with_export`
       // answered, so the volume is in this shard's set.
-      let serves_latest = crate::verbs::lease_unconfirmed(s, ObjectId(volume.bytes)).is_none();
+      let serves_latest = crate::verbs::lease_verdict(s, ObjectId(volume.bytes)).holds();
       Some((handle, serves_latest.then_some(attr)))
     })
     .flatten()

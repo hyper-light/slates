@@ -169,14 +169,49 @@ pub(crate) fn serve_fetch(state: &ShardState, root: bool, bytes: &[u8]) -> Optio
   )
 }
 
-/// A failed join leaves the member unable to vote. Once initialized, even a delayed initial
-/// fetch cannot replace Raft state or erase a vote; only its newer applied view is considered.
-pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, bytes: &[u8]) -> bool {
+/// What folding a voter's fetch reply did to this node's group state ([`adopt_fetch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FetchOutcome {
+  /// The reply's configuration, or the join state it carried, was taken in (a configuration no newer than the
+  /// one held changes nothing: the group only moves forward).
+  Adopted,
+  /// The voter had nothing newer for this node: [`serve_fetch`] answers a caught-up fetch, or one it will not
+  /// serve, with no bytes. Neither adopted nor refused.
+  Current,
+  /// The reply was refused, counted under its reason and under [`JOIN_REFUSED`].
+  Refused,
+}
+
+/// The status count under which a member records every fetch reply it refused, whatever the reason (each
+/// reason is counted apart as well: [`JoinRefusal::counter`]).
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+pub(crate) const JOIN_REFUSED: &str = "consensus_join_refused";
+
+/// Folds a voter's reply to this node's configuration fetch — on time or late, the one place a reply is
+/// judged, so the two paths cannot disagree. A failed join leaves the member unable to vote. Once
+/// initialized, even a delayed initial fetch cannot replace Raft state or erase a vote; only its newer
+/// applied view is considered. An empty reply is the voter's "nothing newer" ([`FetchOutcome::Current`]).
+pub(crate) fn adopt_fetch(
+  state: &mut ShardState,
+  root: bool,
+  peer: HostId,
+  bytes: &[u8],
+) -> FetchOutcome {
+  let refuse = |state: &mut ShardState, reason: JoinRefusal| {
+    for name in [reason.counter(root), JOIN_REFUSED] {
+      let count = state.refusals.entry(name).or_insert(0);
+      *count = count.saturating_add(1);
+    }
+    FetchOutcome::Refused
+  };
+  if bytes.is_empty() {
+    return FetchOutcome::Current;
+  }
   if !root && !crate::fleet::same_region(state, peer) {
-    return false;
+    return refuse(state, JoinRefusal::OtherRegion);
   }
   let Ok(reply) = Fetched::from_bytes(bytes) else {
-    return false;
+    return refuse(state, JoinRefusal::ReplyUndecodable);
   };
   let pending = state.recovery.target(root).cloned();
   if pending
@@ -184,36 +219,36 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
     .is_some_and(|target| target.group != reply.group)
     || (pending.is_none() && group_id(state, root).is_some_and(|group| group != reply.group))
   {
-    return false;
+    return refuse(state, JoinRefusal::ForeignGroup);
   }
   if let Some(join) = &reply.join
     && genesis(root, &join.origin) != reply.group
   {
-    return false;
+    return refuse(state, JoinRefusal::ForeignGenesis);
   }
   if root {
     let Ok(configuration) = decode_root_configuration(&reply.configuration) else {
-      return false;
+      return refuse(state, JoinRefusal::ConfigurationUndecodable);
     };
     if pending
       .as_ref()
       .is_some_and(|target| configuration.version < target.floor)
     {
-      return false;
+      return refuse(state, JoinRefusal::BelowFloor);
     }
     if pending.is_some() || !state.root.initialized() {
       let Some(join) = reply.join else {
-        return false;
+        return refuse(state, JoinRefusal::NoJoinState);
       };
       if join.raft.id != peer {
-        return false;
+        return refuse(state, JoinRefusal::JoinFromAnotherPeer);
       }
       let Ok(base) = decode_root_configuration(&join.base) else {
-        return false;
+        return refuse(state, JoinRefusal::BaseUndecodable);
       };
       let mut replacement = RootGroup::learner(state.fleet.host());
       if replacement.join_from(join.raft, base).is_err() {
-        return false;
+        return refuse(state, JoinRefusal::JoinRefused);
       }
       state.root = replacement;
       state.root_group = Some(GroupIdentity {
@@ -227,23 +262,23 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
     }
   } else {
     let Ok(configuration) = decode_regional_configuration(&reply.configuration) else {
-      return false;
+      return refuse(state, JoinRefusal::ConfigurationUndecodable);
     };
     if pending
       .as_ref()
       .is_some_and(|target| configuration.version < target.floor)
     {
-      return false;
+      return refuse(state, JoinRefusal::BelowFloor);
     }
     if pending.is_some() || !state.council.initialized() {
       let Some(join) = reply.join else {
-        return false;
+        return refuse(state, JoinRefusal::NoJoinState);
       };
       if join.raft.id != peer {
-        return false;
+        return refuse(state, JoinRefusal::JoinFromAnotherPeer);
       }
       let Ok(base) = decode_regional_configuration(&join.base) else {
-        return false;
+        return refuse(state, JoinRefusal::BaseUndecodable);
       };
       let mut replacement = RegionalCouncil::learner(
         state.fleet.host(),
@@ -252,7 +287,7 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
         base.has_mirror,
       );
       if replacement.join_from(join.raft, base).is_err() {
-        return false;
+        return refuse(state, JoinRefusal::JoinRefused);
       }
       state.council = replacement;
       state.council_group = Some(GroupIdentity {
@@ -265,7 +300,61 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
       state.council.adopt(configuration);
     }
   }
-  true
+  FetchOutcome::Adopted
+}
+
+/// Why a fetched configuration or join state was not adopted ([`adopt_fetch`]); each is counted under its own
+/// name, so a refused join says which rule refused it.
+#[derive(Clone, Copy)]
+enum JoinRefusal {
+  /// A regional fetch answered by a peer of another region.
+  OtherRegion,
+  /// The reply's bytes (not empty: an empty reply is [`FetchOutcome::Current`]) did not decode.
+  ReplyUndecodable,
+  /// The reply decoded, but the configuration it carries did not.
+  ConfigurationUndecodable,
+  /// The reply names a group other than the one this node belongs to or is recovering into.
+  ForeignGroup,
+  /// The join state's origin does not hash to the group the reply names.
+  ForeignGenesis,
+  /// The configuration is older than the recovery's floor.
+  BelowFloor,
+  /// An uninitialized node's fetch came back without the join state it needs.
+  NoJoinState,
+  /// The join state is another voter's, not the answering peer's.
+  JoinFromAnotherPeer,
+  /// The join state's base did not decode.
+  BaseUndecodable,
+  /// The group refused to install the join state (the saved log and its base disagree, or a reused identity).
+  JoinRefused,
+}
+
+impl JoinRefusal {
+  /// The refusal's status counter, per group.
+  fn counter(self, root: bool) -> &'static str {
+    match (root, self) {
+      (false, Self::OtherRegion) => "consensus.join.other_region",
+      (false, Self::ReplyUndecodable) => "consensus.join.reply_undecodable",
+      (false, Self::ConfigurationUndecodable) => "consensus.join.configuration_undecodable",
+      (false, Self::ForeignGroup) => "consensus.join.foreign_group",
+      (false, Self::ForeignGenesis) => "consensus.join.foreign_genesis",
+      (false, Self::BelowFloor) => "consensus.join.below_floor",
+      (false, Self::NoJoinState) => "consensus.join.no_join_state",
+      (false, Self::JoinFromAnotherPeer) => "consensus.join.from_another_peer",
+      (false, Self::BaseUndecodable) => "consensus.join.base_undecodable",
+      (false, Self::JoinRefused) => "consensus.join.refused_by_group",
+      (true, Self::OtherRegion) => "consensus.root_join.other_region",
+      (true, Self::ReplyUndecodable) => "consensus.root_join.reply_undecodable",
+      (true, Self::ConfigurationUndecodable) => "consensus.root_join.configuration_undecodable",
+      (true, Self::ForeignGroup) => "consensus.root_join.foreign_group",
+      (true, Self::ForeignGenesis) => "consensus.root_join.foreign_genesis",
+      (true, Self::BelowFloor) => "consensus.root_join.below_floor",
+      (true, Self::NoJoinState) => "consensus.root_join.no_join_state",
+      (true, Self::JoinFromAnotherPeer) => "consensus.root_join.from_another_peer",
+      (true, Self::BaseUndecodable) => "consensus.root_join.base_undecodable",
+      (true, Self::JoinRefused) => "consensus.root_join.refused_by_group",
+    }
+  }
 }
 
 /// A configuration publication to owner shards. Raft roles and votes remain on the control

@@ -48,7 +48,8 @@ mod common;
 use std::net::TcpStream;
 
 use common::nfs::{
-  create, lookup, lookup_carries_attributes, mount, owner_and_mode, read, read_status, write,
+  create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode, read,
+  read_status, write,
 };
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
@@ -4419,6 +4420,9 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
   let mut foreign = Client::connect(&foreign_instance);
   let looked_up = foreign.call(&RequestBody::Status { volume: id });
   let counters = foreign_daemon.fleet_refusals();
+  let successor_counters = successor_daemon
+    .fleet_refusals()
+    .map(|counters| location_counters(&counters));
   for daemon in daemons {
     daemon.stop();
   }
@@ -4432,7 +4436,11 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
   );
   assert!(
     matches!(looked_up, ReplyBody::Status { .. }),
-    "the round asked the successor once its session returned: {looked_up:?}"
+    "the round asked the successor once its session returned: {looked_up:?}; location counters at the \
+     foreign node {:?} and the successor {successor_counters:?}",
+    counters
+      .as_ref()
+      .map(|counters| location_counters(counters))
   );
   let counters = counters.expect("the foreign node's counters were read");
   assert!(
@@ -6064,7 +6072,7 @@ fn owners_over_nfs(daemon: &Daemon, name: &str) -> Owners {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
   let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
-  let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
+  let file_fh = lookup_or_describe(&mut stream, daemon, &root_fh, "hello.txt", 2);
   [
     owner_and_mode(&mut stream, &root_fh, 3),
     owner_and_mode(&mut stream, &file_fh, 4),
@@ -6076,8 +6084,26 @@ fn read_hello_over_nfs(daemon: &Daemon, name: &str) -> Vec<u8> {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
   let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
-  let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
+  let file_fh = lookup_or_describe(&mut stream, daemon, &root_fh, "hello.txt", 2);
   read(&mut stream, &file_fh, 3)
+}
+
+/// LOOKUP `name` under `root_fh` on `daemon`'s NFS port; a status other than `NFS3_OK` fails the test with the
+/// daemon described — its refusal counts, among them why a lease gate refused (`lease.refused.*`) — so a
+/// retry-later answer says which rule gave it.
+fn lookup_or_describe(
+  stream: &mut TcpStream,
+  daemon: &Daemon,
+  root_fh: &[u8],
+  name: &str,
+  xid: u32,
+) -> Vec<u8> {
+  lookup_status(stream, root_fh, name, xid).unwrap_or_else(|status| {
+    panic!(
+      "LOOKUP {name} answered status {status} on {}",
+      describe(&[daemon])
+    )
+  })
 }
 
 /// Provisions `name` on the owner (`daemons[0]`, reached at `instance`), writes [`CONTENT`] into it over

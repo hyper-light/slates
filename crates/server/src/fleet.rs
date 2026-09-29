@@ -4532,14 +4532,10 @@ fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
           }
         }
         LateReplies::ConfigFetch => {
-          if !crate::consensus::adopt_fetch(s, false, *peer, bytes) {
-            *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
-          }
+          crate::consensus::adopt_fetch(s, false, *peer, bytes);
         }
         LateReplies::RootFetch => {
-          if !crate::consensus::adopt_fetch(s, true, *peer, bytes) {
-            *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
-          }
+          crate::consensus::adopt_fetch(s, true, *peer, bytes);
         }
         // Folded on the seal's owner shard by [`fold_late_content`], outside this borrow.
         LateReplies::Content { .. } => {}
@@ -4706,29 +4702,29 @@ fn unsettled_neighbourhood(state: &ShardState, local: HostId) -> Option<(u64, u6
     .then_some((regional.version, current.generation))
 }
 
-/// Whether every record this shard owns is held by `f + 1` of each cohort of its current placement (§4.8 "the
-/// newest committed record is held by f+1 of the new candidates"): each volume's newest head, by the
+/// Whether every record this shard owns is held by `f + 1` of its cohort in the current neighbourhood (§4.8
+/// "the newest committed record is held by f+1 of the new candidates";
+/// [`slates_db::register::Configuration::placed_on_current`]): each volume's newest head, by the
 /// acknowledgements the record plane recorded for it, and each green's newest merge record
-/// ([`crate::merge_service::greens_placed_on_current_cohort`]). While this owner's neighbourhood change is in
-/// flight, its placement joins the settled and the current cohorts, so a head placed only on the settled one
-/// is not yet counted; the record plane re-ships it to the new candidates. True with nothing owned.
+/// ([`crate::merge_service::greens_placed_on_current_cohort`]). A head placed only on the settled cohort is not
+/// yet counted; the record plane re-ships it to the new candidates. The settled cohort is not asked: a joint
+/// write already reached it, and an old cohort that lost a host could never answer. True with nothing owned.
 fn records_placed_on_current_neighbourhood(state: &ShardState) -> bool {
   let config = state.fleet.configuration();
   let heads = state.volumes.iter().all(|(_, slot)| {
     let object = ObjectId(slot.id.bytes);
-    state.placed_heads.get(&object).is_some_and(|head| {
-      config
-        .place(object)
-        .placed_with(&head.placement.acked, config.quorum)
-    })
+    state
+      .placed_heads
+      .get(&object)
+      .is_some_and(|head| config.placed_on_current(object, &head.placement.acked))
   });
   heads && crate::merge_service::greens_placed_on_current_cohort(state)
 }
 
 /// Reports this node's neighbourhood change placed, once it is (§4.8 "Neighbourhood changes"; Vertical Paxos
 /// II's state transfer before the old configuration retires): while the council's current neighbourhood for
-/// this node differs from its settled one, every shard is asked whether all it owns is held by `f + 1` of each
-/// cohort of its current placement ([`records_placed_on_current_neighbourhood`]) under the very configuration
+/// this node differs from its settled one, every shard is asked whether all it owns is held by `f + 1` of its
+/// cohort in the current neighbourhood ([`records_placed_on_current_neighbourhood`]) under the very configuration
 /// version the report names; when all are, `Settle` for that neighbourhood's version goes to the council
 /// ([`send_council_report`]). Repeated each period until the installed configuration shows it settled; a report
 /// for a neighbourhood that moved on meanwhile changes nothing (the fold checks the version).
@@ -5787,11 +5783,9 @@ async fn drive_root_learner_fetch(
   let (replied, stragglers) =
     broadcast(requests, ROOT_FETCH_STREAM, Priority::Metadata, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
-  let mut fetched = Vec::new();
+  let mut fetched = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    if !reply.bytes.is_empty() {
-      fetched.push((host, reply.bytes));
-    }
+    fetched.push((host, reply.bytes));
     recovered.push((host, endpoint));
   }
   // A late fetch reply is adopted when it arrives (the coordinator settles the round's stragglers).
@@ -5804,9 +5798,7 @@ async fn drive_root_learner_fetch(
   return_sessions(recovered);
   state::with_state(|s| {
     for (peer, bytes) in &fetched {
-      if !crate::consensus::adopt_fetch(s, true, *peer, bytes) {
-        *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
-      }
+      crate::consensus::adopt_fetch(s, true, *peer, bytes);
     }
   });
 }
@@ -5859,11 +5851,9 @@ async fn drive_learner_fetch(
   let (replied, stragglers) =
     broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
   let mut recovered = Vec::with_capacity(replied.len());
-  let mut fetched = Vec::new();
+  let mut fetched = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
-    if !reply.bytes.is_empty() {
-      fetched.push((host, reply.bytes));
-    }
+    fetched.push((host, reply.bytes));
     recovered.push((host, endpoint));
   }
   // A late fetch reply is adopted when it arrives (the coordinator settles the round's stragglers).
@@ -5878,9 +5868,7 @@ async fn drive_learner_fetch(
   // learner on the highest version any reachable voter returned).
   state::with_state(|s| {
     for (peer, bytes) in &fetched {
-      if !crate::consensus::adopt_fetch(s, false, *peer, bytes) {
-        *s.refusals.entry("consensus_join_refused").or_insert(0) += 1;
-      }
+      crate::consensus::adopt_fetch(s, false, *peer, bytes);
     }
   });
 }

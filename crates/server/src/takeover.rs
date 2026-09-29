@@ -645,19 +645,17 @@ fn fold_answers(state: &mut ShardState, departed: HostId, answers: Vec<(HostId, 
 }
 
 /// The objects of `departed`'s takeover ready to adopt, each with the newest record reported for it: every
-/// one of its recovery cohorts has `f + 1` members that promised it — this node, a member whose answer is
-/// complete, or one that listed it. An object with a cohort of fewer than `f + 1` members left is lost, counted
-/// and never adopted.
-fn ready_objects(
+/// one of its recovery cohorts has its recovery quorum of members that promised it — `cohort − f`, `f + 1` at
+/// the floor, at least one ([`slates_db::register::Quorum::recovery`]) — this node, a member whose answer is
+/// complete, or one that listed it. An object with a cohort left with fewer members than that quorum is lost,
+/// counted and never adopted: more of that cohort failed than the region tolerates.
+pub(crate) fn ready_objects(
   state: &mut ShardState,
   departed: HostId,
   local: HostId,
 ) -> Vec<(ObjectId, Accepted)> {
   let regional = state.council.configuration().clone();
   let local_promises = gate_open(state, departed);
-  let needed = usize::try_from(regional.quorum.f)
-    .unwrap_or(usize::MAX)
-    .saturating_add(1);
   let Some(take) = state.host_takeovers.get_mut(&departed) else {
     return Vec::new();
   };
@@ -666,6 +664,7 @@ fn ready_objects(
   for (object, reports) in &take.learned {
     let mut promised_everywhere = true;
     for cohort in regional.recovery_cohorts(departed, *object) {
+      let needed = regional.quorum.recovery(cohort.len());
       let members: Vec<HostId> = cohort
         .into_iter()
         .filter(|host| regional.members.contains(host))

@@ -115,12 +115,26 @@ pub(crate) fn lookup_carries_attributes(
 
 /// NFS LOOKUP `name` in `dir_fh` → the child's file handle.
 pub(crate) fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+  lookup_status(stream, dir_fh, name, xid)
+    .unwrap_or_else(|status| panic!("LOOKUP {name}: status {status}, expected 0"))
+}
+
+/// NFS LOOKUP `name` in `dir_fh` → the child's file handle, or the status the server answered instead — so a
+/// test can report the server's state beside a retry-later (`NFS3ERR_JUKEBOX`) or stale answer.
+pub(crate) fn lookup_status(
+  stream: &mut TcpStream,
+  dir_fh: &[u8],
+  name: &str,
+  xid: u32,
+) -> Result<Vec<u8>, u32> {
   let mut args = Vec::new();
   opaque(dir_fh, &mut args);
   opaque(name.as_bytes(), &mut args);
   let reply = call(stream, NFS_PROGRAM, 3, &args, xid);
-  assert_eq!(status(&reply), 0, "LOOKUP {name}");
-  read_opaque(&reply, 4).0
+  match status(&reply) {
+    0 => Ok(read_opaque(&reply, 4).0),
+    answered => Err(answered),
+  }
 }
 
 /// NFS GETATTR of `fh` → its `(mode, uid, gid)` — what `stat` shows through a kernel mount, and what a

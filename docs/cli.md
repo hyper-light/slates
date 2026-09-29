@@ -178,8 +178,14 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 less one), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
 `fleet_takeovers_pending` (a retired owner's objects the council reassigned to it whose takeover has not
 finished: a takeover that stalls shows here) and `fleet_configuration_version` (the regional configuration
-it has installed; each admission or retirement advances it); then the two consensus groups as this node
-drives them — `fleet_council_leads` (whether
+it has installed; each admission, retirement, settlement and takeover confirmation advances it); then
+`fleet_settled_generation` and `fleet_neighbourhood_generation` (the versions its settled and its current
+neighbourhood were fixed at: they differ while its records are being moved onto a new neighbourhood), and one
+`fleet_retirement: host=… version=… survivors=[…] confirmed=[…] unconfirmed=[…]` line per retirement the
+council still keeps (the retired member, the version that retired it, the members its objects' successors are
+ranked among, those that have confirmed their share, and the takeovers it carried unconfirmed — a retirement
+whose survivors have not all confirmed is a takeover still running); then the two consensus groups as this
+node drives them — `fleet_council_leads` (whether
 this node is the regional configuration council's elected leader), `fleet_council_base_periods` and
 `fleet_council_span_periods` (the election timeout it derived, in coordinator periods: base
 `⌈10 × max(broadcast RTT tail, heartbeat) / heartbeat⌉`, the span the same over the RTT variation),

@@ -1435,6 +1435,34 @@ fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
   )
 }
 
+/// The takeover block of the fleet status (§4.8): this node's settled and current neighbourhood versions, then
+/// one line per retirement the configuration keeps — its version, survivors, confirmations and the takeovers it
+/// carries.
+fn takeover_text(report: &slates_client::TakeoverReport) -> String {
+  let ids = |hosts: &[u64]| {
+    hosts
+      .iter()
+      .map(u64::to_string)
+      .collect::<Vec<String>>()
+      .join(" ")
+  };
+  let mut out = format!(
+    "fleet_settled_generation: {}\nfleet_neighbourhood_generation: {}\n",
+    report.settled_generation, report.neighbourhood_generation
+  );
+  for retirement in &report.retirements {
+    out.push_str(&format!(
+      "fleet_retirement: host={} version={} survivors=[{}] confirmed=[{}] unconfirmed=[{}]\n",
+      retirement.host,
+      retirement.version,
+      ids(&retirement.survivors),
+      ids(&retirement.confirmed),
+      ids(&retirement.unconfirmed)
+    ));
+  }
+  out
+}
+
 /// The daemon's status: the daemon's lines, its place in the fleet (a laptop: `f` 0, itself the one
 /// member, no peers probed), then one block per shard with its health signals and its telemetry drain.
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
@@ -1461,6 +1489,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     report.fleet.takeovers_pending,
     report.fleet.configuration_version
   );
+  out.push_str(&takeover_text(&report.fleet.takeover));
   out.push_str(&group_text("council", &report.fleet.council));
   out.push_str(&group_text("root", &report.fleet.root));
   for shard in &report.shards {

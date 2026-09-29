@@ -1212,9 +1212,27 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
       "held_records": r.fleet.held_records,
       "takeovers_pending": r.fleet.takeovers_pending,
       "configuration_version": r.fleet.configuration_version,
+      "takeover": takeover_json(&r.fleet.takeover),
       "council": group_json(&r.fleet.council),
       "root": group_json(&r.fleet.root),
     },
+  })
+}
+
+/// The takeover block of the fleet status as JSON (§4.8): this node's settled and current neighbourhood
+/// versions and every retirement kept — the same fields the text form's `fleet_settled_generation`,
+/// `fleet_neighbourhood_generation` and `fleet_retirement` lines print.
+fn takeover_json(t: &slates_client::TakeoverReport) -> Value {
+  json!({
+    "settled_generation": t.settled_generation,
+    "neighbourhood_generation": t.neighbourhood_generation,
+    "retirements": t.retirements.iter().map(|r| json!({
+      "host": r.host,
+      "version": r.version,
+      "survivors": r.survivors,
+      "confirmed": r.confirmed,
+      "unconfirmed": r.unconfirmed,
+    })).collect::<Vec<_>>(),
   })
 }
 

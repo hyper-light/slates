@@ -4,7 +4,8 @@
 
 use slates_ipc::IpcError;
 use slates_ipc::protocol::{
-  DaemonReport, FleetReport, GroupReport, Refusal, ReplyBody, RequestBody, encode_body,
+  DaemonReport, FleetReport, GroupReport, Refusal, ReplyBody, RequestBody, RetirementReport,
+  TakeoverReport, encode_body,
 };
 use slates_ipc::status::collect;
 
@@ -54,6 +55,17 @@ fn report() -> ReplyBody {
         held_records: 37,
         takeovers_pending: 41,
         configuration_version: 43,
+        takeover: TakeoverReport {
+          settled_generation: 47,
+          neighbourhood_generation: 53,
+          retirements: vec![RetirementReport {
+            host: 59,
+            version: 61,
+            survivors: vec![19, 29],
+            confirmed: vec![29],
+            unconfirmed: vec![67],
+          }],
+        },
       },
     }),
   }

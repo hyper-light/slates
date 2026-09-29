@@ -126,6 +126,22 @@ impl Quorum {
   pub fn committed(self, acked: usize) -> bool {
     acked >= self.commit()
   }
+
+  /// Derived: the promises a takeover's phase one needs from a recovery cohort of `cohort` hosts before it
+  /// adopts, so that its answers meet every record that could have committed there. A commit is `f + 1`
+  /// acknowledgements of the cohort, so `cohort − f` promises meet every such set — `q1 + q2 > n`, the
+  /// intersection Flexible Paxos proves sufficient [A: Howard, Malkhi, Spiegelman, "Flexible Paxos:
+  /// Quorum intersection revisited", OPODIS 2016] — and one fewer can miss one. At the candidate floor
+  /// (`cohort = 2f + 1`) that is `f + 1`. A cohort a forming region fixed with fewer hosts needs fewer: a
+  /// commit there is held by more of its hosts, so fewer answers meet it (two hosts at `f = 1` commit only with
+  /// both, so either one's promise suffices); demanding `f + 1` there declared a record lost while its cohort's
+  /// survivor held it. A cohort of `f` or fewer hosts never committed anything, yet a round adopts only what a
+  /// promise reports, so it needs one.
+  pub fn recovery(self, cohort: usize) -> usize {
+    cohort
+      .saturating_sub(usize::try_from(self.f).unwrap_or(usize::MAX))
+      .max(1)
+  }
 }
 
 /// A host's monotonic authority over the objects it owns (§4.8 "Leases and reads"): a holder
@@ -1728,6 +1744,17 @@ impl Configuration {
     placement
   }
 
+  /// Whether a record of `object` acknowledged by `acked` is held by `f + 1` of its cohort in the current
+  /// neighbourhood — the readiness §4.8 "Neighbourhood changes" names for the old set to retire ("the newest
+  /// committed record is held by f+1 of the new candidates"). The old cohort is deliberately not asked: every
+  /// record committed while the change is in flight already reached `f + 1` of it, and once the council settles
+  /// the current neighbourhood a takeover recovers through that one, so its holding the newest record is the
+  /// whole of the state transfer. Judging the joint shape instead kept an owner whose old cohort lost a host
+  /// unsettled for good — that cohort can never again gather `f + 1` — and so every write it made unplaced.
+  pub fn placed_on_current(&self, object: ObjectId, acked: &[HostId]) -> bool {
+    self.place_content(object).placed_with(acked, self.quorum)
+  }
+
   /// The placement **content** of `object` takes (§4.10): its cohort in the current neighbourhood alone. Content
   /// is fetched by identity from the holders the head names, so it needs no joint placement across a change.
   pub fn place_content(&self, object: ObjectId) -> Placement {
@@ -2526,6 +2553,55 @@ mod tests {
       .collect();
     let mut refs: Vec<&mut dyn Holder> = holders.iter_mut().map(|h| h as &mut dyn Holder).collect();
     commit_over_holders(&candidates, &record, &mut refs)
+  }
+
+  /// Shape: the largest `f` the exhaustive quorum oracles enumerate — cohorts up to `2f + 1 = 7` hosts, so
+  /// every subset of a cohort is a 7-bit mask.
+  const ORACLE_MAX_F: u32 = 3;
+
+  /// The subsets of `hosts` hosts (as bit masks) with exactly `size` members.
+  fn subsets_of_size(hosts: usize, size: usize) -> impl Iterator<Item = u32> {
+    (0..1u32 << hosts).filter(move |mask| mask.count_ones() as usize == size)
+  }
+
+  /// §4.8 "Promotion and takeover" (Flexible Paxos's `q1 + q2 > n`): for every `f` up to [`ORACLE_MAX_F`] and every
+  /// cohort a region can fix — one host up to the `2f + 1` floor — a phase one of [`Quorum::recovery`] promises from
+  /// the cohort's survivors (the retired owner, host 0, excluded) meets every `f + 1` commit the cohort could have
+  /// made, the retired owner's own acknowledgement among it or not; and one promise fewer misses some commit
+  /// wherever a smaller round could adopt at all. At the floor the rule is `f + 1`.
+  #[test]
+  fn a_recovery_quorum_meets_every_commit_its_cohort_could_make_and_no_smaller_one_does() {
+    for f in 0..=ORACLE_MAX_F {
+      let quorum = Quorum { f };
+      for hosts in 1..=quorum.candidates() {
+        let promises = quorum.recovery(hosts);
+        let survivors = (1u32 << hosts) - 2;
+        let commits: Vec<u32> = subsets_of_size(hosts, quorum.commit()).collect();
+        let rounds: Vec<u32> = subsets_of_size(hosts, promises)
+          .filter(|round| round & !survivors == 0)
+          .collect();
+        for commit in &commits {
+          for round in &rounds {
+            assert_ne!(
+              commit & round,
+              0,
+              "f = {f}, {hosts} hosts: a round of {promises} meets every commit"
+            );
+          }
+        }
+        if promises > 1 {
+          let missed = subsets_of_size(hosts, promises - 1)
+            .filter(|round| round & !survivors == 0)
+            .any(|round| commits.iter().any(|commit| commit & round == 0));
+          assert!(
+            missed,
+            "f = {f}, {hosts} hosts: {} promises can miss a commit",
+            promises - 1
+          );
+        }
+      }
+      assert_eq!(quorum.recovery(quorum.candidates()), quorum.commit());
+    }
   }
 
   /// AC-2.5 (the register slice): the observable outcome of a write — placed or not, and the
@@ -3553,6 +3629,54 @@ mod tests {
           != configuration.place_content(*object).candidates
       });
     (regional, owner, configuration, moved, kept)
+  }
+
+  /// §4.8 "Neighbourhood changes" ("the group retires the old set only after … the newest committed record is
+  /// held by f+1 of the new candidates"): readiness to settle is judged on the current cohort alone. An owner
+  /// admitted beside the bootstrap alone is settled on those two hosts; when the bootstrap dies before the
+  /// owner reports its later neighbourhood, its old cohort can never again gather `f + 1`, so a joint write
+  /// cannot place — and readiness judged on the joint shape would keep the owner unsettled, and every write it
+  /// makes unplaced, for good. Its head held by `f + 1` of the current cohort is what lets it settle.
+  #[test]
+  fn an_owner_whose_old_cohort_lost_a_host_is_ready_once_its_current_cohort_holds_its_head() {
+    let quorum = Quorum { f: 1 };
+    let (bootstrap, owner, third) = (HostId(1), HostId(2), HostId(3));
+    let mut regional = RegionalConfiguration::formed(
+      vec![bootstrap],
+      quorum,
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    assert!(regional.admit(owner, None, 3));
+    assert!(regional.admit(third, None, 3));
+    regional.take_over(bootstrap, 3);
+    let configuration = regional.configuration_for(owner).unwrap();
+    let object = ObjectId::new(owner, 0);
+    let old = configuration
+      .settled
+      .as_ref()
+      .map(|settled| settled.cohort(owner, object, quorum))
+      .unwrap_or_default();
+    assert_eq!(
+      old,
+      vec![owner, bootstrap],
+      "the owner is still settled beside the bootstrap"
+    );
+    assert!(
+      !configuration
+        .place(object)
+        .placed_with(&[owner, third], quorum),
+      "a joint write cannot place while the old cohort has lost a host"
+    );
+    assert!(
+      configuration.placed_on_current(object, &[owner, third]),
+      "the head at f + 1 of the current cohort readies the settlement"
+    );
+    assert!(
+      !configuration.placed_on_current(object, &[owner, bootstrap]),
+      "the old cohort's acknowledgements do not count toward the new one"
+    );
   }
 
   /// §4.8 "Neighbourhood changes" (joint writes): while an owner's change is in flight, a record of an object

@@ -588,6 +588,40 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
   }
 }
 
+/// The takeover state as this shard's council holds it (§4.8 "Neighbourhood changes", "Promotion and
+/// takeover"): this node's settled and current neighbourhood versions, and every retirement kept — what a
+/// status report shows so a stalled takeover says why.
+fn takeover_report(state: &ShardState) -> slates_ipc::protocol::TakeoverReport {
+  let regional = state.council.configuration();
+  let local = state.fleet.host();
+  let ids = |hosts: &[HostId]| hosts.iter().map(|host| host.0).collect::<Vec<u64>>();
+  let mut retirements: Vec<slates_ipc::protocol::RetirementReport> = regional
+    .retired
+    .iter()
+    .map(
+      |(host, retirement)| slates_ipc::protocol::RetirementReport {
+        host: host.0,
+        version: retirement.version,
+        survivors: ids(&retirement.survivors),
+        confirmed: ids(&retirement.confirmed),
+        unconfirmed: ids(&retirement.unconfirmed),
+      },
+    )
+    .collect();
+  retirements.sort_by_key(|retirement| retirement.version);
+  slates_ipc::protocol::TakeoverReport {
+    settled_generation: regional
+      .settled
+      .get(&local)
+      .map_or(0, |settled| settled.generation),
+    neighbourhood_generation: regional
+      .neighbourhoods
+      .get(&local)
+      .map_or(0, |neighbourhood| neighbourhood.generation),
+    retirements,
+  }
+}
+
 /// The objects this node's takeovers have learned and not yet adopted (§4.8 "Promotion and takeover"; the
 /// takeover module): what a status report shows as pending, so a stalled takeover shows in any node's status.
 fn takeovers_pending(state: &ShardState) -> u64 {
@@ -599,27 +633,36 @@ fn takeovers_pending(state: &ShardState) -> u64 {
   u64::try_from(pending).unwrap_or(u64::MAX)
 }
 
-/// Whether this node's authority over `object`'s latest state is **not** confirmed right now, and the
-/// configuration version it would refuse with (§4.8 "Leases and reads"; AUD-08). Reads the fanned owner
-/// lease against the object's candidate holders under the installed configuration and the host clock, so a
-/// paused shard's lease has already lapsed by the clock when it resumes. `None` — confirmed, serve — when
-/// `f` of the other candidates confirmed within the lease bound (or within the bounded startup allowance),
-/// and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate ([`dispatch`]) and the mount
-/// bridge ([`crate::nfs`]).
-pub(crate) fn lease_unconfirmed(state: &ShardState, object: ObjectId) -> Option<u64> {
+/// The owner lease's verdict on `object`'s latest state here (§4.8 "Leases and reads"; AUD-08). Reads the
+/// fanned owner lease against the object's candidate holders under the installed configuration and the host
+/// clock, so a paused shard's lease has already lapsed by the clock when it resumes. It holds when `f` of the
+/// other candidates (every one of them when there are fewer) confirmed within the lease bound, within the
+/// bounded startup allowance, and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate
+/// ([`dispatch`]), the mount bridge ([`crate::nfs`]) and the daemon's test observation.
+pub(crate) fn lease_verdict(state: &ShardState, object: ObjectId) -> crate::lease::LeaseVerdict {
   let config = state.fleet.configuration();
   // The cohort a successor's promotion quorum is drawn from: the settled one while this owner's neighbourhood
   // change is in flight (every record it commits is at `f + 1` of it), else the current one.
   let candidates = config.recovery_cohort(object);
   let now = slates_machine::clock::monotonic_ns();
-  let holds = state.lease.holds(
+  state.lease.verdict(
     now,
     config.owner,
     config.version,
     config.quorum,
     &candidates,
-  );
-  (!holds).then_some(config.version)
+  )
+}
+
+/// The configuration version a latest-state request on `object` is refused under while the owner lease does
+/// not hold ([`lease_verdict`]), or `None` when it holds. Each refusal is counted by its reason
+/// ([`crate::lease::LEASE_SUPERSEDED`], [`crate::lease::LEASE_UNCONFIRMED`]), so a status report tells a
+/// supersession from missing confirmations.
+pub(crate) fn lease_refusal(state: &mut ShardState, object: ObjectId) -> Option<u64> {
+  let reason = lease_verdict(state, object).refusal_count_name()?;
+  let count = state.refusals.entry(reason).or_insert(0);
+  *count = count.saturating_add(1);
+  Some(state.fleet.configuration().version)
 }
 
 /// Whether a verb is a **read** safe to forward to a volume's owner without a completion record: a
@@ -1843,6 +1886,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     held_records: u64::try_from(state.holder_records.len()).unwrap_or(u64::MAX),
     takeovers_pending: takeovers_pending(state),
     configuration_version: state.fleet.configuration().version,
+    takeover: takeover_report(state),
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
   }
@@ -1919,6 +1963,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let control = shards.iter().find(|shard| shard.control);
   let council = control.map_or_else(|| council_report(state), |shard| shard.council.clone());
   let root = control.map_or_else(|| root_report(state), |shard| shard.root.clone());
+  let takeover = control.map_or_else(|| takeover_report(state), |shard| shard.takeover.clone());
   let (held_records, takeovers_pending, configuration_version) = control.map_or_else(
     || {
       (
@@ -1958,6 +2003,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     held_records,
     takeovers_pending,
     configuration_version,
+    takeover,
   }
 }
 
@@ -2145,7 +2191,7 @@ fn dispatch(
   // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
   if let Some(volume) = serves_latest_state(&body)
     && state.db.partition().volume(to_db_volume(volume)).is_some()
-    && let Some(version) = lease_unconfirmed(state, ObjectId(volume.bytes))
+    && let Some(version) = lease_refusal(state, ObjectId(volume.bytes))
   {
     return refused(Refusal::LeaseUnconfirmed { version });
   }

@@ -1916,6 +1916,66 @@ Built last: the takeover itself (step 3 of 3), replacing the per-object path.
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
 stalled takeover shows in any node's status.
 
+### 2026-09-29: a formation cohort lost a record its survivor held — fixed; readiness asked a cohort that could not answer — fixed; lease refusals on CI — open
+
+A Linux io_uring loop of the three-process CLI test failed once in 118 runs. Both survivors held the dead
+owner's head, and neither ever served it. The new status lines named the cause:
+- no retirement was left;
+- the council's leader counted `fleet.takeover.lost: 2`.
+
+`bootstrap` forms a region with one node, and the leader admits the others one by one. The owner was admitted
+beside the bootstrap alone and died before it reported its later neighbourhood placed. Its recovery cohort
+therefore had two hosts, one of them alive. The round demanded `f + 1 = 2` live promisers, found one, and called
+the object lost.
+- A phase one needs `cohort − f` promises (`Quorum::recovery`; Flexible Paxos's `q1 + q2 > n`). That is
+  `f + 1` at the floor, and one survivor of a two-host cohort at `f = 1`, since both hosts hold every commit
+  there.
+- The lease's bound moves with it, to `min(f, others)`. An exhaustive oracle showed that the old
+  `others − f` would have held a lease on zero confirmations while a single promise promoted.
+- Found by reading: readiness to settle was judged on the joint shape. An owner whose old cohort lost a host
+  could then never settle, and no write of its would ever place. It is now judged on the current cohort, as
+  §4.8 says.
+- Tests:
+  - `a_takeover_recovers_an_owner_settled_beside_one_host_from_that_host` (red: lost 1);
+  - two exhaustive quorum oracles (db and lease; each red under the old rule);
+  - `an_owner_whose_old_cohort_lost_a_host_is_ready_once_its_current_cohort_holds_its_head` (red).
+- Reported siblings: the modelled ledger's `take_over` and `Promotion::promoted` still count `f + 1`. The
+  cluster crate's `promote_ledger_record` is no longer called by the daemon and survives only with its test.
+
+**Fixed — a late empty fetch reply counted as a refused join.** The same loop's other two failures (runs 125
+and 147) were formation failures on `consensus.join.undecodable` and `consensus_join_refused`. A voter answers
+a caught-up member's fetch with no bytes. The on-time fold skipped such a reply, but the late fold passed it to
+`adopt_fetch`, which failed to decode it and counted a refused join.
+- `adopt_fetch` is now the one judge of a reply (`FetchOutcome`: adopted, current, refused), counting
+  refusals itself.
+- The undecodable reason is split in two: a torn reply is told apart from a configuration that fails to
+  decode.
+- Failing test first: `an_empty_fetch_reply_is_neither_adopted_nor_a_refused_join`.
+[Bug record](../bugs/2026-09-29-a-late-empty-fetch-reply-counted-as-a-refused-join.md).
+
+**Built for the diagnosis:**
+- status lists each kept retirement (`fleet_retirement`) and the node's settled and current neighbourhood
+  versions;
+- each refused join is counted by its rule (`consensus.join.*`, `consensus.root_join.*`);
+- each latest-state refusal is counted by its reason (`lease.refused.superseded`,
+  `lease.refused.unconfirmed`).
+
+**Open — CI run 36603261909's two failures are owner-lease refusals.** One is the NFS takeover test's
+`NFS3ERR_JUKEBOX`, the other the CLI mount's `LeaseUnconfirmed { version: 3 }`. The lease and every record key
+on the one regional version, which each `Settle` and `Confirm` now advances. That churn is the hypothesis, and
+it is unproven until the refusal's reason is counted.
+
+**Open — the location test's `HomedElsewhere` (CI on `84cc9c1`) recurred locally, once in a suite run.**
+- At the asking node the round met the successor's session out, asked it once it returned, and found no
+  owner.
+- At the successor, one `fleet.owner_location.foreign_view` was counted.
+- That counter covered five conditions. One of them is this node's placement not yet having installed its
+  council's configuration: a window of up to a coordinator period after every commit, `Settle` and `Confirm`
+  included.
+- The serve side now counts each condition apart (`not_ready`, `root_view_differs`, `outside_home`,
+  `placement_behind`). The cause is unproven until the next failure names it.
+[Bug record](../bugs/2026-09-29-a-formation-cohort-lost-a-record-its-survivor-held.md).
+
 ### 2026-09-29: holders promised a takeover without the lease gate — fixed
 
 Found while reading the takeover path for the open stall above. The owner lease (AUD-08) needs `others − f`

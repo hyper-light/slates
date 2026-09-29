@@ -322,10 +322,15 @@ fn is_mounted(path: &str) -> bool {
     .any(|line| line.contains(path))
 }
 
-/// `slates mount ID DIR` reports the path and the kernel mount table lists a real NFS mount there.
+/// `slates mount ID DIR` reports the path and the kernel mount table lists a real NFS mount there. A refused
+/// mount fails with the daemon's status, whose refusal counts say which rule refused it (a lease refusal is
+/// counted `lease.refused.superseded` or `lease.refused.unconfirmed`).
 fn mount_and_check(instance: &str, id: &str, path: &str) {
   let (code, out, err) = run(instance, &["mount", id, path]);
-  assert_eq!(code, 0, "slates mount failed: {err}");
+  if code != 0 {
+    let (_, status, status_err) = run(instance, &["status"]);
+    panic!("slates mount failed: {err}\n--- {instance} status:\n{status}{status_err}");
+  }
   assert_eq!(
     value_of(&out, "mounted"),
     path,

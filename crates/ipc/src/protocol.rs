@@ -816,6 +816,8 @@ pub struct ShardReport {
   pub takeovers_pending: u64,
   /// The version of the regional configuration this shard has installed.
   pub configuration_version: u64,
+  /// The takeover state as this shard's council holds it (live on the control shard).
+  pub takeover: TakeoverReport,
   /// Task admissions this shard's runtime arena refused since boot (§4.3 "a task exceeding the budget
   /// is a counted bug signal"; §4.14): the shard's derived task budget covers every task the daemon
   /// spawns on it — clients' cross-shard work, its own loops, the fleet's share — so a count here is a
@@ -863,6 +865,37 @@ pub struct FleetReport {
   /// The version of the regional configuration the control shard has installed: a retirement or an
   /// admission advances it.
   pub configuration_version: u64,
+  /// The takeover state as the control shard's council holds it: this node's neighbourhood settlement and
+  /// every retirement kept, so a takeover that stalls shows why in any node's status.
+  pub takeover: TakeoverReport,
+}
+
+/// The takeover state a council holds (§4.8 "Neighbourhood changes", "Promotion and takeover"): this node's
+/// settled and current neighbourhood versions, and every retirement the configuration keeps.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct TakeoverReport {
+  /// The version this node's settled neighbourhood was fixed at — the set its records are all placed on.
+  pub settled_generation: u64,
+  /// The version its current neighbourhood was fixed at: equal to the settled one outside a change in
+  /// flight.
+  pub neighbourhood_generation: u64,
+  /// The retirements the configuration keeps, oldest first.
+  pub retirements: Vec<RetirementReport>,
+}
+
+/// One retirement the configuration keeps (§4.8 "Promotion and takeover").
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct RetirementReport {
+  /// The retired host.
+  pub host: u64,
+  /// The configuration version that retired it.
+  pub version: u64,
+  /// The members its objects' successors are ranked among, fixed at the retirement.
+  pub survivors: Vec<u64>,
+  /// The survivors that confirmed their share of its takeover.
+  pub confirmed: Vec<u64>,
+  /// The retired hosts whose takeover it had not confirmed its share of when it retired.
+  pub unconfirmed: Vec<u64>,
 }
 
 /// The daemon's status.

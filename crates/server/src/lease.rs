@@ -18,18 +18,21 @@
 //! others it holds `f + 1` — a quorum of the copyset ([`OwnerLease::holds`], [`confirmations_needed`]).
 //!
 //! **Why that is safe (the intersection).** A successor serves an object only after phase one over the
-//! object's surviving candidates — `f + 1` promises out of the `2f` survivors. A holder answers a
+//! object's surviving candidates — at the floor, `f + 1` promises out of the `2f` survivors. A holder answers a
 //! promotion for a departed owner only once it has **not** answered that owner alive for the horizon
 //! ([`AnswersGiven::promotion_open`]) — or once the owner has announced it saw the configuration that
 //! retired it (then the owner refuses everything itself, and yields its objects on re-admission). Any
 //! `f + 1` of the `2f` survivors intersect any `f` of them, so while the owner's lease holds, at least one
 //! holder of every possible promotion quorum is still refusing the promotion: no successor adopts, so no
-//! stale answer is possible. Below the floor — a region of fewer than `2f + 1` members, so an object with
-//! fewer other candidates — the same intersection needs fewer: `others − f`, and none once `f + 1` promises
-//! cannot be gathered at all. Demanding `f` there refused a lone owner its own objects for good once its
-//! startup allowance ran out, though no successor could ever adopt them (2026-09-29). The owner's bound is the holder's less the clock-rate tolerance (twice
-//! RFC 5905's 500 ppm: its own clock slow, the holder's fast), measured from the probe's **send** time —
-//! before the holder formed its answer.
+//! stale answer is possible. Below the floor — a cohort a forming region fixed with fewer hosts — a promotion
+//! needs fewer promises (`cohort − f`, at least one: [`Quorum::recovery`]), so the same intersection needs
+//! every other candidate up to `f` (`min(f, others)`), and a lone owner, with no other candidate, needs none.
+//! Demanding `f` of a lone owner refused it its own objects for good once its startup allowance ran out
+//! (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`); counting `f + 1` promises in a two-host
+//! cohort lost records its survivor held, and the lease's bound moved with the corrected promotion
+//! (`docs/bugs/2026-09-29-a-formation-cohort-lost-a-record-its-survivor-held.md`). The owner's bound is the
+//! holder's less the clock-rate tolerance (twice RFC 5905's 500 ppm: its own clock slow, the holder's fast),
+//! measured from the probe's **send** time — before the holder formed its answer.
 //!
 //! **Pauses, expiry, takeover.** The lease is checked per request against the host's suspend-inclusive
 //! monotonic clock (`slates_machine::clock`), never against a loop having run: a paused owner's lease
@@ -167,17 +170,18 @@ impl OwnerLease {
   /// are `candidates` (this node among them) at `now_ns` — not superseded, and either within the bounded
   /// startup allowance of the current configuration ([`OwnerLease::configuration_installed_ns`]) or with
   /// enough of the other candidates having confirmed it within [`lease_bound_ns`] under the installed
-  /// `version` ([`confirmations_needed`]: `f` at the `2f + 1` floor, fewer below it).
-  pub fn holds(
+  /// `version` ([`confirmations_needed`]: `f`, or every other candidate when there are fewer). A refusal says
+  /// which of the two it is, so a refused read can be told apart in the status counts.
+  pub fn verdict(
     &self,
     now_ns: u64,
     local: HostId,
     version: u64,
     quorum: Quorum,
     candidates: &[HostId],
-  ) -> bool {
-    if self.superseded.is_some() {
-      return false;
+  ) -> LeaseVerdict {
+    if let Some(newer) = self.superseded {
+      return LeaseVerdict::Superseded { newer };
     }
     let others = candidates.iter().filter(|host| **host != local);
     let needed = confirmations_needed(others.clone().count(), quorum);
@@ -189,30 +193,83 @@ impl OwnerLease {
         })
       })
       .count();
-    if fresh >= needed {
-      return true;
-    }
     // The bounded startup allowance: within the membership horizon of installing this configuration, no
     // successor can yet exist (the council's death-confirmation window exceeds the horizon), so a reachable
     // owner still gathering its first acks under the new version serves rather than false-refusing.
-    self
+    let allowed = self
       .configuration_installed_ns
-      .is_some_and(|installed| now_ns.saturating_sub(installed) <= horizon_ns())
+      .is_some_and(|installed| now_ns.saturating_sub(installed) <= horizon_ns());
+    if fresh >= needed || allowed {
+      LeaseVerdict::Holds
+    } else {
+      LeaseVerdict::Unconfirmed { fresh, needed }
+    }
   }
 }
 
+/// Whether an owner's lease holds on an object, and if not, why ([`OwnerLease::verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseVerdict {
+  /// The owner may serve the object's latest state.
+  Holds,
+  /// A peer announced configuration `newer`, which this node has not installed: its authority is uncertain
+  /// until it does.
+  Superseded {
+    /// The newest version a peer announced.
+    newer: u64,
+  },
+  /// Past the startup allowance, fewer of the object's other candidates confirmed this node within the bound,
+  /// under its installed version, than the intersection needs.
+  Unconfirmed {
+    /// The fresh confirmations counted.
+    fresh: usize,
+    /// The confirmations needed ([`confirmations_needed`]).
+    needed: usize,
+  },
+}
+
+impl LeaseVerdict {
+  /// Whether the lease holds.
+  pub fn holds(self) -> bool {
+    self == LeaseVerdict::Holds
+  }
+
+  /// The status count a refusal on this verdict is recorded under, `None` when the lease holds.
+  pub fn refusal_count_name(self) -> Option<&'static str> {
+    match self {
+      LeaseVerdict::Holds => None,
+      LeaseVerdict::Superseded { .. } => Some(LEASE_SUPERSEDED),
+      LeaseVerdict::Unconfirmed { .. } => Some(LEASE_UNCONFIRMED),
+    }
+  }
+}
+
+/// The status count under which an owner records a latest-state request it refused because a peer announced a
+/// configuration it has not installed.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+pub const LEASE_SUPERSEDED: &str = "lease.refused.superseded";
+
+/// The status count under which an owner records a latest-state request it refused past its startup allowance
+/// because too few of the object's other candidates confirmed it under its installed version.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+pub const LEASE_UNCONFIRMED: &str = "lease.refused.unconfirmed";
+
 /// Derived: how many of an object's `others` (its candidate holders other than the owner) must have freshly
 /// confirmed the owner for its lease to hold: as many as leave no promotion quorum without one. A successor
-/// adopts only on `f + 1` promises from the surviving candidates (§4.8 "Promotion"; `collect_promises`), and a
+/// adopts only on [`Quorum::recovery`] promises from the object's cohort — `cohort − f`, at least one, drawn
+/// from the `others` since the retired owner never promises (§4.8 "Promotion"; `crate::takeover`) — and a
 /// holder that confirmed the owner refuses to promise until that lease can have lapsed
-/// ([`AnswersGiven::promotion_open`]), so the owner needs `others − f` confirmations: then any `f + 1` of the
-/// others include one of them. At the candidate floor, `2f` others, that is `f`; with `f` or fewer others no
-/// `f + 1` promises can be gathered, no successor can adopt, and the owner needs none — a region smaller than
-/// the floor (one node at `f = 1`), where demanding `f` refused the owner its own objects for good once its
-/// startup allowance ran out (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`). `f = 0` (the
-/// laptop) needs none by the same arithmetic (R8).
+/// ([`AnswersGiven::promotion_open`]). The confirmations meet every such quorum once more than
+/// `others − promises` of them are fresh, which is `min(f, others)`: `f` whenever the cohort holds more than `f`
+/// hosts (at the candidate floor, `2f` others, as before), and every other candidate in a smaller cohort, where
+/// a single promise already promotes. A lone owner has no others and needs none, so it keeps serving its own
+/// objects past its startup allowance (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`); `f = 0`
+/// (the laptop) needs none by the same arithmetic (R8). The earlier `others − f` matched a promotion rule of
+/// `f + 1` promises, which declared a record lost while its formation cohort's survivor held it; with the
+/// recovery quorum it would have let an owner settled beside one host serve on no confirmation while that host
+/// alone promoted a successor (`docs/bugs/2026-09-29-a-formation-cohort-lost-a-record-its-survivor-held.md`).
 pub fn confirmations_needed(others: usize, quorum: Quorum) -> usize {
-  others.saturating_sub(usize::try_from(quorum.f).unwrap_or(usize::MAX))
+  others.min(usize::try_from(quorum.f).unwrap_or(usize::MAX))
 }
 
 /// The holder side of the lease: when this node last answered each peer's direct probe — a lease-confirming
@@ -309,13 +366,17 @@ mod tests {
     let mut lease = OwnerLease::default();
     let now = 10 * lease_bound_ns();
     lease.configuration_installed_ns = Some(0); // installed long ago: no startup allowance
-    assert!(!lease.holds(now, LOCAL, 4, one, &candidates));
-    assert!(lease.holds(now, LOCAL, 4, Quorum { f: 0 }, &[LOCAL]));
+    assert!(!lease.verdict(now, LOCAL, 4, one, &candidates).holds());
+    assert!(
+      lease
+        .verdict(now, LOCAL, 4, Quorum { f: 0 }, &[LOCAL])
+        .holds()
+    );
 
     lease.confirm(X, now - lease_bound_ns(), 4);
-    let at_bound = lease.holds(now, LOCAL, 4, one, &candidates);
-    let past_bound = lease.holds(now + 1, LOCAL, 4, one, &candidates);
-    let wrong_version = lease.holds(now, LOCAL, 5, one, &candidates);
+    let at_bound = lease.verdict(now, LOCAL, 4, one, &candidates).holds();
+    let past_bound = lease.verdict(now + 1, LOCAL, 4, one, &candidates).holds();
+    let wrong_version = lease.verdict(now, LOCAL, 5, one, &candidates).holds();
     assert!(at_bound, "exactly at the bound still holds");
     assert!(!past_bound, "one past it lapses");
     assert!(!wrong_version, "wrong version does not count");
@@ -324,53 +385,106 @@ mod tests {
     let two = Quorum { f: 2 };
     let five = [LOCAL, X, Y, HostId(4), HostId(5)];
     assert!(
-      lease.holds(now + 1, LOCAL, 4, one, &candidates),
+      lease.verdict(now + 1, LOCAL, 4, one, &candidates).holds(),
       "the fresher Y confirms"
     );
     assert!(
-      !lease.holds(now + 1, LOCAL, 4, two, &five),
+      !lease.verdict(now + 1, LOCAL, 4, two, &five).holds(),
       "f = 2 needs two fresh: X has lapsed"
     );
   }
 
-  /// Below the candidate floor fewer confirmations are needed, by the same intersection: a successor needs
-  /// `f + 1` promises from the object's other candidates, so the owner needs as many fresh confirmations as
-  /// leave no `f + 1` of them unconfirmed — none once there are `f` or fewer, since no promotion can then be
-  /// gathered at all (a region smaller than the floor). At the floor it is `f`, as before. The configuration
-  /// was installed long ago, so the startup allowance never applies here.
+  /// Below the candidate floor the intersection asks for every other candidate up to `f`: a successor needs
+  /// [`Quorum::recovery`] promises of the object's cohort, which a cohort of `f` or fewer others meets with a single
+  /// promise (every commit there is held by all of them), so the owner needs each of them fresh; a lone owner has
+  /// none to ask and needs none. At the floor it is `f`, as before. The configuration was installed long ago, so
+  /// the startup allowance never applies here.
   #[test]
-  fn below_the_candidate_floor_the_intersection_needs_fewer_confirmations() {
+  fn below_the_candidate_floor_the_owner_needs_every_other_candidate_up_to_f() {
     let one = Quorum { f: 1 };
     let two = Quorum { f: 2 };
     let mut lease = OwnerLease::default();
     let now = 10 * lease_bound_ns();
     lease.configuration_installed_ns = Some(0);
     assert!(
-      lease.holds(now, LOCAL, 4, one, &[LOCAL]),
+      lease.verdict(now, LOCAL, 4, one, &[LOCAL]).holds(),
       "alone at f = 1: no successor can be promoted"
     );
     assert!(
-      lease.holds(now, LOCAL, 4, one, &[LOCAL, X]),
-      "one other candidate cannot give the f + 1 = 2 promises a promotion needs"
+      !lease.verdict(now, LOCAL, 4, one, &[LOCAL, X]).holds(),
+      "beside one host at f = 1: that host's promise alone promotes, so it must confirm"
+    );
+    lease.confirm(X, now, 4);
+    assert!(
+      lease.verdict(now, LOCAL, 4, one, &[LOCAL, X]).holds(),
+      "its fresh confirmation holds the lease"
     );
     assert!(
-      !lease.holds(now, LOCAL, 4, one, &[LOCAL, X, Y]),
-      "at the floor f = 1 still needs one"
+      lease.verdict(now, LOCAL, 4, one, &[LOCAL, X, Y]).holds(),
+      "at the floor f = 1 needs one"
     );
     let four = [LOCAL, X, Y, HostId(4)];
     assert!(
-      !lease.holds(now, LOCAL, 4, two, &four),
-      "three others at f = 2: any 3 promises include all of them, so one must confirm"
+      !lease.verdict(now, LOCAL, 4, two, &four).holds(),
+      "three others at f = 2: two promises promote, so one confirmation leaves two unconfirmed"
     );
     lease.confirm(Y, now, 4);
     assert!(
-      lease.holds(now, LOCAL, 4, two, &four),
-      "one fresh of the three others intersects every promotion quorum"
+      lease.verdict(now, LOCAL, 4, two, &four).holds(),
+      "two fresh of the three others meet every pair of promises"
     );
     assert!(
-      !lease.holds(now, LOCAL, 4, two, &[LOCAL, X, Y, HostId(4), HostId(5)]),
+      lease
+        .verdict(now, LOCAL, 4, two, &[LOCAL, X, Y, HostId(4), HostId(5)])
+        .holds(),
       "at the floor f = 2 needs two"
     );
+  }
+
+  /// Shape: the largest `f` the exhaustive intersection oracle enumerates — cohorts up to `2f + 1 = 7` hosts,
+  /// so every subset of an owner's other candidates is a 6-bit mask.
+  const ORACLE_MAX_F: u32 = 3;
+
+  /// The subsets of `hosts` hosts (as bit masks) with exactly `size` members.
+  fn subsets_of_size(hosts: usize, size: usize) -> impl Iterator<Item = u32> {
+    (0..1u32 << hosts).filter(move |mask| mask.count_ones() as usize == size)
+  }
+
+  /// §4.8 "Leases and reads" (the intersection the lease rests on): for every `f` up to [`ORACLE_MAX_F`] and
+  /// every cohort a region can fix, any [`confirmations_needed`] of the owner's other candidates meet every
+  /// promotion quorum a successor can gather among them ([`Quorum::recovery`] of the cohort) — so while the
+  /// lease holds, some holder of every such quorum is still refusing — and one confirmation fewer leaves some
+  /// quorum wholly unconfirmed. A promotion quorum and the lease are both drawn from the others: the retired
+  /// owner never promises.
+  #[test]
+  fn every_promotion_quorum_meets_the_lease_confirmations_and_no_fewer_suffice() {
+    for f in 0..=ORACLE_MAX_F {
+      let quorum = Quorum { f };
+      for cohort in 1..=quorum.candidates() {
+        let others = cohort - 1;
+        let needed = confirmations_needed(others, quorum);
+        let promises = quorum.recovery(cohort);
+        let quorums: Vec<u32> = subsets_of_size(others, promises).collect();
+        for confirmed in subsets_of_size(others, needed) {
+          for promised in &quorums {
+            assert_ne!(
+              confirmed & promised,
+              0,
+              "f = {f}, {others} others: {needed} confirmations meet every promotion of {promises}"
+            );
+          }
+        }
+        if needed > 0 {
+          let unconfirmed = subsets_of_size(others, needed - 1)
+            .any(|confirmed| quorums.iter().any(|promised| confirmed & promised == 0));
+          assert!(
+            unconfirmed,
+            "f = {f}, {others} others: {} confirmations leave a promotion unmet",
+            needed - 1
+          );
+        }
+      }
+    }
   }
 
   /// A supersession voids every object's lease until the newer version is installed; a fresh confirmation
@@ -384,13 +498,13 @@ mod tests {
     lease.configuration_installed_ns = Some(0); // installed long ago: no startup allowance
     lease.confirm(Y, now, 4);
     assert!(
-      lease.holds(now, LOCAL, 4, one, &candidates),
+      lease.verdict(now, LOCAL, 4, one, &candidates).holds(),
       "a fresh Y confirms version 4"
     );
 
     lease.supersede(5);
     assert!(
-      !lease.holds(now, LOCAL, 4, one, &candidates),
+      !lease.verdict(now, LOCAL, 4, one, &candidates).holds(),
       "superseded overrides the fresh Y"
     );
     lease.installed(4, 0);
@@ -401,11 +515,11 @@ mod tests {
     lease.installed(5, 0);
     assert!(lease.superseded.is_none());
     assert!(
-      !lease.holds(now, LOCAL, 5, one, &candidates),
+      !lease.verdict(now, LOCAL, 5, one, &candidates).holds(),
       "the answers were at version 4"
     );
     lease.confirm(Y, now, 5);
-    assert!(lease.holds(now, LOCAL, 5, one, &candidates));
+    assert!(lease.verdict(now, LOCAL, 5, one, &candidates).holds());
   }
 
   /// The bounded startup allowance holds the lease for the horizon after a configuration install, with no
@@ -418,20 +532,24 @@ mod tests {
     let installed = 10 * horizon_ns();
     lease.installed(3, installed);
     assert!(
-      lease.holds(installed, LOCAL, 3, one, &candidates),
+      lease.verdict(installed, LOCAL, 3, one, &candidates).holds(),
       "just installed: allowed"
     );
     assert!(
-      lease.holds(installed + horizon_ns(), LOCAL, 3, one, &candidates),
+      lease
+        .verdict(installed + horizon_ns(), LOCAL, 3, one, &candidates)
+        .holds(),
       "at the horizon: allowed"
     );
     assert!(
-      !lease.holds(installed + horizon_ns() + 1, LOCAL, 3, one, &candidates),
+      !lease
+        .verdict(installed + horizon_ns() + 1, LOCAL, 3, one, &candidates)
+        .holds(),
       "past the horizon with no confirmation: unconfirmed"
     );
     lease.supersede(4);
     assert!(
-      !lease.holds(installed, LOCAL, 3, one, &candidates),
+      !lease.verdict(installed, LOCAL, 3, one, &candidates).holds(),
       "superseded even inside the allowance"
     );
   }

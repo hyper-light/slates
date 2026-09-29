@@ -389,9 +389,10 @@ mod tests {
         crate::consensus::decode_message(state, true, local, &old_message),
         Err(RaftWireError::ForeignGroup)
       );
-      assert!(!crate::consensus::adopt_fetch(
-        state, true, local, &old_fetch
-      ));
+      assert_eq!(
+        crate::consensus::adopt_fetch(state, true, local, &old_fetch),
+        crate::consensus::FetchOutcome::Refused
+      );
       assert!(
         !state.root.propose(RootCommand::AdmitRegion(RegionId(4))),
         "a paused group has no proposing authority"

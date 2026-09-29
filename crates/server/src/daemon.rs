@@ -1827,7 +1827,7 @@ impl Daemon {
     object: slates_db::register::ObjectId,
   ) -> Result<bool, ObserveError> {
     self.observe(self.shard_of_object(object), move |s| {
-      crate::verbs::lease_unconfirmed(s, object).is_none()
+      crate::verbs::lease_verdict(s, object).holds()
     })
   }
 
@@ -3141,6 +3141,35 @@ mod tests {
     }
   }
 
+  /// §4.8 learner fetch (D-14): a voter with nothing newer answers a caught-up fetch with no bytes
+  /// (`serve_fetch`). Folding that reply adopts nothing and refuses nothing. The Linux io_uring loop's runs 125
+  /// and 147 of 150 (2026-09-29) failed formation on one such reply arriving after its round: the late fold
+  /// decoded it as a join, counted `consensus.join.undecodable` and `consensus_join_refused`, and the three-process
+  /// test's refusal allow-list rejected both. The on-time fold skipped empty replies; the late one did not.
+  #[test]
+  fn an_empty_fetch_reply_is_neither_adopted_nor_a_refused_join() {
+    let (refused, version, outcomes) = audit_on_shard(|state| {
+      let peer = state.fleet.host();
+      let version = state.council.configuration().version;
+      let outcomes =
+        [false, true].map(|root| crate::consensus::adopt_fetch(state, root, peer, &[]));
+      let refused: u64 = state
+        .refusals
+        .iter()
+        .filter(|(name, _)| name.contains("join"))
+        .map(|(_, count)| *count)
+        .sum();
+      (
+        refused,
+        state.council.configuration().version == version,
+        outcomes,
+      )
+    });
+    assert_eq!(refused, 0, "an empty reply is no refused join");
+    assert!(version, "an empty reply adopts nothing");
+    assert_eq!(outcomes, [crate::consensus::FetchOutcome::Current; 2]);
+  }
+
   /// AC-8.1, §4.8, AUD-07: a separately bootstrapped group cannot alter this group's
   /// term or prefix, even when its packet names the authenticated sender correctly.
   #[test]
@@ -3176,7 +3205,10 @@ mod tests {
           crate::consensus::decode_message(state, root, peer, &message),
           Err(RaftWireError::ForeignGroup)
         );
-        assert!(!crate::consensus::adopt_fetch(state, root, peer, &fetch));
+        assert_eq!(
+          crate::consensus::adopt_fetch(state, root, peer, &fetch),
+          crate::consensus::FetchOutcome::Refused
+        );
       }
       assert!(state.council.is_leader());
       assert!(state.root.is_leader());
@@ -3464,6 +3496,105 @@ mod tests {
     assert_eq!(
       once_lapsed, 1,
       "once its answers can no longer feed the lease, its copy is learned"
+    );
+  }
+
+  /// Makes the audit node the bootstrap of an `f = 1` region that admits a second member and then a third,
+  /// the way `bootstrap` and the leader's admissions form every fleet: the second member's settled
+  /// neighbourhood is the two hosts it was admitted beside until it reports its new one placed. Holds one record
+  /// of `object` written by the second member while its change is in flight, then takes the second member over
+  /// and installs the result. Returns the retired member.
+  fn retire_an_owner_settled_on_a_formation_neighbourhood(
+    state: &mut crate::state::ShardState,
+    object: slates_db::register::ObjectId,
+  ) -> slates_db::HostId {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, Quorum, Record};
+    let local = state.fleet.host();
+    let departed = HostId(local.0 ^ 1);
+    let third = HostId(local.0 ^ 2);
+    state.council = RegionalCouncil::new(
+      local,
+      vec![local],
+      vec![local],
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    for host in [departed, third] {
+      assert!(
+        state
+          .council
+          .propose(Reconfiguration::Admit { host, domain: None })
+      );
+    }
+    let settled = &state.council.configuration().settled[&departed];
+    assert_eq!(
+      settled.hosts.len(),
+      2,
+      "the second member is settled beside the bootstrap alone"
+    );
+    install_council(state);
+    let generation = state.fleet.configuration().version;
+    let mut acceptor = Acceptor::new(
+      local,
+      Authority {
+        generation,
+        owner: departed,
+      },
+    );
+    acceptor
+      .accept(&Record {
+        owner: departed,
+        object,
+        sequence: 0,
+        epoch: FIRST_EPOCH,
+        generation,
+        value: b"head".to_vec(),
+      })
+      .unwrap();
+    state.holder_records.insert(object, acceptor);
+    state.fleet.track_object_owner(object, departed);
+    assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+    install_council(state);
+    crate::takeover::resolve_held_objects(state, local);
+    departed
+  }
+
+  /// §4.8 "Promotion and takeover" (Flexible Paxos's intersection, research record): an owner retired while its
+  /// settled neighbourhood is the two hosts a forming region admitted it beside is recovered from the one
+  /// survivor of that cohort. A record committed there is held by both of its hosts, so one promise meets every
+  /// commit; requiring `f + 1` live members of a two-host cohort declared the object lost while its survivor held
+  /// it — the Linux io_uring loop's run 118 of 150 (2026-09-29): both survivors held the volume's head,
+  /// `fleet.takeover.lost` counted it, and no survivor ever served it.
+  #[test]
+  fn a_takeover_recovers_an_owner_settled_beside_one_host_from_that_host() {
+    use slates_db::register::ObjectId;
+    let (successor, ready, lost) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let object = ObjectId([29; 16]);
+      let departed = retire_an_owner_settled_on_a_formation_neighbourhood(state, object);
+      let successor = state.fleet.object_owner(object);
+      assert!(crate::takeover::begin_round(state, departed, local).is_some());
+      let ready = crate::takeover::ready_objects(state, departed, local);
+      let lost = state
+        .refusals
+        .get("fleet.takeover.lost")
+        .copied()
+        .unwrap_or(0);
+      (successor == Some(local), ready, lost)
+    });
+    assert!(successor, "the one survivor of the cohort is the successor");
+    assert_eq!(lost, 0, "a record its cohort's survivor holds is not lost");
+    assert_eq!(
+      ready.len(),
+      1,
+      "the survivor's own promise readies the object"
+    );
+    assert!(
+      ready.iter().all(|(_, adopted)| adopted.value == b"head"),
+      "the survivor adopts the record it holds"
     );
   }
 

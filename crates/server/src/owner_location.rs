@@ -46,10 +46,23 @@ pub(crate) struct CachedRoute {
 /// the node counts the precise failure, so an unavailable view is never reported as NotFound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LocationError {
+  /// No peer claimed the object at the newest generation answered.
   Unavailable,
+  /// A query or reply that does not decode.
   Malformed,
+  /// A reply bound to another query: another object, region or root view.
   ForeignView,
+  /// Two peers claimed the object at the same generation.
   ConflictingOwners,
+  /// Asked while this node's consensus groups are not ready to answer (joining, or not initialized).
+  NotReady,
+  /// Asked under a root view other than the one this node holds.
+  RootViewDiffers,
+  /// Asked about a region this node is not in, or an object homed elsewhere.
+  OutsideHome,
+  /// Asked while this node's placement has not yet installed the regional configuration its council holds:
+  /// its held-object route may predate the newest takeover, so it names no owner.
+  PlacementBehind,
 }
 
 impl LocationError {
@@ -59,6 +72,10 @@ impl LocationError {
       Self::Malformed => "fleet.owner_location.malformed",
       Self::ForeignView => "fleet.owner_location.foreign_view",
       Self::ConflictingOwners => "fleet.owner_location.conflicting_owners",
+      Self::NotReady => "fleet.owner_location.not_ready",
+      Self::RootViewDiffers => "fleet.owner_location.root_view_differs",
+      Self::OutsideHome => "fleet.owner_location.outside_home",
+      Self::PlacementBehind => "fleet.owner_location.placement_behind",
     }
   }
 }
@@ -117,17 +134,21 @@ pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, Locatio
     .node_regions
     .get(&ObjectId(query.object).creator())
     .copied();
-  if !state.consensus_ready
-    || root.version != query.root_version
-    || state.node_regions.get(&local) != Some(&RegionId(query.region))
+  if !state.consensus_ready {
+    return Err(LocationError::NotReady);
+  }
+  if root.version != query.root_version {
+    return Err(LocationError::RootViewDiffers);
+  }
+  if state.node_regions.get(&local) != Some(&RegionId(query.region))
     || creator_region
       .is_none_or(|region| root.home_of(ObjectId(query.object), region) != RegionId(query.region))
   {
-    return Err(LocationError::ForeignView);
+    return Err(LocationError::OutsideHome);
   }
   let regional = state.council.configuration();
   if state.fleet.configuration().version != regional.version {
-    return Err(LocationError::ForeignView);
+    return Err(LocationError::PlacementBehind);
   }
   Ok(
     Reply {

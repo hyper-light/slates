@@ -2797,8 +2797,13 @@ refinement and revalidation before those results can be applied to the corrected
 > - Every holder answers the round in pages of a fresh session's first credit, after the lease gate. A
 >   holder that holds nothing answers too, and its complete answer is its promise for every object it does
 >   not list. The retired host is no member, and the successor is the only member named for the object.
-> - An object is adopted once `f + 1` members of each recovery cohort have promised. It is re-committed
->   under the successor's placement at the round's epoch, then served.
+> - An object is adopted once each of its recovery cohorts has given its recovery quorum of promises:
+>   `cohort − f`, which is `f + 1` at the `2f + 1` floor (Flexible Paxos: `q1 + q2 > n`). It is re-committed
+>   under the successor's placement at the round's epoch, then served. A cohort that a forming region fixed
+>   with fewer hosts needs fewer promises. Two hosts at `f = 1` commit only with both, so one survivor's
+>   promise suffices. Asking `f + 1` there declared lost a record the survivor held
+>   (`docs/bugs/2026-09-29-a-formation-cohort-lost-a-record-its-survivor-held.md`; regression
+>   `a_takeover_recovers_an_owner_settled_beside_one_host_from_that_host`).
 > - A survivor confirms its share to the council, and a retirement is dropped once all have. Stale copies
 >   are reclaimed.
 > - Regression `a_takeover_completes_when_one_survivor_never_received_the_head` covers both successors in
@@ -2821,9 +2826,13 @@ integration still require the A-9 tests.
 > - While they differ, a record whose cohort moved is sent to both cohorts and commits at `f + 1` of each
 >   (`Placement::joint`). Content stays on its current cohort: the head names its holders.
 > - The record plane re-ships heads to the new candidates.
-> - Once every shard holds all it owns at `f + 1` of each current cohort, judged under the very version the
+> - Once every shard holds all it owns at `f + 1` of its current cohort, judged under the very version the
 >   report names, the owner reports `Settle` over the report stream. The council's leader proposes it (only a
 >   report about the reporter itself, only when caught up, only once), and the old set retires.
+> - The old cohort is not asked: it already holds every joint commit. An old cohort that has lost a host can
+>   never answer again, and asking it kept its owner unsettled for good, with every write unplaced
+>   (`Configuration::placed_on_current`; regression
+>   `an_owner_whose_old_cohort_lost_a_host_is_ready_once_its_current_cohort_holds_its_head`).
 > - The owner lease counts over the settled cohort, the one a successor recovers through.
 > - A retirement keeps the settled neighbourhood in a retirement record for the takeover, which is built next.
 > - Regression `an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`.
@@ -2866,12 +2875,18 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > regression `a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`). The mount's synthetic
 > root answers a `LOOKUP` or `READDIRPLUS` of a volume's name with the volume root's stable handle, and
 > withholds its attributes while the lease is unconfirmed (RFC 1813 carries them as optional), so the
-> client's next `GETATTR` meets the gate. The confirmations needed are the intersection bound over the
-> object's actual candidates, `others − f` (saturating): `f` at the `2f + 1` floor, fewer below it, and none
-> once no successor could gather the `f + 1` promises a takeover needs. Demanding `f` everywhere had refused
-> a lone owner (one node in its region at `f = 1`) its own objects once its startup allowance ran out
-> (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`; regression
-> `a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance`). Every promising holder
+> client's next `GETATTR` meets the gate. The confirmations needed are the intersection bound against the
+> promotion quorum (`cohort − f` promises, at least one), which is `min(f, others)`:
+> - `f` at the `2f + 1` floor;
+> - every other candidate in a smaller cohort, where a single promise already promotes;
+> - none for a lone owner.
+>
+> Demanding `f` everywhere had refused a lone owner (one node in its region at `f = 1`) its own objects once
+> its startup allowance ran out (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`; regression
+> `a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance`). The bound moved from
+> `others − f` when the promotion quorum was corrected: with one promise promoting beside one host,
+> `others − f` would have held a lease on no confirmation at all. The exhaustive oracle
+> `every_promotion_quorum_meets_the_lease_confirmations_and_no_fewer_suffice` checks both directions. Every promising holder
 > now applies the holder-side gate, not only the successor: each holder keeps the departed owner of every
 > object an install reassigns, and refuses a prepare while its own answers may still feed that owner's lease
 > (`docs/bugs/2026-09-29-holders-promised-without-the-lease-gate.md`; regression
