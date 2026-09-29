@@ -853,6 +853,12 @@ commit latency and commits a second; messages and bytes are summed.
 | 2,000/s, 1 % | 4 batches | 201 / 321 ms | 1,985 | 109,822,390 | 17,503 |
 | 4,000/s, 1 % | 0 / 1 / 4 batches | 11,187 / 7,520 / 7,432 ms median | 1,024 / 2,005 / 2,033 | 111,870,940 (each) | 0 / 15,365 / 17,512 |
 
+**The derived window** (each node's own, set every period from its measured paths as the daemon sets it:
+one batch for each period a lost batch takes to repair, ⌈2 × tail / heartbeat⌉) equals the best fixed window
+in every row: at 2,000 proposals a second with 1 % loss 201 / 321 ms, 1,985 a second, 109,822,117 bytes; at
+1,000 a second 172 / 222 ms and 83,126,233 bytes; at 4,000 a second 2,058 a second without loss and 2,033
+with.
+
 **Measured and rejected:** going ahead whenever a resend would not reach the next index (the first cut). At
 2,000 proposals a second each period's batch fell just short of full, so every resend reached past it: no batch
 went ahead in any seed, and the group committed 1,018 a second at a 2,497 ms median, as with no window.

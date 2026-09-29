@@ -622,4 +622,19 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
   - **Next.** The groups' wiring: a window derived from each node's measured paths — one batch holds the
     capacity, and more cuts the tail under loss — then votes routed to the leader, the fast track's policy from
     its crossover measurement, MLRaft, and the KIND lane.
+- **Slice 12 (2026-09-29): the groups' window, derived.**
+  - **The rule** (`ElectionTiming::window_budget`, `slates_cluster::timing::REPAIR_ROUND_TRIPS`): one append
+    budget for each period a lost batch takes to repair on the node's slowest measured voter path.
+    - The leader keeps sending one batch a period ahead while the follower's refusal travels back and the
+      resend travels out: two round trips, ⌈2 × tail / heartbeat⌉ periods.
+    - That is one batch on a loopback, where nothing need go ahead, and four or more across regions.
+    - The council and the root group set it each period with their election timing, and the recovery's
+      reading of every report (slice 11) makes windows that differ across a group safe.
+  - **Measured** (the same five regions, 20 seeds, 30 s streams; each node deriving its own window each period
+    in the simulation as the daemon does):
+    - The derived window equals the best fixed window in every case.
+    - At 2,000 proposals a second with 1 % loss, 201 / 321 ms median / p99, where one batch gives 260 / 458 ms.
+    - At every other rate and loss it matches one batch or four, whichever is better.
+  - **Next.** The fast track's crossover — proposers away from the leader, loss, placement — which decides
+    whether a group opens it, and its votes' routing to the leader in the fleet.
 

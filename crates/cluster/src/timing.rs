@@ -51,6 +51,11 @@ use crate::CommitBudget;
 /// Derived: ten — the paper's order of magnitude, the design's multiplier (§4.8), an anchor not a tunable.
 pub const ELECTION_MARGIN: u64 = 10;
 
+/// Derived: two — the round trips a lost batch takes to repair when the leader sends batches ahead
+/// (`docs/wip/research/consensus-enhancements.md` §3.5): the follower's refusal of the batch after the lost one
+/// reaches the leader, and the resend reaches the follower.
+pub const REPAIR_ROUND_TRIPS: u64 = 2;
+
 /// The measured path to one peer: the transport's RFC 9002 §5.3 estimator over every round trip this node
 /// timed to that peer, and how many round trips fed it — the witness that the estimate is measured, not
 /// assumed (a path with no sample contributes nothing to a derivation, never the RFC's 333 ms initial
@@ -200,6 +205,20 @@ impl ElectionTiming {
       broadcast_rtt_spread_ns: spread,
       samples,
     }
+  }
+
+  /// The window a node holds (`RaftNode::set_window_budget`), in bytes: one `batch_bytes` for each period a
+  /// lost batch takes to repair on its slowest measured voter path ([`REPAIR_ROUND_TRIPS`] round trips), since
+  /// the leader keeps sending one batch a period ahead meanwhile and the follower buffers them; at least one.
+  /// One batch on a LAN, where an acknowledgement is back within the period and nothing need go ahead; four
+  /// across the five published Azure regions, where four cut the commit tail under 1 % loss from 458 to 321 ms
+  /// at 2,000 proposals a second and one holds the capacity (2026-09-29, `crates/cluster/tests/pipelining.rs`).
+  pub fn window_budget(&self, heartbeat_ns: u64, batch_bytes: usize) -> usize {
+    let repair = self
+      .broadcast_rtt_tail_ns
+      .saturating_mul(REPAIR_ROUND_TRIPS);
+    let batches = usize::try_from(periods_of(repair, heartbeat_ns)).unwrap_or(usize::MAX);
+    batch_bytes.saturating_mul(batches)
   }
 
   /// This node's own timeout in periods for its `attempt`-th campaign: `base + (draw mod span)`, the draw a
@@ -449,6 +468,30 @@ mod tests {
       "the timeout in wall time is at least ten times the tail"
     );
     assert_eq!(timing.broadcast_rtt_tail_ns, tail);
+  }
+
+  /// §3.5: a node's window is one batch for each period a lost batch takes to repair on its slowest voter path —
+  /// one with nothing measured and on a loopback path, whose tail is inside a period (an acknowledgement is
+  /// back before the next send, so nothing need go ahead), and ⌈2 × tail / heartbeat⌉ on a WAN path, where a
+  /// tail past one period makes it at least three.
+  #[test]
+  fn the_window_holds_a_repairs_worth_of_batches_on_the_slowest_path() {
+    const BATCH: usize = 4_367;
+    assert_eq!(
+      ElectionTiming::floor().window_budget(HEARTBEAT, BATCH),
+      BATCH
+    );
+    let lan = ElectionTiming::derive(HEARTBEAT, [&path_of(&LOOPBACK_SAMPLES_MS)]);
+    assert_eq!(lan.window_budget(HEARTBEAT, BATCH), BATCH);
+    let wan = path_of(&WAN_SAMPLES_MS);
+    let timing = ElectionTiming::derive(HEARTBEAT, [&wan]);
+    let tail = wan.tail_ns().expect("sampled");
+    let batches = usize::try_from((2 * tail).div_ceil(HEARTBEAT)).unwrap();
+    assert_eq!(timing.window_budget(HEARTBEAT, BATCH), BATCH * batches);
+    assert!(
+      batches >= 3,
+      "a tail past one period spans three periods twice over: {batches}"
+    );
   }
 
   /// The span follows the path's **variation**: after six samples the RFC 9002 estimator still carries the

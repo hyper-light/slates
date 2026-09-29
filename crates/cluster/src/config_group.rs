@@ -894,6 +894,13 @@ impl RegionalCouncil {
     self.raft.set_priority(priority);
   }
 
+  /// Sets this node's window, as its drive derived it this period from its measured voter paths
+  /// (`ElectionTiming::window_budget`; `docs/wip/research/consensus-enhancements.md` §3.5): how far its
+  /// leader sends ahead of acknowledgements and what it holds ahead of a hole ([`RaftNode::set_window_budget`]).
+  pub fn set_window_budget(&mut self, bytes: usize) {
+    self.raft.set_window_budget(bytes);
+  }
+
   /// This node's election rank among the voters the caller holds `alive` (§3.4,
   /// [`RaftNode::election_rank`]): the timer yields one timeout per rank.
   pub fn election_rank(&self, alive: &[HostId]) -> usize {

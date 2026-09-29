@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 
 use slates_db::register::HostId;
 use support::azure::{REGIONS, placement, profile, quorum_round_trip_ms};
-use support::timed::{Campaign, ElectionOrder, Fault, MS, Scenario, run};
+use support::timed::{Campaign, ElectionOrder, Fault, MS, Scenario, Window, run};
 
 /// Shape: the seeds each region set runs under.
 const SEEDS: u64 = 20;
@@ -80,7 +80,7 @@ fn measure(
       campaign: Campaign::PreVote,
       order,
       seed,
-      window_budget: 0,
+      window: Window::Bytes(0),
     });
     *measured
       .leaders

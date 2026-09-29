@@ -2720,8 +2720,10 @@ reconnaissance because the touched partitions are named up front).
 > Status (2026-09-29): built in `RaftNode` — the window, the recovery, the fast track, buffering, and the
 > leader's pipelined replication — and explored on the real core at full scale with no violation. Across five
 > Azure regions a window of one batch keeps a group committing 2,000 proposals a second at a 172 ms median
-> where none is overloaded, and changes nothing at a low rate. Owed: the groups' wiring (their window budget
-> is zero, so nothing pipelines or opens a fast track yet) and the fast track's crossover measurement.
+> where none is overloaded, and changes nothing at a low rate. The council and the root group set their
+> window each period from their measured paths (Derived constants below), which matched the best fixed window
+> in every measured case. Owed: the fast track's crossover measurement, which decides whether a group opens
+> it, and its votes' routing to the leader in the fleet; until then no group opens it.
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
@@ -2942,7 +2944,9 @@ class; probation threshold = late
 count over the measured window that exceeds the hedge rate's variance; detection timeout for
 membership from RTT p99 × k; auto-seal cadence as before; healer cadence from the measured
 put-failure rate; membership lease from heartbeat RTT p99 × k; election timeout for the
-configuration group ≥ 10 × broadcast RTT p99 with the randomization span from RTT variance;
+configuration group ≥ 10 × broadcast RTT p99 with the randomization span from RTT variance; the
+consensus window = one append budget for each period a lost batch takes to repair, ⌈2 × broadcast RTT
+tail / heartbeat⌉ (one on a loopback; `ElectionTiming::window_budget`, set each period with the timing);
 SWIM period = max(k × RTT p99, scheduler quantum); gossip λ from measured convergence;
 tombstone retention = measured partition-heal p99; mirror shipping batch from the measured WAN
 bandwidth-delay product.

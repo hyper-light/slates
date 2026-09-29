@@ -15,11 +15,9 @@ mod support;
 use std::time::Instant;
 
 use slates_cluster::raft::RaftNode;
-use slates_cluster::raft_wire::append_batch_bytes;
 use slates_db::register::HostId;
-use slates_transport::endpoint::MAX_PACKET_PAYLOAD;
 use support::azure::{placement, profile};
-use support::timed::{Campaign, ElectionOrder, MS, Outcome, Scenario, run};
+use support::timed::{Campaign, ElectionOrder, MS, Outcome, Scenario, Window, batch_budget, run};
 
 /// Shape: the regions the group spans — all five of the matrix, so the leader's quorum round trip (83 to 185
 /// ms) is at or past the 100 ms period.
@@ -28,21 +26,11 @@ const REGIONS: usize = 5;
 const PROPOSE_FROM_NS: u64 = 10_000 * MS;
 /// Shape: the jitter added to each one-way delay — a few milliseconds of queueing around a published median.
 const JITTER_NS: u64 = 5 * MS;
-/// Format: the group envelope the council's messages ride in (`slates_server::consensus`): a 32-byte group
-/// id and the message's 4-byte length.
-const ENVELOPE_BYTES: usize = 32 + 4;
-
-/// The council drive's batch budget for this group: a fresh session's first credit, less the append's
-/// header, priority table and trailer and the envelope.
-fn batch_budget() -> usize {
-  append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES, REGIONS)
-}
-
 /// One run: `seed`'s placement of the regions, proposals every `propose_every_ns` for `stream_ns`, the
 /// given window, and `loss_ppm` of the messages lost.
 fn scenario(
   seed: u64,
-  window_budget: usize,
+  window: Window,
   propose_every_ns: u64,
   stream_ns: u64,
   loss_ppm: u32,
@@ -58,7 +46,7 @@ fn scenario(
     campaign: Campaign::PreVote,
     order: ElectionOrder::ByPriority,
     seed,
-    window_budget,
+    window,
   })
 }
 
@@ -81,7 +69,7 @@ fn median(values: &mut [u64]) -> u64 {
 
 fn measure(
   seeds: u64,
-  window_budget: usize,
+  window: Window,
   propose_every_ns: u64,
   stream_ns: u64,
   loss_ppm: u32,
@@ -89,7 +77,7 @@ fn measure(
   let (mut medians, mut p99s, mut rates) = (Vec::new(), Vec::new(), Vec::new());
   let (mut messages, mut bytes, mut sent_ahead) = (0, 0, 0);
   for seed in 0..seeds {
-    let outcome = scenario(seed, window_budget, propose_every_ns, stream_ns, loss_ppm);
+    let outcome = scenario(seed, window, propose_every_ns, stream_ns, loss_ppm);
     medians.push(outcome.commit_latency_pct(50) / MS);
     p99s.push(outcome.commit_latency_pct(99) / MS);
     rates.push(u64::try_from(outcome.commit_latencies_ns.len()).unwrap() * 1_000 * MS / stream_ns);
@@ -117,9 +105,12 @@ const GATE_STREAM_NS: u64 = 10_000 * MS;
 /// it changes nothing at all: every run is the same, byte for byte.
 #[test]
 fn a_window_of_one_batch_keeps_up_where_none_does() {
-  let budget = batch_budget();
+  let budget = batch_budget(REGIONS);
   let overloaded = |window| measure(GATE_SEEDS, window, 500_000, GATE_STREAM_NS, 0);
-  let (without, with) = (overloaded(0), overloaded(budget));
+  let (without, with) = (
+    overloaded(Window::Bytes(0)),
+    overloaded(Window::Bytes(budget)),
+  );
   eprintln!("2,000 a second: without a window {without:?}; with one batch {with:?}");
   assert!(with.sent_ahead > 0, "batches went ahead");
   assert!(
@@ -132,8 +123,8 @@ fn a_window_of_one_batch_keeps_up_where_none_does() {
   );
   let quiet = |window| measure(GATE_SEEDS, window, 50 * MS, GATE_STREAM_NS, 0);
   assert_eq!(
-    quiet(0),
-    quiet(budget),
+    quiet(Window::Bytes(0)),
+    quiet(Window::Bytes(budget)),
     "a backlog within one batch is resent, window or not"
   );
 }
@@ -158,14 +149,20 @@ fn pipelining_across_rates_and_loss() {
     .unwrap_or(30)
     * 1_000
     * MS;
-  let budget = batch_budget();
+  let budget = batch_budget(REGIONS);
   eprintln!("batch budget {budget} bytes; a command's entry is 21 bytes");
+  let windows = [
+    Window::Bytes(0),
+    Window::Bytes(budget),
+    Window::Bytes(4 * budget),
+    Window::Derived,
+  ];
   for loss_ppm in [0, 10_000] {
     for every_us in [50_000, 2_000, 1_000, 500, 250] {
-      for window in [0, budget, 4 * budget] {
+      for window in windows {
         let measured = measure(seeds, window, every_us * MS / 1_000, stream_ns, loss_ppm);
         eprintln!(
-          "loss {loss_ppm} ppm, a proposal every {every_us} us, window {window}: {measured:?}"
+          "loss {loss_ppm} ppm, a proposal every {every_us} us, window {window:?}: {measured:?}"
         );
       }
     }

@@ -1848,10 +1848,15 @@ the log: 20 ms a proposal at a 5,000-entry backlog, now 61–102 ns at any backl
 window than a voter's could leave a chosen index free. It now reads every slot above its log, as the verified
 model does, so a group's windows may differ. [Bug record](../bugs/2026-09-29-a-recovery-read-only-its-own-windows-reach.md).
 
+**Update, the same day:** the council and the root group set their window each period from their measured
+paths (a batch for each period a lost batch takes to repair: ⌈2 × tail / heartbeat⌉, one on a loopback). In
+the simulation it matched the best fixed window in every case (201 / 321 ms at 2,000 a second with 1 % loss,
+where one batch gives 260 / 458 ms).
+
 **Owed:**
-- The groups' window budget, derived from each node's measured paths. One batch holds the capacity; four cut
-  the tail under 1 % loss from 458 to 321 ms p99.
-- Then votes routed to the leader, the fast track's policy, MLRaft, and the KIND lane.
+- The fast track's crossover measurement and its votes' routing to the leader in the fleet. Until then no
+  group opens it.
+- MLRaft, and the KIND lane's measurement of the fleet under a burst.
 
 ### 2026-09-29: the fast track and the window are built in the core — the design's sync rule lost chosen values; fixed
 

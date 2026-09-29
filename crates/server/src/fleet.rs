@@ -4953,8 +4953,14 @@ async fn drive_config_council(
   // This period's election timing, derived from the measured paths to the other voters (§4.8 "Derived
   // constants"): ten times the slowest voter's round-trip tail, floored at ten periods — the floor on any
   // loopback, and what `Daemon::council_timing` reports. Voters only: a member being caught up takes no part
-  // in an election.
-  let timing = derive_group_timing(&others, |s, timing| s.council_timing = timing);
+  // in an election. The window follows the same tail: a batch for each period a lost batch takes to repair
+  // (`docs/wip/research/consensus-enhancements.md` §3.5) — one on a loopback.
+  let timing = derive_group_timing(&others, |s, timing| {
+    s.council_timing = timing;
+    let batch = crate::consensus::append_batch_bytes(s.council.voters().len());
+    s.council
+      .set_window_budget(timing.window_budget(HEARTBEAT_NS, batch));
+  });
   // A leader's invitation (thesis §3.10, leadership transfer) outranks this period's timer.
   if campaign_if_invited(Group::Council, &others, budget, timer, in_flight).await {
     return;
@@ -5087,8 +5093,13 @@ async fn drive_root_group(
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
-  // This period's election timing over the paths to the other root voters, as the council's.
-  let timing = derive_group_timing(&others, |s, timing| s.root_timing = timing);
+  // This period's election timing and window over the paths to the other root voters, as the council's.
+  let timing = derive_group_timing(&others, |s, timing| {
+    s.root_timing = timing;
+    let batch = crate::consensus::append_batch_bytes(s.root.voters().len());
+    s.root
+      .set_window_budget(timing.window_budget(HEARTBEAT_NS, batch));
+  });
   // A leader's invitation (thesis §3.10, leadership transfer) outranks this period's timer.
   if campaign_if_invited(Group::Root, &others, budget, timer, in_flight).await {
     return;

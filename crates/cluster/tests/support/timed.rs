@@ -154,10 +154,19 @@ pub(crate) struct Scenario {
   pub(crate) order: ElectionOrder,
   /// The seed for jitter, loss and tick phases.
   pub(crate) seed: u64,
-  /// The window every node holds, in wire bytes (`RaftNode::set_window_budget`): what a follower can hold
-  /// ahead of a hole, and so how far a leader sends ahead of acknowledgements. Zero, the groups' default,
-  /// holds none and sends nothing ahead.
-  pub(crate) window_budget: usize,
+  /// How every node's window is set (`RaftNode::set_window_budget`): what a follower can hold ahead of a hole,
+  /// and so how far a leader sends ahead of acknowledgements.
+  pub(crate) window: Window,
+}
+
+/// How every node's window is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Window {
+  /// A fixed number of wire bytes on every node; zero holds none and sends nothing ahead.
+  Bytes(usize),
+  /// Each node's own, set every period from its measured voter paths as the daemon sets it
+  /// (`ElectionTiming::window_budget` over the council drive's batch budget).
+  Derived,
 }
 
 /// What a scenario measured.
@@ -320,7 +329,7 @@ impl Sim {
       .iter()
       .map(|id| {
         let mut raft = RaftNode::new(*id, voters.clone());
-        raft.set_window_budget(scenario.window_budget);
+        raft.set_window_budget(initial_window(scenario.window, voters.len()));
         let retained = raft.saved();
         (
           *id,
@@ -479,8 +488,11 @@ impl Sim {
         node.down_until = Some(until);
       } else if now >= until && node.down_until == Some(until) {
         node.raft = RaftNode::restore(node.retained.clone()).unwrap();
-        // The window budget is configuration, not retained state.
-        node.raft.set_window_budget(self.scenario.window_budget);
+        // The window is configuration, not retained state; a derived one is set again at the next tick.
+        let voters = node.raft.all_voters().len();
+        node
+          .raft
+          .set_window_budget(initial_window(self.scenario.window, voters));
         node.timer = ElectionTimer::new();
         node.invitation = None;
         node.down_until = None;
@@ -533,6 +545,15 @@ impl Sim {
     };
     self.nodes.get_mut(&id).unwrap().raft.set_priority(priority);
     let timing = self.timing(id);
+    if self.scenario.window == Window::Derived {
+      let window = timing.window_budget(HEARTBEAT_NS, batch_budget(voters.len()));
+      self
+        .nodes
+        .get_mut(&id)
+        .unwrap()
+        .raft
+        .set_window_budget(window);
+    }
     if self.nodes[&id].raft.is_leader() {
       self.lead(id, &timing);
     } else {
@@ -582,10 +603,7 @@ impl Sim {
 
   fn lead(&mut self, id: HostId, timing: &ElectionTiming) {
     self.propose_due(id);
-    // The council drive's budget: a fresh fleet session's first credit, less the append header and the
-    // group envelope (a 32-byte group id and a 4-byte length).
-    let voters = self.nodes[&id].raft.all_voters().len();
-    let budget = append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES, voters);
+    let budget = batch_budget(self.nodes[&id].raft.all_voters().len());
     for peer in self.others(id) {
       let raft = &mut self.nodes.get_mut(&id).unwrap().raft;
       let message = raft
@@ -804,6 +822,21 @@ impl Sim {
       );
     }
     self.outcome
+  }
+}
+
+/// The council drive's batch budget for a group of `voters`: a fresh fleet session's first credit, less the
+/// append header and the group envelope (a 32-byte group id and a 4-byte length).
+pub(crate) fn batch_budget(voters: usize) -> usize {
+  append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES, voters)
+}
+
+/// A node's window before it has measured anything: the fixed bytes, or — derived — the timing floor's, one
+/// batch.
+fn initial_window(window: Window, voters: usize) -> usize {
+  match window {
+    Window::Bytes(bytes) => bytes,
+    Window::Derived => ElectionTiming::floor().window_budget(HEARTBEAT_NS, batch_budget(voters)),
   }
 }
 
