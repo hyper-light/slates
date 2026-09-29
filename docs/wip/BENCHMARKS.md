@@ -969,6 +969,12 @@ export. CI gates the successor's identity (`on_the_kind_profile_a_central_leader
 third row's defect. Real pods run about twice the simulation's time to a successor: 4 in 10 of the
 successors' pre-elections drew no reply within their deadline.
 
+**The heal (2026-09-29, A-40).** Each trial then waits for the healed leader to rejoin: every pod holding all
+three members with one leader. Over 19 trials it rejoined 4.95, 4.97, 4.97, 4.98, 4.98, 5.07, 5.09, 5.17,
+6.08, 6.09, 6.11, 6.13, 6.15, 6.15, 6.16, 6.18, 6.19, 6.20 and 6.30 s after the heal. Before A-40 it had not
+rejoined 180 s later. By the heal, 15 s into the cut, the reconnection schedule has reached its 6 s cap,
+which bounds the wait.
+
 ### MLRaft: one to five logs across five regions (2026-09-29)
 
 **Hardware:** as above. **Command:** `SLATES_MULTILOG_SEEDS=20 cargo test -p slates-cluster --release --test

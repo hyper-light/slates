@@ -292,15 +292,24 @@ pre-elections still drew no reply within their deadline (one logged at over 127 
 pre-vote reply is dropped, so the candidate campaigns again a timeout later. A gate on "never" would then
 turn on how often that repeats.
 
-**Found by it, open: a symmetric partition never heals.** The first runs reused one fleet across trials.
-The cut leader, healed after 15 s, never rejoined.
+**Found by it, and fixed: a symmetric partition never healed.** The first runs reused one fleet across
+trials. The cut leader, healed after 15 s, never rejoined.
 - Its peers held only each other alive, and it held only itself.
 - It began 175 pre-elections at term 2 while they led at term 3.
 - Each side's probe to the other logged `idles: BelievedDead`.
-The design re-admits a believed-dead peer when *its* probe reaches a node (`resume_if_in_mesh`,
-`serve_peer_probes`; A-15). After a partition both sides believe the other dead, neither probes, and no
-refutation can happen: only a restart rejoins it. Serf solves this with periodic reconnection attempts to
-failed members. Owed (GAPS).
+The design re-admitted a believed-dead peer only when *its* probe reached a node (A-15). After a partition
+both sides believe the other dead, neither probed, and only a restart rejoined. An idle probe task now reaches
+out on a backed-off schedule (A-40; `docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`). Each trial
+now waits, after the heal, for every pod to hold all three members with one leader again (bounded by
+`REJOIN_WAIT`). Over 19 trials the healed leader rejoined 4.95–6.30 s after the heal, every time.
+
+**Found by it, open: a survivor's record session drops after a leader's loss.** In 4 of the 12 trials whose
+survivors' rounds were logged, the central survivor's first pre-elections found no session to the other
+survivor: its pool entry held no session and none was lent out, for at least 2 s. Those pre-elections asked
+no one.
+- The outranked pod won in 1 of those 4 trials.
+- It also won one unlogged trial, whose central candidate's 3 pre-elections drew no reply.
+The cause is owed (GAPS).
 
 ## The one gap left — a whole-pod restart does not rejoin (open; not the cause first recorded)
 

@@ -1826,7 +1826,7 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
-### 2026-09-29: KIND succession — a round with no reply yet gave up at its lookahead — fixed; a symmetric partition never heals — open
+### 2026-09-29: KIND succession — a round with no reply yet gave up at its lookahead — fixed; a symmetric partition never healed — fixed; a survivor's record session drops after a leader's loss — open
 
 **Built.** The KIND lane's succession measurement (`cargo xtask kind succession`; `docs/wip/kind-lane.md`,
 Piece 6). The council's leader is lost under unequal paths: pod 0's egress 80 ms, pod 1's 20 ms, pod 2
@@ -1849,14 +1849,32 @@ successor. It runs on real daemons, so it checks the lease fix below where the s
   pod succeeds 6 of 6 (6.47 s).
 [Bug record](../bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md).
 
-**Open — a symmetric partition never heals.** A council leader cut off for 15 s and healed never rejoined in
-180 s:
+**Fixed the same day — a symmetric partition never healed.** A council leader cut off for 15 s and healed had
+not rejoined 180 s later:
 - its peers held only each other alive, and it held only itself;
 - it began 175 pre-elections at a stale term;
 - each side's probe to the other idled as `BelievedDead`.
-Re-admission waits for the dead-believed peer's own probe (`resume_if_in_mesh`, A-15). After a symmetric
-partition neither side probes, so only a restart rejoins. Owed: bounded, backed-off contact attempts to
-believed-dead members (Serf's reconnect), with a failing test first.
+Re-admission (A-15) waited for the dead-believed peer's own probe, and after a symmetric partition neither
+side probes. An idle probe task now reaches out on a backed-off schedule (200 ms, doubling to 6 s; A-40).
+- The failing test came first (`peers_that_each_believe_the_other_dead_find_each_other_again`), and the
+  fleet suite passes 54 of 54.
+- On KIND a healed leader rejoins 4.95–6.30 s after the heal (19 trials).
+[Bug record](../bugs/2026-09-29-a-symmetric-partition-never-healed.md).
+
+**Open — a survivor's record session to the other survivor drops after a leader's loss.** Logged on KIND in 4
+of the 12 trials whose survivors' rounds were logged. At the central survivor's first pre-elections its pool
+held no link to the lost leader (removed at its retirement, as designed), and a link to the other survivor
+with no session and none lent out: down for at least 2 s. A pre-election then asks no one.
+- In 1 of those 4 trials the outranked pod won instead.
+- So did one unlogged trial, whose central candidate's 3 pre-elections drew no reply.
+Owed: what tears down a healthy peer's record session there, with a failing test first.
+
+**Open — one CI failure, unexplained.** `a_green_chain_survives_a_daemon_restart` (`crates/client/tests/
+client.rs`) failed once on CI's Ubuntu lane (io_uring), run 36554081271 on `b036a0e`. The second daemon's
+rendezvous bind was refused `EADDRINUSE` after `first.stop()`, the symptom of
+`docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`. It is not in the previous ten failed
+runs, and 270 local Linux runs under io_uring did not reproduce it (aarch64, kernel 6.12; isolated, the
+whole binary, and on 4 contended CPUs). Owed: a reproduction on CI's kernel, then the cause.
 
 **Open — a late pre-vote reply is dropped.** With both fixes, 4 of the KIND successors' 10 pre-elections drew
 no reply within their deadline (one logged at over 127 ms against 124 ms), and each costs a whole election

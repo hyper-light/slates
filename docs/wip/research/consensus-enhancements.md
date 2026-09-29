@@ -787,8 +787,16 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
       candidate's pre-votes as leased.
     The simulation of the same profile had predicted both successors, 200 of 200 each way, and CI now gates
     its prediction.
-  - **Open.** A symmetric partition never heals: neither side probes a peer it believes dead, so a healed
-    node stays out until it restarts. And a late pre-vote reply is dropped: 4 in 10 of the successors'
-    pre-elections cost a timeout for a reply just past the deadline. Both are in GAPS.
-  - **Next.** The partition heal, then the late pre-vote reply.
+  - **Found and fixed: a symmetric partition never healed.** Neither side probed a peer it believed dead, so
+    a healed node stayed out until it restarted. An idle probe task now reaches out on a backed-off schedule
+    (A-40), and a healed leader rejoins in 4.95–6.30 s over 19 trials
+    (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`).
+  - **Open.**
+    - A survivor's record session to the other survivor is sometimes down right after a leader's loss, so
+      its first pre-elections ask no one. Logged in 4 of 12 trials, the outranked pod winning one of them
+      (and one unlogged trial).
+    - A late pre-vote reply is dropped: 4 in 10 of the successors' pre-elections cost a timeout for a reply
+      just past the deadline.
+    Both are in GAPS.
+  - **Next.** The dropped session, then the late pre-vote reply.
 

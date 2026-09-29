@@ -2702,8 +2702,9 @@ reconnaissance because the touched partitions are named up front).
 > nothing gathered stopping at three quarters of its deadline, which cut off a far voter's reply; such a
 > round now waits its whole deadline, unextended
 > (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`). Status now reports each
-> group's election state. Open: a symmetric partition does not heal, since neither side probes a peer it
-> believes dead (GAPS).
+> group's election state. It also found that a symmetric partition never healed, since neither side probed
+> a peer it believed dead; an idle probe task now reaches out on a backed-off schedule, and a healed leader
+> rejoins in 5–6.3 s (A-40).
 
 > **The fast track's recovery, verified before it is built (2026-09-28; `docs/wip/research/
 > consensus-enhancements.md`, slice 8).** Parallel replication and the fast track let a follower hold slots
@@ -6018,7 +6019,7 @@ Applied in the same change to: §4.8 (Membership — a retired peer that returns
 - Authorization: Ada's "build all of fleet" (2026-09-10) and the sequencing "finish the focused rejoin first" (2026-09-11). Closes the owed rejoin path.
 - Scope correction (2026-09-11): this re-admits a peer retired by a **false suspicion** — a still-live node whose RAM (its holds, fences and records) is intact, refuting a transient network or scheduling glitch. A **restart is not this path**: a RAM-only node that restarts has lost all its state, so it must rejoin as a *new* member with a *fresh ephemeral id* (the old id stays dead and its objects are taken over — §4.8 line ~1801, RAMCloud's recovery model), never be re-admitted under its old id with a reset fence that would accept a stale low-epoch record (a StaleNeverCommits hazard). The membership id is therefore ephemeral (per boot) while the certificate is the stable authenticated identity; A-13's certificate-*derived* stable host id is the piece to change (peers known by certificate and address, ids learned on contact) — sequenced as the next correctness fix. Refutation below covers only the false-positive case.
 - The mechanism (§4.8 "Membership fed by SWIM", D-14): a peer the fleet retired by a false suspicion is re-admitted when it comes back, by SWIM's own incarnation refutation, with **no separate death-incarnation tracker or rejoin bump**. slates already keeps a dead member as `{Dead, incarnation}` in the membership view and self-refutes on hearing its own death ([`Membership::refute`] raises the incarnation past what it heard), so the whole rejoin is one wiring fix: the probe **serve** side (`serve_peer_probes`), for the peer its handshake authenticated (its certificate in the roster — a ping's `from` is unauthenticated), reads this node's belief about that peer and, when it is not alive, **echoes it** in the acknowledgement; the returning peer applies that to itself, refutes to a higher incarnation, and gossips its new life, which the serve side then **folds** into the shared `FleetNode` (scoped to the authenticated prober — the `sync_peer` discipline, so it can never flap a third peer). A higher incarnation always overrides the death, so the stale death cannot re-retire the re-admitted member; the fold needs no bump because the refutation already carries one.
-- The probe loop **idles rather than ending** on retirement (`probe_peer`): a believed-dead peer is never dialed (that establish would block on a peer that will not answer — the reason a prior "re-dial after K misses" was reverted), and no probe session is held; when the peer rejoins, the neighbourhood regains it and the loop resumes, realigning its detector to the re-admitted belief so it tracks the peer as alive and can detect a *future* death. The record link (`establish_record_link`) idles the same way. No supervisor re-spawns anything — the persistent tasks self-heal.
+- The probe loop **idles rather than ending** on retirement (`probe_peer`): a believed-dead peer is never dialed (that establish would block on a peer that will not answer — the reason a prior "re-dial after K misses" was reverted), and no probe session is held; when the peer rejoins, the neighbourhood regains it and the loop resumes, realigning its detector to the re-admitted belief so it tracks the peer as alive and can detect a *future* death. The record link (`establish_record_link`) idles the same way. No supervisor re-spawns anything — the persistent tasks self-heal. (Amended by A-40, 2026-09-29: after a symmetric partition no dead-believed peer's probe crosses, so an idle task now reaches out on a backed-off schedule.)
 - Pushed past the reference (hyperscale's Python SWIM, which needs a per-peer death-incarnation tracker, a `minimum_rejoin_incarnation_bump`, and an out-of-band `reset_peer_for_rejoin` RPC): slates carries the death incarnation in the membership view it already keeps, and `refute` supplies the bump, so re-admission is the ordinary incarnation-override merge with none of that apparatus. The **authority** stays the configuration group (D-14): SWIM only detects; a re-admission is an `Admit` the group reconciles, and a returning host adopts the configuration's current host epoch (bumped by the takeover that retired it), which fences its pre-death records — stronger than incarnation refutation alone.
 - Proof: `crates/server/tests/fleet.rs::a_falsely_retired_peer_rejoins_by_refutation` — two live daemons form the direct probe mesh; one is made to falsely retire the other (`Daemon::observe_peer_dead`, the same fold the detector performs when it ages a peer to death); the retired peer, alive and still probing, learns of its death from the echo, refutes, and is re-admitted, and stays admitted (no flap). 5/5 serialized; the full fleet suite 13/13. A real process kill cannot be exercised in-process — the demultiplexer's serve socket is `Box::leak`ed to the process's lifetime and cannot be rebound where a live deployment's OS would free it — so the test injects the (false) death and drives the recovery over live sessions instead.
 - What it does not change: the rules R1–R10; the register protocol, its refusal taxonomy and the one-quorum rule; the configuration group as the membership authority (SWIM detects, the group decides); the N=1≡fleet degenerate (a laptop has no peers to retire or re-admit). Bounded scatter-width neighbourhoods and the configuration group live over the transport (the Meta-scale membership work) remain owed and are the next fleet pieces; enrollment (§4.13) and the rest of §4.10 remain owed.
@@ -6537,3 +6538,29 @@ taking the call's length); `slates-server` (the call's length reaches the compou
 (`Shard::spin_for_work` and `harvest_io`, `UringDriver::harvest_ready`); `unsafe-budget.toml`;
 `xtask conformance bench` (errors name the transport and phase); `docs/wip/BENCHMARKS.md`; GAPS and
 TBD_FIXES.
+
+### A-40 — An idle probe task reaches out to a peer it believes dead, on a backed-off schedule (2026-09-29)
+Applied in the same change to: §4.8 (Membership — the rejoin of A-15), the `slates-server` membership loop
+(`crates/server/src/fleet.rs`: `Reconnect`, `reach_out`, `probe_peer`), the fleet tests
+(`crates/server/tests/fleet.rs`), the KIND lane (`xtask/src/kind.rs`, the succession step's rejoin wait),
+`docs/wip/kind-lane.md`, `docs/wip/BENCHMARKS.md` and GAPS.
+- Why: A-15 re-admits a dead-believed peer when that peer's own probe reaches a node, and a node never dials
+  a peer it believes dead. A partition is symmetric: each side ages the other to death, so no probe crosses
+  and the halves stay apart until one restarts. The KIND lane's succession step showed it: a council leader
+  cut off for 15 s had not rejoined 180 s after the heal
+  (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`).
+- The rule: an idle probe task reaches out to its peer — one suspicion window after the retirement, the wait
+  doubling on each unanswered attempt (RFC 6298 §5.5) up to `ELECTION_MARGIN` × the suspicion window at the
+  Lifeguard cap (6 s at the 100 ms beat), and starting over on an answer.
+  - An attempt is one handshake budget and one ping carrying this node's state and its belief that the peer
+    is dead. The answer's gossip is folded, so both sides refute and re-admit each other through A-15's own
+    path; re-admission stays by refutation.
+  - An attempt credits no lease, ages or credits no detector, samples no path and asks no relay. It blocks
+    only the idle task, for one handshake budget. A-15's concern was a live task blocked on a dead peer.
+  - A peer gone for good costs one handshake per 6 s, and a healed partition is found within 6 s.
+- Evidence: `peers_that_each_believe_the_other_dead_find_each_other_again` failed before (apart after the
+  whole rejoin deadline) and passes in 4.3 s with the reconnect counters moved. The schedule is unit-tested.
+  The fleet suite passes 54 of 54. On KIND, over 19 trials, a healed leader rejoined 4.95–6.30 s after the
+  heal, every time.
+- What it does not change: the configuration group as the membership authority; re-admission by incarnation
+  refutation only; the record link's idling (it resumes when the probe plane re-admits the peer).

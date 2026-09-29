@@ -958,6 +958,90 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
   );
 }
 
+/// AC (§4.8, rejoin; `docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`): peers that **each**
+/// believe the other dead — what both sides of a real cut conclude — find each other again once the path
+/// between them is whole. A retires B and B retires A (both deaths injected; the network between them never
+/// breaks), so neither is reached by the other's probe, which the one-sided rejoin
+/// ([`a_falsely_retired_peer_rejoins_by_refutation`]) waits for. Before the fix neither side probed a peer it
+/// believed dead, nothing crossed, and they stayed apart until one restarted: on KIND a council leader cut
+/// off for 15 s and healed had not rejoined 180 s later. Non-vacuous: both are shown apart first, then
+/// together, then staying together.
+#[test]
+fn peers_that_each_believe_the_other_dead_find_each_other_again() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  let host_a = daemon_a.member_identity().unwrap();
+  let host_b = daemon_b.member_identity().unwrap();
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed"
+  );
+
+  // Each side retires the other, as both sides of a cut conclude.
+  inject_death_into([&daemon_a], host_b);
+  inject_death_into([&daemon_b], host_a);
+  let each_holds_both = || -> Result<(bool, bool), ObserveError> {
+    Ok((
+      daemon_a.fleet_members()?.contains(&host_b),
+      daemon_b.fleet_members()?.contains(&host_a),
+    ))
+  };
+  let apart = poll_until(&[&daemon_a, &daemon_b], RETIREMENT_DEADLINE, || {
+    each_holds_both().map(|(a_holds_b, b_holds_a)| !a_holds_b && !b_holds_a)
+  });
+  let together = poll_until(&[&daemon_a, &daemon_b], REJOIN_DEADLINE, || {
+    each_holds_both().map(|(a_holds_b, b_holds_a)| a_holds_b && b_holds_a)
+  });
+  let stable = together
+    && holds_for(FORMATION_SETTLE, || {
+      each_holds_both().map(|(a_holds_b, b_holds_a)| a_holds_b && b_holds_a)
+    });
+  // The rejoin came through an idle task reaching out: attempted, and answered.
+  let reached = [&daemon_a, &daemon_b].map(|daemon| {
+    (
+      refusal_count(daemon, "fleet.reconnect.attempted"),
+      refusal_count(daemon, "fleet.reconnect.answered"),
+    )
+  });
+
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(apart, "each retired the other after the injected deaths");
+  assert!(
+    together,
+    "each re-admitted the other once the path was whole"
+  );
+  assert!(
+    stable,
+    "they stayed together — the re-admission did not flap"
+  );
+  assert!(
+    reached.iter().any(|reached| matches!(
+      reached,
+      (Ok(tried), Ok(heard)) if *tried >= 1 && *heard >= 1
+    )),
+    "an idle task reached out and was answered: {reached:?}"
+  );
+}
+
 /// Derived: how long [`a_starved_but_live_peer_is_not_retired`] starves B's control shard — three anchor
 /// liveness budgets ([`LIVENESS_BUDGET_NS`]). Past the silence at which the old fixed probe deadline (one
 /// heartbeat, so six misses in a row) declared a peer dead (≈ 1.2 s at rest), and past the suspicion's

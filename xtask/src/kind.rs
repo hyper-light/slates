@@ -126,7 +126,8 @@ const SUCCESSION_CUT: Duration = Duration::from_secs(15);
 const SETTLED_SAMPLES: u32 = 5;
 /// Shape: how long a settled leader is waited for before a cut.
 const SETTLE_WAIT: Duration = Duration::from_secs(180);
-/// Shape: how long a successor is waited for after a cut.
+/// Shape: how long a successor is waited for after a cut. (The healed leader's rejoin is waited for up to
+/// [`REJOIN_WAIT`], the lane's bound for a replaced pod's.)
 const SUCCESSION_WAIT: Duration = Duration::from_secs(60);
 /// Format: the ephemeral cut container's security context (`kubectl debug --custom`): root with
 /// `NET_ADMIN`, as the chart's netem init container runs, over the pod's non-root default.
@@ -1682,6 +1683,10 @@ struct Succession {
   lost: String,
   successor: String,
   took: Duration,
+  /// From the heal until every pod held all three members again, one of them leading: the cut leader,
+  /// believing its peers dead as they believe it, found again
+  /// (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`).
+  rejoined: Duration,
   before: Vec<View>,
   after: Vec<View>,
 }
@@ -1715,11 +1720,12 @@ impl Succession {
       })
       .collect();
     format!(
-      "trial {}: {} lost; {} leads {:.2} s after the cut; {}",
+      "trial {}: {} lost; {} leads {:.2} s after the cut; the fleet whole again {:.2} s after the heal; {}",
       self.trial,
       self.lost,
       self.successor,
       self.took.as_secs_f64(),
+      self.rejoined.as_secs_f64(),
       survivors.join("; ")
     )
   }
@@ -1893,11 +1899,19 @@ impl Lane {
       custom,
       &shaping.restore(ordinal),
     )?;
+    let pods: Vec<String> = (0..LANE_REPLICAS).map(|index| self.pod(index)).collect();
+    let (_, rejoined) = self.wait_views(
+      &pods,
+      REJOIN_WAIT,
+      "the healed leader rejoined its peers",
+      |views| Self::formed_at(LANE_REPLICAS, views),
+    )?;
     Ok(Succession {
       trial,
       lost,
       successor,
       took: found_at.saturating_duration_since(cut_at),
+      rejoined,
       before,
       after,
     })

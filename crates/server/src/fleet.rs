@@ -88,7 +88,8 @@ use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{Delivery, ProbeOutcome, SwimMessage, deliver_once, probe_once};
 use slates_cluster::timing::{
-  ElectionTimer, ElectionTiming, FollowerStep, PathRtt, RoundAnchors, quorum_priority, round_budget,
+  ELECTION_MARGIN, ElectionTimer, ElectionTiming, FollowerStep, PathRtt, RoundAnchors,
+  quorum_priority, round_budget,
 };
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, TimedReply, broadcast,
@@ -144,6 +145,72 @@ const GOSSIP_PER_BIT: u32 = 2;
 /// next period before a member is suspected). Two periods: one to miss, one to confirm the miss, before the
 /// aging declares death; the Lifeguard multiplier dilates it when this node itself looks unhealthy.
 pub(crate) const SUSPICION_PERIODS: u32 = 2;
+
+/// Shape: how much an unanswered reconnection attempt lengthens the wait before the next ([`Reconnect`]) —
+/// doubling, the binary exponential backoff TCP applies to an unanswered retransmission (RFC 6298 §5.5, "the
+/// host MUST set RTO ← RTO * 2").
+const RECONNECT_BACKOFF: u64 = 2;
+
+/// Derived: the first span an idle probe task waits before reaching out to a peer it believes dead
+/// ([`Reconnect`]) — one suspicion window at full health, [`SUSPICION_PERIODS`] beats: as long as a live
+/// peer's silence takes to be suspected, so a partition that heals at once is found about as fast as it was
+/// lost.
+fn reconnect_first_ns() -> u64 {
+  HEARTBEAT_NS.saturating_mul(u64::from(SUSPICION_PERIODS))
+}
+
+/// Derived: the longest span an idle probe task waits between reconnection attempts — an order of magnitude
+/// ([`ELECTION_MARGIN`], the design's ratio of a timeout to the span it must dominate) past the longest a
+/// live peer's silence can take to be judged dead, the suspicion window at the Lifeguard cap
+/// (`SUSPICION_PERIODS × (LOCAL_HEALTH_CAP + 1)` beats): 6 s at the daemon's 100 ms beat. A peer gone for good
+/// costs one handshake in that span, and a healed partition is found within it.
+fn reconnect_cap_ns() -> u64 {
+  reconnect_first_ns()
+    .saturating_mul(u64::from(LOCAL_HEALTH_CAP.saturating_add(1)))
+    .saturating_mul(ELECTION_MARGIN)
+}
+
+/// When an idle probe task next reaches out to the peer it believes dead
+/// (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`). Re-admission (A-15) waits for a
+/// dead-believed peer's own probe to reach this node; after a symmetric partition each side believes the
+/// other dead, so neither probe would ever cross, and the halves stay apart until one restarts. So an idle task
+/// reaches out itself ([`reach_out`]): first one [`reconnect_first_ns`] after the peer was retired, each
+/// unanswered attempt lengthening the wait by [`RECONNECT_BACKOFF`] up to [`reconnect_cap_ns`], and an answered
+/// one starting it over — its refutation is then under way, and the next contact carries it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Reconnect {
+  due_ns: u64,
+  interval_ns: u64,
+}
+
+impl Reconnect {
+  /// The schedule for a peer retired at `now_ns`.
+  fn from(now_ns: u64) -> Reconnect {
+    let interval_ns = reconnect_first_ns();
+    Reconnect {
+      due_ns: now_ns.saturating_add(interval_ns),
+      interval_ns,
+    }
+  }
+
+  /// Whether an attempt is due at `now_ns`.
+  fn due(&self, now_ns: u64) -> bool {
+    now_ns >= self.due_ns
+  }
+
+  /// Schedules the attempt after one made at `now_ns`, which the peer `answered` or not.
+  fn attempted(&mut self, now_ns: u64, answered: bool) {
+    self.interval_ns = if answered {
+      reconnect_first_ns()
+    } else {
+      self
+        .interval_ns
+        .saturating_mul(RECONNECT_BACKOFF)
+        .min(reconnect_cap_ns())
+    };
+    self.due_ns = now_ns.saturating_add(self.interval_ns);
+  }
+}
 
 /// Derived: the Lifeguard local-health multiplier cap minus one — a 3× cap (§4.8 "bounded local-health
 /// multiplier"; the raw `(LHM+1)` reaches 9× at the paper's saturation, which pushes timers off a cliff, so
@@ -2173,6 +2240,8 @@ async fn probe_peer(
   // Set while this peer is retired, so the resume that follows realigns the detector to the re-admitted
   // belief before it probes again.
   let mut was_idle = false;
+  // While this peer is retired: when this task next reaches out to it ([`Reconnect`]).
+  let mut reconnect: Option<Reconnect> = None;
 
   loop {
     follow_current_id(&mut detector, &mut peer, &mut probe_timing, origin, &shards);
@@ -2180,12 +2249,28 @@ async fn probe_peer(
     // A retirement this task learns here — the shard's membership already says so, from another task's
     // fold or an injected death — releases the probe session and any pending dial exactly as one its
     // own fold finds below does; before, a task that went idle this way kept both, so the resume re-used
-    // a session to a process that was gone and drove a dial at an address the peer had left.
+    // a session to a process that was gone and drove a dial at an address the peer had left. While idle it
+    // reaches out on the [`Reconnect`] schedule, so a peer that believes this node dead too is found once
+    // the path between them heals.
     if !resume_if_in_mesh(&mut detector, peer.host, &mut was_idle) {
       release_probe_session(peer.host, &mut session, &mut client, &mut recorded_mesh);
+      let reach = ReachOut {
+        identity,
+        name: &name,
+        address: &address,
+        certificate: &certificate,
+        resolver,
+        local,
+        local_boot_nonce,
+        peer: &peer,
+        fanout,
+        timing: &probe_timing,
+      };
+      reach_out_when_due(&reach, &mut reconnect, &mut detector, &mut probe_nonce).await;
       futures::sleep(HEARTBEAT_NS).await;
       continue;
     }
+    reconnect = None;
     (client, session) = establish_session(
       client,
       session,
@@ -2196,12 +2281,7 @@ async fn probe_peer(
       resolver,
     )
     .await;
-    if session.is_some() && !recorded_mesh {
-      // The direct probe session to this peer has formed — record it, so the daemon can tell the real mesh
-      // is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
-      state::with_state(|s| s.formed_probe_peers.insert(peer.host));
-      recorded_mesh = true;
-    }
+    record_formed_mesh(session.is_some(), &mut recorded_mesh, peer.host);
     if session.is_some() {
       probe_nonce += 1;
       session = probe_cycle(
@@ -2242,6 +2322,123 @@ async fn probe_peer(
     // requester credits a relayed answer, within a round trip rather than a period.
     sleep_or_wake(probe_period_ns(detector.health_multiplier()), peer.host).await;
   }
+}
+
+/// Records the direct probe session to `peer_host` once it has `formed`, so the daemon can tell the real
+/// mesh is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
+fn record_formed_mesh(formed: bool, recorded: &mut bool, peer_host: HostId) {
+  if formed && !*recorded {
+    state::with_state(|s| s.formed_probe_peers.insert(peer_host));
+    *recorded = true;
+  }
+}
+
+/// What an idle probe task reaches out to its peer with ([`reach_out`]): its own identity and the peer's dial,
+/// and what the ping carries.
+struct ReachOut<'a> {
+  identity: &'a Identity,
+  name: &'a str,
+  address: &'a NodeAddress,
+  certificate: &'a CertificateDer<'static>,
+  resolver: Option<&'static Resolver>,
+  local: HostId,
+  local_boot_nonce: u64,
+  peer: &'a ProbedPeer,
+  fanout: usize,
+  timing: &'a ProbeTiming,
+}
+
+/// One idle period's reconnection ([`Reconnect`]): the schedule starts when the peer is first found retired,
+/// and an attempt runs when it is due, with the next probe nonce.
+async fn reach_out_when_due(
+  reach: &ReachOut<'_>,
+  reconnect: &mut Option<Reconnect>,
+  detector: &mut Detector,
+  probe_nonce: &mut u64,
+) {
+  let now = futures::now_ns();
+  let schedule = reconnect.get_or_insert_with(|| Reconnect::from(now));
+  if !schedule.due(now) {
+    return;
+  }
+  *probe_nonce = probe_nonce.saturating_add(1);
+  let answered = reach_out(reach, detector, *probe_nonce).await;
+  schedule.attempted(futures::now_ns(), answered);
+}
+
+/// One attempt to reach a peer this node believes dead ([`Reconnect`]): a fresh probe session, one handshake
+/// budget to bring it up, and one ping carrying this node's gossip — its own state and its belief that the
+/// peer is dead, so a live peer refutes that at once (the buddy system). The answer's gossip is folded as any
+/// probe's is: an echo of this node's own death, which it refutes, and the peer's refuted state, which
+/// re-admits it (A-15: a higher incarnation always overrides the death). Nothing else a probe does: no lease
+/// is credited, since the peer may believe this node dead; the detector is neither aged nor credited, since
+/// the loop realigns it on the resume; no path is sampled and no relay asked. The session is dropped after,
+/// and a resume dials afresh. Returns whether the peer answered; counted either way (`fleet.reconnect.*`).
+async fn reach_out(reach: &ReachOut<'_>, detector: &mut Detector, nonce: u64) -> bool {
+  let ReachOut {
+    identity,
+    name,
+    address,
+    certificate,
+    resolver,
+    local,
+    local_boot_nonce,
+    peer,
+    fanout,
+    timing,
+  } = *reach;
+  count_refusal(RECONNECT_ATTEMPTED);
+  let Some(mut endpoint) = client_for(
+    identity,
+    name,
+    (address, crate::deploy::Plane::Probe),
+    certificate,
+    resolver,
+  )
+  .await
+  else {
+    return false;
+  };
+  if endpoint.establish().await.is_err() {
+    return false;
+  }
+  let Some(ping) = state::with_state(|state| SwimMessage::Ping {
+    from: local,
+    nonce,
+    boot_nonce: local_boot_nonce,
+    configuration_version: state
+      .lease
+      .known_version(state.fleet.configuration().version),
+    gossip: outgoing_probe_gossip(
+      state,
+      peer.host,
+      state.fleet.membership().state(peer.host),
+      fanout,
+    ),
+  }) else {
+    return false;
+  };
+  let Ok((
+    _,
+    ProbeOutcome::Acked {
+      from,
+      boot_nonce,
+      gossip,
+      ..
+    },
+  )) = probe_once(endpoint, &ping, timing.budget(path_tail_ns(peer.host))).await
+  else {
+    return false;
+  };
+  state::with_state(|state| {
+    if learn_member(state, peer.anchor, boot_nonce, from) == LearnedOutcome::Forged {
+      return false;
+    }
+    receive_probe_gossip(state, detector, from, &gossip);
+    count_refusal_in(state, RECONNECT_ANSWERED);
+    true
+  })
+  .unwrap_or(false)
 }
 
 /// What a probe task lets go of when its peer is retired, whichever path told it — its own fold at the
@@ -3643,6 +3840,10 @@ const PROBE_INDIRECT_UNDELIVERED: &str = "fleet.probe.indirect.undelivered";
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
 const DIAL_STALE_DROPPED: &str = "fleet.dial.stale_dropped";
+/// An idle probe task reached out to a peer it believes dead ([`reach_out`]), and one such attempt the peer
+/// answered: the partition heal's non-vacuity counters.
+const RECONNECT_ATTEMPTED: &str = "fleet.reconnect.attempted";
+const RECONNECT_ANSWERED: &str = "fleet.reconnect.answered";
 /// A discovery exchange that reached its deadline unanswered: its session released, the link re-dials
 /// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`).
 const DISCOVERY_DEADLINE: &str = "fleet.discovery.deadline";
@@ -6591,6 +6792,53 @@ mod tests {
     assert!(
       filling.judge(1, started + hedge_delay),
       "a round that gathered an acknowledgement within the delay is still filling and is extended"
+    );
+  }
+
+  /// The partition heal's schedule (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`): the first
+  /// attempt one suspicion window after the retirement, each unanswered one doubling the wait up to the cap
+  /// and staying there, and an answered one starting it over.
+  #[test]
+  fn reconnection_backs_off_to_its_cap_and_an_answer_starts_it_over() {
+    let retired_at = 1_000 * MS;
+    let mut schedule = Reconnect::from(retired_at);
+    let first = reconnect_first_ns();
+    assert!(
+      !schedule.due(retired_at + first - 1),
+      "not before the first window"
+    );
+    assert!(schedule.due(retired_at + first), "due at it");
+    let mut now = retired_at + first;
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+      schedule.attempted(now, false);
+      waits.push(schedule.due_ns - now);
+      now = schedule.due_ns;
+    }
+    assert_eq!(
+      waits,
+      vec![
+        2 * first,
+        4 * first,
+        8 * first,
+        16 * first,
+        30 * first,
+        30 * first,
+        30 * first,
+        30 * first
+      ],
+      "doubling to the cap, ten times the suspicion window at the health cap, then held"
+    );
+    assert_eq!(
+      reconnect_cap_ns(),
+      6_000 * MS,
+      "6 s at the daemon's 100 ms beat"
+    );
+    schedule.attempted(now, true);
+    assert_eq!(
+      schedule.due_ns - now,
+      first,
+      "an answer starts the schedule over"
     );
   }
 
