@@ -1826,6 +1826,26 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-28: learners with catch-up rounds — built
+
+A member promoted into a council or root seat joined the joint configuration at once, with whatever prefix
+it held — the availability gap of the thesis's Figure 4.4. Now:
+
+- **Staging** (thesis §4.2.1, `RaftNode::catch_up`). The leader stages the member and replicates to it in
+  rounds, counting it toward nothing. It begins the joint change only once a round completes within an
+  election timeout, and aborts a member whose lag does not shrink for a whole window.
+- **Measured.** Replaying Figure 4.4(a), the group could not commit for 21 replication rounds with the
+  newcomer added directly, and committed in the first round when it was staged.
+- **Explorer.** It now explores membership changes (one spare node, adds through staging, removals
+  including the leader's). At full scale: no violation; 2,571 / 2,200 changes; 1,359 / 1,151 members
+  caught up first; 147 / 128 stagings aborted.
+- **The `voters()` split.** The groups' `voters()` returned the replication targets, and the recovery plan
+  and the drive's elections read it as the voter set. With staged members in that list, a council of one
+  voter reported three, and a drain found no one to hand to (`DrainReport { council: NoTarget }`; no
+  survivor led within 40 s in the CLI test, before this commit). `voters()` is now the voter set, and
+  `replication_targets()` is what the drive replicates to.
+
+
 ### 2026-09-28: the delivery test read a reused handle value as the decoy — fixed (its sibling: next entry)
 
 CI run 36500813478's Windows nightly job failed the delivery test with exit 13 ("the decoy came along"), one

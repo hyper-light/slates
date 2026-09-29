@@ -34,6 +34,12 @@
 //! never shrank (`docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`); until 2026-09-22 it was the
 //! lowest member ids whatever their state, so a replacement admitted beside its unretired predecessor took
 //! a live voter's seat (`docs/bugs/2026-09-22-council-seats-follow-id-order-not-liveness.md`).
+//! A member the leader promotes is **caught up before it votes** (thesis §4.2.1): `reconcile_voters` stages
+//! the members its target adds — the leader replicates to them in rounds — and begins the joint change only
+//! once each has completed a round within an election timeout, so the joint configuration never waits on a
+//! voter with a stale log. Two kinds of non-voter therefore exist: every member beyond the seats fetches the
+//! committed configuration (`adopt`); a member being promoted is also replicated to, as a staged learner.
+//!
 //! Owed: the FencedRegister TLA+ revalidation for the per-host epoch fence (A-9, §4.8 lines 1710-1712).
 
 use std::mem::size_of;
@@ -41,7 +47,7 @@ use std::mem::size_of;
 use slates_db::register::{DomainId, HostId, Quorum, RegionalConfiguration};
 
 use crate::fold::{Fold, Snapshotted};
-use crate::raft::{RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal};
+use crate::raft::{CatchUp, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal};
 use crate::raft_wire::{RaftMessage, decode_regional_configuration, encode_regional_configuration};
 
 /// A regional configuration rides a council snapshot as the bytes a learner's fetch ships.
@@ -265,6 +271,8 @@ pub struct RegionalCouncil {
   /// path and acted on by the drive loop ([`invited_campaign`](Self::invited_campaign)), which alone starts
   /// elections and broadcasts — one slot, so bounded; a newer invitation replaces an older one.
   invitation: Option<TimeoutNow>,
+  /// Stagings aborted by [`reconcile_voters`](Self::reconcile_voters) (the non-vacuity counter).
+  stagings_aborted: u64,
 }
 
 impl RegionalCouncil {
@@ -416,6 +424,7 @@ impl RegionalCouncil {
       scatter,
       leader_contact: 0,
       invitation: None,
+      stagings_aborted: 0,
     };
     group.finish_election(false);
     group
@@ -448,10 +457,19 @@ impl RegionalCouncil {
     self.raft.is_leader()
   }
 
-  /// The peers the drive loop ships elections and replication to: the council's current voters, plus —
-  /// while a membership change's entry is still uncommitted — the voters it is removing, so a live member
-  /// demoted to learner receives the entry that removes it ([`RaftNode::replication_targets`]).
+  /// The council's voter set in force (Raft §6): its base voters, and the incoming voters too while a joint
+  /// change is in flight — who elections ask and learners fetch from.
   pub fn voters(&self) -> Vec<HostId> {
+    self.raft.all_voters()
+  }
+
+  /// The peers the drive loop replicates to ([`RaftNode::replication_targets`]): the voters, plus — while a
+  /// membership change's entry is still uncommitted — the voters it is removing, so a live member demoted to
+  /// learner receives the entry that removes it, plus the members being caught up to join (thesis §4.2.1).
+  /// Until 2026-09-28 this list was `voters`, which the recovery plan and the drive's elections read as the
+  /// voter set: once staged members joined it, a council of one voter reported three, and a drain found no
+  /// one to hand leadership to.
+  pub fn replication_targets(&self) -> Vec<HostId> {
     self.raft.replication_targets()
   }
 
@@ -824,9 +842,31 @@ impl RegionalCouncil {
       self.fold.state().quorum,
     );
     if target.is_empty() || target == sitting {
+      // Nothing to add: unstage anything a previous target named.
+      self.raft.catch_up(&sitting);
       return false;
     }
-    self.raft.begin_membership_change(target)
+    // A member the change adds is caught up first (thesis §4.2.1), so the joint configuration never waits on
+    // a voter with a stale log — the availability gap of the thesis's Figure 4.4.
+    match self.raft.catch_up(&target) {
+      CatchUp::Ready => self.raft.begin_membership_change(target),
+      CatchUp::Aborted { .. } => {
+        self.stagings_aborted = self.stagings_aborted.saturating_add(1);
+        false
+      }
+      CatchUp::Pending | CatchUp::NotLeader => false,
+    }
+  }
+
+  /// Whether this leader is catching `node` up to join the voters (thesis §4.2.1). The drive keeps direct
+  /// contact with a staged member so the rounds can reach it.
+  pub fn is_staged(&self, node: HostId) -> bool {
+    self.raft.staged().iter().any(|(member, _)| *member == node)
+  }
+
+  /// The stagings this council aborted — a member that could not catch up — over its life.
+  pub fn stagings_aborted(&self) -> u64 {
+    self.stagings_aborted
   }
 
   /// Adopts a configuration a **learner** fetched from a council voter (§4.8, D-14: the council is a small
@@ -1456,7 +1496,7 @@ mod tests {
   ) {
     let targets: Vec<HostId> = councils
       .get(&leader)
-      .map(RegionalCouncil::voters)
+      .map(RegionalCouncil::replication_targets)
       .unwrap_or_default()
       .into_iter()
       .filter(|peer| *peer != leader && reachable.contains(peer))
@@ -1491,27 +1531,63 @@ mod tests {
     }
   }
 
-  /// Drives the voter set to follow the committed membership through its three leader periods — begin the
-  /// joint change, complete it once its entry committed, then find nothing more to do — with the
-  /// replication rounds each needs, the leader holding `alive` alive, returning what each period's
-  /// `reconcile_voters` reported.
+  /// What moving the voter set took, leader period by period: the periods spent catching added members up
+  /// before the joint change began (thesis §4.2.1 — none when the change only removes voters), whether it
+  /// began, whether it completed once its entry committed, and whether a further period found more to do.
+  #[derive(Debug, PartialEq, Eq)]
+  struct VoterChange {
+    staging_periods: usize,
+    began: bool,
+    completed: bool,
+    more: bool,
+  }
+
+  impl VoterChange {
+    /// The joint change began, completed, and nothing more followed.
+    fn moved_once(&self) -> bool {
+      self.began && self.completed && !self.more
+    }
+  }
+
+  /// Shape: the leader periods a test lets staging run before calling it stuck — a member one probe from
+  /// caught up needs two (a refused probe that finds its end, then the batch), so four is ample.
+  const STAGING_PERIODS_BOUND: usize = 4;
+
+  /// Drives the voter set to follow the committed membership, leader period by period — stage and catch up
+  /// any member the target adds, begin the joint change, complete it once its entry committed, then find
+  /// nothing more to do — with the replication rounds each needs, the leader holding `alive` alive.
   fn drive_voter_change(
     councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
     leader: HostId,
     reachable: &[HostId],
     alive: &[HostId],
-  ) -> [bool; 3] {
+  ) -> VoterChange {
     let period = |councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>| {
       councils
         .get_mut(&leader)
         .is_some_and(|council| council.reconcile_voters(alive))
     };
-    let began = period(councils);
+    let mut staging_periods = 0;
+    let began = loop {
+      if period(councils) {
+        break true;
+      }
+      if councils[&leader].raft.staged().is_empty() || staging_periods == STAGING_PERIODS_BOUND {
+        break false;
+      }
+      staging_periods += 1;
+      settle(councils, leader, reachable, 1);
+    };
     settle(councils, leader, reachable, 1);
     let completed = period(councils);
     settle(councils, leader, reachable, 2);
     let more = period(councils);
-    [began, completed, more]
+    VoterChange {
+      staging_periods,
+      began,
+      completed,
+      more,
+    }
   }
 
   /// AC (§4.8, D-14; Raft §6): a voter the council **retires** leaves the Raft voter set — it stops
@@ -1551,10 +1627,10 @@ mod tests {
 
     // The voter set follows the committed membership: the joint change, then C_new, each committed by
     // the two survivors; then nothing more to do.
-    assert_eq!(
-      drive_voter_change(&mut councils, OWNER, &survivors, &survivors),
-      [true, true, false],
-      "began the joint change, completed it once committed, then settled"
+    let change = drive_voter_change(&mut councils, OWNER, &survivors, &survivors);
+    assert!(
+      change.moved_once() && change.staging_periods == 0,
+      "began the joint change at once (it adds no voter), completed it once committed, then settled: {change:?}"
     );
     assert_eq!(
       (
@@ -1629,7 +1705,12 @@ mod tests {
     // No seat is free: every sitting voter is still a member, so the voter set stays where it is.
     assert_eq!(
       drive_voter_change(&mut councils, LEADER, &reachable, &alive),
-      [false, false, false],
+      VoterChange {
+        staging_periods: 0,
+        began: false,
+        completed: false,
+        more: false
+      },
       "admitting a member moves no voter while every seat is held"
     );
     assert_eq!(
@@ -1644,17 +1725,22 @@ mod tests {
     );
 
     // The predecessor's death is confirmed: it is taken over, and its freed seat goes to the replacement.
+    // The replacement is a fresh member that joined the group's state as a learner (the fetch does this in a
+    // fleet), and the leader reaches it — it is alive — so it can be caught up before it votes (thesis
+    // §4.2.1); a member the leader could not reach would never be promoted.
     let retired = councils
       .get_mut(&LEADER)
       .is_some_and(|leader| leader.reconcile_alive(&declared, &[PREDECESSOR]));
     settle(&mut councils, LEADER, &reachable, 2);
-    assert_eq!(
-      (
-        retired,
-        drive_voter_change(&mut councils, LEADER, &reachable, &alive)
-      ),
-      (true, [true, true, false]),
-      "the takeover committed, then the voter change began, completed and settled"
+    let (saved, base) = councils[&LEADER].join_state().unwrap();
+    let mut replacement = RegionalCouncil::learner(REPLACEMENT, Quorum { f: 1 }, 3, false);
+    replacement.join_from(saved, base).unwrap();
+    councils.insert(REPLACEMENT, replacement);
+    let change = drive_voter_change(&mut councils, LEADER, &alive, &alive);
+    assert!(
+      retired && change.moved_once() && change.staging_periods > 0,
+      "the takeover committed, then the replacement was caught up and the voter change began, completed \
+       and settled: {change:?}"
     );
     assert_eq!(
       (
@@ -1685,13 +1771,10 @@ mod tests {
       .get_mut(&OWNER)
       .is_some_and(|leader| leader.reconcile_alive(&declared, &[B]));
     settle(&mut councils, OWNER, &survivors, 2);
-    assert_eq!(
-      (
-        taken_over,
-        drive_voter_change(&mut councils, OWNER, &survivors, &survivors)
-      ),
-      (true, [true, true, false]),
-      "B's takeover committed and the voter set moved once"
+    let change = drive_voter_change(&mut councils, OWNER, &survivors, &survivors);
+    assert!(
+      taken_over && change.moved_once() && change.staging_periods == 0,
+      "B's takeover committed and the voter set moved once, adding no one: {change:?}"
     );
     assert_eq!(
       (councils[&OWNER].voters(), councils[&A].is_voter(C)),
@@ -1699,12 +1782,13 @@ mod tests {
       "the freed seat stays empty while C is only suspected"
     );
 
-    // C's suspicion is refuted: the leader holds it alive, so it takes the free seat.
+    // C's suspicion is refuted: the leader holds it alive — and reaches it, which catching it up before it
+    // votes requires (thesis §4.2.1) — so it takes the free seat.
     let alive = [OWNER, A, C];
-    assert_eq!(
-      drive_voter_change(&mut councils, OWNER, &survivors, &alive),
-      [true, true, false],
-      "the live learner is promoted to the free seat"
+    let change = drive_voter_change(&mut councils, OWNER, &alive, &alive);
+    assert!(
+      change.moved_once() && change.staging_periods > 0,
+      "the live learner was caught up, then promoted to the free seat: {change:?}"
     );
     assert_eq!(councils[&OWNER].voters(), vec![OWNER, A, C]);
   }
@@ -1743,10 +1827,11 @@ mod tests {
       "C was a learner beyond the candidate floor; B's takeover committed; C adopted the fetched configuration"
     );
 
-    // The voter set follows: C is the one live learner, so it is promoted to B's freed seat.
-    assert_eq!(
-      drive_voter_change(&mut councils, OWNER, &alive, &alive),
-      [true, true, false]
+    // The voter set follows: C is the one live learner, so it is caught up and promoted to B's freed seat.
+    let change = drive_voter_change(&mut councils, OWNER, &alive, &alive);
+    assert!(
+      change.moved_once() && change.staging_periods > 0,
+      "{change:?}"
     );
     assert_eq!(
       (

@@ -2664,6 +2664,16 @@ reconnaissance because the touched partitions are named up front).
 > 45,607 after. The explorer now compacts, ships and corrupts snapshots, and bounds batches; at full scale
 > there was no violation. Next: learners with catch-up rounds (thesis §4.2.1) on this base.
 
+> **Learners with catch-up rounds (2026-09-28; `docs/wip/research/consensus-enhancements.md`, slice 6).**
+> A member a group promotes is caught up before it votes (thesis §4.2.1). The leader stages it: it replicates
+> to the member in rounds, counts it toward no quorum, keeps a session to it wherever it sits, and leaves it
+> out of the election timing. The joint change begins only once a round has completed within an election
+> timeout. A member whose lag does not shrink for a whole window is aborted and staged afresh on a later
+> period, so an unreachable member is never made a voter. Replaying the thesis's Figure 4.4(a), the group
+> committed in the first round after losing a voter instead of after 21. The safety explorer now explores
+> membership changes, including a removed leader stepping down (§4.2.2), with no violation at full scale.
+> The groups' `voters()` is the voter set; `replication_targets()` is what the drive replicates to.
+
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
 > never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original

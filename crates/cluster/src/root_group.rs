@@ -33,7 +33,7 @@ use std::mem::size_of;
 use slates_db::register::{HostId, OBJECT_BYTES, ObjectId, RegionId, RootConfiguration};
 
 use crate::fold::{Fold, Snapshotted};
-use crate::raft::{RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal};
+use crate::raft::{CatchUp, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal};
 use crate::raft_wire::{RaftMessage, decode_root_configuration, encode_root_configuration};
 
 /// A root configuration rides a root-group snapshot as the bytes a learner's fetch ships.
@@ -206,6 +206,8 @@ pub struct RootGroup {
   /// path and acted on by the drive loop ([`invited_campaign`](Self::invited_campaign)), which alone starts
   /// elections and broadcasts — one slot, so bounded; a newer invitation replaces an older one.
   invitation: Option<TimeoutNow>,
+  /// Stagings aborted by [`reconcile_voters`](Self::reconcile_voters) (the non-vacuity counter).
+  stagings_aborted: u64,
 }
 
 impl RootGroup {
@@ -324,6 +326,7 @@ impl RootGroup {
       view_pending: false,
       leader_contact: 0,
       invitation: None,
+      stagings_aborted: 0,
     };
     group.finish_election(false);
     group
@@ -358,10 +361,17 @@ impl RootGroup {
     self.raft.leader()
   }
 
-  /// The peers the drive loop ships elections and replication to: the group's current voters, plus — while a
-  /// membership change's entry is still uncommitted — the voters it is removing, so a live host demoted from
-  /// representative receives the entry that removes it ([`RaftNode::replication_targets`]).
+  /// The root group's voter set in force (Raft §6): its base voters, and the incoming voters too while a
+  /// joint change is in flight — who elections ask and learners fetch from.
   pub fn voters(&self) -> Vec<HostId> {
+    self.raft.all_voters()
+  }
+
+  /// The peers the drive loop replicates to ([`RaftNode::replication_targets`]): the voters, plus — while a
+  /// membership change's entry is still uncommitted — the voters it is removing, so a live host demoted from
+  /// representative receives the entry that removes it, plus the representatives being caught up to join
+  /// (thesis §4.2.1).
+  pub fn replication_targets(&self) -> Vec<HostId> {
     self.raft.replication_targets()
   }
 
@@ -687,10 +697,33 @@ impl RootGroup {
       .collect();
     target.sort_unstable_by_key(|host| host.0);
     target.dedup();
-    if target.is_empty() || target == self.raft.all_voters() {
+    let sitting = self.raft.all_voters();
+    if target.is_empty() || target == sitting {
+      // Nothing to add: unstage anything a previous target named.
+      self.raft.catch_up(&sitting);
       return false;
     }
-    self.raft.begin_membership_change(target)
+    // A representative the change adds is caught up first (thesis §4.2.1), so the joint configuration never
+    // waits on a voter with a stale log.
+    match self.raft.catch_up(&target) {
+      CatchUp::Ready => self.raft.begin_membership_change(target),
+      CatchUp::Aborted { .. } => {
+        self.stagings_aborted = self.stagings_aborted.saturating_add(1);
+        false
+      }
+      CatchUp::Pending | CatchUp::NotLeader => false,
+    }
+  }
+
+  /// Whether this leader is catching `node` up to join the voters (thesis §4.2.1). The drive keeps direct
+  /// contact with a staged member so the rounds can reach it.
+  pub fn is_staged(&self, node: HostId) -> bool {
+    self.raft.staged().iter().any(|(member, _)| *member == node)
+  }
+
+  /// The stagings this group aborted — a representative that could not catch up — over its life.
+  pub fn stagings_aborted(&self) -> u64 {
+    self.stagings_aborted
   }
 
   /// Adopts a root configuration fetched from a group voter (§4.8, D-14: the root group is a small elected
@@ -765,7 +798,17 @@ mod tests {
     let (saved, base) = leader.join_state().unwrap();
     replacement.join_from(saved, base).unwrap();
     let representatives = BTreeMap::from([(region, fresh)]);
-    assert!(leader.reconcile_voters(&representatives));
+    // The replacement is caught up before the joint change adds it (thesis §4.2.1): staged, then one
+    // round brings it the leader's log.
+    assert!(!leader.reconcile_voters(&representatives), "staged first");
+    let reply = replacement
+      .answer(leader.replication_for(fresh, UNBOUNDED).unwrap())
+      .unwrap();
+    leader.fold_reply(reply);
+    assert!(
+      leader.reconcile_voters(&representatives),
+      "caught up: the change begins"
+    );
     let reply = replacement
       .answer(leader.replication_for(fresh, UNBOUNDED).unwrap())
       .unwrap();
@@ -937,7 +980,7 @@ mod tests {
   ) {
     let targets: Vec<HostId> = groups
       .get(&leader)
-      .map(RootGroup::voters)
+      .map(RootGroup::replication_targets)
       .unwrap_or_default()
       .into_iter()
       .filter(|peer| *peer != leader && reachable.contains(peer))

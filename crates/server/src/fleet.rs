@@ -3758,6 +3758,9 @@ enum DirectContact {
   Neighbour,
   /// A voter of the council or the root group.
   Voter,
+  /// A member this node, leading the council or the root group, is catching up to join its voters (thesis
+  /// §4.2.1): its rounds need a session to it wherever it sits.
+  Staged,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -3790,6 +3793,8 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::Neighbour
   } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
     DirectContact::Voter
+  } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
+    DirectContact::Staged
   } else {
     DirectContact::OutsideNeighbourhood
   }
@@ -4867,16 +4872,22 @@ async fn drive_config_council(
   timer: &mut ElectionTimer,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
+  let Some((is_voter, is_leader, contact, voters, targets)) = state::with_state(|s| {
     if s.recovery.council.is_some() {
-      return (false, false, s.council.leader_contact(), Vec::new());
+      return (
+        false,
+        false,
+        s.council.leader_contact(),
+        Vec::new(),
+        Vec::new(),
+      );
     }
-    let voters = s.council.voters();
     (
       s.council.is_voter(local),
       s.council.is_leader(),
       s.council.leader_contact(),
-      voters,
+      s.council.voters(),
+      s.council.replication_targets(),
     )
   }) else {
     return;
@@ -4915,7 +4926,8 @@ async fn drive_config_council(
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
   // This period's election timing, derived from the measured paths to the other voters (§4.8 "Derived
   // constants"): ten times the slowest voter's round-trip tail, floored at ten periods — the floor on any
-  // loopback, and what `Daemon::council_timing` reports.
+  // loopback, and what `Daemon::council_timing` reports. Voters only: a member being caught up takes no part
+  // in an election.
   let timing = derive_group_timing(&others, |s, timing| s.council_timing = timing);
   // A leader's invitation (thesis §3.10, leadership transfer) outranks this period's timer.
   if campaign_if_invited(Group::Council, &others, budget, timer, in_flight).await {
@@ -4923,7 +4935,8 @@ async fn drive_config_council(
   }
 
   if is_leader {
-    lead_council_period(&others, budget, timer, &timing, in_flight).await;
+    let replicated: Vec<HostId> = targets.into_iter().filter(|peer| *peer != local).collect();
+    lead_council_period(&replicated, budget, timer, &timing, in_flight).await;
     return;
   }
   if others.is_empty() {
@@ -4999,16 +5012,22 @@ async fn drive_root_group(
   timer: &mut ElectionTimer,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let Some((is_voter, is_leader, contact, voters)) = state::with_state(|s| {
+  let Some((is_voter, is_leader, contact, voters, targets)) = state::with_state(|s| {
     if s.recovery.root.is_some() {
-      return (false, false, s.root.leader_contact(), Vec::new());
+      return (
+        false,
+        false,
+        s.root.leader_contact(),
+        Vec::new(),
+        Vec::new(),
+      );
     }
-    let voters = s.root.voters();
     (
       s.root.is_voter(local),
       s.root.is_leader(),
       s.root.leader_contact(),
-      voters,
+      s.root.voters(),
+      s.root.replication_targets(),
     )
   }) else {
     return;
@@ -5036,7 +5055,8 @@ async fn drive_root_group(
   }
 
   if is_leader {
-    lead_root_period(&others, budget, timer, &timing, in_flight).await;
+    let replicated: Vec<HostId> = targets.into_iter().filter(|peer| *peer != local).collect();
+    lead_root_period(&replicated, budget, timer, &timing, in_flight).await;
     return;
   }
   if others.is_empty() {

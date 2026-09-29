@@ -266,3 +266,38 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     - fleet suite 53/53, CLI process suite 13/13.
   - Measured: 4,000 changes cost 25.5 µs per change before and 0.6 µs after; retained bytes 90,083 before and
     45,607 after (`docs/wip/BENCHMARKS.md`).
+- **Slice 6 (2026-09-28): learners with catch-up rounds** (thesis §4.2.1; verified against the text). The
+  core stages the members a target voter set adds (`RaftNode::catch_up`). A staged member is a replication
+  target counted toward nothing. Each round replicates what the leader held when it began, and the member
+  is caught up when a round completes within one CheckQuorum window. It is aborted after a whole window in
+  which its lag did not shrink (`STALLED_WINDOWS`; the first tick only sets the baseline, so the abort comes
+  at least one election timeout in, as a transfer's does). A new member's replication starts at the leader's
+  end, so the conflict hint finds its end in one refusal and a nearly current member is not sent the whole
+  log. Both groups' `reconcile_voters` stage before the joint change. The fleet keeps a session to a staged
+  member (`DirectContact::Staged`), and the election timing counts voters only.
+  - **Measured.** Figure 4.4(a) replayed (a fourth voter with an empty log, 40 entries behind at a
+    two-entry budget, then the loss of an original voter): 21 rounds without a commit when added directly,
+    1 when staged.
+  - **Explorer.** It now explores membership changes: a spare node, adds through staging, and random
+    removals including the leader. At full scale, in release, 27.7 s:
+
+    | Counter | Three voters | Five voters |
+    |---|---|---|
+    | changes begun | 2,571 | 2,200 |
+    | members caught up first | 1,359 | 1,151 |
+    | stagings aborted | 147 | 128 |
+
+    There was no violation.
+  - **Found on the way:**
+    - The explorer's own snapshot encoding dropped configuration entries, and its first membership run
+      flagged the compacting node at seed 0, step 3,018. Its new trace tool (`replay_to_the_first_violation`)
+      named the model's fault in one replay.
+    - The groups' `voters()` returned the replication targets, which the recovery plan and elections read
+      as the voter set. The CLI drain test caught it before commit: `DrainReport { council: NoTarget }`,
+      and no survivor led within 40 s.
+  - **Drain timing.** `SIGTERM` to a survivor in office took 171–208 ms over five runs, against 106–127 ms
+    at `4e38d3e`. A timestamped trace splits one run: the drain's start to the successor winning took 109 ms
+    (one period, unchanged); `SIGTERM` to the drain's start took about 95 ms. The daemon checks for a stop
+    once per 100 ms heartbeat, so that part is the phase between the test's signal and that check. What
+    shifted the phase is not established.
+  - Fleet suite 53/53, CLI suite 13/13.

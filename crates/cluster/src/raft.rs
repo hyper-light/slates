@@ -38,6 +38,16 @@
 //! reply never moves it back; and an append anchored inside a follower's committed prefix is taken from the
 //! follower's commit index on, never refused
 //! (`docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`).
+//!
+//! And **learners with catch-up rounds** (thesis §4.2.1): a member a voter set adds is staged —
+//! replicated to in rounds, each carrying what the leader held when it began, counted toward no quorum —
+//! and [`catch_up`](RaftNode::catch_up) reports it ready once a round completes within one CheckQuorum
+//! window (under an election timeout); a member whose lag does not shrink for a whole window is aborted
+//! ("unavailable or so slow that it will never catch up"). Staging is leader-local and ends with
+//! leadership. Replaying the thesis's Figure 4.4(a) — a fourth voter with an empty log, then the loss of
+//! an original voter — the group could not commit for 21 replication rounds when the newcomer was added
+//! directly, and committed in the first round when it was staged
+//! (`a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does`).
 //! The multi-node **conformance suite** (`tests/raft.rs`) drives a cluster through election, replication,
 //! a partition and a membership change, checking Election Safety, Log Matching, Leader Completeness and
 //! State Machine Safety.
@@ -179,6 +189,51 @@ struct Transfer {
 /// election timeout; a transfer started just before a tick has only a sliver of a timeout behind it at that
 /// tick, so the abort comes at the second tick — at least one whole election timeout, at most two.
 const TRANSFER_QUORUM_CHECKS: u8 = 2;
+
+/// A member being caught up before it votes (thesis §4.2.1, "Catching up new servers"): the leader
+/// replicates to it in rounds, each replicating everything the leader held when the round began, and the
+/// member is caught up once a round completes within one CheckQuorum window — under an election timeout,
+/// "the assumption that there are not enough unreplicated entries to create a significant availability
+/// gap". Leader-local, never replicated: a new leader stages afresh.
+#[derive(Clone, Copy, Debug)]
+struct Staging {
+  /// The leader's last index when the current round began: the round completes when the member matches it.
+  round_end: u64,
+  /// Whether a CheckQuorum tick has passed since the current round began.
+  window_passed: bool,
+  /// The member's lag behind the leader's last index at the previous tick (`u64::MAX` before the first).
+  lag_at_tick: u64,
+  /// Consecutive whole windows in which that lag did not shrink.
+  strikes: u8,
+  /// Whether a round has completed within one window.
+  caught_up: bool,
+}
+
+/// Derived: the whole CheckQuorum windows (election timeouts) a staged member's lag may go without
+/// shrinking before its staging is aborted (thesis §4.2.1: "the leader should also abort the change if the
+/// new server is unavailable or is so slow that it will never catch up"). One: a window holds about ten
+/// replication rounds, and an available member takes at least a batch in each. The first tick after
+/// staging begins only sets the baseline — the window before it may be a sliver — so the abort comes at the
+/// second tick at the earliest, at least one whole election timeout after staging began, as a transfer's
+/// does ([`TRANSFER_QUORUM_CHECKS`]).
+const STALLED_WINDOWS: u8 = 1;
+
+/// Where catching up the members a voter set adds stands (thesis §4.2.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatchUp {
+  /// Every member the target set adds is caught up, or it adds none: the membership change may begin.
+  Ready,
+  /// Members are still being caught up; the leader replicates to them in rounds.
+  Pending,
+  /// A staged member's lag did not shrink for [`STALLED_WINDOWS`] whole windows, so its staging ended. A
+  /// later call stages it afresh ("the caller may always try again").
+  Aborted {
+    /// The member whose staging ended.
+    member: HostId,
+  },
+  /// This node does not lead.
+  NotLeader,
+}
 
 /// A voter configuration (Raft §6): the base voter set and, during a membership change, the incoming
 /// set. A decision needs a majority of the base and — when `joint` is set — of the incoming set too.
@@ -468,6 +523,13 @@ pub struct RaftNode {
   transfer: Option<Transfer>,
   /// Transfers this node started that were aborted at their deadline (the non-vacuity counter).
   transfers_aborted: u64,
+  /// The members being caught up before they vote, while leading (thesis §4.2.1); bounded by the target
+  /// voter set the caller passes ([`catch_up`](RaftNode::catch_up)).
+  staging: BTreeMap<HostId, Staging>,
+  /// The member whose staging ended since the last [`catch_up`](RaftNode::catch_up), reported there once.
+  staging_aborted: Option<HostId>,
+  /// Stagings aborted (the non-vacuity counter of the abort path).
+  stagings_aborted: u64,
 }
 
 impl RaftNode {
@@ -499,6 +561,9 @@ impl RaftNode {
       snapshot_data: Vec::new(),
       transfer: None,
       transfers_aborted: 0,
+      staging: BTreeMap::new(),
+      staging_aborted: None,
+      stagings_aborted: 0,
     }
   }
 
@@ -755,6 +820,7 @@ impl RaftNode {
     self.leader_hint = None;
     self.votes.clear();
     self.transfer = None;
+    self.staging.clear();
   }
 
   /// Becomes leader if the votes gathered this election are a majority of the voters, initialising the
@@ -766,6 +832,8 @@ impl RaftNode {
     }
     self.role = Role::Leader;
     self.transfer = None;
+    self.staging.clear();
+    self.staging_aborted = None;
     // Start the CheckQuorum window already in contact with the voters that just elected it, so the first
     // check does not spuriously step a freshly-won leader down before its heartbeats have replied.
     self.contacts = self.votes.clone();
@@ -806,6 +874,9 @@ impl RaftNode {
   /// (there is no session to it). Bounded: the extra targets drop out the moment the change commits.
   pub fn replication_targets(&self) -> Vec<HostId> {
     let mut set: BTreeSet<HostId> = self.all_voters().into_iter().collect();
+    if self.role == Role::Leader {
+      set.extend(self.staging.keys().copied());
+    }
     if self.latest_config_index() > self.commit_index
       && let Some(outgoing) = self.config_before_latest()
     {
@@ -1172,6 +1243,21 @@ impl RaftNode {
     self
       .next_index
       .insert(follower, next.max(matched.saturating_add(1)));
+    // A staged member that has taken everything its round replicates completes the round: within one
+    // window it is caught up; otherwise the next round replicates what the leader holds now (thesis
+    // §4.2.1's rounds, which shrink as it gains).
+    let last = self.last_log_index();
+    if let Some(staging) = self.staging.get_mut(&follower)
+      && !staging.caught_up
+      && matched >= staging.round_end
+    {
+      if staging.window_passed {
+        staging.round_end = last;
+        staging.window_passed = false;
+      } else {
+        staging.caught_up = true;
+      }
+    }
   }
 
   /// Appends `command` to the leader's own log at the current term and updates its self-match, so a
@@ -1373,6 +1459,7 @@ impl RaftNode {
       return;
     }
     self.age_transfer();
+    self.age_staging();
     let mut reachable = self.contacts.clone();
     reachable.insert(self.id);
     if !self.is_majority(&reachable) {
@@ -1381,8 +1468,134 @@ impl RaftNode {
       self.has_leader = false;
       self.leader_hint = None;
       self.transfer = None;
+      self.staging.clear();
     }
     self.contacts.clear();
+  }
+
+  /// One CheckQuorum tick of every staging not yet caught up: the round in progress has now spanned a
+  /// window, and a member whose lag has not shrunk for [`STALLED_WINDOWS`] whole windows is aborted
+  /// (counted, and reported by the next [`catch_up`](RaftNode::catch_up)).
+  fn age_staging(&mut self) {
+    let last = self.last_log_index();
+    let matches: Vec<(HostId, u64)> = self
+      .staging
+      .keys()
+      .map(|member| (*member, self.match_of(*member)))
+      .collect();
+    let mut aborted = Vec::new();
+    for (member, matched) in matches {
+      let Some(staging) = self.staging.get_mut(&member) else {
+        continue;
+      };
+      if staging.caught_up {
+        continue;
+      }
+      staging.window_passed = true;
+      let lag = last.saturating_sub(matched);
+      staging.strikes = if lag < staging.lag_at_tick {
+        0
+      } else {
+        staging.strikes.saturating_add(1)
+      };
+      staging.lag_at_tick = lag;
+      if staging.strikes >= STALLED_WINDOWS {
+        aborted.push(member);
+      }
+    }
+    for member in aborted {
+      self.staging.remove(&member);
+      self.forget_progress(member);
+      self.stagings_aborted = self.stagings_aborted.saturating_add(1);
+      self.staging_aborted = Some(member);
+    }
+  }
+
+  /// Forgets a non-voter's replication progress, so the maps hold only the members this leader serves.
+  fn forget_progress(&mut self, member: HostId) {
+    if !self.is_voter(member) {
+      self.next_index.remove(&member);
+      self.match_index.remove(&member);
+    }
+  }
+
+  /// Catches up, before they vote, the members `target` adds to the voter set in force (thesis §4.2.1): each
+  /// is staged — replicated to in rounds, counted toward nothing — until a round completes within one
+  /// CheckQuorum window. Returns [`CatchUp::Ready`] once every added member is caught up (or `target` adds
+  /// none), so the caller may begin the membership change; [`CatchUp::Pending`] while they are being caught
+  /// up; [`CatchUp::Aborted`] once, for a member whose staging ended (the next call stages it afresh). A
+  /// staged member `target` no longer names is unstaged. A new member's replication starts at this leader's
+  /// end, as an elected leader's followers' do, so a member already holding most of the log is not sent the
+  /// whole of it.
+  pub fn catch_up(&mut self, target: &[HostId]) -> CatchUp {
+    if self.role != Role::Leader {
+      return CatchUp::NotLeader;
+    }
+    let voters = self.all_voters();
+    let adds: BTreeSet<HostId> = target
+      .iter()
+      .copied()
+      .filter(|member| *member != self.id && !voters.contains(member))
+      .collect();
+    let unstaged: Vec<HostId> = self
+      .staging
+      .keys()
+      .copied()
+      .filter(|member| !adds.contains(member))
+      .collect();
+    for member in unstaged {
+      self.staging.remove(&member);
+      self.forget_progress(member);
+    }
+    if let Some(member) = self.staging_aborted.take()
+      && adds.contains(&member)
+    {
+      return CatchUp::Aborted { member };
+    }
+    let last = self.last_log_index();
+    for member in &adds {
+      if !self.staging.contains_key(member) {
+        self.staging.insert(
+          *member,
+          Staging {
+            round_end: last,
+            window_passed: false,
+            lag_at_tick: u64::MAX,
+            strikes: 0,
+            caught_up: false,
+          },
+        );
+        self.next_index.insert(*member, last.saturating_add(1));
+        self.match_index.insert(*member, 0);
+      }
+    }
+    if adds.iter().all(|member| {
+      self
+        .staging
+        .get(member)
+        .is_some_and(|staging| staging.caught_up)
+    }) {
+      CatchUp::Ready
+    } else {
+      CatchUp::Pending
+    }
+  }
+
+  /// The members being caught up while leading, with whether each is caught up.
+  pub fn staged(&self) -> Vec<(HostId, bool)> {
+    if self.role != Role::Leader {
+      return Vec::new();
+    }
+    self
+      .staging
+      .iter()
+      .map(|(member, staging)| (*member, staging.caught_up))
+      .collect()
+  }
+
+  /// The stagings this node aborted (thesis §4.2.1's abort), over its life.
+  pub fn stagings_aborted(&self) -> u64 {
+    self.stagings_aborted
   }
 
   /// One CheckQuorum tick of the transfer in flight: past [`TRANSFER_QUORUM_CHECKS`] ticks it is aborted
@@ -3366,5 +3579,224 @@ mod tests {
       }
     }
     false
+  }
+
+  /// A leader of {A, B, C} holding ten committed entries (B took them), and D, a fresh node outside the
+  /// voter set.
+  fn leader_with_history() -> (RaftNode, RaftNode, RaftNode) {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    for value in 0..10u8 {
+      leader.append_command(vec![value]);
+    }
+    let mut follower_b = RaftNode::new(B, vec![A, B, C]);
+    let reply = follower_b.on_append_entries(leader.replicate_to(B, UNBOUNDED).expect("an append"));
+    leader.on_append_reply(reply);
+    assert_eq!(leader.commit_index(), 10);
+    let member = RaftNode::new(D, vec![A, B, C]);
+    (leader, follower_b, member)
+  }
+
+  /// One replication round from `leader` to the staged `member` (id D).
+  fn replicate_to_d(leader: &mut RaftNode, member: &mut RaftNode) {
+    if let Some(append) = leader.replicate_to(D, UNBOUNDED) {
+      let reply = member.on_append_entries(append);
+      leader.on_append_reply(reply);
+    }
+  }
+
+  /// Thesis §4.2.1: a member a voter set adds is caught up before the change may begin — the leader stages it,
+  /// replicates to it (it is a replication target, never a voter), and reports it ready once a round has
+  /// completed within one CheckQuorum window; its acknowledgements count toward no commit.
+  #[test]
+  fn a_new_member_is_caught_up_before_the_change_may_begin() {
+    let (mut leader, _follower_b, mut member) = leader_with_history();
+    let target = [A, B, C, D];
+    assert_eq!(leader.catch_up(&target), CatchUp::Pending);
+    assert!(
+      leader.replication_targets().contains(&D),
+      "D is replicated to"
+    );
+    assert!(!leader.is_voter(D), "but it does not vote");
+    for _ in 0..3 {
+      replicate_to_d(&mut leader, &mut member);
+    }
+    assert_eq!(member.last_log_index(), 10, "D holds the log");
+    assert_eq!(leader.catch_up(&target), CatchUp::Ready);
+    assert!(leader.begin_membership_change(target.to_vec()));
+  }
+
+  /// Learners count toward nothing (thesis §4.2.1: "not yet counted towards majorities"): with B and C
+  /// silent, a staged D taking every entry commits none of them.
+  #[test]
+  fn a_staged_member_counts_toward_no_commit() {
+    let (mut leader, _follower_b, mut member) = leader_with_history();
+    assert_eq!(leader.catch_up(&[A, B, C, D]), CatchUp::Pending);
+    leader.append_command(b"new".to_vec());
+    for _ in 0..3 {
+      replicate_to_d(&mut leader, &mut member);
+    }
+    assert_eq!(member.last_log_index(), 11, "D took the new entry");
+    assert_eq!(
+      leader.commit_index(),
+      10,
+      "D's acknowledgement committed nothing"
+    );
+  }
+
+  /// Thesis §4.2.1's abort: a staged member that never answers has its staging ended at the second
+  /// CheckQuorum tick — the baseline, then one whole election timeout without progress — reported once and
+  /// counted; the next call stages it afresh ("the caller may always try again"). One tick is not enough.
+  #[test]
+  fn a_member_that_never_answers_is_aborted_and_staged_afresh_after() {
+    let (mut leader, _follower_b, _member) = leader_with_history();
+    let target = [A, B, C, D];
+    assert_eq!(leader.catch_up(&target), CatchUp::Pending);
+    for tick in 0..=STALLED_WINDOWS {
+      if tick == STALLED_WINDOWS {
+        assert_eq!(
+          leader.catch_up(&target),
+          CatchUp::Pending,
+          "the baseline tick alone aborts nothing"
+        );
+      }
+      // B and C keep the leader in contact, so CheckQuorum does not depose it.
+      for voter in [B, C] {
+        leader.on_append_reply(AppendReply {
+          read_context: 0,
+          follower: voter,
+          term: leader.term(),
+          success: true,
+          match_index: 0,
+          conflict_term: 0,
+          conflict_index: 0,
+        });
+      }
+      leader.check_quorum();
+      assert!(leader.is_leader(), "tick {tick}");
+    }
+    assert_eq!(leader.catch_up(&target), CatchUp::Aborted { member: D });
+    assert_eq!(leader.stagings_aborted(), 1);
+    assert_eq!(leader.catch_up(&target), CatchUp::Pending, "staged afresh");
+  }
+
+  /// A round that spans a CheckQuorum window does not count (it may have lasted an election timeout); the
+  /// next round, completing within a window, does.
+  #[test]
+  fn a_round_that_spans_a_window_is_followed_by_one_that_counts() {
+    let (mut leader, _follower_b, mut member) = leader_with_history();
+    let target = [A, B, C, D];
+    assert_eq!(leader.catch_up(&target), CatchUp::Pending);
+    for voter in [B, C] {
+      leader.on_append_reply(AppendReply {
+        read_context: 0,
+        follower: voter,
+        term: leader.term(),
+        success: true,
+        match_index: 0,
+        conflict_term: 0,
+        conflict_index: 0,
+      });
+    }
+    leader.check_quorum();
+    for _ in 0..3 {
+      replicate_to_d(&mut leader, &mut member);
+    }
+    assert_eq!(member.last_log_index(), 10);
+    assert_eq!(
+      leader.staged(),
+      vec![(D, true)],
+      "the first round spanned a window; the next completed within one"
+    );
+    assert_eq!(leader.catch_up(&target), CatchUp::Ready);
+  }
+
+  /// Staging is leader-local: a leader that loses leadership forgets it, and a node that leads again starts
+  /// with none.
+  #[test]
+  fn staging_ends_with_leadership() {
+    let (mut leader, _follower_b, _member) = leader_with_history();
+    assert_eq!(leader.catch_up(&[A, B, C, D]), CatchUp::Pending);
+    leader.observe_term(leader.term() + 1);
+    assert!(!leader.is_leader());
+    assert!(leader.staged().is_empty());
+    assert!(!leader.replication_targets().contains(&D));
+    assert_eq!(leader.catch_up(&[A, B, C, D]), CatchUp::NotLeader);
+  }
+
+  /// Shape: the entry bytes one append carries in the availability-gap test — about two of its entries — so
+  /// a lagging member takes many rounds to catch up, as it takes many heartbeats on a real session.
+  const GAP_BUDGET: usize = 32;
+  /// Shape: the entries the group holds before the change — a lag of about twenty rounds at the gap budget.
+  const GAP_HISTORY: u8 = 40;
+
+  /// One replication round from `leader` to each of `alive` it replicates to, each reply folded.
+  fn gap_round(leader: &mut RaftNode, alive: &mut BTreeMap<HostId, RaftNode>) {
+    for target in leader.replication_targets() {
+      let Some(follower) = alive.get_mut(&target) else {
+        continue;
+      };
+      if let Some(append) = leader.replicate_to(target, GAP_BUDGET) {
+        let reply = follower.on_append_entries(append);
+        leader.on_append_reply(reply);
+      }
+    }
+  }
+
+  /// Thesis §4.2.1, Figure 4.4(a), replayed: voters {A, B, C} hold [`GAP_HISTORY`] entries; D joins with an
+  /// empty log and the voters become {A, B, C, D}; then C fails, so a commit needs three of four and D must
+  /// hold it. Returns the replication rounds the first entry proposed after C's failure took to commit.
+  fn rounds_to_commit_after_a_loss(staged: bool) -> u64 {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    let mut alive: BTreeMap<HostId, RaftNode> = [B, C]
+      .into_iter()
+      .map(|id| (id, RaftNode::new(id, vec![A, B, C])))
+      .collect();
+    for value in 0..GAP_HISTORY {
+      leader.append_command(vec![value]);
+    }
+    while leader.commit_index() < u64::from(GAP_HISTORY) {
+      gap_round(&mut leader, &mut alive);
+    }
+    alive.insert(D, RaftNode::new(D, vec![A, B, C]));
+    let target = [A, B, C, D];
+    if staged {
+      while leader.catch_up(&target) != CatchUp::Ready {
+        gap_round(&mut leader, &mut alive);
+      }
+    }
+    assert!(leader.begin_membership_change(target.to_vec()));
+    while leader.in_joint_configuration() {
+      gap_round(&mut leader, &mut alive);
+      leader.complete_membership_change();
+    }
+    while leader.commit_index() < leader.last_log_index() {
+      gap_round(&mut leader, &mut alive);
+    }
+    alive.remove(&C);
+    leader.append_command(b"after the loss".to_vec());
+    let proposed = leader.last_log_index();
+    let mut rounds = 0;
+    while leader.commit_index() < proposed {
+      gap_round(&mut leader, &mut alive);
+      rounds += 1;
+      assert!(rounds <= u64::from(GAP_HISTORY), "bounded");
+    }
+    rounds
+  }
+
+  /// Thesis §4.2.1 ("if a fourth server with an empty log is added ... and one of the original three servers
+  /// fails, the cluster will be temporarily unable to commit new entries"): added directly, the newcomer
+  /// leaves the group unable to commit for as many rounds as it takes to catch up; staged first, the group
+  /// commits in the first round after the loss.
+  #[test]
+  fn a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does() {
+    let direct = rounds_to_commit_after_a_loss(false);
+    let staged = rounds_to_commit_after_a_loss(true);
+    eprintln!("rounds to the first commit after the loss: direct {direct}, staged {staged}");
+    assert_eq!(staged, 1, "the staged newcomer held the log already");
+    assert!(
+      direct > staged + 5,
+      "the direct newcomer's catch-up held commits back: {direct} rounds"
+    );
   }
 }

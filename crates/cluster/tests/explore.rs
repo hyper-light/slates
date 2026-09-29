@@ -28,27 +28,31 @@
 //! batch boundaries, and a snapshot's state is sometimes corrupted in flight, which its recipient must
 //! decline (the groups decode the state first, `crate::fold`) without the leader crediting it.
 //!
-//! Not explored yet: membership changes (the conformance suite `tests/raft.rs` covers them by script). The
-//! model-level exploration of the Fast Raft and ParallelRaft log shapes extends this driver. Test by use
-//! (R5): the real core, the council's drive, observable outcomes.
+//! Membership changes are explored (Raft §6, thesis §4.2.1): every history has one spare node beyond its
+//! voters, and the leader's reconfiguration move — the groups' `reconcile_voters` rule — brings a non-voter
+//! in through staging (caught up in rounds before the joint change may begin) while there is room for one
+//! more voter, takes a random voter out (the leader included, which then steps down, §4.2.2) when there is
+//! not, and completes a joint change once its entry commits. The model-level exploration of the Fast Raft
+//! and ParallelRaft log shapes extends this driver. Test by use (R5): the real core, the council's drive,
+//! observable outcomes.
 
 // Test harness: an unwrap, expect or panic here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_cluster::raft::{InstallSnapshot, LogEntry, RaftNode, SavedRaft};
+use slates_cluster::raft::{CatchUp, InstallSnapshot, LogEntry, RaftNode, SavedRaft};
 use slates_cluster::raft_wire::RaftMessage;
 use slates_db::register::HostId;
 
 /// Shape: the seeds each cluster size is explored under at full scale — the `--ignored` run CI makes in
-/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes is 14 s there
-/// and 167 s in a debug build (measured 2026-09-28, Apple M5 Max), so the workspace's debug run explores
-/// [`SEEDS_QUICK`] instead.
+/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 27.7 s there
+/// with compaction and membership changes explored (measured 2026-09-28, Apple M5 Max; 14 s before them),
+/// so the workspace's debug run explores [`SEEDS_QUICK`] instead.
 const SEEDS_FULL: u64 = 400;
-/// Shape: the seeds the workspace's debug run explores — about ten seconds of a debug build at 167 s per 400
-/// seeds, and still enough histories for every non-vacuity floor below (each is at least one event per seed;
-/// full scale counted 18 invited elections per seed at three voters).
+/// Shape: the seeds the workspace's debug run explores — 20.5 s of a debug build (2026-09-28), and still
+/// enough histories for every non-vacuity floor below (each is at least one event per seed but the rare
+/// staging abort's).
 const SEEDS_QUICK: u64 = 24;
 /// Shape: the steps one seeded history runs.
 const STEPS: usize = 4_000;
@@ -63,13 +67,17 @@ const IN_FLIGHT_BOUND: usize = 256;
 /// Shape: the commands a history proposes at most, so the logs stay small enough to compare pairwise after
 /// every step.
 const PROPOSALS_BOUND: u64 = 64;
+/// Shape: the events a replayed history keeps for its diagnosis — the last few hundred steps' worth.
+const TRACE_BOUND: usize = 2_000;
+/// Shape: the fewest voters a reconfiguration leaves — three, the smallest group that tolerates a failure.
+const MIN_VOTERS: usize = 3;
 /// Shape: the entry bytes one append carries — about two of the explorer's command entries (21 wire bytes
 /// each: term, length, an eight-byte command, the configuration flag) — so catching a follower up takes
 /// several batches and every batch boundary is explored.
 const APPEND_BUDGET: usize = 48;
-/// Shape: the actions one step chooses among — the hundred of the original mix and four more: three for a
-/// compaction, one for corrupting a snapshot in flight.
-const ACTIONS: usize = 104;
+/// Shape: the actions one step chooses among — the hundred of the original mix and eight more: three for a
+/// compaction, one for corrupting a snapshot in flight, four for a reconfiguration period.
+const ACTIONS: usize = 108;
 
 /// A splitmix64 generator: deterministic from its seed, so every failure replays from the seed printed.
 struct Rng(u64);
@@ -126,6 +134,14 @@ struct Counters {
   bounded_batches: u64,
   /// Consistency-check refusals that carried a conflict hint (Raft §5.3).
   conflict_hints: u64,
+  /// Joint membership changes begun (Raft §6).
+  changes_begun: u64,
+  /// Joint membership changes completed (`C_new` appended).
+  changes_completed: u64,
+  /// Stagings that caught a member up before its change began (thesis §4.2.1).
+  members_caught_up: u64,
+  /// Stagings aborted: the member's lag did not shrink for a whole window.
+  stagings_aborted: u64,
 }
 
 /// One explored cluster: the nodes, what each last retained, the network, the partition, and the history
@@ -147,14 +163,17 @@ struct Cluster {
   /// The next snapshot a leader ships is corrupted in flight (set by the adversary's corruption move).
   corrupt_next_snapshot: bool,
   counters: Counters,
+  /// The last events of a replayed history, for diagnosing a violation ([`replay_to_the_first_violation`]);
+  /// `None` in an ordinary exploration, which formats nothing.
+  trace: Option<std::collections::VecDeque<String>>,
 }
 
 impl Cluster {
+  /// `size` voters and one spare node beyond them, a non-voter until a reconfiguration brings it in.
   fn new(size: u64) -> Cluster {
     let voters: Vec<HostId> = (1..=size).map(HostId).collect();
-    let nodes: Vec<RaftNode> = voters
-      .iter()
-      .map(|id| RaftNode::new(*id, voters.clone()))
+    let nodes: Vec<RaftNode> = (1..=size + 1)
+      .map(|id| RaftNode::new(HostId(id), voters.clone()))
       .collect();
     let retained = nodes.iter().map(RaftNode::saved).collect();
     Cluster {
@@ -168,7 +187,61 @@ impl Cluster {
       proposals: 0,
       corrupt_next_snapshot: false,
       counters: Counters::default(),
+      trace: None,
     }
+  }
+
+  /// Records an event of a replayed history (bounded to [`TRACE_BOUND`], the oldest dropped).
+  fn note(&mut self, event: impl FnOnce() -> String) {
+    if let Some(trace) = &mut self.trace {
+      if trace.len() >= TRACE_BOUND {
+        trace.pop_front();
+      }
+      trace.push_back(event());
+    }
+  }
+
+  /// A one-line summary of every node: role, term, commit and snapshot, voters, joint, last log entries.
+  fn summary(&self) -> String {
+    self
+      .nodes
+      .iter()
+      .map(|node| {
+        let saved = node.saved();
+        let tail: Vec<String> = full_log(&saved)
+          .iter()
+          .enumerate()
+          .skip(full_log(&saved).len().saturating_sub(6))
+          .map(|(i, entry)| {
+            format!(
+              "{}:t{}{}",
+              i + 1,
+              entry.term,
+              entry
+                .config
+                .as_ref()
+                .map_or(String::new(), |config| format!(
+                  "/cfg{:?}+{:?}",
+                  config.voters, config.joint
+                ))
+            )
+          })
+          .collect();
+        format!(
+          "{:?} {:?} t{} commit {} snap {} voters {:?} joint {} staged {:?} tail [{}]",
+          node.id(),
+          node.role(),
+          node.term(),
+          node.commit_index(),
+          node.snapshot_index(),
+          node.all_voters(),
+          node.in_joint_configuration(),
+          node.staged(),
+          tail.join(" ")
+        )
+      })
+      .collect::<Vec<_>>()
+      .join("\n")
   }
 
   fn position(&self, id: HostId) -> usize {
@@ -209,6 +282,8 @@ impl Cluster {
 
   /// An election timeout at node `at`: a pre-election, its pre-votes sent to every other voter.
   fn time_out(&mut self, at: usize) {
+    let id = self.nodes[at].id();
+    self.note(|| format!("time out {id:?}"));
     let was_leader = self.nodes[at].is_leader();
     let pre_votes = self.nodes[at].on_election_timeout();
     self.finish_election(at, was_leader);
@@ -278,6 +353,12 @@ impl Cluster {
   /// Delivers the in-flight message at `index`: a request is answered, a reply folded by its sender.
   fn deliver(&mut self, index: usize) {
     let flight = self.in_flight.remove(index);
+    self.note(|| {
+      format!(
+        "deliver {:?} -> {:?}: {:?}",
+        flight.from, flight.to, flight.message
+      )
+    });
     let at = self.position(flight.to);
     let was_leader = self.nodes[at].is_leader();
     let mut outgoing: Vec<RaftMessage> = Vec::new();
@@ -397,8 +478,71 @@ impl Cluster {
     self.corrupt_next_snapshot = true;
   }
 
+  /// One reconfiguration period of the leader, if there is one — the groups' `reconcile_voters` rule: complete
+  /// a joint change once its entry has committed; otherwise, with the log committed, bring a random non-voter
+  /// in through staging while the voters number fewer than the nodes, or take a random voter out (never
+  /// below three) when every node votes.
+  fn reconfigure(&mut self, rng: &mut Rng) {
+    let Some(at) = self.nodes.iter().position(RaftNode::is_leader) else {
+      return;
+    };
+    let node = &mut self.nodes[at];
+    if node.in_joint_configuration() {
+      let completed = node.complete_membership_change();
+      if completed {
+        self.counters.changes_completed += 1;
+      }
+      let leader_id = node.id();
+      self.note(|| format!("complete at {leader_id:?}: {completed}"));
+      self.retain(at);
+      return;
+    }
+    if node.last_log_index() != node.commit_index() {
+      return;
+    }
+    let voters = node.all_voters();
+    let voters_before = voters.len();
+    let outside: Vec<HostId> = self
+      .nodes
+      .iter()
+      .map(RaftNode::id)
+      .filter(|id| !voters.contains(id))
+      .collect();
+    let target: Vec<HostId> = if !outside.is_empty() {
+      let mut target = voters;
+      target.push(outside[rng.below(outside.len())]);
+      target.sort_unstable_by_key(|id| id.0);
+      target
+    } else if voters.len() > MIN_VOTERS {
+      let out = voters[rng.below(voters.len())];
+      voters.into_iter().filter(|id| *id != out).collect()
+    } else {
+      return;
+    };
+    let node = &mut self.nodes[at];
+    let outcome = node.catch_up(&target);
+    let leader_id = node.id();
+    self.note(|| format!("reconfigure at {leader_id:?} toward {target:?}: {outcome:?}"));
+    let node = &mut self.nodes[at];
+    match outcome {
+      CatchUp::Ready => {
+        if node.begin_membership_change(target.clone()) {
+          self.counters.changes_begun += 1;
+          if target.len() > voters_before {
+            self.counters.members_caught_up += 1;
+          }
+        }
+      }
+      CatchUp::Aborted { .. } => self.counters.stagings_aborted += 1,
+      CatchUp::Pending | CatchUp::NotLeader => {}
+    }
+    self.retain(at);
+  }
+
   /// Crashes node `at` and restarts it from what it last retained.
   fn crash(&mut self, at: usize) {
+    let id = self.nodes[at].id();
+    self.note(|| format!("crash {id:?}"));
     self.nodes[at] =
       RaftNode::restore(self.retained[at].clone()).expect("a retained state restores");
     self.counters.crashes += 1;
@@ -451,6 +595,7 @@ impl Cluster {
         self.compact(rng, at);
       }
       103 => self.corrupt_snapshot(),
+      104..=107 => self.reconfigure(rng),
       _ => {}
     }
   }
@@ -623,15 +768,62 @@ fn full_log(saved: &SavedRaft) -> Vec<LogEntry> {
   log
 }
 
-/// The explorer's snapshot state: every entry's term, command length and command, little-endian.
+/// The explorer's snapshot state: every entry whole — its term, its command (length-prefixed) and its
+/// configuration (a presence byte, then the voter set and the joint set's presence byte and set), little-
+/// endian. A configuration entry must survive the round trip: the first form kept only terms and commands,
+/// so a compacted joint-configuration entry came back a plain empty command and the State Machine Safety
+/// check flagged the compacting node (seed 0, step 3,018, 2026-09-28 — the model's fault, not Raft's).
 fn encode_history(entries: &[LogEntry]) -> Vec<u8> {
+  let hosts = |out: &mut Vec<u8>, set: &[HostId]| {
+    out.extend_from_slice(&u32::try_from(set.len()).unwrap().to_le_bytes());
+    for host in set {
+      out.extend_from_slice(&host.0.to_le_bytes());
+    }
+  };
   let mut out = Vec::new();
   for entry in entries {
     out.extend_from_slice(&entry.term.to_le_bytes());
     out.extend_from_slice(&u32::try_from(entry.command.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&entry.command);
+    match &entry.config {
+      None => out.push(0),
+      Some(config) => {
+        out.push(1);
+        hosts(&mut out, &config.voters);
+        match &config.joint {
+          None => out.push(0),
+          Some(joint) => {
+            out.push(1);
+            hosts(&mut out, joint);
+          }
+        }
+      }
+    }
   }
   out
+}
+
+/// A host set from the front of `bytes`: its count, then each id.
+fn take_hosts(bytes: &[u8]) -> Option<(Vec<HostId>, &[u8])> {
+  let (count, mut rest) = bytes.split_at_checked(4)?;
+  let count = usize::try_from(u32::from_le_bytes(count.try_into().ok()?)).ok()?;
+  let mut hosts = Vec::new();
+  for _ in 0..count {
+    let (id, tail) = rest.split_at_checked(8)?;
+    hosts.push(HostId(u64::from_le_bytes(id.try_into().ok()?)));
+    rest = tail;
+  }
+  Some((hosts, rest))
+}
+
+/// A presence byte from the front of `bytes`, or `None` when it is neither zero nor one.
+fn take_flag(bytes: &[u8]) -> Option<(bool, &[u8])> {
+  let (&flag, rest) = bytes.split_first()?;
+  match flag {
+    0 => Some((false, rest)),
+    1 => Some((true, rest)),
+    _ => None,
+  }
 }
 
 /// The history a snapshot state carries, or `None` when the bytes do not decode whole.
@@ -643,10 +835,28 @@ fn decode_history(bytes: &[u8]) -> Option<Vec<LogEntry>> {
     let (length, tail) = tail.split_at_checked(4)?;
     let length = usize::try_from(u32::from_le_bytes(length.try_into().ok()?)).ok()?;
     let (command, tail) = tail.split_at_checked(length)?;
-    entries.push(LogEntry::command(
-      u64::from_le_bytes(term.try_into().ok()?),
-      command.to_vec(),
-    ));
+    let (has_config, tail) = take_flag(tail)?;
+    let (config, tail) = if has_config {
+      let (voters, tail) = take_hosts(tail)?;
+      let (has_joint, tail) = take_flag(tail)?;
+      let (joint, tail) = if has_joint {
+        let (joint, tail) = take_hosts(tail)?;
+        (Some(joint), tail)
+      } else {
+        (None, tail)
+      };
+      (
+        Some(slates_cluster::raft::VoterConfig { voters, joint }),
+        tail,
+      )
+    } else {
+      (None, tail)
+    };
+    entries.push(LogEntry {
+      term: u64::from_le_bytes(term.try_into().ok()?),
+      command: command.to_vec(),
+      config,
+    });
     rest = tail;
   }
   Some(entries)
@@ -705,6 +915,10 @@ fn explore(size: u64, seeds: u64) -> Counters {
     total.snapshots_declined += c.snapshots_declined;
     total.bounded_batches += c.bounded_batches;
     total.conflict_hints += c.conflict_hints;
+    total.changes_begun += c.changes_begun;
+    total.changes_completed += c.changes_completed;
+    total.members_caught_up += c.members_caught_up;
+    total.stagings_aborted += c.stagings_aborted;
   }
   total
 }
@@ -735,6 +949,12 @@ fn explore_and_check_coverage(seeds: u64) {
       ),
       (counted.bounded_batches, "the budget bounded appends"),
       (counted.conflict_hints, "refusals carried conflict hints"),
+      (counted.changes_begun, "membership changes began"),
+      (counted.changes_completed, "membership changes completed"),
+      (
+        counted.members_caught_up,
+        "added members were caught up before their change",
+      ),
     ];
     for (count, path) in floors {
       assert!(
@@ -742,6 +962,12 @@ fn explore_and_check_coverage(seeds: u64) {
         "{size} voters: {path} ({count} over {seeds} seeds)"
       );
     }
+    // A staging aborts only when its member is cut off for a whole CheckQuorum window — 12 of 24 seeds at
+    // three voters, 4 of 24 at five (2026-09-28) — so this path is floored at once per exploration.
+    assert!(
+      counted.stagings_aborted > 0,
+      "{size} voters: a staging aborted"
+    );
   }
 }
 
@@ -760,4 +986,41 @@ fn the_dialect_keeps_raft_safety_under_an_adversarial_network() {
 #[ignore = "full scale: CI runs it in release (`cargo test -p slates-cluster --release --test explore -- --ignored`)"]
 fn the_dialect_keeps_raft_safety_at_full_scale() {
   explore_and_check_coverage(SEEDS_FULL);
+}
+
+/// Diagnosis: replays one seeded history of `SLATES_EXPLORE_SIZE` voters (seed `SLATES_EXPLORE_SEED`) with
+/// its trace on, and at the first step whose check fails prints the trace — the last events and every
+/// node's state after each step — to standard error before failing (R1: a test writes no host path; the
+/// caller redirects it). Run by hand: `SLATES_EXPLORE_SIZE=3 SLATES_EXPLORE_SEED=0 cargo test -p
+/// slates-cluster --test explore replay_to_the_first_violation -- --ignored --nocapture 2> <file>`.
+#[test]
+#[ignore = "a diagnosis tool, run by hand with its environment set"]
+fn replay_to_the_first_violation() {
+  let size: u64 = std::env::var("SLATES_EXPLORE_SIZE")
+    .unwrap()
+    .parse()
+    .unwrap();
+  let seed: u64 = std::env::var("SLATES_EXPLORE_SEED")
+    .unwrap()
+    .parse()
+    .unwrap();
+  let mut rng = Rng(seed ^ (size << 32));
+  let mut cluster = Cluster::new(size);
+  cluster.trace = Some(std::collections::VecDeque::new());
+  for step in 0..STEPS {
+    let calm = (step / STRETCH) % 2 == 1;
+    cluster.note(|| format!("== step {step} (calm {calm})"));
+    cluster.step(&mut rng, calm);
+    let summary = cluster.summary();
+    cluster.note(|| summary);
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      cluster.check(seed, step);
+    }));
+    if checked.is_err() {
+      for line in cluster.trace.take().unwrap() {
+        eprintln!("{line}");
+      }
+      panic!("violation at step {step}; the trace precedes this line");
+    }
+  }
 }

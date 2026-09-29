@@ -712,3 +712,24 @@ Max, macOS 26.4), 2026-09-28.
   the whole snapshot in place of the one entry it lacked, at every compaction. The third voter of a
   three-voter council never compacted itself, having been sent a snapshot each time. The leader now waits for
   its followers while the log is within twice the threshold.
+
+### Learners: the availability gap of the thesis's Figure 4.4(a) (2026-09-28)
+
+**Command:** `cargo test -p slates-cluster --lib a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does -- --nocapture`
+(deterministic; replication rounds, not wall time). Setup: voters {A, B, C} hold 40 entries; D joins with an
+empty log and the voters become {A, B, C, D}; then C fails. Appends carry about two entries.
+
+| newcomer | rounds from C's failure to the next commit |
+|---|---|
+| added directly | 21 |
+| staged first (thesis §4.2.1) | 1 |
+
+At the fleet's 100 ms heartbeat, that is about 2.1 s without a commit against 0.1 s.
+
+**Drain timing after staging.** Command: `SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli
+a_terminated_council_leader_process_hands_off_before_it_exits -- --exact --nocapture`, five runs.
+
+- `SIGTERM` to a survivor in office: 208 / 205 / 171 / 204 / 186 ms (106–127 ms at `4e38d3e`).
+- One timestamped run splits it: the drain's start to the successor winning took 109 ms (one period: the
+  invitation at +33 ms, the successor's next period at +109 ms); `SIGTERM` to the drain's start took about
+  95 ms. The daemon checks for a stop once per 100 ms heartbeat.
