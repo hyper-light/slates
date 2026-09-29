@@ -146,8 +146,9 @@ pub struct PreVoteReply {
 }
 
 /// A reply to a [`RequestVote`]: the replying voter, its current term (so a candidate learns of a newer
-/// term), and whether it granted the vote.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// term), whether it granted the vote, and — when it did — its window slots above the candidate's last log
+/// entry, which the candidate recovers from (`docs/wip/research/consensus-enhancements.md` §4).
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoteReply {
   /// The voter replying.
   pub voter: HostId,
@@ -155,6 +156,38 @@ pub struct VoteReply {
   pub term: u64,
   /// Whether the vote was granted.
   pub granted: bool,
+  /// The voter's window slots above the candidate's last log entry (empty unless granted).
+  pub reports: Vec<SlotReport>,
+}
+
+/// A proposer's command sent straight to every voter — the **fast track**
+/// (`docs/wip/research/consensus-enhancements.md` §3.7): a voter synced to the term's leader votes it at
+/// `index`, and the leader decides the index from the votes, committing in one round trip from the proposer
+/// when a fast quorum voted the same command.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastPropose {
+  /// The term the proposer knows.
+  pub term: u64,
+  /// The proposing node.
+  pub proposer: HostId,
+  /// The one-based index proposed at.
+  pub index: u64,
+  /// The command.
+  pub command: Vec<u8>,
+}
+
+/// A voter's fast vote, sent to its term's leader: the command it holds at `index` for this term (its first
+/// vote there stands; one vote per index per term).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FastVote {
+  /// The voter's term.
+  pub term: u64,
+  /// The voter.
+  pub voter: HostId,
+  /// The one-based index voted at.
+  pub index: u64,
+  /// The command voted.
+  pub command: Vec<u8>,
 }
 
 /// A leader's invitation to a caught-up voter to start an election at once (thesis §3.10, leadership
@@ -319,6 +352,26 @@ impl LogEntry {
 const ENTRY_COUNT_BYTES: usize = size_of::<u32>();
 /// Format: a presence flag on the Raft wire is one byte.
 const ENTRY_FLAG_BYTES: usize = 1;
+/// Format: the smallest entry's wire bytes — a term, an empty command's length, no configuration
+/// ([`LogEntry::encoded_len`] of a no-op).
+const MIN_ENTRY_BYTES: usize = size_of::<u64>() + ENTRY_COUNT_BYTES + ENTRY_FLAG_BYTES;
+
+/// Derived: the fast quorum of `voters` — the smallest `f` with `2f + q > 2n` for the classic quorum
+/// `q = ⌊n/2⌋ + 1`, the size at which a value a fast quorum accepted has the most votes in every classic
+/// quorum (Lamport, *Fast Paxos*, 2006; Fast Raft's ⌈3n/4⌉, which it equals — `tests/slot_model.rs` asserts
+/// it for every scope it runs).
+pub fn fast_quorum(voters: usize) -> usize {
+  let classic = voters / 2 + 1;
+  (1..=voters)
+    .find(|fast| {
+      fast
+        .saturating_mul(2)
+        .saturating_add(classic)
+        .saturating_sub(voters.saturating_mul(2))
+        > 0
+    })
+    .unwrap_or(voters)
+}
 
 /// A voter's election priority (`docs/wip/research/consensus-enhancements.md` §3.4): the round trip it
 /// would commit in as leader — its quorum round trip, the `⌊n/2⌋`-th smallest measured round trip to the
@@ -345,6 +398,37 @@ impl ElectionPriority {
   }
 }
 
+/// A slot in a node's **window** above its log (`docs/wip/research/consensus-enhancements.md` §4): the
+/// leader's entry that arrived ahead of a hole in the log, or a fast vote for a proposer's entry. A node
+/// accepts either only once it is synced to its term's leader, keeps it until it syncs to a newer term's
+/// leader — so Raft's truncation of the log never erases a vote a slot records — and reports it with its
+/// vote, for the new leader's recovery.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct WindowSlot {
+  /// The term it was accepted in: the leader's, for its entry; the voter's, for a fast vote.
+  pub term: u64,
+  /// Whether it is a fast vote, rather than the leader's entry.
+  pub fast: bool,
+  /// The entry.
+  pub entry: LogEntry,
+}
+
+impl WindowSlot {
+  /// Its ballot: its term, and within a term the leader's entry outranks a fast vote.
+  fn ballot(&self) -> (u64, bool) {
+    (self.term, !self.fast)
+  }
+}
+
+/// A window slot at its one-based log index: what a voter reports with its vote, and what a node retains.
+#[derive(slates_wire::Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SlotReport {
+  /// The slot's one-based log index.
+  pub index: u64,
+  /// The slot.
+  pub slot: WindowSlot,
+}
+
 /// A leader's replication message (Raft `AppendEntries`): the leader's term, the log position it is
 /// appending after (`prev_log_index`/`prev_log_term`, the consistency check), the entries to append
 /// (empty for a heartbeat), and the leader's commit index. A follower appends only when its log matches
@@ -369,6 +453,12 @@ pub struct AppendEntries {
   /// Every voter's election priority as the leader last heard it, its own included (§3.4), so each
   /// follower ranks itself against the same table.
   pub priorities: Vec<(HostId, ElectionPriority)>,
+  /// The index of the first entry this leader appended after its recovery — its **sync point** — or zero
+  /// before it has appended one. A follower whose log holds the leader's entry there is synced to the
+  /// leader's term, and drops its window slots of older terms.
+  pub sync_index: u64,
+  /// The first index open to the fast track this term, or zero when the leader proposes classically.
+  pub open_from: u64,
 }
 
 /// A follower's reply to [`AppendEntries`]: the follower, its current term, whether the append
@@ -469,6 +559,11 @@ pub struct SavedRaft {
   pub snapshot_term: u64,
   /// The state-machine snapshot at that position.
   pub snapshot_data: Vec<u8>,
+  /// The window above the log: every slot is an accepted value, retained as the log is, since recovery
+  /// counts on it (`docs/wip/research/consensus-enhancements.md` §4).
+  pub window: Vec<SlotReport>,
+  /// The term of the leader this node's log was last synced to (zero before any).
+  pub synced_term: u64,
 }
 
 /// A publication that cannot describe a legal recovered Raft state (§4.8). The caller refuses
@@ -489,6 +584,9 @@ pub enum RaftRecoveryError {
   InvalidCommitIndex,
   /// A retained position cannot be represented by the protocol's index width.
   IndexOverflow,
+  /// A window slot is at index zero, repeats an index, or was accepted in a term later than the saved
+  /// current term; or the synced term is.
+  InvalidWindow,
 }
 
 impl SavedRaft {
@@ -531,7 +629,22 @@ impl SavedRaft {
       }
       previous_term = entry.term;
     }
-    Ok(())
+    self.validate_window()
+  }
+
+  /// Validates the window: each slot at a distinct positive index, accepted no later than the current term,
+  /// and the synced term no later either.
+  fn validate_window(&self) -> Result<(), RaftRecoveryError> {
+    let mut indices = BTreeSet::new();
+    let valid = self.synced_term <= self.term
+      && self.window.iter().all(|report| {
+        report.index > 0 && report.slot.term <= self.term && indices.insert(report.index)
+      });
+    if valid {
+      Ok(())
+    } else {
+      Err(RaftRecoveryError::InvalidWindow)
+    }
   }
 }
 
@@ -591,6 +704,66 @@ pub struct RaftNode {
   priority_transfer_failed: bool,
   /// ElectionPriority transfers started (the non-vacuity counter).
   priority_transfers: u64,
+  /// The window above the log (`docs/wip/research/consensus-enhancements.md` §4): the leader's entries that
+  /// arrived out of order and fast votes, by index. Retained; bounded by [`window_budget`](Self::window_budget)
+  /// bytes.
+  window: BTreeMap<u64, WindowSlot>,
+  /// The term of the leader this node's log was last synced to (its log held that leader's entry at the
+  /// leader's sync point); only that term's slots are accepted into the window. Retained.
+  synced_term: u64,
+  /// The wire bytes the window may hold — the caller's, the same as one append's batch
+  /// (`raft_wire::append_batch_bytes`); zero, the default, holds none.
+  window_budget: usize,
+  /// While a candidate: the window slots each voter that granted this election reported.
+  reports: BTreeMap<HostId, Vec<SlotReport>>,
+  /// While leading: the index of the first entry appended after this leader's recovery (its sync point), or
+  /// zero before one.
+  sync_index: u64,
+  /// While leading: the first index open to the fast track this term, or zero when proposing classically.
+  open_from: u64,
+  /// The fast track's opening as this node last knew it announced — by its own opening while leading, by its
+  /// leader's appends while following — with the term it was announced in: `(term, first open index)`. It
+  /// counts in that term only, so an opening can never outlive its term, whichever way the term or the role
+  /// moves on (an election this node starts, or a timeout that ends its own leadership without a new term).
+  open_announced: (u64, u64),
+  /// While leading with the fast track open: the votes at each index above the commit index, by voter —
+  /// undecided indices within the window's span above the log, and decided ones still counting toward a fast
+  /// quorum.
+  fast_votes: BTreeMap<u64, BTreeMap<HostId, Vec<u8>>>,
+  /// While leading: indices a fast quorum chose above what it knows committed, which that reaches once every
+  /// index below them is committed.
+  fast_chosen: BTreeSet<u64>,
+  /// While leading: the index through which this leader knows the log committed, its fast choices included —
+  /// at least the commit index, which stays classic (`docs/wip/research/consensus-enhancements.md` §4). Zero
+  /// when not leading.
+  fast_through: u64,
+  /// The highest index this node proposed at on the fast track this term.
+  fast_proposed: u64,
+  /// Recoveries that re-proposed a value found only in windows, holes they filled with no-ops, window slots
+  /// pruned under a classic commit, and leader's entries buffered and later absorbed into the log (the
+  /// non-vacuity counters of the window's paths).
+  window_counters: WindowCounters,
+}
+
+/// What the window's paths did over a node's life (the non-vacuity counters the explorer reads).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowCounters {
+  /// Values a recovery re-proposed from voters' windows.
+  pub recovered: u64,
+  /// Of those, values a fast quorum could have chosen (Fast Paxos's rule).
+  pub recovered_fast_choices: u64,
+  /// Free indices a recovery filled with a no-op below the last value it re-proposed.
+  pub holes_filled: u64,
+  /// Window slots pruned once a classic commit covered their index.
+  pub pruned: u64,
+  /// The leader's entries this node buffered in its window, arrived ahead of a hole.
+  pub buffered: u64,
+  /// Buffered entries moved into the log once the hole below them filled.
+  pub absorbed: u64,
+  /// Indices this node decided as leader from fast votes.
+  pub decided_from_votes: u64,
+  /// Of those, indices a fast quorum chose, committed in one round.
+  pub fast_commits: u64,
 }
 
 impl RaftNode {
@@ -631,6 +804,18 @@ impl RaftNode {
       priority_transfer_pending: false,
       priority_transfer_failed: false,
       priority_transfers: 0,
+      window: BTreeMap::new(),
+      synced_term: 0,
+      window_budget: 0,
+      reports: BTreeMap::new(),
+      sync_index: 0,
+      open_from: 0,
+      open_announced: (0, 0),
+      fast_votes: BTreeMap::new(),
+      fast_chosen: BTreeSet::new(),
+      fast_through: 0,
+      fast_proposed: 0,
+      window_counters: WindowCounters::default(),
     }
   }
 
@@ -650,6 +835,15 @@ impl RaftNode {
       snapshot_index: self.snapshot_index,
       snapshot_term: self.snapshot_term,
       snapshot_data: self.snapshot_data.clone(),
+      window: self
+        .window
+        .iter()
+        .map(|(index, slot)| SlotReport {
+          index: *index,
+          slot: slot.clone(),
+        })
+        .collect(),
+      synced_term: self.synced_term,
     }
   }
 
@@ -666,6 +860,12 @@ impl RaftNode {
     node.snapshot_index = saved.snapshot_index;
     node.snapshot_term = saved.snapshot_term;
     node.snapshot_data = saved.snapshot_data;
+    node.window = saved
+      .window
+      .into_iter()
+      .map(|report| (report.index, report.slot))
+      .collect();
+    node.synced_term = saved.synced_term;
     Ok(node)
   }
 
@@ -812,6 +1012,7 @@ impl RaftNode {
     self.role = Role::Candidate;
     self.voted_for = Some(self.id);
     self.votes = BTreeSet::from([self.id]);
+    self.reports.clear();
     self.become_leader_if_majority();
 
     let request = RequestVote {
@@ -847,11 +1048,29 @@ impl RaftNode {
       self.retention_pending |= self.voted_for != Some(request.candidate);
       self.voted_for = Some(request.candidate);
     }
+    let reports = if granted {
+      self.window_above(request.last_log_index)
+    } else {
+      Vec::new()
+    };
     VoteReply {
       voter: self.id,
       term: self.current_term,
       granted,
+      reports,
     }
+  }
+
+  /// This node's window slots above `index`, as a vote reports them.
+  fn window_above(&self, index: u64) -> Vec<SlotReport> {
+    self
+      .window
+      .range(index.saturating_add(1)..)
+      .map(|(index, slot)| SlotReport {
+        index: *index,
+        slot: slot.clone(),
+      })
+      .collect()
   }
 
   /// Handles a received [`VoteReply`]. A reply carrying a newer term steps us down. Otherwise, while we
@@ -864,6 +1083,7 @@ impl RaftNode {
     }
     if self.role == Role::Candidate && reply.term == self.current_term && reply.granted {
       self.votes.insert(reply.voter);
+      self.reports.insert(reply.voter, reply.reports);
       self.become_leader_if_majority();
     }
   }
@@ -886,8 +1106,15 @@ impl RaftNode {
     self.role = Role::Follower;
     self.leader_hint = None;
     self.votes.clear();
+    self.reports.clear();
     self.transfer = None;
     self.staging.clear();
+    self.sync_index = 0;
+    self.open_from = 0;
+    self.fast_votes.clear();
+    self.fast_chosen.clear();
+    self.fast_through = 0;
+    self.fast_proposed = 0;
   }
 
   /// Becomes leader if the votes gathered this election are a majority of the voters, initialising the
@@ -898,6 +1125,7 @@ impl RaftNode {
       return;
     }
     self.role = Role::Leader;
+    self.recover();
     self.transfer = None;
     self.staging.clear();
     self.staging_aborted = None;
@@ -916,6 +1144,122 @@ impl RaftNode {
         self.match_index.insert(*peer, 0);
       }
     }
+  }
+
+  /// The recovery a new leader runs before its first append (`docs/wip/research/consensus-enhancements.md`
+  /// §4; the design `tests/prefix_model.rs` verifies). Each index above its own last log entry that a
+  /// window holds — its own, or one a granting voter reported, within [`window_span`](Self::window_span) —
+  /// is decided by the highest ballot there: a leader's entry is re-proposed as it is; at a fast ballot, the
+  /// value with at least `|Q| + |F| − n` of the reports (Fast Paxos's rule: the value a fast quorum could
+  /// have chosen), and otherwise the index is free. The recovered values are appended at this term, with a
+  /// no-op at each free index below the last of them, so this leader can commit them. It is then synced to
+  /// its own term, and keeps its window: a slot goes only once a classic commit covers its index (§4), since
+  /// until then a later leader's truncation can erase the log entries that carry it — clearing it here lost a
+  /// chosen value (the explorer's seed 266, 2026-09-29). With empty windows — the classic path — it appends
+  /// nothing.
+  fn recover(&mut self) {
+    let above = self.last_log_index();
+    let reach = above.saturating_add(self.window_span());
+    let mut reported: BTreeMap<u64, Vec<WindowSlot>> = BTreeMap::new();
+    // `BTreeMap::range` panics on a start past its end, so the reach is checked, not ranged (a zero span —
+    // the default budget — has none above the log).
+    let own = self
+      .window
+      .iter()
+      .filter(|(index, _)| **index > above && **index <= reach)
+      .map(|(index, slot)| (*index, slot.clone()));
+    let voters = self
+      .reports
+      .values()
+      .flatten()
+      .filter(|report| report.index > above && report.index <= reach)
+      .map(|report| (report.index, report.slot.clone()));
+    for (index, slot) in own.chain(voters) {
+      reported.entry(index).or_default().push(slot);
+    }
+    let heard = self.votes.len();
+    let recovered: BTreeMap<u64, (LogEntry, bool)> = reported
+      .iter()
+      .filter_map(|(index, slots)| {
+        self
+          .recovered_value(slots, heard)
+          .map(|found| (*index, found))
+      })
+      .collect();
+    if let Some(&last) = recovered.keys().next_back() {
+      for index in above.saturating_add(1)..=last {
+        let entry = match recovered.get(&index) {
+          Some((entry, fast)) => {
+            self.window_counters.recovered = self.window_counters.recovered.saturating_add(1);
+            if *fast {
+              self.window_counters.recovered_fast_choices = self
+                .window_counters
+                .recovered_fast_choices
+                .saturating_add(1);
+            }
+            LogEntry {
+              term: self.current_term,
+              ..entry.clone()
+            }
+          }
+          None => {
+            self.window_counters.holes_filled = self.window_counters.holes_filled.saturating_add(1);
+            LogEntry::command(self.current_term, Vec::new())
+          }
+        };
+        self.log.push(entry);
+      }
+    }
+    self.reports.clear();
+    self.synced_term = self.current_term;
+    self.sync_index = 0;
+    self.open_from = 0;
+    self.fast_votes.clear();
+    self.fast_chosen.clear();
+    self.fast_through = 0;
+    self.fast_proposed = 0;
+    self.retention_pending = true;
+  }
+
+  /// What the recovery decides from the reports at one index, `slots`, heard from `heard` voters: the entry
+  /// to re-propose and whether a fast ballot chose it, or `None` when the index is free.
+  fn recovered_value(&self, slots: &[WindowSlot], heard: usize) -> Option<(LogEntry, bool)> {
+    let highest = slots.iter().map(WindowSlot::ballot).max()?;
+    let at_highest: Vec<&WindowSlot> = slots
+      .iter()
+      .filter(|slot| slot.ballot() == highest)
+      .collect();
+    let (_, decided) = highest;
+    if decided {
+      return at_highest.first().map(|slot| (slot.entry.clone(), false));
+    }
+    // Fast votes exist only in a term without a joint configuration (a membership change begins only with
+    // the fast track closed, and on a committed log), so the configuration in force is the one they were
+    // cast under; a joint one here is counted and treated as free.
+    let config = self.effective_config();
+    if config.joint.is_some() {
+      return None;
+    }
+    let voters = config.voters.len();
+    let threshold = heard
+      .saturating_add(fast_quorum(voters))
+      .saturating_sub(voters);
+    at_highest
+      .iter()
+      .find(|candidate| {
+        at_highest
+          .iter()
+          .filter(|other| other.entry == candidate.entry)
+          .count()
+          >= threshold
+      })
+      .map(|slot| (slot.entry.clone(), true))
+  }
+
+  /// The most indices above its log end a node's window may reach, and the recovery reads: the window
+  /// budget over the smallest entry's wire bytes. Zero while the budget is zero, the default.
+  fn window_span(&self) -> u64 {
+    u64::try_from(self.window_budget / MIN_ENTRY_BYTES).unwrap_or(u64::MAX)
   }
 
   /// Every voter that participates now — the base set, plus the incoming set while a joint membership
@@ -1103,15 +1447,25 @@ impl RaftNode {
     self.log.get(position).map(|entry| entry.term)
   }
 
-  /// The highest index known committed (a majority holds it).
+  /// The highest index known committed classically: a majority's logs hold it at their leader's term. It is
+  /// what a follower learns, what is retained, and what a window drops slots under — a fast commit does not
+  /// raise it, since a fast-committed value is in no majority's logs and a successor may need its slots
+  /// (`docs/wip/research/consensus-enhancements.md` §4).
   pub fn commit_index(&self) -> u64 {
     self.commit_index
   }
 
+  /// The index through which this node knows the log committed: its commit index and, while it leads, the
+  /// indices past it that fast quorums chose, in order — what the caller applies and acknowledges.
+  pub fn committed_through(&self) -> u64 {
+    self.commit_index.max(self.fast_through)
+  }
+
   /// The committed log entries not yet folded into the snapshot, in order (the entries the caller applies
-  /// after the snapshotted prefix). With no snapshot this is the whole committed prefix.
+  /// after the snapshotted prefix), through [`committed_through`](Self::committed_through). With no snapshot
+  /// this is the whole committed prefix.
   pub fn committed_entries(&self) -> &[LogEntry] {
-    let committed_above_snapshot = self.commit_index.saturating_sub(self.snapshot_index);
+    let committed_above_snapshot = self.committed_through().saturating_sub(self.snapshot_index);
     let count = usize::try_from(committed_above_snapshot).unwrap_or(usize::MAX);
     &self.log[..count.min(self.log.len())]
   }
@@ -1245,6 +1599,7 @@ impl RaftNode {
       self.voters = request.config.voters;
       self.joint = request.config.joint;
       self.commit_index = self.commit_index.max(request.last_included_index);
+      self.prune_committed();
     }
     self.snapshot_reply(self.commit_index)
   }
@@ -1336,13 +1691,275 @@ impl RaftNode {
   pub fn append_command(&mut self, command: Vec<u8>) -> bool {
     // A leader handing off leadership stops accepting proposals (thesis §3.10), so the target's log can
     // catch up to a fixed end and the election it starts is won by a log that holds every entry.
-    if self.role != Role::Leader || self.active_transfer().is_some() {
+    // A leader whose fast track is open proposes through it ([`propose_fast`](Self::propose_fast)): a
+    // classic entry at an index open to fast votes could contradict a value a fast quorum chose there.
+    if self.role != Role::Leader || self.active_transfer().is_some() || self.open_from > 0 {
       return false;
     }
-    self.retention_pending = true;
-    self.log.push(LogEntry::command(self.current_term, command));
-    self.advance_leader_commit();
+    self.leader_append(LogEntry::command(self.current_term, command));
     true
+  }
+
+  /// Appends `entry` to this leader's log, publishes it, and advances the commit index. The first entry a
+  /// leader appends after its recovery is its **sync point**: a follower whose log holds it is synced to this
+  /// term ([`AppendEntries::sync_index`]).
+  fn leader_append(&mut self, entry: LogEntry) {
+    self.retention_pending = true;
+    self.log.push(entry);
+    if self.sync_index == 0 {
+      self.sync_index = self.last_log_index();
+    }
+    self.advance_leader_commit();
+  }
+
+  /// Sets the wire bytes this node's window may hold — the caller's append budget
+  /// (`raft_wire::append_batch_bytes`), since a window holds at most what one append carries. Zero, the
+  /// default, holds none: no entry is buffered and no fast vote is cast.
+  pub fn set_window_budget(&mut self, bytes: usize) {
+    self.window_budget = bytes;
+  }
+
+  /// What the window's paths did over this node's life.
+  pub fn window_counters(&self) -> WindowCounters {
+    self.window_counters
+  }
+
+  /// The window slots this node holds, by index.
+  pub fn window(&self) -> Vec<SlotReport> {
+    self.window_above(0)
+  }
+
+  /// Opens this term's **fast track** (`docs/wip/research/consensus-enhancements.md` §3.7): from the next
+  /// index on, commands are proposed straight to every voter ([`propose_fast`](Self::propose_fast)), and this
+  /// leader decides each index from the votes. Only a leader that has appended its sync point opens it, with
+  /// a window budget, on a committed configuration that is not joint and with no transfer in flight; once
+  /// open, it stays open for the term, and a classic append or a membership change is refused. Returns whether
+  /// it opened.
+  ///
+  /// The configuration must have committed because the votes are counted against it, by this leader and by
+  /// any successor's recovery: a committed configuration is in every later leader's log, and a later change
+  /// begins only in a classic term whose leader recovered these votes first. With `C_new` appended and not
+  /// committed, a successor lacking it would count the joint configuration and treat a chosen index as free.
+  pub fn open_fast_track(&mut self) -> bool {
+    if self.role != Role::Leader
+      || self.sync_index == 0
+      || self.window_budget == 0
+      || self.open_from > 0
+      || self.in_joint_configuration()
+      || self.latest_config_index() > self.commit_index
+      || self.active_transfer().is_some()
+    {
+      return false;
+    }
+    self.open_from = self.last_log_index().saturating_add(1);
+    self.open_announced = (self.current_term, self.open_from);
+    true
+  }
+
+  /// The first index open to the fast track this term as this node knows it announced, or zero when closed or
+  /// announced in another term.
+  fn fast_open_from(&self) -> u64 {
+    let (term, open_from) = self.open_announced;
+    if term == self.current_term {
+      open_from
+    } else {
+      0
+    }
+  }
+
+  /// Whether this node may propose on the fast track now: the track is open this term, as it knows, and it is
+  /// synced to the term's leader.
+  pub fn fast_track_open(&self) -> bool {
+    self.fast_open_from() > 0 && self.synced_term == self.current_term
+  }
+
+  /// Proposes `command` on the fast track at the lowest index this node knows unused — past the opening, its
+  /// log, its window and its own last proposal — returning the proposal to send every voter (itself
+  /// included), or `None` when the track is not open to it. The caller learns the outcome from the log:
+  /// another command decided at the index means this one was not chosen, and it proposes again.
+  pub fn propose_fast(&mut self, command: Vec<u8>) -> Option<FastPropose> {
+    // A leader handing off accepts no proposals (thesis §3.10), on either track.
+    if !self.fast_track_open() || self.active_transfer().is_some() {
+      return None;
+    }
+    let used = self
+      .window
+      .keys()
+      .next_back()
+      .copied()
+      .unwrap_or(0)
+      .max(self.last_log_index())
+      .max(self.fast_proposed);
+    let index = self.fast_open_from().max(used.saturating_add(1));
+    self.fast_proposed = index;
+    Some(FastPropose {
+      term: self.current_term,
+      proposer: self.id,
+      index,
+      command,
+    })
+  }
+
+  /// Handles a fast proposal as a voter: a voter synced to this term's leader, at an index the leader opened,
+  /// above its log and within its window's span and budget, votes the command — unless it already voted there
+  /// this term (its vote stands, and is sent again) or holds this term's decision there. Returns the vote to
+  /// send the term's leader.
+  pub fn on_fast_propose(&mut self, proposal: FastPropose) -> Option<FastVote> {
+    let open_from = self.fast_open_from();
+    let index = proposal.index;
+    let floor = self.last_log_index();
+    let reach = floor.saturating_add(self.window_span());
+    if proposal.term != self.current_term
+      || !self.is_voter(self.id)
+      || self.synced_term != self.current_term
+      || open_from == 0
+      || index < open_from
+      || index <= floor
+      || index > reach
+    {
+      return None;
+    }
+    let vote = |command: Vec<u8>| FastVote {
+      term: proposal.term,
+      voter: self.id,
+      index,
+      command,
+    };
+    if let Some(held) = self.window.get(&index) {
+      if held.fast && held.term == self.current_term {
+        return Some(vote(held.entry.command.clone()));
+      }
+      if held.ballot() >= (self.current_term, false) {
+        return None;
+      }
+    }
+    let entry = LogEntry::command(self.current_term, proposal.command);
+    let replaced = self
+      .window
+      .get(&index)
+      .map_or(0, |held| held.entry.encoded_len());
+    let held: usize = self
+      .window
+      .values()
+      .map(|slot| slot.entry.encoded_len())
+      .fold(0, usize::saturating_add);
+    if held
+      .saturating_sub(replaced)
+      .saturating_add(entry.encoded_len())
+      > self.window_budget
+    {
+      return None;
+    }
+    let command = entry.command.clone();
+    self.window.insert(
+      index,
+      WindowSlot {
+        term: self.current_term,
+        fast: true,
+        entry,
+      },
+    );
+    self.retention_pending = true;
+    Some(vote(command))
+  }
+
+  /// Handles a fast vote as the leader: tallies it (one vote per voter per index, above the commit index
+  /// and within the window's span above the log), decides the next indices in order while a classic quorum
+  /// has voted at each ([`decide_from_votes`](Self::decide_from_votes)), and commits each decided index a
+  /// fast quorum voted — a vote arriving after the decision still counts toward the fast quorum, as the
+  /// round's vote it is.
+  pub fn on_fast_vote(&mut self, vote: FastVote) {
+    if self.role != Role::Leader
+      || vote.term != self.current_term
+      || self.open_from == 0
+      || vote.index < self.open_from
+      || vote.index <= self.committed_through()
+      || vote.index > self.last_log_index().saturating_add(self.window_span())
+      || !self.is_voter(vote.voter)
+    {
+      return;
+    }
+    // A vote of this term shows the voter follows this leader, as a reply does.
+    self.contacts.insert(vote.voter);
+    self
+      .fast_votes
+      .entry(vote.index)
+      .or_default()
+      .insert(vote.voter, vote.command);
+    self.decide_from_votes();
+    self.count_fast_quorums();
+  }
+
+  /// Marks as chosen each decided index above the commit index whose command a fast quorum of this term's
+  /// votes carries, and advances the commit index over them.
+  fn count_fast_quorums(&mut self) {
+    let fast = fast_quorum(self.all_voters().len());
+    let (committed, last) = (self.committed_through(), self.last_log_index());
+    let mut chosen = Vec::new();
+    // Filtered rather than ranged: `BTreeMap::range` panics on a start past its end, as a fully committed
+    // log's `committed + 1..=last` is.
+    for (index, votes) in self
+      .fast_votes
+      .iter()
+      .filter(|(index, _)| **index > committed && **index <= last)
+    {
+      let Some(entry) = self.position(*index).and_then(|at| self.log.get(at)) else {
+        continue;
+      };
+      let carried = votes
+        .values()
+        .filter(|command| **command == entry.command)
+        .count();
+      if entry.term == self.current_term && carried >= fast && !self.fast_chosen.contains(index) {
+        chosen.push(*index);
+      }
+    }
+    for index in chosen {
+      self.fast_chosen.insert(index);
+      self.window_counters.fast_commits = self.window_counters.fast_commits.saturating_add(1);
+    }
+    self.advance_leader_commit();
+    let committed = self.committed_through();
+    self.fast_votes.retain(|index, _| *index > committed);
+  }
+
+  /// Decides this leader's next index from its votes, and the ones after while each has them: once a classic
+  /// quorum of voters has voted there, the command a fast quorum could have chosen — at least
+  /// `heard + |F| − n` of the heard votes (Fast Paxos's rule; the most voted, necessarily) — or else the most
+  /// voted, is appended at this term. It commits when a fast quorum voted it
+  /// ([`count_fast_quorums`](Self::count_fast_quorums)), or else by a majority's logs as any entry of the term.
+  fn decide_from_votes(&mut self) {
+    // A leader handing off decides nothing (thesis §3.10: it stops accepting proposals, so the target's log can
+    // match its own); the votes wait in the voters' windows for the successor's recovery.
+    if self.active_transfer().is_some() {
+      return;
+    }
+    loop {
+      let next = self.last_log_index().saturating_add(1);
+      let Some(votes) = self.fast_votes.get(&next) else {
+        return;
+      };
+      let heard: BTreeSet<HostId> = votes.keys().copied().collect();
+      if !self.is_majority(&heard) {
+        return;
+      }
+      let mut counts: BTreeMap<&Vec<u8>, usize> = BTreeMap::new();
+      for command in votes.values() {
+        let count = counts.entry(command).or_default();
+        *count = count.saturating_add(1);
+      }
+      // The most voted command, ties to the least bytes so every run decides alike.
+      let Some(command) = counts
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then(right.0.cmp(left.0)))
+        .map(|(command, _)| (*command).clone())
+      else {
+        return;
+      };
+      self.leader_append(LogEntry::command(self.current_term, command));
+      self.window_counters.decided_from_votes =
+        self.window_counters.decided_from_votes.saturating_add(1);
+    }
   }
 
   /// Builds the [`AppendEntries`] to send `follower`, from the leader's `next_index` for it: the entries
@@ -1401,6 +2018,8 @@ impl RaftNode {
       entries,
       leader_commit: self.commit_index,
       priorities,
+      sync_index: self.sync_index,
+      open_from: self.open_from,
     })
   }
 
@@ -1416,6 +2035,11 @@ impl RaftNode {
     // A current-term append means a leader exists for our term — defer to it (a candidate steps down)
     // and note the contact, so we refuse pre-votes that would disrupt this leader (§9.6).
     self.recognize_leader(request.term, request.leader);
+    // Within a term the opening only goes from closed to one fixed index, so a reordered append that predates
+    // it does not close the track again.
+    let (term, known) = self.open_announced;
+    let known = if term == request.term { known } else { 0 };
+    self.open_announced = (request.term, known.max(request.open_from));
     // The leader's priority table is the one every follower ranks itself against (§3.4).
     self.priorities = std::mem::take(&mut request.priorities)
       .into_iter()
@@ -1441,10 +2065,13 @@ impl RaftNode {
       request.prev_log_term = self.entry_term(self.commit_index).unwrap_or(0);
     }
 
-    // Consistency check: our log must contain the previous entry with the leader's term.
+    // Consistency check: our log must contain the previous entry with the leader's term. A follower synced
+    // to this leader keeps the leader's own-term entries that arrived ahead of a hole in its window, so they
+    // join its log the moment the hole fills (§3.5's out-of-order acknowledgement).
     if request.prev_log_index > 0
       && self.entry_term(request.prev_log_index) != Some(request.prev_log_term)
     {
+      self.buffer(&request);
       return self.conflict_reply(request.prev_log_index, request.read_context);
     }
 
@@ -1471,7 +2098,103 @@ impl RaftNode {
       self.retention_pending |= self.commit_index != committed;
       self.commit_index = committed;
     }
+    self.observe_sync(request.term, request.sync_index);
+    let index = self.absorb(request.term).max(index);
+    self.prune_committed();
     self.append_reply(true, index, request.read_context)
+  }
+
+  /// Keeps the leader's entries of its own term from a refused append in the window, when this node is synced
+  /// to that leader: each above the log's end, within [`window_span`](Self::window_span) and the window's
+  /// budget, where no slot of its ballot or a higher one is held.
+  fn buffer(&mut self, request: &AppendEntries) {
+    if self.synced_term != request.term || request.term != self.current_term {
+      return;
+    }
+    let (floor, reach) = (
+      self.last_log_index(),
+      self.last_log_index().saturating_add(self.window_span()),
+    );
+    let mut index = request.prev_log_index;
+    for entry in &request.entries {
+      index = index.saturating_add(1);
+      if entry.term != request.term || index <= floor || index > reach {
+        continue;
+      }
+      let slot = WindowSlot {
+        term: request.term,
+        fast: false,
+        entry: entry.clone(),
+      };
+      if self.window_holds_at_least(index, slot.ballot()) || !self.window_fits(&slot.entry) {
+        continue;
+      }
+      self.window.insert(index, slot);
+      self.retention_pending = true;
+      self.window_counters.buffered = self.window_counters.buffered.saturating_add(1);
+    }
+  }
+
+  /// Whether the window holds a slot at `index` of `ballot` or a higher one.
+  fn window_holds_at_least(&self, index: u64, ballot: (u64, bool)) -> bool {
+    self
+      .window
+      .get(&index)
+      .is_some_and(|held| held.ballot() >= ballot)
+  }
+
+  /// Whether `entry` fits the window's budget beside what it holds.
+  fn window_fits(&self, entry: &LogEntry) -> bool {
+    let held: usize = self
+      .window
+      .values()
+      .map(|slot| slot.entry.encoded_len())
+      .fold(0, usize::saturating_add);
+    held.saturating_add(entry.encoded_len()) <= self.window_budget
+  }
+
+  /// A successful append from the leader of `term` whose sync point is `sync_index`: once this node's log
+  /// holds that leader's entry there, it is synced to `term`. Its slots of older terms stay: dropping them here
+  /// lost a chosen value in the prefix model's 18-step history (a later leader's truncation erased the synced
+  /// log entries that were then the only record); they go under a classic commit, as every slot does.
+  fn observe_sync(&mut self, term: u64, sync_index: u64) {
+    if sync_index == 0 || self.synced_term >= term || self.entry_term(sync_index) != Some(term) {
+      return;
+    }
+    self.synced_term = term;
+    self.retention_pending = true;
+  }
+
+  /// Moves into the log the leader's buffered entries of `term` that now continue it, returning the index of
+  /// the log's last entry after.
+  fn absorb(&mut self, term: u64) -> u64 {
+    loop {
+      let next = self.last_log_index().saturating_add(1);
+      let Some(slot) = self
+        .window
+        .get(&next)
+        .filter(|slot| !slot.fast && slot.term == term && slot.entry.term == term)
+      else {
+        return self.last_log_index();
+      };
+      let entry = slot.entry.clone();
+      self.log.push(entry);
+      self.retention_pending = true;
+      self.window_counters.absorbed = self.window_counters.absorbed.saturating_add(1);
+    }
+  }
+
+  /// Drops window slots at classically committed indices: Raft's election rule puts a classically committed
+  /// entry, and every value below it, in every later leader's log, so a slot there records nothing a recovery
+  /// could need. A fast commit is not enough: pruning under it lost a chosen value in the prefix model (a
+  /// successor that lacked it outranked the log that held it, and found the slots gone).
+  fn prune_committed(&mut self) {
+    let committed = self.commit_index;
+    let before = self.window.len();
+    self.window.retain(|index, _| *index > committed);
+    let pruned = u64::try_from(before.saturating_sub(self.window.len())).unwrap_or(u64::MAX);
+    self.window_counters.pruned = self.window_counters.pruned.saturating_add(pruned);
+    self.retention_pending |= pruned > 0;
   }
 
   /// Handles a follower's [`AppendReply`] as the leader (Raft §5.3). A newer term steps us down. On
@@ -1776,6 +2499,9 @@ impl RaftNode {
         self.priority_transfer_pending = false;
         self.priority_transfer_failed = true;
       }
+      // The fast track's votes that waited out the transfer are decided now, not at the next vote to arrive.
+      self.decide_from_votes();
+      self.count_fast_quorums();
     } else {
       self.transfer = Some(Transfer {
         quorum_checks,
@@ -1898,10 +2624,12 @@ impl RaftNode {
       return None;
     }
     self.read_context = self.read_context.checked_add(1)?;
+    // The read index is what this leader has applied and acknowledged, fast commits included: a read after a
+    // fast-committed write must see it.
     self.read_round = Some(ReadRound {
       context: self.read_context,
       term: self.current_term,
-      index: self.commit_index,
+      index: self.committed_through(),
       config: self.effective_config(),
       confirmed: BTreeSet::from([self.id]),
     });
@@ -1944,7 +2672,9 @@ impl RaftNode {
   /// leader begins one, not while another is in flight, and not while the previous configuration entry
   /// is still uncommitted (one change at a time — Ongaro's thesis §4.1: two configuration entries in
   /// flight could let disjoint majorities form). An empty target is refused (a group cannot vote itself
-  /// out of existence). Returns whether it started.
+  /// out of existence), and so is a change while this term's fast track is open: fast votes are counted
+  /// against the configuration they were cast under, so a change needs a classic term
+  /// (`docs/wip/research/consensus-enhancements.md` §4). Returns whether it started.
   pub fn begin_membership_change(&mut self, new_voters: Vec<HostId>) -> bool {
     let current = self.effective_config();
     if self.role != Role::Leader
@@ -1952,21 +2682,20 @@ impl RaftNode {
       || current.joint.is_some()
       || new_voters.is_empty()
       || self.latest_config_index() > self.commit_index
+      || self.open_from > 0
     {
       return false;
     }
     self.read_round = None;
     // Append the joint configuration `C_old,new` as a log entry — it takes effect on append (§6), so the
     // very next quorum check needs a majority of both sets. It replicates like any entry.
-    self.retention_pending = true;
-    self.log.push(LogEntry::configuration(
+    self.leader_append(LogEntry::configuration(
       self.current_term,
       VoterConfig {
         voters: current.voters,
         joint: Some(new_voters),
       },
     ));
-    self.advance_leader_commit();
     true
   }
 
@@ -1987,15 +2716,13 @@ impl RaftNode {
     }
     self.read_round = None;
     // Append the final configuration `C_new` (§6): the change is done once this commits.
-    self.retention_pending = true;
-    self.log.push(LogEntry::configuration(
+    self.leader_append(LogEntry::configuration(
       self.current_term,
       VoterConfig {
         voters: new_voters,
         joint: None,
       },
     ));
-    self.advance_leader_commit();
     true
   }
 
@@ -2064,12 +2791,25 @@ impl RaftNode {
         if self.is_majority(&holders) {
           self.retention_pending = true;
           self.commit_index = candidate;
-          self.step_down_if_removed();
-          return;
+          break;
         }
       }
       candidate = candidate.saturating_sub(1);
     }
+    // Indices a fast quorum chose are committed once every index below them is: this leader applies and
+    // acknowledges them, while its commit index — what followers learn, and what windows prune under — stays
+    // classic.
+    let last = self.last_log_index();
+    let mut through = self.committed_through();
+    while through < last && self.fast_chosen.contains(&through.saturating_add(1)) {
+      through = through.saturating_add(1);
+    }
+    self.fast_through = through;
+    self.fast_chosen.retain(|index| *index > through);
+    // The leader votes on the fast track too, into its own window; its slots go under a classic commit, as a
+    // follower's do.
+    self.prune_committed();
+    self.step_down_if_removed();
   }
 
   /// How far `voter`'s log matches the leader's: the leader's own last index for itself, else the
@@ -2119,6 +2859,8 @@ mod tests {
       snapshot_index: 0,
       snapshot_term: 0,
       snapshot_data: Vec::new(),
+      window: Vec::new(),
+      synced_term: 0,
     })
     .expect("a valid fixture prefix")
   }
@@ -2151,6 +2893,7 @@ mod tests {
           voter,
           term: node.term(),
           granted: true,
+          reports: Vec::new(),
         });
       }
     }
@@ -2314,6 +3057,7 @@ mod tests {
       voter: B,
       term: 1,
       granted: true,
+      reports: Vec::new(),
     });
     assert!(node.is_leader(), "self plus one of three is a majority");
   }
@@ -2328,6 +3072,7 @@ mod tests {
       voter: B,
       term: 1,
       granted: true,
+      reports: Vec::new(),
     });
     assert_eq!(
       node.role(),
@@ -2338,6 +3083,7 @@ mod tests {
       voter: C,
       term: 1,
       granted: true,
+      reports: Vec::new(),
     });
     assert!(node.is_leader(), "three of five is");
   }
@@ -2481,6 +3227,7 @@ mod tests {
       voter: B,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     assert!(leader.is_leader());
     leader.append_command(b"cfg-new".to_vec()); // index 3, term 4
@@ -2524,6 +3271,7 @@ mod tests {
       voter: B,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     assert!(leader.is_leader());
 
@@ -2577,6 +3325,8 @@ mod tests {
       entries: Vec::new(),
       leader_commit: 0,
       priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
     });
     assert_eq!(node.term(), 1);
 
@@ -2684,6 +3434,8 @@ mod tests {
       entries: Vec::new(),
       leader_commit: 0,
       priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
     });
     assert_eq!(
       node.leader(),
@@ -3056,6 +3808,7 @@ mod tests {
       voter: B,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     assert!(leader.is_leader());
     assert_eq!(
@@ -3383,6 +4136,7 @@ mod tests {
       voter: B,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     assert!(leader.is_leader());
     leader.append_command(b"t3".to_vec()); // index 4, term 3
@@ -3429,6 +4183,7 @@ mod tests {
       voter: B,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     leader.append_command(b"t3".to_vec()); // index 4, term 3
     let mut follower_b = node_with_uncommitted_log(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
@@ -3507,6 +4262,8 @@ mod tests {
       entries: vec![LogEntry::command(follower.term() + 1, b"other".to_vec())],
       leader_commit: 0,
       priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
     };
     let reply = follower.on_append_entries(conflicting);
     assert!(reply.success);
@@ -3586,6 +4343,7 @@ mod tests {
       voter: C,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     assert!(leader.is_leader());
     let mut follower = RaftNode::new(B, vec![A, B, C]);
@@ -3610,6 +4368,7 @@ mod tests {
       voter: C,
       term: leader.term(),
       granted: true,
+      reports: Vec::new(),
     });
     assert!(leader.is_leader());
     let mut follower = node_with_uncommitted_log(
@@ -4020,6 +4779,8 @@ mod tests {
       entries: Vec::new(),
       leader_commit: 0,
       priorities: table.to_vec(),
+      sync_index: 0,
+      open_from: 0,
     });
     assert!(reply.success);
     assert_eq!(reply.priority, own, "the reply carries its own priority");
@@ -4099,5 +4860,516 @@ mod tests {
       "no second try this leadership"
     );
     assert_eq!(leader.priority_transfers(), 1);
+  }
+
+  /// Shape: a window budget with room for several small commands (a one-byte command's entry is 14 bytes on
+  /// the wire), so the tests of every rule but the bound stay clear of it.
+  const WINDOW_BUDGET: usize = 256;
+
+  /// Replicates `leader`'s log to each follower once and folds the replies.
+  fn replicate_once(leader: &mut RaftNode, followers: &mut [(HostId, &mut RaftNode)]) {
+    for (who, follower) in followers.iter_mut() {
+      let append = leader
+        .replicate_to(*who, UNBOUNDED)
+        .expect("a leader replicates");
+      let reply = follower.on_append_entries(append);
+      leader.on_append_reply(reply);
+    }
+  }
+
+  /// A group of `voters` with windows: the first leads, its sync point (the no-op a group appends on winning)
+  /// has reached every other voter, which is synced to its term, and its fast track is open and announced.
+  fn fast_group(voters: &[HostId]) -> Vec<RaftNode> {
+    let mut nodes: Vec<RaftNode> = voters
+      .iter()
+      .map(|id| {
+        if *id == voters[0] {
+          elected_leader(*id, voters.to_vec())
+        } else {
+          RaftNode::new(*id, voters.to_vec())
+        }
+      })
+      .collect();
+    for node in &mut nodes {
+      node.set_window_budget(WINDOW_BUDGET);
+    }
+    let (leader, followers) = nodes.split_first_mut().unwrap();
+    assert!(leader.append_command(Vec::new()), "the sync point");
+    let mut reached: Vec<(HostId, &mut RaftNode)> =
+      followers.iter_mut().map(|node| (node.id(), node)).collect();
+    replicate_once(leader, &mut reached);
+    assert!(leader.open_fast_track());
+    replicate_once(leader, &mut reached);
+    nodes
+  }
+
+  /// §3.7: a proposal every voter votes commits in one round from the proposer — the leader decides it at the
+  /// first classic quorum of votes and commits it at the fast quorum, before any follower's log holds it. The
+  /// commit is the leader's to apply and acknowledge; its commit index, which followers learn and windows prune
+  /// under, stays classic (§4).
+  #[test]
+  fn a_proposal_a_fast_quorum_votes_commits_in_one_round() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    assert_eq!(proposal.index, 2, "the first index after the sync point");
+    let votes: Vec<FastVote> = nodes
+      .iter_mut()
+      .filter_map(|node| node.on_fast_propose(proposal.clone()))
+      .collect();
+    assert_eq!(votes.len(), 3);
+    let leader = &mut nodes[0];
+    for vote in votes {
+      leader.on_fast_vote(vote);
+    }
+    assert_eq!((leader.committed_through(), leader.commit_index()), (2, 1));
+    assert_eq!(leader.committed_entries().last().unwrap().command, b"x");
+    let counters = leader.window_counters();
+    assert_eq!((counters.decided_from_votes, counters.fast_commits), (1, 1));
+  }
+
+  /// §3.7: two proposals at one index split the votes. The leader decides the one a classic quorum carries,
+  /// and — no fast quorum voting it — it commits once a majority's logs hold it, as a classic entry; the
+  /// losing vote stays in its voter's window until the commit, then goes.
+  #[test]
+  fn split_votes_are_decided_by_the_leader_and_commit_through_its_log() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let x = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    let y = nodes[2].propose_fast(b"y".to_vec()).unwrap();
+    assert_eq!(
+      (x.index, y.index),
+      (2, 2),
+      "both proposers think index 2 unused"
+    );
+    let votes = [
+      nodes[0].on_fast_propose(x.clone()).unwrap(),
+      nodes[1].on_fast_propose(x).unwrap(),
+      nodes[2].on_fast_propose(y).unwrap(),
+    ];
+    assert_eq!(votes[2].command, b"y");
+    for vote in votes {
+      nodes[0].on_fast_vote(vote);
+    }
+    let (leader, followers) = nodes.split_first_mut().unwrap();
+    assert_eq!(leader.last_log_index(), 2, "decided");
+    assert_eq!(leader.commit_index(), 1, "no fast quorum voted it");
+    let mut reached: Vec<(HostId, &mut RaftNode)> =
+      followers.iter_mut().map(|node| (node.id(), node)).collect();
+    replicate_once(leader, &mut reached);
+    assert_eq!(leader.commit_index(), 2);
+    assert_eq!(leader.committed_entries().last().unwrap().command, b"x");
+    assert_eq!(leader.window_counters().fast_commits, 0);
+    replicate_once(leader, &mut reached);
+    assert!(
+      nodes[2].window().is_empty(),
+      "the committed index's slot is gone"
+    );
+  }
+
+  /// §4, the recovery: every voter votes a proposal, and the leader stops before it hears a vote. A new leader
+  /// elected by two of them finds the value in their windows — two reports, at least `2 + 3 − 3` — and
+  /// re-proposes it at the same index: a fast quorum may have chosen it.
+  #[test]
+  fn a_new_leader_recovers_a_fast_choice_from_its_voters_windows() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    for node in nodes.iter_mut() {
+      node.on_fast_propose(proposal.clone()).unwrap();
+    }
+    let request = nodes[1].start_election().into_iter().next().unwrap();
+    let reply = nodes[2].on_request_vote(request);
+    assert!(reply.granted);
+    assert_eq!(reply.reports.len(), 1, "C reports its vote at index 2");
+    nodes[1].on_vote_reply(reply);
+    let successor = &nodes[1];
+    assert!(successor.is_leader());
+    let entry = &successor.saved().log[1];
+    assert_eq!(
+      (entry.term, entry.command.as_slice()),
+      (successor.term(), b"x".as_slice())
+    );
+    let counters = successor.window_counters();
+    assert_eq!(
+      (counters.recovered, counters.recovered_fast_choices),
+      (1, 1)
+    );
+  }
+
+  /// A five-voter group where `voted` voters voted `x` at index 2 and the leader stopped: `C` is then elected
+  /// by `C`, `D` and `E`, and reports whether it re-proposed `x`.
+  fn recovers_with_votes(voted: &[usize]) -> bool {
+    let mut nodes = fast_group(&[A, B, C, D, E]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    for at in voted {
+      nodes[*at].on_fast_propose(proposal.clone()).unwrap();
+    }
+    let requests = nodes[2].start_election();
+    for (at, request) in [(3, requests[2]), (4, requests[3])] {
+      let reply = nodes[at].on_request_vote(request);
+      nodes[2].on_vote_reply(reply);
+    }
+    assert!(nodes[2].is_leader());
+    nodes[2]
+      .saved()
+      .log
+      .get(1)
+      .is_some_and(|entry| entry.command == b"x")
+  }
+
+  /// §4, Fast Paxos's threshold, five voters (a fast quorum of four): with three reports heard, a value two of
+  /// them carry could have been chosen (with the two unheard, four), and is re-proposed; a value one carries
+  /// could not (three at most), and its index is left free.
+  #[test]
+  fn a_value_short_of_the_threshold_leaves_its_index_free() {
+    assert!(
+      recovers_with_votes(&[2, 3]),
+      "two reports of three reach 3 + 4 − 5"
+    );
+    assert!(!recovers_with_votes(&[2]), "one report is short of it");
+  }
+
+  /// §4, syncing: a voter keeps its fast vote of an older term when its log reaches the next leader's sync
+  /// point, and drops it once a classic commit covers its index — until then a later leader's truncation could
+  /// erase the synced entries, and with them the only record of the vote (the prefix model's 18 steps).
+  #[test]
+  fn a_synced_follower_keeps_older_slots_until_a_classic_commit_covers_them() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    nodes[2].on_fast_propose(proposal).unwrap();
+    assert_eq!(nodes[2].window().len(), 1);
+    let requests = nodes[1].start_election();
+    let reply = nodes[0].on_request_vote(requests[0]);
+    nodes[1].on_vote_reply(reply);
+    assert!(nodes[1].is_leader());
+    assert!(nodes[1].append_command(Vec::new()), "the new sync point");
+    let (successor, rest) = nodes.split_at_mut(2);
+    replicate_once(&mut successor[1], &mut [(C, &mut rest[0])]);
+    assert_eq!(
+      rest[0].window().len(),
+      1,
+      "C is synced and keeps its vote of term 1"
+    );
+    replicate_once(&mut successor[1], &mut [(C, &mut rest[0])]);
+    assert!(
+      rest[0].window().is_empty(),
+      "the classic commit of index 2 covers it"
+    );
+    assert_eq!(rest[0].window_counters().pruned, 1);
+  }
+
+  /// §3.5, out-of-order acknowledgement: a synced follower keeps the leader's entry that arrives ahead of a hole
+  /// in its window, and absorbs it into its log the moment the hole fills — no second send of it.
+  #[test]
+  fn a_follower_buffers_the_leaders_entries_ahead_of_a_hole_and_absorbs_them() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    leader.set_window_budget(WINDOW_BUDGET);
+    follower.set_window_budget(WINDOW_BUDGET);
+    assert!(leader.append_command(Vec::new()), "the sync point");
+    replicate_once(&mut leader, &mut [(B, &mut follower)]);
+    assert!(leader.append_command(b"x".to_vec()));
+    assert!(leader.append_command(b"y".to_vec()));
+    let both = leader.replicate_to(B, UNBOUNDED).unwrap();
+    assert_eq!(both.entries.len(), 2);
+    let ahead = AppendEntries {
+      prev_log_index: 2,
+      prev_log_term: both.entries[0].term,
+      entries: vec![both.entries[1].clone()],
+      ..both.clone()
+    };
+    let behind = AppendEntries {
+      entries: vec![both.entries[0].clone()],
+      ..both
+    };
+    let refused = follower.on_append_entries(ahead);
+    assert!(!refused.success, "the hole at index 2");
+    assert_eq!(follower.window_counters().buffered, 1);
+    let accepted = follower.on_append_entries(behind);
+    assert_eq!(accepted.match_index, 3, "the buffered entry joined the log");
+    assert_eq!(follower.window_counters().absorbed, 1);
+    assert_eq!(follower.last_log_index(), 3);
+  }
+
+  /// §4: while this term's fast track is open, a classic append and a membership change are refused — a classic
+  /// entry at an open index could contradict a fast choice, and fast votes count against one configuration.
+  #[test]
+  fn the_fast_track_refuses_classic_appends_and_membership_changes() {
+    let mut nodes = fast_group(&[A, B, C]);
+    assert!(!nodes[0].append_command(b"x".to_vec()));
+    assert!(!nodes[0].begin_membership_change(vec![A, B]));
+  }
+
+  /// §4, the bounds: a voter votes only within its window's span above its log, and only while the window's
+  /// budget has room; zero budget, the default, holds nothing and opens no fast track.
+  #[test]
+  fn the_window_is_bounded_by_its_budget_and_span() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let far = FastPropose {
+      term: nodes[1].term(),
+      proposer: B,
+      index: nodes[1].last_log_index()
+        + u64::try_from(WINDOW_BUDGET / MIN_ENTRY_BYTES).unwrap()
+        + 1,
+      command: b"x".to_vec(),
+    };
+    assert!(nodes[1].on_fast_propose(far).is_none(), "beyond the span");
+    let large = nodes[1].propose_fast(vec![0; WINDOW_BUDGET]).unwrap();
+    assert!(
+      nodes[1].on_fast_propose(large).is_none(),
+      "beyond the budget"
+    );
+    let mut unbudgeted = elected_leader(A, vec![A]);
+    assert!(unbudgeted.append_command(Vec::new()));
+    assert!(!unbudgeted.open_fast_track(), "no window, no fast track");
+  }
+
+  /// §4.8 retention: a window is retained as the log is — every slot an accepted value — and a publication
+  /// whose window is damaged is refused before the node votes.
+  #[test]
+  fn a_retained_window_survives_restore_and_a_damaged_one_is_refused() {
+    use slates_wire::Wire;
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    nodes[1].on_fast_propose(proposal).unwrap();
+    let saved = nodes[1].saved();
+    assert_eq!(saved.window.len(), 1);
+    let mut bytes = Vec::new();
+    saved.encode(&mut bytes);
+    let decoded = SavedRaft::decode(&mut bytes.as_slice()).unwrap();
+    let restored = RaftNode::restore(decoded).unwrap();
+    assert_eq!(restored.window(), nodes[1].window());
+    for damage in [
+      |saved: &mut SavedRaft| saved.window[0].index = 0,
+      |saved: &mut SavedRaft| saved.window[0].slot.term = saved.term + 1,
+      |saved: &mut SavedRaft| saved.synced_term = saved.term + 1,
+    ] {
+      let mut damaged = nodes[1].saved();
+      damage(&mut damaged);
+      assert_eq!(
+        RaftNode::restore(damaged).err(),
+        Some(RaftRecoveryError::InvalidWindow)
+      );
+    }
+  }
+
+  /// §4, the bounds over a term's life: the leader votes on the fast track too, into its own window, and its
+  /// slots go under a classic commit as a follower's do — so a window of three entries carries ten fast
+  /// commits. Until 2026-09-29 only a follower pruned: the leader's window filled after three, it stopped
+  /// voting, and a three-voter group (a fast quorum of three) committed nothing more on the fast track.
+  #[test]
+  fn a_leaders_own_votes_leave_its_window_at_commit() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let three_entries = 3 * (MIN_ENTRY_BYTES + 1);
+    for node in &mut nodes {
+      node.set_window_budget(three_entries);
+    }
+    for round in 0..10u8 {
+      let proposal = nodes[1].propose_fast(vec![round]).unwrap();
+      let votes: Vec<FastVote> = nodes
+        .iter_mut()
+        .filter_map(|node| node.on_fast_propose(proposal.clone()))
+        .collect();
+      for vote in votes {
+        nodes[0].on_fast_vote(vote);
+      }
+      let (leader, followers) = nodes.split_first_mut().unwrap();
+      let mut reached: Vec<(HostId, &mut RaftNode)> =
+        followers.iter_mut().map(|node| (node.id(), node)).collect();
+      replicate_once(leader, &mut reached);
+    }
+    assert_eq!(nodes[0].window_counters().fast_commits, 10);
+    assert!(
+      nodes[0].window().is_empty(),
+      "every slot of the leader's is committed"
+    );
+  }
+
+  /// Thesis §3.10 with the fast track open: a leader handing off stops deciding from votes, as it stops
+  /// accepting proposals, so the target's log can match its own; the votes stay in the voters' windows for the
+  /// successor's recovery.
+  #[test]
+  fn a_transferring_leader_decides_nothing_from_votes() {
+    let mut nodes = fast_group(&[A, B, C]);
+    nodes[0].transfer_leadership(B).unwrap();
+    assert!(
+      nodes[0].propose_fast(b"own".to_vec()).is_none(),
+      "the leader proposes nothing"
+    );
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    let before = nodes[0].last_log_index();
+    for at in [1, 2] {
+      let vote = nodes[at].on_fast_propose(proposal.clone()).unwrap();
+      nodes[0].on_fast_vote(vote);
+    }
+    assert_eq!(
+      nodes[0].last_log_index(),
+      before,
+      "a classic quorum voted, and nothing was decided"
+    );
+    assert_eq!(
+      nodes[2].window().len(),
+      1,
+      "the vote waits for the successor"
+    );
+    for _ in 0..TRANSFER_QUORUM_CHECKS {
+      nodes[0].check_quorum();
+    }
+    assert_eq!(nodes[0].transfers_aborted(), 1);
+    assert_eq!(
+      nodes[0].last_log_index(),
+      before + 1,
+      "the waiting votes are decided at the abort"
+    );
+  }
+
+  /// §3.7: an opening of the fast track counts in the term it was announced in only. `B` heard term 1's opening,
+  /// then won term 2 by its own election and never opened the track, then timed out, leaving leadership in the
+  /// same term. Until 2026-09-29 the term-1 announcement still stood, so `B` proposed and voted on a fast track
+  /// no leader of term 2 had opened (the explorer's first run with the fast track, seed 0 at three voters).
+  #[test]
+  fn an_opening_counts_in_its_own_term_only() {
+    let mut nodes = fast_group(&[A, B, C]);
+    assert!(nodes[1].fast_track_open(), "B heard term 1's opening");
+    let requests = nodes[1].start_election();
+    let reply = nodes[2].on_request_vote(requests[1]);
+    nodes[1].on_vote_reply(reply);
+    assert!(nodes[1].is_leader());
+    assert!(
+      !nodes[1].fast_track_open(),
+      "B leads term 2 and opened nothing"
+    );
+    nodes[1].on_election_timeout();
+    assert!(!nodes[1].is_leader());
+    assert!(
+      !nodes[1].fast_track_open(),
+      "no leader of term 2 opened the track"
+    );
+    assert!(nodes[1].propose_fast(b"x".to_vec()).is_none());
+  }
+
+  /// Three voters where the leader `A` fast-committed `x` at index 2 and `y` at 3 and then went quiet, and `B`
+  /// won the next term with `C`'s reports and re-proposed both at its own term, then appended its sync point
+  /// (§4's recovery). `A` holds the two commands under term 1, `B` the same two under term 2. Returns `A`, `B`
+  /// and `C`.
+  fn a_fast_commit_re_proposed_by_a_successor() -> (RaftNode, RaftNode, RaftNode) {
+    let mut nodes = fast_group(&[A, B, C]);
+    for command in [b"x", b"y"] {
+      let proposal = nodes[1].propose_fast(command.to_vec()).unwrap();
+      let votes: Vec<FastVote> = nodes
+        .iter_mut()
+        .filter_map(|node| node.on_fast_propose(proposal.clone()))
+        .collect();
+      for vote in votes {
+        nodes[0].on_fast_vote(vote);
+      }
+    }
+    assert_eq!(
+      (nodes[0].committed_through(), nodes[0].commit_index()),
+      (3, 1),
+      "A fast-committed both; its commit index stays classic"
+    );
+    let [mut a, mut b, mut c]: [RaftNode; 3] = nodes.try_into().ok().unwrap();
+    let requests = b.start_election();
+    b.on_vote_reply(c.on_request_vote(requests[1]));
+    assert!(b.is_leader());
+    assert!(b.append_command(Vec::new()), "B's sync point");
+    let terms =
+      |node: &RaftNode| -> Vec<u64> { node.saved().log.iter().map(|entry| entry.term).collect() };
+    assert_eq!((terms(&a), terms(&b)), (vec![1, 1, 1], vec![1, 2, 2, 2]));
+    let _ = &mut a;
+    (a, b, c)
+  }
+
+  /// §4: a fast commit is the committing leader's alone — to apply and acknowledge — so when a successor
+  /// re-proposes the commands under its own term, the old leader takes the successor's entries as any follower
+  /// takes a leader's: its log ends up the successor's, entry for entry and term for term. Committed entries
+  /// therefore never differ in term between nodes (the prefix model never takes the path that would keep one
+  /// under an older term).
+  #[test]
+  fn an_old_leaders_fast_commits_yield_to_its_successors_entries() {
+    let (mut a, mut b, mut c) = a_fast_commit_re_proposed_by_a_successor();
+    // Rounds, not one: a follower's first refusal backs the leader up before it takes the entries.
+    for _ in 0..3 {
+      replicate_once(&mut b, &mut [(A, &mut a), (C, &mut c)]);
+    }
+    assert_eq!(a.saved().log, b.saved().log);
+    assert_eq!((b.commit_index(), a.commit_index()), (4, 4));
+    let commands: Vec<Vec<u8>> = a
+      .committed_entries()
+      .iter()
+      .map(|entry| entry.command.clone())
+      .collect();
+    assert_eq!(
+      commands,
+      vec![Vec::new(), b"x".to_vec(), b"y".to_vec(), Vec::new()]
+    );
+  }
+
+  /// §4: a new leader keeps its window — its recovery reads it, but a slot goes only once a classic commit
+  /// covers its index. Clearing it at the election lost a chosen value in the explorer (seed 266): the new
+  /// leader's log carried the value until a later leader's truncation erased it, and then nothing did.
+  #[test]
+  fn a_new_leader_keeps_its_window_until_a_classic_commit() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    for at in [1, 2] {
+      nodes[at].on_fast_propose(proposal.clone()).unwrap();
+    }
+    let requests = nodes[1].start_election();
+    let reply = nodes[2].on_request_vote(requests[1]);
+    nodes[1].on_vote_reply(reply);
+    assert!(nodes[1].is_leader());
+    assert_eq!(nodes[1].window_counters().recovered_fast_choices, 1);
+    assert_eq!(nodes[1].window().len(), 1, "B's own vote stays");
+    assert!(nodes[1].append_command(Vec::new()), "the sync point");
+    let (_, rest) = nodes.split_at_mut(1);
+    let (b, c) = rest.split_at_mut(1);
+    for _ in 0..2 {
+      replicate_once(&mut b[0], &mut [(C, &mut c[0])]);
+    }
+    assert!(
+      b[0].window().is_empty(),
+      "the classic commit covers index 2"
+    );
+  }
+
+  /// §4, one configuration per fast term: the fast track opens only on a committed configuration. A leader
+  /// that has appended `C_new` must wait for it to commit — a successor lacking it would take the joint
+  /// configuration as its own and treat an index a fast quorum chose under `C_new` as free.
+  #[test]
+  fn the_fast_track_waits_for_the_configuration_to_commit() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    let mut b = RaftNode::new(B, vec![A, B, C]);
+    for node in [&mut leader, &mut b] {
+      node.set_window_budget(WINDOW_BUDGET);
+    }
+    assert!(leader.append_command(Vec::new()), "the sync point");
+    replicate_once(&mut leader, &mut [(B, &mut b)]);
+    assert!(leader.begin_membership_change(vec![A, B]));
+    replicate_once(&mut leader, &mut [(B, &mut b)]);
+    assert!(leader.complete_membership_change());
+    assert!(!leader.in_joint_configuration());
+    assert!(
+      !leader.open_fast_track(),
+      "C_new is appended, not committed"
+    );
+    replicate_once(&mut leader, &mut [(B, &mut b)]);
+    assert_eq!(leader.commit_index(), leader.last_log_index());
+    assert!(leader.open_fast_track(), "C_new committed");
+  }
+
+  /// The recovery reads its window by filter, not by `BTreeMap::range`, which panics on a start past its end:
+  /// a node holding a slot with a zero budget — its reach is its log's end — once aborted here on winning an
+  /// election. It wins now, recovering nothing beyond its reach.
+  #[test]
+  fn a_node_holding_a_window_with_no_budget_wins_without_panicking() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    nodes[1].on_fast_propose(proposal).unwrap();
+    nodes[1].set_window_budget(0);
+    let requests = nodes[1].start_election();
+    let reply = nodes[2].on_request_vote(requests[1]);
+    nodes[1].on_vote_reply(reply);
+    assert!(nodes[1].is_leader());
+    assert_eq!(nodes[1].window_counters().recovered, 0);
   }
 }

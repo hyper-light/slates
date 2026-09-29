@@ -19,8 +19,9 @@ use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
-  AppendEntries, AppendReply, ElectionPriority, InstallSnapshot, InstallSnapshotReply, LogEntry,
-  PreVote, PreVoteReply, RaftNode, RequestVote, TimeoutNow, VoteReply, VoterConfig,
+  AppendEntries, AppendReply, ElectionPriority, FastPropose, FastVote, InstallSnapshot,
+  InstallSnapshotReply, LogEntry, PreVote, PreVoteReply, RaftNode, RequestVote, SlotReport,
+  TimeoutNow, VoteReply, VoterConfig, WindowSlot,
 };
 
 /// A Raft message on the wire.
@@ -46,6 +47,10 @@ pub enum RaftMessage {
   InstallSnapshot(InstallSnapshot),
   /// A follower's reply to a snapshot: how far its log now matches the leader's.
   InstallSnapshotReply(InstallSnapshotReply),
+  /// A proposer's command sent straight to every voter (the fast track, research record §3.7).
+  FastPropose(FastPropose),
+  /// A voter's fast vote, sent to its term's leader.
+  FastVote(FastVote),
 }
 
 /// A refusal to decode a Raft message from received bytes (the closed hostile-input taxonomy).
@@ -88,15 +93,21 @@ const TAG_TIMEOUT_NOW: u8 = 7;
 /// Format: the snapshot transfer and its reply (Raft §7), continuing the sequence.
 const TAG_INSTALL_SNAPSHOT: u8 = 8;
 const TAG_INSTALL_SNAPSHOT_REPLY: u8 = 9;
+/// Format: the fast track's proposal and vote (research record §3.7), continuing the sequence.
+const TAG_FAST_PROPOSE: u8 = 10;
+const TAG_FAST_VOTE: u8 = 11;
 
 /// Format: an append's fixed bytes before its entries — the tag, six `u64` fields (term, leader, previous
 /// index and term, commit index, read context) and the `u32` entry count.
 pub const APPEND_HEADER_BYTES: usize = 1 + 6 * size_of::<u64>() + size_of::<u32>();
+/// Format: an append's fixed bytes after its priority table — the sync point and the fast track's opening,
+/// two `u64` fields.
+pub const APPEND_TRAILER_BYTES: usize = 2 * size_of::<u64>();
 
 /// Derived: the entry bytes one append may carry (the `budget` of [`RaftNode::replicate_to`]) so that the
 /// whole message — its fixed header ([`APPEND_HEADER_BYTES`]), its priority table (a count and one
-/// [`PRIORITY_ROW_BYTES`] row for each of the `voters`), the `envelope` bytes its sender frames it in, and
-/// its entries — fits the credit a fresh session with frames of `frame_cap` bytes grants before any window
+/// [`PRIORITY_ROW_BYTES`] row for each of the `voters`), its trailer ([`APPEND_TRAILER_BYTES`]), the
+/// `envelope` bytes its sender frames it in, and its entries — fits the credit a fresh session with frames of `frame_cap` bytes grants before any window
 /// update (`slates_transport::connection::initial_receive_window`: the reorder threshold plus one packets of
 /// stream data, the least credit loss detection needs). A batch within it reaches its follower in one
 /// flight on any session, however new; the session's window grows past it on its own, and an entry larger
@@ -109,6 +120,7 @@ pub fn append_batch_bytes(frame_cap: usize, envelope: usize, voters: usize) -> u
   .unwrap_or(usize::MAX)
   .saturating_sub(APPEND_HEADER_BYTES)
   .saturating_sub(table)
+  .saturating_sub(APPEND_TRAILER_BYTES)
   .saturating_sub(envelope)
 }
 
@@ -130,6 +142,8 @@ impl RaftMessage {
       Self::TimeoutNow(invitation) => invitation.leader,
       Self::InstallSnapshot(snapshot) => snapshot.leader,
       Self::InstallSnapshotReply(reply) => reply.follower,
+      Self::FastPropose(proposal) => proposal.proposer,
+      Self::FastVote(vote) => vote.voter,
     }
   }
 
@@ -158,6 +172,13 @@ impl RaftMessage {
         put_u64(&mut out, reply.voter.0);
         put_u64(&mut out, reply.term);
         out.push(u8::from(reply.granted));
+        put_u32(
+          &mut out,
+          u32::try_from(reply.reports.len()).unwrap_or(u32::MAX),
+        );
+        for report in &reply.reports {
+          encode_report(&mut out, report);
+        }
       }
       RaftMessage::AppendEntries(append) => {
         out.push(TAG_APPEND_ENTRIES);
@@ -182,6 +203,8 @@ impl RaftMessage {
           put_u64(&mut out, voter.0);
           encode_priority(&mut out, priority);
         }
+        put_u64(&mut out, append.sync_index);
+        put_u64(&mut out, append.open_from);
       }
       RaftMessage::AppendReply(reply) => {
         out.push(TAG_APPEND_REPLY);
@@ -231,6 +254,20 @@ impl RaftMessage {
         put_u64(&mut out, reply.term);
         put_u64(&mut out, reply.match_index);
       }
+      RaftMessage::FastPropose(proposal) => {
+        out.push(TAG_FAST_PROPOSE);
+        put_u64(&mut out, proposal.term);
+        put_u64(&mut out, proposal.proposer.0);
+        put_u64(&mut out, proposal.index);
+        put_bytes(&mut out, &proposal.command);
+      }
+      RaftMessage::FastVote(vote) => {
+        out.push(TAG_FAST_VOTE);
+        put_u64(&mut out, vote.term);
+        put_u64(&mut out, vote.voter.0);
+        put_u64(&mut out, vote.index);
+        put_bytes(&mut out, &vote.command);
+      }
     }
     out
   }
@@ -256,11 +293,19 @@ impl RaftMessage {
         let (voter, rest) = take_u64(rest)?;
         let (term, rest) = take_u64(rest)?;
         let (granted, rest) = take_bool(rest)?;
+        let (count, mut rest) = take_count(rest)?;
+        let mut reports = Vec::with_capacity(count);
+        for _ in 0..count {
+          let (report, tail) = decode_report(rest)?;
+          reports.push(report);
+          rest = tail;
+        }
         expect_end(rest)?;
         Ok(RaftMessage::VoteReply(VoteReply {
           voter: HostId(voter),
           term,
           granted,
+          reports,
         }))
       }
       TAG_APPEND_ENTRIES => {
@@ -285,6 +330,8 @@ impl RaftMessage {
           priorities.push((HostId(voter), priority));
           rest = tail;
         }
+        let (sync_index, rest) = take_u64(rest)?;
+        let (open_from, rest) = take_u64(rest)?;
         expect_end(rest)?;
         Ok(RaftMessage::AppendEntries(AppendEntries {
           read_context,
@@ -295,6 +342,8 @@ impl RaftMessage {
           entries,
           leader_commit,
           priorities,
+          sync_index,
+          open_from,
         }))
       }
       TAG_APPEND_REPLY => {
@@ -379,6 +428,32 @@ impl RaftMessage {
           match_index,
         }))
       }
+      TAG_FAST_PROPOSE => {
+        let (term, rest) = take_u64(rest)?;
+        let (proposer, rest) = take_u64(rest)?;
+        let (index, rest) = take_u64(rest)?;
+        let (command, rest) = take_bytes(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::FastPropose(FastPropose {
+          term,
+          proposer: HostId(proposer),
+          index,
+          command,
+        }))
+      }
+      TAG_FAST_VOTE => {
+        let (term, rest) = take_u64(rest)?;
+        let (voter, rest) = take_u64(rest)?;
+        let (index, rest) = take_u64(rest)?;
+        let (command, rest) = take_bytes(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::FastVote(FastVote {
+          term,
+          voter: HostId(voter),
+          index,
+          command,
+        }))
+      }
       other => Err(RaftWireError::UnknownTag { tag: other }),
     }
   }
@@ -386,6 +461,30 @@ impl RaftMessage {
 
 /// Appends a log entry: its term, its command (length-prefixed), then its optional voter configuration.
 /// [`LogEntry::encoded_len`] counts exactly these bytes (`an_entry_takes_the_bytes_the_core_counts`).
+/// Appends a window slot's report: its index, the term it was accepted in, whether it is a fast vote, then
+/// its entry.
+fn encode_report(out: &mut Vec<u8>, report: &SlotReport) {
+  put_u64(out, report.index);
+  put_u64(out, report.slot.term);
+  out.push(u8::from(report.slot.fast));
+  encode_entry(out, &report.slot.entry);
+}
+
+/// Decodes a window slot's report from the front of `bytes`, returning it and the remainder.
+fn decode_report(bytes: &[u8]) -> Result<(SlotReport, &[u8]), RaftWireError> {
+  let (index, rest) = take_u64(bytes)?;
+  let (term, rest) = take_u64(rest)?;
+  let (fast, rest) = take_bool(rest)?;
+  let (entry, rest) = decode_entry(rest)?;
+  Ok((
+    SlotReport {
+      index,
+      slot: WindowSlot { term, fast, entry },
+    },
+    rest,
+  ))
+}
+
 fn encode_entry(out: &mut Vec<u8>, entry: &LogEntry) {
   put_u64(out, entry.term);
   put_u32(out, u32::try_from(entry.command.len()).unwrap_or(u32::MAX));
@@ -487,6 +586,12 @@ fn decode_hosts(bytes: &[u8]) -> Result<(Vec<HostId>, &[u8]), RaftWireError> {
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
   out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// Appends a length-prefixed byte string (the length a little-endian `u32`), which [`take_bytes`] reads.
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+  put_u32(out, u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+  out.extend_from_slice(bytes);
 }
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
@@ -832,6 +937,8 @@ mod tests {
       ],
       leader_commit: 2,
       priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
     })
   }
 
@@ -865,6 +972,7 @@ mod tests {
         voter: B,
         term: 7,
         granted: true,
+        reports: Vec::new(),
       }),
       append_with_entries(),
       RaftMessage::AppendReply(AppendReply {
@@ -905,6 +1013,13 @@ mod tests {
         term: 9,
         match_index: 7,
       }),
+      fast_propose(),
+      RaftMessage::FastVote(FastVote {
+        term: 6,
+        voter: B,
+        index: 12,
+        command: b"cmd".to_vec(),
+      }),
     ];
     for message in messages {
       let bytes = message.encode();
@@ -931,7 +1046,7 @@ mod tests {
   /// cannot see that).
   #[test]
   fn every_message_has_a_golden_encoding() {
-    let golden: [(RaftMessage, Vec<u8>); 9] = [
+    let golden: [(RaftMessage, Vec<u8>); 11] = [
       (
         RaftMessage::RequestVote(RequestVote {
           term: 7,
@@ -953,12 +1068,28 @@ mod tests {
           voter: HostId(2),
           term: 7,
           granted: true,
+          reports: vec![SlotReport {
+            index: 0x11,
+            slot: WindowSlot {
+              term: 0x12,
+              fast: true,
+              entry: LogEntry::command(0x12, b"fv".to_vec()),
+            },
+          }],
         }),
         [
           &[TAG_VOTE_REPLY][..],
           &[2, 0, 0, 0, 0, 0, 0, 0],
           &[7, 0, 0, 0, 0, 0, 0, 0],
           &[1],
+          &[1, 0, 0, 0],                // reports
+          &[0x11, 0, 0, 0, 0, 0, 0, 0], // its index
+          &[0x12, 0, 0, 0, 0, 0, 0, 0], // the term it was accepted in
+          &[1],                         // a fast vote
+          &[0x12, 0, 0, 0, 0, 0, 0, 0], // its entry: term
+          &[2, 0, 0, 0],                // command length
+          b"fv",
+          &[0], // no configuration
         ]
         .concat(),
       ),
@@ -987,6 +1118,8 @@ mod tests {
               spread_ns: 0x22,
             },
           )],
+          sync_index: 0x23,
+          open_from: 0x24,
         }),
         [
           &[TAG_APPEND_ENTRIES][..],
@@ -1012,6 +1145,8 @@ mod tests {
           &[2, 0, 0, 0, 0, 0, 0, 0],    // voter
           &[0x21, 0, 0, 0, 0, 0, 0, 0], // its quorum round trip
           &[0x22, 0, 0, 0, 0, 0, 0, 0], // its spread
+          &[0x23, 0, 0, 0, 0, 0, 0, 0], // the sync point
+          &[0x24, 0, 0, 0, 0, 0, 0, 0], // the fast track's opening
         ]
         .concat(),
       ),
@@ -1127,6 +1262,40 @@ mod tests {
         ]
         .concat(),
       ),
+      (
+        RaftMessage::FastPropose(FastPropose {
+          term: 0x31,
+          proposer: HostId(3),
+          index: 0x32,
+          command: b"fp".to_vec(),
+        }),
+        [
+          &[TAG_FAST_PROPOSE][..],
+          &[0x31, 0, 0, 0, 0, 0, 0, 0], // term
+          &[3, 0, 0, 0, 0, 0, 0, 0],    // proposer
+          &[0x32, 0, 0, 0, 0, 0, 0, 0], // index
+          &[2, 0, 0, 0],                // command length
+          b"fp",
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::FastVote(FastVote {
+          term: 0x41,
+          voter: HostId(4),
+          index: 0x42,
+          command: b"fv".to_vec(),
+        }),
+        [
+          &[TAG_FAST_VOTE][..],
+          &[0x41, 0, 0, 0, 0, 0, 0, 0], // term
+          &[4, 0, 0, 0, 0, 0, 0, 0],    // voter
+          &[0x42, 0, 0, 0, 0, 0, 0, 0], // index
+          &[2, 0, 0, 0],                // command length
+          b"fv",
+        ]
+        .concat(),
+      ),
     ];
     for (message, bytes) in golden {
       assert_eq!(
@@ -1140,6 +1309,84 @@ mod tests {
         "the golden bytes decode"
       );
     }
+  }
+
+  /// A fast proposal every test of the fast track's wire uses.
+  fn fast_propose() -> RaftMessage {
+    RaftMessage::FastPropose(FastPropose {
+      term: 6,
+      proposer: A,
+      index: 12,
+      command: b"cmd".to_vec(),
+    })
+  }
+
+  /// Hostile input on the fast track's messages and a vote's reports (research record §3.7, §4): every
+  /// truncation of a valid encoding is refused `Truncated` or `LengthMismatch`, a trailing byte is
+  /// `LengthMismatch`, a command length reaching past the bytes is `LengthMismatch` before any allocation, a
+  /// report count past the bytes too, a report's fast flag that is neither zero nor one is `BadFlag`, and a
+  /// session cannot propose or vote for another member.
+  #[test]
+  fn hostile_fast_track_messages_are_refused() {
+    let vote_reply = RaftMessage::VoteReply(VoteReply {
+      voter: B,
+      term: 7,
+      granted: true,
+      reports: vec![SlotReport {
+        index: 3,
+        slot: WindowSlot {
+          term: 7,
+          fast: true,
+          entry: LogEntry::command(7, b"x".to_vec()),
+        },
+      }],
+    });
+    for message in [fast_propose(), vote_reply.clone()] {
+      let bytes = message.encode();
+      for cut in 1..bytes.len() {
+        assert!(
+          matches!(
+            RaftMessage::decode(&bytes[..cut]),
+            Err(RaftWireError::Truncated | RaftWireError::LengthMismatch)
+          ),
+          "{message:?} cut at {cut}"
+        );
+      }
+      let mut long = bytes.clone();
+      long.push(0);
+      assert_eq!(
+        RaftMessage::decode(&long),
+        Err(RaftWireError::LengthMismatch)
+      );
+      assert_eq!(
+        RaftMessage::decode_from(&bytes, HostId(message.sender().0 ^ u64::MAX)),
+        Err(RaftWireError::ForeignSender)
+      );
+    }
+    // The command length is the last `u32` before the command's three bytes.
+    let mut lying = fast_propose().encode();
+    let length_at = lying.len() - 3 - size_of::<u32>();
+    lying[length_at..length_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      RaftMessage::decode(&lying),
+      Err(RaftWireError::LengthMismatch)
+    );
+    // The report count follows the tag, the voter, the term and the granted flag.
+    let count_at = 1 + 2 * size_of::<u64>() + 1;
+    let mut counted = vote_reply.encode();
+    counted[count_at..count_at + size_of::<u32>()].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      RaftMessage::decode(&counted),
+      Err(RaftWireError::LengthMismatch)
+    );
+    // The report's fast flag follows its index and term.
+    let flag_at = count_at + size_of::<u32>() + 2 * size_of::<u64>();
+    let mut flagged = vote_reply.encode();
+    flagged[flag_at] = 2;
+    assert_eq!(
+      RaftMessage::decode(&flagged),
+      Err(RaftWireError::BadFlag { flag: 2 })
+    );
   }
 
   /// Hostile input on the leadership-transfer invitation: every truncation of a valid encoding is refused
@@ -1260,14 +1507,19 @@ mod tests {
       entries: Vec::new(),
       leader_commit: 0,
       priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
     });
-    // The header, then an empty priority table's count.
-    assert_eq!(empty.encode().len(), APPEND_HEADER_BYTES + size_of::<u32>());
+    // The header, an empty priority table's count, then the trailer.
+    assert_eq!(
+      empty.encode().len(),
+      APPEND_HEADER_BYTES + size_of::<u32>() + APPEND_TRAILER_BYTES
+    );
   }
 
-  /// The derived batch budget: a whole append — its header, a five-voter priority table, the sender's
-  /// envelope and a batch of exactly the budget — is the credit a fresh session grants before any window
-  /// update, so it needs no update to arrive; and an envelope larger than that credit leaves no budget
+  /// The derived batch budget: a whole append — its header, a five-voter priority table, its trailer, the
+  /// sender's envelope and a batch of exactly the budget — is the credit a fresh session grants before any
+  /// window update, so it needs no update to arrive; and an envelope larger than that credit leaves no budget
   /// rather than wrapping.
   #[test]
   fn a_budgeted_append_fits_a_fresh_sessions_first_credit() {
@@ -1281,7 +1533,10 @@ mod tests {
     let table = size_of::<u32>() + voters * PRIORITY_ROW_BYTES;
     let budget = append_batch_bytes(frame_cap, envelope, voters);
     assert!(budget > 0);
-    assert_eq!(budget + APPEND_HEADER_BYTES + table + envelope, credit);
+    assert_eq!(
+      budget + APPEND_HEADER_BYTES + table + APPEND_TRAILER_BYTES + envelope,
+      credit
+    );
     assert_eq!(append_batch_bytes(frame_cap, credit, voters), 0);
   }
 
@@ -1317,6 +1572,7 @@ mod tests {
       voter: A,
       term: 1,
       granted: false,
+      reports: Vec::new(),
     })
     .encode();
     bytes.push(0);

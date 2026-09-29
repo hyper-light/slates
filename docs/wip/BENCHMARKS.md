@@ -817,3 +817,47 @@ one_scope_from_the_environment --nocapture`.
 | design | 4, 3, 1, 3 and 5, 2, 1, 3 | over 22,016,505 and 11,870,838 | past the 4 GiB ceiling, stopped | 8.8 s, 7.1 s | 2.7 GB, 2.5 GB |
 
 The whole full-scale set runs in 18.4 s here and holds 2.43 GB at its peak.
+
+**Superseded 2026-09-29:** the design this table verifies drops a synced node's older slots at the sync, and
+that loses a chosen value at a scope the table never reached (three indices with four terms). The corrected
+design and its numbers follow.
+
+### The prefix model, corrected: a slot goes only under a classic commit (2026-09-29)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1, rustc 1.98.0, release; no other session's build
+alongside. State counts are exact. **Commands:** CI's step, `cargo test -p slates-cluster --release --test
+prefix_model -- --ignored --test-threads=1 --exact the_design_keeps_agreement_at_full_scope
+each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one --nocapture`. One scope:
+`SLATES_PREFIX_SCOPE=3,3,1,4 [SLATES_PREFIX_VARIANT=drop-at-sync|prune-at-fast-commit|drop-covered|
+commit-from-windows|report-logs-too] [SLATES_PREFIX_CEILING_GB=24] cargo test -p slates-cluster --release
+--test prefix_model -- --ignored --exact one_scope_from_the_environment --nocapture`.
+
+The model now gives each node the classic commit index it knows, prunes a slot only under it, keeps a new
+leader's window, and keeps a follower's committed prefix on an append as the code does. Log matching is Raft's
+strict form.
+
+| Variant | Scope (nodes, indices, values, terms) | Classes | Result | Wall | Peak |
+|---|---|---|---|---|---|
+| design | 3, 3, 1, 2 (the default suite; 6.9 s in debug) | 1,951,672 | no fault | 0.70 s | 299 MB |
+| design | 3, 3, 1, 3 | 21,776,022 | no fault | 7.3 s | 2,622 MB |
+| design | 4, 2, 2, 3 | 12,559,351 | no fault | 4.7 s | 1,918 MB |
+| design | 3, 2, 2, 4 | 3,401,082 | no fault | 1.1 s | 561 MB |
+| design, by hand (past CI's ceiling) | 3, 3, 2, 3 | 188,172,261 | no fault | 76.1 s | 14.0 GB |
+| design, by hand (past CI's ceiling) | 3, 3, 1, 4 | 152,906,020 | no fault | 58.8 s | 11.7 GB |
+| slots dropped at a sync (the first design) | 3, 3, 1, 4 | 15,379,817 (serial) | a chosen value lost after 18 steps | — | — |
+| slots pruned under a commit that counts fast commits | 3, 3, 1, 3 | 860,982 (serial) | log matching broken after 12 steps; with the dialect's value-level matching instead, a chosen value lost at 3, 3, 1, 4 (43,450,155 classes) | 17.6 s (the latter) | 6.4 GB |
+| commits counted from windows | 3, 3, 1, 3 | 382,952 (serial) | a committed entry lost after 12 steps | — | — |
+| slots dropped once covered | 3, 3, 1, 3 | 2,015,576 (serial) | a committed entry lost after 16 steps | — | — |
+| voters report their logs too | 3, 3, 1, 3 | 21,789,824 | no fault; 49,654 recoveries from a log | 6.8 s | 2,565 MB |
+
+In every design scope, no path keeps a committed entry under an older term than a leader's (the design
+asserts it), and slots are pruned under a commit 544,767 to 99,631,245 times. CI's step takes 13.1 s for the
+design's scopes (2.6 GB peak) and 65 s for the rejected rules (2.9 GB peak; the serial searches run on one
+core). The two by-hand scopes exceed the 4 GiB ceiling CI's smallest runner allows.
+
+**Measured and rejected on the way:**
+- Keeping a synced node's older slots until its commit index covered its synced leader's no-op, pruning under
+  a commit index that counted fast commits: a chosen value lost at 39,450,280 classes (3, 3, 1, 4).
+- The serial search keyed its visited set by whole keys, holding each 64-byte key twice (about 400 bytes a
+  state at the peak): the 18-step history above outgrew the 4 GiB ceiling. It now holds 128-bit
+  fingerprints, 131 accounted bytes a state, and fits.

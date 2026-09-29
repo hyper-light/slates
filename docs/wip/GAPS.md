@@ -1826,6 +1826,39 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: the fast track and the window are built in the core — the design's sync rule lost chosen values; fixed
+
+**Built** (`crates/cluster/src/raft.rs`, `raft_wire.rs`; `docs/wip/research/consensus-enhancements.md` §4,
+slice 10). The window (retained and validated), window reports with votes, the sync point and the fast
+track's opening in appends, `FastPropose` and `FastVote`, the ballot recovery, the fast track, buffering and
+absorption, and the window's byte budget and span. The Raft safety explorer covers all of it on the real core,
+with a ghost of every vote cast. At full scale it saw 1,227 and 1,691 fast choices and 743 and 831 fast
+commits, with no violation.
+
+**Found on the way, each fixed with a failing test first:**
+- A leader's own votes never left its window.
+- A handing-off leader kept deciding.
+- An opening of the fast track outlived its term.
+- The track could open on an uncommitted configuration.
+- **The committed design's rule for dropping slots lost a chosen value.** The design said a synced node
+  drops its older slots at the sync, and a new leader cleared its window. The explorer met the fault at full
+  scale (seed 266); the model then reproduced it in 18 steps at a scope its earlier searches had not
+  combined. Pruning under a commit index that counts fast commits fails too. A slot now goes only under a
+  classic commit, and the commit index is classic; the leader alone counts its fast choices, to apply,
+  acknowledge and read. [Bug record](../bugs/2026-09-29-window-slots-dropped-before-a-classic-commit-lost-chosen-values.md).
+
+**Verified.** The corrected design holds with Raft's strict log matching at 152,906,020 and 188,172,261
+classes. Those two scopes are searched by hand (11.7 GB and 14.0 GB); CI searches the scopes under its 4 GiB
+ceiling, and each rejected rule where it fails.
+
+**Owed:**
+- Pipelined replication. Without it, §3.5's out-of-order acknowledgement has almost no hole to fill: 4
+  buffered entries in 3,200,000 explored steps.
+- The groups' wiring: the window budget, votes routed to the leader, and the fast track's policy. Today the
+  budget is zero in the groups, so nothing opens.
+- The timed measurements that set the defaults.
+- MLRaft, and the KIND lane.
+
 ### 2026-09-28: Fast Raft's published recovery is unsafe — the ballot rule is verified; the dialect is owed
 
 **Model** (`crates/cluster/tests/slot_model.rs`; `docs/wip/research/consensus-enhancements.md` §3.7, slice
@@ -1853,6 +1886,10 @@ reporting their logs too (safe, but it resurrects stale entries).
 in `RaftNode` yet, and the randomized explorer must cover them on the real code. Then the measurement of the
 fast track's crossover (loss, proposer placement), which decides whether it is on by default. Four nodes with
 three indices, and five nodes, exceed the 4 GiB ceiling for the prefix model.
+
+**Update 2026-09-29:** the dialect is built and explored (the entry above), and the design this entry calls
+verified was corrected: its sync rule lost chosen values. Still owed from here: the pipelining that
+out-of-order acknowledgement needs, and the crossover measurement.
 
 ### 2026-09-28: priority elections — built; the explorer's diagnosis tool broke CI's `--ignored` run — fixed
 

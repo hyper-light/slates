@@ -541,6 +541,17 @@ impl RootGroup {
         self.discard_superseded_view();
         Some(RaftMessage::InstallSnapshotReply(reply))
       }
+      // A fast proposal is answered with this voter's vote (research record §3.7); a vote the leader
+      // receives is tallied, and it decides the next indices it can.
+      RaftMessage::FastPropose(proposal) => self
+        .raft
+        .on_fast_propose(proposal)
+        .map(RaftMessage::FastVote),
+      RaftMessage::FastVote(vote) => {
+        self.raft.on_fast_vote(vote);
+        self.apply_committed();
+        None
+      }
       RaftMessage::VoteReply(_)
       | RaftMessage::PreVoteReply(_)
       | RaftMessage::AppendReply(_)
@@ -574,11 +585,18 @@ impl RootGroup {
         self.apply_committed();
         Vec::new()
       }
+      // A voter's answer to this node's fast proposal: tallied when this node leads.
+      RaftMessage::FastVote(vote) => {
+        self.raft.on_fast_vote(vote);
+        self.apply_committed();
+        Vec::new()
+      }
       RaftMessage::PreVote(_)
       | RaftMessage::RequestVote(_)
       | RaftMessage::AppendEntries(_)
       | RaftMessage::TimeoutNow(_)
-      | RaftMessage::InstallSnapshot(_) => Vec::new(),
+      | RaftMessage::InstallSnapshot(_)
+      | RaftMessage::FastPropose(_) => Vec::new(),
     };
     self.finish_election(was_leader);
     messages

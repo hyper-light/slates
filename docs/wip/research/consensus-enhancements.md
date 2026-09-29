@@ -173,25 +173,51 @@ their self-approved entries with their vote, and the new leader re-runs the vote
 
 ## 4. Composition
 
-- **One log model, as built** (verified by the prefix model, slice 9). Raft's log keeps every rule it has:
-  in-order appends with the consistency check and truncation, Raft's election rule, and commitment by a
-  majority's logs at the current term. Above the log, each follower keeps a **window** of slots:
+- **One log model, as built** (verified by the prefix model, slices 9 and 10; built in `RaftNode`, slice 10).
+  Raft's log keeps every rule it has: in-order appends with the consistency check and truncation, Raft's
+  election rule, and commitment by a majority's logs at the current term. Above the log, each node keeps a
+  **window** of slots:
   - the leader's entries that arrived out of order;
   - fast votes, each with the term it was accepted in.
 
-  A follower accepts either only once it is **synced** to its term's leader, meaning its log holds the
-  no-op that leader appends after its recovery. On syncing, it drops the slots of older terms.
+  A node accepts either only once it is **synced** to its term's leader, meaning its log holds the no-op
+  that leader appends after its recovery.
+
+  **The commit index is classic.** A node's commit index is the highest index a majority's logs hold at
+  their leader's term; it is what a follower learns and what is retained. A leader also counts the indices
+  fast quorums chose, in order past its commit index, and applies, acknowledges and reads at that frontier
+  (`RaftNode::committed_through`); the frontier is its alone and ends with its leadership.
+
+  **A slot goes only under a classic commit.** A slot is an acceptor's record of an accepted value, and a
+  node drops it only once its commit index covers the slot's index: Raft's election rule then puts that
+  entry, and every value below it, in every later leader's log. Nothing else drops a slot — not a sync, not
+  the node's own election, not a fast commit.
 
   **Recovery.** Voters report their window slots with their votes. For each index above the candidate's
   last log entry, the highest ballot decides as in §3.7, and the leader appends the recovered values at
-  its term, a no-op at each free index below the last of them, and then its own no-op. Three choices are
-  each backed by a search:
+  its term, a no-op at each free index below the last of them, and then its own no-op. It keeps its own
+  window. Each of these choices is backed by a search (`crates/cluster/tests/prefix_model.rs`), and each
+  rejected rule is kept as a variant that fails by its shortest history:
   - **Reports are windows only.** The candidate's own log is kept (Raft's election rule makes it safe),
     and voters' log entries are not reported. That keeps a classic leader from resurrecting a deposed
     leader's uncommitted entries, which Raft discards.
-  - **A window slot outlives the log entry that covers it.** It is dropped only at a sync; dropping it
-    earlier loses a committed entry in 17 steps.
+  - **A window slot outlives the log entry that covers it.** Dropping it once covered loses a committed
+    entry in 16 steps.
+  - **Not at a sync.** Dropping a synced node's older slots at the sync (and clearing a new leader's window)
+    loses a chosen value in 18 steps: the synced log carried it, but a later leader's truncation erased it.
+    The explorer met it first (slice 10), at a scope the model's earlier searches had not combined.
+  - **Not under a fast commit.** Pruning under a commit index that counts fast commits keeps a committed
+    entry under the fast leader's term while every later leader holds it under its own, 12 steps; with a
+    fourth term it loses the value.
   - **Commitment stays in order** (§3.5).
+
+  Because a follower's committed prefix is classic, committed entries never differ in term between nodes,
+  and Raft's log matching holds as it stands: the model never takes the path that would keep a committed
+  entry under an older term than a leader's.
+- **One configuration per fast term.** The fast track opens only on a committed configuration that is not
+  joint, with the leader's no-op appended and no transfer in flight, and stays open for the term; a membership
+  change waits for a classic term. A successor's recovery counts the votes against that configuration, which
+  every later leader's log holds. An opening counts in the term it was announced in only.
 - **Application stays in order** for every mechanism (the configuration state machine is sequential).
 - **Pre-vote and priority** gate *starting* an election; **transfer** starts one deliberately; none
   changes the vote rule.
@@ -472,4 +498,74 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
   - **Next.** The dialect (`RaftNode`): the window and sync term in `SavedRaft`, window reports in
     `VoteReply`, the sync point and fast-track opening in `AppendEntries`, the fast track's messages, and
     the randomized explorer extended to all of it.
+  - **Correction (slice 10).** The design above was unsafe outside the scopes searched: it dropped a synced
+    node's older slots at the sync. The corrected design, and the rejected rules, are in §4 and slice 10.
+- **Slice 10 (2026-09-29): the fast track and the window in the real core, and two design faults the
+  explorer found.**
+  - **Built** (`crates/cluster/src/raft.rs`, `raft_wire.rs`):
+    - the window and the synced term, retained in `SavedRaft` and validated before a node votes
+      (`InvalidWindow`);
+    - window reports in `VoteReply`, the sync point and the fast track's opening in `AppendEntries`;
+    - the fast track's two messages, `FastPropose` and `FastVote` (tags 10 and 11, golden vectors,
+      hostile-input tests);
+    - the recovery (§3.7's ballot rule over windows);
+    - the fast track: a leader opens it, any synced node proposes, voters vote to their leader, the leader
+      decides each index at a classic quorum of votes and commits at a fast quorum;
+    - buffering of the leader's entries ahead of a hole, and their absorption;
+    - the window's bounds: a byte budget and the span it buys above the log.
+
+    The council and the root group dispatch the two messages; the window budget defaults to zero, so nothing
+    opens a fast track until the groups are wired (owed).
+  - **The explorer covers it all on the real code.**
+    - Every node holds a window as large as one append.
+    - A leader may open the fast track at any step.
+    - Any node proposes on it, and votes go to the voter's leader.
+    - A ghost of every vote cast (the acceptors' state) marks the indices a fast quorum chose.
+    - New checks: no two commands chosen at one index; a new leader holds every chosen command; log terms
+      never decrease; windows stay within budget and above the commit index.
+    - State Machine Safety and Leader Completeness compare commands and configurations, and terms too except
+      at a chosen index, which a leader commits under its term and a successor re-proposes under its own.
+    - Log Matching stays Raft's own.
+
+    At full scale (400 seeds each of three and five voters, 24 s): 1,227 and 1,691 fast choices, 743 and 831
+    fast commits, 740 and 1,474 recoveries of a fast choice, 10 and 27 commands committed under two terms,
+    7,704 and 12,431 slots pruned under a classic commit. Each path is floored per seed, or per exploration
+    where it is rarer.
+  - **Found and fixed, each with a failing test first:**
+    - A leader's own fast votes never left its window. Three voters need all three votes, so fast commits
+      stopped after the window filled (3 of 10).
+    - A leader handing off kept deciding from votes, which can keep its target from ever catching up
+      (thesis §3.10). It now decides nothing until the transfer ends, and decides the waiting votes if it
+      aborts.
+    - An opening of the fast track outlived its term. A node that won a term without opening it, then timed
+      out, still believed the previous term's opening and voted where no leader had opened (the explorer's
+      first run, seed 0). An opening now counts in the term it was announced in only.
+    - The fast track could open with `C_new` appended and not committed. A successor lacking it would take
+      the joint configuration as its own and treat a chosen index as free. It now opens only on a committed
+      configuration.
+    - **The design's sync rule lost a chosen value** — the explorer at full scale, seed 266 (three voters,
+      step 630), then the model in 18 steps at three nodes, three indices and four terms. The model's
+      earlier full scopes never combined three indices with four terms. A new leader cleared its window;
+      a later leader's truncation then erased the log entries that carried the value. The first correction
+      (older slots kept until the node's commit covers its synced leader's no-op; slots pruned under the
+      commit index) failed in the model too: a fast commit is in no majority's logs. The rule that holds:
+      a slot goes only under a classic commit, and the commit index is classic (§4).
+      [Bug record](../../bugs/2026-09-29-window-slots-dropped-before-a-classic-commit-lost-chosen-values.md).
+  - **Measured and rejected:** answering term differences at committed indices, by skipping the
+    consistency check at the commit index and refusing a snapshot at or below it. Both answered a symptom of
+    a commit index that counted fast commits; with a classic commit index no committed entry differs in term
+    between nodes, so both were reverted rather than kept as a second path.
+  - **The model, re-verified.** Each node knows its classic commit index, and the append keeps a follower's
+    committed prefix as the code does. The design holds with Raft's strict log matching:
+    - three nodes, three indices, one value, four terms: 152,906,020 classes;
+    - three nodes, three indices, two values, three terms: 188,172,261 classes.
+
+    Both were searched by hand: they hold 11.7 GB and 14.0 GB, past CI's 4 GiB ceiling. CI searches the
+    scopes that fit, and every rejected rule at the smallest scope where it fails (`docs/wip/BENCHMARKS.md`).
+    The serial search keeps fingerprints in its visited set now, not whole keys: 131 bytes of accounted
+    memory per state for a 64-byte key, where a key held twice cost about 400.
+  - **Next.** The leader pipelines: it sends the next batch before the last is acknowledged. Without that a
+    follower almost never has a hole to buffer across (4 buffered entries in 3,200,000 explored steps), and
+    §3.5's out-of-order acknowledgement pays nothing. Then the groups' wiring (window budget, vote routing to
+    the leader, the fast track's policy) and the timed measurements that decide it.
 

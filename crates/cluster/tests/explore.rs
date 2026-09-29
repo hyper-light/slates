@@ -36,9 +36,24 @@
 //! voters, and the leader's reconfiguration move — the groups' `reconcile_voters` rule — brings a non-voter
 //! in through staging (caught up in rounds before the joint change may begin) while there is room for one
 //! more voter, takes a random voter out (the leader included, which then steps down, §4.2.2) when there is
-//! not, and completes a joint change once its entry commits. The model-level exploration of the Fast Raft
-//! and ParallelRaft log shapes extends this driver. Test by use (R5): the real core, the council's drive,
-//! observable outcomes.
+//! not, and completes a joint change once its entry commits.
+//!
+//! The fast track and the window are explored (research record §3.5, §3.7 and §4; the design the prefix
+//! model verifies): every node holds a window as large as one append; a leader may open its term's fast
+//! track at any step; a client's command then reaches any node, which proposes it to every voter, and each
+//! voter's vote goes to its own leader. A ghost of every vote cast — the Paxos acceptors' state, counted from
+//! the moment a vote is cast, whatever becomes of its message — marks each index a fast quorum chose, and
+//! the checks take the dialect's form around it:
+//!
+//! - **Fast agreement**: no two commands are ever chosen at one index.
+//! - **State Machine Safety** and **Leader Completeness** compare commands and configurations, and terms too
+//!   except at a chosen index: a leader applies its fast commit under its own term, and a successor that
+//!   lacks it re-proposes it under the successor's. A new leader also holds every chosen command.
+//! - **Log Matching** stays Raft's own, terms and all: a follower's committed prefix is classic.
+//! - Every log's terms never decrease, and every window stays within its budget and above its node's commit
+//!   index.
+//!
+//! Test by use (R5): the real core, the council's drive, observable outcomes.
 
 // Test harness: an unwrap, expect or panic here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -46,19 +61,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_cluster::raft::{
-  CatchUp, ElectionPriority, InstallSnapshot, LogEntry, RaftNode, SavedRaft,
+  CatchUp, ElectionPriority, FastVote, InstallSnapshot, LogEntry, RaftNode, SavedRaft,
+  WindowCounters, fast_quorum,
 };
 use slates_cluster::raft_wire::RaftMessage;
 use slates_db::register::HostId;
 
 /// Shape: the seeds each cluster size is explored under at full scale — the `--ignored` run CI makes in
-/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 27.7 s there
-/// with compaction and membership changes explored (measured 2026-09-28, Apple M5 Max; 14 s before them),
-/// so the workspace's debug run explores [`SEEDS_QUICK`] instead.
+/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 24.0 s with
+/// the fast track and the window explored (measured 2026-09-29, Apple M5 Max, release; 27.7 s on 2026-09-28
+/// with compaction and membership changes, 14 s before them), so the workspace's debug run explores
+/// [`SEEDS_QUICK`] instead.
 const SEEDS_FULL: u64 = 400;
-/// Shape: the seeds the workspace's debug run explores — 20.5 s of a debug build (2026-09-28), and still
-/// enough histories for every non-vacuity floor below (each is at least one event per seed but the rare
-/// staging abort's).
+/// Shape: the seeds the workspace's debug run explores — 18.6 s of a debug build (2026-09-29), and still
+/// enough histories for every non-vacuity floor below (each is at least one event per seed but the three
+/// rare paths', floored once per exploration).
 const SEEDS_QUICK: u64 = 24;
 /// Shape: the steps one seeded history runs.
 const STEPS: usize = 4_000;
@@ -86,9 +103,14 @@ const MIN_VOTERS: usize = 3;
 /// each: term, length, an eight-byte command, the configuration flag) — so catching a follower up takes
 /// several batches and every batch boundary is explored.
 const APPEND_BUDGET: usize = 48;
-/// Shape: the actions one step chooses among — the hundred of the original mix and eight more: three for a
-/// compaction, one for corrupting a snapshot in flight, four for a reconfiguration period.
-const ACTIONS: usize = 108;
+/// Shape: the actions one step chooses among — the hundred of the original mix and nine more: three for a
+/// compaction, one for corrupting a snapshot in flight, four for a reconfiguration period, one for the leader
+/// opening its fast track.
+const ACTIONS: usize = 109;
+/// Shape: the window every node holds, in wire bytes — the append budget, as the groups set it (a window
+/// holds at most what one append carries, `RaftNode::set_window_budget`): two of the explorer's command
+/// entries, and a span of three indices above a node's log, so the bound is met often.
+const WINDOW_BUDGET: usize = APPEND_BUDGET;
 
 /// A splitmix64 generator: deterministic from its seed, so every failure replays from the seed printed.
 struct Rng(u64);
@@ -155,6 +177,22 @@ struct Counters {
   stagings_aborted: u64,
   /// Leadership transfers started by priority (§3.4).
   priority_transfers: u64,
+  /// Fast tracks a leader opened (research record §3.7).
+  fast_tracks_opened: u64,
+  /// Commands proposed on a fast track, each to every voter.
+  fast_proposals: u64,
+  /// Fast votes cast.
+  fast_votes_cast: u64,
+  /// Fast votes whose voter knew no leader to send them to.
+  fast_votes_unrouted: u64,
+  /// Indices a fast quorum chose (the ghost the checks read).
+  fast_choices: u64,
+  /// Indices committed under two terms — a fast choice committed by its leader and re-proposed by a successor
+  /// (§4's recovery), which the dialect's State Machine Safety allows at a chosen index only.
+  re_proposed_commits: u64,
+  /// What the nodes' windows did, summed over every node's life (a crash restarts a node's count, so each
+  /// node's is added before it crashes).
+  window: WindowCounters,
 }
 
 /// One explored cluster: the nodes, what each last retained, the network, the partition, and the history
@@ -181,6 +219,15 @@ struct Cluster {
   trace: Option<std::collections::VecDeque<String>>,
   /// Each node's election priority for the history (§3.4), set again after a crash-restart.
   priorities: BTreeMap<HostId, ElectionPriority>,
+  /// The voters of each term whose leader opened its fast track, as that leader counted them when it did.
+  fast_terms: BTreeMap<u64, usize>,
+  /// Every fast vote cast, by term and index: each voter's command (the ghost of the Paxos acceptors' state,
+  /// which the checks read — a vote counts from the moment it is cast, whether or not its message arrives).
+  votes_cast: BTreeMap<(u64, u64), BTreeMap<HostId, Vec<u8>>>,
+  /// The command a fast quorum chose at each index, over the whole history.
+  chosen: BTreeMap<u64, Vec<u8>>,
+  /// The indices committed under two terms (see [`Counters::re_proposed_commits`]).
+  re_proposed: BTreeSet<u64>,
 }
 
 impl Cluster {
@@ -188,7 +235,11 @@ impl Cluster {
   fn new(size: u64) -> Cluster {
     let voters: Vec<HostId> = (1..=size).map(HostId).collect();
     let nodes: Vec<RaftNode> = (1..=size + 1)
-      .map(|id| RaftNode::new(HostId(id), voters.clone()))
+      .map(|id| {
+        let mut node = RaftNode::new(HostId(id), voters.clone());
+        node.set_window_budget(WINDOW_BUDGET);
+        node
+      })
       .collect();
     let retained = nodes.iter().map(RaftNode::saved).collect();
     Cluster {
@@ -204,6 +255,10 @@ impl Cluster {
       counters: Counters::default(),
       trace: None,
       priorities: BTreeMap::new(),
+      fast_terms: BTreeMap::new(),
+      votes_cast: BTreeMap::new(),
+      chosen: BTreeMap::new(),
+      re_proposed: BTreeSet::new(),
     }
   }
 
@@ -424,12 +479,26 @@ impl Cluster {
         }
         outgoing.extend(votes.into_iter().map(RaftMessage::RequestVote));
       }
+      // The fast track (research record §3.7): a proposal is answered with the voter's vote, cast the moment
+      // it is returned; a vote the leader receives is tallied.
+      RaftMessage::FastPropose(proposal) => {
+        if let Some(vote) = self.nodes[at].on_fast_propose(proposal) {
+          self.cast(&vote);
+          outgoing.push(RaftMessage::FastVote(vote));
+        }
+      }
+      RaftMessage::FastVote(vote) => self.nodes[at].on_fast_vote(vote),
     }
     self.finish_election(at, was_leader);
     self.retain(at);
-    let from = flight.to;
-    // A request's reply goes back to its sender; the vote requests a granted pre-election yields go to
-    // every other voter, one each.
+    self.route(at, flight.from, outgoing);
+  }
+
+  /// Sends what node `at` answered a message from `sender` with: a request's reply goes back to its sender;
+  /// the vote requests a granted pre-election yields go to every other voter, one each; a fast vote goes to
+  /// the voter's leader, whoever proposed (research record §3.7).
+  fn route(&mut self, at: usize, sender: HostId, outgoing: Vec<RaftMessage>) {
+    let from = self.nodes[at].id();
     let voters: Vec<HostId> = self.nodes[at]
       .all_voters()
       .into_iter()
@@ -438,13 +507,45 @@ impl Cluster {
     let mut vote_targets = voters.into_iter();
     for message in outgoing {
       let to = match message {
-        RaftMessage::RequestVote(_) => match vote_targets.next() {
-          Some(to) => to,
-          None => continue,
-        },
-        _ => flight.from,
+        RaftMessage::RequestVote(_) => vote_targets.next(),
+        RaftMessage::FastVote(_) => {
+          let leader = self.nodes[at].leader();
+          if leader.is_none() {
+            self.counters.fast_votes_unrouted += 1;
+          }
+          leader
+        }
+        _ => Some(sender),
       };
-      self.send(from, to, message);
+      if let Some(to) = to {
+        self.send(from, to, message);
+      }
+    }
+  }
+
+  /// Records a fast vote cast (the ghost [`Cluster::votes_cast`]).
+  fn cast(&mut self, vote: &FastVote) {
+    self.counters.fast_votes_cast += 1;
+    self
+      .votes_cast
+      .entry((vote.term, vote.index))
+      .or_default()
+      .insert(vote.voter, vote.command.clone());
+  }
+
+  /// The leader, if any, opens its term's fast track (refusals — no sync point yet, a configuration not yet
+  /// committed, a transfer in flight, already open — are part of the exploration), and the explorer records
+  /// the voters its votes are counted against.
+  fn open_fast_track(&mut self) {
+    let Some(at) = self.nodes.iter().position(RaftNode::is_leader) else {
+      return;
+    };
+    if self.nodes[at].open_fast_track() {
+      let node = &self.nodes[at];
+      self.fast_terms.insert(node.term(), node.all_voters().len());
+      self.counters.fast_tracks_opened += 1;
+      let (id, term) = (node.id(), node.term());
+      self.note(|| format!("open fast track at {id:?} t{term}"));
     }
   }
 
@@ -559,12 +660,15 @@ impl Cluster {
   fn crash(&mut self, at: usize) {
     let id = self.nodes[at].id();
     self.note(|| format!("crash {id:?}"));
+    add_window(&mut self.counters.window, self.nodes[at].window_counters());
     self.nodes[at] =
       RaftNode::restore(self.retained[at].clone()).expect("a retained state restores");
-    // A priority is measured, not retained: the restarted node measures the same paths again.
+    // A priority is measured, not retained: the restarted node measures the same paths again. The window
+    // budget is the caller's setting, not retained either.
     if let Some(priority) = self.priorities.get(&id) {
       self.nodes[at].set_priority(*priority);
     }
+    self.nodes[at].set_window_budget(WINDOW_BUDGET);
     self.counters.crashes += 1;
   }
 
@@ -618,7 +722,7 @@ impl Cluster {
           self.heartbeat(at);
         }
       }
-      80..=87 => self.propose(),
+      80..=87 => self.propose(rng),
       88..=89 => self.check_quorum_everywhere(),
       92..=94 => {
         let at = rng.below(self.nodes.len());
@@ -632,6 +736,7 @@ impl Cluster {
       }
       103 => self.corrupt_snapshot(),
       104..=107 => self.reconfigure(rng),
+      108 => self.open_fast_track(),
       _ => {}
     }
   }
@@ -670,16 +775,32 @@ impl Cluster {
     self.counters.duplicated += 1;
   }
 
-  /// The leader, if any, proposes the next command (bounded by [`PROPOSALS_BOUND`]).
-  fn propose(&mut self) {
+  /// A client's next command (bounded by [`PROPOSALS_BOUND`]) reaches a node `rng` picks: one to which the
+  /// fast track is open proposes it to every voter, itself included; otherwise it goes to the leader, if any,
+  /// which proposes it on its fast track when that is open and appends it when not (refused while a transfer
+  /// is in flight).
+  fn propose(&mut self, rng: &mut Rng) {
     if self.proposals >= PROPOSALS_BOUND {
       return;
     }
-    let Some(at) = self.nodes.iter().position(RaftNode::is_leader) else {
+    let command = (self.proposals + 1).to_le_bytes().to_vec();
+    let reached = rng.below(self.nodes.len());
+    let leader = self.nodes.iter().position(RaftNode::is_leader);
+    for at in std::iter::once(reached).chain(leader) {
+      if let Some(proposal) = self.nodes[at].propose_fast(command.clone()) {
+        self.proposals += 1;
+        self.counters.fast_proposals += 1;
+        let from = self.nodes[at].id();
+        for to in self.nodes[at].all_voters() {
+          self.send(from, to, RaftMessage::FastPropose(proposal.clone()));
+        }
+        return;
+      }
+    }
+    let Some(at) = leader else {
       return;
     };
     self.proposals += 1;
-    let command = self.proposals.to_le_bytes().to_vec();
     self.nodes[at].append_command(command);
     self.retain(at);
   }
@@ -718,6 +839,7 @@ impl Cluster {
           node.id(),
           Whole {
             commit_index: saved.commit_index,
+            committed_through: node.committed_through(),
             log: full_log(&saved),
           },
         )
@@ -725,9 +847,37 @@ impl Cluster {
       .collect();
     let at = format!("seed {seed} step {step}");
     self.check_election_safety(&at);
+    self.check_fast_agreement(&at);
     self.check_state_machine_safety(&logs, &at);
     self.check_leader_completeness(&logs, &at);
     check_log_matching(&logs, &at);
+    self.check_terms_and_windows(&logs, &at);
+  }
+
+  /// Fast agreement (Paxos's P2 at the acceptors, from the ghost [`Cluster::votes_cast`]): a command becomes
+  /// chosen at its index once a fast quorum of its term's voters has voted it, and no other command is ever
+  /// chosen there, in any term.
+  fn check_fast_agreement(&mut self, at: &str) {
+    for ((term, index), votes) in &self.votes_cast {
+      let voters = *self.fast_terms.get(term).unwrap_or_else(|| {
+        panic!("{at}: a fast vote in term {term}, whose leader opened no fast track")
+      });
+      let mut counts: BTreeMap<&Vec<u8>, usize> = BTreeMap::new();
+      for command in votes.values() {
+        *counts.entry(command).or_default() += 1;
+      }
+      for (command, count) in counts {
+        if count < fast_quorum(voters) {
+          continue;
+        }
+        let first = self.chosen.entry(*index).or_insert_with(|| command.clone());
+        assert_eq!(
+          first, command,
+          "{at}: two commands chosen at index {index} (the second in term {term})"
+        );
+      }
+    }
+    self.counters.fast_choices = u64::try_from(self.chosen.len()).unwrap();
   }
 
   /// Election Safety, over the whole history: every term has at most one leader, ever.
@@ -746,48 +896,124 @@ impl Cluster {
   }
 
   /// State Machine Safety: every committed entry agrees with the first seen committed at its index — the
-  /// entries a snapshot holds included, since a snapshot is committed history.
+  /// entries a snapshot holds included, since a snapshot is committed history, and a leader's fast commits,
+  /// which it applies and acknowledges. In the dialect's form: the command and configuration always, the term
+  /// too except at an index a fast quorum chose, where a successor that re-proposed the choice commits it
+  /// under its own term (§4's recovery) and the fast-committing leader under its.
   fn check_state_machine_safety(&mut self, logs: &[(HostId, Whole)], at: &str) {
     for (id, whole) in logs {
-      for index in 1..=whole.commit_index {
+      for index in 1..=whole.committed_through {
         let entry = &whole.log[usize::try_from(index - 1).unwrap()];
         let first = self.committed.entry(index).or_insert_with(|| entry.clone());
-        assert_eq!(
-          first, entry,
-          "{at}: {id:?} committed a different entry at index {index}"
+        assert!(
+          same_command(first, entry),
+          "{at}: {id:?} committed a different command at index {index}: {entry:?} where {first:?} was"
         );
+        if first.term != entry.term {
+          assert!(
+            self.chosen.contains_key(&index),
+            "{at}: {id:?} committed index {index} under term {} where term {} committed it, and no fast \
+             quorum chose it",
+            entry.term,
+            first.term
+          );
+          self.re_proposed.insert(index);
+        }
       }
     }
     self.counters.commits = u64::try_from(self.committed.len()).unwrap();
+    self.counters.re_proposed_commits = u64::try_from(self.re_proposed.len()).unwrap();
   }
 
-  /// Leader Completeness: a node becoming leader holds every entry committed so far (checked once per
-  /// leadership — the property binds a node when it becomes leader, not a deposed one yet to hear of it).
+  /// Leader Completeness: a node becoming leader holds every entry committed so far — in the dialect's form,
+  /// as State Machine Safety compares them — and every command a fast quorum chose, at its index (the prefix
+  /// model's `LeaderIncomplete`); checked once per leadership, since the property binds a node when it becomes
+  /// leader, not a deposed one yet to hear of it.
   fn check_leader_completeness(&mut self, logs: &[(HostId, Whole)], at: &str) {
     for (id, whole) in logs {
       let node = &self.nodes[self.position(*id)];
       if !node.is_leader() || !self.completeness_checked.insert((*id, node.term())) {
         continue;
       }
-      for (index, entry) in &self.committed {
-        let held = usize::try_from(index - 1)
+      let held_at = |index: u64| {
+        usize::try_from(index - 1)
           .ok()
-          .and_then(|position| whole.log.get(position));
-        assert_eq!(
-          held,
-          Some(entry),
-          "{at}: leader {id:?} of term {} lacks committed index {index}",
+          .and_then(|position| whole.log.get(position))
+      };
+      for (index, entry) in &self.committed {
+        let held = held_at(*index);
+        assert!(
+          held.is_some_and(|held| same_command(held, entry)
+            && (held.term == entry.term || self.chosen.contains_key(index))),
+          "{at}: leader {id:?} of term {} lacks committed index {index}: holds {held:?}, committed {entry:?}",
+          node.term()
+        );
+      }
+      for (index, command) in &self.chosen {
+        let held = held_at(*index);
+        assert!(
+          held.is_some_and(|held| held.command == *command && held.config.is_none()),
+          "{at}: leader {id:?} of term {} lacks the command a fast quorum chose at index {index}: holds {held:?}",
           node.term()
         );
       }
     }
   }
+
+  /// Two structural invariants of every node: its log's terms never decrease (its recovery refuses a log
+  /// whose do), and its window holds slots only above its commit index and within its budget (no unbounded
+  /// growth).
+  fn check_terms_and_windows(&self, logs: &[(HostId, Whole)], at: &str) {
+    for (id, whole) in logs {
+      let terms: Vec<u64> = whole.log.iter().map(|entry| entry.term).collect();
+      assert!(
+        terms.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{at}: {id:?}'s log terms decrease: {terms:?}"
+      );
+      let window = self.nodes[self.position(*id)].window();
+      let held: usize = window
+        .iter()
+        .map(|report| report.slot.entry.encoded_len())
+        .sum();
+      assert!(
+        held <= WINDOW_BUDGET,
+        "{at}: {id:?}'s window holds {held} bytes, past its budget {WINDOW_BUDGET}"
+      );
+      assert!(
+        window
+          .iter()
+          .all(|report| report.index > whole.commit_index),
+        "{at}: {id:?} keeps a window slot at or below its commit index {}",
+        whole.commit_index
+      );
+    }
+  }
 }
 
-/// A node's whole log for the checks: its snapshot's history followed by the entries above it, and its commit
-/// index.
+/// Whether two entries carry the same command and configuration — the state machine's input, whatever the
+/// term they were appended under.
+fn same_command(left: &LogEntry, right: &LogEntry) -> bool {
+  left.command == right.command && left.config == right.config
+}
+
+/// Adds `more` to `total`, path by path.
+fn add_window(total: &mut WindowCounters, more: WindowCounters) {
+  total.recovered += more.recovered;
+  total.recovered_fast_choices += more.recovered_fast_choices;
+  total.holes_filled += more.holes_filled;
+  total.pruned += more.pruned;
+  total.buffered += more.buffered;
+  total.absorbed += more.absorbed;
+  total.decided_from_votes += more.decided_from_votes;
+  total.fast_commits += more.fast_commits;
+}
+
+/// A node's whole log for the checks: its snapshot's history followed by the entries above it; its commit
+/// index, which is classic; and the index through which it knows the log committed, a leader's fast commits
+/// included.
 struct Whole {
   commit_index: u64,
+  committed_through: u64,
   log: Vec<LogEntry>,
 }
 
@@ -903,7 +1129,8 @@ fn decode_history(bytes: &[u8]) -> Option<Vec<LogEntry>> {
 }
 
 /// Log Matching, pairwise: two logs holding an entry of the same term at an index agree on it and on every
-/// entry before it.
+/// entry before it — in Raft's own form, terms and all, since a follower's committed prefix is classic and so
+/// is every later leader's.
 fn check_log_matching(logs: &[(HostId, Whole)], at: &str) {
   for (left_id, left) in logs {
     for (right_id, right) in logs {
@@ -961,6 +1188,16 @@ fn explore(size: u64, seeds: u64) -> Counters {
     total.members_caught_up += c.members_caught_up;
     total.stagings_aborted += c.stagings_aborted;
     total.priority_transfers += c.priority_transfers;
+    total.fast_tracks_opened += c.fast_tracks_opened;
+    total.fast_proposals += c.fast_proposals;
+    total.fast_votes_cast += c.fast_votes_cast;
+    total.fast_votes_unrouted += c.fast_votes_unrouted;
+    total.fast_choices += c.fast_choices;
+    total.re_proposed_commits += c.re_proposed_commits;
+    add_window(&mut total.window, c.window);
+    for node in &cluster.nodes {
+      add_window(&mut total.window, node.window_counters());
+    }
   }
   total
 }
@@ -998,6 +1235,29 @@ fn explore_and_check_coverage(seeds: u64) {
         "added members were caught up before their change",
       ),
       (counted.priority_transfers, "leaders handed off by priority"),
+      (counted.fast_tracks_opened, "leaders opened the fast track"),
+      (
+        counted.fast_proposals,
+        "commands were proposed on the fast track",
+      ),
+      (counted.fast_votes_cast, "fast votes were cast"),
+      (counted.fast_choices, "fast quorums chose commands"),
+      (
+        counted.window.decided_from_votes,
+        "leaders decided indices from votes",
+      ),
+      (
+        counted.window.fast_commits,
+        "fast quorums committed in one round",
+      ),
+      (
+        counted.window.recovered_fast_choices,
+        "recoveries re-proposed a fast choice",
+      ),
+      (
+        counted.window.pruned,
+        "window slots were pruned under a classic commit",
+      ),
     ];
     for (count, path) in floors {
       assert!(
@@ -1005,12 +1265,22 @@ fn explore_and_check_coverage(seeds: u64) {
         "{size} voters: {path} ({count} over {seeds} seeds)"
       );
     }
-    // A staging aborts only when its member is cut off for a whole CheckQuorum window — 12 of 24 seeds at
-    // three voters, 4 of 24 at five (2026-09-28) — so this path is floored at once per exploration.
-    assert!(
-      counted.stagings_aborted > 0,
-      "{size} voters: a staging aborted"
-    );
+    // Three paths are rarer than one event per seed, so each is floored at once per exploration. A staging
+    // aborts only when its member is cut off for a whole CheckQuorum window. A recovery fills a hole only when
+    // a value it re-proposes sits above an index its reports leave free. And a command commits under two
+    // terms only when a leader fast-commits it and a successor that lacks it re-proposes it. Measured
+    // 2026-09-29 over 24 seeds, three / five voters: 5 / 8 aborts, 15 / 18 holes, 1 / 1 such commits.
+    let rare = [
+      (counted.stagings_aborted, "a staging aborted"),
+      (counted.window.holes_filled, "a recovery filled a hole"),
+      (
+        counted.re_proposed_commits,
+        "a fast commit was re-proposed by a successor",
+      ),
+    ];
+    for (count, path) in rare {
+      assert!(count > 0, "{size} voters: {path}");
+    }
   }
 }
 

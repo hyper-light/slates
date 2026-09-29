@@ -1,5 +1,5 @@
-//! The design the dialect will build, checked exhaustively at small scope before it is built
-//! (`docs/wip/research/consensus-enhancements.md` §3.5, §3.7 and §4; slice 9). The slot model
+//! The design the dialect builds, checked exhaustively at small scope
+//! (`docs/wip/research/consensus-enhancements.md` §3.5, §3.7 and §4; slices 9 and 10). The slot model
 //! (`tests/slot_model.rs`) proved the ballot recovery over instances with no order. The dialect keeps Raft's
 //! in-order log instead, and adds only what the fast track and parallel replication need above it — so two
 //! steps of this design lie outside that proof, and this model is where they are checked:
@@ -7,39 +7,58 @@
 //! - **The candidate's own log is kept.** A new leader recovers only the indices above its last log entry:
 //!   Raft's election rule (the candidate's last entry is at least as up to date as each voter's) and log
 //!   matching are what make the entries below it safe.
-//! - **A synced follower forgets older slots.** A follower accepts out-of-order entries and fast votes only
+//! - **A slot goes only under a classic commit.** A follower accepts out-of-order entries and fast votes only
 //!   from the leader it is synced to — once its log holds that leader's no-op, the entry the leader appends
-//!   after its recovery — and on syncing it drops the slots it held for older terms: an acceptor forgetting
-//!   accepted values, safe only if the synced log carries every value that could have been chosen.
+//!   after its recovery. A slot is an acceptor's record of an accepted value, and a node drops it only once it
+//!   knows an index at or above the slot's is committed classically — held by a majority's logs at their
+//!   leader's term — since Raft's election rule then puts that entry, and every value below it, in every later
+//!   leader's log. A fast commit does not: its value is in a fast quorum's windows, not a majority's logs, and
+//!   a successor that lacks it recovers it from them. So a follower learns only the classic commit index; the
+//!   leader alone counts its fast choices, to apply and acknowledge them. Two earlier rules fail (2026-09-29):
+//!   dropping a synced node's older slots at the sync itself ([`Variant::DropAtSync`]; the explorer met it at
+//!   full scale first) loses a chosen value in 18 steps — a later leader's truncation erased the log entries
+//!   that were then the only record; and pruning at a commit index that counts fast commits
+//!   ([`Variant::PruneAtFastCommit`]; this model met it while checking the first correction) breaks log
+//!   matching in 12 steps — a follower keeps a fast-committed entry under the fast leader's term while every
+//!   later leader holds it under its own — and with a fourth term loses a chosen value: a candidate whose last
+//!   entry a successor re-proposed under a newer term outranks the log that holds it, and the pruned slots are
+//!   gone.
 //!
 //! **The model.** Each node has a Raft log (the leader-approved entries, in order, each with the term of the
-//! leader that placed it), a window of slots above the log (a leader's entry that arrived out of order, or a
-//! fast vote, each with the term it was accepted in), the term it is synced to, and — while leading — which
-//! nodes hold each index, where the fast track opens and the index of its no-op. The actions are atomic:
+//! leader that placed it), the classic commit index it knows, a window of slots (a leader's entry that arrived
+//! out of order, or a fast vote, each with the term it was accepted in), the term it is synced to, and — while
+//! leading — which nodes hold each index, where the fast track opens and the index of its no-op. The actions
+//! are atomic:
 //!
 //! - a timeout;
 //! - a term learnt from a leader's message;
 //! - an election won by a chosen majority under Raft's rule, with the recovery below;
 //! - an in-order append of the leader's log through an index, with Raft's truncation of the first
-//!   conflicting entry;
+//!   conflicting entry above the follower's committed prefix, which it keeps as it holds it (as the code's
+//!   append skips entries at or below its commit index), and the leader's classic commit index learnt
+//!   through it;
 //! - an out-of-order append of one of the leader's entries into a synced follower's window;
 //! - a fast vote by a synced follower at an open index;
 //! - the leader's decision at its next index from a classic quorum of fast votes;
 //! - a classic proposal at its next index;
-//! - a commit, once a majority holds an index in its log or window.
+//! - a classic commit, once a majority's logs hold an index (under [`Variant::CommitFromWindows`], or its
+//!   windows).
 //!
-//! **The recovery.** The voters report every log entry and window slot above the candidate's last log
-//! entry, with its ballot: a log entry's is its term and "decided", a window slot's is its term and whether it
-//! is a fast vote. Per index, the highest ballot decides as in the slot model (a decision is re-proposed; a
-//! fast ballot re-proposes the value with at least `|Q| + |F| − n` of the reports, and is otherwise free).
-//! The leader appends the recovered values at its term, a no-op at each free index below the last
-//! recovered one, and then its own no-op, which is the sync point. It then either opens the fast track after
-//! that point or proposes classically; the dialect chooses by measurement, and the model searches both.
+//! **The recovery.** The voters report their window slots above the candidate's last log entry, each with its
+//! ballot: its term and whether it is a fast vote (under [`Variant::ReportLogsToo`], their log entries too, a
+//! log entry's ballot being its term and "decided"). Per index, the highest ballot decides as in the slot model
+//! (a decision is re-proposed; a fast ballot re-proposes the value with at least `|Q| + |F| − n` of the
+//! reports, and is otherwise free). The leader appends the recovered values at its term, a no-op at each free
+//! index below the last recovered one, and then its own no-op, which is the sync point; it keeps its window.
+//! It then either opens the fast track after that point or proposes classically; the dialect chooses by
+//! measurement, and the model searches both.
 //!
 //! **The checks,** after every step:
 //! - agreement: one value committed per index;
 //! - P2c: no leader of a term at or after a commit sends another value there;
-//! - log matching: two logs holding an entry of one term at one index agree up to it;
+//! - log matching: two logs holding an entry of one term at one index agree up to it (a follower's committed
+//!   prefix is classic, so its entries are every later leader's, term and all: the path that keeps a
+//!   committed entry under an older term than the leader's is never taken);
 //! - election safety: one leader per term;
 //! - leader completeness: a leader's log holds every committed value at its index, and extends to every
 //!   committed index.
@@ -94,6 +113,13 @@ enum Variant {
   /// A leader counts a window's copy of its entry toward a commit (out-of-order commitment): Raft's
   /// truncation can then erase a replica of a committed entry.
   CommitFromWindows,
+  /// A node drops its slots of older terms at the sync itself (and a new leader clears its window at its
+  /// recovery): a later leader's truncation can then erase the log entries that were the only remaining
+  /// record of a chosen value.
+  DropAtSync,
+  /// A node prunes its slots at a commit index that counts fast commits: a fast-committed value is in no
+  /// majority's logs, so a later leader may lack it and need the pruned slot.
+  PruneAtFastCommit,
 }
 
 impl Scope {
@@ -174,6 +200,9 @@ struct Node {
   window: [Option<Slot>; MAX_INDICES],
   /// The term of the leader whose no-op this node's log holds (zero before any).
   synced: u8,
+  /// The length of the prefix this node knows committed classically (under
+  /// [`Variant::PruneAtFastCommit`], committed at all).
+  commit: u8,
   leading: Option<Leading>,
 }
 
@@ -213,6 +242,7 @@ impl State {
       log: [Entry { term: 0, value: 0 }; MAX_INDICES],
       window: [None; MAX_INDICES],
       synced: 0,
+      commit: 0,
       leading: None,
     };
     State {
@@ -359,8 +389,10 @@ const FILLED_A_HOLE: u64 = 64;
 const SYNC_DROPPED_A_SLOT: u64 = 128;
 const TRUNCATED_A_LOG: u64 = 256;
 const SCATTERED: u64 = 512;
+const KEPT_A_COMMITTED_TERM: u64 = 1024;
+const PRUNED_AT_COMMIT: u64 = 2048;
 /// Format: each path's name, in bit order.
-const PATHS: [&str; 10] = [
+const PATHS: [&str; 12] = [
   "fast commits",
   "classic commits",
   "commits above an uncommitted index",
@@ -371,6 +403,8 @@ const PATHS: [&str; 10] = [
   "slots dropped at a sync",
   "logs truncated",
   "entries scattered",
+  "committed entries kept under an older term",
+  "slots pruned at a commit",
 ];
 
 type Next = Step<State, Fault>;
@@ -649,7 +683,9 @@ fn recover(scope: Scope, state: &State, node: usize, quorum: u8, fast: bool, nex
     0
   };
   leader.length = u8::try_from(length).unwrap();
-  leader.window = [None; MAX_INDICES];
+  if scope.variant == Variant::DropAtSync {
+    leader.window = [None; MAX_INDICES];
+  }
   leader.synced = term;
   leader.leading = Some(Leading {
     matched: [0; MAX_NODES],
@@ -662,6 +698,7 @@ fn recover(scope: Scope, state: &State, node: usize, quorum: u8, fast: bool, nex
     },
     committed: [false; MAX_INDICES],
   });
+  next.paths |= settle_window(scope, &mut next.state.nodes[node]);
   check_new_leader(scope, next, node);
   let entries: Vec<Entry> = next.state.nodes[node].entries().to_vec();
   for (index, entry) in entries.iter().enumerate().skip(kept) {
@@ -701,8 +738,10 @@ fn guard(next: &mut Next, index: usize, value: u8, term: u8) {
 }
 
 /// The leader's log through `through` reaches `node` in order: Raft's append, from where the two logs
-/// agree, truncating the follower's first conflicting entry and all after it; a follower whose log thereby
-/// reaches the leader's no-op is synced, and drops its window slots below its log's end and of older terms.
+/// agree, truncating the follower's first conflicting entry and all after it — above the follower's committed
+/// prefix, which it keeps as it holds it (the dialect's consistency check). The follower learns the leader's
+/// commit index as far as the append reaches, and a follower whose log thereby reaches the leader's no-op is
+/// synced; its window then settles ([`settle_window`]).
 fn append(scope: Scope, state: &State, leader: usize, node: usize, through: u8) -> Option<Next> {
   let source = state.nodes[leader];
   let leading = source.leading?;
@@ -710,12 +749,13 @@ fn append(scope: Scope, state: &State, leader: usize, node: usize, through: u8) 
   if node == leader || target.term > source.term || through > source.length {
     return None;
   }
-  let agreed = source
-    .entries()
-    .iter()
-    .zip(target.entries())
-    .take_while(|(ours, theirs)| ours == theirs)
-    .count();
+  let kept = usize::from(target.commit).min(usize::from(target.length));
+  let agreed = kept
+    + source.entries()[kept.min(source.entries().len())..]
+      .iter()
+      .zip(&target.entries()[kept..])
+      .take_while(|(ours, theirs)| ours == theirs)
+      .count();
   let mut next = Step::plain(*state);
   let follower = &mut next.state.nodes[node];
   if follower.term < source.term {
@@ -728,9 +768,14 @@ fn append(scope: Scope, state: &State, leader: usize, node: usize, through: u8) 
     if usize::from(target.length) > agreed {
       next.paths |= TRUNCATED_A_LOG;
     }
-    follower.log[..through].copy_from_slice(&source.log[..through]);
+    follower.log[kept..through].copy_from_slice(&source.log[kept..through]);
     follower.length = u8::try_from(through).unwrap();
   }
+  if (0..kept).any(|index| follower.log[index].term != source.log[index].term) {
+    next.paths |= KEPT_A_COMMITTED_TERM;
+  }
+  let learnt = source.commit.min(u8::try_from(through).unwrap());
+  follower.commit = follower.commit.max(learnt);
   next.paths |= sync_and_prune(scope, follower, &source, leading.sync_index);
   let matched = u8::try_from(through.min(usize::from(next.state.nodes[node].length))).unwrap();
   let acks = &mut next.state.nodes[leader].leading.as_mut()?.matched[node];
@@ -741,31 +786,63 @@ fn append(scope: Scope, state: &State, leader: usize, node: usize, through: u8) 
   Some(next)
 }
 
-/// After an append from `source`: the follower is synced once its log agrees with the leader's through the
-/// leader's no-op — not merely as long, since a stale log may be — and then drops its window slots of older
-/// terms (and, under [`Variant::DropCovered`], those its log covers). Returns the paths taken.
+/// After an append from `source`: the follower is synced once its log holds the leader's no-op — its log
+/// agreeing with the leader's through it, the committed prefix it keeps counting as agreeing, not merely as
+/// long, since a stale log may be. Its window then settles. Returns the paths taken.
 fn sync_and_prune(scope: Scope, follower: &mut Node, source: &Node, sync_index: u8) -> u64 {
-  let agreeing = source
-    .entries()
-    .iter()
-    .zip(follower.entries())
-    .take_while(|(ours, theirs)| ours == theirs)
-    .count();
+  let kept = usize::from(follower.commit).min(usize::from(follower.length));
+  let agreeing = kept
+    + source.entries()[kept.min(source.entries().len())..]
+      .iter()
+      .zip(&follower.entries()[kept..])
+      .take_while(|(ours, theirs)| ours == theirs)
+      .count();
   if sync_index > 0 && agreeing >= usize::from(sync_index) && follower.synced < source.term {
     follower.synced = source.term;
   }
-  let (length, synced) = (usize::from(follower.length), follower.synced);
+  settle_window(scope, follower)
+}
+
+/// A node's window after its commit index or sync moved: a slot at a classically committed index goes (every
+/// later leader's log holds that index). Under [`Variant::DropAtSync`] a synced node's slots of older terms go
+/// too, and under [`Variant::DropCovered`] a slot its log covers. Returns the paths taken.
+fn settle_window(scope: Scope, node: &mut Node) -> u64 {
+  let (length, commit, synced) = (
+    usize::from(node.length),
+    usize::from(node.commit),
+    node.synced,
+  );
   let mut paths = 0;
-  for (index, slot) in follower.window.iter_mut().enumerate() {
+  for (index, slot) in node.window.iter_mut().enumerate() {
+    let Some(held) = *slot else {
+      continue;
+    };
     let covered = scope.variant == Variant::DropCovered && index < length;
-    if slot.is_some_and(|held| covered || held.term < synced) {
-      if index >= length {
-        paths |= SYNC_DROPPED_A_SLOT;
-      }
+    let older = scope.variant == Variant::DropAtSync && held.term < synced;
+    if index < commit {
+      paths |= PRUNED_AT_COMMIT;
+      *slot = None;
+    } else if covered || older {
+      paths |= SYNC_DROPPED_A_SLOT;
       *slot = None;
     }
   }
   paths
+}
+
+/// A leader's known commit after it committed through `through` (a length) classically, or — under
+/// [`Variant::PruneAtFastCommit`] — its committed prefix extended over each index committed in its term, fast
+/// ones included.
+fn leader_commit(scope: Scope, node: &mut Node, through: usize) {
+  let mut commit = usize::from(node.commit).max(through);
+  if scope.variant == Variant::PruneAtFastCommit
+    && let Some(leading) = node.leading
+  {
+    while leading.committed.get(commit).copied().unwrap_or(false) {
+      commit += 1;
+    }
+  }
+  node.commit = u8::try_from(commit).unwrap();
 }
 
 /// The leader's entry at `index` — one of its own term — reaches a follower synced to it, above that
@@ -859,6 +936,8 @@ fn decide(scope: Scope, state: &State, leader: usize, value: u8, voters: u8) -> 
   decider.length += 1;
   if count(value) >= scope.fast_quorum() {
     decider.leading.as_mut()?.committed[index] = true;
+    leader_commit(scope, decider, 0);
+    next.paths |= settle_window(scope, decider);
     record_commit(&mut next, index, value, deciding.term, FAST_COMMIT);
   }
   Some(next)
@@ -918,6 +997,14 @@ fn commit(scope: Scope, state: &State, leader: usize, index: usize) -> Option<Ne
   for below in from..=index {
     leading.committed[below] = true;
   }
+  let committer = &mut next.state.nodes[leader];
+  let classic = if scope.variant == Variant::CommitFromWindows {
+    0
+  } else {
+    index + 1
+  };
+  leader_commit(scope, committer, classic);
+  next.paths |= settle_window(scope, committer);
   for (below, held) in source
     .entries()
     .iter()
@@ -987,6 +1074,7 @@ struct Signature {
   log_noops: [bool; MAX_INDICES],
   window: [Option<(u8, bool, bool)>; MAX_INDICES],
   synced: u8,
+  commit: u8,
   leading: Option<LeadingShape>,
   matched_by: [u8; MAX_NODES],
   held_by_leaders: [usize; MAX_INDICES],
@@ -1021,6 +1109,7 @@ fn signature(scope: Scope, state: &State, me: usize) -> Signature {
       .window
       .map(|slot| slot.map(|slot| (slot.term, slot.fast, slot.value == NOOP))),
     synced: node.synced,
+    commit: node.commit,
     leading: node.leading.map(|leading| {
       let mut matched = leading.matched;
       matched.sort_unstable();
@@ -1163,6 +1252,7 @@ fn pack_node(packer: &mut Packer<WORDS>, node: &Node) {
     }
   }
   packer.put(TERM_BITS, u64::from(node.synced));
+  packer.put(LENGTH_BITS, u64::from(node.commit));
   packer.put(1, u64::from(node.leading.is_some()));
   if let Some(leading) = node.leading {
     for matched in leading.matched {
@@ -1196,6 +1286,7 @@ fn take_node(packer: &mut Packer<WORDS>) -> Node {
     });
   }
   node.synced = packer.small(TERM_BITS);
+  node.commit = packer.small(LENGTH_BITS);
   if packer.take(1) == 1 {
     let mut leading = Leading {
       matched: [0; MAX_NODES],
@@ -1324,10 +1415,11 @@ impl Model for PrefixModel {
           })
           .collect();
         format!(
-          "{}:t{}s{} [{}] {{{}}}",
+          "{}:t{}s{}c{} [{}] {{{}}}",
           NAMES[node],
           held.term,
           held.synced,
+          held.commit,
           log.join(","),
           window.join(",")
         )
@@ -1337,17 +1429,17 @@ impl Model for PrefixModel {
   }
 }
 
-/// The paths every scope of the design takes (recovery from a log is the rejected variant's, and a hole
-/// needs three indices).
+/// The paths every scope of the design takes (recovery from a log is a rejected variant's, a slot dropped
+/// at a sync another's, and a hole needs three indices).
 const DESIGN_PATHS: [&str; 8] = [
   "fast commits",
   "classic commits",
   "commits above an uncommitted index",
   "recoveries from a window decision",
   "recoveries of a possible fast choice",
-  "slots dropped at a sync",
   "logs truncated",
   "entries scattered",
+  "slots pruned at a commit",
 ];
 
 fn scope(nodes: usize, indices: usize, values: u8, terms: u8, variant: Variant) -> Scope {
@@ -1394,36 +1486,49 @@ fn design_holds(scope: Scope) {
     scope.indices < 3 || holes > 0,
     "no hole was filled at {scope:?}"
   );
+  // A follower's committed prefix is classic, so it holds every later leader's entries, terms and all.
+  assert_eq!(
+    report.taken(&model, "committed entries kept under an older term"),
+    0,
+    "a committed entry was kept under an older term at {scope:?}"
+  );
 }
 
 /// §4, the design, at the scope the default suite affords: three nodes, three indices, one value, two terms
-/// (331,522 classes) — fast and classic commits, both recoveries, holes filled, slots dropped at a sync,
-/// logs truncated, entries scattered.
+/// — fast and classic commits, both recoveries, holes filled, slots pruned at a commit, logs truncated,
+/// entries scattered.
 #[test]
 fn the_design_keeps_agreement() {
   design_holds(scope(3, 3, 1, 2, Variant::Design));
 }
 
-/// §4, the design at full scope: three terms, two values with three nodes and three indices, four nodes,
-/// and four terms.
+/// §4, the design at full scope as CI's runners hold it (4 GiB): three terms with three nodes and three
+/// indices, two values with four nodes, and four terms with two indices. The scopes past that ceiling —
+/// three indices with two values (188,172,261 classes) and with four terms (152,906,020, where both of
+/// 2026-09-29's rejected rules show) — are searched by hand, the command and measurements in
+/// `docs/wip/BENCHMARKS.md`.
 #[test]
 #[ignore = "exhaustive; CI's full-scale step runs it in release"]
 fn the_design_keeps_agreement_at_full_scope() {
-  for (nodes, indices, values, terms) in [(3, 3, 1, 3), (3, 3, 2, 3), (4, 2, 2, 3), (3, 2, 2, 4)] {
+  for (nodes, indices, values, terms) in [(3, 3, 1, 3), (4, 2, 2, 3), (3, 2, 2, 4)] {
     design_holds(scope(nodes, indices, values, terms, Variant::Design));
   }
 }
 
-/// §4, every alternative the search rejected, run where it shows: counting a window's copy toward a commit
-/// loses a committed entry (the shortest history, 12 steps), as does dropping a window slot its log covers
-/// (17 steps); reporting log entries too is safe, but its recovery resurrects a deposed leader's uncommitted
-/// entries, which the design never does.
+/// §4, every alternative the search rejected, each at the smallest scope where it shows, by its shortest
+/// history: counting a window's copy toward a commit loses a committed entry, as does dropping a window slot
+/// its log covers or dropping a synced node's older slots at the sync, and pruning at a commit index that
+/// counts fast commits keeps a committed entry under a term the leader's log does not hold there. Reporting
+/// log entries too is safe, but its recovery resurrects a deposed leader's uncommitted entries, which the
+/// design never does.
 #[test]
 #[ignore = "exhaustive; CI's full-scale step runs it in release"]
 fn each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one() {
   for failing in [
     scope(3, 3, 1, 3, Variant::CommitFromWindows),
-    scope(3, 3, 2, 3, Variant::DropCovered),
+    scope(3, 3, 1, 3, Variant::DropCovered),
+    scope(3, 3, 1, 3, Variant::PruneAtFastCommit),
+    scope(3, 3, 1, 4, Variant::DropAtSync),
   ] {
     let model = PrefixModel::at(failing);
     let shortest = exhaustive::search(&model, State::initial(), &|_| true);
@@ -1434,14 +1539,14 @@ fn each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one()
     assert!(
       matches!(
         fault,
-        Fault::LeaderIncomplete { .. } | Fault::Disagreement { .. }
+        Fault::LeaderIncomplete { .. } | Fault::Disagreement { .. } | Fault::LogsDiverge { .. }
       ),
       "{fault:?}"
     );
   }
-  let (report, met) = run(scope(3, 3, 2, 3, Variant::ReportLogsToo));
+  let (report, met) = run(scope(3, 3, 1, 3, Variant::ReportLogsToo));
   assert!(met.is_none(), "{met:?}");
-  let model = PrefixModel::at(scope(3, 3, 2, 3, Variant::ReportLogsToo));
+  let model = PrefixModel::at(scope(3, 3, 1, 3, Variant::ReportLogsToo));
   assert!(report.taken(&model, "recoveries from a log above the candidate's") > 0);
 }
 
@@ -1467,6 +1572,8 @@ fn one_scope_from_the_environment() {
     Ok("report-logs-too") => Variant::ReportLogsToo,
     Ok("drop-covered") => Variant::DropCovered,
     Ok("commit-from-windows") => Variant::CommitFromWindows,
+    Ok("drop-at-sync") => Variant::DropAtSync,
+    Ok("prune-at-fast-commit") => Variant::PruneAtFastCommit,
     _ => Variant::Design,
   };
   let scope = Scope {

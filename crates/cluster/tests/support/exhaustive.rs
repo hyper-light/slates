@@ -3,8 +3,8 @@
 //! `tests/prefix_model.rs`). A model names its states, actions, faults and the packed representative of a
 //! state's class under renaming; this module visits every reachable class once and checks each step.
 //!
-//! Two searches. [`search`] is breadth first on one core with whole keys and parents: its first fault is
-//! reached by a shortest history, which it replays concretely. [`explore`] is breadth first level by level
+//! Two searches. [`search`] is breadth first on one core over fingerprints, with each class's key and parent
+//! in an id table: its first fault is reached by a shortest history, which it replays concretely. [`explore`] is breadth first level by level
 //! across every core over 128-bit fingerprints of the representatives: each worker expands a slice of the
 //! frontier against a read-only view of the visited shards, then each shard takes the new successors that
 //! hash to it — scoped threads, joined before the level ends, nothing shared mutably. Two states share a
@@ -25,13 +25,6 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 /// full-scale step alone after the build; this leaves it 3 GB.
 pub(crate) const MEMORY_CEILING_BYTES: usize = 4 << 30;
 
-/// Derived: the bytes one state costs the serial search at the peak, measured on the slot model — 186.8 MB
-/// of resident memory for 968,767 states (193 bytes each) and 404.6 MB for 2,855,567 (142 each), release,
-/// 2026-09-28: its packed key in the visited set and again in the id table, its parent's id and its place in
-/// the queue, with the set and the table briefly holding both their old and new storage as they grow.
-/// Rounded up. A model whose key is larger than the slot model's 32 bytes scales it by its key's size.
-const BYTES_PER_STATE_OF_A_32_BYTE_KEY: usize = 200;
-
 /// Derived: the bytes a visited class costs the parallel search at its peak: a 16-byte fingerprint and a
 /// control byte per bucket, the set at 7/8 load, and — while a shard grows — its old table beside the new one
 /// of twice the buckets: `17 × 8/7 × 3`. Rounded up.
@@ -40,8 +33,17 @@ const VISITED_BYTES: usize = (16 + 1) * 8 * 3 / 7 + 1;
 /// Derived: resident memory over the bytes the parallel search accounts for — measured 2,689 MB resident
 /// against 1,556 MB accounted at the widest level of the slot model's five nodes and four terms
 /// (2026-09-28): the buckets' and frontiers' doubling capacities and the allocator's retained pages, which no
-/// field count sees. Rounded up.
+/// field count sees. Rounded up. The serial search holds it too (its id table doubles as it grows).
 const RESIDENT_PER_ACCOUNTED: usize = 2;
+
+/// Derived: the bytes one state costs the serial search, accounted: its fingerprint in the visited set
+/// ([`VISITED_BYTES`]), its packed key in the id table, and its parent's id and its place in the queue (four
+/// bytes each). Until 2026-09-29 the visited set held whole keys, so each key was held twice and a state cost
+/// about 400 bytes at the peak for a 64-byte key (measured on the slot model at 32 bytes: 193 and 142, scaled);
+/// the prefix model's shortest history under a rejected rule then outgrew the 4 GiB ceiling.
+fn serial_bytes_per_state<K>() -> usize {
+  VISITED_BYTES + size_of::<K>() + 2 * size_of::<u32>()
+}
 
 /// A model the searches can run: its states, steps, faults, and a packed representative per class.
 pub(crate) trait Model: Sync {
@@ -350,11 +352,10 @@ pub(crate) fn search<M: Model>(
   start: M::State,
   stops: &dyn Fn(&M::Fault) -> bool,
 ) -> Report<M> {
-  let per_state = BYTES_PER_STATE_OF_A_32_BYTE_KEY * size_of::<M::Key>().max(32) / 32;
-  let budget = MEMORY_CEILING_BYTES / per_state;
+  let budget = MEMORY_CEILING_BYTES / RESIDENT_PER_ACCOUNTED / serial_bytes_per_state::<M::Key>();
   let initial = model.canonical(&start);
-  let mut visited: Set<M::Key> = Set::default();
-  visited.insert(initial);
+  let mut visited: Set<u128> = Set::default();
+  visited.insert(fingerprint(&initial));
   let mut keys = vec![initial];
   let mut parents = vec![0_u32];
   let mut queue = VecDeque::from([0_u32]);
@@ -381,7 +382,7 @@ pub(crate) fn search<M: Model>(
         }
       }
       let key = model.canonical(&next.state);
-      if visited.insert(key) {
+      if visited.insert(fingerprint(&key)) {
         assert!(
           keys.len() < budget,
           "the serial search exceeds its budget of {budget} states"

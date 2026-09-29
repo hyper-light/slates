@@ -2706,11 +2706,21 @@ reconnaissance because the touched partitions are named up front).
 >
 > The dialect's design around it is verified too (slice 9). Raft's log is unchanged. A window above it
 > holds out-of-order entries and fast votes, accepted only once a follower's log holds its leader's
-> post-recovery no-op. Recovery reads windows only, so a classic leader never resurrects stale entries. A
-> slot is kept until a sync to a newer term. Commitment stays in order: counting windows loses a committed
-> entry in 12 steps.
+> post-recovery no-op. Recovery reads windows only, so a classic leader never resurrects stale entries.
+> Commitment stays in order: counting windows loses a committed entry in 12 steps.
 >
-> Status: both models verified; the dialect does not have windows, the fast track or this recovery yet.
+> **Corrected 2026-09-29 (slice 10).** A slot is kept until a *classic* commit covers its index, not until a
+> sync: the sync rule lost a chosen value (the explorer at full scale, then the model in 18 steps), and so
+> does pruning under a commit index that counts fast commits (12 steps). The commit index is classic; a
+> leader counts its fast choices past it to apply, acknowledge and read, and that frontier ends with its
+> leadership. The fast track opens only on a committed configuration, and an opening counts in its own term
+> only. The corrected design holds with Raft's strict log matching up to 188,172,261 classes
+> (`docs/bugs/2026-09-29-window-slots-dropped-before-a-classic-commit-lost-chosen-values.md`).
+>
+> Status (2026-09-29): built in `RaftNode` — the window, the recovery, the fast track, buffering — and
+> explored on the real core at full scale with no violation. Owed: the leader's pipelined replication
+> (without it a follower almost never has a hole to buffer across), the groups' wiring (their window budget
+> is zero, so nothing opens a fast track yet), and the timed measurements that set the defaults.
 
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,

@@ -845,6 +845,19 @@ fn answer(node: &mut Node, message: RaftMessage) -> (Option<RaftMessage>, Vec<Ra
       node.raft.on_append_reply(answer);
       (None, Vec::new())
     }
+    // The fast track (research record §3.7): a proposal is answered with the voter's vote; a vote the leader
+    // receives is tallied.
+    RaftMessage::FastPropose(proposal) => (
+      node
+        .raft
+        .on_fast_propose(proposal)
+        .map(RaftMessage::FastVote),
+      Vec::new(),
+    ),
+    RaftMessage::FastVote(vote) => {
+      node.raft.on_fast_vote(vote);
+      (None, Vec::new())
+    }
     RaftMessage::InstallSnapshotReply(answer) => {
       node.raft.on_install_snapshot_reply(answer);
       (None, Vec::new())
