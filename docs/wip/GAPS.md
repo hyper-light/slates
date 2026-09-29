@@ -1866,6 +1866,21 @@ that round, with the deterministic test (kept out of the suite until then) as it
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
 stalled takeover shows in any node's status.
 
+### 2026-09-29: holders promised a takeover without the lease gate — fixed
+
+Found while reading the takeover path for the open stall above. The owner lease (AUD-08) needs `others − f`
+confirmations so that every `f + 1` promotion quorum holds a confirming holder, which protects a read only if
+every promising holder refuses while its own answers may still feed the lease. Only the successor applied that
+gate, to itself. At `f = 1` an owner cut off from the council and the successor, but not from the third
+candidate, kept its lease on that candidate's answers while that candidate promised the successor.
+- Every holder now keeps the departed owner of each object an install reassigns.
+- Every holder refuses to promise while the gate is closed, counted `fleet.promotion.deferred`.
+- A holder drops the record when it accepts the object's record from its new owner.
+
+A genuinely dead owner delays nothing: the council's death-confirmation window already exceeds the horizon.
+Failing test first: `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease`.
+[Bug record](../bugs/2026-09-29-holders-promised-without-the-lease-gate.md).
+
 ### 2026-09-29: the no-panic sweep — ratcheted per crate, 13 of 29 crates clean; the SDKs' id parser panicked — fixed
 
 CLAUDE.md (banned item 6) forbids panics in shipped code: out-of-bounds indexing or slicing, string slicing

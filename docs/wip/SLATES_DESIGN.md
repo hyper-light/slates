@@ -2830,7 +2830,11 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > once no successor could gather the `f + 1` promises a takeover needs. Demanding `f` everywhere had refused
 > a lone owner (one node in its region at `f = 1`) its own objects once its startup allowance ran out
 > (`docs/bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md`; regression
-> `a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance`).
+> `a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance`). Every promising holder
+> now applies the holder-side gate, not only the successor: each holder keeps the departed owner of every
+> object an install reassigns, and refuses a prepare while its own answers may still feed that owner's lease
+> (`docs/bugs/2026-09-29-holders-promised-without-the-lease-gate.md`; regression
+> `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease`).
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the

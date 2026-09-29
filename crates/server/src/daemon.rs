@@ -3295,6 +3295,68 @@ mod tests {
     assert!(Ack::decode(&committed).is_ok());
   }
 
+  /// §4.8 "Leases and reads"; AUD-08: a holder answers a successor's prepare for a departed owner's object only
+  /// once that owner's lease — which this holder's own answers to its probes may still be feeding — can have
+  /// lapsed. The owner's lease needs `others − f` fresh confirmations so that every `f + 1` promotion quorum
+  /// contains a confirming holder; that is safe only if every promising holder applies the gate, not only the
+  /// successor. While this holder has answered the departed owner within the membership horizon it promises
+  /// nothing; once it has not, it promises.
+  #[test]
+  fn a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease() {
+    use slates_db::register::{Acceptor, Authority, HostEpoch, HostId, ObjectId, Prepare, Promise};
+    let (fed, lapsed) = audit_on_shard(|state| {
+      let successor = state.fleet.host();
+      let departed = HostId(successor.0 ^ 1);
+      let object = ObjectId([23; 16]);
+      let generation = state.fleet.configuration().version;
+      let mut acceptor = Acceptor::new(
+        successor,
+        Authority {
+          generation,
+          owner: departed,
+        },
+      );
+      acceptor
+        .install_authority(Authority {
+          generation,
+          owner: successor,
+        })
+        .unwrap();
+      state.holder_records.insert(object, acceptor);
+      state.departed_owners.insert(
+        object,
+        crate::lease::DepartedOwner {
+          owner: departed,
+          since_version: generation,
+        },
+      );
+      let now = slates_machine::clock::monotonic_ns();
+      state.answers_given.answered_alive(departed, now);
+      let prepare = Prepare {
+        owner: successor,
+        object,
+        epoch: HostEpoch(2),
+        generation,
+      };
+      let fed = crate::fleet::serve_held_promotion(state, successor, &prepare);
+      // This holder's last answer to the departed owner is now older than the horizon.
+      state
+        .answers_given
+        .alive_answers
+        .insert(departed, now - crate::lease::horizon_ns() - 1);
+      let lapsed = crate::fleet::serve_held_promotion(state, successor, &prepare);
+      (fed, lapsed)
+    });
+    assert!(
+      Promise::decode(&fed).is_err(),
+      "a holder that answered the departed owner within the horizon promises nothing"
+    );
+    assert!(
+      Promise::decode(&lapsed).is_ok(),
+      "once its answers can no longer feed the owner's lease, the holder promises"
+    );
+  }
+
   /// AC-6.3, §4.16; AUD-12: a stale epoch, foreign generation or conflicting accepted position
   /// must refuse before holder recomputation. A later legitimate origin must still seed and serve.
   #[test]

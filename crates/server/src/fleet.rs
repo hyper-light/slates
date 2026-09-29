@@ -2697,6 +2697,16 @@ async fn serve_peer_records(
 /// highest record this node holds for the object — and replies with the binding [`Promise`], or an empty
 /// reply if this node holds nothing for the object or the acceptor refuses (a foreign generation, an
 /// unauthorized owner, or an epoch below the fence), so the new owner counts nothing.
+///
+/// **The departed owner's lease first** (§4.8 "Leases and reads", AUD-08). The owner's lease needs
+/// `others − f` fresh confirmations so that every `f + 1` promotion quorum contains a holder that confirmed it
+/// ([`crate::lease::confirmations_needed`]); that intersection protects a read only if **every** promising holder
+/// refuses while its own answers may still feed the lease, not only the successor. So a holder that answered
+/// the departed owner's probe within the membership horizon, and has not heard that owner acknowledge its
+/// retirement, promises nothing yet ([`crate::lease::AnswersGiven::promotion_open`]), counted
+/// [`PROMOTION_DEFERRED`]; the successor retries next period. Before 2026-09-29 only the successor applied the
+/// gate, so an owner cut off from all but one holder kept its lease on that holder's answers while that holder
+/// promised the successor.
 pub(crate) fn serve_held_promotion(
   state: &mut ShardState,
   peer_host: HostId,
@@ -2704,6 +2714,16 @@ pub(crate) fn serve_held_promotion(
 ) -> Vec<u8> {
   if prepare.owner != peer_host {
     return encode_refusal(&RegisterError::Unauthorized);
+  }
+  if let Some(departed) = state.departed_owners.get(&prepare.object)
+    && !state.answers_given.promotion_open(
+      departed.owner,
+      departed.since_version,
+      slates_machine::clock::monotonic_ns(),
+    )
+  {
+    *state.refusals.entry(PROMOTION_DEFERRED).or_insert(0) += 1;
+    return Vec::new();
   }
   match state.holder_records.get_mut(&prepare.object) {
     Some(acceptor) => match acceptor.prepare(prepare) {
@@ -2713,6 +2733,13 @@ pub(crate) fn serve_held_promotion(
     None => Vec::new(),
   }
 }
+
+/// The status refusal count under which a holder records a successor's prepare it deferred because its own
+/// answers to the departed owner's probes may still feed that owner's lease ([`serve_held_promotion`]; §4.8
+/// "Leases and reads", AUD-08). It rises for at most the membership horizon after the holder last answered the
+/// departed owner; the successor retries each period.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const PROMOTION_DEFERRED: &str = "fleet.promotion.deferred";
 
 /// Brings every held acceptor's authority into step with the routing view (§4.8 "distributing the
 /// taken-over authority to the holders"): for each object this node holds a copy of, installs the object's
@@ -2784,6 +2811,10 @@ pub(crate) fn accept_held_record(
   };
   match accepted {
     Ok(ack) => {
+      // A record accepted under the current configuration comes from a member, so never from the object's
+      // departed owner: the object has an authorized live owner again, and the promotion gate this holder
+      // kept for it has served its purpose.
+      state.departed_owners.remove(&record.object);
       match state
         .fleet
         .track_object(record.object, peer_host, state.council.configuration())
@@ -5791,9 +5822,18 @@ fn sync_config_from_council(local: HostId) {
       .installed(configuration.version, slates_machine::clock::monotonic_ns());
     for reassignment in s.fleet.install_configuration(configuration, &members) {
       s.pending_takeovers.insert(reassignment.object);
-      if let Some(&owner) = pre_owners.get(&reassignment.object) {
+    }
+    // Every held object whose owner this install retired keeps its departed owner, at **every** holder and not
+    // only at the successor: each holder gates its own promise on that owner's lease
+    // ([`serve_held_promotion`]), and the successor gates its takeover on the same record ([`takeovers`]).
+    for (object, owner) in pre_owners {
+      let reassigned = s
+        .fleet
+        .object_owner(object)
+        .is_some_and(|successor| successor != owner);
+      if reassigned && !members.contains(&owner) {
         s.departed_owners.insert(
-          reassignment.object,
+          object,
           crate::lease::DepartedOwner {
             owner,
             since_version,

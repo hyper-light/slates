@@ -501,10 +501,13 @@ pub struct ShardState {
   /// by the members.
   pub answers_given: crate::lease::AnswersGiven,
   /// The held objects whose owner a committed configuration retired and whose successor has not yet
-  /// promoted them here: the departed owner and the version that retired it, so the promotion gate knows
-  /// whom this node answered and what that owner must have seen. Set at the configuration install
-  /// (`fleet::sync_config_from_council`), removed when the promotion is answered or the object forgotten.
-  /// Bounded by the held objects; only the control shard touches it.
+  /// re-committed them here: the departed owner and the version that retired it, so the promotion gate knows
+  /// whom this node answered and what that owner must have seen. Kept at **every** holder of such an object,
+  /// not only its successor, because every promising holder applies the gate (`fleet::serve_held_promotion`;
+  /// the successor also gates its own drive, `fleet::takeovers`). Set at the configuration install
+  /// (`fleet::sync_config_from_council`), removed when this holder accepts a record of the object from its
+  /// new owner (`fleet::accept_held_record`) or the successor places it (`fleet::drive_takeover`). Bounded by
+  /// the held objects; only the control shard touches it.
   pub departed_owners: BTreeMap<ObjectId, crate::lease::DepartedOwner>,
   /// The configuration council's election timing as derived this period from the paths to its other
   /// voters (the floor with none measured): the base and span in coordinator periods, the tail and spread
