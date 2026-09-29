@@ -361,7 +361,7 @@ const MIN_ENTRY_BYTES: usize = size_of::<u64>() + ENTRY_COUNT_BYTES + ENTRY_FLAG
 /// quorum (Lamport, *Fast Paxos*, 2006; Fast Raft's ⌈3n/4⌉, which it equals — `tests/slot_model.rs` asserts
 /// it for every scope it runs).
 pub fn fast_quorum(voters: usize) -> usize {
-  let classic = voters / 2 + 1;
+  let classic = (voters / 2).saturating_add(1);
   (1..=voters)
     .find(|fast| {
       fast
@@ -401,7 +401,8 @@ impl ElectionPriority {
 /// Why a node refused a pre-vote: thesis §9.6's conditions, in the order [`RaftNode::on_pre_vote`] checks them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreVoteRefusal {
-  /// It is not a voter, or it leads.
+  /// It leads. (Whether it is a voter in its own configuration is not asked: thesis §4.1, a server answers
+  /// without consulting its configuration, and the candidate's configuration decides whether it counts.)
   Role,
   /// It holds a leader's lease: it has heard from one within the minimum election timeout.
   Leased,
@@ -1082,7 +1083,7 @@ impl RaftNode {
 
   /// Why this node would refuse `request`, or `None` to grant it (thesis §9.6; [`on_pre_vote`](Self::on_pre_vote)).
   fn pre_vote_refusal(&self, request: &PreVote) -> Option<PreVoteRefusal> {
-    if !self.is_voter(self.id) || self.role == Role::Leader {
+    if self.role == Role::Leader {
       Some(PreVoteRefusal::Role)
     } else if self.has_leader {
       Some(PreVoteRefusal::Leased)
@@ -1162,8 +1163,11 @@ impl RaftNode {
     }
     let not_yet_voted_elsewhere =
       self.voted_for.is_none() || self.voted_for == Some(request.candidate);
-    let granted = self.is_voter(self.id)
-      && request.term == self.current_term
+    // Whether this node is a voter in its own configuration is not asked (thesis §4.1: a server answers
+    // without consulting its configuration): a member promoted by an entry it has not yet received is a voter
+    // in the candidate's configuration, which decides whether its vote counts
+    // (`docs/bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md`).
+    let granted = request.term == self.current_term
       && not_yet_voted_elsewhere
       && self.candidate_log_is_current(request.last_log_index, request.last_log_term);
     if granted {
@@ -1203,11 +1207,30 @@ impl RaftNode {
       self.step_down(reply.term);
       return;
     }
-    if self.role == Role::Candidate && reply.term == self.current_term && reply.granted {
+    // Only a voter of this candidate's configuration is recorded: no other vote can count toward its
+    // majority, and the recovery a win runs counts the granters it heard and reads their reports, so a grant
+    // from outside — a member that has not learned its demotion, or any server this configuration does not
+    // name — must not reach either (thesis §4.1: the candidate's configuration decides).
+    if self.role == Role::Candidate
+      && reply.term == self.current_term
+      && reply.granted
+      && self.votes_in_configuration(reply.voter)
+    {
       self.votes.insert(reply.voter);
       self.reports.insert(reply.voter, reply.reports);
       self.become_leader_if_majority();
     }
+  }
+
+  /// Whether `voter` votes in this node's effective configuration: a voter of it, or of the new set of a
+  /// joint one.
+  fn votes_in_configuration(&self, voter: HostId) -> bool {
+    let config = self.effective_config();
+    config.voters.contains(&voter)
+      || config
+        .joint
+        .as_ref()
+        .is_some_and(|new| new.contains(&voter))
   }
 
   /// Steps this node down to a follower at `term` on observing it from any message (Raft §5.1 "a node
@@ -1523,7 +1546,7 @@ impl RaftNode {
     if index <= self.snapshot_index {
       return None;
     }
-    usize::try_from(index - self.snapshot_index - 1).ok()
+    usize::try_from(index.checked_sub(self.snapshot_index)?.checked_sub(1)?).ok()
   }
 
   /// The index of the last log entry (the snapshot index for an empty log; zero when neither exists).
@@ -1577,7 +1600,7 @@ impl RaftNode {
   pub fn committed_entries(&self) -> &[LogEntry] {
     let committed_above_snapshot = self.committed_through().saturating_sub(self.snapshot_index);
     let count = usize::try_from(committed_above_snapshot).unwrap_or(usize::MAX);
-    &self.log[..count.min(self.log.len())]
+    self.log.get(..count).unwrap_or(&self.log)
   }
 
   /// The index up to which the log has been compacted into a snapshot (zero when nothing is compacted).
@@ -1631,12 +1654,15 @@ impl RaftNode {
     let Some(term) = self.entry_term(up_to) else {
       return false;
     };
-    let discard = usize::try_from(up_to - self.snapshot_index).unwrap_or(usize::MAX);
+    let discard = usize::try_from(up_to.saturating_sub(self.snapshot_index)).unwrap_or(usize::MAX);
     let discard = discard.min(self.log.len());
     // A configuration entry in the discarded prefix would take its voter set with it — fold the most
     // recent one into the base configuration so the effective configuration is preserved. (A later
     // configuration entry that survives the compaction still dominates it, being derived from the log.)
-    if let Some(config) = self.log[..discard]
+    if let Some(config) = self
+      .log
+      .get(..discard)
+      .unwrap_or_default()
       .iter()
       .rev()
       .find_map(|entry| entry.config.clone())
@@ -1695,9 +1721,13 @@ impl RaftNode {
       let keeps_suffix =
         self.entry_term(request.last_included_index) == Some(request.last_included_term);
       if keeps_suffix {
-        let discard = usize::try_from(request.last_included_index - self.snapshot_index)
-          .unwrap_or(usize::MAX)
-          .min(self.log.len());
+        let discard = usize::try_from(
+          request
+            .last_included_index
+            .saturating_sub(self.snapshot_index),
+        )
+        .unwrap_or(usize::MAX)
+        .min(self.log.len());
         self.log.drain(0..discard);
         self.config_entries = self
           .config_entries
@@ -2285,8 +2315,8 @@ impl RaftNode {
     // end of our log. (etcd's `handleAppendEntries` answers such an append with its commit index and drops
     // it; taking the new entries saves the round trip a joining member would otherwise spend.)
     if request.prev_log_index < self.commit_index {
-      let covered =
-        usize::try_from(self.commit_index - request.prev_log_index).unwrap_or(usize::MAX);
+      let covered = usize::try_from(self.commit_index.saturating_sub(request.prev_log_index))
+        .unwrap_or(usize::MAX);
       if covered >= request.entries.len() {
         return self.append_reply(true, self.commit_index, request.read_context);
       }
@@ -3289,31 +3319,33 @@ mod tests {
     assert_eq!(restored.all_voters(), vec![A, B]);
   }
 
-  /// AC-8.1, §4.8 restart-as-join; AUD-07: a fresh replacement is outside the existing voter
-  /// configuration. It may receive replication, but neither a vote request nor direct campaign
-  /// entrypoint may let it supply a vote before a membership entry admits it.
+  /// AC-8.1, §4.8 restart-as-join; AUD-07: a member outside its own configuration never campaigns, and no
+  /// vote it grants counts where a membership entry has not admitted it. It answers a request as any server
+  /// does (thesis §4.1: without consulting its configuration, since an entry admitting it may simply not have
+  /// reached it yet), but a candidate records only votes from its own configuration's voters, so a grant from
+  /// outside neither counts toward a majority nor enters the recovery a win runs. (A fresh replacement answers
+  /// nothing at all until it is initialized — the wrapper's rule, `RegionalCouncil::answer`.)
   #[test]
-  fn a_learner_neither_grants_votes_nor_campaigns_before_admission() {
+  fn a_member_outside_its_configuration_never_campaigns_and_its_vote_counts_nowhere_else() {
     let mut learner = RaftNode::new(D, vec![A, B, C]);
-    let request = RequestVote {
-      term: 7,
-      candidate: A,
-      last_log_index: 0,
-      last_log_term: 0,
-    };
-    assert!(!learner.on_request_vote(request).granted);
-    assert!(
-      !learner
-        .on_pre_vote(PreVote {
-          term: 8,
-          candidate: A,
-          last_log_index: 0,
-          last_log_term: 0,
-        })
-        .granted
-    );
     assert!(learner.start_election().is_empty());
+    assert!(learner.on_election_timeout().is_empty());
     assert_eq!(learner.role(), Role::Follower);
+
+    // A candidate of {A, B, C} is granted D's vote, and it does not count: A still needs B or C.
+    let mut candidate = RaftNode::new(A, vec![A, B, C]);
+    let request = candidate
+      .start_election()
+      .into_iter()
+      .next()
+      .expect("A campaigns");
+    let reply = learner.on_request_vote(request);
+    assert!(reply.granted, "D answers as any server does (thesis §4.1)");
+    candidate.on_vote_reply(reply);
+    assert!(
+      !candidate.is_leader(),
+      "a vote from outside the candidate's configuration does not count toward its majority"
+    );
   }
 
   /// A single-voter group elects itself: its vote reaches a majority of one, so it becomes
@@ -4125,6 +4157,58 @@ mod tests {
       leader.read_index(read),
       Some(2),
       "a term-4 commit enables the read at index 2"
+    );
+  }
+
+  /// Replicates from `leader` to `follower` (id `who`) for a bounded number of rounds, applying each reply,
+  /// so the follower holds the leader's log and learns its commit index.
+  fn replicate_rounds(leader: &mut RaftNode, follower: &mut RaftNode, who: HostId) {
+    for _ in 0..4 {
+      let Some(append) = leader.replicate_to(who, UNBOUNDED) else {
+        return;
+      };
+      leader.on_append_reply(follower.on_append_entries(append));
+    }
+  }
+
+  /// Thesis §4.1 ("servers process incoming RPC requests without consulting their current configurations";
+  /// `docs/bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md`): a member whose
+  /// promotion to voter the leader committed without it — the leader lost before the entries reached it —
+  /// still grants a candidate's pre-vote and vote; the candidate's configuration, which names it a voter,
+  /// decides whether the vote counts. Before the fix it refused both, because its own stale configuration
+  /// did not list it, so the survivor holding the new configuration could never reach a majority (the
+  /// three-process CLI fleet test: 26 pre-elections, every one refused by role).
+  #[test]
+  fn a_member_that_missed_its_promotion_still_votes_for_a_candidate_that_has_it() {
+    let mut b = elected_leader(B, vec![A, B]);
+    let mut a = RaftNode::new(A, vec![A, B]);
+    let mut c = RaftNode::new(C, vec![A, B]);
+    replicate_rounds(&mut b, &mut a, A);
+    // B moves the group to {A, B, C}: the joint entry, then the final one, each committed with A's
+    // acknowledgement alone (a majority of {A, B}, and of {A, B, C}); C receives neither.
+    assert!(b.begin_membership_change(vec![A, B, C]));
+    replicate_rounds(&mut b, &mut a, A);
+    assert!(b.complete_membership_change());
+    replicate_rounds(&mut b, &mut a, A);
+    assert!(
+      a.is_voter(C) && !c.is_voter(C),
+      "A holds the promotion; C does not"
+    );
+    // B is lost. A's lease of it lapses, and A campaigns among {A, B, C}.
+    a.forget_leader();
+    let pre_vote = a
+      .on_election_timeout()
+      .into_iter()
+      .next()
+      .expect("A campaigns: it is a voter in its configuration");
+    let votes = a.on_pre_vote_reply(c.on_pre_vote(pre_vote));
+    let vote = votes
+      .and_then(|votes| votes.into_iter().next())
+      .expect("C granted A's pre-vote, a majority of {A, B, C} with A's own");
+    a.on_vote_reply(c.on_request_vote(vote));
+    assert!(
+      a.is_leader(),
+      "C's vote elected A: its configuration, not C's, decides whether C votes"
     );
   }
 

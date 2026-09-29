@@ -31,6 +31,18 @@
 //! neighbourhood to the alive membership, advancing the version so a stale request is refused (the
 //! `f = 0` degenerate of the fleet consensus, which is owed).
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
+
 pub mod config_group;
 pub mod content;
 pub mod coordinates;

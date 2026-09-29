@@ -24,6 +24,18 @@
 //! container (which still stores an opaque manifest blob), and export/restore are later Phase 7
 //! work (owed).
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
+
 pub mod archive;
 pub mod codec;
 pub mod format;

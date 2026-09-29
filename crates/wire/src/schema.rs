@@ -20,13 +20,12 @@ const MIX_SHIFT: u32 = 29;
 
 /// FNV-1a over the reflection text.
 pub const fn fnv64(text: &str) -> u64 {
-  let bytes = text.as_bytes();
+  let mut rest = text.as_bytes();
   let mut hash = FNV_OFFSET;
-  let mut i = 0;
-  while i < bytes.len() {
-    hash ^= bytes[i] as u64;
+  while let [byte, tail @ ..] = rest {
+    hash ^= *byte as u64;
     hash = hash.wrapping_mul(FNV_PRIME);
-    i += 1;
+    rest = tail;
   }
   hash
 }
@@ -34,12 +33,12 @@ pub const fn fnv64(text: &str) -> u64 {
 /// Mixes a type's own hash with its field types' hashes in order.
 pub const fn mix(own: u64, fields: &[u64]) -> u64 {
   let mut hash = own;
-  let mut i = 0;
-  while i < fields.len() {
-    hash ^= fields[i].rotate_left(MIX_ROTATE);
+  let mut rest = fields;
+  while let [field, tail @ ..] = rest {
+    hash ^= field.rotate_left(MIX_ROTATE);
     hash = hash.wrapping_mul(MIX_MULTIPLIER);
     hash ^= hash >> MIX_SHIFT;
-    i += 1;
+    rest = tail;
   }
   hash
 }

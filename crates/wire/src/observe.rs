@@ -702,12 +702,14 @@ impl ChokepointRegistry {
 
   /// Registers one chokepoint's emitter. Registering an already-registered chokepoint is idempotent.
   pub fn register(&mut self, point: Chokepoint) {
-    self.registered[point.index()] = true;
+    if let Some(flag) = self.registered.get_mut(point.index()) {
+      *flag = true;
+    }
   }
 
   /// Whether a chokepoint has registered.
   pub fn is_registered(&self, point: Chokepoint) -> bool {
-    self.registered[point.index()]
+    self.registered.get(point.index()).copied().unwrap_or(false)
   }
 
   /// Whether every chokepoint in the roster has registered — the gate is open and the health plane
@@ -722,7 +724,7 @@ impl ChokepointRegistry {
     Chokepoint::ALL
       .iter()
       .copied()
-      .filter(|point| !self.registered[point.index()])
+      .filter(|point| !self.is_registered(*point))
       .collect()
   }
 }

@@ -175,7 +175,11 @@ slates anchor --fleet /etc/slates/fleet.json --node a
 `slates status` on any node shows its place in the fleet: `fleet_host` (its member id),
 `fleet_f`, `fleet_host_epoch`, `fleet_members` (the members it holds alive) and
 `fleet_peers_probed` (peers with a formed session; the mesh is up when this is the member count
-less one); then the two consensus groups as this node drives them — `fleet_council_leads` (whether
+less one), `fleet_held_records` (the objects it holds a record copy of as a candidate holder),
+`fleet_takeovers_pending` (a retired owner's objects the council reassigned to it whose takeover has not
+finished: a takeover that stalls shows here) and `fleet_configuration_version` (the regional configuration
+it has installed; each admission or retirement advances it); then the two consensus groups as this node
+drives them — `fleet_council_leads` (whether
 this node is the regional configuration council's elected leader), `fleet_council_base_periods` and
 `fleet_council_span_periods` (the election timeout it derived, in coordinator periods: base
 `⌈10 × max(broadcast RTT tail, heartbeat) / heartbeat⌉`, the span the same over the RTT variation),
@@ -189,8 +193,8 @@ timeouts it yields before campaigning), `fleet_council_leader_lease` (whether it
 alive, and so refuses pre-votes), `fleet_council_pre_elections` and `fleet_council_elections` (the
 campaigns it has begun since it started), `fleet_council_pre_votes_granted` and
 `fleet_council_pre_votes_refused` (the replies its pre-elections drew), and `fleet_council_refused_role`,
-`_refused_leased`, `_refused_term` and `_refused_log` (the pre-votes it refused as a voter, by reason: it
-leads or does not vote, it holds a lease, the term is not ahead, the candidate's log is behind) — and the
+`_refused_leased`, `_refused_term` and `_refused_log` (the pre-votes it refused, by reason: it leads, it
+holds a lease, the term is not ahead, the candidate's log is behind) — and the
 same nineteen `fleet_root_*` lines for the root group across regions. A single daemon shows the same
 lines, degenerate: `f` 0, itself the one member, leading both groups after explicit bootstrap,
 at the floor with no sample.

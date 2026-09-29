@@ -134,13 +134,13 @@ fn land_once<H: LandFs>(
     Err(LandingRefusal::GrantRequired(p)) => p,
     other => panic!("{other:?}"),
   };
-  req.grant = Some(grants.issue(
+  req.grant = grants.issue(
     Surface::Cli,
     presented.manifest.hash,
     GrantScope::Once,
     1,
     TERM_NS,
-  ));
+  );
   land(
     host,
     target,

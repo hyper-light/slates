@@ -157,7 +157,7 @@ impl RandomizedOrder {
     let len = items.len();
     for index in (1..len).rev() {
       let span = u64::try_from(index).unwrap_or(0).saturating_add(1);
-      let pick = usize::try_from(self.next() % span).unwrap_or(0);
+      let pick = usize::try_from(self.next().checked_rem(span).unwrap_or(0)).unwrap_or(0);
       items.swap(index, pick);
     }
   }
@@ -549,9 +549,8 @@ impl Detector {
   fn next_target(&mut self) -> Option<HostId> {
     loop {
       // Advance through the current shuffled round, skipping any member that died mid-round.
-      while self.cursor < self.order.len() {
-        let candidate = self.order[self.cursor];
-        self.cursor += 1;
+      while let Some(&candidate) = self.order.get(self.cursor) {
+        self.cursor = self.cursor.saturating_add(1);
         if self.is_probed(candidate) {
           return Some(candidate);
         }

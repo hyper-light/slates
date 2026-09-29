@@ -317,12 +317,18 @@ impl Audit {
 
   fn push(&mut self, mut record: AuditRecord) {
     record.seq = self.next_seq;
-    self.next_seq += 1;
+    self.next_seq = self.next_seq.saturating_add(1);
     if self.records.len() < self.retain {
       self.records.push(record);
     } else {
-      self.records[self.head] = record;
-      self.head = (self.head + 1) % self.retain;
+      if let Some(slot) = self.records.get_mut(self.head) {
+        *slot = record;
+      }
+      self.head = self
+        .head
+        .saturating_add(1)
+        .checked_rem(self.retain)
+        .unwrap_or(0);
     }
   }
 
@@ -405,16 +411,18 @@ fn median(samples: &mut [u64]) -> u64 {
     return 0;
   }
   samples.sort_unstable();
-  samples[samples.len() / 2]
+  samples.get(samples.len() / 2).copied().unwrap_or(0)
 }
 
 impl CostSamples {
   fn fold(mut self) -> LandingCosts {
     let samples = u64::try_from(
-      self.link_ns.len()
-        + self.write_ns_per_kib.len()
-        + self.exchange_ns.len()
-        + self.verify_ns.len(),
+      self
+        .link_ns
+        .len()
+        .saturating_add(self.write_ns_per_kib.len())
+        .saturating_add(self.exchange_ns.len())
+        .saturating_add(self.verify_ns.len()),
     )
     .unwrap_or(u64::MAX);
     LandingCosts {
@@ -468,7 +476,8 @@ struct Written {
 impl<H: LandFs> Landing<'_, H> {
   fn hidden_name(&mut self) -> Box<str> {
     let n = self.hidden_counter;
-    self.hidden_counter += 1;
+    // Saturating, not wrapping: a hidden name is created exclusively, so a repeat is refused, never reused.
+    self.hidden_counter = self.hidden_counter.saturating_add(1);
     format!("{HIDDEN_PREFIX}{:016x}-{n}", self.request.landing_id).into()
   }
 
@@ -592,14 +601,16 @@ impl<H: LandFs> Landing<'_, H> {
     let mut buf = vec![0u8; HASH_READ_BYTES];
     let mut off = 0u64;
     while off < length {
-      let take = usize::try_from(length - off)
+      let take = usize::try_from(length.saturating_sub(off))
         .unwrap_or(buf.len())
         .min(buf.len());
-      let n = self.host.read_at(file, off, &mut buf[..take])?;
+      let n = self
+        .host
+        .read_at(file, off, buf.get_mut(..take).unwrap_or_default())?;
       if n == 0 {
         break;
       }
-      hasher.update(&buf[..n]);
+      hasher.update(buf.get(..n).unwrap_or_default());
       off = off.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
     }
     Ok(*hasher.finalize().as_bytes())
@@ -733,7 +744,7 @@ impl<H: LandFs> Landing<'_, H> {
             observer.before_write(self.host, entry);
             let entry_started = Instant::now();
             let w = self.write_entry(entry, vol, store);
-            step_entries += 1;
+            step_entries = step_entries.saturating_add(1);
             step_max_ns = step_max_ns.max(elapsed_ns(entry_started));
             w
           }
@@ -915,7 +926,10 @@ impl<H: LandFs> Landing<'_, H> {
       .unwrap_or(u64::MAX)
       .div_ceil(KIB)
       .max(1);
-    self.costs.write_ns_per_kib.push(elapsed_ns(started) / kib);
+    self
+      .costs
+      .write_ns_per_kib
+      .push(elapsed_ns(started).checked_div(kib).unwrap_or(0));
     Ok(temp)
   }
 
@@ -1349,7 +1363,7 @@ impl<H: LandFs> Landing<'_, H> {
       let ns = elapsed_ns(started);
       total_ns = total_ns.saturating_add(ns);
       self.costs.dir_sync_ns.push(ns);
-      dirs += 1;
+      dirs = dirs.saturating_add(1);
     }
     let media = if self.request.media_durability {
       match self.host.sync_media(self.root) {
@@ -1402,7 +1416,7 @@ impl<H: LandFs> Landing<'_, H> {
           self.host.unlink(dir, &e.name).is_ok()
         };
         if gone {
-          removed += 1;
+          removed = removed.saturating_add(1);
         }
       }
     }
@@ -1458,9 +1472,9 @@ fn elapsed_ns(since: Instant) -> u64 {
 
 /// The directory and name of a volume path.
 fn split(path: &str) -> (&str, &str) {
-  match path.rfind('/') {
-    Some(0) => ("/", &path[1..]),
-    Some(i) => (&path[..i], &path[i + 1..]),
+  match path.rsplit_once('/') {
+    Some(("", name)) => ("/", name),
+    Some((dir, name)) => (dir, name),
     None => ("/", path),
   }
 }

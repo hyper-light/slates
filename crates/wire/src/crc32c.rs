@@ -30,11 +30,15 @@ fn tables() -> &'static Tables {
       }
       *slot = crc;
     }
-    for i in 0..TABLE_ENTRIES {
-      for k in 1..SLICES {
-        let prev = t[k - 1][i];
-        t[k][i] =
-          (prev >> u8::BITS) ^ t[0][usize::try_from(prev & u32::from(u8::MAX)).unwrap_or(0)];
+    // Each slice's table from the one before: an entry shifts a byte through, then folds the byte table.
+    let base = t[0];
+    for k in 1..SLICES {
+      let previous = t.get(k.saturating_sub(1)).copied().unwrap_or(base);
+      if let Some(table) = t.get_mut(k) {
+        for (slot, prev) in table.iter_mut().zip(previous) {
+          let low = usize::try_from(prev & u32::from(u8::MAX)).unwrap_or(0);
+          *slot = (prev >> u8::BITS) ^ base.get(low).copied().unwrap_or(0);
+        }
       }
     }
     Tables(t)
@@ -74,15 +78,17 @@ fn software(crc: u32, data: &[u8]) -> u32 {
     let folded = u64::from_le_bytes(*chunk) ^ u64::from(crc);
     let mut next = 0u32;
     for (k, table) in t.iter().rev().enumerate() {
-      let shift = u32::try_from(k).unwrap_or(0) * u8::BITS;
-      let index = usize::try_from((folded >> shift) & u64::from(u8::MAX)).unwrap_or(0);
-      next ^= table[index];
+      let shift = u32::try_from(k).unwrap_or(0).saturating_mul(u8::BITS);
+      let index =
+        usize::try_from(folded.checked_shr(shift).unwrap_or(0) & u64::from(u8::MAX)).unwrap_or(0);
+      // A byte indexes a 256-entry table, so the entry is always there.
+      next ^= table.get(index).copied().unwrap_or(0);
     }
     crc = next;
   }
   for b in remainder {
     let index = usize::try_from((crc ^ u32::from(*b)) & u32::from(u8::MAX)).unwrap_or(0);
-    crc = t[0][index] ^ (crc >> u8::BITS);
+    crc = t[0].get(index).copied().unwrap_or(0) ^ (crc >> u8::BITS);
   }
   !crc
 }

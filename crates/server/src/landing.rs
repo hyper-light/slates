@@ -576,10 +576,13 @@ pub fn issue_grant(
     GrantScope::Once => LandScope::Once,
     GrantScope::Session => LandScope::Session,
   };
+  // A grant id is never reused; once the id space is spent (2^64 grants — memory runs out first, one record
+  // per grant) the grant is refused as a spent capacity.
   let id = state
     .landing
     .grants
-    .issue(Surface::Cli, awaiting.manifest, land_scope, now, term_ns);
+    .issue(Surface::Cli, awaiting.manifest, land_scope, now, term_ns)
+    .ok_or(Refusal::NoSpace)?;
   let record = DbGrantRecord {
     id: id.0,
     principal: principal.clone(),

@@ -250,15 +250,21 @@ impl AnchorSegment {
         reason: "the creator is still writing the header",
       });
     }
-    let cached = &bytes[AT_IDENTITY..AT_IDENTITY + IDENTITY_BYTES];
+    let cached = bytes
+      .get(AT_IDENTITY..AT_IDENTITY.saturating_add(IDENTITY_BYTES))
+      .unwrap_or_default();
     if cached != identity.hash() {
       return Err(AnchorError::Identity {
         cached: hex(cached),
         current: hex(&identity.hash()),
       });
     }
-    let mut encoded = [0u8; GEOMETRY_BYTES];
-    encoded.copy_from_slice(&bytes[AT_GEOMETRY..AT_GEOMETRY + GEOMETRY_BYTES]);
+    let encoded = bytes
+      .get(AT_GEOMETRY..AT_GEOMETRY.saturating_add(GEOMETRY_BYTES))
+      .and_then(|field| <[u8; GEOMETRY_BYTES]>::try_from(field).ok())
+      .ok_or(AnchorError::Layout {
+        reason: "shorter than its header",
+      })?;
     let geometry = Geometry::decode(&encoded);
     let total = read_u64(bytes, AT_TOTAL);
     if total != geometry.total_bytes() || usize::try_from(total).ok() != Some(len) {
@@ -398,7 +404,7 @@ impl AnchorSegment {
     let offset = range.start.checked_add(at).ok_or(AnchorError::Geometry {
       reason: "word offset overflows",
     })?;
-    if offset + size_of::<u64>() > range.end {
+    if offset.saturating_add(size_of::<u64>()) > range.end {
       return Err(AnchorError::Geometry {
         reason: "word past its region",
       });
@@ -451,7 +457,7 @@ impl AnchorSegment {
   /// A region's length in bytes.
   pub fn region_len(&self, kind: RegionKind) -> Result<usize, AnchorError> {
     let range = self.range(self.spec(kind)?)?;
-    Ok(range.end - range.start)
+    Ok(range.end.saturating_sub(range.start))
   }
 
   /// The `len` bytes at `at` within a region, for the region's single owner. Only these bytes are
@@ -585,22 +591,30 @@ impl AnchorSegment {
   }
 }
 
+/// Writes `value` at `at`: every caller names a fixed field inside the header, which the caller has sized;
+/// were the range missing, nothing is written, never out of bounds.
 fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
-  bytes[at..at + value.len()].copy_from_slice(value);
+  if let Some(field) = bytes.get_mut(at..at.saturating_add(value.len())) {
+    field.copy_from_slice(value);
+  }
 }
 
+/// The little-endian `u32` at `at`, or zero where the header does not reach (every caller names a fixed
+/// field inside a header it has checked the length of; a zero magic or version is refused as wrong).
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
-  let mut word = [0u8; size_of::<u32>()];
-  let n = word.len();
-  word.copy_from_slice(&bytes[at..at + n]);
-  u32::from_le_bytes(word)
+  bytes
+    .get(at..at.saturating_add(size_of::<u32>()))
+    .and_then(|field| <[u8; size_of::<u32>()]>::try_from(field).ok())
+    .map_or(0, u32::from_le_bytes)
 }
 
+/// The little-endian `u64` at `at`, or zero where the header does not reach (a zero total or length is
+/// refused by the checks that read it).
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
-  let mut word = [0u8; size_of::<u64>()];
-  let n = word.len();
-  word.copy_from_slice(&bytes[at..at + n]);
-  u64::from_le_bytes(word)
+  bytes
+    .get(at..at.saturating_add(size_of::<u64>()))
+    .and_then(|field| <[u8; size_of::<u64>()]>::try_from(field).ok())
+    .map_or(0, u64::from_le_bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {

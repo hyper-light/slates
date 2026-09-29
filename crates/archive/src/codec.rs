@@ -114,7 +114,10 @@ fn ns_per_byte_scaled(bytes_per_second: u64) -> u64 {
     return u64::MAX;
   }
   u64::try_from(
-    (u128::from(NANOS_PER_SECOND) * u128::from(RATE_SCALE)) / u128::from(bytes_per_second),
+    u128::from(NANOS_PER_SECOND)
+      .saturating_mul(u128::from(RATE_SCALE))
+      .checked_div(u128::from(bytes_per_second))
+      .unwrap_or(u128::MAX),
   )
   .unwrap_or(u64::MAX)
 }
@@ -212,7 +215,10 @@ pub fn sample(bytes: &[u8]) -> Sampled {
   }
   let mut histogram = [0usize; 256];
   for byte in &sampled {
-    histogram[usize::from(*byte)] += 1;
+    // A byte indexes a 256-bucket histogram, so the bucket is always there.
+    if let Some(bucket) = histogram.get_mut(usize::from(*byte)) {
+      *bucket = bucket.saturating_add(1);
+    }
   }
   let distinct = histogram.iter().filter(|count| **count > 0).count();
   if distinct < BYTE_SET_THRESHOLD {
@@ -237,12 +243,15 @@ pub fn sample(bytes: &[u8]) -> Sampled {
 
 /// The sample: [`SAMPLING_READ_SIZE`] bytes at every [`SAMPLING_INTERVAL`] offset.
 fn collect_sample(bytes: &[u8]) -> Vec<u8> {
-  let mut sampled =
-    Vec::with_capacity(bytes.len() / SAMPLING_INTERVAL * SAMPLING_READ_SIZE + SAMPLING_READ_SIZE);
+  let mut sampled = Vec::with_capacity(
+    (bytes.len() / SAMPLING_INTERVAL)
+      .saturating_mul(SAMPLING_READ_SIZE)
+      .saturating_add(SAMPLING_READ_SIZE),
+  );
   let mut offset = 0;
   while offset < bytes.len() {
     let end = offset.saturating_add(SAMPLING_READ_SIZE).min(bytes.len());
-    sampled.extend_from_slice(&bytes[offset..end]);
+    sampled.extend_from_slice(bytes.get(offset..end).unwrap_or_default());
     offset = offset.saturating_add(SAMPLING_INTERVAL);
   }
   sampled
@@ -251,7 +260,7 @@ fn collect_sample(bytes: &[u8]) -> Vec<u8> {
 /// Btrfs `sample_repeated_patterns`: the first half of the sample equals the second half.
 fn repeated_halves(sampled: &[u8]) -> bool {
   let half = sampled.len() / 2;
-  half > 0 && sampled[..half] == sampled[half..half * 2]
+  half > 0 && sampled.get(..half) == sampled.get(half..half.saturating_mul(2))
 }
 
 /// Btrfs `byte_core_set_size`: how many of the most frequent byte values cover
@@ -264,12 +273,12 @@ fn core_set_size(histogram: &[usize; 256], sample_len: usize) -> usize {
     .filter(|count| *count > 0)
     .collect();
   counts.sort_unstable_by(|a, b| b.cmp(a));
-  let target = sample_len * CORE_SET_COVERAGE_PERCENT / PERCENT_LEN;
-  let mut covered = 0;
+  let target = sample_len.saturating_mul(CORE_SET_COVERAGE_PERCENT) / PERCENT_LEN;
+  let mut covered: usize = 0;
   for (index, count) in counts.iter().enumerate() {
-    covered += count;
+    covered = covered.saturating_add(*count);
     if covered >= target {
-      return index + 1;
+      return index.saturating_add(1);
     }
   }
   counts.len()
@@ -287,14 +296,21 @@ fn entropy_percent(histogram: &[usize; 256], sample_len: usize) -> u64 {
   for count in histogram.iter().copied().filter(|count| *count > 0) {
     let count = u64::try_from(count).unwrap_or(u64::MAX);
     // log2(len / count) in fixed point: ilog2 of (len << fraction) / count.
-    let ratio = (len << ENTROPY_FRACTION_BITS) / count;
+    let ratio = len
+      .checked_shl(ENTROPY_FRACTION_BITS)
+      .unwrap_or(u64::MAX)
+      .checked_div(count)
+      .unwrap_or(0);
     let log2_scaled =
       u64::from(ratio.max(1).ilog2()).saturating_sub(u64::from(ENTROPY_FRACTION_BITS));
     // Weighted by p = count / len, kept scaled by len to stay in integers.
     sum_scaled = sum_scaled.saturating_add(count.saturating_mul(log2_scaled));
   }
   // sum_scaled / len is the entropy in bits; as a percentage of eight bits.
-  sum_scaled.saturating_mul(PERCENT) / (len.saturating_mul(BITS_PER_BYTE))
+  sum_scaled
+    .saturating_mul(PERCENT)
+    .checked_div(len.saturating_mul(BITS_PER_BYTE))
+    .unwrap_or(0)
 }
 
 /// The LZ4 probe with early exit (OpenZFS early abort; Borg `auto`): compresses `bytes` and reports
@@ -311,9 +327,11 @@ pub fn lz4_probe(bytes: &[u8], accept_below: u64) -> Option<(u64, Vec<u8>)> {
 /// Silesia prior. Predicted, never below one byte.
 fn predicted_zstd_size(policy: &CodecPolicy, rate: &CodecRate, lz4_size: u64) -> u64 {
   let share_permille = match policy.lz4 {
-    Some(lz4) if lz4.ratio_permille > 0 => {
-      rate.ratio_permille.saturating_mul(PERMILLE) / lz4.ratio_permille
-    }
+    Some(lz4) if lz4.ratio_permille > 0 => rate
+      .ratio_permille
+      .saturating_mul(PERMILLE)
+      .checked_div(lz4.ratio_permille)
+      .unwrap_or(ZSTD_OVER_LZ4_PRIOR_PERMILLE),
     _ => ZSTD_OVER_LZ4_PRIOR_PERMILLE,
   };
   (lz4_size.saturating_mul(share_permille) / PERMILLE).max(1)
@@ -325,14 +343,20 @@ fn predicted_zstd_size(policy: &CodecPolicy, rate: &CodecRate, lz4_size: u64) ->
 /// nanoseconds and `t` the codec's scaled nanoseconds over the chunk. Negative when compressing does
 /// not pay; the format floor is applied by the caller.
 fn worth(policy: &CodecPolicy, rate: &CodecRate, raw_len: u64, stored_len: u64) -> i128 {
+  // Three u64 factors can pass i128, so every product saturates: an extreme worth stays extreme, never
+  // wraps to the opposite sign.
   let saved = i128::from(raw_len.saturating_sub(stored_len))
-    * i128::from(policy.byte_ns_scaled)
-    * i128::from(policy.value_of_byte_permille);
-  let compress_ns = i128::from(rate.compress_ns_per_byte) * i128::from(raw_len);
+    .saturating_mul(i128::from(policy.byte_ns_scaled))
+    .saturating_mul(i128::from(policy.value_of_byte_permille));
+  let compress_ns = i128::from(rate.compress_ns_per_byte).saturating_mul(i128::from(raw_len));
   let decompress_ns = i128::from(rate.decompress_ns_per_byte)
-    * i128::from(raw_len)
-    * i128::from(policy.expected_reads);
-  saved - (compress_ns + decompress_ns) * i128::from(policy.value_of_cpu_permille)
+    .saturating_mul(i128::from(raw_len))
+    .saturating_mul(i128::from(policy.expected_reads));
+  saved.saturating_sub(
+    compress_ns
+      .saturating_add(decompress_ns)
+      .saturating_mul(i128::from(policy.value_of_cpu_permille)),
+  )
 }
 
 /// The decision for one chunk (§4.11's per-chunk rule): the sampler first — a hole or a surely

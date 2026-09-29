@@ -39,7 +39,7 @@ impl Credit {
         available,
       });
     }
-    self.sent += bytes;
+    self.sent = self.sent.saturating_add(bytes);
     Ok(())
   }
 }

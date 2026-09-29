@@ -150,14 +150,13 @@ impl<H: LandFs> Setup<'_, H> {
     observer: &mut O,
   ) -> Result<LandingReport, LandingRefusal> {
     let presented = self.present(&req);
-    let id = self.session.grants.issue(
+    req.grant = self.session.grants.issue(
       Surface::Cli,
       presented.manifest.hash,
       GrantScope::Once,
       req.now_ns,
       TERM_NS,
     );
-    req.grant = Some(id);
     self.try_land(&req, observer)
   }
 

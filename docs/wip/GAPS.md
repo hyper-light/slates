@@ -1826,16 +1826,47 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
-### 2026-09-29: open — the three-process CLI fleet test's takeover wait ran out once on CI
+### 2026-09-29: the three-process CLI fleet test's takeover wait ran out — a member that missed its promotion refused every election, fixed; a takeover stalled when a survivor never received the head, open
 
 CI run 36576662318 (`38c987e`, Ubuntu) failed
 `three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death` at `wait_successor`:
-neither survivor served the dead owner's volume within the fleet wait. Reproduced once in 6 runs in Linux
-Docker with io_uring (`seccomp=unconfined`). The next 44 runs passed, as did 8 of 8 on macOS. The failing
-run's state was not kept, so no cause is claimed. The wait now dumps each survivor's status and its last
-answer for the volume when it runs out, and a longer Docker loop is running to catch the next failure.
+neither survivor served the dead owner's volume. The wait now dumps each survivor's status when it runs out,
+and a loop in Linux Docker with io_uring caught two defects.
 
-### 2026-09-29: the no-panic sweep — ratcheted per crate, 8 of 29 crates clean; the SDKs' id parser panicked — fixed
+**Fixed — a member that missed its promotion refused every election.** In the dump:
+- survivor A campaigned 26 times, every pre-vote refused;
+- survivor C refused them all "by role", held a lease of the dead leader, and had no path samples to its
+  fellow voters.
+
+C's promotion to voter had been committed without it, and the core refused any vote from a receiver not in
+its own configuration, against thesis §4.1. A learner's lease also never lapsed, since the learner branch of
+both groups' drive skipped the timer.
+- The core now answers votes whatever its own configuration says, and a candidate records only votes from
+  its own configuration's voters, so the recovery's count and reports stay exact.
+- A learner's lease lapses at the minimum election timeout.
+- AUD-07's rule (no vote before initialization) stays where it is enforced, and is now pinned by a wrapper
+  test.
+- The Raft explorer passes at full scale.
+- In Linux Docker the deadlock went from 1 dumped in 81 runs to none in 150.
+[Bug record](../bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md).
+
+**Open — a takeover stalled when a survivor never received the head.** The 150 runs after the fix still
+failed twice, with the council led: nothing took the volume over. Reproduced deterministically in-process: a
+head committed at `f + 1` while the third candidate never received any record of the object stalls its
+takeover for good. Two causes:
+- a holder with nothing gives no promise, so the successor never reaches `f + 1`;
+- a successor with nothing never learns the object.
+
+The design's phase one is a per-host batched round in which every holder, including one with nothing,
+replies; the implementation runs per-object rounds from a successor that must already hold the object. Owed:
+that round, with the deterministic test (kept out of the suite until then) as its failing test first.
+[Bug record](../bugs/2026-09-29-a-takeover-stalled-when-a-survivor-never-received-the-head.md).
+
+**Built for it:** status now reports the control shard's held record copies, pending takeovers and installed
+configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
+stalled takeover shows in any node's status.
+
+### 2026-09-29: the no-panic sweep — ratcheted per crate, 13 of 29 crates clean; the SDKs' id parser panicked — fixed
 
 CLAUDE.md (banned item 6) forbids panics in shipped code: out-of-bounds indexing or slicing, string slicing
 off a character boundary, and overflowing arithmetic among them. The workspace lints deny `unwrap`,
@@ -1870,7 +1901,19 @@ Each crate is linted for all three platforms before it leaves the list:
   size.
 - The Linux mount-table reader appends what it read and no longer slices at computed offsets.
 
-**Owed:** the 21 crates on the pending list, `xtask`, and then the workspace lint itself.
+**Clean (batch 2):** `anchor`, `archive`, `cluster`, `land`, `wire`: 13 of 29 shipped crates.
+- The wire's header and frame decoding read their fields with checked slices, and refuse `Truncated` where a
+  short input was sliced. On a 32-bit host a frame length near `u32::MAX` now saturates and reads as
+  truncated instead of overflowing.
+- The CRC tables and the `const` schema hashes walk their inputs without an index.
+- The landing's grant ids are allocated checked: an id space spent refuses the grant `NoSpace`, and never
+  overwrites a record.
+- Every counter elsewhere saturates.
+- Linted on macOS, on Linux in Docker, and on Windows in the MinGW image.
+
+**Owed:** the 16 crates on the pending list, `xtask`, and then the workspace lint itself. Found on the way,
+open: the landing's grant table never drops a record (revoke and consume only change state), so it grows by
+one per human grant for the daemon's life.
 
 ### 2026-09-29: a campaign asked no one while a session was out — fixed; exclusive session lending — open
 

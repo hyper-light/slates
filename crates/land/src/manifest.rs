@@ -248,15 +248,19 @@ impl Manifest {
         Action::Symlink { .. } => "symlink",
         Action::Clear => "clear",
       };
-      *summary.by_action.entry(action.into()).or_insert(0) += 1;
+      let actions = summary.by_action.entry(action.into()).or_insert(0);
+      *actions = actions.saturating_add(1);
       let top = e
         .path
         .trim_start_matches('/')
         .split('/')
         .next()
         .unwrap_or("");
-      *summary.by_top_level.entry(top.into()).or_insert(0) += 1;
-      summary.bytes += e.overlay.map_or(0, |o| o.size);
+      let tops = summary.by_top_level.entry(top.into()).or_insert(0);
+      *tops = tops.saturating_add(1);
+      summary.bytes = summary
+        .bytes
+        .saturating_add(e.overlay.map_or(0, |o| o.size));
     }
     let hash = *blake3::hash(&Self::encode(&entries)).as_bytes();
     Self {
@@ -306,7 +310,7 @@ pub fn plan(
     .collect();
   for d in &diverged {
     if !filter.keeps(&d.path) {
-      filtered_out += 1;
+      filtered_out = filtered_out.saturating_add(1);
       continue;
     }
     if d.kind == Divergence::Whiteout && origins.iter().any(|o| o.as_ref() == d.path.as_str()) {
@@ -438,9 +442,9 @@ fn entry_for(
 }
 
 fn split(path: &str) -> (&str, &str) {
-  match path.rfind('/') {
-    Some(0) => ("/", &path[1..]),
-    Some(i) => (&path[..i], &path[i + 1..]),
+  match path.rsplit_once('/') {
+    Some(("", name)) => ("/", name),
+    Some((dir, name)) => (dir, name),
     None => ("/", path),
   }
 }

@@ -416,18 +416,14 @@ mod structural {
   /// Every other shipped crate's root carries [`NO_PANIC_ATTRIBUTE`]. The list only shrinks: a crate on it
   /// that already carries the attribute fails too, so a crate leaves the list in the change that cleans it.
   const NO_PANIC_PENDING: &[&str] = &[
-    "slates-anchor",
-    "slates-archive",
     "slates-bridge-core",
     "slates-bridge-fskit",
     "slates-bridge-fuse",
     "slates-bridge-nfs",
     "slates-bridge-virtiofs",
-    "slates-cluster",
     "slates-conformance",
     "slates-db",
     "slates-ipc",
-    "slates-land",
     "slates-machine",
     "slates-mem",
     "slates-merge",
@@ -435,7 +431,6 @@ mod structural {
     "slates-server",
     "slates-transport",
     "slates-vfs",
-    "slates-wire",
     "slates-wire-derive",
   ];
 

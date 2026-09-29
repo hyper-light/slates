@@ -51,6 +51,9 @@ fn report() -> ReplyBody {
         replaced: 0,
         council: group.clone(),
         root: group,
+        held_records: 37,
+        takeovers_pending: 41,
+        configuration_version: 43,
       },
     }),
   }

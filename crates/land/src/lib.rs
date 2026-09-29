@@ -18,6 +18,18 @@
 //! data sync); a compare-and-swap lost to an outsider is undone and reported; a re-run is
 //! idempotent by hash; a directory rename is one rename; the work is proportional to the delta.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
+// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
+// clean this holds it there.
+#![cfg_attr(
+  not(test),
+  deny(
+    clippy::indexing_slicing,
+    clippy::string_slice,
+    clippy::arithmetic_side_effects
+  )
+)]
+
 pub mod engine;
 pub mod grant;
 pub mod manifest;

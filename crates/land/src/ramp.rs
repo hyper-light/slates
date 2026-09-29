@@ -21,7 +21,11 @@ impl StepSample {
   fn throughput(&self) -> u64 {
     /// Format: nanoseconds per second.
     const NS_PER_S: u64 = 1_000_000_000;
-    self.entries.saturating_mul(NS_PER_S) / self.wall_ns.max(1)
+    self
+      .entries
+      .saturating_mul(NS_PER_S)
+      .checked_div(self.wall_ns.max(1))
+      .unwrap_or(0)
   }
 }
 
@@ -59,7 +63,7 @@ impl Ramp {
     let throughput = sample.throughput();
     let Some((last_throughput, last_p99)) = self.previous else {
       self.previous = Some((throughput, sample.p99_ns));
-      self.depth = (self.depth * 2).min(self.max_depth);
+      self.depth = self.depth.saturating_mul(2).min(self.max_depth);
       return self.depth;
     };
     let rose = throughput
@@ -69,7 +73,7 @@ impl Ramp {
     let latency_held = sample.p99_ns.saturating_mul(PERMILLE)
       <= last_p99.saturating_mul(PERMILLE.saturating_add(self.variance_permille));
     if rose && latency_held && self.depth < self.max_depth && !self.settled {
-      self.depth = (self.depth * 2).min(self.max_depth);
+      self.depth = self.depth.saturating_mul(2).min(self.max_depth);
     } else if !rose || !latency_held {
       self.depth = (self.depth / 2).max(1);
       self.settled = true;

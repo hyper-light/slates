@@ -236,7 +236,7 @@ impl ElectionTiming {
   pub fn timeout_periods(&self, local: HostId, attempt: u32) -> u32 {
     let span = u64::from(self.span_periods.max(1));
     let draw = splitmix64(local.0 ^ u64::from(attempt).wrapping_mul(GOLDEN_GAMMA));
-    let jitter = u32::try_from(draw % span).unwrap_or(0);
+    let jitter = u32::try_from(draw.checked_rem(span).unwrap_or(0)).unwrap_or(0);
     self.base_periods.saturating_add(jitter)
   }
 }
@@ -426,7 +426,10 @@ pub fn round_budget(anchors: &RoundAnchors, tail_ns: Option<u64>) -> CommitBudge
   let stall = heartbeat.saturating_mul(u64::from(anchors.stall_periods));
   CommitBudget::with_extension(
     heartbeat.max(tail),
-    (heartbeat / anchors.polls_per_period.max(1)).max(1),
+    heartbeat
+      .checked_div(anchors.polls_per_period.max(1))
+      .unwrap_or(heartbeat)
+      .max(1),
     anchors.lookahead.0,
     anchors.lookahead.1,
     heartbeat,

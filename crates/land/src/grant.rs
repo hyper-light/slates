@@ -86,7 +86,8 @@ pub struct Grants {
 
 impl Grants {
   /// Issues a grant for a manifest from a human surface; `term_ns` is the grant term derived
-  /// from the measured plan-to-grant interval (§4.15's derived constants; the caller's).
+  /// from the measured plan-to-grant interval (§4.15's derived constants; the caller's). `None` once the
+  /// grant id space is spent: an id is never reused, so a record is never overwritten by a newer grant.
   pub fn issue(
     &mut self,
     surface: Surface,
@@ -94,8 +95,8 @@ impl Grants {
     scope: GrantScope,
     now_ns: u64,
     term_ns: u64,
-  ) -> GrantId {
-    self.next += 1;
+  ) -> Option<GrantId> {
+    self.next = self.next.checked_add(1)?;
     let id = GrantId(self.next);
     self.records.insert(
       id,
@@ -109,7 +110,7 @@ impl Grants {
         state: GrantState::Issued,
       },
     );
-    id
+    Some(id)
   }
 
   /// Revokes a grant.
@@ -214,7 +215,9 @@ impl Leases {
         generation: l.generation,
       });
     }
-    self.generation += 1;
+    // A generation advances once per lease taken; it saturates rather than wrapping, since 2^64 takes (one
+    // per landing) are unreachable, and a saturated generation stays the largest, never an older one.
+    self.generation = self.generation.saturating_add(1);
     let lease = LandingLease {
       target: target.into(),
       holder,
@@ -244,7 +247,9 @@ mod tests {
   #[test]
   fn a_grant_binds_one_manifest() {
     let mut grants = Grants::default();
-    let id = grants.issue(Surface::Cli, [1; 32], GrantScope::Once, 100, 50);
+    let id = grants
+      .issue(Surface::Cli, [1; 32], GrantScope::Once, 100, 50)
+      .expect("a grant id");
     assert_eq!(
       grants.check(None, [1; 32], 110),
       Err(GrantRefusal::GrantRequired)
@@ -258,13 +263,17 @@ mod tests {
       grants.check(Some(id), [1; 32], 200),
       Err(GrantRefusal::GrantExpired)
     );
-    let id2 = grants.issue(Surface::Confirmation, [3; 32], GrantScope::Once, 100, 50);
+    let id2 = grants
+      .issue(Surface::Confirmation, [3; 32], GrantScope::Once, 100, 50)
+      .expect("a grant id");
     grants.consume(id2);
     assert_eq!(
       grants.check(Some(id2), [3; 32], 110),
       Err(GrantRefusal::GrantExpired)
     );
-    let id3 = grants.issue(Surface::Cli, [4; 32], GrantScope::Session, 100, 50);
+    let id3 = grants
+      .issue(Surface::Cli, [4; 32], GrantScope::Session, 100, 50)
+      .expect("a grant id");
     grants.consume(id3);
     assert!(
       grants.check(Some(id3), [4; 32], 110).is_ok(),

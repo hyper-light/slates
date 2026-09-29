@@ -215,7 +215,11 @@ impl<'a> Reader<'a> {
   }
 
   fn u8(&mut self) -> Result<u8, ContentError> {
-    Ok(self.take(1)?[0])
+    self
+      .take(1)?
+      .first()
+      .copied()
+      .ok_or(ContentError::Truncated)
   }
 
   fn u32(&mut self) -> Result<u32, ContentError> {

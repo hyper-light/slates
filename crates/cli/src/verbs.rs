@@ -1440,7 +1440,7 @@ fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
 fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> String {
   let members: Vec<String> = report.fleet.members.iter().map(u64::to_string).collect();
   let mut out = format!(
-    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\n",
+    "pid: {}\ngeneration: {}\nrestarts: {}\nheartbeat_age_ns: {}\nclients_reaped: {}\nclients_refused: {}\nshards: {}\nfleet_host: {}\nfleet_f: {}\nfleet_host_epoch: {}\nfleet_members: {}\nfleet_peers_probed: {}\nfleet_unknown_id: {}\nfleet_inbox_full: {}\nfleet_sessions_refused: {}\nfleet_replaced: {}\nfleet_held_records: {}\nfleet_takeovers_pending: {}\nfleet_configuration_version: {}\n",
     report.pid,
     report.generation,
     report.restarts,
@@ -1456,7 +1456,10 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     report.fleet.unknown_id,
     report.fleet.inbox_full,
     report.fleet.sessions_refused,
-    report.fleet.replaced
+    report.fleet.replaced,
+    report.fleet.held_records,
+    report.fleet.takeovers_pending,
+    report.fleet.configuration_version
   );
   out.push_str(&group_text("council", &report.fleet.council));
   out.push_str(&group_text("root", &report.fleet.root));

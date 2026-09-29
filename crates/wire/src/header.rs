@@ -136,14 +136,14 @@ impl Header {
   pub fn decode(bytes: &[u8]) -> Result<Header, WireError> {
     if bytes.len() < HEADER_LEN {
       return Err(WireError::Truncated {
-        needed: HEADER_LEN - bytes.len(),
+        needed: HEADER_LEN.saturating_sub(bytes.len()),
       });
     }
-    let magic = u32::from_le_bytes(take(bytes, AT_MAGIC));
+    let magic = u32::from_le_bytes(take(bytes, AT_MAGIC)?);
     if magic != MAGIC {
       return Err(WireError::BadMagic { got: magic });
     }
-    let major = u16::from_le_bytes(take(bytes, AT_MAJOR));
+    let major = u16::from_le_bytes(take(bytes, AT_MAJOR)?);
     if major != MAJOR {
       return Err(WireError::UnsupportedMajor {
         got: major,
@@ -151,25 +151,31 @@ impl Header {
       });
     }
     Ok(Header {
-      minor: u16::from_le_bytes(take(bytes, AT_MINOR)),
-      flags: Flags(u32::from_le_bytes(take(bytes, AT_FLAGS))),
-      class: Class::from_word(u16::from_le_bytes(take(bytes, AT_CLASS)))?,
-      kind: u16::from_le_bytes(take(bytes, AT_KIND)),
-      length: u32::from_le_bytes(take(bytes, AT_LENGTH)),
-      checksum: u32::from_le_bytes(take(bytes, AT_CHECKSUM)),
-      request: RequestId::from_word(u64::from_le_bytes(take(bytes, AT_REQUEST))),
+      minor: u16::from_le_bytes(take(bytes, AT_MINOR)?),
+      flags: Flags(u32::from_le_bytes(take(bytes, AT_FLAGS)?)),
+      class: Class::from_word(u16::from_le_bytes(take(bytes, AT_CLASS)?))?,
+      kind: u16::from_le_bytes(take(bytes, AT_KIND)?),
+      length: u32::from_le_bytes(take(bytes, AT_LENGTH)?),
+      checksum: u32::from_le_bytes(take(bytes, AT_CHECKSUM)?),
+      request: RequestId::from_word(u64::from_le_bytes(take(bytes, AT_REQUEST)?)),
     })
   }
 }
 
+/// Writes `bytes` at `at` in a header: every offset is a fixed field inside [`HEADER_LEN`], so the range is
+/// always there; were it not, nothing is written, never out of bounds.
 fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
-  out[at..at + bytes.len()].copy_from_slice(bytes);
+  if let Some(field) = out.get_mut(at..at.saturating_add(bytes.len())) {
+    field.copy_from_slice(bytes);
+  }
 }
 
-fn take<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
-  let mut word = [0u8; N];
-  word.copy_from_slice(&bytes[at..at + N]);
-  word
+/// The `N` bytes at `at`, or the typed refusal a short input earns.
+fn take<const N: usize>(bytes: &[u8], at: usize) -> Result<[u8; N], WireError> {
+  bytes
+    .get(at..at.saturating_add(N))
+    .and_then(|field| <[u8; N]>::try_from(field).ok())
+    .ok_or(WireError::Truncated { needed: N })
 }
 
 #[cfg(test)]

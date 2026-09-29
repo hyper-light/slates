@@ -414,11 +414,12 @@ impl LandFs for OsLand {
     let mut written = 0usize;
     while written < bytes.len() {
       let at = off.saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
-      let n = rustix::io::pwrite(fd, &bytes[written..], at).map_err(refusal)?;
+      let n =
+        rustix::io::pwrite(fd, bytes.get(written..).unwrap_or_default(), at).map_err(refusal)?;
       if n == 0 {
         return Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()));
       }
-      written += n;
+      written = written.saturating_add(n);
     }
     Ok(())
   }

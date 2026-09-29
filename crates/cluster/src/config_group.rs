@@ -2084,6 +2084,30 @@ mod tests {
     assert!(!refused.initialized());
   }
 
+  /// AUD-07 ("new members cannot vote or campaign before initialization"): a fresh member that has not
+  /// received the group's base and prefix answers no pre-vote and no vote request, whatever they ask, so a
+  /// replacement that lost its state never supplies a vote.
+  #[test]
+  fn an_uninitialized_member_answers_no_vote() {
+    let mut fresh = RegionalCouncil::learner(HostId(9), Quorum { f: 1 }, 3, false);
+    assert!(!fresh.initialized());
+    let pre_vote = RaftMessage::PreVote(crate::raft::PreVote {
+      term: 8,
+      candidate: A,
+      last_log_index: 0,
+      last_log_term: 0,
+    });
+    let vote = RaftMessage::RequestVote(crate::raft::RequestVote {
+      term: 8,
+      candidate: A,
+      last_log_index: 0,
+      last_log_term: 0,
+    });
+    assert_eq!(fresh.answer(pre_vote), None);
+    assert_eq!(fresh.answer(vote), None);
+    assert!(fresh.election_timeout().is_empty());
+  }
+
   /// Measurement (`docs/wip/BENCHMARKS.md`, "consensus log compaction"): a sole-voter council commits
   /// `changes` membership changes — each one a propose, commit and apply, the path a leader period runs — and
   /// reports the retained publication's size (the `SavedRaft` the control shard re-encodes before every

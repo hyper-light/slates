@@ -281,15 +281,21 @@ impl Geometry {
   }
 }
 
+/// Writes `value` at `at`: every caller names a fixed field inside the encoded geometry, so the range is
+/// always there; were it not, nothing is written, never out of bounds.
 fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
-  bytes[at..at + value.len()].copy_from_slice(value);
+  if let Some(field) = bytes.get_mut(at..at.saturating_add(value.len())) {
+    field.copy_from_slice(value);
+  }
 }
 
+/// The little-endian `u64` at `at`. Every caller names a fixed field inside the geometry; were one missing
+/// it reads as zero, which the segment's total-size check then refuses.
 fn word(bytes: &[u8], at: usize) -> u64 {
-  let mut w = [0u8; size_of::<u64>()];
-  let n = w.len();
-  w.copy_from_slice(&bytes[at..at + n]);
-  u64::from_le_bytes(w)
+  bytes
+    .get(at..at.saturating_add(size_of::<u64>()))
+    .and_then(|field| <[u8; size_of::<u64>()]>::try_from(field).ok())
+    .map_or(0, u64::from_le_bytes)
 }
 
 #[cfg(test)]

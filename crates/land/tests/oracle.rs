@@ -1115,13 +1115,17 @@ fn a_mismatched_grant_and_a_held_lease_refuse() {
     session: &mut session,
   };
   let presented = setup.present(&request(11));
-  let once = setup.session.grants.issue(
-    Surface::Cli,
-    presented.manifest.hash,
-    GrantScope::Once,
-    1,
-    TERM_NS,
-  );
+  let once = setup
+    .session
+    .grants
+    .issue(
+      Surface::Cli,
+      presented.manifest.hash,
+      GrantScope::Once,
+      1,
+      TERM_NS,
+    )
+    .expect("a grant id");
   // The plan changed after the human saw it.
   write_file(setup.vol, setup.host, setup.store, "/src/lib.rs", b"v2");
   let mut req = request(11);
@@ -1165,13 +1169,17 @@ fn a_held_lease_refuses_and_a_single_use_grant_is_consumed() {
   };
   let mut req = request(11);
   let presented = setup.present(&request(11));
-  let fresh = setup.session.grants.issue(
-    Surface::Cli,
-    presented.manifest.hash,
-    GrantScope::Once,
-    1,
-    TERM_NS,
-  );
+  let fresh = setup
+    .session
+    .grants
+    .issue(
+      Surface::Cli,
+      presented.manifest.hash,
+      GrantScope::Once,
+      1,
+      TERM_NS,
+    )
+    .expect("a grant id");
   req.grant = Some(fresh);
   let held = setup.session.leases.take("/", 99, 1, TERM_NS).unwrap();
   let refused = setup.try_land(&req, &mut Unobserved);
@@ -1213,13 +1221,17 @@ fn a_session_grant_covers_the_next_landing() {
     session: &mut session,
   };
   let presented = setup.present(&request(12));
-  let grant = setup.session.grants.issue(
-    Surface::Confirmation,
-    presented.manifest.hash,
-    GrantScope::Session,
-    1,
-    TERM_NS,
-  );
+  let grant = setup
+    .session
+    .grants
+    .issue(
+      Surface::Confirmation,
+      presented.manifest.hash,
+      GrantScope::Session,
+      1,
+      TERM_NS,
+    )
+    .expect("a grant id");
   let mut req = request(12);
   req.grant = Some(grant);
   let report = setup.try_land(&req, &mut Unobserved).unwrap();

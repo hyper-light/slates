@@ -1833,6 +1833,9 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     control: is_control_shard(state),
     council: council_report(state),
     root: root_report(state),
+    held_records: u64::try_from(state.holder_records.len()).unwrap_or(u64::MAX),
+    takeovers_pending: u64::try_from(state.pending_takeovers.len()).unwrap_or(u64::MAX),
+    configuration_version: state.fleet.configuration().version,
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
   }
@@ -1909,6 +1912,22 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let control = shards.iter().find(|shard| shard.control);
   let council = control.map_or_else(|| council_report(state), |shard| shard.council.clone());
   let root = control.map_or_else(|| root_report(state), |shard| shard.root.clone());
+  let (held_records, takeovers_pending, configuration_version) = control.map_or_else(
+    || {
+      (
+        u64::try_from(state.holder_records.len()).unwrap_or(u64::MAX),
+        u64::try_from(state.pending_takeovers.len()).unwrap_or(u64::MAX),
+        configuration.version,
+      )
+    },
+    |shard| {
+      (
+        shard.held_records,
+        shard.takeovers_pending,
+        shard.configuration_version,
+      )
+    },
+  );
   FleetReport {
     host: state.fleet.host().0,
     f: configuration.quorum.f,
@@ -1929,6 +1948,9 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     replaced: demux_sum(state, |c| c.replaced),
     council,
     root,
+    held_records,
+    takeovers_pending,
+    configuration_version,
   }
 }
 

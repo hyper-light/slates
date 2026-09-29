@@ -808,6 +808,14 @@ pub struct ShardReport {
   pub council: GroupReport,
   /// The root group across regions as this shard holds it (live on the control shard).
   pub root: GroupReport,
+  /// The objects this shard holds a record copy of as a candidate holder (§4.8 "records are sent to all
+  /// candidates"); live on the control shard, zero on the others.
+  pub held_records: u64,
+  /// The objects whose takeover this shard owes and has not finished (§4.8 "Promotion": a retired owner's
+  /// objects the council reassigned here); live on the control shard, zero on the others.
+  pub takeovers_pending: u64,
+  /// The version of the regional configuration this shard has installed.
+  pub configuration_version: u64,
   /// Task admissions this shard's runtime arena refused since boot (§4.3 "a task exceeding the budget
   /// is a counted bug signal"; §4.14): the shard's derived task budget covers every task the daemon
   /// spawns on it — clients' cross-shard work, its own loops, the fleet's share — so a count here is a
@@ -847,6 +855,14 @@ pub struct FleetReport {
   pub council: GroupReport,
   /// The root group across regions, likewise; the degenerate self-leading group in a single-region fleet.
   pub root: GroupReport,
+  /// The objects this node holds a record copy of as a candidate holder (the control shard's count).
+  pub held_records: u64,
+  /// The objects whose takeover this node owes and has not finished (the control shard's count): a takeover
+  /// that stalls shows here.
+  pub takeovers_pending: u64,
+  /// The version of the regional configuration the control shard has installed: a retirement or an
+  /// admission advances it.
+  pub configuration_version: u64,
 }
 
 /// The daemon's status.

@@ -58,7 +58,7 @@ pub trait Wire: Sized {
 pub fn take<'a>(input: &mut &'a [u8], n: usize) -> Result<&'a [u8], WireError> {
   if input.len() < n {
     return Err(WireError::Truncated {
-      needed: n - input.len(),
+      needed: n.saturating_sub(input.len()),
     });
   }
   let (head, tail) = input.split_at(n);
@@ -72,7 +72,7 @@ pub fn take_len(input: &mut &[u8]) -> Result<usize, WireError> {
   let len = usize::try_from(u32::decode(input)?).unwrap_or(usize::MAX);
   if input.len() < len {
     return Err(WireError::Truncated {
-      needed: len - input.len(),
+      needed: len.saturating_sub(input.len()),
     });
   }
   Ok(len)
@@ -116,7 +116,10 @@ impl Wire for u8 {
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     #[cfg(test)]
     BYTE_DECODINGS.set(BYTE_DECODINGS.get() + 1);
-    Ok(take(input, 1)?[0])
+    take(input, 1)?
+      .first()
+      .copied()
+      .ok_or(WireError::Truncated { needed: 1 })
   }
   fn encode_slice(values: &[Self], out: &mut Vec<u8>) {
     out.extend_from_slice(values);

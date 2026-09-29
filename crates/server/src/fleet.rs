@@ -4764,6 +4764,13 @@ impl Group {
     }
   }
 
+  fn forget_leader(self, state: &mut ShardState) {
+    match self {
+      Group::Council => state.council.forget_leader(),
+      Group::Root => state.root.forget_leader(),
+    }
+  }
+
   fn invited_campaign(self, state: &mut ShardState) -> Vec<RaftMessage> {
     match self {
       Group::Council => state.council.invited_campaign(),
@@ -5173,6 +5180,32 @@ async fn lead_root_period(
   }
 }
 
+/// A learner's period of its group's election timer (thesis §4.2.3). A learner never campaigns, but the lease
+/// of a leader it no longer hears lapses at the minimum election timeout, as a voter's does: a member whose
+/// promotion to voter the leader committed without it is a voter in a candidate's configuration, and a lease
+/// it could never lose refused that candidate for good
+/// (`docs/bugs/2026-09-29-a-member-that-missed-its-promotion-refused-every-election.md`). Where a voter would
+/// have campaigned, the learner re-baselines the timer instead.
+fn lapse_learner_lease(
+  group: Group,
+  timer: &mut ElectionTimer,
+  contact: u64,
+  timing: &ElectionTiming,
+  local: HostId,
+  rank: usize,
+) {
+  match timer.follower_period(contact, timing, local, rank) {
+    FollowerStep::Follow => {}
+    FollowerStep::LeaderLapsed => {
+      let _ = state::with_state(|s| group.forget_leader(s));
+    }
+    FollowerStep::Campaign => {
+      let _ = state::with_state(|s| group.forget_leader(s));
+      timer.rebaseline(contact);
+    }
+  }
+}
+
 /// Drives this node's configuration council one period from the record-plane coordinator (§4.8, D-14). As
 /// **leader** it replicates a heartbeat to every voter (holding the term and carrying the commit index); as
 /// a **follower** it counts the periods since the leader last made contact and, once past the jittered
@@ -5248,6 +5281,8 @@ async fn drive_config_council(
       drive_learner_fetch(&voters, budget, in_flight).await;
       let _ = state::with_state(|s| s.config_refresh_wanted = false);
     }
+    let timing = derive_group_timing(&voters, |s, timing| s.council_timing = timing);
+    lapse_learner_lease(Group::Council, timer, contact, &timing, local, rank);
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();
@@ -5398,6 +5433,8 @@ async fn drive_root_group(
     if wanted {
       drive_root_learner_fetch(&voters, budget, in_flight).await;
     }
+    let timing = derive_group_timing(&voters, |s, timing| s.root_timing = timing);
+    lapse_learner_lease(Group::Root, timer, contact, &timing, local, rank);
     return;
   }
   let others: Vec<HostId> = voters.into_iter().filter(|voter| *voter != local).collect();

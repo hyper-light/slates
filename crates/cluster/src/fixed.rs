@@ -22,22 +22,25 @@ pub(crate) fn log2_fixed(x: u64) -> u64 {
     return 0;
   }
   // The integer part is the position of the highest set bit; x >= 2 here, so it is at least one.
-  let integer_part = (u64::BITS - 1) - x.leading_zeros();
+  let integer_part = (u64::BITS.saturating_sub(1)).saturating_sub(x.leading_zeros());
   let mut result = u64::from(integer_part) << FRACTION_BITS;
 
   // Normalise x to the mantissa in [1, 2), scaled to Q(FRACTION_BITS): shift so the leading one lands at
   // bit FRACTION_BITS.
   let mut mantissa = if integer_part >= FRACTION_BITS {
-    x >> (integer_part - FRACTION_BITS)
+    x.checked_shr(integer_part.saturating_sub(FRACTION_BITS))
+      .unwrap_or(0)
   } else {
-    x << (FRACTION_BITS - integer_part)
+    x.checked_shl(FRACTION_BITS.saturating_sub(integer_part))
+      .unwrap_or(0)
   };
   let one = 1u64 << FRACTION_BITS;
 
   // Refine one fractional bit per iteration by repeated squaring (Turner's algorithm): squaring the
   // mantissa and testing whether it crossed 2.0 recovers the next bit of the fraction.
   for bit in (0..FRACTION_BITS).rev() {
-    mantissa = (mantissa * mantissa) >> FRACTION_BITS;
+    // The mantissa stays below `2 << FRACTION_BITS`, so its square fits a `u64` with room to spare.
+    mantissa = mantissa.saturating_mul(mantissa) >> FRACTION_BITS;
     if mantissa >= (one << 1) {
       mantissa >>= 1;
       result |= 1u64 << bit;
@@ -67,15 +70,22 @@ pub(crate) fn suspicion_window(
   let expected = expected.max(1);
   let numerator = log2_fixed(confirmations.saturating_add(1));
   let denominator = log2_fixed(u64::from(expected).saturating_add(1));
-  let span = u64::from(max - min);
+  let span = u64::from(max.saturating_sub(min));
   let reduction = if numerator >= denominator {
     span
   } else {
-    // span · log2(C+1) / log2(K+1); the fixed-point scale cancels in the ratio.
-    span.saturating_mul(numerator) / denominator
+    // span · log2(C+1) / log2(K+1); the fixed-point scale cancels in the ratio. The denominator is at
+    // least log2(2) (the expectation is at least one); were it ever zero, no reduction: the full window,
+    // the side that never declares a member dead sooner.
+    span
+      .saturating_mul(numerator)
+      .checked_div(denominator)
+      .unwrap_or(0)
   };
-  let reduction = u32::try_from(reduction).unwrap_or(u32::MAX).min(max - min);
-  max - reduction
+  let reduction = u32::try_from(reduction)
+    .unwrap_or(u32::MAX)
+    .min(max.saturating_sub(min));
+  max.saturating_sub(reduction)
 }
 
 #[cfg(test)]

@@ -139,7 +139,7 @@ pub fn log_of(key: u64, logs: usize) -> usize {
   z = (z ^ (z >> 27)).wrapping_mul(MIX_TWO);
   z ^= z >> 31;
   let count = u64::try_from(logs.max(1)).unwrap_or(u64::MAX);
-  usize::try_from(z % count).unwrap_or(0)
+  usize::try_from(z.checked_rem(count).unwrap_or(0)).unwrap_or(0)
 }
 
 /// One command the merge applied.

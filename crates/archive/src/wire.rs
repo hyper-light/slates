@@ -112,7 +112,11 @@ impl<'a> Reader<'a> {
 
   /// Reads one byte.
   pub fn u8(&mut self) -> Result<u8, ArchiveError> {
-    Ok(self.take(size_of::<u8>())?[0])
+    self
+      .take(size_of::<u8>())?
+      .first()
+      .copied()
+      .ok_or(ArchiveError::Truncated)
   }
 
   /// Reads a little-endian `u16`.

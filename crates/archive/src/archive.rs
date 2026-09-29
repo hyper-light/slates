@@ -455,20 +455,21 @@ fn verify_archive_hash(bytes: &[u8]) -> Result<(), ArchiveError> {
     return Err(ArchiveError::Truncated);
   }
   let magic_at =
-    usize::try_from(total - u64::try_from(size_of::<u32>()).unwrap_or(0)).unwrap_or(usize::MAX);
+    usize::try_from(total.saturating_sub(u64::try_from(size_of::<u32>()).unwrap_or(0)))
+      .unwrap_or(usize::MAX);
   let tail = bytes.get(magic_at..).ok_or(ArchiveError::Truncated)?;
   if u32::from_le_bytes(tail.try_into().unwrap_or_default()) != TRAILER_MAGIC {
     return Err(ArchiveError::BadTrailer);
   }
   // The hash covers everything up to the hash field (the section index included), which ends
   // `size_of::<[u8;32]>() + size_of::<u32>()` bytes before the end.
-  let hash_field = size_of::<[u8; 32]>() + size_of::<u32>();
+  let hash_field = size_of::<[u8; 32]>().saturating_add(size_of::<u32>());
   let covered_end = usize::try_from(total)
     .unwrap_or(usize::MAX)
     .saturating_sub(hash_field);
   let covered = bytes.get(..covered_end).ok_or(ArchiveError::Truncated)?;
   let stored = bytes
-    .get(covered_end..covered_end + size_of::<[u8; 32]>())
+    .get(covered_end..covered_end.saturating_add(size_of::<[u8; 32]>()))
     .ok_or(ArchiveError::Truncated)?;
   if hash_of(covered).as_slice() != stored {
     return Err(ArchiveError::ArchiveHashMismatch);

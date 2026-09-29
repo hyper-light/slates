@@ -54,7 +54,9 @@ impl RestartPolicy {
   /// daemon starts (at the measured start p99) the budget holds, at least one, so a daemon
   /// failing faster than it can start is a loop and one that recovers is not.
   pub fn derive(recovery_budget_ns: u64, daemon_start_p99_ns: u64) -> Derived<RestartPolicy> {
-    let starts = recovery_budget_ns / daemon_start_p99_ns.max(1);
+    let starts = recovery_budget_ns
+      .checked_div(daemon_start_p99_ns.max(1))
+      .unwrap_or(0);
     let max_restarts = u32::try_from(starts).unwrap_or(u32::MAX).max(1);
     derived!(
       RestartPolicy {

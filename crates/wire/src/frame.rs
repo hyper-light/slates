@@ -65,7 +65,8 @@ impl FrameCaps {
 
   /// The cap for a class.
   pub fn cap(&self, class: Class) -> u32 {
-    self.caps[class.index()]
+    // Every class has a cap; were one missing, its frames would be refused (a zero cap), never admitted.
+    self.caps.get(class.index()).copied().unwrap_or(0)
   }
 }
 
@@ -159,7 +160,7 @@ impl Framer {
       checksum,
       request,
     };
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut out = Vec::with_capacity(HEADER_LEN.saturating_add(body.len()));
     out.extend_from_slice(&header.encode());
     out.extend_from_slice(&body);
     Ok(out)
@@ -183,12 +184,13 @@ impl Framer {
         kind: header.kind,
       })?;
     let length = usize::try_from(header.length).unwrap_or(usize::MAX);
-    if input.len() < HEADER_LEN + length {
+    // The frame's end; on a 32-bit host a length near `u32::MAX` saturates here and reads as truncated.
+    let end = HEADER_LEN.saturating_add(length);
+    let Some(body) = input.get(HEADER_LEN..end) else {
       return Err(WireError::Truncated {
-        needed: HEADER_LEN + length - input.len(),
+        needed: end.saturating_sub(input.len()),
       });
-    }
-    let body = &input[HEADER_LEN..HEADER_LEN + length];
+    };
     if header.class.checksummed() {
       let got = crc32c(body);
       if got != header.checksum {
@@ -206,7 +208,7 @@ impl Framer {
         got: schema,
       });
     }
-    *input = &input[HEADER_LEN + length..];
+    *input = input.get(end..).unwrap_or_default();
     Ok(Frame {
       header,
       body: rest.to_vec(),
