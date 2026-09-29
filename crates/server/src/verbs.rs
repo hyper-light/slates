@@ -1319,6 +1319,9 @@ fn run_forwarded(
   body: RequestBody,
   cause: Option<SpanContext>,
 ) -> Option<ReplyBody> {
+  // A client's verb run here opens this shard's idle window as a ring request does on the client's own
+  // shard (§4.7): the owner of a burst of forwarded verbs catches the next one spinning, not parked.
+  slates_rt::registry::with_current(|ctx| ctx.note_activity());
   match state
     .db
     .partition()

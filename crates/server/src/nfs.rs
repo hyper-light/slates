@@ -1355,6 +1355,9 @@ async fn serve_one(stream: TcpStream, port: u16) {
         if stream.write_all(&write_record(&reply)).await.is_err() {
           return;
         }
+        // A mount's call is client activity: the shard spins out its idle window after it, so the next
+        // call of a burst is read without a kernel wake (§4.7).
+        registry::with_current(|ctx| ctx.note_activity());
         buffer.drain(..consumed);
         // A ready read/write does not yield. Bound a busy connection to one RPC per turn,
         // so its successive durability barriers cannot starve the heartbeat (§4.3, D-18).

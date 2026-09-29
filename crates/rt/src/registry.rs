@@ -880,7 +880,7 @@ mod tests {
   #[test]
   fn control_is_refused_when_the_channel_is_full_or_the_shard_is_gone() {
     let (id, receiver) = register(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
-    send_control(id, Control::Active(true)).unwrap();
+    send_control(id, Control::Shutdown).unwrap();
     assert!(matches!(
       send_control(id, Control::Shutdown),
       Err(RtError::ControlFull { .. })
@@ -904,17 +904,17 @@ mod tests {
     let (id, _receiver) = register(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
     let holder = holder_of(id).unwrap();
     assert_eq!(holder.shard(), id);
-    send_control_to_holder(holder, Control::Active(true)).unwrap();
+    send_control_to_holder(holder, Control::Shutdown).unwrap();
     unregister(id);
     assert_ne!(holder_of(id), Some(holder), "the old registration ended");
     assert!(matches!(
-      send_control_to_holder(holder, Control::Active(true)),
+      send_control_to_holder(holder, Control::Shutdown),
       Err(RtError::ShardGone { .. })
     ));
     let (again, _receiver) = register(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
     if again == id {
       assert!(matches!(
-        send_control_to_holder(holder, Control::Active(true)),
+        send_control_to_holder(holder, Control::Shutdown),
         Err(RtError::ShardGone { .. })
       ));
       assert_ne!(holder_of(again), Some(holder));

@@ -307,11 +307,6 @@ pub static INIT_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// client reconnected under it, was told `SessionTaken`, and the node refused every client once the bound
 /// was consumed: `docs/bugs/2026-09-14-fleet-tasks-outside-the-task-budget-poison-client-admission.md`).
 pub static HANDOFF_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Activations that could not reach a client's shard (its control channel full or gone when the
-/// `Control::Active` message was sent at the handoff): that shard then parks straight after each quiet
-/// step instead of spinning its idle window, so each of its client's requests pays a whole wake. Counted
-/// and logged once — before 2026-09-28 the send's refusal was discarded.
-pub static ACTIVATION_LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Client ids that could not be given back to the control shard's live set after a lost handoff or a
 /// reaped client (the control shard's channel full or gone when the forget task was sent): each is a
 /// slot of the client bound held until the daemon restarts, counted here and logged once, never silent.
@@ -1354,6 +1349,28 @@ impl Daemon {
   /// An observation the daemon could not make is its typed refusal.
   pub fn live_tasks(&self) -> Result<usize, ObserveError> {
     self.observe_shard(self.shards.first().copied(), |shard| shard.live_tasks())
+  }
+
+  /// The idle spins each shard has entered since boot, in shard order (§4.7 "Shards poll rings while any
+  /// client has activity within the measured idle window"): the spin a shard runs before it parks, which
+  /// client activity opens and its window bounds (`spin_hits` + `spin_misses` + `spin_deadlines` of
+  /// [`slates_rt::shard::Counters`]). Asked as a one-shot task on each shard, so the asking is no client
+  /// activity. A test reads it across a quiet stretch to prove an idle daemon parks rather than spins; an
+  /// observation the daemon could not make is its typed refusal.
+  pub fn idle_spins(&self) -> Result<Vec<u64>, ObserveError> {
+    self
+      .shards
+      .iter()
+      .map(|shard| {
+        self.observe_shard(Some(*shard), |ctx| {
+          let counters = ctx.counters();
+          counters
+            .spin_hits
+            .saturating_add(counters.spin_misses)
+            .saturating_add(counters.spin_deadlines)
+        })
+      })
+      .collect()
   }
 
   /// Whether this daemon leads the **root group** across regions (§4.8, D-14 — the root master). A one-shot
@@ -2513,6 +2530,11 @@ async fn serve_loop() {
       (did, now.saturating_sub(s.last_work_ns) < idle_window_ns)
     })
     .unwrap_or((false, false));
+    if did {
+      // Client work opens the shard's idle window (§4.7): after this loop goes quiet, the shard itself
+      // spins out what is left of the window before it parks, and parks at once outside it.
+      registry::with_current(|ctx| ctx.note_activity());
+    }
     if did || within_window {
       futures::yield_now().await;
     } else {
@@ -2766,7 +2788,6 @@ async fn control_loop(
             shard.0
           );
         }
-        activate(shard);
       }
     }
     if let Err(error) = wait_for_rendezvous(&listener).await {
@@ -2790,19 +2811,6 @@ async fn wait_for_rendezvous(listener: &Listener) -> Result<(), slates_rt::RtErr
 async fn wait_for_rendezvous(_listener: &Listener) -> Result<(), slates_rt::RtError> {
   futures::idle().await;
   Ok(())
-}
-
-/// Tells `shard` a client is active there, so it spins its idle window before parking (§4.7); a refused
-/// message is counted ([`ACTIVATION_LOST`]) and logged once.
-fn activate(shard: ShardId) {
-  if let Err(e) = registry::send_control(shard.0, Control::Active(true))
-    && ACTIVATION_LOST.fetch_add(1, Ordering::AcqRel) == 0
-  {
-    eprintln!(
-      "slates-server: shard {} could not be told a client is active: {e}",
-      shard.0
-    );
-  }
 }
 
 /// The heartbeat: the anchor's `daemon.alive` input, beaten at a cadence inside its budget.

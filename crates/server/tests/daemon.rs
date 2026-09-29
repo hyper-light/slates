@@ -434,6 +434,41 @@ fn a_pending_rendezvous_does_not_repeatedly_kick_the_shards() {
   drop(daemon);
 }
 
+/// §4.7 "Shards poll rings while any client has activity within the measured idle window" (A-42): a shard
+/// spins before it parks only within the window its clients' last activity opened. Before 2026-09-29 the
+/// first client's handoff set its shard spinning before every park for good: an idle solo daemon went
+/// from 0.07 % of a CPU before any client to 1.6–1.8 % after one had come and gone, and an idle fleet
+/// pod's shard spent 15–32 % of a core
+/// (docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md). Do: serve a client
+/// on each shard, close the clients, wait out their windows, then count each shard's idle spins across a
+/// quiet stretch of the daemon's own timers. Expect: no shard enters an idle spin in the stretch.
+#[test]
+// The quiet stretch is the measurement: the test thread sleeps through it while the daemon idles.
+#[allow(clippy::disallowed_methods)]
+fn an_idle_daemon_parks_once_its_clients_windows_have_passed() {
+  let (daemon, instance) = daemon("idle-spin");
+  for _ in 0..TEST_SHARDS {
+    let mut client = Client::connect(&instance);
+    assert!(matches!(
+      client.call(&RequestBody::List),
+      ReplyBody::Listed { .. }
+    ));
+  }
+  // Derived: one liveness budget outlasts any idle window (the wake estimate × the idle ratio, milliseconds
+  // at most), and a second one spans ten heartbeats and a reap sweep, each a timer that ends in an idle
+  // shard.
+  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  std::thread::sleep(budget);
+  let before = daemon.idle_spins().expect("each shard answers");
+  std::thread::sleep(budget);
+  let after = daemon.idle_spins().expect("each shard answers");
+  assert_eq!(
+    after, before,
+    "an idle shard spun before its parks with no client activity in its window"
+  );
+  drop(daemon);
+}
+
 /// A freshly bootstrapped `f = 1` fleet under the operator's durability policy. Its two
 /// configured peers are unreachable, so only the bootstrap host is admitted. The durability
 /// calculation must not count those absent peers as replicas (§4.8, AUD-07).

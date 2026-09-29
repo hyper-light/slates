@@ -1966,9 +1966,15 @@ visible to clients.
   - the burst measurement above, again, on a fleet that does not restart;
   - the lane asserting `restarts: 0`;
   - the anchor's budget made the operator's input it is documented to become.
-- **Found by the same measurement, open.** An idle shard spins before every park for good once any client
-  has connected: `activate` sets the flag at a handoff and nothing clears it. The fixed fleet's idle shards
-  used 28–62 s of CPU in 190 s, 15–32 % of a core each.
+- **Found by the same measurement, and fixed (A-42).** An idle shard spun before every park for good once
+  any client had connected: `activate` set the flag at a handoff and nothing cleared it. The fixed fleet's
+  idle shards used 28–62 s of CPU in 190 s, 15–32 % of a core each. Now client work opens the idle window
+  and the shard spins out only what is left of it. The same fleet's shards used 2.3–3.6 s in 190 s
+  (`docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md`).
+- **Found while measuring, open — the provisioning histogram cannot run.** `provision_bench`, the R9 gate,
+  aborts at its create-destroy loop with `Refused(BudgetExceeded { available: 1478 })` after 51 "a volume
+  was not imaged, skipped: ESTALE" lines. It does the same at `fd7b7b0`, before A-42, so the cause is
+  older. The last recorded run is 2026-09-05. Owed: the cause, a fix, and the histogram re-recorded.
 
 **Open, explained — retired peers' seed ids held alive.** Explained by the restarts above (a restarted
 daemon's fresh fleet node seeds every manifest peer alive and re-learns only the peers that reach it); owed:

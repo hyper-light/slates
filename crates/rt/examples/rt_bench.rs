@@ -187,8 +187,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let counters = two.shutdown();
   println!("shard counters after the round trips: {counters:?}");
 
-  // The same round trip with the shard active: it spins for the profile's window before
-  // parking, so a reply that lands within the window skips the kernel wake.
+  // The same round trip with each spawned task noted as client activity: the shard spins out the
+  // profile's window after it before parking, so a spawn that lands within the window skips the kernel
+  // wake.
   let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
     budget_per_probe: Duration::from_millis(50),
     codecs: false,
@@ -198,7 +199,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   spinning.spin_ns = profile.derived().spin_before_park_ns.get();
   let two = Runtime::start(&spinning)?;
   let target = two.shard_ids()[1];
-  let _ = two.set_active(target, true);
   let (tx, rx) = channel::<u64>();
   report_placed(
     "foreign spawn and reply with the shard spinning before it parks",
@@ -206,6 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       || {
         let tx = tx.clone();
         let _ = two.spawn_on(target, async move {
+          slates_rt::registry::with_current(|ctx| ctx.note_activity());
           let _ = tx.send(PINGS.fetch_add(1, Ordering::Relaxed));
         });
         let _ = rx.recv();
@@ -277,6 +278,14 @@ fn wake_side(side: u64) {
   slates_rt::registry::wake(slates_mem::Encoded::from_word(word));
 }
 
+/// Notes a ping-pong turn as client activity when the run measures spinning shards: each side then spins
+/// out the idle window after its turn, so the other side's reply lands in the spin.
+fn note_turn(active: bool) {
+  if active {
+    slates_rt::registry::with_current(|ctx| ctx.note_activity());
+  }
+}
+
 /// Runs `rounds` ping-pongs between a task on shard 0 and a task on shard 1; returns the
 /// per-round-trip sample measured on side 0 and shard 1's spin counters.
 fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
@@ -289,10 +298,6 @@ fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
     Err(_) => return (Sample::new(Vec::new()), 0, 0),
   };
   let ids = rt.shard_ids().to_vec();
-  if active {
-    let _ = rt.set_active(ids[0], true);
-    let _ = rt.set_active(ids[1], true);
-  }
   let (tx, rx) = channel::<Vec<u64>>();
   let _ = rt.spawn_on(ids[1], async move {
     // Side 1 echoes: wait for its turn, hand the turn back, and wake side 0.
@@ -302,6 +307,7 @@ fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
         break;
       }
       TURN.store(0, Ordering::Release);
+      note_turn(active);
       wake_side(0);
     }
   });
@@ -315,6 +321,7 @@ fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
     for _ in 0..ROUNDS {
       let started = std::time::Instant::now();
       TURN.store(1, Ordering::Release);
+      note_turn(active);
       wake_side(1);
       AwaitTurn { side: 0 }.await;
       times.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));

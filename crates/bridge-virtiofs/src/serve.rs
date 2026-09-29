@@ -198,6 +198,9 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
       .with_bridge(|b, registry| admitted.service(b, registry))
       .map_err(ServeError::Authority)??;
     *passes = passes.saturating_add(1);
+    // A guest's requests are client activity: the shard spins out its idle window after a pass, so the
+    // guest's next kick lands in the spin rather than waking a parked shard (§4.7).
+    slates_rt::registry::with_current(|ctx| ctx.note_activity());
     if !pass.more_pending {
       return Ok(());
     }

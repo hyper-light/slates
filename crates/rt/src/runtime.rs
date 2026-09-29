@@ -389,11 +389,6 @@ impl Runtime {
     registry::holder_of(shard.0)
   }
 
-  /// Tells a shard whether a client is active, which enables the idle spin before parking.
-  pub fn set_active(&self, shard: ShardId, active: bool) -> Result<(), RtError> {
-    registry::send_control(shard.0, Control::Active(active))
-  }
-
   /// Requests a task's cancellation from any thread.
   pub fn cancel(&self, task: TaskId) -> Result<(), RtError> {
     registry::send_control(task.0.shard(), Control::Cancel(task.0))

@@ -1026,8 +1026,9 @@ ring and kicks the driver; a stale generation is ignored.
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
 run ready tasks to their next await; expire timers; store the loop generation (QSBR); if nothing
-is ready, spin for the idle-spin window (while any client is active) — a multiple of the shard's
-wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
+is ready, spin out the idle-spin window that the last client activity opened (A-42: the server notes a
+served ring request, forwarded verb, mount call or guest pass; a timer's work opens none) — a multiple of
+the shard's wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
 readiness is known only to the driver, so the spin polls it without blocking; A-39), then park in
 the driver. Every non-blocking harvest is one that never sleeps: on io_uring that is `io_uring_enter`
 with `GETEVENTS` and `min_complete = 0`, which runs the deferred task work and returns (A-39). Cancellation: dropping a future releases nothing it did not own (resources live in arenas
@@ -2274,6 +2275,20 @@ drops.
 > **Status (2026-09-22, the client ring follows Little's law).** The client ring was not sized by the formula below: `slots_per_ring` reused the runtime's inbound-ring depth, `wake.p99 / syscall.median` from one boot probe, and each client's bulk area scales with it. The probe's tail is unstable (the pod image's own profile gave wake p99 from 667 ns to 511,042 ns across runs a minute apart, often from 64 samples), so three KIND pods of one image derived 16384, 8 and 256 slots and seated 1, 1285 and 41 clients; the one-seat pod refused the lane's `bootstrap` while its readiness probe held the seat, and CI's macOS runner seated two clients and refused the restart test's third. The ring is now `next_power_of_two(requests_in_flight_per_shard)`, this Little's law value (32 slots); every pod of a two-CPU fresh-cluster run logs 32 slots and 330 client seats. Owed: the admission value rests on two stated assumptions rather than measured rates. (The wake probe's two events and unconverged tail, and `spin_ns` reading the p50, were closed on 2026-09-25: §4.1's status.) Record: `docs/bugs/2026-09-22-client-ring-sized-by-the-wake-tail-not-littles-law.md`.
 
 > **Status (2026-09-25, A-31: the client learns its own wake).** A client spun for the daemon's boot mean for its whole life. It now spins for an online estimate seeded with that mean (`spin_ns`, weighted over about `2^spin_shift` wakes) and refined from its own parks: the daemon stamps the host clock into the region's `reply_stamp` before it wakes a parked client, marks it confirmed when its wake call reports a sleeper found (`futex_wake`'s count; `os_sync_wake_by_address_any` refuses `ENOENT` when none), and the client folds a confirmed stamp inside its wait into the estimate (`ClientEnd::wait`, `wake_samples`); a confirmation that lands after the woken client read the stamp is settled at its next wait. The region's layout goes to version 2 (a client of another version is refused by name, as before). Confirmation is not decoration: without it, a daemon replying the instant the parked flag rose taught the client 611–974 ns on Apple silicon against the boot probe's 2.0–3.3 µs for confirmed sleepers, because such a reply lands while the client's wait is being set up and the wait returns without sleeping. The same evidence corrects a benchmark: `ipc_bench`'s `ring_round_trip_parked_and_woken` row (ratcheted at 1,233 ns here) is mostly that race — of 2,000 parked trips per run only 2, 18, 11, 1 and 1 slept on Apple silicon and 1–3 on Linux (503–545 ns, against a confirmed-sleeper mean of 15–17 µs there); the bench now prints the count, and `docs/wip/BENCHMARKS.md` records the correction. Proven by use in `crates/ipc/tests/rings.rs` (`a_client_learns_its_wake_from_the_parks_a_reply_ended`; a client that never parked learns nothing and keeps the published window). Record: `docs/bugs/2026-09-25-wake-estimate-frozen-at-boot-and-preemptions-counted-as-long-steps.md`.
+
+> **Status (2026-09-29, A-42: the idle spin is opened by client activity and ends with its window).** The
+> daemon set a shard "active" at its first client's handoff and nothing cleared it, so from then on every
+> idle moment of the shard, however long after its clients, ended in a full idle-window spin: an idle
+> solo daemon spent 1.6–1.8 % of a CPU after one client had come and gone (0.07–0.09 % before any), and
+> an idle fleet pod's shard 28–62 s of CPU in 190 s. Now the server notes client work where it serves it
+> (a ring request, a verb forwarded from another shard, a mount's call, a guest's pass;
+> `ShardContext::note_activity`), and the shard spins only until the window that activity opened ends.
+> Timers that fire after a client has gone quiet open no window of their own. The serve loop's own
+> polling window, which lets a client skip the doorbell, is unchanged. The idle solo daemon measured
+> 0.08–0.11 % after its client; the idle fleet pods 2.3–3.6 s of CPU in 190 s. Failing test first:
+> `an_idle_daemon_parks_once_its_clients_windows_have_passed` (12 and 2 idle spins in one quiet second
+> before, none after); `crates/rt/tests/idle_spin.rs` proves the window by use. Record:
+> `docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md`.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
@@ -6733,3 +6748,25 @@ the chart's values, `docs/wip/kind-lane.md` and GAPS.
 - What it does not change: thread-per-core ownership; pinning on a machine or cpuset the daemon owns (the
   §4.3 worked example still fixes five shards to five Super cores); the machine identity's meaning (the
   count of cores the process may use, now counted from the mask).
+
+### A-42 — The idle spin is opened by client activity and ends with its window (2026-09-29)
+Applied in the same change to: §4.3 ("Loop"), §4.7 (its status), `slates-rt` (`ShardContext::note_activity`
+and the loop's `spin_after_activity`; `Control::Active`, `Runtime::set_active` and the shard's `active`
+flag removed), `slates-server` (client work noted in the serve loop, `run_forwarded` and the NFS
+connection; the handoff's `activate` and `ACTIVATION_LOST` removed; `Daemon::idle_spins`),
+`slates-bridge-virtiofs` (each service pass), the runtime's bench, and GAPS.
+- Why: §4.7 says shards poll rings while any client has activity within the measured idle window. The
+  daemon marked a shard active at a client's handoff and never cleared the mark, so an idle daemon
+  spun a full window before every park for good once one client had connected: 1.6–1.8 % of a CPU on
+  an idle solo daemon, 15–32 % of a core on an idle fleet pod
+  (`docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md`).
+- The rule: served client work opens the window, and the shard spins out only what is left of it. A
+  timer's work after the client went quiet opens none. Replaced, not layered: the active flag, its
+  control message and the handoff's activation are gone.
+- Evidence: the daemon test (12 and 2 idle spins per quiet second before, none after); the runtime test
+  (no spin without activity, spins inside the window, none after it); an idle solo daemon at
+  0.08–0.11 % of a CPU after its client (1.6–1.8 % before); idle fleet pods at 2.3–3.6 s of CPU in 190 s
+  (28–62 s before). The fleet suite passes 59 of 59 and the CLI suite 13 of 13.
+- What it does not change: the serve loop's polling window and its doorbell protocol; the window's
+  length (the shard's wake estimate × `IDLE_WINDOW_RATIO`); a request after a quiet window pays one kick,
+  as before.

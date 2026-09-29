@@ -190,8 +190,8 @@ const REPLY_WITHIN: Duration = Duration::from_millis(1_000);
 
 /// §4.3: a shard spinning in its idle window sees its driver's readiness, not only its rings: a request
 /// arriving on a socket while the shard spins is answered at once, not after the window ends and the
-/// shard parks. (The daemon keeps every shard with a client active, so each socket request had waited
-/// out up to one window — 1.3 ms in a container — per hop.)
+/// shard parks. (A shard spins within the window its clients' activity opened, so each socket request had
+/// waited out up to one window — 1.3 ms in a container — per hop.)
 #[test]
 fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
   let config = RuntimeConfig {
@@ -200,7 +200,11 @@ fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
   };
   let rt = Runtime::start(&config).unwrap();
   let id = rt.shard_ids()[0];
-  rt.set_active(id, true).unwrap();
+  // A client's earlier request opened the shard's idle window, as the server notes one it served.
+  rt.spawn_on(id, async {
+    slates_rt::registry::with_current(|ctx| ctx.note_activity());
+  })
+  .unwrap();
   let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
   let addr = listener.local_addr().unwrap();
   rt.spawn_on(id, async move {

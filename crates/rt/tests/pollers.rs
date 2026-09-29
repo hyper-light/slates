@@ -84,14 +84,18 @@ fn wait_until(deadline: Duration, done: impl Fn() -> bool) -> bool {
 fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
   let rt = Runtime::start(&config()).unwrap();
   let shard = rt.shard_ids()[0];
-  rt.set_active(shard, true).unwrap();
+  // A client's earlier request opened the shard's idle window, as the server notes one it served.
+  rt.spawn_on(shard, async {
+    registry::with_current(|ctx| ctx.note_activity());
+  })
+  .unwrap();
   rt.spawn_on(shard, doorbell_loop()).unwrap();
   assert!(
     wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 1),
     "the doorbell task ran once and went idle"
   );
-  // Let the step that polled the task end and the shard, active with nothing to do, settle into its
-  // spin; then ring.
+  // Let the step that polled the task end and the shard, inside its window with nothing to do, settle
+  // into its spin; then ring.
   let _ = wait_until(SETTLE, || false);
   RUNG.store(true, Ordering::Release);
   if let Some(entry) = registry::entry(shard.0) {

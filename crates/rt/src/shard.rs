@@ -3,8 +3,8 @@
 //!
 //! Each iteration: drain the control channel and the inbound rings (spawns, cancels, shutdown,
 //! wakes) and the driver's completions into the run queue; expire timers; run ready tasks to
-//! their next await, at most a batch of them; then, if nothing is ready, spin for the configured
-//! window while a client is active, and park in the driver until a kick, a completion or the
+//! their next await, at most a batch of them; then, if nothing is ready, spin out the idle window
+//! that client activity opened (§4.7), and park in the driver until a kick, a completion or the
 //! next deadline. Cancellation is a message that guarantees a terminal completion: the future is
 //! dropped at the next poll boundary, the task's children are cancelled and joined, and whoever
 //! joins it sees `Cancelled`. The watchdog counts polls that exceed the step quantum — the expected wake
@@ -258,7 +258,9 @@ pub struct ShardContext {
   inbound: Vec<&'static SpscRing>,
   current_task: Cell<Option<u32>>,
   exited: Cell<bool>,
-  active: Cell<bool>,
+  /// When the server last served a client's work on this shard (its clock), opening the idle window the
+  /// shard spins in before it parks ([`ShardContext::note_activity`]); `None` until the first.
+  activity_ns: Cell<Option<u64>>,
   pair_full_events: Cell<u64>,
   nested_borrows: Cell<u64>,
   /// The absolute deadline the shard last waited for — parked in its driver, or idle-spinning — and
@@ -355,7 +357,7 @@ impl ShardContext {
       inbound: seed.inbound,
       current_task: Cell::new(None),
       exited: Cell::new(false),
-      active: Cell::new(false),
+      activity_ns: Cell::new(None),
       pair_full_events: Cell::new(0),
       nested_borrows: Cell::new(0),
       waited_for_ns: Cell::new(None),
@@ -439,14 +441,12 @@ impl ShardContext {
     self.exited.get()
   }
 
-  /// Whether a client is active (the idle spin is enabled).
-  pub fn active(&self) -> bool {
-    self.active.get()
-  }
-
-  /// Sets the active flag on this shard's thread (the runtime sends a message from elsewhere).
-  pub fn set_active(&self, active: bool) {
-    self.active.set(active);
+  /// Notes that the server just served a client's work on this shard — a request from its ring, a verb
+  /// forwarded from another shard, a mount's call (§4.7 "Shards poll rings while any client has activity
+  /// within the measured idle window"): the shard spins out the idle window from now before it parks, so
+  /// the client's next request within it costs no kernel wake. Called on the shard's own thread.
+  pub fn note_activity(&self) {
+    self.activity_ns.set(Some(self.now_ns()));
   }
 
   /// Whether any inbound ring holds a word (a check without a syscall).
@@ -752,9 +752,11 @@ impl ShardContext {
 
   // ------------------------------------------------------------------ the loop
 
-  /// Runs the loop on the calling thread until shutdown completes. When idle and a client is
-  /// active, the shard spins for the configured window checking its rings before it parks: a
-  /// wake that lands during the spin costs a cache-line transfer instead of a kernel wake.
+  /// Runs the loop on the calling thread until shutdown completes. When idle within the window a
+  /// client's last activity opened, the shard spins out the window checking its rings, pollers and
+  /// driver before it parks: a wake that lands during the spin costs a cache-line transfer instead of
+  /// a kernel wake. Outside every window it parks at once, so an idle daemon's own timers never keep it
+  /// spinning (docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md).
   pub fn run(&'static self) {
     registry::set_current(Some(self));
     // Driver I/O completions are harvested only when the shard waits ([`park`]). Under continuous task
@@ -784,7 +786,7 @@ impl ShardContext {
         }
         continue;
       }
-      if self.active.get() && self.spin_until_work(outcome.next_deadline_ns) {
+      if self.spin_after_activity(outcome.next_deadline_ns) {
         continue;
       }
       self.park(outcome.next_deadline_ns);
@@ -820,17 +822,22 @@ impl ShardContext {
       .unwrap_or(false)
   }
 
-  /// Spins for the configured window watching the rings and the driver; true when something
-  /// arrived or a timer fell due during the spin (either is work for the next step), false when
-  /// the window ran out with nothing to do.
-  fn spin_until_work(&self, deadline_ns: Option<u64>) -> bool {
-    let spin_ns = self.spin_window_ns();
-    let now = self.now_ns();
-    if spin_ns == 0 {
+  /// Spins out the rest of the idle window the last client activity opened
+  /// ([`ShardContext::note_activity`]), watching the rings, the pollers and the driver; true when
+  /// something arrived or a timer fell due during the spin (either is work for the next step), false
+  /// when the window ran out, or had already, with nothing to do. The window is measured from the
+  /// activity, not from this idle moment: timers that fire after a client has gone quiet do not open a
+  /// fresh one each.
+  fn spin_after_activity(&self, deadline_ns: Option<u64>) -> bool {
+    let Some(activity) = self.activity_ns.get() else {
+      return false;
+    };
+    let window_end = activity.saturating_add(self.spin_window_ns());
+    if self.now_ns() >= window_end {
       return false;
     }
     self.update_attribution(Tracker::wait_began);
-    let found = self.spin_for_work(now.saturating_add(spin_ns), deadline_ns);
+    let found = self.spin_for_work(window_end, deadline_ns);
     if found {
       self.wait_ended();
     }
@@ -1339,7 +1346,6 @@ impl ShardContext {
         inner.shutting_down = true;
         cancel_all(&mut inner.arena, &self.local);
       }
-      Control::Active(active) => self.active.set(active),
     }
   }
 

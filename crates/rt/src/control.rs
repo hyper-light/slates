@@ -1,4 +1,4 @@
-//! Control messages to a shard: spawn, cancel, shutdown, active. They travel over a bounded
+//! Control messages to a shard: spawn, cancel, shutdown. They travel over a bounded
 //! standard channel per shard (`std::sync::mpsc::sync_channel`), never over the wake rings,
 //! because a spawn carries a boxed future and a ring carries words (§4.3). The channel is
 //! control, not a data path: a spawn is admission, and `try_send` refuses instead of blocking
@@ -18,6 +18,4 @@ pub enum Control {
   Cancel(Encoded),
   /// Finish every task and exit the loop.
   Shutdown,
-  /// A client became active (true) or inactive (false): spin before parking while active.
-  Active(bool),
 }
