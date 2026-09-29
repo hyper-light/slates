@@ -179,7 +179,9 @@ less one), `fleet_held_records` (the objects it holds a record copy of as a cand
 `fleet_takeovers_pending` (a retired owner's objects the council reassigned to it whose takeover has not
 finished: a takeover that stalls shows here) and `fleet_configuration_version` (the regional configuration
 it has installed; each admission, retirement, settlement and takeover confirmation advances it); then
-`fleet_settled_generation` and `fleet_neighbourhood_generation` (the versions its settled and its current
+`fleet_configuration_members` (how many members that configuration holds: the council's committed membership,
+where `fleet_members` is the ones this node's detector holds alive), `fleet_settled_generation` and
+`fleet_neighbourhood_generation` (the versions its settled and its current
 neighbourhood were fixed at: they differ while its records are being moved onto a new neighbourhood), and one
 `fleet_retirement: host=… version=… survivors=[…] confirmed=[…] unconfirmed=[…]` line per retirement the
 council still keeps (the retired member, the version that retired it, the members its objects' successors are
@@ -200,8 +202,11 @@ alive, and so refuses pre-votes), `fleet_council_pre_elections` and `fleet_counc
 campaigns it has begun since it started), `fleet_council_pre_votes_granted` and
 `fleet_council_pre_votes_refused` (the replies its pre-elections drew), and `fleet_council_refused_role`,
 `_refused_leased`, `_refused_term` and `_refused_log` (the pre-votes it refused, by reason: it leads, it
-holds a lease, the term is not ahead, the candidate's log is behind) — and the
-same nineteen `fleet_root_*` lines for the root group across regions. A single daemon shows the same
+holds a lease, the term is not ahead, the candidate's log is behind), and `fleet_council_voters` and
+`fleet_council_joint` (the voters seated in the configuration in force, and whether a joint change of them is
+in flight: members are admitted before they are caught up and promoted to voters, so right after formation a
+council can seat fewer voters than its `f` asks, and it tolerates only the losses its seated voters give) —
+and the same twenty-one `fleet_root_*` lines for the root group across regions. A single daemon shows the same
 lines, degenerate: `f` 0, itself the one member, leading both groups after explicit bootstrap,
 at the floor with no sample.
 

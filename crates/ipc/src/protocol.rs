@@ -745,6 +745,12 @@ pub struct GroupReport {
   pub refused_term: u64,
   /// Pre-votes it refused because the candidate's log was behind its own.
   pub refused_log: u64,
+  /// The voters seated in the group's configuration in force: its fault tolerance is what this many voters
+  /// give, whatever the membership (thesis §4.3). A member being caught up and promoted is not seated until
+  /// its joint change commits.
+  pub voters: u64,
+  /// Whether a joint change of the voter set is in flight (Raft §6).
+  pub joint: bool,
 }
 
 /// One shard's part of the daemon's status.
@@ -881,6 +887,9 @@ pub struct TakeoverReport {
   pub neighbourhood_generation: u64,
   /// The retirements the configuration keeps, oldest first.
   pub retirements: Vec<RetirementReport>,
+  /// How many members the regional configuration holds: the council's committed membership, where the fleet
+  /// block's `members` is the ones this node's detector holds alive.
+  pub members: u64,
 }
 
 /// One retirement the configuration keeps (§4.8 "Promotion and takeover").

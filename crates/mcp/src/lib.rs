@@ -1233,6 +1233,7 @@ fn takeover_json(t: &slates_client::TakeoverReport) -> Value {
       "confirmed": r.confirmed,
       "unconfirmed": r.unconfirmed,
     })).collect::<Vec<_>>(),
+    "members": t.members,
   })
 }
 
@@ -1259,6 +1260,8 @@ fn group_json(g: &GroupReport) -> Value {
     "refused_leased": g.refused_leased,
     "refused_term": g.refused_term,
     "refused_log": g.refused_log,
+    "voters": g.voters,
+    "joint": g.joint,
   })
 }
 

@@ -778,12 +778,29 @@ struct View {
   /// The retirements its configuration still keeps: a takeover whose survivors have not all confirmed their
   /// share (§4.8 "Promotion and takeover").
   retirements: u64,
+  /// How many members its configuration holds — the council's committed membership, where `members` is the
+  /// ones its detector holds alive (zero from an image that predates the count).
+  configuration_members: u64,
+  /// The council's voters seated in the configuration in force, and whether a joint change of them is in
+  /// flight (zero and false from an image that predates them).
+  council_voters: u64,
+  council_joint: bool,
 }
 
 impl View {
   /// Whether this node's neighbourhood is settled: no change of it in flight.
   fn settled(&self) -> bool {
     self.settled_generation == self.neighbourhood_generation
+  }
+
+  /// Whether the council this node sees has every seat of a region of `n` members filled — `min(2f + 1, n)`
+  /// voters seated, no joint change in flight — so it tolerates the `f` losses its fault tolerance names. A
+  /// region's members are admitted before they are caught up and promoted to voters (thesis §4.2.1), so for a
+  /// while after formation its council has fewer: the burst step's third trial of 2026-09-29 cut the bootstrap
+  /// pod, the one voter seated then, and the council could never elect again.
+  fn council_seated(&self, n: u64) -> bool {
+    let seats = n.min(self.f.saturating_mul(2).saturating_add(1));
+    self.council_voters == seats && !self.council_joint
   }
 }
 
@@ -971,13 +988,21 @@ impl View {
         .and_then(|takeover| takeover.get("retirements"))
         .and_then(serde_json::Value::as_array)
         .map_or(0, |kept| u64::try_from(kept.len()).unwrap_or(u64::MAX)),
+      configuration_members: fleet
+        .get("takeover")
+        .map_or(0, |takeover| u64_of(takeover, "members")),
+      council_voters: u64_of(council, "voters"),
+      council_joint: council
+        .get("joint")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false),
     })
   }
 
   /// One line of the view, for the record.
   fn line(&self) -> String {
     format!(
-      "{}: host={} f={} members={:?} peers_probed={} leads={} base={} span={} tail_ns={} spread_ns={} samples={} term={} priority_ns={}±{} rank={} lease={} pre_elections={} elections={} resolve_refused={} version={} settled={}/{} retirements={}",
+      "{}: host={} f={} members={:?} peers_probed={} leads={} base={} span={} tail_ns={} spread_ns={} samples={} term={} priority_ns={}±{} rank={} lease={} pre_elections={} elections={} resolve_refused={} version={} configuration_members={} voters={} joint={} settled={}/{} retirements={}",
       self.pod,
       self.host,
       self.f,
@@ -998,6 +1023,9 @@ impl View {
       self.elections,
       self.resolve_refused,
       self.configuration_version,
+      self.configuration_members,
+      self.council_voters,
+      self.council_joint,
       self.settled_generation,
       self.neighbourhood_generation,
       self.retirements
@@ -2211,6 +2239,13 @@ impl Lane {
         |views| Self::settled_at(BURST_REPLICAS, views),
       )?;
       let settled: Vec<View> = settled.into_iter().flatten().collect();
+      eprintln!(
+        "kind: the burst fleet settled every neighbourhood {:.1} s after it formed:",
+        took.as_secs_f64()
+      );
+      for view in &settled {
+        eprintln!("kind:   {}", view.line());
+      }
       let burst = self.cut_voters(trial, &settled, took, &custom)?;
       eprintln!("kind: {}", burst.line());
       measured.push(burst);
@@ -2218,15 +2253,52 @@ impl Lane {
     self.report_bursts(&measured)
   }
 
-  /// The fleet of `n` pods has formed ([`Lane::formed_at`]) and settled: every neighbourhood settled, no
-  /// retirement kept, and every pod at one configuration version.
+  /// The fleet of `n` pods has formed ([`Lane::formed_at`]: its detectors hold each other alive) and its
+  /// configuration settled: the council has committed exactly `n` members, every neighbourhood is settled, no
+  /// retirement is kept, and every pod stands at one configuration version. A pod the council has not
+  /// admitted yet holds no configuration, so its neighbourhood versions read zero and equal — the committed
+  /// membership, not the versions, is what says the admissions are done.
   fn settled_at(n: u64, views: &[Option<View>]) -> bool {
     let all: Vec<&View> = views.iter().flatten().collect();
     let version = all.first().map(|view| view.configuration_version);
     Self::formed_at(n, views)
       && all.iter().all(|view| {
-        view.settled() && view.retirements == 0 && Some(view.configuration_version) == version
+        view.configuration_members == n
+          && view.council_seated(n)
+          && view.settled()
+          && view.retirements == 0
+          && Some(view.configuration_version) == version
       })
+  }
+
+  /// The survivors of a burst have resolved it, judged by the council's configuration alone: every one answers,
+  /// holds exactly `n` committed members at one version with every neighbourhood settled and no retirement
+  /// kept, and one of them leads. Not by their detectors ([`Lane::formed_at`]): after the council retired a
+  /// cut voter's learned id, the survivors' detectors held its manifest seed id alive again (the first run,
+  /// 2026-09-29: five alive members on each survivor, two of them the cut pods' seeds, 300 s after the
+  /// council had resolved at version 23), so a detector-view condition never held.
+  fn resolved_at(n: u64, views: &[Option<View>]) -> bool {
+    let all: Vec<&View> = views.iter().flatten().collect();
+    let version = all.first().map(|view| view.configuration_version);
+    all.len() == views.len()
+      && all.iter().filter(|view| view.leads).count() == 1
+      && all.iter().all(|view| {
+        view.configuration_members == n
+          && view.settled()
+          && view.retirements == 0
+          && Some(view.configuration_version) == version
+      })
+  }
+
+  /// The survivors of a burst hold a configuration of exactly `n` members — the council has committed every
+  /// cut voter's retirement — at one version.
+  fn retired_to(n: u64, views: &[Option<View>]) -> bool {
+    let all: Vec<&View> = views.iter().flatten().collect();
+    let version = all.first().map(|view| view.configuration_version);
+    all.len() == views.len()
+      && all
+        .iter()
+        .all(|view| view.configuration_members == n && Some(view.configuration_version) == version)
   }
 
   /// The pods a burst cuts from `settled`: the council's leader, then the next voters by descending ordinal
@@ -2299,6 +2371,7 @@ impl Lane {
       .fold(0, u64::saturating_add);
     let (anchor, anchor_uptime) = self.vm_clock()?;
     let first = format!("burst-{trial}-0");
+    let cutting = Instant::now();
     for (index, pod) in cut.iter().enumerate() {
       self.in_pod_network(
         pod,
@@ -2307,6 +2380,23 @@ impl Lane {
         "tc qdisc replace dev eth0 root netem loss 100% && cut -d' ' -f1 /proc/uptime",
       )?;
     }
+    let (_, led_at) = self.burst_stage(&survivors, cutting, "a survivor led", |views| {
+      views.iter().flatten().any(|view| view.leads)
+    })?;
+    let (_, retired_at) = self.burst_stage(
+      &survivors,
+      cutting,
+      "the council retired the cut voters",
+      |views| Self::retired_to(remaining, views),
+    )?;
+    let (resolved, resolved_at) = self.burst_stage(
+      &survivors,
+      cutting,
+      "the survivors resolved the burst",
+      |views| Self::resolved_at(remaining, views),
+    )?;
+    // The cut's instant on the VM's clock, read once its container has certainly run: `kubectl debug
+    // --attach=false` returns before the container's command does, so a read at once found its log empty.
     let lost = cut
       .first()
       .ok_or_else(|| Failure("kind: a burst cut no pod".to_owned()))?;
@@ -2319,21 +2409,6 @@ impl Lane {
       )));
     }
     let cut_at = anchor + Duration::from_secs_f64(offset);
-    let (_, led_at) = self.burst_stage(&survivors, cut_at, "a survivor led", |views| {
-      views.iter().flatten().any(|view| view.leads)
-    })?;
-    let (_, retired_at) = self.burst_stage(
-      &survivors,
-      cut_at,
-      "the survivors retired the cut voters",
-      |views| Self::formed_at(remaining, views),
-    )?;
-    let (resolved, resolved_at) = self.burst_stage(
-      &survivors,
-      cut_at,
-      "the survivors resolved the burst",
-      |views| Self::settled_at(remaining, views),
-    )?;
     let elections_after: u64 = resolved
       .iter()
       .map(|view| view.elections)
@@ -2508,11 +2583,12 @@ mod tests {
         "members": [1, 2, 3, 4, 5],
         "peers_probed": 4,
         "configuration_version": version,
-        "council": { "leads": leads },
+        "council": { "leads": leads, "voters": 5, "joint": false },
         "takeover": {
           "settled_generation": settled,
           "neighbourhood_generation": current,
           "retirements": kept,
+          "members": if settled == 0 { 1 } else { 5 },
         },
       },
       "shards": [],
@@ -2552,6 +2628,10 @@ mod tests {
     assert!(
       !Lane::settled_at(5, &settled(8, (6, 6), 0)),
       "a pod a version behind"
+    );
+    assert!(
+      !Lane::settled_at(5, &settled(9, (0, 0), 0)),
+      "a pod the council has not admitted: its versions read zero and equal, its configuration holds one member"
     );
   }
 

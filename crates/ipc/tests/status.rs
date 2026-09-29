@@ -30,6 +30,8 @@ fn report() -> ReplyBody {
     refused_leased: 73,
     refused_term: 79,
     refused_log: 83,
+    voters: 89,
+    joint: true,
   };
   ReplyBody::DaemonStatus {
     report: Box::new(DaemonReport {
@@ -65,6 +67,7 @@ fn report() -> ReplyBody {
             confirmed: vec![29],
             unconfirmed: vec![67],
           }],
+          members: 71,
         },
       },
     }),

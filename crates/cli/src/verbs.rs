@@ -1412,7 +1412,7 @@ fn telemetry_text(batch: &TelemetryReport) -> String {
 /// election state — term, priority, rank, lease and the campaigns it began.
 fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
   format!(
-    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\nfleet_{group}_term: {}\nfleet_{group}_priority_ns: {}\nfleet_{group}_priority_spread_ns: {}\nfleet_{group}_rank: {}\nfleet_{group}_leader_lease: {}\nfleet_{group}_pre_elections: {}\nfleet_{group}_elections: {}\nfleet_{group}_pre_votes_granted: {}\nfleet_{group}_pre_votes_refused: {}\nfleet_{group}_refused_role: {}\nfleet_{group}_refused_leased: {}\nfleet_{group}_refused_term: {}\nfleet_{group}_refused_log: {}\n",
+    "fleet_{group}_leads: {}\nfleet_{group}_base_periods: {}\nfleet_{group}_span_periods: {}\nfleet_{group}_rtt_tail_ns: {}\nfleet_{group}_rtt_spread_ns: {}\nfleet_{group}_samples: {}\nfleet_{group}_term: {}\nfleet_{group}_priority_ns: {}\nfleet_{group}_priority_spread_ns: {}\nfleet_{group}_rank: {}\nfleet_{group}_leader_lease: {}\nfleet_{group}_pre_elections: {}\nfleet_{group}_elections: {}\nfleet_{group}_pre_votes_granted: {}\nfleet_{group}_pre_votes_refused: {}\nfleet_{group}_refused_role: {}\nfleet_{group}_refused_leased: {}\nfleet_{group}_refused_term: {}\nfleet_{group}_refused_log: {}\nfleet_{group}_voters: {}\nfleet_{group}_joint: {}\n",
     report.leads,
     report.base_periods,
     report.span_periods,
@@ -1431,7 +1431,9 @@ fn group_text(group: &str, report: &slates_client::GroupReport) -> String {
     report.refused_role,
     report.refused_leased,
     report.refused_term,
-    report.refused_log
+    report.refused_log,
+    report.voters,
+    report.joint
   )
 }
 
@@ -1447,8 +1449,8 @@ fn takeover_text(report: &slates_client::TakeoverReport) -> String {
       .join(" ")
   };
   let mut out = format!(
-    "fleet_settled_generation: {}\nfleet_neighbourhood_generation: {}\n",
-    report.settled_generation, report.neighbourhood_generation
+    "fleet_configuration_members: {}\nfleet_settled_generation: {}\nfleet_neighbourhood_generation: {}\n",
+    report.members, report.settled_generation, report.neighbourhood_generation
   );
   for retirement in &report.retirements {
     out.push_str(&format!(

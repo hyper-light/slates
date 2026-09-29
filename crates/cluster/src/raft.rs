@@ -459,6 +459,11 @@ pub struct ElectionView {
   pub elections: u64,
   /// The pre-vote outcomes it has seen.
   pub pre_votes: PreVoteTally,
+  /// The voters seated in the configuration in force: its base set (thesis §4.3). While a joint change is in
+  /// flight (`joint`), the set being moved to is not counted here.
+  pub seated: u64,
+  /// Whether a joint change of the voter set is in flight (Raft §6): its new set is not seated until it commits.
+  pub joint: bool,
 }
 
 /// A slot in a node's **window** above its log (`docs/wip/research/consensus-enhancements.md` §4): the
@@ -2749,6 +2754,7 @@ impl RaftNode {
 
   /// This node's election state, for an observer ([`ElectionView`]).
   pub fn election_view(&self) -> ElectionView {
+    let config = self.effective_config();
     ElectionView {
       term: self.current_term,
       priority: self.own_priority,
@@ -2756,6 +2762,8 @@ impl RaftNode {
       pre_elections: self.pre_elections,
       elections: self.elections,
       pre_votes: self.pre_vote_tally,
+      seated: u64::try_from(config.voters.len()).unwrap_or(u64::MAX),
+      joint: config.joint.is_some(),
     }
   }
 

@@ -619,6 +619,7 @@ fn takeover_report(state: &ShardState) -> slates_ipc::protocol::TakeoverReport {
       .get(&local)
       .map_or(0, |neighbourhood| neighbourhood.generation),
     retirements,
+    members: u64::try_from(regional.members.len()).unwrap_or(u64::MAX),
   }
 }
 
@@ -1953,6 +1954,8 @@ fn group_report(
     refused_leased: view.pre_votes.refused_leased,
     refused_term: view.pre_votes.refused_term,
     refused_log: view.pre_votes.refused_log,
+    voters: view.seated,
+    joint: view.joint,
   }
 }
 

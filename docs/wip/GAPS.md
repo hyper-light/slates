@@ -1916,6 +1916,46 @@ Built last: the takeover itself (step 3 of 3), replacing the per-object path.
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
 stalled takeover shows in any node's status.
 
+### 2026-09-29: KIND burst — the council under a burst of reconfiguration; a council seats fewer voters than its `f` for a while after formation; retired peers' seed ids held alive — open
+
+**Built.** `cargo xtask kind burst` (docs/wip/kind-lane.md, Piece 7) runs the consensus goal's owed KIND
+measurement of the groups under a burst.
+- Each trial installs five replicas at `f = 2` under the `wan` profile and times formation until every
+  neighbourhood is settled.
+- It then cuts the council's leader and one more voter together, from ephemeral `NET_ADMIN` containers.
+- The survivors are timed to a new leader, to both retirements committed, and to the burst resolved: every
+  neighbourhood settled, no retirement kept, one version.
+- Status now reports what the lane needed: the council's committed member count
+  (`fleet_configuration_members`), and each group's seated voters and whether a joint change is in flight
+  (`fleet_council_voters`, `fleet_council_joint`).
+
+**Measured** (three fresh fleets; kind-lane.md Piece 7). After the cut, a leader after 5.16–15.35 s, both
+retirements after 16.42–40.91 s, and the burst resolved after 28.48–63.28 s, in 11–14 commits with one
+election each. Medians: led 8.76 s, retired 24.66 s, resolved 29.90 s.
+
+**Decided — the fast track stays closed in the groups.** Members now originate proposals: they report
+`Settle` and `Confirm`, which the leader proposes. The fast track saves a far proposer up to one hop (§3.7's
+crossover). But the reports' phase, from retired to resolved, took 5.2 to 22.4 s, and it refuses no client
+meanwhile. The track would also bring its most complex path into a group whose bursts are mostly membership
+changes, which it refuses. This closes the fast-track entry's owed "vote routing in the fleet": no group has
+a latency-critical proposer away from its leader.
+
+**Found — a council seats fewer voters than its `f` for a while after formation.** The first trials cut a
+fleet whose five members were all admitted and settled 2.2 s after formation. But the council's committed
+voter set was still the bootstrap alone: the promotions (catch-up rounds, then the joint change) had not
+committed, and `slates-1`'s plan read `voters: [slates-0]`. The cut took `slates-0`, and the council could
+never elect again, the documented lost-quorum case. The lane now waits for the seats before a cut. Owed: the
+seating time measured, and whether serving at `f = 2` before the council can tolerate `f` losses should be
+visible to clients.
+
+**Open — retired peers' seed ids held alive.** After the council retired both cut voters, every survivor's
+detector listed five alive members, 300 s on and with no pod restarted: itself, the other two survivors, and
+the two cut pods' *manifest seed* ids (`member_id(anchor, 0)`). The seeds had been folded dead when each
+pod's fresh id was learned at formation, so something revived them after the retirement. Status reports them
+as members held alive, and a detector-view check never settled. Reading the probe task's idle path and the
+learn-on-contact path did not find the reviver; owed: a logged transition of any member to alive, with its
+source, and a reproduction.
+
 ### 2026-09-29: the owner lease was voided by other hosts' configuration changes — fixed; the lease counted the settled cohort only — fixed; settled-neighbourhood hosts left direct contact — fixed
 
 The open lease refusals below had one cause:

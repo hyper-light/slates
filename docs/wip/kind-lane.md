@@ -325,6 +325,60 @@ no one.
 - It also won one unlogged trial, whose central candidate's 3 pre-elections drew no reply.
 The cause is owed (GAPS).
 
+## Piece 7 — burst: the council under a burst of reconfiguration (built 2026-09-29; run under `burst`)
+
+`cargo xtask kind burst [--trials N]` measures the groups under a burst, the consensus goal's owed KIND item.
+Pipelining, priority elections, pre-vote and the council's reconfiguration are all on the path.
+
+- **The profile.** Five replicas at `f = 2`, so the council seats five voters. The `wan` profile shapes pods 0
+  and 1 (80 ms ± 20 ms egress), and pods 2–4 are unshaped.
+- **Formation.** A trial waits until the fleet is formed and its configuration is settled:
+  - the council has committed all five members and seated five voters, with no joint change in flight;
+  - every neighbourhood is settled and no retirement is kept;
+  - every pod stands at one version.
+- **The burst.** The council's leader and the next central voter are cut together (100 % egress loss, from
+  ephemeral `NET_ADMIN` containers), `f` voters in all. The survivors must:
+  - elect;
+  - retire both (a death confirmation and a voter change each);
+  - commit each retirement's takeover, every survivor's confirmation of its share, and every settlement of
+    a neighbourhood the retirements moved.
+- **Timing.** From the cut, on the VM's clock as succession times it, to:
+  - a survivor leading;
+  - the council's committed membership down to the three survivors;
+  - the burst resolved: the three settled, no retirement kept, one version, one leader.
+
+**Measured 2026-09-29** (this box, as Piece 6; image `slates:burst-voters`, the tree after `16c847b`; three
+fresh fleets):
+
+| Trial | Settled after formation | Cut | Led | Retired | Resolved | Commits |
+|---|---|---|---|---|---|---|
+| 0 | 19.9 s | leader `slates-4`, `slates-3` | 15.35 s | 40.91 s | 63.28 s | 13 |
+| 1 | 0.6 s | leader `slates-0`, `slates-4` | 5.16 s | 24.66 s | 29.90 s | 14 |
+| 2 | 13.9 s | leader `slates-4`, `slates-3` | 8.76 s | 16.42 s | 28.48 s | 11 |
+
+Medians: led 8.76 s, retired 24.66 s, resolved 29.90 s after the cut; one election each.
+
+**Found by it, before it could measure.**
+- **The detector view is not the council's.** The first criterion for "resolved" used the lane's formation
+  check, which reads each node's detector. After the council had retired both cut voters and resolved at
+  version 23, every survivor's detector still held five members alive, the two extra being the cut pods'
+  manifest seed ids. The step judges by the council's committed membership now. The revived seeds are open
+  (GAPS, 2026-09-29).
+- **A council seats fewer voters than its `f` for a while after formation.** One trial cut a fleet whose five
+  members were all admitted and settled 2.2 s after formation. Its council's committed voters were the
+  bootstrap alone: the promotions, catch-up rounds and then the joint change, had not committed. The cut took
+  that voter, and the council could never elect again. Status now reports each group's seated voters and
+  whether a joint change is in flight (`fleet_council_voters`, `fleet_council_joint`). The step waits for five
+  seats before it cuts.
+
+**Decided with it — the fast track stays closed.** Since the council settles neighbourhoods and confirms
+takeovers, members originate proposals: they report to the leader, which proposes. The fast track pays off
+for a proposer far from its leader (research record §3.7: up to 37 % sooner below 4 % loss). But the phase
+those reports make up, from retired to resolved, took 5.2 to 22.4 s here, and its cost to clients is nil:
+joint writes go on, and nothing is refused meanwhile. The fast track would save at most one member-to-leader
+hop per report, and it would bring its most complex path into a group whose bursts are mostly membership
+changes, which the fast track refuses.
+
 ## The one gap left — a whole-pod restart does not rejoin (open; not the cause first recorded)
 
 When the owner's pod is deleted, the StatefulSet recreates it under the same name at a new IP. The
