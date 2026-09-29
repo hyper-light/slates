@@ -3050,17 +3050,14 @@ mod tests {
         );
         state.root = RootGroup::new(local, vec![RegionId(0)], voters);
         let (raft, base) = state.council.join_state().unwrap();
-        state.council_group = Some(crate::consensus::genesis(
+        state.council_group = crate::consensus::GroupIdentity::created(
           false,
           &raft,
-          &encode_regional_configuration(&base),
-        ));
+          encode_regional_configuration(&base),
+        );
         let (raft, base) = state.root.join_state().unwrap();
-        state.root_group = Some(crate::consensus::genesis(
-          true,
-          &raft,
-          &encode_root_configuration(&base),
-        ));
+        state.root_group =
+          crate::consensus::GroupIdentity::created(true, &raft, encode_root_configuration(&base));
         [
           state.council.answer(request(HostId(1))).unwrap(),
           state.root.answer(request(HostId(1))).unwrap(),

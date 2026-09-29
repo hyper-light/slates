@@ -21,9 +21,14 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use slates_cluster::raft::{RaftNode, TimeoutNow};
-use slates_cluster::raft_wire::RaftMessage;
+use slates_cluster::raft_wire::{RaftMessage, append_batch_bytes};
 use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt};
 use slates_db::register::HostId;
+use slates_transport::endpoint::MAX_PACKET_PAYLOAD;
+
+/// Format: the group envelope the council's messages ride in (`slates_server::consensus`): a 32-byte group
+/// id and the message's 4-byte length.
+const ENVELOPE_BYTES: usize = 32 + 4;
 
 /// Shape: the heartbeat period every node ticks at — the daemon's `HEARTBEAT_NS` (100 ms), mirrored so a
 /// period here is a period there.
@@ -514,9 +519,21 @@ impl Sim {
 
   fn lead(&mut self, id: HostId, timing: &ElectionTiming) {
     self.propose_due(id);
+    // The council drive's budget: a fresh fleet session's first credit, less the append header and the
+    // group envelope (a 32-byte group id and a 4-byte length).
+    let budget = append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES);
     for peer in self.others(id) {
-      if let Some(append) = self.nodes[&id].raft.replicate_to(peer) {
-        self.send(id, peer, RaftMessage::AppendEntries(append), self.now);
+      let raft = &self.nodes[&id].raft;
+      let message = raft
+        .replicate_to(peer, budget)
+        .map(RaftMessage::AppendEntries)
+        .or_else(|| {
+          raft
+            .install_snapshot_for(peer)
+            .map(RaftMessage::InstallSnapshot)
+        });
+      if let Some(message) = message {
+        self.send(id, peer, message, self.now);
       }
     }
     let node = self.nodes.get_mut(&id).unwrap();
@@ -606,36 +623,7 @@ impl Sim {
     let was_leader = self.nodes[&to].raft.is_leader();
     let answers_a_request = matches!(flight.message_kind(), Kind::Reply);
     let node = self.nodes.get_mut(&to).unwrap();
-    let mut reply = None;
-    let mut follow_on = Vec::new();
-    match flight.message {
-      RaftMessage::PreVote(pre) => {
-        reply = Some(RaftMessage::PreVoteReply(node.raft.on_pre_vote(pre)))
-      }
-      RaftMessage::RequestVote(vote) => {
-        let answer = node.raft.on_request_vote(vote);
-        if answer.granted {
-          node.contact += 1;
-        }
-        reply = Some(RaftMessage::VoteReply(answer));
-      }
-      RaftMessage::AppendEntries(append) => {
-        let append_term = append.term;
-        let answer = node.raft.on_append_entries(append);
-        if append_term >= answer.term {
-          node.contact += 1;
-        }
-        reply = Some(RaftMessage::AppendReply(answer));
-      }
-      RaftMessage::TimeoutNow(invitation) => node.invitation = Some(invitation),
-      RaftMessage::PreVoteReply(answer) => {
-        if let Some(votes) = node.raft.on_pre_vote_reply(answer) {
-          follow_on = votes.into_iter().map(RaftMessage::RequestVote).collect();
-        }
-      }
-      RaftMessage::VoteReply(answer) => node.raft.on_vote_reply(answer),
-      RaftMessage::AppendReply(answer) => node.raft.on_append_reply(answer),
-    }
+    let (reply, follow_on) = answer(node, flight.message);
     // A reply's round trip samples the path to the peer that answered (the daemon samples the same round
     // trips its election timing derives from).
     if flight.request_sent_ns > 0 && answers_a_request {
@@ -746,6 +734,65 @@ impl Sim {
   }
 }
 
+/// `node` handles one delivered `message` as the council's serve and fold paths do: the reply a request
+/// earns, and the vote requests a won pre-election yields. A leader's append or snapshot, and a vote this
+/// node granted, count as contact (the timer rules of Raft Figure 2).
+fn answer(node: &mut Node, message: RaftMessage) -> (Option<RaftMessage>, Vec<RaftMessage>) {
+  match message {
+    RaftMessage::PreVote(pre) => (
+      Some(RaftMessage::PreVoteReply(node.raft.on_pre_vote(pre))),
+      Vec::new(),
+    ),
+    RaftMessage::RequestVote(vote) => {
+      let answer = node.raft.on_request_vote(vote);
+      if answer.granted {
+        node.contact += 1;
+      }
+      (Some(RaftMessage::VoteReply(answer)), Vec::new())
+    }
+    RaftMessage::AppendEntries(append) => {
+      let append_term = append.term;
+      let answer = node.raft.on_append_entries(append);
+      if append_term >= answer.term {
+        node.contact += 1;
+      }
+      (Some(RaftMessage::AppendReply(answer)), Vec::new())
+    }
+    RaftMessage::InstallSnapshot(snapshot) => {
+      let snapshot_term = snapshot.term;
+      let answer = node.raft.on_install_snapshot(snapshot);
+      if snapshot_term >= answer.term {
+        node.contact += 1;
+      }
+      (Some(RaftMessage::InstallSnapshotReply(answer)), Vec::new())
+    }
+    RaftMessage::TimeoutNow(invitation) => {
+      node.invitation = Some(invitation);
+      (None, Vec::new())
+    }
+    RaftMessage::PreVoteReply(answer) => (
+      None,
+      node
+        .raft
+        .on_pre_vote_reply(answer)
+        .map(|votes| votes.into_iter().map(RaftMessage::RequestVote).collect())
+        .unwrap_or_default(),
+    ),
+    RaftMessage::VoteReply(answer) => {
+      node.raft.on_vote_reply(answer);
+      (None, Vec::new())
+    }
+    RaftMessage::AppendReply(answer) => {
+      node.raft.on_append_reply(answer);
+      (None, Vec::new())
+    }
+    RaftMessage::InstallSnapshotReply(answer) => {
+      node.raft.on_install_snapshot_reply(answer);
+      (None, Vec::new())
+    }
+  }
+}
+
 /// A message's kind: a request expects a reply; a reply answers one; an invitation expects none.
 enum Kind {
   Request,
@@ -755,9 +802,10 @@ enum Kind {
 impl Flight {
   fn message_kind(&self) -> Kind {
     match self.message {
-      RaftMessage::PreVoteReply(_) | RaftMessage::VoteReply(_) | RaftMessage::AppendReply(_) => {
-        Kind::Reply
-      }
+      RaftMessage::PreVoteReply(_)
+      | RaftMessage::VoteReply(_)
+      | RaftMessage::AppendReply(_)
+      | RaftMessage::InstallSnapshotReply(_) => Kind::Reply,
       _ => Kind::Request,
     }
   }

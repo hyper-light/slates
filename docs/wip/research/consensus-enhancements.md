@@ -237,3 +237,32 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
   - an isolated leader is succeeded (cluster 1.4–1.6 s; multi-region 3.0–3.6 s) and its return deposes nobody;
   - it found a liveness bug in the production timer: correlated jitter split the vote for up to 19 s (bug record
     `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`); fixed by an independent draw.
+- **Slice 5 (2026-09-28): compaction, bounded appends and fast backup** — the base learners need. Both
+  groups compact by the thesis's size rule (§5.1.2 "Servers take a snapshot once the size of the log
+  exceeds the size of the previous snapshot times a configurable expansion factor"; factor one, since the
+  cost traded is the retained publication, not disk bandwidth). The shared rules live in `crates/cluster/src/fold.rs`:
+  replay without copying the log, the compaction rule, the snapshot install that decodes the state first,
+  and the snapshot-aware join and restore. Appends carry at most `raft_wire::append_batch_bytes`, and a
+  refusal carries the §5.3 conflict hint. `InstallSnapshot` and its reply ride the wire (tags 8 and 9), and
+  the groups' identity is checked against a retained origin.
+  - Found on the way, latent until compaction ran, each with a test failing on `HEAD` (five-by-five):
+    - a late append below a snapshot pushed compacted entries onto the log (5 → 7 entries);
+    - one refusal per entry (20 to find an empty follower);
+    - late replies moved progress back (10 → 3);
+    - the snapshot reply credited the leader's own later snapshot.
+
+    See `docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`.
+  - Measured and rejected: compacting the moment a majority commits. The follower one round behind was sent
+    the whole snapshot at every compaction, and the third voter of three never compacted itself. The leader
+    now waits for its followers while the log is within twice the snapshot.
+  - Proven:
+    - explorer at full scale — 32,954 / 38,192 compactions, 2,917 / 2,405 snapshots installed, 1,419 / 978
+      corrupted snapshots declined, 20,616 / 34,839 bounded batches, 15,309 / 17,072 conflict hints — with no
+      violation;
+    - the council folds exactly an oracle's configuration over 120 changes, and a voter left behind the
+      leader's snapshot installs it and converges (the root group likewise);
+    - a compacted council restores under its group id (the old identity check refused it: "retained council
+      genesis differs");
+    - fleet suite 53/53, CLI process suite 13/13.
+  - Measured: 4,000 changes cost 25.5 µs per change before and 0.6 µs after; retained bytes 90,083 before and
+    45,607 after (`docs/wip/BENCHMARKS.md`).

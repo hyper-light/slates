@@ -1839,7 +1839,35 @@ reused by the next pipe 1,999 times in 2,000 (measured), so the fix needs a stro
 [Bug record](../bugs/2026-09-28-the-delivery-test-read-a-reused-handle-value-as-the-decoy.md).
 
 
-### 2026-09-28: open — the consensus groups' logs are never compacted, and an append carries the whole lag
+### 2026-09-28: the consensus groups' logs are never compacted, and an append carries the whole lag — fixed
+
+Fixed in the next change (`docs/wip/research/consensus-enhancements.md`, slice 5; measurements in
+`docs/wip/BENCHMARKS.md`). What was built:
+
+- Both groups compact by the thesis's size rule (§5.1.2, expansion factor one; `crates/cluster/src/fold.rs`),
+  the snapshot carrying the folded configuration. A leader waits for its followers while the log is within
+  twice the snapshot.
+- Appends carry at most a fresh session's first credit (`raft_wire::append_batch_bytes`).
+- Refusals carry the §5.3 conflict hint.
+- The snapshot and its reply ride the wire (tags 8 and 9), and a follower behind the leader's snapshot
+  installs it.
+- The groups' identity is checked against a retained origin, since compaction moves the bases the genesis was
+  computed from.
+- Replay no longer copies the log on every message: 25.5 µs per change at 4,000 changes before, 0.6 µs after.
+
+Latent core defects this made reachable, fixed in the same change:
+[bug record](../bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md).
+
+Sibling observations (open, for Ada):
+
+- The regional configuration's `epochs` map keeps every host ever admitted — retirement does not remove its
+  entry — and every daemon start admits a fresh member id. So the configuration, and with it every snapshot,
+  grows with the fleet's restarts.
+- The transport endpoint buffers an arriving request or reply whole, with no size bound
+  (`Endpoint::drain`, `crates/transport/src/endpoint.rs`). A peer is authenticated, but the buffer has no
+  derived cap.
+
+The original entry:
 
 Found while designing learner catch-up (`docs/wip/research/consensus-enhancements.md` §3.3). The council and
 root group never call the core's `compact` ("These group wrappers never compact their logs",

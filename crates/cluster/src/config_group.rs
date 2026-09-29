@@ -40,10 +40,20 @@ use std::mem::size_of;
 
 use slates_db::register::{DomainId, HostId, Quorum, RegionalConfiguration};
 
-use crate::raft::{
-  AppendEntries, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal,
-};
-use crate::raft_wire::RaftMessage;
+use crate::fold::{Fold, Snapshotted};
+use crate::raft::{RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal};
+use crate::raft_wire::{RaftMessage, decode_regional_configuration, encode_regional_configuration};
+
+/// A regional configuration rides a council snapshot as the bytes a learner's fetch ships.
+impl Snapshotted for RegionalConfiguration {
+  fn encode(&self) -> Vec<u8> {
+    encode_regional_configuration(self)
+  }
+
+  fn decode(bytes: &[u8]) -> Option<Self> {
+    decode_regional_configuration(bytes).ok()
+  }
+}
 
 /// A configuration change as it rides the Raft log — the command a committed [`LogEntry`](crate::raft::LogEntry)
 /// carries, decoded and applied to the [`Configuration`] in commit order so every voter reaches the same
@@ -234,16 +244,16 @@ pub fn council_voters(
 /// transport carries.
 pub struct RegionalCouncil {
   raft: RaftNode,
-  configuration: RegionalConfiguration,
+  /// The regional configuration as the fold of the committed log over the state at the log's snapshot
+  /// boundary (the formed configuration before the first compaction), compacted by the thesis's size rule
+  /// ([`crate::fold`]). A fetched learner view stays in `learned`; replay advances the fold independently
+  /// and applies each epoch change once.
+  fold: Fold<RegionalConfiguration>,
   /// A newer read view fetched while a learner. It is never the input to Raft replay:
   /// applying its commands again would repeat epochs or home changes (§4.8, AUD-07).
   /// A changed learner view must survive before it is published to serving shards.
   view_pending: bool,
   learned: Option<RegionalConfiguration>,
-  /// The original common base of the committed Raft fold. A fetched learner view stays in
-  /// `learned`; replay advances `configuration` independently and applies each epoch change once.
-  base: RegionalConfiguration,
-  applied: u64,
   scatter: u64,
   /// Monotone count of the events that defer this node's own election — a leader's append answered here, or a
   /// vote this node granted a candidate (Raft Figure 2's two follower timer-resets). The drive loop's election
@@ -270,8 +280,9 @@ impl RegionalCouncil {
       scatter,
       has_mirror,
     );
-    group.configuration.version = 0;
-    group.base.version = 0;
+    let mut base = group.fold.base().clone();
+    base.version = 0;
+    group.fold = Fold::new(base);
     group
   }
 
@@ -285,7 +296,7 @@ impl RegionalCouncil {
   pub fn join_state(&self) -> Option<(SavedRaft, RegionalConfiguration)> {
     self
       .initialized()
-      .then(|| (self.raft.saved(), self.base.clone()))
+      .then(|| (self.raft.saved(), self.fold.base().clone()))
   }
 
   /// Creates the first voter of an explicitly authorized replacement group (§4.8).
@@ -301,9 +312,7 @@ impl RegionalCouncil {
       scatter,
       configuration.has_mirror,
     );
-    group.base = configuration.clone();
-    group.configuration = configuration;
-    group.applied = 0;
+    group.fold = Fold::new(configuration);
     group.apply_committed();
     group
   }
@@ -318,14 +327,10 @@ impl RegionalCouncil {
     if saved.id != self.raft.id() {
       return Err(RaftRecoveryError::ReusedIdentity);
     }
-    if saved.snapshot_index != 0 {
-      return Err(RaftRecoveryError::InvalidSnapshot);
-    }
+    let fold = Fold::for_saved(&saved, base)?;
     self.raft = RaftNode::restore(saved)?;
-    self.configuration = base.clone();
-    self.base = base;
+    self.fold = fold;
     self.learned = None;
-    self.applied = 0;
     self.apply_committed();
     if self.raft.all_voters() == [self.raft.id()] {
       self.election_timeout();
@@ -367,19 +372,15 @@ impl RegionalCouncil {
     if saved.id == self.raft.id() {
       return Err(RaftRecoveryError::ReusedIdentity);
     }
-    // These group wrappers never compact their logs. Accepting a snapshot without its matching
-    // state-machine base would fold a different history; reject it before installing anything.
-    if saved.snapshot_index != 0 {
-      return Err(RaftRecoveryError::InvalidSnapshot);
-    }
+    // A compacted donor's base is its snapshot's state; a snapshot paired with another base would fold a
+    // different history, so it is refused before anything is installed.
+    let fold = Fold::for_saved(&saved, base)?;
     saved.id = self.raft.id();
     saved.voted_for = None;
     let raft = RaftNode::restore(saved)?;
     self.raft = raft;
-    self.configuration = base.clone();
+    self.fold = fold;
     self.learned = None;
-    self.base = base;
-    self.applied = 0;
     self.apply_committed();
     Ok(())
   }
@@ -409,11 +410,9 @@ impl RegionalCouncil {
       RegionalConfiguration::formed(members, quorum, domains, scatter, has_mirror);
     let mut group = RegionalCouncil {
       raft,
-      base: configuration.clone(),
-      configuration,
+      fold: Fold::new(configuration),
       learned: None,
       view_pending: false,
-      applied: 0,
       scatter,
       leader_contact: 0,
       invitation: None,
@@ -425,7 +424,23 @@ impl RegionalCouncil {
   /// The regional configuration the council has agreed on so far — every node's placement view derives from
   /// it ([`RegionalConfiguration::configuration_for`]).
   pub fn configuration(&self) -> &RegionalConfiguration {
-    self.learned.as_ref().unwrap_or(&self.configuration)
+    self.learned.as_ref().unwrap_or(self.fold.state())
+  }
+
+  /// The compactions this council's log has taken (the thesis's size rule, [`crate::fold`]).
+  pub fn compactions(&self) -> u64 {
+    self.fold.compactions()
+  }
+
+  /// The index through which this council's log is folded into its snapshot (zero before the first
+  /// compaction).
+  pub fn snapshot_index(&self) -> u64 {
+    self.raft.snapshot_index()
+  }
+
+  /// The index of this council's last log entry.
+  pub fn last_log_index(&self) -> u64 {
+    self.raft.last_log_index()
   }
 
   /// Whether this node leads the council (only the leader may propose).
@@ -478,9 +493,9 @@ impl RegionalCouncil {
       self.raft.in_joint_configuration(),
       self.raft.commit_index(),
       self.raft.last_log_index(),
-      self.applied,
-      self.configuration.members,
-      self.configuration.version,
+      self.fold.applied(),
+      self.fold.state().members,
+      self.fold.state().version,
       log.join(" | ")
     )
   }
@@ -510,9 +525,20 @@ impl RegionalCouncil {
     }
   }
 
-  /// The append the leader replicates to `follower` now (or a heartbeat), or `None` when not the leader.
-  pub fn replication_for(&self, follower: HostId) -> Option<AppendEntries> {
-    self.raft.replicate_to(follower)
+  /// What the leader replicates to `follower` now — an append carrying at most `budget` entry bytes (a
+  /// heartbeat when nothing is owed), or the snapshot when the entries it needs were compacted away (Raft
+  /// §7) — or `None` when this node does not lead.
+  pub fn replication_for(&self, follower: HostId, budget: usize) -> Option<RaftMessage> {
+    self
+      .raft
+      .replicate_to(follower, budget)
+      .map(RaftMessage::AppendEntries)
+      .or_else(|| {
+        self
+          .raft
+          .install_snapshot_for(follower)
+          .map(RaftMessage::InstallSnapshot)
+      })
   }
 
   /// **DRIVE**: the leader's CheckQuorum tick (Raft §6.2), on the election-timeout cadence: a leader that has
@@ -623,9 +649,25 @@ impl RegionalCouncil {
         self.invitation = Some(invitation);
         None
       }
-      RaftMessage::VoteReply(_) | RaftMessage::PreVoteReply(_) | RaftMessage::AppendReply(_) => {
-        None
+      RaftMessage::InstallSnapshot(snapshot) => {
+        // A leader's snapshot is contact from it exactly as its append is (the timer rule above).
+        let snapshot_term = snapshot.term;
+        let scatter = self.scatter;
+        let reply = self
+          .fold
+          .install(&mut self.raft, snapshot, |configuration, command| {
+            apply_command(configuration, command, scatter);
+          });
+        if snapshot_term >= reply.term {
+          self.leader_contact = self.leader_contact.saturating_add(1);
+        }
+        self.discard_superseded_view();
+        Some(RaftMessage::InstallSnapshotReply(reply))
       }
+      RaftMessage::VoteReply(_)
+      | RaftMessage::PreVoteReply(_)
+      | RaftMessage::AppendReply(_)
+      | RaftMessage::InstallSnapshotReply(_) => None,
     }
   }
 
@@ -650,10 +692,16 @@ impl RegionalCouncil {
         self.apply_committed();
         Vec::new()
       }
+      RaftMessage::InstallSnapshotReply(reply) => {
+        self.raft.on_install_snapshot_reply(reply);
+        self.apply_committed();
+        Vec::new()
+      }
       RaftMessage::PreVote(_)
       | RaftMessage::RequestVote(_)
       | RaftMessage::AppendEntries(_)
-      | RaftMessage::TimeoutNow(_) => Vec::new(),
+      | RaftMessage::TimeoutNow(_)
+      | RaftMessage::InstallSnapshot(_) => Vec::new(),
     };
     self.finish_election(was_leader);
     messages
@@ -667,17 +715,17 @@ impl RegionalCouncil {
     let (command, would_change) = match change {
       Reconfiguration::Admit { host, domain } => (
         ConfigCommand::Admit { host, domain },
-        !self.configuration.members.contains(&host),
+        !self.fold.state().members.contains(&host),
       ),
       Reconfiguration::Retire(host) => (
         ConfigCommand::Retire(host),
-        self.configuration.members.contains(&host),
+        self.fold.state().members.contains(&host),
       ),
       Reconfiguration::TakeOver(host) => (
         // Per-host takeover: bump the host's fencing epoch and retire it (one bump fences every object it
         // owned; the surviving owner of each is recomputed by rendezvous, not named here).
         ConfigCommand::TakeOver { dead: host },
-        self.configuration.members.contains(&host),
+        self.fold.state().members.contains(&host),
       ),
     };
     if !would_change {
@@ -771,9 +819,9 @@ impl RegionalCouncil {
     let sitting = self.raft.all_voters();
     let target = council_voters(
       &sitting,
-      &self.configuration.members,
+      &self.fold.state().members,
       alive,
-      self.configuration.quorum,
+      self.fold.state().quorum,
     );
     if target.is_empty() || target == sitting {
       return false;
@@ -795,47 +843,52 @@ impl RegionalCouncil {
     true
   }
 
-  /// Applies each newly committed command once from the common base. A fetched read view
-  /// never feeds this fold and is discarded when replay reaches its version (§4.8, AUD-07).
+  /// Applies each newly committed command once from the common base, and compacts the log when the
+  /// thesis's size rule says so ([`crate::fold`]). A fetched read view never feeds this fold and is
+  /// discarded when replay reaches its version (§4.8, AUD-07).
   fn apply_committed(&mut self) {
-    let committed = self.raft.committed_entries().to_vec();
-    if self.applied == 0 && !committed.is_empty() {
-      self.configuration = self.base.clone();
-    }
-    while let Some(entry) = committed.get(usize::try_from(self.applied).unwrap_or(usize::MAX)) {
-      if let Some(command) = ConfigCommand::decode(&entry.command) {
-        self.apply_regional(command);
-      }
-      self.applied = self.applied.saturating_add(1);
-    }
+    let scatter = self.scatter;
+    self.fold.advance(&mut self.raft, |configuration, command| {
+      apply_command(configuration, command, scatter);
+    });
+    self.discard_superseded_view();
+  }
+
+  /// Drops a fetched read view once the fold has reached its version.
+  fn discard_superseded_view(&mut self) {
     if self
       .learned
       .as_ref()
-      .is_some_and(|learned| learned.version <= self.configuration.version)
+      .is_some_and(|learned| learned.version <= self.fold.state().version)
     {
       self.learned = None;
     }
   }
+}
 
-  /// Applies one committed command to the regional configuration.
-  fn apply_regional(&mut self, command: ConfigCommand) {
-    match command {
-      ConfigCommand::Admit { host, domain } => {
-        self.configuration.admit(host, domain, self.scatter);
-      }
-      ConfigCommand::Retire(host) => {
-        self.configuration.retire(host, self.scatter);
-      }
-      ConfigCommand::TakeOver { dead } => {
-        self.configuration.take_over(dead, self.scatter);
-      }
+/// Applies one committed entry's command bytes to the regional configuration; a configuration entry's
+/// (empty) or a malformed command's bytes change nothing.
+fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scatter: u64) {
+  match ConfigCommand::decode(command) {
+    Some(ConfigCommand::Admit { host, domain }) => {
+      configuration.admit(host, domain, scatter);
     }
+    Some(ConfigCommand::Retire(host)) => {
+      configuration.retire(host, scatter);
+    }
+    Some(ConfigCommand::TakeOver { dead }) => {
+      configuration.take_over(dead, scatter);
+    }
+    None => {}
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Shape: an append budget no batch reaches, for the tests of every rule but batching and compaction.
+  const UNBOUNDED: usize = usize::MAX;
 
   /// AC-8.1, §4.8, AUD-07: a replacement imports the original fold base, becomes a voter
   /// through joint consensus, then refuses an initial-state replay that would erase its vote.
@@ -904,11 +957,15 @@ mod tests {
     replacement_id: HostId,
   ) {
     let (prefix, _) = replacement.join_state().unwrap();
+    // A candidate exactly as up to date as the replacement: its last index and term, past any compaction.
     let request = crate::raft::RequestVote {
       term: prefix.term + 1,
       candidate: OWNER,
-      last_log_index: prefix.log.len() as u64,
-      last_log_term: prefix.log.last().unwrap().term,
+      last_log_index: prefix.snapshot_index + prefix.log.len() as u64,
+      last_log_term: prefix
+        .log
+        .last()
+        .map_or(prefix.snapshot_term, |entry| entry.term),
     };
     assert!(
       matches!(replacement.answer(RaftMessage::RequestVote(request)),
@@ -1046,8 +1103,8 @@ mod tests {
   /// follower applies too).
   fn replicate(leader: &mut RegionalCouncil, follower: &mut RegionalCouncil, rounds: usize) {
     for _ in 0..rounds {
-      if let Some(append) = leader.replication_for(A) {
-        exchange(leader, follower, RaftMessage::AppendEntries(append));
+      if let Some(message) = leader.replication_for(A, UNBOUNDED) {
+        exchange(leader, follower, message);
       }
     }
   }
@@ -1132,9 +1189,10 @@ mod tests {
     elect(&mut leader, &mut follower);
     let before = follower.leader_contact();
     // Name a previous entry the follower cannot hold: rejected by the consistency check, yet live contact.
-    let mut rejected = leader
-      .replication_for(A)
-      .expect("the leader owes its follower a heartbeat");
+    let Some(RaftMessage::AppendEntries(mut rejected)) = leader.replication_for(A, UNBOUNDED)
+    else {
+      panic!("the leader owes its follower a heartbeat");
+    };
     rejected.prev_log_index = rejected.prev_log_index.saturating_add(10);
     rejected.prev_log_term = rejected.prev_log_term.saturating_add(1);
     let reply = follower.answer(RaftMessage::AppendEntries(rejected));
@@ -1148,9 +1206,9 @@ mod tests {
       "a rejected current-term append is still leader contact — the election timer resets"
     );
     // A stale-term append (a deposed leader's) is refused and is not contact.
-    let mut stale = leader
-      .replication_for(A)
-      .expect("the leader owes its follower a heartbeat");
+    let Some(RaftMessage::AppendEntries(mut stale)) = leader.replication_for(A, UNBOUNDED) else {
+      panic!("the leader owes its follower a heartbeat");
+    };
     stale.term = 0;
     let reply = follower.answer(RaftMessage::AppendEntries(stale));
     assert!(
@@ -1386,6 +1444,16 @@ mod tests {
     leader: HostId,
     reachable: &[HostId],
   ) {
+    replicate_round_within(councils, leader, reachable, UNBOUNDED);
+  }
+
+  /// [`replicate_round`] with appends carrying at most `budget` entry bytes.
+  fn replicate_round_within(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    leader: HostId,
+    reachable: &[HostId],
+    budget: usize,
+  ) {
     let targets: Vec<HostId> = councils
       .get(&leader)
       .map(RegionalCouncil::voters)
@@ -1394,12 +1462,15 @@ mod tests {
       .filter(|peer| *peer != leader && reachable.contains(peer))
       .collect();
     for peer in targets {
-      let Some(append) = councils.get(&leader).and_then(|l| l.replication_for(peer)) else {
+      let Some(message) = councils
+        .get(&leader)
+        .and_then(|l| l.replication_for(peer, budget))
+      else {
         continue;
       };
       let reply = councils
         .get_mut(&peer)
-        .and_then(|council| council.answer(RaftMessage::AppendEntries(append)));
+        .and_then(|council| council.answer(message));
       if let Some(reply) = reply
         && let Some(council) = councils.get_mut(&leader)
       {
@@ -1691,5 +1762,211 @@ mod tests {
       councils[&OWNER].configuration(),
       "the promoted learner re-folded the log from the base: its configuration is the leader's, exactly"
     );
+  }
+
+  /// Shape: an append budget of about two council commands (an admission is 10 command bytes, 23 on the
+  /// wire), so these tests cross batch boundaries as the fleet's budget does on a longer log.
+  const SMALL_BUDGET: usize = 64;
+  /// Shape: the membership changes the compaction tests commit — far past the first compaction of a
+  /// three-member council (its configuration encodes to a few hundred bytes; each change is about thirty).
+  const CHANGES: u64 = 120;
+
+  /// The `index`-th change of a compaction test: admit a transient member, or retire it again, so the
+  /// configuration's size stays level while its version and log keep growing.
+  fn change(index: u64) -> Reconfiguration {
+    let host = HostId(1_000 + index / 2);
+    if index.is_multiple_of(2) {
+      Reconfiguration::Admit { host, domain: None }
+    } else {
+      Reconfiguration::Retire(host)
+    }
+  }
+
+  /// Applies `change` to an oracle configuration directly, as a committed command applies it.
+  fn apply_to_oracle(oracle: &mut RegionalConfiguration, change: &Reconfiguration) {
+    match change {
+      Reconfiguration::Admit { host, domain } => {
+        oracle.admit(*host, *domain, 3);
+      }
+      Reconfiguration::Retire(host) => {
+        oracle.retire(*host, 3);
+      }
+      Reconfiguration::TakeOver(host) => {
+        oracle.take_over(*host, 3);
+      }
+    }
+  }
+
+  /// Commits `changes` one at a time from `leader` to the `reachable` peers (each proposed once the last
+  /// has committed, as `reconcile_alive` gates it), with the small append budget, and returns the oracle
+  /// configuration the changes produce from `oracle`.
+  fn commit_changes(
+    councils: &mut std::collections::BTreeMap<HostId, RegionalCouncil>,
+    leader: HostId,
+    reachable: &[HostId],
+    changes: std::ops::Range<u64>,
+    mut oracle: RegionalConfiguration,
+  ) -> RegionalConfiguration {
+    for index in changes {
+      let proposal = change(index);
+      assert!(
+        councils.get_mut(&leader).unwrap().propose(proposal.clone()),
+        "change {index} proposed"
+      );
+      apply_to_oracle(&mut oracle, &proposal);
+      for _ in 0..4 {
+        replicate_round_within(councils, leader, reachable, SMALL_BUDGET);
+      }
+      assert!(councils[&leader].caught_up(), "change {index} committed");
+    }
+    oracle
+  }
+
+  /// The wire bytes of a retained log's entries.
+  fn log_bytes(saved: &SavedRaft) -> usize {
+    saved
+      .log
+      .iter()
+      .map(crate::raft::LogEntry::encoded_len)
+      .sum()
+  }
+
+  /// Thesis §5.1.2 (`crate::fold`): a council that compacts by the size rule folds exactly the configuration
+  /// its committed changes produce (an oracle applying them directly), on every voter; and its retained log
+  /// never holds more wire bytes than twice its last snapshot (the rule, plus the entries a leader keeps for
+  /// a follower still taking them), where before 2026-09-28 it held every entry of the fleet's life.
+  /// Non-vacuity: every voter compacted — the third included, which a leader compacting before its followers
+  /// held the entries sent a snapshot instead each time.
+  #[test]
+  fn a_compacting_council_folds_what_its_changes_produce_and_stays_bounded() {
+    let members = [OWNER, A, B];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &members);
+    settle(&mut councils, OWNER, &members, 2);
+    let oracle = councils[&OWNER].configuration().clone();
+    let oracle = commit_changes(&mut councils, OWNER, &members, 0..CHANGES, oracle);
+    settle(&mut councils, OWNER, &members, 2);
+    for (id, council) in &councils {
+      assert_eq!(council.configuration(), &oracle, "{id:?} folds the oracle");
+      assert!(council.compactions() > 0, "{id:?} compacted");
+      let (saved, _) = council.join_state().unwrap();
+      assert!(
+        log_bytes(&saved) <= 2 * saved.snapshot_data.len(),
+        "{id:?} retains {} log bytes past a snapshot of {} after {} compactions",
+        log_bytes(&saved),
+        saved.snapshot_data.len(),
+        council.compactions()
+      );
+      assert!(
+        saved.log.len() < usize::try_from(CHANGES).unwrap(),
+        "{id:?} retains {} of {} entries",
+        saved.log.len(),
+        CHANGES
+      );
+    }
+  }
+
+  /// Raft §7 through the council: a voter cut off while the others commit past their compaction is sent the
+  /// leader's snapshot when it returns — its missing entries are gone from the leader's log — installs it,
+  /// takes the entries after it, and ends with exactly the leader's configuration.
+  #[test]
+  fn a_voter_left_behind_the_leaders_snapshot_catches_up_to_its_configuration() {
+    let members = [OWNER, A, B];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &members);
+    settle(&mut councils, OWNER, &members, 2);
+    let oracle = councils[&OWNER].configuration().clone();
+    let oracle = commit_changes(&mut councils, OWNER, &[OWNER, A], 0..CHANGES, oracle);
+    assert!(
+      councils[&OWNER].snapshot_index() > councils[&B].last_log_index(),
+      "the leader compacted past everything B holds"
+    );
+    let owed = councils[&OWNER].replication_for(B, SMALL_BUDGET);
+    assert!(
+      matches!(owed, Some(RaftMessage::InstallSnapshot(_))),
+      "B is owed the snapshot, not an append"
+    );
+    // Round one ships the snapshot; the rounds after it the entries above it, a small batch each.
+    let mut rounds = 0;
+    while councils[&B].configuration() != councils[&OWNER].configuration() {
+      replicate_round_within(&mut councils, OWNER, &members, SMALL_BUDGET);
+      rounds += 1;
+      assert!(
+        rounds <= CHANGES,
+        "B catches up in a bounded number of rounds"
+      );
+    }
+    assert!(councils[&B].snapshot_index() > 0, "B installed a snapshot");
+    assert_eq!(councils[&B].configuration(), &oracle);
+    assert_eq!(
+      councils[&B].configuration(),
+      councils[&OWNER].configuration()
+    );
+  }
+
+  /// A compacted council's state restores under its own identity and joins a fresh member to the same
+  /// configuration; a snapshot paired with any other base is refused before anything is installed.
+  #[test]
+  fn a_compacted_council_restores_and_joins_and_refuses_a_mismatched_base() {
+    let members = [OWNER, A, B];
+    let mut councils = councils(&members);
+    elect_among(&mut councils, OWNER, &members);
+    settle(&mut councils, OWNER, &members, 2);
+    let formed = councils[&OWNER].configuration().clone();
+    commit_changes(&mut councils, OWNER, &members, 0..CHANGES, formed.clone());
+    let (saved, base) = councils[&A].join_state().unwrap();
+    assert!(saved.snapshot_index > 0, "the donor compacted");
+    let expected = councils[&A].configuration().clone();
+
+    let mut restored = council(A);
+    restored.restore_from(saved.clone(), base.clone()).unwrap();
+    assert_eq!(restored.configuration(), &expected);
+
+    let mut joined = RegionalCouncil::learner(HostId(9), Quorum { f: 1 }, 3, false);
+    joined.join_from(saved.clone(), base).unwrap();
+    assert_eq!(joined.configuration(), &expected);
+
+    let mut refused = RegionalCouncil::learner(HostId(10), Quorum { f: 1 }, 3, false);
+    assert_eq!(
+      refused.join_from(saved, formed),
+      Err(RaftRecoveryError::InvalidSnapshot)
+    );
+    assert!(!refused.initialized());
+  }
+
+  /// Measurement (`docs/wip/BENCHMARKS.md`, "consensus log compaction"): a sole-voter council commits
+  /// `changes` membership changes — each one a propose, commit and apply, the path a leader period runs — and
+  /// reports the retained publication's size (the `SavedRaft` the control shard re-encodes before every
+  /// reply), its log length, the compactions, and the time the history took. Run with
+  /// `cargo test --release -p slates-cluster --lib measure_a_long_council_history -- --ignored --nocapture`.
+  #[test]
+  #[ignore = "a measurement, run by hand in release"]
+  fn measure_a_long_council_history() {
+    use slates_wire::Wire;
+    for changes in [250u64, 1_000, 4_000] {
+      let mut council = RegionalCouncil::new(
+        OWNER,
+        vec![OWNER],
+        vec![OWNER],
+        Quorum { f: 0 },
+        std::collections::BTreeMap::new(),
+        3,
+        false,
+      );
+      let started = std::time::Instant::now();
+      for index in 0..changes {
+        assert!(council.propose(change(index)));
+      }
+      let took = started.elapsed();
+      let (saved, _) = council.join_state().unwrap();
+      eprintln!(
+        "changes {changes}: retained {} bytes, log {} entries, compactions {}, {:.3} ms ({:.2} us per change)",
+        saved.to_bytes().len(),
+        saved.log.len(),
+        council.compactions(),
+        took.as_secs_f64() * 1e3,
+        took.as_secs_f64() * 1e6 / changes as f64
+      );
+    }
   }
 }

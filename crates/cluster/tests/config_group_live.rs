@@ -12,6 +12,10 @@
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, channel};
 
+/// Shape: an append budget no batch reaches — these tests exercise the drive over a live transport, not
+/// batching.
+const UNBOUNDED: usize = usize::MAX;
+
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
@@ -188,10 +192,8 @@ fn run_distributed_membership_change() -> Outcome {
       // Round one replicates the entry (the voter appends, the leader commits at the majority); round two's
       // heartbeat carries the advanced commit index, so the voter applies too.
       for _ in 0..2 {
-        if let Some(append) = leader.replication_for(VOTER)
-          && let Some(reply) = request_raft(&mut endpoint, &RaftMessage::AppendEntries(append))
-            .await
-            .unwrap()
+        if let Some(message) = leader.replication_for(VOTER, UNBOUNDED)
+          && let Some(reply) = request_raft(&mut endpoint, &message).await.unwrap()
         {
           leader.fold_reply(reply);
         }
@@ -331,10 +333,8 @@ fn run_voter_removal_over_the_transport() -> RemovalOutcome {
       // Two replication rounds to the live voter: the entry, then the commit heartbeat.
       let replicate = async |leader: &mut RegionalCouncil, endpoint: &mut Endpoint| {
         for _ in 0..2 {
-          if let Some(append) = leader.replication_for(VOTER)
-            && let Some(reply) = request_raft(endpoint, &RaftMessage::AppendEntries(append))
-              .await
-              .unwrap()
+          if let Some(message) = leader.replication_for(VOTER, UNBOUNDED)
+            && let Some(reply) = request_raft(endpoint, &message).await.unwrap()
           {
             leader.fold_reply(reply);
           }

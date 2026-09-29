@@ -26,7 +26,18 @@
 //! committed prefix into a snapshot and discards it, so the log stays bounded (every index resolves
 //! through a snapshot offset that is a no-op until the first compaction); and a follower that has fallen
 //! below the leader's snapshot — which no append can reach — is caught up by
-//! [`install_snapshot_for`](RaftNode::install_snapshot_for)/[`on_install_snapshot`](RaftNode::on_install_snapshot).
+//! [`install_snapshot_for`](RaftNode::install_snapshot_for)/[`on_install_snapshot`](RaftNode::on_install_snapshot),
+//! its reply stating what it now holds (never the leader's own snapshot index, which may have moved on).
+//! The groups compact by the thesis's size rule (`crate::fold`).
+//!
+//! **Replication is bounded and backs up by term** (2026-09-28): an append carries at most a byte budget
+//! of entries (`raft_wire::append_batch_bytes`, a fresh session's first credit) and never nothing while one
+//! is owed; a consistency-check refusal carries the conflict hint of §5.3 (the follower's conflicting term
+//! and where its run begins, or where its log ends), so the leader backs up a whole term — or straight to
+//! an empty follower's end, thesis §4.2.1 — in one round trip; progress only grows within a term, so a late
+//! reply never moves it back; and an append anchored inside a follower's committed prefix is taken from the
+//! follower's commit index on, never refused
+//! (`docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`).
 //! The multi-node **conformance suite** (`tests/raft.rs`) drives a cluster through election, replication,
 //! a partition and a membership change, checking Election Safety, Log Matching, Leader Completeness and
 //! State Machine Safety.
@@ -212,7 +223,30 @@ impl LogEntry {
       config: Some(config),
     }
   }
+
+  /// The bytes this entry takes on the wire (`crate::raft_wire`, which a test holds to this count): the
+  /// term, the command's length and bytes, the configuration's presence byte, and for a configuration
+  /// entry its voter set (a count and eight bytes per voter) and the joint set's presence byte and set.
+  pub fn encoded_len(&self) -> usize {
+    let hosts =
+      |set: &[HostId]| ENTRY_COUNT_BYTES.saturating_add(set.len().saturating_mul(size_of::<u64>()));
+    let config = self.config.as_ref().map_or(0, |config| {
+      hosts(&config.voters)
+        .saturating_add(ENTRY_FLAG_BYTES)
+        .saturating_add(config.joint.as_deref().map_or(0, hosts))
+    });
+    size_of::<u64>()
+      .saturating_add(ENTRY_COUNT_BYTES)
+      .saturating_add(self.command.len())
+      .saturating_add(ENTRY_FLAG_BYTES)
+      .saturating_add(config)
+  }
 }
+
+/// Format: a length or count on the Raft wire is a little-endian `u32`.
+const ENTRY_COUNT_BYTES: usize = size_of::<u32>();
+/// Format: a presence flag on the Raft wire is one byte.
+const ENTRY_FLAG_BYTES: usize = 1;
 
 /// A leader's replication message (Raft `AppendEntries`): the leader's term, the log position it is
 /// appending after (`prev_log_index`/`prev_log_term`, the consistency check), the entries to append
@@ -239,7 +273,11 @@ pub struct AppendEntries {
 
 /// A follower's reply to [`AppendEntries`]: the follower, its current term, whether the append
 /// succeeded (the consistency check held), and — on success — the highest log index it now matches the
-/// leader on, so the leader advances `match_index`/`next_index` for it.
+/// leader on, so the leader advances `match_index`/`next_index` for it. A consistency-check refusal
+/// carries the conflict hint of Raft §5.3 (the term of the follower's entry at the leader's previous
+/// index and the first index the follower holds for that term, or — when its log is too short — no term
+/// and the index after its last entry), so the leader backs up past a whole conflicting term, or straight
+/// to the follower's end, in one round trip instead of one entry per round trip.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AppendReply {
   /// The read context from the request this reply answers; zero is not a read confirmation.
@@ -252,6 +290,13 @@ pub struct AppendReply {
   pub success: bool,
   /// On success, the last index the follower's log now matches the leader on.
   pub match_index: u64,
+  /// On a consistency-check refusal, the term of the follower's entry at the previous index, or zero when
+  /// the follower's log does not reach it. Zero otherwise.
+  pub conflict_term: u64,
+  /// On a consistency-check refusal, where the leader should look next: the first index the follower holds
+  /// of `conflict_term`, or the index after the follower's last entry when `conflict_term` is zero. Zero
+  /// otherwise.
+  pub conflict_index: u64,
 }
 
 /// A leader's snapshot transfer (Raft `InstallSnapshot`, §7) — sent to a follower that has fallen below
@@ -275,13 +320,18 @@ pub struct InstallSnapshot {
   pub state: Vec<u8>,
 }
 
-/// A follower's reply to [`InstallSnapshot`]: the follower and its current term.
+/// A follower's reply to [`InstallSnapshot`]: the follower, its current term, and how far its log is now
+/// known to match the leader's — its commit index once the snapshot is handled (committed entries are the
+/// same on every server, and an installed snapshot is committed), or zero when it declined the snapshot
+/// (its state did not decode), so the leader never credits a follower with entries it does not hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InstallSnapshotReply {
   /// The follower replying.
   pub follower: HostId,
   /// The follower's current term.
   pub term: u64,
+  /// The index the follower's log now matches the leader's through, or zero when it declined.
+  pub match_index: u64,
 }
 
 /// One outstanding ReadIndex round (§6.4): a read's start index and voter configuration, plus
@@ -930,12 +980,45 @@ impl RaftNode {
     self.snapshot_index
   }
 
+  /// How far every follower this node replicates to holds the log: while leading, the least match index
+  /// among its replication targets (its own last index when it replicates to no one); otherwise its commit
+  /// index, since a follower serves no one. What a leader compacts past this point, a follower still
+  /// catching up can only take as the whole snapshot.
+  pub fn replicated_through(&self) -> u64 {
+    if self.role != Role::Leader {
+      return self.commit_index;
+    }
+    self
+      .replication_targets()
+      .into_iter()
+      .filter(|target| *target != self.id)
+      .map(|target| self.match_of(target))
+      .min()
+      .unwrap_or_else(|| self.last_log_index())
+  }
+
+  /// The wire bytes of the log entries above the snapshot through `index` — what compacting to `index`
+  /// would replace with a snapshot ([`LogEntry::encoded_len`]).
+  pub fn log_bytes_through(&self, index: u64) -> usize {
+    let through = usize::try_from(index.saturating_sub(self.snapshot_index))
+      .unwrap_or(usize::MAX)
+      .min(self.log.len());
+    self
+      .log
+      .get(..through)
+      .unwrap_or(&[])
+      .iter()
+      .map(LogEntry::encoded_len)
+      .fold(0usize, usize::saturating_add)
+  }
+
   /// Compacts the log by folding the committed prefix up to `up_to` into a snapshot and discarding those
   /// entries, so the log stays bounded (§7). Only committed entries are compacted — `up_to` must be at or
   /// below the commit index and beyond the current snapshot — and the snapshot term is recorded so the
   /// consistency check at the boundary still holds. Returns whether it compacted. The caller must have
-  /// captured the state machine's state at `up_to` first; a follower far enough behind to need a
-  /// discarded entry is served an install-snapshot (owed).
+  /// captured the state machine's state at `up_to` first (the groups do, `crate::fold`); a follower far
+  /// enough behind to need a discarded entry is sent the snapshot
+  /// ([`install_snapshot_for`](RaftNode::install_snapshot_for)).
   pub fn compact(&mut self, up_to: u64, state: Vec<u8>) -> bool {
     if up_to <= self.snapshot_index || up_to > self.commit_index {
       return false;
@@ -997,18 +1080,9 @@ impl RaftNode {
   /// caller applies the state to its state machine. Returns the reply.
   pub fn on_install_snapshot(&mut self, request: InstallSnapshot) -> InstallSnapshotReply {
     if request.term < self.current_term {
-      return InstallSnapshotReply {
-        follower: self.id,
-        term: self.current_term,
-      };
+      return self.snapshot_reply(0);
     }
-    if request.term > self.current_term {
-      self.step_down(request.term);
-    }
-    self.read_round = None;
-    self.role = Role::Follower;
-    self.has_leader = true;
-    self.leader_hint = Some(request.leader);
+    self.recognize_leader(request.term, request.leader);
 
     if request.last_included_index > self.snapshot_index {
       self.retention_pending = true;
@@ -1031,15 +1105,47 @@ impl RaftNode {
       self.joint = request.config.joint;
       self.commit_index = self.commit_index.max(request.last_included_index);
     }
+    self.snapshot_reply(self.commit_index)
+  }
+
+  /// Declines an [`InstallSnapshot`] whose state the caller could not decode: the sender is recognized as
+  /// the leader of its term exactly as for an install (a newer term steps this node down, and the contact
+  /// defers its election), but nothing of the snapshot is adopted, and the reply's zero match index tells the
+  /// leader this follower holds nothing more than before.
+  pub fn decline_snapshot(&mut self, request: &InstallSnapshot) -> InstallSnapshotReply {
+    if request.term >= self.current_term {
+      self.recognize_leader(request.term, request.leader);
+    }
+    self.snapshot_reply(0)
+  }
+
+  /// Defers to the leader of `term` (a current-or-newer term): a newer term steps this node down, and a
+  /// leader exists for the term, so a candidate stands down and a pre-vote that would disrupt it is refused
+  /// (§9.6).
+  fn recognize_leader(&mut self, term: u64, leader: HostId) {
+    if term > self.current_term {
+      self.step_down(term);
+    }
+    self.read_round = None;
+    self.role = Role::Follower;
+    self.has_leader = true;
+    self.leader_hint = Some(leader);
+  }
+
+  /// A snapshot reply with this node's current term and `match_index`.
+  fn snapshot_reply(&self, match_index: u64) -> InstallSnapshotReply {
     InstallSnapshotReply {
       follower: self.id,
       term: self.current_term,
+      match_index,
     }
   }
 
   /// Handles a follower's [`InstallSnapshotReply`] as the leader: a newer term steps us down; otherwise
-  /// the follower now holds up to the snapshot, so its `match_index`/`next_index` advance past it and the
-  /// commit index may advance.
+  /// the follower's log matches through the index it reports (a declined snapshot reports zero and moves
+  /// nothing), so its `match_index`/`next_index` advance to it — never backward, and never to this leader's
+  /// own snapshot index, which may have moved on since the snapshot left — and the commit index may
+  /// advance.
   pub fn on_install_snapshot_reply(&mut self, reply: InstallSnapshotReply) {
     if reply.term > self.current_term {
       self.step_down(reply.term);
@@ -1049,11 +1155,23 @@ impl RaftNode {
       return;
     }
     self.contacts.insert(reply.follower);
-    self.match_index.insert(reply.follower, self.snapshot_index);
+    if reply.match_index > 0 {
+      self.record_match(reply.follower, reply.match_index);
+      self.advance_leader_commit();
+    }
+  }
+
+  /// Records that `follower`'s log matches this leader's through `index`: its match index only grows within
+  /// a term (the leader's log is append-only while it leads, so a matched prefix stays matched), and its
+  /// next index is at least the entry after it. A late reply to an earlier request therefore never moves
+  /// either back.
+  fn record_match(&mut self, follower: HostId, index: u64) {
+    let matched = self.match_of(follower).max(index);
+    self.match_index.insert(follower, matched);
+    let next = self.next_index.get(&follower).copied().unwrap_or(1);
     self
       .next_index
-      .insert(reply.follower, self.snapshot_index.saturating_add(1));
-    self.advance_leader_commit();
+      .insert(follower, next.max(matched.saturating_add(1)));
   }
 
   /// Appends `command` to the leader's own log at the current term and updates its self-match, so a
@@ -1072,9 +1190,12 @@ impl RaftNode {
   }
 
   /// Builds the [`AppendEntries`] to send `follower`, from the leader's `next_index` for it: the entries
-  /// after that point and the previous position for the consistency check. Empty entries make it a
-  /// heartbeat. Returns `None` if this node is not the leader.
-  pub fn replicate_to(&self, follower: HostId) -> Option<AppendEntries> {
+  /// after that point — as many as fit in `budget` wire bytes ([`LogEntry::encoded_len`]), and always at
+  /// least one when any is owed, so an entry larger than the budget still goes, alone — and the previous
+  /// position for the consistency check. Empty entries make it a heartbeat. Returns `None` if this node is
+  /// not the leader, or when the entries the follower needs were compacted away (it needs
+  /// [`install_snapshot_for`](RaftNode::install_snapshot_for)).
+  pub fn replicate_to(&self, follower: HostId, budget: usize) -> Option<AppendEntries> {
     if self.role != Role::Leader {
       return None;
     }
@@ -1092,7 +1213,17 @@ impl RaftNode {
     };
     let from = usize::try_from(next.saturating_sub(self.snapshot_index).saturating_sub(1))
       .unwrap_or(usize::MAX);
-    let entries = self.log.get(from..).unwrap_or(&[]).to_vec();
+    let owed = self.log.get(from..).unwrap_or(&[]);
+    let mut spent = 0usize;
+    let batch = owed
+      .iter()
+      .take_while(|entry| {
+        let first = spent == 0;
+        spent = spent.saturating_add(entry.encoded_len());
+        first || spent <= budget
+      })
+      .count();
+    let entries = owed.get(..batch).unwrap_or(&[]).to_vec();
     Some(AppendEntries {
       read_context: self.read_round.as_ref().map_or(0, |read| read.context),
       term: self.current_term,
@@ -1109,25 +1240,39 @@ impl RaftNode {
   /// when the log matches at `prev_log_index`/`prev_log_term`; then any conflicting suffix is truncated,
   /// the new entries appended, and the commit index advanced toward the leader's. Returns the reply,
   /// carrying on success the last index now matched.
-  pub fn on_append_entries(&mut self, request: AppendEntries) -> AppendReply {
+  pub fn on_append_entries(&mut self, mut request: AppendEntries) -> AppendReply {
     if request.term < self.current_term {
       return self.append_reply(false, 0, 0);
     }
-    if request.term > self.current_term {
-      self.step_down(request.term);
-    }
     // A current-term append means a leader exists for our term — defer to it (a candidate steps down)
     // and note the contact, so we refuse pre-votes that would disrupt this leader (§9.6).
-    self.read_round = None;
-    self.role = Role::Follower;
-    self.has_leader = true;
-    self.leader_hint = Some(request.leader);
+    self.recognize_leader(request.term, request.leader);
+
+    // An append anchored inside our committed prefix — a late or duplicated copy, or the first append to a
+    // member that joined with the committed prefix, sent before the leader learned how far it is — agrees
+    // with us through our commit index, since every committed entry is the same on every server. So its
+    // entries at or below our commit index are skipped and the rest are taken as if it were anchored there;
+    // one that ends inside our committed prefix brings nothing new, and the reply says we match through our
+    // commit index. Without this, a previous index below our snapshot failed the check, each refusal backed
+    // the leader up one entry, and the append that finally anchored at zero landed compacted entries on the
+    // end of our log. (etcd's `handleAppendEntries` answers such an append with its commit index and drops
+    // it; taking the new entries saves the round trip a joining member would otherwise spend.)
+    if request.prev_log_index < self.commit_index {
+      let covered =
+        usize::try_from(self.commit_index - request.prev_log_index).unwrap_or(usize::MAX);
+      if covered >= request.entries.len() {
+        return self.append_reply(true, self.commit_index, request.read_context);
+      }
+      request.entries.drain(..covered);
+      request.prev_log_index = self.commit_index;
+      request.prev_log_term = self.entry_term(self.commit_index).unwrap_or(0);
+    }
 
     // Consistency check: our log must contain the previous entry with the leader's term.
     if request.prev_log_index > 0
       && self.entry_term(request.prev_log_index) != Some(request.prev_log_term)
     {
-      return self.append_reply(false, 0, request.read_context);
+      return self.conflict_reply(request.prev_log_index, request.read_context);
     }
 
     // Append, truncating the first conflicting entry and everything after it.
@@ -1177,14 +1322,45 @@ impl RaftNode {
     // Any same-term reply proves the follower is reachable this CheckQuorum window.
     self.contacts.insert(reply.follower);
     if reply.success {
-      self.match_index.insert(reply.follower, reply.match_index);
-      self
-        .next_index
-        .insert(reply.follower, reply.match_index.saturating_add(1));
+      self.record_match(reply.follower, reply.match_index);
       self.advance_leader_commit();
-    } else if let Some(next) = self.next_index.get_mut(&reply.follower) {
-      *next = (*next).saturating_sub(1).max(1);
+    } else {
+      self.back_up(reply);
     }
+  }
+
+  /// Moves `next_index` back after a consistency-check refusal, by the follower's conflict hint (Raft
+  /// §5.3): past this leader's last entry of the conflicting term when it holds that term, else to the
+  /// follower's hint. The result is strictly below the current next index — the hint is at or below the
+  /// refused previous index, and a leader holding the follower's conflicting term holds it only before
+  /// that index (terms never decrease along a log, and log matching rules out a later run) — and never at
+  /// or below the follower's match index, so a late refusal of an earlier request cannot undo progress.
+  fn back_up(&mut self, reply: AppendReply) {
+    let Some(&next) = self.next_index.get(&reply.follower) else {
+      return;
+    };
+    let hint = if reply.conflict_term == 0 {
+      reply.conflict_index
+    } else {
+      self
+        .last_index_of_term(reply.conflict_term)
+        .map_or(reply.conflict_index, |last| last.saturating_add(1))
+    };
+    let floor = self.match_of(reply.follower).saturating_add(1);
+    let backed = hint.min(next.saturating_sub(1)).max(floor).max(1);
+    self.next_index.insert(reply.follower, backed);
+  }
+
+  /// The index of this leader's last entry of `term` above its snapshot, if it holds one.
+  fn last_index_of_term(&self, term: u64) -> Option<u64> {
+    let position = self.log.iter().rposition(|entry| entry.term == term)?;
+    let position = u64::try_from(position).ok()?;
+    Some(
+      self
+        .snapshot_index
+        .saturating_add(position)
+        .saturating_add(1),
+    )
   }
 
   /// The leader's CheckQuorum tick (Raft §6.2): if the leader has not been in contact with a majority of
@@ -1459,6 +1635,31 @@ impl RaftNode {
       term: self.current_term,
       success,
       match_index,
+      conflict_term: 0,
+      conflict_index: 0,
+    }
+  }
+
+  /// A consistency-check refusal at the leader's previous index `prev` (at or above our commit index), with
+  /// the conflict hint of Raft §5.3: when our log does not reach `prev`, no term and the index after our
+  /// last entry; otherwise the term we hold at `prev` and the first index of that term's run in our log —
+  /// never below the entry after our snapshot, which holds only committed entries.
+  fn conflict_reply(&self, prev: u64, read_context: u64) -> AppendReply {
+    let (conflict_term, conflict_index) = match self.entry_term(prev) {
+      None => (0, self.last_log_index().saturating_add(1)),
+      Some(term) => {
+        let floor = self.snapshot_index.saturating_add(1);
+        let mut first = prev;
+        while first > floor && self.entry_term(first.saturating_sub(1)) == Some(term) {
+          first = first.saturating_sub(1);
+        }
+        (term, first)
+      }
+    };
+    AppendReply {
+      conflict_term,
+      conflict_index,
+      ..self.append_reply(false, 0, read_context)
     }
   }
 
@@ -1504,6 +1705,10 @@ impl RaftNode {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Shape: an append budget no batch reaches, for the tests of every rule but batching (which pass their
+  /// own).
+  const UNBOUNDED: usize = usize::MAX;
 
   const A: HostId = HostId(1);
   const B: HostId = HostId(2);
@@ -1575,7 +1780,7 @@ mod tests {
   /// no longer be built (the follower needs a snapshot). Returns whether it became stuck; bounded.
   fn replicate_until_stuck(leader: &mut RaftNode, follower: &mut RaftNode, who: HostId) -> bool {
     for _ in 0..8 {
-      let Some(append) = leader.replicate_to(who) else {
+      let Some(append) = leader.replicate_to(who, UNBOUNDED) else {
         return true;
       };
       let reply = follower.on_append_entries(append);
@@ -1655,7 +1860,7 @@ mod tests {
     // Catch up from the compacted prefix before accepting the joint configuration.
     let snapshot = node.install_snapshot_for(B).unwrap();
     node.on_install_snapshot_reply(follower.on_install_snapshot(snapshot));
-    let append = node.replicate_to(B).unwrap();
+    let append = node.replicate_to(B, UNBOUNDED).unwrap();
     node.on_append_reply(follower.on_append_entries(append));
     let saved = node.saved();
     let restored = RaftNode::restore(saved.clone()).unwrap();
@@ -1866,7 +2071,9 @@ mod tests {
       "not committed until a majority holds it"
     );
 
-    let to_b = leader.replicate_to(B).expect("leader replicates");
+    let to_b = leader
+      .replicate_to(B, UNBOUNDED)
+      .expect("leader replicates");
     assert_eq!(to_b.entries.len(), 1);
     let mut follower = RaftNode::new(B, vec![A, B, C]);
     let reply = follower.on_append_entries(to_b);
@@ -1900,13 +2107,13 @@ mod tests {
     // A follower with a single conflicting entry (term 1) at index 1.
     let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 1, None, log_of(&[1]));
 
-    let first = leader.replicate_to(B).expect("append");
+    let first = leader.replicate_to(B, UNBOUNDED).expect("append");
     let reply = follower.on_append_entries(first);
     assert!(!reply.success, "a mismatched previous entry is rejected");
     leader.on_append_reply(reply);
 
     for _ in 0..5 {
-      let append = leader.replicate_to(B).expect("append");
+      let append = leader.replicate_to(B, UNBOUNDED).expect("append");
       let reply = follower.on_append_entries(append);
       leader.on_append_reply(reply);
       if reply.success {
@@ -1941,7 +2148,7 @@ mod tests {
 
     // A majority replicates the old (term-2) entry — it must NOT be committed by count alone.
     let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 5, None, Vec::new());
-    let append = leader.replicate_to(B).expect("append");
+    let append = leader.replicate_to(B, UNBOUNDED).expect("append");
     let reply = follower.on_append_entries(append);
     leader.on_append_reply(reply);
     assert_eq!(
@@ -1952,7 +2159,7 @@ mod tests {
 
     // Appending and replicating a current-term entry commits both together.
     leader.append_command(b"cfg-5".to_vec()); // index 2, term 5
-    let append = leader.replicate_to(B).expect("append");
+    let append = leader.replicate_to(B, UNBOUNDED).expect("append");
     let reply = follower.on_append_entries(append);
     leader.on_append_reply(reply);
     assert_eq!(
@@ -2120,6 +2327,8 @@ mod tests {
       term: leader.term(),
       success: true,
       match_index: 0,
+      conflict_term: 0,
+      conflict_index: 0,
     });
     leader.check_quorum();
     assert!(
@@ -2237,6 +2446,8 @@ mod tests {
         term: a.term(),
         success: true,
         match_index: 0,
+        conflict_term: 0,
+        conflict_index: 0,
       });
       a.check_quorum();
       assert!(
@@ -2292,6 +2503,8 @@ mod tests {
         term,
         success: true,
         match_index,
+        conflict_term: 0,
+        conflict_index: 0,
       });
     }
     assert_eq!(
@@ -2353,13 +2566,15 @@ mod tests {
     let mut successor = RaftNode::new(B, vec![A, B, C]);
     let mut third = RaftNode::new(C, vec![A, B, C]);
     old.append_command(b"old".to_vec());
-    old.on_append_reply(successor.on_append_entries(old.replicate_to(B).unwrap()));
+    old.on_append_reply(successor.on_append_entries(old.replicate_to(B, UNBOUNDED).unwrap()));
     let election = successor.start_election();
     successor.on_vote_reply(third.on_request_vote(election[0]));
     assert!(successor.is_leader());
     successor.append_command(b"new".to_vec());
-    successor.on_append_reply(third.on_append_entries(successor.replicate_to(C).unwrap()));
-    successor.on_append_reply(third.on_append_entries(successor.replicate_to(C).unwrap()));
+    successor
+      .on_append_reply(third.on_append_entries(successor.replicate_to(C, UNBOUNDED).unwrap()));
+    successor
+      .on_append_reply(third.on_append_entries(successor.replicate_to(C, UNBOUNDED).unwrap()));
     assert_eq!(successor.commit_index(), 2);
     let read = old
       .begin_read()
@@ -2378,7 +2593,7 @@ mod tests {
     let mut leader = elected_leader(A, vec![A, B, C]);
     let mut follower = RaftNode::new(B, vec![A, B, C]);
     leader.append_command(b"value".to_vec());
-    let old = follower.on_append_entries(leader.replicate_to(B).unwrap());
+    let old = follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap());
     leader.on_append_reply(old);
     let first = leader.begin_read().unwrap();
     assert_eq!(
@@ -2388,7 +2603,7 @@ mod tests {
     );
     leader.on_append_reply(old);
     assert_eq!(leader.read_index(first), None);
-    let confirmed = follower.on_append_entries(leader.replicate_to(B).unwrap());
+    let confirmed = follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap());
     leader.on_append_reply(confirmed);
     assert_eq!(leader.read_index(first), Some(1));
     assert_eq!(
@@ -2404,7 +2619,7 @@ mod tests {
       None,
       "old replies and cancellation cannot complete the new round"
     );
-    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B).unwrap()));
+    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap()));
     assert_eq!(leader.read_index(second), Some(1));
   }
 
@@ -2417,10 +2632,10 @@ mod tests {
     leader.append_command(b"value".to_vec());
     let mut second = RaftNode::new(B, voters.clone());
     let mut third = RaftNode::new(C, voters);
-    leader.on_append_reply(second.on_append_entries(leader.replicate_to(B).unwrap()));
-    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C).unwrap()));
+    leader.on_append_reply(second.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap()));
+    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C, UNBOUNDED).unwrap()));
     let read = leader.begin_read().unwrap();
-    let reply = second.on_append_entries(leader.replicate_to(B).unwrap());
+    let reply = second.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap());
     leader.on_append_reply(reply);
     leader.on_append_reply(reply);
     leader.on_append_reply(AppendReply {
@@ -2429,7 +2644,7 @@ mod tests {
     });
     assert_eq!(leader.read_index(read), None);
     assert!(leader.begin_membership_change(vec![A, B, C]));
-    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C).unwrap()));
+    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C, UNBOUNDED).unwrap()));
     assert_eq!(
       leader.read_index(read),
       None,
@@ -2466,7 +2681,7 @@ mod tests {
     // Commit a current-term entry with a majority (a follower that already holds the term-3 prefix).
     leader.append_command(b"cfg-4".to_vec());
     let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 4, None, log_of(&[3]));
-    let append = leader.replicate_to(B).expect("append");
+    let append = leader.replicate_to(B, UNBOUNDED).expect("append");
     let reply = follower.on_append_entries(append);
     assert!(
       reply.success,
@@ -2477,7 +2692,7 @@ mod tests {
       .begin_read()
       .expect("current-term commit starts a read");
     assert_eq!(leader.read_index(read), None);
-    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B).unwrap()));
+    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap()));
     assert_eq!(
       leader.read_index(read),
       Some(2),
@@ -2506,6 +2721,8 @@ mod tests {
       term,
       success: true,
       match_index: 1,
+      conflict_term: 0,
+      conflict_index: 0,
     };
 
     // B is a majority of the old set {A,B,C} together with A, but holds no majority of the new set.
@@ -2544,6 +2761,8 @@ mod tests {
         term,
         success: true,
         match_index: 1,
+        conflict_term: 0,
+        conflict_index: 0,
       });
     }
     assert_eq!(leader.commit_index(), 1, "the joint entry committed");
@@ -2579,6 +2798,8 @@ mod tests {
       term,
       success: true,
       match_index,
+      conflict_term: 0,
+      conflict_index: 0,
     };
     // The joint entry (index 1): B with A carries the old set but not the new one, so the change cannot
     // complete yet; C's acknowledgement commits it, and the joint configuration still names the leader.
@@ -2636,6 +2857,8 @@ mod tests {
       term,
       success: true,
       match_index,
+      conflict_term: 0,
+      conflict_index: 0,
     };
     leader.on_append_reply(reply(B, 1));
     assert_eq!(
@@ -2669,6 +2892,8 @@ mod tests {
       term,
       success: true,
       match_index,
+      conflict_term: 0,
+      conflict_index: 0,
     };
     leader.on_append_reply(reply(B, 1));
     assert!(leader.complete_membership_change());
@@ -2773,7 +2998,7 @@ mod tests {
 
     // Commit index 4 by replicating to a follower that holds the term-1/term-2 prefix.
     let mut follower = node_with_uncommitted_log(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
-    let append = leader.replicate_to(B).expect("append");
+    let append = leader.replicate_to(B, UNBOUNDED).expect("append");
     let reply = follower.on_append_entries(append);
     assert!(reply.success);
     leader.on_append_reply(reply);
@@ -2785,7 +3010,9 @@ mod tests {
 
     // Append and replicate again: the follower (already caught up) accepts across the boundary.
     leader.append_command(b"t3-more".to_vec()); // index 5
-    let append = leader.replicate_to(B).expect("append after compaction");
+    let append = leader
+      .replicate_to(B, UNBOUNDED)
+      .expect("append after compaction");
     assert!(
       append.prev_log_index >= leader.snapshot_index(),
       "the append anchors at or after the snapshot"
@@ -2814,7 +3041,7 @@ mod tests {
     });
     leader.append_command(b"t3".to_vec()); // index 4, term 3
     let mut follower_b = node_with_uncommitted_log(B, vec![A, B, C], 3, None, log_of(&[1, 1, 2]));
-    let append = leader.replicate_to(B).expect("append");
+    let append = leader.replicate_to(B, UNBOUNDED).expect("append");
     let reply = follower_b.on_append_entries(append);
     leader.on_append_reply(reply);
     assert_eq!(leader.commit_index(), 4);
@@ -2842,7 +3069,9 @@ mod tests {
     );
 
     // Now a normal append carries the entries beyond the snapshot, and C is caught up.
-    let append = leader.replicate_to(C).expect("append after the snapshot");
+    let append = leader
+      .replicate_to(C, UNBOUNDED)
+      .expect("append after the snapshot");
     let reply = follower_c.on_append_entries(append);
     assert!(reply.success, "C accepts the post-snapshot entries");
     assert_eq!(
@@ -2868,7 +3097,7 @@ mod tests {
     // A follower adopts the joint configuration when it receives the entry.
     let mut follower = RaftNode::new(B, vec![A, B, C]);
     let append = leader
-      .replicate_to(B)
+      .replicate_to(B, UNBOUNDED)
       .expect("append carrying the configuration entry");
     follower.on_append_entries(append);
     assert!(
@@ -2906,7 +3135,7 @@ mod tests {
     // Replicate the joint entry to B and C — a majority of both configurations — so it commits.
     for id in [B, C] {
       let mut follower = RaftNode::new(id, vec![A, B, C]);
-      let append = leader.replicate_to(id).expect("append");
+      let append = leader.replicate_to(id, UNBOUNDED).expect("append");
       let reply = follower.on_append_entries(append);
       leader.on_append_reply(reply);
     }
@@ -2922,5 +3151,220 @@ mod tests {
       leader.in_joint_configuration(),
       "the configuration folded into the snapshot is preserved"
     );
+  }
+
+  /// Raft §7 with §5.3 (`docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`): a
+  /// late copy of an append anchored below a follower's compacted prefix leaves its log exactly as it was —
+  /// the follower matches the leader through its commit index, since every committed entry is the same on
+  /// every server — and the reply says so. Before, the append anchored at zero pushed the entries the
+  /// snapshot already holds onto the end of the log.
+  #[test]
+  fn a_late_append_below_a_compacted_prefix_leaves_the_log_whole() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    for value in 0..5u8 {
+      leader.append_command(vec![value]);
+    }
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    let append = leader.replicate_to(B, UNBOUNDED).expect("an append");
+    let late_copy = append.clone();
+    let reply = follower.on_append_entries(append);
+    leader.on_append_reply(reply);
+    let heartbeat = leader.replicate_to(B, UNBOUNDED).expect("a heartbeat");
+    follower.on_append_entries(heartbeat);
+    assert_eq!(follower.commit_index(), 5);
+    assert!(follower.compact(3, b"state".to_vec()));
+    let before = follower.saved();
+    let reply = follower.on_append_entries(late_copy);
+    assert!(reply.success);
+    assert_eq!(
+      reply.match_index, 5,
+      "it matches the leader through its commit index"
+    );
+    assert_eq!(follower.saved(), before, "the log is exactly as it was");
+  }
+
+  /// Thesis §4.2.1 and Raft §5.3: a follower whose log does not reach the leader's previous index says
+  /// where its log ends, so the leader backs up to it in one round trip — an empty follower behind twenty
+  /// entries costs one refusal, not twenty.
+  #[test]
+  fn an_empty_follower_is_found_in_one_refusal() {
+    let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 1, None, log_of(&[1; 20]));
+    leader.start_election();
+    leader.on_vote_reply(VoteReply {
+      voter: C,
+      term: leader.term(),
+      granted: true,
+    });
+    assert!(leader.is_leader());
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    assert_eq!(catch_up(&mut leader, &mut follower, B), 1);
+    assert_eq!(follower.last_log_index(), 20);
+  }
+
+  /// Raft §5.3: a follower holding a run of a stale term's entries names the term and where the run
+  /// begins, so the leader skips the whole run in one round trip — eight diverged entries cost one refusal,
+  /// not eight — and the follower's log ends as the leader's.
+  #[test]
+  fn a_stale_terms_run_is_skipped_in_one_refusal() {
+    let mut leader = node_with_uncommitted_log(
+      A,
+      vec![A, B, C],
+      3,
+      None,
+      log_of(&[1, 1, 3, 3, 3, 3, 3, 3, 3, 3]),
+    );
+    leader.start_election();
+    leader.on_vote_reply(VoteReply {
+      voter: C,
+      term: leader.term(),
+      granted: true,
+    });
+    assert!(leader.is_leader());
+    let mut follower = node_with_uncommitted_log(
+      B,
+      vec![A, B, C],
+      2,
+      None,
+      log_of(&[1, 1, 2, 2, 2, 2, 2, 2, 2, 2]),
+    );
+    assert_eq!(catch_up(&mut leader, &mut follower, B), 1);
+    assert_eq!(follower.saved().log, leader.saved().log);
+  }
+
+  /// Replicates from `leader` to `follower` (id `who`) until an append succeeds, returning the refusals it
+  /// took; bounded by the leader's log.
+  fn catch_up(leader: &mut RaftNode, follower: &mut RaftNode, who: HostId) -> u64 {
+    let mut refusals = 0;
+    loop {
+      let append = leader.replicate_to(who, UNBOUNDED).expect("an append");
+      let reply = follower.on_append_entries(append);
+      leader.on_append_reply(reply);
+      if reply.success {
+        return refusals;
+      }
+      refusals += 1;
+      assert!(refusals <= leader.last_log_index(), "bounded by the log");
+    }
+  }
+
+  /// An append carries at most its budget of entry bytes ([`LogEntry::encoded_len`]), and never nothing
+  /// while an entry is owed: a budget smaller than one entry still sends that entry, alone, so replication
+  /// always progresses.
+  #[test]
+  fn an_append_carries_its_budget_and_never_nothing_when_owed() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    for value in 0..10u8 {
+      leader.append_command(vec![value]);
+    }
+    let entry = LogEntry::command(leader.term(), vec![0]).encoded_len();
+    let batch = |budget: usize| {
+      leader
+        .replicate_to(B, budget)
+        .expect("an append")
+        .entries
+        .len()
+    };
+    assert_eq!(batch(2 * entry), 2);
+    assert_eq!(batch(3 * entry - 1), 2);
+    for budget in [0, 1, entry - 1] {
+      assert_eq!(batch(budget), 1, "budget {budget}");
+    }
+    assert_eq!(batch(UNBOUNDED), 10);
+  }
+
+  /// Thesis §3.5 (a follower's matched prefix only grows within a term): a late reply never moves its
+  /// progress back — after the follower matched through ten, an earlier success through four and an earlier
+  /// refusal hinting at the log's start leave the next append anchored at ten.
+  #[test]
+  fn late_replies_never_move_progress_back() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    for value in 0..10u8 {
+      leader.append_command(vec![value]);
+    }
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    let reply = follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).expect("an append"));
+    leader.on_append_reply(reply);
+    assert_eq!(reply.match_index, 10);
+    leader.on_append_reply(AppendReply {
+      match_index: 4,
+      ..reply
+    });
+    leader.on_append_reply(AppendReply {
+      success: false,
+      match_index: 0,
+      conflict_term: 0,
+      conflict_index: 1,
+      ..reply
+    });
+    let next = leader.replicate_to(B, UNBOUNDED).expect("a heartbeat");
+    assert_eq!(next.prev_log_index, 10);
+  }
+
+  /// A leader with four entries committed with B and compacted through three, and an empty C that needs
+  /// its snapshot.
+  fn leader_owing_c_a_snapshot() -> (RaftNode, RaftNode) {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    for value in 0..4u8 {
+      leader.append_command(vec![value]);
+    }
+    let mut follower_b = RaftNode::new(B, vec![A, B, C]);
+    let reply = follower_b.on_append_entries(leader.replicate_to(B, UNBOUNDED).expect("an append"));
+    leader.on_append_reply(reply);
+    assert_eq!(leader.commit_index(), 4);
+    assert!(leader.compact(3, b"state-3".to_vec()));
+    let follower_c = RaftNode::new(C, vec![A, B, C]);
+    (leader, follower_c)
+  }
+
+  /// A follower that declines a snapshot (its state did not decode, `crate::fold`) is credited with
+  /// nothing: the leader owes it the snapshot still, and the follower adopted none of it.
+  #[test]
+  fn a_declined_snapshot_credits_the_follower_with_nothing() {
+    let (mut leader, mut follower_c) = leader_owing_c_a_snapshot();
+    let _ = catch_up_or_stuck(&mut leader, &mut follower_c);
+    let snapshot = leader
+      .install_snapshot_for(C)
+      .expect("C needs the snapshot");
+    let reply = follower_c.decline_snapshot(&snapshot);
+    assert_eq!(reply.match_index, 0);
+    leader.on_install_snapshot_reply(reply);
+    assert!(leader.install_snapshot_for(C).is_some(), "C still needs it");
+    assert_eq!(follower_c.snapshot_index(), 0);
+  }
+
+  /// The leader credits a snapshot's recipient with what the recipient says it holds, never with its own
+  /// snapshot index when the reply arrives: a leader that compacted further while the snapshot was in
+  /// flight still owes the follower the newer one.
+  #[test]
+  fn a_snapshot_reply_credits_what_the_follower_holds() {
+    let (mut leader, mut follower_c) = leader_owing_c_a_snapshot();
+    let _ = catch_up_or_stuck(&mut leader, &mut follower_c);
+    let snapshot = leader
+      .install_snapshot_for(C)
+      .expect("C needs the snapshot");
+    let reply = follower_c.on_install_snapshot(snapshot);
+    assert_eq!(reply.match_index, 3);
+    assert!(leader.compact(4, b"state-4".to_vec()));
+    leader.on_install_snapshot_reply(reply);
+    let again = leader
+      .install_snapshot_for(C)
+      .expect("C holds only through 3, below the leader's snapshot at 4");
+    assert_eq!(again.last_included_index, 4);
+  }
+
+  /// Replicates from `leader` to C until an append can no longer be built (C needs a snapshot) or C
+  /// accepts; returns whether it got stuck. Bounded by the leader's log.
+  fn catch_up_or_stuck(leader: &mut RaftNode, follower_c: &mut RaftNode) -> bool {
+    for _ in 0..=leader.last_log_index() {
+      let Some(append) = leader.replicate_to(C, UNBOUNDED) else {
+        return true;
+      };
+      let reply = follower_c.on_append_entries(append);
+      leader.on_append_reply(reply);
+      if reply.success {
+        return false;
+      }
+    }
+    false
   }
 }

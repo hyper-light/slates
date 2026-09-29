@@ -2638,6 +2638,32 @@ reconnaissance because the touched partitions are named up front).
 > drain** (§2.6 status): a stopping daemon hands off what it leads first. Priority placement and multi-log
 > balancing are the next users.
 
+> **Consensus log compaction and bounded replication (2026-09-28;
+> `docs/wip/research/consensus-enhancements.md`, slice 5).** Until this change neither group compacted: every
+> entry of the fleet's life stayed in its log and in every retained publication, and each message's replay
+> copied the whole committed log. What is built:
+>
+> - **Compaction.** Both groups compact by the thesis's size rule (§5.1.2, expansion factor one;
+>   `crates/cluster/src/fold.rs`). The snapshot carries the folded configuration, so an install rebuilds the
+>   same state. A leader waits for its followers while the log is within twice the snapshot, and past that it
+>   compacts regardless, so a laggard or a dead member cannot pin it. The retained publication is at most
+>   three times the configuration plus the uncommitted tail.
+> - **Bounded appends.** An append carries at most a fresh session's first credit of entries
+>   (`raft_wire::append_batch_bytes`).
+> - **Conflict hints.** A refusal carries the §5.3 conflict hint, so an empty follower behind 20 entries is
+>   found in one refusal (before: 20).
+> - **Snapshots on the wire.** `InstallSnapshot` and its reply are wire tags 8 and 9. The reply states what the
+>   follower holds, and a follower that cannot decode the state declines with nothing credited.
+> - **Group identity.** Each group's identity is checked against its retained origin (the first voter
+>   configuration and base), because compaction moves the bases the genesis was computed from.
+>
+> Latent core defects this made reachable are fixed in the same change:
+> `docs/bugs/2026-09-28-a-late-append-could-land-compacted-entries-on-a-log.md`.
+>
+> Measured over 4,000 committed changes: 25.5 µs per change before, 0.6 µs after; retained bytes 90,083 before,
+> 45,607 after. The explorer now compacts, ships and corrupts snapshots, and bounds batches; at full scale
+> there was no violation. Next: learners with catch-up rounds (thesis §4.2.1) on this base.
+
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
 > never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original

@@ -21,6 +21,9 @@ use slates_rt::udp::UdpSocket;
 use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
 
+/// Shape: an append budget no batch reaches — these tests exercise other rules than batching.
+const UNBOUNDED: usize = usize::MAX;
+
 const NAME: &str = "slates-node";
 /// Shape: a small packet budget — sixteen bytes of stream data per frame — so a message spans several
 /// packets and the reassembly, credit and loss paths all run.
@@ -157,7 +160,9 @@ fn run_election_and_replication() -> Outcome {
 
       // Append and replicate an entry, feeding the reply back.
       node.append_command(b"first".to_vec());
-      let append = node.replicate_to(VOTER).expect("an append to replicate");
+      let append = node
+        .replicate_to(VOTER, UNBOUNDED)
+        .expect("an append to replicate");
       if let Some(RaftMessage::AppendReply(reply)) =
         request_raft(&mut endpoint, &RaftMessage::AppendEntries(append))
           .await

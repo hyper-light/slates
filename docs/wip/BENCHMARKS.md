@@ -685,3 +685,30 @@ three voters; heartbeat 100 ms; election timing derived from the modelled round 
 | isolated follower, pre-vote: longest commit gap | 100 ms (the proposal cadence) | 168–284 ms |
 | isolated leader: successor elected after | 1.42–1.59 s | 3.0–3.6 s (one seed 8.3 s) |
 | isolated leader, before the jitter fix | — | 3.0–3.4 s typically; 12.0, 19.3 and 19.9 s on three seeds |
+
+### Consensus log compaction and bounded replication (2026-09-28)
+
+**Command:** `cargo test --release -p slates-cluster --lib measure_a_long_council_history -- --ignored --nocapture`.
+The "before" column is the same drive against `HEAD` `90874fc` in a scratch export. Setup: a sole-voter council
+commits `n` membership changes (alternately admitting and retiring a transient member), each a propose, commit
+and apply — the path a leader period runs. "Retained" is the encoded `SavedRaft`, the publication the control
+shard re-encodes and checksums before every consensus reply. Three runs each, all shown; this box (Apple M5
+Max, macOS 26.4), 2026-09-28.
+
+| changes | retained bytes (before → after) | log entries (before → after) | time per change, µs (before; after) |
+|---|---|---|---|
+| 250 | 5,708 → 3,182 | 251 → 67 | 2.35 / 2.05 / 2.13; 0.59 / 0.54 / 0.51 |
+| 1,000 | 22,583 → 9,601 | 1,001 → 100 | 5.69 / 5.69 / 5.31; 0.50 / 0.48 / 0.42 |
+| 4,000 | 90,083 → 45,607 | 4,001 → 928 | 25.39 / 25.48 / 25.50; 0.62 / 0.62 / 0.57 |
+
+- **Time per change.** Before, it grew with the history's length: each apply copied the whole committed log,
+  so the total was quadratic (102 ms for 4,000 changes). After, it is flat (2.3–2.5 ms for 4,000; 41×).
+- **Retained bytes.** After compaction they are bounded by three times the configuration plus the uncommitted
+  tail (`crate::fold`). What still grows here is the configuration itself: its `epochs` map keeps every host
+  ever admitted (`docs/wip/GAPS.md`, 2026-09-28).
+- **Catch-up round trips** (the core's tests): an empty follower behind 20 entries is found in 1 refusal
+  (before, 20); a stale term's run of 8 entries is skipped in 1 (before, 8).
+- **Measured and rejected: compacting the moment a majority commits.** The follower one round behind was sent
+  the whole snapshot in place of the one entry it lacked, at every compaction. The third voter of a
+  three-voter council never compacted itself, having been sent a snapshot each time. The leader now waits for
+  its followers while the log is within twice the threshold.

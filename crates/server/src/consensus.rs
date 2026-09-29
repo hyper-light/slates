@@ -4,7 +4,7 @@
 //! Only an authenticated local account can explicitly create a new group. A missing quorum stays missing.
 
 use slates_cluster::config_group::RegionalCouncil;
-use slates_cluster::raft::SavedRaft;
+use slates_cluster::raft::{SavedRaft, VoterConfig};
 use slates_cluster::raft_wire::{
   RaftMessage, RaftWireError, decode_regional_configuration, decode_root_configuration,
   encode_regional_configuration, encode_root_configuration,
@@ -80,10 +80,11 @@ pub(crate) fn bootstrap(state: &mut ShardState, root: bool, member: u64) -> Repl
     let _ = state.fleet.install_configuration(configuration, &[local]);
   }
   if let Some((raft, base)) = state.council.join_state() {
-    state.council_group = Some(genesis(false, &raft, &encode_regional_configuration(&base)));
+    state.council_group =
+      GroupIdentity::created(false, &raft, encode_regional_configuration(&base));
   }
   if root && let Some((raft, base)) = state.root.join_state() {
-    state.root_group = Some(genesis(true, &raft, &encode_root_configuration(&base)));
+    state.root_group = GroupIdentity::created(true, &raft, encode_root_configuration(&base));
   }
   state.consensus_ready = state.root.initialized();
   state.bootstrap_authorized = Some(root);
@@ -98,12 +99,14 @@ pub(crate) struct Fetch {
   pub version: u64,
 }
 
-/// The state donor and its prefix travel together. The caller checks the donor against the
-/// authenticated peer before decoding the group's application state.
+/// The state donor and its prefix travel together, with the group's origin — which the joiner hashes
+/// against the group id the reply names, since the donor's bases may have moved past it by compaction. The
+/// caller checks the donor against the authenticated peer before decoding the group's application state.
 #[derive(Wire)]
 struct JoinState {
   raft: SavedRaft,
   base: Vec<u8>,
+  origin: Origin,
 }
 
 #[derive(Wire)]
@@ -126,7 +129,8 @@ pub(crate) fn serve_fetch(state: &ShardState, root: bool, bytes: &[u8]) -> Optio
       state.council.configuration().version,
     )
   };
-  let group = group_id(state, root)?;
+  let identity = group_identity(state, root)?;
+  let group = identity.id;
   if !initialized
     || request.group.is_some_and(|requested| requested != group)
     || (request.group.is_some() && request.version >= version)
@@ -140,12 +144,14 @@ pub(crate) fn serve_fetch(state: &ShardState, root: bool, bytes: &[u8]) -> Optio
     Some(JoinState {
       raft,
       base: encode_root_configuration(&base),
+      origin: identity.origin.clone(),
     })
   } else {
     let (raft, base) = state.council.join_state()?;
     Some(JoinState {
       raft,
       base: encode_regional_configuration(&base),
+      origin: identity.origin.clone(),
     })
   };
   let configuration = if root {
@@ -181,7 +187,7 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
     return false;
   }
   if let Some(join) = &reply.join
-    && genesis(root, &join.raft, &join.base) != reply.group
+    && genesis(root, &join.origin) != reply.group
   {
     return false;
   }
@@ -210,7 +216,10 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
         return false;
       }
       state.root = replacement;
-      state.root_group = Some(reply.group);
+      state.root_group = Some(GroupIdentity {
+        id: reply.group,
+        origin: join.origin,
+      });
       state.recovery.root = None;
     }
     if !state.root.is_voter(state.fleet.host()) {
@@ -246,7 +255,10 @@ pub(crate) fn adopt_fetch(state: &mut ShardState, root: bool, peer: HostId, byte
         return false;
       }
       state.council = replacement;
-      state.council_group = Some(reply.group);
+      state.council_group = Some(GroupIdentity {
+        id: reply.group,
+        origin: join.origin,
+      });
       state.recovery.council = None;
     }
     if !state.council.is_voter(state.fleet.host()) {
@@ -293,23 +305,65 @@ impl Publication {
   }
 }
 
-/// The genesis remains immutable as the log changes the voters. These wrappers do not compact,
-/// so the Raft base voter set and application base are exactly the initial group definition.
-pub(crate) fn genesis(root: bool, raft: &SavedRaft, base: &[u8]) -> [u8; 32] {
+/// The definition a consensus group was created with: its first voter configuration and the encoding of its
+/// first application state. Its hash is the group's identity ([`genesis`]).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct Origin {
+  voters: VoterConfig,
+  base: Vec<u8>,
+}
+
+/// A consensus group's immutable identity (§4.8, AUD-07): the hash of its [`Origin`], and the origin itself.
+/// The hash binds every exchange to the group (the envelope). The origin travels with a join and is retained
+/// with the group, so a donor's or a publication's claim is checked against the origin after compaction has
+/// moved the Raft log's base and the fold's base past it — the check that hashed the current bases held only
+/// while the groups never compacted (until 2026-09-28).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct GroupIdentity {
+  /// The group id: [`genesis`] of the origin.
+  pub id: [u8; 32],
+  /// What the group was created with.
+  pub origin: Origin,
+}
+
+impl GroupIdentity {
+  /// The identity of a group created now, from its current state: nothing has compacted it yet, so its Raft
+  /// base voter configuration and its fold base are its origin. `None` for a state already compacted, which
+  /// no creation produces.
+  pub(crate) fn created(root: bool, raft: &SavedRaft, base: Vec<u8>) -> Option<GroupIdentity> {
+    (raft.snapshot_index == 0).then(|| {
+      let origin = Origin {
+        voters: raft.base.clone(),
+        base,
+      };
+      GroupIdentity {
+        id: genesis(root, &origin),
+        origin,
+      }
+    })
+  }
+}
+
+/// A group's id: the hash of its origin — the same bytes, field for field, as before origins were carried.
+pub(crate) fn genesis(root: bool, origin: &Origin) -> [u8; 32] {
   let mut hash = blake3::Hasher::new();
   hash.update(b"slates/consensus-genesis/v1");
   hash.update(&[u8::from(root)]);
-  hash.update(&raft.base.to_bytes());
-  hash.update(base);
+  hash.update(&origin.voters.to_bytes());
+  hash.update(&origin.base);
   *hash.finalize().as_bytes()
 }
 
-fn group_id(state: &ShardState, root: bool) -> Option<[u8; 32]> {
+fn group_identity(state: &ShardState, root: bool) -> Option<&GroupIdentity> {
   if root {
-    state.root_group
+    state.root_group.as_ref()
   } else {
-    state.council_group
+    state.council_group.as_ref()
   }
+}
+
+fn group_id(state: &ShardState, root: bool) -> Option<[u8; 32]> {
+  group_identity(state, root).map(|identity| identity.id)
 }
 
 /// Bind every consensus exchange to its immutable group, as well as its authenticated member.
@@ -317,6 +371,20 @@ fn group_id(state: &ShardState, root: bool) -> Option<[u8; 32]> {
 struct Envelope {
   group: [u8; 32],
   message: Vec<u8>,
+}
+
+/// Derived: the entry bytes one consensus append carries — a fresh fleet session's first credit at the
+/// fleet frame cap, less the append's fixed header and the [`Envelope`] around it
+/// (`slates_cluster::raft_wire::append_batch_bytes`). The envelope's overhead is measured from its own
+/// encoding, so the two cannot drift apart.
+pub(crate) fn append_batch_bytes() -> usize {
+  let envelope = Envelope {
+    group: [0; 32],
+    message: Vec::new(),
+  }
+  .to_bytes()
+  .len();
+  slates_cluster::raft_wire::append_batch_bytes(crate::fleet::FLEET_FRAME_CAP, envelope)
 }
 
 pub(crate) fn encode_message(

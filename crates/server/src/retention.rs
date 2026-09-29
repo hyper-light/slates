@@ -25,6 +25,9 @@ struct Group {
   base: Vec<u8>,
   view: Vec<u8>,
   genesis: [u8; CHECKSUM_BYTES],
+  /// What the group was created with, whose hash the genesis is: compaction moves the retained bases past
+  /// it, so the check hashes this rather than them.
+  origin: crate::consensus::Origin,
 }
 
 #[derive(Clone, Wire)]
@@ -62,24 +65,26 @@ impl Retained {
       bootstrap: state.bootstrap_authorized,
       recovery: state.recovery.clone(),
       enrolled: state.enrolled.clone(),
-      council: state.council.join_state().zip(state.council_group).map(
-        |((raft, base), genesis)| Group {
+      council: state
+        .council
+        .join_state()
+        .zip(state.council_group.clone())
+        .map(|((raft, base), identity)| Group {
           raft,
           base: encode_regional_configuration(&base),
           view: encode_regional_configuration(state.council.configuration()),
-          genesis,
-        },
-      ),
-      root: state
-        .root
-        .join_state()
-        .zip(state.root_group)
-        .map(|((raft, base), genesis)| Group {
+          genesis: identity.id,
+          origin: identity.origin,
+        }),
+      root: state.root.join_state().zip(state.root_group.clone()).map(
+        |((raft, base), identity)| Group {
           raft,
           base: encode_root_configuration(&base),
           view: encode_root_configuration(state.root.configuration()),
-          genesis,
-        }),
+          genesis: identity.id,
+          origin: identity.origin,
+        },
+      ),
       regions: state
         .node_regions
         .iter()
@@ -96,7 +101,7 @@ impl Retained {
       return Err(invalid("retained consensus belongs to another identity"));
     }
     if let Some(group) = self.council {
-      if crate::consensus::genesis(false, &group.raft, &group.base) != group.genesis {
+      if crate::consensus::genesis(false, &group.origin) != group.genesis {
         return Err(invalid("retained council genesis differs"));
       }
       let base = decode_regional_configuration(&group.base)
@@ -108,10 +113,13 @@ impl Retained {
         .restore_from(group.raft, base)
         .map_err(|_| invalid("invalid retained council state"))?;
       state.council.adopt(view);
-      state.council_group = Some(group.genesis);
+      state.council_group = Some(crate::consensus::GroupIdentity {
+        id: group.genesis,
+        origin: group.origin,
+      });
     }
     if let Some(group) = self.root {
-      if crate::consensus::genesis(true, &group.raft, &group.base) != group.genesis {
+      if crate::consensus::genesis(true, &group.origin) != group.genesis {
         return Err(invalid("retained root genesis differs"));
       }
       let base = decode_root_configuration(&group.base)
@@ -123,7 +131,10 @@ impl Retained {
         .restore_from(group.raft, base)
         .map_err(|_| invalid("invalid retained root state"))?;
       state.root.adopt(view);
-      state.root_group = Some(group.genesis);
+      state.root_group = Some(crate::consensus::GroupIdentity {
+        id: group.genesis,
+        origin: group.origin,
+      });
     }
     state.node_regions = self
       .regions
@@ -303,11 +314,8 @@ mod tests {
       false,
     );
     let (raft, base) = state.council.join_state().unwrap();
-    state.council_group = Some(crate::consensus::genesis(
-      false,
-      &raft,
-      &encode_regional_configuration(&base),
-    ));
+    state.council_group =
+      crate::consensus::GroupIdentity::created(false, &raft, encode_regional_configuration(&base));
     assert!(vote(state, HostId(1), 7));
     retain(state).unwrap();
   }
@@ -363,6 +371,54 @@ mod tests {
         !vote(state, HostId(1), 8),
         "the completed replacement must take precedence"
       );
+    });
+  }
+
+  /// §4.8 (AUD-07) with Raft §7: a council that has compacted its log restores from its publication with the
+  /// same configuration under the same group id. The id is checked against the retained origin, because
+  /// compaction moved the Raft base and the fold base past what the id was computed from; hashing them, as
+  /// the check did before 2026-09-28, refuses every compacted group ("retained council genesis differs").
+  #[test]
+  fn a_compacted_council_restores_under_its_group_id() {
+    use slates_cluster::config_group::Reconfiguration;
+    crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      state.council = RegionalCouncil::new(
+        local,
+        vec![local],
+        vec![local],
+        Quorum { f: 0 },
+        Default::default(),
+        3,
+        false,
+      );
+      let (raft, base) = state.council.join_state().unwrap();
+      state.council_group = crate::consensus::GroupIdentity::created(
+        false,
+        &raft,
+        encode_regional_configuration(&base),
+      );
+      let id = state.council_group.as_ref().unwrap().id;
+      for index in 0..120u64 {
+        let host = HostId(1_000 + index / 2);
+        let change = if index % 2 == 0 {
+          Reconfiguration::Admit { host, domain: None }
+        } else {
+          Reconfiguration::Retire(host)
+        };
+        assert!(state.council.propose(change), "change {index}");
+      }
+      assert!(state.council.compactions() > 0, "the council compacted");
+      assert!(state.council.snapshot_index() > 0);
+      let expected = state.council.configuration().clone();
+      retain(state).unwrap();
+      load(&state.segment)
+        .unwrap()
+        .unwrap()
+        .restore(state)
+        .unwrap();
+      assert_eq!(state.council.configuration(), &expected);
+      assert_eq!(state.council_group.as_ref().unwrap().id, id);
     });
   }
 

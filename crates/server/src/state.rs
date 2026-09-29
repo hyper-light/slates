@@ -216,10 +216,11 @@ pub struct ShardState {
   pub consensus_failure: Option<slates_anchor::AnchorError>,
   /// This start's explicit bootstrap, retained for idempotent retries without resetting Raft.
   pub bootstrap_authorized: Option<bool>,
-  /// The regional group's immutable genesis identity; a separate bootstrap cannot replace its log.
-  pub council_group: Option<[u8; 32]>,
-  /// The root group's immutable genesis identity, distinct from its current voters.
-  pub root_group: Option<[u8; 32]>,
+  /// The regional group's immutable identity — the hash of its origin, with the origin
+  /// (`crate::consensus::GroupIdentity`); a separate bootstrap cannot replace its log.
+  pub council_group: Option<crate::consensus::GroupIdentity>,
+  /// The root group's immutable identity, distinct from its current voters.
+  pub root_group: Option<crate::consensus::GroupIdentity>,
   /// The **root configuration group** across regions (§4.8, D-14 — "a root group across regions holds region
   /// membership and cross-region promotions"): the multi-voter Raft the control shard's config plane drives
   /// over the transport (among the region representatives) to agree on the `RootConfiguration` — which regions

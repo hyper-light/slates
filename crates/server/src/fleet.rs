@@ -4449,14 +4449,15 @@ async fn drive_council_replication(
   if sessions.is_empty() {
     return;
   }
-  // The append owed each borrowed voter, built under a brief borrow (the endpoints stay out here).
+  // What each borrowed voter is owed — a budgeted append, a heartbeat, or the snapshot when its entries were
+  // compacted away — built under a brief borrow (the endpoints stay out here).
+  let batch = crate::consensus::append_batch_bytes();
   let appends: std::collections::BTreeMap<HostId, Vec<u8>> = state::with_state(|s| {
     sessions
       .iter()
       .filter_map(|(host, _)| {
-        s.council.replication_for(*host).and_then(|append| {
-          crate::consensus::encode_message(s, false, &RaftMessage::AppendEntries(append))
-            .map(|bytes| (*host, bytes))
+        s.council.replication_for(*host, batch).and_then(|message| {
+          crate::consensus::encode_message(s, false, &message).map(|bytes| (*host, bytes))
         })
       })
       .collect()
@@ -5066,13 +5067,13 @@ async fn drive_root_replication(
   if sessions.is_empty() {
     return;
   }
+  let batch = crate::consensus::append_batch_bytes();
   let appends: std::collections::BTreeMap<HostId, Vec<u8>> = state::with_state(|s| {
     sessions
       .iter()
       .filter_map(|(host, _)| {
-        s.root.replication_for(*host).and_then(|append| {
-          crate::consensus::encode_message(s, true, &RaftMessage::AppendEntries(append))
-            .map(|bytes| (*host, bytes))
+        s.root.replication_for(*host, batch).and_then(|message| {
+          crate::consensus::encode_message(s, true, &message).map(|bytes| (*host, bytes))
         })
       })
       .collect()
@@ -5193,7 +5194,7 @@ async fn drive_root_learner_fetch(
       group: if s.recovery.root.is_some() {
         None
       } else {
-        s.root_group
+        s.root_group.as_ref().map(|identity| identity.id)
       },
       version: s.root.configuration().version,
     })
@@ -5265,7 +5266,7 @@ async fn drive_learner_fetch(
       group: if s.recovery.council.is_some() {
         None
       } else {
-        s.council_group
+        s.council_group.as_ref().map(|identity| identity.id)
       },
       version: s.council.configuration().version,
     })

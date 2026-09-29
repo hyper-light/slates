@@ -21,6 +21,9 @@ use std::collections::BTreeSet;
 use slates_cluster::raft::{RaftNode, Role};
 use slates_db::register::HostId;
 
+/// Shape: an append budget no batch reaches — these tests exercise other rules than batching.
+const UNBOUNDED: usize = usize::MAX;
+
 /// A deterministic cluster of Raft nodes, addressed by id `HostId(1..=n)`.
 struct Cluster {
   nodes: Vec<RaftNode>,
@@ -90,8 +93,8 @@ impl Cluster {
       if !reachable.contains(&follower) {
         continue;
       }
-      // Bounded by the log length: each rejection backs next_index up by one.
-      while let Some(append) = self.at(leader).replicate_to(follower) {
+      // Bounded by the log length: each rejection backs next_index up by at least one.
+      while let Some(append) = self.at(leader).replicate_to(follower, UNBOUNDED) {
         let reply = self.at(follower).on_append_entries(append);
         let success = reply.success;
         self.at(leader).on_append_reply(reply);

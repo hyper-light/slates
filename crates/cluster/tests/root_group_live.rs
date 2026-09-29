@@ -12,6 +12,10 @@
 
 use std::sync::mpsc::{Receiver, channel};
 
+/// Shape: an append budget no batch reaches — these tests exercise the drive over a live transport, not
+/// batching.
+const UNBOUNDED: usize = usize::MAX;
+
 use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_cluster::raft_wire::{RaftMessage, request_raft};
@@ -195,10 +199,8 @@ fn run_distributed_promotion() -> Outcome {
       // Round one replicates the entry (the voter appends, the leader commits at the majority); round two's
       // heartbeat carries the advanced commit index, so the voter applies too.
       for _ in 0..2 {
-        if let Some(append) = leader.replication_for(VOTER)
-          && let Some(reply) = request_raft(&mut endpoint, &RaftMessage::AppendEntries(append))
-            .await
-            .unwrap()
+        if let Some(message) = leader.replication_for(VOTER, UNBOUNDED)
+          && let Some(reply) = request_raft(&mut endpoint, &message).await.unwrap()
         {
           leader.fold_reply(reply);
         }

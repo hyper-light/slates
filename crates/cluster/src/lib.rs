@@ -37,6 +37,7 @@ pub mod coordinates;
 pub mod detector;
 pub(crate) mod fixed;
 pub mod fleet;
+mod fold;
 mod gossip;
 pub mod membership;
 pub mod progress;

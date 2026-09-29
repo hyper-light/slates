@@ -37,6 +37,10 @@ use slates_transport::endpoint::Endpoint;
 use slates_transport::handshake::Identity;
 use slates_transport::rtt::RttEstimator;
 
+/// Shape: an append budget no batch reaches — these tests exercise the drive over a live transport, not
+/// batching.
+const UNBOUNDED: usize = usize::MAX;
+
 const NAME: &str = "slates-fleet";
 /// Shape: the fleet's frame class — a whole council message or probe in one frame, as the daemon's cap
 /// derived from the RFC 9000 §14.1 minimum datagram gives it, so an exchange is one round trip.
@@ -414,8 +418,8 @@ async fn drive_replication(owner: HostId, others: &[HostId], budget: CommitBudge
       .iter()
       .filter_map(|(host, _)| {
         n.council
-          .replication_for(*host)
-          .map(|append| (*host, RaftMessage::AppendEntries(append).encode()))
+          .replication_for(*host, UNBOUNDED)
+          .map(|message| (*host, message.encode()))
       })
       .collect()
   });

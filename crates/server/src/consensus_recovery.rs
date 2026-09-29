@@ -97,7 +97,7 @@ pub(crate) fn plan(
       raft,
       slates_cluster::raft_wire::encode_root_configuration(&base),
       slates_cluster::raft_wire::encode_root_configuration(state.root.configuration()),
-      state.root_group,
+      state.root_group.as_ref().map(|identity| identity.id),
       state.root.configuration().version,
       state.root.voters(),
     )
@@ -107,7 +107,7 @@ pub(crate) fn plan(
       raft,
       slates_cluster::raft_wire::encode_regional_configuration(&base),
       slates_cluster::raft_wire::encode_regional_configuration(state.council.configuration()),
-      state.council_group,
+      state.council_group.as_ref().map(|identity| identity.id),
       state.council.configuration().version,
       state.council.voters(),
     )
@@ -239,11 +239,14 @@ fn reform(state: &mut ShardState, root: bool) -> Result<[u8; 32], Refusal> {
     let mut base = state.root.configuration().clone();
     base.version = base.version.checked_add(1).ok_or(unavailable.clone())?;
     let group = RootGroup::reform(local, base);
-    let (raft, base) = group.join_state().ok_or(unavailable)?;
-    let identity = crate::consensus::genesis(true, &raft, &encode_root_configuration(&base));
+    let (raft, base) = group.join_state().ok_or(unavailable.clone())?;
+    let identity =
+      crate::consensus::GroupIdentity::created(true, &raft, encode_root_configuration(&base))
+        .ok_or(unavailable)?;
+    let id = identity.id;
     state.root = group;
     state.root_group = Some(identity);
-    Ok(identity)
+    Ok(id)
   } else {
     let mut base = state.council.configuration().clone();
     base.version = base.version.checked_add(1).ok_or(unavailable.clone())?;
@@ -254,11 +257,14 @@ fn reform(state: &mut ShardState, root: bool) -> Result<[u8; 32], Refusal> {
       neighbourhood.generation = base.version;
     }
     let group = RegionalCouncil::reform(local, base, state.council.scatter());
-    let (raft, base) = group.join_state().ok_or(unavailable)?;
-    let identity = crate::consensus::genesis(false, &raft, &encode_regional_configuration(&base));
+    let (raft, base) = group.join_state().ok_or(unavailable.clone())?;
+    let identity =
+      crate::consensus::GroupIdentity::created(false, &raft, encode_regional_configuration(&base))
+        .ok_or(unavailable)?;
+    let id = identity.id;
     state.council = group;
     state.council_group = Some(identity);
-    Ok(identity)
+    Ok(id)
   }
 }
 

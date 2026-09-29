@@ -1,6 +1,6 @@
 //! The Raft wire (§4.8, §4.10a) — the on-the-wire encoding of the configuration group's Raft messages
 //! ([`RequestVote`], [`VoteReply`], [`AppendEntries`], [`AppendReply`], [`PreVote`], [`PreVoteReply`],
-//! [`TimeoutNow`]) so the dialect can be driven over
+//! [`TimeoutNow`], [`InstallSnapshot`], [`InstallSnapshotReply`]) so the dialect can be driven over
 //! the fleet transport. The state machine ([`crate::raft`]) is sans-io and message-passing; this module
 //! is the pure codec that turns those messages into bytes and back.
 //!
@@ -19,8 +19,8 @@ use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
-  AppendEntries, AppendReply, LogEntry, PreVote, PreVoteReply, RaftNode, RequestVote, TimeoutNow,
-  VoteReply, VoterConfig,
+  AppendEntries, AppendReply, InstallSnapshot, InstallSnapshotReply, LogEntry, PreVote,
+  PreVoteReply, RaftNode, RequestVote, TimeoutNow, VoteReply, VoterConfig,
 };
 
 /// A Raft message on the wire.
@@ -42,6 +42,10 @@ pub enum RaftMessage {
   /// A leader's invitation to a caught-up voter to campaign at once (thesis §3.10, leadership transfer).
   /// It has no reply: the invited voter's vote requests are its answer.
   TimeoutNow(TimeoutNow),
+  /// A leader's snapshot for a follower whose next entries were compacted away (Raft §7).
+  InstallSnapshot(InstallSnapshot),
+  /// A follower's reply to a snapshot: how far its log now matches the leader's.
+  InstallSnapshotReply(InstallSnapshotReply),
 }
 
 /// A refusal to decode a Raft message from received bytes (the closed hostile-input taxonomy).
@@ -81,6 +85,29 @@ const TAG_PRE_VOTE: u8 = 5;
 const TAG_PRE_VOTE_REPLY: u8 = 6;
 /// Format: the leadership-transfer invitation's tag byte, continuing the sequence.
 const TAG_TIMEOUT_NOW: u8 = 7;
+/// Format: the snapshot transfer and its reply (Raft §7), continuing the sequence.
+const TAG_INSTALL_SNAPSHOT: u8 = 8;
+const TAG_INSTALL_SNAPSHOT_REPLY: u8 = 9;
+
+/// Format: an append's fixed bytes before its entries — the tag, six `u64` fields (term, leader, previous
+/// index and term, commit index, read context) and the `u32` entry count.
+pub const APPEND_HEADER_BYTES: usize = 1 + 6 * size_of::<u64>() + size_of::<u32>();
+
+/// Derived: the entry bytes one append may carry (the `budget` of [`RaftNode::replicate_to`]) so that the
+/// whole message — its fixed header ([`APPEND_HEADER_BYTES`]), the `envelope` bytes its sender frames it
+/// in, and its entries — fits the credit a fresh session with frames of `frame_cap` bytes grants before any
+/// window update (`slates_transport::connection::initial_receive_window`: the reorder threshold plus one
+/// packets of stream data, the least credit loss detection needs). A batch within it reaches its follower
+/// in one flight on any session, however new; the session's window grows past it on its own, and an entry
+/// larger than it still goes, alone.
+pub fn append_batch_bytes(frame_cap: usize, envelope: usize) -> usize {
+  usize::try_from(slates_transport::connection::initial_receive_window(
+    frame_cap,
+  ))
+  .unwrap_or(usize::MAX)
+  .saturating_sub(APPEND_HEADER_BYTES)
+  .saturating_sub(envelope)
+}
 
 /// Shape: the largest entry count, command length or voter count a decoder accepts before allocating —
 /// a hostile datagram cannot force an unbounded allocation. Far above any real Raft batch or fleet size.
@@ -98,6 +125,8 @@ impl RaftMessage {
       Self::PreVoteReply(reply) => reply.voter,
       Self::AppendReply(reply) => reply.follower,
       Self::TimeoutNow(invitation) => invitation.leader,
+      Self::InstallSnapshot(snapshot) => snapshot.leader,
+      Self::InstallSnapshotReply(reply) => reply.follower,
     }
   }
 
@@ -150,6 +179,8 @@ impl RaftMessage {
         out.push(u8::from(reply.success));
         put_u64(&mut out, reply.match_index);
         put_u64(&mut out, reply.read_context);
+        put_u64(&mut out, reply.conflict_term);
+        put_u64(&mut out, reply.conflict_index);
       }
       RaftMessage::PreVote(request) => {
         out.push(TAG_PRE_VOTE);
@@ -168,6 +199,25 @@ impl RaftMessage {
         out.push(TAG_TIMEOUT_NOW);
         put_u64(&mut out, invitation.term);
         put_u64(&mut out, invitation.leader.0);
+      }
+      RaftMessage::InstallSnapshot(snapshot) => {
+        out.push(TAG_INSTALL_SNAPSHOT);
+        put_u64(&mut out, snapshot.term);
+        put_u64(&mut out, snapshot.leader.0);
+        put_u64(&mut out, snapshot.last_included_index);
+        put_u64(&mut out, snapshot.last_included_term);
+        encode_voter_config(&mut out, &snapshot.config);
+        put_u32(
+          &mut out,
+          u32::try_from(snapshot.state.len()).unwrap_or(u32::MAX),
+        );
+        out.extend_from_slice(&snapshot.state);
+      }
+      RaftMessage::InstallSnapshotReply(reply) => {
+        out.push(TAG_INSTALL_SNAPSHOT_REPLY);
+        put_u64(&mut out, reply.follower.0);
+        put_u64(&mut out, reply.term);
+        put_u64(&mut out, reply.match_index);
       }
     }
     out
@@ -232,6 +282,8 @@ impl RaftMessage {
         let (success, rest) = take_bool(rest)?;
         let (match_index, rest) = take_u64(rest)?;
         let (read_context, rest) = take_u64(rest)?;
+        let (conflict_term, rest) = take_u64(rest)?;
+        let (conflict_index, rest) = take_u64(rest)?;
         expect_end(rest)?;
         Ok(RaftMessage::AppendReply(AppendReply {
           read_context,
@@ -239,6 +291,8 @@ impl RaftMessage {
           term,
           success,
           match_index,
+          conflict_term,
+          conflict_index,
         }))
       }
       TAG_PRE_VOTE => {
@@ -274,12 +328,41 @@ impl RaftMessage {
           leader: HostId(leader),
         }))
       }
+      TAG_INSTALL_SNAPSHOT => {
+        let (term, rest) = take_u64(rest)?;
+        let (leader, rest) = take_u64(rest)?;
+        let (last_included_index, rest) = take_u64(rest)?;
+        let (last_included_term, rest) = take_u64(rest)?;
+        let (config, rest) = decode_voter_config(rest)?;
+        let (state, rest) = take_bytes(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::InstallSnapshot(InstallSnapshot {
+          term,
+          leader: HostId(leader),
+          last_included_index,
+          last_included_term,
+          config,
+          state,
+        }))
+      }
+      TAG_INSTALL_SNAPSHOT_REPLY => {
+        let (follower, rest) = take_u64(rest)?;
+        let (term, rest) = take_u64(rest)?;
+        let (match_index, rest) = take_u64(rest)?;
+        expect_end(rest)?;
+        Ok(RaftMessage::InstallSnapshotReply(InstallSnapshotReply {
+          follower: HostId(follower),
+          term,
+          match_index,
+        }))
+      }
       other => Err(RaftWireError::UnknownTag { tag: other }),
     }
   }
 }
 
 /// Appends a log entry: its term, its command (length-prefixed), then its optional voter configuration.
+/// [`LogEntry::encoded_len`] counts exactly these bytes (`an_entry_takes_the_bytes_the_core_counts`).
 fn encode_entry(out: &mut Vec<u8>, entry: &LogEntry) {
   put_u64(out, entry.term);
   put_u32(out, u32::try_from(entry.command.len()).unwrap_or(u32::MAX));
@@ -288,16 +371,34 @@ fn encode_entry(out: &mut Vec<u8>, entry: &LogEntry) {
     None => out.push(0),
     Some(config) => {
       out.push(1);
-      encode_hosts(out, &config.voters);
-      match &config.joint {
-        None => out.push(0),
-        Some(joint) => {
-          out.push(1);
-          encode_hosts(out, joint);
-        }
-      }
+      encode_voter_config(out, config);
     }
   }
+}
+
+/// Appends a voter configuration: the voter set, then the joint set's presence byte and set.
+fn encode_voter_config(out: &mut Vec<u8>, config: &VoterConfig) {
+  encode_hosts(out, &config.voters);
+  match &config.joint {
+    None => out.push(0),
+    Some(joint) => {
+      out.push(1);
+      encode_hosts(out, joint);
+    }
+  }
+}
+
+/// Decodes a voter configuration from the front of `bytes`, returning it and the remainder.
+fn decode_voter_config(bytes: &[u8]) -> Result<(VoterConfig, &[u8]), RaftWireError> {
+  let (voters, rest) = decode_hosts(bytes)?;
+  let (has_joint, rest) = take_bool(rest)?;
+  let (joint, rest) = if has_joint {
+    let (joint, rest) = decode_hosts(rest)?;
+    (Some(joint), rest)
+  } else {
+    (None, rest)
+  };
+  Ok((VoterConfig { voters, joint }, rest))
 }
 
 /// Decodes a log entry from the front of `bytes`, returning it and the remainder.
@@ -308,19 +409,12 @@ fn decode_entry(bytes: &[u8]) -> Result<(LogEntry, &[u8]), RaftWireError> {
   if !has_config {
     return Ok((LogEntry::command(term, command), rest));
   }
-  let (voters, rest) = decode_hosts(rest)?;
-  let (has_joint, rest) = take_bool(rest)?;
-  let (joint, rest) = if has_joint {
-    let (joint, rest) = decode_hosts(rest)?;
-    (Some(joint), rest)
-  } else {
-    (None, rest)
-  };
+  let (config, rest) = decode_voter_config(rest)?;
   Ok((
     LogEntry {
       term,
       command,
-      config: Some(VoterConfig { voters, joint }),
+      config: Some(config),
     },
     rest,
   ))
@@ -434,6 +528,9 @@ pub async fn serve_raft_once(
       }
       Ok(RaftMessage::AppendEntries(append)) => {
         RaftMessage::AppendReply(node.on_append_entries(append)).encode()
+      }
+      Ok(RaftMessage::InstallSnapshot(snapshot)) => {
+        RaftMessage::InstallSnapshotReply(node.on_install_snapshot(snapshot)).encode()
       }
       _ => Vec::new(),
     })
@@ -692,8 +789,23 @@ mod tests {
     })
   }
 
+  fn snapshot_with_joint_config() -> RaftMessage {
+    RaftMessage::InstallSnapshot(InstallSnapshot {
+      term: 9,
+      leader: A,
+      last_included_index: 7,
+      last_included_term: 8,
+      config: VoterConfig {
+        voters: vec![A, B],
+        joint: Some(vec![B, HostId(3)]),
+      },
+      state: b"configuration".to_vec(),
+    })
+  }
+
   /// Every message kind round-trips through encode/decode unchanged — including an append carrying a
-  /// command entry and a configuration entry with a joint voter set.
+  /// command entry and a configuration entry with a joint voter set, a refusal carrying its conflict hint,
+  /// and a snapshot whose configuration is joint.
   #[test]
   fn every_message_round_trips() {
     let messages = [
@@ -715,6 +827,8 @@ mod tests {
         term: 5,
         success: true,
         match_index: 4,
+        conflict_term: 0,
+        conflict_index: 0,
       }),
       RaftMessage::PreVote(PreVote {
         term: 8,
@@ -728,6 +842,21 @@ mod tests {
         granted: false,
       }),
       RaftMessage::TimeoutNow(TimeoutNow { term: 9, leader: A }),
+      RaftMessage::AppendReply(AppendReply {
+        read_context: 3,
+        follower: B,
+        term: 5,
+        success: false,
+        match_index: 0,
+        conflict_term: 4,
+        conflict_index: 2,
+      }),
+      snapshot_with_joint_config(),
+      RaftMessage::InstallSnapshotReply(InstallSnapshotReply {
+        follower: B,
+        term: 9,
+        match_index: 7,
+      }),
     ];
     for message in messages {
       let bytes = message.encode();
@@ -754,7 +883,7 @@ mod tests {
   /// cannot see that).
   #[test]
   fn every_message_has_a_golden_encoding() {
-    let golden: [(RaftMessage, Vec<u8>); 7] = [
+    let golden: [(RaftMessage, Vec<u8>); 9] = [
       (
         RaftMessage::RequestVote(RequestVote {
           term: 7,
@@ -832,16 +961,20 @@ mod tests {
           read_context: 6,
           follower: HostId(2),
           term: 5,
-          success: true,
+          success: false,
           match_index: 4,
+          conflict_term: 0x0a,
+          conflict_index: 0x0b,
         }),
         [
           &[TAG_APPEND_REPLY][..],
-          &[2, 0, 0, 0, 0, 0, 0, 0],
-          &[5, 0, 0, 0, 0, 0, 0, 0],
-          &[1],
-          &[4, 0, 0, 0, 0, 0, 0, 0],
-          &[6, 0, 0, 0, 0, 0, 0, 0],
+          &[2, 0, 0, 0, 0, 0, 0, 0],    // follower
+          &[5, 0, 0, 0, 0, 0, 0, 0],    // term
+          &[0],                         // success
+          &[4, 0, 0, 0, 0, 0, 0, 0],    // match_index
+          &[6, 0, 0, 0, 0, 0, 0, 0],    // read_context
+          &[0x0a, 0, 0, 0, 0, 0, 0, 0], // conflict_term
+          &[0x0b, 0, 0, 0, 0, 0, 0, 0], // conflict_index
         ]
         .concat(),
       ),
@@ -887,6 +1020,48 @@ mod tests {
         ]
         .concat(),
       ),
+      (
+        RaftMessage::InstallSnapshot(InstallSnapshot {
+          term: 9,
+          leader: HostId(1),
+          last_included_index: 7,
+          last_included_term: 8,
+          config: VoterConfig {
+            voters: vec![HostId(1)],
+            joint: Some(vec![HostId(2)]),
+          },
+          state: b"st".to_vec(),
+        }),
+        [
+          &[TAG_INSTALL_SNAPSHOT][..],
+          &[9, 0, 0, 0, 0, 0, 0, 0], // term
+          &[1, 0, 0, 0, 0, 0, 0, 0], // leader
+          &[7, 0, 0, 0, 0, 0, 0, 0], // last_included_index
+          &[8, 0, 0, 0, 0, 0, 0, 0], // last_included_term
+          &[1, 0, 0, 0],             // voter count
+          &[1, 0, 0, 0, 0, 0, 0, 0],
+          &[1],          // a joint set
+          &[1, 0, 0, 0], // joint count
+          &[2, 0, 0, 0, 0, 0, 0, 0],
+          &[2, 0, 0, 0], // state length
+          b"st",
+        ]
+        .concat(),
+      ),
+      (
+        RaftMessage::InstallSnapshotReply(InstallSnapshotReply {
+          follower: HostId(2),
+          term: 9,
+          match_index: 7,
+        }),
+        [
+          &[TAG_INSTALL_SNAPSHOT_REPLY][..],
+          &[2, 0, 0, 0, 0, 0, 0, 0],
+          &[9, 0, 0, 0, 0, 0, 0, 0],
+          &[7, 0, 0, 0, 0, 0, 0, 0],
+        ]
+        .concat(),
+      ),
     ];
     for (message, bytes) in golden {
       assert_eq!(
@@ -924,6 +1099,120 @@ mod tests {
       RaftMessage::decode_from(&bytes, B),
       Err(RaftWireError::ForeignSender)
     );
+  }
+
+  /// Hostile input on the snapshot transfer (Raft §7): every truncation of a valid encoding is refused
+  /// `Truncated` or `LengthMismatch` (a cut inside a declared count or the state), a trailing byte is
+  /// `LengthMismatch`, a state length reaching past the bytes is `LengthMismatch` before any allocation, a
+  /// joint flag that is neither zero nor one is `BadFlag`, and a session cannot ship a snapshot, or answer
+  /// one, for another member.
+  #[test]
+  fn a_hostile_snapshot_is_refused() {
+    let snapshot = snapshot_with_joint_config();
+    let bytes = snapshot.encode();
+    for cut in 1..bytes.len() {
+      assert!(
+        matches!(
+          RaftMessage::decode(&bytes[..cut]),
+          Err(RaftWireError::Truncated | RaftWireError::LengthMismatch)
+        ),
+        "cut at {cut}"
+      );
+    }
+    let mut long = bytes.clone();
+    long.push(0);
+    assert_eq!(
+      RaftMessage::decode(&long),
+      Err(RaftWireError::LengthMismatch)
+    );
+    // The state's length is the four bytes before it: claim far more than follows.
+    let state_length_at = bytes.len() - b"configuration".len() - size_of::<u32>();
+    let mut lying = bytes.clone();
+    lying[state_length_at..state_length_at + size_of::<u32>()]
+      .copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      RaftMessage::decode(&lying),
+      Err(RaftWireError::LengthMismatch)
+    );
+    // The joint flag follows the tag, four u64 fields, the voter count and two voters.
+    let joint_flag_at = 1 + 4 * size_of::<u64>() + size_of::<u32>() + 2 * size_of::<u64>();
+    let mut bad_flag = bytes.clone();
+    bad_flag[joint_flag_at] = 2;
+    assert_eq!(
+      RaftMessage::decode(&bad_flag),
+      Err(RaftWireError::BadFlag { flag: 2 })
+    );
+    assert_eq!(
+      RaftMessage::decode_from(&bytes, B),
+      Err(RaftWireError::ForeignSender)
+    );
+    let reply = RaftMessage::InstallSnapshotReply(InstallSnapshotReply {
+      follower: B,
+      term: 9,
+      match_index: 7,
+    })
+    .encode();
+    assert_eq!(
+      RaftMessage::decode_from(&reply, A),
+      Err(RaftWireError::ForeignSender)
+    );
+  }
+
+  /// Doc truth: [`LogEntry::encoded_len`] — the size the core's append budget counts — is exactly the bytes
+  /// this codec writes for an entry, for a command entry, an empty one, and configuration entries with and
+  /// without a joint set; and [`APPEND_HEADER_BYTES`] is exactly an empty append's encoding.
+  #[test]
+  fn an_entry_takes_the_bytes_the_core_counts() {
+    let entries = [
+      LogEntry::command(3, b"command".to_vec()),
+      LogEntry::command(3, Vec::new()),
+      LogEntry::configuration(
+        4,
+        VoterConfig {
+          voters: vec![A, B, HostId(3)],
+          joint: None,
+        },
+      ),
+      LogEntry::configuration(
+        5,
+        VoterConfig {
+          voters: vec![A],
+          joint: Some(vec![B, HostId(3)]),
+        },
+      ),
+    ];
+    for entry in &entries {
+      let mut out = Vec::new();
+      encode_entry(&mut out, entry);
+      assert_eq!(out.len(), entry.encoded_len(), "{entry:?}");
+    }
+    let empty = RaftMessage::AppendEntries(AppendEntries {
+      read_context: 0,
+      term: 0,
+      leader: A,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: Vec::new(),
+      leader_commit: 0,
+    });
+    assert_eq!(empty.encode().len(), APPEND_HEADER_BYTES);
+  }
+
+  /// The derived batch budget: a whole append — its header, the sender's envelope and a batch of exactly the
+  /// budget — is the credit a fresh session grants before any window update, so it needs no update to
+  /// arrive; and an envelope larger than that credit leaves no budget rather than wrapping.
+  #[test]
+  fn a_budgeted_append_fits_a_fresh_sessions_first_credit() {
+    let frame_cap = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
+    let envelope = 36;
+    let credit = usize::try_from(slates_transport::connection::initial_receive_window(
+      frame_cap,
+    ))
+    .unwrap();
+    let budget = append_batch_bytes(frame_cap, envelope);
+    assert!(budget > 0);
+    assert_eq!(budget + APPEND_HEADER_BYTES + envelope, credit);
+    assert_eq!(append_batch_bytes(frame_cap, credit), 0);
   }
 
   /// An empty input and an unknown tag are refused, not panicked.
