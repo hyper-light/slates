@@ -733,3 +733,22 @@ a_terminated_council_leader_process_hands_off_before_it_exits -- --exact --nocap
 - One timestamped run splits it: the drain's start to the successor winning took 109 ms (one period: the
   invitation at +33 ms, the successor's next period at +109 ms); `SIGTERM` to the drain's start took about
   95 ms. The daemon checks for a stop once per 100 ms heartbeat.
+
+### Priority elections across published inter-region round trips (2026-09-28)
+
+**Command:** `cargo test -p slates-cluster --release --test priority -- --nocapture` (virtual time; twenty
+seeds; Microsoft's "Azure network round-trip latency statistics", P50, page dated 2026-07-30, directional,
+one way = half the round trip, ± 5 ms jitter; heartbeat 100 ms; a proposal every 50 ms; regions placed on
+hosts by a seed-dependent permutation).
+
+| region set | order | final leaders (seeds) | median commit latency, median of seeds |
+|---|---|---|---|
+| East US, West Europe, Japan East (quorum 83 / 85 / 162 ms) | first timeout | East US 20 | 137 ms |
+| same | priority | East US 20 (0 transfers) | 137 ms |
+| + Southeast Asia, Brazil South (quorum 117 / 169 / 162 / 169 / 185 ms) | first timeout | East US 14, West Europe 6 | 189 ms |
+| same | priority | East US 20 (6 transfers) | 171 ms |
+| five regions, East US down 20–40 s | first timeout | Brazil South 3, Japan East 6, Southeast Asia 5, West Europe 6 | 234 ms |
+| same | priority | East US 20 (27 transfers) | 201 ms |
+
+About half a 100 ms period of every commit latency is the drive's cadence: a proposal waits for the next
+period before it is replicated.

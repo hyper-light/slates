@@ -33,7 +33,9 @@ use std::mem::size_of;
 use slates_db::register::{HostId, OBJECT_BYTES, ObjectId, RegionId, RootConfiguration};
 
 use crate::fold::{Fold, Snapshotted};
-use crate::raft::{CatchUp, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal};
+use crate::raft::{
+  CatchUp, ElectionPriority, RaftNode, RaftRecoveryError, SavedRaft, TimeoutNow, TransferRefusal,
+};
 use crate::raft_wire::{RaftMessage, decode_root_configuration, encode_root_configuration};
 
 /// A root configuration rides a root-group snapshot as the bytes a learner's fetch ships.
@@ -724,6 +726,28 @@ impl RootGroup {
   /// The stagings this group aborted — a representative that could not catch up — over its life.
   pub fn stagings_aborted(&self) -> u64 {
     self.stagings_aborted
+  }
+
+  /// Records this node's own election priority, as its drive measured it this period (§3.4).
+  pub fn set_priority(&mut self, priority: ElectionPriority) {
+    self.raft.set_priority(priority);
+  }
+
+  /// This node's election rank among the voters the caller holds `alive` (§3.4,
+  /// [`RaftNode::election_rank`]): the timer yields one timeout per rank.
+  pub fn election_rank(&self, alive: &[HostId]) -> usize {
+    self.raft.election_rank(alive)
+  }
+
+  /// Hands leadership to a live, caught-up voter that outranks this leader, when one does (§3.4 with thesis
+  /// §3.10, [`RaftNode::priority_transfer`]); the drive ships the invitation as for any transfer.
+  pub fn priority_transfer(&mut self, alive: &[HostId]) -> Option<HostId> {
+    self.raft.priority_transfer(alive)
+  }
+
+  /// The priority transfers this node started as leader, over its life.
+  pub fn priority_transfers(&self) -> u64 {
+    self.raft.priority_transfers()
   }
 
   /// Adopts a root configuration fetched from a group voter (§4.8, D-14: the root group is a small elected

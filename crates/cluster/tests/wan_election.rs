@@ -647,7 +647,9 @@ async fn follow_or_campaign(
     });
     return;
   }
-  if !with_node(owner, |n| n.timer.follower_period(contact, timing, owner)) {
+  if !with_node(owner, |n| {
+    n.timer.follower_period(contact, timing, owner, 0)
+  }) {
     return;
   }
   with_node(owner, |n| n.campaigns += 1);

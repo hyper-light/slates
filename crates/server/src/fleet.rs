@@ -87,7 +87,9 @@ use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::root_group::root_representatives;
 use slates_cluster::swim::{Delivery, ProbeOutcome, SwimMessage, deliver_once, probe_once};
-use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, round_budget};
+use slates_cluster::timing::{
+  ElectionTimer, ElectionTiming, PathRtt, RoundAnchors, quorum_priority, round_budget,
+};
 use slates_cluster::{
   ClusterError, CommitBudget, PROMOTE_STREAM, RECORD_STREAM, Stragglers, TimedReply, broadcast,
   commit_record, promote_record, request_within,
@@ -4456,8 +4458,8 @@ async fn drive_council_replication(
   }
   // What each borrowed voter is owed — a budgeted append, a heartbeat, or the snapshot when its entries were
   // compacted away — built under a brief borrow (the endpoints stay out here).
-  let batch = crate::consensus::append_batch_bytes();
   let appends: std::collections::BTreeMap<HostId, Vec<u8>> = state::with_state(|s| {
+    let batch = crate::consensus::append_batch_bytes(s.council.voters().len());
     sessions
       .iter()
       .filter_map(|(host, _)| {
@@ -4825,7 +4827,13 @@ async fn lead_council_period(
   drive_council_replication(others, budget, in_flight).await;
   drive_transfer_invitation(Group::Council, budget, in_flight).await;
   if timer.leader_period(timing) {
-    state::with_state(|s| s.council.check_quorum());
+    state::with_state(|s| {
+      s.council.check_quorum();
+      // A voter that commits distinguishably faster takes over, once this leader has led a whole window
+      // (§3.4); its invitation leaves with next period's replication.
+      let alive = authenticated_alive(s);
+      s.council.priority_transfer(&alive);
+    });
   }
 }
 
@@ -4856,7 +4864,11 @@ async fn lead_root_period(
   drive_root_replication(others, budget, in_flight).await;
   drive_transfer_invitation(Group::Root, budget, in_flight).await;
   if timer.leader_period(timing) {
-    state::with_state(|s| s.root.check_quorum());
+    state::with_state(|s| {
+      s.root.check_quorum();
+      let alive = authenticated_alive(s);
+      s.root.priority_transfer(&alive);
+    });
   }
 }
 
@@ -4872,7 +4884,7 @@ async fn drive_config_council(
   timer: &mut ElectionTimer,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let Some((is_voter, is_leader, contact, voters, targets)) = state::with_state(|s| {
+  let Some((is_voter, is_leader, contact, voters, targets, rank)) = state::with_state(|s| {
     if s.recovery.council.is_some() {
       return (
         false,
@@ -4880,14 +4892,28 @@ async fn drive_config_council(
         s.council.leader_contact(),
         Vec::new(),
         Vec::new(),
+        0,
       );
     }
+    let voters = s.council.voters();
+    // This period's election priority (§3.4): the quorum round trip over the measured paths to the other
+    // voters; and this node's rank among the voters it holds alive, for the timer's gate.
+    let priority = quorum_priority(
+      voters
+        .iter()
+        .filter(|voter| **voter != local)
+        .map(|voter| s.peer_paths.get(voter)),
+      voters.len(),
+    );
+    s.council.set_priority(priority);
+    let rank = s.council.election_rank(&authenticated_alive(s));
     (
       s.council.is_voter(local),
       s.council.is_leader(),
       s.council.leader_contact(),
-      s.council.voters(),
+      voters,
       s.council.replication_targets(),
+      rank,
     )
   }) else {
     return;
@@ -4947,7 +4973,7 @@ async fn drive_config_council(
   }
   // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
   // jittered timeout under this period's derived timing and campaigns there.
-  if timer.follower_period(contact, &timing, local) {
+  if timer.follower_period(contact, &timing, local, rank) {
     drive_council_election(&others, budget, in_flight).await;
     // Re-baseline the contact counter so a fresh campaign is not immediately retriggered: a won election
     // makes this node leader next period; a lost one waits out the timer again.
@@ -5012,7 +5038,7 @@ async fn drive_root_group(
   timer: &mut ElectionTimer,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let Some((is_voter, is_leader, contact, voters, targets)) = state::with_state(|s| {
+  let Some((is_voter, is_leader, contact, voters, targets, rank)) = state::with_state(|s| {
     if s.recovery.root.is_some() {
       return (
         false,
@@ -5020,14 +5046,28 @@ async fn drive_root_group(
         s.root.leader_contact(),
         Vec::new(),
         Vec::new(),
+        0,
       );
     }
+    let voters = s.root.voters();
+    // This period's root election priority and rank, as the council's (§3.4) — across regions, where the
+    // quorum round trips differ and the priority does its work.
+    let priority = quorum_priority(
+      voters
+        .iter()
+        .filter(|voter| **voter != local)
+        .map(|voter| s.peer_paths.get(voter)),
+      voters.len(),
+    );
+    s.root.set_priority(priority);
+    let rank = s.root.election_rank(&authenticated_alive(s));
     (
       s.root.is_voter(local),
       s.root.is_leader(),
       s.root.leader_contact(),
-      s.root.voters(),
+      voters,
       s.root.replication_targets(),
+      rank,
     )
   }) else {
     return;
@@ -5067,7 +5107,7 @@ async fn drive_root_group(
   }
   // A follower: the timer resets while the leader keeps making contact; otherwise it ages toward its
   // jittered timeout under this period's derived timing and campaigns there.
-  if timer.follower_period(contact, &timing, local) {
+  if timer.follower_period(contact, &timing, local, rank) {
     drive_root_election(&others, budget, in_flight).await;
     if let Some(contact) = state::with_state(|s| s.root.leader_contact()) {
       timer.rebaseline(contact);
@@ -5087,8 +5127,8 @@ async fn drive_root_replication(
   if sessions.is_empty() {
     return;
   }
-  let batch = crate::consensus::append_batch_bytes();
   let appends: std::collections::BTreeMap<HostId, Vec<u8>> = state::with_state(|s| {
+    let batch = crate::consensus::append_batch_bytes(s.root.voters().len());
     sessions
       .iter()
       .filter_map(|(host, _)| {

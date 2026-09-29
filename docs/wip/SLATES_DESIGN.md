@@ -2674,6 +2674,20 @@ reconnaissance because the touched partitions are named up front).
 > membership changes, including a removed leader stepping down (§4.2.2), with no violation at full scale.
 > The groups' `voters()` is the voter set; `replication_targets()` is what the drive replicates to.
 
+> **Priority elections (2026-09-28; `docs/wip/research/consensus-enhancements.md`, slice 7).** A voter's
+> election priority is its measured quorum round trip: the `⌊n/2⌋`-th smallest smoothed round trip to the
+> other voters, with that path's spread, which is the round trip it would commit in as leader. Followers
+> report theirs in every `AppendReply`, and the leader returns every voter's in its `AppendEntries`, so every
+> follower ranks itself against one table.
+>
+> The election timer yields one timeout per live voter whose interval lies wholly below its own
+> (SOFAJRaft's decaying target, in ranks). A leader that has led a whole window hands off (thesis §3.10) to
+> a live voter that outranks it, at most once per leadership that aborts.
+>
+> Overlapping intervals tie, so a single host, or an unmeasured group, behaves exactly as before. Across
+> Microsoft's published five-region matrix, the fastest-committing region leads every seed, where the first
+> timeout picked it on 14 of 20, and takes leadership back after an outage.
+
 > **Takeover placement retention (2026-09-17).** Accepted held records retain their owner's bounded
 > candidate set and quorum. Retirement selects among those candidates still in committed membership,
 > never from a neighborhood rebuilt after a fresh replacement joined. Phase one uses that original

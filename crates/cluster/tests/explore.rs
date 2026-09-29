@@ -28,6 +28,10 @@
 //! batch boundaries, and a snapshot's state is sometimes corrupted in flight, which its recipient must
 //! decline (the groups decode the state first, `crate::fold`) without the leader crediting it.
 //!
+//! Priority is explored (`docs/wip/research/consensus-enhancements.md` §3.4): every node holds a distinct
+//! random election priority for its history, and a leader's CheckQuorum tick hands leadership to a node that
+//! outranks it once it has led a whole window — so priority transfers interleave with every fault above.
+//!
 //! Membership changes are explored (Raft §6, thesis §4.2.1): every history has one spare node beyond its
 //! voters, and the leader's reconfiguration move — the groups' `reconcile_voters` rule — brings a non-voter
 //! in through staging (caught up in rounds before the joint change may begin) while there is room for one
@@ -41,7 +45,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use slates_cluster::raft::{CatchUp, InstallSnapshot, LogEntry, RaftNode, SavedRaft};
+use slates_cluster::raft::{
+  CatchUp, ElectionPriority, InstallSnapshot, LogEntry, RaftNode, SavedRaft,
+};
 use slates_cluster::raft_wire::RaftMessage;
 use slates_db::register::HostId;
 
@@ -67,6 +73,11 @@ const IN_FLIGHT_BOUND: usize = 256;
 /// Shape: the commands a history proposes at most, so the logs stay small enough to compare pairwise after
 /// every step.
 const PROPOSALS_BOUND: u64 = 64;
+/// Shape: the range of the explorer's random quorum round trips, and their spread — wide enough that most
+/// pairs of nodes outrank one another and a few tie.
+const PRIORITY_FLOOR_MS: u64 = 50;
+const PRIORITY_CEILING_MS: u64 = 250;
+const PRIORITY_SPREAD_MS: u64 = 5;
 /// Shape: the events a replayed history keeps for its diagnosis — the last few hundred steps' worth.
 const TRACE_BOUND: usize = 2_000;
 /// Shape: the fewest voters a reconfiguration leaves — three, the smallest group that tolerates a failure.
@@ -142,6 +153,8 @@ struct Counters {
   members_caught_up: u64,
   /// Stagings aborted: the member's lag did not shrink for a whole window.
   stagings_aborted: u64,
+  /// Leadership transfers started by priority (§3.4).
+  priority_transfers: u64,
 }
 
 /// One explored cluster: the nodes, what each last retained, the network, the partition, and the history
@@ -166,6 +179,8 @@ struct Cluster {
   /// The last events of a replayed history, for diagnosing a violation ([`replay_to_the_first_violation`]);
   /// `None` in an ordinary exploration, which formats nothing.
   trace: Option<std::collections::VecDeque<String>>,
+  /// Each node's election priority for the history (§3.4), set again after a crash-restart.
+  priorities: BTreeMap<HostId, ElectionPriority>,
 }
 
 impl Cluster {
@@ -188,6 +203,7 @@ impl Cluster {
       corrupt_next_snapshot: false,
       counters: Counters::default(),
       trace: None,
+      priorities: BTreeMap::new(),
     }
   }
 
@@ -545,7 +561,27 @@ impl Cluster {
     self.note(|| format!("crash {id:?}"));
     self.nodes[at] =
       RaftNode::restore(self.retained[at].clone()).expect("a retained state restores");
+    // A priority is measured, not retained: the restarted node measures the same paths again.
+    if let Some(priority) = self.priorities.get(&id) {
+      self.nodes[at].set_priority(*priority);
+    }
     self.counters.crashes += 1;
+  }
+
+  /// Gives every node a distinct random election priority for the history (§3.4): quorum round trips
+  /// between [`PRIORITY_FLOOR_MS`] and [`PRIORITY_CEILING_MS`], each with a spread of
+  /// [`PRIORITY_SPREAD_MS`] — some pairs outrank, some tie.
+  fn assign_priorities(&mut self, rng: &mut Rng) {
+    for node in &mut self.nodes {
+      let span = usize::try_from(PRIORITY_CEILING_MS - PRIORITY_FLOOR_MS).unwrap();
+      let quorum_ms = PRIORITY_FLOOR_MS + u64::try_from(rng.below(span)).unwrap();
+      let priority = ElectionPriority {
+        quorum_ns: quorum_ms * 1_000_000,
+        spread_ns: PRIORITY_SPREAD_MS * 1_000_000,
+      };
+      node.set_priority(priority);
+      self.priorities.insert(node.id(), priority);
+    }
   }
 
   /// One step chosen by `rng`: any action in an adversarial stretch; in a calm one, no crash, drop, duplicate
@@ -650,9 +686,13 @@ impl Cluster {
 
   /// Every node that believes it leads runs its CheckQuorum tick.
   fn check_quorum_everywhere(&mut self) {
+    let all: Vec<HostId> = self.nodes.iter().map(RaftNode::id).collect();
     for node in &mut self.nodes {
       if node.is_leader() {
         node.check_quorum();
+        if node.priority_transfer(&all).is_some() {
+          self.counters.priority_transfers += 1;
+        }
       }
     }
   }
@@ -893,6 +933,7 @@ fn explore(size: u64, seeds: u64) -> Counters {
   for seed in 0..seeds {
     let mut rng = Rng(seed ^ (size << 32));
     let mut cluster = Cluster::new(size);
+    cluster.assign_priorities(&mut rng);
     for step in 0..STEPS {
       let calm = (step / STRETCH) % 2 == 1;
       cluster.step(&mut rng, calm);
@@ -919,6 +960,7 @@ fn explore(size: u64, seeds: u64) -> Counters {
     total.changes_completed += c.changes_completed;
     total.members_caught_up += c.members_caught_up;
     total.stagings_aborted += c.stagings_aborted;
+    total.priority_transfers += c.priority_transfers;
   }
   total
 }
@@ -955,6 +997,7 @@ fn explore_and_check_coverage(seeds: u64) {
         counted.members_caught_up,
         "added members were caught up before their change",
       ),
+      (counted.priority_transfers, "leaders handed off by priority"),
     ];
     for (count, path) in floors {
       assert!(
@@ -992,20 +1035,28 @@ fn the_dialect_keeps_raft_safety_at_full_scale() {
 /// its trace on, and at the first step whose check fails prints the trace — the last events and every
 /// node's state after each step — to standard error before failing (R1: a test writes no host path; the
 /// caller redirects it). Run by hand: `SLATES_EXPLORE_SIZE=3 SLATES_EXPLORE_SEED=0 cargo test -p
-/// slates-cluster --test explore replay_to_the_first_violation -- --ignored --nocapture 2> <file>`.
+/// slates-cluster --test explore replay_to_the_first_violation -- --ignored --nocapture 2> <file>`. Without
+/// its environment it skips loudly and passes, so an `--ignored` run of the whole file never fails on it
+/// (CI run 36511884967 did, `3316fc0`).
 #[test]
 #[ignore = "a diagnosis tool, run by hand with its environment set"]
 fn replay_to_the_first_violation() {
-  let size: u64 = std::env::var("SLATES_EXPLORE_SIZE")
-    .unwrap()
-    .parse()
-    .unwrap();
-  let seed: u64 = std::env::var("SLATES_EXPLORE_SEED")
-    .unwrap()
-    .parse()
-    .unwrap();
+  let (Some(size), Some(seed)) = (
+    std::env::var("SLATES_EXPLORE_SIZE")
+      .ok()
+      .and_then(|size| size.parse::<u64>().ok()),
+    std::env::var("SLATES_EXPLORE_SEED")
+      .ok()
+      .and_then(|seed| seed.parse::<u64>().ok()),
+  ) else {
+    eprintln!(
+      "skipping the replay: set SLATES_EXPLORE_SIZE and SLATES_EXPLORE_SEED to replay one history"
+    );
+    return;
+  };
   let mut rng = Rng(seed ^ (size << 32));
   let mut cluster = Cluster::new(size);
+  cluster.assign_priorities(&mut rng);
   cluster.trace = Some(std::collections::VecDeque::new());
   for step in 0..STEPS {
     let calm = (step / STRETCH) % 2 == 1;

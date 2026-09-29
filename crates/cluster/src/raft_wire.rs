@@ -19,8 +19,8 @@ use slates_transport::connection::Priority;
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
 use crate::raft::{
-  AppendEntries, AppendReply, InstallSnapshot, InstallSnapshotReply, LogEntry, PreVote,
-  PreVoteReply, RaftNode, RequestVote, TimeoutNow, VoteReply, VoterConfig,
+  AppendEntries, AppendReply, ElectionPriority, InstallSnapshot, InstallSnapshotReply, LogEntry,
+  PreVote, PreVoteReply, RaftNode, RequestVote, TimeoutNow, VoteReply, VoterConfig,
 };
 
 /// A Raft message on the wire.
@@ -94,18 +94,21 @@ const TAG_INSTALL_SNAPSHOT_REPLY: u8 = 9;
 pub const APPEND_HEADER_BYTES: usize = 1 + 6 * size_of::<u64>() + size_of::<u32>();
 
 /// Derived: the entry bytes one append may carry (the `budget` of [`RaftNode::replicate_to`]) so that the
-/// whole message — its fixed header ([`APPEND_HEADER_BYTES`]), the `envelope` bytes its sender frames it
-/// in, and its entries — fits the credit a fresh session with frames of `frame_cap` bytes grants before any
-/// window update (`slates_transport::connection::initial_receive_window`: the reorder threshold plus one
-/// packets of stream data, the least credit loss detection needs). A batch within it reaches its follower
-/// in one flight on any session, however new; the session's window grows past it on its own, and an entry
-/// larger than it still goes, alone.
-pub fn append_batch_bytes(frame_cap: usize, envelope: usize) -> usize {
+/// whole message — its fixed header ([`APPEND_HEADER_BYTES`]), its priority table (a count and one
+/// [`PRIORITY_ROW_BYTES`] row for each of the `voters`), the `envelope` bytes its sender frames it in, and
+/// its entries — fits the credit a fresh session with frames of `frame_cap` bytes grants before any window
+/// update (`slates_transport::connection::initial_receive_window`: the reorder threshold plus one packets of
+/// stream data, the least credit loss detection needs). A batch within it reaches its follower in one
+/// flight on any session, however new; the session's window grows past it on its own, and an entry larger
+/// than it still goes, alone.
+pub fn append_batch_bytes(frame_cap: usize, envelope: usize, voters: usize) -> usize {
+  let table = size_of::<u32>().saturating_add(voters.saturating_mul(PRIORITY_ROW_BYTES));
   usize::try_from(slates_transport::connection::initial_receive_window(
     frame_cap,
   ))
   .unwrap_or(usize::MAX)
   .saturating_sub(APPEND_HEADER_BYTES)
+  .saturating_sub(table)
   .saturating_sub(envelope)
 }
 
@@ -171,6 +174,14 @@ impl RaftMessage {
         for entry in &append.entries {
           encode_entry(&mut out, entry);
         }
+        put_u32(
+          &mut out,
+          u32::try_from(append.priorities.len()).unwrap_or(u32::MAX),
+        );
+        for (voter, priority) in &append.priorities {
+          put_u64(&mut out, voter.0);
+          encode_priority(&mut out, priority);
+        }
       }
       RaftMessage::AppendReply(reply) => {
         out.push(TAG_APPEND_REPLY);
@@ -181,6 +192,7 @@ impl RaftMessage {
         put_u64(&mut out, reply.read_context);
         put_u64(&mut out, reply.conflict_term);
         put_u64(&mut out, reply.conflict_index);
+        encode_priority(&mut out, &reply.priority);
       }
       RaftMessage::PreVote(request) => {
         out.push(TAG_PRE_VOTE);
@@ -265,6 +277,14 @@ impl RaftMessage {
           entries.push(entry);
           rest = tail;
         }
+        let (count, mut rest) = take_count(rest)?;
+        let mut priorities = Vec::with_capacity(count);
+        for _ in 0..count {
+          let (voter, tail) = take_u64(rest)?;
+          let (priority, tail) = decode_priority(tail)?;
+          priorities.push((HostId(voter), priority));
+          rest = tail;
+        }
         expect_end(rest)?;
         Ok(RaftMessage::AppendEntries(AppendEntries {
           read_context,
@@ -274,6 +294,7 @@ impl RaftMessage {
           prev_log_term,
           entries,
           leader_commit,
+          priorities,
         }))
       }
       TAG_APPEND_REPLY => {
@@ -284,6 +305,7 @@ impl RaftMessage {
         let (read_context, rest) = take_u64(rest)?;
         let (conflict_term, rest) = take_u64(rest)?;
         let (conflict_index, rest) = take_u64(rest)?;
+        let (priority, rest) = decode_priority(rest)?;
         expect_end(rest)?;
         Ok(RaftMessage::AppendReply(AppendReply {
           read_context,
@@ -293,6 +315,7 @@ impl RaftMessage {
           match_index,
           conflict_term,
           conflict_index,
+          priority,
         }))
       }
       TAG_PRE_VOTE => {
@@ -375,6 +398,28 @@ fn encode_entry(out: &mut Vec<u8>, entry: &LogEntry) {
     }
   }
 }
+
+/// Appends an election priority: its quorum round trip, then its spread, in nanoseconds.
+fn encode_priority(out: &mut Vec<u8>, priority: &ElectionPriority) {
+  put_u64(out, priority.quorum_ns);
+  put_u64(out, priority.spread_ns);
+}
+
+/// Decodes an election priority from the front of `bytes`, returning it and the remainder.
+fn decode_priority(bytes: &[u8]) -> Result<(ElectionPriority, &[u8]), RaftWireError> {
+  let (quorum_ns, rest) = take_u64(bytes)?;
+  let (spread_ns, rest) = take_u64(rest)?;
+  Ok((
+    ElectionPriority {
+      quorum_ns,
+      spread_ns,
+    },
+    rest,
+  ))
+}
+
+/// Format: one row of an append's priority table — the voter, then its round trip and spread.
+pub const PRIORITY_ROW_BYTES: usize = 3 * size_of::<u64>();
 
 /// Appends a voter configuration: the voter set, then the joint set's presence byte and set.
 fn encode_voter_config(out: &mut Vec<u8>, config: &VoterConfig) {
@@ -786,6 +831,7 @@ mod tests {
         ),
       ],
       leader_commit: 2,
+      priorities: Vec::new(),
     })
   }
 
@@ -829,6 +875,7 @@ mod tests {
         match_index: 4,
         conflict_term: 0,
         conflict_index: 0,
+        priority: ElectionPriority::default(),
       }),
       RaftMessage::PreVote(PreVote {
         term: 8,
@@ -850,6 +897,7 @@ mod tests {
         match_index: 0,
         conflict_term: 4,
         conflict_index: 2,
+        priority: ElectionPriority::default(),
       }),
       snapshot_with_joint_config(),
       RaftMessage::InstallSnapshotReply(InstallSnapshotReply {
@@ -932,6 +980,13 @@ mod tests {
             ),
           ],
           leader_commit: 2,
+          priorities: vec![(
+            HostId(2),
+            ElectionPriority {
+              quorum_ns: 0x21,
+              spread_ns: 0x22,
+            },
+          )],
         }),
         [
           &[TAG_APPEND_ENTRIES][..],
@@ -952,7 +1007,11 @@ mod tests {
           &[2, 0, 0, 0],             // voter count
           &[1, 0, 0, 0, 0, 0, 0, 0],
           &[2, 0, 0, 0, 0, 0, 0, 0],
-          &[0], // no joint set
+          &[0],                         // no joint set
+          &[1, 0, 0, 0],                // priority rows
+          &[2, 0, 0, 0, 0, 0, 0, 0],    // voter
+          &[0x21, 0, 0, 0, 0, 0, 0, 0], // its quorum round trip
+          &[0x22, 0, 0, 0, 0, 0, 0, 0], // its spread
         ]
         .concat(),
       ),
@@ -965,6 +1024,10 @@ mod tests {
           match_index: 4,
           conflict_term: 0x0a,
           conflict_index: 0x0b,
+          priority: ElectionPriority {
+            quorum_ns: 0x0c,
+            spread_ns: 0x0d,
+          },
         }),
         [
           &[TAG_APPEND_REPLY][..],
@@ -975,6 +1038,8 @@ mod tests {
           &[6, 0, 0, 0, 0, 0, 0, 0],    // read_context
           &[0x0a, 0, 0, 0, 0, 0, 0, 0], // conflict_term
           &[0x0b, 0, 0, 0, 0, 0, 0, 0], // conflict_index
+          &[0x0c, 0, 0, 0, 0, 0, 0, 0], // priority: quorum round trip
+          &[0x0d, 0, 0, 0, 0, 0, 0, 0], // priority: spread
         ]
         .concat(),
       ),
@@ -1194,13 +1259,16 @@ mod tests {
       prev_log_term: 0,
       entries: Vec::new(),
       leader_commit: 0,
+      priorities: Vec::new(),
     });
-    assert_eq!(empty.encode().len(), APPEND_HEADER_BYTES);
+    // The header, then an empty priority table's count.
+    assert_eq!(empty.encode().len(), APPEND_HEADER_BYTES + size_of::<u32>());
   }
 
-  /// The derived batch budget: a whole append — its header, the sender's envelope and a batch of exactly the
-  /// budget — is the credit a fresh session grants before any window update, so it needs no update to
-  /// arrive; and an envelope larger than that credit leaves no budget rather than wrapping.
+  /// The derived batch budget: a whole append — its header, a five-voter priority table, the sender's
+  /// envelope and a batch of exactly the budget — is the credit a fresh session grants before any window
+  /// update, so it needs no update to arrive; and an envelope larger than that credit leaves no budget
+  /// rather than wrapping.
   #[test]
   fn a_budgeted_append_fits_a_fresh_sessions_first_credit() {
     let frame_cap = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
@@ -1209,10 +1277,12 @@ mod tests {
       frame_cap,
     ))
     .unwrap();
-    let budget = append_batch_bytes(frame_cap, envelope);
+    let voters = 5;
+    let table = size_of::<u32>() + voters * PRIORITY_ROW_BYTES;
+    let budget = append_batch_bytes(frame_cap, envelope, voters);
     assert!(budget > 0);
-    assert_eq!(budget + APPEND_HEADER_BYTES + envelope, credit);
-    assert_eq!(append_batch_bytes(frame_cap, credit), 0);
+    assert_eq!(budget + APPEND_HEADER_BYTES + table + envelope, credit);
+    assert_eq!(append_batch_bytes(frame_cap, credit, voters), 0);
   }
 
   /// An empty input and an unknown tag are refused, not panicked.

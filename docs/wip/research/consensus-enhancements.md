@@ -69,12 +69,34 @@ commits. The number of rounds is bounded (a server that cannot keep up is refuse
 retried forever).
 
 ### 3.4 Priority elections
-Each member has an election priority (derived, never hand-set: from its measured centrality — the
-Vivaldi coordinate's mean RTT to the other voters — so the leader sits where commits are fastest). A node
-starts an election only while its priority is at least the group's current *target priority*; the target
-decays after each election timeout that elected nobody, so liveness never depends on the highest-priority
-node being up (SOFAJRaft's rule). A leader that sees a caught-up voter of higher priority transfers to it
-(3.2). MLRaft uses the same two tools to spread leaders across nodes.
+Refined 2026-09-28, before building. The leader should sit where commits are fastest, and a leader commits
+once a majority including itself holds an entry. So a voter's priority is its **quorum round trip**: the
+`⌊n/2⌋`-th smallest round trip from it to the other voters. It is not the mean.
+
+Measured against Microsoft's published P50 round trips (Azure network latency statistics, page dated
+2026-07-30, fetched 2026-09-28): for a five-region root group of East US, West Europe, Japan East, Southeast
+Asia and Brazil South, the quorum round trip is 117 / 169 / 162 / 169 / 185 ms. An unprioritized election
+averages 160 ms; the East US leader gives 117. With three regions (East US, West Europe, Japan East) it is
+83 / 85 / 162 ms: 110 ms on average, 83 at best.
+
+- **Measured, not predicted.** Each voter computes its own quorum round trip, with the spread of the path
+  that sets it, from its measured paths (`peer_paths`, the Jacobson estimators the election timing uses).
+  The Vivaldi coordinates were the first plan, but the fleet's integration is incomplete: each probe task
+  owns an engine fed by one peer, and the announced coordinate comes from an engine that no sample feeds.
+- **Exchanged through Raft.** A follower reports its figure in its `AppendReply`, and the leader returns
+  every voter's figure in its `AppendEntries`, so all followers rank against the same table. The wire grows
+  by one fixed-size record per voter.
+- **Rank.** A voter's rank is how many live voters (the caller's liveness view) have an interval — round
+  trip ± spread — lying wholly below its own. An unknown figure never outranks, and overlapping intervals
+  tie. On one host every interval overlaps, so the gate is a no-op there, as it must be.
+- **Election gate** (SOFAJRaft's decaying target, in ranks). A follower whose timeout fires campaigns only if
+  its rank is within the timeouts it has yielded since it last heard a leader. Otherwise it yields this one,
+  and each yield admits the next rank. So an election waits at most one timeout per more-central live voter,
+  and none when the best live voter is up.
+- **Transfer** (3.2). A leader that has led for a full CheckQuorum window hands off to a caught-up, live
+  voter whose interval lies wholly below its own. It does so at most once per leadership that aborts, since
+  proposals are refused while a transfer is in flight and a failing target must not cost the group its
+  availability.
 
 ### 3.5 Parallel vote replication and processing (ParallelRaft-CE)
 Raft acknowledges and commits strictly in index order, so one lost `AppendEntries` holds back every later
@@ -301,3 +323,29 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     once per 100 ms heartbeat, so that part is the phase between the test's signal and that check. What
     shifted the phase is not established.
   - Fleet suite 53/53, CLI suite 13/13.
+- **Slice 7 (2026-09-28): priority elections** (§3.4 as refined above).
+  - **Mechanism.** The priority is the measured quorum round trip with its spread
+    (`timing::quorum_priority`). Followers report it in `AppendReply` and the leader returns the table in
+    `AppendEntries`. `RaftNode::election_rank` counts live voters whose interval lies wholly below one's own;
+    `ElectionTimer::follower_period` yields one timeout per rank; `RaftNode::priority_transfer` hands off to
+    an outranking live voter after `PRIORITY_WINDOWS` ticks, latched after one abort per leadership.
+  - **Measured** (`tests/priority.rs`, Microsoft's P50 matrix of 2026-07-30; twenty seeds, the regions placed
+    on hosts by a seed-dependent permutation):
+    - **Three regions** (East US, West Europe, Japan East): the orders agree. East US leads every seed
+      (quorum 83 ms, tied with West Europe at 85), and median commit latency is 137 ms either way. The
+      derived election timing already favours the node whose slowest path is shortest.
+    - **Five regions**: by the first timeout, East US 14 and West Europe 6; by priority, East US 20, after
+      6 transfers. Median commit latency 189 ms by timeout, 171 ms by priority.
+    - **East US down for 20 s, then back**: the control ends with Brazil South 3, Japan East 6, Southeast
+      Asia 5 and West Europe 6 (median 234 ms); priority ends with East US on every seed (27 transfers,
+      median 201 ms).
+  - **Measured and rejected: requiring the target to hold every entry before a priority transfer.** A
+    remote voter is always a proposal cadence behind, so no handoff happened once proposals flowed (six, all
+    before the stream). The transfer's own catch-up (thesis §3.10) replaces it.
+  - **Explorer.** Random priorities, with leaders handing off at CheckQuorum: 1,843 / 2,149 priority
+    transfers at full scale, no violation. Fleet suite 53/53, CLI suite 13/13.
+  - **Observations.**
+    - Before the permutation, the simulation's fixed host numbering made one region win every first
+      election, since the timer's jitter is a draw from the node's id.
+    - The fleet's Vivaldi coordinates are not fed coherently: engines are per probe task, and the announced
+      coordinate comes from an unfed engine. Priority therefore uses measured paths.

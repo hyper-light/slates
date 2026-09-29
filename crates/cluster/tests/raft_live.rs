@@ -124,6 +124,11 @@ fn run_election_and_replication() -> Outcome {
       let mut node = RaftNode::new(VOTER, vec![CANDIDATE, VOTER]);
       serve_raft_once(&mut endpoint, &mut node).await.unwrap(); // the vote request
       serve_raft_once(&mut endpoint, &mut node).await.unwrap(); // the append
+      // The reply is in flight when the serve returns; settle it before the session drops. Until
+      // 2026-09-28 this test dropped it at once, which held only while the append's reply (57 bytes) fit
+      // the first flight at this frame cap (4 packets of 16 bytes); the election priority it carries since
+      // made it 73, and the candidate waited forever for the rest.
+      endpoint.settle().await.unwrap();
       let _ = voter_index_tx.send(node.last_log_index());
     })
     .unwrap();

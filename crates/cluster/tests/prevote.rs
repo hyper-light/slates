@@ -19,7 +19,7 @@
 
 mod support;
 
-use support::timed::{Campaign, Fault, MS, Outcome, Profile, Scenario, run};
+use support::timed::{Campaign, ElectionOrder, Fault, MS, Outcome, Profile, Scenario, run};
 
 /// Shape: the seeds each scenario runs under.
 const SEEDS: u64 = 20;
@@ -58,6 +58,7 @@ fn scenario(profile: &Profile, fault: Fault, campaign: Campaign, seed: u64) -> S
     propose_every_ns: PROPOSE_EVERY_NS,
     propose_from_ns: PROPOSE_FROM_NS,
     campaign,
+    order: ElectionOrder::ByPriority,
     seed,
   }
 }

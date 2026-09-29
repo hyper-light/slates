@@ -48,6 +48,17 @@
 //! an original voter — the group could not commit for 21 replication rounds when the newcomer was added
 //! directly, and committed in the first round when it was staged
 //! (`a_staged_newcomer_leaves_no_availability_gap_where_a_direct_one_does`).
+//!
+//! And **priority** (`docs/wip/research/consensus-enhancements.md` §3.4): each voter's priority is its
+//! quorum round trip — the round trip it would commit in as leader — measured by its caller
+//! ([`set_priority`](RaftNode::set_priority)). A follower reports its own in every [`AppendReply`], and the
+//! leader returns every voter's in its [`AppendEntries`], so each follower ranks itself against the same
+//! table ([`election_rank`](RaftNode::election_rank); the caller's timer yields one timeout per rank). A
+//! leader hands off to a voter that outranks it once it has led a whole window, at most once per leadership
+//! that aborts ([`priority_transfer`](RaftNode::priority_transfer)). Overlapping intervals — round trip ±
+//! spread — tie, so one host's noise never ranks anyone. On Microsoft's published inter-region matrix, five
+//! regions: the fastest-committing region led every seed (14 of 20 before), and it took leadership back on
+//! every seed after it returned from an outage (none before).
 //! The multi-node **conformance suite** (`tests/raft.rs`) drives a cluster through election, replication,
 //! a partition and a membership change, checking Election Safety, Log Matching, Leader Completeness and
 //! State Machine Safety.
@@ -209,6 +220,12 @@ struct Staging {
   caught_up: bool,
 }
 
+/// Derived: the CheckQuorum ticks a new leader waits before handing leadership to a voter that outranks it
+/// (§3.4): two — the first tick after an election may come a sliver after it, so the second is the first
+/// to span a whole election timeout of leading, over which every voter's reply has refreshed its priority
+/// in the leader's table.
+const PRIORITY_WINDOWS: u8 = 2;
+
 /// Derived: the whole CheckQuorum windows (election timeouts) a staged member's lag may go without
 /// shrinking before its staging is aborted (thesis §4.2.1: "the leader should also abort the change if the
 /// new server is unavailable or is so slow that it will never catch up"). One: a window holds about ten
@@ -303,6 +320,31 @@ const ENTRY_COUNT_BYTES: usize = size_of::<u32>();
 /// Format: a presence flag on the Raft wire is one byte.
 const ENTRY_FLAG_BYTES: usize = 1;
 
+/// A voter's election priority (`docs/wip/research/consensus-enhancements.md` §3.4): the round trip it
+/// would commit in as leader — its quorum round trip, the `⌊n/2⌋`-th smallest measured round trip to the
+/// other voters (a leader commits once a majority including itself holds an entry) — and the spread of the
+/// path that sets it, both in nanoseconds. A zero round trip is unknown (a needed path has no sample yet):
+/// it never outranks and is never outranked, so an unmeasured group behaves as one without priorities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ElectionPriority {
+  /// The quorum round trip, nanoseconds; zero when unknown.
+  pub quorum_ns: u64,
+  /// The spread of the path that sets it (the estimator's `4 · rttvar`), nanoseconds.
+  pub spread_ns: u64,
+}
+
+impl ElectionPriority {
+  /// Whether this priority is known and commits distinguishably faster than `other`: its interval — the
+  /// round trip plus its spread — lies wholly below `other`'s round trip less its spread. Overlapping
+  /// intervals tie, so measurement noise never ranks one voter above another.
+  pub fn outranks(&self, other: &ElectionPriority) -> bool {
+    self.quorum_ns > 0
+      && other.quorum_ns > 0
+      && self.quorum_ns.saturating_add(self.spread_ns)
+        < other.quorum_ns.saturating_sub(other.spread_ns)
+  }
+}
+
 /// A leader's replication message (Raft `AppendEntries`): the leader's term, the log position it is
 /// appending after (`prev_log_index`/`prev_log_term`, the consistency check), the entries to append
 /// (empty for a heartbeat), and the leader's commit index. A follower appends only when its log matches
@@ -324,6 +366,9 @@ pub struct AppendEntries {
   pub entries: Vec<LogEntry>,
   /// The leader's commit index, so the follower may advance its own.
   pub leader_commit: u64,
+  /// Every voter's election priority as the leader last heard it, its own included (§3.4), so each
+  /// follower ranks itself against the same table.
+  pub priorities: Vec<(HostId, ElectionPriority)>,
 }
 
 /// A follower's reply to [`AppendEntries`]: the follower, its current term, whether the append
@@ -352,6 +397,8 @@ pub struct AppendReply {
   /// of `conflict_term`, or the index after the follower's last entry when `conflict_term` is zero. Zero
   /// otherwise.
   pub conflict_index: u64,
+  /// The follower's own election priority, as it last measured it (§3.4).
+  pub priority: ElectionPriority,
 }
 
 /// A leader's snapshot transfer (Raft `InstallSnapshot`, §7) — sent to a follower that has fallen below
@@ -530,6 +577,20 @@ pub struct RaftNode {
   staging_aborted: Option<HostId>,
   /// Stagings aborted (the non-vacuity counter of the abort path).
   stagings_aborted: u64,
+  /// This node's own election priority, as its caller last measured it (§3.4).
+  own_priority: ElectionPriority,
+  /// Every voter's priority: while leading, as each follower last replied it; while following, the
+  /// leader's table from its last append. Bounded by the replication targets.
+  priorities: BTreeMap<HostId, ElectionPriority>,
+  /// CheckQuorum ticks since this node began leading (saturating).
+  windows_led: u8,
+  /// Whether the transfer in flight was started by priority, so its abort is recognized.
+  priority_transfer_pending: bool,
+  /// Whether a priority transfer aborted during this leadership: no further one is tried until the next,
+  /// since a leader refuses proposals while a transfer is in flight.
+  priority_transfer_failed: bool,
+  /// ElectionPriority transfers started (the non-vacuity counter).
+  priority_transfers: u64,
 }
 
 impl RaftNode {
@@ -564,6 +625,12 @@ impl RaftNode {
       staging: BTreeMap::new(),
       staging_aborted: None,
       stagings_aborted: 0,
+      own_priority: ElectionPriority::default(),
+      priorities: BTreeMap::new(),
+      windows_led: 0,
+      priority_transfer_pending: false,
+      priority_transfer_failed: false,
+      priority_transfers: 0,
     }
   }
 
@@ -834,6 +901,9 @@ impl RaftNode {
     self.transfer = None;
     self.staging.clear();
     self.staging_aborted = None;
+    self.windows_led = 0;
+    self.priority_transfer_pending = false;
+    self.priority_transfer_failed = false;
     // Start the CheckQuorum window already in contact with the voters that just elected it, so the first
     // check does not spuriously step a freshly-won leader down before its heartbeats have replied.
     self.contacts = self.votes.clone();
@@ -1310,6 +1380,18 @@ impl RaftNode {
       })
       .count();
     let entries = owed.get(..batch).unwrap_or(&[]).to_vec();
+    let mut priorities: Vec<(HostId, ElectionPriority)> = self
+      .all_voters()
+      .into_iter()
+      .filter(|voter| *voter != self.id)
+      .filter_map(|voter| {
+        self
+          .priorities
+          .get(&voter)
+          .map(|priority| (voter, *priority))
+      })
+      .collect();
+    priorities.push((self.id, self.own_priority));
     Some(AppendEntries {
       read_context: self.read_round.as_ref().map_or(0, |read| read.context),
       term: self.current_term,
@@ -1318,6 +1400,7 @@ impl RaftNode {
       prev_log_term,
       entries,
       leader_commit: self.commit_index,
+      priorities,
     })
   }
 
@@ -1333,6 +1416,10 @@ impl RaftNode {
     // A current-term append means a leader exists for our term — defer to it (a candidate steps down)
     // and note the contact, so we refuse pre-votes that would disrupt this leader (§9.6).
     self.recognize_leader(request.term, request.leader);
+    // The leader's priority table is the one every follower ranks itself against (§3.4).
+    self.priorities = std::mem::take(&mut request.priorities)
+      .into_iter()
+      .collect();
 
     // An append anchored inside our committed prefix — a late or duplicated copy, or the first append to a
     // member that joined with the committed prefix, sent before the leader learned how far it is — agrees
@@ -1405,8 +1492,9 @@ impl RaftNode {
     {
       read.confirmed.insert(reply.follower);
     }
-    // Any same-term reply proves the follower is reachable this CheckQuorum window.
+    // Any same-term reply proves the follower is reachable this CheckQuorum window, and carries its priority.
     self.contacts.insert(reply.follower);
+    self.priorities.insert(reply.follower, reply.priority);
     if reply.success {
       self.record_match(reply.follower, reply.match_index);
       self.advance_leader_commit();
@@ -1460,6 +1548,9 @@ impl RaftNode {
     }
     self.age_transfer();
     self.age_staging();
+    self.windows_led = self.windows_led.saturating_add(1);
+    let targets: BTreeSet<HostId> = self.replication_targets().into_iter().collect();
+    self.priorities.retain(|voter, _| targets.contains(voter));
     let mut reachable = self.contacts.clone();
     reachable.insert(self.id);
     if !self.is_majority(&reachable) {
@@ -1598,6 +1689,78 @@ impl RaftNode {
     self.stagings_aborted
   }
 
+  /// Records this node's own election priority, as its caller measured it this period (§3.4).
+  pub fn set_priority(&mut self, priority: ElectionPriority) {
+    self.own_priority = priority;
+  }
+
+  /// Every voter's priority as this node holds it: while leading, as each follower last replied it; while
+  /// following, the leader's table.
+  pub fn priorities(&self) -> Vec<(HostId, ElectionPriority)> {
+    self
+      .priorities
+      .iter()
+      .map(|(voter, priority)| (*voter, *priority))
+      .collect()
+  }
+
+  /// This node's election rank (§3.4): how many voters of the configuration in force that the caller holds
+  /// `alive` outrank it in the table this node holds ([`ElectionPriority::outranks`]). Zero while this node's own
+  /// priority is unknown or nothing outranks it — the case a group without measurements is always in.
+  pub fn election_rank(&self, alive: &[HostId]) -> usize {
+    self
+      .all_voters()
+      .into_iter()
+      .filter(|voter| *voter != self.id && alive.contains(voter))
+      .filter(|voter| {
+        self
+          .priorities
+          .get(voter)
+          .is_some_and(|priority| priority.outranks(&self.own_priority))
+      })
+      .count()
+  }
+
+  /// Hands leadership to the voter that outranks this leader most (§3.4 with thesis §3.10), when one does:
+  /// a voter the caller holds `alive` whose priority outranks this node's — the least quorum round trip
+  /// among them, then the lowest id. The transfer itself brings the target's log up to date before it
+  /// invites it (thesis §3.10's first step), so the target need not hold every entry now: a remote voter
+  /// is always a proposal cadence behind a busy leader, and a first cut that required it never handed off
+  /// while proposals flowed (measured 2026-09-28: six handoffs, all before the stream began). Only after
+  /// [`PRIORITY_WINDOWS`] ticks of leading, with no transfer in flight, and not after a priority transfer
+  /// has aborted during this leadership — the abort bounds a failing one, and the latch keeps it from
+  /// costing proposals again. Returns the target when a transfer started.
+  pub fn priority_transfer(&mut self, alive: &[HostId]) -> Option<HostId> {
+    if self.role != Role::Leader
+      || self.windows_led < PRIORITY_WINDOWS
+      || self.priority_transfer_failed
+      || self.active_transfer().is_some()
+    {
+      return None;
+    }
+    let (target, _) = self
+      .all_voters()
+      .into_iter()
+      .filter(|voter| *voter != self.id && alive.contains(voter))
+      .filter_map(|voter| {
+        self
+          .priorities
+          .get(&voter)
+          .map(|priority| (voter, *priority))
+      })
+      .filter(|(_, priority)| priority.outranks(&self.own_priority))
+      .min_by_key(|(voter, priority)| (priority.quorum_ns, voter.0))?;
+    self.transfer_leadership(target).ok()?;
+    self.priority_transfer_pending = true;
+    self.priority_transfers = self.priority_transfers.saturating_add(1);
+    Some(target)
+  }
+
+  /// The priority transfers this node started, over its life.
+  pub fn priority_transfers(&self) -> u64 {
+    self.priority_transfers
+  }
+
   /// One CheckQuorum tick of the transfer in flight: past [`TRANSFER_QUORUM_CHECKS`] ticks it is aborted
   /// (counted) and the leader accepts proposals again (thesis §3.10).
   fn age_transfer(&mut self) {
@@ -1609,6 +1772,10 @@ impl RaftNode {
     if quorum_checks >= TRANSFER_QUORUM_CHECKS {
       self.transfer = None;
       self.transfers_aborted = self.transfers_aborted.saturating_add(1);
+      if self.priority_transfer_pending {
+        self.priority_transfer_pending = false;
+        self.priority_transfer_failed = true;
+      }
     } else {
       self.transfer = Some(Transfer {
         quorum_checks,
@@ -1850,6 +2017,7 @@ impl RaftNode {
       match_index,
       conflict_term: 0,
       conflict_index: 0,
+      priority: self.own_priority,
     }
   }
 
@@ -2408,6 +2576,7 @@ mod tests {
       prev_log_term: 0,
       entries: Vec::new(),
       leader_commit: 0,
+      priorities: Vec::new(),
     });
     assert_eq!(node.term(), 1);
 
@@ -2514,6 +2683,7 @@ mod tests {
       prev_log_term: 0,
       entries: Vec::new(),
       leader_commit: 0,
+      priorities: Vec::new(),
     });
     assert_eq!(
       node.leader(),
@@ -2542,6 +2712,7 @@ mod tests {
       match_index: 0,
       conflict_term: 0,
       conflict_index: 0,
+      priority: ElectionPriority::default(),
     });
     leader.check_quorum();
     assert!(
@@ -2661,6 +2832,7 @@ mod tests {
         match_index: 0,
         conflict_term: 0,
         conflict_index: 0,
+        priority: ElectionPriority::default(),
       });
       a.check_quorum();
       assert!(
@@ -2718,6 +2890,7 @@ mod tests {
         match_index,
         conflict_term: 0,
         conflict_index: 0,
+        priority: ElectionPriority::default(),
       });
     }
     assert_eq!(
@@ -2936,6 +3109,7 @@ mod tests {
       match_index: 1,
       conflict_term: 0,
       conflict_index: 0,
+      priority: ElectionPriority::default(),
     };
 
     // B is a majority of the old set {A,B,C} together with A, but holds no majority of the new set.
@@ -2976,6 +3150,7 @@ mod tests {
         match_index: 1,
         conflict_term: 0,
         conflict_index: 0,
+        priority: ElectionPriority::default(),
       });
     }
     assert_eq!(leader.commit_index(), 1, "the joint entry committed");
@@ -3013,6 +3188,7 @@ mod tests {
       match_index,
       conflict_term: 0,
       conflict_index: 0,
+      priority: ElectionPriority::default(),
     };
     // The joint entry (index 1): B with A carries the old set but not the new one, so the change cannot
     // complete yet; C's acknowledgement commits it, and the joint configuration still names the leader.
@@ -3072,6 +3248,7 @@ mod tests {
       match_index,
       conflict_term: 0,
       conflict_index: 0,
+      priority: ElectionPriority::default(),
     };
     leader.on_append_reply(reply(B, 1));
     assert_eq!(
@@ -3107,6 +3284,7 @@ mod tests {
       match_index,
       conflict_term: 0,
       conflict_index: 0,
+      priority: ElectionPriority::default(),
     };
     leader.on_append_reply(reply(B, 1));
     assert!(leader.complete_membership_change());
@@ -3328,6 +3506,7 @@ mod tests {
       prev_log_term: 0,
       entries: vec![LogEntry::command(follower.term() + 1, b"other".to_vec())],
       leader_commit: 0,
+      priorities: Vec::new(),
     };
     let reply = follower.on_append_entries(conflicting);
     assert!(reply.success);
@@ -3669,6 +3848,7 @@ mod tests {
           match_index: 0,
           conflict_term: 0,
           conflict_index: 0,
+          priority: ElectionPriority::default(),
         });
       }
       leader.check_quorum();
@@ -3695,6 +3875,7 @@ mod tests {
         match_index: 0,
         conflict_term: 0,
         conflict_index: 0,
+        priority: ElectionPriority::default(),
       });
     }
     leader.check_quorum();
@@ -3798,5 +3979,125 @@ mod tests {
       direct > staged + 5,
       "the direct newcomer's catch-up held commits back: {direct} rounds"
     );
+  }
+
+  /// A priority of `quorum_ms` ± `spread_ms`, in nanoseconds.
+  fn priority_ms(quorum_ms: u64, spread_ms: u64) -> ElectionPriority {
+    ElectionPriority {
+      quorum_ns: quorum_ms * 1_000_000,
+      spread_ns: spread_ms * 1_000_000,
+    }
+  }
+
+  /// §3.4: a priority outranks another only when its interval — round trip plus spread — lies wholly below
+  /// the other's round trip less its spread; overlapping intervals tie both ways, and an unknown priority
+  /// (zero) neither outranks nor is outranked.
+  #[test]
+  fn only_a_wholly_lower_interval_outranks() {
+    let central = priority_ms(117, 10);
+    let edge = priority_ms(169, 10);
+    let near_edge = priority_ms(125, 10);
+    assert!(central.outranks(&edge));
+    assert!(!edge.outranks(&central));
+    assert!(
+      !central.outranks(&near_edge) && !near_edge.outranks(&central),
+      "overlapping intervals tie"
+    );
+    let unknown = ElectionPriority::default();
+    assert!(!unknown.outranks(&edge) && !central.outranks(&unknown));
+  }
+
+  /// A follower of {A, B, C} that took the leader's priority table from its append.
+  fn follower_with_table(own: ElectionPriority, table: &[(HostId, ElectionPriority)]) -> RaftNode {
+    let mut follower = RaftNode::new(C, vec![A, B, C]);
+    follower.set_priority(own);
+    let reply = follower.on_append_entries(AppendEntries {
+      read_context: 0,
+      term: 1,
+      leader: A,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: Vec::new(),
+      leader_commit: 0,
+      priorities: table.to_vec(),
+    });
+    assert!(reply.success);
+    assert_eq!(reply.priority, own, "the reply carries its own priority");
+    follower
+  }
+
+  /// §3.4's rank: a follower counts the live voters of the leader's table that outrank it — not the dead,
+  /// not the tied, not the unknown.
+  #[test]
+  fn a_follower_ranks_against_the_leaders_table_among_live_voters() {
+    let follower = follower_with_table(
+      priority_ms(169, 10),
+      &[(A, priority_ms(117, 10)), (B, priority_ms(162, 10))],
+    );
+    assert_eq!(
+      follower.election_rank(&[A, B]),
+      1,
+      "A outranks C; B ties it"
+    );
+    assert_eq!(follower.election_rank(&[B]), 0, "a dead A outranks no one");
+    let unmeasured = follower_with_table(
+      ElectionPriority::default(),
+      &[(A, priority_ms(117, 10)), (B, priority_ms(162, 10))],
+    );
+    assert_eq!(unmeasured.election_rank(&[A, B]), 0, "unknown ranks first");
+  }
+
+  /// B and C answer the leader this window, each carrying its priority (B 117 ms, C 140 ms, ± 10 ms), so
+  /// CheckQuorum keeps it leading and its table holds both.
+  fn b_and_c_answer(leader: &mut RaftNode) {
+    for (voter, quorum) in [(B, 117), (C, 140)] {
+      leader.on_append_reply(AppendReply {
+        read_context: 0,
+        follower: voter,
+        term: leader.term(),
+        success: true,
+        match_index: 0,
+        conflict_term: 0,
+        conflict_index: 0,
+        priority: priority_ms(quorum, 10),
+      });
+    }
+  }
+
+  /// §3.4's transfer: a leader hands off to the live voter that outranks it most, only after two
+  /// CheckQuorum ticks of leading — never to a dead one, never when nothing outranks it — and after a
+  /// priority transfer aborts, not again during this leadership.
+  #[test]
+  fn a_leader_hands_off_by_priority_after_a_whole_window_and_once_after_an_abort() {
+    let mut leader = elected_leader(A, vec![A, B, C]);
+    leader.set_priority(priority_ms(169, 10));
+    b_and_c_answer(&mut leader);
+    assert_eq!(
+      leader.priority_transfer(&[B, C]),
+      None,
+      "not before a whole window"
+    );
+    for _ in 0..PRIORITY_WINDOWS {
+      b_and_c_answer(&mut leader);
+      leader.check_quorum();
+    }
+    assert!(leader.is_leader());
+    assert_eq!(
+      leader.priority_transfer(&[C]),
+      Some(C),
+      "B is dead: C, which also outranks A"
+    );
+    // The transfer to C never completes: two ticks abort it, and the latch holds for this leadership.
+    for _ in 0..TRANSFER_QUORUM_CHECKS {
+      b_and_c_answer(&mut leader);
+      leader.check_quorum();
+    }
+    assert!(leader.transferring_to().is_none(), "aborted");
+    assert_eq!(
+      leader.priority_transfer(&[B, C]),
+      None,
+      "no second try this leadership"
+    );
+    assert_eq!(leader.priority_transfers(), 1);
   }
 }

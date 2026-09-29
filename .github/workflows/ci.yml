@@ -57,8 +57,10 @@ jobs:
         run: cargo test --workspace
       - name: AC-1.1 model suite over 10^6 generated operations
         run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
+      # By exact name: the file's other ignored test is a diagnosis tool (`replay_to_the_first_violation`),
+      # which a bare `--ignored` swept in (CI run 36511884967).
       - name: T-8.13 Raft safety explorer at full scale
-        run: cargo test -p slates-cluster --release --test explore -- --ignored
+        run: cargo test -p slates-cluster --release --test explore -- --ignored --exact the_dialect_keeps_raft_safety_at_full_scale
       - name: AC-1.2 differential suite against tmpfs (Linux)
         if: runner.os == 'Linux'
         run: SLATES_TEST_RAMDIR=/dev/shm PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture

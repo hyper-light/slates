@@ -20,15 +20,18 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use slates_cluster::raft::{RaftNode, TimeoutNow};
+use slates_cluster::raft::{ElectionPriority, RaftNode, TimeoutNow};
 use slates_cluster::raft_wire::{RaftMessage, append_batch_bytes};
-use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt};
+use slates_cluster::timing::{ElectionTimer, ElectionTiming, PathRtt, quorum_priority};
 use slates_db::register::HostId;
 use slates_transport::endpoint::MAX_PACKET_PAYLOAD;
 
 /// Format: the group envelope the council's messages ride in (`slates_server::consensus`): a 32-byte group
 /// id and the message's 4-byte length.
 const ENVELOPE_BYTES: usize = 32 + 4;
+/// Shape: the periods of silence after which a node stops holding a peer alive — the daemon's two-period
+/// suspicion and one for the probe interval.
+const ALIVE_PERIODS: u64 = 3;
 
 /// Shape: the heartbeat period every node ticks at — the daemon's `HEARTBEAT_NS` (100 ms), mirrored so a
 /// period here is a period there.
@@ -118,6 +121,17 @@ pub(crate) enum Campaign {
   Direct,
 }
 
+/// How elections are ordered (`docs/wip/research/consensus-enhancements.md` §3.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ElectionOrder {
+  /// The daemon's drive: each node measures its election priority, the timer yields to live voters that
+  /// outrank it, and a leader hands off to one that does.
+  ByPriority,
+  /// The control: every priority left unknown, so the first timeout wins — the drive before §3.4. A harness
+  /// variant, never a production path.
+  ByTimeout,
+}
+
 /// A scenario: the voters, the network, the faults, how long it runs, and the proposal stream.
 #[derive(Clone, Debug)]
 pub(crate) struct Scenario {
@@ -136,6 +150,8 @@ pub(crate) struct Scenario {
   pub(crate) propose_from_ns: u64,
   /// How followers campaign.
   pub(crate) campaign: Campaign,
+  /// How elections are ordered.
+  pub(crate) order: ElectionOrder,
   /// The seed for jitter, loss and tick phases.
   pub(crate) seed: u64,
 }
@@ -163,6 +179,10 @@ pub(crate) struct Outcome {
   pub(crate) isolated: Vec<(u64, HostId)>,
   /// Each node's election timing at the end: base periods, span periods, broadcast round-trip tail.
   pub(crate) timings: BTreeMap<HostId, (u32, u32, u64)>,
+  /// Leadership transfers started by priority (§3.4), over every node.
+  pub(crate) priority_transfers: u64,
+  /// Timeouts followers yielded to voters that outranked them.
+  pub(crate) yields: u64,
 }
 
 impl Outcome {
@@ -258,6 +278,8 @@ struct Node {
   timer: ElectionTimer,
   contact: u64,
   paths: BTreeMap<HostId, PathRtt>,
+  /// When each peer last answered a probe: the node's liveness view, as SWIM's is.
+  heard: BTreeMap<HostId, u64>,
   invitation: Option<TimeoutNow>,
   down_until: Option<u64>,
   retained: slates_cluster::raft::SavedRaft,
@@ -297,6 +319,7 @@ impl Sim {
             timer: ElectionTimer::new(),
             contact: 0,
             paths: BTreeMap::new(),
+            heard: BTreeMap::new(),
             invitation: None,
             down_until: None,
             retained,
@@ -482,6 +505,20 @@ impl Sim {
       return;
     }
     self.probe(id);
+    // This period's election priority, as the daemon's drive measures it (§3.4) — or unknown in the control.
+    let node = &self.nodes[&id];
+    let voters = node.raft.all_voters();
+    let priority = match self.scenario.order {
+      ElectionOrder::ByPriority => quorum_priority(
+        voters
+          .iter()
+          .filter(|voter| **voter != id)
+          .map(|voter| node.paths.get(voter)),
+        voters.len(),
+      ),
+      ElectionOrder::ByTimeout => ElectionPriority::default(),
+    };
+    self.nodes.get_mut(&id).unwrap().raft.set_priority(priority);
     let timing = self.timing(id);
     if self.nodes[&id].raft.is_leader() {
       self.lead(id, &timing);
@@ -517,11 +554,25 @@ impl Sim {
     }
   }
 
+  /// The peers `id` holds alive: each answered a probe within the suspicion span — probes go every period
+  /// and are answered in a stream however long the path, so a live peer's last answer is at most about a
+  /// period old; [`ALIVE_PERIODS`] of silence is the daemon's suspicion (two periods) and one more for the
+  /// probe interval.
+  fn alive(&self, id: HostId) -> Vec<HostId> {
+    self.nodes[&id]
+      .heard
+      .iter()
+      .filter(|(_, at)| self.now.saturating_sub(**at) <= ALIVE_PERIODS * HEARTBEAT_NS)
+      .map(|(peer, _)| *peer)
+      .collect()
+  }
+
   fn lead(&mut self, id: HostId, timing: &ElectionTiming) {
     self.propose_due(id);
     // The council drive's budget: a fresh fleet session's first credit, less the append header and the
     // group envelope (a 32-byte group id and a 4-byte length).
-    let budget = append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES);
+    let voters = self.nodes[&id].raft.all_voters().len();
+    let budget = append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES, voters);
     for peer in self.others(id) {
       let raft = &self.nodes[&id].raft;
       let message = raft
@@ -536,10 +587,13 @@ impl Sim {
         self.send(id, peer, message, self.now);
       }
     }
+    let alive = self.alive(id);
     let node = self.nodes.get_mut(&id).unwrap();
     let invitation = node.raft.take_timeout_now();
     if node.timer.leader_period(timing) {
       node.raft.check_quorum();
+      // A voter that commits distinguishably faster takes over (§3.4); its invitation leaves next period.
+      node.raft.priority_transfer(&alive);
     }
     if let Some((to, invitation)) = invitation {
       self.send(id, to, RaftMessage::TimeoutNow(invitation), self.now);
@@ -588,11 +642,19 @@ impl Sim {
         return;
       }
     }
+    let alive = self.alive(id);
     let node = self.nodes.get_mut(&id).unwrap();
     let contact = node.contact;
-    if !node.timer.follower_period(contact, timing, id) {
+    let rank = node.raft.election_rank(&alive);
+    let yielded = node.timer.yielded();
+    let campaign = node.timer.follower_period(contact, timing, id, rank);
+    if node.timer.yielded() > yielded {
+      self.outcome.yields += 1;
+    }
+    if !campaign {
       return;
     }
+    let node = self.nodes.get_mut(&id).unwrap();
     self.outcome.campaigns += 1;
     self.outcome.campaign_events.push((self.now, id));
     let messages: Vec<RaftMessage> = match self.scenario.campaign {
@@ -697,19 +759,16 @@ impl Sim {
         Some(Event::Deliver(flight)) => self.deliver(flight),
         Some(Event::ProbeAck { at, peer, sent_ns }) if !self.down(at) => {
           let round_trip = self.now.saturating_sub(sent_ns);
-          self
-            .nodes
-            .get_mut(&at)
-            .unwrap()
-            .paths
-            .entry(peer)
-            .or_default()
-            .on_sample(round_trip);
+          let now = self.now;
+          let node = self.nodes.get_mut(&at).unwrap();
+          node.paths.entry(peer).or_default().on_sample(round_trip);
+          node.heard.insert(peer, now);
         }
         Some(Event::ProbeAck { .. }) | None => {}
       }
     }
     for (id, node) in &self.nodes {
+      self.outcome.priority_transfers += node.raft.priority_transfers();
       self.outcome.final_terms.insert(*id, node.raft.term());
       self.outcome.max_term = self.outcome.max_term.max(node.raft.term());
     }

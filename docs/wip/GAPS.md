@@ -1826,6 +1826,37 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-28: priority elections — built; the explorer's diagnosis tool broke CI's `--ignored` run — fixed
+
+**Priority** (`docs/wip/research/consensus-enhancements.md` §3.4). A voter's priority is its measured quorum
+round trip. Followers report theirs in `AppendReply`, and the leader returns the table in `AppendEntries`.
+The timer yields one timeout per live voter that outranks it, and a leader hands off to one that does.
+Measured on Microsoft's published matrix across five regions:
+
+- East US, the fastest-committing region, led all 20 seeds (14 before);
+- the median commit latency fell from 189 to 171 ms;
+- after East US returned from an outage it led all 20 seeds again (none before).
+
+At full scale the explorer interleaves 1,843 / 2,149 priority transfers with every fault, with no violation.
+
+**CI run 36511884967 (`3316fc0`).** Both gate lanes failed "T-8.13 … at full scale": its bare `--ignored`
+swept in the new diagnosis tool, `replay_to_the_first_violation`, which unwrapped absent environment
+variables. The tool now skips loudly without them, and the step names its test exactly.
+
+**A test harness that dropped a reply in flight** (`crates/cluster/tests/raft_live.rs`). The priority field
+grew `AppendReply` from 57 to 73 bytes, past the first flight of that test's 16-byte frames (4 packets,
+64 bytes). The voter dropped its session straight after its last serve, against the transport's contract
+(`Endpoint::settle`), so the candidate waited forever for the reply's tail: the gate hung for 12 minutes
+before it was stopped. The voter now settles first, as every sibling live test does.
+[Bug record](../bugs/2026-09-28-a-live-test-dropped-its-last-reply-in-flight.md).
+
+Sibling observations (open, for Ada): `crates/transport/tests/admission.rs`'s `echo` serves once and stops
+driving the server, which holds only while every echo fits one 16-byte frame (all are 13 bytes or less). And
+the fleet's Vivaldi integration is incomplete. Each probe task owns a
+coordinate engine fed by its one peer, and the coordinate a node announces comes from an engine no sample
+feeds. So priority uses measured paths, not coordinates.
+
+
 ### 2026-09-28: learners with catch-up rounds — built
 
 A member promoted into a council or root seat joined the joint configuration at once, with whatever prefix

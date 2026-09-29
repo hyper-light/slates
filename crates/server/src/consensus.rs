@@ -373,18 +373,18 @@ struct Envelope {
   message: Vec<u8>,
 }
 
-/// Derived: the entry bytes one consensus append carries — a fresh fleet session's first credit at the
-/// fleet frame cap, less the append's fixed header and the [`Envelope`] around it
-/// (`slates_cluster::raft_wire::append_batch_bytes`). The envelope's overhead is measured from its own
-/// encoding, so the two cannot drift apart.
-pub(crate) fn append_batch_bytes() -> usize {
+/// Derived: the entry bytes one consensus append carries to a group of `voters` — a fresh fleet session's
+/// first credit at the fleet frame cap, less the append's fixed header, its priority table and the
+/// [`Envelope`] around it (`slates_cluster::raft_wire::append_batch_bytes`). The envelope's overhead is
+/// measured from its own encoding, so the two cannot drift apart.
+pub(crate) fn append_batch_bytes(voters: usize) -> usize {
   let envelope = Envelope {
     group: [0; 32],
     message: Vec::new(),
   }
   .to_bytes()
   .len();
-  slates_cluster::raft_wire::append_batch_bytes(crate::fleet::FLEET_FRAME_CAP, envelope)
+  slates_cluster::raft_wire::append_batch_bytes(crate::fleet::FLEET_FRAME_CAP, envelope, voters)
 }
 
 pub(crate) fn encode_message(

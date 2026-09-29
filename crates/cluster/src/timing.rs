@@ -106,6 +106,39 @@ impl PathRtt {
   }
 }
 
+/// A voter's election priority from its measured paths to the other voters of a group of `voters`
+/// (`docs/wip/research/consensus-enhancements.md` §3.4): the `⌊voters/2⌋`-th smallest smoothed round trip
+/// among `paths` — a leader commits once a majority including itself holds an entry, so that is the round
+/// trip it would commit in — with that path's spread. Unknown (zero) while a sole voter, or while fewer
+/// measured paths than that exist: a voter that has not timed its quorum ranks nobody and is ranked by
+/// nobody.
+pub fn quorum_priority<'a>(
+  paths: impl IntoIterator<Item = Option<&'a PathRtt>>,
+  voters: usize,
+) -> crate::raft::ElectionPriority {
+  let quorum = voters / 2;
+  let mut measured: Vec<(u64, u64)> = paths
+    .into_iter()
+    .flatten()
+    .filter_map(|path| {
+      path
+        .spread_ns()
+        .map(|spread| (path.smoothed_rtt_ns(), spread))
+    })
+    .collect();
+  measured.sort_unstable();
+  quorum
+    .checked_sub(1)
+    .and_then(|position| measured.get(position))
+    .map_or_else(
+      crate::raft::ElectionPriority::default,
+      |&(quorum_ns, spread_ns)| crate::raft::ElectionPriority {
+        quorum_ns,
+        spread_ns,
+      },
+    )
+}
+
 /// A configuration group's election timing for one period, derived from the measured paths to its other
 /// voters ([`ElectionTiming::derive`]). Periods are the coordinator's (one heartbeat or longer each).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,13 +247,15 @@ fn periods_of(span_ns: u64, heartbeat_ns: u64) -> u32 {
 }
 
 /// A group's election timer as its coordinator counts it — one tick per period, persisting across periods:
-/// the follower's age since leader contact, the last contact value it saw, and its jitter rotation. The
+/// the follower's age since leader contact, the last contact value it saw, its jitter rotation, and the
+/// timeouts it has yielded to more central voters (`docs/wip/research/consensus-enhancements.md` §3.4). The
 /// daemon's council and root group each own one; the fabric harness drives the same type.
 #[derive(Debug, Default)]
 pub struct ElectionTimer {
   idle_periods: u32,
   seen_contact: u64,
   attempt: u32,
+  yielded: u32,
 }
 
 impl ElectionTimer {
@@ -230,14 +265,26 @@ impl ElectionTimer {
   }
 
   /// A **follower's** period. `contact` is the group's leader-contact count (Raft Figure 2's two follower
-  /// timer-resets: a leader's append answered, a vote granted); while it advances the age resets and no
-  /// campaign runs. Otherwise the timer ages one period and, once at this node's jittered timeout under
-  /// `timing` ([`ElectionTiming::timeout_periods`]), returns `true` — campaign now — rotating the attempt
-  /// and resetting the age.
-  pub fn follower_period(&mut self, contact: u64, timing: &ElectionTiming, local: HostId) -> bool {
+  /// timer-resets: a leader's append answered, a vote granted); while it advances the age resets, the
+  /// yielded timeouts clear, and no campaign runs. Otherwise the timer ages one period and, once at this
+  /// node's jittered timeout under `timing` ([`ElectionTiming::timeout_periods`]), rotates the attempt and
+  /// resets the age — and returns `true`, campaign now, when this node's election `rank` (how many live
+  /// voters outrank it, `RaftNode::election_rank`) is within the timeouts it has already yielded since it
+  /// last heard a leader. Otherwise it yields this timeout to the more central voters and admits the next
+  /// rank (SOFAJRaft's decaying target priority, in ranks): an election waits at most one timeout per live
+  /// voter that outranks this one, and none when the best live voter is up. Rank zero — no measurements, or
+  /// nothing outranks this node — campaigns at every timeout, exactly as without priorities.
+  pub fn follower_period(
+    &mut self,
+    contact: u64,
+    timing: &ElectionTiming,
+    local: HostId,
+    rank: usize,
+  ) -> bool {
     if contact != self.seen_contact {
       self.seen_contact = contact;
       self.idle_periods = 0;
+      self.yielded = 0;
       return false;
     }
     self.idle_periods = self.idle_periods.saturating_add(1);
@@ -246,7 +293,16 @@ impl ElectionTimer {
     }
     self.attempt = self.attempt.saturating_add(1);
     self.idle_periods = 0;
+    if u32::try_from(rank).unwrap_or(u32::MAX) > self.yielded {
+      self.yielded = self.yielded.saturating_add(1);
+      return false;
+    }
     true
+  }
+
+  /// The timeouts this follower has yielded to more central voters since it last heard a leader.
+  pub fn yielded(&self) -> u32 {
+    self.yielded
   }
 
   /// A **leader's** period: ages one period and returns `true` every `base_periods` — judge the quorum now
@@ -460,7 +516,7 @@ mod tests {
     local: HostId,
     periods: u32,
   ) -> bool {
-    (0..periods).all(|_| !timer.follower_period(contact, timing, local))
+    (0..periods).all(|_| !timer.follower_period(contact, timing, local, 0))
   }
 
   /// A follower campaigns once it has aged past its jittered timeout with no leader contact — the base and
@@ -477,7 +533,7 @@ mod tests {
       "inside the timeout nothing fires"
     );
     assert!(
-      timer.follower_period(0, &timing, local),
+      timer.follower_period(0, &timing, local, 0),
       "the timeout's own period fires"
     );
     assert_eq!(timer.attempts(), 1);
@@ -499,12 +555,12 @@ mod tests {
       first - 1
     ));
     assert!(
-      timer.follower_period(0, &timing, local),
+      timer.follower_period(0, &timing, local, 0),
       "the first campaign"
     );
     assert!(ages_without_firing(&mut timer, 0, &timing, local, 5));
     assert!(
-      !timer.follower_period(1, &timing, local),
+      !timer.follower_period(1, &timing, local, 0),
       "contact advanced: reset"
     );
     assert_eq!(timer.idle_periods(), 0);
@@ -517,7 +573,7 @@ mod tests {
       second - 1
     ));
     assert!(
-      timer.follower_period(1, &timing, local),
+      timer.follower_period(1, &timing, local, 0),
       "the second attempt's timeout fires"
     );
   }
@@ -608,6 +664,73 @@ mod tests {
     assert_eq!(
       far.max_deadline_ns(),
       wan.tail_ns().unwrap() + 10 * HEARTBEAT
+    );
+  }
+
+  /// §3.4's gate: a follower of rank two yields its first two timeouts and campaigns at the third; any
+  /// leader contact clears the yielded count, so the next leader loss starts from rank zero again; rank
+  /// zero campaigns at every timeout.
+  #[test]
+  fn a_follower_yields_one_timeout_per_rank() {
+    let timing = ElectionTiming::floor();
+    let local = HostId(9);
+    let mut timer = ElectionTimer::new();
+    let mut fired = Vec::new();
+    for _ in 0..3 {
+      let mut periods = 0;
+      loop {
+        periods += 1;
+        let campaign = timer.follower_period(0, &timing, local, 2);
+        if campaign || timer.idle_periods() == 0 {
+          fired.push(campaign);
+          break;
+        }
+        assert!(periods < 1_000, "a timeout fires");
+      }
+    }
+    assert_eq!(
+      fired,
+      vec![false, false, true],
+      "two yields, then a campaign"
+    );
+    assert!(!timer.follower_period(1, &timing, local, 2), "contact");
+    assert_eq!(timer.yielded(), 0, "contact clears the yields");
+    let mut rank_zero = ElectionTimer::new();
+    let mut periods = 0;
+    while !rank_zero.follower_period(0, &timing, local, 0) {
+      periods += 1;
+      assert!(periods < 1_000, "rank zero campaigns at its first timeout");
+    }
+  }
+
+  /// §3.4's measure: the quorum round trip is the `⌊n/2⌋`-th smallest measured path to the other voters,
+  /// with that path's spread — the nearest path of three voters, the second of five — and unknown until
+  /// that many paths are measured, or for a sole voter.
+  #[test]
+  fn the_quorum_round_trip_is_the_majoritys_farthest_path() {
+    let path = |rtt_ms: u64| {
+      let mut path = PathRtt::new();
+      for _ in 0..8 {
+        path.on_sample(rtt_ms * 1_000_000);
+      }
+      path
+    };
+    let near = path(72);
+    let middle = path(162);
+    let far = path(262);
+    let three = quorum_priority([Some(&middle), Some(&near)], 3);
+    assert_eq!(three.quorum_ns, near.smoothed_rtt_ns());
+    assert_eq!(Some(three.spread_ns), near.spread_ns());
+    let five = quorum_priority([Some(&far), None, Some(&near), Some(&middle)], 5);
+    assert_eq!(five.quorum_ns, middle.smoothed_rtt_ns());
+    assert_eq!(
+      quorum_priority([None, None, Some(&near), None], 5),
+      crate::raft::ElectionPriority::default(),
+      "one measured path does not reach a majority of five"
+    );
+    assert_eq!(
+      quorum_priority(std::iter::empty(), 1),
+      crate::raft::ElectionPriority::default()
     );
   }
 }
