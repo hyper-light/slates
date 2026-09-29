@@ -288,9 +288,23 @@ Two defects were found, and both are fixed in the daemon:
   always cut off (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`).
 
 Its outcome is statistical, so the step is not part of `all`. With both fixes, 4 of the successors' 10
-pre-elections still drew no reply within their deadline (one logged at over 127 ms against 124 ms). A late
-pre-vote reply is dropped, so the candidate campaigns again a timeout later. A gate on "never" would then
-turn on how often that repeats.
+pre-elections still drew no reply within their deadline (one logged at over 127 ms against 124 ms).
+
+**Found by it, and fixed: a campaign asked no one while a session was out.** Each trial line now carries the
+survivors' campaign counters. Per campaign round, they count the voters it could not ask, by why: no link,
+session lent to a dispatch, or session held by its link task. They also count the pre-vote grants dropped
+for arriving late, and the record links' counters (discovery pages ended by deadline, invalidation or
+transport fault; re-dials).
+
+Over ten trials, every unanswered pre-election was a campaign whose only live voter's session was held out
+of its link by a discovery page, and none was a late grant. A campaign now waits, within its round's base
+deadline, for a session that is out. Ten trials after the fix:
+- the median successor fell from 2.77 to 1.91 s;
+- no voter went unasked;
+- 9 of 10 successors won their first pre-election.
+
+The tenth drew a refusal by lease, Raft's randomized retry
+(`docs/bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md`).
 
 **Found by it, and fixed: a symmetric partition never healed.** The first runs reused one fleet across
 trials. The cut leader, healed after 15 s, never rejoined.

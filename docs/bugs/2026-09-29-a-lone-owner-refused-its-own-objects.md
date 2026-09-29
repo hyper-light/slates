@@ -85,6 +85,14 @@ The rest of the lease is unchanged: the version match, the bound, supersession a
 
 The two forwarding tests now record b's last reply, so a failed wait names what b answered.
 
+**Corrected after CI run 36571342643 (macOS).** The by-use test's first check that the span was covered
+assumed a round lasts about one poll interval: at least half as many rounds as the span holds intervals.
+A round is two status calls, one forwarded between nodes, plus the pace. On CI's macOS runner that is about
+50 ms, so the run made 54 rounds against the 135 that check demanded, while every answer was served. The
+check now states the property it stood for:
+- at least one round per horizon;
+- the last round begun in the final horizon, well past the startup allowance.
+
 ## Siblings
 
 - The lease's other callers (the verb gate, the mount gate, the synthetic root) read `holds` and change with

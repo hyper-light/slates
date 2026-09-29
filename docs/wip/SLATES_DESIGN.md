@@ -2704,7 +2704,11 @@ reconnaissance because the touched partitions are named up front).
 > (`docs/bugs/2026-09-29-a-round-with-no-reply-yet-gave-up-at-its-lookahead.md`). Status now reports each
 > group's election state. It also found that a symmetric partition never healed, since neither side probed
 > a peer it believed dead; an idle probe task now reaches out on a backed-off schedule, and a healed leader
-> rejoins in 5–6.3 s (A-40).
+> rejoins in 5–6.3 s (A-40). Counters per campaign then showed the remaining unanswered pre-elections were
+> campaigns that asked no one: the only live voter's session was held out of its link by a discovery page.
+> A campaign now waits for a session that is out, within its round's base deadline. Over ten trials each,
+> the median successor fell from 2.77 to 1.91 s
+> (`docs/bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md`).
 
 > **The fast track's recovery, verified before it is built (2026-09-28; `docs/wip/research/
 > consensus-enhancements.md`, slice 8).** Parallel replication and the fast track let a follower hold slots

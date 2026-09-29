@@ -3279,6 +3279,116 @@ fn a_council_leader_hands_leadership_to_a_named_voter_faster_than_a_leader_loss_
   assert_handoff_beats_loss(elected, &measured);
 }
 
+/// Shape: how many election timeouts [`a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment`] waits
+/// for the target to lead before it gives up — three: the handoff it asserts beats one, and a campaign that
+/// asked no one waits out at least one more before it can try again.
+const CAMPAIGN_GIVE_UP_TIMEOUTS: u32 = 3;
+
+/// Shape: how long [`a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment`] counts the other voters'
+/// sessions out at each of the target's campaigns — three of the fleet's poll intervals, as a discovery page
+/// holds a session for one round trip, and well inside a round's base deadline (at least a heartbeat).
+const CAMPAIGN_HOLD_NS: u64 = 3 * (HEARTBEAT_NS / POLL_PER_PERIOD);
+
+/// §4.8, D-14; thesis §3.10 (`docs/bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md`): a
+/// campaign whose voters' record sessions are out of their links for a moment — as the link task's discovery
+/// page holds one for its round trip — waits for them within its round's base deadline and asks them, rather
+/// than asking no one and waiting out a whole election timeout (on KIND, 4 of 10 leader losses lost a campaign
+/// that way). Do: the council leader invites a named voter to campaign (a transfer) while, at each of that
+/// voter's campaigns, the other two voters' sessions count as out for three poll intervals. Expect: the target
+/// leads, alone, within the council's election timeout; its campaign awaited both sessions
+/// (`fleet.election.session_awaited`, the non-vacuity count) and left no voter unasked for a session out
+/// (`fleet.election.session_held`, `fleet.election.session_lent`). Before the fix the campaign found no session,
+/// sent no vote request, and the target could not lead.
+#[test]
+fn a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let elected = poll_until(&observed, COUNCIL_ELECTION_DEADLINE, || {
+    one_leader(&daemons)
+  });
+  let leader = leader_index(&daemons);
+  let target = leader.and_then(|lead| (0..daemons.len()).find(|&index| index != lead));
+  let handoff = leader.zip(target).map(|(leader, target)| {
+    let others: Vec<HostId> = (0..daemons.len())
+      .filter(|index| *index != target)
+      .map(|index| hosts[index])
+      .collect();
+    let timeout = daemons[target]
+      .council_timing()
+      .map(|timing| Duration::from_nanos(HEARTBEAT_NS * u64::from(timing.base_periods)));
+    let injected = daemons[target].inject_campaign_session_hold(&others, CAMPAIGN_HOLD_NS);
+    let started = Instant::now();
+    let accepted = daemons[leader].transfer_council_leadership(hosts[target]);
+    // The poll ends when the target leads alone, or once it has waited [`CAMPAIGN_GIVE_UP_TIMEOUTS`] election
+    // timeouts: a failing run then ends in seconds, not at the poll's period budget.
+    let give_up = timeout.as_ref().map_or(Duration::ZERO, |timeout| {
+      *timeout * CAMPAIGN_GIVE_UP_TIMEOUTS
+    });
+    let led = poll_until(&observed, COUNCIL_ELECTION_DEADLINE, || {
+      Ok(
+        (daemons[target].council_leads()? && one_leader(&daemons)?) || started.elapsed() >= give_up,
+      )
+    });
+    let handoff = started.elapsed();
+    let counters = daemons[target].fleet_refusals();
+    (
+      timeout,
+      injected,
+      accepted,
+      led && handoff < give_up,
+      handoff,
+      counters,
+    )
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(elected, "the council elected a leader before the transfer");
+  let (timeout, injected, accepted, handed, handoff, counters) =
+    handoff.expect("a leader and another voter to hand leadership to");
+  eprintln!(
+    "campaign into sessions out for {CAMPAIGN_HOLD_NS} ns: handoff {:.3} s against an election timeout of \
+     {timeout:?}",
+    handoff.as_secs_f64()
+  );
+  assert!(
+    injected.is_ok() && matches!(accepted, Ok(Ok(()))),
+    "the hold was injected ({injected:?}) and the leader accepted the transfer ({accepted:?})"
+  );
+  assert!(
+    handed && timeout.as_ref().is_ok_and(|timeout| handoff < *timeout),
+    "the target led, alone, within the council's election timeout ({timeout:?}), in {handoff:?}: its campaign \
+     waited for the sessions out and asked both voters"
+  );
+  let counters = counters.expect("the target's counters were observed");
+  let count = |name: &str| counters.get(name).copied().unwrap_or(0);
+  assert!(
+    count("fleet.election.session_awaited") >= 2,
+    "the campaign awaited both voters' sessions: {counters:?}"
+  );
+  assert_eq!(
+    (
+      count("fleet.election.session_held"),
+      count("fleet.election.session_lent")
+    ),
+    (0, 0),
+    "no voter was left unasked for a session out: {counters:?}"
+  );
+}
+
 /// Thesis §3.10 across regions: the **root group** leader hands leadership to a named root voter over the
 /// transport. Three hosts in three regions, so each region's representative — every host — votes in the root
 /// group; the target comes to lead the root group, alone, within the root group's election timeout.
@@ -4078,8 +4188,9 @@ fn poll_status_served(
 /// runs, not only within the startup allowance after a configuration install: its region holds no other
 /// candidate, so no successor can gather the `f + 1` promises a takeover needs, and there is no stale read for
 /// its lease to prevent. Do: create a volume on a; once b (region 1) has forwarded one status of it to a, ask
-/// a directly and b through its forward, every poll interval, for three membership horizons. Expect: every
-/// answer served, over at least as many rounds as the span holds poll intervals halved (non-vacuous). Before
+/// a directly and b through its forward, round after round, for three membership horizons. Expect: every
+/// answer served, with at least one round per horizon and the last begun in the final horizon, well past the
+/// startup allowance (non-vacuous: the span was covered, however long a round took on the machine). Before
 /// the fix the lease demanded `f` confirmations whatever the candidate set: it lapsed about half a second after
 /// formation and a refused its own volume `LeaseUnconfirmed { version: 0 }` for good, so the forwarding tests
 /// passed only when their first read landed inside that window (CI run 36567187754).
@@ -4118,12 +4229,13 @@ fn a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance
     routed,
     "b forwarded a status of a's volume to a and it was served (last reply: {first:?})"
   );
-  let (rounds, refused) = sustained.unwrap_or_default();
-  let span_ns = LONE_OWNER_HORIZONS * slates_server::lease::horizon_ns();
-  let paced_rounds = span_ns / (HEARTBEAT_NS / POLL_PER_PERIOD);
+  let (rounds, last_round, refused) = sustained.unwrap_or_default();
+  let horizon = Duration::from_nanos(slates_server::lease::horizon_ns());
+  let final_horizon = horizon * u32::try_from(LONE_OWNER_HORIZONS - 1).unwrap();
   assert!(
-    rounds >= paced_rounds / 2,
-    "the span was sampled: {rounds} rounds against {paced_rounds} poll intervals"
+    rounds >= LONE_OWNER_HORIZONS && last_round >= final_horizon,
+    "the span was covered: {rounds} rounds, the last begun at {last_round:?} (the final horizon begins at \
+     {final_horizon:?})"
   );
   assert_eq!(
     refused,
@@ -4136,20 +4248,23 @@ fn a_lone_owner_in_its_region_serves_its_latest_state_past_the_startup_allowance
 /// keeps asking for — three, so the span runs well past the startup allowance (one horizon after an install).
 const LONE_OWNER_HORIZONS: u64 = 3;
 
-/// Asks for a status of `volume` directly through `local` and through `forwarded` every poll interval for
-/// [`LONE_OWNER_HORIZONS`] membership horizons: the rounds asked, and every answer that was not served.
+/// Asks for a status of `volume` directly through `local` and through `forwarded`, round after round a poll
+/// interval apart, for [`LONE_OWNER_HORIZONS`] membership horizons: the rounds asked, when the last began, and
+/// every answer that was not served.
 fn status_served_throughout(
   local: &mut Client,
   forwarded: &mut Client,
   volume: VolumeId,
-) -> (u64, Vec<String>) {
+) -> (u64, Duration, Vec<String>) {
   let span = Duration::from_nanos(LONE_OWNER_HORIZONS * slates_server::lease::horizon_ns());
   // The pace between rounds is a timed wait on a channel nobody sends on: the test thread parks.
   let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
   let started = Instant::now();
   let mut rounds = 0;
+  let mut last_round = Duration::ZERO;
   let mut refused = Vec::new();
   while started.elapsed() < span {
+    last_round = started.elapsed();
     for (path, client) in [("a", &mut *local), ("b's forward", &mut *forwarded)] {
       let reply = client.call(&RequestBody::Status { volume });
       if !matches!(reply, ReplyBody::Status { .. }) {
@@ -4162,7 +4277,7 @@ fn status_served_throughout(
     rounds += 1;
     let _ = pace.recv_timeout(UNAVAILABLE_PACE);
   }
-  (rounds, refused)
+  (rounds, last_round, refused)
 }
 
 /// Shape: how long [`a_forward_waits_for_the_owners_session_while_it_is_out`] holds the session out — five

@@ -1826,6 +1826,26 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: a campaign asked no one while a session was out — fixed; exclusive session lending — open
+
+**Fixed.** The campaign counters (next entry) named the KIND lane's unanswered pre-elections. Over ten trials,
+each was a campaign whose only live voter's session was held out of its link by a discovery page, so its
+round asked no one and it waited out a whole election timeout. No late grant was dropped.
+- A campaign now waits for a session that is out (held by its link or lent to a dispatch), within its round's
+  base deadline.
+- The failing test came first (`a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment`: a transfer
+  into sessions held for 30 ms; unfixed, no lead in three timeouts; fixed, a lead in 0.09–0.13 s).
+- The fleet suite passes 57 of 57.
+- On KIND over ten trials each, the median successor fell from 2.77 to 1.91 s, no voter went unasked, and 9
+  of 10 won their first pre-election.
+[Bug record](../bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md).
+
+**Open — one session per peer is lent exclusively.** A discovery page, a coordinator dispatch, a forward and
+a campaign each take the whole session out of its link, though the transport runs several exchanges on one
+session at once (`Endpoint::begin`/`drive`). Campaigns and forwards now wait for it. Replication rounds and
+record dispatches retry a missed voter next period. Owed: a shared session (one owner driving it, exchanges
+submitted to it) so no exchange waits for another's.
+
 ### 2026-09-29: a lone owner refused its own objects — fixed; campaign counters added for the open KIND items
 
 **Fixed.** CI run 36567187754 (`2c6c034`, Ubuntu) failed a cross-region forwarding test, and a local full suite
@@ -1842,7 +1862,7 @@ successor could ever adopt: a takeover needs `f + 1` promises from other candida
 - The forwarding tests now record the last reply.
 [Bug record](../bugs/2026-09-29-a-lone-owner-refused-its-own-objects.md).
 
-**Built for the open KIND items (measurement pending).** Six succession trials on `2c6c034` gave successors in
+**Built for the open KIND items (measured: the entry above).** Six succession trials on `2c6c034` gave successors in
 2.01–5.76 s, none by the outranked pod. In 3 of 6 trials the central survivor's first pre-elections drew no
 reply at all. Every survivor's only link event was one discovery deadline. The counter does not name the peer; the page
 to the cut leader is the likely one. There were no re-dials, transport faults or invalidations. The daemon now counts, per campaign
@@ -1923,13 +1943,14 @@ side probes. An idle probe task now reaches out on a backed-off schedule (200 ms
 - On KIND a healed leader rejoins 4.95–6.30 s after the heal (19 trials).
 [Bug record](../bugs/2026-09-29-a-symmetric-partition-never-healed.md).
 
-**Open — a survivor's record session to the other survivor drops after a leader's loss.** Logged on KIND in 4
-of the 12 trials whose survivors' rounds were logged. At the central survivor's first pre-elections its pool
-held no link to the lost leader (removed at its retirement, as designed), and a link to the other survivor
-with no session and none lent out: down for at least 2 s. A pre-election then asks no one.
+**Resolved the same day — a survivor's record session to the other survivor "drops" after a leader's loss.**
+Logged on KIND in 4 of the 12 trials whose survivors' rounds were logged: a link to the other survivor with
+no session and none lent out, for at least 2 s. A pre-election then asks no one.
+
+Nothing tore the session down. The counters show it held by its own link task, on a discovery page, at the
+campaign's start: no re-dial, fault or invalidation. The campaign now waits for it (the entry above).
 - In 1 of those 4 trials the outranked pod won instead.
 - So did one unlogged trial, whose central candidate's 3 pre-elections drew no reply.
-Owed: what tears down a healthy peer's record session there, with a failing test first.
 
 **Open — one CI failure, unexplained.** `a_green_chain_survives_a_daemon_restart` (`crates/client/tests/
 client.rs`) failed once on CI's Ubuntu lane (io_uring), run 36554081271 on `b036a0e`. The second daemon's
@@ -1938,11 +1959,15 @@ rendezvous bind was refused `EADDRINUSE` after `first.stop()`, the symptom of
 runs, and 270 local Linux runs under io_uring did not reproduce it (aarch64, kernel 6.12; isolated, the
 whole binary, and on 4 contended CPUs). Owed: a reproduction on CI's kernel, then the cause.
 
-**Open — a late pre-vote reply is dropped.** With both fixes, 4 of the KIND successors' 10 pre-elections drew
-no reply within their deadline (one logged at over 127 ms against 124 ms), and each costs a whole election
-timeout. Raft counts a vote whenever it arrives within the candidacy, so a late grant folded while the
-pre-election is current would cost a period instead. Owed: measure and decide. Until then the succession
-step stays out of `kind all`, since its gate would turn on how often the retry repeats.
+**Measured the same day — a late pre-vote reply is dropped.** With both fixes, 4 of the KIND successors' 10
+pre-elections drew no reply within their deadline (one logged at over 127 ms against 124 ms). Raft counts a
+vote whenever it arrives within the candidacy, so a late grant folded while the pre-election is current
+would cost a period instead of a timeout.
+
+The daemon now counts each late grant it drops (`fleet.election.late_pre_vote_grant`): 0 in 20 KIND trials.
+The unanswered pre-elections were campaigns that asked no one (above). So folding late grants is not built;
+the counter stays, to show it if it ever matters. The succession step stays out of `kind all`, since its
+outcome is statistical.
 
 ### 2026-09-29: MLRaft — built, verified, measured, one log kept; a yielding voter refused the voter it yielded to — fixed
 

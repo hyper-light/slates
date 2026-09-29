@@ -481,6 +481,11 @@ pub struct ShardState {
   /// but a relay can), without touching the transport. Empty in production
   /// (`Daemon::inject_probe_deafness`).
   pub probe_deaf_to: std::collections::BTreeSet<slates_db::HostId>,
+  /// Test support (never reachable from the wire): voters whose record sessions each of this node's
+  /// campaigns counts as out of their links, as a discovery page holds one, for the span after the
+  /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions
+  /// that are out for a moment. `None` in production (`Daemon::inject_campaign_session_hold`).
+  pub campaign_session_hold: Option<(std::collections::BTreeSet<slates_db::HostId>, u64)>,
   /// This node's owner-lease evidence (§4.8 "Leases and reads"; AUD-08): each peer's latest direct
   /// acknowledgement that reported this node alive under the installed configuration version, and any
   /// newer version a peer announced. Written on the control shard by the probe tasks

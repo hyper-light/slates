@@ -3861,6 +3861,9 @@ const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
 const ELECTION_NO_LINK: &str = "fleet.election.no_link";
 const ELECTION_SESSION_LENT: &str = "fleet.election.session_lent";
 const ELECTION_SESSION_HELD: &str = "fleet.election.session_held";
+/// A voter whose session was out of its link when a campaign's round began and came back within the round's
+/// base deadline, so the round asked it ([`take_campaign_sessions`]): the wait's non-vacuity count.
+const ELECTION_SESSION_AWAITED: &str = "fleet.election.session_awaited";
 /// A pre-vote grant that arrived after its round ended ([`late_raft_reply`]): dropped, as the design has it
 /// (the next campaign re-runs its pre-vote), and counted, so how often a campaign loses a grant to its
 /// deadline is measured (GAPS 2026-09-29, a late pre-vote reply is dropped).
@@ -4824,15 +4827,73 @@ async fn drive_vote_round(
   return_sessions(recovered);
 }
 
-/// Borrows the sessions of the other voters a campaign's round asks ([`take_sessions`]), and counts each
-/// voter it cannot ask by why: no link ([`ELECTION_NO_LINK`]), its session lent to a dispatch
-/// ([`ELECTION_SESSION_LENT`]), or its session held by the link task ([`ELECTION_SESSION_HELD`]).
-fn take_campaign_sessions(others: &[HostId]) -> Vec<(HostId, Endpoint)> {
-  let sessions = take_sessions(|host| others.contains(&host));
+/// Borrows the sessions of the other voters a campaign's round asks ([`take_sessions`]). A voter whose session
+/// is out of its link for a moment — held by its link task's discovery page for one round trip, or lent to a
+/// dispatch — is waited for, paced at `budget`'s poll interval, until the round's base deadline: a page
+/// returns its session within the page's round trip, which that deadline covers (it is at least the slowest
+/// voter's round-trip tail, `round_budget`). Taking only what was in the links at the first look sent the
+/// round to no one whenever the only live voter's session was out, and the campaign then cost a whole
+/// election timeout: on KIND, 4 of 10 leader losses
+/// (`docs/bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md`). A voter with no link — retired,
+/// or never dialled — is not waited for. Each voter awaited and taken is counted
+/// ([`ELECTION_SESSION_AWAITED`]); each still unasked at the end, by why ([`ELECTION_NO_LINK`],
+/// [`ELECTION_SESSION_LENT`], [`ELECTION_SESSION_HELD`]).
+async fn take_campaign_sessions(
+  others: &[HostId],
+  budget: CommitBudget,
+) -> Vec<(HostId, Endpoint)> {
+  let began = futures::now_ns();
+  let (withheld, withheld_until) = campaign_hold(began);
+  let available = |host: HostId| !(withheld.contains(&host) && futures::now_ns() < withheld_until);
+  let mut taken = take_sessions(|host| others.contains(&host) && available(host));
+  let first_look = taken.len();
+  loop {
+    let out = voters_out(others, &taken);
+    if out.is_empty() || futures::now_ns().saturating_sub(began) >= budget.deadline_ns {
+      count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
+      return taken;
+    }
+    futures::sleep(budget.poll_interval_ns).await;
+    taken.extend(take_sessions(|host| out.contains(&host) && available(host)));
+  }
+}
+
+/// Test support: the voters whose sessions a campaign that began at `began_ns` counts as out of their links,
+/// and until when ([`ShardState::campaign_session_hold`]); none in production.
+fn campaign_hold(began_ns: u64) -> (std::collections::BTreeSet<HostId>, u64) {
+  state::with_state(|s| s.campaign_session_hold.clone())
+    .flatten()
+    .map_or_else(
+      || (std::collections::BTreeSet::new(), began_ns),
+      |(voters, span_ns)| (voters, began_ns.saturating_add(span_ns)),
+    )
+}
+
+/// The other voters a campaign has not yet taken a session of whose record link exists — the session out
+/// on a discovery page or a dispatch — the ones it waits for.
+fn voters_out(others: &[HostId], taken: &[(HostId, Endpoint)]) -> Vec<HostId> {
+  state::with_state(|s| {
+    others
+      .iter()
+      .copied()
+      .filter(|voter| !taken.iter().any(|(host, _)| host == voter))
+      .filter(|voter| s.record_sessions.contains_key(voter))
+      .collect()
+  })
+  .unwrap_or_default()
+}
+
+/// Counts a campaign's session take: the voters awaited ([`ELECTION_SESSION_AWAITED`]), and each voter left
+/// unasked by why.
+fn count_campaign_sessions(others: &[HostId], taken: &[(HostId, Endpoint)], awaited: usize) {
   let _ = state::with_state(|s| {
+    if awaited > 0 {
+      let count = s.refusals.entry(ELECTION_SESSION_AWAITED).or_insert(0);
+      *count = count.saturating_add(u64::try_from(awaited).unwrap_or(u64::MAX));
+    }
     for voter in others
       .iter()
-      .filter(|voter| !sessions.iter().any(|(host, _)| host == *voter))
+      .filter(|voter| !taken.iter().any(|(host, _)| host == *voter))
     {
       let why = match s.record_sessions.get(voter) {
         None => ELECTION_NO_LINK,
@@ -4842,7 +4903,6 @@ fn take_campaign_sessions(others: &[HostId]) -> Vec<(HostId, Endpoint)> {
       count_refusal_in(s, why);
     }
   });
-  sessions
 }
 
 /// A campaign the leader invited (thesis §3.10, leadership transfer): when the serve path has recorded an
@@ -4861,7 +4921,7 @@ async fn drive_invited_campaign(
   let Some(vote) = votes.into_iter().next() else {
     return false;
   };
-  let sessions = take_campaign_sessions(others);
+  let sessions = take_campaign_sessions(others, budget).await;
   if !sessions.is_empty() {
     drive_vote_round(group, vote, sessions, budget, in_flight).await;
   }
@@ -4949,7 +5009,7 @@ async fn drive_council_election(
   else {
     return;
   };
-  let sessions = take_campaign_sessions(others);
+  let sessions = take_campaign_sessions(others, budget).await;
   if sessions.is_empty() {
     return;
   }
@@ -5451,7 +5511,7 @@ async fn drive_root_election(
   else {
     return;
   };
-  let sessions = take_campaign_sessions(others);
+  let sessions = take_campaign_sessions(others, budget).await;
   if sessions.is_empty() {
     return;
   }

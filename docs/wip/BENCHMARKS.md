@@ -969,6 +969,19 @@ export. CI gates the successor's identity (`on_the_kind_profile_a_central_leader
 third row's defect. Real pods run about twice the simulation's time to a successor: 4 in 10 of the
 successors' pre-elections drew no reply within their deadline.
 
+**The campaign's session wait (2026-09-29).** New counters named that gap. A campaign's round could not ask
+the only live voter, because its session was held out of its link by a discovery page. No late grant was
+dropped. Ten trials each, the same profile, no other session's load on the machine:
+
+| Daemon | Successor | Seconds to a successor, each trial | Voters not asked for a held session |
+|---|---|---|---|
+| `3f8733e` (counters only) | the central survivor, 10 of 10 | 1.58, 1.95, 1.95, 1.96, 2.35, 2.77, 3.45, 3.52, 3.91, 5.01 (median 2.77) | 5, in 4 trials |
+| a campaign waits for a session out, within its round's base deadline | the central survivor, 10 of 10 | 1.54, 1.60, 1.69, 1.87, 1.87, 1.91, 1.93, 1.94, 1.95, 3.43 (median 1.91) | 0 |
+
+The one slow trial after the fix drew a refusal by lease: the other survivor had heard the cut leader up to a
+heartbeat later than the candidate. The retry won
+(`docs/bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md`).
+
 **The heal (2026-09-29, A-40).** Each trial then waits for the healed leader to rejoin: every pod holding all
 three members with one leader. Over 19 trials it rejoined 4.95, 4.97, 4.97, 4.98, 4.98, 5.07, 5.09, 5.17,
 6.08, 6.09, 6.11, 6.13, 6.15, 6.15, 6.16, 6.18, 6.19, 6.20 and 6.30 s after the heal. Before A-40 it had not

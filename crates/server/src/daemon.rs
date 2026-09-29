@@ -1770,6 +1770,22 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
+  /// links for `span_ns` after its round begins, as a discovery page holds one for its round trip, so a test
+  /// drives a campaign into sessions that are out for a moment
+  /// (`docs/bugs/2026-09-29-a-campaign-asked-no-one-while-a-session-was-out.md`). An empty `voters` disarms
+  /// it. `Ok` once installed, else the typed refusal.
+  pub fn inject_campaign_session_hold(
+    &self,
+    voters: &[slates_db::HostId],
+    span_ns: u64,
+  ) -> Result<(), ObserveError> {
+    let voters: std::collections::BTreeSet<slates_db::HostId> = voters.iter().copied().collect();
+    self.observe(self.shards.first().copied(), move |s| {
+      s.campaign_session_hold = (!voters.is_empty()).then_some((voters, span_ns));
+    })
+  }
+
   /// Whether this node's **owner lease** over `object` holds right now (§4.8 "Leases and reads"; AUD-08):
   /// `f` of the object's other candidate holders confirmed this node alive under the installed
   /// configuration within the lease bound (or the bounded startup allowance is still open), and it is not
@@ -2292,6 +2308,7 @@ fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     indirect: crate::fleet::IndirectProbes::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
+    campaign_session_hold: None,
     // The owner lease starts its bounded startup allowance at boot (§4.8 "Leases and reads", AUD-08): the
     // node has just installed its initial configuration, so within the first membership horizon it serves
     // its objects while its first probe acks accumulate, and no takeover can yet have committed.
