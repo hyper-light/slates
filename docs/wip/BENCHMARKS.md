@@ -822,6 +822,56 @@ The whole full-scale set runs in 18.4 s here and holds 2.43 GB at its peak.
 that loses a chosen value at a scope the table never reached (three indices with four terms). The corrected
 design and its numbers follow.
 
+### Pipelined replication across five regions (2026-09-29)
+
+**Hardware:** Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1, rustc 1.98.0, release. The timed simulation is
+deterministic, so a run's numbers are exact for its seeds; the wall time is this machine's. **Command:**
+`SLATES_PIPELINING_SEEDS=20 SLATES_PIPELINING_STREAM_S=30 cargo test -p slates-cluster --release --test
+pipelining -- --ignored --exact pipelining_across_rates_and_loss --nocapture` (12.6 s).
+
+**Setup:** five voters on Microsoft's published P50 matrix (East US, West Europe, Japan East, Southeast Asia,
+Brazil South; `support::azure`), 5 ms jitter, elections by priority, the council drive's one append per
+follower per 100 ms period with its batch budget (4,367 bytes: about 208 of the stream's 21-byte entries),
+proposals from 10 s for 30 s. Each row is the median over 20 seeds of each seed's median and 99th percentile
+commit latency and commits a second; messages and bytes are summed.
+
+| Offered, loss | Window | Median / p99 | Commits a second | Bytes sent | Batches ahead |
+|---|---|---|---|---|---|
+| 20/s, none | 0, 1 batch, 4 batches | 156 / 206 ms | 19 | 9,676,654 (each) | 0 |
+| 500/s, none | 0, 1, 4 | 172 / 221 ms | 497 | 57,877,534 (each) | 0 |
+| 1,000/s, none | 0 | 172 / 222 ms | 994 | 96,467,659 | 0 |
+| 1,000/s, none | 1 batch | 172 / 222 ms | 994 | 83,126,233 | 5,956 |
+| 2,000/s, none | 0 | 7,319 / 14,378 ms | 1,029 | 110,932,564 | 0 |
+| 2,000/s, none | 1 batch | 172 / 222 ms | 1,988 | 109,189,186 | 15,932 |
+| 2,000/s, none | 4 batches | 172 / 222 ms | 1,988 | 108,321,466 | 17,930 |
+| 4,000/s, none | 0 | 11,169 / 22,010 ms | 1,030 | 111,889,534 | 0 |
+| 4,000/s, none | 1 or 4 batches | 7,349 / 14,406 ms | 2,058 | 111,889,534 | 15,940 / 17,940 |
+| 1,000/s, 1 % | 0 | 183 / 267 ms | 993 | 97,175,833 | 0 |
+| 1,000/s, 1 % | 1 batch | 174 / 241 ms | 994 | 84,700,216 | 5,806 |
+| 2,000/s, 1 % | 0 | 7,357 / 14,483 ms | 1,022 | 111,380,905 | 0 |
+| 2,000/s, 1 % | 1 batch | 260 / 458 ms | 1,980 | 110,712,202 | 15,357 |
+| 2,000/s, 1 % | 4 batches | 201 / 321 ms | 1,985 | 109,822,390 | 17,503 |
+| 4,000/s, 1 % | 0 / 1 / 4 batches | 11,187 / 7,520 / 7,432 ms median | 1,024 / 2,005 / 2,033 | 111,870,940 (each) | 0 / 15,365 / 17,512 |
+
+**Measured and rejected:** going ahead whenever a resend would not reach the next index (the first cut). At
+2,000 proposals a second each period's batch fell just short of full, so every resend reached past it: no batch
+went ahead in any seed, and the group committed 1,018 a second at a 2,497 ms median, as with no window.
+
+### A leader's cost per proposal at a growing backlog (2026-09-29)
+
+**Command:** `SLATES_BACKLOG_ENTRIES=50000 cargo test -p slates-cluster --release --test pipelining --
+--ignored --exact a_proposal_costs_the_leader_the_same_at_any_backlog --nocapture`: a leader of five whose
+followers acknowledge nothing, each thousand proposals timed. Hardware as above.
+
+| Backlog | Before (each scan of the log) | After |
+|---|---|---|
+| 1,000 | 129 µs | 102 ns |
+| 2,000 | 774 µs | — |
+| 3,000 | 5.7 ms | — |
+| 4,000 | 12.1 ms | — |
+| 5,000 | 20.0 ms | 96 ns |
+| 10,000 to 50,000 | not reached | 61 ns to 67 ns |
+
 ### The prefix model, corrected: a slot goes only under a classic commit (2026-09-29)
 
 **Hardware:** Apple M5 Max, 18 cores, 128 GB, macOS 26.4.1, rustc 1.98.0, release; no other session's build

@@ -548,7 +548,7 @@ impl RegionalCouncil {
   /// What the leader replicates to `follower` now — an append carrying at most `budget` entry bytes (a
   /// heartbeat when nothing is owed), or the snapshot when the entries it needs were compacted away (Raft
   /// §7) — or `None` when this node does not lead.
-  pub fn replication_for(&self, follower: HostId, budget: usize) -> Option<RaftMessage> {
+  pub fn replication_for(&mut self, follower: HostId, budget: usize) -> Option<RaftMessage> {
     self
       .raft
       .replicate_to(follower, budget)
@@ -1545,7 +1545,7 @@ mod tests {
       .collect();
     for peer in targets {
       let Some(message) = councils
-        .get(&leader)
+        .get_mut(&leader)
         .and_then(|l| l.replication_for(peer, budget))
       else {
         continue;
@@ -2008,7 +2008,10 @@ mod tests {
       councils[&OWNER].snapshot_index() > councils[&B].last_log_index(),
       "the leader compacted past everything B holds"
     );
-    let owed = councils[&OWNER].replication_for(B, SMALL_BUDGET);
+    let owed = councils
+      .get_mut(&OWNER)
+      .unwrap()
+      .replication_for(B, SMALL_BUDGET);
     assert!(
       matches!(owed, Some(RaftMessage::InstallSnapshot(_))),
       "B is owed the snapshot, not an append"

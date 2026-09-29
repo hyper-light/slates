@@ -111,6 +111,16 @@ The mapping, as verified (slice 9): out-of-order **acknowledgement** within a te
 buffers the leader's entries that arrive ahead of a hole in its window, so they are not sent again and
 commit the moment the hole fills — with **in-order commitment and application**.
 
+**Built with pipelining (slice 11).** Out-of-order acknowledgement needs entries in flight ahead of a hole,
+so the leader pipelines (thesis §10.2.2; etcd's probe and replicate states): a follower whose place is
+confirmed is sent the next batch before the last is acknowledged, while its backlog is more than one resend
+carries and what is in flight beyond the first unacknowledged batch fits its window; a refusal returns it to
+probing, one batch at a time. When a resend would carry the whole backlog it is sent instead, since it also
+recovers a lost batch within one send. Measured on five Azure regions (one send a period, as the council's
+drive): a window of one batch changes nothing at 20 or 500 proposals a second, sends 14 % fewer bytes at
+1,000, and at 2,000 keeps up — a 172 ms median commit — where no window is overloaded at 7.3 s; a larger
+window cuts the tail under 1 % loss (458 → 321 ms p99).
+
 **Out-of-order commitment was measured and rejected.** The prefix model found a 12-step history. A leader
 commits an index out of order from a window's copy. Recovery by the next leader fills the uncommitted index
 below it with a no-op. That no-op conflicts with the old leader's log, and Raft's truncation deletes the old
@@ -568,4 +578,48 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     follower almost never has a hole to buffer across (4 buffered entries in 3,200,000 explored steps), and
     §3.5's out-of-order acknowledgement pays nothing. Then the groups' wiring (window budget, vote routing to
     the leader, the fast track's policy) and the timed measurements that decide it.
+- **Slice 11 (2026-09-29): pipelined replication, and a leader whose cost grew with its backlog.**
+  - **Built** (`RaftNode::replicate_to`, with its first failing tests):
+    - A follower is **probing** after an election, a refusal or its staging: sent one batch from its next
+      index until one is acknowledged.
+    - Otherwise it is **pipelined**: sent the next batch before the last is acknowledged, while what is in
+      flight beyond its first unacknowledged batch fits its window, and the next index moves past what went.
+    - Otherwise it is sent its first unacknowledged batch again — a heartbeat when it holds everything.
+    - A batch goes ahead only when a resend would not carry the whole backlog. The first cut went ahead only
+      when a resend would not reach the next index, and at 2,000 proposals a second — batches just short of
+      full — it never went ahead, however far the backlog grew.
+
+    With no window nothing goes ahead, so the groups (window zero until wired) send as before, byte for byte.
+  - **Measured** (`crates/cluster/tests/pipelining.rs`; five Azure regions, 20 seeds, 30 s streams,
+    `docs/wip/BENCHMARKS.md`):
+
+    | Offered rate, loss | No window: median / p99, commits a second | One batch | Four batches |
+    |---|---|---|---|
+    | 20 or 500 a second | 156–174 / 206–241 ms | the same, byte for byte | the same |
+    | 1,000, none | 172 / 222 ms, 96.5 MB sent | 172 / 222 ms, 83.1 MB | as one batch |
+    | 1,000, 1 % | 183 / 267 ms | 174 / 241 ms | 174 / 241 ms |
+    | 2,000, none | 7,319 / 14,378 ms, 1,029 | 172 / 222 ms, 1,988 | as one batch |
+    | 2,000, 1 % | 7,357 / 14,483 ms, 1,022 | 260 / 458 ms, 1,980 | 201 / 321 ms, 1,985 |
+    | 4,000, none | 1,030 a second | 2,058 a second | 2,058 a second |
+
+    A window of one batch holds the capacity, since the drive sends one append a period and the quorum round
+    trip (83–185 ms) is under two periods; a larger one cuts the tail under loss, since followers buffer
+    more while a hole is repaired. CI gates the 2,000-a-second case and the identity at a low rate
+    (`a_window_of_one_batch_keeps_up_where_none_does`, 0.64 s in debug).
+  - **Found on the way: a leader's work per message grew with its backlog.** The commit rule tried every index
+    from the log's end down to the commit index, and every configuration lookup scanned the log. One
+    proposal cost 20 ms at a 5,000-entry backlog, and it now costs 61 ns to 102 ns at any backlog up to
+    50,000. The rule now takes the index where a majority begins among the match indices, and the log's
+    configuration entries are indexed. [Bug record](../../bugs/2026-09-29-a-leaders-commit-rule-scanned-its-backlog.md).
+  - **Found on the way: the recovery read only its own window's reach** above its log, while the prefix
+    model's reads every slot above the log. A leader with a smaller window than a voter's left an index free
+    where the voter had helped choose a value beyond it — harmless only while every window is the same, which
+    nothing enforced. It now reads every slot above its log (each reporter's window bounds its reports), so a
+    group's windows may differ, as windows derived from each node's measured paths will. The explorer now
+    gives each node one of three windows per history (one, one and a half, two appends); at full scale 2 and
+    25 recoveries took a value past the new leader's own reach, with no violation.
+    [Bug record](../../bugs/2026-09-29-a-recovery-read-only-its-own-windows-reach.md).
+  - **Next.** The groups' wiring: a window derived from each node's measured paths — one batch holds the
+    capacity, and more cuts the tail under loss — then votes routed to the leader, the fast track's policy from
+    its crossover measurement, MLRaft, and the KIND lane.
 

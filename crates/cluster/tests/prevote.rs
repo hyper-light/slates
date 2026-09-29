@@ -60,6 +60,7 @@ fn scenario(profile: &Profile, fault: Fault, campaign: Campaign, seed: u64) -> S
     campaign,
     order: ElectionOrder::ByPriority,
     seed,
+    window_budget: 0,
   }
 }
 

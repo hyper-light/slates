@@ -417,7 +417,7 @@ impl RootGroup {
   /// What the leader replicates to `follower` now — an append carrying at most `budget` entry bytes (a
   /// heartbeat when nothing is owed), or the snapshot when the entries it needs were compacted away (Raft
   /// §7) — or `None` when this node does not lead.
-  pub fn replication_for(&self, follower: HostId, budget: usize) -> Option<RaftMessage> {
+  pub fn replication_for(&mut self, follower: HostId, budget: usize) -> Option<RaftMessage> {
     self
       .raft
       .replicate_to(follower, budget)
@@ -1029,7 +1029,7 @@ mod tests {
       .collect();
     for peer in targets {
       let Some(message) = groups
-        .get(&leader)
+        .get_mut(&leader)
         .and_then(|l| l.replication_for(peer, budget))
       else {
         continue;
@@ -1479,7 +1479,10 @@ mod tests {
     assert_eq!(roots[&P1].configuration(), &oracle);
     assert!(roots[&P0].compactions() > 0, "the leader compacted");
     assert!(matches!(
-      roots[&P0].replication_for(P2, SMALL_BUDGET),
+      roots
+        .get_mut(&P0)
+        .unwrap()
+        .replication_for(P2, SMALL_BUDGET),
       Some(RaftMessage::InstallSnapshot(_))
     ));
     let mut rounds = 0;

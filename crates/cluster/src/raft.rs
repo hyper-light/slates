@@ -673,9 +673,17 @@ pub struct RaftNode {
   read_context: u64,
   read_round: Option<ReadRound>,
   log: Vec<LogEntry>,
+  /// The indices of the log's configuration entries, kept beside it so the configuration in force is found
+  /// without a scan: a leader asks for it on every append, reply and vote, and a scan of a long log there
+  /// made a proposal cost 20 ms at a 5,000-entry backlog (2026-09-29).
+  config_entries: BTreeSet<u64>,
   commit_index: u64,
   next_index: BTreeMap<HostId, u64>,
   match_index: BTreeMap<HostId, u64>,
+  /// While leading: the followers whose place is a guess — after this leader's election, a refusal, or a
+  /// member's staging — sent one batch from `next_index` at a time until one is acknowledged (thesis
+  /// §10.2.2's fallback; etcd's probe state). The others are pipelined ([`replicate_to`](Self::replicate_to)).
+  probing: BTreeSet<HostId>,
   snapshot_index: u64,
   snapshot_term: u64,
   snapshot_data: Vec<u8>,
@@ -752,6 +760,9 @@ pub struct WindowCounters {
   pub recovered: u64,
   /// Of those, values a fast quorum could have chosen (Fast Paxos's rule).
   pub recovered_fast_choices: u64,
+  /// Of those, values past this node's own window's reach above its log, which only a voter whose window
+  /// reaches further reported.
+  pub recovered_beyond_reach: u64,
   /// Free indices a recovery filled with a no-op below the last value it re-proposed.
   pub holes_filled: u64,
   /// Window slots pruned once a classic commit covered their index.
@@ -762,6 +773,8 @@ pub struct WindowCounters {
   pub absorbed: u64,
   /// Indices this node decided as leader from fast votes.
   pub decided_from_votes: u64,
+  /// Batches this node sent as leader ahead of a follower's acknowledgements (pipelined, §3.5).
+  pub sent_ahead: u64,
   /// Of those, indices a fast quorum chose, committed in one round.
   pub fast_commits: u64,
 }
@@ -787,9 +800,11 @@ impl RaftNode {
       read_context: 0,
       read_round: None,
       log: Vec::new(),
+      config_entries: BTreeSet::new(),
       commit_index: 0,
       next_index: BTreeMap::new(),
       match_index: BTreeMap::new(),
+      probing: BTreeSet::new(),
       snapshot_index: 0,
       snapshot_term: 0,
       snapshot_data: Vec::new(),
@@ -855,9 +870,11 @@ impl RaftNode {
     node.joint = saved.base.joint;
     node.current_term = saved.term;
     node.voted_for = saved.voted_for;
-    node.log = saved.log;
-    node.commit_index = saved.commit_index;
     node.snapshot_index = saved.snapshot_index;
+    for entry in saved.log {
+      node.push_entry(entry);
+    }
+    node.commit_index = saved.commit_index;
     node.snapshot_term = saved.snapshot_term;
     node.snapshot_data = saved.snapshot_data;
     node.window = saved
@@ -1138,20 +1155,22 @@ impl RaftNode {
     let next = self.last_log_index().saturating_add(1);
     self.next_index.clear();
     self.match_index.clear();
+    self.probing.clear();
     for peer in &self.all_voters() {
       if *peer != self.id {
         self.next_index.insert(*peer, next);
         self.match_index.insert(*peer, 0);
+        self.probing.insert(*peer);
       }
     }
   }
 
   /// The recovery a new leader runs before its first append (`docs/wip/research/consensus-enhancements.md`
   /// §4; the design `tests/prefix_model.rs` verifies). Each index above its own last log entry that a
-  /// window holds — its own, or one a granting voter reported, within [`window_span`](Self::window_span) —
-  /// is decided by the highest ballot there: a leader's entry is re-proposed as it is; at a fast ballot, the
-  /// value with at least `|Q| + |F| − n` of the reports (Fast Paxos's rule: the value a fast quorum could
-  /// have chosen), and otherwise the index is free. The recovered values are appended at this term, with a
+  /// window holds — its own, or one a granting voter reported — is decided by the highest ballot there: a
+  /// leader's entry is re-proposed as it is; at a fast ballot, the value with at least `|Q| + |F| − n` of the
+  /// reports (Fast Paxos's rule: the value a fast quorum could have chosen), and otherwise the index is
+  /// free. The recovered values are appended at this term, with a
   /// no-op at each free index below the last of them, so this leader can commit them. It is then synced to
   /// its own term, and keeps its window: a slot goes only once a classic commit covers its index (§4), since
   /// until then a later leader's truncation can erase the log entries that carry it — clearing it here lost a
@@ -1159,20 +1178,20 @@ impl RaftNode {
   /// nothing.
   fn recover(&mut self) {
     let above = self.last_log_index();
-    let reach = above.saturating_add(self.window_span());
     let mut reported: BTreeMap<u64, Vec<WindowSlot>> = BTreeMap::new();
-    // `BTreeMap::range` panics on a start past its end, so the reach is checked, not ranged (a zero span —
-    // the default budget — has none above the log).
+    // Every slot above the log, as the prefix model's recovery reads them — not only those within this node's
+    // own reach: a voter whose window reaches further may have helped choose a value there, and until
+    // 2026-09-29 a leader with a smaller window left such an index free. Each reporter's window bounds what it
+    // reports.
     let own = self
       .window
-      .iter()
-      .filter(|(index, _)| **index > above && **index <= reach)
+      .range(above.saturating_add(1)..)
       .map(|(index, slot)| (*index, slot.clone()));
     let voters = self
       .reports
       .values()
       .flatten()
-      .filter(|report| report.index > above && report.index <= reach)
+      .filter(|report| report.index > above)
       .map(|report| (report.index, report.slot.clone()));
     for (index, slot) in own.chain(voters) {
       reported.entry(index).or_default().push(slot);
@@ -1186,11 +1205,18 @@ impl RaftNode {
           .map(|found| (*index, found))
       })
       .collect();
+    let reach = above.saturating_add(self.window_span());
     if let Some(&last) = recovered.keys().next_back() {
       for index in above.saturating_add(1)..=last {
         let entry = match recovered.get(&index) {
           Some((entry, fast)) => {
             self.window_counters.recovered = self.window_counters.recovered.saturating_add(1);
+            if index > reach {
+              self.window_counters.recovered_beyond_reach = self
+                .window_counters
+                .recovered_beyond_reach
+                .saturating_add(1);
+            }
             if *fast {
               self.window_counters.recovered_fast_choices = self
                 .window_counters
@@ -1207,7 +1233,7 @@ impl RaftNode {
             LogEntry::command(self.current_term, Vec::new())
           }
         };
-        self.log.push(entry);
+        self.push_entry(entry);
       }
     }
     self.reports.clear();
@@ -1305,49 +1331,32 @@ impl RaftNode {
   /// The one-based log index of the most recent configuration entry, or zero when the log holds none
   /// (the effective configuration is then the base).
   fn latest_config_index(&self) -> u64 {
-    self
-      .log
-      .iter()
-      .rposition(|entry| entry.config.is_some())
-      .and_then(|position| u64::try_from(position).ok())
-      .map_or(0, |position| {
-        self
-          .snapshot_index
-          .saturating_add(position)
-          .saturating_add(1)
-      })
+    self.config_entries.last().copied().unwrap_or(0)
   }
 
   /// The configuration the latest configuration entry replaced: the previous configuration entry in the
   /// log, or the base when it is the only one. `None` when the log holds no configuration entry.
   fn config_before_latest(&self) -> Option<VoterConfig> {
-    let latest = self.log.iter().rposition(|entry| entry.config.is_some())?;
-    let previous = self.log[..latest]
-      .iter()
-      .rev()
-      .find_map(|entry| entry.config.clone());
-    Some(previous.unwrap_or(VoterConfig {
-      voters: self.voters.clone(),
-      joint: self.joint.clone(),
-    }))
+    let mut latest_first = self.config_entries.iter().rev();
+    latest_first.next()?;
+    Some(
+      latest_first
+        .next()
+        .and_then(|index| self.config_at(*index))
+        .unwrap_or_else(|| self.base_config()),
+    )
   }
 
   /// The configuration in force **at the commit index**: the most recent configuration entry at or below
   /// it, or the base when none is committed — what a leader consults to learn that its own removal has
   /// committed.
   fn committed_config(&self) -> VoterConfig {
-    let committed = usize::try_from(self.commit_index.saturating_sub(self.snapshot_index))
-      .unwrap_or(usize::MAX)
-      .min(self.log.len());
-    for entry in self.log[..committed].iter().rev() {
-      if let Some(config) = &entry.config {
-        return config.clone();
-      }
-    }
-    VoterConfig {
-      voters: self.voters.clone(),
-      joint: self.joint.clone(),
-    }
+    self
+      .config_entries
+      .range(..=self.commit_index)
+      .next_back()
+      .and_then(|index| self.config_at(*index))
+      .unwrap_or_else(|| self.base_config())
   }
 
   /// A leader whose own removal has **committed** steps down (Ongaro's thesis §4.2.2): once the sole
@@ -1373,15 +1382,11 @@ impl RaftNode {
   /// configuration when the log holds none. A truncated configuration entry reverts the effective
   /// configuration automatically, because it is derived from the log rather than stored.
   fn effective_config(&self) -> VoterConfig {
-    for entry in self.log.iter().rev() {
-      if let Some(config) = &entry.config {
-        return config.clone();
-      }
-    }
-    VoterConfig {
-      voters: self.voters.clone(),
-      joint: self.joint.clone(),
-    }
+    self
+      .config_entries
+      .last()
+      .and_then(|index| self.config_at(*index))
+      .unwrap_or_else(|| self.base_config())
   }
 
   /// Whether `granters` form a majority under the current configuration (the quorum intersection Raft's
@@ -1536,6 +1541,7 @@ impl RaftNode {
     }
     self.retention_pending = true;
     self.log.drain(0..discard);
+    self.config_entries = self.config_entries.split_off(&up_to.saturating_add(1));
     self.snapshot_index = up_to;
     self.snapshot_term = term;
     self.snapshot_data = state;
@@ -1588,8 +1594,12 @@ impl RaftNode {
           .unwrap_or(usize::MAX)
           .min(self.log.len());
         self.log.drain(0..discard);
+        self.config_entries = self
+          .config_entries
+          .split_off(&request.last_included_index.saturating_add(1));
       } else {
         self.log.clear();
+        self.config_entries.clear();
       }
       self.snapshot_index = request.last_included_index;
       self.snapshot_term = request.last_included_term;
@@ -1664,6 +1674,7 @@ impl RaftNode {
   fn record_match(&mut self, follower: HostId, index: u64) {
     let matched = self.match_of(follower).max(index);
     self.match_index.insert(follower, matched);
+    self.probing.remove(&follower);
     let next = self.next_index.get(&follower).copied().unwrap_or(1);
     self
       .next_index
@@ -1705,7 +1716,7 @@ impl RaftNode {
   /// term ([`AppendEntries::sync_index`]).
   fn leader_append(&mut self, entry: LogEntry) {
     self.retention_pending = true;
-    self.log.push(entry);
+    self.push_entry(entry);
     if self.sync_index == 0 {
       self.sync_index = self.last_log_index();
     }
@@ -1962,21 +1973,39 @@ impl RaftNode {
     }
   }
 
-  /// Builds the [`AppendEntries`] to send `follower`, from the leader's `next_index` for it: the entries
-  /// after that point — as many as fit in `budget` wire bytes ([`LogEntry::encoded_len`]), and always at
-  /// least one when any is owed, so an entry larger than the budget still goes, alone — and the previous
-  /// position for the consistency check. Empty entries make it a heartbeat. Returns `None` if this node is
-  /// not the leader, or when the entries the follower needs were compacted away (it needs
-  /// [`install_snapshot_for`](RaftNode::install_snapshot_for)).
-  pub fn replicate_to(&self, follower: HostId, budget: usize) -> Option<AppendEntries> {
+  /// Builds the [`AppendEntries`] to send `follower` and records what went: a batch of entries — as many as
+  /// fit in `budget` wire bytes ([`LogEntry::encoded_len`]), and always at least one when any is owed, so an
+  /// entry larger than the budget still goes, alone — with the previous position for the consistency check.
+  /// Empty entries make it a heartbeat. Where the batch starts (`docs/wip/research/consensus-enhancements.md`
+  /// §3.5; thesis §10.2.2):
+  /// - a follower whose place is a guess (probing) is sent from its `next_index`, one batch until one is
+  ///   acknowledged;
+  /// - a confirmed follower is pipelined: sent the next batch before the last is acknowledged, while what is
+  ///   in flight beyond its first unacknowledged batch fits its window — the group's one window budget, what
+  ///   it can hold ahead of a hole ([`room_ahead`](Self::room_ahead)) — and `next_index` moves past what went;
+  /// - otherwise it is sent its first unacknowledged batch again, which is a heartbeat when it holds
+  ///   everything.
+  ///
+  /// With no window nothing goes ahead, so every send starts at the first unacknowledged entry. Returns `None`
+  /// if this node is not the leader, or when the entries the follower needs were compacted away (it needs
+  /// [`install_snapshot_for`](RaftNode::install_snapshot_for), and is set to probe from there).
+  pub fn replicate_to(&mut self, follower: HostId, budget: usize) -> Option<AppendEntries> {
     if self.role != Role::Leader {
       return None;
     }
     let next = self.next_index.get(&follower).copied().unwrap_or(1).max(1);
-    let prev_log_index = next.saturating_sub(1);
-    // The entry before the new ones has been compacted away — the follower needs an install-snapshot
-    // ([`install_snapshot_for`](RaftNode::install_snapshot_for)), not an append.
+    let first_unacknowledged = self.match_of(follower).saturating_add(1);
+    let probing = self.probing.contains(&follower);
+    let resend = !probing
+      && next > first_unacknowledged
+      && !self.room_ahead(first_unacknowledged, next, budget);
+    let from = if resend { first_unacknowledged } else { next };
+    let prev_log_index = from.saturating_sub(1);
+    // The entry before the batch has been compacted away — the follower needs an install-snapshot
+    // ([`install_snapshot_for`](RaftNode::install_snapshot_for)), not an append; it probes from there.
     if prev_log_index < self.snapshot_index {
+      self.next_index.insert(follower, from);
+      self.probing.insert(follower);
       return None;
     }
     let prev_log_term = if prev_log_index == 0 {
@@ -1984,19 +2013,14 @@ impl RaftNode {
     } else {
       self.entry_term(prev_log_index).unwrap_or(0)
     };
-    let from = usize::try_from(next.saturating_sub(self.snapshot_index).saturating_sub(1))
-      .unwrap_or(usize::MAX);
-    let owed = self.log.get(from..).unwrap_or(&[]);
-    let mut spent = 0usize;
-    let batch = owed
-      .iter()
-      .take_while(|entry| {
-        let first = spent == 0;
-        spent = spent.saturating_add(entry.encoded_len());
-        first || spent <= budget
-      })
-      .count();
-    let entries = owed.get(..batch).unwrap_or(&[]).to_vec();
+    let entries = self.batch_from(from, budget).to_vec();
+    if !probing && !resend {
+      let sent = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+      self.next_index.insert(follower, from.saturating_add(sent));
+      if from > first_unacknowledged {
+        self.window_counters.sent_ahead = self.window_counters.sent_ahead.saturating_add(1);
+      }
+    }
     let mut priorities: Vec<(HostId, ElectionPriority)> = self
       .all_voters()
       .into_iter()
@@ -2021,6 +2045,71 @@ impl RaftNode {
       sync_index: self.sync_index,
       open_from: self.open_from,
     })
+  }
+
+  /// The entries a batch from `from` carries within `budget` wire bytes, and always the first when any is owed.
+  fn batch_from(&self, from: u64, budget: usize) -> &[LogEntry] {
+    let start = usize::try_from(from.saturating_sub(self.snapshot_index).saturating_sub(1))
+      .unwrap_or(usize::MAX);
+    let owed = self.log.get(start..).unwrap_or(&[]);
+    let mut spent = 0usize;
+    let batch = owed
+      .iter()
+      .take_while(|entry| {
+        let first = spent == 0;
+        spent = spent.saturating_add(entry.encoded_len());
+        first || spent <= budget
+      })
+      .count();
+    owed.get(..batch).unwrap_or(&[])
+  }
+
+  /// Whether a follower whose first unacknowledged entry is `first_unacknowledged` may be sent the batch from
+  /// `next` now, ahead of its acknowledgements:
+  /// - a resend would not reach the log's end — the backlog is more than one batch; when a resend would carry
+  ///   the whole backlog it is the better send, since it also recovers a lost batch within one send, where a
+  ///   batch sent ahead finds the loss only through the follower's refusal, a round trip later (a first cut
+  ///   resent whenever a resend reached past `next`, and at a steady rate just short of a batch a period never
+  ///   sent ahead however far the backlog grew);
+  /// - there is a batch at `next`;
+  /// - it and what is in flight beyond the first unacknowledged batch fit the window, the group's one budget:
+  ///   what the follower can hold ahead of a hole, so nothing sent ahead is lost to one (§3.5).
+  ///
+  /// A follower whose first unacknowledged entry was compacted away needs a snapshot, not more entries.
+  fn room_ahead(&self, first_unacknowledged: u64, next: u64, budget: usize) -> bool {
+    let bytes = |entries: &[LogEntry]| {
+      entries
+        .iter()
+        .map(LogEntry::encoded_len)
+        .fold(0, usize::saturating_add)
+    };
+    if first_unacknowledged <= self.snapshot_index {
+      return false;
+    }
+    let resent = self.batch_from(first_unacknowledged, budget);
+    let resend_reaches =
+      first_unacknowledged.saturating_add(u64::try_from(resent.len()).unwrap_or(u64::MAX));
+    if resend_reaches > self.last_log_index() {
+      return false;
+    }
+    let coming = bytes(self.batch_from(next, budget));
+    let first = bytes(resent);
+    let sent = next.saturating_sub(first_unacknowledged);
+    let start = usize::try_from(
+      first_unacknowledged
+        .saturating_sub(self.snapshot_index)
+        .saturating_sub(1),
+    )
+    .unwrap_or(usize::MAX);
+    let in_flight = bytes(
+      self
+        .log
+        .get(start..)
+        .unwrap_or(&[])
+        .get(..usize::try_from(sent).unwrap_or(usize::MAX))
+        .unwrap_or(&[]),
+    );
+    coming > 0 && in_flight.saturating_sub(first).saturating_add(coming) <= self.window_budget
   }
 
   /// Handles a received [`AppendEntries`] as a follower (Raft §5.3). A stale-term append is rejected. A
@@ -2083,11 +2172,11 @@ impl RaftNode {
         Some(term) if term == entry.term => {} // already present and matching — keep it
         Some(_) => {
           self.truncate_from(index);
-          self.log.push(entry);
+          self.push_entry(entry);
         }
         None => {
           self.retention_pending = true;
-          self.log.push(entry);
+          self.push_entry(entry);
         }
       }
     }
@@ -2178,7 +2267,7 @@ impl RaftNode {
         return self.last_log_index();
       };
       let entry = slot.entry.clone();
-      self.log.push(entry);
+      self.push_entry(entry);
       self.retention_pending = true;
       self.window_counters.absorbed = self.window_counters.absorbed.saturating_add(1);
     }
@@ -2246,6 +2335,7 @@ impl RaftNode {
     let floor = self.match_of(reply.follower).saturating_add(1);
     let backed = hint.min(next.saturating_sub(1)).max(floor).max(1);
     self.next_index.insert(reply.follower, backed);
+    self.probing.insert(reply.follower);
   }
 
   /// The index of this leader's last entry of `term` above its snapshot, if it holds one.
@@ -2330,6 +2420,7 @@ impl RaftNode {
     if !self.is_voter(member) {
       self.next_index.remove(&member);
       self.match_index.remove(&member);
+      self.probing.remove(&member);
     }
   }
 
@@ -2381,6 +2472,7 @@ impl RaftNode {
         );
         self.next_index.insert(*member, last.saturating_add(1));
         self.match_index.insert(*member, 0);
+        self.probing.insert(*member);
       }
     }
     if adds.iter().all(|member| {
@@ -2732,6 +2824,34 @@ impl RaftNode {
       .unwrap_or(usize::MAX);
     self.retention_pending |= keep < self.log.len();
     self.log.truncate(keep);
+    self.config_entries.split_off(&index);
+  }
+
+  /// Appends `entry` to the log, noting its index when it is a configuration entry.
+  fn push_entry(&mut self, entry: LogEntry) {
+    if entry.config.is_some() {
+      self
+        .config_entries
+        .insert(self.last_log_index().saturating_add(1));
+    }
+    self.log.push(entry);
+  }
+
+  /// The configuration the log's entry at `index` carries, if it is a configuration entry there.
+  fn config_at(&self, index: u64) -> Option<VoterConfig> {
+    self
+      .position(index)
+      .and_then(|at| self.log.get(at))
+      .and_then(|entry| entry.config.clone())
+  }
+
+  /// The configuration below the log: the base, which a compaction or a snapshot folded the log's earlier
+  /// configurations into.
+  fn base_config(&self) -> VoterConfig {
+    VoterConfig {
+      voters: self.voters.clone(),
+      joint: self.joint.clone(),
+    }
   }
 
   /// A follower's reply with this node's current term.
@@ -2780,21 +2900,14 @@ impl RaftNode {
     if self.role != Role::Leader {
       return;
     }
-    let mut candidate = self.last_log_index();
-    while candidate > self.commit_index {
-      if self.entry_term(candidate) == Some(self.current_term) {
-        let holders: BTreeSet<HostId> = self
-          .all_voters()
-          .into_iter()
-          .filter(|voter| self.match_of(*voter) >= candidate)
-          .collect();
-        if self.is_majority(&holders) {
-          self.retention_pending = true;
-          self.commit_index = candidate;
-          break;
-        }
-      }
-      candidate = candidate.saturating_sub(1);
+    // Raft's rule, §5.3 and §5.4.2: the highest index a majority holds commits when its entry is of this
+    // term. A leader's entries of its own term are the end of its log, so no lower index of this term is held
+    // by a majority either when that one's entry is older. Until 2026-09-29 each call scanned every index from
+    // the log's end down to the commit index, and a proposal cost 20 ms at a 5,000-entry backlog.
+    let held = self.quorum_match();
+    if held > self.commit_index && self.entry_term(held) == Some(self.current_term) {
+      self.retention_pending = true;
+      self.commit_index = held;
     }
     // Indices a fast quorum chose are committed once every index below them is: this leader applies and
     // acknowledges them, while its commit index — what followers learn, and what windows prune under — stays
@@ -2814,6 +2927,23 @@ impl RaftNode {
 
   /// How far `voter`'s log matches the leader's: the leader's own last index for itself, else the
   /// follower's tracked `match_index` (nothing for a follower not yet replicated to).
+  /// The highest index a majority of every configuration in force holds — for each, the match index at the
+  /// place a majority begins among its voters' match indices in descending order — this leader's own being
+  /// its last index.
+  fn quorum_match(&self) -> u64 {
+    let held = |set: &[HostId]| {
+      let mut matches: Vec<u64> = set.iter().map(|voter| self.match_of(*voter)).collect();
+      matches.sort_unstable_by(|left, right| right.cmp(left));
+      matches.get(set.len() / 2).copied().unwrap_or(0)
+    };
+    let config = self.effective_config();
+    let base = held(&config.voters);
+    config
+      .joint
+      .as_ref()
+      .map_or(base, |new| base.min(held(new)))
+  }
+
   fn match_of(&self, voter: HostId) -> u64 {
     if voter == self.id {
       self.last_log_index()
@@ -3704,15 +3834,16 @@ mod tests {
     let mut successor = RaftNode::new(B, vec![A, B, C]);
     let mut third = RaftNode::new(C, vec![A, B, C]);
     old.append_command(b"old".to_vec());
-    old.on_append_reply(successor.on_append_entries(old.replicate_to(B, UNBOUNDED).unwrap()));
+    let append = old.replicate_to(B, UNBOUNDED).unwrap();
+    old.on_append_reply(successor.on_append_entries(append));
     let election = successor.start_election();
     successor.on_vote_reply(third.on_request_vote(election[0]));
     assert!(successor.is_leader());
     successor.append_command(b"new".to_vec());
-    successor
-      .on_append_reply(third.on_append_entries(successor.replicate_to(C, UNBOUNDED).unwrap()));
-    successor
-      .on_append_reply(third.on_append_entries(successor.replicate_to(C, UNBOUNDED).unwrap()));
+    let append = successor.replicate_to(C, UNBOUNDED).unwrap();
+    successor.on_append_reply(third.on_append_entries(append));
+    let append = successor.replicate_to(C, UNBOUNDED).unwrap();
+    successor.on_append_reply(third.on_append_entries(append));
     assert_eq!(successor.commit_index(), 2);
     let read = old
       .begin_read()
@@ -3757,7 +3888,8 @@ mod tests {
       None,
       "old replies and cancellation cannot complete the new round"
     );
-    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap()));
+    let append = leader.replicate_to(B, UNBOUNDED).unwrap();
+    leader.on_append_reply(follower.on_append_entries(append));
     assert_eq!(leader.read_index(second), Some(1));
   }
 
@@ -3770,8 +3902,10 @@ mod tests {
     leader.append_command(b"value".to_vec());
     let mut second = RaftNode::new(B, voters.clone());
     let mut third = RaftNode::new(C, voters);
-    leader.on_append_reply(second.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap()));
-    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C, UNBOUNDED).unwrap()));
+    let append = leader.replicate_to(B, UNBOUNDED).unwrap();
+    leader.on_append_reply(second.on_append_entries(append));
+    let append = leader.replicate_to(C, UNBOUNDED).unwrap();
+    leader.on_append_reply(third.on_append_entries(append));
     let read = leader.begin_read().unwrap();
     let reply = second.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap());
     leader.on_append_reply(reply);
@@ -3782,7 +3916,8 @@ mod tests {
     });
     assert_eq!(leader.read_index(read), None);
     assert!(leader.begin_membership_change(vec![A, B, C]));
-    leader.on_append_reply(third.on_append_entries(leader.replicate_to(C, UNBOUNDED).unwrap()));
+    let append = leader.replicate_to(C, UNBOUNDED).unwrap();
+    leader.on_append_reply(third.on_append_entries(append));
     assert_eq!(
       leader.read_index(read),
       None,
@@ -3831,7 +3966,8 @@ mod tests {
       .begin_read()
       .expect("current-term commit starts a read");
     assert_eq!(leader.read_index(read), None);
-    leader.on_append_reply(follower.on_append_entries(leader.replicate_to(B, UNBOUNDED).unwrap()));
+    let append = leader.replicate_to(B, UNBOUNDED).unwrap();
+    leader.on_append_reply(follower.on_append_entries(append));
     assert_eq!(
       leader.read_index(read),
       Some(2),
@@ -4408,7 +4544,7 @@ mod tests {
       leader.append_command(vec![value]);
     }
     let entry = LogEntry::command(leader.term(), vec![0]).encoded_len();
-    let batch = |budget: usize| {
+    let mut batch = |budget: usize| {
       leader
         .replicate_to(B, budget)
         .expect("an append")
@@ -5355,6 +5491,214 @@ mod tests {
     replicate_once(&mut leader, &mut [(B, &mut b)]);
     assert_eq!(leader.commit_index(), leader.last_log_index());
     assert!(leader.open_fast_track(), "C_new committed");
+  }
+
+  /// Shape: a batch budget of one one-byte command's entry, so each append carries one entry and every batch
+  /// boundary is visible.
+  const ONE_ENTRY: usize = MIN_ENTRY_BYTES + 1;
+
+  /// A leader `A` whose sync point `B` and `C` hold (their places confirmed), every node's window `window`
+  /// bytes, and `commands` one-byte commands appended after it.
+  fn pipelining_group(window: usize, commands: u8) -> Vec<RaftNode> {
+    let mut nodes: Vec<RaftNode> = [A, B, C]
+      .iter()
+      .map(|id| {
+        let mut node = if *id == A {
+          elected_leader(A, vec![A, B, C])
+        } else {
+          RaftNode::new(*id, vec![A, B, C])
+        };
+        node.set_window_budget(window);
+        node
+      })
+      .collect();
+    let (leader, followers) = nodes.split_first_mut().unwrap();
+    assert!(leader.append_command(Vec::new()), "the sync point");
+    let mut reached: Vec<(HostId, &mut RaftNode)> =
+      followers.iter_mut().map(|node| (node.id(), node)).collect();
+    replicate_once(leader, &mut reached);
+    for command in 0..commands {
+      assert!(leader.append_command(vec![command]));
+    }
+    nodes
+  }
+
+  /// §3.5 with thesis §10.2.2: a follower whose place is confirmed is sent the next batch before the last is
+  /// acknowledged — as many batches beyond the first unacknowledged one as its window holds — and then, with
+  /// no room, the first unacknowledged batch again. Until 2026-09-29 every send restarted at the first
+  /// unacknowledged entry, so a follower never had an entry ahead of a hole to buffer.
+  #[test]
+  fn a_confirmed_follower_is_sent_batches_ahead_within_its_window() {
+    let mut nodes = pipelining_group(3 * ONE_ENTRY, 5);
+    let leader = &mut nodes[0];
+    let sent: Vec<u64> = (0..5)
+      .map(|_| leader.replicate_to(B, ONE_ENTRY).unwrap().prev_log_index)
+      .collect();
+    assert_eq!(
+      sent,
+      vec![1, 2, 3, 4, 1],
+      "the first batch, three ahead, then the first again"
+    );
+  }
+
+  /// §3.5: a batch lost ahead of buffered ones costs one resend of the hole — the follower buffered the later
+  /// batches, refused them over the hole, and acknowledges them all when the hole fills — and they are never
+  /// sent again.
+  #[test]
+  fn a_lost_batch_costs_one_resend_and_the_buffered_ones_are_not_sent_again() {
+    let mut nodes = pipelining_group(3 * ONE_ENTRY, 3);
+    let (leader, followers) = nodes.split_first_mut().unwrap();
+    let follower = &mut followers[0];
+    let appends: Vec<AppendEntries> = (0..3)
+      .map(|_| leader.replicate_to(B, ONE_ENTRY).unwrap())
+      .collect();
+    for append in appends.into_iter().skip(1) {
+      let reply = follower.on_append_entries(append);
+      assert!(!reply.success, "the hole at index 2");
+      leader.on_append_reply(reply);
+    }
+    assert_eq!(follower.window_counters().buffered, 2);
+    let resend = leader.replicate_to(B, ONE_ENTRY).unwrap();
+    assert_eq!(
+      (resend.prev_log_index, resend.entries.len()),
+      (1, 1),
+      "the hole's batch alone"
+    );
+    let reply = follower.on_append_entries(resend);
+    assert_eq!(reply.match_index, 4, "the buffered batches joined the log");
+    leader.on_append_reply(reply);
+    assert_eq!(follower.window_counters().absorbed, 2);
+    let after = leader.replicate_to(B, ONE_ENTRY).unwrap();
+    assert_eq!(
+      (after.prev_log_index, after.entries.len()),
+      (4, 0),
+      "a heartbeat: nothing is owed"
+    );
+  }
+
+  /// §4, the recovery reads every report above its log, as the prefix model's does, not only its own window's
+  /// reach: a node with a smaller window than its voters' must still recover what they chose beyond it. `B`
+  /// reaches one index past its log and cannot vote at index 3; the other four — a fast quorum of five — vote
+  /// `y` there, so it is chosen. Until 2026-09-29 `B`, elected by `C` and `D`, read reports within its own
+  /// reach only and left index 3 free, where its next entry would have replaced a chosen command.
+  #[test]
+  fn a_recovery_reads_every_report_beyond_its_own_reach() {
+    let mut nodes = fast_group(&[A, B, C, D, E]);
+    nodes[1].set_window_budget(MIN_ENTRY_BYTES + 1);
+    for command in [b"x", b"y"] {
+      let proposal = nodes[0].propose_fast(command.to_vec()).unwrap();
+      for node in nodes.iter_mut() {
+        node.on_fast_propose(proposal.clone());
+      }
+    }
+    assert_eq!(nodes[1].window().len(), 1, "B voted at index 2 only");
+    let requests = nodes[1].start_election();
+    for (at, request) in [(2, requests[1]), (3, requests[2])] {
+      let reply = nodes[at].on_request_vote(request);
+      nodes[1].on_vote_reply(reply);
+    }
+    assert!(nodes[1].is_leader());
+    let commands: Vec<Vec<u8>> = nodes[1]
+      .saved()
+      .log
+      .iter()
+      .map(|entry| entry.command.clone())
+      .collect();
+    assert_eq!(commands, vec![Vec::new(), b"x".to_vec(), b"y".to_vec()]);
+    assert_eq!(nodes[1].window_counters().recovered_beyond_reach, 1);
+  }
+
+  /// §4, a recovery from a decision: `C` buffered the leader's entry that arrived ahead of a lost one, and the
+  /// leader stopped. `B`, elected by `C`, finds that slot's ballot — a decision, which outranks any fast vote —
+  /// and re-proposes it as it is, at its own term, with a no-op in the hole below it.
+  #[test]
+  fn a_new_leader_re_proposes_a_buffered_decision() {
+    let mut nodes = pipelining_group(3 * ONE_ENTRY, 2);
+    let lost = nodes[0].replicate_to(C, ONE_ENTRY).unwrap();
+    let ahead = nodes[0].replicate_to(C, ONE_ENTRY).unwrap();
+    assert_eq!((lost.prev_log_index, ahead.prev_log_index), (1, 2));
+    assert!(
+      !nodes[2].on_append_entries(ahead).success,
+      "the hole at index 2"
+    );
+    assert_eq!(nodes[2].window_counters().buffered, 1);
+    let requests = nodes[1].start_election();
+    let reply = nodes[2].on_request_vote(requests[1]);
+    nodes[1].on_vote_reply(reply);
+    assert!(nodes[1].is_leader());
+    let log = nodes[1].saved().log;
+    let term = nodes[1].term();
+    assert_eq!(
+      log
+        .iter()
+        .map(|entry| (entry.term, entry.command.clone()))
+        .collect::<Vec<_>>(),
+      vec![(1, Vec::new()), (term, Vec::new()), (term, vec![1])],
+      "the sync point, a no-op in the hole, the decision re-proposed"
+    );
+    let counters = nodes[1].window_counters();
+    assert_eq!(
+      (
+        counters.recovered,
+        counters.recovered_fast_choices,
+        counters.holes_filled
+      ),
+      (1, 0, 1)
+    );
+  }
+
+  /// §3.5: when a resend of the first unacknowledged batch would carry the new entries anyway — the backlog
+  /// fits one batch, the groups' usual case — the leader resends rather than sending ahead, whatever the
+  /// window, so a lost batch is recovered by the next send and not a round trip later.
+  #[test]
+  fn a_backlog_within_one_batch_is_resent_not_sent_ahead() {
+    let mut nodes = pipelining_group(3 * ONE_ENTRY, 1);
+    let leader = &mut nodes[0];
+    let first = leader.replicate_to(B, 3 * ONE_ENTRY).unwrap();
+    assert_eq!((first.prev_log_index, first.entries.len()), (1, 1));
+    for command in [7, 8] {
+      assert!(leader.append_command(vec![command]));
+    }
+    let second = leader.replicate_to(B, 3 * ONE_ENTRY).unwrap();
+    assert_eq!(
+      (second.prev_log_index, second.entries.len()),
+      (1, 3),
+      "the unacknowledged entry and the two new ones, in one resend"
+    );
+  }
+
+  /// §3.5: a backlog past what one resend carries goes ahead even when the unacknowledged batch was not full.
+  /// Until 2026-09-29 the leader resent whenever a resend reached past what it had sent — every period, at a
+  /// steady rate just short of a batch a period — and never sent ahead however far its backlog grew (the
+  /// timed simulation's five regions at 2,000 proposals a second: no batch sent ahead, 1,018 commits a
+  /// second).
+  #[test]
+  fn a_backlog_past_one_resend_goes_ahead_after_a_short_batch() {
+    let mut nodes = pipelining_group(3 * ONE_ENTRY, 1);
+    let leader = &mut nodes[0];
+    let short = leader.replicate_to(B, 3 * ONE_ENTRY).unwrap();
+    assert_eq!((short.prev_log_index, short.entries.len()), (1, 1));
+    for command in 10..15 {
+      assert!(leader.append_command(vec![command]));
+    }
+    let next = leader.replicate_to(B, 3 * ONE_ENTRY).unwrap();
+    assert_eq!(
+      (next.prev_log_index, next.entries.len()),
+      (2, 3),
+      "five new entries past a one-entry batch: a resend of three would not reach the log's end"
+    );
+  }
+
+  /// With no window — the groups' default — nothing is sent ahead: every send starts at the first
+  /// unacknowledged entry, exactly as before pipelining.
+  #[test]
+  fn with_no_window_nothing_is_sent_ahead() {
+    let mut nodes = pipelining_group(0, 5);
+    let leader = &mut nodes[0];
+    let sent: Vec<u64> = (0..3)
+      .map(|_| leader.replicate_to(B, ONE_ENTRY).unwrap().prev_log_index)
+      .collect();
+    assert_eq!(sent, vec![1, 1, 1]);
   }
 
   /// The recovery reads its window by filter, not by `BTreeMap::range`, which panics on a start past its end:

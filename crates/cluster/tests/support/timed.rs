@@ -154,6 +154,10 @@ pub(crate) struct Scenario {
   pub(crate) order: ElectionOrder,
   /// The seed for jitter, loss and tick phases.
   pub(crate) seed: u64,
+  /// The window every node holds, in wire bytes (`RaftNode::set_window_budget`): what a follower can hold
+  /// ahead of a hole, and so how far a leader sends ahead of acknowledgements. Zero, the groups' default,
+  /// holds none and sends nothing ahead.
+  pub(crate) window_budget: usize,
 }
 
 /// What a scenario measured.
@@ -175,12 +179,17 @@ pub(crate) struct Outcome {
   pub(crate) final_terms: BTreeMap<HostId, u64>,
   /// Messages sent.
   pub(crate) messages: u64,
+  /// Their wire bytes (`RaftMessage::encode`), before the group's envelope.
+  pub(crate) bytes: u64,
   /// Each resolved isolation: when, and the node cut off.
   pub(crate) isolated: Vec<(u64, HostId)>,
   /// Each node's election timing at the end: base periods, span periods, broadcast round-trip tail.
   pub(crate) timings: BTreeMap<HostId, (u32, u32, u64)>,
   /// Leadership transfers started by priority (§3.4), over every node.
   pub(crate) priority_transfers: u64,
+  /// Batches leaders sent ahead of acknowledgements (pipelined), over every node's life since its last
+  /// restart.
+  pub(crate) sent_ahead: u64,
   /// Timeouts followers yielded to voters that outranked them.
   pub(crate) yields: u64,
 }
@@ -310,7 +319,8 @@ impl Sim {
     let nodes = voters
       .iter()
       .map(|id| {
-        let raft = RaftNode::new(*id, voters.clone());
+        let mut raft = RaftNode::new(*id, voters.clone());
+        raft.set_window_budget(scenario.window_budget);
         let retained = raft.saved();
         (
           *id,
@@ -410,6 +420,7 @@ impl Sim {
 
   fn send(&mut self, from: HostId, to: HostId, message: RaftMessage, request_sent_ns: u64) {
     self.outcome.messages += 1;
+    self.outcome.bytes += u64::try_from(message.encode().len()).unwrap();
     if self.partitioned(from, to)
       || self.rng.below(1_000_000) < u64::from(self.scenario.profile.loss_ppm)
     {
@@ -468,6 +479,8 @@ impl Sim {
         node.down_until = Some(until);
       } else if now >= until && node.down_until == Some(until) {
         node.raft = RaftNode::restore(node.retained.clone()).unwrap();
+        // The window budget is configuration, not retained state.
+        node.raft.set_window_budget(self.scenario.window_budget);
         node.timer = ElectionTimer::new();
         node.invitation = None;
         node.down_until = None;
@@ -574,7 +587,7 @@ impl Sim {
     let voters = self.nodes[&id].raft.all_voters().len();
     let budget = append_batch_bytes(MAX_PACKET_PAYLOAD, ENVELOPE_BYTES, voters);
     for peer in self.others(id) {
-      let raft = &self.nodes[&id].raft;
+      let raft = &mut self.nodes.get_mut(&id).unwrap().raft;
       let message = raft
         .replicate_to(peer, budget)
         .map(RaftMessage::AppendEntries)
@@ -769,6 +782,7 @@ impl Sim {
     }
     for (id, node) in &self.nodes {
       self.outcome.priority_transfers += node.raft.priority_transfers();
+      self.outcome.sent_ahead += node.raft.window_counters().sent_ahead;
       self.outcome.final_terms.insert(*id, node.raft.term());
       self.outcome.max_term = self.outcome.max_term.max(node.raft.term());
     }

@@ -39,9 +39,11 @@
 //! not, and completes a joint change once its entry commits.
 //!
 //! The fast track and the window are explored (research record §3.5, §3.7 and §4; the design the prefix
-//! model verifies): every node holds a window as large as one append; a leader may open its term's fast
-//! track at any step; a client's command then reaches any node, which proposes it to every voter, and each
-//! voter's vote goes to its own leader. A ghost of every vote cast — the Paxos acceptors' state, counted from
+//! model verifies): every node holds a window as large as one append, so a leader pipelines to each follower
+//! whose place it has confirmed — each heartbeat move sends the next batch before the last is acknowledged,
+//! as far as that window holds — and a follower buffers what arrives ahead of a hole; a leader may open its
+//! term's fast track at any step; a client's command then reaches any node, which proposes it to every
+//! voter, and each voter's vote goes to its own leader. A ghost of every vote cast — the Paxos acceptors' state, counted from
 //! the moment a vote is cast, whatever becomes of its message — marks each index a fast quorum chose, and
 //! the checks take the dialect's form around it:
 //!
@@ -68,10 +70,10 @@ use slates_cluster::raft_wire::RaftMessage;
 use slates_db::register::HostId;
 
 /// Shape: the seeds each cluster size is explored under at full scale — the `--ignored` run CI makes in
-/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 24.0 s with
-/// the fast track and the window explored (measured 2026-09-29, Apple M5 Max, release; 27.7 s on 2026-09-28
-/// with compaction and membership changes, 14 s before them), so the workspace's debug run explores
-/// [`SEEDS_QUICK`] instead.
+/// release ("T-8.13 Raft safety explorer at full scale"): 400 seeds × 4,000 steps × 2 sizes took 25.9 s with
+/// the fast track, pipelining and windows of three sizes explored (measured 2026-09-29, Apple M5 Max, release;
+/// 27.7 s on 2026-09-28 with compaction and membership changes, 14 s before them), so the workspace's debug
+/// run explores [`SEEDS_QUICK`] instead.
 const SEEDS_FULL: u64 = 400;
 /// Shape: the seeds the workspace's debug run explores — 18.6 s of a debug build (2026-09-29), and still
 /// enough histories for every non-vacuity floor below (each is at least one event per seed but the three
@@ -107,10 +109,13 @@ const APPEND_BUDGET: usize = 48;
 /// compaction, one for corrupting a snapshot in flight, four for a reconfiguration period, one for the leader
 /// opening its fast track.
 const ACTIONS: usize = 109;
-/// Shape: the window every node holds, in wire bytes — the append budget, as the groups set it (a window
-/// holds at most what one append carries, `RaftNode::set_window_budget`): two of the explorer's command
-/// entries, and a span of three indices above a node's log, so the bound is met often.
-const WINDOW_BUDGET: usize = APPEND_BUDGET;
+/// Shape: the windows a node may hold, in wire bytes: one, one and a half and two of the append budget — the
+/// groups set a window from the measured paths, so windows differ across a group — each a span of 3, 5 or 7
+/// indices above a node's log and room for two, three or four of the explorer's command entries (21 wire bytes
+/// each), so the bound is met often and a leader's recovery meets voters whose windows reach further than its
+/// own. A half-append window (one entry) was tried first: a node holding it could rarely vote, and three
+/// voters' fast commits fell below one per seed (21 over 24, 2026-09-29).
+const WINDOW_BUDGETS: [usize; 3] = [APPEND_BUDGET, APPEND_BUDGET * 3 / 2, APPEND_BUDGET * 2];
 
 /// A splitmix64 generator: deterministic from its seed, so every failure replays from the seed printed.
 struct Rng(u64);
@@ -219,6 +224,8 @@ struct Cluster {
   trace: Option<std::collections::VecDeque<String>>,
   /// Each node's election priority for the history (§3.4), set again after a crash-restart.
   priorities: BTreeMap<HostId, ElectionPriority>,
+  /// Each node's window for the history, set again after a crash-restart.
+  windows: BTreeMap<HostId, usize>,
   /// The voters of each term whose leader opened its fast track, as that leader counted them when it did.
   fast_terms: BTreeMap<u64, usize>,
   /// Every fast vote cast, by term and index: each voter's command (the ghost of the Paxos acceptors' state,
@@ -235,11 +242,7 @@ impl Cluster {
   fn new(size: u64) -> Cluster {
     let voters: Vec<HostId> = (1..=size).map(HostId).collect();
     let nodes: Vec<RaftNode> = (1..=size + 1)
-      .map(|id| {
-        let mut node = RaftNode::new(HostId(id), voters.clone());
-        node.set_window_budget(WINDOW_BUDGET);
-        node
-      })
+      .map(|id| RaftNode::new(HostId(id), voters.clone()))
       .collect();
     let retained = nodes.iter().map(RaftNode::saved).collect();
     Cluster {
@@ -255,6 +258,7 @@ impl Cluster {
       counters: Counters::default(),
       trace: None,
       priorities: BTreeMap::new(),
+      windows: BTreeMap::new(),
       fast_terms: BTreeMap::new(),
       votes_cast: BTreeMap::new(),
       chosen: BTreeMap::new(),
@@ -383,7 +387,7 @@ impl Cluster {
       .filter(|to| *to != from)
       .collect();
     for to in targets {
-      let node = &self.nodes[at];
+      let node = &mut self.nodes[at];
       if let Some(append) = node.replicate_to(to, APPEND_BUDGET) {
         let reaches = append.prev_log_index + u64::try_from(append.entries.len()).unwrap();
         if reaches < node.last_log_index() {
@@ -663,12 +667,14 @@ impl Cluster {
     add_window(&mut self.counters.window, self.nodes[at].window_counters());
     self.nodes[at] =
       RaftNode::restore(self.retained[at].clone()).expect("a retained state restores");
-    // A priority is measured, not retained: the restarted node measures the same paths again. The window
-    // budget is the caller's setting, not retained either.
+    // A priority is measured, not retained: the restarted node measures the same paths again. Its window is
+    // the caller's setting from the same paths, not retained either.
     if let Some(priority) = self.priorities.get(&id) {
       self.nodes[at].set_priority(*priority);
     }
-    self.nodes[at].set_window_budget(WINDOW_BUDGET);
+    if let Some(window) = self.windows.get(&id) {
+      self.nodes[at].set_window_budget(*window);
+    }
     self.counters.crashes += 1;
   }
 
@@ -685,6 +691,15 @@ impl Cluster {
       };
       node.set_priority(priority);
       self.priorities.insert(node.id(), priority);
+    }
+  }
+
+  /// Gives every node a window drawn from [`WINDOW_BUDGETS`] for the history.
+  fn assign_windows(&mut self, rng: &mut Rng) {
+    for node in &mut self.nodes {
+      let window = WINDOW_BUDGETS[rng.below(WINDOW_BUDGETS.len())];
+      node.set_window_budget(window);
+      self.windows.insert(node.id(), window);
     }
   }
 
@@ -975,9 +990,10 @@ impl Cluster {
         .iter()
         .map(|report| report.slot.entry.encoded_len())
         .sum();
+      let budget = self.windows.get(id).copied().unwrap_or(0);
       assert!(
-        held <= WINDOW_BUDGET,
-        "{at}: {id:?}'s window holds {held} bytes, past its budget {WINDOW_BUDGET}"
+        held <= budget,
+        "{at}: {id:?}'s window holds {held} bytes, past its budget {budget}"
       );
       assert!(
         window
@@ -1000,11 +1016,13 @@ fn same_command(left: &LogEntry, right: &LogEntry) -> bool {
 fn add_window(total: &mut WindowCounters, more: WindowCounters) {
   total.recovered += more.recovered;
   total.recovered_fast_choices += more.recovered_fast_choices;
+  total.recovered_beyond_reach += more.recovered_beyond_reach;
   total.holes_filled += more.holes_filled;
   total.pruned += more.pruned;
   total.buffered += more.buffered;
   total.absorbed += more.absorbed;
   total.decided_from_votes += more.decided_from_votes;
+  total.sent_ahead += more.sent_ahead;
   total.fast_commits += more.fast_commits;
 }
 
@@ -1161,6 +1179,7 @@ fn explore(size: u64, seeds: u64) -> Counters {
     let mut rng = Rng(seed ^ (size << 32));
     let mut cluster = Cluster::new(size);
     cluster.assign_priorities(&mut rng);
+    cluster.assign_windows(&mut rng);
     for step in 0..STEPS {
       let calm = (step / STRETCH) % 2 == 1;
       cluster.step(&mut rng, calm);
@@ -1258,6 +1277,10 @@ fn explore_and_check_coverage(seeds: u64) {
         counted.window.pruned,
         "window slots were pruned under a classic commit",
       ),
+      (
+        counted.window.sent_ahead,
+        "leaders sent batches ahead of acknowledgements",
+      ),
     ];
     for (count, path) in floors {
       assert!(
@@ -1265,13 +1288,24 @@ fn explore_and_check_coverage(seeds: u64) {
         "{size} voters: {path} ({count} over {seeds} seeds)"
       );
     }
-    // Three paths are rarer than one event per seed, so each is floored at once per exploration. A staging
+    // Five paths are rarer than one event per seed, so each is floored at once per exploration. A staging
     // aborts only when its member is cut off for a whole CheckQuorum window. A recovery fills a hole only when
-    // a value it re-proposes sits above an index its reports leave free. And a command commits under two
-    // terms only when a leader fast-commits it and a successor that lacks it re-proposes it. Measured
-    // 2026-09-29 over 24 seeds, three / five voters: 5 / 8 aborts, 15 / 18 holes, 1 / 1 such commits.
+    // a value it re-proposes sits above an index its reports leave free. A command commits under two terms
+    // only when a leader fast-commits it and a successor that lacks it re-proposes it. And a leader sends a
+    // batch ahead only when its backlog to a follower is more than one resend carries, so a follower buffers
+    // ahead of a hole only then. Measured 2026-09-29 over 24 seeds, three / five voters: 8 / 8 aborts, 19 / 25
+    // holes, 2 / 4 such commits, 41 / 70 buffered and 38 / 63 absorbed (over 400 seeds: 569 / 1,052 buffered,
+    // 511 / 960 absorbed, and 10 / 0 recoveries of a buffered decision).
     let rare = [
       (counted.stagings_aborted, "a staging aborted"),
+      (
+        counted.window.buffered,
+        "a follower buffered pipelined entries ahead of a hole",
+      ),
+      (
+        counted.window.absorbed,
+        "buffered entries joined the log when the hole filled",
+      ),
       (counted.window.holes_filled, "a recovery filled a hole"),
       (
         counted.re_proposed_commits,
@@ -1280,6 +1314,16 @@ fn explore_and_check_coverage(seeds: u64) {
     ];
     for (count, path) in rare {
       assert!(count > 0, "{size} voters: {path}");
+    }
+    // A recovery takes a value past its own window's reach only when a voter whose window reaches further
+    // helped choose it and the new leader's is the smaller: 2 / 25 times over 400 seeds, three / five voters,
+    // and none in the quick run's 24 seeds at three (2026-09-29). Floored at full scale; the unit test
+    // `a_recovery_reads_every_report_beyond_its_own_reach` holds it on every run.
+    if seeds >= SEEDS_FULL {
+      assert!(
+        counted.window.recovered_beyond_reach > 0,
+        "{size} voters: a recovery took a value past its own window's reach"
+      );
     }
   }
 }
@@ -1327,6 +1371,7 @@ fn replay_to_the_first_violation() {
   let mut rng = Rng(seed ^ (size << 32));
   let mut cluster = Cluster::new(size);
   cluster.assign_priorities(&mut rng);
+  cluster.assign_windows(&mut rng);
   cluster.trace = Some(std::collections::VecDeque::new());
   for step in 0..STEPS {
     let calm = (step / STRETCH) % 2 == 1;

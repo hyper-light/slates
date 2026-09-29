@@ -2,5 +2,6 @@
 //! §5). Each test binary compiles it on its own and uses only part of it.
 #![allow(dead_code)]
 
+pub(crate) mod azure;
 pub(crate) mod exhaustive;
 pub(crate) mod timed;

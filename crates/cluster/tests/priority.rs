@@ -1,8 +1,6 @@
 //! Priority elections (`docs/wip/research/consensus-enhancements.md` §3.4), on the timed simulation
-//! (`support::timed`) over the real `RaftNode` and the real election timer, across real inter-region paths:
-//! Microsoft's published P50 round trips ("Azure network round-trip latency statistics",
-//! learn.microsoft.com/en-us/azure/networking/azure-network-latency, page dated 2026-07-30, fetched
-//! 2026-09-28; directional, one way taken as half the round trip).
+//! (`support::timed`) over the real `RaftNode` and the real election timer, across real inter-region paths
+//! (`support::azure`: Microsoft's published P50 round trips).
 //!
 //! A leader commits once a majority including itself holds an entry, so the round trip it commits in is its
 //! quorum round trip: the `⌊n/2⌋`-th smallest round trip to the other voters. Measured here: which region
@@ -17,7 +15,8 @@ mod support;
 use std::collections::BTreeMap;
 
 use slates_db::register::HostId;
-use support::timed::{Campaign, ElectionOrder, Fault, MS, Profile, Scenario, run};
+use support::azure::{REGIONS, placement, profile, quorum_round_trip_ms};
+use support::timed::{Campaign, ElectionOrder, Fault, MS, Scenario, run};
 
 /// Shape: the seeds each region set runs under.
 const SEEDS: u64 = 20;
@@ -30,73 +29,6 @@ const PROPOSE_EVERY_NS: u64 = 50 * MS;
 /// Shape: the jitter added to each one-way delay — a few milliseconds of queueing around a published
 /// median, which the page gives no spread for.
 const JITTER_NS: u64 = 5 * MS;
-
-/// Format: the regions, in the matrix's order.
-const REGIONS: [&str; 5] = [
-  "East US",
-  "West Europe",
-  "Japan East",
-  "Southeast Asia",
-  "Brazil South",
-];
-/// Format: the published P50 round trips, in milliseconds, source row to destination column, among
-/// [`REGIONS`] (read from the page's tables; `East US` → `West Europe` is 83 ms and `West Europe` →
-/// `East US` 85 ms — the page is directional).
-const ROUND_TRIPS_MS: [[u64; 5]; 5] = [
-  [0, 83, 162, 224, 117],
-  [85, 0, 233, 169, 185],
-  [162, 234, 0, 72, 262],
-  [224, 169, 72, 0, 330],
-  [118, 185, 262, 331, 0],
-];
-
-/// Which host sits in each of the first `regions` regions under `seed`: a permutation of the hosts
-/// `1..=regions` (Fisher–Yates over splitmix64). The simulation numbers its voters `1..=n` and the
-/// election timer's jitter is a draw from the node's id, so with a fixed placement the same region would win
-/// every first election — one region led all twenty seeds before this (2026-09-28); a fleet's member ids are
-/// random 64-bit values, which the permutation models.
-fn placement(regions: usize, seed: u64) -> Vec<HostId> {
-  let mut hosts: Vec<HostId> = (1..=u64::try_from(regions).unwrap()).map(HostId).collect();
-  let mut state = seed;
-  for index in (1..regions).rev() {
-    state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut mixed = state;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^= mixed >> 31;
-    let pick = usize::try_from(mixed % u64::try_from(index + 1).unwrap()).unwrap();
-    hosts.swap(index, pick);
-  }
-  hosts
-}
-
-/// The profile of the regions on `hosts` (region `i` on `hosts[i]`): each direction half the published
-/// round trip from its source, with [`JITTER_NS`].
-fn azure(hosts: &[HostId]) -> Profile {
-  let mut profile = Profile::uniform(0, JITTER_NS, 0);
-  for (from, from_host) in hosts.iter().enumerate() {
-    for (to, to_host) in hosts.iter().enumerate() {
-      if from != to {
-        let one_way = ROUND_TRIPS_MS[from][to] * MS / 2;
-        profile
-          .pairs
-          .insert((*from_host, *to_host), (one_way, JITTER_NS));
-      }
-    }
-  }
-  profile
-}
-
-/// The published quorum round trip of region `node` among the first `regions`: the `⌊n/2⌋`-th smallest
-/// round trip from it to the others.
-fn quorum_round_trip_ms(node: usize, regions: usize) -> u64 {
-  let mut trips: Vec<u64> = (0..regions)
-    .filter(|other| *other != node)
-    .map(|other| ROUND_TRIPS_MS[node][other])
-    .collect();
-  trips.sort_unstable();
-  trips[regions / 2 - 1]
-}
 
 /// The median of `values` (non-empty).
 fn median(values: &mut [u64]) -> u64 {
@@ -140,7 +72,7 @@ fn measure(
     let hosts = placement(regions, seed);
     let outcome = run(Scenario {
       voters: u64::try_from(regions).unwrap(),
-      profile: azure(&hosts),
+      profile: profile(&hosts, JITTER_NS, 0),
       faults: faults(&hosts),
       duration_ns: DURATION_NS,
       propose_every_ns: PROPOSE_EVERY_NS,
@@ -148,6 +80,7 @@ fn measure(
       campaign: Campaign::PreVote,
       order,
       seed,
+      window_budget: 0,
     });
     *measured
       .leaders

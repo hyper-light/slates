@@ -1826,6 +1826,33 @@ its flags and its descriptor) now passes on macOS and Linux; the Windows arm is 
 lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
 
 
+### 2026-09-29: pipelined replication — built and measured; a leader's per-message cost grew with its backlog — fixed
+
+**Built** (`RaftNode::replicate_to`; `docs/wip/research/consensus-enhancements.md` §3.5, slice 11).
+- A follower whose place is a guess is probed one batch at a time.
+- A confirmed one is sent batches ahead of its acknowledgements, as far as its window holds, whenever a resend
+  would not carry the whole backlog.
+
+With no window nothing changes, byte for byte.
+
+**Measured** (five Azure regions, the council's one append a period). A window of one batch keeps a group
+committing 2,000 proposals a second at a 172 ms median, where no window is overloaded at 7.3 s. At 1,000 a
+second it sends 14 % fewer bytes. At a low rate it changes nothing, and CI gates both. The explorer's
+followers now buffer across holes (457 and 806 buffered entries at full scale).
+
+**Found and fixed:** the commit rule tried every index of the backlog, and every configuration lookup scanned
+the log: 20 ms a proposal at a 5,000-entry backlog, now 61–102 ns at any backlog up to 50,000.
+[Bug record](../bugs/2026-09-29-a-leaders-commit-rule-scanned-its-backlog.md).
+
+**Also fixed:** the recovery read window slots only within its own window's reach, so a leader with a smaller
+window than a voter's could leave a chosen index free. It now reads every slot above its log, as the verified
+model does, so a group's windows may differ. [Bug record](../bugs/2026-09-29-a-recovery-read-only-its-own-windows-reach.md).
+
+**Owed:**
+- The groups' window budget, derived from each node's measured paths. One batch holds the capacity; four cut
+  the tail under 1 % loss from 458 to 321 ms p99.
+- Then votes routed to the leader, the fast track's policy, MLRaft, and the KIND lane.
+
 ### 2026-09-29: the fast track and the window are built in the core — the design's sync rule lost chosen values; fixed
 
 **Built** (`crates/cluster/src/raft.rs`, `raft_wire.rs`; `docs/wip/research/consensus-enhancements.md` §4,
