@@ -318,3 +318,37 @@ consumer's volume id).
 > value and owns what it creates; a sibling without the delivery is the account; the Windows arm runs in
 > the CI lanes. Owed: the SDKs' own spawn helpers, the fleet leg, MCP roots, and the Linux issuer surface.
 > Record: `docs/wip/enrollment.md` (2026-09-14 section).
+
+---
+
+# 2026-09-28: the delivery name carries the channel's identity
+
+A process a consumer starts inherits `SLATES_CONSUMER_FD` but not the descriptor. The take trusted the
+number and so adopted, read and closed that process's own pipe or socket at the same number. The name now
+carries the channel's identity, and the take confirms it before touching anything:
+
+| Platform | Name | Checked, in order |
+|---|---|---|
+| Unix | `NUMBER:DEVICE:INODE:MTIME:MTIME_NSEC` | `fstat` of the number against the four fields (taken after the record is written and the write end closed) |
+| Windows | `HANDLE:TWIN:PIPE_NAME` | both handles open; `CompareObjectHandles` (never waits); a pipe; `FileNameInfo`'s name, the only query that can wait |
+
+The Windows pipe is named `slates-delivery-<pid>-<creation time>-<ordinal>`. It has one instance, is created
+with `FILE_FLAG_FIRST_PIPE_INSTANCE`, and refuses remote clients. It is connected to the harness's own client
+before the name is published anywhere. Its record is written in `PIPE_NOWAIT` mode.
+
+Why not `(st_dev, st_ino)` alone: macOS gives the next pipe a dead pipe's pair (1,999 of 2,000). Why not
+the process tree: the pass-through flow (a consumer's own `slates mcp` child binding with the inherited,
+untaken descriptor) has a parent that is not the harness.
+
+Proven:
+
+- a consumer's own pipe at the freed number keeps its identity, its probe and its flags (the consumer
+  child, macOS and Linux);
+- a name over another channel is refused in-process (Unix unit test);
+- stale names over the test's own handles are refused by the pipe name and by the pair check (Windows CI);
+- the positive path holds everywhere (the consumer child, `client --test consumer` 2/2, the CLI `run`
+  harness 1/1).
+
+The closed taxonomy is now `DeliveryFault { Absent, Malformed, NotInherited, WrongKind, WrongLength { got },
+Corrupt, AlreadyConsumed }`. Record: `docs/bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md`.
+

@@ -30,6 +30,8 @@ const EXIT_WRONG_CONSUMER: i32 = 11;
 const EXIT_WRONG_CAPABILITY: i32 = 12;
 const EXIT_DECOY_INHERITED: i32 = 13;
 const EXIT_NOT_CLOSED_AFTER_TAKE: i32 = 14;
+#[cfg(unix)]
+const EXIT_STALE_TAKE_TOUCHED_OWN_PIPE: i32 = 15;
 /// Shape: the consumer the parent enrolls (an owner-tagged id shape) and its capability.
 const CONSUMER: u64 = 0x0002_0000_0000_002a;
 const CAPABILITY: Capability = [0x5a; 32];
@@ -145,9 +147,10 @@ fn decoy_is_here(identity: &str) -> bool {
 }
 
 /// The consumer child: takes the delivery, checks it is the one the parent made, that the decoy did
-/// not come along, that a second look answers the same, and that the delivery descriptor is closed
-/// after the take. Ignored so `cargo test` never runs it in-process; the parent runs it with
-/// `--ignored --exact`.
+/// not come along, that a second look answers the same, that the delivery descriptor is closed after
+/// the take, and (Unix) that the now stale name leaves a pipe of its own at that number alone. Exits
+/// with the code of the first check that fails. Ignored so `cargo test` never runs it in-process; the
+/// parent runs it with `--ignored --exact`.
 #[test]
 #[ignore = "the consumer child; run by a_consumer_child_takes_... with --ignored"]
 fn delivery_consumer_child() {
@@ -155,35 +158,104 @@ fn delivery_consumer_child() {
     return;
   };
   assert_eq!(role, "consumer");
+  let delivery_name = std::env::var(ENV_CONSUMER_FD).unwrap();
+  let verdict = the_take_is_the_parents_delivery()
+    .and_then(|()| nothing_else_came_along())
+    .and_then(|()| the_take_happened_once(&delivery_name));
+  std::process::exit(verdict.err().unwrap_or(EXIT_OK));
+}
+
+/// The delivery is there and is the one the parent made: its consumer, and its capability by hash.
+fn the_take_is_the_parents_delivery() -> Result<(), i32> {
   let expected_consumer: u64 = std::env::var(EXPECT_CONSUMER).unwrap().parse().unwrap();
   let expected_hash = std::env::var(EXPECT_HASH).unwrap();
-  let delivery_name = std::env::var(ENV_CONSUMER_FD).unwrap();
-  let taken = match delivered() {
-    Ok(taken) => taken,
-    Err(e) => {
-      eprintln!("consumer child: {e}");
-      std::process::exit(EXIT_NO_DELIVERY);
-    }
-  };
+  let taken = delivered().map_err(|e| {
+    eprintln!("consumer child: {e}");
+    EXIT_NO_DELIVERY
+  })?;
   if taken.consumer != expected_consumer {
-    std::process::exit(EXIT_WRONG_CONSUMER);
+    return Err(EXIT_WRONG_CONSUMER);
   }
   if capability_hash(&taken.capability) != expected_hash {
-    std::process::exit(EXIT_WRONG_CAPABILITY);
+    return Err(EXIT_WRONG_CAPABILITY);
   }
+  Ok(())
+}
+
+/// The parent's decoy did not come along.
+fn nothing_else_came_along() -> Result<(), i32> {
   let decoy = std::env::var(DECOY).unwrap();
   if decoy_is_here(&decoy) {
     eprintln!(
       "consumer child: the parent's decoy {decoy} is open here, the same object — inherited"
     );
-    std::process::exit(EXIT_DECOY_INHERITED);
+    return Err(EXIT_DECOY_INHERITED);
   }
-  // Taken once: a second look is the same answer, and the descriptor itself is closed.
+  Ok(())
+}
+
+/// Taken once: a second look is the same answer, the descriptor itself is closed, and (Unix) the
+/// stale name leaves this process's own pipe at its number alone.
+fn the_take_happened_once(delivery_name: &str) -> Result<(), i32> {
+  let expected_consumer: u64 = std::env::var(EXPECT_CONSUMER).unwrap().parse().unwrap();
   assert!(matches!(delivered(), Ok(again) if again.consumer == expected_consumer));
-  if take_named(&delivery_name) != Err(DeliveryFault::NotInherited) {
-    std::process::exit(EXIT_NOT_CLOSED_AFTER_TAKE);
+  if take_named(delivery_name) != Err(DeliveryFault::NotInherited) {
+    return Err(EXIT_NOT_CLOSED_AFTER_TAKE);
   }
-  std::process::exit(EXIT_OK);
+  #[cfg(unix)]
+  if !a_stale_take_leaves_this_processs_own_pipe_alone(delivery_name) {
+    return Err(EXIT_STALE_TAKE_TOUCHED_OWN_PIPE);
+  }
+  Ok(())
+}
+
+/// Shape: the bytes a process's own pipe holds when a stale take looks at it — a length no delivery
+/// record has, so a take that read them would say so.
+const PROBE: &[u8] = b"probe";
+
+/// After the take, the delivery's name is stale in this process, as it is in every process a consumer
+/// starts (the variable is inherited, the descriptor is not). This process opens its own pipe at the
+/// name's number — the number the take freed, which the kernel hands to the next open that asks for the
+/// lowest free number at or above it — writes a probe into it, and asks for the delivery again. The
+/// take must refuse and leave the pipe exactly as it was: open, the same pipe, its bytes unread, its
+/// status flags unchanged. Checked through the raw number, so a take that closed it is seen rather than
+/// closed a second time.
+#[cfg(unix)]
+fn a_stale_take_leaves_this_processs_own_pipe_alone(stale_name: &str) -> bool {
+  use std::os::fd::AsRawFd;
+  let number: i32 = stale_name.split(':').next().unwrap().parse().unwrap();
+  let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+  let placed = rustix::io::fcntl_dupfd_cloexec(&read_end, number).unwrap();
+  assert_eq!(
+    placed.as_raw_fd(),
+    number,
+    "the number the take closed is the lowest free one at or above itself"
+  );
+  drop(read_end);
+  assert_eq!(rustix::io::write(&write_end, PROBE).unwrap(), PROBE.len());
+  let before = rustix::fs::fstat(&placed).unwrap();
+  let status_before = rustix::fs::fcntl_getfl(&placed).unwrap();
+  let refused = take_named(stale_name);
+  // SAFETY: a borrow of this process's own number for the checks below; if the take closed it, the
+  // calls fail with EBADF and touch nothing.
+  let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(number) };
+  let same_pipe = rustix::fs::fstat(borrowed)
+    .is_ok_and(|now| now.st_dev == before.st_dev && now.st_ino == before.st_ino);
+  let status_kept = rustix::fs::fcntl_getfl(borrowed).is_ok_and(|now| now == status_before);
+  let bytes_kept = rustix::io::ioctl_fionread(borrowed)
+    .is_ok_and(|available| usize::try_from(available).is_ok_and(|bytes| bytes == PROBE.len()));
+  eprintln!(
+    "consumer child: a stale take at {number} answered {refused:?}; the pipe there is the same: \
+     {same_pipe}, its status flags kept: {status_kept}, its probe unread: {bytes_kept}"
+  );
+  let intact =
+    refused == Err(DeliveryFault::NotInherited) && same_pipe && status_kept && bytes_kept;
+  if !same_pipe {
+    // The take closed the number: dropping `placed` would close it again (or close whatever reused
+    // it), so its ownership is given up without a close.
+    let _ = std::os::fd::IntoRawFd::into_raw_fd(placed);
+  }
+  intact
 }
 
 /// A child spawned without a delivery: prints the fault it finds, tagged.
@@ -232,7 +304,7 @@ fn a_consumer_child_takes_the_capability_from_the_one_inherited_descriptor_and_n
   assert_eq!(
     code,
     Some(EXIT_OK),
-    "the consumer child took its delivery (10 none, 11 wrong consumer, 12 wrong capability, 13 the decoy came along, 14 not closed after the take)"
+    "the consumer child took its delivery (10 none, 11 wrong consumer, 12 wrong capability, 13 the decoy came along, 14 not closed after the take, 15 a stale take touched the process's own pipe at the number)"
   );
 }
 
@@ -265,5 +337,131 @@ fn a_sibling_without_a_delivery_is_absent_and_a_stale_number_is_not_inherited() 
     fault_of("stale", Some(&delivery.descriptor_name())),
     "NotInherited"
   );
+  drop(delivery);
+}
+
+/// Windows: this process's own pipe holding the probe, a twin handle of its read end (the same
+/// object), an unrelated event, and the pipe's write end — each a handle this test closes.
+#[cfg(windows)]
+struct OwnHandles {
+  read: windows_sys::Win32::Foundation::HANDLE,
+  twin: windows_sys::Win32::Foundation::HANDLE,
+  unrelated: windows_sys::Win32::Foundation::HANDLE,
+  write: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl OwnHandles {
+  fn open() -> OwnHandles {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess};
+    let (mut read, mut write): (HANDLE, HANDLE) = (null_mut(), null_mut());
+    // SAFETY: two out-pointers to locals; no security attributes (not inheritable); the default size.
+    assert_ne!(unsafe { CreatePipe(&mut read, &mut write, null(), 0) }, 0);
+    let mut written = 0u32;
+    let length = u32::try_from(PROBE.len()).unwrap();
+    // SAFETY: the probe is live and of the length passed; the pipe's write end; a synchronous write.
+    let ok = unsafe { WriteFile(write, PROBE.as_ptr(), length, &mut written, null_mut()) };
+    assert_ne!(ok, 0);
+    let mut twin: HANDLE = null_mut();
+    // SAFETY: this process's pseudo-handle; a live handle; an out-pointer to a local.
+    let ok = unsafe {
+      DuplicateHandle(
+        GetCurrentProcess(),
+        read,
+        GetCurrentProcess(),
+        &mut twin,
+        0,
+        0,
+        DUPLICATE_SAME_ACCESS,
+      )
+    };
+    assert_ne!(ok, 0);
+    // SAFETY: an unnamed, non-inheritable, auto-reset event.
+    let unrelated = unsafe { CreateEventW(null(), 0, 0, null()) };
+    assert!(!unrelated.is_null());
+    OwnHandles {
+      read,
+      twin,
+      unrelated,
+      write,
+    }
+  }
+
+  /// Each handle's flags, or `None` for one that is not open.
+  fn flags(&self) -> [Option<u32>; 3] {
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE};
+    let flags = |handle: HANDLE| {
+      let mut flags = 0u32;
+      // SAFETY: a handle value and an out-pointer to a local; fails for a handle that is not open.
+      (unsafe { GetHandleInformation(handle, &mut flags) } != 0).then_some(flags)
+    };
+    [flags(self.read), flags(self.twin), flags(self.unrelated)]
+  }
+
+  /// The bytes waiting in the pipe, read without taking them.
+  fn waiting(&self) -> usize {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+    let mut available = 0u32;
+    // SAFETY: no buffer (null, length zero); one out-pointer for the byte count; the pipe's read end.
+    let ok = unsafe {
+      PeekNamedPipe(
+        self.read,
+        null_mut(),
+        0,
+        null_mut(),
+        &mut available,
+        null_mut(),
+      )
+    };
+    assert_ne!(ok, 0);
+    usize::try_from(available).unwrap()
+  }
+}
+
+#[cfg(windows)]
+impl Drop for OwnHandles {
+  fn drop(&mut self) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    for handle in [self.read, self.twin, self.write, self.unrelated] {
+      // SAFETY: handles this struct created, each closed once, here.
+      unsafe { CloseHandle(handle) };
+    }
+  }
+}
+
+/// Windows (§4.13; `docs/bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md`): a
+/// delivery name whose two handle values hold this process's own pipe — the stale name a consumer's own
+/// process inherits, its values since reused — is refused `NotInherited` by the pipe's name, and two
+/// values holding different objects are refused before the pipe is queried at all. Every handle is
+/// left as it was: open, its flags unchanged, the probe in the pipe unread.
+#[cfg(windows)]
+#[test]
+fn a_stale_name_over_this_processs_own_handles_leaves_them_alone() {
+  let delivery = Delivery::prepare(CONSUMER, &CAPABILITY).unwrap();
+  let pipe_name = delivery
+    .descriptor_name()
+    .splitn(3, ':')
+    .nth(2)
+    .unwrap()
+    .to_owned();
+  let own = OwnHandles::open();
+  let before = own.flags();
+  let value = |handle: windows_sys::Win32::Foundation::HANDLE| handle.expose_provenance();
+  let stale = format!("{}:{}:{pipe_name}", value(own.read), value(own.twin));
+  assert_eq!(take_named(&stale), Err(DeliveryFault::NotInherited));
+  let two_objects = format!("{}:{}:{pipe_name}", value(own.read), value(own.unrelated));
+  assert_eq!(take_named(&two_objects), Err(DeliveryFault::NotInherited));
+  assert_eq!(
+    own.flags(),
+    before,
+    "every handle is open with its flags unchanged"
+  );
+  assert_eq!(own.waiting(), PROBE.len(), "the probe is unread");
+  drop(own);
   drop(delivery);
 }

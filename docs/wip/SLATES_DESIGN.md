@@ -3359,6 +3359,18 @@ that the current uid-based implementation enforces them.
 > account; the Windows arm runs in the CI lanes. Owed: the SDKs' own spawn helpers, the fleet leg, MCP
 > roots, and the Linux issuer surface. Record: `docs/wip/enrollment.md` (2026-09-14 section).
 
+> **Status (2026-09-28).** The delivery name carries the channel's identity, not only its number. On Unix
+> it is `NUMBER:DEVICE:INODE:MTIME:MTIME_NSEC`, the pipe's `fstat` after the record is written. On Windows
+> it is `HANDLE:TWIN:PIPE_NAME`: two inherited handles of a pipe with a unique name, which is still a
+> one-instance server/client pair. The take confirms the identity with calls that touch nothing before it
+> adopts. A stale name — every process a consumer starts inherits the variable but not the descriptor —
+> whose number now holds that process's own pipe or socket is refused `NotInherited`, and the descriptor
+> is left untouched; before, it was read, its flags changed and it was closed. On Windows,
+> `CompareObjectHandles` on the two handles runs before the name query, the one query that can wait, so
+> that query never reaches a foreign handle. `NotANumber` became `Malformed`. Record:
+> `docs/bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md`,
+> `docs/wip/enrollment.md` (2026-09-28 section).
+
 > **Status (2026-09-19, AUD-01 — the NFS edge is authorized by the mount capability alone).** The
 > loopback mount serves **every** volume only through a mount capability: the attachment id and a
 > random 16-byte token the access-list-checked `attach` (and a green's `attach_green`) mints, stores on

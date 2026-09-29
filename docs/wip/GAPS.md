@@ -1809,7 +1809,24 @@ jitter kept two congruent survivors in lockstep (split votes every round; fixed 
 both timers — unconfirmed until a failure's dump shows the lockstep.
 
 
-### 2026-09-28: the delivery test read a reused handle value as the decoy — fixed; the take's sibling open
+### 2026-09-28: a stale delivery name took a process's own pipe — fixed
+
+`take_named` adopted whatever pipe or socket sat at the number `SLATES_CONSUMER_FD` names, then read it,
+changed its flags and closed it. Every process a consumer starts inherits the variable but not the
+descriptor. The name now carries the channel's identity, and the take confirms it with calls that touch
+nothing:
+
+- Unix: `fstat`'s device, inode and nanosecond modification time. The device and inode alone repeat on
+  macOS 1,999 times in 2,000.
+- Windows: a uniquely named pipe on two inherited handles. `CompareObjectHandles` runs first, so the name
+  query, which can wait, never reaches a foreign handle.
+
+`NotANumber` became `Malformed`. The failing test (a consumer's own pipe at the freed number lost its probe,
+its flags and its descriptor) now passes on macOS and Linux; the Windows arm is proven by both Windows CI
+lanes. [Bug record](../bugs/2026-09-28-a-stale-delivery-name-took-a-process-s-own-pipe.md).
+
+
+### 2026-09-28: the delivery test read a reused handle value as the decoy — fixed (its sibling: next entry)
 
 CI run 36500813478's Windows nightly job failed the delivery test with exit 13 ("the decoy came along"), one
 failure in five nightly runs of unchanged ipc code. The child checked only that *some* handle was open at the
