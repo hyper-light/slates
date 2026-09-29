@@ -2874,8 +2874,9 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
-The [dated audit](../audit/2026-09-29_audit.md) records 40 open findings against
-ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently changing working tree.
+The [dated audit](../audit/2026-09-29_audit.md) records 63 open findings across three
+passes, beginning at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
+changing working tree.
 It is a review, not an implementation change or acceptance closure. It preserves the
 existing gap classifications and historical measurements rather than treating them as
 current-tree passes.
@@ -2892,6 +2893,37 @@ current-tree passes.
 | AUD-29-33–36 | Every admitted queue geometry must preserve unread work; stream final sizes and aggregate receive/reset credit must be checked before buffering or consumption, without panic or exceeding admitted session memory (§4.2–§4.3, §4.9–§4.10a). |
 | AUD-29-37–38 | Raft report recovery must preserve chosen values with bounded admitted gap work; every accepted live transition must produce restorable state, with semantic and authenticated-sender validation (§4.8–§4.9). |
 | AUD-29-39–40 | Exhausted timers must refuse rather than report elapsed time; refused namespace mutations must return reservations and leave names, links, journal and all resource charges unchanged (§4.2–§4.3, §4.5). |
+| AUD-29-41–42 | Every representation of private content and metadata must have admitted protected residency and dump exclusion; the hermeticity oracle must verify actual objects, consumer/grant intervals and sinks rather than exempt disk streams or unproved shared-memory paths (§4.2, §4.13, R1/R10). |
+| AUD-29-43–44 | Replicated chunks/manifests/transients require all-cost admission and authoritative retirement; manifest ownership must acquire referenced chunks independently of shipped bytes, with idempotent retries and exact release (§4.2, §4.10–§4.11). |
+| AUD-29-45–46 | Fleet content existence/fetch/put needs current object/consumer authority; receive-credit consumption and source/retransmission storage must remain bounded by admitted destinations and operation ownership (§4.9, §4.13). |
+| AUD-29-47–49 | Handshake encryption levels must be protected separately; key usage/failure budgets must cause update or typed termination; unvalidated addresses must have bounded output and pre-authentication work (§4.10a, D-15). |
+| AUD-29-50–54 | Congestion/pacing must charge protected packet bytes and select fitting frames; authenticated control must progress through lost bulk, blocked handlers and exhaustion of shared credit/CPU/memory, with peer-chosen class checked against purpose (§4.3, §4.9–§4.10a). |
+| AUD-29-55–58 | Transfers must resume verified partial work, preserve complete metadata and sparse semantics, and independently progress holder offers/puts without a needless slowest-peer barrier (§4.5, §4.9–§4.11). |
+| AUD-29-59 | Remote holder ACKs require complete closure publication into admitted protected anchor RAM and recovery before the holder serves/counts it; eventual healing is insufficient (§4.8, §4.10). |
+| AUD-29-60–61 | Address changes need bounded authenticated validation and new-path measurements; local UDP backpressure needs owned pending-send/readiness state and accurate acceptance timing (§4.3, §4.10a). |
+| AUD-29-62–63 | Windows base access must retain contained directory handles; fixtures, trace output and property-failure persistence must prove RAM-backed ownership before writes (§4.5, R1/R8, Part 6). |
+
+The third pass uses baseline 8ab25deb7c31bfca77a33cc681ce120bac76e7d1 plus concurrent
+fleet/heartbeat diagnostics; those diagnostics were subsequently committed in ca60bd9
+and continued changing during the review. They are not accepted here as repairs.
+Fresh bounded offline cluster/transport and conformance builds passed. Six holder tests
+and four Copa tests passed. Four compiled-library drivers reproduced retry/orphan
+retention and premature shared-chunk release, raw-flight certificate visibility,
+payload-only congestion accounting and a fitting control frame blocked by the
+prospective budget, and trace exemptions without object/grant/residency evidence.
+The documented driver sources were rechecked under 20-second compile / three-second
+run bounds and their binaries removed. No live spill, reflected traffic, Windows
+leak or full-product/network acceptance is claimed.
+
+The audit's §§9–12 specify the strict access/residency boundary, sophisticated transfer
+experiments, congested/unstable/extremely-low-bandwidth measurements and 30 end-to-end
+case families. The literal no-disk-access request is stronger than the current
+design-sanctioned base/bootstrap reads; no exception is inferred. The selected Copa
+and scheduling decisions remain in force, with packet-accounting/ownership/security
+repairs required before new performance comparisons. The current chosen-controller
+grid has 56 scenarios; the historical 57-case selection included coexistence and is a
+different evidence claim. Existing admissions, guest/cache and conformance gaps stay
+open; neither the new programme nor passing focused tests closes an acceptance row.
 
 The second pass uses baseline 16c847b4a9191e6601bfe93ad026d1a2f2165560 plus
 concurrent CLI/IPC/MCP/server/KIND edits. Compiled-library probes reproduced all

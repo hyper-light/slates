@@ -2859,13 +2859,14 @@ fn settle_handoff(started: LeadershipHandoff, office: Office) -> LeadershipHando
 
 async fn heartbeat_loop(segment: AnchorSegment) {
   let mut clock = HostClock::new();
-  let mut last_beat: Option<u64> = None;
+  let mut last: Option<(u64, slates_rt::shard::Counters)> = None;
   loop {
     let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
-    if let Some(gap) = last_beat.map(|last| now.saturating_sub(last)) {
-      log_late_beat(gap);
+    let counters = registry::with_current(|ctx| ctx.counters()).unwrap_or_default();
+    if let Some((beat, before)) = last {
+      log_late_beat(now.saturating_sub(beat), &before, &counters);
     }
-    last_beat = Some(now);
+    last = Some((now, counters));
     if let Ok(sup) = segment.supervision() {
       sup.beat(now);
     }
@@ -2875,31 +2876,43 @@ async fn heartbeat_loop(segment: AnchorSegment) {
 
 /// Logs a beat that came [`LATE_BEAT_SHARE`] of the liveness budget or more after the one before (§4.14
 /// `daemon.alive`): the shard went that long without running its heartbeat task, and past the budget the anchor
-/// kills it. With the gap go the shard's longest step and its measured timer overrun (the runtime's pulse), so
-/// a near miss says whether one step held the shard or the shard woke late — the evidence the KIND lane's
-/// lapses were owed (GAPS 2026-09-29: an idle five-replica fleet under the `wan` profile had its daemons killed
-/// every minute or two, on an image from before the day's changes as on the day's).
-fn log_late_beat(gap: u64) {
+/// kills it. With the gap goes what the shard did in it, from its counters `before` and `after`: its steps and
+/// polls, each long poll by what held it (a task's own CPU past the quantum, the thread blocked in the kernel,
+/// the host keeping a runnable thread off the CPU, or unattributed), the timers it fired, the times it waited,
+/// the tasks it spawned and finished and those live, its longest poll and its measured timer overrun. So a near
+/// miss says whether the shard was busy, blocked, parked or descheduled — the evidence the KIND lane's lapses
+/// were owed (GAPS 2026-09-29: an idle five-replica fleet under the `wan` profile had its daemons killed every
+/// minute or two, on an image from before the day's changes as on the day's).
+fn log_late_beat(
+  gap: u64,
+  before: &slates_rt::shard::Counters,
+  after: &slates_rt::shard::Counters,
+) {
   if gap < LIVENESS_BUDGET_NS / LATE_BEAT_SHARE {
     return;
   }
-  let (longest_step_ns, overrun_ns) = futures::shard_id()
-    .and_then(|shard| {
-      registry::with_entry(shard.0, |entry| {
-        (
-          entry.pulse.longest_step_ns(),
-          entry.pulse.scheduler_overrun_ns(),
-        )
-      })
-    })
-    .unwrap_or((0, 0));
+  let delta =
+    |field: fn(&slates_rt::shard::Counters) -> u64| field(after).saturating_sub(field(before));
   eprintln!(
-    "slates daemon: a heartbeat came {} ms after the last (the anchor's budget is {} ms); the shard's longest \
-     step is {} ms and its timer overrun {} ms",
+    "slates daemon: a heartbeat came {} ms after the last (the anchor's budget is {} ms): in the gap the shard \
+     ran {} steps and {} polls ({} long in a task, {} blocked in the kernel, {} preempted by the host, {} \
+     unattributed), fired {} timers, waited {} times, spawned {} tasks and finished {}; {} tasks live; its \
+     longest poll is {} ms and its timer overrun {} ms",
     gap / NS_PER_MS,
     LIVENESS_BUDGET_NS / NS_PER_MS,
-    longest_step_ns / NS_PER_MS,
-    overrun_ns / NS_PER_MS
+    delta(|c| c.steps),
+    delta(|c| c.polls),
+    delta(|c| c.long_steps),
+    delta(|c| c.blocked_steps),
+    delta(|c| c.preempted_steps),
+    delta(|c| c.unattributed_steps),
+    delta(|c| c.timers_fired),
+    delta(|c| c.waits),
+    delta(|c| c.spawns),
+    delta(|c| c.completed),
+    after.spawns.saturating_sub(after.completed),
+    after.longest_step_ns / NS_PER_MS,
+    after.scheduler_overrun_ns / NS_PER_MS
   );
 }
 
