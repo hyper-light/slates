@@ -66,11 +66,16 @@ pub enum SwimMessage {
     /// The acknowledging node's daemon boot_nonce — the same announcement a ping makes, so the prober
     /// validates the id its peer answers under exactly as the peer validates the prober's.
     boot_nonce: u64,
-    /// The newest regional configuration version the acknowledging node has installed or seen (§4.8
-    /// "Leases and reads"; AUD-08): the prober credits this answer toward its owner lease only when it
-    /// equals the version the prober itself has installed — "a majority observation must belong to the
-    /// relevant authority generation" — and a newer one tells the prober its authority is superseded.
+    /// The version of the regional configuration the acknowledging node's council holds (§4.8 "Leases and
+    /// reads"; AUD-08) — the configuration `standing` was read from, so the prober can tell a holder that has
+    /// not admitted it yet (an older configuration) from one that has retired it (a newer one).
     configuration_version: u64,
+    /// The acknowledging node's view of the prober's authority standing: the version its configuration
+    /// fixed the prober's settled neighbourhood at, `None` when the prober is no member of it. The prober
+    /// credits this answer toward its owner lease only when its own standing recognizes it — "a majority
+    /// observation must belong to the relevant authority generation" (`slates_db::register::Standing`) — so
+    /// another host's configuration change leaves the lease as it was.
+    standing: Option<u64>,
     /// The membership updates piggybacked on this acknowledgement.
     gossip: Vec<(HostId, MemberState)>,
     /// The acknowledging node's Vivaldi coordinate.
@@ -133,6 +138,11 @@ pub enum SwimWireError {
   /// An acknowledgement's network coordinate was malformed: too many dimensions (a hostile
   /// over-allocation), or a byte length that does not match the declared dimensions.
   MalformedCoordinate,
+  /// An acknowledgement's standing presence byte is neither absent nor present.
+  UnknownPresence {
+    /// The presence byte that arrived.
+    presence: u8,
+  },
 }
 
 /// Format: the message tag occupies one leading byte; these are its values.
@@ -140,6 +150,11 @@ const TAG_PING: u8 = 1;
 const TAG_ACK: u8 = 2;
 const TAG_PING_REQ: u8 = 3;
 const TAG_INDIRECT_ACK: u8 = 4;
+
+/// Format: an acknowledgement's standing is one presence byte, then the eight-byte version when present.
+const STANDING_ABSENT: u8 = 0;
+/// Format: the presence byte of a standing that follows.
+const STANDING_PRESENT: u8 = 1;
 
 /// Format: a liveness is one byte in a gossip entry; these are its values (the detector's three states).
 const LIVENESS_ALIVE: u8 = 0;
@@ -262,6 +277,7 @@ impl SwimMessage {
         nonce,
         boot_nonce,
         configuration_version,
+        standing,
         gossip,
         coordinate,
       } => {
@@ -270,6 +286,13 @@ impl SwimMessage {
         out.extend_from_slice(&nonce.to_le_bytes());
         out.extend_from_slice(&boot_nonce.to_le_bytes());
         out.extend_from_slice(&configuration_version.to_le_bytes());
+        match standing {
+          Some(generation) => {
+            out.push(STANDING_PRESENT);
+            out.extend_from_slice(&generation.to_le_bytes());
+          }
+          None => out.push(STANDING_ABSENT),
+        }
         encode_gossip(&mut out, gossip);
         encode_coordinate(&mut out, coordinate);
       }
@@ -329,6 +352,7 @@ impl SwimMessage {
         let (nonce, rest) = take_word(rest)?;
         let (boot_nonce, rest) = take_word(rest)?;
         let (configuration_version, rest) = take_word(rest)?;
+        let (standing, rest) = take_standing(rest)?;
         let (gossip, leftover) = decode_gossip(rest)?;
         let coordinate = decode_coordinate(leftover)?;
         Ok(SwimMessage::Ack {
@@ -336,6 +360,7 @@ impl SwimMessage {
           nonce,
           boot_nonce,
           configuration_version,
+          standing,
           gossip,
           coordinate,
         })
@@ -395,6 +420,20 @@ fn encode_gossip(out: &mut Vec<u8>, gossip: &[(HostId, MemberState)]) {
 fn take_host(bytes: &[u8]) -> Result<(HostId, &[u8]), SwimWireError> {
   let (word, rest) = take_word(bytes)?;
   Ok((HostId(word), rest))
+}
+
+/// Reads an acknowledgement's standing at the front of `bytes`: its presence byte, then the version when
+/// present; `Truncated` if the bytes end first, `UnknownPresence` for any other presence byte.
+fn take_standing(bytes: &[u8]) -> Result<(Option<u64>, &[u8]), SwimWireError> {
+  let (&presence, rest) = bytes.split_first().ok_or(SwimWireError::Truncated)?;
+  match presence {
+    STANDING_ABSENT => Ok((None, rest)),
+    STANDING_PRESENT => {
+      let (generation, rest) = take_word(rest)?;
+      Ok((Some(generation), rest))
+    }
+    presence => Err(SwimWireError::UnknownPresence { presence }),
+  }
 }
 
 /// Reads a little-endian u64 at the front of `bytes` (the probe nonce, and the raw word `take_host`
@@ -575,9 +614,13 @@ pub enum ProbeOutcome {
     /// id against (`from` must be `member_id(anchor, boot_nonce)` for the certificate the session
     /// authenticated), with no numeric age ordering between boot nonces.
     boot_nonce: u64,
-    /// The newest regional configuration version the acknowledging node announced (§4.8 "Leases and
-    /// reads"): the caller credits the answer toward its owner lease only at its own installed version.
+    /// The version of the configuration the acknowledging node read `standing` from (§4.8 "Leases and
+    /// reads").
     configuration_version: u64,
+    /// The acknowledging node's view of the caller's authority standing (the version its configuration fixed
+    /// the caller's settled neighbourhood at; `None` when the caller is no member of it): the evidence the
+    /// caller's owner lease is credited from.
+    standing: Option<u64>,
     /// The membership updates the acknowledgement carried.
     gossip: Vec<(HostId, MemberState)>,
     /// The measured round-trip time of this probe, in nanoseconds (the shard clock).
@@ -647,12 +690,14 @@ pub async fn probe_once(
         nonce,
         boot_nonce,
         configuration_version,
+        standing,
         gossip,
         coordinate,
       }) if Some(nonce) == expected => ProbeOutcome::Acked {
         from,
         boot_nonce,
         configuration_version,
+        standing,
         gossip,
         rtt_ns: now_ns().saturating_sub(started_ns),
         coordinate,
@@ -793,8 +838,10 @@ pub async fn serve_probe(
           // message that carried none (not a ping) echoes zero, which a real probe's non-zero nonce rejects.
           nonce: message.nonce().unwrap_or(0),
           boot_nonce: local_boot_nonce,
-          // A standalone detector places under no regional configuration (version zero, the formed one).
+          // A standalone detector places under no regional configuration (version zero, the formed one), so
+          // it holds no view of the prober's standing.
           configuration_version: 0,
+          standing: None,
           gossip,
           coordinate: detector.coordinate(),
         }
@@ -849,6 +896,7 @@ mod tests {
       nonce: 42,
       boot_nonce: 1,
       configuration_version: 6,
+      standing: Some(4),
       gossip: sample_gossip(),
       coordinate: sample_coordinate(),
     };
@@ -864,6 +912,7 @@ mod tests {
     hostile.extend_from_slice(&0u64.to_le_bytes()); // nonce
     hostile.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
     hostile.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
+    hostile.push(STANDING_ABSENT); // no standing
     hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
     hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
     assert_eq!(
@@ -871,6 +920,40 @@ mod tests {
       Err(SwimWireError::MalformedCoordinate),
       "an over-large coordinate is refused before allocating"
     );
+  }
+
+  /// Hostile input on the acknowledgement's standing: a presence byte that is neither absent nor present is
+  /// refused as such, and a standing whose version is cut short, or whose presence byte is the last byte, is
+  /// refused as truncated — before any gossip is read.
+  #[test]
+  fn a_hostile_standing_is_refused() {
+    let ack = SwimMessage::Ack {
+      from: A,
+      nonce: 42,
+      boot_nonce: 1,
+      configuration_version: 6,
+      standing: Some(0x0102_0304_0506_0708),
+      gossip: Vec::new(),
+      coordinate: sample_coordinate(),
+    }
+    .encode();
+    // tag + from + nonce + boot_nonce + configuration_version: the presence byte's offset.
+    let presence = 1 + 4 * size_of::<u64>();
+    let mut unknown = ack.clone();
+    if let Some(byte) = unknown.get_mut(presence) {
+      *byte = 2;
+    }
+    assert_eq!(
+      SwimMessage::decode(&unknown),
+      Err(SwimWireError::UnknownPresence { presence: 2 })
+    );
+    for cut in [presence, presence + 1, presence + size_of::<u64>()] {
+      assert_eq!(
+        SwimMessage::decode(ack.get(..cut).unwrap_or_default()),
+        Err(SwimWireError::Truncated),
+        "cut at {cut}"
+      );
+    }
   }
 
   /// Every message kind round-trips through encode/decode unchanged, gossip included.
@@ -889,7 +972,17 @@ mod tests {
         nonce: u64::MAX,
         boot_nonce: u64::MAX,
         configuration_version: u64::MAX,
+        standing: None,
         gossip: Vec::new(),
+        coordinate: sample_coordinate(),
+      },
+      SwimMessage::Ack {
+        from: A,
+        nonce: 5,
+        boot_nonce: 6,
+        configuration_version: 7,
+        standing: Some(u64::MAX),
+        gossip: sample_gossip(),
         coordinate: sample_coordinate(),
       },
       SwimMessage::PingReq {
@@ -1129,6 +1222,7 @@ mod tests {
     bytes.extend_from_slice(&0u64.to_le_bytes()); // nonce
     bytes.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
     bytes.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
+    bytes.push(STANDING_ABSENT); // no standing
     bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // count = huge
     assert_eq!(
       SwimMessage::decode(&bytes),
@@ -1141,6 +1235,7 @@ mod tests {
     short.extend_from_slice(&0u64.to_le_bytes()); // nonce
     short.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
     short.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
+    short.push(STANDING_ABSENT); // no standing
     short.extend_from_slice(&1u32.to_le_bytes());
     short.extend_from_slice(&[9, 9, 9]); // a partial entry
     assert_eq!(

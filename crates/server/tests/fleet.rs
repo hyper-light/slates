@@ -48,8 +48,8 @@ mod common;
 use std::net::TcpStream;
 
 use common::nfs::{
-  create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode, read,
-  read_status, write,
+  create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode_status,
+  read_bytes_status, read_status, write,
 };
 use common::trace;
 use common::wait::{ProgressCharge, Verdict, verdict};
@@ -4423,6 +4423,18 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
   let successor_counters = successor_daemon
     .fleet_refusals()
     .map(|counters| location_counters(&counters));
+  // Each home-region daemon's installed and council configuration versions just after the round, so a
+  // refused lookup shows whether its answers straddled a configuration change.
+  let versions: Vec<_> = daemons
+    .iter()
+    .filter(|daemon| daemon.instance() != foreign_instance)
+    .map(|daemon| {
+      (
+        daemon.member_identity().map(|host| host == successor),
+        daemon.configuration_versions(),
+      )
+    })
+    .collect();
   for daemon in daemons {
     daemon.stop();
   }
@@ -4437,7 +4449,8 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
   assert!(
     matches!(looked_up, ReplyBody::Status { .. }),
     "the round asked the successor once its session returned: {looked_up:?}; location counters at the \
-     foreign node {:?} and the successor {successor_counters:?}",
+     foreign node {:?} and the successor {successor_counters:?}; home-region (is the successor, \
+     (installed, council) versions) {versions:?}",
     counters
       .as_ref()
       .map(|counters| location_counters(counters))
@@ -6072,10 +6085,22 @@ fn owners_over_nfs(daemon: &Daemon, name: &str) -> Owners {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
   let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
-  let file_fh = lookup_or_describe(&mut stream, daemon, &root_fh, "hello.txt", 2);
+  let file_fh = or_describe(
+    lookup_status(&mut stream, &root_fh, "hello.txt", 2),
+    daemon,
+    "LOOKUP hello.txt",
+  );
   [
-    owner_and_mode(&mut stream, &root_fh, 3),
-    owner_and_mode(&mut stream, &file_fh, 4),
+    or_describe(
+      owner_and_mode_status(&mut stream, &root_fh, 3),
+      daemon,
+      "GETATTR of the root",
+    ),
+    or_describe(
+      owner_and_mode_status(&mut stream, &file_fh, 4),
+      daemon,
+      "GETATTR of hello.txt",
+    ),
   ]
 }
 
@@ -6084,23 +6109,25 @@ fn read_hello_over_nfs(daemon: &Daemon, name: &str) -> Vec<u8> {
   let port = daemon.nfs_port().expect("the daemon serves NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
   let root_fh = mount(&mut stream, &capability_path(daemon, name), 1);
-  let file_fh = lookup_or_describe(&mut stream, daemon, &root_fh, "hello.txt", 2);
-  read(&mut stream, &file_fh, 3)
+  let file_fh = or_describe(
+    lookup_status(&mut stream, &root_fh, "hello.txt", 2),
+    daemon,
+    "LOOKUP hello.txt",
+  );
+  or_describe(
+    read_bytes_status(&mut stream, &file_fh, 3),
+    daemon,
+    "READ hello.txt",
+  )
 }
 
-/// LOOKUP `name` under `root_fh` on `daemon`'s NFS port; a status other than `NFS3_OK` fails the test with the
-/// daemon described — its refusal counts, among them why a lease gate refused (`lease.refused.*`) — so a
-/// retry-later answer says which rule gave it.
-fn lookup_or_describe(
-  stream: &mut TcpStream,
-  daemon: &Daemon,
-  root_fh: &[u8],
-  name: &str,
-  xid: u32,
-) -> Vec<u8> {
-  lookup_status(stream, root_fh, name, xid).unwrap_or_else(|status| {
+/// An NFS procedure's result on `daemon`; a status other than `NFS3_OK` fails the test with the daemon
+/// described — its refusal counts, among them why a lease gate refused (`lease.refused.*`) — so a retry-later
+/// answer says which rule gave it.
+fn or_describe<T>(answered: Result<T, u32>, daemon: &Daemon, procedure: &str) -> T {
+  answered.unwrap_or_else(|status| {
     panic!(
-      "LOOKUP {name} answered status {status} on {}",
+      "{procedure} answered status {status} on {}",
       describe(&[daemon])
     )
   })

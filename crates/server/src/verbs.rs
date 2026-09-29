@@ -641,16 +641,18 @@ fn takeovers_pending(state: &ShardState) -> u64 {
 /// ([`dispatch`]), the mount bridge ([`crate::nfs`]) and the daemon's test observation.
 pub(crate) fn lease_verdict(state: &ShardState, object: ObjectId) -> crate::lease::LeaseVerdict {
   let config = state.fleet.configuration();
-  // The cohort a successor's promotion quorum is drawn from: the settled one while this owner's neighbourhood
-  // change is in flight (every record it commits is at `f + 1` of it), else the current one.
-  let candidates = config.recovery_cohort(object);
+  // The cohorts a successor's promotion quorum can be drawn from: the settled one, and — while this owner's
+  // neighbourhood change is in flight and moved the object's cohort — the current one the council may settle
+  // at any moment (the joint lease, as the joint writes).
+  let cohorts = config.lease_cohorts(object);
   let now = slates_machine::clock::monotonic_ns();
   state.lease.verdict(
     now,
     config.owner,
-    config.version,
+    config.standing(),
     config.quorum,
-    &candidates,
+    &cohorts,
+    state.fleet.members(),
   )
 }
 

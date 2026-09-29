@@ -2891,6 +2891,31 @@ snapshot reads need no latest-head lease but still require read rights and verif
 > object an install reassigns, and refuses a prepare while its own answers may still feed that owner's lease
 > (`docs/bugs/2026-09-29-holders-promised-without-the-lease-gate.md`; regression
 > `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease`).
+>
+> **Status (2026-09-29, the relevant authority generation).** The lease is keyed to the owner's own
+> authority, not the regional version
+> (`docs/bugs/2026-09-29-the-owner-lease-was-voided-by-other-hosts-configuration-changes.md`).
+>
+> - **An owner's standing** is the version its settled neighbourhood was fixed at, the set a takeover recovers
+>   through, with its current neighbourhood's version. Another host's admission, settlement, retirement or
+>   confirmed takeover leaves it unchanged. Keyed to the regional version, each of those voided every owner's
+>   lease until it installed the change: a successor refused its adopted volume in 5 of 17 Linux io_uring runs,
+>   every refusal `lease.refused.superseded`.
+> - **A holder's acknowledgement** carries its view of the prober's standing, and the version it read it at.
+>   - A standing the owner recognizes confirms it.
+>   - The owner is superseded only by its own retirement (no membership under a newer configuration) or by
+>     its id's re-admission (a newer settled neighbourhood).
+> - **The lease is joint while a change is in flight**, as the writes are. It needs the intersection bound in
+>   the settled cohort and in the current one, since the council may settle the current one at any moment, and
+>   a retirement after that recovers through it. Counting only the settled cohort let an owner cut off with
+>   lagging holders keep its lease while a successor recovered through the new cohort.
+> - **A retired candidate is not waited for**: it cannot promise.
+> - **Direct contact keeps the settled neighbourhood's hosts** while a change is in flight, because the joint
+>   writes and the joint lease reach them.
+> - Regressions: `only_a_change_to_the_owners_own_authority_supersedes_it`,
+>   `a_change_in_flight_needs_confirmations_in_both_cohorts`,
+>   `an_owner_keeps_direct_contact_with_its_settled_neighbourhood_while_a_change_is_in_flight`, and the
+>   intersection oracle over every set of live candidates.
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the
@@ -2924,6 +2949,23 @@ version.
 > routing regression distinguishes a copyset successor from an unrelated live node, and the
 > forwarded-write test requires its retry to reach the owner. Evidence and limits:
 > `docs/bugs/2026-09-17-remote-lookup-guesses-outside-the-copyset.md`.
+>
+> **Status (2026-09-29).** Two parts of this rule assumed the regional generation changes only on membership and
+> takeover. Since the council settles neighbourhoods and confirms takeovers, it moves several times within a
+> few periods after every takeover, so both parts refused the one owner a lookup could find. The location test
+> then failed in 4 of 17 Linux io_uring rounds.
+> - **"Has applied the committed regional generation."** Right after a takeover the successor's coordinator
+>   period runs long, and its placement stayed a version behind its council (7 against 8) through the lookup,
+>   so it refused to answer (`placement_behind`). A node now claims under its council's configuration: while
+>   that holds it as a member and its route names itself. Ownership moves only when the owner is retired, so
+>   the placement's lag cannot make a claim false.
+> - **"Only the newest observed regional generation supplies a hint."** A survivor that had installed an
+>   unrelated settlement answered "not mine" under a newer version, and the round discarded the successor's
+>   claim. Only claims compete now, the newest claim winning, and conflicting claims at one generation still
+>   refuse. A peer that is not the owner carries no ownership information and never takes a claim away
+>   (AC-8.14: "after one stable configuration change a stale lookup refreshes once").
+> - Regressions: `a_node_whose_placement_lags_its_council_still_claims_what_it_owns`,
+>   `a_peer_that_is_not_the_owner_never_takes_away_a_claim`.
 
 > **A forward waits for the owner's session (2026-09-25).** A forward took the owner's record session once
 > and, when a coordinator dispatch or a discovery page had it out, refused the client `HomedElsewhere` at

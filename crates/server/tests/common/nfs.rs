@@ -140,12 +140,26 @@ pub(crate) fn lookup_status(
 /// NFS GETATTR of `fh` → its `(mode, uid, gid)` — what `stat` shows through a kernel mount, and what a
 /// takeover successor must reproduce for the dead owner's tree (fattr3: type, mode, nlink, uid, gid, …).
 pub(crate) fn owner_and_mode(stream: &mut TcpStream, fh: &[u8], xid: u32) -> (u32, u32, u32) {
+  owner_and_mode_status(stream, fh, xid)
+    .unwrap_or_else(|status| panic!("GETATTR: status {status}, expected 0"))
+}
+
+/// NFS GETATTR of `fh` → its `(mode, uid, gid)`, or the status the server answered instead.
+pub(crate) fn owner_and_mode_status(
+  stream: &mut TcpStream,
+  fh: &[u8],
+  xid: u32,
+) -> Result<(u32, u32, u32), u32> {
   let mut args = Vec::new();
   opaque(fh, &mut args);
   let reply = call(stream, NFS_PROGRAM, 1, &args, xid);
-  assert_eq!(status(&reply), 0, "GETATTR");
-  let field = |at: usize| u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
-  (field(8), field(16), field(20))
+  match status(&reply) {
+    0 => {
+      let field = |at: usize| u32::from_be_bytes(reply[at..at + 4].try_into().unwrap());
+      Ok((field(8), field(16), field(20)))
+    }
+    answered => Err(answered),
+  }
 }
 
 /// NFS CREATE (UNCHECKED) `name` in `dir_fh` with mode 0644 → the new file's handle.
@@ -187,12 +201,25 @@ pub(crate) fn write(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u3
 
 /// NFS READ up to 400 bytes at offset zero from `file_fh`.
 pub(crate) fn read(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> {
+  read_bytes_status(stream, file_fh, xid)
+    .unwrap_or_else(|status| panic!("READ: status {status}, expected 0"))
+}
+
+/// NFS READ of `file_fh` from offset 0 → the bytes, or the status the server answered instead.
+pub(crate) fn read_bytes_status(
+  stream: &mut TcpStream,
+  file_fh: &[u8],
+  xid: u32,
+) -> Result<Vec<u8>, u32> {
   let mut args = Vec::new();
   opaque(file_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // offset
   args.extend_from_slice(&400u32.to_be_bytes()); // count
   let reply = call(stream, NFS_PROGRAM, 6, &args, xid);
-  assert_eq!(status(&reply), 0, "READ succeeded");
+  let answered = status(&reply);
+  if answered != 0 {
+    return Err(answered);
+  }
   let mut off = 4;
   let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
   off += 4;
@@ -200,7 +227,7 @@ pub(crate) fn read(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> 
     off += 84; // post_op_attr fattr3
   }
   off += 8; // count and eof
-  read_opaque(&reply, off).0
+  Ok(read_opaque(&reply, off).0)
 }
 
 /// NFS FSSTAT `fh` → the volume's (total bytes, free bytes): the quota the export serves as the

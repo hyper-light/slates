@@ -1602,7 +1602,7 @@ async fn serve_peer_probes(
           Vec::new()
         }
         Ok(message) => {
-          let Some((gossip, configuration_version)) = state::with_state(|state| {
+          let Some((gossip, configuration_version, standing)) = state::with_state(|state| {
             let anchor = rostered_anchor?;
             let boot_nonce = message.boot_nonce()?;
             let peer = message.from();
@@ -1641,11 +1641,15 @@ async fn serve_peer_probes(
               state.answers_given.announced(peer, *configuration_version);
             }
             let belief = state.fleet.membership().state(peer);
+            // The owner-lease evidence this answer carries (§4.8 "Leases and reads"): this node's council
+            // configuration's view of the prober's authority standing, and the version it was read at, so the
+            // prober can tell its retirement from this node's not having admitted it yet.
+            let regional = state.council.configuration();
+            let (version, standing) = (regional.version, regional.standing_of(peer));
             Some((
               outgoing_probe_gossip(state, peer, belief, fanout),
-              state
-                .lease
-                .known_version(state.fleet.configuration().version),
+              version,
+              standing,
             ))
           })
           .flatten() else {
@@ -1657,6 +1661,7 @@ async fn serve_peer_probes(
             nonce: message.nonce().unwrap_or(0),
             boot_nonce: local_boot_nonce,
             configuration_version,
+            standing,
             gossip,
             coordinate: detector.coordinate(),
           }
@@ -1850,6 +1855,7 @@ async fn probe_and_apply(
         from,
         boot_nonce,
         configuration_version,
+        standing,
         gossip,
         rtt_ns,
         coordinate,
@@ -1877,15 +1883,21 @@ async fn probe_and_apply(
           // moves to the requester's queue and the requester's probe task is woken to carry it back.
           answer_relay_asks(s, peer.host);
           // The owner lease (§4.8 "Leases and reads"; AUD-08): this peer, a candidate holder of this node's
-          // objects, has answered a probe reporting this node alive. Credit it toward the lease at the
-          // version the peer announced — measured from the probe's send time, before the peer formed its
-          // answer. A version newer than this node's installed one means this node's authority is
-          // superseded (a retirement or takeover it has not applied): every object's lease voids until it
-          // installs that version.
-          s.lease.confirm(peer.host, sent_ns, configuration_version);
-          if configuration_version > s.fleet.configuration().version {
-            s.lease.supersede(configuration_version);
-          }
+          // objects, has answered a probe reporting this node alive, naming the standing its configuration
+          // holds this node at. It confirms the lease when this node's own standing recognizes that — measured
+          // from the probe's send time, before the peer formed its answer — and supersedes it only when it
+          // shows this node's own authority changed where it has not installed (`OwnerLease::answered`):
+          // another host's configuration change leaves it as it was.
+          let installed = s.fleet.configuration();
+          let (own, installed_version) = (installed.standing(), installed.version);
+          s.lease.answered(
+            peer.host,
+            sent_ns,
+            configuration_version,
+            standing,
+            own,
+            installed_version,
+          );
         });
         #[allow(clippy::cast_precision_loss)]
         detector.observe_rtt(peer.host, rtt_ns as f64);
@@ -3974,7 +3986,8 @@ enum DirectContact {
   UnlearnedSeed,
   /// Not a member of the council's committed configuration (a newcomer or an unknown id): contacted.
   NotInCouncilConfiguration,
-  /// In this node's neighbourhood.
+  /// In this node's neighbourhood: its current one, or its settled one while a change is in flight, since its
+  /// joint writes and its joint lease reach both.
   Neighbour,
   /// A voter of the council or the root group.
   Voter,
@@ -4009,7 +4022,7 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::Forming
   } else if !state.council.configuration().members.contains(&peer) {
     DirectContact::NotInCouncilConfiguration
-  } else if state.fleet.configuration().neighbourhood.contains(&peer) {
+  } else if state.fleet.configuration().neighbours(peer) {
     DirectContact::Neighbour
   } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
     DirectContact::Voter

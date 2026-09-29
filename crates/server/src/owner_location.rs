@@ -60,9 +60,6 @@ pub(crate) enum LocationError {
   RootViewDiffers,
   /// Asked about a region this node is not in, or an object homed elsewhere.
   OutsideHome,
-  /// Asked while this node's placement has not yet installed the regional configuration its council holds:
-  /// its held-object route may predate the newest takeover, so it names no owner.
-  PlacementBehind,
 }
 
 impl LocationError {
@@ -75,7 +72,6 @@ impl LocationError {
       Self::NotReady => "fleet.owner_location.not_ready",
       Self::RootViewDiffers => "fleet.owner_location.root_view_differs",
       Self::OutsideHome => "fleet.owner_location.outside_home",
-      Self::PlacementBehind => "fleet.owner_location.placement_behind",
     }
   }
 }
@@ -123,8 +119,12 @@ fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
       .is_some_and(|member| member.liveness != Liveness::Dead)
 }
 
-/// Answer from the held-object route after configuration application. A pending takeover does
-/// not advertise itself until adoption finishes. Peers without this object report no owner;
+/// Answer from the held-object route, under the council's configuration. A node claims an object only
+/// while that configuration holds it as a member and its route names itself; ownership moves only when the
+/// owner is retired, so a placement still installing the council's newest configuration cannot make a claim
+/// false, and the node answers meanwhile. (Refusing then — the placement a version behind its council for most
+/// of a long coordinator period right after a takeover — refused the one owner a lookup could find.) A pending
+/// takeover does not advertise itself until adoption finishes. Peers without this object report no owner;
 /// they never infer one from live membership. The session has already authenticated enrollment.
 pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, LocationError> {
   let query = Query::from_bytes(bytes).map_err(|_| LocationError::Malformed)?;
@@ -147,9 +147,6 @@ pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, Locatio
     return Err(LocationError::OutsideHome);
   }
   let regional = state.council.configuration();
-  if state.fleet.configuration().version != regional.version {
-    return Err(LocationError::PlacementBehind);
-  }
   Ok(
     Reply {
       query,
@@ -162,38 +159,70 @@ pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, Locatio
   )
 }
 
-/// Only replies at the newest observed regional generation can supply a route. A conflicting
-/// claim at that generation refuses regardless of arrival order; newer negative replies also
-/// invalidate an older positive. The peer identity supplies the owner, never a payload field.
+/// Only claims supply a route: the claim at the newest regional generation among them, since an owner
+/// retired and succeeded claims under an older configuration than its successor adopted under. Conflicting
+/// claims at that generation refuse regardless of arrival order. A peer's answer that the object is not its own
+/// carries no ownership information and never takes a claim away (AC-8.14: after one configuration change a
+/// stale lookup refreshes once) — an unrelated settlement a survivor installed a moment earlier used to discard
+/// the successor's claim. This is location, not authority: the claimed owner's lease and fence decide whether it
+/// serves. The peer identity supplies the owner, never a payload field.
 #[derive(Default)]
 struct Answers {
   generation: Option<u64>,
   owner: Option<HostId>,
   conflicting: bool,
+  /// Claims a newer claim dropped, counted when the round ends (`fleet.owner_location.claim_superseded`).
+  superseded_claims: u64,
+}
+
+/// What folding one reply did to a round's answer, counted by the round, so a refused lookup says which
+/// answers it had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Folded {
+  /// A peer claimed the object, at the newest generation claimed so far.
+  Claim,
+  /// A peer answered that the object is not its own.
+  NotOwner,
+  /// A claim at an older generation than one already folded: it changes nothing.
+  OlderClaim,
+}
+
+impl Folded {
+  fn counter(self) -> &'static str {
+    match self {
+      Self::Claim => "fleet.owner_location.claim",
+      Self::NotOwner => "fleet.owner_location.not_owner",
+      Self::OlderClaim => "fleet.owner_location.older_claim",
+    }
+  }
 }
 
 impl Answers {
-  fn fold(&mut self, query: Query, peer: HostId, bytes: &[u8]) -> Result<(), LocationError> {
+  fn fold(&mut self, query: Query, peer: HostId, bytes: &[u8]) -> Result<Folded, LocationError> {
     let reply = Reply::from_bytes(bytes).map_err(|_| LocationError::Malformed)?;
     if reply.query != query {
       return Err(LocationError::ForeignView);
+    }
+    if !reply.serves {
+      return Ok(Folded::NotOwner);
     }
     if self
       .generation
       .is_some_and(|generation| generation > reply.generation)
     {
-      return Ok(());
+      return Ok(Folded::OlderClaim);
     }
     if self.generation != Some(reply.generation) {
+      if self.owner.is_some() {
+        self.superseded_claims = self.superseded_claims.saturating_add(1);
+      }
       self.generation = Some(reply.generation);
       self.owner = None;
       self.conflicting = false;
     }
-    if reply.serves {
-      self.conflicting |= self.owner.is_some_and(|owner| owner != peer);
-      self.owner = Some(peer);
-    }
-    Ok(())
+    self.conflicting |= self.owner.is_some_and(|owner| owner != peer);
+    self.owner = Some(peer);
+    Ok(Folded::Claim)
   }
 
   fn finish(self) -> Result<HostId, LocationError> {
@@ -260,6 +289,9 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
     unasked = out;
     slates_rt::futures::sleep(poll_ns).await;
   }
+  for _ in 0..answers.superseded_claims {
+    count("fleet.owner_location.claim_superseded");
+  }
   let result = answers.finish();
   if let Err(error) = result {
     count(error.counter());
@@ -277,20 +309,25 @@ async fn ask(
   budget_ns: u64,
   poll_ns: u64,
 ) {
+  let mut unanswered: std::collections::BTreeSet<HostId> =
+    taken.iter().map(|(peer, _)| *peer).collect();
   let requests = taken
     .into_iter()
     .map(|(peer, endpoint)| (peer, request.to_vec(), endpoint))
     .collect();
   let budget = CommitBudget::hard(budget_ns, poll_ns);
   let (replies, mut stragglers) = broadcast(requests, STREAM, Priority::Metadata, budget).await;
-  fold_replies(answers, query, replies);
+  fold_replies(answers, query, replies, &mut unanswered);
   loop {
     let (replies, done) = stragglers.recover_replies();
-    fold_replies(answers, query, replies);
+    fold_replies(answers, query, replies, &mut unanswered);
     if done {
       break;
     }
     slates_rt::futures::sleep(budget.poll_interval_ns).await;
+  }
+  for _ in &unanswered {
+    count("fleet.owner_location.no_reply");
   }
 }
 
@@ -312,6 +349,8 @@ fn sessions_out(peers: &std::collections::BTreeSet<HostId>) -> std::collections:
   .unwrap_or_default()
 }
 
+/// Folds the replies that arrived into the round's answer, counting what each did — an empty reply is the
+/// peer's refusal, which it counted itself by reason — and strikes each replying peer from `unanswered`.
 fn fold_replies(
   answers: &mut Answers,
   query: Query,
@@ -320,14 +359,20 @@ fn fold_replies(
     slates_cluster::TimedReply,
     slates_transport::endpoint::Endpoint,
   )>,
+  unanswered: &mut std::collections::BTreeSet<HostId>,
 ) {
   let mut sessions = Vec::with_capacity(replies.len());
   for (peer, reply, endpoint) in replies {
-    if !reply.bytes.is_empty()
-      && let Err(error) = answers.fold(query, peer, &reply.bytes)
-    {
-      count(error.counter());
-    }
+    unanswered.remove(&peer);
+    let counter = if reply.bytes.is_empty() {
+      "fleet.owner_location.refused_by_peer"
+    } else {
+      match answers.fold(query, peer, &reply.bytes) {
+        Ok(folded) => folded.counter(),
+        Err(error) => error.counter(),
+      }
+    };
+    count(counter);
     sessions.push((peer, endpoint));
   }
   return_sessions(sessions);
@@ -345,29 +390,23 @@ mod tests {
     }
   }
 
-  /// AC-8.14: a new negative view invalidates an old owner; an actual new owner is the route,
-  /// regardless of reply order. Unrelated members never become owners by their ranking.
+  /// A reply to `query()` under `generation`, claiming the object when `serves`.
+  fn reply(generation: u64, serves: bool) -> Vec<u8> {
+    Reply {
+      query: query(),
+      generation,
+      serves,
+    }
+    .to_bytes()
+  }
+
+  /// AC-8.14: an owner that claims under a newer generation than an old one — the successor that adopted what
+  /// a retired owner still claims — is the route, regardless of reply order, and a peer that is not the owner
+  /// changes nothing. Unrelated members never become owners by their ranking.
   #[test]
-  fn only_the_owner_at_the_newest_observed_generation_supplies_a_route() {
+  fn the_newest_claim_supplies_the_route() {
     let query = query();
-    let old = Reply {
-      query,
-      generation: 1,
-      serves: true,
-    }
-    .to_bytes();
-    let absent = Reply {
-      query,
-      generation: 2,
-      serves: false,
-    }
-    .to_bytes();
-    let current = Reply {
-      query,
-      generation: 2,
-      serves: true,
-    }
-    .to_bytes();
+    let (old, absent, current) = (reply(1, true), reply(2, false), reply(2, true));
     for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
       let replies = [
         (HostId(1), &old),
@@ -381,10 +420,75 @@ mod tests {
       }
       assert_eq!(answers.finish(), Ok(HostId(3)));
     }
+    let mut none = Answers::default();
+    assert_eq!(none.fold(query, HostId(2), &absent), Ok(Folded::NotOwner));
+    assert_eq!(
+      none.finish(),
+      Err(LocationError::Unavailable),
+      "with no claim there is no route"
+    );
+  }
+
+  /// What each reply did is what the round counts: a peer that is not the owner drops no claim, a newer claim
+  /// drops an older one (counted `claim_superseded`), and a claim older than the one held changes nothing.
+  #[test]
+  fn each_reply_says_what_it_did_to_the_round() {
+    let query = query();
     let mut answers = Answers::default();
-    answers.fold(query, HostId(1), &old).unwrap();
-    answers.fold(query, HostId(2), &absent).unwrap();
-    assert_eq!(answers.finish(), Err(LocationError::Unavailable));
+    assert_eq!(
+      answers.fold(query, HostId(1), &reply(1, true)),
+      Ok(Folded::Claim)
+    );
+    assert_eq!(
+      answers.fold(query, HostId(2), &reply(2, false)),
+      Ok(Folded::NotOwner)
+    );
+    assert_eq!(
+      answers.superseded_claims, 0,
+      "not the owner: no claim dropped"
+    );
+    assert_eq!(
+      answers.fold(query, HostId(3), &reply(2, true)),
+      Ok(Folded::Claim)
+    );
+    assert_eq!(answers.superseded_claims, 1, "the older claim was dropped");
+    assert_eq!(
+      answers.fold(query, HostId(1), &reply(1, true)),
+      Ok(Folded::OlderClaim)
+    );
+    assert_eq!(answers.finish(), Ok(HostId(3)));
+  }
+
+  /// AC-8.14 ("after one stable configuration change a stale lookup refreshes once"): a peer's answer that it
+  /// is not the owner carries no ownership information — peers "never infer [an owner] from live membership" —
+  /// so a newer configuration it answers under cannot take away the owner's claim. Do: the successor claims
+  /// under configuration 8, a survivor that installed an unrelated settlement since answers "not mine" under 9.
+  /// Expect: the successor is the route. The Linux io_uring loop failed the location test on this: after a
+  /// takeover each survivor's `Settle` and the successor's `Confirm` advance the version within a few periods.
+  #[test]
+  fn a_peer_that_is_not_the_owner_never_takes_away_a_claim() {
+    let query = query();
+    let claim = Reply {
+      query,
+      generation: 8,
+      serves: true,
+    }
+    .to_bytes();
+    let not_mine = Reply {
+      query,
+      generation: 9,
+      serves: false,
+    }
+    .to_bytes();
+    for order in [[0, 1], [1, 0]] {
+      let replies = [(HostId(3), &claim), (HostId(4), &not_mine)];
+      let mut answers = Answers::default();
+      for index in order {
+        let (peer, bytes) = replies[index];
+        answers.fold(query, peer, bytes).unwrap();
+      }
+      assert_eq!(answers.finish(), Ok(HostId(3)), "order {order:?}");
+    }
   }
 
   /// AC-8.14 / §4.9: conflicting, truncated or wrongly bound replies cannot select an owner.

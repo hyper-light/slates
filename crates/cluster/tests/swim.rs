@@ -270,6 +270,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
                 nonce: STALE_NONCE,
                 boot_nonce: TARGET_BOOT_NONCE,
                 configuration_version: 0,
+                standing: None,
                 gossip: vec![(
                   RUMOUR,
                   MemberState {
@@ -368,6 +369,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
           from: _,
           boot_nonce: _,
           configuration_version: _,
+          standing: _,
           gossip,
           rtt_ns,
           coordinate,

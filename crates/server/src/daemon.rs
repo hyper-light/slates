@@ -886,6 +886,19 @@ impl Daemon {
     })
   }
 
+  /// Test support: the regional configuration version this daemon's placement has installed and the one its
+  /// council holds (§4.8): equal once the coordinator has installed what the council committed. A test reads
+  /// them to show which configurations its daemons stood at when an answer depended on it. A one-shot
+  /// control-shard question; the typed refusal when the shard could not answer.
+  pub fn configuration_versions(&self) -> Result<(u64, u64), ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      (
+        s.fleet.configuration().version,
+        s.council.configuration().version,
+      )
+    })
+  }
+
   /// Test support: holds this daemon's record session to `peer` out of its link for `span_ns` and then puts
   /// it back, exactly as a coordinator dispatch or a discovery page holds it (`fleet::take_sessions`,
   /// `fleet::return_sessions`), so a test drives a forward into a session that is out (§4.8 "Lookup";
@@ -3139,6 +3152,114 @@ mod tests {
         "restarting cannot grant a second vote in the same term"
       );
     }
+  }
+
+  /// §4.8 "Neighbourhood changes" (joint writes) and "Leases and reads" (the joint lease): while an owner's
+  /// change is in flight its records go to both cohorts and its lease needs confirmations in both, so it keeps
+  /// direct contact — the record session and the probe — with its settled neighbourhood's hosts, not only its
+  /// current one's. Do: admit a member that displaces a non-voting host from the owner's neighbourhood, and
+  /// install the result. Expect: the displaced host, still in the owner's settled neighbourhood, is kept in
+  /// direct contact until the owner settles. Before, it was dropped as outside the neighbourhood, so a joint
+  /// write could not reach it and the lease could never be confirmed by it.
+  #[test]
+  fn an_owner_keeps_direct_contact_with_its_settled_neighbourhood_while_a_change_is_in_flight() {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{HostId, Quorum, RegionalConfiguration};
+    let (displaced, kept) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let members: Vec<HostId> = (1..=4u64).map(|n| HostId(local.0 ^ n)).collect();
+      let scatter = 3;
+      let formed = |extra: &[HostId]| {
+        let mut all = vec![local];
+        all.extend_from_slice(extra);
+        RegionalConfiguration::formed(
+          all,
+          Quorum { f: 1 },
+          std::collections::BTreeMap::new(),
+          scatter,
+          false,
+        )
+      };
+      let before = formed(&members).neighbourhoods[&local].hosts.clone();
+      // A newcomer that rendezvous ranks into the owner's neighbourhood, displacing one of its hosts.
+      let (newcomer, displaced) = (5..=u64::from(u16::MAX))
+        .map(|n| HostId(local.0 ^ n))
+        .find_map(|newcomer| {
+          let mut probe = formed(&members);
+          probe.admit(newcomer, None, scatter);
+          let after = &probe.neighbourhoods[&local].hosts;
+          before
+            .iter()
+            .find(|host| !after.contains(host))
+            .map(|displaced| (newcomer, *displaced))
+        })
+        .unwrap();
+      let mut all = vec![local];
+      all.extend_from_slice(&members);
+      state.council = RegionalCouncil::new(
+        local,
+        all,
+        vec![local],
+        Quorum { f: 1 },
+        std::collections::BTreeMap::new(),
+        scatter,
+        false,
+      );
+      assert!(state.council.propose(Reconfiguration::Admit {
+        host: newcomer,
+        domain: None,
+      }));
+      install_council(state);
+      let placement = state.fleet.configuration();
+      assert!(
+        !placement.neighbourhood.contains(&displaced)
+          && placement
+            .settled
+            .as_ref()
+            .is_some_and(|settled| settled.hosts.contains(&displaced)),
+        "the displaced host left the current neighbourhood and stays in the settled one"
+      );
+      (
+        displaced,
+        crate::fleet::keeps_direct_contact_with(state, displaced),
+      )
+    });
+    assert!(
+      kept,
+      "the owner keeps direct contact with {displaced:?}, still in its settled neighbourhood"
+    );
+  }
+
+  /// §4.8 Lookup, AC-8.14: a node whose placement has not yet installed its council's newest configuration
+  /// still claims an object it owns — ownership moves only when the owner is retired, and the claim is judged
+  /// against the council's own membership, so the lag cannot make a claim false. Do: commit a change on this
+  /// node's council without installing it, and ask where its own object is. Expect: it claims the object. The
+  /// Linux io_uring loop failed the location test on this refusal (`placement_behind`): right after a
+  /// takeover the successor's coordinator period runs long, and its placement stayed a version behind its
+  /// council (7 against 8) through the lookup.
+  #[test]
+  fn a_node_whose_placement_lags_its_council_still_claims_what_it_owns() {
+    use slates_cluster::config_group::Reconfiguration;
+    use slates_db::register::{HostId, ObjectId, RegionId};
+    use slates_wire::Wire;
+    let claimed = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let object = ObjectId::new(local, 1);
+      state.node_regions.insert(local, RegionId(0));
+      state.fleet.track_object_owner(object, local);
+      let installed = state.fleet.configuration().version;
+      assert!(state.council.propose(Reconfiguration::Admit {
+        host: HostId(local.0 ^ 1),
+        domain: None,
+      }));
+      assert!(state.council.configuration().version > installed);
+      let query = crate::owner_location::Query::new(state, object, 0);
+      crate::owner_location::serve(state, &query.to_bytes())
+    });
+    assert!(
+      claimed.is_ok(),
+      "the owner answers while its placement catches up: {claimed:?}"
+    );
   }
 
   /// §4.8 learner fetch (D-14): a voter with nothing newer answers a caught-up fetch with no bytes

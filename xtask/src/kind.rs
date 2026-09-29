@@ -19,6 +19,11 @@
 //!   80 ms, pod 1's 20 ms, pod 2 unshaped): the settled leader's egress is cut from an ephemeral
 //!   `NET_ADMIN` container, the survivors are polled until one leads, and the cut heals. The outranked
 //!   pod must never succeed a central one (research record §3.4; thesis §4.2.3).
+//! - `burst [--trials N]` — the council under a burst of reconfiguration: five replicas (`f = 2`) under the
+//!   `wan` profile, formation timed until every neighbourhood is settled, then the council's leader and one
+//!   more voter cut together (`f` of them, from ephemeral `NET_ADMIN` containers). The survivors must elect,
+//!   retire both, and commit every takeover's confirmations and every settlement; the step times each stage
+//!   and counts the commits the burst took (research record §3.5, §3.6; §4.8 "Neighbourhood changes").
 //! - `down` — deletes the cluster. `all` runs every step in order and deletes the cluster at the end,
 //!   also on failure, unless `--keep`.
 //!
@@ -129,6 +134,22 @@ const SETTLE_WAIT: Duration = Duration::from_secs(180);
 /// Shape: how long a successor is waited for after a cut. (The healed leader's rejoin is waited for up to
 /// [`REJOIN_WAIT`], the lane's bound for a replaced pod's.)
 const SUCCESSION_WAIT: Duration = Duration::from_secs(60);
+/// Shape: the burst measurement's fleet (docs/wip/kind-lane.md, "Piece 7"): the scale step's five replicas at
+/// `f = 2`, so the council seats five voters and a burst can take two of them and keep a majority.
+const BURST_REPLICAS: u64 = SCALED_REPLICAS;
+/// Derived: the voters a burst cuts together — the burst fleet's `f`, `⌊(replicas − 1) / 2⌋`, the most a
+/// region of that size tolerates losing at once (§4.8: `2f + 1` voters keep a majority after `f` losses).
+const BURST_CUT: u64 = BURST_REPLICAS.saturating_sub(1) / 2;
+/// Shape: the bursts a run measures unless `--trials` says otherwise, each on a fresh fleet.
+const BURST_TRIALS: u64 = 3;
+/// Shape: how long a formed burst fleet gets to settle every neighbourhood before a cut — its admissions'
+/// settlements are a few council commits over the `wan` profile's ~160 ms round trips.
+const BURST_SETTLE_WAIT: Duration = Duration::from_secs(120);
+/// Shape: how long the survivors get to resolve a burst — to elect, retire each cut voter behind its death
+/// confirmation (a voter change each), and commit every confirmation and settlement — over the `wan`
+/// profile's round trips and its 20-period election base.
+const BURST_WAIT: Duration = Duration::from_secs(300);
+
 /// Format: the ephemeral cut container's security context (`kubectl debug --custom`): root with
 /// `NET_ADMIN`, as the chart's netem init container runs, over the pod's non-root default.
 const CUT_CONTAINER: &str = r#"{"securityContext":{"runAsNonRoot":false,"runAsUser":0,"capabilities":{"add":["NET_ADMIN"]}}}"#;
@@ -145,6 +166,7 @@ pub(crate) enum Step {
   Scale,
   Netem,
   Succession,
+  Burst,
   Down,
   All,
 }
@@ -164,7 +186,7 @@ pub(crate) struct Options {
   pub(crate) identities: Option<PathBuf>,
   /// `install`: a netem profile `(delay, jitter, loss)`.
   pub(crate) netem: Option<(String, String, String)>,
-  /// `succession`: how many leader losses.
+  /// `succession`: how many leader losses; `burst`: how many bursts.
   pub(crate) trials: u64,
 }
 
@@ -225,11 +247,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
     Some("scale") => Step::Scale,
     Some("netem") => Step::Netem,
     Some("succession") => Step::Succession,
+    Some("burst") => Step::Burst,
     Some("down") => Step::Down,
     Some("all") => Step::All,
     other => {
       return Err(Failure(format!(
-        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, down, all"
+        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, burst, down, all"
       )));
     }
   };
@@ -242,7 +265,10 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
     out: None,
     identities: None,
     netem: None,
-    trials: SUCCESSION_TRIALS,
+    trials: match step {
+      Step::Burst => BURST_TRIALS,
+      _ => SUCCESSION_TRIALS,
+    },
   };
   let mut rest = args[1..].iter();
   while let Some(arg) = rest.next() {
@@ -742,6 +768,23 @@ struct View {
   /// Its campaigns' voters not asked, by why, and the pre-vote grants dropped for arriving late (zero from
   /// an image that predates a counter).
   asked: CampaignCounters,
+  /// The regional configuration version it has installed (§4.8): every admission, retirement, settlement
+  /// and confirmed takeover advances it, so the difference across a burst is the council's commits in it.
+  configuration_version: u64,
+  /// The versions its settled and its current neighbourhoods were fixed at: equal once the council has taken
+  /// its report that its records are all placed on its current neighbourhood (§4.8 "Neighbourhood changes").
+  settled_generation: u64,
+  neighbourhood_generation: u64,
+  /// The retirements its configuration still keeps: a takeover whose survivors have not all confirmed their
+  /// share (§4.8 "Promotion and takeover").
+  retirements: u64,
+}
+
+impl View {
+  /// Whether this node's neighbourhood is settled: no change of it in flight.
+  fn settled(&self) -> bool {
+    self.settled_generation == self.neighbourhood_generation
+  }
 }
 
 /// A view's campaign counters, each summed over the shards under the name the daemon counts it by
@@ -916,13 +959,25 @@ impl View {
       resolve_refused,
       links: LinkCounters::parse(status),
       asked: CampaignCounters::parse(status),
+      configuration_version: u64_of(fleet, "configuration_version"),
+      settled_generation: fleet
+        .get("takeover")
+        .map_or(0, |takeover| u64_of(takeover, "settled_generation")),
+      neighbourhood_generation: fleet
+        .get("takeover")
+        .map_or(0, |takeover| u64_of(takeover, "neighbourhood_generation")),
+      retirements: fleet
+        .get("takeover")
+        .and_then(|takeover| takeover.get("retirements"))
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, |kept| u64::try_from(kept.len()).unwrap_or(u64::MAX)),
     })
   }
 
   /// One line of the view, for the record.
   fn line(&self) -> String {
     format!(
-      "{}: host={} f={} members={:?} peers_probed={} leads={} base={} span={} tail_ns={} spread_ns={} samples={} term={} priority_ns={}±{} rank={} lease={} pre_elections={} elections={} resolve_refused={}",
+      "{}: host={} f={} members={:?} peers_probed={} leads={} base={} span={} tail_ns={} spread_ns={} samples={} term={} priority_ns={}±{} rank={} lease={} pre_elections={} elections={} resolve_refused={} version={} settled={}/{} retirements={}",
       self.pod,
       self.host,
       self.f,
@@ -941,7 +996,11 @@ impl View {
       self.leader_lease,
       self.pre_elections,
       self.elections,
-      self.resolve_refused
+      self.resolve_refused,
+      self.configuration_version,
+      self.settled_generation,
+      self.neighbourhood_generation,
+      self.retirements
     )
   }
 }
@@ -1060,6 +1119,7 @@ impl Lane {
       Step::Scale => self.scale(),
       Step::Netem => self.netem_profiles(),
       Step::Succession => self.succession(self.trials),
+      Step::Burst => self.burst(self.trials),
       Step::All => self.all(),
       Step::Image | Step::Smoke | Step::Certs | Step::Down => Ok(()),
     }
@@ -2081,6 +2141,247 @@ impl Lane {
   }
 }
 
+/// One burst the burst step measured: its fleet's settlement after formation, the voters cut, and how long
+/// after the cut the survivors elected a leader, retired the cut voters, and resolved the burst — every
+/// neighbourhood settled, no retirement kept, one configuration version — with the council's commits and the
+/// survivors' elections it took.
+struct Burst {
+  trial: u64,
+  /// From the formed fleet to every neighbourhood settled, and the configuration version then.
+  settled: Duration,
+  settled_version: u64,
+  /// The pods cut, the council's leader first.
+  cut: Vec<String>,
+  /// From the cut to the first survivor leading, to the survivors holding each other alone as members, and to
+  /// the burst resolved.
+  led: Duration,
+  retired: Duration,
+  resolved: Duration,
+  /// The configuration version the burst resolved at; its commits are the difference from `settled_version`.
+  resolved_version: u64,
+  /// The survivors' elections begun between the cut and the resolution.
+  elections: u64,
+}
+
+impl Burst {
+  fn line(&self) -> String {
+    format!(
+      "burst trial {}: settled {:.1} s after formation at version {}; cut {:?}; led after {:.2} s, retired after \
+       {:.2} s, resolved after {:.2} s at version {} ({} commits); {} elections begun",
+      self.trial,
+      self.settled.as_secs_f64(),
+      self.settled_version,
+      self.cut,
+      self.led.as_secs_f64(),
+      self.retired.as_secs_f64(),
+      self.resolved.as_secs_f64(),
+      self.resolved_version,
+      self.resolved_version.saturating_sub(self.settled_version),
+      self.elections
+    )
+  }
+}
+
+impl Lane {
+  /// `burst`: the council under a burst of reconfiguration, `trials` times on a fresh fleet each (the module
+  /// doc; research record §3.5 and §3.6; §4.8 "Neighbourhood changes", "Promotion and takeover"). Each trial
+  /// installs [`BURST_REPLICAS`] under the `wan` profile, times the formed fleet to settled, cuts the council's
+  /// leader and [`BURST_CUT`]` − 1` more voters together, and times the survivors through the burst.
+  fn burst(&self, trials: u64) -> Result<(), Failure> {
+    let (profile, delay, jitter, loss) = NETEM_PROFILES
+      .first()
+      .copied()
+      .ok_or_else(|| Failure("kind: no WAN profile to burst under".to_owned()))?;
+    let shaping = Shaping::uniform(delay, jitter, loss);
+    let custom = self._scratch.path.join("cut.json");
+    write_scratch(&custom, CUT_CONTAINER.as_bytes())?;
+    let pods: Vec<String> = (0..BURST_REPLICAS).map(|index| self.pod(index)).collect();
+    let mut measured = Vec::new();
+    for trial in 0..trials {
+      let elapsed = self.fresh_install(BURST_REPLICAS, Some(&shaping))?;
+      eprintln!(
+        "kind: burst trial {trial}: {BURST_REPLICAS} replicas under `{profile}` installed in {:.1} s",
+        elapsed.as_secs_f64()
+      );
+      self.wait_formed(BURST_REPLICAS, "the burst fleet formed")?;
+      let (settled, took) = self.wait_views(
+        &pods,
+        BURST_SETTLE_WAIT,
+        "the burst fleet settled every neighbourhood",
+        |views| Self::settled_at(BURST_REPLICAS, views),
+      )?;
+      let settled: Vec<View> = settled.into_iter().flatten().collect();
+      let burst = self.cut_voters(trial, &settled, took, &custom)?;
+      eprintln!("kind: {}", burst.line());
+      measured.push(burst);
+    }
+    self.report_bursts(&measured)
+  }
+
+  /// The fleet of `n` pods has formed ([`Lane::formed_at`]) and settled: every neighbourhood settled, no
+  /// retirement kept, and every pod at one configuration version.
+  fn settled_at(n: u64, views: &[Option<View>]) -> bool {
+    let all: Vec<&View> = views.iter().flatten().collect();
+    let version = all.first().map(|view| view.configuration_version);
+    Self::formed_at(n, views)
+      && all.iter().all(|view| {
+        view.settled() && view.retirements == 0 && Some(view.configuration_version) == version
+      })
+  }
+
+  /// The pods a burst cuts from `settled`: the council's leader, then the next voters by descending ordinal
+  /// (the unshaped pods before the `wan`-shaped 0 and 1, so the burst takes the central voters first), to
+  /// [`BURST_CUT`] in all.
+  fn burst_victims(settled: &[View]) -> Result<Vec<String>, Failure> {
+    let leader = settled
+      .iter()
+      .find(|view| view.leads)
+      .ok_or_else(|| Failure("kind: a settled burst fleet reports no leader".to_owned()))?;
+    let mut others: Vec<&View> = settled
+      .iter()
+      .filter(|view| view.pod != leader.pod)
+      .collect();
+    others.sort_by_key(|view| std::cmp::Reverse(ordinal_of(&view.pod)));
+    let more = usize::try_from(BURST_CUT.saturating_sub(1)).unwrap_or(usize::MAX);
+    Ok(
+      std::iter::once(leader.pod.clone())
+        .chain(others.iter().take(more).map(|view| view.pod.clone()))
+        .collect(),
+    )
+  }
+
+  /// Polls `pods` until `reached` holds of their views, bounded by [`BURST_WAIT`] from `since`; returns their
+  /// views then and the instant it was seen (polled at [`POLL`], finer than [`Lane::wait_views`], since the
+  /// stages it times are seconds).
+  fn burst_stage(
+    &self,
+    pods: &[String],
+    since: Instant,
+    what: &str,
+    reached: impl Fn(&[Option<View>]) -> bool,
+  ) -> Result<(Vec<View>, Instant), Failure> {
+    loop {
+      let views = self.views(pods)?;
+      if reached(&views) {
+        return Ok((views.into_iter().flatten().collect(), Instant::now()));
+      }
+      if since.elapsed() > BURST_WAIT {
+        return Err(Failure(format!(
+          "kind: {what} did not happen within {BURST_WAIT:?} of the cut:{}",
+          self.fleet_diagnostics(pods)
+        )));
+      }
+      pause(POLL);
+    }
+  }
+
+  /// One burst: the victims of `settled` ([`Lane::burst_victims`]) are cut together, their egress dropped from
+  /// ephemeral `NET_ADMIN` containers, and the survivors are timed from the first cut — on the VM's clock, as
+  /// the succession step times its cut — to a leader, to holding each other alone, and to the burst resolved.
+  fn cut_voters(
+    &self,
+    trial: u64,
+    settled: &[View],
+    took: Duration,
+    custom: &Path,
+  ) -> Result<Burst, Failure> {
+    let cut = Self::burst_victims(settled)?;
+    let survivors: Vec<String> = settled
+      .iter()
+      .map(|view| view.pod.clone())
+      .filter(|pod| !cut.contains(pod))
+      .collect();
+    let remaining = count_pods(&survivors);
+    let elections_before: u64 = settled
+      .iter()
+      .filter(|view| survivors.contains(&view.pod))
+      .map(|view| view.elections)
+      .fold(0, u64::saturating_add);
+    let (anchor, anchor_uptime) = self.vm_clock()?;
+    let first = format!("burst-{trial}-0");
+    for (index, pod) in cut.iter().enumerate() {
+      self.in_pod_network(
+        pod,
+        &format!("burst-{trial}-{index}"),
+        custom,
+        "tc qdisc replace dev eth0 root netem loss 100% && cut -d' ' -f1 /proc/uptime",
+      )?;
+    }
+    let lost = cut
+      .first()
+      .ok_or_else(|| Failure("kind: a burst cut no pod".to_owned()))?;
+    let logged = self.kubectl(&["logs", lost, "-c", &first])?;
+    let offset = uptime_seconds(&logged.stdout)? - anchor_uptime;
+    if !(0.0..=BURST_WAIT.as_secs_f64()).contains(&offset) {
+      return Err(Failure(format!(
+        "kind: the cut in {lost} logged {} against the VM's {anchor_uptime} before it",
+        logged.stdout.trim()
+      )));
+    }
+    let cut_at = anchor + Duration::from_secs_f64(offset);
+    let (_, led_at) = self.burst_stage(&survivors, cut_at, "a survivor led", |views| {
+      views.iter().flatten().any(|view| view.leads)
+    })?;
+    let (_, retired_at) = self.burst_stage(
+      &survivors,
+      cut_at,
+      "the survivors retired the cut voters",
+      |views| Self::formed_at(remaining, views),
+    )?;
+    let (resolved, resolved_at) = self.burst_stage(
+      &survivors,
+      cut_at,
+      "the survivors resolved the burst",
+      |views| Self::settled_at(remaining, views),
+    )?;
+    let elections_after: u64 = resolved
+      .iter()
+      .map(|view| view.elections)
+      .fold(0, u64::saturating_add);
+    Ok(Burst {
+      trial,
+      settled: took,
+      settled_version: settled.first().map_or(0, |view| view.configuration_version),
+      cut,
+      led: led_at.saturating_duration_since(cut_at),
+      retired: retired_at.saturating_duration_since(cut_at),
+      resolved: resolved_at.saturating_duration_since(cut_at),
+      resolved_version: resolved
+        .first()
+        .map_or(0, |view| view.configuration_version),
+      elections: elections_after.saturating_sub(elections_before),
+    })
+  }
+
+  /// The run's record: every burst's line and each stage's median. Every trial either resolved within its
+  /// bounds or failed the run at the stage that did not.
+  fn report_bursts(&self, measured: &[Burst]) -> Result<(), Failure> {
+    let median = |stage: fn(&Burst) -> Duration| {
+      let mut seconds: Vec<f64> = measured
+        .iter()
+        .map(|burst| stage(burst).as_secs_f64())
+        .collect();
+      seconds.sort_by(f64::total_cmp);
+      seconds.get(seconds.len() / 2).copied().unwrap_or(0.0)
+    };
+    eprintln!(
+      "kind: burst: {} trials of {BURST_REPLICAS} replicas, {BURST_CUT} voters cut; medians: settled {:.1} s after \
+       formation, led {:.2} s, retired {:.2} s, resolved {:.2} s after the cut",
+      measured.len(),
+      median(|burst| burst.settled),
+      median(|burst| burst.led),
+      median(|burst| burst.retired),
+      median(|burst| burst.resolved)
+    );
+    Ok(())
+  }
+}
+
+/// A pod count as the fleet counts members.
+fn count_pods(pods: &[String]) -> u64 {
+  u64::try_from(pods.len()).unwrap_or(u64::MAX)
+}
+
 /// The first field of a `/proc/uptime` line: seconds since the VM booted.
 fn uptime_seconds(line: &str) -> Result<f64, Failure> {
   line
@@ -2092,7 +2393,7 @@ fn uptime_seconds(line: &str) -> Result<f64, Failure> {
 
 #[cfg(test)]
 mod tests {
-  use super::{CampaignCounters, LinkCounters, View};
+  use super::{BURST_CUT, CampaignCounters, Lane, LinkCounters, View};
 
   /// A `slates status --json` document with the fleet block the lane reads and one shard's refusals.
   fn status_with_refusals(refusals: &[(&str, u64)]) -> serde_json::Value {
@@ -2187,5 +2488,89 @@ mod tests {
         late_grants: 7,
       }
     );
+  }
+  /// A status document for pod `pod` of a formed five-member fleet at configuration `version`, whose
+  /// neighbourhood was settled at `settled` and fixed at `current`, keeping `retirements` retirements.
+  fn settlement_status(
+    host: u64,
+    leads: bool,
+    version: u64,
+    (settled, current): (u64, u64),
+    retirements: usize,
+  ) -> serde_json::Value {
+    let kept: Vec<serde_json::Value> = (0..retirements)
+      .map(|_| serde_json::json!({ "host": 9, "version": version }))
+      .collect();
+    serde_json::json!({
+      "fleet": {
+        "host": host,
+        "f": 2,
+        "members": [1, 2, 3, 4, 5],
+        "peers_probed": 4,
+        "configuration_version": version,
+        "council": { "leads": leads },
+        "takeover": {
+          "settled_generation": settled,
+          "neighbourhood_generation": current,
+          "retirements": kept,
+        },
+      },
+      "shards": [],
+    })
+  }
+
+  /// docs/wip/kind-lane.md "Piece 7": a view reads the settlement the burst step waits on — the
+  /// configuration version, both neighbourhood versions and the retirements kept — and a fleet counts as
+  /// settled only when every pod is formed, settled, keeps no retirement and stands at one version.
+  #[test]
+  fn a_burst_waits_for_every_neighbourhood_settled_at_one_version() {
+    let views = |statuses: Vec<serde_json::Value>| -> Vec<Option<View>> {
+      statuses
+        .iter()
+        .enumerate()
+        .map(|(ordinal, status)| View::parse(&format!("slates-{ordinal}"), status).ok())
+        .collect()
+    };
+    let settled = |version: u64, second: (u64, u64), retirements: usize| {
+      let mut statuses: Vec<serde_json::Value> = (1..=5u64)
+        .map(|host| settlement_status(host, host == 3, 9, (6, 6), 0))
+        .collect();
+      if let Some(status) = statuses.get_mut(1) {
+        *status = settlement_status(2, false, version, second, retirements);
+      }
+      views(statuses)
+    };
+    assert!(Lane::settled_at(5, &settled(9, (6, 6), 0)));
+    assert!(
+      !Lane::settled_at(5, &settled(9, (4, 6), 0)),
+      "a neighbourhood change in flight"
+    );
+    assert!(
+      !Lane::settled_at(5, &settled(9, (6, 6), 1)),
+      "a retirement kept"
+    );
+    assert!(
+      !Lane::settled_at(5, &settled(8, (6, 6), 0)),
+      "a pod a version behind"
+    );
+  }
+
+  /// docs/wip/kind-lane.md "Piece 7": a burst cuts the council's leader, then the central voters before the
+  /// `wan`-shaped pods 0 and 1, to `f` of the five in all.
+  #[test]
+  fn a_burst_cuts_the_leader_then_the_central_voters() {
+    let settled: Vec<View> = (0..5u64)
+      .filter_map(|ordinal| {
+        View::parse(
+          &format!("slates-{ordinal}"),
+          &settlement_status(ordinal, ordinal == 2, 9, (6, 6), 0),
+        )
+        .ok()
+      })
+      .collect();
+    let cut = Lane::burst_victims(&settled).expect("a leader to cut");
+    assert_eq!(usize::try_from(BURST_CUT).ok(), Some(cut.len()));
+    assert_eq!(cut.first().map(String::as_str), Some("slates-2"));
+    assert_eq!(cut.get(1).map(String::as_str), Some("slates-4"));
   }
 }

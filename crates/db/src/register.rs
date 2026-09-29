@@ -1692,6 +1692,41 @@ pub struct Configuration {
   /// council settles the current one, and a takeover recovers through this one. `None` once its current
   /// neighbourhood is settled — always on a laptop.
   pub settled: Option<Settled>,
+  /// The configuration version this owner's current neighbourhood was fixed at ([`Neighbourhood::generation`]):
+  /// with the settled neighbourhood's, the owner's authority standing ([`Configuration::standing`]).
+  pub generation: u64,
+}
+
+/// An owner's **authority standing** as its installed configuration fixes it (§4.8 "Leases and reads": "a
+/// majority observation must belong to the relevant authority generation"): the versions its settled and its
+/// current neighbourhoods were fixed at. A takeover of the owner recovers through its settled neighbourhood
+/// ([`Retirement::settled`]), and that is either the one this owner holds settled or — once the council takes
+/// the owner's report — its current one. So a holder's view belongs to the owner's authority generation when
+/// its configuration fixes the owner's settled neighbourhood at either version; every other configuration
+/// change — another host's admission, settlement, retirement, a confirmed takeover — leaves it as it was.
+/// Equal on a settled owner; zero on a laptop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Standing {
+  /// The version the owner's settled neighbourhood was fixed at.
+  pub settled: u64,
+  /// The version the owner's current neighbourhood was fixed at: its settled one once the council takes the
+  /// owner's report, never older than `settled`.
+  pub current: u64,
+}
+
+impl Standing {
+  /// Whether a holder whose configuration fixes this owner's settled neighbourhood at `generation` sees the
+  /// owner under this standing: its settled neighbourhood, or its current one the council has settled since.
+  pub fn recognizes(self, generation: u64) -> bool {
+    generation == self.settled || generation == self.current
+  }
+
+  /// Whether a holder's settled generation for this owner is one this standing cannot account for: newer than
+  /// the owner's current neighbourhood, so the owner's authority changed in a configuration it has not
+  /// installed (its id retired and admitted again).
+  pub fn superseded_by(self, generation: u64) -> bool {
+    generation > self.current
+  }
 }
 
 impl Configuration {
@@ -1708,6 +1743,7 @@ impl Configuration {
       quorum: Quorum { f: 0 },
       has_mirror: false,
       settled: None,
+      generation: 0,
     }
   }
 
@@ -1725,8 +1761,8 @@ impl Configuration {
   /// The placement a **record** of `object` takes when the owner first holds it (`Placement::local`): its
   /// cohort in the current neighbourhood — and, while a change is in flight and moved this object's cohort,
   /// the settled cohort too, joined (§4.8 "joint writes"): the record goes to both and commits at `f + 1` of
-  /// each, so every record the owner commits stays at `f + 1` of the cohort a takeover recovers through
-  /// ([`recovery_cohort`](Configuration::recovery_cohort)).
+  /// each, so every record the owner commits stays at `f + 1` of the cohort a takeover recovers through (the
+  /// settled one, or the current one once the council settles it: [`lease_cohorts`](Configuration::lease_cohorts)).
   pub fn place(&self, object: ObjectId) -> Placement {
     let mut placement = self.place_content(object);
     if let Some(settled) = &self.settled {
@@ -1767,19 +1803,42 @@ impl Configuration {
     )
   }
 
-  /// The cohort a takeover of this owner would recover `object` through: the settled cohort while a change is
-  /// in flight, else the current one. Every record the owner commits is at `f + 1` of it, so the owner lease
-  /// counts confirmations over it (the successor's promotion quorum is drawn from it).
-  pub fn recovery_cohort(&self, object: ObjectId) -> Vec<HostId> {
-    match &self.settled {
-      Some(settled) => settled.cohort(self.owner, object, self.quorum),
-      None => candidates_for(
-        self.owner,
-        &self.neighbourhood,
-        &self.domains,
-        object,
-        self.quorum,
-      ),
+  /// The cohorts this owner's lease over `object` must hold confirmations in (§4.8 "Leases and reads"): the
+  /// one a takeover recovers `object` through — the settled cohort — and, while a change is in flight that
+  /// moved `object`'s cohort, the current one too, since the council may settle it at any moment and a
+  /// retirement after that recovers through it. The joint lease mirrors the joint writes
+  /// ([`place`](Configuration::place)): counting only the settled cohort let an owner cut off with holders
+  /// that had not yet learned its settlement keep its lease while a successor recovered through the new cohort.
+  /// One cohort outside a change, or when the change left `object`'s cohort as it was.
+  pub fn lease_cohorts(&self, object: ObjectId) -> Vec<Vec<HostId>> {
+    let placement = self.place(object);
+    if placement.joint.is_empty() {
+      vec![placement.candidates]
+    } else {
+      placement.joint
+    }
+  }
+
+  /// Whether `host` is in this owner's neighbourhood for placement: its current one, or — while a change is in
+  /// flight — its settled one, which its joint writes still reach ([`place`](Configuration::place)) and its
+  /// joint lease still counts ([`lease_cohorts`](Configuration::lease_cohorts)).
+  pub fn neighbours(&self, host: HostId) -> bool {
+    self.neighbourhood.contains(&host)
+      || self
+        .settled
+        .as_ref()
+        .is_some_and(|settled| settled.hosts.contains(&host))
+  }
+
+  /// This owner's authority standing ([`Standing`]): the versions its settled and its current neighbourhoods
+  /// were fixed at.
+  pub fn standing(&self) -> Standing {
+    Standing {
+      settled: self
+        .settled
+        .as_ref()
+        .map_or(self.generation, |settled| settled.generation),
+      current: self.generation,
     }
   }
 
@@ -2044,7 +2103,17 @@ impl RegionalConfiguration {
         .get(&owner)
         .filter(|settled| settled.generation != neighbourhood.generation)
         .cloned(),
+      generation: neighbourhood.generation,
     })
+  }
+
+  /// The version this configuration fixed `host`'s settled neighbourhood at — its authority generation as a
+  /// holder sees it ([`Standing`]) — or `None` when `host` is no member (not yet admitted here, or retired).
+  pub fn standing_of(&self, host: HostId) -> Option<u64> {
+    if !self.members.contains(&host) {
+      return None;
+    }
+    self.settled.get(&host).map(|settled| settled.generation)
   }
 
   /// Admits `member` to the region (a join the council agrees on) with the failure `domain` its node
@@ -2623,6 +2692,7 @@ mod tests {
       quorum: Quorum { f: 1 },
       has_mirror: false,
       settled: None,
+      generation: 0,
     };
     for object in 0..64u64 {
       let laptop_place = write(&laptop, object, FIRST_EPOCH);
@@ -3170,6 +3240,7 @@ mod tests {
       quorum: Quorum { f: 1 },
       has_mirror: false,
       settled: None,
+      generation: 0,
     };
     assert_eq!(
       floor.copyset_count(),
@@ -3226,6 +3297,7 @@ mod tests {
         quorum,
         has_mirror: false,
         settled: None,
+        generation: 0,
       };
       assert!(configuration.within_loss_bound(0.0, 0));
       assert!(!configuration.within_loss_bound(0.0, 1));
@@ -3719,9 +3791,15 @@ mod tests {
       "f + 1 of each commits"
     );
     assert_eq!(
-      configuration.recovery_cohort(object),
-      old,
-      "a takeover recovers through the settled cohort"
+      configuration.lease_cohorts(object),
+      vec![old, new],
+      "the lease holds in both cohorts: a takeover recovers through the settled one, or through the current \
+       one once the council settles it"
+    );
+    let standing = configuration.standing();
+    assert!(
+      standing.settled < standing.current,
+      "a change in flight: the settled neighbourhood is the older"
     );
   }
 
@@ -3746,7 +3824,18 @@ mod tests {
       "a settled neighbourhood carries no second cohort"
     );
     assert!(settled.place(object).joint.is_empty());
-    assert_eq!(settled.recovery_cohort(object), new);
+    assert_eq!(settled.lease_cohorts(object), vec![new]);
+    assert_eq!(
+      settled.standing().settled,
+      configuration.standing().current,
+      "the settled neighbourhood is the one the owner reported"
+    );
+    assert!(
+      configuration
+        .standing()
+        .recognizes(settled.standing().settled),
+      "a holder that installed the settlement is recognized by the owner that reported it"
+    );
   }
 
   /// A retired host's successor for `object` in `regional`, which must exist.

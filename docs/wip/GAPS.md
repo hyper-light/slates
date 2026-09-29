@@ -1916,6 +1916,47 @@ Built last: the takeover itself (step 3 of 3), replacing the per-object path.
 configuration version (`fleet_held_records`, `fleet_takeovers_pending`, `fleet_configuration_version`), so a
 stalled takeover shows in any node's status.
 
+### 2026-09-29: the owner lease was voided by other hosts' configuration changes — fixed; the lease counted the settled cohort only — fixed; settled-neighbourhood hosts left direct contact — fixed
+
+The open lease refusals below had one cause:
+- in a Linux io_uring loop, every NFS-takeover failure that printed its node's counts (4 of 4) was
+  `lease.refused.superseded`;
+- one location failure reached the successor and was refused `LeaseUnconfirmed { version: 11 }`.
+
+The lease was keyed to the regional version, which every admission, retirement, `Settle` and `Confirm` in the
+region advances. After a takeover several such changes follow within a few periods, and each voided every
+owner's lease until it installed it.
+- **Keyed to the owner's standing.** An owner's standing is the version its settled neighbourhood (the set a
+  takeover recovers through) was fixed at, with its current one's. A holder's acknowledgement carries its view
+  of the prober's standing. The owner is superseded only by its own retirement or its id's re-admission.
+- **Found by the analysis — a safety gap.** The lease counted the settled cohort only while the writes were
+  joint. An owner cut off with holders that had not learned its settlement kept its lease on their answers,
+  while a successor recovered through the new cohort. The lease is now joint, as the writes are.
+- **A retired candidate is not waited for**: it cannot promise.
+- **Found with it.** Direct contact dropped the settled neighbourhood's hosts once a change moved them out,
+  though the joint writes and the joint lease need them. It keeps them now.
+- **Tests.** Failing test first for the direct contact. The lease tests were rewritten for the new rules, and
+  the intersection oracle now covers every set of live candidates. Fleet suite 59/59 (257.2 s, macOS).
+- **Measured in Linux under io_uring.** The NFS takeover test and the location test alternated, 40 rounds.
+  - Before: the NFS test failed 5 of 17 rounds and the location test 4 of 17.
+  - With this fix and the location fixes below: 0 of 40 for each. At the earlier rates, 40 clean rounds
+    would happen by chance about once in a million for the NFS test.
+[Bug record](../bugs/2026-09-29-the-owner-lease-was-voided-by-other-hosts-configuration-changes.md).
+
+**Fixed — the location round refused the one owner it could find (`HomedElsewhere`).** The asker now counts
+what each reply did. Two Linux io_uring failures then showed the cause: the successor refused
+`placement_behind`, and its placement was still a version behind its council after the round (7 against 8).
+- A node now claims under its council's own membership. Ownership moves only when the owner is retired, so
+  the placement's install lag cannot make a claim false.
+- A peer that is not the owner no longer takes a claim away: only claims compete, the newest winning.
+  Otherwise another survivor's unrelated settlement, installed a moment earlier, discarded the successor's
+  claim.
+- Both are failing tests first. §4.8 "Owner location" carries the status.
+- Sibling (open, for Ada): each coordinator period installs the council's configuration once, before the
+  record plane and the takeover rounds, so after a takeover the placement lags its council for most of a
+  long period. Every reader that compares the two waits for it: a takeover round (`begin_round`) and the
+  settlement report.
+
 ### 2026-09-29: a formation cohort lost a record its survivor held — fixed; readiness asked a cohort that could not answer — fixed; lease refusals on CI — open
 
 A Linux io_uring loop of the three-process CLI test failed once in 118 runs. Both survivors held the dead
@@ -2764,3 +2805,35 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 - **Open: the thin-link tail** (Copa's standing queue on thin lossless links). The same prototype halved
   the 64 kbit/s, 20 ms steady p99.
 
+
+### 2026-09-29: comprehensive product, safety and global-scale audit
+
+The [dated audit](../audit/2026-09-29_audit.md) records 32 open findings against
+ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently changing working tree.
+It is a review, not an implementation change or acceptance closure. It preserves the
+existing gap classifications and historical measurements rather than treating them as
+current-tree passes.
+
+| Audit findings | Open contract |
+|---|---|
+| AUD-29-01–07 | Grants must bind the target identity, volume, consumer and chosen state at use; landing must preserve outsider replacements, serialize the target across shards, report real durability and retain bounded, consistent plan/grant state (§4.13, §4.15, R1/R10). |
+| AUD-29-08–12 | Safe runtime references must not outlive reclaimed contexts; shared atomic/plain-byte access must enforce its invariant; allocator frees and every handle representation must reject invalid or exhausted identities; runtime startup/drop must own all workers (§4.2–§4.3). |
+| AUD-29-13–16 | Archive decoding/restoration must be admitted and canonical, honor checked file offsets and refuse ambiguous names; rename must validate lazy base-directory emptiness (§4.5, §4.9, §4.11). |
+| AUD-29-17–18 | Takeover must preserve full volume policy/access and recovery must refuse a corrupt or shortened acknowledged green (§4.8, §4.10, §4.16). |
+| AUD-29-19–24 | SDK admission and completion must remain async, bounded and terminal under cancellation/channel loss; request ids must never wrap into old completions; MCP input and HTTP caller authority must be bounded and verified (§4.7, §4.9, §4.12–§4.13). |
+| AUD-29-25–30 | Landing and bulk work must not starve owner/control progress; Raft term exhaustion must refuse; packet numbers must not repeat; configuration fan-out and consensus retention need admitted, measured costs (§4.3, §4.8–§4.10a, §4.15). |
+| AUD-29-31–32 | Structural enforcement must substantiate its stated syscall-boundary claim; capabilities, ratchets, cadence and platform evidence must describe what is actually enforced (R1–R5, R8/R9, Part 6). |
+
+Bounded source-inclusion probes on Darwin arm64, rustc 1.98.0 (2026-09-29), reproduced
+invalid buddy free/accounting, stale slab-handle revival, oversized allocation panic,
+two Raft leaders in the same maximal term, manifest trailing/component acceptance,
+ignored restore offsets and request-sequence exhaustion. The audit records the commands
+and fixture limits. Format passed; an archive Cargo test was stopped at another build's
+directory lock before tests ran. No full-suite, Miri, live-mount or WAN pass is claimed.
+
+The dedicated Raft assessment distinguishes implemented PreVote, CheckQuorum, joint
+membership, learners, ReadIndex, compaction, priority transfer and replication windows
+from the remaining live scheduling/session/retention evidence. It retains the existing
+measured decisions on one leader-origin log and fast-track enablement. No item above is
+closed until a failing behavioral test, design-consistent correction, sibling sweep and
+the applicable acceptance evidence land.
