@@ -223,3 +223,17 @@ Rejected variants stay on record with their numbers (`docs/wip/BENCHMARKS.md`).
     0.106 / 0.125 s after the signal, the daemon exiting 0 each time, against a 1 s election timeout.
   - Measured-and-open: the drain is three drive-loop periods; waking the loop on an invitation (instead of
     the next tick) would cut it toward round trips — to be measured before it is built.
+- **Slice 4 (2026-09-28): the timed simulation and the pre-vote audit** — `crates/cluster/tests/support/timed.rs`
+  models real `RaftNode`s and the real `ElectionTimer` on a virtual clock: per-pair latency, jitter and loss,
+  partitions and crashes as windows, the council's drive (heartbeat periods, pre-vote, CheckQuorum on the leader's
+  cadence, the new leader's no-op, invitations), the SWIM probe's round trips feeding each node's path estimate
+  (without them a follower derived its timing from one or two startup samples — a tail three times the true
+  round trip — and waited 5.9 s instead of 2.2), and a steady proposal stream whose longest gap between commits
+  is the unavailability. The audit (`tests/prevote.rs`, twenty seeds, a 0.25 ms cluster and an 80 ms ± 20 ms
+  multi-region profile):
+  - an isolated follower rejoins without deposing the leader and without moving the term, on every seed and
+    both profiles; the direct-election control deposes the leader on every seed after inflating the term by
+    22 (cluster) or 12–14 (multi-region);
+  - an isolated leader is succeeded (cluster 1.4–1.6 s; multi-region 3.0–3.6 s) and its return deposes nobody;
+  - it found a liveness bug in the production timer: correlated jitter split the vote for up to 19 s (bug record
+    `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`); fixed by an independent draw.

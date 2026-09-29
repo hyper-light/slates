@@ -1804,7 +1804,34 @@ council's voters within 30 s. Not reproduced here: 4 of 4 full local suites, the
 copies and 24 of 24 under twelve (about two daemons per core), each copy finishing in 12–14 s. The sampled
 earlier failed CI runs show no failure of this test. The assertion now prints every survivor's consensus state
 (leadership, committed voters, the council's log and commit indexes, members held alive, refusal counters), so
-the next occurrence names its cause; no cause is claimed until one does.
+the next occurrence names its cause; no cause is claimed until one does. A candidate found since: the election
+jitter kept two congruent survivors in lockstep (split votes every round; fixed below), and a warm restart resets
+both timers — unconfirmed until a failure's dump shows the lockstep.
+
+
+### 2026-09-28: open — the consensus groups' logs are never compacted, and an append carries the whole lag
+
+Found while designing learner catch-up (`docs/wip/research/consensus-enhancements.md` §3.3). The council and
+root group never call the core's `compact` ("These group wrappers never compact their logs",
+`config_group.rs`/`root_group.rs`): every election's no-op, membership change, takeover and voter change stays
+in the log for the fleet's life. The retained publication (`SavedRaft`, the whole log) is re-encoded at every
+term, vote or append, and `replicate_to` sends a follower every entry from its `next_index` in one
+`AppendEntries`, so elections, retention and catch-up slow linearly with the fleet's age. The consensus region
+(two log budgets and a snapshot budget, about 360 MB at the KIND geometry) holds millions of tens-of-bytes
+entries, so the eventual `ConsensusCapacity` refusal — which stops the control shard — is far off, but it is
+unbounded growth (banned item 8) with a guaranteed end. Owed, in order:
+- bounded `AppendEntries` batches, the bound derived from the fleet frame;
+- compaction in both groups, the snapshot carrying the folded configuration (so install-snapshot rebuilds the
+  same state), triggered by a derived committed-entry budget;
+- then learner catch-up rounds over it.
+
+
+### 2026-09-28: correlated election jitter livelocked a split vote — fixed
+
+The pre-vote audit on the timed simulation found survivors of a leader loss splitting the vote for up to 19 s
+on the multi-region profile: the timer's `(id + attempt) mod span` draw keeps two congruent nodes congruent
+forever. The draw is now an independent splitmix64 mix of id and attempt; a successor is elected in 3.0–3.6 s
+(one seed 8.3 s). [Bug record](../bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md).
 
 
 ### 2026-09-28: consensus enhancements — explorer and leadership transfer built

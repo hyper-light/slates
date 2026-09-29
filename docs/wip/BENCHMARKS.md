@@ -672,3 +672,16 @@ and `SLATES_TEST_CLI=1 cargo test -p slates-cli --test cli a_terminated_council_
 
 Before the drain the anchor killed the daemon at once, so the survivors waited out the 1 s election timeout
 before campaigning (the leader-loss elections above: median 1.316 s).
+
+### The pre-vote audit on the timed simulation (2026-09-28)
+
+**Command:** `cargo test -p slates-cluster --release --test prevote -- --nocapture` (virtual time; twenty seeds;
+three voters; heartbeat 100 ms; election timing derived from the modelled round trips).
+
+| scenario | cluster (0.25 ms one way) | multi-region (80 ± 20 ms one way) |
+|---|---|---|
+| isolated follower, pre-vote: leader changes on the heal / term inflation | 0 / 0 (every seed) | 0 / 0 (every seed) |
+| isolated follower, direct control: leader changes / term inflation | 1 / 22 (every seed) | 1 / 12–14 (every seed) |
+| isolated follower, pre-vote: longest commit gap | 100 ms (the proposal cadence) | 168–284 ms |
+| isolated leader: successor elected after | 1.42–1.59 s | 3.0–3.6 s (one seed 8.3 s) |
+| isolated leader, before the jitter fix | — | 3.0–3.4 s typically; 12.0, 19.3 and 19.9 s on three seeds |

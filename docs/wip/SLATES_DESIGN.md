@@ -2862,6 +2862,14 @@ SWIM period = max(k × RTT p99, scheduler quantum); gossip λ from measured conv
 tombstone retention = measured partition-heal p99; mirror shipping batch from the measured WAN
 bandwidth-delay product.
 
+> **Election jitter is an independent draw per attempt (2026-09-28).** Each follower's timeout is
+> `base + (splitmix64(id ^ attempt·γ) mod span)` periods — deterministic, but independent across nodes and
+> across attempts, as Raft's randomized timeout is (§5.2, §9.3). The previous `(id + attempt) mod span` kept
+> two congruent nodes congruent forever (both attempts advance together), so two survivors of a leader loss
+> could split the vote every round: 19 s on the multi-region simulation until the cut healed, never with a
+> permanent loss. Now a successor is elected within 3.0–3.6 s there (one seed 8.3 s, one collision round).
+> Record: `docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`.
+
 > **Collection boundary correction (2026-09-20, AC-8.12).** A collector drains replies
 > before judging its deadline; after a polling sleep it always returns to the receive
 > loop. Judging with the pre-sleep count discarded healthy replies already queued and

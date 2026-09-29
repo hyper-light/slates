@@ -169,15 +169,41 @@ impl ElectionTiming {
     }
   }
 
-  /// This node's own timeout in periods for its `attempt`-th campaign: `base + ((local + attempt) mod
-  /// span)` — a deterministic per-node offset in `[0, span)`, the simulator-reproducible analogue of Raft's
-  /// randomized election timeout (§9.3), rotating each attempt so two ids that collide modulo the span
-  /// break their tie within a few attempts rather than by luck.
+  /// This node's own timeout in periods for its `attempt`-th campaign: `base + (draw mod span)`, the draw a
+  /// splitmix64 mix of the id and the attempt — deterministic, so a simulation reproduces from its seed, yet
+  /// independent across nodes and across attempts, as Raft's randomized election timeout is (§5.2, §9.3). Two
+  /// nodes that draw the same offset on one attempt draw independently on the next, so a collision — both
+  /// timing out together, granting each other's pre-vote, and splitting the vote — repeats with probability
+  /// about `1/span` per round.
+  ///
+  /// Until 2026-09-28 the draw was `(local + attempt) mod span`. Every campaign advances both nodes' attempts
+  /// together, and a shared increment preserves the difference, so two nodes whose sums were congruent stayed
+  /// congruent forever: the survivors of a leader loss split the vote round after round — 19 s on the
+  /// multi-region simulation until the cut healed; a permanent loss would never have elected
+  /// (`docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`).
   pub fn timeout_periods(&self, local: HostId, attempt: u32) -> u32 {
     let span = u64::from(self.span_periods.max(1));
-    let jitter = u32::try_from(local.0.wrapping_add(u64::from(attempt)) % span).unwrap_or(0);
+    let draw = splitmix64(local.0 ^ u64::from(attempt).wrapping_mul(GOLDEN_GAMMA));
+    let jitter = u32::try_from(draw % span).unwrap_or(0);
     self.base_periods.saturating_add(jitter)
   }
+}
+
+/// Format: splitmix64's increment, the odd integer nearest 2^64/φ (Steele, Lea & Flood, *Fast splittable
+/// pseudorandom number generators*, OOPSLA 2014) — here it spreads consecutive attempts across the draw.
+const GOLDEN_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
+/// Format: splitmix64's first finalizer multiplier (Steele, Lea & Flood 2014).
+const MIX_ONE: u64 = 0xbf58_476d_1ce4_e5b9;
+/// Format: splitmix64's second finalizer multiplier (Steele, Lea & Flood 2014).
+const MIX_TWO: u64 = 0x94d0_49bb_1331_11eb;
+
+/// splitmix64's finalizer: a bijective mix of `word` whose outputs are statistically independent across
+/// nearby inputs.
+fn splitmix64(word: u64) -> u64 {
+  let mut z = word.wrapping_add(GOLDEN_GAMMA);
+  z = (z ^ (z >> 30)).wrapping_mul(MIX_ONE);
+  z = (z ^ (z >> 27)).wrapping_mul(MIX_TWO);
+  z ^ (z >> 31)
 }
 
 /// `span_ns` in whole periods of `heartbeat_ns`, rounded up, at least one; saturating.
@@ -437,34 +463,41 @@ mod tests {
     (0..periods).all(|_| !timer.follower_period(contact, timing, local))
   }
 
-  /// A follower campaigns once it has aged past its jittered timeout with no leader contact — host 3 at
-  /// the floor waits 10 + 3 periods, the deterministic per-node offset — and the campaign rotates its
-  /// attempt.
+  /// A follower campaigns once it has aged past its jittered timeout with no leader contact — the base and
+  /// its per-attempt draw in `[0, span)` — and the campaign advances its attempt.
   #[test]
   fn a_follower_campaigns_after_its_jittered_timeout() {
     let timing = ElectionTiming::floor();
     let local = HostId(3);
+    let timeout = timing.timeout_periods(local, 0);
+    assert!(timeout >= timing.base_periods && timeout < timing.base_periods + timing.span_periods);
     let mut timer = ElectionTimer::new();
     assert!(
-      ages_without_firing(&mut timer, 0, &timing, local, 12),
-      "twelve periods are inside the timeout"
+      ages_without_firing(&mut timer, 0, &timing, local, timeout - 1),
+      "inside the timeout nothing fires"
     );
     assert!(
       timer.follower_period(0, &timing, local),
-      "period 13 fires: 10 + 3"
+      "the timeout's own period fires"
     );
     assert_eq!(timer.attempts(), 1);
   }
 
-  /// Any advance of the leader-contact count resets a follower's age (Raft Figure 2's timer resets), and
-  /// after a campaign the rotated attempt makes the next timeout one period longer, so two colliding
-  /// followers drift apart.
+  /// Any advance of the leader-contact count resets a follower's age (Raft Figure 2's timer resets), and the
+  /// next campaign waits the next attempt's timeout.
   #[test]
-  fn contact_resets_the_follower_and_the_attempt_rotates_its_jitter() {
+  fn contact_resets_the_follower_and_the_next_attempt_draws_afresh() {
     let timing = ElectionTiming::floor();
     let local = HostId(3);
     let mut timer = ElectionTimer::new();
-    assert!(ages_without_firing(&mut timer, 0, &timing, local, 12));
+    let first = timing.timeout_periods(local, 0);
+    assert!(ages_without_firing(
+      &mut timer,
+      0,
+      &timing,
+      local,
+      first - 1
+    ));
     assert!(
       timer.follower_period(0, &timing, local),
       "the first campaign"
@@ -475,11 +508,60 @@ mod tests {
       "contact advanced: reset"
     );
     assert_eq!(timer.idle_periods(), 0);
-    // The rotated attempt: 10 + ((3 + 1) mod 10) = 14 periods now.
-    assert!(ages_without_firing(&mut timer, 1, &timing, local, 13));
+    let second = timing.timeout_periods(local, 1);
+    assert!(ages_without_firing(
+      &mut timer,
+      1,
+      &timing,
+      local,
+      second - 1
+    ));
     assert!(
       timer.follower_period(1, &timing, local),
-      "period 14 fires on the second attempt"
+      "the second attempt's timeout fires"
+    );
+  }
+
+  /// Raft §5.2 / §9.3 (`docs/bugs/2026-09-28-correlated-election-jitter-livelocked-a-split-vote.md`): two
+  /// nodes' draws are independent across attempts they take together, so a collision does not persist. Over
+  /// every pair of 32 ids (small and hashed) and every attempt offset between them (4,960 trials of 64 shared
+  /// attempts), independent draws collide about once in `span` (ten at the floor): the mean is 6.4 per 64,
+  /// and the largest of 4,960 binomial draws reaches 24 with probability 2.2 × 10⁻⁵ (measured 17, which a fair
+  /// draw's maximum reaches with probability 0.49). The draw it replaced, `(id + attempt) mod span`, kept a
+  /// colliding pair colliding on all 64.
+  #[test]
+  fn two_nodes_draws_stay_independent_across_shared_attempts() {
+    let timing = ElectionTiming::floor();
+    let ids: Vec<HostId> = (1..=16)
+      .map(HostId)
+      .chain((1..=16).map(|seed: u64| HostId(seed.wrapping_mul(0x2545_f491_4f6c_dd1d))))
+      .collect();
+    let mut worst = 0;
+    let mut total = 0;
+    let mut trials = 0;
+    for (index, left) in ids.iter().enumerate() {
+      for right in ids.iter().skip(index + 1) {
+        for offset in 0..timing.span_periods {
+          let collisions = (0..64u32)
+            .filter(|attempt| {
+              timing.timeout_periods(*left, *attempt)
+                == timing.timeout_periods(*right, attempt + offset)
+            })
+            .count();
+          worst = worst.max(collisions);
+          total += collisions;
+          trials += 1;
+        }
+      }
+    }
+    assert!(
+      worst < 24,
+      "a pair collided on {worst} of 64 shared attempts"
+    );
+    let mean_tenths = total * 10 / trials;
+    assert!(
+      (54..=74).contains(&mean_tenths),
+      "collisions average {mean_tenths} tenths per 64 attempts, not about 64 in 10"
     );
   }
 
