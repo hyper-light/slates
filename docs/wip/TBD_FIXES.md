@@ -34,6 +34,15 @@ authorized merely by appearing here.
   the kqueue base watcher never delivered a hint
   (`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`), and the removal
   oracle held only on tmpfs (`docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
+- [ ] **Run 36669682141, macOS: a SIGTERMed council leader's survivors elected nobody for 40 s (open, not
+  reproduced).** `a_terminated_council_leader_process_hands_off_before_it_exits`: the leader's drain ended
+  `SteppedDown` after 2.1 s, its invited target never took office, and neither survivor (two of three voters)
+  led within 40 s against a 1 s election timeout. The pure core cannot hold two live voters back: pre-vote,
+  vote and priority yields are all bounded (a yielding follower campaigns after at most rank + 1 timeouts), so
+  the suspect is the survivors reaching each other — unconfirmed. The failure carried no survivor-side state;
+  the test now prints each survivor's `status` (term, lease, elections, pre-votes by refusal reason, voters)
+  before it fails. Not reproduced: 8 single runs and 18 runs six at a time (≈3 vCPU each) on macOS, every
+  one handing off in 200–320 ms. Owed: the next failure's survivor status, then the fix.
 - [ ] **Linux container, 2026-09-30: `snapshot_landing` failed once (open, not reproduced).** The granted
   landing at `crates/server/tests/snapshot_landing.rs:56` returned something other than `Landed`, after
   26.23 s against a normal 0.4–0.9 s. It ran as the last of four server test binaries in one cargo

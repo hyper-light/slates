@@ -2806,6 +2806,15 @@ fn a_terminated_council_leader_process_hands_off_before_it_exits() {
   eprintln!(
     "drain by SIGTERM: a survivor led after {handoff:?} (election timeout {timeout:?}); exit {exit:?}"
   );
+  if handed.len() != 1 {
+    // The evidence a stalled succession needs (CI run 36669682141 had none): each survivor's own view of
+    // the council — term, lease, pre-elections and elections begun, pre-votes by refusal reason, voters —
+    // and its links, printed before the assertion fails.
+    for survivor in &survivors {
+      let (code, status, stderr) = run(survivor, &["status"]);
+      eprintln!("survivor {survivor} status (exit {code}):\n{status}{stderr}");
+    }
+  }
   assert_eq!(handed.len(), 1, "a survivor leads after the drain");
   assert!(
     handoff < timeout,
