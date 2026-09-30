@@ -115,6 +115,32 @@ pub struct SimHost {
   armed: Vec<(u64, Interference)>,
   /// What each armed edit did, in the order they fired.
   interfered: Vec<Interfered>,
+  /// Failures a test armed ([`SimHost::fail`]). A test arms a handful.
+  faults: Vec<Fault>,
+}
+
+/// A seam verb a test can make fail ([`SimHost::fail`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimVerb {
+  /// `open_dir`, by the opened directory's path.
+  OpenDir,
+  /// `sync_dir`, by the directory's path.
+  SyncDir,
+  /// `sync_media`, by the directory's path.
+  SyncMedia,
+  /// `sync_file`, by no path (every file matches an empty prefix).
+  SyncFile,
+  /// `unlink`, by the entry's path.
+  Unlink,
+}
+
+/// An armed failure: the next `times` calls of `verb` whose path starts with `prefix` answer `error`.
+#[derive(Clone, Debug)]
+struct Fault {
+  verb: SimVerb,
+  prefix: String,
+  error: HostError,
+  times: u32,
 }
 
 /// What an armed outsider edit did when it fired: the inode it created and the one it displaced from its
@@ -180,6 +206,7 @@ impl SimHost {
       calls: 0,
       armed: Vec::new(),
       interfered: Vec::new(),
+      faults: Vec::new(),
     }
   }
 
@@ -199,6 +226,38 @@ impl SimHost {
   /// Whether every armed edit has happened (a test's non-vacuity check).
   pub fn interfered(&self) -> bool {
     self.armed.is_empty()
+  }
+
+  /// Arms a failure: the next `times` calls of `verb` whose path starts with `prefix` answer `error` — the
+  /// host refusals a landing must report and survive (a full disk, a directory it cannot open, a sync or a
+  /// cleanup that fails; AUD-29-05). A write verb meets the crash first, when one is armed.
+  pub fn fail(&mut self, verb: SimVerb, prefix: &str, error: HostError, times: u32) {
+    self.faults.push(Fault {
+      verb,
+      prefix: prefix.to_owned(),
+      error,
+      times,
+    });
+  }
+
+  /// Drops every armed failure.
+  pub fn clear_faults(&mut self) {
+    self.faults.clear();
+  }
+
+  /// The armed failure due for a call of `verb` on `path`, consumed one call at a time.
+  fn fault(&mut self, verb: SimVerb, path: &str) -> Result<(), HostError> {
+    match self
+      .faults
+      .iter_mut()
+      .find(|f| f.verb == verb && f.times > 0 && path.starts_with(f.prefix.as_str()))
+    {
+      Some(fault) => {
+        fault.times = fault.times.saturating_sub(1);
+        Err(fault.error)
+      }
+      None => Ok(()),
+    }
   }
 
   /// What the armed edits did, in the order they fired.
@@ -621,6 +680,7 @@ impl HostFs for SimHost {
     self.tick();
     let mut parts = self.dir_parts(parent)?;
     parts.push(name.into());
+    self.fault(SimVerb::OpenDir, &format!("/{}", parts.join("/")))?;
     match self.node(&parts) {
       Some(n) if n.kind == HostKind::Dir => {}
       Some(_) => return Err(HostError::NotDirectory),
@@ -849,6 +909,7 @@ impl LandFs for SimHost {
 
   fn sync_file(&mut self, file: HostFile) -> Result<(), HostError> {
     self.write_step()?;
+    self.fault(SimVerb::SyncFile, "")?;
     if !self.opens.contains_key(&file.0) {
       return Err(HostError::StaleHandle);
     }
@@ -1012,6 +1073,7 @@ impl LandFs for SimHost {
       Some(_) => {}
     }
     let path = format!("/{}", parts.join("/"));
+    self.fault(SimVerb::Unlink, &path)?;
     self.remove(&path);
     Ok(())
   }
@@ -1057,14 +1119,16 @@ impl LandFs for SimHost {
 
   fn sync_media(&mut self, dir: HostDir) -> Result<(), HostError> {
     self.write_step()?;
-    self.dir_parts(dir)?;
+    let parts = self.dir_parts(dir)?;
+    self.fault(SimVerb::SyncMedia, &format!("/{}", parts.join("/")))?;
     self.synced_dirs.push(dir.0);
     Ok(())
   }
 
   fn sync_dir(&mut self, dir: HostDir) -> Result<(), HostError> {
     self.write_step()?;
-    self.dir_parts(dir)?;
+    let parts = self.dir_parts(dir)?;
+    self.fault(SimVerb::SyncDir, &format!("/{}", parts.join("/")))?;
     self.synced_dirs.push(dir.0);
     Ok(())
   }

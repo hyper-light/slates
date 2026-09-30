@@ -2925,9 +2925,10 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
-The [dated audit](../audit/2026-09-29_audit.md) records 78 findings across four
-passes; 01 has the separately recorded closure below, leaving 77 without a recorded
-closure. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
+The [dated audit](../audit/2026-09-29_audit.md) records 87 findings across five
+passes; 01, 04 and 06 have the separately recorded closures below, leaving 84 without a
+recorded full closure. 02 is mitigated in part, with exact older-snapshot landing still
+owed. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
 changing working tree.
 It is a review, not an implementation change or acceptance closure. It preserves the
 existing gap classifications and historical measurements rather than treating them as
@@ -2959,6 +2960,45 @@ current-tree passes.
 | AUD-29-71–73 | Native guest memory must establish complete queue ownership and publication ordering; consumer revocation must fence admitted devices before its acknowledgement (§4.6, §4.13, AC-4.12/T-4.14). |
 | AUD-29-74–76 | Container identity/group/security semantics, authenticated Pod publication/teardown, access modes and immutable/subtree exports need supported profiles and typed refusals for unavailable forms (§4.6, §4.13, AC-4.11/T-4.13). |
 | AUD-29-77–78 | RAM admission/residency must include actual runtime/VMM/cache/mapped/retained-copy boundaries; the 14 skipped OCI/virtio-fs records and capability evidence require reconciliation and real consumer tests (R1, §4.2, §4.6, Part 6). |
+| AUD-29-79–81 | Guest cache negotiation must have actual invalidation delivery; FUSE creation must apply umask exactly once and preserve profile-specific creating uid/gid separately from Consumer authority (§4.6, §4.13, AC-4.11–4.12). |
+| AUD-29-82–83 | Guest replies/fsync require checked anchor recovery publication and the same current owner/epoch fence as the live NFS path, including reads and f=0/fleet equivalence (D-18, §4.6, §4.8, R8). |
+| AUD-29-84–85 | Revocation must fence mounted Consumer/borrowed OCI capabilities before acknowledgement; malformed reply geometry must refuse before effects and retain owned release of every unreported handle/reference (§4.6, §4.13, A-28). |
+| AUD-29-86–87 | Directory enumeration/encoding needs page-bounded admitted semantic work; busy guest queues must observe stop/authority state at bounded service boundaries and complete owned reclamation (§4.2–§4.3, §4.6, T-4.14). |
+
+The fifth pass uses baseline 733ea3e with concurrent IPC/fleet edits; f18f02c and
+bc81da4 arrived during inspection, followed by further landing edits. Linux v6.12
+primary sources, checked 2026-09-29,
+provide independent umask/cache expectations and kernel permission posture. The
+compiled-library diagnostic (§7.6, 20-second build/compile and three-second execution
+bounds) uses public Bridge/Device APIs and the existing simulated queue fixture over
+anonymous RAM. It reproduced DONT_MASK with discarded umask (0666 vs 0600 and 0777 vs
+0700), creating credentials 1000:100 discarded for enrollment/parent 501:0, explicit
+invalidation negotiated with u64::MAX metadata validity, CREATE/WRITE EIO after visible
+effects, two open handles for one successful CREATE reply, and 66 bridge rows for a
+32-byte/one-entry directory page. Maximal requested directory size with a 16-byte
+posted reply also returned EIO after processing. These are bounded diagnostics, not a
+native guest, protected-residency or large-directory performance pass.
+
+Fresh bounded offline tests passed 10 bridge-core, 58 FUSE and 10 virtio-fs cases
+(78 total; no failures/ignored in selected binaries). The guest differential uses the
+same dispatcher on both legs and cannot expose their shared semantic mistakes.
+Source inspection found missing guest recovery-publication/owner-lease gates, mounted
+Consumer revocation fencing and stop checks inside continuously busy queue drains.
+No real mount, daemon crash, container, Pod, VMM or network experiment ran. No new
+implementation repair or acceptance closure follows from these passes.
+
+The audit's §14 adds 16 P-case families to the 30 E/24 O families (70 total) and
+records page/cursor, metadata projection, incremental recovery, coherence and
+loss-aware continuation experiments. Its 100,000-child/128-entry-page calculation
+(782 pages, about 78.2 million row visits; 234.6 seconds of hypothetical sequential
+300 ms RTT) is a scale inference, not a measured WAN result. No controller change,
+new constant, lock service, per-write consensus, disk object or privilege is authorized.
+The new tripwires extend GAP-A9-1's transient/reference admission, GAP-A9-5's mounted
+semantics, GAP-A9-4's guest barrier scope, GAP-A9-6's recovery publication,
+GAP-A9-9's mount/device authority, GAP-A9-11's semantic-work cost and GAP-A9-15's
+independent transport evidence. All nine fifth-pass findings
+remain open. Separate landing closures below are preserved as recorded evidence and
+were not independently rerun by this continuation.
 
 The fourth pass uses baseline b455527a4887ef309335e3f5e42a947b179a50da and primary
 OCI runtime-spec v1.3.0, VIRTIO 1.2, Docker, Kubernetes, CSI and VMM documentation

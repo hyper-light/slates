@@ -180,6 +180,39 @@ pub enum Degradation {
     /// The errno.
     errno: i32,
   },
+  /// A directory the landing touched could not be opened or synced: the entries named in it are on the
+  /// disk but not known durable, so they stay in the volume's overlay, and a resume syncs the directory
+  /// again before it advances them (§4.15 steps 8–9; AUD-29-05).
+  Unsynced {
+    /// The directory, by its path from the target.
+    dir: Box<str>,
+    /// What the host answered.
+    error: HostError,
+  },
+  /// The media barrier the grant asked for failed: nothing this landing wrote is known to have reached the
+  /// media, so no entry leaves the overlay (AUD-29-05). Barriers only, when media durability was not asked
+  /// for, is [`Degradation::BarriersOnly`] instead: a supported level, not a failed one.
+  MediaUnsynced {
+    /// What the host answered.
+    error: HostError,
+  },
+  /// An entry of the landing's own on the disk could not be removed — a temporary after a failed write,
+  /// or a hidden sibling of an earlier attempt the sweep could not settle — and stays under its name,
+  /// reported rather than hidden (AUD-29-05).
+  Leftover {
+    /// Its path from the target.
+    path: Box<str>,
+    /// What the host answered.
+    error: HostError,
+  },
+  /// A directory the sweep could not list: hidden siblings an earlier attempt left in it, if any, stay
+  /// there unseen (AUD-29-05).
+  Unswept {
+    /// The directory, by its path from the target.
+    dir: Box<str>,
+    /// What the host answered.
+    error: HostError,
+  },
   /// An entry the landing moved to one of its own names could not go back, because its name had been taken
   /// again meanwhile: it is kept at `kept`, never removed (AUD-29-04). It is an entry that was not the
   /// witnessed one, or the witnessed one whose replacement lost its name to an outsider inside the exchange
@@ -245,6 +278,10 @@ pub struct LandingReport {
   pub conflicts: usize,
   /// Entries the host refused.
   pub failed: usize,
+  /// Entries on the disk that stay in the overlay because they did not reach the durability boundary: their
+  /// directory, or the media barrier the grant asked for, did not sync (`degraded` says which). The resume
+  /// syncs and advances them (AUD-29-05).
+  pub held: usize,
   /// Bytes written to the disk.
   pub bytes_written: u64,
   /// The durability achieved.
@@ -491,6 +528,10 @@ struct Landing<'a, H: LandFs> {
   ramp: Ramp,
   /// The host errno that ended the landing, when one did.
   crashed: Option<i32>,
+  /// Touched directories that could not be opened or synced: entries in them are not advanced.
+  unsynced: BTreeSet<Box<str>>,
+  /// Whether the media barrier the grant asked for failed: then no entry is advanced.
+  media_failed: bool,
 }
 
 /// What the writer needs besides the host: the volume, the grant, the observer, the audit log.
@@ -559,11 +600,11 @@ impl<H: LandFs> Landing<'_, H> {
     dir: HostDir,
     name: &str,
     path: &str,
-  ) -> Result<(), WriteFailure> {
+  ) -> Result<(), HostError> {
     match self.host.rename_noreplace(aside_dir, aside, dir, name) {
       Ok(()) => Ok(()),
       Err(HostError::Unavailable(ERRNO_EXIST)) => self.keep(aside_dir, aside_dir_path, aside, path),
-      Err(e) => Err(e.into()),
+      Err(e) => Err(e),
     }
   }
 
@@ -988,7 +1029,7 @@ impl<H: LandFs> Landing<'_, H> {
       None => self.hidden_name(),
       Some(_) => self.aside_name(&entry.path),
     };
-    let temp = self.fill_temp(dir, &hidden, &bytes, overlay)?;
+    let temp = self.fill_temp(dir, dir_path, &hidden, &bytes, overlay)?;
     let result = match witnessed {
       None => self.link_create(temp, dir, &hidden, name),
       Some(witness) => self.swap_replace(Swap {
@@ -1018,6 +1059,7 @@ impl<H: LandFs> Landing<'_, H> {
   fn fill_temp(
     &mut self,
     dir: HostDir,
+    dir_path: &str,
     hidden: &str,
     bytes: &[u8],
     overlay: OverlayIdentity,
@@ -1032,7 +1074,15 @@ impl<H: LandFs> Landing<'_, H> {
       .and_then(|()| self.host.sync_file(temp));
     if let Err(e) = filled {
       self.host.close_file(temp);
-      let _ = self.host.unlink(dir, hidden);
+      // An unnamed temporary has no name to remove (`NotFound`); a named one that stays is reported, never
+      // dropped (AUD-29-05).
+      match self.host.unlink(dir, hidden) {
+        Ok(()) | Err(HostError::NotFound) => {}
+        Err(error) => self.degraded.push(Degradation::Leftover {
+          path: join(dir_path, hidden).into(),
+          error,
+        }),
+      }
       return Err(e.into());
     }
     /// Format: bytes per KiB.
@@ -1174,7 +1224,7 @@ impl<H: LandFs> Landing<'_, H> {
     dir_path: &str,
     hidden: &str,
     path: &str,
-  ) -> Result<(), WriteFailure> {
+  ) -> Result<(), HostError> {
     let kept = self.kept_name();
     self.host.rename_noreplace(dir, hidden, dir, &kept)?;
     self.degraded.push(Degradation::Kept {
@@ -1545,12 +1595,12 @@ impl<H: LandFs> Landing<'_, H> {
     dir: HostDir,
     name: &str,
     witnessed: Option<&Witness>,
-  ) -> Result<Option<bool>, WriteFailure> {
+  ) -> Result<Option<bool>, HostError> {
     let victim = match self.host.open_dir(dir, name) {
       Ok(d) => d,
       Err(HostError::NotFound) => return Ok(None),
       Err(HostError::NotDirectory) => return Ok(Some(false)),
-      Err(e) => return Err(e.into()),
+      Err(e) => return Err(e),
     };
     let current = self.host.fingerprint_dir(victim);
     self.host.close_dir(victim);
@@ -1593,7 +1643,7 @@ impl<H: LandFs> Landing<'_, H> {
   }
 
   /// Removes everything inside `dir`.
-  fn remove_children(&mut self, dir: HostDir) -> Result<(), WriteFailure> {
+  fn remove_children(&mut self, dir: HostDir) -> Result<(), HostError> {
     for entry in self.host.list(dir)? {
       if entry.kind == HostKind::Dir {
         let child = self.host.open_dir(dir, &entry.name)?;
@@ -1685,59 +1735,95 @@ impl<H: LandFs> Landing<'_, H> {
 
   // ------------------------------------------------------------- syncing
 
-  /// One sync per touched directory, then the media barrier when asked.
+  /// One sync per touched directory, then the media barrier when asked. Every failure is recorded
+  /// (AUD-29-05): a directory that cannot be opened or synced is `Unsynced` and its entries are held in the
+  /// overlay; a failed media barrier the grant asked for is `MediaUnsynced` and holds every entry. Before
+  /// 2026-09-29 a directory that failed to open was skipped with the landing still reporting its
+  /// directories synced, and a sync failure other than a crash-like errno still let every entry advance.
   fn sync_all(&mut self) -> Durability {
     let touched: Vec<Box<str>> = self.touched.iter().cloned().collect();
-    let mut dirs_synced = true;
     let mut dirs = 0usize;
     let mut total_ns = 0u64;
     for path in touched {
-      let Ok(dir) = self.open_dir_path(&path) else {
-        continue;
-      };
       let started = Instant::now();
-      match self.host.sync_dir(dir) {
-        Ok(()) => {}
-        Err(HostError::Unavailable(errno)) if !disk_full(errno) => {
-          dirs_synced = false;
-          self.crashed = Some(errno);
-        }
-        Err(_) => dirs_synced = false,
-      }
+      let synced = self
+        .open_dir_path(&path)
+        .and_then(|dir| self.host.sync_dir(dir));
       let ns = elapsed_ns(started);
       total_ns = total_ns.saturating_add(ns);
       self.costs.dir_sync_ns.push(ns);
-      dirs = dirs.saturating_add(1);
-    }
-    let media = if self.request.media_durability {
-      match self.host.sync_media(self.root) {
-        Ok(()) => true,
-        Err(HostError::Unavailable(errno)) if !disk_full(errno) => {
-          self.crashed = Some(errno);
-          false
+      match synced {
+        Ok(()) => dirs = dirs.saturating_add(1),
+        Err(error) => {
+          self.note_crash(error);
+          self.degraded.push(Degradation::Unsynced {
+            dir: path.clone(),
+            error,
+          });
+          self.unsynced.insert(path);
         }
-        Err(_) => false,
       }
-    } else {
-      false
-    };
+    }
+    let media = self.request.media_durability && self.media_barrier();
     if !self.request.media_durability {
       self.degraded.push(Degradation::BarriersOnly);
     }
     Durability {
       data_synced: self.crashed.is_none(),
-      dirs_synced,
+      dirs_synced: self.unsynced.is_empty(),
       media,
       dirs,
       dir_sync_ns: total_ns,
     }
   }
 
+  /// The media barrier the grant asked for: whether it held. A failure is `MediaUnsynced`, and holds every
+  /// entry in the overlay.
+  fn media_barrier(&mut self) -> bool {
+    match self.host.sync_media(self.root) {
+      Ok(()) => true,
+      Err(error) => {
+        self.note_crash(error);
+        self.degraded.push(Degradation::MediaUnsynced { error });
+        self.media_failed = true;
+        false
+      }
+    }
+  }
+
+  /// A host refusal that ends the landing: an errno other than a full disk (a host that stopped answering
+  /// — the simulated crash, an `EIO`) aborts the landing so nothing is advanced; a full disk and the typed
+  /// refusals (not found, not a directory, a stale handle) are recorded by the caller and the landing goes on.
+  fn note_crash(&mut self, error: HostError) {
+    if let HostError::Unavailable(errno) = error
+      && !disk_full(errno)
+    {
+      self.crashed = Some(errno);
+    }
+  }
+
+  /// Whether an entry reached the durability boundary this landing promises (§4.15 steps 8–9): its directory
+  /// synced — for a rename, both directories — and the media barrier held when the grant asked for it. Only
+  /// such an entry leaves the overlay.
+  fn durable(&self, report: &EntryReport) -> bool {
+    if self.media_failed {
+      return false;
+    }
+    let (dir, _) = split(&report.path);
+    let origin_synced = match &report.action {
+      Action::Rename { from } => !self.unsynced.contains(split(from).0),
+      _ => true,
+    };
+    origin_synced && !self.unsynced.contains(dir)
+  }
+
   // ------------------------------------------------------------- sweep
 
-  /// Removes hidden siblings carrying this landing id from the manifest's directories (a
-  /// crashed earlier attempt of the same landing), proportional to the delta's directories.
-  fn sweep(&mut self, manifest: &Manifest) -> Result<usize, HostError> {
+  /// Settles the hidden siblings carrying this landing id in the manifest's directories (a crashed earlier
+  /// attempt of the same landing), proportional to the delta's directories: how many it removed. A sibling
+  /// it cannot settle is reported `Leftover`, and a directory it cannot list `Unswept` (AUD-29-05; before
+  /// 2026-09-29 both were dropped, and a failed sweep counted zero).
+  fn sweep(&mut self, manifest: &Manifest) -> usize {
     let mut parents: BTreeSet<Box<str>> = BTreeSet::new();
     for entry in &manifest.entries {
       parents.insert(split(&entry.path).0.into());
@@ -1747,27 +1833,39 @@ impl<H: LandFs> Landing<'_, H> {
     }
     let mut removed = 0usize;
     for parent in parents {
-      let Ok(dir) = self.open_dir_path(&parent) else {
-        continue;
+      let listed = self
+        .open_dir_path(&parent)
+        .and_then(|dir| self.host.list(dir).map(|entries| (dir, entries)));
+      let (dir, entries) = match listed {
+        Ok(found) => found,
+        // A directory the plan names that is not there (one this landing creates) holds no sibling.
+        Err(HostError::NotFound | HostError::NotDirectory) => continue,
+        Err(error) => {
+          self.degraded.push(Degradation::Unswept { dir: parent, error });
+          continue;
+        }
       };
-      for e in self.host.list(dir)? {
+      for e in entries {
         if !self.is_own_hidden(&e.name) {
           continue;
         }
-        let gone = match self.aside_hash(&e.name) {
+        let settled = match self.aside_hash(&e.name) {
           // An entry moved aside is removed only once checked (AUD-29-04).
-          Some(hash) => self
-            .resolve_aside(dir, &parent, &e.name, e.kind, hash, manifest)
-            .unwrap_or(false),
-          None if e.kind == HostKind::Dir => self.remove_named_tree(dir, &e.name).is_ok(),
-          None => self.host.unlink(dir, &e.name).is_ok(),
+          Some(hash) => self.resolve_aside(dir, &parent, &e.name, e.kind, hash, manifest),
+          None if e.kind == HostKind::Dir => self.remove_named_tree(dir, &e.name).map(|()| true),
+          None => self.host.unlink(dir, &e.name).map(|()| true),
         };
-        if gone {
-          removed = removed.saturating_add(1);
+        match settled {
+          Ok(true) => removed = removed.saturating_add(1),
+          Ok(false) => {}
+          Err(error) => self.degraded.push(Degradation::Leftover {
+            path: join(&parent, &e.name).into(),
+            error,
+          }),
         }
       }
     }
-    Ok(removed)
+    removed
   }
 
   /// Settles an entry a crashed attempt left moved aside at `aside` under `parent` (AUD-29-04). The witnessed
@@ -1784,7 +1882,7 @@ impl<H: LandFs> Landing<'_, H> {
     kind: HostKind,
     hash: u64,
     manifest: &Manifest,
-  ) -> Result<bool, WriteFailure> {
+  ) -> Result<bool, HostError> {
     let Some(entry) = manifest.entries.iter().find(|m| {
       let displaced = displaced_path(m);
       path_hash(displaced) == hash && split(displaced).0 == parent
@@ -1804,7 +1902,7 @@ impl<H: LandFs> Landing<'_, H> {
         match self.host.rename_noreplace(dir, aside, dir, name) {
           Ok(()) => return Ok(false),
           Err(HostError::Unavailable(ERRNO_EXIST)) => {}
-          Err(e) => return Err(e.into()),
+          Err(e) => return Err(e),
         }
       }
       if kind == HostKind::Dir {
@@ -1829,7 +1927,7 @@ impl<H: LandFs> Landing<'_, H> {
     dir: HostDir,
     aside: &str,
     entry: &LandingEntry,
-  ) -> Result<bool, WriteFailure> {
+  ) -> Result<bool, HostError> {
     let Some(witness) = entry.witnessed.as_ref() else {
       return Ok(false);
     };
@@ -1853,7 +1951,7 @@ impl<H: LandFs> Landing<'_, H> {
     aside: &str,
     kind: HostKind,
     entry: &LandingEntry,
-  ) -> Result<bool, WriteFailure> {
+  ) -> Result<bool, HostError> {
     match kind {
       HostKind::File => {
         let ours = match entry.overlay {
@@ -1869,7 +1967,7 @@ impl<H: LandFs> Landing<'_, H> {
         Ok(()) => Ok(true),
         // Not empty: never this landing's.
         Err(HostError::Unavailable(_)) => Ok(false),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e),
       },
       _ => Ok(false),
     }
@@ -1895,7 +1993,7 @@ impl<H: LandFs> Landing<'_, H> {
     Ok(result? == *hash)
   }
 
-  fn remove_named_tree(&mut self, dir: HostDir, name: &str) -> Result<(), WriteFailure> {
+  fn remove_named_tree(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {
     let d = self.host.open_dir(dir, name)?;
     let emptied = self.remove_children(d);
     self.host.close_dir(d);
@@ -2155,6 +2253,8 @@ impl<'a, H: LandFs> Landing<'a, H> {
       costs: CostSamples::default(),
       ramp: Ramp::new(request.cores, request.max_depth, request.variance_permille),
       crashed: None,
+      unsynced: BTreeSet::new(),
+      media_failed: false,
     }
   }
 }
@@ -2179,7 +2279,7 @@ fn land_under_lease<H: LandFs>(
   // An earlier attempt's leftovers are settled before the verdicts are taken: an entry it left moved aside
   // (inside an exchange fallback's or a rename's window) goes back first, so validation sees each path old or
   // new, never missing (AUD-29-04).
-  let swept = landing.sweep(manifest).unwrap_or(0);
+  let swept = landing.sweep(manifest);
   let validated = landing.validate(manifest);
   let mut reports = match validated {
     Ok(r) => r,
@@ -2226,7 +2326,14 @@ fn land_under_lease<H: LandFs>(
     });
   }
   landing.close_dirs();
-  let state = terminal_state(&reports, landing.crashed.is_some());
+  // An entry that landed but did not reach the durability boundary (its directory, or the media barrier the
+  // grant asked for, did not sync) stays in the overlay: the resume syncs it and advances it then
+  // (AUD-29-05; before 2026-09-29 such entries were advanced, and a lost sync lost the private work).
+  let held = reports
+    .iter()
+    .filter(|r| advances(r.outcome.as_ref()) && !landing.durable(r))
+    .count();
+  let state = terminal_state(&reports, landing.crashed.is_some(), held);
   let facts = if vol.is_overlay() {
     None
   } else {
@@ -2245,7 +2352,7 @@ fn land_under_lease<H: LandFs>(
   let completed = state != LandingState::Aborted;
   for r in reports
     .iter()
-    .filter(|r| completed && advances(r.outcome.as_ref()))
+    .filter(|r| completed && advances(r.outcome.as_ref()) && landing.durable(r))
   {
     landed.push(r.path.to_string());
     if let Action::Rename { from } = &r.action {
@@ -2296,6 +2403,7 @@ fn land_under_lease<H: LandFs>(
       .iter()
       .filter(|r| matches!(r.outcome, Some(Outcome::Failed { .. })))
       .count(),
+    held,
     entries: reports,
     bytes_written: landing.bytes_written,
     durability,
@@ -2319,9 +2427,15 @@ fn advances(outcome: Option<&Outcome>) -> bool {
   )
 }
 
-fn terminal_state(reports: &[EntryReport], crashed: bool) -> LandingState {
+/// The landing's terminal state: `Aborted` after a crash; `Done` only when every entry landed or was
+/// already there and every one reached the durability boundary (`held` counts those that did not);
+/// `Partial` otherwise.
+fn terminal_state(reports: &[EntryReport], crashed: bool, held: usize) -> LandingState {
   if crashed {
     return LandingState::Aborted;
+  }
+  if held > 0 {
+    return LandingState::Partial;
   }
   let clean = reports.iter().all(|r| {
     matches!(
