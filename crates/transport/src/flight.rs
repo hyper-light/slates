@@ -29,6 +29,19 @@
 //! whole handshake is a few kilobytes, and the sender refuses a stream past [`MAX_STREAM_BYTES`] or a
 //! flight past [`MAX_FLIGHT_BYTES`] typed, so a hostile or corrupt field cannot allocate without bound.
 //!
+//! **Encryption levels (RFC 9001 §4.1.3; AUD-29-47).** TLS writes a handshake at two levels before the
+//! 1-RTT keys: the Initial level (ClientHello, ServerHello — no identity) and the Handshake level
+//! (EncryptedExtensions, Certificate, CertificateVerify, Finished — the peer identities). `rustls::quic`
+//! hands the transport both as unencrypted bytes, and protecting the second is the transport's job. Each
+//! level is its own stream with its own offsets. Initial-level bytes cross as the plain fragments above;
+//! Handshake-level bytes cross as **sealed** fragments: `[SEALED_FRAGMENT_TAG][number: u32 LE]` followed
+//! by the plain fragment's body (start, within, total, payload) AEAD-sealed under that level's packet key,
+//! with the tag and number as associated data ([`seal`], [`open`]). The number is the AEAD nonce input: a
+//! sender numbers every sealed fragment it sends, retransmits included, and never reuses one under its
+//! keys. An opened sealed fragment is the plain fragment again, so one [`Reassembler`] per level serves
+//! both. Until 2026-09-30 both levels were flattened into one plaintext stream, and a passive observer read
+//! the certificates off the wire.
+//!
 //! **Reliability.** Fragmentation is stateless and deterministic: the same flight at the same start
 //! fragments to the same bytes every time, so a retransmit of a flight (the handshake's own loss
 //! recovery) resends identical fragments, and the [`Reassembler`] is idempotent under duplicates and
@@ -55,6 +68,21 @@ pub const FRAGMENT_HEADER: usize = AT_TOTAL + 2;
 /// fragment never needs IP fragmentation. Anchored to [`MIN_DATAGRAM_BYTES`].
 pub const FRAGMENT_PAYLOAD: usize = MIN_DATAGRAM_BYTES - FRAGMENT_HEADER;
 
+/// Format: the first byte of a **sealed** fragment, one carrying Handshake-level bytes (see the module
+/// doc): the fixed bit clear and the high bit set, as the plain tag, and distinct from it.
+pub const SEALED_FRAGMENT_TAG: u8 = 0x81;
+/// Format: a sealed fragment's number (`u32` LE) after its tag — the AEAD nonce input.
+const SEALED_NUMBER_BYTES: usize = 4;
+/// Format: a sealed fragment's associated data: its tag and number.
+pub const SEALED_HEADER: usize = 1 + SEALED_NUMBER_BYTES;
+/// Format: the AEAD tag every TLS 1.3 suite appends (16 bytes, RFC 8446 §5.2 over AES-GCM and
+/// ChaCha20-Poly1305).
+const SEALED_TAG_BYTES: usize = 16;
+/// Derived: the most flight bytes one sealed fragment carries — the path floor less the sealed header, the
+/// sealed body's own field header and the AEAD tag.
+pub const SEALED_FRAGMENT_PAYLOAD: usize =
+  MIN_DATAGRAM_BYTES - SEALED_HEADER - (FRAGMENT_HEADER - 1) - SEALED_TAG_BYTES;
+
 /// Shape: the largest handshake flight the endpoint fragments or reassembles — the reassembler will not
 /// buffer past it, so a corrupt or hostile `total` cannot allocate without bound. A mutual-TLS flight
 /// with a certificate chain of several certificates is a few kilobytes; this is sixteen path-floor
@@ -62,8 +90,8 @@ pub const FRAGMENT_PAYLOAD: usize = MIN_DATAGRAM_BYTES - FRAGMENT_HEADER;
 pub const MAX_FLIGHT_BYTES: usize = 16 * MIN_DATAGRAM_BYTES;
 
 /// Derived: the most fragments one flight spans, for bounding a receive loop. Anchored to
-/// [`MAX_FLIGHT_BYTES`] and [`FRAGMENT_PAYLOAD`].
-pub const MAX_FLIGHT_FRAGMENTS: usize = MAX_FLIGHT_BYTES.div_ceil(FRAGMENT_PAYLOAD);
+/// [`MAX_FLIGHT_BYTES`] and the smaller of the two payloads, [`SEALED_FRAGMENT_PAYLOAD`].
+pub const MAX_FLIGHT_FRAGMENTS: usize = MAX_FLIGHT_BYTES.div_ceil(SEALED_FRAGMENT_PAYLOAD);
 
 /// Format: the most bytes one direction of a handshake may send in all — what the `u16` stream offset
 /// can name. A TLS 1.3 direction is a few kilobytes; this is the field's range.
@@ -74,15 +102,23 @@ pub const MAX_STREAM_BYTES: usize = u16::MAX as usize;
 /// [`MAX_FLIGHT_BYTES`], or would end past [`MAX_STREAM_BYTES`] — the caller refuses it typed rather
 /// than sending an unreassemblable stream. An empty flight produces no fragments (nothing to say).
 pub fn fragment(flight: &[u8], start: usize) -> Option<Vec<Vec<u8>>> {
-  if flight.len() > MAX_FLIGHT_BYTES || start.checked_add(flight.len())? > MAX_STREAM_BYTES {
+  fragment_within(flight, start, FRAGMENT_PAYLOAD)
+}
+
+/// [`fragment`] with each fragment's payload at most `payload` bytes.
+fn fragment_within(flight: &[u8], start: usize, payload: usize) -> Option<Vec<Vec<u8>>> {
+  if flight.len() > MAX_FLIGHT_BYTES
+    || start.checked_add(flight.len())? > MAX_STREAM_BYTES
+    || payload == 0
+  {
     return None;
   }
   let start_word = u16::try_from(start).ok()?;
   let total_word = u16::try_from(flight.len()).ok()?;
-  let mut out = Vec::with_capacity(flight.len().div_ceil(FRAGMENT_PAYLOAD));
+  let mut out = Vec::with_capacity(flight.len().div_ceil(payload));
   let mut within = 0usize;
   while within < flight.len() {
-    let end = flight.len().min(within + FRAGMENT_PAYLOAD);
+    let end = flight.len().min(within.checked_add(payload)?);
     let mut datagram = Vec::with_capacity(FRAGMENT_HEADER + (end - within));
     datagram.push(FRAGMENT_TAG);
     datagram.extend_from_slice(&start_word.to_le_bytes());
@@ -98,6 +134,69 @@ pub fn fragment(flight: &[u8], start: usize) -> Option<Vec<Vec<u8>>> {
 /// Whether `datagram` is a handshake fragment (routed as a handshake datagram and tagged as a fragment).
 pub fn is_fragment(datagram: &[u8]) -> bool {
   !is_short_header(datagram) && datagram.first() == Some(&FRAGMENT_TAG)
+}
+
+/// Whether `datagram` is a sealed handshake fragment (Handshake-level bytes, see the module doc).
+pub fn is_sealed_fragment(datagram: &[u8]) -> bool {
+  !is_short_header(datagram) && datagram.first() == Some(&SEALED_FRAGMENT_TAG)
+}
+
+/// Why a flight could not be sealed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealRefusal {
+  /// The flight is past [`MAX_FLIGHT_BYTES`], or would end past [`MAX_STREAM_BYTES`].
+  TooLarge,
+  /// The sender has numbered every sealed fragment a `u32` can name: another would reuse a nonce.
+  NumbersExhausted,
+  /// The AEAD refused (a payload past the suite's limit).
+  Sealing,
+}
+
+/// Seals `flight`, which begins at offset `start` of its level's stream, into fragments under `key`, each
+/// numbered from `next_number` onward (advanced past the last used). An empty flight seals to nothing.
+pub fn seal(
+  flight: &[u8],
+  start: usize,
+  key: &dyn rustls::quic::PacketKey,
+  next_number: &mut u32,
+) -> Result<Vec<Vec<u8>>, SealRefusal> {
+  let plain =
+    fragment_within(flight, start, SEALED_FRAGMENT_PAYLOAD).ok_or(SealRefusal::TooLarge)?;
+  let mut sealed = Vec::with_capacity(plain.len());
+  for fragment in plain {
+    let number = *next_number;
+    *next_number = number.checked_add(1).ok_or(SealRefusal::NumbersExhausted)?;
+    let mut datagram = Vec::with_capacity(SEALED_HEADER + fragment.len() + key.tag_len());
+    datagram.push(SEALED_FRAGMENT_TAG);
+    datagram.extend_from_slice(&number.to_le_bytes());
+    let mut body = fragment.get(1..).ok_or(SealRefusal::Sealing)?.to_vec();
+    let tag = key
+      .encrypt_in_place(u64::from(number), &datagram, &mut body)
+      .map_err(|_| SealRefusal::Sealing)?;
+    datagram.extend_from_slice(&body);
+    datagram.extend_from_slice(tag.as_ref());
+    sealed.push(datagram);
+  }
+  Ok(sealed)
+}
+
+/// Opens a sealed fragment under `key`: the plain fragment it carries, for its level's [`Reassembler`], or
+/// `None` when it is not a sealed fragment or does not authenticate (tampered, forged, or sealed under
+/// other keys) — dropped and counted by the caller, never fed to the TLS state.
+pub fn open(datagram: &[u8], key: &dyn rustls::quic::PacketKey) -> Option<Vec<u8>> {
+  if !is_sealed_fragment(datagram) {
+    return None;
+  }
+  let header = datagram.get(..SEALED_HEADER)?;
+  let number: [u8; SEALED_NUMBER_BYTES] = datagram.get(1..SEALED_HEADER)?.try_into().ok()?;
+  let mut body = datagram.get(SEALED_HEADER..)?.to_vec();
+  let plain = key
+    .decrypt_in_place(u64::from(u32::from_le_bytes(number)), header, &mut body)
+    .ok()?;
+  let mut fragment = Vec::with_capacity(1 + plain.len());
+  fragment.push(FRAGMENT_TAG);
+  fragment.extend_from_slice(plain);
+  Some(fragment)
 }
 
 /// What pushing a fragment into a [`Reassembler`] yields.
@@ -233,6 +332,95 @@ fn parse(datagram: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// Real QUIC packet keys for the sealed-fragment tests: the Initial keys a connection id derives (RFC 9001
+  /// §5.2), as the client (`local` seals toward the server) and as the server (`remote` opens them).
+  fn keys(connection_id: &[u8], side: rustls::Side) -> rustls::quic::Keys {
+    let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+      .tls13()
+      .unwrap();
+    rustls::quic::Keys::initial(
+      rustls::quic::Version::V1,
+      suite,
+      suite.quic.unwrap(),
+      connection_id,
+      side,
+    )
+  }
+
+  /// AUD-29-47 (the sealed codec, by use): do: seal a multi-fragment flight from the client's keys and open
+  /// every fragment with the server's; expect the plain fragments back, the reassembled flight equal to the
+  /// original, numbers advanced one per fragment, and no plaintext byte of the flight on the wire.
+  #[test]
+  fn sealed_fragments_open_to_the_flight_and_hide_it() {
+    let (client, server) = (
+      keys(b"cid", rustls::Side::Client),
+      keys(b"cid", rustls::Side::Server),
+    );
+    let flight: Vec<u8> = (0..3 * SEALED_FRAGMENT_PAYLOAD)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let mut numbers = 0u32;
+    let sealed = seal(&flight, 0, client.local.packet.as_ref(), &mut numbers).unwrap();
+    assert_eq!(numbers, u32::try_from(sealed.len()).unwrap());
+    assert!(
+      sealed
+        .iter()
+        .all(|datagram| datagram.len() <= MIN_DATAGRAM_BYTES)
+    );
+    let marker = flight.get(..32).unwrap();
+    assert!(
+      !sealed
+        .iter()
+        .any(|datagram| datagram.windows(marker.len()).any(|w| w == marker))
+    );
+    let mut reassembler = Reassembler::new();
+    let mut rebuilt = None;
+    for datagram in &sealed {
+      let plain = open(datagram, server.remote.packet.as_ref()).unwrap();
+      if let Reassembly::Flight(bytes) = reassembler.push(&plain) {
+        rebuilt = Some(bytes);
+      }
+    }
+    assert_eq!(rebuilt, Some(flight));
+  }
+
+  /// AUD-29-47: do: flip one byte of a sealed fragment's number, its ciphertext and its tag in turn, and
+  /// open an intact one under keys from another connection; expect every one refused.
+  #[test]
+  fn a_tampered_or_foreign_sealed_fragment_does_not_open() {
+    let (client, server) = (
+      keys(b"cid", rustls::Side::Client),
+      keys(b"cid", rustls::Side::Server),
+    );
+    let other = keys(b"other", rustls::Side::Server);
+    let mut numbers = 0u32;
+    let sealed = seal(b"finished", 0, client.local.packet.as_ref(), &mut numbers).unwrap();
+    let datagram = sealed.first().unwrap();
+    for at in [1, SEALED_HEADER + 1, datagram.len() - 1] {
+      let mut tampered = datagram.clone();
+      *tampered.get_mut(at).unwrap() ^= 0x01;
+      assert_eq!(
+        open(&tampered, server.remote.packet.as_ref()),
+        None,
+        "byte {at}"
+      );
+    }
+    assert_eq!(open(datagram, other.remote.packet.as_ref()), None);
+    assert!(open(datagram, server.remote.packet.as_ref()).is_some());
+  }
+
+  /// AUD-29-47: do: seal with the next number at the last a `u32` names; expect `NumbersExhausted` — a number
+  /// with no successor is not issued, so the counter never has to wrap into a reused nonce.
+  #[test]
+  fn sealed_numbers_end_without_a_repeat() {
+    let client = keys(b"cid", rustls::Side::Client);
+    let mut numbers = u32::MAX;
+    assert_eq!(
+      seal(b"one", 0, client.local.packet.as_ref(), &mut numbers),
+      Err(SealRefusal::NumbersExhausted)
+    );
+  }
 
   /// A pseudo-random stream for the oracle, seeded so a failure replays (`xorshift64*`).
   struct Rng(u64);

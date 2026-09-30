@@ -274,6 +274,54 @@ impl QuicExt for Quic {
   }
 }
 
+/// One handshake turn's output: the bytes this end's TLS wrote at each encryption level, in order (RFC 9001
+/// §4.1.3). Initial-level bytes cross as plain fragments; Handshake-level bytes — the certificates and the
+/// proof of their keys — cross sealed under that level's keys (`crate::flight`; AUD-29-47).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Flight {
+  /// Bytes written at the Initial level (ClientHello, ServerHello).
+  initial: Vec<u8>,
+  /// Bytes written at the Handshake level (EncryptedExtensions, Certificate, CertificateVerify, Finished).
+  handshake: Vec<u8>,
+}
+
+impl Flight {
+  fn is_empty(&self) -> bool {
+    self.initial.is_empty() && self.handshake.is_empty()
+  }
+}
+
+/// The level this end's TLS writes its next handshake bytes at: Initial until the Handshake keys arrive,
+/// Handshake until the 1-RTT keys do (bytes written in the call that reports a key change belong to the
+/// old level — `rustls::quic::Connection::write_hs`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum WriteLevel {
+  #[default]
+  Initial,
+  Handshake,
+  OneRtt,
+}
+
+/// The handshake's Handshake-level state (RFC 9001 §4.1.3): what this end writes at, the Handshake keys,
+/// this end's Handshake-level stream and sealed-fragment numbers, and the peer's Handshake-level stream.
+#[derive(Default)]
+struct Levels {
+  write: WriteLevel,
+  /// The Handshake-level keys, once TLS reports them: `local` seals this end's fragments, `remote` opens
+  /// the peer's.
+  keys: Option<Keys>,
+  /// Bytes of this end's Handshake-level stream sent so far.
+  sent: usize,
+  /// The number the next sealed fragment carries — the AEAD nonce input, never reused.
+  numbers: u32,
+  /// Reassembles the peer's Handshake-level stream from its opened fragments.
+  reassembler: crate::flight::Reassembler,
+  /// Sealed fragments that arrived before this end had the keys to open them (the peer's ServerHello and
+  /// the sealed flight after it cross together); opened once the keys arrive. Bounded at one flight's
+  /// fragments: a further one is dropped (the peer's retransmit brings it again).
+  waiting: Vec<Vec<u8>>,
+}
+
 /// How an endpoint reaches the wire: its own socket (one socket, one peer — a dialing client, or a
 /// server told its peer), or a socket shared with other sessions through a demultiplexer, which routes
 /// each received datagram to this session's inbox by connection id (`crate::demux`). Sends go straight
@@ -319,10 +367,12 @@ pub struct Endpoint {
   /// A client's final handshake flight, kept after establishment: a raw handshake datagram arriving on
   /// an established session is a server still asking for it (its confirmation raced this end's exit
   /// from the handshake), and is answered by resending it. Empty on a server.
-  final_flight: Vec<u8>,
+  final_flight: Flight,
   /// The handshake flight this end last sent and has not seen answered, kept across `establish` calls so
   /// the next call retransmits it (RFC 9002 §6.2); empty once established or before the first flight.
-  pending_flight: Vec<u8>,
+  pending_flight: Flight,
+  /// The Handshake level's keys, streams and waiting fragments (AUD-29-47).
+  levels: Levels,
   /// Reassembles the peer's handshake flights from their fragments (`crate::flight`): a flight larger
   /// than one path-floor datagram arrives as several, so this holds the pieces until the whole flight is
   /// present before it is fed to the TLS state. Kept across `establish` calls, as `pending_flight` is, so
@@ -390,8 +440,9 @@ impl Endpoint {
       conn: Connection::new(shape, Role::Client),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
-      final_flight: Vec::new(),
-      pending_flight: Vec::new(),
+      final_flight: Flight::default(),
+      pending_flight: Flight::default(),
+      levels: Levels::default(),
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
       hs_sent: 0,
@@ -426,8 +477,9 @@ impl Endpoint {
       conn: Connection::new(shape, Role::Server),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
-      final_flight: Vec::new(),
-      pending_flight: Vec::new(),
+      final_flight: Flight::default(),
+      pending_flight: Flight::default(),
+      levels: Levels::default(),
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
       hs_sent: 0,
@@ -464,8 +516,9 @@ impl Endpoint {
       conn: Connection::new(shape, Role::Server),
       rx_largest: 0,
       frame_cap: checked_budget(&shape)?,
-      final_flight: Vec::new(),
-      pending_flight: Vec::new(),
+      final_flight: Flight::default(),
+      pending_flight: Flight::default(),
+      levels: Levels::default(),
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
       hs_sent: 0,
@@ -633,14 +686,14 @@ impl Endpoint {
 
   /// One `establish` call's turns over the connection; `last_flight` is the flight this end most recently
   /// sent (carried in from the previous call and left for the next when the budget runs out).
-  async fn establish_turns(&mut self, last_flight: &mut Vec<u8>) -> Result<(), EndpointError> {
+  async fn establish_turns(&mut self, last_flight: &mut Flight) -> Result<(), EndpointError> {
     let mut sent_at: Option<u64> = None;
     // A flight arrives as fragments the endpoint's reassembler rebuilds; it also recognizes a peer's
     // retransmit of a flight already consumed (`Reassembly::Repeat`) and does not re-feed it to
     // `read_hs`, which would fault the ordered handshake stream. The reassembler is an endpoint field, so
     // fragments split across two `establish` calls still rebuild one flight.
     for _ in 0..HANDSHAKE_TURN_CEILING {
-      let out = self.drain_handshake();
+      let out = self.drain_handshake()?;
       if !out.is_empty() {
         // Fragmented so a flight larger than the path floor still crosses (RFC 9000 §19.6); a flight
         // past the bounds is refused typed inside `send_new_flight`.
@@ -666,7 +719,7 @@ impl Endpoint {
         if self.quic.is_client() {
           self.final_flight = last_flight.clone();
         }
-        return self.confirm_handshake(last_flight.as_slice()).await;
+        return self.confirm_handshake(last_flight).await;
       }
       // Receive the peer's next flight, retransmitting our last flight each probe timeout so a dropped
       // handshake packet — the common case being a peer not yet listening when we first sent — is recovered
@@ -707,7 +760,12 @@ impl Endpoint {
   /// socket — and on each `Repeat` (the peer retransmitting a flight already consumed: it is still
   /// asking). The retransmit interval backs off from the timer granularity toward the probe timeout; the
   /// count of timeouts, repeats and partial or malformed datagrams is bounded (banned item 8).
-  async fn receive_flight(&mut self, last_flight: &[u8]) -> Result<Vec<u8>, EndpointError> {
+  async fn receive_flight(&mut self, last_flight: &Flight) -> Result<Vec<u8>, EndpointError> {
+    // Sealed fragments that arrived before the keys that open them (the peer's ServerHello and its sealed
+    // flight cross together): opened now that the last turn may have brought the keys.
+    if let Some(flight) = self.open_waiting() {
+      return Ok(flight);
+    }
     let mut attempts = 0u32;
     // Datagrams received in this turn that did not complete a flight: a bound on a peer that sends
     // fragments which never complete, or garbage (banned item 8) — every fragment a flight can have,
@@ -717,7 +775,7 @@ impl Endpoint {
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(period).await? {
-        Some((datagram, _from)) => match self.reassembler.push(&datagram) {
+        Some((datagram, _from)) => match self.place(datagram) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
           // A fragment that does not yet complete a flight is progress — the peer is alive and
@@ -784,7 +842,7 @@ impl Endpoint {
   /// stall an N-node fleet's mesh hit). The two sides play complementary roles, and the residual
   /// two-army uncertainty is resolved the way QUIC resolves it — the server, which upon finishing
   /// already holds the client's flight, announces completion, and the client waits to hear it.
-  async fn confirm_handshake(&mut self, last_flight: &[u8]) -> Result<(), EndpointError> {
+  async fn confirm_handshake(&mut self, last_flight: &Flight) -> Result<(), EndpointError> {
     if self.quic.is_client() {
       self.confirm_as_client(last_flight).await
     } else {
@@ -798,7 +856,7 @@ impl Endpoint {
   /// retransmits the flight on each probe timeout (and at once on a raw handshake datagram, which means
   /// the server is still waiting) until then. Bounded by the handshake retransmit ceiling (banned
   /// item 8).
-  async fn confirm_as_client(&mut self, last_flight: &[u8]) -> Result<(), EndpointError> {
+  async fn confirm_as_client(&mut self, last_flight: &Flight) -> Result<(), EndpointError> {
     let mut retransmits = 0u32;
     let mut backoff = GRANULARITY_NS;
     let deadline = self.confirmation_deadline();
@@ -936,22 +994,83 @@ impl Endpoint {
     Ok(())
   }
 
-  /// Drains every handshake byte the connection currently has to send, across encryption-level
-  /// boundaries, capturing the 1-RTT keys when they arrive. Stops when a `write_hs` call neither
-  /// changes keys nor writes more bytes (nothing left at any level).
-  fn drain_handshake(&mut self) -> Vec<u8> {
-    let mut out = Vec::new();
+  /// Drains every handshake byte the connection currently has to send, **kept apart by encryption level**
+  /// (RFC 9001 §4.1.3): bytes a `write_hs` call writes belong to the level it was writing at, and a key
+  /// change it reports applies to the calls after. Captures the Handshake keys (which seal this end's
+  /// Handshake-level fragments and open the peer's) and the 1-RTT keys. Stops when a call neither changes
+  /// keys nor writes. A byte written after the 1-RTT keys has no level this dialect carries (session
+  /// tickets are off, `handshake::server_config`) and is refused rather than sent unprotected.
+  fn drain_handshake(&mut self) -> Result<Flight, EndpointError> {
+    let mut flight = Flight::default();
     loop {
-      let before = out.len();
+      let mut out = Vec::new();
       let change = self.quic.write_hs(&mut out);
-      let no_change = change.is_none();
-      if let Some(KeyChange::OneRtt { keys, .. }) = change {
-        self.keys = Some(keys);
+      let wrote = !out.is_empty();
+      match self.levels.write {
+        WriteLevel::Initial => flight.initial.extend_from_slice(&out),
+        WriteLevel::Handshake => flight.handshake.extend_from_slice(&out),
+        WriteLevel::OneRtt if wrote => {
+          return Err(EndpointError::Handshake(HandshakeError::Setup(
+            "TLS wrote handshake bytes after the 1-RTT keys".to_owned(),
+          )));
+        }
+        WriteLevel::OneRtt => {}
       }
-      if no_change && out.len() == before {
-        return out;
+      match change {
+        Some(KeyChange::Handshake { keys }) => {
+          self.levels.keys = Some(keys);
+          self.levels.write = WriteLevel::Handshake;
+        }
+        Some(KeyChange::OneRtt { keys, .. }) => {
+          self.keys = Some(keys);
+          self.levels.write = WriteLevel::OneRtt;
+        }
+        None if !wrote => return Ok(flight),
+        None => {}
       }
     }
+  }
+
+  /// Places one received handshake datagram: a plain fragment into the Initial-level stream; a sealed one,
+  /// opened under the Handshake keys, into the Handshake-level stream — or kept until the keys arrive
+  /// (bounded; a fragment past the bound is dropped as malformed, and the peer's retransmit brings it
+  /// again). A sealed fragment that does not open (tampered, forged, other keys) is malformed: dropped,
+  /// never fed to TLS.
+  fn place(&mut self, datagram: Vec<u8>) -> crate::flight::Reassembly {
+    if crate::flight::is_fragment(&datagram) {
+      return self.reassembler.push(&datagram);
+    }
+    if !crate::flight::is_sealed_fragment(&datagram) {
+      return crate::flight::Reassembly::Malformed;
+    }
+    let Some(keys) = self.levels.keys.as_ref() else {
+      if self.levels.waiting.len() >= crate::flight::MAX_FLIGHT_FRAGMENTS {
+        return crate::flight::Reassembly::Malformed;
+      }
+      self.levels.waiting.push(datagram);
+      return crate::flight::Reassembly::Pending;
+    };
+    match crate::flight::open(&datagram, keys.remote.packet.as_ref()) {
+      Some(plain) => self.levels.reassembler.push(&plain),
+      None => crate::flight::Reassembly::Malformed,
+    }
+  }
+
+  /// Opens the sealed fragments that arrived before the Handshake keys, once the keys are here: the
+  /// peer's Handshake-level flight, if they complete it.
+  fn open_waiting(&mut self) -> Option<Vec<u8>> {
+    let keys = self.levels.keys.as_ref()?;
+    let mut completed = None;
+    for datagram in std::mem::take(&mut self.levels.waiting) {
+      let Some(plain) = crate::flight::open(&datagram, keys.remote.packet.as_ref()) else {
+        self.discarded = self.discarded.saturating_add(1);
+        continue;
+      };
+      if let crate::flight::Reassembly::Flight(flight) = self.levels.reassembler.push(&plain) {
+        completed = Some(flight);
+      }
+    }
+    completed
   }
 
   /// Sends a **new** handshake `flight` — the next of this end's stream, starting at `hs_sent` — and
@@ -960,10 +1079,11 @@ impl Endpoint {
   /// several fragments the peer reassembles, rather than one oversized datagram that a router may drop
   /// or the receiver truncate. A flight past the bounds is refused typed (`FlightTooLarge`) before a byte
   /// leaves and before the stream advances.
-  fn send_new_flight(&mut self, flight: &[u8]) -> Result<(), EndpointError> {
-    let start = self.hs_sent;
-    self.send_flight_at(flight, start)?;
-    self.hs_sent += flight.len();
+  fn send_new_flight(&mut self, flight: &Flight) -> Result<(), EndpointError> {
+    let (initial, sealed) = (self.hs_sent, self.levels.sent);
+    self.send_flight_at(flight, initial, sealed)?;
+    self.hs_sent = self.hs_sent.saturating_add(flight.initial.len());
+    self.levels.sent = self.levels.sent.saturating_add(flight.handshake.len());
     Ok(())
   }
 
@@ -971,18 +1091,44 @@ impl Endpoint {
   /// its first send, so the peer places its fragments identically (a retransmit of a consumed flight is
   /// recognized by its start and not re-fed). Fragmentation is deterministic, so the datagrams are
   /// byte-identical to the first send's.
-  fn resend_flight(&mut self, flight: &[u8]) -> Result<(), EndpointError> {
-    let start = self.hs_sent.saturating_sub(flight.len());
-    self.send_flight_at(flight, start)
+  fn resend_flight(&mut self, flight: &Flight) -> Result<(), EndpointError> {
+    let initial = self.hs_sent.saturating_sub(flight.initial.len());
+    let sealed = self.levels.sent.saturating_sub(flight.handshake.len());
+    self.send_flight_at(flight, initial, sealed)
   }
 
-  /// The fragmented send both forms share.
-  fn send_flight_at(&mut self, flight: &[u8], start: usize) -> Result<(), EndpointError> {
-    let fragments =
-      crate::flight::fragment(flight, start).ok_or(EndpointError::FlightTooLarge {
-        bytes: flight.len(),
-        cap: crate::flight::MAX_FLIGHT_BYTES,
+  /// The fragmented send both forms share: the Initial-level bytes as plain fragments at `initial` of that
+  /// stream, then the Handshake-level bytes sealed under the Handshake keys at `sealed` of theirs — each
+  /// sealed fragment under a fresh number, a retransmit included, so no nonce repeats (AUD-29-47).
+  fn send_flight_at(
+    &mut self,
+    flight: &Flight,
+    initial: usize,
+    sealed: usize,
+  ) -> Result<(), EndpointError> {
+    let too_large = |bytes: usize| EndpointError::FlightTooLarge {
+      bytes,
+      cap: crate::flight::MAX_FLIGHT_BYTES,
+    };
+    let mut fragments = crate::flight::fragment(&flight.initial, initial)
+      .ok_or_else(|| too_large(flight.initial.len()))?;
+    if !flight.handshake.is_empty() {
+      let keys = self.levels.keys.as_ref().ok_or(EndpointError::NotReady)?;
+      let sealed = crate::flight::seal(
+        &flight.handshake,
+        sealed,
+        keys.local.packet.as_ref(),
+        &mut self.levels.numbers,
+      )
+      .map_err(|refusal| match refusal {
+        crate::flight::SealRefusal::TooLarge => too_large(flight.handshake.len()),
+        crate::flight::SealRefusal::NumbersExhausted => EndpointError::PacketNumbersExhausted,
+        crate::flight::SealRefusal::Sealing => EndpointError::Handshake(HandshakeError::Setup(
+          "the AEAD refused a handshake fragment".to_owned(),
+        )),
       })?;
+      fragments.extend(sealed);
+    }
     for fragment in &fragments {
       self.send(fragment)?;
       self.fragments_sent = self.fragments_sent.saturating_add(1);
@@ -1640,13 +1786,18 @@ mod tests {
           .unwrap();
           // Run the real TLS state machine synchronously to isolate confirmation from flight delivery.
           for _ in 0..HANDSHAKE_TURN_CEILING {
-            let to_server = client.drain_handshake();
-            if !to_server.is_empty() {
-              server.quic.read_hs(&to_server).unwrap();
+            // Each level's bytes in order, as the wire delivers them once opened.
+            let to_server = client.drain_handshake().unwrap();
+            for part in [&to_server.initial, &to_server.handshake] {
+              if !part.is_empty() {
+                server.quic.read_hs(part).unwrap();
+              }
             }
-            let to_client = server.drain_handshake();
-            if !to_client.is_empty() {
-              client.quic.read_hs(&to_client).unwrap();
+            let to_client = server.drain_handshake().unwrap();
+            for part in [&to_client.initial, &to_client.handshake] {
+              if !part.is_empty() {
+                client.quic.read_hs(part).unwrap();
+              }
             }
             if client.keys.is_some()
               && server.keys.is_some()
@@ -1663,7 +1814,8 @@ mod tests {
             (server, client)
           };
           let interval = receiver.handshake_probe_ceiling() / 2;
-          let mut confirmation = std::pin::pin!(receiver.confirm_handshake(&[]));
+          let no_flight = Flight::default();
+          let mut confirmation = std::pin::pin!(receiver.confirm_handshake(&no_flight));
           // Every received datagram provokes another. Bound the fixture itself so the pre-fix failure
           // is a fast assertion, never an infinite test. Confirmation must refuse before this count.
           let count = MAX_PARTIAL_FRAGMENTS_PER_TURN + 1;

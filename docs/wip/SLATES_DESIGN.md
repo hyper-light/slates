@@ -3590,6 +3590,20 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 
 > **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
 
+> **Status (2026-09-30, AUD-29-47).** The handshake keeps TLS's encryption levels apart (RFC 9001 §4.1.3).
+> - **Initial level.** ClientHello and ServerHello cross as plain fragments.
+> - **Handshake level.** EncryptedExtensions, both certificates, CertificateVerify and Finished cross as
+>   sealed fragments.
+>   - Each is AEAD-sealed under that level's packet keys, with its tag and a per-sender number (the nonce
+>     input; retransmits re-seal under fresh numbers, so no nonce repeats) as associated data.
+>   - Each level has its own stream.
+> - **Receiving.** A receiver holds sealed fragments that arrive before their keys (bounded at one flight)
+>   and opens them once its ServerHello yields the keys. A fragment that does not open is dropped and
+>   counted, and a sealed-fragment number with no successor is refused.
+> - **Before.** Both levels crossed as one plaintext stream, and an on-path observer read the
+>   certificates. `crates/transport/tests/handshake_levels.rs` is red on the old flattening and green
+>   now (`docs/bugs/2026-09-30-the-handshake-sent-its-certificates-in-plaintext.md`).
+>
 > **Status (2026-09-30, AUD-29-27).** A session never reuses a packet number under its keys.
 > - **The space ends at `2^62`** (RFC 9000 §12.3). Once it is spent, the connection sends nothing: no packet,
 >   probe or confirmation, and no frame is taken from a queue. Its endpoint ends the session
