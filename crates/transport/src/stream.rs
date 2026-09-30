@@ -189,7 +189,16 @@ impl StreamAssembler {
   /// are dropped (idempotent under reorder/duplicate/overlap); a `fin` records the stream's final
   /// length. Refuses a segment reaching past the window, or a `fin` conflicting with an earlier one.
   pub fn offer(&mut self, offset: u64, data: &[u8], fin: bool) -> Result<(), StreamError> {
-    let end = offset.saturating_add(data.len() as u64);
+    // A segment whose end is past the offset range is refused before anything is recorded (AUD-29-27).
+    let Some(end) = u64::try_from(data.len())
+      .ok()
+      .and_then(|len| offset.checked_add(len))
+    else {
+      return Err(StreamError::BeyondWindow {
+        end: u64::MAX,
+        window: self.window,
+      });
+    };
     if end > self.window {
       return Err(StreamError::BeyondWindow {
         end,

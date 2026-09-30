@@ -418,8 +418,12 @@ impl Connection {
   /// with no stream bytes, so it takes no room in the congestion window; its loss is kept out of the
   /// controller (RFC 9000 §14.4). `None` when no probe is due.
   pub fn poll_probe(&mut self, now: u64) -> Option<(u64, usize)> {
+    // A spent packet-number space sends nothing, before any state moves (the session ends: AUD-29-27).
+    if self.sent.exhausted() {
+      return None;
+    }
     let size = self.path_mtu.as_mut()?.next_probe(now)?;
-    let pn = self.sent.next_pn();
+    let pn = self.sent.next_pn()?;
     self.sent.on_sent(
       pn,
       vec![Frame::Ping],
@@ -526,6 +530,10 @@ impl Connection {
   /// the pacer (RFC 9002 §6.2.4); then, if an acknowledgement is owed, the acknowledgement followed by the
   /// current receive credit. An acknowledgement-only packet is neither paced nor window-limited.
   pub fn poll_transmit(&mut self, now: u64, packet_budget: usize) -> Option<(u64, Vec<Frame>)> {
+    // A spent packet-number space sends nothing, before any frame is taken from its queue (AUD-29-27).
+    if self.sent.exhausted() {
+      return None;
+    }
     let budget = packet_budget as u64;
     // With nothing recoverable in flight no probe timer runs, so a blocked sender reports itself (a lone
     // path-MTU probe carries nothing and does not count: it once silenced this report and deadlocked a
@@ -557,7 +565,7 @@ impl Connection {
     if frames.is_empty() {
       return None;
     }
-    let pn = self.sent.next_pn();
+    let pn = self.sent.next_pn()?;
     if !reliable.is_empty() {
       // The datagram's size on the wire: the frames plus the packet's fixed overhead (an upper bound — the
       // packet number may encode shorter than its longest form).
@@ -1495,9 +1503,15 @@ impl Connection {
   /// ([`Endpoint::establish`](crate::Endpoint::establish)); see RFC 9000 §19.20, RFC 9001 §4.1.2. It is
   /// not ack-eliciting and not tracked; the endpoint resends a confirmation with a fresh number each
   /// probe timeout, so no number is ever reused under the packet keys (RFC 9001 §9.5).
-  pub fn emit_confirm(&mut self) -> (u64, Vec<Frame>) {
-    let pn = self.sent.next_pn();
-    (pn, vec![self.flow.connection_credit_frame()])
+  pub fn emit_confirm(&mut self) -> Option<(u64, Vec<Frame>)> {
+    let pn = self.sent.next_pn()?;
+    Some((pn, vec![self.flow.connection_credit_frame()]))
+  }
+
+  /// Whether the packet-number space is spent (`2^62`, RFC 9000 §12.3): the connection sends nothing more
+  /// and its endpoint ends the session ([`EndpointError::PacketNumbersExhausted`](crate::EndpointError)).
+  pub fn packet_numbers_exhausted(&self) -> bool {
+    self.sent.exhausted()
   }
 
   /// Drains the bytes now contiguous on receive stream `stream_id` (in order, each once) at `now`, slides
@@ -1737,6 +1751,27 @@ mod tests {
       },
       role,
     )
+  }
+
+  /// AUD-29-27: do: a connection whose packet-number space is spent, with data queued; poll a packet, a
+  /// probe and a handshake confirmation; expect nothing sent, the queued data still queued (no frame taken
+  /// from its queue), and the connection reporting its space spent — the endpoint then ends the session.
+  #[test]
+  fn a_spent_packet_number_space_sends_nothing_and_loses_nothing() {
+    let cap = 1200;
+    let mut sender = fixed(cap, Role::Client);
+    let content = vec![7u8; 100];
+    let _ = open(&mut sender, &content);
+    sender.sent = crate::conn::SentTracker::starting_at(crate::packet_number::PACKET_NUMBER_SPACE);
+    let budget = sender.packet_budget(cap);
+    assert_eq!(sender.poll_transmit(1_000, budget), None);
+    assert_eq!(sender.poll_probe(1_000), None);
+    assert_eq!(sender.emit_confirm(), None);
+    assert!(sender.packet_numbers_exhausted());
+    // The queue was not touched: a fresh number space would still send the data.
+    sender.sent = crate::conn::SentTracker::new();
+    let sent = sender.poll_transmit(1_000, budget);
+    assert!(sent.is_some_and(|(_, frames)| !frames.is_empty()));
   }
 
   /// §4.10a (RFC 9000 §19.13; `docs/bugs/2026-09-28-a-lone-path-probe-silenced-the-blocked-report.md`): a

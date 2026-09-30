@@ -115,12 +115,19 @@ impl FlowController {
   /// The stream's credit ceiling to advertise: consumed + the window. Never the whole object — it
   /// stays exactly `window_ahead` beyond what has been read.
   pub fn stream_max(&self, stream_id: u64) -> u64 {
-    self.stream_consumed.get(&stream_id).copied().unwrap_or(0) + self.window_ahead
+    // Saturating: the ceiling is a `u64` on the wire (D-15), and the read cursor it adds to cannot pass the
+    // bytes actually received — the bound is exact, and never an overflow (AUD-29-27).
+    self
+      .stream_consumed
+      .get(&stream_id)
+      .copied()
+      .unwrap_or(0)
+      .saturating_add(self.window_ahead)
   }
 
   /// The connection's credit ceiling to advertise.
   pub fn connection_max(&self) -> u64 {
-    self.connection_consumed + self.window_ahead
+    self.connection_consumed.saturating_add(self.window_ahead)
   }
 
   /// The `MaxStreamData` frame advertising this stream's current credit ceiling.

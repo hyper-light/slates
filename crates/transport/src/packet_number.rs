@@ -24,6 +24,10 @@ pub const MAX_PACKET_NUMBER_BYTES: u32 = 4;
 /// constant. Used to clamp a reconstructed number to a value the space can actually hold.
 const PACKET_NUMBER_SPACE_BITS: u32 = 62;
 
+/// The first packet number the space cannot hold (`2^62`): a sender reaching it closes the connection and
+/// never reuses a number under its keys (RFC 9000 §12.3; AUD-29-27).
+pub(crate) const PACKET_NUMBER_SPACE: u64 = 1 << PACKET_NUMBER_SPACE_BITS;
+
 /// A packet number truncated for the wire: its `len` (1–4) least-significant bytes, big-endian (QUIC
 /// network byte order), in the first `len` bytes of `bytes`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -258,11 +258,30 @@ impl SentTracker {
     SentTracker::default()
   }
 
-  /// Assigns the next monotonic packet number.
-  pub fn next_pn(&mut self) -> u64 {
+  /// A tracker whose next number is `next` (a test seeding the tracker near the space's end).
+  #[cfg(test)]
+  pub(crate) fn starting_at(next: u64) -> SentTracker {
+    SentTracker {
+      next_pn: next,
+      ..SentTracker::default()
+    }
+  }
+
+  /// Assigns the next monotonic packet number, or `None` once the packet-number space is spent (`2^62`,
+  /// RFC 9000 §12.3): the connection must then close, never reuse a number under its keys (AUD-29-27; the
+  /// tracker saturated at `u64::MAX` and returned that number repeatedly until 2026-09-30).
+  pub fn next_pn(&mut self) -> Option<u64> {
+    if self.exhausted() {
+      return None;
+    }
     let pn = self.next_pn;
-    self.next_pn = self.next_pn.saturating_add(1);
-    pn
+    self.next_pn = pn.checked_add(1)?;
+    Some(pn)
+  }
+
+  /// Whether the packet-number space is spent: no number is left to send under these keys.
+  pub fn exhausted(&self) -> bool {
+    self.next_pn >= crate::packet_number::PACKET_NUMBER_SPACE
   }
 
   /// The next packet number that will be assigned, without advancing it — the packet-number cursor,
@@ -541,6 +560,23 @@ impl SentTracker {
 
 #[cfg(test)]
 mod tests {
+
+  /// AUD-29-27 (RFC 9000 §12.3): do: a tracker two numbers short of the packet-number space's end; take
+  /// numbers until it refuses; expect the last two numbers, each once, then `None` for good — never a
+  /// repeated number (the old tracker saturated at `u64::MAX` and returned it forever).
+  #[test]
+  fn the_packet_number_space_ends_without_a_repeat() {
+    let space = crate::packet_number::PACKET_NUMBER_SPACE;
+    let mut sent = SentTracker {
+      next_pn: space - 2,
+      ..SentTracker::default()
+    };
+    assert_eq!(sent.next_pn(), Some(space - 2));
+    assert_eq!(sent.next_pn(), Some(space - 1));
+    assert!(sent.exhausted());
+    assert_eq!(sent.next_pn(), None);
+    assert_eq!(sent.next_pn(), None);
+  }
   use super::*;
   use crate::stream::{StreamAssembler, StreamSender};
 
@@ -720,7 +756,7 @@ mod tests {
   fn a_multi_range_ack_frees_every_run() {
     let mut sent = SentTracker::new();
     for pn in 0..6 {
-      assert_eq!(sent.next_pn(), pn);
+      assert_eq!(sent.next_pn(), Some(pn));
       sent.on_sent(
         pn,
         vec![Frame::Stream {
@@ -765,7 +801,7 @@ mod tests {
     let mut sent = SentTracker::new();
     for pn in 0..6 {
       let got = sent.next_pn();
-      assert_eq!(got, pn);
+      assert_eq!(got, Some(pn));
       sent.on_sent(pn, vec![Frame::MaxData { max: pn }], 0, 0);
     }
     // Acknowledge [2,5]; 0 and 1 remain in flight, both >= REORDER_THRESHOLD below largest (5).
@@ -872,7 +908,7 @@ mod tests {
       if frames.is_empty() {
         break; // nothing new and nothing lost — the non-tail drop never leaves this at completion.
       }
-      let pn = sent.next_pn();
+      let pn = sent.next_pn().unwrap();
       sent.on_sent(pn, frames.clone(), 0, 0);
       // The lossy channel drops the second packet (pn 1) exactly once — a non-tail drop, so later
       // packets advance the largest-acked past the reorder threshold and the loss is detected.

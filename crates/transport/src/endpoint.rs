@@ -181,6 +181,9 @@ pub enum EndpointError {
     /// The largest allowed ([`MAX_PACKET_PAYLOAD`]).
     max: usize,
   },
+  /// The packet-number space is spent (`2^62`, RFC 9000 §12.3): the session closes without sending, and no
+  /// number is ever reused under its keys (AUD-29-27). A re-dial starts a fresh session.
+  PacketNumbersExhausted,
   /// A 1-RTT packet came out larger than the datagram floor — the packet builder's budget was broken.
   /// Refused rather than sent, so the fault is loud instead of a packet a path silently drops.
   DatagramTooLarge {
@@ -922,7 +925,10 @@ impl Endpoint {
   /// fresh packet number and a re-advertised flow-control credit, protected under the local 1-RTT keys.
   fn send_confirm(&mut self) -> Result<(), EndpointError> {
     let cid = self.connection_id()?;
-    let (pn, frames) = self.conn.emit_confirm();
+    let (pn, frames) = self
+      .conn
+      .emit_confirm()
+      .ok_or(EndpointError::PacketNumbersExhausted)?;
     let largest_acked = self.conn.tx_largest_acked();
     let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames, 0)?;
@@ -1009,6 +1015,10 @@ impl Endpoint {
         });
       }
       self.send(&datagram)?;
+    }
+    // A spent packet-number space ends the session here, typed: nothing more can be sent under these keys.
+    if self.conn.packet_numbers_exhausted() {
+      return Err(EndpointError::PacketNumbersExhausted);
     }
     // Then the path-MTU probe, if one is due: a `Ping` padded to the size under test. A size the local stack
     // refuses (`EMSGSIZE`: past the interface, or past the host's datagram cap) bounds the search at once and
