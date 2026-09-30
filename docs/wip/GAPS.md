@@ -3165,9 +3165,10 @@ baseline requirement on every platform, Windows included: only a base read (host
 server) and a granted landing touch disk. No `/tmp`, no temporary directory, no RAM directory (tmpfs,
 `/dev/shm`, RAM disks are filesystems), in tests as in the product. The contract is in the design (§0.2) and
 its site table is enforced by `cargo xtask check`. Defects to remove: the CLI's reads of fleet manifest,
-certificate, key and recovery-key files; every test fixture that creates a directory or file (the server
-tests' landing targets and mount points, the CLI and client tests' `mktemp -d`, xtask conformance scratch and
-mount points, `$RUNNER_TEMP`), to move onto in-memory seams (the daemon landing through an injected host);
+certificate, key and recovery-key files; landing targets, bases and mount points that tests make under the
+system temporary directory (`mktemp -d`), which move to the build output (a landing writes a real disk by
+design, and tests exercise it for real); other test scratch and xtask conformance scratch under `$RUNNER_TEMP`
+or `mktemp -d`;
 persisted proptest failures (AUD-29-63); proof of what backs each kernel pseudo-file the machine profile
 reads. The residency, disclosure and ownership claims stay open with their findings (AUD-29-41, -42, -43,
 -44, -45, -59, -62).

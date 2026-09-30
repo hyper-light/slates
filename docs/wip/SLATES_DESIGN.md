@@ -77,9 +77,17 @@ only reads are of a volume's base (a host directory, or a remote file server). T
 temporary directory, and RAM-backed directories too: tmpfs, `/dev/shm` and RAM disks are still filesystems.
 It holds on every platform, Windows included, and it binds the tests and harnesses exactly as it binds the
 product: a test exercises a base or a landing through an in-memory host, never a directory it creates.
-Exactly two disk contacts are sanctioned, and nothing else: reading the base an overlay volume sits on
-(`slates-base`, read-only), and writing a landing a human granted, inside its target only (`slates-land`:
-its entries, hidden temporaries, entries moved aside and any kept beside their names). Every other current
+Exactly two disk contacts are sanctioned, and nothing else: reading a volume's base, and the landing. The
+base is shared, immutable and never copied (the CitC/EdenFS model, `research/edenfs-scale-distribution.md`
+§2.1–§2.5): on a laptop, the host directory an overlay sits on (`slates-base`, read-only); across the fleet,
+content-addressed chunks and manifests attached as a manifest reference and fetched lazily from holders' RAM
+— RAM to RAM, never through a disk. Unlike EdenFS, whose overlay is on disk, a volume's private delta stays in
+RAM. The landing is the explicit, human-granted merge, and it writes to the host's disk: it materializes the
+delta, including content the volume pulled from a remote holder, inside its target only (`slates-land`: its
+entries, hidden temporaries, entries moved aside and any kept beside their names). The laptop and the global
+fleet are one code path: nodes exchange content in RAM, and only a landing writes a host disk. Tests exercise
+that real usage: a landing test writes a real target on disk and an overlay test reads a real base on disk
+(under the build output, never `/tmp`); neither is moved onto an in-memory host. Every other current
 contact is a defect against this requirement, recorded here and in GAPS until it is removed:
 
 - the operator commands' reads of a fleet manifest, its certificates and key, resolver configuration, and a
@@ -88,8 +96,9 @@ contact is a defect against this requirement, recorded here and in GAPS until it
   but the path alone does not prove the backing object, so each interface is to be identified;
 - test fixtures and harnesses that create directories or files anywhere — `mktemp -d`, `$RUNNER_TEMP`,
   mount points, landing targets, manifests — or persist property-test failures beside the source
-  (AUD-29-63). Their remedy is an in-memory seam (the daemon lands through an injected host, as the engine
-  does over its simulated host), never a RAM directory.
+  (AUD-29-63), except a landing's target and a base, which are the sanctioned contacts themselves and move
+  from the system temporary directory to the build output; the rest is scratch to remove, never moved into a
+  RAM directory.
 
 Four separate claims follow from it, each needing its own evidence:
 
