@@ -474,6 +474,21 @@ impl Connection {
     }
   }
 
+  /// The most of this end's streams that may wait past the peer's credit (`StreamSpace::limit`).
+  pub fn stream_limit(&self) -> u64 {
+    self.streams.limit()
+  }
+
+  /// Notes whether exchanges wait unbound for the stream credit (`StreamSpace::set_wanting`).
+  pub fn set_streams_wanted(&mut self, wanted: bool) {
+    self.streams.set_wanting(wanted);
+  }
+
+  /// Whether an exchange of class `priority` may open its stream now (`StreamSpace::admits`).
+  pub fn admits(&self, priority: Priority) -> bool {
+    self.streams.admits(priority)
+  }
+
   /// Opens this end's next stream, of request `kind` in class `priority`, carrying the whole of `data`
   /// (finished), and returns its id; the peer's reply arrives on the same id. The stream waits unsent
   /// while the peer's stream credit does not cover it, and a limit's worth waiting is a typed refusal

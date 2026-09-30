@@ -26,7 +26,7 @@
 //! own socket or such a shared one (`Link`). Remaining connection work: an MTU budget (several frames
 //! per packet). The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::task::Poll;
 
 use rustix::net::SocketAddrV4;
@@ -212,6 +212,22 @@ fn checked_budget(shape: &ConnectionShape) -> Result<usize, EndpointError> {
       min,
       max: MAX_PACKET_PAYLOAD,
     })
+}
+
+/// One of this end's exchanges: its stream once bound, and the reply bytes read so far.
+#[derive(Debug)]
+struct Exchange {
+  stream: Option<u64>,
+  reply: Vec<u8>,
+}
+
+/// An exchange begun but not yet bound to a stream ([`Endpoint::begin`]).
+#[derive(Debug)]
+struct Queued {
+  exchange: u64,
+  kind: u64,
+  priority: Priority,
+  request: Vec<u8>,
 }
 
 /// Everything an endpoint holds per exchange and per stream ([`Endpoint::census`]).
@@ -442,10 +458,20 @@ pub struct Endpoint {
   /// undecryptable packet is discarded, never fatal). A counter, so a test can assert the discard path
   /// ran.
   discarded: u64,
-  /// This end's open exchanges (requests sent, replies not yet taken), each with the reply bytes read so
-  /// far — bounded by the stream credit (`crate::streams`: a limit's worth in flight and a limit's worth
-  /// waiting) and each reply by its flow-control window.
-  exchanges: BTreeMap<u64, Vec<u8>>,
+  /// This end's open exchanges by exchange id (requests begun, replies not yet taken), each with its stream
+  /// once bound and the reply bytes read so far — bounded by the stream credit (a limit's worth bound past
+  /// it) and the queue below, and each reply by its flow-control window.
+  exchanges: BTreeMap<u64, Exchange>,
+  /// The exchange each bound stream carries, so a reply's bytes find their exchange.
+  by_stream: BTreeMap<u64, u64>,
+  /// Exchanges begun but not yet bound to a stream, in the order begun: a class binds only while the
+  /// stream credit leaves a slot for each more urgent class (`Connection::admits`), so an exchange waits
+  /// here unsequenced rather than take a sequence a later, more urgent exchange would queue behind (the
+  /// constrained-link design §5.3; credit is by sequence, RFC 9000 §4.6). Bounded by the stream limit, less a
+  /// slot per more urgent class: past it, `begin` is refused `Backlogged`.
+  queued: VecDeque<Queued>,
+  /// The id the next exchange takes.
+  next_exchange: u64,
   /// The peer's requests still arriving, by stream id, with the bytes read so far — bounded by the stream
   /// credit this end extends and the flow-control window.
   arriving: BTreeMap<u64, Vec<u8>>,
@@ -503,6 +529,9 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
+      by_stream: BTreeMap::new(),
+      queued: VecDeque::new(),
+      next_exchange: 0,
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
     })
@@ -545,6 +574,9 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
+      by_stream: BTreeMap::new(),
+      queued: VecDeque::new(),
+      next_exchange: 0,
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
     })
@@ -589,6 +621,9 @@ impl Endpoint {
       handshake_budgets_spent: 0,
       discarded: 0,
       exchanges: BTreeMap::new(),
+      by_stream: BTreeMap::new(),
+      queued: VecDeque::new(),
+      next_exchange: 0,
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
     })
@@ -1284,6 +1319,8 @@ impl Endpoint {
   /// under the local 1-RTT keys (the number sized against what the peer has acknowledged) and sent.
   fn flush(&mut self) -> Result<(), EndpointError> {
     let cid = self.connection_id()?;
+    // Credit that arrived since the last turn admits waiting exchanges before anything is sent.
+    self.bind_queued()?;
     // Packets are framed at the path MTU discovery has confirmed (the floor until it confirms more), and no
     // datagram may exceed it.
     let cap = self.conn.path_mtu().unwrap_or(MIN_DATAGRAM_BYTES);
@@ -1441,45 +1478,110 @@ impl Endpoint {
     Ok(())
   }
 
-  /// Begins an exchange: sends `request` on this end's next stream, of `kind` in class `priority`, and
-  /// returns its id; the reply arrives on the same id and is taken with [`take_reply`](Endpoint::take_reply)
-  /// once complete, while [`drive`](Endpoint::drive) runs the session. Several exchanges run at once, each
-  /// scheduled by its class — a record commit is never queued behind a content put on the same session. An
-  /// exchange past the peer's stream credit waits unsent; a limit's worth waiting is refused typed.
+  /// Begins an exchange: sends `request` on a stream of this end, of `kind` in class `priority`, and returns
+  /// its id; the reply is taken with [`take_reply`](Endpoint::take_reply) once complete, while
+  /// [`drive`](Endpoint::drive) runs the session. Several exchanges run at once, each scheduled by its class
+  /// — a record commit is never queued behind a content put on the same session, in the packet schedule,
+  /// the connection credit or the stream credit: an exchange binds to a stream only while the peer's stream
+  /// credit leaves a slot for each more urgent class, and waits unsequenced until then, so a more urgent
+  /// exchange begun later binds first. A limit's worth waiting unbound is refused typed.
   pub fn begin(
     &mut self,
     kind: u64,
     priority: Priority,
     request: &[u8],
   ) -> Result<u64, EndpointError> {
-    let stream_id = self
+    // The wait is bounded by the stream limit, less a slot per more urgent class: bulk exchanges filling
+    // the queue never refuse a control exchange begun after them.
+    let limit = self
       .conn
-      .open_exchange(kind, priority, request)
-      .map_err(EndpointError::Stream)?;
-    self.exchanges.insert(stream_id, Vec::new());
-    Ok(stream_id)
+      .stream_limit()
+      .saturating_sub(priority.classes_above());
+    let waiting = u64::try_from(self.queued.len()).unwrap_or(u64::MAX);
+    if waiting >= limit {
+      return Err(EndpointError::Stream(
+        crate::streams::StreamRefusal::Backlogged { waiting, limit },
+      ));
+    }
+    let exchange = self.next_exchange;
+    self.next_exchange = exchange.checked_add(1).ok_or(EndpointError::Stream(
+      crate::streams::StreamRefusal::SequencesExhausted,
+    ))?;
+    self.exchanges.insert(
+      exchange,
+      Exchange {
+        stream: None,
+        reply: Vec::new(),
+      },
+    );
+    self.queued.push_back(Queued {
+      exchange,
+      kind,
+      priority,
+      request: request.to_vec(),
+    });
+    self.bind_queued()?;
+    Ok(exchange)
+  }
+
+  /// Binds waiting exchanges to streams while the stream credit admits them: the most urgent class first,
+  /// in the order begun within a class (`Connection::admits`).
+  fn bind_queued(&mut self) -> Result<(), EndpointError> {
+    loop {
+      let next = Priority::ALL.iter().find_map(|&class| {
+        if !self.conn.admits(class) {
+          return None;
+        }
+        self
+          .queued
+          .iter()
+          .position(|queued| queued.priority == class)
+      });
+      let Some(queued) = next.and_then(|at| self.queued.remove(at)) else {
+        self.conn.set_streams_wanted(!self.queued.is_empty());
+        return Ok(());
+      };
+      let stream = self
+        .conn
+        .open_exchange(queued.kind, queued.priority, &queued.request)
+        .map_err(EndpointError::Stream)?;
+      self.by_stream.insert(stream, queued.exchange);
+      if let Some(exchange) = self.exchanges.get_mut(&queued.exchange) {
+        exchange.stream = Some(stream);
+      }
+    }
   }
 
   /// The reply of exchange `id` if it has arrived whole, taking it (the exchange is then finished and its
-  /// receiving half closed); `None` while it is still arriving or for an unknown exchange. A receive
-  /// stream counts complete only once every byte through its `fin` has been read, so the reply taken is
-  /// always whole.
+  /// receiving half closed); `None` while it is still waiting or arriving, or for an unknown exchange. A
+  /// receive stream counts complete only once every byte through its `fin` has been read, so the reply
+  /// taken is always whole.
   pub fn take_reply(&mut self, id: u64) -> Option<Vec<u8>> {
     self.drain();
-    if !self.conn.recv_stream_complete(id) {
+    let stream = self.exchanges.get(&id)?.stream?;
+    if !self.conn.recv_stream_complete(stream) {
       return None;
     }
-    let reply = self.exchanges.remove(&id)?;
-    self.conn.close_recv(id);
-    Some(reply)
+    let exchange = self.exchanges.remove(&id)?;
+    self.by_stream.remove(&stream);
+    self.conn.close_recv(stream);
+    Some(exchange.reply)
   }
 
-  /// Abandons exchange `id`: its request stops sending (`ResetStream`) and its reply is refused
-  /// (`StopSending`), so the path stops carrying either; the session's other exchanges are untouched.
+  /// Abandons exchange `id`: a bound one's request stops sending (`ResetStream`) and its reply is refused
+  /// (`StopSending`), so the path stops carrying either; one still waiting is dropped from the queue. The
+  /// session's other exchanges are untouched.
   pub fn abandon(&mut self, id: u64) {
-    if self.exchanges.remove(&id).is_some() {
-      self.conn.reset_stream(id);
-      self.conn.stop_sending(id);
+    let Some(exchange) = self.exchanges.remove(&id) else {
+      return;
+    };
+    match exchange.stream {
+      Some(stream) => {
+        self.by_stream.remove(&stream);
+        self.conn.reset_stream(stream);
+        self.conn.stop_sending(stream);
+      }
+      None => self.queued.retain(|queued| queued.exchange != id),
     }
   }
 
@@ -1517,11 +1619,7 @@ impl Endpoint {
 
   /// The id of the exchange [`begin`](Endpoint::begin) most recently started, if it is still open.
   pub fn last_exchange(&self) -> Option<u64> {
-    self
-      .exchanges
-      .keys()
-      .copied()
-      .max_by_key(|&id| crate::streams::sequence(id))
+    self.exchanges.keys().next_back().copied()
   }
 
   /// Abandons every open exchange (a caller dropping a session's pending work).
@@ -1656,8 +1754,13 @@ impl Endpoint {
       if crate::streams::initiator(id) == role {
         // A reply to this end's exchange. One no longer open (taken or abandoned) is already closed at the
         // connection, so its frames never reach here; should one, it is refused, never read as a request.
-        match self.exchanges.get_mut(&id) {
-          Some(reply) => reply.extend_from_slice(&chunk),
+        match self
+          .by_stream
+          .get(&id)
+          .copied()
+          .and_then(|exchange| self.exchanges.get_mut(&exchange))
+        {
+          Some(exchange) => exchange.reply.extend_from_slice(&chunk),
           None => self.conn.stop_sending(id),
         }
         continue;

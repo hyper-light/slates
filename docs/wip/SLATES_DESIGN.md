@@ -3629,6 +3629,13 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   window plus reserve stays within the session's receive ceiling. Both ends derive the reserve from the
 >   shape's frame cap (R8).
 > - **Blocked reports** fire when any class with data waiting has no credit it may spend.
+> - **Stream credit too.** An exchange binds to a stream only while the peer's stream credit leaves a slot
+>   for each more urgent class (control may wait past the credit up to the limit). Otherwise it waits
+>   unsequenced in the endpoint, in a queue bounded by the limit less a slot per more urgent class, and binds
+>   most urgent first as credit arrives. Waiting exchanges count as blocked (`STREAMS_BLOCKED`). A ping
+>   behind twice a limit's worth of bulk exchanges went from waiting for them (1,561 ms at session start)
+>   to within the head-of-line bound
+>   (`docs/bugs/2026-09-30-bulk-exchanges-held-the-stream-credit-a-control-exchange-needed.md`).
 > - **Evidence.** On one session across a 1 Mbit/s, 40 ms bottleneck with a bulk transfer loading it, the
 >   worst of twelve control pings fell from 118 ms (a 68 ms wait for credit) to 79 ms. The head-of-line
 >   test's bound is now RTT + queue + two packets, down from four

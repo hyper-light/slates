@@ -852,3 +852,121 @@ async fn dead_peer_client(mut endpoint: Endpoint) -> (Endpoint, Result<bool, Str
   }
   (endpoint, Ok(cut_off))
 }
+
+/// Shape: each bulk exchange of the stream-slot scenario — a few packets, so the bulk streams stay open
+/// long enough on the 1 Mbit/s link for the ping to meet them.
+const SLOT_BULK_BYTES: usize = 8 * 1024;
+
+/// What the stream-slot client measured.
+#[derive(Debug)]
+struct SlotOutcome {
+  ping_latency_ns: u64,
+  bulk_begun: usize,
+  bulk_done_at_ping: usize,
+}
+
+/// AC (§4.10a; the constrained-link design §5.3 applied to stream credit, RFC 9000 §4.6): on a session whose
+/// stream limit is small, bulk exchanges begun past what the peer's credit covers never take the slots a
+/// more urgent exchange needs. Do X (begin twice the limit's worth of bulk exchanges on a 1 Mbit/s path,
+/// then — once the bulk flow has settled into the path — one control ping), expect Y (the ping is admitted and answered within the head-of-line bound — RTT +
+/// one queue drain + two packets — while bulk exchanges are still running, and every bulk exchange admitted
+/// completes). Until 2026-09-30 the bulk exchanges took every sequence up to the limit past the credit, and
+/// the ping was refused `Backlogged` or waited behind them.
+#[test]
+fn a_control_exchange_is_not_stranded_behind_bulk_exchanges_holding_the_stream_credit() {
+  let net = Net {
+    link: Some((HOL_RATE, HOL_BDP_BYTES)),
+    ..Net::clean(HOL_ONE_WAY_NS)
+  };
+  let serialization_ns = MIN_DATAGRAM_BYTES as u64 * 8 * NS_PER_SECOND / HOL_RATE;
+  let queue_drain_ns = HOL_BDP_BYTES * 8 * NS_PER_SECOND / HOL_RATE;
+  let bound_ns = 2 * HOL_ONE_WAY_NS + queue_drain_ns + 2 * serialization_ns;
+  let limit = usize::try_from(stream_limit(CREDIT_WINDOWS)).unwrap();
+  for seed in [1, 2, 3] {
+    let report = run_session(
+      seed,
+      net,
+      CREDIT_WINDOWS,
+      ServerMode::Serve,
+      move |endpoint| slots_client(endpoint, 2 * limit),
+    );
+    assert_clean(&format!("seed {seed}"), &report);
+    let outcome = report.client.as_ref().unwrap();
+    assert!(
+      outcome.bulk_begun > limit / 2,
+      "seed {seed}: the bulk exchanges filled the credit: {outcome:?}"
+    );
+    assert!(
+      outcome.bulk_done_at_ping < outcome.bulk_begun,
+      "seed {seed}: bulk exchanges were still running when the ping completed: {outcome:?}"
+    );
+    assert!(
+      outcome.ping_latency_ns <= bound_ns,
+      "seed {seed}: the ping took {} ms, past the {} ms bound: {outcome:?}",
+      outcome.ping_latency_ns / MS,
+      bound_ns / MS
+    );
+  }
+}
+
+async fn slots_client(
+  mut endpoint: Endpoint,
+  bulk: usize,
+) -> (Endpoint, Result<SlotOutcome, String>) {
+  let outcome = slots_work(&mut endpoint, bulk).await;
+  (endpoint, outcome)
+}
+
+async fn slots_work(endpoint: &mut Endpoint, bulk: usize) -> Result<SlotOutcome, String> {
+  let mut open = Vec::new();
+  for index in 0..bulk {
+    match endpoint.begin(BULK, Priority::Bulk, &vec![0xB5; SLOT_BULK_BYTES]) {
+      Ok(id) => open.push(id),
+      Err(EndpointError::Stream(StreamRefusal::Backlogged { .. })) => break,
+      Err(e) => return Err(format!("begin bulk {index}: {e:?}")),
+    }
+  }
+  let bulk_begun = open.len();
+  // The ping waits until the bulk flow has settled into the path, as the head-of-line scenario's do: a burst
+  // at session start meets a queue still holding the handshake flight, a loss this test does not measure.
+  let settle_until = slates_rt::futures::now_ns().saturating_add(HOL_PING_START_NS);
+  let mut done = 0usize;
+  while slates_rt::futures::now_ns() < settle_until {
+    if let Some(Err(e)) = within(TICK_NS, endpoint.drive()).await {
+      return Err(format!("drive: {e:?}"));
+    }
+    let before = open.len();
+    open.retain(|&id| endpoint.take_reply(id).is_none());
+    done += before - open.len();
+  }
+  let began = slates_rt::futures::now_ns();
+  let ping = endpoint
+    .begin(PING, Priority::Control, &[0x50; HOL_PING_BYTES])
+    .map_err(|e| format!("begin ping: {e:?}"))?;
+  let mut ping_latency_ns = None;
+  let mut bulk_done_at_ping = 0usize;
+  let deadline = began.saturating_add(RUN_BOUND_NS);
+  while ping_latency_ns.is_none() || !open.is_empty() {
+    if slates_rt::futures::now_ns() > deadline {
+      return Err(format!(
+        "stalled: ping {ping_latency_ns:?}, {} bulk open",
+        open.len()
+      ));
+    }
+    if let Some(Err(e)) = within(TICK_NS, endpoint.drive()).await {
+      return Err(format!("drive: {e:?}"));
+    }
+    let before = open.len();
+    open.retain(|&id| endpoint.take_reply(id).is_none());
+    done += before - open.len();
+    if ping_latency_ns.is_none() && endpoint.take_reply(ping).is_some() {
+      ping_latency_ns = Some(slates_rt::futures::now_ns().saturating_sub(began));
+      bulk_done_at_ping = done;
+    }
+  }
+  Ok(SlotOutcome {
+    ping_latency_ns: ping_latency_ns.unwrap_or(u64::MAX),
+    bulk_begun,
+    bulk_done_at_ping,
+  })
+}

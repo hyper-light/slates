@@ -73,9 +73,8 @@ more than the design allows. Membership, fencing and register traffic sit in the
 
 ## Sibling sweep
 
-- **Stream slots (reported, not changed here).** Bulk exchanges can hold every stream the peer allows
-  (`StreamSpace`'s limit). A control exchange opened then meets the backlog refusal until one completes.
-  This is the same class inversion on the stream-count tier, and it is the next change.
+- **Stream slots (fixed the same day).** Bulk exchanges could hold every stream the peer allows
+  (`docs/bugs/2026-09-30-bulk-exchanges-held-the-stream-credit-a-control-exchange-needed.md`).
 - **The congestion window (by design).** A control frame still waits for the congestion window over bytes
   already in flight. That wait is the queue it cannot jump, and the bound counts it.
 - **Retransmissions (reported).** Queued retransmissions go before fresh control frames

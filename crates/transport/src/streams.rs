@@ -208,6 +208,8 @@ pub struct StreamSpace {
   local_next: u64,
   /// This end's open streams, by sequence.
   local_open: BTreeMap<u64, Halves>,
+  /// Whether exchanges wait unbound for the credit to admit them ([`StreamSpace::set_wanting`]).
+  wanting: bool,
   /// The peer's credit: this end may send on its sequences below this.
   peer_credit: u64,
   /// One past the highest sequence of the peer's streams seen.
@@ -230,6 +232,7 @@ impl StreamSpace {
       limit,
       local_next: 0,
       local_open: BTreeMap::new(),
+      wanting: false,
       peer_credit: limit,
       peer_next: 0,
       peer_open: BTreeMap::new(),
@@ -246,6 +249,21 @@ impl StreamSpace {
   /// The role this end plays.
   pub fn role(&self) -> Role {
     self.role
+  }
+
+  /// Whether a stream of class `priority` may be opened now without queueing behind the peer's credit in a
+  /// way that orders a more urgent class after it (the constrained-link design §5.3, applied to stream
+  /// credit): a control stream may wait past the credit up to the limit; a stream of any other class only
+  /// while its sequence leaves one slot of the credit per more urgent class, so a later, more urgent
+  /// exchange's sequence is still within the credit and is sent at once. Credit is by sequence (RFC 9000
+  /// §4.6), so a stream queued past the credit is sent only after every earlier one: until 2026-09-30 bulk
+  /// exchanges could take every slot, and a control exchange opened after them waited for them to finish.
+  pub fn admits(&self, priority: Priority) -> bool {
+    let above = priority.classes_above();
+    if above == 0 {
+      return self.local_next.saturating_sub(self.peer_credit) < self.limit;
+    }
+    self.local_next.saturating_add(above) < self.peer_credit
   }
 
   /// Opens this end's next stream, of `kind` in class `priority`, returning its id. Refused when a
@@ -442,7 +460,15 @@ impl StreamSpace {
   /// The peer's credit this end is blocked at: `Some(credit)` while one of this end's streams waits past
   /// it (RFC 9000 §19.14 `STREAMS_BLOCKED`), `None` otherwise.
   pub fn waiting_limit(&self) -> Option<u64> {
-    (self.local_next > self.peer_credit).then_some(self.peer_credit)
+    (self.local_next > self.peer_credit || self.wanting).then_some(self.peer_credit)
+  }
+
+  /// Notes whether exchanges wait unbound for this end's credit to admit them
+  /// ([`StreamSpace::admits`]): while they do, this end is blocked at the credit exactly as a stream waiting
+  /// past it is, and says so (RFC 9000 §19.14 `STREAMS_BLOCKED`), so the peer's answer carries the credit it
+  /// raised as streams finished — a quiet peer has nothing else to send it on.
+  pub fn set_wanting(&mut self, wanting: bool) {
+    self.wanting = wanting;
   }
 
   /// Takes the peer's `MaxStreams` credit (it only ever rises; a stale, reordered one is ignored).
