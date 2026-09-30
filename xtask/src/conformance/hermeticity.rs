@@ -97,6 +97,9 @@ const ES_EVENTS: &[&str] = &[
 struct EsLogger {
   process: TraceProcess,
   filter: Option<std::thread::JoinHandle<Result<Filtered, Failure>>>,
+  /// Dropped once the tracer has stopped: the filter then drains what the stream still holds and ends,
+  /// never waiting for the stream's end, which a process that outlived the stop can hold back.
+  stop: Option<std::sync::mpsc::Sender<()>>,
   errors: PathBuf,
 }
 
@@ -125,13 +128,15 @@ impl EsLogger {
     let file = std::fs::File::create(log)
       .map_err(|e| Failure(format!("creating {}: {e}", log.display())))?;
     let binary = binary.display().to_string();
+    let (stop, stopped) = std::sync::mpsc::channel();
     let filter = std::thread::Builder::new()
       .name("eslogger-filter".to_owned())
-      .spawn(move || keep_slates_events(stdout, file, &binary))
+      .spawn(move || keep_slates_events(stdout, file, &binary, &stopped))
       .map_err(|e| Failure(format!("starting the eslogger filter: {e}")))?;
     Ok(EsLogger {
       process: TraceProcess::new(child, signal_eslogger, MOUNT_WAIT),
       filter: Some(filter),
+      stop: Some(stop),
       errors,
     })
   }
@@ -166,7 +171,17 @@ impl EsLogger {
         .process
         .wait_ready(|| Ok(has_event_of_process(&std::fs::read_to_string(log)?, pid)))
     });
+    self.shut_down(caught_up)
+  }
+
+  /// Stops the tracer once `caught_up` holds, then ends and joins the filter: the filter's verdict and
+  /// the tracer's exit together.
+  fn shut_down(mut self, caught_up: Result<(), Failure>) -> Result<Filtered, Failure> {
     let stopped = caught_up.and_then(|()| self.process.stop_accepting(terminated_by_term));
+    // The tracer has stopped, or failed to (then this value's drop cancels it): the filter drains what
+    // the stream still holds and ends. Joining it on the stream's end instead hung CI run 36655388624's
+    // macOS job for 74 minutes after a complete trace; nothing past the marker is evidence.
+    drop(self.stop.take());
     let filtered = self
       .filter
       .take()
@@ -246,44 +261,139 @@ struct Filtered {
 /// this client, counted so the run fails rather than judging a partial trace.
 fn keep_slates_events(
   events: std::process::ChildStdout,
-  mut out: std::fs::File,
+  mut out: impl std::io::Write,
   binary: &str,
+  stopped: &std::sync::mpsc::Receiver<()>,
 ) -> Result<Filtered, Failure> {
-  use std::io::{BufRead, Write};
-  let mut filtered = Filtered::default();
-  let mut last_seq: Option<u64> = None;
-  for line in std::io::BufReader::new(events).lines() {
-    let line = line?;
-    if line.trim().is_empty() {
-      continue;
-    }
-    match global_seq(&line) {
-      Some(seq) => {
-        if let Some(last) = last_seq {
-          filtered.dropped += seq.saturating_sub(last).saturating_sub(1);
+  use std::io::Read;
+  let mut events = events;
+  let flags = rustix::fs::fcntl_getfl(&events).map_err(std::io::Error::from)?;
+  rustix::fs::fcntl_setfl(&events, flags | rustix::fs::OFlags::NONBLOCK)
+    .map_err(std::io::Error::from)?;
+  let mut stream = Stream::default();
+  let mut chunk = vec![0u8; STREAM_CHUNK];
+  // Bytes still to drain once the tracer has stopped: `None` until then.
+  let mut draining: Option<usize> = None;
+  loop {
+    match events.read(&mut chunk) {
+      Ok(0) => {
+        // The stream's end: its last line counts, whole or not, as a line read to the end does.
+        stream.finish(&mut out, binary)?;
+        break;
+      }
+      Ok(read) => {
+        stream.take(chunk.get(..read).unwrap_or_default(), &mut out, binary)?;
+        if let Some(left) = draining.as_mut() {
+          *left = left.saturating_sub(read);
+          if *left == 0 {
+            break;
+          }
         }
-        last_seq = Some(seq);
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+        if draining.is_some() {
+          break;
+        }
+        if matches!(
+          stopped.try_recv(),
+          Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ) {
+          draining = Some(STREAM_DRAIN);
+        } else {
+          super::pause();
+        }
+      }
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+      Err(error) => return Err(error.into()),
+    }
+  }
+  // A line torn at a stop is past the drain marker (the stop follows the marker's own event), so it is
+  // not evidence and is not judged.
+  out.flush()?;
+  Ok(stream.filtered)
+}
+
+/// Shape: one read of the tracer's stream: 64 KiB, the default pipe buffer on Linux (pipe(7): sixteen
+/// pages) and the most macOS buffers for a large write, so one read can empty a full pipe.
+const STREAM_CHUNK: usize = 64 * 1024;
+/// Shape: what the filter still reads once the tracer has stopped: one pipe buffer, the most a stopped
+/// writer can have left unread, so a writer that outlived the stop cannot keep the drain going.
+const STREAM_DRAIN: usize = STREAM_CHUNK;
+
+/// The filter's position in the tracer's stream: the partial line waiting for its end, the last
+/// sequence number seen, and what has been kept and counted dropped.
+#[derive(Default)]
+struct Stream {
+  partial: Vec<u8>,
+  last_seq: Option<u64>,
+  filtered: Filtered,
+}
+
+impl Stream {
+  /// Takes bytes from the stream and handles every line they complete.
+  fn take(
+    &mut self,
+    bytes: &[u8],
+    out: &mut impl std::io::Write,
+    binary: &str,
+  ) -> Result<(), Failure> {
+    self.partial.extend_from_slice(bytes);
+    while let Some(end) = self.partial.iter().position(|&byte| byte == b'\n') {
+      let line: Vec<u8> = self.partial.drain(..=end).collect();
+      self.line(&line, out, binary)?;
+    }
+    Ok(())
+  }
+
+  /// Handles the stream's last line, which no newline ended.
+  fn finish(&mut self, out: &mut impl std::io::Write, binary: &str) -> Result<(), Failure> {
+    let last = std::mem::take(&mut self.partial);
+    if last.is_empty() {
+      return Ok(());
+    }
+    self.line(&last, out, binary)
+  }
+
+  /// One line of the stream: counted against the sequence, and kept when it is a slates event or not
+  /// an event at all.
+  fn line(
+    &mut self,
+    bytes: &[u8],
+    out: &mut impl std::io::Write,
+    binary: &str,
+  ) -> Result<(), Failure> {
+    let text = std::str::from_utf8(bytes)
+      .map_err(|error| Failure(format!("the tracer's stream is not UTF-8: {error}")))?;
+    let line = text.trim_end_matches(['\n', '\r']);
+    if line.trim().is_empty() {
+      return Ok(());
+    }
+    match global_seq(line) {
+      Some(seq) => {
+        if let Some(last) = self.last_seq {
+          self.filtered.dropped += seq.saturating_sub(last).saturating_sub(1);
+        }
+        self.last_seq = Some(seq);
       }
       None => {
         // Not an event at all: kept, so the parser counts it unresolved.
         writeln!(out, "{line}")?;
-        filtered.kept += 1;
-        continue;
+        self.filtered.kept += 1;
+        return Ok(());
       }
     }
-    if !names_binary(&line, binary) {
-      continue;
+    if !names_binary(line, binary) {
+      return Ok(());
     }
-    let keep = serde_json::from_str::<serde_json::Value>(&line).map_or(true, |event| {
+    let keep = serde_json::from_str::<serde_json::Value>(line).map_or(true, |event| {
       event["process"]["executable"]["path"].as_str() == Some(binary)
     });
     if keep {
       writeln!(out, "{line}")?;
-      filtered.kept += 1;
+      self.filtered.kept += 1;
     }
+    Ok(())
   }
-  out.flush()?;
-  Ok(filtered)
 }
 
 /// Whether a raw eslogger line names `binary` anywhere, by byte search. eslogger's JSON escapes every
@@ -722,6 +832,81 @@ mod tests {
       "torn {\"process\":{\"audit_token\":{\"pid\":76710",
       76710
     ));
+  }
+
+  /// Shape: how long the stop may take in the held-stream history: the tracer's own exit bound
+  /// ([`MOUNT_WAIT`]) twice over, far past a stop that does not wait on the stream's end.
+  const STOP_BOUND: std::time::Duration = MOUNT_WAIT.saturating_mul(2);
+
+  /// Signals the fixture's process group directly (the tests run no privileged tracer).
+  #[cfg(unix)]
+  fn fixture_signal(pid: u32, signal: StopSignal) -> Result<(), Failure> {
+    let group = rustix::process::Pid::from_raw(i32::try_from(pid).expect("fixture pid"))
+      .expect("positive fixture pid");
+    let signal = match signal {
+      StopSignal::Interrupt => rustix::process::Signal::TERM,
+      StopSignal::Kill => rustix::process::Signal::KILL,
+    };
+    rustix::process::kill_process_group(group, signal)
+      .map_err(|error| Failure(format!("signalling the fixture: {error}")))
+  }
+
+  /// AC-9.7 (the hermeticity tracer): the stop returns once the tracer itself has stopped, even when a
+  /// descendant that outlives the stop signal keeps the tracer's stream open. Do: a stand-in tracer that
+  /// writes one event, leaves a descendant ignoring the stop signal and holding its stdout, and exits on
+  /// the stop signal; stop it through the tracer's own shutdown. Expect: the shutdown returns within
+  /// twice the tracer's exit bound, successfully. Until 2026-09-30 the filter ended only at the stream's
+  /// end and the shutdown joined it unbounded: CI run 36655388624's macOS conformance job hung 74
+  /// minutes in that join, after the trace was complete.
+  #[cfg(unix)]
+  #[test]
+  fn the_tracer_shutdown_returns_while_a_descendant_holds_its_stream_open() {
+    use std::io::BufRead;
+    use std::os::unix::process::CommandExt;
+    // The descendant says on stderr once it ignores the stop signal, so the stop cannot race its trap.
+    let mut child = Command::new("sh")
+      .args([
+        "-c",
+        r#"(trap '' TERM; echo held >&2; exec sleep 600) & trap 'exit 0' TERM; printf '{"global_seq_num":1}\n'; while :; do sleep 1; done"#,
+      ])
+      .stdin(Stdio::null())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .process_group(0)
+      .spawn()
+      .expect("spawn the stand-in tracer");
+    let group = child.id();
+    let stdout = child.stdout.take().expect("the stand-in's stdout");
+    let mut held = String::new();
+    std::io::BufReader::new(child.stderr.take().expect("the stand-in's stderr"))
+      .read_line(&mut held)
+      .expect("the descendant reports");
+    assert_eq!(held, "held\n", "the descendant holds the stream");
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let filter = std::thread::spawn(move || {
+      keep_slates_events(stdout, std::io::sink(), "/the/slates/binary", &stopped)
+    });
+    let logger = EsLogger {
+      process: TraceProcess::new(child, fixture_signal, MOUNT_WAIT),
+      filter: Some(filter),
+      stop: Some(stop),
+      errors: PathBuf::new(),
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+      let _ = done.send(logger.shut_down(Ok(())).is_ok());
+    });
+    let outcome = finished.recv_timeout(STOP_BOUND);
+    // The descendant ignores the stop signal: end it (and with it the stream) whatever happened.
+    let _ = fixture_signal(group, StopSignal::Kill);
+    shutdown
+      .join()
+      .expect("the shutdown thread ends once the stream closes");
+    assert_eq!(
+      outcome,
+      Ok(true),
+      "the shutdown waited on the stream's end, which the descendant held open"
+    );
   }
 
   use slates_conformance::workload::{Entry, EntryKind};

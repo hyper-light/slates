@@ -1,11 +1,26 @@
 # Remaining fixes and verification
 
-Updated: **2026-09-26**. Checkpoint against `3b38d15`, including the instruction-benchmark
+Updated: **2026-09-30**. Checkpoint against `3b38d15`, including the instruction-benchmark
 repair below. This is the remaining-work
 list for the audit/CI repair session; [GAPS.md](GAPS.md) remains the authoritative contract
 ledger. Historical audit findings below need closure evidence against current source, not
 blind reimplementation of their original baseline. No new test, install or deployment is
 authorized merely by appearing here.
+
+## CI repair checkpoint (2026-09-30)
+
+- [x] **Run 36655388624, Linux: the position-mapping oracle judged only the head.** A generated history
+  (an insert strictly inside a range, then a delete of exactly those bytes) made the oracle expect a
+  clean map where the design's per-delta rule, and the mapper, hand the range to the verdict. The oracle
+  now judges every version; the case is pinned; 200,000 histories agree. See
+  `docs/bugs/2026-09-30-the-position-mapping-oracle-judged-only-the-head.md`. The failing run wrote a
+  proptest regression file into the checkout: evidence for AUD-29-63's sweep.
+- [x] **Run 36655388624, macOS: the hermeticity suite hung 74 minutes after a complete trace.** The
+  eslogger filter ended only at the stream's end, and the shutdown joined it unbounded, whether or not
+  the tracer had stopped. The filter now ends when told the tracer has stopped, after a bounded drain; a
+  stand-in tracer whose descendant holds the stream timed out the old shutdown and passes the new one.
+  See `docs/bugs/2026-09-30-the-eslogger-shutdown-waited-for-a-stream-end-that-never-came.md`. The live
+  eslogger path is confirmed only by the macOS CI lane.
 
 ## Current CI repair checkpoint (2026-09-22)
 

@@ -5,10 +5,14 @@
 //! as overlapping (handed to the verdict).
 //!
 //! The oracle tracks provenance. It applies each intervening delta to a vector that records, for
-//! every head byte, which base byte it came from (or that it is new); a base range maps cleanly
-//! exactly when its bytes all survived and stayed contiguous, and then to the position they
-//! occupy. This is computed independently of the mapper, so a wrong shift or a missed overlap
-//! diverges.
+//! every byte, which base byte it came from (or that it is new), and keeps that vector at every
+//! version; a base range maps cleanly exactly when its bytes survived and stayed contiguous at
+//! every version in (base, head] — "no intervening change touched it", delta by delta, as the
+//! design hands to the verdict a range that any intervening effect range overlaps — and then to the
+//! position they occupy at head. Judging the head alone certified a different rule: an insert
+//! strictly inside a range that a later delete removed left the head contiguous, while the range
+//! had been touched (CI run 36655388624, 2026-09-30). This is computed independently of the mapper,
+//! so a wrong shift or a missed overlap diverges.
 
 use slates_merge::map::{Mapped, map_range};
 use slates_merge::ops_doc::{Op, OpKind};
@@ -44,12 +48,14 @@ const MAX_INSERT: u64 = 12;
 /// A base byte's origin marker is its index; a new byte's is this sentinel.
 const NEW: i64 = -1;
 
-/// Applies the raw single-op deltas to a provenance vector (head byte -> base index or `NEW`)
-/// and returns both the provenance after all deltas and the ops in their version coordinates.
-fn simulate(base_len: u64, raw_ops: &[Raw]) -> (Vec<i64>, Vec<Vec<Op>>) {
+/// Applies the raw single-op deltas to a provenance vector (byte -> base index or `NEW`) and
+/// returns the provenance at every version — the base's first, head's last — and the ops in their
+/// version coordinates.
+fn simulate(base_len: u64, raw_ops: &[Raw]) -> (Vec<Vec<i64>>, Vec<Vec<Op>>) {
   let mut provenance: Vec<i64> = (0..base_len)
     .map(|i| i64::try_from(i).unwrap_or(NEW))
     .collect();
+  let mut versions = vec![provenance.clone()];
   let mut deltas = Vec::new();
   for raw in raw_ops {
     let current = provenance.len() as u64;
@@ -90,14 +96,16 @@ fn simulate(base_len: u64, raw_ops: &[Raw]) -> (Vec<i64>, Vec<Vec<Op>>) {
         deltas.push(vec![op(OpKind::Delete, at, len)]);
       }
     }
+    // Reached only when the op made a delta (an op on an empty file is skipped above).
+    versions.push(provenance.clone());
   }
-  (provenance, deltas)
+  (versions, deltas)
 }
 
-/// Classifies a base range from the provenance: `Some(shifted)` when every base byte survived and
-/// stayed contiguous (mapping cleanly to where they are), `None` when any is gone or the run was
-/// split by an intervening insert.
-fn expected(provenance: &[i64], range: Range) -> Option<Range> {
+/// Where a base range sits in one version: `Some` when every one of its base bytes is there and
+/// they are contiguous, `None` when any is gone (deleted or overwritten) or the run is split by an
+/// insert.
+fn intact_at(provenance: &[i64], range: Range) -> Option<Range> {
   if range.len == 0 {
     return None;
   }
@@ -117,6 +125,17 @@ fn expected(provenance: &[i64], range: Range) -> Option<Range> {
   } else {
     None
   }
+}
+
+/// Classifies a base range from the provenance at every version: `Some(shifted)`, where its bytes
+/// sit at head, when they were intact and contiguous at every version; `None` when any version
+/// touched them.
+fn expected(versions: &[Vec<i64>], range: Range) -> Option<Range> {
+  versions
+    .iter()
+    .map(|provenance| intact_at(provenance, range))
+    .collect::<Option<Vec<Range>>>()?
+    .pop()
 }
 
 /// Passes the deltas as the slice-of-slices the mapper takes.
@@ -187,10 +206,36 @@ fn a_later_delta_meeting_the_shifted_range_overlaps() {
   assert_eq!(got, Mapped::Overlaps);
 }
 
+/// The shrunk history of CI run 36655388624: an insert of twelve bytes strictly inside base range 1..3,
+/// then a delete of exactly those twelve bytes. The mapper and the oracle must agree on it.
+#[test]
+fn the_shrunk_history_of_ci_run_36655388624_agrees() {
+  let raw = [
+    Raw {
+      kind: 79,
+      a: 37,
+      b: 11,
+    },
+    Raw {
+      kind: 47,
+      a: 18,
+      b: 11,
+    },
+  ];
+  let (versions, deltas) = simulate(4, &raw);
+  let range = Range::new(1, 2);
+  let got = map_range(&refs(&deltas), range);
+  match expected(&versions, range) {
+    Some(shifted) => assert_eq!(got, Mapped::Shifted(shifted)),
+    None => assert_eq!(got, Mapped::Overlaps),
+  }
+}
+
 proptest! {
   /// T-6.4 (the position-mapping oracle): for any base length, any sequence of intervening
   /// single-op deltas, and any base range, the mapper agrees with the provenance: a range whose
-  /// bytes all survived contiguously maps to their head position, and any other range overlaps.
+  /// bytes stayed intact and contiguous at every version maps to their head position, and any other
+  /// range overlaps.
   #[test]
   fn the_map_agrees_with_provenance(
     base_len in 1u64..48,
@@ -202,10 +247,10 @@ proptest! {
     len in 1u64..12,
   ) {
     prop_assume!(start + len <= base_len);
-    let (provenance, deltas) = simulate(base_len, &raw);
+    let (versions, deltas) = simulate(base_len, &raw);
     let range = Range::new(start, len);
     let got = map_range(&refs(&deltas), range);
-    match expected(&provenance, range) {
+    match expected(&versions, range) {
       Some(shifted) => prop_assert_eq!(got, Mapped::Shifted(shifted)),
       None => prop_assert_eq!(got, Mapped::Overlaps),
     }

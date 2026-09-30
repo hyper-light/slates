@@ -18,6 +18,11 @@
 //! order; folding old deltas into checkpoint deltas so a distant base maps in `O(log)` lookups
 //! is the same composition applied ahead of time (the design's checkpoints) and is the measured
 //! optimization when a base-lag benchmark shows the raw walk dominating (owed, not guessed).
+//! Gotcha for that fold: it must keep every span an intervening delta touched, not only the net
+//! size change. An insert strictly inside a range followed by a delete of exactly those bytes nets
+//! to nothing, yet the raw walk hands the range to the verdict — a fold that kept the net effect
+//! alone would map it cleanly, and the composition would stop being exact (the oracle in
+//! `tests/map.rs` judges every version for this reason; CI run 36655388624, 2026-09-30).
 
 use crate::ops_doc::{Op, OpKind};
 use crate::range::Range;
