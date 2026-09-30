@@ -2258,13 +2258,17 @@ a slot kind.
 
 **Wake strategy.** Client: write slot, publish `tail` (release), read `cpl` head with acquire in a
 loop for its wake estimate (seeded with `spin_ns`, the daemon-published measured wake cost, and
-refined from the client's own parks, A-31), then clear the reply stamp, set `parked = 1`, re-check the
-reply (to close the race), and wait on the wake word (futex / `os_sync_wait_on_address(SHARED)` /
-the Event). Daemon: after writing a reply, read `parked`; if set, stamp the host clock into
+refined from the client's own parks, A-31), then clear the reply stamp, set `parked = 1`, fence
+(`SeqCst`; the park protocol, A-44), re-check the reply (to close the race), and wait on the wake word
+(futex / `os_sync_wait_on_address(SHARED)` / the Event). Daemon: after writing a reply and advancing
+the wake word, fence and read `parked`; if set, advance the word once more, stamp the host clock into
 `reply_stamp` (the first reply of the park only), wake (futex wake / wake by address / `SetEvent`),
 mark the stamp confirmed when the wake reports it found a sleeper (Linux and macOS; Windows' Event
 cannot tell, so there a stamp inside the wait is taken unconfirmed), and, for SDK event loops, signal
-the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. The client folds a
+the completion fd (eventfd / pipe / socket) so `add_reader`/`uv_poll` fires. Where no descriptor can be
+shared (macOS, Windows), a client-local bridge thread makes its pipe or socket readable after every
+return from its wait while the client is armed and a reply waits in its ring: a level, never an edge
+(A-44). The client folds a
 confirmed stamp inside its wait into its estimate (stamp to return). Shards poll rings while any
 client has activity within the
 measured idle window, then park in the driver; a parked shard is woken by the driver kick the
@@ -2294,6 +2298,19 @@ drops.
 > `an_idle_daemon_parks_once_its_clients_windows_have_passed` (12 and 2 idle spins in one quiet second
 > before, none after); `crates/rt/tests/idle_spin.rs` proves the window by use. Record:
 > `docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md`.
+
+> **Status (2026-09-29, A-44: the park protocol is fenced and the async bridges are level-triggered).** A
+> reply to a client that was parking could be lost for good. The client raised `parked` and re-checked its
+> ring, and the daemon wrote the reply and read `parked`, each `Release`/`Acquire` with no fence — the
+> store-buffering shape the doorbell had until 2026-09-28 — so both reads could miss. The macOS and Windows
+> bridges nudged their event loop on a change of the wake word, and a change seen while the client was not
+> yet armed was used up, so even a later wake found "no change". The Python async lifecycle hung on the
+> macOS runner (`cead594`, past 1 h 47 min), and 1 of 320 contended runs hung here with the client's loop
+> in `kevent`, its bridge in `__ulock_wait2` and the shard parked. Now both halves fence
+> (`slates-ipc` `park.rs`), the daemon advances the word once more before a wake, and the bridges nudge on
+> a level. loom deadlocks the old protocol at interleaving 1 and explores 42,826 interleavings of the new
+> one (a client, a daemon and a bridge) with no loss; 800 contended runs pass. Record:
+> `docs/bugs/2026-09-29-an-async-client-waited-forever-for-a-reply-that-had-landed.md`.
 
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
@@ -6863,3 +6880,28 @@ replacing `rename` removed; the simulated host's outsider edits at any seam call
 - What it does not change: the exchange path's verify (a changed ctime still requires the witnessed
   bytes); a recursive removal's witness (the directory's inode; what is beneath it is removed with it, as
   `Rmdir` is defined); hidden-sibling sweeping by landing id only.
+
+### A-44 — The park protocol is fenced and the async bridges are level-triggered (2026-09-29)
+Applied in the same change to: §4.7 ("Wake strategy", its status), `slates-ipc` (`park.rs`, new: the two
+fenced halves and the bridge's level, with its loom model; `endpoint.rs`: `arm_async` and the sync
+`wait` fence after raising the flag, `DaemonEnd::reply` fences before reading it and advances the word
+once more before a wake; `completion.rs`: the macOS and Windows bridges judge a level), CI's loom lane (it
+runs the new model), and GAPS.
+- Why: a parked client and the replying daemon each wrote and then read with no fence between (the
+  store-buffering shape, the doorbell's until the day before), so both could miss. The async bridges
+  were edge-triggered on the wake word: a change seen while the client was not yet armed was used up, and
+  a later wake found no change. The async lifecycle hung on the macOS runner, and 1 of 320 contended
+  runs hung here (`docs/bugs/2026-09-29-an-async-client-waited-forever-for-a-reply-that-had-landed.md`).
+- The rule:
+  - The client fences between raising `parked` and its re-check.
+  - The daemon fences between publishing a reply and reading `parked`, and advances the word once more
+    before a wake, so a wake landing between a bridge's two waits reaches its next value-checked wait.
+  - A bridge nudges after every return while the client is armed and a reply waits in its ring.
+  - A fast-path reply, taken during the spin, still costs no wake and no nudge.
+- Evidence: loom deadlocks the old protocol (interleaving 1) and explores 42,826 interleavings of the new
+  one with a client, a daemon and a bridge, no loss, and all three ways a reply arrives exercised (spin,
+  re-check, nudge). 800 contended async lifecycle runs pass. The Python and Node suites (sync and async)
+  pass.
+- What it does not change: the ring format, the region layout version, the wake word's meaning to the sync
+  client, and the Linux eventfd path's shape (the daemon writes it only for an armed client; the fences
+  close its race).

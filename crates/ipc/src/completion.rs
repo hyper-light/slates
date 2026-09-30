@@ -8,7 +8,8 @@
 //! there is no shared fd for the daemon to write. The completion fd there is instead a *client-local*
 //! signal — a self-pipe on macOS, a loopback socket pair on Windows — and this bridge is the thread
 //! that makes it readable: it parks on the very wake the daemon already raises on a reply to a parked
-//! client (§4.7 "Wake strategy"), and on each woken change signals its end.
+//! client (§4.7 "Wake strategy"), and after every return signals its end while the client is armed and a
+//! reply waits (a level; `crate::park`).
 //!
 //! Linux gains a third bridge shape for one narrow reason: an SDK that *adopts* the completion fd
 //! into a stream (Node's `net.Socket`) cannot adopt an eventfd — libuv's `uv_guess_handle` returns
@@ -29,16 +30,19 @@
 //!   can poll: libuv's `uv_poll` and a Python selector both accept a Windows `SOCKET`); the thread
 //!   parks on the region's named auto-reset *Event* (`ClientRegion::wake_wait`), because
 //!   `WaitOnAddress` is process-local (D-10) so the daemon signals the Event, not the word, to reach
-//!   another process. The word still carries the reply count and the `client_parked` flag, read here
-//!   exactly as on macOS to tell a real reply from a bare timeout and to gate on an armed client.
+//!   another process. The level is read exactly as on macOS: the `client_parked` flag and the completion
+//!   ring's depth.
 //!
-//! The daemon is unchanged in shape. It bumps the wake word on every reply and raises the wake only
-//! when the client is parked (`client_parked != 0`); the async SDK sets that flag when it yields to
-//! the event loop (the slow path) and clears it once the reply is taken. So a fast-path reply —
-//! taken during the spin, the client never parked — costs the daemon no wake and this bridge no
-//! signal, and the async fast path stays free of any event-loop wakeup (§4.7 worked example: the
-//! extension "returns the reply without ever touching the event loop"). The bridge signals only for
-//! an armed reply, gating on the same `client_parked` word the daemon reads.
+//! The daemon bumps the wake word on every reply and raises the wake only when the client is parked
+//! (`client_parked != 0`, read after the park protocol's fence; `crate::park`), bumping the word once
+//! more first. The async SDK sets that flag when it yields to the event loop (the slow path) and clears it
+//! once the reply is taken. So a fast-path reply — taken during the spin, the client never parked — costs
+//! the daemon no wake and this bridge no signal, and the async fast path stays free of any event-loop
+//! wakeup (§4.7 worked example: the extension "returns the reply without ever touching the event loop").
+//! The bridge signals only while the client is armed and a reply waits: a level, judged afresh after
+//! every return from its wait. Until 2026-09-29 it signalled on a change of the word instead, and a change
+//! seen while the client was not yet armed was used up — a lost wake that hung the async lifecycle on the
+//! macOS runner (docs/bugs/2026-09-29-an-async-client-waited-forever-for-a-reply-that-had-landed.md).
 //!
 //! One thread per async client, owned by the [`crate::endpoint::ClientEnd`] and joined on drop (no
 //! fire-and-forget, banned item 9). It is the `DoorbellThread` pattern from `slates-server`: the
@@ -160,40 +164,54 @@ impl CompletionBridge {
   }
 }
 
-/// The macOS bridge thread: park on the wake word; on a woken change, if the client is armed
-/// (parked), make the completion pipe readable. A disarmed change — a fast-path reply the client
-/// took during its spin — is skipped, so the async fast path never wakes the event loop.
+/// The macOS bridge thread: park on the wake word; after every return, whether woken or timed out, make
+/// the completion pipe readable while the client is armed and a reply waits in its ring
+/// ([`armed_with_reply_waiting`], a level). A fast-path reply, taken during the spin, finds the client
+/// unarmed, so the async fast path never wakes the event loop.
 #[cfg(target_os = "macos")]
 fn run(region: ClientRegion, write: OwnedFd, stop: &'static AtomicBool) {
   let Ok(word) = region.wake_word() else {
     return;
   };
-  // The value last acted on: a reply that lands between two waits shows as a change on the next
-  // comparison, never lost (the wait compares against `seen`, and returns at once when the word has
-  // already moved past it), so no wake is dropped even off the parked instant.
+  // The value the next wait compares against: it returns at once when the word has moved past it, so a
+  // wake raised while this thread is between waits is not missed (the daemon advances the word before
+  // every wake; `crate::park`).
   let mut seen = word.load(Ordering::Acquire);
   while !stop.load(Ordering::Acquire) {
     let _ = wake::wait(word, seen, Some(POLL_NS));
     if stop.load(Ordering::Acquire) {
       break;
     }
-    let now = word.load(Ordering::Acquire);
-    if now == seen {
-      // A bare timeout with no reply: nothing to signal.
-      continue;
-    }
-    seen = now;
-    // Only an armed client is one waiting on its event loop; a fast-path reply (parked == 0, taken
-    // during the spin) needs no nudge and gets none, so the daemon's no-wake fast path stays free.
-    let armed = region
-      .client_parked()
-      .is_ok_and(|parked| parked.load(Ordering::Acquire) != 0);
-    if armed {
+    seen = word.load(Ordering::Acquire);
+    if armed_with_reply_waiting(&region) {
       // Non-blocking: a full pipe is already readable, so a dropped nudge only means the SDK's next
       // poll finds the reply, never a lost one — the same best-effort as the Linux eventfd nudge.
       let _ = rustix::io::write(&write, &NUDGE);
     }
   }
+}
+
+/// A bridge's level, judged after every return from its wait (`crate::park::reply_waiting_for_armed`):
+/// the client is armed — waiting on its event loop — and a reply waits in its completion ring. Before
+/// 2026-09-29 the bridges nudged on a change of the wake word instead, and a change seen while the client
+/// was not yet armed was used up: a reply whose client armed a moment later never woke its event loop (the
+/// async lifecycle hung on the macOS runner). A fast-path reply, taken during the spin, finds the client
+/// unarmed and costs no nudge, as before.
+#[cfg(any(target_os = "macos", windows))]
+fn armed_with_reply_waiting(region: &ClientRegion) -> bool {
+  crate::park::reply_waiting_for_armed(
+    || {
+      region
+        .client_parked()
+        .is_ok_and(|parked| parked.load(Ordering::Acquire) != 0)
+    },
+    || {
+      region
+        .cpl()
+        .depth(region.object())
+        .is_ok_and(|depth| depth > 0)
+    },
+  )
 }
 
 /// A non-blocking, close-on-exec self-pipe: `(read, write)`. The thread writes the write end to
@@ -430,37 +448,20 @@ impl CompletionBridge {
   }
 }
 
-/// The Windows bridge thread: park on the region's named Event; on a woken change, if the client is
-/// armed (parked), make the completion socket readable. A disarmed change — a fast-path reply the
-/// client took during its spin — is skipped, so the async fast path never wakes the event loop. The
-/// word carries the reply count (to tell a real reply from a bare Event timeout) and the
-/// `client_parked` flag (to gate the nudge), read exactly as the macOS thread reads them.
+/// The Windows bridge thread: park on the region's named Event; after every return, whether signalled or
+/// timed out, make the completion socket readable while the client is armed and a reply waits in its ring
+/// ([`armed_with_reply_waiting`], a level). A fast-path reply, taken during the spin, finds the client
+/// unarmed, so the async fast path never wakes the event loop.
 #[cfg(windows)]
 fn run(region: ClientRegion, mut write: TcpStream, stop: &'static AtomicBool) {
-  let Ok(word) = region.wake_word() else {
-    return;
-  };
-  // The value last acted on: a reply that lands between two waits shows as a change on the next
-  // comparison, never lost — the auto-reset Event holds its signal until a waiter consumes it, so a
-  // reply raised off the parked instant returns the next `wake_wait` at once.
-  let mut seen = word.load(Ordering::Acquire);
+  // The auto-reset Event holds a signal until a waiter consumes it, so a wake raised while this thread
+  // is between waits returns the next `wake_wait` at once.
   while !stop.load(Ordering::Acquire) {
     let _ = region.wake_wait(Some(POLL_NS));
     if stop.load(Ordering::Acquire) {
       break;
     }
-    let now = word.load(Ordering::Acquire);
-    if now == seen {
-      // A bare Event timeout with no reply: nothing to signal.
-      continue;
-    }
-    seen = now;
-    // Only an armed client is one waiting on its event loop; a fast-path reply (parked == 0, taken
-    // during the spin) needs no nudge and gets none, so the daemon's no-wake fast path stays free.
-    let armed = region
-      .client_parked()
-      .is_ok_and(|parked| parked.load(Ordering::Acquire) != 0);
-    if armed {
+    if armed_with_reply_waiting(&region) {
       // Non-blocking: a full send buffer means the socket is already readable at the peer, so a
       // dropped nudge only means the SDK's next poll finds the reply, never a lost one.
       let _ = write.write(&NUDGE);

@@ -2826,6 +2826,32 @@ Closed: [a client request could wait for a timer after a lost doorbell](../bugs/
 - **Swallowed errors fixed in the sweep:** `mark_parked`'s ignored `set_parked` result, now counted as
   `ipc.idle_announce`, and a discarded `Control::Active` send, now counted as `ACTIVATION_LOST`.
 
+### 2026-09-29: the reply's park protocol is fenced and the async bridges are level-triggered (A-44)
+
+Closed: [an async client waited forever for a reply that had landed](../bugs/2026-09-29-an-async-client-waited-forever-for-a-reply-that-had-landed.md).
+This is the 2026-09-28 doorbell fix's sibling, which that sweep missed.
+
+- **Symptom:** the macOS SDK packaging job hung at `cead594` (1 h 49 min, then cancelled).
+  Reproduced here in 1 of 320 contended runs, with the client's loop in `kevent`, its bridge in
+  `__ulock_wait2` and the shard parked.
+- **Evidence:** loom deadlocks the old reply protocol at interleaving 1. The fenced, level-triggered one
+  passes 42,826 interleavings at the CI bound with a client, a daemon and a bridge. 800 contended runs
+  pass after the fix.
+- **Fix:**
+  - `slates-ipc` `park.rs` holds the fences and the bridge's level.
+  - `arm_async` and the sync `wait` fence after raising the flag.
+  - The daemon fences before reading it and advances the word once more before a wake.
+  - The macOS and Windows bridges nudge while the client is armed and a reply waits.
+- **Open:** the SDK job's steps have no timeout, so a hang holds a macOS runner for GitHub's 6 h default.
+
+### 2026-09-29: fleet test polls hold their clients
+
+The macOS runner's `a_takeover_completes_when_one_survivor_never_received_the_head` failed at `afeed36`
+with "too many clients (the bound is 2248)". Its poll opened a client per check, measured here at 479–658
+per second, while a departed client holds its seat for at least 1 s. The poll, and two audit waits that did
+the same, now hold one client per daemon (`f18f02c`). The daemon's bound and typed refusal behaved as
+designed.
+
 ### 2026-09-28: a seed id's replacement keeps the record link's pending dial
 
 Closed: [formation dropped a dial to the peer it was reaching](../bugs/2026-09-28-formation-dropped-a-dial-to-the-peer-it-was-reaching.md)

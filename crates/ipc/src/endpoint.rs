@@ -342,12 +342,15 @@ impl ClientEnd {
   }
 
   /// Arms the completion signal before the SDK yields to its event loop: the daemon wakes a parked
-  /// client on a reply, making the completion fd readable, and the macOS bridge nudges its pipe only
-  /// while armed. This is the same `parked` flag the sync [`Self::wait`] sets; the async path manages
+  /// client on a reply, making the completion fd readable, and the bridges nudge their pipe or socket
+  /// only while armed. This is the same `parked` flag the sync [`Self::wait`] sets; the async path manages
   /// it explicitly because it never calls `wait`. A caller re-checks [`Self::try_take`] right after
-  /// arming to close the race with a reply that landed during the spin.
+  /// arming to close the race with a reply that landed during the spin; the park protocol's fence
+  /// ([`crate::park::after_arming`]) orders that re-check after the flag, so a reply it misses is one the
+  /// daemon sees the flag for and wakes on (before 2026-09-29 there was no fence, and both could miss).
   pub fn arm_async(&self) -> Result<(), IpcError> {
     self.region.client_parked()?.store(1, Ordering::Release);
+    crate::park::after_arming();
     Ok(())
   }
 
@@ -469,6 +472,9 @@ impl ClientEnd {
       self.unsettled = None;
       self.region.reply_stamp()?.store(0, Ordering::Relaxed);
       self.region.client_parked()?.store(1, Ordering::Release);
+      // The park protocol's client half: the word's value and the re-check below are ordered after the
+      // flag, so a reply the re-check misses is one the daemon sees the flag for (§4.7; `crate::park`).
+      crate::park::after_arming();
       #[cfg(not(windows))]
       let expected = self.region.wake_word()?.load(Ordering::Acquire);
       if let Some(reply) = self.try_take()? {
@@ -623,7 +629,15 @@ impl DaemonEnd {
     self.next_reply = self.next_reply.wrapping_add(1);
     let word = self.region.wake_word()?;
     word.fetch_add(1, Ordering::AcqRel);
-    if self.region.client_parked()?.load(Ordering::Acquire) != 0 {
+    let parked = self.region.client_parked()?;
+    // The park protocol's daemon half (`crate::park`): the flag is read after the reply's publication in
+    // the order the client's fence takes part in, so a parked client whose re-check missed this reply is
+    // seen here and woken. Before 2026-09-29 this read had no fence, and a client's re-check and this read
+    // could both miss.
+    if crate::park::after_publishing_armed(|| parked.load(Ordering::Relaxed) != 0) {
+      // A second advance for the wake: a bridge between two waits has already taken the first advance
+      // into the value its next wait compares against, and this one makes that wait return.
+      word.fetch_add(1, Ordering::AcqRel);
       // The first wake of this park stamps the host clock, so the client can time its own wake (§4.7);
       // a later reply to the same park keeps the first stamp.
       let stamp = self.region.reply_stamp()?;
