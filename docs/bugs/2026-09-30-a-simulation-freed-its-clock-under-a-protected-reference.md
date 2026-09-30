@@ -31,3 +31,14 @@
   `MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --test ownership --test timers`
   gives 5/5 and 6/6, with no undefined behaviour.
 - **Red case.** CI's run of the old code is the red case.
+
+## Sibling
+
+- **The same shape in `LocalRuntime`.** `LocalRuntime` held `ctx: &'static ShardContext` and freed that
+  context in its own `Drop`. It now holds the pointer and lends it through `context(&self)`.
+  - The unsafe budget rises 62 → 63.
+  - Miri does not run `LocalRuntime`, which needs the OS driver, so the argument is the same as for the
+    simulation's clock.
+- **The other `&'static` fields were checked.** In the runtime these are the drivers' clock and flags, a
+  context's entry, and its ring halves. Each is freed by someone else, after its holder, never by its
+  holder's own `Drop`.

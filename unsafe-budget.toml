@@ -176,8 +176,9 @@ slates-mem = 22
 # 2026-09-28 (+2): don't-fragment on datagram sockets (macOS `IP_DONTFRAG`, Windows `IP_DONTFRAGMENT`).
 # 2026-09-30 (+1): the simulation clock is read through `SimRuntime::clock` (`sim.rs`), a borrow bounded by
 # `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
-# freed the clock (Miri, `--test ownership`).
-slates-rt = 62
+# freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
+# context its own `Drop` frees.
+slates-rt = 63
 slates-base = 6
 slates-vfs = 0
 slates-land = 3

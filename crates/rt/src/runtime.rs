@@ -578,14 +578,18 @@ fn await_readiness(
 
 /// One shard on the calling thread with the OS driver (tests, benches, the CLI's own work).
 pub struct LocalRuntime {
-  ctx: &'static ShardContext,
+  /// The shard's context, freed by this runtime's `Drop`: held as a pointer and lent through
+  /// [`LocalRuntime::context`], never as a reference field — a runtime passed by value (`drop(rt)`) has its
+  /// reference fields protected for the call, and freeing their target inside it is undefined behaviour
+  /// (the simulation's clock had exactly this shape, found by Miri on 2026-09-30).
+  ctx: std::ptr::NonNull<ShardContext>,
   notes: Vec<String>,
 }
 
 impl std::fmt::Debug for LocalRuntime {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("LocalRuntime")
-      .field("shard", &self.ctx.id)
+      .field("shard", &self.context().id)
       .finish()
   }
 }
@@ -595,8 +599,8 @@ impl Drop for LocalRuntime {
   /// `run_until_*` returns before), so its context is freed and its slot given back here: the kick
   /// descriptor closes and the slot is reusable by the next runtime.
   fn drop(&mut self) {
-    let id = self.ctx.id;
-    registry::note_arena_generation(id, self.ctx.arena_generation_high());
+    let id = self.context().id;
+    registry::note_arena_generation(id, self.context().arena_generation_high());
     // The context was built and run on this thread (the handle is `!Send`), and every `run_until_*`
     // returned before this drop: free it here, then give the slot back.
     registry::reclaim_context(id);
@@ -609,11 +613,11 @@ impl LocalRuntime {
   pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
     let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
     Ok(LocalRuntime {
-      ctx: ShardContext::build(ShardSeed::register(
+      ctx: std::ptr::NonNull::from(ShardContext::build(ShardSeed::register(
         config,
         prepared.seed,
         register_kick(prepared.kick_fd),
-      )?)?,
+      )?)?),
       notes: prepared.notes,
     })
   }
@@ -625,18 +629,18 @@ impl LocalRuntime {
     kick: Kick,
   ) -> Result<LocalRuntime, RtError> {
     Ok(LocalRuntime {
-      ctx: ShardContext::build(ShardSeed::register(
+      ctx: std::ptr::NonNull::from(ShardContext::build(ShardSeed::register(
         config,
         driver,
         registry::RegisterKick::Kick(kick),
-      )?)?,
+      )?)?),
       notes: Vec::new(),
     })
   }
 
   /// The shard.
   pub fn shard_id(&self) -> ShardId {
-    ShardId(self.ctx.id)
+    ShardId(self.context().id)
   }
 
   /// The driver notes.
@@ -646,12 +650,14 @@ impl LocalRuntime {
 
   /// Spawns a joinable task.
   pub fn spawn<F: Future<Output = ()> + 'static>(&self, future: F) -> Result<TaskId, RtError> {
-    self.ctx.spawn_local(crate::shard::boxed(future), None)
+    self
+      .context()
+      .spawn_local(crate::shard::boxed(future), None)
   }
 
   /// Runs until no task, timer or message is pending.
   pub fn run_until_idle(&self) {
-    self.ctx.run_until_idle();
+    self.context().run_until_idle();
   }
 
   /// The shard's context, for counters and joins: lent for this runtime's borrow, since dropping the
@@ -667,6 +673,9 @@ impl LocalRuntime {
   /// }
   /// ```
   pub fn context(&self) -> &ShardContext {
-    self.ctx
+    // SAFETY: the pointer came from the `&'static` `ShardContext::build` returned, whose context is freed only
+    // by this runtime's `Drop` (`reclaim_context`); the borrow returned is bounded by `&self`, so it ends
+    // before that drop.
+    unsafe { self.ctx.as_ref() }
   }
 }
