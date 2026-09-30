@@ -34,6 +34,11 @@ authorized merely by appearing here.
   the kqueue base watcher never delivered a hint
   (`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`), and the removal
   oracle held only on tmpfs (`docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
+- [x] **Runs 36672730335–36673694677, both conformance lanes: the cargo workload differed.** Moving the
+  harness's scratch into `target/` (A-50) put the workload's crate inside the repository, and cargo took the
+  repository's manifest for its workspace ("this may be fixable by adding … to `workspace.members`"). The
+  crate is now its own workspace root; locally over the NFS mount all eight tools that ran were identical
+  (the watcher skipped: no `fswatch` here).
 - [ ] **Run 36669682141, macOS: a SIGTERMed council leader's survivors elected nobody for 40 s (open, not
   reproduced).** `a_terminated_council_leader_process_hands_off_before_it_exits`: the leader's drain ended
   `SteppedDown` after 2.1 s, its invited target never took office, and neither survivor (two of three voters)

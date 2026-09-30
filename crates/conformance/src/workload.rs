@@ -54,10 +54,13 @@ git count-objects -v | grep '^count:'
 "#;
 
 /// The cargo workload: a dependency-free crate built twice; the second build must report the
-/// crate `Fresh` (AC-3.2 "incremental builds reuse artifacts") and the binary must run.
+/// crate `Fresh` (AC-3.2 "incremental builds reuse artifacts") and the binary must run. The crate is its
+/// own workspace root (`[workspace]`), so it builds the same wherever its directory sits — a volume or a
+/// scratch inside another workspace included (the harness's scratch moved into the repository's `target/`
+/// on 2026-09-30, and cargo then took the repository's manifest for this crate's workspace).
 const CARGO: &str = r#"
 mkdir -p mini/src
-printf '[package]\nname = "mini"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n' > mini/Cargo.toml
+printf '[package]\nname = "mini"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\n\n[workspace]\n' > mini/Cargo.toml
 printf 'fn main() { println!("mini says hello with {} args", std::env::args().count()); }\n' > mini/src/main.rs
 cd mini
 cargo build -q --offline
