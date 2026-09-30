@@ -5797,6 +5797,8 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
   } else {
     None
   };
+  // The volume's catalog register reached B too (AUD-29-17): it is shipped before the head can be.
+  let held_catalog = daemon_b.fleet_holder_head(object.catalog()).ok().flatten();
 
   daemon_a.stop();
   daemon_b.stop();
@@ -5810,9 +5812,12 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
     head.manifest.is_none(),
     "an unsealed volume's head names no content: {head:?}"
   );
+  let catalog = held_catalog
+    .and_then(|(_, value)| slates_server::catalog::CatalogValue::from_record_bytes(&value))
+    .expect("B holds the volume's catalog register");
   assert!(
-    matches!(head.size, slates_db::catalog::SizeClass::Bounded { limit } if limit == 1 << 20),
-    "B holds the head's catalog essentials (the size class the volume was created with): {head:?}"
+    matches!(catalog.size, slates_db::catalog::SizeClass::Bounded { limit } if limit == 1 << 20),
+    "B holds the volume's catalog (the size class the volume was created with): {catalog:?}"
   );
 }
 
@@ -5905,8 +5910,18 @@ fn three_daemons_take_over_a_dead_owners_head() {
     &daemons[successor_index],
     object,
   );
+  // The catalog register is adopted in the same round, object by object: wait for it as for the head.
+  let catalog_served = poll_head_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &daemons[successor_index],
+    object.catalog(),
+  );
   let held = daemons[successor_index]
     .fleet_holder_head(object)
+    .ok()
+    .flatten();
+  let held_catalog = daemons[successor_index]
+    .fleet_holder_head(object.catalog())
     .ok()
     .flatten();
 
@@ -5917,15 +5932,22 @@ fn three_daemons_take_over_a_dead_owners_head() {
     served,
     "the successor took over the dead owner's head and served it region-placed under its ownership"
   );
+  assert!(
+    catalog_served,
+    "the successor took over the volume's catalog register and placed it under its ownership"
+  );
   let held = held.expect("the successor still holds the taken-over head");
   assert_eq!(
     held.0, successor,
     "the successor is now the object's owner (the takeover reassigned ownership)"
   );
-  let head = HeadValue::from_record_bytes(&held.1).expect("a well-formed head value");
+  HeadValue::from_record_bytes(&held.1).expect("a well-formed head value");
+  let catalog = held_catalog
+    .and_then(|(_, value)| slates_server::catalog::CatalogValue::from_record_bytes(&value))
+    .expect("the successor holds the volume's catalog register");
   assert_eq!(
-    head.name, "taken-over",
-    "the taken-over head's value survived the promotion and re-commit"
+    catalog.name, "taken-over",
+    "the taken-over catalog survived the promotion and re-commit"
   );
 }
 
@@ -6021,8 +6043,18 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
     &daemons[successor_index],
     object,
   );
+  // The catalog register is adopted in the same round, object by object: wait for it as for the head.
+  let catalog_served = poll_head_placed(
+    &daemons.iter().collect::<Vec<_>>(),
+    &daemons[successor_index],
+    object.catalog(),
+  );
   let held = daemons[successor_index]
     .fleet_holder_head(object)
+    .ok()
+    .flatten();
+  let held_catalog = daemons[successor_index]
+    .fleet_holder_head(object.catalog())
     .ok()
     .flatten();
 
@@ -6033,15 +6065,22 @@ fn five_daemons_take_over_a_dead_owners_head_over_a_multi_holder_quorum() {
     served,
     "the successor took over the dead owner's head over a multi-holder quorum and served it region-placed"
   );
+  assert!(
+    catalog_served,
+    "the successor took over the volume's catalog register over the multi-holder quorum"
+  );
   let held = held.expect("the successor still holds the taken-over head");
   assert_eq!(
     held.0, successor,
     "the successor is now the object's owner (the takeover reassigned ownership)"
   );
-  let head = HeadValue::from_record_bytes(&held.1).expect("a well-formed head value");
+  HeadValue::from_record_bytes(&held.1).expect("a well-formed head value");
+  let catalog = held_catalog
+    .and_then(|(_, value)| slates_server::catalog::CatalogValue::from_record_bytes(&value))
+    .expect("the successor holds the volume's catalog register");
   assert_eq!(
-    head.name, "taken-over-5",
-    "the taken-over head's value survived the multi-holder promotion and re-commit"
+    catalog.name, "taken-over-5",
+    "the taken-over catalog survived the multi-holder promotion and re-commit"
   );
 }
 
@@ -9393,4 +9432,101 @@ fn refused_placeholder(error: &IpcError) -> ReplyBody {
       reason: error.to_string(),
     },
   }
+}
+
+/// Shape: the uid the catalog-takeover test grants read access to.
+const GRANTED_UID: u32 = 7_777;
+
+/// AUD-29-17 (§4.8 "catalog entries are registers the owner writes under that epoch"): a volume's catalog —
+/// here a grant made **after** its head placed, so no head the owner shipped carries it — survives the owner's
+/// death. Do X (seal a volume on A, wait for its head to place, grant uid 7777 read access, kill A), expect Y
+/// (the successor serves the volume with the grant in its access list). Until 2026-09-30 the catalog rode the
+/// head value, which ships only at a seal, so the grant was lost and the consumer with it.
+#[test]
+fn a_grant_made_after_the_last_seal_survives_a_takeover() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let id = match seal_hello_on_owner(&instance_a, &daemons, "granted") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let object = ObjectId(id.bytes);
+  let mut client = Client::connect(&instance_a);
+  let grant = slates_ipc::protocol::Rights {
+    read: true,
+    write: false,
+    admin: false,
+  };
+  let shared = client.call(&RequestBody::Share {
+    volume: id,
+    principal: slates_ipc::protocol::Principal::Uid { uid: GRANTED_UID },
+    rights: grant,
+  });
+  assert!(matches!(shared, ReplyBody::Shared), "{shared:?}");
+  // The catalog register's newest record reaches both survivors before A dies.
+  let replicated = poll_until(&daemons.iter().collect::<Vec<_>>(), SERVE_DEADLINE, || {
+    Ok(daemons[1..].iter().all(|daemon| {
+      daemon
+        .fleet_holder_head(object.catalog())
+        .ok()
+        .flatten()
+        .is_some_and(|(_, value)| {
+          slates_server::catalog::CatalogValue::from_record_bytes(&value)
+            .is_some_and(|catalog| !catalog.access.is_empty())
+        })
+    }))
+  });
+
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &successor_instance, id);
+  let access = daemons[successor_index]
+    .volume_access(object)
+    .ok()
+    .flatten();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    replicated,
+    "the grant's catalog record reached both survivors"
+  );
+  assert!(served, "the successor serves the taken-over volume");
+  let access = access.expect("the successor records the volume");
+  assert_eq!(
+    access,
+    vec![slates_db::catalog::AccessEntry {
+      principal: slates_db::catalog::Principal::Uid { uid: GRANTED_UID },
+      rights: slates_db::catalog::Rights {
+        read: true,
+        write: false,
+        admin: false,
+      },
+    }],
+    "the consumer keeps its access on the successor"
+  );
 }

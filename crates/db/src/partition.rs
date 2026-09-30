@@ -717,8 +717,14 @@ impl Partition {
     match op {
       Op::VolumeCreated { record } => self.insert_volume(record.clone()),
       Op::VolumeStateChanged { id, state } => self.update_volume(*id, |v| v.state = *state),
-      Op::VolumeResized { id, size } => self.update_volume(*id, |v| v.policy.size = *size),
-      Op::VolumeRebased { id, base } => self.update_volume(*id, |v| v.base = base.clone()),
+      Op::VolumeResized { id, size } => self.update_volume(*id, |v| {
+        v.policy.size = *size;
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
+      Op::VolumeRebased { id, base } => self.update_volume(*id, |v| {
+        v.base = base.clone();
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
       Op::VolumeAccounted {
         id,
         referenced_bytes,
@@ -731,7 +737,10 @@ impl Partition {
         v.head = *head;
         v.epoch = *epoch;
       }),
-      Op::AccessChanged { id, access } => self.update_volume(*id, |v| v.access = access.clone()),
+      Op::AccessChanged { id, access } => self.update_volume(*id, |v| {
+        v.access = access.clone();
+        v.catalog_version = v.catalog_version.saturating_add(1);
+      }),
       Op::VolumeDestroyed { id } => self.remove_volume(*id),
       Op::SnapshotTaken { record } => self.insert_snapshot(record.clone()),
       Op::SnapshotPlaced { volume, id, placed } => {

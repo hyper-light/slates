@@ -83,6 +83,7 @@ fn volume(n: u64) -> VolumeRecord {
     owner: Principal::Uid { uid: 1000 },
     access: vec![],
     created_ns: 0,
+    catalog_version: 0,
   }
 }
 

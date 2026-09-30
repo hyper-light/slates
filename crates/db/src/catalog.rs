@@ -260,6 +260,11 @@ pub struct VolumeRecord {
   pub access: Vec<AccessEntry>,
   /// Created at, monotonic ns.
   pub created_ns: u64,
+  /// The catalog register's sequence (§4.8 "catalog entries are registers the owner writes under that
+  /// epoch"): 0 at creation, raised by every op that changes what a successor must rebuild — the policy,
+  /// the access list, the base — so the owner ships each change as a newer record and a takeover adopts the
+  /// newest (AUD-29-17). Raised in `apply`, so replay reproduces it.
+  pub catalog_version: u64,
 }
 
 /// Where a snapshot's records and content are held (§4.8).

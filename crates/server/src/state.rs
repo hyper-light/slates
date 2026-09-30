@@ -558,6 +558,10 @@ pub struct ShardState {
   /// from a recorded holder) and the volume is created under its original id. Empty once every
   /// takeover serves.
   pub pending_materializations: BTreeMap<ObjectId, crate::head::HeadValue>,
+  /// The catalog register this node adopted for each taken-over volume (keyed by the volume's object), with
+  /// the adopted record's sequence (AUD-29-17): a pending materialization waits for it, and the successor's
+  /// record continues the register from that sequence. Bounded by the objects this node owns.
+  pub pending_catalogs: BTreeMap<ObjectId, (u64, crate::catalog::CatalogValue)>,
   /// Taken-over **greens** whose newest merge record this node adopted, awaiting materialization into
   /// an owned green on the shard the id routes to (§4.16 owner-loss recovery; AUD-14): the catalog
   /// record, the origin, the chain and the engine rebuilt from this node's own accepted records and

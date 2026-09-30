@@ -1990,6 +1990,21 @@ impl Daemon {
     })
   }
 
+  /// The access list of the volume `object` names as this node's catalog records it, or `None` when this
+  /// node holds no record of it — what a successor serves a taken-over volume's consumers under
+  /// (AUD-29-17). Asked on the volume's owner shard.
+  pub fn volume_access(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<Vec<slates_db::catalog::AccessEntry>>, ObserveError> {
+    self.observe(self.shard_of_object(object), move |s| {
+      s.db
+        .partition()
+        .volume(slates_db::catalog::VolumeId { bytes: object.0 })
+        .map(|record| record.access.clone())
+    })
+  }
+
   /// The shards.
   pub fn shards(&self) -> &[ShardId] {
     &self.shards
@@ -2426,6 +2441,7 @@ fn init_shard(
     healer: crate::fleet::HealerCursor::default(),
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
+    pending_catalogs: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
   };
   // The landing counter starts past every landing recovered with the partition (its records are

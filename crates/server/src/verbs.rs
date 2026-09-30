@@ -114,13 +114,30 @@ fn unpin_origin(state: &mut ShardState, origin: Handle<VolumeSlot>, snapshot: Sn
 /// and a per-host counter (the low 6 bytes), so ids never repeat on this host. (Before, the high bytes carried
 /// the partition, a Phase-8 placeholder: the id then named no creator host, so a cross-region lookup could not
 /// resolve the creator's region — the reason slice-1's guard misrouted a real volume.)
-fn fresh_volume_id(state: &mut ShardState) -> DbVolumeId {
+///
+/// `None` once the counter would reach the register-class bit (`slates_db::register::MAX_OBJECT_COUNTER`): an id
+/// past it would read as another register class of an older volume, so the partition mints no more ids
+/// ([`ids_exhausted`]). Until 2026-09-30 the counter was truncated silently to its low 48 bits.
+fn fresh_volume_id(state: &mut ShardState) -> Option<DbVolumeId> {
+  let count = state.db.next_seq();
+  if count > slates_db::register::MAX_OBJECT_COUNTER {
+    return None;
+  }
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&state.fleet.host().0.to_be_bytes());
   bytes[8..10].copy_from_slice(&state.partition.to_be_bytes());
-  let count = state.db.next_seq();
   bytes[10..].copy_from_slice(&count.to_be_bytes()[2..]);
-  DbVolumeId { bytes }
+  Some(DbVolumeId { bytes })
+}
+
+/// The refusal of a verb that needs a fresh volume id on a partition that has minted its last one.
+fn ids_exhausted() -> Refusal {
+  Refusal::Unsupported {
+    feature: format!(
+      "a volume id past this partition's {} ids",
+      slates_db::register::MAX_OBJECT_COUNTER
+    ),
+  }
 }
 
 /// The rights a principal holds on a volume (§4.13): the owner holds every right.
@@ -2994,7 +3011,16 @@ fn create(
       refusal_of_vfs(&e),
     );
   }
-  let id = fresh_volume_id(state);
+  let Some(id) = fresh_volume_id(state) else {
+    let _ = volume.discard_partial(&mut state.store);
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      ids_exhausted(),
+    );
+  };
   let record = VolumeRecord {
     id,
     name: name.to_owned(),
@@ -3023,6 +3049,7 @@ fn create(
     owner: principal.clone(),
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
+    catalog_version: 0,
   };
   publish_created_volume(
     state,
@@ -3362,7 +3389,9 @@ fn create_green(
       Err(refusal) => return refused(refusal),
     },
   };
-  let id = fresh_volume_id(state);
+  let Some(id) = fresh_volume_id(state) else {
+    return refused(ids_exhausted());
+  };
   let record = VolumeRecord {
     id,
     name: name.to_owned(),
@@ -3386,6 +3415,7 @@ fn create_green(
     owner: principal.clone(),
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
+    catalog_version: 0,
   };
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
@@ -3482,7 +3512,9 @@ fn create_work(
       existing: to_wire_volume(existing.id),
     });
   }
-  let id = fresh_volume_id(state);
+  let Some(id) = fresh_volume_id(state) else {
+    return refused(ids_exhausted());
+  };
   let record = VolumeRecord {
     id,
     name: name.to_owned(),
@@ -3507,6 +3539,7 @@ fn create_work(
     owner: principal.clone(),
     access: Vec::new(),
     created_ns: state.clock.monotonic_ns(),
+    catalog_version: 0,
   };
   let now = state.clock.monotonic_ns();
   if let Err(e) = state
@@ -4157,7 +4190,16 @@ fn clone(
   // Cap the clone's inode dimension at the same allowance already reserved above, so its per-volume
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
   let _ = volume_core.set_inode_allowance(clone_allowance);
-  let id = fresh_volume_id(state);
+  let Some(id) = fresh_volume_id(state) else {
+    let _ = volume_core.discard_partial(&mut state.store);
+    return give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      ids_exhausted(),
+    );
+  };
   let now = state.clock.monotonic_ns();
   let mut new_record = record.clone();
   new_record.id = id;
@@ -5211,6 +5253,7 @@ pub(crate) fn materialize_taken_over_green(
       owner: recovery.owner.clone(),
       access: Vec::new(),
       created_ns: state.clock.monotonic_ns(),
+      catalog_version: 0,
     };
     let now = state.clock.monotonic_ns();
     if let Err(e) = state
@@ -5283,23 +5326,36 @@ pub(crate) fn materialize_taken_over_green(
 /// this node, fatal-and-loud (§4.16 D-27).
 const GREEN_TAKEOVER_MISMATCH: &str = "merge.takeover_mismatch";
 
+/// What a takeover adopted for one volume: its head (the content), its catalog (what the volume is served
+/// as) and each register's adopted sequence.
+pub(crate) struct TakenOver<'a> {
+  /// The adopted head register value.
+  pub head: &'a crate::head::HeadValue,
+  /// The adopted catalog register value (AUD-29-17).
+  pub catalog: &'a crate::catalog::CatalogValue,
+  /// The catalog register's adopted sequence: the successor's record continues the register from it.
+  pub catalog_sequence: u64,
+  /// The head register's adopted sequence.
+  pub sequence: u64,
+}
+
 pub(crate) fn materialize_taken_over(
   state: &mut ShardState,
   id: DbVolumeId,
-  head: &crate::head::HeadValue,
-  sequence: u64,
+  taken: &TakenOver<'_>,
   region: Vec<u64>,
   archive: &slates_archive::Archive,
 ) -> Result<(), Box<ReplyBody>> {
+  let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
   if state.by_id.contains_key(&id) {
     return Ok(());
   }
-  if let Some(existing) = state.db.partition().volume_by_name(&head.name) {
+  if let Some(existing) = state.db.partition().volume_by_name(&catalog.name) {
     return Err(Box::new(refused(Refusal::AlreadyExists {
       existing: to_wire_volume(existing.id),
     })));
   }
-  let size = match head.size {
+  let size = match catalog.size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
   };
@@ -5356,7 +5412,7 @@ pub(crate) fn materialize_taken_over(
       )));
     }
   };
-  let names = wire_names(head.names);
+  let names = wire_names(catalog.names);
   let config = volume_config(state, names, quota_for(size));
   // The taken-over volume's records are reserved against the metadata ledger before it exists (§4.2).
   let metadata_credit = match reserve_metadata(state, config.journal_bytes) {
@@ -5371,6 +5427,24 @@ pub(crate) fn materialize_taken_over(
       )));
     }
   };
+  // A volume that must live in locked RAM keeps that guarantee on its successor (§4.2, AUD-29-17): the
+  // shard's arena is locked as a strict create locks it, and a successor the OS will not let lock refuses
+  // the takeover typed rather than serve the volume swappable.
+  if catalog.require_locked
+    && let Err(e) = state.store.content.arena_mut().lock()
+  {
+    let available = match e {
+      slates_mem::MemError::LockRefused { locked, .. } => u64::try_from(locked).unwrap_or(u64::MAX),
+      _ => 0,
+    };
+    return Err(Box::new(give_back(
+      state,
+      reservation,
+      version_credit,
+      metadata_credit,
+      Refusal::BudgetExceeded { available },
+    )));
+  }
   let mut volume = match Volume::create(&mut state.store, config) {
     Ok(v) => v,
     Err(e) => {
@@ -5406,14 +5480,16 @@ pub(crate) fn materialize_taken_over(
   let now = state.clock.monotonic_ns();
   let record = VolumeRecord {
     id,
-    name: head.name.clone(),
+    name: catalog.name.clone(),
     owner_shard: state.partition,
     policy: PolicyRecord {
-      size: head.size,
-      names: head.names,
-      require_locked: false,
+      size: catalog.size,
+      names: catalog.names,
+      require_locked: catalog.require_locked,
       role: Role::Plain,
     },
+    // Placed content is always whole in RAM (an overlay's base-backed bodies are never sealed), so the
+    // successor serves it with no base beneath.
     base: BaseRecord::Scratch,
     head: DbSnapshotId::default(),
     // The seal below advances the epoch to the adopted sequence, so the head register continues from it.
@@ -5421,10 +5497,12 @@ pub(crate) fn materialize_taken_over(
     referenced_bytes: 0,
     unique_bytes: 0,
     state: VolumeState::Live,
+    // A lease was a client's of the dead owner; clients take new ones from the successor.
     lease: None,
-    owner: head.owner.clone(),
-    access: Vec::new(),
+    owner: catalog.owner.clone(),
+    access: catalog.access.clone(),
     created_ns: now,
+    catalog_version: taken.catalog_sequence,
   };
   let published = publish_created_volume(
     state,
@@ -7187,16 +7265,107 @@ mod tests {
     });
   }
 
-  /// A takeover head for `name` bounded at `limit` bytes, owned by uid 501.
-  fn takeover_head(name: &str, limit: u64) -> crate::head::HeadValue {
-    crate::head::HeadValue {
-      manifest: None,
-      content_holders: Vec::new(),
+  /// A takeover catalog for `name` bounded at `limit` bytes, owned by uid 501, with no locked policy and no
+  /// grants.
+  fn takeover_catalog(name: &str, limit: u64) -> crate::catalog::CatalogValue {
+    crate::catalog::CatalogValue {
       name: name.to_owned(),
       size: slates_db::catalog::SizeClass::Bounded { limit },
       names: slates_db::catalog::NamePolicy::Exact,
       owner: Principal::Uid { uid: 501 },
+      require_locked: false,
+      access: Vec::new(),
     }
+  }
+
+  /// Takes over volume `id` as `catalog` describes it, from `archive`, at head sequence 1 and catalog
+  /// sequence 0 (the head names no holders: the content is handed over whole).
+  fn take_over(
+    state: &mut crate::state::ShardState,
+    id: slates_db::catalog::VolumeId,
+    catalog: &crate::catalog::CatalogValue,
+    archive: &slates_archive::Archive,
+  ) -> Result<(), Box<super::ReplyBody>> {
+    let head = crate::head::HeadValue {
+      manifest: None,
+      content_holders: Vec::new(),
+    };
+    let taken = super::TakenOver {
+      head: &head,
+      catalog,
+      catalog_sequence: 0,
+      sequence: 1,
+    };
+    super::materialize_taken_over(state, id, &taken, Vec::new(), archive)
+  }
+
+  /// AUD-29-17: do: take over a volume whose catalog carries a consumer's grant, and one whose catalog
+  /// requires locked RAM; expect the successor's record to keep the grant (the consumer keeps its access), and the
+  /// locked volume either kept locked or refused `BudgetExceeded` with nothing published — never served as
+  /// a weaker, swappable volume. Until 2026-09-30 a takeover reset both.
+  #[test]
+  fn a_takeover_keeps_the_volumes_grants_and_its_locked_policy() {
+    crate::daemon::audit_on_shard(|state| {
+      let data = slates_archive::Archive::raw_chunk(b"DATA".to_vec());
+      let archive = || {
+        takeover_archive(
+          vec![slates_archive::Extent {
+            offset: 0,
+            len: 4,
+            chunk: data.identity,
+            chunk_offset: 0,
+          }],
+          vec![data.clone()],
+        )
+      };
+      let grant = slates_db::catalog::AccessEntry {
+        principal: Principal::Uid { uid: 777 },
+        rights: slates_db::catalog::Rights {
+          read: true,
+          write: true,
+          admin: false,
+        },
+      };
+      let granted = slates_db::catalog::VolumeId { bytes: [0x61; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        access: vec![grant.clone()],
+        ..takeover_catalog("granted", 1 << 20)
+      };
+      take_over(state, granted, &catalog, &archive()).unwrap();
+      let record = state.db.partition().volume(granted).unwrap();
+      assert_eq!(record.access, vec![grant], "the consumer keeps its access");
+      assert!(!record.policy.require_locked);
+
+      let locked = slates_db::catalog::VolumeId { bytes: [0x62; 16] };
+      let catalog = crate::catalog::CatalogValue {
+        require_locked: true,
+        ..takeover_catalog("locked", 1 << 20)
+      };
+      match take_over(state, locked, &catalog, &archive()) {
+        Ok(()) => assert!(
+          state
+            .db
+            .partition()
+            .volume(locked)
+            .unwrap()
+            .policy
+            .require_locked,
+          "served, it is served locked"
+        ),
+        Err(refusal) => {
+          assert!(
+            matches!(
+              *refusal,
+              super::ReplyBody::Refused {
+                refusal: Refusal::BudgetExceeded { .. }
+              }
+            ),
+            "{refusal:?}"
+          );
+          assert!(!state.by_id.contains_key(&locked), "nothing was published");
+        }
+      }
+    });
   }
 
   /// An archive of one file `f` laid out by `extents` over `chunks`, its recorded size their tiled length.
@@ -7258,15 +7427,7 @@ mod tests {
         vec![data],
       );
       let id = slates_db::catalog::VolumeId { bytes: [0x51; 16] };
-      super::materialize_taken_over(
-        state,
-        id,
-        &takeover_head("successor", 1 << 20),
-        1,
-        Vec::new(),
-        &sparse,
-      )
-      .unwrap();
+      take_over(state, id, &takeover_catalog("successor", 1 << 20), &sparse).unwrap();
       let handle = *state.by_id.get(&id).unwrap();
       let slot = state.volumes.get(handle).unwrap();
       let inode = slot.volume.resolve(&state.store, "f").unwrap().inode;
@@ -7293,12 +7454,10 @@ mod tests {
         Vec::new(),
       );
       let other = slates_db::catalog::VolumeId { bytes: [0x52; 16] };
-      let refusal = super::materialize_taken_over(
+      let refusal = take_over(
         state,
         other,
-        &takeover_head("too-big", 1 << 20),
-        1,
-        Vec::new(),
+        &takeover_catalog("too-big", 1 << 20),
         &oversized,
       )
       .unwrap_err();

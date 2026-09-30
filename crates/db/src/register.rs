@@ -85,7 +85,39 @@ impl ObjectId {
     word.copy_from_slice(&self.0[size_of::<u64>()..]);
     u64::from_be_bytes(word)
   }
+
+  /// The catalog register of this object (§4.8 "catalog entries are registers the owner writes under that
+  /// epoch"): the same id with the register-class bit set. It is placed, owned and taken over exactly as
+  /// its object is ([`ObjectId::placement_key`]), so a volume's catalog and its head always share their
+  /// holders and their successor.
+  pub const fn catalog(self) -> ObjectId {
+    let mut bytes = self.0;
+    bytes[CLASS_BYTE] |= CATALOG_CLASS;
+    ObjectId(bytes)
+  }
+
+  /// Whether this id names a catalog register ([`ObjectId::catalog`]).
+  pub const fn is_catalog(&self) -> bool {
+    self.0[CLASS_BYTE] & CATALOG_CLASS != 0
+  }
+
+  /// The object whose placement and takeover this id follows: the id itself with its register-class bit
+  /// cleared, so every register class of one object ranks the same holders and the same successor.
+  pub const fn placement_key(&self) -> ObjectId {
+    let mut bytes = self.0;
+    bytes[CLASS_BYTE] &= !CATALOG_CLASS;
+    ObjectId(bytes)
+  }
 }
+
+/// Format: the byte of an object id carrying its register-class bit — the first byte of the per-creator
+/// counter (bytes 10–15 of a volume id, after the creator and the partition).
+const CLASS_BYTE: usize = 10;
+/// Format: the register-class bit — the counter's top bit — set for a catalog register.
+const CATALOG_CLASS: u8 = 0x80;
+/// The largest per-creator counter an object id may carry: the counter's 48 bits less the class bit, so
+/// no object's own id ever reads as a catalog register. An id minter refuses past it.
+pub const MAX_OBJECT_COUNTER: u64 = (1u64 << 47) - 1;
 
 /// The width of an encoded object id (16 bytes) — its place in every register wire layout.
 pub const OBJECT_BYTES: usize = size_of::<ObjectId>();
@@ -456,7 +488,9 @@ fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
   /// Format: the FNV-1a 64-bit prime.
   const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
   let mut hash = FNV_OFFSET;
-  for byte in host.to_le_bytes().iter().chain(object.0.iter()) {
+  // Every register class of one object hashes as that object, so its classes share holders and successor.
+  let key = object.placement_key();
+  for byte in host.to_le_bytes().iter().chain(key.0.iter()) {
     hash ^= u64::from(*byte);
     hash = hash.wrapping_mul(FNV_PRIME);
   }

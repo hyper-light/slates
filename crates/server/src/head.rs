@@ -7,12 +7,12 @@
 //!
 //! The value names the snapshot's **content** (the archive manifest's identity, D-17) and the
 //! candidates that acknowledged holding it, so a reader — a takeover successor materializing the
-//! volume, a remote attach — fetches the content by identity from a recorded holder. It also carries
-//! the catalog essentials a successor needs to serve the volume under its original id: the mount
-//! name, the size class, the name policy and the owning principal. The design lists catalog entries
-//! as a register class of their own, with one batched phase-one round per class on a takeover; folding
-//! the catalog essentials into the head's value gives one round per volume today, and the split into
-//! a distinct catalog register is the owed refinement.
+//! volume, a remote attach — fetches the content by identity from a recorded holder. What a successor
+//! serves the content *as* — the name, size class, name policy, owner, locked policy and access list — is
+//! the volume's catalog register (`crate::catalog`), shipped on every catalog change; a head ships only once
+//! its catalog's current version is placed, so an adopted head always has an adopted catalog. Until
+//! 2026-09-30 those fields rode this value, which ships only when a seal places, and a later change was lost
+//! at a takeover (AUD-29-17).
 //!
 //! The encoding is the daemon's canonical wire codec ([`slates_wire::Wire`]) — the same codec the
 //! catalog records use — so the value is deterministic across hosts (the record's identity, and so
@@ -20,7 +20,7 @@
 //! any malformation; a value with trailing bytes is refused too, so a record is exactly one value.
 
 use slates_archive::Archive;
-use slates_db::catalog::{NamePolicy, Principal, SizeClass, SnapshotId};
+use slates_db::catalog::SnapshotId;
 use slates_db::register::{HostEpoch, HostId, Placement};
 use slates_vfs::export::SnapshotArchiver;
 use slates_wire::Wire;
@@ -34,26 +34,18 @@ pub struct HeadValue {
   /// The candidate holders that acknowledged holding the content whole (host ids), the "acknowledging
   /// set" a reader fetches from; empty when there is no content.
   pub content_holders: Vec<u64>,
-  /// The volume's mount name (unique per host), so a successor serves it under the same name.
-  pub name: String,
-  /// The volume's size class, so a successor reserves the same admission.
-  pub size: SizeClass,
-  /// The volume's name-equivalence policy.
-  pub names: NamePolicy,
-  /// The owning principal, so a successor enforces the same rights.
-  pub owner: Principal,
 }
 
 impl HeadValue {
   /// The value's canonical bytes, the head record's `value`.
   pub fn to_record_bytes(&self) -> Vec<u8> {
-    self.to_bytes()
+    crate::catalog::tagged(crate::catalog::HEAD_CLASS, self.to_bytes())
   }
 
-  /// Parses a head record's value; `None` for bytes that are not exactly one value (truncated,
-  /// malformed, or with trailing bytes).
+  /// Parses a head record's value; `None` for another register class or for bytes that are not exactly
+  /// one value (truncated, malformed, or with trailing bytes).
   pub fn from_record_bytes(bytes: &[u8]) -> Option<HeadValue> {
-    let mut input = bytes;
+    let mut input = crate::catalog::untagged(crate::catalog::HEAD_CLASS, bytes)?;
     let value = <HeadValue as Wire>::decode(&mut input).ok()?;
     if input.is_empty() { Some(value) } else { None }
   }
@@ -126,10 +118,6 @@ mod tests {
     HeadValue {
       manifest: Some([7u8; 32]),
       content_holders: vec![3, 9],
-      name: "scratch".to_owned(),
-      size: SizeClass::Bounded { limit: 1 << 20 },
-      names: NamePolicy::Exact,
-      owner: Principal::Uid { uid: 501 },
     }
   }
 
@@ -146,7 +134,6 @@ mod tests {
     let creation = HeadValue {
       manifest: None,
       content_holders: Vec::new(),
-      ..value()
     };
     assert_eq!(
       HeadValue::from_record_bytes(&creation.to_record_bytes()),

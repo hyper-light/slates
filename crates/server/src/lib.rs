@@ -22,6 +22,7 @@
 //! [`telemetry`] (the chokepoint spans' per-shard rings and the bounded `Telemetry` drain the status
 //! surfaces read, §4.14), [`error`].
 
+pub mod catalog;
 pub mod config;
 mod consensus;
 mod consensus_recovery;

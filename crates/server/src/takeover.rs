@@ -817,7 +817,14 @@ fn record_adoption(
     take.learned.remove(&object);
     take.adopted.insert(object);
   }
-  if let Some(head) = HeadValue::from_record_bytes(&record.value) {
+  if object.is_catalog() {
+    // A volume's catalog register: its successor rebuilds the volume under it (AUD-29-17).
+    if let Some(catalog) = crate::catalog::CatalogValue::from_record_bytes(&record.value) {
+      state
+        .pending_catalogs
+        .insert(object.placement_key(), (record.sequence, catalog));
+    }
+  } else if let Some(head) = HeadValue::from_record_bytes(&record.value) {
     state.pending_materializations.insert(object, head);
   } else if let Some(merge) =
     crate::merge_service::MergeRecordValue::from_record_bytes(&record.value)

@@ -1044,14 +1044,14 @@ pub struct MergeRecordValue {
 }
 
 impl MergeRecordValue {
-  /// The value's canonical bytes.
+  /// The value's canonical bytes, behind the merge register's class byte (`crate::catalog::MERGE_CLASS`).
   pub fn to_record_bytes(&self) -> Vec<u8> {
-    self.to_bytes()
+    crate::catalog::tagged(crate::catalog::MERGE_CLASS, self.to_bytes())
   }
 
-  /// Parses a record's value; `None` for bytes that are not exactly one value.
+  /// Parses a record's value; `None` for another register class or for bytes that are not exactly one value.
   pub fn from_record_bytes(bytes: &[u8]) -> Option<MergeRecordValue> {
-    let mut input = bytes;
+    let mut input = crate::catalog::untagged(crate::catalog::MERGE_CLASS, bytes)?;
     let value = <MergeRecordValue as Wire>::decode(&mut input).ok()?;
     if input.is_empty() { Some(value) } else { None }
   }

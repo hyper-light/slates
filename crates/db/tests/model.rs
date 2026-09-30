@@ -240,6 +240,7 @@ fn volume(n: u64, name: &str) -> VolumeRecord {
     owner: principal(0),
     access: vec![],
     created_ns: 0,
+    catalog_version: 0,
   }
 }
 

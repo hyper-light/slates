@@ -2980,48 +2980,86 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       continue;
     };
     let object = ObjectId(slot.id.bytes);
+    // The catalog register first (AUD-29-17): what a successor serves the volume as, shipped at every
+    // catalog change. The head waits until the catalog's current version is committed, so an adopted head
+    // always meets an adopted catalog as new as the head's own volume.
+    let catalog = object.catalog();
+    let catalog_owed = owed_record(
+      state,
+      config,
+      (catalog, record.catalog_version),
+      crate::catalog::CatalogValue::of(record).to_record_bytes(),
+      local,
+    );
+    let catalog_committed = state.placed_heads.get(&catalog).is_some_and(|head| {
+      head.sequence == record.catalog_version && head.placement.placed(config.quorum)
+    });
+    let catalog_ready = catalog_owed.is_none() || catalog_committed;
+    heads.extend(catalog_owed);
+    if !catalog_ready {
+      continue;
+    }
     let Some((sequence, value)) = head_value_of(state, record, object, config.quorum) else {
       continue; // The newest seal's content is not yet placed: the head waits for it.
     };
-    let placement = config.place(object);
-    let recorded = state.placed_heads.get(&object);
-    let acked = recorded
-      .filter(|head| head.sequence == sequence)
-      .map(|head| head.placement.acked.clone())
-      .unwrap_or_default();
-    // The head is written at the greater of the host's epoch and the epoch the object was last written or
-    // adopted under: a taken-over object's holders fenced it at its promotion epoch (see `PlacedHead`).
-    let epoch = recorded
-      .map_or(config.host_epoch, |head| head.epoch)
-      .max(config.host_epoch);
-    // Every remote candidate that has not acked still needs the head; when none remain the head is done.
-    let outstanding = placement
-      .candidates
-      .iter()
-      .any(|candidate| *candidate != local && !acked.contains(candidate));
-    if !outstanding {
-      continue;
-    }
-    heads.push(Head {
-      shard: state.shard,
-      object,
-      record: Record {
-        owner: local,
-        object,
-        sequence,
-        epoch,
-        generation: config.version,
-        value: value.to_record_bytes(),
-      },
-      shape: Placement {
-        acked: Vec::new(),
-        ..placement
-      },
-      acked,
-      quorum: config.quorum,
-    });
+    heads.extend(owed_record(
+      state,
+      config,
+      (object, sequence),
+      value.to_record_bytes(),
+      local,
+    ));
   }
   heads
+}
+
+/// The record of `object` at `sequence` with `value`, as this owner still owes it to some remote candidate —
+/// its full candidate set, the candidates that already hold it and the quorum — or `None` once every remote
+/// candidate holds it. The record is written at the greater of the host's epoch and the epoch the object was
+/// last written or adopted under: a taken-over object's holders fenced it at its promotion epoch (see
+/// `PlacedHead`).
+fn owed_record(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  (object, sequence): (ObjectId, u64),
+  value: Vec<u8>,
+  local: HostId,
+) -> Option<Head> {
+  let placement = config.place(object);
+  let recorded = state.placed_heads.get(&object);
+  let acked = recorded
+    .filter(|head| head.sequence == sequence)
+    .map(|head| head.placement.acked.clone())
+    .unwrap_or_default();
+  let epoch = recorded
+    .map_or(config.host_epoch, |head| head.epoch)
+    .max(config.host_epoch);
+  // Every remote candidate that has not acked still needs the record; when none remain it is done.
+  let outstanding = placement
+    .candidates
+    .iter()
+    .any(|candidate| *candidate != local && !acked.contains(candidate));
+  if !outstanding {
+    return None;
+  }
+  Some(Head {
+    shard: state.shard,
+    object,
+    record: Record {
+      owner: local,
+      object,
+      sequence,
+      epoch,
+      generation: config.version,
+      value,
+    },
+    shape: Placement {
+      acked: Vec::new(),
+      ..placement
+    },
+    acked,
+    quorum: config.quorum,
+  })
 }
 
 /// The head this node should be shipping for `record`'s volume — its sequence and value — or `None` while
@@ -3038,10 +3076,6 @@ fn head_value_of(
   let value = |manifest: Option<[u8; 32]>, content_holders: Vec<u64>| HeadValue {
     manifest,
     content_holders,
-    name: record.name.clone(),
-    size: record.policy.size,
-    names: record.policy.names,
-    owner: record.owner.clone(),
   };
   if record.epoch == 0 {
     return Some((0, value(None, Vec::new())));
@@ -3848,12 +3882,24 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
     let placed = s.placed_heads.get(&object).cloned()?;
+    // The volume's catalog, adopted in the same round (it is placed before any head that could be adopted
+    // is shipped): the volume is served as that catalog describes it (AUD-29-17). Until it is adopted the
+    // materialization waits, uncounted.
+    let (catalog_sequence, catalog) = s.pending_catalogs.get(&object).cloned()?;
+    let catalog_placed = s.placed_heads.get(&object.catalog()).cloned()?;
     // The partition the id names, as this daemon's runtime shard (the shard list is in partition order).
     let target = s.shards.get(usize::from(partition)).copied()?;
-    Some((archive, placed, target))
+    Some((
+      archive,
+      placed,
+      catalog_sequence,
+      catalog,
+      catalog_placed,
+      target,
+    ))
   })
   .flatten();
-  let Some((archive, placed, target)) = taken else {
+  let Some((archive, placed, catalog_sequence, catalog, catalog_placed, target)) = taken else {
     return;
   };
   let region = head.content_holders.clone();
@@ -3862,11 +3908,18 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     target,
     move |s| {
       let sequence = placed.sequence;
-      let served = verbs::materialize_taken_over(s, id, &head, sequence, region, &archive).is_ok();
+      let taken = verbs::TakenOver {
+        head: &head,
+        catalog: &catalog,
+        catalog_sequence,
+        sequence,
+      };
+      let served = verbs::materialize_taken_over(s, id, &taken, region, &archive).is_ok();
       if served {
-        // The owner shard now owns the head's placement — its record plane writes the object's next
-        // heads at the promotion epoch and ships only to holders still missing this one.
+        // The owner shard now owns the head's and the catalog's placements — its record plane writes the
+        // object's next records at the promotion epoch and ships only to holders still missing these.
         s.placed_heads.insert(object, placed);
+        s.placed_heads.insert(object.catalog(), catalog_placed);
       }
       served
     },
@@ -3876,6 +3929,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   state::with_state(|s| {
     if served == Some(true) {
       s.pending_materializations.remove(&object);
+      s.pending_catalogs.remove(&object);
     } else {
       *s.refusals.entry(MATERIALIZE_REFUSED).or_insert(0) += 1;
     }
@@ -4843,12 +4897,15 @@ fn unsettled_neighbourhood(state: &ShardState, local: HostId) -> Option<(u64, u6
 /// write already reached it, and an old cohort that lost a host could never answer. True with nothing owned.
 fn records_placed_on_current_neighbourhood(state: &ShardState) -> bool {
   let config = state.fleet.configuration();
+  // Every register of each volume the node owns — its head and its catalog (AUD-29-17).
   let heads = state.volumes.iter().all(|(_, slot)| {
     let object = ObjectId(slot.id.bytes);
-    state
-      .placed_heads
-      .get(&object)
-      .is_some_and(|head| config.placed_on_current(object, &head.placement.acked))
+    [object, object.catalog()].into_iter().all(|register| {
+      state
+        .placed_heads
+        .get(&register)
+        .is_some_and(|head| config.placed_on_current(register, &head.placement.acked))
+    })
   });
   heads && crate::merge_service::greens_placed_on_current_cohort(state)
 }
