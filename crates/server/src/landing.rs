@@ -524,6 +524,7 @@ fn run_landing(
     Ok(s) => s,
     Err(_) => return refused(Refusal::NotFound),
   };
+  let was_overlay = slot.volume.is_overlay();
   // Observe each entry to emit a `land.entry` span (§4.14), into a bounded buffer so a large landing
   // does not grow it without bound (ban 8). It records only timings; the spans are built and drained
   // into the shard's telemetry sink after the landing, once the borrows above are released.
@@ -543,6 +544,18 @@ fn run_landing(
     &mut spans,
   );
   drain_land_spans(state, spans);
+  // A scratch volume the landing made an overlay over its target (§4.15 step 9) names the target by the
+  // landing host's handles: the slot keeps that host, so every later verb is served through the base it
+  // now has. Until 2026-09-30 the host was dropped here and the volume was served hostless — a landed file,
+  // now a base entry, could not be read, and a name the overlay had not materialized was not seen (found
+  // when the bridge began refusing hostless verbs on an overlay, AUD-29-16).
+  if !was_overlay
+    && let Ok(slot) = state.volumes.get_mut(prepared.handle)
+    && slot.volume.is_overlay()
+    && slot.host.is_none()
+  {
+    slot.host = Some(prepared.os.into_host());
+  }
   let ids = LandingIds {
     landing_id,
     fresh: presented.is_none(),

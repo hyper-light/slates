@@ -97,6 +97,29 @@ pub struct BaseConfig {
 }
 
 /// A directory's cached listing: the host handle, the fingerprint the entries were read under,
+/// The listed entry `name` names under `policy`, found by binary search: a listing is kept sorted by
+/// `(policy.hash, policy.fold)` of its names ([`Overlay::load_listing`]), the order this compares in —
+/// the hash first, the folded name (which may allocate) only on a tie. A relist prunes every overlay
+/// entry against the listing, so a linear search made each relist O(entries × listed); the racy listing
+/// rule (2026-09-30) relists inside a changed directory's timestamp window, so each relist must be cheap.
+fn listed_entry<'e>(
+  entries: &'e [BaseEntry],
+  policy: crate::names::NameEquivalence,
+  name: &str,
+) -> Option<&'e BaseEntry> {
+  let hash = policy.hash(name);
+  let folded = policy.fold(name);
+  let at = entries
+    .binary_search_by(|entry| {
+      policy
+        .hash(&entry.name)
+        .cmp(&hash)
+        .then_with(|| policy.fold(&entry.name).cmp(&folded))
+    })
+    .ok()?;
+  entries.get(at)
+}
+
 /// and the entries in the volume's canonical order.
 #[derive(Debug)]
 pub(crate) struct Listing {
@@ -859,11 +882,14 @@ impl Volume {
       .as_ref()
       .and_then(|b| b.listings.get(&dir_no))
       .and_then(|l| l.entries.as_ref())
-      .is_some_and(|entries| entries.iter().any(|e| policy.same(&e.name, name)))
+      .is_some_and(|entries| listed_entry(entries, policy, name).is_some())
   }
 
-  /// Whether a directory is empty for `rmdir`: no live overlay entry, and every base name
-  /// under it whiteouted (the listing must be loaded, which the overlay verbs do).
+  /// Whether a directory is empty enough to remove or to be replaced by a rename (the one check both
+  /// use, AUD-29-16): no live overlay entry, and every base name under it whiteouted. A merged
+  /// directory's base listing must be loaded, which the overlay verbs do before asking; one that is not
+  /// is refused `BaseUnavailable` (the host is needed to list it), never taken for empty — until
+  /// 2026-09-30 an unread listing answered "empty" and rename replaced a directory with disk children.
   pub(crate) fn empty_for_rmdir(
     &self,
     store: &Store,
@@ -883,7 +909,7 @@ impl Volume {
       .and_then(|b| b.listings.get(&node.inode))
       .and_then(|l| l.entries.as_ref())
     else {
-      return Ok(true);
+      return Err(VfsError::BaseUnavailable(0));
     };
     Ok(entries.iter().all(|e| {
       node
@@ -946,6 +972,7 @@ impl Overlay<'_> {
     // witness racy — docs/bugs/2026-09-14-racy-rule-compares-monotonic-with-wall-clock.md).
     let now = self.host.now_ns();
     let policy = self.vol.policy;
+    let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     let listing = plane
       .listings
@@ -961,7 +988,14 @@ impl Overlay<'_> {
       .host
       .fingerprint_dir(listing.dir)
       .map_err(host_refusal)?;
-    if listing.entries.is_some() && listing.fingerprint == Some(fingerprint) {
+    // The racy rule for listings (§4.5, as for a file's witness): an unchanged fingerprint proves the
+    // listing current only when it was read more than one timestamp granularity after the directory last
+    // changed; within that window a child added in the same tick leaves the fingerprint as it was, so the
+    // directory is listed again. Until 2026-09-30 a listing read in the tick of a change was trusted, and
+    // a rename replaced a directory whose outsider child it never saw (AUD-29-16 sibling).
+    let changed_at = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+    let racy = listing.read_at_ns.saturating_sub(changed_at) <= granularity;
+    if listing.entries.is_some() && listing.fingerprint == Some(fingerprint) && !racy {
       return Ok(());
     }
     let mut entries = self.host.list(listing.dir).map_err(host_refusal)?;
@@ -1046,7 +1080,7 @@ impl Overlay<'_> {
     let mut gone = Vec::new();
     let mut changed = Vec::new();
     for e in store.dirs.get(dir)?.iter(&store.blocks) {
-      let listed = entries.iter().find(|b| policy.same(&b.name, e.name));
+      let listed = listed_entry(entries, policy, e.name);
       match (listed, e.child) {
         (Some(l), Child::File(no)) if l.kind == HostKind::File && self.unloaded_file(store, no) => {
           changed.push((no, l.fingerprint));
@@ -1145,8 +1179,19 @@ impl Overlay<'_> {
     no: InodeNo,
     fp: Fingerprint,
   ) -> Result<(), VfsError> {
-    if let Some(f) = self.plane()?.descriptors.remove(&no) {
-      self.host.close_file(f);
+    // A held descriptor stays while the listed name still names the file it holds (the same `(dev,
+    // ino)`; an in-place edit shows through its `fstat`), so an opener keeps the file it opened across a
+    // relist; it is closed only when the name now names another file (a replacement). Until 2026-09-30
+    // every relist closed it, and a file opened, then unlinked through the mount after a relist, lost its
+    // bytes: the reopen by name found the name gone (AUD-29-16 sibling, found by the racy listing rule).
+    if let Some(held) = self.plane()?.descriptors.get(&no).copied() {
+      let same_file = self
+        .host
+        .fstat(held)
+        .is_ok_and(|now| now.dev == fp.dev && now.ino == fp.ino);
+      if !same_file && let Some(f) = self.plane()?.descriptors.remove(&no) {
+        self.host.close_file(f);
+      }
     }
     // A relist refreshes every untouched entry, changed or not; a kept digest is stale knowledge
     // only when the listing's fingerprint no longer matches the one it was verified under.
@@ -1253,7 +1298,7 @@ impl Overlay<'_> {
         .as_ref()
         .and_then(|b| b.listings.get(&dir_no))
         .and_then(|l| l.entries.as_ref())
-        .and_then(|es| es.iter().find(|e| policy.same(&e.name, name)).cloned()),
+        .and_then(|es| listed_entry(es, policy, name).cloned()),
     )
   }
 
@@ -1643,7 +1688,21 @@ impl Overlay<'_> {
     to_name: &str,
   ) -> Result<(), VfsError> {
     let source = self.lookup(store, from_dir, from_name)?;
-    let _ = self.lookup(store, to_dir, to_name);
+    // The target, served from the base when it lives there: only its absence lets the rename go on
+    // without it; any other refusal (a stale handle, the host, admission) refuses the rename unchanged.
+    // A merged directory target has its base listing loaded, so the volume's emptiness check sees the
+    // disk children it has not been asked about yet (AUD-29-16).
+    match self.lookup(store, to_dir, to_name) {
+      Ok(target) => {
+        if let Child::Dir(target_dir) = target.child
+          && store.dirs.get(target_dir)?.base == BaseDirState::Merged
+        {
+          self.load_listing(store, target_dir)?;
+        }
+      }
+      Err(VfsError::NotFound) => {}
+      Err(refusal) => return Err(refusal),
+    }
     let from_dir = self.vol.head_dir(store, from_dir)?;
     let to_dir = self.vol.head_dir(store, to_dir)?;
     let from_base = self.base_entry(store, from_dir, from_name)?;

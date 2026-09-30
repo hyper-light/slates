@@ -36,6 +36,8 @@ const SHORT_TERM_NS: u64 = 50_000_000;
 const PAUSE: Duration = Duration::from_nanos(2 * SHORT_TERM_NS);
 
 fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
+  // The base tree predates the mount (`common::SETTLED_NS`).
+  host.advance_ns(common::SETTLED_NS);
   let root = host.root();
   let facts = host.facts(root).unwrap();
   Volume::create_overlay(

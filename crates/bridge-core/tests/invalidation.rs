@@ -101,6 +101,9 @@ struct Overlay {
 impl Overlay {
   fn over(mut host: SimHost) -> Overlay {
     host.set_granularity_ns(GRANULARITY_NS);
+    // The tree predates the mount, as a disk tree does: its last change is older than the granularity,
+    // so its listing is trusted until the directory changes (the listing racy rule, §4.5).
+    host.advance_ns(i64::try_from(2 * GRANULARITY_NS).unwrap());
     let mut store = store();
     let root = host.root();
     let facts = host.facts(root).unwrap();

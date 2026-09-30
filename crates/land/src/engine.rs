@@ -549,6 +549,14 @@ struct Landing<'a, H: LandFs> {
   /// file's own descriptor after the last rename, so an outsider's later change to the name cannot be taken
   /// for it (A-49's rebase).
   placed: BTreeMap<Box<str>, Fingerprint>,
+  /// Each replaced file this landing's sweep put back at its name after a crash, by path, with the
+  /// fingerprint the put-back left. The rename moves the file's ctime and nothing else; the sweep had
+  /// proved it the witnessed file just before (`aside_is_witnessed`), so that ctime is this landing's own
+  /// and the entry's witness is judged with it ([`Landing::witness_of`]). Any change after the put-back
+  /// moves the fingerprint again and is still a conflict. Until 2026-09-30 the resume took its own
+  /// put-back for an outsider's edit and reported `ModifyModify` on every entry a no-exchange crash had
+  /// set aside — hidden by a simulated clock that never moved.
+  restored: BTreeMap<Box<str>, Fingerprint>,
 }
 
 /// What the writer needs besides the host: the volume, the grant, the observer, the audit log.
@@ -782,8 +790,33 @@ impl<H: LandFs> Landing<'_, H> {
   /// Whether the verdict for `entry` needs the disk's bytes hashed: a create over an existing
   /// file always (same bytes or a conflict), a replacement only when the fingerprint moved
   /// from the witness or the witness was racy.
+  /// The witness an entry is judged against: its own, or — for a replaced file this landing's sweep put
+  /// back — the same witness with the ctime the put-back left, when that is the only difference
+  /// ([`Landing::restored`]).
+  fn witness_of(&self, entry: &LandingEntry) -> Option<Witness> {
+    let witness = entry.witnessed?;
+    let restored = self
+      .restored
+      .get(&entry.path)
+      .filter(|after| {
+        Fingerprint {
+          ctime_ns: witness.fingerprint.ctime_ns,
+          ..**after
+        } == witness.fingerprint
+      })
+      .copied();
+    Some(match restored {
+      Some(after) => Witness {
+        fingerprint: after,
+        ..witness
+      },
+      None => witness,
+    })
+  }
+
   fn needs_hash(&mut self, entry: &LandingEntry) -> Result<bool, HostError> {
-    match (&entry.action, entry.witnessed.as_ref()) {
+    let witness = self.witness_of(entry);
+    match (&entry.action, witness.as_ref()) {
       (Action::Create, _) | (Action::Replace, None) => Ok(true),
       (Action::Replace, Some(w)) => {
         if w.racy {
@@ -834,9 +867,10 @@ impl<H: LandFs> Landing<'_, H> {
         }
         _ => self.disk_state(&entry.path, hash, check_ours)?,
       };
+      let witness = self.witness_of(entry);
       let v = verdict(
         &entry.action,
-        entry.witnessed.as_ref(),
+        witness.as_ref(),
         disk,
         entry.overlay.as_ref(),
       );
@@ -1019,7 +1053,10 @@ impl<H: LandFs> Landing<'_, H> {
         }
       }
       Action::Create => return self.write_file(entry, vol, store, None),
-      Action::Replace => return self.write_file(entry, vol, store, entry.witnessed.as_ref()),
+      Action::Replace => {
+        let witness = self.witness_of(entry);
+        return self.write_file(entry, vol, store, witness.as_ref());
+      }
       Action::Delete => self.delete(dir_path, name, entry.witnessed.as_ref())?,
       Action::Rmdir => self.remove_tree_entry(dir_path, name, entry.witnessed.as_ref())?,
       Action::Clear => return self.clear_entry(dir_path, name, entry),
@@ -1960,7 +1997,14 @@ impl<H: LandFs> Landing<'_, H> {
       }
       if matches!(entry.action, Action::Replace | Action::Clear) {
         match self.host.rename_noreplace(dir, aside, dir, name) {
-          Ok(()) => return Ok(false),
+          Ok(()) => {
+            if matches!(entry.action, Action::Replace)
+              && let Ok(after) = self.host.entry_fingerprint(dir, name)
+            {
+              self.restored.insert(displaced.into(), after);
+            }
+            return Ok(false);
+          }
           Err(HostError::Unavailable(ERRNO_EXIST)) => {}
           Err(e) => return Err(e),
         }
@@ -2320,6 +2364,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       unsynced: BTreeSet::new(),
       media_failed: false,
       placed: BTreeMap::new(),
+      restored: BTreeMap::new(),
     }
   }
 }

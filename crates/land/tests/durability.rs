@@ -34,6 +34,8 @@ const ENOSPC: i32 = 28;
 const EACCES: i32 = 13;
 
 fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
+  // The base tree predates the mount (`common::SETTLED_NS`).
+  host.advance_ns(common::SETTLED_NS);
   let root = host.root();
   let facts = host.facts(root).unwrap();
   Volume::create_overlay(

@@ -170,6 +170,14 @@ impl OsLand {
     &mut self.host
   }
 
+  /// The base host beneath, kept after the landing: a scratch volume the landing made an overlay over its
+  /// target (`Overlay::land_advance`) names the target by this host's handles, so the volume must be served
+  /// through this host and no other. The writer's temporaries are names only; any a crash left are its
+  /// hidden siblings, which the next landing's sweep removes.
+  pub fn into_host(self) -> OsHost {
+    self.host
+  }
+
   fn dir(&self, dir: HostDir) -> Result<BorrowedFd<'_>, HostError> {
     self.host.dir_fd(dir)
   }

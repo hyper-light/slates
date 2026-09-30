@@ -1711,6 +1711,34 @@ the verdict that every entry beneath still matches its listing fingerprint.
 
 **Laptop degenerate.** Identical.
 
+> **Status (2026-09-30, AUD-29-16 and the siblings it found).** A directory never replaces a base
+> directory with disk children, and a listing is never trusted inside its directory's timestamp window.
+> - **One emptiness check.** Rename and rmdir share one base-aware check: no live overlay entry, and every
+>   base name whiteouted. The overlay loads a merged target's listing before a rename. A merged
+>   directory whose listing is not loaded is refused `BaseUnavailable`, never taken for empty. A rename's
+>   target lookup refuses on every error but `NotFound`, so a host refusal changes nothing.
+> - **Hostless verbs.** The bridge refuses every verb on an overlay served without its host
+>   (`BaseUnavailable`). The volume layer cannot see base names it has not materialized, so a hostless
+>   rename would shadow a disk directory.
+> - **The listing racy rule** (as for a file's witness). An unchanged directory fingerprint proves a cached
+>   listing current only when the listing was read more than one timestamp granularity after the directory
+>   last changed. Otherwise the directory is listed again. A relist costs O(n log m): the listing is
+>   binary-searched in its `(hash, fold)` order.
+> - **Descriptors across a relist.** A relist keeps a held descriptor while the listed name still names the
+>   same `(dev, ino)`, so an open file survives an unlink after a relist.
+> - **A landed scratch volume keeps its host.** A landing that makes a scratch volume an overlay of its
+>   target leaves the landing's host in the volume's slot, so the landed files (now base entries) are
+>   served through it.
+> - **Crash resume.** A landing's sweep that puts a witnessed file back by rename records the ctime the
+>   rename left. The resume judges the entry against it, not against an outsider's edit.
+> - **Evidence.** Each item has a test that was red first
+>   (`docs/bugs/2026-09-30-a-rename-replaced-a-base-directory-it-had-not-listed.md`).
+> - **Owed.**
+>   - A landed volume's durable record still says `Scratch`, so a restart rebuilds it without its base.
+>   - Landing an overlay runs the engine's base operations through the writer's own host rather than the
+>     slot's.
+>   - A file replaced on disk while open is still served its new bytes after a relist (open pins).
+
 ### 4.6 OS bridges (D-1, D-2, D-3)
 
 **Special names (A-26).** A bridge may create and report FIFO/socket inodes only with

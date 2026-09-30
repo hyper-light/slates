@@ -1358,7 +1358,12 @@ impl Volume {
     self.live()?;
     names::check(to_name)?;
     let source = self.lookup(store, from_dir, from_name)?;
-    let target = self.lookup(store, to_dir, to_name).ok();
+    // Only the target's absence means "no target"; any other refusal refuses the rename unchanged.
+    let target = match self.lookup(store, to_dir, to_name) {
+      Ok(target) => Some(target),
+      Err(VfsError::NotFound) => None,
+      Err(refusal) => return Err(refusal),
+    };
     if from_dir == to_dir && self.policy.same(from_name, to_name) {
       // The same entry. A folding volume keeps names as spelled, as APFS and NTFS do (EQUIVALENCE §4),
       // so another spelling of it respells the entry: `readme` → `README` renames, the inode unchanged.
@@ -1387,7 +1392,9 @@ impl Volume {
       match target.map(|t| t.child) {
         None => {}
         Some(Child::Dir(existing)) => {
-          if !store.dirs.get(existing)?.is_empty() {
+          // The same base-aware check rmdir uses (AUD-29-16): a merged directory's disk children count.
+          let existing = self.head_dir(store, existing)?;
+          if !self.empty_for_rmdir(store, existing)? {
             return Err(VfsError::NotEmpty);
           }
         }

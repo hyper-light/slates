@@ -531,6 +531,9 @@ fn removing_a_large_base_directory_and_recreating_two_files_is_one_opaque_direct
   for i in 0..ENTRIES {
     host.replace_file(&format!("/vendor/pkg-{i:05}.txt"), b"x");
   }
+  // The tree predates the mount, as a disk tree does: its last change is older than the timestamp
+  // granularity, so its listing is read once and trusted (the listing racy rule, §4.5).
+  host.advance_ns(1_000_000_000);
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
   let vendor = match vol
@@ -1614,4 +1617,146 @@ fn a_recovered_snapshot_keeps_the_witnesses_it_froze() {
     Some(f1)
   );
   assert_eq!(recovered.base_plane().unwrap().witness(lib), head);
+}
+
+/// The names `dir` lists through the overlay, sorted.
+fn listed(vol: &mut Volume, host: &mut SimHost, store: &mut Store, path: &str) -> Vec<String> {
+  let dir = match vol.with_host(host).resolve(store, path).unwrap().child {
+    Child::Dir(h) => h,
+    other => panic!("{other:?}"),
+  };
+  let mut names: Vec<String> = vol
+    .with_host(host)
+    .readdir(store, dir)
+    .unwrap()
+    .iter()
+    .map(|r| r.name.to_owned())
+    .collect();
+  names.sort();
+  names
+}
+
+/// AUD-29-16 (§4.5; POSIX `rename`: a directory replaces only an empty directory): do: rename a new
+/// directory over a base directory whose disk child has never been read, and again after listing it;
+/// expect `NotEmpty` both times with both trees unchanged, and — once the base child is whiteouted — the
+/// rename to succeed. (The hostless form is refused at the bridge: `crates/bridge-core/tests/base_overlay.rs`.) Until 2026-09-30 rename asked the overlay node alone
+/// (`DirNode::is_empty`), found no entries in an unread base directory, and replaced it.
+#[test]
+fn a_directory_never_replaces_a_lazy_base_directory_with_children() {
+  let mut host = SimHost::new();
+  host.mkdir("/target");
+  host.replace_file("/target/keep", b"kept");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let root = vol.root();
+  vol
+    .with_host(&mut host)
+    .mkdir(&mut store, root, "src", 0o755)
+    .unwrap();
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .rename(&mut store, root, "src", root, "target"),
+    Err(VfsError::NotEmpty),
+    "before the target's children were read"
+  );
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/target/keep").unwrap(),
+    b"kept"
+  );
+  assert!(vol.with_host(&mut host).resolve(&mut store, "/src").is_ok());
+  assert_eq!(
+    listed(&mut vol, &mut host, &mut store, "/target"),
+    vec!["keep".to_owned()]
+  );
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .rename(&mut store, root, "src", root, "target"),
+    Err(VfsError::NotEmpty),
+    "after listing"
+  );
+  let target = match vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/target")
+    .unwrap()
+    .child
+  {
+    Child::Dir(h) => h,
+    other => panic!("{other:?}"),
+  };
+  vol
+    .with_host(&mut host)
+    .unlink(&mut store, target, "keep")
+    .unwrap();
+  vol
+    .with_host(&mut host)
+    .rename(&mut store, root, "src", root, "target")
+    .unwrap();
+  assert!(listed(&mut vol, &mut host, &mut store, "/target").is_empty());
+  assert!(
+    vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/src")
+      .is_err()
+  );
+}
+
+/// AUD-29-16: do: list an empty base directory, let an outsider add a file inside it, then rename a new
+/// directory over it; and, on a fresh overlay whose host refuses to open the target directory, try the
+/// same rename; expect `NotEmpty` for the first (the listing is re-validated against the disk, so the
+/// outsider's child counts) and the host's refusal for the second — never the target taken for absent
+/// and shadowed by a new directory — with the source still in place both times.
+#[test]
+fn a_rename_over_a_base_directory_sees_outsider_children_and_refuses_on_a_host_fault() {
+  use slates_vfs::host::HostError;
+  use slates_vfs::host::sim::SimVerb;
+  let mut host = SimHost::new();
+  host.mkdir("/empty");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let root = vol.root();
+  assert!(listed(&mut vol, &mut host, &mut store, "/empty").is_empty());
+  vol
+    .with_host(&mut host)
+    .mkdir(&mut store, root, "src", 0o755)
+    .unwrap();
+  host.replace_file("/empty/outsider", b"new on disk");
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .rename(&mut store, root, "src", root, "empty"),
+    Err(VfsError::NotEmpty)
+  );
+  assert!(vol.with_host(&mut host).resolve(&mut store, "/src").is_ok());
+
+  let mut faulty = SimHost::new();
+  faulty.mkdir("/target");
+  let mut fresh_store = common::store();
+  let mut fresh = overlay(&mut faulty, &mut fresh_store);
+  let fresh_root = fresh.root();
+  fresh
+    .with_host(&mut faulty)
+    .mkdir(&mut fresh_store, fresh_root, "src", 0o755)
+    .unwrap();
+  faulty.fail(SimVerb::OpenDir, "/target", HostError::Unavailable(5), 1);
+  assert_eq!(
+    fresh
+      .with_host(&mut faulty)
+      .rename(&mut fresh_store, fresh_root, "src", fresh_root, "target"),
+    Err(VfsError::BaseUnavailable(5))
+  );
+  assert!(
+    fresh
+      .with_host(&mut faulty)
+      .resolve(&mut fresh_store, "/src")
+      .is_ok()
+  );
+  assert!(
+    fresh
+      .diverged(&fresh_store)
+      .iter()
+      .all(|d| d.path != "/target"),
+    "the disk directory was not shadowed"
+  );
 }

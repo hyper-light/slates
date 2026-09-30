@@ -102,6 +102,15 @@ fn a_landing_of_a_snapshot_writes_its_bytes_and_the_head_lands_after_it() {
   let state = land(&mut client, &secret, volume, None, &target.path);
   assert_eq!(state, "done");
   assert_eq!(std::fs::read(&landed).unwrap(), HEAD_BYTES);
+  // The landed file left the overlay: it is now a base entry of the target the volume overlays, served
+  // through the host the landing kept (until 2026-09-30 the volume was served hostless after a landing).
+  let (mut stream, root) = mounted(&daemon);
+  let file = lookup(&mut stream, &root, "f", 7);
+  assert_eq!(
+    read(&mut stream, &file, 8),
+    HEAD_BYTES,
+    "the landed file reads back through the mount, from the disk it landed on"
+  );
   drop(client);
   daemon.stop();
 }

@@ -23,6 +23,11 @@ use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
+/// Shape: how far the simulated clock moves between building a base tree and mounting it. A disk tree
+/// predates its mount, so its last change is older than the timestamp granularity and its listing is
+/// trusted once read; a mount in the same tick as the change re-lists on every use (the listing racy rule,
+/// §4.5). One second passes any granularity these tests set.
+pub(crate) const SETTLED_NS: i64 = 1_000_000_000;
 /// Format: the page size the tests use (the store's granule).
 pub(crate) const PAGE: usize = 4096;
 /// Shape: pages in the test region (16 MiB of content).

@@ -148,6 +148,22 @@ impl HostRef<'_> {
   }
 }
 
+/// The host a verb dispatches through: the lent or owned host when there is one; none for a scratch
+/// volume; refused `BaseUnavailable` for an overlay volume served without its host (AUD-29-16 sibling).
+/// Without the host, the volume layer cannot see a base name it has not materialized, so a rename,
+/// create or link would shadow a disk entry and a lookup would answer "absent" for one that exists: the
+/// verb refuses unchanged instead. Every verb that chooses between the overlay and the bare volume asks
+/// here, so no mount path can take the hostless arm for an overlay.
+fn host_for<'h>(
+  host: &'h mut HostRef<'_>,
+  overlay: bool,
+) -> Result<Option<&'h mut dyn HostFs>, VfsError> {
+  match host.as_mut() {
+    None if overlay => Err(VfsError::BaseUnavailable(0)),
+    served => Ok(served),
+  }
+}
+
 impl<'v> VolumeBridge<'v> {
   /// A bridge over the volume `volume_id` names, backed by `volume` and its `store`.
   pub fn new(
@@ -286,7 +302,7 @@ impl<'v> VolumeBridge<'v> {
   /// entry) and its kind (structural, always in the store).
   fn attr_of(&mut self, no: u64) -> Result<NodeAttr, VfsError> {
     let inode = InodeNo(no);
-    let observed = match self.host.as_mut() {
+    let observed = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).observe(self.store, inode),
       None => self.volume.observe(self.store, inode),
     }?;
@@ -374,7 +390,7 @@ impl<'v> VolumeBridge<'v> {
   /// a base name not yet looked up counts as existing. `NotFound` is the one refusal that means
   /// "absent"; any other (a base directory unreadable) is propagated, never read as absence.
   fn name_exists(&mut self, dir: InodeNo, name: &str) -> Result<bool, VfsError> {
-    let located = match self.host.as_mut() {
+    let located = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).lookup_no(self.store, dir, name),
       None => self.volume.lookup_no(self.store, dir, name),
     };
@@ -414,7 +430,7 @@ impl<'v> VolumeBridge<'v> {
     let gid = match cx.owner_gid {
       Some(gid) => gid,
       None => {
-        match self.host.as_mut() {
+        match host_for(&mut self.host, self.volume.is_overlay())? {
           Some(host) => self.volume.with_host(host).stat(self.store, parent),
           None => self.volume.stat(self.store, parent),
         }?
@@ -479,7 +495,7 @@ impl Bridge for VolumeBridge<'_> {
     // first use (the OS's bulk call), validates it by the directory's fingerprint on every later
     // use, and materializes a hit — so a direct LOOKUP of an untouched base file works without a
     // prior READDIR (§4.5 "Lookup"). A scratch volume uses the plain lookup.
-    let located = match self.host.as_mut() {
+    let located = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).lookup_no(self.store, dir, name),
       None => self.volume.lookup_no(self.store, dir, name),
     }?;
@@ -537,7 +553,7 @@ impl Bridge for VolumeBridge<'_> {
     }
     let mut buf = vec![0u8; want];
     let inode = InodeNo(object.inode);
-    let read = match self.host.as_mut() {
+    let read = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -634,7 +650,7 @@ impl Bridge for VolumeBridge<'_> {
       return u32::try_from(written).map_err(|_| VfsError::FileTooLarge);
     }
     // An overlay write copies the base up first (through the host); a scratch write does not.
-    let written = match self.host.as_mut() {
+    let written = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -669,7 +685,7 @@ impl Bridge for VolumeBridge<'_> {
       .parent_no(self.store, dir_no)
       .unwrap_or(dir_no)
       .0;
-    let rows = match self.host.as_mut() {
+    let rows = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self.volume.with_host(host).readdir_no(self.store, dir_no),
       None => self.volume.readdir_no(self.store, dir_no),
     }?;
@@ -714,7 +730,7 @@ impl Bridge for VolumeBridge<'_> {
     let parent_no = InodeNo(parent.inode);
     // Through the overlay rules for an overlay volume: a name the base holds is `EEXIST`, not a
     // second file shadowing the disk's (§4.6; AC-1.17).
-    let no = match self.host.as_mut() {
+    let no = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -799,7 +815,7 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
-    let no = match self.host.as_mut() {
+    let no = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -824,7 +840,7 @@ impl Bridge for VolumeBridge<'_> {
     // Through the overlay rules for an overlay volume: a name the base holds is `EEXIST`, and the
     // new directory is opaque (only overlay entries show), so it is in the diverged set the landing
     // plans from (§4.5 "Mutation"; AC-1.10).
-    let no = match self.host.as_mut() {
+    let no = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -842,7 +858,7 @@ impl Bridge for VolumeBridge<'_> {
     let parent_no = InodeNo(parent.inode);
     // Through the overlay rules for an overlay volume: the listing is reloaded first, so a base name
     // leaves its whiteout even after a watcher hint invalidated the cached listing (§4.5).
-    match self.host.as_mut() {
+    match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -854,7 +870,7 @@ impl Bridge for VolumeBridge<'_> {
   fn rmdir(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<(), VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
-    match self.host.as_mut() {
+    match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -872,7 +888,7 @@ impl Bridge for VolumeBridge<'_> {
   ) -> Result<NodeAttr, VfsError> {
     self.authorize_write(cx)?;
     let parent_no = InodeNo(parent.inode);
-    let no = match self.host.as_mut() {
+    let no = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -897,7 +913,7 @@ impl Bridge for VolumeBridge<'_> {
     let target_no = InodeNo(target.inode);
     // Through the overlay rules for an overlay volume: a link to an untouched base file copies its
     // witness up (the link count is a metadata change), and a name the base holds is `EEXIST`.
-    match self.host.as_mut() {
+    match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -944,7 +960,7 @@ impl Bridge for VolumeBridge<'_> {
     }
     // Through the overlay rules for an overlay volume: a renamed base file copies its witness up and
     // leaves a whiteout at the old name, a renamed base directory records its origin (§4.5 "Rename").
-    match self.host.as_mut() {
+    match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
@@ -973,7 +989,7 @@ impl Bridge for VolumeBridge<'_> {
     // "Copy-up") — so the landing has the base the change was made against, and the live-disk stat
     // that follows an untouched entry no longer undoes the change.
     if let Some(size) = changes.size {
-      match self.host.as_mut() {
+      match host_for(&mut self.host, self.volume.is_overlay())? {
         Some(host) => self
           .volume
           .with_host(host)
@@ -982,7 +998,7 @@ impl Bridge for VolumeBridge<'_> {
       }?;
     }
     if let Some(mode) = changes.mode {
-      match self.host.as_mut() {
+      match host_for(&mut self.host, self.volume.is_overlay())? {
         Some(host) => self.volume.with_host(host).chmod(self.store, inode, mode),
         None => self.volume.chmod(self.store, inode, mode),
       }?;
@@ -993,7 +1009,7 @@ impl Bridge for VolumeBridge<'_> {
       let current = self.attr_of(ino)?;
       let uid = changes.uid.unwrap_or(current.uid);
       let gid = changes.gid.unwrap_or(current.gid);
-      match self.host.as_mut() {
+      match host_for(&mut self.host, self.volume.is_overlay())? {
         Some(host) => self
           .volume
           .with_host(host)
@@ -1002,7 +1018,7 @@ impl Bridge for VolumeBridge<'_> {
       }?;
     }
     if changes.atime.is_some() || changes.mtime.is_some() || changes.ctime.is_some() {
-      match self.host.as_mut() {
+      match host_for(&mut self.host, self.volume.is_overlay())? {
         Some(host) => self.volume.with_host(host).set_times(
           self.store,
           inode,

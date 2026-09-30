@@ -42,6 +42,9 @@ const REGION_PAGES: usize = 4096;
 /// Shape: the large-file class boundary, one chunk window (as the base oracle uses), so every file
 /// here is small class and a content copy-up reads it whole.
 const LARGE: u64 = 65_536;
+/// Shape: how far the simulated clock moves between building a base tree and mounting it — past any
+/// granularity these tests set, so the tree is settled (not racy) when first listed.
+const SETTLED_NS: i64 = 1_000_000_000;
 /// Format: the `st_mode` the simulated host reports for a file (`S_IFREG` over `rw-r--r--`).
 const SIM_FILE_MODE: u32 = 0o100_644;
 
@@ -129,7 +132,23 @@ impl Fixture {
     Fixture::over(host)
   }
 
+  /// A fixture mounted in the same tick its tree last changed: every listing is racy (re-read each use).
+  fn racy(mut host: SimHost) -> Fixture {
+    let mut store = store();
+    let vol = overlay(&mut host, &mut store);
+    Fixture {
+      host,
+      store,
+      vol,
+      handles: new_handle_store(),
+      cx: rw_cx(),
+    }
+  }
+
   fn over(mut host: SimHost) -> Fixture {
+    // The tree predates the mount, as a disk tree does: its last change is older than the timestamp
+    // granularity, so a listing read now is trusted until the directory changes (the listing racy rule).
+    host.advance_ns(SETTLED_NS);
     let mut store = store();
     let vol = overlay(&mut host, &mut store);
     Fixture {
@@ -209,6 +228,9 @@ fn set(names: &[&str]) -> BTreeSet<String> {
 fn a_base_file_resolves_by_lookup_before_any_readdir_and_the_listing_follows_the_rule() {
   let mut f = Fixture::worked_example();
   f.host.replace_file("/src/util.rs", b"pub fn util() {}");
+  // `util.rs` is part of the settled tree: the clock passes the racy window before the steady lookups,
+  // which would otherwise re-list rightly (a directory changed within the granularity is never trusted).
+  f.host.advance_ns(SETTLED_NS);
   let root = f.root();
   let src = f.lookup(root, "src").unwrap();
 
@@ -586,4 +608,106 @@ fn unlink_of_a_base_name_after_a_hint_invalidated_the_listing_still_leaves_a_whi
   assert_eq!(f.names(root), set(&["g"]), "f stays hidden, g shows");
   assert_eq!(f.diverged(), vec![("/f".to_owned(), Divergence::Whiteout)]);
   assert_eq!(f.host.bytes("/f").unwrap(), b"f", "the disk is untouched");
+}
+
+/// AUD-29-16 (§4.5; POSIX `rename`): do: through the bridge, rename a new directory over a base
+/// directory whose disk child the mount has never read; then serve the same overlay through a bridge
+/// that was given no host and try the rename and a lookup there; expect `NotEmpty` with both trees
+/// unchanged through the host, and the hostless bridge refusing `BaseUnavailable` for both verbs rather
+/// than shadowing the disk directory with a new one — the volume layer cannot see a base name it has not
+/// materialized, so no mount verb may run it hostless over an overlay.
+#[test]
+fn a_directory_rename_never_replaces_an_unread_base_directory_and_a_hostless_bridge_refuses() {
+  let mut host = SimHost::new();
+  host.mkdir("/target");
+  host.replace_file("/target/keep", b"kept");
+  let mut fx = Fixture::over(host);
+  let root = fx.root();
+  fx.bridge(|b, cx| b.mkdir(oid(root), cx, "src", 0o755).map(|_| ()))
+    .unwrap();
+  let rename = |b: &mut VolumeBridge<'_>, cx: &OpContext| {
+    b.rename(
+      oid(root),
+      oid(root),
+      cx,
+      "src",
+      "target",
+      RenameFlags::default(),
+    )
+  };
+  assert_eq!(fx.bridge(rename), Err(VfsError::NotEmpty));
+  let target = fx.lookup(root, "target").unwrap();
+  assert_eq!(fx.names(target), set(&["keep"]));
+  assert!(fx.lookup(root, "src").is_ok());
+
+  let mut fresh = Fixture::over(fx.host);
+  let fresh_root = fresh.root();
+  fresh
+    .bridge(|b, cx| b.mkdir(oid(fresh_root), cx, "src", 0o755).map(|_| ()))
+    .unwrap();
+  let cx = fresh.cx.clone();
+  let mut hostless = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut fresh.vol,
+    &mut fresh.store,
+    &mut fresh.handles,
+    None,
+  );
+  assert_eq!(
+    hostless.rename(
+      oid(fresh_root),
+      oid(fresh_root),
+      &cx,
+      "src",
+      "target",
+      RenameFlags::default()
+    ),
+    Err(VfsError::BaseUnavailable(0))
+  );
+  assert_eq!(
+    hostless.lookup(oid(fresh_root), &cx, "target").map(|_| ()),
+    Err(VfsError::BaseUnavailable(0))
+  );
+  drop(hostless);
+  let target = fresh.lookup(fresh_root, "target").unwrap();
+  assert_eq!(
+    fresh.names(target),
+    set(&["keep"]),
+    "the disk directory is still served"
+  );
+}
+
+/// Unlink-while-open when the mount runs in the tick the base directory last changed (its listing is
+/// racy, so every lookup re-lists it): do: open an untouched base file, unlink it through the mount, read
+/// through the open handle, then release; expect the opener's bytes after the unlink, the name hidden, and
+/// the inode reclaimed at release. Found 2026-09-30 by the listing racy rule: a re-list closed every
+/// untouched entry's descriptor, so the descriptor the open took was closed during the unlink's own lookup
+/// and the read after the unlink refused `NotFound` — any outsider change to the directory did the same
+/// before the rule. A re-list now keeps a descriptor that still names the listed file.
+#[test]
+fn unlink_of_an_open_base_file_keeps_its_bytes_across_a_relisting_directory() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"hello");
+  let mut f = Fixture::racy(host);
+  let root = f.root();
+  let ino = f.lookup(root, "f").unwrap();
+  let fh = f.bridge(|b, cx| b.open(oid(ino), cx, 0).unwrap());
+  f.bridge(|b, cx| b.unlink(oid(root), cx, "f").unwrap());
+  assert_eq!(f.lookup(root, "f"), Err(VfsError::NotFound));
+  assert!(f.names(root).is_empty(), "the base name is hidden");
+  assert_eq!(
+    f.read(ino).unwrap(),
+    b"hello",
+    "the open file still serves the bytes the opener saw"
+  );
+  f.bridge(|b, cx| b.release(oid(ino), cx, fh).unwrap());
+  assert!(
+    f.bridge(|b, cx| b.getattr(oid(ino), cx)).is_err(),
+    "reclaimed once the open handle is released"
+  );
+  assert_eq!(
+    f.host.bytes("/f").unwrap(),
+    b"hello",
+    "the disk is untouched"
+  );
 }
