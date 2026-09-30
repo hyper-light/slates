@@ -646,9 +646,11 @@ impl RegionalCouncil {
   /// healthy leader. A lone voter proceeds straight to leading with no messages (the `f = 0` degenerate).
   pub fn election_timeout(&mut self) -> Vec<RaftMessage> {
     let was_leader = self.is_leader();
+    // A term with no successor cannot campaign: nothing is sent (counted in the node's `terms_exhausted`).
     let messages = self
       .raft
       .on_election_timeout()
+      .unwrap_or_default()
       .into_iter()
       .map(RaftMessage::PreVote)
       .collect();

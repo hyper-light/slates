@@ -154,7 +154,7 @@ fn run_election_and_replication() -> Outcome {
       let mut node = RaftNode::new(CANDIDATE, vec![CANDIDATE, VOTER]);
 
       // Win the election: send the vote request, feed the reply back.
-      let request = node.start_election().into_iter().next().unwrap();
+      let request = node.start_election().unwrap().into_iter().next().unwrap();
       if let Some(RaftMessage::VoteReply(reply)) =
         request_raft(&mut endpoint, &RaftMessage::RequestVote(request))
           .await

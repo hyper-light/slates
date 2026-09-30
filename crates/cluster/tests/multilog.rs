@@ -182,7 +182,7 @@ impl Cluster {
   fn time_out(&mut self, at: usize, log: usize) {
     let node = self.nodes[at].log_mut(log).unwrap();
     let was_leader = node.is_leader();
-    let pre_votes = node.on_election_timeout();
+    let pre_votes = node.on_election_timeout().unwrap();
     self.finish_election(at, log, was_leader);
     self.retain(at);
     let from = self.id(at);

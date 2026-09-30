@@ -73,7 +73,7 @@ impl Cluster {
   /// replies are fed back — so the candidate becomes leader iff a majority grants. `reachable` is the set
   /// that can exchange messages (a partition excludes the rest).
   fn elect(&mut self, candidate: HostId, reachable: &BTreeSet<HostId>) {
-    let requests = self.at(candidate).start_election();
+    let requests = self.at(candidate).start_election().unwrap();
     let Some(request) = requests.first().copied() else {
       return; // a single-voter candidate already led
     };
@@ -108,7 +108,7 @@ impl Cluster {
   /// Runs a pre-election for `candidate` (Raft §9.6): it asks each reachable peer for a pre-vote and,
   /// only if a majority would grant, starts a real election. Returns whether a real election started.
   fn attempt_pre_election(&mut self, candidate: HostId, reachable: &BTreeSet<HostId>) -> bool {
-    let pre_votes = self.at(candidate).on_election_timeout();
+    let pre_votes = self.at(candidate).on_election_timeout().unwrap();
     let Some(pre_vote) = pre_votes.first().copied() else {
       return self.at(candidate).is_leader(); // a lone voter goes straight to leading
     };

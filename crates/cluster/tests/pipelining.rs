@@ -190,7 +190,7 @@ fn a_proposal_costs_the_leader_the_same_at_any_backlog() {
   };
   let voters: Vec<HostId> = (1..=5).map(HostId).collect();
   let mut leader = RaftNode::new(voters[0], voters.clone());
-  let requests = leader.start_election();
+  let requests = leader.start_election().unwrap();
   for (voter, request) in voters[1..].iter().zip(requests) {
     let reply = RaftNode::new(*voter, voters.clone()).on_request_vote(request);
     leader.on_vote_reply(reply);

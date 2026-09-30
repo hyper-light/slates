@@ -845,12 +845,14 @@ impl Sim {
       Campaign::PreVote => node
         .raft
         .on_election_timeout()
+        .unwrap()
         .into_iter()
         .map(RaftMessage::PreVote)
         .collect(),
       Campaign::Direct => node
         .raft
         .start_election()
+        .unwrap()
         .into_iter()
         .map(RaftMessage::RequestVote)
         .collect(),

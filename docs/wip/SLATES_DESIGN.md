@@ -2508,6 +2508,17 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 **Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
 hard links and snapshot versions. No live kernel endpoint state is part of the image.
 
+> **Status (2026-09-30, AUD-29-26).** No consensus counter saturates into a repeated identity.
+> - **Terms.** A node whose term is `u64::MAX` cannot campaign: `on_election_timeout` and `start_election`
+>   return `TermExhausted` before the term, the vote or any message changes. A pre-vote reply and a
+>   `TimeoutNow` check the next term instead of saturating it. Before this, a second node at the saturated
+>   term campaigned at it again and two leaders held one term.
+> - **Log indices.** An entry past `u64::MAX` is refused (`indices_exhausted`): a leader's proposal or
+>   membership change returns `false`, a fast proposal `None`, and a follower refuses an append that would
+>   run past the range whole, before touching its log. A publication past the range does not restore
+>   (`IndexOverflow`). Such a state is reachable only through a peer's or a publication's maximal field
+>   (`docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`).
+>
 > **Status (A-9, 2026-09-05).** Local records, replay/completion transactions and an
 > f-parameterized register core exist. `ledger`, `mirror` and `reconfig` are pure simulations
 > using direct calls. They are not an implementation-side proof of the historical TLA models

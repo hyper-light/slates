@@ -310,7 +310,7 @@ impl Lockstep {
 
   /// `candidate` campaigns (pre-vote, then the real vote) with `voter`, every message delivered at once.
   fn campaign(&mut self, candidate: HostId, voter: HostId) {
-    let pre_votes = self.node(candidate).on_election_timeout();
+    let pre_votes = self.node(candidate).on_election_timeout().unwrap();
     let reply = self.node(voter).on_pre_vote(pre_votes[0]);
     let Some(votes) = self.node(candidate).on_pre_vote_reply(reply) else {
       return;

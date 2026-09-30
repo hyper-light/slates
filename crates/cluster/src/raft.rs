@@ -716,6 +716,12 @@ impl SavedRaft {
   }
 }
 
+/// A campaign refused because this node's term is `u64::MAX` and has no successor (AUD-29-26): starting an
+/// election at the same term again would cast a second self-vote in one term. Reachable only through a
+/// peer's or a publication's maximal term; nothing changed when it is returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TermExhausted;
+
 /// A Raft node's state: its identity, the voters it counts a majority against, the persistent term and
 /// vote (Raft's `currentTerm`/`votedFor`), its role, the votes gathered this election, the replicated
 /// `log` and how far it is committed, and — while leader — the per-follower `next_index`/`match_index`
@@ -784,6 +790,10 @@ pub struct RaftNode {
   /// [`election_view`](Self::election_view)).
   pre_elections: u64,
   elections: u64,
+  /// Campaigns refused because the term had no successor (`u64::MAX`, AUD-29-26), and entries refused because
+  /// the log index had none: tripwires — reachable only through a peer's or a publication's maximal field.
+  terms_exhausted: u64,
+  indices_exhausted: u64,
   pre_vote_tally: PreVoteTally,
   /// The window above the log (`docs/wip/research/consensus-enhancements.md` §4): the leader's entries that
   /// arrived out of order and fast votes, by index. Retained; bounded by [`window_budget`](Self::window_budget)
@@ -894,6 +904,8 @@ impl RaftNode {
       priority_transfers: 0,
       pre_elections: 0,
       elections: 0,
+      terms_exhausted: 0,
+      indices_exhausted: 0,
       pre_vote_tally: PreVoteTally::default(),
       window: BTreeMap::new(),
       synced_term: 0,
@@ -948,7 +960,9 @@ impl RaftNode {
     node.voted_for = saved.voted_for;
     node.snapshot_index = saved.snapshot_index;
     for entry in saved.log {
-      node.push_entry(entry);
+      if !node.push_entry(entry) {
+        return Err(RaftRecoveryError::IndexOverflow);
+      }
     }
     node.commit_index = saved.commit_index;
     node.snapshot_term = saved.snapshot_term;
@@ -1029,31 +1043,58 @@ impl RaftNode {
   /// A node that is **not a voter** of its effective configuration — removed by a committed membership
   /// change, or a learner that never was one — does not campaign at all (Ongaro's thesis §4.2.3: a
   /// removed server that kept campaigning would disrupt the cluster it no longer belongs to).
-  pub fn on_election_timeout(&mut self) -> Vec<PreVote> {
+  pub fn on_election_timeout(&mut self) -> Result<Vec<PreVote>, TermExhausted> {
     if !self.is_voter(self.id) {
-      return Vec::new();
+      return Ok(Vec::new());
     }
+    // A term with no successor cannot campaign: refused before anything changes (AUD-29-26).
+    let Some(next_term) = self.next_term() else {
+      return Err(TermExhausted);
+    };
     self.has_leader = false;
     self.leader_hint = None;
     self.role = Role::PreCandidate;
     self.pre_elections = self.pre_elections.saturating_add(1);
     self.pre_votes = BTreeSet::from([self.id]);
     if self.is_majority(&self.pre_votes) {
-      self.start_election();
-      return Vec::new();
+      self.start_election()?;
+      return Ok(Vec::new());
     }
     let request = PreVote {
-      term: self.current_term.saturating_add(1),
+      term: next_term,
       candidate: self.id,
       last_log_index: self.last_log_index(),
       last_log_term: self.last_log_term(),
     };
-    self
-      .all_voters()
-      .into_iter()
-      .filter(|voter| *voter != self.id)
-      .map(|_| request)
-      .collect()
+    Ok(
+      self
+        .all_voters()
+        .into_iter()
+        .filter(|voter| *voter != self.id)
+        .map(|_| request)
+        .collect(),
+    )
+  }
+
+  /// The term after this node's, or `None` at `u64::MAX` — then this node cannot campaign (AUD-29-26), and
+  /// the refusal is counted.
+  fn next_term(&mut self) -> Option<u64> {
+    let next = self.current_term.checked_add(1);
+    if next.is_none() {
+      self.terms_exhausted = self.terms_exhausted.saturating_add(1);
+    }
+    next
+  }
+
+  /// Campaigns refused because the term had no successor ([`TermExhausted`]).
+  pub fn terms_exhausted(&self) -> u64 {
+    self.terms_exhausted
+  }
+
+  /// Entries refused because the log index had no successor (AUD-29-26's sibling): a leader's proposal
+  /// refused, a follower's append past the index range refused, a publication past it unrestorable.
+  pub fn indices_exhausted(&self) -> u64 {
+    self.indices_exhausted
   }
 
   /// The caller's timer has heard no leader for the minimum election timeout (thesis §4.2.3;
@@ -1106,7 +1147,7 @@ impl RaftNode {
   /// its term now, having confirmed it can win) and returns the [`RequestVote`] to send. Otherwise
   /// `None`.
   pub fn on_pre_vote_reply(&mut self, reply: PreVoteReply) -> Option<Vec<RequestVote>> {
-    if self.role != Role::PreCandidate || reply.term != self.current_term.saturating_add(1) {
+    if self.role != Role::PreCandidate || Some(reply.term) != self.current_term.checked_add(1) {
       return None;
     }
     let tally = if reply.granted {
@@ -1120,7 +1161,7 @@ impl RaftNode {
     }
     self.pre_votes.insert(reply.voter);
     if self.is_majority(&self.pre_votes) {
-      return Some(self.start_election());
+      return self.start_election().ok();
     }
     None
   }
@@ -1129,12 +1170,18 @@ impl RaftNode {
   /// a candidate, vote for self, and return the [`RequestVote`] to send each *other* voter. A single
   /// voter reaches its own majority here and becomes leader with no messages (the `f = 0` degenerate).
   /// Prefer [`on_election_timeout`](RaftNode::on_election_timeout), which runs the pre-vote round first.
-  pub fn start_election(&mut self) -> Vec<RequestVote> {
+  /// Refused, [`TermExhausted`], before anything changes — the term, the vote, any message — when the term
+  /// has no successor: a node at `u64::MAX` that campaigned at the same term again would vote for itself a
+  /// second time in one term (AUD-29-26: two leaders in one term).
+  pub fn start_election(&mut self) -> Result<Vec<RequestVote>, TermExhausted> {
     if !self.is_voter(self.id) {
-      return Vec::new();
+      return Ok(Vec::new());
     }
+    let Some(next_term) = self.next_term() else {
+      return Err(TermExhausted);
+    };
     self.retention_pending = true;
-    self.current_term = self.current_term.saturating_add(1);
+    self.current_term = next_term;
     self.elections = self.elections.saturating_add(1);
     self.read_round = None;
     self.role = Role::Candidate;
@@ -1149,12 +1196,14 @@ impl RaftNode {
       last_log_index: self.last_log_index(),
       last_log_term: self.last_log_term(),
     };
-    self
-      .all_voters()
-      .into_iter()
-      .filter(|voter| *voter != self.id)
-      .map(|_| request)
-      .collect()
+    Ok(
+      self
+        .all_voters()
+        .into_iter()
+        .filter(|voter| *voter != self.id)
+        .map(|_| request)
+        .collect(),
+    )
   }
 
   /// Handles a received [`RequestVote`] (Raft §5.2, §5.4.1). A request under a newer term first steps
@@ -1366,7 +1415,9 @@ impl RaftNode {
             LogEntry::command(self.current_term, Vec::new())
           }
         };
-        self.push_entry(entry);
+        if !self.push_entry(entry) {
+          break;
+        }
       }
     }
     self.reports.clear();
@@ -1847,20 +1898,22 @@ impl RaftNode {
     if self.role != Role::Leader || self.active_transfer().is_some() || self.open_from > 0 {
       return false;
     }
-    self.leader_append(LogEntry::command(self.current_term, command));
-    true
+    self.leader_append(LogEntry::command(self.current_term, command))
   }
 
   /// Appends `entry` to this leader's log, publishes it, and advances the commit index. The first entry a
   /// leader appends after its recovery is its **sync point**: a follower whose log holds it is synced to this
-  /// term ([`AppendEntries::sync_index`]).
-  fn leader_append(&mut self, entry: LogEntry) {
+  /// term ([`AppendEntries::sync_index`]). Refused (`false`, counted) when the log index has no successor.
+  fn leader_append(&mut self, entry: LogEntry) -> bool {
+    if !self.push_entry(entry) {
+      return false;
+    }
     self.retention_pending = true;
-    self.push_entry(entry);
     if self.sync_index == 0 {
       self.sync_index = self.last_log_index();
     }
     self.advance_leader_commit();
+    true
   }
 
   /// Sets the wire bytes this node's window may hold — the caller's append budget
@@ -1941,7 +1994,12 @@ impl RaftNode {
       .unwrap_or(0)
       .max(self.last_log_index())
       .max(self.fast_proposed);
-    let index = self.fast_open_from().max(used.saturating_add(1));
+    // An index with no successor refuses the proposal (counted), never proposes one index twice.
+    let Some(after) = used.checked_add(1) else {
+      self.indices_exhausted = self.indices_exhausted.saturating_add(1);
+      return None;
+    };
+    let index = self.fast_open_from().max(after);
     self.fast_proposed = index;
     Some(FastPropose {
       term: self.current_term,
@@ -2143,7 +2201,9 @@ impl RaftNode {
       else {
         return;
       };
-      self.leader_append(LogEntry::command(self.current_term, command));
+      if !self.leader_append(LogEntry::command(self.current_term, command)) {
+        return;
+      }
       self.window_counters.decided_from_votes =
         self.window_counters.decided_from_votes.saturating_add(1);
     }
@@ -2340,20 +2400,16 @@ impl RaftNode {
       return self.conflict_reply(request.prev_log_index, request.read_context);
     }
 
+    // An append whose entries run past the index range is refused before the log is touched (counted).
+    if self.runs_past_the_index_range(&request) {
+      return self.append_reply(false, self.last_log_index(), request.read_context);
+    }
     // Append, truncating the first conflicting entry and everything after it.
     let mut index = request.prev_log_index;
     for entry in request.entries {
       index = index.saturating_add(1);
-      match self.entry_term(index) {
-        Some(term) if term == entry.term => {} // already present and matching — keep it
-        Some(_) => {
-          self.truncate_from(index);
-          self.push_entry(entry);
-        }
-        None => {
-          self.retention_pending = true;
-          self.push_entry(entry);
-        }
+      if !self.place_entry(index, entry) {
+        break;
       }
     }
 
@@ -2443,7 +2499,9 @@ impl RaftNode {
         return self.last_log_index();
       };
       let entry = slot.entry.clone();
-      self.push_entry(entry);
+      if !self.push_entry(entry) {
+        return self.last_log_index();
+      }
       self.retention_pending = true;
       self.window_counters.absorbed = self.window_counters.absorbed.saturating_add(1);
     }
@@ -2913,7 +2971,8 @@ impl RaftNode {
     {
       return Vec::new();
     }
-    self.start_election()
+    // An invitation at a term with no successor cannot be taken up (counted, `terms_exhausted`).
+    self.start_election().unwrap_or_default()
   }
 
   /// Leadership transfers this node started that were aborted at their deadline (thesis §3.10).
@@ -3003,8 +3062,7 @@ impl RaftNode {
         voters: current.voters,
         joint: Some(new_voters),
       },
-    ));
-    true
+    ))
   }
 
   /// Completes a membership change: leaves the joint configuration, adopting the new voter set as the
@@ -3030,8 +3088,7 @@ impl RaftNode {
         voters: new_voters,
         joint: None,
       },
-    ));
-    true
+    ))
   }
 
   /// Truncates the log from the one-based `index` onward (removing that entry and every later one).
@@ -3043,14 +3100,49 @@ impl RaftNode {
     self.config_entries.split_off(&index);
   }
 
-  /// Appends `entry` to the log, noting its index when it is a configuration entry.
-  fn push_entry(&mut self, entry: LogEntry) {
+  /// Places a leader's `entry` at `index` of a follower's log: kept when already present and matching, the
+  /// log truncated from `index` when it conflicts, appended when absent. `false` when the append was refused
+  /// (`indices_exhausted`).
+  fn place_entry(&mut self, index: u64, entry: LogEntry) -> bool {
+    match self.entry_term(index) {
+      Some(term) if term == entry.term => true,
+      Some(_) => {
+        self.truncate_from(index);
+        self.push_entry(entry)
+      }
+      None => {
+        self.retention_pending = true;
+        self.push_entry(entry)
+      }
+    }
+  }
+
+  /// Whether `request`'s entries would run past the last representable index (counted in
+  /// `indices_exhausted`): such an append is refused whole, before the log is touched.
+  fn runs_past_the_index_range(&mut self, request: &AppendEntries) -> bool {
+    let reaches = u64::try_from(request.entries.len())
+      .ok()
+      .and_then(|count| request.prev_log_index.checked_add(count));
+    if reaches.is_none() {
+      self.indices_exhausted = self.indices_exhausted.saturating_add(1);
+    }
+    reaches.is_none()
+  }
+
+  /// Appends `entry` to the log, noting its index when it is a configuration entry. Refused (`false`,
+  /// counted in `indices_exhausted`) when the last index has no successor: saturating it would give two
+  /// entries one index (AUD-29-26's sibling).
+  #[must_use]
+  fn push_entry(&mut self, entry: LogEntry) -> bool {
+    let Some(index) = self.last_log_index().checked_add(1) else {
+      self.indices_exhausted = self.indices_exhausted.saturating_add(1);
+      return false;
+    };
     if entry.config.is_some() {
-      self
-        .config_entries
-        .insert(self.last_log_index().saturating_add(1));
+      self.config_entries.insert(index);
     }
     self.log.push(entry);
+    true
   }
 
   /// The configuration the log's entry at `index` carries, if it is a configuration entry there.
@@ -3232,7 +3324,7 @@ mod tests {
   /// Drives a candidate to leadership among `voters` by granting it every other voter's vote.
   fn elected_leader(id: HostId, voters: Vec<HostId>) -> RaftNode {
     let mut node = RaftNode::new(id, voters.clone());
-    node.start_election();
+    node.start_election().unwrap();
     for voter in voters {
       if voter != id {
         node.on_vote_reply(VoteReply {
@@ -3322,7 +3414,7 @@ mod tests {
   #[test]
   fn recovery_preserves_the_vote_snapshot_and_membership_with_the_log() {
     let mut node = RaftNode::new(A, vec![A]);
-    node.start_election();
+    node.start_election().unwrap();
     assert!(node.append_command(b"committed before restart".to_vec()));
     assert!(node.compact(1, b"state at index one".to_vec()));
     assert!(node.begin_membership_change(vec![A, B]));
@@ -3361,14 +3453,15 @@ mod tests {
   #[test]
   fn a_member_outside_its_configuration_never_campaigns_and_its_vote_counts_nowhere_else() {
     let mut learner = RaftNode::new(D, vec![A, B, C]);
-    assert!(learner.start_election().is_empty());
-    assert!(learner.on_election_timeout().is_empty());
+    assert!(learner.start_election().unwrap().is_empty());
+    assert!(learner.on_election_timeout().unwrap().is_empty());
     assert_eq!(learner.role(), Role::Follower);
 
     // A candidate of {A, B, C} is granted D's vote, and it does not count: A still needs B or C.
     let mut candidate = RaftNode::new(A, vec![A, B, C]);
     let request = candidate
       .start_election()
+      .unwrap()
       .into_iter()
       .next()
       .expect("A campaigns");
@@ -3386,7 +3479,7 @@ mod tests {
   #[test]
   fn a_single_voter_elects_itself_leader() {
     let mut node = RaftNode::new(A, vec![A]);
-    let requests = node.start_election();
+    let requests = node.start_election().unwrap();
     assert!(requests.is_empty(), "a lone voter sends no requests");
     assert!(node.is_leader(), "and is immediately leader");
     assert_eq!(node.term(), 1);
@@ -3397,7 +3490,7 @@ mod tests {
   #[test]
   fn a_candidate_becomes_leader_at_a_majority() {
     let mut node = RaftNode::new(A, vec![A, B, C]);
-    let requests = node.start_election();
+    let requests = node.start_election().unwrap();
     assert_eq!(requests.len(), 2, "a request to each other voter");
     assert_eq!(node.role(), Role::Candidate);
 
@@ -3415,7 +3508,7 @@ mod tests {
   #[test]
   fn a_split_vote_stays_a_candidate() {
     let mut node = RaftNode::new(A, vec![A, B, C, D, E]);
-    node.start_election();
+    node.start_election().unwrap();
     node.on_vote_reply(VoteReply {
       voter: B,
       term: 1,
@@ -3460,7 +3553,7 @@ mod tests {
   #[test]
   fn a_newer_term_steps_a_candidate_down_and_can_win_its_vote() {
     let mut node = RaftNode::new(A, vec![A, B, C]);
-    node.start_election(); // A is a candidate at term 1
+    node.start_election().unwrap(); // A is a candidate at term 1
     assert_eq!(node.role(), Role::Candidate);
 
     let reply = node.on_request_vote(request_from(B, 2));
@@ -3570,7 +3663,7 @@ mod tests {
   fn a_mismatched_follower_is_repaired_by_backing_up() {
     // A leader for a fresh term over a two-entry log, plus one new current-term entry.
     let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 3, None, log_of(&[3, 3]));
-    leader.start_election(); // term 4
+    leader.start_election().unwrap(); // term 4
     leader.on_vote_reply(VoteReply {
       voter: B,
       term: leader.term(),
@@ -3614,7 +3707,7 @@ mod tests {
   fn an_earlier_term_entry_is_not_committed_by_count_alone() {
     // A leader for term 5 holding one entry left over from term 2 (index 1).
     let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 4, None, log_of(&[2]));
-    leader.start_election(); // term 5
+    leader.start_election().unwrap(); // term 5
     leader.on_vote_reply(VoteReply {
       voter: B,
       term: leader.term(),
@@ -3651,7 +3744,7 @@ mod tests {
   #[test]
   fn a_solo_node_pre_elects_and_leads() {
     let mut node = RaftNode::new(A, vec![A]);
-    let pre_votes = node.on_election_timeout();
+    let pre_votes = node.on_election_timeout().unwrap();
     assert!(pre_votes.is_empty(), "a lone voter sends no pre-votes");
     assert!(node.is_leader(), "and proceeds straight to leadership");
     assert_eq!(node.term(), 1);
@@ -3698,10 +3791,124 @@ mod tests {
 
   /// A pre-vote majority starts the real election: a pre-candidate that gathers a majority of pre-votes
   /// increments its term and issues real vote requests.
+  /// Three voters all at `term`, as a peer's term field or a publication would put them there.
+  fn three_at(term: u64) -> BTreeMap<HostId, RaftNode> {
+    [A, B, C]
+      .into_iter()
+      .map(|id| {
+        let mut node = RaftNode::new(id, vec![A, B, C]);
+        node.observe_term(term);
+        (id, node)
+      })
+      .collect()
+  }
+
+  /// AUD-29-26 (Election Safety): do: three voters at `u64::MAX - 1`; A campaigns and wins at `u64::MAX` with
+  /// B's vote; then B's and C's election timers fire, and B is invited to take over (`TimeoutNow`); expect
+  /// every later campaign refused `TermExhausted` with nothing changed — term, vote, role — and A the only
+  /// leader of the maximal term. Before 2026-09-30 B campaigned at the same saturated term and won it with
+  /// C's vote: two leaders in one term.
+  #[test]
+  fn a_term_with_no_successor_cannot_campaign_and_keeps_one_leader() {
+    let mut nodes = three_at(u64::MAX - 1);
+    let requests = nodes.get_mut(&A).unwrap().start_election().unwrap();
+    assert_eq!(requests.first().map(|request| request.term), Some(u64::MAX));
+    let vote = nodes.get_mut(&B).unwrap().on_request_vote(requests[0]);
+    nodes.get_mut(&A).unwrap().on_vote_reply(vote);
+    assert!(nodes[&A].is_leader(), "A leads the maximal term");
+    // C hears the campaign too, so both followers are at the maximal term.
+    let _ = nodes.get_mut(&C).unwrap().on_request_vote(requests[1]);
+    for id in [B, C] {
+      let node = nodes.get_mut(&id).unwrap();
+      let before = (node.term(), node.voted_for(), node.role());
+      assert_eq!(node.on_election_timeout(), Err(TermExhausted));
+      assert_eq!(node.start_election(), Err(TermExhausted));
+      assert_eq!((node.term(), node.voted_for(), node.role()), before);
+      assert!(node.terms_exhausted() >= 2);
+    }
+    let invitation = TimeoutNow {
+      term: u64::MAX,
+      leader: A,
+    };
+    assert!(
+      nodes
+        .get_mut(&B)
+        .unwrap()
+        .on_timeout_now(invitation)
+        .is_empty()
+    );
+    let leaders = nodes.values().filter(|node| node.is_leader()).count();
+    assert_eq!(leaders, 1, "one leader in the maximal term");
+  }
+
+  /// AUD-29-26 (pre-vote at the boundary): do: a pre-vote reply naming a term past `u64::MAX` cannot exist,
+  /// and a voter at `u64::MAX` asked to pre-vote for `u64::MAX` refuses it by term; expect no grant and no
+  /// state change.
+  #[test]
+  fn a_pre_vote_at_the_maximal_term_is_refused_by_term() {
+    let mut nodes = three_at(u64::MAX);
+    let voter = nodes.get_mut(&B).unwrap();
+    voter.forget_leader();
+    let reply = voter.on_pre_vote(PreVote {
+      term: u64::MAX,
+      candidate: A,
+      last_log_index: 0,
+      last_log_term: 0,
+    });
+    assert!(!reply.granted);
+    assert_eq!(voter.term(), u64::MAX);
+  }
+
+  /// AUD-29-26's sibling (log index exhaustion): do: restore a follower whose snapshot ends at the last
+  /// representable index, then send it an append of one more entry there; expect the append refused whole,
+  /// the log unchanged, and the refusal counted — never a second entry at one index.
+  #[test]
+  fn an_append_past_the_last_index_is_refused_whole() {
+    let mut saved = RaftNode::new(B, vec![A, B, C]).saved();
+    saved.term = 3;
+    saved.snapshot_index = u64::MAX;
+    saved.snapshot_term = 3;
+    saved.commit_index = u64::MAX;
+    let mut follower = RaftNode::restore(saved).unwrap();
+    let reply = follower.on_append_entries(AppendEntries {
+      read_context: 0,
+      term: 3,
+      leader: A,
+      prev_log_index: u64::MAX,
+      prev_log_term: 3,
+      entries: vec![LogEntry::command(3, vec![1])],
+      leader_commit: u64::MAX,
+      priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
+    });
+    assert!(!reply.success);
+    assert_eq!(follower.last_log_index(), u64::MAX);
+    assert_eq!(follower.indices_exhausted(), 1);
+  }
+
+  /// AUD-29-26's sibling: do: a leader whose log ends at the last representable index proposes a command and
+  /// a membership change; expect both refused (`false`), the log unchanged, and each refusal counted.
+  #[test]
+  fn a_leader_at_the_last_index_refuses_new_entries() {
+    let mut saved = RaftNode::new(A, vec![A]).saved();
+    saved.term = 3;
+    saved.snapshot_index = u64::MAX;
+    saved.snapshot_term = 3;
+    saved.commit_index = u64::MAX;
+    let mut leader = RaftNode::restore(saved).unwrap();
+    let _ = leader.start_election().unwrap();
+    assert!(leader.is_leader());
+    assert!(!leader.append_command(vec![7]));
+    assert!(!leader.begin_membership_change(vec![A, B]));
+    assert_eq!(leader.last_log_index(), u64::MAX);
+    assert!(leader.indices_exhausted() >= 2);
+  }
+
   #[test]
   fn pre_votes_from_a_majority_start_a_real_election() {
     let mut node = RaftNode::new(A, vec![A, B, C]);
-    let pre_votes = node.on_election_timeout();
+    let pre_votes = node.on_election_timeout().unwrap();
     assert_eq!(pre_votes.len(), 2, "a pre-vote to each other voter");
     assert_eq!(node.role(), Role::PreCandidate);
     assert_eq!(
@@ -3792,7 +3999,7 @@ mod tests {
     );
 
     // Campaigning forgets the hint, so a candidate never redirects to a stale leader.
-    node.on_election_timeout();
+    node.on_election_timeout().unwrap();
     assert_eq!(node.leader(), None, "a campaigning node forgets its leader");
   }
 
@@ -4054,7 +4261,7 @@ mod tests {
     old.append_command(b"old".to_vec());
     let append = old.replicate_to(B, UNBOUNDED).unwrap();
     old.on_append_reply(successor.on_append_entries(append));
-    let election = successor.start_election();
+    let election = successor.start_election().unwrap();
     successor.on_vote_reply(third.on_request_vote(election[0]));
     assert!(successor.is_leader());
     successor.append_command(b"new".to_vec());
@@ -4156,7 +4363,7 @@ mod tests {
   fn a_leader_without_a_current_term_commit_has_no_read_index() {
     // Elected at a fresh term over an old-term log; recovered resets the commit index to zero.
     let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 3, None, log_of(&[3]));
-    leader.start_election(); // term 4
+    leader.start_election().unwrap(); // term 4
     leader.on_vote_reply(VoteReply {
       voter: B,
       term: leader.term(),
@@ -4231,6 +4438,7 @@ mod tests {
     a.forget_leader();
     let pre_vote = a
       .on_election_timeout()
+      .unwrap()
       .into_iter()
       .next()
       .expect("A campaigns: it is a voter in its configuration");
@@ -4370,7 +4578,7 @@ mod tests {
     // a voter, and never campaigns again.
     leader.on_append_reply(reply(B, 2));
     leader.on_append_reply(reply(C, 2));
-    let campaign = leader.on_election_timeout();
+    let campaign = leader.on_election_timeout().unwrap();
     assert_eq!(
       (
         leader.commit_index(),
@@ -4537,7 +4745,7 @@ mod tests {
   fn replication_works_across_a_snapshot_boundary() {
     // A three-node leader with a committed three-entry log (recovered so the log exists), elected fresh.
     let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
-    leader.start_election(); // term 3
+    leader.start_election().unwrap(); // term 3
     leader.on_vote_reply(VoteReply {
       voter: B,
       term: leader.term(),
@@ -4584,7 +4792,7 @@ mod tests {
   fn a_follower_below_the_snapshot_is_caught_up_by_install_snapshot() {
     // A term-3 leader with a four-entry committed log, compacted up to index 3 with some snapshot state.
     let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 2, None, log_of(&[1, 1, 2]));
-    leader.start_election(); // term 3
+    leader.start_election().unwrap(); // term 3
     leader.on_vote_reply(VoteReply {
       voter: B,
       term: leader.term(),
@@ -4744,7 +4952,7 @@ mod tests {
   #[test]
   fn an_empty_follower_is_found_in_one_refusal() {
     let mut leader = node_with_uncommitted_log(A, vec![A, B, C], 1, None, log_of(&[1; 20]));
-    leader.start_election();
+    leader.start_election().unwrap();
     leader.on_vote_reply(VoteReply {
       voter: C,
       term: leader.term(),
@@ -4769,7 +4977,7 @@ mod tests {
       None,
       log_of(&[1, 1, 3, 3, 3, 3, 3, 3, 3, 3]),
     );
-    leader.start_election();
+    leader.start_election().unwrap();
     leader.on_vote_reply(VoteReply {
       voter: C,
       term: leader.term(),
@@ -5381,7 +5589,12 @@ mod tests {
     for node in nodes.iter_mut() {
       node.on_fast_propose(proposal.clone()).unwrap();
     }
-    let request = nodes[1].start_election().into_iter().next().unwrap();
+    let request = nodes[1]
+      .start_election()
+      .unwrap()
+      .into_iter()
+      .next()
+      .unwrap();
     let reply = nodes[2].on_request_vote(request);
     assert!(reply.granted);
     assert_eq!(reply.reports.len(), 1, "C reports its vote at index 2");
@@ -5408,7 +5621,7 @@ mod tests {
     for at in voted {
       nodes[*at].on_fast_propose(proposal.clone()).unwrap();
     }
-    let requests = nodes[2].start_election();
+    let requests = nodes[2].start_election().unwrap();
     for (at, request) in [(3, requests[2]), (4, requests[3])] {
       let reply = nodes[at].on_request_vote(request);
       nodes[2].on_vote_reply(reply);
@@ -5442,7 +5655,7 @@ mod tests {
     let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
     nodes[2].on_fast_propose(proposal).unwrap();
     assert_eq!(nodes[2].window().len(), 1);
-    let requests = nodes[1].start_election();
+    let requests = nodes[1].start_election().unwrap();
     let reply = nodes[0].on_request_vote(requests[0]);
     nodes[1].on_vote_reply(reply);
     assert!(nodes[1].is_leader());
@@ -5695,7 +5908,7 @@ mod tests {
   fn an_opening_counts_in_its_own_term_only() {
     let mut nodes = fast_group(&[A, B, C]);
     assert!(nodes[1].fast_track_open(), "B heard term 1's opening");
-    let requests = nodes[1].start_election();
+    let requests = nodes[1].start_election().unwrap();
     let reply = nodes[2].on_request_vote(requests[1]);
     nodes[1].on_vote_reply(reply);
     assert!(nodes[1].is_leader());
@@ -5703,7 +5916,7 @@ mod tests {
       !nodes[1].fast_track_open(),
       "B leads term 2 and opened nothing"
     );
-    nodes[1].on_election_timeout();
+    nodes[1].on_election_timeout().unwrap();
     assert!(!nodes[1].is_leader());
     assert!(
       !nodes[1].fast_track_open(),
@@ -5734,7 +5947,7 @@ mod tests {
       "A fast-committed both; its commit index stays classic"
     );
     let [mut a, mut b, mut c]: [RaftNode; 3] = nodes.try_into().ok().unwrap();
-    let requests = b.start_election();
+    let requests = b.start_election().unwrap();
     b.on_vote_reply(c.on_request_vote(requests[1]));
     assert!(b.is_leader());
     assert!(b.append_command(Vec::new()), "B's sync point");
@@ -5780,7 +5993,7 @@ mod tests {
     for at in [1, 2] {
       nodes[at].on_fast_propose(proposal.clone()).unwrap();
     }
-    let requests = nodes[1].start_election();
+    let requests = nodes[1].start_election().unwrap();
     let reply = nodes[2].on_request_vote(requests[1]);
     nodes[1].on_vote_reply(reply);
     assert!(nodes[1].is_leader());
@@ -5922,7 +6135,7 @@ mod tests {
       }
     }
     assert_eq!(nodes[1].window().len(), 1, "B voted at index 2 only");
-    let requests = nodes[1].start_election();
+    let requests = nodes[1].start_election().unwrap();
     for (at, request) in [(2, requests[1]), (3, requests[2])] {
       let reply = nodes[at].on_request_vote(request);
       nodes[1].on_vote_reply(reply);
@@ -5952,7 +6165,7 @@ mod tests {
       "the hole at index 2"
     );
     assert_eq!(nodes[2].window_counters().buffered, 1);
-    let requests = nodes[1].start_election();
+    let requests = nodes[1].start_election().unwrap();
     let reply = nodes[2].on_request_vote(requests[1]);
     nodes[1].on_vote_reply(reply);
     assert!(nodes[1].is_leader());
@@ -6040,7 +6253,7 @@ mod tests {
     let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
     nodes[1].on_fast_propose(proposal).unwrap();
     nodes[1].set_window_budget(0);
-    let requests = nodes[1].start_election();
+    let requests = nodes[1].start_election().unwrap();
     let reply = nodes[2].on_request_vote(requests[1]);
     nodes[1].on_vote_reply(reply);
     assert!(nodes[1].is_leader());

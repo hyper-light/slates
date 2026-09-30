@@ -570,7 +570,8 @@ mod tests {
       .unwrap()
       .log_mut(log)
       .unwrap()
-      .start_election();
+      .start_election()
+      .unwrap();
     let voters: Vec<HostId> = group.keys().copied().filter(|id| *id != leader).collect();
     for (voter, request) in voters.into_iter().zip(requests) {
       let reply = group

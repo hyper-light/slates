@@ -348,7 +348,12 @@ impl Sim {
       }
       FollowerStep::Campaign => {}
     }
-    let pre_votes = node.multi.log_mut(log).unwrap().on_election_timeout();
+    let pre_votes = node
+      .multi
+      .log_mut(log)
+      .unwrap()
+      .on_election_timeout()
+      .unwrap();
     node.timers[log].rebaseline(contact);
     self.finish_election(id, log, false);
     for (to, pre_vote) in self.others(id).into_iter().zip(pre_votes) {

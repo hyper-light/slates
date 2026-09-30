@@ -363,7 +363,7 @@ impl Cluster {
     let id = self.nodes[at].id();
     self.note(|| format!("time out {id:?}"));
     let was_leader = self.nodes[at].is_leader();
-    let pre_votes = self.nodes[at].on_election_timeout();
+    let pre_votes = self.nodes[at].on_election_timeout().unwrap();
     self.finish_election(at, was_leader);
     self.retain(at);
     let from = self.nodes[at].id();
