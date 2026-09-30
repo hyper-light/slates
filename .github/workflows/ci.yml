@@ -504,6 +504,8 @@ jobs:
       # expected-failure list's own header names this lane's root run as the review input, and the
       # summary record cannot say which assertion failed with what. The output directory is uploaded
       # below; the rest of the scratch (a cargo target, fsstress's tree) stays on the runner.
+      # The cache restores the last run's `target/`, scratch included: every suite's own directory is
+      # emptied before it runs (`Scratch::fresh`), and only the tool builds are reused.
       - name: Plan, then run every suite this runner can (each verdict gates the step; records kept)
         run: cargo xtask conformance all --records target/conformance-records --scratch target/conformance-scratch --keep
       - name: Upload the records

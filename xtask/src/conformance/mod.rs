@@ -424,9 +424,32 @@ impl Scratch {
     &self.path
   }
 
-  /// A fresh subdirectory of the scratch.
-  pub(crate) fn subdir(&self, name: &str) -> Result<PathBuf, Failure> {
+  /// A subdirectory the suites share and a rerun reuses: the tool builds (`tools`), keyed by their
+  /// pinned sources, so a kept scratch saves the build and never changes a verdict.
+  pub(crate) fn shared(&self, name: &str) -> Result<PathBuf, Failure> {
     let path = self.path.join(name);
+    create_dir(&path)?;
+    Ok(path)
+  }
+
+  /// An empty subdirectory for one suite's run: a host reference tree, a landing target, a suite's
+  /// outputs. A `--scratch` directory outlives its run (CI's cache restored the last run's, and a
+  /// developer reruns over a kept one), so a leftover tree is removed first, and a removal that fails is
+  /// a refusal, because a verdict judged over the last run's files is false (2026-09-30: git found the
+  /// last run's repository and exited 1; rsync's destination held the last run's copy).
+  pub(crate) fn fresh(&self, name: &str) -> Result<PathBuf, Failure> {
+    let path = self.path.join(name);
+    #[allow(clippy::disallowed_methods)]
+    match std::fs::remove_dir_all(&path) {
+      Ok(()) => {}
+      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+      Err(error) => {
+        return Err(Failure(format!(
+          "emptying the kept scratch {}: {error}",
+          path.display()
+        )));
+      }
+    }
     create_dir(&path)?;
     Ok(path)
   }

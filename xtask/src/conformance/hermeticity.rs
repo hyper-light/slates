@@ -671,7 +671,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .iter()
     .map(|entry| entry.path.clone())
     .collect::<Vec<_>>();
-  let target = run.scratch.subdir("land-target")?;
+  let target = run.scratch.fresh("land-target")?;
   let target = std::fs::canonicalize(&target)?;
   let written = land_under_grant(run, &session, &target)?;
   let verified = verify_landing(&target, &work)

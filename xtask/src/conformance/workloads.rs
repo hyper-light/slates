@@ -142,7 +142,7 @@ fn execute(
 
 /// The workload suite over the mount.
 pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
-  let host_root = run.scratch.subdir("workloads-host")?;
+  let host_root = run.scratch.fresh("workloads-host")?;
   let fold = folds_names(&host_root);
   let session = Session::open(run, "workloads", super::VOLUME_SIZE, fold, None)?;
   let mount_root = session.workdir("workloads")?;
@@ -213,6 +213,36 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AC-3.2 / T-3.3: do the host reference run of the real git workload twice over one kept scratch (what
+  /// CI does when its cache restores the previous run's `--scratch` tree); expect the second run to be the
+  /// first run again — exit 0, and identical by the suite's own comparison. On 2026-09-30 the second run found the first's
+  /// repository, exited 1, and the git and rsync workloads differed from the mount on both hosts.
+  #[test]
+  fn a_host_reference_run_over_a_kept_scratch_starts_from_an_empty_tree() {
+    if !tool_on_path("git") {
+      eprintln!("skipping the kept-scratch rerun: git is absent");
+      return;
+    }
+    let path =
+      crate::conformance::build_output(&format!("slates-rerun-{}", std::process::id())).unwrap();
+    let scratch = super::super::Scratch { path, keep: false };
+    let workload = ROSTER
+      .iter()
+      .find(|workload| workload.name == "git")
+      .unwrap();
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+      let host_root = scratch.fresh("workloads-host").unwrap();
+      runs.push(execute(workload, &host_root.join(workload.name), scratch.path()).unwrap());
+    }
+    let (first, second) = (&runs[0], &runs[1]);
+    assert_eq!(first.exit_code, 0, "first run: {}", first.output);
+    assert_eq!(second.exit_code, 0, "rerun: {}", second.output);
+    // Judged as the suite judges host against mount (the git index records stat times, so the reviewed
+    // policy leaves it out).
+    assert_eq!(compare(workload, first, second), WorkloadStatus::Identical);
+  }
 
   /// AC-3.2 / T-3.3: run the real editor save workload in ordinary and TMPDIR-matching paths.
   /// Both must retain the original bytes in the backup and write the edited bytes to the new file.

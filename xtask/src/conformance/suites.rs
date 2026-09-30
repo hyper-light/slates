@@ -73,11 +73,11 @@ fn outcome_for(
 
 /// fsx over the mount.
 pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
-  let tools = run.scratch.subdir("tools")?;
+  let tools = run.scratch.shared("tools")?;
   let built = fetch::build_fsx(&tools)?;
   let session = Session::open(run, "fsx", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("fsx")?;
-  let logs = run.scratch.subdir("fsx-logs")?;
+  let logs = run.scratch.fresh("fsx-logs")?;
   let bounds = run.bounds();
   let args: Vec<String> = vec![
     "-N".to_owned(),
@@ -133,7 +133,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 
 /// fsstress over the mount.
 pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
-  let tools = run.scratch.subdir("tools")?.join("ltp");
+  let tools = run.scratch.shared("tools")?.join("ltp");
   let built = fetch::build_fsstress(&tools, run.os)?;
   let session = Session::open(run, "fsstress", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("fsstress")?;
@@ -484,7 +484,7 @@ fn pjdfstest_runner(root_available: bool, current: Runner) -> (bool, Runner) {
 
 /// pjdfstest over the mount, file by file, judged against the reviewed list.
 pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
-  let tools = run.scratch.subdir("tools")?;
+  let tools = run.scratch.shared("tools")?;
   let tree = fetch::build_pjdfstest(&tools)?;
   let session = Session::open(run, "pjdfstest", super::VOLUME_SIZE, false, None)?;
   let work = session.workdir("pjd")?;
@@ -492,7 +492,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let files = test_files(&tree.root)?;
   // Every file's raw TAP output is kept in the scratch (`--keep`), so a failure can be reviewed by
   // its own message before it is listed as expected.
-  let outputs = run.scratch.subdir("pjdfstest-output")?;
+  let outputs = run.scratch.fresh("pjdfstest-output")?;
   let mut parsed = Vec::with_capacity(files.len());
   let mut timed_out = Vec::new();
   for file in &files {
