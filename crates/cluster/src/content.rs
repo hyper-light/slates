@@ -1403,46 +1403,57 @@ mod tests {
   }
 }
 
-/// The content hold's manifest-to-chunk ownership oracle (AUD-29-44; AC-7.3, AC-8.12): generated histories
-/// of puts — any object, any manifest, any subset of a chunk pool shipped (referenced chunks, unreferenced
-/// ones, or none), retries included — and forgets, run against a serial model that knows only which object
-/// holds which manifests. After every step the hold must agree: every manifest the model holds is held and
-/// reconstructible to exactly its referenced chunks, nothing the model does not hold is, the store keeps
-/// exactly the chunks some held manifest references (no orphan, no premature eviction), and a refused put
-/// changes nothing.
+/// The content hold's manifest-to-chunk ownership oracle (AUD-29-44; AC-7.3, AC-8.12). Each generated case
+/// is a **shape** — a set of distinct manifests, each referencing a non-empty subset of a chunk pool — and a
+/// **history** over it: puts (any object, any manifest, any subset of the pool shipped: the referenced
+/// chunks, unreferenced ones, or none; retries included) and forgets. The history runs against the hold and
+/// against a serial model that knows only which object holds which manifests. After every step the two must
+/// agree: every manifest the model holds is held and reconstructible to exactly its referenced chunks,
+/// nothing the model does not hold is, the store keeps exactly the chunks some held manifest references (no
+/// orphan, no premature eviction), and a refused put changes nothing.
+///
+/// Nothing about the shape is hand-picked: the manifests' overlaps are generated. The generator's bounds are
+/// the smallest at which every case the ownership rule distinguishes can occur (each bound's `Derived:` line
+/// names the case that needs it), and a **case census** counts each case as the run meets it; the run fails
+/// if any case was never met, so a generator that silently stopped reaching a case cannot pass as an oracle.
+/// The run is deterministic (a fixed-seed runner), so the census is a stable fact, not a probability.
 #[cfg(test)]
 mod ownership_oracle {
+  use std::cell::RefCell;
   use std::collections::{BTreeMap, BTreeSet};
 
   use proptest::prelude::*;
+  use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+  use slates_archive::format::{MAX_BASE_PAGE_BYTES, MAX_CHUNK_BYTES};
   use slates_archive::{Entry, Extent, NodeMeta};
 
   use super::*;
 
-  /// Shape: the chunk pool the manifests draw from.
-  const POOL: usize = 5;
-  /// Shape: each manifest's referenced chunks — overlapping, so manifests share chunks within an object
-  /// and across objects.
-  const MANIFESTS: [&[usize]; 4] = [&[0, 1], &[1, 2], &[2, 3, 4], &[0, 4]];
-  /// Shape: the objects the history places content for.
-  const OBJECTS: u64 = 2;
+  /// Derived: two objects is the smallest count at which one chunk can be held for two objects at once and a
+  /// put can be refused although the chunk it lacks is held — for another object (cross-object isolation).
+  const OBJECTS: usize = 2;
+  /// Derived: two manifests is the smallest count at which manifests share a chunk, so a put can complete
+  /// from a chunk another held manifest owns and a forget can keep a chunk another manifest still references.
+  const MANIFESTS: usize = 2;
+  /// Derived: two shared-or-private roles per manifest pair need three chunks (one shared, one private to
+  /// each of the two manifests), and a put shipping a chunk no manifest references needs a fourth.
+  const POOL: usize = 3 + 1;
+  /// Derived: filling every (object, manifest) slot and emptying it again, so every model state is reachable
+  /// from the empty one within one history.
+  const HISTORY: usize = 2 * OBJECTS * MANIFESTS;
 
-  fn pool() -> Vec<Chunk> {
-    (0..POOL)
-      .map(|at| {
-        let seed = u8::try_from(at).unwrap();
-        Archive::raw_chunk(vec![seed; 8 + at])
-      })
-      .collect()
+  /// The chunk at pool index `at`: its bytes are the index, so every pool chunk has its own identity.
+  fn chunk(at: usize) -> Chunk {
+    Archive::raw_chunk(at.to_le_bytes().to_vec())
   }
 
-  /// Manifest `index` with `shipped` of the pool attached (by pool index).
-  fn archive(index: usize, shipped: &BTreeSet<usize>) -> Archive {
-    let pool = pool();
-    let entries = MANIFESTS[index]
+  /// The manifest referencing `referenced`, with `shipped` of the pool attached (by pool index). The header
+  /// is the format's own bounds and zero ids: ownership reads only the manifest and the chunks.
+  fn archive(referenced: &BTreeSet<usize>, shipped: &BTreeSet<usize>) -> Archive {
+    let entries = referenced
       .iter()
       .map(|&at| {
-        let chunk = &pool[at];
+        let chunk = chunk(at);
         Entry {
           name: format!("c{at}"),
           meta: NodeMeta {
@@ -1459,124 +1470,299 @@ mod ownership_oracle {
       })
       .collect();
     Archive {
-      base_page_size: 4096,
-      chunk_min: 4096,
-      chunk_max: 4096,
-      created_unix: 1,
-      volume_id: 5,
-      snapshot_id: 6,
+      base_page_size: u32::try_from(MAX_BASE_PAGE_BYTES).unwrap(),
+      chunk_min: u32::try_from(MAX_CHUNK_BYTES).unwrap(),
+      chunk_max: u32::try_from(MAX_CHUNK_BYTES).unwrap(),
+      created_unix: 0,
+      volume_id: 0,
+      snapshot_id: 0,
       name_policy_id: 0,
       unicode_version: 0,
       root_meta: NodeMeta::default(),
       manifest: Node::Directory(entries),
-      chunks: shipped.iter().map(|&at| pool[at].clone()).collect(),
+      chunks: shipped.iter().map(|&at| chunk(at)).collect(),
     }
   }
 
-  fn identity(index: usize) -> [u8; 32] {
-    archive(index, &BTreeSet::new()).manifest_identity()
+  fn identity(referenced: &BTreeSet<usize>) -> [u8; 32] {
+    archive(referenced, &BTreeSet::new()).manifest_identity()
   }
 
-  fn object(at: u64) -> ObjectId {
-    ObjectId::new(HostId(1), at)
+  fn object(at: usize) -> ObjectId {
+    ObjectId::new(HostId(1), u64::try_from(at).unwrap())
   }
 
   #[derive(Clone, Debug)]
   enum Step {
     Put {
-      object: u64,
+      object: usize,
       manifest: usize,
       shipped: BTreeSet<usize>,
     },
     Forget {
-      object: u64,
+      object: usize,
       manifest: usize,
     },
   }
 
+  /// A step, generated as a plain tuple so the strategy needs no `Arc`-backed `prop_oneof!` (R2).
   fn step() -> impl Strategy<Value = Step> {
-    prop_oneof![
-      3 => (0..OBJECTS, 0..MANIFESTS.len(), proptest::collection::btree_set(0..POOL, 0..=POOL))
-        .prop_map(|(object, manifest, shipped)| Step::Put { object, manifest, shipped }),
-      1 => (0..OBJECTS, 0..MANIFESTS.len())
-        .prop_map(|(object, manifest)| Step::Forget { object, manifest }),
-    ]
+    (
+      any::<bool>(),
+      0..OBJECTS,
+      0..MANIFESTS,
+      proptest::collection::btree_set(0..POOL, 0..=POOL),
+    )
+      .prop_map(|(put, object, manifest, shipped)| {
+        if put {
+          Step::Put {
+            object,
+            manifest,
+            shipped,
+          }
+        } else {
+          Step::Forget { object, manifest }
+        }
+      })
   }
 
-  /// Applies `step` to the model: whether a put succeeds is decided by the rule — every referenced chunk
-  /// shipped now or referenced by a manifest the object already holds; a held manifest's retry succeeds.
-  fn model_apply(model: &mut BTreeMap<u64, BTreeSet<usize>>, step: &Step) -> bool {
+  /// A shape: distinct manifests (equal chunk sets are one manifest, one identity), each non-empty.
+  fn shape() -> impl Strategy<Value = Vec<BTreeSet<usize>>> {
+    proptest::collection::btree_set(
+      proptest::collection::btree_set(0..POOL, 1..=POOL),
+      1..=MANIFESTS,
+    )
+    .prop_map(|manifests| manifests.into_iter().collect())
+  }
+
+  /// Every case the ownership rule distinguishes; the census counts each as a history meets it.
+  #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+  enum Case {
+    /// A put completed with every referenced chunk shipped.
+    PutWholeShipped,
+    /// A put completed with a referenced chunk not shipped but held by another of the object's manifests.
+    PutCompletedFromHeld,
+    /// A put refused: a referenced chunk neither shipped nor held for the object.
+    PutRefused,
+    /// A put refused although the missing chunk is held — for another object.
+    PutRefusedHeldElsewhere,
+    /// A put of a manifest the object already holds.
+    Retry,
+    /// A completed put that shipped a chunk the manifest does not reference.
+    ShippedUnreferenced,
+    /// One chunk held for two objects at once.
+    SharedAcrossObjects,
+    /// A forget that kept a chunk another of the object's manifests still references.
+    ForgetKept,
+    /// A forget that released a chunk nothing references any more.
+    ForgetReleased,
+    /// A forget of a manifest the object does not hold.
+    ForgetNotHeld,
+  }
+
+  /// Every case, for the census's completeness check.
+  const CASES: [Case; 10] = [
+    Case::PutWholeShipped,
+    Case::PutCompletedFromHeld,
+    Case::PutRefused,
+    Case::PutRefusedHeldElsewhere,
+    Case::Retry,
+    Case::ShippedUnreferenced,
+    Case::SharedAcrossObjects,
+    Case::ForgetKept,
+    Case::ForgetReleased,
+    Case::ForgetNotHeld,
+  ];
+
+  /// The model: for each object, the indices of the manifests it holds.
+  type Model = BTreeMap<usize, BTreeSet<usize>>;
+
+  /// The chunks `object`'s held manifests reference.
+  fn chunks_of(model: &Model, manifests: &[BTreeSet<usize>], object: usize) -> BTreeSet<usize> {
+    model
+      .get(&object)
+      .into_iter()
+      .flatten()
+      .filter_map(|&index| manifests.get(index))
+      .flatten()
+      .copied()
+      .collect()
+  }
+
+  /// Applies `step` to the model by the rule — a put completes when every referenced chunk is shipped now or
+  /// referenced by a manifest the object already holds; a held manifest's retry completes — and records the
+  /// cases it meets. Returns whether the step succeeded, or `None` for a step naming no manifest of the shape.
+  fn model_apply(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    step: &Step,
+    census: &mut BTreeSet<Case>,
+  ) -> Option<bool> {
     match step {
       Step::Put {
         object,
         manifest,
         shipped,
       } => {
-        let held = model.entry(*object).or_default();
-        if held.contains(manifest) {
-          return true;
+        let referenced = manifests.get(*manifest)?;
+        if model
+          .get(object)
+          .is_some_and(|held| held.contains(manifest))
+        {
+          census.insert(Case::Retry);
+          return Some(true);
         }
-        let have: BTreeSet<usize> = held
+        let have = chunks_of(model, manifests, *object);
+        let missing: BTreeSet<usize> = referenced
           .iter()
-          .flat_map(|m| MANIFESTS[*m].iter().copied())
+          .filter(|chunk| !shipped.contains(chunk) && !have.contains(chunk))
+          .copied()
           .collect();
-        let whole = MANIFESTS[*manifest]
-          .iter()
-          .all(|chunk| shipped.contains(chunk) || have.contains(chunk));
-        if whole {
-          held.insert(*manifest);
+        if !missing.is_empty() {
+          census.insert(Case::PutRefused);
+          let elsewhere = (0..OBJECTS)
+            .filter(|other| other != object)
+            .any(|other| !missing.is_disjoint(&chunks_of(model, manifests, other)));
+          if elsewhere {
+            census.insert(Case::PutRefusedHeldElsewhere);
+          }
+          return Some(false);
         }
-        whole
+        census.insert(if referenced.is_subset(shipped) {
+          Case::PutWholeShipped
+        } else {
+          Case::PutCompletedFromHeld
+        });
+        if !shipped.is_subset(referenced) {
+          census.insert(Case::ShippedUnreferenced);
+        }
+        model.entry(*object).or_default().insert(*manifest);
+        Some(true)
       }
-      Step::Forget { object, manifest } => model.entry(*object).or_default().remove(manifest),
+      Step::Forget { object, manifest } => {
+        let referenced = manifests.get(*manifest)?;
+        let removed = model
+          .get_mut(object)
+          .is_some_and(|held| held.remove(manifest));
+        if !removed {
+          census.insert(Case::ForgetNotHeld);
+          return Some(false);
+        }
+        let still = chunks_of(model, manifests, *object);
+        if !referenced.is_disjoint(&still) {
+          census.insert(Case::ForgetKept);
+        }
+        if !referenced.is_subset(&still) {
+          census.insert(Case::ForgetReleased);
+        }
+        Some(true)
+      }
     }
   }
 
-  fn check(hold: &ContentHold, model: &BTreeMap<u64, BTreeSet<usize>>) {
-    let pool = pool();
+  /// Compares the hold with the model; `Err` names the first disagreement.
+  fn check(hold: &ContentHold, model: &Model, manifests: &[BTreeSet<usize>]) -> Result<(), String> {
     let mut referenced = BTreeSet::new();
     for at in 0..OBJECTS {
-      let held = model.get(&at).cloned().unwrap_or_default();
-      for index in 0..MANIFESTS.len() {
-        let id = identity(index);
-        if held.contains(&index) {
-          let archive = hold
-            .archive_of(object(at), &id)
-            .expect("a held manifest is reconstructible");
-          let chunks: BTreeSet<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
-          let expected: BTreeSet<[u8; 32]> =
-            MANIFESTS[index].iter().map(|&c| pool[c].identity).collect();
-          assert_eq!(chunks, expected, "object {at} manifest {index}");
-          referenced.extend(MANIFESTS[index].iter().copied());
-        } else {
-          assert!(
-            !hold.holds_manifest(object(at), &id),
-            "object {at} manifest {index}"
-          );
+      for (index, chunks) in manifests.iter().enumerate() {
+        let id = identity(chunks);
+        let held = model.get(&at).is_some_and(|held| held.contains(&index));
+        if !held {
+          if hold.holds_manifest(object(at), &id) {
+            return Err(format!(
+              "object {at} holds manifest {index} the model does not"
+            ));
+          }
+          continue;
         }
+        let archive = hold
+          .archive_of(object(at), &id)
+          .ok_or_else(|| format!("object {at} manifest {index} is not reconstructible"))?;
+        let got: BTreeSet<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
+        let expected: BTreeSet<[u8; 32]> = chunks.iter().map(|&c| chunk(c).identity).collect();
+        if got != expected {
+          return Err(format!(
+            "object {at} manifest {index} reconstructed other chunks"
+          ));
+        }
+        referenced.extend(chunks.iter().copied());
       }
     }
-    let manifests: usize = model.values().map(BTreeSet::len).sum();
-    assert_eq!(hold.manifest_count(), manifests);
-    assert_eq!(
-      hold.chunk_count(),
-      referenced.len(),
-      "the store keeps exactly the chunks a held manifest references"
-    );
+    let manifest_count: usize = model.values().map(BTreeSet::len).sum();
+    if hold.manifest_count() != manifest_count {
+      return Err(format!(
+        "{} manifests held, the model holds {manifest_count}",
+        hold.manifest_count()
+      ));
+    }
+    if hold.chunk_count() != referenced.len() {
+      return Err(format!(
+        "{} chunks stored, held manifests reference {}",
+        hold.chunk_count(),
+        referenced.len()
+      ));
+    }
+    Ok(())
   }
 
-  /// AUD-29-44's three witnesses, as the audit ran them: do: (1) put one manifest twice and forget it once,
-  /// (2) hold manifest 0, hold manifest 1 — which shares chunk 1 — without shipping chunk 1, then forget 0,
-  /// (3) ship an unreferenced chunk with a manifest and forget the manifest; expect (1) no chunk retained, (2)
-  /// manifest 1 still reconstructible with chunk 1 kept, (3) no chunk orphaned.
+  /// Runs one shape and history on a fresh hold against the model, recording the cases met.
+  fn run(
+    manifests: &[BTreeSet<usize>],
+    steps: &[Step],
+    census: &mut BTreeSet<Case>,
+  ) -> Result<(), String> {
+    let mut hold = ContentHold::new();
+    let mut model = Model::new();
+    for step in steps {
+      let Some(expected) = model_apply(&mut model, manifests, step, census) else {
+        continue;
+      };
+      let got = match step {
+        Step::Put {
+          object: at,
+          manifest,
+          shipped,
+        } => manifests
+          .get(*manifest)
+          .is_some_and(|chunks| hold.hold(object(*at), archive(chunks, shipped)).is_ok()),
+        Step::Forget {
+          object: at,
+          manifest,
+        } => manifests
+          .get(*manifest)
+          .is_some_and(|chunks| hold.forget_manifest(object(*at), &identity(chunks))),
+      };
+      if got != expected {
+        return Err(format!(
+          "{step:?}: the hold answered {got}, the model {expected}"
+        ));
+      }
+      check(&hold, &model, manifests)
+        .map_err(|disagreement| format!("after {step:?}: {disagreement}"))?;
+      let shared = chunks_of(&model, manifests, 0);
+      if (1..OBJECTS).any(|other| !shared.is_disjoint(&chunks_of(&model, manifests, other))) {
+        census.insert(Case::SharedAcrossObjects);
+      }
+    }
+    Ok(())
+  }
+
+  /// AUD-29-44's three witnesses, as the audit ran them, over two manifests that share one chunk: do: (1)
+  /// put one manifest twice and forget it once, (2) hold the first, hold the second without shipping the
+  /// shared chunk, then forget the first, (3) ship an unreferenced chunk with a manifest and forget the
+  /// manifest; expect (1) no chunk retained, (2) the second still reconstructible with the shared chunk kept,
+  /// (3) no chunk orphaned.
   #[test]
   fn the_audits_three_ownership_witnesses_hold() {
+    let (shared, only_first, only_second, unreferenced) = (0, 1, 2, 3);
+    let first = BTreeSet::from([shared, only_first]);
+    let second = BTreeSet::from([shared, only_second]);
     let a = object(0);
+
     let mut hold = ContentHold::new();
-    let all: BTreeSet<usize> = MANIFESTS[0].iter().copied().collect();
-    hold.hold(a, archive(0, &all)).unwrap();
-    hold.hold(a, archive(0, &all)).unwrap();
-    hold.forget_manifest(a, &identity(0));
+    hold.hold(a, archive(&first, &first)).unwrap();
+    hold.hold(a, archive(&first, &first)).unwrap();
+    hold.forget_manifest(a, &identity(&first));
     assert_eq!(
       (hold.manifest_count(), hold.chunk_count()),
       (0, 0),
@@ -1584,49 +1770,50 @@ mod ownership_oracle {
     );
 
     let mut hold = ContentHold::new();
-    hold.hold(a, archive(0, &all)).unwrap();
+    hold.hold(a, archive(&first, &first)).unwrap();
     hold
-      .hold(a, archive(1, &BTreeSet::from([2])))
-      .expect("chunk 1 is already held for the object");
-    hold.forget_manifest(a, &identity(0));
+      .hold(a, archive(&second, &BTreeSet::from([only_second])))
+      .expect("the shared chunk is already held for the object");
+    hold.forget_manifest(a, &identity(&first));
     let kept = hold
-      .archive_of(a, &identity(1))
-      .expect("(2) manifest 1 is still whole");
-    assert_eq!(kept.chunks.len(), 2);
+      .archive_of(a, &identity(&second))
+      .expect("(2) the second manifest is still whole");
+    assert_eq!(kept.chunks.len(), second.len());
 
     let mut hold = ContentHold::new();
-    let with_extra: BTreeSet<usize> = MANIFESTS[0].iter().copied().chain([3]).collect();
-    hold.hold(a, archive(0, &with_extra)).unwrap();
+    let with_extra: BTreeSet<usize> = first.iter().copied().chain([unreferenced]).collect();
+    hold.hold(a, archive(&first, &with_extra)).unwrap();
     assert_eq!(
       hold.chunk_count(),
-      2,
+      first.len(),
       "the unreferenced chunk was never kept"
     );
-    hold.forget_manifest(a, &identity(0));
+    hold.forget_manifest(a, &identity(&first));
     assert_eq!(hold.chunk_count(), 0, "(3) nothing orphaned");
   }
 
-  proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
-    /// AUD-29-44: do: run a generated history of puts and forgets on a hold and on the serial model; expect
-    /// them to agree after every step (see the module doc).
-    #[test]
-    fn the_hold_owns_exactly_what_its_manifests_reference(steps in proptest::collection::vec(step(), 1..40)) {
-      let mut hold = ContentHold::new();
-      let mut model: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
-      for step in &steps {
-        let expected = model_apply(&mut model, step);
-        let got = match step {
-          Step::Put { object: at, manifest, shipped } => {
-            hold.hold(object(*at), archive(*manifest, shipped)).is_ok()
-          }
-          Step::Forget { object: at, manifest } => {
-            hold.forget_manifest(object(*at), &identity(*manifest))
-          }
-        };
-        prop_assert_eq!(got, expected, "{:?}", step);
-        check(&hold, &model);
-      }
+  /// AUD-29-44: do: run generated shapes and histories of puts and forgets on a hold and on the serial model,
+  /// with a fixed-seed runner at proptest's default case count; expect them to agree after every step (see
+  /// the module doc), and expect the census to have met every case the ownership rule distinguishes.
+  #[test]
+  fn the_hold_owns_exactly_what_its_manifests_reference() {
+    let census = RefCell::new(BTreeSet::new());
+    let mut runner = TestRunner::new_with_rng(
+      slates_test_seeds::unseeded(Config::default()),
+      TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let strategy = (shape(), proptest::collection::vec(step(), 1..=HISTORY));
+    let result = runner.run(&strategy, |(manifests, steps)| {
+      run(&manifests, &steps, &mut census.borrow_mut()).map_err(TestCaseError::fail)
+    });
+    if let Err(failure) = result {
+      panic!("AUD-29-44: {failure}");
     }
+    let met = census.into_inner();
+    let unmet: Vec<Case> = CASES
+      .into_iter()
+      .filter(|case| !met.contains(case))
+      .collect();
+    assert!(unmet.is_empty(), "the generator never reached {unmet:?}");
   }
 }
