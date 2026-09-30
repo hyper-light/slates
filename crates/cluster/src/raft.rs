@@ -2663,6 +2663,31 @@ impl RaftNode {
     }
   }
 
+  /// After a staging was judged stalled ([`catch_up`](Self::catch_up) returned [`CatchUp::Aborted`]): begins the
+  /// joint change to the sitting voters and every staged member that did catch up, in `target`'s order, so one
+  /// member that could not catch up does not hold back the ones that have; the stalled member is staged again
+  /// by the next change. Any voter set is a valid change (Raft §6 asks only that changes go one at a time), so
+  /// this is the same joint path as a full one. Whether a change began (none when no staged member caught
+  /// up). Until 2026-09-30 a group waited for every added member at once, and one member its leader could not
+  /// reach left the regional council at one voter of three members.
+  pub fn promote_caught_up(&mut self, target: &[HostId]) -> bool {
+    let sitting = self.all_voters();
+    let caught_up: Vec<HostId> = self
+      .staged()
+      .into_iter()
+      .filter_map(|(member, caught)| caught.then_some(member))
+      .collect();
+    let partial: Vec<HostId> = target
+      .iter()
+      .copied()
+      .filter(|host| sitting.contains(host) || caught_up.contains(host))
+      .collect();
+    if caught_up.is_empty() || partial == sitting {
+      return false;
+    }
+    self.begin_membership_change(partial)
+  }
+
   /// The members being caught up while leading, with whether each is caught up.
   pub fn staged(&self) -> Vec<(HostId, bool)> {
     if self.role != Role::Leader {

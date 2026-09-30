@@ -737,7 +737,8 @@ impl RootGroup {
       CatchUp::Ready => self.raft.begin_membership_change(target),
       CatchUp::Aborted { .. } => {
         self.stagings_aborted = self.stagings_aborted.saturating_add(1);
-        false
+        // One stalled representative must not hold back the ones caught up (`RaftNode::promote_caught_up`).
+        self.raft.promote_caught_up(&target)
       }
       CatchUp::Pending | CatchUp::NotLeader => false,
     }
@@ -1063,6 +1064,50 @@ mod tests {
         group.fold_reply(reply);
       }
     }
+  }
+
+  /// Shape: leader periods the widening test allows (a stall judged at the second CheckQuorum tick, then a
+  /// period each for the joint change and `C_new`).
+  const WIDENING_PERIODS: usize = 12;
+
+  /// §4.8 (D-14) and thesis §4.2.1, for the root group. Do: a root group whose only voter is P0, over regions
+  /// R0–R2 represented by P0–P2; the leader reaches P1 but never P2; drive leader periods (reconcile the voters,
+  /// CheckQuorum, replicate). Expect: P1 is promoted once P2's staging stalls — the voters become `[P0, P1]` —
+  /// and P2 once it is reachable. Before 2026-09-30 one representative that could not catch up held back one
+  /// that had, as in the regional council
+  /// (`docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`).
+  #[test]
+  fn a_representative_that_cannot_catch_up_does_not_hold_back_one_that_has() {
+    let mut groups: BTreeMap<HostId, RootGroup> = [P0, P1, P2]
+      .into_iter()
+      .map(|node| (node, RootGroup::new(node, vec![R0, R1, R2], vec![P0])))
+      .collect();
+    elect_among(&mut groups, P0, &[P0]);
+    assert!(groups[&P0].is_leader());
+    let representatives: BTreeMap<RegionId, HostId> =
+      [(R0, P0), (R1, P1), (R2, P2)].into_iter().collect();
+    let drive = |groups: &mut BTreeMap<HostId, RootGroup>, reachable: &[HostId]| {
+      for _ in 0..WIDENING_PERIODS {
+        if let Some(leader) = groups.get_mut(&P0) {
+          leader.reconcile_voters(&representatives);
+          leader.check_quorum();
+        }
+        replicate_round(groups, P0, reachable);
+        replicate_round(groups, P0, reachable);
+      }
+    };
+    drive(&mut groups, &[P0, P1]);
+    assert_eq!(
+      groups[&P0].voters(),
+      vec![P0, P1],
+      "P1 promoted though P2 stalled"
+    );
+    drive(&mut groups, &[P0, P1, P2]);
+    assert_eq!(
+      groups[&P0].voters(),
+      vec![P0, P1, P2],
+      "P2 promoted once reachable"
+    );
   }
 
   /// AC (§4.8, D-14; Raft §6): a retired region's **representative leaves the root voter set** — it stops

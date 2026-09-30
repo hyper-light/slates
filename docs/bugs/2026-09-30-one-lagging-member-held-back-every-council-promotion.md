@@ -57,6 +57,19 @@ leader had no session to.
   `complete_membership_change` once the joint entry commits), whose safety does not depend on which
   voters the new set names.
 
+## Sibling
+
+- **The root group had the same gate.** `RootGroup::reconcile_voters` also answered a stalled staging with
+  no change, so one unreachable regional representative held back every other representative's promotion
+  to the root voters.
+- **One implementation now.** The promotion lives in the Raft core as `RaftNode::promote_caught_up`, and both
+  the council and the root group call it on `CatchUp::Aborted`.
+- **Red, then green.** `root_group::tests::a_representative_that_cannot_catch_up_does_not_hold_back_one_that_has`
+  failed before the edit (the voters stayed `[P0]`) and passes after it (`[P0, P1]`, then `[P0, P1, P2]`
+  once P2 is reachable).
+- **Suites after the move.** `slates-cluster` passes on macOS and Linux (lib 225, one ignored), and the server fleet suite passes
+  59/59 on macOS.
+
 ## Open
 
 - Why the leader could not catch the third member up in those runs is still unobserved. The first

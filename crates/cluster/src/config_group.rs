@@ -1039,34 +1039,11 @@ impl RegionalCouncil {
       CatchUp::Ready => self.raft.begin_membership_change(target),
       CatchUp::Aborted { .. } => {
         self.stagings_aborted = self.stagings_aborted.saturating_add(1);
-        self.promote_the_caught_up(&sitting, &target)
+        // One stalled member must not hold back the ones caught up (`RaftNode::promote_caught_up`).
+        self.raft.promote_caught_up(&target)
       }
       CatchUp::Pending | CatchUp::NotLeader => false,
     }
-  }
-
-  /// A staging judged stalled must not hold back the members that did catch up: the joint change begins to
-  /// the sitting voters and those caught up (a valid configuration change — Raft §6 asks only that changes go
-  /// one at a time), in the target's order; the stalled member is staged afresh by the next change. Until
-  /// 2026-09-30 the change waited for every added member at once, and one member the leader could not reach
-  /// left the council at one voter of three members. Only on an abort — the common case, members catching up
-  /// together, still moves the voters once. Whether a change began.
-  fn promote_the_caught_up(&mut self, sitting: &[HostId], target: &[HostId]) -> bool {
-    let caught_up: Vec<HostId> = self
-      .raft
-      .staged()
-      .into_iter()
-      .filter_map(|(member, caught)| caught.then_some(member))
-      .collect();
-    let partial: Vec<HostId> = target
-      .iter()
-      .copied()
-      .filter(|host| sitting.contains(host) || caught_up.contains(host))
-      .collect();
-    if caught_up.is_empty() || partial.as_slice() == sitting {
-      return false;
-    }
-    self.raft.begin_membership_change(partial)
   }
 
   /// Whether this leader is catching `node` up to join the voters (thesis §4.2.1). The drive keeps direct
