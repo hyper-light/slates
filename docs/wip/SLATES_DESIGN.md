@@ -2578,7 +2578,10 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > set (three voters, one dead: the two survivors commit alone; a fourth member is promoted at `f = 1`), a
 > removed leader steps down once `C_new` commits, a node outside its configuration never campaigns, and
 > outgoing voters receive their removal until it commits. The believed-dead contact clause stays, no
-> longer papering over a stale set. Record: `docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`. A
+> longer papering over a stale set. Record: `docs/bugs/2026-09-13-raft-voter-set-never-shrinks.md`. (2026-09-30: a
+> member whose staging stalls no longer holds back the ones caught up — the joint change begins to the sitting
+> voters and those, and the stalled member is staged again by the next change;
+> `docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`.) A
 > holder-side defect it exposed — an acceptor created by a refused first record pinned at a stale
 > generation, so a head provisioned in the install window never placed — is fixed
 > (`docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`).

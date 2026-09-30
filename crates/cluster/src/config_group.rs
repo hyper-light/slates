@@ -1039,10 +1039,34 @@ impl RegionalCouncil {
       CatchUp::Ready => self.raft.begin_membership_change(target),
       CatchUp::Aborted { .. } => {
         self.stagings_aborted = self.stagings_aborted.saturating_add(1);
-        false
+        self.promote_the_caught_up(&sitting, &target)
       }
       CatchUp::Pending | CatchUp::NotLeader => false,
     }
+  }
+
+  /// A staging judged stalled must not hold back the members that did catch up: the joint change begins to
+  /// the sitting voters and those caught up (a valid configuration change — Raft §6 asks only that changes go
+  /// one at a time), in the target's order; the stalled member is staged afresh by the next change. Until
+  /// 2026-09-30 the change waited for every added member at once, and one member the leader could not reach
+  /// left the council at one voter of three members. Only on an abort — the common case, members catching up
+  /// together, still moves the voters once. Whether a change began.
+  fn promote_the_caught_up(&mut self, sitting: &[HostId], target: &[HostId]) -> bool {
+    let caught_up: Vec<HostId> = self
+      .raft
+      .staged()
+      .into_iter()
+      .filter_map(|(member, caught)| caught.then_some(member))
+      .collect();
+    let partial: Vec<HostId> = target
+      .iter()
+      .copied()
+      .filter(|host| sitting.contains(host) || caught_up.contains(host))
+      .collect();
+    if caught_up.is_empty() || partial.as_slice() == sitting {
+      return false;
+    }
+    self.raft.begin_membership_change(partial)
   }
 
   /// Whether this leader is catching `node` up to join the voters (thesis §4.2.1). The drive keeps direct
@@ -2150,6 +2174,71 @@ mod tests {
       "the live learner was caught up, then promoted to the free seat: {change:?}"
     );
     assert_eq!(councils[&OWNER].voters(), vec![OWNER, A, C]);
+  }
+
+  /// Shape: leader periods the test below allows: a stalled staging is judged at the second CheckQuorum tick
+  /// (`STALLED_WINDOWS` whole windows after the baseline), then the joint change and `C_new` each take a
+  /// period to commit; twelve is several times that.
+  const WIDENING_PERIODS: usize = 12;
+
+  /// §4.8 (D-14) and thesis §4.2.1. Do: a council formed by its first node alone (voters `[OWNER]`) with A and B
+  /// admitted; the leader reaches A but never B (B's session down); drive leader periods as the fleet's leader
+  /// does — reconcile the voters, tick CheckQuorum, replicate to what it reaches. Expect: A is promoted — the
+  /// voters become `[OWNER, A]` once B's staging is judged stalled — and B, once reachable, is staged again,
+  /// caught up and promoted by the next change. Before 2026-09-30 the joint change waited for every added member at once, so one member that
+  /// could not catch up held back one that had: the council stayed at one voter of three members (three macOS
+  /// CI failures that day: a fleet formation, an enrollment, a three-process deploy refused
+  /// `LeaseUnconfirmed`).
+  #[test]
+  fn a_member_that_cannot_catch_up_does_not_hold_back_one_that_has() {
+    let members = [OWNER, A, B];
+    let quorum = Quorum { f: 1 };
+    let mut councils: std::collections::BTreeMap<HostId, RegionalCouncil> = members
+      .iter()
+      .map(|&node| {
+        (
+          node,
+          RegionalCouncil::new(
+            node,
+            members.to_vec(),
+            vec![OWNER],
+            quorum,
+            std::collections::BTreeMap::new(),
+            3,
+            false,
+          ),
+        )
+      })
+      .collect();
+    elect_among(&mut councils, OWNER, &[OWNER]);
+    assert!(councils[&OWNER].is_leader());
+    let (reachable, alive) = ([OWNER, A], [OWNER, A, B]);
+    for _ in 0..WIDENING_PERIODS {
+      if let Some(leader) = councils.get_mut(&OWNER) {
+        leader.reconcile_voters(&alive);
+        leader.check_quorum();
+      }
+      settle(&mut councils, OWNER, &reachable, 2);
+    }
+    assert_eq!(
+      councils[&OWNER].voters(),
+      vec![OWNER, A],
+      "A, caught up, was promoted though B could not catch up"
+    );
+    assert!(councils[&A].is_voter(A), "A knows itself a voter");
+    // B's session comes back: the next change stages it afresh, catches it up and promotes it.
+    for _ in 0..WIDENING_PERIODS {
+      if let Some(leader) = councils.get_mut(&OWNER) {
+        leader.reconcile_voters(&alive);
+        leader.check_quorum();
+      }
+      settle(&mut councils, OWNER, &alive, 2);
+    }
+    assert_eq!(
+      councils[&OWNER].voters(),
+      vec![OWNER, A, B],
+      "the stalled member was promoted once it could catch up"
+    );
   }
 
   /// AC (§4.8, D-14 — "a small elected council"): beyond the candidate floor the extra members are learners;

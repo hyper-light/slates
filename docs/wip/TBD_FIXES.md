@@ -44,7 +44,12 @@ authorized merely by appearing here.
   resume could not own. Temporaries are now created at a plain hidden name and linked to the aside once
   complete. Red → green on the crash oracle's new named-temporary model
   (`docs/bugs/2026-09-30-a-crash-mid-write-left-a-temporary-the-resume-could-not-own.md`).
-- [ ] **A council that never widens past one voter (open; three CI occurrences, none reproduced).** One
+- [~] **A council that never widens past one voter: the stall is fixed; its trigger is still open.**
+  `reconcile_voters` promoted no member until every added member had caught up, so one member the leader
+  could not reach held back the rest. A caught-up member is now promoted when a staging stalls. The unit
+  test went red to green; fleet 59/60 and CLI 13/13 pass
+  (`docs/bugs/2026-09-30-one-lagging-member-held-back-every-council-promotion.md`). Still open: why the
+  leader could not reach the third member. The original record follows. One
   signature across three tests on the macOS runner: a node's council view holds one voter while the
   configuration holds three members, and its lease or promotion never completes.
   - Run 36663502686 (the formation test; entry below).
