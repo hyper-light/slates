@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use slates_land::engine::{LandingState, Outcome};
+use slates_land::engine::{Degradation, LandingState, Outcome};
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::HostFs;
@@ -439,9 +439,37 @@ fn t_1_15_kill_9_on_tmpfs_leaves_every_file_old_or_new() {
       round_bytes(last, f)
     );
   }
-  assert!(
-    !names_in(&ws.path).iter().any(|n| n.starts_with(".slates-")),
-    "siblings swept: {:?}",
-    names_in(&ws.path)
-  );
+  assert_siblings_swept_or_kept(&ws.path, &report.degraded, last);
+}
+
+/// The resume's siblings (A-43): each one is swept, or kept beside its name and reported (`Kept`) when the
+/// resume cannot verify it as the entry the crashed attempt displaced — never removed unverified — and a
+/// kept one holds a whole round, never torn bytes. This resume's overlay is built from the disk after the
+/// kill, so it lacks the attempt's witnesses: an exchange the kill caught before its check leaves the
+/// displaced file unverifiable (CI run 36666172500 kept one). Before A-43 every sibling was a temporary and
+/// was swept.
+fn assert_siblings_swept_or_kept(root: &Path, degraded: &[Degradation], last: u64) {
+  let kept: Vec<String> = degraded
+    .iter()
+    .filter_map(|cell| match cell {
+      Degradation::Kept { kept, .. } => kept.rsplit('/').next().map(str::to_owned),
+      _ => None,
+    })
+    .collect();
+  for name in names_in(root)
+    .into_iter()
+    .filter(|n| n.starts_with(".slates-"))
+  {
+    assert!(
+      kept.contains(&name),
+      "an unreported sibling {name}; kept: {kept:?}"
+    );
+    let bytes = read(&root.join(&name)).unwrap();
+    assert!(
+      (0..=last).any(|r| (0..KILL_FILES).any(|f| bytes == round_bytes(r, f))),
+      "the kept {name} is torn: {:?}",
+      String::from_utf8_lossy(&bytes)
+    );
+    eprintln!("t_1_15: kept {name}, reported, holding a whole round");
+  }
 }

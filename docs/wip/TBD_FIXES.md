@@ -22,6 +22,13 @@ authorized merely by appearing here.
   See `docs/bugs/2026-09-30-the-eslogger-shutdown-waited-for-a-stream-end-that-never-came.md`. The live
   eslogger path is confirmed only by the macOS CI lane.
 
+- [x] **Run 36666172500, Linux: the `kill -9` landing test found a kept sibling.** After the resume a
+  `.slates-kept-…` entry remained. A-43 keeps, and reports, an aside the resume cannot verify as the entry
+  the crashed attempt displaced. This test's resume builds its overlay from the disk after the kill, so it
+  lacks the attempt's witnesses, and an exchange the kill caught before its check leaves the displaced
+  file unverifiable. The test predated A-43 and asserted that no sibling remains. It now asserts A-43's
+  contract: each sibling is swept or reported `Kept`, and a kept one holds a whole round. On Linux
+  `/dev/shm`, 60 of 60 runs pass and 11 of them reached the kept path.
 - [ ] **Run 36663502686, Linux: a fleet formation did not widen its council (open, not reproduced).**
   `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment` failed in `assert_fleet_forms`, before
   its own steps: the council leader (term 1) kept voters = [itself] with all three hosts members; its
