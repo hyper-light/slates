@@ -1552,6 +1552,15 @@ neither the server nor a mounted client is granted device activation by a volume
 Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
 must exercise local communication and isolation between clones as well as namespace calls.
 
+> **Status (2026-09-30, A-48).** The base plane's witnesses, their disk homes, and the fingerprints behind
+> whiteouts and redirects are versioned by epoch like the tree and the inode table: a snapshot, and a
+> clone made from one, reads them as the snapshot froze them. A write overwrites a version no live
+> snapshot reads and appends one otherwise; a snapshot's destroy drops what only it read, so a key holds
+> at most one more version than the live snapshots; the volume image (layout 7) carries every version.
+> Before, the tables were the head's only, and a clone of a snapshot from before a rewitness landed its
+> old-based edit over the outsider's change without a conflict (`crates/land/tests/source.rs`, red on
+> `c5b47cb`). Record: `docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md`.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing
@@ -3867,8 +3876,8 @@ No copy-up, hashing, archive or landing step opens a host special file as regula
 > exactly its state: nothing but snapshots journaled since, with no record dropped
 > (`Volume::unchanged_since`). A head changed since is refused `Unsupported` before any host access, and a
 > snapshot the volume never had is `NotFound`. The engine plans the head. Landing an older snapshot exactly
-> needs the base plane's witnesses frozen per snapshot, and today they are the head's: owed, with the
-> advancement rule that keeps later live edits private. Record:
+> needs the base plane's witnesses frozen per snapshot: done 2026-09-30 (A-48, §4.5 status). The engine's
+> source and the advancement rule that keeps later live edits private are owed. Record:
 > `docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md`.
 
 **Live source and complete capture (A-9).** Creating a live overlay opens and identifies its
@@ -7070,4 +7079,30 @@ and GAPS.
 - What it does not change: the landing plan, verdicts and write classes; presentations and grants; the
   term (still the failover bound, until the measured term and its keepalive arrive with the sliced engine,
   AUD-29-25); the fleet register of the lease record (still owed).
+
+### A-48 — The base plane's witnesses are versioned with the snapshots that froze them (2026-09-30)
+Applied in the same change to: §4.5 (its status), §4.15 (the AUD-29-02 status), `slates-vfs`
+(`base_versions.rs`: `Versioned`; `base.rs`: the four tables, their writes at the witness clock, the
+snapshot-scoped reads and `diverged_in`, the clone's view; `volume.rs`: the clone's epoch, the prune at a
+snapshot's destroy; `base_recovery.rs`, `recover.rs`: image layout 7), the tests, and GAPS.
+- Why: a landing verdict is a pure function of the witnessed base, the disk now and the overlay (D-26), and
+  the witnessed bases were the head's only while every other input to a snapshot was versioned. A clone of
+  an older snapshot took the head's, so after a rewitness it landed its old-based edit over an outsider's
+  change without a conflict; and an older snapshot could not be landed exactly (AUD-29-02;
+  `docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md`).
+- The rule:
+  - The witnesses, their disk homes, and the fingerprints behind whiteouts and redirects are recorded
+    against the head's epoch; a snapshot frozen at epoch `e` reads each key's last value at or before `e`.
+  - A write overwrites the key's last version when no live snapshot reads it, else appends one; a
+    snapshot's destroy drops what only it read. A key holds at most one more version than the live
+    snapshots.
+  - A clone starts from its snapshot's view, never the origin's head.
+  - The volume image carries every version (layout 7); the head's witnesses still each need a home in a
+    reacquired directory.
+- Evidence: the versioned table against a model over generated histories (every snapshot reads what it
+  froze; the bound after every step; a clone's start); a snapshot's witnesses and whiteouts through a later
+  rewitness and whiteout, its frozen diverged set, the prune and the image round trip by use; and the clone
+  landing, red on `c5b47cb` (`Done`, the outsider's file replaced) and refused `Conflict(ModifyModify)` now.
+- What it does not change: the head's reads and writes, the verdict table, drift checks and descriptors
+  (the head's), and what a landing lands (the head, still, until the engine's source; AUD-29-02).
 

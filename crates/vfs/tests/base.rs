@@ -1461,3 +1461,157 @@ fn an_outsiders_edit_moves_the_change_counter_and_a_plain_stat_does_not() {
   let (_, settled) = counter(&mut vol, &mut host, &mut store);
   assert_eq!(settled, edited, "and a further stat leaves it");
 }
+
+/// The worked example taken on to a snapshot and past it (A-48): `lib.rs` copied up under witness W1 and
+/// `main.rs` deleted under a whiteout of its base fingerprint F1, then snapshot S. After it an outsider
+/// replaces both files; the head sees the drift and rewitnesses `lib.rs` (W2), and creates `main.rs`
+/// again and deletes it, which records the whiteout over the replaced file (F2). Returns the snapshot,
+/// `lib.rs`'s inode, W1 and F1.
+fn past_a_snapshot() -> (
+  SimHost,
+  Store,
+  Volume,
+  slates_vfs::ids::SnapshotId,
+  slates_vfs::ids::InodeNo,
+  slates_vfs::inode::Witness,
+  Fingerprint,
+) {
+  let (mut host, mut store, mut vol, lib) = worked_example();
+  let w1 = vol.base_plane().unwrap().witness(lib).unwrap();
+  let f1 = host.fingerprint("/src/main.rs").unwrap();
+  let src = src_dir(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .unlink(&mut store, src, "main.rs")
+    .unwrap();
+  let s = vol.snapshot(&mut store).unwrap();
+  host.advance_ns(1_000_000_000);
+  host.replace_file("/src/lib.rs", b"pulled lib");
+  host.replace_file("/src/main.rs", b"pulled main");
+  vol.with_host(&mut host).status(&mut store).unwrap();
+  vol
+    .with_host(&mut host)
+    .rewitness(&mut store, None)
+    .unwrap();
+  let src = src_dir(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .create_file(&mut store, src, "main.rs", 0o100_644)
+    .unwrap();
+  let src = src_dir(&mut vol, &mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .unlink(&mut store, src, "main.rs")
+    .unwrap();
+  (host, store, vol, s, lib, w1, f1)
+}
+
+/// The head's `/src` directory node.
+fn src_dir(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+) -> slates_mem::Handle<slates_vfs::dir::DirNode> {
+  let Child::Dir(src) = vol.with_host(host).resolve(store, "/src").unwrap().child else {
+    panic!("a directory");
+  };
+  src
+}
+
+/// A-48 (AUD-29-02's prerequisite): a snapshot keeps the witnesses it froze. Do: take the worked example
+/// past a snapshot (a rewitness and a whiteout over a replaced file after it). Expect: the snapshot reads
+/// W1 for `lib.rs` and F1 behind `main.rs`'s whiteout, and its diverged set is the one it froze — while
+/// the head reads W2 and F2.
+#[test]
+fn a_snapshot_keeps_the_witnesses_it_froze_through_later_changes() {
+  let (host, store, vol, s, lib, w1, f1) = past_a_snapshot();
+  let head = vol.base_plane().unwrap().witness(lib).unwrap();
+  assert_ne!(head, w1, "the head rewitnessed");
+  assert_eq!(vol.witness_in(s, lib), Some(w1));
+  assert_eq!(
+    vol.whiteout_witness_in(&store, s, "/src", "main.rs"),
+    Some(f1)
+  );
+  let f2 = host.fingerprint("/src/main.rs").unwrap();
+  assert_ne!(f2, f1, "the outsider replaced main.rs");
+  assert_eq!(vol.whiteout_witness(&store, "/src", "main.rs"), Some(f2));
+  let frozen: Vec<(String, Divergence)> = vol
+    .diverged_in(&store, s)
+    .unwrap()
+    .into_iter()
+    .map(|d| (d.path, d.kind))
+    .collect();
+  assert_eq!(
+    frozen,
+    vec![
+      ("/src/lib.rs".to_owned(), Divergence::Witnessed),
+      ("/src/main.rs".to_owned(), Divergence::Whiteout),
+    ]
+  );
+}
+
+/// A-48 (the clone sibling): a clone starts from the witnesses of the snapshot it was made from. Do: take
+/// the worked example past a snapshot and clone the snapshot. Expect: the clone reads W1 for `lib.rs` and
+/// F1 behind `main.rs`'s whiteout. Before 2026-09-30 it read the head's W2 and F2.
+#[test]
+fn a_clone_starts_from_its_snapshots_witnesses_not_the_heads() {
+  let (_host, store, mut vol, s, lib, w1, f1) = past_a_snapshot();
+  let clone = Volume::clone_of(
+    &store,
+    &mut vol,
+    s,
+    VolumeConfig {
+      prefix: 8,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 20,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap();
+  assert_eq!(clone.base_plane().unwrap().witness(lib), Some(w1));
+  assert_eq!(clone.whiteout_witness(&store, "/src", "main.rs"), Some(f1));
+}
+
+/// A-48's bound: the witness versions only a snapshot read go with its destroy. Do: take the worked
+/// example past a snapshot, count the versions, destroy the snapshot. Expect: more versions than the
+/// head's while the snapshot lives, the head's alone after, and the head's reads unchanged.
+#[test]
+fn a_snapshots_destroy_drops_the_witness_versions_only_it_read() {
+  let (_host, mut store, mut vol, s, lib, _w1, _hidden) = past_a_snapshot();
+  let head = vol.base_plane().unwrap().witness(lib);
+  let with_snapshot = vol.base_plane().unwrap().witness_versions();
+  vol.destroy_snapshot(&mut store, s).unwrap();
+  let after = vol.base_plane().unwrap().witness_versions();
+  // The head holds lib.rs's witness, its home, and main.rs's whiteout: one version each.
+  assert_eq!(after, 3, "the head's versions alone");
+  assert!(with_snapshot > after, "{with_snapshot} with the snapshot");
+  assert_eq!(vol.base_plane().unwrap().witness(lib), head);
+}
+
+/// A-48 (§4.8 recovery): the witness versions a snapshot reads survive the volume image. Do: take the
+/// worked example past a snapshot, image the volume and recover it. Expect: the recovered snapshot reads
+/// W1 and the whiteout, and the recovered head the rewitnessed witness.
+#[test]
+fn a_recovered_snapshot_keeps_the_witnesses_it_froze() {
+  let (mut host, store, vol, s, lib, w1, f1) = past_a_snapshot();
+  let head = vol.base_plane().unwrap().witness(lib);
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  let image = slates_vfs::recover::VolumeImage::from_content(&image.to_content()).unwrap();
+  let mut after = common::store();
+  let root = host.root();
+  let recovered = Volume::from_image(
+    &mut after,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .unwrap();
+  assert_eq!(recovered.witness_in(s, lib), Some(w1));
+  assert_eq!(
+    recovered.whiteout_witness_in(&after, s, "/src", "main.rs"),
+    Some(f1)
+  );
+  assert_eq!(recovered.base_plane().unwrap().witness(lib), head);
+}

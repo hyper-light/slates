@@ -49,9 +49,10 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// The image layout's history: 3 (2026-09-15) a file's body is its held runs at their offsets, not
 /// one vector of its logical length; 4 (A-26) FIFO/socket kinds with empty bodies and zero size; 5
 /// (§4.5, 2026-09-26) each inode's extended-attribute table and, for an attribute inode, its owner;
-/// 6 (§4.6) each inode's AppleDouble working copy.
+/// 6 (§4.6) each inode's AppleDouble working copy; 7 (A-48, 2026-09-30) the base plane's witness,
+/// home, whiteout and redirect tables with every version a snapshot still reads.
 /// Format: the image layout version, bumped with any change to the types below.
-const IMAGE_VERSION: u16 = 6;
+const IMAGE_VERSION: u16 = 7;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]

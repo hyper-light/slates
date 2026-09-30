@@ -3153,14 +3153,21 @@ cleanup failures.**
   call's reply handoff drops a refusal uncounted (`xshard::call_on`, the forward path), bounded only by the
   caller's deadline.
 
+**Closed 2026-09-30 — A-48 (found preparing AUD-29-02): a clone of an older snapshot was judged by the head's
+witnesses.** The base plane's witness, home, whiteout and redirect tables are versioned by epoch; a snapshot
+and a clone of it read what the snapshot froze; a destroy drops what only it read (at most live snapshots + 1
+versions per key); image layout 7. The clone landing that replaced an outsider's file on `c5b47cb` now
+conflicts (`docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md`). Open:
+the tables are heap outside the metadata ledger (§4.2).
+
 **Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:
   nothing but snapshots journaled since, no record dropped). A head changed since is refused `Unsupported`
   before any host access, and a snapshot the volume never had is `NotFound`
   (`docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md`).
 - **Owed.**
-  - Exact landing of an older snapshot, which needs the base plane's witnesses (file, whiteout, redirect)
-    frozen per snapshot: a §4.5/§4.15 amendment.
+  - Exact landing of an older snapshot. Its first need, the base plane's witnesses frozen per snapshot,
+    is done (A-48, 2026-09-30).
   - The engine's source made explicit through plan, validate, write and advance, with advancement
     guarded by the head still equalling what landed.
   - A source field in the durable landing and grant records, which needs a catalog format version.

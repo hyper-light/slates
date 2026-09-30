@@ -25,6 +25,9 @@
 #[path = "base_recovery.rs"]
 mod recovery;
 pub use recovery::BaseImage;
+#[path = "base_versions.rs"]
+mod versions;
+use versions::{Version, Versioned};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -35,10 +38,18 @@ use crate::error::VfsError;
 use crate::host::{
   BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, WatchState,
 };
-use crate::ids::InodeNo;
+use crate::ids::{Epoch, InodeNo, SnapshotId};
 use crate::inode::{BaseBody, Body, Fingerprint, Home, Inode, Kind, Witness};
 use crate::journal::Op;
 use crate::volume::{DirRow, Located, Store, Volume, VolumeConfig};
+
+/// When a base-plane table is written (A-48): the head's epoch, which labels the new value, and the newest
+/// live snapshot's, which decides whether the value it replaces can still be read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WitnessClock {
+  head: Epoch,
+  newest: Option<Epoch>,
+}
 
 /// Format: a directory's own two links (`.` and its name); each subdirectory adds one (POSIX).
 const ROOT_LINKS: u32 = 2;
@@ -329,22 +340,23 @@ pub struct BasePlane {
   large_class_bytes: u64,
   /// Listings by directory inode number.
   pub(crate) listings: BTreeMap<InodeNo, Listing>,
-  /// Witnesses by inode number.
-  witnesses: BTreeMap<InodeNo, Witness>,
+  /// Witnesses by inode number, versioned by epoch so a snapshot reads its own (A-48).
+  witnesses: Versioned<InodeNo, Witness>,
   /// Where on the disk each witness was taken: the base directory's inode number and the
   /// entry name there. A renamed base file keeps its bytes at the old disk path (§4.5), so
-  /// drift checks and descriptors follow this, not the volume's current name.
-  witness_homes: BTreeMap<InodeNo, (InodeNo, Box<str>)>,
+  /// drift checks and descriptors follow this, not the volume's current name. Versioned with the
+  /// witnesses, so every witness a snapshot reads keeps its home.
+  witness_homes: Versioned<InodeNo, (InodeNo, Box<str>)>,
   /// Drift by inode number.
   drift: BTreeMap<InodeNo, DriftKind>,
   /// Open file descriptors by inode number (large-class copies and read-through).
   descriptors: BTreeMap<InodeNo, HostFile>,
   /// The base entry each whiteout hides, by (directory inode, name): its fingerprint at the
-  /// removal, the landing's witnessed base for a delete (§4.15).
-  whiteouts: BTreeMap<(InodeNo, Box<str>), Fingerprint>,
+  /// removal, the landing's witnessed base for a delete (§4.15). Versioned by epoch (A-48).
+  whiteouts: Versioned<(InodeNo, Box<str>), Fingerprint>,
   /// The base directory each redirect moved, by the directory's inode: its fingerprint at the
-  /// rename, the landing's witnessed base for the rename.
-  redirects: BTreeMap<InodeNo, Fingerprint>,
+  /// rename, the landing's witnessed base for the rename. Versioned by epoch (A-48).
+  redirects: Versioned<InodeNo, Fingerprint>,
   watch: WatchState,
   /// Directories whose listings a hint invalidated and whose witnessed entries want a check.
   recheck: BTreeSet<InodeNo>,
@@ -386,12 +398,12 @@ impl BasePlane {
       facts: config.facts,
       large_class_bytes: config.large_class_bytes,
       listings,
-      witnesses: BTreeMap::new(),
-      witness_homes: BTreeMap::new(),
+      witnesses: Versioned::default(),
+      witness_homes: Versioned::default(),
       drift: BTreeMap::new(),
       descriptors: BTreeMap::new(),
-      whiteouts: BTreeMap::new(),
-      redirects: BTreeMap::new(),
+      whiteouts: Versioned::default(),
+      redirects: Versioned::default(),
       watch: WatchState::Unavailable,
       recheck: BTreeSet::new(),
       recheck_all: false,
@@ -417,8 +429,11 @@ impl BasePlane {
     self.hint_seq
   }
 
-  /// A clone's plane: the same root and facts, the origin's witnesses, its own listings.
-  pub(crate) fn for_clone(&self, root_no: InodeNo) -> Self {
+  /// A clone's plane: the same root and facts, its own listings, and the witnesses of the snapshot it
+  /// was made from — frozen at `epoch` — never the origin's head's (A-48). Before 2026-09-30 a clone of an
+  /// older snapshot took the head's, so after a rewitness its old-based bytes were judged against the
+  /// newer witness.
+  pub(crate) fn for_clone(&self, root_no: InodeNo, epoch: Epoch) -> Self {
     let mut plane = Self::new(
       BaseConfig {
         root: self.root,
@@ -427,21 +442,98 @@ impl BasePlane {
       },
       root_no,
     );
-    plane.witnesses = self.witnesses.clone();
-    plane.witness_homes = self.witness_homes.clone();
-    plane.whiteouts = self.whiteouts.clone();
-    plane.redirects = self.redirects.clone();
+    plane.witnesses = self.witnesses.view_at(epoch);
+    plane.witness_homes = self.witness_homes.view_at(epoch);
+    plane.whiteouts = self.whiteouts.view_at(epoch);
+    plane.redirects = self.redirects.view_at(epoch);
     plane
   }
 
   /// The witness of an inode, if it was copied up.
   pub fn witness(&self, no: InodeNo) -> Option<Witness> {
-    self.witnesses.get(&no).copied()
+    self.witnesses.head(&no).copied()
   }
 
   /// Whether the inode is witnessed.
   pub fn is_witnessed(&self, no: InodeNo) -> bool {
-    self.witnesses.contains_key(&no)
+    self.witnesses.head_has(&no)
+  }
+
+  /// The witness of an inode as a snapshot frozen at `epoch` holds it (A-48).
+  pub fn witness_at(&self, no: InodeNo, epoch: Epoch) -> Option<Witness> {
+    self.witnesses.at(&no, epoch).copied()
+  }
+
+  /// Records a witness and the disk home it was taken at, as the head's (`at`: the volume's witness
+  /// clock). A witness taken with no home keeps the one it had.
+  fn record_witness(
+    &mut self,
+    no: InodeNo,
+    witness: Witness,
+    home: Option<(InodeNo, Box<str>)>,
+    at: WitnessClock,
+  ) {
+    self.witnesses.set(no, Some(witness), at.head, at.newest);
+    if let Some(home) = home {
+      self.witness_homes.set(no, Some(home), at.head, at.newest);
+    }
+  }
+
+  /// Forgets an inode's witness and its home, as the head's.
+  fn forget_witness(&mut self, no: InodeNo, at: WitnessClock) {
+    self.witnesses.remove(&no, at.head, at.newest);
+    self.witness_homes.remove(&no, at.head, at.newest);
+  }
+
+  /// Records the fingerprint of the base entry a whiteout at `(dir, name)` hides, as the head's.
+  fn record_whiteout(
+    &mut self,
+    dir: InodeNo,
+    name: &str,
+    fingerprint: Fingerprint,
+    at: WitnessClock,
+  ) {
+    self
+      .whiteouts
+      .set((dir, name.into()), Some(fingerprint), at.head, at.newest);
+  }
+
+  /// Forgets the whiteout at `(dir, name)`, as the head's.
+  fn forget_whiteout(&mut self, dir: InodeNo, name: &str, at: WitnessClock) {
+    self
+      .whiteouts
+      .remove(&(dir, name.into()), at.head, at.newest);
+  }
+
+  /// Records the fingerprint of the base directory a redirect moved, as the head's.
+  fn record_redirect(&mut self, no: InodeNo, fingerprint: Fingerprint, at: WitnessClock) {
+    self
+      .redirects
+      .set(no, Some(fingerprint), at.head, at.newest);
+  }
+
+  /// Forgets a directory's redirect, as the head's.
+  fn forget_redirect(&mut self, no: InodeNo, at: WitnessClock) {
+    self.redirects.remove(&no, at.head, at.newest);
+  }
+
+  /// Drops the versions no remaining snapshot reads: `live` are the epochs of the volume's snapshots
+  /// after a destroy (A-48's bound).
+  pub(crate) fn prune_versions(&mut self, live: &[Epoch]) {
+    self.witnesses.prune(live);
+    self.witness_homes.prune(live);
+    self.whiteouts.prune(live);
+    self.redirects.prune(live);
+  }
+
+  /// The versions the witness tables hold, over every table: the measure of A-48's bound.
+  pub fn witness_versions(&self) -> usize {
+    self
+      .witnesses
+      .version_count()
+      .saturating_add(self.witness_homes.version_count())
+      .saturating_add(self.whiteouts.version_count())
+      .saturating_add(self.redirects.version_count())
   }
 
   /// The digest verb's counters, for the tests that must see a path move.
@@ -571,8 +663,44 @@ impl Volume {
   /// The diverged set (AC-1.10): witnessed, created, whiteouted and redirected entries, by
   /// path, over the loaded nodes only (cost proportional to what the volume touched).
   pub fn diverged(&self, store: &Store) -> Vec<Diverged> {
+    let plane = self.base.as_ref();
+    self.diverged_from(
+      store,
+      self.root,
+      |no| plane.is_some_and(|b| b.is_witnessed(no)),
+      |no| matches!(self.inode(store, no).map(|i| &i.body), Ok(Body::Base(_))),
+    )
+  }
+
+  /// The diverged set as snapshot `id` froze it (A-48): its tree, its inode versions and the witnesses
+  /// it read, never the head's.
+  pub fn diverged_in(&self, store: &Store, id: SnapshotId) -> Result<Vec<Diverged>, VfsError> {
+    let (epoch, root) = self.snapshot_info(id)?;
+    let plane = self.base.as_ref();
+    Ok(self.diverged_from(
+      store,
+      root,
+      |no| plane.is_some_and(|b| b.witness_at(no, epoch).is_some()),
+      |no| {
+        matches!(
+          self.inode_in(store, id, no).map(|i| &i.body),
+          Ok(Body::Base(_))
+        )
+      },
+    ))
+  }
+
+  /// The diverged walk from `root`: `witnessed` and `is_base` answer for the tree walked (the head's or a
+  /// snapshot's).
+  fn diverged_from(
+    &self,
+    store: &Store,
+    root: Handle<DirNode>,
+    witnessed: impl Fn(InodeNo) -> bool,
+    is_base: impl Fn(InodeNo) -> bool,
+  ) -> Vec<Diverged> {
     let mut out = Vec::new();
-    let mut stack = vec![(String::new(), self.root)];
+    let mut stack = vec![(String::new(), root)];
     while let Some((prefix, dir)) = stack.pop() {
       let Ok(node) = store.dirs.get(dir) else {
         continue;
@@ -596,14 +724,12 @@ impl Volume {
             }
           }
           Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
-            let witnessed = self.base.as_ref().is_some_and(|b| b.is_witnessed(no));
-            let is_base = matches!(self.inode(store, no).map(|i| &i.body), Ok(Body::Base(_)));
-            if witnessed {
+            if witnessed(no) {
               out.push(Diverged {
                 path,
                 kind: Divergence::Witnessed,
               });
-            } else if !is_base {
+            } else if !is_base(no) {
               out.push(Diverged {
                 path,
                 kind: Divergence::Created,
@@ -629,7 +755,7 @@ impl Volume {
       .base
       .as_ref()?
       .whiteouts
-      .get(&(dir_no, name.into()))
+      .head(&(dir_no, name.into()))
       .copied()
   }
 
@@ -640,7 +766,63 @@ impl Volume {
       return None;
     };
     let no = store.dirs.get(h).ok()?.inode;
-    self.base.as_ref()?.redirects.get(&no).copied()
+    self.base.as_ref()?.redirects.head(&no).copied()
+  }
+
+  /// [`Self::whiteout_witness`] as snapshot `id` holds it (A-48).
+  pub fn whiteout_witness_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    dir: &str,
+    name: &str,
+  ) -> Option<Fingerprint> {
+    let (epoch, _) = self.snapshot_info(id).ok()?;
+    let located = self.resolve_in(store, id, dir).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let dir_no = store.dirs.get(h).ok()?.inode;
+    self
+      .base
+      .as_ref()?
+      .whiteouts
+      .at(&(dir_no, name.into()), epoch)
+      .copied()
+  }
+
+  /// [`Self::redirect_witness`] as snapshot `id` holds it (A-48).
+  pub fn redirect_witness_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    path: &str,
+  ) -> Option<Fingerprint> {
+    let (epoch, _) = self.snapshot_info(id).ok()?;
+    let located = self.resolve_in(store, id, path).ok()?;
+    let Child::Dir(h) = located.child else {
+      return None;
+    };
+    let no = store.dirs.get(h).ok()?.inode;
+    self.base.as_ref()?.redirects.at(&no, epoch).copied()
+  }
+
+  /// The witness of inode `no` as snapshot `id` holds it (A-48).
+  pub fn witness_in(&self, id: SnapshotId, no: InodeNo) -> Option<Witness> {
+    let (epoch, _) = self.snapshot_info(id).ok()?;
+    self.base.as_ref()?.witness_at(no, epoch)
+  }
+
+  /// The clock the base plane's versioned tables are written at: the head's epoch and the newest live
+  /// snapshot's (A-48).
+  pub(crate) fn witness_clock(&self) -> WitnessClock {
+    WitnessClock {
+      head: self.epoch,
+      newest: self
+        .last_snapshot
+        .and_then(|id| self.snapshot_info(id).ok())
+        .map(|(epoch, _)| epoch),
+    }
   }
 
   /// Whether the base beneath `dir` holds `name` (loaded listing only; the caller loads it).
@@ -691,10 +873,13 @@ impl Volume {
     if plane.forget_digest(store, no) {
       plane.digest_stats.invalidated += 1;
     }
-    plane.witnesses.remove(&no);
-    plane.witness_homes.remove(&no);
     plane.drift.remove(&no);
-    plane.descriptors.remove(&no)
+    let descriptor = plane.descriptors.remove(&no);
+    let at = self.witness_clock();
+    if let Some(plane) = self.base.as_mut() {
+      plane.forget_witness(no, at);
+    }
+    descriptor
   }
 }
 
@@ -1381,10 +1566,9 @@ impl Overlay<'_> {
     let left = node
       .lookup(&store.blocks, self.vol.policy, name)
       .is_some_and(|e| e.child == Child::Whiteout);
+    let at = self.vol.witness_clock();
     if left && let Some(plane) = self.vol.base.as_mut() {
-      plane
-        .whiteouts
-        .insert((node.inode, name.into()), entry.fingerprint);
+      plane.record_whiteout(node.inode, name, entry.fingerprint, at);
     }
   }
 
@@ -1412,8 +1596,9 @@ impl Overlay<'_> {
     let removed_no = located.inode;
     self.vol.rmdir(store, dir, name)?;
     self.remember_whiteout(store, dir, name, base.as_ref());
+    let at = self.vol.witness_clock();
     if let Some(plane) = self.vol.base.as_mut() {
-      plane.redirects.remove(&removed_no);
+      plane.forget_redirect(removed_no, at);
       if let Some(l) = plane.listings.remove(&removed_no) {
         self.host.close_dir(l.dir);
       }
@@ -1458,8 +1643,9 @@ impl Overlay<'_> {
       if let Child::Dir(h) = moved.child {
         let h = self.vol.make_current_dir_node(store, h)?;
         store.dirs.get_mut(h)?.origin = Some(from.clone().into());
+        let at = self.vol.witness_clock();
         if let (Some(entry), Some(plane)) = (from_base.as_ref(), self.vol.base.as_mut()) {
-          plane.redirects.insert(moved.inode, entry.fingerprint);
+          plane.record_redirect(moved.inode, entry.fingerprint, at);
         }
         let to_path = self.vol.path_of(store, to_dir, to_name);
         self.vol.record(
@@ -1641,7 +1827,7 @@ impl Overlay<'_> {
       .vol
       .base
       .as_ref()
-      .and_then(|b| b.witness_homes.get(&no).cloned())
+      .and_then(|b| b.witness_homes.head(&no).cloned())
     {
       let host_dir = self.listing_dir(parent)?;
       return Ok((host_dir, name.to_string()));
@@ -1725,11 +1911,9 @@ impl Overlay<'_> {
         b.base_len = fp.size;
       }
     }
-    let plane = self.plane()?;
-    plane.witnesses.insert(no, witness);
-    if let Some(home) = home_parent {
-      plane.witness_homes.insert(no, (home, name.clone().into()));
-    }
+    let at = self.vol.witness_clock();
+    let home = home_parent.map(|home| (home, name.clone().into()));
+    self.plane()?.record_witness(no, witness, home, at);
     if kind == CopyUp::Content && !large {
       // The small class: the bytes come in whole and the body becomes plain content.
       self.host.close_file(file);
@@ -2295,7 +2479,7 @@ impl Overlay<'_> {
       .vol
       .base
       .as_ref()
-      .map(|b| b.witnesses.keys().copied().collect())
+      .map(|b| b.witnesses.iter_head().map(|(no, _)| *no).collect())
       .unwrap_or_default();
     for no in witnessed {
       let _ = self.check_drift(store, no);
@@ -2365,7 +2549,7 @@ impl Overlay<'_> {
     }
     let all = std::mem::take(&mut plane.recheck_all);
     let dirs = std::mem::take(&mut plane.recheck);
-    let witnessed: Vec<InodeNo> = plane.witnesses.keys().copied().collect();
+    let witnessed: Vec<InodeNo> = plane.witnesses.iter_head().map(|(no, _)| *no).collect();
     let targets: Vec<InodeNo> = witnessed
       .into_iter()
       .filter(|no| {
@@ -2449,8 +2633,9 @@ impl Overlay<'_> {
       Child::Whiteout => {
         // The base no longer has the name: nothing to hide.
         self.drop_entry(store, dir, name)?;
+        let at = self.vol.witness_clock();
         if let Some(plane) = self.vol.base.as_mut() {
-          plane.whiteouts.remove(&(dir_no, name.into()));
+          plane.forget_whiteout(dir_no, name, at);
         }
       }
       Child::Dir(h) => {
@@ -2459,9 +2644,10 @@ impl Overlay<'_> {
         node.origin = None;
         node.base = BaseDirState::Merged;
         let no = node.inode;
+        let at = self.vol.witness_clock();
         if let Some(plane) = self.vol.base.as_mut() {
-          plane.redirects.remove(&no);
-          plane.whiteouts.remove(&(dir_no, name.into()));
+          plane.forget_redirect(no, at);
+          plane.forget_whiteout(dir_no, name, at);
           // The directory is on the disk now: its listing is read from there.
           if !plane.listings.contains_key(&no)
             && let Some(parent) = plane.listings.get(&dir_no).map(|l| l.dir)
@@ -2596,8 +2782,9 @@ impl Overlay<'_> {
         witnessed_at: self.vol.clock.monotonic_ns(),
         racy: false,
       };
+      let at = self.vol.witness_clock();
       let plane = self.plane()?;
-      plane.witnesses.insert(no, witness);
+      plane.record_witness(no, witness, None, at);
       plane.drift.remove(&no);
       let handle = self.vol.make_current_inode(store, no)?;
       let prev = store.inodes.get(handle)?.version;

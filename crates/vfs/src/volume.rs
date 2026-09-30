@@ -518,7 +518,7 @@ impl Volume {
       base: origin
         .base
         .as_ref()
-        .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1))),
+        .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1), epoch)),
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       state: VolumeState::Live,
@@ -2374,7 +2374,28 @@ impl Volume {
     if self.last_snapshot == Some(id) {
       self.last_snapshot = previous;
     }
-    for dead in removed.deadlist.items() {
+    self.hand_down_deadlist(store, &removed.deadlist, previous, prev_epoch)?;
+    let versions_freed = retained_before.saturating_sub(self.retained_versions());
+    let bytes_freed = bytes_before.saturating_sub(self.retained_bytes(store));
+    self.credit_retention(store, bytes_freed, versions_freed);
+    // The witness versions only this snapshot read go with it (A-48's bound).
+    let live: Vec<Epoch> = self.snapshots.iter().map(|(_, s)| s.epoch).collect();
+    if let Some(plane) = self.base.as_mut() {
+      plane.prune_versions(&live);
+    }
+    Ok(())
+  }
+
+  /// A destroyed snapshot's dead objects: those the previous snapshot still shares go on its deadlist,
+  /// those a clone's origin still shares stay, and the rest are released.
+  fn hand_down_deadlist(
+    &mut self,
+    store: &mut Store,
+    deadlist: &Deadlist,
+    previous: Option<SnapshotId>,
+    prev_epoch: Option<Epoch>,
+  ) -> Result<(), VfsError> {
+    for dead in deadlist.items() {
       match prev_epoch {
         Some(pe) if dead.born() <= pe => {
           if let Some(p) = previous
@@ -2391,9 +2412,6 @@ impl Volume {
         },
       }
     }
-    let versions_freed = retained_before.saturating_sub(self.retained_versions());
-    let bytes_freed = bytes_before.saturating_sub(self.retained_bytes(store));
-    self.credit_retention(store, bytes_freed, versions_freed);
     Ok(())
   }
 

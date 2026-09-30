@@ -2,11 +2,13 @@
 //! independent of overlay renames. Reacquisition opens each component without following links and
 //! requires the saved directory fingerprint; a replaced or unavailable source is a typed refusal.
 //! Cached listings, digests and watcher tokens are rebuilt, never mistaken for retained authority.
+//! The witness tables are kept with every version a snapshot still reads (A-48), so a recovered volume
+//! lands and clones its snapshots against the witnesses they froze.
 
-use super::{BaseConfig, BasePlane, DriftKind, Listing};
+use super::{BaseConfig, BasePlane, DriftKind, Listing, Version};
 use crate::error::VfsError;
 use crate::host::{HostDir, HostFacts, HostFs, WatchState};
-use crate::ids::InodeNo;
+use crate::ids::{Epoch, InodeNo};
 use crate::inode::{Fingerprint, Witness};
 use slates_wire::Wire;
 
@@ -17,25 +19,44 @@ struct Directory {
   fingerprint: Fingerprint,
 }
 
+/// One version of an inode's witness: from epoch `from`, the witness (or its removal).
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 struct Witnessed {
   inode: u64,
-  witness: Witness,
+  from: u64,
+  witness: Option<Witness>,
+}
+
+/// Where on the disk a witness was taken: the base directory's inode and the entry name there.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+struct Home {
   parent: u64,
   name: String,
 }
 
+/// One version of a witness's home.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+struct Homed {
+  inode: u64,
+  from: u64,
+  home: Option<Home>,
+}
+
+/// One version of a whiteout's hidden base fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 struct Whiteout {
   parent: u64,
   name: String,
-  fingerprint: Fingerprint,
+  from: u64,
+  fingerprint: Option<Fingerprint>,
 }
 
+/// One version of a redirect's moved base fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 struct Redirect {
   inode: u64,
-  fingerprint: Fingerprint,
+  from: u64,
+  fingerprint: Option<Fingerprint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -51,6 +72,7 @@ pub struct BaseImage {
   large_class_bytes: u64,
   directories: Vec<Directory>,
   witnesses: Vec<Witnessed>,
+  homes: Vec<Homed>,
   whiteouts: Vec<Whiteout>,
   redirects: Vec<Redirect>,
   drift: Vec<Drift>,
@@ -80,42 +102,56 @@ impl BasePlane {
         })
       })
       .collect::<Result<_, VfsError>>()?;
-    let witnesses = self
+    // The head's witnesses each keep their home: drift checks and descriptors need it.
+    if self
       .witnesses
-      .iter()
-      .map(|(inode, witness)| {
-        let (parent, name) = self
-          .witness_homes
-          .get(inode)
-          .ok_or(VfsError::RecoveryIncomplete)?;
-        Ok(Witnessed {
-          inode: inode.0,
-          witness: *witness,
-          parent: parent.0,
-          name: name.to_string(),
-        })
-      })
-      .collect::<Result<_, VfsError>>()?;
+      .iter_head()
+      .any(|(inode, _)| !self.witness_homes.head_has(inode))
+    {
+      return Err(VfsError::RecoveryIncomplete);
+    }
     Ok(BaseImage {
       granularity_ns: self.facts.timestamp_granularity_ns,
       large_class_bytes: self.large_class_bytes,
       directories,
-      witnesses,
+      witnesses: self
+        .witnesses
+        .versions()
+        .map(|(inode, version)| Witnessed {
+          inode: inode.0,
+          from: version.from.0,
+          witness: version.value,
+        })
+        .collect(),
+      homes: self
+        .witness_homes
+        .versions()
+        .map(|(inode, version)| Homed {
+          inode: inode.0,
+          from: version.from.0,
+          home: version.value.as_ref().map(|(parent, name)| Home {
+            parent: parent.0,
+            name: name.to_string(),
+          }),
+        })
+        .collect(),
       whiteouts: self
         .whiteouts
-        .iter()
-        .map(|((parent, name), fingerprint)| Whiteout {
+        .versions()
+        .map(|((parent, name), version)| Whiteout {
           parent: parent.0,
           name: name.to_string(),
-          fingerprint: *fingerprint,
+          from: version.from.0,
+          fingerprint: version.value,
         })
         .collect(),
       redirects: self
         .redirects
-        .iter()
-        .map(|(inode, fingerprint)| Redirect {
+        .versions()
+        .map(|(inode, version)| Redirect {
           inode: inode.0,
-          fingerprint: *fingerprint,
+          from: version.from.0,
+          fingerprint: version.value,
         })
         .collect(),
       drift: self
@@ -181,30 +217,16 @@ impl BasePlane {
       if !plane.listings.contains_key(&root_no) {
         return Err(VfsError::RecoveryIncomplete);
       }
-      for entry in &image.witnesses {
-        if !plane.listings.contains_key(&InodeNo(entry.parent))
-          || plane
-            .witnesses
-            .insert(InodeNo(entry.inode), entry.witness)
-            .is_some()
-        {
-          return Err(VfsError::RecoveryIncomplete);
-        }
-        plane.witness_homes.insert(
-          InodeNo(entry.inode),
-          (InodeNo(entry.parent), entry.name.as_str().into()),
-        );
-      }
-      for entry in &image.whiteouts {
-        plane.whiteouts.insert(
-          (InodeNo(entry.parent), entry.name.as_str().into()),
-          entry.fingerprint,
-        );
-      }
-      for entry in &image.redirects {
-        plane
-          .redirects
-          .insert(InodeNo(entry.inode), entry.fingerprint);
+      restore_versions(&mut plane, image)?;
+      // Every head witness keeps a home in a reacquired directory, as it did when it was imaged.
+      let homeless = plane.witnesses.iter_head().any(|(inode, _)| {
+        !plane
+          .witness_homes
+          .head(inode)
+          .is_some_and(|(parent, _)| plane.listings.contains_key(parent))
+      });
+      if homeless {
+        return Err(VfsError::RecoveryIncomplete);
       }
       for entry in &image.drift {
         plane.drift.insert(InodeNo(entry.inode), entry.kind);
@@ -222,6 +244,52 @@ impl BasePlane {
       return Err(error);
     }
     Ok(plane)
+  }
+}
+
+/// Rebuilds the versioned witness tables from the image, refusing any table whose versions do not run
+/// forward in epoch order: that is not a history the plane recorded.
+fn restore_versions(plane: &mut BasePlane, image: &BaseImage) -> Result<(), VfsError> {
+  let refused = |_| VfsError::RecoveryIncomplete;
+  for entry in &image.witnesses {
+    plane
+      .witnesses
+      .restore(InodeNo(entry.inode), version(entry.from, entry.witness))
+      .map_err(refused)?;
+  }
+  for entry in &image.homes {
+    let home = entry
+      .home
+      .as_ref()
+      .map(|home| (InodeNo(home.parent), home.name.as_str().into()));
+    plane
+      .witness_homes
+      .restore(InodeNo(entry.inode), version(entry.from, home))
+      .map_err(refused)?;
+  }
+  for entry in &image.whiteouts {
+    plane
+      .whiteouts
+      .restore(
+        (InodeNo(entry.parent), entry.name.as_str().into()),
+        version(entry.from, entry.fingerprint),
+      )
+      .map_err(refused)?;
+  }
+  for entry in &image.redirects {
+    plane
+      .redirects
+      .restore(InodeNo(entry.inode), version(entry.from, entry.fingerprint))
+      .map_err(refused)?;
+  }
+  Ok(())
+}
+
+/// A recorded version from epoch `from`.
+fn version<V>(from: u64, value: Option<V>) -> Version<V> {
+  Version {
+    from: Epoch(from),
+    value,
   }
 }
 
