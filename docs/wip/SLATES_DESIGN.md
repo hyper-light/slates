@@ -70,21 +70,26 @@ their numbers.
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
 | R10 | Disk is written only on a user permission grant. | A grant is a database record created only by the CLI or a confirmation surface a human operates; the MCP server and the SDKs have no verb that creates one; the landing engine refuses without a grant bound to the exact manifest it is about to write; every grant, manifest, and outcome is in the audit log (§4.15). |
 
-**R1's access and residency contract (A-50, 2026-09-30; audit §9; decided by Ada, 2026-09-30).** The
-baseline requirement is literal zero disk access, and that includes `/tmp` and every other temporary
-directory. It is not a capability or a deployment option; there is no mode in which more disk access is
-allowed. Exactly two disk contacts are sanctioned, and nothing else: reading the host directory an overlay
-volume sits on (`slates-base`, read-only), and writing a landing a human granted, inside its target only
-(`slates-land`: its entries, hidden temporaries, entries moved aside and any kept beside their names). Every
-other current path that touches a disk-backed file is a defect against this requirement, recorded here and in
-GAPS until it is removed:
+**R1's access and residency contract (A-50, 2026-09-30; audit §9; decided by Ada, 2026-09-30).** slates is
+pure in memory: literal zero disk access is the baseline requirement — the entire point of the product —
+not a capability, an option or a mode. No disk is touched until an explicit, human-granted landing, and the
+only reads are of a volume's base (a host directory, or a remote file server). That rules out `/tmp`, every
+temporary directory, and RAM-backed directories too: tmpfs, `/dev/shm` and RAM disks are still filesystems.
+It holds on every platform, Windows included, and it binds the tests and harnesses exactly as it binds the
+product: a test exercises a base or a landing through an in-memory host, never a directory it creates.
+Exactly two disk contacts are sanctioned, and nothing else: reading the base an overlay volume sits on
+(`slates-base`, read-only), and writing a landing a human granted, inside its target only (`slates-land`:
+its entries, hidden temporaries, entries moved aside and any kept beside their names). Every other current
+contact is a defect against this requirement, recorded here and in GAPS until it is removed:
 
 - the operator commands' reads of a fleet manifest, its certificates and key, resolver configuration, and a
   recovery key file (`slates-cli`);
 - the machine profile's queries of kernel pseudo-files (`slates-machine`) — kernel state, not disk files,
   but the path alone does not prove the backing object, so each interface is to be identified;
-- test fixtures and harnesses that create scratch under the system temporary directory (`mktemp -d -t`,
-  `$RUNNER_TEMP`) or persist property-test failures beside the source (AUD-29-63);
+- test fixtures and harnesses that create directories or files anywhere — `mktemp -d`, `$RUNNER_TEMP`,
+  mount points, landing targets, manifests — or persist property-test failures beside the source
+  (AUD-29-63). Their remedy is an in-memory seam (the daemon lands through an injected host, as the engine
+  does over its simulated host), never a RAM directory.
 
 Four separate claims follow from it, each needing its own evidence:
 
