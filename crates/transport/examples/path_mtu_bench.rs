@@ -158,7 +158,7 @@ fn one_run(payload: &'static [u8]) -> Run {
   })
   .unwrap();
   let run = result_rx.recv().unwrap();
-  let _ = rt.shutdown();
+  rt.shutdown().unwrap();
   run
 }
 

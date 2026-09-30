@@ -53,6 +53,12 @@ pub enum RtError {
   },
   /// A memory refusal beneath the runtime.
   Mem(MemError),
+  /// A shard's worker thread ended without a result: it panicked (AUD-29-12). Its slot was still given
+  /// back and its siblings still stopped and joined.
+  WorkerFailed {
+    /// The shard.
+    shard: u16,
+  },
 }
 
 impl fmt::Display for RtError {
@@ -70,6 +76,7 @@ impl fmt::Display for RtError {
       Self::ControlFull { shard } => write!(f, "shard {shard}'s control channel is full"),
       Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
       Self::Mem(e) => write!(f, "memory: {e}"),
+      Self::WorkerFailed { shard } => write!(f, "shard {shard}'s worker ended without a result"),
     }
   }
 }

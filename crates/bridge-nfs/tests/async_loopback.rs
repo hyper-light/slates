@@ -241,7 +241,7 @@ fn a_client_mounts_and_reads_a_file_over_the_async_server() {
   );
 
   drop(stream);
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// T-3.4 / §4.3: two queued RPCs must leave a turn between replies, even when the socket

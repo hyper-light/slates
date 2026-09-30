@@ -1576,7 +1576,7 @@ fn run_burst(
       .daemon_a
       .fleet_members()
       .is_ok_and(|members| members.contains(&fleet.host_b));
-  burst.shutdown();
+  burst.shutdown().unwrap();
   BurstOutcome {
     burst_done,
     reports,

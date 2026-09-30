@@ -101,11 +101,11 @@ fn a_tcp_request_and_reply_travel_through_the_driver() {
     }
     Ok(Err(e)) => panic!("the round trip failed: {e:?}"),
     Err(e) => {
-      let counters = rt.shutdown();
+      let counters = rt.shutdown().unwrap();
       panic!("timed out ({e}); counters {counters:#?}");
     }
   }
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// A listener bound, reduced to its bare descriptor, and re-adopted serves on the SAME port — the
@@ -174,11 +174,11 @@ fn a_listener_handed_over_by_descriptor_serves_on_the_same_port() {
     }
     Ok(Err(e)) => panic!("the round trip failed: {e:?}"),
     Err(e) => {
-      let counters = rt.shutdown();
+      let counters = rt.shutdown().unwrap();
       panic!("timed out ({e}); counters {counters:#?}");
     }
   }
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// Shape: an idle spin window far longer than any round trip, so a reply that waited for the window to
@@ -243,5 +243,5 @@ fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
     waited < REPLY_WITHIN,
     "the reply waited {waited:?}: a spinning shard must see socket readiness"
   );
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }

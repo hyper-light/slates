@@ -82,7 +82,7 @@ fn a_task_on_one_shard_is_woken_by_a_task_on_another() {
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
       Ok(m) => received.push(m),
       Err(e) => {
-        let counters = rt.shutdown();
+        let counters = rt.shutdown().unwrap();
         panic!(
           "timed out ({e}) after {received:?}; waiter word {}; flag {}; counters {counters:#?}",
           WAITER.load(Ordering::Acquire),
@@ -99,7 +99,7 @@ fn a_task_on_one_shard_is_woken_by_a_task_on_another() {
     got,
     vec!["signaller done on shard 1", "waiter woke on shard 0"]
   );
-  let counters = rt.shutdown();
+  let counters = rt.shutdown().unwrap();
   assert_eq!(counters.len(), 2);
   assert!(
     counters.iter().all(|c| c.nested_borrows == 0),
@@ -122,7 +122,7 @@ fn shutdown_cancels_running_tasks_and_joins_the_threads() {
   }
   // Let the spawns land before the shutdown message.
   std::thread::yield_now();
-  let counters = rt.shutdown();
+  let counters = rt.shutdown().unwrap();
   assert_eq!(counters.len(), 3);
   let cancelled: u64 = counters.iter().map(|c| c.cancelled).sum();
   let spawned: u64 = counters.iter().map(|c| c.spawns).sum();

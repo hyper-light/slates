@@ -85,7 +85,7 @@ fn a_burst_past_one_batch_is_drained_whole_and_the_shutdown_behind_it_lands() {
   );
   let (done_tx, done_rx) = std::sync::mpsc::channel();
   std::thread::spawn(move || {
-    rt.shutdown();
+    rt.shutdown().unwrap();
     let _ = done_tx.send(());
   });
   done_rx

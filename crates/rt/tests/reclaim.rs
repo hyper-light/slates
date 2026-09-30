@@ -98,7 +98,7 @@ fn a_shut_down_runtimes_slot_is_reclaimed_so_more_runtimes_than_slots_may_run_in
       panic!("runtime {round} refused after {round} shut-down runtimes: {e:?}")
     });
     assert_eq!(runtime.shard_ids().len(), 1);
-    let _ = runtime.shutdown();
+    runtime.shutdown().unwrap();
   }
 }
 
@@ -111,10 +111,10 @@ fn a_shut_down_runtime_closes_every_descriptor_it_opened() {
   let _serial = serial();
   // One warm-up cycle so lazily-opened process-wide descriptors (the thread-local storage of the
   // first shard thread, the allocator's) are in the baseline.
-  let _ = Runtime::start(&config(2)).unwrap().shutdown();
+  Runtime::start(&config(2)).unwrap().shutdown().unwrap();
   let baseline = open_descriptors();
   for _ in 0..64 {
-    let _ = Runtime::start(&config(2)).unwrap().shutdown();
+    Runtime::start(&config(2)).unwrap().shutdown().unwrap();
   }
   let after = open_descriptors();
   assert!(
@@ -161,7 +161,7 @@ fn shutdown_releases_a_listener_with_an_armed_readiness_wait() {
     })
     .unwrap();
   let observed = received.recv_timeout(std::time::Duration::from_secs(5));
-  let counters = runtime.shutdown();
+  let counters = runtime.shutdown().unwrap();
   observed.expect("the listener's readiness wait was armed before shutdown");
   assert_eq!(counters[0].cancelled, 1, "shutdown cancelled the listener");
   drop(bind_abstract_listener(&address));
@@ -231,7 +231,7 @@ fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
   let id = first.shard_ids()[0];
   first.spawn_on(id, Capture(tx)).unwrap();
   let waker = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-  let _ = first.shutdown();
+  first.shutdown().unwrap();
 
   let second = Runtime::start(&config(1)).unwrap();
   assert_eq!(
@@ -256,7 +256,7 @@ fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
     .expect("the new holder polled its own task");
   let before = slates_rt::registry::stale_wakes(id.0);
   waker.wake_by_ref();
-  let counters = second.shutdown();
+  let counters = second.shutdown().unwrap();
   let after = slates_rt::registry::stale_wakes(id.0);
   assert_eq!(
     after, before,
@@ -290,7 +290,7 @@ fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
 
   let first = Runtime::start(&config(1)).unwrap();
   let id = first.shard_ids()[0];
-  let _ = first.shutdown();
+  first.shutdown().unwrap();
   slates_rt::registry::note_arena_generation(id.0, slates_mem::Encoded::MAX_GENERATION);
 
   let second = Runtime::start(&config(1)).unwrap();
@@ -321,7 +321,7 @@ fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
   );
   let before = slates_rt::registry::stale_wakes(id.0);
   stale.wake_by_ref();
-  let counters = second.shutdown();
+  let counters = second.shutdown().unwrap();
   assert_eq!(
     counters[0].completed, 2,
     "the stale wake polled nothing extra"
@@ -342,5 +342,5 @@ fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
     id,
     "a slot whose wake generations are spent is never reissued"
   );
-  let _ = third.shutdown();
+  third.shutdown().unwrap();
 }

@@ -316,7 +316,7 @@ fn the_loop_serves_kicks_through_the_driver_and_ends_on_hangup() {
   let reclaimed = end.reclaimed.expect("the terminal step ran");
   assert!(reclaimed.references_swept);
   assert_eq!(reclaimed.credits_restored, (8, 1 << 20));
-  let _ = rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// A revoke request from the shard wakes the loop out of its wait on the doorbell and ends it
@@ -361,7 +361,7 @@ fn a_revoke_request_wakes_the_loop_and_reclaims() {
     !second || end.passes > 0,
     "a second request after the end finds no loop"
   );
-  let _ = rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// An in-process seam has no doorbell for a loop to wait on: the loop ends at once, naming it, and
@@ -396,5 +396,5 @@ fn a_seam_without_a_doorbell_ends_the_loop_at_once() {
   assert_eq!(end.why, EndReason::NoDoorbell);
   assert!(end.reclaimed.is_ok());
   assert_eq!((end.wakes, end.passes), (0, 0));
-  let _ = rt.shutdown();
+  rt.shutdown().unwrap();
 }

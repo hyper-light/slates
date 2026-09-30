@@ -12,7 +12,7 @@ use slates_machine::{Derived, MachineProfile, derived};
 use slates_mem::SpscRing;
 
 use crate::control::Control;
-use crate::driver::{DriverSeed, Kick, os_driver};
+use crate::driver::{DriverSeed, Kick, Prepared, os_driver};
 use crate::error::RtError;
 use crate::registry;
 use crate::shard::{Counters, ShardContext, ShardId, ShardSeed, TaskId};
@@ -273,9 +273,22 @@ pub(crate) fn register_kick(_fd: Option<()>) -> registry::RegisterKick {
   registry::RegisterKick::Kick(Kick::None)
 }
 
-/// The OS runtime: one thread per shard.
+/// One shard's worker: its id and the thread running it, whose result is the shard's counters or why it
+/// could not run.
+struct Worker {
+  id: u16,
+  thread: JoinHandle<Result<Counters, RtError>>,
+}
+
+/// The OS runtime: one thread per shard. It owns its workers from start to a terminal state (AUD-29-12):
+/// `start` is transactional — every shard's context is built and acknowledged before it returns, and any
+/// failure stops and joins the workers that did start and gives every registry slot back before the typed
+/// refusal returns — and a runtime dropped without [`Runtime::shutdown`] stops and joins its workers in
+/// `Drop`. Until 2026-09-30 a worker whose context failed to build returned default counters under a
+/// successful start, a failure part-way through `start` detached the threads already spawned and kept
+/// their slots, and dropping the value detached every worker.
 pub struct Runtime {
-  threads: Vec<JoinHandle<Counters>>,
+  workers: Vec<Worker>,
   ids: Vec<ShardId>,
   notes: Vec<String>,
 }
@@ -288,59 +301,184 @@ impl std::fmt::Debug for Runtime {
   }
 }
 
+impl Drop for Runtime {
+  /// A runtime dropped without [`Runtime::shutdown`] stops, cancels and joins its workers and gives their
+  /// slots back, exactly as `shutdown` would; a worker's failure is reported on the error stream, the one
+  /// place a drop can put it.
+  fn drop(&mut self) {
+    if self.workers.is_empty() {
+      return;
+    }
+    if let Err(error) = stop(std::mem::take(&mut self.workers)) {
+      eprintln!("slates-rt: a runtime dropped without shutdown: {error}");
+    }
+  }
+}
+
+/// A shard's worker body: builds the context on this thread (pinned first, so the arena and rings are
+/// first touched on the shard's own core), acknowledges the build — or its refusal — on `ready`, then runs
+/// the loop and frees the context. The acknowledgement's sender is dropped with it, so a worker that ends
+/// before acknowledging is seen as gone rather than awaited.
+fn run_worker(
+  seed: ShardSeed,
+  core: Option<u32>,
+  ready: std::sync::mpsc::SyncSender<(u16, Result<(), RtError>)>,
+) -> Result<Counters, RtError> {
+  let id = seed.id;
+  let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
+  let ctx = match ShardContext::build(seed) {
+    Ok(ctx) => ctx,
+    Err(error) => {
+      let _ = ready.send((id, Err(error.clone())));
+      return Err(error);
+    }
+  };
+  let _ = ready.send((id, Ok(())));
+  drop(ready);
+  if let Some((core, Pinning::Refused)) = pinned {
+    ctx.note_pin_refused();
+    log_pin_refused(ctx.id, core);
+  }
+  ctx.run();
+  let counters = ctx.counters();
+  // The loop has returned on this thread: the current-context cell is cleared, the arena is
+  // empty, and nothing foreign dereferences a context — so this thread, which built it,
+  // frees it. The slot's entry stays (retired by `stop`'s `unregister` after the join).
+  registry::reclaim_context(id);
+  Ok(counters)
+}
+
+/// Stops every worker (a shutdown message, retried while the shard's control channel is full), joins them
+/// all, and then gives every slot back — after every join, never before, since a shard's pair rings are lent
+/// to its peers. The counters in shard order, or the first worker's failure (every worker is still joined
+/// and every slot still given back).
+fn stop(workers: Vec<Worker>) -> Result<Vec<Counters>, RtError> {
+  for worker in &workers {
+    // A full control channel refuses the message; the shard drains its channel as it runs, so the send is
+    // retried until it lands or the shard is gone. Before 2026-09-17 the refusal was dropped, and the join
+    // then waited for a shutdown the shard never received (`tests/admission.rs`).
+    while let Err(RtError::ControlFull { .. }) =
+      registry::send_control(worker.id, Control::Shutdown)
+    {
+      std::thread::yield_now();
+    }
+  }
+  let ids: Vec<u16> = workers.iter().map(|worker| worker.id).collect();
+  let mut counters = Vec::with_capacity(workers.len());
+  let mut failure = None;
+  for worker in workers {
+    let id = worker.id;
+    match worker.thread.join() {
+      Ok(Ok(shard)) => counters.push(shard),
+      Ok(Err(error)) => {
+        failure.get_or_insert(error);
+      }
+      Err(_) => {
+        failure.get_or_insert(RtError::WorkerFailed { shard: id });
+      }
+    }
+  }
+  for id in ids {
+    registry::unregister(id);
+  }
+  match failure {
+    Some(error) => Err(error),
+    None => Ok(counters),
+  }
+}
+
+/// Gives back the slots of seeds that never became workers.
+fn release_seeds(seeds: Vec<ShardSeed>) {
+  let ids: Vec<u16> = seeds.iter().map(|seed| seed.id).collect();
+  drop(seeds);
+  for id in ids {
+    registry::unregister(id);
+  }
+}
+
+/// Registers `config.shards` seeds over drivers `prepare` makes, pairing their rings; on any refusal every
+/// slot claimed so far is given back.
+fn register_seeds(
+  config: &RuntimeConfig,
+  prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
+  notes: &mut Vec<String>,
+) -> Result<Vec<ShardSeed>, RtError> {
+  let mut seeds = Vec::new();
+  for _ in 0..config.shards {
+    let registered = prepare().and_then(|prepared| {
+      notes.extend(prepared.notes);
+      ShardSeed::register(config, prepared.seed, register_kick(prepared.kick_fd))
+    });
+    match registered {
+      Ok(seed) => seeds.push(seed),
+      Err(error) => {
+        release_seeds(seeds);
+        return Err(error);
+      }
+    }
+  }
+  if let Err(error) = connect_pairs(&mut seeds) {
+    release_seeds(seeds);
+    return Err(error);
+  }
+  Ok(seeds)
+}
+
 impl Runtime {
   /// Starts `config.shards` shard threads on the OS drivers.
   pub fn start(config: &RuntimeConfig) -> Result<Runtime, RtError> {
-    let mut seeds = Vec::new();
+    let entries = u32::try_from(config.ring_entries).unwrap_or(u32::MAX);
+    Self::start_with(config, &mut || os_driver(entries))
+  }
+
+  /// Starts `config.shards` shard threads over the drivers `prepare` makes, one call per shard: the OS
+  /// drivers ([`Runtime::start`]) or a test double, as [`LocalRuntime::with_driver`] takes one. Returns once
+  /// every shard's context is built on its own thread; any refusal — a driver `prepare` refuses, a
+  /// registration, a thread the OS will not spawn, a context that fails to build — stops and joins the
+  /// workers already started, gives every slot back, and returns that refusal.
+  pub fn start_with(
+    config: &RuntimeConfig,
+    prepare: &mut dyn FnMut() -> Result<Prepared, RtError>,
+  ) -> Result<Runtime, RtError> {
     let mut notes = Vec::new();
-    for _ in 0..config.shards {
-      let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
-      notes.extend(prepared.notes);
-      seeds.push(ShardSeed::register(
-        config,
-        prepared.seed,
-        register_kick(prepared.kick_fd),
-      )?);
-    }
-    connect_pairs(&mut seeds)?;
+    let seeds = register_seeds(config, prepare, &mut notes)?;
     let ids: Vec<ShardId> = seeds.iter().map(|s| ShardId(s.id)).collect();
-    let mut threads = Vec::new();
-    for (index, seed) in seeds.into_iter().enumerate() {
+    let (ready, acknowledged) = std::sync::mpsc::sync_channel(seeds.len().max(1));
+    let mut workers = Vec::with_capacity(seeds.len());
+    let mut seeds = seeds.into_iter().enumerate();
+    while let Some((index, seed)) = seeds.next() {
       let core = if config.pin {
         config.cores.get(index).copied()
       } else {
         None
       };
-      let thread = std::thread::Builder::new()
-        .name(format!("slates-shard-{}", seed.id))
-        .spawn(move || {
-          // Fixed before the context is built, so the arena and rings are first touched on the shard's own
-          // core (and NUMA node).
-          let pinned = core.map(|core| (core, slates_machine::probes::pin_current_thread(core)));
-          let Ok(ctx) = ShardContext::build(seed) else {
-            return Counters::default();
+      let id = seed.id;
+      let ready = ready.clone();
+      let spawned = std::thread::Builder::new()
+        .name(format!("slates-shard-{id}"))
+        .spawn(move || run_worker(seed, core, ready));
+      match spawned {
+        Ok(thread) => workers.push(Worker { id, thread }),
+        Err(error) => {
+          // The seed moved into the refused closure and is dropped with it; its slot, and the rest, go back.
+          registry::unregister(id);
+          release_seeds(seeds.map(|(_, seed)| seed).collect());
+          let refusal = RtError::DriverRefused {
+            call: "thread spawn",
+            code: error.raw_os_error(),
           };
-          if let Some((core, Pinning::Refused)) = pinned {
-            ctx.note_pin_refused();
-            log_pin_refused(ctx.id, core);
-          }
-          let id = ctx.id;
-          ctx.run();
-          let counters = ctx.counters();
-          // The loop has returned on this thread: the current-context cell is cleared, the arena is
-          // empty, and nothing foreign dereferences a context — so this thread, which built it,
-          // frees it. The slot's entry stays (retired by `shutdown`'s `unregister` after the join).
-          registry::reclaim_context(id);
-          counters
-        })
-        .map_err(|e| RtError::DriverRefused {
-          call: "thread spawn",
-          code: e.raw_os_error(),
-        })?;
-      threads.push(thread);
+          roll_back(workers, &refusal);
+          return Err(refusal);
+        }
+      }
+    }
+    drop(ready);
+    if let Err(error) = await_readiness(&acknowledged, &workers) {
+      roll_back(workers, &error);
+      return Err(error);
     }
     Ok(Runtime {
-      threads,
+      workers,
       ids,
       notes,
     })
@@ -394,31 +532,45 @@ impl Runtime {
     registry::send_control(task.0.shard(), Control::Cancel(task.0))
   }
 
-  /// Shuts every shard down (cancelling what runs) and joins the threads; returns the counters.
-  pub fn shutdown(self) -> Vec<Counters> {
-    for id in &self.ids {
-      // A full control channel refuses the message; the shard drains its channel as it runs, so the
-      // send is retried until it lands or the shard is gone. Before 2026-09-17 the refusal was
-      // dropped, and the join below then waited for a shutdown the shard never received: a runtime
-      // shut down while a shard's channel was full (a burst of submissions behind a long poll) hung
-      // for good (`tests/admission.rs`). The wait is bounded by the shard's next drain — a shard that
-      // never drains again would hang the join just the same.
-      while let Err(RtError::ControlFull { .. }) = registry::send_control(id.0, Control::Shutdown) {
-        std::thread::yield_now();
+  /// Shuts every shard down (cancelling what runs), joins every worker and gives every slot back; the
+  /// counters in shard order, or the first worker's failure (typed; every worker is still joined and every
+  /// slot still given back).
+  pub fn shutdown(mut self) -> Result<Vec<Counters>, RtError> {
+    stop(std::mem::take(&mut self.workers))
+  }
+}
+
+/// Stops and joins the workers of a start that failed with `refusal`, giving every slot back. A failure of
+/// the rollback other than the refusal itself (a sibling that panicked meanwhile) is reported on the error
+/// stream, since the start returns the refusal that caused it.
+fn roll_back(workers: Vec<Worker>, refusal: &RtError) {
+  if let Err(error) = stop(workers)
+    && error != *refusal
+  {
+    eprintln!("slates-rt: rolling back a start refused ({refusal}) also found: {error}");
+  }
+}
+
+/// Waits for every worker to acknowledge its build: the first refusal, or `WorkerFailed` for a worker that
+/// ended without acknowledging (its sender dropped with it), so no failed shard is ever advertised.
+fn await_readiness(
+  acknowledged: &std::sync::mpsc::Receiver<(u16, Result<(), RtError>)>,
+  workers: &[Worker],
+) -> Result<(), RtError> {
+  for _ in workers {
+    match acknowledged.recv() {
+      Ok((_, Ok(()))) => {}
+      Ok((_, Err(error))) => return Err(error),
+      Err(_) => {
+        let silent = workers
+          .iter()
+          .find(|worker| worker.thread.is_finished())
+          .map_or(u16::MAX, |worker| worker.id);
+        return Err(RtError::WorkerFailed { shard: silent });
       }
     }
-    let counters: Vec<Counters> = self
-      .threads
-      .into_iter()
-      .map(|t| t.join().unwrap_or_default())
-      .collect();
-    // Every thread has ended: give every slot back (the kick descriptors close, the slots are
-    // reusable). After every join, never before — a shard's pair rings are lent to its peers.
-    for id in &self.ids {
-      registry::unregister(id.0);
-    }
-    counters
   }
+  Ok(())
 }
 
 /// One shard on the calling thread with the OS driver (tests, benches, the CLI's own work).

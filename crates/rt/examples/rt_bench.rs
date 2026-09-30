@@ -184,7 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       budget,
     ),
   );
-  let counters = two.shutdown();
+  let counters = two.shutdown()?;
   println!("shard counters after the round trips: {counters:?}");
 
   // The same round trip with each spawned task noted as client activity: the shard spins out the
@@ -214,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
       budget,
     ),
   );
-  let counters = two.shutdown();
+  let counters = two.shutdown()?;
   println!(
     "spin window {} ns; shard 1 spin hits {} misses {}",
     spinning.spin_ns, counters[1].spin_hits, counters[1].spin_misses
@@ -225,7 +225,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   for (label, spin_ns) in [("parking", 0), ("spinning", spinning.spin_ns)] {
     let mut cfg = config(2);
     cfg.spin_ns = spin_ns;
-    let (sample, hits, misses) = ping_pong(&cfg, spin_ns > 0);
+    let (sample, hits, misses) = ping_pong(&cfg, spin_ns > 0)?;
     let interval =
       bootstrap_interval(&sample, &mut Xorshift::new(Xorshift::SEED)).unwrap_or(Interval {
         median: 0,
@@ -288,15 +288,15 @@ fn note_turn(active: bool) {
 
 /// Runs `rounds` ping-pongs between a task on shard 0 and a task on shard 1; returns the
 /// per-round-trip sample measured on side 0 and shard 1's spin counters.
-fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
+fn ping_pong(
+  cfg: &RuntimeConfig,
+  active: bool,
+) -> Result<(Sample, u64, u64), slates_rt::error::RtError> {
   /// Shape: enough rounds for the bootstrap interval to mean something; a few milliseconds.
   const ROUNDS: u64 = 2000;
   TURN.store(0, Ordering::Release);
   REGISTERED.store(0, Ordering::Release);
-  let rt = match Runtime::start(cfg) {
-    Ok(rt) => rt,
-    Err(_) => return (Sample::new(Vec::new()), 0, 0),
-  };
+  let rt = Runtime::start(cfg)?;
   let ids = rt.shard_ids().to_vec();
   let (tx, rx) = channel::<Vec<u64>>();
   let _ = rt.spawn_on(ids[1], async move {
@@ -331,10 +331,11 @@ fn ping_pong(cfg: &RuntimeConfig, active: bool) -> (Sample, u64, u64) {
   let times = rx.recv().unwrap_or_default();
   TURN.store(u64::MAX, Ordering::Release);
   wake_side(1);
-  let counters = rt.shutdown();
-  (
+  let counters = rt.shutdown()?;
+  let responder = counters.get(1).copied().unwrap_or_default();
+  Ok((
     Sample::new(times),
-    counters[1].spin_hits,
-    counters[1].spin_misses,
-  )
+    responder.spin_hits,
+    responder.spin_misses,
+  ))
 }

@@ -172,5 +172,5 @@ fn main() {
   // Keep the process alive while the runtime's shards serve; the demo runs until killed.
   let (_keep_alive, rx) = channel::<()>();
   let _ = rx.recv();
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }

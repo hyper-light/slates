@@ -1986,23 +1986,27 @@ impl Daemon {
 
   /// Stops the daemon: the doorbell thread, then every shard, joined.
   pub fn stop(mut self) {
+    self.stop_parts();
+  }
+
+  /// Stops the doorbell and the runtime if they still run. A shard worker that failed is reported on the
+  /// daemon's error stream, which its anchor keeps (every worker is still joined and every slot given back,
+  /// AUD-29-12); with `panic = "abort"` a release build never reaches here after a worker's panic.
+  fn stop_parts(&mut self) {
     if let Some(mut doorbell) = self.doorbell.take() {
       doorbell.stop();
     }
-    if let Some(runtime) = self.runtime.take() {
-      runtime.shutdown();
+    if let Some(runtime) = self.runtime.take()
+      && let Err(error) = runtime.shutdown()
+    {
+      eprintln!("slates-server: stopping the daemon's shards: {error}");
     }
   }
 }
 
 impl Drop for Daemon {
   fn drop(&mut self) {
-    if let Some(mut doorbell) = self.doorbell.take() {
-      doorbell.stop();
-    }
-    if let Some(runtime) = self.runtime.take() {
-      runtime.shutdown();
-    }
+    self.stop_parts();
   }
 }
 

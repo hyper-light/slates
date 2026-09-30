@@ -102,7 +102,7 @@ fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
     entry.kick.kick();
   }
   let woken = wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 2);
-  let counters = rt.shutdown();
+  let counters = rt.shutdown().unwrap();
   let shard_counters = &counters[0];
   assert!(
     shard_counters.spin_hits >= 1,

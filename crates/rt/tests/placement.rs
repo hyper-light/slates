@@ -104,7 +104,7 @@ mod linux {
       let (index, mask) = masks.recv_timeout(ANSWER).unwrap();
       out[index] = mask;
     }
-    rt.shutdown();
+    rt.shutdown().unwrap();
     out
   }
 

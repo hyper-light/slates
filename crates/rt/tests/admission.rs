@@ -88,7 +88,7 @@ fn a_receipt_names_the_admitted_task_and_the_task_runs() {
   ran
     .recv_timeout(WAIT)
     .expect("the admitted task ran and reported");
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// Whether the fillers may end (the arena test's release flag).
@@ -152,7 +152,7 @@ fn a_full_arena_refuses_on_the_receipt_and_admits_once_a_task_ends() {
       other => panic!("after the release the submission met {other:?}"),
     }
   }
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }
 
 /// A request the shard drains after its shutdown began is terminated unadmitted: the receipt says
@@ -165,7 +165,7 @@ fn a_request_drained_during_shutdown_is_terminated_on_its_receipt() {
   // Queued behind the hold, in this order: the shutdown, then the request.
   registry::send_control(shard.0, Control::Shutdown).unwrap();
   let (receipt, ran) = submit_reporter(&rt, shard);
-  let counters = rt.shutdown();
+  let counters = rt.shutdown().unwrap();
   assert_eq!(receipt.wait(WAIT), Some(Admission::Terminated));
   assert!(
     ran.recv_timeout(QUIET).is_err(),
@@ -186,7 +186,7 @@ fn a_submission_pinned_to_a_holder_is_refused_once_its_slot_is_reused() {
   let first = Runtime::start(&config(ARENA)).unwrap();
   let shard = first.shard_ids()[0];
   let holder = first.holder_of(shard).unwrap();
-  first.shutdown();
+  first.shutdown().unwrap();
   assert!(
     matches!(
       submit_to_holder(holder, async {}),
@@ -222,7 +222,7 @@ fn a_submission_pinned_to_a_holder_is_refused_once_its_slot_is_reused() {
     rx.recv_timeout(WAIT)
       .expect("by id alone, the reused slot's new holder ran a task meant for the old one");
   }
-  second.shutdown();
+  second.shutdown().unwrap();
 }
 
 /// A shutdown whose message first meets a full control channel still lands and completes: the send
@@ -244,7 +244,7 @@ fn a_shutdown_lands_against_a_full_control_channel() {
   assert!(queued >= 1, "the channel filled behind the hold");
   let (done_tx, done_rx) = channel();
   std::thread::spawn(move || {
-    rt.shutdown();
+    rt.shutdown().unwrap();
     let _ = done_tx.send(());
   });
   done_rx

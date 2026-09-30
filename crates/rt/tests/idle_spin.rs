@@ -113,5 +113,5 @@ fn a_shard_spins_only_inside_the_window_its_last_client_activity_opened() {
     spins(&after_window),
     "the shard spun after its client's window had ended: {later:?}"
   );
-  rt.shutdown();
+  rt.shutdown().unwrap();
 }

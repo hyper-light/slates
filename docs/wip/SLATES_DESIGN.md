@@ -977,6 +977,14 @@ checked and refuse before mutation.
 > refuses to pack a generation it cannot carry and compares exactly. A registry shard slot whose arena
 > generations or own slot word are spent is never claimed again
 > (`docs/bugs/2026-09-30-generation-wrap-revived-stale-handles.md`).
+>
+> **Status (2026-09-30, AUD-29-12).** A runtime owns its workers from start to a terminal state. `start`
+> returns only once every shard has built its context on its own thread and acknowledged it. Any refusal
+> (a driver, a registration, a thread spawn, a context build) stops and joins the workers already
+> started, gives every registry slot back, and returns typed; no failed shard is advertised. `shutdown`
+> joins every worker and gives every slot back before it reports the first failure typed (a panic is
+> `WorkerFailed`). A runtime dropped without `shutdown` does the same in `Drop`
+> (`docs/bugs/2026-09-30-runtime-start-and-drop-orphaned-workers.md`).
 
 Before admitting content, the server prepares and locks the memory that will back it and its
 metadata. This includes rings, logs, parse buffers, decompression, copies, archive construction,

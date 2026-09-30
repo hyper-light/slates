@@ -66,11 +66,11 @@ fn a_shut_down_runtimes_context_heap_is_given_back() {
   let before = resident_kib();
   let warm = Runtime::start(&config()).unwrap();
   let live = resident_kib();
-  warm.shutdown();
+  warm.shutdown().unwrap();
   let footprint = live.saturating_sub(before);
   let after_warm = resident_kib();
   for _ in 0..CYCLES {
-    let _ = Runtime::start(&config()).unwrap().shutdown();
+    Runtime::start(&config()).unwrap().shutdown().unwrap();
   }
   let after = resident_kib();
   let growth = after.saturating_sub(after_warm);

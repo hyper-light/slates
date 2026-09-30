@@ -47,7 +47,7 @@ fn shutdown_within(rt: Runtime, context: &str) -> Result<(), String> {
   let shard = rt.shard_ids()[0];
   let (done_tx, done_rx) = channel();
   let stopper = std::thread::spawn(move || {
-    let counters = rt.shutdown();
+    let counters = rt.shutdown().unwrap();
     let _ = done_tx.send(counters);
   });
   if done_rx.recv_timeout(SHUTDOWN_WAIT).is_ok() {
