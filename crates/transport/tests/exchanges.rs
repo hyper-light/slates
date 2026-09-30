@@ -507,9 +507,14 @@ struct HolOutcome {
 /// across a 1 Mbit/s bottleneck whose queue a bulk transfer keeps full, a control exchange completes in
 /// about one round trip plus the queue it cannot jump — never behind the transfer's unsent bytes. Do X
 /// (start a 250 kB bulk exchange, then twelve control pings on the same session), expect Y (every ping's
-/// latency ≤ RTT + one full queue's drain + four packets' serialization; the bulk transfer still running
-/// when the last ping completes — non-vacuous: the pings really overlapped it; both ends quiescent after).
-/// The single-exchange session this replaced made every ping wait for the whole transfer (~2 s).
+/// latency ≤ RTT + one full queue's drain + two packets' serialization — the packet on the wire when the
+/// ping is framed and one pacer gap; the bulk transfer still running when the last ping completes —
+/// non-vacuous: the pings really overlapped it; both ends quiescent after). The single-exchange session
+/// this replaced made every ping wait for the whole transfer (~2 s). The bound was four packets until
+/// 2026-09-30: that slack hid a ping waiting for connection credit the bulk exchange had spent (up to 68 ms;
+/// worst 118 ms, then red when the handshake's phase moved); with the class credit reserve the worst is
+/// 79 ms (seeds 1–3), and the bound is the design's
+/// (`docs/bugs/2026-09-30-bulk-spent-the-connection-credit-a-control-exchange-needed.md`).
 #[test]
 fn a_control_exchange_is_not_queued_behind_a_bulk_one_on_the_same_session() {
   let net = Net {
@@ -518,7 +523,7 @@ fn a_control_exchange_is_not_queued_behind_a_bulk_one_on_the_same_session() {
   };
   let serialization_ns = MIN_DATAGRAM_BYTES as u64 * 8 * NS_PER_SECOND / HOL_RATE;
   let queue_drain_ns = HOL_BDP_BYTES * 8 * NS_PER_SECOND / HOL_RATE;
-  let bound_ns = 2 * HOL_ONE_WAY_NS + queue_drain_ns + 4 * serialization_ns;
+  let bound_ns = 2 * HOL_ONE_WAY_NS + queue_drain_ns + 2 * serialization_ns;
   for seed in [1, 2, 3] {
     let report = run_session(seed, net, 64, ServerMode::Serve, hol_client);
     assert_clean(&format!("seed {seed}"), &report);
@@ -531,7 +536,7 @@ fn a_control_exchange_is_not_queued_behind_a_bulk_one_on_the_same_session() {
     let worst = outcome.ping_latencies_ns.iter().copied().max().unwrap_or(0);
     assert!(
       worst <= bound_ns,
-      "seed {seed}: the worst ping took {} ms, past the {} ms bound (RTT + queue + 4 packets): {:?}",
+      "seed {seed}: the worst ping took {} ms, past the {} ms bound (RTT + queue + 2 packets): {:?}",
       worst / MS,
       bound_ns / MS,
       outcome.ping_latencies_ns

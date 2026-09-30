@@ -55,6 +55,16 @@ pub enum Priority {
 impl Priority {
   /// Every class, most urgent first.
   pub const ALL: [Priority; 3] = [Priority::Control, Priority::Metadata, Priority::Bulk];
+
+  /// How many classes are more urgent than this one: the classes whose share of connection credit it leaves
+  /// untouched (`crate::connection::class_credit_reserve`).
+  pub fn classes_above(self) -> u64 {
+    match self {
+      Priority::Control => 0,
+      Priority::Metadata => 1,
+      Priority::Bulk => 2,
+    }
+  }
 }
 
 /// Which end of the session opened a stream.

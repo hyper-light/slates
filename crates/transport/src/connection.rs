@@ -63,6 +63,23 @@ pub fn initial_receive_window(max_frame_len: usize) -> u64 {
   (REORDER_THRESHOLD + 1).saturating_mul(stream_bytes_per_packet(max_frame_len))
 }
 
+/// The connection credit a sender of `class` leaves unspent for the classes above it, for a frame cap of
+/// `max_frame_len` (§4.10a; the constrained-link design §5.3: a control exchange never waits behind a bulk
+/// one — in the packet schedule *or* in the connection's flow-control credit).
+/// Derived: one packet's stream bytes per more urgent class — so the first packet of an exchange of any
+/// class above finds credit waiting, however much the classes below have queued, and needs no credit update
+/// from the peer (a round trip). The receiver advertises the largest of these, `class_credit_reserve(Bulk)`,
+/// on top of its stream window ([`FlowController`]), so a lone bulk stream still has its whole stream
+/// window: the reserve is headroom, never a cut. Both ends derive it from the same frame cap (R8). Until
+/// 2026-09-30 one bulk stream could spend the last byte of connection credit, and a control ping on the
+/// same session waited up to 68 ms of a 40 ms path for the peer's `MaxData`
+/// (`docs/bugs/2026-09-30-bulk-spent-the-connection-credit-a-control-exchange-needed.md`).
+pub fn class_credit_reserve(class: Priority, max_frame_len: usize) -> u64 {
+  class
+    .classes_above()
+    .saturating_mul(stream_bytes_per_packet(max_frame_len))
+}
+
 /// The most stream data one packet of `packet_budget` encoded frame bytes carries: the budget less one
 /// `Stream` frame's header.
 pub fn stream_bytes_per_packet(packet_budget: usize) -> u64 {
@@ -173,7 +190,8 @@ pub struct SendStops {
   pub window: u64,
   /// The pacer held the next packet.
   pub pacer: u64,
-  /// The peer's connection credit was spent.
+  /// The connection credit every class with data may spend was spent (a class leaves the classes above it
+  /// their reserve, [`class_credit_reserve`]).
   pub credit: u64,
   /// No stream had data it could send (none at all, or none within its stream credit).
   pub empty: u64,
@@ -268,6 +286,9 @@ pub struct Connection {
   connection_sent: u64,
   /// Send side: the connection-wide flow-control ceiling the peer has advertised (`MaxData`).
   peer_max_data: u64,
+  /// The frame cap the class credit reserves are derived from ([`class_credit_reserve`]) — the shape's, fixed
+  /// for the session, so both ends derive the same reserve whatever the path MTU search does later.
+  reserve_frame_cap: usize,
   /// ACK-of-ACK bookkeeping (RFC 9000 §13.2.4): for each ack-eliciting packet this end sent that also
   /// carried an acknowledgement, the largest packet number that acknowledgement covered.
   sent_acks: BTreeMap<u64, u64>,
@@ -322,7 +343,7 @@ enum FreshStop {
   Window,
   /// The pacer holds the next packet until the given time.
   Pacer(u64),
-  /// The peer's connection credit is spent.
+  /// The connection credit every class with data may spend is spent.
   Credit,
   /// No stream has data within its credit.
   Empty,
@@ -331,6 +352,7 @@ enum FreshStop {
 impl Connection {
   /// A fresh connection of `shape`, playing `role`.
   pub fn new(shape: ConnectionShape, role: Role) -> Connection {
+    let reserve_frame_cap = usize::try_from(shape.max_datagram).unwrap_or(usize::MAX);
     Connection {
       send_streams: BTreeMap::new(),
       send_order: PerClass::default(),
@@ -352,7 +374,11 @@ impl Connection {
       // the additional ones that fit the packet budget): beyond them a range could never be acknowledged
       // anyway, and the generator stays bounded however many packets arrive.
       acks: AckGenerator::new(ack_ranges_for(shape.max_datagram).saturating_add(1)),
-      flow: FlowController::new(shape.initial_window, shape.receive_ceiling),
+      flow: FlowController::new(
+        shape.initial_window,
+        shape.receive_ceiling,
+        class_credit_reserve(Priority::Bulk, reserve_frame_cap),
+      ),
       initial_window: shape.initial_window,
       ack_owed: false,
       retransmitted: 0,
@@ -367,9 +393,12 @@ impl Connection {
       probes_owed: 0,
       window_full_at: None,
       connection_sent: 0,
-      // The peer's initial connection credit is the initial window it advertises before any read; both
-      // ends derive the same one (R8).
-      peer_max_data: shape.initial_window,
+      // The peer's initial connection credit is what it advertises before any read — the initial window
+      // and the class reserve on top of it; both ends derive the same one (R8).
+      peer_max_data: shape
+        .initial_window
+        .saturating_add(class_credit_reserve(Priority::Bulk, reserve_frame_cap)),
+      reserve_frame_cap,
       sent_acks: BTreeMap::new(),
       duplicates: 0,
       violations: 0,
@@ -582,14 +611,7 @@ impl Connection {
   /// with a reliable, ack-eliciting `DataBlocked` / `StreamDataBlocked`, whose acknowledgement carries the
   /// credit. Each is sent once per limit; a raised limit that blocks again is reported again.
   fn note_blocked(&mut self) {
-    let data_waiting = self
-      .send_streams
-      .iter()
-      .any(|(&stream_id, sender)| self.streams.sendable(stream_id) && !sender.is_drained());
-    if data_waiting
-      && self.connection_sent >= self.peer_max_data
-      && self.blocked_sent != Some(self.peer_max_data)
-    {
+    if self.connection_credit_blocked() && self.blocked_sent != Some(self.peer_max_data) {
       self.blocked_sent = Some(self.peer_max_data);
       self.control.push_back(Frame::DataBlocked {
         limit: self.peer_max_data,
@@ -753,7 +775,8 @@ impl Connection {
       else {
         return FreshStop::Budget;
       };
-      let connection_credit = self.peer_max_data.saturating_sub(self.connection_sent);
+      // The most any class may spend: the most urgent class leaves no reserve.
+      let connection_credit = self.class_credit(Priority::Control);
       if connection_credit == 0 {
         return FreshStop::Credit;
       }
@@ -761,8 +784,9 @@ impl Connection {
       if !probe && !self.window_room(packing.data, cap) {
         return FreshStop::Window;
       }
-      let Some(frame) = self.next_fresh_frame(usize::try_from(cap).unwrap_or(usize::MAX)) else {
-        return FreshStop::Empty;
+      let frame = match self.next_fresh_frame(data_room) {
+        Ok(frame) => frame,
+        Err(stop) => return stop,
       };
       let data = tracked_bytes(&frame);
       self.connection_sent = self.connection_sent.saturating_add(data);
@@ -936,10 +960,59 @@ impl Connection {
   /// of the best scheduler in every scenario, against round-robin's 4.8×, and a weighted (deficit
   /// round-robin) scheduler that starved the control and metadata classes outright. The losers were
   /// deleted.
-  fn next_fresh_frame(&mut self, max_frame_len: usize) -> Option<Frame> {
-    Priority::ALL
-      .iter()
-      .find_map(|&class| self.round_robin_class(class, max_frame_len))
+  fn next_fresh_frame(&mut self, data_room: u64) -> Result<Frame, FreshStop> {
+    let mut held_by_credit = false;
+    for class in Priority::ALL {
+      let cap = data_room.min(self.class_credit(class));
+      if cap == 0 {
+        held_by_credit = held_by_credit || self.class_has_sendable(class);
+        continue;
+      }
+      if let Some(frame) = self.round_robin_class(class, usize::try_from(cap).unwrap_or(usize::MAX))
+      {
+        return Ok(frame);
+      }
+    }
+    Err(if held_by_credit {
+      FreshStop::Credit
+    } else {
+      FreshStop::Empty
+    })
+  }
+
+  /// The connection credit a stream of `class` may spend now: the peer's ceiling less what was sent, less
+  /// the reserve `class` leaves for the classes above it ([`class_credit_reserve`]).
+  fn class_credit(&self, class: Priority) -> u64 {
+    self
+      .peer_max_data
+      .saturating_sub(self.connection_sent)
+      .saturating_sub(class_credit_reserve(class, self.reserve_frame_cap))
+  }
+
+  /// Whether a stream of `class` has bytes it could frame now, within its stream credit.
+  fn class_has_sendable(&self, class: Priority) -> bool {
+    self.send_order.get(class).iter().any(|stream_id| {
+      self.streams.sendable(*stream_id)
+        && self
+          .send_streams
+          .get(stream_id)
+          .is_some_and(StreamSender::has_sendable)
+    })
+  }
+
+  /// Whether some class has data still to frame and no connection credit it may spend — the sender is
+  /// blocked at the peer's `MaxData` (RFC 9000 §4.1, §19.12) as far as that class can go.
+  fn connection_credit_blocked(&self) -> bool {
+    Priority::ALL.iter().any(|&class| {
+      self.class_credit(class) == 0
+        && self.send_order.get(class).iter().any(|stream_id| {
+          self.streams.sendable(*stream_id)
+            && self
+              .send_streams
+              .get(stream_id)
+              .is_some_and(|sender| !sender.is_drained())
+        })
+    })
   }
 
   /// The next frame of `stream_id`, if the peer's stream credit covers it and it has data within its
@@ -1314,7 +1387,7 @@ impl Connection {
       Frame::ResetStream { stream_id, .. } => self.resets_owed.contains(stream_id),
       // A blocked report is resent only while the sender is still blocked at the same limit.
       Frame::DataBlocked { limit } => {
-        *limit == self.peer_max_data && self.connection_sent >= self.peer_max_data
+        *limit == self.peer_max_data && self.connection_credit_blocked()
       }
       Frame::StreamsBlocked { limit } => self.streams.waiting_limit() == Some(*limit),
       Frame::StreamDataBlocked { stream_id, limit } => {
@@ -1454,7 +1527,9 @@ impl Connection {
     // The probe carries new data only if new data can actually leave now — a stream with data inside its
     // own credit but no connection credit left cannot, and a probe that sends nothing leaves the timer
     // firing at the same instant forever (found by the loss oracle, 2026-09-27).
-    let fresh_can_leave = self.has_fresh_data() && self.peer_max_data > self.connection_sent;
+    let fresh_can_leave = Priority::ALL
+      .iter()
+      .any(|&class| self.class_credit(class) > 0 && self.class_has_sendable(class));
     if !fresh_can_leave && self.retransmit.is_empty() {
       // No new data: the probe carries a copy of the oldest in-flight packet's frames (RFC 9002 §6.2.4);
       // the original stays in flight until acknowledged or declared lost. A probe is not a congestion
@@ -1787,9 +1862,9 @@ mod tests {
     sender.enable_path_mtu(9_000);
     let content = vec![7u8; usize::try_from(initial_receive_window(cap)).unwrap() * 2];
     open(&mut sender, &content);
-    // Send until the connection credit is spent, past each pacing release.
+    // Send until the stream has nothing its credit lets it send, past each pacing release.
     let mut now = 1_000;
-    while sender.connection_sent < sender.peer_max_data {
+    while sender.class_has_sendable(Priority::Metadata) {
       match sender.poll_transmit(now, cap) {
         Some((pn, frames)) => receiver.handle_incoming(now, pn, &frames),
         None => now = sender.next_timeout().unwrap_or(now).max(now + 1),
@@ -2381,6 +2456,66 @@ mod tests {
     );
   }
 
+  /// §4.10a (the constrained-link design §5.3; `docs/bugs/2026-09-30-bulk-spent-the-connection-credit-a-control-exchange-needed.md`):
+  /// connection credit is taken in priority order too. Do X (two bulk exchanges, each longer than the
+  /// window, send until the bulk class stops on connection credit, with nothing read by the peer; then a
+  /// control exchange begins), expect Y (the bulk class had the whole window — the reserve is on top of
+  /// it — and the control exchange leaves in the next packets the pacer releases, with no credit update
+  /// from the peer). Until 2026-09-30 the bulk class spent the last byte of connection credit and the
+  /// control exchange waited a round trip for it.
+  #[test]
+  fn a_control_exchange_leaves_at_once_when_bulk_has_spent_its_credit() {
+    let window = initial_receive_window(FRAME_CAP);
+    let mut sender = fixed_window(FRAME_CAP);
+    for seed in [4, 5] {
+      let bulk = stream_content(seed, usize::try_from(2 * window).unwrap());
+      sender.open_exchange(KIND, Priority::Bulk, &bulk).unwrap();
+    }
+    let now = send_until(&mut sender, 1_000, |sender, _| sender.stops.credit > 0);
+    assert!(sender.stops.credit > 0, "the bulk class stopped on credit");
+    assert_eq!(
+      sender.connection_sent, window,
+      "the bulk class had the whole window"
+    );
+    let ping = sender
+      .open_exchange(KIND, Priority::Control, &stream_content(6, 8))
+      .unwrap();
+    let carries_ping = |frames: &[Frame]| {
+      frames
+        .iter()
+        .any(|frame| matches!(frame, Frame::Stream { stream_id, .. } if *stream_id == ping))
+    };
+    let mut carried = false;
+    send_until(&mut sender, now, |_, frames| {
+      carried = carried || frames.is_some_and(carries_ping);
+      carried
+    });
+    assert!(carried, "the control exchange left without a credit update");
+  }
+
+  /// Polls `sender` from `now`, moving time to each pacing release, until `done` (given the sender and the
+  /// frames just sent, if any) holds or a bounded number of polls pass; returns the time reached.
+  fn send_until(
+    sender: &mut Connection,
+    mut now: u64,
+    mut done: impl FnMut(&Connection, Option<&[Frame]>) -> bool,
+  ) -> u64 {
+    for _ in 0..1_000 {
+      if done(sender, None) {
+        break;
+      }
+      match sender.poll_transmit(now, FRAME_CAP) {
+        Some((_, frames)) => {
+          if done(sender, Some(&frames)) {
+            break;
+          }
+        }
+        None => now = sender.pacing_release.unwrap_or(now).max(now + 1),
+      }
+    }
+    now
+  }
+
   /// Runs `streams` over a lossless path, asserting on every send that the total sent across streams is
   /// within `window` of the total read; returns what arrived and the largest such lead seen.
   fn window_bounded_transfer(
@@ -2779,7 +2914,8 @@ mod tests {
 
   /// §4.10a §8 "BDP-autotuned" (Chromium QUIC's rule): over a path whose BDP far exceeds the initial
   /// window, the receive window doubles whenever a window is read within two round trips, up to the
-  /// ceiling and never past it — and the transfer completes.
+  /// ceiling and never past it — the connection's credit, the window and the class reserve on top of it
+  /// ([`class_credit_reserve`]), is what the ceiling bounds — and the transfer completes.
   #[test]
   fn the_receive_window_autotunes_to_its_ceiling() {
     let cap = 1200usize;
@@ -2816,7 +2952,11 @@ mod tests {
     assert_eq!(received.len(), content.len(), "the transfer completed");
     let (window, growths) = receiver.receive_window();
     assert!(growths > 0, "the window grew ({growths} times)");
-    assert_eq!(window, ceiling, "and stopped at the ceiling");
+    assert_eq!(
+      window + class_credit_reserve(Priority::Bulk, cap),
+      ceiling,
+      "and stopped at the ceiling"
+    );
   }
 
   proptest! {

@@ -3590,6 +3590,21 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 
 > **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
 
+> **Status (2026-09-30, connection credit in priority order).** A control exchange no longer waits for
+> connection credit that a bulk exchange spent (the constrained-link design §5.3).
+> - **The reserve.** A sender of one priority class leaves unspent one packet's stream bytes of connection
+>   credit for each class above it (`class_credit_reserve`): bulk leaves two, metadata one, control none.
+>   So the first packet of a more urgent exchange always finds credit, with no `MaxData` round trip.
+> - **Headroom, not a cut.** The receiver advertises the bulk reserve on top of its stream window, so a lone
+>   bulk stream still has its whole window (the reorder-detection minimum). The window auto-tunes so that
+>   window plus reserve stays within the session's receive ceiling. Both ends derive the reserve from the
+>   shape's frame cap (R8).
+> - **Blocked reports** fire when any class with data waiting has no credit it may spend.
+> - **Evidence.** On one session across a 1 Mbit/s, 40 ms bottleneck with a bulk transfer loading it, the
+>   worst of twelve control pings fell from 118 ms (a 68 ms wait for credit) to 79 ms. The head-of-line
+>   test's bound is now RTT + queue + two packets, down from four
+>   (`docs/bugs/2026-09-30-bulk-spent-the-connection-credit-a-control-exchange-needed.md`).
+>
 > **Status (2026-09-30, AUD-29-49).** A server never amplifies toward an unvalidated address (RFC 9000 §8.1).
 > - **The allowance.** Before the peer's address is validated, a server sends at most three times the bytes
 >   it received from it.

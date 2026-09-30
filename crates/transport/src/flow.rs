@@ -5,8 +5,12 @@
 //! `MaxData`; the sender ([`crate::stream::StreamSender::grant_credit`]) frames only within it. The
 //! window stays `window_ahead` beyond consumed, so a bulk stream **never has the whole object in
 //! credit** (the permanent invariant): the sender can never race more than one window ahead of the
-//! reader, so its buffer and the receiver's are both bounded and a bulk transfer never starves a
-//! control frame.
+//! reader, so its buffer and the receiver's are both bounded. The connection's credit is the window plus
+//! a class reserve (`crate::connection::class_credit_reserve`) that a sender's lower classes leave
+//! unspent, so a bulk transfer never spends the credit a control exchange needs. Until 2026-09-30 the
+//! connection's credit equalled one stream's window, a lone bulk stream spent all of it, and a control
+//! ping waited up to 68 ms of a 40 ms path for the peer's `MaxData`
+//! (`docs/bugs/2026-09-30-bulk-spent-the-connection-credit-a-control-exchange-needed.md`).
 //!
 //! `window_ahead` is derived by the caller (the design's `k × frame_cap`, BDP-autotuned — owed), not
 //! a constant here. Absolute offsets make a credit update idempotent under loss/reorder (a lower
@@ -30,6 +34,9 @@ use crate::session::Frame;
 #[derive(Debug)]
 pub struct FlowController {
   window_ahead: u64,
+  /// Connection credit advertised on top of the window, for the priority classes above the one a stream
+  /// carries (`crate::connection::class_credit_reserve`): a sender's lowest class leaves it unspent.
+  class_reserve: u64,
   /// The most the window may grow to (the session's receive budget).
   ceiling: u64,
   connection_consumed: u64,
@@ -46,12 +53,15 @@ const AUTOTUNE_RTT_MULTIPLE: u64 = 2;
 const AUTOTUNE_GROWTH_FACTOR: u64 = 2;
 
 impl FlowController {
-  /// A controller advertising `window_ahead` bytes of credit beyond what the app has consumed, growing to
-  /// at most `ceiling` (never below the initial window).
-  pub fn new(window_ahead: u64, ceiling: u64) -> FlowController {
+  /// A controller advertising `window_ahead` bytes of credit beyond what the app has consumed per stream,
+  /// and `class_reserve` more for the connection, the window growing so that the connection's credit stays
+  /// within `ceiling` (never below the initial window: the reorder-detection minimum,
+  /// `crate::connection::initial_receive_window`).
+  pub fn new(window_ahead: u64, ceiling: u64, class_reserve: u64) -> FlowController {
     FlowController {
       window_ahead,
-      ceiling: ceiling.max(window_ahead),
+      class_reserve,
+      ceiling: ceiling.saturating_sub(class_reserve).max(window_ahead),
       connection_consumed: 0,
       stream_consumed: BTreeMap::new(),
       epoch: None,
@@ -125,9 +135,12 @@ impl FlowController {
       .saturating_add(self.window_ahead)
   }
 
-  /// The connection's credit ceiling to advertise.
+  /// The connection's credit ceiling to advertise: consumed + the window + the class reserve.
   pub fn connection_max(&self) -> u64 {
-    self.connection_consumed.saturating_add(self.window_ahead)
+    self
+      .connection_consumed
+      .saturating_add(self.window_ahead)
+      .saturating_add(self.class_reserve)
   }
 
   /// The `MaxStreamData` frame advertising this stream's current credit ceiling.
@@ -167,7 +180,7 @@ mod tests {
   /// The credit ceiling stays a fixed window ahead of what is consumed, never the whole object.
   #[test]
   fn credit_stays_a_window_ahead_of_consumed() {
-    let mut flow = FlowController::new(40, 40);
+    let mut flow = FlowController::new(40, 40, 0);
     assert_eq!(flow.stream_max(1), 40, "initial credit is one window");
     flow.on_stream_consumed(1, 100);
     assert_eq!(flow.stream_max(1), 140, "credit tracks consumed + window");
@@ -180,7 +193,7 @@ mod tests {
   /// never un-counts its bytes — the credit the sender relies on must not regress.
   #[test]
   fn connection_credit_sums_streams_and_never_regresses() {
-    let mut flow = FlowController::new(40, 40);
+    let mut flow = FlowController::new(40, 40, 0);
     assert_eq!(
       flow.connection_max(),
       40,
@@ -213,7 +226,7 @@ mod tests {
   /// stalling the connection-level credit ratchet (the bug the cluster's connection-reuse test caught).
   #[test]
   fn forgetting_a_stream_resets_its_watermark_but_keeps_the_connection_total() {
-    let mut flow = FlowController::new(40, 40);
+    let mut flow = FlowController::new(40, 40, 0);
     flow.on_stream_consumed(1, 100);
     assert_eq!(
       flow.stream_max(1),
@@ -265,7 +278,7 @@ mod tests {
     let mut source = StreamSender::new();
     source.write(&content);
     source.finish();
-    let flow = FlowController::new(WINDOW_AHEAD, WINDOW_AHEAD);
+    let flow = FlowController::new(WINDOW_AHEAD, WINDOW_AHEAD, 0);
     let mut assembler = StreamAssembler::new(flow.stream_max(STREAM_ID));
     source.grant_credit(flow.stream_max(STREAM_ID));
 
