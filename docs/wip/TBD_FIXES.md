@@ -44,6 +44,29 @@ authorized merely by appearing here.
   resume could not own. Temporaries are now created at a plain hidden name and linked to the aside once
   complete. Red → green on the crash oracle's new named-temporary model
   (`docs/bugs/2026-09-30-a-crash-mid-write-left-a-temporary-the-resume-could-not-own.md`).
+- [ ] **A council that never widens past one voter (open; three CI occurrences, none reproduced).** One
+  signature across three tests on the macOS runner: a node's council view holds one voter while the
+  configuration holds three members, and its lease or promotion never completes.
+  - Run 36663502686 (the formation test; entry below).
+  - Job 109761848083 (`4c6febb`), `an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum`:
+    - unlisted-2 held voters = [one host];
+    - it counted `fleet.accept.replaced` 1 and `fleet.link.stale_return` 1, with 142 reconnects all
+      answered.
+  - Job 109765227530 (`2de3276`), `three_daemon_processes_deploy_a_fleet…`: the mount was refused
+    `LeaseUnconfirmed { version: 3 }`, with `fleet_council_voters: 1`, `fleet_configuration_members: 3`,
+    configuration version 3 and settled generation 2.
+
+  Ruled out, from the code:
+  - The borrow tag cannot be lost across a session's replacement: `Endpoint::connection_id` caches the
+    id. A `stale_return` is the benign late return after a slot was re-established.
+
+  Not reproduced here:
+  - the enrollment test, 12 runs six at a time;
+  - the deploy flow, 18 runs six at a time at load 12–15.
+
+  A refused mount on a forming fleet now prints every node's status and whether the council widens within
+  the fleet wait, and when, so the next occurrence says slow formation from a stall.
+
 - [ ] **Run 36669682141, macOS: a SIGTERMed council leader's survivors elected nobody for 40 s (open, not
   reproduced).** `a_terminated_council_leader_process_hands_off_before_it_exits`: the leader's drain ended
   `SteppedDown` after 2.1 s, its invited target never took office, and neither survivor (two of three voters)

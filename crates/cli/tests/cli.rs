@@ -345,7 +345,8 @@ fn mount_and_check(instance: &str, id: &str, path: &str) {
   let (code, out, err) = run(instance, &["mount", id, path]);
   if code != 0 {
     let (_, status, status_err) = run(instance, &["status"]);
-    panic!("slates mount failed: {err}\n--- {instance} status:\n{status}{status_err}");
+    let council = diagnose_fleet_council(instance);
+    panic!("slates mount failed: {err}\n--- {instance} status:\n{status}{status_err}{council}");
   }
   assert_eq!(
     value_of(&out, "mounted"),
@@ -2753,6 +2754,48 @@ fn wait_for_full_council(instances: &[String]) -> usize {
     "every node votes in the council"
   );
   leaders[0]
+}
+
+/// When `instance` is a fleet node of this process, the evidence a refused mount on a forming fleet needs
+/// (three CI failures on 2026-09-30 showed a council stuck at one voter of three members, with no view of the
+/// leader): every node's status, then whether the council widens within the fleet wait and when. The test
+/// still fails; this only says whether the refusal met a formation that was slow or one that stalled.
+fn diagnose_fleet_council(instance: &str) -> String {
+  let pid = std::process::id();
+  let instances: Vec<String> = FLEET_NODES
+    .iter()
+    .map(|node| format!("cli-fleet-{node}-{pid}"))
+    .collect();
+  if !instances.iter().any(|fleet| fleet == instance) {
+    return String::new();
+  }
+  let mut evidence = String::new();
+  for node in &instances {
+    let (_, status, status_err) = run(node, &["status"]);
+    evidence.push_str(&format!(
+      "\n--- {node} status at the refusal:\n{status}{status_err}"
+    ));
+  }
+  let started = Instant::now();
+  let widened = loop {
+    let leaders = council_leaders(&instances);
+    if let [leader] = leaders[..]
+      && council_voters(&instances[leader]) == FLEET_NODES.len()
+    {
+      break Some(started.elapsed());
+    }
+    if started.elapsed() >= FLEET_WAIT {
+      break None;
+    }
+    pause();
+  };
+  evidence.push_str(&match widened {
+    Some(after) => format!("\n--- the council widened to every node {after:?} after the refusal"),
+    None => format!(
+      "\n--- the council did not widen to every node within {FLEET_WAIT:?} after the refusal"
+    ),
+  });
+  evidence
 }
 
 /// Polls `survivors` from `asked` until exactly one leads the council (or the fleet wait passes): the leaders
