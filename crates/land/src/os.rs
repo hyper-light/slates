@@ -19,7 +19,7 @@
 //! user (`TargetNotOwned`). `TargetIsVolume` waits on the mount table of Phase 3 (GAPS §8c).
 
 use std::collections::BTreeMap;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path};
 
 use rustix::fs::{AtFlags, Mode, OFlags};
@@ -117,37 +117,68 @@ fn target_component_refusal(
   TargetRefusal::Unavailable(refusal(error))
 }
 
+/// Walks an absolute target path from `/` one component at a time (no `..`, no symlink: containment), checks
+/// the target is owned by this process's user, and returns its descriptor and the key it lands under.
+fn walk_target(path: &Path) -> Result<(OwnedFd, String), TargetRefusal> {
+  let mut components = path.components();
+  if components.next() != Some(Component::RootDir) {
+    return Err(TargetRefusal::NotAbsolute);
+  }
+  let mut current = rustix::fs::open("/", dir_flags(), Mode::empty())
+    .map_err(|e| TargetRefusal::Unavailable(refusal(e)))?;
+  let mut key = String::new();
+  for component in components {
+    let name = match component {
+      Component::Normal(n) => n.to_str().ok_or(TargetRefusal::EscapesTarget)?,
+      Component::CurDir => continue,
+      _ => return Err(TargetRefusal::EscapesTarget),
+    };
+    let next = rustix::fs::openat(&current, name, dir_flags(), Mode::empty())
+      .map_err(|error| target_component_refusal(current.as_fd(), name, error))?;
+    key.push('/');
+    key.push_str(name);
+    current = next;
+  }
+  let st = rustix::fs::fstat(&current).map_err(|e| TargetRefusal::Unavailable(refusal(e)))?;
+  if st.st_uid != rustix::process::geteuid().as_raw() {
+    return Err(TargetRefusal::TargetNotOwned);
+  }
+  Ok((current, key))
+}
+
 impl OsLand {
   /// Opens an absolute target path with containment and the ownership check, and returns the
   /// writer with the target. Ancestor descriptors used to resolve it are closed on the way.
   pub fn open_target(path: &Path) -> Result<(Self, LandingTarget), TargetRefusal> {
-    let mut components = path.components();
-    if components.next() != Some(Component::RootDir) {
-      return Err(TargetRefusal::NotAbsolute);
+    let (current, key) = walk_target(path)?;
+    let (host, _) = OsHost::open_root(Path::new("/")).map_err(TargetRefusal::Unavailable)?;
+    Self::adopt_target(host, current, key).map_err(|(_, refusal)| refusal)
+  }
+
+  /// [`OsLand::open_target`] inside an existing host — the base host an overlay volume's slot holds — so the
+  /// target and every handle the volume's base names live in one host (a handle is an index into its own
+  /// host's table; another host's same number names another directory). A refusal hands the host back, so
+  /// the volume keeps it.
+  pub fn open_target_in(
+    host: OsHost,
+    path: &Path,
+  ) -> Result<(Self, LandingTarget), (OsHost, TargetRefusal)> {
+    match walk_target(path) {
+      Ok((current, key)) => Self::adopt_target(host, current, key),
+      Err(refusal) => Err((host, refusal)),
     }
-    let mut current = rustix::fs::open("/", dir_flags(), Mode::empty())
-      .map_err(|e| TargetRefusal::Unavailable(refusal(e)))?;
-    let mut key = String::new();
-    for component in components {
-      let name = match component {
-        Component::Normal(n) => n.to_str().ok_or(TargetRefusal::EscapesTarget)?,
-        Component::CurDir => continue,
-        _ => return Err(TargetRefusal::EscapesTarget),
-      };
-      let next = rustix::fs::openat(&current, name, dir_flags(), Mode::empty())
-        .map_err(|error| target_component_refusal(current.as_fd(), name, error))?;
-      key.push('/');
-      key.push_str(name);
-      current = next;
-    }
-    let st = rustix::fs::fstat(&current).map_err(|e| TargetRefusal::Unavailable(refusal(e)))?;
-    if st.st_uid != rustix::process::geteuid().as_raw() {
-      return Err(TargetRefusal::TargetNotOwned);
-    }
-    let (mut host, _) = OsHost::open_root(Path::new("/")).map_err(TargetRefusal::Unavailable)?;
-    let dir = host
-      .adopt_dir(current)
-      .map_err(TargetRefusal::Unavailable)?;
+  }
+
+  /// The writer over `host`, with the walked target `current` adopted into it under `key`.
+  fn adopt_target(
+    mut host: OsHost,
+    current: OwnedFd,
+    key: String,
+  ) -> Result<(Self, LandingTarget), (OsHost, TargetRefusal)> {
+    let dir = match host.adopt_dir(current) {
+      Ok(dir) => dir,
+      Err(error) => return Err((host, TargetRefusal::Unavailable(error))),
+    };
     let target = LandingTarget {
       dir,
       key: if key.is_empty() {

@@ -6,10 +6,10 @@
 use slates_wire::Wire;
 
 use crate::catalog::{
-  AccessEntry, AttachmentRecord, AuditRecord, CompletionRecord, ConsumerRecord, GrantRecord,
-  GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord, LineageEdge,
-  NfsClientRecord, NfsLockRecord, NfsOpenRecord, PlacementState, SizeClass, SnapshotId,
-  SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
+  AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
+  GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
+  LineageEdge, NfsClientRecord, NfsLockRecord, NfsOpenRecord, PlacementState, SizeClass,
+  SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -274,6 +274,14 @@ pub enum Op {
     /// The new instance.
     instance: u32,
   },
+  /// A volume took a base: a landing made a scratch volume an overlay over the directory it landed on
+  /// (§4.15 step 9), so a recovery reacquires that directory for it. Appended.
+  VolumeRebased {
+    /// The volume.
+    id: VolumeId,
+    /// What it now sits on.
+    base: BaseRecord,
+  },
 }
 
 impl Op {
@@ -319,6 +327,7 @@ impl Op {
       Op::NfsClientSet { .. } => "nfs_client_set",
       Op::NfsClientCleared { .. } => "nfs_client_cleared",
       Op::NfsInstanceAdvanced { .. } => "nfs_instance_advanced",
+      Op::VolumeRebased { .. } => "volume_rebased",
     }
   }
 }

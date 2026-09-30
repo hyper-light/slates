@@ -1733,11 +1733,12 @@ the verdict that every entry beneath still matches its listing fingerprint.
 >   rename left. The resume judges the entry against it, not against an outsider's edit.
 > - **Evidence.** Each item has a test that was red first
 >   (`docs/bugs/2026-09-30-a-rename-replaced-a-base-directory-it-had-not-listed.md`).
-> - **Owed.**
->   - A landed volume's durable record still says `Scratch`, so a restart rebuilds it without its base.
->   - Landing an overlay runs the engine's base operations through the writer's own host rather than the
->     slot's.
->   - A file replaced on disk while open is still served its new bytes after a relist (open pins).
+> - **One host per volume, durably.** A landing of an overlay runs its writer inside the volume's own base
+>   host (handles are per host), taken when it runs and returned after. A landing that makes a scratch
+>   volume an overlay records `Op::VolumeRebased` and publishes the content image, so a restart serves
+>   it over its base
+>   (`docs/bugs/2026-09-30-a-landing-used-its-own-host-for-the-volumes-base-and-recorded-no-rebase.md`).
+> - **Owed.** A file replaced on disk while open is still served its new bytes after a relist (open pins).
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
 

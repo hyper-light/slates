@@ -114,3 +114,131 @@ fn a_landing_of_a_snapshot_writes_its_bytes_and_the_head_lands_after_it() {
   drop(client);
   daemon.stop();
 }
+
+/// Shape: the overlay test's volume name, and the bytes of the file the base holds and the one the mount adds.
+const OVERLAY_VOLUME: &str = "overlay-landing";
+const KEPT_BYTES: &[u8] = b"on the disk before the mount";
+const NEW_BYTES: &[u8] = b"written through the mount";
+
+/// §4.15 (a landing of an overlay volume into the directory it overlays): do: overlay a real directory
+/// holding `kept`, create and write `new` through the mount, land the head into that directory, then read
+/// both names back through the mount; expect the landing done with `new` on the disk, and both files served
+/// from the disk afterwards. The engine runs the volume's base operations through the host it is given, and
+/// the volume's base names the directory by the handles of the host its slot holds: the landing must use that
+/// host for the base, or its handles name other directories (found 2026-09-30, AUD-29-16's sibling sweep).
+#[test]
+fn a_landing_of_an_overlay_into_its_base_serves_both_files_afterwards() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-ovland-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-ovland-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = target_dir();
+  target.seed("kept", KEPT_BYTES);
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let volume = client
+    .create(&slates_client::CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch(OVERLAY_VOLUME)
+    })
+    .unwrap();
+  let mounted_overlay = |daemon: &Daemon| {
+    let port = daemon.nfs_port().expect("the daemon is serving NFS");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let capability = daemon
+      .mount_capability(OVERLAY_VOLUME)
+      .expect("the name's owner shard answers")
+      .expect("the volume is served");
+    let root = mount(&mut stream, &capability, 1);
+    (stream, root)
+  };
+  let (mut stream, root) = mounted_overlay(&daemon);
+  let file = create(&mut stream, &root, "new", 2);
+  write(&mut stream, &file, NEW_BYTES, 3);
+  let state = land(&mut client, &secret, volume, None, &target.path);
+  assert_eq!(state, "done");
+  assert_eq!(
+    std::fs::read(format!("{}/new", target.path)).unwrap(),
+    NEW_BYTES
+  );
+  let (mut stream, root) = mounted_overlay(&daemon);
+  let new = lookup(&mut stream, &root, "new", 4);
+  assert_eq!(read(&mut stream, &new, 5), NEW_BYTES);
+  let kept = lookup(&mut stream, &root, "kept", 6);
+  assert_eq!(read(&mut stream, &kept, 7), KEPT_BYTES);
+  drop(client);
+  daemon.stop();
+}
+
+/// Shape: a base file past a chunk window on any supported page (16 pages of at most 64 KiB), and the
+/// size the large-file class starts at in this test, so an edit of its first bytes pins one window and the
+/// rest is read from the disk when it lands.
+const LARGE_FILE_BYTES: usize = 2 * 1024 * 1024;
+const TEST_LARGE_CLASS_BYTES: u64 = 4096;
+
+/// §4.15 (a landing reads the unpinned bytes of a large base file from the base): do: overlay a directory
+/// holding a 2 MiB file with the large-file class at one page, rewrite its first bytes through the mount,
+/// land the head into that directory; expect the file on the disk to be the edit followed by the base's own
+/// remaining bytes. The landing reads those remaining bytes through the volume's base host: until 2026-09-30
+/// it read them through the landing writer's own host, whose handle numbers name other directories.
+#[test]
+fn a_landing_of_a_partly_edited_large_base_file_keeps_the_disk_bytes_it_did_not_edit() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-ovlarge-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  config.large_class_bytes = TEST_LARGE_CLASS_BYTES;
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-ovlarge-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = target_dir();
+  let original: Vec<u8> = (0..LARGE_FILE_BYTES)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  target.seed("large", &original);
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let volume = client
+    .create(&slates_client::CreateSpec {
+      base: Some(target.path.clone()),
+      ..scratch(OVERLAY_VOLUME)
+    })
+    .unwrap();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon
+    .mount_capability(OVERLAY_VOLUME)
+    .expect("the name's owner shard answers")
+    .expect("the volume is served");
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "large", 2);
+  write(&mut stream, &file, NEW_BYTES, 3);
+  let state = land(&mut client, &secret, volume, None, &target.path);
+  assert_eq!(state, "done");
+  let mut expected = original.clone();
+  expected[..NEW_BYTES.len()].copy_from_slice(NEW_BYTES);
+  assert_eq!(
+    std::fs::read(format!("{}/large", target.path)).unwrap(),
+    expected,
+    "the edit, then the base's own bytes"
+  );
+  drop(client);
+  daemon.stop();
+}

@@ -1222,3 +1222,72 @@ fn cut_log_after_one_record(segment: &mut AnchorSegment, partition: u16, from_ta
     from_tail + u64::try_from(slates_db::record::RECORD_HEADER).unwrap_or(0) + body_len;
   segment.ring_words(RegionKind::Log(partition)).unwrap()[1].store(record_end, Ordering::Release);
 }
+
+/// Shape: the landed volume's name, and the bytes of a file the landing target held before the volume
+/// overlaid it (the volume never wrote it).
+const LANDED_VOLUME: &str = "landed";
+const OUTSIDE_BYTES: &[u8] = b"on the target before the landing\n";
+
+/// Mounts `name` on `daemon` over NFS: the stream and the root handle.
+fn mounted_on(daemon: &Daemon, name: &str) -> (TcpStream, Vec<u8>) {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon
+    .mount_capability(name)
+    .expect("the name's owner shard answers")
+    .expect("the volume is served");
+  let root = mount(&mut stream, &capability, 1);
+  (stream, root)
+}
+
+/// §4.15 step 9, §4.8 (a landed scratch volume is an overlay of its target, durably): do: land a scratch
+/// volume into a directory that already holds `outside`, read `outside` through the mount (the volume
+/// overlays the target now), restart the daemon over the same segment and read it again; expect the same
+/// bytes both times. Until 2026-09-30 the volume's record kept `Scratch`, so the restart rebuilt it without
+/// the directory beneath it and `outside` was gone.
+#[test]
+fn a_landed_scratch_volume_keeps_its_base_across_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-landrestart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("landrestart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("outside", OUTSIDE_BYTES);
+  let mut client = connect(&instance);
+  let secret = first.segment().issuer_secret().unwrap();
+  let volume = client.create(&scratch(LANDED_VOLUME)).unwrap();
+  let (mut stream, root) = mounted_on(&first, LANDED_VOLUME);
+  let file = create(&mut stream, &root, "f", 2);
+  write(&mut stream, &file, BEFORE, 3);
+  let grant = common::landing::approve(&mut client, &secret, volume, None, &target.path);
+  match client.land(volume, None, &target.path, Filter::default(), Some(grant)) {
+    Ok(slates_client::Landing::Landed(outcome)) => assert_eq!(outcome.state, "done"),
+    other => panic!("the granted landing: {other:?}"),
+  }
+  let (mut stream, root) = mounted_on(&first, LANDED_VOLUME);
+  let outside = lookup(&mut stream, &root, "outside", 4);
+  assert_eq!(
+    read(&mut stream, &outside, 5),
+    OUTSIDE_BYTES,
+    "the volume overlays the target"
+  );
+  drop(stream);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let (mut stream, root) = mounted_on(&second, LANDED_VOLUME);
+  let outside = lookup(&mut stream, &root, "outside", 6);
+  assert_eq!(
+    read(&mut stream, &outside, 7),
+    OUTSIDE_BYTES,
+    "after the restart the volume still overlays the directory it landed on"
+  );
+  let landed = lookup(&mut stream, &root, "f", 8);
+  assert_eq!(read(&mut stream, &landed, 9), BEFORE);
+  drop(client);
+  second.stop();
+}

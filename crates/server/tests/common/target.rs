@@ -13,6 +13,17 @@ pub(crate) struct TargetDir {
   pub(crate) path: String,
 }
 
+impl TargetDir {
+  /// Writes `bytes` to `name` in the directory: a file the disk held before a volume overlaid it or a
+  /// landing wrote into it — the fixture's own directory in the build output, as its creation and removal
+  /// are.
+  #[allow(dead_code)]
+  pub(crate) fn seed(&self, name: &str, bytes: &[u8]) {
+    #[allow(clippy::disallowed_methods)]
+    std::fs::write(format!("{}/{name}", self.path), bytes).unwrap();
+  }
+}
+
 impl Drop for TargetDir {
   fn drop(&mut self) {
     // The test's own directory in the build output (CLAUDE §4: removed at the end).

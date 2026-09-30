@@ -521,7 +521,8 @@ impl Partition {
       | Op::VolumeAccounted { id, .. }
       | Op::VolumeHeadAdvanced { id, .. }
       | Op::AccessChanged { id, .. }
-      | Op::VolumeDestroyed { id } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
+      | Op::VolumeDestroyed { id }
+      | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
         if self.snapshot(record.volume, record.id).is_some() {
@@ -717,6 +718,7 @@ impl Partition {
       Op::VolumeCreated { record } => self.insert_volume(record.clone()),
       Op::VolumeStateChanged { id, state } => self.update_volume(*id, |v| v.state = *state),
       Op::VolumeResized { id, size } => self.update_volume(*id, |v| v.policy.size = *size),
+      Op::VolumeRebased { id, base } => self.update_volume(*id, |v| v.base = base.clone()),
       Op::VolumeAccounted {
         id,
         referenced_bytes,

@@ -145,6 +145,9 @@ struct LandingIds<'a> {
   volume: DbVolumeId,
   snapshot: DbSnapshotId,
   target: &'a str,
+  /// Whether this landing made a scratch volume an overlay over `target` (§4.15 step 9): its record then
+  /// names the new base, so a recovery reacquires it.
+  rebased: bool,
 }
 
 /// What a `land` request names (§4.15).
@@ -492,7 +495,7 @@ struct Prepared {
 #[cfg(unix)]
 fn run_landing(
   state: &mut ShardState,
-  mut prepared: Prepared,
+  prepared: Prepared,
   lease: Option<&LandingLease>,
 ) -> ReplyBody {
   // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes
@@ -525,6 +528,27 @@ fn run_landing(
     Err(_) => return refused(Refusal::NotFound),
   };
   let was_overlay = slot.volume.is_overlay();
+  // One host per volume: an overlay's base names its directories by the handles of the host its slot holds,
+  // so the writer is built inside that host — taken now, as the landing runs (a granted landing's wait for
+  // its lease left it serving), with the target walked again under the same containment — and given back
+  // after. A writer over its own host would read the base through handles that name other directories there.
+  let (mut os, land_target) = if was_overlay {
+    let Some(host) = slot.host.take() else {
+      return refused(Refusal::BaseUnavailable {
+        path: prepared.target.clone(),
+        errno: 0,
+      });
+    };
+    match OsLand::open_target_in(host, std::path::Path::new(&prepared.target)) {
+      Ok(pair) => pair,
+      Err((host, refusal)) => {
+        slot.host = Some(host);
+        return refused(target_refusal(&refusal));
+      }
+    }
+  } else {
+    (prepared.os, prepared.land_target)
+  };
   // Observe each entry to emit a `land.entry` span (§4.14), into a bounded buffer so a large landing
   // does not grow it without bound (ban 8). It records only timings; the spans are built and drained
   // into the shard's telemetry sink after the landing, once the borrows above are released.
@@ -533,8 +557,8 @@ fn run_landing(
     .max(1);
   let mut spans = SpanObserver::with_capacity(telemetry_capacity);
   let outcome = land(
-    &mut prepared.os,
-    &prepared.land_target,
+    &mut os,
+    &land_target,
     &mut slot.volume,
     &mut state.store,
     &mut state.landing.grants,
@@ -544,17 +568,22 @@ fn run_landing(
     &mut spans,
   );
   drain_land_spans(state, spans);
-  // A scratch volume the landing made an overlay over its target (§4.15 step 9) names the target by the
-  // landing host's handles: the slot keeps that host, so every later verb is served through the base it
-  // now has. Until 2026-09-30 the host was dropped here and the volume was served hostless — a landed file,
-  // now a base entry, could not be read, and a name the overlay had not materialized was not seen (found
-  // when the bridge began refusing hostless verbs on an overlay, AUD-29-16).
-  if !was_overlay
-    && let Ok(slot) = state.volumes.get_mut(prepared.handle)
+  // The volume keeps the writer's host when it has a base: an overlay's own, given back; or — a scratch volume
+  // the landing made an overlay over its target (§4.15 step 9) — the host whose handle now names its base
+  // root. An overlay's walked target is closed first (its base root is its own handle), so a landing adds no
+  // handle to the host it returns to. Until 2026-09-30 a landed scratch volume was served hostless: a landed
+  // file, now a base entry, could not be read (found when the bridge began refusing hostless verbs on an
+  // overlay, AUD-29-16).
+  let mut rebased = false;
+  if let Ok(slot) = state.volumes.get_mut(prepared.handle)
     && slot.volume.is_overlay()
-    && slot.host.is_none()
   {
-    slot.host = Some(prepared.os.into_host());
+    rebased = !was_overlay;
+    let mut host = os.into_host();
+    if was_overlay {
+      host.close_dir(land_target.dir);
+    }
+    slot.host = Some(host);
   }
   let ids = LandingIds {
     landing_id,
@@ -562,6 +591,7 @@ fn run_landing(
     volume: prepared.volume,
     snapshot: prepared.snapshot,
     target: &prepared.target,
+    rebased,
   };
   let presenter = Presenter {
     client: prepared.client,
@@ -1064,25 +1094,14 @@ fn finish(
       });
     }
   }
-  // The grant's transition as it happened (AUD-29-06): the engine consumes a single-use grant whose landing
-  // finished and never a session grant, and a landing it aborted leaves either grant usable for the resume;
-  // the durable state follows the runtime one. Until 2026-09-29 every grant presented was recorded consumed.
-  if let Some(id) = grant
-    && state
-      .landing
-      .grants
-      .get(slates_land::grant::GrantId(id))
-      .is_some_and(|g| g.state == LandGrantState::Consumed)
-  {
-    ops.push(Op::GrantStateChanged {
-      id,
-      state: DbGrantState::Consumed,
-    });
-  }
+  ops.extend(closing_ops(state, ids, grant));
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       return refused(crate::error::refusal_of_db(&e));
     }
+  }
+  if let Some(refusal) = publish_landed(state, ids, report) {
+    return refusal;
   }
   ReplyBody::Landed {
     outcome: LandingOutcome {
@@ -1099,6 +1118,69 @@ fn finish(
       ramp_depth: report.ramp_depth,
     },
   }
+}
+
+/// The ops that close a finished landing's records: its grant's transition, and the volume's new base when
+/// the landing made a scratch volume an overlay.
+#[cfg(unix)]
+fn closing_ops(state: &ShardState, ids: &LandingIds<'_>, grant: Option<u64>) -> Vec<Op> {
+  let mut ops = Vec::new();
+  // The grant's transition as it happened (AUD-29-06): the engine consumes a single-use grant whose landing
+  // finished and never a session grant, and a landing it aborted leaves either grant usable for the resume;
+  // the durable state follows the runtime one. Until 2026-09-29 every grant presented was recorded consumed.
+  if let Some(id) = grant
+    && state
+      .landing
+      .grants
+      .get(slates_land::grant::GrantId(id))
+      .is_some_and(|g| g.state == LandGrantState::Consumed)
+  {
+    ops.push(Op::GrantStateChanged {
+      id,
+      state: DbGrantState::Consumed,
+    });
+  }
+  // A landing that made a scratch volume an overlay records its new base (§4.15 step 9): until 2026-09-30 the
+  // record kept `Scratch`, and a restart rebuilt the volume without the directory its landed files are in.
+  if ids.rebased {
+    ops.push(Op::VolumeRebased {
+      id: ids.volume,
+      base: slates_db::catalog::BaseRecord::Path {
+        path: ids.target.to_owned(),
+      },
+    });
+  }
+  ops
+}
+
+/// Publishes the shard's content images after a landing that advanced the volume (see the body); the refusal
+/// to reply with when the volume was not captured, else `None`.
+#[cfg(unix)]
+fn publish_landed(
+  state: &mut ShardState,
+  ids: &LandingIds<'_>,
+  report: &LandingReport,
+) -> Option<ReplyBody> {
+  // A landing that advanced the volume (its landed entries left the overlay; a scratch volume took a base)
+  // changed what a recovery rebuilds, so the content image is published before the reply, as every mutating
+  // verb's is (§4.8, AUD-05): a volume the publish could not capture is refused, never acknowledged. Until
+  // 2026-09-30 a landing published nothing, and a restart rebuilt the pre-landing image — refused outright
+  // once the record named the new base (the image still said scratch).
+  if matches!(
+    report.state,
+    slates_land::engine::LandingState::Done | slates_land::engine::LandingState::Partial
+  ) {
+    match crate::verbs::publish_shard(state) {
+      Ok(published) if !published.captured(ids.volume) => {
+        return Some(refused(crate::error::refusal_of_vfs(
+          &slates_vfs::VfsError::RecoveryIncomplete,
+        )));
+      }
+      Ok(_) => {}
+      Err(error) => return Some(refused(crate::error::refusal_of_vfs(&error))),
+    }
+  }
+  None
 }
 
 /// The engine's durability as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped it).
