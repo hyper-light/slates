@@ -3160,6 +3160,15 @@ versions per key); image layout 7. The clone landing that replaced an outsider's
 conflicts (`docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md`). Open:
 the tables are heap outside the metadata ledger (§4.2).
 
+**Open 2026-09-30 — A-50 (audit §9; Ada's requirement): zero disk access is the baseline.** Only the overlay's
+base reads and a granted landing's writes may touch disk; `/tmp` and every temporary directory are excluded,
+in tests too. The contract is in the design (§0.2) and its site table is enforced by `cargo xtask check`.
+Defects to remove: the CLI's reads of fleet manifest, certificate, key and recovery-key files; temporary-
+directory scratch in test fixtures (`crates/server/tests/common/target.rs` and the daemon tests' `mktemp -d
+-t`), conformance scratch under `$RUNNER_TEMP`, and persisted proptest failures (AUD-29-63); proof of what
+backs each kernel pseudo-file the machine profile reads. The residency, disclosure and ownership claims stay
+open with their findings (AUD-29-41, -42, -43, -44, -45, -59, -62).
+
 **Closed 2026-09-30 — AUD-29-02 (A-48, A-49): a landing lands exactly the snapshot it names.** The engine's
 source is explicit through plan, verdict and write; the snapshot's own witnesses judge it (A-48); the advance is
 relative to it, so the head's later edits stay private and land next as replacements. The daemon test was

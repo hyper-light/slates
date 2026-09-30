@@ -330,7 +330,7 @@ mod structural {
     ("slates-bridge-winfsp", "the volume (§4.6)"),
     (
       "slates-cli",
-      "the launcher's namespace setup and mount install (§4.12); reads the operator's fleet manifest and certificate files (§2.6 step 6)",
+      "the launcher's namespace setup and mount install (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed",
     ),
   ];
 
@@ -485,6 +485,7 @@ mod structural {
       check_sources(package, &mut violations)?;
       check_no_panic_ratchet(package, &mut violations)?;
     }
+    check_design_table(&root, &mut violations)?;
     if violations.is_empty() {
       println!(
         "structural: ok ({} shipped crates)",
@@ -640,6 +641,83 @@ mod structural {
       if code.contains(pattern) {
         violations.push(format!("{}:{line_no}: {what}: `{pattern}`", file.display()));
       }
+    }
+  }
+
+  /// Format: the markers around the design's generated table of host-path sites (§0.2, A-50).
+  const TABLE_BEGIN: &str = "<!-- host-path-sites:begin -->\n";
+  const TABLE_END: &str = "<!-- host-path-sites:end -->";
+
+  /// The design's table of the crates that may name a host path (a file, a socket or a mount point),
+  /// rendered from [`HOST_PATH_ALLOWED`], the table this check enforces.
+  fn host_path_table() -> String {
+    let mut table = String::from("| Crate | Why it may name a host path |\n|---|---|\n");
+    for (name, why) in HOST_PATH_ALLOWED {
+      table.push_str(&format!("| `{name}` | {why} |\n"));
+    }
+    table
+  }
+
+  /// The design's table of host-path sites must be the one this check enforces (A-50): a crate given leave
+  /// to name host paths, or a changed reason, is in the design in the same change.
+  fn check_design_table(root: &Path, violations: &mut Vec<String>) -> Result<(), Failure> {
+    let design = std::fs::read_to_string(root.join("docs/wip/SLATES_DESIGN.md"))?;
+    if design_table(&design) != Some(host_path_table().as_str()) {
+      violations.push(
+        "docs/wip/SLATES_DESIGN.md's host-path table differs from HOST_PATH_ALLOWED; run `cargo test -p xtask -- --ignored regenerate_the_host_path_table`"
+          .to_owned(),
+      );
+    }
+    Ok(())
+  }
+
+  /// The design's generated block, between its markers.
+  fn design_table(design: &str) -> Option<&str> {
+    let start = design.find(TABLE_BEGIN)?.checked_add(TABLE_BEGIN.len())?;
+    let end = design.get(start..)?.find(TABLE_END)?.checked_add(start)?;
+    design.get(start..end)
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use super::{TABLE_BEGIN, TABLE_END, design_table, host_path_table, workspace_root};
+
+    fn design_path() -> std::path::PathBuf {
+      workspace_root()
+        .expect("the workspace root")
+        .join("docs/wip/SLATES_DESIGN.md")
+    }
+
+    /// A-50 (doc truth): the design lists exactly the crates `cargo xtask check` lets name a host path,
+    /// each with the reason the check records. Do: read the design's generated block. Expect: it equals
+    /// the table rendered from the check's own list.
+    #[test]
+    fn the_design_lists_exactly_the_crates_allowed_to_name_host_paths() {
+      let design = std::fs::read_to_string(design_path()).expect("the design is readable");
+      assert_eq!(
+        design_table(&design),
+        Some(host_path_table().as_str()),
+        "run `cargo test -p xtask -- --ignored regenerate_the_host_path_table`"
+      );
+    }
+
+    /// The deliberate writer: rewrites the design's generated block. Ignored, so a normal run never
+    /// mutates the tree.
+    #[test]
+    #[ignore = "rewrites docs/wip/SLATES_DESIGN.md's host-path table; run deliberately with --ignored"]
+    fn regenerate_the_host_path_table() {
+      let design = std::fs::read_to_string(design_path()).expect("the design is readable");
+      let start = design.find(TABLE_BEGIN).expect("the begin marker") + TABLE_BEGIN.len();
+      let end = start + design[start..].find(TABLE_END).expect("the end marker");
+      let rewritten = format!(
+        "{}{}{}",
+        &design[..start],
+        host_path_table(),
+        &design[end..]
+      );
+      // The design's `--ignored regenerate` writer (CLAUDE §4 "Doc-truth tests").
+      #[allow(clippy::disallowed_methods)]
+      std::fs::write(design_path(), rewritten).expect("the design is writable");
     }
   }
 }

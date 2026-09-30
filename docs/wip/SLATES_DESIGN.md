@@ -70,6 +70,54 @@ their numbers.
 | R9 | Sub-50 µs provisioning. | The provisioning path is decomposed step by step with a cited cost per step and a per-step budget; the end-to-end histogram (p50, p99, p999, max) is a permanent CI gate. |
 | R10 | Disk is written only on a user permission grant. | A grant is a database record created only by the CLI or a confirmation surface a human operates; the MCP server and the SDKs have no verb that creates one; the landing engine refuses without a grant bound to the exact manifest it is about to write; every grant, manifest, and outcome is in the audit log (§4.15). |
 
+**R1's access and residency contract (A-50, 2026-09-30; audit §9; decided by Ada, 2026-09-30).** The
+baseline requirement is literal zero disk access, and that includes `/tmp` and every other temporary
+directory. It is not a capability or a deployment option; there is no mode in which more disk access is
+allowed. Exactly two disk contacts are sanctioned, and nothing else: reading the host directory an overlay
+volume sits on (`slates-base`, read-only), and writing a landing a human granted, inside its target only
+(`slates-land`: its entries, hidden temporaries, entries moved aside and any kept beside their names). Every
+other current path that touches a disk-backed file is a defect against this requirement, recorded here and in
+GAPS until it is removed:
+
+- the operator commands' reads of a fleet manifest, its certificates and key, resolver configuration, and a
+  recovery key file (`slates-cli`);
+- the machine profile's queries of kernel pseudo-files (`slates-machine`) — kernel state, not disk files,
+  but the path alone does not prove the backing object, so each interface is to be identified;
+- test fixtures and harnesses that create scratch under the system temporary directory (`mktemp -d -t`,
+  `$RUNNER_TEMP`) or persist property-test failures beside the source (AUD-29-63);
+
+Four separate claims follow from it, each needing its own evidence:
+
+1. *No host file is accessed.* Evidence today: the lint wall and `cargo xtask check` confine host paths to the
+   crates below, and only `slates-land` links a write-capable file syscall; the hermeticity tracer (macOS and
+   Linux lanes) sees no write outside a granted target. Owed: the tracer to record reads as well as writes, and
+   the authority behind each effect (audit §9.3, AUD-29-42); Windows base handles (AUD-29-62).
+2. *No private byte is paged out or dumped.* Not claimed yet: only a strict create locks the content arena;
+   metadata, rings, logs, completion records, codec and transport buffers are pageable, and no dump exclusion
+   is set (AUD-29-41).
+3. *No private byte is disclosed across consumers or hosts.* A grant binds its consumer (AUD-29-01); owed:
+   per-consumer authority for fleet content (AUD-29-45).
+4. *Ownership is bounded through cancellation, restart and destroy.* Partly evidenced by §4.2's admission;
+   owed: replicated and restored representations (AUD-29-43, AUD-29-44, AUD-29-59).
+
+The crates that may name a host path, and why (generated from `cargo xtask check`'s own table; a test keeps
+the two equal):
+
+<!-- host-path-sites:begin -->
+| Crate | Why it may name a host path |
+|---|---|
+| `slates-machine` | reads the kernel's pseudo-files (/proc, /sys) as queries; never writes |
+| `slates-base` | read-only access to the directories overlay volumes sit on (§4.15) |
+| `slates-land` | the only writer of host paths, under a grant (§4.15) |
+| `slates-ipc` | the per-OS rendezvous, which creates no filesystem entry (§4.7) |
+| `slates-mcp` | the loopback MCP Streamable HTTP transport (§4.12); authorized by Ada 2026-09-06 |
+| `slates-bridge-fuse` | the mount and its device file (§4.6) |
+| `slates-bridge-nfs` | the mount point and loopback socket (§4.6) |
+| `slates-bridge-fskit` | the mount (§4.6) |
+| `slates-bridge-winfsp` | the volume (§4.6) |
+| `slates-cli` | the launcher's namespace setup and mount install (§4.12); its reads of the operator's fleet manifest, certificate, key and recovery-key files are defects against A-50's zero disk access, to be removed |
+<!-- host-path-sites:end -->
+
 ### 0.3 Evidence tiers and how citations are written
 
 Every claim that could be wrong carries a bracketed citation with a tier letter:
@@ -7141,4 +7189,23 @@ source), the tests, and GAPS.
 - What it does not change: the verdict table, the write classes and their removal discipline (A-43), the
   durability boundary (A-45), unnamed landings, and the durable records of an unnamed landing (still
   naming the head snapshot; a catalog format version is owed).
+
+### A-50 — Zero disk access is the baseline requirement; two contacts are sanctioned (2026-09-30)
+Applied in the same change to: §0.2 (R1's access and residency contract, with the generated table of host-path
+sites), `xtask` (the structural check enforces that table against `HOST_PATH_ALLOWED`), and GAPS.
+- Why: the audit's §9 found R1's promise stated as one claim ("RAM only") while it is four, and the product
+  touching disk beyond the base and the landing; a first draft of this contract called literal zero disk
+  access an owed capability. Ada, 2026-09-30: "this isn't a capability. This is the baseline *requirement*",
+  "That ALSO means no /tmp".
+- The rule: literal zero disk access, including `/tmp` and every temporary directory, with no mode that allows
+  more. Exactly two disk contacts are sanctioned (Ada's decision): read-only reads of the host directory an
+  overlay volume sits on, and a granted landing's writes inside its target. Every other contact is a defect:
+  the operator commands' reads of fleet manifest, certificate, key and recovery-key files; temporary-directory
+  scratch in tests and harnesses and persisted property-test failures (AUD-29-63); kernel pseudo-file reads
+  whose backing is unproven. The four claims — no host file accessed, no private byte paged out or dumped, none
+  disclosed across consumers or hosts, ownership bounded through cancellation, restart and destroy — are
+  evidenced separately, each with the findings that still block it.
+- Evidence: the structural check now fails when the design's table and the enforced list differ (shown by
+  altering one row).
+- What it does not change: the lint wall, the write-syscall confinement to `slates-land`, D-25 and D-26.
 
