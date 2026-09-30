@@ -67,6 +67,13 @@ A tracer that fails to stop now fails the suite, with eslogger's stderr, within 
     exiting on the stop signal — 20 of 20 runs as a non-root user in Docker. The reader now stays open to
     the end, as the real tracer's stderr file does: 20 of 20 as that user, 10 of 10 as root and 10 of 10
     on macOS.
+- **Found on CI (run 36663502686, macOS): the first non-blocking filter slept on an empty pipe.** It
+  paused 20 ms whenever a read found nothing, and a machine-wide eslogger stream outran it. The kept
+  trace shows twelve readiness probes where the old blocking read's run needed two, then nothing more:
+  the anchor, the daemon, the landing and the drain marker never reached the log. The suite failed
+  "tracer produced no event within 20s" instead of hanging. The idle filter now `poll`s the stream for
+  at most one stop-check interval (20 ms), so it wakes the moment data arrives, as a blocking read
+  does. The mechanism is inferred from the trace; the fix is proven only by the macOS lane.
 - **Green.** The test passes in milliseconds, and the xtask suite is whole (31 and 4).
 - **Still to confirm.** The live eslogger path runs only on the macOS CI lane, which needs root; this
   machine does not run `sudo`.

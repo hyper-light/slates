@@ -300,7 +300,7 @@ fn keep_slates_events(
         ) {
           draining = Some(STREAM_DRAIN);
         } else {
-          super::pause();
+          wait_readable(&events)?;
         }
       }
       Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
@@ -312,6 +312,28 @@ fn keep_slates_events(
   out.flush()?;
   Ok(stream.filtered)
 }
+
+/// Waits until the tracer's stream is readable, or one stop-check interval has passed: the filter wakes
+/// the moment an event arrives, as a blocking read does, and still sees the stop. Sleeping on an empty
+/// pipe instead let the filter fall behind a machine-wide stream (CI run 36663502686: twelve readiness
+/// probes where two had sufficed, then nothing of the lifecycle kept, and the drain marker never seen).
+fn wait_readable(events: &std::process::ChildStdout) -> Result<(), Failure> {
+  let mut ready = [rustix::event::PollFd::new(
+    events,
+    rustix::event::PollFlags::IN,
+  )];
+  let interval = rustix::event::Timespec {
+    tv_sec: 0,
+    tv_nsec: STOP_CHECK_NS,
+  };
+  match rustix::event::poll(&mut ready, Some(&interval)) {
+    Ok(_) | Err(rustix::io::Errno::INTR) => Ok(()),
+    Err(error) => Err(std::io::Error::from(error).into()),
+  }
+}
+
+/// Shape: how often an idle filter looks for the stop, in nanoseconds: the harness's poll pause (20 ms).
+const STOP_CHECK_NS: i64 = 20_000_000;
 
 /// Shape: one read of the tracer's stream: 64 KiB, the default pipe buffer on Linux (pipe(7): sixteen
 /// pages) and the most macOS buffers for a large write, so one read can empty a full pipe.
