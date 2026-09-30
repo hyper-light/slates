@@ -83,7 +83,7 @@ async fn recv_port(rx: Receiver<u16>) -> u16 {
     if let Ok(p) = rx.try_recv() {
       return p;
     }
-    slates_rt::futures::sleep(1_000).await;
+    slates_rt::futures::sleep(1_000).await.unwrap();
   }
 }
 

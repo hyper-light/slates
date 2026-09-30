@@ -69,7 +69,7 @@ fn a_task_on_one_shard_is_woken_by_a_task_on_another() {
   rt.spawn_on(ids[1], async move {
     // Give the waiter time to register its waker, then flip the flag and wake it across shards.
     while REGISTERED.load(Ordering::Acquire) == 0 {
-      sleep(100_000).await;
+      sleep(100_000).await.unwrap();
     }
     FLAG.store(1, Ordering::Release);
     let word = slates_mem::Encoded::from_word(WAITER.load(Ordering::Acquire));
@@ -116,7 +116,7 @@ fn shutdown_cancels_running_tasks_and_joins_the_threads() {
   let rt = Runtime::start(&config(3)).unwrap();
   for id in rt.shard_ids().to_vec() {
     rt.spawn_on(id, async {
-      sleep(60_000_000_000).await;
+      sleep(60_000_000_000).await.unwrap();
     })
     .unwrap();
   }

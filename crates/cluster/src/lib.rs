@@ -291,8 +291,8 @@ impl DispatchWait {
     if !self.judge(gathered, now_ns()) {
       return false;
     }
-    sleep(self.poll_interval_ns).await;
-    true
+    // A sleep refused (off a shard) cannot time the wait: the dispatch stops waiting rather than spin.
+    sleep(self.poll_interval_ns).await.is_ok()
   }
 
   /// The decision [`keep_waiting`](DispatchWait::keep_waiting) takes before parking,
@@ -328,7 +328,7 @@ impl DispatchWait {
 /// What one timed exchange produced ([`request_within`]): the peer's reply bytes — empty when it refused,
 /// the deadline won, or the transport failed — and the exchange's **round trip**: `Some(elapsed)` when the
 /// peer answered inside the deadline (a refusal included: it completed a round trip), `None` when the
-/// deadline won or the transport failed — Karn's rule, a timed-out exchange is no round-trip sample. The
+/// deadline won, the transport failed, or the deadline could not be armed — Karn's rule, a timed-out exchange is no round-trip sample. The
 /// round trip is what the fleet's per-peer path estimate feeds on (`timing::PathRtt`, §4.8 "election
 /// timeout ≥ 10 × broadcast RTT p99"): a consensus round's replies, timely and late, each measure the
 /// path to the voter that answered.
@@ -446,21 +446,14 @@ pub async fn request_within(
   deadline_ns: u64,
 ) -> (TimedReply, Endpoint) {
   let sent_ns = now_ns();
-  let reply = {
-    let mut exchange = std::pin::pin!(endpoint.request(stream_id, priority, request));
-    let mut timer = std::pin::pin!(sleep(deadline_ns));
-    std::future::poll_fn(|cx| {
-      // Prefer a delivered reply over the deadline when both are ready.
-      if let std::task::Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), cx) {
-        return std::task::Poll::Ready(result.ok());
-      }
-      if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-        return std::task::Poll::Ready(None);
-      }
-      std::task::Poll::Pending
-    })
-    .await
-  };
+  // A delivered reply is preferred over the deadline when both are ready; a deadline that cannot be armed
+  // (off a shard) fails the exchange like a transport error, never as a timeout (AUD-29-39).
+  let reply =
+    slates_rt::futures::within(deadline_ns, endpoint.request(stream_id, priority, request))
+      .await
+      .ok()
+      .flatten()
+      .and_then(Result::ok);
   if reply.is_none() {
     // The deadline won: the `request` future was dropped mid-exchange. Abandon the exchange so its
     // half-sent frames do not ride the next flush on this reused session and reach the peer folded into an

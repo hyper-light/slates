@@ -250,7 +250,10 @@ async fn until<F: std::future::Future>(until_ns: u64, future: F) -> Option<F::Ou
     if let std::task::Poll::Ready(out) = std::future::Future::poll(future.as_mut(), cx) {
       return std::task::Poll::Ready(Some(out));
     }
-    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+    if std::future::Future::poll(deadline.as_mut(), cx)
+      .map(Result::unwrap)
+      .is_ready()
+    {
       return std::task::Poll::Ready(None);
     }
     std::task::Poll::Pending
@@ -318,7 +321,7 @@ async fn probe_peer(owner: HostId, peer: HostId, endpoint: Endpoint) {
         n.paths.entry(peer).or_default().on_sample(round_trip_ns);
       });
     }
-    sleep(HEARTBEAT_NS).await;
+    sleep(HEARTBEAT_NS).await.unwrap();
   }
 }
 
@@ -629,7 +632,7 @@ async fn coordinate(owner: HostId, rule: Rule, council_sessions: Vec<(HostId, En
     } else {
       follow_or_campaign(owner, contact, &others, &timing, budget).await;
     }
-    sleep(HEARTBEAT_NS).await;
+    sleep(HEARTBEAT_NS).await.unwrap();
   }
 }
 

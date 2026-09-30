@@ -102,7 +102,7 @@ fn fill_arena(rt: &Runtime, shard: ShardId) -> (usize, usize) {
     let receipt = rt
       .spawn_on_with_receipt(shard, async {
         while !RELEASE.load(Ordering::Acquire) {
-          sleep(HOP_NS).await;
+          sleep(HOP_NS).await.unwrap();
         }
       })
       .unwrap();

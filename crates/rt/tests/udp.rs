@@ -108,7 +108,7 @@ fn a_udp_datagram_is_received_through_the_driver() {
   // driver wakes it, and recv_from returns.
   let (sent_tx, sent_rx) = channel();
   rt.spawn_on(id, async move {
-    slates_rt::futures::sleep(5_000_000).await;
+    slates_rt::futures::sleep(5_000_000).await.unwrap();
     let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let _ = sent_tx.send(sender.send_to(b"ping", target));
   })
@@ -218,7 +218,7 @@ fn an_adopted_socket_receives_and_its_port_is_never_released_in_between() {
   })
   .unwrap();
   rt.spawn_on(id, async move {
-    slates_rt::futures::sleep(5_000_000).await;
+    slates_rt::futures::sleep(5_000_000).await.unwrap();
     let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let _ = sender.send_to(b"adopted", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
   })
@@ -285,9 +285,9 @@ fn a_second_receive_on_the_same_socket_registers_readiness_again() {
   let (sent_tx, sent_rx) = channel();
   rt.spawn_on(id, async move {
     let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-    slates_rt::futures::sleep(5_000_000).await;
+    slates_rt::futures::sleep(5_000_000).await.unwrap();
     let _ = sent_tx.send(sender.send_to(b"first", target));
-    slates_rt::futures::sleep(20_000_000).await;
+    slates_rt::futures::sleep(20_000_000).await.unwrap();
     let _ = sent_tx.send(sender.send_to(b"second", target));
   })
   .unwrap();
@@ -342,7 +342,7 @@ fn a_simulated_udp_datagram_is_received() {
         if let Ok(p) = port_rx.try_recv() {
           break p;
         }
-        slates_rt::futures::sleep(1_000).await;
+        slates_rt::futures::sleep(1_000).await.unwrap();
       };
       let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
       let _ = sender.send_to(b"simping", SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
@@ -409,14 +409,14 @@ fn run_stamped_flow(seed: u64, delay: slates_rt::sim::SimPath) -> Vec<(u64, u64)
         if let Ok(p) = port_rx.try_recv() {
           break p;
         }
-        slates_rt::futures::sleep(1_000).await;
+        slates_rt::futures::sleep(1_000).await.unwrap();
       };
       let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
       let dest = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
       for _ in 0..FLOW_LENGTH {
         let stamp = slates_rt::futures::now_ns();
         let _ = sender.send_to(&stamp.to_le_bytes(), dest);
-        slates_rt::futures::sleep(SEND_GAP_NS).await;
+        slates_rt::futures::sleep(SEND_GAP_NS).await.unwrap();
       }
     })
     .unwrap();

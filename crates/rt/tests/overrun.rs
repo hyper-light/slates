@@ -83,7 +83,7 @@ fn a_wait_stepped_past_its_deadline_reports_the_lateness() {
   let rt = LocalRuntime::new(&config()).unwrap();
   let ctx = rt.context();
   rt.spawn(async {
-    futures::sleep(SLEEP_NS).await;
+    futures::sleep(SLEEP_NS).await.unwrap();
   })
   .unwrap();
   // The task arms its timer; the shard then has nothing to do until it fires.
@@ -140,7 +140,7 @@ fn a_busy_shards_late_timer_is_not_a_scheduler_overrun() {
   let rt = LocalRuntime::new(&config()).unwrap();
   rt.spawn(async {
     let due = futures::now_ns().saturating_add(SLEEP_NS);
-    futures::sleep(SLEEP_NS).await;
+    futures::sleep(SLEEP_NS).await.unwrap();
     SLEEPER_LATE_NS.store(futures::now_ns().saturating_sub(due), Ordering::Release);
     SLEEPER_OVERRUN_NS.store(futures::scheduler_overrun_ns(), Ordering::Release);
   })
@@ -180,7 +180,7 @@ static IDLE_OVERRUN_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 async fn sleep_repeatedly() {
   let began = futures::now_ns();
   for _ in 0..SLEEPS {
-    futures::sleep(SLEEP_NS).await;
+    futures::sleep(SLEEP_NS).await.unwrap();
   }
   SLEEPS_SPAN_NS.store(futures::now_ns().saturating_sub(began), Ordering::Release);
   IDLE_OVERRUN_NS.store(futures::scheduler_overrun_ns(), Ordering::Release);

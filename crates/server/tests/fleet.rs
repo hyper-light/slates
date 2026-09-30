@@ -1321,7 +1321,9 @@ async fn dial_record_socket(
     loop {
       match release.try_recv() {
         Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-        Err(std::sync::mpsc::TryRecvError::Empty) => slates_rt::futures::sleep(HOLD_POLL_NS).await,
+        Err(std::sync::mpsc::TryRecvError::Empty) => {
+          slates_rt::futures::sleep(HOLD_POLL_NS).await.unwrap();
+        }
       }
     }
   }

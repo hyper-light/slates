@@ -144,7 +144,7 @@ async fn recv_port(rx: Receiver<u16>) -> u16 {
     if let Ok(p) = rx.try_recv() {
       return p;
     }
-    slates_rt::futures::sleep(POLL_NS).await;
+    slates_rt::futures::sleep(POLL_NS).await.unwrap();
   }
 }
 
@@ -157,7 +157,7 @@ async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> Option<()> {
     if let std::task::Poll::Ready(result) = settle.as_mut().poll(cx) {
       return std::task::Poll::Ready(result.ok());
     }
-    if deadline.as_mut().poll(cx).is_ready() {
+    if deadline.as_mut().poll(cx).map(Result::unwrap).is_ready() {
       return std::task::Poll::Ready(None);
     }
     std::task::Poll::Pending
@@ -247,7 +247,7 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
         )
         .unwrap();
         endpoint.establish().await.unwrap();
-        slates_rt::futures::sleep(plan.at_ns).await;
+        slates_rt::futures::sleep(plan.at_ns).await.unwrap();
         let mut acceptor = Acceptor::new(holder, authority());
         for _ in 0..plan.serves {
           // Ignore the result: a holder that serves before the commit resolves acknowledges cleanly; a
@@ -302,7 +302,7 @@ fn run_commit(budget: CommitBudget, plans: &[HolderPlan], recommit: Option<Quoru
       let mut sessions = committed.reusable;
       // Give the stragglers their bounded time to finish, then recover their sessions.
       let mut stragglers = committed.stragglers;
-      slates_rt::futures::sleep(RECOVERY_WAIT_NS).await;
+      slates_rt::futures::sleep(RECOVERY_WAIT_NS).await.unwrap();
       let (late, _) = stragglers.recover();
       let recovered: Vec<HostId> = late.iter().map(|(host, _)| *host).collect();
       sessions.extend(late);
@@ -538,7 +538,7 @@ fn run_broadcast(budget: CommitBudget, plans: &[HolderPlan]) -> (Vec<HostId>, u6
         )
         .unwrap();
         endpoint.establish().await.unwrap();
-        slates_rt::futures::sleep(plan.at_ns).await;
+        slates_rt::futures::sleep(plan.at_ns).await.unwrap();
         for _ in 0..plan.serves {
           let _ = endpoint.serve_once(|_, _| b"granted".to_vec()).await;
         }

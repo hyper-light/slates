@@ -145,7 +145,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tick = config(1).timer_tick_ns;
     let started = std::time::Instant::now();
     if let Ok(id) = rt.spawn(async move {
-      sleep(tick).await;
+      // A refused sleep would read as zero lateness: the measurement fails instead.
+      if let Err(refusal) = sleep(tick).await {
+        eprintln!("timer lateness: the sleep was refused: {refusal}");
+        std::process::exit(1);
+      }
     }) {
       rt.run_until_idle();
       let _ = rt.context().detach(id);

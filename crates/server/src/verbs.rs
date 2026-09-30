@@ -799,7 +799,10 @@ async fn await_deferred_completion(
 ) -> Option<ReplyBody> {
   let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
   loop {
-    slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS).await;
+    // Off a shard no poll can be timed: the reply is given up, as at its deadline.
+    slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
+      .await
+      .ok()?;
     let recorded = crate::xshard::call_within(
       control,
       shard,

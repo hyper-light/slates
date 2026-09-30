@@ -93,7 +93,7 @@ async fn recv_port(rx: Receiver<u16>) -> u16 {
     if let Ok(p) = rx.try_recv() {
       return p;
     }
-    slates_rt::futures::sleep(1_000).await;
+    slates_rt::futures::sleep(1_000).await.unwrap();
   }
 }
 
@@ -148,7 +148,9 @@ fn a_silent_peer_is_detected_dead_and_its_objects_are_taken_over() {
         // idle. A real crashed peer's socket stops answering the same way; the survivor's detector then
         // ages the suspicion to death with no further packets. The window covers the probe deadline with
         // margin; the survivor's post-probe tick loop is synchronous, so it needs no sim time.
-        slates_rt::futures::sleep(DEADLINE_NS.saturating_mul(4)).await;
+        slates_rt::futures::sleep(DEADLINE_NS.saturating_mul(4))
+          .await
+          .unwrap();
       }
     })
     .unwrap();

@@ -24,7 +24,7 @@
 //! against a nameserver task, at N=1 with no OS network (R8).
 
 use slates_rt::RtError;
-use slates_rt::futures::{now_ns, sleep};
+use slates_rt::futures::now_ns;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 
 /// The resolver configuration the command read from the operating system (`/etc/resolv.conf`): where to
@@ -359,18 +359,11 @@ async fn recv_within(
   buf: &mut [u8],
   timeout_ns: u64,
 ) -> Option<Result<(usize, SocketAddrV4), RtError>> {
-  let mut receive = std::pin::pin!(socket.recv_from(buf));
-  let mut timer = std::pin::pin!(sleep(timeout_ns));
-  std::future::poll_fn(|cx| {
-    if let std::task::Poll::Ready(received) = std::future::Future::poll(receive.as_mut(), cx) {
-      return std::task::Poll::Ready(Some(received));
-    }
-    if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-      return std::task::Poll::Ready(None);
-    }
-    std::task::Poll::Pending
-  })
-  .await
+  // A deadline that cannot be armed (off a shard) is the receive's own refusal, never a timeout.
+  match slates_rt::futures::within(timeout_ns, socket.recv_from(buf)).await {
+    Ok(received) => received,
+    Err(refusal) => Some(Err(refusal)),
+  }
 }
 
 /// One query to one nameserver: sends it from a fresh socket and waits up to the resolver's timeout for
@@ -540,7 +533,7 @@ mod tests {
           if let Ok(port) = port_rx.try_recv() {
             break port;
           }
-          sleep(1_000).await;
+          slates_rt::futures::sleep(1_000).await.unwrap();
         };
         let resolver = Resolver {
           nameservers: (0..nameservers)

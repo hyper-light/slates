@@ -381,7 +381,7 @@ jobs:
       # Miri's leak check is off for it; every other check stays on. The OS-driver tests are
       # marked ignored under Miri, which cannot model kqueue or eventfd.
       - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
-        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers
 
   windows-nightly:
     name: windows (nightly cadence)

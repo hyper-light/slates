@@ -115,7 +115,7 @@ fn a_sealed_control_datagram_travels_over_udp_and_is_accepted() {
         if let Ok(p) = port_rx.try_recv() {
           break p;
         }
-        slates_rt::futures::sleep(1_000).await;
+        slates_rt::futures::sleep(1_000).await.unwrap();
       };
       let schedule = KeySchedule::from_control_secret(&SECRET);
       let mut sealer = schedule.sealer(SENDER, EPOCH, Direction::Initiator, CHANNEL);

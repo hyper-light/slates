@@ -27,7 +27,6 @@
 //! per packet). The `Arc` here is rustls's config (D-8 exception 2), in `crate::handshake`.
 
 use std::collections::BTreeMap;
-use std::future::Future;
 use std::task::Poll;
 
 use rustix::net::SocketAddrV4;
@@ -551,29 +550,27 @@ impl Endpoint {
     let outcome = match &self.link {
       // The shard's receive buffer is lent only for the synchronous read, never across the await
       // (`crate::receive`), so one buffer of the largest UDP payload serves every session on the shard.
-      Link::Own(socket) => within(
-        async {
-          loop {
-            if let Some(datagram) = crate::receive::try_receive(socket)? {
-              return Ok(datagram);
-            }
-            socket.readable().await?;
+      // A deadline that cannot be armed (off a shard) is the receive's refusal, never a timeout.
+      Link::Own(socket) => slates_rt::futures::within(timeout_ns, async {
+        loop {
+          if let Some(datagram) = crate::receive::try_receive(socket)? {
+            return Ok(datagram);
           }
-        },
+          socket.readable().await?;
+        }
+      })
+      .await
+      .map_err(EndpointError::Io)?
+      .map(|received| received.map_err(EndpointError::Io)),
+      Link::Shared { demux, slot } => slates_rt::futures::within(
         timeout_ns,
+        std::future::poll_fn(|cx| {
+          with_demux(*demux, |d| d.poll_recv(*slot, cx))
+            .unwrap_or(Poll::Ready(Err(EndpointError::Closed)))
+        }),
       )
       .await
-      .map(|received| received.map_err(EndpointError::Io)),
-      Link::Shared { demux, slot } => {
-        within(
-          std::future::poll_fn(|cx| {
-            with_demux(*demux, |d| d.poll_recv(*slot, cx))
-              .unwrap_or(Poll::Ready(Err(EndpointError::Closed)))
-          }),
-          timeout_ns,
-        )
-        .await
-      }
+      .map_err(EndpointError::Io)?,
     };
     outcome.transpose()
   }
@@ -1521,23 +1518,6 @@ pub(crate) fn connection_id_of(datagram: &[u8]) -> Option<ConnectionId> {
     .and_then(|bytes| bytes.try_into().ok())
 }
 
-/// Races a receive against a timer of `timeout_ns`: its output if it lands first, `None` on the timer.
-/// A delivered datagram is preferred when both are ready.
-async fn within<F: Future>(receive: F, timeout_ns: u64) -> Option<F::Output> {
-  let mut receive = std::pin::pin!(receive);
-  let mut timer = std::pin::pin!(slates_rt::futures::sleep(timeout_ns));
-  std::future::poll_fn(|cx| {
-    if let Poll::Ready(out) = receive.as_mut().poll(cx) {
-      return Poll::Ready(Some(out));
-    }
-    if timer.as_mut().poll(cx).is_ready() {
-      return Poll::Ready(None);
-    }
-    Poll::Pending
-  })
-  .await
-}
-
 #[cfg(test)]
 mod tests {
   // Test harness: an unwrap here is a failed test.
@@ -1681,7 +1661,7 @@ mod tests {
           for _ in 0..count {
             sender.send(&[0]).unwrap();
             if paced {
-              slates_rt::futures::sleep(interval).await;
+              slates_rt::futures::sleep(interval).await.unwrap();
             } else {
               slates_rt::futures::yield_now().await;
             }

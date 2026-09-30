@@ -35,6 +35,22 @@ use crate::observe::{Admitted, Observation, ObserveError, ObserveStage};
 use crate::state::{self, ClientSlot, ShardState, StateAccess};
 use crate::verbs;
 
+/// A perpetual loop's pace on its shard: waits `ns`. The sleep is refused only off a shard, where no server
+/// loop runs; if it ever is, the loop stops here — counted (`runtime.sleep_refused`) and said once in the
+/// log — rather than spinning or reading the refusal as elapsed time (AUD-29-39). The task stays owned and
+/// ends with its shard.
+pub(crate) async fn pace(ns: u64) {
+  if let Err(refusal) = slates_rt::futures::sleep(ns).await {
+    if crate::fleet::count_refusal(SLEEP_REFUSED) == 1 {
+      eprintln!("slates-server: a periodic loop's sleep was refused ({refusal}); the loop stops");
+    }
+    std::future::pending::<()>().await;
+  }
+}
+
+/// A perpetual loop's sleep refused ([`pace`]): a tripwire, never an expected count.
+const SLEEP_REFUSED: &str = "runtime.sleep_refused";
+
 /// Shape: the heartbeat cadence the control shard beats the anchor's word at (§4.14
 /// `daemon.alive`): a tenth of the anchor's liveness budget, so nine beats fit inside it.
 pub const HEARTBEAT_NS: u64 = 100_000_000;
@@ -934,11 +950,11 @@ impl Daemon {
             };
             break (sessions, outcome);
           }
-          slates_rt::futures::sleep(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
+          pace(HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD).await;
         };
         let _ = taken.send(outcome);
         if !sessions.is_empty() {
-          slates_rt::futures::sleep(span_ns).await;
+          pace(span_ns).await;
           crate::fleet::return_sessions(sessions);
         }
       })
@@ -2468,7 +2484,7 @@ async fn reap_loop() {
   )
   .get();
   loop {
-    futures::sleep(cadence).await;
+    pace(cadence).await;
     state::with_state(|s| {
       let _ = verbs::expire_leases(s);
       // A destroy whose completion the catalog refused is recorded again here, at the reaper's cadence
@@ -2895,7 +2911,7 @@ async fn heartbeat_loop(segment: AnchorSegment) {
     if let Ok(sup) = segment.supervision() {
       sup.beat(now);
     }
-    futures::sleep(HEARTBEAT_NS).await;
+    pace(HEARTBEAT_NS).await;
   }
 }
 

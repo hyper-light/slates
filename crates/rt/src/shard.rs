@@ -115,6 +115,9 @@ pub struct Counters {
   pub stale_wakes: u64,
   /// Timers fired.
   pub timers_fired: u64,
+  /// Sleeps that found the timer wheel full and waited for a timer to free rather than completing before
+  /// their deadline (AUD-29-39): an overload tripwire, each wait woken by the next freed timer.
+  pub timer_waits: u64,
   /// Driver waits.
   pub waits: u64,
   /// Driver completions delivered.
@@ -243,6 +246,14 @@ pub struct ShardInner {
   /// The consumer of the entry's foreign wake ring, claimed at build and held for the context's life (the
   /// ring's only consumer, AUD-29-33); `None` for a context with no entry.
   foreign: Option<slates_mem::mpsc::Consumer<'static>>,
+  /// Task slots whose sleep found the wheel full, in the order they asked, each slot at most once
+  /// (`timer_waiter_queued`), so the queue never exceeds the arena's slots (AUD-29-39). A freed timer wakes
+  /// the oldest slot's task, whose sleep then arms; a slot whose task ended meanwhile wakes its new occupant,
+  /// if any, spuriously — which every future tolerates.
+  timer_waiters: std::collections::VecDeque<u32>,
+  /// Whether each slot is in `timer_waiters`, grown to the highest slot that waited (below the arena's
+  /// capacity).
+  timer_waiter_queued: Vec<bool>,
 }
 
 impl ShardInner {
@@ -482,6 +493,8 @@ impl ShardContext {
         shutting_down: false,
         pollers: Vec::new(),
         foreign,
+        timer_waiters: std::collections::VecDeque::new(),
+        timer_waiter_queued: Vec::new(),
       }),
       kept: KeptValues::default(),
     }));
@@ -854,8 +867,72 @@ impl ShardContext {
   /// Disarms a timer.
   pub fn disarm_timer(&self, id: crate::timer::TimerId) -> Result<(), RtError> {
     self
-      .with_inner(|inner| inner.timers.cancel(id))
+      .with_inner(|inner| {
+        inner.timers.cancel(id)?;
+        self.wake_timer_waiters(inner, 1);
+        Ok(())
+      })
       .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Queues the task `word` names to be woken when a timer frees — the path of a sleep that found the wheel
+  /// full (AUD-29-39): it waits, never completing before its deadline, and arms on the poll that follows.
+  /// A slot already queued is not queued twice. A word naming no live task is refused.
+  pub fn wait_for_timer(&self, word: u64) -> Result<(), RtError> {
+    self
+      .with_inner(|inner| {
+        let word = Encoded::from_word(word);
+        let stale = RtError::StaleTask {
+          slot: word.slot(),
+          generation: word.generation(),
+        };
+        if !inner
+          .arena
+          .contains(Handle::from_raw(word.slot(), word.generation()))
+        {
+          return Err(stale);
+        }
+        let index = usize::try_from(word.slot()).map_err(|_| stale.clone())?;
+        if inner.timer_waiter_queued.len() <= index {
+          inner
+            .timer_waiter_queued
+            .resize(index.checked_add(1).ok_or(stale)?, false);
+        }
+        if let Some(queued) = inner.timer_waiter_queued.get_mut(index)
+          && !*queued
+        {
+          *queued = true;
+          inner.timer_waiters.push_back(word.slot());
+          inner.counters.timer_waits += 1;
+        }
+        Ok(())
+      })
+      .ok_or(RtError::NotOnShardThread)?
+  }
+
+  /// Wakes the tasks of up to `freed` slots waiting for a timer, oldest first (a slot with no live task is
+  /// skipped).
+  fn wake_timer_waiters(&self, inner: &mut ShardInner, freed: usize) {
+    let mut woken = 0;
+    while woken < freed {
+      let Some(slot) = inner.timer_waiters.pop_front() else {
+        return;
+      };
+      if let Some(queued) = usize::try_from(slot)
+        .ok()
+        .and_then(|index| inner.timer_waiter_queued.get_mut(index))
+      {
+        *queued = false;
+      }
+      let live = inner
+        .arena
+        .generation_at(slot)
+        .is_some_and(|generation| inner.arena.contains(Handle::from_raw(slot, generation)));
+      if live {
+        self.local.push(slot);
+        woken += 1;
+      }
+    }
   }
 
   /// Live tasks in the arena.
@@ -1469,11 +1546,13 @@ impl ShardContext {
     let mut fired = std::mem::take(&mut inner.fired);
     inner.timers.advance(now, &mut fired);
     let any = !fired.is_empty();
+    let freed = fired.len();
     for word in fired.drain(..) {
       inner.counters.timers_fired += 1;
       self.local.push(Encoded::from_word(word).slot());
     }
     inner.fired = fired;
+    self.wake_timer_waiters(inner, freed);
     any
   }
 

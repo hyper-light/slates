@@ -77,7 +77,7 @@ async fn recv_port(rx: std::sync::mpsc::Receiver<u16>) -> u16 {
     if let Ok(p) = rx.try_recv() {
       return p;
     }
-    slates_rt::futures::sleep(1_000).await;
+    slates_rt::futures::sleep(1_000).await.unwrap();
   }
 }
 
@@ -391,7 +391,7 @@ fn a_request_gets_a_reply_over_a_live_session() {
         .serve_once_async(|_, req| async move {
           // Yield before producing the reply, so the pending-await path of `serve_once_async` is exercised
           // (a forwarded verb's reply comes from an `xshard` await, not synchronously).
-          slates_rt::futures::sleep(1_000).await;
+          slates_rt::futures::sleep(1_000).await.unwrap();
           req.iter().map(|b| b.wrapping_add(1)).collect()
         })
         .await
@@ -666,7 +666,7 @@ async fn within<F: Future>(within_ns: u64, future: F) -> Option<F::Output> {
     if let std::task::Poll::Ready(output) = future.as_mut().poll(cx) {
       return std::task::Poll::Ready(Some(output));
     }
-    if deadline.as_mut().poll(cx).is_ready() {
+    if deadline.as_mut().poll(cx).map(Result::unwrap).is_ready() {
       return std::task::Poll::Ready(None);
     }
     std::task::Poll::Pending
@@ -777,7 +777,7 @@ fn a_request_behind_an_abandoned_exchanges_unacknowledged_reply_is_served() {
         if let Some(abandoned) = client.last_exchange() {
           client.abandon(abandoned);
         }
-        slates_rt::futures::sleep(SETTLE_NS).await;
+        slates_rt::futures::sleep(SETTLE_NS).await.unwrap();
         let reply_b = within(
           EXCHANGE_BOUND_NS,
           client.request(STREAM_ID, Priority::Control, b"request B"),
@@ -844,7 +844,7 @@ async fn recv_count<T>(rx: std::sync::mpsc::Receiver<T>, count: usize) -> Vec<T>
   while out.len() < count {
     match rx.try_recv() {
       Ok(value) => out.push(value),
-      Err(_) => slates_rt::futures::sleep(1_000).await,
+      Err(_) => slates_rt::futures::sleep(1_000).await.unwrap(),
     }
   }
   out
@@ -1275,7 +1275,7 @@ fn a_packet_naming_no_session_is_dropped_and_counted_while_the_live_session_serv
           .send_to(&stray, SocketAddrV4::new(Ipv4Addr::LOCALHOST, stray_port))
           .map_err(|e| format!("{e:?}"))?;
         // Let the demultiplexer see it before the next request.
-        slates_rt::futures::sleep(1_000_000).await;
+        slates_rt::futures::sleep(1_000_000).await.unwrap();
         let after = endpoint
           .request(STREAM_ID, Priority::Control, b"after the stray")
           .await
@@ -1686,7 +1686,7 @@ async fn recv_signal(rx: std::sync::mpsc::Receiver<()>) {
     if rx.try_recv().is_ok() {
       return;
     }
-    slates_rt::futures::sleep(1_000).await;
+    slates_rt::futures::sleep(1_000).await.unwrap();
   }
 }
 

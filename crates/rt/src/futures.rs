@@ -6,9 +6,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use slates_mem::MemError;
+
 use crate::error::RtError;
 use crate::registry;
-use crate::shard::{ShardId, TaskId, boxed};
+use crate::shard::{ShardContext, ShardId, TaskId, boxed};
 use crate::task::Outcome;
 use crate::timer::TimerId;
 use crate::waker::word_of;
@@ -157,7 +159,14 @@ pub fn sleep(ns: u64) -> Sleep {
   }
 }
 
-/// The sleep future.
+/// The sleep future: completes, `Ok`, no earlier than its deadline — the shard's clock at the first poll
+/// plus the span. A wheel with no free timer does not end it early: the task waits for a timer to free
+/// (counted, `Counters::timer_waits`) and arms then, or completes if its deadline passed meanwhile. It is
+/// refused only where no wait can succeed: polled off a shard, or with a waker that is not a task's
+/// (`NotOnShardThread`). A caller racing it against other work must tell `Ready(Err)` from the deadline —
+/// `Poll::is_ready` does not. Until 2026-09-30 every
+/// arming failure, a full wheel included, completed the sleep at once, so an overloaded periodic loop spun
+/// exactly when the runtime was under pressure (AUD-29-39).
 #[derive(Debug)]
 pub struct Sleep {
   ns: u64,
@@ -166,35 +175,71 @@ pub struct Sleep {
 }
 
 impl Future for Sleep {
-  type Output = ();
+  type Output = Result<(), RtError>;
 
-  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+  fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
     let Some(word) = word_of(cx.waker()) else {
-      // A foreign waker cannot be armed on the wheel; the sleep degrades to an immediate return,
-      // which the caller's own clock will notice.
-      return Poll::Ready(());
+      return Poll::Ready(Err(RtError::NotOnShardThread));
     };
-    let now = registry::with_current(|ctx| ctx.now_ns()).unwrap_or(0);
-    match self.deadline {
-      None => {
-        let deadline = now.saturating_add(self.ns);
-        self.deadline = Some(deadline);
-        let armed = registry::with_current(|ctx| ctx.arm_timer(deadline, word.word()));
-        match armed {
-          Some(Ok(id)) => {
-            self.timer = Some(id);
-            Poll::Pending
-          }
-          _ => Poll::Ready(()),
-        }
+    let Some(now) = registry::with_current(ShardContext::now_ns) else {
+      return Poll::Ready(Err(RtError::NotOnShardThread));
+    };
+    // A deadline past the clock's range saturates: the sleep then never completes, which is exactly "no
+    // earlier than its deadline" (the range is some 584 years of nanoseconds), and its timer is the future's
+    // own, disarmed when it drops.
+    let span = self.ns;
+    let deadline = *self.deadline.get_or_insert(now.saturating_add(span));
+    if now >= deadline {
+      // A timer still armed (the clock passed the deadline before the wheel fired it) is given back.
+      if let Some(id) = self.timer.take() {
+        let _ = registry::with_current(|ctx| ctx.disarm_timer(id));
       }
-      Some(deadline) if now >= deadline => {
-        self.timer = None;
-        Poll::Ready(())
+      return Poll::Ready(Ok(()));
+    }
+    if self.timer.is_some() {
+      return Poll::Pending;
+    }
+    match registry::with_current(|ctx| {
+      ctx
+        .arm_timer(deadline, word.word())
+        .map(Some)
+        .or_else(|refusal| match refusal {
+          // The wheel is full: wait for a timer to free, and arm on the poll that wakes.
+          RtError::Mem(MemError::SlabFull { .. }) => ctx.wait_for_timer(word.word()).map(|()| None),
+          refusal => Err(refusal),
+        })
+    }) {
+      Some(Ok(armed)) => {
+        self.timer = armed;
+        Poll::Pending
       }
-      Some(_) => Poll::Pending,
+      Some(Err(refusal)) => Poll::Ready(Err(refusal)),
+      None => Poll::Ready(Err(RtError::NotOnShardThread)),
     }
   }
+}
+
+/// Races `work` against a deadline `ns` from now on the shard's wheel: `Ok(Some(output))` when the work
+/// finishes first (preferred when both are ready), `Ok(None)` once the deadline has passed, and the sleep's
+/// refusal when no deadline can be kept (polled off a shard) — never a deadline that did not pass
+/// (AUD-29-39). On a wheel with no free timer the deadline, like any sleep, arms once a timer frees (counted,
+/// `Counters::timer_waits`), so under timer exhaustion it is enforced late, never early; the shard's timer
+/// bound is derived to cover its tasks' concurrent waits, which makes that count an overload tripwire. The one race every timed wait in the workspace uses; before 2026-09-30 each call site raced
+/// a pinned sleep by hand and read a refused sleep's completion as the deadline.
+pub async fn within<F: Future>(ns: u64, work: F) -> Result<Option<F::Output>, RtError> {
+  let mut work = std::pin::pin!(work);
+  let mut deadline = std::pin::pin!(sleep(ns));
+  std::future::poll_fn(|cx| {
+    if let Poll::Ready(output) = work.as_mut().poll(cx) {
+      return Poll::Ready(Ok(Some(output)));
+    }
+    match deadline.as_mut().poll(cx) {
+      Poll::Ready(Ok(())) => Poll::Ready(Ok(None)),
+      Poll::Ready(Err(refusal)) => Poll::Ready(Err(refusal)),
+      Poll::Pending => Poll::Pending,
+    }
+  })
+  .await
 }
 
 impl Drop for Sleep {

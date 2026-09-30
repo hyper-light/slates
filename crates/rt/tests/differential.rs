@@ -44,7 +44,7 @@ async fn program(log: Sender<String>) {
   .unwrap();
   let l2 = log.clone();
   let c2 = spawn_child(async move {
-    sleep(3_000_000).await;
+    sleep(3_000_000).await.unwrap();
     let _ = l2.send("c2 after sleeping".to_owned());
   })
   .unwrap();
@@ -61,7 +61,7 @@ async fn program(log: Sender<String>) {
   send(&log, "joined c2");
   let l4 = log.clone();
   let c4 = spawn(async move {
-    sleep(1_000_000_000).await;
+    sleep(1_000_000_000).await.unwrap();
     let _ = l4.send("c4 should never print".to_owned());
   })
   .unwrap();
@@ -137,7 +137,7 @@ fn a_lost_driver_cancels_every_task_with_a_terminal_completion() {
     let tx = tx.clone();
     sim
       .spawn_on(shard, async move {
-        sleep(10_000_000 * (i + 1)).await;
+        sleep(10_000_000 * (i + 1)).await.unwrap();
         let _ = tx.send(format!("task {i} finished sleeping"));
       })
       .unwrap();
@@ -164,7 +164,7 @@ fn a_parent_finishing_cancels_and_joins_its_children() {
       for i in 0..3 {
         let tx = tx.clone();
         spawn_child(async move {
-          sleep(1_000_000_000).await;
+          sleep(1_000_000_000).await.unwrap();
           let _ = tx.send(format!("child {i}"));
         })
         .unwrap();

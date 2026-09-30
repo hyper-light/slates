@@ -238,6 +238,18 @@ fn count(counter: &'static str) {
   state::with_state(|state| *state.refusals.entry(counter).or_insert(0) += 1);
 }
 
+/// Whether a round may wait one more poll for sessions still out: no once the liveness budget is spent, or
+/// when no poll can be timed (a refused sleep, off a shard — never a spin, AUD-29-39); either way counted as
+/// sessions that never returned.
+async fn wait_for_returning_sessions(began: u64, poll_ns: u64) -> bool {
+  let spent = slates_rt::futures::now_ns().saturating_sub(began) >= LIVENESS_BUDGET_NS;
+  if spent || slates_rt::futures::sleep(poll_ns).await.is_err() {
+    count("fleet.owner_location.session_never_returned");
+    return false;
+  }
+  true
+}
+
 /// One bounded read-only round, with no retries. Every dispatched child has the liveness-budget
 /// deadline; the round owns their straggler receiver until every session is returned. Concurrent
 /// requests can borrow only disjoint sessions, so aggregate fanout stays at the admitted peer bound.
@@ -282,12 +294,10 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
       met_out = true;
       count("fleet.owner_location.session_out");
     }
-    if slates_rt::futures::now_ns().saturating_sub(began) >= LIVENESS_BUDGET_NS {
-      count("fleet.owner_location.session_never_returned");
+    unasked = out;
+    if !wait_for_returning_sessions(began, poll_ns).await {
       break;
     }
-    unasked = out;
-    slates_rt::futures::sleep(poll_ns).await;
   }
   for _ in 0..answers.superseded_claims {
     count("fleet.owner_location.claim_superseded");
@@ -324,7 +334,12 @@ async fn ask(
     if done {
       break;
     }
-    slates_rt::futures::sleep(budget.poll_interval_ns).await;
+    if slates_rt::futures::sleep(budget.poll_interval_ns)
+      .await
+      .is_err()
+    {
+      break;
+    }
   }
   for _ in &unanswered {
     count("fleet.owner_location.no_reply");

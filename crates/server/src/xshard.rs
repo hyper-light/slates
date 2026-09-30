@@ -26,7 +26,6 @@ use std::task::{Context, Poll, Waker};
 
 use slates_rt::control::Control;
 use slates_rt::error::RtError;
-use slates_rt::futures::sleep;
 use slates_rt::registry;
 use slates_rt::task::SpawnRequest;
 
@@ -211,21 +210,16 @@ pub async fn call_within<T: Send + 'static>(
   within(call, deadline_ns).await
 }
 
-/// Awaits a registered call within the caller's remaining time budget (§4.3). Dropping this future
-/// cancels its registration even when neither the call nor its deadline has completed.
+/// Awaits a registered call within the caller's remaining time budget (§4.3): its answer, or `None` when
+/// the call failed, the deadline passed, or no deadline could be armed (off a shard — never read as time
+/// passing, AUD-29-39). Dropping this future cancels its registration even when neither the call nor its
+/// deadline has completed.
 pub async fn within<T: 'static>(call: CrossShardCall<T>, deadline_ns: u64) -> Option<T> {
-  let mut call = std::pin::pin!(call);
-  let mut timer = std::pin::pin!(sleep(deadline_ns));
-  std::future::poll_fn(|cx| {
-    if let Poll::Ready(result) = call.as_mut().poll(cx) {
-      return Poll::Ready(result);
-    }
-    if timer.as_mut().poll(cx).is_ready() {
-      return Poll::Ready(None);
-    }
-    Poll::Pending
-  })
-  .await
+  slates_rt::futures::within(deadline_ns, call)
+    .await
+    .ok()
+    .flatten()
+    .flatten()
 }
 
 #[cfg(test)]

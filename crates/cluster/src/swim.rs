@@ -20,7 +20,7 @@ use std::mem::size_of;
 
 use slates_db::register::HostId;
 use slates_rt::error::RtError;
-use slates_rt::futures::{now_ns, sleep};
+use slates_rt::futures::now_ns;
 use slates_transport::connection::{Priority, StreamRefusal};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 
@@ -726,26 +726,23 @@ async fn race_reply(
   bytes: &[u8],
   budget: CommitBudget,
 ) -> Option<Result<Vec<u8>, EndpointError>> {
-  let received = {
-    let mut request = std::pin::pin!(endpoint.request(PROBE_STREAM, Priority::Control, bytes));
-    let mut deadline = std::pin::pin!(sleep(budget.deadline_ns));
-    std::future::poll_fn(|cx| {
-      if let std::task::Poll::Ready(result) = std::future::Future::poll(request.as_mut(), cx) {
-        return std::task::Poll::Ready(Some(result));
-      }
-      if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
-        return std::task::Poll::Ready(None);
-      }
-      std::task::Poll::Pending
-    })
-    .await
-  };
-  if received.is_none()
+  let raced = slates_rt::futures::within(
+    budget.deadline_ns,
+    endpoint.request(PROBE_STREAM, Priority::Control, bytes),
+  )
+  .await;
+  // The request future was dropped mid-exchange — the deadline won, or none could be armed — so the
+  // exchange is abandoned.
+  if !matches!(raced, Ok(Some(_)))
     && let Some(abandoned) = endpoint.last_exchange()
   {
     endpoint.abandon(abandoned);
   }
-  received
+  match raced {
+    Ok(received) => received,
+    // A deadline that cannot be armed (off a shard) fails the exchange, never as a timeout (AUD-29-39).
+    Err(refusal) => Some(Err(EndpointError::Io(refusal))),
+  }
 }
 
 /// How one indirect-probe message fared over a probe session ([`deliver_once`]).

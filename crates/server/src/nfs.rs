@@ -684,7 +684,11 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
       let _ = state::with_state(|s| *s.refusals.entry("nfs.unmount_unconfirmed").or_insert(0) += 1);
       return;
     }
-    futures::sleep(poll).await;
+    if futures::sleep(poll).await.is_err() {
+      // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
+      let _ = state::with_state(|s| *s.refusals.entry("nfs.unmount_unconfirmed").or_insert(0) += 1);
+      return;
+    }
   }
 }
 

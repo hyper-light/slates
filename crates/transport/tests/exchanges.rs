@@ -100,7 +100,7 @@ async fn within<F: Future>(within_ns: u64, future: F) -> Option<F::Output> {
     if let std::task::Poll::Ready(output) = future.as_mut().poll(cx) {
       return std::task::Poll::Ready(Some(output));
     }
-    if deadline.as_mut().poll(cx).is_ready() {
+    if deadline.as_mut().poll(cx).map(Result::unwrap).is_ready() {
       return std::task::Poll::Ready(None);
     }
     std::task::Poll::Pending

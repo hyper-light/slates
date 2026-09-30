@@ -1001,6 +1001,25 @@ checked and refuse before mutation.
 > `WorkerFailed`). A runtime dropped without `shutdown` does the same in `Drop`
 > (`docs/bugs/2026-09-30-runtime-start-and-drop-orphaned-workers.md`).
 >
+> **Status (2026-09-30, AUD-29-39).** A sleep completes no earlier than its deadline, or is refused typed.
+> - **A full wheel makes the sleep wait, not return.** The task is queued for the next freed timer: once
+>   per slot, so the queue is bounded by the arena, and counted as `timer_waits`. It arms then, or completes
+>   if its deadline passed meanwhile.
+> - **A deadline past the clock saturates.** It never fires, and the timer is the future's own until it
+>   drops.
+> - **The only refusal is `NotOnShardThread`.** It is returned for a poll off a shard or with a waker that
+>   is not a task's.
+> - **One combinator races work against a deadline.** `futures::within` answers the work, the deadline, or
+>   the refusal, kept apart. It replaces the hand-rolled races that read a refused sleep as the deadline.
+> - **Under timer exhaustion a deadline is enforced late, never early.** The server derives one timer per
+>   task, which makes `timer_waits` an overload tripwire.
+> - **Every caller handles the refusal:**
+>   - a bounded operation ends with its "gave up" result;
+>   - a perpetual server loop stops, counted (`daemon::pace`);
+>   - an exchange fails typed (`EndpointError::Io`, `DiscoveryFault::Unbounded`);
+>   - a probe period waits for traffic alone
+>   (`docs/bugs/2026-09-30-a-refused-sleep-completed-at-once.md`).
+>
 > **Status (2026-09-30, AUD-29-08).** No safe runtime API lends state that its owner frees.
 > - **A context is lent only for a borrow that proves it alive.** `LocalRuntime::context` and
 >   `SimRuntime::context` lend for the owner's borrow. `registry::with_current` lends inside a closure, and

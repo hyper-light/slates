@@ -461,7 +461,7 @@ async fn coordinator(
         .unwrap();
       assert_eq!(reply.len(), PING_BYTES, "the ping echoed");
       let _ = pings.send((started - run_start, slates_rt::futures::now_ns() - started));
-      slates_rt::futures::sleep(ping_gap).await;
+      slates_rt::futures::sleep(ping_gap).await.unwrap();
     }
   })
   .unwrap();
@@ -527,7 +527,7 @@ async fn wait_for_bulk(
       );
       false
     });
-    slates_rt::futures::sleep(MS).await;
+    slates_rt::futures::sleep(MS).await.unwrap();
   }
   true
 }

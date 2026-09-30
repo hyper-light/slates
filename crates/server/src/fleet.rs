@@ -897,9 +897,19 @@ fn wake_probe_task(state: &mut ShardState, peer: HostId) {
 /// (a post that landed between the check and the park is not missed) and drops its waker on the way out.
 async fn sleep_or_wake(period_ns: u64, peer: HostId) {
   let mut timer = std::pin::pin!(futures::sleep(period_ns));
+  // A refused period (off a shard) waits for traffic alone: counted, never read as the period passing, and
+  // never a spin (AUD-29-39).
+  let mut timed = true;
   std::future::poll_fn(|cx| {
-    if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-      return std::task::Poll::Ready(());
+    if timed {
+      match std::future::Future::poll(timer.as_mut(), cx) {
+        std::task::Poll::Ready(Ok(())) => return std::task::Poll::Ready(()),
+        std::task::Poll::Ready(Err(_)) => {
+          timed = false;
+          count_refusal(PERIOD_UNBOUNDED);
+        }
+        std::task::Poll::Pending => {}
+      }
     }
     let pending = state::with_state(|s| {
       if s.indirect.traffic_pending_for(peer) {
@@ -2304,7 +2314,7 @@ async fn probe_peer(identity: Kept<Identity>, dial: PeerDial, local: HostId, nei
         timing: &probe_timing,
       };
       reach_out_when_due(&reach, &mut reconnect, &mut detector, &mut probe_nonce).await;
-      futures::sleep(HEARTBEAT_NS).await;
+      crate::daemon::pace(HEARTBEAT_NS).await;
       continue;
     }
     reconnect = None;
@@ -2605,7 +2615,7 @@ async fn serve_peer_records(
             // wire), so a peer's exchange is pending — its endpoint borrowed — while this node is then
             // stopped: the interrupted-discovery restart the replacement-voter regression forces.
             while state::with_state(|state| state.discovery_withhold_replies).unwrap_or(false) {
-              futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+              crate::daemon::pace(HEARTBEAT_NS / POLL_PER_PERIOD).await;
             }
             let outcome =
               state::with_state(|state| crate::discovery::serve(state, &certificate, &request));
@@ -3889,6 +3899,10 @@ const DISCOVERY_DEADLINE: &str = "fleet.discovery.deadline";
 const DISCOVERY_INVALIDATED: &str = "fleet.discovery.invalidated";
 /// A discovery exchange whose transport failed terminally.
 const DISCOVERY_TRANSPORT: &str = "fleet.discovery.transport";
+/// A discovery exchange whose deadline could not be armed ([`DiscoveryFault::Unbounded`]): a tripwire.
+const DISCOVERY_UNBOUNDED: &str = "fleet.discovery.unbounded";
+/// A probe task's period whose sleep was refused ([`sleep_or_wake`]): it then waits for traffic alone.
+const PERIOD_UNBOUNDED: &str = "fleet.probe.period_unbounded";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
@@ -4120,7 +4134,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       // (that establish would block on a peer that will not answer, `docs/bugs/2026-09-10-*`), so idling
       // costs nothing until the peer is alive again.
       state::with_state(|s| s.record_sessions.remove(&peer_host));
-      futures::sleep(HEARTBEAT_NS).await;
+      crate::daemon::pace(HEARTBEAT_NS).await;
       continue;
     }
     // Absent means no session (never established, or lost); a `None` entry means the coordinator has it out
@@ -4144,7 +4158,7 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     if !absent {
       refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
     }
-    futures::sleep(HEARTBEAT_NS).await;
+    crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
 
@@ -4266,6 +4280,9 @@ enum DiscoveryFault {
   Deadline,
   Invalidated,
   Transport,
+  /// The exchange's deadline could not be armed (its sleep refused, off a shard): never read as the
+  /// deadline passing (AUD-29-39).
+  Unbounded,
 }
 
 impl DiscoveryFault {
@@ -4274,6 +4291,7 @@ impl DiscoveryFault {
       DiscoveryFault::Deadline => DISCOVERY_DEADLINE,
       DiscoveryFault::Invalidated => DISCOVERY_INVALIDATED,
       DiscoveryFault::Transport => DISCOVERY_TRANSPORT,
+      DiscoveryFault::Unbounded => DISCOVERY_UNBOUNDED,
     }
   }
 
@@ -4282,6 +4300,9 @@ impl DiscoveryFault {
       DiscoveryFault::Deadline => DiscoveryOutcome::Deadline,
       DiscoveryFault::Invalidated => DiscoveryOutcome::Invalidated,
       DiscoveryFault::Transport => DiscoveryOutcome::Transport,
+      // A deadline that cannot be armed is a terminal runtime failure of the exchange: its session is
+      // released like a transport's; its own counter tells the two apart.
+      DiscoveryFault::Unbounded => DiscoveryOutcome::Transport,
     }
   }
 }
@@ -4353,8 +4374,14 @@ async fn exchange_discovery(
       if let std::task::Poll::Ready(result) = std::future::Future::poll(exchange.as_mut(), cx) {
         return std::task::Poll::Ready(result.map_err(|_| DiscoveryFault::Transport));
       }
-      if std::future::Future::poll(timer.as_mut(), cx).is_ready() {
-        return std::task::Poll::Ready(Err(DiscoveryFault::Deadline));
+      match std::future::Future::poll(timer.as_mut(), cx) {
+        std::task::Poll::Ready(Ok(())) => {
+          return std::task::Poll::Ready(Err(DiscoveryFault::Deadline));
+        }
+        std::task::Poll::Ready(Err(_)) => {
+          return std::task::Poll::Ready(Err(DiscoveryFault::Unbounded));
+        }
+        std::task::Poll::Pending => {}
       }
       // At most one waiter per anchor: the link task drives one exchange at a time.
       state::with_state(|s| {
@@ -5053,7 +5080,11 @@ async fn take_campaign_sessions(
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
-    futures::sleep(budget.poll_interval_ns).await;
+    // A refused sleep (off a shard) ends the wait with what was taken, never a spin.
+    if futures::sleep(budget.poll_interval_ns).await.is_err() {
+      count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
+      return taken;
+    }
     taken.extend(take_sessions(|host| out.contains(&host) && available(host)));
   }
 }
@@ -6146,7 +6177,7 @@ async fn run_record_plane(local: HostId) {
     // Serve the content of each adopted head, from what this node holds or a recorded holder, on the
     // shard the taken-over id routes to.
     materialize_adopted_objects(origin, budget).await;
-    futures::sleep(HEARTBEAT_NS).await;
+    crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
 
@@ -6449,7 +6480,12 @@ pub(crate) async fn forward_over_leader_session(
     if expired {
       return None;
     }
-    futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD).await;
+    if futures::sleep(HEARTBEAT_NS / POLL_PER_PERIOD)
+      .await
+      .is_err()
+    {
+      return None;
+    }
   }
 }
 

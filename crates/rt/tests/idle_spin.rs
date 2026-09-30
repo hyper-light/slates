@@ -84,7 +84,7 @@ fn a_shard_spins_only_inside_the_window_its_last_client_activity_opened() {
   let shard = rt.shard_ids()[0];
   rt.spawn_on(shard, async {
     loop {
-      sleep(TICK_NS).await;
+      sleep(TICK_NS).await.unwrap();
     }
   })
   .unwrap();

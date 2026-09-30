@@ -111,7 +111,7 @@ fn spawn_sender(
       for (index, (at, len)) in schedule.into_iter().enumerate() {
         let now = slates_rt::futures::now_ns();
         if at > now {
-          slates_rt::futures::sleep(at - now).await;
+          slates_rt::futures::sleep(at - now).await.unwrap();
         }
         let sequence = first_sequence + index as u64;
         let _ = socket.send_to(&datagram(sequence, len), dest).unwrap();
@@ -372,7 +372,7 @@ fn a_nat_mapping_expires_and_the_next_datagram_rebinds() {
       let peer_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer);
       inside.send_to(&datagram(1, 16), peer_addr).unwrap();
       // Idle past the timeout, then speak again.
-      slates_rt::futures::sleep(2 * IDLE).await;
+      slates_rt::futures::sleep(2 * IDLE).await.unwrap();
       inside.send_to(&datagram(2, 16), peer_addr).unwrap();
       let mut buf = [0u8; 64];
       let (_, _) = inside.recv_from(&mut buf).await.unwrap();

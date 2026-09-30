@@ -93,7 +93,9 @@ async fn address_from(receiver: Receiver<SocketAddrV4>) -> SocketAddrV4 {
     if let Ok(address) = receiver.try_recv() {
       return address;
     }
-    slates_rt::futures::sleep(config().timer_tick_ns).await;
+    slates_rt::futures::sleep(config().timer_tick_ns)
+      .await
+      .unwrap();
   }
 }
 
@@ -106,7 +108,10 @@ async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
     if let std::task::Poll::Ready(settled) = std::future::Future::poll(settle.as_mut(), cx) {
       return std::task::Poll::Ready(settled.is_ok());
     }
-    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+    if std::future::Future::poll(deadline.as_mut(), cx)
+      .map(Result::unwrap)
+      .is_ready()
+    {
       return std::task::Poll::Ready(false);
     }
     std::task::Poll::Pending
@@ -125,7 +130,12 @@ async fn serve_bounded(endpoint: &mut Endpoint, held: &mut ContentHold) -> bool 
     if let Poll::Ready(result) = serving.as_mut().poll(context) {
       return Poll::Ready(result.is_ok());
     }
-    if deadline.as_mut().poll(context).is_ready() {
+    if deadline
+      .as_mut()
+      .poll(context)
+      .map(Result::unwrap)
+      .is_ready()
+    {
       return Poll::Ready(false);
     }
     Poll::Pending
@@ -170,7 +180,7 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
       )
       .unwrap();
       endpoint.establish().await.unwrap();
-      slates_rt::futures::sleep(offer_delay_ns).await;
+      slates_rt::futures::sleep(offer_delay_ns).await.unwrap();
       let mut held = ContentHold::new();
       for _ in ["offer", "put"] {
         if !serve_bounded(&mut endpoint, &mut held).await {
@@ -214,7 +224,9 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
         budget,
       )
       .await;
-      slates_rt::futures::sleep(budget.max_deadline_ns()).await;
+      slates_rt::futures::sleep(budget.max_deadline_ns())
+        .await
+        .unwrap();
       let (late, complete) = placed.stragglers.recover();
       placed_tx
         .send(PutObservation {

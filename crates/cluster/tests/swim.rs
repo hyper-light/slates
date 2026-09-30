@@ -100,7 +100,7 @@ async fn recv_port(rx: Receiver<u16>) -> u16 {
     if let Ok(p) = rx.try_recv() {
       return p;
     }
-    slates_rt::futures::sleep(1_000).await;
+    slates_rt::futures::sleep(1_000).await.unwrap();
   }
 }
 
@@ -130,7 +130,10 @@ async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
     if let std::task::Poll::Ready(settled) = std::future::Future::poll(settle.as_mut(), cx) {
       return std::task::Poll::Ready(settled.is_ok());
     }
-    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+    if std::future::Future::poll(deadline.as_mut(), cx)
+      .map(Result::unwrap)
+      .is_ready()
+    {
       return std::task::Poll::Ready(false);
     }
     std::task::Poll::Pending
@@ -153,7 +156,10 @@ async fn serve_within(endpoint: &mut Endpoint, detector: &mut Detector, within_n
     if let std::task::Poll::Ready(served) = std::future::Future::poll(serve.as_mut(), cx) {
       return std::task::Poll::Ready(served.is_ok());
     }
-    if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+    if std::future::Future::poll(deadline.as_mut(), cx)
+      .map(Result::unwrap)
+      .is_ready()
+    {
       return std::task::Poll::Ready(false);
     }
     std::task::Poll::Pending
@@ -290,7 +296,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
           // second the live one. The rumour rides both, so the prober's counted acknowledgement carrying
           // it proves a served reply was counted; the nonce proves *which*. Each serve is bounded, so a
           // prober that never sends a second probe leaves the fabric idle rather than this target waiting.
-          slates_rt::futures::sleep(LATE_SLEEP_NS).await;
+          slates_rt::futures::sleep(LATE_SLEEP_NS).await.unwrap();
           let mut detector = Detector::new(TARGET, timing());
           detector.apply(
             RUMOUR,
@@ -347,7 +353,7 @@ fn run_probe(mode: TargetMode) -> ProbeResult {
         );
         // The next probe goes out a period later, once the target is back (the daemon re-probes at a
         // backed-off deadline; here the wait is the target's own late span, so the probe meets it awake).
-        slates_rt::futures::sleep(LATE_SLEEP_NS).await;
+        slates_rt::futures::sleep(LATE_SLEEP_NS).await.unwrap();
         let _ = detector.tick();
         let second = SwimMessage::Ping {
           from: PROBER,
