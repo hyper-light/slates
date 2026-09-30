@@ -3590,6 +3590,24 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 
 > **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
 
+> **Status (2026-09-30, AUD-29-48).** 1-RTT keys update, and their use is bounded (RFC 9001 §6, §6.6).
+> - **Generations.** A session seals at most a generation's confidentiality limit, which is the AEAD's own
+>   or an operator's smaller cap (`Endpoint::cap_key_usage`). Then it moves to the next generation from the
+>   TLS secrets and flips the short header's key-phase bit.
+> - **The update rule.** The next generation is derived ahead, so the peer recognizes an update on its
+>   first packet and moves too. One previous receive key is kept for reordered stragglers, so at most three
+>   key sets are held. An update starts only once the peer has acknowledged a packet of the current
+>   generation.
+> - **Terminal outcomes.**
+>   - At the limit without such an acknowledgement, the session ends `KeysExhausted(ConfidentialityExhausted)`.
+>   - Failed opens count across all keys, and at the integrity limit the session ends
+>     `KeysExhausted(IntegrityExhausted)`. Below it a failure is one discarded packet.
+> - **The control-plane seal** refuses past AES-GCM's 2^23-message confidentiality limit per key (the key
+>   rotates by epoch) and past its 2^52-forgery integrity limit.
+> - **Evidence.** A live session capped at eight packets per generation moves through thirteen generations
+>   each way over forty exchanges, with every reply correct and no forgeries
+>   (`docs/bugs/2026-09-30-session-keys-never-updated-or-counted.md`).
+>
 > **Status (2026-09-30, AUD-29-47).** The handshake keeps TLS's encryption levels apart (RFC 9001 §4.1.3).
 > - **Initial level.** ClientHello and ServerHello cross as plain fragments.
 > - **Handshake level.** EncryptedExtensions, both certificates, CertificateVerify and Finished cross as

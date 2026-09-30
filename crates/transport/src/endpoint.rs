@@ -58,6 +58,9 @@ const SHORT_HEADER_RESERVED_MASK: u8 = 0x18;
 /// Format: RFC 9000 §17.3 — bits 0-1 of a short-header first byte carry the packet-number length minus
 /// one, so a stored 0..=3 means a 1..=4 byte field.
 const PACKET_NUMBER_LENGTH_MASK: u8 = 0x03;
+/// Format: RFC 9001 §6 — bit 2 of a short-header first byte, the key phase: which generation of 1-RTT keys
+/// sealed the packet (`crate::keys`). Header-protected with the rest of the low bits.
+const KEY_PHASE_BIT: u8 = 0x04;
 /// Format: RFC 9000 §17.2/§17.3 — the destination connection id every short header carries, eight
 /// bytes (within the standard's 0..=20). Both ends derive it from the TLS exporter once the handshake
 /// completes ([`Endpoint::connection_id`]), so it is unique per session and never negotiated on the
@@ -181,6 +184,10 @@ pub enum EndpointError {
     /// The largest allowed ([`MAX_PACKET_PAYLOAD`]).
     max: usize,
   },
+  /// The session's 1-RTT keys cannot continue safely (RFC 9001 §6.6): a generation sealed its limit with no
+  /// acknowledgement to update on, or the integrity limit of failed opens was reached (AUD-29-48). The
+  /// session ends; a re-dial starts a fresh one.
+  KeysExhausted(crate::keys::KeyRefusal),
   /// The packet-number space is spent (`2^62`, RFC 9000 §12.3): the session closes without sending, and no
   /// number is ever reused under its keys (AUD-29-27). A re-dial starts a fresh session.
   PacketNumbersExhausted,
@@ -351,7 +358,11 @@ pub struct Endpoint {
   link: Link,
   peer: SocketAddrV4,
   quic: Quic,
-  keys: Option<Keys>,
+  /// The 1-RTT key schedule once the handshake produced it (`crate::keys`: generations, updates, limits).
+  keys: Option<crate::keys::OneRtt>,
+  /// Caps on the 1-RTT keys' usage below the AEAD's own limits ([`Endpoint::cap_key_usage`]); none by
+  /// default — `u64::MAX` leaves the AEAD's limits in force.
+  key_caps: (u64, u64),
   /// The connection id, once derived from the completed handshake ([`Endpoint::connection_id`]).
   cid: Option<ConnectionId>,
   /// The peer's transport parameters (`crate::params`), decoded and checked when the connection id is
@@ -435,6 +446,7 @@ impl Endpoint {
       quic: Quic::Client(client),
       pinned: Some(pinned.clone()),
       keys: None,
+      key_caps: (u64::MAX, u64::MAX),
       cid: None,
       peer_params: None,
       conn: Connection::new(shape, Role::Client),
@@ -472,6 +484,7 @@ impl Endpoint {
       quic: Quic::Server(server),
       pinned: None,
       keys: None,
+      key_caps: (u64::MAX, u64::MAX),
       cid: None,
       peer_params: None,
       conn: Connection::new(shape, Role::Server),
@@ -511,6 +524,7 @@ impl Endpoint {
       quic: Quic::Server(server),
       pinned: None,
       keys: None,
+      key_caps: (u64::MAX, u64::MAX),
       cid: None,
       peer_params: None,
       conn: Connection::new(shape, Role::Server),
@@ -988,7 +1002,7 @@ impl Endpoint {
       .emit_confirm()
       .ok_or(EndpointError::PacketNumbersExhausted)?;
     let largest_acked = self.conn.tx_largest_acked();
-    let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
+    let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
     let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames, 0)?;
     self.send(&datagram)?;
     Ok(())
@@ -1021,8 +1035,9 @@ impl Endpoint {
           self.levels.keys = Some(keys);
           self.levels.write = WriteLevel::Handshake;
         }
-        Some(KeyChange::OneRtt { keys, .. }) => {
-          self.keys = Some(keys);
+        Some(KeyChange::OneRtt { keys, next }) => {
+          let (packets, failures) = self.key_caps;
+          self.keys = Some(crate::keys::OneRtt::new(keys, next, packets, failures));
           self.levels.write = WriteLevel::OneRtt;
         }
         None if !wrote => return Ok(flight),
@@ -1142,18 +1157,36 @@ impl Endpoint {
     self.fragments_sent
   }
 
+  /// Caps the 1-RTT keys' usage below the AEAD's own limits (RFC 9001 §6.6): at most `packets` sealed per key
+  /// generation before an update, and at most `failures` failed opens for the session. The smaller of the
+  /// cap and the AEAD's limit is in force; set before the handshake produces the keys. An operator's
+  /// tighter policy, and how a test crosses the limits without billions of packets.
+  pub fn cap_key_usage(&mut self, packets: u64, failures: u64) {
+    self.key_caps = (packets, failures);
+  }
+
+  /// The 1-RTT key generations this session has moved past (either end's update), and the packets that
+  /// failed to open: zero before the handshake.
+  pub fn key_usage(&self) -> (u64, u64) {
+    self
+      .keys
+      .as_ref()
+      .map_or((0, 0), |keys| (keys.updates(), keys.failures()))
+  }
+
   /// Flushes every packet the connection currently wants to send: each `poll_transmit` gives a packet
   /// number (from the connection's continuous packet-number space) and its frames, which are protected
   /// under the local 1-RTT keys (the number sized against what the peer has acknowledged) and sent.
   fn flush(&mut self) -> Result<(), EndpointError> {
     let cid = self.connection_id()?;
-    let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
     // Packets are framed at the path MTU discovery has confirmed (the floor until it confirms more), and no
     // datagram may exceed it.
     let cap = self.conn.path_mtu().unwrap_or(MIN_DATAGRAM_BYTES);
     let budget = self.conn.packet_budget(self.frame_cap);
     while let Some((pn, frames)) = self.conn.poll_transmit(now_ns(), budget) {
-      let datagram = protect_packet(keys, &cid, pn, self.conn.tx_largest_acked(), &frames, 0)?;
+      let largest_acked = self.conn.tx_largest_acked();
+      let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
+      let datagram = protect_packet(keys, &cid, pn, largest_acked, &frames, 0)?;
       if datagram.len() > cap {
         return Err(EndpointError::DatagramTooLarge {
           bytes: datagram.len(),
@@ -1170,14 +1203,9 @@ impl Endpoint {
     // refuses (`EMSGSIZE`: past the interface, or past the host's datagram cap) bounds the search at once and
     // is not an error of the session.
     if let Some((pn, size)) = self.conn.poll_probe(now_ns()) {
-      let datagram = protect_packet(
-        keys,
-        &cid,
-        pn,
-        self.conn.tx_largest_acked(),
-        &[Frame::Ping],
-        size,
-      )?;
+      let largest_acked = self.conn.tx_largest_acked();
+      let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
+      let datagram = protect_packet(keys, &cid, pn, largest_acked, &[Frame::Ping], size)?;
       match self.send(&datagram) {
         Ok(()) => {}
         Err(EndpointError::Io(refusal)) if refusal.is_message_too_large() => {
@@ -1250,10 +1278,15 @@ impl Endpoint {
   fn ingest(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
     let now = now_ns();
     let cid = self.connection_id()?;
-    let keys = self.keys.as_ref().ok_or(EndpointError::NotReady)?;
+    let keys = self.keys.as_mut().ok_or(EndpointError::NotReady)?;
     let (pn, frames) = unprotect_packet(keys, &cid, self.rx_largest, datagram)?;
     self.rx_largest = self.rx_largest.max(pn);
     self.conn.handle_incoming(now, pn, &frames);
+    // An acknowledgement of a packet sealed under the current keys confirms them, which lets the next key
+    // update start (RFC 9001 §6.1).
+    if let (Some(keys), Some(largest)) = (self.keys.as_mut(), self.conn.tx_largest_acked()) {
+      keys.on_acknowledged(largest);
+    }
     Ok(())
   }
 
@@ -1545,7 +1578,7 @@ impl Endpoint {
 /// needs to sample, AEAD-seals them under the local 1-RTT packet key with that header as associated
 /// data, then masks the first byte and the packet-number field with the local header-protection key.
 fn protect_packet(
-  keys: &Keys,
+  keys: &mut crate::keys::OneRtt,
   cid: &ConnectionId,
   pn: u64,
   largest_acked: Option<u64>,
@@ -1556,7 +1589,10 @@ fn protect_packet(
   // the connection id, then the packet number.
   let encoded = encode_packet_number(pn, largest_acked);
   let pn_len = encoded.len();
-  let first_byte = FIXED_BIT | u8::try_from(pn_len - 1).unwrap_or(0);
+  // The generation that seals this packet, and its key-phase bit (an update happens here when due).
+  let phase = keys.seal(pn).map_err(EndpointError::KeysExhausted)?;
+  let phase_bit = if phase { KEY_PHASE_BIT } else { 0 };
+  let first_byte = FIXED_BIT | phase_bit | u8::try_from(pn_len - 1).unwrap_or(0);
   let mut packet = Vec::with_capacity(PACKET_NUMBER_OFFSET + pn_len);
   packet.push(first_byte);
   packet.extend_from_slice(cid);
@@ -1565,7 +1601,7 @@ fn protect_packet(
 
   // The frame bytes, padded (RFC 9000 §19.1 PADDING = zero bytes) so the packet is long enough that
   // header protection can sample the ciphertext even without counting the tag.
-  let sample_len = keys.local.header.sample_len();
+  let sample_len = keys.local_header().sample_len();
   // A path-MTU probe is padded further, to exactly `pad_to` bytes on the wire (`crate::pmtud`); every
   // other packet passes zero and is only padded for the sample.
   let mut payload = encode_frames(frames);
@@ -1582,8 +1618,7 @@ fn protect_packet(
 
   // AEAD-seal the payload with the plaintext header as associated data, then assemble the packet.
   let tag = keys
-    .local
-    .packet
+    .local_packet()
     .encrypt_in_place(pn, &packet, &mut payload)?;
   packet.extend_from_slice(&payload);
   packet.extend_from_slice(tag.as_ref());
@@ -1598,7 +1633,9 @@ fn protect_packet(
     .split_at_mut_checked(PACKET_NUMBER_OFFSET)
     .ok_or(EndpointError::NotReady)?;
   let first = first.first_mut().ok_or(EndpointError::NotReady)?;
-  keys.local.header.encrypt_in_place(sample, first, number)?;
+  keys
+    .local_header()
+    .encrypt_in_place(sample, first, number)?;
   Ok(packet)
 }
 
@@ -1608,12 +1645,12 @@ fn protect_packet(
 /// reconstructs the full number against `rx_largest`, then AEAD-opens the payload under the remote
 /// 1-RTT key with the unmasked header as associated data.
 fn unprotect_packet(
-  keys: &Keys,
+  keys: &mut crate::keys::OneRtt,
   cid: &ConnectionId,
   rx_largest: u64,
   datagram: &[u8],
 ) -> Result<(u64, Vec<Frame>), EndpointError> {
-  let sample_len = keys.remote.header.sample_len();
+  let sample_len = keys.remote_header().sample_len();
   if datagram.len() < HEADER_PROTECTION_SAMPLE_OFFSET + sample_len {
     return Err(EndpointError::NotReady);
   }
@@ -1634,7 +1671,9 @@ fn unprotect_packet(
     .split_at_mut_checked(PACKET_NUMBER_OFFSET)
     .ok_or(EndpointError::NotReady)?;
   let first = first.first_mut().ok_or(EndpointError::NotReady)?;
-  keys.remote.header.decrypt_in_place(sample, first, number)?;
+  keys
+    .remote_header()
+    .decrypt_in_place(sample, first, number)?;
 
   // Validate the now-plaintext short header.
   let first_byte = *packet.first().ok_or(EndpointError::Header)?;
@@ -1654,7 +1693,16 @@ fn unprotect_packet(
     .ok_or(EndpointError::Header)?;
   let aad = aad.to_vec();
   let mut buf = body.to_vec();
-  let plaintext = keys.remote.packet.decrypt_in_place(pn, &aad, &mut buf)?;
+  // Opened under the generation its key-phase bit and number name (`crate::keys`); a packet that does not
+  // authenticate is discarded, and at the integrity limit the session ends (RFC 9001 §6.6).
+  let phase = first_byte & KEY_PHASE_BIT != 0;
+  let opened = keys
+    .open(pn, phase, &aad, &mut buf)
+    .map_err(|refusal| match refusal {
+      crate::keys::OpenRefusal::Unauthenticated => EndpointError::Tls(rustls::Error::DecryptError),
+      crate::keys::OpenRefusal::Exhausted(exhausted) => EndpointError::KeysExhausted(exhausted),
+    })?;
+  let plaintext = buf.get(..opened).ok_or(EndpointError::Header)?;
   let frames = decode_frames(plaintext).map_err(EndpointError::Frames)?;
   Ok((pn, frames))
 }
@@ -1702,7 +1750,104 @@ mod tests {
   /// packet-protection functions can be exercised without a socket. (The direction is: the client's
   /// local packet key equals the server's remote packet key, so a client-protected packet opens with
   /// the server's keys.)
-  fn handshake_keys() -> (Keys, Keys) {
+  /// One packet carrying `max` in a credit frame, sealed by `from` as packet `pn`.
+  fn sealed(from: &mut crate::keys::OneRtt, pn: u64, max: u64) -> Vec<u8> {
+    protect_packet(from, &CID, pn, None, &[Frame::MaxData { max }], 0).unwrap()
+  }
+
+  /// The credit a packet opened by `to` carried.
+  fn opened(to: &mut crate::keys::OneRtt, datagram: &[u8]) -> Result<u64, EndpointError> {
+    let (_, frames) = unprotect_packet(to, &CID, 0, datagram)?;
+    match frames.as_slice() {
+      [Frame::MaxData { max }] => Ok(*max),
+      other => panic!("unexpected frames {other:?}"),
+    }
+  }
+
+  /// AUD-29-48 (RFC 9001 §6): do: cap each generation at two sealed packets; seal two, have the peer open
+  /// them and acknowledge the second, seal a third; expect the third to carry the other key phase and open
+  /// at the peer under the next generation — the peer moving too (both ends one update in) — and a packet of
+  /// the old generation delivered late still to open under the previous key.
+  #[test]
+  fn a_confirmed_generation_updates_at_its_limit_and_stragglers_still_open() {
+    let (mut client, mut server) = handshake_keys_capped(2, u64::MAX);
+    let first = sealed(&mut client, 0, 10);
+    let second = sealed(&mut client, 1, 11);
+    assert_eq!(opened(&mut server, &first).ok(), Some(10));
+    client.on_acknowledged(1);
+    let third = sealed(&mut client, 2, 12);
+    assert_eq!(client.updates(), 1, "the sender updated at its limit");
+    assert_eq!(
+      opened(&mut server, &third).ok(),
+      Some(12),
+      "the next generation opens it"
+    );
+    assert_eq!(server.updates(), 1, "the peer moved with it");
+    assert_eq!(
+      opened(&mut server, &second).ok(),
+      Some(11),
+      "a straggler opens under the previous key"
+    );
+    let reply = sealed(&mut server, 0, 20);
+    assert_eq!(
+      opened(&mut client, &reply).ok(),
+      Some(20),
+      "the peer's replies use the new generation"
+    );
+  }
+
+  /// AUD-29-48: do: cap each generation at two sealed packets and seal a third with no acknowledgement of the
+  /// current generation; expect `KeysExhausted(ConfidentialityExhausted)` — no packet sealed past the limit.
+  #[test]
+  fn an_unconfirmed_generation_at_its_limit_seals_nothing_more() {
+    let (mut client, _server) = handshake_keys_capped(2, u64::MAX);
+    let _ = sealed(&mut client, 0, 1);
+    let _ = sealed(&mut client, 1, 2);
+    assert!(matches!(
+      protect_packet(&mut client, &CID, 2, None, &[Frame::Ping], 0),
+      Err(EndpointError::KeysExhausted(
+        crate::keys::KeyRefusal::ConfidentialityExhausted
+      ))
+    ));
+  }
+
+  /// AUD-29-48 (RFC 9001 §6.6): do: cap the session at three failed opens and deliver tampered packets; expect
+  /// the first two discarded (`Tls`, the discard class) and the third to end the session
+  /// (`KeysExhausted(IntegrityExhausted)`), after which even an intact packet is refused the same way.
+  #[test]
+  fn forgeries_end_the_session_at_its_integrity_limit() {
+    let (mut client, mut server) = handshake_keys_capped(u64::MAX, 3);
+    let packet = sealed(&mut client, 0, 5);
+    let mut forged = packet.clone();
+    let last = forged.len() - 1;
+    forged[last] ^= 0x01;
+    assert!(matches!(
+      opened(&mut server, &forged),
+      Err(EndpointError::Tls(_))
+    ));
+    assert!(matches!(
+      opened(&mut server, &forged),
+      Err(EndpointError::Tls(_))
+    ));
+    assert!(matches!(
+      opened(&mut server, &forged),
+      Err(EndpointError::KeysExhausted(
+        crate::keys::KeyRefusal::IntegrityExhausted
+      ))
+    ));
+    assert_eq!(server.failures(), 3);
+  }
+
+  fn handshake_keys() -> (crate::keys::OneRtt, crate::keys::OneRtt) {
+    handshake_keys_capped(u64::MAX, u64::MAX)
+  }
+
+  /// Both ends' 1-RTT key schedules from a real in-memory handshake, their usage capped at `packets` per
+  /// generation and `failures` failed opens.
+  fn handshake_keys_capped(
+    packets: u64,
+    failures: u64,
+  ) -> (crate::keys::OneRtt, crate::keys::OneRtt) {
     let identity = self_signed("slates-node");
     let (mut client, mut server) = connect(&identity, &identity, "slates-node").unwrap();
     let mut client_keys = None;
@@ -1712,15 +1857,15 @@ mod tests {
         break;
       }
       let mut to_server = Vec::new();
-      if let Some(KeyChange::OneRtt { keys, .. }) = client.write_hs(&mut to_server) {
-        client_keys = Some(keys);
+      if let Some(KeyChange::OneRtt { keys, next }) = client.write_hs(&mut to_server) {
+        client_keys = Some(crate::keys::OneRtt::new(keys, next, packets, failures));
       }
       if !to_server.is_empty() {
         server.read_hs(&to_server).unwrap();
       }
       let mut to_client = Vec::new();
-      if let Some(KeyChange::OneRtt { keys, .. }) = server.write_hs(&mut to_client) {
-        server_keys = Some(keys);
+      if let Some(KeyChange::OneRtt { keys, next }) = server.write_hs(&mut to_client) {
+        server_keys = Some(crate::keys::OneRtt::new(keys, next, packets, failures));
       }
       if !to_client.is_empty() {
         client.read_hs(&to_client).unwrap();
@@ -1919,14 +2064,14 @@ mod tests {
   /// header equal to its plaintext, which this asserts never happens across the whole run.
   #[test]
   fn header_protection_masks_and_the_packet_round_trips() {
-    let (client_keys, server_keys) = handshake_keys();
+    let (mut client_keys, mut server_keys) = handshake_keys();
     // A deliberately tiny frame so the packet must be padded up to the sampleable length.
     let frames = vec![Frame::MaxData { max: 0x0102_0304 }];
 
     let mut any_masked = false;
     let mut rx_largest = 0u64;
     for pn in 0..8u64 {
-      let wire = protect_packet(&client_keys, &CID, pn, None, &frames, 0).unwrap();
+      let wire = protect_packet(&mut client_keys, &CID, pn, None, &frames, 0).unwrap();
       let plain = plaintext_header(pn);
       if wire[..plain.len()] != plain[..] {
         any_masked = true;
@@ -1936,7 +2081,8 @@ mod tests {
         Some(CID),
         "the id rides in the clear, so a demultiplexer can route by it"
       );
-      let (got_pn, got_frames) = unprotect_packet(&server_keys, &CID, rx_largest, &wire).unwrap();
+      let (got_pn, got_frames) =
+        unprotect_packet(&mut server_keys, &CID, rx_largest, &wire).unwrap();
       assert_eq!(got_pn, pn, "reconstructed packet number");
       assert_eq!(got_frames, frames, "recovered frames");
       rx_largest = rx_largest.max(got_pn);
@@ -1951,34 +2097,34 @@ mod tests {
   /// it), and a packet too short to sample is refused — never a panic, never a silent accept.
   #[test]
   fn a_tampered_or_short_packet_is_refused() {
-    let (client_keys, server_keys) = handshake_keys();
+    let (mut client_keys, mut server_keys) = handshake_keys();
     let frames = vec![Frame::Stream {
       stream_id: 1,
       offset: 0,
       fin: true,
       data: b"payload".to_vec(),
     }];
-    let wire = protect_packet(&client_keys, &CID, 3, None, &frames, 0).unwrap();
+    let wire = protect_packet(&mut client_keys, &CID, 3, None, &frames, 0).unwrap();
 
     // Flip the last byte (inside the AEAD tag): opening must fail.
     let mut tampered = wire.clone();
     let last = tampered.len() - 1;
     tampered[last] ^= 0x01;
     assert!(
-      unprotect_packet(&server_keys, &CID, 0, &tampered).is_err(),
+      unprotect_packet(&mut server_keys, &CID, 0, &tampered).is_err(),
       "a tampered packet must not open"
     );
 
     // A packet shorter than the header-protection sample is refused as not-ready, not a panic.
     assert!(matches!(
-      unprotect_packet(&server_keys, &CID, 0, &wire[..4]),
+      unprotect_packet(&mut server_keys, &CID, 0, &wire[..4]),
       Err(EndpointError::NotReady)
     ));
 
     // A packet naming another session's id is refused at the header, before any crypto.
     let other: ConnectionId = [9; CONNECTION_ID_BYTES];
     assert!(matches!(
-      unprotect_packet(&server_keys, &other, 0, &wire),
+      unprotect_packet(&mut server_keys, &other, 0, &wire),
       Err(EndpointError::Header)
     ));
   }

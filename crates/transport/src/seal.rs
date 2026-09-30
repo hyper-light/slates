@@ -42,6 +42,15 @@ pub const KEY_BYTES: usize = <Aes256Gcm as KeySizeUser>::KeySize::USIZE;
 /// `sealed_len` is pure framing the decoder bounds-checks and the tag over the ciphertext covers.
 const AAD_BYTES: usize = PROLOGUE_BYTES - size_of::<u32>();
 
+/// Format: RFC 9001 §6.6 and Appendix B.1.1 — AEAD_AES_256_GCM's confidentiality limit, the most messages one
+/// key may seal (2^23, for messages of up to 2^11 AES blocks; a control datagram is far smaller). Past it
+/// the key's confidentiality bound lapses, so the sealer refuses and the key rotates to its next epoch
+/// (`crate::schedule`). Nonce uniqueness alone does not bound this (AUD-29-48).
+const CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
+/// Format: RFC 9001 §6.6 and Appendix B.1.2 — AEAD_AES_256_GCM's integrity limit, the most forged messages
+/// one key may be asked to open (2^52): past it an opener refuses everything under the key.
+const INTEGRITY_LIMIT: u64 = 1 << 52;
+
 /// The AES-GCM nonce as the cipher sizes it (96 bits): `counter ‖ channel`.
 type SealNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
 
@@ -49,9 +58,12 @@ type SealNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
 /// one is a corrupt, forged, replayed or exhausted datagram — never a panic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealError {
-  /// The sealer's 64-bit nonce counter is exhausted; the key must be rotated (never reached in
-  /// practice — 2^64 datagrams — but refused rather than wrapped, which would reuse a nonce).
+  /// The key has sealed its confidentiality limit (2^23 datagrams, RFC 9001 §6.6); it must rotate to its
+  /// next epoch. Refused rather than sealed past the bound, and never wrapped into a reused nonce.
   CounterExhausted,
+  /// The opener's key has been asked to open its integrity limit of forged datagrams (RFC 9001 §6.6): it
+  /// refuses everything until the key rotates.
+  IntegrityExhausted,
   /// The opener already accepted this counter (a replay, or an out-of-order redelivery on a
   /// drop-older channel).
   Replay,
@@ -71,7 +83,10 @@ pub enum SealError {
 impl std::fmt::Display for SealError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
-      SealError::CounterExhausted => f.write_str("the sealer's nonce counter is exhausted"),
+      SealError::CounterExhausted => f.write_str("the sealer's key has sealed its limit"),
+      SealError::IntegrityExhausted => {
+        f.write_str("the opener's key has refused its limit of forgeries")
+      }
       SealError::Replay => f.write_str("the opener already accepted this counter"),
       SealError::BadSeal => f.write_str("the AEAD tag did not verify"),
       SealError::Truncated => f.write_str("the sealed datagram ended early"),
@@ -149,6 +164,9 @@ impl Sealer {
   /// nonce — catastrophic for GCM).
   fn seal(&mut self, aad: &[u8], plaintext: &[u8]) -> Result<(u64, Vec<u8>), SealError> {
     let counter = self.counter;
+    if counter >= CONFIDENTIALITY_LIMIT {
+      return Err(SealError::CounterExhausted);
+    }
     let advanced = counter.checked_add(1).ok_or(SealError::CounterExhausted)?;
     let nonce = nonce_for(counter, self.channel);
     let ciphertext = self
@@ -172,6 +190,8 @@ pub struct Opener {
   cipher: Aes256Gcm,
   channel: u32,
   high_water: Option<u64>,
+  /// Datagrams that failed to open under this key (counted toward its integrity limit).
+  failures: u64,
 }
 
 impl std::fmt::Debug for Opener {
@@ -193,6 +213,7 @@ impl Opener {
       cipher: Aes256Gcm::new(&key),
       channel,
       high_water: None,
+      failures: 0,
     }
   }
 
@@ -200,6 +221,9 @@ impl Opener {
   /// counter (replay/drop-older) *before* the crypto, and advances the high-water only *after* the tag
   /// verifies, so a forged high counter with a bad tag cannot lock out honest datagrams.
   fn open(&mut self, counter: u64, aad: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, SealError> {
+    if self.failures >= INTEGRITY_LIMIT {
+      return Err(SealError::IntegrityExhausted);
+    }
     if let Some(high_water) = self.high_water
       && counter <= high_water
     {
@@ -215,7 +239,10 @@ impl Opener {
           aad,
         },
       )
-      .map_err(|_| SealError::BadSeal)?;
+      .map_err(|_| {
+        self.failures = self.failures.saturating_add(1);
+        SealError::BadSeal
+      })?;
     self.high_water = Some(counter);
     Ok(plaintext)
   }
@@ -291,6 +318,33 @@ impl ControlDatagram {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// AUD-29-48 (RFC 9001 §6.6): do: a sealer whose key has sealed its confidentiality limit; seal once more;
+  /// expect `CounterExhausted` — the key rotates, it never seals past the bound.
+  #[test]
+  fn a_key_at_its_confidentiality_limit_seals_nothing_more() {
+    let mut sealer = Sealer::from_key(&[7u8; KEY_BYTES], 1);
+    sealer.counter = CONFIDENTIALITY_LIMIT;
+    assert_eq!(
+      sealer.seal(b"aad", b"body"),
+      Err(SealError::CounterExhausted)
+    );
+  }
+
+  /// AUD-29-48 (RFC 9001 §6.6): do: an opener whose key has refused its integrity limit of forgeries; open a
+  /// genuine datagram; expect `IntegrityExhausted` — nothing opens under the key until it rotates.
+  #[test]
+  fn a_key_at_its_integrity_limit_opens_nothing() {
+    let key = [7u8; KEY_BYTES];
+    let mut sealer = Sealer::from_key(&key, 1);
+    let (counter, ciphertext) = sealer.seal(b"aad", b"body").unwrap();
+    let mut opener = Opener::from_key(&key, 1);
+    opener.failures = INTEGRITY_LIMIT;
+    assert_eq!(
+      opener.open(counter, b"aad", &ciphertext),
+      Err(SealError::IntegrityExhausted)
+    );
+  }
   use crate::Envelope;
 
   /// A distinct, non-trivial key so a wrong-key open is a real test (not all-zeros).

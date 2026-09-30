@@ -795,6 +795,8 @@ pub fn outcome_of_request_error(error: &EndpointError) -> ProbeOutcome {
     | EndpointError::PeerParameters(_)
     // A session whose packet numbers are spent can send nothing more under its keys (RFC 9000 §12.3).
     | EndpointError::PacketNumbersExhausted
+    // Keys past their usage limits cannot protect another packet safely (RFC 9001 §6.6).
+    | EndpointError::KeysExhausted(_)
     | EndpointError::Stream(StreamRefusal::SequencesExhausted) => ProbeOutcome::Broken,
     // A backlog past the peer's stream credit means the peer is not finishing this end's streams — a
     // missed probe, which the suspicion rule already weighs; the other refusals are serve-side only.
