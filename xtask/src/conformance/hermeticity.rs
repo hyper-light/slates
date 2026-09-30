@@ -877,10 +877,12 @@ mod tests {
       .expect("spawn the stand-in tracer");
     let group = child.id();
     let stdout = child.stdout.take().expect("the stand-in's stdout");
+    // The stand-in's stderr stays open to the end, as the real tracer's (a file) does: the shell reports
+    // its foreground child's death there on the stop (dash: `Terminated`), and a closed pipe would kill
+    // it with SIGPIPE instead of letting it exit on the stop signal (20 of 20 runs as a non-root user).
+    let mut report = std::io::BufReader::new(child.stderr.take().expect("the stand-in's stderr"));
     let mut held = String::new();
-    std::io::BufReader::new(child.stderr.take().expect("the stand-in's stderr"))
-      .read_line(&mut held)
-      .expect("the descendant reports");
+    report.read_line(&mut held).expect("the descendant reports");
     assert_eq!(held, "held\n", "the descendant holds the stream");
     let (stop, stopped) = std::sync::mpsc::channel();
     let filter = std::thread::spawn(move || {
@@ -894,7 +896,12 @@ mod tests {
     };
     let (done, finished) = std::sync::mpsc::channel();
     let shutdown = std::thread::spawn(move || {
-      let _ = done.send(logger.shut_down(Ok(())).is_ok());
+      let _ = done.send(
+        logger
+          .shut_down(Ok(()))
+          .map(|_| ())
+          .map_err(|error| error.0),
+      );
     });
     let outcome = finished.recv_timeout(STOP_BOUND);
     // The descendant ignores the stop signal: end it (and with it the stream) whatever happened.
@@ -904,9 +911,10 @@ mod tests {
       .expect("the shutdown thread ends once the stream closes");
     assert_eq!(
       outcome,
-      Ok(true),
-      "the shutdown waited on the stream's end, which the descendant held open"
+      Ok(Ok(())),
+      "the shutdown must return, successfully, while the descendant holds the stream open"
     );
+    drop(report);
   }
 
   use slates_conformance::workload::{Entry, EntryKind};

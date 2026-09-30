@@ -62,6 +62,11 @@ A tracer that fails to stop now fails the suite, with eslogger's stderr, within 
   (reparented to pid 1) held the stream.
   - Found on the way: the first version of the fixture passed, because the stop signal reached the
     subshell before its ignore trap. The descendant now reports on stderr before the stop is sent.
+  - Found on CI (run 36663034331, Linux): the test then dropped its stderr reader, and dash reports its
+    foreground child's death there on the stop (`Terminated`), so the stand-in died of SIGPIPE instead of
+    exiting on the stop signal — 20 of 20 runs as a non-root user in Docker. The reader now stays open to
+    the end, as the real tracer's stderr file does: 20 of 20 as that user, 10 of 10 as root and 10 of 10
+    on macOS.
 - **Green.** The test passes in milliseconds, and the xtask suite is whole (31 and 4).
 - **Still to confirm.** The live eslogger path runs only on the macOS CI lane, which needs root; this
   machine does not run `sudo`.
