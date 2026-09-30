@@ -1572,7 +1572,9 @@ pub struct LandingSummary {
   pub filtered_out: u64,
 }
 
-/// A finished landing's outcome (§4.15).
+/// A finished landing's outcome (§4.15): the counts, and what the landing achieved and met — its
+/// durability, every Degraded cell, the entries it kept private, and the concurrency it settled on (AUD-29-05:
+/// until 2026-09-29 the reply carried the counts only, and a landing that did not sync read as done).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LandingOutcome {
   /// The landing id.
@@ -1589,6 +1591,98 @@ pub struct LandingOutcome {
   pub failed: u64,
   /// Bytes written to the disk.
   pub bytes_written: u64,
+  /// Entries on the disk that stay in the volume's overlay because they did not reach the durability
+  /// boundary (their directory, or the media barrier asked for, did not sync); a resume advances them.
+  pub held: u64,
+  /// The durability the landing achieved (§4.15 step 8).
+  pub durability: LandingDurability,
+  /// Every Degraded cell the landing met, in the order met.
+  pub degraded: Vec<LandingDegradation>,
+  /// The in-flight depth the landing's ramp settled on (§4.15 step 7).
+  pub ramp_depth: u32,
+}
+
+/// The durability a landing achieved (§4.15 step 8).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LandingDurability {
+  /// Every written file's data sync ran before its link or exchange.
+  pub data_synced: bool,
+  /// Every directory the landing touched was synced.
+  pub dirs_synced: bool,
+  /// The media barrier ran and held.
+  pub media: bool,
+  /// Whether the grant asked for media durability: without it, barriers only is the supported level.
+  pub media_requested: bool,
+  /// Directories synced.
+  pub dirs: u64,
+}
+
+/// A host's answer as a landing reports it: its typed refusals, or the errno it gave.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostAnswer {
+  /// The entry does not exist (any more).
+  NotFound,
+  /// Not a directory where one was needed.
+  NotDirectory,
+  /// Not a file where one was needed.
+  NotFile,
+  /// A handle the host no longer holds.
+  StaleHandle,
+  /// The host's errno.
+  Errno {
+    /// The errno.
+    errno: i32,
+  },
+}
+
+/// A Degraded cell a landing met (§4.15 failure matrix), as the reply carries it.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub enum LandingDegradation {
+  /// The filesystem has no atomic exchange; the fallback's widest window, nanoseconds, a name was absent.
+  NoExchange {
+    /// The widest window, nanoseconds.
+    widest_window_ns: u64,
+  },
+  /// Media durability was not asked for: barriers only, the supported level.
+  BarriersOnly,
+  /// The host stopped answering (a crash-like errno); the landing aborted and advanced nothing.
+  Crashed {
+    /// The errno.
+    errno: i32,
+  },
+  /// A touched directory could not be opened or synced; the entries in it stay in the overlay.
+  Unsynced {
+    /// The directory, by its path from the target.
+    dir: String,
+    /// What the host answered.
+    answer: HostAnswer,
+  },
+  /// The media barrier asked for failed; every entry stays in the overlay.
+  MediaUnsynced {
+    /// What the host answered.
+    answer: HostAnswer,
+  },
+  /// An entry of the landing's own could not be removed and stays under its name.
+  Leftover {
+    /// Its path from the target.
+    path: String,
+    /// What the host answered.
+    answer: HostAnswer,
+  },
+  /// A directory the sweep could not list; an earlier attempt's siblings in it, if any, stay.
+  Unswept {
+    /// The directory, by its path from the target.
+    dir: String,
+    /// What the host answered.
+    answer: HostAnswer,
+  },
+  /// An entry moved aside that could not go back is kept beside its name, never removed.
+  Kept {
+    /// The manifest path of the entry it was displaced by.
+    path: String,
+    /// The path it is kept at.
+    kept: String,
+  },
 }
 
 /// A grant in a listing (§4.13, §4.15).

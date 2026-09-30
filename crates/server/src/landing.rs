@@ -25,7 +25,9 @@ use slates_db::catalog::{
   LandingState as DbLandingState, Principal, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId,
 };
 #[cfg(unix)]
-use slates_ipc::protocol::{ActionCount, LandingOutcome, LandingSummary};
+use slates_ipc::protocol::{
+  ActionCount, HostAnswer, LandingDegradation, LandingDurability, LandingOutcome, LandingSummary,
+};
 use slates_ipc::protocol::{
   AuditEntry, GrantScope, GrantSummary, Refusal, ReplyBody, SnapshotId, VolumeId,
 };
@@ -33,7 +35,9 @@ use slates_land::engine::Audit;
 #[cfg(unix)]
 use slates_land::engine::{AuditKind, AuditRecord};
 #[cfg(unix)]
-use slates_land::engine::{LandingRefusal, LandingReport, LandingRequest, Observer, land};
+use slates_land::engine::{
+  Degradation, Durability, LandingRefusal, LandingReport, LandingRequest, Observer, land,
+};
 use slates_land::grant::{
   GrantBinding, GrantRecord as LandGrantRecord, GrantScope as LandScope,
   GrantState as LandGrantState, Grants, Leases, Surface, TargetIdentity,
@@ -46,7 +50,7 @@ use slates_land::manifest::{Filter, LandingEntry, Manifest};
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::clock::Clock;
 #[cfg(unix)]
-use slates_vfs::host::LandFs;
+use slates_vfs::host::{HostError, LandFs};
 #[cfg(unix)]
 use slates_wire::observe::Chokepoint;
 
@@ -524,7 +528,67 @@ fn finish(
       conflicts: report.conflicts as u64,
       failed: report.failed as u64,
       bytes_written: report.bytes_written,
+      held: u64::try_from(report.held).unwrap_or(u64::MAX),
+      durability: durability_of(&report.durability),
+      degraded: report.degraded.iter().map(degradation_of).collect(),
+      ramp_depth: report.ramp_depth,
     },
+  }
+}
+
+/// The engine's durability as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped it).
+#[cfg(unix)]
+fn durability_of(durability: &Durability) -> LandingDurability {
+  LandingDurability {
+    data_synced: durability.data_synced,
+    dirs_synced: durability.dirs_synced,
+    media: durability.media,
+    media_requested: durability.media_requested,
+    dirs: u64::try_from(durability.dirs).unwrap_or(u64::MAX),
+  }
+}
+
+/// A Degraded cell the engine met, as the reply carries it (AUD-29-05: until 2026-09-29 the reply dropped
+/// every one).
+#[cfg(unix)]
+fn degradation_of(degradation: &Degradation) -> LandingDegradation {
+  match degradation {
+    Degradation::NoExchange { widest_window_ns } => LandingDegradation::NoExchange {
+      widest_window_ns: *widest_window_ns,
+    },
+    Degradation::BarriersOnly => LandingDegradation::BarriersOnly,
+    Degradation::Crashed { errno } => LandingDegradation::Crashed { errno: *errno },
+    Degradation::Unsynced { dir, error } => LandingDegradation::Unsynced {
+      dir: dir.to_string(),
+      answer: answer_of(*error),
+    },
+    Degradation::MediaUnsynced { error } => LandingDegradation::MediaUnsynced {
+      answer: answer_of(*error),
+    },
+    Degradation::Leftover { path, error } => LandingDegradation::Leftover {
+      path: path.to_string(),
+      answer: answer_of(*error),
+    },
+    Degradation::Unswept { dir, error } => LandingDegradation::Unswept {
+      dir: dir.to_string(),
+      answer: answer_of(*error),
+    },
+    Degradation::Kept { path, kept } => LandingDegradation::Kept {
+      path: path.to_string(),
+      kept: kept.to_string(),
+    },
+  }
+}
+
+/// A host refusal as the reply carries it.
+#[cfg(unix)]
+fn answer_of(error: HostError) -> HostAnswer {
+  match error {
+    HostError::NotFound => HostAnswer::NotFound,
+    HostError::NotDirectory => HostAnswer::NotDirectory,
+    HostError::NotFile => HostAnswer::NotFile,
+    HostError::StaleHandle => HostAnswer::StaleHandle,
+    HostError::Unavailable(errno) => HostAnswer::Errno { errno },
   }
 }
 

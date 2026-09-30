@@ -1247,6 +1247,20 @@ fn print_landing(landing: slates_client::Landing) {
       println!("conflicts: {}", outcome.conflicts);
       println!("failed: {}", outcome.failed);
       println!("bytes_written: {}", outcome.bytes_written);
+      println!("held: {}", outcome.held);
+      let durability = &outcome.durability;
+      println!(
+        "durability: data_synced {} dirs_synced {} ({} synced) media {} (requested {})",
+        durability.data_synced,
+        durability.dirs_synced,
+        durability.dirs,
+        durability.media,
+        durability.media_requested
+      );
+      for degradation in &outcome.degraded {
+        println!("degraded: {}", slates_mcp::degradation_json(degradation));
+      }
+      println!("ramp_depth: {}", outcome.ramp_depth);
     }
     slates_client::Landing::GrantRequired {
       landing,

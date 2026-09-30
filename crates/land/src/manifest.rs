@@ -454,7 +454,7 @@ const S_IFMT: u32 = 0o170_000;
 /// Format: the directory type in a POSIX mode.
 const S_IFDIR: u32 = 0o040_000;
 
-fn kind_is_dir(mode: u32) -> bool {
+pub(crate) fn kind_is_dir(mode: u32) -> bool {
   mode & S_IFMT == S_IFDIR
 }
 

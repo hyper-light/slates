@@ -35,10 +35,11 @@ use serde_json::{Value, json};
 use slates_client::{
   AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
   Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
-  GreenBase, GroupReport, Intent, KernelCache, Landing, LandingOutcome, LandingSummary, NamePolicy,
-  OciBinding, OciRuntime, ReadAt, ReadWritePolicy, Rebased, Residency, ShardReport, Signal,
-  SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted, TargetPathConstraint,
-  TelemetryReport, TransportReport, UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
+  GreenBase, GroupReport, HostAnswer, Intent, KernelCache, Landing, LandingDegradation,
+  LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime, ReadAt, ReadWritePolicy,
+  Rebased, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport,
+  Submitted, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  VolumeSummary, WorkOp,
 };
 
 pub mod http;
@@ -1066,7 +1067,53 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
     "conflicts": o.conflicts,
     "failed": o.failed,
     "bytes_written": o.bytes_written,
+    "held": o.held,
+    "durability": {
+      "data_synced": o.durability.data_synced,
+      "dirs_synced": o.durability.dirs_synced,
+      "media": o.durability.media,
+      "media_requested": o.durability.media_requested,
+      "dirs": o.durability.dirs,
+    },
+    "degraded": o.degraded.iter().map(degradation_json).collect::<Vec<_>>(),
+    "ramp_depth": o.ramp_depth,
   })
+}
+
+/// A Degraded cell a landing met, as JSON: its `kind` and its facts (§4.15 failure matrix; AUD-29-05).
+/// Public so the CLI prints the same schema.
+pub fn degradation_json(d: &LandingDegradation) -> Value {
+  match d {
+    LandingDegradation::NoExchange { widest_window_ns } => {
+      json!({"kind": "no_exchange", "widest_window_ns": widest_window_ns})
+    }
+    LandingDegradation::BarriersOnly => json!({"kind": "barriers_only"}),
+    LandingDegradation::Crashed { errno } => json!({"kind": "crashed", "errno": errno}),
+    LandingDegradation::Unsynced { dir, answer } => {
+      json!({"kind": "unsynced", "dir": dir, "answer": answer_json(answer)})
+    }
+    LandingDegradation::MediaUnsynced { answer } => {
+      json!({"kind": "media_unsynced", "answer": answer_json(answer)})
+    }
+    LandingDegradation::Leftover { path, answer } => {
+      json!({"kind": "leftover", "path": path, "answer": answer_json(answer)})
+    }
+    LandingDegradation::Unswept { dir, answer } => {
+      json!({"kind": "unswept", "dir": dir, "answer": answer_json(answer)})
+    }
+    LandingDegradation::Kept { path, kept } => json!({"kind": "kept", "path": path, "kept": kept}),
+  }
+}
+
+/// A host's answer as JSON: a typed refusal's name, or `{"errno": n}`.
+fn answer_json(answer: &HostAnswer) -> Value {
+  match answer {
+    HostAnswer::NotFound => json!("not_found"),
+    HostAnswer::NotDirectory => json!("not_directory"),
+    HostAnswer::NotFile => json!("not_file"),
+    HostAnswer::StaleHandle => json!("stale_handle"),
+    HostAnswer::Errno { errno } => json!({"errno": errno}),
+  }
 }
 
 /// An attachment as JSON: its id (for detach), the lease epoch for a write attachment, the path

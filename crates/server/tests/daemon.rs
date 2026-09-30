@@ -955,21 +955,42 @@ fn grant_scenario() {
   );
   // The landing runs under its grant, and `grants` lists it — across shards (the grant record lives on
   // the volume's owner shard, not necessarily the client's).
-  assert!(matches!(
-    client.call(&RequestBody::Land {
-      volume: id,
-      snapshot: Some(snapshot),
-      target: target.path.clone(),
-      filter: Filter::default(),
-      grant: Some(grant),
-    }),
-    ReplyBody::Landed { .. }
-  ));
+  let landed = client.call(&RequestBody::Land {
+    volume: id,
+    snapshot: Some(snapshot),
+    target: target.path.clone(),
+    filter: Filter::default(),
+    grant: Some(grant),
+  });
+  let ReplyBody::Landed { outcome } = landed else {
+    panic!("the granted landing lands: {landed:?}")
+  };
+  assert_landed_reply_carries_what_it_achieved(&outcome);
   assert!(matches!(
     client.call(&RequestBody::Grants),
     ReplyBody::Grants { grants } if grants.len() == 1 && grants[0].id == grant
   ));
   daemon.stop();
+}
+
+/// AUD-29-05: the reply carries what the landing achieved, not the counts alone — its durability (synced,
+/// media neither asked for nor reached), its Degraded cells (barriers only: the supported level, since the
+/// verb asks for no media barrier), nothing held, and the ramp's settled depth. Until 2026-09-29 the reply
+/// dropped all of it. (This scenario's plan is the grant's: its content is the engine tests' to check,
+/// `crates/land/tests/durability.rs`; here, that the facts cross the wire.)
+fn assert_landed_reply_carries_what_it_achieved(outcome: &slates_ipc::protocol::LandingOutcome) {
+  assert_eq!(outcome.state, "done", "{outcome:?}");
+  assert!(
+    outcome.durability.data_synced && outcome.durability.dirs_synced,
+    "{outcome:?}"
+  );
+  assert!(!outcome.durability.media_requested && !outcome.durability.media);
+  assert_eq!(
+    outcome.degraded,
+    vec![slates_ipc::protocol::LandingDegradation::BarriersOnly]
+  );
+  assert_eq!(outcome.held, 0);
+  assert!(outcome.ramp_depth > 0, "{outcome:?}");
 }
 
 /// A grant request for `landing` under `proof`, scoped once for the test's deadline.

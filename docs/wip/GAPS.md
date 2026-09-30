@@ -2926,7 +2926,7 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
 The [dated audit](../audit/2026-09-29_audit.md) records 87 findings across five
-passes; 01, 04 and 06 have the separately recorded closures below, leaving 84 without a
+passes; 01, 04, 05 and 06 have the separately recorded closures below, leaving 83 without a
 recorded full closure. 02 is mitigated in part, with exact older-snapshot landing still
 owed. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
 changing working tree.
@@ -3047,8 +3047,8 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 05, 07
-  (04 and 06 are closed below).
+- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 07
+  (04, 05 and 06 are closed below).
 
 **Closed 2026-09-29 — AUD-29-06: a session grant was recorded consumed, and a restart lost every grant.**
 - **Transitions.** `finish` records only the transition the engine made: a single-use grant consumed by a
@@ -3083,6 +3083,25 @@ use.**
     removed directory goes with it (`Rmdir` as defined; a subtree witness would be a §4.15 amendment).
   - A landing never resumed leaves its hidden siblings, now including a fallback crash's aside entry,
     until a landing with its id runs.
+
+**Closed 2026-09-29 — AUD-29-05 (A-45): a landing advanced entries it had not made durable, and hid its
+cleanup failures.**
+- **The boundary.** An entry leaves the overlay only when its directory synced (a rename's two) and the
+  media barrier held when the grant asked for it. The rest are `held` and the resume advances them, so a
+  failed sync can no longer strand landed work outside the overlay. `Done` means every entry advanced; a
+  skip that left an entry private is `Partial`.
+- **Reported, not hidden.** A directory that cannot be opened or synced (`Unsynced`), a failed requested
+  media barrier (`MediaUnsynced`, as against `BarriersOnly`), a sibling the sweep cannot settle or a
+  temporary a failed write cannot remove (`Leftover`), and a directory the sweep cannot list (`Unswept`)
+  are typed cells. The reply now carries them, with the durability, `held` and the ramp depth, to the CLI,
+  MCP and the Node SDK.
+- **Found on the way.** A `mkdir` that met a file counted as already there; it is now a type conflict.
+- **Evidence.** `crates/land/tests/durability.rs`: five histories under simulated faults, four red on the
+  old engine and all green now, each resuming to the reference. The daemon's landed reply is asserted.
+  Record: `docs/bugs/2026-09-29-a-landing-advanced-entries-it-had-not-made-durable.md`. Part of the change
+  landed inside `ca53844`, whose commit swept the working tree's edits.
+- **Open.** A grant asking for media durability on a target that cannot perform the barrier should be
+  refused from a capability, not held on every attempt. The land verb never asks for media durability.
 
 **Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:

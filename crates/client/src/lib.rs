@@ -49,13 +49,13 @@ pub use slates_ipc::delivery::{Capability, Delivered, Delivery, DeliveryFault, E
 pub use slates_ipc::protocol::{
   AbsenceIs, ActionCount, AttachRequest, AttachTransport, AttachmentCapability, AuditEntry,
   CauseRecord, ChokepointReport, Conformance, DaemonReport, DeleteWhileOpen, Established, Filter,
-  FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostMountEvidence, HostPathReason,
-  Intent, KernelCache, LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime,
-  PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount, Residency,
-  RetirementReport, Rights, Scope, ShardReport, SharingSemantics, Signal, SizeClass,
-  SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport,
-  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
-  VolumeSummary, WorkOp,
+  FleetReport, GrantScope, GrantSummary, GreenBase, GroupReport, HostAnswer, HostMountEvidence,
+  HostPathReason, Intent, KernelCache, LandingDegradation, LandingDurability, LandingOutcome,
+  LandingSummary, NamePolicy, OciBinding, OciRuntime, PlacedState, Principal, ReadAt,
+  ReadWritePolicy, Refusal, RefusalCount, Residency, RetirementReport, Rights, Scope, ShardReport,
+  SharingSemantics, Signal, SizeClass, SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord,
+  StatusReport, TakeoverReport, TargetPathConstraint, TelemetryReport, TransportReport,
+  UnsupportedReason, VolumeId, VolumeSummary, WorkOp,
 };
 /// The request id [`Client::begin`] returns and [`Client::poll_reply`] matches on — the async
 /// caller holds it between the send and the reply the completion fd signals (§4.7, D-19).

@@ -232,8 +232,11 @@ pub struct Durability {
   pub data_synced: bool,
   /// Every touched directory was synced.
   pub dirs_synced: bool,
-  /// The media barrier ran.
+  /// The media barrier ran and held.
   pub media: bool,
+  /// Whether the grant asked for media durability: without it, barriers only is the supported level
+  /// (`BarriersOnly`), not a failed one (`MediaUnsynced`; AUD-29-05).
+  pub media_requested: bool,
   /// Directories synced.
   pub dirs: usize,
   /// The total time in the directory syncs, nanoseconds (the per-directory cost the sync
@@ -981,7 +984,7 @@ impl<H: LandFs> Landing<'_, H> {
         self.touched.insert(dir_path.into());
         match self.host.mkdir(dir, name, mode) {
           Ok(()) => Outcome::Written,
-          Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Skipped(SkipReason::AlreadyThere),
+          Err(HostError::Unavailable(ERRNO_EXIST)) => self.existing_directory(dir, name)?,
           Err(e) => return Err(e.into()),
         }
       }
@@ -1005,6 +1008,20 @@ impl<H: LandFs> Landing<'_, H> {
       outcome,
       window_ns: None,
     })
+  }
+
+  /// A mkdir that found its name taken: already there only when what holds the name is a directory. One
+  /// that met a file an outsider made is a type conflict, so it is never advanced over that file with the
+  /// private work beneath it (AUD-29-05; before 2026-09-29 any `EEXIST` counted as already there).
+  fn existing_directory(&mut self, dir: HostDir, name: &str) -> Result<Outcome, WriteFailure> {
+    match self.host.entry_fingerprint(dir, name) {
+      Ok(there) if crate::manifest::kind_is_dir(there.mode) => {
+        Ok(Outcome::Skipped(SkipReason::AlreadyThere))
+      }
+      Ok(_) => Ok(Outcome::Conflict(ConflictClass::TypeChanged)),
+      Err(HostError::NotFound) => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+      Err(e) => Err(e.into()),
+    }
   }
 
   /// Writes a file: temporary, bytes, mode, mtime, data sync, then link at the name (a create)
@@ -1772,6 +1789,7 @@ impl<H: LandFs> Landing<'_, H> {
       data_synced: self.crashed.is_none(),
       dirs_synced: self.unsynced.is_empty(),
       media,
+      media_requested: self.request.media_durability,
       dirs,
       dir_sync_ns: total_ns,
     }
@@ -1841,7 +1859,9 @@ impl<H: LandFs> Landing<'_, H> {
         // A directory the plan names that is not there (one this landing creates) holds no sibling.
         Err(HostError::NotFound | HostError::NotDirectory) => continue,
         Err(error) => {
-          self.degraded.push(Degradation::Unswept { dir: parent, error });
+          self
+            .degraded
+            .push(Degradation::Unswept { dir: parent, error });
           continue;
         }
       };
@@ -2428,22 +2448,16 @@ fn advances(outcome: Option<&Outcome>) -> bool {
 }
 
 /// The landing's terminal state: `Aborted` after a crash; `Done` only when every entry landed or was
-/// already there and every one reached the durability boundary (`held` counts those that did not);
-/// `Partial` otherwise.
+/// already there (so it leaves the overlay) and every one reached the durability boundary (`held` counts
+/// those that did not); `Partial` otherwise.
 fn terminal_state(reports: &[EntryReport], crashed: bool, held: usize) -> LandingState {
   if crashed {
     return LandingState::Aborted;
   }
-  if held > 0 {
-    return LandingState::Partial;
-  }
-  let clean = reports.iter().all(|r| {
-    matches!(
-      r.outcome,
-      Some(Outcome::Written | Outcome::Skipped(_) | Outcome::AcceptedIdentical)
-    )
-  });
-  if clean {
+  // Done only when every entry reached its landed state: a skip that left an entry private (its parent
+  // missing, the grant ended) is Partial, as the failure matrix states (AUD-29-05; before 2026-09-29 every
+  // skip counted as done).
+  if held == 0 && reports.iter().all(|r| advances(r.outcome.as_ref())) {
     LandingState::Done
   } else {
     LandingState::Partial

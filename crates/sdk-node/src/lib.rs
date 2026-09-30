@@ -46,8 +46,9 @@
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
-  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
+  Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, HostAnswer, Landing,
+  LandingDegradation, NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport, Submitted,
+  VolumeId, VolumeSummary, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -213,7 +214,9 @@ pub struct LandingSummaryJs {
   pub filtered_out: i64,
 }
 
-/// A finished landing's outcome (§4.15): its id, terminal `state`, and the per-entry and byte counts.
+/// A finished landing's outcome (§4.15): its id, terminal `state`, the per-entry and byte counts, the
+/// entries `held` in the overlay because they did not reach the durability boundary, the `durability`
+/// achieved, every `degraded` cell met, and the ramp's settled `rampDepth` (AUD-29-05).
 #[napi(object)]
 pub struct LandingOutcomeJs {
   pub landing: i64,
@@ -223,6 +226,95 @@ pub struct LandingOutcomeJs {
   pub conflicts: i64,
   pub failed: i64,
   pub bytes_written: i64,
+  pub held: i64,
+  pub durability: LandingDurabilityJs,
+  pub degraded: Vec<LandingDegradationJs>,
+  pub ramp_depth: i64,
+}
+
+/// The durability a landing achieved (§4.15 step 8).
+#[napi(object)]
+pub struct LandingDurabilityJs {
+  pub data_synced: bool,
+  pub dirs_synced: bool,
+  pub media: bool,
+  pub media_requested: bool,
+  pub dirs: i64,
+}
+
+/// A Degraded cell a landing met: its `kind` (`no_exchange`, `barriers_only`, `crashed`, `unsynced`,
+/// `media_unsynced`, `leftover`, `unswept`, `kept`) and the facts that kind carries; the others are unset.
+#[napi(object)]
+pub struct LandingDegradationJs {
+  pub kind: String,
+  /// The directory (`unsynced`, `unswept`).
+  pub dir: Option<String>,
+  /// The entry's path (`leftover`, `kept`).
+  pub path: Option<String>,
+  /// Where the entry is kept (`kept`).
+  pub kept: Option<String>,
+  /// The host's typed answer (`not_found`, `not_directory`, `not_file`, `stale_handle`), when it gave one.
+  pub answer: Option<String>,
+  /// The host's errno (`crashed`, or an answer that was an errno).
+  pub errno: Option<i32>,
+  /// The fallback's widest window, nanoseconds (`no_exchange`).
+  pub widest_window_ns: Option<i64>,
+}
+
+/// A Degraded cell as its JS object: every field unset but the ones its kind carries.
+fn degradation_js(degradation: &LandingDegradation) -> Result<LandingDegradationJs> {
+  let mut out = LandingDegradationJs {
+    kind: String::new(),
+    dir: None,
+    path: None,
+    kept: None,
+    answer: None,
+    errno: None,
+    widest_window_ns: None,
+  };
+  let answered = |answer: &HostAnswer, out: &mut LandingDegradationJs| match answer {
+    HostAnswer::NotFound => out.answer = Some("not_found".to_owned()),
+    HostAnswer::NotDirectory => out.answer = Some("not_directory".to_owned()),
+    HostAnswer::NotFile => out.answer = Some("not_file".to_owned()),
+    HostAnswer::StaleHandle => out.answer = Some("stale_handle".to_owned()),
+    HostAnswer::Errno { errno } => out.errno = Some(*errno),
+  };
+  match degradation {
+    LandingDegradation::NoExchange { widest_window_ns } => {
+      out.kind = "no_exchange".to_owned();
+      out.widest_window_ns = Some(status_i64(*widest_window_ns, "widestWindowNs")?);
+    }
+    LandingDegradation::BarriersOnly => out.kind = "barriers_only".to_owned(),
+    LandingDegradation::Crashed { errno } => {
+      out.kind = "crashed".to_owned();
+      out.errno = Some(*errno);
+    }
+    LandingDegradation::Unsynced { dir, answer } => {
+      out.kind = "unsynced".to_owned();
+      out.dir = Some(dir.clone());
+      answered(answer, &mut out);
+    }
+    LandingDegradation::MediaUnsynced { answer } => {
+      out.kind = "media_unsynced".to_owned();
+      answered(answer, &mut out);
+    }
+    LandingDegradation::Leftover { path, answer } => {
+      out.kind = "leftover".to_owned();
+      out.path = Some(path.clone());
+      answered(answer, &mut out);
+    }
+    LandingDegradation::Unswept { dir, answer } => {
+      out.kind = "unswept".to_owned();
+      out.dir = Some(dir.clone());
+      answered(answer, &mut out);
+    }
+    LandingDegradation::Kept { path, kept } => {
+      out.kind = "kept".to_owned();
+      out.path = Some(path.clone());
+      out.kept = Some(kept.clone());
+    }
+  }
+  Ok(out)
 }
 
 /// The result of `land` (§4.15): `grantRequired` false with the finished `outcome`, or true with the
@@ -263,6 +355,20 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
         conflicts: status_i64(o.conflicts, "conflicts")?,
         failed: status_i64(o.failed, "failed")?,
         bytes_written: status_i64(o.bytes_written, "bytesWritten")?,
+        held: status_i64(o.held, "held")?,
+        durability: LandingDurabilityJs {
+          data_synced: o.durability.data_synced,
+          dirs_synced: o.durability.dirs_synced,
+          media: o.durability.media,
+          media_requested: o.durability.media_requested,
+          dirs: status_i64(o.durability.dirs, "dirs")?,
+        },
+        degraded: o
+          .degraded
+          .iter()
+          .map(degradation_js)
+          .collect::<Result<Vec<_>>>()?,
+        ramp_depth: i64::from(o.ramp_depth),
       }),
       landing: None,
       manifest: None,

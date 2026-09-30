@@ -4048,13 +4048,19 @@ entry either old or new, never torn).
    once when the measured per-directory cost times the directory count exceeds the measured
    `syncfs` cost; macOS one `F_FULLFSYNC` after the barriers when the grant asked for media
    durability, otherwise the barriers only; Windows `FlushFileBuffers` on the directory handles).
-   The outcome record states which durability the landing achieved.
-9. *Advance.* For every `Written` entry, `fstat` the landed file and make that the entry's new
-   witness; clear the overlay entry (the volume now reads it from disk, and its cached bytes are
-   evictable); clear whiteouts and redirects that landed; a scratch volume gains `Base::Path` on
-   the target. Entries that failed stay in the overlay with their outcome. Record
-   `LandingFinished{Done | Partial}`, release the lease, consume the grant, and reply with the
-   report.
+   The outcome record states which durability the landing achieved, and the reply carries it with
+   every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
+   asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
+   its own it could not remove (`Leftover`), a directory the sweep could not list (`Unswept`).
+9. *Advance.* For every entry that landed (or was already there) *and reached the durability
+   boundary* — its directory synced (a rename's two), and the media barrier held when the grant asked
+   for it — `fstat` the landed file and make that the entry's new witness; clear the overlay entry (the
+   volume now reads it from disk, and its cached bytes are evictable); clear whiteouts and redirects
+   that landed; a scratch volume gains `Base::Path` on the target. Entries that failed stay in the
+   overlay with their outcome, and so do entries on the disk that did not reach the boundary (`held`;
+   A-45): the resume re-validates them, syncs their directories and advances them then. Record
+   `LandingFinished{Done | Partial}` — `Done` only when every entry advanced — release the lease,
+   consume the grant, and reply with the report.
 10. *Containment of every write.* The target directory is the grant boundary and retains its
     identity throughout the landing. Create each temporary inside that boundary and use the
     per-entry exchange in step 6. Never build a sibling beside the target or replace the target
@@ -4102,9 +4108,12 @@ slates mount: Refused before the lease is taken. Exchange unsupported on the fil
 (the fallback, with the window the name was absent reported). Crash mid-landing: Degraded (old-or-new per entry; resume by
 hash; hidden siblings swept). Power loss after the report: Masked (data and directory syncs
 preceded the report; on macOS only if media durability was requested, otherwise Degraded and so
-stated in the report). Disk full mid-landing: the entry fails `ENOSPC`, its sibling is removed,
-the landing continues to `Partial` (the human sees exactly what landed). Base directory removed
-during a landing: `Aborted` with every finished entry listed.
+stated in the report). Disk full mid-landing: the entry fails `ENOSPC`, its sibling is removed
+(or, when that removal fails, reported `Leftover`), the landing continues to `Partial` (the human sees
+exactly what landed). A directory that cannot be opened or synced, or a media barrier asked for that
+fails without a crash: Degraded (`Unsynced`, `MediaUnsynced`), the landing `Partial`, the entries it
+covers held in the overlay for the resume (A-45). Base directory removed during a landing: `Aborted`
+with every finished entry listed.
 
 **Refusals.** The base and landing entries of §4.4's taxonomy; nothing else.
 
@@ -4152,6 +4161,18 @@ stays in the overlay.
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
 > holding only what the manifest creates beneath it; a rename whose destination holds the
 > witnessed directory), so the re-run is idempotent for directories as it is for files.
+
+> **Status (2026-09-29, A-45, AUD-29-05).** A landing advances only entries that reached the durability
+> boundary, and says what it achieved. Before, a directory that failed to open for its sync was skipped
+> while the report said the directories were synced; a sync or media-barrier failure that was not
+> crash-like still ended `Done` and advanced every entry; the sweep's and a failed write's cleanup
+> failures were dropped; the reply carried the counts only; and every skip counted as done. Now each
+> such failure is a typed Degraded cell, the entries it covers stay in the overlay (`held`) until a
+> resume syncs them, `Done` means every entry advanced, and the reply carries the durability, the cells
+> and the ramp's depth to the CLI, MCP and SDK. Found on the way: a `mkdir` that met a file counted as
+> already there, and is now a type conflict. Five by-use histories under simulated faults
+> (`crates/land/tests/durability.rs`) failed on the old engine four times and now pass. Record:
+> `docs/bugs/2026-09-29-a-landing-advanced-entries-it-had-not-made-durable.md`.
 
 > **Status (2026-09-29, A-43, AUD-29-04).** Every removal is a move to the landing's own aside name by
 > an exchange or a rename that replaces nothing, a check there, and only then the removal. This covers
@@ -6905,3 +6926,31 @@ runs the new model), and GAPS.
 - What it does not change: the ring format, the region layout version, the wake word's meaning to the sync
   client, and the Linux eventfd path's shape (the daemon writes it only for an armed client; the fences
   close its race).
+
+### A-45 — A landing advances only what reached its durability boundary, and reports what it achieved (2026-09-29)
+Applied in the same change to: §4.15 (steps 8–9, the failure matrix, its status), `slates-land`
+(`engine.rs`: `Unsynced`, `MediaUnsynced`, `Leftover`, `Unswept`, `Durability::media_requested`,
+`LandingReport::held`, the durability test of each advance, `terminal_state`, a mkdir that meets a file;
+`manifest.rs`), `slates-vfs` (the simulated host's targeted faults), `slates-ipc` (`LandingOutcome`'s
+`held`, `durability`, `degraded`, `ramp_depth`; `LandingDurability`, `LandingDegradation`, `HostAnswer`),
+`slates-server` (the reply), the CLI, MCP and the Node SDK (their renderings), and GAPS.
+- Why: the engine treated durability as a field of its report, never as a condition of advancing. A
+  directory it could not open or sync, or a media barrier asked for that failed without a crash, still
+  ended `Done` and moved the entries out of the overlay, so a power loss could lose landed work that was
+  no longer private. Cleanup failures were dropped, the reply carried counts only, and every skip counted
+  as done (AUD-29-05;
+  `docs/bugs/2026-09-29-a-landing-advanced-entries-it-had-not-made-durable.md`).
+- The rule:
+  - An entry advances only when its directory synced (a rename's two) and the media barrier held when
+    asked for. The rest are held in the overlay, and the resume syncs and advances them.
+  - Every failure to open, sync, barrier, sweep or clean up is a typed Degraded cell in the report and the
+    reply. A crash-like errno still aborts.
+  - `Done` means every entry advanced.
+  - A mkdir that meets a file is a type conflict.
+- Evidence: five by-use histories under simulated faults (a directory sync answering `ENOSPC`, a directory
+  that cannot be opened for its sync, a full disk mid-write whose temporary cannot be removed, a sibling
+  the sweep cannot remove, a media barrier that fails). Four failed on the old engine; all five now pass,
+  each resuming to the reference. The daemon's landed reply carries the facts.
+- What it does not change: the crash rule (a crash-like errno aborts and advances nothing), the order of
+  the write classes, the reply's counts.
+
