@@ -22,6 +22,17 @@ authorized merely by appearing here.
   See `docs/bugs/2026-09-30-the-eslogger-shutdown-waited-for-a-stream-end-that-never-came.md`. The live
   eslogger path is confirmed only by the macOS CI lane.
 
+- [ ] **Run 36663502686, Linux: a fleet formation did not widen its council (open, not reproduced).**
+  `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment` failed in `assert_fleet_forms`, before
+  its own steps: the council leader (term 1) kept voters = [itself] with all three hosts members; its
+  record links reached one follower only; that follower and the leader were at log version 4 (commit 5),
+  the other at version 3 (commit 4). The follower without the leader's link had sent 269 reports; the
+  third host counted `fleet.accept.replaced` 1 and `fleet.link.stale_return` 1. Not reproduced here:
+  20 of 20 single runs and the full suite (60 of 60) on Linux with io_uring as a non-root user; 40 single
+  runs (30 of them six at a time) and two full suites (59 of 59) on macOS. The same test passed on the
+  neighbouring runs. Owed: a reproduction, or logs of the leader's link task at the moment the link
+  dropped, before any fix.
+
 ## Current CI repair checkpoint (2026-09-22)
 
 - [x] **Run 35791239154: client seats followed the wake tail.** `slots_per_ring` came from one boot
