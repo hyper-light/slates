@@ -6556,79 +6556,91 @@ pub(crate) async fn forward_over_leader_session(
 #[cfg(test)]
 mod tests {
 
-  /// AUD-29-45 (§4.13 "Content identity and sharing"): do: a region of five members at `f = 1`, an object
-  /// created by host 1, and ask who may place and read its content — then take host 1 over and ask again;
-  /// expect the owner alone to place, and only onto its own candidates; its candidates (and it) to read; a
-  /// member outside both and a non-member to be refused; and after the takeover the successor to act as owner
-  /// while the departed host is refused everything.
-  #[test]
-  fn content_authority_follows_the_objects_owner_and_placement() {
-    use slates_cluster::content::ContentAccess::{Place, Read};
-    use slates_db::register::{Quorum, RegionalConfiguration};
+  /// A region of five members at `f = 1` with one neighbourhood of all of them, and an object host 1 created.
+  fn content_region() -> (slates_db::register::RegionalConfiguration, ObjectId, u64) {
     // Shape: a neighbourhood of every member.
     let scatter = 5;
-    let mut regional = RegionalConfiguration::formed(
+    let regional = slates_db::register::RegionalConfiguration::formed(
       (1..=5).map(HostId).collect(),
-      Quorum { f: 1 },
+      slates_db::register::Quorum { f: 1 },
       std::collections::BTreeMap::new(),
       scatter,
       false,
     );
-    let owner = HostId(1);
-    let object = ObjectId::new(owner, 7);
-    let records = std::collections::BTreeMap::new();
-    let candidates = regional
+    (regional, ObjectId::new(HostId(1), 7), scatter)
+  }
+
+  /// The acting owner's candidates for `object`, as the holder computes them.
+  fn content_candidates(
+    regional: &slates_db::register::RegionalConfiguration,
+    owner: HostId,
+    object: ObjectId,
+  ) -> Vec<HostId> {
+    regional
       .configuration_for(owner)
       .unwrap()
       .place(object)
-      .candidates;
+      .candidates
+  }
+
+  /// AUD-29-45 (§4.13 "Content identity and sharing"): do: ask who may place and read an object's content in
+  /// a live region; expect the owner alone to place, and only onto its own candidates; its candidates to read;
+  /// a member outside the placement and a non-member to be refused.
+  #[test]
+  fn content_authority_follows_the_objects_owner_and_placement() {
+    use slates_cluster::content::ContentAccess::{Place, Read};
+    let (regional, object, _) = content_region();
+    let records = std::collections::BTreeMap::new();
+    let owner = HostId(1);
+    let candidates = content_candidates(&regional, owner, object);
     let holder = *candidates.iter().find(|host| **host != owner).unwrap();
     let outsider = (1..=5)
       .map(HostId)
       .find(|host| !candidates.contains(host))
       .unwrap();
-    let allowed = |regional: &RegionalConfiguration, peer, access, local| {
-      content_authorized(regional, &records, local, peer, access, object)
-    };
-    assert!(allowed(&regional, owner, Place, holder));
+    let allowed =
+      |peer, access, local| content_authorized(&regional, &records, local, peer, access, object);
+    assert!(allowed(owner, Place, holder));
+    assert!(!allowed(owner, Place, outsider), "only onto a candidate");
+    assert!(!allowed(holder, Place, holder), "only the owner places");
+    assert!(allowed(holder, Read, holder), "a candidate reads");
     assert!(
-      !allowed(&regional, owner, Place, outsider),
-      "only onto a candidate"
-    );
-    assert!(
-      !allowed(&regional, holder, Place, holder),
-      "only the owner places"
-    );
-    assert!(
-      allowed(&regional, holder, Read, holder),
-      "a candidate reads"
-    );
-    assert!(
-      !allowed(&regional, outsider, Read, holder),
+      !allowed(outsider, Read, holder),
       "a member outside the placement"
     );
-    assert!(
-      !allowed(&regional, HostId(99), Read, holder),
-      "a non-member"
-    );
+    assert!(!allowed(HostId(99), Read, holder), "a non-member");
+  }
+
+  /// AUD-29-45: do: take the object's owner over, and ask again; expect the successor to act as owner — to
+  /// place onto its own candidates and read from the old cohort — while the departed host is refused.
+  #[test]
+  fn content_authority_passes_to_the_takeover_successor() {
+    use slates_cluster::content::ContentAccess::{Place, Read};
+    let (mut regional, object, scatter) = content_region();
+    let records = std::collections::BTreeMap::new();
+    let owner = HostId(1);
+    let holder = *content_candidates(&regional, owner, object)
+      .iter()
+      .find(|host| **host != owner)
+      .unwrap();
     regional.take_over(owner, scatter).unwrap();
     let successor = regional.successor(owner, object).unwrap();
-    let placed = regional
-      .configuration_for(successor)
-      .unwrap()
-      .place(object)
-      .candidates;
-    let landing = *placed.iter().find(|host| **host != successor).unwrap();
+    let landing = *content_candidates(&regional, successor, object)
+      .iter()
+      .find(|host| **host != successor)
+      .unwrap();
+    let allowed =
+      |peer, access, local| content_authorized(&regional, &records, local, peer, access, object);
     assert!(
-      allowed(&regional, successor, Place, landing),
+      allowed(successor, Place, landing),
       "the successor acts as owner"
     );
-    assert!(allowed(&regional, successor, Read, holder));
+    assert!(allowed(successor, Read, holder));
     assert!(
-      !allowed(&regional, owner, Read, holder),
+      !allowed(owner, Read, holder),
       "the departed owner is refused"
     );
-    assert!(!allowed(&regional, owner, Place, landing));
+    assert!(!allowed(owner, Place, landing));
   }
   use super::*;
   use slates_cluster::DispatchWait;
