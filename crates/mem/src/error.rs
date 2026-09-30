@@ -83,12 +83,37 @@ pub enum MemError {
     /// Why it names no live block.
     reason: ExtentRefusal,
   },
+  /// A shared object's layout or an access to it that would mix a plain access with an atomic one, or two
+  /// atomic widths, on the same bytes (AUD-29-09): nothing was read, written or viewed.
+  LayoutRefused {
+    /// The offset refused.
+    offset: usize,
+    /// The bytes refused.
+    len: usize,
+    /// Why.
+    reason: LayoutRefusal,
+  },
   /// A block head's or a slot's generation space is spent: it is retired rather than wrapped, so a stale
   /// reference to it can never be mistaken for a live one (AUD-29-11).
   GenerationExhausted {
     /// The granule or slot index whose generations are spent.
     index: u32,
   },
+}
+
+/// Why a shared object's layout or access was refused (AUD-29-09).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutRefusal {
+  /// A declared word, or an access, past the object's end.
+  OutOfRange,
+  /// A declared word not aligned to its width.
+  Misaligned,
+  /// Two declared words sharing a byte (a stride shorter than the word included).
+  Overlap,
+  /// An atomic view of bytes that are not a declared word of that width.
+  NotAWord,
+  /// A copy that would touch a declared word.
+  TouchesWord,
 }
 
 /// Why a freed extent names no live block (AUD-29-10).
@@ -164,6 +189,14 @@ impl fmt::Display for MemError {
       } => write!(
         f,
         "extent at {offset} of {len} bytes names no live block: {reason:?}"
+      ),
+      Self::LayoutRefused {
+        offset,
+        len,
+        reason,
+      } => write!(
+        f,
+        "shared layout refused at {offset} for {len} bytes: {reason:?}"
       ),
       Self::GenerationExhausted { index } => {
         write!(f, "generations of index {index} are spent; it is retired")

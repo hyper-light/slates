@@ -89,6 +89,23 @@ Measured and rejected, same day:
 - **The wall clock.** At load average 11 it could not resolve the few-nanosecond question: the same
   binary's one-page row ranged 31–44 ns between rounds. The instruction count decided it.
 
+**Typed shared-memory access (2026-09-30, AUD-29-09).** One push and one pop of a 64-slot client ring,
+single-threaded, instruction counts under callgrind in a Linux container (a probe example run for the
+measurement, not kept), each tree in its own target directory:
+
+| Build | Instructions per push + pop |
+|---|---|
+| Before (whole-map byte slices, unchecked) | 307 |
+| First cut: every word and copy checked by searching the layout — **rejected** | 1,186 |
+| Final: words and slot bodies resolved once, reached by constant-time validated arithmetic | 450 |
+
+The rejected cut spent ~880 instructions in `Layout::holds`/`touches` searches and ~50 building and
+dropping an unused refusal per pop. Wall clock, `cargo run --release -p slates-ipc --example ipc_bench`,
+best of six at load 11: spinning round trip 212 ns before, 221 ns after (within the between-run noise,
+which ranged 212–441 ns for the unchanged binary); parked round trip 1,043 ns before, 934 ns after. A
+power-of-two fast path for strided-run arithmetic was also tried and measured no better; it is kept
+only because it is exact and cheaper in instructions.
+
 What it means: a slab operation costs a tenth of a syscall and a buddy operation a third; the
 ring round trip is about two and a half core-to-core cache-line transfers on this machine
 (the profile's ring matrix measured 132–190 ns per pair), which is the cost floor for a

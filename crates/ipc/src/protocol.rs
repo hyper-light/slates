@@ -2284,7 +2284,7 @@ pub enum Direction {
 /// no allocator sits on the path.
 fn chunk(region: &ClientRegion, direction: Direction, index: u64) -> (usize, usize) {
   let slots = region.cmd().slots().max(1);
-  let half = region.bulk().len() / 2;
+  let half = region.bulk_len() / 2;
   let chunk = half / slots;
   let position = usize::try_from(index % u64::try_from(slots).unwrap_or(1)).unwrap_or(0);
   let base = match direction {
@@ -2313,7 +2313,7 @@ pub fn pack<M: Wire>(
       capacity,
     });
   }
-  region.bulk_mut()[offset..offset + body.len()].copy_from_slice(&body);
+  region.write_bulk(offset, &body)?;
   let mut payload = [0u8; BULK_REF_BYTES];
   payload[..8].copy_from_slice(&u64::try_from(offset).unwrap_or(u64::MAX).to_le_bytes());
   payload[8..].copy_from_slice(&u64::try_from(body.len()).unwrap_or(u64::MAX).to_le_bytes());
@@ -2347,16 +2347,17 @@ pub fn unpack<M: Wire>(
         payload[8..].try_into().unwrap_or([0; 8]),
       ))
       .unwrap_or(usize::MAX);
-      let bulk = region.bulk();
-      let end = offset.checked_add(len).ok_or(IpcError::BadSlot {
-        reason: "bulk reference overflows",
-      })?;
-      if end > bulk.len() {
+      if offset
+        .checked_add(len)
+        .is_none_or(|end| end > region.bulk_len())
+      {
         return Err(IpcError::BadSlot {
           reason: "bulk reference outside the area",
         });
       }
-      unframe(&bulk[offset..end])
+      let mut body = vec![0u8; len];
+      region.read_bulk(offset, &mut body)?;
+      unframe(&body)
     }
     SlotKind::Cancel | SlotKind::Heartbeat => Err(IpcError::BadSlot {
       reason: "not a message",

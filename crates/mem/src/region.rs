@@ -14,13 +14,14 @@
 use memmap2::MmapMut;
 
 use crate::error::MemError;
-use crate::shared::SharedObject;
+use crate::shared::ExclusiveObject;
 
 /// What backs a region's bytes: a private anonymous mapping (the default, process-local, gone at
 /// exit), or a shared memory object (§4.7, `SharedObject`) that survives the process and is
 /// re-attached by a restarted daemon through its handoff. The arena addresses bytes the same way
 /// over either; only the survival and ownership differ, which is what backing content in the anchor
-/// (§4.8 recovery) needs. Both expose their bytes through safe accessors, so this adds no unsafe.
+/// (§4.8 recovery) needs. A shared object hands out no reference to its bytes (AUD-29-09); this region
+/// takes an [`ExclusiveObject`], whose constructor carries the promise that only this region reaches it.
 #[derive(Debug)]
 enum Backing {
   /// A private anonymous mapping, faulted in by the pre-fault scheduler; lost when the process
@@ -28,7 +29,7 @@ enum Backing {
   Anon(MmapMut),
   /// A shared memory object the region owns; its bytes outlive the process and a restarted daemon
   /// maps the same object, so content placed here recovers (§4.8).
-  Shared(SharedObject),
+  Shared(ExclusiveObject),
 }
 
 impl Backing {
@@ -82,7 +83,9 @@ impl Region {
   /// recover them. Used to back the store's content arena in anchor-owned RAM rather than a private
   /// mapping, so an agent's writes survive a daemon crash (BUG-11). The object's length (rounded to
   /// whole `page`s) is the region's length; `huge` is not asked of a shared object here.
-  pub fn shared(object: SharedObject, page: usize) -> Region {
+  /// The object is an [`ExclusiveObject`]: the region hands out references to its bytes, which only
+  /// storage no other process reaches may do (AUD-29-09).
+  pub fn shared(object: ExclusiveObject, page: usize) -> Region {
     let page = page.max(1);
     Region {
       backing: Backing::Shared(object),

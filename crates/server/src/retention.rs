@@ -279,7 +279,7 @@ mod tests {
   #![allow(clippy::unwrap_used, clippy::panic)]
 
   use super::*;
-  use slates_anchor::layout::{PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN};
+  use slates_anchor::layout::{PAYLOAD_BYTES, PAYLOAD_LEN};
   use slates_cluster::config_group::RegionalCouncil;
   use slates_cluster::raft::RequestVote;
   use slates_cluster::raft_wire::RaftMessage;
@@ -333,23 +333,28 @@ mod tests {
       let target = RegionKind::Consensus(
         u8::try_from((state.consensus_generation + 1) % u64::from(SLOTS)).unwrap(),
       );
-      let saved_target = state
+      // The target's length and body as they stand (racy bytes, copied as the seqlock copies them).
+      let mut saved_target = vec![0u8; PAYLOAD_BYTES - PAYLOAD_LEN + payload.len()];
+      state
         .segment
-        .region_read(target, 0, PAYLOAD_BYTES + payload.len())
-        .unwrap()
-        .to_vec();
+        .region_read_racy(target, PAYLOAD_LEN, &mut saved_target)
+        .unwrap();
       // Begin and commit are atomic words; the length and body can tear at any byte.
       for copied in 0..=payload.len() {
-        let bytes = state
-          .segment
-          .region_write(target, 0, saved_target.len())
+        let segment = &mut state.segment;
+        segment
+          .region_write_racy(target, PAYLOAD_LEN, &saved_target)
           .unwrap();
-        bytes.copy_from_slice(&saved_target);
-        bytes[PAYLOAD_GENERATION..PAYLOAD_GENERATION + size_of::<u64>()]
-          .copy_from_slice(&1u64.to_le_bytes());
-        bytes[PAYLOAD_LEN..PAYLOAD_LEN + size_of::<u64>()]
-          .copy_from_slice(&(payload.len() as u64).to_le_bytes());
-        bytes[PAYLOAD_BYTES..PAYLOAD_BYTES + copied].copy_from_slice(&payload[..copied]);
+        segment
+          .payload_generation(target)
+          .unwrap()
+          .store(1, std::sync::atomic::Ordering::Release);
+        segment
+          .region_write_racy(target, PAYLOAD_LEN, &(payload.len() as u64).to_le_bytes())
+          .unwrap();
+        segment
+          .region_write_racy(target, PAYLOAD_BYTES, &payload[..copied])
+          .unwrap();
         load(&state.segment)
           .unwrap()
           .unwrap()
@@ -430,19 +435,23 @@ mod tests {
       retain_first_vote(state);
       let target =
         RegionKind::Consensus(u8::try_from(state.consensus_generation % u64::from(SLOTS)).unwrap());
-      state
-        .segment
-        .region_write(target, PAYLOAD_BYTES + CHECKSUM_BYTES, 1)
-        .unwrap()[0] ^= 1;
+      let flip = |segment: &mut slates_anchor::AnchorSegment| {
+        let mut byte = [0u8; 1];
+        segment
+          .region_read_racy(target, PAYLOAD_BYTES + CHECKSUM_BYTES, &mut byte)
+          .unwrap();
+        byte[0] ^= 1;
+        segment
+          .region_write_racy(target, PAYLOAD_BYTES + CHECKSUM_BYTES, &byte)
+          .unwrap();
+      };
+      flip(&mut state.segment);
       assert!(matches!(
         load(&state.segment),
         Err(AnchorError::Layout { .. })
       ));
       // Repair only the test's injected corruption so the fixture can shut down normally.
-      state
-        .segment
-        .region_write(target, PAYLOAD_BYTES + CHECKSUM_BYTES, 1)
-        .unwrap()[0] ^= 1;
+      flip(&mut state.segment);
     });
   }
 

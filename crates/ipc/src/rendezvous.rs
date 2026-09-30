@@ -712,7 +712,7 @@ pub mod platform {
 
   use std::sync::atomic::{AtomicU32, Ordering};
 
-  use slates_mem::{Handoff, SharedObject};
+  use slates_mem::{Handoff, SharedObject, Width, WordRun, Words};
 
   use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
@@ -725,6 +725,8 @@ pub mod platform {
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
   /// padding (4), the daemon's start stamp (8), padding to a cache line.
   const HEADER_BYTES: usize = 64;
+  /// Format: the slot count's offset in the header (after the magic).
+  const AT_SLOT_COUNT: usize = 4;
   /// Format: the doorbell word's offset in the header.
   pub const AT_DOORBELL: usize = 8;
   /// Format: the start stamp's offset in the header: the wall clock in nanoseconds when the
@@ -755,6 +757,13 @@ pub mod platform {
   const CLAIMED: u32 = 1;
   /// Format: the daemon wrote the region into the slot.
   const READY: u32 = 2;
+  /// Format: a client took the slot and is writing its pid and wanted id; the daemon ignores it until
+  /// the client publishes `CLAIMED` (AUD-29-09: before, the claim was visible before those fields were
+  /// written, and the daemon could read them unwritten).
+  const CLAIMING: u32 = 5;
+  /// Format: the daemon took a claimed slot to answer it; neither the client's timeout nor another client
+  /// can take the slot while the daemon writes its answer.
+  const ANSWERING: u32 = 6;
   /// Format: the client opened the region; the daemon reclaims the slot.
   const DONE: u32 = 3;
   /// The daemon refused the claim: the client reads it typed and marks the slot `DONE`, where before a
@@ -767,6 +776,11 @@ pub mod platform {
   /// unavailable (nanoseconds): the control shard's loop is microseconds, so a second is a
   /// dead daemon.
   const CLAIM_WAIT_NS: u64 = 1_000_000_000;
+  /// Derived: how long a slot may sit unchanged in a state a live party moves on from (`CLAIMING`,
+  /// `READY`, `REFUSED`) before the daemon takes it back: twice the claim wait, past which no live client
+  /// is still waiting on it (a client gives up after one claim wait, or two once the daemon took its
+  /// claim), so only a dead party's slot is reclaimed.
+  const STALE_SLOT_NS: u64 = 2 * CLAIM_WAIT_NS;
 
   /// No control channel on these platforms yet: the bootstrap-object rendezvous passes no descriptor,
   /// so the completion fd an async SDK polls (D-19) arrives with the control socket owed here (a Unix
@@ -806,24 +820,27 @@ pub mod platform {
     }
   }
 
-  /// The start stamp of the daemon holding `instance`'s bootstrap object, if one does.
+  /// The start stamp of the daemon holding `instance`'s bootstrap object, if one does. The stamp is
+  /// the object's publication word: zero until the daemon has written the header, so a reader that maps
+  /// the object mid-creation sees "not yet", never a torn header.
   fn generation_of(instance: &str) -> Option<u64> {
     let handoff = SharedObject::handoff_for_name(&rendezvous_name(instance))?;
-    let object = SharedObject::open(&handoff, HEADER_BYTES + SLOTS * SLOT_BYTES).ok()?;
-    let bytes = object.bytes();
-    let magic = u32::from_le_bytes(
-      bytes[..size_of::<u32>()]
-        .try_into()
-        .unwrap_or([0; size_of::<u32>()]),
-    );
-    if magic != MAGIC {
-      return None;
+    let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).ok()?;
+    published(&object).ok().flatten()
+  }
+
+  /// The object's start stamp once its header is published (`None` before), with the magic checked.
+  fn published(object: &SharedObject) -> Result<Option<u64>, IpcError> {
+    let generation = object.atomic_u64(AT_GENERATION)?.load(Ordering::Acquire);
+    if generation == 0 {
+      return Ok(None);
     }
-    Some(u64::from_le_bytes(
-      bytes[AT_GENERATION..AT_GENERATION + 8]
-        .try_into()
-        .unwrap_or([0; 8]),
-    ))
+    if read_u32(object, 0)? != MAGIC {
+      return Err(IpcError::Layout {
+        reason: "bootstrap object has the wrong magic",
+      });
+    }
+    Ok(Some(generation))
   }
 
   /// The wall clock in nanoseconds, the start stamp of a daemon opening the object now.
@@ -836,6 +853,9 @@ pub mod platform {
 
   pub(super) struct Listener {
     object: SharedObject,
+    /// Per claim slot, the state it was last seen in and since when: a slot left in a state only a live
+    /// party moves on from is reclaimed past [`STALE_SLOT_NS`]. Bounded by the table.
+    seen: Vec<Option<(u32, std::time::Instant)>>,
     /// One named Event per claim slot, which the slot's claimant waits on for READY or REFUSED and
     /// which is signaled here once the claim is answered. `WaitOnAddress` on the slot word is
     /// process-local on Windows (D-10), so it cannot wake a client in another process; the Event
@@ -928,31 +948,97 @@ pub mod platform {
   /// The daemon's doorbell waiter is the bell itself.
   pub type DoorbellWaiter = Bell;
 
+  /// Format: the bootstrap object's length: the header and the claim slots.
+  const OBJECT_BYTES: usize = HEADER_BYTES + SLOTS * SLOT_BYTES;
+
+  /// The bootstrap object's declared atomic words (AUD-29-09): the doorbell, the start stamp (the
+  /// header's publication word) and every claim slot's state word; the rest is plain, owned by whichever
+  /// side the slot's state names.
+  fn bootstrap_words() -> Words {
+    Words::new()
+      .with(WordRun::one(AT_DOORBELL, Width::U32))
+      .with(WordRun::one(AT_GENERATION, Width::U64))
+      .with(WordRun::strided(
+        HEADER_BYTES + AT_STATE,
+        SLOT_BYTES,
+        SLOTS,
+        Width::U32,
+      ))
+  }
+
   fn slot_at(index: usize) -> usize {
-    HEADER_BYTES + index * SLOT_BYTES
+    index
+      .saturating_mul(SLOT_BYTES)
+      .saturating_add(HEADER_BYTES)
   }
 
   fn state(object: &SharedObject, index: usize) -> Result<&AtomicU32, IpcError> {
-    Ok(object.atomic_u32(slot_at(index) + AT_STATE)?)
+    Ok(object.atomic_u32(slot_at(index).saturating_add(AT_STATE))?)
+  }
+
+  fn read_u32(object: &SharedObject, at: usize) -> Result<u32, IpcError> {
+    let mut word = [0u8; size_of::<u32>()];
+    object.read(at, &mut word)?;
+    Ok(u32::from_le_bytes(word))
+  }
+
+  fn read_u64(object: &SharedObject, at: usize) -> Result<u64, IpcError> {
+    let mut word = [0u8; size_of::<u64>()];
+    object.read(at, &mut word)?;
+    Ok(u64::from_le_bytes(word))
+  }
+
+  /// The region name a `READY` slot names, and the region's length.
+  fn read_answer(object: &SharedObject, at: usize) -> Result<(String, usize), IpcError> {
+    let mut raw = [0u8; NAME_BYTES];
+    object.read(at.saturating_add(AT_NAME), &mut raw)?;
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(NAME_BYTES);
+    let name = String::from_utf8_lossy(raw.get(..end).unwrap_or_default()).into_owned();
+    let len = read_u64(object, at.saturating_add(AT_LEN))?;
+    Ok((name, usize::try_from(len).unwrap_or(0)))
+  }
+
+  /// A slot the daemon answers with a region: the assigned id, the length and the name, written while it
+  /// holds the slot `ANSWERING`.
+  fn write_answer(
+    object: &mut SharedObject,
+    at: usize,
+    client_id: u32,
+    len: usize,
+    name: &str,
+  ) -> Result<(), IpcError> {
+    let mut raw = [0u8; NAME_BYTES];
+    if let Some(field) = raw.get_mut(..name.len()) {
+      field.copy_from_slice(name.as_bytes());
+    }
+    object.write(at.saturating_add(AT_CLIENT), &client_id.to_le_bytes())?;
+    object.write(
+      at.saturating_add(AT_LEN),
+      &u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes(),
+    )?;
+    object.write(at.saturating_add(AT_NAME), &raw)?;
+    Ok(())
   }
 
   impl Listener {
     pub(super) fn open(instance: &str) -> Result<Listener, IpcError> {
-      let mut object = SharedObject::create(
-        &rendezvous_name(instance),
-        HEADER_BYTES + SLOTS * SLOT_BYTES,
+      let mut object =
+        SharedObject::create(&rendezvous_name(instance), OBJECT_BYTES, bootstrap_words())?;
+      object.write(0, &MAGIC.to_le_bytes())?;
+      object.write(
+        AT_SLOT_COUNT,
+        &u32::try_from(SLOTS).unwrap_or(u32::MAX).to_le_bytes(),
       )?;
-      {
-        let bytes = object.bytes_mut();
-        bytes[..4].copy_from_slice(&MAGIC.to_le_bytes());
-        bytes[4..8].copy_from_slice(&u32::try_from(SLOTS).unwrap_or(u32::MAX).to_le_bytes());
-        bytes[AT_GENERATION..AT_GENERATION + 8].copy_from_slice(&stamp_now().to_le_bytes());
-      }
       for i in 0..SLOTS {
         state(&object, i)?.store(FREE, Ordering::Release);
       }
+      // The start stamp last, with release: it publishes the header and the free table (never zero).
+      object
+        .atomic_u64(AT_GENERATION)?
+        .store(stamp_now().max(1), Ordering::Release);
       Ok(Listener {
         object,
+        seen: vec![None; SLOTS],
         #[cfg(windows)]
         ready_events: (0..SLOTS)
           .map(|index| crate::wake::Event::open(&ready_event_name(instance, index)))
@@ -982,7 +1068,7 @@ pub mod platform {
 
     pub(super) fn doorbell_waiter(&self) -> Result<Option<DoorbellWaiter>, IpcError> {
       let handoff = self.object.handoff()?;
-      let object = SharedObject::open(&handoff, self.object.len())?;
+      let object = SharedObject::open(&handoff, self.object.len(), bootstrap_words())?;
       #[cfg(windows)]
       let instance = self.instance.as_str();
       #[cfg(not(windows))]
@@ -1001,101 +1087,144 @@ pub mod platform {
     ) -> Result<Option<Accepted>, IpcError> {
       for i in 0..SLOTS {
         let word = state(&self.object, i)?;
-        match word.load(Ordering::Acquire) {
+        let now = word.load(Ordering::Acquire);
+        match now {
           DONE => word.store(FREE, Ordering::Release),
           CLAIMED => {
-            let wanted = {
-              let at = slot_at(i);
-              let b = self.object.bytes();
-              u32::from_le_bytes([
-                b[at + AT_CLIENT],
-                b[at + AT_CLIENT + 1],
-                b[at + AT_CLIENT + 2],
-                b[at + AT_CLIENT + 3],
-              ])
-            };
-            let client_id = assign(wanted);
-            let Prepared { region, .. } = match make_region(client_id) {
-              Ok(prepared) => prepared,
-              Err(e) => {
-                // The claim is answered whatever the refusal: the bound when that is the reason,
-                // else no bound — the client reports the daemon refused it — never left `CLAIMED`.
-                let limit = match &e {
-                  IpcError::TooManyClients { limit } => *limit,
-                  _ => super::NO_BOUND,
-                };
-                let at = slot_at(i);
-                self.object.bytes_mut()[at + AT_LEN..at + AT_LEN + 8]
-                  .copy_from_slice(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
-                let word = state(&self.object, i)?;
-                word.store(REFUSED, Ordering::Release);
-                // Wake the claimant where it waits: on the word here (macOS), on the named ready Event
-                // on Windows, where the word-based wake is process-local and unsupported (D-10).
-                #[cfg(not(windows))]
-                wake::wake_one(word)?;
-                #[cfg(windows)]
-                self.signal_ready(i)?;
-                return Err(e);
-              }
-            };
-            // From here the client holds an id the daemon reserved: a failure is reported with that
-            // id so the daemon gives it back (`IpcError::HandoffLost`).
-            let lost = |cause: IpcError| IpcError::HandoffLost {
-              client_id,
-              cause: Box::new(cause),
-            };
-            let (handoff, len) = region.handoff().map_err(lost)?;
-            let Handoff::Name(name) = handoff else {
-              return Err(lost(IpcError::Layout {
-                reason: "a region here hands off a name",
-              }));
-            };
-            if name.len() > NAME_BYTES {
-              return Err(lost(IpcError::Layout {
-                reason: "region name longer than the slot holds",
-              }));
-            }
-            let at = slot_at(i);
-            let pid = {
-              let bytes = self.object.bytes();
-              u32::from_le_bytes([
-                bytes[at + AT_PID],
-                bytes[at + AT_PID + 1],
-                bytes[at + AT_PID + 2],
-                bytes[at + AT_PID + 3],
-              ])
-            };
+            // Take the claim to answer it; a client whose claim wait just ran out took it back first.
+            if word
+              .compare_exchange(CLAIMED, ANSWERING, Ordering::AcqRel, Ordering::Acquire)
+              .is_ok()
             {
-              let bytes = self.object.bytes_mut();
-              bytes[at + AT_CLIENT..at + AT_CLIENT + 4].copy_from_slice(&client_id.to_le_bytes());
-              bytes[at + AT_LEN..at + AT_LEN + 8]
-                .copy_from_slice(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
-              bytes[at + AT_NAME..at + AT_NAME + NAME_BYTES].fill(0);
-              bytes[at + AT_NAME..at + AT_NAME + name.len()].copy_from_slice(name.as_bytes());
+              let answered = self.answer(i, assign, make_region);
+              // A claim this daemon took is always answered: a failure after it took the slot is the
+              // claimant's refusal, never a slot left `ANSWERING` for the claimant to wait out.
+              if let Err(error) = &answered
+                && state(&self.object, i)?.load(Ordering::Acquire) == ANSWERING
+              {
+                self.refuse(i, error)?;
+              }
+              return answered.map(Some);
             }
-            let word = state(&self.object, i).map_err(lost)?;
-            word.store(READY, Ordering::Release);
-            // Wake the claimant where it waits: the word here (macOS); on Windows the named auto-reset
-            // Event, since the word wake is process-local there and unsupported (D-10) — the Event holds
-            // a signal raised before the client waits, so a served-before-the-wait claim is not lost.
-            #[cfg(not(windows))]
-            wake::wake_one(word).map_err(lost)?;
-            #[cfg(windows)]
-            self.signal_ready(i).map_err(lost)?;
-            return Ok(Some(Accepted {
-              client_id,
-              // The object's mode and per-user name are the authentication: whoever opened
-              // it is the daemon's user (the kernel refused everyone else).
-              uid: current_uid(),
-              pid,
-              region,
-              control: Some(Control),
-            }));
+          }
+          CLAIMING | READY | REFUSED => {
+            self.reclaim_if_stale(i, now)?;
+            continue;
           }
           _ => {}
         }
+        self.forget(i);
       }
       Ok(None)
+    }
+
+    /// Forgets when slot `index` was first seen in its current state.
+    fn forget(&mut self, index: usize) {
+      if let Some(seen) = self.seen.get_mut(index) {
+        *seen = None;
+      }
+    }
+
+    /// Takes slot `index` back to `FREE` when it has sat in `now` — a state only a live party moves on
+    /// from — past [`STALE_SLOT_NS`]: its client died claiming, or before reading its answer. By CAS, so a
+    /// party that moves it on meanwhile keeps it.
+    fn reclaim_if_stale(&mut self, index: usize, now: u32) -> Result<(), IpcError> {
+      let Some(seen) = self.seen.get_mut(index) else {
+        return Ok(());
+      };
+      let since = match seen {
+        Some((state_seen, since)) if *state_seen == now => *since,
+        _ => {
+          *seen = Some((now, std::time::Instant::now()));
+          return Ok(());
+        }
+      };
+      if u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX) >= STALE_SLOT_NS {
+        let _ = state(&self.object, index)?.compare_exchange(
+          now,
+          FREE,
+          Ordering::AcqRel,
+          Ordering::Acquire,
+        );
+        *seen = None;
+      }
+      Ok(())
+    }
+
+    /// Answers the claim in slot `index`, which this daemon holds `ANSWERING`: a region, or the typed
+    /// refusal.
+    fn answer(
+      &mut self,
+      index: usize,
+      assign: &mut dyn FnMut(u32) -> u32,
+      make_region: &mut dyn FnMut(u32) -> Result<Prepared, IpcError>,
+    ) -> Result<Accepted, IpcError> {
+      let at = slot_at(index);
+      let wanted = read_u32(&self.object, at.saturating_add(AT_CLIENT))?;
+      let pid = read_u32(&self.object, at.saturating_add(AT_PID))?;
+      let client_id = assign(wanted);
+      let Prepared { region, .. } = match make_region(client_id) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+          self.refuse(index, &error)?;
+          return Err(error);
+        }
+      };
+      // From here the client holds an id the daemon reserved: a failure is reported with that id so the
+      // daemon gives it back (`IpcError::HandoffLost`).
+      let lost = |cause: IpcError| IpcError::HandoffLost {
+        client_id,
+        cause: Box::new(cause),
+      };
+      let (handoff, len) = region.handoff().map_err(lost)?;
+      let Handoff::Name(name) = handoff else {
+        return Err(lost(IpcError::Layout {
+          reason: "a region here hands off a name",
+        }));
+      };
+      if name.len() > NAME_BYTES {
+        return Err(lost(IpcError::Layout {
+          reason: "region name longer than the slot holds",
+        }));
+      }
+      write_answer(&mut self.object, at, client_id, len, &name).map_err(lost)?;
+      self.publish(index, READY).map_err(lost)?;
+      Ok(Accepted {
+        client_id,
+        // The object's mode and per-user name are the authentication: whoever opened
+        // it is the daemon's user (the kernel refused everyone else).
+        uid: current_uid(),
+        pid,
+        region,
+        control: Some(Control),
+      })
+    }
+
+    /// Answers slot `index` with `error`: the client bound when that is the reason, else no bound — the
+    /// client reports the daemon refused it.
+    fn refuse(&mut self, index: usize, error: &IpcError) -> Result<(), IpcError> {
+      let limit = match error {
+        IpcError::TooManyClients { limit } => *limit,
+        _ => super::NO_BOUND,
+      };
+      let at = slot_at(index).saturating_add(AT_LEN);
+      self
+        .object
+        .write(at, &u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes())?;
+      self.publish(index, REFUSED)
+    }
+
+    /// Publishes slot `index`'s answer (`READY` or `REFUSED`, with release after its fields) and wakes the
+    /// claimant where it waits: on the word here (macOS); on Windows the named ready Event, since the word
+    /// wake is process-local there (D-10) — the Event holds a signal raised before the client waits.
+    fn publish(&self, index: usize, answer: u32) -> Result<(), IpcError> {
+      let word = state(&self.object, index)?;
+      word.store(answer, Ordering::Release);
+      #[cfg(not(windows))]
+      wake::wake_one(word)?;
+      #[cfg(windows)]
+      self.signal_ready(index)?;
+      Ok(())
     }
   }
 
@@ -1122,141 +1251,285 @@ pub mod platform {
     std::process::id()
   }
 
-  pub(super) fn connect(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
+  /// The bootstrap object of `instance`, its handoff, and its published start stamp.
+  fn open_bootstrap(instance: &str) -> Result<(Handoff, SharedObject, u64), IpcError> {
+    let unavailable = |why: &'static str| IpcError::DaemonUnavailable {
+      endpoint: instance.to_owned(),
+      why,
+    };
     let handoff =
       SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
         feature: "rendezvous by name",
       })?;
-    let object = SharedObject::open(&handoff, HEADER_BYTES + SLOTS * SLOT_BYTES).map_err(|_| {
-      IpcError::DaemonUnavailable {
-        endpoint: instance.to_owned(),
-        why: "the rendezvous object is not there (no daemon has created it)",
+    let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
+      .map_err(|_| unavailable("the rendezvous object is not there (no daemon has created it)"))?;
+    let generation = published(&object)?
+      .ok_or_else(|| unavailable("the daemon has not yet published its rendezvous object"))?;
+    Ok((handoff, object, generation))
+  }
+
+  /// Claims a free slot: `FREE` → `CLAIMING`, the pid and the wanted id written, then `CLAIMED` with
+  /// release, so the daemon never reads the fields before they are written. A slot the daemon reclaimed
+  /// meanwhile (this claimant was stalled past the stale bound) is given up and another claimed.
+  fn claim(object: &mut SharedObject, wanted: u32) -> Result<usize, IpcError> {
+    for index in 0..SLOTS {
+      if state(object, index)?
+        .compare_exchange(FREE, CLAIMING, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+      {
+        continue;
       }
-    })?;
-    if u32::from_le_bytes([
-      object.bytes()[0],
-      object.bytes()[1],
-      object.bytes()[2],
-      object.bytes()[3],
-    ]) != MAGIC
-    {
-      return Err(IpcError::Layout {
-        reason: "bootstrap object has the wrong magic",
-      });
-    }
-    let generation = u64::from_le_bytes(
-      object.bytes()[AT_GENERATION..AT_GENERATION + 8]
-        .try_into()
-        .unwrap_or([0; 8]),
-    );
-    // Claim a free slot.
-    let mut claimed = None;
-    for i in 0..SLOTS {
-      let word = state(&object, i)?;
-      if word
-        .compare_exchange(FREE, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
+      let at = slot_at(index);
+      object.write(at.saturating_add(AT_PID), &current_pid().to_le_bytes())?;
+      // The id the client wants back (zero: a fresh one); the daemon answers with the id it assigns.
+      object.write(at.saturating_add(AT_CLIENT), &wanted.to_le_bytes())?;
+      if state(object, index)?
+        .compare_exchange(CLAIMING, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
       {
-        claimed = Some(i);
-        break;
+        return Ok(index);
       }
     }
-    let Some(index) = claimed else {
-      return Err(IpcError::RingFull);
-    };
-    let at = slot_at(index);
-    // The pid is written after the claim; a daemon reading the claim reads it too. The
-    // object is ours alone to write at this slot now.
-    {
-      let mut object = object;
-      object.bytes_mut()[at + AT_PID..at + AT_PID + 4]
-        .copy_from_slice(&current_pid().to_le_bytes());
-      // The id the client wants back (zero: a fresh one); the daemon overwrites it with the
-      // id it assigns.
-      object.bytes_mut()[at + AT_CLIENT..at + AT_CLIENT + 4].copy_from_slice(&wanted.to_le_bytes());
-      // The Event the daemon signals when it answers this slot (Windows; the word wake is
-      // process-local there). The daemon holds every slot's Event from its start, so a signal
-      // raised before this wait is kept until the wait consumes it.
-      #[cfg(windows)]
-      let ready_event = match crate::wake::Event::open(&ready_event_name(instance, index)) {
-        Ok(event) => event,
-        Err(error) => {
-          state(&object, index)?.store(FREE, Ordering::Release);
-          return Err(error);
-        }
-      };
-      // Ring the daemon-wide doorbell so a parked control shard sees the claim. The client's own
-      // doorbell for later rings is this bell, over its own mapping of the bootstrap object.
-      let bell = SharedObject::open(&handoff, HEADER_BYTES + SLOTS * SLOT_BYTES)
-        .map_err(IpcError::from)
-        .and_then(|mapping| Bell::new(mapping, instance));
-      let bell = match bell.and_then(|bell| bell.ring().map(|()| bell)) {
-        Ok(bell) => bell,
-        Err(error) => {
-          // The claim cannot be announced: give the slot back rather than leave it claimed.
-          state(&object, index)?.store(FREE, Ordering::Release);
-          return Err(error);
-        }
-      };
-      let word = state(&object, index)?;
-      // Wait for READY (spin then wait on the word, or on the Event on Windows).
-      let started = std::time::Instant::now();
-      loop {
-        let now = word.load(Ordering::Acquire);
-        if now == READY {
-          break;
-        }
-        if now == REFUSED {
-          // The daemon's typed refusal at its client bound: read the bound, give the slot back.
-          let limit = u64::from_le_bytes(
-            object.bytes()[at + AT_LEN..at + AT_LEN + 8]
-              .try_into()
-              .unwrap_or([0; 8]),
-          );
-          word.store(DONE, Ordering::Release);
-          return Err(super::refusal_of(
-            usize::try_from(limit).unwrap_or(usize::MAX),
-            instance,
-          ));
-        }
-        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        if elapsed >= CLAIM_WAIT_NS {
-          word.store(FREE, Ordering::Release);
+    Err(IpcError::RingFull)
+  }
+
+  /// Waits for the daemon's answer to the claim in slot `index`: its state `READY` or `REFUSED`. At the
+  /// claim wait the claim is taken back by CAS — only if the daemon has not taken it to answer, whose
+  /// answer is then awaited one more claim wait.
+  fn await_answer(
+    object: &SharedObject,
+    index: usize,
+    instance: &str,
+    #[cfg(windows)] ready_event: &crate::wake::Event,
+  ) -> Result<u32, IpcError> {
+    let word = state(object, index)?;
+    let started = std::time::Instant::now();
+    let mut wait_ns = CLAIM_WAIT_NS;
+    loop {
+      let now = word.load(Ordering::Acquire);
+      if now == READY || now == REFUSED {
+        return Ok(now);
+      }
+      let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+      if elapsed >= wait_ns {
+        let took_back = word
+          .compare_exchange(CLAIMED, FREE, Ordering::AcqRel, Ordering::Acquire)
+          .is_ok();
+        if took_back || wait_ns > CLAIM_WAIT_NS {
           return Err(IpcError::DaemonUnavailable {
             endpoint: instance.to_owned(),
             why: "the daemon did not answer the claim within the claim wait",
           });
         }
-        #[cfg(not(windows))]
-        let _ = wake::wait(word, now, Some(CLAIM_WAIT_NS - elapsed))?;
-        #[cfg(windows)]
-        let _ = ready_event.wait(Some(CLAIM_WAIT_NS - elapsed))?;
+        // The daemon took the claim to answer it: its answer is due; wait one more claim wait for it.
+        wait_ns = wait_ns.saturating_add(CLAIM_WAIT_NS);
+        continue;
       }
-      let (name, len) = {
-        let bytes = object.bytes();
-        let raw = &bytes[at + AT_NAME..at + AT_NAME + NAME_BYTES];
-        let end = raw.iter().position(|b| *b == 0).unwrap_or(NAME_BYTES);
-        let name = String::from_utf8_lossy(&raw[..end]).into_owned();
-        let len = u64::from_le_bytes(
-          bytes[at + AT_LEN..at + AT_LEN + 8]
-            .try_into()
-            .unwrap_or([0; 8]),
-        );
-        (name, usize::try_from(len).unwrap_or(0))
-      };
-      let region = ClientRegion::open(&Handoff::Name(name), len)?;
-      state(&object, index)?.store(DONE, Ordering::Release);
-      Ok(Connected {
-        region,
-        doorbell: Doorbell::Word(bell),
-        liveness: super::Liveness {
-          inner: Liveness {
-            instance: instance.to_owned(),
-            generation,
-          },
-        },
-        control: Some(ClientControl),
+      #[cfg(not(windows))]
+      let _ = wake::wait(word, now, Some(wait_ns.saturating_sub(elapsed)))?;
+      #[cfg(windows)]
+      let _ = ready_event.wait(Some(wait_ns.saturating_sub(elapsed)))?;
+    }
+  }
+
+  /// Takes the answered slot `index` to `DONE`: the daemon's fields, copied before, are this client's
+  /// only if the slot was still its answer (the daemon reclaims an answer left past the stale bound).
+  fn finish(
+    object: &SharedObject,
+    index: usize,
+    answer: u32,
+    instance: &str,
+  ) -> Result<(), IpcError> {
+    state(object, index)?
+      .compare_exchange(answer, DONE, Ordering::AcqRel, Ordering::Acquire)
+      .map(drop)
+      .map_err(|_| IpcError::DaemonUnavailable {
+        endpoint: instance.to_owned(),
+        why: "the daemon reclaimed the claim before the client read its answer",
       })
+  }
+
+  /// Gives slot `index` back when its claim cannot be announced; only while it is still merely claimed,
+  /// so a claim the daemon already took is left to its answer.
+  fn give_back(object: &SharedObject, index: usize) {
+    if let Ok(word) = state(object, index) {
+      let _ = word.compare_exchange(CLAIMED, FREE, Ordering::AcqRel, Ordering::Acquire);
+    }
+  }
+
+  pub(super) fn connect(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
+    let (handoff, mut object, generation) = open_bootstrap(instance)?;
+    let index = claim(&mut object, wanted)?;
+    // The Event the daemon signals when it answers this slot (Windows; the word wake is process-local
+    // there). The daemon holds every slot's Event from its start, so a signal raised before this wait is
+    // kept until the wait consumes it.
+    #[cfg(windows)]
+    let ready_event = match crate::wake::Event::open(&ready_event_name(instance, index)) {
+      Ok(event) => event,
+      Err(error) => {
+        give_back(&object, index);
+        return Err(error);
+      }
+    };
+    // Ring the daemon-wide doorbell so a parked control shard sees the claim. The client's own doorbell
+    // for later rings is this bell, over its own mapping of the bootstrap object.
+    let bell = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
+      .map_err(IpcError::from)
+      .and_then(|mapping| Bell::new(mapping, instance));
+    let bell = match bell.and_then(|bell| bell.ring().map(|()| bell)) {
+      Ok(bell) => bell,
+      Err(error) => {
+        // The claim cannot be announced: give the slot back rather than leave it claimed.
+        give_back(&object, index);
+        return Err(error);
+      }
+    };
+    let answer = await_answer(
+      &object,
+      index,
+      instance,
+      #[cfg(windows)]
+      &ready_event,
+    )?;
+    let at = slot_at(index);
+    if answer == REFUSED {
+      // The daemon's typed refusal: the bound when that was the reason, else none.
+      let limit = read_u64(&object, at.saturating_add(AT_LEN))?;
+      finish(&object, index, REFUSED, instance)?;
+      return Err(super::refusal_of(
+        usize::try_from(limit).unwrap_or(usize::MAX),
+        instance,
+      ));
+    }
+    let (name, len) = read_answer(&object, at)?;
+    finish(&object, index, READY, instance)?;
+    let region = ClientRegion::open(&Handoff::Name(name), len)?;
+    Ok(Connected {
+      region,
+      doorbell: Doorbell::Word(bell),
+      liveness: super::Liveness {
+        inner: Liveness {
+          instance: instance.to_owned(),
+          generation,
+        },
+      },
+      control: Some(ClientControl),
+    })
+  }
+
+  #[cfg(test)]
+  mod tests {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+
+    use super::*;
+    use crate::region::RegionGeometry;
+
+    fn instance(tag: &str) -> String {
+      format!("rdv-{tag}-{}", std::process::id())
+    }
+
+    /// Shape: a small region, enough for a claim to be answered with one.
+    fn geometry() -> RegionGeometry {
+      RegionGeometry {
+        slots: 4,
+        spin_ns: 1_000,
+        spin_shift: 3,
+        bulk_bytes: 4096,
+        page: 4096,
+      }
+    }
+
+    /// The daemon's side of one accept: the wanted id granted, a real region made for it.
+    fn accept(listener: &mut Listener, tag: &str) -> Result<Option<Accepted>, IpcError> {
+      let tag = tag.to_owned();
+      listener.accept_one(&mut |wanted| wanted.max(1), &mut |id| {
+        Ok(Prepared {
+          region: ClientRegion::create(
+            &format!("rdvr-{tag}-{id}-{}", std::process::id()),
+            id,
+            0,
+            geometry(),
+          )?,
+          kick_fd: None,
+        })
+      })
+    }
+
+    /// A client's own mapping of `name`'s bootstrap object.
+    fn client_mapping(name: &str) -> SharedObject {
+      let handoff = SharedObject::handoff_for_name(&rendezvous_name(name)).unwrap();
+      SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words()).unwrap()
+    }
+
+    /// AUD-29-09 (the claim protocol). Do: a client takes slot 0 `CLAIMING` and has not written its
+    /// fields; the daemon accepts; the client writes its wanted id and publishes `CLAIMED`; the daemon
+    /// accepts again. Expect: nothing answered while the fields were unwritten (before 2026-09-30 a claim
+    /// was visible before its fields, and the daemon could read them unwritten); the published claim
+    /// answered `READY` with the id it wanted.
+    #[test]
+    fn a_claim_is_answered_only_once_its_fields_are_published() {
+      let name = instance("claiming");
+      let mut listener = Listener::open(&name).unwrap();
+      let mut client = client_mapping(&name);
+      assert!(
+        state(&client, 0)
+          .unwrap()
+          .compare_exchange(FREE, CLAIMING, AcqRel, Acquire)
+          .is_ok()
+      );
+      assert!(
+        accept(&mut listener, "a").unwrap().is_none(),
+        "a claim still being written is not answered"
+      );
+      client
+        .write(slot_at(0) + AT_CLIENT, &7u32.to_le_bytes())
+        .unwrap();
+      client
+        .write(slot_at(0) + AT_PID, &current_pid().to_le_bytes())
+        .unwrap();
+      state(&client, 0).unwrap().store(CLAIMED, Release);
+      let accepted = accept(&mut listener, "b")
+        .unwrap()
+        .expect("the published claim is answered");
+      assert_eq!(accepted.client_id, 7);
+      assert_eq!(state(&client, 0).unwrap().load(Acquire), READY);
+    }
+
+    /// AUD-29-09 (a dead claimant). Do: leave slot 0 `CLAIMING`, as a client killed mid-claim would;
+    /// accept once, again past the stale bound. Expect: the slot kept on the first pass (a live claimant
+    /// could still publish), taken back `FREE` on the second, so a dead claimant never strands it.
+    #[test]
+    fn a_claim_abandoned_mid_write_is_reclaimed_past_the_stale_bound() {
+      let name = instance("stale");
+      let mut listener = Listener::open(&name).unwrap();
+      let client = client_mapping(&name);
+      state(&client, 0).unwrap().store(CLAIMING, Release);
+      assert!(accept(&mut listener, "c").unwrap().is_none());
+      assert_eq!(state(&client, 0).unwrap().load(Acquire), CLAIMING);
+      #[allow(clippy::disallowed_methods)] // a test waiting out the stale bound it checks
+      std::thread::sleep(std::time::Duration::from_nanos(
+        STALE_SLOT_NS + CLAIM_WAIT_NS / 10,
+      ));
+      assert!(accept(&mut listener, "d").unwrap().is_none());
+      assert_eq!(state(&client, 0).unwrap().load(Acquire), FREE);
+    }
+
+    /// AUD-29-09 (header publication). Do: create the bootstrap object with its header written but the
+    /// start stamp not yet published, and connect. Expect: `DaemonUnavailable` naming the unpublished
+    /// object, never a torn header read as a daemon.
+    #[test]
+    fn a_client_never_reads_an_unpublished_bootstrap_header() {
+      let name = instance("unpublished");
+      let mut object =
+        SharedObject::create(&rendezvous_name(&name), OBJECT_BYTES, bootstrap_words()).unwrap();
+      object.write(0, &MAGIC.to_le_bytes()).unwrap();
+      assert!(matches!(
+        connect(&name, 0),
+        Err(IpcError::DaemonUnavailable {
+          why: "the daemon has not yet published its rendezvous object",
+          ..
+        })
+      ));
     }
   }
 }

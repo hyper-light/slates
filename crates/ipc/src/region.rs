@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use slates_mem::{Handoff, SharedObject};
+use slates_mem::{Handoff, RunId, SharedObject, Width, WordRun, Words};
 
 use crate::error::IpcError;
 use crate::slot::Ring;
@@ -105,6 +105,49 @@ impl RegionGeometry {
   }
 }
 
+/// The region's own words, each a run of one: wake, the two parked flags, the doorbell, the reply stamp.
+const REGION_WORDS: [WordRun; 5] = [
+  WordRun::one(AT_WAKE, Width::U32),
+  WordRun::one(AT_CLIENT_PARKED, Width::U32),
+  WordRun::one(AT_DAEMON_PARKED, Width::U32),
+  WordRun::one(AT_DOORBELL, Width::U32),
+  WordRun::one(AT_REPLY_STAMP, Width::U64),
+];
+
+/// The region's own words, resolved once in its object so every wait and wake reaches them in constant
+/// time.
+#[derive(Clone, Copy, Debug)]
+struct RegionIds {
+  wake: RunId,
+  client_parked: RunId,
+  daemon_parked: RunId,
+  doorbell: RunId,
+  reply_stamp: RunId,
+}
+
+impl RegionIds {
+  fn resolve(object: &SharedObject) -> Result<RegionIds, IpcError> {
+    let [wake, client_parked, daemon_parked, doorbell, reply_stamp] = REGION_WORDS;
+    Ok(RegionIds {
+      wake: object.resolve(&wake)?,
+      client_parked: object.resolve(&client_parked)?,
+      daemon_parked: object.resolve(&daemon_parked)?,
+      doorbell: object.resolve(&doorbell)?,
+      reply_stamp: object.resolve(&reply_stamp)?,
+    })
+  }
+}
+
+/// The region's declared atomic words (AUD-29-09): the words block and both rings' sequence words and
+/// hints; the header and the bulk area are plain, reached by copy.
+fn region_words(cmd: &Ring, cpl: &Ring) -> Words {
+  REGION_WORDS
+    .into_iter()
+    .fold(Words::new(), |words, run| words.with(run))
+    .and(cmd.words())
+    .and(cpl.words())
+}
+
 /// A client region: the object and its rings.
 pub struct ClientRegion {
   object: SharedObject,
@@ -114,6 +157,7 @@ pub struct ClientRegion {
   spin_shift: u32,
   cmd: Ring,
   cpl: Ring,
+  ids: RegionIds,
   bulk: (usize, usize),
   /// The Windows cross-process wake: a named auto-reset Event derived from the region's object name
   /// (`{name}-wake`), so both ends open the same one with no handle passing. `WaitOnAddress` on the
@@ -162,16 +206,19 @@ impl ClientRegion {
       });
     }
     let total = geometry.total_bytes();
-    let mut object = SharedObject::create(name, total)?;
     let slots = usize::try_from(geometry.slots).unwrap_or(0);
     let cmd = Ring::at(geometry.cmd_offset(), slots);
     let cpl = Ring::at(geometry.cpl_offset(), slots);
+    let mut object = SharedObject::create(name, total, region_words(&cmd, &cpl))?;
+    let (cmd, cpl) = (cmd.resolved(&object)?, cpl.resolved(&object)?);
+    let ids = RegionIds::resolve(&object)?;
     let bulk = (
       geometry.bulk_offset(),
       usize::try_from(geometry.bulk_bytes).unwrap_or(0),
     );
     {
-      let bytes = object.bytes_mut();
+      let mut header = [0u8; HEADER_BYTES];
+      let bytes = &mut header[..];
       put(bytes, AT_MAGIC, &MAGIC.to_le_bytes());
       put(bytes, AT_VERSION, &LAYOUT_VERSION.to_le_bytes());
       put(bytes, AT_CLIENT, &client_id.to_le_bytes());
@@ -199,14 +246,15 @@ impl ClientRegion {
       );
       put(bytes, AT_BULK_LEN, &geometry.bulk_bytes.to_le_bytes());
       put(bytes, AT_SPIN_SHIFT, &geometry.spin_shift.to_le_bytes());
+      object.write(0, &header)?;
     }
     cmd.init(&object)?;
     cpl.init(&object)?;
-    for at in [AT_WAKE, AT_CLIENT_PARKED, AT_DAEMON_PARKED, AT_DOORBELL] {
-      object.atomic_u32(at)?.store(0, Ordering::Release);
+    for id in [ids.wake, ids.client_parked, ids.daemon_parked, ids.doorbell] {
+      object.run_u32(id, 0)?.store(0, Ordering::Release);
     }
     object
-      .atomic_u64(AT_REPLY_STAMP)?
+      .run_u64(ids.reply_stamp, 0)?
       .store(0, Ordering::Release);
     #[cfg(windows)]
     let wake_event = windows_wake_event(&object)?;
@@ -218,6 +266,7 @@ impl ClientRegion {
       spin_shift: geometry.spin_shift,
       cmd,
       cpl,
+      ids,
       bulk,
       #[cfg(windows)]
       wake_event,
@@ -226,9 +275,17 @@ impl ClientRegion {
 
   /// The client opens the region the daemon handed over.
   pub fn open(handoff: &Handoff, len: usize) -> Result<ClientRegion, IpcError> {
-    let object = SharedObject::open(handoff, len)?;
-    let bytes = object.bytes();
-    if bytes.len() < RINGS_OFFSET || read_u32(bytes, AT_MAGIC) != MAGIC {
+    if len < RINGS_OFFSET {
+      return Err(IpcError::Layout {
+        reason: "a region shorter than its header and words",
+      });
+    }
+    // The header first, by copy, before any word is declared: the rings' places come from it.
+    let object = SharedObject::open(handoff, len, Words::new())?;
+    let mut header = [0u8; HEADER_BYTES];
+    object.read(0, &mut header)?;
+    let bytes = &header[..];
+    if read_u32(bytes, AT_MAGIC) != MAGIC {
       return Err(IpcError::Layout {
         reason: "wrong magic",
       });
@@ -249,14 +306,27 @@ impl ClientRegion {
     let bulk_at = usize::try_from(read_u64(bytes, AT_BULK)).unwrap_or(usize::MAX);
     let bulk_len = usize::try_from(read_u64(bytes, AT_BULK_LEN)).unwrap_or(usize::MAX);
     let ring_bytes = Ring::bytes(slots);
-    let inside = |at: usize, len: usize| at.checked_add(len).is_some_and(|end| end <= bytes.len());
+    let inside = |at: usize, span: usize| at.checked_add(span).is_some_and(|end| end <= len);
     if !inside(cmd_at, ring_bytes) || !inside(cpl_at, ring_bytes) || !inside(bulk_at, bulk_len) {
       return Err(IpcError::Layout {
         reason: "a ring or the bulk area lies outside the region",
       });
     }
+    let (cmd, cpl) = (Ring::at(cmd_at, slots), Ring::at(cpl_at, slots));
+    // A header whose rings would overlap the words block or each other is refused here, typed.
+    let object = object.declare(region_words(&cmd, &cpl))?;
+    let (cmd, cpl) = (cmd.resolved(&object)?, cpl.resolved(&object)?);
+    let ids = RegionIds::resolve(&object)?;
+    if region_words(&cmd, &cpl)
+      .layout(len)?
+      .touches(bulk_at, bulk_len)
+    {
+      return Err(IpcError::Layout {
+        reason: "the bulk area overlaps a ring or the words block",
+      });
+    }
     let client_id = read_u32(bytes, AT_CLIENT);
-    let shard = u16::from_le_bytes([bytes[AT_SHARD], bytes[AT_SHARD + 1]]);
+    let shard = u16::from_le_bytes(field(bytes, AT_SHARD));
     let spin_ns = read_u32(bytes, AT_SPIN);
     let spin_shift = read_u32(bytes, AT_SPIN_SHIFT);
     #[cfg(windows)]
@@ -267,8 +337,9 @@ impl ClientRegion {
       shard,
       spin_ns,
       spin_shift,
-      cmd: Ring::at(cmd_at, slots),
-      cpl: Ring::at(cpl_at, slots),
+      cmd,
+      cpl,
+      ids,
       bulk: (bulk_at, bulk_len),
       #[cfg(windows)]
       wake_event,
@@ -343,40 +414,58 @@ impl ClientRegion {
 
   /// The wake word.
   pub fn wake_word(&self) -> Result<&AtomicU32, IpcError> {
-    Ok(self.object.atomic_u32(AT_WAKE)?)
+    Ok(self.object.run_u32(self.ids.wake, 0)?)
   }
 
   /// The client's parked flag.
   pub fn client_parked(&self) -> Result<&AtomicU32, IpcError> {
-    Ok(self.object.atomic_u32(AT_CLIENT_PARKED)?)
+    Ok(self.object.run_u32(self.ids.client_parked, 0)?)
   }
 
   /// The daemon's parked flag.
   pub fn daemon_parked(&self) -> Result<&AtomicU32, IpcError> {
-    Ok(self.object.atomic_u32(AT_DAEMON_PARKED)?)
+    Ok(self.object.run_u32(self.ids.daemon_parked, 0)?)
   }
 
   /// The doorbell the client rings when the daemon is parked.
   pub fn doorbell(&self) -> Result<&AtomicU32, IpcError> {
-    Ok(self.object.atomic_u32(AT_DOORBELL)?)
+    Ok(self.object.run_u32(self.ids.doorbell, 0)?)
   }
 
   /// The reply stamp: the host clock (`slates_machine::clock::monotonic_ns`) when the daemon first woke
   /// the parked client, with [`REPLY_STAMP_CONFIRMED`] set once that wake found the client asleep; zero
   /// once the client has cleared it.
   pub fn reply_stamp(&self) -> Result<&AtomicU64, IpcError> {
-    Ok(self.object.atomic_u64(AT_REPLY_STAMP)?)
+    Ok(self.object.run_u64(self.ids.reply_stamp, 0)?)
   }
 
-  /// The bulk area.
-  pub fn bulk(&self) -> &[u8] {
-    &self.object.bytes()[self.bulk.0..self.bulk.0 + self.bulk.1]
+  /// The bulk area's bytes.
+  pub fn bulk_len(&self) -> usize {
+    self.bulk.1
   }
 
-  /// The bulk area, mutably.
-  pub fn bulk_mut(&mut self) -> &mut [u8] {
-    let (at, len) = self.bulk;
-    &mut self.object.bytes_mut()[at..at + len]
+  /// Copies the `into.len()` bytes at `offset` of the bulk area out; refused outside the area.
+  pub fn read_bulk(&self, offset: usize, into: &mut [u8]) -> Result<(), IpcError> {
+    let at = self.bulk_at(offset, into.len())?;
+    Ok(self.object.read(at, into)?)
+  }
+
+  /// Copies `from` into the bulk area at `offset`; refused outside the area.
+  pub fn write_bulk(&mut self, offset: usize, from: &[u8]) -> Result<(), IpcError> {
+    let at = self.bulk_at(offset, from.len())?;
+    Ok(self.object.write(at, from)?)
+  }
+
+  /// The object offset of `len` bulk bytes at `offset` of the area, or the refusal outside it.
+  fn bulk_at(&self, offset: usize, len: usize) -> Result<usize, IpcError> {
+    let outside = IpcError::BadSlot {
+      reason: "bulk reference outside the area",
+    };
+    let end = offset.checked_add(len).ok_or(outside.clone())?;
+    if end > self.bulk.1 {
+      return Err(outside);
+    }
+    self.bulk.0.checked_add(offset).ok_or(outside)
   }
 }
 
@@ -385,19 +474,24 @@ fn cmd_offset_of(geometry: &RegionGeometry) -> usize {
 }
 
 fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
-  bytes[at..at + value.len()].copy_from_slice(value);
+  if let Some(field) = bytes.get_mut(at..at.saturating_add(value.len())) {
+    field.copy_from_slice(value);
+  }
+}
+
+/// The `N` bytes at `at` (zero past the end: the header's length was checked when it was read).
+fn field<const N: usize>(bytes: &[u8], at: usize) -> [u8; N] {
+  let mut word = [0u8; N];
+  if let Some(found) = bytes.get(at..at.saturating_add(N)) {
+    word.copy_from_slice(found);
+  }
+  word
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
-  let mut w = [0u8; size_of::<u32>()];
-  let n = w.len();
-  w.copy_from_slice(&bytes[at..at + n]);
-  u32::from_le_bytes(w)
+  u32::from_le_bytes(field(bytes, at))
 }
 
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
-  let mut w = [0u8; size_of::<u64>()];
-  let n = w.len();
-  w.copy_from_slice(&bytes[at..at + n]);
-  u64::from_le_bytes(w)
+  u64::from_le_bytes(field(bytes, at))
 }

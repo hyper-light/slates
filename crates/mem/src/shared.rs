@@ -10,11 +10,17 @@
 //! The mapping is a full read-write view. On Unix it is `memmap2`'s file-backed map (the one
 //! `unsafe` call, whose invariant is that the object is ours to map: nothing truncates it while
 //! a view lives, and every other mapper follows the same rule); on Windows the section view from
-//! `MapViewOfFile`. Words that two processes read and write concurrently (a ring's head and
-//! tail, a wake word, a heartbeat) are reached through [`SharedObject::atomic_u64`] and
-//! [`SharedObject::atomic_u32`], which view the mapped bytes as atomics: aligned, inside the map,
-//! living as long as the map. Everything else is read and written through byte slices by the
-//! single owner of that part of the layout.
+//! `MapViewOfFile`.
+//!
+//! **No reference into the mapping is ever handed out** (AUD-29-09). Another process writes the same
+//! bytes, so a `&[u8]` over them would promise Rust an immutability the other process does not keep. The
+//! layout's concurrent words are declared when the object is created or opened ([`Words`]) and reached
+//! only through [`SharedObject::atomic_u64`] and [`SharedObject::atomic_u32`], for a declared word of
+//! exactly that width. Every other byte crosses the boundary by copy — [`SharedObject::read`] and
+//! [`SharedObject::write`], through the mapping's raw pointer — and a copy that touches a declared word is
+//! refused. So a plain access and an atomic one, or two atomic widths, never meet on the same bytes, and
+//! the protocol the words carry (a slot released by its sequence word) is what orders the copies. Until
+//! 2026-09-30 the object handed out whole-map byte slices beside atomic views of words inside them.
 //!
 //! Hermeticity: tmpfs pages, `shm_open` objects and pagefile-backed sections are all pageable;
 //! the caller locks what must never reach a disk with [`SharedObject::lock`], and the RAM-only
@@ -31,10 +37,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64};
 
-use crate::error::MemError;
-
-/// Format: the widest word the atomic views hand out; every atomic offset is a multiple of it.
-const WORD_BYTES: usize = 8;
+use crate::error::{LayoutRefusal, MemError};
+use crate::words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words, refused};
 
 /// How an object is handed to another process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,10 +49,11 @@ pub enum Handoff {
   Name(String),
 }
 
-/// A shared memory object and its full view.
+/// A shared memory object and its full view, reached by copy and through its declared words.
 pub struct SharedObject {
   inner: platform::Inner,
   len: usize,
+  words: Layout,
 }
 
 impl std::fmt::Debug for SharedObject {
@@ -61,16 +66,28 @@ impl std::fmt::Debug for SharedObject {
 
 impl SharedObject {
   /// Creates an object of `len` bytes named `name` (the name matters on macOS and Windows,
-  /// where it is the handoff; on Linux it is the descriptor's label).
-  pub fn create(name: &str, len: usize) -> Result<SharedObject, MemError> {
+  /// where it is the handoff; on Linux it is the descriptor's label), whose concurrent words are `words`.
+  pub fn create(name: &str, len: usize, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
     let inner = platform::create(name, len)?;
-    Ok(SharedObject { inner, len })
+    Ok(SharedObject { inner, len, words })
   }
 
-  /// Opens an object another process created, from its handoff, expecting `len` bytes.
-  pub fn open(handoff: &Handoff, len: usize) -> Result<SharedObject, MemError> {
+  /// Opens an object another process created, from its handoff, expecting `len` bytes laid out with
+  /// `words` (the creator's layout: both sides declare the same).
+  pub fn open(handoff: &Handoff, len: usize, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(len)?;
     let inner = platform::open(handoff, len)?;
-    Ok(SharedObject { inner, len })
+    Ok(SharedObject { inner, len, words })
+  }
+
+  /// This object with `words` declared: for an opener that learns the layout from a header it first read
+  /// by copy (a client region's rings). By value, so no atomic view of the old layout can outlive the
+  /// change; the new layout is checked like a created one, so a hostile header that would overlap or
+  /// misalign words is refused.
+  pub fn declare(self, words: Words) -> Result<SharedObject, MemError> {
+    let words = words.layout(self.len)?;
+    Ok(SharedObject { words, ..self })
   }
 
   /// The handoff another process uses to open an object created under `name` on a platform
@@ -96,56 +113,125 @@ impl SharedObject {
     self.len == 0
   }
 
-  /// The bytes, for the single owner of the range it reads.
-  pub fn bytes(&self) -> &[u8] {
-    self.inner.bytes()
+  /// Copies the `into.len()` bytes at `offset` out, for the side that owns them under the layout's
+  /// protocol; refused past the end or touching a declared word.
+  pub fn read(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, into.len(), self.len)?;
+    copy_out(&self.inner, offset, into);
+    Ok(())
   }
 
-  /// The bytes, for the single owner of the range it writes.
-  pub fn bytes_mut(&mut self) -> &mut [u8] {
-    self.inner.bytes_mut()
+  /// Copies `from` in at `offset`, for the side that owns those bytes under the layout's protocol;
+  /// refused past the end or touching a declared word.
+  pub fn write(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, from.len(), self.len)?;
+    copy_in(&mut self.inner, offset, from);
+    Ok(())
   }
 
-  /// A 64-bit atomic view of the word at `offset` (8-byte aligned, inside the map).
+  /// The declared 64-bit word at `offset`, as an atomic.
   pub fn atomic_u64(&self, offset: usize) -> Result<&AtomicU64, MemError> {
-    self.check_word(offset, WORD_BYTES)?;
-    word_view(
-      &self.inner.bytes()[offset..offset + WORD_BYTES],
-      offset,
-      self.len,
-    )
+    check_word(&self.words, offset, Width::U64)?;
+    word_view(&self.inner, offset)
   }
 
-  /// A 32-bit atomic view of the word at `offset` (4-byte aligned, inside the map).
+  /// The declared 32-bit word at `offset`, as an atomic.
   pub fn atomic_u32(&self, offset: usize) -> Result<&AtomicU32, MemError> {
-    self.check_word(offset, size_of::<u32>())?;
-    word_view(
-      &self.inner.bytes()[offset..offset + size_of::<u32>()],
-      offset,
-      self.len,
-    )
+    check_word(&self.words, offset, Width::U32)?;
+    word_view(&self.inner, offset)
   }
 
-  fn check_word(&self, offset: usize, width: usize) -> Result<(), MemError> {
-    let end = offset.checked_add(width).ok_or(MemError::OutOfRange {
-      offset,
-      len: self.len,
-    })?;
-    if !offset.is_multiple_of(width)
-      || end > self.len
-      || !(self.inner.bytes().as_ptr() as usize).is_multiple_of(WORD_BYTES)
-    {
-      return Err(MemError::OutOfRange {
-        offset,
-        len: self.len,
-      });
-    }
+  /// The id of the declared run `run`, resolved once so a hot path reaches its words in constant time.
+  pub fn resolve(&self, run: &WordRun) -> Result<RunId, MemError> {
+    resolve(&self.words, run)
+  }
+
+  /// Word `index` of the declared 64-bit run `id`, as an atomic, in constant time.
+  pub fn run_u64(&self, id: RunId, index: usize) -> Result<&AtomicU64, MemError> {
+    word_view(&self.inner, run_word(&self.words, id, index, Width::U64)?)
+  }
+
+  /// Word `index` of the declared 32-bit run `id`, as an atomic, in constant time.
+  pub fn run_u32(&self, id: RunId, index: usize) -> Result<&AtomicU32, MemError> {
+    word_view(&self.inner, run_word(&self.words, id, index, Width::U32)?)
+  }
+
+  /// The id of the declared span run `span`, resolved once so a hot path copies its spans in constant
+  /// time.
+  pub fn resolve_span(&self, span: &SpanRun) -> Result<SpanId, MemError> {
+    self
+      .words
+      .resolve_span(span)
+      .ok_or_else(|| refused(0, 0, LayoutRefusal::NotAWord))
+  }
+
+  /// Copies `into.len()` bytes out of span `index` of the declared span run `id`, in constant time: the
+  /// layout proved every span of the run clear of its words when it was built.
+  pub fn read_span(&self, id: SpanId, index: usize, into: &mut [u8]) -> Result<(), MemError> {
+    copy_out(
+      &self.inner,
+      span_at(&self.words, id, index, into.len())?,
+      into,
+    );
+    Ok(())
+  }
+
+  /// Copies `from` into span `index` of the declared span run `id`, in constant time.
+  pub fn write_span(&mut self, id: SpanId, index: usize, from: &[u8]) -> Result<(), MemError> {
+    let at = span_at(&self.words, id, index, from.len())?;
+    copy_in(&mut self.inner, at, from);
     Ok(())
   }
 
   /// Locks the whole object into RAM (D-12); the refusal names the OS call.
   pub fn lock(&mut self) -> Result<(), MemError> {
     self.inner.lock()
+  }
+}
+
+/// A shared memory object exactly one process reaches, through this value only: the storage a region
+/// backs with anchor-owned RAM (`Region::shared`), whose arena hands out references to its bytes. Its one
+/// constructor carries the promise; its views are then safe.
+pub struct ExclusiveObject(SharedObject);
+
+impl std::fmt::Debug for ExclusiveObject {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_tuple("ExclusiveObject").field(&self.0).finish()
+  }
+}
+
+impl ExclusiveObject {
+  /// `object`, as storage no one else reaches.
+  ///
+  /// # Safety
+  ///
+  /// While this value lives, no other process maps or reaches the object's bytes, and no other value
+  /// in this one does: the anchor that keeps the object across a daemon restart holds it without touching
+  /// it, and a restarted daemon wraps it only after the one before it has exited. The object must declare
+  /// no words. A shared object two processes use at once is reached through its copies and words instead
+  /// (AUD-29-09).
+  pub unsafe fn new(object: SharedObject) -> ExclusiveObject {
+    ExclusiveObject(object)
+  }
+
+  /// The whole map.
+  pub fn bytes(&self) -> &[u8] {
+    self.0.inner.bytes()
+  }
+
+  /// The whole map, writable.
+  pub fn bytes_mut(&mut self) -> &mut [u8] {
+    self.0.inner.bytes_mut()
+  }
+
+  /// The object's handoff, for the process that re-wraps it after this one.
+  pub fn handoff(&self) -> Result<Handoff, MemError> {
+    self.0.handoff()
+  }
+
+  /// Locks the whole object into RAM (D-12).
+  pub fn lock(&mut self) -> Result<(), MemError> {
+    self.0.lock()
   }
 }
 
@@ -158,6 +244,7 @@ pub struct SparseObject {
   inner: platform::Inner,
   len: usize,
   commits: platform::Commits,
+  words: Layout,
 }
 
 impl std::fmt::Debug for SparseObject {
@@ -169,25 +256,31 @@ impl std::fmt::Debug for SparseObject {
 }
 
 impl SparseObject {
-  /// Creates a sparse object of `len` bytes named `name` (the name matters where it is the handoff).
-  pub fn create(name: &str, len: usize) -> Result<SparseObject, MemError> {
+  /// Creates a sparse object of `len` bytes named `name` (the name matters where it is the handoff),
+  /// whose concurrent words are `words`.
+  pub fn create(name: &str, len: usize, words: Words) -> Result<SparseObject, MemError> {
+    let words = words.layout(len)?;
     let inner = platform::create_sparse(name, len)?;
     let commits = platform::Commits::new(len)?;
     Ok(SparseObject {
       inner,
       len,
       commits,
+      words,
     })
   }
 
-  /// Opens a sparse object another process created, from its handoff, expecting `len` bytes.
-  pub fn open(handoff: &Handoff, len: usize) -> Result<SparseObject, MemError> {
+  /// Opens a sparse object another process created, from its handoff, expecting `len` bytes laid out
+  /// with `words`.
+  pub fn open(handoff: &Handoff, len: usize, words: Words) -> Result<SparseObject, MemError> {
+    let words = words.layout(len)?;
     let inner = platform::open(handoff, len)?;
     let commits = platform::Commits::new(len)?;
     Ok(SparseObject {
       inner,
       len,
       commits,
+      words,
     })
   }
 
@@ -206,46 +299,192 @@ impl SparseObject {
     self.len == 0
   }
 
-  /// The `len` bytes at `offset`, committed first, for the single owner of the range it reads.
-  pub fn range(&self, offset: usize, len: usize) -> Result<&[u8], MemError> {
-    self.check_range(offset, len)?;
-    self.commits.commit(&self.inner, offset, len)?;
-    Ok(self.inner.slice(offset, len))
+  /// Copies the `into.len()` bytes at `offset` out (committed first); refused past the end or touching a
+  /// declared word.
+  pub fn read(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, into.len(), self.len)?;
+    self.commits.commit(&self.inner, offset, into.len())?;
+    copy_out(&self.inner, offset, into);
+    Ok(())
   }
 
-  /// The `len` bytes at `offset`, committed first, for the single owner of the range it writes.
-  pub fn range_mut(&mut self, offset: usize, len: usize) -> Result<&mut [u8], MemError> {
-    self.check_range(offset, len)?;
-    self.commits.commit(&self.inner, offset, len)?;
-    Ok(self.inner.slice_mut(offset, len))
+  /// Copies `from` in at `offset` (committed first); refused past the end or touching a declared word.
+  pub fn write(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_copy(&self.words, offset, from.len(), self.len)?;
+    self.commits.commit(&self.inner, offset, from.len())?;
+    copy_in(&mut self.inner, offset, from);
+    Ok(())
   }
 
-  /// A 64-bit atomic view of the word at `offset` (8-byte aligned, inside the map), committed first.
+  /// Copies the `into.len()` racy bytes at `offset` out, byte by byte through `AtomicU8` (committed first):
+  /// for a seqlock reader, which validates the copy against the generation after. Refused unless the span
+  /// lies wholly inside one declared racy span.
+  pub fn read_racy(&self, offset: usize, into: &mut [u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, into.len(), self.len)?;
+    self.commits.commit(&self.inner, offset, into.len())?;
+    racy_out(&self.inner, offset, into);
+    Ok(())
+  }
+
+  /// Copies `from` in at `offset` byte by byte through `AtomicU8` (committed first): for a seqlock writer.
+  /// Refused unless the span lies wholly inside one declared racy span.
+  pub fn write_racy(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
+    check_racy(&self.words, offset, from.len(), self.len)?;
+    self.commits.commit(&self.inner, offset, from.len())?;
+    racy_in(&self.inner, offset, from);
+    Ok(())
+  }
+
+  /// The declared 64-bit word at `offset`, committed first, as an atomic.
   pub fn atomic_u64(&self, offset: usize) -> Result<&AtomicU64, MemError> {
-    word_view(
-      self.range(offset, size_of::<AtomicU64>())?,
-      offset,
-      self.len,
-    )
+    check_word(&self.words, offset, Width::U64)?;
+    self
+      .commits
+      .commit(&self.inner, offset, Width::U64.bytes())?;
+    word_view(&self.inner, offset)
   }
 
-  /// A 32-bit atomic view of the word at `offset` (4-byte aligned, inside the map), committed first.
+  /// The declared 32-bit word at `offset`, committed first, as an atomic.
   pub fn atomic_u32(&self, offset: usize) -> Result<&AtomicU32, MemError> {
-    word_view(
-      self.range(offset, size_of::<AtomicU32>())?,
-      offset,
-      self.len,
-    )
+    check_word(&self.words, offset, Width::U32)?;
+    self
+      .commits
+      .commit(&self.inner, offset, Width::U32.bytes())?;
+    word_view(&self.inner, offset)
   }
 
-  fn check_range(&self, offset: usize, len: usize) -> Result<(), MemError> {
-    match offset.checked_add(len) {
-      Some(end) if end <= self.len => Ok(()),
-      _ => Err(MemError::OutOfRange {
-        offset,
-        len: self.len,
-      }),
+  /// The id of the declared run `run`, resolved once so a hot path reaches its words in constant time.
+  pub fn resolve(&self, run: &WordRun) -> Result<RunId, MemError> {
+    resolve(&self.words, run)
+  }
+
+  /// Word `index` of the declared 64-bit run `id`, committed first, as an atomic, in constant time.
+  pub fn run_u64(&self, id: RunId, index: usize) -> Result<&AtomicU64, MemError> {
+    let offset = run_word(&self.words, id, index, Width::U64)?;
+    self
+      .commits
+      .commit(&self.inner, offset, Width::U64.bytes())?;
+    word_view(&self.inner, offset)
+  }
+}
+
+/// A copy of `len` bytes at `offset` in an object of `object_len` bytes laid out with `words`: inside the
+/// object, and touching no declared word.
+fn check_copy(
+  words: &Layout,
+  offset: usize,
+  len: usize,
+  object_len: usize,
+) -> Result<(), MemError> {
+  match offset.checked_add(len) {
+    Some(end) if end <= object_len => {}
+    _ => return Err(refused(offset, len, LayoutRefusal::OutOfRange)),
+  }
+  if words.touches(offset, len) {
+    return Err(refused(offset, len, LayoutRefusal::TouchesWord));
+  }
+  Ok(())
+}
+
+/// A racy copy of `len` bytes at `offset`: inside the object and wholly inside one declared racy span.
+fn check_racy(
+  words: &Layout,
+  offset: usize,
+  len: usize,
+  object_len: usize,
+) -> Result<(), MemError> {
+  match offset.checked_add(len) {
+    Some(end) if end <= object_len => {}
+    _ => return Err(refused(offset, len, LayoutRefusal::OutOfRange)),
+  }
+  if !words.racy_covers(offset, len) {
+    return Err(refused(offset, len, LayoutRefusal::NotAWord));
+  }
+  Ok(())
+}
+
+/// Copies the `into.len()` bytes at `offset` out (inside the map; the caller checked).
+fn copy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
+  // SAFETY: `[offset, offset + into.len())` lies inside the live map (the caller checked) and is
+  // committed where the platform commits; the source is the mapping's raw pointer, never a reference, and
+  // `into` is this process's own buffer, so the two cannot overlap. These are plain bytes, which the
+  // layout's protocol gives the copying side for the copy (no declared word is touched: checked).
+  unsafe {
+    std::ptr::copy_nonoverlapping(inner.base().add(offset), into.as_mut_ptr(), into.len());
+  }
+}
+
+/// Copies `from` in at `offset` (inside the map; the caller checked).
+fn copy_in(inner: &mut platform::Inner, offset: usize, from: &[u8]) {
+  // SAFETY: as for `copy_out`, in the other direction; `&mut` is this process's only writer through the
+  // object.
+  unsafe {
+    std::ptr::copy_nonoverlapping(from.as_ptr(), inner.base().add(offset), from.len());
+  }
+}
+
+/// Copies declared racy bytes out through `AtomicU8`, relaxed (the seqlock's generation orders them).
+fn racy_out(inner: &platform::Inner, offset: usize, into: &mut [u8]) {
+  let base = inner.base().wrapping_add(offset);
+  for (index, byte) in into.iter_mut().enumerate() {
+    // SAFETY: the byte lies inside the live map (the caller checked the span) and is a declared racy
+    // byte, which every access on either side reaches only through `AtomicU8` (the layout refuses a plain
+    // copy of it and any wider atomic over it); `AtomicU8` has no alignment requirement and every bit
+    // pattern is valid.
+    *byte = unsafe {
+      &*base
+        .wrapping_add(index)
+        .cast::<std::sync::atomic::AtomicU8>()
     }
+    .load(std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// Copies `from` into declared racy bytes through `AtomicU8`, relaxed.
+fn racy_in(inner: &platform::Inner, offset: usize, from: &[u8]) {
+  let base = inner.base().wrapping_add(offset);
+  for (index, byte) in from.iter().enumerate() {
+    // SAFETY: as in `racy_out`.
+    unsafe {
+      &*base
+        .wrapping_add(index)
+        .cast::<std::sync::atomic::AtomicU8>()
+    }
+    .store(*byte, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+/// The offset of span `index` of span run `id` for a copy of `len` bytes: constant time, and only a span
+/// the layout declared (validated inside the object and clear of every word when the layout was built).
+fn span_at(layout: &Layout, id: SpanId, index: usize, len: usize) -> Result<usize, MemError> {
+  layout
+    .span(id)
+    .and_then(|span| span.span(index, len))
+    .ok_or_else(|| refused(index, len, LayoutRefusal::NotAWord))
+}
+
+/// `run`'s id in `layout`, or the refusal for a run it does not declare.
+fn resolve(layout: &Layout, run: &WordRun) -> Result<RunId, MemError> {
+  layout
+    .resolve(run)
+    .ok_or_else(|| refused(run.first_offset(), 0, LayoutRefusal::NotAWord))
+}
+
+/// The offset of word `index` of run `id` of `width` in `layout`: constant time, and only a word the
+/// layout declared (validated in range and aligned when the layout was built).
+fn run_word(layout: &Layout, id: RunId, index: usize, width: Width) -> Result<usize, MemError> {
+  layout
+    .run(id)
+    .and_then(|run| run.word(index, width))
+    .ok_or_else(|| refused(index, width.bytes(), LayoutRefusal::NotAWord))
+}
+
+/// An atomic view of `width` at `offset`: only a declared word of exactly that width.
+fn check_word(words: &Layout, offset: usize, width: Width) -> Result<(), MemError> {
+  if words.holds(offset, width) {
+    Ok(())
+  } else {
+    Err(refused(offset, width.bytes(), LayoutRefusal::NotAWord))
   }
 }
 
@@ -255,15 +494,18 @@ trait Word {}
 impl Word for AtomicU32 {}
 impl Word for AtomicU64 {}
 
-/// Views `word` — exactly one `W` wide and aligned to it — as the atomic `W`; `OutOfRange` otherwise.
-fn word_view<W: Word>(word: &[u8], offset: usize, len: usize) -> Result<&W, MemError> {
-  if word.len() != size_of::<W>() || !(word.as_ptr() as usize).is_multiple_of(align_of::<W>()) {
-    return Err(MemError::OutOfRange { offset, len });
+/// The declared word at `offset` (checked by the caller: inside the map, aligned to `W`, declared of `W`'s
+/// width, touched by no copy) as the atomic `W`.
+fn word_view<W: Word>(inner: &platform::Inner, offset: usize) -> Result<&W, MemError> {
+  let word = inner.base().wrapping_add(offset);
+  if !(word as usize).is_multiple_of(align_of::<W>()) {
+    return Err(refused(offset, size_of::<W>(), LayoutRefusal::Misaligned));
   }
-  // SAFETY: `word` is exactly `size_of::<W>()` bytes, aligned to `W`, inside a map that lives as long
-  // as the borrow `word` carries; `W` is an atomic integer (the `Word` impls), valid for every bit
-  // pattern; every other access to these bytes across processes is atomic by this module's rule.
-  Ok(unsafe { &*word.as_ptr().cast::<W>() })
+  // SAFETY: the word lies inside a map that lives as long as `inner` (the caller checked the range),
+  // aligned to `W` (checked above), and is a declared word of `W`'s width, which the layout guarantees no
+  // copy touches and no other width views; `W` is an atomic integer, valid for every bit pattern. No Rust
+  // reference to the map's bytes exists to alias it: the object hands out none.
+  Ok(unsafe { &*word.cast::<W>() })
 }
 
 #[cfg(unix)]
@@ -505,20 +747,17 @@ mod platform {
   }
 
   impl Inner {
+    /// The map's first byte, as the raw pointer the mapping returned (no reference to its bytes is formed).
+    pub(super) fn base(&self) -> *mut u8 {
+      self.map.as_ptr().cast_mut()
+    }
+
+    /// The whole map, for [`super::ExclusiveObject`] only (its constructor's contract makes it sound).
     pub(super) fn bytes(&self) -> &[u8] {
       &self.map
     }
 
-    /// The `len` bytes at `offset` (inside the map; the caller checked).
-    pub(super) fn slice(&self, offset: usize, len: usize) -> &[u8] {
-      &self.map[offset..offset + len]
-    }
-
-    /// The `len` bytes at `offset`, writable (inside the map; the caller checked).
-    pub(super) fn slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
-      &mut self.map[offset..offset + len]
-    }
-
+    /// The whole map, writable, for [`super::ExclusiveObject`] only.
     pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
       &mut self.map
     }
@@ -818,28 +1057,22 @@ mod platform {
   }
 
   impl Inner {
-    /// The `len` bytes at `offset` (inside the view and committed; the caller checked both).
-    pub(super) fn slice(&self, offset: usize, len: usize) -> &[u8] {
-      // SAFETY: `[offset, offset + len)` lies inside the view (the caller checked) and is committed
-      // (the sparse object committed it first), so it is readable for as long as `self` lives.
-      unsafe { std::slice::from_raw_parts(self.view_ptr().cast::<u8>().add(offset), len) }
+    /// The view's first byte, as the raw pointer the view returned (no reference to its bytes is formed).
+    pub(super) fn base(&self) -> *mut u8 {
+      self.view_ptr().cast::<u8>()
     }
 
-    /// The `len` bytes at `offset`, writable (inside the view and committed; the caller checked).
-    pub(super) fn slice_mut(&mut self, offset: usize, len: usize) -> &mut [u8] {
-      // SAFETY: as for `slice`, and `&mut self` is the only borrow of these bytes in this process.
-      unsafe { std::slice::from_raw_parts_mut(self.view_ptr().cast::<u8>().add(offset), len) }
-    }
-
+    /// The whole view, for [`super::ExclusiveObject`] only.
     pub(super) fn bytes(&self) -> &[u8] {
-      // SAFETY: the view is `len` readable bytes for as long as `self` lives.
-      unsafe { std::slice::from_raw_parts(self.view_ptr().cast::<u8>(), self.len) }
+      // SAFETY: the view is `len` readable bytes for as long as `self` lives, and `ExclusiveObject`'s
+      // constructor keeps every other access away while the slice does.
+      unsafe { std::slice::from_raw_parts(self.base(), self.len) }
     }
 
+    /// The whole view, writable, for [`super::ExclusiveObject`] only.
     pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
-      // SAFETY: the view is `len` writable bytes for as long as `self` lives, and `&mut self`
-      // is the only borrow of them in this process.
-      unsafe { std::slice::from_raw_parts_mut(self.view_ptr().cast::<u8>(), self.len) }
+      // SAFETY: as for `bytes`, and `&mut self` is the only borrow of the view in this process.
+      unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
@@ -862,47 +1095,162 @@ mod tests {
   use std::sync::atomic::Ordering;
 
   use super::*;
+  use crate::words::WordRun;
 
-  /// The object is created without a path, written through its bytes, and read back through
-  /// a second mapping of the same object within this process (the cross-process shape).
+  /// Shape: the test object's length.
+  const LEN: usize = 4096;
+
+  /// A small layout: a 32-bit word at 4, a 64-bit word at 8, a racy span at 64..128.
+  fn test_words() -> Words {
+    Words::new()
+      .with(WordRun::one(4, Width::U32))
+      .with(WordRun::one(8, Width::U64))
+      .with(WordRun::racy(64, 64))
+  }
+
+  fn reason(result: Result<(), MemError>) -> Option<LayoutRefusal> {
+    match result {
+      Err(MemError::LayoutRefused { reason, .. }) => Some(reason),
+      _ => None,
+    }
+  }
+
+  /// AUD-29-09. Do: create an object with declared words, copy bytes in, store a word, and read both
+  /// through a second mapping. Expect: the copies and the word cross; an atomic view of an undeclared
+  /// offset, of the other width, or past the end is refused `NotAWord`; a copy that would touch a word is
+  /// refused `TouchesWord` and leaves the word as it was.
   #[test]
   #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
-  fn a_shared_object_is_seen_through_a_second_mapping() {
+  fn a_shared_object_crosses_by_copies_and_declared_words_only() {
     let mut a = SharedObject::create(
       &format!("slates-mem-shared-test-a-{}", std::process::id()),
-      4096,
+      LEN,
+      test_words(),
     )
     .unwrap();
-    a.bytes_mut()[100..104].copy_from_slice(&[1, 2, 3, 4]);
-    let word = a.atomic_u64(8).unwrap();
-    word.store(0xdead_beef, Ordering::Release);
-    #[cfg(target_os = "linux")]
-    let b = {
-      let handoff = a.handoff().unwrap();
-      SharedObject::open(&handoff, 4096).unwrap()
-    };
-    #[cfg(not(target_os = "linux"))]
-    let b = {
-      let handoff = a.handoff().unwrap();
-      SharedObject::open(&handoff, 4096).unwrap()
-    };
-    assert_eq!(&b.bytes()[100..104], &[1, 2, 3, 4]);
+    a.write(200, &[1, 2, 3, 4]).unwrap();
+    a.atomic_u64(8)
+      .unwrap()
+      .store(0xdead_beef, Ordering::Release);
+    let b = SharedObject::open(&a.handoff().unwrap(), LEN, test_words()).unwrap();
+    let mut back = [0u8; 4];
+    b.read(200, &mut back).unwrap();
+    assert_eq!(back, [1, 2, 3, 4]);
     assert_eq!(
       b.atomic_u64(8).unwrap().load(Ordering::Acquire),
       0xdead_beef
     );
-    assert!(a.atomic_u64(3).is_err(), "misaligned");
-    assert!(a.atomic_u64(4096).is_err(), "past the end");
     assert!(a.atomic_u32(4).is_ok());
+    for refused in [
+      a.atomic_u64(16).map(drop),
+      a.atomic_u64(LEN).map(drop),
+      a.atomic_u32(8).map(drop),
+    ] {
+      assert_eq!(reason(refused), Some(LayoutRefusal::NotAWord));
+    }
+    assert_eq!(
+      reason(a.write(6, &[0xFF; 8])),
+      Some(LayoutRefusal::TouchesWord)
+    );
+    assert_eq!(
+      b.atomic_u64(8).unwrap().load(Ordering::Acquire),
+      0xdead_beef,
+      "the refused copy wrote nothing"
+    );
+    assert_eq!(
+      reason(b.read(0, &mut [0u8; 16])),
+      Some(LayoutRefusal::TouchesWord)
+    );
   }
 
-  /// §4.8: a sparse object is written and read by ranges, and a second mapping sees the bytes and the
-  /// words; a range past the end is refused typed, never sliced. Do: write a range far into a large
-  /// object and a word, reopen it by its handoff. Expect: the bytes and the word back; `OutOfRange` for
-  /// a range that ends past the object.
+  /// AUD-29-09 (the hot path's constant-time copies). Do: declare a ring's slot bodies as a span run
+  /// beside its sequence words; copy a body into span 3 and read it back through a second mapping; ask
+  /// for span 4 of four, and a copy longer than a span; declare a span run that overlaps a word. Expect:
+  /// the body crosses; the out-of-run span and the long copy refused `NotAWord`; the overlapping
+  /// declaration refused `TouchesWord` at create, before any mapping exists.
   #[test]
   #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
-  fn a_sparse_object_is_reached_by_ranges_and_seen_through_a_second_mapping() {
+  fn a_declared_span_copies_in_constant_time_and_never_over_a_word() {
+    let seq = WordRun::strided(0, 64, 4, Width::U64);
+    let bodies = crate::words::SpanRun::strided(8, 64, 4, 56);
+    let words = || Words::new().with(seq).with_span(bodies);
+    let mut a = SharedObject::create(
+      &format!("slates-mem-span-test-{}", std::process::id()),
+      LEN,
+      words(),
+    )
+    .unwrap();
+    let span = a.resolve_span(&bodies).unwrap();
+    a.write_span(span, 3, b"slot three body").unwrap();
+    let b = SharedObject::open(&a.handoff().unwrap(), LEN, words()).unwrap();
+    let span_b = b.resolve_span(&bodies).unwrap();
+    let mut back = [0u8; 15];
+    b.read_span(span_b, 3, &mut back).unwrap();
+    assert_eq!(&back, b"slot three body");
+    assert_eq!(
+      reason(b.read_span(span_b, 4, &mut back)),
+      Some(LayoutRefusal::NotAWord)
+    );
+    assert_eq!(
+      reason(a.write_span(span, 0, &[0u8; 57])),
+      Some(LayoutRefusal::NotAWord),
+      "a copy longer than the span"
+    );
+    let over = Words::new()
+      .with(seq)
+      .with_span(crate::words::SpanRun::strided(4, 64, 4, 56));
+    assert!(matches!(
+      SharedObject::create(
+        &format!("slates-mem-span-over-{}", std::process::id()),
+        LEN,
+        over
+      ),
+      Err(MemError::LayoutRefused {
+        reason: LayoutRefusal::TouchesWord,
+        ..
+      })
+    ));
+  }
+
+  /// AUD-29-09. Do: create an object whose layout overlaps two widths on one byte, and open one with a
+  /// word past its end. Expect: both refused before any mapping is handed out.
+  #[test]
+  #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
+  fn a_layout_that_would_mix_accesses_is_refused_at_create() {
+    let overlapping = test_words().with(WordRun::one(12, Width::U32));
+    let created = SharedObject::create(
+      &format!("slates-mem-shared-test-overlap-{}", std::process::id()),
+      LEN,
+      overlapping,
+    );
+    assert!(matches!(
+      created,
+      Err(MemError::LayoutRefused {
+        reason: LayoutRefusal::Overlap,
+        ..
+      })
+    ));
+    let past = Words::new().with(WordRun::one(LEN, Width::U64));
+    assert!(matches!(
+      SharedObject::create(
+        &format!("slates-mem-shared-test-past-{}", std::process::id()),
+        LEN,
+        past
+      ),
+      Err(MemError::LayoutRefused {
+        reason: LayoutRefusal::OutOfRange,
+        ..
+      })
+    ));
+  }
+
+  /// §4.8 and AUD-29-09: a sparse object is reached by copies far into a large layout, its racy span only
+  /// by racy copies, and a second mapping sees all of it. Do: write plain bytes deep inside, a racy
+  /// payload and a word; reopen by the handoff. Expect: each back through its own access; a plain copy of
+  /// the racy span and a racy copy of plain bytes both refused; a copy ending past the object refused.
+  #[test]
+  #[cfg_attr(miri, ignore)] // memfd_create / shm_open shared memory is not modelled by Miri
+  fn a_sparse_object_is_reached_by_its_declared_accesses_through_a_second_mapping() {
     /// Shape: a layout far larger than what the test touches, as the anchor segment is.
     const SPARSE_LEN: usize = 1 << 30;
     /// Shape: an offset deep inside it.
@@ -910,23 +1258,35 @@ mod tests {
     let mut a = SparseObject::create(
       &format!("slates-mem-sparse-test-{}", std::process::id()),
       SPARSE_LEN,
+      test_words(),
     )
     .unwrap();
-    a.range_mut(FAR, 4).unwrap().copy_from_slice(&[4, 3, 2, 1]);
-    a.atomic_u64(64).unwrap().store(0x5eed, Ordering::Release);
-    let b = SparseObject::open(&a.handoff().unwrap(), SPARSE_LEN).unwrap();
-    assert_eq!(b.range(FAR, 4).unwrap(), &[4, 3, 2, 1]);
-    assert_eq!(b.atomic_u64(64).unwrap().load(Ordering::Acquire), 0x5eed);
+    a.write(FAR, &[4, 3, 2, 1]).unwrap();
+    a.write_racy(64, b"published").unwrap();
+    a.atomic_u64(8).unwrap().store(0x5eed, Ordering::Release);
+    let b = SparseObject::open(&a.handoff().unwrap(), SPARSE_LEN, test_words()).unwrap();
+    let mut far = [0u8; 4];
+    b.read(FAR, &mut far).unwrap();
+    assert_eq!(far, [4, 3, 2, 1]);
+    let mut payload = [0u8; 9];
+    b.read_racy(64, &mut payload).unwrap();
+    assert_eq!(&payload, b"published");
+    assert_eq!(b.atomic_u64(8).unwrap().load(Ordering::Acquire), 0x5eed);
+    let mut untouched = [9u8; 8];
+    b.read(1 << 20, &mut untouched).unwrap();
+    assert_eq!(untouched, [0; 8], "an untouched range reads zeros");
     assert_eq!(
-      b.range(0, 8).unwrap(),
-      &[0; 8],
-      "an untouched range reads zeros"
+      reason(b.read(64, &mut [0u8; 4])),
+      Some(LayoutRefusal::TouchesWord)
     );
-    assert!(
-      matches!(b.range(SPARSE_LEN - 2, 4), Err(MemError::OutOfRange { .. })),
-      "a range past the end is refused"
+    assert_eq!(
+      reason(b.read_racy(FAR, &mut [0u8; 4])),
+      Some(LayoutRefusal::NotAWord)
     );
-    assert!(b.atomic_u64(65).is_err(), "misaligned");
+    assert_eq!(
+      reason(b.read(SPARSE_LEN - 2, &mut [0u8; 4])),
+      Some(LayoutRefusal::OutOfRange)
+    );
   }
 
   /// AC (docs/bugs/2026-09-14-segment-handoff-descriptor-owned-twice.md): one handoff is attached more
@@ -938,16 +1298,22 @@ mod tests {
   #[cfg(target_os = "linux")]
   #[cfg_attr(miri, ignore)] // memfd_create shared memory is not modelled by Miri
   fn two_attaches_from_one_handoff_each_own_their_descriptor() {
-    let mut a = SharedObject::create("slates-mem-shared-test-twice", 4096).unwrap();
-    a.bytes_mut()[0..4].copy_from_slice(&[9, 8, 7, 6]);
+    let mut a = SharedObject::create("slates-mem-shared-test-twice", LEN, Words::new()).unwrap();
+    a.write(0, &[9, 8, 7, 6]).unwrap();
     let handoff = a.handoff().unwrap();
-    let first = SharedObject::open(&handoff, 4096).unwrap();
-    let second = SharedObject::open(&handoff, 4096).unwrap();
-    assert_eq!(&first.bytes()[0..4], &[9, 8, 7, 6]);
-    assert_eq!(&second.bytes()[0..4], &[9, 8, 7, 6]);
+    let read = |object: &SharedObject| {
+      let mut back = [0u8; 4];
+      object.read(0, &mut back).unwrap();
+      back
+    };
+    let first = SharedObject::open(&handoff, LEN, Words::new()).unwrap();
+    let second = SharedObject::open(&handoff, LEN, Words::new()).unwrap();
+    assert_eq!(read(&first), [9, 8, 7, 6]);
+    assert_eq!(read(&second), [9, 8, 7, 6]);
     drop(first);
     drop(second);
-    let third = SharedObject::open(&handoff, 4096).expect("the inherited number is still open");
-    assert_eq!(&third.bytes()[0..4], &[9, 8, 7, 6]);
+    let third =
+      SharedObject::open(&handoff, LEN, Words::new()).expect("the inherited number is still open");
+    assert_eq!(read(&third), [9, 8, 7, 6]);
   }
 }

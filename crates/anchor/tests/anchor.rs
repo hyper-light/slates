@@ -432,18 +432,17 @@ fn the_content_object_survives_a_daemon_restart_through_the_handoff() {
   let mut daemon = AnchorSegment::open_content(&env).unwrap().unwrap();
   let offset = 8 * 4096;
   let written = b"agent content written before the crash";
-  daemon
-    .range_mut(offset, written.len())
-    .unwrap()
-    .copy_from_slice(written);
+  daemon.write(offset, written).unwrap();
 
   // The daemon crashes: its mapping is gone. The supervisor still holds the object alive.
   drop(daemon);
 
   // The restarted daemon re-opens the content object from the same handoff; the bytes survive.
   let restarted = AnchorSegment::open_content(&env).unwrap().unwrap();
+  let mut survived = vec![0u8; written.len()];
+  restarted.read(offset, &mut survived).unwrap();
   assert_eq!(
-    restarted.range(offset, written.len()).unwrap(),
+    &survived[..],
     written,
     "content in the anchor's content object survives a daemon restart"
   );
@@ -547,9 +546,15 @@ fn a_segment_with_process_relative_deadlines_is_refused_before_recovery() {
   let name = format!("slates-anchor-old-clock-{}", std::process::id());
   let segment = AnchorSegment::create(&name, &identity(), geometry()).unwrap();
   let (handoff, len) = handoff_of(&segment);
-  let mut mapping = slates_mem::SharedObject::open(&handoff, len).unwrap();
-  mapping.bytes_mut()[AT_VERSION..AT_VERSION + size_of::<u32>()]
-    .copy_from_slice(&PROCESS_RELATIVE_LAYOUT.to_le_bytes());
+  // A second mapping of the header alone (its seqlock word declared), writing the old version by copy.
+  let header = slates_mem::Words::new().with(slates_mem::WordRun::one(
+    slates_anchor::layout::AT_GENERATION,
+    slates_mem::Width::U64,
+  ));
+  let mut mapping = slates_mem::SparseObject::open(&handoff, len, header).unwrap();
+  mapping
+    .write(AT_VERSION, &PROCESS_RELATIVE_LAYOUT.to_le_bytes())
+    .unwrap();
   let result = AnchorSegment::attach(&handoff, len, &identity());
   assert!(
     matches!(

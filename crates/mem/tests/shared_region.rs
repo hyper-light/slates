@@ -10,6 +10,7 @@
 use slates_mem::SharedObject;
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
+use slates_mem::{ExclusiveObject, Words};
 
 /// Shape: a small shared object and page for the test.
 const PAGE: usize = 4096;
@@ -25,8 +26,10 @@ fn object_name(tag: &str) -> String {
 /// content live in anchor-owned RAM without changing the volume core.
 #[test]
 fn an_arena_over_a_shared_region_allocates_and_serves_bytes() {
-  let object = SharedObject::create(&object_name("arena"), LEN).unwrap();
+  let object = SharedObject::create(&object_name("arena"), LEN, Words::new()).unwrap();
   let mut arena = ChunkArena::new(PAGE);
+  // SAFETY: this test is the object's only mapper, and the object declares no words.
+  let object = unsafe { ExclusiveObject::new(object) };
   arena.add_region(Region::shared(object, PAGE)).unwrap();
 
   let extent = arena.alloc(PAGE).unwrap();
@@ -47,21 +50,26 @@ fn an_arena_over_a_shared_region_allocates_and_serves_bytes() {
 /// mapping (`Region::map`) would lose them; this is why the store's content must be anchor-owned.
 #[test]
 fn content_in_a_shared_region_survives_the_writing_mapping_being_dropped() {
-  let object = SharedObject::create(&object_name("survive"), LEN).unwrap();
+  let object = SharedObject::create(&object_name("survive"), LEN, Words::new()).unwrap();
   // The handoff a restarted daemon would use to re-map the same object.
   let handoff = object.handoff().unwrap();
 
   // The "running daemon" places content in the object through its region.
-  let mut region = Region::shared(object, PAGE);
+  // SAFETY: this region is the object's only accessor until it is dropped below, and the object declares
+  // no words.
+  let mut region = Region::shared(unsafe { ExclusiveObject::new(object) }, PAGE);
   let offset = 8 * PAGE;
   let content = b"volume bytes an agent wrote before the crash";
   region.bytes_mut()[offset..offset + content.len()].copy_from_slice(content);
 
   // The "restarted daemon" re-maps the same object from the handoff, then the old mapping goes away
   // (the crashed process exits). The content must still be readable through the new mapping.
-  let reattached = SharedObject::open(&handoff, LEN).unwrap();
-  let recovered = Region::shared(reattached, PAGE);
+  // The re-map comes first (on macOS the name lives only while its creator's mapping does); only the
+  // mapping is taken, no byte is touched, until the old region is gone.
+  let reattached = SharedObject::open(&handoff, LEN, Words::new()).unwrap();
   drop(region);
+  // SAFETY: the writing region is dropped; this is the object's only accessor now.
+  let recovered = Region::shared(unsafe { ExclusiveObject::new(reattached) }, PAGE);
 
   assert_eq!(
     &recovered.bytes()[offset..offset + content.len()],

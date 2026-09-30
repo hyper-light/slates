@@ -253,9 +253,12 @@ fn a_hostile_slot_is_refused_and_the_ring_keeps_flowing() {
       1,
       "slot 1 is free"
     );
-    let bytes = object.bytes_mut();
-    bytes[SLOT_ONE_AT + 8..SLOT_ONE_AT + 10].copy_from_slice(&0xffffu16.to_le_bytes());
-    bytes[SLOT_ONE_AT + 10..SLOT_ONE_AT + 12].copy_from_slice(&200u16.to_le_bytes());
+    object
+      .write(SLOT_ONE_AT + 8, &0xffffu16.to_le_bytes())
+      .unwrap();
+    object
+      .write(SLOT_ONE_AT + 10, &200u16.to_le_bytes())
+      .unwrap();
     object
       .atomic_u64(SLOT_ONE_AT)
       .unwrap()
@@ -283,10 +286,9 @@ fn a_hostile_slot_is_refused_and_the_ring_keeps_flowing() {
   {
     let object = client.region_mut().object_mut();
     let at = SLOT_ONE_AT + 64;
-    let bytes = object.bytes_mut();
-    bytes[at + 8..at + 10].copy_from_slice(&1u16.to_le_bytes());
-    bytes[at + 10..at + 12].copy_from_slice(&4u16.to_le_bytes());
-    bytes[at + 20..at + 24].copy_from_slice(b"next");
+    object.write(at + 8, &1u16.to_le_bytes()).unwrap();
+    object.write(at + 10, &4u16.to_le_bytes()).unwrap();
+    object.write(at + 20, b"next").unwrap();
     object.atomic_u64(at).unwrap().store(3, Ordering::Release);
   }
   assert_eq!(daemon.try_take().unwrap().unwrap().payload, b"next");

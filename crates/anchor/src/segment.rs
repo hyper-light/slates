@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use slates_machine::facts::Identity;
-use slates_mem::{Handoff, SparseObject};
+use slates_mem::{Handoff, SparseObject, Width, WordRun, Words};
 
 use crate::error::AnchorError;
 use crate::layout::{
@@ -28,6 +28,56 @@ pub const ENV_LEN: &str = "SLATES_ANCHOR_LEN";
 pub const ENV_CONTENT: &str = "SLATES_ANCHOR_CONTENT";
 /// Format: the environment variable carrying the content object's length.
 pub const ENV_CONTENT_LEN: &str = "SLATES_ANCHOR_CONTENT_LEN";
+
+/// Format: the supervision block's consecutive 64-bit words, `SUP_PID` through `SUP_STOP_BY`.
+const SUPERVISION_WORDS: usize = 8;
+
+/// The segment's declared layout (AUD-29-09), derived from its geometry: the header's seqlock word; the
+/// supervision block's words and its issuer secret (racy: the daemon rewrites it while a `slates grant`
+/// command may copy it); each payload region's generation word and, after it, its length and body as a
+/// racy span (the seqlock rule: a reader copies while a writer may be rewriting, then checks the
+/// generation); each ring region's four words, its data plain (written by the daemon, read by a later one).
+/// The header's other fields and a ring's data are plain. Until 2026-09-30 the header's generation word
+/// was written as plain bytes and read as an atomic, and every region handed out byte slices.
+fn segment_words(geometry: &Geometry) -> Words {
+  let mut words = Words::new().with(WordRun::one(AT_GENERATION, Width::U64));
+  for region in geometry.regions() {
+    let at = usize::try_from(region.offset).unwrap_or(usize::MAX);
+    let len = usize::try_from(region.len).unwrap_or(0);
+    words = match region.kind {
+      RegionKind::Supervision => words
+        .with(WordRun::strided(
+          at.saturating_add(SUP_PID),
+          size_of::<u64>(),
+          SUPERVISION_WORDS,
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_ISSUER),
+          ISSUER_SECRET_BYTES,
+        )),
+      RegionKind::Log(_) | RegionKind::Audit => words.with(WordRun::strided(
+        at.saturating_add(RING_HEAD),
+        size_of::<u64>(),
+        RING_WORDS,
+        Width::U64,
+      )),
+      RegionKind::Profile
+      | RegionKind::Snapshot(..)
+      | RegionKind::Consensus(_)
+      | RegionKind::Landing(_) => words
+        .with(WordRun::one(
+          at.saturating_add(PAYLOAD_GENERATION),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(PAYLOAD_LEN),
+          len.saturating_sub(PAYLOAD_LEN),
+        )),
+    };
+  }
+  words
+}
 
 /// The mapped anchor segment: a sparse object (`slates_mem::SparseObject`), backed only where its
 /// regions are touched — a log ring's written span, a published slot — so a layout sized by the design's
@@ -170,15 +220,18 @@ impl AnchorSegment {
     let total = usize::try_from(geometry.total_bytes()).map_err(|_| AnchorError::Geometry {
       reason: "total length overflows",
     })?;
-    let mut object = SparseObject::create(name, total)?;
-    let bytes = object.range_mut(0, HEADER_BYTES.min(total))?;
-    put(bytes, AT_GENERATION, &1u64.to_le_bytes());
-    put(bytes, AT_MAGIC, &MAGIC.to_le_bytes());
-    put(bytes, AT_VERSION, &LAYOUT_VERSION.to_le_bytes());
-    put(bytes, AT_IDENTITY, &identity.hash());
-    put(bytes, AT_TOTAL, &geometry.total_bytes().to_le_bytes());
-    put(bytes, AT_GEOMETRY, &geometry.encode());
-    put(bytes, AT_GENERATION, &2u64.to_le_bytes());
+    let mut object = SparseObject::create(name, total, segment_words(&geometry))?;
+    // The header under its seqlock: odd while written, even once whole.
+    let generation = object.atomic_u64(AT_GENERATION)?;
+    generation.store(1, Ordering::Release);
+    object.write(AT_MAGIC, &MAGIC.to_le_bytes())?;
+    object.write(AT_VERSION, &LAYOUT_VERSION.to_le_bytes())?;
+    object.write(AT_IDENTITY, &identity.hash())?;
+    object.write(AT_TOTAL, &geometry.total_bytes().to_le_bytes())?;
+    object.write(AT_GEOMETRY, &geometry.encode())?;
+    object
+      .atomic_u64(AT_GENERATION)?
+      .store(2, Ordering::Release);
     let segment = AnchorSegment {
       object,
       geometry,
@@ -200,7 +253,12 @@ impl AnchorSegment {
     content_name: &str,
     content_bytes: usize,
   ) -> Result<AnchorSegment, AnchorError> {
-    self.content = Some(SparseObject::create(content_name, content_bytes.max(1))?);
+    // The content object has one accessor at a time (the running daemon): no concurrent words.
+    self.content = Some(SparseObject::create(
+      content_name,
+      content_bytes.max(1),
+      Words::new(),
+    )?);
     Ok(self)
   }
 
@@ -217,7 +275,7 @@ impl AnchorSegment {
       Ok(fd) if cfg!(target_os = "linux") => Handoff::Descriptor(fd),
       _ => Handoff::Name(raw.clone()),
     };
-    Some(SparseObject::open(&handoff, len).map_err(AnchorError::from))
+    Some(SparseObject::open(&handoff, len, Words::new()).map_err(AnchorError::from))
   }
 
   /// Attaches to a segment another process created, from its handoff and length, checking
@@ -227,13 +285,25 @@ impl AnchorSegment {
     len: usize,
     identity: &Identity,
   ) -> Result<AnchorSegment, AnchorError> {
-    let object = SparseObject::open(handoff, len)?;
-    if object.len() < HEADER_BYTES {
+    if len < HEADER_BYTES {
       return Err(AnchorError::Layout {
         reason: "shorter than its header",
       });
     }
-    let bytes = object.range(0, HEADER_BYTES)?;
+    // The header first, with only its seqlock word declared: the geometry that lays out the rest is in it.
+    let header_words = Words::new().with(WordRun::one(AT_GENERATION, Width::U64));
+    let object = SparseObject::open(handoff, len, header_words)?;
+    let generation = object.atomic_u64(AT_GENERATION)?.load(Ordering::Acquire);
+    if generation == 0 || !generation.is_multiple_of(2) {
+      return Err(AnchorError::Layout {
+        reason: "the creator is still writing the header",
+      });
+    }
+    let mut header = [0u8; HEADER_BYTES];
+    object.read(0, header.get_mut(..AT_GENERATION).unwrap_or_default())?;
+    let after = AT_GENERATION.saturating_add(size_of::<u64>());
+    object.read(after, header.get_mut(after..).unwrap_or_default())?;
+    let bytes = &header[..];
     if read_u32(bytes, AT_MAGIC) != MAGIC {
       return Err(AnchorError::Layout {
         reason: "wrong magic",
@@ -242,12 +312,6 @@ impl AnchorSegment {
     if read_u32(bytes, AT_VERSION) != LAYOUT_VERSION {
       return Err(AnchorError::Layout {
         reason: "wrong layout version",
-      });
-    }
-    let generation = object.atomic_u64(AT_GENERATION)?.load(Ordering::Acquire);
-    if !generation.is_multiple_of(2) {
-      return Err(AnchorError::Layout {
-        reason: "the creator is still writing the header",
       });
     }
     let cached = bytes
@@ -272,6 +336,8 @@ impl AnchorSegment {
         reason: "the mapped length is not the geometry's",
       });
     }
+    // Reopened with the geometry's full layout: a header whose geometry overlaps words is refused here.
+    let object = SparseObject::open(handoff, len, segment_words(&geometry))?;
     Ok(AnchorSegment {
       object,
       geometry,
@@ -436,21 +502,16 @@ impl AnchorSegment {
     &mut self,
     secret: &[u8; ISSUER_SECRET_BYTES],
   ) -> Result<(), AnchorError> {
-    self
-      .region_write(RegionKind::Supervision, SUP_ISSUER, ISSUER_SECRET_BYTES)?
-      .copy_from_slice(secret);
-    Ok(())
+    let at = self.region_span(RegionKind::Supervision, SUP_ISSUER, ISSUER_SECRET_BYTES)?;
+    Ok(self.object.write_racy(at, secret)?)
   }
 
   /// The daemon's published grant-issuer secret, copied out of the supervision block; all zero until a
   /// daemon has started under this anchor (a fresh segment holds no authority, so no proof verifies).
   pub fn issuer_secret(&self) -> Result<[u8; ISSUER_SECRET_BYTES], AnchorError> {
     let mut out = [0u8; ISSUER_SECRET_BYTES];
-    out.copy_from_slice(self.region_read(
-      RegionKind::Supervision,
-      SUP_ISSUER,
-      ISSUER_SECRET_BYTES,
-    )?);
+    let at = self.region_span(RegionKind::Supervision, SUP_ISSUER, ISSUER_SECRET_BYTES)?;
+    self.object.read_racy(at, &mut out)?;
     Ok(out)
   }
 
@@ -460,22 +521,55 @@ impl AnchorSegment {
     Ok(range.end.saturating_sub(range.start))
   }
 
-  /// The `len` bytes at `at` within a region, for the region's single owner. Only these bytes are
-  /// backed (the segment is sparse); a span past the region is refused, never read from its neighbour.
-  pub fn region_read(&self, kind: RegionKind, at: usize, len: usize) -> Result<&[u8], AnchorError> {
-    let start = self.region_span(kind, at, len)?;
-    Ok(self.object.range(start, len)?)
+  /// Copies the `into.len()` plain bytes at `at` within a region out, for the region's single owner (a
+  /// ring's data). Only these bytes are backed (the segment is sparse); a span past the region is refused,
+  /// never read from its neighbour, and a span over a word or a racy payload is refused by the layout.
+  pub fn region_read(
+    &self,
+    kind: RegionKind,
+    at: usize,
+    into: &mut [u8],
+  ) -> Result<(), AnchorError> {
+    let start = self.region_span(kind, at, into.len())?;
+    Ok(self.object.read(start, into)?)
   }
 
-  /// The `len` bytes at `at` within a region, writable, for the region's single owner.
+  /// Copies `from` into a region's plain bytes at `at`, for the region's single owner.
   pub fn region_write(
     &mut self,
     kind: RegionKind,
     at: usize,
-    len: usize,
-  ) -> Result<&mut [u8], AnchorError> {
-    let start = self.region_span(kind, at, len)?;
-    Ok(self.object.range_mut(start, len)?)
+    from: &[u8],
+  ) -> Result<(), AnchorError> {
+    let start = self.region_span(kind, at, from.len())?;
+    Ok(self.object.write(start, from)?)
+  }
+
+  /// Copies a payload region's racy bytes at `at` out (its length and body, as the seqlock reader does).
+  pub fn region_read_racy(
+    &self,
+    kind: RegionKind,
+    at: usize,
+    into: &mut [u8],
+  ) -> Result<(), AnchorError> {
+    let start = self.region_span(kind, at, into.len())?;
+    Ok(self.object.read_racy(start, into)?)
+  }
+
+  /// Copies `from` into a payload region's racy bytes at `at` (as the seqlock writer does).
+  pub fn region_write_racy(
+    &mut self,
+    kind: RegionKind,
+    at: usize,
+    from: &[u8],
+  ) -> Result<(), AnchorError> {
+    let start = self.region_span(kind, at, from.len())?;
+    Ok(self.object.write_racy(start, from)?)
+  }
+
+  /// A payload region's seqlock generation word.
+  pub fn payload_generation(&self, kind: RegionKind) -> Result<&AtomicU64, AnchorError> {
+    self.word_at(self.spec(kind)?, PAYLOAD_GENERATION)
   }
 
   /// The segment offset of `[at, at + len)` inside a region, refused when it leaves the region.
@@ -539,16 +633,14 @@ impl AnchorSegment {
     let generation = self.word_at(spec, PAYLOAD_GENERATION)?;
     let start = generation.load(Ordering::Acquire);
     generation.store(start | 1, Ordering::Release);
-    self
-      .region_write(kind, PAYLOAD_LEN, size_of::<u64>())?
-      .copy_from_slice(
-        &u64::try_from(payload.len())
-          .unwrap_or(u64::MAX)
-          .to_le_bytes(),
-      );
-    self
-      .region_write(kind, PAYLOAD_BYTES, payload.len())?
-      .copy_from_slice(payload);
+    self.region_write_racy(
+      kind,
+      PAYLOAD_LEN,
+      &u64::try_from(payload.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes(),
+    )?;
+    self.region_write_racy(kind, PAYLOAD_BYTES, payload)?;
     let generation = self.word_at(spec, PAYLOAD_GENERATION)?;
     generation.store((start | 1).wrapping_add(1), Ordering::Release);
     Ok(())
@@ -566,11 +658,9 @@ impl AnchorSegment {
     if !before.is_multiple_of(2) {
       return Err(AnchorError::PublicationInProgress);
     }
-    let len = usize::try_from(read_u64(
-      self.region_read(kind, PAYLOAD_LEN, size_of::<u64>())?,
-      0,
-    ))
-    .map_err(|_| AnchorError::Layout {
+    let mut len_word = [0u8; size_of::<u64>()];
+    self.region_read_racy(kind, PAYLOAD_LEN, &mut len_word)?;
+    let len = usize::try_from(u64::from_le_bytes(len_word)).map_err(|_| AnchorError::Layout {
       reason: "payload length overflows",
     })?;
     let end = PAYLOAD_BYTES.checked_add(len).ok_or(AnchorError::Layout {
@@ -581,21 +671,14 @@ impl AnchorSegment {
         reason: "payload length exceeds its region",
       });
     }
-    let payload = self.region_read(kind, PAYLOAD_BYTES, len)?.to_vec();
+    let mut payload = vec![0u8; len];
+    self.region_read_racy(kind, PAYLOAD_BYTES, &mut payload)?;
     if generation.load(Ordering::Acquire) != before {
       return Err(AnchorError::Layout {
         reason: "the payload changed while it was read",
       });
     }
     Ok(Some(payload))
-  }
-}
-
-/// Writes `value` at `at`: every caller names a fixed field inside the header, which the caller has sized;
-/// were the range missing, nothing is written, never out of bounds.
-fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
-  if let Some(field) = bytes.get_mut(at..at.saturating_add(value.len())) {
-    field.copy_from_slice(value);
   }
 }
 

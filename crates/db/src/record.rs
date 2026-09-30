@@ -317,13 +317,10 @@ impl LogRing {
     let start = position(capacity, at);
     let first = bytes.len().min(cap.saturating_sub(start));
     let base = slates_anchor::layout::RING_BYTES;
-    segment
-      .region_write(self.kind, base + start, first)?
-      .copy_from_slice(&bytes[..first]);
-    if first < bytes.len() {
-      segment
-        .region_write(self.kind, base, bytes.len() - first)?
-        .copy_from_slice(&bytes[first..]);
+    let (head, tail) = bytes.split_at(first);
+    segment.region_write(self.kind, base.saturating_add(start), head)?;
+    if !tail.is_empty() {
+      segment.region_write(self.kind, base, tail)?;
     }
     Ok(())
   }
@@ -340,10 +337,10 @@ impl LogRing {
     let start = position(capacity, at);
     let first = out.len().min(cap.saturating_sub(start));
     let base = slates_anchor::layout::RING_BYTES;
-    out[..first].copy_from_slice(segment.region_read(self.kind, base + start, first)?);
-    if first < out.len() {
-      let rest = out.len() - first;
-      out[first..].copy_from_slice(segment.region_read(self.kind, base, rest)?);
+    let (head, tail) = out.split_at_mut(first);
+    segment.region_read(self.kind, base.saturating_add(start), head)?;
+    if !tail.is_empty() {
+      segment.region_read(self.kind, base, tail)?;
     }
     Ok(())
   }

@@ -38,16 +38,18 @@ pub mod ring;
 pub mod segmented;
 pub mod shared;
 pub mod slab;
+pub mod words;
 
 pub use arena::{ChunkArena, Extent};
-pub use error::{ExtentRefusal, MemError};
+pub use error::{ExtentRefusal, LayoutRefusal, MemError};
 pub use handle::{Encoded, Handle};
 pub use mpsc::MpscRing;
 pub use region::Region;
 pub use ring::SpscRing;
 pub use segmented::Segmented;
-pub use shared::{Handoff, SharedObject, SparseObject};
+pub use shared::{ExclusiveObject, Handoff, SharedObject, SparseObject};
 pub use slab::Slab;
+pub use words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words};
 
 /// Tests that observe the OS's locked-byte counter run one at a time: the counter is
 /// process-wide, and two of them locking at once read each other's bytes.

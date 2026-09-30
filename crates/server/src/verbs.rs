@@ -6317,8 +6317,9 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
   );
 }
 
-/// A shard's slice of the anchor content object, read by ranges (§4.8): the object is sparse (backed
-/// only where it is touched), so the image is found and read without ever viewing the whole slice.
+/// A shard's slice of the anchor content object, read by copies (§4.8): the object is sparse (backed
+/// only where it is touched) and hands out no reference to its bytes (AUD-29-09), so the image is found
+/// and copied out without ever viewing the whole slice.
 struct ContentView<'a> {
   object: &'a slates_mem::SparseObject,
   start: usize,
@@ -6330,9 +6331,9 @@ impl slates_vfs::recover::ImageRead for ContentView<'_> {
     self.len
   }
 
-  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], slates_vfs::VfsError> {
-    content_range(self.start, self.len, offset, len)
-      .and_then(|at| self.object.range(at, len).ok())
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), slates_vfs::VfsError> {
+    content_range(self.start, self.len, offset, into.len())
+      .and_then(|at| self.object.read(at, into).ok())
       .ok_or(slates_vfs::VfsError::RecoveryIncomplete)
   }
 }
@@ -6350,21 +6351,21 @@ impl slates_vfs::recover::ImageRead for ContentSlots<'_> {
     self.len
   }
 
-  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], slates_vfs::VfsError> {
-    content_range(self.start, self.len, offset, len)
-      .and_then(|at| self.object.range(at, len).ok())
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), slates_vfs::VfsError> {
+    content_range(self.start, self.len, offset, into.len())
+      .and_then(|at| self.object.read(at, into).ok())
       .ok_or(slates_vfs::VfsError::RecoveryIncomplete)
   }
 }
 
 impl slates_vfs::recover::ImageWrite for ContentSlots<'_> {
-  fn image_write(&mut self, offset: usize, len: usize) -> Result<&mut [u8], slates_vfs::VfsError> {
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), slates_vfs::VfsError> {
     // A span past the slice, or memory the OS would not back (a Windows commit refused), is no space.
-    let at =
-      content_range(self.start, self.len, offset, len).ok_or(slates_vfs::VfsError::NoSpace)?;
+    let at = content_range(self.start, self.len, offset, from.len())
+      .ok_or(slates_vfs::VfsError::NoSpace)?;
     self
       .object
-      .range_mut(at, len)
+      .write(at, from)
       .map_err(|_| slates_vfs::VfsError::NoSpace)
   }
 }

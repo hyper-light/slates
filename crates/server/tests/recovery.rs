@@ -19,6 +19,7 @@
 #![cfg(unix)]
 
 use std::net::TcpStream;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use slates_anchor::{AnchorSegment, RegionKind};
@@ -456,43 +457,37 @@ enum Crash {
   AfterRecord,
 }
 
-/// Reads a ring's tail (its monotonic byte write offset) from the log region's header word.
+/// Reads a ring's tail (its monotonic byte write offset) from the log region's tail word.
 fn log_tail(segment: &AnchorSegment, partition: u16) -> u64 {
-  let mut word = [0u8; size_of::<u64>()];
-  word.copy_from_slice(
-    segment
-      .region_read(
-        RegionKind::Log(partition),
-        slates_anchor::layout::RING_TAIL,
-        8,
-      )
-      .unwrap(),
-  );
-  u64::from_le_bytes(word)
+  segment.ring_words(RegionKind::Log(partition)).unwrap()[1].load(Ordering::Acquire)
 }
 
-/// The 64-byte header words (head, tail, capacity, sequence base) of each partition's log ring — what
-/// a crash-before-the-record rolls back. Copying the header, never the many-gigabyte data ring.
-fn log_headers(segment: &AnchorSegment, partitions: u16) -> Vec<(u16, Vec<u8>)> {
+/// The header words (head, tail, capacity, sequence base) of each partition's log ring — what a
+/// crash-before-the-record rolls back. The words, never the many-gigabyte data ring.
+fn log_headers(segment: &AnchorSegment, partitions: u16) -> Vec<(u16, Vec<u64>)> {
   (0..partitions)
     .map(|p| {
-      let header = segment
-        .region_read(RegionKind::Log(p), 0, slates_anchor::layout::RING_BYTES)
-        .unwrap();
-      (p, header.to_vec())
+      let words = segment.ring_words(RegionKind::Log(p)).unwrap();
+      (
+        p,
+        words
+          .iter()
+          .map(|word| word.load(Ordering::Acquire))
+          .collect(),
+      )
     })
     .collect()
 }
 
-/// Puts each ring's header back, rolling its tail (and head/sequence) to the captured state — so a
-/// record appended after the capture is beyond the tail and ignored on replay, exactly as a crash
+/// Puts each ring's header words back, rolling its tail (and head/sequence) to the captured state — so
+/// a record appended after the capture is beyond the tail and ignored on replay, exactly as a crash
 /// before that record's durable commit would leave it.
-fn restore_log_headers(segment: &mut AnchorSegment, headers: &[(u16, Vec<u8>)]) {
-  for (p, header) in headers {
-    segment
-      .region_write(RegionKind::Log(*p), 0, header.len())
-      .unwrap()
-      .copy_from_slice(header);
+fn restore_log_headers(segment: &mut AnchorSegment, headers: &[(u16, Vec<u64>)]) {
+  for (p, values) in headers {
+    let words = segment.ring_words(RegionKind::Log(*p)).unwrap();
+    for (word, value) in words.iter().zip(values) {
+      word.store(*value, Ordering::Release);
+    }
   }
 }
 
@@ -1212,39 +1207,18 @@ fn a_clone_pin_and_a_destroy_in_flight_reconcile_to_the_catalog_across_a_restart
 /// header + body — and writes the tail word back. `from_tail` is small in these tests, so the record
 /// does not wrap the ring.
 fn cut_log_after_one_record(segment: &mut AnchorSegment, partition: u16, from_tail: u64) {
-  let capacity = {
-    let mut word = [0u8; size_of::<u64>()];
-    word.copy_from_slice(
-      segment
-        .region_read(
-          RegionKind::Log(partition),
-          slates_anchor::layout::RING_CAPACITY,
-          8,
-        )
-        .unwrap(),
-    );
-    u64::from_le_bytes(word)
-  };
+  let capacity = segment.ring_words(RegionKind::Log(partition)).unwrap()[2].load(Ordering::Acquire);
   let data_at = slates_anchor::layout::RING_BYTES
     + usize::try_from(from_tail % capacity.max(1)).unwrap_or(0)
     + RECORD_LEN_AT;
   let body_len = {
     let mut word = [0u8; size_of::<u32>()];
-    word.copy_from_slice(
-      segment
-        .region_read(RegionKind::Log(partition), data_at, size_of::<u32>())
-        .unwrap(),
-    );
+    segment
+      .region_read(RegionKind::Log(partition), data_at, &mut word)
+      .unwrap();
     u64::from(u32::from_le_bytes(word))
   };
   let record_end =
     from_tail + u64::try_from(slates_db::record::RECORD_HEADER).unwrap_or(0) + body_len;
-  segment
-    .region_write(
-      RegionKind::Log(partition),
-      slates_anchor::layout::RING_TAIL,
-      8,
-    )
-    .unwrap()
-    .copy_from_slice(&record_end.to_le_bytes());
+  segment.ring_words(RegionKind::Log(partition)).unwrap()[1].store(record_end, Ordering::Release);
 }

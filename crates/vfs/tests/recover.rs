@@ -10,7 +10,33 @@
 mod common;
 
 use common::{store, volume};
-use slates_mem::SharedObject;
+use slates_mem::{SharedObject, Words};
+
+/// A whole shared object as image memory, reached by its copies (AUD-29-09: the object hands out no
+/// reference to its bytes). The object declares no words: the image is its only content.
+struct ObjectImage(SharedObject);
+
+impl slates_vfs::recover::ImageRead for ObjectImage {
+  fn image_len(&self) -> usize {
+    self.0.len()
+  }
+
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), slates_vfs::VfsError> {
+    self
+      .0
+      .read(offset, into)
+      .map_err(|_| slates_vfs::VfsError::RecoveryIncomplete)
+  }
+}
+
+impl slates_vfs::recover::ImageWrite for ObjectImage {
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), slates_vfs::VfsError> {
+    self
+      .0
+      .write(offset, from)
+      .map_err(|_| slates_vfs::VfsError::NoSpace)
+  }
+}
 use slates_vfs::VfsError;
 use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
@@ -247,14 +273,15 @@ fn a_volume_survives_a_content_object_handoff() {
   let b = built();
 
   // The running daemon publishes the image into the anchor content object.
-  let mut object = SharedObject::create(&object_name("h"), CONTENT_LEN).unwrap();
-  let handoff = object.handoff().unwrap();
-  b.image.write_to(object.bytes_mut()).unwrap();
+  let mut object =
+    ObjectImage(SharedObject::create(&object_name("h"), CONTENT_LEN, Words::new()).unwrap());
+  let handoff = object.0.handoff().unwrap();
+  b.image.write_to(&mut object).unwrap();
 
   // The restarted daemon re-opens the same object; the writer's mapping then goes away.
-  let reattached = SharedObject::open(&handoff, CONTENT_LEN).unwrap();
+  let reattached = ObjectImage(SharedObject::open(&handoff, CONTENT_LEN, Words::new()).unwrap());
   drop(object);
-  let image = VolumeImage::read_from(reattached.bytes())
+  let image = VolumeImage::read_from(&reattached)
     .unwrap()
     .expect("the published image is present after the handoff");
 
@@ -461,14 +488,15 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
       image: b.to_image(&original, None).unwrap(),
     },
   ]);
-  let mut object = SharedObject::create(&object_name("s"), CONTENT_LEN).unwrap();
-  let handoff = object.handoff().unwrap();
-  shard.write_to(object.bytes_mut()).unwrap();
+  let mut object =
+    ObjectImage(SharedObject::create(&object_name("s"), CONTENT_LEN, Words::new()).unwrap());
+  let handoff = object.0.handoff().unwrap();
+  shard.write_to(&mut object).unwrap();
 
   // The restarted daemon re-opens the object and recovers every volume into a fresh store.
-  let reattached = SharedObject::open(&handoff, CONTENT_LEN).unwrap();
+  let reattached = ObjectImage(SharedObject::open(&handoff, CONTENT_LEN, Words::new()).unwrap());
   drop(object);
-  let recovered = ShardImage::read_from(reattached.bytes())
+  let recovered = ShardImage::read_from(&reattached)
     .unwrap()
     .expect("the shard image is present after the handoff");
   let keys: Vec<[u8; 16]> = recovered.volumes.iter().map(|v| v.key).collect();

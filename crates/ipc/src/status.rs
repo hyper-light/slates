@@ -9,7 +9,7 @@ use crate::{ClientRegion, IpcError};
 
 /// The status snapshot's byte bound: the already admitted bulk credit of the reply ring.
 pub fn snapshot_capacity(region: &ClientRegion) -> usize {
-  region.bulk().len() / 2
+  region.bulk_len() / 2
 }
 
 /// What a page holds past its framing and cursor, derived using the actual wire encoder.

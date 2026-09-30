@@ -985,6 +985,19 @@ checked and refuse before mutation.
 > joins every worker and gives every slot back before it reports the first failure typed (a panic is
 > `WorkerFailed`). A runtime dropped without `shutdown` does the same in `Drop`
 > (`docs/bugs/2026-09-30-runtime-start-and-drop-orphaned-workers.md`).
+>
+> **Status (2026-09-30, AUD-29-09).** A shared memory object hands out no reference into its mapping. Its
+> layout — declared when it is created or opened, validated then — types every byte: **words**, reached
+> only as atomics of their declared width; **racy bytes** (a seqlock's payload), copied only through
+> `AtomicU8`; declared **plain spans** (a ring's slot bodies), copied in constant time; and everything
+> else, copied through the mapping's raw pointer, refused where it would touch a word. A hot path
+> resolves its words and spans once and reaches them in constant time (IPC push and pop: 450 instructions
+> against 307 unchecked; a first cut that searched per access took 1,186 and was rejected). The one
+> reference path is `ExclusiveObject`, whose unsafe constructor carries the single-accessor promise a
+> region's arena needs. The rendezvous claim table publishes a claim only after its fields
+> (`CLAIMING` → `CLAIMED`), answers under ownership (`ANSWERING`), takes claims back by CAS, reclaims a
+> dead party's slot past twice the claim wait, and publishes its header through the start stamp
+> (`docs/bugs/2026-09-30-shared-mappings-aliased-plain-bytes-and-atomic-words.md`).
 
 Before admitting content, the server prepares and locks the memory that will back it and its
 metadata. This includes rings, logs, parse buffers, decompression, copies, archive construction,

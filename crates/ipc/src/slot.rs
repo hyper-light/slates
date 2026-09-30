@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use slates_mem::SharedObject;
+use slates_mem::{RunId, SharedObject, SpanId, SpanRun, Width, WordRun, Words};
 
 use crate::error::IpcError;
 
@@ -26,6 +26,9 @@ const AT_REQUEST: usize = 12;
 const AT_PAYLOAD: usize = 20;
 /// Format: the payload bytes a slot carries.
 pub const PAYLOAD_BYTES: usize = 40;
+/// Format: a slot's body after its sequence word — kind, length, request word and payload — copied in
+/// and out whole (AUD-29-09: the sequence word is atomic, the body plain, and they never meet).
+const BODY_BYTES: usize = AT_PAYLOAD + PAYLOAD_BYTES - AT_KIND;
 /// Format: the ring's words before its slots: the producer's tail hint and the consumer's head
 /// hint, each on its own cache line (the slots' sequences carry the protocol; the hints let
 /// the other side see depth without scanning).
@@ -109,6 +112,60 @@ impl Slot {
   }
 }
 
+/// A slot's body as the producer writes it: kind, length, request word, payload zero-padded to its field.
+fn encode_body(slot: &Slot) -> [u8; BODY_BYTES] {
+  let mut body = [0u8; BODY_BYTES];
+  let len = u16::try_from(slot.payload.len()).unwrap_or(u16::MAX);
+  let fields: [(usize, &[u8]); 4] = [
+    (AT_KIND, &slot.kind.word().to_le_bytes()),
+    (AT_LEN, &len.to_le_bytes()),
+    (AT_REQUEST, &slot.request.to_le_bytes()),
+    (AT_PAYLOAD, &slot.payload),
+  ];
+  for (at, bytes) in fields {
+    let start = at.saturating_sub(AT_KIND);
+    if let Some(field) = body.get_mut(start..start.saturating_add(bytes.len())) {
+      field.copy_from_slice(bytes);
+    }
+  }
+  body
+}
+
+/// A slot's body as the consumer reads it; a hostile kind or length is a typed refusal.
+fn decode_body(body: &[u8; BODY_BYTES]) -> Result<Slot, IpcError> {
+  // Every field lies inside the body by the format's constants; a missing one is the one refusal below,
+  // built only when it happens (an unused refusal would be built and dropped on every pop).
+  let field = |at: usize, len: usize| {
+    let start = at.saturating_sub(AT_KIND);
+    body.get(start..start.saturating_add(len))
+  };
+  let word16 = |at: usize| {
+    field(at, size_of::<u16>()).map(|bytes| {
+      u16::from_le_bytes([
+        bytes.first().copied().unwrap_or(0),
+        bytes.get(1).copied().unwrap_or(0),
+      ])
+    })
+  };
+  let past = || IpcError::BadSlot {
+    reason: "a field past the slot",
+  };
+  let kind = SlotKind::from_word(word16(AT_KIND).ok_or_else(past)?)?;
+  let len = usize::from(word16(AT_LEN).ok_or_else(past)?);
+  if len > PAYLOAD_BYTES {
+    return Err(IpcError::BadSlot {
+      reason: "length past the payload",
+    });
+  }
+  let mut request = [0u8; size_of::<u64>()];
+  request.copy_from_slice(field(AT_REQUEST, size_of::<u64>()).ok_or_else(past)?);
+  Ok(Slot {
+    kind,
+    request: u64::from_le_bytes(request),
+    payload: field(AT_PAYLOAD, len).ok_or_else(past)?.to_vec(),
+  })
+}
+
 /// A ring of slots inside a shared object, at a byte offset: one producer, one consumer, in
 /// different processes.
 #[derive(Clone, Copy, Debug)]
@@ -117,6 +174,18 @@ pub struct Ring {
   offset: usize,
   /// Slots (a power of two).
   slots: usize,
+  /// Its words' runs, resolved in the object it lives in ([`Ring::resolved`]), so each word is reached in
+  /// constant time; `None` until then, when each access resolves them (the slow path).
+  ids: Option<RingIds>,
+}
+
+/// A ring's resolved runs: its tail hint, its head hint, its slots' sequence words.
+#[derive(Clone, Copy, Debug)]
+struct RingIds {
+  tail: RunId,
+  head: RunId,
+  seq: RunId,
+  body: SpanId,
 }
 
 impl Ring {
@@ -127,7 +196,77 @@ impl Ring {
 
   /// A ring at `offset` with `slots` slots.
   pub fn at(offset: usize, slots: usize) -> Ring {
-    Ring { offset, slots }
+    Ring {
+      offset,
+      slots,
+      ids: None,
+    }
+  }
+
+  /// The ring's three runs: tail hint, head hint, sequence words.
+  fn runs(&self) -> [WordRun; 3] {
+    [
+      WordRun::one(self.offset.saturating_add(AT_TAIL_HINT), Width::U64),
+      WordRun::one(self.offset.saturating_add(AT_HEAD_HINT), Width::U64),
+      WordRun::strided(
+        self
+          .offset
+          .saturating_add(RING_HEADER_BYTES)
+          .saturating_add(AT_SEQ),
+        SLOT_BYTES,
+        self.slots,
+        Width::U64,
+      ),
+    ]
+  }
+
+  /// This ring with its runs resolved in `object`, the object it lives in: every word from here on is
+  /// reached in constant time, never searched for (measured 2026-09-30: the search cost ~880 of 1,186
+  /// instructions a push and a pop took).
+  pub fn resolved(self, object: &SharedObject) -> Result<Ring, IpcError> {
+    Ok(Ring {
+      ids: Some(self.resolve_ids(object)?),
+      ..self
+    })
+  }
+
+  /// The ring's slot bodies: each slot after its sequence word, a plain span owned by one side at a time.
+  fn bodies(&self) -> SpanRun {
+    SpanRun::strided(
+      self
+        .offset
+        .saturating_add(RING_HEADER_BYTES)
+        .saturating_add(AT_KIND),
+      SLOT_BYTES,
+      self.slots,
+      BODY_BYTES,
+    )
+  }
+
+  fn resolve_ids(&self, object: &SharedObject) -> Result<RingIds, IpcError> {
+    let [tail, head, seq] = self.runs();
+    Ok(RingIds {
+      tail: object.resolve(&tail)?,
+      head: object.resolve(&head)?,
+      seq: object.resolve(&seq)?,
+      body: object.resolve_span(&self.bodies())?,
+    })
+  }
+
+  /// The ring's resolved runs: kept, or resolved now.
+  fn ids(&self, object: &SharedObject) -> Result<RingIds, IpcError> {
+    match self.ids {
+      Some(ids) => Ok(ids),
+      None => self.resolve_ids(object),
+    }
+  }
+
+  fn tail_hint<'o>(&self, object: &'o SharedObject) -> Result<&'o AtomicU64, IpcError> {
+    Ok(object.run_u64(self.ids(object)?.tail, 0)?)
+  }
+
+  fn head_hint<'o>(&self, object: &'o SharedObject) -> Result<&'o AtomicU64, IpcError> {
+    Ok(object.run_u64(self.ids(object)?.head, 0)?)
   }
 
   /// Slots.
@@ -135,14 +274,24 @@ impl Ring {
     self.slots
   }
 
-  fn slot_offset(&self, index: u64) -> usize {
-    let position =
-      usize::try_from(index % u64::try_from(self.slots.max(1)).unwrap_or(1)).unwrap_or(0);
-    self.offset + RING_HEADER_BYTES + position * SLOT_BYTES
+  /// The ring's declared atomic words (AUD-29-09): the two hints and every slot's sequence word; each
+  /// slot's body after its sequence word is a declared plain span, owned by one side at a time.
+  pub fn words(&self) -> Words {
+    self
+      .runs()
+      .into_iter()
+      .fold(Words::new(), |words, run| words.with(run))
+      .with_span(self.bodies())
+  }
+
+  /// The position of message `index` in the ring.
+  fn position(&self, index: u64) -> usize {
+    let slots = u64::try_from(self.slots.max(1)).unwrap_or(1);
+    usize::try_from(index.checked_rem(slots).unwrap_or(0)).unwrap_or(0)
   }
 
   fn seq<'o>(&self, object: &'o SharedObject, index: u64) -> Result<&'o AtomicU64, IpcError> {
-    Ok(object.atomic_u64(self.slot_offset(index) + AT_SEQ)?)
+    Ok(object.run_u64(self.ids(object)?.seq, self.position(index))?)
   }
 
   /// Initializes every slot's sequence to its index (free) and the hints to zero; the
@@ -151,12 +300,8 @@ impl Ring {
     for i in 0..u64::try_from(self.slots).unwrap_or(0) {
       self.seq(object, i)?.store(i, Ordering::Release);
     }
-    object
-      .atomic_u64(self.offset + AT_TAIL_HINT)?
-      .store(0, Ordering::Release);
-    object
-      .atomic_u64(self.offset + AT_HEAD_HINT)?
-      .store(0, Ordering::Release);
+    self.tail_hint(object)?.store(0, Ordering::Release);
+    self.head_hint(object)?.store(0, Ordering::Release);
     Ok(())
   }
 
@@ -177,19 +322,13 @@ impl Ring {
     if !self.can_push(object, index)? {
       return Err(IpcError::RingFull);
     }
-    let at = self.slot_offset(index);
-    let bytes = object.bytes_mut();
-    bytes[at + AT_KIND..at + AT_KIND + 2].copy_from_slice(&slot.kind.word().to_le_bytes());
-    let len = u16::try_from(slot.payload.len()).unwrap_or(u16::MAX);
-    bytes[at + AT_LEN..at + AT_LEN + 2].copy_from_slice(&len.to_le_bytes());
-    bytes[at + AT_REQUEST..at + AT_REQUEST + 8].copy_from_slice(&slot.request.to_le_bytes());
-    bytes[at + AT_PAYLOAD..at + AT_PAYLOAD + PAYLOAD_BYTES].fill(0);
-    bytes[at + AT_PAYLOAD..at + AT_PAYLOAD + slot.payload.len()].copy_from_slice(&slot.payload);
+    let body = self.ids(object)?.body;
+    object.write_span(body, self.position(index), &encode_body(slot))?;
     self
       .seq(object, index)?
       .store(index.wrapping_add(1), Ordering::Release);
-    object
-      .atomic_u64(self.offset + AT_TAIL_HINT)?
+    self
+      .tail_hint(object)?
       .store(index.wrapping_add(1), Ordering::Release);
     Ok(())
   }
@@ -206,45 +345,23 @@ impl Ring {
     if !self.can_pop(object, index)? {
       return Ok(None);
     }
-    let at = self.slot_offset(index);
-    let bytes = object.bytes();
-    let kind = u16::from_le_bytes([bytes[at + AT_KIND], bytes[at + AT_KIND + 1]]);
-    let len = usize::from(u16::from_le_bytes([
-      bytes[at + AT_LEN],
-      bytes[at + AT_LEN + 1],
-    ]));
-    let mut request = [0u8; size_of::<u64>()];
-    request.copy_from_slice(&bytes[at + AT_REQUEST..at + AT_REQUEST + 8]);
-    let decoded = SlotKind::from_word(kind).and_then(|kind| {
-      if len > PAYLOAD_BYTES {
-        return Err(IpcError::BadSlot {
-          reason: "length past the payload",
-        });
-      }
-      Ok(Slot {
-        kind,
-        request: u64::from_le_bytes(request),
-        payload: bytes[at + AT_PAYLOAD..at + AT_PAYLOAD + len].to_vec(),
-      })
-    });
+    let mut body = [0u8; BODY_BYTES];
+    object.read_span(self.ids(object)?.body, self.position(index), &mut body)?;
+    let decoded = decode_body(&body);
     self.seq(object, index)?.store(
       index.wrapping_add(u64::try_from(self.slots).unwrap_or(0)),
       Ordering::Release,
     );
-    object
-      .atomic_u64(self.offset + AT_HEAD_HINT)?
+    self
+      .head_hint(object)?
       .store(index.wrapping_add(1), Ordering::Release);
     decoded.map(Some)
   }
 
   /// Messages the producer has published that the consumer has not taken, by the hints.
   pub fn depth(&self, object: &SharedObject) -> Result<u64, IpcError> {
-    let tail = object
-      .atomic_u64(self.offset + AT_TAIL_HINT)?
-      .load(Ordering::Acquire);
-    let head = object
-      .atomic_u64(self.offset + AT_HEAD_HINT)?
-      .load(Ordering::Acquire);
+    let tail = self.tail_hint(object)?.load(Ordering::Acquire);
+    let head = self.head_hint(object)?.load(Ordering::Acquire);
     Ok(tail.wrapping_sub(head))
   }
 }

@@ -27,7 +27,7 @@ use std::mem::Discriminant;
 
 use slates_mem::Handle;
 use slates_wire::Wire;
-use slates_wire::crc32c::crc32c;
+use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::clock::Clock;
 use crate::dir::{Child, DirNode};
@@ -423,9 +423,9 @@ impl ShardImage {
   /// for a committed slot that is CRC-valid but decodes wrong (never a false success). A publish torn
   /// mid-write is skipped in favour of the previous committed image.
   pub fn read_from<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<ShardImage>, VfsError> {
-    match recover_committed(slots) {
+    match recover_committed(slots)? {
       None => Ok(None),
-      Some(bytes) => ShardImage::from_content(bytes).map(Some),
+      Some(bytes) => ShardImage::from_content(&bytes).map(Some),
     }
   }
 }
@@ -460,28 +460,29 @@ impl VolumeImage {
   /// [`VfsError::RecoveryIncomplete`], never an empty success; a publish torn mid-write is skipped in
   /// favour of the previous committed image.
   pub fn read_from<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<VolumeImage>, VfsError> {
-    match recover_committed(slots) {
+    match recover_committed(slots)? {
       None => Ok(None),
-      Some(bytes) => VolumeImage::from_content(bytes).map(Some),
+      Some(bytes) => VolumeImage::from_content(&bytes).map(Some),
     }
   }
 }
 
-/// Where a double-buffered image is read from (§4.8), by ranges: the content object is sparse (backed
-/// only where it is touched, `slates_mem::SparseObject`), so a reader asks for the header, then the
-/// payload it names, and never views the whole slot. A byte slice is one; the daemon's slice of the
-/// content object is another.
+/// Where a double-buffered image is read from (§4.8), by copies: the content object is sparse (backed
+/// only where it is touched, `slates_mem::SparseObject`) and hands out no reference to its bytes
+/// (AUD-29-09), so a reader copies the header, then streams the payload it names through a bounded
+/// buffer to check it, and copies out only the image it recovers. A byte slice is one; the daemon's slice
+/// of the content object is another.
 pub trait ImageRead {
   /// The bytes the two slots share.
   fn image_len(&self) -> usize;
-  /// The `len` bytes at `offset`; `RecoveryIncomplete` for a span past the end.
-  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], VfsError>;
+  /// Copies the `into.len()` bytes at `offset` out; `RecoveryIncomplete` for a span past the end.
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), VfsError>;
 }
 
-/// Where a double-buffered image is published (§4.8), by ranges.
+/// Where a double-buffered image is published (§4.8), by copies.
 pub trait ImageWrite: ImageRead {
-  /// The `len` writable bytes at `offset`; `NoSpace` for a span past the end.
-  fn image_write(&mut self, offset: usize, len: usize) -> Result<&mut [u8], VfsError>;
+  /// Copies `from` in at `offset`; `NoSpace` for a span past the end.
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), VfsError>;
 }
 
 impl ImageRead for [u8] {
@@ -489,20 +490,24 @@ impl ImageRead for [u8] {
     self.len()
   }
 
-  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], VfsError> {
-    offset
-      .checked_add(len)
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), VfsError> {
+    let from = offset
+      .checked_add(into.len())
       .and_then(|end| self.get(offset..end))
-      .ok_or(VfsError::RecoveryIncomplete)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    into.copy_from_slice(from);
+    Ok(())
   }
 }
 
 impl ImageWrite for [u8] {
-  fn image_write(&mut self, offset: usize, len: usize) -> Result<&mut [u8], VfsError> {
-    offset
-      .checked_add(len)
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), VfsError> {
+    let into = offset
+      .checked_add(from.len())
       .and_then(|end| self.get_mut(offset..end))
-      .ok_or(VfsError::NoSpace)
+      .ok_or(VfsError::NoSpace)?;
+    into.copy_from_slice(from);
+    Ok(())
   }
 }
 
@@ -511,14 +516,14 @@ impl ImageRead for Vec<u8> {
     self.as_slice().image_len()
   }
 
-  fn image_read(&self, offset: usize, len: usize) -> Result<&[u8], VfsError> {
-    self.as_slice().image_read(offset, len)
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), VfsError> {
+    self.as_slice().image_read(offset, into)
   }
 }
 
 impl ImageWrite for Vec<u8> {
-  fn image_write(&mut self, offset: usize, len: usize) -> Result<&mut [u8], VfsError> {
-    self.as_mut_slice().image_write(offset, len)
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), VfsError> {
+    self.as_mut_slice().image_write(offset, from)
   }
 }
 
@@ -526,6 +531,10 @@ impl ImageWrite for Vec<u8> {
 const LEN_WIDTH: usize = size_of::<u32>();
 /// Format: the frame header — a little-endian byte length then a CRC-32C of the payload bytes.
 const FRAME_HEADER: usize = 2 * LEN_WIDTH;
+/// Shape: the span a slot's payload is streamed through to check its CRC, so checking a slot costs a
+/// bounded buffer whatever the image's size (any span is correct; this one keeps the per-span call cost a
+/// small fraction of the CRC's own over each span).
+const CRC_SPAN_BYTES: usize = 1 << 16;
 
 /// One of the two slots: its offset and length within the image memory.
 #[derive(Clone, Copy)]
@@ -550,43 +559,68 @@ fn frame<S: ImageWrite + ?Sized>(
     return Err(VfsError::NoSpace);
   }
   let len = u32::try_from(payload.len()).map_err(|_| VfsError::FileTooLarge)?;
-  let header = slots.image_write(slot.offset, FRAME_HEADER)?;
-  header[..LEN_WIDTH].copy_from_slice(&len.to_le_bytes());
-  header[LEN_WIDTH..].copy_from_slice(&crc32c(payload).to_le_bytes());
-  slots
-    .image_write(slot.offset + FRAME_HEADER, payload.len())?
-    .copy_from_slice(payload);
+  let mut header = [0u8; FRAME_HEADER];
+  let (len_field, crc_field) = header.split_at_mut(LEN_WIDTH);
+  len_field.copy_from_slice(&len.to_le_bytes());
+  crc_field.copy_from_slice(&crc32c(payload).to_le_bytes());
+  slots.image_write(slot.offset, &header)?;
+  slots.image_write(slot.offset.saturating_add(FRAME_HEADER), payload)?;
   Ok(total)
 }
 
-/// The framed payload in `slot`: `None` if the slot is empty (a fresh object), `Err(RecoveryIncomplete)`
-/// if the frame is present but unreadable (a length past the slot or a CRC mismatch from a torn
-/// write), else the validated payload bytes for a decoder.
-fn unframe<S: ImageRead + ?Sized>(slots: &S, slot: Slot) -> Result<Option<&[u8]>, VfsError> {
+/// A slot whose frame is present and CRC-valid: where its payload starts and how long it is.
+#[derive(Clone, Copy)]
+struct Framed {
+  at: usize,
+  len: usize,
+}
+
+/// The framed payload in `slot`: `None` if the slot is empty (a fresh object),
+/// `Err(RecoveryIncomplete)` if the frame is present but unreadable (a length past the slot or a CRC
+/// mismatch from a torn write), else where the validated payload lies. The payload is streamed through a
+/// bounded buffer to check it, never copied whole.
+fn unframe<S: ImageRead + ?Sized>(slots: &S, slot: Slot) -> Result<Option<Framed>, VfsError> {
   if slot.len < FRAME_HEADER {
     return Ok(None);
   }
-  let header = slots.image_read(slot.offset, FRAME_HEADER)?;
-  let mut len_bytes = [0u8; LEN_WIDTH];
-  len_bytes.copy_from_slice(&header[..LEN_WIDTH]);
-  let len = usize::try_from(u32::from_le_bytes(len_bytes)).unwrap_or(usize::MAX);
+  let mut header = [0u8; FRAME_HEADER];
+  slots.image_read(slot.offset, &mut header)?;
+  let (len_field, crc_field) = header.split_at(LEN_WIDTH);
+  let word = |field: &[u8]| {
+    let mut bytes = [0u8; LEN_WIDTH];
+    bytes.copy_from_slice(field);
+    u32::from_le_bytes(bytes)
+  };
+  let len = usize::try_from(word(len_field)).unwrap_or(usize::MAX);
   if len == 0 {
     return Ok(None);
   }
-  let mut crc_bytes = [0u8; LEN_WIDTH];
-  crc_bytes.copy_from_slice(&header[LEN_WIDTH..FRAME_HEADER]);
-  let want_crc = u32::from_le_bytes(crc_bytes);
   let end = FRAME_HEADER
     .checked_add(len)
     .ok_or(VfsError::RecoveryIncomplete)?;
   if slot.len < end {
     return Err(VfsError::RecoveryIncomplete);
   }
-  let payload = slots.image_read(slot.offset + FRAME_HEADER, len)?;
-  if crc32c(payload) != want_crc {
+  let at = slot.offset.saturating_add(FRAME_HEADER);
+  if streamed_crc(slots, at, len)? != word(crc_field) {
     return Err(VfsError::RecoveryIncomplete);
   }
-  Ok(Some(payload))
+  Ok(Some(Framed { at, len }))
+}
+
+/// The CRC-32C of the `len` bytes at `at`, streamed through a bounded buffer.
+fn streamed_crc<S: ImageRead + ?Sized>(slots: &S, at: usize, len: usize) -> Result<u32, VfsError> {
+  let mut span = vec![0u8; len.min(CRC_SPAN_BYTES)];
+  let mut crc = 0;
+  let mut done = 0usize;
+  while done < len {
+    let take = (len - done).min(span.len());
+    let chunk = span.get_mut(..take).ok_or(VfsError::RecoveryIncomplete)?;
+    slots.image_read(at.saturating_add(done), chunk)?;
+    crc = crc32c_append(crc, chunk);
+    done = done.saturating_add(take);
+  }
+  Ok(crc)
 }
 
 /// Format: the generation counter prefixed to a published slot's payload, so a restart can order the
@@ -621,13 +655,15 @@ fn publish_committed<S: ImageWrite + ?Sized>(
   image: &[u8],
 ) -> Result<usize, VfsError> {
   let (zero, one) = slots_of(slots.image_len());
-  let committed = slot_generation(slots, zero)
+  let (zero_generation, one_generation) =
+    (slot_generation(slots, zero), slot_generation(slots, one));
+  let committed = zero_generation
     .unwrap_or(0)
-    .max(slot_generation(slots, one).unwrap_or(0));
+    .max(one_generation.unwrap_or(0));
   let next = committed.checked_add(1).ok_or(VfsError::FileTooLarge)?;
   // Write the slot that does not hold the committed image (the older, empty, or torn one), so the
   // committed one survives whatever happens to this write.
-  let slot_zero_committed = slot_generation(slots, zero) == Some(committed) && committed > 0;
+  let slot_zero_committed = zero_generation == Some(committed) && committed > 0;
   let mut payload = Vec::with_capacity(SLOT_GEN_WIDTH.saturating_add(image.len()));
   payload.extend_from_slice(&next.to_le_bytes());
   payload.extend_from_slice(image);
@@ -636,36 +672,46 @@ fn publish_committed<S: ImageWrite + ?Sized>(
 }
 
 /// The last committed image in double-buffered `slots` (§4.8): the CRC-valid slot with the higher
-/// generation, or `None` if neither slot holds one (a fresh object, or both torn). A torn slot fails
-/// its CRC and is skipped, so an interrupted publish falls back to the previous committed image; a
-/// slot that is CRC-valid but decodes wrong is left for the caller to refuse, never a false success.
-fn recover_committed<S: ImageRead + ?Sized>(slots: &S) -> Option<&[u8]> {
+/// generation, copied out, or `None` if neither slot holds one (a fresh object, or both torn). A torn
+/// slot fails its CRC and is skipped, so an interrupted publish falls back to the previous committed
+/// image; a slot that is CRC-valid but decodes wrong is left for the caller to refuse, never a false
+/// success.
+fn recover_committed<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<Vec<u8>>, VfsError> {
   let (zero, one) = slots_of(slots.image_len());
-  let slot_zero = slot_payload(slots, zero);
-  let slot_one = slot_payload(slots, one);
-  match (slot_zero, slot_one) {
+  let chosen = match (slot_image(slots, zero), slot_image(slots, one)) {
     (Some((g0, p0)), Some((g1, p1))) => Some(if g0 >= g1 { p0 } else { p1 }),
     (Some((_, p0)), None) => Some(p0),
     (None, Some((_, p1))) => Some(p1),
     (None, None) => None,
-  }
+  };
+  chosen
+    .map(|framed| {
+      let mut image = vec![0u8; framed.len];
+      slots.image_read(framed.at, &mut image).map(|()| image)
+    })
+    .transpose()
 }
 
 /// A slot's generation, if its frame is CRC-valid and carries one.
 fn slot_generation<S: ImageRead + ?Sized>(slots: &S, slot: Slot) -> Option<u64> {
-  slot_payload(slots, slot).map(|(generation, _)| generation)
+  slot_image(slots, slot).map(|(generation, _)| generation)
 }
 
-/// A CRC-valid slot's generation and the image bytes after it, or `None` for an empty or torn slot.
-fn slot_payload<S: ImageRead + ?Sized>(slots: &S, slot: Slot) -> Option<(u64, &[u8])> {
-  match unframe(slots, slot) {
-    Ok(Some(payload)) if payload.len() >= SLOT_GEN_WIDTH => {
-      let mut generation = [0u8; SLOT_GEN_WIDTH];
-      generation.copy_from_slice(&payload[..SLOT_GEN_WIDTH]);
-      Some((u64::from_le_bytes(generation), &payload[SLOT_GEN_WIDTH..]))
-    }
-    _ => None,
+/// A CRC-valid slot's generation and where the image after it lies, or `None` for an empty or torn slot.
+fn slot_image<S: ImageRead + ?Sized>(slots: &S, slot: Slot) -> Option<(u64, Framed)> {
+  let framed = unframe(slots, slot).ok().flatten()?;
+  if framed.len < SLOT_GEN_WIDTH {
+    return None;
   }
+  let mut generation = [0u8; SLOT_GEN_WIDTH];
+  slots.image_read(framed.at, &mut generation).ok()?;
+  Some((
+    u64::from_le_bytes(generation),
+    Framed {
+      at: framed.at.saturating_add(SLOT_GEN_WIDTH),
+      len: framed.len - SLOT_GEN_WIDTH,
+    },
+  ))
 }
 
 /// The image of `kind`.
