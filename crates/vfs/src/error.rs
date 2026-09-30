@@ -69,6 +69,13 @@ pub enum VfsError {
   Archived,
   /// The name-equivalence policy of the two volumes differs (clone into a policy is refused).
   PolicyMismatch,
+  /// The tree nests deeper than an archive carries (`slates_archive::manifest::MAX_DEPTH` path
+  /// components): refused at the export, never emitted for every reader to refuse. The bound is a resource
+  /// bound — a restore keys each entry by its whole path, so a chain `d` deep costs `O(d²)` path bytes.
+  TreeTooDeep {
+    /// The most components an archived path may have.
+    limit: usize,
+  },
   /// A memory refusal beneath the volume (arena exhausted, slab full).
   Memory(slates_mem::MemError),
   /// A snapshot, submit or detach barrier could not close an attachment's generation: a request
@@ -96,7 +103,7 @@ impl VfsError {
       Self::NoAttribute => "ENOATTR",
       Self::NotPermitted => "EPERM",
       Self::SpecialFileOperation => "EOPNOTSUPP",
-      Self::InvalidName => "ENAMETOOLONG",
+      Self::InvalidName | Self::TreeTooDeep { .. } => "ENAMETOOLONG",
       Self::TooManyLinks => "EMLINK",
       Self::NoSpace => "ENOSPC",
       Self::FileTooLarge => "EFBIG",

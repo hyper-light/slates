@@ -218,3 +218,56 @@ fn recovery_refuses_content_attached_to_an_ipc_name() {
     Err(VfsError::RecoveryIncomplete)
   ));
 }
+
+/// Exports the snapshot `snapshot` of `volume` to completion, or its refusal.
+fn export_whole(
+  volume: &Volume,
+  store: &slates_vfs::volume::Store,
+  snapshot: slates_vfs::ids::SnapshotId,
+) -> Result<slates_archive::Archive, VfsError> {
+  use slates_archive::codec::CodecPolicy;
+  use slates_vfs::export::{Progress, SnapshotArchiver};
+  let mut archiver = SnapshotArchiver::new(volume, store, snapshot, 0, 0, CodecPolicy::raw_only())?;
+  loop {
+    if let Progress::Done(archive) = archiver.advance(volume, store, u64::MAX)? {
+      return Ok(archive);
+    }
+  }
+}
+
+/// A volume holding a directory chain `depth` components deep with one file at its bottom (a path of
+/// `depth + 1` components), snapshotted.
+fn nested(
+  depth: usize,
+) -> (
+  slates_vfs::volume::Store,
+  Volume,
+  slates_vfs::ids::SnapshotId,
+) {
+  let mut store = common::store();
+  let mut volume = common::volume(&mut store, 1 << 24);
+  let mut dir = volume.root_inode(&store).unwrap();
+  for _ in 0..depth {
+    dir = volume.mkdir_no(&mut store, dir, "d", 0o755).unwrap();
+  }
+  volume.create_file_no(&mut store, dir, "f", 0o644).unwrap();
+  let snapshot = volume.snapshot(&mut store).unwrap();
+  (store, volume, snapshot)
+}
+
+/// §4.11 (the manifest's depth bound, AUD-29-13): do: export a volume whose deepest path has
+/// `MAX_DEPTH` components, and one whose deepest has one more; expect the first to export and decode, and
+/// the second refused typed at the export (`TreeTooDeep`) — never an archive every reader refuses. Until
+/// 2026-09-30 the exporter emitted it, and its placement and takeover failed at every holder.
+#[test]
+fn an_export_deeper_than_the_manifest_bound_is_refused_typed() {
+  let bound = slates_archive::manifest::MAX_DEPTH;
+  let (store, volume, snapshot) = nested(bound - 1);
+  let archive = export_whole(&volume, &store, snapshot).expect("the bound exports");
+  slates_archive::Archive::decode(&archive.encode()).expect("and decodes");
+  let (store, volume, snapshot) = nested(bound);
+  assert_eq!(
+    export_whole(&volume, &store, snapshot).err(),
+    Some(VfsError::TreeTooDeep { limit: bound })
+  );
+}

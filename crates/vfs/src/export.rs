@@ -339,6 +339,13 @@ impl SnapshotArchiver {
     };
     let meta = meta_of(volume, store, self.snapshot, next.inode, MODE_DIRECTORY)?;
     let pending = pending_of(volume, store, dir)?;
+    // An entry inside this directory has one path component per frame, the root's included, once this
+    // one is pushed: past the manifest's bound the archive could not be read back, so the export refuses
+    // it typed here (AUD-29-13) rather than emit what every reader refuses.
+    let limit = slates_archive::manifest::MAX_DEPTH;
+    if !pending.is_empty() && self.frames.len() >= limit {
+      return Err(VfsError::TreeTooDeep { limit });
+    }
     self.frames.push(Frame {
       dir,
       name: next.name,

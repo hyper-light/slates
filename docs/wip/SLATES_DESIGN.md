@@ -3780,11 +3780,11 @@ the format floor.
 >     stack.
 >   - A successor serves a hole-then-data file at its offsets and refuses a gibibyte hole under a 1 MiB bound
 >     (`docs/bugs/2026-09-30-archive-decoding-and-restore-trusted-declared-sizes-and-layout.md`).
-> - **Still owed.**
->   - Restore's output is dense (AUD-29-57).
->   - A volume deeper than `MAX_DEPTH` exports an archive no reader accepts. The tree type's recursive
->     encode, identity and drop need iterative forms, and a depth bound derived from memory rather than
->     `PATH_MAX`, before the bound can rise to what the VFS holds (GAPS, AUD-29-13–16 row).
+> - **The producer keeps the bound.** A volume deeper than `MAX_DEPTH` is refused `TreeTooDeep` at the
+>   export (`Unsupported` on the wire), never sealed into an archive no reader accepts. The bound is a
+>   resource bound: restore keys entries by path, so a chain `d` deep costs `O(d²)`
+>   (`docs/bugs/2026-09-30-an-export-past-the-manifest-depth-bound-emitted-an-unreadable-archive.md`).
+> - **Still owed.** Restore's output is dense (AUD-29-57).
 
 ### 4.12 Agent surfaces (D-19)
 

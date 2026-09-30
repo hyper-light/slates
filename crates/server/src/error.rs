@@ -127,6 +127,9 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     },
     VfsError::DigestNotClean => Refusal::DigestNotClean,
     VfsError::DigestUnverified => Refusal::DigestUnverified,
+    VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
+      feature: format!("archiving a tree deeper than {limit} path components"),
+    },
     other => Refusal::BadRequest {
       reason: format!("{other:?}"),
     },
