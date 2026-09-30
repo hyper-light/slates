@@ -309,7 +309,7 @@ them rather than renumbering or weakening the original gates.
 - D-O12 (opened 2026-09-04) Pointer-group sharding threshold — CLOSED 2026-09-04 by A-6: there is no pointer group; the configuration group commits only on failures and moves. The auto-seal cadence constants are still measured in Phase 8.
 - D-O13 — CLOSED 2026-09-04 by A-6: heads and chains are fenced registers in the Vertical Paxos II form; hedged placement adopted; pre-granted placement blocks unnecessary; erasure coding accepted earlier. Original text of the item: volume heads as fenced single-writer records in the content multiplex (consensus only for membership, placement and leases); hedged placement N > W for pointer records; pre-granted placement blocks so fleet `create` stays local; erasure coding as a measured policy for cold sealed content. Its first item (POSIX-native durability points at `fsync`, `snapshot`, `detach`, `archive`, all in RAM) is subsumed by A-4's `fsync` wording. Owner: Phase 8, decided by Ada.
 - D-O14 (opened 2026-09-04) FUSE passthrough for untouched base files — CLOSED 2026-09-04: not used; slates never requires `CAP_SYS_ADMIN` or root beyond the OS-provided brokers installed once (`fusermount3`/user namespaces, the FSKit extension, the WinFsp driver); the daemon copy path is the only base read path.
-- D-O15 (opened 2026-09-04) The landing fallback where the target filesystem lacks an atomic exchange (verify-then-rename-over with a reported window) versus a staging-directory strategy — Phase 1 measures the window; Phase 4 measures per platform.
+- D-O15 (opened 2026-09-04) The landing fallback where the target filesystem lacks an atomic exchange (verify-then-rename-over with a reported window until 2026-09-29; since A-43 the old entry moves aside and the new one in by renames that replace nothing, the name's absent window reported) versus a staging-directory strategy — Phase 1 measures the window; Phase 4 measures per platform.
 - D-O16 (opened 2026-09-04) Landing filters — DECIDED 2026-09-04: the confirmation surface offers suggestions the human toggles (ignore-file-aware); the agent's filter stays explicit; a toggle produces a new manifest hash (§4.15 step 2). Phase 5 builds it.
 - D-O17 (opened 2026-09-04) Conflict rate from whole-file tool rewrites versus SDK `edit` operations: if the measured share of conflicts caused by whole-file rewrites on shared files exceeds the operator SLO, reopen the ergonomics (a declared-edit bridge path for editors; stronger skill guidance) — Phase 6 measures.
 - D-O18 (opened 2026-09-04) Merge proposer authority: slates departs from hecate's leader-fused proposer (one shared pointer group; partitioned execution) and uses a consensus-issued lease with an epoch check at commit; CLOSED 2026-09-04 by A-6: the owner is the distinguished proposer of its own registers under its host epoch, so no leader-versus-leaseholder split can exist; a resumed stale owner is refused at the first holder (model-checked as StaleNeverCommits and Continuity).
@@ -378,7 +378,7 @@ are retained with their scope; no documentation edit is an implementation accept
 - Drift checks per second exceeding the measured `stat` capacity of a base (stat storms) → reopen the check cadence in §4.5 (hint-driven checks only, or a coarser listing fingerprint).
 - Watcher overflow rate above the operator SLO on a base → reopen the watcher strategy (fanotify mount marks on Linux; the USN journal on Windows).
 - Large-class copy-up cost or descriptor use beyond its derived budget → reopen the copy-up class boundary (D-6, §4.5).
-- Landings falling back to rename-over (no exchange) above a measured fraction → revisit D-O15 within the granted target; replacing its ungranted parent is forbidden.
+- Landings taking the exchange fallback (no exchange; A-43's two renames that replace nothing) above a measured fraction → revisit D-O15 within the granted target; replacing its ungranted parent is forbidden.
 - Merged listing cost on the largest base directories above the readdir latency budget → reopen the listing cache (§4.5).
 - Any write by a slates process outside a granted target in the tracer → stop the release; it is a rule violation, not a tripwire.
 - `StaleEpoch` refusals outside an observed takeover or migration → a fencing or membership bug; fatal in CI, alarm in production (never a tripwire to tune).
@@ -591,7 +591,8 @@ seeded runs of random outsider rewrites in both forms, every loss detected at th
 silently applied); T-1.15 and AC-1.13 (a crash at every one of the writer's 96 write
 instructions over a delta with every action class: every path old or new after each, the
 resume with the same landing id sweeps the siblings, reaches the reference disk, and a
-further plan is empty); T-1.16 (no exchange: verify-then-rename, the window in the outcome,
+further plan is empty); T-1.16 (no exchange: verify-then-rename — since A-43, 2026-09-29, the old entry
+moved aside and the new one in, the name's absent window measured —, the window in the outcome,
 `NoExchange` reported, an outsider edit still refused at the verify); T-1.12 (the 40k-entry
 directory: one `Clear` and two creates, exactly two entries after); a scratch landing into an
 empty target (1,010 entries, the scratch volume an overlay after, reads then following the disk;
@@ -2980,8 +2981,8 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 04, 05, 07
-  (06 is closed below).
+- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 05, 07
+  (04 and 06 are closed below).
 
 **Closed 2026-09-29 — AUD-29-06: a session grant was recorded consumed, and a restart lost every grant.**
 - **Transitions.** `finish` records only the transition the engine made: a single-use grant consumed by a
@@ -2992,6 +2993,30 @@ use.**
 - **Evidence.** `a_session_grant_outlives_a_restart_and_a_single_use_grant_stays_spent`, red with either
   part disabled
   (`docs/bugs/2026-09-29-grants-were-lost-at-a-restart-and-session-grants-recorded-consumed.md`).
+
+**Closed 2026-09-29 — AUD-29-04 (A-43): a landing's removal could remove an outsider's replacement.**
+- **The rule.** Every removal is a move to the landing's own aside name, a check there, then the removal.
+  The move is an exchange or a rename that replaces nothing; this covers deletes of files, symlinks and
+  other entries, directory removals, clears, directory renames, both exchange fallbacks and the undo
+  paths. An entry that is not the witnessed one goes back without replacing anything, or is kept and
+  reported (`Degradation::Kept`) when its name was taken. The seam no longer has a replacing rename.
+- **The resume.** It settles aside names before its verdicts. A fallback crash inside its window puts the
+  old entry back, so each path is old or new again.
+- **Evidence.** The removal oracle, its rules stated once in `crates/land/tests/common/removal.rs`: an
+  outsider save armed at every seam call and at every pair of calls, over nine removal kinds.
+  - Over the simulated host (139 single and 547 pair histories): red on the old engine for seven kinds
+    with one save and all nine with two.
+  - Over a real Linux tmpfs directory: red on the old engine for six kinds with one save.
+  - T-1.15 without the exchange: red when the sweep follows validation, or when a witnessed aside is
+    removed while its name is free.
+  - All green now. The exchange path's engine cost is unchanged within noise.
+  - Record: `docs/bugs/2026-09-29-a-landing-removal-could-remove-an-outsiders-replacement.md`.
+- **Siblings, open.**
+  - The sweep swallows its errors (AUD-29-05, next).
+  - A recursive removal's witness is the directory's inode only, so an outsider's file written beneath a
+    removed directory goes with it (`Rmdir` as defined; a subtree witness would be a §4.15 amendment).
+  - A landing never resumed leaves its hidden siblings, now including a fallback crash's aside entry,
+    until a landing with its id runs.
 
 **Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:

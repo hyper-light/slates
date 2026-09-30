@@ -171,14 +171,21 @@ pub trait LandFs: HostFs {
   fn place(&mut self, file: HostFile, dir: HostDir, name: &str) -> Result<(), HostError>;
   /// Atomically exchanges the entries `a` and `b` under `dir` (both must exist).
   fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError>;
-  /// Renames `from` under `dir` to `to` under `to_dir`, replacing an entry there.
-  fn rename(
+  /// Renames `from` under `dir` to `to` under `to_dir` only when `to` does not exist (Linux
+  /// `RENAME_NOREPLACE`, macOS `RENAME_EXCL`), refused `EEXIST` otherwise: the step that moves an entry
+  /// aside or puts one back without ever replacing a name an outsider took (AUD-29-04). It is the seam's only
+  /// rename: a rename that replaced its destination removed whatever an outsider had put there unchecked, so
+  /// the seam no longer offers one (2026-09-29).
+  fn rename_noreplace(
     &mut self,
     dir: HostDir,
     from: &str,
     to_dir: HostDir,
     to: &str,
   ) -> Result<(), HostError>;
+  /// The fingerprint of the entry `name` under `dir` itself — a symlink's own, not its target's (`fstatat`
+  /// without following): how a moved-aside entry of any kind is checked against its witness.
+  fn entry_fingerprint(&mut self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError>;
   /// Removes a file or symlink.
   fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError>;
   /// Creates a directory.

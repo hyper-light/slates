@@ -23,7 +23,7 @@ use slates_vfs::volume::{Store, Volume};
 mod common;
 use common::{
   LARGE, Session, Setup, TERM_NS, config, mkdir, read_through, rename, request, rm_r, scratch,
-  store, symlink, unlink, write_file,
+  split, store, symlink, unlink, write_file,
 };
 
 fn overlay(host: &mut SimHost, store: &mut Store) -> Volume {
@@ -627,9 +627,11 @@ fn crash_edits(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
   write_file(vol, host, store, "/cleared/c.txt", b"c");
 }
 
-/// The crash scenario, ready to land: the host, the volume and its store.
-fn crash_scenario() -> (SimHost, Store, Volume) {
+/// The crash scenario, ready to land: the host, the volume and its store; `exchange: false` takes the
+/// atomic exchange away (the fallback of T-1.16).
+fn crash_scenario(exchange: bool) -> (SimHost, Store, Volume) {
   let mut host = SimHost::new();
+  host.set_exchange_supported(exchange);
   crash_base(&mut host);
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
@@ -638,8 +640,8 @@ fn crash_scenario() -> (SimHost, Store, Volume) {
 }
 
 /// The reference: the disk before, the disk after a clean landing, and the write count.
-fn crash_reference() -> (Disk, Disk, u64) {
-  let (mut host, mut store, mut vol) = crash_scenario();
+fn crash_reference(exchange: bool) -> (Disk, Disk, u64) {
+  let (mut host, mut store, mut vol) = crash_scenario(exchange);
   let before = {
     let mut fresh = SimHost::new();
     crash_base(&mut fresh);
@@ -674,10 +676,59 @@ fn assert_old_or_new(crash_at: u64, now: &Disk, before: &Disk, after: &Disk) {
   }
 }
 
-/// One crash at write instruction `crash_at`: every path old or new, then the resume reaches
-/// the reference, sweeps the siblings, and a further run plans nothing.
-fn crash_then_resume(crash_at: u64, before: &Disk, after: &Disk) {
-  let (mut host, mut store, mut vol) = crash_scenario();
+/// Without the exchange (§4.15 "Exchange fallback", AUD-29-04): every path on `now` is old or new, or
+/// absent while its old entry sits aside at one of the landing's own hidden names beside it (a crash inside a
+/// window between moving the old entry aside and placing the new one), byte for byte. How many paths were
+/// set aside.
+fn assert_old_new_or_aside(crash_at: u64, host: &SimHost, before: &Disk, after: &Disk) -> usize {
+  let mut set_aside = 0usize;
+  let now = disk(host);
+  let hidden: Disk = host
+    .paths()
+    .into_iter()
+    .filter(|(p, _)| is_hidden(p))
+    .map(|(p, k)| {
+      let bytes = host.bytes(&p).unwrap_or_default();
+      (p, (k, bytes))
+    })
+    .collect();
+  for path in before.keys().chain(after.keys()) {
+    if now.get(path) == before.get(path) || now.get(path) == after.get(path) {
+      continue;
+    }
+    let old = before.get(path);
+    let aside = !now.contains_key(path)
+      && old.is_some()
+      && ancestors_or_self(path).any(|entry| {
+        let rest = path.strip_prefix(entry).unwrap_or_default();
+        !now.contains_key(entry)
+          && hidden
+            .keys()
+            .any(|h| split(h).0 == split(entry).0 && hidden.get(&format!("{h}{rest}")) == old)
+      });
+    assert!(
+      aside,
+      "crash {crash_at}: {path} is neither old, new nor set aside: {:?}",
+      now.get(path)
+    );
+    set_aside += 1;
+  }
+  set_aside
+}
+
+/// `path` and each directory above it, nearest first (the root excluded).
+fn ancestors_or_self(path: &str) -> impl Iterator<Item = &str> {
+  std::iter::successors(Some(path), |p| {
+    let (parent, _) = split(p);
+    (parent != "/").then_some(parent)
+  })
+}
+
+/// One crash at write instruction `crash_at`: every path old or new (or, without the exchange, set aside),
+/// then the resume reaches the reference, sweeps the siblings, and a further run plans nothing. How many
+/// paths the crash left set aside.
+fn crash_then_resume(exchange: bool, crash_at: u64, before: &Disk, after: &Disk) -> usize {
+  let (mut host, mut store, mut vol) = crash_scenario(exchange);
   let target = root_target(&mut host);
   let mut session = Session::new();
   host.crash_at_write(host.write_steps() + crash_at);
@@ -703,7 +754,12 @@ fn crash_then_resume(crash_at: u64, before: &Disk, after: &Disk) {
         .any(|d| matches!(d, Degradation::Crashed { .. }))
     );
   }
-  assert_old_or_new(crash_at, &disk(&host), before, after);
+  let set_aside = if exchange {
+    assert_old_or_new(crash_at, &disk(&host), before, after);
+    0
+  } else {
+    assert_old_new_or_aside(crash_at, &host, before, after)
+  };
   host.recover();
   let mut setup = Setup {
     host: &mut host,
@@ -734,24 +790,41 @@ fn crash_then_resume(crash_at: u64, before: &Disk, after: &Disk) {
     "crash {crash_at}: siblings swept: {:?}",
     hidden_names(&host)
   );
+  set_aside
 }
 
 /// T-1.15 and AC-1.13: crash at every write instruction; every entry is old or new; the
 /// resume sweeps the hidden siblings and lands the rest; a further run plans nothing.
 #[test]
 fn t_1_15_crash_at_every_write_instruction_then_resume() {
-  let (before, after, steps) = crash_reference();
+  let (before, after, steps) = crash_reference(true);
   assert!(steps > 20, "the scenario writes in many steps: {steps}");
   for crash_at in 0..steps {
-    crash_then_resume(crash_at, &before, &after);
+    crash_then_resume(true, crash_at, &before, &after);
   }
+}
+
+/// T-1.15 and T-1.16 with AUD-29-04: the same crash at every write instruction on a filesystem without the
+/// exchange. Every path is old or new, or absent while its old entry sits aside at one of the landing's own
+/// names (a crash inside the fallback's window); the resume puts such an entry back before its verdicts are
+/// taken, then reaches the reference, sweeps the siblings, and a further run plans nothing.
+#[test]
+fn t_1_15_without_exchange_crash_at_every_write_instruction_then_resume() {
+  let (before, after, steps) = crash_reference(false);
+  assert!(steps > 20, "the scenario writes in many steps: {steps}");
+  let mut set_aside = 0usize;
+  for crash_at in 0..steps {
+    set_aside += crash_then_resume(false, crash_at, &before, &after);
+  }
+  // Not vacuous: some crash fell inside a window and left an entry aside for the resume to put back.
+  assert!(set_aside > 0, "no crash of {steps} fell inside a window");
 }
 
 // ---------------------------------------------------------------- exchange fallback
 
-/// T-1.16: a filesystem without exchange; replacements take verify-then-rename; the window is
-/// measured into the outcome; the Degraded cell is reported; an outsider edit before the write
-/// is still refused (at the verify).
+/// T-1.16: a filesystem without exchange; a replacement moves the old file aside and the new one in, never
+/// over anything (AUD-29-04); the window the name is absent is measured into the outcome; the Degraded cell
+/// is reported; an outsider edit before the write is still refused (at the verify).
 #[test]
 fn t_1_16_without_exchange_the_fallback_reports_its_window() {
   let mut host = SimHost::new();

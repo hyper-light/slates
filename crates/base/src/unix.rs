@@ -140,6 +140,15 @@ impl OsHost {
     self.file(file).map(AsFd::as_fd)
   }
 
+  /// The fingerprint of the entry `name` under `dir` itself — a symlink's own, not its target's (`statat`
+  /// without following): the landing's check of an entry it moved aside (AUD-29-04). A read, like
+  /// [`HostFs::list`]'s own per-entry `statat`.
+  pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    let st =
+      rustix::fs::statat(self.dir(dir)?, name, AtFlags::SYMLINK_NOFOLLOW).map_err(refusal)?;
+    Ok(fingerprint(&st))
+  }
+
   /// Takes ownership of a directory descriptor the caller opened (with containment); refused `EMFILE` once
   /// the handle ids are spent ([`OsHost::allocate`]).
   pub fn adopt_dir(&mut self, fd: OwnedFd) -> Result<HostDir, HostError> {

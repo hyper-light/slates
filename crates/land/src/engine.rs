@@ -17,6 +17,11 @@
 //!   own ctime change requires a stable content hash; a mismatch exchanges back, removes
 //!   the temporary and records `Undone(TargetInUse)`; a create whose
 //!   name appeared meanwhile fails the link with `EEXIST` and records `Conflict(TargetInUse)`;
+//! - nothing an outsider put at a name is removed in the witnessed entry's place (AUD-29-04): an entry
+//!   is removed only as the object moved to one of this landing's own names (by the exchange, or by a
+//!   rename that replaces nothing) and checked there; one that is not the witnessed object goes back
+//!   without replacing anything, or is kept beside its name and reported (`Degradation::Kept`). The
+//!   write seam offers no rename that replaces its destination;
 //! - a re-run is idempotent: the plan is by hash, and an entry the disk already holds is a
 //!   `Skip`, which advances without a write;
 //! - the work is proportional to the delta: the only directories opened are the parents of the
@@ -51,6 +56,16 @@ use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
 /// landing id follows, then a per-landing counter, so a sweep recognizes its own names.
 const HIDDEN_PREFIX: &str = ".slates-";
+/// Format: the mark between a hidden name's landing id and the hash of the manifest path whose entry was
+/// moved aside under it (AUD-29-04), so a sweep after a crash can check the entry before removing it.
+const ASIDE_MARK: &str = "-aside-";
+/// Format: the prefix of a name an entry moved aside is kept under when its own name was taken before it
+/// could be put back: no sweep removes it (it is not this landing's hidden name), and the report names it.
+const KEPT_PREFIX: &str = ".slates-kept-";
+/// Format: the radix of the numbers in a hidden name (the landing id, the aside path hash), written `{:016x}`.
+const HIDDEN_NAME_RADIX: u32 = 16;
+/// Format: the leading bytes of a manifest path's BLAKE3 that an aside name carries: one `u64`.
+const PATH_HASH_BYTES: usize = size_of::<u64>();
 /// Format: `EEXIST` on Linux and macOS (the seam reports it as `Unavailable(17)`).
 const ERRNO_EXIST: i32 = 17;
 /// Format: `EINVAL` on Linux and macOS: a filesystem without `RENAME_EXCHANGE` reports it.
@@ -144,17 +159,18 @@ pub struct EntryReport {
   pub verdict: Option<Verdict>,
   /// The outcome, once written.
   pub outcome: Option<Outcome>,
-  /// The unverified window of the exchange fallback, when that path was taken.
+  /// The window the entry's name was absent in the exchange fallback (between moving the old entry aside
+  /// and placing the new one), when that path was taken.
   pub window_ns: Option<u64>,
 }
 
 /// A Degraded cell the landing hit (the design's failure matrix).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Degradation {
-  /// The filesystem lacks an atomic exchange; entries were written by verify-then-rename with
-  /// the widest window observed.
+  /// The filesystem lacks an atomic exchange; entries were written by moving the old entry aside and
+  /// the new one in, never over anything, with the widest window a name was absent.
   NoExchange {
-    /// The widest unverified window, nanoseconds.
+    /// The widest window, nanoseconds.
     widest_window_ns: u64,
   },
   /// Media durability was not requested (macOS barriers only).
@@ -163,6 +179,16 @@ pub enum Degradation {
   Crashed {
     /// The errno.
     errno: i32,
+  },
+  /// An entry the landing moved to one of its own names could not go back, because its name had been taken
+  /// again meanwhile: it is kept at `kept`, never removed (AUD-29-04). It is an entry that was not the
+  /// witnessed one, or the witnessed one whose replacement lost its name to an outsider inside the exchange
+  /// fallback's window.
+  Kept {
+    /// The manifest path of the entry it was displaced by.
+    path: Box<str>,
+    /// The path it is kept at, beside where the landing had moved it.
+    kept: Box<str>,
   },
 }
 
@@ -492,6 +518,74 @@ impl<H: LandFs> Landing<'_, H> {
 
   fn is_own_hidden(&self, name: &str) -> bool {
     name.starts_with(&format!("{HIDDEN_PREFIX}{:016x}-", self.request.landing_id))
+  }
+
+  /// The name the entry at `path` is moved aside to while it is checked (AUD-29-04): this landing's hidden
+  /// prefix, the aside mark and the path's hash. It is also the replacement temporary's name, since the
+  /// exchange leaves the displaced entry under it.
+  fn aside_name(&self, path: &str) -> Box<str> {
+    format!(
+      "{HIDDEN_PREFIX}{:016x}{ASIDE_MARK}{:016x}",
+      self.request.landing_id,
+      path_hash(path)
+    )
+    .into()
+  }
+
+  /// The path hash an aside name of this landing carries.
+  fn aside_hash(&self, name: &str) -> Option<u64> {
+    let prefix = format!(
+      "{HIDDEN_PREFIX}{:016x}{ASIDE_MARK}",
+      self.request.landing_id
+    );
+    u64::from_str_radix(name.strip_prefix(prefix.as_str())?, HIDDEN_NAME_RADIX).ok()
+  }
+
+  /// A name no sweep removes, for an entry moved aside that could not go back.
+  fn kept_name(&mut self) -> Box<str> {
+    let n = self.hidden_counter;
+    self.hidden_counter = self.hidden_counter.saturating_add(1);
+    format!("{KEPT_PREFIX}{:016x}-{n}", self.request.landing_id).into()
+  }
+
+  /// Puts the entry moved aside at `aside` under `aside_dir` (the directory at `aside_dir_path`) back at
+  /// `name` under `dir`, never replacing whatever holds that name now; if the name was taken meanwhile, keeps
+  /// the entry under a name no sweep removes and reports it (`Degradation::Kept`) for the entry at `path`.
+  fn put_back(
+    &mut self,
+    aside_dir: HostDir,
+    aside_dir_path: &str,
+    aside: &str,
+    dir: HostDir,
+    name: &str,
+    path: &str,
+  ) -> Result<(), WriteFailure> {
+    match self.host.rename_noreplace(aside_dir, aside, dir, name) {
+      Ok(()) => Ok(()),
+      Err(HostError::Unavailable(ERRNO_EXIST)) => self.keep(aside_dir, aside_dir_path, aside, path),
+      Err(e) => Err(e.into()),
+    }
+  }
+
+  /// Whether the entry moved aside at `aside` is the witnessed object: the witness's fingerprint in all but
+  /// the ctime the move itself changes (the entry's full fingerprint was checked just before the move).
+  /// `None` when nothing is there any more.
+  fn aside_matches(
+    &mut self,
+    dir: HostDir,
+    aside: &str,
+    witness: &Witness,
+  ) -> Result<Option<bool>, HostError> {
+    match self.host.entry_fingerprint(dir, aside) {
+      Ok(moved) => Ok(Some(
+        Fingerprint {
+          ctime_ns: witness.fingerprint.ctime_ns,
+          ..moved
+        } == witness.fingerprint,
+      )),
+      Err(HostError::NotFound) => Ok(None),
+      Err(e) => Err(e),
+    }
   }
 
   /// Opens (or finds) the directory at `path`, relative to the root; every opened handle is
@@ -888,11 +982,23 @@ impl<H: LandFs> Landing<'_, H> {
     let bytes = read_overlay_bytes(vol, store, self.host, &entry.path)?;
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
-    let hidden = self.hidden_name();
+    // A replacement's temporary takes the entry's aside name: the exchange leaves the displaced entry under
+    // it, and a sweep after a crash checks it before removing it (AUD-29-04).
+    let hidden = match witnessed {
+      None => self.hidden_name(),
+      Some(_) => self.aside_name(&entry.path),
+    };
     let temp = self.fill_temp(dir, &hidden, &bytes, overlay)?;
     let result = match witnessed {
       None => self.link_create(temp, dir, &hidden, name),
-      Some(w) => self.swap_replace(temp, dir, &hidden, name, w),
+      Some(witness) => self.swap_replace(Swap {
+        temp,
+        dir,
+        hidden: &hidden,
+        name,
+        path: &entry.path,
+        witness,
+      }),
     };
     self.host.close_file(temp);
     match result {
@@ -972,19 +1078,12 @@ impl<H: LandFs> Landing<'_, H> {
 
   /// A replacement: place the temporary at its hidden name, hold the old file, exchange, and
   /// verify the displaced file is the witnessed one; else exchange back.
-  fn swap_replace(
-    &mut self,
-    temp: HostFile,
-    dir: HostDir,
-    hidden: &str,
-    name: &str,
-    w: &Witness,
-  ) -> Result<Written, WriteFailure> {
-    self.host.place(temp, dir, hidden)?;
-    let old = match self.host.open_file(dir, name) {
+  fn swap_replace(&mut self, swap: Swap<'_>) -> Result<Written, WriteFailure> {
+    self.host.place(swap.temp, swap.dir, swap.hidden)?;
+    let old = match self.host.open_file(swap.dir, swap.name) {
       Ok(f) => f,
       Err(HostError::NotFound | HostError::NotFile) => {
-        self.host.unlink(dir, hidden)?;
+        self.host.unlink(swap.dir, swap.hidden)?;
         return Ok(Written {
           outcome: Outcome::Conflict(ConflictClass::TargetInUse),
           window_ns: None,
@@ -993,9 +1092,9 @@ impl<H: LandFs> Landing<'_, H> {
       Err(e) => return Err(e.into()),
     };
     let result = if self.exchange {
-      self.exchange_and_verify(old, dir, hidden, name, w)
+      self.exchange_and_verify(old, swap)
     } else {
-      self.verify_then_rename(old, dir, hidden, name, w)
+      self.replace_by_renames(old, swap)
     };
     self.host.close_file(old);
     result
@@ -1004,11 +1103,15 @@ impl<H: LandFs> Landing<'_, H> {
   fn exchange_and_verify(
     &mut self,
     old: HostFile,
-    dir: HostDir,
-    hidden: &str,
-    name: &str,
-    w: &Witness,
+    swap: Swap<'_>,
   ) -> Result<Written, WriteFailure> {
+    let Swap {
+      dir,
+      hidden,
+      name,
+      witness: w,
+      ..
+    } = swap;
     // Only our exchange may explain a changed ctime. An earlier metadata change is still
     // a witness conflict, even when the outsider left the same mode and content behind.
     let before = self.host.fstat(old)?;
@@ -1017,7 +1120,7 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(()) => {}
       Err(HostError::Unavailable(errno)) if no_exchange(errno) => {
         self.exchange = false;
-        return self.verify_then_rename(old, dir, hidden, name, w);
+        return self.replace_by_renames(old, swap);
       }
       Err(e) => return Err(e.into()),
     }
@@ -1036,14 +1139,49 @@ impl<H: LandFs> Landing<'_, H> {
         window_ns: None,
       });
     }
-    // Lost to an outsider: the old file goes back, the temporary goes away.
+    // Lost to an outsider: the old file goes back, and the temporary goes once it is checked to be ours — a
+    // second outsider edit between the two exchanges leaves its own file there instead (AUD-29-04).
     self.host.exchange(dir, hidden, name)?;
-    self.host.unlink(dir, hidden)?;
+    self.remove_own_temp(swap)?;
     verified?;
     Ok(Written {
       outcome: Outcome::Undone(ConflictClass::TargetInUse),
       window_ns: None,
     })
+  }
+
+  /// Removes the replacement's temporary from its hidden name once the entry there is checked to be it: the
+  /// open descriptor holds the temporary's inode, so the identity is exact. Another entry there is kept under
+  /// a name no sweep removes and reported (`Degradation::Kept`), never removed.
+  fn remove_own_temp(&mut self, swap: Swap<'_>) -> Result<(), WriteFailure> {
+    let ours = self.host.fstat(swap.temp)?;
+    match self.host.entry_fingerprint(swap.dir, swap.hidden) {
+      Ok(there) if there.dev == ours.dev && there.ino == ours.ino => {
+        self.host.unlink(swap.dir, swap.hidden)?;
+      }
+      Ok(_) => self.keep(swap.dir, split(swap.path).0, swap.hidden, swap.path)?,
+      Err(HostError::NotFound) => {}
+      Err(e) => return Err(e.into()),
+    }
+    Ok(())
+  }
+
+  /// Keeps the entry at `hidden` under `dir` (the directory at `dir_path`) under a name no sweep removes,
+  /// reported as `Degradation::Kept` for the entry at `path`.
+  fn keep(
+    &mut self,
+    dir: HostDir,
+    dir_path: &str,
+    hidden: &str,
+    path: &str,
+  ) -> Result<(), WriteFailure> {
+    let kept = self.kept_name();
+    self.host.rename_noreplace(dir, hidden, dir, &kept)?;
+    self.degraded.push(Degradation::Kept {
+      path: path.into(),
+      kept: join(dir_path, &kept).into(),
+    });
+    Ok(())
   }
 
   /// Open what the exchange actually displaced: a pre-exchange descriptor can still point
@@ -1083,16 +1221,22 @@ impl<H: LandFs> Landing<'_, H> {
     Ok(identity == witness.identity && after == before)
   }
 
-  /// The exchange fallback (Degraded): verify the old file through its descriptor, then rename
-  /// the temporary over it; the window between the two is measured and reported.
-  fn verify_then_rename(
-    &mut self,
-    old: HostFile,
-    dir: HostDir,
-    hidden: &str,
-    name: &str,
-    w: &Witness,
-  ) -> Result<Written, WriteFailure> {
+  /// The exchange fallback (Degraded; AUD-29-04). The old file must match the witness through the descriptor
+  /// held on it; it is then moved aside without replacing anything and checked where it went (as the
+  /// exchange's displaced file is), the temporary takes the name without replacing anything, and only then
+  /// is the checked file removed. The name is absent between the two renames: that window is measured and
+  /// reported, and a crash inside it leaves the old file aside for the resume's sweep to put back. Before
+  /// 2026-09-29 the temporary was renamed over the name after the check, which removed whatever an outsider
+  /// had put there in between.
+  fn replace_by_renames(&mut self, old: HostFile, swap: Swap<'_>) -> Result<Written, WriteFailure> {
+    let Swap {
+      dir,
+      hidden,
+      name,
+      path,
+      witness: w,
+      ..
+    } = swap;
     let verify_started = Instant::now();
     let current = self.host.fstat(old)?;
     self.costs.verify_ns.push(elapsed_ns(verify_started));
@@ -1103,19 +1247,69 @@ impl<H: LandFs> Landing<'_, H> {
         window_ns: None,
       });
     }
+    // The temporary takes a plain hidden name, freeing the aside name for the old file.
+    let staged = self.hidden_name();
+    self.host.rename_noreplace(dir, hidden, dir, &staged)?;
+    let aside = self.aside_name(path);
     let window_started = Instant::now();
-    self.host.rename(dir, hidden, dir, name)?;
+    if let Some(outcome) = self.set_file_aside(dir, name, &aside, path, w)? {
+      self.host.unlink(dir, &staged)?;
+      return Ok(Written {
+        outcome,
+        window_ns: None,
+      });
+    }
+    if let Err(e) = self.host.rename_noreplace(dir, &staged, dir, name) {
+      // The name was made again inside the window (`EEXIST`), or the host refused: the old file goes back,
+      // kept beside the name when an outsider holds it, and the temporary goes.
+      self.put_back(dir, split(path).0, &aside, dir, name, path)?;
+      self.host.unlink(dir, &staged)?;
+      return match e {
+        HostError::Unavailable(ERRNO_EXIST) => Ok(Written {
+          outcome: Outcome::Undone(ConflictClass::TargetInUse),
+          window_ns: None,
+        }),
+        e => Err(e.into()),
+      };
+    }
     let window_ns = elapsed_ns(window_started);
     self.costs.link_ns.push(window_ns);
     self.widest_window_ns = self.widest_window_ns.max(window_ns);
+    self.host.unlink(dir, &aside)?;
     Ok(Written {
       outcome: Outcome::Written,
       window_ns: Some(window_ns),
     })
   }
 
-  /// A delete: the file's fingerprint must still be the witnessed one through a descriptor;
-  /// a symlink (no descriptor) is unlinked as is.
+  /// The fallback's old file, moved aside to `aside` and checked there: `None` when it is the witnessed file,
+  /// else the outcome the replacement ends with — nothing was there, or another entry, which went back.
+  fn set_file_aside(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    aside: &str,
+    path: &str,
+    witness: &Witness,
+  ) -> Result<Option<Outcome>, WriteFailure> {
+    match self.host.rename_noreplace(dir, name, dir, aside) {
+      Ok(()) => {}
+      Err(HostError::NotFound) => return Ok(Some(Outcome::Conflict(ConflictClass::TargetInUse))),
+      Err(e) => return Err(e.into()),
+    }
+    if self.verify_displaced(dir, aside, witness)? {
+      return Ok(None);
+    }
+    self.put_back(dir, split(path).0, aside, dir, name, path)?;
+    Ok(Some(Outcome::Undone(ConflictClass::TargetInUse)))
+  }
+
+  /// A delete of a file, symlink or other entry (AUD-29-04): the entry must be the witnessed one as it
+  /// stands, and it is removed only as the object moved aside in one step and checked there, so an
+  /// outsider's replacement at any moment is never removed in its place. One that is not the witnessed
+  /// object goes back where it was, never over a newer entry. Before 2026-09-29 the file was checked through
+  /// a descriptor that was then closed and the name unlinked, so a replacement in between was removed, and
+  /// a symlink or other entry was unlinked unchecked.
   fn delete(
     &mut self,
     dir_path: &str,
@@ -1124,28 +1318,37 @@ impl<H: LandFs> Landing<'_, H> {
   ) -> Result<Outcome, WriteFailure> {
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
-    let file = match self.host.open_file(dir, name) {
-      Ok(f) => f,
+    let current = match self.host.entry_fingerprint(dir, name) {
+      Ok(current) => current,
       Err(HostError::NotFound) => return Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
-      Err(HostError::NotFile) => {
-        self.host.unlink(dir, name)?;
-        return Ok(Outcome::Written);
-      }
       Err(e) => return Err(e.into()),
     };
-    let current = self.host.fstat(file);
-    self.host.close_file(file);
-    let matches = witnessed.is_some_and(|w| current.as_ref().is_ok_and(|c| *c == w.fingerprint));
-    if !matches {
+    let Some(witness) = witnessed.filter(|w| w.fingerprint == current) else {
       return Ok(Outcome::Conflict(ConflictClass::TargetInUse));
+    };
+    let path = join(dir_path, name);
+    let aside = self.aside_name(&path);
+    match self.host.rename_noreplace(dir, name, dir, &aside) {
+      Ok(()) => {}
+      Err(HostError::NotFound) => return Ok(Outcome::Skipped(SkipReason::AlreadyThere)),
+      Err(e) => return Err(e.into()),
     }
-    self.host.unlink(dir, name)?;
-    Ok(Outcome::Written)
+    match self.aside_matches(dir, &aside, witness)? {
+      Some(true) => {
+        self.host.unlink(dir, &aside)?;
+        Ok(Outcome::Written)
+      }
+      Some(false) => {
+        self.put_back(dir, split(&path).0, &aside, dir, name, &path)?;
+        Ok(Outcome::Undone(ConflictClass::TargetInUse))
+      }
+      None => Ok(Outcome::Conflict(ConflictClass::TargetInUse)),
+    }
   }
 
-  /// A recursive removal: the directory's inode must be the witnessed one; then the directory
-  /// is renamed to a hidden sibling in one step (the name is old or gone, never half-removed)
-  /// and the hidden tree is removed bottom-up; a crash leaves it for the sweep.
+  /// A recursive removal: the directory's inode must be the witnessed one; then the directory is renamed to
+  /// this landing's aside name in one step (the name is old or gone, never half-removed), checked there, and
+  /// the hidden tree is removed bottom-up; a crash leaves it for the sweep.
   fn remove_tree_entry(
     &mut self,
     dir_path: &str,
@@ -1154,14 +1357,13 @@ impl<H: LandFs> Landing<'_, H> {
   ) -> Result<Outcome, WriteFailure> {
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
-    let Some(hidden) = self.set_aside(dir, dir_path, name, witnessed)? else {
-      return Ok(Outcome::Skipped(SkipReason::AlreadyThere));
-    };
-    let Some(hidden) = hidden else {
-      return Ok(Outcome::Conflict(ConflictClass::TargetInUse));
-    };
-    self.remove_named_tree(dir, &hidden)?;
-    Ok(Outcome::Written)
+    match self.set_aside(dir, dir_path, name, witnessed)? {
+      Ok(aside) => {
+        self.remove_named_tree(dir, &aside)?;
+        Ok(Outcome::Written)
+      }
+      Err(outcome) => Ok(outcome),
+    }
   }
 
   /// A clear: a fresh directory (the overlay's mode) is made beside the old one and exchanged
@@ -1197,24 +1399,57 @@ impl<H: LandFs> Landing<'_, H> {
       }
       Some(true) => {}
     }
-    self.forget_dirs_under(&join(dir_path, name));
-    let fresh = self.hidden_name();
+    let path = join(dir_path, name);
+    self.forget_dirs_under(&path);
+    // The fresh directory takes the entry's aside name: the exchange leaves the displaced directory under
+    // it, and a sweep after a crash checks it before removing it (AUD-29-04).
+    let fresh = self.aside_name(&path);
     self.host.mkdir(dir, &fresh, mode)?;
+    // The fresh directory's identity, taken while only this landing's hidden name holds it.
+    let made = self.host.entry_fingerprint(dir, &fresh)?;
     if !self.exchange_names(dir, &fresh, name)? {
-      return self.clear_by_renames(dir, &fresh, name);
+      return self.clear_by_renames(dir, &path, &fresh, name, entry.witnessed.as_ref());
     }
     // The displaced directory must be the witnessed one; else the old one goes back.
     if self.verify_dir(dir, &fresh, entry.witnessed.as_ref())? != Some(true) {
-      self.host.exchange(dir, &fresh, name)?;
-      self.host.rmdir(dir, &fresh)?;
-      return Ok(Written {
-        outcome: Outcome::Undone(ConflictClass::TargetInUse),
-        window_ns: None,
-      });
+      return self.undo_clear(dir, &path, &fresh, name, made);
     }
     self.remove_named_tree(dir, &fresh)?;
     Ok(Written {
       outcome: Outcome::Written,
+      window_ns: None,
+    })
+  }
+
+  /// A clear that displaced another entry than the witnessed directory: the exchange back returns it to its
+  /// name, and the fresh directory is removed only once the entry the exchange back left at `fresh` is
+  /// checked to be it (`made`, its identity when only this landing's hidden name held it). A second outsider
+  /// edit between the two exchanges leaves its own entry there instead, and that is kept, never removed; so
+  /// is the fresh directory when `rmdir` refuses it, because an outsider wrote into it while it held the name
+  /// (AUD-29-04).
+  fn undo_clear(
+    &mut self,
+    dir: HostDir,
+    path: &str,
+    fresh: &str,
+    name: &str,
+    made: Fingerprint,
+  ) -> Result<Written, WriteFailure> {
+    self.host.exchange(dir, fresh, name)?;
+    match self.host.entry_fingerprint(dir, fresh) {
+      Ok(there) if there.dev == made.dev && there.ino == made.ino => {
+        match self.host.rmdir(dir, fresh) {
+          Ok(()) => {}
+          Err(HostError::Unavailable(_)) => self.keep(dir, split(path).0, fresh, path)?,
+          Err(e) => return Err(e.into()),
+        }
+      }
+      Ok(_) => self.keep(dir, split(path).0, fresh, path)?,
+      Err(HostError::NotFound) => {}
+      Err(e) => return Err(e.into()),
+    }
+    Ok(Written {
+      outcome: Outcome::Undone(ConflictClass::TargetInUse),
       window_ns: None,
     })
   }
@@ -1224,13 +1459,36 @@ impl<H: LandFs> Landing<'_, H> {
   fn clear_by_renames(
     &mut self,
     dir: HostDir,
+    path: &str,
     fresh: &str,
     name: &str,
+    witnessed: Option<&Witness>,
   ) -> Result<Written, WriteFailure> {
-    let aside = self.hidden_name();
+    // The fresh directory takes a plain hidden name, freeing the aside name for the original.
+    let plain = self.hidden_name();
+    self.host.rename_noreplace(dir, fresh, dir, &plain)?;
+    let aside = self.aside_name(path);
     let started = Instant::now();
-    self.host.rename(dir, name, dir, &aside)?;
-    self.host.rename(dir, fresh, dir, name)?;
+    if let Some(outcome) = self.set_original_aside(dir, path, name, &aside, witnessed)? {
+      self.host.rmdir(dir, &plain)?;
+      return Ok(Written {
+        outcome,
+        window_ns: None,
+      });
+    }
+    if let Err(e) = self.host.rename_noreplace(dir, &plain, dir, name) {
+      // The name was made again meanwhile (`EEXIST`), or the host refused: the witnessed directory goes back
+      // — kept beside the name when an outsider holds it — rather than removed, and ours goes.
+      self.put_back(dir, split(path).0, &aside, dir, name, path)?;
+      self.host.rmdir(dir, &plain)?;
+      return match e {
+        HostError::Unavailable(ERRNO_EXIST) => Ok(Written {
+          outcome: Outcome::Undone(ConflictClass::TargetInUse),
+          window_ns: None,
+        }),
+        e => Err(e.into()),
+      };
+    }
     let window_ns = elapsed_ns(started);
     self.widest_window_ns = self.widest_window_ns.max(window_ns);
     self.remove_named_tree(dir, &aside)?;
@@ -1238,6 +1496,30 @@ impl<H: LandFs> Landing<'_, H> {
       outcome: Outcome::Written,
       window_ns: Some(window_ns),
     })
+  }
+
+  /// A clear's original without an exchange, moved aside to `aside` and checked there (AUD-29-04; before
+  /// 2026-09-29 it was removed unchecked, after a check made before the move): `None` when it is the
+  /// witnessed directory, else the outcome the clear ends with — nothing was there, or another directory,
+  /// which went back.
+  fn set_original_aside(
+    &mut self,
+    dir: HostDir,
+    path: &str,
+    name: &str,
+    aside: &str,
+    witnessed: Option<&Witness>,
+  ) -> Result<Option<Outcome>, WriteFailure> {
+    match self.host.rename_noreplace(dir, name, dir, aside) {
+      Ok(()) => {}
+      Err(HostError::NotFound) => return Ok(Some(Outcome::Conflict(ConflictClass::TargetInUse))),
+      Err(e) => return Err(e.into()),
+    }
+    if self.verify_dir(dir, aside, witnessed)? == Some(true) {
+      return Ok(None);
+    }
+    self.put_back(dir, split(path).0, aside, dir, name, path)?;
+    Ok(Some(Outcome::Undone(ConflictClass::TargetInUse)))
   }
 
   /// Exchanges two names in `dir`; `false` when the filesystem has no exchange (the landing
@@ -1277,26 +1559,37 @@ impl<H: LandFs> Landing<'_, H> {
     })))
   }
 
-  /// Renames the directory `name` to a hidden sibling after its inode matched the witness.
-  /// `None`: nothing there; `Some(None)`: there but not the witnessed one; `Some(Some(h))`: set
-  /// aside at `h`.
+  /// Moves the directory `name` to this landing's aside name after its inode matched the witness, and checks
+  /// it there: `Ok` with the aside name when it is the witnessed directory, else the outcome the removal ends
+  /// with — nothing there, another entry there (nothing moved), or another entry moved and put back.
   fn set_aside(
     &mut self,
     dir: HostDir,
     dir_path: &str,
     name: &str,
     witnessed: Option<&Witness>,
-  ) -> Result<Option<Option<Box<str>>>, WriteFailure> {
+  ) -> Result<Result<Box<str>, Outcome>, WriteFailure> {
     match self.verify_dir(dir, name, witnessed)? {
-      None => Ok(None),
-      Some(false) => Ok(Some(None)),
-      Some(true) => {
-        self.forget_dirs_under(&join(dir_path, name));
-        let hidden = self.hidden_name();
-        self.host.rename(dir, name, dir, &hidden)?;
-        Ok(Some(Some(hidden)))
-      }
+      None => return Ok(Err(Outcome::Skipped(SkipReason::AlreadyThere))),
+      Some(false) => return Ok(Err(Outcome::Conflict(ConflictClass::TargetInUse))),
+      Some(true) => {}
     }
+    let path = join(dir_path, name);
+    self.forget_dirs_under(&path);
+    let aside = self.aside_name(&path);
+    match self.host.rename_noreplace(dir, name, dir, &aside) {
+      Ok(()) => {}
+      Err(HostError::NotFound) => return Ok(Err(Outcome::Skipped(SkipReason::AlreadyThere))),
+      Err(e) => return Err(e.into()),
+    }
+    // The directory moved is the one removed: it must still be the witnessed one, else it goes back
+    // (AUD-29-04; before 2026-09-29 the check came before the move, so a directory an outsider put in
+    // between was removed with everything beneath it).
+    if self.verify_dir(dir, &aside, witnessed)? == Some(true) {
+      return Ok(Ok(aside));
+    }
+    self.put_back(dir, dir_path, &aside, dir, name, &path)?;
+    Ok(Err(Outcome::Undone(ConflictClass::TargetInUse)))
   }
 
   /// Removes everything inside `dir`.
@@ -1315,7 +1608,13 @@ impl<H: LandFs> Landing<'_, H> {
     Ok(())
   }
 
-  /// A directory rename: the origin's inode must be the witnessed one.
+  /// A directory rename (AUD-29-04): the origin must be the witnessed directory as it stands; it is then moved
+  /// to this landing's aside name beside it without replacing anything and checked there, and only then moved
+  /// to its new name, again without replacing anything. One that is not the witnessed directory goes back,
+  /// and so does the witnessed one when the new name is taken meanwhile. Between the two renames the
+  /// directory is at neither name, so each name stays old or new; a crash there leaves it aside for the
+  /// resume's sweep to put back. Before 2026-09-29 the origin was checked and then renamed straight to its
+  /// new name, where no check could say which directory had moved.
   fn rename_dir(
     &mut self,
     from: &str,
@@ -1328,24 +1627,60 @@ impl<H: LandFs> Landing<'_, H> {
     let to_dir = self.open_dir_path(to_dir_path)?;
     self.touched.insert(from_dir_path.into());
     self.touched.insert(to_dir_path.into());
+    if let Some(conflict) = self.origin_conflict(from_dir, from_name, witnessed)? {
+      return Ok(conflict);
+    }
+    self.forget_dirs_under(from);
+    let aside = self.aside_name(from);
+    match self
+      .host
+      .rename_noreplace(from_dir, from_name, from_dir, &aside)
+    {
+      Ok(()) => {}
+      Err(HostError::NotFound) => return Ok(Outcome::Conflict(ConflictClass::RenameRename)),
+      Err(e) => return Err(e.into()),
+    }
+    if self.verify_dir(from_dir, &aside, witnessed)? != Some(true) {
+      self.put_back(from_dir, from_dir_path, &aside, from_dir, from_name, from)?;
+      return Ok(Outcome::Undone(ConflictClass::TargetInUse));
+    }
+    let started = Instant::now();
+    if let Err(e) = self
+      .host
+      .rename_noreplace(from_dir, &aside, to_dir, to_name)
+    {
+      // The new name was taken meanwhile (`EEXIST`), or the host refused: the directory goes back.
+      self.put_back(from_dir, from_dir_path, &aside, from_dir, from_name, from)?;
+      return match e {
+        HostError::Unavailable(ERRNO_EXIST) => Ok(Outcome::Undone(ConflictClass::TargetInUse)),
+        e => Err(e.into()),
+      };
+    }
+    self.costs.link_ns.push(elapsed_ns(started));
+    Ok(Outcome::Written)
+  }
+
+  /// A rename's origin as it stands: `None` when it is the witnessed directory (by inode), else the
+  /// conflict the rename ends with — gone, no longer a directory, or another directory.
+  fn origin_conflict(
+    &mut self,
+    from_dir: HostDir,
+    from_name: &str,
+    witnessed: Option<&Witness>,
+  ) -> Result<Option<Outcome>, WriteFailure> {
     let origin = match self.host.open_dir(from_dir, from_name) {
       Ok(d) => d,
-      Err(HostError::NotFound) => return Ok(Outcome::Conflict(ConflictClass::RenameRename)),
-      Err(HostError::NotDirectory) => return Ok(Outcome::Conflict(ConflictClass::TypeChanged)),
+      Err(HostError::NotFound) => return Ok(Some(Outcome::Conflict(ConflictClass::RenameRename))),
+      Err(HostError::NotDirectory) => {
+        return Ok(Some(Outcome::Conflict(ConflictClass::TypeChanged)));
+      }
       Err(e) => return Err(e.into()),
     };
     let current = self.host.fingerprint_dir(origin);
     self.host.close_dir(origin);
     let matches =
       witnessed.is_some_and(|w| current.as_ref().is_ok_and(|c| c.ino == w.fingerprint.ino));
-    if !matches {
-      return Ok(Outcome::Conflict(ConflictClass::TargetInUse));
-    }
-    self.forget_dirs_under(from);
-    let started = Instant::now();
-    self.host.rename(from_dir, from_name, to_dir, to_name)?;
-    self.costs.link_ns.push(elapsed_ns(started));
-    Ok(Outcome::Written)
+    Ok((!matches).then_some(Outcome::Conflict(ConflictClass::TargetInUse)))
   }
 
   // ------------------------------------------------------------- syncing
@@ -1419,10 +1754,13 @@ impl<H: LandFs> Landing<'_, H> {
         if !self.is_own_hidden(&e.name) {
           continue;
         }
-        let gone = if e.kind == HostKind::Dir {
-          self.remove_named_tree(dir, &e.name).is_ok()
-        } else {
-          self.host.unlink(dir, &e.name).is_ok()
+        let gone = match self.aside_hash(&e.name) {
+          // An entry moved aside is removed only once checked (AUD-29-04).
+          Some(hash) => self
+            .resolve_aside(dir, &parent, &e.name, e.kind, hash, manifest)
+            .unwrap_or(false),
+          None if e.kind == HostKind::Dir => self.remove_named_tree(dir, &e.name).is_ok(),
+          None => self.host.unlink(dir, &e.name).is_ok(),
         };
         if gone {
           removed = removed.saturating_add(1);
@@ -1430,6 +1768,131 @@ impl<H: LandFs> Landing<'_, H> {
       }
     }
     Ok(removed)
+  }
+
+  /// Settles an entry a crashed attempt left moved aside at `aside` under `parent` (AUD-29-04). The witnessed
+  /// entry its manifest entry displaced is removed; for a replacement or a clear, only once the name holds
+  /// the new entry — inside the exchange fallback's window the name is absent, and the old entry goes back so
+  /// the path is old again and the resume lands it anew. This landing's own leftover (a replacement's
+  /// temporary, a clear's fresh directory) is removed. Any other entry goes back to its name, or is kept
+  /// beside it when the name is taken, as is one no manifest entry names. Whether it was removed.
+  fn resolve_aside(
+    &mut self,
+    dir: HostDir,
+    parent: &str,
+    aside: &str,
+    kind: HostKind,
+    hash: u64,
+    manifest: &Manifest,
+  ) -> Result<bool, WriteFailure> {
+    let Some(entry) = manifest.entries.iter().find(|m| {
+      let displaced = displaced_path(m);
+      path_hash(displaced) == hash && split(displaced).0 == parent
+    }) else {
+      self.keep(dir, parent, aside, &join(parent, aside))?;
+      return Ok(false);
+    };
+    let displaced = displaced_path(entry);
+    let (_, name) = split(displaced);
+    if self.aside_is_witnessed(dir, aside, entry)? {
+      // A rename's directory is never removed: it goes back to its origin (below), and the resume renames it.
+      if matches!(entry.action, Action::Rename { .. }) {
+        self.put_back(dir, parent, aside, dir, name, displaced)?;
+        return Ok(false);
+      }
+      if matches!(entry.action, Action::Replace | Action::Clear) {
+        match self.host.rename_noreplace(dir, aside, dir, name) {
+          Ok(()) => return Ok(false),
+          Err(HostError::Unavailable(ERRNO_EXIST)) => {}
+          Err(e) => return Err(e.into()),
+        }
+      }
+      if kind == HostKind::Dir {
+        self.remove_named_tree(dir, aside)?;
+      } else {
+        self.host.unlink(dir, aside)?;
+      }
+      return Ok(true);
+    }
+    if self.remove_if_own(dir, aside, kind, entry)? {
+      return Ok(true);
+    }
+    self.put_back(dir, parent, aside, dir, name, displaced)?;
+    Ok(false)
+  }
+
+  /// Whether the entry at `aside` is the witnessed entry `entry` displaces: a directory by its inode, a
+  /// replaced file as the exchange's displaced file is checked (content when its ctime moved), anything else
+  /// by its own fingerprint.
+  fn aside_is_witnessed(
+    &mut self,
+    dir: HostDir,
+    aside: &str,
+    entry: &LandingEntry,
+  ) -> Result<bool, WriteFailure> {
+    let Some(witness) = entry.witnessed.as_ref() else {
+      return Ok(false);
+    };
+    Ok(match entry.action {
+      Action::Rmdir | Action::Clear | Action::Rename { .. } => {
+        self.verify_dir(dir, aside, Some(witness))? == Some(true)
+      }
+      Action::Replace => self.verify_displaced(dir, aside, witness)?,
+      _ => self.aside_matches(dir, aside, witness)? == Some(true),
+    })
+  }
+
+  /// Removes the entry at `aside` when it is this landing's own leftover: a replacement's temporary (a file
+  /// holding the overlay's bytes) or a clear's fresh directory (removed only while empty, by `rmdir`). The one
+  /// other empty directory that can sit at an aside name is an outsider's that an exchange displaced just
+  /// before a crash; its removal loses no bytes, only that empty directory's own metadata. Whether it was
+  /// removed.
+  fn remove_if_own(
+    &mut self,
+    dir: HostDir,
+    aside: &str,
+    kind: HostKind,
+    entry: &LandingEntry,
+  ) -> Result<bool, WriteFailure> {
+    match kind {
+      HostKind::File => {
+        let ours = match entry.overlay {
+          Some(overlay) => self.file_hashes_to(dir, aside, &overlay.hash)?,
+          None => false,
+        };
+        if ours {
+          self.host.unlink(dir, aside)?;
+        }
+        Ok(ours)
+      }
+      HostKind::Dir => match self.host.rmdir(dir, aside) {
+        Ok(()) => Ok(true),
+        // Not empty: never this landing's.
+        Err(HostError::Unavailable(_)) => Ok(false),
+        Err(e) => Err(e.into()),
+      },
+      _ => Ok(false),
+    }
+  }
+
+  /// Whether the file `name` under `dir` holds bytes whose BLAKE3 is `hash` (the manifest's overlay identity).
+  fn file_hashes_to(
+    &mut self,
+    dir: HostDir,
+    name: &str,
+    hash: &[u8; 32],
+  ) -> Result<bool, HostError> {
+    let file = match self.host.open_file(dir, name) {
+      Ok(file) => file,
+      Err(HostError::NotFound | HostError::NotFile) => return Ok(false),
+      Err(e) => return Err(e),
+    };
+    let result = self
+      .host
+      .fstat(file)
+      .and_then(|current| self.hash_file(file, current.size));
+    self.host.close_file(file);
+    Ok(result? == *hash)
   }
 
   fn remove_named_tree(&mut self, dir: HostDir, name: &str) -> Result<(), WriteFailure> {
@@ -1488,12 +1951,47 @@ fn split(path: &str) -> (&str, &str) {
   }
 }
 
+/// The path of the base entry a manifest entry moves aside: a rename's origin, else the entry's own path.
+fn displaced_path(entry: &LandingEntry) -> &str {
+  match &entry.action {
+    Action::Rename { from } => from,
+    _ => &entry.path,
+  }
+}
+
+/// A manifest path's aside hash: the first eight bytes of its BLAKE3, little-endian (AUD-29-04). A collision
+/// between two paths of one landing's parent directory only makes the second move aside refuse `EEXIST`.
+fn path_hash(path: &str) -> u64 {
+  blake3::hash(path.as_bytes())
+    .as_bytes()
+    .first_chunk::<PATH_HASH_BYTES>()
+    .copied()
+    .map_or(0, u64::from_le_bytes)
+}
+
 fn join(dir: &str, name: &str) -> String {
   if dir == "/" {
     format!("/{name}")
   } else {
     format!("{dir}/{name}")
   }
+}
+
+/// One replacement in flight: the temporary holding the new bytes, where it sits, and what it replaces.
+#[derive(Clone, Copy)]
+struct Swap<'a> {
+  /// The temporary, open: its descriptor holds the inode, so the temporary is known exactly.
+  temp: HostFile,
+  /// The entry's directory.
+  dir: HostDir,
+  /// The temporary's hidden name: the entry's aside name, where the exchange leaves the displaced file.
+  hidden: &'a str,
+  /// The entry's name.
+  name: &'a str,
+  /// The entry's manifest path.
+  path: &'a str,
+  /// The witness the displaced file must match.
+  witness: &'a Witness,
 }
 
 /// A write refusal: the host's or the volume's.
@@ -1678,6 +2176,10 @@ fn land_under_lease<H: LandFs>(
     .capabilities(target.dir)
     .map_err(LandingRefusal::Target)?;
   let mut landing = Landing::start(host, target, request, caps);
+  // An earlier attempt's leftovers are settled before the verdicts are taken: an entry it left moved aside
+  // (inside an exchange fallback's or a rename's window) goes back first, so validation sees each path old or
+  // new, never missing (AUD-29-04).
+  let swept = landing.sweep(manifest).unwrap_or(0);
   let validated = landing.validate(manifest);
   let mut reports = match validated {
     Ok(r) => r,
@@ -1702,7 +2204,6 @@ fn land_under_lease<H: LandFs>(
     landing.close_dirs();
     return Err(LandingRefusal::Conflict(reports));
   }
-  let swept = landing.sweep(manifest).unwrap_or(0);
   landing.write_all(
     manifest,
     &mut reports,

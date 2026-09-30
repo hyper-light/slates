@@ -4007,10 +4007,20 @@ entry either old or new, never torn).
    `FlushFileBuffers`, `SetFileInformationByHandle(FileRenameInfoEx, REPLACE_IF_EXISTS |
    POSIX_SEMANTICS)`, and keep the target handle until the replace returns (it still names the
    old file, so the verify is free). Sparse ranges are preserved (data extents only); large files
-   are preallocated. Deletes: `unlinkat` (or `RemoveDirectory`) only after the entry's fingerprint
-   matches the witnessed base through a descriptor opened `O_NOFOLLOW`; directory renames:
-   `renameat2` / `renamex_np` / `FileRenameInfoEx` of the origin to the new name after the origin's
-   fingerprint matches.
+   are preallocated. Removals (A-43): an entry is removed only as the object moved to one of the
+   landing's own names and checked there, never by its name after a check made elsewhere. A delete,
+   a directory removal and a directory rename first require the entry's fingerprint (a directory's
+   inode) as it stands, then move it to the landing's aside name (`.slates-<landing>-aside-<path
+   hash>`) by a rename that replaces nothing (`renameat2(RENAME_NOREPLACE)`, `renameatx_np(
+   RENAME_EXCL)`), and check the entry there: an unfollowed `statat` against the witness in all but
+   the ctime the move changes. Only a match is then removed (`unlinkat`, or the tree bottom-up) or,
+   for a rename, moved to its new name by a rename that replaces nothing. Anything else goes back
+   without replacing anything, or, if its name was taken meanwhile, is kept beside it under
+   `.slates-kept-<landing>-<n>` and reported (`Degraded: Kept`); no sweep removes a kept entry. The
+   exchange's temporary and a clear's fresh directory take the aside name, so the displaced entry
+   lands there. An exchange back removes only the temporary by its descriptor's inode, or the fresh
+   directory by the identity it had at its hidden name; anything else there is kept. The seam offers
+   no rename that replaces its destination.
 7. *Concurrency inside the landing.* In-flight entries start at the measured count of the
    landing pool's cores and double while measured throughput rises by more than its variance and
    per-entry latency p99 stays within the previous step's by the measured variance fraction
@@ -4036,16 +4046,26 @@ entry either old or new, never torn).
     violated R1 even for an empty target.
 11. *Crash and resume.* Every written entry is old or new, never torn (a temporary is linked or
     exchanged only after its data sync). A crashed landing's manifest is in the anchor segment;
-    the next landing of the same snapshot into the same target re-plans, skips entries whose
-    disk hash already equals the overlay's (idempotent), and removes hidden siblings that carry
-    its landing id inside the granted target (never elsewhere). After a reboot the manifest is
-    gone; the re-plan is still idempotent by hash.
+    the next landing of the same snapshot into the same target re-plans, settles the hidden
+    siblings that carry its landing id inside the granted target (never elsewhere) before it takes
+    any verdict, then skips entries whose disk hash already equals the overlay's (idempotent). A
+    sibling at a plain hidden name is the landing's own and is removed. One at an aside name is
+    settled by its manifest entry (A-43): the witnessed entry is removed, except that a replacement's
+    or clear's goes back while its name is free, as a rename's directory always does; the landing's
+    own temporary or empty fresh directory is removed; anything else goes back, or is kept. After a
+    reboot the manifest is gone; the re-plan is still idempotent by hash.
 
 **Exchange fallback.** Where the target filesystem lacks `RENAME_EXCHANGE` (`EINVAL`) or
-`RENAME_SWAP` (`ENOTSUP`, detected by capability query), the entry is written by verify-then-
-`rename`-over: fingerprint check, then rename; the window between them is unverified and its
-measured width is written into the entry's outcome. This is a documented Degraded cell and a
-tripwire (`GAPS.md`).
+`RENAME_SWAP` (`ENOTSUP`, detected by capability query), the old entry is moved to its aside
+name by a rename that replaces nothing and checked there (a replaced file as the exchange's
+displaced file is, content when its ctime moved), then the new entry takes the name by a rename
+that replaces nothing, and only then is the old one removed (A-43). The name is absent between
+the two renames; that window's measured width is written into the entry's outcome. A name taken
+inside it sends the old entry back or, when the outsider holds the name, keeps it (`Kept`). A
+crash inside it leaves the old entry aside, and step 11 puts it back before the resume's
+verdicts, so each path is old or new again. Before 2026-09-29 the new file was renamed over the
+name after a descriptor check, which removed whatever an outsider had put there in between. This
+is a documented Degraded cell and a tripwire (`GAPS.md`).
 
 **Networking table.** None. Landings are host-local. The landing lease is the only fleet-visible
 record (a register the host writes to its candidate holders under its epoch, §4.8).
@@ -4057,10 +4077,12 @@ Grant expired or revoked mid-landing: the current entry finishes, no further ent
 ends, nothing written. Conflict at validation: Refused (`Conflict{entries}`), nothing written.
 Compare-and-swap loss during writing (an outsider replaced the file between validation and the
 exchange): that entry is exchanged back and recorded `Conflict(TargetInUse)`; the landing
-continues; the report is `Partial`. Sharing violation on Windows: same. Lease held by another
+continues; the report is `Partial`. An outsider's entry moved aside by a removal and then shut out
+of its own name by a later outsider edit: Degraded (`Kept`, the entry kept beside its name and
+listed in the report). Sharing violation on Windows: same. Lease held by another
 session: Refused (`LandingLeaseHeld{holder, generation}`). Target escapes, not owned, or inside a
 slates mount: Refused before the lease is taken. Exchange unsupported on the filesystem: Degraded
-(fallback with the window reported). Crash mid-landing: Degraded (old-or-new per entry; resume by
+(the fallback, with the window the name was absent reported). Crash mid-landing: Degraded (old-or-new per entry; resume by
 hash; hidden siblings swept). Power loss after the report: Masked (data and directory syncs
 preceded the report; on macOS only if media durability was requested, otherwise Degraded and so
 stated in the report). Disk full mid-landing: the entry fails `ENOSPC`, its sibling is removed,
@@ -4113,6 +4135,17 @@ stays in the overlay.
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
 > holding only what the manifest creates beneath it; a rename whose destination holds the
 > witnessed directory), so the re-run is idempotent for directories as it is for files.
+
+> **Status (2026-09-29, A-43, AUD-29-04).** Every removal is a move to the landing's own aside name by
+> an exchange or a rename that replaces nothing, a check there, and only then the removal. This covers
+> deletes of files, symlinks and other entries, directory removals, clears, directory renames, both
+> fallbacks and the undo paths. The seam's replacing rename is gone. Held to one set of rules by a
+> removal oracle with an outsider save armed at every seam call and at every pair of calls, over the
+> simulated host (`crates/land/tests/removal.rs`: 139 single-save and 547 pair histories) and over a
+> real Linux tmpfs directory (`crates/land/tests/os_removal.rs`). T-1.15's crash oracle now also runs
+> without the exchange: a crash inside the fallback's window leaves the old entry aside, and the resume
+> puts it back before its verdicts. Record:
+> `docs/bugs/2026-09-29-a-landing-removal-could-remove-an-outsiders-replacement.md`.
 
 **Integration points.** §4.4 (verbs, refusals, states), §4.5 (whiteouts, redirects, witnesses,
 copy-up, drift), §4.6 (base reads, invalidation on drift), §4.8 (grant, lease and
@@ -6798,3 +6831,35 @@ connection; the handoff's `activate` and `ACTIVATION_LOST` removed; `Daemon::idl
 - What it does not change: the serve loop's polling window and its doorbell protocol; the window's
   length (the shard's wake estimate × `IDLE_WINDOW_RATIO`); a request after a quiet window pays one kick,
   as before.
+
+### A-43 — A landing removes an entry only as the object it moved aside and checked (2026-09-29)
+Applied in the same change to: §4.15 (step 6's removals, step 11's resume, "Exchange fallback", the
+failure matrix, its status), `slates-vfs` (`LandFs`: `rename_noreplace` and `entry_fingerprint` added, the
+replacing `rename` removed; the simulated host's outsider edits at any seam call), `slates-land`
+(`engine.rs`, `os.rs`), `slates-base` (`OsHost::entry_fingerprint`), the landing tests (`removal.rs`,
+`os_removal.rs`, `common/removal.rs`, T-1.15 without the exchange), and GAPS.
+- Why: §4.15's compare-and-swap covered the replacement's exchange only. A delete checked a file through a
+  descriptor it then closed, and unlinked the name. A symlink was unlinked unchecked. A directory removal
+  or rename checked an inode, then moved whatever held the name. The exchange fallback renamed over the
+  name. So an outsider's save between the check and the act was removed, moved or overwritten while the
+  report said `Written` (the audit's AUD-29-04; red on the old engine for seven of nine removal kinds over
+  the simulated host, and for six over a real tmpfs directory:
+  `docs/bugs/2026-09-29-a-landing-removal-could-remove-an-outsiders-replacement.md`).
+- The rule: an entry is removed only as the object moved to one of the landing's own names and checked
+  there.
+  - Moving it: by the exchange, or by a rename that replaces nothing. The seam offers no rename that
+    replaces its destination.
+  - An entry that is not the witnessed one goes back without replacing anything, or is kept and reported
+    when its name was taken meanwhile.
+  - Undo paths remove only what they can identify as their own.
+  - A resume settles its aside names before taking any verdict.
+  - The fallback trades a name briefly absent (measured and reported, as the clear's already was) for
+    never removing an outsider's save.
+- Evidence: the removal oracle over the simulated host (139 single-save and 547 pair histories, every
+  rule non-vacuous) and over a real Linux tmpfs directory; T-1.15 without the exchange (79 crash points, 8
+  inside a window, each resumed to the reference; red when the resume's sweep follows validation or a
+  witnessed aside is removed while its name is free). The exchange path's engine cost per entry is
+  unchanged within noise (8,566–8,956 ns old, 8,836–9,029 ns new, interleaved at load 8–10).
+- What it does not change: the exchange path's verify (a changed ctime still requires the witnessed
+  bytes); a recursive removal's witness (the directory's inode; what is beneath it is removed with it, as
+  `Rmdir` is defined); hidden-sibling sweeping by landing id only.

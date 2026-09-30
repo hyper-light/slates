@@ -266,6 +266,22 @@ The workspace's own tree served as the proportionality check (AC-1.14, in the or
 worked example's sixteen entries take the same number of seam calls over a 1,000-entry base
 and a 100,000-entry one.
 
+Re-measured 2026-09-29 for A-43 (AUD-29-04). Every removal now moves the entry to a checked aside name,
+and a replacement's temporary takes a path-hashed aside name. The command is the same. The old engine
+(`9b98390`'s `engine.rs` in a worktree with the new seam) and the new one ran in three interleaved rounds
+on this machine at load average 8–10 (other sessions' KIND clusters). Land per entry, each the median of
+five runs:
+
+| Engine | Round 1 | Round 2 | Round 3 | Run range |
+|---|---|---|---|---|
+| Old | 8,678 ns | 8,956 ns | 8,566 ns | 8,083–9,274 ns |
+| New | 9,029 ns | 8,836 ns | 8,877 ns | 8,192–9,285 ns |
+
+The per-round difference, −120 to +351 ns, is inside that spread: no regression is claimed, and none
+below it is excluded. The absolute numbers sit above the 2026-09-05 row because of the load. The bench's
+delta is replacements only; the removal kinds' costs are recorded as seam calls per landing in
+`docs/bugs/2026-09-29-a-landing-removal-could-remove-an-outsiders-replacement.md`.
+
 ## Phase 2 baseline: the database (2026-09-05)
 
 Environment: as above (Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile). Command:

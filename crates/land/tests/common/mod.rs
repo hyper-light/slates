@@ -4,6 +4,8 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod removal;
+
 use slates_land::engine::{
   Audit, LandingRefusal, LandingReport, LandingRequest, LandingTarget, Observer, Presented,
   Unobserved, land,

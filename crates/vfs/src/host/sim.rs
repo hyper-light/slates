@@ -110,6 +110,35 @@ pub struct SimHost {
   synced_files: Vec<u64>,
   /// Every seam call so far, read or write, for proportionality checks (AC-1.14).
   calls: u64,
+  /// Outsider edits armed for later seam calls ([`SimHost::interfere_at_call`]): the call count each fires
+  /// at, and the edit. A test arms a handful.
+  armed: Vec<(u64, Interference)>,
+  /// What each armed edit did, in the order they fired.
+  interfered: Vec<Interfered>,
+}
+
+/// What an armed outsider edit did when it fired: the inode it created and the one it displaced from its
+/// path, so an oracle can tell an entry the outsider removed from one the landing removed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Interfered {
+  /// The inode the edit created.
+  pub created: u64,
+  /// The inode the path held before, if it held one.
+  pub displaced: Option<u64>,
+}
+
+/// An outsider's edit a test arms for one seam call: applied just before that call runs, so a landing meets
+/// it between any two of its own steps (AUD-29-04: "inject outsider replacement at every host instruction
+/// around each removal").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Interference {
+  /// The file at `path` replaced by `bytes` under a new inode (an editor's save-by-rename).
+  Replace {
+    /// The path.
+    path: String,
+    /// The outsider's bytes.
+    bytes: Vec<u8>,
+  },
 }
 
 impl Default for SimHost {
@@ -149,12 +178,49 @@ impl SimHost {
       synced_dirs: Vec::new(),
       synced_files: Vec::new(),
       calls: 0,
+      armed: Vec::new(),
+      interfered: Vec::new(),
     }
   }
 
   /// Seam calls so far.
   pub fn calls(&self) -> u64 {
     self.calls
+  }
+
+  /// Arms `edit` to happen just before the `n`-th seam call from now (0 is the very next), read or write.
+  /// Several may be armed; two armed for one call fire in the order they were armed.
+  pub fn interfere_at_call(&mut self, n: u64, edit: Interference) {
+    self
+      .armed
+      .push((self.calls.saturating_add(n).saturating_add(1), edit));
+  }
+
+  /// Whether every armed edit has happened (a test's non-vacuity check).
+  pub fn interfered(&self) -> bool {
+    self.armed.is_empty()
+  }
+
+  /// What the armed edits did, in the order they fired.
+  pub fn interferences(&self) -> &[Interfered] {
+    &self.interfered
+  }
+
+  /// One seam call: counted, and the outsider edits armed for it applied first.
+  fn tick(&mut self) {
+    self.calls += 1;
+    let now = self.calls;
+    let due: Vec<Interference> = self
+      .armed
+      .extract_if(.., |(at, _)| *at == now)
+      .map(|(_, edit)| edit)
+      .collect();
+    for edit in due {
+      let done = match edit {
+        Interference::Replace { path, bytes } => self.replace_file_reporting(&path, &bytes),
+      };
+      self.interfered.push(done);
+    }
   }
 
   // ---------------------------------------------------------------- landing controls
@@ -213,7 +279,7 @@ impl SimHost {
 
   /// One write verb: refuses once the crash point is reached.
   fn write_step(&mut self) -> Result<(), HostError> {
-    self.calls += 1;
+    self.tick();
     if self.crashed {
       return Err(HostError::Unavailable(SIM_EIO));
     }
@@ -351,6 +417,11 @@ impl SimHost {
 
   /// Creates or replaces a file with a new inode (what an editor's save-by-rename does).
   pub fn replace_file(&mut self, path: &str, bytes: &[u8]) {
+    self.replace_file_reporting(path, bytes);
+  }
+
+  /// [`SimHost::replace_file`], saying which inode it created and which it displaced.
+  fn replace_file_reporting(&mut self, path: &str, bytes: &[u8]) -> Interfered {
     let parts = Self::split(path);
     let (name, parent) = parts
       .split_last()
@@ -358,12 +429,18 @@ impl SimHost {
       .unwrap_or_default();
     let mut node = self.fresh(HostKind::File);
     node.bytes = bytes.to_vec();
+    let mut done = Interfered {
+      created: node.ino,
+      displaced: None,
+    };
     if let Some(p) = self.node_mut(&parent)
       && let Some(old) = p.children.insert(name, node)
     {
+      done.displaced = Some(old.ino);
       self.retired.insert(old.ino, old);
     }
     self.touch_parent(&parent);
+    done
   }
 
   /// Overwrites a file in place, same inode, timestamps advanced by `dt_ns` (zero keeps them,
@@ -504,7 +581,7 @@ impl SimHost {
 
 impl HostFs for SimHost {
   fn facts(&mut self, dir: HostDir) -> Result<HostFacts, HostError> {
-    self.calls += 1;
+    self.tick();
     self.dir_parts(dir)?;
     Ok(HostFacts {
       timestamp_granularity_ns: self.granularity_ns,
@@ -512,7 +589,7 @@ impl HostFs for SimHost {
   }
 
   fn fingerprint_dir(&mut self, dir: HostDir) -> Result<Fingerprint, HostError> {
-    self.calls += 1;
+    self.tick();
     let parts = self.dir_parts(dir)?;
     self
       .node(&parts)
@@ -521,7 +598,7 @@ impl HostFs for SimHost {
   }
 
   fn list(&mut self, dir: HostDir) -> Result<Vec<BaseEntry>, HostError> {
-    self.calls += 1;
+    self.tick();
     let parts = self.dir_parts(dir)?;
     let node = self.node(&parts).ok_or(HostError::NotFound)?;
     if node.kind != HostKind::Dir {
@@ -541,7 +618,7 @@ impl HostFs for SimHost {
   }
 
   fn open_dir(&mut self, parent: HostDir, name: &str) -> Result<HostDir, HostError> {
-    self.calls += 1;
+    self.tick();
     let mut parts = self.dir_parts(parent)?;
     parts.push(name.into());
     match self.node(&parts) {
@@ -556,7 +633,7 @@ impl HostFs for SimHost {
   }
 
   fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
-    self.calls += 1;
+    self.tick();
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
     let node = match self.node(&parts) {
@@ -578,12 +655,29 @@ impl HostFs for SimHost {
   }
 
   fn fstat(&mut self, file: HostFile) -> Result<Fingerprint, HostError> {
-    self.calls += 1;
+    self.tick();
+    if let Some(Open::Temp { node, placed }) = self.opens.get(&file.0) {
+      // A temporary's own inode wherever its names have moved (an exchange moves them), as `fstat` on its
+      // descriptor reports it; the landing checks an undo's temporary by it (AUD-29-04).
+      let ino = node.ino;
+      let live = placed
+        .as_ref()
+        .and_then(|path| {
+          self
+            .node(path)
+            .filter(|n| n.ino == ino)
+            .cloned()
+            .or_else(|| self.sibling_with_ino(path, ino))
+        })
+        .or_else(|| self.find_ino(ino))
+        .unwrap_or_else(|| node.clone());
+      return Ok(live.fingerprint());
+    }
     Ok(self.live_node(file)?.fingerprint())
   }
 
   fn read_at(&mut self, file: HostFile, off: u64, buf: &mut [u8]) -> Result<usize, HostError> {
-    self.calls += 1;
+    self.tick();
     let node = self.live_node(file)?;
     let off = usize::try_from(off).unwrap_or(usize::MAX);
     if off >= node.bytes.len() {
@@ -595,7 +689,7 @@ impl HostFs for SimHost {
   }
 
   fn read_link(&mut self, dir: HostDir, name: &str) -> Result<Box<str>, HostError> {
-    self.calls += 1;
+    self.tick();
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
     match self.node(&parts) {
@@ -626,7 +720,7 @@ impl HostFs for SimHost {
   }
 
   fn now_ns(&mut self) -> i64 {
-    self.calls += 1;
+    self.tick();
     self.now_ns
   }
 }
@@ -871,7 +965,7 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  fn rename(
+  fn rename_noreplace(
     &mut self,
     dir: HostDir,
     from: &str,
@@ -881,13 +975,32 @@ impl LandFs for SimHost {
     self.write_step()?;
     let f = self.entry_parts(dir, from)?;
     let t = self.entry_parts(to_dir, to)?;
-    let from_path = format!("/{}", f.join("/"));
-    let to_path = format!("/{}", t.join("/"));
     if self.node(&f).is_none() {
       return Err(HostError::NotFound);
     }
-    SimHost::rename(self, &from_path, &to_path);
+    if self.node(&t).is_some() {
+      return Err(HostError::Unavailable(SIM_EEXIST));
+    }
+    let now = self.now_ns;
+    SimHost::rename(
+      self,
+      &format!("/{}", f.join("/")),
+      &format!("/{}", t.join("/")),
+    );
+    // A rename changes the moved inode's ctime, as Linux does.
+    if let Some(moved) = self.node_mut(&t) {
+      moved.ctime_ns = now;
+    }
     Ok(())
+  }
+
+  fn entry_fingerprint(&mut self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    self.tick();
+    let parts = self.entry_parts(dir, name)?;
+    self
+      .node(&parts)
+      .map(SimNode::fingerprint)
+      .ok_or(HostError::NotFound)
   }
 
   fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {

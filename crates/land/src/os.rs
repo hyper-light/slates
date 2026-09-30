@@ -262,20 +262,70 @@ fn exchange_names(dir: BorrowedFd<'_>, a: &str, b: &str) -> Result<(), HostError
 /// The exchange: macOS `renameatx_np(RENAME_SWAP)`.
 #[cfg(target_os = "macos")]
 fn exchange_names(dir: BorrowedFd<'_>, a: &str, b: &str) -> Result<(), HostError> {
+  renameatx(dir, a, dir, b, libc::RENAME_SWAP)
+}
+
+/// A rename that never replaces (AUD-29-04): Linux `renameat2(RENAME_NOREPLACE)`, refused `EEXIST` when
+/// `to` exists.
+#[cfg(target_os = "linux")]
+fn rename_without_replacing(
+  dir: BorrowedFd<'_>,
+  from: &str,
+  to_dir: BorrowedFd<'_>,
+  to: &str,
+) -> Result<(), HostError> {
+  rustix::fs::renameat_with(dir, from, to_dir, to, rustix::fs::RenameFlags::NOREPLACE)
+    .map_err(refusal)
+}
+
+/// A rename that never replaces: macOS `renameatx_np(RENAME_EXCL)`, refused `EEXIST` when `to` exists.
+#[cfg(target_os = "macos")]
+fn rename_without_replacing(
+  dir: BorrowedFd<'_>,
+  from: &str,
+  to_dir: BorrowedFd<'_>,
+  to: &str,
+) -> Result<(), HostError> {
+  renameatx(dir, from, to_dir, to, libc::RENAME_EXCL)
+}
+
+/// Where neither exists, the rename that never replaces is unavailable: a removal refuses rather than race.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn rename_without_replacing(
+  _dir: BorrowedFd<'_>,
+  _from: &str,
+  _to_dir: BorrowedFd<'_>,
+  _to: &str,
+) -> Result<(), HostError> {
+  Err(HostError::Unavailable(
+    rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+  ))
+}
+
+/// macOS `renameatx_np` from `a` under `dir` to `b` under `to_dir`, with `flag` (`RENAME_SWAP` or
+/// `RENAME_EXCL`).
+#[cfg(target_os = "macos")]
+fn renameatx(
+  dir: BorrowedFd<'_>,
+  a: &str,
+  to_dir: BorrowedFd<'_>,
+  b: &str,
+  flag: libc::c_uint,
+) -> Result<(), HostError> {
   let a = std::ffi::CString::new(a)
     .map_err(|_| HostError::Unavailable(rustix::io::Errno::INVAL.raw_os_error()))?;
   let b = std::ffi::CString::new(b)
     .map_err(|_| HostError::Unavailable(rustix::io::Errno::INVAL.raw_os_error()))?;
-  // SAFETY: `dir` is a directory descriptor this host owns for the call's duration; `a` and
+  // SAFETY: `dir` and `to_dir` are directory descriptors this host owns for the call's duration; `a` and
   // `b` are NUL-terminated C strings that outlive the call; `renameatx_np` reads them and
   // writes nothing to memory the caller holds.
   let rc = unsafe {
     libc::renameatx_np(
       dir.as_raw_fd(),
       a.as_ptr(),
-      dir.as_raw_fd(),
+      to_dir.as_raw_fd(),
       b.as_ptr(),
-      libc::RENAME_SWAP,
+      flag,
     )
   };
   if rc == 0 {
@@ -475,14 +525,18 @@ impl LandFs for OsLand {
     exchange_names(self.dir(dir)?, a, b)
   }
 
-  fn rename(
+  fn rename_noreplace(
     &mut self,
     dir: HostDir,
     from: &str,
     to_dir: HostDir,
     to: &str,
   ) -> Result<(), HostError> {
-    rustix::fs::renameat(self.dir(dir)?, from, self.dir(to_dir)?, to).map_err(refusal)
+    rename_without_replacing(self.dir(dir)?, from, self.dir(to_dir)?, to)
+  }
+
+  fn entry_fingerprint(&mut self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    self.host.entry_fingerprint(dir, name)
   }
 
   fn unlink(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {
