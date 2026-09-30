@@ -138,8 +138,11 @@ pub enum ContentMessage {
   },
   /// The holder's bound acknowledgement of a put it verified and holds whole.
   Ack(ContentAck),
-  /// A reader asks for a manifest's whole archive by identity.
+  /// A reader asks for a manifest's whole archive by identity, **for an object**: a holder serves it only
+  /// to a host with authority over that object, and only from what it holds for that object (AUD-29-45).
   Fetch {
+    /// The object whose content is asked for.
+    object: ObjectId,
     /// The manifest identity.
     manifest: [u8; 32],
   },
@@ -339,8 +342,9 @@ impl ContentMessage {
         out.extend_from_slice(&ack.sequence.to_le_bytes());
         out.extend_from_slice(&ack.manifest);
       }
-      ContentMessage::Fetch { manifest } => {
+      ContentMessage::Fetch { object, manifest } => {
         out.push(KIND_FETCH);
+        out.extend_from_slice(&object.0);
         out.extend_from_slice(manifest);
       }
       ContentMessage::Have { archive } => {
@@ -381,6 +385,7 @@ impl ContentMessage {
         manifest: reader.hash()?,
       }),
       KIND_FETCH => ContentMessage::Fetch {
+        object: reader.object()?,
         manifest: reader.hash()?,
       },
       KIND_HAVE => ContentMessage::Have {
@@ -460,15 +465,38 @@ fn with_chunks(archive: &Archive, chunks: Vec<Chunk>) -> Archive {
   }
 }
 
-/// What a node holds as a content candidate for other owners' snapshots (§4.10): the distinct chunks
-/// by identity (deduplicated across every manifest held) and each held manifest by its identity, with
-/// the archive header it arrived under so the whole archive can be reassembled for a reader. Serves
-/// the holder side of every content exchange ([`ContentHold::serve`]); every archive is verified
-/// before anything is stored, and a manifest is held only once every chunk it references is.
+/// What a request asks of a holder, for the authority check that precedes any lookup (AUD-29-45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentAccess {
+  /// Placing content for an object: an offer (which asks what the holder lacks) or a put.
+  Place,
+  /// Reading an object's content back: a fetch.
+  Read,
+}
+
+/// What a node holds as a content candidate for other owners' snapshots (§4.10), **scoped by object**
+/// (§4.13 "Content identity and sharing"; AUD-29-45). A chunk hash proves bytes, not permission to read them
+/// or to ask whether they exist: every answer — the missing set an offer draws, which already-held chunks a
+/// put may lean on, the archive a fetch returns — is computed from what this node holds **for the object the
+/// request names**, and only after the caller's authority check for that object passed. The bytes themselves
+/// are kept once whatever objects reference them (a shared store, one reference per object), so dedup saves
+/// memory without answering across objects. A refused or unheld request draws the same empty reply, so an
+/// answer never reveals whether another object's content exists. Every archive is verified before anything is
+/// stored, and a manifest is held only once every chunk it references is held for its object.
 #[derive(Debug, Default)]
 pub struct ContentHold {
   store: ContentStore,
+  objects: BTreeMap<ObjectId, Held>,
+  /// Requests refused by the authority check (a non-vacuity counter for the scope).
+  unauthorized: u64,
+}
+
+/// One object's held content: its manifests (each with the archive header it arrived under) and how many of
+/// them reference each chunk.
+#[derive(Debug, Default)]
+struct Held {
   manifests: BTreeMap<[u8; 32], Archive>,
+  chunks: BTreeMap<[u8; 32], u64>,
 }
 
 impl ContentHold {
@@ -477,9 +505,21 @@ impl ContentHold {
     ContentHold::default()
   }
 
-  /// Whether the manifest with `identity` is held whole.
-  pub fn holds_manifest(&self, identity: &[u8; 32]) -> bool {
-    self.manifests.contains_key(identity)
+  /// Whether the manifest with `identity` is held whole for `object`.
+  pub fn holds_manifest(&self, object: ObjectId, identity: &[u8; 32]) -> bool {
+    self
+      .objects
+      .get(&object)
+      .is_some_and(|held| held.manifests.contains_key(identity))
+  }
+
+  /// Whether any object's content includes the manifest with `identity` — an operator's and a test's view of
+  /// this node, never an answer on the wire.
+  pub fn holds_manifest_for_any_object(&self, identity: &[u8; 32]) -> bool {
+    self
+      .objects
+      .values()
+      .any(|held| held.manifests.contains_key(identity))
   }
 
   /// The distinct chunks held — the non-vacuity counter a test reads (a put of one missing chunk
@@ -488,64 +528,120 @@ impl ContentHold {
     self.store.unique_count()
   }
 
-  /// The manifests held.
+  /// The manifests held, across objects.
   pub fn manifest_count(&self) -> usize {
-    self.manifests.len()
+    self.objects.values().map(|held| held.manifests.len()).sum()
   }
 
-  /// Of `chunks`, the identities this hold lacks — the missing set an offer is answered with.
-  pub fn missing_of(&self, chunks: &[[u8; 32]]) -> Vec<[u8; 32]> {
+  /// Requests the authority check refused.
+  pub fn unauthorized(&self) -> u64 {
+    self.unauthorized
+  }
+
+  /// Of `chunks`, the identities this hold lacks **for `object`** — the missing set an offer is answered
+  /// with. A chunk held only for another object counts as lacking: its presence is not this object's to know.
+  pub fn missing_of(&self, object: ObjectId, chunks: &[[u8; 32]]) -> Vec<[u8; 32]> {
+    let held = self.objects.get(&object);
     chunks
       .iter()
       .copied()
-      .filter(|identity| !self.store.contains(identity))
+      .filter(|identity| !held.is_some_and(|held| held.chunks.contains_key(identity)))
       .collect()
   }
 
-  /// Holds `archive` — every chunk it ships verified against its identity, every chunk its manifest
-  /// references required to be shipped or already held — and returns the manifest identity now held.
-  /// Nothing is stored on a refusal.
-  pub fn hold(&mut self, archive: Archive) -> Result<[u8; 32], ContentRefusal> {
+  /// Holds `archive` for `object` — every chunk it ships verified against its identity, every chunk its
+  /// manifest references required to be shipped or already held **for this object** — and returns the
+  /// manifest identity now held. Nothing is stored on a refusal; holding a manifest already held is a no-op.
+  pub fn hold(&mut self, object: ObjectId, archive: Archive) -> Result<[u8; 32], ContentRefusal> {
     if !archive.chunks.iter().all(verified) {
       return Err(ContentRefusal::IdentityMismatch);
     }
-    let shipped: BTreeSet<[u8; 32]> = archive.chunks.iter().map(|chunk| chunk.identity).collect();
-    let missing = referenced_chunks(&archive.manifest)
-      .into_iter()
-      .filter(|identity| !shipped.contains(identity) && !self.store.contains(identity))
+    let held = self.objects.entry(object).or_default();
+    let mut shipped: BTreeMap<[u8; 32], Chunk> = archive
+      .chunks
+      .iter()
+      .map(|chunk| (chunk.identity, chunk.clone()))
+      .collect();
+    let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&archive.manifest).into_iter().collect();
+    let missing = referenced
+      .iter()
+      .filter(|identity| !shipped.contains_key(*identity) && !held.chunks.contains_key(*identity))
       .count();
     if missing > 0 {
+      if held.manifests.is_empty() && held.chunks.is_empty() {
+        self.objects.remove(&object);
+      }
       return Err(ContentRefusal::Incomplete { missing });
     }
     let identity = archive.manifest_identity();
-    let record = with_chunks(&archive, Vec::new());
-    for chunk in archive.chunks {
-      self.store.insert(chunk);
+    if held.manifests.contains_key(&identity) {
+      return Ok(identity);
     }
-    self.manifests.insert(identity, record);
+    for chunk_identity in &referenced {
+      let references = held.chunks.entry(*chunk_identity).or_insert(0);
+      if *references == 0
+        && let Some(chunk) = shipped.remove(chunk_identity)
+      {
+        self.store.insert(chunk);
+      }
+      *references = references.saturating_add(1);
+    }
+    held
+      .manifests
+      .insert(identity, with_chunks(&archive, Vec::new()));
     Ok(identity)
   }
 
-  /// Forgets a held manifest: its record is dropped and each chunk it references loses one reference
-  /// (a chunk no other held manifest references is evicted, so the store's accounting stays exact).
-  /// Returns whether the manifest was held. This is what a holder's **content loss** looks like from
-  /// the owner's side — in a real deployment a restart (a RAM-only node holds nothing after one, §4.8
-  /// "Recovery"); in-process, a test's injection — the condition the healer repairs (§4.10
-  /// "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from the wire.
-  pub fn forget_manifest(&mut self, identity: &[u8; 32]) -> bool {
-    let Some(record) = self.manifests.remove(identity) else {
+  /// Forgets a manifest held for `object`: its record is dropped and each chunk it references loses one of
+  /// the object's references (a chunk the object no longer references gives back its store reference, and
+  /// the bytes go when no object references them). Returns whether the manifest was held. This is what a
+  /// holder's **content loss** looks like from the owner's side — in a real deployment a restart (a RAM-only
+  /// node holds nothing after one, §4.8 "Recovery"); in-process, a test's injection — the condition the
+  /// healer repairs (§4.10 "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from
+  /// the wire.
+  pub fn forget_manifest(&mut self, object: ObjectId, identity: &[u8; 32]) -> bool {
+    let Some(held) = self.objects.get_mut(&object) else {
       return false;
     };
-    for referenced in referenced_chunks(&record.manifest) {
-      self.store.release(&referenced);
+    let Some(record) = held.manifests.remove(identity) else {
+      return false;
+    };
+    let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&record.manifest).into_iter().collect();
+    for chunk_identity in referenced {
+      if let Some(references) = held.chunks.get_mut(&chunk_identity) {
+        *references = references.saturating_sub(1);
+        if *references == 0 {
+          held.chunks.remove(&chunk_identity);
+          self.store.release(&chunk_identity);
+        }
+      }
+    }
+    if held.manifests.is_empty() {
+      self.objects.remove(&object);
     }
     true
   }
 
-  /// The whole archive for a held manifest — its header, manifest, and every referenced chunk in
-  /// reference order — or `None` if the manifest is not held whole.
-  pub fn archive_of(&self, identity: &[u8; 32]) -> Option<Archive> {
-    let record = self.manifests.get(identity)?;
+  /// Forgets the manifest with `identity` for every object holding it (a test's injection of content loss,
+  /// [`forget_manifest`](Self::forget_manifest)); whether any held it.
+  pub fn forget_manifest_for_every_object(&mut self, identity: &[u8; 32]) -> bool {
+    let holding: Vec<ObjectId> = self
+      .objects
+      .iter()
+      .filter(|(_, held)| held.manifests.contains_key(identity))
+      .map(|(object, _)| *object)
+      .collect();
+    let mut forgot = false;
+    for object in holding {
+      forgot |= self.forget_manifest(object, identity);
+    }
+    forgot
+  }
+
+  /// The whole archive for a manifest held for `object` — its header, manifest, and every referenced chunk
+  /// in reference order — or `None` if it is not held whole for that object.
+  pub fn archive_of(&self, object: ObjectId, identity: &[u8; 32]) -> Option<Archive> {
+    let record = self.objects.get(&object)?.manifests.get(identity)?;
     let mut chunks = Vec::new();
     for referenced in referenced_chunks(&record.manifest) {
       chunks.push(self.store.get(&referenced)?.clone());
@@ -553,29 +649,52 @@ impl ContentHold {
     Some(with_chunks(record, chunks))
   }
 
-  /// Serves one content request as `holder`: an offer is answered with the missing set, a put with a
-  /// bound acknowledgement once verified and held whole, a fetch with the whole archive; anything
-  /// malformed, unverifiable or incomplete is answered with an empty reply (the owner counts nothing).
-  pub fn serve(&mut self, holder: HostId, request: &[u8]) -> Vec<u8> {
-    match ContentMessage::decode(request) {
-      Ok(ContentMessage::Offer {
+  /// Serves one content request as `holder`, once `authorized` has allowed the access it asks for the object
+  /// it names (checked before any lookup or allocation): an offer is answered with the object's missing set,
+  /// a put with a bound acknowledgement once verified and held whole, a fetch with the object's archive.
+  /// Anything refused, malformed, unverifiable, incomplete or unheld is answered with the same empty reply.
+  pub fn serve(
+    &mut self,
+    holder: HostId,
+    request: &[u8],
+    authorized: impl FnOnce(ContentAccess, ObjectId) -> bool,
+  ) -> Vec<u8> {
+    let Ok(message) = ContentMessage::decode(request) else {
+      return Vec::new();
+    };
+    let asked = match &message {
+      ContentMessage::Offer { object, .. } | ContentMessage::Put { object, .. } => {
+        Some((ContentAccess::Place, *object))
+      }
+      ContentMessage::Fetch { object, .. } => Some((ContentAccess::Read, *object)),
+      _ => None,
+    };
+    let Some((access, object)) = asked else {
+      return Vec::new();
+    };
+    if !authorized(access, object) {
+      self.unauthorized = self.unauthorized.saturating_add(1);
+      return Vec::new();
+    }
+    match message {
+      ContentMessage::Offer {
         object,
         sequence,
         manifest,
         chunks,
-      }) => ContentMessage::Missing {
+      } => ContentMessage::Missing {
         object,
         sequence,
         manifest,
-        missing: self.missing_of(&chunks),
+        missing: self.missing_of(object, &chunks),
       }
       .encode(),
-      Ok(ContentMessage::Put {
+      ContentMessage::Put {
         object,
         sequence,
         archive,
-      }) => match Archive::decode(&archive).map_err(ContentRefusal::Malformed) {
-        Ok(archive) => match self.hold(archive) {
+      } => match Archive::decode(&archive).map_err(ContentRefusal::Malformed) {
+        Ok(archive) => match self.hold(object, archive) {
           Ok(manifest) => ContentMessage::Ack(ContentAck {
             holder,
             object,
@@ -587,7 +706,7 @@ impl ContentHold {
         },
         Err(_) => Vec::new(),
       },
-      Ok(ContentMessage::Fetch { manifest }) => match self.archive_of(&manifest) {
+      ContentMessage::Fetch { object, manifest } => match self.archive_of(object, &manifest) {
         Some(archive) => ContentMessage::Have {
           archive: archive.encode(),
         }
@@ -874,10 +993,11 @@ pub async fn put_content(
 /// and the endpoint for reuse whatever the outcome.
 pub async fn fetch_content(
   endpoint: Endpoint,
+  object: ObjectId,
   manifest: [u8; 32],
   deadline_ns: u64,
 ) -> (Option<Archive>, Endpoint) {
-  let request = ContentMessage::Fetch { manifest }.encode();
+  let request = ContentMessage::Fetch { object, manifest }.encode();
   let (reply, endpoint) = request_within(
     endpoint,
     CONTENT_FETCH_STREAM,
@@ -971,7 +1091,10 @@ mod tests {
         sequence: SEQUENCE,
         manifest: hash(1),
       }),
-      ContentMessage::Fetch { manifest: hash(1) },
+      ContentMessage::Fetch {
+        object: OBJECT,
+        manifest: hash(1),
+      },
       ContentMessage::Have {
         archive: vec![1, 2],
       },
@@ -1047,7 +1170,11 @@ mod tests {
       ContentMessage::decode(&[0xEE]),
       Err(ContentError::UnknownKind { kind: 0xEE })
     );
-    let mut fetch = ContentMessage::Fetch { manifest: hash(1) }.encode();
+    let mut fetch = ContentMessage::Fetch {
+      object: OBJECT,
+      manifest: hash(1),
+    }
+    .encode();
     fetch.push(0);
     assert_eq!(ContentMessage::decode(&fetch), Err(ContentError::BadLength));
   }
@@ -1060,22 +1187,22 @@ mod tests {
     let archive = two_chunk_archive();
     let identities: Vec<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
     let mut hold = ContentHold::new();
-    assert_eq!(hold.missing_of(&identities), identities);
+    assert_eq!(hold.missing_of(OBJECT, &identities), identities);
 
     let partial = with_chunks(&archive, vec![archive.chunks[0].clone()]);
     assert_eq!(
-      hold.hold(partial),
+      hold.hold(OBJECT, partial),
       Err(ContentRefusal::Incomplete { missing: 1 }),
       "a manifest referencing an unshipped, unheld chunk is not held"
     );
     assert_eq!(hold.chunk_count(), 0, "nothing stored on a refusal");
 
-    let manifest = hold.hold(archive.clone()).unwrap();
+    let manifest = hold.hold(OBJECT, archive.clone()).unwrap();
     assert_eq!(manifest, archive.manifest_identity());
-    assert!(hold.holds_manifest(&manifest));
+    assert!(hold.holds_manifest(OBJECT, &manifest));
     assert_eq!(hold.chunk_count(), 2);
-    assert!(hold.missing_of(&identities).is_empty());
-    let whole = hold.archive_of(&manifest).unwrap();
+    assert!(hold.missing_of(OBJECT, &identities).is_empty());
+    let whole = hold.archive_of(OBJECT, &manifest).unwrap();
     assert_eq!(
       whole.encode(),
       archive.encode(),
@@ -1101,7 +1228,7 @@ mod tests {
       chunk: archive.chunks[0].identity,
       chunk_offset: 0,
     }]);
-    hold.hold(earlier).unwrap();
+    hold.hold(OBJECT, earlier).unwrap();
 
     let offer = ContentMessage::Offer {
       object: OBJECT,
@@ -1110,7 +1237,7 @@ mod tests {
       chunks: archive.chunks.iter().map(|c| c.identity).collect(),
     };
     let Ok(ContentMessage::Missing { missing, .. }) =
-      ContentMessage::decode(&hold.serve(holder, &offer.encode()))
+      ContentMessage::decode(&hold.serve(holder, &offer.encode(), |_, _| true))
     else {
       panic!("an offer is answered with the missing set");
     };
@@ -1127,6 +1254,7 @@ mod tests {
         archive: corrupt.encode(),
       }
       .encode(),
+      |_, _| true,
     );
     assert!(refused.is_empty(), "a corrupt chunk is refused, not held");
     assert_eq!(hold.chunk_count(), 1);
@@ -1140,6 +1268,7 @@ mod tests {
         archive: partial.encode(),
       }
       .encode(),
+      |_, _| true,
     );
     let Ok(ContentMessage::Ack(ack)) = ContentMessage::decode(&reply) else {
       panic!("a complete put is acknowledged");
@@ -1152,9 +1281,11 @@ mod tests {
     let fetched = hold.serve(
       holder,
       &ContentMessage::Fetch {
+        object: OBJECT,
         manifest: archive.manifest_identity(),
       }
       .encode(),
+      |_, _| true,
     );
     let Ok(ContentMessage::Have { archive: bytes }) = ContentMessage::decode(&fetched) else {
       panic!("a fetch is answered with the archive");
@@ -1165,12 +1296,105 @@ mod tests {
         .serve(
           holder,
           &ContentMessage::Fetch {
+            object: OBJECT,
             manifest: hash(0xCC)
           }
-          .encode()
+          .encode(),
+          |_, _| true,
         )
         .is_empty(),
       "a manifest not held is an empty answer"
     );
+  }
+
+  /// A second object, for the scoping tests.
+  const OTHER: ObjectId = ObjectId([9; OBJECT_BYTES]);
+
+  /// AUD-29-45 (§4.13 "Content identity and sharing"): do: hold one object's archive, then ask about the same
+  /// chunks and manifest for another object — an offer's missing set, a put leaning on them unshipped, a
+  /// fetch; expect every answer as if nothing were held: the chunks missing, the put refused incomplete, the
+  /// fetch empty — while the first object's own answers are unchanged, and the bytes stored once.
+  #[test]
+  fn another_objects_content_is_neither_revealed_nor_lent() {
+    let archive = two_chunk_archive();
+    let identities: Vec<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
+    let mut hold = ContentHold::new();
+    let manifest = hold.hold(OBJECT, archive.clone()).unwrap();
+    assert_eq!(hold.missing_of(OTHER, &identities), identities);
+    let leaning = with_chunks(&archive, Vec::new());
+    assert_eq!(
+      hold.hold(OTHER, leaning),
+      Err(ContentRefusal::Incomplete { missing: 2 })
+    );
+    assert!(hold.archive_of(OTHER, &manifest).is_none());
+    let fetched = hold.serve(
+      HostId(3),
+      &ContentMessage::Fetch {
+        object: OTHER,
+        manifest,
+      }
+      .encode(),
+      |_, _| true,
+    );
+    assert!(
+      fetched.is_empty(),
+      "another object's manifest is not served"
+    );
+    assert!(hold.missing_of(OBJECT, &identities).is_empty());
+    hold.hold(OTHER, archive).unwrap();
+    assert_eq!(
+      hold.chunk_count(),
+      2,
+      "the bytes are kept once for both objects"
+    );
+    assert!(hold.forget_manifest(OBJECT, &manifest));
+    assert!(
+      hold.archive_of(OTHER, &manifest).is_some(),
+      "forgetting one object's copy keeps the other's"
+    );
+  }
+
+  /// AUD-29-45: do: serve an offer, a put and a fetch whose authority check refuses; expect the same empty
+  /// reply an unheld request draws, nothing stored, the check asked with the right access and object, and
+  /// each refusal counted.
+  #[test]
+  fn a_refused_authority_draws_the_empty_reply_and_is_counted() {
+    let archive = two_chunk_archive();
+    let mut hold = ContentHold::new();
+    let requests = [
+      (
+        ContentAccess::Place,
+        ContentMessage::Offer {
+          object: OBJECT,
+          sequence: SEQUENCE,
+          manifest: archive.manifest_identity(),
+          chunks: archive.chunks.iter().map(|c| c.identity).collect(),
+        },
+      ),
+      (
+        ContentAccess::Place,
+        ContentMessage::Put {
+          object: OBJECT,
+          sequence: SEQUENCE,
+          archive: archive.encode(),
+        },
+      ),
+      (
+        ContentAccess::Read,
+        ContentMessage::Fetch {
+          object: OBJECT,
+          manifest: archive.manifest_identity(),
+        },
+      ),
+    ];
+    for (expected, request) in &requests {
+      let reply = hold.serve(HostId(4), &request.encode(), |access, object| {
+        assert_eq!((access, object), (*expected, OBJECT));
+        false
+      });
+      assert!(reply.is_empty());
+    }
+    assert_eq!(hold.chunk_count(), 0);
+    assert_eq!(hold.unauthorized(), 3);
   }
 }

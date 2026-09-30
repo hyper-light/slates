@@ -3990,6 +3990,23 @@ sharing scope and reference authorization; cross-scope existence and timing must
 private data. Slates does not copy Hecate's disk-at-rest layout or salt scheme merely because
 it uses content addressing. The RAM-only trust boundary and any allowed sharing are explicit.
 
+> **Status (2026-09-30, AUD-29-45, in part).** A holder answers content requests per object, under the
+> object's authority.
+> - **Bound to the object.** Every offer, put and fetch names its object (`Fetch` gained it). The holder
+>   decides authority from the committed configuration and its own records before any lookup or allocation.
+>   - A placement needs the object's acting owner (its owner, or a departed owner's takeover successor) and
+>     must land on that owner's candidates.
+>   - A read needs the acting owner, one of its candidates, or a holder of its recovery cohort.
+> - **Scoped answers.** Answers come only from what the holder holds for that object: another object's
+>   chunks count as missing, cannot be leaned on by a put, and are never fetched. A refused request draws the
+>   same empty reply as an unheld one, and is counted.
+> - **Dedup.** Chunk bytes are still stored once across objects, with exact per-object references.
+> - **Residual.** A put of a chunk another object already holds skips one allocation. That timing difference
+>   is below a microsecond and masked by the verification every shipped chunk undergoes, but it is not zero.
+> - **Owed.** The requesting consumer's scope across hosts is owed with the fleet delegation. Consumers are
+>   separated on the host that issues the request.
+> - Record: `docs/bugs/2026-09-30-content-hashes-authorized-fleet-content-requests.md`.
+
 ### 4.14 Observability (D-23)
 
 > **Status (2026-09-09).** The chokepoint-span roster and the three distinct identity types are built

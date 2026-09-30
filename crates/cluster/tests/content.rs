@@ -124,7 +124,8 @@ async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
 async fn serve_bounded(endpoint: &mut Endpoint, held: &mut ContentHold) -> bool {
   use std::future::Future;
   use std::task::Poll;
-  let mut serving = std::pin::pin!(endpoint.serve_once(|_, request| held.serve(HOLDER, &request)));
+  let mut serving =
+    std::pin::pin!(endpoint.serve_once(|_, request| held.serve(HOLDER, &request, |_, _| true)));
   let mut deadline = std::pin::pin!(slates_rt::futures::sleep(COLLECTION_NS * 2));
   std::future::poll_fn(|context| {
     if let Poll::Ready(result) = serving.as_mut().poll(context) {
@@ -190,7 +191,7 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
       // The put's reply is in flight when the serve returns; settle it before the session drops.
       let _ = settle_within(&mut endpoint, COLLECTION_NS * 2).await;
       held_tx
-        .send(held.holds_manifest(&archive().manifest_identity()))
+        .send(held.holds_manifest_for_any_object(&archive().manifest_identity()))
         .unwrap();
     })
     .unwrap();

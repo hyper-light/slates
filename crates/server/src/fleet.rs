@@ -2667,7 +2667,23 @@ async fn serve_peer_records(
                   .or_insert(0) += 1;
                 return Vec::new();
               }
-              s.held_content.serve(local, &request)
+              // Authority for the object the request names is decided before any lookup (AUD-29-45),
+              // from the committed configuration and this holder's records — never from the content hash.
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              let (council, records) = (&s.council, &s.holder_records);
+              s.held_content.serve(local, &request, |access, object| {
+                content_authorized(
+                  council.configuration(),
+                  records,
+                  local,
+                  peer_host,
+                  access,
+                  object,
+                )
+              })
             })
             .unwrap_or_default(),
             // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
@@ -2843,6 +2859,51 @@ pub(crate) fn accept_held_record(
 /// Validates a record against both the transport principal and installed authority before any effect
 /// (§4.8, §4.16; AUD-10/AUD-12). The first record and all later records have the same peer binding.
 /// A merge holder calls this before recomputing, then accepts in the same synchronous shard turn.
+/// Whether `peer` may place (offer, put) or read (fetch) `object`'s content on this holder (§4.13 "Content
+/// identity and sharing"; AUD-29-45). A content hash is an identity, never a bearer right: the peer must be a
+/// member acting for the object — its current owner, or, once that owner departed, its takeover successor —
+/// and a placement must land on one of the acting owner's candidates for the object. A read is also allowed
+/// to the object's candidate holders (a re-replication among them). The owner is the one this holder's
+/// records name, else the object's creator (content is placed before its first record, §4.16).
+pub(crate) fn content_authorized(
+  regional: &slates_db::register::RegionalConfiguration,
+  records: &std::collections::BTreeMap<ObjectId, slates_db::register::Acceptor>,
+  local: HostId,
+  peer: HostId,
+  access: slates_cluster::content::ContentAccess,
+  object: ObjectId,
+) -> bool {
+  if !regional.members.contains(&peer) {
+    return false;
+  }
+  let owner = records
+    .get(&object)
+    .map_or_else(|| object.creator(), slates_db::register::Acceptor::owner);
+  let acting = if regional.members.contains(&owner) {
+    Some(owner)
+  } else {
+    regional.successor(owner, object)
+  };
+  let Some(acting) = acting else {
+    return false;
+  };
+  let candidates = regional
+    .configuration_for(acting)
+    .map(|configuration| configuration.place(object).candidates)
+    .unwrap_or_default();
+  match access {
+    slates_cluster::content::ContentAccess::Place => peer == acting && candidates.contains(&local),
+    slates_cluster::content::ContentAccess::Read => {
+      peer == acting
+        || candidates.contains(&peer)
+        || regional
+          .recovery_cohorts(owner, object)
+          .iter()
+          .any(|cohort| cohort.contains(&peer))
+    }
+  }
+}
+
 pub(crate) fn check_held_record(
   state: &mut ShardState,
   local: HostId,
@@ -3669,7 +3730,8 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
       state::with_state(|s| s.pending_materializations.remove(&object));
       continue;
     };
-    let held = state::with_state(|s| s.held_content.holds_manifest(&manifest)).unwrap_or(false);
+    let held =
+      state::with_state(|s| s.held_content.holds_manifest(object, &manifest)).unwrap_or(false);
     if !held {
       let holders = head.holders();
       let mut sessions = take_sessions(|host| holders.contains(&host));
@@ -3678,12 +3740,14 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
         continue; // No recorded holder reachable this period.
       };
       return_sessions(sessions);
-      let (archive, endpoint) = fetch_content(endpoint, manifest, budget.max_deadline_ns()).await;
+      let (archive, endpoint) =
+        fetch_content(endpoint, object, manifest, budget.max_deadline_ns()).await;
       return_sessions(vec![(host, endpoint)]);
       let Some(archive) = archive else {
         continue;
       };
-      let stored = state::with_state(|s| s.held_content.hold(archive).is_ok()).unwrap_or(false);
+      let stored =
+        state::with_state(|s| s.held_content.hold(object, archive).is_ok()).unwrap_or(false);
       if !stored {
         count_refusal(MATERIALIZE_REFUSED);
         continue;
@@ -3780,7 +3844,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
   let taken = state::with_state(|s| {
-    let archive = s.held_content.archive_of(&manifest)?;
+    let archive = s.held_content.archive_of(object, &manifest)?;
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
     let placed = s.placed_heads.get(&object).cloned()?;
@@ -6491,6 +6555,81 @@ pub(crate) async fn forward_over_leader_session(
 
 #[cfg(test)]
 mod tests {
+
+  /// AUD-29-45 (§4.13 "Content identity and sharing"): do: a region of five members at `f = 1`, an object
+  /// created by host 1, and ask who may place and read its content — then take host 1 over and ask again;
+  /// expect the owner alone to place, and only onto its own candidates; its candidates (and it) to read; a
+  /// member outside both and a non-member to be refused; and after the takeover the successor to act as owner
+  /// while the departed host is refused everything.
+  #[test]
+  fn content_authority_follows_the_objects_owner_and_placement() {
+    use slates_cluster::content::ContentAccess::{Place, Read};
+    use slates_db::register::{Quorum, RegionalConfiguration};
+    // Shape: a neighbourhood of every member.
+    let scatter = 5;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    let owner = HostId(1);
+    let object = ObjectId::new(owner, 7);
+    let records = std::collections::BTreeMap::new();
+    let candidates = regional
+      .configuration_for(owner)
+      .unwrap()
+      .place(object)
+      .candidates;
+    let holder = *candidates.iter().find(|host| **host != owner).unwrap();
+    let outsider = (1..=5)
+      .map(HostId)
+      .find(|host| !candidates.contains(host))
+      .unwrap();
+    let allowed = |regional: &RegionalConfiguration, peer, access, local| {
+      content_authorized(regional, &records, local, peer, access, object)
+    };
+    assert!(allowed(&regional, owner, Place, holder));
+    assert!(
+      !allowed(&regional, owner, Place, outsider),
+      "only onto a candidate"
+    );
+    assert!(
+      !allowed(&regional, holder, Place, holder),
+      "only the owner places"
+    );
+    assert!(
+      allowed(&regional, holder, Read, holder),
+      "a candidate reads"
+    );
+    assert!(
+      !allowed(&regional, outsider, Read, holder),
+      "a member outside the placement"
+    );
+    assert!(
+      !allowed(&regional, HostId(99), Read, holder),
+      "a non-member"
+    );
+    regional.take_over(owner, scatter).unwrap();
+    let successor = regional.successor(owner, object).unwrap();
+    let placed = regional
+      .configuration_for(successor)
+      .unwrap()
+      .place(object)
+      .candidates;
+    let landing = *placed.iter().find(|host| **host != successor).unwrap();
+    assert!(
+      allowed(&regional, successor, Place, landing),
+      "the successor acts as owner"
+    );
+    assert!(allowed(&regional, successor, Read, holder));
+    assert!(
+      !allowed(&regional, owner, Read, holder),
+      "the departed owner is refused"
+    );
+    assert!(!allowed(&regional, owner, Place, landing));
+  }
   use super::*;
   use slates_cluster::DispatchWait;
 

@@ -1946,7 +1946,7 @@ pub(crate) fn accept_merge_record(
   }
   let inputs = match value.inputs {
     None => None,
-    Some(manifest) => match held_inputs(state, &manifest) {
+    Some(manifest) => match held_inputs(state, object, &manifest) {
       Some(bytes) => Some(bytes),
       None => {
         *state.refusals.entry(INPUTS_UNHELD).or_insert(0) += 1;
@@ -1976,8 +1976,8 @@ pub(crate) fn accept_merge_record(
 /// The inputs bytes a manifest names, from this holder's content hold — the one file's one chunk —
 /// with a test's corruption fault applied once if set (the last byte of the post-state, so the
 /// increment still decodes but recomputes to different bytes).
-fn held_inputs(state: &mut ShardState, manifest: &[u8; 32]) -> Option<Vec<u8>> {
-  let archive = state.held_content.archive_of(manifest)?;
+fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) -> Option<Vec<u8>> {
+  let archive = state.held_content.archive_of(object, manifest)?;
   let chunk = archive.chunks.first()?;
   let mut bytes = Archive::content(chunk).ok()?;
   if state.merge.fault.corrupt_next_inputs {
@@ -2092,7 +2092,7 @@ pub(crate) fn recover_green_inputs(
     let inputs = match value.inputs {
       None if version == 0 => None,
       None => return None,
-      Some(manifest) => Some(held_inputs(state, &manifest)?),
+      Some(manifest) => Some(held_inputs(state, object, &manifest)?),
     };
     match (version, inputs) {
       (0, bytes) => origin = bytes,
@@ -2422,13 +2422,14 @@ mod tests {
   fn the_record_names_the_inputs_by_the_identity_the_hold_keys_by() {
     let bytes = b"the increment's chain entry";
     let named = MergeShardState::inputs_identity(bytes, 4096);
+    let object = ObjectId::new(slates_db::HostId(1), 1);
     let mut hold = slates_cluster::content::ContentHold::new();
     let held = hold
-      .hold(MergeShardState::inputs_archive(bytes, 0, 4096))
+      .hold(object, MergeShardState::inputs_archive(bytes, 0, 4096))
       .expect("the inputs archive is whole and verifies");
     assert_eq!(named, held, "the record names what the hold keys by");
     let found = hold
-      .archive_of(&named)
+      .archive_of(object, &named)
       .expect("the holder finds the inputs the record names");
     assert_eq!(Archive::content(&found.chunks[0]).unwrap(), bytes);
     let tree_only = MergeShardState::inputs_archive(bytes, 0, 4096)
@@ -2439,7 +2440,7 @@ mod tests {
       "the tree's own identity is not the hold's key (format minor 2)"
     );
     assert!(
-      hold.archive_of(&tree_only).is_none(),
+      hold.archive_of(object, &tree_only).is_none(),
       "a record naming the tree's identity finds nothing"
     );
   }
