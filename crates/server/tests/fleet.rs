@@ -1913,9 +1913,15 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   );
 }
 
-/// Whether `status` for `volume` at `instance` answers with a report right now (one call, no polling).
+/// Whether `status` for `volume` at `instance` answers with a report right now (one call, no polling: a
+/// poll holds its client and asks [`status_answers`], since a client per check outruns the reaper — a
+/// dropped client keeps its seat until its silence is noticed — and exhausts the daemon's client table).
 fn status_answers_once(instance: &str, volume: VolumeId) -> bool {
-  let mut client = Client::connect(instance);
+  status_answers(&mut Client::connect(instance), volume)
+}
+
+/// Whether `status` for `volume` answers with a report through `client`, right now.
+fn status_answers(client: &mut Client, volume: VolumeId) -> bool {
   matches!(
     client.call(&RequestBody::Status { volume }),
     ReplyBody::Status { .. }
@@ -4408,10 +4414,8 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
     .find(|daemon| daemon.member_identity().unwrap() == successor)
     .unwrap();
   assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
-  assert!(audit_wait(|| Ok(status_answers_once(
-    successor_daemon.instance(),
-    id
-  ))));
+  let mut successor_client = Client::connect(successor_daemon.instance());
+  assert!(audit_wait(|| Ok(status_answers(&mut successor_client, id))));
   let foreign_daemon = daemons
     .iter()
     .find(|daemon| daemon.instance() == foreign_instance)
@@ -4535,10 +4539,8 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     .find(|daemon| daemon.member_identity().unwrap() == successor)
     .unwrap();
   assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
-  assert!(audit_wait(|| Ok(status_answers_once(
-    successor_daemon.instance(),
-    id
-  ))));
+  let mut successor_client = Client::connect(successor_daemon.instance());
+  assert!(audit_wait(|| Ok(status_answers(&mut successor_client, id))));
   let mut foreign = Client::connect(&foreign_instance);
   let mut last = ReplyBody::Refused {
     refusal: Refusal::NotFound,
@@ -6358,15 +6360,20 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
   // The owner dies; a survivor must take every volume over and serve it.
   daemons.remove(0).stop();
   let survivors: Vec<&Daemon> = daemons.iter().collect();
+  // One held client per survivor for the whole poll (see `status_answers_once`): a client per check exhausted
+  // a survivor's client table on the macOS runner on 2026-09-29 ("too many clients (the bound is 2248)").
+  let mut clients: Vec<Client> = daemons
+    .iter()
+    .map(|daemon| Client::connect(daemon.instance()))
+    .collect();
   let started = Instant::now();
   let served = poll_until(&survivors, SERVE_DEADLINE, || {
-    let all = volumes.iter().all(|(id, _)| {
-      daemons
-        .iter()
-        .any(|daemon| status_answers_once(daemon.instance(), *id))
-    });
+    let all = volumes
+      .iter()
+      .all(|(id, _)| clients.iter_mut().any(|client| status_answers(client, *id)));
     Ok(all || started.elapsed() >= SERVE_DEADLINE)
   }) && started.elapsed() < SERVE_DEADLINE;
+  drop(clients);
   let counters: Vec<_> = daemons.iter().map(Daemon::fleet_refusals).collect();
   for daemon in daemons {
     daemon.stop();
@@ -6439,10 +6446,7 @@ fn volumes_for_each_successor(daemons: &[Daemon], hosts: &[HostId]) -> Vec<(Volu
 fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) -> bool {
   let mut client = Client::connect(instance);
   poll_until(daemons, SERVE_DEADLINE, || {
-    Ok(matches!(
-      client.call(&RequestBody::Status { volume }),
-      ReplyBody::Status { .. }
-    ))
+    Ok(status_answers(&mut client, volume))
   })
 }
 
