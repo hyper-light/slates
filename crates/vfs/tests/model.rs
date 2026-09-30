@@ -980,56 +980,6 @@ fn ac_1_1_one_million_generated_operations_agree_with_the_model() {
   );
 }
 
-/// §4.5 "Journal" (AUD-29-02): the head is unchanged since a snapshot until an operation other than a snapshot
-/// is journaled, and nothing vouches for it once retention has dropped a record since. Do: snapshot a volume,
-/// ask; snapshot again, ask; write, ask; then, with a journal too small to keep them, snapshot a second volume
-/// and take more snapshots than the journal retains, and ask. Expect: unchanged, unchanged, changed; and
-/// "changed" for the second volume, although only snapshots followed, since the records after it are gone.
-#[test]
-fn the_head_is_unchanged_since_a_snapshot_until_something_else_is_journaled() {
-  let mut store = store();
-  let mut vol = volume(&mut store, 1 << 24);
-  let root = vol.root();
-  let f = vol.create_file(&mut store, root, "f", 0o644).unwrap();
-  vol.write(&mut store, f, 0, b"landed").unwrap();
-  let s = vol.snapshot(&mut store).unwrap();
-  assert_eq!(vol.unchanged_since(s), Ok(true));
-  vol.snapshot(&mut store).unwrap();
-  assert_eq!(
-    vol.unchanged_since(s),
-    Ok(true),
-    "a later snapshot changes nothing"
-  );
-  vol.write(&mut store, f, 0, b"edited").unwrap();
-  assert_eq!(vol.unchanged_since(s), Ok(false));
-
-  /// Shape: a journal budget that holds a handful of records, so later snapshots push the ones after the
-  /// first out.
-  const TINY_JOURNAL: usize = 256;
-  /// Shape: snapshots taken after the first, far more than the tiny journal holds.
-  const LATER_SNAPSHOTS: usize = 64;
-  let mut small = Volume::create(
-    &mut store,
-    slates_vfs::volume::VolumeConfig {
-      prefix: 8,
-      names: NameEquivalence::Fold,
-      quota: slates_vfs::quota::Quota::Bounded { limit: 1 << 20 },
-      journal_bytes: TINY_JOURNAL,
-      clock: Box::new(slates_vfs::clock::StepClock::new(0, 1_000)),
-    },
-  )
-  .unwrap();
-  let first = small.snapshot(&mut store).unwrap();
-  for _ in 0..LATER_SNAPSHOTS {
-    small.snapshot(&mut store).unwrap();
-  }
-  assert_eq!(
-    small.unchanged_since(first),
-    Ok(false),
-    "records since the snapshot were dropped: nothing vouches for the head"
-  );
-}
-
 /// A file with two versions: "version one" under snapshot `s1`, "VERSION TWO" at the head.
 fn two_versions() -> (Store, Volume, InodeNo, SnapshotId) {
   let mut store = store();

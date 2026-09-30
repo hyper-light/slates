@@ -91,7 +91,13 @@ fn ipc_names_refuse_landing_before_an_ordinary_file_can_be_written() {
     let mut host = SimHost::new();
     let before = disk(&host);
     assert!(matches!(
-      slates_land::manifest::plan(&mut volume, &mut store, &mut host, &Filter::default()),
+      slates_land::manifest::plan(
+        &mut volume,
+        &mut store,
+        &mut host,
+        &Filter::default(),
+        slates_land::source::Source::Head
+      ),
       Err(slates_vfs::VfsError::SpecialFileOperation)
     ));
     assert_eq!(disk(&host), before);

@@ -39,7 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
-use slates_vfs::base::BaseConfig;
+use slates_vfs::base::{BaseConfig, Landed};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::{HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs};
 use slates_vfs::inode::{Fingerprint, Witness};
@@ -51,6 +51,7 @@ use crate::grant::{
 };
 use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary, plan};
 use crate::ramp::{Ramp, StepSample};
+pub use crate::source::Source;
 use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
 
 /// Format: the prefix of every hidden sibling a landing creates inside the granted target; the
@@ -434,8 +435,11 @@ pub struct LandingRequest {
   pub consumer: Box<[u8]>,
   /// The volume landed, by its id.
   pub volume: [u8; 16],
-  /// The snapshot landed.
+  /// The snapshot landed, as the grant binds it (the catalog's number).
   pub snapshot: u64,
+  /// What is landed (A-49): the head, or a snapshot of the volume exactly as it froze. The plan, the
+  /// presentation, the verdicts' witnessed bases and the bytes written all come from it.
+  pub source: Source,
   /// The grant, when the human issued one.
   pub grant: Option<GrantId>,
   /// The filter.
@@ -538,6 +542,10 @@ struct Landing<'a, H: LandFs> {
   unsynced: BTreeSet<Box<str>>,
   /// Whether the media barrier the grant asked for failed: then no entry is advanced.
   media_failed: bool,
+  /// Each file this landing placed, by path, with the fingerprint its placement left: taken through the
+  /// file's own descriptor after the last rename, so an outsider's later change to the name cannot be taken
+  /// for it (A-49's rebase).
+  placed: BTreeMap<Box<str>, Fingerprint>,
 }
 
 /// What the writer needs besides the host: the volume, the grant, the observer, the audit log.
@@ -1047,7 +1055,7 @@ impl<H: LandFs> Landing<'_, H> {
     let overlay = entry
       .overlay
       .ok_or(WriteFailure::Volume(VfsError::Invalid))?;
-    let bytes = read_overlay_bytes(vol, store, self.host, &entry.path)?;
+    let bytes = read_overlay_bytes(vol, store, self.host, self.request.source, &entry.path)?;
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
     // A replacement's temporary takes the entry's aside name: the exchange leaves the displaced entry under
@@ -1068,6 +1076,13 @@ impl<H: LandFs> Landing<'_, H> {
         witness,
       }),
     };
+    // What the placement left at the name, read through the file's own descriptor before it closes.
+    if let Ok(w) = &result
+      && w.outcome == Outcome::Written
+      && let Ok(placed) = self.host.fstat(temp)
+    {
+      self.placed.insert(entry.path.clone(), placed);
+    }
     self.host.close_file(temp);
     match result {
       Ok(w) => {
@@ -2147,14 +2162,13 @@ fn read_overlay_bytes<H: LandFs>(
   vol: &mut Volume,
   store: &mut Store,
   host: &mut H,
+  source: Source,
   path: &str,
 ) -> Result<Vec<u8>, WriteFailure> {
-  let located = vol.resolve(store, path)?;
-  let attrs = vol.stat(store, located.inode)?;
+  let located = source.resolve(vol, store, path)?;
+  let attrs = source.stat(vol, store, located.inode)?;
   let mut bytes = vec![0u8; usize::try_from(attrs.size).map_err(|_| VfsError::FileTooLarge)?];
-  let n = vol
-    .with_host(host)
-    .read(store, located.inode, 0, &mut bytes)?;
+  let n = source.read(vol, store, host, located.inode, &mut bytes)?;
   bytes.truncate(n);
   Ok(bytes)
 }
@@ -2174,7 +2188,8 @@ pub fn land<H: LandFs>(
   observer: &mut dyn Observer<H>,
 ) -> Result<LandingReport, LandingRefusal> {
   // Plan.
-  let manifest = plan(vol, store, host, &request.filter).map_err(LandingRefusal::Volume)?;
+  let manifest =
+    plan(vol, store, host, &request.filter, request.source).map_err(LandingRefusal::Volume)?;
   audit.push(AuditRecord {
     seq: 0,
     at_ns: request.now_ns,
@@ -2286,6 +2301,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       crashed: None,
       unsynced: BTreeSet::new(),
       media_failed: false,
+      placed: BTreeMap::new(),
     }
   }
 }
@@ -2381,17 +2397,7 @@ fn land_under_lease<H: LandFs>(
   // A landed rename leaves the overlay with the whiteout at its origin. An aborted landing
   // advances nothing: its entries stay in the overlay so the resume re-plans them all, finds
   // the landed ones already there, and syncs their directories again.
-  let mut landed: Vec<String> = Vec::with_capacity(reports.len());
-  let completed = state != LandingState::Aborted;
-  for r in reports
-    .iter()
-    .filter(|r| completed && advances(r.outcome.as_ref()) && landing.durable(r))
-  {
-    landed.push(r.path.to_string());
-    if let Action::Rename { from } = &r.action {
-      landed.push(from.to_string());
-    }
-  }
+  let landed = advanced(&reports, state, manifest, request, &landing);
   let base = facts.map(|facts| BaseConfig {
     root: target_dir,
     facts,
@@ -2399,7 +2405,7 @@ fn land_under_lease<H: LandFs>(
   });
   vol
     .with_host(landing.host)
-    .land_advance(store, &landed, base)
+    .land_advance(store, &landed, base, request.source.snapshot())
     .map_err(LandingRefusal::Volume)?;
   audit.push(AuditRecord {
     seq: 0,
@@ -2449,6 +2455,54 @@ fn land_under_lease<H: LandFs>(
 }
 
 /// Whether an outcome takes its entry out of the overlay: the disk holds the overlay's state.
+/// The paths a landing advances, each written file with the witness of what it wrote: the fingerprint its
+/// placement left and the identity of the source's bytes (A-49). A landed rename leaves the overlay with
+/// the whiteout at its origin. An aborted landing advances nothing: its entries stay in the overlay so the
+/// resume re-plans them all, finds the landed ones already there, and syncs their directories again.
+fn advanced<H: LandFs>(
+  reports: &[EntryReport],
+  state: LandingState,
+  manifest: &Manifest,
+  request: &LandingRequest,
+  landing: &Landing<'_, H>,
+) -> Vec<Landed> {
+  let identities: BTreeMap<&str, [u8; 32]> = manifest
+    .entries
+    .iter()
+    .filter_map(|entry| Some((entry.path.as_ref(), entry.overlay?.hash)))
+    .collect();
+  let mut landed = Vec::with_capacity(reports.len());
+  let completed = state != LandingState::Aborted;
+  for r in reports
+    .iter()
+    .filter(|r| completed && advances(r.outcome.as_ref()) && landing.durable(r))
+  {
+    // The landing's own write left a fresh ctime, so its witness is racy by the design's rule: a later
+    // verdict re-hashes the file rather than trust its fingerprint.
+    let written = landing
+      .placed
+      .get(&r.path)
+      .zip(identities.get(r.path.as_ref()))
+      .map(|(fingerprint, identity)| Witness {
+        fingerprint: *fingerprint,
+        identity: *identity,
+        witnessed_at: request.now_ns,
+        racy: true,
+      });
+    landed.push(Landed {
+      path: r.path.to_string(),
+      written,
+    });
+    if let Action::Rename { from } = &r.action {
+      landed.push(Landed {
+        path: from.to_string(),
+        written: None,
+      });
+    }
+  }
+  landed
+}
+
 fn advances(outcome: Option<&Outcome>) -> bool {
   matches!(
     outcome,

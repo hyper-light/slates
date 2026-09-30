@@ -12,6 +12,8 @@ use slates_vfs::host::HostFs;
 use slates_vfs::inode::{Fingerprint, Kind, Witness};
 use slates_vfs::volume::{Store, Volume};
 
+use crate::source::Source;
+
 /// Whether `path` is `prefix` or lies beneath it.
 fn under(path: &str, prefix: &str) -> bool {
   path == prefix || path.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
@@ -290,15 +292,20 @@ fn put_fingerprint(out: &mut Vec<u8>, fp: &Fingerprint) {
   out.extend_from_slice(&fp.mode.to_le_bytes());
 }
 
-/// Plans the manifest of a volume's head: the diverged entries with their witnesses and the
-/// overlay's identities (the bytes are hashed here, once, proportional to the delta).
+/// Plans the manifest of `source` — the volume's head or one of its snapshots (A-49): the diverged entries
+/// with their witnesses and the overlay's identities (the bytes are hashed here, once, proportional to the
+/// delta), every one of them as the source holds it.
 pub fn plan(
   vol: &mut Volume,
   store: &mut Store,
   host: &mut dyn HostFs,
   filter: &Filter,
+  source: Source,
 ) -> Result<Manifest, VfsError> {
-  let diverged = vol.diverged(store);
+  let diverged = match source {
+    Source::Head => vol.diverged(store),
+    Source::Snapshot(id) => vol.diverged_in(store, id)?,
+  };
   let mut entries = Vec::new();
   let mut filtered_out = 0usize;
   // A renamed base directory implies the whiteout at its origin; that whiteout is not a
@@ -306,7 +313,7 @@ pub fn plan(
   let origins: Vec<Box<str>> = diverged
     .iter()
     .filter(|d| d.kind == Divergence::Redirect)
-    .filter_map(|d| origin_of(vol, store, &d.path))
+    .filter_map(|d| origin_of(vol, store, source, &d.path))
     .collect();
   for d in &diverged {
     if !filter.keeps(&d.path) {
@@ -316,15 +323,15 @@ pub fn plan(
     if d.kind == Divergence::Whiteout && origins.iter().any(|o| o.as_ref() == d.path.as_str()) {
       continue;
     }
-    if let Some(entry) = entry_for(vol, store, host, d)? {
+    if let Some(entry) = entry_for(vol, store, host, source, d)? {
       entries.push(entry);
     }
   }
   Ok(Manifest::from_entries(entries, filtered_out))
 }
 
-fn origin_of(vol: &Volume, store: &Store, path: &str) -> Option<Box<str>> {
-  match vol.resolve(store, path).ok()?.child {
+fn origin_of(vol: &Volume, store: &Store, source: Source, path: &str) -> Option<Box<str>> {
+  match source.resolve(vol, store, path).ok()?.child {
     Child::Dir(h) => store.dirs.get(h).ok()?.origin.clone(),
     _ => None,
   }
@@ -335,18 +342,21 @@ fn entry_for(
   vol: &mut Volume,
   store: &mut Store,
   host: &mut dyn HostFs,
+  source: Source,
   d: &Diverged,
 ) -> Result<Option<LandingEntry>, VfsError> {
   let path: Box<str> = d.path.as_str().into();
   match d.kind {
     Divergence::Whiteout => {
       let (dir, name) = split(&d.path);
-      let witnessed = vol.whiteout_witness(store, dir, name).map(|fp| Witness {
-        fingerprint: fp,
-        identity: [0; 32],
-        witnessed_at: 0,
-        racy: false,
-      });
+      let witnessed = source
+        .whiteout_witness(vol, store, dir, name)
+        .map(|fp| Witness {
+          fingerprint: fp,
+          identity: [0; 32],
+          witnessed_at: 0,
+          racy: false,
+        });
       let action = if witnessed.is_some_and(|w| kind_is_dir(w.fingerprint.mode)) {
         Action::Rmdir
       } else {
@@ -360,13 +370,15 @@ fn entry_for(
       }))
     }
     Divergence::Redirect => {
-      let from = origin_of(vol, store, &d.path).ok_or(VfsError::Invalid)?;
-      let witnessed = vol.redirect_witness(store, &d.path).map(|fp| Witness {
-        fingerprint: fp,
-        identity: [0; 32],
-        witnessed_at: 0,
-        racy: false,
-      });
+      let from = origin_of(vol, store, source, &d.path).ok_or(VfsError::Invalid)?;
+      let witnessed = source
+        .redirect_witness(vol, store, &d.path)
+        .map(|fp| Witness {
+          fingerprint: fp,
+          identity: [0; 32],
+          witnessed_at: 0,
+          racy: false,
+        });
       Ok(Some(LandingEntry {
         path,
         action: Action::Rename { from },
@@ -375,18 +387,20 @@ fn entry_for(
       }))
     }
     Divergence::Created | Divergence::Witnessed => {
-      let located = vol.resolve(store, &d.path)?;
+      let located = source.resolve(vol, store, &d.path)?;
       match located.child {
         Child::Dir(_) => {
-          let attrs = vol.stat(store, located.inode)?;
+          let attrs = source.stat(vol, store, located.inode)?;
           // An opaque directory over a whiteout of a base directory clears the disk's copy.
           let (dir, name) = split(&d.path);
-          let cleared = vol.whiteout_witness(store, dir, name).map(|fp| Witness {
-            fingerprint: fp,
-            identity: [0; 32],
-            witnessed_at: 0,
-            racy: false,
-          });
+          let cleared = source
+            .whiteout_witness(vol, store, dir, name)
+            .map(|fp| Witness {
+              fingerprint: fp,
+              identity: [0; 32],
+              witnessed_at: 0,
+              racy: false,
+            });
           Ok(Some(LandingEntry {
             path,
             action: if cleared.is_some() {
@@ -406,19 +420,19 @@ fn entry_for(
         Child::Symlink(no) => Ok(Some(LandingEntry {
           path,
           action: Action::Symlink {
-            target: vol.readlink(store, no)?,
+            target: source.readlink(vol, store, no)?,
           },
           witnessed: None,
           overlay: None,
         })),
         Child::Fifo(_) | Child::Socket(_) => Err(VfsError::SpecialFileOperation),
         Child::File(no) => {
-          let attrs = vol.stat(store, no)?;
+          let attrs = source.stat(vol, store, no)?;
           let mut bytes =
             vec![0u8; usize::try_from(attrs.size).map_err(|_| VfsError::FileTooLarge)?];
-          let n = vol.with_host(host).read(store, no, 0, &mut bytes)?;
+          let n = source.read(vol, store, host, no, &mut bytes)?;
           bytes.truncate(n);
-          let witnessed = vol.base_plane().and_then(|b| b.witness(no));
+          let witnessed = source.witness(vol, no);
           Ok(Some(LandingEntry {
             path,
             action: if witnessed.is_some() {

@@ -85,6 +85,7 @@ fn request(id: u64) -> LandingRequest {
     consumer: b"bench".as_slice().into(),
     volume: [0; 16],
     snapshot: 0,
+    source: slates_land::source::Source::Head,
     grant: None,
     filter: Filter::default(),
     now_ns: 1,
@@ -217,8 +218,14 @@ fn sim_rows() {
       key: "/".into(),
     };
     let started = Instant::now();
-    let manifest =
-      slates_land::manifest::plan(&mut vol, &mut store, &mut host, &Filter::default()).unwrap();
+    let manifest = slates_land::manifest::plan(
+      &mut vol,
+      &mut store,
+      &mut host,
+      &Filter::default(),
+      slates_land::source::Source::Head,
+    )
+    .unwrap();
     plan.push(ns_per_entry(started.elapsed(), manifest.entries.len()));
     let started = Instant::now();
     let report = land_once(
@@ -233,8 +240,14 @@ fn sim_rows() {
     assert_eq!(report.written, SIM_DELTA);
     // The idempotent second landing: plan of the empty delta.
     let started = Instant::now();
-    let again =
-      slates_land::manifest::plan(&mut vol, &mut store, &mut host, &Filter::default()).unwrap();
+    let again = slates_land::manifest::plan(
+      &mut vol,
+      &mut store,
+      &mut host,
+      &Filter::default(),
+      slates_land::source::Source::Head,
+    )
+    .unwrap();
     second.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     assert!(again.entries.is_empty());
   }

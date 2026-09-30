@@ -48,6 +48,8 @@ use slates_land::grant::{GrantId, GrantRefusal, LandingLease};
 use slates_land::manifest::{Filter, LandingEntry, Manifest};
 #[cfg(unix)]
 use slates_land::os::{OsLand, TargetRefusal};
+#[cfg(unix)]
+use slates_land::source::Source;
 use slates_vfs::clock::Clock;
 #[cfg(unix)]
 use slates_vfs::host::{HostError, HostFs, LandFs};
@@ -430,12 +432,15 @@ fn land_verb_unix(
     return refused(Refusal::LandingsAwaitingFull);
   }
   let db_snapshot = snapshot.map_or(record.head, to_db_snapshot);
-  // A named snapshot is what lands, before any host access (AUD-29-02).
-  if let Some(named) = snapshot
-    && let Err(refusal) = named_snapshot_is_head(state, handle, &record, named)
-  {
-    return refused(refusal);
-  }
+  // A named snapshot is what lands, exactly as it froze; an unnamed landing lands the head. Resolved before
+  // any host access (AUD-29-02, A-49).
+  let source = match snapshot {
+    Some(named) => match named_snapshot_source(state, handle, &record, named) {
+      Ok(source) => source,
+      Err(refusal) => return refused(refusal),
+    },
+    None => Source::Head,
+  };
   // Open the target: this is the only place the server touches a host path for writing, and
   // only under the grant checked below (R1, R10). A path that cannot be opened, or that
   // escapes containment, is a typed refusal with no write.
@@ -448,6 +453,7 @@ fn land_verb_unix(
     os,
     land_target,
     filter: to_land_filter(filter),
+    source,
     volume: db_volume,
     snapshot: db_snapshot,
     target: target.to_owned(),
@@ -470,6 +476,7 @@ struct Prepared {
   os: OsLand,
   land_target: slates_land::engine::LandingTarget,
   filter: Filter,
+  source: Source,
   volume: DbVolumeId,
   snapshot: DbSnapshotId,
   target: String,
@@ -503,6 +510,7 @@ fn run_landing(
     consumer: prepared.principal.key().into_boxed_slice(),
     volume: prepared.volume.bytes,
     snapshot: prepared.snapshot.value,
+    source: prepared.source,
     grant: prepared.grant.map(GrantId),
     filter: prepared.filter.clone(),
     now_ns: state.clock.monotonic_ns(),
@@ -852,20 +860,17 @@ fn unbound_refusal_name(field: slates_land::grant::BindingField) -> &'static str
   }
 }
 
-/// Whether a landing of the named `snapshot` may land the head: the catalog must hold the snapshot for this
-/// volume (`NotFound` for one it never had, another volume's included) and the head must still be exactly
-/// its state — nothing but snapshots journaled since (`Volume::unchanged_since`). The engine plans and writes
-/// the head; landing an older snapshot exactly needs the base plane's witnesses as the snapshot froze them,
-/// which are the head's today, so a head changed since the snapshot is refused `Unsupported` before any host
-/// access rather than landed under the snapshot's name (AUD-29-02,
-/// docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md).
+/// The state a landing of a named snapshot lands (§4.15 step 1; AUD-29-02, A-49): that snapshot, exactly
+/// as it froze. A snapshot the catalog does not hold for this volume — never taken, destroyed, or another
+/// volume's — is `NotFound`, before any host access. Before 2026-09-30 the engine planned and wrote the head
+/// whatever snapshot was named, and a head changed since the snapshot was refused instead.
 #[cfg(unix)]
-fn named_snapshot_is_head(
+fn named_snapshot_source(
   state: &ShardState,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
   record: &slates_db::catalog::VolumeRecord,
   snapshot: SnapshotId,
-) -> Result<(), Refusal> {
+) -> Result<Source, Refusal> {
   let db_snapshot = to_db_snapshot(snapshot);
   if state
     .db
@@ -881,13 +886,11 @@ fn named_snapshot_is_head(
     generation: u32::try_from(db_snapshot.value & u64::from(u32::MAX))
       .map_err(|_| Refusal::NotFound)?,
   };
-  match slot.volume.unchanged_since(vfs_snapshot) {
-    Ok(true) => Ok(()),
-    Ok(false) => Err(Refusal::Unsupported {
-      feature: "landing a snapshot the volume has changed since".to_owned(),
-    }),
-    Err(_) => Err(Refusal::NotFound),
-  }
+  slot
+    .volume
+    .snapshot_info(vfs_snapshot)
+    .map_err(|_| Refusal::NotFound)?;
+  Ok(Source::Snapshot(vfs_snapshot))
 }
 
 /// Records the planned landing (AwaitingGrant) and its audit, and replies `GrantRequired`.

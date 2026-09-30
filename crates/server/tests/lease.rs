@@ -15,66 +15,27 @@
 
 use std::net::TcpStream;
 use std::os::unix::fs::MetadataExt;
-use std::time::{Duration, Instant};
 
-use slates_client::{
-  Client, ClientError, CreateSpec, Deadlines, Landing, NamePolicy, SizeClass, SnapshotId, VolumeId,
-};
-use slates_ipc::protocol::{Filter, GrantScope, Refusal};
+use slates_client::{Client, ClientError, Landing, SnapshotId, VolumeId};
+use slates_ipc::protocol::{Filter, Refusal};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
+use common::landing::{approve, connect, scratch};
 use common::lease::{hold, lease_key_of, release};
 use common::nfs::{create, mount, write};
 use common::target::{TargetDir, target_dir};
 
 /// Shape: shards per test daemon: two, so the two volumes can have different owner shards.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: names tried to find one volume on each shard — the owner is a hash of the name, so a handful
 /// covers two shards (checked, not assumed).
 const NAMES: usize = 16;
-/// Shape: the lease term and grant term of the test's holds and approvals: a minute, far past the test.
+/// Shape: the lease term of the test's holds: a minute, far past the test.
 const TERM_NS: u64 = 60_000_000_000;
 /// Shape: the holder the test takes the lease for: no landing attempt of the daemon's is numbered this
 /// high (its counters start at one under a sixteen-bit partition).
 const HOLDER: u64 = u64::MAX;
-
-/// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
-/// budget).
-fn deadlines() -> Deadlines {
-  Deadlines::derive(
-    slates_server::daemon::LIVENESS_BUDGET_NS,
-    slates_db::replay::RECOVERY_BUDGET_NS,
-  )
-  .get()
-}
-
-fn connect(instance: &str) -> Client {
-  let started = Instant::now();
-  loop {
-    match Client::connect(instance, deadlines()) {
-      Ok(client) => return client,
-      Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
-      {
-        std::hint::spin_loop();
-      }
-      Err(e) => panic!("{e}"),
-    }
-  }
-}
-
-fn scratch(name: &str) -> CreateSpec {
-  CreateSpec {
-    name: name.to_owned(),
-    size: SizeClass::Bounded { limit: 1 << 20 },
-    names: NamePolicy::Exact,
-    require_locked: false,
-    base: None,
-  }
-}
 
 /// A volume named so that shard `shard` owns it, holding one file `file` with `bytes` (written through the
 /// daemon's NFS transport), snapshotted.
@@ -101,29 +62,6 @@ fn volume_on(
   let handle = create(&mut stream, &root, file, 2);
   write(&mut stream, &handle, bytes, 3);
   (volume, client.snapshot(volume).unwrap())
-}
-
-/// Presents the landing of `snapshot` into `target` and approves it, as the human's surface does (the proof
-/// under the daemon's issuer secret); the grant id.
-fn approve(
-  client: &mut Client,
-  secret: &[u8; 32],
-  volume: VolumeId,
-  snapshot: SnapshotId,
-  target: &str,
-) -> u64 {
-  let presented = client.land(volume, Some(snapshot), target, Filter::default(), None);
-  let Ok(Landing::GrantRequired {
-    landing, manifest, ..
-  }) = presented
-  else {
-    panic!("the landing was not presented: {presented:?}");
-  };
-  let proof =
-    slates_server::landing::grant_proof(secret, landing, &manifest, GrantScope::Once, TERM_NS);
-  client
-    .grant(landing, manifest, GrantScope::Once, TERM_NS, proof)
-    .expect("the approval issues a grant")
 }
 
 /// Another spelling of the directory at `path` that opens that same directory, where the host has one
@@ -229,7 +167,7 @@ fn granted_landings(daemon: &Daemon, client: &mut Client, target: &TargetDir) ->
     (volume_on(daemon, client, 1, "b", b"from b"), other),
   ]
   .map(|((volume, snapshot), spelling)| {
-    let grant = approve(client, &secret, volume, snapshot, &spelling);
+    let grant = approve(client, &secret, volume, Some(snapshot), &spelling);
     (volume, snapshot, spelling, grant)
   })
 }

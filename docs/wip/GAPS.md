@@ -2936,9 +2936,8 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
 The [dated audit](../audit/2026-09-29_audit.md) records 87 findings across five
-passes; 01, 03, 04, 05, 06 and 07 have the separately recorded closures below, leaving 81 without a
-recorded full closure. 02 is mitigated in part, with exact older-snapshot landing still
-owed. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
+passes; 01, 02, 03, 04, 05, 06 and 07 have the separately recorded closures below, leaving 80 without a
+recorded full closure. 02's durable source field for unnamed landings remains owed. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
 changing working tree.
 It is a review, not an implementation change or acceptance closure. It preserves the
 existing gap classifications and historical measurements rather than treating them as
@@ -3057,7 +3056,8 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 in part (below); 03, 04, 05, 06 and 07 are closed below.
+- **Still open in this row.** 02's durable source field for unnamed landings; 02 (exact snapshot landing),
+  03, 04, 05, 06 and 07 are closed below.
 
 **Closed 2026-09-29 — AUD-29-06: a session grant was recorded consumed, and a restart lost every grant.**
 - **Transitions.** `finish` records only the transition the engine made: a single-use grant consumed by a
@@ -3160,7 +3160,14 @@ versions per key); image layout 7. The clone landing that replaced an outsider's
 conflicts (`docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md`). Open:
 the tables are heap outside the metadata ledger (§4.2).
 
-**Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
+**Closed 2026-09-30 — AUD-29-02 (A-48, A-49): a landing lands exactly the snapshot it names.** The engine's
+source is explicit through plan, verdict and write; the snapshot's own witnesses judge it (A-48); the advance is
+relative to it, so the head's later edits stay private and land next as replacements. The daemon test was
+refused `Unsupported` on `57a1f2f` and lands now (`crates/server/tests/snapshot_landing.rs`,
+`crates/land/tests/source.rs`). Owed: an unnamed landing's durable records name the head snapshot while the live
+head lands (a catalog format version). History of the mitigation follows.
+
+**Mitigated 2026-09-29 (superseded 2026-09-30, above) — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:
   nothing but snapshots journaled since, no record dropped). A head changed since is refused `Unsupported`
   before any host access, and a snapshot the volume never had is `NotFound`

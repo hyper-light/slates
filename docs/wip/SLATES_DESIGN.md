@@ -3875,9 +3875,14 @@ No copy-up, hashing, archive or landing step opens a host special file as regula
 > **Status (2026-09-29, AUD-29-02).** A landing of a named snapshot lands it only while the head is still
 > exactly its state: nothing but snapshots journaled since, with no record dropped
 > (`Volume::unchanged_since`). A head changed since is refused `Unsupported` before any host access, and a
-> snapshot the volume never had is `NotFound`. The engine plans the head. Landing an older snapshot exactly
-> needs the base plane's witnesses frozen per snapshot: done 2026-09-30 (A-48, §4.5 status). The engine's
-> source and the advancement rule that keeps later live edits private are owed. Record:
+> snapshot the volume never had is `NotFound`. **Superseded 2026-09-30 (A-49):** a landing lands exactly the
+> state it names. A named snapshot is the engine's source through plan, verdict and write, judged by the
+> witnesses it froze (A-48), and the advance is relative to it: an entry the head still holds as the snapshot
+> did leaves the overlay, a file the head changed since stays private and is rebased onto what landed, a head
+> whiteout keeps deleting it against the landed fingerprint, and anything else waits for a later verdict. The
+> head's later edits then land as replacements, not conflicts (`crates/land/tests/source.rs`,
+> `crates/server/tests/snapshot_landing.rs`, red on `57a1f2f`). Still owed: an unnamed landing's durable
+> records name the head snapshot while the live head lands (a catalog format version). Record:
 > `docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md`.
 
 **Live source and complete capture (A-9).** Creating a live overlay opens and identifies its
@@ -7105,4 +7110,35 @@ snapshot's destroy; `base_recovery.rs`, `recover.rs`: image layout 7), the tests
   landing, red on `c5b47cb` (`Done`, the outsider's file replaced) and refused `Conflict(ModifyModify)` now.
 - What it does not change: the head's reads and writes, the verdict table, drift checks and descriptors
   (the head's), and what a landing lands (the head, still, until the engine's source; AUD-29-02).
+
+### A-49 — A landing lands exactly the state it names, and advances the head relative to it (2026-09-30)
+Applied in the same change to: §4.15 (the AUD-29-02 status), `slates-land` (`source.rs`: `Source`;
+`manifest.rs`: `plan` from the source; `engine.rs`: `LandingRequest::source`, the bytes read at the source,
+each placed file's fingerprint, what landed passed to the advance), `slates-vfs` (`base.rs`: `Overlay::read_in`,
+the base-aware snapshot read; `Landed`; `land_advance` relative to a snapshot; `volume.rs`, `journal.rs`:
+`unchanged_since` and `oldest_retained_seq` removed), `slates-server` (`landing.rs`: a named snapshot is the
+source), the tests, and GAPS.
+- Why: a landing of a named snapshot planned and wrote the head; since 2026-09-29 it was refused whenever
+  the head had moved, so an older snapshot could not be landed at all (AUD-29-02;
+  `docs/bugs/2026-09-29-a-landing-of-a-named-snapshot-landed-the-live-head.md`).
+- The rule:
+  - A landing's source is a snapshot or the head (an unnamed landing, one owner-shard step). The plan, the
+    presentation, the verdicts' witnessed bases (the source's own, A-48) and the bytes written all come from
+    it; a large file's unpinned ranges are read from the disk only while the disk is the source's witnessed
+    base. A snapshot the volume does not hold is refused before any host access.
+  - The advance, for a snapshot source: an entry the head holds exactly as the snapshot did (the same object
+    at the same version) leaves the overlay; a file the head changed since stays private and is rebased
+    onto what landed — its witness the fingerprint the landing's placement left and the snapshot's identity,
+    racy by the design's rule, since the placement's ctime is fresh; a head whiteout of a landed file keeps
+    deleting it, against the landed fingerprint; anything else stays for a later landing's verdict. A file
+    whose body still reads base ranges from the disk keeps its witness.
+  - The head source advances as before.
+- Evidence: through the daemon, a snapshot's landing was refused `Unsupported` on `57a1f2f` and now writes the
+  snapshot's bytes while the head's edit stays private, and the head then lands over them with no conflict;
+  the engine lands a snapshot's two entries and nothing of the head's three later edits, then the head's as
+  replacements and a create; a head delete after the snapshot deletes what it landed; an unknown snapshot
+  is refused before any write; the server presents a snapshot's manifest unchanged after the head moved.
+- What it does not change: the verdict table, the write classes and their removal discipline (A-43), the
+  durability boundary (A-45), unnamed landings, and the durable records of an unnamed landing (still
+  naming the head snapshot; a catalog format version is owed).
 

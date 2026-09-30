@@ -180,12 +180,6 @@ impl OpLog {
     self.records.iter().filter(move |r| r.seq > seq)
   }
 
-  /// The oldest sequence the log still holds, or the next one when it holds none: every sequence from
-  /// this one on is retained.
-  pub fn oldest_retained_seq(&self) -> u64 {
-    self.records.front().map_or(self.next_seq, |r| r.seq)
-  }
-
   /// The newest sequence assigned.
   pub fn head_seq(&self) -> u64 {
     self.next_seq - 1

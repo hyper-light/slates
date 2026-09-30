@@ -51,6 +51,32 @@ pub(crate) struct WitnessClock {
   newest: Option<Epoch>,
 }
 
+/// A path a landing advanced (§4.15 step 9), and for a file it wrote, the witness of what it wrote: the
+/// fingerprint its own write left on the disk and the identity of the bytes (A-49).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Landed {
+  /// The path, as the landed source names it.
+  pub path: String,
+  /// For a written file: the landed file's witness.
+  pub written: Option<Witness>,
+}
+
+/// How the head's entry at a landed path compares with the landed snapshot's (A-49).
+enum Since {
+  /// The head holds it exactly as the snapshot did: the same object at the same version.
+  Unchanged,
+  /// A file the head changed since, now inode `no` at `name` in directory `dir`.
+  ChangedFile {
+    no: InodeNo,
+    dir: InodeNo,
+    name: Box<str>,
+  },
+  /// A file the head deleted since: a whiteout at `name` in directory `dir`.
+  Deleted { dir: InodeNo, name: Box<str> },
+  /// Anything else.
+  Other,
+}
+
 /// Format: a directory's own two links (`.` and its name); each subdirectory adds one (POSIX).
 const ROOT_LINKS: u32 = 2;
 
@@ -1735,6 +1761,78 @@ impl Overlay<'_> {
     Ok(want)
   }
 
+  /// A file's bytes as snapshot `id` holds them (A-49): its own pinned extents, and the base's unpinned
+  /// ranges from the disk — read only while the disk still holds the snapshot's witnessed base, else
+  /// `BaseDrift`. A landing of the snapshot reads these after its verdict found the disk to be that base, so
+  /// the disk's bytes there are the snapshot's. The head's drift state is neither read nor changed.
+  pub fn read_in(
+    &mut self,
+    store: &mut Store,
+    id: SnapshotId,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
+    let inode = self.vol.inode_in(store, id, no)?;
+    let (base_len, lost, size, pinned) = match &inode.body {
+      Body::Base(b) => (b.base_len, b.lost, inode.attrs.size, b.pinned.clone()),
+      _ => return self.vol.read_in(store, id, no, off, buf),
+    };
+    if off >= size {
+      return Ok(0);
+    }
+    let want =
+      usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
+    let end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
+    let covered = pinned
+      .iter()
+      .any(|e| e.off <= off && end <= e.off.saturating_add(e.len));
+    if lost && !(covered || off >= base_len) {
+      return Err(VfsError::BaseDrift);
+    }
+    let out = buf.get_mut(..want).ok_or(VfsError::Invalid)?;
+    out.fill(0);
+    if off < base_len && !covered {
+      let disk_want =
+        usize::try_from((base_len - off).min(u64::try_from(want).unwrap_or(u64::MAX))).unwrap_or(0);
+      let witness = self.vol.witness_in(id, no).ok_or(VfsError::BaseDrift)?;
+      let disk = out.get_mut(..disk_want).ok_or(VfsError::Invalid)?;
+      self.read_disk_witnessed(store, no, &witness, off, disk)?;
+    }
+    for e in &pinned {
+      if let Some(bytes) = store.content.extent_bytes(e) {
+        crate::volume::copy_range(bytes, e.off, off, out);
+      }
+    }
+    Ok(want)
+  }
+
+  /// Fills `out` from the disk at `off` through the inode's descriptor while the disk file is still the one
+  /// `witness` fingerprinted, else `BaseDrift`; nothing of the head's drift state is touched.
+  fn read_disk_witnessed(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    witness: &Witness,
+    off: u64,
+    out: &mut [u8],
+  ) -> Result<(), VfsError> {
+    let file = self.descriptor(store, no)?;
+    if self.host.fstat(file).map_err(host_refusal)? != witness.fingerprint {
+      return Err(VfsError::BaseDrift);
+    }
+    let mut done = 0usize;
+    while let Some(rest) = out.get_mut(done..).filter(|rest| !rest.is_empty()) {
+      let at = off.saturating_add(u64::try_from(done).unwrap_or(u64::MAX));
+      let n = self.host.read_at(file, at, rest).map_err(host_refusal)?;
+      if n == 0 {
+        break;
+      }
+      done = done.saturating_add(n);
+    }
+    Ok(())
+  }
+
   /// Fills `out` from the disk at `off` through the inode's descriptor, after the drift check
   /// when the entry is witnessed.
   fn read_disk(
@@ -2582,11 +2680,19 @@ impl Overlay<'_> {
   /// becomes an untouched base entry again (the disk holds it now; the next read comes from
   /// there), a landed whiteout or opaque marker is forgotten, a landed redirect clears its
   /// origin. A scratch volume becomes an overlay over the target (`Base::Path`) first.
+  ///
+  /// A landing of a snapshot (`source`, A-49) advances the head relative to what it landed: an entry the
+  /// head still holds exactly as the snapshot did leaves the overlay; a file the head changed since stays
+  /// private and is rebased onto what landed (its witness becomes the landed file, so the later edit lands
+  /// next as a replacement of it, not a conflict with it); a head whiteout of a landed file keeps deleting
+  /// it, against the landed fingerprint; anything else the head changed stays as it is, for a later landing's
+  /// verdict to decide.
   pub fn land_advance(
     &mut self,
     store: &mut Store,
-    landed: &[String],
+    landed: &[Landed],
     base: Option<BaseConfig>,
+    source: Option<SnapshotId>,
   ) -> Result<(), VfsError> {
     if self.vol.base.is_none() {
       let base = base.ok_or(VfsError::NotOverlay)?;
@@ -2595,14 +2701,140 @@ impl Overlay<'_> {
       let root_no = store.dirs.get(root)?.inode;
       self.vol.base = Some(BasePlane::new(base, root_no));
     }
-    for path in landed {
-      self.forget_landed(store, path)?;
+    for entry in landed {
+      match source {
+        None => self.forget_landed(store, &entry.path)?,
+        Some(id) => self.advance_from_snapshot(store, id, entry)?,
+      }
     }
     // Every listing is stale: the landing changed the directories beneath.
     if let Some(plane) = self.vol.base.as_mut() {
       for l in plane.listings.values_mut() {
         l.entries = None;
       }
+    }
+    Ok(())
+  }
+
+  /// One path a landing of snapshot `id` advanced, applied to the head by how the head's entry there
+  /// compares with the snapshot's.
+  fn advance_from_snapshot(
+    &mut self,
+    store: &mut Store,
+    id: SnapshotId,
+    landed: &Landed,
+  ) -> Result<(), VfsError> {
+    match self.head_against_snapshot(store, id, &landed.path)? {
+      Since::Unchanged => self.forget_landed(store, &landed.path),
+      Since::ChangedFile { no, dir, name } => match landed.written {
+        Some(written) => self.rebase_file(store, no, dir, &name, written),
+        None => Ok(()),
+      },
+      Since::Deleted { dir, name } => {
+        if let Some(written) = landed.written {
+          let at = self.vol.witness_clock();
+          if let Some(plane) = self.vol.base.as_mut() {
+            plane.record_whiteout(dir, &name, written.fingerprint, at);
+          }
+        }
+        Ok(())
+      }
+      Since::Other => Ok(()),
+    }
+  }
+
+  /// How the head's entry at `path` compares with snapshot `id`'s.
+  fn head_against_snapshot(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    path: &str,
+  ) -> Result<Since, VfsError> {
+    let (dir_path, name) = match path.rfind('/') {
+      Some(0) => ("/", path.get(1..).unwrap_or_default()),
+      Some(i) => (
+        path.get(..i).unwrap_or_default(),
+        path.get(i + 1..).unwrap_or_default(),
+      ),
+      None => ("/", path),
+    };
+    let policy = self.vol.policy;
+    let then = match self.vol.resolve_in(store, id, dir_path)?.child {
+      Child::Dir(h) => store
+        .dirs
+        .get(h)?
+        .lookup(&store.blocks, policy, name)
+        .map(|e| e.child),
+      _ => None,
+    };
+    let Ok(Located {
+      child: Child::Dir(head_dir),
+      ..
+    }) = self.vol.resolve(store, dir_path)
+    else {
+      return Ok(Since::Other);
+    };
+    let head_dir = self.vol.head_dir(store, head_dir)?;
+    let dir_no = store.dirs.get(head_dir)?.inode;
+    let now = store
+      .dirs
+      .get(head_dir)?
+      .lookup(&store.blocks, policy, name)
+      .map(|e| e.child);
+    Ok(match (then, now) {
+      (
+        Some(Child::File(a) | Child::Symlink(a) | Child::Fifo(a) | Child::Socket(a)),
+        Some(Child::File(b) | Child::Symlink(b) | Child::Fifo(b) | Child::Socket(b)),
+      ) if a == b
+        && self.vol.inode_in(store, id, a)?.version == self.vol.inode(store, b)?.version =>
+      {
+        Since::Unchanged
+      }
+      (Some(Child::Whiteout), Some(Child::Whiteout)) => Since::Unchanged,
+      (Some(Child::Dir(x)), Some(Child::Dir(y)))
+        if store.dirs.get(x)?.inode == store.dirs.get(y)?.inode =>
+      {
+        Since::Unchanged
+      }
+      (Some(Child::File(_)), Some(Child::File(no))) => Since::ChangedFile {
+        no,
+        dir: dir_no,
+        name: name.into(),
+      },
+      (Some(Child::File(_)), Some(Child::Whiteout)) => Since::Deleted {
+        dir: dir_no,
+        name: name.into(),
+      },
+      _ => Since::Other,
+    })
+  }
+
+  /// A head file changed since the landed snapshot, rebased onto what landed: its witness becomes the
+  /// landed file, at the landed name. A file whose body still reads base ranges from the disk keeps its
+  /// witness (its unpinned bytes are the old base's, which the landed file may not hold): a later landing's
+  /// verdict decides it.
+  fn rebase_file(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    dir: InodeNo,
+    name: &str,
+    written: Witness,
+  ) -> Result<(), VfsError> {
+    if matches!(self.vol.inode(store, no)?.body, Body::Base(_)) {
+      return Ok(());
+    }
+    let at = self.vol.witness_clock();
+    let Some(plane) = self.vol.base.as_mut() else {
+      return Ok(());
+    };
+    if plane.forget_digest(store, no) {
+      plane.digest_stats.invalidated += 1;
+    }
+    plane.record_witness(no, written, Some((dir, name.into())), at);
+    plane.drift.remove(&no);
+    if let Some(stale) = plane.descriptors.remove(&no) {
+      self.host.close_file(stale);
     }
     Ok(())
   }

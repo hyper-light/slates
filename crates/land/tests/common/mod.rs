@@ -96,6 +96,7 @@ pub(crate) fn request(landing_id: u64) -> LandingRequest {
     consumer: CONSUMER.into(),
     volume: VOLUME,
     snapshot: SNAPSHOT,
+    source: slates_land::source::Source::Head,
     grant: None,
     filter: Filter::default(),
     now_ns: 1,

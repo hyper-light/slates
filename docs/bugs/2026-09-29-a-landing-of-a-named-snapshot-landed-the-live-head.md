@@ -52,15 +52,26 @@ that was not the one written.
   make it "changed". That last case cannot pass vacuously: without the retention check, the remaining
   snapshot records would answer `true`.
 
-## Owed
+## Owed, then done (2026-09-30)
 
-Exact landing of an older snapshot:
-- the base plane's witnesses frozen per snapshot, epoch-versioned alongside the tree they describe (a
-  design amendment to §4.5 and §4.15);
-- the engine's source made explicit through plan, validate, write and advance;
-- advancement that takes a landed entry out of the head only when the head's entry still equals what
-  landed, so later live edits stay private.
+Exact landing of an older snapshot, done in two changes:
+- **A-48:** the base plane's witnesses are frozen per snapshot, versioned by epoch alongside the tree
+  they describe.
+  `docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md` records the
+  clone lost update found on the way.
+- **A-49:** the engine's source is explicit (`slates_land::source::Source`) through plan, verdict and
+  write, and the advance is relative to the source. An entry the head still holds exactly as the
+  snapshot did leaves the overlay; a file the head changed since stays private, rebased onto what landed
+  (the fingerprint its placement left and the snapshot's identity); a head whiteout keeps deleting it,
+  against the landed fingerprint; anything else stays for a later verdict.
+  - The server lands a named snapshot as that source. The `Unsupported` refusal and
+    `Volume::unchanged_since` are gone.
+  - Red: the daemon test `crates/server/tests/snapshot_landing.rs` on `57a1f2f` was refused
+    `Unsupported`.
+  - Green: the snapshot's bytes land, the head's edit stays private, and the head then lands over them
+    with no conflict. The engine tests in `crates/land/tests/source.rs` cover the same plus a later
+    delete and an unknown snapshot.
 
-Until then the refusal keeps the substitution from happening. Also owed: the durable landing and grant
-records of an unnamed landing name the volume's head snapshot while the live head lands. They cannot
-gain a source field without a catalog format version, since a `Wire` struct cannot grow a field.
+Still owed: the durable landing and grant records of an unnamed landing name the volume's head snapshot
+while the live head lands. They cannot gain a source field without a catalog format version, since a
+`Wire` struct cannot grow a field.

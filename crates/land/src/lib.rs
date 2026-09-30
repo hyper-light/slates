@@ -34,6 +34,7 @@ pub mod engine;
 pub mod grant;
 pub mod manifest;
 pub mod ramp;
+pub mod source;
 pub mod verdict;
 
 #[cfg(unix)]

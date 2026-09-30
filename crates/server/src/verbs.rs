@@ -7048,16 +7048,16 @@ mod tests {
     });
   }
 
-  /// §4.15 (AUD-29-02): a landing of a named snapshot lands that snapshot's state, never the live head's.
-  /// Exact landing of an older snapshot is owed (the base plane's witnesses are the head's, not frozen per
-  /// snapshot), so a named snapshot lands only while the head is still exactly it, and is refused before any
-  /// host access otherwise; a snapshot the volume does not hold is `NotFound`. Before 2026-09-29 the engine
-  /// planned and wrote the live head while the record named the snapshot. Do: snapshot a volume holding "v1"
-  /// and land it; write "v2" at the head and land the snapshot again; land a snapshot the volume never had.
-  /// Expect: the first goes on to the target (whose path does not exist: `TargetUnavailable`, no write); the
-  /// second and third refuse before the target is reached.
+  /// §4.15 (AUD-29-02, A-49): a landing of a named snapshot presents that snapshot's state, whatever the head
+  /// has become since, and a snapshot the volume does not hold is `NotFound` before any host access. Do:
+  /// snapshot a volume holding "v1" and present the snapshot's landing (into this crate's directory, opened
+  /// read-only: nothing is granted, so nothing is written); write "v2" at the head and present the snapshot
+  /// again, then the head; present a snapshot the volume never had. Expect: the snapshot's second
+  /// presentation carries its first's manifest and the head's another; the unknown one is `NotFound`. Before
+  /// 2026-09-30 the changed head was refused `Unsupported`; before 2026-09-29 the head was landed under the
+  /// snapshot's name.
   #[test]
-  fn a_landing_of_a_named_snapshot_never_lands_a_head_changed_since() {
+  fn a_landing_of_a_named_snapshot_presents_that_snapshot_whatever_the_head_became() {
     crate::daemon::audit_on_shard(|state| {
       let principal = Principal::Uid { uid: 1234 };
       let reply = super::dispatch(
@@ -7095,47 +7095,43 @@ mod tests {
       let super::ReplyBody::Snapshotted { id: snapshot, .. } = reply else {
         panic!("{reply:?}")
       };
-      let land = |state: &mut crate::state::ShardState, snapshot| {
+      let present = |state: &mut crate::state::ShardState, snapshot| {
         crate::landing::land_verb(
           state,
           1,
           &principal,
           crate::landing::LandCall {
             volume: id,
-            snapshot: Some(snapshot),
-            target: "/nonexistent/slates/aud-29-02",
+            snapshot,
+            target: env!("CARGO_MANIFEST_DIR"),
             filter: &slates_ipc::protocol::Filter::default(),
             grant: None,
           },
         )
       };
-      assert!(
-        matches!(
-          land(state, snapshot),
-          super::ReplyBody::Refused {
-            refusal: Refusal::TargetUnavailable { .. }
-          }
-        ),
-        "the head is still the snapshot: the landing goes on to its target"
-      );
+      let manifest_of = |reply: super::ReplyBody| match reply {
+        super::ReplyBody::GrantRequired { manifest, .. } => manifest,
+        other => panic!("not presented: {other:?}"),
+      };
+      let before = manifest_of(present(state, Some(snapshot)));
       {
         let slot = state.volumes.get_mut(handle).unwrap();
         slot.volume.write(&mut state.store, file, 0, b"v2").unwrap();
       }
-      let changed = land(state, snapshot);
-      assert!(
-        matches!(
-          &changed,
-          super::ReplyBody::Refused {
-            refusal: Refusal::Unsupported { .. }
-          }
-        ),
-        "a head changed since the snapshot must not be landed as it: {changed:?}"
+      assert_eq!(
+        manifest_of(present(state, Some(snapshot))),
+        before,
+        "the snapshot presents what it froze"
+      );
+      assert_ne!(
+        manifest_of(present(state, None)),
+        before,
+        "the head presents what it became"
       );
       let never = super::SnapshotId {
         value: snapshot.value.wrapping_add(1 << u32::BITS),
       };
-      let unknown = land(state, never);
+      let unknown = present(state, Some(never));
       assert!(
         matches!(
           &unknown,

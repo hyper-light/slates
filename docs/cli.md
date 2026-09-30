@@ -323,6 +323,8 @@ human saw, the scope and the term — which the daemon recomputes before issuing
 not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+`land --snapshot N` lands that snapshot exactly as it was taken, whatever the volume has become since; the
+volume's later edits stay private, and a later `land` without `--snapshot` lands them over it.
 One landing at a time writes into a directory, whichever volume lands and however its path is
 spelled: another landing into it meanwhile is refused `LandingLeaseHeld` (exit 1) and can be retried
 once the first has replied. `slates status` counts each shard's `landings_in_flight` and
