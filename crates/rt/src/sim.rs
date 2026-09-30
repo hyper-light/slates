@@ -882,13 +882,15 @@ impl Driver for SimDriver {
 /// A set of simulated shards on the calling thread.
 pub struct SimRuntime {
   shards: Vec<&'static ShardContext>,
-  /// The simulation clock, read here and borrowed by the drivers for the life of their contexts.
-  clock: &'static SimShared,
-  /// The clock's allocation, owned here as a raw pointer and freed in `Drop` after every context is
+  /// The simulation clock's allocation — read here ([`SimRuntime::clock`]) and borrowed by the drivers for
+  /// the life of their contexts — owned here as a raw pointer and freed in `Drop` after every context is
   /// reclaimed. A raw pointer, not a `Box`: moving a `Box` (into this struct, or this struct out of
   /// `new`) is a unique retag of its allocation under Stacked Borrows, which invalidated the shared
   /// borrows the drivers already held — Miri caught the drivers' next `now_ns` reading through a tag
-  /// no longer on the borrow stack (2026-09-16; `-p slates-rt --test differential`).
+  /// no longer on the borrow stack (2026-09-16; `-p slates-rt --test differential`). And no reference to it
+  /// is a field: a runtime passed by value (`drop(sim)`) has its reference fields protected for the call, and
+  /// freeing their target inside it is undefined behaviour — Miri caught the old `clock: &'static` field so
+  /// (2026-09-30; `-p slates-rt --test ownership`).
   clock_allocation: std::ptr::NonNull<SimShared>,
   shared: Vec<&'static SimShared>,
 }
@@ -920,13 +922,20 @@ impl Drop for SimRuntime {
       crate::registry::unregister(id);
     }
     // SAFETY: the allocation was made by `Box::new` in `new` and is freed exactly once, here, after
-    // every context — and so every driver holding a `&'static` into it — was reclaimed above; nothing
-    // reads `self.clock` after this.
+    // every context — and so every driver holding a `&'static` into it — was reclaimed above; no field
+    // holds a reference into it, and nothing reads the clock after this.
     unsafe { drop(Box::from_raw(self.clock_allocation.as_ptr())) };
   }
 }
 
 impl SimRuntime {
+  /// The simulation clock, lent for this runtime's borrow.
+  fn clock(&self) -> &SimShared {
+    // SAFETY: the allocation lives from `new` until this runtime's `Drop` frees it, and the returned borrow
+    // is bounded by `&self`, so it ends before the drop; the allocation is never moved through a `Box`.
+    unsafe { self.clock_allocation.as_ref() }
+  }
+
   /// Builds `config.shards` simulated shards sharing one clock seeded by `seed`.
   pub fn new(config: &RuntimeConfig, seed: u64) -> Result<SimRuntime, RtError> {
     let clock_allocation = std::ptr::NonNull::from(Box::leak(Box::new(SimShared::new(seed))));
@@ -984,7 +993,6 @@ impl SimRuntime {
       .collect::<Result<Vec<_>, _>>()?;
     Ok(SimRuntime {
       shards,
-      clock,
       clock_allocation,
       shared,
     })
@@ -997,7 +1005,7 @@ impl SimRuntime {
 
   /// Virtual now.
   pub fn now_ns(&self) -> u64 {
-    self.clock.now_ns()
+    self.clock().now_ns()
   }
 
   /// Spawns a detached task on a shard.
@@ -1028,7 +1036,7 @@ impl SimRuntime {
   pub fn run_until_idle(&mut self) -> u64 {
     let mut steps = 0u64;
     loop {
-      sim_fabric_deliver_due(self.clock.now_ns());
+      sim_fabric_deliver_due(self.clock().now_ns());
       let mut any_work = false;
       let mut earliest: Option<u64> = None;
       for index in 0..self.shards.len() {
@@ -1060,8 +1068,8 @@ impl SimRuntime {
       }
       match earliest {
         Some(deadline) => {
-          if deadline > self.clock.now_ns() {
-            self.clock.now_ns.store(deadline, Ordering::Release);
+          if deadline > self.clock().now_ns() {
+            self.clock().now_ns.store(deadline, Ordering::Release);
           }
         }
         None => break,
@@ -1072,11 +1080,10 @@ impl SimRuntime {
 
   /// Advances the clock by `ns` without running anything (a pause in the story).
   pub fn advance(&mut self, ns: u64) {
-    let now = self.clock.now_ns();
-    self
-      .clock
+    let clock = self.clock();
+    clock
       .now_ns
-      .store(now.saturating_add(ns), Ordering::Release);
+      .store(clock.now_ns().saturating_add(ns), Ordering::Release);
   }
 
   /// A shard's context, for counters and joins in tests.
