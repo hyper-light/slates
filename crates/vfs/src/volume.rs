@@ -2663,7 +2663,7 @@ impl Volume {
         Dead::Chunk(handle, born) if self.owns(*born) => store.content.chunk(*handle),
         _ => None,
       })
-      .map(|chunk| u64::try_from(chunk.block.len).unwrap_or(u64::MAX))
+      .map(|chunk| u64::try_from(chunk.block.len()).unwrap_or(u64::MAX))
       .fold(0u64, u64::saturating_add)
   }
 
@@ -2715,14 +2715,14 @@ impl Volume {
         ExtentSrc::Zero => None,
       })
       .filter(|chunk| self.retains(chunk.born))
-      .map(|chunk| block_len(chunk.block.len))
+      .map(|chunk| block_len(chunk.block.len()))
       .fold(0u64, u64::saturating_add);
     if let Body::Open { open, .. } = &inode.body
       && open.len > 0
       && touched(open.off, open.len)
       && self.retains(open.born)
     {
-      retained = retained.saturating_add(block_len(open.block.len));
+      retained = retained.saturating_add(block_len(open.block.len()));
     }
     Ok(retained)
   }
@@ -2840,7 +2840,7 @@ impl Volume {
         let len = store
           .content
           .chunk(handle)
-          .map_or(0, |c| u64::try_from(c.block.len).unwrap_or(u64::MAX));
+          .map_or(0, |c| u64::try_from(c.block.len()).unwrap_or(u64::MAX));
         let covered = len.min(self.retention_prepaid);
         self.retention_prepaid -= covered;
         let mut charged = covered;
@@ -3943,7 +3943,7 @@ pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epo
     ExtentSrc::Chunk { chunk, .. } => store
       .content
       .chunk(chunk)
-      .map(|c| (c.born, u64::try_from(c.block.len).unwrap_or(u64::MAX))),
+      .map(|c| (c.born, u64::try_from(c.block.len()).unwrap_or(u64::MAX))),
     ExtentSrc::Zero => None,
   };
   match &inode.body {
@@ -3951,7 +3951,10 @@ pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epo
     Body::Sealed(extents) => extents.iter().filter_map(sealed_block).collect(),
     Body::Open { open, sealed } => {
       let mut out: Vec<(Epoch, u64)> = sealed.iter().filter_map(sealed_block).collect();
-      out.push((open.born, u64::try_from(open.block.len).unwrap_or(u64::MAX)));
+      out.push((
+        open.born,
+        u64::try_from(open.block.len()).unwrap_or(u64::MAX),
+      ));
       out
     }
     Body::Base(b) => b.pinned.iter().filter_map(sealed_block).collect(),
@@ -4098,7 +4101,7 @@ fn rebuilt_if_smaller(
   let ExtentSrc::Chunk { chunk, .. } = clipped.src else {
     return Ok(clipped);
   };
-  let block = store.content.chunk(chunk).map_or(0, |c| c.block.len);
+  let block = store.content.chunk(chunk).map_or(0, |c| c.block.len());
   let need = usize::try_from(clipped.len).unwrap_or(usize::MAX);
   if store.content.block_bytes(need) >= block {
     return Ok(clipped);

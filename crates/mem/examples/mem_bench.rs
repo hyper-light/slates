@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ),
   );
 
-  let mut buddy = Buddy::new(page, 12);
+  let mut buddy = Buddy::new(page, 12)?;
   report(
     "buddy alloc+free (one page)",
     measure(

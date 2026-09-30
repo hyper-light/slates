@@ -74,6 +74,40 @@ pub enum MemError {
     /// The object's length.
     len: usize,
   },
+  /// A free that names no live block this allocator handed out (AUD-29-10): nothing changed.
+  ForeignExtent {
+    /// The offset the freed extent named.
+    offset: usize,
+    /// The length the freed extent named.
+    len: usize,
+    /// Why it names no live block.
+    reason: ExtentRefusal,
+  },
+  /// A block head's or a slot's generation space is spent: it is retired rather than wrapped, so a stale
+  /// reference to it can never be mistaken for a live one (AUD-29-11).
+  GenerationExhausted {
+    /// The granule or slot index whose generations are spent.
+    index: u32,
+  },
+}
+
+/// Why a freed extent names no live block (AUD-29-10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtentRefusal {
+  /// Another arena issued it.
+  OtherArena,
+  /// Its region is not one of this arena's.
+  NoSuchRegion,
+  /// Its offset is not on a granule, or not on its block size's boundary.
+  Misaligned,
+  /// Its length is not exactly one block's (a power-of-two number of granules).
+  WrongLength,
+  /// It lies past the region's end.
+  OutOfRange,
+  /// No live block starts there with that length: it is free (a duplicate free) or inside another block.
+  NotAllocated,
+  /// The block there was freed and handed out again since: the extent is a stale copy.
+  Stale,
 }
 
 impl fmt::Display for MemError {
@@ -122,6 +156,17 @@ impl fmt::Display for MemError {
           f,
           "offset {offset} is misaligned or past the {len}-byte object"
         )
+      }
+      Self::ForeignExtent {
+        offset,
+        len,
+        reason,
+      } => write!(
+        f,
+        "extent at {offset} of {len} bytes names no live block: {reason:?}"
+      ),
+      Self::GenerationExhausted { index } => {
+        write!(f, "generations of index {index} are spent; it is retired")
       }
     }
   }

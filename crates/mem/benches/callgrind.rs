@@ -79,7 +79,7 @@ fn slab_insert_remove(mut slab: Slab<[u8; 64]>) -> Result<([u8; 64], usize), Mem
 }
 
 fn buddy() -> Buddy {
-  Buddy::new(4096, 12)
+  require_success(Buddy::new(4096, 12), "construct the benchmark allocator")
 }
 
 fn check_buddy(result: Result<(usize, usize, usize), MemError>) {
@@ -91,7 +91,10 @@ fn check_buddy(result: Result<(usize, usize, usize), MemError>) {
 #[library_benchmark(teardown = check_buddy)]
 #[bench::one_page(buddy())]
 fn buddy_alloc_free_page(mut buddy: Buddy) -> Result<(usize, usize, usize), MemError> {
-  count_instructions(move || {
+  // Borrowed, not moved: the allocator's own destruction is not part of one alloc and free (measured
+  // 2026-09-30: freeing its per-granule tables was 763 of this row's 2,077 instructions, and an added
+  // table read as a 142-instruction regression of operations that had become 82 cheaper).
+  count_instructions(|| {
     let block = buddy.alloc(4096)?;
     black_box(buddy.free(block))?;
     Ok(black_box((
@@ -105,7 +108,10 @@ fn buddy_alloc_free_page(mut buddy: Buddy) -> Result<(usize, usize, usize), MemE
 #[library_benchmark(teardown = check_buddy)]
 #[bench::split_and_coalesce(buddy())]
 fn buddy_alloc_free_split(mut buddy: Buddy) -> Result<(usize, usize, usize), MemError> {
-  count_instructions(move || {
+  // Borrowed, not moved: the allocator's own destruction is not part of one alloc and free (measured
+  // 2026-09-30: freeing its per-granule tables was 763 of this row's 2,077 instructions, and an added
+  // table read as a 142-instruction regression of operations that had become 82 cheaper).
+  count_instructions(|| {
     let page = buddy.alloc(4096)?;
     let large = buddy.alloc(4096 * 64)?;
     black_box(buddy.free(large))?;

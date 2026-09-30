@@ -8,19 +8,49 @@
 //! refuse in turn. Nothing here reaches the system allocator after the region set is built
 //! (AC-0.4); a region's buddy state is allocated once when the region is added.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::buddy::{Block, Buddy};
-use crate::error::MemError;
+use crate::error::{ExtentRefusal, MemError};
 use crate::region::Region;
 
-/// An extent within a region.
+/// The identities handed to arenas so far in this process: an extent carries its arena's, so a free into
+/// another arena is refused (AUD-29-10). Taken once per arena, on a cold path.
+static ARENAS: AtomicU64 = AtomicU64::new(0);
+
+/// An extent within a region, as the arena that allocated it issued it. Only this crate constructs one,
+/// and a free is accepted only from the issuing arena for the live allocation it names (AUD-29-10).
+///
+/// ```compile_fail
+/// let forged = slates_mem::arena::Extent { region: 0, offset: 1, len: 4095 };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Extent {
+  arena: u64,
+  region: u16,
+  block: Block,
+}
+
+impl Extent {
   /// The region's index within the arena.
-  pub region: u16,
+  pub const fn region(&self) -> u16 {
+    self.region
+  }
+
   /// Byte offset within the region.
-  pub offset: usize,
+  pub const fn offset(&self) -> usize {
+    self.block.offset()
+  }
+
   /// Length in bytes (the allocated block, which may exceed what was asked).
-  pub len: usize,
+  pub const fn len(&self) -> usize {
+    self.block.len()
+  }
+
+  /// Whether the extent is empty (never: an extent holds at least one granule).
+  pub const fn is_empty(&self) -> bool {
+    self.block.is_empty()
+  }
 }
 
 #[derive(Debug)]
@@ -32,6 +62,8 @@ struct Slot {
 /// The arena.
 #[derive(Debug)]
 pub struct ChunkArena {
+  /// This arena's identity, or `None` when the process has spent them (it then refuses every allocation).
+  identity: Option<u64>,
   slots: Vec<Slot>,
   granule: usize,
   allocated_bytes: usize,
@@ -40,7 +72,15 @@ pub struct ChunkArena {
 impl ChunkArena {
   /// An arena whose blocks are multiples of `granule` bytes (the base page, from the profile).
   pub fn new(granule: usize) -> Self {
+    // Checked, never wrapped: 2^64 arenas cannot be made in practice, but a spent space refuses by type.
+    let identity = ARENAS
+      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |taken| {
+        taken.checked_add(1)
+      })
+      .ok()
+      .and_then(|taken| taken.checked_add(1));
     Self {
+      identity,
       slots: Vec::new(),
       granule: granule.max(1),
       allocated_bytes: 0,
@@ -64,7 +104,7 @@ impl ChunkArena {
     })?;
     self.slots.push(Slot {
       region,
-      buddy: Buddy::new(self.granule, max_order),
+      buddy: Buddy::new(self.granule, max_order)?,
     });
     Ok(index)
   }
@@ -116,15 +156,21 @@ impl ChunkArena {
 
   /// Allocates at least `len` bytes from the first region that can serve it.
   pub fn alloc(&mut self, len: usize) -> Result<Extent, MemError> {
+    let arena = self
+      .identity
+      .ok_or(MemError::GenerationExhausted { index: u32::MAX })?;
     let mut largest = 0;
     for (index, slot) in self.slots.iter_mut().enumerate() {
+      let Ok(region) = u16::try_from(index) else {
+        break;
+      };
       match slot.buddy.alloc(len) {
         Ok(block) => {
-          self.allocated_bytes += block.len;
+          self.allocated_bytes = self.allocated_bytes.saturating_add(block.len());
           return Ok(Extent {
-            region: u16::try_from(index).unwrap_or(u16::MAX),
-            offset: block.offset,
-            len: block.len,
+            arena,
+            region,
+            block,
           });
         }
         Err(MemError::ArenaExhausted { largest_free, .. }) => largest = largest.max(largest_free),
@@ -153,20 +199,23 @@ impl ChunkArena {
     }
   }
 
-  /// Frees an extent.
+  /// Frees an extent this arena issued for a live allocation; anything else is refused
+  /// ([`MemError::ForeignExtent`]) with every total unchanged.
   pub fn free(&mut self, extent: Extent) -> Result<(), MemError> {
+    let foreign = |reason| MemError::ForeignExtent {
+      offset: extent.offset(),
+      len: extent.len(),
+      reason,
+    };
+    if self.identity != Some(extent.arena) {
+      return Err(foreign(ExtentRefusal::OtherArena));
+    }
     let slot = self
       .slots
       .get_mut(usize::from(extent.region))
-      .ok_or(MemError::TooLarge {
-        len: extent.len,
-        max: 0,
-      })?;
-    slot.buddy.free(Block {
-      offset: extent.offset,
-      len: extent.len,
-    })?;
-    self.allocated_bytes -= extent.len;
+      .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
+    slot.buddy.free(extent.block)?;
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(extent.len());
     Ok(())
   }
 
@@ -183,7 +232,7 @@ impl ChunkArena {
     slot
       .region
       .bytes()
-      .get(extent.offset..extent.offset.checked_add(extent.len)?)
+      .get(extent.offset()..extent.offset().checked_add(extent.len())?)
   }
 
   /// The bytes of an extent, mutably.
@@ -192,7 +241,7 @@ impl ChunkArena {
     slot
       .region
       .bytes_mut()
-      .get_mut(extent.offset..extent.offset.checked_add(extent.len)?)
+      .get_mut(extent.offset()..extent.offset().checked_add(extent.len())?)
   }
 
   /// A region, for the locking sequence and the pre-fault scheduler.
@@ -233,9 +282,9 @@ mod tests {
     let mut arena = two_regions(p);
     assert_eq!(arena.regions(), 2);
     let a = arena.alloc(p * 3).unwrap();
-    assert_eq!((a.region, a.offset, a.len), (0, 0, p * 4));
+    assert_eq!((a.region(), a.offset(), a.len()), (0, 0, p * 4));
     let b = arena.alloc(p).unwrap();
-    assert_eq!(b.region, 1);
+    assert_eq!(b.region(), 1);
     assert_eq!(arena.allocated_bytes(), p * 5);
     arena.bytes_mut(b).unwrap()[0] = 9;
     assert_eq!(arena.bytes(b).unwrap()[0], 9);

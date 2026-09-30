@@ -40,7 +40,7 @@ pub mod shared;
 pub mod slab;
 
 pub use arena::{ChunkArena, Extent};
-pub use error::MemError;
+pub use error::{ExtentRefusal, MemError};
 pub use handle::{Encoded, Handle};
 pub use mpsc::MpscRing;
 pub use region::Region;

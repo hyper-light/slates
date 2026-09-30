@@ -172,7 +172,7 @@ impl ChunkStore {
   /// Grows an open extent's block to hold `need` bytes, copying what was written; refuses past a
   /// chunk.
   pub fn grow(&mut self, open: &mut OpenExtent, need: usize) -> Result<(), VfsError> {
-    if need <= open.block.len {
+    if need <= open.block.len() {
       return Ok(());
     }
     if need > self.chunk_bytes {
@@ -242,7 +242,7 @@ impl ChunkStore {
     open.len = open.len.min(len);
     let keep = usize::try_from(open.len).unwrap_or(usize::MAX);
     let want = self.block_bytes(keep);
-    if want >= open.block.len {
+    if want >= open.block.len() {
       return Ok(());
     }
     let block = self.arena.alloc(want)?;
@@ -359,10 +359,10 @@ mod tests {
   fn an_open_extent_grows_by_pages_and_zero_fills_gaps() {
     let mut s = store();
     let mut open = s.open(0, 10, Epoch(0)).unwrap();
-    assert_eq!(open.block.len, 4096);
+    assert_eq!(open.block.len(), 4096);
     s.write_open(&mut open, 0, b"hello").unwrap();
     s.write_open(&mut open, 5000, b"far").unwrap();
-    assert_eq!(open.block.len, 8192, "grew by a page multiple");
+    assert_eq!(open.block.len(), 8192, "grew by a page multiple");
     assert_eq!(open.len, 5003);
     assert_eq!(&s.open_bytes(&open)[..5], b"hello");
     assert_eq!(

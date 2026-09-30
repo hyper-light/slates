@@ -62,7 +62,7 @@ fn a_budget_over_usable_capacity_never_over_promises_what_the_arena_can_back() {
   let extent = arena
     .alloc(capacity)
     .expect("what the budget admitted, the arena backs");
-  assert_eq!(extent.len, capacity);
+  assert_eq!(extent.len(), capacity);
   arena.free(extent).unwrap();
   budget.release(reservation);
 }

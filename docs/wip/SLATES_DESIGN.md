@@ -961,6 +961,15 @@ cannot grow a vector of tombstones. Segment, slab and buddy geometry report usab
 not mapping length. Conversion, rounding, counter arithmetic and generation exhaustion are
 checked and refuse before mutation.
 
+> **Status (2026-09-30, AUD-29-10).** An arena frees only the live extents it issued. An extent's fields are
+> private, so only `slates-mem` constructs one. It carries its arena's identity and its allocation's
+> incarnation. A free that is misaligned, of the wrong length, outside the region, not allocated
+> (duplicate or interior), stale after reuse, or from another arena is refused `ForeignExtent` with
+> every total unchanged. A spent incarnation refuses `GenerationExhausted` rather than wrapping. The
+> buddy's granule is a power of two, and the validated path costs fewer instructions than the unvalidated
+> one did (`docs/bugs/2026-09-30-the-buddy-allocator-accepted-a-forged-free.md`; BENCHMARKS "Validated
+> frees").
+
 Before admitting content, the server prepares and locks the memory that will back it and its
 metadata. This includes rings, logs, parse buffers, decompression, copies, archive construction,
 base caches, guest request buffers and retained versions. An uncharged heap allocation cannot

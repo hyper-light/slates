@@ -68,6 +68,27 @@ allocator calls across eight rounds of 1,024 slab inserts and removes and 12 bud
 and frees and finds none; loom explores every interleaving of the SPSC ring (one producer, one
 consumer) and the MPSC ring (two producers, one consumer) and finds no lost or reordered word.
 
+**Validated frees (2026-09-30, AUD-29-10).** A free now names its allocation exactly (offset on its size's
+boundary, exact length, incarnation, arena); the granule is a power of two, so every conversion is a shift.
+Instruction counts, `cargo bench -p slates-mem --bench callgrind --features slates-mem/instruction-counts`
+in a Linux container (aarch64, valgrind 3.24, `--security-opt seccomp=unconfined` for `setarch`), each tree
+in its own target directory:
+
+| Operation | Before (`5922adf`) | After | Change |
+|---|---|---|---|
+| Buddy alloc+free, one page | 1,295 | 1,218 | −77 (−5.9%) |
+| Buddy alloc+free, 64 pages split and coalesced | 1,507 | 1,479 | −28 (−1.9%) |
+
+Measured and rejected, same day:
+- **The bench as it stood.** It counted the allocator's destruction inside each alloc+free: freeing its
+  tables was 763 of 2,077 instructions, and one added table read as a 142-instruction regression of
+  operations that had become 82 cheaper (`callgrind_annotate` per function). The two buddy benches now
+  borrow the allocator.
+- **`#[inline]` on the allocator's checked helpers.** No better on the wall clock (one page 38–39 ns
+  against 32–34), so it is not kept.
+- **The wall clock.** At load average 11 it could not resolve the few-nanosecond question: the same
+  binary's one-page row ranged 31–44 ns between rounds. The instruction count decided it.
+
 What it means: a slab operation costs a tenth of a syscall and a buddy operation a third; the
 ring round trip is about two and a half core-to-core cache-line transfers on this machine
 (the profile's ring matrix measured 132–190 ns per pair), which is the cost floor for a
