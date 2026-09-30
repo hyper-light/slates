@@ -3164,13 +3164,16 @@ the tables are heap outside the metadata ledger (§4.2).
 baseline requirement on every platform, Windows included: only a base read (host directory or remote file
 server) and a granted landing touch disk. No `/tmp`, no temporary directory, no RAM directory (tmpfs,
 `/dev/shm`, RAM disks are filesystems), in tests as in the product. The contract is in the design (§0.2) and
-its site table is enforced by `cargo xtask check`. Defects to remove: the CLI's reads of fleet manifest,
-certificate, key and recovery-key files; landing targets, bases and mount points that tests make under the
-system temporary directory (`mktemp -d`), which move to the build output (a landing writes a real disk by
-design, and tests exercise it for real); other test scratch and xtask conformance scratch under `$RUNNER_TEMP`
-or `mktemp -d`;
-persisted proptest failures (AUD-29-63); proof of what backs each kernel pseudo-file the machine profile
-reads. The residency, disclosure and ownership claims stay open with their findings (AUD-29-41, -42, -43,
+its site table is enforced by `cargo xtask check`. **Done 2026-09-30:** every test's real host directory
+(landing targets, bases, kernel mount points, conformance scratch and records) is in the build output on every
+host; `mktemp`, `$RUNNER_TEMP`, `/dev/shm` and the `SLATES_TEST_RAMDIR` gate are gone, so the OS landing,
+removal, base-watcher and host-differential suites run on macOS too; the tracer judges `/dev/shm` writes as
+outside. That found the dead kqueue base watcher (fixed,
+`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`) and a removal oracle that
+held only on tmpfs (fixed, `docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
+Defects still to remove: the CLI's reads of fleet manifest, certificate, key and recovery-key files (and the
+test fixtures that write them); persisted proptest failures (AUD-29-63); proof of what backs each kernel
+pseudo-file the machine profile reads. The residency, disclosure and ownership claims stay open with their findings (AUD-29-41, -42, -43,
 -44, -45, -59, -62).
 
 **Closed 2026-09-30 — AUD-29-02 (A-48, A-49): a landing lands exactly the snapshot it names.** The engine's

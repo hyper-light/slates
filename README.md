@@ -59,7 +59,7 @@ $ slates volume create scratch --bounded 512MiB
 id: 0001000000000371fd39000000000001
 path: (none until a bridge exists)
 
-$ MNT=$(mktemp -d) && slates mount 0001000000000371fd39000000000001 $MNT
+$ MNT=~/slates-mnt && mkdir -p $MNT && slates mount 0001000000000371fd39000000000001 $MNT
 mounted: /private/var/folders/1s/.../T/slates-readme-9_w1qw5m
 
 $ printf 'written through the mount\n' > $MNT/hello.txt && cat $MNT/hello.txt
@@ -133,7 +133,7 @@ snapshot: 0
 $ slates volume clone 0001000000000371fd39000000000001 0 copy
 id: 000100000000043df000000000000004
 
-$ MNT=$(mktemp -d) && slates mount 0001000000000371fd39000000000001 $MNT
+$ MNT=~/slates-mnt && mkdir -p $MNT && slates mount 0001000000000371fd39000000000001 $MNT
 mounted: /private/var/folders/1s/.../T/slates-readme-9_w1qw5m
 ```
 

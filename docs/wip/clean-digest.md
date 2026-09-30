@@ -195,6 +195,9 @@ lines over `std::time`) is owed to the `windows-latest` CI lane's clippy, as the
   parity did not require `digest`; adding it is mechanical.
 - **The RAM-directory differential** was not run here (no RAM-backed directory on this macOS box;
   it skips loudly). CI Linux runs it under `/dev/shm`.
+  *Correction 2026-09-30 (A-50):* the gate is gone and the test runs on every host in the build
+  output. Its first macOS run found that the kqueue watcher had never delivered a hint
+  (`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`): the skip hid it.
 - **The record neighbourhood of the bound**: `DIGEST_SHARE_OF_INODE_TABLE` is a ratified shape until
   the digest hit rate is measured; the counters exist for that measurement.
 

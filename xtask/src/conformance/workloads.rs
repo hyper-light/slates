@@ -213,25 +213,18 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::path::PathBuf;
 
   /// AC-3.2 / T-3.3: run the real editor save workload in ordinary and TMPDIR-matching paths.
   /// Both must retain the original bytes in the backup and write the edited bytes to the new file.
-  /// The caller supplies RAM-backed scratch; no mount, installation or privilege is performed here.
+  /// The scratch is in the build output (A-50); no mount, installation or privilege is performed here.
   #[test]
   fn an_editor_save_preserves_its_backup_even_inside_tmpdir() {
-    let Some(ram) = std::env::var_os("SLATES_TEST_RAMDIR") else {
-      eprintln!("skipping real Vim save history: set SLATES_TEST_RAMDIR to a RAM-backed directory");
-      return;
-    };
     if !tool_on_path("vim") {
       eprintln!("skipping real Vim save history: vim is absent");
       return;
     }
-    let path = PathBuf::from(ram).join(format!("slates-editor-{}", std::process::id()));
-    // Development-tool fixture, created only beneath the caller's explicitly supplied RAM directory.
-    #[allow(clippy::disallowed_methods)]
-    std::fs::create_dir(&path).unwrap();
+    let path =
+      crate::conformance::build_output(&format!("slates-editor-{}", std::process::id())).unwrap();
     let scratch = super::super::Scratch { path, keep: false };
     let ordinary = scratch.path().join("ordinary");
     let temporary = scratch.path().join("temporary");

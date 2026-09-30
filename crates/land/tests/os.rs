@@ -1,11 +1,11 @@
 //! The landing over the operating system (Phase 1 task 11; §4.15 step 6, §4.13): a real
-//! directory on a RAM-backed filesystem named by `SLATES_TEST_RAMDIR` (CI Linux: `/dev/shm`);
-//! without it every test here skips loudly and passes. Nothing is written outside the named
+//! directory on the host's disk in the build output (`CARGO_TARGET_TMPDIR`, under `target/`),
+//! on every host (A-50: never `/tmp`, never a RAM directory). Nothing is written outside that
 //! directory; each test works in its own subdirectory named with the process id and removes it.
 //!
 //! Covered: the worked example's shape against the disk (bytes, modes, mtimes, symlinks,
 //! removals, a directory rename), containment refusals (a symlink component, `..`), idempotent
-//! re-run by hash, and T-1.15's real `kill -9` on tmpfs: a child process lands round after
+//! re-run by hash, and T-1.15's real `kill -9` on the host's disk: a child process lands round after
 //! round until killed; every file is then a whole round, never torn; the parent resumes with
 //! the child's last landing id, sweeps its siblings and reaches the reference.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
@@ -28,27 +28,22 @@ use common::{
   symlink, unlink, write_file,
 };
 
-/// Format: the environment variable naming the RAM-backed directory.
-const RAM_DIR: &str = "SLATES_TEST_RAMDIR";
 /// Format: the environment variable that turns this binary into the kill test's child.
 const CHILD_DIR: &str = "SLATES_LAND_CHILD_DIR";
 /// Shape: files per round of the kill test.
 const KILL_FILES: usize = 64;
 /// Shape: how long the parent lets the child land before the kill, milliseconds; long enough
-/// for several rounds on tmpfs (a round of 64 files measured under 5 ms there).
+/// for several rounds (a round of 64 files measured under 5 ms on tmpfs; the parent waits for
+/// the first round before the clock starts, so a slower disk only lands fewer rounds).
 const KILL_AFTER_MS: u64 = 40;
 /// Shape: the parent waits at most this long for the child's first round.
 const CHILD_START_MS: u64 = 5_000;
 
-/// The RAM directory, or `None` with a loud skip.
-fn ram_dir(test: &str) -> Option<PathBuf> {
-  match std::env::var_os(RAM_DIR) {
-    Some(dir) => Some(PathBuf::from(dir)),
-    None => {
-      println!("{test}: skipped — set {RAM_DIR} to a RAM-backed directory (CI Linux: /dev/shm)");
-      None
-    }
-  }
+/// The build output (`CARGO_TARGET_TMPDIR`, under `target/`): the real host directory this test lands into
+/// and reads from (A-50: a landing writes the host's disk and a base is read from it, so tests exercise both
+/// for real — never under `/tmp` and never in a RAM directory).
+fn build_output() -> PathBuf {
+  PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
 /// A fresh working directory for one test, named with the process id, and its removal.
@@ -60,7 +55,7 @@ impl Workspace {
   fn new(base: &Path, test: &str) -> Self {
     let path = base.join(format!("slates-land-{}-{test}", std::process::id()));
     // The test harness is the one place a test writes a host path outside a landing: the
-    // RAM-backed scratch directory it removes at the end (CLAUDE.md §4).
+    // build-output directory it removes at the end (CLAUDE.md §4).
     #[allow(clippy::disallowed_methods)]
     std::fs::create_dir_all(&path).unwrap();
     Self { path }
@@ -159,9 +154,7 @@ fn assert_example_on_disk(root: &Path) {
 /// The worked example against a real directory, then an idempotent re-run.
 #[test]
 fn the_worked_example_lands_on_a_real_directory() {
-  let Some(ram) = ram_dir("the_worked_example_lands_on_a_real_directory") else {
-    return;
-  };
+  let ram = build_output();
   let ws = Workspace::new(&ram, "example");
   seed_example(&ws.path);
   let (mut host, target) = OsLand::open_target(&ws.path).unwrap();
@@ -204,9 +197,7 @@ fn the_worked_example_lands_on_a_real_directory() {
 /// Containment: a symlink component and `..` are refused before the lease; a relative path too.
 #[test]
 fn a_target_path_that_escapes_is_refused() {
-  let Some(ram) = ram_dir("a_target_path_that_escapes_is_refused") else {
-    return;
-  };
+  let ram = build_output();
   let ws = Workspace::new(&ram, "escape");
   seed_dir(&ws.path.join("real"));
   #[allow(clippy::disallowed_methods)]
@@ -247,10 +238,7 @@ fn a_target_path_that_escapes_is_refused() {
 /// beneath that directory, without leaving a sibling outside the grant.
 #[test]
 fn a_scratch_volume_into_an_empty_real_directory_preserves_the_target() {
-  let Some(ram) = ram_dir("a_scratch_volume_into_an_empty_real_directory_preserves_the_target")
-  else {
-    return;
-  };
+  let ram = build_output();
   let ws = Workspace::new(&ram, "stage");
   seed_dir(&ws.path.join("out"));
   let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
@@ -397,10 +385,8 @@ fn assert_whole_rounds(root: &Path, last: u64) {
 /// T-1.15 on a real filesystem: `kill -9` mid-landing; every file is a whole round; the resume
 /// with the child's landing id sweeps the siblings and lands the round in full.
 #[test]
-fn t_1_15_kill_9_on_tmpfs_leaves_every_file_old_or_new() {
-  let Some(ram) = ram_dir("t_1_15_kill_9_on_tmpfs_leaves_every_file_old_or_new") else {
-    return;
-  };
+fn t_1_15_kill_9_on_the_disk_leaves_every_file_old_or_new() {
+  let ram = build_output();
   let ws = Workspace::new(&ram, "kill");
   for f in 0..KILL_FILES {
     seed_file(&ws.path.join(format!("f{f}")), &round_bytes(0, f));

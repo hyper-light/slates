@@ -104,9 +104,9 @@ const LINUX_NFS_ADAPTER: Adapter = Adapter {
 };
 
 /// Tools every mounted macOS suite needs.
-const MACOS_MOUNT_TOOLS: &[&str] = &["mount_nfs", "umount", "mktemp", "sh"];
+const MACOS_MOUNT_TOOLS: &[&str] = &["mount_nfs", "umount", "sh"];
 /// Tools every mounted Linux suite needs (root mounts through the OS client).
-const LINUX_MOUNT_TOOLS: &[&str] = &["mount", "umount", "mktemp", "sh", "sudo"];
+const LINUX_MOUNT_TOOLS: &[&str] = &["mount", "umount", "sh", "sudo"];
 
 /// The availability of a cell.
 pub fn availability(transport: Transport, suite: Suite) -> Availability {
@@ -127,7 +127,7 @@ fn native_macos(suite: Suite) -> Availability {
   match suite {
     Suite::Pjdfstest => Availability::Runnable {
       on,
-      tools: &["cc", "sh", "mount_nfs", "umount", "mktemp", "openssl", "dd"],
+      tools: &["cc", "sh", "mount_nfs", "umount", "openssl", "dd"],
       root: RootNeed::ReducesScope(
         "pjdfstest's README requires root; without it every case that switches uid/gid (`-u`/`-g`) \
          is counted as needs-root, not as a failure",
@@ -136,7 +136,7 @@ fn native_macos(suite: Suite) -> Availability {
     },
     Suite::Fsx | Suite::Fsstress => Availability::Runnable {
       on,
-      tools: &["cc", "curl", "mount_nfs", "umount", "mktemp", "sh"],
+      tools: &["cc", "curl", "mount_nfs", "umount", "sh"],
       root: RootNeed::None,
       adapter: None,
     },
@@ -148,7 +148,7 @@ fn native_macos(suite: Suite) -> Availability {
     },
     Suite::Hermeticity => Availability::Runnable {
       on,
-      tools: &["fs_usage", "sudo", "mount_nfs", "umount", "mktemp", "sh"],
+      tools: &["fs_usage", "sudo", "mount_nfs", "umount", "sh"],
       root: RootNeed::Required(
         "fs_usage needs root for the kernel tracing facility it uses (its manual); macOS has no \
          unprivileged filesystem-write tracer",
@@ -164,9 +164,7 @@ fn native_linux(suite: Suite, adapter: Option<Adapter>) -> Availability {
   match suite {
     Suite::Pjdfstest => Availability::Runnable {
       on,
-      tools: &[
-        "cc", "sh", "mount", "umount", "mktemp", "sudo", "openssl", "dd",
-      ],
+      tools: &["cc", "sh", "mount", "umount", "sudo", "openssl", "dd"],
       root: RootNeed::Required(
         "the Linux NFS client mount needs root, and pjdfstest's README requires it",
       ),
@@ -174,7 +172,7 @@ fn native_linux(suite: Suite, adapter: Option<Adapter>) -> Availability {
     },
     Suite::Fsx | Suite::Fsstress => Availability::Runnable {
       on,
-      tools: &["cc", "curl", "mount", "umount", "mktemp", "sh", "sudo"],
+      tools: &["cc", "curl", "mount", "umount", "sh", "sudo"],
       root: RootNeed::Required("the Linux NFS client mount needs root"),
       adapter,
     },
@@ -186,7 +184,7 @@ fn native_linux(suite: Suite, adapter: Option<Adapter>) -> Availability {
     },
     Suite::Hermeticity => Availability::Runnable {
       on,
-      tools: &["strace", "mount", "umount", "mktemp", "sh", "sudo"],
+      tools: &["strace", "mount", "umount", "sh", "sudo"],
       root: RootNeed::Required(
         "the Linux NFS client mount needs root (strace of the harness's own children needs none)",
       ),

@@ -340,8 +340,9 @@ cargo xtask conformance matrix --write            # regenerate §2 from the trac
 cargo test -p slates-conformance --test matrix    # the doc-truth tests
 ```
 
-`--records DIR` (default `docs/wip/conformance/records`), `--scratch DIR` (default a fresh
-`mktemp -d`; removed unless `--keep`), the bounds `--fsx-ops/--fsx-seed/--fsx-length`,
+`--records DIR` (default `docs/wip/conformance/records`), `--scratch DIR` (default
+`<target>/conformance-scratch-<pid>` in the build output — A-50: never `/tmp` or a RAM directory;
+removed unless `--keep`), the bounds `--fsx-ops/--fsx-seed/--fsx-length`,
 `--fsstress-ops/--fsstress-procs/--fsstress-seed` (defaults are `Shape:` constants in
 `xtask/src/conformance/mod.rs` and are recorded in each record's `bound`). The suite sources are
 fetched from pinned commits into the scratch and verified by SHA-256 before `cc` builds them

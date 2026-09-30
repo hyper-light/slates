@@ -93,11 +93,11 @@ excluded from comparison and checked by the model suite and T-1.5.
 
 ## 7. Where the suite runs
 
-Linux CI on `/dev/shm` (tmpfs), 2,000 histories of up to 40 steps per run with shrinking;
-locally only when `SLATES_TEST_RAMDIR` names a RAM-backed directory, otherwise it prints that
-it skipped and passes. It never writes disk: a RAM disk on macOS or an NTFS RAM VHD is a
-system-state change that needs its own authorization, and the nightly lanes for those targets
-are Phase 4's.
+Every host, in a directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`; A-50:
+never `/tmp` and never a RAM directory): Linux CI with 2,000 histories of up to 40 steps per run
+with shrinking, and locally with the default 300. The host's own name policy is probed first, so
+APFS runs it folding names (measured 2026-09-30: 300 histories agreed, 71 extended-attribute steps
+on both sides) and ext4 exact (300 agreed, 96 attribute steps). The NTFS lane is Phase 4's.
 
 ## 8. Required mounted and guest equivalence (A-9)
 

@@ -877,46 +877,6 @@ fn lease_scenario() {
   daemon.stop();
 }
 
-/// A landing target on the host: a directory named with the process id (`mktemp -d`), owned by this
-/// user — what `OsLand::open_target` admits — and removed when dropped, even on a failed assertion
-/// (tests write only to a temp directory they name and remove, CLAUDE.md §4).
-struct TargetDir {
-  path: String,
-}
-
-impl Drop for TargetDir {
-  fn drop(&mut self) {
-    let _ = std::process::Command::new("rm")
-      .args(["-rf", &self.path])
-      .output();
-  }
-}
-
-fn target_dir() -> TargetDir {
-  let out = std::process::Command::new("mktemp")
-    .args([
-      "-d",
-      "-t",
-      &format!("slates-grant-{}.XXXXXX", std::process::id()),
-    ])
-    .output()
-    .unwrap();
-  assert!(
-    out.status.success(),
-    "mktemp -d: {}",
-    String::from_utf8_lossy(&out.stderr)
-  );
-  let made = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-  // The canonical path: a landing target is resolved component by component with `O_NOFOLLOW` (§4.13 —
-  // no symlink in the chain may redirect a write), and macOS's `/var` is a symlink to `/private/var`, so
-  // the path `mktemp` prints would be refused `NotDirectory` at the link; the landing is given the real
-  // directory. A read of the path, not a write.
-  let path = std::fs::canonicalize(&made)
-    .map(|p| p.to_string_lossy().into_owned())
-    .unwrap_or(made);
-  TargetDir { path }
-}
-
 /// AC-5.10 / T-5.12 and AC-2.8 (§4.13 "Grants"): a grant is accepted only with a **verified proof of
 /// issuer authority** bound to the exact presented landing, never by the channel it arrives on. A
 /// landing is presented (`GrantRequired`); an approval forged from the agent's own channel — the right
@@ -927,8 +887,8 @@ fn target_dir() -> TargetDir {
 /// genuine approval differ only in the secret behind the proof.
 fn grant_scenario() {
   let (daemon, instance) = daemon("grant");
-  let target = target_dir();
-  let elsewhere = target_dir();
+  let target = common::target::target_dir();
+  let elsewhere = common::target::target_dir();
   let mut client = Client::connect(&instance);
   let (id, snapshot, landing, manifest) = present_landing(&mut client, &target.path);
   forged_approval_is_refused(&mut client, landing, manifest);
@@ -1099,7 +1059,7 @@ fn a_granted_landing_consumes_its_presentation() {
   let secret = daemon.segment().issuer_secret().unwrap();
   let mut client = Client::connect(&instance);
   for cycle in 0..3 {
-    let target = target_dir();
+    let target = common::target::target_dir();
     let (id, snapshot, landing, manifest) =
       present_named(&mut client, &format!("cycle-{cycle}"), &target.path);
     assert_eq!(landings_awaiting(&mut client), 1, "cycle {cycle} presented");
@@ -3269,7 +3229,7 @@ fn base_immutable_part(client: &mut Client, g: slates_ipc::protocol::VolumeId, d
 fn green_over_base_scenario() {
   let (daemon, instance) = daemon("merge-base");
   let mut client = Client::connect(&instance);
-  let dir = target_dir();
+  let dir = common::target::target_dir();
   host_write(&format!("{}/f.txt", dir.path), "disk bytes");
   let overlay = overlay_over(&mut client, "over", &dir.path);
   let g = base_completeness_part(&mut client, overlay);

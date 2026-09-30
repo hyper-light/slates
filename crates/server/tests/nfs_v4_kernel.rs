@@ -1,13 +1,13 @@
 //! The Linux kernel's own NFSv4 client against the daemon (§4.6 A-35): a volume provisioned in an
-//! in-process daemon is mounted with `mount -t nfs4 -o vers=4.1` and `vers=4.2` at a directory under
-//! the RAM test directory, driven through ordinary file calls — create, write, read, append, mkdir,
+//! in-process daemon is mounted with `mount -t nfs4 -o vers=4.1` and `vers=4.2` at a directory in
+//! the build output (A-50: never `/tmp`, never a RAM directory), driven through ordinary file calls — create, write, read, append, mkdir,
 //! rename, symlink, hard link, truncate, list, remove, and `flock` between two open files (the server's
 //! LOCK, LOCKT and LOCKU), and on 4.2 `lseek(SEEK_HOLE/SEEK_DATA)` and `copy_file_range` (the server's
 //! SEEK and COPY) and `user.` extended attributes (RFC 8276) — and read back over NFSv3 from the daemon, so the
 //! kernel's compounds are proved to land in the volume, not only to succeed.
 //!
-//! Gated: it needs Linux, root (or passwordless `sudo`) for `mount`, the `mount.nfs4` helper, and a
-//! RAM-backed `SLATES_TEST_RAMDIR`; set `SLATES_TEST_NFS4_KERNEL=1` to run it. Without any of these it
+//! Gated: it needs Linux, root (or passwordless `sudo`) for `mount`, and the `mount.nfs4` helper;
+//! set `SLATES_TEST_NFS4_KERNEL=1` to run it. Without any of these it
 //! skips loudly, printing why, and passes.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg(unix)]
@@ -40,9 +40,6 @@ fn skip_reason() -> Option<String> {
   }
   if std::env::var_os(ENV_OPT_IN).is_none() {
     return Some(format!("{ENV_OPT_IN} is not set"));
-  }
-  if std::env::var_os("SLATES_TEST_RAMDIR").is_none() {
-    return Some("SLATES_TEST_RAMDIR is not set (name a RAM-backed directory)".to_owned());
   }
   if !Path::new("/sbin/mount.nfs4").exists() && !Path::new("/usr/sbin/mount.nfs4").exists() {
     return Some("the mount.nfs4 helper is not installed".to_owned());
@@ -158,11 +155,11 @@ fn daemon_with_volume(tag: &str, name: &str) -> Daemon {
 }
 
 /// Mounts `source` (`127.0.0.1:/<name>@<capability>`) with the kernel's NFSv4 client at minor version
-/// `minor`, at a fresh directory under the RAM test directory.
+/// `minor`, at a fresh directory in the build output.
 fn kernel_mount(source: &str, port: u16, minor: u32) -> KernelMount {
-  let base = PathBuf::from(std::env::var_os("SLATES_TEST_RAMDIR").unwrap());
+  let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
   let path = base.join(format!("nfs4-{minor}-{}", std::process::id()));
-  #[allow(clippy::disallowed_methods)] // the mount point, inside the RAM test directory
+  #[allow(clippy::disallowed_methods)] // the mount point, in the build output
   std::fs::create_dir_all(&path).unwrap();
   let mount = KernelMount { path };
   // Locks go to the server (the default `local_lock=none`): LOCK, LOCKT and LOCKU are served (A-35).

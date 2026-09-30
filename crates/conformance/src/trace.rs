@@ -164,9 +164,6 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
   if KERNEL_OBJECT_PREFIXES.iter().any(|p| path.starts_with(p)) {
     return Placement::RamOnly("kernel object (socket, pipe, anon inode, memfd, shm)");
   }
-  if path.starts_with("/dev/shm/") {
-    return Placement::RamOnly("tmpfs shared-memory object under /dev/shm");
-  }
   if path == "/dev/fuse" {
     return Placement::RamOnly("the FUSE device");
   }
@@ -1082,8 +1079,9 @@ mod tests {
   }
 
   /// The judgement places each event: inside the target (including the temp name and the rename's
-  /// both names), RAM-only objects, the standard streams, and the two violations (`/etc/evil`, the
-  /// relative file under the working directory).
+  /// both names), RAM-only objects, the standard streams, and the three violations: a file under
+  /// `/dev/shm` (a tmpfs is a filesystem, not RAM-only — A-50), `/etc/evil`, and the relative file
+  /// under the working directory.
   #[test]
   fn strace_events_are_placed_in_the_closed_taxonomy() {
     let events = parse_strace_with_cwd(STRACE, "/scratch/cwd");
@@ -1091,10 +1089,17 @@ mod tests {
     assert_eq!(judged.write_calls, 13);
     assert_eq!(judged.inside_target, 5);
     assert_eq!(judged.standard_streams, 2);
-    assert_eq!(judged.ram_only, 4, "socket, memfd, /dev/shm, pipe");
-    assert_eq!(judged.outside, 2);
-    assert_eq!(judged.violations[0].path, "/etc/evil");
-    assert_eq!(judged.violations[1].path, "/scratch/cwd/relative.txt");
+    assert_eq!(judged.ram_only, 3, "socket, memfd, pipe");
+    assert_eq!(judged.outside, 3);
+    let violations: Vec<&str> = judged.violations.iter().map(|v| v.path.as_str()).collect();
+    assert_eq!(
+      violations,
+      [
+        "/dev/shm/slates-con",
+        "/etc/evil",
+        "/scratch/cwd/relative.txt"
+      ]
+    );
     assert_eq!(
       judged.written_inside,
       vec![".slates-tmp-1".to_owned(), "a.txt".to_owned()]
@@ -1102,22 +1107,22 @@ mod tests {
     assert_eq!(judged.unresolved, 0);
   }
 
-  /// AC-9.4 / T-9.1: RAM-backed landing targets still need observable, matched writes.
+  /// AC-9.4 / T-9.1: a landing target's writes are observable and matched, an unnamed file included.
   /// The kernel's unnamed inode is temporary only because an O_TMPFILE open returned it.
   #[test]
-  fn an_unnamed_landing_file_is_attributed_to_its_ram_backed_target() {
-    let log = "91 openat(4</dev/shm/target>, \".\", O_WRONLY|O_TMPFILE, 0600) = 5</dev/shm/target/#9>(deleted)\n\
-      91 pwrite64(5</dev/shm/target/#9>(deleted), \"x\", 1, 0) = 1\n\
-      91 linkat(AT_FDCWD, \"/proc/self/fd/5\", 4</dev/shm/target>, \"file\", AT_SYMLINK_FOLLOW) = 0\n";
+  fn an_unnamed_landing_file_is_attributed_to_its_target() {
+    let log = "91 openat(4</work/target>, \".\", O_WRONLY|O_TMPFILE, 0600) = 5</work/target/#9>(deleted)\n\
+      91 pwrite64(5</work/target/#9>(deleted), \"x\", 1, 0) = 1\n\
+      91 linkat(AT_FDCWD, \"/proc/self/fd/5\", 4</work/target>, \"file\", AT_SYMLINK_FOLLOW) = 0\n";
     let policy = Policy {
-      target: "/dev/shm/target",
+      target: "/work/target",
       working_directory: "/scratch",
       streams: &[],
     };
     let judged = judge(&parse_strace(log), &policy);
     assert_eq!(judged.inside_target, 3);
     assert_eq!(judged.written_inside, ["#9", "file"]);
-    assert_eq!(strace_unnamed_paths(log), ["/dev/shm/target/#9"]);
+    assert_eq!(strace_unnamed_paths(log), ["/work/target/#9"]);
     assert!(
       strace_unnamed_paths(
         "91 openat(4</target>, \"#9\", O_WRONLY, 0600) = 5</target/#9>(deleted)\n"

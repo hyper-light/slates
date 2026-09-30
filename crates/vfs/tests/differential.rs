@@ -1,18 +1,16 @@
 //! AC-1.2: the differential suite against the host filesystem. The same generated histories
-//! the model suite runs (`common::steps`) are applied to a volume and to a directory on a
-//! RAM-backed host filesystem, and the abstract state is compared after every step under the
+//! the model suite runs (`common::steps`) are applied to a volume and to a directory on the
+//! host filesystem, and the abstract state is compared after every step under the
 //! reviewed equivalence policy (`docs/wip/EQUIVALENCE.md`). The host is the oracle for POSIX;
 //! the model suite is the oracle for the design's own rules (accounting, snapshots).
 //!
-//! Gated: `SLATES_TEST_RAMDIR` must name a RAM-backed directory (CI Linux: `/dev/shm`); without
-//! it the suite prints that it skipped and passes, so a machine without a RAM disk never fails
-//! and never writes disk (CLAUDE.md §4). Everything written goes under one subdirectory named
-//! with the process id, removed when the harness drops it, panics included.
+//! The host directory is in the build output (`CARGO_TARGET_TMPDIR`, under `target/`) on every
+//! host, never `/tmp` and never a RAM directory (A-50). Everything written goes under one
+//! subdirectory named with the process id, removed when the harness drops it, panics included.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be. proptest's
 // strategy types carry `Arc` (D-8's harness exception). The host filesystem is this test's
-// oracle, so it uses `std::fs` writes; they land only under the RAM-backed directory the
-// environment names, and the directory is removed at the end.
+// oracle, so it uses `std::fs` writes; they land only under the build-output directory, and the directory is removed at the end.
 #![cfg(unix)]
 #![allow(
   clippy::unwrap_used,
@@ -39,8 +37,12 @@ use common::drive::{Xattrs, apply_volume, head_state, pick_file};
 use common::steps::{Step, XattrMode, step};
 use common::{store, volume_with};
 
-/// Format: the environment variable naming the RAM-backed directory.
-const RAMDIR_VAR: &str = "SLATES_TEST_RAMDIR";
+/// The build output (`CARGO_TARGET_TMPDIR`, under `target/`): the real host directory this test lands into
+/// and reads from (A-50: a landing writes the host's disk and a base is read from it, so tests exercise both
+/// for real — never under `/tmp` and never in a RAM directory).
+fn build_output() -> PathBuf {
+  PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
 
 /// The host directory of one run, removed on drop.
 struct HostRoot {
@@ -266,7 +268,7 @@ fn host_path(root: &Path, dir: &[String], name: &str) -> PathBuf {
   p
 }
 
-/// `head_state` uses absolute VFS paths; resolve them inside this case's RAM directory.
+/// `head_state` uses absolute VFS paths; resolve them inside this case's host directory.
 fn selected_host_file(root: &Path, target: &str) -> PathBuf {
   root.join(
     target
@@ -479,11 +481,8 @@ fn cases() -> u32 {
 /// AC-1.2: selected files and their aliases keep the same bytes and links at both depths.
 #[test]
 fn selected_files_and_aliases_agree_at_the_root_and_in_a_directory() {
-  let Some(base) = std::env::var_os(RAMDIR_VAR) else {
-    println!("differential: skipped — {RAMDIR_VAR} is not set (name a RAM-backed directory)");
-    return;
-  };
-  let root = HostRoot::create(Path::new(&base), "selected-files").unwrap();
+  let base = build_output();
+  let root = HostRoot::create(&base, "selected-files").unwrap();
   let policy = probe_policy(&root.path);
   for (case, directory) in [Vec::new(), vec!["directory".to_owned()]]
     .into_iter()
@@ -516,11 +515,8 @@ fn selected_files_and_aliases_agree_at_the_root_and_in_a_directory() {
 /// unchanged on both.
 #[test]
 fn a_file_renamed_onto_a_non_empty_directory_may_report_either_refusal() {
-  let Some(base) = std::env::var_os(RAMDIR_VAR) else {
-    println!("differential: skipped — {RAMDIR_VAR} is not set (name a RAM-backed directory)");
-    return;
-  };
-  let root = HostRoot::create(Path::new(&base), "rename-onto-directory").unwrap();
+  let base = build_output();
+  let root = HostRoot::create(&base, "rename-onto-directory").unwrap();
   let policy = probe_policy(&root.path);
   let b = || vec!["b".to_owned()];
   let history = [
@@ -536,18 +532,7 @@ fn a_file_renamed_onto_a_non_empty_directory_may_report_either_refusal() {
 /// AC-1.2: the volume and the host filesystem agree on every abstract state under the policy.
 #[test]
 fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
-  let Some(base) = std::env::var_os(RAMDIR_VAR) else {
-    println!(
-      "differential: skipped — {RAMDIR_VAR} is not set (name a RAM-backed directory; CI Linux uses /dev/shm)"
-    );
-    return;
-  };
-  let base = PathBuf::from(base);
-  assert!(
-    base.is_dir(),
-    "{RAMDIR_VAR}={} is not a directory",
-    base.display()
-  );
+  let base = build_output();
   let root = HostRoot::create(&base, "histories").unwrap();
   let policy = probe_policy(&root.path);
   let host_xattrs = probe_user_xattrs(&root.path);

@@ -1,8 +1,9 @@
 //! The landing baselines (Phase 1 task 13; T-1.17): the engine's own cost per entry over the
-//! simulated host (plan, validate, write, advance), and, when `SLATES_TEST_RAMDIR` names a
-//! RAM-backed directory, a 10k-entry delta landed into a 10^6-entry tree by the OS writer
-//! against `cp -r` of the same delta, with the ramp's settled depth recorded. Without the
-//! directory the OS rows are skipped loudly; nothing is written outside it.
+//! simulated host (plan, validate, write, advance), and, on Unix, a 10k-entry delta landed into a
+//! 10^6-entry tree on the host's disk by the OS writer against `cp -r` of the same delta, with the
+//! ramp's settled depth recorded. The trees live in the build output beside this binary (under
+//! `target/`; A-50: a landing writes the host's disk, never `/tmp` and never a RAM directory);
+//! nothing is written outside it.
 //!
 //! Rows are `ratchet\t<key>\t<lower>\t<median>\t<upper>` in nanoseconds per entry (the
 //! bootstrap interval of the best-of-N runs), as `cargo xtask ratchet` reads them.
@@ -46,8 +47,6 @@ const OS_DELTA: usize = 10_000;
 const OS_BASE: usize = 1_000_000;
 /// Shape: files per directory of the generated trees.
 const PER_DIR: usize = 100;
-/// Format: the environment variable naming the RAM-backed directory.
-const RAM_DIR: &str = "SLATES_TEST_RAMDIR";
 
 fn store() -> Store {
   let mut arena = ChunkArena::new(PAGE);
@@ -291,8 +290,8 @@ mod os_rows {
   }
 
   #[allow(clippy::disallowed_methods)]
-  pub(super) fn run(ram: &Path) {
-    let ws = ram.join(format!("slates-land-bench-{}", std::process::id()));
+  pub(super) fn run(build_output: &Path) {
+    let ws = build_output.join(format!("slates-land-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(&ws).unwrap();
     let base = ws.join("base");
@@ -356,13 +355,15 @@ mod os_rows {
 
 fn main() {
   sim_rows();
-  match std::env::var_os(RAM_DIR).map(PathBuf::from) {
+  // The build output: the directory holding this example's binary.
+  let beside = std::env::current_exe()
+    .ok()
+    .and_then(|exe| exe.parent().map(PathBuf::from));
+  match beside {
     #[cfg(unix)]
-    Some(ram) => os_rows::run(&ram),
+    Some(build_output) => os_rows::run(&build_output),
     #[cfg(not(unix))]
     Some(_) => println!("land bench: the OS rows run on Unix only"),
-    None => println!(
-      "land bench: OS rows skipped — set {RAM_DIR} to a RAM-backed directory (CI Linux: /dev/shm)"
-    ),
+    None => println!("land bench: OS rows skipped — the binary's directory is unknown"),
   }
 }

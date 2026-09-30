@@ -1,5 +1,6 @@
 //! A-26 / AC-3.10: real kernel IPC is local and transient; cloned names share no pipe or listener.
-//! Requires the same ordinary-user FUSE environment as coherence_mount; all paths are in RAM.
+//! Requires the same ordinary-user FUSE environment as coherence_mount; its paths are in the build output
+//! (`CARGO_TARGET_TMPDIR`; A-50: never `/tmp`, never a RAM directory).
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -34,7 +35,11 @@ struct MountPaths {
 
 impl MountPaths {
   fn new() -> Self {
-    let root = format!("/dev/shm/slates-ipc-{}", std::process::id());
+    let root = format!(
+      "{}/slates-ipc-{}",
+      env!("CARGO_TARGET_TMPDIR"),
+      std::process::id()
+    );
     let original = format!("{root}/original");
     let clone = format!("{root}/clone");
     assert!(

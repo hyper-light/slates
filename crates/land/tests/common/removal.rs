@@ -96,8 +96,11 @@ pub(crate) struct Fired {
 
 /// What a leg saw of one landed history.
 pub(crate) struct Seen<'a> {
-  /// Whether every armed edit fired.
-  pub(crate) all_fired: bool,
+  /// Whether every armed edit whose seam call the landing reached fired there. A landing on a real disk
+  /// may end before an armed call: its path follows the kernel's coarse clock (whether its own exchange
+  /// moved a ctime within one tick), so an edit armed past that run's end is a history the clock did not
+  /// produce this time, not a harness failure. An edit at a reached call that did not fire is one.
+  pub(crate) reached_edits_fired: bool,
   /// What each edit did, in firing order.
   pub(crate) fired: Vec<Fired>,
   /// Every entry under the target after the landing, by inode, with its path from the target (`/doomed`).
@@ -161,7 +164,10 @@ pub(crate) fn assert_reference(removal: Removal, seen: &Seen<'_>) {
 
 /// Judges one interfered history by the module doc's rules; `label` names it in a failure.
 pub(crate) fn judge(removal: Removal, label: &str, seen: &Seen<'_>) -> Verdict {
-  assert!(seen.all_fired, "{label}: an armed edit never happened");
+  assert!(
+    seen.reached_edits_fired,
+    "{label}: an edit armed at a call the landing reached never happened"
+  );
   let kept = kept_paths(seen.result);
   assert_outsiders_survive(removal, label, seen, &kept);
   assert_nothing_left_unreported(label, seen, &kept);

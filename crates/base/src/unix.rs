@@ -494,10 +494,20 @@ mod watch {
         return Vec::new();
       };
       let mut events: Vec<Event> = Vec::with_capacity(DRAIN);
-      // SAFETY: no changes are submitted; the output vector has the capacity the kernel may
-      // fill, and rustix sets its length from the count the kernel returns; a zero timeout
-      // never blocks.
-      let drained = unsafe { kevent(queue, &[], &mut events, Some(std::time::Duration::ZERO)) };
+      // The kernel fills the vector's spare capacity and rustix sets its length from the count
+      // returned. A bare `&mut events` hands rustix 1.x the vector's *length* (zero) as the event
+      // list's size, so the kernel reported nothing and no hint was ever delivered here
+      // (docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md).
+      // SAFETY: no changes are submitted; the output buffer is the vector's spare capacity, which
+      // the kernel may fill up to its length; a zero timeout never blocks.
+      let drained = unsafe {
+        kevent(
+          queue,
+          &[],
+          rustix::buffer::spare_capacity(&mut events),
+          Some(std::time::Duration::ZERO),
+        )
+      };
       if drained.is_err() {
         return Vec::new();
       }

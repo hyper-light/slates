@@ -14,8 +14,8 @@
 //! root|unprivileged]` (re-read a kept `pjdfstest-output` directory — a `--keep` scratch here, or
 //! the CI lane's uploaded artifact — and print the counts, the judgement, and the failures by
 //! shape and by file, so a run that happened elsewhere is reviewed by a command). Scratch lives
-//! outside the tree (`--scratch`, else a fresh `mktemp -d`) and is removed at the end unless
-//! `--keep`.
+//! in the build output (`--scratch`, else `<target>/conformance-scratch-<pid>`; A-50: never `/tmp`
+//! and never a RAM directory) and is removed at the end unless `--keep`.
 //!
 //! This is a development tool, not shipped code: it writes its scratch and its records with
 //! `std::fs`, each such site allowed in place with the reason, exactly as the ratchet task does.
@@ -374,8 +374,21 @@ pub(crate) fn remove_tree(path: &Path) {
   }
 }
 
-/// A fresh scratch directory outside the tree (`--scratch DIR`, else `mktemp -d`), removed on drop
-/// unless kept.
+/// A directory named `name` in the build output — `CARGO_TARGET_DIR`, else the workspace's `target/` —
+/// created if absent and canonical. The harness's scratch, mount points and landing targets are real
+/// host directories there (A-50: a landing writes the host's disk and a base is read from it, so the
+/// suites exercise both for real — never under `/tmp` and never in a RAM directory).
+pub(crate) fn build_output(name: &str) -> Result<PathBuf, Failure> {
+  let root = crate::workspace_root()?;
+  let target = std::env::var_os("CARGO_TARGET_DIR")
+    .map_or_else(|| root.join("target"), |dir| root.join(PathBuf::from(dir)));
+  let path = target.join(name);
+  create_dir(&path)?;
+  std::fs::canonicalize(&path).map_err(|e| Failure(format!("build output {}: {e}", path.display())))
+}
+
+/// A fresh scratch directory in the build output (`--scratch DIR`, else [`build_output`]), removed on
+/// drop unless kept.
 pub(crate) struct Scratch {
   path: PathBuf,
   keep: bool,
@@ -392,13 +405,11 @@ impl Scratch {
         create_dir(&dir)?;
         dir
       }
-      None => {
-        let made = stdout_of("mktemp", &["-d", "-t", "slates-conformance.XXXXXX"]);
-        if made.is_empty() {
-          return Err(Failure("mktemp -d failed; pass --scratch DIR".to_owned()));
-        }
-        PathBuf::from(made)
-      }
+      None => build_output(&format!(
+        "conformance-scratch-{}/{}",
+        std::process::id(),
+        transport.slug()
+      ))?,
     };
     let path = std::fs::canonicalize(&path)
       .map_err(|e| Failure(format!("scratch {}: {e}", path.display())))?;

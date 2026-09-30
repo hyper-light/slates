@@ -29,6 +29,17 @@ authorized merely by appearing here.
   file unverifiable. The test predated A-43 and asserted that no sibling remains. It now asserts A-43's
   contract: each sibling is swept or reported `Kept`, and a kept one holds a whole round. On Linux
   `/dev/shm`, 60 of 60 runs pass and 11 of them reached the kept path.
+- [x] **A-50 fixtures off `/tmp` and `/dev/shm` (2026-09-30).** Landing targets, bases, mount points and
+  conformance scratch are in the build output; the gated OS suites now run on macOS too. Found and fixed:
+  the kqueue base watcher never delivered a hint
+  (`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`), and the removal
+  oracle held only on tmpfs (`docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
+- [ ] **Linux container, 2026-09-30: `snapshot_landing` failed once (open, not reproduced).** The granted
+  landing at `crates/server/tests/snapshot_landing.rs:56` returned something other than `Landed`, after
+  26.23 s against a normal 0.4–0.9 s. It ran as the last of four server test binaries in one cargo
+  invocation. The refusal's text was lost: my filter printed only the panic line. Not reproduced in 35 later
+  runs: 15 alone, and 5 of the same lease/snapshot_landing/recovery sequence. Owed: the full output of
+  the next failure.
 - [ ] **Run 36663502686, Linux: a fleet formation did not widen its council (open, not reproduced).**
   `a_campaign_waits_for_a_voters_session_that_is_out_for_a_moment` failed in `assert_fleet_forms`, before
   its own steps: the council leader (term 1) kept voters = [itself] with all three hosts members; its

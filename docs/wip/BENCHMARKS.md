@@ -244,9 +244,10 @@ the median with the lowest and highest run as its edges). The simulated rows run
 `SimHost` (an in-memory disk), so they measure the engine's own work per entry: plan, the
 verdict pass, the temporary, the exchange, the verify, the syncs, the advance. The OS rows
 (T-1.17: a 10k-entry delta into a 10^6-entry tree by the OS writer against `cp -r` of the same
-delta, with the ramp's settled depth) run only where `SLATES_TEST_RAMDIR` names a RAM-backed
-directory (the Linux lane, `/dev/shm`); a macOS RAM disk is a system-state change Ada has not
-authorized, so their first numbers are the lane's.
+delta, with the ramp's settled depth) run on Unix in the build output beside the example's
+binary, on the host's disk (A-50: a landing writes the host's disk; never `/tmp` and never a RAM
+directory). Until 2026-09-30 they ran only on the Linux lane's `/dev/shm`, so the numbers recorded
+below are tmpfs numbers; a disk row replaces them at the next recorded run.
 
 | Operation | Median | Runs | Notes |
 |---|---|---|---|

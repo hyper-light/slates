@@ -100,7 +100,8 @@ impl Run {
   /// What the landing left, for the rules.
   fn seen(&self) -> Seen<'_> {
     Seen {
-      all_fired: self.host.interfered(),
+      // The simulated host's clock is the test's, so every armed call is reached: all fired.
+      reached_edits_fired: self.host.interfered(),
       fired: self
         .host
         .interferences()

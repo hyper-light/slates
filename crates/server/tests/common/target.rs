@@ -1,10 +1,13 @@
-//! A landing target for a test: a fresh directory under the process's temporary directory, named
-//! with the process id and removed when dropped (CLAUDE.md §4: a test's scratch is named with the pid
-//! and removed at the end). A landing plans against a real directory (§4.15), so the target must exist
-//! and be canonical — the landing resolves it component by component with `O_NOFOLLOW`, and macOS's
-//! `/var` is a symlink to `/private/var`.
+//! A real directory on disk for a test's landing target or overlay base (design §0.2, A-50): a landing writes
+//! the host's disk and an overlay reads a base there, so tests exercise both for real — never under `/tmp`
+//! or any system temporary directory, and never in a RAM directory. It lives in the build output
+//! (`CARGO_TARGET_TMPDIR`, under `target/`), named with the process id and a per-process counter, and is
+//! removed when dropped. The path is canonical: a landing resolves its target component by component with
+//! `O_NOFOLLOW`.
 
-/// A test's landing target, removed on drop.
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// A test's directory, removed on drop.
 pub(crate) struct TargetDir {
   /// The canonical path of the directory.
   pub(crate) path: String,
@@ -12,31 +15,25 @@ pub(crate) struct TargetDir {
 
 impl Drop for TargetDir {
   fn drop(&mut self) {
-    let _ = std::process::Command::new("rm")
-      .args(["-rf", &self.path])
-      .output();
+    // The test's own directory in the build output (CLAUDE §4: removed at the end).
+    #[allow(clippy::disallowed_methods)]
+    let _removed = std::fs::remove_dir_all(&self.path);
   }
 }
 
-/// A fresh, empty, canonical landing target under the temporary directory.
+/// A fresh, empty, canonical directory in the build output.
 pub(crate) fn target_dir() -> TargetDir {
-  let out = std::process::Command::new("mktemp")
-    .args([
-      "-d",
-      "-t",
-      &format!("slates-land-{}.XXXXXX", std::process::id()),
-    ])
-    .output()
-    .unwrap();
-  assert!(
-    out.status.success(),
-    "mktemp -d: {}",
-    String::from_utf8_lossy(&out.stderr)
-  );
-  let made = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-  // A read of the path, never a write: the canonical form the landing's `O_NOFOLLOW` walk accepts.
-  let path = std::fs::canonicalize(&made)
-    .map(|p| p.to_string_lossy().into_owned())
-    .unwrap_or(made);
-  TargetDir { path }
+  static NEXT: AtomicU64 = AtomicU64::new(0);
+  let made = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+    "slates-{}-{}",
+    std::process::id(),
+    NEXT.fetch_add(1, Ordering::Relaxed)
+  ));
+  #[allow(clippy::disallowed_methods)]
+  std::fs::create_dir_all(&made).unwrap();
+  #[allow(clippy::disallowed_methods)]
+  let path = std::fs::canonicalize(&made).unwrap();
+  TargetDir {
+    path: path.to_string_lossy().into_owned(),
+  }
 }

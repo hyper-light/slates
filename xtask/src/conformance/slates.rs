@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::Transport;
 
-use super::{Run, create_dir, pause, stdout_of, tool_on_path};
+use super::{Run, create_dir, pause, stdout_of};
 use crate::Failure;
 
 /// Shape: how long the anchor and its daemon get to come up — the CLI test's twenty seconds,
@@ -498,13 +498,12 @@ fn is_mounted(path: &Path) -> bool {
     .any(|line| line.contains(&path.display().to_string()))
 }
 
-/// A fresh user-owned mount-point directory (`mktemp -d`), canonical.
+/// A fresh user-owned mount-point directory in the build output, canonical (A-50).
 fn fresh_mount_point() -> Result<PathBuf, Failure> {
-  let made = stdout_of("mktemp", &["-d", "-t", "slates-mount.XXXXXX"]);
-  if made.is_empty() {
-    return Err(Failure("mktemp -d failed for the mount point".to_owned()));
-  }
-  std::fs::canonicalize(&made).map_err(|e| Failure(format!("mount point {made}: {e}")))
+  /// The mount points this process has made, so each is fresh.
+  static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  super::build_output(&format!("slates-mount-{}-{serial}", std::process::id()))
 }
 
 /// Mounts the volume: `slates mount` on macOS; the root NFS client on Linux.
@@ -728,9 +727,6 @@ impl Session {
     (suite, size, fold): (&str, &str, bool),
     tracer: Option<&[String]>,
   ) -> Result<Session, Failure> {
-    if !tool_on_path("mktemp") {
-      return Err(Failure("mktemp is needed".to_owned()));
-    }
     let instance = format!("conf-{suite}-{}", std::process::id());
     let anchor = Anchor::start(&binary, &instance, run.scratch.path(), tracer)?;
     // A fresh daemon serves no placement until its configuration group is bootstrapped (the
@@ -800,17 +796,15 @@ mod tests {
       return;
     };
     let instance = format!("conf-stop-test-{}", std::process::id());
-    /// The test's scratch directory (`mktemp -d`, named with the process id), removed when dropped.
+    /// The test's scratch directory (in the build output, named with the process id), removed when
+    /// dropped.
     struct Scratch(PathBuf);
     impl Drop for Scratch {
       fn drop(&mut self) {
         let _ = Command::new("rm").arg("-rf").arg(&self.0).status();
       }
     }
-    let scratch = Scratch(PathBuf::from(stdout_of(
-      "mktemp",
-      &["-d", "-t", &format!("{instance}.XXXXXX")],
-    )));
+    let scratch = Scratch(crate::conformance::build_output(&instance).unwrap());
     let binary = SlatesBinary {
       path: binary.into(),
     };
@@ -865,9 +859,10 @@ mod tests {
   #[cfg(target_os = "linux")]
   #[test]
   #[allow(clippy::unwrap_used)]
-  #[allow(clippy::disallowed_methods)] // owned test scratch, verified tmpfs before creating it
+  #[allow(clippy::disallowed_methods)] // the test's own scratch in the build output
   fn the_hermeticity_tracer_allows_startup_and_observes_writes() {
     use super::*;
+    use crate::conformance::tool_on_path;
     use slates_conformance::trace::{Policy, judge, parse_strace_with_cwd};
 
     let Some(binary) = std::env::var_os("SLATES_TEST_BINARY") else {
@@ -880,12 +875,9 @@ mod tests {
       eprintln!("SKIP: the hermeticity startup regression requires strace");
       return;
     }
-    let root = Path::new("/dev/shm");
-    // Format: TMPFS_MAGIC from Linux uapi/linux/magic.h; refuse a disk-backed test root.
-    assert_eq!(rustix::fs::statfs(root).unwrap().f_type, 0x0102_1994);
     let instance = format!("conf-trace-test-{}", std::process::id());
-    let scratch = root.join(&instance);
-    std::fs::create_dir(&scratch).unwrap();
+    // A-50: the harness's own trace and log, in the build output — never `/tmp` or a RAM directory.
+    let scratch = crate::conformance::build_output(&instance).unwrap();
     struct Scratch(PathBuf);
     impl Drop for Scratch {
       fn drop(&mut self) {

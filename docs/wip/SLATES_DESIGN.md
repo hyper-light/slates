@@ -76,8 +76,7 @@ not a capability, an option or a mode. No disk is touched until an explicit, hum
 only reads are of a volume's base (a host directory, or a remote file server). That rules out `/tmp`, every
 temporary directory, and RAM-backed directories too: tmpfs, `/dev/shm` and RAM disks are still filesystems.
 It holds on every platform, Windows included, and it binds the tests and harnesses exactly as it binds the
-product: a test exercises a base or a landing through an in-memory host, never a directory it creates.
-Exactly two disk contacts are sanctioned, and nothing else: reading a volume's base, and the landing. The
+product. Exactly two disk contacts are sanctioned, and nothing else: reading a volume's base, and the landing. The
 base is shared, immutable and never copied (the CitC/EdenFS model, `research/edenfs-scale-distribution.md`
 §2.1–§2.5): on a laptop, the host directory an overlay sits on (`slates-base`, read-only); across the fleet,
 content-addressed chunks and manifests attached as a manifest reference and fetched lazily from holders' RAM
@@ -94,11 +93,20 @@ contact is a defect against this requirement, recorded here and in GAPS until it
   recovery key file (`slates-cli`);
 - the machine profile's queries of kernel pseudo-files (`slates-machine`) — kernel state, not disk files,
   but the path alone does not prove the backing object, so each interface is to be identified;
-- test fixtures and harnesses that create directories or files anywhere — `mktemp -d`, `$RUNNER_TEMP`,
-  mount points, landing targets, manifests — or persist property-test failures beside the source
-  (AUD-29-63), except a landing's target and a base, which are the sanctioned contacts themselves and move
-  from the system temporary directory to the build output; the rest is scratch to remove, never moved into a
-  RAM directory.
+- test fixtures that write the operator's files the CLI reads (a fleet manifest, DER certificates and keys, a
+  recovery key), which go with the CLI's reads above; and property-test failures persisted beside the source
+  (AUD-29-63).
+
+> **Status (2026-09-30).** A test's real host directories — landing targets, bases, kernel mount points,
+> the conformance harness's scratch and records — are in the build output (`CARGO_TARGET_TMPDIR`, or
+> `target/` for an example and for `cargo xtask conformance`) on every host. Nothing uses `mktemp`,
+> `$RUNNER_TEMP`, `/tmp` or `/dev/shm`, and the `SLATES_TEST_RAMDIR` gate is gone: the landing-over-the-OS,
+> removal, base-watcher and host-differential suites now run on macOS as well as Linux. The hermeticity
+> tracer judges a write under `/dev/shm` as outside (a tmpfs is a filesystem, not RAM-only). Running them on
+> real disks found two defects that tmpfs had hidden: the kqueue base watcher never delivered a hint
+> (`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`), and the removal
+> oracle's identity and call-count premises failed on ext4
+> (`docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
 
 Four separate claims follow from it, each needing its own evidence:
 

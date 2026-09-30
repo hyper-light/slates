@@ -1,8 +1,8 @@
 //! The operating-system host against the workspace's own tree (read-only, always on) and
-//! against a RAM-backed directory the environment names (writes by the test only, to inject
-//! outsider edits; skipped loudly without `SLATES_TEST_RAMDIR`).
+//! against a real directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`; A-50:
+//! never `/tmp`, never a RAM directory), written by the test only, to inject outsider edits.
 
-// Test harness code: an unwrap here is a failed test. The RAM-directory tests write there
+// Test harness code: an unwrap here is a failed test. The build-output tests write there
 // through the standard library to play the outsider; the crate under test writes nothing.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
 
@@ -232,27 +232,47 @@ fn an_overlay_over_the_workspace_tree_digests_a_file_as_the_disk_holds_it() {
   assert_eq!(digest_stats(&vol).computed, 1);
 }
 
-/// Shape: the pause that lets a RAM filesystem's timestamp tick close so a digest may be kept
+/// Shape: the pause that lets a filesystem's timestamp tick close so a digest may be kept
 /// (nanosecond granularity on tmpfs and APFS, a microsecond clock resolution on macOS): two
 /// milliseconds, far past both.
 #[cfg(unix)]
 const TICK: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// Over a RAM-backed directory (skipped loudly without `SLATES_TEST_RAMDIR`), the watcher leg of
+/// A test's own directory in the build output (`CARGO_TARGET_TMPDIR`; A-50: a real base directory,
+/// never `/tmp` or a RAM directory), named with the process id and removed on drop, a failed assertion
+/// included.
+#[cfg(unix)]
+struct BuildOutputDir(PathBuf);
+
+#[cfg(unix)]
+impl BuildOutputDir {
+  fn new(slug: &str) -> Self {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+      .join(format!("slates-{slug}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    Self(dir)
+  }
+}
+
+#[cfg(unix)]
+impl Drop for BuildOutputDir {
+  fn drop(&mut self) {
+    let _ = std::fs::remove_dir_all(&self.0);
+  }
+}
+
+/// Over a real directory in the build output, the watcher leg of
 /// §4.15 on a real filesystem: a kept digest follows the disk through the real watcher — a
 /// replacement by rename hints the directory, the hint's revalidation drops the kept digest, and
 /// the next export names the new bytes; a later change elsewhere in the directory hints again,
 /// re-verifies the kept digest and keeps it, and the export after it is reused.
 #[cfg(unix)]
 #[test]
-fn a_ram_directory_digest_follows_the_disk_through_the_watcher() {
-  let Some(base) = std::env::var_os("SLATES_TEST_RAMDIR") else {
-    println!("host: skipped — SLATES_TEST_RAMDIR is not set (name a RAM-backed directory)");
-    return;
-  };
-  let dir = PathBuf::from(base).join(format!("slates-digest-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir(&dir).unwrap();
+fn a_real_directory_digest_follows_the_disk_through_the_watcher() {
+  // A-50: a real base directory in the build output, never `/tmp` or a RAM directory.
+  let owned = BuildOutputDir::new("digest");
+  let dir = owned.0.clone();
   std::fs::write(dir.join("f"), b"one").unwrap();
   std::thread::sleep(TICK);
 
@@ -265,7 +285,6 @@ fn a_ram_directory_digest_follows_the_disk_through_the_watcher() {
   assert_eq!(digest_stats(&vol).cached, 1, "the tick had closed: kept");
   let rechecks = assert_replacement_hint_drops_the_digest(&mut vol, &mut host, &mut store, &dir);
   assert_unrelated_change_hint_keeps_the_digest(&mut vol, &mut host, &mut store, &dir, rechecks);
-  std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// Replace `f` by rename (a new inode at the name): the real watcher hints the directory, the
@@ -333,18 +352,14 @@ fn assert_unrelated_change_hint_keeps_the_digest(
   );
 }
 
-/// Over a RAM-backed directory: a held descriptor keeps serving a file replaced beneath it, a
+/// Over a real directory in the build output: a held descriptor keeps serving a file replaced beneath it, a
 /// symlink is never followed as a directory or a file, and the watcher hints at a change.
 #[cfg(unix)]
 #[test]
-fn a_ram_directory_shows_descriptor_semantics_nofollow_and_hints() {
-  let Some(base) = std::env::var_os("SLATES_TEST_RAMDIR") else {
-    println!("host: skipped — SLATES_TEST_RAMDIR is not set (name a RAM-backed directory)");
-    return;
-  };
-  let dir = PathBuf::from(base).join(format!("slates-host-{}", std::process::id()));
-  let _ = std::fs::remove_dir_all(&dir);
-  std::fs::create_dir(&dir).unwrap();
+fn a_real_directory_shows_descriptor_semantics_nofollow_and_hints() {
+  // A-50: a real base directory in the build output, never `/tmp` or a RAM directory.
+  let owned = BuildOutputDir::new("host");
+  let dir = owned.0.clone();
   std::fs::write(dir.join("f"), b"one").unwrap();
   std::fs::create_dir(dir.join("sub")).unwrap();
   std::os::unix::fs::symlink("sub", dir.join("link")).unwrap();
@@ -376,5 +391,4 @@ fn a_ram_directory_shows_descriptor_semantics_nofollow_and_hints() {
   host.close_file(file);
   host.close_file(fresh);
   host.close_dir(root);
-  std::fs::remove_dir_all(&dir).unwrap();
 }

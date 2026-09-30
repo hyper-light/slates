@@ -290,18 +290,34 @@ impl Drop for MountPoint {
   }
 }
 
-/// A fresh, user-owned mount-point directory (`mktemp -d`), resolved to its real path so it matches
-/// what the kernel records in the mount table (`/var/folders/...` is a symlink to `/private/var/...`
-/// on macOS). `std::fs::canonicalize` is a read, not a write, so it is outside the R1 wall; the
-/// directory itself is made by `mktemp`, not `std::fs::create_dir`.
-fn fresh_mount_point() -> String {
-  let out = Command::new("mktemp").arg("-d").output().unwrap();
-  assert!(out.status.success(), "mktemp -d");
-  let raw = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+/// A fresh, user-owned directory in the build output (`CARGO_TARGET_TMPDIR`, under `target/`), named with
+/// the process id and a per-process counter: a mount point, or the operator's files a test writes (A-50: a
+/// test's real host directories live in the build output, never `/tmp`). Resolved to its real path so a
+/// mount point matches what the kernel records in the mount table. The directory is made by `mkdir`, not
+/// `std::fs::create_dir`; `std::fs::canonicalize` is a read.
+fn build_output_dir(prefix: &str) -> String {
+  static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+  let raw = format!(
+    "{}/{prefix}-{}-{}",
+    env!("CARGO_TARGET_TMPDIR"),
+    std::process::id(),
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+  );
+  let made = Command::new("mkdir").args(["-p", &raw]).output().unwrap();
+  assert!(
+    made.status.success(),
+    "mkdir -p {raw}: {}",
+    String::from_utf8_lossy(&made.stderr)
+  );
   std::fs::canonicalize(&raw)
     .unwrap()
     .to_string_lossy()
     .into_owned()
+}
+
+/// A fresh mount-point directory in the build output.
+fn fresh_mount_point() -> String {
+  build_output_dir("slates-mount")
 }
 
 /// Whether `mount_nfs` — the mechanism `slates mount` drives — is on this host. It is macOS and the
@@ -1187,7 +1203,7 @@ impl Drop for FleetProcess {
   }
 }
 
-/// A scratch directory for the manifest and the DER files (`mktemp -d`, named with the process id),
+/// A scratch directory in the build output for the manifest and the DER files (`build_output_dir`),
 /// removed when dropped — even when an assertion fails.
 struct ScratchDir {
   path: String,
@@ -1200,21 +1216,8 @@ impl Drop for ScratchDir {
 }
 
 fn scratch_dir() -> ScratchDir {
-  let out = Command::new("mktemp")
-    .args([
-      "-d",
-      "-t",
-      &format!("slates-fleet-{}.XXXXXX", std::process::id()),
-    ])
-    .output()
-    .unwrap();
-  assert!(
-    out.status.success(),
-    "mktemp -d: {}",
-    String::from_utf8_lossy(&out.stderr)
-  );
   ScratchDir {
-    path: String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+    path: build_output_dir("slates-fleet"),
   }
 }
 
@@ -2594,17 +2597,10 @@ fn recovery_approval_is_bound_to_the_reviewed_plan_and_anchor_issuer() {
 /// T-2.14 / AUD-07: a separately invoked CLI can approve recovery on every platform using
 /// a node-specific operator key; absence, a wrong key and malformed key bytes all refuse.
 #[test]
-#[allow(clippy::disallowed_methods)] // Operator fixtures live only in the explicitly supplied RAM directory.
+#[allow(clippy::disallowed_methods)] // The operator's key file, in the test's build-output directory.
 fn recovery_approval_uses_the_provisioned_node_key_across_processes() {
-  let Some(ram) = std::env::var_os("SLATES_TEST_RAM") else {
-    eprintln!("skipping portable recovery CLI flow: set SLATES_TEST_RAM to a RAM-backed directory");
-    return;
-  };
-  let path = std::path::PathBuf::from(ram).join(format!("slates-recovery-{}", std::process::id()));
-  std::fs::create_dir(&path).unwrap();
-  let _scratch = ScratchDir {
-    path: path.to_string_lossy().into_owned(),
-  };
+  let scratch = scratch_dir();
+  let path = std::path::PathBuf::from(&scratch.path);
   let key_path = path.join("recovery.key");
   std::fs::write(&key_path, [91u8; 32]).unwrap();
   let environment = vec![(

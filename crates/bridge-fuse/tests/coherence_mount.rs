@@ -8,8 +8,8 @@
 //! the refused gather.
 //!
 //! Linux only, gated: skips loudly without `fusermount3` or `/dev/fuse` (the CI Linux lane has both;
-//! locally, a container with `--device /dev/fuse --cap-add SYS_ADMIN`). The mount point is under
-//! `/dev/shm`, named with the process id, unmounted and removed at the end.
+//! locally, a container with `--device /dev/fuse --cap-add SYS_ADMIN`). The mount point is in the
+//! build output (`CARGO_TARGET_TMPDIR`; A-50), named with the process id, unmounted and removed at the end.
 #![cfg(target_os = "linux")]
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -34,8 +34,6 @@ use common::{FailingGather, store, volume_for_owner};
 const MOUNT_WAIT: Duration = Duration::from_secs(60);
 /// Shape: the pause between polls of the loop's reports.
 const POLL_MS: u64 = 20;
-/// Format: the RAM-backed scratch root every Linux lane uses.
-const RAM_ROOT: &str = "/dev/shm";
 /// Shape: the volume id, the transport's uid (the mounting user) and the other attachment's.
 const VOLUME: VolumeId = VolumeId { bytes: [7; 16] };
 const OTHER_UID: u32 = 1001;
@@ -91,7 +89,11 @@ impl Drop for Scratch {
 }
 
 fn scratch() -> Scratch {
-  let root = format!("{RAM_ROOT}/slates-coherence-{}", std::process::id());
+  let root = format!(
+    "{}/slates-coherence-{}",
+    env!("CARGO_TARGET_TMPDIR"),
+    std::process::id()
+  );
   let mount_point = format!("{root}/mnt");
   let made = Command::new("mkdir")
     .args(["-p", &mount_point])

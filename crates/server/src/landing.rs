@@ -12,9 +12,9 @@
 //! The engine and the manifest are `slates-land`'s (Phase 1); this module is the wiring: it
 //! holds the runtime grant, lease and audit structures per shard, mirrors their mutations into
 //! the database's durable records, and maps the engine's refusals to the wire taxonomy. The
-//! write path runs on Linux and macOS; its tests write into a RAM-backed directory and so are
-//! gated to the CI Linux lane (`/dev/shm`), skipping loudly elsewhere, exactly as the Phase 1
-//! landing tests are.
+//! write path runs on Linux and macOS; its tests land into a real directory on the host's disk in
+//! the build output (`CARGO_TARGET_TMPDIR`; A-50: never `/tmp`, never a RAM directory), on every
+//! host, exactly as the Phase 1 landing tests do.
 
 use slates_db::Op;
 #[cfg(unix)]

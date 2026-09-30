@@ -111,11 +111,15 @@ fn mount_options(port: u16) -> String {
   )
 }
 
-/// A fresh, user-owned mount-point directory (`mktemp -d`, not `std::fs::create_dir` — R1).
+/// A fresh, user-owned mount-point directory in the build output — beside this example's binary under
+/// `target/`, named with the process id — made by `mkdir`, not `std::fs::create_dir` (R1; A-50: never `/tmp`).
 fn fresh_mount_point() -> String {
-  let out = Command::new("mktemp").arg("-d").output().unwrap();
-  assert!(out.status.success(), "mktemp -d");
-  String::from_utf8_lossy(&out.stdout).trim().to_owned()
+  let exe = std::env::current_exe().unwrap();
+  let beside = exe.parent().unwrap();
+  let path = format!("{}/slates-mount-{}", beside.display(), std::process::id());
+  let made = Command::new("mkdir").args(["-p", &path]).output().unwrap();
+  assert!(made.status.success(), "mkdir -p {path}");
+  path
 }
 
 /// Writes a file through the mount and reads it back (shell, not `std::fs` — R1), showing the bytes

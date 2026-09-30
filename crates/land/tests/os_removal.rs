@@ -2,8 +2,8 @@
 //! oracle of `tests/removal.rs`, held to the same rules (`common::removal`), with the operating system as the
 //! disk — so the rename that replaces nothing (`renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(
 //! RENAME_EXCL)` on macOS), its `EEXIST`, the unfollowed `statat` of a moved entry and the exchange are the
-//! kernel's, not the simulation's. The directory is the RAM-backed one `SLATES_TEST_RAMDIR` names (CI Linux:
-//! `/dev/shm`); without it every test here skips loudly and passes. Nothing is written outside it.
+//! kernel's, not the simulation's. The directory is a real one in the build output (`CARGO_TARGET_TMPDIR`), on
+//! every host (A-50: never `/tmp`, never a RAM directory). Nothing is written outside it.
 //!
 //! The OS writer sits behind [`Interfering`], which delegates every seam call, counts it, and makes an armed
 //! outsider's save — its bytes written beside the target, then renamed over the interfered path (a directory
@@ -37,18 +37,11 @@ use common::{
   LARGE, Session, Setup, TERM_NS, config, mkdir, rename, request, rm_r, store, unlink, write_file,
 };
 
-/// Format: the environment variable naming the RAM-backed directory.
-const RAM_DIR: &str = "SLATES_TEST_RAMDIR";
-
-/// The RAM directory, or `None` with a loud skip.
-fn ram_dir(test: &str) -> Option<PathBuf> {
-  match std::env::var_os(RAM_DIR) {
-    Some(dir) => Some(PathBuf::from(dir)),
-    None => {
-      println!("{test}: skipped — set {RAM_DIR} to a RAM-backed directory (CI Linux: /dev/shm)");
-      None
-    }
-  }
+/// The build output (`CARGO_TARGET_TMPDIR`, under `target/`): the real host directory this test lands into
+/// and reads from (A-50: a landing writes the host's disk and a base is read from it, so tests exercise both
+/// for real — never under `/tmp` and never in a RAM directory).
+fn build_output() -> PathBuf {
+  PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
 /// A fresh working directory for one history, named with the process id, removed on drop.
@@ -59,8 +52,8 @@ struct Workspace {
 impl Workspace {
   fn new(base: &Path, name: &str) -> Self {
     let path = base.join(format!("slates-os-removal-{}-{name}", std::process::id()));
-    // The test harness is the one place a test writes a host path outside a landing: the RAM-backed
-    // scratch directory it removes at the end (CLAUDE.md §4).
+    // The test harness is the one place a test writes a host path outside a landing: the build-output
+    // directory it removes at the end (CLAUDE.md §4).
     #[allow(clippy::disallowed_methods)]
     std::fs::create_dir_all(path.join("target")).unwrap();
     #[allow(clippy::disallowed_methods)]
@@ -93,6 +86,33 @@ struct Interfering {
   outsider_dir: PathBuf,
   /// Whether the engine may see the exchange.
   exchange: bool,
+  /// A descriptor on every outsider file, held for the history, so its inode number names it alone.
+  pins: Vec<std::os::fd::OwnedFd>,
+}
+
+/// Format: `O_SYMLINK` from macOS `<sys/fcntl.h>`: open a symlink itself rather than its target (rustix
+/// names no such flag).
+#[cfg(target_vendor = "apple")]
+const O_SYMLINK: u32 = 0x0020_0000;
+
+/// A descriptor on the object at `path` itself (a symlink not followed), held so the kernel cannot free the
+/// inode and hand its number to a later file while the oracle identifies objects by number. ext4 reuses a
+/// freed number at once (a removed witnessed object's number came back as the outsider's later file, and
+/// the oracle read the removal as not done); tmpfs and APFS hand out fresh numbers, which hid this. A held
+/// descriptor changes nothing a landing observes: unlink, rename and rmdir succeed on an open object.
+fn pin(path: &Path) -> std::os::fd::OwnedFd {
+  #[cfg(target_os = "linux")]
+  let flags = rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW;
+  #[cfg(target_vendor = "apple")]
+  let flags = rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::from_bits_retain(O_SYMLINK);
+  #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+  let flags = rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW;
+  rustix::fs::open(
+    path,
+    flags | rustix::fs::OFlags::CLOEXEC,
+    rustix::fs::Mode::empty(),
+  )
+  .unwrap()
 }
 
 impl Interfering {
@@ -124,6 +144,7 @@ impl Interfering {
     let temp = self.outsider_dir.join(format!("save-{}", self.fired.len()));
     std::fs::write(&temp, bytes).unwrap();
     let created = std::fs::symlink_metadata(&temp).unwrap().ino();
+    self.pins.push(pin(&temp));
     let before = std::fs::symlink_metadata(&self.path).ok();
     if before.as_ref().is_some_and(std::fs::Metadata::is_dir) {
       std::fs::remove_dir_all(&self.path).unwrap();
@@ -320,17 +341,19 @@ fn inodes(target: &Path) -> BTreeMap<u64, String> {
 /// One landed history over the real directory.
 struct Run {
   result: Result<LandingReport, LandingRefusal>,
-  calls: u64,
   witnessed: u64,
   fired: Vec<Fired>,
-  all_fired: bool,
+  /// Every edit armed at a call this run reached fired there.
+  reached_edits_fired: bool,
+  /// Edits armed past this run's last seam call: the history ended before them.
+  unreached: usize,
   inodes: BTreeMap<u64, String>,
 }
 
 impl Run {
   fn seen(&self) -> Seen<'_> {
     Seen {
-      all_fired: self.all_fired,
+      reached_edits_fired: self.reached_edits_fired,
       fired: self.fired.clone(),
       inodes: self.inodes.clone(),
       witnessed: self.witnessed,
@@ -349,12 +372,14 @@ fn run(ram: &Path, label: &str, removal: Removal, edits: &[(u64, &[u8])]) -> Run
   let witnessed = std::fs::symlink_metadata(target_path.join("doomed"))
     .unwrap()
     .ino();
+  let _witnessed_pin = pin(&target_path.join("doomed"));
   let (inner, target) = OsLand::open_target(&target_path).unwrap();
   let mut host = Interfering {
     inner,
     calls: 0,
     armed: Vec::new(),
     fired: Vec::new(),
+    pins: Vec::new(),
     path: target_path.join(removal.interfered().trim_start_matches('/')),
     outsider_dir: ws.path.join("outsider"),
     exchange: removal.exchange(),
@@ -405,7 +430,6 @@ fn run(ram: &Path, label: &str, removal: Removal, edits: &[(u64, &[u8])]) -> Run
   for (n, bytes) in edits {
     host.arm(*n, bytes);
   }
-  let before = host.calls;
   let result = Setup {
     host: &mut host,
     target: &target,
@@ -415,35 +439,43 @@ fn run(ram: &Path, label: &str, removal: Removal, edits: &[(u64, &[u8])]) -> Run
   }
   .try_land(&granted, &mut Unobserved);
   Run {
-    calls: host.calls.saturating_sub(before),
     witnessed,
-    all_fired: host.armed.is_empty(),
+    reached_edits_fired: host.armed.iter().all(|(at, _)| *at > host.calls),
+    unreached: host.armed.len(),
     fired: host.fired.clone(),
     inodes: inodes(&target_path),
     result,
   }
 }
 
-/// AUD-29-04 over a real directory. Do: for every kind of `common::removal`, land it once to count its seam
-/// calls, then once per call with a real outsider save over the name just before that call, then once per
-/// pair of calls with two saves. Expect: every history keeps `common::removal`'s rules with the kernel's own
-/// renames, stats and exchange behind the engine, and across each kind's single-save histories both a stale
-/// entry and a written one occurred (neither rule passes vacuously).
+/// AUD-29-04 over a real directory. Do: for every kind of `common::removal`, land it once per seam call with a
+/// real outsider save over the name just before that call, then once per later call of that history with a
+/// second save — each loop running until a landing ends before its armed call, so every position the
+/// landing's own path reaches is interfered with. Expect: every history keeps `common::removal`'s rules with
+/// the kernel's own renames, stats and exchange behind the engine; across each kind's single-save histories
+/// both a stale entry and a written one occurred, and some two-save history fired both saves (no rule
+/// passes vacuously).
+///
+/// The positions come from each run, not from a reference count: on a coarse-clock filesystem (ext4 steps
+/// its ctime in kernel ticks) the engine rightly re-verifies a displaced original whose ctime its own
+/// exchange moved, and whether that ctime moved depends on the tick — one history measured 29 seam calls
+/// in one run and 27 in the next (2026-09-30). Both paths are real and both are judged.
 #[test]
 fn a_real_outsider_save_at_any_seam_call_survives_every_removal() {
-  let Some(ram) = ram_dir("a_real_outsider_save_at_any_seam_call_survives_every_removal") else {
-    return;
-  };
+  let ram = build_output();
   for (kind, removal) in REMOVALS.into_iter().enumerate() {
     let reference = run(&ram, &format!("{kind}-ref"), removal, &[]);
     assert_reference(removal, &reference.seen());
-    let (mut stale, mut written) = (0u64, 0u64);
-    for n in 0..reference.calls {
+    let (mut stale, mut written, mut pairs) = (0u64, 0u64, 0u64);
+    for n in 0.. {
       let one = run(&ram, &format!("{kind}-{n}"), removal, &[(n, OUTSIDER)]);
+      if one.unreached > 0 {
+        break;
+      }
       let verdict = judge(removal, &format!("{removal:?} at call {n}"), &one.seen());
       stale += u64::from(verdict.stale);
       written += u64::from(verdict.written);
-      for second in n.saturating_add(1)..one.calls {
+      for second in n.saturating_add(1).. {
         let two = run(
           &ram,
           &format!("{kind}-{n}-{second}"),
@@ -455,12 +487,15 @@ fn a_real_outsider_save_at_any_seam_call_survives_every_removal() {
           &format!("{removal:?} at calls {n} and {second}"),
           &two.seen(),
         );
+        if two.unreached > 0 {
+          break;
+        }
+        pairs += 1;
       }
     }
     assert!(
-      written > 0 && (stale > 0 || matches!(removal, Removal::RenameOnto)),
-      "{removal:?}: {stale} stale and {written} written histories of {}",
-      reference.calls
+      written > 0 && (stale > 0 || matches!(removal, Removal::RenameOnto)) && pairs > 0,
+      "{removal:?}: {stale} stale, {written} written and {pairs} two-save histories"
     );
   }
 }

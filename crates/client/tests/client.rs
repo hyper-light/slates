@@ -569,21 +569,19 @@ impl Drop for HostDir {
   }
 }
 
-/// A fresh host directory named with the process id, holding `f.txt` = `disk bytes`.
+/// A fresh host directory in the build output named with the process id, holding `f.txt` = `disk bytes`.
 fn host_dir_with_file() -> HostDir {
-  // The template needs trailing `X`s: GNU mktemp (Linux) refuses one without them ("too few X's"),
-  // while BSD mktemp (macOS) tolerates their absence — so the bare prefix passed on macOS and failed
-  // the Linux lane. `<prefix>.XXXXXX` is the form the conformance harness already uses on both.
-  let out = std::process::Command::new("mktemp")
-    .args([
-      "-d",
-      "-t",
-      &format!("slates-origin-{}.XXXXXX", std::process::id()),
-    ])
+  // A-50: a test's base is a real host directory in the build output (`CARGO_TARGET_TMPDIR`), never `/tmp`.
+  let path = format!(
+    "{}/slates-origin-{}",
+    env!("CARGO_TARGET_TMPDIR"),
+    std::process::id()
+  );
+  let made = std::process::Command::new("mkdir")
+    .args(["-p", &path])
     .output()
     .unwrap();
-  assert!(out.status.success(), "mktemp -d");
-  let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+  assert!(made.status.success(), "mkdir -p {path}");
   let wrote = std::process::Command::new("sh")
     .arg("-c")
     .arg(format!("printf '%s' 'disk bytes' > '{path}/f.txt'"))

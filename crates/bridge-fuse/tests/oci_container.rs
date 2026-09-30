@@ -14,8 +14,8 @@
 //! `fusermount3` refuses `allow_other` — the runtime's daemon and the container's processes are other
 //! users to the FUSE mount, which admits only the mounting uid unless `/etc/fuse.conf` sets
 //! `user_allow_other` (§4.6 "`allow_other` only if `user_allow_other` is set and the operator
-//! asked"; this test is the operator asking). The scratch directory is RAM-backed (`/dev/shm`),
-//! named with the process id, and removed at the end.
+//! asked"; this test is the operator asking). The scratch directory is in the build output
+//! (`CARGO_TARGET_TMPDIR`; A-50: never `/tmp`, never a RAM directory), named with the process id, and removed at the end.
 #![cfg(target_os = "linux")]
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -39,8 +39,6 @@ const DOCKER_INFO_WAIT: Duration = Duration::from_secs(60);
 const POLL_MS: u64 = 20;
 /// Format: the image the container workload runs in — one small image.
 const CONTAINER_IMAGE: &str = "alpine:3.20";
-/// Format: the RAM-backed scratch root every Linux lane uses.
-const RAM_ROOT: &str = "/dev/shm";
 /// Format: the bind entry's vocabulary as `crates/bridge-oci/src/binding.rs` builds it (the OCI
 /// runtime specification's bind mount): the entry a daemon returns for a write and a read attachment.
 const OPTIONS_RW: &str = "rw";
@@ -156,7 +154,11 @@ impl Drop for Scratch {
 }
 
 fn scratch() -> Scratch {
-  let root = format!("{RAM_ROOT}/slates-oci-{}", std::process::id());
+  let root = format!(
+    "{}/slates-oci-{}",
+    env!("CARGO_TARGET_TMPDIR"),
+    std::process::id()
+  );
   let mount_point = format!("{root}/mnt");
   let made = Command::new("mkdir")
     .args(["-p", &mount_point])

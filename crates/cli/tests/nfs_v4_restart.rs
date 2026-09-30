@@ -5,8 +5,8 @@
 //! must still bind (another open file's `flock` is refused), and the file must open afresh — the
 //! client's id and state ids were kept in the partitions, so no grace period and no reclaim.
 //!
-//! Gated: Linux, root (or passwordless `sudo`) for `mount`, the `mount.nfs4` helper, a RAM-backed
-//! `SLATES_TEST_RAMDIR`, and `SLATES_TEST_NFS4_KERNEL=1`; otherwise it skips loudly and passes.
+//! Gated: Linux, root (or passwordless `sudo`) for `mount`, the `mount.nfs4` helper, and
+//! `SLATES_TEST_NFS4_KERNEL=1`; the mount point is in the build output (A-50); otherwise it skips loudly and passes.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![cfg(target_os = "linux")]
 
@@ -49,9 +49,6 @@ fn pause() {
 fn skip_reason() -> Option<String> {
   if std::env::var_os("SLATES_TEST_NFS4_KERNEL").is_none() {
     return Some("SLATES_TEST_NFS4_KERNEL is not set".to_owned());
-  }
-  if std::env::var_os("SLATES_TEST_RAMDIR").is_none() {
-    return Some("SLATES_TEST_RAMDIR is not set (name a RAM-backed directory)".to_owned());
   }
   if !Path::new("/sbin/mount.nfs4").exists() && !Path::new("/usr/sbin/mount.nfs4").exists() {
     return Some("the mount.nfs4 helper is not installed".to_owned());
@@ -154,9 +151,9 @@ fn nfsv4_opens_and_locks_survive_a_daemon_restart() {
   let capability = format!("{:x}.{token}", attached.attachment);
   let port = client.status(volume).unwrap().nfs_port.unwrap();
 
-  let point = PathBuf::from(std::env::var_os("SLATES_TEST_RAMDIR").unwrap())
-    .join(format!("nfs4-restart-{}", std::process::id()));
-  #[allow(clippy::disallowed_methods)] // the mount point, in the RAM test directory
+  let point =
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("nfs4-restart-{}", std::process::id()));
+  #[allow(clippy::disallowed_methods)] // the mount point, in the build output
   std::fs::create_dir_all(&point).unwrap();
   let mount = KernelMount(point);
   let options = format!("vers=4.2,proto=tcp,port={port},hard,timeo=10");
