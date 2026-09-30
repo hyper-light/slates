@@ -66,6 +66,14 @@ impl Deadlines {
   }
 }
 
+/// Derived: the last sequence a client issues. Sequences run from 1 up to here and never wrap: a wrapped
+/// sequence would meet the daemon's window as already acknowledged, or meet an earlier completion (AUD-29-21).
+/// `u32::MAX` is kept as the [`Session::next_sequence`] of a client that issued this one — a resume from it
+/// issues nothing, so the last id is never reissued. Past it every fresh request is refused
+/// `SequencesExhausted`, and the transition is a new client: a fresh client id and window, while retries of
+/// ids already issued still reach their completion records.
+pub const LAST_SEQUENCE: u32 = u32::MAX - 1;
+
 /// What a client keeps to resume: its id and the next sequence it would use. A process that
 /// restarts with this retries what it had in flight and meets the completion record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -544,7 +552,8 @@ impl Client {
   pub fn session(&self) -> Session {
     Session {
       client_id: self.client_id,
-      next_sequence: self.sequence.wrapping_add(1),
+      // At most `LAST_SEQUENCE + 1 = u32::MAX`, the exhausted marker: exact, never a wrap.
+      next_sequence: self.sequence.saturating_add(1),
     }
   }
 
@@ -585,7 +594,7 @@ impl Client {
     // daemon's retained records stay bounded without the caller's help (§4.9) — up to the
     // watermark, which an unpublished id not yet retried holds back.
     let up_to = self.ack_watermark();
-    if up_to.wrapping_sub(self.acknowledged) >= self.ack_every {
+    if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.acknowledge(up_to)?;
     }
     if matches!(body, RequestBody::DaemonStatus) {
@@ -603,7 +612,7 @@ impl Client {
     self
       .unpublished
       .first()
-      .map_or(self.sequence, |&lowest| lowest.wrapping_sub(1))
+      .map_or(self.sequence, |&lowest| lowest.saturating_sub(1))
   }
 
   /// Notes what `word`'s reply means for the retryable set: an `Unpublished` refusal keeps the id
@@ -636,11 +645,7 @@ impl Client {
 
   /// One request under the next sequence, without the automatic acknowledgement.
   fn call_plain(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
-    self.sequence = self.sequence.wrapping_add(1);
-    let id = RequestId {
-      client: self.client_id,
-      sequence: self.sequence,
-    };
+    let id = self.fresh_id()?;
     self.exchange(id, body)
   }
 
@@ -682,7 +687,7 @@ impl Client {
   /// verb is not sent.
   fn rebind_if_needed(&mut self) -> Result<(), ClientError> {
     while let Some((consumer, proof)) = self.pending_bind() {
-      let id = self.fresh_id();
+      let id = self.fresh_id()?;
       match self.round_trip(id, &RequestBody::Attest { consumer, proof })? {
         // The daemon went away again during the bind and the client reconnected: bind the newer channel.
         None => {}
@@ -697,13 +702,19 @@ impl Client {
     Ok(())
   }
 
-  /// The next request id.
-  fn fresh_id(&mut self) -> RequestId {
-    self.sequence = self.sequence.wrapping_add(1);
-    RequestId {
+  /// The next request id, or `SequencesExhausted` past [`LAST_SEQUENCE`] — refused before anything is sent,
+  /// never a wrap into an id the daemon has already seen (AUD-29-21).
+  fn fresh_id(&mut self) -> Result<RequestId, ClientError> {
+    if self.sequence >= LAST_SEQUENCE {
+      return Err(ClientError::SequencesExhausted {
+        client: self.client_id,
+      });
+    }
+    self.sequence = self.sequence.saturating_add(1);
+    Ok(RequestId {
       client: self.client_id,
       sequence: self.sequence,
-    }
+    })
   }
 
   /// One send and one wait for `id`'s reply: the decoded reply, or `None` when the daemon was found
@@ -752,7 +763,7 @@ impl Client {
   /// acknowledges by a sync [`Self::acknowledge`] between calls, or by `begin`-ing the ack body and
   /// dropping its reply.
   pub fn begin(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
-    let id = self.fresh_id();
+    let id = self.fresh_id()?;
     loop {
       // A reconnect on the way (the daemon found gone while the ring stayed full) leaves a fresh
       // channel: bound again to the consumer, when the client holds one, before the request goes.
@@ -911,7 +922,7 @@ impl Client {
   /// optimistically; a lost ack only means the daemon holds a little more until the next one.
   pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
     let up_to = self.ack_watermark();
-    if up_to.wrapping_sub(self.acknowledged) >= self.ack_every {
+    if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
       self.begin(&RequestBody::Acknowledge { up_to })?;
       self.acknowledged = self.acknowledged.max(up_to);
     }

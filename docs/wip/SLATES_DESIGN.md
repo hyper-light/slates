@@ -3400,6 +3400,17 @@ window is the process-restart window (zero, thanks to the anchor). Same code, ze
 
 ### 4.9 Wire protocol (D-15)
 
+> **Status (2026-09-30, AUD-29-21).** A client's request sequence never wraps.
+> - **Range and marker.** Sequences run from 1 to `LAST_SEQUENCE = u32::MAX − 1`, and `u32::MAX` is kept
+>   as the session's exhausted marker, so a resume from it issues nothing.
+> - **Refusal.** Past the last sequence every fresh request, including the automatic acknowledgement and
+>   a rebind, is refused `ClientError::SequencesExhausted` before it is sent.
+> - **What still works.** Retries of issued ids are still answered from their completion records.
+> - **The transition.** New work goes through a new client, with a fresh client id and window.
+> - **Arithmetic.** The acknowledgement cadence compares without wrapping. Before this, the sequence
+>   wrapped to zero, which the daemon's window then met as already acknowledged
+>   (`docs/bugs/2026-09-30-request-sequences-wrapped-into-acknowledged.md`).
+>
 > **Status (2026-09-19, byte sequences):** `Wire` dispatches a sequence operation to
 > its element type. `u8` copies the canonical payload in bulk; structured elements encode
 > and decode each field. Length prefixes, schema hashes and bytes are unchanged, and lengths

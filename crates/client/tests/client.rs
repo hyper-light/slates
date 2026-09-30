@@ -403,6 +403,90 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   drop(segment);
 }
 
+/// AUD-29-21 (§4.9, RIFL): do: connect a client, restart its daemon over the same anchor-held segment, and
+/// resume the client's session seeded at the last request sequence; create a volume under it, then ask for
+/// more; expect the last create served, every later fresh request refused `SequencesExhausted` before it is
+/// sent, the session carrying the exhausted marker, and a retry of the last id still answered from its
+/// completion record — never a wrapped sequence met as already acknowledged (the old client wrapped to zero).
+/// The restart is how a test frees the client id: the daemon keeps an id while its process lives.
+#[test]
+fn a_client_at_its_last_sequence_refuses_fresh_requests_and_keeps_its_retries() {
+  let profile = profile();
+  let instance = format!("cl-seq-end-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
+    * 2
+    * usize::from(config.geometry.partitions.max(1));
+  let segment = AnchorSegment::create(
+    &format!("slates-seg-cl-seq-end-{}", std::process::id()),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(
+    &format!("slates-con-cl-seq-end-{}", std::process::id()),
+    content_bytes,
+  )
+  .unwrap();
+  let source = || {
+    let (handoff, len) = segment.handoff().unwrap();
+    let content = segment.content_handoff().unwrap();
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+    }
+  };
+  let first = Daemon::start(&profile, config.clone(), source()).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let client_id = connect(&instance).client_id();
+  first.stop();
+  let second = Daemon::start(&profile, config, source()).unwrap();
+  second
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  // The resumed client's first call acknowledges what it holds (one sequence, the acknowledgement due at a
+  // fresh watermark), so the create after it takes the last sequence.
+  let seeded = slates_client::Session {
+    client_id,
+    next_sequence: slates_client::LAST_SEQUENCE - 1,
+  };
+  let mut client = Client::resume(&instance, seeded, deadlines()).unwrap();
+  let last = client.create(&scratch("last")).unwrap();
+  let last_id = client.last_request();
+  assert_eq!(last_id.sequence, slates_client::LAST_SEQUENCE);
+  assert!(matches!(
+    client.create(&scratch("past")),
+    Err(ClientError::SequencesExhausted { client }) if client == client_id
+  ));
+  assert_eq!(
+    client.session().next_sequence,
+    u32::MAX,
+    "the exhausted marker"
+  );
+  let retried = client
+    .retry(
+      last_id,
+      &RequestBody::Create {
+        name: "last".to_owned(),
+        size: SizeClass::Bounded { limit: 1 << 20 },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    )
+    .unwrap();
+  assert_eq!(
+    retried,
+    slates_ipc::protocol::ReplyBody::Created { id: last },
+    "the retry meets the record"
+  );
+  second.stop();
+  drop(segment);
+}
+
 /// AC-2.3 / AC-2.6: use the last fresh identity, refuse the next admission, restart, and
 /// expect the existing session to keep working while fresh admission remains refused.
 #[test]

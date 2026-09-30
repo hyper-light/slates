@@ -34,6 +34,13 @@ pub enum ClientError {
     /// The id the daemon assigned instead.
     assigned: u32,
   },
+  /// This client has issued its last request sequence (`LAST_SEQUENCE`): no fresh request is sent, since
+  /// a wrapped sequence would meet the daemon's window as already acknowledged (AUD-29-21). Retries of
+  /// issued ids still work; new work goes through a new client — a fresh client id and window.
+  SequencesExhausted {
+    /// The exhausted client id.
+    client: u32,
+  },
 }
 
 impl fmt::Display for ClientError {
@@ -46,6 +53,9 @@ impl fmt::Display for ClientError {
       Self::DaemonGone { after_ns } => write!(f, "daemon gone for {after_ns} ns"),
       Self::SessionTaken { assigned } => {
         write!(f, "session held by a live client; assigned {assigned}")
+      }
+      Self::SequencesExhausted { client } => {
+        write!(f, "client {client} has issued its last request sequence")
       }
     }
   }
