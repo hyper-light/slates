@@ -153,12 +153,14 @@ impl UdpSocket {
   }
 
   /// Awaits the socket's read readiness through the driver: a datagram is waiting, or the wait ended
-  /// spuriously — so a caller follows it with [`UdpSocket::try_recv_from`] and loops on `None`.
-  pub async fn readable(&self) -> Result<(), RtError> {
-    match &self.inner {
-      Inner::Real { socket } => readable(socket.raw_id()).await,
-      Inner::Sim { port } => readable(i32::from(*port)).await,
-    }
+  /// spuriously — so a caller follows it with [`UdpSocket::try_recv_from`] and loops on `None`. The future
+  /// names the socket by its descriptor (or fabric port), not by a borrow, so a task that reaches the socket
+  /// through a handle (a kept demultiplexer, AUD-29-08) can await it outside the handle's borrow.
+  pub fn readable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    readable(match &self.inner {
+      Inner::Real { socket } => socket.raw_id(),
+      Inner::Sim { port } => i32::from(*port),
+    })
   }
 
   /// Takes one waiting datagram into `buf` without blocking: the byte count and the sender, or `None`

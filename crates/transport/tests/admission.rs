@@ -14,7 +14,7 @@ use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use slates_transport::connection::Priority;
-use slates_transport::demux::{Demux, SessionRefusal};
+use slates_transport::demux::{Demux, DemuxId, SessionRefusal};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
 
@@ -116,7 +116,7 @@ async fn together<Left: Future, Right: Future>(
 }
 
 struct Harness {
-  demux: &'static Demux,
+  demux: DemuxId,
   certificate: CertificateDer<'static>,
 }
 
@@ -124,7 +124,9 @@ impl Harness {
   fn new(allowed: Vec<CertificateDer<'static>>) -> Harness {
     let identity = identities(1).pop().unwrap();
     let certificate = identity.certificate();
-    let identity = slates_rt::registry::with_current(|context| context.keep(identity)).unwrap();
+    let identity = slates_rt::registry::with_current(|context| context.keep(identity))
+      .unwrap()
+      .unwrap();
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let demux = Demux::start(socket, identity, allowed, shape(), PEERS).unwrap();
     let task = futures::spawn(async move {
@@ -139,7 +141,7 @@ impl Harness {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     let mut client = Endpoint::client(
       socket,
-      self.demux.local_addr().unwrap(),
+      self.demux.with(Demux::local_addr).unwrap().unwrap(),
       identity,
       &self.certificate,
       NAME,
@@ -147,7 +149,7 @@ impl Harness {
     )
     .unwrap();
     let (dialed, (server, accepted)) = together(client.establish(), async {
-      let mut server = self.demux.accept().await;
+      let mut server = self.demux.accept().await.unwrap();
       let accepted = server.establish().await;
       (server, accepted)
     })
@@ -164,7 +166,7 @@ impl Harness {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
     Endpoint::client(
       socket,
-      self.demux.local_addr().unwrap(),
+      self.demux.with(Demux::local_addr).unwrap().unwrap(),
       identity,
       &self.certificate,
       NAME,
@@ -185,7 +187,7 @@ impl Harness {
     }
     // The client sent a real first flight. Holding the server endpoint here with no handshake poll
     // models a pending serve task; ownership, rather than a timer guess, keeps its reservation full.
-    (client, self.demux.accept().await)
+    (client, self.demux.accept().await.unwrap())
   }
 }
 
@@ -225,7 +227,14 @@ fn a_redialing_identity_cannot_take_another_peers_sessions() {
       ),
       "retrying the refused endpoint must recheck admission, never reuse a cached connection id"
     );
-    assert_eq!(harness.demux.counters().peer_sessions_refused, 2);
+    assert_eq!(
+      harness
+        .demux
+        .with(Demux::counters)
+        .unwrap()
+        .peer_sessions_refused,
+      2
+    );
     drop((excess_client, excess_server));
     let (mut other_client, mut other_server, accepted) = harness.dial(&other).await;
     accepted.unwrap();
@@ -238,7 +247,11 @@ fn a_redialing_identity_cannot_take_another_peers_sessions() {
     echo(&mut next_client, &mut next_server, b"slot reused").await;
     echo(&mut other_client, &mut other_server, b"B survives").await;
     drop((next_client, next_server, other_client, other_server));
-    assert_eq!(harness.demux.sessions(), 0, "every owned charge returned");
+    assert_eq!(
+      harness.demux.with(Demux::sessions).unwrap(),
+      0,
+      "every owned charge returned"
+    );
   });
 }
 
@@ -262,20 +275,21 @@ fn full_pending_capacity_preserves_live_service_and_reclaims_on_drop() {
       excess.establish().await,
       Err(EndpointError::NotReady)
     ));
-    let counters = harness.demux.counters();
+    let counters = harness.demux.with(Demux::counters).unwrap();
     assert!(counters.sessions_refused > 0);
     assert_eq!(counters.peer_sessions_refused, 0);
     assert_eq!(counters.setup_refused, 0);
-    assert_eq!(harness.demux.sessions(), PEERS + 1);
+    assert_eq!(harness.demux.with(Demux::sessions).unwrap(), PEERS + 1);
     drop(pending.pop());
     let (mut joined_client, mut joined_server, accepted) = harness.dial(&joining).await;
     accepted.unwrap();
     echo(&mut joined_client, &mut joined_server, b"pending freed").await;
     echo(&mut client, &mut server, b"still serving").await;
     drop((pending, client, server, joined_client, joined_server));
-    assert_eq!(harness.demux.sessions(), 0);
+    assert_eq!(harness.demux.with(Demux::sessions).unwrap(), 0);
     assert!(
-      harness.demux.counters().high_water <= u64::try_from(harness.demux.capacity()).unwrap()
+      harness.demux.with(Demux::counters).unwrap().high_water
+        <= u64::try_from(harness.demux.with(Demux::capacity).unwrap()).unwrap()
     );
   });
 }
@@ -298,7 +312,10 @@ fn a_full_identity_reservation_refuses_a_new_peer_without_replacing_another() {
       refused,
       Err(EndpointError::Admission(SessionRefusal::PeerCapacity))
     ));
-    assert_eq!(harness.demux.counters().peers_refused, 1);
+    assert_eq!(
+      harness.demux.with(Demux::counters).unwrap().peers_refused,
+      1
+    );
     drop((client, server));
     for (client, server) in &mut held {
       echo(client, server, b"not displaced").await;
@@ -308,6 +325,6 @@ fn a_full_identity_reservation_refuses_a_new_peer_without_replacing_another() {
     accepted.unwrap();
     echo(&mut client, &mut server, b"identity freed").await;
     drop((held, client, server));
-    assert_eq!(harness.demux.sessions(), 0);
+    assert_eq!(harness.demux.with(Demux::sessions).unwrap(), 0);
   });
 }

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use slates_rt::driver::Kick;
 use slates_rt::registry::{
-  MAX_SHARDS, RegisterKick, TrySend, holder_of, register, try_send_foreign, unregister, with_entry,
+  MAX_SHARDS, RegisterKick, TrySend, holder_of, register, try_send_foreign, with_entry,
 };
 
 /// Sends `word` to `target` as a shard does: one turn at a time, draining this thread's own ring
@@ -71,7 +71,8 @@ fn registrations_wakes_and_unregistrations_interleave_without_a_fault() {
     .map(|_| {
       std::thread::spawn(move || {
         for _ in 0..CYCLES {
-          let (id, receiver) = register(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+          let (registration, receiver) = register(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+          let id = registration.shard();
           let held = holder_of(id).unwrap();
           // A foreign wake to our own slot lands in its ring, drained by the "shard" (this thread).
           // Both wakes are sent as a shard sends: one turn at a time, draining this thread's own ring
@@ -93,7 +94,7 @@ fn registrations_wakes_and_unregistrations_interleave_without_a_fault() {
           let neighbour = id.wrapping_add(1) % u16::try_from(MAX_SHARDS).unwrap_or(u16::MAX);
           let _ = send_as_shard(id, neighbour, 9, landed);
           let _ = receiver.try_recv();
-          unregister(id);
+          drop(registration);
           // The slot was given back: its generation moved past the even value this thread held
           // (another test in this binary, or another thread here, may already hold it again, so
           // "free" is not the claim — "no longer mine" is).

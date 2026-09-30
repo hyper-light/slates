@@ -15,8 +15,9 @@ use iai_callgrind::{
 };
 use slates_rt::error::RtError;
 use slates_rt::futures::yield_now;
+use slates_rt::registry::with_current;
 use slates_rt::runtime::RuntimeConfig;
-use slates_rt::shard::Counters;
+use slates_rt::shard::{Counters, Kept, ShardId};
 use slates_rt::sim::SimRuntime;
 
 // The default function-return boundary included teardown instructions on Linux ARM64
@@ -135,9 +136,54 @@ fn local_wake(mut sim: SimRuntime) -> Result<Counters, RtError> {
   })
 }
 
+/// Shape: the word the kept-value row keeps and reads back, so the teardown sees the lookup resolved.
+const KEPT_WORD: u64 = 42;
+
+/// A runtime holding one kept word (kept by a task, outside the measured span), with its shard and handle.
+fn kept_value() -> (SimRuntime, ShardId, Kept<u64>) {
+  let mut sim = sim();
+  let shard = sim.shard_ids()[0];
+  let (tx, rx) = std::sync::mpsc::channel();
+  require_success(
+    sim.spawn_on(shard, async move {
+      let _ = tx.send(with_current(|context| context.keep(KEPT_WORD)));
+    }),
+    "admit the keeping task",
+  );
+  sim.run_until_idle();
+  match rx.recv() {
+    Ok(Some(Ok(kept))) => (sim, shard, kept),
+    other => {
+      eprintln!("keep the benchmark word: {other:?}");
+      std::process::exit(1);
+    }
+  }
+}
+
+fn check_kept(word: Option<u64>) {
+  assert_eq!(
+    word,
+    Some(KEPT_WORD),
+    "the handle resolves on its own context"
+  );
+}
+
+// AUD-29-08: one validated lookup of a kept value (the check of the context's registration, the shared
+// borrow, the index and the type) — what every datagram a demultiplexer routes pays to reach it.
+#[library_benchmark(teardown = check_kept)]
+#[bench::own_context(kept_value())]
+fn kept_lookup(fixture: (SimRuntime, ShardId, Kept<u64>)) -> Option<u64> {
+  let (sim, shard, kept) = fixture;
+  // Borrowed, not moved: the runtime's destruction is not part of one lookup.
+  count_instructions(|| {
+    let context = sim.context(shard).ok()?;
+    black_box(kept).with_in(context, |word| *word)
+  })
+}
+
 library_benchmark_group!(
   name = runtime;
-  benchmarks = step_idle, spawn_and_run, local_wake
+  benchmarks = step_idle, spawn_and_run, local_wake, kept_lookup
 );
 
 main!(

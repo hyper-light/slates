@@ -1339,9 +1339,16 @@ impl Daemon {
   pub fn fleet_demux_counters(
     &self,
   ) -> Result<Vec<slates_transport::demux::DemuxCounters>, ObserveError> {
-    self.observe(self.shards.first().copied(), |s| {
-      s.demuxes.iter().map(|demux| demux.counters()).collect()
-    })
+    // A demultiplexer the observation cannot reach (its shard's context ended) is the state out of reach,
+    // never a zeroed row.
+    self
+      .observe(self.shards.first().copied(), |s| {
+        s.demuxes
+          .iter()
+          .map(|demux| demux.with(slates_transport::demux::Demux::counters))
+          .collect::<Option<Vec<_>>>()
+      })?
+      .ok_or(ObserveError::State(StateAccess::Absent))
   }
 
   /// Live tasks in the control shard's arena (§4.14), the observation's own task among them. A test reads

@@ -2032,8 +2032,10 @@ fn demux_sum(
   state: &ShardState,
   counter: impl Fn(&slates_transport::demux::DemuxCounters) -> u64,
 ) -> u64 {
+  // A handle that no longer resolves names a demultiplexer this shard no longer runs (its context ended
+  // under a state that outlived it), which serves nothing and so counts nothing.
   state.demuxes.iter().fold(0u64, |sum, demux| {
-    sum.saturating_add(counter(&demux.counters()))
+    sum.saturating_add(demux.with(|demux| counter(&demux.counters())).unwrap_or(0))
   })
 }
 

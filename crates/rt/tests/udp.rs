@@ -25,19 +25,17 @@ const PULSE_GAP: Duration = Duration::from_millis(200);
 
 /// One read of a shard's pulse: steps, waits, spawns, completions, and whether it has exited.
 fn pulse(shard: u16) -> String {
-  slates_rt::registry::entry(shard).map_or_else(
-    || "no entry".to_owned(),
-    |entry| {
-      format!(
-        "steps {} waits {} spawns {} completed {} exited {}",
-        entry.pulse.steps(),
-        entry.pulse.waits(),
-        entry.pulse.spawns(),
-        entry.pulse.completed(),
-        entry.exited.load(std::sync::atomic::Ordering::Acquire)
-      )
-    },
-  )
+  slates_rt::registry::with_entry(shard, |entry| {
+    format!(
+      "steps {} waits {} spawns {} completed {} exited {}",
+      entry.pulse.steps(),
+      entry.pulse.waits(),
+      entry.pulse.spawns(),
+      entry.pulse.completed(),
+      entry.exited.load(std::sync::atomic::Ordering::Acquire)
+    )
+  })
+  .unwrap_or_else(|| "no entry".to_owned())
 }
 
 /// Shuts the runtime down, or reports the shard's pulse (read twice, [`PULSE_GAP`] apart: steps that

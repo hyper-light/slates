@@ -986,6 +986,28 @@ checked and refuse before mutation.
 > `WorkerFailed`). A runtime dropped without `shutdown` does the same in `Drop`
 > (`docs/bugs/2026-09-30-runtime-start-and-drop-orphaned-workers.md`).
 >
+> **Status (2026-09-30, AUD-29-08).** No safe runtime API lends state that its owner frees.
+> - **A context is lent only for a borrow that proves it alive.** `LocalRuntime::context` and
+>   `SimRuntime::context` lend for the owner's borrow. `registry::with_current` lends inside a closure, and
+>   the thread's current shard is published only for the span of a step, run or park. The guard borrows
+>   the context and restores the enclosing span's shard.
+> - **Kept values are named by handles.** A value a shard keeps (a demultiplexer, the fleet identity, the
+>   resolver, the node name) is named by a `Kept<T>` handle: the context's registration (slot and slot
+>   generation, never repeated in a process) plus the value's index.
+>   - The handle is `Copy` and harmless anywhere: another thread, or after the runtime's end.
+>   - `Kept::with` lends the value inside a closure only while its own context runs on the calling
+>     thread. `Kept::with_in` lends it through a borrow of that context.
+>   - Anything else answers `None`, and a keep inside a live lend is `KeptInUse`.
+> - **Reclamation is private to its owners.** `reclaim_context`, `unregister`, `entry` and
+>   `lend_pair_ring` are crate-private. A holder outside the runtime retires its slot only by dropping the
+>   `Registration` it was given, which proves no context was built over it.
+> - **Transport and fleet follow the same rule.** The transport's `DemuxId` is the demultiplexer's handle,
+>   and its thread-local table of `&'static` demultiplexers is gone. The fleet's dial inputs are a `Copy`
+>   value of handles.
+> - **Tests.** Compile-fail doctests prove that each lend cannot escape. `crates/rt/tests/ownership.rs`,
+>   on the simulated driver, so Miri runs it, holds handles past the owner's drop, across runtimes and
+>   across threads (`docs/bugs/2026-09-30-runtime-lent-static-references-to-state-it-frees.md`).
+>
 > **Status (2026-09-30, AUD-29-09).** A shared memory object hands out no reference into its mapping. Its
 > layout — declared when it is created or opened, validated then — types every byte: **words**, reached
 > only as atomics of their declared width; **racy bytes** (a seqlock's payload), copied only through

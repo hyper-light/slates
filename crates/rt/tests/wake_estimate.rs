@@ -77,19 +77,21 @@ impl Future for PendOnce {
 }
 
 /// Steps the shard until it has nothing to do.
-fn step_until_idle(ctx: &'static slates_rt::shard::ShardContext) {
+fn step_until_idle(ctx: &slates_rt::shard::ShardContext) {
   while ctx.step().did_work {}
 }
 
 /// Parks the shard and wakes it from another thread a millisecond after it announced the park: a real
 /// kick of a sleeping shard, the event the online estimate learns from.
-fn park_and_kick(ctx: &'static slates_rt::shard::ShardContext, wakers: &Receiver<Waker>) {
+fn park_and_kick(ctx: &slates_rt::shard::ShardContext, wakers: &Receiver<Waker>) {
   let waker = wakers.try_recv().expect("the task handed over its waker");
-  let entry = registry::entry(ctx.id).expect("a local shard is registered");
+  let shard = ctx.id;
   std::thread::scope(|scope| {
     scope.spawn(move || {
       let began = Instant::now();
-      while !entry.parking.parked() {
+      while !registry::with_entry(shard, |entry| entry.parking.parked())
+        .expect("a local shard is registered")
+      {
         assert!(
           began.elapsed() < PARK_WAIT,
           "the shard never announced its park"
@@ -152,8 +154,8 @@ fn a_tracking_shard_learns_its_wake_from_the_parks_its_kicks_ended() {
     "the estimate moved off its one-second prior toward the measured wakes: {counters:?}"
   );
   assert_eq!(ctx.quantum_ns(), counters.wake_cost_ns);
-  let pulse = &registry::entry(ctx.id).unwrap().pulse;
-  assert_eq!(pulse.wake_cost_ns(), counters.wake_cost_ns);
+  let mirrored = registry::with_entry(ctx.id, |entry| entry.pulse.wake_cost_ns()).unwrap();
+  assert_eq!(mirrored, counters.wake_cost_ns);
 
   let fixed = LocalRuntime::new(&config(QUANTUM_NS, None)).unwrap();
   let fixed_ctx = fixed.context();

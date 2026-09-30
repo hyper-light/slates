@@ -178,12 +178,12 @@ impl std::fmt::Debug for ShardSeed {
 
 impl ShardSeed {
   /// Registers a shard over `driver` in the process registry and returns its seed.
-  pub fn register(
+  pub(crate) fn register(
     config: &RuntimeConfig,
     driver: DriverSeed,
     kick: registry::RegisterKick,
   ) -> Result<ShardSeed, RtError> {
-    let (id, control) = registry::register(config.ring_entries, config.tasks_per_shard, kick)?;
+    let (id, control) = registry::register_slot(config.ring_entries, config.tasks_per_shard, kick)?;
     let kick = registry::with_entry(id, |entry| entry.kick).unwrap_or(Kick::None);
     Ok(ShardSeed {
       id,
@@ -287,26 +287,99 @@ pub struct ShardContext {
   /// ([`crate::attribution::Tracker`]). Unused on a simulated shard, whose polls are the task's alone.
   attribution: Cell<Tracker>,
   entry: Option<&'static Entry>,
+  /// Which registration this context is (its slot and the slot's generation, never repeated in the
+  /// process — AUD-29-11): a [`Kept`] handle names it, so a handle of an ended context is refused, never
+  /// resolved against a later one on the same slot or thread.
+  incarnation: Option<registry::SlotHolder>,
   inner: RefCell<ShardInner>,
-  /// Declared after `inner`, so it drops after the tasks: a task may hold a kept value.
-  kept: Kept,
+  /// Declared after `inner`, so it drops after the tasks: a task may hold a kept value's handle (a task
+  /// cancelled while the shard runs still reaches the value through it; at teardown no shard runs, and the
+  /// handle answers `None`).
+  kept: KeptValues,
 }
 
 /// Values a shard owns for its life and drops with its context, after its tasks (§4.3: a per-shard
-/// singleton — a socket's demultiplexer, a fleet identity — is `&'static` to the shard's tasks, and
-/// this is what makes that `'static` a promise the context's end keeps rather than a leak, as
-/// `Box::leak` was before 2026-09-14). Shape: filled at boot only (one entry per socket or identity a
-/// shard serves), never per operation, so it needs no bound of its own; dropped last-in-first-out so
-/// a value kept later (a demultiplexer over an identity) goes before what it borrows.
+/// singleton — a socket's demultiplexer, a fleet identity — shared by the shard's tasks). Each is named by a
+/// [`Kept`] handle, never lent as a reference that could outlive the context (AUD-29-08). Shape: filled at
+/// boot only (one entry per socket or identity a shard serves), never per operation, so it needs no bound
+/// of its own; dropped last-in-first-out so a value kept later (a demultiplexer naming an identity) goes
+/// before what it names.
 #[derive(Default)]
-struct Kept(RefCell<Vec<Box<dyn std::any::Any>>>);
+struct KeptValues(RefCell<Vec<Box<dyn std::any::Any>>>);
 
-impl Drop for Kept {
+impl Drop for KeptValues {
   fn drop(&mut self) {
     let mut values = self.0.borrow_mut();
     while let Some(value) = values.pop() {
       drop(value);
     }
+  }
+}
+
+/// A value a shard keeps for its life ([`ShardContext::keep`]), named by its context's registration and
+/// its place among the kept values — a generational handle whose every use validates it (AUD-29-08). It is
+/// `Copy` and `'static`, so tasks share it freely, and it can be held anywhere (another thread, past the
+/// runtime's end) without harm: the value is reached only inside [`Kept::with`] or [`Kept::with_in`],
+/// which lend `&T` for a closure's span and only while a borrow of the owning context proves it alive, and
+/// answer `None` for a context that ended or is not the one running here. Until 2026-09-30 `keep` returned
+/// a `&'static T` that safe code could keep past the context's free — sent to another thread, or held on
+/// this one after the runtime dropped — and read freed memory.
+///
+/// The lend cannot leave its closure (AUD-29-08's compile-time acceptance):
+///
+/// ```compile_fail,E0521
+/// fn escape(kept: slates_rt::shard::Kept<String>) -> Option<&'static String> {
+///   kept.with(|value| value)
+/// }
+/// ```
+pub struct Kept<T: 'static> {
+  context: registry::SlotHolder,
+  index: usize,
+  value: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for Kept<T> {
+  fn clone(&self) -> Self {
+    *self
+  }
+}
+
+impl<T> Copy for Kept<T> {}
+
+impl<T> PartialEq for Kept<T> {
+  fn eq(&self, other: &Self) -> bool {
+    self.context == other.context && self.index == other.index
+  }
+}
+
+impl<T> Eq for Kept<T> {}
+
+impl<T> std::fmt::Debug for Kept<T> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Kept")
+      .field("shard", &self.context.shard())
+      .field("index", &self.index)
+      .finish()
+  }
+}
+
+impl<T: 'static> Kept<T> {
+  /// Runs `f` on the value, on the shard running on this thread: `None` when no shard runs here, when the
+  /// one running is not the value's (another shard's, or a later context on the same slot), or when its
+  /// kept values are being changed. The reference cannot leave `f`.
+  pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> Option<R> {
+    registry::with_current(|context| self.with_in(context, f)).flatten()
+  }
+
+  /// Runs `f` on the value through a borrow of its context (a test or an owner between steps, holding
+  /// `LocalRuntime::context`): `None` when `context` is not the value's.
+  pub fn with_in<R>(self, context: &ShardContext, f: impl FnOnce(&T) -> R) -> Option<R> {
+    if context.incarnation != Some(self.context) {
+      return None;
+    }
+    let values = context.kept.0.try_borrow().ok()?;
+    let value = values.get(self.index)?.downcast_ref::<T>()?;
+    Some(f(value))
   }
 }
 
@@ -320,13 +393,14 @@ impl std::fmt::Debug for ShardContext {
 
 impl ShardContext {
   /// Builds the context from its seed on the calling thread (which builds the driver too). The
-  /// context is handed out as `&'static` — every task, waker-side path and the thread's current-context
-  /// cell name it that way — but it is not leaked: its slot keeps the box's raw pointer and the same
-  /// thread frees it once its loop has returned (`registry::reclaim_context`; the multi-thread
-  /// worker after `run`, `LocalRuntime` and `SimRuntime` in `Drop`). No other thread ever
-  /// dereferences a context (a wake routes by id through the registry entry), so the `'static` is a
-  /// promise the loop's exit keeps, not a leak. Before 2026-09-14 the box was leaked outright.
-  pub fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
+  /// `&'static` returned is the owner's alone — the multi-thread worker's frame, `LocalRuntime` and
+  /// `SimRuntime` keep it private — and it is not leaked: its slot keeps the box's raw pointer and the
+  /// same thread frees it once its loop has returned (`registry::reclaim_context`; the worker after
+  /// `run`, `LocalRuntime` and `SimRuntime` in `Drop`). Everything outside the owner reaches the context
+  /// through a borrow of the owner or of a step's span (`registry::with_current`), never the `'static`
+  /// (AUD-29-08). No other thread ever dereferences a context (a wake routes by id through the registry
+  /// entry). Before 2026-09-14 the box was leaked outright.
+  pub(crate) fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
     let config = seed.config;
     let driver = (seed.driver)(seed.kick)?;
     // The arena's generations continue from where the slot's previous holder left them, so a wake
@@ -378,6 +452,7 @@ impl ShardContext {
       real_time: driver.kind() != DriverKind::Simulation,
       attribution: Cell::new(Tracker::default()),
       entry: registry::entry(seed.id),
+      incarnation: registry::entry(seed.id).map(Entry::holder),
       inner: RefCell::new(ShardInner {
         arena,
         timers,
@@ -390,7 +465,7 @@ impl ShardContext {
         shutting_down: false,
         pollers: Vec::new(),
       }),
-      kept: Kept::default(),
+      kept: KeptValues::default(),
     }));
     let id = seed.id;
     registry::attach_context(id, context);
@@ -403,21 +478,38 @@ impl ShardContext {
     Ok(unsafe { &*context })
   }
 
-  /// Gives the shard `value` to own for its life and hands back a `'static` reference to it: the
-  /// form a per-shard singleton takes (a socket's demultiplexer, the fleet identity its sessions
-  /// present) so every task of the shard can borrow it plainly. Dropped with the context — on the
-  /// owning thread after its loop returned and every task is gone — last kept first. Call it at
-  /// boot, once per singleton (see [`Kept`]); it is not for per-operation values.
-  pub fn keep<T: 'static>(&self, value: T) -> &'static T {
-    let boxed: Box<T> = Box::new(value);
-    let reference: &T = &boxed;
-    // SAFETY: extends the borrow to `'static`. The value lives in a heap box whose allocation never
-    // moves (only the `Box` handle does, into `kept`) and is dropped only with this context —
-    // `registry::reclaim_context`, on the owning thread after its loop returned and its task arena
-    // emptied — so no task, the only holder of such a reference, outlives it.
-    let reference: &'static T = unsafe { &*std::ptr::from_ref(reference) };
-    self.kept.0.borrow_mut().push(boxed);
-    reference
+  /// Gives the shard `value` to own for its life and hands back its [`Kept`] handle: the form a per-shard
+  /// singleton takes (a socket's demultiplexer, the fleet identity its sessions present), shared by every
+  /// task of the shard. Dropped with the context — on the owning thread after its loop returned and every
+  /// task is gone — last kept first. Call it at boot, once per singleton; it is not for per-operation
+  /// values. Refused (`KeptInUse`) inside a [`Kept::with`] on this shard, and (`NotOnShardThread`) for a
+  /// context with no registration to name.
+  pub fn keep<T: 'static>(&self, value: T) -> Result<Kept<T>, RtError> {
+    self.keep_with(|_| value)
+  }
+
+  /// [`keep`](Self::keep) for a value that names itself (a demultiplexer whose sessions route back to it):
+  /// `build` receives the handle the value will have. Refused (`KeptInUse`) if `build` kept another value
+  /// meanwhile, the built value then dropped.
+  pub fn keep_with<T: 'static>(
+    &self,
+    build: impl FnOnce(Kept<T>) -> T,
+  ) -> Result<Kept<T>, RtError> {
+    let context = self.incarnation.ok_or(RtError::NotOnShardThread)?;
+    let in_use = RtError::KeptInUse { shard: self.id };
+    let index = self.kept.0.try_borrow().map_err(|_| in_use.clone())?.len();
+    let kept = Kept {
+      context,
+      index,
+      value: std::marker::PhantomData,
+    };
+    let value = build(kept);
+    let mut values = self.kept.0.try_borrow_mut().map_err(|_| in_use.clone())?;
+    if values.len() != index {
+      return Err(in_use);
+    }
+    values.push(Box::new(value));
+    Ok(kept)
   }
 
   /// Runs `f` with the mutable state, or refuses a nested borrow (counted).
@@ -760,8 +852,8 @@ impl ShardContext {
   /// driver before it parks: a wake that lands during the spin costs a cache-line transfer instead of
   /// a kernel wake. Outside every window it parks at once, so an idle daemon's own timers never keep it
   /// spinning (docs/bugs/2026-09-29-an-idle-shard-spun-for-good-once-a-client-had-connected.md).
-  pub fn run(&'static self) {
-    registry::set_current(Some(self));
+  pub fn run(&self) {
+    let entered = registry::enter(self);
     // Driver I/O completions are harvested only when the shard waits ([`park`]). Under continuous task
     // readiness the loop below never reaches `park` — a shard whose client never lets `serve_round` go
     // idle re-queues its serve task every step — so without this an I/O-bound task (a fleet node's
@@ -795,7 +887,7 @@ impl ShardContext {
       self.park(outcome.next_deadline_ns);
       last_wait_ns = self.now_ns();
     }
-    registry::set_current(None);
+    drop(entered);
     self.exited.set(true);
   }
 
@@ -885,8 +977,8 @@ impl ShardContext {
   /// Steps until no task, timer or message is pending, parking for timers as needed; returns
   /// when the shard is idle or has exited. The driver is polled only when it may hold something
   /// (a zero-timeout poll costs a syscall the idle path must not pay for nothing).
-  pub fn run_until_idle(&'static self) {
-    registry::set_current(Some(self));
+  pub fn run_until_idle(&self) {
+    let _entered = registry::enter(self);
     loop {
       let outcome = self.step();
       if outcome.exit {
@@ -912,11 +1004,10 @@ impl ShardContext {
         }
       }
     }
-    registry::set_current(None);
   }
 
   /// One loop iteration without blocking.
-  pub fn step(&'static self) -> StepOutcome {
+  pub fn step(&self) -> StepOutcome {
     if self.exited.get() {
       return StepOutcome {
         did_work: false,
@@ -924,7 +1015,7 @@ impl ShardContext {
         exit: true,
       };
     }
-    registry::set_current(Some(self));
+    let _entered = registry::enter(self);
     // While a long poll has gone unattributed, each step opens a window at its start, so the next long
     // poll is judged by the step's own CPU alone; an unarmed shard reads neither clock.
     if self.real_time {
@@ -989,7 +1080,8 @@ impl ShardContext {
   /// comes first and the inbox re-check second, so a message that landed between the loop's last
   /// look and here is seen now, and one that lands after sees the announcement and kicks (the
   /// protocol and its loom model: [`crate::parking`]).
-  pub fn park(&'static self, deadline_ns: Option<u64>) {
+  pub fn park(&self, deadline_ns: Option<u64>) {
+    let _entered = registry::enter(self);
     // What this wait is for; the next step measures how late it runs against it (`scheduler_overrun_ns`).
     self.waited_for_ns.set(deadline_ns);
     self.update_attribution(Tracker::wait_began);
@@ -1128,7 +1220,7 @@ impl ShardContext {
 
   /// The driver's blocking wait until a kick, a completion or `deadline_ns`, its completions
   /// queued; true when the driver was lost.
-  fn wait_in_driver(&'static self, deadline_ns: Option<u64>) -> bool {
+  fn wait_in_driver(&self, deadline_ns: Option<u64>) -> bool {
     self
       .with_inner(|inner| {
         inner.counters.waits += 1;
@@ -1159,7 +1251,7 @@ impl ShardContext {
   }
 
   /// Cancels every task with a terminal completion and exits: the driver is gone.
-  fn fail_all(&'static self) {
+  fn fail_all(&self) {
     self.with_inner(|inner| {
       inner.shutting_down = true;
       cancel_all(&mut inner.arena, &self.local);

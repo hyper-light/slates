@@ -396,8 +396,9 @@ pub struct ShardState {
   pub(crate) discovery: Option<crate::discovery::Discovery>,
   /// Authenticated candidate addresses included in the anchor publication.
   pub(crate) enrolled: Vec<crate::discovery::Announcement>,
-  /// The two shard-owned fleet socket demultiplexers.
-  pub demuxes: Vec<&'static slates_transport::demux::Demux>,
+  /// The two shard-owned fleet socket demultiplexers, by their handles (reached only while this shard runs:
+  /// AUD-29-08).
+  pub demuxes: Vec<slates_transport::demux::DemuxId>,
   /// The register records this node holds as a **candidate holder** for other owners' objects (§4.8
   /// "records are sent to all candidates; committed at `f + 1`"): one durable [`Acceptor`] per object
   /// this node backs, keyed by the object. A peer's record commit — served on the per-peer record socket

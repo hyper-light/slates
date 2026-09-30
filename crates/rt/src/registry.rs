@@ -268,13 +268,54 @@ static CONTEXTS_RECLAIMED: AtomicU64 = AtomicU64::new(0);
 static SLOTS: [Slot; MAX_SHARDS] = [const { Slot::new() }; MAX_SHARDS];
 
 thread_local! {
-  static CURRENT: Cell<Option<&'static ShardContext>> = const { Cell::new(None) };
+  /// The context of the shard running on this thread, or null: set only for the span of an [`Entered`]
+  /// guard, which borrows that context for its life (AUD-29-08).
+  static CURRENT: Cell<*const ShardContext> = const { Cell::new(std::ptr::null()) };
+}
+
+/// A registration held by code outside the runtime (a registry test racing claims and retirements): the
+/// proof that its holder owns the slot and built no context over it, since a context is built only from a
+/// runtime's own seed. Dropping it retires the slot ([`unregister`]). Until 2026-09-30 `unregister` was a
+/// public safe function taking any shard id, so safe code could retire a running shard's slot and free the
+/// entry its context holds (AUD-29-08).
+#[derive(Debug)]
+pub struct Registration {
+  shard: u16,
+}
+
+impl Registration {
+  /// The registered shard id.
+  pub fn shard(&self) -> u16 {
+    self.shard
+  }
+}
+
+impl Drop for Registration {
+  fn drop(&mut self) {
+    unregister(self.shard);
+  }
+}
+
+/// Claims a slot as [`register_slot`] does, for a holder outside the runtime: the slot is retired when the
+/// returned [`Registration`] drops. Retiring a slot by its number — a running shard's included — is not
+/// reachable from outside the runtime:
+///
+/// ```compile_fail,E0603
+/// slates_rt::registry::unregister(0);
+/// ```
+pub fn register(
+  ring_entries: usize,
+  control_bound: usize,
+  kick: RegisterKick,
+) -> Result<(Registration, Receiver<Control>), RtError> {
+  let (shard, control) = register_slot(ring_entries, control_bound, kick)?;
+  Ok((Registration { shard }, control))
 }
 
 /// Registers a new shard with a wake ring of `ring_entries` words, a control channel bounded at
 /// `control_bound`, and its kick; returns the id and the control channel's receiving end. Takes the
 /// lowest free slot; refuses `TooManyShards` when every slot holds a live shard.
-pub fn register(
+pub(crate) fn register_slot(
   ring_entries: usize,
   control_bound: usize,
   kick: RegisterKick,
@@ -403,7 +444,7 @@ pub(crate) fn attach_context(shard: u16, context: *mut ShardContext) {
 /// untouched here (retirement waits for foreign readers in [`unregister`]). Idempotent: a slot with no attached context is a no-op. Before
 /// 2026-09-14 every build leaked its context for the process lifetime — a task arena, run queue and
 /// timer wheel each sized to the shard's task budget, per shard, per runtime start.
-pub fn reclaim_context(shard: u16) {
+pub(crate) fn reclaim_context(shard: u16) {
   let Some(slot) = SLOTS.get(usize::from(shard)) else {
     return;
   };
@@ -418,12 +459,9 @@ pub fn reclaim_context(shard: u16) {
   // `LocalRuntime`, a simulation — could be dropped with the cell still naming the context freed
   // here, and the thread's next wake would dereference freed memory. Cleared here, once, for every
   // owner: the cell is this thread's, and the context is this thread's to free.
-  CURRENT.with(|current| {
-    if current
-      .get()
-      .is_some_and(|ctx| std::ptr::eq(ctx, context.cast_const()))
-    {
-      current.set(None);
+  let _ = CURRENT.try_with(|current| {
+    if std::ptr::eq(current.get(), context.cast_const()) {
+      current.set(std::ptr::null());
     }
   });
   // SAFETY: `context` is the pointer `Box::into_raw` produced in `ShardContext::build`, stored by
@@ -443,7 +481,7 @@ pub fn contexts_reclaimed() -> u64 {
 /// Retires a shard after all of its runtime's contexts have ended. Remove the entry from
 /// lookup, wait for foreign borrowers, then drop its resources and publish the free generation.
 /// A new registration cannot claim the slot before retirement has finished (§4.3).
-pub fn unregister(shard: u16) {
+pub(crate) fn unregister(shard: u16) {
   let Some(slot) = SLOTS.get(usize::from(shard)) else {
     return;
   };
@@ -526,7 +564,7 @@ pub fn note_exited(shard: u16) {
 /// reference for its life; its slot cannot be re-registered before its thread has ended and joined)
 /// and for a runtime building its shards before any of them runs. A foreign reader uses
 /// [`with_entry`]. `None` for a free slot.
-pub fn entry(shard: u16) -> Option<&'static Entry> {
+pub(crate) fn entry(shard: u16) -> Option<&'static Entry> {
   let slot = SLOTS.get(usize::from(shard))?;
   if slot.generation.load(Ordering::Acquire) & 1 == 1 {
     return None;
@@ -543,7 +581,7 @@ pub fn entry(shard: u16) -> Option<&'static Entry> {
 
 /// Stores a pair ring in `shard`'s entry and lends it for the entry's life (see
 /// `Entry::pair_rings`); `None` for a free slot.
-pub fn lend_pair_ring(
+pub(crate) fn lend_pair_ring(
   shard: u16,
   ring: slates_mem::SpscRing,
 ) -> Option<&'static slates_mem::SpscRing> {
@@ -575,14 +613,52 @@ pub fn stale_wakes(shard: u16) -> u64 {
     .map_or(0, |slot| slot.stale_wakes.load(Ordering::Relaxed))
 }
 
-/// Publishes the running shard's context for the current thread (the shard loop calls this).
-pub(crate) fn set_current(ctx: Option<&'static ShardContext>) {
-  CURRENT.with(|c| c.set(ctx));
+/// The span a shard runs on this thread: from [`enter`] to the guard's drop, [`with_current`] lends its
+/// context, and the drop restores whichever context an enclosing span had entered (a step of one runtime
+/// inside a task of another). The guard borrows the context, so the context outlives every lend.
+pub(crate) struct Entered<'context> {
+  /// The shard an enclosing span had entered, or null: restored at the drop.
+  previous: *const ShardContext,
+  context: std::marker::PhantomData<&'context ShardContext>,
 }
 
-/// Runs `f` with the current shard's context, if this thread runs a shard.
+impl Drop for Entered<'_> {
+  fn drop(&mut self) {
+    let _ = CURRENT.try_with(|current| current.set(self.previous));
+  }
+}
+
+/// Makes `context` this thread's running shard for the guard's span (the loop's `run`, `run_until_idle`,
+/// `step` and `park`). Before 2026-09-30 a step published a `&'static` context and left it published after
+/// it returned, so a lend could outlive the owner that freed it. The restore costs a bare simulated step 11
+/// instructions (5,630 against 5,619, callgrind, 2026-09-30); skipping the writes when the shard is already
+/// current cost bare steps 13 more (5,643) for a saving on the worker's `run` no row measures — rejected.
+pub(crate) fn enter(context: &ShardContext) -> Entered<'_> {
+  let previous = CURRENT
+    .try_with(|current| current.replace(std::ptr::from_ref(context)))
+    .unwrap_or(std::ptr::null());
+  Entered {
+    previous,
+    context: std::marker::PhantomData,
+  }
+}
+
+/// Runs `f` with this thread's running shard's context, or `None` outside a shard's span. The reference
+/// cannot leave `f`:
+///
+/// ```compile_fail,E0521
+/// fn escape() -> Option<&'static slates_rt::shard::ShardContext> {
+///   slates_rt::registry::with_current(|context| context)
+/// }
+/// ```
 pub fn with_current<R>(f: impl FnOnce(&ShardContext) -> R) -> Option<R> {
-  CURRENT.with(Cell::get).map(f)
+  let current = CURRENT.try_with(Cell::get).ok()?;
+  // SAFETY: the cell is non-null only inside an `Entered` span, and holds the context that span's guard
+  // borrows (or, after an inner span ended, the enclosing span's context, whose guard borrows it for
+  // longer). A borrowed context cannot be freed: its owner (`LocalRuntime`, `SimRuntime`, a worker's own
+  // frame) is borrowed for the guard's life, and `reclaim_context` runs only on an owner that is not.
+  let context = unsafe { current.as_ref() }?;
+  Some(f(context))
 }
 
 /// The current shard's id, if this thread runs one.
@@ -725,6 +801,13 @@ pub struct SlotHolder {
   generation: u32,
 }
 
+impl Entry {
+  /// The registration that owns this entry.
+  pub(crate) fn holder(&self) -> SlotHolder {
+    self.holder
+  }
+}
+
 impl SlotHolder {
   /// The shard id.
   pub fn shard(&self) -> u16 {
@@ -766,7 +849,8 @@ mod tests {
     let form = Kick::Eventfd;
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let form = Kick::Kqueue;
-    let (shard, _control) = register(2, 1, RegisterKick::Descriptor(descriptor, form)).unwrap();
+    let (shard, _control) =
+      register_slot(2, 1, RegisterKick::Descriptor(descriptor, form)).unwrap();
     let kick = with_entry(shard, |entry| entry.kick).unwrap();
     let descriptor = match kick {
       #[cfg(target_os = "linux")]
@@ -808,7 +892,7 @@ mod tests {
       "unregistration closed a borrowed descriptor"
     );
     assert_eq!(descriptor.with(|_| ()), None);
-    let (replacement, _control) = register(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
+    let (replacement, _control) = register_slot(2, 1, RegisterKick::Kick(Kick::None)).unwrap();
     assert_eq!(
       descriptor.with(|_| ()),
       None,
@@ -823,7 +907,7 @@ mod tests {
   /// Non-vacuous: the four fills landed (the ring was full), and the stale count moved by one.
   #[test]
   fn a_wake_to_an_exited_holders_full_ring_is_counted_stale_not_spun_on() {
-    let (id, _receiver) = register(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+    let (id, _receiver) = register_slot(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
     for word in 0..4u64 {
       send_foreign(id, word);
     }
@@ -846,8 +930,8 @@ mod tests {
 
   #[test]
   fn registration_hands_out_distinct_ids_and_entries() {
-    let (a, _ra) = register(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
-    let (b, _rb) = register(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+    let (a, _ra) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
+    let (b, _rb) = register_slot(8, 4, RegisterKick::Kick(Kick::none())).unwrap();
     assert_ne!(a, b);
     assert!(entry(a).is_some());
     assert!(entry(b).is_some());
@@ -858,7 +942,7 @@ mod tests {
 
   #[test]
   fn a_wake_from_a_foreign_thread_lands_in_the_target_ring() {
-    let (id, _receiver) = register(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
+    let (id, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
     let word = Encoded::pack(id, 5, 1).unwrap();
     wake(word);
     let mut consumer = entry(id).unwrap().inbound.consumer();
@@ -869,7 +953,7 @@ mod tests {
 
   #[test]
   fn a_full_foreign_ring_spins_and_counts_without_losing_the_word() {
-    let (id, _receiver) = register(2, 4, RegisterKick::Kick(Kick::none())).unwrap();
+    let (id, _receiver) = register_slot(2, 4, RegisterKick::Kick(Kick::none())).unwrap();
     let entry = entry(id).unwrap();
     send_foreign(id, 1);
     send_foreign(id, 2);
@@ -887,7 +971,7 @@ mod tests {
 
   #[test]
   fn control_is_refused_when_the_channel_is_full_or_the_shard_is_gone() {
-    let (id, receiver) = register(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
+    let (id, receiver) = register_slot(2, 1, RegisterKick::Kick(Kick::none())).unwrap();
     send_control(id, Control::Shutdown).unwrap();
     assert!(matches!(
       send_control(id, Control::Shutdown),
@@ -909,7 +993,7 @@ mod tests {
   /// a later registration holds it — never delivered to the new holder.
   #[test]
   fn a_holder_pinned_send_is_refused_once_the_slot_changes_hands() {
-    let (id, _receiver) = register(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+    let (id, _receiver) = register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
     let holder = holder_of(id).unwrap();
     assert_eq!(holder.shard(), id);
     send_control_to_holder(holder, Control::Shutdown).unwrap();
@@ -919,7 +1003,7 @@ mod tests {
       send_control_to_holder(holder, Control::Shutdown),
       Err(RtError::ShardGone { .. })
     ));
-    let (again, _receiver) = register(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
+    let (again, _receiver) = register_slot(2, 2, RegisterKick::Kick(Kick::none())).unwrap();
     if again == id {
       assert!(matches!(
         send_control_to_holder(holder, Control::Shutdown),

@@ -1080,7 +1080,7 @@ impl SimRuntime {
   }
 
   /// A shard's context, for counters and joins in tests.
-  pub fn context(&self, shard: ShardId) -> Result<&'static ShardContext, RtError> {
+  pub fn context(&self, shard: ShardId) -> Result<&ShardContext, RtError> {
     let index = self.index_of(shard)?;
     self
       .shards

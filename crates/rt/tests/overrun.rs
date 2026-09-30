@@ -203,7 +203,7 @@ fn an_idle_shards_measured_overrun_never_exceeds_the_lateness_it_observed() {
       != u64::MAX),
     "the sleeps finished inside the deadline"
   );
-  let mirrored = registry::entry(shard.0).map(|entry| entry.pulse.scheduler_overrun_ns());
+  let mirrored = registry::with_entry(shard.0, |entry| entry.pulse.scheduler_overrun_ns());
   let counters = rt.shutdown().unwrap();
   let overrun = IDLE_OVERRUN_NS.load(Ordering::Acquire);
   let lateness = SLEEPS_SPAN_NS

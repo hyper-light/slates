@@ -325,16 +325,6 @@ pub(crate) fn refused(call: &'static str, e: rustix::io::Errno) -> RtError {
 mod tests {
   use super::*;
 
-  /// The slot outlives its driver and retires even when an assertion unwinds. Otherwise
-  /// the parallel registry stress test can fill its abandoned ring and wait forever.
-  struct RegisteredDriverSlot(u16);
-
-  impl Drop for RegisteredDriverSlot {
-    fn drop(&mut self) {
-      crate::registry::unregister(self.0);
-    }
-  }
-
   /// AC-0.6: the real driver wakes for a kick, delivers a no-op, and supports a timed wait
   /// despite another kick arriving before its deadline. All registered resources are retired.
   #[test]
@@ -343,9 +333,11 @@ mod tests {
     let prepared = os_driver(64).unwrap();
     let notes = prepared.notes.clone();
     // Exercise the real registration and retirement protocol, including the foreign kick.
-    let (shard, _control) =
+    // The registration outlives its driver and retires even when an assertion unwinds (its drop):
+    // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
+    let (registration, _control) =
       crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
-    let registration = RegisteredDriverSlot(shard);
+    let shard = registration.shard();
     let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     eprintln!("driver {} notes {notes:?}", driver.kind().name());
@@ -405,9 +397,11 @@ mod tests {
   #[cfg_attr(miri, ignore)]
   fn a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps() {
     let prepared = os_driver(64).unwrap();
-    let (shard, _control) =
+    // The registration outlives its driver and retires even when an assertion unwinds (its drop):
+    // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
+    let (registration, _control) =
       crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
-    let registration = RegisteredDriverSlot(shard);
+    let shard = registration.shard();
     let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
     let mut driver = (prepared.seed)(kick).unwrap();
     let (reader, writer) = rustix::pipe::pipe().unwrap();

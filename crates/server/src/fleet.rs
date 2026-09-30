@@ -105,10 +105,11 @@ use slates_db::register::{
   RegisterError, encode_refusal,
 };
 use slates_rt::futures;
+use slates_rt::shard::Kept;
 use slates_rt::udp::UdpSocket;
 use slates_rt::udp::{Ipv4Addr, SocketAddrV4};
 use slates_transport::connection::{ConnectionShape, Priority};
-use slates_transport::demux::Demux;
+use slates_transport::demux::{Demux, DemuxId};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
 use slates_transport::rtt::RttEstimator;
@@ -474,7 +475,7 @@ struct PeerDial {
   name: String,
   address: NodeAddress,
   certificate: CertificateDer<'static>,
-  resolver: Option<&'static Resolver>,
+  resolver: Option<Kept<Resolver>>,
 }
 
 /// A fleet peer as the serve side knows it: the certificate the handshake must present (mutual TLS admits
@@ -1175,16 +1176,27 @@ pub async fn run_membership(transport: FleetTransport) {
   };
   // The identity is shared by every serve session and client dial of this shard — it is not `Clone` (it
   // holds a private key), so the control shard owns the one copy for its life (`ShardContext::keep`) and
-  // each task borrows it as `&'static`; it is dropped with the shard's context, after every task. Before
-  // 2026-09-14 it was leaked once per daemon boot. The resolver every dial task shares is kept the same way.
-  let Some(identity) = slates_rt::registry::with_current(|ctx| {
+  // each task names it by its `Kept` handle, reaching it only inside a closure while this shard runs
+  // (AUD-29-08); it is dropped with the shard's context, after every task. Before 2026-09-14 it was leaked
+  // once per daemon boot, and until 2026-09-30 it was lent as a `&'static` that could outlive the context.
+  // The resolver and the node name every dial task shares are kept the same way.
+  let Some(Ok(identity)) = slates_rt::registry::with_current(|ctx| {
     ctx.keep(identity.with_authorities(enrollment_roots.clone()))
   }) else {
     count_refusal(BIND_REFUSED);
     return;
   };
-  let resolver: Option<&'static Resolver> =
-    resolver.and_then(|resolver| slates_rt::registry::with_current(|ctx| ctx.keep(resolver)));
+  let resolver: Option<Kept<Resolver>> = resolver.and_then(|resolver| {
+    slates_rt::registry::with_current(|ctx| ctx.keep(resolver).ok()).flatten()
+  });
+  let Some(Ok(kept_name)) = slates_rt::registry::with_current(|ctx| ctx.keep(name.clone())) else {
+    count_refusal(BIND_REFUSED);
+    return;
+  };
+  let Some(certificate) = identity.with(Identity::certificate) else {
+    count_refusal(BIND_REFUSED);
+    return;
+  };
   let neighbourhood =
     state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));
@@ -1193,7 +1205,7 @@ pub async fn run_membership(transport: FleetTransport) {
       state,
       name.clone(),
       enrollment_roots.clone(),
-      identity.certificate(),
+      certificate,
       advertise,
       record_port,
       &peers,
@@ -1208,17 +1220,12 @@ pub async fn run_membership(transport: FleetTransport) {
     }
     None => return,
   };
-  let Some(driver) = slates_rt::registry::with_current(|context| {
-    context.keep(PeerDriver {
-      identity,
-      name: name.clone(),
-      resolver,
-      local,
-      neighbourhood,
-    })
-  }) else {
-    count_refusal(LOOP_SPAWN_REFUSED);
-    return;
+  let driver = PeerDriver {
+    identity,
+    name: kept_name,
+    resolver,
+    local,
+    neighbourhood,
   };
   // The boot line of the fleet's derived timing (R3: every derived value logged with its inputs). Nothing is
   // measured yet, so every value is at its floor; each period re-derives it from the measured paths, and
@@ -1303,21 +1310,30 @@ pub async fn run_membership(transport: FleetTransport) {
   spawn_detached(run_record_plane(local), LOOP_SPAWN_REFUSED);
 }
 
-/// Shared immutable dial inputs, owned by the control shard; each candidate owns its two tasks.
+/// Shared immutable dial inputs: handles of what the control shard keeps for its life (its identity, its
+/// name, the resolver) and two plain values, so every task holds its own copy (AUD-29-08). Each candidate
+/// owns its two tasks.
+#[derive(Clone, Copy)]
 struct PeerDriver {
-  identity: &'static Identity,
-  name: String,
-  resolver: Option<&'static Resolver>,
+  identity: Kept<Identity>,
+  name: Kept<String>,
+  resolver: Option<Kept<Resolver>>,
   local: HostId,
   neighbourhood: usize,
 }
 
 impl PeerDriver {
-  fn start(&'static self, peer: FleetPeer) {
+  /// Spawns a candidate's probe and record tasks; a node name no longer reachable (the control shard's
+  /// context ended) spawns neither, counted as a refused spawn.
+  fn start(self, peer: FleetPeer) {
+    let Some(name) = self.name.with(String::clone) else {
+      count_refusal(LOOP_SPAWN_REFUSED);
+      return;
+    };
     let probe = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
-      name: self.name.clone(),
+      name: name.clone(),
       address: peer.address,
       certificate: peer.certificate.clone(),
       resolver: self.resolver,
@@ -1325,7 +1341,7 @@ impl PeerDriver {
     let record = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
-      name: self.name.clone(),
+      name,
       address: peer.record_address,
       certificate: peer.certificate,
       resolver: self.resolver,
@@ -1341,7 +1357,7 @@ impl PeerDriver {
 /// A serve socket's receive loop as a task, for the daemon's life: it routes every datagram to its session.
 /// The socket refusing ends it, counted (`fleet.serve`), so an operator sees a node that stopped accepting
 /// rather than a mesh that silently never re-forms.
-async fn run_demux(demux: &'static Demux) {
+async fn run_demux(demux: DemuxId) {
   if let Err(e) = demux.run().await {
     // Counted for `status`, and said once in the log with its reason: a node that silently stopped
     // accepting sessions on a plane is a mesh that never forms with nothing to read but a count.
@@ -1354,14 +1370,14 @@ async fn run_demux(demux: &'static Demux) {
 /// session, ended by the session's failure or its replacement by the peer's re-dial. Bounded by the
 /// demultiplexer's session slots (`SESSIONS_PER_PEER` per peer): a task ends and releases its slot before
 /// another session for the same peer can be opened past that.
-async fn accept_probes(
-  demux: &'static Demux,
-  local: HostId,
-  neighbourhood: usize,
-  roster: Vec<Rostered>,
-) {
+async fn accept_probes(demux: DemuxId, local: HostId, neighbourhood: usize, roster: Vec<Rostered>) {
   loop {
-    let session = demux.accept().await;
+    // An unreachable demultiplexer (the shard's context ended) ends the loop, counted as a serve socket
+    // that stopped accepting.
+    let Ok(session) = demux.accept().await else {
+      count_refusal(SERVE_REFUSED);
+      return;
+    };
     // A full task arena drops the accepted session here, explicitly — its slot goes back to the
     // demultiplexer and the peer's next re-dial takes a fresh one — and counts it, never lost in
     // silence (banned item 9). The fleet's share of the arena is sized for every session the
@@ -1376,14 +1392,14 @@ async fn accept_probes(
 /// Accepts every record session a peer dials on the record socket and serves it over this node's durable
 /// holds (§4.8): one serve task per session, which resolves the peer it authenticated through `roster`.
 /// Bounded as [`accept_probes`] is.
-async fn accept_records(
-  demux: &'static Demux,
-  local: HostId,
-  roster: Vec<Rostered>,
-  driver: &'static PeerDriver,
-) {
+async fn accept_records(demux: DemuxId, local: HostId, roster: Vec<Rostered>, driver: PeerDriver) {
   loop {
-    let session = demux.accept().await;
+    // An unreachable demultiplexer (the shard's context ended) ends the loop, counted as a serve socket
+    // that stopped accepting.
+    let Ok(session) = demux.accept().await else {
+      count_refusal(SERVE_REFUSED);
+      return;
+    };
     spawn_detached(
       serve_peer_records(session, local, roster.clone(), driver),
       SERVE_SPAWN_REFUSED,
@@ -1403,11 +1419,11 @@ async fn accept_records(
 /// the kernel routes to it (a loopback-bound socket cannot send off the host). `None` if the name did not
 /// resolve or the runtime refuses the socket or endpoint.
 async fn client_for(
-  identity: &Identity,
+  identity: Kept<Identity>,
   name: &str,
   address: (&NodeAddress, crate::deploy::Plane),
   certificate: &CertificateDer<'static>,
-  resolver: Option<&'static Resolver>,
+  resolver: Option<Kept<Resolver>>,
 ) -> Option<Endpoint> {
   let (address, plane) = address;
   let discovered = state::with_state(|state| {
@@ -1425,7 +1441,13 @@ async fn client_for(
         count_refusal(RESOLVE_NO_RESOLVER);
         return None;
       };
-      match dns::lookup(resolver, host).await {
+      // The lookup awaits the nameservers, so it runs over its own copy of the configuration (a few
+      // addresses and two numbers), never over a borrow of the kept one.
+      let Some(resolver) = resolver.with(Resolver::clone) else {
+        count_refusal(KEPT_UNREACHABLE);
+        return None;
+      };
+      match dns::lookup(&resolver, host).await {
         Ok(ip) => SocketAddrV4::new(ip, *port),
         Err(e) => {
           // The first refusal of each kind is logged once, so an operator's first look at the daemon's log
@@ -1439,7 +1461,14 @@ async fn client_for(
     }
   };
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
-  Endpoint::client(socket, peer, identity, certificate, name, fleet_shape()).ok()
+  let shape = fleet_shape();
+  let Some(built) =
+    identity.with(|identity| Endpoint::client(socket, peer, identity, certificate, name, shape))
+  else {
+    count_refusal(KEPT_UNREACHABLE);
+    return None;
+  };
+  built.ok()
 }
 
 /// The connection shape every fleet session is built with: the fleet frame cap, the derived receive
@@ -1470,11 +1499,11 @@ fn resolve_refusal(error: &dns::DnsError) -> &'static str {
 async fn establish_session(
   client: Option<Endpoint>,
   session: Option<Endpoint>,
-  identity: &Identity,
+  identity: Kept<Identity>,
   name: &str,
   address: (&NodeAddress, crate::deploy::Plane),
   certificate: &CertificateDer<'static>,
-  resolver: Option<&'static Resolver>,
+  resolver: Option<Kept<Resolver>>,
 ) -> (Option<Endpoint>, Option<Endpoint>) {
   let (address, plane) = address;
   if session.is_some() {
@@ -2204,12 +2233,7 @@ fn follow_current_id(
 /// takeover). Dropping the session on one miss would retire a live peer on any transient glitch
 /// (`docs/bugs/2026-09-10-swim-stale-ack.md`); a re-dial now replaces a lost session at the peer, but a
 /// probe verdict still rests on the suspicion window, not on one miss.
-async fn probe_peer(
-  identity: &'static Identity,
-  dial: PeerDial,
-  local: HostId,
-  neighbourhood: usize,
-) {
+async fn probe_peer(identity: Kept<Identity>, dial: PeerDial, local: HostId, neighbourhood: usize) {
   let PeerDial {
     anchor,
     host: seed,
@@ -2349,11 +2373,11 @@ fn record_formed_mesh(formed: bool, recorded: &mut bool, peer_host: HostId) {
 /// What an idle probe task reaches out to its peer with ([`reach_out`]): its own identity and the peer's dial,
 /// and what the ping carries.
 struct ReachOut<'a> {
-  identity: &'a Identity,
+  identity: Kept<Identity>,
   name: &'a str,
   address: &'a NodeAddress,
   certificate: &'a CertificateDer<'static>,
-  resolver: Option<&'static Resolver>,
+  resolver: Option<Kept<Resolver>>,
   local: HostId,
   local_boot_nonce: u64,
   peer: &'a ProbedPeer,
@@ -2525,7 +2549,7 @@ async fn serve_peer_records(
   mut endpoint: Endpoint,
   local: HostId,
   roster: Vec<Rostered>,
-  driver: &'static PeerDriver,
+  driver: PeerDriver,
 ) {
   if let Err(e) = endpoint.establish().await {
     count_accept_failure(&e, "record");
@@ -3884,6 +3908,10 @@ const ELECTION_SESSION_AWAITED: &str = "fleet.election.session_awaited";
 const ELECTION_LATE_PRE_VOTE_GRANT: &str = "fleet.election.late_pre_vote_grant";
 const RESOLVE_REFUSED: &str = "fleet.resolve";
 const RESOLVE_NO_RESOLVER: &str = "fleet.resolve.no-resolver";
+/// A value the control shard keeps for its life (its identity, its name, the resolver) named by a task that
+/// could not reach it — run off that shard, or after its context ended (AUD-29-08): a tripwire, never an
+/// expected count, since every dial task runs on the control shard within its life.
+const KEPT_UNREACHABLE: &str = "fleet.kept.unreachable";
 const RESOLVE_TIMEOUT: &str = "fleet.resolve.timeout";
 const RESOLVE_NXDOMAIN: &str = "fleet.resolve.refused";
 const RESOLVE_NO_ADDRESS: &str = "fleet.resolve.no-address";
@@ -4059,7 +4087,7 @@ fn is_unlearned_seed(state: &ShardState, peer: HostId) -> bool {
 /// behind one slow link. Idles when the peer is retired from every set this node reaches it for — its
 /// neighbourhood and its consensus groups — dropping its session (a retired peer is never a candidate or a
 /// voter again under this configuration), so it is not an unbounded retry of a dead peer (banned item 8).
-async fn establish_record_link(driver: &'static PeerDriver, dial: PeerDial) {
+async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
   let identity = driver.identity;
   let mut discovery_cursor = crate::discovery::Cursor::default();
   let PeerDial {
@@ -4169,7 +4197,7 @@ async fn enroll_record_session(
   peer_host: HostId,
   anchor: HostId,
   cursor: &mut crate::discovery::Cursor,
-  driver: &'static PeerDriver,
+  driver: PeerDriver,
 ) {
   let Some(mut session) = session else {
     return;
@@ -4193,7 +4221,7 @@ async fn refresh_discovery(
   peer_host: HostId,
   anchor: HostId,
   cursor: &mut crate::discovery::Cursor,
-  driver: &'static PeerDriver,
+  driver: PeerDriver,
 ) {
   let session = state::with_state(|state| {
     state
@@ -4308,7 +4336,7 @@ async fn exchange_discovery(
   anchor: HostId,
   expected: HostId,
   cursor: &mut crate::discovery::Cursor,
-  driver: &'static PeerDriver,
+  driver: PeerDriver,
 ) -> DiscoveryOutcome {
   let Some(request) = state::with_state(|state| cursor.request(state)).flatten() else {
     return DiscoveryOutcome::Refused;

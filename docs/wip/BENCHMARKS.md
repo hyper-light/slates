@@ -106,6 +106,24 @@ which ranged 212–441 ns for the unchanged binary); parked round trip 1,043 ns 
 power-of-two fast path for strided-run arithmetic was also tried and measured no better; it is kept
 only because it is exact and cheaper in instructions.
 
+**Owner-bound runtime lends (2026-09-30, AUD-29-08).** Instruction counts under callgrind in a Linux
+container (`cargo bench -p slates-rt --bench callgrind --features slates-rt/instruction-counts`), the
+commit before and after, each tree in its own target directory:
+
+| Row | Before | After |
+|---|---|---|
+| `step_idle` (bare simulated steps to idle) | 5,619 | 5,630 |
+| `spawn_and_run` | 7,273 | 7,287 |
+| `local_wake` | 7,922 | 7,939 |
+| `kept_lookup` (new: one validated lookup of a kept value) | — | 80 |
+
+The step rows pay the restore of the thread's current shard at each step's end (the old step left it
+published, which was the unsoundness). Skipping the writes when the shard is already current was tried and
+**rejected**: it cost bare steps 13 more instructions (`step_idle` 5,643) for a saving on the worker's `run`
+that no row measures. `kept_lookup` is what a demultiplexer pays per routed datagram to reach itself; it
+replaced a thread-local table lookup of a `&'static` of about the same shape (TLS, `RefCell` borrow, index)
+and adds the registration and type checks.
+
 What it means: a slab operation costs a tenth of a syscall and a buddy operation a third; the
 ring round trip is about two and a half core-to-core cache-line transfers on this machine
 (the profile's ring matrix measured 132–190 ns per pair), which is the cost floor for a

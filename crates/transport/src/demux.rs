@@ -18,8 +18,8 @@
 //! construction.
 //!
 //! **Ownership and bounds (D-8, banned item 8).** The demultiplexer is owned by the shard that starts it,
-//! for that shard's life (`ShardContext::keep`: one per socket per boot, handed to the shard's tasks as
-//! `&'static` and dropped with the shard's context after them, its socket closed and its port free
+//! for that shard's life (`ShardContext::keep_with`: one per socket per boot, named by its [`DemuxId`]
+//! handle and dropped with the shard's context after its tasks, its socket closed and its port free
 //! again) — and its state is a `RefCell` on the one shard thread that runs it (no lock, no `Arc`). Sessions live in a slab of at most `max_sessions` slots
 //! (three per unit of peer capacity: one pending handshake, a live authenticated session and its
 //! replacement). Pending work cannot consume the authenticated reservation. Authentication checks the
@@ -33,17 +33,22 @@
 //! the sessions drain their inboxes between arrivals instead of after a whole burst. An [`Endpoint`]
 //! built on a shared link releases its slot when dropped.
 //!
-//! An endpoint on a shared link names its demultiplexer by a [`DemuxId`] looked up in this shard's
-//! thread-local table, never by reference: the demultiplexer's state is this thread's alone (a
-//! `RefCell`), so a reference to it could not cross threads, while the endpoint stays `Send` as every
-//! other endpoint is. Used from another thread, a shared-link endpoint finds no demultiplexer and is
-//! refused typed (`Closed`) — never a data race.
+//! Everything outside the demultiplexer — an endpoint on a shared link, the task running its receive loop,
+//! the fleet's accept loops — names it by its [`DemuxId`], never by reference: the id is the shard's
+//! [`Kept`] handle, reached only inside a closure while the owning shard runs on the calling thread
+//! (AUD-29-08). The demultiplexer's state is this thread's alone (a `RefCell`), so a reference to it could
+//! not cross threads, while the endpoint stays `Send` as every other endpoint is. Used from another
+//! thread, or after the shard's context ended, a handle finds no demultiplexer and is refused typed
+//! (`Closed`) — never a data race and never freed memory. Until 2026-09-30 the demultiplexer was lent as a
+//! `&'static` and listed in a thread-local table of such references, which safe code could keep past the
+//! context that freed it.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::task::{Context, Poll, Waker};
 
 use rustls::pki_types::CertificateDer;
+use slates_rt::shard::{Kept, ShardContext};
 use slates_rt::udp::{SocketAddrV4, UdpSocket};
 
 use crate::connection::ConnectionShape;
@@ -69,46 +74,55 @@ pub enum SessionRefusal {
   PeerSessions,
 }
 
-/// A demultiplexer's id in this shard's table (see the module doc).
+/// A demultiplexer's handle: the shard's [`Kept`] handle of it (see the module doc).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DemuxId(u32);
+pub struct DemuxId(Kept<Demux>);
 
-thread_local! {
-  /// The demultiplexers this shard runs, by id: one entry per socket started on this thread, cleared
-  /// by the demultiplexer's own drop (it is owned by its shard's context and dropped with it), so a
-  /// later demultiplexer on the same thread — the next simulation's, the next local runtime's — is
-  /// never confused with a dropped one. Bounded by the sockets a node serves on.
-  static DEMUXES: RefCell<Vec<Option<&'static Demux>>> = const { RefCell::new(Vec::new()) };
+/// Runs `f` on the demultiplexer `id` names, or `None` when its shard does not run on this thread (another
+/// thread, or its context ended).
+pub(crate) fn with_demux<R>(id: DemuxId, f: impl FnOnce(&Demux) -> R) -> Option<R> {
+  id.0.with(f)
 }
 
-/// Runs `f` on the demultiplexer `id` names on this shard, or `None` if this thread runs no such
-/// demultiplexer (or the thread is ending and its table is already gone).
-pub(crate) fn with_demux<R>(id: DemuxId, f: impl FnOnce(&'static Demux) -> R) -> Option<R> {
-  let demux = DEMUXES
-    .try_with(|table| {
-      table
-        .borrow()
-        .get(usize::try_from(id.0).unwrap_or(usize::MAX))
-        .copied()
-        .flatten()
-    })
-    .ok()
-    .flatten()?;
-  Some(f(demux))
-}
+impl DemuxId {
+  /// Runs `f` on the demultiplexer, on its shard's thread while the shard runs (a task): `None` otherwise.
+  pub fn with<R>(self, f: impl FnOnce(&Demux) -> R) -> Option<R> {
+    self.0.with(f)
+  }
 
-impl Drop for Demux {
-  /// Forgets this demultiplexer's id on its thread: an endpoint that names it after this finds
-  /// nothing (`Closed`), never a dropped table entry. The socket closes with the value.
-  fn drop(&mut self) {
-    let _ = DEMUXES.try_with(|table| {
-      if let Some(slot) = table
-        .borrow_mut()
-        .get_mut(usize::try_from(self.id.0).unwrap_or(usize::MAX))
-      {
-        *slot = None;
+  /// Runs `f` on the demultiplexer through a borrow of its shard's context (an owner between steps — a
+  /// test holding `LocalRuntime::context`): `None` when `context` is not its shard's.
+  pub fn with_in<R>(self, context: &ShardContext, f: impl FnOnce(&Demux) -> R) -> Option<R> {
+    self.0.with_in(context, f)
+  }
+
+  /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket refuses
+  /// (or the demultiplexer is unreachable, `Closed`); the caller owns the task (spawns it on this shard and
+  /// cancels it at shutdown).
+  pub async fn run(self) -> Result<(), EndpointError> {
+    loop {
+      // Routed straight out of the shard's receive buffer (`crate::receive`), lent only for the read; an
+      // empty socket hands back its readiness future, awaited outside the handle's borrow.
+      let empty = with_demux(self, |demux| -> Result<_, EndpointError> {
+        let routed = crate::receive::with_datagram(&demux.socket, |datagram, from| {
+          demux.route(datagram, from)
+        })?;
+        Ok(routed.is_none().then(|| demux.socket.readable()))
+      })
+      .ok_or(EndpointError::Closed)??;
+      match empty {
+        Some(readable) => readable.await?,
+        // Yield between datagrams: a burst queued in the kernel would otherwise be routed whole before any
+        // session task ran, filling an inbox the session had no chance to drain.
+        None => slates_rt::futures::yield_now().await,
       }
-    });
+    }
+  }
+
+  /// A future that yields the next server session a new source opened — un-established: the caller
+  /// drives [`Endpoint::establish`] as for any endpoint. `Closed` once the demultiplexer is unreachable.
+  pub fn accept(self) -> Accept {
+    Accept { demux: self }
   }
 }
 
@@ -199,7 +213,7 @@ struct Inner {
 pub struct Demux {
   id: DemuxId,
   socket: UdpSocket,
-  identity: &'static Identity,
+  identity: Kept<Identity>,
   allowed: Vec<CertificateDer<'static>>,
   /// The connection shape every session on this socket is built with.
   shape: ConnectionShape,
@@ -216,18 +230,18 @@ pub struct Demux {
 impl Demux {
   /// Takes ownership of `socket` and serves up to `peer_capacity` identities on it, presenting `identity` and
   /// requiring each dialer's certificate among `allowed` (mutual TLS — the same trust a single-peer
-  /// server enforces). Owned by the calling shard for its life (`ShardContext::keep`) and handed out
-  /// as `&'static` to that shard's tasks; dropped — the socket closed, its port free again — when the
-  /// shard's context is, after its tasks. Before 2026-09-14 it was leaked, so a stopped in-process
-  /// daemon never freed its serve ports. Refused when the caller is not on a shard thread. The caller
-  /// spawns [`Demux::run`] on the shard that will drive the sessions, and owns that task.
+  /// server enforces). Owned by the calling shard for its life (`ShardContext::keep_with`) and named by
+  /// the returned [`DemuxId`]; dropped — the socket closed, its port free again — when the shard's context
+  /// is, after its tasks. Before 2026-09-14 it was leaked, so a stopped in-process daemon never freed its
+  /// serve ports. Refused when the caller is not on a shard thread. The caller spawns [`DemuxId::run`] on
+  /// the shard that will drive the sessions, and owns that task.
   pub fn start(
     socket: UdpSocket,
-    identity: &'static Identity,
+    identity: Kept<Identity>,
     allowed: Vec<CertificateDer<'static>>,
     shape: ConnectionShape,
     peer_capacity: usize,
-  ) -> Result<&'static Demux, EndpointError> {
+  ) -> Result<DemuxId, EndpointError> {
     let max_sessions = peer_capacity
       .checked_mul(SESSION_SLOTS_PER_PEER)
       .filter(|slots| *slots != 0 && u32::try_from(*slots).is_ok())
@@ -238,15 +252,14 @@ impl Demux {
       .rev()
       .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
       .collect();
-    let id = DEMUXES.with(|table| DemuxId(u32::try_from(table.borrow().len()).unwrap_or(u32::MAX)));
     // A socket that will not say has the smallest queue a datagram socket can be given: one datagram.
     let inbox_datagrams = socket
       .recv_buffer_bytes()
       .map(|bytes| bytes / MIN_DATAGRAM_BYTES)
       .unwrap_or(1)
       .max(1);
-    let demux = Demux {
-      id,
+    let build = |kept| Demux {
+      id: DemuxId(kept),
       socket,
       identity,
       allowed,
@@ -268,11 +281,12 @@ impl Demux {
         last_setup_refusal: None,
       }),
     };
-    let demux: &'static Demux = slates_rt::registry::with_current(|ctx| ctx.keep(demux)).ok_or(
-      EndpointError::Io(slates_rt::error::RtError::NotOnShardThread),
-    )?;
-    DEMUXES.with(|table| table.borrow_mut().push(Some(demux)));
-    Ok(demux)
+    let kept = slates_rt::registry::with_current(|ctx| ctx.keep_with(build))
+      .ok_or(EndpointError::Io(
+        slates_rt::error::RtError::NotOnShardThread,
+      ))?
+      .map_err(EndpointError::Io)?;
+    Ok(DemuxId(kept))
   }
 
   /// This demultiplexer's id on its shard — what an endpoint on its socket names it by.
@@ -283,11 +297,18 @@ impl Demux {
   /// A fresh TLS server state presenting this demultiplexer's identity and pinning its allowed peers —
   /// one per accepted session.
   pub(crate) fn server_connection(&self) -> Result<rustls::quic::ServerConnection, HandshakeError> {
-    server_connection(
-      self.identity,
-      &self.allowed,
-      &crate::params::TransportParameters::local(),
-    )
+    self
+      .identity
+      .with(|identity| {
+        server_connection(
+          identity,
+          &self.allowed,
+          &crate::params::TransportParameters::local(),
+        )
+      })
+      .ok_or_else(|| {
+        HandshakeError::Setup("the shard's identity is not reachable on this thread".to_owned())
+      })?
   }
 
   /// The connection shape every session on this socket is built with.
@@ -331,32 +352,9 @@ impl Demux {
     self.capacity
   }
 
-  /// The receive loop: reads every datagram off the socket and routes it. Runs until the socket refuses;
-  /// the caller owns the task (spawns it on this shard and cancels it at shutdown).
-  pub async fn run(&'static self) -> Result<(), EndpointError> {
-    loop {
-      // Routed straight out of the shard's receive buffer (`crate::receive`), lent only for the read.
-      if crate::receive::with_datagram(&self.socket, |datagram, from| self.route(datagram, from))?
-        .is_none()
-      {
-        self.socket.readable().await?;
-        continue;
-      }
-      // Yield between datagrams: a burst queued in the kernel would otherwise be routed whole before any
-      // session task ran, filling an inbox the session had no chance to drain.
-      slates_rt::futures::yield_now().await;
-    }
-  }
-
   /// The datagrams one session's inbox holds before a further one is dropped (see the module doc).
   pub fn inbox_datagrams(&self) -> usize {
     self.inbox_datagrams
-  }
-
-  /// A future that yields the next server session a new source opened — un-established: the caller
-  /// drives [`Endpoint::establish`] as for any endpoint.
-  pub fn accept(&'static self) -> Accept {
-    Accept { demux: self }
   }
 
   /// Sends `datagram` to `peer` on the shared socket (every session sends through it directly).
@@ -467,7 +465,7 @@ impl Demux {
 
   /// Routes one datagram: a 1-RTT packet by its connection id; a raw handshake datagram by its source,
   /// opening a session for a source not yet seen.
-  fn route(&'static self, datagram: &[u8], from: SocketAddrV4) {
+  fn route(&self, datagram: &[u8], from: SocketAddrV4) {
     let mut inner = self.inner.borrow_mut();
     if is_short_header(datagram) {
       let target = connection_id_of(datagram).and_then(|id| inner.by_id.get(&id).copied());
@@ -555,7 +553,7 @@ impl Inner {
   /// Opens a server session for a new source: takes a free slot, builds the un-established endpoint on
   /// the shared link, and queues it for `accept`. Refused typed when no slot is free, or when the
   /// endpoint could not be built (the slot given back) — the caller counts each under its own category.
-  fn open(&mut self, demux: &'static Demux, from: SocketAddrV4) -> Result<Slot, OpenRefusal> {
+  fn open(&mut self, demux: &Demux, from: SocketAddrV4) -> Result<Slot, OpenRefusal> {
     if self.pending_handshakes >= demux.peer_capacity {
       return Err(OpenRefusal::Exhausted);
     }
@@ -598,20 +596,24 @@ impl Inner {
   }
 }
 
-/// The future [`Demux::accept`] returns: the next server session a new source opened.
+/// The future [`DemuxId::accept`] returns: the next server session a new source opened, or `Closed` once
+/// the demultiplexer is unreachable (its shard's context ended, or polled on another thread).
 pub struct Accept {
-  demux: &'static Demux,
+  demux: DemuxId,
 }
 
 impl std::future::Future for Accept {
-  type Output = Endpoint;
-  fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Endpoint> {
-    let mut inner = self.demux.inner.borrow_mut();
-    if let Some(endpoint) = inner.pending.pop_front() {
-      return Poll::Ready(endpoint);
-    }
-    inner.accept_waker = Some(cx.waker().clone());
-    Poll::Pending
+  type Output = Result<Endpoint, EndpointError>;
+  fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    let polled = with_demux(self.demux, |demux| {
+      let mut inner = demux.inner.borrow_mut();
+      if let Some(endpoint) = inner.pending.pop_front() {
+        return Poll::Ready(Ok(endpoint));
+      }
+      inner.accept_waker = Some(cx.waker().clone());
+      Poll::Pending
+    });
+    polled.unwrap_or(Poll::Ready(Err(EndpointError::Closed)))
   }
 }
 

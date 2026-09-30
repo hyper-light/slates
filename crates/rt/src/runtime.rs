@@ -651,8 +651,19 @@ impl LocalRuntime {
     self.ctx.run_until_idle();
   }
 
-  /// The shard's context, for counters and joins.
-  pub fn context(&self) -> &'static ShardContext {
+  /// The shard's context, for counters and joins: lent for this runtime's borrow, since dropping the
+  /// runtime frees it (AUD-29-08; until 2026-09-30 it was a `&'static` that outlived the drop). The lend
+  /// cannot outlive the runtime:
+  ///
+  /// ```compile_fail,E0515
+  /// use slates_rt::runtime::{LocalRuntime, RuntimeConfig};
+  /// use slates_rt::shard::ShardContext;
+  /// fn escape(config: &RuntimeConfig) -> Option<&'static ShardContext> {
+  ///   let runtime = LocalRuntime::new(config).ok()?;
+  ///   Some(runtime.context())
+  /// }
+  /// ```
+  pub fn context(&self) -> &ShardContext {
     self.ctx
   }
 }

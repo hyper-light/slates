@@ -98,9 +98,7 @@ fn a_ring_during_the_idle_spin_wakes_a_consuming_poller() {
   // into its spin; then ring.
   let _ = wait_until(SETTLE, || false);
   RUNG.store(true, Ordering::Release);
-  if let Some(entry) = registry::entry(shard.0) {
-    entry.kick.kick();
-  }
+  let _ = registry::with_entry(shard.0, |entry| entry.kick.kick());
   let woken = wait_until(WAKE_DEADLINE, || SERVED.load(Ordering::Acquire) >= 2);
   let counters = rt.shutdown().unwrap();
   let shard_counters = &counters[0];

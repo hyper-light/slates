@@ -17,7 +17,7 @@ use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
 use slates_transport::connection::Priority;
-use slates_transport::demux::{Demux, DemuxCounters};
+use slates_transport::demux::{Demux, DemuxCounters, DemuxId};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
 use slates_transport::params::TransportParameters;
@@ -952,10 +952,11 @@ async fn serve_shared_socket(plan: ServerPlan) {
 
 async fn serve_shared_socket_on_shard(plan: ServerPlan) {
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-  let identity: &'static Identity =
-    slates_rt::registry::with_current(|ctx| ctx.keep(plan.identity)).unwrap();
+  let identity = slates_rt::registry::with_current(|ctx| ctx.keep(plan.identity))
+    .unwrap()
+    .unwrap();
   let demux = Demux::start(socket, identity, plan.allowed, shape(), plan.peer_capacity).unwrap();
-  let port = demux.local_addr().unwrap().port();
+  let port = demux.with(Demux::local_addr).unwrap().unwrap().port();
   for tx in plan.port_txs {
     let _ = tx.send(port);
   }
@@ -965,7 +966,7 @@ async fn serve_shared_socket_on_shard(plan: ServerPlan) {
   .unwrap();
   let _ = slates_rt::futures::detach(run);
   for max_requests in plan.sessions {
-    let session = demux.accept().await;
+    let session = demux.accept().await.unwrap();
     let serve = slates_rt::futures::spawn(serve_up_to(
       session,
       plan.add,
@@ -976,7 +977,11 @@ async fn serve_shared_socket_on_shard(plan: ServerPlan) {
     let _ = slates_rt::futures::detach(serve);
   }
   let _ = recv_count(plan.done_rx, plan.clients).await;
-  let _ = plan.counters_tx.send((demux.counters(), demux.sessions()));
+  let _ = plan.counters_tx.send(
+    demux
+      .with(|demux| (demux.counters(), demux.sessions()))
+      .unwrap(),
+  );
 }
 
 /// AC (§4.10a §8 "connection IDs"; §4.8 one serve socket per plane): **two clients dial one accepting
@@ -1427,12 +1432,13 @@ fn start_pool(
   allowed: Vec<CertificateDer<'static>>,
   capacity: usize,
   port_txs: Vec<std::sync::mpsc::Sender<u16>>,
-) -> &'static Demux {
+) -> DemuxId {
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
-  let identity: &'static Identity =
-    slates_rt::registry::with_current(|ctx| ctx.keep(identity)).unwrap();
+  let identity = slates_rt::registry::with_current(|ctx| ctx.keep(identity))
+    .unwrap()
+    .unwrap();
   let demux = Demux::start(socket, identity, allowed, shape(), capacity).unwrap();
-  let port = demux.local_addr().unwrap().port();
+  let port = demux.with(Demux::local_addr).unwrap().unwrap().port();
   for tx in port_txs {
     let _ = tx.send(port);
   }
@@ -1558,7 +1564,9 @@ fn a_roster_the_server_cannot_build_from_is_a_setup_refusal_not_capacity() {
       let task = slates_rt::futures::spawn(async move {
         let demux = start_pool(server_identity, broken, SMALL_POOL, vec![port_tx]);
         recv_signal(dialer_done_rx).await;
-        report_stage(demux, "final", &stages_tx);
+        demux
+          .with(|demux| report_stage(demux, "final", &stages_tx))
+          .unwrap();
       })
       .unwrap();
       let _ = slates_rt::futures::detach(task);

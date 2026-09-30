@@ -53,6 +53,12 @@ pub enum RtError {
   },
   /// A memory refusal beneath the runtime.
   Mem(MemError),
+  /// The shard's kept values are borrowed — a keep inside a `Kept::with` on the same shard, or inside
+  /// another keep's build — so a value cannot be added now (AUD-29-08).
+  KeptInUse {
+    /// The shard.
+    shard: u16,
+  },
   /// A shard's worker thread ended without a result: it panicked (AUD-29-12). Its slot was still given
   /// back and its siblings still stopped and joined.
   WorkerFailed {
@@ -76,6 +82,7 @@ impl fmt::Display for RtError {
       Self::ControlFull { shard } => write!(f, "shard {shard}'s control channel is full"),
       Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
       Self::Mem(e) => write!(f, "memory: {e}"),
+      Self::KeptInUse { shard } => write!(f, "shard {shard}'s kept values are borrowed"),
       Self::WorkerFailed { shard } => write!(f, "shard {shard}'s worker ended without a result"),
     }
   }
