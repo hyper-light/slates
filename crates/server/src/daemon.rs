@@ -2442,6 +2442,7 @@ fn init_shard(
     repairs: 0,
     pending_materializations: std::collections::BTreeMap::new(),
     pending_catalogs: std::collections::BTreeMap::new(),
+    fenced_greens: std::collections::BTreeMap::new(),
     pending_green_materializations: std::collections::BTreeMap::new(),
   };
   // The landing counter starts past every landing recovered with the partition (its records are

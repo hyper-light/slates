@@ -2258,7 +2258,20 @@ fn dispatch(
       coincident_failures: shortfall.coincident_failures,
     });
   }
+  // A fenced green (AUD-29-18) is never served: its recovered history is not what was acknowledged. The one
+  // verb it takes is an admin's `Destroy` — the reviewed release; its durable log is the evidence until then.
+  let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
+  let destroying = matches!(body, RequestBody::Destroy { .. });
+  if fenced.is_some() && !destroying {
+    *state.refusals.entry(GREEN_FENCED).or_insert(0) += 1;
+    return refused(Refusal::ContentUnavailable);
+  }
   let reply = dispatch_inner(state, client_id, principal, body);
+  if let Some(volume) = fenced
+    && matches!(reply, ReplyBody::Destroyed)
+  {
+    state.fenced_greens.remove(&volume);
+  }
   // The content image must precede a successful completion (§4.8, AUD-05). A refusal can leave
   // an unacknowledged effect in memory, but neither this reply nor its retry may promise recovery.
   if republish && !matches!(reply, ReplyBody::Refused { .. }) {
@@ -6366,46 +6379,79 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
 /// before the restart. A corrupt chain entry stops the replay there — the green recovers to its last
 /// good version, logged, rather than presenting a wrong later state.
 fn rebuild_green(state: &mut ShardState, record: &VolumeRecord) {
-  let chain: Vec<Vec<u8>> = state.db.partition().green_chain(record.id).to_vec();
-  // A base-seeded green re-seeds its origin (version 0) before the chain replays over it; a corrupt
-  // origin stops the rebuild there, logged, rather than replaying the chain over an empty version 0.
-  let mut green = match state.db.partition().green_origin(record.id) {
-    None => slates_merge::engine::Green::new(),
-    Some(bytes) => match slates_merge::origin::Origin::decode(bytes) {
-      Ok(origin) => slates_merge::engine::Green::with_origin(&origin),
-      Err(e) => {
-        eprintln!(
-          "slates-server: partition {}: green {} origin is corrupt, replay stops: {e}",
-          state.partition, record.name
-        );
-        state
-          .greens
-          .insert(record.id, slates_merge::engine::Green::new());
-        return;
-      }
-    },
+  let green = match replay_green(state, record.id) {
+    Ok(green) => green,
+    Err(fence) => return fence_green(state, record, fence),
   };
-  for (version, bytes) in chain.iter().enumerate() {
-    match slates_merge::engine::Increment::decode(bytes) {
-      Ok(inc) => {
-        let _ = green.submit(&inc);
+  state.greens.insert(record.id, green);
+  // The replay rebuilt every history in full; the recovered works are reset to the head and a green's
+  // attachments are reconciled out at boot, so nothing reachable lies below the head: fold to it and
+  // re-take the retention the remaining histories hold, ahead of new claims (§4.2 recovery order). A
+  // retention the budget cannot hold fences the green rather than serve it over budget.
+  if let Err(short) = crate::merge_service::settle_green_retention(state, record.id) {
+    fence_green(
+      state,
+      record,
+      crate::merge_service::GreenFence::Retention { short },
+    );
+  }
+}
+
+/// Replays green `id`'s durable origin and chain into a fresh engine (§4.16): every chain entry was an
+/// acknowledged version, so each must decode and be accepted at exactly its own version — version `n` for
+/// the `n`-th entry, over the origin's version 0 — or the replay is refused with the fence naming why
+/// (AUD-29-18). Until 2026-09-30 a corrupt origin installed an empty green, a corrupt entry stopped the replay
+/// and installed the shorter one, and a submit's outcome was not checked at all.
+fn replay_green(
+  state: &ShardState,
+  id: DbVolumeId,
+) -> Result<slates_merge::engine::Green, crate::merge_service::GreenFence> {
+  use crate::merge_service::GreenFence;
+  let mut green = match state.db.partition().green_origin(id) {
+    None => slates_merge::engine::Green::new(),
+    Some(bytes) => slates_merge::origin::Origin::decode(bytes)
+      .map(|origin| slates_merge::engine::Green::with_origin(&origin))
+      .map_err(|_| GreenFence::OriginCorrupt)?,
+  };
+  for (index, bytes) in state.db.partition().green_chain(id).iter().enumerate() {
+    let version = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+    let increment = slates_merge::engine::Increment::decode(bytes)
+      .map_err(|_| GreenFence::EntryCorrupt { version })?;
+    match green.submit(&increment) {
+      slates_merge::engine::Outcome::Accepted { version: accepted } if accepted == version => {}
+      slates_merge::engine::Outcome::Accepted { version: accepted } => {
+        return Err(GreenFence::WrongVersion { version, accepted });
       }
-      Err(e) => {
-        eprintln!(
-          "slates-server: partition {}: green {} chain entry {version} is corrupt, replay stops: {e}",
-          state.partition, record.name
-        );
-        break;
+      slates_merge::engine::Outcome::Conflict { .. } => {
+        return Err(GreenFence::NotAccepted { version });
       }
     }
   }
   green.set_rejected_budget(crate::merge_service::rejected_cache_budget(state));
-  state.greens.insert(record.id, green);
-  // The replay rebuilt every history in full; the recovered works are reset to the head and a green's
-  // attachments are reconciled out at boot, so nothing reachable lies below the head: fold to it and
-  // re-take the retention the remaining histories hold, ahead of new claims (§4.2 recovery order).
-  let _ = crate::merge_service::settle_green_retention(state, record.id);
+  Ok(green)
 }
+
+/// Fences green `record` (AUD-29-18): no engine and no retention stay installed, every verb naming it is
+/// refused typed (`dispatch`), and its durable origin and chain are left as they are — the evidence a
+/// reviewed recovery works from. Counted and logged once per fencing.
+fn fence_green(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  fence: crate::merge_service::GreenFence,
+) {
+  state.greens.remove(&record.id);
+  crate::merge_service::release_green_retention(state, record.id);
+  state.fenced_greens.insert(record.id, fence);
+  *state.refusals.entry(GREEN_FENCED).or_insert(0) += 1;
+  eprintln!(
+    "slates-server: partition {}: green {} fenced, its recovered history is not what was acknowledged: {fence:?}",
+    state.partition, record.name
+  );
+}
+
+/// The status count of greens fenced at recovery (AUD-29-18). Format: a refusal name in the daemon's status
+/// report, alongside the verbs' refusal kinds.
+const GREEN_FENCED: &str = "merge.green_fenced";
 
 /// Rebuilds a recovered work volume as a fresh clone of its green's current head (§4.16): a work's
 /// declared edits are scratch and do not survive a restart (BUG-11 class), so the work is reset —
@@ -7261,6 +7307,182 @@ mod tests {
           }
         ),
         "a snapshot the volume does not hold: {unknown:?}"
+      );
+    });
+  }
+
+  /// AUD-29-18 (§4.16, D-27: a recovered green is its acknowledged history or nothing): do: create a green,
+  /// append a chain entry no increment decodes to its durable log, rebuild it as a restart does, then ask
+  /// its versions; expect the green fenced — no engine installed, the verb refused `ContentUnavailable` —
+  /// never served as the shorter history the replay could reach. Until 2026-09-30 the replay stopped at the
+  /// corrupt entry, logged, and installed the shortened green.
+  #[test]
+  fn a_green_whose_recovered_chain_is_corrupt_is_fenced_not_served_shorter() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid { uid: 1234 };
+      let reply = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateGreen {
+          name: "fenced".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::GreenCreated { id } = reply else {
+        panic!("{reply:?}")
+      };
+      let green = super::to_db_volume(id);
+      let corrupt = super::Op::GreenAdvanced {
+        green,
+        increment: vec![0xff; 16],
+      };
+      state.db.mutate(&mut state.segment, &corrupt, 0).unwrap();
+      let record = state.db.partition().volume(green).cloned().unwrap();
+      super::rebuild_green(state, &record);
+      assert!(
+        !state.greens.contains_key(&green),
+        "no engine was installed"
+      );
+      let reply = super::dispatch(state, 1, &owner, super::RequestBody::Versions { green: id });
+      assert!(
+        matches!(
+          reply,
+          super::ReplyBody::Refused {
+            refusal: Refusal::ContentUnavailable
+          }
+        ),
+        "{reply:?}"
+      );
+      // The reviewed release: its admin destroys the fenced green, and the fence goes with it.
+      let reply = super::dispatch(state, 1, &owner, super::RequestBody::Destroy { volume: id });
+      assert!(matches!(reply, super::ReplyBody::Destroyed), "{reply:?}");
+      assert!(
+        state.fenced_greens.is_empty(),
+        "the fence is released with the green"
+      );
+    });
+  }
+
+  /// AUD-29-18: do: create a green, submit one increment through a work so its chain holds one acknowledged
+  /// version, and rebuild it — expect the replay to reproduce exactly that head (version 1, the same identity);
+  /// then append that same entry again, as a log replaying a duplicate would, and rebuild — expect the green
+  /// fenced, since the replay accepts the duplicate as version 1, not the acknowledged version 2; and a green
+  /// whose origin does not decode fenced too. A healthy replay matches; anything else is never served.
+  #[test]
+  fn a_healthy_green_replays_exactly_and_a_duplicate_or_corrupt_origin_is_fenced() {
+    crate::daemon::audit_on_shard(|state| {
+      let owner = Principal::Uid { uid: 1234 };
+      let super::ReplyBody::GreenCreated { id } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateGreen {
+          name: "replayed".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ) else {
+        panic!("create green")
+      };
+      let super::ReplyBody::WorkCreated { id: work, .. } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateWork {
+          green: id,
+          name: "replayed-work".to_owned(),
+        },
+      ) else {
+        panic!("create work")
+      };
+      let edited = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Edit {
+          work,
+          path: "/f".to_owned(),
+          at: 0,
+          delete_len: 0,
+          bytes: b"hello".to_vec(),
+        },
+      );
+      assert!(matches!(edited, super::ReplyBody::Edited), "{edited:?}");
+      let submitted = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::Submit {
+          work,
+          evidence: Vec::new(),
+        },
+      );
+      assert!(
+        matches!(
+          submitted,
+          super::ReplyBody::Submitted {
+            version: Some(1),
+            ..
+          }
+        ),
+        "{submitted:?}"
+      );
+      let green = super::to_db_volume(id);
+      let before = state
+        .greens
+        .get(&green)
+        .map(|g| (g.head(), g.head_identity()));
+      let record = state.db.partition().volume(green).cloned().unwrap();
+      super::rebuild_green(state, &record);
+      assert_eq!(
+        state
+          .greens
+          .get(&green)
+          .map(|g| (g.head(), g.head_identity())),
+        before,
+        "the healthy replay reproduces the acknowledged head exactly"
+      );
+      let entry = state.db.partition().green_chain(green)[0].clone();
+      let duplicate = super::Op::GreenAdvanced {
+        green,
+        increment: entry,
+      };
+      state.db.mutate(&mut state.segment, &duplicate, 0).unwrap();
+      super::rebuild_green(state, &record);
+      assert!(!state.greens.contains_key(&green));
+      assert_eq!(
+        state.fenced_greens.get(&green),
+        Some(&crate::merge_service::GreenFence::WrongVersion {
+          version: 2,
+          accepted: 1
+        })
+      );
+
+      let super::ReplyBody::GreenCreated { id: other } = super::dispatch(
+        state,
+        1,
+        &owner,
+        super::RequestBody::CreateGreen {
+          name: "origin".to_owned(),
+          require_evidence: false,
+          base: None,
+        },
+      ) else {
+        panic!("create green")
+      };
+      let other = super::to_db_volume(other);
+      let corrupt = super::Op::GreenOriginated {
+        green: other,
+        origin: vec![0xff; 16],
+      };
+      state.db.mutate(&mut state.segment, &corrupt, 0).unwrap();
+      let record = state.db.partition().volume(other).cloned().unwrap();
+      super::rebuild_green(state, &record);
+      assert_eq!(
+        state.fenced_greens.get(&other),
+        Some(&crate::merge_service::GreenFence::OriginCorrupt)
       );
     });
   }

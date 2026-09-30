@@ -1057,6 +1057,37 @@ impl MergeRecordValue {
   }
 }
 
+/// Why a green's recovered history was fenced rather than served (AUD-29-18; §4.16, D-27): every durable
+/// chain entry was an acknowledged version, so a replay that cannot reproduce each as an acceptance at its
+/// own version would present a shorter or different history under the same id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GreenFence {
+  /// The origin (version 0) does not decode.
+  OriginCorrupt,
+  /// The chain entry for `version` does not decode.
+  EntryCorrupt {
+    /// The version the entry was acknowledged as.
+    version: u64,
+  },
+  /// The chain entry for `version` was not accepted on replay (a conflict).
+  NotAccepted {
+    /// The version the entry was acknowledged as.
+    version: u64,
+  },
+  /// The chain entry for `version` was accepted as another version.
+  WrongVersion {
+    /// The version the entry was acknowledged as.
+    version: u64,
+    /// The version the replay accepted it as.
+    accepted: u64,
+  },
+  /// The retention the rebuilt histories hold could not be charged: `short` bytes past the budget.
+  Retention {
+    /// The bytes the budget could not cover.
+    short: u64,
+  },
+}
+
 /// A green's outstanding replication (§4.16, AUD-13). The per-holder ordered positions index
 /// has one entry per missing acknowledgement, bounded by the pending records times their candidate
 /// count. Selecting the next shipment reads one position per holder, independent of chain length.

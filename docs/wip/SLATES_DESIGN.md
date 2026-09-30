@@ -3622,6 +3622,15 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 
 > **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
 
+> **Status (2026-09-30, AUD-29-18, green recovery fails closed).** A recovered green is its acknowledged
+> history or nothing.
+> - **Replay.** Every durable chain entry must decode and be accepted at exactly its own version, over the
+>   origin's version 0, and its retention must be chargeable.
+> - **Otherwise the green is fenced.** No engine is installed, verbs naming it are refused
+>   `ContentUnavailable`, and the log is kept as evidence. The one verb it takes is its admin's `Destroy`,
+>   the reviewed release
+>   (`docs/bugs/2026-09-30-green-recovery-served-an-empty-or-shortened-history.md`).
+>
 > **Status (2026-09-30, AUD-29-17, the catalog register class).** A volume's catalog is a register of its
 > own, as §4.8 lists it.
 > - **Object.** The volume id with the register-class bit (`ObjectId::catalog`). Placement and successor

@@ -308,6 +308,10 @@ pub struct ShardState {
   /// Green volumes' merge engines (§4.16): the in-memory chain and per-path state a green owns,
   /// keyed by its id. A green is not a store-backed VFS tree; its merged content lives here.
   pub greens: BTreeMap<VolumeId, Green>,
+  /// Greens whose recovered history did not reproduce what was acknowledged (AUD-29-18), each with why:
+  /// no engine is installed and every verb naming one is refused typed, while its durable origin and chain
+  /// stay untouched as the evidence a reviewed recovery works from. Bounded by the partition's greens.
+  pub fenced_greens: BTreeMap<VolumeId, crate::merge_service::GreenFence>,
   /// Work volumes' declared operations (§4.16): each work over a green accumulates the operations an
   /// agent declares (through `edit`) and the bytes they name, composed into an increment on submit.
   pub works: BTreeMap<VolumeId, WorkState>,
