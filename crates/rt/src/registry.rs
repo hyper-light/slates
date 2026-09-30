@@ -948,6 +948,7 @@ mod tests {
     let consumer = entry(id).unwrap().inbound.consumer().unwrap();
     assert_eq!(consumer.pop(), Some(word.word()));
     assert_eq!(current_shard(), None);
+    drop(consumer);
     unregister(id);
   }
 
@@ -966,6 +967,9 @@ mod tests {
     filler.join().unwrap();
     assert_eq!(c.pop(), Some(2));
     assert_eq!(c.pop(), Some(3));
+    // The claim is released into the ring before retirement frees it (Miri: a consumer dropped after
+    // `unregister` wrote into the freed ring).
+    drop(c);
     unregister(id);
   }
 

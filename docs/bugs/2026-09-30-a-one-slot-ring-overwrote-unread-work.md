@@ -45,3 +45,16 @@
 - **Loom.** The loom models, including the smallest geometry (two slots, lapping), pass:
   `RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc --lib --release loom`.
 - **Instruction counts.** Recorded in `docs/wip/BENCHMARKS.md` (Single-owner ring halves).
+
+## Follow-up: a test consumer outlived its ring (Miri, CI job 109811181968)
+
+- **The failure.** Miri reported a use-after-free in `registry::tests::a_full_foreign_ring_spins_and_counts_without_losing_the_word`:
+  the test's claimed `Consumer` was still alive when `unregister` freed the entry and its ring, and the
+  consumer's drop (which releases the claim) wrote into the freed ring.
+- **The sibling.** `a_wake_from_a_foreign_thread_lands_in_the_target_ring` had the same shape.
+- **The fix.** Both tests drop the consumer before `unregister`.
+- **Production is not affected.** Its only holder is the shard context, which drops its consumer when the
+  context is reclaimed, before the slot is unregistered. The contention test's consumers live inside a
+  scoped `with_entry` closure, and the parking tests' rings are leaked by design.
+- **Miri.** `cargo +nightly miri test -p slates-rt --lib registry::` gives 7/7, and
+  `-p slates-mem --lib -- ring mpsc` gives 9/9, both with no undefined behaviour.
