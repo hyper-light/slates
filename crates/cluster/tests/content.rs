@@ -75,7 +75,11 @@ fn archive() -> Archive {
     root_meta: NodeMeta::default(),
     manifest: Node::Directory(vec![Entry {
       name: "file".to_owned(),
-      meta: NodeMeta::default(),
+      // The canonical form: the file's recorded size is the length its extents tile.
+      meta: NodeMeta {
+        size: chunk.raw_len,
+        ..NodeMeta::default()
+      },
       node: Node::File(vec![Extent {
         offset: 0,
         len: chunk.raw_len,

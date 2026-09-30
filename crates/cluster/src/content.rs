@@ -1059,7 +1059,11 @@ mod tests {
       root_meta: NodeMeta::default(),
       manifest: Node::Directory(vec![Entry {
         name: "file".to_owned(),
-        meta: NodeMeta::default(),
+        // The canonical form: the file's recorded size is the length its extents tile.
+        meta: NodeMeta {
+          size: first.raw_len + second.raw_len,
+          ..NodeMeta::default()
+        },
         node: Node::File(extents),
       }]),
       chunks: vec![first, second],

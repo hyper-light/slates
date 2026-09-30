@@ -88,11 +88,14 @@ impl std::fmt::Debug for ChunkStore {
 }
 
 /// The chunk size: the largest open extent, and so the unit of copy-on-write. Sixteen base pages
-/// until the p90 sealed size is measured on real workloads (Phase 1 baselines record it; the
-/// formula in §4.5 is "smallest page multiple ≥ p90 sealed size").
+/// (`slates_archive::format::CHUNK_PAGES`, the archive format's chunk rule, so an archive reader's cap
+/// covers every chunk this store cuts) until the p90 sealed size is measured on real workloads (Phase 1
+/// baselines record it; the formula in §4.5 is "smallest page multiple ≥ p90 sealed size").
 pub fn chunk_bytes(page: usize) -> Derived<usize> {
   derived!(
-    page.max(1).saturating_mul(16),
+    page
+      .max(1)
+      .saturating_mul(usize::try_from(slates_archive::format::CHUNK_PAGES).unwrap_or(usize::MAX)),
     "16 × base page until the p90 sealed size is measured (§4.5 derived constants)",
     ["page.base"]
   )

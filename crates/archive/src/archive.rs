@@ -19,8 +19,8 @@
 //! reserves their fields so an archive written then stays readable now.
 
 use crate::format::{
-  ArchiveError, Chunk, Encoding, FORMAT_MAJOR, FORMAT_MINOR, MAGIC, SEEK_TABLE_MAGIC,
-  TRAILER_MAGIC, flag,
+  ArchiveError, Chunk, Encoding, FORMAT_MAJOR, FORMAT_MINOR, MAGIC, MAX_CHUNK_BYTES,
+  SEEK_TABLE_MAGIC, TRAILER_MAGIC, flag,
 };
 use crate::manifest::{self, Node, NodeMeta};
 use crate::wire::{Reader, Writer};
@@ -295,9 +295,15 @@ impl Archive {
 
     let mut reader = Reader::at(bytes, sections.chunks_offset)?;
     let mut chunks = Vec::new();
+    let (mut raw_total, mut stored_total) = (0u64, 0u64);
     for index in 0..header.chunk_count {
-      let chunk = read_chunk(&mut reader, index)?;
+      let chunk = read_chunk(&mut reader, index, header.chunk_max)?;
+      raw_total = raw_total.saturating_add(chunk.raw_len);
+      stored_total = stored_total.saturating_add(chunk.stored_len);
       chunks.push(chunk);
+    }
+    if raw_total != header.raw_bytes || stored_total != header.stored_bytes {
+      return Err(ArchiveError::TotalsMismatch);
     }
 
     let mut manifest_reader = Reader::at(bytes, sections.manifest_offset)?;
@@ -343,6 +349,7 @@ impl Archive {
     bytes: &[u8],
     identity: &[u8; 32],
   ) -> Result<Option<Chunk>, ArchiveError> {
+    let header = Header::parse(bytes)?;
     verify_archive_hash(bytes)?;
     let sections = Sections::parse(bytes)?;
     let mut seek = Reader::at(bytes, sections.seek_offset)?;
@@ -356,7 +363,7 @@ impl Archive {
       let offset = seek.u64()?;
       if &entry_identity == identity {
         let mut reader = Reader::at(bytes, offset)?;
-        return Ok(Some(read_chunk(&mut reader, 0)?));
+        return Ok(Some(read_chunk(&mut reader, 0, header.chunk_max)?));
       }
     }
     Ok(None)
@@ -370,6 +377,8 @@ struct Header {
   chunk_max: u32,
   manifest_hash: [u8; 32],
   chunk_count: u64,
+  raw_bytes: u64,
+  stored_bytes: u64,
   created_unix: u64,
   volume_id: u64,
   snapshot_id: u64,
@@ -398,10 +407,13 @@ impl Header {
     let base_page_size = reader.u32()?;
     let chunk_min = reader.u32()?;
     let chunk_max = reader.u32()?;
+    if u64::from(chunk_max) > MAX_CHUNK_BYTES {
+      return Err(ArchiveError::ChunkMaxTooLarge { found: chunk_max });
+    }
     let manifest_hash = reader.hash()?;
     let chunk_count = reader.u64()?;
-    let _raw_bytes = reader.u64()?;
-    let _stored_bytes = reader.u64()?;
+    let raw_bytes = reader.u64()?;
+    let stored_bytes = reader.u64()?;
     let created_unix = reader.u64()?;
     let volume_id = reader.u64()?;
     let snapshot_id = reader.u64()?;
@@ -413,6 +425,8 @@ impl Header {
       chunk_max,
       manifest_hash,
       chunk_count,
+      raw_bytes,
+      stored_bytes,
       created_unix,
       volume_id,
       snapshot_id,
@@ -477,12 +491,18 @@ fn verify_archive_hash(bytes: &[u8]) -> Result<(), ArchiveError> {
   Ok(())
 }
 
-/// Reads and verifies one chunk record at the reader's cursor.
-fn read_chunk(reader: &mut Reader<'_>, index: u64) -> Result<Chunk, ArchiveError> {
+/// Reads and verifies one chunk record at the reader's cursor, admitting its declared sizes before any
+/// allocation (AUD-29-13): at most the archive's `chunk_max` raw bytes, and in the canonical form
+/// ([`check_canonical_chunk`]).
+fn read_chunk(reader: &mut Reader<'_>, index: u64, chunk_max: u32) -> Result<Chunk, ArchiveError> {
   let identity = reader.hash()?;
   let raw_len = reader.u64()?;
   let stored_len = reader.u64()?;
   let encoding = Encoding::from_wire(reader.u8()?).ok_or(ArchiveError::BadLength)?;
+  if raw_len > u64::from(chunk_max) {
+    return Err(ArchiveError::ChunkTooLarge { index });
+  }
+  check_canonical_chunk(raw_len, stored_len, encoding, index)?;
   let level = reader.u8()?;
   let dictionary = reader.hash()?;
   let stored = usize::try_from(stored_len).unwrap_or(usize::MAX);
@@ -505,10 +525,41 @@ fn read_chunk(reader: &mut Reader<'_>, index: u64) -> Result<Chunk, ArchiveError
   Ok(chunk)
 }
 
+/// Refuses a chunk record that is not canonical (AUD-29-13): an empty chunk (no extent can name one), a
+/// raw chunk whose declared raw length is not its payload's, or an encoded chunk no smaller than its raw
+/// bytes (the writer keeps an encoding only when it saves space, `Archive::compressed_chunk`).
+fn check_canonical_chunk(
+  raw_len: u64,
+  stored_len: u64,
+  encoding: Encoding,
+  index: u64,
+) -> Result<(), ArchiveError> {
+  let canonical = raw_len > 0
+    && match encoding {
+      Encoding::Raw => stored_len == raw_len,
+      Encoding::Lz4 | Encoding::Zstd => stored_len < raw_len,
+    };
+  if canonical {
+    Ok(())
+  } else {
+    Err(ArchiveError::NonCanonicalChunk { index })
+  }
+}
+
 /// Decodes a chunk's stored payload to its raw bytes by its encoding: a raw chunk is its bytes; an
 /// LZ4 chunk is decompressed to its declared raw length; a zstd chunk is owed. A payload that will
-/// not decode is a typed refusal naming the chunk.
+/// not decode is a typed refusal naming the chunk, and no chunk decodes past the format's cap
+/// ([`MAX_CHUNK_BYTES`]) or out of canonical form, whoever built the record (AUD-29-13).
 fn decode_payload(chunk: &Chunk, index: u64) -> Result<Vec<u8>, ArchiveError> {
+  if chunk.raw_len > MAX_CHUNK_BYTES {
+    return Err(ArchiveError::ChunkTooLarge { index });
+  }
+  check_canonical_chunk(
+    chunk.raw_len,
+    u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX),
+    chunk.encoding,
+    index,
+  )?;
   match chunk.encoding {
     Encoding::Raw => Ok(chunk.payload.clone()),
     Encoding::Lz4 => {

@@ -7,6 +7,9 @@ use std::collections::BTreeSet;
 use slates_archive::archive::Archive;
 use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
 use slates_archive::restore::restore;
+
+/// Shape: the bytes a restore here is admitted — far past any fixture, so only the budget tests meet it.
+const ADMITTED: u64 = 1 << 30;
 use slates_archive::transfer::{chunks_for, missing_set};
 
 /// A flat archive of one raw chunk per file.
@@ -15,9 +18,13 @@ fn archive_of(files: &[(&str, Vec<u8>)]) -> Archive {
   let mut entries = Vec::new();
   for (name, bytes) in files {
     let chunk = Archive::raw_chunk(bytes.clone());
+    // The canonical form: the recorded size is the length the extent tiles (AUD-29-14).
     entries.push(Entry {
       name: (*name).to_owned(),
-      meta: NodeMeta::default(),
+      meta: NodeMeta {
+        size: bytes.len() as u64,
+        ..NodeMeta::default()
+      },
       node: Node::File(vec![Extent {
         offset: 0,
         len: bytes.len() as u64,
@@ -75,7 +82,7 @@ fn a_partial_transfer_restores_the_whole_archive() {
   let mut received = archive.clone();
   received.chunks = vec![shared];
   received.chunks.extend(shipped);
-  let restored = restore(&received).expect("restores from held + shipped");
+  let restored = restore(&received, ADMITTED).expect("restores from held + shipped");
   assert_eq!(
     restored.files.get("shared"),
     Some(&b"the identical build output".to_vec())

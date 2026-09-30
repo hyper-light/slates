@@ -15,7 +15,7 @@ fn sample() -> Archive {
   let chunks = vec![
     Archive::raw_chunk(b"the first chunk".to_vec()),
     Archive::raw_chunk(b"a second, longer chunk of bytes".to_vec()),
-    Archive::raw_chunk(Vec::new()),
+    Archive::raw_chunk(b"3".to_vec()),
   ];
   Archive {
     base_page_size: 4096,
@@ -425,4 +425,62 @@ fn zstd_beats_lz4_on_structured_data() {
     lz4.stored_len
   );
   assert_eq!(Archive::content(&zstd).expect("decodes"), raw);
+}
+
+/// AUD-29-13: do: decode archives whose chunk records declare a maximal raw length (a compressed payload
+/// of a few bytes claiming `u64::MAX`), a raw length past the header's chunk maximum, a raw chunk whose
+/// raw length is not its payload's, an empty chunk, and a header whose chunk maximum is past the format's
+/// cap; expect each refused typed before any decompression — never an allocation of the declared size.
+#[test]
+fn hostile_chunk_sizes_are_refused_before_decoding() {
+  use slates_archive::format::MAX_CHUNK_BYTES;
+  let with_chunk = |chunk: Chunk| Archive {
+    chunks: vec![chunk],
+    ..sample()
+  };
+  let honest = Archive::raw_chunk(vec![7u8; 64]);
+  let maximal = Chunk {
+    raw_len: u64::MAX,
+    stored_len: 8,
+    encoding: Encoding::Lz4,
+    payload: vec![0u8; 8],
+    ..honest.clone()
+  };
+  assert_eq!(
+    Archive::decode(&with_chunk(maximal).encode()),
+    Err(ArchiveError::ChunkTooLarge { index: 0 })
+  );
+  let past_header = Chunk {
+    raw_len: u64::from(sample().chunk_max) + 1,
+    stored_len: 8,
+    encoding: Encoding::Lz4,
+    payload: vec![0u8; 8],
+    ..honest.clone()
+  };
+  assert_eq!(
+    Archive::decode(&with_chunk(past_header).encode()),
+    Err(ArchiveError::ChunkTooLarge { index: 0 })
+  );
+  let raw_lies = Chunk {
+    raw_len: 4096,
+    ..honest.clone()
+  };
+  assert_eq!(
+    Archive::decode(&with_chunk(raw_lies).encode()),
+    Err(ArchiveError::NonCanonicalChunk { index: 0 })
+  );
+  assert_eq!(
+    Archive::decode(&with_chunk(Archive::raw_chunk(Vec::new())).encode()),
+    Err(ArchiveError::NonCanonicalChunk { index: 0 })
+  );
+  let wide = Archive {
+    chunk_max: u32::try_from(MAX_CHUNK_BYTES + 1).unwrap(),
+    ..sample()
+  };
+  assert_eq!(
+    Archive::decode(&wide.encode()),
+    Err(ArchiveError::ChunkMaxTooLarge {
+      found: u32::try_from(MAX_CHUNK_BYTES + 1).unwrap()
+    })
+  );
 }

@@ -714,7 +714,7 @@ mod tests {
       "a file of three chunks and more cuts into several distinct chunks: {}",
       archive.chunks.len()
     );
-    let restored = restore(&archive).unwrap();
+    let restored = restore(&archive, u64::MAX).unwrap();
     assert_restored_tree(&restored, &body);
   }
 

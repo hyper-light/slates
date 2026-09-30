@@ -178,7 +178,8 @@ fn archives_preserve_ipc_metadata_without_stream_bytes() {
       break;
     }
   }
-  let restored = slates_archive::restore(&result.expect("bounded walk completes")).unwrap();
+  let restored =
+    slates_archive::restore(&result.expect("bounded walk completes"), u64::MAX).unwrap();
   for (name, kind) in [("pipe", Kind::Fifo), ("socket", Kind::Socket)] {
     let meta = &restored.metadata[name];
     assert_eq!(kind_of_mode(meta.mode), Some(kind));

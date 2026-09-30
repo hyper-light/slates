@@ -1133,15 +1133,29 @@ pub struct HolderMergeState {
 
 impl MergeShardState {
   /// The version-0 or version-N inputs of `green` as one archive: a manifest with one file named
-  /// [`INPUTS_ENTRY_NAME`] over one raw chunk of the bytes (the chain's own entry). Deterministic:
-  /// the manifest identity depends on the bytes, the entry's name and size, and the default root
-  /// metadata alone — and it is [`Archive::manifest_identity`], the one identity the put, the hold and
-  /// the record all name (the tree's own identity is not it since the root's metadata joined the
-  /// manifest, format minor 2).
+  /// [`INPUTS_ENTRY_NAME`] over the bytes cut into raw chunks of at most `page` bytes (the archive's
+  /// declared maximum chunk), in the canonical form every reader admits (AUD-29-13: a chunk past the
+  /// declared maximum is refused; an empty file has no extent). Deterministic: the manifest identity depends
+  /// on the bytes, the entry's name and size, the page and the default root metadata alone — and it is
+  /// [`Archive::manifest_identity`], the one identity the put, the hold and the record all name (the tree's
+  /// own identity is not it since the root's metadata joined the manifest, format minor 2). Until
+  /// 2026-09-30 the bytes were one chunk whatever their length, past the maximum the archive declared.
   fn inputs_archive(bytes: &[u8], created_unix: u64, page: u32) -> Archive {
-    let chunk = Archive::raw_chunk(bytes.to_vec());
-    let len = chunk.raw_len;
-    let identity = chunk.identity;
+    let chunk_bytes = usize::try_from(page).unwrap_or(usize::MAX).max(1);
+    let mut extents = Vec::new();
+    let mut chunks = Vec::new();
+    let mut offset = 0u64;
+    for piece in bytes.chunks(chunk_bytes) {
+      let chunk = Archive::raw_chunk(piece.to_vec());
+      extents.push(Extent {
+        offset,
+        len: chunk.raw_len,
+        chunk: chunk.identity,
+        chunk_offset: 0,
+      });
+      offset = offset.saturating_add(chunk.raw_len);
+      chunks.push(chunk);
+    }
     Archive {
       base_page_size: page,
       chunk_min: page,
@@ -1155,17 +1169,12 @@ impl MergeShardState {
       manifest: Node::Directory(vec![Entry {
         name: INPUTS_ENTRY_NAME.to_owned(),
         meta: NodeMeta {
-          size: len,
+          size: offset,
           ..NodeMeta::default()
         },
-        node: Node::File(vec![Extent {
-          offset: 0,
-          len,
-          chunk: identity,
-          chunk_offset: 0,
-        }]),
+        node: Node::File(extents),
       }]),
-      chunks: vec![chunk],
+      chunks,
     }
   }
 
@@ -1973,13 +1982,25 @@ pub(crate) fn accept_merge_record(
   }
 }
 
-/// The inputs bytes a manifest names, from this holder's content hold — the one file's one chunk —
-/// with a test's corruption fault applied once if set (the last byte of the post-state, so the
-/// increment still decodes but recomputes to different bytes).
+/// The inputs bytes a manifest names, from this holder's content hold — the one file, restored within
+/// the bytes the hold admitted (its chunks' raw bytes and one chunk's decode space: a well-formed inputs
+/// archive names each chunk once, so its file is never longer, and a hostile one naming a chunk many
+/// times is refused before allocating, AUD-29-13) — with a test's corruption fault applied once if set
+/// (the last byte of the post-state, so the increment still decodes but recomputes to different bytes).
 fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) -> Option<Vec<u8>> {
   let archive = state.held_content.archive_of(object, manifest)?;
-  let chunk = archive.chunks.first()?;
-  let mut bytes = Archive::content(chunk).ok()?;
+  let held = archive
+    .chunks
+    .iter()
+    .fold(0u64, |total, chunk| total.saturating_add(chunk.raw_len));
+  let largest = archive
+    .chunks
+    .iter()
+    .map(|chunk| chunk.raw_len)
+    .max()
+    .unwrap_or(0);
+  let mut restored = slates_archive::restore(&archive, held.saturating_add(largest)).ok()?;
+  let mut bytes = restored.files.remove(INPUTS_ENTRY_NAME)?;
   if state.merge.fault.corrupt_next_inputs {
     state.merge.fault.corrupt_next_inputs = false;
     // The increment encoding ends with the evidence count (a `u64`); the byte before it is the

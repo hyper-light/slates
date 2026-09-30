@@ -5299,15 +5299,26 @@ pub(crate) fn materialize_taken_over(
       existing: to_wire_volume(existing.id),
     })));
   }
-  let restored = slates_archive::restore(archive).map_err(|e| {
-    refused(Refusal::BadRequest {
-      reason: format!("taken-over content archive: {e}"),
-    })
-  })?;
   let size = match head.size {
     DbSizeClass::Bounded { limit } => SizeClass::Bounded { limit },
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
   };
+  // The restore is admitted before it allocates (AUD-29-13): no more than the volume may hold — its bound
+  // or its dynamic maximum — and no more than this shard could admit, since every restored byte is written
+  // into the volume next. An archive needing more is refused typed before a byte is reconstructed.
+  let volume_cap = match size {
+    SizeClass::Bounded { limit } => limit,
+    SizeClass::Dynamic { max } => max,
+  };
+  let restore_budget = volume_cap.min(state.store.budget.admittable());
+  let restored = slates_archive::restore(archive, restore_budget).map_err(|e| match e {
+    slates_archive::ArchiveError::OverBudget { .. } => refused(Refusal::BudgetExceeded {
+      available: restore_budget,
+    }),
+    other => refused(Refusal::BadRequest {
+      reason: format!("taken-over content archive: {other}"),
+    }),
+  })?;
   let reservation = match size {
     SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
       Ok(r) => Some(r),
@@ -7176,6 +7187,134 @@ mod tests {
     });
   }
 
+  /// A takeover head for `name` bounded at `limit` bytes, owned by uid 501.
+  fn takeover_head(name: &str, limit: u64) -> crate::head::HeadValue {
+    crate::head::HeadValue {
+      manifest: None,
+      content_holders: Vec::new(),
+      name: name.to_owned(),
+      size: slates_db::catalog::SizeClass::Bounded { limit },
+      names: slates_db::catalog::NamePolicy::Exact,
+      owner: Principal::Uid { uid: 501 },
+    }
+  }
+
+  /// An archive of one file `f` laid out by `extents` over `chunks`, its recorded size their tiled length.
+  fn takeover_archive(
+    extents: Vec<slates_archive::Extent>,
+    chunks: Vec<slates_archive::Chunk>,
+  ) -> slates_archive::Archive {
+    let size = slates_archive::manifest::tiled_length(&extents).unwrap();
+    slates_archive::Archive {
+      base_page_size: 4096,
+      chunk_min: 4096,
+      chunk_max: 65_536,
+      created_unix: 0,
+      volume_id: 0,
+      snapshot_id: 0,
+      name_policy_id: 0,
+      unicode_version: 0,
+      root_meta: slates_archive::NodeMeta {
+        mode: 0o040755,
+        ..Default::default()
+      },
+      manifest: slates_archive::Node::Directory(vec![slates_archive::Entry {
+        name: "f".to_owned(),
+        meta: slates_archive::NodeMeta {
+          mode: 0o100644,
+          size,
+          nlink: 1,
+          ..Default::default()
+        },
+        node: slates_archive::Node::File(extents),
+      }]),
+      chunks,
+    }
+  }
+
+  /// AUD-29-13, AUD-29-14 (through the successor's own materialization path): do: take over a volume whose
+  /// archived file is a 4 KiB hole then 4 bytes of data, and one whose file is a gibibyte hole under a 1 MiB
+  /// bound; expect the first served with the data at its file offset (zeros before it), and the second
+  /// refused `BudgetExceeded` before any reconstruction, with no volume published under its name.
+  #[test]
+  fn a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused() {
+    crate::daemon::audit_on_shard(|state| {
+      let data = slates_archive::Archive::raw_chunk(b"DATA".to_vec());
+      let sparse = takeover_archive(
+        vec![
+          slates_archive::Extent {
+            offset: 0,
+            len: 4096,
+            chunk: [0u8; 32],
+            chunk_offset: 0,
+          },
+          slates_archive::Extent {
+            offset: 4096,
+            len: 4,
+            chunk: data.identity,
+            chunk_offset: 0,
+          },
+        ],
+        vec![data],
+      );
+      let id = slates_db::catalog::VolumeId { bytes: [0x51; 16] };
+      super::materialize_taken_over(
+        state,
+        id,
+        &takeover_head("successor", 1 << 20),
+        1,
+        Vec::new(),
+        &sparse,
+      )
+      .unwrap();
+      let handle = *state.by_id.get(&id).unwrap();
+      let slot = state.volumes.get(handle).unwrap();
+      let inode = slot.volume.resolve(&state.store, "f").unwrap().inode;
+      let mut bytes = vec![0xffu8; 4100];
+      let read = slot
+        .volume
+        .read(&state.store, inode, 0, &mut bytes)
+        .unwrap();
+      assert_eq!(read, 4100);
+      assert!(
+        bytes[..4096].iter().all(|byte| *byte == 0),
+        "the hole reads as zeros"
+      );
+      assert_eq!(&bytes[4096..], b"DATA", "the data sits at its file offset");
+
+      let gibibyte = 1u64 << 30;
+      let oversized = takeover_archive(
+        vec![slates_archive::Extent {
+          offset: 0,
+          len: gibibyte,
+          chunk: [0u8; 32],
+          chunk_offset: 0,
+        }],
+        Vec::new(),
+      );
+      let other = slates_db::catalog::VolumeId { bytes: [0x52; 16] };
+      let refusal = super::materialize_taken_over(
+        state,
+        other,
+        &takeover_head("too-big", 1 << 20),
+        1,
+        Vec::new(),
+        &oversized,
+      )
+      .unwrap_err();
+      assert!(
+        matches!(
+          *refusal,
+          super::ReplyBody::Refused {
+            refusal: Refusal::BudgetExceeded { .. }
+          }
+        ),
+        "{refusal:?}"
+      );
+      assert!(!state.by_id.contains_key(&other), "nothing was published");
+    });
+  }
+
   /// AC-5.2 / A-26: takeover reconstructs linked IPC names as one inode, including archived owners.
   #[test]
   fn archive_restore_preserves_ipc_hardlinks() {
@@ -7219,6 +7358,7 @@ mod tests {
           mode: 0o040755,
           ..Default::default()
         },
+        chunks_decoded: 0,
       };
       super::populate_restored(&mut state.store, &mut slot.volume, &restored).unwrap();
       let first = slot.volume.resolve(&state.store, "pipe").unwrap().inode;

@@ -3711,6 +3711,42 @@ rest restores. Insufficient memory to hold a compressed copy: Refused before wor
 **Derived constants.** All from the profile and per-volume observations; the only fixed rule is
 the format floor.
 
+> **Status (2026-09-30, AUD-29-13, AUD-29-14, AUD-29-15).** An archive is admitted before it is
+> decoded or reconstructed, and only its canonical form decodes.
+> - **Chunks.** A chunk's declared raw length is at most the header's `chunk_max`, and `chunk_max` is at most
+>   the format's cap: `CHUNK_PAGES` (16, the content store's chunk rule) × the largest supported base page
+>   (64 KiB), which is 1 MiB. A raw chunk's raw length is its payload's; an encoded chunk is smaller than its
+>   raw bytes; no chunk is empty; the header's byte totals are its chunks' sums. All of it is checked before
+>   decompression, so a small stream cannot demand a large allocation.
+> - **Manifest.** Decoding is exact: no trailing bytes. Every name is one valid component (not empty, `.`
+>   or `..`, no `/`, `\` or NUL, at most 255 bytes). A directory's names strictly increase, so there are no
+>   repeats. A file's extents tile it from offset zero with no gap, overlap or empty extent, and its recorded
+>   size is their length. No path is deeper than `MAX_DEPTH` (`PATH_MAX / 2`, 2,048 components). A declared
+>   count is bounded by what the remaining bytes could encode, and the walk is iterative.
+> - **Restore.** Restore plans the tree without reading a chunk, re-checking the same rules for trees built
+>   in memory. It refuses `OverBudget` before allocating when every file's length plus one chunk's decode
+>   space passes the caller's budget. It allocates fallibly and decodes each chunk once for every extent
+>   that names it (`Restored::chunks_decoded`).
+> - **Callers' budgets.**
+>   - A takeover successor restores within the volume's bound (or dynamic maximum) and the shard's
+>     admittable bytes. Over it, the takeover is refused `BudgetExceeded` with nothing published.
+>   - A holder reads merge inputs within the bytes its hold admitted.
+>   - Merge inputs archives are cut into page-sized chunks, the maximum they declare.
+> - **Evidence.**
+>   - A terabyte hole and a 256-fold repeated compressed chunk are refused one byte under their need; the
+>     repeated chunk restores with one decode.
+>   - Maximal and past-maximum raw lengths, lying raw lengths and empty chunks are refused typed.
+>   - Trailing bytes, bad names, repeats, unsorted names, bad tilings, size mismatches and a tree one level
+>     past the bound are refused typed. The bound itself encodes, decodes and restores on a test thread's
+>     stack.
+>   - A successor serves a hole-then-data file at its offsets and refuses a gibibyte hole under a 1 MiB bound
+>     (`docs/bugs/2026-09-30-archive-decoding-and-restore-trusted-declared-sizes-and-layout.md`).
+> - **Still owed.**
+>   - Restore's output is dense (AUD-29-57).
+>   - A volume deeper than `MAX_DEPTH` exports an archive no reader accepts. The tree type's recursive
+>     encode, identity and drop need iterative forms, and a depth bound derived from memory rather than
+>     `PATH_MAX`, before the bound can rise to what the VFS holds (GAPS, AUD-29-13–16 row).
+
 ### 4.12 Agent surfaces (D-19)
 
 > **Correction (2026-09-17, CLI process gate).** `run` and `exec` accept global flags before

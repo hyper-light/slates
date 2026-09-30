@@ -41,6 +41,21 @@ pub mod flag {
   pub const KNOWN: u32 = COMPRESSED_MANIFEST | DICTIONARIES | SEEK_TABLE;
 }
 
+/// Format: how many base pages one chunk spans at most — the chunk rule (§4.5 derived constants: sixteen
+/// base pages until the p90 sealed size is measured). The content store derives its chunk size from it
+/// (`slates_vfs::content::chunk_bytes`), so a reader's cap and a writer's chunks cannot drift apart.
+pub const CHUNK_PAGES: u64 = 16;
+
+/// Format: the largest base page any supported target uses — 64 KiB (Linux arm64 and ppc64 64K-page
+/// kernels; x86-64 uses 4 KiB and Apple arm64 16 KiB) [B: the kernels' page-size configurations].
+pub const MAX_BASE_PAGE_BYTES: u64 = 64 * 1024;
+
+/// The most raw bytes one chunk may hold, whatever an archive's header declares (AUD-29-13): a reader
+/// decodes no chunk past it, so a small stream cannot demand a large decompression.
+/// Derived: [`CHUNK_PAGES`] × [`MAX_BASE_PAGE_BYTES`] = 1 MiB — the largest chunk any supported writer
+/// produces.
+pub const MAX_CHUNK_BYTES: u64 = CHUNK_PAGES * MAX_BASE_PAGE_BYTES;
+
 /// How a chunk's payload is stored. Only [`Encoding::Raw`] is produced today; `Lz4` and `Zstd`
 /// are the codec pass (Phase 7 task 3, owed), and the field reserves their wire values so an
 /// archive written later stays readable.
@@ -129,6 +144,37 @@ pub enum ArchiveError {
   },
   /// A manifest extent names a chunk the archive does not hold (a malformed archive).
   MissingChunk,
+  /// The header declares a maximum chunk size past the format's cap ([`MAX_CHUNK_BYTES`]).
+  ChunkMaxTooLarge {
+    /// The declared maximum.
+    found: u32,
+  },
+  /// A chunk declares more raw bytes than the archive's maximum chunk size or the format's cap.
+  ChunkTooLarge {
+    /// The chunk's position in the archive.
+    index: u64,
+  },
+  /// A chunk's record is not in the canonical form: an empty chunk, a raw chunk whose declared raw
+  /// length is not its payload's, or an encoded chunk no smaller than its raw bytes.
+  NonCanonicalChunk {
+    /// The chunk's position in the archive.
+    index: u64,
+  },
+  /// The header's raw or stored byte totals are not the sums of its chunks'.
+  TotalsMismatch,
+  /// A file's extents do not tile it exactly, or its recorded size is not the length they tile.
+  BadExtents,
+  /// A directory entry's name is not one valid path component.
+  BadName,
+  /// Two entries restore to one path.
+  DuplicatePath,
+  /// Restoring needs more bytes than the caller admitted, refused before any allocation.
+  OverBudget {
+    /// The bytes the restore needs: every file's length and one chunk's decode space.
+    needed: u64,
+    /// The bytes the caller admitted.
+    budget: u64,
+  },
 }
 
 impl core::fmt::Display for ArchiveError {
@@ -146,6 +192,24 @@ impl core::fmt::Display for ArchiveError {
       Self::BadLength => f.write_str("archive declares a length past its end"),
       Self::BadPayload { index } => write!(f, "chunk {index} has an undecodable payload"),
       Self::MissingChunk => f.write_str("a manifest extent names a chunk not in the archive"),
+      Self::ChunkMaxTooLarge { found } => {
+        write!(
+          f,
+          "archive declares a {found}-byte chunk maximum, past the format's cap"
+        )
+      }
+      Self::ChunkTooLarge { index } => write!(f, "chunk {index} is larger than the chunk maximum"),
+      Self::NonCanonicalChunk { index } => write!(f, "chunk {index} is not in canonical form"),
+      Self::TotalsMismatch => f.write_str("archive byte totals do not match its chunks"),
+      Self::BadExtents => f.write_str("a file's extents do not tile it exactly"),
+      Self::BadName => f.write_str("a directory entry's name is not one path component"),
+      Self::DuplicatePath => f.write_str("two entries restore to one path"),
+      Self::OverBudget { needed, budget } => {
+        write!(
+          f,
+          "restoring needs {needed} bytes, past the {budget} admitted"
+        )
+      }
     }
   }
 }
