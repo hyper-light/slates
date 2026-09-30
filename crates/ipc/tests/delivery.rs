@@ -225,13 +225,29 @@ fn a_stale_take_leaves_this_processs_own_pipe_alone(stale_name: &str) -> bool {
   use std::os::fd::AsRawFd;
   let number: i32 = stale_name.split(':').next().unwrap().parse().unwrap();
   let (read_end, write_end) = rustix::pipe::pipe().unwrap();
-  let placed = rustix::io::fcntl_dupfd_cloexec(&read_end, number).unwrap();
+  // The pipe takes the two lowest free numbers, which can include the one the take freed: a process with a
+  // single free number below it hands the pipe that one and this one (CI's macOS runner, 2026-09-29: the
+  // pipe took 3 and 4, and the read end was then placed at 5, not the stale 4). The end that took it moves
+  // off first, so the read end is placed at exactly that number.
+  let write_end = if write_end.as_raw_fd() == number {
+    let moved = rustix::io::fcntl_dupfd_cloexec(&write_end, number.saturating_add(1)).unwrap();
+    drop(write_end);
+    moved
+  } else {
+    write_end
+  };
+  let placed = if read_end.as_raw_fd() == number {
+    read_end
+  } else {
+    let placed = rustix::io::fcntl_dupfd_cloexec(&read_end, number).unwrap();
+    drop(read_end);
+    placed
+  };
   assert_eq!(
     placed.as_raw_fd(),
     number,
     "the number the take closed is the lowest free one at or above itself"
   );
-  drop(read_end);
   assert_eq!(rustix::io::write(&write_end, PROBE).unwrap(), PROBE.len());
   let before = rustix::fs::fstat(&placed).unwrap();
   let status_before = rustix::fs::fcntl_getfl(&placed).unwrap();

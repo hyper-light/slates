@@ -2844,6 +2844,16 @@ This is the 2026-09-28 doorbell fix's sibling, which that sweep missed.
   - The macOS and Windows bridges nudge while the client is armed and a reply waits.
 - **Open:** the SDK job's steps have no timeout, so a hang holds a macOS runner for GitHub's 6 h default.
 
+### 2026-09-29: the delivery test places its own pipe exactly at the stale number
+
+The macOS runner failed `bc81da4`'s `slates-ipc` `delivery` test: the consumer child's check put its own
+pipe at "the lowest free number at or above" the stale delivery number (4), but the pipe itself had taken
+the two lowest free numbers, 3 and 4, so the read end landed at 5. The check assumed the pipe could not
+include the stale number, which holds only when no single free number sits below it. The failure was
+reproduced here by filling the low numbers until one was free below the stale 6 (the pipe then took 5 and
+6, and the read end landed at 7). Whichever pipe end took the number now moves off it first, so the read end
+is placed there exactly. Every stale-take check is unchanged and passes under that reproduction.
+
 ### 2026-09-29: fleet test polls hold their clients
 
 The macOS runner's `a_takeover_completes_when_one_survivor_never_received_the_head` failed at `afeed36`
