@@ -329,6 +329,32 @@ struct Levels {
   waiting: Vec<Vec<u8>>,
 }
 
+/// Format: RFC 9000 §8.1 — before a peer's address is validated a server sends at most three times the bytes
+/// it has received from it, so a spoofed source cannot turn it into an amplifier (AUD-29-49).
+const AMPLIFICATION_FACTOR: u64 = 3;
+
+/// A server's anti-amplification account for a peer whose address is not yet validated (RFC 9000 §8.1): the
+/// bytes received from it and sent to it. Validation — a sealed handshake fragment from the peer that opens,
+/// which it could only seal after processing this end's flight — ends the account.
+#[derive(Clone, Copy, Debug, Default)]
+struct Amplification {
+  received: u64,
+  sent: u64,
+}
+
+impl Amplification {
+  /// Whether `bytes` more may be sent; if so, they are counted as sent.
+  fn allow(&mut self, bytes: usize) -> bool {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let allowance = self.received.saturating_mul(AMPLIFICATION_FACTOR);
+    if self.sent.saturating_add(bytes) > allowance {
+      return false;
+    }
+    self.sent = self.sent.saturating_add(bytes);
+    true
+  }
+}
+
 /// How an endpoint reaches the wire: its own socket (one socket, one peer — a dialing client, or a
 /// server told its peer), or a socket shared with other sessions through a demultiplexer, which routes
 /// each received datagram to this session's inbox by connection id (`crate::demux`). Sends go straight
@@ -384,6 +410,18 @@ pub struct Endpoint {
   pending_flight: Flight,
   /// The Handshake level's keys, streams and waiting fragments (AUD-29-47).
   levels: Levels,
+  /// A server's anti-amplification account until its peer's address is validated; `None` for a client and
+  /// once validated (AUD-29-49).
+  amplification: Option<Amplification>,
+  /// Where the next resend of the current flight starts among its fragments: a flight the allowance cut
+  /// short resumes past what it sent, so a long flight's later fragments are reached, not its first ones
+  /// again and again.
+  flight_cursor: usize,
+  /// When this end last answered a raw handshake datagram on an established session: at most one answer per
+  /// probe timeout, so repeated raw traffic cannot draw unbounded final flights or confirmations.
+  raw_answered_at: Option<u64>,
+  /// Times a flight stopped at the amplification allowance (a non-vacuity counter for the limit).
+  amplification_holds: u64,
   /// Reassembles the peer's handshake flights from their fragments (`crate::flight`): a flight larger
   /// than one path-floor datagram arrives as several, so this holds the pieces until the whole flight is
   /// present before it is fed to the TLS state. Kept across `establish` calls, as `pending_flight` is, so
@@ -455,6 +493,10 @@ impl Endpoint {
       final_flight: Flight::default(),
       pending_flight: Flight::default(),
       levels: Levels::default(),
+      amplification: None,
+      flight_cursor: 0,
+      raw_answered_at: None,
+      amplification_holds: 0,
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
       hs_sent: 0,
@@ -493,6 +535,10 @@ impl Endpoint {
       final_flight: Flight::default(),
       pending_flight: Flight::default(),
       levels: Levels::default(),
+      amplification: Some(Amplification::default()),
+      flight_cursor: 0,
+      raw_answered_at: None,
+      amplification_holds: 0,
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
       hs_sent: 0,
@@ -533,6 +579,10 @@ impl Endpoint {
       final_flight: Flight::default(),
       pending_flight: Flight::default(),
       levels: Levels::default(),
+      amplification: Some(Amplification::default()),
+      flight_cursor: 0,
+      raw_answered_at: None,
+      amplification_holds: 0,
       reassembler: crate::flight::Reassembler::new(),
       fragments_sent: 0,
       hs_sent: 0,
@@ -789,7 +839,7 @@ impl Endpoint {
     loop {
       let period = backoff.min(self.handshake_probe_ceiling());
       match self.recv_within(period).await? {
-        Some((datagram, _from)) => match self.place(datagram) {
+        Some((datagram, from)) => match self.receive_handshake(datagram, from) {
           // A whole flight this end has not consumed: feed it to `read_hs` below.
           crate::flight::Reassembly::Flight(flight) => return Ok(flight),
           // A fragment that does not yet complete a flight is progress — the peer is alive and
@@ -1046,6 +1096,23 @@ impl Endpoint {
     }
   }
 
+  /// Takes one handshake datagram received from `from`: a server counts what an unvalidated peer sent toward
+  /// what it may send back (RFC 9000 §8.1), then the datagram is placed.
+  fn receive_handshake(
+    &mut self,
+    datagram: Vec<u8>,
+    from: SocketAddrV4,
+  ) -> crate::flight::Reassembly {
+    if from == self.peer
+      && let Some(account) = self.amplification.as_mut()
+    {
+      account.received = account
+        .received
+        .saturating_add(u64::try_from(datagram.len()).unwrap_or(u64::MAX));
+    }
+    self.place(datagram)
+  }
+
   /// Places one received handshake datagram: a plain fragment into the Initial-level stream; a sealed one,
   /// opened under the Handshake keys, into the Handshake-level stream — or kept until the keys arrive
   /// (bounded; a fragment past the bound is dropped as malformed, and the peer's retransmit brings it
@@ -1066,7 +1133,12 @@ impl Endpoint {
       return crate::flight::Reassembly::Pending;
     };
     match crate::flight::open(&datagram, keys.remote.packet.as_ref()) {
-      Some(plain) => self.levels.reassembler.push(&plain),
+      Some(plain) => {
+        // A peer that sealed under the Handshake keys processed this end's flight: its address is
+        // validated, and the amplification limit ends (RFC 9000 §8.1).
+        self.amplification = None;
+        self.levels.reassembler.push(&plain)
+      }
       None => crate::flight::Reassembly::Malformed,
     }
   }
@@ -1081,6 +1153,7 @@ impl Endpoint {
         self.discarded = self.discarded.saturating_add(1);
         continue;
       };
+      self.amplification = None;
       if let crate::flight::Reassembly::Flight(flight) = self.levels.reassembler.push(&plain) {
         completed = Some(flight);
       }
@@ -1096,6 +1169,7 @@ impl Endpoint {
   /// leaves and before the stream advances.
   fn send_new_flight(&mut self, flight: &Flight) -> Result<(), EndpointError> {
     let (initial, sealed) = (self.hs_sent, self.levels.sent);
+    self.flight_cursor = 0;
     self.send_flight_at(flight, initial, sealed)?;
     self.hs_sent = self.hs_sent.saturating_add(flight.initial.len());
     self.levels.sent = self.levels.sent.saturating_add(flight.handshake.len());
@@ -1144,10 +1218,35 @@ impl Endpoint {
       })?;
       fragments.extend(sealed);
     }
-    for fragment in &fragments {
+    // A client pads its Initial-level datagrams to the path floor, so a server's allowance — three times
+    // what it received — covers its reply (RFC 9000 §8.1).
+    if self.quic.is_client() {
+      for fragment in fragments
+        .iter_mut()
+        .filter(|fragment| crate::flight::is_fragment(fragment))
+      {
+        crate::flight::pad(fragment, MIN_DATAGRAM_BYTES);
+      }
+    }
+    // Sent from the cursor round the flight: a server before validation stops where its allowance does, and
+    // its next resend — drawn by the peer's next datagram, which grows the allowance — continues from there.
+    let count = fragments.len();
+    for offset in 0..count {
+      let index = self.flight_cursor.saturating_add(offset) % count.max(1);
+      let Some(fragment) = fragments.get(index) else {
+        continue;
+      };
+      if let Some(account) = self.amplification.as_mut()
+        && !account.allow(fragment.len())
+      {
+        self.flight_cursor = index;
+        self.amplification_holds = self.amplification_holds.saturating_add(1);
+        return Ok(());
+      }
       self.send(fragment)?;
       self.fragments_sent = self.fragments_sent.saturating_add(1);
     }
+    self.flight_cursor = 0;
     Ok(())
   }
 
@@ -1155,6 +1254,12 @@ impl Endpoint {
   /// flight asserts this passed one).
   pub fn fragments_sent(&self) -> u64 {
     self.fragments_sent
+  }
+
+  /// Times a flight stopped at the anti-amplification allowance (RFC 9000 §8.1): a server's non-vacuity
+  /// counter for the limit.
+  pub fn amplification_holds(&self) -> u64 {
+    self.amplification_holds
   }
 
   /// Caps the 1-RTT keys' usage below the AEAD's own limits (RFC 9001 §6.6): at most `packets` sealed per key
@@ -1251,6 +1356,16 @@ impl Endpoint {
   fn fold_or_discard(&mut self, datagram: &[u8]) -> Result<(), EndpointError> {
     if !is_short_header(datagram) {
       self.discarded = self.discarded.saturating_add(1);
+      // At most one answer per probe timeout: repeated raw traffic — a peer's retransmits, or a flood from
+      // its address — cannot draw unbounded final flights or confirmations (AUD-29-49).
+      let now = now_ns();
+      if self
+        .raw_answered_at
+        .is_some_and(|at| now.saturating_sub(at) < self.handshake_probe_ceiling())
+      {
+        return Ok(());
+      }
+      self.raw_answered_at = Some(now);
       if self.quic.is_client() {
         if !self.final_flight.is_empty() {
           let flight = self.final_flight.clone();
@@ -1872,6 +1987,69 @@ mod tests {
       }
     }
     (client_keys.unwrap(), server_keys.unwrap())
+  }
+
+  /// AUD-29-49: do: a client holding its final flight receives fifty raw handshake datagrams at one instant,
+  /// then one more a probe timeout later; expect exactly one answer (its final flight, one fragment) for the
+  /// fifty and a second for the late one — repeated raw traffic cannot draw unbounded answers.
+  #[test]
+  fn raw_datagrams_draw_one_answer_per_probe_timeout() {
+    use rustix::net::Ipv4Addr;
+    let mut runtime = slates_rt::sim::SimRuntime::new(
+      &slates_rt::runtime::RuntimeConfig {
+        shards: 1,
+        tasks_per_shard: 8,
+        timers_per_shard: 8,
+        ring_entries: 8,
+        step_budget_ns: 1_000_000_000,
+        timer_tick_ns: 100_000,
+        batch: 8,
+        pin: false,
+        cores: Vec::new(),
+        page_bytes: 4096,
+        spin_ns: 0,
+        wake_tracking: None,
+      },
+      19,
+    )
+    .unwrap();
+    let shard = runtime.shard_ids()[0];
+    let (sent, received) = std::sync::mpsc::sync_channel(1);
+    runtime
+      .spawn_on(shard, async move {
+        let identity = self_signed("slates-node");
+        let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = Endpoint::client(
+          socket,
+          peer.local_addr().unwrap(),
+          &identity,
+          &identity.certificate(),
+          "slates-node",
+          crate::connection::ConnectionShape::for_frame_cap(
+            MAX_PACKET_PAYLOAD,
+            crate::connection::initial_receive_window(MAX_PACKET_PAYLOAD),
+          ),
+        )
+        .unwrap();
+        client.final_flight = Flight {
+          initial: vec![1; 10],
+          handshake: Vec::new(),
+        };
+        let raw = crate::flight::fragment(&[2; 10], 0).unwrap().remove(0);
+        for _ in 0..50 {
+          client.fold_or_discard(&raw).unwrap();
+        }
+        let burst = client.fragments_sent();
+        slates_rt::futures::sleep(client.handshake_probe_ceiling())
+          .await
+          .unwrap();
+        client.fold_or_discard(&raw).unwrap();
+        let _ = sent.send((burst, client.fragments_sent()));
+      })
+      .unwrap();
+    runtime.run_until_idle();
+    assert_eq!(received.recv().unwrap(), (1, 2));
   }
 
   /// T-0.3, §4.10a bounded handshakes; AUD-18: after TLS finishes, a peer sends only invalid

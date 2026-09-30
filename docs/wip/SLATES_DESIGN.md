@@ -3590,6 +3590,20 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 
 > **Status (2026-09-13).** The hedge, the healer and the cost model are built to the derived-constants
 
+> **Status (2026-09-30, AUD-29-49).** A server never amplifies toward an unvalidated address (RFC 9000 §8.1).
+> - **The allowance.** Before the peer's address is validated, a server sends at most three times the bytes
+>   it received from it.
+> - **Validation.** The first sealed handshake fragment from the peer that opens validates it, because only
+>   a peer that processed this end's flight holds those keys.
+> - **Padding.** A client pads its Initial-level datagrams to the path floor, so the allowance covers a
+>   reply. Fragments carry an explicit payload length, so padding is never read as flight bytes.
+> - **Resuming a cut-short flight.** A flight the allowance stops resumes from a cursor at the next
+>   retransmit, so a flight larger than one allowance still completes.
+> - **Established sessions.** Raw handshake datagrams draw at most one answer per probe timeout.
+> - **Evidence.** A silent source drew 2,499 bytes for its 1,200, against 120,351 without the limit, and a
+>   talking client completed a wide-certificate flight past the allowance
+>   (`docs/bugs/2026-09-30-a-server-answered-any-hello-with-its-whole-flight.md`).
+>
 > **Status (2026-09-30, AUD-29-48).** 1-RTT keys update, and their use is bounded (RFC 9001 §6, §6.6).
 > - **Generations.** A session seals at most a generation's confidentiality limit, which is the AEAD's own
 >   or an operator's smaller cap (`Endpoint::cap_key_usage`). Then it moves to the next generation from the

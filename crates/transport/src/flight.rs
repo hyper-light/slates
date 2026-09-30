@@ -21,7 +21,10 @@
 //! harmless: before this a fragment was placed by its offset *within* a flight alone, so a late
 //! fragment of flight N with the same length as flight N + 1 would have written into N + 1's buffer.
 //!
-//! **Framing.** A fragment is `[tag][start: u16 LE][within: u16 LE][total: u16 LE][payload…]`. The tag
+//! **Framing.** A fragment is `[tag][start: u16 LE][within: u16 LE][total: u16 LE][len: u16 LE][payload…]`,
+//! and bytes past the `len`-byte payload are padding: a client pads its Initial-level datagrams to the
+//! path floor ([`pad`]) so a server's anti-amplification allowance — three times what it received from an
+//! unvalidated address (RFC 9000 §8.1; AUD-29-49) — covers its reply. The tag
 //! is [`FRAGMENT_TAG`], chosen with the QUIC fixed bit (`0x40`) **clear** so the demultiplexer and the
 //! endpoint still route it as a handshake datagram, not a 1-RTT packet
 //! ([`crate::endpoint::is_short_header`] stays the discriminator), and distinct from any TLS 1.3
@@ -60,9 +63,12 @@ const AT_START: usize = 1;
 const AT_WITHIN: usize = AT_START + 2;
 /// Format: the offset of the flight's total length (`u16` LE): after the position.
 const AT_TOTAL: usize = AT_WITHIN + 2;
+/// Format: the offset of the payload's length (`u16` LE): after the total. Bytes past the payload are padding.
+const AT_LEN: usize = AT_TOTAL + 2;
 /// Format: the fragment header — the tag, the flight's stream start (`u16` LE), the fragment's offset
-/// within the flight (`u16` LE), the flight's total length (`u16` LE); the payload follows.
-pub const FRAGMENT_HEADER: usize = AT_TOTAL + 2;
+/// within the flight (`u16` LE), the flight's total length (`u16` LE), the payload's length (`u16` LE); the
+/// payload follows, then any padding.
+pub const FRAGMENT_HEADER: usize = AT_LEN + 2;
 
 /// Derived: the most flight bytes one fragment carries — the path-floor datagram less the header, so a
 /// fragment never needs IP fragmentation. Anchored to [`MIN_DATAGRAM_BYTES`].
@@ -124,6 +130,7 @@ fn fragment_within(flight: &[u8], start: usize, payload: usize) -> Option<Vec<Ve
     datagram.extend_from_slice(&start_word.to_le_bytes());
     datagram.extend_from_slice(&u16::try_from(within).ok()?.to_le_bytes());
     datagram.extend_from_slice(&total_word.to_le_bytes());
+    datagram.extend_from_slice(&u16::try_from(end - within).ok()?.to_le_bytes());
     datagram.extend_from_slice(flight.get(within..end)?);
     out.push(datagram);
     within = end;
@@ -321,12 +328,22 @@ fn parse(datagram: &[u8]) -> Option<(usize, usize, usize, &[u8])> {
     let pair: [u8; 2] = pair.try_into().ok()?;
     Some(usize::from(u16::from_le_bytes(pair)))
   };
+  let len = word(AT_LEN)?;
   Some((
     word(AT_START)?,
     word(AT_WITHIN)?,
     word(AT_TOTAL)?,
-    datagram.get(FRAGMENT_HEADER..)?,
+    datagram.get(FRAGMENT_HEADER..FRAGMENT_HEADER.checked_add(len)?)?,
   ))
+}
+
+/// Pads a plain fragment with zeros to `to` bytes (a no-op for one already that long): what a client does to
+/// its Initial-level datagrams, so the server's anti-amplification allowance covers its reply (RFC 9000 §8.1).
+/// The fragment's `len` field bounds its payload, so the padding is never read as flight bytes.
+pub fn pad(datagram: &mut Vec<u8>, to: usize) {
+  if datagram.len() < to {
+    datagram.resize(to, 0);
+  }
 }
 
 #[cfg(test)]
