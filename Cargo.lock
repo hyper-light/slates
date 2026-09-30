@@ -1540,12 +1540,14 @@ dependencies = [
 name = "slates-cluster"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "rcgen",
  "rustix",
  "rustls",
  "slates-archive",
  "slates-db",
  "slates-rt",
+ "slates-test-seeds",
  "slates-transport",
  "slates-wire",
 ]

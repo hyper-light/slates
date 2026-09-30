@@ -1402,3 +1402,231 @@ mod tests {
     assert_eq!(hold.unauthorized(), 3);
   }
 }
+
+/// The content hold's manifest-to-chunk ownership oracle (AUD-29-44; AC-7.3, AC-8.12): generated histories
+/// of puts — any object, any manifest, any subset of a chunk pool shipped (referenced chunks, unreferenced
+/// ones, or none), retries included — and forgets, run against a serial model that knows only which object
+/// holds which manifests. After every step the hold must agree: every manifest the model holds is held and
+/// reconstructible to exactly its referenced chunks, nothing the model does not hold is, the store keeps
+/// exactly the chunks some held manifest references (no orphan, no premature eviction), and a refused put
+/// changes nothing.
+#[cfg(test)]
+mod ownership_oracle {
+  use std::collections::{BTreeMap, BTreeSet};
+
+  use proptest::prelude::*;
+  use slates_archive::{Entry, Extent, NodeMeta};
+
+  use super::*;
+
+  /// Shape: the chunk pool the manifests draw from.
+  const POOL: usize = 5;
+  /// Shape: each manifest's referenced chunks — overlapping, so manifests share chunks within an object
+  /// and across objects.
+  const MANIFESTS: [&[usize]; 4] = [&[0, 1], &[1, 2], &[2, 3, 4], &[0, 4]];
+  /// Shape: the objects the history places content for.
+  const OBJECTS: u64 = 2;
+
+  fn pool() -> Vec<Chunk> {
+    (0..POOL)
+      .map(|at| {
+        let seed = u8::try_from(at).unwrap();
+        Archive::raw_chunk(vec![seed; 8 + at])
+      })
+      .collect()
+  }
+
+  /// Manifest `index` with `shipped` of the pool attached (by pool index).
+  fn archive(index: usize, shipped: &BTreeSet<usize>) -> Archive {
+    let pool = pool();
+    let entries = MANIFESTS[index]
+      .iter()
+      .map(|&at| {
+        let chunk = &pool[at];
+        Entry {
+          name: format!("c{at}"),
+          meta: NodeMeta {
+            size: chunk.raw_len,
+            ..NodeMeta::default()
+          },
+          node: Node::File(vec![Extent {
+            offset: 0,
+            len: chunk.raw_len,
+            chunk: chunk.identity,
+            chunk_offset: 0,
+          }]),
+        }
+      })
+      .collect();
+    Archive {
+      base_page_size: 4096,
+      chunk_min: 4096,
+      chunk_max: 4096,
+      created_unix: 1,
+      volume_id: 5,
+      snapshot_id: 6,
+      name_policy_id: 0,
+      unicode_version: 0,
+      root_meta: NodeMeta::default(),
+      manifest: Node::Directory(entries),
+      chunks: shipped.iter().map(|&at| pool[at].clone()).collect(),
+    }
+  }
+
+  fn identity(index: usize) -> [u8; 32] {
+    archive(index, &BTreeSet::new()).manifest_identity()
+  }
+
+  fn object(at: u64) -> ObjectId {
+    ObjectId::new(HostId(1), at)
+  }
+
+  #[derive(Clone, Debug)]
+  enum Step {
+    Put {
+      object: u64,
+      manifest: usize,
+      shipped: BTreeSet<usize>,
+    },
+    Forget {
+      object: u64,
+      manifest: usize,
+    },
+  }
+
+  fn step() -> impl Strategy<Value = Step> {
+    prop_oneof![
+      3 => (0..OBJECTS, 0..MANIFESTS.len(), proptest::collection::btree_set(0..POOL, 0..=POOL))
+        .prop_map(|(object, manifest, shipped)| Step::Put { object, manifest, shipped }),
+      1 => (0..OBJECTS, 0..MANIFESTS.len())
+        .prop_map(|(object, manifest)| Step::Forget { object, manifest }),
+    ]
+  }
+
+  /// Applies `step` to the model: whether a put succeeds is decided by the rule — every referenced chunk
+  /// shipped now or referenced by a manifest the object already holds; a held manifest's retry succeeds.
+  fn model_apply(model: &mut BTreeMap<u64, BTreeSet<usize>>, step: &Step) -> bool {
+    match step {
+      Step::Put {
+        object,
+        manifest,
+        shipped,
+      } => {
+        let held = model.entry(*object).or_default();
+        if held.contains(manifest) {
+          return true;
+        }
+        let have: BTreeSet<usize> = held
+          .iter()
+          .flat_map(|m| MANIFESTS[*m].iter().copied())
+          .collect();
+        let whole = MANIFESTS[*manifest]
+          .iter()
+          .all(|chunk| shipped.contains(chunk) || have.contains(chunk));
+        if whole {
+          held.insert(*manifest);
+        }
+        whole
+      }
+      Step::Forget { object, manifest } => model.entry(*object).or_default().remove(manifest),
+    }
+  }
+
+  fn check(hold: &ContentHold, model: &BTreeMap<u64, BTreeSet<usize>>) {
+    let pool = pool();
+    let mut referenced = BTreeSet::new();
+    for at in 0..OBJECTS {
+      let held = model.get(&at).cloned().unwrap_or_default();
+      for index in 0..MANIFESTS.len() {
+        let id = identity(index);
+        if held.contains(&index) {
+          let archive = hold
+            .archive_of(object(at), &id)
+            .expect("a held manifest is reconstructible");
+          let chunks: BTreeSet<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
+          let expected: BTreeSet<[u8; 32]> =
+            MANIFESTS[index].iter().map(|&c| pool[c].identity).collect();
+          assert_eq!(chunks, expected, "object {at} manifest {index}");
+          referenced.extend(MANIFESTS[index].iter().copied());
+        } else {
+          assert!(
+            !hold.holds_manifest(object(at), &id),
+            "object {at} manifest {index}"
+          );
+        }
+      }
+    }
+    let manifests: usize = model.values().map(BTreeSet::len).sum();
+    assert_eq!(hold.manifest_count(), manifests);
+    assert_eq!(
+      hold.chunk_count(),
+      referenced.len(),
+      "the store keeps exactly the chunks a held manifest references"
+    );
+  }
+
+  /// AUD-29-44's three witnesses, as the audit ran them: do: (1) put one manifest twice and forget it once,
+  /// (2) hold manifest 0, hold manifest 1 — which shares chunk 1 — without shipping chunk 1, then forget 0,
+  /// (3) ship an unreferenced chunk with a manifest and forget the manifest; expect (1) no chunk retained, (2)
+  /// manifest 1 still reconstructible with chunk 1 kept, (3) no chunk orphaned.
+  #[test]
+  fn the_audits_three_ownership_witnesses_hold() {
+    let a = object(0);
+    let mut hold = ContentHold::new();
+    let all: BTreeSet<usize> = MANIFESTS[0].iter().copied().collect();
+    hold.hold(a, archive(0, &all)).unwrap();
+    hold.hold(a, archive(0, &all)).unwrap();
+    hold.forget_manifest(a, &identity(0));
+    assert_eq!(
+      (hold.manifest_count(), hold.chunk_count()),
+      (0, 0),
+      "(1) nothing retained"
+    );
+
+    let mut hold = ContentHold::new();
+    hold.hold(a, archive(0, &all)).unwrap();
+    hold
+      .hold(a, archive(1, &BTreeSet::from([2])))
+      .expect("chunk 1 is already held for the object");
+    hold.forget_manifest(a, &identity(0));
+    let kept = hold
+      .archive_of(a, &identity(1))
+      .expect("(2) manifest 1 is still whole");
+    assert_eq!(kept.chunks.len(), 2);
+
+    let mut hold = ContentHold::new();
+    let with_extra: BTreeSet<usize> = MANIFESTS[0].iter().copied().chain([3]).collect();
+    hold.hold(a, archive(0, &with_extra)).unwrap();
+    assert_eq!(
+      hold.chunk_count(),
+      2,
+      "the unreferenced chunk was never kept"
+    );
+    hold.forget_manifest(a, &identity(0));
+    assert_eq!(hold.chunk_count(), 0, "(3) nothing orphaned");
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+    /// AUD-29-44: do: run a generated history of puts and forgets on a hold and on the serial model; expect
+    /// them to agree after every step (see the module doc).
+    #[test]
+    fn the_hold_owns_exactly_what_its_manifests_reference(steps in proptest::collection::vec(step(), 1..40)) {
+      let mut hold = ContentHold::new();
+      let mut model: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
+      for step in &steps {
+        let expected = model_apply(&mut model, step);
+        let got = match step {
+          Step::Put { object: at, manifest, shipped } => {
+            hold.hold(object(*at), archive(*manifest, shipped)).is_ok()
+          }
+          Step::Forget { object: at, manifest } => {
+            hold.forget_manifest(object(*at), &identity(*manifest))
+          }
+        };
+        prop_assert_eq!(got, expected, "{:?}", step);
+        check(&hold, &model);
+      }
+    }
+  }
+}

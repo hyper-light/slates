@@ -26,6 +26,9 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 # the UDP address types (via rustix::net, as the transport uses) for binding sim sockets in tests.
 rustix = { workspace = true }
+# the content hold's manifest-ownership oracle over generated histories (AUD-29-44).
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
 
 [lints]
 workspace = true
