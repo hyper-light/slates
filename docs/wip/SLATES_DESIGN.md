@@ -969,6 +969,14 @@ checked and refuse before mutation.
 > buddy's granule is a power of two, and the validated path costs fewer instructions than the unvalidated
 > one did (`docs/bugs/2026-09-30-the-buddy-allocator-accepted-a-forged-free.md`; BENCHMARKS "Validated
 > frees").
+>
+> **Status (2026-09-30, AUD-29-11).** No generation wraps or is masked. A slab's generation limit is the
+> narrowest representation its handles are packed into: the runtime's task arena uses the wake word's 24
+> bits, `Encoded::MAX_GENERATION`. A slot freed at the limit retires, is never reissued, and has no live
+> generation. A slab with no slot left because of retirement refuses `GenerationExhausted`. The wake word
+> refuses to pack a generation it cannot carry and compares exactly. A registry shard slot whose arena
+> generations or own slot word are spent is never claimed again
+> (`docs/bugs/2026-09-30-generation-wrap-revived-stale-handles.md`).
 
 Before admitting content, the server prepares and locks the memory that will back it and its
 metadata. This includes rings, logs, parse buffers, decompression, copies, archive construction,
