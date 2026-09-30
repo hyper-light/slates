@@ -535,7 +535,13 @@ impl Bridge for VolumeBridge<'_> {
         .with_host(host)
         .open_base(self.store, InodeNo(object.inode))?;
     }
-    self.open_handle(object.inode, cx.attachment.key())
+    let handle = self.open_handle(object.inode, cx.attachment.key())?;
+    // The open pins the file it opened: a base file replaced on the disk meanwhile keeps serving this
+    // handle what it opened (POSIX), released at `release` or the attachment's teardown sweep.
+    self
+      .volume
+      .open_for(InodeNo(object.inode), cx.attachment.key());
+    Ok(handle)
   }
 
   fn read(
@@ -754,6 +760,7 @@ impl Bridge for VolumeBridge<'_> {
     // for reuse. An unknown or already-freed handle is a no-op (the kernel may release one the
     // bridge already dropped).
     if let Ok(inode) = self.handles.get(unpack_handle(fh)).copied() {
+      self.volume.close_for(InodeNo(inode), cx.attachment.key());
       let _ = self
         .volume
         .forget_for(self.store, InodeNo(inode), cx.attachment.key(), 1);

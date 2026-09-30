@@ -370,7 +370,7 @@ pub struct StaleBaseEntries {
 
 /// Entries a fresh listing lacks (by name) and unwitnessed files it still lists with their
 /// fingerprints.
-type Stale = (Vec<String>, Vec<(InodeNo, Fingerprint)>);
+type Stale = (Vec<String>, Vec<(InodeNo, Fingerprint, String)>);
 
 /// Which copy-up a mutation needs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1058,8 +1058,16 @@ impl Overlay<'_> {
   /// entry shows the live disk, so one the disk no longer has leaves the node, and one the
   /// disk changed drops its descriptor and takes the listing's attributes.
   fn prune_unloaded(&mut self, store: &mut Store, dir: Handle<DirNode>) -> Result<(), VfsError> {
-    let (gone, changed) = self.stale_entries(store, dir)?;
-    for (no, fp) in changed {
+    let (mut gone, changed) = self.stale_entries(store, dir)?;
+    for (no, fp, name) in changed {
+      // An open file whose name now names another file keeps the file it opened (POSIX): its inode leaves
+      // the name, held by its references and its descriptor, and the name serves the new file as a new
+      // inode on its next lookup. Until 2026-09-30 the open inode took the new file's fingerprint and
+      // descriptor, and the opener read bytes it never opened.
+      if self.vol.is_open(no) && self.names_another_file(no, fp) {
+        gone.push(name);
+        continue;
+      }
       self.refresh_unloaded(store, no, fp)?;
     }
     for name in gone {
@@ -1083,7 +1091,7 @@ impl Overlay<'_> {
       let listed = listed_entry(entries, policy, e.name);
       match (listed, e.child) {
         (Some(l), Child::File(no)) if l.kind == HostKind::File && self.unloaded_file(store, no) => {
-          changed.push((no, l.fingerprint));
+          changed.push((no, l.fingerprint, e.name.to_owned()));
         }
         (Some(_), _) => {}
         (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
@@ -1104,6 +1112,23 @@ impl Overlay<'_> {
       }
     }
     Ok((gone, changed))
+  }
+
+  /// Whether the descriptor inode `no` holds names a file other than `fp`'s (the listed name was replaced
+  /// on the disk); `false` when it holds none — then nothing opened is kept.
+  fn names_another_file(&mut self, no: InodeNo, fp: Fingerprint) -> bool {
+    let Some(held) = self
+      .vol
+      .base
+      .as_ref()
+      .and_then(|plane| plane.descriptors.get(&no).copied())
+    else {
+      return false;
+    };
+    self
+      .host
+      .fstat(held)
+      .is_ok_and(|now| now.dev != fp.dev || now.ino != fp.ino)
   }
 
   /// Whether an inode is an untouched base entry (unwitnessed, base-backed or a base symlink,

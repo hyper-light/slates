@@ -272,6 +272,12 @@ pub struct Volume {
   /// attachment"). Bounded by (attachments × referenced inodes); empty for a volume no one holds
   /// open.
   pub(crate) attachment_refs: BTreeMap<u64, BTreeMap<InodeNo, u32>>,
+  /// Per attachment, the open handles it holds per inode ([`Volume::open_for`]) — a subset of its
+  /// references (an open also takes one), kept so a teardown sweep releases its opens with them.
+  pub(crate) attachment_opens: BTreeMap<u64, BTreeMap<InodeNo, u32>>,
+  /// The open handles per inode, over every attachment: an open base file keeps the file it opened when
+  /// the disk's name comes to name another file ([`Volume::is_open`]; POSIX open-file semantics).
+  pub(crate) opens: BTreeMap<InodeNo, u32>,
   /// Inodes that have left the namespace (`nlink == 0`) while still referenced, awaiting
   /// reclamation at their last `unreference`, each with the retention bytes the unlink secured for
   /// its content (§4.2: charged when the name went, because the last close cannot refuse; consumed
@@ -460,6 +466,8 @@ impl Volume {
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
+      attachment_opens: BTreeMap::new(),
+      opens: BTreeMap::new(),
       orphans: BTreeMap::new(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
@@ -525,6 +533,8 @@ impl Volume {
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
+      attachment_opens: BTreeMap::new(),
+      opens: BTreeMap::new(),
       orphans: BTreeMap::new(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
@@ -591,6 +601,8 @@ impl Volume {
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
       attachment_refs: BTreeMap::new(),
+      attachment_opens: BTreeMap::new(),
+      opens: BTreeMap::new(),
       orphans: BTreeMap::new(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
@@ -3519,6 +3531,13 @@ impl Volume {
   /// guarantee at unmount (§3). The batch is bounded by the owner's referenced inodes; the
   /// cooperative slicing of a very large sweep is owed (like the other bounded-work sites).
   pub fn sweep_attachment(&mut self, store: &mut Store, attachment: u64) -> Result<(), VfsError> {
+    for (no, count) in self
+      .attachment_opens
+      .remove(&attachment)
+      .unwrap_or_default()
+    {
+      self.unpin_open(no, count);
+    }
     let Some(owned) = self.attachment_refs.remove(&attachment) else {
       return Ok(());
     };
@@ -3529,6 +3548,55 @@ impl Volume {
       self.unreference_n(store, no, u64::from(count))?;
     }
     Ok(())
+  }
+
+  /// Records an open handle of `attachment` on inode `no` (the transport's open, which also took a
+  /// reference): while any handle is open, a base file keeps serving the file it opened when the disk's
+  /// name is replaced by another ([`Volume::is_open`]). Bounded by the transport's handle table.
+  pub fn open_for(&mut self, no: InodeNo, attachment: u64) {
+    let owned = self
+      .attachment_opens
+      .entry(attachment)
+      .or_default()
+      .entry(no)
+      .or_insert(0);
+    *owned = owned.saturating_add(1);
+    let global = self.opens.entry(no).or_insert(0);
+    *global = global.saturating_add(1);
+  }
+
+  /// Releases one open handle of `attachment` on inode `no` ([`Volume::open_for`]); an unknown one is a
+  /// no-op (a transport may release a handle it already dropped).
+  pub fn close_for(&mut self, no: InodeNo, attachment: u64) {
+    let Some(inodes) = self.attachment_opens.get_mut(&attachment) else {
+      return;
+    };
+    let Some(count) = inodes.get_mut(&no) else {
+      return;
+    };
+    *count = count.saturating_sub(1);
+    if *count == 0 {
+      inodes.remove(&no);
+    }
+    if inodes.is_empty() {
+      self.attachment_opens.remove(&attachment);
+    }
+    self.unpin_open(no, 1);
+  }
+
+  /// Whether any handle holds inode `no` open.
+  pub fn is_open(&self, no: InodeNo) -> bool {
+    self.opens.get(&no).is_some_and(|count| *count > 0)
+  }
+
+  /// Drops `count` from the global open count of `no`.
+  fn unpin_open(&mut self, no: InodeNo, count: u32) {
+    if let Some(global) = self.opens.get_mut(&no) {
+      *global = global.saturating_sub(count);
+      if *global == 0 {
+        self.opens.remove(&no);
+      }
+    }
   }
 
   /// Debits `drop` from `attachment`'s ledger entry for inode `no`, removing the entry at zero and

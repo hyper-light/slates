@@ -711,3 +711,60 @@ fn unlink_of_an_open_base_file_keeps_its_bytes_across_a_relisting_directory() {
     "the disk is untouched"
   );
 }
+
+/// POSIX open-file semantics over a live base (§4.5, §4.6 "Base files"): do: open an untouched base file,
+/// let an outsider replace it on disk with a new file (a new inode, as a save-by-rename does), then look
+/// the name up again and read both; expect the name to serve the new file (a new inode number) while the
+/// open handle still reads the file it opened, and that file reclaimed once the handle is released. Until
+/// 2026-09-30 a relist rebound the open inode to the new file, so the opener read bytes it never opened.
+#[test]
+fn an_open_base_file_replaced_on_disk_keeps_serving_the_opener_what_it_opened() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"old");
+  let mut f = Fixture::over(host);
+  let root = f.root();
+  let opened = f.lookup(root, "f").unwrap();
+  let fh = f.bridge(|b, cx| b.open(oid(opened), cx, 0).unwrap());
+  f.host.advance_ns(SETTLED_NS);
+  f.host.replace_file("/f", b"the new file");
+  f.host.advance_ns(SETTLED_NS);
+  let named = f.lookup(root, "f").unwrap();
+  assert_ne!(named, opened, "the name now names another file");
+  assert_eq!(f.read(named).unwrap(), b"the new file");
+  assert_eq!(
+    f.read(opened).unwrap(),
+    b"old",
+    "the open handle reads the file it opened"
+  );
+  f.bridge(|b, cx| b.release(oid(opened), cx, fh).unwrap());
+  assert!(
+    f.bridge(|b, cx| b.getattr(oid(opened), cx)).is_err(),
+    "the replaced file is reclaimed once released"
+  );
+  assert_eq!(f.read(named).unwrap(), b"the new file");
+}
+
+/// The same replacement with the mount torn down instead of released (§3 the teardown sweep): do: open a
+/// base file, replace it on the disk, then sweep the attachment; expect the opened file reclaimed and the
+/// name serving the new file — a mount lost without its releases leaves no pin behind.
+#[test]
+fn a_teardown_sweep_releases_the_opens_a_lost_mount_held() {
+  let mut host = SimHost::new();
+  host.replace_file("/f", b"old");
+  let mut f = Fixture::over(host);
+  let root = f.root();
+  let opened = f.lookup(root, "f").unwrap();
+  let _fh = f.bridge(|b, cx| b.open(oid(opened), cx, 0).unwrap());
+  f.host.advance_ns(SETTLED_NS);
+  f.host.replace_file("/f", b"the new file");
+  f.host.advance_ns(SETTLED_NS);
+  let named = f.lookup(root, "f").unwrap();
+  assert_ne!(named, opened);
+  f.bridge(|b, cx| b.sweep_attachment(cx).unwrap());
+  assert!(
+    f.bridge(|b, cx| b.getattr(oid(opened), cx)).is_err(),
+    "the swept open no longer holds the replaced file"
+  );
+  let named = f.lookup(root, "f").unwrap();
+  assert_eq!(f.read(named).unwrap(), b"the new file");
+}

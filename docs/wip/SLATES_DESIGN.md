@@ -1738,7 +1738,10 @@ the verdict that every entry beneath still matches its listing fingerprint.
 >   volume an overlay records `Op::VolumeRebased` and publishes the content image, so a restart serves
 >   it over its base
 >   (`docs/bugs/2026-09-30-a-landing-used-its-own-host-for-the-volumes-base-and-recorded-no-rebase.md`).
-> - **Owed.** A file replaced on disk while open is still served its new bytes after a relist (open pins).
+> - **Open pins.** The bridge records each open (`Volume::open_for`, released at `release` and at the
+>   attachment's teardown sweep). A relist that finds an open inode's name naming another file detaches the
+>   inode, which keeps serving the opener what it opened, and the name serves the new file as a new inode
+>   (`docs/bugs/2026-09-30-an-open-base-file-replaced-on-disk-served-the-new-file.md`).
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
 
