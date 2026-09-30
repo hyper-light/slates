@@ -46,8 +46,8 @@ use slates_vfs::inode::{Fingerprint, Witness};
 use slates_vfs::volume::{Store, Volume};
 
 use crate::grant::{
-  GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLeaseHeld, Leases,
-  TargetIdentity,
+  GrantBinding, GrantId, GrantRecord, GrantRefusal, GrantScope, Grants, LandingLease,
+  LandingLeaseHeld, TargetIdentity, lease_key,
 };
 use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary, plan};
 use crate::ramp::{Ramp, StepSample};
@@ -124,6 +124,9 @@ pub enum SkipReason {
   ParentMissing,
   /// The grant expired or was revoked before this entry started.
   GrantEnded,
+  /// The landing lease's term ended before this entry started: a holder paused past its term never writes
+  /// on after another may hold the target (AUD-29-03).
+  LeaseEnded,
 }
 
 /// What happened to one entry.
@@ -321,6 +324,10 @@ pub enum LandingRefusal {
   Grant(GrantRefusal),
   /// Another session holds the landing lease on the target.
   LeaseHeld(LandingLeaseHeld),
+  /// A granted landing came without a live landing lease on this target's canonical identity (the caller
+  /// takes it from the target's one host-local owner before the engine runs; AUD-29-03): nothing was
+  /// written.
+  LeaseRequired,
   /// At least one entry's verdict is a conflict; nothing was written.
   Conflict(Vec<EntryReport>),
   /// The target could not be read.
@@ -423,8 +430,6 @@ pub struct LandingTarget {
 pub struct LandingRequest {
   /// The landing's id (hidden siblings carry it).
   pub landing_id: u64,
-  /// The session holding the lease.
-  pub holder: u64,
   /// The consumer landing: its exact principal identity (the server's principal key), which a grant binds.
   pub consumer: Box<[u8]>,
   /// The volume landed, by its id.
@@ -437,8 +442,6 @@ pub struct LandingRequest {
   pub filter: Filter,
   /// Now, monotonic ns.
   pub now_ns: u64,
-  /// Derived: the lease term, the caller's landing-duration p99 × k (§4.15).
-  pub lease_term_ns: u64,
   /// Whether the grant asked for media durability.
   pub media_durability: bool,
   /// Derived: the large-class boundary a scratch volume's new base uses (`BaseConfig`).
@@ -542,6 +545,8 @@ struct WriteContext<'x, H: LandFs> {
   vol: &'x mut Volume,
   store: &'x mut Store,
   grant: Option<&'x GrantRecord>,
+  /// The landing lease every entry is fenced by.
+  lease: &'x LandingLease,
   observer: &'x mut dyn Observer<H>,
   audit: &'x mut Audit,
 }
@@ -849,10 +854,12 @@ impl<H: LandFs> Landing<'_, H> {
       vol,
       store,
       grant,
+      lease,
       observer,
       audit,
     } = cx;
     let grant = *grant;
+    let lease = *lease;
     let started = Instant::now();
     let mut class = None;
     let mut step_started = Instant::now();
@@ -879,12 +886,15 @@ impl<H: LandFs> Landing<'_, H> {
       let entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
       let outcome = match report.verdict {
         Some(Verdict::Apply) => {
-          if grant_ended(
-            grant,
-            self.request.now_ns.saturating_add(elapsed_ns(started)),
-          ) {
+          let now_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
+          if grant_ended(grant, now_ns) {
             Written {
               outcome: Outcome::Skipped(SkipReason::GrantEnded),
+              window_ns: None,
+            }
+          } else if lease.expires_ns <= now_ns {
+            Written {
+              outcome: Outcome::Skipped(SkipReason::LeaseEnded),
               window_ns: None,
             }
           } else {
@@ -2158,7 +2168,7 @@ pub fn land<H: LandFs>(
   vol: &mut Volume,
   store: &mut Store,
   grants: &mut Grants,
-  leases: &mut Leases,
+  lease: Option<&LandingLease>,
   audit: &mut Audit,
   request: &LandingRequest,
   observer: &mut dyn Observer<H>,
@@ -2189,19 +2199,20 @@ pub fn land<H: LandFs>(
     }
     Err(e) => return Err(LandingRefusal::Grant(e)),
   };
-  // Lease.
-  let lease = leases
-    .take(
-      &target.key,
-      request.holder,
-      request.now_ns,
-      request.lease_term_ns,
-    )
-    .map_err(LandingRefusal::LeaseHeld)?;
+  // Lease (AUD-29-03): the caller took the landing lease on the target's canonical identity from the
+  // target's one host-local owner; it must name this target and still be live, and every entry is fenced by
+  // its term. The engine neither takes nor releases it.
+  let lease = match lease {
+    Some(held)
+      if held.target.as_ref() == lease_key(&binding.target) && held.expires_ns > request.now_ns =>
+    {
+      held
+    }
+    _ => return Err(LandingRefusal::LeaseRequired),
+  };
   let result = land_under_lease(
-    host, target, vol, store, audit, request, &manifest, &grant, observer,
+    host, target, vol, store, audit, request, &manifest, &grant, lease, observer,
   );
-  leases.release(&lease);
   if let Ok(report) = &result
     && matches!(report.state, LandingState::Done | LandingState::Partial)
     && grant.scope == GrantScope::Once
@@ -2280,7 +2291,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
 }
 
 /// Everything after the lease: validate, sweep, write inside the target, sync, advance.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // land's own inputs, the manifest and grant it checked, and its lease
 fn land_under_lease<H: LandFs>(
   host: &mut H,
   target: &LandingTarget,
@@ -2290,6 +2301,7 @@ fn land_under_lease<H: LandFs>(
   request: &LandingRequest,
   manifest: &Manifest,
   grant: &GrantRecord,
+  lease: &LandingLease,
   observer: &mut dyn Observer<H>,
 ) -> Result<LandingReport, LandingRefusal> {
   let caps = host
@@ -2331,6 +2343,7 @@ fn land_under_lease<H: LandFs>(
       vol,
       store,
       grant: Some(grant),
+      lease,
       observer,
       audit,
     },

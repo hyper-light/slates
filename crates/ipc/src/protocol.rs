@@ -836,6 +836,13 @@ pub struct ShardReport {
   pub landings_awaiting: u64,
   /// The bound on `landings_awaiting`: the daemon's client seats (one pending presentation per seat).
   pub landings_awaiting_bound: u64,
+  /// Granted landings running here as owned tasks (§4.15 "Ownership facts"; AUD-29-03): each ends — landed,
+  /// refused or failed — with its reply, so it returns to zero; the shard's task arena bounds it.
+  pub landings_in_flight: u64,
+  /// Target landing leases recorded on this shard (§4.15 step 4; AUD-29-03): live on the control shard, the
+  /// one owner of the host's target leases, zero on the others. A landing releases its lease before its
+  /// reply, and a take releases every lease whose term has ended, so it returns to zero.
+  pub target_leases: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1958,6 +1965,9 @@ pub enum Refusal {
   /// was allocated and nothing was recorded. Retry once one is granted and landed or its client has gone
   /// (AUD-29-07). Appended for append-only evolution.
   LandingsAwaitingFull,
+  /// A granted landing's target lease ended before the landing could start — its term passed while it
+  /// waited — so nothing was written; retry (AUD-29-03). Appended for append-only evolution.
+  LandingLeaseLost,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

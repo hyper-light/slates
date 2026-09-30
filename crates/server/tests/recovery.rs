@@ -973,6 +973,143 @@ fn present_landing(
   }
 }
 
+// ----------------------------------------------------------- target landing leases across a restart
+
+/// Shape: the long lease of the restart test — a minute, far past the test.
+const MINUTE_LEASE_NS: u64 = 60_000_000_000;
+/// Shape: the attempt the restart test's leases stand for: no landing attempt of the daemon's is numbered
+/// this high (its counters start at one under a sixteen-bit partition).
+const OTHER_ATTEMPT: u64 = u64::MAX;
+/// Shape: the pause between the restart test's reads of the clock while it waits out a lease's term.
+const LEASE_POLL: Duration = Duration::from_millis(10);
+
+/// A landing granted for the session: its volume (a fresh one named `name`), snapshot, target and grant.
+type SessionLanding = (VolumeId, SnapshotId, String, u64);
+
+/// Grants, for the session, the landing of a fresh volume named `name` into `target`.
+fn session_landing(
+  client: &mut Client,
+  secret: &[u8; 32],
+  name: &str,
+  target: &str,
+) -> SessionLanding {
+  let volume = client.create(&scratch(name)).unwrap();
+  let snapshot = client.snapshot(volume).unwrap();
+  let grant = approve(
+    client,
+    secret,
+    volume,
+    snapshot,
+    target,
+    slates_ipc::protocol::GrantScope::Session,
+  );
+  (volume, snapshot, target.to_owned(), grant)
+}
+
+/// Lands `landing` under its grant.
+fn land_granted(
+  client: &mut Client,
+  landing: &SessionLanding,
+) -> Result<slates_client::Landing, ClientError> {
+  let (volume, snapshot, target, grant) = landing;
+  client.land(
+    *volume,
+    Some(*snapshot),
+    target,
+    Filter::default(),
+    Some(*grant),
+  )
+}
+
+/// Waits until the host's monotonic clock has passed `expires_ns`.
+fn wait_past(expires_ns: u64) {
+  while slates_machine::clock::monotonic_ns() <= expires_ns {
+    // The harness paces its wait for a term to end; shipped code parks on its driver (D-9).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(LEASE_POLL);
+  }
+}
+
+/// The target leases the daemon records, over every shard.
+fn target_leases(client: &mut Client) -> u64 {
+  client
+    .daemon_status()
+    .unwrap()
+    .shards
+    .iter()
+    .map(|shard| shard.target_leases)
+    .sum()
+}
+
+/// AUD-29-03 (§4.15 step 4 and "Ownership facts"; §4.8 recovery — restart and cancellation): a target lease
+/// is a durable record of the control partition, so it outlives the daemon that took it — an attempt its
+/// daemon's end cancels leaves its lease to its term — and a recovered lease blocks landings until that term
+/// ends, and not after. Do: under a first daemon, grant for the session the landings of two volumes into two
+/// targets, then take each target's lease for another attempt — the first for a minute, the second for the
+/// recovery budget — and stop the daemon; under a second daemon over the same segment, land both, the second
+/// once its lease's term has passed. Expect: the first landing is refused `LandingLeaseHeld` naming that
+/// attempt, with its target empty; the second lands; and the minute lease is the only record left — the
+/// landing released its own and its take released the ended one.
+#[test]
+fn a_target_lease_outlives_its_daemon_and_blocks_landings_until_its_term() {
+  use common::lease::{hold, lease_key_of};
+  let profile = common::machine_profile();
+  let instance = format!("srv-leaserst-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("leaserst", &profile, &config);
+  let blocked = common::target::target_dir();
+  let freed = common::target::target_dir();
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let secret = first.segment().issuer_secret().unwrap();
+  let mut client = connect(&instance);
+  let into_blocked = session_landing(&mut client, &secret, "blocked", &blocked.path);
+  let into_freed = session_landing(&mut client, &secret, "freed", &freed.path);
+  hold(
+    &first,
+    &lease_key_of(&blocked.path),
+    OTHER_ATTEMPT,
+    MINUTE_LEASE_NS,
+  )
+  .unwrap();
+  let ending = hold(
+    &first,
+    &lease_key_of(&freed.path),
+    OTHER_ATTEMPT,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .unwrap();
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let refused = land_granted(&mut client, &into_blocked);
+  assert!(
+    matches!(
+      refused,
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::LandingLeaseHeld {
+          holder: OTHER_ATTEMPT
+        }
+      ))
+    ),
+    "the lease taken before the restart holds the target after it: {refused:?}"
+  );
+  assert_eq!(std::fs::read_dir(&blocked.path).unwrap().count(), 0);
+  wait_past(ending.expires_ns);
+  let landed = land_granted(&mut client, &into_freed);
+  assert!(
+    matches!(landed, Ok(slates_client::Landing::Landed(_))),
+    "a recovered lease past its term blocks nothing: {landed:?}"
+  );
+  assert_eq!(target_leases(&mut client), 1, "the minute lease alone");
+  second.stop();
+  drop((blocked, freed));
+  drop(segment);
+}
+
 // ------------------------------------------------ clone pins and destroy completion across a restart
 
 /// The partition that owns `volume` (`slates_server::verbs::owner_of` over its id's bytes).

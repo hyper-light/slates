@@ -2,6 +2,9 @@
 //! compiles this module afresh, so a helper one test does not use is dead code there — allowed here.
 #![allow(dead_code)]
 
+// The landing lease's holds go through the Unix landing plane (the daemon lands nothing on Windows yet).
+#[cfg(unix)]
+pub(crate) mod lease;
 pub(crate) mod nfs;
 pub(crate) mod target;
 pub(crate) mod trace;

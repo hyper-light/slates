@@ -465,14 +465,17 @@ pub struct GrantRecord {
   pub target_inode: u64,
 }
 
-/// The landing lease on a canonical target.
+/// The landing lease on a canonical target: one record per target, kept by the control partition (§4.15
+/// "Ownership facts"; AUD-29-03).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LandingLeaseRecord {
-  /// The target.
+  /// The target: its canonical identity's key (`slates_land::grant::lease_key`, the directory's device and
+  /// inode), so every alias of one directory names one record.
   pub target: String,
-  /// The holder (a session).
+  /// The holder: the landing attempt that took it.
   pub holder: u64,
-  /// The fencing generation.
+  /// The fencing generation: the take's log sequence on the control partition, so it only grows — across
+  /// releases, which remove the record, and restarts.
   pub generation: u64,
   /// Expires at, monotonic ns.
   pub expires_ns: u64,

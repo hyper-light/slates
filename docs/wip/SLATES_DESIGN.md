@@ -1323,8 +1323,9 @@ witnessed and pinned entries keep serving. Drift under a witnessed entry: Degrad
 planes `BaseUnavailable{path, errno}`, `BaseDrift{entries}`, `TargetNotOwned{path}`,
 `TargetIsVolume{path}`, `EscapesTarget{path}`, `GrantRequired{request_id, manifest_hash}`,
 `GrantMismatch{expected, got}`, `GrantExpired`, `GrantRefused`, `Conflict{entries}`, `TargetInUse{path}`,
-`LandingLeaseHeld{holder, generation}`, `LandingPartial{manifest, failures}`, `Forbidden{verb}`,
-`GrantChannelRefused{channel}` (A-8), and for the merge
+`LandingLeaseHeld{holder}`, `LandingLeaseLost` (the lease ended before the landing started; A-47),
+`LandingPartial{manifest, failures}`, `Forbidden{verb}`, `GrantChannelRefused{channel}` (A-8), and for
+the merge
 plane `ReadOnlyVolume`, `NotGreen`, `NotWork`, `UnknownBase{green, version}`,
 `MergeConflict{windows}`, `IncrementTooLarge{limit}`, `EvidenceRequired`,
 `DuplicateIncrement{original}` (informational), and for the fleet `StaleEpoch{current}` (a
@@ -3935,7 +3936,8 @@ struct LandingEntry { path: PathKey, kind: EntryKind, action: Action /* Create |
                       outcome: Option<Outcome> /* Written | Skipped{reason} | Failed{errno} | Conflict{class} | Undone */ }
 enum Verdict { Apply, Skip /* disk already holds it */, AcceptIdentical, Conflict(ConflictClass) }
 enum ConflictClass { ModifyModify, ModifyDelete, DeleteModify, RenameRename, CreateCreate, TypeChanged, TargetInUse }
-struct LandingLease { target: CanonicalTarget, holder: SessionId, generation: u64, expires: Monotonic }
+struct LandingLease { target: CanonicalTarget /* device and inode */, holder: AttemptId /* one landing attempt (A-47) */,
+                      generation: u64 /* the take's log sequence on the control partition */, expires: Monotonic }
 struct AuditRecord { seq: u64, at: Monotonic, kind: AuditKind /* GrantIssued | GrantRevoked | LandingPlanned | LandingValidated | EntryWritten | EntryRefused | LandingFinished */,
                      grant: Option<GrantId>, landing: Option<RequestId>, manifest: Option<Blake3>, outcome: Option<LandingState> }
 ```
@@ -3943,7 +3945,11 @@ Ownership facts: a landing request belongs to the owner shard of the snapshot's 
 as one of its tasks; the manifest lives in that shard's arena; grants, landing leases and the
 audit log are database records (§4.8) written through the control shard; the target directory
 descriptor is opened by the landing task and closed at its terminal step; nothing in this plane
-is shared across shards.
+is shared across shards. The landing lease is the control partition's record under the target's
+canonical identity (the opened directory's device and inode), so every spelling of one directory
+and every owner shard meet one lease; the landing task asks for it by a bounded message, and a
+granted landing's task takes it before the engine starts, commits the landing's records with the
+request's completion, releases it, and only then replies (A-47).
 
 **State machines.** Grant: `Issued → Consumed` (a landing bound to its manifest finished, for a
 single-use grant) | `Issued → Expired` (its term, or the session ended, for a session grant) |
@@ -3981,8 +3987,11 @@ entry either old or new, never torn).
    same target for the session but each landing still presents its manifest, and any conflict
    still refuses. The server refuses grant creation on the ring and MCP channels.
 4. *Lease and validate.* Take the landing lease on the canonical target (refuse
-   `LandingLeaseHeld` if another session holds it); open the target directory descriptor with
-   containment (Linux `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` for every component;
+   `LandingLeaseHeld` while any other landing attempt holds it — another session's, or another of
+   the same session's; A-47), and start each entry only while the lease's term runs: an entry that
+   would start after it is `Skipped(LeaseEnded)` and the landing `Partial`; open the target
+   directory descriptor with containment (Linux `openat2` with
+   `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` for every component;
    `O_NOFOLLOW` chains on macOS; reparse-tag checks on Windows), refuse `EscapesTarget`,
    `TargetNotOwned`, `TargetIsVolume`; then for every entry compute the verdict from three
    inputs: the witnessed base (absent for a scratch volume or a created entry), the disk now
@@ -4110,7 +4119,12 @@ exchange): that entry is exchanged back and recorded `Conflict(TargetInUse)`; th
 continues; the report is `Partial`. An outsider's entry moved aside by a removal and then shut out
 of its own name by a later outsider edit: Degraded (`Kept`, the entry kept beside its name and
 listed in the report). Sharing violation on Windows: same. Lease held by another
-session: Refused (`LandingLeaseHeld{holder, generation}`). Target escapes, not owned, or inside a
+attempt: Refused (`LandingLeaseHeld{holder}`), nothing written. Lease ended before the landing
+started (its wait for the lease outlasted the term): Refused (`LandingLeaseLost`), nothing written.
+Lease ended mid-landing (a holder paused past its term): the current entry finishes, no further
+entry starts (`Skipped(LeaseEnded)`), `Partial`; the resume takes a new lease. The landing's daemon
+ends mid-landing (a crash, a cancellation): the lease is a durable record and holds the target
+until its term (A-47). Target escapes, not owned, or inside a
 slates mount: Refused before the lease is taken. Exchange unsupported on the filesystem: Degraded
 (the fallback, with the window the name was absent reported). Crash mid-landing: Degraded (old-or-new per entry; resume by
 hash; hidden siblings swept). Power loss after the report: Masked (data and directory syncs
@@ -4168,6 +4182,25 @@ stays in the overlay.
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
 > holding only what the manifest creates beneath it; a rename whose destination holds the
 > witnessed directory), so the re-run is idempotent for directories as it is for files.
+
+> **Status (2026-09-29, A-47, AUD-29-03).** One host target has one landing lease, whichever shard owns
+> the landing volume and whichever spelling names the target. Before, each owner shard kept its own lease
+> table keyed by the target's path, the engine never fenced by the term, no path wrote the durable
+> records, and a holder was a session that could take its own unexpired lease again — so two volumes on
+> two shards, or two spellings of one directory, landed into it at once, a paused holder was not stopped by
+> its term, and a restart forgot every lease. Now the lease is the control partition's durable record under
+> the target's device and inode, its generation the take's log sequence; a granted landing runs as an owned
+> task that takes it before the engine, fences every entry by its term, commits its records with the
+> request's completion, releases it and then replies, and a retry joins the running landing. A take past
+> its caller's deadline takes nothing, a lost answer is compensated by a release keyed to the attempt, and a
+> take releases the leases whose terms have ended. Proven by use: two red histories on the old engine (a
+> lease held in another shard's table, and under another spelling, each landed `Done`); the engine's
+> live-lease and paused-holder histories; four control-shard tests; a daemon test where two shards'
+> volumes, one through macOS's firmlinked spelling, are refused naming the one holder and then both land;
+> and a restart test where a lease taken under the first daemon refuses a landing under the second until
+> its term. The term is still the failover bound with no keepalive (the measured term and its renewal come
+> with the sliced engine, AUD-29-25), and the record is not yet written to the host's candidate holders.
+> Record: `docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md`.
 
 > **Status (2026-09-29, A-46, AUD-29-07).** A presented landing is consumed by the landing its grant
 > covers, replaced by its client's re-presentation, abandoned with its client, and bounded per shard. Before,
@@ -6996,4 +7029,45 @@ state change; `config.rs`: `landings_awaiting_per_shard`; `reap.rs`: abandonment
   audit log and the id counter unchanged.
 - What it does not change: the grant's own lifecycle (its states, its term) and the grant verb; durable
   presentation records written before this change; the unpruned grant table (its own gap).
+
+### A-47 — One host target has one landing lease, owned by the control partition and fenced by its term (2026-09-29)
+Applied in the same change to: §4.15 (the data model, "Ownership facts", step 4, the failure matrix, its
+status), §4.4 (the refusal taxonomy), `slates-land` (`grant.rs`: `lease_key`; `engine.rs`: the caller's
+lease, `LeaseRequired`, `SkipReason::LeaseEnded`, the per-entry fence; `LandingRequest` without `holder` and
+`lease_term_ns`), `slates-db` (`partition.rs`: a take refused while the lease is unexpired whoever asks, a
+generation that must grow, `landing_leases`; `catalog.rs`: the record's fields), `slates-server`
+(`landing.rs`: `take_target_lease`, `release_target_lease`, the owned granted-landing task, `join_in_flight`;
+`verbs.rs`: the joins, the status counts, the refusal's name), `slates-ipc` (`Refusal::LandingLeaseLost`;
+`ShardReport`'s `landings_in_flight` and `target_leases`), the CLI and MCP (their renderings), the tests,
+and GAPS.
+- Why: each owner shard kept its own lease table keyed by the target's path, so two volumes on two shards,
+  or two spellings of one directory, landed into it at once; the engine never fenced by the term; no path
+  wrote the durable records; and the holder was a session that could take its own unexpired lease again
+  (AUD-29-03; `docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md`).
+- The rule:
+  - The lease is the control partition's durable record under the target's canonical identity: the opened
+    directory's device and inode. Every spelling of the directory and every owner shard meet one lease.
+  - A take is refused `LandingLeaseHeld`, naming the holder, while the lease is unexpired — whoever asks.
+    The holder is one landing attempt; a renewal is its own operation, not a second take.
+  - The generation is the take's log sequence on the control partition, so it only grows, across releases
+    and restarts.
+  - A granted landing runs as an owned task on its volume's owner shard: it takes the lease by a bounded
+    message to the control shard, reads its id and clock, runs the engine under the lease, commits the
+    landing's records with the request's completion, releases the lease, then replies. A retry of the
+    request joins it.
+  - The engine writes only under a live lease on its own target, refused `LeaseRequired` (the reply's
+    `LandingLeaseLost`) otherwise, and starts no entry after the term (`Skipped(LeaseEnded)`, `Partial`).
+  - A take that arrives after its caller's deadline takes nothing, a take whose answer is lost is
+    compensated by a release keyed to the attempt, and every take first releases the leases whose terms
+    have ended, so the records never outnumber the leases live at the last take.
+  - A presentation takes no lease.
+- Evidence: on `c5b47cb`'s engine a lease held in another shard's table, and one held under another
+  spelling of the directory, each let a granted landing through to `Done`. Now the engine refuses without a
+  live lease on its own target and fences a paused holder; the control shard holds one holder until release
+  or term; a daemon refuses two shards' volumes (one through the firmlinked spelling) naming the one holder,
+  and then lands both with nothing left; and a lease taken under one daemon refuses a landing under the
+  next until its term.
+- What it does not change: the landing plan, verdicts and write classes; presentations and grants; the
+  term (still the failover bound, until the measured term and its keepalive arrive with the sliced engine,
+  AUD-29-25); the fleet register of the lease record (still owed).
 

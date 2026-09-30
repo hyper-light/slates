@@ -323,6 +323,10 @@ human saw, the scope and the term — which the daemon recomputes before issuing
 not verify (a forged, replayed or modified-plan approval) is refused `GrantIssuerUnverified` and
 counted; the MCP server and the SDKs carry no proof by construction and are refused by kind.
 Passing `--grant N` to `land` then consumes the grant; the landing must present the same manifest.
+One landing at a time writes into a directory, whichever volume lands and however its path is
+spelled: another landing into it meanwhile is refused `LandingLeaseHeld` (exit 1) and can be retried
+once the first has replied. `slates status` counts each shard's `landings_in_flight` and
+`target_leases`.
 Neither a control-channel label nor the caller's uid is proof of human approval — only the secret
 is, and only the anchor's user maps it. `slates anchor` prints the variables to export for that
 (`slates anchor: issuer surface: export SLATES_ANCHOR=… SLATES_ANCHOR_LEN=…`) on macOS and Windows,

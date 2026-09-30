@@ -1081,8 +1081,11 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     Seen::Acknowledged => return Served::Reply(refused(Refusal::DuplicateRequest)),
     Seen::New => {
       // A retry of a submit whose acceptance still waits for its commit joins the wait: it is answered
-      // with the committed result when the version places, never a success from memory.
-      if crate::merge_service::join_awaiting(state, origin, id) {
+      // with the committed result when the version places, never a success from memory. A retry of a
+      // granted landing still running joins it the same way (AUD-29-03).
+      if crate::merge_service::join_awaiting(state, origin, id)
+        || crate::landing::join_in_flight(state, origin, id)
+      {
         return Served::Forwarded;
       }
     }
@@ -1334,8 +1337,11 @@ fn run_forwarded(
     }
     Seen::Acknowledged => return Some(refused(Refusal::DuplicateRequest)),
     Seen::New => {
-      // A retry of a submit whose acceptance still waits for its commit joins the wait.
-      if crate::merge_service::join_awaiting(state, origin, id) {
+      // A retry of a submit whose acceptance still waits for its commit joins the wait, as does a retry
+      // of a granted landing still running (AUD-29-03).
+      if crate::merge_service::join_awaiting(state, origin, id)
+        || crate::landing::join_in_flight(state, origin, id)
+      {
         return None;
       }
     }
@@ -1898,6 +1904,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     landings_awaiting: u64::try_from(state.landing.awaiting.len()).unwrap_or(u64::MAX),
     landings_awaiting_bound: u64::try_from(state.config.landings_awaiting_per_shard)
       .unwrap_or(u64::MAX),
+    landings_in_flight: u64::try_from(state.landing.in_flight.len()).unwrap_or(u64::MAX),
+    target_leases: u64::try_from(state.db.partition().landing_leases().count()).unwrap_or(u64::MAX),
   }
 }
 
@@ -2098,6 +2106,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::Unsupported { .. } => "unsupported",
     Refusal::TooManyClients => "too_many_clients",
     Refusal::LandingsAwaitingFull => "landings_awaiting_full",
+    Refusal::LandingLeaseLost => "landing_lease_lost",
     Refusal::Overloaded { .. } => "overloaded",
     Refusal::BadRequest { .. } => "bad_request",
     Refusal::Unpublished { .. } => "unpublished",
@@ -4797,7 +4806,7 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
 /// volume is at most one verb old — a fresh create is empty and a fresh clone has not diverged —
 /// so its destroy completes within the destroy slice budget the cooperative path uses; the loop is
 /// bounded by that volume's own extent. Returns how many volumes were released.
-fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
+pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
   let orphans: Vec<(DbVolumeId, Handle<VolumeSlot>)> = state
     .by_id
     .iter()

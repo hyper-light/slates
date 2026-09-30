@@ -77,17 +77,28 @@ pub(crate) const VOLUME: [u8; 16] = [7; 16];
 /// Shape: the snapshot these tests land.
 pub(crate) const SNAPSHOT: u64 = 1;
 
+/// Shape: the holder the harness's landings take the target lease as.
+pub(crate) const LEASE_HOLDER: u64 = 1;
+
+/// The key `target`'s landing lease is held under: its canonical identity, as the engine checks it.
+pub(crate) fn target_lease_key<H: HostFs>(host: &mut H, target: &LandingTarget) -> String {
+  let identity = host.fingerprint_dir(target.dir).unwrap();
+  slates_land::grant::lease_key(&slates_land::grant::TargetIdentity {
+    key: target.key.clone(),
+    device: identity.dev,
+    inode: identity.ino,
+  })
+}
+
 pub(crate) fn request(landing_id: u64) -> LandingRequest {
   LandingRequest {
     landing_id,
-    holder: 1,
     consumer: CONSUMER.into(),
     volume: VOLUME,
     snapshot: SNAPSHOT,
     grant: None,
     filter: Filter::default(),
     now_ns: 1,
-    lease_term_ns: TERM_NS,
     media_durability: false,
     large_class_bytes: LARGE,
     cores: 2,
@@ -134,17 +145,37 @@ impl<H: LandFs> Setup<'_, H> {
     req: &LandingRequest,
     observer: &mut O,
   ) -> Result<LandingReport, LandingRefusal> {
-    land(
+    // A granted landing holds the target's landing lease under its canonical identity, taken for the landing
+    // and released after, as the server takes it from the control shard (AUD-29-03). A presentation writes
+    // nothing and holds none.
+    let lease = match req.grant {
+      Some(_) => {
+        let key = target_lease_key(self.host, self.target);
+        Some(
+          self
+            .session
+            .leases
+            .take(&key, LEASE_HOLDER, req.now_ns, TERM_NS)
+            .map_err(LandingRefusal::LeaseHeld)?,
+        )
+      }
+      None => None,
+    };
+    let result = land(
       self.host,
       self.target,
       self.vol,
       self.store,
       &mut self.session.grants,
-      &mut self.session.leases,
+      lease.as_ref(),
       &mut self.session.audit,
       req,
       observer,
-    )
+    );
+    if let Some(held) = &lease {
+      self.session.leases.release(held);
+    }
+    result
   }
 
   /// Presents: the `GrantRequired` reply.

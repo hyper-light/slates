@@ -40,17 +40,17 @@ use slates_land::engine::{
 };
 use slates_land::grant::{
   GrantBinding, GrantRecord as LandGrantRecord, GrantScope as LandScope,
-  GrantState as LandGrantState, Grants, Leases, Surface, TargetIdentity,
+  GrantState as LandGrantState, Grants, Surface, TargetIdentity,
 };
 #[cfg(unix)]
-use slates_land::grant::{GrantId, GrantRefusal};
+use slates_land::grant::{GrantId, GrantRefusal, LandingLease};
 #[cfg(unix)]
 use slates_land::manifest::{Filter, LandingEntry, Manifest};
 #[cfg(unix)]
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::clock::Clock;
 #[cfg(unix)]
-use slates_vfs::host::{HostError, LandFs};
+use slates_vfs::host::{HostError, HostFs, LandFs};
 #[cfg(unix)]
 use slates_wire::observe::Chokepoint;
 
@@ -66,13 +66,13 @@ use crate::verbs::{find, forbidden, rights_of, to_db_snapshot, to_db_volume};
 /// derived retention is wired with the landing-rate measurement in a later phase).
 const AUDIT_RETAIN: usize = 4096;
 
-/// The runtime landing state a shard holds (§4.15): the grants, the leases and the audit log,
-/// each mirrored into the durable database as it changes.
+/// The runtime landing state a shard holds (§4.15): the grants and the audit log, each mirrored into the
+/// durable database as it changes; the presentations awaiting a grant; and the granted landings running as
+/// owned tasks. Target leases are not kept here: they are durable records on the control shard, one owner
+/// for the host's targets (AUD-29-03; before 2026-09-29 each shard kept its own table).
 pub struct LandingState {
   /// The runtime grants (mirrored to `GrantRecord`).
   pub grants: Grants,
-  /// The target leases (mirrored to `LandingLeaseRecord`).
-  pub leases: Leases,
   /// The runtime audit log (mirrored to `AuditRecord`).
   pub audit: Audit,
   /// The next landing id.
@@ -80,6 +80,15 @@ pub struct LandingState {
   /// A landing awaiting a grant: its id, the manifest it planned, the volume and the target,
   /// so a grant on the control channel binds the right manifest (§4.15 step 3).
   pub awaiting: std::collections::BTreeMap<u64, Awaiting>,
+  /// Granted landings running as owned tasks on this shard, by the request that started each (its origin,
+  /// client and sequence), with where its reply goes: the newest attempt's route, since a retry comes from
+  /// where its client now waits. A retry joins the landing and never starts a second. One entry per task,
+  /// so bounded by the shard's task arena.
+  pub in_flight:
+    std::collections::BTreeMap<(u64, u32, u32), Option<crate::merge_service::ReplyRoute>>,
+  /// The next landing attempt this shard numbers: the holder a target lease is taken for, one per attempt,
+  /// so two landings never share a lease — not even two of one principal.
+  pub next_holder: u64,
 }
 
 /// A landing presented and waiting for a grant.
@@ -115,10 +124,11 @@ impl Default for LandingState {
   fn default() -> LandingState {
     LandingState {
       grants: Grants::default(),
-      leases: Leases::default(),
       audit: Audit::new(AUDIT_RETAIN),
       next_landing: 1,
       awaiting: std::collections::BTreeMap::new(),
+      in_flight: std::collections::BTreeMap::new(),
+      next_holder: 1,
     }
   }
 }
@@ -180,6 +190,135 @@ pub fn land_verb(
       feature: "landing".to_owned(),
     })
   }
+}
+
+/// Takes the landing lease on the target whose canonical key is `key`, on this shard — the control shard,
+/// the one owner of the host's target leases (§4.15 "Ownership facts", step 4; AUD-29-03) — for the landing
+/// attempt `holder`, for `term_ns`, as a durable record. Refused `LandingLeaseHeld`, naming the holder,
+/// while any attempt's lease on that target is unexpired. Refused `LandingLeaseLost`, taking nothing, once
+/// the caller's `deadline_ns` has passed: the caller no longer waits for the answer, and a lease it never
+/// learned of would hold the target for a term. The generation is the take's log sequence on this
+/// partition, so it only grows, across releases and restarts: a release or a fence naming an older one
+/// names a lease that is gone.
+#[cfg(unix)]
+pub fn take_target_lease(
+  state: &mut ShardState,
+  key: String,
+  holder: u64,
+  term_ns: u64,
+  deadline_ns: u64,
+) -> Result<LandingLease, Refusal> {
+  let now = state.clock.monotonic_ns();
+  if now >= deadline_ns {
+    *state.refusals.entry(LEASE_TAKE_LATE).or_insert(0) += 1;
+    return Err(Refusal::LandingLeaseLost);
+  }
+  release_expired_leases(state, now)?;
+  let generation = state.db.next_seq();
+  let expires_ns = now.saturating_add(term_ns);
+  let record = slates_db::catalog::LandingLeaseRecord {
+    target: key.clone(),
+    holder,
+    generation,
+    expires_ns,
+  };
+  match state
+    .db
+    .mutate(&mut state.segment, &Op::LandingLeaseTaken { record }, now)
+  {
+    Ok(_) => Ok(LandingLease {
+      target: key.into_boxed_str(),
+      holder,
+      generation,
+      expires_ns,
+    }),
+    Err(slates_db::DbError::LeaseHeld { .. }) => Err(Refusal::LandingLeaseHeld {
+      holder: state
+        .db
+        .partition()
+        .landing_lease(&key)
+        .map_or(0, |held| held.holder),
+    }),
+    Err(e) => Err(crate::error::refusal_of_db(&e)),
+  }
+}
+
+/// Format: the landing-plane counter of a target-lease take that reached the control shard after its
+/// caller's deadline, and took nothing.
+#[cfg(unix)]
+const LEASE_TAKE_LATE: &str = "landing.lease_take_late";
+
+/// Releases every target lease whose term has ended, so the control partition holds no more records than
+/// the leases live at its last take (ban 8): a lease whose release never came — its attempt's compensation
+/// lost as well, or its daemon gone — would otherwise stay for good. Bounded by those records.
+#[cfg(unix)]
+fn release_expired_leases(state: &mut ShardState, now: u64) -> Result<(), Refusal> {
+  let expired: Vec<String> = state
+    .db
+    .partition()
+    .landing_leases()
+    .filter(|lease| lease.expires_ns <= now)
+    .map(|lease| lease.target.clone())
+    .collect();
+  for target in expired {
+    state
+      .db
+      .mutate(
+        &mut state.segment,
+        &Op::LandingLeaseReleased { target },
+        now,
+      )
+      .map_err(|e| crate::error::refusal_of_db(&e))?;
+  }
+  Ok(())
+}
+
+/// Releases the target lease on `key` when the landing attempt `holder` still holds it, on this (the
+/// control) shard, and nothing otherwise: an attempt whose term ended, and whose target another has taken
+/// since, releases nothing of the new holder's. It is also the compensation for a take whose answer never
+/// came back: the attempt's own lease, if that take landed.
+#[cfg(unix)]
+pub fn release_target_lease(state: &mut ShardState, key: &str, holder: u64) -> Result<(), Refusal> {
+  let held = state
+    .db
+    .partition()
+    .landing_lease(key)
+    .is_some_and(|lease| lease.holder == holder);
+  if !held {
+    return Ok(());
+  }
+  let now = state.clock.monotonic_ns();
+  state
+    .db
+    .mutate(
+      &mut state.segment,
+      &Op::LandingLeaseReleased {
+        target: key.to_owned(),
+      },
+      now,
+    )
+    .map(|_| ())
+    .map_err(|e| crate::error::refusal_of_db(&e))
+}
+
+/// A retry of a granted landing still running joins it (AUD-29-03): the verb does not run again, and the
+/// reply goes where this attempt came from when it came from somewhere. Whether the request was running.
+pub(crate) fn join_in_flight(
+  state: &mut ShardState,
+  origin: u64,
+  id: slates_wire::request::RequestId,
+) -> bool {
+  let Some(route) = state
+    .landing
+    .in_flight
+    .get_mut(&(origin, id.client, id.sequence))
+  else {
+    return false;
+  };
+  if let Some(newest) = state.reply_route.take() {
+    *route = Some(newest);
+  }
+  true
 }
 
 /// Drops every landing `client` presented on this shard and never landed: its retirement abandons them
@@ -300,38 +439,80 @@ fn land_verb_unix(
   // Open the target: this is the only place the server touches a host path for writing, and
   // only under the grant checked below (R1, R10). A path that cannot be opened, or that
   // escapes containment, is a typed refusal with no write.
-  let (mut os, land_target) = match OsLand::open_target(std::path::Path::new(target)) {
+  let (os, land_target) = match OsLand::open_target(std::path::Path::new(target)) {
     Ok(pair) => pair,
     Err(refusal) => return refused(target_refusal(&refusal)),
   };
-  let now = state.clock.monotonic_ns();
+  let prepared = Prepared {
+    handle,
+    os,
+    land_target,
+    filter: to_land_filter(filter),
+    volume: db_volume,
+    snapshot: db_snapshot,
+    target: target.to_owned(),
+    principal: principal.clone(),
+    client: client_id,
+    grant,
+  };
+  match grant {
+    // A presentation writes nothing and takes no lease: it is answered now.
+    None => run_landing(state, prepared, None),
+    // A granted landing runs as an owned task under its target's lease (AUD-29-03).
+    Some(_) => defer_granted_landing(state, prepared),
+  }
+}
+
+/// A landing ready to run: its volume, its opened target and what its request and records name.
+#[cfg(unix)]
+struct Prepared {
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  os: OsLand,
+  land_target: slates_land::engine::LandingTarget,
+  filter: Filter,
+  volume: DbVolumeId,
+  snapshot: DbSnapshotId,
+  target: String,
+  principal: Principal,
+  client: u32,
+  grant: Option<u64>,
+}
+
+/// Runs the engine for `prepared` under `lease` (none for a presentation) and turns its outcome into the
+/// reply: the finished landing's records, the presentation, or the typed refusal. The landing's id and clock
+/// are read here, as it runs — for a granted landing after its wait for the lease, so a presentation another
+/// landing consumed meanwhile is not landed twice under one id.
+#[cfg(unix)]
+fn run_landing(
+  state: &mut ShardState,
+  mut prepared: Prepared,
+  lease: Option<&LandingLease>,
+) -> ReplyBody {
   // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes
   // to this shard, where the presented record waits. A granted landing lands under the id of the
   // presentation its grant was issued from, so its finish consumes that presentation and a resume under the
   // same grant keeps the id its hidden siblings carry (AUD-29-07; before 2026-09-29 every call took a fresh
   // id, the presentation was never consumed, and a resume could not find its crashed attempt's siblings).
-  let presented = grant.and_then(|g| presentation_for(state, g));
+  let presented = prepared.grant.and_then(|g| presentation_for(state, g));
   let landing_id = presented
     .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
   let request = LandingRequest {
     landing_id,
-    holder: session_of(principal),
     // The grant binds the caller by its exact principal (its key), never by the session number several
     // principals can share, and the volume and snapshot this landing names (AUD-29-01).
-    consumer: principal.key().into_boxed_slice(),
-    volume: db_volume.bytes,
-    snapshot: db_snapshot.value,
-    grant: grant.map(GrantId),
-    filter: to_land_filter(filter),
-    now_ns: now,
-    lease_term_ns: state.config.failover_slo_ns,
+    consumer: prepared.principal.key().into_boxed_slice(),
+    volume: prepared.volume.bytes,
+    snapshot: prepared.snapshot.value,
+    grant: prepared.grant.map(GrantId),
+    filter: prepared.filter.clone(),
+    now_ns: state.clock.monotonic_ns(),
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
     cores: 1,
     max_depth: 1,
     variance_permille: 0,
   };
-  let slot = match state.volumes.get_mut(handle) {
+  let slot = match state.volumes.get_mut(prepared.handle) {
     Ok(s) => s,
     Err(_) => return refused(Refusal::NotFound),
   };
@@ -343,12 +524,12 @@ fn land_verb_unix(
     .max(1);
   let mut spans = SpanObserver::with_capacity(telemetry_capacity);
   let outcome = land(
-    &mut os,
-    &land_target,
+    &mut prepared.os,
+    &prepared.land_target,
     &mut slot.volume,
     &mut state.store,
     &mut state.landing.grants,
-    &mut state.landing.leases,
+    lease,
     &mut state.landing.audit,
     &request,
     &mut spans,
@@ -357,47 +538,307 @@ fn land_verb_unix(
   let ids = LandingIds {
     landing_id,
     fresh: presented.is_none(),
-    volume: db_volume,
-    snapshot: db_snapshot,
-    target,
+    volume: prepared.volume,
+    snapshot: prepared.snapshot,
+    target: &prepared.target,
+  };
+  let presenter = Presenter {
+    client: prepared.client,
+    principal: &prepared.principal,
   };
   match outcome {
-    Ok(report) => finish(state, principal, &ids, &report, grant),
-    Err(LandingRefusal::GrantRequired(plan)) => present(
-      state,
-      Presenter {
-        client: client_id,
-        principal,
-      },
-      &ids,
-      &plan.manifest,
-      &plan.binding,
-    ),
-    Err(LandingRefusal::Conflict(entries)) => refused(Refusal::LandingConflict {
+    Ok(report) => finish(state, &prepared.principal, &ids, &report, prepared.grant),
+    Err(refusal) => not_landed(state, presenter, &ids, refusal),
+  }
+}
+
+/// The reply to a landing the engine did not land: its presentation when it needs a grant, else the typed
+/// refusal.
+#[cfg(unix)]
+fn not_landed(
+  state: &mut ShardState,
+  presenter: Presenter<'_>,
+  ids: &LandingIds<'_>,
+  refusal: LandingRefusal,
+) -> ReplyBody {
+  match refusal {
+    LandingRefusal::GrantRequired(plan) => {
+      present(state, presenter, ids, &plan.manifest, &plan.binding)
+    }
+    LandingRefusal::Conflict(entries) => refused(Refusal::LandingConflict {
       entries: entries.iter().map(|e| e.path.to_string()).collect(),
     }),
-    Err(LandingRefusal::LeaseHeld(held)) => refused(Refusal::LandingLeaseHeld {
+    LandingRefusal::LeaseHeld(held) => refused(Refusal::LandingLeaseHeld {
       holder: held.holder,
     }),
-    Err(LandingRefusal::Grant(GrantRefusal::GrantMismatch { .. })) => {
-      refused(Refusal::GrantMismatch)
-    }
+    // The lease ended while the landing waited to run: nothing was written.
+    LandingRefusal::LeaseRequired => refused(Refusal::LandingLeaseLost),
+    LandingRefusal::Grant(GrantRefusal::GrantMismatch { .. }) => refused(Refusal::GrantMismatch),
     // A grant approved for another consumer, volume, snapshot or target: the landing is not the one the
     // human approved, refused before any write and counted by the field that differed.
-    Err(LandingRefusal::Grant(GrantRefusal::Unbound { field })) => {
+    LandingRefusal::Grant(GrantRefusal::Unbound { field }) => {
       *state
         .refusals
         .entry(unbound_refusal_name(field))
         .or_insert(0) += 1;
       refused(Refusal::GrantMismatch)
     }
-    Err(LandingRefusal::Grant(_)) => refused(Refusal::GrantInvalid),
-    Err(LandingRefusal::Target(e)) => refused(Refusal::TargetUnavailable {
+    LandingRefusal::Grant(_) => refused(Refusal::GrantInvalid),
+    LandingRefusal::Target(e) => refused(Refusal::TargetUnavailable {
       reason: format!("{e:?}"),
     }),
-    Err(LandingRefusal::Volume(e)) => refused(refusal_of_vfs(&e)),
+    LandingRefusal::Volume(e) => refused(refusal_of_vfs(&e)),
   }
 }
+
+/// Starts a granted landing as an owned task on this shard and defers the verb's reply to it (§4.15
+/// "Ownership facts": "runs as one of its tasks"; AUD-29-03). The task takes the target's lease from the
+/// control shard under the target's canonical identity, runs the engine under it with the landing's records
+/// and the request's completion committed as one atom, releases the lease, and then delivers the reply.
+/// Before 2026-09-29 the landing ran inside the verb and took a lease from its own shard's table, keyed by
+/// the target's path.
+#[cfg(unix)]
+fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> ReplyBody {
+  let Some(request) = state.current_request else {
+    return refused(Refusal::Unsupported {
+      feature: "a granted landing outside a recorded request".to_owned(),
+    });
+  };
+  let key = match prepared.os.fingerprint_dir(prepared.land_target.dir) {
+    Ok(identity) => slates_land::grant::lease_key(&TargetIdentity {
+      key: prepared.land_target.key.clone(),
+      device: identity.dev,
+      inode: identity.ino,
+    }),
+    Err(e) => {
+      return refused(Refusal::TargetUnavailable {
+        reason: format!("{e:?}"),
+      });
+    }
+  };
+  // The attempt is numbered in the landing-id shape — its partition in the high bits — so attempts of two
+  // shards never share a holder.
+  let holder = crate::verbs::landing_id(state.partition, state.landing.next_holder);
+  state.landing.next_holder = state.landing.next_holder.saturating_add(1);
+  let shard = state.shard;
+  let control = state.shards.first().copied().unwrap_or(shard);
+  // The term is the operator's failover bound, as the per-shard lease's was; the measured landing duration
+  // p99 x k of §4.15's table, with its keepalive, comes with the sliced engine (AUD-29-25).
+  let term = state.config.failover_slo_ns;
+  let deadline = state.clock.monotonic_ns().saturating_add(term);
+  let (origin, id) = request;
+  let flight = (origin, id.client, id.sequence);
+  // The verb's span is the cause of the landing's `land.entry` spans, though they end after it (§4.14).
+  let cause = state.current_span;
+  let route = state.reply_route.take();
+  let task = async move {
+    let taken = acquire_target_lease(
+      LeaseAsk {
+        shard,
+        control,
+        holder,
+        term,
+        deadline,
+      },
+      key.clone(),
+    )
+    .await;
+    let held = taken.is_ok();
+    let finished = crate::state::with_state(move |s| {
+      complete_granted_landing(s, prepared, taken, request, cause)
+    });
+    // The lease goes before the reply, so the caller's next landing into the target finds it free.
+    let released = !held
+      || crate::xshard::call_within(
+        shard,
+        control,
+        move |s| release_target_lease(s, &key, holder),
+        term,
+      )
+      .await
+      .is_some_and(|released| released.is_ok());
+    crate::state::with_state(move |s| {
+      if !released {
+        // Unreleased, the lease ends by its term; counted, never silent.
+        *s.refusals.entry(LEASE_UNRELEASED).or_insert(0) += 1;
+      }
+      if let Some((reply, route)) = finished {
+        deliver_landing(s, reply, route);
+      }
+    });
+  };
+  match slates_rt::futures::spawn(task).and_then(slates_rt::futures::detach) {
+    Ok(()) => {
+      state.landing.in_flight.insert(flight, route);
+      state.acceptance_deferred = true;
+      deferred_reply()
+    }
+    Err(_) => refused(Refusal::Overloaded { shard }),
+  }
+}
+
+/// Where a landing attempt asks for its target's lease: from this shard to the control shard, for the
+/// attempt `holder`, for `term` nanoseconds, answered by the monotonic `deadline`.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct LeaseAsk {
+  shard: u16,
+  control: u16,
+  holder: u64,
+  term: u64,
+  deadline: u64,
+}
+
+/// Takes the target lease `key` from the control shard for a landing attempt, waiting at most one term. A
+/// take whose answer does not come back in that time is compensated — the attempt's own lease released,
+/// should the take have landed; a take still queued refuses itself past the deadline — so a lease outlives
+/// an attempt that never learned of it only when the compensation fails as well, and then by its term.
+#[cfg(unix)]
+async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease, Refusal> {
+  let LeaseAsk {
+    shard,
+    control,
+    holder,
+    term,
+    deadline,
+  } = ask;
+  let asked = key.clone();
+  if let Some(taken) = crate::xshard::call_within(
+    shard,
+    control,
+    move |s| take_target_lease(s, asked, holder, term, deadline),
+    term,
+  )
+  .await
+  {
+    return taken;
+  }
+  let compensated = crate::xshard::call_within(
+    shard,
+    control,
+    move |s| release_target_lease(s, &key, holder),
+    term,
+  )
+  .await
+  .is_some_and(|released| released.is_ok());
+  crate::state::with_state(|s| {
+    *s.refusals.entry(LEASE_TAKE_UNANSWERED).or_insert(0) += 1;
+    if !compensated {
+      *s.refusals.entry(LEASE_UNRELEASED).or_insert(0) += 1;
+    }
+  });
+  Err(Refusal::Overloaded { shard: control })
+}
+
+/// Format: the landing-plane counter of a target-lease take whose answer did not come back within its term.
+#[cfg(unix)]
+const LEASE_TAKE_UNANSWERED: &str = "landing.lease_take_unanswered";
+
+/// Format: the landing-plane counter of a target lease whose release did not reach the control shard (it
+/// ends by its term).
+#[cfg(unix)]
+const LEASE_UNRELEASED: &str = "landing.lease_unreleased";
+
+/// The placeholder a deferred landing's verb returns. It is never delivered: the verb deferred its reply, and
+/// `run_recorded` answers nothing for it.
+#[cfg(unix)]
+fn deferred_reply() -> ReplyBody {
+  ReplyBody::Landed {
+    outcome: LandingOutcome {
+      landing: 0,
+      state: String::new(),
+      written: 0,
+      skipped: 0,
+      conflicts: 0,
+      failed: 0,
+      bytes_written: 0,
+      held: 0,
+      durability: LandingDurability {
+        data_synced: false,
+        dirs_synced: false,
+        media: false,
+        media_requested: false,
+        dirs: 0,
+      },
+      degraded: Vec::new(),
+      ramp_depth: 0,
+    },
+  }
+}
+
+/// The granted landing's own step on its owner shard: the engine under the lease, with the landing's records
+/// and the request's completion committed as one atom — or the lease's refusal recorded as the completion.
+/// Returns the recorded reply and where it goes.
+#[cfg(unix)]
+fn complete_granted_landing(
+  state: &mut ShardState,
+  prepared: Prepared,
+  lease: Result<LandingLease, Refusal>,
+  (origin, id): (u64, slates_wire::request::RequestId),
+  cause: Option<slates_wire::observe::SpanContext>,
+) -> (ReplyBody, Option<crate::merge_service::ReplyRoute>) {
+  let route = state
+    .landing
+    .in_flight
+    .remove(&(origin, id.client, id.sequence))
+    .flatten();
+  let outer = std::mem::replace(&mut state.current_span, cause);
+  state.db.begin();
+  let reply = match lease {
+    Ok(lease) => run_landing(state, prepared, Some(&lease)),
+    Err(refusal) => refused(refusal),
+  };
+  let recorded = crate::verbs::record_completion(state, origin, id, reply);
+  let reply = match state.db.commit(&mut state.segment) {
+    Ok(_) => recorded,
+    Err(e) => {
+      // Nothing of the landing's records is durable, as in `run_recorded`: counted, never recorded as the
+      // completion, so a retry runs again.
+      let refusal = crate::error::refusal_of_db(&e);
+      *state
+        .refusals
+        .entry(crate::verbs::refusal_name(&refusal))
+        .or_insert(0) += 1;
+      crate::verbs::reconcile_unpublished_effects(state);
+      refused(refusal)
+    }
+  };
+  state.current_span = outer;
+  (reply, route)
+}
+
+/// Delivers a granted landing's reply to where its request waits, on its client's shard. A request with no
+/// route — a forward from another node — reads its completion record instead.
+#[cfg(unix)]
+fn deliver_landing(
+  state: &mut ShardState,
+  reply: ReplyBody,
+  route: Option<crate::merge_service::ReplyRoute>,
+) {
+  let Some(route) = route else {
+    return;
+  };
+  let delivery = slates_rt::task::SpawnRequest::new(
+    Box::pin(async move {
+      crate::state::deliver(route.client_index, route.request, reply, true);
+    }),
+    None,
+  );
+  if slates_rt::registry::send_control(
+    route.shard,
+    slates_rt::control::Control::Spawn(Box::new(delivery)),
+  )
+  .is_err()
+  {
+    // The client's retry answers from the completion record.
+    *state.refusals.entry(LANDING_UNDELIVERED).or_insert(0) += 1;
+  }
+}
+
+/// Format: the landing-plane counter of a granted landing's reply that could not be handed to its client's
+/// shard.
+#[cfg(unix)]
+const LANDING_UNDELIVERED: &str = "landing.reply_undelivered";
 
 /// The refusal-ledger name of a landing refused for a grant bound elsewhere, by the field that differed.
 #[cfg(unix)]
@@ -1125,8 +1566,130 @@ fn grant_state_name(state: DbGrantState) -> String {
 #[cfg(all(test, unix))]
 mod tests {
   use super::{
-    ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, revoke_proof,
+    ENROLL_DOMAIN, REVOKE_DOMAIN, SpanObserver, attest_proof, enroll_proof, release_target_lease,
+    revoke_proof, take_target_lease,
   };
+  use slates_ipc::protocol::Refusal;
+  use slates_vfs::clock::Clock;
+
+  /// Shape: a lease term longer than any of these histories, in nanoseconds (a minute).
+  const LONG_TERM_NS: u64 = 60_000_000_000;
+  /// Shape: a lease term the histories outlive by pausing, in nanoseconds (20 ms).
+  const SHORT_TERM_NS: u64 = 20_000_000;
+  /// Shape: how many targets the bound history leases at once.
+  const TARGETS: u64 = 5;
+
+  /// The canonical key of a target, as `slates_land::grant::lease_key` spells one (device 1, `inode`).
+  fn target(inode: u64) -> String {
+    slates_land::grant::lease_key(&slates_land::grant::TargetIdentity {
+      key: "/".into(),
+      device: 1,
+      inode,
+    })
+  }
+
+  /// A deadline the history never reaches.
+  fn far(state: &mut crate::state::ShardState) -> u64 {
+    state.clock.monotonic_ns().saturating_add(LONG_TERM_NS)
+  }
+
+  /// Outlives a short term: the paused holder.
+  fn pause_past_a_short_term() {
+    // The paused holder: the test stands in for a descheduled landing attempt.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(2 * SHORT_TERM_NS));
+  }
+
+  /// §4.15 step 4 (AUD-29-03): the control shard's target lease has one holder until it is released or its
+  /// term ends. Do: attempt A takes a target; attempts B and A again take it; B releases it; A releases it
+  /// and C takes it. Expect: B's take and A's second take are refused `LandingLeaseHeld` naming A — an attempt
+  /// id is not a renewal; another target is its own lease; B's release frees nothing; after A's release C
+  /// holds it under a greater generation; the status report counts each record and none once released.
+  #[test]
+  fn a_target_lease_has_one_holder_until_its_release_or_its_term() {
+    crate::daemon::audit_on_shard(|state| {
+      let deadline = far(state);
+      let a = take_target_lease(state, target(2), 10, LONG_TERM_NS, deadline).unwrap();
+      for holder in [11, 10] {
+        assert_eq!(
+          take_target_lease(state, target(2), holder, LONG_TERM_NS, deadline),
+          Err(Refusal::LandingLeaseHeld { holder: 10 }),
+          "attempt {holder}"
+        );
+      }
+      take_target_lease(state, target(3), 11, LONG_TERM_NS, deadline).unwrap();
+      assert_eq!(crate::verbs::shard_report(state).target_leases, 2);
+      release_target_lease(state, &target(2), 11).unwrap();
+      assert_eq!(
+        take_target_lease(state, target(2), 12, LONG_TERM_NS, deadline),
+        Err(Refusal::LandingLeaseHeld { holder: 10 }),
+        "another attempt's release freed nothing"
+      );
+      release_target_lease(state, &target(2), 10).unwrap();
+      let c = take_target_lease(state, target(2), 12, LONG_TERM_NS, deadline).unwrap();
+      assert!(c.generation > a.generation, "{c:?} after {a:?}");
+      release_target_lease(state, &target(2), 12).unwrap();
+      release_target_lease(state, &target(3), 11).unwrap();
+      assert_eq!(crate::verbs::shard_report(state).target_leases, 0);
+    });
+  }
+
+  /// §4.15 step 4 (AUD-29-03, a paused old holder): a lease whose term ends is overtaken, and its holder's
+  /// late release frees nothing of the new holder's. Do: attempt A takes a target for a short term and
+  /// pauses past it; B takes the target; A releases. Expect: B's take succeeds under a greater generation,
+  /// and after A's release the target is still B's.
+  #[test]
+  fn a_holder_paused_past_its_term_is_overtaken_and_its_release_frees_nothing() {
+    crate::daemon::audit_on_shard(|state| {
+      let deadline = far(state);
+      let a = take_target_lease(state, target(2), 10, SHORT_TERM_NS, deadline).unwrap();
+      pause_past_a_short_term();
+      let b = take_target_lease(state, target(2), 11, LONG_TERM_NS, deadline).unwrap();
+      assert!(b.generation > a.generation, "{b:?} after {a:?}");
+      release_target_lease(state, &target(2), 10).unwrap();
+      assert_eq!(
+        take_target_lease(state, target(2), 12, LONG_TERM_NS, deadline),
+        Err(Refusal::LandingLeaseHeld { holder: 11 }),
+        "the paused holder's release freed nothing of the new holder's"
+      );
+    });
+  }
+
+  /// §4.15 step 4 (AUD-29-03): a take that reaches the control shard after its caller stopped waiting takes
+  /// nothing, so no lease is held for an attempt that never learns of it. Do: take with a deadline already
+  /// passed, then take for another attempt. Expect: the first is refused `LandingLeaseLost` and the second
+  /// holds the target at once.
+  #[test]
+  fn a_take_past_its_callers_deadline_takes_nothing() {
+    crate::daemon::audit_on_shard(|state| {
+      let passed = state.clock.monotonic_ns();
+      assert_eq!(
+        take_target_lease(state, target(2), 10, LONG_TERM_NS, passed),
+        Err(Refusal::LandingLeaseLost)
+      );
+      let deadline = far(state);
+      let taken = take_target_lease(state, target(2), 11, LONG_TERM_NS, deadline).unwrap();
+      assert_eq!(taken.holder, 11);
+    });
+  }
+
+  /// §4.15 step 4, ban 8 (AUD-29-03): the control shard holds no more lease records than the leases live at
+  /// its last take — a lease whose release never came is released by the next take once its term ends. Do:
+  /// lease five targets for a short term, releasing none; pause past the term; lease a sixth. Expect: the
+  /// status report counts five, then one.
+  #[test]
+  fn a_take_releases_the_leases_whose_terms_have_ended() {
+    crate::daemon::audit_on_shard(|state| {
+      let deadline = far(state);
+      for inode in 0..TARGETS {
+        take_target_lease(state, target(inode), inode, SHORT_TERM_NS, deadline).unwrap();
+      }
+      assert_eq!(crate::verbs::shard_report(state).target_leases, TARGETS);
+      pause_past_a_short_term();
+      take_target_lease(state, target(TARGETS), TARGETS, LONG_TERM_NS, deadline).unwrap();
+      assert_eq!(crate::verbs::shard_report(state).target_leases, 1);
+    });
+  }
 
   /// The landing span observer is bounded shed-first (§4.14): recording more entry timings than its
   /// capacity keeps the most recent and counts the shed ones, so a large landing never grows the buffer

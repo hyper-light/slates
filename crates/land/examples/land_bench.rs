@@ -82,14 +82,12 @@ fn config() -> VolumeConfig {
 fn request(id: u64) -> LandingRequest {
   LandingRequest {
     landing_id: id,
-    holder: 1,
     consumer: b"bench".as_slice().into(),
     volume: [0; 16],
     snapshot: 0,
     grant: None,
     filter: Filter::default(),
     now_ns: 1,
-    lease_term_ns: TERM_NS,
     media_durability: false,
     large_class_bytes: LARGE,
     cores: 2,
@@ -129,7 +127,7 @@ fn land_once<H: LandFs>(
     vol,
     store,
     &mut grants,
-    &mut leases,
+    None,
     &mut audit,
     &req,
     &mut Unobserved,
@@ -145,18 +143,28 @@ fn land_once<H: LandFs>(
     1,
     TERM_NS,
   );
-  land(
+  // The target's landing lease under its canonical identity, as the server takes it (AUD-29-03).
+  let identity = host.fingerprint_dir(target.dir).unwrap();
+  let key = slates_land::grant::lease_key(&slates_land::grant::TargetIdentity {
+    key: target.key.clone(),
+    device: identity.dev,
+    inode: identity.ino,
+  });
+  let lease = leases.take(&key, 1, req.now_ns, TERM_NS).unwrap();
+  let report = land(
     host,
     target,
     vol,
     store,
     &mut grants,
-    &mut leases,
+    Some(&lease),
     &mut audit,
     &req,
     &mut Unobserved,
   )
-  .unwrap()
+  .unwrap();
+  leases.release(&lease);
+  report
 }
 
 /// The bootstrap-free interval of `samples`: min, median, max (N is small and shown).

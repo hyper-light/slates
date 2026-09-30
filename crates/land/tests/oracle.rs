@@ -1256,7 +1256,8 @@ fn a_held_lease_refuses_and_a_single_use_grant_is_consumed() {
     )
     .expect("a grant id");
   req.grant = Some(fresh);
-  let held = setup.session.leases.take("/", 99, 1, TERM_NS).unwrap();
+  let key = common::target_lease_key(setup.host, setup.target);
+  let held = setup.session.leases.take(&key, 99, 1, TERM_NS).unwrap();
   let refused = setup.try_land(&req, &mut Unobserved);
   assert!(
     matches!(refused, Err(LandingRefusal::LeaseHeld(_))),

@@ -60,6 +60,14 @@ pub struct TargetIdentity {
   pub inode: u64,
 }
 
+/// The key a target's landing lease is held under (§4.15 step 4; AUD-29-03): its canonical identity, the
+/// opened directory's device and inode, so every path that names the same directory — an alias through
+/// `..`, a second mount of it, a relative spelling — holds one lease, and a directory replaced at the same
+/// path is another target.
+pub fn lease_key(target: &TargetIdentity) -> String {
+  format!("{:016x}:{:016x}", target.device, target.inode)
+}
+
 /// What a grant binds besides its manifest (§4.13 "Grants"; §4.15's `GrantRecord`): who lands what,
 /// where. A landing presents its own binding and a grant covers it only when they agree
 /// ([`Grants::check`]).

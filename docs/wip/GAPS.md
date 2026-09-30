@@ -2936,7 +2936,7 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
 The [dated audit](../audit/2026-09-29_audit.md) records 87 findings across five
-passes; 01, 04, 05, 06 and 07 have the separately recorded closures below, leaving 82 without a
+passes; 01, 03, 04, 05, 06 and 07 have the separately recorded closures below, leaving 81 without a
 recorded full closure. 02 is mitigated in part, with exact older-snapshot landing still
 owed. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
 changing working tree.
@@ -3057,8 +3057,7 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 in part (below) and 03 (the lease is per shard and per path string);
-  04, 05, 06 and 07 are closed below.
+- **Still open in this row.** 02 in part (below); 03, 04, 05, 06 and 07 are closed below.
 
 **Closed 2026-09-29 — AUD-29-06: a session grant was recorded consumed, and a restart lost every grant.**
 - **Transitions.** `finish` records only the transition the engine made: a single-use grant consumed by a
@@ -3126,6 +3125,33 @@ cleanup failures.**
   refusal changes nothing. Record: `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`.
 - **Open.** Presentations do not survive a restart (a grant for an earlier one is `NotFound`), and a single
   client can use the whole bound until it lands or goes.
+
+**Closed 2026-09-29 — AUD-29-03 (A-47): a target's landing lease was per shard and per path.**
+- **One lease per target.** The lease is the control partition's durable record under the target's
+  canonical identity, the opened directory's device and inode, so every owner shard and every spelling of
+  the directory meet one lease. A take is refused `LandingLeaseHeld`, naming the holder, while it is
+  unexpired, whoever asks; the holder is one landing attempt, and the generation is the take's log
+  sequence, so it only grows across releases and restarts.
+- **The landing under it.** A granted landing runs as an owned task on its volume's owner shard: it takes
+  the lease by a bounded message, runs the engine under it, commits the landing's records with the
+  request's completion, releases the lease and then replies; a retry joins it. The engine writes only under
+  a live lease on its own target (`LandingLeaseLost` otherwise) and starts no entry after the term
+  (`Skipped(LeaseEnded)`, `Partial`).
+- **Bounded and never stranded.** A take past its caller's deadline takes nothing, a lost answer is
+  compensated by a release keyed to the attempt, and a take releases every lease whose term has ended. The
+  status report counts `landings_in_flight` and `target_leases`.
+- **Evidence.** Two red histories on `c5b47cb`'s engine (a lease in another shard's table, and under another
+  spelling, each let a granted landing through to `Done`); the engine's live-lease and paused-holder
+  histories; four control-shard tests; a daemon test with two shards' volumes, one through macOS's
+  firmlinked spelling, refused naming the one holder and then both landed with nothing left; and a restart
+  test where the first daemon's lease refuses a landing under the second until its term. Record:
+  `docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md`.
+- **Open.** The term is still the failover bound and nothing renews it: the measured term and its keepalive
+  come with the sliced engine (AUD-29-25), and until then a landing longer than one term ends `Partial` and
+  resumes. Two daemons on one machine do not exclude each other's landings; a directory and a directory
+  inside it are two leases; the record is not yet written to the host's candidate holders. The cross-shard
+  call's reply handoff drops a refusal uncounted (`xshard::call_on`, the forward path), bounded only by the
+  caller's deadline.
 
 **Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:

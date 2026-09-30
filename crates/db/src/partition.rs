@@ -473,6 +473,11 @@ impl Partition {
     self.landing_leases.get(target.as_bytes())
   }
 
+  /// Every landing lease record (the control partition's, §4.15; AUD-29-03).
+  pub fn landing_leases(&self) -> impl Iterator<Item = &LandingLeaseRecord> {
+    self.landing_leases.iter().map(|(_, lease)| lease)
+  }
+
   /// A landing.
   pub fn landing(&self, id: u64) -> Option<&LandingRecord> {
     self.landings.get(&id)
@@ -687,14 +692,18 @@ impl Partition {
     }
   }
 
-  /// One holder per target: another session takes the landing lease only after expiry.
+  /// One holder per target, whoever asks (§4.15 step 4; AUD-29-03): a take is refused while the current
+  /// lease is unexpired — even by its own holder, whose id names one landing attempt and is not a renewal —
+  /// and a lease's fencing generation never goes backwards. Before 2026-09-29 the same holder could take an
+  /// unexpired lease again; no path wrote these records then.
   fn check_landing_lease(&self, record: &LandingLeaseRecord, now_ns: u64) -> Result<(), DbError> {
     match self.landing_lease(&record.target) {
-      Some(held) if held.holder != record.holder && held.expires_ns > now_ns => {
-        Err(DbError::LeaseHeld {
-          epoch: held.generation,
-        })
-      }
+      Some(held) if held.expires_ns > now_ns => Err(DbError::LeaseHeld {
+        epoch: held.generation,
+      }),
+      Some(held) if record.generation <= held.generation => Err(DbError::StaleLease {
+        current: held.generation,
+      }),
       _ => Ok(()),
     }
   }

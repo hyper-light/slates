@@ -1333,6 +1333,10 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "spans_dropped": s.spans_dropped,
     "peers_probed": s.peers_probed,
     "tasks_refused": s.tasks_refused,
+    "landings_awaiting": s.landings_awaiting,
+    "landings_awaiting_bound": s.landings_awaiting_bound,
+    "landings_in_flight": s.landings_in_flight,
+    "target_leases": s.target_leases,
     "telemetry": telemetry.map(telemetry_json),
   })
 }
