@@ -24,7 +24,7 @@ use std::pin::Pin;
 use std::sync::mpsc::Receiver;
 use std::task::{Context, Poll};
 
-use slates_mem::{Encoded, Handle, Slab, SpscRing};
+use slates_mem::{Encoded, Handle, Slab, ring};
 
 use slates_machine::wake::WakeEstimate;
 
@@ -166,8 +166,8 @@ pub struct ShardSeed {
   pub control: Receiver<Control>,
   /// The configuration.
   pub config: RuntimeConfig,
-  outbound: Vec<Option<&'static SpscRing>>,
-  inbound: Vec<&'static SpscRing>,
+  outbound: Vec<Option<ring::Producer<'static>>>,
+  inbound: Vec<ring::Consumer<'static>>,
 }
 
 impl std::fmt::Debug for ShardSeed {
@@ -191,21 +191,22 @@ impl ShardSeed {
       kick,
       control,
       config: config.clone(),
-      outbound: vec![None; MAX_SHARDS],
+      outbound: std::iter::repeat_with(|| None).take(MAX_SHARDS).collect(),
       inbound: Vec::new(),
     })
   }
 
-  /// Connects the single-producer ring this shard sends on to `target`.
-  pub(crate) fn set_outbound(&mut self, target: u16, ring: &'static SpscRing) {
+  /// Gives this shard the producer half of the pair ring it sends on to `target` (the ring's only
+  /// producer, held for the context's life).
+  pub(crate) fn set_outbound(&mut self, target: u16, producer: ring::Producer<'static>) {
     if let Some(slot) = self.outbound.get_mut(usize::from(target)) {
-      *slot = Some(ring);
+      *slot = Some(producer);
     }
   }
 
-  /// Connects the single-producer ring this shard receives on.
-  pub(crate) fn set_inbound(&mut self, ring: &'static SpscRing) {
-    self.inbound.push(ring);
+  /// Gives this shard the consumer half of a pair ring it receives on (the ring's only consumer).
+  pub(crate) fn set_inbound(&mut self, consumer: ring::Consumer<'static>) {
+    self.inbound.push(consumer);
   }
 }
 
@@ -239,6 +240,9 @@ pub struct ShardInner {
   fired: Vec<u64>,
   completions: Vec<Completion>,
   pollers: Vec<Poller>,
+  /// The consumer of the entry's foreign wake ring, claimed at build and held for the context's life (the
+  /// ring's only consumer, AUD-29-33); `None` for a context with no entry.
+  foreign: Option<slates_mem::mpsc::Consumer<'static>>,
 }
 
 impl ShardInner {
@@ -254,8 +258,10 @@ pub struct ShardContext {
   pub id: u16,
   /// The local run queue.
   pub local: LocalQueue,
-  outbound: Vec<Option<&'static SpscRing>>,
-  inbound: Vec<&'static SpscRing>,
+  /// The producer half of each pair ring this shard sends on, by target shard.
+  outbound: Vec<Option<ring::Producer<'static>>>,
+  /// The consumer half of each pair ring this shard receives on.
+  inbound: Vec<ring::Consumer<'static>>,
   current_task: Cell<Option<u32>>,
   exited: Cell<bool>,
   /// When the server last served a client's work on this shard (its clock), opening the idle window the
@@ -403,6 +409,17 @@ impl ShardContext {
   pub(crate) fn build(seed: ShardSeed) -> Result<&'static ShardContext, RtError> {
     let config = seed.config;
     let driver = (seed.driver)(seed.kick)?;
+    // The foreign wake ring's one consumer, claimed for the context's life (the entry outlives it: the slot
+    // is retired only after the context is reclaimed).
+    let foreign = match registry::entry(seed.id) {
+      Some(entry) => Some(
+        entry
+          .inbound
+          .consumer()
+          .ok_or(RtError::RingClaimed { shard: seed.id })?,
+      ),
+      None => None,
+    };
     // The arena's generations continue from where the slot's previous holder left them, so a wake
     // word minted for that shard can never name a task of this one (registry slot reuse, §4.3).
     let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
@@ -464,6 +481,7 @@ impl ShardContext {
         counters: Counters::default(),
         shutting_down: false,
         pollers: Vec::new(),
+        foreign,
       }),
       kept: KeptValues::default(),
     }));
@@ -552,7 +570,7 @@ impl ShardContext {
     {
       return true;
     }
-    self.inbound.iter().any(|ring| !ring.is_empty())
+    self.inbound.iter().any(|consumer| !consumer.is_empty())
   }
 
   /// The task being polled on this shard right now.
@@ -634,7 +652,7 @@ impl ShardContext {
     let Some(Some(ring)) = self.outbound.get(usize::from(target)) else {
       return registry::PairSend::NoRing;
     };
-    let (mut producer, _) = ring.split();
+    let producer = ring;
     let mut pending = word;
     loop {
       match producer.push(pending) {
@@ -1301,17 +1319,19 @@ impl ShardContext {
   fn drain_inbound(&self, inner: &mut ShardInner) -> bool {
     let mut any = false;
     let batch = inner.config.batch.max(1);
-    if let Some(entry) = self.entry {
-      let mut consumer = entry.inbound.consumer();
-      for _ in 0..batch {
-        let Some(word) = consumer.pop() else { break };
-        any = true;
-        inner.counters.wakes_foreign += 1;
-        self.handle_wake(inner, Encoded::from_word(word));
-      }
+    for _ in 0..batch {
+      let Some(word) = inner
+        .foreign
+        .as_ref()
+        .and_then(slates_mem::mpsc::Consumer::pop)
+      else {
+        break;
+      };
+      any = true;
+      inner.counters.wakes_foreign += 1;
+      self.handle_wake(inner, Encoded::from_word(word));
     }
-    for ring in &self.inbound {
-      let (_, mut consumer) = ring.split();
+    for consumer in &self.inbound {
       for _ in 0..batch {
         let Some(word) = consumer.pop() else { break };
         any = true;

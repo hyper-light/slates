@@ -235,8 +235,11 @@ pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
       // registration), so the lifetime is the slot protocol's promise, not a leak.
       let ring: &'static SpscRing = registry::lend_pair_ring(ids[a], SpscRing::new(entries)?)
         .ok_or(RtError::ShardGone { shard: ids[a] })?;
-      seeds[a].set_outbound(ids[b], ring);
-      seeds[b].set_inbound(ring);
+      // Split once, here: the source shard holds the only producer and the target the only consumer for
+      // their contexts' lives (AUD-29-33).
+      let (producer, consumer) = ring.split().ok_or(RtError::RingClaimed { shard: ids[a] })?;
+      seeds[a].set_outbound(ids[b], producer);
+      seeds[b].set_inbound(consumer);
     }
   }
   Ok(())

@@ -945,7 +945,7 @@ mod tests {
     let (id, _receiver) = register_slot(4, 4, RegisterKick::Kick(Kick::none())).unwrap();
     let word = Encoded::pack(id, 5, 1).unwrap();
     wake(word);
-    let mut consumer = entry(id).unwrap().inbound.consumer();
+    let consumer = entry(id).unwrap().inbound.consumer().unwrap();
     assert_eq!(consumer.pop(), Some(word.word()));
     assert_eq!(current_shard(), None);
     unregister(id);
@@ -961,7 +961,7 @@ mod tests {
     while entry.ring_full_events.load(Ordering::Relaxed) == 0 {
       std::thread::yield_now();
     }
-    let mut c = entry.inbound.consumer();
+    let c = entry.inbound.consumer().unwrap();
     assert_eq!(c.pop(), Some(1));
     filler.join().unwrap();
     assert_eq!(c.pop(), Some(2));

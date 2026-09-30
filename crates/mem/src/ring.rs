@@ -11,13 +11,19 @@
 //! Under `--cfg loom` the atomics are loom's and the test explores every interleaving (AC-0.7,
 //! T-0.3).
 //!
-//! The ring is `Sync` for exactly one producer and one consumer at a time; the [`Producer`] and
-//! [`Consumer`] halves enforce that in the type system and are what shards hold.
+//! The ring is `Sync` for exactly one producer and one consumer; the [`Producer`] and [`Consumer`] halves
+//! enforce that and are what shards hold for the ring's life. [`SpscRing::split`] hands the halves out once
+//! (a second call is `None`), and each half is `Send` but not `Sync`, so it moves to its thread whole and is
+//! never used from two threads at once — which is why `push` and `pop` take `&self`. Until 2026-09-30
+//! `split` could be called any number of times, and the runtime called it on every send and every drain:
+//! the single producer and consumer were a convention, not a property of the type (AUD-29-33).
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::marker::PhantomData;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::MemError;
 
@@ -35,6 +41,8 @@ pub struct SpscRing {
   mask: usize,
   head: Padded<AtomicUsize>,
   tail: Padded<AtomicUsize>,
+  /// Whether the halves were handed out ([`SpscRing::split`]); set once, never cleared.
+  split: AtomicBool,
 }
 
 impl SpscRing {
@@ -49,6 +57,7 @@ impl SpscRing {
       mask: capacity - 1,
       head: Padded(AtomicUsize::new(0)),
       tail: Padded(AtomicUsize::new(0)),
+      split: AtomicBool::new(false),
     })
   }
 
@@ -57,9 +66,22 @@ impl SpscRing {
     self.mask + 1
   }
 
-  /// Splits the ring into its producer and consumer halves.
-  pub fn split(&self) -> (Producer<'_>, Consumer<'_>) {
-    (Producer { ring: self }, Consumer { ring: self })
+  /// Splits the ring into its producer and consumer halves — once in its life: `None` if they were
+  /// already handed out, so no second producer or consumer can exist.
+  pub fn split(&self) -> Option<(Producer<'_>, Consumer<'_>)> {
+    if self.split.swap(true, Ordering::AcqRel) {
+      return None;
+    }
+    Some((
+      Producer {
+        ring: self,
+        one_thread: PhantomData,
+      },
+      Consumer {
+        ring: self,
+        one_thread: PhantomData,
+      },
+    ))
   }
 
   /// Words waiting.
@@ -77,21 +99,31 @@ impl SpscRing {
   }
 }
 
-/// The producer half.
+/// The producer half: the ring's only producer, used from one thread at a time (`Send`, not `Sync`). It
+/// cannot be shared between threads:
+///
+/// ```compile_fail,E0277
+/// fn shared<T: Sync>(_: &T) {}
+/// let ring = slates_mem::SpscRing::new(2).unwrap();
+/// let (producer, _consumer) = ring.split().unwrap();
+/// shared(&producer);
+/// ```
 #[derive(Debug)]
 pub struct Producer<'a> {
   ring: &'a SpscRing,
+  one_thread: PhantomData<Cell<()>>,
 }
 
-/// The consumer half.
+/// The consumer half: the ring's only consumer, used from one thread at a time (`Send`, not `Sync`).
 #[derive(Debug)]
 pub struct Consumer<'a> {
   ring: &'a SpscRing,
+  one_thread: PhantomData<Cell<()>>,
 }
 
 impl Producer<'_> {
   /// Pushes a word; returns it back when the ring is full.
-  pub fn push(&mut self, word: u64) -> Result<(), u64> {
+  pub fn push(&self, word: u64) -> Result<(), u64> {
     let tail = self.ring.tail.0.load(Ordering::Relaxed);
     let head = self.ring.head.0.load(Ordering::Acquire);
     if tail.wrapping_sub(head) == self.ring.capacity() {
@@ -108,8 +140,13 @@ impl Producer<'_> {
 }
 
 impl Consumer<'_> {
+  /// Whether nothing waits (a racy read for a loop's check; `pop` is exact).
+  pub fn is_empty(&self) -> bool {
+    self.ring.is_empty()
+  }
+
   /// Pops the oldest word, if any.
-  pub fn pop(&mut self) -> Option<u64> {
+  pub fn pop(&self) -> Option<u64> {
     let head = self.ring.head.0.load(Ordering::Relaxed);
     let tail = self.ring.tail.0.load(Ordering::Acquire);
     if head == tail {
@@ -145,7 +182,7 @@ mod tests {
   #[test]
   fn fifo_with_wraparound_and_full_and_empty_refusals() {
     let ring = SpscRing::new(4).unwrap();
-    let (mut p, mut c) = ring.split();
+    let (p, c) = ring.split().unwrap();
     assert_eq!(c.pop(), None);
     for i in 0..4 {
       p.push(i).unwrap();
@@ -163,12 +200,23 @@ mod tests {
     }
   }
 
+  /// AUD-29-33 (the SPSC sibling): do: split a ring, then split it again; expect the second split `None`, so
+  /// no second producer or consumer can exist, and the first halves still carry words.
+  #[test]
+  fn a_ring_splits_once() {
+    let ring = SpscRing::new(2).unwrap();
+    let (producer, consumer) = ring.split().unwrap();
+    assert!(ring.split().is_none(), "a second pair of halves");
+    producer.push(3).unwrap();
+    assert_eq!(consumer.pop(), Some(3));
+  }
+
   #[test]
   fn one_producer_and_one_consumer_thread_see_every_word_in_order() {
     let ring = SpscRing::new(64).unwrap();
     let total = 100_000u64;
     std::thread::scope(|s| {
-      let (mut p, mut c) = ring.split();
+      let (p, c) = ring.split().unwrap();
       s.spawn(move || {
         for i in 0..total {
           while p.push(i).is_err() {
@@ -217,7 +265,7 @@ mod loom_tests {
   fn every_interleaving_of_one_producer_and_one_consumer_is_fifo_without_loss() {
     loom_bounds::explore("spsc ring, one producer and one consumer", || {
       let ring: &'static SpscRing = Box::leak(Box::new(SpscRing::new(CAPACITY).unwrap()));
-      let (mut producer, mut consumer) = ring.split();
+      let (producer, consumer) = ring.split().unwrap();
       let pushing = loom::thread::spawn(move || {
         for word in 1..=WORDS {
           let mut pending = word;

@@ -961,6 +961,21 @@ cannot grow a vector of tombstones. Segment, slab and buddy geometry report usab
 not mapping length. Conversion, rounding, counter arithmetic and generation exhaustion are
 checked and refuse before mutation.
 
+> **Status (2026-09-30, AUD-29-33).** Every ring geometry the constructors admit keeps unread work, and
+> each ring has exactly one of each half.
+> - **The multi-producer ring needs two slots.** Its slot sequences tell "full" (position + 1) from "free
+>   for the next lap" (position + capacity) only from two slots up, so a one-slot ring is refused
+>   `BadCapacity` (it let a second push overwrite the first, unread).
+> - **Its consumer is claimed.** `consumer()` is `None` while another claim is held, and the claim is
+>   released on drop.
+> - **The single-producer ring splits once.** A second `split()` is `None`.
+> - **Halves stay on one thread.** Every half is `Send` but not `Sync`, so it moves to its thread whole and
+>   takes `&self`.
+> - **The runtime holds its halves for the context's life.** It splits each pair ring once when it connects
+>   its shards, and claims its foreign ring's consumer at build (`RtError::RingClaimed` if either was
+>   taken). A send or a drain no longer mints halves
+>   (`docs/bugs/2026-09-30-a-one-slot-ring-overwrote-unread-work.md`).
+>
 > **Status (2026-09-30, AUD-29-10).** An arena frees only the live extents it issued. An extent's fields are
 > private, so only `slates-mem` constructs one. It carries its arena's identity and its allocation's
 > incarnation. A free that is misaligned, of the wrong length, outside the region, not allocated

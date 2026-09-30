@@ -59,6 +59,12 @@ pub enum RtError {
     /// The shard.
     shard: u16,
   },
+  /// A ring half the shard must own alone — its foreign wake ring's consumer, a pair ring's producer or
+  /// consumer — was already handed out (AUD-29-33: each ring has exactly one of each).
+  RingClaimed {
+    /// The shard.
+    shard: u16,
+  },
   /// A shard's worker thread ended without a result: it panicked (AUD-29-12). Its slot was still given
   /// back and its siblings still stopped and joined.
   WorkerFailed {
@@ -83,6 +89,10 @@ impl fmt::Display for RtError {
       Self::ShardGone { shard } => write!(f, "shard {shard} is gone"),
       Self::Mem(e) => write!(f, "memory: {e}"),
       Self::KeptInUse { shard } => write!(f, "shard {shard}'s kept values are borrowed"),
+      Self::RingClaimed { shard } => write!(
+        f,
+        "a ring half shard {shard} must own was already handed out"
+      ),
       Self::WorkerFailed { shard } => write!(f, "shard {shard}'s worker ended without a result"),
     }
   }

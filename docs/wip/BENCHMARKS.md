@@ -106,6 +106,14 @@ which ranged 212–441 ns for the unchanged binary); parked round trip 1,043 ns 
 power-of-two fast path for strided-run arithmetic was also tried and measured no better; it is kept
 only because it is exact and cheaper in instructions.
 
+**Single-owner ring halves (2026-09-30, AUD-29-33).** `ring_push_pop` (a split, one push, one pop), the
+commit before and after, with the ring borrowed by the measured closure in both trees (moving the 384-byte
+ring into it cost a 54-instruction copy, and its teardown dominated the row: 281 before and 366 after as
+first measured): 54 → 63 instructions. The nine are the split's one-time claim, a 5-instruction swap, and
+its check; push and pop are unchanged. The runtime now splits each pair ring once at start instead of on
+every send and drain. Its rows moved by 1–4 instructions (`step_idle` 5,631, `spawn_and_run` 7,289,
+`local_wake` 7,943).
+
 **Owner-bound runtime lends (2026-09-30, AUD-29-08).** Instruction counts under callgrind in a Linux
 container (`cargo bench -p slates-rt --bench callgrind --features slates-rt/instruction-counts`), the
 commit before and after, each tree in its own target directory:

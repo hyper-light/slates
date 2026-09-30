@@ -9,11 +9,19 @@
 //! is full and releases it by writing the next lap's sequence. The word itself is an atomic, so
 //! the ring holds no `UnsafeCell` and no unsafe code. Under `--cfg loom` the test explores every
 //! interleaving of two producers and one consumer (T-0.3).
+//!
+//! Two slots is the smallest ring the protocol admits: a slot's sequence reads "full" at its position plus
+//! one and "free for the next lap" at its position plus the capacity, which are one value at capacity one —
+//! so a one-slot ring let a second push overwrite the unread first (AUD-29-33, 2026-09-30); it is refused.
+//! The consumer is claimed ([`MpscRing::consumer`]; `None` while another is held) and released when the
+//! claim drops, and it is `Send` but not `Sync`, so no two threads ever pop at once.
 
 #[cfg(loom)]
-use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::marker::PhantomData;
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crate::error::MemError;
 
@@ -35,12 +43,18 @@ pub struct MpscRing {
   mask: usize,
   head: Padded<AtomicUsize>,
   tail: Padded<AtomicUsize>,
+  /// Whether a [`Consumer`] is held.
+  consumer_held: AtomicBool,
 }
 
+/// Derived: the smallest capacity whose slot sequences tell a full slot (position + 1) from one free for
+/// the next lap (position + capacity) — they coincide at one (see the module doc).
+pub const MIN_CAPACITY: usize = 2;
+
 impl MpscRing {
-  /// A ring of `capacity` slots (a power of two, at least one).
+  /// A ring of `capacity` slots (a power of two, at least [`MIN_CAPACITY`]).
   pub fn new(capacity: usize) -> Result<Self, MemError> {
-    if capacity == 0 || !capacity.is_power_of_two() {
+    if capacity < MIN_CAPACITY || !capacity.is_power_of_two() {
       return Err(MemError::BadCapacity { capacity });
     }
     let slots: Vec<Slot> = (0..capacity)
@@ -54,6 +68,7 @@ impl MpscRing {
       mask: capacity - 1,
       head: Padded(AtomicUsize::new(0)),
       tail: Padded(AtomicUsize::new(0)),
+      consumer_held: AtomicBool::new(false),
     })
   }
 
@@ -99,21 +114,41 @@ impl MpscRing {
     slot.sequence.load(Ordering::Acquire) != head.wrapping_add(1)
   }
 
-  /// The consumer half; there must be exactly one at a time.
-  pub const fn consumer(&self) -> Consumer<'_> {
-    Consumer { ring: self }
+  /// Claims the consumer half: `None` while another claim is held, so there is exactly one at a time.
+  pub fn consumer(&self) -> Option<Consumer<'_>> {
+    if self.consumer_held.swap(true, Ordering::AcqRel) {
+      return None;
+    }
+    Some(Consumer {
+      ring: self,
+      one_thread: PhantomData,
+    })
   }
 }
 
-/// The consumer half.
+/// The consumer half: the ring's only consumer while held, used from one thread at a time (`Send`, not
+/// `Sync`); dropping it releases the claim. It cannot be shared between threads:
+///
+/// ```compile_fail,E0277
+/// fn shared<T: Sync>(_: &T) {}
+/// let ring = slates_mem::MpscRing::new(2).unwrap();
+/// shared(&ring.consumer().unwrap());
+/// ```
 #[derive(Debug)]
 pub struct Consumer<'a> {
   ring: &'a MpscRing,
+  one_thread: PhantomData<Cell<()>>,
+}
+
+impl Drop for Consumer<'_> {
+  fn drop(&mut self) {
+    self.ring.consumer_held.store(false, Ordering::Release);
+  }
 }
 
 impl Consumer<'_> {
   /// Pops the oldest word, if any.
-  pub fn pop(&mut self) -> Option<u64> {
+  pub fn pop(&self) -> Option<u64> {
     let head = self.ring.head.0.load(Ordering::Relaxed);
     let slot = &self.ring.slots[head & self.ring.mask];
     let sequence = slot.sequence.load(Ordering::Acquire);
@@ -141,7 +176,7 @@ mod tests {
   #[test]
   fn fifo_per_producer_and_full_is_a_refusal() {
     let ring = MpscRing::new(4).unwrap();
-    let mut c = ring.consumer();
+    let c = ring.consumer().unwrap();
     assert_eq!(c.pop(), None);
     for i in 0..4 {
       ring.push(i).unwrap();
@@ -153,6 +188,74 @@ mod tests {
     assert_eq!(rest, vec![1, 2, 3, 4]);
     assert_eq!(ring.capacity(), 4);
     assert!(ring.is_empty());
+  }
+
+  /// AUD-29-33: do: build a one-slot ring; expect `BadCapacity` (the protocol cannot tell its full slot
+  /// from its free one — the old ring let a second push overwrite the first, unread).
+  #[test]
+  fn a_one_slot_ring_is_refused() {
+    assert!(matches!(
+      MpscRing::new(1),
+      Err(MemError::BadCapacity { capacity: 1 })
+    ));
+  }
+
+  /// AUD-29-33: do: for every admitted geometry up to 64 slots, fill the ring, push once more, pop one, push
+  /// again, then alternate push and pop for three laps; expect the extra push refused with its word handed
+  /// back, the oldest word never lost or replaced, and FIFO order across every wrap.
+  #[test]
+  fn every_admitted_geometry_refuses_when_full_and_keeps_fifo_across_wraps() {
+    /// Shape: the largest geometry the sweep covers — enough laps of the sequence arithmetic at every
+    /// power of two a small bound admits.
+    const LARGEST: usize = 64;
+    let mut capacity = MIN_CAPACITY;
+    while capacity <= LARGEST {
+      let ring = MpscRing::new(capacity).unwrap();
+      let consumer = ring.consumer().unwrap();
+      let words = u64::try_from(capacity).unwrap();
+      for word in 0..words {
+        ring.push(word).unwrap();
+      }
+      assert_eq!(
+        ring.push(u64::MAX),
+        Err(u64::MAX),
+        "capacity {capacity}: full"
+      );
+      assert_eq!(consumer.pop(), Some(0), "capacity {capacity}: oldest kept");
+      ring.push(words).unwrap();
+      let drained: Vec<u64> = std::iter::from_fn(|| consumer.pop()).collect();
+      assert_eq!(
+        drained,
+        (1..=words).collect::<Vec<u64>>(),
+        "capacity {capacity}"
+      );
+      for word in 0..words * 3 {
+        ring.push(word).unwrap();
+        assert_eq!(
+          consumer.pop(),
+          Some(word),
+          "capacity {capacity}: across the wrap"
+        );
+      }
+      assert_eq!(consumer.pop(), None);
+      capacity *= 2;
+    }
+  }
+
+  /// AUD-29-33: do: claim the consumer, claim it again, drop the first claim, claim again; expect the second
+  /// claim `None` while the first is held and a fresh claim after it drops.
+  #[test]
+  fn the_consumer_is_claimed_by_one_holder_at_a_time() {
+    let ring = MpscRing::new(MIN_CAPACITY).unwrap();
+    let first = ring.consumer().unwrap();
+    assert!(
+      ring.consumer().is_none(),
+      "a second consumer while one is held"
+    );
+    ring.push(5).unwrap();
+    drop(first);
+    let second = ring.consumer().unwrap();
+    assert_eq!(second.pop(), Some(5));
   }
 
   #[test]
@@ -172,7 +275,7 @@ mod tests {
           }
         });
       }
-      let mut c = ring.consumer();
+      let c = ring.consumer().unwrap();
       let mut next = vec![0u64; usize::try_from(producers).unwrap()];
       let mut received = 0u64;
       while received < per_producer * producers {
@@ -232,7 +335,7 @@ mod loom_tests {
           })
         })
         .collect();
-      let mut consumer = ring.consumer();
+      let consumer = ring.consumer().unwrap();
       let mut got = Vec::new();
       let total = usize::try_from(producers * words_per_producer).unwrap();
       while got.len() < total {

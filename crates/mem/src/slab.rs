@@ -690,12 +690,12 @@ mod loom_tests {
         let to_peer: &'static SpscRing = Box::leak(Box::new(SpscRing::new(RING_CAPACITY).unwrap()));
         let from_peer: &'static MpscRing =
           Box::leak(Box::new(MpscRing::new(RING_CAPACITY).unwrap()));
-        let (mut publish, receive) = to_peer.split();
+        let (publish, receive) = to_peer.split().unwrap();
         let mut slab: Slab<u64> = Slab::new(SLOTS, SLOTS);
         let first = slab.insert(FIRST).unwrap();
         publish.push(first.encode(SHARD).unwrap().word()).unwrap();
         let peer = loom::thread::spawn(move || {
-          let mut receive = receive;
+          let receive = receive;
           let word = receive.pop().expect("published before the peer started");
           // The request back names the handle by the packed word it arrived as.
           let mut pending = word;
@@ -704,7 +704,7 @@ mod loom_tests {
             loom::thread::yield_now();
           }
         });
-        let mut requests = from_peer.consumer();
+        let requests = from_peer.consumer().unwrap();
         let mut applied = 0;
         // Give the peer its first chance to run before the shard's first look (the doc above).
         loom::thread::yield_now();

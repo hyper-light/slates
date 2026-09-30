@@ -35,7 +35,10 @@ fn send_as_shard(own: u16, target: u16, word: u64, landed: &AtomicU64) -> bool {
 fn drain_own(id: u16, landed: &AtomicU64) -> bool {
   with_entry(id, |entry| {
     let mut seen = false;
-    let mut ring = entry.inbound.consumer();
+    let ring = entry
+      .inbound
+      .consumer()
+      .expect("this thread is its slot's only consumer");
     while let Some(word) = ring.pop() {
       if word == 7 {
         landed.fetch_add(1, Ordering::Relaxed);

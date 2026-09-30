@@ -107,9 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let from_peer = SpscRing::new(1024)?;
   let stop = std::sync::atomic::AtomicBool::new(false);
   let mut round_trip = None;
+  let (peer_in_producer, peer_in_consumer) = to_peer.split().ok_or("a fresh ring splits")?;
+  let (peer_out_producer, peer_out_consumer) = from_peer.split().ok_or("a fresh ring splits")?;
   std::thread::scope(|scope| {
-    let (mut peer_in_producer, mut peer_in_consumer) = to_peer.split();
-    let (mut peer_out_producer, mut peer_out_consumer) = from_peer.split();
     let stop = &stop;
     scope.spawn(move || {
       while !stop.load(std::sync::atomic::Ordering::Acquire) {

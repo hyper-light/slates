@@ -135,8 +135,11 @@ fn check_ring(result: Result<Option<u64>, u64>) {
 #[library_benchmark(teardown = check_ring)]
 #[bench::push_pop(ring())]
 fn ring_push_pop(ring: SpscRing) -> Result<Option<u64>, u64> {
-  count_instructions(move || {
-    let (mut producer, mut consumer) = ring.split();
+  // Borrowed, not moved: moving the 384-byte ring into the measured closure cost a 54-instruction copy, and
+  // its teardown is not part of one push and pop (measured 2026-09-30).
+  count_instructions(|| {
+    // A fresh ring splits; a refusal reads as a word the teardown rejects.
+    let (producer, consumer) = ring.split().ok_or(u64::MAX)?;
     producer.push(black_box(7))?;
     Ok(black_box(consumer.pop()))
   })

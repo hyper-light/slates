@@ -305,7 +305,7 @@ mod loom_tests {
           kick.notify();
         });
       });
-      let mut consumer = ring.consumer();
+      let consumer = ring.consumer().unwrap();
       let mut waited = false;
       // The shard's loop: drain the ring, and park unless something is pending.
       let word = loop {
@@ -366,7 +366,7 @@ mod loom_tests {
         };
         let first = loom::thread::spawn(move || send(WORD));
         let second = loom::thread::spawn(move || send(WORD + 1));
-        let mut consumer = channel.consumer();
+        let consumer = channel.consumer().unwrap();
         let mut received = 0;
         let mut waited = false;
         // The shard's loop: a step drains when the flag is taken; a step that drained loops again; an idle
@@ -426,7 +426,7 @@ mod loom_tests {
           ring.push(WORD).unwrap();
           parking.kick_if_parked(|| kick.notify());
         });
-        let mut consumer = ring.consumer();
+        let consumer = ring.consumer().unwrap();
         let word = loop {
           if let Some(word) = consumer.pop() {
             break word;
