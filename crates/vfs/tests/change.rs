@@ -69,7 +69,7 @@ fn apply(step: &Step, vol: &mut Volume, store: &mut Store) {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig::with_cases(256))]
+  #![proptest_config(slates_test_seeds::seeded(ProptestConfig::with_cases(256), include_str!("change.proptest-regressions")).unwrap())]
 
   /// A-38: on generated histories, every object whose ctime moves under a stepping clock has its
   /// change counter moved under a frozen clock, at every step; no counter ever decreases.

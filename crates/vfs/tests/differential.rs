@@ -547,13 +547,12 @@ fn the_volume_agrees_with_the_host_filesystem_on_every_history() {
       base.display()
     );
   }
-  let mut runner = TestRunner::new(Config {
+  // A failing seed is reported, never written (A-50; AUD-29-63).
+  let mut runner = TestRunner::new(slates_test_seeds::unseeded(Config {
     cases: cases(),
     max_shrink_iters: 2000,
-    // Never write a regression file into the tree (CLAUDE.md §4).
-    failure_persistence: None,
     ..Config::default()
-  });
+  }));
   let counter = std::cell::Cell::new(0u64);
   let xattr_steps = std::cell::Cell::new(0u64);
   let strategy = prop::collection::vec(step(), 1..40);

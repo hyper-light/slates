@@ -191,6 +191,7 @@ fn truncate_to_zero_leaves_no_extents() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// T-6.8 (the splice oracle): for any base length and any journal, reading the spliced extent
   /// list back reproduces the file's final content — the new version's bytes are assembled from
   /// base and post-state references, never copied.

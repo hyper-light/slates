@@ -12,6 +12,7 @@ description = "The merge engine (D-27, §4.16): the deterministic two-pass verdi
 blake3 = { workspace = true }
 
 [dev-dependencies]
+slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
 
 # shuttle builds only under `RUSTFLAGS="--cfg shuttle"` for the sixteen-agent randomized schedule of

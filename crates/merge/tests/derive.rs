@@ -270,6 +270,7 @@ fn an_empty_journal_is_the_identity() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("derive.proptest-regressions")).unwrap())]
   /// T-6.1 (the deriver oracle): for any base length and any in-bounds journal, applying the net
   /// ops to the base — drawing added bytes from the post-state by source offset — reproduces the
   /// post-state exactly. This is composition-is-correct without any byte comparison in the

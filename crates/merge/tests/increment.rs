@@ -456,6 +456,7 @@ fn content_on_a_missing_file_refuses() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("increment.proptest-regressions")).unwrap())]
   /// T-6.7 (the whole-volume oracle): for any base and any valid journal of content, create,
   /// unlink and rename across three paths, reconstructing the filesystem from the increment
   /// reproduces the model the journal produced (skipping the rare owed refusal).
@@ -649,6 +650,7 @@ fn simulate_dirs(base_dirs: &[String], raw_ops: &[Raw]) -> (Vec<VolumeOp>, BTree
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("increment.proptest-regressions")).unwrap())]
   /// T-6.10 (the directory oracle): for any base directories and any valid mkdir/rmdir journal,
   /// applying the document's Mkdir and Rmdir ops to the base directory set yields the set the
   /// journal actually produced.

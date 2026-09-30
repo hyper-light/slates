@@ -24,6 +24,7 @@ slates-rt = { workspace = true }
 blake3 = { workspace = true }
 
 [dev-dependencies]
+slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

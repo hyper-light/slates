@@ -17,7 +17,7 @@ use slates_vfs::volume::Seek;
 const SPAN: u64 = 1 << 20;
 
 proptest! {
-  #![proptest_config(ProptestConfig::with_cases(64))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::with_cases(64)))]
 
   /// A-35 (RFC 7862 §15.11): after writes of nonzero bytes at generated offsets, for every probed
   /// offset inside the file: SEEK_DATA answers a byte at or after it with no written byte skipped, and

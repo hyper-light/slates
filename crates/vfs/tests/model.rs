@@ -920,7 +920,7 @@ fn run(steps: Vec<Step>, quota: u64) {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig { cases: 400, max_shrink_iters: 4000, failure_persistence: None, .. ProptestConfig::default() })]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 400, max_shrink_iters: 4000, .. ProptestConfig::default() }))]
 
   #[test]
   fn the_volume_equals_the_model_on_every_history(steps in prop::collection::vec(step(), 1..40)) {
@@ -952,13 +952,12 @@ fn ac_1_1_one_million_generated_operations_agree_with_the_model() {
     let mut seed = [0u8; 32];
     seed[..8].copy_from_slice(&batch.to_le_bytes());
     let mut runner = TestRunner::new_with_rng(
-      Config {
+      // A failing seed is reported, never written (A-50; AUD-29-63).
+      slates_test_seeds::unseeded(Config {
         cases: CASES_PER_BATCH,
         max_shrink_iters: 4000,
-        // Never write a regression file into the tree (CLAUDE.md §4).
-        failure_persistence: None,
         ..Config::default()
-      },
+      }),
       TestRng::from_seed(RngAlgorithm::ChaCha, &seed),
     );
     let result = runner.run(&strategy, |steps| {

@@ -262,7 +262,7 @@ proptest! {
   // Takeover/commit interleavings that expose an epoch or fence bug are a sparse needle; a high case
   // count exercises the class in well under a second (the example tests in register.rs are the
   // deterministic guards).
-  #![proptest_config(ProptestConfig { cases: 8192, ..ProptestConfig::default() })]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 8192, ..ProptestConfig::default() }))]
 
   /// Over any history of commits and takeovers at f in {0, 1, 2}, the register preserves Agreement /
   /// no-rewrite, Continuity, StaleNeverCommits and non-vacuity. Each step is `(is_takeover, value, mask)`

@@ -18,6 +18,7 @@ slates-archive = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+slates-test-seeds = { workspace = true }
 libc = { workspace = true }
 proptest = { workspace = true }
 # The differential suite's host side sets, lists and removes extended attributes (§4.5).

@@ -3171,9 +3171,12 @@ removal, base-watcher and host-differential suites run on macOS too; the tracer 
 outside. That found the dead kqueue base watcher (fixed,
 `docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`) and a removal oracle that
 held only on tmpfs (fixed, `docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
-Defects still to remove: the CLI's reads of fleet manifest, certificate, key and recovery-key files (and the
-test fixtures that write them); persisted proptest failures (AUD-29-63); proof of what backs each kernel
-pseudo-file the machine profile reads. The residency, disclosure and ownership claims stay open with their findings (AUD-29-41, -42, -43,
+**AUD-29-63 closed 2026-09-30:** property suites replay their reviewed seed files compiled in and report a new
+failing seed on the error stream, never a file (`crates/test-seeds`; four by-use tests, one of which proves a
+compiled seed is replayed first; `cargo xtask check` refuses a suite that could write); the fleet trace goes to
+the error stream (`SLATES_FLEET_TRACE=1`); the landing target fixture is in the build output. Defects still to
+remove: the CLI's reads of fleet manifest, certificate, key and recovery-key files (and the test fixtures that
+write them); proof of what backs each kernel pseudo-file the machine profile reads. The residency, disclosure and ownership claims stay open with their findings (AUD-29-41, -42, -43,
 -44, -45, -59, -62).
 
 **Closed 2026-09-30 — AUD-29-02 (A-48, A-49): a landing lands exactly the snapshot it names.** The engine's

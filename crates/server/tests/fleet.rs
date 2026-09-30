@@ -134,7 +134,7 @@ const TRACE_SAMPLE: Duration = Duration::from_secs(1);
 /// the very shard it starves. The ask itself already waited the observe budget; this only spaces the next.
 const UNAVAILABLE_PACE: Duration = Duration::from_nanos(HEARTBEAT_NS / POLL_PER_PERIOD);
 
-/// The trace of one wait ([`trace`], on only when `SLATES_FLEET_TRACE` names a file): its site (the file
+/// The trace of one wait ([`trace`], on only when `SLATES_FLEET_TRACE=1`, written to the test's error stream): its site (the file
 /// and line that called the wait, so no call site needs a label), when it began and last sampled, how
 /// many times the condition was asked since, the slowest ask it saw, and how many asks the daemons could
 /// not answer (with the last such refusal) — so a stall names the wait, what the observed coordinators

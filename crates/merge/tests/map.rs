@@ -232,6 +232,7 @@ fn the_shrunk_history_of_ci_run_36655388624_agrees() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// T-6.4 (the position-mapping oracle): for any base length, any sequence of intervening
   /// single-op deltas, and any base range, the mapper agrees with the provenance: a range whose
   /// bytes stayed intact and contiguous at every version maps to their head position, and any other

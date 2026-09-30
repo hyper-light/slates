@@ -250,6 +250,7 @@ mod oracle {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
     /// Over any history of issues, accepts, announce, owner-ack, transfers and retire, ReadSafety
     /// holds in every reachable state and NoLoss holds once retired. Steps are `(action, x, y)`
     /// tuples so the strategy needs no `Arc`-backed `prop_oneof` (R2).

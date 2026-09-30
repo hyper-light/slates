@@ -730,7 +730,7 @@ fn note_applied(op: &Op, ids: &mut Ids) {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig { cases: 60, failure_persistence: None, ..ProptestConfig::default() })]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 60, ..ProptestConfig::default() }))]
 
   /// AC-2.3's durability half and AC-2.4's fencing under generated histories: after every
   /// crash the recovered partition equals the live one; refused operations were never

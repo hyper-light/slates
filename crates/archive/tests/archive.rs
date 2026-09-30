@@ -147,6 +147,7 @@ fn a_short_stream_is_refused() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// T-7.4 (hostile): any truncation of a valid archive is refused with a typed error, never a
   /// panic and never a false accept.
   #[test]

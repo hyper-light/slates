@@ -175,6 +175,7 @@ mod tests {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
     /// The behavioural oracle (R5): whatever number a healthy in-order receiver expects, the sender's
     /// chosen field length lets it reconstruct the exact number sent. For any `full_pn` and any
     /// `largest_acked ≤ full_pn`, decoding the encoded field against **any** largest-received value in

@@ -94,8 +94,7 @@ contact is a defect against this requirement, recorded here and in GAPS until it
 - the machine profile's queries of kernel pseudo-files (`slates-machine`) — kernel state, not disk files,
   but the path alone does not prove the backing object, so each interface is to be identified;
 - test fixtures that write the operator's files the CLI reads (a fleet manifest, DER certificates and keys, a
-  recovery key), which go with the CLI's reads above; and property-test failures persisted beside the source
-  (AUD-29-63).
+  recovery key), which go with the CLI's reads above.
 
 > **Status (2026-09-30).** A test's real host directories — landing targets, bases, kernel mount points,
 > the conformance harness's scratch and records — are in the build output (`CARGO_TARGET_TMPDIR`, or
@@ -106,7 +105,12 @@ contact is a defect against this requirement, recorded here and in GAPS until it
 > real disks found two defects that tmpfs had hidden: the kqueue base watcher never delivered a hint
 > (`docs/bugs/2026-09-30-the-kqueue-base-watcher-drained-into-a-zero-length-list.md`), and the removal
 > oracle's identity and call-count premises failed on ext4
-> (`docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`).
+> (`docs/bugs/2026-09-30-the-removal-oracle-assumed-tmpfs-identity-and-timing.md`). Property tests write no
+> failure file (AUD-29-63): every suite is configured through `slates-test-seeds`, which compiles the reviewed
+> seed files into the test binary, replays them before novel cases, and reports a new failing seed on the
+> test's error stream in the seed file's own line format; `cargo xtask check` refuses a suite that bypasses
+> it or sets `failure_persistence` itself. The fleet harness trace writes to the test's error stream
+> (`SLATES_FLEET_TRACE=1`), never a file.
 
 Four separate claims follow from it, each needing its own evidence:
 

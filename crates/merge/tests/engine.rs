@@ -810,6 +810,7 @@ fn a_truncated_increment_refuses() {
 // merge block by block; the engine must agree on every generated history.
 
 proptest! {
+  #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("engine.proptest-regressions")).unwrap())]
   // Each block independently: 0 = untouched, 1..=3 = overwritten with that tag. The agent must
   // touch at least one block (an empty content increment is a different path).
   #[test]

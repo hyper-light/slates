@@ -601,6 +601,7 @@ mod tests {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
     /// The oracle (T-transport streams): the space against a serial model that remembers every stream the
     /// peer ever opened and closed, over generated histories. The space must agree on every arrival, never
     /// hold more than the limit of the peer's streams (open plus awaited), and remember a closed stream as

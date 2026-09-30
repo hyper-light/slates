@@ -150,6 +150,7 @@ fn an_unknown_kind_is_refused() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// T-7.4-style (hostile): arbitrary bytes decode to a typed error or a tree, never a panic.
   #[test]
   fn arbitrary_bytes_do_not_panic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {

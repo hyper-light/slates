@@ -247,7 +247,7 @@ mod oracle {
     // A high case count: the adversarial quorum transitions of the source audit's BUG-12 are a
     // sparse needle, so the default 256 cases misses them; 16384 reliably exercises the class in a
     // fraction of a second (the deterministic regression above is the guaranteed guard).
-    #![proptest_config(ProptestConfig { cases: 16384, ..ProptestConfig::default() })]
+    #![proptest_config(slates_test_seeds::seeded(ProptestConfig { cases: 16384, ..ProptestConfig::default() }, include_str!("ledger.proptest-regressions")).unwrap())]
 
     /// Over any history at f in {0,1,2}, the register never violates its safety properties:
     /// Agreement (no position holds two quorum-agreed identities), NoLoss and TotalOrder (the

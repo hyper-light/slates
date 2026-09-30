@@ -459,6 +459,7 @@ mod tests {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
     /// The overlap oracle: arbitrary slices of a known stream — overlapping each other partially, duplicated,
     /// in any order — reassemble to exactly the covered prefix; the first copy of every byte is kept, and a
     /// segment straddling several buffered ones fills only the gaps between them.
@@ -484,6 +485,7 @@ mod tests {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
     /// The reassembly oracle: a known byte string split into segments offered in an arbitrary order,
     /// with arbitrary duplicates, reassembles to exactly the original — proof of ordered, gapless,
     /// once-each delivery under reorder and duplication.

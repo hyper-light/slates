@@ -64,7 +64,7 @@ impl Model {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig { cases: 400, ..ProptestConfig::default() })]
+  #![proptest_config(slates_test_seeds::seeded(ProptestConfig { cases: 400, ..ProptestConfig::default() }, include_str!("reference_model.proptest-regressions")).unwrap())]
 
   /// AC-1.7-style oracle: the volume's per-attachment references and teardown sweep match the serial
   /// model on every generated history — aliveness agrees after every step, a reference succeeds iff

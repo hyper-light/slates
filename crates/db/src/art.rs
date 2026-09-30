@@ -589,7 +589,7 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(ProptestConfig { cases: 400, failure_persistence: None, ..ProptestConfig::default() })]
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 400, ..ProptestConfig::default() }))]
 
     /// The tree equals an ordered map on every generated history: insert, remove, get, and
     /// iteration order, with prefixes of other keys and empty keys included.

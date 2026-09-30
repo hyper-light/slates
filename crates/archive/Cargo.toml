@@ -22,6 +22,7 @@ default = ["zstd"]
 zstd = ["dep:zstd"]
 
 [dev-dependencies]
+slates-test-seeds = { workspace = true }
 proptest = { workspace = true }
 
 [lints]

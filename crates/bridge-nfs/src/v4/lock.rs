@@ -488,6 +488,7 @@ mod tests {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
     /// A-35 (the lock algebra, RFC 8881 §18.10.4 POSIX semantics): on every generated history of locks
     /// and unlocks, the owner's ranges equal the byte-level model, stay disjoint and ordered, and never
     /// leave two touching ranges of one kind unmerged.

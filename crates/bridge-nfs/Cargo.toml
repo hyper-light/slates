@@ -16,6 +16,7 @@ slates-rt = { workspace = true }
 slates-vfs = { workspace = true }
 
 [dev-dependencies]
+slates-test-seeds = { workspace = true }
 slates-mem = { workspace = true }
 proptest = { workspace = true }
 

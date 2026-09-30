@@ -9,7 +9,8 @@
 - **Box:** Darwin 25.4.0 arm64, 18 hardware threads (`hw.ncpu = 18`), shared with other agents' builds.
 - **Suite:** `cargo test -p slates-server --test fleet -- --test-threads=1`, 34 tests, serialized behind
   `FLEET_TEST_LOCK` so one test's daemons run against a quiet machine.
-- **Instrument:** the opt-in trace this change adds (`SLATES_FLEET_TRACE=<path>`; commits `c760deb`,
+- **Instrument:** the opt-in trace this change adds (`SLATES_FLEET_TRACE=<path>` then; since 2026-09-30
+  `SLATES_FLEET_TRACE=1`, written to the test's error stream, never a file — A-50, AUD-29-63; commits `c760deb`,
   `f8caa59`). Off by default. Per poll: the wait's site, the slowest observed coordinator's period count
   (`Daemon::fleet_progress`, a direct atomic read), the periods advanced, the frozen-progress span, the
   ask count and slowest ask, and each daemon's every-shard **pulse** (`Daemon::shard_pulses`, read

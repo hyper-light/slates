@@ -214,7 +214,7 @@ fn same_files(a: &PathState, b: &PathState) -> bool {
 }
 
 proptest! {
-  #![proptest_config(ProptestConfig { cases: 300, max_shrink_iters: 2000, failure_persistence: None, .. ProptestConfig::default() })]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 300, max_shrink_iters: 2000, .. ProptestConfig::default() }))]
 
   /// T-1.18 and AC-1.15: on random histories over a random base, applying the derived
   /// document to the base reproduces the head's files, symlinks and directories byte for

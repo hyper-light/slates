@@ -2785,6 +2785,7 @@ mod tests {
   }
 
   proptest! {
+    #![proptest_config(slates_test_seeds::seeded(proptest::test_runner::Config::default(), include_str!("../proptest-regressions/connection.txt")).unwrap())]
     /// The behavioural oracle (R5): for any streams and any loss pattern, the receiver reassembles each
     /// stream exactly — in order, each byte once, never confused.
     #[test]

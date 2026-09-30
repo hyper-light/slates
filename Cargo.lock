@@ -1402,6 +1402,7 @@ dependencies = [
  "blake3",
  "lz4_flex",
  "proptest",
+ "slates-test-seeds",
  "zstd",
 ]
 
@@ -1461,6 +1462,7 @@ dependencies = [
  "slates-db",
  "slates-mem",
  "slates-rt",
+ "slates-test-seeds",
  "slates-vfs",
 ]
 
@@ -1567,6 +1569,7 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "slates-rt",
+ "slates-test-seeds",
  "slates-wire",
 ]
 
@@ -1645,6 +1648,7 @@ dependencies = [
  "blake3",
  "proptest",
  "shuttle",
+ "slates-test-seeds",
 ]
 
 [[package]]
@@ -1712,6 +1716,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "slates-test-seeds"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "slates-transport"
 version = "0.1.0"
 dependencies = [
@@ -1724,6 +1735,7 @@ dependencies = [
  "sha2",
  "slates-machine",
  "slates-rt",
+ "slates-test-seeds",
 ]
 
 [[package]]
@@ -1738,6 +1750,7 @@ dependencies = [
  "slates-archive",
  "slates-machine",
  "slates-mem",
+ "slates-test-seeds",
  "slates-wire",
  "unicode-normalization",
 ]

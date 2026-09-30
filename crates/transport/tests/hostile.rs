@@ -64,6 +64,7 @@ fn valid_sealed() -> Vec<u8> {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// The plaintext codec never panics on arbitrary bytes, and any datagram it accepts round-trips.
   #[test]
   fn plaintext_decode_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..4096)) {

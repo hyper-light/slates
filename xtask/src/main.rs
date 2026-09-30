@@ -484,6 +484,7 @@ mod structural {
       check_dependencies(&metadata, package, &mut violations);
       check_sources(package, &mut violations)?;
       check_no_panic_ratchet(package, &mut violations)?;
+      check_property_persistence(package, &mut violations)?;
     }
     check_design_table(&root, &mut violations)?;
     if violations.is_empty() {
@@ -644,6 +645,71 @@ mod structural {
     }
   }
 
+  /// Format: the crate that owns property-test failure persistence (A-50; AUD-29-63).
+  const SEEDS_CRATE: &str = "slates-test-seeds";
+  /// Format: the path through which every property suite takes its configuration.
+  const SEEDS_PATH: &str = "slates_test_seeds::";
+
+  /// A property suite writes no failure file (A-50; AUD-29-63): every `proptest!` block and every
+  /// hand-built `TestRunner` in `package` takes its configuration through `slates_test_seeds` (one use per
+  /// suite, so a second block in a file cannot inherit proptest's writing default), and nothing but that
+  /// crate sets `failure_persistence`. Sources, tests, benches and examples are all checked: a failing test
+  /// is exactly where the default would write.
+  fn check_property_persistence(
+    package: &Package,
+    violations: &mut Vec<String>,
+  ) -> Result<(), Failure> {
+    if package.name == SEEDS_CRATE {
+      return Ok(());
+    }
+    let crate_root = Path::new(&package.manifest_path)
+      .parent()
+      .ok_or_else(|| Failure(format!("{}: manifest has no directory", package.name)))?;
+    let mut files = Vec::new();
+    for tree in ["src", "tests", "benches", "examples"] {
+      let dir = crate_root.join(tree);
+      if dir.is_dir() {
+        rust_sources(&dir, &mut files)?;
+      }
+    }
+    for file in files {
+      let source = std::fs::read_to_string(&file)?;
+      violations.extend(property_persistence_violations(
+        &file.display().to_string(),
+        &source,
+      ));
+    }
+    Ok(())
+  }
+
+  /// The persistence violations in one file's source (comments and string contents ignored).
+  fn property_persistence_violations(label: &str, source: &str) -> Vec<String> {
+    let code: Vec<String> = source.lines().map(code_only).collect();
+    let count = |needle: &str| {
+      code
+        .iter()
+        .map(|line| line.matches(needle).count())
+        .fold(0usize, usize::saturating_add)
+    };
+    let suites = count("proptest!")
+      .saturating_add(count("TestRunner::new("))
+      .saturating_add(count("TestRunner::new_with_rng("));
+    let through_seeds = count(SEEDS_PATH);
+    let mut found = Vec::new();
+    if through_seeds < suites {
+      found.push(format!(
+        "{label}: {suites} property suite(s) but {through_seeds} configured through `{SEEDS_PATH}` — \
+         proptest's default writes a failure file (A-50; AUD-29-63)"
+      ));
+    }
+    if count("failure_persistence") > 0 {
+      found.push(format!(
+        "{label}: sets `failure_persistence`; use `{SEEDS_PATH}seeded` or `unseeded` (A-50; AUD-29-63)"
+      ));
+    }
+    found
+  }
+
   /// Format: the markers around the design's generated table of host-path sites (§0.2, A-50).
   const TABLE_BEGIN: &str = "<!-- host-path-sites:begin -->\n";
   const TABLE_END: &str = "<!-- host-path-sites:end -->";
@@ -680,7 +746,36 @@ mod structural {
 
   #[cfg(test)]
   mod tests {
-    use super::{TABLE_BEGIN, TABLE_END, design_table, host_path_table, workspace_root};
+    use super::{
+      TABLE_BEGIN, TABLE_END, design_table, host_path_table, property_persistence_violations,
+      workspace_root,
+    };
+
+    /// AUD-29-63. Do: judge a file whose two property blocks both go through the seeds crate, one whose
+    /// second block does not, one with a hand-built runner that does not, and one that sets
+    /// `failure_persistence` itself. Expect: the first passes; each other is refused, naming the reason; a
+    /// mention in a comment counts for nothing.
+    #[test]
+    fn a_property_suite_that_could_write_a_failure_file_is_refused() {
+      let both = "proptest! {\n #![proptest_config(slates_test_seeds::unseeded(c))]\n}\nproptest! {\n #![proptest_config(slates_test_seeds::unseeded(c))]\n}\n";
+      assert!(property_persistence_violations("a.rs", both).is_empty());
+      let second_bare = "proptest! {\n #![proptest_config(slates_test_seeds::unseeded(c))]\n}\nproptest! {\n}\n// slates_test_seeds:: in a comment\n";
+      let refused = property_persistence_violations("b.rs", second_bare);
+      assert_eq!(refused.len(), 1, "{refused:?}");
+      assert!(
+        refused[0].contains("2 property suite(s) but 1"),
+        "{refused:?}"
+      );
+      let runner = "let r = TestRunner::new(Config::default());\n";
+      assert_eq!(property_persistence_violations("c.rs", runner).len(), 1);
+      let own = "let r = TestRunner::new(slates_test_seeds::unseeded(Config { failure_persistence: None, ..c }));\n";
+      let refused = property_persistence_violations("d.rs", own);
+      assert_eq!(refused.len(), 1, "{refused:?}");
+      assert!(
+        refused[0].contains("sets `failure_persistence`"),
+        "{refused:?}"
+      );
+    }
 
     fn design_path() -> std::path::PathBuf {
       workspace_root()

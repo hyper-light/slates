@@ -80,6 +80,7 @@ fn a_chunk_is_evicted_on_the_last_release() {
 }
 
 proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
   /// T-7.1 (property): for any chunks with duplicates, the store reads back byte-exact and its
   /// accounting is exact — distinct chunks stored once, references summed. The non-vacuity check:
   /// when duplicates were inserted, the unique count is below the insert count (dedup happened).

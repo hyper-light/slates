@@ -26,6 +26,7 @@ rustix = { workspace = true }
 slates-machine = { workspace = true }
 
 [dev-dependencies]
+slates-test-seeds = { workspace = true }
 # Generative hostile-input fuzzing of the wire parsers (the hostile-input rule; D-20).
 proptest = { workspace = true }
 # A self-signed cert for the handshake test (pure Rust with the ring feature — no cmake).

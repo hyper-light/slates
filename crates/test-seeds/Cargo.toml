@@ -1,0 +1,16 @@
+[package]
+name = "slates-test-seeds"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+publish = false
+description = "Property-test failure persistence without a disk (A-50; audit AUD-29-63): each suite's reviewed seed file is compiled into the test binary and replayed; a new failing seed is reported on the test's error stream, never written. A development dependency only."
+
+[dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
