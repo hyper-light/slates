@@ -93,13 +93,16 @@ const GENERATION_BITS: u32 = 24;
 impl Encoded {
   /// The largest slot index the packed form can carry.
   pub const MAX_SLOT: u32 = (1 << SLOT_BITS) - 1;
+  /// The largest generation the packed form can carry: a slab whose handles are packed here retires a
+  /// slot at this generation rather than issue one the word would have to truncate (AUD-29-11).
+  pub const MAX_GENERATION: u32 = (1 << GENERATION_BITS) - 1;
 
-  /// Packs the three fields, refusing a slot index that does not fit.
+  /// Packs the three fields, refusing a slot index or a generation that does not fit (never truncated:
+  /// a truncated generation would alias an older one of the same slot).
   pub const fn pack(shard: u16, slot: u32, generation: u32) -> Option<Encoded> {
-    if slot > Self::MAX_SLOT {
+    if slot > Self::MAX_SLOT || generation > Self::MAX_GENERATION {
       return None;
     }
-    let generation = generation & ((1 << GENERATION_BITS) - 1);
     Some(Encoded(
       ((shard as u64) << (SLOT_BITS + GENERATION_BITS))
         | ((slot as u64) << GENERATION_BITS)
@@ -129,16 +132,16 @@ impl Encoded {
     u32::try_from((self.0 >> GENERATION_BITS) & ((1 << SLOT_BITS) - 1)).unwrap_or(u32::MAX)
   }
 
-  /// The low 24 bits of the generation.
+  /// The generation (at most [`Encoded::MAX_GENERATION`]).
   pub fn generation(self) -> u32 {
     // Masked to GENERATION_BITS bits, so the conversion cannot fail.
     u32::try_from(self.0 & ((1 << GENERATION_BITS) - 1)).unwrap_or(u32::MAX)
   }
 
-  /// Whether this packed handle names the same slot and generation as `handle`.
+  /// Whether this packed handle names the same slot and generation as `handle`, exactly: a handle whose
+  /// generation the word could not carry matches no word.
   pub fn matches<T>(self, handle: Handle<T>) -> bool {
-    self.slot() == handle.index
-      && self.generation() == (handle.generation & ((1 << GENERATION_BITS) - 1))
+    self.slot() == handle.index && self.generation() == handle.generation
   }
 }
 
@@ -172,18 +175,36 @@ mod tests {
 
   #[test]
   fn encoding_round_trips_and_refuses_an_oversized_slot() {
-    let h: Handle<u8> = Handle::new(123_456, 0xABCD_EF01);
+    let h: Handle<u8> = Handle::new(123_456, 0xCD_EF01);
     let e = h.encode(42).unwrap();
     assert_eq!(e.shard(), 42);
     assert_eq!(e.slot(), 123_456);
     assert_eq!(e.generation(), 0xCD_EF01);
     assert!(e.matches(h));
-    assert!(!e.matches(Handle::<u8>::new(123_456, 0xABCD_EF02)));
+    assert!(!e.matches(Handle::<u8>::new(123_456, 0xCD_EF02)));
     assert_eq!(Encoded::from_word(e.word()), e);
     assert!(
       Handle::<u8>::new(Encoded::MAX_SLOT + 1, 0)
         .encode(0)
         .is_none()
+    );
+  }
+
+  /// AUD-29-11. Do: pack a generation one past the word's width; compare a word against a handle whose
+  /// generation differs from it only above 24 bits. Expect: the pack is refused, and the word matches only
+  /// its exact generation — before, both truncated to 24 bits and aliased.
+  #[test]
+  fn a_generation_the_word_cannot_carry_is_refused_not_truncated() {
+    assert!(
+      Handle::<u8>::new(1, Encoded::MAX_GENERATION + 1)
+        .encode(0)
+        .is_none()
+    );
+    let word = Handle::<u8>::new(1, 5).encode(0).unwrap();
+    assert!(word.matches(Handle::<u8>::new(1, 5)));
+    assert!(
+      !word.matches(Handle::<u8>::new(1, 5 + (1 << 24))),
+      "no 24-bit alias"
     );
   }
 }

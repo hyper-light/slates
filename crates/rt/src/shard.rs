@@ -332,11 +332,14 @@ impl ShardContext {
     // The arena's generations continue from where the slot's previous holder left them, so a wake
     // word minted for that shard can never name a task of this one (registry slot reuse, §4.3).
     let generation_base = registry::entry(seed.id).map_or(0, |entry| entry.generation_base);
+    // A task's handle is packed into a wake word of 24 generation bits: a slot retires at that limit
+    // rather than issue a generation the word would truncate into an alias (AUD-29-11).
     let mut arena = Slab::with_generation_base(
       config.tasks_per_shard.min(config.segment_tasks()),
       config.tasks_per_shard,
       generation_base,
-    );
+    )
+    .with_generation_limit(Encoded::MAX_GENERATION);
     arena.reserve_segments(
       config
         .tasks_per_shard
@@ -1237,7 +1240,7 @@ impl ShardContext {
         if !inner
           .arena
           .generation_at(slot)
-          .is_some_and(|g| g & GENERATION_MASK == generation)
+          .is_some_and(|g| g == generation)
         {
           return Err(RtError::StaleTask { slot, generation });
         }
@@ -1264,7 +1267,7 @@ impl ShardContext {
       inner
         .arena
         .generation_at(p.slot)
-        .is_some_and(|g| g & GENERATION_MASK == p.generation)
+        .is_some_and(|g| g == p.generation)
     });
     for p in &inner.pollers {
       if (p.ready)() {
@@ -1280,7 +1283,7 @@ impl ShardContext {
     if inner
       .arena
       .generation_at(word.slot())
-      .is_some_and(|g| g & GENERATION_MASK == word.generation())
+      .is_some_and(|g| g == word.generation())
     {
       self.local.push(word.slot());
     } else {
@@ -1400,9 +1403,6 @@ impl ShardContext {
     drop(dropped);
   }
 }
-
-/// Format: the generation bits an inbound wake carries (the low 24 of the slot's 32).
-const GENERATION_MASK: u32 = (1 << 24) - 1;
 
 fn handle_of(id: TaskId) -> Handle<TaskSlot> {
   Handle::from_raw(id.0.slot(), id.0.generation())

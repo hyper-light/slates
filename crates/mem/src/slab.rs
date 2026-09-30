@@ -6,16 +6,26 @@
 //! allocator. `remove` bumps the slot's generation, so every handle issued for the old occupant
 //! is refused from then on with `StaleHandle` (T-0.1). Capacity is bounded by the caller so
 //! admission stays a decision, not an accident.
+//!
+//! A generation is never wrapped (AUD-29-11). Each slab has a generation limit: the largest generation
+//! every representation of its handles can carry (`u32::MAX` for a plain handle; the runtime's task arena
+//! sets the packed wake word's 24 bits, [`Encoded::MAX_GENERATION`](crate::handle::Encoded)). A slot freed
+//! at the limit is **retired**: it holds nothing and is never issued again, so no handle it ever issued
+//! can name a later occupant. Until 2026-09-30 the generation wrapped to zero, and an ancient generation-zero
+//! handle resolved to the new object; the runtime's words compared 24 masked bits, aliasing after 2^24
+//! reuses of one slot. Retirement costs capacity only after a slot has been reused its whole generation
+//! space; a slab that has none left refuses [`MemError::GenerationExhausted`], never `SlabFull`.
 
 use crate::error::MemError;
 use crate::handle::Handle;
 use crate::segmented::Segmented;
 
-/// A slot: vacant with a link to the next free slot, or occupied.
+/// A slot: vacant with a link to the next free slot, occupied, or retired (its generations spent).
 #[derive(Debug)]
 enum Body<T> {
   Vacant { next_free: Option<u32> },
   Occupied(T),
+  Retired,
 }
 
 #[derive(Debug)]
@@ -35,6 +45,12 @@ pub struct Slab<T> {
   /// same shard id starts every slot past the highest generation the old one issued, so a handle
   /// minted for the old slab can never match a slot of this one. Zero for a first slab.
   generation_base: u32,
+  /// The largest generation a handle of this slab may carry, in every representation it is packed into.
+  generation_limit: u32,
+  /// Slots retired at the limit: never issued again.
+  retired: usize,
+  /// The last slot retired, which a refusal names.
+  last_retired: Option<u32>,
 }
 
 impl<T> Slab<T> {
@@ -54,6 +70,9 @@ impl<T> Slab<T> {
       len: 0,
       max_slots,
       generation_base: 0,
+      generation_limit: u32::MAX,
+      retired: 0,
+      last_retired: None,
     }
   }
 
@@ -69,19 +88,46 @@ impl<T> Slab<T> {
       len: 0,
       max_slots,
       generation_base,
+      generation_limit: u32::MAX,
+      retired: 0,
+      last_retired: None,
     }
   }
 
   /// One past the highest generation any slot of this slab has reached: what a successor slab under
   /// the same shard id must start from so no handle of this slab names one of its slots.
+  /// Saturates at `u32::MAX`, which is past every limit: a successor then has no generation to issue.
   pub fn generation_high(&self) -> u32 {
     let mut high = self.generation_base;
     for index in 0..self.slots.len() {
       if let Some(slot) = self.slots.get(index) {
-        high = high.max(slot.generation.wrapping_add(1));
+        high = high.max(slot.generation.saturating_add(1));
       }
     }
     high
+  }
+
+  /// Limits every handle this slab issues to generations at most `limit` (the smallest width any
+  /// representation of its handles packs a generation into). Past it a slot retires.
+  #[must_use]
+  pub fn with_generation_limit(mut self, limit: u32) -> Self {
+    self.generation_limit = limit;
+    self
+  }
+
+  /// Slots retired at the generation limit.
+  pub const fn retired(&self) -> usize {
+    self.retired
+  }
+
+  /// The refusal when no slot can be issued: the generations are spent if any slot retired, else full.
+  fn no_slot(&self) -> MemError {
+    match self.last_retired {
+      Some(index) => MemError::GenerationExhausted { index },
+      None => MemError::SlabFull {
+        capacity: self.max_slots,
+      },
+    }
   }
 
   /// Pre-allocates `count` segments so that the next inserts allocate nothing.
@@ -121,7 +167,8 @@ impl<T> Slab<T> {
   /// Whether an insert would succeed — the occupied count is below the bound. Lets a caller that
   /// must not lose its value on a full slab check first, since `insert` consumes the value.
   pub const fn has_room(&self) -> bool {
-    self.len < self.max_slots
+    self.len.saturating_add(self.retired) < self.max_slots
+      && self.generation_base <= self.generation_limit
   }
 
   /// Slots created so far (occupied or vacant).
@@ -145,24 +192,28 @@ impl<T> Slab<T> {
         })?;
       let next = match slot.body {
         Body::Vacant { next_free } => next_free,
-        Body::Occupied(_) => None,
+        Body::Occupied(_) | Body::Retired => None,
       };
       slot.body = Body::Occupied(value);
       self.free_head = next;
-      self.len += 1;
+      self.len = self.len.saturating_add(1);
       return Ok(Handle::new(index, slot.generation));
     }
     if self.slots.len() >= self.max_slots {
-      return Err(MemError::SlabFull {
-        capacity: self.max_slots,
-      });
+      return Err(self.no_slot());
     }
     let generation = self.generation_base;
+    if generation > self.generation_limit {
+      // A predecessor under the same identity spent the generations: no fresh slot may be issued.
+      return Err(MemError::GenerationExhausted {
+        index: u32::try_from(self.slots.len()).unwrap_or(u32::MAX),
+      });
+    }
     let index = self.slots.push(Slot {
       generation,
       body: Body::Occupied(value),
     });
-    self.len += 1;
+    self.len = self.len.saturating_add(1);
     let index = u32::try_from(index).map_err(|_| MemError::SlabFull {
       capacity: self.max_slots,
     })?;
@@ -196,6 +247,9 @@ impl<T> Slab<T> {
         len: self.slots.len(),
       });
     }
+    if generation > self.generation_limit {
+      return Err(MemError::GenerationExhausted { index });
+    }
     // Fill the gap [slots.len(), index) with vacant slots threaded into the free list, so a
     // destroyed entry's slot is reused by a later insert exactly as a fresh slab would reuse it.
     while self.slots.len() < target {
@@ -212,7 +266,7 @@ impl<T> Slab<T> {
       generation,
       body: Body::Occupied(value),
     });
-    self.len += 1;
+    self.len = self.len.saturating_add(1);
     Ok(Handle::new(index, generation))
   }
 
@@ -245,11 +299,13 @@ impl<T> Slab<T> {
   }
 
   /// The current generation of a slot by index (occupied or vacant), for structures that link
-  /// slots by index and rebuild the handle to check liveness; `None` beyond the slots created.
+  /// slots by index and rebuild the handle to check liveness; `None` beyond the slots created and for a
+  /// retired slot, which has no live generation (its last would otherwise still match its last handle).
   pub fn generation_at(&self, index: u32) -> Option<u32> {
     self
       .slots
       .get(usize::try_from(index).unwrap_or(usize::MAX))
+      .filter(|slot| !matches!(slot.body, Body::Retired))
       .map(|slot| slot.generation)
   }
 
@@ -258,26 +314,47 @@ impl<T> Slab<T> {
     self.get(handle).is_ok()
   }
 
-  /// Removes the value behind a live handle; the slot's generation moves on.
+  /// Removes the value behind a live handle; the slot's generation moves on, or the slot retires at the
+  /// generation limit.
   pub fn remove(&mut self, handle: Handle<T>) -> Result<T, MemError> {
-    let index = usize::try_from(handle.index()).unwrap_or(usize::MAX);
-    let slot = self.slots.get_mut(index).ok_or_else(|| stale(handle))?;
-    if slot.generation != handle.generation() || matches!(slot.body, Body::Vacant { .. }) {
-      return Err(stale(handle));
-    }
-    let body = std::mem::replace(
-      &mut slot.body,
-      Body::Vacant {
-        next_free: self.free_head,
-      },
-    );
-    slot.generation = slot.generation.wrapping_add(1);
-    self.free_head = Some(handle.index());
-    self.len -= 1;
+    let body = self.vacate(handle)?;
     match body {
       Body::Occupied(value) => Ok(value),
-      Body::Vacant { .. } => Err(stale(handle)),
+      Body::Vacant { .. } | Body::Retired => Err(stale(handle)),
     }
+  }
+
+  /// Vacates the live slot `handle` names and returns what it held: its next generation, threaded onto
+  /// the free list, or retired when its generation is the limit (never wrapped, never reissued).
+  fn vacate(&mut self, handle: Handle<T>) -> Result<Body<T>, MemError> {
+    let index = usize::try_from(handle.index()).unwrap_or(usize::MAX);
+    let limit = self.generation_limit;
+    let free_head = self.free_head;
+    let slot = self.slots.get_mut(index).ok_or_else(|| stale(handle))?;
+    if slot.generation != handle.generation() || !matches!(slot.body, Body::Occupied(_)) {
+      return Err(stale(handle));
+    }
+    let next = slot.generation.checked_add(1).filter(|next| *next <= limit);
+    let vacated = match next {
+      Some(next) => {
+        slot.generation = next;
+        std::mem::replace(
+          &mut slot.body,
+          Body::Vacant {
+            next_free: free_head,
+          },
+        )
+      }
+      None => std::mem::replace(&mut slot.body, Body::Retired),
+    };
+    if next.is_some() {
+      self.free_head = Some(handle.index());
+    } else {
+      self.retired = self.retired.saturating_add(1);
+      self.last_retired = Some(handle.index());
+    }
+    self.len = self.len.saturating_sub(1);
+    Ok(vacated)
   }
 
   /// Frees a slot without moving its value out: the value is dropped in place, so a large
@@ -285,18 +362,7 @@ impl<T> Slab<T> {
   /// a slab through `remove` cost 2.4 ns per released object of a 10^6-file destroy
   /// (2026-09-05, `cargo run --release -p slates-vfs --example vfs_bench`).
   pub fn discard(&mut self, handle: Handle<T>) -> Result<(), MemError> {
-    let index = usize::try_from(handle.index()).unwrap_or(usize::MAX);
-    let slot = self.slots.get_mut(index).ok_or_else(|| stale(handle))?;
-    if slot.generation != handle.generation() || matches!(slot.body, Body::Vacant { .. }) {
-      return Err(stale(handle));
-    }
-    slot.body = Body::Vacant {
-      next_free: self.free_head,
-    };
-    slot.generation = slot.generation.wrapping_add(1);
-    self.free_head = Some(handle.index());
-    self.len -= 1;
-    Ok(())
+    self.vacate(handle).map(drop)
   }
 
   /// Iterates live entries mutably as (handle, value).
@@ -316,7 +382,7 @@ impl<T> Slab<T> {
           Handle::new(u32::try_from(i).unwrap_or(u32::MAX), generation),
           value,
         )),
-        Body::Vacant { .. } => None,
+        Body::Vacant { .. } | Body::Retired => None,
       })
   }
 
@@ -331,7 +397,7 @@ impl<T> Slab<T> {
           Handle::new(u32::try_from(i).unwrap_or(u32::MAX), slot.generation),
           value,
         )),
-        Body::Vacant { .. } => None,
+        Body::Vacant { .. } | Body::Retired => None,
       })
   }
 }
@@ -356,6 +422,85 @@ mod tests {
       handles.swap(i, rng.below(i + 1));
     }
     handles
+  }
+
+  /// AUD-29-11 at the plain handle's boundary. Do: start a one-slot slab at generation `u32::MAX`, insert
+  /// and remove (by `remove`, then by `discard` in a second slab). Expect: the slot retires rather than
+  /// wrap; the handle it issued and an ancient generation-zero handle are both stale; the next insert
+  /// refuses `GenerationExhausted` naming the slot, not `SlabFull`; nothing is live or reported by
+  /// generation; a successor would start past every limit.
+  #[test]
+  fn a_slot_at_the_top_generation_retires_rather_than_wrapping() {
+    retire_the_only_slot(false);
+    retire_the_only_slot(true);
+  }
+
+  /// One path of the test above: the slot freed by `remove`, or by `discard`.
+  fn retire_the_only_slot(by_discard: bool) {
+    let mut slab: Slab<u64> = Slab::with_generation_base(1, 1, u32::MAX);
+    let last = slab.insert(7).unwrap();
+    assert_eq!(last.generation(), u32::MAX);
+    if by_discard {
+      slab.discard(last).unwrap();
+    } else {
+      assert_eq!(slab.remove(last).unwrap(), 7);
+    }
+    assert_retired_for_good(&mut slab, last);
+  }
+
+  /// The only slot of `slab` retired after issuing `last`: every handle to it stale, nothing reissued.
+  fn assert_retired_for_good(slab: &mut Slab<u64>, last: Handle<u64>) {
+    let ancient: Handle<u64> = Handle::new(0, 0);
+    assert!(!slab.contains(last));
+    assert!(!slab.contains(ancient), "no wrap to zero");
+    assert_eq!(
+      slab.insert(8),
+      Err(MemError::GenerationExhausted { index: 0 })
+    );
+    assert_eq!(slab.retired(), 1);
+    assert!(!slab.has_room());
+    assert_eq!(
+      slab.generation_at(0),
+      None,
+      "a retired slot has no live generation"
+    );
+    assert_eq!(slab.generation_high(), u32::MAX);
+  }
+
+  /// AUD-29-11 at a packed representation's boundary. Do: a slab limited to 24-bit generations, its slot
+  /// started one below the limit; insert/remove twice; then a slab whose base is past the limit. Expect:
+  /// the slot issues the limit once and retires after it (its handles stale, the next insert takes a
+  /// fresh slot); a slab starting past the limit issues nothing (`GenerationExhausted`).
+  #[test]
+  fn a_limited_slab_retires_at_its_representations_limit() {
+    let limit = crate::handle::Encoded::MAX_GENERATION;
+    let mut slab: Slab<u64> =
+      Slab::with_generation_base(2, 2, limit - 1).with_generation_limit(limit);
+    let first = slab.insert(1).unwrap();
+    slab.remove(first).unwrap();
+    let at_limit = slab.insert(2).unwrap();
+    assert_eq!((at_limit.index(), at_limit.generation()), (0, limit));
+    slab.remove(at_limit).unwrap();
+    assert_eq!(slab.retired(), 1);
+    assert!(!slab.contains(first) && !slab.contains(at_limit));
+    let fresh = slab.insert(3).unwrap();
+    assert_eq!(fresh.index(), 1, "the retired slot is not reissued");
+    assert!(
+      slab.generation_high() > limit,
+      "a successor under this identity has nothing to issue"
+    );
+
+    let mut spent: Slab<u64> =
+      Slab::with_generation_base(2, 2, limit + 1).with_generation_limit(limit);
+    assert_eq!(
+      spent.insert(4),
+      Err(MemError::GenerationExhausted { index: 0 })
+    );
+    assert!(!spent.has_room());
+    assert_eq!(
+      spent.insert_at(0, limit + 1, 5),
+      Err(MemError::GenerationExhausted { index: 0 })
+    );
   }
 
   #[test]

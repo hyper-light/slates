@@ -285,8 +285,16 @@ pub fn register(
     if free & 1 == 0 {
       continue;
     }
+    // A slot whose identities are spent is never claimed again (AUD-29-11): its own word would wrap and
+    // a stale holder would name the next shard, or its task arena has issued every generation a wake word
+    // carries and a successor would have none to issue. It is retired, like a slab slot at its limit.
+    if slot.arena_generation.load(Ordering::Acquire) > Encoded::MAX_GENERATION {
+      continue;
+    }
     // Claim: free (odd) → claimed (the next even). A loser sees the even value and moves on.
-    let live = free.wrapping_add(1);
+    let Some(live) = free.checked_add(1) else {
+      continue;
+    };
     if slot
       .generation
       .compare_exchange(free, live, Ordering::AcqRel, Ordering::Acquire)

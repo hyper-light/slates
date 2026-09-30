@@ -267,3 +267,80 @@ fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
     "the new holder ran exactly its own task; the stale wake polled nothing extra"
   );
 }
+
+/// AUD-29-11 at the wake word's boundary, without 2^24 iterations. Do: free a runtime's shard slot and
+/// prime it to the last generation a wake word carries (`Encoded::MAX_GENERATION`, what a predecessor
+/// that reused one task slot to the end would leave); start a runtime on it; run a task to completion and
+/// keep its waker; run a second task; fire the first waker; shut down; start a third runtime. Expect: the
+/// first task was issued the last generation and its slot retired (the second task took another slot);
+/// the stale waker is refused by the arena and polls nothing; and the slot, its generations spent, is not
+/// handed to the third runtime — where a 24-bit mask would have let the next holder alias it.
+#[test]
+fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
+  let _serial = serial();
+  use std::task::{Context, Poll};
+  struct Capture(std::sync::mpsc::Sender<std::task::Waker>);
+  impl std::future::Future for Capture {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+      let _ = self.0.send(cx.waker().clone());
+      Poll::Ready(())
+    }
+  }
+
+  let first = Runtime::start(&config(1)).unwrap();
+  let id = first.shard_ids()[0];
+  let _ = first.shutdown();
+  slates_rt::registry::note_arena_generation(id.0, slates_mem::Encoded::MAX_GENERATION);
+
+  let second = Runtime::start(&config(1)).unwrap();
+  assert_eq!(second.shard_ids()[0], id, "the primed slot was reused");
+  let wait = std::time::Duration::from_secs(5);
+  let admitted = |receipt: slates_rt::task::AdmissionReceipt| match receipt.wait(wait) {
+    Some(slates_rt::task::Admission::Admitted(task)) => task,
+    other => panic!("the task was not admitted: {other:?}"),
+  };
+  let (tx, rx) = std::sync::mpsc::channel();
+  let last = admitted(
+    second
+      .spawn_on_with_receipt(id, Capture(tx.clone()))
+      .unwrap(),
+  );
+  let stale = rx.recv_timeout(wait).unwrap();
+  assert_eq!(
+    last.0.generation(),
+    slates_mem::Encoded::MAX_GENERATION,
+    "the first task was issued the word's last generation"
+  );
+  let next = admitted(second.spawn_on_with_receipt(id, Capture(tx)).unwrap());
+  let _live = rx.recv_timeout(wait).unwrap();
+  assert_ne!(
+    next.0.slot(),
+    last.0.slot(),
+    "the slot that issued the last generation retired and was not reissued"
+  );
+  let before = slates_rt::registry::stale_wakes(id.0);
+  stale.wake_by_ref();
+  let counters = second.shutdown();
+  assert_eq!(
+    counters[0].completed, 2,
+    "the stale wake polled nothing extra"
+  );
+  assert_eq!(
+    slates_rt::registry::stale_wakes(id.0),
+    before,
+    "the wake reached the live slot, so the arena refused it"
+  );
+  assert!(
+    counters[0].stale_wakes >= 1,
+    "the arena counted the refused wake"
+  );
+
+  let third = Runtime::start(&config(1)).unwrap();
+  assert_ne!(
+    third.shard_ids()[0],
+    id,
+    "a slot whose wake generations are spent is never reissued"
+  );
+  let _ = third.shutdown();
+}
