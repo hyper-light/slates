@@ -3968,7 +3968,14 @@ entry either old or new, never torn).
    suggestions the human toggles, such as excluding what the target's ignore files name; the
    agent's own filter stays explicit; a toggled suggestion
    produces a new manifest and a new hash, so the grant always binds what will actually be
-   written.
+   written. The presentation is held on the volume's owner shard until it is used or abandoned
+   (A-46): the landing its grant covers runs under the presentation's id and consumes it when it
+   finishes (`Done` or `Partial`; an aborted one keeps it, so the resume keeps the id its hidden
+   siblings carry); a client presenting the same volume and target again replaces its own; the
+   presenting client's retirement abandons it. A shard holds at most one presentation per client
+   seat of the daemon (`clients_per_shard × shards`); a presentation past that is refused
+   `LandingsAwaitingFull` before any id or record is made. Presentations are runtime state: after a
+   restart a grant for one made before it is `NotFound`, and the landing is presented again.
 3. *Grant.* A human issues the grant through the CLI or the confirmation surface; the record is
    bound to the manifest hash; a session grant covers later landings of the same volume into the
    same target for the session but each landing still presents its manifest, and any conflict
@@ -4161,6 +4168,17 @@ stays in the overlay.
 > tree removed), and a resumed landing's recognition of its own finished work (a directory
 > holding only what the manifest creates beneath it; a rename whose destination holds the
 > witnessed directory), so the re-run is idempotent for directories as it is for files.
+
+> **Status (2026-09-29, A-46, AUD-29-07).** A presented landing is consumed by the landing its grant
+> covers, replaced by its client's re-presentation, abandoned with its client, and bounded per shard. Before,
+> a presentation took one id and the granted landing a fresh one, so the finish removed a key that was never
+> there, the grant left the presentation in place, and every plan stayed in memory for good; a resume under
+> the same grant also took a fresh id and could not find its crashed attempt's hidden siblings. The status
+> report counts `landings_awaiting` against its bound. Three plan → grant → land cycles leave none
+> (`a_granted_landing_consumes_its_presentation`; one was left per cycle before), a killed presenter's is
+> dropped by the reaper (`crates/client/tests/presentation.rs`; it outlived the client before), and a
+> presentation past the bound is refused with nothing allocated or recorded. Record:
+> `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`.
 
 > **Status (2026-09-29, A-45, AUD-29-05).** A landing advances only entries that reached the durability
 > boundary, and says what it achieved. Before, a directory that failed to open for its sync was skipped
@@ -6953,4 +6971,29 @@ Applied in the same change to: §4.15 (steps 8–9, the failure matrix, its stat
   each resuming to the reference. The daemon's landed reply carries the facts.
 - What it does not change: the crash rule (a crash-like errno aborts and advances nothing), the order of
   the write classes, the reply's counts.
+
+### A-46 — A landing presentation is consumed, replaced, abandoned with its client, and bounded (2026-09-29)
+Applied in the same change to: §4.15 (step 2, its status), `slates-server` (`landing.rs`: `Awaiting::client`,
+`LandCall`, `presentation_for`, `presentations_full`, `abandon_presentations`, the finish's consumption and
+state change; `config.rs`: `landings_awaiting_per_shard`; `reap.rs`: abandonment on every owner;
+`verbs.rs`: the status report), `slates-ipc` (`Refusal::LandingsAwaitingFull`; `ShardReport`'s
+`landings_awaiting` and `landings_awaiting_bound`), the tests, and GAPS.
+- Why: a presentation took one landing id and the granted landing a fresh one, so nothing ever removed the
+  presentation, and a resume under the same grant could not sweep its own crashed attempt's siblings. Nothing
+  bounded the presentations either (AUD-29-07;
+  `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`).
+- The rule:
+  - The landing a grant covers runs under the id of the presentation that grant was issued from. That is
+    the presentation whose manifest and binding equal the grant's.
+  - The landing consumes it when `Done` or `Partial`, and moves its durable record out of `AwaitingGrant`.
+    An aborted landing keeps it, so the resume keeps the id.
+  - A client re-presenting the same volume and target replaces its own presentation.
+  - Retiring a client abandons its presentations on every owner shard.
+  - A shard holds at most one presentation per client seat of the daemon. A presentation past that is
+    refused before anything is allocated or recorded.
+- Evidence: the consumption and abandonment tests failed on the old lifecycle — one presentation left per
+  cycle, and a killed client's outliving it — and pass now. The bound's refusal leaves the status count, the
+  audit log and the id counter unchanged.
+- What it does not change: the grant's own lifecycle (its states, its term) and the grant verb; durable
+  presentation records written before this change; the unpruned grant table (its own gap).
 

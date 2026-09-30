@@ -1040,6 +1040,87 @@ fn present_landing(
   (id, snapshot, landing, manifest)
 }
 
+/// A fresh volume named `name`, snapshotted and presented for landing into `target`: its id, snapshot,
+/// landing id and manifest.
+fn present_named(
+  client: &mut Client,
+  name: &str,
+  target: &str,
+) -> (
+  slates_ipc::protocol::VolumeId,
+  slates_ipc::protocol::SnapshotId,
+  u64,
+  [u8; 32],
+) {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create {name}");
+  };
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot {name}");
+  };
+  let presented = client.call(&RequestBody::Land {
+    volume: id,
+    snapshot: Some(snapshot),
+    target: target.to_owned(),
+    filter: Filter::default(),
+    grant: None,
+  });
+  let ReplyBody::GrantRequired {
+    landing, manifest, ..
+  } = presented
+  else {
+    panic!("{name} was not presented: {presented:?}");
+  };
+  (id, snapshot, landing, manifest)
+}
+
+/// The landings the daemon holds awaiting a grant, over every shard (the status report).
+fn landings_awaiting(client: &mut Client) -> u64 {
+  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
+    panic!("status");
+  };
+  report
+    .shards
+    .iter()
+    .map(|shard| shard.landings_awaiting)
+    .sum()
+}
+
+/// §4.15 step 3 (AUD-29-07): presented landings do not accumulate. Do: three plan → grant → land cycles on
+/// one client, each a new volume into a fresh directory. Expect: after each landing the daemon's status
+/// counts no landing awaiting a grant — the landing consumed the presentation its grant was issued from
+/// (before 2026-09-29 each cycle left one behind for good). An abandoned presentation expiring with its
+/// client needs a real process death: `crates/client/tests/presentation.rs`.
+#[test]
+fn a_granted_landing_consumes_its_presentation() {
+  let (daemon, instance) = daemon("presentations");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut client = Client::connect(&instance);
+  for cycle in 0..3 {
+    let target = target_dir();
+    let (id, snapshot, landing, manifest) =
+      present_named(&mut client, &format!("cycle-{cycle}"), &target.path);
+    assert_eq!(landings_awaiting(&mut client), 1, "cycle {cycle} presented");
+    let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
+    let landed = client.call(&RequestBody::Land {
+      volume: id,
+      snapshot: Some(snapshot),
+      target: target.path.clone(),
+      filter: Filter::default(),
+      grant: Some(grant),
+    });
+    assert!(matches!(landed, ReplyBody::Landed { .. }), "{landed:?}");
+    assert_eq!(
+      landings_awaiting(&mut client),
+      0,
+      "cycle {cycle}'s landing consumed its presentation"
+    );
+  }
+  drop(daemon);
+}
+
 /// A forged approval — the agent knows the landing and its manifest but not the issuer secret — is
 /// refused as unverified authority and issues nothing.
 fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 32]) {

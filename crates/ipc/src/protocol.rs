@@ -830,6 +830,12 @@ pub struct ShardReport {
   /// sizing defect surfacing, never expected load. A refused client admission is what left a fleet
   /// node unable to seat any client on 2026-09-14.
   pub tasks_refused: u64,
+  /// Landings presented here and awaiting a grant (§4.15 step 3; AUD-29-07): each is consumed when its
+  /// granted landing finishes, replaced when its client presents the same volume and target again, and
+  /// dropped when its client is retired, so it returns to zero; `landings_awaiting_bound` bounds it.
+  pub landings_awaiting: u64,
+  /// The bound on `landings_awaiting`: the daemon's client seats (one pending presentation per seat).
+  pub landings_awaiting_bound: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1948,6 +1954,10 @@ pub enum Refusal {
     /// The generation that could not close.
     generation: u64,
   },
+  /// The owner shard's landings awaiting a grant are at their bound: the landing was not presented — no id
+  /// was allocated and nothing was recorded. Retry once one is granted and landed or its client has gone
+  /// (AUD-29-07). Appended for append-only evolution.
+  LandingsAwaitingFull,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

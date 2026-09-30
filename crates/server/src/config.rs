@@ -234,6 +234,11 @@ pub struct DaemonConfig {
   /// Derived: clients per shard, the admission limit (AC-2.6): what the client share of the
   /// reserve holds in regions.
   pub clients_per_shard: usize,
+  /// Derived: the landings one owner shard holds awaiting a grant (§4.15 step 3; AUD-29-07) — the daemon's
+  /// client seats, `clients_per_shard × shards`: a presentation lives on its volume's owner shard whichever
+  /// shard its client sits on, and each seat may have one pending there. A presentation past it is refused
+  /// `LandingsAwaitingFull` before an id or a record is made.
+  pub landings_awaiting_per_shard: usize,
   /// Derived: the shard's reserve in bytes.
   pub reserve_per_shard: u64,
   /// Derived: the large-class boundary of overlay copy-ups (one arena region).
@@ -548,6 +553,16 @@ impl DaemonConfig {
       ["reserve_per_shard", "region_bytes"]
     );
     derivations.push(note("clients_per_shard", &clients));
+    // A landing presentation lives on its volume's owner shard whichever shard its client sits on: the
+    // daemon's seats bound the presentations one shard holds (AUD-29-07).
+    let landings_awaiting: Derived<usize> = derived!(
+      clients
+        .get()
+        .saturating_mul(usize::try_from(shards).unwrap_or(usize::MAX)),
+      "clients_per_shard × shards",
+      ["clients_per_shard", "shards"]
+    );
+    derivations.push(note("landings_awaiting_per_shard", &landings_awaiting));
     // The task arena and the control channel hold the cross-shard traffic of the clients:
     // one task per forwarded request at its owner and one for its reply at the origin, and
     // the shard's own loops; the admission value above sizes only what one client may hold
@@ -595,6 +610,7 @@ impl DaemonConfig {
       caps,
       region,
       clients_per_shard: clients.get(),
+      landings_awaiting_per_shard: landings_awaiting.get(),
       reserve_per_shard: reserve.get(),
       large_class_bytes: d.arena_region_bytes.get(),
       store,

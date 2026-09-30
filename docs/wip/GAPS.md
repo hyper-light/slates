@@ -2926,7 +2926,7 @@ root-caused and measured across laptop, single-cluster and multi-region deployme
 ### 2026-09-29: comprehensive product, safety and global-scale audit
 
 The [dated audit](../audit/2026-09-29_audit.md) records 87 findings across five
-passes; 01, 04, 05 and 06 have the separately recorded closures below, leaving 83 without a
+passes; 01, 04, 05, 06 and 07 have the separately recorded closures below, leaving 82 without a
 recorded full closure. 02 is mitigated in part, with exact older-snapshot landing still
 owed. The audit began at ae6f48b02bd87faf89c28100c5d3790f93b0714c plus the concurrently
 changing working tree.
@@ -3047,8 +3047,8 @@ use.**
   now refuse with the disk unchanged; the approved landings still land. The daemon's `grant_scenario`
   refuses a retarget end to end.
 - **Record.** `docs/bugs/2026-09-29-a-grant-did-not-bind-its-target-volume-or-consumer.md`.
-- **Still open in this row.** 02 in part (below), 03 (the lease is per shard and per path string), 07
-  (04, 05 and 06 are closed below).
+- **Still open in this row.** 02 in part (below) and 03 (the lease is per shard and per path string);
+  04, 05, 06 and 07 are closed below.
 
 **Closed 2026-09-29 — AUD-29-06: a session grant was recorded consumed, and a restart lost every grant.**
 - **Transitions.** `finish` records only the transition the engine made: a single-use grant consumed by a
@@ -3102,6 +3102,20 @@ cleanup failures.**
   landed inside `ca53844`, whose commit swept the working tree's edits.
 - **Open.** A grant asking for media durability on a target that cannot perform the barrier should be
   refused from a capability, not held on every attempt. The land verb never asks for media durability.
+
+**Closed 2026-09-29 — AUD-29-07 (A-46): landing presentations were never consumed, expired or bounded.**
+- **The lifecycle.**
+  - A granted landing runs under the id of the presentation its grant was issued from and consumes it when
+    it finishes; an aborted one keeps it, so a resume keeps the id its siblings carry.
+  - A client's re-presentation of the same volume and target replaces its own.
+  - The reaper abandons a retired client's presentations on every owner shard.
+  - A shard holds at most one per client seat of the daemon, refusing `LandingsAwaitingFull` past that
+    before anything is allocated or recorded.
+  - The status report counts them against the bound.
+- **Evidence.** The consumption and abandonment tests failed on the old lifecycle and pass now; the bound's
+  refusal changes nothing. Record: `docs/bugs/2026-09-29-landing-presentations-were-never-consumed-or-bounded.md`.
+- **Open.** Presentations do not survive a restart (a grant for an earlier one is `NotFound`), and a single
+  client can use the whole bound until it lands or goes.
 
 **Mitigated 2026-09-29, exact form owed — AUD-29-02: a landing of a named snapshot landed the live head.**
 - **Now.** A named snapshot lands only while the head is still exactly its state (`Volume::unchanged_since`:

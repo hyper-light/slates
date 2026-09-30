@@ -1895,6 +1895,9 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     takeover: takeover_report(state),
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
+    landings_awaiting: u64::try_from(state.landing.awaiting.len()).unwrap_or(u64::MAX),
+    landings_awaiting_bound: u64::try_from(state.config.landings_awaiting_per_shard)
+      .unwrap_or(u64::MAX),
   }
 }
 
@@ -2094,6 +2097,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::BarrierIncomplete { .. } => "barrier_incomplete",
     Refusal::Unsupported { .. } => "unsupported",
     Refusal::TooManyClients => "too_many_clients",
+    Refusal::LandingsAwaitingFull => "landings_awaiting_full",
     Refusal::Overloaded { .. } => "overloaded",
     Refusal::BadRequest { .. } => "bad_request",
     Refusal::Unpublished { .. } => "unpublished",
@@ -2333,7 +2337,18 @@ fn dispatch_inner(
       target,
       filter,
       grant,
-    } => crate::landing::land_verb(state, principal, volume, snapshot, &target, &filter, grant),
+    } => crate::landing::land_verb(
+      state,
+      client_id,
+      principal,
+      crate::landing::LandCall {
+        volume,
+        snapshot,
+        target: &target,
+        filter: &filter,
+        grant,
+      },
+    ),
     RequestBody::Grants => crate::landing::grants_verb(state, principal),
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
     RequestBody::Acknowledge { up_to } => acknowledge(state, client_id, up_to),
@@ -6900,6 +6915,130 @@ mod tests {
     });
   }
 
+  /// A fresh bounded volume named `name`, created through the verb.
+  fn created(
+    state: &mut crate::state::ShardState,
+    principal: &Principal,
+    name: &str,
+  ) -> super::VolumeId {
+    let reply = super::dispatch(
+      state,
+      1,
+      principal,
+      super::RequestBody::Create {
+        name: name.to_owned(),
+        size: super::SizeClass::Bounded { limit: 1 << 20 },
+        names: super::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let super::ReplyBody::Created { id } = reply else {
+      panic!("{reply:?}")
+    };
+    id
+  }
+
+  /// A landing of `volume` into `target` by client 1 with no grant: a presentation, or its refusal.
+  fn present_landing(
+    state: &mut crate::state::ShardState,
+    principal: &Principal,
+    volume: super::VolumeId,
+    target: &str,
+  ) -> super::ReplyBody {
+    crate::landing::land_verb(
+      state,
+      1,
+      principal,
+      crate::landing::LandCall {
+        volume,
+        snapshot: None,
+        target,
+        filter: &slates_ipc::protocol::Filter::default(),
+        grant: None,
+      },
+    )
+  }
+
+  /// The landings the shard's status report counts awaiting a grant.
+  fn awaiting_count(state: &mut crate::state::ShardState) -> u64 {
+    super::shard_report(state).landings_awaiting
+  }
+
+  /// The `landing_planned` records the audit verb lists.
+  fn planned_records(state: &mut crate::state::ShardState, principal: &Principal) -> usize {
+    let reply = super::dispatch(state, 1, principal, super::RequestBody::Audit { since: 0 });
+    let super::ReplyBody::Audit { records } = reply else {
+      panic!("{reply:?}")
+    };
+    records
+      .iter()
+      .filter(|r| r.kind == "landing_planned")
+      .count()
+  }
+
+  /// §4.15 step 3 (AUD-29-07): the landings a shard holds awaiting a grant are bounded, and a presentation
+  /// past the bound is refused before it allocates anything, while a client re-presenting the same volume
+  /// and target replaces its own and needs no room. Do: with the bound at one, present volume A, then B,
+  /// then A again (the target is this crate's own directory, opened read-only: nothing is granted, so
+  /// nothing is written). Expect: B is refused `LandingsAwaitingFull` and changes nothing — the status report
+  /// still counts one presentation, the audit log still one `landing_planned`, and A's re-presentation takes
+  /// the very next id, so none was spent on B; A's second presentation replaces its first (still one), and
+  /// the first's id is no longer grantable. Before 2026-09-29 nothing bounded the presentations.
+  #[test]
+  fn a_presentation_past_the_bound_is_refused_and_changes_nothing() {
+    crate::daemon::audit_on_shard(|state| {
+      state.config.landings_awaiting_per_shard = 1;
+      let principal = Principal::Uid { uid: 1234 };
+      let target = env!("CARGO_MANIFEST_DIR");
+      let a = created(state, &principal, "presented-a");
+      let b = created(state, &principal, "presented-b");
+      let first = present_landing(state, &principal, a, target);
+      let super::ReplyBody::GrantRequired { landing: first, .. } = first else {
+        panic!("{first:?}")
+      };
+      assert_eq!(awaiting_count(state), 1);
+      let planned = planned_records(state, &principal);
+      let refusal = present_landing(state, &principal, b, target);
+      assert!(
+        matches!(
+          refusal,
+          super::ReplyBody::Refused {
+            refusal: Refusal::LandingsAwaitingFull
+          }
+        ),
+        "{refusal:?}"
+      );
+      assert_eq!(awaiting_count(state), 1, "the refusal presented nothing");
+      assert_eq!(
+        planned_records(state, &principal),
+        planned,
+        "nor recorded anything"
+      );
+      let again = present_landing(state, &principal, a, target);
+      let super::ReplyBody::GrantRequired { landing: again, .. } = again else {
+        panic!("{again:?}")
+      };
+      assert_eq!(again, first + 1, "no id was spent on the refusal");
+      assert_eq!(
+        awaiting_count(state),
+        1,
+        "the re-presentation replaced the first"
+      );
+      assert_eq!(
+        crate::landing::issue_grant(
+          state,
+          &principal,
+          first,
+          slates_ipc::protocol::GrantScope::Once,
+          1
+        ),
+        Err(Refusal::NotFound),
+        "the replaced presentation is no longer grantable"
+      );
+    });
+  }
+
   /// §4.15 (AUD-29-02): a landing of a named snapshot lands that snapshot's state, never the live head's.
   /// Exact landing of an older snapshot is owed (the base plane's witnesses are the head's, not frozen per
   /// snapshot), so a named snapshot lands only while the head is still exactly it, and is refused before any
@@ -6950,12 +7089,15 @@ mod tests {
       let land = |state: &mut crate::state::ShardState, snapshot| {
         crate::landing::land_verb(
           state,
+          1,
           &principal,
-          id,
-          Some(snapshot),
-          "/nonexistent/slates/aud-29-02",
-          &slates_ipc::protocol::Filter::default(),
-          None,
+          crate::landing::LandCall {
+            volume: id,
+            snapshot: Some(snapshot),
+            target: "/nonexistent/slates/aud-29-02",
+            filter: &slates_ipc::protocol::Filter::default(),
+            grant: None,
+          },
         )
       };
       assert!(

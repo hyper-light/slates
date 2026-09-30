@@ -98,6 +98,8 @@ pub struct Awaiting {
   pub target: String,
   /// The principal it was presented to.
   pub principal: Principal,
+  /// The client that presented it: its retirement abandons the presentation (AUD-29-07).
+  pub client: u32,
 }
 
 impl std::fmt::Debug for LandingState {
@@ -125,42 +127,69 @@ impl Default for LandingState {
 #[cfg(unix)]
 struct LandingIds<'a> {
   landing_id: u64,
+  /// Whether `landing_id` was allocated for this call (a presentation, or a granted landing no presentation
+  /// made) rather than taken from the presentation the grant was issued from.
+  fresh: bool,
   volume: DbVolumeId,
   snapshot: DbSnapshotId,
   target: &'a str,
 }
 
+/// What a `land` request names (§4.15).
+pub struct LandCall<'a> {
+  /// The volume.
+  pub volume: VolumeId,
+  /// The snapshot, or the head.
+  pub snapshot: Option<SnapshotId>,
+  /// The target directory's path.
+  pub target: &'a str,
+  /// The filter.
+  pub filter: &'a slates_ipc::protocol::Filter,
+  /// The grant, when one was issued.
+  pub grant: Option<u64>,
+}
+
 /// Lands `volume`'s snapshot into `target` (§4.15). Without a grant covering the planned
 /// manifest, the reply is `GrantRequired`; with one, the landing runs and the reply is
-/// `Landed`. Conflicts, a held lease and a mismatched grant are typed refusals.
+/// `Landed`. Conflicts, a held lease and a mismatched grant are typed refusals. `client_id` is the
+/// calling client, whose presentations its retirement abandons (AUD-29-07).
 pub fn land_verb(
   state: &mut ShardState,
+  client_id: u32,
   principal: &Principal,
-  volume: VolumeId,
-  snapshot: Option<SnapshotId>,
-  target: &str,
-  filter: &slates_ipc::protocol::Filter,
-  grant: Option<u64>,
+  call: LandCall<'_>,
 ) -> ReplyBody {
   // A merge volume has no store-backed snapshot to land (§4.16; the extent-backed green is owed).
-  if let Some(reply) =
-    crate::merge_service::refuse_store_verb(state, volume, crate::merge_service::StoreVerb::Land)
-  {
+  if let Some(reply) = crate::merge_service::refuse_store_verb(
+    state,
+    call.volume,
+    crate::merge_service::StoreVerb::Land,
+  ) {
     return reply;
   }
   #[cfg(unix)]
   {
-    land_verb_unix(state, principal, volume, snapshot, target, filter, grant)
+    land_verb_unix(state, client_id, principal, call)
   }
   #[cfg(not(unix))]
   {
     // The write path is the `os` module (Unix), the landing engine's only real writer; the
     // Windows writer arrives with the Windows bridge (Phase 4). The verb refuses cleanly here.
-    let _ = (state, principal, volume, snapshot, target, filter, grant);
+    let _ = (state, client_id, principal, call);
     refused(Refusal::Unsupported {
       feature: "landing".to_owned(),
     })
   }
+}
+
+/// Drops every landing `client` presented on this shard and never landed: its retirement abandons them
+/// (AUD-29-07), so a presentation does not outlive the client waiting on it. Bounded by the shard's
+/// presentations.
+pub fn abandon_presentations(state: &mut ShardState, client: u32) {
+  state
+    .landing
+    .awaiting
+    .retain(|_, awaiting| awaiting.client != client);
 }
 
 /// A landing observer (§4.14) that records one `land.entry` timing per entry into a bounded buffer, so
@@ -237,13 +266,17 @@ fn drain_land_spans(state: &mut ShardState, observer: SpanObserver) {
 #[cfg(unix)]
 fn land_verb_unix(
   state: &mut ShardState,
+  client_id: u32,
   principal: &Principal,
-  volume: VolumeId,
-  snapshot: Option<SnapshotId>,
-  target: &str,
-  filter: &slates_ipc::protocol::Filter,
-  grant: Option<u64>,
+  call: LandCall<'_>,
 ) -> ReplyBody {
+  let LandCall {
+    volume,
+    snapshot,
+    target,
+    filter,
+    grant,
+  } = call;
   let (handle, record) = match find(state, volume) {
     Ok(x) => x,
     Err(r) => return *r,
@@ -252,6 +285,11 @@ fn land_verb_unix(
     return forbidden("land");
   }
   let db_volume = to_db_volume(volume);
+  // A landing without a grant ends in a presentation, and the shard holds only so many: past the bound it
+  // is refused before any host access, id or record (AUD-29-07).
+  if grant.is_none() && presentations_full(state, client_id, db_volume, target) {
+    return refused(Refusal::LandingsAwaitingFull);
+  }
   let db_snapshot = snapshot.map_or(record.head, to_db_snapshot);
   // A named snapshot is what lands, before any host access (AUD-29-02).
   if let Some(named) = snapshot
@@ -268,8 +306,13 @@ fn land_verb_unix(
   };
   let now = state.clock.monotonic_ns();
   // The id names its owner partition (`verbs::landing_id`), so the `Grant` that later covers it routes
-  // to this shard, where the presented record waits.
-  let landing_id = crate::verbs::landing_id(state.partition, state.landing.next_landing);
+  // to this shard, where the presented record waits. A granted landing lands under the id of the
+  // presentation its grant was issued from, so its finish consumes that presentation and a resume under the
+  // same grant keeps the id its hidden siblings carry (AUD-29-07; before 2026-09-29 every call took a fresh
+  // id, the presentation was never consumed, and a resume could not find its crashed attempt's siblings).
+  let presented = grant.and_then(|g| presentation_for(state, g));
+  let landing_id = presented
+    .unwrap_or_else(|| crate::verbs::landing_id(state.partition, state.landing.next_landing));
   let request = LandingRequest {
     landing_id,
     holder: session_of(principal),
@@ -313,18 +356,22 @@ fn land_verb_unix(
   drain_land_spans(state, spans);
   let ids = LandingIds {
     landing_id,
+    fresh: presented.is_none(),
     volume: db_volume,
     snapshot: db_snapshot,
     target,
   };
   match outcome {
     Ok(report) => finish(state, principal, &ids, &report, grant),
-    Err(LandingRefusal::GrantRequired(presented)) => present(
+    Err(LandingRefusal::GrantRequired(plan)) => present(
       state,
-      principal,
+      Presenter {
+        client: client_id,
+        principal,
+      },
       &ids,
-      &presented.manifest,
-      &presented.binding,
+      &plan.manifest,
+      &plan.binding,
     ),
     Err(LandingRefusal::Conflict(entries)) => refused(Refusal::LandingConflict {
       entries: entries.iter().map(|e| e.path.to_string()).collect(),
@@ -403,17 +450,57 @@ fn named_snapshot_is_head(
 }
 
 /// Records the planned landing (AwaitingGrant) and its audit, and replies `GrantRequired`.
+/// Who presents a landing: the calling client (whose retirement abandons the presentation) and its
+/// principal.
+#[cfg(unix)]
+struct Presenter<'a> {
+  client: u32,
+  principal: &'a Principal,
+}
+
+/// Whether a presentation by `client` of `volume` into `target` would pass the shard's bound: a client's
+/// re-presentation of the same volume and target replaces its own and never does (AUD-29-07).
+#[cfg(unix)]
+fn presentations_full(state: &ShardState, client: u32, volume: DbVolumeId, target: &str) -> bool {
+  let replaces = state.landing.awaiting.values().any(|awaiting| {
+    awaiting.client == client && awaiting.volume == volume && awaiting.target == target
+  });
+  !replaces && state.landing.awaiting.len() >= state.config.landings_awaiting_per_shard
+}
+
+/// The presentation a granted landing lands (AUD-29-07): the awaiting landing whose manifest and binding the
+/// grant was issued from. `None` for a grant covering a plan no presentation made (a session grant's later
+/// plans), which lands under a fresh id.
+#[cfg(unix)]
+fn presentation_for(state: &ShardState, grant: u64) -> Option<u64> {
+  let granted = state.landing.grants.get(GrantId(grant))?;
+  state
+    .landing
+    .awaiting
+    .iter()
+    .find(|(_, awaiting)| {
+      awaiting.manifest == granted.manifest && awaiting.binding == granted.binding
+    })
+    .map(|(id, _)| *id)
+}
+
 #[cfg(unix)]
 fn present(
   state: &mut ShardState,
-  principal: &Principal,
+  presenter: Presenter<'_>,
   ids: &LandingIds<'_>,
   manifest: &Manifest,
   binding: &slates_land::grant::GrantBinding,
 ) -> ReplyBody {
+  let Presenter { client, principal } = presenter;
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
   let landing_id = ids.landing_id;
+  // A client presenting the same volume and target again replaces its earlier presentation, whose id is no
+  // longer grantable (AUD-29-07): re-planning costs no room.
+  state.landing.awaiting.retain(|_, awaiting| {
+    !(awaiting.client == client && awaiting.volume == ids.volume && awaiting.target == ids.target)
+  });
   state.landing.awaiting.insert(
     landing_id,
     Awaiting {
@@ -423,6 +510,7 @@ fn present(
       snapshot: ids.snapshot,
       target: ids.target.to_owned(),
       principal: principal.clone(),
+      client,
     },
   );
   let now = state.clock.monotonic_ns();
@@ -475,8 +563,17 @@ fn finish(
   grant: Option<u64>,
 ) -> ReplyBody {
   let landing_id = ids.landing_id;
-  state.landing.next_landing = state.landing.next_landing.saturating_add(1);
-  state.landing.awaiting.remove(&landing_id);
+  if ids.fresh {
+    state.landing.next_landing = state.landing.next_landing.saturating_add(1);
+  }
+  // A finished landing consumes the presentation it landed; an aborted one keeps it, so the resume lands
+  // under the same id and sweeps what the crashed attempt left (AUD-29-07).
+  if matches!(
+    report.state,
+    slates_land::engine::LandingState::Done | slates_land::engine::LandingState::Partial
+  ) {
+    state.landing.awaiting.remove(&landing_id);
+  }
   let now = state.clock.monotonic_ns();
   let db_state = db_landing_state(&report.state);
   let record = LandingRecord {
@@ -490,7 +587,18 @@ fn finish(
     written: u32::try_from(report.written).unwrap_or(u32::MAX),
     conflicts: u32::try_from(report.conflicts).unwrap_or(u32::MAX),
   };
-  let mut ops = vec![Op::LandingRecorded { record }];
+  // A landing under a fresh id is recorded; one under its presentation's id moves that presentation's
+  // record out of `AwaitingGrant` (AUD-29-07), its grant named by the audit records that follow.
+  let mut ops = vec![if ids.fresh {
+    Op::LandingRecorded { record }
+  } else {
+    Op::LandingStateChanged {
+      id: landing_id,
+      state: db_state,
+      written: record.written,
+      conflicts: record.conflicts,
+    }
+  }];
   // Mirror the engine's audit records for this landing into the durable log.
   for audit in state.landing.audit.records() {
     if audit.landing == landing_id {

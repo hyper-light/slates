@@ -92,6 +92,15 @@ async fn remove_on_owners(
   deadline: u64,
 ) -> Result<(), Refusal> {
   for &shard in shards {
+    // The client's presentations there are abandoned with it (AUD-29-07): nothing waits on them now.
+    crate::xshard::call_within(
+      origin,
+      shard,
+      move |state| crate::landing::abandon_presentations(state, client),
+      deadline,
+    )
+    .await
+    .ok_or(Refusal::Overloaded { shard })?;
     let attachments = crate::xshard::call_within(
       origin,
       shard,
