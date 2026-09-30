@@ -635,9 +635,19 @@ fn crash_edits(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
 
 /// The crash scenario, ready to land: the host, the volume and its store; `exchange: false` takes the
 /// atomic exchange away (the fallback of T-1.16).
-fn crash_scenario(exchange: bool) -> (SimHost, Store, Volume) {
+/// The simulated filesystem a crash scenario runs on: whether it has the atomic exchange, and whether it
+/// has unnamed temporaries (`O_TMPFILE`: Linux's tmpfs and ext4 do; APFS does not, so a macOS temporary is
+/// named from its creation).
+#[derive(Clone, Copy)]
+struct Filesystem {
+  exchange: bool,
+  unnamed_temporaries: bool,
+}
+
+fn crash_scenario(fs: Filesystem) -> (SimHost, Store, Volume) {
   let mut host = SimHost::new();
-  host.set_exchange_supported(exchange);
+  host.set_exchange_supported(fs.exchange);
+  host.set_unnamed_temporaries(fs.unnamed_temporaries);
   crash_base(&mut host);
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
@@ -646,8 +656,8 @@ fn crash_scenario(exchange: bool) -> (SimHost, Store, Volume) {
 }
 
 /// The reference: the disk before, the disk after a clean landing, and the write count.
-fn crash_reference(exchange: bool) -> (Disk, Disk, u64) {
-  let (mut host, mut store, mut vol) = crash_scenario(exchange);
+fn crash_reference(fs: Filesystem) -> (Disk, Disk, u64) {
+  let (mut host, mut store, mut vol) = crash_scenario(fs);
   let before = {
     let mut fresh = SimHost::new();
     crash_base(&mut fresh);
@@ -733,8 +743,9 @@ fn ancestors_or_self(path: &str) -> impl Iterator<Item = &str> {
 /// One crash at write instruction `crash_at`: every path old or new (or, without the exchange, set aside),
 /// then the resume reaches the reference, sweeps the siblings, and a further run plans nothing. How many
 /// paths the crash left set aside.
-fn crash_then_resume(exchange: bool, crash_at: u64, before: &Disk, after: &Disk) -> usize {
-  let (mut host, mut store, mut vol) = crash_scenario(exchange);
+fn crash_then_resume(fs: Filesystem, crash_at: u64, before: &Disk, after: &Disk) -> usize {
+  let exchange = fs.exchange;
+  let (mut host, mut store, mut vol) = crash_scenario(fs);
   let target = root_target(&mut host);
   let mut session = Session::new();
   host.crash_at_write(host.write_steps() + crash_at);
@@ -803,11 +814,49 @@ fn crash_then_resume(exchange: bool, crash_at: u64, before: &Disk, after: &Disk)
 /// resume sweeps the hidden siblings and lands the rest; a further run plans nothing.
 #[test]
 fn t_1_15_crash_at_every_write_instruction_then_resume() {
-  let (before, after, steps) = crash_reference(true);
+  crash_at_every_instruction(LINUX);
+}
+
+/// T-1.15 on a filesystem whose temporaries are named from creation (APFS: no `O_TMPFILE`). Do: crash at
+/// every write instruction, then resume. Expect: as on Linux — every path old or new, the resume reaching
+/// the reference, and every sibling swept, none kept: a temporary the crashed attempt created is the
+/// landing's own however little of it was written (§4.15 step 11). Red before 2026-09-30: a temporary
+/// crashed mid-write sat at its aside name, matched neither the witness nor the overlay, and was kept
+/// (the macOS CI runner's `kill -9` found an empty `.slates-kept-*`; job 109759894864).
+#[test]
+fn t_1_15_named_temporaries_crash_at_every_write_instruction_then_resume() {
+  crash_at_every_instruction(MACOS);
+}
+
+/// The same on a filesystem with named temporaries and no exchange.
+#[test]
+fn t_1_15_named_temporaries_without_exchange_crash_at_every_write_instruction_then_resume() {
+  let set_aside = crash_at_every_instruction(Filesystem {
+    exchange: false,
+    unnamed_temporaries: false,
+  });
+  assert!(set_aside > 0, "no crash fell inside a window");
+}
+
+/// Format: Linux's tmpfs and ext4: the exchange and unnamed temporaries.
+const LINUX: Filesystem = Filesystem {
+  exchange: true,
+  unnamed_temporaries: true,
+};
+/// Format: APFS: the exchange (`RENAME_SWAP`), temporaries named from creation.
+const MACOS: Filesystem = Filesystem {
+  exchange: true,
+  unnamed_temporaries: false,
+};
+
+/// Crashes a landing on `fs` at every write instruction and resumes each; the crashes that fell inside a
+/// fallback window.
+fn crash_at_every_instruction(fs: Filesystem) -> usize {
+  let (before, after, steps) = crash_reference(fs);
   assert!(steps > 20, "the scenario writes in many steps: {steps}");
-  for crash_at in 0..steps {
-    crash_then_resume(true, crash_at, &before, &after);
-  }
+  (0..steps)
+    .map(|crash_at| crash_then_resume(fs, crash_at, &before, &after))
+    .sum()
 }
 
 /// T-1.15 and T-1.16 with AUD-29-04: the same crash at every write instruction on a filesystem without the
@@ -816,14 +865,12 @@ fn t_1_15_crash_at_every_write_instruction_then_resume() {
 /// taken, then reaches the reference, sweeps the siblings, and a further run plans nothing.
 #[test]
 fn t_1_15_without_exchange_crash_at_every_write_instruction_then_resume() {
-  let (before, after, steps) = crash_reference(false);
-  assert!(steps > 20, "the scenario writes in many steps: {steps}");
-  let mut set_aside = 0usize;
-  for crash_at in 0..steps {
-    set_aside += crash_then_resume(false, crash_at, &before, &after);
-  }
+  let set_aside = crash_at_every_instruction(Filesystem {
+    exchange: false,
+    unnamed_temporaries: true,
+  });
   // Not vacuous: some crash fell inside a window and left an entry aside for the resume to put back.
-  assert!(set_aside > 0, "no crash of {steps} fell inside a window");
+  assert!(set_aside > 0, "no crash fell inside a window");
 }
 
 // ---------------------------------------------------------------- exchange fallback

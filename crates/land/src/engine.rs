@@ -530,6 +530,9 @@ struct Landing<'a, H: LandFs> {
   touched: BTreeSet<Box<str>>,
   /// Whether the exchange path is still believed to work (flipped by the first `EINVAL`).
   exchange: bool,
+  /// Whether the filesystem gives unnamed temporaries (`O_TMPFILE`); where it does not, a temporary is
+  /// named from its creation.
+  unnamed_temporaries: bool,
   hidden_counter: u64,
   bytes_written: u64,
   widest_window_ns: u64,
@@ -1058,23 +1061,28 @@ impl<H: LandFs> Landing<'_, H> {
     let bytes = read_overlay_bytes(vol, store, self.host, self.request.source, &entry.path)?;
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
-    // A replacement's temporary takes the entry's aside name: the exchange leaves the displaced entry under
-    // it, and a sweep after a crash checks it before removing it (AUD-29-04).
-    let hidden = match witnessed {
-      None => self.hidden_name(),
-      Some(_) => self.aside_name(&entry.path),
-    };
-    let temp = self.fill_temp(dir, dir_path, &hidden, &bytes, overlay)?;
+    // Every temporary is created at a plain hidden name, the landing's own by its name: a crash while it is
+    // being written leaves it there, and the sweep removes it. A replacement's complete temporary then takes
+    // the entry's aside name, where the exchange leaves the displaced entry and a sweep after a crash checks
+    // it before removing it (AUD-29-04). Before 2026-09-30 a replacement's temporary was created at its
+    // aside name, where a crash mid-write left bytes that matched neither the witness nor the overlay, and
+    // the resume kept them (a named-temporary filesystem: APFS).
+    let created = self.hidden_name();
+    let temp = self.fill_temp(dir, dir_path, &created, &bytes, overlay)?;
     let result = match witnessed {
-      None => self.link_create(temp, dir, &hidden, name),
-      Some(witness) => self.swap_replace(Swap {
-        temp,
-        dir,
-        hidden: &hidden,
-        name,
-        path: &entry.path,
-        witness,
-      }),
+      None => self.link_create(temp, dir, &created, name),
+      Some(witness) => {
+        let aside = self.aside_name(&entry.path);
+        self.swap_replace(Swap {
+          temp,
+          dir,
+          created: &created,
+          hidden: &aside,
+          name,
+          path: &entry.path,
+          witness,
+        })
+      }
     };
     // What the placement left at the name, read through the file's own descriptor before it closes.
     if let Ok(w) = &result
@@ -1171,7 +1179,14 @@ impl<H: LandFs> Landing<'_, H> {
   /// A replacement: place the temporary at its hidden name, hold the old file, exchange, and
   /// verify the displaced file is the witnessed one; else exchange back.
   fn swap_replace(&mut self, swap: Swap<'_>) -> Result<Written, WriteFailure> {
+    // The complete temporary takes its aside name (a link), then leaves its creation name if it had one.
     self.host.place(swap.temp, swap.dir, swap.hidden)?;
+    if !self.unnamed_temporaries {
+      match self.host.unlink(swap.dir, swap.created) {
+        Ok(()) | Err(HostError::NotFound) => {}
+        Err(e) => return Err(e.into()),
+      }
+    }
     let old = match self.host.open_file(swap.dir, swap.name) {
       Ok(f) => f,
       Err(HostError::NotFound | HostError::NotFile) => {
@@ -2127,6 +2142,8 @@ struct Swap<'a> {
   temp: HostFile,
   /// The entry's directory.
   dir: HostDir,
+  /// The plain hidden name the temporary was created at (a named temporary still holds it).
+  created: &'a str,
   /// The temporary's hidden name: the entry's aside name, where the exchange leaves the displaced file.
   hidden: &'a str,
   /// The entry's name.
@@ -2292,6 +2309,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       dirs: BTreeMap::new(),
       touched: BTreeSet::new(),
       exchange: caps.exchange,
+      unnamed_temporaries: caps.unnamed_temporaries,
       hidden_counter: 0,
       bytes_written: 0,
       widest_window_ns: 0,

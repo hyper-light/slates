@@ -39,6 +39,11 @@ authorized merely by appearing here.
   repository's manifest for its workspace ("this may be fixable by adding … to `workspace.members`"). The
   crate is now its own workspace root; locally over the NFS mount all eight tools that ran were identical
   (the watcher skipped: no `fswatch` here).
+- [x] **Job 109759894864 (macOS, `baff1ae`): the `kill -9` landing kept an empty sibling.** A replacement's
+  temporary was created at its aside name; on APFS (named temporaries) a crash mid-write left bytes the
+  resume could not own. Temporaries are now created at a plain hidden name and linked to the aside once
+  complete. Red → green on the crash oracle's new named-temporary model
+  (`docs/bugs/2026-09-30-a-crash-mid-write-left-a-temporary-the-resume-could-not-own.md`).
 - [ ] **Run 36669682141, macOS: a SIGTERMed council leader's survivors elected nobody for 40 s (open, not
   reproduced).** `a_terminated_council_leader_process_hands_off_before_it_exits`: the leader's drain ended
   `SteppedDown` after 2.1 s, its invited target never took office, and neither survivor (two of three voters)

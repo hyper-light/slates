@@ -4218,7 +4218,13 @@ entry either old or new, never torn).
     settled by its manifest entry (A-43): the witnessed entry is removed, except that a replacement's
     or clear's goes back while its name is free, as a rename's directory always does; the landing's
     own temporary or empty fresh directory is removed; anything else goes back, or is kept. After a
-    reboot the manifest is gone; the re-plan is still idempotent by hash.
+    reboot the manifest is gone; the re-plan is still idempotent by hash. Every temporary is created at
+    a plain hidden name and written, given its mode and mtime, and synced there; only a complete
+    temporary takes an aside name (a link, its creation name then dropped), so a crash mid-write leaves
+    it where the sweep removes it as the landing's own. Until 2026-09-30 a replacement's temporary was
+    created at its aside name, and on a filesystem whose temporaries are named from creation (APFS) a
+    crash mid-write left bytes the resume could not own
+    (`docs/bugs/2026-09-30-a-crash-mid-write-left-a-temporary-the-resume-could-not-own.md`).
 
 **Exchange fallback.** Where the target filesystem lacks `RENAME_EXCHANGE` (`EINVAL`) or
 `RENAME_SWAP` (`ENOTSUP`, detected by capability query), the old entry is moved to its aside
