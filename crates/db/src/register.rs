@@ -2124,13 +2124,18 @@ impl RegionalConfiguration {
     if !self.admits(member) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     self.members.push(member);
     self.members.sort_unstable_by_key(|host| host.0);
     self.epochs.entry(member).or_insert(FIRST_EPOCH);
     if let Some(domain) = domain {
       self.domains.insert(member, domain);
     }
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     self.fix_neighbourhoods(scatter);
     // An admitted member owns nothing yet, so its first neighbourhood is settled at once. The members whose
     // neighbourhoods it entered keep their settled ones until they report the change placed.
@@ -2152,6 +2157,11 @@ impl RegionalConfiguration {
     if !self.members.contains(&member) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     let settled = self.settled.remove(&member).or_else(|| {
       self
         .neighbourhoods
@@ -2185,7 +2195,7 @@ impl RegionalConfiguration {
     self.members.retain(|host| *host != member);
     self.neighbourhoods.remove(&member);
     self.domains.remove(&member);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     self.fix_neighbourhoods(scatter);
     if let (Some(settled), Some(survivors)) = (settled, survivors) {
       self.retired.insert(
@@ -2214,12 +2224,17 @@ impl RegionalConfiguration {
     if !self.settles(owner, generation) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     let Some(neighbourhood) = self.neighbourhoods.get(&owner) else {
       return false;
     };
     let settled = Settled::of(neighbourhood, &self.domains);
     self.settled.insert(owner, settled);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     true
   }
 
@@ -2247,6 +2262,11 @@ impl RegionalConfiguration {
     if !self.owes_confirmation(departed, successor) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     let Some(retirement) = self.retired.get_mut(&departed) else {
       return false;
     };
@@ -2254,7 +2274,7 @@ impl RegionalConfiguration {
       .confirmed
       .partition_point(|host| host.0 < successor.0);
     retirement.confirmed.insert(position, successor);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     self.prune_retirements();
     true
   }
@@ -2450,15 +2470,16 @@ impl RegionalConfiguration {
   /// Takes over a dead host (§4.8): bumps its fencing epoch (so its in-flight records are refused as
   /// `StaleEpoch`), retires it, and refixes the neighbourhoods. The dead host's objects are not stored here:
   /// its [`Retirement`] names the cohorts they are recovered through, and every node ranks each object's
-  /// successor from it ([`successor`](RegionalConfiguration::successor)). Returns the host's new epoch.
-  pub fn take_over(&mut self, dead: HostId, scatter: u64) -> HostEpoch {
-    let bumped = {
-      let epoch = self.epochs.entry(dead).or_insert(FIRST_EPOCH);
-      epoch.0 = epoch.0.saturating_add(1);
-      *epoch
-    };
+  /// successor from it ([`successor`](RegionalConfiguration::successor)). Returns the host's new epoch, or
+  /// `None` — nothing changed — when its epoch or the version has no successor: a repeated epoch would let the
+  /// dead host's records pass its fence (AUD-29-26's sibling).
+  pub fn take_over(&mut self, dead: HostId, scatter: u64) -> Option<HostEpoch> {
+    let current = self.epochs.get(&dead).copied().unwrap_or(FIRST_EPOCH);
+    let bumped = HostEpoch(current.0.checked_add(1)?);
+    self.version.checked_add(1)?;
+    self.epochs.insert(dead, bumped);
     self.retire(dead, scatter);
-    bumped
+    Some(bumped)
   }
 }
 
@@ -2509,9 +2530,14 @@ impl RootConfiguration {
     if self.regions.contains(&region) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     self.regions.push(region);
     self.regions.sort_unstable_by_key(|region| region.0);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     true
   }
 
@@ -2521,8 +2547,13 @@ impl RootConfiguration {
     if !self.regions.contains(&region) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     self.regions.retain(|r| *r != region);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     true
   }
 
@@ -2535,9 +2566,14 @@ impl RootConfiguration {
     if region == mirror || !self.regions.contains(&region) || !self.regions.contains(&mirror) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     self.regions.retain(|r| *r != region);
     self.promotions.insert(region, mirror);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     true
   }
 
@@ -2548,8 +2584,13 @@ impl RootConfiguration {
     if !self.regions.contains(&to) || self.homes.get(&volume) == Some(&to) {
       return false;
     }
+    // A version with no successor refuses the change before anything moves, identically on every replica
+    // that applies it (AUD-29-26's sibling: a repeated version would name two configurations).
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
     self.homes.insert(volume, to);
-    self.version = self.version.saturating_add(1);
+    self.version = version;
     true
   }
 
@@ -3421,7 +3462,7 @@ mod tests {
       false,
     );
     let before = regional.epochs[&HostId(2)];
-    let bumped = regional.take_over(HostId(2), scatter);
+    let bumped = regional.take_over(HostId(2), scatter).unwrap();
     assert!(
       bumped.0 > before.0,
       "the dead host's epoch is bumped, fencing its in-flight records"
@@ -3939,6 +3980,56 @@ mod tests {
       regional.admit(departed, None, scatter),
       "admitted once its takeover is done"
     );
+  }
+
+  /// AUD-29-26's sibling (a version names one configuration): do: a regional and a root configuration at
+  /// the last version; admit, retire, take over, and every root change; expect every change refused and both
+  /// configurations unchanged — on every replica alike, since the refusal reads only replicated state.
+  #[test]
+  fn a_configuration_at_the_last_version_refuses_every_change_unchanged() {
+    // Shape: a neighbourhood of every member.
+    let scatter = 5;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    regional.version = u64::MAX;
+    let before = regional.clone();
+    assert!(!regional.admit(HostId(9), None, scatter));
+    assert!(!regional.retire(HostId(2), scatter));
+    assert_eq!(regional.take_over(HostId(2), scatter), None);
+    assert_eq!(regional, before);
+    let mut root = RootConfiguration::formed(vec![RegionId(0), RegionId(1)]);
+    root.version = u64::MAX;
+    let before = root.clone();
+    assert!(!root.admit_region(RegionId(2)));
+    assert!(!root.retire_region(RegionId(1)));
+    assert!(!root.promote_region(RegionId(1), RegionId(0)));
+    assert!(!root.move_home(ObjectId::new(HostId(1), 1), RegionId(1)));
+    assert_eq!(root, before);
+  }
+
+  /// AUD-29-26's sibling (an epoch fences one owner): do: take over a host whose fencing epoch is the last;
+  /// expect `None` and the configuration unchanged — the old code saturated the epoch, so the dead host's
+  /// records under it still passed the fence.
+  #[test]
+  fn a_host_at_the_last_epoch_cannot_be_taken_over() {
+    // Shape: a neighbourhood of every member.
+    let scatter = 5;
+    let mut regional = RegionalConfiguration::formed(
+      (1..=5).map(HostId).collect(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      scatter,
+      false,
+    );
+    regional.epochs.insert(HostId(2), HostEpoch(u64::MAX));
+    let before = regional.clone();
+    assert_eq!(regional.take_over(HostId(2), scatter), None);
+    assert_eq!(regional, before);
   }
 
   /// §4.8 "Promotion and takeover": an object whose recovery cohort lost every survivor is lost — the lineage

@@ -42,8 +42,26 @@
   - `an_append_past_the_last_index_is_refused_whole`.
   - `a_leader_at_the_last_index_refuses_new_entries`.
 
-## Sibling
+## Sibling (closed in the follow-up change)
 
-- **Still to sweep.** The regional and root configuration versions and the host fencing epochs
-  (`register.rs`, `ledger.rs`, `takeover.rs`) still saturate. They are applied through the log, so their
-  refusal must be a deterministic function of the replicated state; this is the follow-up change.
+- **Configuration versions.** Every regional and root mutator checks `version.checked_add(1)` before
+  anything moves: admit, retire, settle, confirm, admit/retire/promote a region, move a home. A change at
+  the last version is refused with the existing "changed nothing" result. The refusal reads only
+  replicated state, so every replica refuses the same entry alike, which keeps apply deterministic.
+- **Host epochs.** `RegionalConfiguration::take_over` returns `Option<HostEpoch>` and is `None`, with
+  nothing changed, when the dead host's epoch or the version has no successor. `Owner::take_over`
+  refuses `TakeoverError::EpochExhausted`.
+- **The server's takeover round.**
+  - A holder's fence at `u64::MAX`, or a held record written at it, refuses the round, counted as
+    `fleet.takeover.epoch_exhausted`.
+  - The first epoch is a checked maximum over the held records.
+- **Volume and lease epochs.**
+  - A snapshot checks the volume's next epoch before its barrier or any effect, and a write lease
+    checks its next epoch. Both are refused `Unsupported { feature }` (`volume.epoch_exhausted`,
+    `volume.lease_epoch_exhausted`).
+  - Recovery's head advance at an exhausted epoch is counted and leaves the head as recorded.
+- **Tests.**
+  - `a_configuration_at_the_last_version_refuses_every_change_unchanged`.
+  - `a_host_at_the_last_epoch_cannot_be_taken_over`.
+  - `a_takeover_above_the_last_epoch_is_refused` (ledger).
+- **Suites.** `slates-db`, `slates-cluster` and `slates-server` pass on macOS.

@@ -263,6 +263,9 @@ pub enum TakeoverError {
     /// The candidates a quorum needs.
     needed: usize,
   },
+  /// The highest epoch any reachable holder has seen has no successor (`u64::MAX`), so no new epoch can fence
+  /// the superseded owner: refused rather than reusing an epoch (AUD-29-26's sibling).
+  EpochExhausted,
 }
 
 /// A proposer's view of one register: its host id, the epoch it proposes under, and its log (the
@@ -354,7 +357,12 @@ impl Owner {
     }
     // The next epoch fences every holder the round reaches; it is the successor of the highest
     // epoch seen, not a tuning constant (structural increment, as `2f+1` and `f+1` are).
-    let new_epoch = HostEpoch(cohort.highest_epoch().saturating_add(1));
+    let new_epoch = HostEpoch(
+      cohort
+        .highest_epoch()
+        .checked_add(1)
+        .ok_or(TakeoverError::EpochExhausted)?,
+    );
     let mut logs: Vec<Vec<Record>> = Vec::new();
     for candidate in &reachable_candidates {
       if let Some(holder) = cohort.holders.get_mut(candidate) {
@@ -602,5 +610,37 @@ impl LedgerAcceptor {
       generation: prepare.generation,
       log: self.log.clone(),
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// AUD-29-26's sibling: do: a cohort one of whose holders has already seen the last epoch; take the
+  /// register over; expect `EpochExhausted` — no new epoch could fence the superseded owner, and the round
+  /// never reuses one.
+  #[test]
+  fn a_takeover_above_the_last_epoch_is_refused() {
+    let owner = HostId(1);
+    let members: Vec<HostId> = (1..=3).map(HostId).collect();
+    let mut cohort = Cohort::new(
+      owner,
+      &members,
+      &BTreeMap::new(),
+      ObjectId::new(owner, 1),
+      Quorum { f: 1 },
+    );
+    let seen = cohort.candidates.first().copied().unwrap();
+    let _ = cohort
+      .holders
+      .get_mut(&seen)
+      .unwrap()
+      .fence
+      .accept(HostEpoch(u64::MAX));
+    assert!(matches!(
+      Owner::take_over(&mut cohort, HostId(2), &Reach::All),
+      Err(TakeoverError::EpochExhausted)
+    ));
   }
 }

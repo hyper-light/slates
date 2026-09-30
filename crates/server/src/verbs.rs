@@ -147,6 +147,12 @@ pub(crate) fn forbidden(verb: &str) -> ReplyBody {
   }
 }
 
+/// The refusal feature (and status count) of a volume whose epoch has no successor (`u64::MAX`): no further
+/// snapshot or head advance can fence the one before (AUD-29-26's sibling).
+const VOLUME_EPOCH_EXHAUSTED: &str = "volume.epoch_exhausted";
+/// The refusal feature of a write lease whose epoch has no successor: no new holder can fence the last.
+const LEASE_EPOCH_EXHAUSTED: &str = "volume.lease_epoch_exhausted";
+
 pub(crate) fn refused(refusal: Refusal) -> ReplyBody {
   ReplyBody::Refused { refusal }
 }
@@ -3198,6 +3204,13 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   if !rights_of(&record, principal).write {
     return forbidden("snapshot");
   }
+  // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
+  // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).
+  let Some(next_epoch) = record.epoch.checked_add(1) else {
+    return refused(Refusal::Unsupported {
+      feature: VOLUME_EPOCH_EXHAUSTED.to_owned(),
+    });
+  };
   // The barrier (§4.6 "Writeback and snapshot barrier"; GAP-A9-4): every live attachment of the
   // volume in the shard's registry has its generation closed before the root is frozen, so every
   // request admitted before belongs to this snapshot and every request after to the next; a request
@@ -3230,7 +3243,7 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
       record: SnapshotRecord {
         id: to_db_snapshot(id),
         volume: record.id,
-        epoch: record.epoch.saturating_add(1),
+        epoch: next_epoch,
         identity: None,
         placed: placement_of(state, record.id),
         taken_ns: now,
@@ -3239,7 +3252,7 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
     Op::VolumeHeadAdvanced {
       id: record.id,
       head: to_db_snapshot(id),
-      epoch: record.epoch.saturating_add(1),
+      epoch: next_epoch,
     },
   ];
   for op in &ops {
@@ -4455,7 +4468,14 @@ fn take_write_lease(
 ) -> Result<u64, Refusal> {
   let epoch = match &record.lease {
     Some(current) if &current.holder == principal => current.epoch,
-    Some(current) if current.expires_ns <= now => current.epoch.saturating_add(1),
+    Some(current) if current.expires_ns <= now => {
+      current
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| Refusal::Unsupported {
+          feature: LEASE_EPOCH_EXHAUSTED.to_owned(),
+        })?
+    }
     Some(_) => 1,
     None => 1,
   };
@@ -6812,12 +6832,18 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     }
   }
   if lost.contains(&record.head) {
-    let op = Op::VolumeHeadAdvanced {
-      id: record.id,
-      head: DbSnapshotId::default(),
-      epoch: record.epoch.saturating_add(1),
-    };
-    let _ = state.db.mutate(&mut state.segment, &op, now);
+    match record.epoch.checked_add(1) {
+      Some(epoch) => {
+        let op = Op::VolumeHeadAdvanced {
+          id: record.id,
+          head: DbSnapshotId::default(),
+          epoch,
+        };
+        let _ = state.db.mutate(&mut state.segment, &op, now);
+      }
+      // No epoch can supersede the lost head's: counted, and the head is left as recorded.
+      None => *state.refusals.entry(VOLUME_EPOCH_EXHAUSTED).or_insert(0) += 1,
+    }
   }
   let attached: Vec<u64> = state
     .db

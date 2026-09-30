@@ -52,6 +52,9 @@ pub(crate) const TAKEOVER_STREAM: u64 = 16;
 /// request, a request whose asker is not the session's peer, or one naming a host this holder has no kept
 /// retirement for. Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const TAKEOVER_REFUSED: &str = "fleet.takeover.refused";
+/// The status count of takeover rounds refused because no epoch could supersede what they must fence — a
+/// holder's fence or a held record at `u64::MAX` (AUD-29-26's sibling): the round never reuses an epoch.
+const TAKEOVER_EPOCH_EXHAUSTED: &str = "fleet.takeover.epoch_exhausted";
 
 /// The status refusal count under which a holder records a takeover page it deferred because its own answers
 /// to the retired owner's probes may still feed that owner's lease (§4.8 "Leases and reads", AUD-08); the
@@ -441,7 +444,10 @@ pub(crate) fn begin_round(
   if state.fleet.configuration().version != regional.version {
     return None;
   }
-  let first_epoch = initial_epoch(state, &regional, departed, local);
+  let Some(first_epoch) = initial_epoch(state, &regional, departed, local) else {
+    *state.refusals.entry(TAKEOVER_EPOCH_EXHAUSTED).or_insert(0) += 1;
+    return None;
+  };
   let take = state
     .host_takeovers
     .entry(departed)
@@ -451,7 +457,11 @@ pub(crate) fn begin_round(
     take.restart(regional.version, epoch);
   }
   if let Some(fence) = take.fenced {
-    let epoch = HostEpoch(fence.0.saturating_add(1)).max(take.epoch);
+    let Some(above) = fence.0.checked_add(1) else {
+      *state.refusals.entry(TAKEOVER_EPOCH_EXHAUSTED).or_insert(0) += 1;
+      return None;
+    };
+    let epoch = HostEpoch(above).max(take.epoch);
     take.restart(regional.version, epoch);
   }
   let (epoch, generation) = (take.epoch, take.generation);
@@ -484,27 +494,27 @@ pub(crate) fn begin_round(
 
 /// The epoch a new round of `departed`'s takeover starts at: above every epoch this node's copies of the
 /// objects that fall to it were written at, and at least the retired host's bumped fencing epoch — the fence
-/// every holder raised for it at the install. A holder's fence above it sends the round higher.
+/// every holder raised for it at the install. A holder's fence above it sends the round higher. `None` when a
+/// copy was written at `u64::MAX`, which no epoch can exceed.
 fn initial_epoch(
   state: &ShardState,
   regional: &RegionalConfiguration,
   departed: HostId,
   local: HostId,
-) -> HostEpoch {
+) -> Option<HostEpoch> {
   let bumped = regional
     .epochs
     .get(&departed)
     .copied()
     .unwrap_or(slates_db::register::FIRST_EPOCH);
-  let held = state
+  state
     .holder_records
     .iter()
     .filter(|(object, _)| falls_to(state, **object, departed, local))
     .flat_map(|(_, acceptor)| acceptor.persisted().1)
-    .map(|(_, _, epoch, _)| HostEpoch(epoch.0.saturating_add(1)))
-    .max()
-    .unwrap_or(bumped);
-  bumped.max(held)
+    .try_fold(bumped, |highest, (_, _, epoch, _)| {
+      Some(highest.max(HostEpoch(epoch.0.checked_add(1)?)))
+    })
 }
 
 /// Whether `object`, held here, is one of `departed`'s objects that falls to `local` in its takeover.

@@ -2518,6 +2518,10 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 >   run past the range whole, before touching its log. A publication past the range does not restore
 >   (`IndexOverflow`). Such a state is reachable only through a peer's or a publication's maximal field
 >   (`docs/bugs/2026-09-30-a-saturated-term-let-two-leaders-share-it.md`).
+> - **Configuration versions and fencing epochs.** The same rule holds for them: a regional or root change
+>   at the last version, and a takeover at the last host or volume epoch, are refused before anything moves,
+>   deterministically on every replica. The refusals are `None` / "changed nothing", `EpochExhausted`,
+>   `Unsupported`, and counted in status.
 >
 > **Status (A-9, 2026-09-05).** Local records, replay/completion transactions and an
 > f-parameterized register core exist. `ledger`, `mirror` and `reconfig` are pure simulations
