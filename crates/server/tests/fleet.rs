@@ -7414,12 +7414,18 @@ fn a_holders_replicas_cap_at_its_unpromised_capacity_through_churn_and_retire_to
   );
 }
 
+/// Shape: the churn samples kept for a failure's diagnosis — the last stretch of the run, enough to show
+/// whether the charge or the room moved first (CI failures 2026-10-01 could not be reproduced alone).
+const CHURN_SAMPLES_KEPT: usize = 64;
+
 /// What the churn test saw.
 #[derive(Debug, Default)]
 struct Churn {
   per_seal: u64,
   cap: u64,
   peak: u64,
+  /// The last [`CHURN_SAMPLES_KEPT`] samples: (charge, admittable room, stages, manifests).
+  samples: std::collections::VecDeque<(u64, u64, usize, usize)>,
   accounts_agree: bool,
   refused_at_cap: bool,
   unrelated_wrote: bool,
@@ -7456,6 +7462,15 @@ fn sample_replicas(
 ) -> Result<slates_server::daemon::ReplicaAccount, ObserveError> {
   let account = holder.fleet_replica_account()?;
   churn.peak = churn.peak.max(account.replicated);
+  if churn.samples.len() == CHURN_SAMPLES_KEPT {
+    churn.samples.pop_front();
+  }
+  churn.samples.push_back((
+    account.replicated,
+    account.admittable,
+    account.stages,
+    account.manifests,
+  ));
   churn.accounts_agree &= account.replicated == account.charged;
   Ok(account)
 }

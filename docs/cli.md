@@ -7,7 +7,9 @@ interface; the [gap ledger](wip/GAPS.md) §8i tracks what is still missing.
 
 The current CLI is a development surface. `--locked` records intent without establishing
 locked backing, and bounded/dynamic claims do not yet provide the design's host-capacity
-guarantee. Daemon restart recovers metadata but can lose volume bytes and local snapshots.
+guarantee. A daemon restart under the same anchor keeps acknowledged content and its snapshots
+(`acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte`); the anchor's own death
+loses RAM by design.
 `attach` returns an attachment record without creating a mounted path. `exec` is Linux-only
 and currently expects an externally supplied `SLATES_ROOT` naming an established root mount.
 There is no implemented CLI/MCP virtio-fs or OCI attachment flow; the MCP server (`slates mcp`)

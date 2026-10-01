@@ -198,8 +198,8 @@ fn report_first_budget_refusal(
   eprintln!(
     "slates-server: {dimension} budget refuse-all (first occurrence): requested={requested} \
      config[reserve_per_shard={} shards={} max_inodes={} max_chunks={} metadata_class={}] \
-     bytes[capacity={} committed={} retained={} headroom={}] \
-     versions[capacity={} committed={} retained={} headroom={}]",
+     bytes[capacity={} committed={} retained={} headroom={} replicated={}] \
+     versions[capacity={} committed={} retained={} headroom={}] held[stages={} charged={}]",
     state.config.reserve_per_shard,
     state.config.runtime.shards,
     state.config.store.max_inodes,
@@ -209,10 +209,13 @@ fn report_first_budget_refusal(
     state.store.budget.committed(),
     state.store.budget.retained(),
     state.store.budget.headroom(),
+    state.store.budget.replicated(),
     state.store.versions.capacity(),
     state.store.versions.committed(),
     state.store.versions.retained(),
     state.store.versions.headroom(),
+    state.held_content.stage_count(),
+    state.held_content.charged_bytes(),
   );
 }
 
@@ -1437,6 +1440,12 @@ pub fn record_completion(
   state.served += 1;
   if let ReplyBody::Refused { refusal } = &reply {
     *state.refusals.entry(refusal_name(refusal)).or_insert(0) += 1;
+    // Every refuse-all budget refusal, whatever path produced it (a write, a merge version, a takeover's
+    // restore), logs the store's breakdown once — the create path alone did before, and a takeover's
+    // `BudgetExceeded { available: 0 }` on CI (run 36828863866, 2026-10-01) carried no breakdown.
+    if let Refusal::BudgetExceeded { available } = refusal {
+      report_first_budget_refusal(state, "any verb", 0, *available);
+    }
   }
   reply
 }

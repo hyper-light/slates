@@ -36,6 +36,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod capabilities;
 mod conformance;
 mod kind;
 mod ratchet;
@@ -75,7 +76,14 @@ fn main() -> ExitCode {
     "check" => structural::run()
       .and_then(|()| literals::run())
       .and_then(|()| workspace_root().and_then(|root| unsafe_budget::run(&root, false)))
-      .and_then(|()| workspace_root().and_then(|root| version::run(&root, &version::Mode::Check))),
+      .and_then(|()| workspace_root().and_then(|root| version::run(&root, &version::Mode::Check)))
+      .and_then(|()| workspace_root().and_then(|root| check_capabilities(&root))),
+    "capabilities" => workspace_root().and_then(|root| {
+      if args.iter().any(|a| a == "--write") {
+        capabilities::write(&root).map_err(Failure)?;
+      }
+      check_capabilities(&root)
+    }),
     "version" => workspace_root().and_then(|root| {
       let mode = version::mode_from(&args[1..])?;
       version::run(&root, &mode)
@@ -114,7 +122,7 @@ fn main() -> ExitCode {
       kind::run(&root, &options)
     }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, ratchet, conformance, kind"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, capabilities, ratchet, conformance, kind"
     ))),
   };
   match outcome {
@@ -123,6 +131,24 @@ fn main() -> ExitCode {
       eprintln!("xtask: {failure}");
       ExitCode::FAILURE
     }
+  }
+}
+
+/// The capability table's check (AUD-29-32): the README's table equals the registry's rendering and every
+/// cited test exists and runs.
+fn check_capabilities(root: &Path) -> Result<(), Failure> {
+  let problems = capabilities::problems(root);
+  for problem in &problems {
+    eprintln!("capabilities: {problem}");
+  }
+  if problems.is_empty() {
+    println!(
+      "capabilities: ok ({} rows, each proof a runnable test)",
+      capabilities::CAPABILITIES.len()
+    );
+    Ok(())
+  } else {
+    Err(Failure(format!("{} capability problem(s)", problems.len())))
   }
 }
 
