@@ -2034,7 +2034,7 @@ fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) ->
     .max()
     .unwrap_or(0);
   let mut restored = slates_archive::restore(&archive, held.saturating_add(largest)).ok()?;
-  let mut bytes = restored.files.remove(INPUTS_ENTRY_NAME)?;
+  let mut bytes = restored.files.remove(INPUTS_ENTRY_NAME)?.dense()?;
   if state.merge.fault.corrupt_next_inputs {
     state.merge.fault.corrupt_next_inputs = false;
     // The increment encoding ends with the evidence count (a `u64`); the byte before it is the

@@ -16,7 +16,10 @@
 //!
 //! Chunking is fixed-size at the volume's chunk size (the copy-on-write unit, §4.5), so the same
 //! bytes at the same offsets cut into the same chunks and deduplicate across snapshots by identity —
-//! the design's rule for large files ("page-multiple fixed chunks", research §2.4). Each chunk is
+//! the design's rule for large files ("page-multiple fixed chunks", research §2.4). Only the chunk
+//! windows that hold data are cut (AUD-29-57, A-55): the body's data ranges at the snapshot decide them,
+//! each data range becomes an extent naming its slice of its window's chunk, and every gap is a hole
+//! extent, so a sparse file costs its data and its exact sparse map reaches the archive. Each chunk is
 //! stored under the **compress-or-not cost model** (D-17, §4.11; [`slates_archive::codec`]): the
 //! [`CodecPolicy`] the caller derives from the boot profile's measured codec points decides raw, LZ4 or
 //! a zstd level per chunk; the manifest identity is the BLAKE3 of the raw bytes and never depends on it.
@@ -122,26 +125,94 @@ struct Pending {
 }
 
 /// A body — a file's bytes or an extended attribute's value — part-way through being cut into chunks
-/// across slices, read at the snapshot.
+/// across slices, read at the snapshot. Only its **data** is walked (AUD-29-57): the data ranges still to
+/// cut, and the offset the extents tile so far; every gap between data is a hole extent, so a sparse body
+/// costs its data, not its logical size, and its exact sparse map reaches the archive.
 struct BodyCursor {
   inode: InodeNo,
-  offset: u64,
   size: u64,
+  data: VecDeque<Range>,
+  tiled: u64,
   extents: Vec<Extent>,
 }
 
+/// The zero identity a hole extent names.
+const HOLE: [u8; 32] = [0u8; 32];
+
+/// A byte range `[start, end)` of a body.
+type Range = (u64, u64);
+
+/// One chunk window to cut and the data ranges inside it.
+type Window = (Range, Vec<Range>);
+
 impl BodyCursor {
-  fn new(inode: InodeNo, size: u64) -> BodyCursor {
-    BodyCursor {
+  /// The cursor over `inode`'s body of `size` bytes at `snapshot`: its data ranges read up front (a body with
+  /// none is one hole, or nothing when empty).
+  fn new(
+    volume: &Volume,
+    store: &Store,
+    snapshot: SnapshotId,
+    inode: InodeNo,
+    size: u64,
+  ) -> Result<BodyCursor, VfsError> {
+    let mut cursor = BodyCursor {
       inode,
-      offset: 0,
       size,
+      data: volume
+        .data_ranges_in(store, snapshot, inode)?
+        .into_iter()
+        .collect(),
+      tiled: 0,
       extents: Vec::new(),
-    }
+    };
+    cursor.close_if_done();
+    Ok(cursor)
   }
 
   fn finished(&self) -> bool {
-    self.offset >= self.size
+    self.data.is_empty()
+  }
+
+  /// Tiles `[self.tiled, to)` with one hole extent, when it is not empty.
+  fn hole_to(&mut self, to: u64) {
+    if to > self.tiled {
+      self.extents.push(Extent {
+        offset: self.tiled,
+        len: to.saturating_sub(self.tiled),
+        chunk: HOLE,
+        chunk_offset: 0,
+      });
+      self.tiled = to;
+    }
+  }
+
+  /// Once every data range is cut, ends the body with the hole up to its size.
+  fn close_if_done(&mut self) {
+    if self.data.is_empty() {
+      self.hole_to(self.size);
+    }
+  }
+
+  /// The next chunk window to cut — `[start, end)`, aligned to `chunk` bytes and within the size — and the
+  /// data ranges inside it, taken off the cursor (a range running past the window keeps its remainder).
+  fn next_window(&mut self, chunk: u64) -> Option<Window> {
+    let (first, _) = *self.data.front()?;
+    let start = first.checked_div(chunk).unwrap_or(0).saturating_mul(chunk);
+    let end = start.saturating_add(chunk).min(self.size);
+    let mut inside = Vec::new();
+    while let Some(&(from, to)) = self.data.front() {
+      if from >= end {
+        break;
+      }
+      self.data.pop_front();
+      if to > end {
+        self.data.push_front((end, to));
+        inside.push((from, end));
+        break;
+      }
+      inside.push((from, to));
+    }
+    Some(((start, end), inside))
   }
 }
 
@@ -297,13 +368,17 @@ impl SnapshotArchiver {
       walked: Walked::default(),
     };
     // The root's attribute values are cut first; its metadata replaces the frame's once whole.
-    archiver.start(NodeCursor {
-      name: String::new(),
-      meta: root_meta,
-      queued: root_attributes,
-      value: None,
-      then: Then::Root,
-    })?;
+    archiver.start(
+      volume,
+      store,
+      NodeCursor {
+        name: String::new(),
+        meta: root_meta,
+        queued: root_attributes,
+        value: None,
+        then: Then::Root,
+      },
+    )?;
     Ok(archiver)
   }
 
@@ -409,13 +484,17 @@ impl SnapshotArchiver {
     if !pending.is_empty() && self.frames.len() >= limit {
       return Err(VfsError::TreeTooDeep { limit });
     }
-    self.start(NodeCursor {
-      name: next.name,
-      meta,
-      queued,
-      value: None,
-      then: Then::Directory { dir, pending },
-    })?;
+    self.start(
+      volume,
+      store,
+      NodeCursor {
+        name: next.name,
+        meta,
+        queued,
+        value: None,
+        then: Then::Directory { dir, pending },
+      },
+    )?;
     Ok(u64::try_from(self.chunk_bytes).unwrap_or(u64::MAX))
   }
 
@@ -430,16 +509,20 @@ impl SnapshotArchiver {
     self.walked.file(size);
     let meta = node_meta(next.inode, &inode.attrs, MODE_FILE);
     let queued = attributes_of(volume, store, self.snapshot, next.inode)?;
-    self.start(NodeCursor {
-      name: next.name,
-      meta,
-      queued,
-      value: None,
-      then: Then::File {
-        inode: next.inode,
-        size,
+    self.start(
+      volume,
+      store,
+      NodeCursor {
+        name: next.name,
+        meta,
+        queued,
+        value: None,
+        then: Then::File {
+          inode: next.inode,
+          size,
+        },
       },
-    })?;
+    )?;
     Ok(u64::try_from(self.chunk_bytes).unwrap_or(u64::MAX))
   }
 
@@ -468,12 +551,13 @@ impl SnapshotArchiver {
       if matches!(value.body, Body::Base(_)) {
         return Err(VfsError::RecoveryIncomplete);
       }
-      let body = BodyCursor::new(attribute, value.attrs.size);
+      let body = BodyCursor::new(volume, store, self.snapshot, attribute, value.attrs.size)?;
       if body.finished() {
-        // An empty value has no extents: an empty chunk is not canonical (no extent can name one).
+        // A value without data — empty, or all hole — is its extents as they stand: an empty chunk is not
+        // canonical (no extent can name one).
         node.meta.xattrs.push(Xattr {
           name: name.into_vec(),
-          extents: Vec::new(),
+          extents: body.extents,
         });
       } else {
         node.value = Some((name, body));
@@ -481,16 +565,16 @@ impl SnapshotArchiver {
       self.node = Some(node);
       return Ok(unit);
     }
-    self.place(node)?;
+    self.place(volume, store, node)?;
     Ok(unit)
   }
 
   /// Starts a node: one with no attributes is placed in the step that began it, so a tree without attributes
   /// walks in exactly the steps it did before format minor 3; one with attributes waits in the cursor
   /// while its values are cut.
-  fn start(&mut self, node: NodeCursor) -> Result<(), VfsError> {
+  fn start(&mut self, volume: &Volume, store: &Store, node: NodeCursor) -> Result<(), VfsError> {
     if node.queued.is_empty() {
-      self.place(node)
+      self.place(volume, store, node)
     } else {
       self.node = Some(node);
       Ok(())
@@ -498,7 +582,7 @@ impl SnapshotArchiver {
   }
 
   /// Places a node whose metadata is whole, as its [`Then`] says.
-  fn place(&mut self, node: NodeCursor) -> Result<(), VfsError> {
+  fn place(&mut self, volume: &Volume, store: &Store, node: NodeCursor) -> Result<(), VfsError> {
     let NodeCursor {
       name, meta, then, ..
     } = node;
@@ -518,19 +602,19 @@ impl SnapshotArchiver {
         });
         Ok(())
       }
-      Then::File { inode, size } if size > 0 => {
-        self.file = Some(FileCursor {
-          name,
-          meta,
-          body: BodyCursor::new(inode, size),
-        });
+      Then::File { inode, size } => {
+        let body = BodyCursor::new(volume, store, self.snapshot, inode, size)?;
+        if body.finished() {
+          // Empty, or all hole: the extents are already whole.
+          return self.push_entry(Entry {
+            name,
+            meta,
+            node: Node::File(body.extents),
+          });
+        }
+        self.file = Some(FileCursor { name, meta, body });
         Ok(())
       }
-      Then::File { .. } => self.push_entry(Entry {
-        name,
-        meta,
-        node: Node::File(Vec::new()),
-      }),
       Then::Leaf(built) => self.push_entry(Entry {
         name,
         meta,
@@ -539,35 +623,44 @@ impl SnapshotArchiver {
     }
   }
 
-  /// Cuts the next chunk off `body`, read at the snapshot, and returns it advanced with the bytes cut.
+  /// Cuts the next data window off `body`, read at the snapshot — one chunk of the window's bytes, at its
+  /// aligned offset so equal bytes at equal offsets deduplicate — and tiles it exactly: a data extent per
+  /// data range in the window (naming its slice of the chunk) and a hole extent per gap. Returns the body
+  /// advanced and the bytes hashed.
   fn cut(
     &mut self,
     volume: &Volume,
     store: &Store,
     mut body: BodyCursor,
   ) -> Result<(BodyCursor, u64), VfsError> {
-    let remaining = body.size.saturating_sub(body.offset);
-    let want = usize::try_from(remaining.min(u64::try_from(self.chunk_bytes).unwrap_or(u64::MAX)))
-      .unwrap_or(self.chunk_bytes);
+    let chunk_len = u64::try_from(self.chunk_bytes).unwrap_or(u64::MAX);
+    let Some(((start, end), inside)) = body.next_window(chunk_len) else {
+      return Ok((body, 0));
+    };
+    let want =
+      usize::try_from(end.saturating_sub(start)).map_err(|_| VfsError::RecoveryIncomplete)?;
     let mut piece = vec![0u8; want];
     // `read_in_body`, not `read_in`: an attribute value is an attribute inode's body, which the public
     // read refuses so that no client reaches a value through a file read.
-    let read = volume.read_in_body(store, self.snapshot, body.inode, body.offset, &mut piece)?;
+    let read = volume.read_in_body(store, self.snapshot, body.inode, start, &mut piece)?;
     // A read short of the size the inode records is a torn snapshot; refuse rather than archive a
     // truncated body under the recorded size.
     if read != want {
       return Err(VfsError::RecoveryIncomplete);
     }
     let len = u64::try_from(read).unwrap_or(u64::MAX);
-    let offset = body.offset;
-    body.offset = body.offset.saturating_add(len);
     let chunk = self.push_chunk(piece);
-    body.extents.push(Extent {
-      offset,
-      len,
-      chunk,
-      chunk_offset: 0,
-    });
+    for (from, to) in inside {
+      body.hole_to(from);
+      body.extents.push(Extent {
+        offset: from,
+        len: to.saturating_sub(from),
+        chunk,
+        chunk_offset: from.saturating_sub(start),
+      });
+      body.tiled = to;
+    }
+    body.close_if_done();
     Ok((body, len))
   }
 
@@ -603,13 +696,17 @@ impl SnapshotArchiver {
     };
     let meta = meta_of(volume, store, self.snapshot, next.inode, type_bits)?;
     let queued = attributes_of(volume, store, self.snapshot, next.inode)?;
-    self.start(NodeCursor {
-      name: next.name,
-      meta,
-      queued,
-      value: None,
-      then: Then::Leaf(Node::File(Vec::new())),
-    })?;
+    self.start(
+      volume,
+      store,
+      NodeCursor {
+        name: next.name,
+        meta,
+        queued,
+        value: None,
+        then: Then::Leaf(Node::File(Vec::new())),
+      },
+    )?;
     Ok(u64::try_from(self.chunk_bytes).unwrap_or(u64::MAX))
   }
 
@@ -636,13 +733,17 @@ impl SnapshotArchiver {
       }]
     };
     let queued = attributes_of(volume, store, self.snapshot, next.inode)?;
-    self.start(NodeCursor {
-      name: next.name,
-      meta,
-      queued,
-      value: None,
-      then: Then::Leaf(Node::File(extents)),
-    })?;
+    self.start(
+      volume,
+      store,
+      NodeCursor {
+        name: next.name,
+        meta,
+        queued,
+        value: None,
+        then: Then::Leaf(Node::File(extents)),
+      },
+    )?;
     Ok(
       u64::try_from(self.chunk_bytes)
         .unwrap_or(u64::MAX)
@@ -914,15 +1015,15 @@ mod tests {
   /// The tree [`populate`] built, as a restore must reproduce it: every file's bytes, the directory, the
   /// symlink as a file under the link type bits, and each entry's kind, permissions and size.
   fn assert_restored_tree(restored: &slates_archive::Restored, body: &[u8]) {
-    assert_eq!(
-      restored.files.get("src/main.rs").map(Vec::as_slice),
-      Some(body)
-    );
-    assert_eq!(restored.files.get("empty"), Some(&Vec::new()));
-    assert_eq!(
-      restored.files.get("link").map(|b| b.as_slice()),
-      Some(b"src/main.rs".as_slice())
-    );
+    let dense = |path: &str| {
+      restored
+        .files
+        .get(path)
+        .and_then(slates_archive::RestoredFile::dense)
+    };
+    assert_eq!(dense("src/main.rs").as_deref(), Some(body));
+    assert_eq!(dense("empty"), Some(Vec::new()));
+    assert_eq!(dense("link").as_deref(), Some(b"src/main.rs".as_slice()));
     assert!(restored.directories.contains("src"));
     let meta = |path: &str| restored.metadata.get(path).cloned().unwrap();
     let expected = [

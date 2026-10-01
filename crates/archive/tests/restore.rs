@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use slates_archive::archive::Archive;
 use slates_archive::format::ArchiveError;
 use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
-use slates_archive::restore::restore;
+use slates_archive::restore::{RestoredFile, restore};
 
 /// Shape: the bytes a restore here is admitted — far past any fixture, so only the budget tests meet it.
 const ADMITTED: u64 = 1 << 30;
@@ -84,7 +84,12 @@ fn a_file_restores_to_its_bytes() {
   let restored = restore(&archive, ADMITTED).expect("restores");
   let mut expected: BTreeMap<String, Vec<u8>> = BTreeMap::new();
   expected.insert("readme".to_owned(), b"hello, archive".to_vec());
-  assert_eq!(restored.files, expected);
+  let dense: BTreeMap<String, Vec<u8>> = restored
+    .files
+    .iter()
+    .filter_map(|(path, file)| Some((path.clone(), file.dense()?)))
+    .collect();
+  assert_eq!(dense, expected);
 }
 
 /// A zero-chunk extent restores as a hole of zeros.
@@ -113,7 +118,14 @@ fn a_hole_restores_as_zeros() {
     chunks: Vec::new(),
   };
   let restored = restore(&archive, ADMITTED).expect("restores");
-  assert_eq!(restored.files.get("sparse"), Some(&vec![0u8; 64]));
+  assert_eq!(
+    restored.files.get("sparse").and_then(RestoredFile::dense),
+    Some(vec![0u8; 64])
+  );
+  assert!(
+    restored.files["sparse"].pieces.is_empty(),
+    "AUD-29-57: a hole restores as no data, not as zeros to write"
+  );
 }
 
 /// A file spanning two chunks concatenates them, reading a sub-range of each.
@@ -153,7 +165,10 @@ fn a_multi_extent_file_concatenates_its_chunks() {
     chunks: vec![first, second],
   };
   let restored = restore(&archive, ADMITTED).expect("restores");
-  assert_eq!(restored.files.get("joined"), Some(&b"CDEwx".to_vec()));
+  assert_eq!(
+    restored.files.get("joined").and_then(RestoredFile::dense),
+    Some(b"CDEwx".to_vec())
+  );
 }
 
 /// A directory tree restores its files by path and records its directories.
@@ -189,8 +204,11 @@ fn a_tree_restores_files_and_directories() {
   };
   let restored = restore(&archive, ADMITTED).expect("restores");
   assert_eq!(
-    restored.files.get("src/lib.rs"),
-    Some(&b"pub fn f() {}".to_vec())
+    restored
+      .files
+      .get("src/lib.rs")
+      .and_then(RestoredFile::dense),
+    Some(b"pub fn f() {}".to_vec())
   );
   assert!(restored.directories.contains("src"));
 }
@@ -231,8 +249,14 @@ fn restore_after_a_round_trip() {
   let bytes = archive.encode();
   let decoded = Archive::decode(&bytes).expect("decodes");
   let restored = restore(&decoded, ADMITTED).expect("restores");
-  assert_eq!(restored.files.get("a"), Some(&b"first".to_vec()));
-  assert_eq!(restored.files.get("b"), Some(&b"second file".to_vec()));
+  assert_eq!(
+    restored.files.get("a").and_then(RestoredFile::dense),
+    Some(b"first".to_vec())
+  );
+  assert_eq!(
+    restored.files.get("b").and_then(RestoredFile::dense),
+    Some(b"second file".to_vec())
+  );
 }
 
 /// A restored file whose chunk was LZ4-compressed decodes correctly.
@@ -265,7 +289,10 @@ fn restore_decodes_compressed_chunks() {
     chunks: vec![chunk],
   };
   let restored = restore(&archive, ADMITTED).expect("restores");
-  assert_eq!(restored.files.get("z"), Some(&raw));
+  assert_eq!(
+    restored.files.get("z").and_then(RestoredFile::dense),
+    Some(raw.clone())
+  );
 }
 
 /// Restore surfaces each named node's metadata by path (for a granted landing to apply).
@@ -342,7 +369,10 @@ fn the_roots_metadata_is_restored_through_the_byte_stream() {
     restored.root, archive.root_meta,
     "the root's metadata is restored"
   );
-  assert_eq!(restored.files.get("f"), Some(&b"x".to_vec()));
+  assert_eq!(
+    restored.files.get("f").and_then(RestoredFile::dense),
+    Some(b"x".to_vec())
+  );
 }
 
 /// An archive holding `manifest` over `chunks`, with the fixture header.
@@ -371,11 +401,12 @@ fn entry(name: &str, node: Node) -> Entry {
   }
 }
 
-/// AUD-29-13: do: restore a file that is one hole of a terabyte, admitted a gigabyte; expect `OverBudget`
-/// naming what it needed — refused from the plan, before any byte is allocated (the test would abort on
-/// the allocation otherwise).
+/// AUD-29-57 (sparse files stay sparse; AUD-29-13 bounded restore): do: restore a file that is one hole of a
+/// terabyte, admitted a gigabyte; expect it restored as its terabyte length with no data piece — the hole
+/// costs nothing and nothing is allocated for it (the test would abort on the allocation otherwise). Until
+/// 2026-10-01 restore was dense, so this file needed a terabyte and was refused `OverBudget`.
 #[test]
-fn a_huge_hole_is_refused_before_allocation() {
+fn a_huge_hole_restores_as_its_length_without_allocating_it() {
   let terabyte = 1u64 << 40;
   let archive = archive_with(
     Node::Directory(vec![entry(
@@ -389,13 +420,15 @@ fn a_huge_hole_is_refused_before_allocation() {
     )]),
     Vec::new(),
   );
+  let restored = restore(&archive, ADMITTED).expect("a hole is admitted at no cost");
   assert_eq!(
-    restore(&archive, ADMITTED),
-    Err(ArchiveError::OverBudget {
-      needed: terabyte,
-      budget: ADMITTED
-    })
+    restored.files["sparse"],
+    RestoredFile {
+      len: terabyte,
+      pieces: Vec::new(),
+    }
   );
+  assert_eq!(restored.chunks_decoded, 0);
 }
 
 /// The references a many-times-named chunk test uses: `count` extents tiling one file, each the whole of
@@ -429,7 +462,7 @@ fn a_chunk_named_many_times_is_decoded_once_and_its_expansion_is_admitted() {
     vec![chunk],
   );
   let restored = restore(&archive, ADMITTED).expect("restores");
-  assert_eq!(restored.files["copies"], bytes.repeat(256));
+  assert_eq!(restored.files["copies"].dense(), Some(bytes.repeat(256)));
   assert_eq!(restored.chunks_decoded, 1, "the chunk was decoded once");
   let needed = copies * len + len;
   assert_eq!(

@@ -7685,5 +7685,20 @@ and `docs/bugs/2026-10-01-a-cut-transfer-lost-its-progress-and-puts-waited-on-th
   that stage, verified as it arrives, so a cut fetch resumes with exactly the chunks still owed; a holder
   serves a chunk only for an object holding the named manifest and referencing it.
 - What it does not change: the collector still polls its channels on the budget's interval; R1–R10.
+
+### A-55 — A sparse file stays sparse through seal, placement and takeover (2026-10-01)
+Applied in the same change to: GAPS (AUD-29-55–58), `docs/bugs/2026-10-01-a-sparse-file-was-exported-and-restored-dense.md`.
+- Why: the exporter cut a body from offset zero to its size, restore produced one dense buffer per file, and a
+  takeover wrote it whole, so a sparse file cost its logical length in hashing, transient memory and the
+  successor's charge, and a successor's holes were data (AUD-29-57).
+- The rule: the archive carries a body's exact sparse map — D-17 already encodes a hole as a zero extent. The
+  exporter visits only the chunk windows holding data (each still one chunk at its aligned offset, so dedup is
+  unchanged), with a data extent per data range naming its slice of the chunk and a hole extent per gap.
+  Restore yields a file as its length and data pieces, admitted on its data bytes. A takeover writes only the
+  pieces and sets the length.
+- Evidence: the in-process rebuild equal to the origin in bytes, length, SEEK map and physical charge, with
+  the export hashing 4 of 32 windows; a terabyte hole restored with nothing allocated.
+- What it does not change: the archive format; hole punching is still owed (no volume verb, NFSv4.2
+  `DEALLOCATE` unserved).
   the merge engine's metadata dimension, R1–R10.
 

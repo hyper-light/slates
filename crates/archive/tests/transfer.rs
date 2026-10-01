@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 
 use slates_archive::archive::Archive;
 use slates_archive::manifest::{Entry, Extent, Node, NodeMeta};
-use slates_archive::restore::restore;
+use slates_archive::restore::{RestoredFile, restore};
 
 /// Shape: the bytes a restore here is admitted — far past any fixture, so only the budget tests meet it.
 const ADMITTED: u64 = 1 << 30;
@@ -84,12 +84,12 @@ fn a_partial_transfer_restores_the_whole_archive() {
   received.chunks.extend(shipped);
   let restored = restore(&received, ADMITTED).expect("restores from held + shipped");
   assert_eq!(
-    restored.files.get("shared"),
-    Some(&b"the identical build output".to_vec())
+    restored.files.get("shared").and_then(RestoredFile::dense),
+    Some(b"the identical build output".to_vec())
   );
   assert_eq!(
-    restored.files.get("changed"),
-    Some(&b"a file only this version has".to_vec())
+    restored.files.get("changed").and_then(RestoredFile::dense),
+    Some(b"a file only this version has".to_vec())
   );
 }
 

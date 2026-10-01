@@ -1073,6 +1073,19 @@ impl Volume {
     })
   }
 
+  /// The data ranges of inode `no` as snapshot `id` holds it — `(start, end)`, ascending, merged, within its
+  /// size: what a chunk, an open extent or inline bytes hold; everything else is a hole (AUD-29-57: the
+  /// archive carries this map exactly, so a sparse file stays sparse through placement and takeover).
+  pub fn data_ranges_in(
+    &self,
+    store: &Store,
+    id: SnapshotId,
+    no: InodeNo,
+  ) -> Result<Vec<(u64, u64)>, VfsError> {
+    let inode = self.inode_in(store, id, no)?;
+    Ok(data_ranges(&inode.body, inode.attrs.size))
+  }
+
   // ------------------------------------------------------------------ namespace mutations
 
   /// Creates an empty file.

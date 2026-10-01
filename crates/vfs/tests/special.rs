@@ -184,7 +184,7 @@ fn archives_preserve_ipc_metadata_without_stream_bytes() {
     let meta = &restored.metadata[name];
     assert_eq!(kind_of_mode(meta.mode), Some(kind));
     assert_eq!((meta.uid, meta.gid), (123, 456));
-    assert!(restored.files[name].is_empty());
+    assert_eq!(restored.files[name].len, 0);
   }
 }
 

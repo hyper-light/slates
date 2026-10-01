@@ -5608,7 +5608,7 @@ fn populate_restored(
     let handle = volume.mkdir(store, parent, &name, mode)?;
     directories.insert(path.clone(), handle);
   }
-  for (path, bytes) in &restored.files {
+  for (path, file) in &restored.files {
     let (parent, name) = parent_of(&directories, path)?;
     let meta = restored
       .metadata
@@ -5620,7 +5620,7 @@ fn populate_restored(
     }
     let no = match kind_of_mode(meta.mode) {
       Some(kind @ (Kind::Fifo | Kind::Socket)) => {
-        if !bytes.is_empty() {
+        if file.len != 0 {
           return Err(slates_vfs::error::VfsError::RecoveryIncomplete);
         }
         let parent_no = store.dirs.get(parent)?.inode;
@@ -5633,15 +5633,16 @@ fn populate_restored(
         )?
       }
       Some(Kind::Symlink) => {
+        let target = file
+          .dense()
+          .ok_or(slates_vfs::VfsError::RecoveryIncomplete)?;
         let target =
-          std::str::from_utf8(bytes).map_err(|_| slates_vfs::VfsError::RecoveryIncomplete)?;
+          std::str::from_utf8(&target).map_err(|_| slates_vfs::VfsError::RecoveryIncomplete)?;
         volume.symlink(store, parent, &name, target)?
       }
       Some(Kind::File) => {
         let no = volume.create_file(store, parent, &name, permissions_of_mode(meta.mode))?;
-        if !bytes.is_empty() {
-          volume.write(store, no, 0, bytes)?;
-        }
+        write_sparse(store, volume, no, file)?;
         no
       }
       Some(Kind::Dir) | None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
@@ -5676,26 +5677,53 @@ fn populate_restored(
   Ok(())
 }
 
+/// Writes a restored file's data pieces at their offsets and nothing else, then gives it its length — so a
+/// hole stays a hole: unwritten, uncharged, and found by `SEEK_HOLE` as on the origin (AUD-29-57). Until
+/// 2026-10-01 the file was written as one dense buffer of its logical length.
+fn write_sparse(
+  store: &mut slates_vfs::volume::Store,
+  volume: &mut Volume,
+  no: slates_vfs::ids::InodeNo,
+  file: &slates_archive::RestoredFile,
+) -> Result<(), slates_vfs::VfsError> {
+  for (offset, bytes) in &file.pieces {
+    volume.write(store, no, *offset, bytes)?;
+  }
+  let written = file.pieces.last().map_or(0, |(offset, bytes)| {
+    offset.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+  });
+  if file.len > written {
+    volume.truncate(store, no, file.len)?;
+  }
+  Ok(())
+}
+
 /// Validates archived inode groups before touching the replacement volume. A repeated inode is a
 /// hard link only when kind, attributes and bytes agree; a hostile archive cannot alias unlike nodes.
 fn validate_restored_nodes(
   restored: &slates_archive::Restored,
 ) -> Result<(), slates_vfs::VfsError> {
   use slates_vfs::{VfsError, export::kind_of_mode, inode::Kind};
-  let mut groups: std::collections::BTreeMap<u64, (&slates_archive::NodeMeta, &[u8], u32)> =
-    std::collections::BTreeMap::new();
-  for (path, bytes) in &restored.files {
+  let mut groups: std::collections::BTreeMap<
+    u64,
+    (
+      &slates_archive::NodeMeta,
+      &slates_archive::RestoredFile,
+      u32,
+    ),
+  > = std::collections::BTreeMap::new();
+  for (path, file) in &restored.files {
     let meta = restored
       .metadata
       .get(path)
       .ok_or(VfsError::RecoveryIncomplete)?;
     match kind_of_mode(meta.mode) {
-      Some(Kind::Fifo | Kind::Socket) if meta.size == 0 && bytes.is_empty() => {}
-      Some(Kind::File | Kind::Symlink) if meta.size == bytes.len() as u64 => {}
+      Some(Kind::Fifo | Kind::Socket) if meta.size == 0 && file.len == 0 => {}
+      Some(Kind::File | Kind::Symlink) if meta.size == file.len => {}
       _ => return Err(VfsError::RecoveryIncomplete),
     }
-    let group = groups.entry(meta.ino).or_insert((meta, bytes, 0));
-    if group.0 != meta || group.1 != bytes {
+    let group = groups.entry(meta.ino).or_insert((meta, file, 0));
+    if group.0 != meta || group.1 != file {
       return Err(VfsError::RecoveryIncomplete);
     }
     group.2 = group.2.checked_add(1).ok_or(VfsError::RecoveryIncomplete)?;
@@ -7707,10 +7735,13 @@ mod tests {
     }
   }
 
-  /// AUD-29-13, AUD-29-14 (through the successor's own materialization path): do: take over a volume whose
-  /// archived file is a 4 KiB hole then 4 bytes of data, and one whose file is a gibibyte hole under a 1 MiB
-  /// bound; expect the first served with the data at its file offset (zeros before it), and the second
-  /// refused `BudgetExceeded` before any reconstruction, with no volume published under its name.
+  /// AUD-29-13, AUD-29-14, AUD-29-57 (through the successor's own materialization path): do: take over a
+  /// volume whose archived file is a 4 KiB hole then 4 bytes of data; one whose file is a gibibyte hole under
+  /// a 1 MiB bound; and one whose file holds two mebibytes of data under the same bound. Expect the first
+  /// served with the data at its file offset (zeros before it), the second served at its
+  /// gibibyte length with nothing charged — a hole costs what it cost the origin, nothing (until 2026-10-01 a
+  /// dense restore refused it) — and the third refused `BudgetExceeded` before any reconstruction, with no
+  /// volume published under its name.
   #[test]
   fn a_taken_over_archive_lands_at_its_offsets_and_an_oversized_one_is_refused() {
     crate::daemon::audit_on_shard(|state| {
@@ -7750,7 +7781,7 @@ mod tests {
       assert_eq!(&bytes[4096..], b"DATA", "the data sits at its file offset");
 
       let gibibyte = 1u64 << 30;
-      let oversized = takeover_archive(
+      let hole = takeover_archive(
         vec![slates_archive::Extent {
           offset: 0,
           len: gibibyte,
@@ -7759,6 +7790,39 @@ mod tests {
         }],
         Vec::new(),
       );
+      let holed = slates_db::catalog::VolumeId { bytes: [0x53; 16] };
+      take_over(state, holed, &takeover_catalog("holed", 1 << 20), &hole).unwrap();
+      let slot = state
+        .volumes
+        .get(*state.by_id.get(&holed).unwrap())
+        .unwrap();
+      let inode = slot.volume.resolve(&state.store, "f").unwrap().inode;
+      assert_eq!(
+        slot.volume.stat(&state.store, inode).unwrap().size,
+        gibibyte
+      );
+      assert_eq!(
+        slot.volume.accounting().referenced_bytes,
+        0,
+        "a hole is free"
+      );
+
+      let mebibyte = slates_archive::Archive::raw_chunk(vec![
+        0x5a;
+        usize::try_from(
+          slates_archive::format::MAX_CHUNK_BYTES
+        )
+        .unwrap()
+      ]);
+      let twice = (0..2)
+        .map(|at| slates_archive::Extent {
+          offset: at * mebibyte.raw_len,
+          len: mebibyte.raw_len,
+          chunk: mebibyte.identity,
+          chunk_offset: 0,
+        })
+        .collect();
+      let oversized = takeover_archive(twice, vec![mebibyte]);
       let other = slates_db::catalog::VolumeId { bytes: [0x52; 16] };
       let refusal = take_over(
         state,
@@ -7813,8 +7877,11 @@ mod tests {
       };
       let restored = slates_archive::Restored {
         files: [
-          ("pipe".to_owned(), Vec::new()),
-          ("pipe-link".to_owned(), Vec::new()),
+          ("pipe".to_owned(), slates_archive::RestoredFile::default()),
+          (
+            "pipe-link".to_owned(),
+            slates_archive::RestoredFile::default(),
+          ),
         ]
         .into(),
         metadata: [
@@ -7867,7 +7934,10 @@ mod tests {
         Err(slates_vfs::VfsError::RecoveryIncomplete)
       );
       let mut malformed = restored;
-      malformed.files.get_mut("pipe").unwrap().push(1);
+      *malformed.files.get_mut("pipe").unwrap() = slates_archive::RestoredFile {
+        len: 1,
+        pieces: vec![(0, vec![1])],
+      };
       assert_eq!(
         super::populate_restored(&mut state.store, &mut slot.volume, &malformed),
         Err(slates_vfs::VfsError::RecoveryIncomplete)
@@ -8010,6 +8080,125 @@ mod tests {
       }
       assert_eq!(rebuilt[2].0, rebuilt[3].0, "both names stay one inode");
       assert_eq!(expected[2].2, [-1, -2, expected[2].2[2], -3], "non-vacuous");
+    });
+  }
+
+  /// A file's data map as a client finds it: `(data, hole)` pairs from walking `SEEK_DATA` and `SEEK_HOLE`
+  /// from offset zero to its size.
+  fn seek_map(
+    store: &slates_vfs::volume::Store,
+    volume: &super::Volume,
+    no: slates_vfs::ids::InodeNo,
+  ) -> Vec<(u64, u64)> {
+    use slates_vfs::volume::Seek;
+    let size = volume.stat(store, no).unwrap().size;
+    let mut map = Vec::new();
+    let mut at = 0;
+    while let Some(data) = volume.seek(store, no, at, Seek::Data).unwrap() {
+      let hole = volume
+        .seek(store, no, data, Seek::Hole)
+        .unwrap()
+        .unwrap_or(size);
+      map.push((data, hole));
+      at = hole;
+    }
+    map
+  }
+
+  /// Shape: the sparse file's length in chunk windows — room for islands well apart and a trailing hole.
+  const SPARSE_WINDOWS: u64 = 32;
+
+  /// AUD-29-57 (§4.5, §4.11 sparse files; R8): do: on an origin volume truncate a file to
+  /// [`SPARSE_WINDOWS`] chunk windows and write three islands — one window-aligned, one small write inside a
+  /// window (holes on both sides within it), one straddling a window boundary — leaving a trailing hole;
+  /// snapshot, export, encode, decode, restore and rebuild in a second volume as a takeover does. Expect the
+  /// rebuilt file's bytes, length and `SEEK_DATA`/`SEEK_HOLE` map equal to the origin's, its physical charge
+  /// equal too, the export to have hashed only the windows holding data (non-vacuous: a small fraction of
+  /// the logical length), and the restore to carry exactly the origin's data map as pieces, no hole.
+  #[test]
+  fn a_sparse_file_keeps_its_holes_through_export_restore_and_rebuild() {
+    crate::daemon::audit_on_shard(|state| {
+      let origin = created_volume(state, "sparse-origin");
+      let successor = created_volume(state, "sparse-successor");
+      let chunk = u64::try_from(state.store.content.chunk_bytes()).unwrap();
+      let size = SPARSE_WINDOWS * chunk;
+      // Islands: window 3 whole; a few bytes in the middle of window 10; across the window 20/21 boundary.
+      let islands: [(u64, u64); 3] = [
+        (3 * chunk, chunk),
+        (10 * chunk + chunk / 2, chunk / 8),
+        (21 * chunk - chunk / 4, chunk / 2),
+      ];
+      let data_windows = 1 + 1 + 2;
+      let (archive, expected, hashed) = {
+        let store = &mut state.store;
+        let volume = &mut state.volumes.get_mut(origin).unwrap().volume;
+        let root = volume.root();
+        let file = volume.create_file(store, root, "sparse", 0o644).unwrap();
+        volume.truncate(store, file, size).unwrap();
+        for (at, (offset, len)) in islands.iter().enumerate() {
+          let fill = u8::try_from(at + 1).unwrap();
+          let bytes = vec![fill; usize::try_from(*len).unwrap()];
+          volume.write(store, file, *offset, &bytes).unwrap();
+        }
+        let snapshot = volume.snapshot(store).unwrap();
+        let mut archiver = slates_vfs::export::SnapshotArchiver::new(
+          volume,
+          store,
+          snapshot,
+          0,
+          0,
+          slates_archive::CodecPolicy::raw_only(),
+        )
+        .unwrap();
+        let archive = loop {
+          if let slates_vfs::export::Progress::Done(archive) =
+            archiver.advance(volume, store, u64::MAX).unwrap()
+          {
+            break archive;
+          }
+        };
+        let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+        volume.read(store, file, 0, &mut bytes).unwrap();
+        let expected = (
+          bytes,
+          seek_map(store, volume, file),
+          volume.accounting().referenced_bytes,
+        );
+        (archive, expected, archiver.bytes_hashed())
+      };
+      let decoded = slates_archive::Archive::decode(&archive.encode()).unwrap();
+      let restored = slates_archive::restore(&decoded, u64::MAX).unwrap();
+      let restored_file = restored.files["sparse"].clone();
+      let store = &mut state.store;
+      let volume = &mut state.volumes.get_mut(successor).unwrap().volume;
+      super::populate_restored(store, volume, &restored).unwrap();
+      let file = volume.resolve(store, "sparse").unwrap().inode;
+      let mut bytes = vec![0u8; usize::try_from(size).unwrap()];
+      volume.read(store, file, 0, &mut bytes).unwrap();
+      let rebuilt = (
+        bytes,
+        seek_map(store, volume, file),
+        volume.accounting().referenced_bytes,
+      );
+      assert_eq!(rebuilt.1, expected.1, "the data map");
+      assert!(rebuilt.0 == expected.0, "the bytes");
+      assert_eq!(rebuilt.2, expected.2, "the physical charge");
+      assert_eq!(volume.stat(store, file).unwrap().size, size, "the length");
+      assert_eq!(
+        hashed,
+        data_windows * chunk,
+        "the export hashed only the windows holding data"
+      );
+      assert_eq!(restored_file.len, size);
+      assert_eq!(
+        restored_file.data_bytes(),
+        expected
+          .1
+          .iter()
+          .map(|(data, hole)| hole - data)
+          .sum::<u64>(),
+        "the restore carries exactly the origin's data map, no hole"
+      );
     });
   }
 
