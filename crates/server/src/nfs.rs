@@ -352,7 +352,13 @@ fn admit_mount(
   if let Some(mount) = s.mount_attachments.get(&capability.0) {
     return Some(mount.registry);
   }
-  let subject = s.db.partition().attachment(capability.0)?.principal.clone();
+  let record = s.db.partition().attachment(capability.0)?;
+  // The export presents the live head: a record naming a snapshot (one admitted before AUD-29-76's refusal,
+  // recovered from the log) is never served as that snapshot.
+  if record.snapshot.is_some() {
+    return None;
+  }
+  let subject = record.principal.clone();
   let registry = s
     .attachments
     .attach(volume, slates_bridge_core::View::Current, subject, rights)

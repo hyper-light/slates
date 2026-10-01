@@ -563,3 +563,80 @@ fn the_guest_transports_report_the_devices_own_facts_and_a_ring_request_is_refus
   drop(client);
   drop(daemon);
 }
+
+/// The bytes `file` holds as the host mount at `path` presents it (the NFS export, over loopback).
+#[cfg(unix)]
+fn read_through_the_mount(port: u16, path: &str, file: &str) -> Vec<u8> {
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut stream, path, 1);
+  let handle = common::nfs::lookup(&mut stream, &root, file, 2);
+  common::nfs::read(&mut stream, &handle, 3)
+}
+
+/// AUD-29-76. Do: write `before` into a file through the volume's own mount, snapshot, write `after`, then
+/// attach the snapshot as a host mount. Expect: refused `SnapshotNotPresentedByHostMount` with nothing
+/// recorded — the host mount presents the live head, so presenting it for the snapshot would show `after`
+/// where the snapshot holds `before` (before 2026-10-01 the attach succeeded and its mount read `after`).
+#[cfg(unix)]
+#[test]
+fn a_snapshot_is_never_presented_through_a_host_mount_of_the_head() {
+  let (daemon, instance) = single_shard_daemon("attach-forms-snapshot-mount");
+  let Some(port) = daemon.nfs_port() else {
+    eprintln!("SKIP: the loopback export did not bind, so no host mount is offered here");
+    return;
+  };
+  let mut client = Client::connect(&instance);
+  let id = create(&mut client, "pinned");
+  let capability = daemon.mount_capability("pinned").unwrap().unwrap();
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut stream, &capability, 1);
+  let file = common::nfs::create(&mut stream, &root, "f", 2);
+  common::nfs::write(&mut stream, &file, b"before", 3);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  common::nfs::write(&mut stream, &file, b"after!", 4);
+  let recorded = status(&mut client, id).attachments;
+  let reply = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: Some(snapshot),
+    intent: Intent::Read,
+    form: AttachRequest::HostMount,
+  });
+  if let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = &reply
+  {
+    let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+    let presented =
+      read_through_the_mount(port, &format!("/pinned@{attachment:x}.{token_hex}"), "f");
+    panic!(
+      "a host mount of the snapshot was attached and presents {:?}",
+      String::from_utf8_lossy(&presented)
+    );
+  }
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::AttachmentUnsupported {
+          transport: AttachTransport::NfsLoopback,
+          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+        },
+        ..
+      }
+    ),
+    "{reply:?}"
+  );
+  assert_eq!(
+    status(&mut client, id).attachments,
+    recorded,
+    "nothing recorded"
+  );
+  drop(client);
+  drop(daemon);
+}

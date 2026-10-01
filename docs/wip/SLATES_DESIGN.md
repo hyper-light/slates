@@ -1887,6 +1887,11 @@ must exercise local communication and isolation between clones as well as namesp
 > authority; no source is chowned or relabelled. A rootless or user-namespace engine, an SELinux-labelling engine
 > and every untested profile are refused typed.
 
+> **Status (2026-10-01, AUD-29-76 in part: no form presents the head for a snapshot).** A host mount presents
+> the live head, so an attach naming a snapshot is refused `SnapshotNotPresentedByHostMount` for every mount form
+> (host mount, FUSE, OCI). The NFS edge never admits a capability recorded for a snapshot. Snapshot and subtree
+> exports are owed.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

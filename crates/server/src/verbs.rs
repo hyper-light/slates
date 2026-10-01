@@ -4618,7 +4618,18 @@ fn establish_form(
     // The record forms: nothing to establish — the SDK's record, and the host mount the requesting
     // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
     // and nothing of the daemon's touches the mount table).
-    AttachRequest::Root | AttachRequest::HostMount => return Ok(None),
+    AttachRequest::Root => return Ok(None),
+    // The host mount presents the live head, never a snapshot: attaching one for a snapshot would show the
+    // head where the snapshot is asked for (AUD-29-76).
+    AttachRequest::HostMount => {
+      if snapshot.is_some() {
+        return Err(Refusal::AttachmentUnsupported {
+          transport: AttachTransport::NfsLoopback,
+          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+        });
+      }
+      return Ok(None);
+    }
     // A FUSE mount (§4.6 "Linux"; AUD-29-64): offered where the host has FUSE, presenting the live head.
     AttachRequest::FuseMount { .. } => {
       if let Some(reason) = crate::transports::fuse(situation).unsupported_reason {
