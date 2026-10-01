@@ -7622,3 +7622,19 @@ Applied in the same change to: §4.8 "Recovery", the §4.10 status (AUD-29-43/59
   re-images the shard on every acknowledged mutation, the incremental publish owed in
   `docs/wip/recovery.md` now owed for the hold too.
 
+### A-52 — The fleet transport speaks standard QUIC, with slates' refinements on top (2026-10-01)
+Applied in the same change to: `docs/wip/transport-quic.md` (the plan), GAPS.
+- Why: the fleet transport speaks a QUIC dialect that departs from RFC 9002 in four places (a capped probe
+  timeout, a 1 ms first handshake retransmit, payload-only bytes in flight, a peer-chosen priority class),
+  retains whole exchanges before admission, has no migration or path validation, and is not interoperable.
+  Ada, 2026-10-01: "you also need to make sure our QUIC is compliant"; "your goal is to combine the two".
+- The rule: the wire layer (packet format, loss recovery, timers, connection IDs, migration, path
+  validation, key update, stateless reset) is standard QUIC through vendored `quinn-proto`, conformed to
+  slates' rules (no `Arc`, `Mutex` or panics; named, cited constants; slates' runtime). slates' congestion
+  refinements (Copa, the pacing quantum, RACK-style reordering, path-MTU) are patches on it, each
+  re-measured. slates' application protocol (exchanges, priority classes set by message kind and the
+  sender's role, credit reserves, absolute credits, typed refusals, streaming through reservations) runs on
+  its streams. Ada chose "vendor and conform" over a rule exception and over a rewrite.
+- Evidence owed: the stages and acceptance tests in `docs/wip/transport-quic.md` §4.
+- What it does not change: D-15's TLS 1.3, §4.10a's planes and R8's one code path.
+
