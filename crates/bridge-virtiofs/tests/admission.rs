@@ -11,12 +11,12 @@
 
 mod common;
 
-use common::{SeamCall, SimVmm, message, reply_error, store, vid, volume};
+use common::{SEAM_RELEASES, SeamCall, SimVmm, message, reply_error, store, vid, volume};
 use slates_bridge_core::{Attachments, Bridge, ObjectId, VolumeBridge};
 use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
 use slates_bridge_virtiofs::admission::{
-  AdmissionError, AdmittedDevice, GuestAttachRequest, GuestTransport, SeamError, ServeError,
-  UnsupportedReason, admit,
+  AdmissionError, AdmittedDevice, GuestAttachRequest, GuestTransport, ReclaimError, SeamError,
+  ServeError, UnsupportedReason, admit,
 };
 use slates_bridge_virtiofs::capability::{Conformance, ReadWritePolicy, TargetPath};
 use slates_bridge_virtiofs::credit::{AttachmentCredits, CreditError, CreditKind};
@@ -535,4 +535,106 @@ fn the_host_report_names_the_unbuilt_binding() {
   assert!(in_process.supported);
   assert_eq!(in_process.target_path, TargetPath::GuestTagAssignedAtAttach);
   assert!(!in_process.dax.advertised);
+}
+
+/// AUD-29-69. Do: admit a device whose VMM fails at each setup step after the consumer is authenticated —
+/// its queues not configured, its memory not mapped (the configuration step), its configuration space not
+/// published — and then admit one whose VMM succeeds. Expect: each admission refused with that step's seam
+/// error and its seam released, and the owner's barrier over the volume afterwards closes no attachment —
+/// the registry as it was before; the successful admission's barrier closes exactly one. Before, each
+/// refusal left a live attachment behind (the §7.5 probe: one per refused admission).
+#[test]
+fn a_refused_admission_leaves_no_attachment_behind() {
+  let mut registry = Attachments::new();
+  for (step, expected) in [
+    (SeamCall::Queues, SeamError::QueuesUnavailable),
+    (SeamCall::Memory, SeamError::MemoryUnavailable),
+    (SeamCall::Publish, SeamError::PublishRefused),
+  ] {
+    let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 })).failing(step);
+    let refused = admit(
+      request(GuestTransport::InProcess),
+      seam,
+      config(),
+      roomy(),
+      rw,
+      &mut registry,
+    )
+    .unwrap_err();
+    assert_eq!(refused.error, AdmissionError::Seam(expected), "{step:?}");
+    assert!(refused.seam.released(), "{step:?}: the seam was released");
+    let barrier = registry.barrier(vid()).unwrap();
+    assert!(
+      barrier.closed.is_empty(),
+      "{step:?}: no attachment left behind for the barrier to close"
+    );
+  }
+  let admitted = admit(
+    request(GuestTransport::InProcess),
+    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 })),
+    config(),
+    roomy(),
+    rw,
+    &mut registry,
+  );
+  assert!(admitted.is_ok());
+  assert_eq!(registry.barrier(vid()).unwrap().closed.len(), 1);
+}
+
+/// An admitted device over a fresh simulated VMM in `registry`.
+fn admitted_in(registry: &mut Attachments) -> AdmittedDevice<SimVmm> {
+  admit(
+    request(GuestTransport::InProcess),
+    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 501 })),
+    config(),
+    roomy(),
+    rw,
+    registry,
+  )
+  .unwrap()
+}
+
+/// AUD-29-70. Do: reclaim an admitted device through a bridge over another volume, so its sweep is refused;
+/// abandon a second (its volume gone); drop a third without any terminal step. Expect: the refused sweep is
+/// named in what was reclaimed, yet the registry attachment, the credits and the seam are released all the
+/// same — the owner's barrier closes nothing and the seam saw its release; the abandoned one likewise, its
+/// sweep named `VolumeGone`; the dropped one released its seam. Before, a refused sweep returned before the
+/// registry was drained and the seam released, and a dropped device released neither.
+#[test]
+fn the_terminal_step_releases_everything_whatever_the_sweep_did() {
+  let mut registry = Attachments::new();
+  let mut store = store();
+  let mut other = volume(&mut store);
+  let mut admitted = admitted_in(&mut registry);
+  let elsewhere = slates_db::catalog::VolumeId { bytes: [0xEE; 16] };
+  let mut wrong_bridge = VolumeBridge::new(elsewhere, &mut other, &mut store);
+  let reclaimed = admitted.reclaim(&mut wrong_bridge, &mut registry).unwrap();
+  assert!(!reclaimed.references_swept);
+  assert!(
+    matches!(reclaimed.sweep_refused, Some(ReclaimError::Sweep(_))),
+    "{reclaimed:?}"
+  );
+  assert!(
+    admitted.seam().released(),
+    "the seam was released after the refused sweep"
+  );
+  assert!(
+    registry.barrier(vid()).unwrap().closed.is_empty(),
+    "no attachment stranded"
+  );
+
+  let mut abandoned = admitted_in(&mut registry);
+  let gone = abandoned.abandon(&mut registry).unwrap();
+  assert_eq!(gone.sweep_refused, Some(ReclaimError::VolumeGone));
+  assert!(abandoned.seam().released());
+  assert!(registry.barrier(vid()).unwrap().closed.is_empty());
+
+  let dropped = admitted_in(&mut registry);
+  let before = SEAM_RELEASES.with(std::cell::Cell::get);
+  drop(dropped);
+  assert_eq!(
+    SEAM_RELEASES.with(std::cell::Cell::get),
+    before + 1,
+    "a dropped device released its seam"
+  );
 }

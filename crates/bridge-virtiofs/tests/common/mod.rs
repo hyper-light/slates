@@ -446,6 +446,11 @@ pub fn reply_error(reply: &[u8]) -> i32 {
 
 // --------------------------------------------------------------------- the simulated VMM seam
 
+thread_local! {
+  /// The releases every simulated VMM on this thread has seen — observable after its device is dropped.
+  pub static SEAM_RELEASES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// One call the device made on the seam, in the order made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeamCall {
@@ -466,6 +471,8 @@ pub struct SimVmm {
   published: Option<DeviceConfig>,
   notified: Vec<u16>,
   released: bool,
+  /// The call the harness made fail, if any.
+  failing: Option<SeamCall>,
 }
 
 impl std::fmt::Debug for SimVmm {
@@ -487,7 +494,15 @@ impl SimVmm {
       published: None,
       notified: Vec::new(),
       released: false,
+      failing: None,
     }
+  }
+
+  /// The same VMM with `call` failing — its queues not configured, its memory not mapped, its configuration
+  /// space not published — so a test drives an admission's refusal at that step.
+  pub fn failing(mut self, call: SeamCall) -> SimVmm {
+    self.failing = Some(call);
+    self
   }
 
   pub fn guest(&self) -> &SimDriver {
@@ -523,16 +538,25 @@ impl VmmSeam for SimVmm {
 
   fn memory(&mut self) -> Result<&mut dyn GuestMemory, SeamError> {
     self.calls.push(SeamCall::Memory);
+    if self.failing == Some(SeamCall::Memory) {
+      return Err(SeamError::MemoryUnavailable);
+    }
     Ok(&mut self.guest.memory)
   }
 
   fn queues(&mut self) -> Result<Vec<QueueLayout>, SeamError> {
     self.calls.push(SeamCall::Queues);
+    if self.failing == Some(SeamCall::Queues) {
+      return Err(SeamError::QueuesUnavailable);
+    }
     Ok(self.guest.layouts())
   }
 
   fn publish(&mut self, config: &DeviceConfig) -> Result<(), SeamError> {
     self.calls.push(SeamCall::Publish);
+    if self.failing == Some(SeamCall::Publish) {
+      return Err(SeamError::PublishRefused);
+    }
     self.published = Some(*config);
     Ok(())
   }
@@ -552,5 +576,6 @@ impl VmmSeam for SimVmm {
 
   fn release(&mut self) {
     self.released = true;
+    SEAM_RELEASES.with(|n| n.set(n.get() + 1));
   }
 }

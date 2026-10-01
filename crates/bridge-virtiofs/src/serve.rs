@@ -168,6 +168,11 @@ pub trait BridgeAccess {
   /// a stale answer, as a hard NFS mount retries `NFS3ERR_JUKEBOX` — and names how long the loop waits before
   /// asking again (the interval the owner's confirmations arrive at); `None` serves.
   fn fenced(&mut self) -> Option<u64>;
+
+  /// Runs `f` with the owner's attachment registry alone — reachable when the volume is not (destroyed under
+  /// the device), so the terminal step can still withdraw the device's attachment (AUD-29-70). `None` only
+  /// when the owner's state is out of reach.
+  fn with_registry<R>(&mut self, f: impl FnOnce(&mut Attachments) -> R) -> Option<R>;
 }
 
 /// Why the loop ended.
@@ -323,9 +328,14 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
       break reason;
     }
   };
-  let reclaimed = bridge
-    .with_bridge(|b, registry| admitted.reclaim(b, registry))
-    .unwrap_or_else(|gone| Err(ReclaimError::Authority(gone)));
+  // The terminal step always runs to its end (AUD-29-70): through the bridge when the volume is there, else
+  // through the registry alone — the volume's references went with it.
+  let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
+    Ok(reclaimed) => reclaimed,
+    Err(gone) => bridge
+      .with_registry(|registry| admitted.abandon(registry))
+      .unwrap_or(Err(ReclaimError::Authority(gone))),
+  };
   unregister(id);
   ServeEnd {
     why,

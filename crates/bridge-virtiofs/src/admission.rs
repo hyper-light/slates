@@ -261,8 +261,10 @@ pub enum ReclaimError {
   AlreadyReclaimed,
   /// The attachment could mint no context for the sweep.
   Authority(VfsError),
-  /// The sweep refused; the device stays revoked for a retry.
+  /// The sweep refused.
   Sweep(VfsError),
+  /// The volume is gone, so there was nothing to sweep: its references went with it.
+  VolumeGone,
 }
 
 impl fmt::Display for ReclaimError {
@@ -271,17 +273,21 @@ impl fmt::Display for ReclaimError {
       Self::AlreadyReclaimed => f.write_str("the device was already reclaimed"),
       Self::Authority(e) => write!(f, "authority refused: {e:?}"),
       Self::Sweep(e) => write!(f, "the sweep refused: {e:?}"),
+      Self::VolumeGone => f.write_str("the volume is gone; its references went with it"),
     }
   }
 }
 
 impl std::error::Error for ReclaimError {}
 
-/// What the terminal step reclaimed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the terminal step reclaimed. The registry attachment, the credits and the seam are released whatever
+/// the sweep did (AUD-29-70); `sweep_refused` names a sweep that could not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reclaimed {
   /// The attachment's references were swept.
   pub references_swept: bool,
+  /// Why the sweep could not run, when it could not: no context for it, a refused sweep, or a volume gone.
+  pub sweep_refused: Option<ReclaimError>,
   /// The credits, whole again: `(requests, bytes)`.
   pub credits_restored: (u32, u64),
   /// Requests that were in flight when revocation took effect.
@@ -393,15 +399,22 @@ pub fn admit<S: VmmSeam>(
     Ok(id) => id,
     Err(e) => return Err(refuse(seam, AdmissionError::Authority(e))),
   };
+  // From here every refusal withdraws the attachment it took (AUD-29-69): a refused admission leaves the
+  // registry as it found it — no live attachment for the owner's barrier to close, no slot consumed.
   let layouts = match seam.queues() {
     Ok(layouts) => layouts,
-    Err(e) => return Err(refuse(seam, AdmissionError::Seam(e))),
+    Err(e) => {
+      withdraw(registry, attachment);
+      return Err(refuse(seam, AdmissionError::Seam(e)));
+    }
   };
   let mut device = Device::new(config);
   if let Err(e) = configure(&mut seam, &mut device, &layouts) {
+    withdraw(registry, attachment);
     return Err(refuse(seam, e));
   }
   if let Err(e) = seam.publish(device.config()) {
+    withdraw(registry, attachment);
     return Err(refuse(seam, AdmissionError::Seam(e)));
   }
   Ok(AdmittedDevice {
@@ -414,6 +427,13 @@ pub fn admit<S: VmmSeam>(
     state: AttachmentState::Live,
     counters: AdmissionCounters::default(),
   })
+}
+
+/// Withdraws an attachment an admission took and then refused: revoked, so nothing is admitted under it, and
+/// drained, so its slot is free — it never served a request, so nothing is in flight to wait for.
+fn withdraw(registry: &mut Attachments, attachment: AttachmentId) {
+  registry.revoke(attachment);
+  registry.drain(attachment);
 }
 
 impl<S: VmmSeam> AdmittedDevice<S> {
@@ -577,8 +597,10 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   }
 
   /// The owned terminal step: sweeps the attachment's references through `bridge` under the
-  /// still-valid authority, revokes and drains the attachment (no further context), restores the
-  /// credits whole, and releases the seam last. Revokes first if the device is still live.
+  /// still-valid authority, then — whatever the sweep did — revokes and drains the attachment (no further
+  /// context), restores the credits whole, and releases the seam last (AUD-29-70: a refused sweep no longer
+  /// strands the registry attachment or the seam). Revokes first if the device is still live. Refused only
+  /// when the device was already reclaimed.
   pub fn reclaim(
     &mut self,
     bridge: &mut dyn Bridge,
@@ -588,20 +610,59 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       return Err(ReclaimError::AlreadyReclaimed);
     }
     let in_flight_at_revoke = self.revoke();
-    let cx = registry
-      .context(self.attachment)
-      .map_err(ReclaimError::Authority)?;
-    bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep)?;
+    let swept = match registry.context(self.attachment) {
+      Ok(cx) => bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep),
+      Err(e) => Err(ReclaimError::Authority(e)),
+    };
+    Ok(self.release_all(registry, in_flight_at_revoke, swept.err()))
+  }
+
+  /// The terminal step for a device whose volume is gone (AUD-29-70): there is no bridge to sweep through, and
+  /// nothing to sweep — the references went with the volume — so the registry attachment is revoked and
+  /// drained, the credits restored and the seam released, as [`AdmittedDevice::reclaim`] does after its sweep.
+  pub fn abandon(&mut self, registry: &mut Attachments) -> Result<Reclaimed, ReclaimError> {
+    if self.state == AttachmentState::Reclaimed {
+      return Err(ReclaimError::AlreadyReclaimed);
+    }
+    let in_flight_at_revoke = self.revoke();
+    Ok(self.release_all(
+      registry,
+      in_flight_at_revoke,
+      Some(ReclaimError::VolumeGone),
+    ))
+  }
+
+  /// Releases everything the device holds besides its references: the registry attachment (revoked, then
+  /// drained), the credits, and the seam, last; the device is reclaimed.
+  fn release_all(
+    &mut self,
+    registry: &mut Attachments,
+    in_flight_at_revoke: u32,
+    sweep_refused: Option<ReclaimError>,
+  ) -> Reclaimed {
     registry.revoke(self.attachment);
     registry.drain(self.attachment);
     let _ = self.ledger.reclaim();
     let credits = self.ledger.credits();
     self.seam.release();
     self.state = AttachmentState::Reclaimed;
-    Ok(Reclaimed {
-      references_swept: true,
+    Reclaimed {
+      references_swept: sweep_refused.is_none(),
+      sweep_refused,
       credits_restored: (credits.requests.get(), credits.bytes.get()),
       requests_in_flight_at_revoke: in_flight_at_revoke,
-    })
+    }
+  }
+}
+
+/// A device dropped without its terminal step (a cancelled serve future, a failed spawn) still releases its
+/// seam: the VMM's side never outlives the device. The registry attachment is the owner's, reached only
+/// through [`AdmittedDevice::reclaim`] or [`AdmittedDevice::abandon`], which the serve loop always runs.
+impl<S: VmmSeam> Drop for AdmittedDevice<S> {
+  fn drop(&mut self) {
+    if self.state != AttachmentState::Reclaimed {
+      self.seam.release();
+      self.state = AttachmentState::Reclaimed;
+    }
   }
 }

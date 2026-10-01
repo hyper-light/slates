@@ -216,6 +216,10 @@ impl BridgeAccess for OwnedVolume {
     FENCED.with(Cell::get).then_some(FENCE_WAIT_NS)
   }
 
+  fn with_registry<R>(&mut self, f: impl FnOnce(&mut Attachments) -> R) -> Option<R> {
+    Some(f(&mut self.registry))
+  }
+
   fn barrier(&mut self) -> bool {
     self.barriers += 1;
     true

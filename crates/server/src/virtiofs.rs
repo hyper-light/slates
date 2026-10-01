@@ -27,7 +27,7 @@ use std::future::Future;
 
 use slates_bridge_core::{Bridge, Rights, VolumeBridge, new_handle_store};
 use slates_bridge_virtiofs::admission::{
-  AdmissionError, GuestAttachRequest, GuestTransport, VmmSeam, admit,
+  AdmissionError, GuestAttachRequest, GuestTransport, ReclaimError, VmmSeam, admit,
 };
 use slates_bridge_virtiofs::capability::{TransportCapability, host_capability};
 use slates_bridge_virtiofs::device::{DeviceConfig, FsTag};
@@ -127,6 +127,14 @@ impl BridgeAccess for ShardBridge {
     .unwrap_or(false)
   }
 
+  /// The owner shard's attachment registry, reachable when the volume is not (AUD-29-70).
+  fn with_registry<R>(
+    &mut self,
+    f: impl FnOnce(&mut slates_bridge_core::Attachments) -> R,
+  ) -> Option<R> {
+    state::with_state(|s| f(&mut s.attachments))
+  }
+
   /// The live-tree fence the NFS mount applies (AUD-29-83): while it stands the guest's requests wait in its
   /// rings, asked again each heartbeat — the cadence at which the confirmations that restore the lease arrive.
   fn fenced(&mut self) -> Option<u64> {
@@ -137,6 +145,8 @@ impl BridgeAccess for ShardBridge {
   }
 }
 
+/// Format: the refusal-ledger name of a refused device's terminal step whose sweep could not run.
+const RECLAIM_INCOMPLETE: &str = "virtiofs.reclaim_incomplete";
 /// Format: the refusal-ledger name of a guest barrier that did not capture its volume.
 const BARRIER_REFUSED: &str = "virtiofs.barrier_refused";
 
@@ -213,8 +223,17 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   let id = match register(bound) {
     Ok(id) => id,
     Err(refused) => {
-      // The terminal step still runs: nothing admitted outlives a refused loop.
-      let _ = bridge.with_bridge(|b, registry| admitted.reclaim(b, registry));
+      // The terminal step still runs to its end: nothing admitted outlives a refused loop (AUD-29-70) — through
+      // the bridge, or the registry alone when the volume is gone; a sweep that could not run is counted.
+      let reclaimed = match bridge.with_bridge(|b, registry| admitted.reclaim(b, registry)) {
+        Ok(reclaimed) => reclaimed,
+        Err(_) => bridge
+          .with_registry(|registry| admitted.abandon(registry))
+          .unwrap_or(Err(ReclaimError::VolumeGone)),
+      };
+      if !reclaimed.is_ok_and(|r| r.references_swept) {
+        let _ = state::with_state(|s| *s.refusals.entry(RECLAIM_INCOMPLETE).or_insert(0) += 1);
+      }
       on_end(GuestDeviceOutcome::LoopRefused(refused));
       return;
     }
