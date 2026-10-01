@@ -335,6 +335,8 @@ pub enum LandingRefusal {
   Target(HostError),
   /// The volume refused.
   Volume(VfsError),
+  /// The run was stepped after it had ended or been abandoned: it has nothing more to do.
+  Ended,
 }
 
 /// What the audit log records (§4.15's `AuditKind`).
@@ -568,6 +570,35 @@ struct WriteContext<'x, H: LandFs> {
   lease: &'x LandingLease,
   observer: &'x mut dyn Observer<H>,
   audit: &'x mut Audit,
+}
+
+/// The write phase's timing across the entries it writes (the ramp's per-class steps), kept between slices.
+struct WriteProgress {
+  /// When the write phase began: the landing's elapsed clock for its grant and lease checks.
+  started: Instant,
+  class: Option<u8>,
+  step_started: Instant,
+  step_entries: u64,
+  step_max_ns: u64,
+}
+
+impl WriteProgress {
+  fn start() -> Self {
+    Self {
+      started: Instant::now(),
+      class: None,
+      step_started: Instant::now(),
+      step_entries: 0,
+      step_max_ns: 0,
+    }
+  }
+}
+
+/// The sync phase's tally across the directories it syncs, kept between slices.
+#[derive(Default)]
+struct SyncProgress {
+  dirs: usize,
+  total_ns: u64,
 }
 
 /// The result of writing one entry.
@@ -842,24 +873,25 @@ impl<H: LandFs> Landing<'_, H> {
   /// The verdict pass over every entry (no writes).
   fn validate(&mut self, manifest: &Manifest) -> Result<Vec<EntryReport>, HostError> {
     let mut out = Vec::with_capacity(manifest.entries.len());
-    // The paths this manifest creates, for a resumed clear to recognize its own directory.
-    let ours: BTreeSet<String> = manifest
-      .entries
-      .iter()
-      .filter(|e| {
-        matches!(
-          e.action,
-          Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear
-        )
-      })
-      .map(|e| e.path.to_string())
-      .collect();
+    let ours = owned_paths(manifest);
     for entry in &manifest.entries {
+      out.push(self.validate_entry(entry, &ours)?);
+    }
+    Ok(out)
+  }
+
+  /// One entry's verdict against the disk now (the unit a sliced landing validates per step).
+  fn validate_entry(
+    &mut self,
+    entry: &LandingEntry,
+    ours: &BTreeSet<String>,
+  ) -> Result<EntryReport, HostError> {
+    {
       let hash = self.needs_hash(entry)?;
       // Every entry's directory is synced at the end, written or not, so a resumed landing
       // makes the previous attempt's entries durable too.
       self.touched.insert(split(&entry.path).0.into());
-      let check_ours = matches!(entry.action, Action::Clear).then_some(&ours);
+      let check_ours = matches!(entry.action, Action::Clear).then_some(ours);
       let disk = match &entry.action {
         Action::Rename { from } => {
           self.touched.insert(split(from).0.into());
@@ -874,26 +906,27 @@ impl<H: LandFs> Landing<'_, H> {
         disk,
         entry.overlay.as_ref(),
       );
-      out.push(EntryReport {
+      Ok(EntryReport {
         path: entry.path.clone(),
         action: entry.action.clone(),
         verdict: Some(v),
         outcome: None,
         window_ns: None,
-      });
+      })
     }
-    Ok(out)
   }
 
   // ------------------------------------------------------------- writing
 
-  /// Writes every `Apply` entry in manifest order (already by class), timing each class as one
-  /// ramp step. Stops at a host crash; skips entries after the grant ended.
-  fn write_all(
+  /// Writes one entry under the write phase's `progress` (the unit a sliced landing writes per step): its
+  /// verdict decides whether it is written, skipped or refused, and its outcome lands in its report.
+  fn write_one(
     &mut self,
     manifest: &Manifest,
-    reports: &mut [EntryReport],
+    entry: &LandingEntry,
+    report: &mut EntryReport,
     cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
   ) {
     let WriteContext {
       vol,
@@ -905,91 +938,86 @@ impl<H: LandFs> Landing<'_, H> {
     } = cx;
     let grant = *grant;
     let lease = *lease;
-    let started = Instant::now();
-    let mut class = None;
-    let mut step_started = Instant::now();
-    let mut step_entries = 0u64;
-    let mut step_max_ns = 0u64;
-    for (entry, report) in manifest.entries.iter().zip(reports.iter_mut()) {
-      if self.crashed.is_some() {
-        break;
+    let started = progress.started;
+    if progress.class != Some(entry.class()) {
+      if progress.class.is_some() {
+        self.ramp.observe(StepSample {
+          entries: progress.step_entries,
+          wall_ns: elapsed_ns(progress.step_started),
+          p99_ns: progress.step_max_ns,
+        });
       }
-      if class != Some(entry.class()) {
-        if class.is_some() {
-          self.ramp.observe(StepSample {
-            entries: step_entries,
-            wall_ns: elapsed_ns(step_started),
-            p99_ns: step_max_ns,
-          });
-        }
-        class = Some(entry.class());
-        step_started = Instant::now();
-        step_entries = 0;
-        step_max_ns = 0;
-      }
-      // The `land.entry` chokepoint span (§4.14) brackets one entry's processing, whatever its verdict.
-      let entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
-      let outcome = match report.verdict {
-        Some(Verdict::Apply) => {
-          let now_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
-          if grant_ended(grant, now_ns) {
-            Written {
-              outcome: Outcome::Skipped(SkipReason::GrantEnded),
-              window_ns: None,
-            }
-          } else if lease.expires_ns <= now_ns {
-            Written {
-              outcome: Outcome::Skipped(SkipReason::LeaseEnded),
-              window_ns: None,
-            }
-          } else {
-            observer.before_write(self.host, entry);
-            let entry_started = Instant::now();
-            let w = self.write_entry(entry, vol, store);
-            step_entries = step_entries.saturating_add(1);
-            step_max_ns = step_max_ns.max(elapsed_ns(entry_started));
-            w
-          }
-        }
-        Some(Verdict::Skip) => Written {
-          outcome: Outcome::Skipped(skip_reason(entry)),
-          window_ns: None,
-        },
-        Some(Verdict::AcceptIdentical) => Written {
-          outcome: Outcome::AcceptedIdentical,
-          window_ns: None,
-        },
-        Some(Verdict::Conflict(c)) => Written {
-          outcome: Outcome::Conflict(c),
-          window_ns: None,
-        },
-        None => continue,
-      };
-      observer.after_entry(
-        entry_start_ns,
-        self.request.now_ns.saturating_add(elapsed_ns(started)),
-      );
-      audit.push(AuditRecord {
-        seq: 0,
-        at_ns: self.request.now_ns.saturating_add(elapsed_ns(started)),
-        kind: if outcome.outcome == Outcome::Written {
-          AuditKind::EntryWritten
-        } else {
-          AuditKind::EntryRefused
-        },
-        grant: grant.map(|g| g.id),
-        landing: self.request.landing_id,
-        manifest: manifest.hash,
-        outcome: None,
-      });
-      report.outcome = Some(outcome.outcome);
-      report.window_ns = outcome.window_ns;
+      progress.class = Some(entry.class());
+      progress.step_started = Instant::now();
+      progress.step_entries = 0;
+      progress.step_max_ns = 0;
     }
-    if class.is_some() {
+    // The `land.entry` chokepoint span (§4.14) brackets one entry's processing, whatever its verdict.
+    let entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
+    let outcome = match report.verdict {
+      Some(Verdict::Apply) => {
+        let now_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
+        if grant_ended(grant, now_ns) {
+          Written {
+            outcome: Outcome::Skipped(SkipReason::GrantEnded),
+            window_ns: None,
+          }
+        } else if lease.expires_ns <= now_ns {
+          Written {
+            outcome: Outcome::Skipped(SkipReason::LeaseEnded),
+            window_ns: None,
+          }
+        } else {
+          observer.before_write(self.host, entry);
+          let entry_started = Instant::now();
+          let w = self.write_entry(entry, vol, store);
+          progress.step_entries = progress.step_entries.saturating_add(1);
+          progress.step_max_ns = progress.step_max_ns.max(elapsed_ns(entry_started));
+          w
+        }
+      }
+      Some(Verdict::Skip) => Written {
+        outcome: Outcome::Skipped(skip_reason(entry)),
+        window_ns: None,
+      },
+      Some(Verdict::AcceptIdentical) => Written {
+        outcome: Outcome::AcceptedIdentical,
+        window_ns: None,
+      },
+      Some(Verdict::Conflict(c)) => Written {
+        outcome: Outcome::Conflict(c),
+        window_ns: None,
+      },
+      None => return,
+    };
+    observer.after_entry(
+      entry_start_ns,
+      self.request.now_ns.saturating_add(elapsed_ns(started)),
+    );
+    audit.push(AuditRecord {
+      seq: 0,
+      at_ns: self.request.now_ns.saturating_add(elapsed_ns(started)),
+      kind: if outcome.outcome == Outcome::Written {
+        AuditKind::EntryWritten
+      } else {
+        AuditKind::EntryRefused
+      },
+      grant: grant.map(|g| g.id),
+      landing: self.request.landing_id,
+      manifest: manifest.hash,
+      outcome: None,
+    });
+    report.outcome = Some(outcome.outcome);
+    report.window_ns = outcome.window_ns;
+  }
+
+  /// Ends the write phase: the last class's ramp step.
+  fn close_write(&mut self, progress: &WriteProgress) {
+    if progress.class.is_some() {
       self.ramp.observe(StepSample {
-        entries: step_entries,
-        wall_ns: elapsed_ns(step_started),
-        p99_ns: step_max_ns,
+        entries: progress.step_entries,
+        wall_ns: elapsed_ns(progress.step_started),
+        p99_ns: progress.step_max_ns,
       });
     }
   }
@@ -1834,30 +1862,31 @@ impl<H: LandFs> Landing<'_, H> {
   /// overlay; a failed media barrier the grant asked for is `MediaUnsynced` and holds every entry. Before
   /// 2026-09-29 a directory that failed to open was skipped with the landing still reporting its
   /// directories synced, and a sync failure other than a crash-like errno still let every entry advance.
-  fn sync_all(&mut self) -> Durability {
-    let touched: Vec<Box<str>> = self.touched.iter().cloned().collect();
-    let mut dirs = 0usize;
-    let mut total_ns = 0u64;
-    for path in touched {
-      let started = Instant::now();
-      let synced = self
-        .open_dir_path(&path)
-        .and_then(|dir| self.host.sync_dir(dir));
-      let ns = elapsed_ns(started);
-      total_ns = total_ns.saturating_add(ns);
-      self.costs.dir_sync_ns.push(ns);
-      match synced {
-        Ok(()) => dirs = dirs.saturating_add(1),
-        Err(error) => {
-          self.note_crash(error);
-          self.degraded.push(Degradation::Unsynced {
-            dir: path.clone(),
-            error,
-          });
-          self.unsynced.insert(path);
-        }
+  /// Syncs one touched directory (the unit a sliced landing syncs per step).
+  fn sync_one(&mut self, path: Box<str>, progress: &mut SyncProgress) {
+    let started = Instant::now();
+    let synced = self
+      .open_dir_path(&path)
+      .and_then(|dir| self.host.sync_dir(dir));
+    let ns = elapsed_ns(started);
+    progress.total_ns = progress.total_ns.saturating_add(ns);
+    self.costs.dir_sync_ns.push(ns);
+    match synced {
+      Ok(()) => progress.dirs = progress.dirs.saturating_add(1),
+      Err(error) => {
+        self.note_crash(error);
+        self.degraded.push(Degradation::Unsynced {
+          dir: path.clone(),
+          error,
+        });
+        self.unsynced.insert(path);
       }
     }
+  }
+
+  /// Ends the sync phase: the media barrier the grant asked for, and the durability reached.
+  fn finish_sync(&mut self, progress: &SyncProgress) -> Durability {
+    let (dirs, total_ns) = (progress.dirs, progress.total_ns);
     let media = self.request.media_durability && self.media_barrier();
     if !self.request.media_durability {
       self.degraded.push(Degradation::BarriersOnly);
@@ -1914,32 +1943,26 @@ impl<H: LandFs> Landing<'_, H> {
 
   // ------------------------------------------------------------- sweep
 
-  /// Settles the hidden siblings carrying this landing id in the manifest's directories (a crashed earlier
-  /// attempt of the same landing), proportional to the delta's directories: how many it removed. A sibling
-  /// it cannot settle is reported `Leftover`, and a directory it cannot list `Unswept` (AUD-29-05; before
-  /// 2026-09-29 both were dropped, and a failed sweep counted zero).
-  fn sweep(&mut self, manifest: &Manifest) -> usize {
-    let mut parents: BTreeSet<Box<str>> = BTreeSet::new();
-    for entry in &manifest.entries {
-      parents.insert(split(&entry.path).0.into());
-      if let Action::Rename { from } = &entry.action {
-        parents.insert(split(from).0.into());
-      }
-    }
+  /// Settles the hidden siblings carrying this landing id in one of the manifest's directories (a crashed
+  /// earlier attempt of the same landing) — the unit a run sweeps per step, over [`sweep_parents`], so the
+  /// sweep is proportional to the delta's directories: how many it removed. A sibling it cannot settle is
+  /// reported `Leftover`, and a directory it cannot list `Unswept` (AUD-29-05; before 2026-09-29 both were
+  /// dropped, and a failed sweep counted zero).
+  fn sweep_parent(&mut self, parent: Box<str>, manifest: &Manifest) -> usize {
     let mut removed = 0usize;
-    for parent in parents {
+    {
       let listed = self
         .open_dir_path(&parent)
         .and_then(|dir| self.host.list(dir).map(|entries| (dir, entries)));
       let (dir, entries) = match listed {
         Ok(found) => found,
         // A directory the plan names that is not there (one this landing creates) holds no sibling.
-        Err(HostError::NotFound | HostError::NotDirectory) => continue,
+        Err(HostError::NotFound | HostError::NotDirectory) => return 0,
         Err(error) => {
           self
             .degraded
             .push(Degradation::Unswept { dir: parent, error });
-          continue;
+          return 0;
         }
       };
       for e in entries {
@@ -2116,6 +2139,34 @@ impl<H: LandFs> Landing<'_, H> {
   }
 }
 
+/// The directories a manifest's entries live in, renames' origins included: where a crashed attempt's hidden
+/// siblings can be.
+fn sweep_parents(manifest: &Manifest) -> Vec<Box<str>> {
+  let mut parents: BTreeSet<Box<str>> = BTreeSet::new();
+  for entry in &manifest.entries {
+    parents.insert(split(&entry.path).0.into());
+    if let Action::Rename { from } = &entry.action {
+      parents.insert(split(from).0.into());
+    }
+  }
+  parents.into_iter().collect()
+}
+
+/// The paths a manifest creates, for a resumed clear to recognize its own directory.
+fn owned_paths(manifest: &Manifest) -> BTreeSet<String> {
+  manifest
+    .entries
+    .iter()
+    .filter(|e| {
+      matches!(
+        e.action,
+        Action::Create | Action::Mkdir | Action::Symlink { .. } | Action::Clear
+      )
+    })
+    .map(|e| e.path.to_string())
+    .collect()
+}
+
 /// The reason an entry with verdict `Skip` was skipped.
 fn skip_reason(entry: &LandingEntry) -> SkipReason {
   match (
@@ -2235,7 +2286,8 @@ fn read_overlay_bytes<H: LandFs>(
 }
 
 /// Runs one landing: plan, present, grant, lease and validate, write by class, sync, advance,
-/// report (§4.15). The caller opened `target` with containment and closes its handle after.
+/// report (§4.15). The caller opened `target` with containment and closes its handle after. The one-call
+/// form of [`begin_landing`] and its [`LandingRun`], stepped through without a budget.
 #[allow(clippy::too_many_arguments)]
 pub fn land<H: LandFs>(
   host: &mut H,
@@ -2248,9 +2300,58 @@ pub fn land<H: LandFs>(
   request: &LandingRequest,
   observer: &mut dyn Observer<H>,
 ) -> Result<LandingReport, LandingRefusal> {
+  let mut run = begin_landing(
+    HostSlot::Lent(host),
+    target,
+    vol,
+    store,
+    grants,
+    lease,
+    audit,
+    request,
+  )
+  .map_err(|(_, refusal)| refusal)?;
+  let result = run.run_through(vol, store, audit, observer);
+  settle_grant(grants, run.grant(), &result);
+  result
+}
+
+/// Consumes a once-grant whose landing reached `Done` or `Partial` (§4.15; AUD-29-06): a landing that ended
+/// otherwise keeps its grant for the resume.
+pub fn settle_grant(
+  grants: &mut Grants,
+  grant: &GrantRecord,
+  result: &Result<LandingReport, LandingRefusal>,
+) {
+  if let Ok(report) = result
+    && matches!(report.state, LandingState::Done | LandingState::Partial)
+    && grant.scope == GrantScope::Once
+  {
+    grants.consume(grant.id);
+  }
+}
+
+/// A landing up to its grant and lease (§4.15 steps 1–4): plans the manifest, checks the landing's binding
+/// against its grant before any write-capable step, and checks the lease; then the [`LandingRun`] that does
+/// the rest, which the caller steps in slices and ends with [`settle_grant`]. Refused with the host given
+/// back: `GrantRequired` (the presentation, with the preliminary verdicts), a grant or lease refusal, or the
+/// volume's or the target's.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_landing<'h, H: LandFs>(
+  mut host: HostSlot<'h, H>,
+  target: &LandingTarget,
+  vol: &mut Volume,
+  store: &mut Store,
+  grants: &mut Grants,
+  lease: Option<&LandingLease>,
+  audit: &mut Audit,
+  request: &LandingRequest,
+) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
   // Plan.
-  let manifest =
-    plan(vol, store, host, &request.filter, request.source).map_err(LandingRefusal::Volume)?;
+  let manifest = match plan(vol, store, host.get(), &request.filter, request.source) {
+    Ok(manifest) => manifest,
+    Err(error) => return Err((host, LandingRefusal::Volume(error))),
+  };
   audit.push(AuditRecord {
     seq: 0,
     at_ns: request.now_ns,
@@ -2262,18 +2363,27 @@ pub fn land<H: LandFs>(
   });
   // Grant: the landing's own binding — the consumer, the volume and snapshot, and the target as opened now —
   // must be the one the grant was approved for (§4.13 "Grants"), before any write-capable step.
-  let binding = binding_of(host, target, request)?;
+  let binding = match binding_of(host.get(), target, request) {
+    Ok(binding) => binding,
+    Err(refusal) => return Err((host, refusal)),
+  };
   let grant = match grants.check(request.grant, &binding, manifest.hash, request.now_ns) {
     Ok(g) => g,
     Err(GrantRefusal::GrantRequired) => {
-      let preliminary = preliminary_verdicts(host, target, request, &manifest)?;
-      return Err(LandingRefusal::GrantRequired(Box::new(Presented {
-        manifest,
-        preliminary,
-        binding,
-      })));
+      let preliminary = match preliminary_verdicts(host.get(), target, request, &manifest) {
+        Ok(preliminary) => preliminary,
+        Err(refusal) => return Err((host, refusal)),
+      };
+      return Err((
+        host,
+        LandingRefusal::GrantRequired(Box::new(Presented {
+          manifest,
+          preliminary,
+          binding,
+        })),
+      ));
     }
-    Err(e) => return Err(LandingRefusal::Grant(e)),
+    Err(e) => return Err((host, LandingRefusal::Grant(e))),
   };
   // Lease (AUD-29-03): the caller took the landing lease on the target's canonical identity from the
   // target's one host-local owner; it must name this target and still be live, and every entry is fenced by
@@ -2282,20 +2392,18 @@ pub fn land<H: LandFs>(
     Some(held)
       if held.target.as_ref() == lease_key(&binding.target) && held.expires_ns > request.now_ns =>
     {
-      held
+      held.clone()
     }
-    _ => return Err(LandingRefusal::LeaseRequired),
+    _ => return Err((host, LandingRefusal::LeaseRequired)),
   };
-  let result = land_under_lease(
-    host, target, vol, store, audit, request, &manifest, &grant, lease, observer,
-  );
-  if let Ok(report) = &result
-    && matches!(report.state, LandingState::Done | LandingState::Partial)
-    && grant.scope == GrantScope::Once
-  {
-    grants.consume(grant.id);
-  }
-  result
+  LandingRun::begin(
+    host,
+    target.clone(),
+    request.clone(),
+    manifest,
+    grant,
+    lease,
+  )
 }
 
 /// The binding a landing presents: its consumer, volume and snapshot, and its target identified by the
@@ -2339,16 +2447,31 @@ fn preliminary_verdicts<H: LandFs>(
   verdicts.map_err(LandingRefusal::Target)
 }
 
-impl<'a, H: LandFs> Landing<'a, H> {
-  fn start(
-    host: &'a mut H,
-    target: &LandingTarget,
-    request: &'a LandingRequest,
-    caps: LandCapabilities,
-  ) -> Self {
+/// A landing's state between slices: everything a [`Landing`] holds but its host and request, which the run
+/// lends it again for each slice.
+struct Saved {
+  root: HostDir,
+  dirs: BTreeMap<Box<str>, HostDir>,
+  touched: BTreeSet<Box<str>>,
+  exchange: bool,
+  unnamed_temporaries: bool,
+  hidden_counter: u64,
+  bytes_written: u64,
+  widest_window_ns: u64,
+  degraded: Vec<Degradation>,
+  costs: CostSamples,
+  ramp: Ramp,
+  crashed: Option<i32>,
+  unsynced: BTreeSet<Box<str>>,
+  media_failed: bool,
+  placed: BTreeMap<Box<str>, Fingerprint>,
+  restored: BTreeMap<Box<str>, Fingerprint>,
+}
+
+impl Saved {
+  /// A fresh landing's state over `target`, with what its filesystem supports.
+  fn start(target: &LandingTarget, request: &LandingRequest, caps: LandCapabilities) -> Self {
     Self {
-      host,
-      request,
       root: target.dir,
       dirs: BTreeMap::new(),
       touched: BTreeSet::new(),
@@ -2369,65 +2492,431 @@ impl<'a, H: LandFs> Landing<'a, H> {
   }
 }
 
-/// Everything after the lease: validate, sweep, write inside the target, sync, advance.
-#[allow(clippy::too_many_arguments)] // land's own inputs, the manifest and grant it checked, and its lease
-fn land_under_lease<H: LandFs>(
-  host: &mut H,
-  target: &LandingTarget,
-  vol: &mut Volume,
-  store: &mut Store,
-  audit: &mut Audit,
-  request: &LandingRequest,
-  manifest: &Manifest,
-  grant: &GrantRecord,
-  lease: &LandingLease,
-  observer: &mut dyn Observer<H>,
-) -> Result<LandingReport, LandingRefusal> {
-  let caps = host
-    .capabilities(target.dir)
-    .map_err(LandingRefusal::Target)?;
-  let mut landing = Landing::start(host, target, request, caps);
-  // An earlier attempt's leftovers are settled before the verdicts are taken: an entry it left moved aside
-  // (inside an exchange fallback's or a rename's window) goes back first, so validation sees each path old or
-  // new, never missing (AUD-29-04).
-  let swept = landing.sweep(manifest);
-  let validated = landing.validate(manifest);
-  let mut reports = match validated {
-    Ok(r) => r,
-    Err(e) => {
-      landing.close_dirs();
-      return Err(LandingRefusal::Target(e));
-    }
-  };
-  audit.push(AuditRecord {
-    seq: 0,
-    at_ns: request.now_ns,
-    kind: AuditKind::LandingValidated,
-    grant: Some(grant.id),
-    landing: request.landing_id,
-    manifest: manifest.hash,
-    outcome: None,
-  });
-  if reports
-    .iter()
-    .any(|r| matches!(r.verdict, Some(Verdict::Conflict(_))))
-  {
-    landing.close_dirs();
-    return Err(LandingRefusal::Conflict(reports));
+impl<'a, H: LandFs> Landing<'a, H> {
+  fn start(
+    host: &'a mut H,
+    target: &LandingTarget,
+    request: &'a LandingRequest,
+    caps: LandCapabilities,
+  ) -> Self {
+    Self::resume(host, request, Saved::start(target, request, caps))
   }
-  landing.write_all(
-    manifest,
-    &mut reports,
-    &mut WriteContext {
-      vol,
-      store,
-      grant: Some(grant),
+
+  /// The landing over its saved state, with its host and request lent for one slice.
+  fn resume(host: &'a mut H, request: &'a LandingRequest, saved: Saved) -> Self {
+    Self {
+      host,
+      request,
+      root: saved.root,
+      dirs: saved.dirs,
+      touched: saved.touched,
+      exchange: saved.exchange,
+      unnamed_temporaries: saved.unnamed_temporaries,
+      hidden_counter: saved.hidden_counter,
+      bytes_written: saved.bytes_written,
+      widest_window_ns: saved.widest_window_ns,
+      degraded: saved.degraded,
+      costs: saved.costs,
+      ramp: saved.ramp,
+      crashed: saved.crashed,
+      unsynced: saved.unsynced,
+      media_failed: saved.media_failed,
+      placed: saved.placed,
+      restored: saved.restored,
+    }
+  }
+
+  /// The landing's state at the end of a slice; its host and request go back to the run.
+  fn suspend(self) -> Saved {
+    Saved {
+      root: self.root,
+      dirs: self.dirs,
+      touched: self.touched,
+      exchange: self.exchange,
+      unnamed_temporaries: self.unnamed_temporaries,
+      hidden_counter: self.hidden_counter,
+      bytes_written: self.bytes_written,
+      widest_window_ns: self.widest_window_ns,
+      degraded: self.degraded,
+      costs: self.costs,
+      ramp: self.ramp,
+      crashed: self.crashed,
+      unsynced: self.unsynced,
+      media_failed: self.media_failed,
+      placed: self.placed,
+      restored: self.restored,
+    }
+  }
+}
+
+/// Where a run's host lives: owned by the run (a daemon's writer, given back by [`LandingRun::into_host`]
+/// when the run ends), or lent by a caller that runs the landing through in one call.
+pub enum HostSlot<'h, H> {
+  /// The run owns the host.
+  Owned(H),
+  /// The run borrows the host.
+  Lent(&'h mut H),
+}
+
+impl<H> HostSlot<'_, H> {
+  fn get(&mut self) -> &mut H {
+    match self {
+      HostSlot::Owned(host) => host,
+      HostSlot::Lent(host) => host,
+    }
+  }
+}
+
+/// Where a run is: one phase of §4.15's sequence after the lease, with its cursor.
+enum Phase {
+  /// Settling a crashed earlier attempt's hidden siblings, one directory per unit.
+  Sweep { parents: Vec<Box<str>>, next: usize },
+  /// Taking each entry's verdict against the disk, one entry per unit.
+  Validate { ours: BTreeSet<String>, next: usize },
+  /// Writing, one entry per unit.
+  Write {
+    next: usize,
+    progress: WriteProgress,
+  },
+  /// Syncing the touched directories, one per unit.
+  Sync {
+    touched: Vec<Box<str>>,
+    next: usize,
+    progress: SyncProgress,
+  },
+  /// Advancing the overlay and reporting.
+  Finish { durability: Durability },
+  /// The run has returned its outcome.
+  Ended,
+}
+
+/// A granted landing as an owned, resumable operation (AUD-29-25; §4.15, §4.3): everything after its grant
+/// and lease were checked — sweep, validate, write, sync, advance — taken one unit at a time (a directory
+/// swept, an entry validated or written, a directory synced) in slices the caller bounds, so the shard that
+/// owns the volume runs other work between them. Nothing about the landing depends on where its slices
+/// end: each unit is the same step the one-call [`land`] takes, in the same order, under the same grant and
+/// lease fences (checked per entry against the landing's own elapsed clock). Dropped before it ends, it has
+/// closed nothing: the caller ends it with [`LandingRun::abandon`], which closes the directories it opened.
+pub struct LandingRun<'h, H: LandFs> {
+  host: HostSlot<'h, H>,
+  request: LandingRequest,
+  target: LandingTarget,
+  manifest: Manifest,
+  grant: GrantRecord,
+  lease: LandingLease,
+  saved: Option<Saved>,
+  reports: Vec<EntryReport>,
+  phase: Phase,
+  swept: usize,
+}
+
+impl<'h, H: LandFs> LandingRun<'h, H> {
+  /// A run of the granted landing of `manifest` into `target`, its grant and lease already checked.
+  pub fn begin(
+    mut host: HostSlot<'h, H>,
+    target: LandingTarget,
+    request: LandingRequest,
+    manifest: Manifest,
+    grant: GrantRecord,
+    lease: LandingLease,
+  ) -> Result<Self, (HostSlot<'h, H>, LandingRefusal)> {
+    let caps = match host.get().capabilities(target.dir) {
+      Ok(caps) => caps,
+      Err(error) => return Err((host, LandingRefusal::Target(error))),
+    };
+    let saved = Saved::start(&target, &request, caps);
+    let parents = sweep_parents(&manifest);
+    Ok(Self {
+      host,
+      request,
+      target,
+      manifest,
+      grant,
       lease,
-      observer,
-      audit,
-    },
-  );
-  let durability = landing.sync_all();
+      saved: Some(saved),
+      reports: Vec::new(),
+      phase: Phase::Sweep { parents, next: 0 },
+      swept: 0,
+    })
+  }
+
+  /// Runs units until the landing ends early, reaches its finish, or `budget_ns` of this slice has passed
+  /// (checked between units, so a slice ends within one unit of its budget): `Some` with the outcome when it
+  /// ended early (a refusal: a target that cannot be read, a conflict), `None` otherwise. It never runs the
+  /// finish, which advances the volume: once [`LandingRun::ready_to_finish`], the caller runs
+  /// [`LandingRun::finish`] where its records commit as one atom with the landing's completion.
+  pub fn step(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    audit: &mut Audit,
+    observer: &mut dyn Observer<H>,
+    budget_ns: u64,
+  ) -> Option<Result<LandingReport, LandingRefusal>> {
+    let began = Instant::now();
+    loop {
+      if self.ready_to_finish() {
+        return None;
+      }
+      if let Some(ended) = self.unit(vol, store, audit, observer) {
+        self.phase = Phase::Ended;
+        return Some(ended);
+      }
+      if elapsed_ns(began) >= budget_ns {
+        return None;
+      }
+    }
+  }
+
+  /// Whether every host step is done and only the finish (the volume's advance and the report) remains.
+  pub fn ready_to_finish(&self) -> bool {
+    matches!(self.phase, Phase::Finish { .. })
+  }
+
+  /// The finish: the overlay advanced past what reached the disk durably, the audit record, the report.
+  /// `LandingRefusal::Ended` before [`LandingRun::ready_to_finish`] or after the run ended.
+  pub fn finish(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    audit: &mut Audit,
+    observer: &mut dyn Observer<H>,
+  ) -> Result<LandingReport, LandingRefusal> {
+    if !self.ready_to_finish() {
+      return Err(LandingRefusal::Ended);
+    }
+    let finished = self
+      .unit(vol, store, audit, observer)
+      .unwrap_or(Err(LandingRefusal::Ended));
+    self.phase = Phase::Ended;
+    finished
+  }
+
+  /// Steps the run through to its outcome, finish included, without a budget: the one-call landing.
+  pub fn run_through(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    audit: &mut Audit,
+    observer: &mut dyn Observer<H>,
+  ) -> Result<LandingReport, LandingRefusal> {
+    match self.step(vol, store, audit, observer, u64::MAX) {
+      Some(ended) => ended,
+      None => self.finish(vol, store, audit, observer),
+    }
+  }
+
+  /// The grant the landing runs under.
+  pub fn grant(&self) -> &GrantRecord {
+    &self.grant
+  }
+
+  /// Whether the run has returned its outcome.
+  pub fn ended(&self) -> bool {
+    matches!(self.phase, Phase::Ended)
+  }
+
+  /// The host, once the run has ended or been abandoned: the daemon's writer, given back.
+  pub fn into_host(self) -> Option<H> {
+    match self.host {
+      HostSlot::Owned(host) => Some(host),
+      HostSlot::Lent(_) => None,
+    }
+  }
+
+  /// Ends a run that will not be stepped again (its client went, the shard is stopping): the directories it
+  /// opened are closed and nothing is advanced, so its entries stay in the overlay and a later landing
+  /// resumes them, sweeping whatever this attempt left — the same state a crash leaves.
+  pub fn abandon(&mut self) {
+    if let Some(saved) = self.saved.take() {
+      let mut landing = Landing::resume(self.host.get(), &self.request, saved);
+      landing.close_dirs();
+      self.saved = Some(landing.suspend());
+    }
+    self.phase = Phase::Ended;
+  }
+
+  /// One unit of the current phase; `Some` when the landing has ended with that outcome.
+  fn unit(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    audit: &mut Audit,
+    observer: &mut dyn Observer<H>,
+  ) -> Option<Result<LandingReport, LandingRefusal>> {
+    let LandingRun {
+      host,
+      request,
+      target,
+      manifest,
+      grant,
+      lease,
+      saved,
+      reports,
+      phase,
+      swept,
+    } = self;
+    let state = saved.take()?;
+    let mut landing = Landing::resume(host.get(), request, state);
+    let mut ended = None;
+    let mut next_phase = None;
+    match phase {
+      Phase::Sweep { parents, next } => match parents.get(*next) {
+        Some(parent) => {
+          *swept = swept.saturating_add(landing.sweep_parent(parent.clone(), manifest));
+          *next = next.saturating_add(1);
+        }
+        None => {
+          reports.reserve(manifest.entries.len());
+          next_phase = Some(Phase::Validate {
+            ours: owned_paths(manifest),
+            next: 0,
+          });
+        }
+      },
+      Phase::Validate { ours, next } => match manifest.entries.get(*next) {
+        Some(entry) => match landing.validate_entry(entry, ours) {
+          Ok(report) => {
+            reports.push(report);
+            *next = next.saturating_add(1);
+          }
+          Err(error) => {
+            landing.close_dirs();
+            ended = Some(Err(LandingRefusal::Target(error)));
+          }
+        },
+        None => {
+          audit.push(AuditRecord {
+            seq: 0,
+            at_ns: request.now_ns,
+            kind: AuditKind::LandingValidated,
+            grant: Some(grant.id),
+            landing: request.landing_id,
+            manifest: manifest.hash,
+            outcome: None,
+          });
+          if reports
+            .iter()
+            .any(|r| matches!(r.verdict, Some(Verdict::Conflict(_))))
+          {
+            landing.close_dirs();
+            ended = Some(Err(LandingRefusal::Conflict(std::mem::take(reports))));
+          } else {
+            next_phase = Some(Phase::Write {
+              next: 0,
+              progress: WriteProgress::start(),
+            });
+          }
+        }
+      },
+      Phase::Write { next, progress } => {
+        let entry = manifest.entries.get(*next);
+        match (entry, reports.get_mut(*next)) {
+          (Some(entry), Some(report)) if landing.crashed.is_none() => {
+            landing.write_one(
+              manifest,
+              entry,
+              report,
+              &mut WriteContext {
+                vol,
+                store,
+                grant: Some(grant),
+                lease,
+                observer,
+                audit,
+              },
+              progress,
+            );
+            *next = next.saturating_add(1);
+          }
+          _ => {
+            landing.close_write(progress);
+            next_phase = Some(Phase::Sync {
+              touched: landing.touched.iter().cloned().collect(),
+              next: 0,
+              progress: SyncProgress::default(),
+            });
+          }
+        }
+      }
+      Phase::Sync {
+        touched,
+        next,
+        progress,
+      } => match touched.get(*next) {
+        Some(path) => {
+          landing.sync_one(path.clone(), progress);
+          *next = next.saturating_add(1);
+        }
+        None => {
+          next_phase = Some(Phase::Finish {
+            durability: landing.finish_sync(progress),
+          });
+        }
+      },
+      Phase::Finish { durability } => {
+        let finished = finish_landing(
+          landing,
+          Finishing {
+            target,
+            vol,
+            store,
+            audit,
+            request,
+            manifest,
+            grant,
+            reports: std::mem::take(reports),
+            durability: *durability,
+            swept: *swept,
+          },
+        );
+        return Some(finished);
+      }
+      Phase::Ended => {
+        *saved = Some(landing.suspend());
+        return Some(Err(LandingRefusal::Ended));
+      }
+    }
+    *saved = Some(landing.suspend());
+    if let Some(next) = next_phase {
+      *phase = next;
+    }
+    ended
+  }
+}
+
+/// What finishing a landing needs besides the landing itself.
+struct Finishing<'x> {
+  target: &'x LandingTarget,
+  vol: &'x mut Volume,
+  store: &'x mut Store,
+  audit: &'x mut Audit,
+  request: &'x LandingRequest,
+  manifest: &'x Manifest,
+  grant: &'x GrantRecord,
+  reports: Vec<EntryReport>,
+  durability: Durability,
+  swept: usize,
+}
+
+/// The end of a landing after its sync: its degradations, its terminal state, the overlay advanced past what
+/// reached the disk durably, the audit record and the report.
+fn finish_landing<H: LandFs>(
+  mut landing: Landing<'_, H>,
+  finishing: Finishing<'_>,
+) -> Result<LandingReport, LandingRefusal> {
+  let Finishing {
+    target,
+    vol,
+    store,
+    audit,
+    request,
+    manifest,
+    grant,
+    reports,
+    durability,
+    swept,
+  } = finishing;
   let target_dir = target.dir;
   if let Some(errno) = landing.crashed {
     landing.degraded.push(Degradation::Crashed { errno });

@@ -659,6 +659,12 @@ fn crash_scenario(fs: Filesystem) -> (SimHost, Store, Volume) {
 
 /// The reference: the disk before, the disk after a clean landing, and the write count.
 fn crash_reference(fs: Filesystem) -> (Disk, Disk, u64) {
+  let (before, after, writes, _) = crash_reference_in(fs, Session::new());
+  (before, after, writes)
+}
+
+/// [`crash_reference`] under `session` (one call, or sliced): also the report and the overlay after.
+fn crash_reference_in(fs: Filesystem, mut session: Session) -> (Disk, Disk, u64, Landed) {
   let (mut host, mut store, mut vol) = crash_scenario(fs);
   let before = {
     let mut fresh = SimHost::new();
@@ -666,7 +672,6 @@ fn crash_reference(fs: Filesystem) -> (Disk, Disk, u64) {
     disk(&fresh)
   };
   let target = root_target(&mut host);
-  let mut session = Session::new();
   let writes = host.write_steps();
   let report = Setup {
     host: &mut host,
@@ -679,7 +684,32 @@ fn crash_reference(fs: Filesystem) -> (Disk, Disk, u64) {
   .unwrap();
   assert_eq!(report.state, LandingState::Done, "{report:?}");
   assert!(hidden_names(&host).is_empty());
-  (before, disk(&host), host.write_steps() - writes)
+  let landed = Landed {
+    outcomes: report
+      .entries
+      .iter()
+      .map(|e| (e.path.to_string(), format!("{:?}", e.outcome)))
+      .collect(),
+    counts: (
+      report.written,
+      report.skipped,
+      report.conflicts,
+      report.failed,
+      report.held,
+    ),
+    diverged: format!("{:?}", vol.diverged(&store)),
+    slices: session.slices,
+  };
+  (before, disk(&host), host.write_steps() - writes, landed)
+}
+
+/// What a landing reported and left in the overlay, for comparing a sliced run with the one call.
+#[derive(Debug, PartialEq, Eq)]
+struct Landed {
+  outcomes: Vec<(String, String)>,
+  counts: (usize, usize, usize, usize, usize),
+  diverged: String,
+  slices: u64,
 }
 
 /// Every path on `now` is as on `before` or as on `after`: old or new, never torn.
@@ -746,10 +776,20 @@ fn ancestors_or_self(path: &str) -> impl Iterator<Item = &str> {
 /// then the resume reaches the reference, sweeps the siblings, and a further run plans nothing. How many
 /// paths the crash left set aside.
 fn crash_then_resume(fs: Filesystem, crash_at: u64, before: &Disk, after: &Disk) -> usize {
+  crash_then_resume_in(fs, crash_at, before, after, Session::new())
+}
+
+/// [`crash_then_resume`] under `session` (one call, or sliced).
+fn crash_then_resume_in(
+  fs: Filesystem,
+  crash_at: u64,
+  before: &Disk,
+  after: &Disk,
+  mut session: Session,
+) -> usize {
   let exchange = fs.exchange;
   let (mut host, mut store, mut vol) = crash_scenario(fs);
   let target = root_target(&mut host);
-  let mut session = Session::new();
   host.crash_at_write(host.write_steps() + crash_at);
   let result = Setup {
     host: &mut host,
@@ -859,6 +899,62 @@ fn crash_at_every_instruction(fs: Filesystem) -> usize {
   (0..steps)
     .map(|crash_at| crash_then_resume(fs, crash_at, &before, &after))
     .sum()
+}
+
+/// AUD-29-25. Do: land the crash scenario on each simulated filesystem in one call, then again stepped one
+/// unit per slice. Expect: the sliced run leaves the same disk, the same report (every entry's outcome and the
+/// counts) and the same overlay, and it took more slices than the manifest has entries — the slicing is
+/// real, and where a slice ends changes nothing.
+#[test]
+fn a_landing_stepped_one_unit_per_slice_lands_exactly_as_the_one_call() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: false,
+    },
+  ] {
+    let (before, after, writes, whole) = crash_reference_in(fs, Session::new());
+    let (sliced_before, sliced_after, sliced_writes, sliced) =
+      crash_reference_in(fs, Session::sliced());
+    assert_eq!((sliced_before, sliced_after), (before, after));
+    assert_eq!(sliced_writes, writes, "the same host writes");
+    assert_eq!(sliced.outcomes, whole.outcomes);
+    assert_eq!(sliced.counts, whole.counts);
+    assert_eq!(sliced.diverged, whole.diverged);
+    assert_eq!(whole.slices, 0, "the one call takes no slices");
+    assert!(
+      usize::try_from(sliced.slices).unwrap() > sliced.outcomes.len(),
+      "{} slices for {} entries",
+      sliced.slices,
+      sliced.outcomes.len()
+    );
+  }
+}
+
+/// AUD-29-25 with T-1.15. Do: crash the sliced landing at every write instruction, then resume it sliced.
+/// Expect: as for the one call — every path old or new (or aside, without the exchange), the resume reaching
+/// the reference, and every sibling swept.
+#[test]
+fn a_sliced_landing_crashed_at_every_write_instruction_resumes_to_the_reference() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+  ] {
+    let (before, after, steps) = crash_reference(fs);
+    for crash_at in 0..steps {
+      crash_then_resume_in(fs, crash_at, &before, &after, Session::sliced());
+    }
+  }
 }
 
 /// T-1.15 and T-1.16 with AUD-29-04: the same crash at every write instruction on a filesystem without the

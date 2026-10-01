@@ -639,6 +639,11 @@ fn not_landed(
       reason: format!("{e:?}"),
     }),
     LandingRefusal::Volume(e) => refused(refusal_of_vfs(&e)),
+    // A run stepped after it ended: the server steps each run to its end once, so this names a defect of
+    // the server's own driving, refused typed rather than answered as a landing.
+    LandingRefusal::Ended => refused(Refusal::Unsupported {
+      feature: "stepping a landing that had ended".to_owned(),
+    }),
   }
 }
 

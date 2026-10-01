@@ -7,8 +7,8 @@
 pub(crate) mod removal;
 
 use slates_land::engine::{
-  Audit, LandingRefusal, LandingReport, LandingRequest, LandingTarget, Observer, Presented,
-  Unobserved, land,
+  Audit, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingTarget, Observer,
+  Presented, Unobserved, begin_landing, land, settle_grant,
 };
 use slates_land::grant::{GrantScope, Grants, Leases, Surface};
 use slates_land::manifest::Filter;
@@ -118,6 +118,11 @@ pub(crate) struct Session {
   pub(crate) grants: Grants,
   pub(crate) leases: Leases,
   pub(crate) audit: Audit,
+  /// The budget of each slice a granted landing is stepped in: unbounded (`u64::MAX`) for the one-call
+  /// landing, `0` for one unit per slice (AUD-29-25: the sliced run must land exactly as the one call does).
+  pub(crate) slice_budget_ns: u64,
+  /// The slices the session's sliced landings took (the sliced oracles' non-vacuity counter).
+  pub(crate) slices: u64,
 }
 
 impl Default for Session {
@@ -132,6 +137,16 @@ impl Session {
       grants: Grants::default(),
       leases: Leases::default(),
       audit: Audit::new(1 << 10),
+      slice_budget_ns: u64::MAX,
+      slices: 0,
+    }
+  }
+
+  /// A session whose granted landings run one unit per slice.
+  pub(crate) fn sliced() -> Self {
+    Self {
+      slice_budget_ns: 0,
+      ..Self::new()
     }
   }
 }
@@ -167,20 +182,61 @@ impl<H: LandFs> Setup<'_, H> {
       }
       None => None,
     };
-    let result = land(
-      self.host,
+    let result = if self.session.slice_budget_ns == u64::MAX {
+      land(
+        self.host,
+        self.target,
+        self.vol,
+        self.store,
+        &mut self.session.grants,
+        lease.as_ref(),
+        &mut self.session.audit,
+        req,
+        observer,
+      )
+    } else {
+      self.land_in_slices(req, lease.as_ref(), observer)
+    };
+    if let Some(held) = &lease {
+      self.session.leases.release(held);
+    }
+    result
+  }
+
+  /// The landing stepped in slices of the session's budget, counting them.
+  fn land_in_slices<O: Observer<H>>(
+    &mut self,
+    req: &LandingRequest,
+    lease: Option<&slates_land::grant::LandingLease>,
+    observer: &mut O,
+  ) -> Result<LandingReport, LandingRefusal> {
+    let mut run = begin_landing(
+      HostSlot::Lent(&mut *self.host),
       self.target,
       self.vol,
       self.store,
       &mut self.session.grants,
-      lease.as_ref(),
+      lease,
       &mut self.session.audit,
       req,
-      observer,
-    );
-    if let Some(held) = &lease {
-      self.session.leases.release(held);
-    }
+    )
+    .map_err(|(_, refusal)| refusal)?;
+    let result = loop {
+      self.session.slices += 1;
+      if let Some(ended) = run.step(
+        self.vol,
+        self.store,
+        &mut self.session.audit,
+        observer,
+        self.session.slice_budget_ns,
+      ) {
+        break ended;
+      }
+      if run.ready_to_finish() {
+        break run.finish(self.vol, self.store, &mut self.session.audit, observer);
+      }
+    };
+    settle_grant(&mut self.session.grants, run.grant(), &result);
     result
   }
 
