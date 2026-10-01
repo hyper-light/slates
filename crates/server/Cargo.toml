@@ -56,6 +56,9 @@ slates-bridge-fuse = { workspace = true }
 # drives across a daemon restart (create, snapshot, clone, status, the exactly-once retry). Its lib
 # depends only on machine/ipc/wire, so this is not a cycle.
 slates-client = { workspace = true }
+# The live guest's workloads (AC-9.7): the conformance roster's scripts and its run comparison, so the guest is
+# judged by exactly the rules the host and container legs are. Its lib depends only on serde/blake3.
+slates-conformance = { workspace = true }
 
 [lints]
 workspace = true

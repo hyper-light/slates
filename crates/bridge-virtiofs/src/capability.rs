@@ -64,6 +64,10 @@ pub enum Conformance {
   /// The simulated guest driver's differential oracle against direct FUSE dispatch (this crate's
   /// tests); no live guest has run.
   SimulatedGuestDriver,
+  /// A live Linux guest under a real VMM mounted the tag and ran the conformance roster's workloads, each
+  /// identical on the volume and on the guest's own RAM (AC-9.7;
+  /// `a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram`).
+  LiveGuestWorkloads,
 }
 
 /// The DAX line of the report.
@@ -132,7 +136,13 @@ pub fn host_capability(transport: GuestTransport) -> TransportCapability {
     read_write: ReadWritePolicy::ReadWrite,
     sharing: sharing_of(None),
     residency: Residency::HostRam,
-    conformance: Conformance::SimulatedGuestDriver,
+    // The vhost-user binding has run a live guest's workloads (Linux, AUD-29-68); the in-process seam has only
+    // the simulated driver until a VMM drives it.
+    conformance: if transport == GuestTransport::InheritedDescriptor && cfg!(target_os = "linux") {
+      Conformance::LiveGuestWorkloads
+    } else {
+      Conformance::SimulatedGuestDriver
+    },
     dax: dax(),
   }
 }

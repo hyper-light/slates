@@ -1198,15 +1198,42 @@ fn live_guest() -> Option<(String, String, String)> {
 /// number), the guest's RAM a sealed memfd; its console output once it exits, or the run's failure.
 #[cfg(target_os = "linux")]
 fn run_qemu(
+  guest: &(String, String, String),
+  socket: &std::os::fd::OwnedFd,
+  sample: &mut dyn FnMut(&[GuestMapping]),
+) -> String {
+  run_qemu_with(guest, socket, (GUEST_RUN, "", false), sample)
+}
+
+/// [`run_qemu`] within `bound`, with `extra` appended to the guest's command line and, with `host_root`, the
+/// host container's root shared read-only over 9p as `hostroot`.
+#[cfg(target_os = "linux")]
+fn run_qemu_with(
   (qemu, kernel, initrd): &(String, String, String),
   socket: &std::os::fd::OwnedFd,
+  (bound, extra, host_root): (Duration, &str, bool),
   sample: &mut dyn FnMut(&[GuestMapping]),
 ) -> String {
   use std::os::fd::AsRawFd;
   // The child inherits the descriptor at its own number (QEMU's `fd=` option names it).
   rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::empty()).unwrap();
   let chardev = format!("socket,id=vfs,fd={}", socket.as_raw_fd());
-  let mut child = std::process::Command::new(qemu)
+  let append = format!("console=ttyAMA0 rdinit=/init panic=-1 quiet{extra}");
+  // The workload guest compiles with rustc, which needs more than the mount guest's RAM.
+  let memory = if host_root {
+    WORKLOAD_GUEST_RAM
+  } else {
+    "256M"
+  };
+  let backend = format!("memory-backend-memfd,id=mem,size={memory},share=on");
+  let mut command = std::process::Command::new(qemu);
+  if host_root {
+    command.args([
+      "-virtfs",
+      "local,path=/,mount_tag=hostroot,security_model=none,readonly=on",
+    ]);
+  }
+  let mut child = command
     .args([
       "-machine",
       "virt,memory-backend=mem",
@@ -1215,9 +1242,9 @@ fn run_qemu(
       "-smp",
       "1",
       "-m",
-      "256M",
+      memory,
       "-object",
-      "memory-backend-memfd,id=mem,size=256M,share=on",
+      &backend,
       "-nographic",
       "-nic",
       "none",
@@ -1227,7 +1254,7 @@ fn run_qemu(
       "-initrd",
       initrd,
       "-append",
-      "console=ttyAMA0 rdinit=/init panic=-1 quiet",
+      &append,
       "-chardev",
       &chardev,
       "-device",
@@ -1241,7 +1268,7 @@ fn run_qemu(
   let mut timed_out = false;
   while child.try_wait().unwrap().is_none() {
     sample(&guest_memory_mappings());
-    if started.elapsed() > GUEST_RUN {
+    if started.elapsed() > bound {
       let _ = child.kill();
       timed_out = true;
       break;
@@ -1257,7 +1284,7 @@ fn run_qemu(
     String::from_utf8_lossy(&output.stderr)
   );
   if timed_out {
-    format!("(the guest did not power off within {GUEST_RUN:?})\n{console}")
+    format!("(the guest did not power off within {bound:?})\n{console}")
   } else {
     console
   }
@@ -1740,4 +1767,260 @@ fn the_volume_goes(client: &mut Client, volume: slates_ipc::protocol::VolumeId) 
     std::thread::sleep(Duration::from_millis(20));
   }
   false
+}
+
+/// Shape: the workload guest's RAM: rustc's working set for a one-file crate with room to spare (the mount
+/// guest's 256 MiB is measured in AUD-29-77 and stays the residency figure).
+#[cfg(target_os = "linux")]
+const WORKLOAD_GUEST_RAM: &str = "1G";
+
+/// Shape: how long the workload guest may run — the boot, then each roster tool twice (nine on Linux, a cargo
+/// build of a one-file crate among them) under software emulation. Measured at 364 s and 317 s on Docker
+/// Desktop's Apple Silicon VM (2026-10-01), so about four times that, still failing a hung guest in bounded time.
+#[cfg(target_os = "linux")]
+const WORKLOAD_RUN: Duration = Duration::from_secs(1500);
+
+/// Format: the guest's script, run inside the host container's root (`/` over 9p, read-only) with the slates tag
+/// at `/mnt` and a RAM `/tmp`. For each roster tool the guest holds, the workload runs on the guest's RAM and on
+/// the slates mount under one fixed environment, and each run's output and resulting tree are printed between
+/// markers: kind, permission bits, size, SHA-256 (or link target) and path per entry.
+#[cfg(target_os = "linux")]
+const GUEST_WORKLOADS: &str = r#"
+export PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export HOME=/tmp/home CARGO_HOME=/tmp/cargo-home RUSTUP_HOME=/usr/local/rustup
+export GIT_AUTHOR_NAME=slates GIT_AUTHOR_EMAIL=slates@example.invalid
+export GIT_COMMITTER_NAME=slates GIT_COMMITTER_EMAIL=slates@example.invalid
+export GIT_AUTHOR_DATE=2026-09-14T00:00:00Z GIT_COMMITTER_DATE=2026-09-14T00:00:00Z
+export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 TZ=UTC LC_ALL=C
+mkdir -p "$HOME" "$CARGO_HOME"
+while read -r name tool; do
+  if ! command -v "$tool" >/dev/null 2>&1; then echo "=== SKIP $name $tool"; continue; fi
+  for side in ram mount; do
+    if [ "$side" = ram ]; then dir=/tmp/w/$name; else dir=/mnt/w/$name; fi
+    mkdir -p "$dir"
+    ( cd "$dir" && sh -e /mnt/scripts/$name.sh ) > /tmp/out.$side 2>&1
+    code=$?
+    echo "=== RUN $name $side $code $dir"
+    cat /tmp/out.$side
+    echo "=== MANIFEST"
+    ( cd "$dir" && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r p; do
+        kind=$(stat -c %F "$p"); mode=$(stat -c %a "$p")
+        case "$kind" in
+          "regular file"|"regular empty file")
+            printf 'f\t%s\t%s\t%s\t%s\n' "$mode" "$(stat -c %s "$p")" "$(sha256sum < "$p" | cut -d' ' -f1)" "${p#./}" ;;
+          directory) printf 'd\t%s\t0\t-\t%s\n' "$mode" "${p#./}" ;;
+          "symbolic link") printf 'l\t0\t0\t%s\t%s\n' "$(readlink "$p")" "${p#./}" ;;
+          *) printf 'o\t%s\t0\t-\t%s\n' "$mode" "${p#./}" ;;
+        esac
+      done )
+    echo "=== END"
+  done
+done < /mnt/roster
+"#;
+
+/// The roster workloads a Linux guest runs: the whole roster but the macOS watcher (`fswatch`).
+#[cfg(target_os = "linux")]
+fn guest_roster() -> Vec<&'static slates_conformance::workload::Workload> {
+  slates_conformance::workload::ROSTER
+    .iter()
+    .filter(|workload| workload.tool != "fswatch")
+    .collect()
+}
+
+/// Writes `bytes` as `name` in directory `dir` over NFS.
+#[cfg(target_os = "linux")]
+fn put(stream: &mut TcpStream, dir: &[u8], name: &str, bytes: &[u8], xid: u32) {
+  let file = common::nfs::create(stream, dir, name, xid);
+  common::nfs::write(stream, &file, bytes, xid.wrapping_add(1));
+}
+
+/// Places the guest's script, the roster and each workload's script in the volume behind `root`.
+#[cfg(target_os = "linux")]
+fn place_workloads(stream: &mut TcpStream, root: &[u8]) {
+  // The roster's bounds, the very values every other leg runs it under.
+  let script = format!(
+    "export {}={} {}={}\n{GUEST_WORKLOADS}",
+    slates_conformance::workload::ENV_SQLITE_BUSY_MS,
+    slates_conformance::workload::SQLITE_BUSY_MS,
+    slates_conformance::workload::ENV_WATCH_SECONDS,
+    slates_conformance::workload::WATCH_SECONDS,
+  );
+  put(stream, root, "run.sh", script.as_bytes(), 10);
+  let roster: String = guest_roster()
+    .iter()
+    .map(|workload| format!("{} {}\n", workload.name, workload.tool))
+    .collect();
+  put(stream, root, "roster", roster.as_bytes(), 12);
+  let scripts = common::nfs::mkdir(stream, root, "scripts", 14);
+  for (position, workload) in guest_roster().iter().enumerate() {
+    let xid = 20 + 2 * u32::try_from(position).unwrap();
+    put(
+      stream,
+      &scripts,
+      &format!("{}.sh", workload.name),
+      workload.script.as_bytes(),
+      xid,
+    );
+  }
+}
+
+/// The runs the guest printed, by workload name and side (`ram`, `mount`), and the tools it lacked.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct GuestRuns {
+  runs: std::collections::BTreeMap<(String, String), slates_conformance::workload::Run>,
+  skipped: Vec<String>,
+}
+
+/// One manifest line the guest printed: kind, permission bits (octal), size, digest or link target, path.
+#[cfg(target_os = "linux")]
+fn manifest_entry(line: &str) -> Option<slates_conformance::workload::Entry> {
+  use slates_conformance::workload::{Entry, EntryKind};
+  let mut fields = line.splitn(5, '\t');
+  let (kind, mode, size, digest, path) = (
+    fields.next()?,
+    fields.next()?,
+    fields.next()?,
+    fields.next()?,
+    fields.next()?,
+  );
+  let (kind, digest) = match kind {
+    "f" => (EntryKind::File, digest.to_owned()),
+    "d" => (EntryKind::Directory, String::new()),
+    "l" => (
+      EntryKind::Symlink {
+        target: digest.to_owned(),
+      },
+      String::new(),
+    ),
+    _ => (EntryKind::Other, String::new()),
+  };
+  Some(Entry {
+    path: path.to_owned(),
+    kind,
+    mode: u32::from_str_radix(mode, 8).ok()?,
+    size: size.parse().ok()?,
+    digest,
+  })
+}
+
+/// Parses the guest's console into its runs.
+#[cfg(target_os = "linux")]
+fn guest_runs(console: &str) -> GuestRuns {
+  let mut parsed = GuestRuns::default();
+  let mut lines = console.lines().map(|line| line.trim_end_matches('\r'));
+  while let Some(line) = lines.next() {
+    if let Some(rest) = line.strip_prefix("=== SKIP ") {
+      parsed.skipped.push(rest.to_owned());
+      continue;
+    }
+    let Some(rest) = line.strip_prefix("=== RUN ") else {
+      continue;
+    };
+    let mut words = rest.splitn(4, ' ');
+    let (Some(name), Some(side), Some(code), Some(directory)) =
+      (words.next(), words.next(), words.next(), words.next())
+    else {
+      continue;
+    };
+    let mut output = String::new();
+    for line in lines.by_ref() {
+      if line == "=== MANIFEST" {
+        break;
+      }
+      output.push_str(line);
+      output.push('\n');
+    }
+    let mut entries = Vec::new();
+    for line in lines.by_ref() {
+      if line == "=== END" {
+        break;
+      }
+      entries.extend(manifest_entry(line));
+    }
+    parsed.runs.insert(
+      (name.to_owned(), side.to_owned()),
+      slates_conformance::workload::Run {
+        directory: directory.to_owned(),
+        exit_code: code.parse().unwrap_or(-1),
+        output,
+        manifest: slates_conformance::workload::Manifest { entries },
+      },
+    );
+  }
+  parsed
+}
+
+/// AC-9.7 / AUD-29-68 (§6's workloads in a live guest). Do: provision a volume and place in it the conformance
+/// roster's scripts; boot the live guest in workload mode — the host container's root over 9p, the slates tag at
+/// its `/mnt`, RAM at `/tmp` — so for each roster tool it holds, the workload runs on the guest's RAM and on the
+/// slates mount; judge each pair by the harness's own rule (`slates_conformance::workload::compare`: exit code,
+/// output with the directory normalized, tree manifest under the roster's reviewed exclusions). Expect: every
+/// workload the guest ran is `Identical`; the tools it lacks are named as skipped. Gated on the live guest's
+/// environment; skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram() {
+  let Some((qemu, kernel, initrd)) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-workloads");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "workloads".to_owned(),
+    size: SizeClass::Bounded { limit: 256 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("workloads").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  place_workloads(&mut stream, &root);
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(WORKLOAD_RUN.as_nanos()).unwrap();
+  let _ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let started = Instant::now();
+  let console = run_qemu_with(
+    &(qemu, kernel, initrd),
+    &theirs,
+    (WORKLOAD_RUN, " slates.workloads", true),
+    &mut |_| {},
+  );
+  eprintln!("the workload guest ran {:?}", started.elapsed());
+  drop(theirs);
+  assert!(console.contains("SLATES-WORKLOADS-DONE"), "{console}");
+  let parsed = guest_runs(&console);
+  eprintln!("skipped in the guest: {:?}", parsed.skipped);
+  let mut judged = 0;
+  for workload in guest_roster() {
+    let ram = parsed
+      .runs
+      .get(&(workload.name.to_owned(), "ram".to_owned()));
+    let slates = parsed
+      .runs
+      .get(&(workload.name.to_owned(), "mount".to_owned()));
+    let (Some(ram), Some(slates)) = (ram, slates) else {
+      continue;
+    };
+    let status = slates_conformance::workload::compare(workload, ram, slates);
+    eprintln!("guest workload {}: {status:?}", workload.name);
+    assert_eq!(
+      status,
+      slates_conformance::record::WorkloadStatus::Identical,
+      "{}: ram {ram:?}\nslates {slates:?}",
+      workload.name
+    );
+    judged += 1;
+  }
+  assert!(judged > 0, "no workload ran in the guest: {console}");
 }

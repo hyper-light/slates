@@ -1934,6 +1934,11 @@ must exercise local communication and isolation between clones as well as namesp
 > `vhost-user-fs-pci` mounting the tag and exchanging files with the host. Owed: the live guest in CI, §6's workloads in
 > the guest.
 
+> **Status (2026-10-01, AC-9.7: live-guest workloads).** A live Linux guest under QEMU's vhost-user-fs ran the
+> conformance roster (git, cargo, npm, python, rg, rsync, sqlite, an editor, a watcher), and each came out identical
+> on the slates mount and on the guest's RAM. The vhost-user form reports `LiveGuestWorkloads` on Linux; CI's run
+> awaits QEMU on the runner.
+
 > **Status (2026-10-01, AUD-29-77: guest memory).** A guest's residency names the VMM's memory, not only the guest's
 > page cache, as beyond what slates protects. Measured on the live guest: the device's mapping of a 256 MiB guest
 > peaked at about 0.5 MiB resident, with 0 KiB locked.

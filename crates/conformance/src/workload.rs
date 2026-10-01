@@ -214,6 +214,12 @@ pub const ENV_SQLITE_BUSY_MS: &str = "SLATES_SQLITE_BUSY_MS";
 /// Format: the environment variable the watcher scripts read their wait from, in seconds; the
 /// harness sets it from its recorded bound.
 pub const ENV_WATCH_SECONDS: &str = "SLATES_WATCH_SECONDS";
+/// Shape: the busy timeout the sqlite workload waits out a sibling's lock with, milliseconds; the two inserts
+/// race by design and the loser must wait rather than fail. One value for every leg that runs the roster (host,
+/// container, guest), so their runs are judged under one bound.
+pub const SQLITE_BUSY_MS: u64 = 5_000;
+/// Shape: how long the watcher workloads wait for their event, seconds; one value for every leg, as above.
+pub const WATCH_SECONDS: u64 = 3;
 
 /// The roster, in the design's order (Part 6 "Real workloads"); both watcher forms are listed
 /// and the harness keeps the one for its operating system.

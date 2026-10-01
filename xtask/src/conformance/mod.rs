@@ -46,11 +46,8 @@ use slates_conformance::{Suite, Transport, matrix};
 
 use crate::Failure;
 
-/// Shape: the busy timeout the sqlite workload waits out a sibling's lock with, milliseconds; the
-/// two inserts race by design and the loser must wait rather than fail.
-const SQLITE_BUSY_MS: u64 = 5_000;
-/// Shape: how long the watcher workloads wait for their event, seconds.
-const WATCH_SECONDS: u64 = 3;
+// The roster's bounds are the conformance crate's, shared with every leg that runs it (the live guest's too).
+use slates_conformance::workload::{SQLITE_BUSY_MS, WATCH_SECONDS};
 /// Shape: fsx's default operation count — enough to exercise every operation class many times
 /// (fsx picks among read/write/mapread/mapwrite/truncate uniformly) inside a minute over loopback.
 const FSX_OPERATIONS: u64 = 10_000;

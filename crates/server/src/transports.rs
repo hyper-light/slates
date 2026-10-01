@@ -425,6 +425,9 @@ pub(crate) fn translate_guest(
         slates_bridge_virtiofs::capability::Conformance::SimulatedGuestDriver => {
           Conformance::SimulatedGuestDriver
         }
+        slates_bridge_virtiofs::capability::Conformance::LiveGuestWorkloads => {
+          Conformance::LiveGuestWorkloads
+        }
       },
     ),
     Some(reason) => refused(

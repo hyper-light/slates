@@ -1387,6 +1387,9 @@ pub enum Conformance {
   /// The simulated guest driver's differential oracle against direct FUSE dispatch
   /// (`crates/bridge-virtiofs`); no live guest has run (AC-9.7).
   SimulatedGuestDriver,
+  /// A live Linux guest under a real VMM mounted the tag and ran the conformance roster's workloads, each
+  /// identical on the volume and on the guest's RAM (AC-9.7; `crates/server/tests/virtiofs.rs`). Appended.
+  LiveGuestWorkloads,
 }
 
 /// Why a transport is not offered here: the `reason` of [`Refusal::AttachmentUnsupported`] and of a

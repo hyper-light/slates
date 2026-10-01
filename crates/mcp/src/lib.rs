@@ -1013,6 +1013,7 @@ pub fn conformance_name(conformance: Conformance) -> &'static str {
     Conformance::LiveKernelMountTest => "live_kernel_mount_test",
     Conformance::VerifiedSourceExport => "verified_source_export",
     Conformance::SimulatedGuestDriver => "simulated_guest_driver",
+    Conformance::LiveGuestWorkloads => "live_guest_workloads",
   }
 }
 
