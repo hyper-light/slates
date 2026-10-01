@@ -332,6 +332,20 @@ impl Partition {
       .collect()
   }
 
+  /// The attachments an enrolled consumer holds on this partition, whatever their volume or form (§4.13: a
+  /// consumer's revocation ends every one of them, AUD-29-84). A walk of the table, bounded by its cap; a
+  /// revocation asks, never a hot path.
+  pub fn attachments_held_by_consumer(&self, consumer: u64) -> Vec<&AttachmentRecord> {
+    self
+      .attachments
+      .iter()
+      .filter(
+        |(_, a)| matches!(a.principal, Principal::Consumer { consumer: c, .. } if c == consumer),
+      )
+      .map(|(_, a)| a)
+      .collect()
+  }
+
   /// The attachments of a volume (a walk of the table, bounded by its cap; a detach and a
   /// recovery ask, never a hot path).
   pub fn attachments_of(&self, volume: VolumeId) -> Vec<&AttachmentRecord> {

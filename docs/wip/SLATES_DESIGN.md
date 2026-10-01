@@ -1843,6 +1843,11 @@ must exercise local communication and isolation between clones as well as namesp
 > every pass boundary and every fenced wait. Proven in a three-node fleet with an isolated owner
 > (`crates/server/tests/fleet.rs`).
 
+> **Status (2026-10-01, AUD-29-84: a consumer's revocation ends its mounts).** The revocation acknowledged to the
+> human waits for every shard to mark the consumer's channels **and** end, as recorded operations, the
+> attachments the consumer holds there — a host mount's token, a FUSE mount, the record a container binding is
+> held to — so its capability reaches nothing afterwards; a shard that cannot end one refuses the revocation.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

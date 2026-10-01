@@ -1416,6 +1416,144 @@ fn once_revoked_every_verb_refuses_before_any_effect(
   ));
 }
 
+/// Format: `NFS3ERR_ACCES` (RFC 1813 §2.6): what a request through a capability that no longer authorizes
+/// its volume answers.
+#[cfg(target_os = "macos")]
+const NFS3ERR_ACCES: u32 = 13;
+
+/// AUD-29-84 (§4.13 "every later effect", A-28). Do: an enrolled consumer, shared read and write on the
+/// account's volume, attaches a host mount and reads a file through its mount capability over the daemon's NFS
+/// port; the human revokes the consumer; then the same connection's handle is read again, the old capability
+/// is presented to a fresh mount, and the account's own capability reads the file. Expect: before the
+/// revocation the consumer's read is served; after it the old handle answers `NFS3ERR_ACCES` and the old
+/// capability mounts nothing — the revocation ended the consumer's mount attachment before it was
+/// acknowledged — while the account's own mount, a host-account attachment, still reads. Before, the
+/// capability outlived the revocation and kept reading. macOS: the host NFS mount is offered there; Linux
+/// refuses it for the privilege, and a consumer's FUSE mount there ends through the same terminal step.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_revoked_consumers_mount_capability_reaches_nothing() {
+  let (daemon, instance) = daemon("revoke-mount");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut owner = Client::connect(&instance);
+  let mut workload = Client::connect(&instance);
+  let scene = a_consumer_with_a_shared_volume(&daemon, &mut owner, &mut workload, &secret);
+  let consumers_path = consumers_mount_path(&mut workload, scene.volume);
+  let port = scene.port;
+  let consumer = scene.consumer;
+  let owners_path = scene.owners_path;
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut stream, &consumers_path, 10);
+  let file = common::nfs::lookup(&mut stream, &root, "f", 11);
+  let before = common::nfs::read_status(&mut stream, &file, 12);
+
+  let revoke = slates_server::landing::revoke_proof(&secret, consumer);
+  assert!(matches!(
+    owner.call(&RequestBody::Revoke {
+      consumer,
+      proof: revoke
+    }),
+    ReplyBody::Revoked
+  ));
+  let after = common::nfs::read_status(&mut stream, &file, 13);
+  let remount = common::nfs::mount_status(&mut stream, &consumers_path, 14);
+  let mut owners_stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let owners_root = common::nfs::mount(&mut owners_stream, &owners_path, 20);
+  let owners_file = common::nfs::lookup(&mut owners_stream, &owners_root, "f", 21);
+  let owners_read = common::nfs::read_status(&mut owners_stream, &owners_file, 22);
+  daemon.stop();
+  assert_eq!(
+    before, 0,
+    "the consumer's capability read before the revocation"
+  );
+  assert_eq!(
+    after, NFS3ERR_ACCES,
+    "the revoked consumer's handle reaches nothing"
+  );
+  assert_ne!(remount, 0, "the revoked capability mounts nothing");
+  assert_eq!(
+    owners_read, 0,
+    "the account's own mount is not revoked with the consumer"
+  );
+}
+
+/// What [`a_revoked_consumers_mount_capability_reaches_nothing`] sets up.
+#[cfg(target_os = "macos")]
+struct ConsumerScene {
+  consumer: u64,
+  volume: VolumeId,
+  owners_path: String,
+  port: u16,
+}
+
+/// Enrolls a consumer and binds `workload` to it; the account creates a volume, writes `f` through its own
+/// capability, and shares read and write with the consumer.
+#[cfg(target_os = "macos")]
+fn a_consumer_with_a_shared_volume(
+  daemon: &Daemon,
+  owner: &mut Client,
+  workload: &mut Client,
+  secret: &[u8; 32],
+) -> ConsumerScene {
+  let account = current_uid();
+  let (consumer, capability) = enroll(owner, secret, account);
+  let proof = slates_server::landing::attest_proof(&capability, workload.client);
+  assert!(matches!(
+    workload.call(&RequestBody::Attest { consumer, proof }),
+    ReplyBody::Attested
+  ));
+  let ReplyBody::Created { id } = owner.call(&scratch("revoke-mount")) else {
+    panic!("create");
+  };
+  let owners_path = daemon
+    .mount_capability("revoke-mount")
+    .expect("the owner shard answers")
+    .expect("the volume is served");
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut stream, &owners_path, 1);
+  let file = common::nfs::create(&mut stream, &root, "f", 2);
+  common::nfs::write(&mut stream, &file, b"shared bytes", 3);
+  assert!(matches!(
+    owner.call(&RequestBody::Share {
+      volume: id,
+      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      rights: slates_ipc::protocol::Rights {
+        read: true,
+        write: true,
+        admin: false
+      },
+    }),
+    ReplyBody::Shared
+  ));
+  ConsumerScene {
+    consumer,
+    volume: id,
+    owners_path,
+    port,
+  }
+}
+
+/// The consumer attaches a host mount of `volume`; the mount path carrying its capability.
+#[cfg(target_os = "macos")]
+fn consumers_mount_path(workload: &mut Client, volume: VolumeId) -> String {
+  let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = workload.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::HostMount,
+  })
+  else {
+    panic!("the consumer's host mount attaches");
+  };
+  let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+  format!("/revoke-mount@{attachment:x}.{token_hex}")
+}
+
 /// The human surface enrolls a consumer under `account`, proving issuer authority with the daemon's
 /// secret; returns the consumer id and the capability shown once.
 fn enroll(client: &mut Client, secret: &[u8; 32], account: u32) -> (u64, [u8; 32]) {

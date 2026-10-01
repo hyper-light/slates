@@ -89,6 +89,14 @@ pub(crate) fn mount(stream: &mut TcpStream, path: &str, xid: u32) -> Vec<u8> {
   read_opaque(&reply, 4).0
 }
 
+/// MOUNT MNT `path` → its status, without asserting it succeeded (a capability that no longer authorizes
+/// its volume is refused).
+pub(crate) fn mount_status(stream: &mut TcpStream, path: &str, xid: u32) -> u32 {
+  let mut args = Vec::new();
+  opaque(path.as_bytes(), &mut args);
+  status(&call(stream, MOUNT_PROGRAM, 1, &args, xid))
+}
+
 /// MOUNT UMNT `path` — what the kernel sends when a mount is removed (`umount`); a void reply (RFC 1813
 /// §5.2.3), so nothing to assert on but its arrival.
 pub(crate) fn umnt(stream: &mut TcpStream, path: &str, xid: u32) {

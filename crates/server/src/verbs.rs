@@ -2553,8 +2553,10 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await;
-    if marked.is_none() {
-      return refused(Refusal::NotFound);
+    match marked {
+      None => return refused(Refusal::NotFound),
+      Some(Err(refusal)) => return refused(refusal),
+      Some(Ok(())) => {}
     }
   }
   ReplyBody::Revoked
@@ -2562,7 +2564,7 @@ async fn revoke_everywhere(origin: u16, owner: u16, shards: &[u16], consumer: u6
 
 /// Marks every slot on this shard bound to `consumer` revoked, so its next verb's gate — one local read
 /// in `serve` — refuses before any effect (banned item 10: no cross-shard call on a write path).
-fn mark_revoked(s: &mut ShardState, consumer: u64) {
+fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
   let bound: Vec<Handle<ClientSlot>> = s
     .clients
     .iter()
@@ -2574,6 +2576,22 @@ fn mark_revoked(s: &mut ShardState, consumer: u64) {
       slot.revoked = true;
     }
   }
+  // The consumer's attachments on this shard's partition end with its channels (AUD-29-84): each is a
+  // capability that outlives the channel — a host mount's token, a FUSE mount, the record a container
+  // binding is held to — so each is ended as a recorded operation, its mount capability then reaching nothing
+  // and its mount unmounted. An attachment that cannot be ended refuses the revocation, never acknowledges one
+  // not in force; the retry ends what is left. A host account's own attachments are not the consumer's.
+  let held: Vec<AttachmentRecord> = s
+    .db
+    .partition()
+    .attachments_held_by_consumer(consumer)
+    .into_iter()
+    .cloned()
+    .collect();
+  for record in held {
+    end_attachment(s, &record).map_err(|e| refusal_of_db(&e))?;
+  }
+  Ok(())
 }
 
 /// Sets `subject`'s rights on `volume` (§4.13 "Access lists": `admin` covers changing the list; the owner
