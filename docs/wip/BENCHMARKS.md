@@ -1245,3 +1245,31 @@ plus its own service; a provisioning probe is two verbs, so it waits behind up t
 can exceed the longest slice (run 1: 13.8 ms against 5.6 ms) — it is the longest step of *any* task on the shard
 over the whole test, the NFS writes and the probes included.
 
+### An RPC-with-TLS connection built per accept, against a shared config (2026-10-01)
+
+`cargo run --release -p slates-transport --example rpc_tls_bench`. It builds the network export's server connection
+per accepted TCP connection (`rpc_tls_connection`: TLS 1.3, a client verifier over the operator's authority, ALPN
+`sunrpc`), and compares that against two things. One is cloning one shared config into a connection, the shape R2
+rejects when an alternative exists. The other is a mutual TLS 1.3 handshake in memory, which every connection
+pays. The certificates are ECDSA P-256 from one test authority (rcgen). Apple M5 Max (18 cores), macOS 26.4.1,
+load average 28–36 from other sessions (not quiesced). 2,000 builds and 200 handshakes per round, 7 rounds.
+
+| Round | Build per connection | Shared config cloned | Mutual handshake | Build's share of an accept |
+|---|---|---|---|---|
+| 1 | 11.04 µs | 0.09 µs | 289.96 µs | 3.67% |
+| 2 | 11.52 µs | 0.15 µs | 280.62 µs | 3.94% |
+| 3 | 11.27 µs | 0.09 µs | 299.71 µs | 3.62% |
+| 4 | 11.01 µs | 0.11 µs | 286.15 µs | 3.71% |
+| 5 | 11.36 µs | 0.08 µs | 311.82 µs | 3.52% |
+| 6 | 12.49 µs | 0.08 µs | 344.05 µs | 3.50% |
+| 7 | 11.30 µs | 0.08 µs | 284.53 µs | 3.82% |
+| **best** | **11.01 µs** | **0.08 µs** | **280.62 µs** | **3.78%** |
+
+**Kept:** the per-connection build. Every `Arc` is the one rustls's constructor requires, with a single owner, in
+the transport crate's D-8 exception module. Each connection verifies clients against the identity's trust anchors
+as they stand when it is accepted. RFC 9289 §5.2.1 says a server SHOULD re-check clients when its anchors change.
+
+**Measured and rejected:** one config shared by every connection. It saves at most 11 µs (3.8%) per accept, on a
+path a kernel NFS client takes once per mount or reconnect, since it holds one TCP connection per server. The
+cost would be slates-level shared ownership and trust anchors fixed at the listener's start.
+

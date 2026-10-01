@@ -9,7 +9,7 @@
     "privilege": "unprivileged"
   },
   "date": "2026-10-01",
-  "command": "docker run --rm --user <uid>:<gid> --mount type=bind,source=<mount>,destination=/work,bind-recursive=disabled,bind-propagation=private --mount type=bind,source=<scratch>/tools/pjd-linux,destination=/src,readonly rust:1.98.0 sh -c cp -R /src/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7 /tmp/p && cd /tmp/p && cat /src/probes/head.h > config.h && for c in /src/probes/*.c; do b=${c%.c}; cc -std=gnu17 -w $(cat $b.flags) -o /tmp/probe.out $c >/dev/null 2>&1 && cat $b.define >> config.h; done; cc -O2 -w -I. -o pjdfstest pjdfstest.c && cd /work/conformance-<pid>/pjd && for f in $(cd /tmp/p && find tests -name '*.t' | sort); do echo '@@@slates-pjdfstest '$f; timeout 300 sh /tmp/p/$f 2>&1; [ $? -eq 124 ] && echo 'TIMED OUT'; done",
+  "command": "docker run --rm --user <uid>:<gid> --mount type=bind,source=<mount>,destination=/work,bind-recursive=disabled,bind-propagation=private --mount type=bind,source=<scratch>/tools/pjd-linux,destination=/src,readonly rust:1.98.0 sh -c cp -R /src/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7 /tmp/p && cd /tmp/p && cat /src/probes/head.h > config.h && for c in /src/probes/*.c; do b=${c%.c}; cc -std=gnu17 -w $(cat $b.flags) -o /tmp/probe.out $c >/dev/null 2>&1 && cat $b.define >> config.h; done; cc -O2 -w -I. -o pjdfstest pjdfstest.c && cd /work/conformance-<pid>/pjd && for f in $(cd /tmp/p && find tests -name '*.t' | sort); do echo '@@@slates-pjdfstest '$f; timeout 300 sh /tmp/p/$f 2>/dev/null; [ $? -eq 124 ] && echo 'TIMED OUT'; done",
   "bound": "every test file at the pinned commit (238 files), 300s per file",
   "outcome": {
     "kind": "limited",
@@ -19,12 +19,12 @@
       "suite": "pjdfstest",
       "files": 238,
       "cases": 8798,
-      "passed": 2314,
-      "failed": 2765,
+      "passed": 2315,
+      "failed": 2764,
       "needs_root": 3691,
       "todo": 28,
       "expected_failures": 0,
-      "unexpected_failures": 2765,
+      "unexpected_failures": 2764,
       "listed_now_passing": 0
     }
   },
@@ -33,13 +33,12 @@
     "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
     "entries": 0
   },
-  "duration_ms": 188736,
+  "duration_ms": 190279,
   "notes": [
     "pjdfstest: pjd/pjdfstest@85a8aea at 85a8aea9e685999ef0540392fd80535f873d7ff7, compiled inside the container with config.h answered by its own compiler from the harness's 33 probes",
-    "0 expected failures; 2765 unlisted failures (tests/chmod/00.t:22, tests/chmod/00.t:23, tests/chmod/00.t:24, tests/chmod/00.t:26, tests/chmod/00.t:27, tests/chmod/00.t:28, tests/chmod/00.t:31, tests/chmod/00.t:33 … and 2757 more); 0 listed now passing; 0 listed absent",
+    "0 expected failures; 2764 unlisted failures (tests/chmod/00.t:22, tests/chmod/00.t:23, tests/chmod/00.t:24, tests/chmod/00.t:26, tests/chmod/00.t:27, tests/chmod/00.t:28, tests/chmod/00.t:31, tests/chmod/00.t:33 … and 2756 more); 0 listed now passing; 0 listed absent",
     "the runtime's profile (`slates oci-runtime docker`): profile: engine=\"Docker Desktop\" version=29.3.1 endpoint=unix://~/.docker/run/docker.sock rootless=false userns=false; evidence: T-4.13 (Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing); identity: host_user_through_share (container ids are not forwarded; the attachment's capability is the authority); hard_links: other_names_stale_after_the_first_is_removed (until the guest revalidates; git: core.createObject=rename)",
-    "the source checked again (`slates oci-check`, mount 2 on device 436207698) just before the bind",
-    "failures by shape (12 of 217 shapes; names folded to N, inode numbers to <inode>): 650 × lstat N/N inode, expected ENOENT, got EACCES; 287 × unlink N/N, expected 0, got EACCES; 211 × unlink N, expected 0, got EACCES; 140 × test_check (a comparison of two values the script read; no message); 110 × bind N/N, expected 0, got EACCES; 110 × mkfifo N/N 0644, expected 0, got EACCES; 99 × symlink test N/N, expected 0, got EACCES; 90 × chmod N 06555, expected 0, got EACCES; 73 × create N/N 0644, expected 0, got EACCES; 55 × rmdir N, expected 0, got ENOTEMPTY; 44 × lstat N/N type, expected ENOENT, got EACCES; 41 × mkfifo N 0644, expected 0, got EACCES",
-    "incomplete or malformed files: tests/chmod/00.t (plan Some(119), 119 cases, 24 malformed lines); tests/chmod/03.t (plan Some(5), 5 cases, 1 malformed lines); tests/chown/00.t (plan Some(1280), 1280 cases, 152 malformed lines); tests/chown/03.t (plan Some(10), 10 cases, 1 malformed lines); tests/link/00.t (plan Some(202), 202 cases, 20 malformed lines); tests/link/03.t (plan Some(13), 13 cases, 1 malformed lines); tests/mkfifo/00.t (plan Some(36), 36 cases, 3 malformed lines); tests/mknod/00.t (plan Some(36), 36 cases, 3 malformed lines); tests/mknod/11.t (plan Some(28), 28 cases, 6 malformed lines); tests/open/03.t (plan Some(4), 4 cases, 1 malformed lines); tests/rename/00.t (plan Some(122), 122 cases, 20 malformed lines); tests/rename/09.t (plan Some(2353), 2353 cases, 42 malformed lines); tests/rename/10.t (plan Some(2099), 2099 cases, 42 malformed lines); tests/rename/23.t (plan Some(42), 42 cases, 8 malformed lines); tests/symlink/03.t (plan Some(6), 6 cases, 1 malformed lines); tests/truncate/03.t (plan Some(5), 5 cases, 1 malformed lines); tests/unlink/00.t (plan Some(112), 112 cases, 40 malformed lines); tests/unlink/03.t (plan Some(4), 4 cases, 1 malformed lines)"
+    "the source checked again (`slates oci-check`, mount 2 on device 436207711) just before the bind",
+    "failures by shape (12 of 217 shapes; names folded to N, inode numbers to <inode>): 650 × lstat N/N inode, expected ENOENT, got EACCES; 287 × unlink N/N, expected 0, got EACCES; 211 × unlink N, expected 0, got EACCES; 140 × test_check (a comparison of two values the script read; no message); 110 × bind N/N, expected 0, got EACCES; 110 × mkfifo N/N 0644, expected 0, got EACCES; 99 × symlink test N/N, expected 0, got EACCES; 90 × chmod N 06555, expected 0, got EACCES; 73 × create N/N 0644, expected 0, got EACCES; 54 × rmdir N, expected 0, got ENOTEMPTY; 44 × lstat N/N type, expected ENOENT, got EACCES; 41 × mkfifo N 0644, expected 0, got EACCES"
   ]
 }

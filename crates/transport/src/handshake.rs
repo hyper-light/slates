@@ -6,10 +6,11 @@
 //! enrollment candidates. Subsequent dials still verify the exact advertised leaf, so sharing
 //! an issuer never permits impersonating another peer (§4.13).
 //!
-//! This module holds the **one `Arc` in slates**: `rustls::quic::{Client,Server}Connection::new`
-//! take `Arc<ClientConfig>`/`Arc<ServerConfig>` by signature (D-8 exception 2 — a foreign API that
-//! takes `Arc`). The two owners are this connection value and rustls's internal handshake state; no
-//! slates type is shared by `Arc`.
+//! This module holds rustls's `Arc`s: `rustls::quic::{Client,Server}Connection::new` take
+//! `Arc<ClientConfig>`/`Arc<ServerConfig>` by signature (D-8 exception 2 — a foreign API that takes
+//! `Arc`), as do the verifier builders. The two owners are this connection value and rustls's internal
+//! handshake state; no slates type is shared by `Arc`. The NFS edge's RPC-with-TLS connection is built
+//! here too ([`rpc_tls_connection`]), so no other crate names `Arc` and a node's key stays here.
 
 // D-8 exception 2: the `Arc` here is only rustls's config, required by its constructor signature.
 #![allow(clippy::disallowed_types)]
@@ -118,6 +119,38 @@ pub fn server_config(
     .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
   config.send_tls13_tickets = 0;
   Ok(config)
+}
+
+/// One RPC-with-TLS server connection (RFC 9289; §4.6 "Kubernetes publication without privilege"),
+/// presenting this node's `identity` and requiring a client certificate that verifies to the identity's
+/// operator authorities ([`Identity::with_authorities`]): TLS 1.3 only (§5, "MUST NOT negotiate TLS versions
+/// prior to 1.3"), the server's ALPN list exactly `alpn` (§5: the server "MUST include only" `sunrpc`), no
+/// resumption tickets. An identity with no authorities has nothing to verify a client against and is refused
+/// (`Setup`), so the network export never opens unauthenticated.
+///
+/// Built per connection, as [`server_connection`] is: rustls's constructor takes `Arc<ServerConfig>` by
+/// signature (D-8 exception 2), so the `Arc` is made here and its one owner is the returned connection —
+/// nothing is shared between connections, and the node's private key never leaves this module.
+pub fn rpc_tls_connection(
+  identity: &Identity,
+  alpn: &[u8],
+) -> Result<rustls::ServerConnection, HandshakeError> {
+  if identity.authorities.is_empty() {
+    return Err(HandshakeError::Setup(
+      "no operator authority to verify an RPC-with-TLS client against".to_owned(),
+    ));
+  }
+  let verifier = client_verifier(&identity.authorities)?;
+  // structural: allow — D-8 exception 2: `with_client_cert_verifier` takes `Arc` by signature.
+  let verifier = Arc::new(RosterVerifier { inner: verifier });
+  let mut config = ServerConfig::builder_with_provider(provider())
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
+  config.alpn_protocols = vec![alpn.to_vec()];
+  config.send_tls13_tickets = 0;
+  // structural: allow — D-8 exception 2: `rustls::ServerConnection::new` takes `Arc` by signature; one owner.
+  rustls::ServerConnection::new(Arc::new(config)).map_err(HandshakeError::from)
 }
 
 /// Verifies a relayed enrollment certificate with the same trust and expiry rules as TLS.
