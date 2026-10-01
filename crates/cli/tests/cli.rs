@@ -2886,3 +2886,85 @@ fn wait_exit(child: &mut Child, bound: Duration) -> Option<std::process::ExitSta
   }
   None
 }
+
+/// The pids of the live processes whose parent is `parent`, from `/proc/<pid>/stat` (its fourth field).
+#[cfg(target_os = "linux")]
+fn children_of(parent: u32) -> Vec<u32> {
+  let mut children = Vec::new();
+  for entry in std::fs::read_dir("/proc").unwrap().flatten() {
+    let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+      continue;
+    };
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+      continue;
+    };
+    // `pid (comm) state ppid ...`: the command may hold spaces, so split after its closing parenthesis.
+    let after_comm = stat.rsplit_once(')').map(|(_, rest)| rest).unwrap_or("");
+    let ppid = after_comm
+      .split_whitespace()
+      .nth(1)
+      .and_then(|f| f.parse::<u32>().ok());
+    if ppid == Some(parent) {
+      children.push(pid);
+    }
+  }
+  children
+}
+
+/// What another process of the same user can learn about `pid`'s core dumps, from outside it: its core
+/// size limits (soft, hard), its core filter, and whether its memory-bearing `/proc` files are closed to
+/// that user (a non-dumpable process's `environ` is).
+#[cfg(target_os = "linux")]
+fn dump_exposure(pid: u32) -> (String, u32, bool) {
+  let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+  let core = limits
+    .lines()
+    .find(|line| line.starts_with("Max core file size"))
+    .map(|line| {
+      let fields: Vec<&str> = line.split_whitespace().collect();
+      // `Max core file size <soft> <hard> bytes`.
+      format!("{} {}", fields[4], fields[5])
+    })
+    .unwrap();
+  let filter = std::fs::read_to_string(format!("/proc/{pid}/coredump_filter")).unwrap();
+  let filter = u32::from_str_radix(filter.trim(), 16).unwrap();
+  let closed = matches!(
+    std::fs::read(format!("/proc/{pid}/environ")),
+    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+  );
+  (core, filter, closed)
+}
+
+/// AUD-29-41 (dump exclusion, the real processes). Do: start the anchor, which spawns its daemon, and look
+/// at both from outside, as another process of the same user. Expect: each has a core size limit of 0 soft
+/// and hard, a core filter selecting no mapping class, and its `environ` closed (not dumpable) — so no core
+/// dump, and no same-user reader, can carry the segment or a volume's bytes. Before (Linux container,
+/// 2026-10-01), the anchor ran with the session's limits (`0 unlimited`: the hard limit raisable), the
+/// default filter (`0x23`: anonymous private and shared memory included) and a readable `/proc`.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_anchor_and_its_daemon_exclude_themselves_from_core_dumps() {
+  let instance = format!("cli-dumps-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let anchor_pid = anchor.child.id();
+  let daemons = children_of(anchor_pid);
+  assert_eq!(
+    daemons.len(),
+    1,
+    "the anchor supervises one daemon: {daemons:?}"
+  );
+  for (role, pid) in [("anchor", anchor_pid), ("daemon", daemons[0])] {
+    let (core, filter, closed) = dump_exposure(pid);
+    eprintln!("{role} {pid}: core limit {core}, core filter {filter:#x}, /proc closed {closed}");
+    assert_eq!(
+      core, "0 0",
+      "{role}: no core file, and the limit cannot be raised"
+    );
+    assert_eq!(filter, 0, "{role}: a collector's dump carries no memory");
+    assert!(
+      closed,
+      "{role}: not dumpable, so its memory files are closed to the same user"
+    );
+  }
+  drop(anchor);
+}

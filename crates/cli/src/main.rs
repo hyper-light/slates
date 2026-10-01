@@ -33,6 +33,7 @@ use std::process::ExitCode;
 mod anchor;
 mod args;
 mod daemon;
+mod dumps;
 #[cfg(target_os = "linux")]
 mod exec;
 mod fleet;

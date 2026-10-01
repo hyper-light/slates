@@ -83,6 +83,8 @@ fn published_profile() -> Result<Published, Failure> {
 
 /// Runs the daemon.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  // Before a volume holds a byte: no core dump may carry it (AUD-29-41).
+  crate::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;
   let parent = ParentWatch::from_env();
   let (profile, source) = match published_profile()? {

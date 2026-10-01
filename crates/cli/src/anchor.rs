@@ -94,6 +94,8 @@ fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
 
 /// Runs the anchor until a stop is requested or the daemon loops.
 pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
+  // Before the segment holds a byte: no core dump may carry it (AUD-29-41).
+  crate::dumps::exclude_from_dumps()?;
   signal::install().map_err(Failure::Failed)?;
   let profile: MachineProfile = measure(options.quick)?;
   let config = DaemonConfig::derive(&profile, &options.instance, options.shards);
