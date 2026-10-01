@@ -8,14 +8,14 @@
     "arch": "arm64",
     "privilege": "unprivileged"
   },
-  "date": "2026-09-14",
+  "date": "2026-10-01",
   "command": "",
   "bound": "",
   "outcome": {
     "kind": "skipped",
     "reason": {
       "kind": "owed",
-      "reason": "the OCI handoff (the attach verb's container form, crates/server) is under construction; there is no container attachment form to drive a suite through"
+      "reason": "the container form exists — `attach` returns a verified non-recursive private bind (the source checked again by `slates oci-check`), and a workload ran through it on Docker Desktop on macOS (the container acceptance test in crates/cli/tests/cli.rs) — but no harness leg runs a suite inside a container through it yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the daemon's FUSE mount"
     }
   },
   "expected_failure_list": null,

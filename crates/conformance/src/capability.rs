@@ -5,15 +5,17 @@
 //! not apply to the transport. Every reason is a sentence a reader can act on, and the table is
 //! the one place those sentences live, so the matrix never says "skipped" without saying why.
 //!
-//! The facts behind the rows, as of 2026-09-14: the macOS mount is the daemon's NFSv3 loopback
-//! server under `mount_nfs` (§4.6, proven live by `crates/cli/tests/cli.rs`); the Linux FUSE
-//! bridge (`crates/bridge-fuse`) has its codec, dispatch, `channel::serve_blocking` and
-//! `mount::mount`, but no daemon transport serves it (`crates/server` links the crate only as a
-//! dev-dependency) and `slates mount` is `mount_nfs`-only, so a Linux run reaches the daemon's
-//! NFS export through a root `mount -t nfs` by the OS client — an adapter, recorded `LIMITED`; the
-//! Windows WinFsp host is proven live by `crates/bridge-winfsp/tests/mount.rs` (create, write,
-//! read, list, delete) and nothing more; virtio-fs is proven only by the simulated guest driver
-//! (`docs/wip/virtiofs.md`); the OCI handoff is under construction.
+//! The facts behind the rows, as of 2026-10-01: the macOS mount is the daemon's NFSv3 loopback
+//! server under `mount_nfs` (§4.6, proven live by `crates/cli/tests/cli.rs`); the daemon serves a Linux
+//! FUSE mount (`slates mount` on Linux, `crates/server/src/fuse.rs`, proven on a real kernel mount by
+//! `crates/server/tests/fuse_mount.rs`), but the Linux lane still reaches the daemon through a root
+//! `mount -t nfs` adapter — running the suites over the FUSE mount itself is owed (pjdfstest's root cases
+//! need `allow_other`, an operator's `user_allow_other`); the Windows WinFsp host is proven live by
+//! `crates/bridge-winfsp/tests/mount.rs` (create, write, read, list, delete) and nothing more;
+//! virtio-fs is proven only by the simulated guest driver (`docs/wip/virtiofs.md`); the OCI container
+//! form exists (`attach` with the container form: a verified non-recursive private bind and `slates
+//! oci-check`) and a workload ran through it on Docker Desktop (T-4.13), but no harness leg runs a suite
+//! inside a container.
 
 use crate::record::{Suite, Transport};
 
@@ -92,15 +94,18 @@ const VIRTIOFS_OWED: &str = concat!(
 );
 
 /// The reason every OCI cell is owed.
-const OCI_OWED: &str = "the OCI handoff (the attach verb's container form, crates/server) is under \
-  construction; there is no container attachment form to drive a suite through";
+const OCI_OWED: &str = "the container form exists — `attach` returns a verified non-recursive private bind \
+  (the source checked again by `slates oci-check`), and a workload ran through it on Docker Desktop on macOS \
+  (the container acceptance test in crates/cli/tests/cli.rs) — but no harness leg runs a suite inside a container through it yet; on \
+  Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the daemon's FUSE mount";
 
 /// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export.
 const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
-  not_covered: "the FUSE bridge itself (crates/bridge-fuse): no daemon transport serves /dev/fuse \
-    (`crates/server` links the crate only as a dev-dependency) and `slates mount` is `mount_nfs`-only",
+  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): the lane \
+    still mounts through the NFS adapter; running the suites over FUSE is owed (pjdfstest's root cases need \
+    `allow_other`, which an operator grants with `user_allow_other` in /etc/fuse.conf)",
 };
 
 /// Tools every mounted macOS suite needs.
