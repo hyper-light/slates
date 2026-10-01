@@ -41,6 +41,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
   status [--json]                                  the daemon's status
   oci-check SOURCE MOUNT_ID DEVICE                 is SOURCE still the mount an `attach --oci` verified (run before binding)
+  oci-runtime RUNTIME                              the profile of the runtime that will bind it, and the evidence it holds
   status ID [--drift] [--json]
   base read ID PATH
   base digest ID PATH [--json]                     a clean base file's verified content digest
@@ -501,6 +502,9 @@ pub(crate) enum Command {
   Client(ClientRequest),
   /// The check a container harness runs just before its runtime binds a verified source (AUD-29-66).
   OciCheck(OciCheck),
+  /// The handshake a container harness runs with the runtime that will bind a verified source (AUD-29-67):
+  /// the runtime's command.
+  OciRuntime(String),
 }
 
 /// `oci-check SOURCE MOUNT_ID DEVICE`: whether `source` is still the mount instance an attach verified, by
@@ -1064,6 +1068,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
         device: number("DEVICE", device)?,
       }))
     }
+    ["oci-runtime", runtime] => Ok(Command::OciRuntime((*runtime).to_owned())),
     ["profile"] => {
       taken.only(&Spec {
         values: &[],

@@ -36,9 +36,9 @@ use slates_client::{
   AttachRequest, AttachTransport, Attachment, AttachmentCapability, CauseRecord, ChokepointReport,
   Client, ClientError, Conformance, CreateSpec, DaemonReport, DeleteWhileOpen, Established, Filter,
   GreenBase, GroupReport, HostAnswer, Intent, KernelCache, Landing, LandingDegradation,
-  LandingOutcome, LandingSummary, NamePolicy, OciBinding, OciRuntime, ReadAt, ReadWritePolicy,
-  Rebased, Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport,
-  Submitted, TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
+  LandingOutcome, LandingSummary, NamePolicy, OciBinding, ReadAt, ReadWritePolicy, Rebased,
+  Residency, ShardReport, Signal, SizeClass, SnapshotId, SpanRecord, StatusReport, Submitted,
+  TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
   VolumeSummary, WorkOp,
 };
 
@@ -980,7 +980,7 @@ pub fn conformance_name(conformance: Conformance) -> &'static str {
     Conformance::None => "none",
     Conformance::VerbLifecycleTest => "verb_lifecycle_test",
     Conformance::LiveKernelMountTest => "live_kernel_mount_test",
-    Conformance::ContainerWorkloadTest => "container_workload_test",
+    Conformance::VerifiedSourceExport => "verified_source_export",
     Conformance::SimulatedGuestDriver => "simulated_guest_driver",
   }
 }
@@ -1024,24 +1024,6 @@ fn kernel_cache_json(cache: KernelCache) -> Value {
   }
 }
 
-/// The OCI runtime probe as text: the command found, or the typed absence.
-pub fn oci_runtime_text(runtime: &OciRuntime) -> String {
-  match runtime {
-    OciRuntime::Found { name } => name.clone(),
-    OciRuntime::NoneOnPath => "absent/none_on_path".to_owned(),
-    OciRuntime::NotProbed => "absent/not_probed".to_owned(),
-  }
-}
-
-/// The OCI runtime probe as JSON: the command's name, or `null` with the typed absence beside it.
-fn oci_runtime_json(runtime: &OciRuntime) -> Value {
-  match runtime {
-    OciRuntime::Found { name } => json!({ "name": name, "absence": Value::Null }),
-    OciRuntime::NoneOnPath => json!({ "name": Value::Null, "absence": "none_on_path" }),
-    OciRuntime::NotProbed => json!({ "name": Value::Null, "absence": "not_probed" }),
-  }
-}
-
 /// One transport's capability as JSON: the six facts of §4.6 A-9 and the refusal reason when not
 /// supported. Public so the CLI's `--json` emits the same schema as the MCP surface (§4.12 parity).
 pub fn capability_json(c: &AttachmentCapability) -> Value {
@@ -1067,7 +1049,6 @@ pub fn transport_report_json(r: &TransportReport) -> Value {
   json!({
     "os": r.os,
     "kernel": r.kernel,
-    "oci_runtime": oci_runtime_json(&r.oci_runtime),
     "capabilities": r.capabilities.iter().map(capability_json).collect::<Vec<_>>(),
   })
 }

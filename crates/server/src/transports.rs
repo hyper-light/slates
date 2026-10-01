@@ -31,7 +31,7 @@
 
 use slates_db::catalog::Rights;
 use slates_ipc::protocol::{
-  AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, KernelCache, OciRuntime,
+  AttachTransport, AttachmentCapability, Conformance, DeleteWhileOpen, KernelCache,
   ReadWritePolicy, Residency, SharingSemantics, TargetPathConstraint, TransportReport,
   UnsupportedReason,
 };
@@ -328,9 +328,11 @@ pub(crate) const fn host_mount_offered(situation: &Situation) -> bool {
 }
 
 /// The container bind (§4.6 A-9): a bind of the established host mount into a container namespace
-/// by the host's OCI runtime (`crate::oci`). Offered exactly where a host mount is, with T-4.13's
-/// container workload as its evidence; refused `HostMountRequired` where no host mount is offered and
-/// `HostPlatform` where none can be. The container's view is the host mount's.
+/// by the host's OCI runtime (`crate::oci`). Offered exactly where a host mount is, its evidence the export's
+/// own — the source verified against the kernel's table and checked again before the bind; whether the
+/// harness's runtime consumes it as tested is the runtime handshake's verdict, per profile, never this row's
+/// (AUD-29-67). Refused `HostMountRequired` where no host mount is offered and `HostPlatform` where none can
+/// be. The container's view is the host mount's.
 pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
   let sharing = sharing(
     false,
@@ -345,7 +347,7 @@ pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
       TargetPathConstraint::ContainerDestination,
       sharing,
       residency,
-      Conformance::ContainerWorkloadTest,
+      Conformance::VerifiedSourceExport,
     );
   }
   let reason = match situation.platform {
@@ -500,47 +502,15 @@ pub(crate) fn guest(
   }
 }
 
-/// Format: the OCI runtimes and the CLIs that drive one, in the order the report prefers them. Its
-/// only non-test consumer is the unix `PATH` probe (`probe_oci_runtime`); on Windows the probe is
-/// not built (the report says the `PATHEXT` probe is owed), so this and its classifier are compiled
-/// only where used — unix, or any test build (the pure classifier is unit-tested on every host).
-#[cfg(any(unix, test))]
-const OCI_RUNTIMES: [&str; 6] = ["runc", "crun", "youki", "docker", "podman", "nerdctl"];
-
-/// The first OCI runtime `command_exists` finds, in the preferred order. Pure over the injected
-/// predicate (the shape of `crates/cli/src/mount.rs::classify`), so every branch tests on every host.
-#[cfg(any(unix, test))]
-pub(crate) fn classify_oci_runtime(command_exists: impl Fn(&str) -> bool) -> OciRuntime {
-  OCI_RUNTIMES
-    .iter()
-    .find(|command| command_exists(command))
-    .map_or(OciRuntime::NoneOnPath, |command| OciRuntime::Found {
-      name: (*command).to_owned(),
-    })
-}
-
 /// Whether `name` resolves to an executable on the daemon's `PATH`: a directory of the `PATH` holds an
 /// entry `name` this process may execute (a query, never a write).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn command_on_path(name: &str) -> bool {
   let Some(paths) = std::env::var_os("PATH") else {
     return false;
   };
   std::env::split_paths(&paths)
     .any(|dir| rustix::fs::access(dir.join(name), rustix::fs::Access::EXEC_OK).is_ok())
-}
-
-/// The OCI runtime on this daemon's `PATH`.
-#[cfg(unix)]
-fn probe_oci_runtime() -> OciRuntime {
-  classify_oci_runtime(command_on_path)
-}
-
-/// The Windows `PATH` probe (`PATHEXT` resolution) is not built; the report says so rather than
-/// reporting "none found".
-#[cfg(not(unix))]
-fn probe_oci_runtime() -> OciRuntime {
-  OciRuntime::NotProbed
 }
 
 /// Format: the FUSE device the kernel exposes.
@@ -582,7 +552,7 @@ fn host_facts() -> (String, Option<String>) {
 }
 
 /// The host facts a report carries, read **once per process** and kept: `uname`'s system name and
-/// release, and which OCI runtime the daemon's `PATH` holds. They are facts of the boot, not of the
+/// release, and whether FUSE is available. They are facts of the boot, not of the
 /// verb — the kernel and the `PATH` do not change under a running daemon — and reading them per
 /// `status` put a `uname` and one `access(2)` per `PATH` directory on the owner shard for every call
 /// (§4.3: a shard runs no blocking syscall off the driver; found integrating the OCI handoff,
@@ -590,7 +560,6 @@ fn host_facts() -> (String, Option<String>) {
 struct HostFacts {
   os: String,
   kernel: Option<String>,
-  oci_runtime: OciRuntime,
   fuse_available: bool,
 }
 
@@ -601,7 +570,6 @@ fn host_facts_once() -> &'static HostFacts {
     HostFacts {
       os,
       kernel,
-      oci_runtime: probe_oci_runtime(),
       fuse_available: probe_fuse(),
     }
   })
@@ -613,7 +581,6 @@ pub(crate) fn report(situation: &Situation) -> TransportReport {
   TransportReport {
     os: facts.os.clone(),
     kernel: facts.kernel.clone(),
-    oci_runtime: facts.oci_runtime.clone(),
     capabilities: capabilities(situation),
   }
 }
@@ -705,13 +672,13 @@ mod tests {
   }
 
   /// macOS: the container bind is offered exactly when the host mount is — a bind of it, with the
-  /// container workload as evidence and the runtime's VM in the residency boundary — and refused
+  /// verified source export as evidence and the runtime's VM in the residency boundary — and refused
   /// `HostMountRequired` when the listener did not bind.
   #[test]
   fn macos_offers_the_container_bind_exactly_when_the_host_mount_is() {
     let oci = entry(&on(Platform::MacOs, true), AttachTransport::Oci);
     assert!(oci.supported, "a bind of the offered host mount");
-    assert_eq!(oci.conformance, Conformance::ContainerWorkloadTest);
+    assert_eq!(oci.conformance, Conformance::VerifiedSourceExport);
     assert_eq!(oci.residency, Residency::DaemonRamKernelCacheAndRuntimeVm);
     assert_eq!(
       oci.sharing.delete_while_open,
@@ -834,28 +801,5 @@ mod tests {
     assert_eq!(unbuilt.conformance, Conformance::None);
     assert!(guest(&situation, AttachTransport::Oci).is_none());
     assert!(guest(&situation, AttachTransport::VirtioFsInProcess).is_some());
-  }
-
-  /// The runtime probe prefers a bare runtime over a CLI that drives one, and reports an empty
-  /// `PATH` as none found — tested with an injected predicate, no `PATH` consulted.
-  #[test]
-  fn the_runtime_probe_prefers_runc_and_reports_none_typed() {
-    assert_eq!(
-      classify_oci_runtime(|command| command == "docker" || command == "runc"),
-      OciRuntime::Found {
-        name: "runc".to_owned()
-      }
-    );
-    assert_eq!(
-      classify_oci_runtime(|command| command == "docker"),
-      OciRuntime::Found {
-        name: "docker".to_owned()
-      }
-    );
-    assert_eq!(classify_oci_runtime(|_| false), OciRuntime::NoneOnPath);
-    assert_eq!(
-      classify_oci_runtime(|command| command == "mount_nfs"),
-      OciRuntime::NoneOnPath
-    );
   }
 }

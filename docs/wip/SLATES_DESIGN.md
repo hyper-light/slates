@@ -1870,6 +1870,16 @@ must exercise local communication and isolation between clones as well as namesp
 > open — so a virtio-fs guest with no notification queue converges by revalidating rather than holding a
 > promise no mechanism keeps.
 
+> **Status (2026-10-01, AUD-29-67: the consuming runtime is judged by a handshake, not a name).** The
+> transport report names no container runtime: the daemon does not run the container, and the first name
+> on its `PATH` certified nothing. The OCI row's evidence is the export's own, `VerifiedSourceExport`: the
+> source verified against the kernel's table at attach and rechecked before the bind (`slates oci-check`).
+> The harness asks the runtime that will bind it for its profile (`slates oci-runtime RUNTIME`), bounded in
+> time and in answer size. The handshake refuses, typed, a runtime other than the Docker CLI, an engine
+> reached over a network (loopback TCP included), a rootless or user-namespace-remapped engine, and every
+> profile no container workload has run through. The one profile with evidence is Docker Desktop on macOS
+> over its local socket (T-4.13, which runs the handshake before each bind).
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

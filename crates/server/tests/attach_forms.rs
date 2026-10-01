@@ -457,7 +457,8 @@ fn attach_reports_its_form_and_an_unsupported_form_is_refused_typed_with_nothing
 }
 
 /// The container bind is offered exactly when a host mount is (macOS with the listener bound), with
-/// the container workload as its evidence; where no host mount is offered it is refused
+/// the verified source export as its evidence (AUD-29-67: the runtime's profile is the handshake's); where no
+/// host mount is offered it is refused
 /// `HostMountRequired` — never claimed from a table.
 #[test]
 fn the_container_bind_is_offered_exactly_when_a_host_mount_is() {
@@ -470,7 +471,7 @@ fn the_container_bind_is_offered_exactly_when_a_host_mount_is() {
   if cfg!(target_os = "macos") {
     assert_eq!(oci.supported, nfs.supported);
     if oci.supported {
-      assert_eq!(oci.conformance, Conformance::ContainerWorkloadTest);
+      assert_eq!(oci.conformance, Conformance::VerifiedSourceExport);
     }
   } else {
     assert_eq!(oci.unsupported_reason, Some(expected_container_refusal()));

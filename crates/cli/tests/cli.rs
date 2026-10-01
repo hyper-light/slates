@@ -2299,6 +2299,11 @@ fn bind_and_run_workloads(instance: &str, id: &str, path: &str) -> Option<serde_
     code, 0,
     "the verified source is unchanged before the bind: {err}"
   );
+  // And it asks the runtime that will bind it for its profile (AUD-29-67): this run is the evidence the
+  // handshake names, so the profile it binds through must be the one named.
+  let (code, profile, err) = run(instance, &["oci-runtime", "docker"]);
+  assert_eq!(code, 0, "the runtime's profile holds evidence: {err}");
+  assert!(profile.contains("evidence: T-4.13"), "{profile}");
   let (code, container_out, container_err) = run_in_container(&entry, &script, "container")
     .unwrap_or_else(|why| panic!("the container did not run: {why}"));
   if code != 0 && (container_err.contains("Mounts denied") || container_err.contains("not shared"))

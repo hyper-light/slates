@@ -39,6 +39,7 @@ mod exec;
 mod fleet;
 mod format;
 mod mount;
+mod oci_runtime;
 mod parent;
 mod recovery_key;
 mod signal;
@@ -84,6 +85,7 @@ fn main() -> ExitCode {
     Command::Exec(request) => run_exec(&request),
     Command::Run(request) => verbs::run_consumer(&request),
     Command::OciCheck(check) => verbs::oci_check(&check),
+    Command::OciRuntime(runtime) => oci_runtime::oci_runtime(&runtime),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,

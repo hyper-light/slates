@@ -1479,10 +1479,9 @@ fn mounts_text(report: &StatusReport) -> String {
 
 fn transports_text(report: &slates_client::TransportReport) -> String {
   let mut text = format!(
-    "os: {}\nkernel: {}\noci_runtime: {}\n",
+    "os: {}\nkernel: {}\n",
     report.os,
     report.kernel.as_deref().unwrap_or("absent/not_stated"),
-    slates_mcp::oci_runtime_text(&report.oci_runtime)
   );
   for capability in &report.capabilities {
     text.push_str(&capability_text(capability));

@@ -36,7 +36,7 @@
 
 | Contract sentence (§4.6 A-9 unless noted) | Enforced by |
 |---|---|
-| "Capabilities differ by host, kernel, runtime and VMM and must be reported by `attach` and `status`: supported transport, target-path constraints, read/write policy, sharing/cache semantics, residency boundary and conformance evidence." | `StatusReport.transports: TransportReport {os, kernel, oci_runtime, capabilities}` and `Attached.capability: AttachmentCapability` (`crates/ipc/src/protocol.rs`); the table `crates/server/src/transports.rs`, pure over one `Platform` seam; `os`/`kernel` from `uname`, the listener from `NFS_PORT`, the runtime from a `PATH` probe. |
+| "Capabilities differ by host, kernel, runtime and VMM and must be reported by `attach` and `status`: supported transport, target-path constraints, read/write policy, sharing/cache semantics, residency boundary and conformance evidence." | `StatusReport.transports: TransportReport {os, kernel, capabilities}` and `Attached.capability: AttachmentCapability` (`crates/ipc/src/protocol.rs`); the table `crates/server/src/transports.rs`, pure over one `Platform` seam; `os`/`kernel` from `uname`, the listener from `NFS_PORT`; the consuming runtime from the harness's handshake (`slates oci-runtime`), never a `PATH` probe. |
 | "Requesting an unsupported form returns `AttachmentUnsupported{transport, reason}`." | `Refusal::AttachmentUnsupported{transport: AttachTransport, reason: UnsupportedReason}`; raised in `verbs::establish_form` before the lease or the record (`crates/server/src/verbs.rs`). |
 | §4.4 "attach(volume\|snapshot, consumer, transport, chosen_path?)"; "Attach with a chosen path that cannot be honoured: Refused (`ChosenPathUnavailable{reason}`)." | `RequestBody::Attach.form: AttachRequest {Root, Oci{source, destination}, Guest{transport}}`; `Refusal::ChosenPathUnavailable{reason: HostPathReason}`. |
 | "A host OCI runtime passes the established host attachment into the container mount namespace." | `crates/server/src/oci.rs` + `crates/bridge-oci`: slates verifies, records and reports; the runtime binds (`docker run -v`/`runc` `mounts[]`); slates enters no namespace. |
@@ -44,7 +44,7 @@
 | "No disk socket, image construction, target mkdir or privilege escalation is implicit in attaching a VFS volume." | `bridge-oci` holds no `std::fs`/`std::net`, creates nothing; the destination is created by the runtime inside the container's rootfs; R10 by construction. |
 | "the read/write policy" | A read attachment yields `options: [bind, ro, private]`; the runtime enforces it (`Read-only file system` measured). Non-recursive since AUD-29-65 (2026-10-01): nothing beneath the source rides along, so `ro` covers the whole bound view. |
 | Appendix C "OCI namespace handoff ... must report [its] own tested semantics"; "macOS NFS fallback: `.nfs` temp files on delete-while-open" | `SharingSemantics.delete_while_open: DeleteWhileOpen {NoKernelClient, Unlinked, SillyRenamed}` — the NFS loopback mount and the bind on macOS say `SillyRenamed`, measured (§4 below). |
-| AC-9.7 "A skipped lane or pure simulation cannot close its transport guarantee." | `Conformance {None, VerbLifecycleTest, LiveKernelMountTest, ContainerWorkloadTest, SimulatedGuestDriver}` names the evidence class the tree holds for the transport on this platform; a refused transport claims `None`. |
+| AC-9.7 "A skipped lane or pure simulation cannot close its transport guarantee." | `Conformance {None, VerbLifecycleTest, LiveKernelMountTest, VerifiedSourceExport, SimulatedGuestDriver}` names the evidence class the tree holds for the transport on this platform; a refused transport claims `None`. |
 | The guest form (GAP-A9-5's owed "transport report on the `attach`/`status` wire") | `transports::translate_guest` carries `slates_bridge_virtiofs::capability::host_capability` fact for fact; `AttachRequest::Guest` over the ring refuses `SeamNotOnWire` (or the device's own `BindingNotBuilt`). |
 
 ## 2. Inventory before this work (file:line at `0ac7aad`)
@@ -146,14 +146,15 @@ the published specification before they are cited outside this tree is owed.
 | `Fuse` | `HostPlatform` | `BridgeNotWired` (the daemon does not serve `/dev/fuse` yet) | `HostPlatform` |
 | `Fskit` | `BridgeNotWired` | `HostPlatform` | `HostPlatform` |
 | `WinFsp` | `HostPlatform` | `HostPlatform` | `BridgeNotWired`; `DriveLetter` |
-| `Oci` | offered iff a host mount is (the listener bound); `ContainerDestination`; `InheritedFromHostMount`; `SillyRenamed`; `DaemonRamKernelCacheAndRuntimeVm`; `ContainerWorkloadTest` | refused `HostMountRequired` | refused `HostPlatform` |
+| `Oci` | offered iff a host mount is (the listener bound); `ContainerDestination`; `InheritedFromHostMount`; `SillyRenamed`; `DaemonRamKernelCacheAndRuntimeVm`; `VerifiedSourceExport` | refused `HostMountRequired` | refused `HostPlatform` |
 | `VirtioFsInProcess` | offered (the device's report); `GuestTag`; `Unlinked`; `DaemonRamAndGuestPageCache{dax_mapped: false}`; `SimulatedGuestDriver` | same | refused `HostPlatform` |
 | `VirtioFsInheritedDescriptor` | refused `BindingNotBuilt` (the device's own reason) | same | refused `HostPlatform` |
 
 The read/write policy is the caller's ceiling on `status` and the intent's on `attach`. The host
-facts: `os`/`kernel` from `uname` (`Darwin 25.4.0` here), `oci_runtime` the first of `runc, crun,
-youki, docker, podman, nerdctl` on the daemon's `PATH` (`docker` here) or a typed absence
-(`NoneOnPath`; `NotProbed` on Windows, where the `PATHEXT` probe is not built).
+facts: `os`/`kernel` from `uname` (`Darwin 25.4.0` here). The report names no container runtime
+(AUD-29-67, 2026-10-01): the daemon does not run the container, and the first runtime name on its `PATH`
+certified nothing about the runtime a harness will use. The harness asks its runtime instead (the
+runtime handshake, below).
 
 ## 4. Measured (macOS 26.4 / Darwin 25.4.0, Apple Silicon, rustc 1.98.0, Docker Desktop 29.3.1 with the `linux/amd64` `alpine:3.20` image under emulation, runtime `runc`; the box at the memory wall throughout — swap 16.0 GB of 17.4 GB used, fseventsd 32 GB RSS — so timings are not benchmarks)
 
@@ -238,8 +239,18 @@ benchmarks.
 - **The conformance fact names the evidence class the tree holds**, never a run: a build-time
   statement per platform, cross-checked by the tests that are that evidence (the T-4.13 test asserts
   the reply's `conformance`/`delete_while_open` against what it then observes).
-- **The runtime probe is a fact, not a requirement**: the daemon reports the first OCI runtime (or
-  CLI) on its `PATH` or a typed absence; the harness may hold its own.
+- **The runtime's profile is the harness's handshake, not a `PATH` name** (AUD-29-67, 2026-10-01):
+  `slates oci-runtime RUNTIME` asks the runtime's engine through its own CLI, bounded by the observe
+  budget and one page of answer. The endpoint (`DOCKER_HOST`, else the current context's) is refused
+  `RemoteEngine` unless it is a local socket or pipe, before the engine is asked. The engine's kind,
+  version and security options come from `docker info`; rootless or `userns` is refused
+  `UserNamespaceUntested`. The profile is judged against the evidence: only Docker Desktop on macOS over
+  its local socket holds it (T-4.13, which now runs the handshake before each bind); every other profile
+  is refused `ProfileUntested` naming engine and host, and every runtime but the Docker CLI
+  `RuntimeUnsupported`. The judge is pure (`crates/bridge-oci/src/runtime.rs`, `tests/runtime.rs`); the
+  queries and the hostile-answer parser are `crates/cli/src/oci_runtime.rs`. Measured here: Docker
+  Desktop 29.3.1 on `unix:///Users/…/.docker/run/docker.sock`, evidence T-4.13. The OCI row's own
+  evidence class is `VerifiedSourceExport` (was `ContainerWorkloadTest`): what the export proves itself.
 - **A cold report lives boxed** (`Box<TransportReport>`, `Box<OciBinding>`) rather than boxing every
   `ReplyBody`: the provisioning reply stays allocation-free (R9).
 - **The workload asserts the measured delete-while-open rule** rather than avoiding it: the
@@ -267,7 +278,8 @@ benchmarks.
    the NFS export does).
 2. **Verification of the runtime-specification words** (`type: "bind"`, `bind`, `private`, `ro`/`rw`) against
    the published OCI runtime specification (`config.md` "Mounts"), quoted from memory.
-3. **The Windows `PATH` probe** (`PATHEXT`) for `oci_runtime`; reported `NotProbed` until built.
+3. **Withdrawn (AUD-29-67):** the Windows `PATH` probe for a runtime name; the report no longer names a
+   runtime, and the handshake replaces the probe.
 4. **A subtree bind** (a directory inside the mount as the source) is refused `NotAMountPoint`
    today; a narrower authorized view would need the subpath in the record.
 5. **The container leg on the CI Linux lane** needs `fusermount3` and `user_allow_other` on the

@@ -41,6 +41,10 @@
 //! (`getfsstat`'s count; Linux `fs.mount-max`), and the Linux read is capped at that count times a
 //! per-line bound derived from `PATH_MAX`.
 //!
+//! Which runtime will bind the source is not the daemon's to know: the harness asks its runtime's engine for
+//! its profile, and [`runtime`] judges the answer against the evidence — the one profile a container workload
+//! has run through, or a typed refusal (AUD-29-67).
+//!
 //! The crate holds no `std::fs`, no `std::net`, no socket and no directory creation; its one `unsafe`
 //! block is the macOS `getfsstat` pair (no safe wrapper exists). The pure parts — the table parser,
 //! the verification and the entry — are tested on every host with simulated tables (`tests/verify.rs`).
@@ -60,4 +64,5 @@
 
 pub mod binding;
 pub mod mount_table;
+pub mod runtime;
 pub mod verify;

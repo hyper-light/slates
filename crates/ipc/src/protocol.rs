@@ -1378,8 +1378,12 @@ pub enum Conformance {
   VerbLifecycleTest,
   /// A real kernel mount driven by use (`crates/cli/tests/cli.rs`, the live mount flow).
   LiveKernelMountTest,
-  /// The same filesystem workload inside a real container and on the host (T-4.13).
-  ContainerWorkloadTest,
+  /// The bind source a host mount exports, verified against the kernel's mount table at attach and checked
+  /// again by the harness just before its runtime binds it (`slates oci-check`). Whether a runtime consumes
+  /// the source as tested is not this row's to say: the harness's runtime handshake (`slates oci-runtime`)
+  /// names the runtime's profile and the container workload that ran through it (T-4.13), or refuses an
+  /// untested profile typed (AUD-29-67).
+  VerifiedSourceExport,
   /// The simulated guest driver's differential oracle against direct FUSE dispatch
   /// (`crates/bridge-virtiofs`); no live guest has run (AC-9.7).
   SimulatedGuestDriver,
@@ -1444,30 +1448,15 @@ pub struct AttachmentCapability {
   pub conformance: Conformance,
 }
 
-/// The OCI runtime found on the daemon's `PATH` (§4.6 A-9 "Capabilities differ by host, kernel,
-/// runtime"): a fact about this host, not a requirement — the harness may hold its own runtime.
-#[derive(Wire, Clone, Debug, PartialEq, Eq)]
-pub enum OciRuntime {
-  /// The first of `runc`, `crun`, `youki`, `docker`, `podman`, `nerdctl` found, in that order.
-  Found {
-    /// The command's name.
-    name: String,
-  },
-  /// The `PATH` was probed and holds none of them.
-  NoneOnPath,
-  /// The `PATH` was not probed on this platform.
-  NotProbed,
-}
-
-/// The host's transport report (§4.6 A-9): the facts that qualify it, then every transport.
+/// The host's transport report (§4.6 A-9): the facts that qualify it, then every transport. The consuming
+/// container runtime is not among the facts: the daemon does not run it and a name on its `PATH` certifies
+/// nothing (AUD-29-67); the harness that holds the runtime asks it for its profile (`slates oci-runtime`).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct TransportReport {
   /// The operating system as the kernel names itself (`uname` sysname; `windows` there).
   pub os: String,
   /// The kernel release (`uname` release); `None` where the OS states none.
   pub kernel: Option<String>,
-  /// The OCI runtime on the daemon's `PATH`.
-  pub oci_runtime: OciRuntime,
   /// Every transport, in a fixed order, offered or refused with its reason.
   pub capabilities: Vec<AttachmentCapability>,
 }
