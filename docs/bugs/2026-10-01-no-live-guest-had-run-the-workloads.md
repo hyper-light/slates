@@ -43,7 +43,8 @@ was not involved. Mounting the 9p root with `cache=mmap,msize=524288` avoids it.
 `9pnet`, `9pnet_virtio` and `9p`, decompressed. The init's workload mode (`slates.workloads` on the command line)
 mounts the 9p root, the tag at its `/mnt`, a tmpfs at its `/tmp`, and runs `/mnt/run.sh` chrooted.
 
-## Owed
+## In CI
 
-Running this in CI needs QEMU on the runner, which is non-Rust tooling in CI (banned item 13) and awaits Ada's
-authorization. The test skips loudly without its environment.
+Ada authorized QEMU in CI on 2026-10-01. The recipe now lives in the repository (`ci/guest/Dockerfile`,
+`ci/guest/init`), built for the host's architecture. The `live-guest` job runs the virtio-fs suite in it, and a
+skipped live guest fails the job.

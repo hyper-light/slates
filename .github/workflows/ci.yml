@@ -152,6 +152,36 @@ jobs:
       - name: Ratchet
         run: cargo xtask ratchet
 
+  # The live guest (AUD-29-68, AC-9.7): QEMU's vhost-user-fs-pci drives a Linux guest whose /init mounts a
+  # daemon volume's tag, then runs the conformance roster on slates and on its RAM. QEMU, the distribution
+  # kernel and a busybox initramfs come from ci/guest (Ada authorized QEMU in CI, 2026-10-01). KVM accelerates
+  # the guest when the runner exposes /dev/kvm; the tests read it and fall back to software emulation.
+  live-guest:
+    name: live guest over vhost-user (QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Open KVM to the job
+        run: |
+          if [ -e /dev/kvm ]; then sudo chmod 666 /dev/kvm; fi
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build -t slates-guest ci/guest
+      - name: The virtio-fs suite with the live guest
+        shell: bash
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src -w /src slates-guest sh -c \
+            'SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz SLATES_GUEST_INITRD=/guest/initrd.gz \
+             cargo test -p slates-server --test virtiofs -- --nocapture' 2>&1 | tee live-guest.log
+          # A skipped live guest is a vacuous pass here: the image provides its environment, so a skip fails.
+          if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
+          grep -q "guest workload git: Identical" live-guest.log
+
   # The two SDKs as a user installs them (§2.4; docs/publish.md), by use on Linux and macOS. The
   # cp39-abi3 wheel maturin builds is installed into a fresh venv after twine checks its metadata
   # (what PyPI would refuse fails here); the napi addon `npm run build` produces is packed into the

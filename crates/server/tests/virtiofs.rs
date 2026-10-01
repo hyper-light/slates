@@ -1205,6 +1205,41 @@ fn run_qemu(
   run_qemu_with(guest, socket, (GUEST_RUN, "", false), sample)
 }
 
+/// The QEMU machine a live guest runs on this host's architecture, and whether KVM accelerates it.
+#[cfg(target_os = "linux")]
+struct GuestMachine {
+  /// The machine type, with the memory backend the vhost-user device needs shared.
+  machine: &'static str,
+  /// The guest kernel's console device.
+  console: &'static str,
+  /// Whether `/dev/kvm` is usable here (the CI runner; Docker Desktop on Apple Silicon has none).
+  kvm: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl GuestMachine {
+  fn of_this_host() -> GuestMachine {
+    let kvm = rustix::fs::access(
+      "/dev/kvm",
+      rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+    )
+    .is_ok();
+    if cfg!(target_arch = "x86_64") {
+      GuestMachine {
+        machine: "q35,memory-backend=mem",
+        console: "ttyS0",
+        kvm,
+      }
+    } else {
+      GuestMachine {
+        machine: "virt,memory-backend=mem",
+        console: "ttyAMA0",
+        kvm,
+      }
+    }
+  }
+}
+
 /// [`run_qemu`] within `bound`, with `extra` appended to the guest's command line and, with `host_root`, the
 /// host container's root shared read-only over 9p as `hostroot`.
 #[cfg(target_os = "linux")]
@@ -1218,7 +1253,11 @@ fn run_qemu_with(
   // The child inherits the descriptor at its own number (QEMU's `fd=` option names it).
   rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::empty()).unwrap();
   let chardev = format!("socket,id=vfs,fd={}", socket.as_raw_fd());
-  let append = format!("console=ttyAMA0 rdinit=/init panic=-1 quiet{extra}");
+  let machine = GuestMachine::of_this_host();
+  let append = format!(
+    "console={} rdinit=/init panic=-1 quiet{extra}",
+    machine.console
+  );
   // The workload guest compiles with rustc, which needs more than the mount guest's RAM.
   let memory = if host_root {
     WORKLOAD_GUEST_RAM
@@ -1227,6 +1266,9 @@ fn run_qemu_with(
   };
   let backend = format!("memory-backend-memfd,id=mem,size={memory},share=on");
   let mut command = std::process::Command::new(qemu);
+  if machine.kvm {
+    command.args(["-accel", "kvm"]);
+  }
   if host_root {
     command.args([
       "-virtfs",
@@ -1236,9 +1278,9 @@ fn run_qemu_with(
   let mut child = command
     .args([
       "-machine",
-      "virt,memory-backend=mem",
+      machine.machine,
       "-cpu",
-      "max",
+      if machine.kvm { "host" } else { "max" },
       "-smp",
       "1",
       "-m",

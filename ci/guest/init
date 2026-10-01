@@ -1,0 +1,33 @@
+#!/bin/busybox sh
+/bin/busybox mkdir -p /proc /sys /dev /mnt
+/bin/busybox mount -t proc proc /proc
+/bin/busybox mount -t sysfs sysfs /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+if /bin/busybox grep -q slates.workloads /proc/cmdline; then
+  # Workload mode: the host container's root over 9p (read-only), the slates tag at its /mnt, a RAM /tmp;
+  # the script the test placed in the volume runs inside that root.
+  for m in netfs 9pnet 9pnet_virtio 9p; do /bin/busybox insmod /lib/9p/$m.ko; done
+  /bin/busybox mkdir -p /root9
+  /bin/busybox mount -t 9p -o trans=virtio,version=9p2000.L,ro,cache=mmap,msize=524288 hostroot /root9
+  /bin/busybox mount -t virtiofs slates /root9/mnt
+  /bin/busybox mount -t tmpfs tmpfs /root9/tmp
+  /bin/busybox mount -t proc proc /root9/proc
+  /bin/busybox mount -t devtmpfs devtmpfs /root9/dev
+  /bin/busybox chroot /root9 /bin/sh /mnt/run.sh
+  echo SLATES-WORKLOADS-DONE
+  /bin/busybox sync
+  /bin/busybox umount /root9/mnt && echo SLATES-GUEST-UNMOUNTED
+  /bin/busybox poweroff -f
+fi
+if /bin/busybox mount -t virtiofs slates /mnt; then
+  echo "SLATES-HOST-SAYS: $(/bin/busybox cat /mnt/from-host.txt)"
+  echo "written by the guest" > /mnt/from-guest.txt
+  /bin/busybox mkdir /mnt/guest-dir
+  echo "SLATES-GUEST-LISTS: $(/bin/busybox ls /mnt | /bin/busybox tr '\n' ' ')"
+  /bin/busybox sync
+  /bin/busybox umount /mnt && echo SLATES-GUEST-UNMOUNTED
+  echo SLATES-GUEST-OK
+else
+  echo SLATES-GUEST-MOUNT-FAILED
+fi
+/bin/busybox poweroff -f
