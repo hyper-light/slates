@@ -12,6 +12,7 @@ import asyncio
 import os
 import signal
 import subprocess
+import sys
 import time
 import unittest
 
@@ -197,6 +198,47 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
 TICK_BOUND_SECS = REPLY_NS / 10 / 1e9
 # The ticker's own period: a tenth of its bound, so a held loop shows as lateness well past one period.
 TICK_SECS = TICK_BOUND_SECS / 10
+# Shape: the noise sampler's sleep — the ticker's own period, so both measure the same scheduling grain.
+NOISE_SAMPLE_SECS = TICK_SECS
+
+# The noise sampler, run in its own interpreter: it sleeps NOISE_SAMPLE_SECS at a time until its stdin closes,
+# then prints the most any sleep returned late.
+_NOISE_SAMPLER = (
+    "import sys, threading, time\n"
+    "stop = threading.Event()\n"
+    "threading.Thread(target=lambda: (sys.stdin.read(), stop.set()), daemon=True).start()\n"
+    "worst = 0.0\n"
+    "while not stop.is_set():\n"
+    "    asked = time.monotonic()\n"
+    "    time.sleep(float(sys.argv[1]))\n"
+    "    worst = max(worst, time.monotonic() - asked - float(sys.argv[1]))\n"
+    "print(worst)\n"
+)
+
+
+class Noise:
+    """The machine's own scheduling noise while the test runs: a sampler in a separate process that sleeps
+    NOISE_SAMPLE_SECS at a time and records how much later than asked each sleep returned — time the OS kept
+    it off a core, as it can keep the loop's thread off. A separate process, not a thread: a native call that
+    wrongly held the GIL would delay a sampler thread as much as the loop and mask the very hold the bound
+    exists to catch. The loop's lateness is judged against the bound plus this noise — the pattern of the
+    Rust driver test and the Node SDK test (CI 2026-10-01: a macOS runner's loop was 0.186 s late under load)."""
+
+    def __init__(self):
+        self._child = subprocess.Popen(
+            [sys.executable, "-c", _NOISE_SAMPLER, str(NOISE_SAMPLE_SECS)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self._worst = None
+
+    def stop(self):
+        """Ends the sampler (once; later calls return the same figure) and returns its worst lateness."""
+        if self._worst is None:
+            out, _ = self._child.communicate(input="")
+            self._worst = float(out.strip() or "0")
+        return self._worst
 
 
 class Ticker:
@@ -263,6 +305,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
+        noise = Noise()
         ticker = Ticker()
         try:
             client = await _connect_when_ready(instance)
@@ -329,11 +372,14 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             for result in doomed:
                 self.assertIsInstance(result, slates.SlatesError)
                 self.assertIn("DaemonGone", str(result))
+            scheduling = noise.stop()
             self.assertLess(
-                ticker.worst, TICK_BOUND_SECS,
-                f"the loop was never held: worst lateness {ticker.worst:.3f} s",
+                ticker.worst, TICK_BOUND_SECS + scheduling,
+                f"the loop was never held: worst lateness {ticker.worst:.3f} s, bound {TICK_BOUND_SECS} s "
+                f"plus the machine's own scheduling noise {scheduling:.3f} s",
             )
         finally:
+            noise.stop()
             ticker.task.cancel()
             try:
                 os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
