@@ -11,7 +11,9 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use slates_client::driver::{Begin, Driver, Event, Ticket};
-use slates_client::{Client, ClientError, Filter, Intent, Landing, VolumeId};
+use slates_client::{
+  Client, ClientError, CreateSpec, Filter, Intent, Landing, SizeClass, VolumeId,
+};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -237,15 +239,84 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   );
 }
 
-/// Shape: the files in the keepalive test's landing — enough that it outlasts its lease's term on any disk.
-const FILES_PAST_TERM: usize = 1_500;
+/// Shape: the files of the calibration landing that measures this machine's per-file landing cost — enough
+/// that the mean is many units, not one unit's noise.
+const CALIBRATION_FILES: usize = 500;
+/// Shape: how many times the span it must outlast a sized landing is made to last, so a disk faster than the
+/// calibration measured still outlasts it.
+const OUTLAST_FACTOR: u32 = 2;
+/// Shape: the most files a sized landing is given — sixteen calibrations; a disk so fast that more would be
+/// needed skips the test loudly rather than writing without bound.
+const MOST_FILES: usize = CALIBRATION_FILES * 16;
+/// Shape: the most a sized landing's volume may grow to — a gibibyte, far above the most files' small
+/// contents; it is dynamic, so it reserves nothing up front and takes only what its files use.
+const SIZED_VOLUME_BYTES: u64 = 1 << 30;
+
+/// A volume for a sized landing: grown as its files arrive, up to a bound far above what it will hold (a
+/// bounded volume would reserve the whole bound at creation, more than a small machine's shard holds).
+fn sized(name: &str) -> CreateSpec {
+  CreateSpec {
+    size: SizeClass::Dynamic {
+      max: SIZED_VOLUME_BYTES,
+    },
+    ..scratch(name)
+  }
+}
+
+/// Creates a sized volume, or reports a loud skip when the shard's budget cannot hold it (a typed
+/// `BudgetExceeded`: a machine too small for the landing this disk's speed calls for).
+fn create_sized(client: &mut Client, name: &str, files: usize) -> Option<VolumeId> {
+  match client.create(&sized(name)) {
+    Ok(volume) => Some(volume),
+    Err(ClientError::Refused(slates_client::Refusal::BudgetExceeded { available })) => {
+      eprintln!(
+        "SKIP: the shard's budget ({available} bytes available) cannot hold a volume for {files} files"
+      );
+      None
+    }
+    Err(e) => panic!("creating {name}: {e:?}"),
+  }
+}
+
+/// How many files a landing needs to last [`OUTLAST_FACTOR`] times `span` on this machine: a calibration
+/// landing of [`CALIBRATION_FILES`] files (its own volume, grant and target) measures the per-file cost.
+/// `None` when more than [`MOST_FILES`] would be needed — the disk outruns the test's bound.
+fn files_to_outlast(
+  daemon: &Daemon,
+  client: &mut Client,
+  secret: &[u8; 32],
+  span: Duration,
+) -> Option<usize> {
+  /// Shape: the calibration volume's name.
+  const CALIBRATION: &str = "calibration-landing";
+  let volume = client.create(&sized(CALIBRATION)).unwrap();
+  write_files(daemon, CALIBRATION, CALIBRATION_FILES);
+  let target = target_dir();
+  let grant = approve(client, secret, volume, None, &target.path);
+  let began = Instant::now();
+  let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
+  let took = began.elapsed();
+  assert!(
+    matches!(landed, Ok(Landing::Landed(_))),
+    "the calibration landing: {landed:?}"
+  );
+  // Its charge goes back to the shard for the landing it sizes.
+  client.destroy(volume).unwrap();
+  let per_file = took / u32::try_from(CALIBRATION_FILES).unwrap();
+  let wanted = span * OUTLAST_FACTOR;
+  let files = usize::try_from(wanted.as_nanos().div_ceil(per_file.as_nanos().max(1))).unwrap();
+  eprintln!(
+    "calibration: {CALIBRATION_FILES} files landed in {took:?} ({per_file:?} each); {files} files to last {wanted:?}"
+  );
+  (files <= MOST_FILES).then_some(files.max(CALIBRATION_FILES))
+}
 /// Shape: the keepalive test's lease term (the daemon's failover bound): a second, which the landing outlasts,
 /// with a half-term renewal margin of 500 ms — past the longest single unit measured here (a 205 ms `fsync`
 /// stall, `docs/wip/BENCHMARKS.md`, 2026-10-01).
 const SHORT_TERM_NS: u64 = 1_000_000_000;
 
-/// AUD-29-25 (the lease keepalive). Do: on a daemon whose landing lease term is one second, land 1,500 files —
-/// longer than the term — under a grant. Expect: the landing is done with every file written, having renewed
+/// AUD-29-25 (the lease keepalive). Do: on a daemon whose landing lease term is one second, land enough files
+/// to last twice the term on this machine (a calibration landing measures the per-file cost) under a grant. Expect: the landing is done with every file written, having renewed
 /// its lease between slices at least once; without the renewal its entries past the term were skipped
 /// (`LeaseEnded`) and it ended partial.
 #[test]
@@ -268,8 +339,23 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   let target = target_dir();
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
-  let volume = client.create(&scratch(VOLUME)).unwrap();
-  write_files(&daemon, VOLUME, FILES_PAST_TERM);
+  let Some(files) = files_to_outlast(
+    &daemon,
+    &mut client,
+    &secret,
+    Duration::from_nanos(SHORT_TERM_NS),
+  ) else {
+    daemon.stop();
+    eprintln!(
+      "SKIP: this disk lands faster than {MOST_FILES} files can outlast a {SHORT_TERM_NS} ns term"
+    );
+    return;
+  };
+  let Some(volume) = create_sized(&mut client, VOLUME, files) else {
+    daemon.stop();
+    return;
+  };
+  write_files(&daemon, VOLUME, files);
   let grant = approve(&mut client, &secret, volume, None, &target.path);
   let began = Instant::now();
   let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
@@ -281,7 +367,7 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
     panic!("the granted landing: {landed:?}");
   };
   eprintln!(
-    "landing of {FILES_PAST_TERM} files: {took:?} under a {SHORT_TERM_NS} ns term, {renewed} renewals: {} written, {}",
+    "landing of {files} files: {took:?} under a {SHORT_TERM_NS} ns term, {renewed} renewals: {} written, {}",
     outcome.written, outcome.state
   );
   assert!(
@@ -289,7 +375,7 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
     "the landing outlasted its term ({took:?}), or the test proves nothing"
   );
   assert_eq!(outcome.state, "done");
-  assert_eq!(outcome.written, u64::try_from(FILES_PAST_TERM).unwrap());
+  assert_eq!(outcome.written, u64::try_from(files).unwrap());
   assert!(renewed >= 1, "the lease was renewed between slices");
 }
 
@@ -343,7 +429,7 @@ fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended 
 }
 
 /// The async driver's patient path (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
-/// to a landing still at work). Do: land two volumes of 1,500 files each under grants through one async
+/// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply deadline, under grants through one async
 /// driver, driven by an event loop as an SDK drives it — one call submitted patient (`submit_patient`, as both
 /// SDKs' `land` is), the other plain — both landings outlasting the reply deadline. Expect: the plain call
 /// ends `Stalled` at its deadline (the control: the landings did outlast it, so the patient flag is what this
@@ -366,10 +452,23 @@ fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
-  let patient_volume = client.create(&scratch(VOLUME)).unwrap();
-  let impatient_volume = client.create(&scratch(IMPATIENT)).unwrap();
-  write_files(&daemon, VOLUME, FILES_PAST_TERM);
-  write_files(&daemon, IMPATIENT, FILES_PAST_TERM);
+  let reply = Duration::from_nanos(deadlines().reply_ns);
+  let Some(files) = files_to_outlast(&daemon, &mut client, &secret, reply) else {
+    daemon.stop();
+    eprintln!(
+      "SKIP: this disk lands faster than {MOST_FILES} files can outlast the {reply:?} reply deadline"
+    );
+    return;
+  };
+  let (Some(patient_volume), Some(impatient_volume)) = (
+    create_sized(&mut client, VOLUME, files),
+    create_sized(&mut client, IMPATIENT, files),
+  ) else {
+    daemon.stop();
+    return;
+  };
+  write_files(&daemon, VOLUME, files);
+  write_files(&daemon, IMPATIENT, files);
   let (patient_target, impatient_target) = (target_dir(), target_dir());
   let patient_grant = approve(
     &mut client,
@@ -406,7 +505,6 @@ fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
   let mut ended = drive(&mut client, &mut driver, &[patient, impatient]);
   daemon.stop();
 
-  let reply = Duration::from_nanos(deadlines().reply_ns);
   let (impatient_at, impatient_end) = ended.remove(&impatient).expect("the plain call ended");
   let (patient_at, patient_end) = ended.remove(&patient).expect("the patient call ended");
   eprintln!(
@@ -424,5 +522,5 @@ fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
     panic!("the patient landing: {patient_end:?}");
   };
   assert_eq!(outcome.state, "done");
-  assert_eq!(outcome.written, u64::try_from(FILES_PAST_TERM).unwrap());
+  assert_eq!(outcome.written, u64::try_from(files).unwrap());
 }

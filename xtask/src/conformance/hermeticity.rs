@@ -502,7 +502,10 @@ struct Landed {
   landing: u64,
   from_ns: u64,
   until_ns: u64,
-  daemon: u32,
+  /// The ids the daemon's writes are traced under: its threads on Linux (strace `-f` names each event by
+  /// its thread, and the landing runs on a shard thread), its process elsewhere (eslogger names the
+  /// process).
+  writers: Vec<u32>,
 }
 
 /// The wall clock in nanoseconds since the Unix epoch: the clock strace `-ttt` and eslogger stamp with.
@@ -578,6 +581,7 @@ fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<L
     .expect_ok("land (granted)")?
     .json()?;
   let until_ns = wall_ns()?;
+  let writers = threads_of(run.os, daemon_pid)?;
   let written = landed["outcome"]["written"].as_u64().ok_or_else(|| {
     Failure(format!(
       "the granted landing reports no written count: {landed}"
@@ -588,8 +592,31 @@ fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<L
     landing,
     from_ns,
     until_ns,
-    daemon: daemon_pid,
+    writers,
   })
+}
+
+/// The ids `pid`'s events are traced under: on Linux every thread of the process, read from its
+/// `/proc/<pid>/task` while it lives (the daemon's shard threads are made at its start and live to its
+/// end, so the landing's thread is among them); elsewhere the process alone.
+fn threads_of(os: HostOs, pid: u32) -> Result<Vec<u32>, Failure> {
+  if os != HostOs::Linux {
+    return Ok(vec![pid]);
+  }
+  let task = format!("/proc/{pid}/task");
+  let mut threads = Vec::new();
+  for entry in std::fs::read_dir(&task).map_err(|e| Failure(format!("reading {task}: {e}")))? {
+    let entry = entry.map_err(|e| Failure(format!("reading {task}: {e}")))?;
+    if let Ok(thread) = entry.file_name().to_string_lossy().parse::<u32>() {
+      threads.push(thread);
+    }
+  }
+  if !threads.contains(&pid) {
+    return Err(Failure(format!(
+      "{task} does not list the process itself: {threads:?}"
+    )));
+  }
+  Ok(threads)
 }
 
 /// Every path under `target`, relative to it: what is on disk after the landing.
@@ -746,7 +773,20 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     HostOs::Linux => parse_strace_with_cwd(&text, &cwd),
     _ => parse_eslogger(&text),
   };
-  let writers = [landed.daemon];
+  let writers = landed.writers.clone();
+  // The tracer's namespace's mounts (Linux): a write's backing filesystem is known by what is mounted at
+  // its path, never by its spelling (the dump exclusion writes `/proc/self/coredump_filter`; AUD-29-41).
+  let mount_table = match run.os {
+    HostOs::Linux => slates_conformance::trace::parse_mountinfo(
+      &std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| Failure(format!("reading /proc/self/mountinfo: {e}")))?,
+    ),
+    _ => Vec::new(),
+  };
+  let mounts: Vec<slates_conformance::trace::Mount<'_>> = mount_table
+    .iter()
+    .map(|(point, fstype)| slates_conformance::trace::Mount { point, fstype })
+    .collect();
   let policy = Policy {
     target: &target.display().to_string(),
     working_directory: &cwd,
@@ -755,6 +795,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       from_ns: landed.from_ns,
       until_ns: landed.until_ns,
     }),
+    mounts: &mounts,
   };
   let judged = judge(&events, &policy);
   // The anchor's log is the harness's own file: the slates processes write their stderr to a pipe the
@@ -808,8 +849,8 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     format!("the granted target: {}", target.display()),
     format!(
-      "the granted landing {:016x}: daemon pid {}, {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
-      landed.landing, landed.daemon, landed.from_ns, landed.until_ns
+      "the granted landing {:016x}: the daemon's traced ids {:?}, {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
+      landed.landing, landed.writers, landed.from_ns, landed.until_ns
     ),
     format!(
       "volume quota: {size} bytes, derived from {inode_count} peak workload entries × {page}-byte host page"

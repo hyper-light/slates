@@ -2912,10 +2912,9 @@ fn children_of(parent: u32) -> Vec<u32> {
 }
 
 /// What another process of the same user can learn about `pid`'s core dumps, from outside it: its core
-/// size limits (soft, hard), its core filter, and whether its memory-bearing `/proc` files are closed to
-/// that user (a non-dumpable process's `environ` is).
+/// size limits (soft, hard) and its core filter.
 #[cfg(target_os = "linux")]
-fn dump_exposure(pid: u32) -> (String, u32, bool) {
+fn dump_exposure(pid: u32) -> (String, u32) {
   let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
   let core = limits
     .lines()
@@ -2927,20 +2926,15 @@ fn dump_exposure(pid: u32) -> (String, u32, bool) {
     })
     .unwrap();
   let filter = std::fs::read_to_string(format!("/proc/{pid}/coredump_filter")).unwrap();
-  let filter = u32::from_str_radix(filter.trim(), 16).unwrap();
-  let closed = matches!(
-    std::fs::read(format!("/proc/{pid}/environ")),
-    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
-  );
-  (core, filter, closed)
+  (core, u32::from_str_radix(filter.trim(), 16).unwrap())
 }
 
 /// AUD-29-41 (dump exclusion, the real processes). Do: start the anchor, which spawns its daemon, and look
 /// at both from outside, as another process of the same user. Expect: each has a core size limit of 0 soft
-/// and hard, a core filter selecting no mapping class, and its `environ` closed (not dumpable) — so no core
-/// dump, and no same-user reader, can carry the segment or a volume's bytes. Before (Linux container,
-/// 2026-10-01), the anchor ran with the session's limits (`0 unlimited`: the hard limit raisable), the
-/// default filter (`0x23`: anonymous private and shared memory included) and a readable `/proc`.
+/// and hard and a core filter selecting no mapping class — so no core file is written, and a collector's
+/// dump carries none of the segment's or a volume's memory. Before (Linux container, 2026-10-01), the anchor
+/// ran with the session's limits (`0 unlimited`: the hard limit raisable) and the default filter (`0x23`:
+/// anonymous private and shared memory included).
 #[cfg(target_os = "linux")]
 #[test]
 fn the_anchor_and_its_daemon_exclude_themselves_from_core_dumps() {
@@ -2954,17 +2948,13 @@ fn the_anchor_and_its_daemon_exclude_themselves_from_core_dumps() {
     "the anchor supervises one daemon: {daemons:?}"
   );
   for (role, pid) in [("anchor", anchor_pid), ("daemon", daemons[0])] {
-    let (core, filter, closed) = dump_exposure(pid);
-    eprintln!("{role} {pid}: core limit {core}, core filter {filter:#x}, /proc closed {closed}");
+    let (core, filter) = dump_exposure(pid);
+    eprintln!("{role} {pid}: core limit {core}, core filter {filter:#x}");
     assert_eq!(
       core, "0 0",
       "{role}: no core file, and the limit cannot be raised"
     );
     assert_eq!(filter, 0, "{role}: a collector's dump carries no memory");
-    assert!(
-      closed,
-      "{role}: not dumpable, so its memory files are closed to the same user"
-    );
   }
   drop(anchor);
 }

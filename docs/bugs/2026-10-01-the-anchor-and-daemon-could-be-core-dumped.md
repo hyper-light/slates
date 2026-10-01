@@ -28,7 +28,7 @@ absent guarantee, not a leak.
 ## Exact edits
 
 - `crates/cli/src/dumps.rs` (new): `exclude_from_dumps` — `setrlimit(RLIMIT_CORE, 0/0)` on every Unix;
-  on Linux `prctl(PR_SET_DUMPABLE, 0)` and `/proc/self/coredump_filter` = 0 (a procfs control write under a
+  on Linux `/proc/self/coredump_filter` = 0 (a procfs control write under a
   reasoned `structural: allow`). A refused setting is a typed start failure.
 - `crates/cli/src/anchor.rs`, `crates/cli/src/daemon.rs`: called first in `run`, before any private byte
   is mapped or received.
@@ -49,3 +49,23 @@ absent guarantee, not a leak.
   `LocalDumps` can write a full dump. Owed with AUD-29-41.
 - Residency (no pageout) of metadata, rings, records, codec and transport buffers: AUD-29-41's other half.
 - The client processes (SDK hosts) are the user's; they map the shared rings and are outside this change.
+
+## Correction (2026-10-01, the same day)
+
+The first commit (`ac7f582`) also made both processes not dumpable (`prctl(PR_SET_DUMPABLE, 0)`) and wrote
+the core filter after it. Two faults, both found by running the Linux hermeticity suite as a non-root user in
+a container (the GitHub runner's case; every earlier Docker run had been as root):
+
+- **Order.** A non-dumpable process's `/proc/self` files belong to root, so an ordinary user's write to the
+  filter was refused `EACCES` and the anchor refused to start: `slates: cannot exclude this process from core
+  dumps: the core filter was refused (code 13)`. Every non-root Linux start failed.
+- **Scope.** Not dumpable also closes the processes' `/proc` to every other process of the user — the path the
+  conformance harness reaches the segment's descriptor by to issue a grant on Linux
+  (`/proc/<daemon>/environ` refused), where the issuer surface is owed (§4.13, `docs/wip/enrollment.md`). The
+  flag adds no dump content the core limit and filter leave; who may reach the segment is the issuer
+  surface's decision.
+
+The flag is removed; the core limit and the empty filter remain, and the test observes those two. Measured
+again as a non-root user on Linux: the CLI suite 14 + 34 pass, anchor and daemon `0 0` and filter `0x0`. The
+lesson is the one already on record: run a Linux process test as a non-root user before calling it verified.
+

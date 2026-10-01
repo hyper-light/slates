@@ -75,6 +75,81 @@ pub struct Policy<'a> {
   /// The granted landing, which alone may write inside the target: `None` when the lifecycle granted
   /// none, and then any write there is unauthorized.
   pub landing: Option<Landing<'a>>,
+  /// The tracer's mount table: a written path's backing filesystem is its longest-prefix mount's, so a
+  /// write to a kernel control file (`/proc/self/coredump_filter`) is told from a disk write by what is
+  /// mounted there, never by its spelling (audit §9.1). Empty where the tracer names no mounts (macOS).
+  pub mounts: &'a [Mount<'a>],
+}
+
+/// One mount of the tracer's namespace, as the judge needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mount<'a> {
+  /// Where it is mounted, canonical.
+  pub point: &'a str,
+  /// Its filesystem type (`mountinfo`'s field after the separator).
+  pub fstype: &'a str,
+}
+
+/// Format: the filesystems whose files are the kernel's own state presented as files — memory, never a
+/// disk (`proc(5)`, `sysfs(5)`, `cgroups(7)`). A write to one configures the kernel (a core filter, a
+/// cgroup limit) and stores nothing. `pstore` is not one: it persists to firmware storage.
+const KERNEL_VIRTUAL_FILESYSTEMS: &[&str] = &["proc", "sysfs", "cgroup", "cgroup2"];
+
+/// Format: `mountinfo`'s mount-point field, zero-based (`proc(5)`: mount id, parent id, major:minor, root,
+/// mount point, …).
+const MOUNT_POINT_FIELD: usize = 4;
+/// Format: an escape's length — a backslash and three octal digits.
+const ESCAPE_LEN: usize = 4;
+/// Format: the radix of an escape's digits (a digit 8 or 9 fails to parse, and the text is kept as written).
+const ESCAPE_RADIX: u32 = 8;
+
+/// The mounts `mountinfo` (`proc(5)`: `/proc/self/mountinfo`) lists, as (mount point, filesystem type):
+/// the fifth field, with the kernel's octal escapes (`\040` for a space) decoded, and the first field after
+/// the ` - ` separator. A line that does not have both is skipped.
+pub fn parse_mountinfo(text: &str) -> Vec<(String, String)> {
+  text
+    .lines()
+    .filter_map(|line| {
+      let (head, tail) = line.split_once(" - ")?;
+      let point = head.split(' ').nth(MOUNT_POINT_FIELD)?;
+      let fstype = tail.split(' ').next()?;
+      Some((unescape_mount_point(point), fstype.to_owned()))
+    })
+    .collect()
+}
+
+/// Decodes `mountinfo`'s three-digit octal escapes (`\040` space, `\011` tab, `\012` newline, `\134`
+/// backslash); anything else is kept as written.
+fn unescape_mount_point(point: &str) -> String {
+  let bytes = point.as_bytes();
+  let mut out = Vec::with_capacity(bytes.len());
+  let mut at = 0usize;
+  while let Some(byte) = bytes.get(at).copied() {
+    let octal = bytes
+      .get(at.saturating_add(1)..at.saturating_add(ESCAPE_LEN))
+      .filter(|digits| byte == b'\\' && digits.iter().all(u8::is_ascii_digit))
+      .and_then(|digits| u8::from_str_radix(std::str::from_utf8(digits).ok()?, ESCAPE_RADIX).ok());
+    match octal {
+      Some(decoded) => {
+        out.push(decoded);
+        at = at.saturating_add(ESCAPE_LEN);
+      }
+      None => {
+        out.push(byte);
+        at = at.saturating_add(1);
+      }
+    }
+  }
+  String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether `path`'s longest-prefix mount is a kernel virtual filesystem.
+fn on_kernel_virtual_mount(path: &str, mounts: &[Mount<'_>]) -> bool {
+  mounts
+    .iter()
+    .filter(|mount| mount.point == "/" || inside(path, mount.point))
+    .max_by_key(|mount| mount.point.len())
+    .is_some_and(|mount| KERNEL_VIRTUAL_FILESYSTEMS.contains(&mount.fstype))
 }
 
 /// A granted landing as the trace must see it (D-26: "inside a granted target during that landing"): the
@@ -226,6 +301,9 @@ pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
   }
   if let Some(class) = object {
     return Placement::RamOnly(class);
+  }
+  if on_kernel_virtual_mount(path, policy.mounts) {
+    return Placement::RamOnly("a kernel control file (its mount is a kernel virtual filesystem)");
   }
   if path.starts_with(UNRESOLVED_PREFIX) {
     return Placement::Unresolved;
@@ -1281,6 +1359,7 @@ mod tests {
       target: TARGET,
       working_directory: "/scratch/cwd",
       landing: Some(landing()),
+      mounts: &[],
     }
   }
 
@@ -1448,6 +1527,7 @@ mod tests {
       target: "/work/target",
       working_directory: "/scratch",
       landing: Some(landing()),
+      mounts: &[],
     };
     let judged = judge(&parse_strace(&stamped(log)), &policy);
     assert_eq!(judged.inside_target, 3);
@@ -1599,6 +1679,7 @@ not a row
         target: TARGET,
         working_directory: "/scratch/cwd",
         landing,
+        mounts: &[],
       };
       judge(&parse_strace(log), &policy)
     };
@@ -1729,5 +1810,110 @@ not a row
     assert!(inside("/t", "/t/"));
     assert!(!inside("/target/a", "/t"));
     assert!(!inside("/t/a", ""));
+  }
+}
+
+#[cfg(test)]
+mod mount_class_tests {
+  use super::*;
+
+  /// AUD-29-41/42 (golden). Do: parse a `mountinfo` excerpt — a disk root, procfs, a cgroup2 tree, a sysfs,
+  /// a disk mounted beneath `/proc` (escaped space in its point), and a malformed line. Expect: each mount's
+  /// point and type, the escape decoded, the malformed line skipped.
+  #[test]
+  fn mountinfo_yields_each_mount_point_and_its_type() {
+    let text = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+23 22 0:21 / /proc rw,nosuid shared:12 - proc proc rw
+24 22 0:22 / /sys rw,nosuid shared:2 - sysfs sysfs rw
+25 24 0:23 / /sys/fs/cgroup rw shared:4 - cgroup2 cgroup2 rw
+26 23 8:2 / /proc/odd\\040disk rw shared:9 - ext4 /dev/sdb1 rw
+garbage without a separator
+";
+    let mounts = parse_mountinfo(text);
+    let pairs: Vec<(&str, &str)> = mounts
+      .iter()
+      .map(|(p, t)| (p.as_str(), t.as_str()))
+      .collect();
+    assert_eq!(
+      pairs,
+      [
+        ("/", "ext4"),
+        ("/proc", "proc"),
+        ("/sys", "sysfs"),
+        ("/sys/fs/cgroup", "cgroup2"),
+        ("/proc/odd disk", "ext4"),
+      ]
+    );
+  }
+
+  fn write_to(path: &str) -> WriteEvent {
+    WriteEvent {
+      line: 1,
+      call: "write".to_owned(),
+      path: path.to_owned(),
+      descriptor: Some(3),
+      pid: Some(7),
+      at_ns: Some(1),
+    }
+  }
+
+  /// AUD-29-41/42. Do: judge writes to a process's core filter, a cgroup limit, a file on a disk mounted
+  /// beneath `/proc`, a disk path spelled to look like procfs (`/procfoo`), and a disk file, against that
+  /// mount table — and the core filter again with no mount table. Expect: the procfs and cgroup writes are
+  /// kernel control files (their longest-prefix mount is a kernel virtual filesystem); the nested disk, the
+  /// look-alike and the disk file are violations; with no mount table nothing is assumed, and the core
+  /// filter is a violation — the class comes from what is mounted, never from the spelling.
+  #[test]
+  fn a_kernel_control_file_is_known_by_its_mount_never_its_spelling() {
+    let table = [
+      Mount {
+        point: "/",
+        fstype: "ext4",
+      },
+      Mount {
+        point: "/proc",
+        fstype: "proc",
+      },
+      Mount {
+        point: "/sys/fs/cgroup",
+        fstype: "cgroup2",
+      },
+      Mount {
+        point: "/proc/odd disk",
+        fstype: "ext4",
+      },
+    ];
+    let with = |mounts| Policy {
+      target: "/work/target",
+      working_directory: "/work",
+      landing: None,
+      mounts,
+    };
+    let control =
+      Placement::RamOnly("a kernel control file (its mount is a kernel virtual filesystem)");
+    assert_eq!(
+      classify(&write_to("/proc/42/coredump_filter"), &with(&table)),
+      control
+    );
+    assert_eq!(
+      classify(&write_to("/sys/fs/cgroup/slates/memory.max"), &with(&table)),
+      control
+    );
+    for disk in [
+      "/proc/odd disk/f",
+      "/procfoo/coredump_filter",
+      "/home/u/file",
+    ] {
+      assert_eq!(
+        classify(&write_to(disk), &with(&table)),
+        Placement::Outside,
+        "{disk}"
+      );
+    }
+    assert_eq!(
+      classify(&write_to("/proc/42/coredump_filter"), &with(&[])),
+      Placement::Outside
+    );
   }
 }

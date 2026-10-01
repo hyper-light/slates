@@ -921,12 +921,20 @@ mod tests {
     let text = std::fs::read_to_string(&trace).unwrap();
     let cwd = scratch.0.to_str().unwrap();
     let events = parse_strace_with_cwd(&text, cwd);
+    let table = slates_conformance::trace::parse_mountinfo(
+      &std::fs::read_to_string("/proc/self/mountinfo").unwrap(),
+    );
+    let mounts: Vec<slates_conformance::trace::Mount<'_>> = table
+      .iter()
+      .map(|(point, fstype)| slates_conformance::trace::Mount { point, fstype })
+      .collect();
     let judged = judge(
       &events,
       &Policy {
         target: "",
         working_directory: cwd,
         landing: None,
+        mounts: &mounts,
       },
     );
     assert!(

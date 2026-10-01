@@ -124,7 +124,7 @@ Four separate claims follow from it, each needing its own evidence:
    descriptor number (AUD-29-42, 2026-10-01). Owed: the tracer to record reads, pageout and dumps as well as
    writes (audit §9.3); Windows base handles (AUD-29-62).
 2. *No private byte is paged out or dumped.* Dumps: the anchor and the daemon exclude themselves before they
-   hold a byte, or refuse to start — core size limit 0 soft and hard (every Unix), not dumpable and an empty
+   hold a byte, or refuse to start — core size limit 0 soft and hard (every Unix) and an empty
    core filter (Linux), observed from outside the real processes (AUD-29-41 in part, 2026-10-01). Not claimed
    yet: pageout — only a strict create locks the content arena; metadata, rings, logs, completion records,
    codec and transport buffers are pageable; and Windows dump exclusion (WER) is not set (AUD-29-41).
