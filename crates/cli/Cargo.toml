@@ -19,6 +19,8 @@ slates-db = { workspace = true }
 slates-ipc = { workspace = true }
 slates-server = { workspace = true }
 slates-client = { workspace = true }
+# The MCP HTTP edge's bearer token comes from the platform's secure random (AUD-29-24).
+slates-transport = { workspace = true }
 slates-mcp = { workspace = true }
 serde_json = { workspace = true }
 slates-vfs = { workspace = true }

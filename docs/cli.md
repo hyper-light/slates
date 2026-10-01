@@ -292,7 +292,12 @@ drain's markers, the `chokepoints` registry with each chokepoint's `fresh`/`late
 the text form prints and the MCP `slates.status` tool returns.
 `slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
 NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
-loopback Streamable HTTP with `--http PORT`.
+loopback Streamable HTTP with `--http PORT` (macOS and Linux). The HTTP edge serves one endpoint,
+`http://127.0.0.1:PORT/mcp`, and prints a bearer token on the terminal when it starts; the agent sends it
+as `Authorization: Bearer TOKEN` with `Content-Type: application/json` and `Host: 127.0.0.1:PORT`. A
+request from a browser page on another origin, under another host name, or without the token is refused
+before it reaches a tool. Oversized lines, headers and bodies are refused, and a slow or idle connection
+never holds up another.
 
 The merge flow (§4.16): `green NAME` starts a green from scratch, or from a **complete immutable
 base** with `--base VOLUME --snapshot N` — a snapshot of a volume whose whole tree is in memory

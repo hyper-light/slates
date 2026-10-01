@@ -1518,6 +1518,7 @@ dependencies = [
  "slates-mcp",
  "slates-rt",
  "slates-server",
+ "slates-transport",
  "slates-vfs",
  "windows-sys 0.60.2",
 ]
@@ -1628,6 +1629,7 @@ dependencies = [
  "slates-db",
  "slates-ipc",
  "slates-machine",
+ "slates-rt",
  "slates-server",
 ]
 

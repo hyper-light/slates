@@ -3955,6 +3955,13 @@ completion socket/fd; external buffers for zero-copy reads with a copy fallback;
 for listings and streams; `AbortSignal` cancellation; ESM/CJS; the typed addon over the
 client channel.
 
+> **Status (2026-10-01, AUD-29-23/24).** The loopback HTTP edge runs on one slates shard with every
+> bound stated (RFC 9112 line and field limits, the message bound, the client's derived deadline, the
+> daemon's derived `clients_per_shard` connections) and authorizes before dispatch: `Host` and `Origin`
+> must name the loopback edge, the target is `/mcp`, the body `application/json`, and a 128-bit bearer
+> token minted at start is required. Stdio lines share the message bound. Owed: servable roots enrolled
+> by a human (§4.13); the HTTP edge on Windows (the runtime's TCP is macOS/Linux).
+
 **MCP server.** `slates mcp`: stdio and loopback Streamable HTTP; the 2026-07-28 stateless
 protocol with per-request `_meta`, `server/discover`, `resultType`, `ttlMs`/`cacheScope`,
 `subscriptions/listen`; dual-era `initialize` handling for the deprecation window; tools:

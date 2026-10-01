@@ -284,43 +284,95 @@ pub(crate) fn mcp(options: &crate::args::McpOptions) -> Result<(), Failure> {
   let client = connect(&options.instance)?;
   let server = slates_mcp::McpServer::new(client);
   match options.http {
-    Some(port) => serve_mcp_http(server, port),
+    #[cfg(not(windows))]
+    Some(port) => serve_mcp_http(server, port, &options.instance),
+    #[cfg(windows)]
+    Some(_) => Err(Failure::Failed(
+      "mcp http: the loopback HTTP edge is served on macOS and Linux; use stdio on Windows"
+        .to_owned(),
+    )),
     None => serve_mcp_stdio(server),
   }
 }
 
-/// Serves MCP over a loopback Streamable HTTP port (§4.12): the local edge, HTTP/1.1 over loopback.
-fn serve_mcp_http(server: slates_mcp::McpServer, port: u16) -> Result<(), Failure> {
-  let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-    .map_err(|e| Failure::Failed(format!("mcp http bind: {e}")))?;
-  slates_mcp::serve(server, &listener).map_err(|e| Failure::Failed(format!("mcp http: {e}")))
+#[cfg(not(windows))]
+/// Serves MCP over a loopback Streamable HTTP port (§4.12; AUD-29-23, AUD-29-24) on one slates shard. The
+/// shard's shape and the connections served at once are the daemon's own derivation for one shard of this
+/// machine (`clients_per_shard`: every request goes through the one daemon client, so more connections
+/// than a shard admits clients buys nothing); the request deadline is the client's derived reply deadline.
+/// The bearer token is minted from the platform's secure random and shown only on this terminal: the human
+/// who started the edge hands it to their agent.
+fn serve_mcp_http(server: slates_mcp::McpServer, port: u16, instance: &str) -> Result<(), Failure> {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  let mcp =
+    |what: &str, e: &dyn std::fmt::Display| Failure::Failed(format!("mcp http {what}: {e}"));
+  let profile = crate::daemon::measure(true)?;
+  let config = slates_server::config::DaemonConfig::derive(&profile, instance, Some(1));
+  let runtime =
+    slates_rt::runtime::LocalRuntime::new(&config.runtime).map_err(|e| mcp("runtime", &e))?;
+  let backlog = i32::try_from(config.clients_per_shard).unwrap_or(i32::MAX);
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), backlog)
+    .map_err(|e| mcp("bind", &e))?;
+  let bound = listener.local_addr().map_err(|e| mcp("bind", &e))?.port();
+  let mut bearer = [0u8; slates_mcp::http::BEARER_BYTES];
+  slates_transport::handshake::secure_random(&mut bearer).map_err(|e| mcp("token", &e))?;
+  let edge = slates_mcp::http::HttpEdge {
+    port: bound,
+    bearer,
+    deadline_ns: Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS)
+      .get()
+      .reply_ns,
+    connections: config.clients_per_shard,
+  };
+  eprintln!(
+    "slates mcp: http://127.0.0.1:{bound}{} (Authorization: Bearer {})",
+    slates_mcp::http::ENDPOINT_PATH,
+    edge.bearer_hex()
+  );
+  let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+  runtime
+    .spawn(async move {
+      let _ = ended_tx.send(slates_mcp::serve(server, listener, edge).await);
+      // The edge ends only when its listener fails: ask the shard to stop, so `run` returns.
+      if let Some(shard) = slates_rt::futures::shard_id() {
+        let _ = slates_rt::registry::send_control(shard.0, slates_rt::control::Control::Shutdown);
+      }
+    })
+    .map_err(|e| mcp("serve", &e))?;
+  runtime.context().run();
+  match ended_rx.try_recv() {
+    Ok(Err(e)) => Err(mcp("listener", &e)),
+    _ => Ok(()),
+  }
 }
 
 /// Serves MCP over stdio: one JSON-RPC message per line in, its reply per line out, until end of
-/// input. A line that is not valid JSON gets a JSON-RPC parse error, so a malformed message never
-/// stops the server.
+/// input. A line that is not valid JSON, or is past the message bound (`slates_mcp::MAX_MESSAGE_BYTES`,
+/// discarded without being kept), gets a JSON-RPC parse error, so a malformed message never stops the
+/// server.
 fn serve_mcp_stdio(mut server: slates_mcp::McpServer) -> Result<(), Failure> {
-  use std::io::{BufRead, Write};
+  use std::io::Write;
   let stdin = std::io::stdin();
   let mut input = stdin.lock();
   let mut out = std::io::stdout().lock();
-  let mut line = String::new();
   loop {
-    line.clear();
-    let read = input
-      .read_line(&mut line)
-      .map_err(|e| Failure::Failed(e.to_string()))?;
-    if read == 0 {
-      return Ok(()); // end of input
-    }
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+    let read =
+      slates_mcp::read_stdio_line(&mut input).map_err(|e| Failure::Failed(e.to_string()))?;
+    let line = match read {
+      slates_mcp::StdioLine::End => return Ok(()),
+      slates_mcp::StdioLine::TooLong => None,
+      slates_mcp::StdioLine::Message(line) => Some(line),
+    };
+    if line
+      .as_ref()
+      .is_some_and(|line| line.iter().all(u8::is_ascii_whitespace))
+    {
       continue;
     }
-    let reply = match serde_json::from_str::<serde_json::Value>(trimmed) {
-      Ok(request) => server.handle(&request),
-      // Not valid JSON: the protocol crate builds the JSON-RPC parse-error reply.
-      Err(_) => Some(slates_mcp::parse_error_reply()),
+    let reply = match line.map(|line| serde_json::from_slice::<serde_json::Value>(&line)) {
+      Some(Ok(request)) => server.handle(&request),
+      // Not valid JSON, or past the bound: the protocol crate builds the JSON-RPC parse-error reply.
+      Some(Err(_)) | None => Some(slates_mcp::parse_error_reply()),
     };
     if let Some(reply) = reply {
       writeln!(out, "{reply}").map_err(|e| Failure::Failed(e.to_string()))?;

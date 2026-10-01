@@ -42,9 +42,70 @@ use slates_client::{
   VolumeSummary, WorkOp,
 };
 
+// The loopback HTTP edge runs on a slates shard's TCP, which the runtime offers on macOS and Linux (the
+// Windows runtime's sockets are UDP only); Windows serves MCP over stdio.
+#[cfg(not(windows))]
 pub mod http;
 
+#[cfg(not(windows))]
 pub use http::serve;
+
+/// Shape: the largest MCP message accepted on either transport — an HTTP body or a stdio line — a bound on
+/// a hostile or mistaken sender so a message never drives an unbounded allocation (AUD-29-24's stdio
+/// half). 64 MiB is far above any real JSON-RPC message and far below memory pressure.
+pub const MAX_MESSAGE_BYTES: u64 = 64 << 20;
+
+/// What one bounded stdio read produced ([`read_stdio_line`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum StdioLine {
+  /// One message line, its newline removed.
+  Message(Vec<u8>),
+  /// A line past [`MAX_MESSAGE_BYTES`], consumed through its newline and discarded unread.
+  TooLong,
+  /// The end of input.
+  End,
+}
+
+/// Reads one newline-terminated message from `reader`, keeping at most [`MAX_MESSAGE_BYTES`] of it: a
+/// longer line is consumed to its end and answered [`StdioLine::TooLong`], so one oversized message costs
+/// the bound, never its length, and the next line is read whole. A final line without a newline is a
+/// message.
+pub fn read_stdio_line(reader: &mut impl std::io::BufRead) -> std::io::Result<StdioLine> {
+  let cap = usize::try_from(MAX_MESSAGE_BYTES).unwrap_or(usize::MAX);
+  let mut line: Vec<u8> = Vec::new();
+  let mut too_long = false;
+  let mut read_any = false;
+  loop {
+    let available = reader.fill_buf()?;
+    if available.is_empty() {
+      return Ok(match (read_any, too_long) {
+        (false, _) => StdioLine::End,
+        (true, true) => StdioLine::TooLong,
+        (true, false) => StdioLine::Message(line),
+      });
+    }
+    read_any = true;
+    let (chunk, ended) = match available.iter().position(|byte| *byte == b'\n') {
+      Some(at) => (available.get(..at).unwrap_or_default(), Some(at)),
+      None => (available, None),
+    };
+    if !too_long && line.len().saturating_add(chunk.len()) <= cap {
+      line.extend_from_slice(chunk);
+    } else {
+      too_long = true;
+      line = Vec::new();
+    }
+    let consumed = ended.map_or(available.len(), |at| at.saturating_add(1));
+    reader.consume(consumed);
+    if ended.is_some() {
+      return Ok(if too_long {
+        StdioLine::TooLong
+      } else {
+        StdioLine::Message(line)
+      });
+    }
+  }
+}
 
 /// The MCP protocol version this server speaks (the dated revision it targets, §4.12).
 const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -1456,4 +1517,36 @@ fn id_from_hex(text: &str) -> Option<VolumeId> {
     *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, HEX_RADIX).ok()?;
   }
   Some(VolumeId { bytes })
+}
+
+#[cfg(test)]
+mod stdio_tests {
+  use super::*;
+
+  /// AUD-29-24 (the stdio half): do: read a message line, a line one byte past the message bound, then
+  /// another message and a final line without a newline; expect the first and last messages whole, the
+  /// oversized line reported `TooLong` without being kept, and the line after it read whole.
+  #[test]
+  fn an_oversized_stdio_line_is_discarded_and_the_next_read_whole() {
+    let cap = usize::try_from(MAX_MESSAGE_BYTES).unwrap();
+    let mut input = b"{\"a\":1}\n".to_vec();
+    input.extend(std::iter::repeat_n(b'x', cap + 1));
+    input.extend_from_slice(b"\n{\"b\":2}\n{\"c\":3}");
+    let mut reader = std::io::BufReader::new(input.as_slice());
+    let lines: Vec<StdioLine> =
+      std::iter::from_fn(|| match read_stdio_line(&mut reader).unwrap() {
+        StdioLine::End => None,
+        line => Some(line),
+      })
+      .collect();
+    assert_eq!(
+      lines,
+      vec![
+        StdioLine::Message(b"{\"a\":1}".to_vec()),
+        StdioLine::TooLong,
+        StdioLine::Message(b"{\"b\":2}".to_vec()),
+        StdioLine::Message(b"{\"c\":3}".to_vec()),
+      ]
+    );
+  }
 }

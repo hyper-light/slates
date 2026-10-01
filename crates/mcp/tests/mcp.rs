@@ -587,43 +587,196 @@ fn the_mcp_surface_serves_the_tools() {
   assert_attach_base(&mut server);
   assert_land(&mut server);
   assert_malformed(&mut server);
-  assert_http_transport(&instance);
+  assert_http_transport(&profile, &instance);
 
   daemon.stop();
 }
 
-/// The loopback Streamable HTTP transport end to end (§4.12): a real TCP POST of a JSON-RPC message
-/// gets its reply over HTTP/1.1. A second client drives the HTTP server (its own daemon connection),
-/// so this exercises the socket path, not just the in-memory parser.
-fn assert_http_transport(instance: &str) {
-  use std::io::{Read, Write};
-  use std::net::{Ipv4Addr, TcpListener, TcpStream};
+/// Shape: the edge's bearer token in this test (the command mints one from the platform's secure random).
+const TEST_BEARER: [u8; slates_mcp::http::BEARER_BYTES] = [0x5c; slates_mcp::http::BEARER_BYTES];
 
-  let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-  let addr = listener.local_addr().unwrap();
+/// Starts the HTTP edge for `instance` on its own shard thread, as `slates mcp --http` runs it (the runtime
+/// and connection bound derived for one shard of this machine, the client's reply deadline), and returns
+/// the port it listens on. The thread serves until the process ends.
+fn start_http_edge(profile: &MachineProfile, instance: &str) -> u16 {
+  use slates_rt::tcp::{Ipv4Addr, SocketAddrV4, TcpListener};
+  let config = DaemonConfig::derive(profile, instance, Some(1));
   let server = McpServer::new(connect(instance));
-  // The server serves connections until dropped; the test makes one request and closes it. The
-  // accept loop then blocks on the next accept, which the process reaps at test end.
+  let (port_tx, port_rx) = std::sync::mpsc::channel();
   std::thread::spawn(move || {
-    let _ = slates_mcp::serve(server, &listener);
+    let runtime = slates_rt::runtime::LocalRuntime::new(&config.runtime).unwrap();
+    let backlog = i32::try_from(config.clients_per_shard).unwrap();
+    let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), backlog).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let edge = slates_mcp::http::HttpEdge {
+      port,
+      bearer: TEST_BEARER,
+      deadline_ns: Deadlines::derive(
+        slates_server::daemon::LIVENESS_BUDGET_NS,
+        slates_db::replay::RECOVERY_BUDGET_NS,
+      )
+      .get()
+      .reply_ns,
+      connections: config.clients_per_shard,
+    };
+    port_tx.send(port).unwrap();
+    runtime
+      .spawn(async move {
+        let _ = slates_mcp::serve(server, listener, edge).await;
+      })
+      .unwrap();
+    // Serves until the process ends: the edge's own loop, not an idle check (a waiting accept is not idle).
+    runtime.context().run();
   });
+  port_rx.recv().unwrap()
+}
 
-  let mut stream = TcpStream::connect(addr).unwrap();
-  let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
-  let request = format!(
-    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-    body.len(),
-    body,
-  );
-  stream.write_all(request.as_bytes()).unwrap();
+/// One HTTP exchange on a fresh connection: `head` (without the blank line) and `body`; the response.
+fn exchange(port: u16, head: &str, body: &str) -> String {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  stream
+    .write_all(
+      format!(
+        "{head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+      )
+      .as_bytes(),
+    )
+    .unwrap();
   let mut response = String::new();
-  stream.read_to_string(&mut response).unwrap();
-  assert!(
-    response.starts_with("HTTP/1.1 200 OK"),
-    "an HTTP POST gets a 200: {response}"
+  let _ = stream.read_to_string(&mut response);
+  response
+}
+
+/// The head an MCP client sends this edge, with `host`, `origin` and the bearer `token` as given.
+fn mcp_head(port: u16, host: &str, origin: Option<&str>, token: Option<&str>) -> String {
+  let mut head = format!(
+    "POST {} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json",
+    slates_mcp::http::ENDPOINT_PATH
+  );
+  if let Some(origin) = origin {
+    head.push_str(&format!("\r\nOrigin: {origin}"));
+  }
+  if let Some(token) = token {
+    head.push_str(&format!("\r\nAuthorization: Bearer {token}"));
+  }
+  let _ = port;
+  head
+}
+
+/// AUD-29-23 and AUD-29-24 (§4.12, §4.13; R6): the loopback HTTP edge over real sockets. Do: open hostile
+/// connections and leave them open — an unterminated line past the bound, too many headers, a body that
+/// never finishes, an idle kept-alive connection, and one reset mid-head — then, while they are open, send
+/// a valid `initialize`; then send a volume-creating tool call from a foreign origin, under a rebound host
+/// name, and with no token. Expect the oversized heads refused (`414`/`431`), the valid client answered
+/// `200` while the slow and idle connections are still open, and each unauthorized call refused (`403`,
+/// `421`, `401`) with no volume created.
+fn assert_http_transport(profile: &MachineProfile, instance: &str) {
+  use std::io::{Read, Write};
+  let port = start_http_edge(profile, instance);
+  let token: String = TEST_BEARER
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  let ours = format!("127.0.0.1:{port}");
+
+  let long_line = exchange(
+    port,
+    &format!(
+      "POST /{} HTTP/1.1",
+      "a".repeat(slates_mcp::http::MAX_LINE_BYTES)
+    ),
+    "",
+  );
+  assert!(long_line.starts_with("HTTP/1.1 414"), "{long_line}");
+  let many: String = (0..=slates_mcp::http::MAX_FIELDS)
+    .map(|at| format!("\r\nX-{at}: v"))
+    .collect();
+  let many_headers = exchange(
+    port,
+    &format!("{}{many}", mcp_head(port, &ours, None, Some(&token))),
+    "{}",
+  );
+  assert!(many_headers.starts_with("HTTP/1.1 431"), "{many_headers}");
+
+  // Held open while the valid client runs: a body that never finishes, an idle connection, a reset one.
+  let mut slow = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  slow
+    .write_all(
+      format!(
+        "{}\r\nContent-Length: 64\r\n\r\n{{",
+        mcp_head(port, &ours, None, Some(&token))
+      )
+      .as_bytes(),
+    )
+    .unwrap();
+  let idle = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let mut reset = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  reset.write_all(b"POST /mcp HTTP/1.1\r\nHo").unwrap();
+  drop(reset);
+
+  let valid = exchange(
+    port,
+    &mcp_head(port, &ours, Some(&format!("http://{ours}")), Some(&token)),
+    r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
   );
   assert!(
-    response.contains("\"protocolVersion\":\"2026-07-28\""),
-    "the initialize result rides the HTTP body: {response}"
+    valid.starts_with("HTTP/1.1 200 OK"),
+    "a valid client is served: {valid}"
   );
+  assert!(
+    valid.contains("\"protocolVersion\":\"2026-07-28\""),
+    "{valid}"
+  );
+
+  assert_unauthorized_calls_have_no_effect(port, instance, &token);
+
+  // The slow and idle connections were still open throughout; the valid client was not held behind them.
+  let mut probe = [0u8; 1];
+  slow.set_nonblocking(true).unwrap();
+  assert!(
+    matches!(slow.read(&mut probe), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+    "the slow connection is still open, unanswered"
+  );
+  drop(idle);
+}
+
+/// AUD-29-24: a volume-creating tool call from a foreign origin, under a rebound host name and without the
+/// token is refused with its status, and no such volume exists afterwards.
+fn assert_unauthorized_calls_have_no_effect(port: u16, instance: &str, token: &str) {
+  let ours = format!("127.0.0.1:{port}");
+  let create = |name: &str| {
+    format!(
+      r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"slates.volume.create","arguments":{{"name":"{name}","size":"1MiB"}}}}}}"#
+    )
+  };
+  let refusals = [
+    (
+      "foreign-origin",
+      mcp_head(port, &ours, Some("https://evil.example"), Some(token)),
+      "403",
+    ),
+    (
+      "rebound-host",
+      mcp_head(port, &format!("rebound.example:{port}"), None, Some(token)),
+      "421",
+    ),
+    ("unbound", mcp_head(port, &ours, None, None), "401"),
+  ];
+  for (name, head, status) in &refusals {
+    let response = exchange(port, head, &create(name));
+    assert!(
+      response.starts_with(&format!("HTTP/1.1 {status}")),
+      "{name}: {response}"
+    );
+  }
+  let mut checker = McpServer::new(connect(instance));
+  let listed = call(&mut checker, "slates.volume.list", json!({}));
+  for (name, _, _) in &refusals {
+    assert!(
+      !listed.to_string().contains(name),
+      "{name}: a refused call has no effect: {listed}"
+    );
+  }
 }

@@ -1,252 +1,670 @@
 //! The MCP loopback Streamable HTTP transport (§4.12). A minimal HTTP/1.1 server: the agent POSTs a
-//! JSON-RPC message and gets the reply as `application/json`; a notification (no reply) gets `202
-//! Accepted`. This is the same-machine *edge* — one agent to its local daemon — so it is HTTP/1.1
-//! over loopback, not QUIC: QUIC's wide-area properties (migration, 0-RTT, per-stream multiplexing)
-//! belong to the fleet transport (daemon↔daemon, §4.10), where the scale is, and are wasted on a
-//! loopback edge that must anyway speak what MCP clients speak. The parsing is bounds-checked against
-//! a hostile `Content-Length` before any allocation; there is no server-initiated stream, so `GET`
-//! (the SSE channel) is answered `405` — the stateless profile the design names.
+//! JSON-RPC message to the one MCP endpoint and gets the reply as `application/json`; a notification (no
+//! reply) gets `202 Accepted`. This is the same-machine *edge* — one agent to its local daemon — so it is
+//! HTTP/1.1 over loopback, not QUIC: QUIC's wide-area properties belong to the fleet transport (§4.10),
+//! and are wasted on a loopback edge that must anyway speak what MCP clients speak. There is no
+//! server-initiated stream, so `GET` (the SSE channel) is answered `405` — the stateless profile the design
+//! names.
+//!
+//! **Bounded, owned connections on the runtime (AUD-29-23).** The edge runs on one slates shard
+//! ([`serve`]): the listener's accept loop and every connection are tasks on it, so an idle or slow client
+//! waits on the driver, never on the thread, and another client is accepted and served meanwhile. Every
+//! bound is stated:
+//! - a request line or header line past [`MAX_LINE_BYTES`] (RFC 9112 §3's recommended minimum support) is
+//!   refused `431` or `414`, a head past [`MAX_FIELDS`] fields `431`, a body past [`MAX_BODY`] `413`, each
+//!   before the bytes are kept;
+//! - contradictory framing is refused `400` (two `Content-Length` values, any `Transfer-Encoding` — RFC 9112
+//!   §6.1/§6.3: this edge does not take chunked bodies), a POST with no length `411`;
+//! - each request, and each wait for the next on a kept-alive connection, is bounded by the edge's
+//!   deadline ([`HttpEdge::deadline_ns`], the client's derived reply deadline: a loopback peer slower than the
+//!   daemon's liveness budget is presumed gone);
+//! - the connections served at once are bounded by [`HttpEdge::connections`]; one past it is answered `503`
+//!   and closed at once.
+//!
+//! A connection's failure — a reset, a truncated body, a deadline — ends that connection only; the
+//! listener keeps serving. Until 2026-10-01 this edge read with unbounded `read_line`s, served one
+//! connection at a time for its whole keep-alive life, and ended the server on any connection's I/O error.
+//!
+//! **The caller's authority, before any dispatch (AUD-29-24).** A loopback bind does not identify the
+//! caller: a web page in the user's browser can POST to `127.0.0.1`, and a DNS-rebound host can reach it
+//! by name. So every request must name this edge — `Host` the loopback address and port it listens on
+//! (a rebound name is refused `421`), `Origin`, when a browser sends one, the same loopback origin (the
+//! MCP transport specification's "servers MUST validate the Origin header"; refused `403`), the request
+//! target the one MCP endpoint ([`ENDPOINT_PATH`]; `404`), `Content-Type: application/json` (`415`: a
+//! page cannot send it without a CORS preflight, which this edge never grants) — and carry the edge's
+//! bearer token (`Authorization: Bearer`, [`BEARER_BYTES`] from the platform's secure random, minted when
+//! the edge starts and shown only to the human who started it; `401`). The token is compared in constant
+//! time. No grant verb exists on this surface (R10). Owed: the servable roots a human enrolls (§4.13).
 
-use std::io::{BufRead, Write};
-use std::net::TcpListener;
+use std::cell::{Cell, RefCell};
 
 use serde_json::Value;
+use slates_rt::futures::{detach, spawn_child, within};
+use slates_rt::shard::Kept;
+use slates_rt::tcp::{TcpListener, TcpStream};
 
 use crate::McpServer;
 
-/// Shape: the largest HTTP request body accepted, a bound on a hostile or mistaken `Content-Length`
-/// so a wild length never drives an allocation. 64 MiB is far above any real JSON-RPC message and far
-/// below memory pressure; a larger body is refused `413` rather than read.
-const MAX_BODY: u64 = 64 << 20;
+/// The largest HTTP request body accepted: the one message bound both transports keep
+/// ([`crate::MAX_MESSAGE_BYTES`]); a larger body is refused `413` rather than read.
+pub const MAX_BODY: u64 = crate::MAX_MESSAGE_BYTES;
 
-/// One parsed HTTP/1.1 request: the method, the body, and whether the connection is kept alive.
-struct HttpRequest {
-  method: String,
-  body: Vec<u8>,
-  keep_alive: bool,
-  too_large: bool,
+/// Format: the longest request line or header field line accepted — RFC 9112 §3: "It is RECOMMENDED that
+/// all HTTP senders and recipients support, at a minimum, request-line lengths of 8000 octets", the same
+/// bound applied to each field line.
+pub const MAX_LINE_BYTES: usize = 8000;
+
+/// Format: the most header fields accepted in one request — Apache httpd's `LimitRequestFields` default
+/// (tier C). An MCP request carries about ten (Host, Origin, Content-Type, Content-Length, Accept,
+/// Authorization, MCP-Protocol-Version, Connection, User-Agent).
+pub const MAX_FIELDS: usize = 100;
+
+/// Format: the one request target the edge serves (the MCP Streamable HTTP transport's single endpoint).
+pub const ENDPOINT_PATH: &str = "/mcp";
+
+/// Format: the bearer token's length — 128 bits, as every capability token slates mints (§4.13: "ids are
+/// random 128-bit values").
+pub const BEARER_BYTES: usize = 16;
+
+/// Format: the blank line that ends an HTTP/1.1 request head (RFC 9112 §2.1).
+const HEAD_END: &[u8] = b"\r\n\r\n";
+
+/// Derived: the most bytes a request head can hold — every field line at its bound, plus the request line.
+const MAX_HEAD_BYTES: usize = MAX_LINE_BYTES * (MAX_FIELDS + 1);
+
+/// What the edge enforces, fixed when it starts.
+#[derive(Clone, Debug)]
+pub struct HttpEdge {
+  /// The loopback port the listener is bound to — what `Host` and `Origin` must name.
+  pub port: u16,
+  /// The bearer token every request must carry.
+  pub bearer: [u8; BEARER_BYTES],
+  /// The bound on one request's arrival and on a kept-alive connection's wait for the next.
+  pub deadline_ns: u64,
+  /// The connections served at once.
+  pub connections: usize,
 }
 
-/// Serves MCP over one accepted connection until the peer closes it (§4.12). Each request is read,
-/// dispatched, and answered in turn; the connection is kept alive unless the peer asks to close.
-pub fn serve_connection(
-  server: &mut McpServer,
-  stream: &mut (impl BufRead + Write),
-) -> std::io::Result<()> {
-  loop {
-    let Some(request) = read_request(stream)? else {
-      return Ok(()); // the peer closed the connection
-    };
-    let keep_alive = request.keep_alive && !request.too_large;
-    respond(server, &request, stream)?;
-    stream.flush()?;
-    if !keep_alive {
-      return Ok(());
+impl HttpEdge {
+  /// The bearer token as it travels: lowercase hex.
+  pub fn bearer_hex(&self) -> String {
+    self
+      .bearer
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect()
+  }
+}
+
+/// One parsed request head: its method, target and the fields the edge reads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Head {
+  /// The method.
+  pub method: String,
+  /// The request target.
+  pub target: String,
+  /// The body's length, when given.
+  pub content_length: Option<u64>,
+  /// Whether the connection is kept alive after this request.
+  pub keep_alive: bool,
+  /// The `Host` field, when exactly one was given.
+  pub host: Option<String>,
+  /// How many `Host` fields were given.
+  pub hosts: usize,
+  /// The `Origin` field, when given.
+  pub origin: Option<String>,
+  /// The `Content-Type` field, when given.
+  pub content_type: Option<String>,
+  /// The `Authorization` field, when given.
+  pub authorization: Option<String>,
+}
+
+/// Why a request is refused, as the status it is answered with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refused {
+  /// `400 Bad Request`: malformed or contradictory framing, or a missing or repeated `Host`.
+  BadRequest,
+  /// `401 Unauthorized`: no bearer token, or the wrong one.
+  Unauthorized,
+  /// `403 Forbidden`: a foreign `Origin`.
+  Forbidden,
+  /// `404 Not Found`: a target other than the MCP endpoint.
+  NotFound,
+  /// `405 Method Not Allowed`: anything but `POST`.
+  MethodNotAllowed,
+  /// `411 Length Required`: a POST with no `Content-Length`.
+  LengthRequired,
+  /// `413 Content Too Large`: a body past [`MAX_BODY`].
+  TooLarge,
+  /// `414 URI Too Long`: a request line past [`MAX_LINE_BYTES`].
+  UriTooLong,
+  /// `415 Unsupported Media Type`: a body that is not `application/json`.
+  UnsupportedMediaType,
+  /// `421 Misdirected Request`: a `Host` that is not this edge.
+  Misdirected,
+  /// `431 Request Header Fields Too Large`: a field line or the head past its bound.
+  HeadersTooLarge,
+  /// `503 Service Unavailable`: every connection slot is in use.
+  Unavailable,
+}
+
+impl Refused {
+  /// The status line's code and reason.
+  fn status(self) -> &'static str {
+    match self {
+      Refused::BadRequest => "400 Bad Request",
+      Refused::Unauthorized => "401 Unauthorized",
+      Refused::Forbidden => "403 Forbidden",
+      Refused::NotFound => "404 Not Found",
+      Refused::MethodNotAllowed => "405 Method Not Allowed",
+      Refused::LengthRequired => "411 Length Required",
+      Refused::TooLarge => "413 Content Too Large",
+      Refused::UriTooLong => "414 URI Too Long",
+      Refused::UnsupportedMediaType => "415 Unsupported Media Type",
+      Refused::Misdirected => "421 Misdirected Request",
+      Refused::HeadersTooLarge => "431 Request Header Fields Too Large",
+      Refused::Unavailable => "503 Service Unavailable",
     }
   }
 }
 
-/// Accepts loopback connections and serves each in turn (§4.12). Single-threaded: one agent per MCP
-/// server, so connections serialize — the daemon, not this edge, is where many agents fan out (§4.7).
-pub fn serve(mut server: McpServer, listener: &TcpListener) -> std::io::Result<()> {
-  for stream in listener.incoming() {
-    let stream = stream?;
-    let mut buffered = std::io::BufReader::new(stream);
-    // `serve_connection` needs Write; wrap so reads are buffered and writes reach the same stream.
-    let mut duplex = Duplex {
-      reader: &mut buffered,
-    };
-    serve_connection(&mut server, &mut duplex)?;
+/// Parses a request head (the bytes before the blank line, without it): the request line and every field
+/// line, each within [`MAX_LINE_BYTES`], at most [`MAX_FIELDS`] fields, the framing consistent.
+pub fn parse_head(head: &[u8]) -> Result<Head, Refused> {
+  let text = std::str::from_utf8(head).map_err(|_| Refused::BadRequest)?;
+  let mut lines = text.split("\r\n");
+  let request_line = lines.next().ok_or(Refused::BadRequest)?;
+  if request_line.len() > MAX_LINE_BYTES {
+    return Err(Refused::UriTooLong);
+  }
+  let mut parts = request_line.split(' ');
+  let (Some(method), Some(target), Some(version), None) =
+    (parts.next(), parts.next(), parts.next(), parts.next())
+  else {
+    return Err(Refused::BadRequest);
+  };
+  if !version.starts_with("HTTP/1.") || method.is_empty() || target.is_empty() {
+    return Err(Refused::BadRequest);
+  }
+  let mut parsed = Head {
+    method: method.to_owned(),
+    target: target.to_owned(),
+    keep_alive: version == "HTTP/1.1",
+    ..Head::default()
+  };
+  let mut fields = 0usize;
+  for line in lines {
+    if line.len() > MAX_LINE_BYTES {
+      return Err(Refused::HeadersTooLarge);
+    }
+    fields = fields.saturating_add(1);
+    if fields > MAX_FIELDS {
+      return Err(Refused::HeadersTooLarge);
+    }
+    read_field(&mut parsed, line)?;
+  }
+  Ok(parsed)
+}
+
+/// Reads one field line into `head`.
+fn read_field(head: &mut Head, line: &str) -> Result<(), Refused> {
+  let (name, value) = line.split_once(':').ok_or(Refused::BadRequest)?;
+  if name.is_empty() || name.ends_with(' ') || name.ends_with('\t') {
+    return Err(Refused::BadRequest); // RFC 9112 §5.1: no whitespace before the colon
+  }
+  let value = value.trim_matches([' ', '\t']).to_owned();
+  match name.to_ascii_lowercase().as_str() {
+    "content-length" => {
+      if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(Refused::BadRequest);
+      }
+      let length: u64 = value.parse().map_err(|_| Refused::TooLarge)?;
+      if head.content_length.is_some_and(|earlier| earlier != length) {
+        return Err(Refused::BadRequest);
+      }
+      head.content_length = Some(length);
+    }
+    "transfer-encoding" => return Err(Refused::BadRequest),
+    "connection" => {
+      for token in value.split(',').map(str::trim) {
+        if token.eq_ignore_ascii_case("close") {
+          head.keep_alive = false;
+        } else if token.eq_ignore_ascii_case("keep-alive") {
+          head.keep_alive = true;
+        }
+      }
+    }
+    "host" => {
+      head.hosts = head.hosts.saturating_add(1);
+      head.host = Some(value);
+    }
+    "origin" => head.origin = Some(value),
+    "content-type" => head.content_type = Some(value),
+    "authorization" => head.authorization = Some(value),
+    _ => {}
   }
   Ok(())
 }
 
-/// A read+write view over a buffered `TcpStream`: reads come from the buffer, writes go to the inner
-/// stream (a `TcpStream` is written through its shared handle).
-struct Duplex<'a> {
-  reader: &'a mut std::io::BufReader<std::net::TcpStream>,
+/// The loopback authorities this edge answers to on `port`, as a `Host` names them.
+fn loopback_hosts(port: u16) -> [String; 3] {
+  [
+    format!("127.0.0.1:{port}"),
+    format!("localhost:{port}"),
+    format!("[::1]:{port}"),
+  ]
 }
 
-impl std::io::Read for Duplex<'_> {
-  fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-    self.reader.read(buf)
+/// Whether `token` equals the edge's bearer, compared in time independent of where they differ.
+fn bearer_matches(edge: &HttpEdge, token: &str) -> bool {
+  let expected = edge.bearer_hex();
+  if token.len() != expected.len() {
+    return false;
+  }
+  token
+    .bytes()
+    .zip(expected.bytes())
+    .fold(0u8, |difference, (got, want)| difference | (got ^ want))
+    == 0
+}
+
+/// Decides whether `head` may reach the MCP server at all (AUD-29-24): the endpoint, the method, `Host`,
+/// `Origin`, the media type, the bearer token and the framing — before any body is read or dispatched.
+pub fn authorize(edge: &HttpEdge, head: &Head) -> Result<(), Refused> {
+  let hosts = loopback_hosts(edge.port);
+  match (&head.host, head.hosts) {
+    (Some(host), 1) => {
+      if !hosts.iter().any(|ours| ours.eq_ignore_ascii_case(host)) {
+        return Err(Refused::Misdirected);
+      }
+    }
+    _ => return Err(Refused::BadRequest), // RFC 9112 §3.2: exactly one Host
+  }
+  if let Some(origin) = &head.origin
+    && !hosts
+      .iter()
+      .any(|ours| origin.eq_ignore_ascii_case(&format!("http://{ours}")))
+  {
+    return Err(Refused::Forbidden);
+  }
+  if head.target != ENDPOINT_PATH {
+    return Err(Refused::NotFound);
+  }
+  if head.method != "POST" {
+    return Err(Refused::MethodNotAllowed);
+  }
+  let token = head
+    .authorization
+    .as_deref()
+    .and_then(|value| value.strip_prefix("Bearer "));
+  if !token.is_some_and(|token| bearer_matches(edge, token.trim())) {
+    return Err(Refused::Unauthorized);
+  }
+  let json = head.content_type.as_deref().is_some_and(|value| {
+    value
+      .split(';')
+      .next()
+      .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+  });
+  if !json {
+    return Err(Refused::UnsupportedMediaType);
+  }
+  match head.content_length {
+    None => Err(Refused::LengthRequired),
+    Some(length) if length > MAX_BODY => Err(Refused::TooLarge),
+    Some(_) => Ok(()),
   }
 }
 
-impl BufRead for Duplex<'_> {
-  fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
-    self.reader.fill_buf()
-  }
-  fn consume(&mut self, amt: usize) {
-    self.reader.consume(amt);
-  }
+/// What the edge shares among its tasks on its shard: the MCP server (one daemon client) and the
+/// connections being served.
+struct Shared {
+  server: RefCell<McpServer>,
+  serving: Cell<usize>,
 }
 
-impl Write for Duplex<'_> {
-  fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-    self.reader.get_mut().write(buf)
-  }
-  fn flush(&mut self) -> std::io::Result<()> {
-    self.reader.get_mut().flush()
-  }
-}
-
-/// Reads one HTTP/1.1 request: the request line, the headers, and the body named by `Content-Length`.
-/// Returns `None` at a clean end of input. A `Content-Length` beyond [`MAX_BODY`] sets `too_large` and
-/// the body is not read (the caller answers `413`).
-fn read_request(reader: &mut impl BufRead) -> std::io::Result<Option<HttpRequest>> {
-  let mut line = String::new();
-  if reader.read_line(&mut line)? == 0 {
-    return Ok(None);
-  }
-  let method = line.split_whitespace().next().unwrap_or("").to_owned();
-  let mut content_length: u64 = 0;
-  // HTTP/1.1 keeps the connection alive unless the peer says otherwise.
-  let mut keep_alive = true;
+/// Serves MCP on `listener` under `edge` until the listener fails (§4.12). Runs on the calling thread's
+/// slates shard: the caller drives it to completion on a [`slates_rt::runtime::LocalRuntime`] built from the
+/// edge's derived runtime configuration. Each connection is its own task; a refusal or failure ends that
+/// connection, never the listener.
+pub async fn serve(
+  server: McpServer,
+  listener: TcpListener,
+  edge: HttpEdge,
+) -> Result<(), slates_rt::error::RtError> {
+  let shared = slates_rt::registry::with_current(|context| {
+    context.keep(Shared {
+      server: RefCell::new(server),
+      serving: Cell::new(0),
+    })
+  })
+  .ok_or(slates_rt::error::RtError::NotOnShardThread)??;
   loop {
-    let mut header = String::new();
-    if reader.read_line(&mut header)? == 0 {
-      break;
+    let stream = listener.accept().await?;
+    let admitted = shared
+      .with(|shared| {
+        let serving = shared.serving.get();
+        let admit = serving < edge.connections;
+        if admit {
+          shared.serving.set(serving.saturating_add(1));
+        }
+        admit
+      })
+      .unwrap_or(false);
+    if !admitted {
+      let _ = write_refusal(&stream, Refused::Unavailable).await;
+      continue;
     }
-    let header = header.trim_end();
-    if header.is_empty() {
-      break; // the blank line ends the headers
-    }
-    if let Some((name, value)) = header.split_once(':') {
-      let name = name.trim().to_ascii_lowercase();
-      let value = value.trim();
-      if name == "content-length" {
-        content_length = value.parse().unwrap_or(0);
-      } else if name == "connection" && value.eq_ignore_ascii_case("close") {
-        keep_alive = false;
+    let connection_edge = edge.clone();
+    let spawned = spawn_child(async move {
+      serve_connection(&stream, shared, &connection_edge).await;
+      let _ = shared.with(|shared| shared.serving.set(shared.serving.get().saturating_sub(1)));
+    });
+    match spawned {
+      Ok(task) => {
+        let _ = detach(task);
+      }
+      Err(_) => {
+        let _ = shared.with(|shared| shared.serving.set(shared.serving.get().saturating_sub(1)));
       }
     }
   }
-  if content_length > MAX_BODY {
-    return Ok(Some(HttpRequest {
-      method,
-      body: Vec::new(),
-      keep_alive,
-      too_large: true,
-    }));
-  }
-  // `content_length <= MAX_BODY` (64 MiB) fits usize on every supported target.
-  let mut body = vec![0u8; usize::try_from(content_length).unwrap_or(0)];
-  reader.read_exact(&mut body)?;
-  Ok(Some(HttpRequest {
-    method,
-    body,
-    keep_alive,
-    too_large: false,
-  }))
 }
 
-/// Dispatches one request and writes its HTTP response. `POST` carries a JSON-RPC message (a single
-/// reply as `application/json`, or `202 Accepted` for a notification, or a JSON-RPC parse error for
-/// non-JSON); `GET` (the SSE channel) is `405` — this server initiates no stream; anything else `405`.
-fn respond(
-  server: &mut McpServer,
-  request: &HttpRequest,
-  writer: &mut impl Write,
-) -> std::io::Result<()> {
-  if request.too_large {
-    return write_status(writer, "413 Payload Too Large", request.keep_alive);
-  }
-  if request.method != "POST" {
-    return write_status(writer, "405 Method Not Allowed", request.keep_alive);
-  }
-  match serde_json::from_slice::<Value>(&request.body) {
-    Ok(message) => match server.handle(&message) {
-      Some(reply) => write_json(writer, &reply, request.keep_alive),
-      None => write_status(writer, "202 Accepted", request.keep_alive),
-    },
-    // A body that is not JSON is a JSON-RPC parse error, carried in a 200 body (a transport success).
-    Err(_) => write_json(writer, &crate::parse_error_reply(), request.keep_alive),
+/// Serves one connection until the peer closes it, a request is refused, or a deadline passes.
+async fn serve_connection(stream: &TcpStream, shared: Kept<Shared>, edge: &HttpEdge) {
+  let mut pending: Vec<u8> = Vec::new();
+  loop {
+    let request = within(edge.deadline_ns, read_request(stream, &mut pending, edge)).await;
+    let (head, body) = match request {
+      Ok(Some(Ok(Some(request)))) => request,
+      Ok(Some(Err(refused))) => {
+        let _ = write_refusal(stream, refused).await;
+        return;
+      }
+      // The peer closed, the deadline passed, the read failed, or the timer could not be armed.
+      _ => return,
+    };
+    let reply = shared
+      .with(|shared| {
+        let Ok(mut server) = shared.server.try_borrow_mut() else {
+          return None;
+        };
+        Some(dispatch(&mut server, &body))
+      })
+      .flatten();
+    let Some(reply) = reply else {
+      let _ = write_refusal(stream, Refused::Unavailable).await;
+      return;
+    };
+    if stream
+      .write_all(&response(reply, head.keep_alive))
+      .await
+      .is_err()
+      || !head.keep_alive
+    {
+      return;
+    }
   }
 }
 
-/// Writes a `200 OK` with a JSON body.
-fn write_json(writer: &mut impl Write, value: &Value, keep_alive: bool) -> std::io::Result<()> {
-  let body = value.to_string();
-  write!(
-    writer,
-    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {}\r\n\r\n",
-    body.len(),
-    connection(keep_alive),
-  )?;
-  writer.write_all(body.as_bytes())
+/// Reads one request off `stream` — the head, then its body — keeping any bytes past it in `pending` for
+/// the next. `Ok(None)` when the peer closed before a request began; `Err` when it is refused.
+async fn read_request(
+  stream: &TcpStream,
+  pending: &mut Vec<u8>,
+  edge: &HttpEdge,
+) -> Result<Option<(Head, Vec<u8>)>, Refused> {
+  let head_end = loop {
+    if let Some(at) = pending
+      .windows(HEAD_END.len())
+      .position(|window| window == HEAD_END)
+    {
+      break at;
+    }
+    if pending.len() > MAX_HEAD_BYTES || line_too_long(pending) {
+      return Err(head_overflow(pending));
+    }
+    if !fill(stream, pending).await {
+      return if pending.is_empty() {
+        Ok(None)
+      } else {
+        Err(Refused::BadRequest) // a truncated head
+      };
+    }
+  };
+  let head = parse_head(pending.get(..head_end).unwrap_or_default())?;
+  authorize(edge, &head)?;
+  let body_len =
+    usize::try_from(head.content_length.unwrap_or(0)).map_err(|_| Refused::TooLarge)?;
+  let body_start = head_end.saturating_add(HEAD_END.len());
+  let body_end = body_start.saturating_add(body_len);
+  while pending.len() < body_end {
+    if !fill(stream, pending).await {
+      return Err(Refused::BadRequest); // a truncated body
+    }
+  }
+  let body = pending
+    .get(body_start..body_end)
+    .unwrap_or_default()
+    .to_vec();
+  pending.drain(..body_end);
+  Ok(Some((head, body)))
 }
 
-/// Writes a status-only response (no body).
-fn write_status(writer: &mut impl Write, status: &str, keep_alive: bool) -> std::io::Result<()> {
-  write!(
-    writer,
-    "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: {}\r\n\r\n",
-    connection(keep_alive),
-  )
+/// Whether the line still being read in `pending` (after its last line break) is past its bound.
+fn line_too_long(pending: &[u8]) -> bool {
+  let start = pending
+    .windows(2)
+    .rposition(|window| window == b"\r\n")
+    .map_or(0, |at| at.saturating_add(2));
+  pending.len().saturating_sub(start) > MAX_LINE_BYTES
 }
 
-/// The `Connection` header value for whether the connection is kept alive.
-fn connection(keep_alive: bool) -> &'static str {
-  if keep_alive { "keep-alive" } else { "close" }
+/// The refusal for a head that outgrew its bounds: the request line, or the fields.
+fn head_overflow(pending: &[u8]) -> Refused {
+  if pending.windows(2).any(|window| window == b"\r\n") {
+    Refused::HeadersTooLarge
+  } else {
+    Refused::UriTooLong
+  }
+}
+
+/// Reads what the peer has sent into `pending`; `false` at end of stream or on a read failure.
+async fn fill(stream: &TcpStream, pending: &mut Vec<u8>) -> bool {
+  let mut buffer = [0u8; MAX_LINE_BYTES];
+  match stream.read(&mut buffer).await {
+    Ok(0) | Err(_) => false,
+    Ok(read) => {
+      pending.extend_from_slice(buffer.get(..read).unwrap_or_default());
+      true
+    }
+  }
+}
+
+/// Dispatches one JSON-RPC body: the reply, or `None` for a notification. A body that is not JSON draws
+/// the JSON-RPC parse error.
+fn dispatch(server: &mut McpServer, body: &[u8]) -> Option<Value> {
+  match serde_json::from_slice::<Value>(body) {
+    Ok(message) => server.handle(&message),
+    Err(_) => Some(crate::parse_error_reply()),
+  }
+}
+
+/// The response bytes for a dispatched request: `200` with the JSON reply, or `202` for a notification.
+fn response(reply: Option<Value>, keep_alive: bool) -> Vec<u8> {
+  let connection = if keep_alive { "keep-alive" } else { "close" };
+  match reply {
+    Some(value) => {
+      let body = value.to_string();
+      format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+         {connection}\r\n\r\n{body}",
+        body.len()
+      )
+      .into_bytes()
+    }
+    None => {
+      format!("HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: {connection}\r\n\r\n")
+        .into_bytes()
+    }
+  }
+}
+
+/// Answers a refusal and closes: the status, and for `401` the challenge naming the scheme.
+async fn write_refusal(
+  stream: &TcpStream,
+  refused: Refused,
+) -> Result<(), slates_rt::error::RtError> {
+  let challenge = if refused == Refused::Unauthorized {
+    "WWW-Authenticate: Bearer\r\n"
+  } else {
+    ""
+  };
+  let text = format!(
+    "HTTP/1.1 {}\r\n{challenge}Content-Length: 0\r\nConnection: close\r\n\r\n",
+    refused.status()
+  );
+  stream.write_all(text.as_bytes()).await
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::io::Cursor;
 
-  /// A `POST` body round-trips to the parsed request; the method, keep-alive and body are read.
-  #[test]
-  fn a_post_request_parses() {
-    let raw = "POST / HTTP/1.1\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
-    let mut reader = Cursor::new(raw.as_bytes());
-    let request = read_request(&mut reader).unwrap().unwrap();
-    assert_eq!(request.method, "POST");
-    assert!(request.keep_alive);
-    assert!(!request.too_large);
-    assert_eq!(request.body, b"{\"a\":1}");
+  fn edge() -> HttpEdge {
+    HttpEdge {
+      port: 7000,
+      bearer: [0xab; BEARER_BYTES],
+      deadline_ns: 1,
+      connections: 1,
+    }
   }
 
-  /// `Connection: close` is honored; a clean end of input yields `None`.
+  /// A head as an MCP client sends it, with `extra` field lines appended.
+  fn head_with(extra: &[&str]) -> String {
+    let mut lines = vec![
+      "POST /mcp HTTP/1.1".to_owned(),
+      "Host: 127.0.0.1:7000".to_owned(),
+      "Content-Type: application/json".to_owned(),
+      "Content-Length: 2".to_owned(),
+      format!("Authorization: Bearer {}", edge().bearer_hex()),
+    ];
+    lines.extend(extra.iter().map(|line| (*line).to_owned()));
+    lines.join("\r\n")
+  }
+
+  fn decided(raw: &str) -> Result<(), Refused> {
+    parse_head(raw.as_bytes()).and_then(|head| authorize(&edge(), &head))
+  }
+
+  /// AUD-29-24: do: authorize an MCP client's request, then the same with each authority defect — a
+  /// foreign origin, a rebound host, a missing or repeated host, no or a wrong token, another path or
+  /// method, a form body; expect the first admitted and each defect refused with its status.
   #[test]
-  fn connection_close_and_eof() {
-    let raw = "POST / HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-    let mut reader = Cursor::new(raw.as_bytes());
-    let request = read_request(&mut reader).unwrap().unwrap();
-    assert!(!request.keep_alive);
-    assert!(
-      read_request(&mut Cursor::new(b"".as_slice()))
-        .unwrap()
-        .is_none(),
-      "a clean end of input yields no request"
+  fn only_this_edges_own_callers_are_admitted() {
+    assert_eq!(decided(&head_with(&[])), Ok(()));
+    assert_eq!(
+      decided(&head_with(&["Origin: http://localhost:7000"])),
+      Ok(())
     );
+    let refusals = [
+      (
+        head_with(&["Origin: https://evil.example"]),
+        Refused::Forbidden,
+      ),
+      (
+        head_with(&["Origin: http://127.0.0.1:7001"]),
+        Refused::Forbidden,
+      ),
+      (
+        head_with(&[]).replace("Host: 127.0.0.1:7000", "Host: rebound.example:7000"),
+        Refused::Misdirected,
+      ),
+      (
+        head_with(&[]).replace("Host: 127.0.0.1:7000\r\n", ""),
+        Refused::BadRequest,
+      ),
+      (head_with(&["Host: 127.0.0.1:7000"]), Refused::BadRequest),
+      (
+        head_with(&[]).replace(&edge().bearer_hex(), &"cd".repeat(BEARER_BYTES)),
+        Refused::Unauthorized,
+      ),
+      (
+        head_with(&[]).replace(
+          &format!("Authorization: Bearer {}", edge().bearer_hex()),
+          "X-Other: v",
+        ),
+        Refused::Unauthorized,
+      ),
+      (
+        head_with(&[]).replace("POST /mcp", "POST /"),
+        Refused::NotFound,
+      ),
+      (
+        head_with(&[]).replace("POST /mcp", "GET /mcp"),
+        Refused::MethodNotAllowed,
+      ),
+      (
+        head_with(&[]).replace("application/json", "application/x-www-form-urlencoded"),
+        Refused::UnsupportedMediaType,
+      ),
+    ];
+    for (raw, expected) in refusals {
+      assert_eq!(decided(&raw), Err(expected), "{raw}");
+    }
   }
 
-  /// A `Content-Length` past the cap sets `too_large` and reads no body (no wild allocation).
+  /// AUD-29-23 hostile input: do: parse heads with a line past the bound, too many fields, two
+  /// contradictory lengths, a chunked body, a non-numeric length, a length past the body cap and none on a
+  /// POST; expect each refused with its status, and a repeated identical length accepted.
   #[test]
-  fn a_hostile_content_length_is_refused_without_reading() {
-    let raw = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", u64::MAX);
-    let mut reader = Cursor::new(raw.into_bytes());
-    let request = read_request(&mut reader).unwrap().unwrap();
-    assert!(request.too_large);
-    assert!(request.body.is_empty());
+  fn malformed_or_oversized_heads_are_refused() {
+    let long = format!("X-Long: {}", "a".repeat(MAX_LINE_BYTES));
+    let many: Vec<String> = (0..=MAX_FIELDS).map(|at| format!("X-{at}: v")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    let cases = [
+      (head_with(&[&long]), Refused::HeadersTooLarge),
+      (head_with(&many), Refused::HeadersTooLarge),
+      (head_with(&["Content-Length: 3"]), Refused::BadRequest),
+      (
+        head_with(&["Transfer-Encoding: chunked"]),
+        Refused::BadRequest,
+      ),
+      (
+        head_with(&[]).replace("Content-Length: 2", "Content-Length: 2x"),
+        Refused::BadRequest,
+      ),
+      (
+        head_with(&[]).replace(
+          "Content-Length: 2",
+          &format!("Content-Length: {}", MAX_BODY + 1),
+        ),
+        Refused::TooLarge,
+      ),
+      (
+        head_with(&[]).replace("Content-Length: 2\r\n", ""),
+        Refused::LengthRequired,
+      ),
+      (
+        format!("POST /{} HTTP/1.1", "a".repeat(MAX_LINE_BYTES)),
+        Refused::UriTooLong,
+      ),
+    ];
+    for (raw, expected) in cases {
+      assert_eq!(decided(&raw), Err(expected), "{}", raw.len());
+    }
+    assert_eq!(decided(&head_with(&["Content-Length: 2"])), Ok(()));
   }
 
-  /// A 200 response carries the JSON body with a matching `Content-Length`; a 202 carries none.
+  /// A refusal's status line, and the `401` challenge, as RFC 9110 writes them.
   #[test]
   fn responses_format_correctly() {
-    let mut out = Vec::new();
-    write_json(&mut out, &serde_json::json!({"ok": true}), true).unwrap();
-    let text = String::from_utf8(out).unwrap();
+    let text = String::from_utf8(response(Some(serde_json::json!({"ok": true})), true)).unwrap();
     assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
-    assert!(text.contains("Content-Type: application/json\r\n"));
     assert!(text.contains("Content-Length: 11\r\n"));
     assert!(text.ends_with("{\"ok\":true}"));
-
-    let mut out = Vec::new();
-    write_status(&mut out, "202 Accepted", false).unwrap();
-    let text = String::from_utf8(out).unwrap();
+    let text = String::from_utf8(response(None, false)).unwrap();
     assert!(text.starts_with("HTTP/1.1 202 Accepted\r\n"));
     assert!(text.contains("Connection: close\r\n"));
   }
