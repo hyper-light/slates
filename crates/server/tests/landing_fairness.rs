@@ -248,12 +248,17 @@ const OUTLAST_FACTOR: u32 = 2;
 /// Shape: the most files a sized landing is given — sixteen calibrations; a disk so fast that more would be
 /// needed skips the test loudly rather than writing without bound.
 const MOST_FILES: usize = CALIBRATION_FILES * 16;
-/// Shape: the most a sized landing's volume may grow to — a gibibyte, far above the most files' small
-/// contents; it is dynamic, so it reserves nothing up front and takes only what its files use.
-const SIZED_VOLUME_BYTES: u64 = 1 << 30;
+/// Shape: the largest base page of a supported target (16 KiB, Apple silicon) — the charged window of each
+/// of the sized landings' tiny files.
+const LARGEST_PAGE: u64 = 16 << 10;
+/// Derived: the most a sized landing's volume may grow to — each of the most files ([`MOST_FILES`], doubled
+/// once more by a landing that must be made again) charged one window of the largest page. Sized to what the
+/// files need, not "far above" it: a volume's inode allowance is derived from its quota (§4.2), and a 1 GiB
+/// maximum reserved the shard's whole version slab, refusing the next volume `BudgetExceeded` (2026-10-01).
+const SIZED_VOLUME_BYTES: u64 = (MOST_FILES as u64) * 2 * LARGEST_PAGE;
 
-/// A volume for a sized landing: grown as its files arrive, up to a bound far above what it will hold (a
-/// bounded volume would reserve the whole bound at creation, more than a small machine's shard holds).
+/// A volume for a sized landing: grown as its files arrive, up to what the most files need (a bounded volume
+/// would reserve the whole bound at creation).
 fn sized(name: &str) -> CreateSpec {
   CreateSpec {
     size: SizeClass::Dynamic {
