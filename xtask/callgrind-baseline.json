@@ -1,0 +1,19 @@
+{
+  "x86_64-linux": {
+    "callgrind::memory::buddy_alloc_free_page.one_page": 1554,
+    "callgrind::memory::buddy_alloc_free_split.split_and_coalesce": 1865,
+    "callgrind::memory::ring_push_pop.push_pop": 56,
+    "callgrind::memory::slab_insert_remove.insert_remove": 1236,
+    "callgrind::runtime::kept_lookup.own_context": 66,
+    "callgrind::runtime::local_wake.one_yield": 7673,
+    "callgrind::runtime::spawn_and_run.trivial": 6982,
+    "callgrind::runtime::step_idle.idle": 5400,
+    "callgrind::wire::body_decode.bytes": 1260,
+    "callgrind::wire::body_encode.body": 1469,
+    "callgrind::wire::crc32c_page.page": 1279,
+    "callgrind::wire::frame_decode.framed_bytes": 510,
+    "callgrind::wire::frame_encode.frame": 2100,
+    "callgrind::wire::header_decode.decode": 39,
+    "callgrind::wire::header_encode.encode": 29
+  }
+}

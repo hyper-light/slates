@@ -478,6 +478,29 @@ microsecond rows and only a large one on the nanosecond rows, because the machin
 that much between processes. The design's instruction-count gate (D-20) is what sees the small
 change; it runs in CI's `callgrind` lane under valgrind (GAPS §8b).
 
+**The instruction-count baseline (2026-10-01, AUD-29-32).** Recorded from CI's first run of the gate,
+which failed as designed on the missing baseline and printed its counts for review.
+- Run: 36849806140, commit `8cd9108`, GitHub `ubuntu-latest` x86_64.
+- Command: `cargo bench --workspace --bench callgrind --features
+  slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts --
+  --save-summary=json`, then `cargo xtask callgrind --iai target/iai`.
+- The counts are committed as `xtask/callgrind-baseline.json` (`x86_64-linux`). Instructions per
+  operation:
+
+  | Bench | Ir | Bench | Ir |
+  |---|---|---|---|
+  | buddy one page | 1,554 | wire header encode | 29 |
+  | buddy split and coalesce | 1,865 | wire header decode | 39 |
+  | ring push and pop | 56 | wire frame encode | 2,100 |
+  | slab insert and remove | 1,236 | wire frame decode | 510 |
+  | runtime kept lookup | 66 | wire body encode | 1,469 |
+  | runtime one local yield | 7,673 | wire body decode | 1,260 |
+  | runtime spawn and run | 6,982 | CRC32C over a page | 1,279 |
+  | runtime idle step | 5,400 | | |
+
+- From here a count more than 1% above its row fails the lane. A lower count passes and is reported,
+  and the bar is lowered with `cargo xtask callgrind --record` after review.
+
 The Phase 2 task 5 run (2026-09-05, `cargo xtask ratchet` after the client and the CLI landed):
 82 rows against the baseline, 0 regressions; no new rows, since the client's cost is the IPC
 round trip already gated (`ipc.*`) and the CLI's is a process start plus one rendezvous. The
