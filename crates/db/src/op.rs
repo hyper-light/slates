@@ -9,7 +9,7 @@ use crate::catalog::{
   AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
   GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
   LineageEdge, NfsClientRecord, NfsLockRecord, NfsOpenRecord, PlacementState, SizeClass,
-  SnapshotId, SnapshotRecord, VolumeId, VolumeRecord, VolumeState,
+  SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -282,6 +282,18 @@ pub enum Op {
     /// What it now sits on.
     base: BaseRecord,
   },
+  /// A takeover successor adopted a destroyed volume's tombstone (AUD-29-43): it owes the tombstone and its
+  /// retirement to the volume's candidate holders exactly as the destroying owner did. Appended.
+  TombstoneAdopted {
+    /// The tombstone.
+    tombstone: Tombstone,
+  },
+  /// Every candidate holder holds a destroyed volume's retirement (AUD-29-43): nothing is owed any more and
+  /// the tombstone gives its slot back. Appended.
+  TombstoneRetired {
+    /// The destroyed volume.
+    id: VolumeId,
+  },
 }
 
 impl Op {
@@ -295,6 +307,8 @@ impl Op {
       Op::VolumeHeadAdvanced { .. } => "volume_head_advanced",
       Op::AccessChanged { .. } => "access_changed",
       Op::VolumeDestroyed { .. } => "volume_destroyed",
+      Op::TombstoneAdopted { .. } => "tombstone_adopted",
+      Op::TombstoneRetired { .. } => "tombstone_retired",
       Op::SnapshotTaken { .. } => "snapshot_taken",
       Op::SnapshotPlaced { .. } => "snapshot_placed",
       Op::SnapshotIdentified { .. } => "snapshot_identified",

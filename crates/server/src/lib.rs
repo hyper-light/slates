@@ -26,6 +26,7 @@ pub mod catalog;
 pub mod config;
 mod consensus;
 mod consensus_recovery;
+pub mod content_retention;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;
 pub mod deploy;
@@ -59,6 +60,7 @@ pub mod state;
 mod status_pages;
 pub mod takeover;
 pub mod telemetry;
+pub mod tombstone;
 // The transport capability report of §4.6 A-9 (what `attach` and `status` say each transport can do
 // on this host); pure over one platform seam, so it compiles and tests everywhere.
 pub mod transports;

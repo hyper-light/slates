@@ -23,6 +23,16 @@ pub const HEAD_CLASS: u8 = 1;
 pub const MERGE_CLASS: u8 = 2;
 /// Format: the class byte of a volume catalog register's value ([`CatalogValue`]).
 pub const CATALOG_CLASS: u8 = 3;
+/// Format: the class byte of a destroyed volume's tombstone value (`crate::tombstone::TombstoneValue`).
+pub const TOMBSTONE_CLASS: u8 = 4;
+
+/// Whether a register value of this class is a **single value** a holder keeps only at its newest position
+/// (a head, a catalog, a tombstone: phase one adopts only the highest), as opposed to a **ledger** it keeps
+/// whole (a green's merge chain, which a successor replays) — AUD-29-43's compaction rule, read from the
+/// value's own class byte.
+pub(crate) fn is_single_value(bytes: &[u8]) -> bool {
+  bytes.first().is_some_and(|class| *class != MERGE_CLASS)
+}
 
 /// `body` behind its class byte: a register value's canonical bytes.
 pub(crate) fn tagged(class: u8, body: Vec<u8>) -> Vec<u8> {

@@ -854,6 +854,7 @@ pub(crate) fn destroy_merge_volume(
       return Some(refused(refusal_of_db(&e)));
     }
   }
+  crate::verbs::retire_local_tombstones(state);
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.
   if let Some(work) = state.works.remove(&id) {
@@ -2477,7 +2478,11 @@ mod tests {
     let object = ObjectId::new(slates_db::HostId(1), 1);
     let mut hold = slates_cluster::content::ContentHold::new();
     let held = hold
-      .hold(object, MergeShardState::inputs_archive(bytes, 0, 4096))
+      .hold(
+        object,
+        slates_cluster::content::Placed::default(),
+        MergeShardState::inputs_archive(bytes, 0, 4096),
+      )
       .expect("the inputs archive is whole and verifies");
     assert_eq!(named, held, "the record names what the hold keys by");
     let found = hold

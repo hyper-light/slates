@@ -214,10 +214,12 @@ fn stale_after_confirmation(
       .is_some_and(|placement| !placement.place(object).candidates.contains(&local))
 }
 
-/// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, and a green's
-/// replica. Counted [`TAKEOVER_RECLAIMED`].
+/// Drops this holder's copy of `object`: its acceptor, its routing entry, its lease-gate record, a green's
+/// replica, and the content it held for the object (AUD-29-43: a stale copy's bytes are reclaimed with its
+/// records, never kept for a head this holder no longer backs). Counted [`TAKEOVER_RECLAIMED`].
 fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
+  state.held_content.forget_object(object);
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);
@@ -818,12 +820,25 @@ fn record_adoption(
     take.adopted.insert(object);
   }
   if object.is_catalog() {
-    // A volume's catalog register: its successor rebuilds the volume under it (AUD-29-17).
-    if let Some(catalog) = crate::catalog::CatalogValue::from_record_bytes(&record.value) {
+    // A volume's catalog register: its successor rebuilds the volume under it (AUD-29-17) — unless the
+    // volume's own register was adopted as a tombstone (AUD-29-43): a destroyed volume is not rebuilt.
+    if let Some(catalog) = crate::catalog::CatalogValue::from_record_bytes(&record.value)
+      && !state
+        .pending_tombstones
+        .contains_key(&object.placement_key())
+    {
       state
         .pending_catalogs
         .insert(object.placement_key(), (record.sequence, catalog));
     }
+  } else if let Some(tombstone) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value)
+  {
+    // A destroyed volume (AUD-29-43): the successor owes its tombstone from the adopted stage on, and never
+    // materializes it.
+    state.pending_catalogs.remove(&object);
+    state
+      .pending_tombstones
+      .insert(object, tombstone.tombstone_sequence(record.sequence));
   } else if let Some(head) = HeadValue::from_record_bytes(&record.value) {
     state.pending_materializations.insert(object, head);
   } else if let Some(merge) =

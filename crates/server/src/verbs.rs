@@ -4986,6 +4986,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         release_slot_credits(state, &slot);
       }
       state.by_id.remove(&id);
+      retire_local_tombstones(state);
     }
   }
   any
@@ -6318,7 +6319,16 @@ fn complete_recovered_destroys(state: &mut ShardState) -> usize {
       completed += 1;
     }
   }
+  retire_local_tombstones(state);
   completed
+}
+
+/// Retires the tombstones a destroy left that no remote candidate is owed (AUD-29-43): on a laptop every one,
+/// with its destroy; in a fleet none until the record plane has shipped both stages — the same rule, which
+/// the record period applies again each period ([`crate::fleet::retire_done_tombstones`]).
+pub(crate) fn retire_local_tombstones(state: &mut ShardState) {
+  let local = state.fleet.host();
+  let _ = crate::fleet::retire_done_tombstones(state, local);
 }
 
 /// Sets every rebuilt snapshot's clone pins to the catalog's live clones of it (§4.8, the catalog
@@ -7088,6 +7098,33 @@ mod tests {
       let published = super::publish_shard(state).expect("the shard publishes");
       assert!(published.skipped.is_empty(), "{published:?}");
       assert!(!published.captured(super::to_db_volume(id)));
+    });
+  }
+
+  /// AUD-29-43, the laptop degenerate (R8): a destroy's tombstone is owed only to remote candidate holders, and
+  /// a laptop has none, so the tombstone retires with its destroy and gives the volume's slot back. Do: create
+  /// a volume, destroy it through the verb and run its slices to the end. Expect: no tombstone left in the
+  /// partition, and a volume of the same name created again under a fresh id.
+  #[test]
+  fn a_laptop_destroy_retires_its_tombstone_with_the_destroy() {
+    crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid { uid: 1234 };
+      let id = created(state, &principal, "tombstoned");
+      let reply = super::dispatch(
+        state,
+        1,
+        &principal,
+        super::RequestBody::Destroy { volume: id },
+      );
+      assert!(matches!(reply, super::ReplyBody::Destroyed), "{reply:?}");
+      while super::step_destroys(state) {}
+      assert_eq!(
+        state.db.partition().tombstone(super::to_db_volume(id)),
+        None
+      );
+      assert_eq!(state.db.partition().tombstones().count(), 0);
+      let again = created(state, &principal, "tombstoned");
+      assert_ne!(again, id, "a destroyed id is never reissued");
     });
   }
 

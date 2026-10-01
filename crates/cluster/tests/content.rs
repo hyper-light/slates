@@ -128,8 +128,9 @@ async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
 async fn serve_bounded(endpoint: &mut Endpoint, held: &mut ContentHold) -> bool {
   use std::future::Future;
   use std::task::Poll;
-  let mut serving =
-    std::pin::pin!(endpoint.serve_once(|_, request| held.serve(HOLDER, &request, |_, _| true)));
+  let mut serving = std::pin::pin!(
+    endpoint.serve_once(|_, request| held.serve(HOLDER, &request, |_, _| true, |_, _, _| true).0)
+  );
   let mut deadline = std::pin::pin!(slates_rt::futures::sleep(COLLECTION_NS * 2));
   std::future::poll_fn(|context| {
     if let Poll::Ready(result) = serving.as_mut().poll(context) {

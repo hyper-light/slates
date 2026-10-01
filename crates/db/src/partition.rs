@@ -21,7 +21,7 @@ use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
   LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord, NfsLockRecord,
-  NfsOpenRecord, Principal, SnapshotId, SnapshotRecord, VolumeId, VolumeRecord,
+  NfsOpenRecord, Principal, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -113,6 +113,9 @@ pub struct PartitionSnapshot {
   pub nfs_clients: Vec<NfsClientRecord>,
   /// The partition's NFSv4 instance: the last one a daemon life advanced to (zero before any).
   pub nfs_instance: u32,
+  /// The destroyed volumes whose tombstone is still owed to their candidate holders, by volume order
+  /// (AUD-29-43; appended for append-only evolution).
+  pub tombstones: Vec<Tombstone>,
 }
 
 /// The partition.
@@ -155,6 +158,10 @@ pub struct Partition {
   nfs_locks: BTreeMap<[u8; 12], NfsLockRecord>,
   nfs_clients: BTreeMap<u64, NfsClientRecord>,
   nfs_instance: u32,
+  /// The destroyed volumes whose tombstone this owner still owes its candidate holders (AUD-29-43), by volume,
+  /// each with the register sequence it is written at. A tombstone keeps its volume's slot of the volume
+  /// capacity until it is retired, so the table is bounded by the same derived cap.
+  tombstones: BTreeMap<VolumeId, u64>,
 }
 
 impl std::fmt::Debug for Partition {
@@ -205,7 +212,42 @@ impl Partition {
       green_chains: BTreeMap::new(),
       green_origins: BTreeMap::new(),
       green_chain_bytes: 0,
+      tombstones: BTreeMap::new(),
     }
+  }
+
+  /// The register sequence a destroy of `id` would close its registers at (AUD-29-43): one past its head
+  /// epoch and, for a green, past its newest version (version 0 is the origin, version `n` the `n`-th chain
+  /// entry), so the tombstone is newer than every value the volume's registers ever held. `None` when the
+  /// volume does not exist or the sequence is spent.
+  pub fn tombstone_sequence(&self, id: VolumeId) -> Option<u64> {
+    let record = self.volume(id)?;
+    let newest_version = self
+      .green_chains
+      .get(&id)
+      .map_or(0, |chain| u64::try_from(chain.len()).unwrap_or(u64::MAX));
+    record.epoch.max(newest_version).checked_add(1)
+  }
+
+  /// The tombstone this owner still owes for the destroyed volume `id`, if any.
+  pub fn tombstone(&self, id: VolumeId) -> Option<Tombstone> {
+    self.tombstones.get(&id).map(|sequence| Tombstone {
+      volume: id,
+      sequence: *sequence,
+    })
+  }
+
+  /// Every tombstone this owner still owes, by volume order.
+  pub fn tombstones(&self) -> impl Iterator<Item = Tombstone> + '_ {
+    self.tombstones.iter().map(|(volume, sequence)| Tombstone {
+      volume: *volume,
+      sequence: *sequence,
+    })
+  }
+
+  /// Volumes and owed tombstones together: what the volume capacity bounds.
+  fn volume_slots_used(&self) -> usize {
+    self.by_id.len().saturating_add(self.tombstones.len())
   }
 
   /// The caps.
@@ -511,17 +553,44 @@ impl Partition {
             existing: existing.id.bytes,
           });
         }
-        if self.by_id.len() >= self.caps.volumes {
+        if self.tombstones.contains_key(&record.id) {
+          return Err(DbError::AlreadyExists {
+            existing: record.id.bytes,
+          });
+        }
+        if self.volume_slots_used() >= self.caps.volumes {
           return Err(DbError::Capacity { table: "volumes" });
         }
         Ok(())
       }
+      Op::VolumeDestroyed { id } => {
+        self.volume(*id).ok_or(DbError::NotFound)?;
+        self
+          .tombstone_sequence(*id)
+          .map(|_| ())
+          .ok_or(DbError::Capacity {
+            table: "tombstone sequence",
+          })
+      }
+      Op::TombstoneAdopted { tombstone } => {
+        if self.volume(tombstone.volume).is_some()
+          || self.tombstones.contains_key(&tombstone.volume)
+        {
+          return Err(DbError::AlreadyExists {
+            existing: tombstone.volume.bytes,
+          });
+        }
+        if self.volume_slots_used() >= self.caps.volumes {
+          return Err(DbError::Capacity { table: "volumes" });
+        }
+        Ok(())
+      }
+      Op::TombstoneRetired { id } => self.tombstones.get(id).map(|_| ()).ok_or(DbError::NotFound),
       Op::VolumeStateChanged { id, .. }
       | Op::VolumeResized { id, .. }
       | Op::VolumeAccounted { id, .. }
       | Op::VolumeHeadAdvanced { id, .. }
       | Op::AccessChanged { id, .. }
-      | Op::VolumeDestroyed { id }
       | Op::VolumeRebased { id, .. } => self.volume(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::SnapshotTaken { record } => {
         self.volume(record.volume).ok_or(DbError::NotFound)?;
@@ -741,7 +810,23 @@ impl Partition {
         v.access = access.clone();
         v.catalog_version = v.catalog_version.saturating_add(1);
       }),
-      Op::VolumeDestroyed { id } => self.remove_volume(*id),
+      Op::VolumeDestroyed { id } => {
+        // The tombstone takes the volume's slot: its sequence is read before the record goes.
+        let sequence = self.tombstone_sequence(*id);
+        self.remove_volume(*id)?;
+        if let Some(sequence) = sequence {
+          self.tombstones.insert(*id, sequence);
+        }
+        Ok(())
+      }
+      Op::TombstoneAdopted { tombstone } => {
+        self.tombstones.insert(tombstone.volume, tombstone.sequence);
+        Ok(())
+      }
+      Op::TombstoneRetired { id } => {
+        self.tombstones.remove(id);
+        Ok(())
+      }
       Op::SnapshotTaken { record } => self.insert_snapshot(record.clone()),
       Op::SnapshotPlaced { volume, id, placed } => {
         let h = *self
@@ -1076,6 +1161,7 @@ impl Partition {
       nfs_locks: self.nfs_locks.values().cloned().collect(),
       nfs_clients: self.nfs_clients.values().cloned().collect(),
       nfs_instance: self.nfs_instance,
+      tombstones: self.tombstones().collect(),
       green_chains: {
         // Every green with a chain or an origin, in id order, so a base-seeded green with no
         // increment yet is carried too.
@@ -1094,6 +1180,16 @@ impl Partition {
           })
           .collect()
       },
+    }
+  }
+
+  /// Restores the enrolled consumers (§4.13) and the owed tombstones (AUD-29-43) a snapshot carries.
+  fn restore_consumers_and_tombstones(&mut self, snapshot: &PartitionSnapshot) {
+    for c in &snapshot.consumers {
+      self.consumers.insert(c.consumer, c.clone());
+    }
+    for tombstone in &snapshot.tombstones {
+      self.tombstones.insert(tombstone.volume, tombstone.sequence);
     }
   }
 
@@ -1159,9 +1255,7 @@ impl Partition {
       p.restore_green_chain(chain);
     }
     p.restore_nfs(snapshot);
-    for c in &snapshot.consumers {
-      p.consumers.insert(c.consumer, c.clone());
-    }
+    p.restore_consumers_and_tombstones(snapshot);
     Ok(p)
   }
 

@@ -218,6 +218,22 @@ pub enum VolumeState {
   Destroyed,
 }
 
+/// A destroyed volume's register tombstone (§4.4 destroy "tombstone the id"; AUD-29-43): the sequence its
+/// replicated registers are closed at. The owner ships it to every candidate holder as the object's final
+/// register value, so a holder releases what it held for the volume and a takeover adopts the destruction
+/// instead of the last live head; once every candidate holds it the owner ships the retirement at the next
+/// sequence and, when every candidate holds that too, drops the tombstone (`Op::TombstoneRetired`). Until
+/// then it occupies the volume's slot in the partition's volume capacity, so tombstones are bounded by the
+/// same derived cap volumes are.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tombstone {
+  /// The destroyed volume.
+  pub volume: VolumeId,
+  /// The register sequence the tombstone is written at: one past every sequence the volume's registers
+  /// used (its head epoch and, for a green, its newest version).
+  pub sequence: u64,
+}
+
 /// A volume's lease (§4.4 "Leases and fencing", D-16).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRecord {

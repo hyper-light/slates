@@ -98,7 +98,8 @@ use slates_cluster::{
 };
 use slates_db::Op;
 use slates_db::catalog::{
-  PlacementState, SnapshotId as DbSnapshotId, VolumeId as DbVolumeId, VolumeRecord,
+  PlacementState, SnapshotId as DbSnapshotId, Tombstone, VolumeId as DbVolumeId, VolumeRecord,
+  VolumeState,
 };
 use slates_db::register::{
   Acceptor, Authority, DomainId, HostEpoch, HostId, ObjectId, Placement, Quorum, Record, RegionId,
@@ -2674,16 +2675,28 @@ async fn serve_peer_records(
                 .get(&peer_anchor)
                 .map_or(seed, |learned| learned.host);
               let (council, records) = (&s.council, &s.holder_records);
-              s.held_content.serve(local, &request, |access, object| {
-                content_authorized(
-                  council.configuration(),
-                  records,
-                  local,
-                  peer_host,
-                  access,
-                  object,
-                )
-              })
+              let (reply, held) = s.held_content.serve(
+                local,
+                &request,
+                |access, object| {
+                  content_authorized(
+                    council.configuration(),
+                    records,
+                    local,
+                    peer_host,
+                    access,
+                    object,
+                  )
+                },
+                |object, sequence, manifest| {
+                  crate::content_retention::admits(records, local, object, sequence, manifest)
+                },
+              );
+              // A newer placement supersedes an older one still ahead of the records (AUD-29-43).
+              if let Some(object) = held {
+                crate::content_retention::retain_object(s, object);
+              }
+              reply
             })
             .unwrap_or_default(),
             // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.
@@ -2845,7 +2858,10 @@ pub(crate) fn accept_held_record(
         .fleet
         .track_object(record.object, peer_host, state.council.configuration())
       {
-        Ok(()) => ack.encode(),
+        Ok(()) => {
+          after_held_record(state, record);
+          ack.encode()
+        }
         Err(error) => encode_refusal(&error),
       }
     }
@@ -2853,6 +2869,25 @@ pub(crate) fn accept_held_record(
     // version, so a stale sender refreshes and retries); every other refusal is an empty reply the sender
     // counts as no acknowledgement ([`encode_refusal`]).
     Err(error) => encode_refusal(&error),
+  }
+}
+
+/// What a holder does once `record` is durably accepted (AUD-29-43): a single-value register (a head, a
+/// catalog, a tombstone — phase one adopts only its newest position) keeps only positions at or above the
+/// accepted one, so a holder's records stay one per register however many seals a volume takes; and a
+/// tombstone releases the destroyed volume's content, or at its retirement the volume's records
+/// ([`crate::tombstone::on_held`]).
+fn after_held_record(state: &mut ShardState, record: &Record) {
+  if crate::catalog::is_single_value(&record.value)
+    && let Some(acceptor) = state.holder_records.get_mut(&record.object)
+  {
+    acceptor.compact_below(record.object, record.sequence);
+  }
+  if let Some(value) = crate::tombstone::TombstoneValue::from_record_bytes(&record.value) {
+    crate::tombstone::on_held(state, record.object, value);
+  } else {
+    // A newer head or ledger position may supersede content held for the object (AUD-29-43).
+    crate::content_retention::retain_object(state, record.object);
   }
 }
 
@@ -2980,6 +3015,18 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       continue;
     };
     let object = ObjectId(slot.id.bytes);
+    // A volume being destroyed ships its tombstone, never its catalog or a head (AUD-29-43): its registers
+    // close at the sequence the destroy's record will keep, so the tombstone is continuous with it.
+    if record.state == VolumeState::Destroying {
+      if let Some(sequence) = state.db.partition().tombstone_sequence(slot.id) {
+        let tombstone = Tombstone {
+          volume: slot.id,
+          sequence,
+        };
+        heads.extend(owed_tombstone(state, config, tombstone, local));
+      }
+      continue;
+    }
     // The catalog register first (AUD-29-17): what a successor serves the volume as, shipped at every
     // catalog change. The head waits until the catalog's current version is committed, so an adopted head
     // always meets an adopted catalog as new as the head's own volume.
@@ -3010,8 +3057,86 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
       local,
     ));
   }
+  for tombstone in state.db.partition().tombstones() {
+    heads.extend(owed_tombstone(state, config, tombstone, local));
+  }
   heads
 }
+
+/// The stage of a destroyed volume's tombstone this owner still owes some candidate (AUD-29-43; see
+/// `crate::tombstone`): the tombstone at its sequence until every remote candidate holds it, then the
+/// retirement at the next sequence until every remote candidate holds that; `None` once both are held
+/// everywhere (at once on a laptop, which has no remote candidate). The recorded placement tells the stages
+/// apart: it moves to the retirement's sequence only once that is shipped.
+fn owed_tombstone(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  tombstone: Tombstone,
+  local: HostId,
+) -> Option<Head> {
+  let object = ObjectId(tombstone.volume.bytes);
+  let retirement = tombstone.sequence.checked_add(1)?;
+  let retiring = state
+    .placed_heads
+    .get(&object)
+    .is_some_and(|head| head.sequence >= retirement);
+  if !retiring {
+    let destroyed = crate::tombstone::TombstoneValue { retired: false };
+    if let Some(head) = owed_record(
+      state,
+      config,
+      (object, tombstone.sequence),
+      destroyed.to_record_bytes(),
+      local,
+    ) {
+      return Some(head);
+    }
+  }
+  let retired = crate::tombstone::TombstoneValue { retired: true };
+  owed_record(
+    state,
+    config,
+    (object, retirement),
+    retired.to_record_bytes(),
+    local,
+  )
+}
+
+/// Retires every tombstone this shard's partition owes no candidate any more (AUD-29-43): records
+/// `Op::TombstoneRetired` — the tombstone gives back its volume slot — and forgets the placements the record
+/// plane kept for the volume and its catalog. Returns the retired objects, so the owner's acceptor can forget
+/// them too. Runs on the owner shard each record period and after every destroy, so on a laptop (no remote
+/// candidate) a tombstone retires with its destroy. A refused record is counted and retried next time.
+pub(crate) fn retire_done_tombstones(state: &mut ShardState, local: HostId) -> Vec<ObjectId> {
+  let config = state.fleet.configuration().clone();
+  let done: Vec<Tombstone> = state
+    .db
+    .partition()
+    .tombstones()
+    .filter(|tombstone| owed_tombstone(state, &config, *tombstone, local).is_none())
+    .collect();
+  let now = state.clock.monotonic_ns();
+  let mut retired = Vec::new();
+  for tombstone in done {
+    let op = slates_db::op::Op::TombstoneRetired {
+      id: tombstone.volume,
+    };
+    if state.db.mutate(&mut state.segment, &op, now).is_err() {
+      count_refusal_in(state, TOMBSTONE_RETIRE_REFUSED);
+      continue;
+    }
+    let object = ObjectId(tombstone.volume.bytes);
+    state.placed_heads.remove(&object);
+    state.placed_heads.remove(&object.catalog());
+    retired.push(object);
+  }
+  retired
+}
+
+/// The status refusal count under which an owner records a retired tombstone its database refused to record
+/// (AUD-29-43); it is retried at the next record period or destroy.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const TOMBSTONE_RETIRE_REFUSED: &str = "fleet.tombstone.retire_refused";
 
 /// The record of `object` at `sequence` with `value`, as this owner still owes it to some remote candidate —
 /// its full candidate set, the candidates that already hold it and the quorum — or `None` once every remote
@@ -3203,7 +3328,10 @@ fn heal_one_placed_snapshot(state: &mut ShardState, local: HostId, created_unix:
     .find_map(|(id, handle)| {
       let object = ObjectId(id.bytes);
       let record = state.db.partition().volume(*id)?;
-      if record.epoch == 0 || state.seals.contains_key(&object) {
+      if record.epoch == 0
+        || record.state == VolumeState::Destroying
+        || state.seals.contains_key(&object)
+      {
         return None;
       }
       let snapshot = state.db.partition().snapshot(*id, record.head)?;
@@ -3242,6 +3370,11 @@ fn sealable_head(
   object: ObjectId,
 ) -> Option<(DbSnapshotId, u64)> {
   let record = state.db.partition().volume(id)?;
+  if record.state == VolumeState::Destroying {
+    // A volume being destroyed places nothing more: its registers are closing (AUD-29-43).
+    state.seals.remove(&object);
+    return None;
+  }
   if record.epoch == 0 {
     return None; // Nothing sealed yet: the creation head names no content.
   }
@@ -3780,8 +3913,15 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
       let Some(archive) = archive else {
         continue;
       };
-      let stored =
-        state::with_state(|s| s.held_content.hold(object, archive).is_ok()).unwrap_or(false);
+      let stored = state::with_state(|s| {
+        // Held as placed for the adopted head's sequence: the retention rule keeps it while the head names
+        // this node, and the materialization below reads it in this same turn (AUD-29-43).
+        let placed = slates_cluster::content::Placed {
+          sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
+        };
+        s.held_content.hold(object, placed, archive).is_ok()
+      })
+      .unwrap_or(false);
       if !stored {
         count_refusal(MATERIALIZE_REFUSED);
         continue;
@@ -3795,9 +3935,77 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
 /// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
 /// ([`materialize_pending_greens`]).
 async fn materialize_adopted_objects(origin: u16, budget: CommitBudget) {
+  adopt_pending_tombstones(origin).await;
   materialize_pending(origin, budget).await;
   materialize_pending_greens(origin).await;
 }
+
+/// Records each adopted tombstone (AUD-29-43) on the shard the destroyed volume's id routes to, with the
+/// adopted placement, so that shard's record plane ships the tombstone's remaining stages to the successor's
+/// candidates and retires it. A tombstone the shard already holds is already owed there; a refused record
+/// (the partition's volume capacity is full) is counted and retried next period.
+async fn adopt_pending_tombstones(origin: u16) {
+  let pending: Vec<(ObjectId, u64, Option<PlacedHead>, Option<u16>)> = state::with_state(|s| {
+    s.pending_tombstones
+      .iter()
+      .map(|(object, sequence)| {
+        let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
+        (
+          *object,
+          *sequence,
+          s.placed_heads.get(object).cloned(),
+          s.shards.get(usize::from(partition)).copied(),
+        )
+      })
+      .collect()
+  })
+  .unwrap_or_default();
+  for (object, sequence, placed, target) in pending {
+    let Some(target) = target else {
+      continue;
+    };
+    let adopted = call_within(
+      origin,
+      target,
+      move |s| {
+        let tombstone = Tombstone {
+          volume: DbVolumeId { bytes: object.0 },
+          sequence,
+        };
+        let now = s.clock.monotonic_ns();
+        let recorded = match s.db.mutate(
+          &mut s.segment,
+          &slates_db::op::Op::TombstoneAdopted { tombstone },
+          now,
+        ) {
+          Ok(_) => true,
+          Err(slates_db::error::DbError::AlreadyExists { .. }) => {
+            s.db.partition().tombstone(tombstone.volume).is_some()
+          }
+          Err(_) => false,
+        };
+        if recorded && let Some(placed) = placed {
+          s.placed_heads.insert(object, placed);
+        }
+        recorded
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    state::with_state(|s| {
+      if adopted == Some(true) {
+        s.pending_tombstones.remove(&object);
+      } else {
+        *s.refusals.entry(TOMBSTONE_ADOPT_REFUSED).or_insert(0) += 1;
+      }
+    });
+  }
+}
+
+/// The status refusal count under which a successor records an adopted tombstone its owner shard could not
+/// record this period (AUD-29-43); it stays pending and is retried.
+/// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
+const TOMBSTONE_ADOPT_REFUSED: &str = "fleet.tombstone.adopt_refused";
 
 /// Materializes each taken-over **green** whose newest merge record this node adopted (§4.16
 /// owner-loss recovery; AUD-14) into an owned green **on the shard its id routes to**: the chain is
@@ -6370,7 +6578,26 @@ async fn run_record_period(
       in_flight.push(dispatch);
     }
   }
-  // Ship each unplaced head to all its candidate holders at once, committed at `f + 1`.
+  ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
+  // Record durably each seal whose content and head have both placed.
+  let _ = run_on(origin, shard, record_placed_seals);
+  retire_shard_tombstones(origin, shard, local, owner_acceptor).await;
+  // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
+  // while unplaced, its record shipped in order once they are.
+  crate::merge_service::run_merge_period(origin, shard, local, budget, owner_acceptor, in_flight)
+    .await;
+}
+
+/// Ships each of `shard`'s unplaced heads — catalogs, heads and tombstones — to all its candidate holders at
+/// once, committed at `f + 1`.
+async fn ship_shard_heads(
+  origin: u16,
+  shard: u16,
+  local: HostId,
+  budget: CommitBudget,
+  owner_acceptor: &mut Acceptor,
+  in_flight: &mut Vec<Dispatch>,
+) {
   let work = call_within(
     origin,
     shard,
@@ -6384,12 +6611,28 @@ async fn run_record_period(
       in_flight.push(dispatch);
     }
   }
-  // Record durably each seal whose content and head have both placed.
-  let _ = run_on(origin, shard, record_placed_seals);
-  // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
-  // while unplaced, its record shipped in order once they are.
-  crate::merge_service::run_merge_period(origin, shard, local, budget, owner_acceptor, in_flight)
-    .await;
+}
+
+/// Retires each destroyed volume's tombstone on `shard` that every candidate holds (AUD-29-43); the owner's
+/// acceptor forgets the volume's and its catalog's registers with it.
+async fn retire_shard_tombstones(
+  origin: u16,
+  shard: u16,
+  local: HostId,
+  owner_acceptor: &mut Acceptor,
+) {
+  let retired = call_within(
+    origin,
+    shard,
+    move |s| retire_done_tombstones(s, local),
+    HEARTBEAT_NS,
+  )
+  .await
+  .unwrap_or_default();
+  for object in retired {
+    owner_acceptor.forget_object(object);
+    owner_acceptor.forget_object(object.catalog());
+  }
 }
 
 /// Format: nanoseconds per second, for the archive header's creation time in Unix seconds.
@@ -6449,6 +6692,10 @@ async fn ship_head(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch), // A runtime refusal dispatched nothing; retry next period.
   };
+  // The owner's own acceptor keeps a single-value register at its newest position only (AUD-29-43).
+  if crate::catalog::is_single_value(&head.record.value) {
+    owner_acceptor.compact_below(head.object, head.record.sequence);
+  }
   // The placement is the owner shard's fact: record it there.
   let (object, sequence, epoch) = (head.object, head.record.sequence, head.record.epoch);
   let _ = run_on(origin, head.shard, move |s| {

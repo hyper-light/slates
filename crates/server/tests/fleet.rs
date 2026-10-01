@@ -6960,6 +6960,296 @@ fn reseal_places(instance: &str, daemon: &Daemon, name: &str, volume: VolumeId) 
   poll_snapshot_placed(&[daemon], &mut client, volume, snapshot)
 }
 
+/// Shape: how many volumes the destroy-retirement test seals on the owner — one more than the survivors, so by
+/// pigeonhole two of them share a takeover successor (one is destroyed, the other kept as the proof that
+/// successor's takeover ran).
+const PIGEONHOLE_VOLUMES: usize = 3;
+/// Shape: the coordinator periods the destroy-retirement test lets the shared successor run after it served
+/// the kept volume — one whole materialization pass after the pass that served it, and the pass itself.
+const PASSES_AFTER_SERVE: u64 = 2;
+
+/// AUD-29-43 (§4.4 destroy "tombstone the id"; §4.10 "a late copy is redundant and reclaimed"; §4.8 takeover):
+/// a destroyed volume's replicated head and content are retired on its holders, and no takeover brings it
+/// back. Three daemons form an `f = 1` fleet; the owner seals three volumes, so two share a takeover
+/// successor (pigeonhole over the two survivors); one of that pair is destroyed. Expect every survivor to
+/// release the destroyed volume's content, and — after the owner dies — the shared successor to serve the
+/// kept volume (its takeover ran) but never the destroyed one, on it or on the other survivor. Before the
+/// fix the holders kept the head and content forever and the successor materialized the destroyed volume.
+#[test]
+fn a_destroyed_volume_is_retired_on_its_holders_and_no_takeover_brings_it_back() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let survivors = [hosts[1], hosts[2]];
+  let (gone, kept) = match seal_a_shared_successor_pair(&instance_a, &daemons, &survivors) {
+    Ok(pair) => pair,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let released = destroy_and_await_release(&instance_a, &daemons, gone);
+
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor =
+    rendezvous_first(&survivors, ObjectId(kept.bytes)).expect("a survivor takes over");
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let after = observe_after_takeover(&daemons, successor_index, kept, gone);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert_retired(&released, &after);
+}
+
+/// The destroy-retirement test's verdict over what it saw around the destroy and after the takeover.
+fn assert_retired(released: &Released, after: &AfterTakeover) {
+  eprintln!("{released:?} {after:?}");
+  assert!(
+    released.held_before,
+    "a survivor held the volume's content before the destroy"
+  );
+  assert!(released.destroyed, "the owner destroyed the volume");
+  assert!(
+    released.released,
+    "every survivor released the destroyed volume's content (it held it for no head any more)"
+  );
+  assert!(
+    after.kept_served,
+    "the shared successor took over and served the kept volume"
+  );
+  assert!(
+    after.passed,
+    "the successor ran a further materialization pass"
+  );
+  assert_eq!(
+    after.gone_served,
+    vec![false, false],
+    "no survivor serves the destroyed volume after the takeover"
+  );
+}
+
+/// Seals [`PIGEONHOLE_VOLUMES`] volumes on the owner and returns two whose takeover successor among
+/// `survivors` is the same (pigeonhole): `(to destroy, to keep)`.
+fn seal_a_shared_successor_pair(
+  instance: &str,
+  daemons: &[Daemon],
+  survivors: &[HostId],
+) -> Result<(VolumeId, VolumeId), String> {
+  let mut sealed = Vec::new();
+  for index in 0..PIGEONHOLE_VOLUMES {
+    sealed.push(seal_hello_on_owner(
+      instance,
+      daemons,
+      &format!("retired-{index}"),
+    )?);
+  }
+  let successor_of = |id: &VolumeId| rendezvous_first(survivors, ObjectId(id.bytes));
+  sealed
+    .iter()
+    .enumerate()
+    .find_map(|(at, first)| {
+      sealed
+        .iter()
+        .skip(at + 1)
+        .find(|second| successor_of(second) == successor_of(first))
+        .map(|second| (*first, *second))
+    })
+    .ok_or_else(|| "no two volumes share a successor".to_owned())
+}
+
+/// What the destroy-retirement test saw around the destroy.
+#[derive(Debug)]
+struct Released {
+  /// A survivor held the volume's content before the destroy.
+  held_before: bool,
+  /// The owner answered the destroy.
+  destroyed: bool,
+  /// Every survivor released the content within the placement deadline.
+  released: bool,
+}
+
+/// Destroys `gone` on the owner (`daemons[0]`) and waits for every survivor to release its content.
+fn destroy_and_await_release(instance: &str, daemons: &[Daemon], gone: VolumeId) -> Released {
+  let Some(manifest) = daemons[0]
+    .fleet_head_manifest(ObjectId(gone.bytes))
+    .ok()
+    .flatten()
+  else {
+    return Released {
+      held_before: false,
+      destroyed: false,
+      released: false,
+    };
+  };
+  // Content places at `f + 1` (the owner and one survivor) and hedges to the rest later, so at least one
+  // survivor holds it.
+  let held_before = daemons[1..]
+    .iter()
+    .any(|daemon| daemon.fleet_holder_content(manifest) == Ok(true));
+  let mut client = Client::connect(instance);
+  let destroyed = matches!(
+    client.call(&RequestBody::Destroy { volume: gone }),
+    ReplyBody::Destroyed
+  );
+  drop(client);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let released = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    all_hold(
+      daemons[1..]
+        .iter()
+        .map(|daemon| daemon.fleet_holder_content(manifest).map(|held| !held)),
+    )
+  });
+  Released {
+    held_before,
+    destroyed,
+    released,
+  }
+}
+
+/// What the destroy-retirement test saw after the owner died.
+#[derive(Debug)]
+struct AfterTakeover {
+  /// The shared successor served the kept volume.
+  kept_served: bool,
+  /// The successor ran [`PASSES_AFTER_SERVE`] further periods.
+  passed: bool,
+  /// Whether each survivor serves the destroyed volume.
+  gone_served: Vec<bool>,
+}
+
+/// Waits for the survivor at `successor_index` to serve `kept`, then for further materialization passes,
+/// and asks every survivor whether it serves `gone`.
+fn observe_after_takeover(
+  daemons: &[Daemon],
+  successor_index: usize,
+  kept: VolumeId,
+  gone: VolumeId,
+) -> AfterTakeover {
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let kept_served = poll_status_answers(&observed, &successor_instance, kept);
+  let served_at = daemons[successor_index].fleet_progress();
+  let passed = poll_until(&observed, SERVE_DEADLINE, || {
+    Ok(daemons[successor_index].fleet_progress() >= served_at.saturating_add(PASSES_AFTER_SERVE))
+  });
+  let gone_served = daemons
+    .iter()
+    .map(|daemon| status_answers_once(daemon.instance(), gone))
+    .collect();
+  AfterTakeover {
+    kept_served,
+    passed,
+    gone_served,
+  }
+}
+
+/// AUD-29-43 (§4.10 "a late copy is redundant and reclaimed"): a holder keeps only the content its newest
+/// accepted head names. Three daemons form an `f = 1` fleet; the owner seals a volume, then writes and seals
+/// it again. Expect a survivor to hold the second seal's content, and every survivor to release the first
+/// seal's content once the newer head supersedes it. Before the fix every seal's content stayed on every
+/// holder for good.
+#[test]
+fn a_holder_releases_content_a_newer_head_supersedes() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let outcome = seal_twice_and_watch_the_first_go(&instance_a, &daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let (first_held, resealed, second_held, first_released) = match outcome {
+    Ok(outcome) => outcome,
+    Err(why) => panic!("setup: {why}"),
+  };
+  assert!(first_held, "a survivor held the first seal's content");
+  assert!(resealed, "the second seal placed");
+  assert!(second_held, "a survivor holds the second seal's content");
+  assert!(
+    first_released,
+    "every survivor released the first seal's content once the newer head superseded it"
+  );
+}
+
+/// Seals a volume on the owner, reseals it, and reports (first held by a survivor, resealed, second held by a
+/// survivor, first released on every survivor).
+fn seal_twice_and_watch_the_first_go(
+  instance: &str,
+  daemons: &[Daemon],
+) -> Result<(bool, bool, bool, bool), String> {
+  let id = seal_hello_on_owner(instance, daemons, "superseded")?;
+  let object = ObjectId(id.bytes);
+  let first = daemons[0]
+    .fleet_head_manifest(object)
+    .ok()
+    .flatten()
+    .ok_or("the first seal's manifest is identified")?;
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let survivors = &daemons[1..];
+  let first_held = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    any_holds(
+      survivors
+        .iter()
+        .map(|daemon| daemon.fleet_holder_content(first)),
+    )
+  });
+  let resealed = reseal_places(instance, &daemons[0], "superseded", id);
+  let second = daemons[0]
+    .fleet_head_manifest(object)
+    .ok()
+    .flatten()
+    .ok_or("the second seal's manifest is identified")?;
+  let second_held = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    any_holds(
+      survivors
+        .iter()
+        .map(|daemon| daemon.fleet_holder_content(second)),
+    )
+  });
+  let first_released = second != first
+    && poll_until(&observed, PLACEMENT_DEADLINE, || {
+      all_hold(
+        survivors
+          .iter()
+          .map(|daemon| daemon.fleet_holder_content(first).map(|held| !held)),
+      )
+    });
+  Ok((first_held, resealed, second_held, first_released))
+}
+
 /// Shape: the number of shards the multi-shard fleet tests run — two, the smallest count with a shard other
 /// than the control shard.
 const TWO_SHARDS: u16 = 2;

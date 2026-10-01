@@ -2435,6 +2435,7 @@ fn init_shard(
     node_regions,
     region_mirrors,
     held_content: slates_cluster::content::ContentHold::new(),
+    pending_tombstones: std::collections::BTreeMap::new(),
     seals: std::collections::BTreeMap::new(),
     put_latency: crate::fleet::PutLatency::default(),
     put_outcomes: crate::fleet::PutOutcomes::default(),

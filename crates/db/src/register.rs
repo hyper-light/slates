@@ -1465,6 +1465,41 @@ impl Acceptor {
     })
   }
 
+  /// Drops every accepted position of `object` below `sequence` (AUD-29-43). For a **single-value** register
+  /// — a volume's head, its catalog, a tombstone — phase one reports only the highest accepted position
+  /// ([`prepare`](Acceptor::prepare)), so once `sequence` is accepted the older positions can never be adopted
+  /// and keeping them is unbounded growth, one position per seal. A **ledger** (a green's merge chain) must
+  /// not be compacted: a successor replays every version. The owner of the value class decides which it is.
+  pub fn compact_below(&mut self, object: ObjectId, sequence: u64) {
+    self
+      .accepted
+      .retain(|&(held, position), _| held != object || position >= sequence);
+  }
+
+  /// The highest accepted position of `object` — by sequence, then epoch, as phase one ranks them — as its
+  /// sequence and value, or `None` when nothing of it is accepted.
+  pub fn highest(&self, object: ObjectId) -> Option<(u64, &[u8])> {
+    self
+      .accepted
+      .range((object, 0)..=(object, u64::MAX))
+      .next_back()
+      .map(|(&(_, sequence), (_, value))| (sequence, value.as_slice()))
+  }
+
+  /// Every accepted value of `object`, in sequence order (a ledger's whole history).
+  pub fn values(&self, object: ObjectId) -> impl Iterator<Item = &[u8]> + '_ {
+    self
+      .accepted
+      .range((object, 0)..=(object, u64::MAX))
+      .map(|(_, (_, value))| value.as_slice())
+  }
+
+  /// Drops every accepted position of `object` (AUD-29-43): the object's registers are retired — a destroyed
+  /// volume whose tombstone every candidate holds — so nothing of it can be adopted again.
+  pub fn forget_object(&mut self, object: ObjectId) {
+    self.accepted.retain(|&(held, _), _| held != object);
+  }
+
   /// Checks authority, epoch and position without changing the promise or accepted history (§4.8).
   /// A holder uses this before recomputing a merge record: a refused record cannot mutate its replica.
   /// The check and acceptance must run in the same owning-shard turn, with no intervening await.
@@ -2697,6 +2732,62 @@ mod tests {
       .collect();
     let mut refs: Vec<&mut dyn Holder> = holders.iter_mut().map(|h| h as &mut dyn Holder).collect();
     commit_over_holders(&candidates, &record, &mut refs)
+  }
+
+  /// AUD-29-43: do: accept three sequences of one single-value register and one of another, compact the first
+  /// below its newest, then forget the second; expect phase one to report the first's newest record unchanged,
+  /// the older positions gone from the durable state, the other object untouched by the compaction and gone
+  /// after its forget.
+  #[test]
+  fn a_compacted_register_keeps_its_newest_position_and_a_forgotten_one_keeps_nothing() {
+    let config = Configuration::solo(HostId(1));
+    let authority = Authority {
+      generation: config.version,
+      owner: config.owner,
+    };
+    let mut acceptor = Acceptor::new(config.owner, authority);
+    for sequence in 1..=3 {
+      acceptor
+        .accept(&record_under(
+          &config,
+          7,
+          sequence,
+          HostEpoch(1),
+          &sequence.to_le_bytes(),
+        ))
+        .unwrap();
+    }
+    acceptor
+      .accept(&record_under(&config, 8, 1, HostEpoch(1), b"other"))
+      .unwrap();
+    let first = ObjectId::new(config.owner, 7);
+    let second = ObjectId::new(config.owner, 8);
+    acceptor.compact_below(first, 3);
+    let positions = |acceptor: &Acceptor, object: ObjectId| -> Vec<u64> {
+      acceptor
+        .persisted()
+        .1
+        .into_iter()
+        .filter(|(held, ..)| *held == object)
+        .map(|(_, sequence, ..)| sequence)
+        .collect()
+    };
+    assert_eq!(positions(&acceptor, first), vec![3]);
+    assert_eq!(positions(&acceptor, second), vec![1]);
+    let prepare = |object| Prepare {
+      owner: config.owner,
+      object,
+      epoch: HostEpoch(2),
+      generation: config.version,
+    };
+    let promise = acceptor.prepare(&prepare(first)).unwrap();
+    assert_eq!(
+      promise.highest.map(|held| (held.sequence, held.value)),
+      Some((3, 3u64.to_le_bytes().to_vec()))
+    );
+    acceptor.forget_object(second);
+    assert!(positions(&acceptor, second).is_empty());
+    assert_eq!(acceptor.prepare(&prepare(second)).unwrap().highest, None);
   }
 
   /// Shape: the largest `f` the exhaustive quorum oracles enumerate — cohorts up to `2f + 1 = 7` hosts, so

@@ -571,6 +571,10 @@ pub struct ShardState {
   /// record, the origin, the chain and the engine rebuilt from this node's own accepted records and
   /// held inputs. Bounded by the objects this node owns; empty on a laptop.
   pub pending_green_materializations: BTreeMap<ObjectId, crate::merge_service::MergeRecordValue>,
+  /// Taken-over volumes whose register this node adopted as a **tombstone** (AUD-29-43), with the tombstone's
+  /// sequence: awaiting `Op::TombstoneAdopted` on the shard the id routes to, from where the record plane
+  /// ships the tombstone's remaining stages. Never materialized. Bounded by the objects this node owns.
+  pub pending_tombstones: BTreeMap<ObjectId, u64>,
 }
 
 /// A work volume's accumulated declared operations (§4.16), composed into an increment on submit.

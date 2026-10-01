@@ -411,6 +411,10 @@ pub enum ContentRefusal {
   },
   /// A chunk's payload does not hash to its declared identity.
   IdentityMismatch,
+  /// The archive ships a chunk its manifest does not reference (AUD-29-43: shipped content is restricted to
+  /// the manifest's closure; an owner ships exactly the referenced chunks a holder lacks). Refused before any
+  /// chunk is decoded or hashed.
+  Unreferenced,
 }
 
 /// The distinct chunk identities a manifest references, in first-reference order (a hole's zero
@@ -489,14 +493,34 @@ pub struct ContentHold {
   objects: BTreeMap<ObjectId, Held>,
   /// Requests refused by the authority check (a non-vacuity counter for the scope).
   unauthorized: u64,
+  /// Puts refused because the holder's accepted records already supersede them (AUD-29-43; a non-vacuity
+  /// counter for the retention rule at the door).
+  superseded: u64,
 }
 
-/// One object's held content: its manifests (each with the archive header it arrived under) and how many of
-/// them reference each chunk.
+/// One object's held content: its manifests (each with the archive header it arrived under and its latest
+/// placement) and how many of them reference each chunk.
 #[derive(Debug, Default)]
 struct Held {
-  manifests: BTreeMap<[u8; 32], Archive>,
+  manifests: BTreeMap<[u8; 32], HeldManifest>,
   chunks: BTreeMap<[u8; 32], u64>,
+}
+
+/// A held manifest: the archive header and tree it arrived under (no chunks) and when it was last placed.
+#[derive(Debug)]
+struct HeldManifest {
+  record: Archive,
+  placed: Placed,
+}
+
+/// How content was last placed on this holder (AUD-29-43): the register sequence the owner placed it for.
+/// The holder's retention rule reads it — content placed for a sequence no accepted record has reached yet is
+/// in flight toward its record, and the newest such placement of an object is kept until an event supersedes
+/// it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Placed {
+  /// The register sequence the content was placed for.
+  pub sequence: u64,
 }
 
 impl ContentHold {
@@ -538,6 +562,11 @@ impl ContentHold {
     self.unauthorized
   }
 
+  /// Puts refused because the holder's accepted records already supersede them (AUD-29-43).
+  pub fn superseded(&self) -> u64 {
+    self.superseded
+  }
+
   /// Of `chunks`, the identities this hold lacks **for `object`** — the missing set an offer is answered
   /// with. A chunk held only for another object counts as lacking: its presence is not this object's to know.
   pub fn missing_of(&self, object: ObjectId, chunks: &[[u8; 32]]) -> Vec<[u8; 32]> {
@@ -549,34 +578,60 @@ impl ContentHold {
       .collect()
   }
 
-  /// Holds `archive` for `object` — every chunk it ships verified against its identity, every chunk its
-  /// manifest references required to be shipped or already held **for this object** — and returns the
-  /// manifest identity now held. Nothing is stored on a refusal; holding a manifest already held is a no-op.
-  pub fn hold(&mut self, object: ObjectId, archive: Archive) -> Result<[u8; 32], ContentRefusal> {
-    if !archive.chunks.iter().all(verified) {
+  /// Holds `archive` for `object`, placed as `placed` — only chunks its manifest references may be shipped,
+  /// every chunk the manifest references must be shipped or already held **for this object**, and every
+  /// shipped chunk the object does not already hold is verified against its identity — and returns the
+  /// manifest identity now held. Nothing is stored on a refusal; holding a manifest already held stores
+  /// nothing and refreshes its placement.
+  pub fn hold(
+    &mut self,
+    object: ObjectId,
+    placed: Placed,
+    archive: Archive,
+  ) -> Result<[u8; 32], ContentRefusal> {
+    let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&archive.manifest).into_iter().collect();
+    if archive
+      .chunks
+      .iter()
+      .any(|chunk| !referenced.contains(&chunk.identity))
+    {
+      return Err(ContentRefusal::Unreferenced);
+    }
+    let held_chunks = self.objects.get(&object).map(|held| &held.chunks);
+    let is_held =
+      |identity: &[u8; 32]| held_chunks.is_some_and(|chunks| chunks.contains_key(identity));
+    let missing = referenced
+      .iter()
+      .filter(|identity| {
+        !is_held(identity)
+          && !archive
+            .chunks
+            .iter()
+            .any(|chunk| chunk.identity == **identity)
+      })
+      .count();
+    if missing > 0 {
+      return Err(ContentRefusal::Incomplete { missing });
+    }
+    if !archive
+      .chunks
+      .iter()
+      .filter(|chunk| !is_held(&chunk.identity))
+      .all(verified)
+    {
       return Err(ContentRefusal::IdentityMismatch);
     }
+    let identity = archive.manifest_identity();
     let held = self.objects.entry(object).or_default();
+    if let Some(record) = held.manifests.get_mut(&identity) {
+      record.placed = placed;
+      return Ok(identity);
+    }
     let mut shipped: BTreeMap<[u8; 32], Chunk> = archive
       .chunks
       .iter()
       .map(|chunk| (chunk.identity, chunk.clone()))
       .collect();
-    let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&archive.manifest).into_iter().collect();
-    let missing = referenced
-      .iter()
-      .filter(|identity| !shipped.contains_key(*identity) && !held.chunks.contains_key(*identity))
-      .count();
-    if missing > 0 {
-      if held.manifests.is_empty() && held.chunks.is_empty() {
-        self.objects.remove(&object);
-      }
-      return Err(ContentRefusal::Incomplete { missing });
-    }
-    let identity = archive.manifest_identity();
-    if held.manifests.contains_key(&identity) {
-      return Ok(identity);
-    }
     for chunk_identity in &referenced {
       let references = held.chunks.entry(*chunk_identity).or_insert(0);
       if *references == 0
@@ -586,10 +641,51 @@ impl ContentHold {
       }
       *references = references.saturating_add(1);
     }
-    held
-      .manifests
-      .insert(identity, with_chunks(&archive, Vec::new()));
+    held.manifests.insert(
+      identity,
+      HeldManifest {
+        record: with_chunks(&archive, Vec::new()),
+        placed,
+      },
+    );
     Ok(identity)
+  }
+
+  /// Keeps, of what is held for `object`, only the manifests `keep` accepts given their identity and latest
+  /// placement, releasing the rest exactly as [`forget_manifest`](Self::forget_manifest) does (AUD-29-43:
+  /// the holder's retention rule is the caller's, from its accepted records). Returns how many were released.
+  pub fn retain(
+    &mut self,
+    object: ObjectId,
+    mut keep: impl FnMut(&[u8; 32], Placed) -> bool,
+  ) -> usize {
+    let released: Vec<[u8; 32]> = self
+      .objects
+      .get(&object)
+      .map(|held| {
+        held
+          .manifests
+          .iter()
+          .filter(|(identity, record)| !keep(identity, record.placed))
+          .map(|(identity, _)| *identity)
+          .collect()
+      })
+      .unwrap_or_default();
+    released
+      .iter()
+      .filter(|identity| self.forget_manifest(object, identity))
+      .count()
+  }
+
+  /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it.
+  pub fn newest_placed(&self, object: ObjectId) -> Option<u64> {
+    self
+      .objects
+      .get(&object)?
+      .manifests
+      .values()
+      .map(|record| record.placed.sequence)
+      .max()
   }
 
   /// Forgets a manifest held for `object`: its record is dropped and each chunk it references loses one of
@@ -603,7 +699,7 @@ impl ContentHold {
     let Some(held) = self.objects.get_mut(&object) else {
       return false;
     };
-    let Some(record) = held.manifests.remove(identity) else {
+    let Some(HeldManifest { record, .. }) = held.manifests.remove(identity) else {
       return false;
     };
     let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&record.manifest).into_iter().collect();
@@ -620,6 +716,21 @@ impl ContentHold {
       self.objects.remove(&object);
     }
     true
+  }
+
+  /// Forgets everything held for `object` (AUD-29-43): every manifest, and each chunk's reference for the
+  /// object (the bytes go when no object references them). The authoritative releases call it — a destroyed
+  /// object's tombstone, a copy reclaimed as stale. Returns how many manifests were held.
+  pub fn forget_object(&mut self, object: ObjectId) -> usize {
+    let manifests: Vec<[u8; 32]> = self
+      .objects
+      .get(&object)
+      .map(|held| held.manifests.keys().copied().collect())
+      .unwrap_or_default();
+    manifests
+      .iter()
+      .filter(|identity| self.forget_manifest(object, identity))
+      .count()
   }
 
   /// Forgets the manifest with `identity` for every object holding it (a test's injection of content loss,
@@ -641,7 +752,7 @@ impl ContentHold {
   /// The whole archive for a manifest held for `object` — its header, manifest, and every referenced chunk
   /// in reference order — or `None` if it is not held whole for that object.
   pub fn archive_of(&self, object: ObjectId, identity: &[u8; 32]) -> Option<Archive> {
-    let record = self.objects.get(&object)?.manifests.get(identity)?;
+    let record = &self.objects.get(&object)?.manifests.get(identity)?.record;
     let mut chunks = Vec::new();
     for referenced in referenced_chunks(&record.manifest) {
       chunks.push(self.store.get(&referenced)?.clone());
@@ -651,16 +762,20 @@ impl ContentHold {
 
   /// Serves one content request as `holder`, once `authorized` has allowed the access it asks for the object
   /// it names (checked before any lookup or allocation): an offer is answered with the object's missing set,
-  /// a put with a bound acknowledgement once verified and held whole, a fetch with the object's archive.
-  /// Anything refused, malformed, unverifiable, incomplete or unheld is answered with the same empty reply.
+  /// a put — once `admits` accepts its object, sequence and manifest (the holder's retention rule, so a put its
+  /// accepted records already supersede is never acknowledged, AUD-29-43) — with a bound acknowledgement once
+  /// verified and held whole, a fetch with the object's archive. Anything refused, malformed, unverifiable,
+  /// incomplete or unheld is answered with the same empty reply. Returns the reply and, for a put that was
+  /// held, its object, so the caller applies its retention rule to what the put superseded.
   pub fn serve(
     &mut self,
     holder: HostId,
     request: &[u8],
     authorized: impl FnOnce(ContentAccess, ObjectId) -> bool,
-  ) -> Vec<u8> {
+    admits: impl FnOnce(ObjectId, u64, &[u8; 32]) -> bool,
+  ) -> (Vec<u8>, Option<ObjectId>) {
     let Ok(message) = ContentMessage::decode(request) else {
-      return Vec::new();
+      return (Vec::new(), None);
     };
     let asked = match &message {
       ContentMessage::Offer { object, .. } | ContentMessage::Put { object, .. } => {
@@ -670,13 +785,13 @@ impl ContentHold {
       _ => None,
     };
     let Some((access, object)) = asked else {
-      return Vec::new();
+      return (Vec::new(), None);
     };
     if !authorized(access, object) {
       self.unauthorized = self.unauthorized.saturating_add(1);
-      return Vec::new();
+      return (Vec::new(), None);
     }
-    match message {
+    let reply = match message {
       ContentMessage::Offer {
         object,
         sequence,
@@ -694,14 +809,23 @@ impl ContentHold {
         sequence,
         archive,
       } => match Archive::decode(&archive).map_err(ContentRefusal::Malformed) {
-        Ok(archive) => match self.hold(object, archive) {
-          Ok(manifest) => ContentMessage::Ack(ContentAck {
-            holder,
-            object,
-            sequence,
-            manifest,
-          })
-          .encode(),
+        Ok(archive) if !admits(object, sequence, &archive.manifest_identity()) => {
+          self.superseded = self.superseded.saturating_add(1);
+          Vec::new()
+        }
+        Ok(archive) => match self.hold(object, Placed { sequence }, archive) {
+          Ok(manifest) => {
+            return (
+              ContentMessage::Ack(ContentAck {
+                holder,
+                object,
+                sequence,
+                manifest,
+              })
+              .encode(),
+              Some(object),
+            );
+          }
           Err(_) => Vec::new(),
         },
         Err(_) => Vec::new(),
@@ -714,7 +838,8 @@ impl ContentHold {
         None => Vec::new(),
       },
       _ => Vec::new(),
-    }
+    };
+    (reply, None)
   }
 }
 
@@ -1195,13 +1320,15 @@ mod tests {
 
     let partial = with_chunks(&archive, vec![archive.chunks[0].clone()]);
     assert_eq!(
-      hold.hold(OBJECT, partial),
+      hold.hold(OBJECT, Placed::default(), partial),
       Err(ContentRefusal::Incomplete { missing: 1 }),
       "a manifest referencing an unshipped, unheld chunk is not held"
     );
     assert_eq!(hold.chunk_count(), 0, "nothing stored on a refusal");
 
-    let manifest = hold.hold(OBJECT, archive.clone()).unwrap();
+    let manifest = hold
+      .hold(OBJECT, Placed::default(), archive.clone())
+      .unwrap();
     assert_eq!(manifest, archive.manifest_identity());
     assert!(hold.holds_manifest(OBJECT, &manifest));
     assert_eq!(hold.chunk_count(), 2);
@@ -1232,7 +1359,7 @@ mod tests {
       chunk: archive.chunks[0].identity,
       chunk_offset: 0,
     }]);
-    hold.hold(OBJECT, earlier).unwrap();
+    hold.hold(OBJECT, Placed::default(), earlier).unwrap();
 
     let offer = ContentMessage::Offer {
       object: OBJECT,
@@ -1240,9 +1367,11 @@ mod tests {
       manifest: archive.manifest_identity(),
       chunks: archive.chunks.iter().map(|c| c.identity).collect(),
     };
-    let Ok(ContentMessage::Missing { missing, .. }) =
-      ContentMessage::decode(&hold.serve(holder, &offer.encode(), |_, _| true))
-    else {
+    let Ok(ContentMessage::Missing { missing, .. }) = ContentMessage::decode(
+      &hold
+        .serve(holder, &offer.encode(), |_, _| true, |_, _, _| true)
+        .0,
+    ) else {
       panic!("an offer is answered with the missing set");
     };
     assert_eq!(missing, vec![archive.chunks[1].identity]);
@@ -1250,30 +1379,36 @@ mod tests {
     // A corrupt put: flip a bit in the missing chunk's payload.
     let mut corrupt = with_chunks(&archive, vec![archive.chunks[1].clone()]);
     corrupt.chunks[0].payload[0] ^= 0x01;
-    let refused = hold.serve(
-      holder,
-      &ContentMessage::Put {
-        object: OBJECT,
-        sequence: SEQUENCE,
-        archive: corrupt.encode(),
-      }
-      .encode(),
-      |_, _| true,
-    );
+    let refused = hold
+      .serve(
+        holder,
+        &ContentMessage::Put {
+          object: OBJECT,
+          sequence: SEQUENCE,
+          archive: corrupt.encode(),
+        }
+        .encode(),
+        |_, _| true,
+        |_, _, _| true,
+      )
+      .0;
     assert!(refused.is_empty(), "a corrupt chunk is refused, not held");
     assert_eq!(hold.chunk_count(), 1);
 
     let partial = with_chunks(&archive, vec![archive.chunks[1].clone()]);
-    let reply = hold.serve(
-      holder,
-      &ContentMessage::Put {
-        object: OBJECT,
-        sequence: SEQUENCE,
-        archive: partial.encode(),
-      }
-      .encode(),
-      |_, _| true,
-    );
+    let reply = hold
+      .serve(
+        holder,
+        &ContentMessage::Put {
+          object: OBJECT,
+          sequence: SEQUENCE,
+          archive: partial.encode(),
+        }
+        .encode(),
+        |_, _| true,
+        |_, _, _| true,
+      )
+      .0;
     let Ok(ContentMessage::Ack(ack)) = ContentMessage::decode(&reply) else {
       panic!("a complete put is acknowledged");
     };
@@ -1282,15 +1417,18 @@ mod tests {
     assert_eq!(ack.holder, holder);
     assert_eq!(hold.chunk_count(), 2, "exactly the missing chunk was added");
 
-    let fetched = hold.serve(
-      holder,
-      &ContentMessage::Fetch {
-        object: OBJECT,
-        manifest: archive.manifest_identity(),
-      }
-      .encode(),
-      |_, _| true,
-    );
+    let fetched = hold
+      .serve(
+        holder,
+        &ContentMessage::Fetch {
+          object: OBJECT,
+          manifest: archive.manifest_identity(),
+        }
+        .encode(),
+        |_, _| true,
+        |_, _, _| true,
+      )
+      .0;
     let Ok(ContentMessage::Have { archive: bytes }) = ContentMessage::decode(&fetched) else {
       panic!("a fetch is answered with the archive");
     };
@@ -1305,7 +1443,9 @@ mod tests {
           }
           .encode(),
           |_, _| true,
+          |_, _, _| true,
         )
+        .0
         .is_empty(),
       "a manifest not held is an empty answer"
     );
@@ -1323,29 +1463,34 @@ mod tests {
     let archive = two_chunk_archive();
     let identities: Vec<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
     let mut hold = ContentHold::new();
-    let manifest = hold.hold(OBJECT, archive.clone()).unwrap();
+    let manifest = hold
+      .hold(OBJECT, Placed::default(), archive.clone())
+      .unwrap();
     assert_eq!(hold.missing_of(OTHER, &identities), identities);
     let leaning = with_chunks(&archive, Vec::new());
     assert_eq!(
-      hold.hold(OTHER, leaning),
+      hold.hold(OTHER, Placed::default(), leaning),
       Err(ContentRefusal::Incomplete { missing: 2 })
     );
     assert!(hold.archive_of(OTHER, &manifest).is_none());
-    let fetched = hold.serve(
-      HostId(3),
-      &ContentMessage::Fetch {
-        object: OTHER,
-        manifest,
-      }
-      .encode(),
-      |_, _| true,
-    );
+    let fetched = hold
+      .serve(
+        HostId(3),
+        &ContentMessage::Fetch {
+          object: OTHER,
+          manifest,
+        }
+        .encode(),
+        |_, _| true,
+        |_, _, _| true,
+      )
+      .0;
     assert!(
       fetched.is_empty(),
       "another object's manifest is not served"
     );
     assert!(hold.missing_of(OBJECT, &identities).is_empty());
-    hold.hold(OTHER, archive).unwrap();
+    hold.hold(OTHER, Placed::default(), archive).unwrap();
     assert_eq!(
       hold.chunk_count(),
       2,
@@ -1392,10 +1537,15 @@ mod tests {
       ),
     ];
     for (expected, request) in &requests {
-      let reply = hold.serve(HostId(4), &request.encode(), |access, object| {
-        assert_eq!((access, object), (*expected, OBJECT));
-        false
-      });
+      let (reply, _) = hold.serve(
+        HostId(4),
+        &request.encode(),
+        |access, object| {
+          assert_eq!((access, object), (*expected, OBJECT));
+          false
+        },
+        |_, _, _| true,
+      );
       assert!(reply.is_empty());
     }
     assert_eq!(hold.chunk_count(), 0);
@@ -1498,6 +1648,10 @@ mod ownership_oracle {
       object: usize,
       manifest: usize,
       shipped: BTreeSet<usize>,
+      /// Whether the put is **offered**, as an owner ships it: after an offer, exactly the manifest's chunks
+      /// the object does not yet hold (the missing set), whatever `shipped` says. The other arm ships
+      /// `shipped` as drawn and reaches the refusals.
+      offered: bool,
     },
     Forget {
       object: usize,
@@ -1512,13 +1666,15 @@ mod ownership_oracle {
       0..OBJECTS,
       0..MANIFESTS,
       proptest::collection::btree_set(0..POOL, 0..=POOL),
+      any::<bool>(),
     )
-      .prop_map(|(put, object, manifest, shipped)| {
+      .prop_map(|(put, object, manifest, shipped, offered)| {
         if put {
           Step::Put {
             object,
             manifest,
             shipped,
+            offered,
           }
         } else {
           Step::Forget { object, manifest }
@@ -1548,8 +1704,8 @@ mod ownership_oracle {
     PutRefusedHeldElsewhere,
     /// A put of a manifest the object already holds.
     Retry,
-    /// A completed put that shipped a chunk the manifest does not reference.
-    ShippedUnreferenced,
+    /// A put refused for shipping a chunk the manifest does not reference.
+    PutRefusedUnreferenced,
     /// One chunk held for two objects at once.
     SharedAcrossObjects,
     /// A forget that kept a chunk another of the object's manifests still references.
@@ -1567,7 +1723,7 @@ mod ownership_oracle {
     Case::PutRefused,
     Case::PutRefusedHeldElsewhere,
     Case::Retry,
-    Case::ShippedUnreferenced,
+    Case::PutRefusedUnreferenced,
     Case::SharedAcrossObjects,
     Case::ForgetKept,
     Case::ForgetReleased,
@@ -1589,8 +1745,9 @@ mod ownership_oracle {
       .collect()
   }
 
-  /// Applies `step` to the model by the rule — a put completes when every referenced chunk is shipped now or
-  /// referenced by a manifest the object already holds; a held manifest's retry completes — and records the
+  /// Applies `step` to the model by the rule — a put shipping a chunk its manifest does not reference is
+  /// refused; otherwise a put completes when every referenced chunk is shipped now or referenced by a
+  /// manifest the object already holds; a held manifest's retry completes — and records the
   /// cases it meets. Returns whether the step succeeded, or `None` for a step naming no manifest of the shape.
   fn model_apply(
     model: &mut Model,
@@ -1603,8 +1760,13 @@ mod ownership_oracle {
         object,
         manifest,
         shipped,
+        ..
       } => {
         let referenced = manifests.get(*manifest)?;
+        if !shipped.is_subset(referenced) {
+          census.insert(Case::PutRefusedUnreferenced);
+          return Some(false);
+        }
         if model
           .get(object)
           .is_some_and(|held| held.contains(manifest))
@@ -1633,9 +1795,6 @@ mod ownership_oracle {
         } else {
           Case::PutCompletedFromHeld
         });
-        if !shipped.is_subset(referenced) {
-          census.insert(Case::ShippedUnreferenced);
-        }
         model.entry(*object).or_default().insert(*manifest);
         Some(true)
       }
@@ -1705,6 +1864,31 @@ mod ownership_oracle {
     Ok(())
   }
 
+  /// `step` as it runs against `manifests` from the model's state: an offered put ships exactly its manifest's
+  /// chunks the object does not yet hold — the missing set the offer draws.
+  fn resolve(step: &Step, manifests: &[BTreeSet<usize>], model: &Model) -> Step {
+    match step {
+      Step::Put {
+        object,
+        manifest,
+        offered: true,
+        ..
+      } => {
+        let have = chunks_of(model, manifests, *object);
+        Step::Put {
+          object: *object,
+          manifest: *manifest,
+          shipped: manifests
+            .get(*manifest)
+            .map(|referenced| referenced.difference(&have).copied().collect())
+            .unwrap_or_default(),
+          offered: false,
+        }
+      }
+      other => other.clone(),
+    }
+  }
+
   /// Runs one shape and history on a fresh hold against the model, recording the cases met.
   fn run(
     manifests: &[BTreeSet<usize>],
@@ -1714,6 +1898,7 @@ mod ownership_oracle {
     let mut hold = ContentHold::new();
     let mut model = Model::new();
     for step in steps {
+      let step = &resolve(step, manifests, &model);
       let Some(expected) = model_apply(&mut model, manifests, step, census) else {
         continue;
       };
@@ -1722,9 +1907,12 @@ mod ownership_oracle {
           object: at,
           manifest,
           shipped,
-        } => manifests
-          .get(*manifest)
-          .is_some_and(|chunks| hold.hold(object(*at), archive(chunks, shipped)).is_ok()),
+          ..
+        } => manifests.get(*manifest).is_some_and(|chunks| {
+          hold
+            .hold(object(*at), Placed::default(), archive(chunks, shipped))
+            .is_ok()
+        }),
         Step::Forget {
           object: at,
           manifest,
@@ -1749,9 +1937,10 @@ mod ownership_oracle {
 
   /// AUD-29-44's three witnesses, as the audit ran them, over two manifests that share one chunk: do: (1)
   /// put one manifest twice and forget it once, (2) hold the first, hold the second without shipping the
-  /// shared chunk, then forget the first, (3) ship an unreferenced chunk with a manifest and forget the
-  /// manifest; expect (1) no chunk retained, (2) the second still reconstructible with the shared chunk kept,
-  /// (3) no chunk orphaned.
+  /// shared chunk, then forget the first, (3) ship an unreferenced chunk with a manifest; expect (1) no chunk
+  /// retained, (2) the second still reconstructible with the shared chunk kept, (3) the put refused
+  /// `Unreferenced` before anything is stored (AUD-29-43 restricts shipped content to the manifest's closure),
+  /// so nothing can be orphaned.
   #[test]
   fn the_audits_three_ownership_witnesses_hold() {
     let (shared, only_first, only_second, unreferenced) = (0, 1, 2, 3);
@@ -1760,8 +1949,12 @@ mod ownership_oracle {
     let a = object(0);
 
     let mut hold = ContentHold::new();
-    hold.hold(a, archive(&first, &first)).unwrap();
-    hold.hold(a, archive(&first, &first)).unwrap();
+    hold
+      .hold(a, Placed::default(), archive(&first, &first))
+      .unwrap();
+    hold
+      .hold(a, Placed::default(), archive(&first, &first))
+      .unwrap();
     hold.forget_manifest(a, &identity(&first));
     assert_eq!(
       (hold.manifest_count(), hold.chunk_count()),
@@ -1770,9 +1963,15 @@ mod ownership_oracle {
     );
 
     let mut hold = ContentHold::new();
-    hold.hold(a, archive(&first, &first)).unwrap();
     hold
-      .hold(a, archive(&second, &BTreeSet::from([only_second])))
+      .hold(a, Placed::default(), archive(&first, &first))
+      .unwrap();
+    hold
+      .hold(
+        a,
+        Placed::default(),
+        archive(&second, &BTreeSet::from([only_second])),
+      )
       .expect("the shared chunk is already held for the object");
     hold.forget_manifest(a, &identity(&first));
     let kept = hold
@@ -1782,14 +1981,15 @@ mod ownership_oracle {
 
     let mut hold = ContentHold::new();
     let with_extra: BTreeSet<usize> = first.iter().copied().chain([unreferenced]).collect();
-    hold.hold(a, archive(&first, &with_extra)).unwrap();
     assert_eq!(
-      hold.chunk_count(),
-      first.len(),
-      "the unreferenced chunk was never kept"
+      hold.hold(a, Placed::default(), archive(&first, &with_extra)),
+      Err(ContentRefusal::Unreferenced)
     );
-    hold.forget_manifest(a, &identity(&first));
-    assert_eq!(hold.chunk_count(), 0, "(3) nothing orphaned");
+    assert_eq!(
+      (hold.manifest_count(), hold.chunk_count()),
+      (0, 0),
+      "(3) nothing stored, so nothing orphaned"
+    );
   }
 
   /// AUD-29-44: do: run generated shapes and histories of puts and forgets on a hold and on the serial model,

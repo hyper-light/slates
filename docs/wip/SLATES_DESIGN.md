@@ -1434,7 +1434,9 @@ metadata provisioning path, not arbitrary host pathname resolution. A scratch vo
 - destroy(volume): mark Destroying, refuse new attachments, recall leases, walk deadlists and
   unique chunks in cooperative slices on the owner shard — driven there whether or not the owner has a
   client of its own (the verb wakes the owner's serve rounds; the reaper's cadence retries a refused
-  record) — release quota, tombstone; the base directory is untouched. A volume being destroyed is left
+  record) — release quota, tombstone; the base directory is untouched. In a fleet the tombstone is the
+  volume's final register value, shipped to every candidate holder and retired once all hold it (§4.10
+  status, AUD-29-43); a takeover adopts it and never re-materializes the volume. A volume being destroyed is left
   out of the shard's recovery image (its record says Destroying; recovery completes it). Before 2026-09-29
   a destroy forwarded to a shard without a client was never stepped
   (`docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md`).
@@ -3630,6 +3632,46 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   `ContentUnavailable`, and the log is kept as evidence. The one verb it takes is its admin's `Destroy`,
 >   the reviewed release
 >   (`docs/bugs/2026-09-30-green-recovery-served-an-empty-or-shortened-history.md`).
+>
+> **Status (2026-09-30, AUD-29-43 in part, a destroy retires its replicas).** A destroyed volume's
+> registers close in two stages, each an ordinary register write shipped to every candidate and committed at
+> `f + 1` (`crates/server/src/tombstone.rs`).
+> - **The tombstone.** It is written at one past every sequence the volume's registers used, and held
+>   durably by the owner's partition until it is retired (bounded by the volume capacity). A holder that
+>   accepts it releases the volume's content.
+> - **The retirement.** It is written at the next sequence once *every* candidate holds the tombstone. A
+>   holder that accepts it drops the volume's and its catalog's records. Waiting for every candidate is what
+>   keeps a later takeover from meeting a lone live head.
+> - **A takeover adopts the tombstone** and never materializes the volume. Before this a successor served a
+>   destroyed volume again.
+> - **On a laptop** the tombstone retires with the destroy: there is no remote candidate to ship to.
+> - **Single-value registers** (head, catalog, tombstone) keep only their newest accepted position. A
+>   green's chain is a ledger and is kept whole.
+> - **A stale copy the takeover reclaims** releases its content too.
+>
+> - **What a holder keeps** (`crates/server/src/content_retention.rs`). A manifest held for another owner
+>   is kept only while one of these holds:
+>   - the object's newest accepted record names it for this holder: a head naming it *and listing this
+>     holder*, or any green ledger position naming it as inputs;
+>   - it is the object's newest placement and ahead of every accepted record. An owner has at most one
+>     placement in flight per object, and its record may follow after any delay: a green's records ship
+>     strictly in version order.
+>
+>   Ahead content is released by events, never by time: an accepted record at or past its sequence that
+>   does not name it, a newer placement, the tombstone, or the stale-copy reclaim. Superseded content and a
+>   late copy the head's holder list does not name go at once. A first cut released ahead content after a
+>   fixed window; under load it released a green's inputs 1.2 s after their put, before their record
+>   arrived, and the submit waiting on that record never completed. It was replaced, not lengthened.
+> - **The rule runs at three points:**
+>   - at the door, where a put the records already supersede is refused, so the owner never counts an
+>     acknowledgement for bytes the holder would drop;
+>   - after every accepted record;
+>   - after every put the hold accepts.
+> - **Shipped content is restricted to the manifest's closure.** A put shipping a chunk its manifest does
+>   not reference is refused `Unreferenced` before any chunk is decoded.
+>
+> Still open: arena-held content under an all-cost typed admission
+> (`docs/bugs/2026-09-30-a-destroyed-volume-came-back-on-takeover.md`).
 >
 > **Status (2026-09-30, AUD-29-17, the catalog register class).** A volume's catalog is a register of its
 > own, as §4.8 lists it.
