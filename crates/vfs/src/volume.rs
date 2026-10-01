@@ -1780,7 +1780,9 @@ impl Volume {
   /// is (`UTIME_OMIT`). The change time is set to `ctime` when the caller supplies one — a kernel
   /// flushing its own writeback-cached timestamps (`FATTR_CTIME`) is the authority on it — and
   /// otherwise advances to now, as POSIX requires for an attribute change. `UTIME_NOW` is resolved
-  /// by the transport into an explicit value through [`Volume::wall_ns`] (AC-3.10). Copy-on-write.
+  /// by the transport into an explicit value through [`Volume::wall_ns`] (AC-3.10). The birth time is
+  /// set only when `btime` is `Some`: a takeover successor restoring an archived node (AUD-29-56), or a
+  /// host whose API sets a creation time. Copy-on-write.
   pub fn set_times(
     &mut self,
     store: &mut Store,
@@ -1788,6 +1790,7 @@ impl Volume {
     atime: Option<i64>,
     mtime: Option<i64>,
     ctime: Option<i64>,
+    btime: Option<i64>,
   ) -> Result<(), VfsError> {
     self.live()?;
     self.namespace_inode(store, no)?;
@@ -1800,6 +1803,9 @@ impl Volume {
     }
     if let Some(mtime) = mtime {
       inode.attrs.mtime = mtime;
+    }
+    if let Some(btime) = btime {
+      inode.attrs.btime = btime;
     }
     inode.stamp_change(ctime.unwrap_or(now));
     self.record(Op::Setattr, "", Some(no), prev);

@@ -25,8 +25,12 @@ pub const FORMAT_MAJOR: u16 = 1;
 /// the owner (`uid`, `gid`) to that metadata and put the root directory's own metadata at the head
 /// of the manifest section, both covered by the header's manifest identity — so a clone or a
 /// takeover successor rebuilds ownership, not only modes and times. As with minor 1, the manifest
-/// of an older minor is not decoded: archives live in RAM within one fleet release.
-pub const FORMAT_MINOR: u16 = 2;
+/// of an older minor is not decoded: archives live in RAM within one fleet release. Minor 3
+/// (2026-09-30, AUD-29-56) made the metadata's times signed, added the access and birth times, and
+/// replaced the "has extended attributes" flag with the attributes themselves (each name and its value's
+/// extents over the archive's chunks), all covered by the manifest identity.
+/// Format: minor 3 is the version this writer emits.
+pub const FORMAT_MINOR: u16 = 3;
 
 /// Format: header flags. Bit 0 the manifest is compressed; bit 1 dictionaries are present; bit 2
 /// a seek table is present.

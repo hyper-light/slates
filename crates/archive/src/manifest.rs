@@ -13,14 +13,16 @@
 //! truncated or malformed tree is a typed refusal, never a panic (§4.9). This module is pure: no
 //! I/O, no clock, no randomness.
 //!
-//! Each directory entry carries its child's per-node metadata (inode number, mode, modification
-//! and change times, size, link count, and a flag for whether the child has extended attributes),
-//! the field list of §2.6 item 4 (`research/compression-archive-dedup.md` §"Manifest"). The
-//! metadata is written into both encodings and hashed into the Merkle identity, so a change to any
-//! entry's mode or times changes the root identity exactly as a change to its content does. This
-//! addition is why the format's minor version is 1 (the root identity of a v1.0 tree and a v1.1
-//! tree of the same shape differ). The root directory has no entry naming it, so its own metadata is
-//! not carried; every named node's is.
+//! Each directory entry carries its child's per-node metadata (inode number, mode, access,
+//! modification, change and birth times as signed nanoseconds, size, link count, owner, and the
+//! extended attributes — each a name and its value's extents over the archive's chunks), the field
+//! list of §2.6 item 4 (`research/compression-archive-dedup.md` §"Manifest"). The metadata is written
+//! into both encodings and hashed into the Merkle identity, so a change to any entry's mode, times or
+//! attributes changes the root identity exactly as a change to its content does. Minor 1 added the
+//! metadata, minor 2 the owner and the root's own metadata ahead of the tree, and minor 3 (2026-09-30,
+//! AUD-29-56) the signed times, the access and birth times and the attribute values: before it an
+//! archive carried only an "has attributes" flag (always written zero), so a placed snapshot could be
+//! verified and served by a successor with its attributes and access times gone.
 //!
 //! Scope: the tree shape (directories, files, extents), each entry's metadata, and the Merkle
 //! identity over both. Restoring the metadata onto a host path is the landing engine's job under a
@@ -48,32 +50,52 @@ pub struct Extent {
   pub chunk_offset: u64,
 }
 
-/// A named node's metadata (§2.6 item 4): the fields a restore needs to reproduce the entry and a
-/// fingerprint needs to detect drift. Times are nanoseconds since the Unix epoch. `xattr_flags` is
-/// nonzero when the node carries extended attributes (the attributes themselves are chunks, not
-/// manifest bytes). Carried and hashed by the archive; applied to a host path only by a granted
-/// landing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// A node's metadata (§2.6 item 4; §4.5): every field a restore needs to reproduce the node as the volume
+/// served it, and a fingerprint needs to detect drift. Times are signed nanoseconds since the Unix epoch,
+/// as the volume holds them, so a pre-epoch time survives (format minor 3; before it negative times
+/// clamped to zero and access and birth times were not carried, AUD-29-56). Every field, the extended
+/// attributes' names and value extents included, is written into the manifest and hashed into its
+/// identity, so two snapshots that differ only in an attribute or a time never share an identity.
+/// Carried and hashed by the archive; applied to a host path only by a granted landing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct NodeMeta {
   /// The inode number the entry had in the volume (identity across renames, not a host inode).
   pub ino: u64,
   /// The permission and type bits.
   pub mode: u32,
-  /// The modification time, nanoseconds since the Unix epoch.
-  pub mtime_ns: u64,
-  /// The change time, nanoseconds since the Unix epoch.
-  pub ctime_ns: u64,
+  /// The access time. Format minor 3.
+  pub atime_ns: i64,
+  /// The modification time.
+  pub mtime_ns: i64,
+  /// The change time.
+  pub ctime_ns: i64,
+  /// The birth (creation) time. Format minor 3.
+  pub btime_ns: i64,
   /// The size in bytes (the file's length; a directory's is the archiver's own value).
   pub size: u64,
   /// The hard-link count.
   pub nlink: u32,
-  /// Nonzero when the node has extended attributes.
-  pub xattr_flags: u32,
   /// The owner's uid, as the volume held it (POSIX ownership; a restore reproduces it, a granted
   /// landing applies it where the grant allows). Format minor 2.
   pub uid: u32,
   /// The owning group's gid, as the volume held it. Format minor 2.
   pub gid: u32,
+  /// The node's extended attributes, each a name and its value's extents over the archive's chunks
+  /// (format minor 3). Written in strictly increasing name order; a reader refuses any other order.
+  pub xattrs: Vec<Xattr>,
+}
+
+/// One extended attribute (§4.5 "Extended attributes"; format minor 3): its name and its value. The value
+/// is content like a file's (the volume holds it as an attribute inode's body), so it is carried the
+/// same way, as extents over content-addressed chunks: a large value (a macOS resource fork) costs its
+/// chunks once and deduplicates with any file holding the same bytes. The value's length is the length
+/// its extents tile; no separate size is written, so the two can never disagree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Xattr {
+  /// The attribute's name: 1 to [`XATTR_NAME_MAX_BYTES`] bytes, no NUL.
+  pub name: Vec<u8>,
+  /// The value's extents, tiling it from offset zero (empty for an empty value).
+  pub extents: Vec<Extent>,
 }
 
 /// One entry in a directory: a name, the child's metadata, and the child it points to.
@@ -122,6 +144,9 @@ pub enum ManifestError {
   BadExtents,
   /// A file's extents cover a length other than the size its metadata records (AUD-29-14).
   SizeMismatch,
+  /// An extended attribute's name is empty, longer than [`XATTR_NAME_MAX_BYTES`] or holds a NUL; or a
+  /// node's attribute names are not in strictly increasing order (AUD-29-56).
+  BadXattr,
 }
 
 impl core::fmt::Display for ManifestError {
@@ -136,6 +161,7 @@ impl core::fmt::Display for ManifestError {
       Self::TooDeep => f.write_str("manifest tree nests past the path limit"),
       Self::BadExtents => f.write_str("manifest file extents do not tile the file"),
       Self::SizeMismatch => f.write_str("manifest file extents disagree with its recorded size"),
+      Self::BadXattr => f.write_str("manifest extended attribute is malformed or out of order"),
     }
   }
 }
@@ -155,8 +181,28 @@ pub const NAME_MAX_BYTES: usize = 255;
 /// ([`write_extent`]).
 const EXTENT_BYTES: usize =
   size_of::<u64>() + size_of::<u64>() + size_of::<[u8; 32]>() + size_of::<u64>();
-/// Format: one encoded entry's metadata bytes ([`write_meta`]).
-const META_BYTES: usize = size_of::<u64>() * 4 + size_of::<u32>() * 5;
+/// Format: the longest extended-attribute name any supported host accepts: Linux's `XATTR_NAME_MAX` (255,
+/// `include/uapi/linux/limits.h`), the largest of the hosts slates serves (macOS's `XATTR_MAXNAMELEN` is
+/// 127). The volume core takes its own limit from this, so a volume can never hold a name its archive
+/// refuses.
+pub const XATTR_NAME_MAX_BYTES: usize = 255;
+/// Format: one encoded entry's fixed metadata bytes ([`write_meta`]), field by field in write order; the
+/// attributes follow the count.
+const META_BYTES: usize = size_of::<u64>() // inode number
+  + size_of::<u32>() // mode
+  + size_of::<i64>() // access time
+  + size_of::<i64>() // modification time
+  + size_of::<i64>() // change time
+  + size_of::<i64>() // birth time
+  + size_of::<u64>() // size
+  + size_of::<u32>() // link count
+  + size_of::<u32>() // owner
+  + size_of::<u32>() // group
+  + size_of::<u32>(); // attribute count
+/// Derived: the fewest bytes one extended attribute encodes to — its name length, a one-byte name (an
+/// empty name is refused) and its extent count. A node's declared attribute count past what the bytes
+/// left could hold at this size is refused before anything is reserved.
+const MIN_XATTR_BYTES: usize = size_of::<u32>() + size_of::<u8>() + size_of::<u64>();
 /// Derived: the fewest bytes one directory entry encodes to — its name length (the name itself may be
 /// empty in the grammar; validation refuses it by name), its metadata and its node's kind and count. A
 /// directory's declared entry count past what the bytes left could hold at this size is refused before
@@ -212,17 +258,29 @@ fn read_extent(reader: &mut Reader<'_>) -> Result<Extent, ManifestError> {
   })
 }
 
-/// Writes an entry's metadata fields in canonical order.
+/// Writes a node's metadata fields in canonical order, its extended attributes sorted by name.
 fn write_meta(writer: &mut Writer, meta: &NodeMeta) {
   writer.u64(meta.ino);
   writer.u32(meta.mode);
-  writer.u64(meta.mtime_ns);
-  writer.u64(meta.ctime_ns);
+  writer.i64(meta.atime_ns);
+  writer.i64(meta.mtime_ns);
+  writer.i64(meta.ctime_ns);
+  writer.i64(meta.btime_ns);
   writer.u64(meta.size);
   writer.u32(meta.nlink);
-  writer.u32(meta.xattr_flags);
   writer.u32(meta.uid);
   writer.u32(meta.gid);
+  let mut xattrs: Vec<&Xattr> = meta.xattrs.iter().collect();
+  xattrs.sort_by(|a, b| a.name.cmp(&b.name));
+  writer.u32(u32::try_from(xattrs.len()).unwrap_or(u32::MAX));
+  for xattr in xattrs {
+    writer.u32(u32::try_from(xattr.name.len()).unwrap_or(u32::MAX));
+    writer.raw(&xattr.name);
+    writer.u64(xattr.extents.len() as u64);
+    for extent in &xattr.extents {
+      write_extent(writer, extent);
+    }
+  }
 }
 
 /// The root directory's own metadata, as the manifest section carries it ahead of the tree (format
@@ -253,28 +311,112 @@ pub fn manifest_identity(root_meta: &NodeMeta, root: &Node) -> [u8; 32] {
   hash_of(writer.as_slice())
 }
 
-/// Reads an entry's metadata fields, refusing a truncated stream.
+/// Reads a node's metadata fields, refusing a truncated stream, and its extended attributes, refusing a
+/// malformed or misordered one.
 fn read_meta(reader: &mut Reader<'_>) -> Result<NodeMeta, ManifestError> {
-  let ino = reader.u64().map_err(|_| ManifestError::Truncated)?;
-  let mode = reader.u32().map_err(|_| ManifestError::Truncated)?;
-  let mtime_ns = reader.u64().map_err(|_| ManifestError::Truncated)?;
-  let ctime_ns = reader.u64().map_err(|_| ManifestError::Truncated)?;
-  let size = reader.u64().map_err(|_| ManifestError::Truncated)?;
-  let nlink = reader.u32().map_err(|_| ManifestError::Truncated)?;
-  let xattr_flags = reader.u32().map_err(|_| ManifestError::Truncated)?;
-  let uid = reader.u32().map_err(|_| ManifestError::Truncated)?;
-  let gid = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  let truncated = |_| ManifestError::Truncated;
+  let ino = reader.u64().map_err(truncated)?;
+  let mode = reader.u32().map_err(truncated)?;
+  let atime_ns = reader.i64().map_err(truncated)?;
+  let mtime_ns = reader.i64().map_err(truncated)?;
+  let ctime_ns = reader.i64().map_err(truncated)?;
+  let btime_ns = reader.i64().map_err(truncated)?;
+  let size = reader.u64().map_err(truncated)?;
+  let nlink = reader.u32().map_err(truncated)?;
+  let uid = reader.u32().map_err(truncated)?;
+  let gid = reader.u32().map_err(truncated)?;
+  let xattrs = read_xattrs(reader)?;
   Ok(NodeMeta {
     ino,
     mode,
+    atime_ns,
     mtime_ns,
     ctime_ns,
+    btime_ns,
     size,
     nlink,
-    xattr_flags,
     uid,
     gid,
+    xattrs,
   })
+}
+
+/// Reads a node's extended attributes: a count bounded by the bytes left, then each name (valid, and
+/// greater than the one before) and its value's extents (bounded the same way, and tiling the value).
+fn read_xattrs(reader: &mut Reader<'_>) -> Result<Vec<Xattr>, ManifestError> {
+  let count = reader.u32().map_err(|_| ManifestError::Truncated)?;
+  let count = usize::try_from(count).map_err(|_| ManifestError::BadNode)?;
+  if count > reader.remaining().checked_div(MIN_XATTR_BYTES).unwrap_or(0) {
+    return Err(ManifestError::BadNode);
+  }
+  let mut xattrs: Vec<Xattr> = Vec::with_capacity(count);
+  for _ in 0..count {
+    let name_len = reader.u32().map_err(|_| ManifestError::Truncated)?;
+    let name_len = usize::try_from(name_len).map_err(|_| ManifestError::BadXattr)?;
+    if name_len == 0 || name_len > XATTR_NAME_MAX_BYTES {
+      return Err(ManifestError::BadXattr);
+    }
+    let name = reader.raw(name_len).map_err(|_| ManifestError::Truncated)?;
+    if name.contains(&0)
+      || xattrs
+        .last()
+        .is_some_and(|previous| previous.name.as_slice() >= name)
+    {
+      return Err(ManifestError::BadXattr);
+    }
+    let extent_count = reader.u64().map_err(|_| ManifestError::Truncated)?;
+    let extent_count = usize::try_from(extent_count).map_err(|_| ManifestError::BadNode)?;
+    if extent_count > reader.remaining().checked_div(EXTENT_BYTES).unwrap_or(0) {
+      return Err(ManifestError::BadNode);
+    }
+    let mut extents = Vec::with_capacity(extent_count);
+    for _ in 0..extent_count {
+      extents.push(read_extent(reader)?);
+    }
+    tiled_length(&extents)?;
+    xattrs.push(Xattr {
+      name: name.to_vec(),
+      extents,
+    });
+  }
+  Ok(xattrs)
+}
+
+/// The distinct chunk identities a tree and its root's metadata reference — every file extent and every
+/// extended attribute's value extent — in first-reference order (a hole's zero identity is not a chunk and
+/// is skipped). Iterative, so a tree at [`MAX_DEPTH`] costs an explicit stack, never the thread's. This is
+/// the one definition of what an archive needs: placement, transfer and retention all read it.
+pub fn referenced_chunks(root_meta: &NodeMeta, root: &Node) -> Vec<[u8; 32]> {
+  let mut seen = std::collections::BTreeSet::new();
+  let mut out = Vec::new();
+  let mut take = |extents: &[Extent]| {
+    for extent in extents {
+      if extent.chunk != [0u8; 32] && seen.insert(extent.chunk) {
+        out.push(extent.chunk);
+      }
+    }
+  };
+  for xattr in &root_meta.xattrs {
+    take(&xattr.extents);
+  }
+  let mut pending: Vec<&Node> = vec![root];
+  while let Some(node) = pending.pop() {
+    match node {
+      Node::File(extents) => take(extents),
+      Node::Directory(entries) => {
+        // Reversed onto the stack, so entries are visited in their order.
+        for entry in entries.iter().rev() {
+          pending.push(&entry.node);
+        }
+        for entry in entries {
+          for xattr in &entry.meta.xattrs {
+            take(&xattr.extents);
+          }
+        }
+      }
+    }
+  }
+  out
 }
 
 /// The directory entries in canonical (sorted-by-name) order.

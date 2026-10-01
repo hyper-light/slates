@@ -8,8 +8,8 @@
 //! [`XattrTable`] — so a value is content like any file's: chunked, sealed, deduplicated, charged to
 //! the quota, frozen by a snapshot at chunk granularity, and readable or writable at an offset (an
 //! NFSv4 named attribute is a file, RFC 8881 §5.3). Copying an owner for a new epoch copies only its
-//! table (names and numbers), never a value. The archive already records attribute values as chunks,
-//! not manifest bytes (`slates-archive` `NodeMeta::xattr_flags`).
+//! table (names and numbers), never a value. A placed archive carries each value the same way, as
+//! extents over chunks (`slates-archive` `Xattr`, format minor 3).
 
 use slates_mem::Handle;
 

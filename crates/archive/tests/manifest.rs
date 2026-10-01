@@ -3,7 +3,7 @@
 //! independent of the order entries were added and changes when any node changes; a malformed
 //! encoding is a typed refusal, never a panic.
 
-use slates_archive::manifest::{Entry, Extent, ManifestError, Node, NodeMeta};
+use slates_archive::manifest::{Entry, Extent, ManifestError, Node, NodeMeta, Xattr};
 
 /// The tree in the canonical form the decoder accepts (§2.6 D-17; AUD-29-14): every file entry's recorded
 /// size is the length its extents tile, as the exporter records it.
@@ -226,9 +226,9 @@ fn meta(mode: u32) -> NodeMeta {
     ctime_ns: 1_700_000_000_500_000_000,
     size: 100,
     nlink: 1,
-    xattr_flags: 0,
     uid: 501,
     gid: 20,
+    ..NodeMeta::default()
   }
 }
 
@@ -282,8 +282,9 @@ fn metadata_changes_the_identity() {
 /// `1a1634ff…`; minor 2 (2026-09-15, the owner appended to every node's metadata) pinned `34bfced9…` over
 /// a sample whose files recorded size zero. On 2026-09-30 the decoder began requiring the canonical form
 /// (AUD-29-14: a file's recorded size is the length its extents tile), so the sample records its files'
-/// real sizes; the encoding and the identity function are unchanged, and the pin below is that same
-/// encoding over the canonical sample.
+/// real sizes (pinned `3a98564d…`). Minor 3 (2026-09-30, AUD-29-56: signed times, access and birth times,
+/// the attributes in place of the flag) pins the value below; the attribute encoding has its own pin in
+/// [`the_attribute_encoding_matches_its_golden_vector`].
 #[test]
 fn the_manifest_identity_matches_its_golden_vector() {
   let hex: String = sample()
@@ -292,7 +293,7 @@ fn the_manifest_identity_matches_its_golden_vector() {
     .map(|b| format!("{b:02x}"))
     .collect();
   assert_eq!(
-    hex, "3a98564d8f8d782d654df826542b30836df26b60fe0d833989fee49f448e6ab9",
+    hex, "d1895ea257bc94691ad4b6cecf0f556ea1f791b1ed5dfee6f4c9ef1a875845a8",
     "the manifest identity changed; regenerate the golden vector only for a deliberate format change"
   );
 }
@@ -307,7 +308,7 @@ fn an_entrys_owner_round_trips_and_changes_the_identity() {
     gid: 4321,
     ..meta(0o644)
   };
-  let tree = one_file_with_meta(owned);
+  let tree = one_file_with_meta(owned.clone());
   let decoded = Node::decode(&tree.encode()).expect("decodes");
   let Node::Directory(entries) = &decoded else {
     panic!("expected a directory");
@@ -343,7 +344,10 @@ fn the_roots_own_metadata_round_trips_and_is_in_the_manifest_identity() {
       .identity(),
     tree.identity()
   );
-  let other_root = NodeMeta { uid: 1001, ..root };
+  let other_root = NodeMeta {
+    uid: 1001,
+    ..root.clone()
+  };
   assert_ne!(
     manifest_identity(&root, &tree),
     manifest_identity(&other_root, &tree),
@@ -469,5 +473,190 @@ fn extents_that_do_not_tile_are_refused() {
   assert_eq!(
     Node::decode(&one_file(vec![extent(0, 8, 1, 0)], 9).encode()),
     Err(ManifestError::SizeMismatch)
+  );
+}
+
+/// A node's metadata with two attributes (one value of two extents, one empty) and pre-epoch times.
+fn meta_with_attributes() -> NodeMeta {
+  NodeMeta {
+    atime_ns: -1,
+    mtime_ns: -2,
+    ctime_ns: -3,
+    btime_ns: -4,
+    xattrs: vec![
+      Xattr {
+        name: b"user.empty".to_vec(),
+        extents: Vec::new(),
+      },
+      Xattr {
+        name: b"user.value".to_vec(),
+        extents: vec![
+          Extent {
+            offset: 0,
+            len: 3,
+            chunk: [0x51; 32],
+            chunk_offset: 0,
+          },
+          Extent {
+            offset: 3,
+            len: 2,
+            chunk: [0x52; 32],
+            chunk_offset: 1,
+          },
+        ],
+      },
+    ],
+    ..meta(0o644)
+  }
+}
+
+/// The encoded root metadata of `meta`, through the manifest section's head.
+fn encoded_meta(meta: &NodeMeta) -> Vec<u8> {
+  slates_archive::manifest::encode_root_meta(meta)
+}
+
+/// Decodes a root-metadata record, requiring it to be the whole input.
+fn decoded_meta(bytes: &[u8]) -> Result<NodeMeta, ManifestError> {
+  let (meta, rest) = slates_archive::manifest::decode_root_meta(bytes)?;
+  assert!(rest.is_empty(), "a root record is the whole input here");
+  Ok(meta)
+}
+
+/// Format: the bytes ahead of the attribute count in an encoded metadata record — the inode number,
+/// mode, four times, size, link count, owner and group (`write_meta`).
+const META_PREFIX_BYTES: usize = 8 + 4 + 8 * 4 + 8 + 4 + 4 + 4;
+
+/// AUD-29-56, golden vector: a node carrying attributes and pre-epoch times hashes to a pinned identity, so
+/// the attribute encoding (names, value extents, signed times) cannot drift unnoticed across versions.
+#[test]
+fn the_attribute_encoding_matches_its_golden_vector() {
+  let hex: String = one_file_with_meta(meta_with_attributes())
+    .identity()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
+  assert_eq!(
+    hex, "d1adc5b11ddbec1b19c68a816e29bab97affb9776ee59ff5cc7ba7f91eb80d47",
+    "the attribute encoding changed; regenerate the golden vector only for a deliberate format change"
+  );
+}
+
+/// AUD-29-56: do: round-trip metadata carrying attributes (written in any order) and pre-epoch times;
+/// expect it back with its attributes in name order and its times unchanged, and the root identity to
+/// change when only one attribute's value extents, only its name, or only one time changes.
+#[test]
+fn attributes_and_signed_times_round_trip_and_change_the_identity() {
+  let mut shuffled = meta_with_attributes();
+  shuffled.xattrs.reverse();
+  let decoded = decoded_meta(&encoded_meta(&shuffled)).expect("decodes");
+  assert_eq!(
+    decoded,
+    meta_with_attributes(),
+    "attributes come back in name order"
+  );
+  let base = one_file_with_meta(meta_with_attributes()).identity();
+  assert_eq!(one_file_with_meta(shuffled).identity(), base);
+  let mut value = meta_with_attributes();
+  value.xattrs[1].extents[1].chunk = [0x53; 32];
+  let mut name = meta_with_attributes();
+  name.xattrs[0].name = b"user.other".to_vec();
+  let mut time = meta_with_attributes();
+  time.btime_ns -= 1;
+  for (what, changed) in [("value", value), ("name", name), ("birth time", time)] {
+    assert_ne!(
+      one_file_with_meta(changed).identity(),
+      base,
+      "an attribute {what} change is an identity change"
+    );
+  }
+}
+
+/// Metadata carrying empty-valued attributes under `names`, in the order given (the writer sorts them).
+fn with_attribute_names(names: &[&[u8]]) -> NodeMeta {
+  NodeMeta {
+    xattrs: names
+      .iter()
+      .map(|name| Xattr {
+        name: name.to_vec(),
+        extents: Vec::new(),
+      })
+      .collect(),
+    ..meta(0o644)
+  }
+}
+
+/// AUD-29-56, hostile input: do: decode metadata whose attribute names are empty, NUL-holding, past the
+/// longest name or repeated; expect each refused typed, and the longest valid name accepted.
+#[test]
+fn malformed_attribute_names_are_refused_typed() {
+  use slates_archive::manifest::XATTR_NAME_MAX_BYTES;
+  let with = with_attribute_names;
+  let too_long = vec![b'n'; XATTR_NAME_MAX_BYTES + 1];
+  let longest = vec![b'n'; XATTR_NAME_MAX_BYTES];
+  assert!(decoded_meta(&encoded_meta(&with(&[&longest]))).is_ok());
+  // A lone empty-named attribute is shorter than the smallest valid one, so its count is refused first;
+  // inside a tree, with bytes after it, the name rule itself refuses it.
+  assert_eq!(
+    decoded_meta(&encoded_meta(&with(&[b""]))),
+    Err(ManifestError::BadNode)
+  );
+  assert_eq!(
+    Node::decode(&one_file_with_meta(with(&[b""])).encode()),
+    Err(ManifestError::BadXattr)
+  );
+  for (what, names) in [
+    ("a NUL in a name", vec![b"user.\0x".as_slice()]),
+    ("a name past the longest", vec![too_long.as_slice()]),
+    (
+      "a repeated name",
+      vec![b"user.a".as_slice(), b"user.a".as_slice()],
+    ),
+  ] {
+    assert_eq!(
+      decoded_meta(&encoded_meta(&with(&names))),
+      Err(ManifestError::BadXattr),
+      "{what}"
+    );
+  }
+}
+
+/// AUD-29-56, hostile input: do: decode metadata whose attributes are out of order, untiled, counted past
+/// the bytes present or truncated; expect each refused typed, before any allocation the input does not back.
+#[test]
+fn malformed_attribute_structure_is_refused_typed() {
+  // Out of order: two names of one length, their bytes swapped in place after the writer sorted them.
+  let mut unordered = encoded_meta(&with_attribute_names(&[b"user.a", b"user.b"]));
+  let first = unordered
+    .windows(6)
+    .position(|window| window == b"user.a")
+    .expect("the first name is present");
+  let second = unordered
+    .windows(6)
+    .position(|window| window == b"user.b")
+    .expect("the second name is present");
+  unordered.swap(first + 5, second + 5);
+  assert_eq!(decoded_meta(&unordered), Err(ManifestError::BadXattr));
+  // Untiled: a value whose second extent leaves a gap.
+  let mut gap = meta_with_attributes();
+  gap.xattrs[1].extents[1].offset += 1;
+  assert_eq!(
+    decoded_meta(&encoded_meta(&gap)),
+    Err(ManifestError::BadExtents)
+  );
+  // A count past the bytes present.
+  let mut counted = encoded_meta(&meta(0o644));
+  counted[META_PREFIX_BYTES..META_PREFIX_BYTES + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+  assert_eq!(decoded_meta(&counted), Err(ManifestError::BadNode));
+  // Truncated inside an attribute's last extent: its declared extent count now outruns the bytes left, so
+  // it is refused by the bound before a field is read past the end.
+  let whole = encoded_meta(&meta_with_attributes());
+  assert_eq!(
+    decoded_meta(&whole[..whole.len() - 1]),
+    Err(ManifestError::BadNode)
+  );
+  // Truncated before the attribute count.
+  assert_eq!(
+    decoded_meta(&whole[..META_PREFIX_BYTES + 1]),
+    Err(ManifestError::Truncated)
   );
 }

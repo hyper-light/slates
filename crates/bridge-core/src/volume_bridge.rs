@@ -1032,6 +1032,7 @@ impl Bridge for VolumeBridge<'_> {
           changes.atime,
           changes.mtime,
           changes.ctime,
+          None,
         ),
         None => self.volume.set_times(
           self.store,
@@ -1039,6 +1040,7 @@ impl Bridge for VolumeBridge<'_> {
           changes.atime,
           changes.mtime,
           changes.ctime,
+          None,
         ),
       }?;
     }

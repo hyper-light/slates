@@ -45,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use slates_archive::format::{ArchiveError, Chunk, Encoding};
-use slates_archive::{Archive, Node, chunks_for};
+use slates_archive::{Archive, chunks_for};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
 use slates_mem::arena::{ChunkArena, Extent};
 use slates_mem::budget::{MetadataBudget, ShardBudget};
@@ -430,31 +430,6 @@ pub enum ContentRefusal {
   },
 }
 
-/// The distinct chunk identities a manifest references, in first-reference order (a hole's zero
-/// identity is not a chunk and is skipped).
-pub fn referenced_chunks(node: &Node) -> Vec<[u8; 32]> {
-  fn walk(node: &Node, seen: &mut BTreeSet<[u8; 32]>, out: &mut Vec<[u8; 32]>) {
-    match node {
-      Node::File(extents) => {
-        for extent in extents {
-          if extent.chunk != [0u8; HASH_BYTES] && seen.insert(extent.chunk) {
-            out.push(extent.chunk);
-          }
-        }
-      }
-      Node::Directory(entries) => {
-        for entry in entries {
-          walk(&entry.node, seen, out);
-        }
-      }
-    }
-  }
-  let mut seen = BTreeSet::new();
-  let mut out = Vec::new();
-  walk(node, &mut seen, &mut out);
-  out
-}
-
 /// The archive's header fields and manifest with `chunks` in place of its own — the partial archive an
 /// owner ships to a holder that lacks exactly those.
 fn with_chunks(archive: &Archive, chunks: Vec<Chunk>) -> Archive {
@@ -470,7 +445,7 @@ fn with_chunks(archive: &Archive, chunks: Vec<Chunk>) -> Archive {
     // The root's own metadata is part of the manifest identity the holder's acknowledgement binds
     // (format minor 2): a partial archive shipped without it would carry another identity than the
     // owner's head names, and the head would never place.
-    root_meta: archive.root_meta,
+    root_meta: archive.root_meta.clone(),
     manifest: archive.manifest.clone(),
     chunks,
   }
@@ -806,7 +781,7 @@ impl ContentHold {
     placed: Placed,
     archive: Archive,
   ) -> Result<[u8; 32], ContentRefusal> {
-    let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&archive.manifest).into_iter().collect();
+    let referenced: BTreeSet<[u8; 32]> = archive.referenced_chunks().into_iter().collect();
     if archive
       .chunks
       .iter()
@@ -1149,7 +1124,7 @@ impl ContentHold {
       return false;
     };
     let referenced: BTreeSet<[u8; 32]> = Self::manifest_of(space.arena, &record)
-      .map(|archive| referenced_chunks(&archive.manifest).into_iter().collect())
+      .map(|archive| archive.referenced_chunks().into_iter().collect())
       .unwrap_or_default();
     let mut bytes = u64::try_from(record.extent.len()).unwrap_or(u64::MAX);
     let mut index = manifest_entry_bytes();
@@ -1257,7 +1232,7 @@ impl ContentHold {
     let record = self.objects.get(&object)?.manifests.get(identity)?;
     let archive = Self::manifest_of(arena, record)?;
     let mut chunks = Vec::new();
-    for referenced in referenced_chunks(&archive.manifest) {
+    for referenced in archive.referenced_chunks() {
       chunks.push(Self::chunk_of(
         arena,
         &referenced,
@@ -1339,7 +1314,8 @@ impl ContentHold {
       let rebuilt = Archive::decode(&manifest.archive)
         .map_err(HoldImageError::Archive)
         .and_then(|mut archive| {
-          archive.chunks = referenced_chunks(&archive.manifest)
+          archive.chunks = archive
+            .referenced_chunks()
             .iter()
             .filter_map(|identity| chunks.get(identity).cloned())
             .collect();
@@ -1790,7 +1766,7 @@ impl TestSpace {
 
 #[cfg(test)]
 mod tests {
-  use slates_archive::{Entry, Extent, NodeMeta};
+  use slates_archive::{Entry, Extent, Node, NodeMeta};
 
   use super::*;
 
@@ -1993,7 +1969,7 @@ mod tests {
       archive.encode(),
       "the archive reassembles byte for byte"
     );
-    assert_eq!(referenced_chunks(&archive.manifest), identities);
+    assert_eq!(archive.referenced_chunks(), identities);
   }
 
   /// The holder side served end to end in-process: an offer to a hold with one chunk already present
@@ -2253,7 +2229,7 @@ mod ownership_oracle {
   use proptest::prelude::*;
   use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
   use slates_archive::format::{MAX_BASE_PAGE_BYTES, MAX_CHUNK_BYTES};
-  use slates_archive::{Entry, Extent, NodeMeta};
+  use slates_archive::{Entry, Extent, Node, NodeMeta};
 
   use super::*;
 

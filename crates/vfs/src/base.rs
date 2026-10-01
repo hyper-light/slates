@@ -3206,9 +3206,10 @@ impl Overlay<'_> {
     atime: Option<i64>,
     mtime: Option<i64>,
     ctime: Option<i64>,
+    btime: Option<i64>,
   ) -> Result<(), VfsError> {
     self.copy_up(store, no, CopyUp::Metadata)?;
-    self.vol.set_times(store, no, atime, mtime, ctime)
+    self.vol.set_times(store, no, atime, mtime, ctime, btime)
   }
 
   /// The by-inode-number forms of the base-aware namespace verbs, for the bridge (which speaks

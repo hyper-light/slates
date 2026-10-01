@@ -279,13 +279,13 @@ fn restore_surfaces_node_metadata() {
     ctime_ns: 456,
     size: 2,
     nlink: 1,
-    xattr_flags: 0,
     uid: 1234,
     gid: 4321,
+    ..NodeMeta::default()
   };
   let manifest = canonical(Node::Directory(vec![Entry {
     name: "secret".to_owned(),
-    meta,
+    meta: meta.clone(),
     node: Node::File(vec![Extent {
       offset: 0,
       len: 2,
@@ -331,9 +331,9 @@ fn the_roots_metadata_is_restored_through_the_byte_stream() {
     ctime_ns: 12,
     size: 0,
     nlink: 2,
-    xattr_flags: 0,
     uid: 1000,
     gid: 2000,
+    ..NodeMeta::default()
   };
   let decoded = Archive::decode(&archive.encode()).expect("the archive decodes");
   assert_eq!(decoded.root_meta, archive.root_meta);

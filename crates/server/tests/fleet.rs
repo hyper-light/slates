@@ -6181,11 +6181,23 @@ fn or_describe<T>(answered: Result<T, u32>, daemon: &Daemon, procedure: &str) ->
 /// the head — the state a takeover test needs before the owner dies. Returns the volume id, or why the
 /// setup did not complete (the caller stops the daemons and fails).
 fn seal_hello_on_owner(instance: &str, daemons: &[Daemon], name: &str) -> Result<VolumeId, String> {
+  seal_decorated_hello_on_owner(instance, daemons, name, |_| {})
+}
+
+/// [`seal_hello_on_owner`], with `decorate` run on the owner after the write and before the seal — the
+/// metadata edits a takeover must carry.
+fn seal_decorated_hello_on_owner(
+  instance: &str,
+  daemons: &[Daemon],
+  name: &str,
+  decorate: impl FnOnce(&Daemon),
+) -> Result<VolumeId, String> {
   let mut client = Client::connect(instance);
   let ReplyBody::Created { id } = client.call(&scratch(name)) else {
     return Err("the volume was not created".to_owned());
   };
   write_hello_over_nfs(&daemons[0], name);
+  decorate(&daemons[0]);
   let ReplyBody::Snapshotted { id: snapshot, .. } =
     client.call(&RequestBody::Snapshot { volume: id })
   else {
@@ -6867,9 +6879,12 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
 
   assert_fleet_forms(&daemons, &hosts, &names);
 
-  // Provision, write and seal on A; wait for the content and head to place and for both survivors to
-  // hold the head (the promotion quorum after A dies).
-  let sealed = seal_hello_on_owner(&instance_a, &daemons, "served");
+  // Provision, write, give the root and the file attributes and the file explicit times, and seal on A;
+  // wait for the content and head to place and for both survivors to hold the head (the promotion quorum
+  // after A dies).
+  let sealed = seal_decorated_hello_on_owner(&instance_a, &daemons, "served", |owner| {
+    decorate_hello(owner, "served")
+  });
   let id = match sealed {
     Ok(id) => id,
     Err(why) => {
@@ -6880,8 +6895,10 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     }
   };
   let object = ObjectId(id.bytes);
-  // What the origin shows for the root's and the file's mode and owner, before it dies.
+  // What the origin shows for the root's and the file's mode and owner, times and attributes, before it
+  // dies.
   let origin_owners = owners_over_nfs(&daemons[0], "served");
+  let origin_metadata = metadata_over_nfs(&daemons[0], "served");
 
   // A dies. The first-ranked survivor takes over the head, then serves the content.
   let owner = daemons.remove(0);
@@ -6897,6 +6914,8 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   // The successor serves the volume once it materialized it: its `status` answers instead of refusing.
   let successor_instance = daemons[successor_index].instance().to_owned();
   let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &successor_instance, id);
+  // The metadata first: a read of the file's bytes would move its access time.
+  let successor_metadata = served.then(|| metadata_over_nfs(&daemons[successor_index], "served"));
   let (got, successor_owners) = served_content(served, &daemons[successor_index], "served");
   // The successor goes on writing the object: a further seal on it places over the remaining holder.
   let resealed =
@@ -6921,11 +6940,75 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     "the successor's root and file carry the origin's mode and owner (the archive carries ownership, \
      format minor 2): [root, hello.txt] as (mode, uid, gid)"
   );
+  assert_successor_metadata(successor_metadata.as_ref(), &origin_metadata);
   assert!(
     resealed,
     "a seal taken on the successor after the takeover places — its head written at the promotion \
      epoch the holders fenced the object at, not the successor's lower host epoch"
   );
+}
+
+/// The metadata of a volume's root and `hello.txt` an NFS client observes: each one's (atime, mtime,
+/// ctime) over NFSv3 and every extended attribute value over NFSv4.2.
+#[derive(Debug, PartialEq, Eq)]
+struct Metadata {
+  times: [[common::nfs::Time3; 3]; 2],
+  attributes: [Vec<(Vec<u8>, Vec<u8>)>; 2],
+}
+
+/// AUD-29-56: the successor's root and file show the origin's NFS-visible times and every attribute value,
+/// and the origin carried attributes at all (non-vacuous).
+fn assert_successor_metadata(successor: Option<&Metadata>, origin: &Metadata) {
+  assert_eq!(
+    successor,
+    Some(origin),
+    "the successor's root and file carry the origin's access, modification and change times and every \
+     extended attribute value (format minor 3, AUD-29-56)"
+  );
+  assert!(
+    origin.attributes.iter().all(|node| !node.is_empty()),
+    "non-vacuous: the origin's root and file both carry attributes"
+  );
+}
+
+/// Reads [`Metadata`] for `name` on `daemon`: the root's and `hello.txt`'s times and attributes.
+fn metadata_over_nfs(daemon: &Daemon, name: &str) -> Metadata {
+  let port = daemon.nfs_port().expect("the daemon serves NFS");
+  let capability = capability_path(daemon, name);
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &capability, 1);
+  let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
+  let times = [
+    common::nfs::times(&mut stream, &root_fh, 3),
+    common::nfs::times(&mut stream, &file_fh, 4),
+  ];
+  let owner = format!("metadata-{}-{}", std::process::id(), daemon.instance());
+  let mut session = common::nfs4::Session::open(port, owner.as_bytes());
+  let attributes = [
+    session.xattrs(&capability, &[]),
+    session.xattrs(&capability, &["hello.txt"]),
+  ];
+  Metadata { times, attributes }
+}
+
+/// The edits [`a_takeover_successor_serves_the_dead_owners_content_over_nfs`] makes before the seal: an
+/// attribute on the root, two on `hello.txt` (one empty), set over NFSv4.2, and `hello.txt`'s access and
+/// modification times set over NFSv3 to two distinct instants before its current modification time (one
+/// and two seconds back), so neither equals what a successor would stamp on its own.
+fn decorate_hello(owner: &Daemon, name: &str) {
+  let port = owner.nfs_port().expect("the daemon serves NFS");
+  let capability = capability_path(owner, name);
+  let session_owner = format!("decorate-{}-{}", std::process::id(), owner.instance());
+  let mut session = common::nfs4::Session::open(port, session_owner.as_bytes());
+  session.set_xattr(&capability, &[], b"user.root", b"on the root");
+  session.set_xattr(&capability, &["hello.txt"], b"user.tag", b"tagged");
+  session.set_xattr(&capability, &["hello.txt"], b"user.empty", b"");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
+  let root_fh = mount(&mut stream, &capability, 1);
+  let file_fh = lookup(&mut stream, &root_fh, "hello.txt", 2);
+  let [_, (seconds, nanoseconds), _] = common::nfs::times(&mut stream, &file_fh, 3);
+  let back = |by: u32| (seconds.saturating_sub(by), nanoseconds);
+  common::nfs::set_times(&mut stream, &file_fh, back(2), back(1), 4);
 }
 
 /// What a successor serves once `status` answers there: the file's bytes and the root's and file's

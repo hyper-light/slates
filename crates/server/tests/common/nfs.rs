@@ -29,6 +29,9 @@ pub(crate) fn read_opaque(buf: &[u8], off: usize) -> (Vec<u8>, usize) {
   )
 }
 
+/// Format: the NFS and MOUNT version every procedure here speaks (RFC 1813), unless it names another.
+pub(crate) const VERSION_3: u32 = 3;
+
 pub(crate) fn call(
   stream: &mut TcpStream,
   program: u32,
@@ -36,8 +39,21 @@ pub(crate) fn call(
   args: &[u8],
   xid: u32,
 ) -> Vec<u8> {
+  call_version(stream, program, VERSION_3, procedure, args, xid)
+}
+
+/// One ONC RPC call of `program` at `version` (AUTH_NONE): the procedure's results, after the reply's
+/// accept status.
+pub(crate) fn call_version(
+  stream: &mut TcpStream,
+  program: u32,
+  version: u32,
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+) -> Vec<u8> {
   let mut body = Vec::new();
-  for field in [xid, 0, 2, program, 3, procedure, 0, 0, 0, 0] {
+  for field in [xid, 0, 2, program, version, procedure, 0, 0, 0, 0] {
     body.extend_from_slice(&field.to_be_bytes());
   }
   body.extend_from_slice(args);
@@ -292,4 +308,40 @@ pub(crate) fn readdirplus(stream: &mut TcpStream, dir_fh: &[u8], xid: u32) -> Ve
     names.push(String::from_utf8_lossy(&name).into_owned());
   }
   names
+}
+
+/// An `nfstime3` as (seconds, nanoseconds).
+pub(crate) type Time3 = (u32, u32);
+
+/// The three times an NFSv3 GETATTR of `fh` reports: (atime, mtime, ctime).
+pub(crate) fn times(stream: &mut TcpStream, fh: &[u8], xid: u32) -> [Time3; 3] {
+  let mut args = Vec::new();
+  opaque(fh, &mut args);
+  let reply = call(stream, NFS_PROGRAM, 1, &args, xid);
+  assert_eq!(status(&reply), 0, "GETATTR");
+  // fattr3 after the status: type, mode, nlink, uid, gid (4 bytes each), size, used, rdev, fsid,
+  // fileid (8 each), then atime, mtime, ctime (each two words).
+  let at = 4 + 5 * 4 + 5 * 8;
+  let word = |offset: usize| u32::from_be_bytes(reply[offset..offset + 4].try_into().unwrap());
+  [0, 1, 2].map(|index| (word(at + index * 8), word(at + index * 8 + 4)))
+}
+
+/// NFSv3 SETATTR of `fh`'s access and modification times to the client-supplied `atime` and `mtime`
+/// (`SET_TO_CLIENT_TIME`), nothing else set and no guard.
+pub(crate) fn set_times(stream: &mut TcpStream, fh: &[u8], atime: Time3, mtime: Time3, xid: u32) {
+  /// Format: `time_how` SET_TO_CLIENT_TIME (RFC 1813 §2.6).
+  const SET_TO_CLIENT_TIME: u32 = 2;
+  let mut args = Vec::new();
+  opaque(fh, &mut args);
+  for _ in 0..4 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // mode, uid, gid, size: not set
+  }
+  for (seconds, nanoseconds) in [atime, mtime] {
+    for field in [SET_TO_CLIENT_TIME, seconds, nanoseconds] {
+      args.extend_from_slice(&field.to_be_bytes());
+    }
+  }
+  args.extend_from_slice(&0u32.to_be_bytes()); // no guard
+  let reply = call(stream, NFS_PROGRAM, 2, &args, xid);
+  assert_eq!(status(&reply), 0, "SETATTR of the times");
 }

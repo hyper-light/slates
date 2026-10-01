@@ -379,6 +379,12 @@ impl Archive {
     manifest::manifest_identity(&self.root_meta, &self.manifest)
   }
 
+  /// The distinct chunks the archive's manifest references — file extents and every extended attribute's
+  /// value extents, the root's included — in first-reference order ([`manifest::referenced_chunks`]).
+  pub fn referenced_chunks(&self) -> Vec<[u8; 32]> {
+    manifest::referenced_chunks(&self.root_meta, &self.manifest)
+  }
+
   /// Reads one chunk by identity using the seek table, verifying its payload, without scanning the
   /// whole archive. Returns `None` when no chunk has that identity.
   pub fn chunk_by_identity(

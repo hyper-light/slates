@@ -32,8 +32,9 @@ use crate::volume::{Store, Volume, stamp_all};
 /// Format: the longest attribute name the volume core accepts, in bytes: Linux's `XATTR_NAME_MAX`
 /// (255, `include/uapi/linux/limits.h`), the largest limit of any host slates serves (macOS's
 /// `XATTR_MAXNAMELEN` is 127, an NFSv4 component is bounded by the server's advertised name limit).
-/// A bridge narrows it to its host's own limit.
-pub const XATTR_NAME_MAX_BYTES: usize = 255;
+/// A bridge narrows it to its host's own limit. It is the archive format's own limit, so a volume never
+/// holds a name its placed archive would refuse (AUD-29-56).
+pub const XATTR_NAME_MAX_BYTES: usize = slates_archive::manifest::XATTR_NAME_MAX_BYTES;
 
 /// How a set treats an existing attribute: the `XATTR_CREATE`/`XATTR_REPLACE` flags of
 /// `setxattr(2)` (and the NFSv4 `OPEN` of a named attribute with or without `EXCLUSIVE`).

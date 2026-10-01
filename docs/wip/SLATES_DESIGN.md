@@ -769,6 +769,7 @@ plan schedules.
 ### D-17 Compression, dedup, hashing, archive: zstd (static contexts) and LZ4; per-class dictionaries trained from the volume's data; a boot-calibrated, online-updated cost model decides per chunk; BLAKE3 fixed in the format; the archive format of `research/compression-archive-dedup.md` §2.6 doubles as the replication and clone-from-archive format
 - Evidence: RFC 8878 and static allocation; lzbench curves; dictionary gains 2-5x on small records; Btrfs heuristic and OpenZFS early abort; whole-file dedup yield; BLAKE3 tree hashing [B; C; D; A as cited]. (`research/compression-archive-dedup.md`)
 - Lost: Brotli, xz, fixed "save 12.5%" rules (sector-rounding artefacts), SHA-256 (not fixed-cost across the matrix), CDC everywhere.
+- Amended (A-53, 2026-09-30): format minor 3 — every node's four times are signed and complete (access, modification, change, birth) and its extended attributes are carried as names with value extents over the archive's chunks, all covered by the manifest identity; a takeover successor restores them (AUD-29-56, `docs/bugs/2026-09-30-a-placed-archive-lost-attributes-and-times.md`).
 - Amended (A-20, 2026-09-15): the manifest's per-node metadata carries the owner (uid, gid), and the root directory's own metadata (mode, owner, times) rides ahead of the tree in the manifest section — format minor 2, both covered by the header's manifest identity — so replication, clone-from-archive and a takeover successor's rebuild (`materialize_taken_over`) reproduce ownership, not only modes and times; under the NFS edge's POSIX access control a tree rebuilt as `0:0` would have shut its owner out (`docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md`).
 - Erasure coding: the format carries a fragment record kind from the first release: a chunk may be held as k data and m parity fragments (Reed-Solomon), each fragment with its own BLAKE3, the chunk's identity unchanged, so replication, archive and clone-from-archive all understand fragments from the first release; the policy that codes cold sealed content instead of replicating it is measured in Phase 8 (D-O6): the class boundary comes from measured read rates, the (k, m) from the failure-domain tree, and the reconstruction cost from the profile [A: Rashmi et al., EC-Cache, NSDI 2016; A: Muralidhar et al., f4, OSDI 2014; A: Huang et al., LRC, ATC 2012].
 
@@ -7637,4 +7638,25 @@ Applied in the same change to: `docs/wip/transport-quic.md` (the plan), GAPS.
   its streams. Ada chose "vendor and conform" over a rule exception and over a rewrite.
 - Evidence owed: the stages and acceptance tests in `docs/wip/transport-quic.md` §4.
 - What it does not change: D-15's TLS 1.3, §4.10a's planes and R8's one code path.
+
+### A-53 — A placed archive carries every attribute value and all four times (2026-09-30)
+Applied in the same change to: D-17, `research/compression-archive-dedup.md` §2.6 item 4, GAPS
+(AUD-29-55–58), `docs/bugs/2026-09-30-a-placed-archive-lost-attributes-and-times.md`, and the archive,
+vfs, cluster and server crates.
+- Why: format minor 2 carried a "has attributes" flag (always written zero), no access or birth time, and
+  unsigned times. A snapshot could be verified and placed, and a takeover successor then served it with
+  every extended attribute gone, the access time equal to the modification time, its own birth time, and
+  pre-epoch times as zero. Two snapshots differing only in those had one identity (AUD-29-56).
+- The rule (format minor 3): a node's metadata carries signed access, modification, change and birth times
+  and its extended attributes. Each attribute is a name (1–255 bytes, no NUL, strictly increasing) and its
+  value's extents over the archive's chunks, since a value is an attribute inode's body (§4.5) and is
+  chunked and deduplicated like a file's. All of it is hashed into the manifest identity. The archive's
+  referenced chunks include attribute values, so placement, retention and transfer cover them. A takeover
+  sets the attributes, the owner and then the four times; a hard link's attributes are set once. As with
+  minors 1 and 2, an older minor is not decoded: archives live in RAM within one fleet release.
+- Evidence: the golden vectors (tree and attribute encodings), the export oracle against the volume at the
+  snapshot, the hostile-input refusals, the in-process rebuild oracle, and the three-daemon takeover over
+  NFS (red with the attribute restore disabled, green with it).
+- What it does not change: the bridges' own time surfaces (WinFsp's creation time is a reported sibling),
+  the merge engine's metadata dimension, R1–R10.
 

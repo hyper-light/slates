@@ -53,6 +53,11 @@ impl Writer {
     self.bytes.extend_from_slice(&value.to_le_bytes());
   }
 
+  /// Writes a little-endian two's-complement `i64` (a signed time, format minor 3).
+  pub fn i64(&mut self, value: i64) {
+    self.bytes.extend_from_slice(&value.to_le_bytes());
+  }
+
   /// Writes a 32-byte identity (a BLAKE3 hash).
   pub fn hash(&mut self, value: &[u8; 32]) {
     self.bytes.extend_from_slice(value);
@@ -135,6 +140,12 @@ impl<'a> Reader<'a> {
   pub fn u64(&mut self) -> Result<u64, ArchiveError> {
     let bytes = self.take(size_of::<u64>())?;
     Ok(u64::from_le_bytes(bytes.try_into().unwrap_or_default()))
+  }
+
+  /// Reads a little-endian two's-complement `i64`.
+  pub fn i64(&mut self) -> Result<i64, ArchiveError> {
+    let bytes = self.take(size_of::<i64>())?;
+    Ok(i64::from_le_bytes(bytes.try_into().unwrap_or_default()))
   }
 
   /// Reads a 32-byte identity.

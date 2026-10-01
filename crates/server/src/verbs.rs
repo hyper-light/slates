@@ -5573,9 +5573,10 @@ pub(crate) fn materialize_taken_over(
 
 /// Recreates a restored archive's tree in a fresh volume: directories parents-first (the restore's paths
 /// sort so), then each file's bytes under its mode and times, a symlink (a file under the link type bits,
-/// its bytes the target) as a link. The archive's own metadata carries the permission bits and times; the
-/// inode numbers are this volume's; the source inode number groups hard links so a takeover keeps
-/// every name of one file or IPC endpoint attached to the same new inode (A-26).
+/// its bytes the target) as a link. The archive's own metadata carries the permission bits, the owner, all
+/// four times and the extended attributes (format minor 3, AUD-29-56); the inode numbers are this
+/// volume's; the source inode number groups hard links so a takeover keeps every name of one file or IPC
+/// endpoint attached to the same new inode (A-26), and its attributes are set once.
 fn populate_restored(
   store: &mut slates_vfs::volume::Store,
   volume: &mut Volume,
@@ -5647,12 +5648,15 @@ fn populate_restored(
     };
     inodes.insert(meta.ino, no);
   }
-  // Linking changes ctime. Restore attributes only after the complete namespace exists.
+  // Linking changes ctime. Restore attributes only after the complete namespace exists. A hard link's
+  // names share one inode, so its attributes are set once, at its first name.
+  let mut restored_inodes = std::collections::BTreeSet::new();
   for (path, meta) in &restored.metadata {
     if restored.files.contains_key(path)
       && let Some(&no) = inodes.get(&meta.ino)
+      && restored_inodes.insert(no)
     {
-      restore_owner_and_times(store, volume, no, meta)?;
+      restore_node(store, volume, no, meta, restored.xattrs.get(path))?;
     }
   }
   // The directories' owners and times last: populating a directory moves its times, and a directory
@@ -5660,15 +5664,15 @@ fn populate_restored(
   for path in restored.directories.iter().rev() {
     if let (Some(handle), Some(meta)) = (directories.get(path), restored.metadata.get(path)) {
       let no = store.dirs.get(*handle)?.inode;
-      restore_owner_and_times(store, volume, no, meta)?;
+      restore_node(store, volume, no, meta, restored.xattrs.get(path))?;
     }
   }
   // The root has no entry naming it; its own metadata rides the archive's head (format minor 2), so
-  // the rebuilt volume's root carries the mode, owner and times the origin's did — which, under the
-  // export's POSIX access control, is what lets the owner into their taken-over volume at all.
+  // the rebuilt volume's root carries the mode, owner, times and attributes the origin's did — which,
+  // under the export's POSIX access control, is what lets the owner into their taken-over volume at all.
   let root = volume.root_inode(store)?;
   volume.chmod(store, root, permissions_of_mode(restored.root.mode))?;
-  restore_owner_and_times(store, volume, root, &restored.root)?;
+  restore_node(store, volume, root, &restored.root, restored.xattrs.get(""))?;
   Ok(())
 }
 
@@ -5702,18 +5706,29 @@ fn validate_restored_nodes(
   Ok(())
 }
 
-/// Gives a restored node the owner and the times its archive metadata carries — the owner first,
-/// since a `chown` marks the change time, and the times last so the archived stamps win.
-fn restore_owner_and_times(
+/// Gives a restored node the extended attributes, the owner and the times its archive metadata carries:
+/// the attributes and the owner first, since each marks the change time, and all four times last so the
+/// archived stamps win. Until 2026-09-30 a successor dropped every attribute, set the access time to the
+/// modification time, kept its own birth time and clamped pre-epoch times to zero (AUD-29-56).
+fn restore_node(
   store: &mut slates_vfs::volume::Store,
   volume: &mut Volume,
   no: slates_vfs::ids::InodeNo,
   meta: &slates_archive::NodeMeta,
+  xattrs: Option<&std::collections::BTreeMap<Vec<u8>, Vec<u8>>>,
 ) -> Result<(), slates_vfs::VfsError> {
+  for (name, value) in xattrs.into_iter().flatten() {
+    volume.xattr_set(store, no, name, value, slates_vfs::xattr::XattrSet::Create)?;
+  }
   volume.chown(store, no, meta.uid, meta.gid)?;
-  let mtime = i64::try_from(meta.mtime_ns).unwrap_or(i64::MAX);
-  let ctime = i64::try_from(meta.ctime_ns).unwrap_or(i64::MAX);
-  volume.set_times(store, no, Some(mtime), Some(mtime), Some(ctime))
+  volume.set_times(
+    store,
+    no,
+    Some(meta.atime_ns),
+    Some(meta.mtime_ns),
+    Some(meta.ctime_ns),
+    Some(meta.btime_ns),
+  )
 }
 
 /// Format: POSIX `0755`, the mode a restored directory takes when the archive carries none for it.
@@ -7802,12 +7817,17 @@ mod tests {
           ("pipe-link".to_owned(), Vec::new()),
         ]
         .into(),
-        metadata: [("pipe".to_owned(), meta), ("pipe-link".to_owned(), meta)].into(),
+        metadata: [
+          ("pipe".to_owned(), meta.clone()),
+          ("pipe-link".to_owned(), meta.clone()),
+        ]
+        .into(),
         directories: Default::default(),
         root: slates_archive::NodeMeta {
           mode: 0o040755,
           ..Default::default()
         },
+        xattrs: Default::default(),
         chunks_decoded: 0,
       };
       super::populate_restored(&mut state.store, &mut slot.volume, &restored).unwrap();
@@ -7860,6 +7880,136 @@ mod tests {
           .to_content(),
         before
       );
+    });
+  }
+
+  /// Creates a bounded volume named `name` as uid 1234 on the test shard and returns its slot handle.
+  fn created_volume(
+    state: &mut crate::state::ShardState,
+    name: &str,
+  ) -> super::Handle<super::VolumeSlot> {
+    let reply = super::dispatch(
+      state,
+      1,
+      &Principal::Uid { uid: 1234 },
+      super::RequestBody::Create {
+        name: name.to_owned(),
+        size: super::SizeClass::Bounded { limit: 1 << 20 },
+        names: super::NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      },
+    );
+    let super::ReplyBody::Created { id } = reply else {
+      panic!("{reply:?}")
+    };
+    *state.by_id.get(&super::to_db_volume(id)).unwrap()
+  }
+
+  /// What a client observes of the node at `path`: its kind and permission bits, owner, link count, four
+  /// times and every attribute value — everything but the inode number, which is the volume's own.
+  type Observed = (u32, (u32, u32, u32), [i64; 4], Vec<(Box<[u8]>, Vec<u8>)>);
+
+  fn observe(
+    store: &slates_vfs::volume::Store,
+    volume: &super::Volume,
+    path: &str,
+  ) -> (slates_vfs::ids::InodeNo, Observed) {
+    let no = volume.resolve(store, path).unwrap().inode;
+    let attrs = volume.stat(store, no).unwrap();
+    let values = volume
+      .xattr_names(store, no)
+      .unwrap()
+      .into_iter()
+      .map(|name| {
+        let len = volume.xattr_len(store, no, &name).unwrap();
+        let mut value = vec![0u8; usize::try_from(len).unwrap()];
+        volume.xattr_read(store, no, &name, 0, &mut value).unwrap();
+        (name, value)
+      })
+      .collect();
+    (
+      no,
+      (
+        attrs.mode,
+        (attrs.uid, attrs.gid, attrs.nlink),
+        [attrs.atime, attrs.mtime, attrs.ctime, attrs.btime],
+        values,
+      ),
+    )
+  }
+
+  /// AUD-29-56 (§4.10 takeover, R8 one code path): do: on an origin volume give the root, a directory and a
+  /// hard-linked file attributes (one empty) and the file pre-epoch access, modification and birth times;
+  /// snapshot, export, encode, decode, restore and rebuild the tree in a second volume as a takeover does;
+  /// expect every node — the root, the directory and both names of the file — to show the origin's mode,
+  /// owner, link count, all four times and every attribute value, and both names to stay one inode.
+  #[test]
+  fn a_rebuilt_volume_shows_the_origins_attributes_times_and_links() {
+    crate::daemon::audit_on_shard(|state| {
+      let origin = created_volume(state, "origin");
+      let successor = created_volume(state, "successor");
+      let paths = ["", "dir", "dir/file", "link"];
+      let (archive, expected) = {
+        let store = &mut state.store;
+        let volume = &mut state.volumes.get_mut(origin).unwrap().volume;
+        let root = volume.root();
+        let dir = volume.mkdir(store, root, "dir", 0o750).unwrap();
+        let file = volume.create_file(store, dir, "file", 0o640).unwrap();
+        volume.write(store, file, 0, b"body").unwrap();
+        volume.link(store, root, "link", file).unwrap();
+        let dir_no = store.dirs.get(dir).unwrap().inode;
+        let root_no = volume.root_inode(store).unwrap();
+        let set = slates_vfs::xattr::XattrSet::Create;
+        for (no, name, value) in [
+          (root_no, b"user.root".as_slice(), b"r".as_slice()),
+          (dir_no, b"user.dir".as_slice(), b"d".as_slice()),
+          (file, b"user.file".as_slice(), b"f".as_slice()),
+          (file, b"user.empty".as_slice(), b"".as_slice()),
+        ] {
+          volume.xattr_set(store, no, name, value, set).unwrap();
+        }
+        // Pre-epoch and distinct: the nearest negative instants to zero, stepping down.
+        volume
+          .set_times(store, file, Some(-1), Some(-2), None, Some(-3))
+          .unwrap();
+        let snapshot = volume.snapshot(store).unwrap();
+        let mut archiver = slates_vfs::export::SnapshotArchiver::new(
+          volume,
+          store,
+          snapshot,
+          0,
+          0,
+          slates_archive::CodecPolicy::raw_only(),
+        )
+        .unwrap();
+        let archive = loop {
+          if let slates_vfs::export::Progress::Done(archive) =
+            archiver.advance(volume, store, u64::MAX).unwrap()
+          {
+            break archive;
+          }
+        };
+        let expected: Vec<Observed> = paths
+          .iter()
+          .map(|path| observe(store, volume, path).1)
+          .collect();
+        (archive, expected)
+      };
+      let decoded = slates_archive::Archive::decode(&archive.encode()).unwrap();
+      let restored = slates_archive::restore(&decoded, u64::MAX).unwrap();
+      let store = &mut state.store;
+      let volume = &mut state.volumes.get_mut(successor).unwrap().volume;
+      super::populate_restored(store, volume, &restored).unwrap();
+      let rebuilt: Vec<(slates_vfs::ids::InodeNo, Observed)> = paths
+        .iter()
+        .map(|path| observe(store, volume, path))
+        .collect();
+      for ((path, (_, got)), want) in paths.iter().zip(&rebuilt).zip(&expected) {
+        assert_eq!(got, want, "{path:?}");
+      }
+      assert_eq!(rebuilt[2].0, rebuilt[3].0, "both names stay one inode");
+      assert_eq!(expected[2].2, [-1, -2, expected[2].2[2], -3], "non-vacuous");
     });
   }
 
