@@ -64,8 +64,8 @@ pub enum GuestDeviceOutcome {
   /// The view asked for was refused before admission (typed, AUD-29-76): a subtree naming nothing or no
   /// directory, a snapshot that is gone or of an overlay, or both at once. The seam was released.
   ViewRefused(Refusal),
-  /// The vhost-user front end did not configure the device within the daemon's failover budget, closed its
-  /// end, or broke the protocol (AUD-29-68); `None` for the budget passing. Nothing was admitted.
+  /// The vhost-user front end did not configure the device within the harness's handshake bound, closed its
+  /// end, or broke the protocol (AUD-29-68); `None` for the bound passing. Nothing was admitted.
   #[cfg(target_os = "linux")]
   HandshakeRefused(Option<slates_bridge_virtiofs::vhost_user::VhostError>),
 }
@@ -333,7 +333,7 @@ async fn serve_vhost_user_device(
   volume: DbVolumeId,
   tag: FsTag,
   view: GuestView,
-  socket: std::os::fd::OwnedFd,
+  (socket, handshake_ns): (std::os::fd::OwnedFd, u64),
   on_end: OnEnd,
 ) {
   use slates_bridge_virtiofs::vhost_user::VhostUserSeam;
@@ -345,10 +345,8 @@ async fn serve_vhost_user_device(
       return;
     }
   };
-  // The front end configures the device as its guest boots its driver: bounded by the daemon's failover
-  // budget, the wait it already allows for a peer to show it is alive.
-  let budget = state::with_state(|s| s.config.failover_slo_ns).unwrap_or(0);
-  let seam = match slates_rt::futures::within(budget, seam.negotiate()).await {
+  // The front end configures the device as its guest boots its driver, within the harness's bound.
+  let seam = match slates_rt::futures::within(handshake_ns, seam.negotiate()).await {
     Ok(Some(Ok(seam))) => seam,
     Ok(Some(Err(refused))) => {
       on_end(GuestDeviceOutcome::HandshakeRefused(Some(refused)));
@@ -459,15 +457,17 @@ impl Daemon {
   /// Attaches a guest device to `volume` under `tag` over a vhost-user front end (the inherited-descriptor form,
   /// AUD-29-68): `socket` is a connected stream socket whose other end the VMM holds (a `socketpair` end, never
   /// a socket on disk). On the owning shard the consumer is read from the socket's peer, the front end is
-  /// negotiated within the daemon's failover budget, and the device is admitted and served exactly as the
-  /// in-process form is; the outcome reaches the harness through `on_end`.
+  /// negotiated within `handshake_ns`, and the device is admitted and served exactly as the in-process form is;
+  /// the outcome reaches the harness through `on_end`. The bound is the harness's: a VMM configures the rings
+  /// only once its guest's driver starts, after the guest boots, and the harness owns the VM and knows its boot
+  /// budget (§4.6 "The harness owns VM and container creation").
   #[cfg(target_os = "linux")]
   pub fn attach_vhost_user_device(
     &self,
     volume: VolumeId,
     tag: FsTag,
     view: GuestView,
-    socket: std::os::fd::OwnedFd,
+    (socket, handshake_ns): (std::os::fd::OwnedFd, u64),
     on_end: OnEnd,
   ) -> Result<(), ServerError> {
     let shard = self.owner_shard(volume)?;
@@ -475,7 +475,13 @@ impl Daemon {
       bytes: volume.bytes,
     };
     let task = SpawnRequest::new(
-      Box::pin(serve_vhost_user_device(device, tag, view, socket, on_end)),
+      Box::pin(serve_vhost_user_device(
+        device,
+        tag,
+        view,
+        (socket, handshake_ns),
+        on_end,
+      )),
       None,
     );
     registry::send_control(shard, Control::Spawn(Box::new(task))).map_err(ServerError::Runtime)

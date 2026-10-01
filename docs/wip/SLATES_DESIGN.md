@@ -1930,7 +1930,9 @@ must exercise local communication and isolation between clones as well as namesp
 > vhost-user through a socket the harness hands the daemon (`attach_vhost_user_device`; never a socket on disk).
 > The VMM is authenticated as the socket's peer. Its memory is accepted only as sealed memory objects, and its
 > rings, kicks and calls are configured by the protocol. Every request or feature not offered is refused typed.
-> Proven by a test front end speaking the real protocol; a live QEMU guest and the durable guest record are owed.
+> Proven by a test front end speaking the real protocol, and by a live Linux guest under QEMU 10.0.13's
+> `vhost-user-fs-pci` mounting the tag and exchanging files with the host. Owed: the live guest in CI, §6's workloads in
+> the guest, and the durable guest record.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

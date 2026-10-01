@@ -797,6 +797,30 @@ mod vhost_front_end {
       payload
     }
 
+    /// Queues the settings and the memory table back to back, asking no reply until the table's: what QEMU
+    /// sends before it waits. The table's ack, once the back end reads them.
+    pub(crate) fn queue_settings_and_memory(&self, ram: &OwnedFd) {
+      self.send(
+        request::SET_FEATURES,
+        0,
+        &OFFERED_FEATURES.to_le_bytes(),
+        &[],
+      );
+      self.send(
+        request::SET_PROTOCOL_FEATURES,
+        0,
+        &OFFERED_PROTOCOL_FEATURES.to_le_bytes(),
+        &[],
+      );
+      self.send(request::SET_OWNER, 0, &[], &[]);
+      self.send(
+        request::SET_MEM_TABLE,
+        FLAG_NEED_REPLY,
+        &memory_table(),
+        &[ram.as_fd()],
+      );
+    }
+
     /// Negotiates features and sends the memory table of `ram` (one region from guest address zero).
     pub(crate) fn negotiate_memory(&self, ram: &OwnedFd) -> u64 {
       assert_eq!(self.get(request::GET_FEATURES), OFFERED_FEATURES);
@@ -818,13 +842,7 @@ mod vhost_front_end {
       );
       assert_eq!(self.get(request::GET_QUEUE_NUM), 2);
       assert_eq!(self.set(request::SET_OWNER, &[], &[]), 0);
-      let entry = region_entry();
-      let mut table = 1u32.to_le_bytes().to_vec();
-      table.extend_from_slice(&0u32.to_le_bytes());
-      for word in [entry.guest_phys, entry.size, entry.user_addr, entry.offset] {
-        table.extend_from_slice(&word.to_le_bytes());
-      }
-      self.set(request::SET_MEM_TABLE, &table, &[ram.as_fd()])
+      self.set(request::SET_MEM_TABLE, &memory_table(), &[ram.as_fd()])
     }
 
     /// Configures each queue of `guest` and enables it; every ack must report success.
@@ -883,6 +901,22 @@ mod vhost_front_end {
     }
   }
 
+  /// The memory table: one region, the guest's RAM from guest address zero.
+  fn memory_table() -> Vec<u8> {
+    let entry = region_entry();
+    let mut table = 1u32.to_le_bytes().to_vec();
+    table.extend_from_slice(&0u32.to_le_bytes());
+    for word in [entry.guest_phys, entry.size, entry.user_addr, entry.offset] {
+      table.extend_from_slice(&word.to_le_bytes());
+    }
+    table
+  }
+
+  /// The reply-ack's status from a reply payload.
+  pub(crate) fn status(reply: &[u8]) -> u64 {
+    u64::from_le_bytes(reply.try_into().unwrap())
+  }
+
   /// A vring-address payload for `layout` in the front end's address space.
   fn ring_addresses(
     index: u32,
@@ -902,6 +936,10 @@ mod vhost_front_end {
     payload
   }
 }
+
+/// Shape: the test front end's handshake bound: it configures the rings at once, so its own reply wait.
+#[cfg(target_os = "linux")]
+const HANDSHAKE_NS: u64 = 10_000_000_000;
 
 /// One FUSE request through the vhost-user guest: submitted on the request queue, kicked, its interrupt
 /// awaited, its reply read back.
@@ -923,7 +961,7 @@ fn through_vhost(
 fn attach_vhost(
   daemon: &Daemon,
   id: slates_ipc::protocol::VolumeId,
-  socket: std::os::fd::OwnedFd,
+  (socket, handshake_ns): (std::os::fd::OwnedFd, u64),
 ) -> std::sync::mpsc::Receiver<GuestDeviceOutcome> {
   let (end_tx, end_rx) = channel();
   daemon
@@ -931,7 +969,7 @@ fn attach_vhost(
       id,
       slates_bridge_virtiofs::device::FsTag::new("slates").unwrap(),
       slates_server::virtiofs::GuestView::default(),
-      socket,
+      (socket, handshake_ns),
       Box::new(move |outcome| {
         let _ = end_tx.send(outcome);
       }),
@@ -957,7 +995,7 @@ fn a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back() {
     panic!("the volume was not created");
   };
   let (front, socket) = vhost_front_end::pair();
-  let ended = attach_vhost(&daemon, id, socket);
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
   let ram = vhost_front_end::guest_ram(true);
   let mut guest = vhost_front_end::guest_over(&ram);
   assert_eq!(
@@ -1028,7 +1066,7 @@ fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
     panic!("the volume was not created");
   };
   let (front, socket) = vhost_front_end::pair();
-  let ended = attach_vhost(&daemon, id, socket);
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
   let unsealed = vhost_front_end::guest_ram(false);
   assert_ne!(
     front.negotiate_memory(&unsealed),
@@ -1046,7 +1084,7 @@ fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
     "{outcome:?}"
   );
   let (front, socket) = vhost_front_end::pair();
-  let ended = attach_vhost(&daemon, id, socket);
+  let ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
   drop(front);
   let outcome = ended.recv_timeout(common::guest::WAIT).unwrap();
   assert!(
@@ -1058,6 +1096,188 @@ fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
     ),
     "{outcome:?}"
   );
+  drop(client);
+  drop(daemon);
+}
+
+/// Shape: how long the live guest may take from QEMU's start to its power-off — the boot, the mount, a few
+/// file calls — under software emulation; measured at about 2 s on an Apple Silicon Docker Desktop VM
+/// (2026-10-01), so a hundredfold margin that still fails a hung guest in bounded time.
+#[cfg(target_os = "linux")]
+const GUEST_RUN: Duration = Duration::from_secs(200);
+
+/// The live guest's paths, from the environment: QEMU, the guest kernel and its initramfs (whose init mounts
+/// the tag `slates`, reads `from-host.txt`, writes `from-guest.txt`, makes `guest-dir`, unmounts and powers
+/// off), or a loud skip.
+#[cfg(target_os = "linux")]
+fn live_guest() -> Option<(String, String, String)> {
+  let read = |name| std::env::var(name).ok();
+  match (
+    read("SLATES_GUEST_QEMU"),
+    read("SLATES_GUEST_KERNEL"),
+    read("SLATES_GUEST_INITRD"),
+  ) {
+    (Some(qemu), Some(kernel), Some(initrd)) => Some((qemu, kernel, initrd)),
+    _ => {
+      eprintln!(
+        "SKIP: the live guest needs SLATES_GUEST_QEMU, SLATES_GUEST_KERNEL and SLATES_GUEST_INITRD"
+      );
+      None
+    }
+  }
+}
+
+/// Runs QEMU with a `vhost-user-fs-pci` device whose front end speaks over `socket` (inherited at its own
+/// number), the guest's RAM a sealed memfd; its console output once it exits, or the run's failure.
+#[cfg(target_os = "linux")]
+fn run_qemu(
+  (qemu, kernel, initrd): &(String, String, String),
+  socket: &std::os::fd::OwnedFd,
+) -> String {
+  use std::os::fd::AsRawFd;
+  // The child inherits the descriptor at its own number (QEMU's `fd=` option names it).
+  rustix::io::fcntl_setfd(socket, rustix::io::FdFlags::empty()).unwrap();
+  let chardev = format!("socket,id=vfs,fd={}", socket.as_raw_fd());
+  let mut child = std::process::Command::new(qemu)
+    .args([
+      "-machine",
+      "virt,memory-backend=mem",
+      "-cpu",
+      "max",
+      "-smp",
+      "1",
+      "-m",
+      "256M",
+      "-object",
+      "memory-backend-memfd,id=mem,size=256M,share=on",
+      "-nographic",
+      "-nic",
+      "none",
+      "-no-reboot",
+      "-kernel",
+      kernel,
+      "-initrd",
+      initrd,
+      "-append",
+      "console=ttyAMA0 rdinit=/init panic=-1 quiet",
+      "-chardev",
+      &chardev,
+      "-device",
+      "vhost-user-fs-pci,chardev=vfs,tag=slates",
+    ])
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+  let started = Instant::now();
+  let mut timed_out = false;
+  while child.try_wait().unwrap().is_none() {
+    if started.elapsed() > GUEST_RUN {
+      let _ = child.kill();
+      timed_out = true;
+      break;
+    }
+    // The test thread polls its child QEMU process; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  let output = child.wait_with_output().unwrap();
+  let console = format!(
+    "{}{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+  if timed_out {
+    format!("(the guest did not power off within {GUEST_RUN:?})\n{console}")
+  } else {
+    console
+  }
+}
+
+/// AUD-29-68 (a live guest). Do: provision a volume and write `from-host.txt` into it over NFS; hand the daemon
+/// one end of a socketpair as a vhost-user device and QEMU the other (`-chardev socket,fd=N`, never a socket on
+/// disk), its guest's RAM a sealed memfd; boot a Linux guest whose init mounts the tag over virtio-fs, reads the
+/// host's file, writes `from-guest.txt`, makes `guest-dir`, unmounts and powers off; then read the volume over
+/// NFS. Expect: the guest reports the host's bytes, lists its own entries, unmounts and finishes; the device
+/// ends when QEMU goes; the host reads the guest's bytes and sees its directory. Gated on the live-guest
+/// environment (QEMU, a kernel with virtio-fs, the initramfs); skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_guest_mounts_the_volume_through_qemu_over_vhost_user() {
+  let Some(guest) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-qemu");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("guestvol")) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("guestvol").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let host_file = common::nfs::create(&mut stream, &root, "from-host.txt", 2);
+  common::nfs::write(&mut stream, &host_file, b"from the host", 3);
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(GUEST_RUN.as_nanos()).unwrap();
+  let ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let console = run_qemu(&guest, &theirs);
+  drop(theirs);
+  if !console.contains("SLATES-GUEST-OK") {
+    let outcome = ended.recv_timeout(common::guest::WAIT);
+    panic!("the guest did not finish; the device: {outcome:?}\n{console}");
+  }
+  assert!(
+    console.contains("SLATES-HOST-SAYS: from the host"),
+    "{console}"
+  );
+  assert!(console.contains("SLATES-GUEST-UNMOUNTED"), "{console}");
+  assert!(console.contains("SLATES-GUEST-OK"), "{console}");
+  let outcome = ended
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device ended");
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  let guest_file = lookup(&mut stream, &root, "from-guest.txt", 4);
+  assert_eq!(read(&mut stream, &guest_file, 5), b"written by the guest\n");
+  assert!(common::nfs::lookup_status(&mut stream, &root, "guest-dir", 6).is_ok());
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-68 (messages queued back to back). Do: as the front end, queue `SET_FEATURES`,
+/// `SET_PROTOCOL_FEATURES`, `SET_OWNER` and `SET_MEM_TABLE` (the last carrying the memory object, asking a
+/// reply-ack) before the daemon adopts the socket, so its first reads find them all waiting — what QEMU sends
+/// before it waits. Expect: the table is accepted (ack 0). Before the fix one receive took several messages,
+/// the table's descriptor arrived while an earlier message was served and was closed with it, and the table
+/// was refused (`a memory table whose descriptors do not match its regions`; QEMU: `vhost_set_mem_table failed`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_front_end_sending_back_to_back_has_each_descriptor_kept_with_its_message() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-vhost-queued");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("queued")) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ram = vhost_front_end::guest_ram(true);
+  front.queue_settings_and_memory(&ram);
+  let _ended = attach_vhost(&daemon, id, (socket, HANDSHAKE_NS));
+  let reply = front.reply().expect("the table's ack");
+  assert_eq!(
+    vhost_front_end::status(&reply),
+    0,
+    "the memory table is accepted"
+  );
+  drop(front);
   drop(client);
   drop(daemon);
 }

@@ -584,15 +584,29 @@ impl VhostUserSeam {
   // -------------------------------------------------------------------------------- the wire
 
   /// Receives what the socket holds now into the inbound buffer, with any descriptors.
+  ///
+  /// Never past the current message: the header alone, then exactly the payload it names. The descriptors a
+  /// message carries arrive with its first byte, so reading one message at a time is what ties them to their
+  /// message; a receive spanning two messages would deliver the second's descriptors while the first is
+  /// served, which closed them (QEMU's back-to-back `SET_PROTOCOL_FEATURES` and `SET_MEM_TABLE`, 2026-10-01).
   fn receive(&mut self) -> Result<Received, VhostError> {
     let mut chunk = [0u8; HEADER_LEN + MAX_PAYLOAD];
-    let room = HEADER_LEN
-      .saturating_add(MAX_PAYLOAD)
-      .saturating_sub(self.inbound.len());
+    let wanted = match self.inbound.get(..HEADER_LEN) {
+      None => HEADER_LEN,
+      Some(head) => {
+        let size =
+          usize::try_from(Header::parse(head)?.size).map_err(|_| protocol("payload size"))?;
+        if size > MAX_PAYLOAD {
+          return Err(protocol(
+            "a message exceeds the largest this back end accepts",
+          ));
+        }
+        HEADER_LEN.saturating_add(size)
+      }
+    };
+    let room = wanted.saturating_sub(self.inbound.len());
     if room == 0 {
-      return Err(protocol(
-        "a message exceeds the largest this back end accepts",
-      ));
+      return Ok(Received::Bytes);
     }
     let take = chunk.get_mut(..room).ok_or(protocol("buffer"))?;
     let mut space =

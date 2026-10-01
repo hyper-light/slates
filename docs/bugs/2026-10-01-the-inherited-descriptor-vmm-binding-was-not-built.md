@@ -47,7 +47,8 @@ Guests could not consume the volume through a real VMM. Nothing was served wrong
   supported on Linux, and stays `BindingNotBuilt` elsewhere (macOS guests use the in-process form).
 - `crates/server/src/virtiofs.rs`:
   - `Daemon::attach_vhost_user_device(volume, tag, view, socket, on_end)` adopts the socket on the owning shard
-    and negotiates within the daemon's failover budget (`slates_rt::futures::within`);
+    and negotiates within the bound the harness gives (`slates_rt::futures::within`). A VMM configures the
+    rings only when its guest's driver starts, after boot, and the harness owns the VM and knows that budget;
   - the device is then admitted and served by the same path as the in-process form, with the transport passed
     through;
   - a failed handshake is `GuestDeviceOutcome::HandshakeRefused`, with nothing admitted.
@@ -74,7 +75,8 @@ Both binding tests are in `crates/server/tests/virtiofs.rs` and run on Linux (ar
 
 ## Not done here (AUD-29-68 stays open)
 
-- **A live guest.** The test front end is the oracle's other leg, not a VMM. QEMU's `vhost-user-fs-pci` with
+- **A live guest: since run, 2026-10-01.** See `docs/bugs/2026-10-01-vhost-user-descriptors-closed-with-an-earlier-message.md`. It ran locally; CI is what remains.
+  The original note follows. The test front end is the oracle's other leg, not a VMM. QEMU's `vhost-user-fs-pci` with
   `-chardev socket,fd=N` speaks the same protocol over an inherited descriptor, and a run of it against this back
   end with a Linux guest that mounts the tag is the next leg. Locally it needs QEMU in a Linux container (software
   emulation; this Mac's Docker has no `/dev/kvm`). In CI it needs QEMU installed on the runner, which is non-Rust
