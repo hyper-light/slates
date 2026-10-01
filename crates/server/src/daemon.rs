@@ -2142,14 +2142,9 @@ impl Daemon {
   /// daemon's error stream, which its anchor keeps (every worker is still joined and every slot given back,
   /// AUD-29-12); with `panic = "abort"` a release build never reaches here after a worker's panic.
   fn stop_parts(&mut self) {
-    // The FUSE mounts first, while their shards still run: a mount whose daemon is gone answers every call
-    // `ENOTCONN` until someone unmounts it (§4.6; AUD-29-64).
-    #[cfg(target_os = "linux")]
-    if self.runtime.is_some() {
-      for shard in self.shards.clone() {
-        let _ = self.observe(Some(shard), crate::fuse::unmount_all);
-      }
-    }
+    // The FUSE mounts end with each shard's serve loop (`EndMounts`), on the shard's own thread as the
+    // shutdown cancels it — never as a question queued behind the shard's work, which would answer every
+    // question already waiting there instead of terminating it (§4.6; AUD-29-64).
     if let Some(mut doorbell) = self.doorbell.take() {
       doorbell.stop();
     }
@@ -2686,12 +2681,29 @@ fn refresh_pressure_hold() {
   }
 }
 
+/// Ends the shard's FUSE mounts when its serve loop ends (§4.6 "Linux"; AUD-29-64): the loop is perpetual,
+/// so it ends only when the daemon's stop cancels every task on the shard, and its drop runs on the shard's
+/// own thread with the shard's state still installed. A mount whose daemon is gone answers every call
+/// `ENOTCONN` until someone unmounts it, so the stop unmounts them here — not by a question sent ahead of the
+/// shutdown, which waits behind whatever the shard is running and answers the questions queued before it.
+#[cfg(target_os = "linux")]
+struct EndMounts;
+
+#[cfg(target_os = "linux")]
+impl Drop for EndMounts {
+  fn drop(&mut self) {
+    let _ = state::with_state(crate::fuse::unmount_all);
+  }
+}
+
 /// The shard's server loop: a poller of its clients' rings; serves while there is work, keeps
 /// polling for the idle window after its last work (§4.7 "Wake strategy": a shard polls while
 /// any client has activity within the window), and idles past it. The window is a multiple of what a
 /// wake costs the shard now — its online wake estimate (§4.3) — so it follows the wakes the shard
 /// actually pays rather than the boot probe's first guess.
 async fn serve_loop() {
+  #[cfg(target_os = "linux")]
+  let _end_mounts = EndMounts;
   if let Some(task) = futures::current_task() {
     let _ =
       registry::with_current(|ctx| ctx.register_poller(task, Box::new(state::any_ring_ready)));

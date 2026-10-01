@@ -577,8 +577,8 @@ pub(crate) fn unmount_if_mounted(s: &ShardState, attachment: u64) {
 }
 
 /// Unmounts every FUSE mount the shard serves (the daemon's stop), waiting for each helper within the
-/// failover bound: on a stop nothing else runs on the shard, and an unmount left to a task the stop is about
-/// to end would leave a dead mount behind.
+/// failover bound. Run by the end of the shard's serve loop (`daemon::EndMounts`): on a stop nothing else
+/// runs on the shard, and an unmount left to a task the stop is about to end would leave a dead mount behind.
 pub(crate) fn unmount_all(s: &mut ShardState) {
   let deadline = std::time::Duration::from_nanos(s.config.failover_slo_ns);
   let points: Vec<String> = s
