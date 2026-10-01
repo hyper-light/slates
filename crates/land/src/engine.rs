@@ -337,6 +337,8 @@ pub enum LandingRefusal {
   Volume(VfsError),
   /// The run was stepped after it had ended or been abandoned: it has nothing more to do.
   Ended,
+  /// The run was stepped while its host was away ([`LandingRun::take_host`]).
+  HostAway,
 }
 
 /// What the audit log records (§4.15's `AuditKind`).
@@ -2348,7 +2350,11 @@ pub fn begin_landing<'h, H: LandFs>(
   request: &LandingRequest,
 ) -> Result<LandingRun<'h, H>, (HostSlot<'h, H>, LandingRefusal)> {
   // Plan.
-  let manifest = match plan(vol, store, host.get(), &request.filter, request.source) {
+  let planned = match host.get() {
+    Some(lent) => plan(vol, store, lent, &request.filter, request.source),
+    None => return Err((host, LandingRefusal::HostAway)),
+  };
+  let manifest = match planned {
     Ok(manifest) => manifest,
     Err(error) => return Err((host, LandingRefusal::Volume(error))),
   };
@@ -2363,14 +2369,22 @@ pub fn begin_landing<'h, H: LandFs>(
   });
   // Grant: the landing's own binding — the consumer, the volume and snapshot, and the target as opened now —
   // must be the one the grant was approved for (§4.13 "Grants"), before any write-capable step.
-  let binding = match binding_of(host.get(), target, request) {
+  let bound = match host.get() {
+    Some(lent) => binding_of(lent, target, request),
+    None => Err(LandingRefusal::HostAway),
+  };
+  let binding = match bound {
     Ok(binding) => binding,
     Err(refusal) => return Err((host, refusal)),
   };
   let grant = match grants.check(request.grant, &binding, manifest.hash, request.now_ns) {
     Ok(g) => g,
     Err(GrantRefusal::GrantRequired) => {
-      let preliminary = match preliminary_verdicts(host.get(), target, request, &manifest) {
+      let verdicts = match host.get() {
+        Some(lent) => preliminary_verdicts(lent, target, request, &manifest),
+        None => Err(LandingRefusal::HostAway),
+      };
+      let preliminary = match verdicts {
         Ok(preliminary) => preliminary,
         Err(refusal) => return Err((host, refusal)),
       };
@@ -2550,19 +2564,23 @@ impl<'a, H: LandFs> Landing<'a, H> {
 }
 
 /// Where a run's host lives: owned by the run (a daemon's writer, given back by [`LandingRun::into_host`]
-/// when the run ends), or lent by a caller that runs the landing through in one call.
+/// when the run ends), lent by a caller that runs the landing through in one call, or away between slices
+/// ([`LandingRun::take_host`]) while its owner serves with it.
 pub enum HostSlot<'h, H> {
   /// The run owns the host.
   Owned(H),
   /// The run borrows the host.
   Lent(&'h mut H),
+  /// The host is away until [`LandingRun::put_host`] gives it back.
+  Away,
 }
 
 impl<H> HostSlot<'_, H> {
-  fn get(&mut self) -> &mut H {
+  fn get(&mut self) -> Option<&mut H> {
     match self {
-      HostSlot::Owned(host) => host,
-      HostSlot::Lent(host) => host,
+      HostSlot::Owned(host) => Some(host),
+      HostSlot::Lent(host) => Some(host),
+      HostSlot::Away => None,
     }
   }
 }
@@ -2620,9 +2638,10 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     grant: GrantRecord,
     lease: LandingLease,
   ) -> Result<Self, (HostSlot<'h, H>, LandingRefusal)> {
-    let caps = match host.get().capabilities(target.dir) {
-      Ok(caps) => caps,
-      Err(error) => return Err((host, LandingRefusal::Target(error))),
+    let caps = match host.get().map(|host| host.capabilities(target.dir)) {
+      Some(Ok(caps)) => caps,
+      Some(Err(error)) => return Err((host, LandingRefusal::Target(error))),
+      None => return Err((host, LandingRefusal::HostAway)),
     };
     let saved = Saved::start(&target, &request, caps);
     let parents = sweep_parents(&manifest);
@@ -2720,16 +2739,33 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
   pub fn into_host(self) -> Option<H> {
     match self.host {
       HostSlot::Owned(host) => Some(host),
-      HostSlot::Lent(_) => None,
+      HostSlot::Lent(_) | HostSlot::Away => None,
     }
+  }
+
+  /// Takes the run's own host away between slices, for its owner to serve with; `None` when the run does not
+  /// own it. The run steps nothing until [`LandingRun::put_host`] gives it back.
+  pub fn take_host(&mut self) -> Option<H> {
+    match std::mem::replace(&mut self.host, HostSlot::Away) {
+      HostSlot::Owned(host) => Some(host),
+      other => {
+        self.host = other;
+        None
+      }
+    }
+  }
+
+  /// Gives the run its host back for its next slice.
+  pub fn put_host(&mut self, host: H) {
+    self.host = HostSlot::Owned(host);
   }
 
   /// Ends a run that will not be stepped again (its client went, the shard is stopping): the directories it
   /// opened are closed and nothing is advanced, so its entries stay in the overlay and a later landing
   /// resumes them, sweeping whatever this attempt left — the same state a crash leaves.
   pub fn abandon(&mut self) {
-    if let Some(saved) = self.saved.take() {
-      let mut landing = Landing::resume(self.host.get(), &self.request, saved);
+    if let (Some(host), Some(saved)) = (self.host.get(), self.saved.take()) {
+      let mut landing = Landing::resume(host, &self.request, saved);
       landing.close_dirs();
       self.saved = Some(landing.suspend());
     }
@@ -2756,8 +2792,11 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       phase,
       swept,
     } = self;
+    let Some(host) = host.get() else {
+      return Some(Err(LandingRefusal::HostAway));
+    };
     let state = saved.take()?;
-    let mut landing = Landing::resume(host.get(), request, state);
+    let mut landing = Landing::resume(host, request, state);
     let mut ended = None;
     let mut next_phase = None;
     match phase {

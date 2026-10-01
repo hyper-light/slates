@@ -4766,6 +4766,17 @@ stays in the overlay.
 > with the sliced engine, AUD-29-25), and the record is not yet written to the host's candidate holders.
 > Record: `docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md`.
 
+> **Status (2026-10-01, AUD-29-25 in part).** A granted landing runs in slices.
+> - **The run.** After its grant and lease, it is an owned, resumable run that takes one unit at a time (a
+>   directory swept, an entry validated or written, a directory synced) in slices of half its shard's step
+>   quantum. The shard serves between slices, and the finish commits with the request's completion as one
+>   atom.
+> - **The base host.** An overlay's base host goes back to the volume's slot between slices.
+> - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
+> - **One at a time.** One granted landing per volume runs at a time.
+> - **Owed:** a large file's copy across slices, the lease keepalive between slices, and the shard-step
+>   percentile lane (`docs/bugs/2026-10-01-a-granted-landing-held-its-shard-for-all-of-its-work.md`).
+>
 > **Status (2026-09-29, A-46, AUD-29-07).** A presented landing is consumed by the landing its grant
 > covers, replaced by its client's re-presentation, abandoned with its client, and bounded per shard. Before,
 > a presentation took one id and the granted landing a fresh one, so the finish removed a key that was never

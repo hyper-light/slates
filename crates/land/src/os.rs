@@ -72,6 +72,12 @@ pub struct OsLand {
   temps: BTreeMap<u64, Temp>,
 }
 
+/// A writer's own state while it has lent its host away ([`OsLand::lend`]).
+#[derive(Debug)]
+pub struct Away {
+  temps: BTreeMap<u64, Temp>,
+}
+
 impl std::fmt::Debug for OsLand {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("OsLand")
@@ -207,6 +213,21 @@ impl OsLand {
   /// hidden siblings, which the next landing's sweep removes.
   pub fn into_host(self) -> OsHost {
     self.host
+  }
+
+  /// Lends the host back between a sliced landing's slices (AUD-29-25): an overlay volume serves its base
+  /// through it while the landing waits for its next slice. The writer's own state — its temporaries, none
+  /// open between units — is kept in the returned [`Away`], which [`OsLand::resume`] takes back with the host.
+  pub fn lend(self) -> (OsHost, Away) {
+    (self.host, Away { temps: self.temps })
+  }
+
+  /// The writer again, over the host it lent and its own state.
+  pub fn resume(host: OsHost, away: Away) -> Self {
+    Self {
+      host,
+      temps: away.temps,
+    }
   }
 
   fn dir(&self, dir: HostDir) -> Result<BorrowedFd<'_>, HostError> {

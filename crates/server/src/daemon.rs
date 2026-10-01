@@ -1855,6 +1855,14 @@ impl Daemon {
     Ok(baseline)
   }
 
+  /// The slices granted landings have taken on this daemon's first shard, and the longest in nanoseconds
+  /// (AUD-29-25): a landing runs in slices with the shard serving between them.
+  pub fn landing_slices(&self) -> Result<(u64, u64), ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      (s.landing.slices, s.landing.longest_slice_ns)
+    })
+  }
+
   /// The pressure hold on this daemon's first shard now (§4.2): what the sampler, or a test, withholds
   /// from new admission there.
   pub fn pressure_hold(&self) -> Result<u64, ObserveError> {

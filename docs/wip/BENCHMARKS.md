@@ -1187,3 +1187,24 @@ its share of the record's region is refused before the log changes (`RaftNode::b
 publication can no longer overflow after the protocol has moved. Revisit if a group's configuration grows
 into the megabytes (root homes at fleet scale), where the 3.1 ms row starts to bind the acknowledgement path.
 
+### A granted landing's slices against a probing client (2026-10-01)
+
+`cargo test -p slates-server --test landing_fairness -- --nocapture` (debug build). The test lands 600 files,
+written through the daemon's NFS transport, into a fresh directory in the build output. It runs on a
+one-shard daemon while a second client probes `list` in a loop. Apple M5 Max, macOS 26.4.1, load average
+4.7–7.0 from other sessions (not quiesced).
+
+| Shape | Landing | Slices | Longest slice | Probes during it | Longest probe | Baseline probe |
+|---|---|---|---|---|---|---|
+| One unbounded slice (before AUD-29-25) | 831.5 ms | 1 | 810.6 ms | 3 | 831.0 ms | 168.9 µs |
+| Sliced, run 1 | 1.80 s | 1,108 | 22.8 ms | 1,035 | 34.6 ms | 162.5 µs |
+| Sliced, run 2 | 1.13 s | 1,093 | 31.7 ms | 1,021 | 36.9 ms | 98.4 µs |
+| Sliced, run 3 (a stalled `fsync`) | 6.26 s | 1,170 | 205.4 ms | 1,096 | 205.6 ms | 166.8 µs |
+
+**Without the probing client** (the same landing, sliced; three runs): 613, 612 and 596 ms, against
+831 ms for the one call. Slicing costs no throughput here.
+
+What it means: a slice ends within one unit of its budget, and a unit is one file's create, write and
+`fsync`, so the longest wait a probe sees is that unit's disk latency. A large file is still one unit
+(owed).
+
