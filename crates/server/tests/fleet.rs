@@ -7418,14 +7418,21 @@ fn a_holders_replicas_cap_at_its_unpromised_capacity_through_churn_and_retire_to
 /// whether the charge or the room moved first (CI failures 2026-10-01 could not be reproduced alone).
 const CHURN_SAMPLES_KEPT: usize = 64;
 
+/// One churn sample: the holder's charge, admittable room, pressure hold, refused puts, stages and
+/// manifests.
+type ChurnSample = (u64, u64, u64, u64, usize, usize);
+
 /// What the churn test saw.
 #[derive(Debug, Default)]
 struct Churn {
   per_seal: u64,
   cap: u64,
   peak: u64,
-  /// The last [`CHURN_SAMPLES_KEPT`] samples: (charge, admittable room, stages, manifests).
-  samples: std::collections::VecDeque<(u64, u64, usize, usize)>,
+  /// The phase the samples are being taken in.
+  phase: &'static str,
+  /// The last [`CHURN_SAMPLES_KEPT`] samples of each phase, so a failure shows the phase that failed and
+  /// not only the baseline polls that follow it.
+  samples: std::collections::BTreeMap<&'static str, std::collections::VecDeque<ChurnSample>>,
   accounts_agree: bool,
   refused_at_cap: bool,
   unrelated_wrote: bool,
@@ -7462,12 +7469,15 @@ fn sample_replicas(
 ) -> Result<slates_server::daemon::ReplicaAccount, ObserveError> {
   let account = holder.fleet_replica_account()?;
   churn.peak = churn.peak.max(account.replicated);
-  if churn.samples.len() == CHURN_SAMPLES_KEPT {
-    churn.samples.pop_front();
+  let samples = churn.samples.entry(churn.phase).or_default();
+  if samples.len() == CHURN_SAMPLES_KEPT {
+    samples.pop_front();
   }
-  churn.samples.push_back((
+  samples.push_back((
     account.replicated,
     account.admittable,
+    account.hold,
+    account.refused_capacity,
     account.stages,
     account.manifests,
   ));
@@ -7484,6 +7494,12 @@ fn place_first_and_promise(
 ) -> Result<(VolumeId, [u8; 32]), String> {
   let holder = &daemons[1];
   let observed: Vec<&Daemon> = daemons.iter().collect();
+  // The holder's pressure hold pinned at zero before its cap is measured: the cap is a room of two seals,
+  // and the live sampler moves the hold with the host's (and this test binary's) memory, by more than a
+  // seal on a loaded runner (CI 2026-10-01: refused at one seal under a cap of three).
+  holder
+    .inject_pressure_hold(0)
+    .map_err(|e| format!("pin the holder's pressure hold: {e}"))?;
   let first = seal_without_waiting(instance, &daemons[0], "churn-0")?;
   if !poll_until(&observed, PLACEMENT_DEADLINE, || {
     sample_replicas(holder, churn).map(|account| account.manifests == 1)
@@ -7530,7 +7546,9 @@ fn churn_against_a_capped_holder(instance: &str, daemons: &[Daemon]) -> Result<C
     accounts_agree: true,
     ..Churn::default()
   };
+  churn.phase = "1 first seal and promise";
   let (first, first_manifest) = place_first_and_promise(instance, daemons, &mut churn)?;
+  churn.phase = "2 seals past the cap";
   let mut waiting = Vec::new();
   for index in 1..=CHURN_MORE_SEALS {
     waiting.push(seal_without_waiting(
@@ -7551,6 +7569,7 @@ fn churn_against_a_capped_holder(instance: &str, daemons: &[Daemon]) -> Result<C
   ) {
     return Err("the first volume was not destroyed".to_owned());
   }
+  churn.phase = "3 room after a destroy";
   let before = sample_replicas(holder, &mut churn).map_err(|e| e.to_string())?;
   churn.room_reused = poll_until(&observed, PLACEMENT_DEADLINE, || {
     let account = sample_replicas(holder, &mut churn)?;
@@ -7562,6 +7581,7 @@ fn churn_against_a_capped_holder(instance: &str, daemons: &[Daemon]) -> Result<C
   for volume in waiting {
     let _ = owner.call(&RequestBody::Destroy { volume });
   }
+  churn.phase = "4 baseline";
   churn.baseline = poll_until(&observed, PLACEMENT_DEADLINE, || {
     sample_replicas(holder, &mut churn)
       .map(|account| (account.replicated, account.index, account.manifests) == (0, 0, 0))

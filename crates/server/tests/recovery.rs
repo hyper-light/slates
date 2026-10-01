@@ -718,6 +718,93 @@ fn an_abandoned_transfer_returns_every_charge_when_replaced() {
   assert_eq!(abandoned_held, Ok(false));
 }
 
+/// Shape: the host memory the pressure test's first daemon reads at its first sample.
+const SAMPLED_AVAILABLE: u64 = 8 << 30;
+/// Shape: how much less the second daemon reads at its own first sample — a process that grew between
+/// two daemons' starts (the fleet test binary grows by its leaked sockets and buffers).
+const GROWN_BETWEEN_STARTS: u64 = 1 << 30;
+/// Shape: a further drop the second daemon reads later, which is real pressure on it.
+const LATER_DROP: u64 = 256 << 20;
+/// Shape: how long the test waits for a sampler to act — many liveness cadences (one second each).
+const SAMPLER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Shape: the pause between the pressure test's polls — a twentieth of the sampler's one-second cadence.
+const SAMPLER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Polls `done` until it holds or [`SAMPLER_WAIT`] passes.
+fn within_sampler_wait(mut done: impl FnMut() -> bool) -> bool {
+  let began = std::time::Instant::now();
+  while began.elapsed() < SAMPLER_WAIT {
+    if done() {
+      return true;
+    }
+    // The harness paces its poll of a sampler that acts once a second; shipped code parks on its
+    // driver (D-9).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SAMPLER_POLL);
+  }
+  done()
+}
+
+/// §4.2, admission.md §5.5 (found by the AUD-29-43 churn test's CI failures). Do: start one daemon whose
+/// sampler reads a host's available memory; start a second in the same process that reads 1 GiB less at
+/// its first sample; then let the second read a further 256 MiB less. Expect: neither daemon holds
+/// anything back for the difference between their starts — each measures pressure from its own first
+/// sample — and the second's later drop is held back across its shards. Before the fix the baseline was
+/// process-wide, fixed by whichever daemon sampled first, so the second daemon withheld the first's
+/// growth as if it were pressure.
+#[test]
+fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
+  let profile = common::machine_profile();
+  let start = |name: &str| {
+    let instance = format!("srv-pressure-{name}-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+    let segment = anchor_segment(&format!("pressure-{name}"), &profile, &config);
+    let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+    (daemon, segment)
+  };
+  let (first, first_segment) = start("first");
+  first.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
+  let first_sampled =
+    within_sampler_wait(|| first.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
+  let (second, second_segment) = start("second");
+  second
+    .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS)
+    .unwrap();
+  let second_sampled = within_sampler_wait(|| {
+    second.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS))
+  });
+  let second_hold_at_start = second.pressure_hold();
+  second
+    .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS - LATER_DROP)
+    .unwrap();
+  let per_shard = LATER_DROP / u64::from(TEST_SHARDS);
+  let pressure_held = within_sampler_wait(|| second.pressure_hold() == Ok(per_shard));
+  let first_hold = first.pressure_hold();
+  first.stop();
+  second.stop();
+  drop((first_segment, second_segment));
+  assert!(first_sampled, "the first daemon took its first sample");
+  assert!(
+    second_sampled,
+    "the second daemon's baseline is its own first sample, not the first daemon's"
+  );
+  assert_eq!(
+    second_hold_at_start,
+    Ok(0),
+    "the second daemon withholds nothing for the process's growth before it started"
+  );
+  assert!(
+    pressure_held,
+    "a later drop on the second daemon is held back, divided among its shards"
+  );
+  assert_eq!(
+    first_hold,
+    Ok(0),
+    "the first daemon saw no pressure of its own"
+  );
+}
+
 /// AUD-29-43 (§4.2 "a remote holder makes the same admission against its own machine before acknowledging
 /// placement"): a replica is admitted only from the holder's unpromised capacity. Do: withhold the whole of
 /// every shard's admittable capacity (the memory-pressure hold), put a replica, then release the hold and

@@ -441,6 +441,8 @@ pub struct ReplicaAccount {
   pub stages: usize,
   /// The bytes the shard's budget may still admit.
   pub admittable: u64,
+  /// The capacity the memory-pressure hold withholds from admission now (§4.2).
+  pub hold: u64,
 }
 
 /// Clients found dead and reclaimed (a health signal; T-2.3).
@@ -1698,6 +1700,7 @@ impl Daemon {
       refused_capacity: s.held_content.refused_capacity(),
       stages: s.held_content.stage_count(),
       admittable: s.store.budget.admittable(),
+      hold: s.store.budget.hold(),
     })
   }
 
@@ -1831,16 +1834,48 @@ impl Daemon {
     })
   }
 
+  /// Test support: the host memory available that this daemon's pressure sampler reads from now on, in
+  /// place of the platform's reading (§4.2; admission.md §5.5) — so a test drives the sampler's
+  /// arithmetic (its baseline and shortfall) deterministically. Installed on every shard, since the
+  /// sampling shard is the reaper's.
+  pub fn inject_available_memory(&self, bytes: u64) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.injected_available = Some(bytes))?;
+    }
+    Ok(())
+  }
+
+  /// The baseline this daemon's pressure sampler measures against, once its first sample is taken (§4.2):
+  /// the sampling shard's, read from whichever shard holds it.
+  pub fn pressure_baseline(&self) -> Result<Option<u64>, ObserveError> {
+    let mut baseline = None;
+    for shard in self.shards.iter().copied() {
+      baseline = baseline.or(self.observe(Some(shard), |s| s.pressure_baseline)?);
+    }
+    Ok(baseline)
+  }
+
+  /// The pressure hold on this daemon's first shard now (§4.2): what the sampler, or a test, withholds
+  /// from new admission there.
+  pub fn pressure_hold(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.store.budget.hold())
+  }
+
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
   /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
   /// drives it directly so a test proves the mechanism without a real low-memory host: a raised hold
-  /// refuses a new reservation while an admitted volume's within-entitlement writes still land.
+  /// refuses a new reservation while an admitted volume's within-entitlement writes still land. The
+  /// injected hold is pinned: the sampler leaves those shards' holds alone from then on, so the test is
+  /// not raced by the host's next sample.
   /// Installed on every shard (a test need not know which shard a volume routes to). `Ok` once
   /// installed everywhere, else the first shard's typed refusal.
   pub fn inject_pressure_hold(&self, bytes: u64) -> Result<(), ObserveError> {
     for shard in self.shards.iter().copied() {
-      self.observe(Some(shard), move |s| s.store.budget.set_hold(bytes))?;
+      self.observe(Some(shard), move |s| {
+        s.pressure_pinned = true;
+        s.store.budget.set_hold(bytes);
+      })?;
     }
     Ok(())
   }
@@ -2470,6 +2505,9 @@ fn init_shard(
       ..crate::lease::OwnerLease::default()
     },
     fanned: crate::fleet::Fanned::default(),
+    pressure_baseline: None,
+    pressure_pinned: false,
+    injected_available: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -2579,10 +2617,6 @@ async fn reap_loop() {
   }
 }
 
-/// The host memory available at the daemon's first pressure sample (§4.2; admission.md §5.5): the
-/// baseline the pressure hold measures a shortfall against. `0` before the first sample; set once.
-static PRESSURE_BASELINE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 /// Samples the host's available memory and sets each shard's pressure hold (§4.2; admission.md §5.5),
 /// run on the reap loop's shard at the liveness cadence — the design's "cheap-refresh". The hold is
 /// the host-wide shortfall below the boot baseline, divided evenly among the shards (so the total
@@ -2593,23 +2627,25 @@ static PRESSURE_BASELINE: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// budget then admits exactly as before, no worse than not sampling. The read is one cheap syscall or
 /// `/proc` line per cadence, not per request.
 fn refresh_pressure_hold() {
-  let Some(available) = slates_machine::facts::Facts::memory_available_now() else {
+  let injected = state::with_state(|s| s.injected_available).flatten();
+  let Some(available) = injected.or_else(slates_machine::facts::Facts::memory_available_now) else {
     return;
   };
-  // The first sample fixes the baseline; a later sample above it only lowers the shortfall.
-  let baseline =
-    match PRESSURE_BASELINE.compare_exchange(0, available, Ordering::AcqRel, Ordering::Acquire) {
-      Ok(_) => available,
-      Err(existing) => existing,
-    };
+  // This daemon's first sample fixes its baseline (kept by the sampling shard, so each daemon in a
+  // process has its own); a later sample above it only lowers the shortfall.
+  let Some((origin, shards, baseline)) = state::with_state(|s| {
+    let baseline = *s.pressure_baseline.get_or_insert(available);
+    (s.shard, s.shards.clone(), baseline)
+  }) else {
+    return;
+  };
   let shortfall = baseline.saturating_sub(available);
-  let Some((origin, shards)) = state::with_state(|s| (s.shard, s.shards.clone())) else {
-    return;
-  };
   let per_shard = shortfall / u64::try_from(shards.len().max(1)).unwrap_or(1);
   for shard in shards {
     let _ = crate::xshard::run_on(origin, shard, move |s| {
-      s.store.budget.set_hold(per_shard);
+      if !s.pressure_pinned {
+        s.store.budget.set_hold(per_shard);
+      }
     });
   }
 }

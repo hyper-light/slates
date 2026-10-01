@@ -505,6 +505,17 @@ pub struct ShardState {
   /// fans a shard only the parts that changed since, and records a delivery only once its bounded channel
   /// accepted it, so a refused fan is sent again the next period. Bounded by the shards.
   pub(crate) fanned: crate::fleet::Fanned,
+  /// The host memory available at this daemon's first pressure sample (§4.2; admission.md §5.5): the
+  /// baseline its pressure hold measures a shortfall against, kept by the shard that samples. Per daemon,
+  /// never process-wide: several daemons in one process (the fleet tests) each measure from their own
+  /// start, so one daemon's growth is not another's pressure.
+  pub(crate) pressure_baseline: Option<u64>,
+  /// A pressure hold a test injected (`Daemon::inject_pressure_hold`), which the sampler then leaves in
+  /// place, so a test that drives the mechanism is not raced by the host's sample.
+  pub(crate) pressure_pinned: bool,
+  /// A host memory reading a test injected (`Daemon::inject_available_memory`), which the sampler uses in
+  /// place of the platform's, so a test of the pressure arithmetic is not at the mercy of the host.
+  pub(crate) injected_available: Option<u64>,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder
