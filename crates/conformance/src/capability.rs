@@ -106,20 +106,19 @@ const VIRTIOFS_OWED: &str = concat!(
 
 /// The reason every OCI cell is owed.
 const OCI_OWED: &str = "the container form exists — `attach` returns a verified non-recursive private bind \
-  (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS \
-  lane under the runtime handshake (`slates oci-runtime docker`), as do fsstress, the workloads and \
-  pjdfstest — but the hermeticity container leg is not built: its tracer needs root, and no lane holds both \
-  root and a container engine; on Linux the bind of the daemon's shared FUSE mount (`slates mount --shared`) runs \
-  container workloads in the CLI suite (a_linux_container_reaches_the_shared_mount_as_its_own_ids), and this \
-  harness has no Linux container leg yet";
+  (the source checked again by `slates oci-check`), and fsx, fsstress, the workloads and pjdfstest run inside a \
+  container through it on the macOS lane under the runtime handshake (`slates oci-runtime docker`); the \
+  hermeticity container leg runs on Linux (`oci-linux`, a root tracer over a Docker Engine bound to the \
+  daemon's shared FUSE mount), and on macOS it is owed: its tracer (`eslogger`) needs root, which this lane's \
+  harness never takes";
 
 /// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export.
 const LINUX_NFS_ADAPTER: Adapter = Adapter {
   name: "a root `mount -t nfs` by the Linux NFS client of the unprivileged daemon's NFSv3 loopback \
     export (the same serving code as macOS)",
-  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): the lane \
-    still mounts through the NFS adapter; running the suites over FUSE is owed (pjdfstest's root cases need \
-    `allow_other`, which an operator grants with `user_allow_other` in /etc/fuse.conf)",
+  not_covered: "the daemon's own FUSE mount (`slates mount` on Linux, crates/server/src/fuse.rs): this lane \
+    mounts through the NFS adapter; the suites over the FUSE mount run in the Linux container lane \
+    (`oci-linux`, `slates mount --shared` with `user_allow_other`)",
 };
 
 /// Tools every mounted macOS suite needs.
@@ -145,6 +144,34 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
       }
     }
     (Transport::Oci, _) => Availability::Owed(OCI_OWED),
+    // A Linux Docker Engine over the daemon's shared FUSE mount (`slates mount --shared`): no root anywhere —
+    // the mount is the user's own, and strace of the harness's own children needs none.
+    (Transport::OciLinux, Suite::Pjdfstest) => Availability::Runnable {
+      on: HostOs::Linux,
+      tools: &["fusermount3", "sh", "cc", "docker"],
+      // pjdfstest's README requires root; it gets it inside the container, whose ids reach the shared mount as
+      // themselves on a Linux engine (`ContainerIdsAsHostIds`), so the host's harness needs none.
+      root: RootNeed::None,
+      adapter: None,
+    },
+    (Transport::OciLinux, Suite::Fsx | Suite::Fsstress | Suite::Workloads) => {
+      Availability::Runnable {
+        on: HostOs::Linux,
+        tools: &["fusermount3", "sh", "cc", "docker"],
+        root: RootNeed::None,
+        adapter: None,
+      }
+    }
+    (Transport::OciLinux, Suite::Hermeticity) => Availability::Runnable {
+      on: HostOs::Linux,
+      tools: &["fusermount3", "strace", "sh", "docker", "sudo"],
+      root: RootNeed::Required(
+        "the tracer must hold CAP_SYS_PTRACE: under an unprivileged tracer the setuid FUSE helper \
+         (fusermount3) loses its privilege and the shared mount is refused EPERM; the daemon still runs as \
+         the user",
+      ),
+      adapter: None,
+    },
     (Transport::NativeMacosNfs, suite) => native_macos(suite),
     (Transport::NativeLinuxFuse, suite) => native_linux(suite, Some(LINUX_NFS_ADAPTER)),
     // The daemon's own NFSv4.2 server under the kernel client: a transport, not an adapter.

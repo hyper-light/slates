@@ -751,6 +751,7 @@ impl Volume {
     dir: Handle<DirNode>,
     name: &str,
   ) -> Result<Located, VfsError> {
+    names::check_length(name)?;
     let dir = self.head_dir(store, dir)?;
     let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
     let entry = node
@@ -2117,6 +2118,7 @@ impl Volume {
     dir: Handle<DirNode>,
     name: &str,
   ) -> Result<Located, VfsError> {
+    names::check_length(name)?;
     // The given node, as it was: never resolved to the head's current node.
     let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
     let entry = node

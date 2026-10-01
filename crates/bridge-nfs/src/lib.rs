@@ -26,6 +26,7 @@ pub mod nfs;
 pub mod portmap;
 pub mod procedures;
 pub mod rpc;
+pub mod rpc_tls;
 pub mod server;
 pub mod v4;
 pub mod xdr;

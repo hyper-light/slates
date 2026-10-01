@@ -86,9 +86,8 @@ const STATUS_NOT_SAME_DEVICE: Ntstatus = Ntstatus(0xC000_00D4);
 const STATUS_DIRECTORY_NOT_EMPTY: Ntstatus = Ntstatus(0xC000_0101);
 /// Format: `STATUS_NOT_A_DIRECTORY` — a file was found where a directory was expected (`ENOTDIR`).
 const STATUS_NOT_A_DIRECTORY: Ntstatus = Ntstatus(0xC000_0103);
-/// Format: `STATUS_NAME_TOO_LONG` — a name longer than the call can carry (`ENAMETOOLONG`). Windows-only,
-/// as its one user, the mount host's directory listing.
-#[cfg(windows)]
+/// Format: `STATUS_NAME_TOO_LONG` — a name longer than the call can carry (`ENAMETOOLONG`; Win32
+/// `ERROR_FILENAME_EXCED_RANGE`): a component past `NAME_MAX` and a directory entry too long for its record.
 const STATUS_NAME_TOO_LONG: Ntstatus = Ntstatus(0xC000_0106);
 
 /// Format: the offset from the Windows `FILETIME` epoch (1601-01-01) to the Unix epoch (1970-01-01),
@@ -142,6 +141,7 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::NoSpace => STATUS_DISK_FULL,
     VfsError::NotPermitted => STATUS_ACCESS_DENIED,
     VfsError::Invalid | VfsError::InvalidName => STATUS_INVALID_PARAMETER,
+    VfsError::NameTooLong => STATUS_NAME_TOO_LONG,
     VfsError::CrossVolumeMove => STATUS_NOT_SAME_DEVICE,
     VfsError::StaleHandle => STATUS_INVALID_HANDLE,
     VfsError::Pinned => STATUS_MEDIA_WRITE_PROTECTED,
@@ -211,6 +211,7 @@ mod tests {
       (VfsError::NotPermitted, STATUS_ACCESS_DENIED),
       (VfsError::Invalid, STATUS_INVALID_PARAMETER),
       (VfsError::InvalidName, STATUS_INVALID_PARAMETER),
+      (VfsError::NameTooLong, STATUS_NAME_TOO_LONG),
       (VfsError::CrossVolumeMove, STATUS_NOT_SAME_DEVICE),
       (VfsError::StaleHandle, STATUS_INVALID_HANDLE),
       (VfsError::Pinned, STATUS_MEDIA_WRITE_PROTECTED),

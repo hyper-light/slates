@@ -9,7 +9,8 @@
 //! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name temporaries
 //! (`O_CREAT|O_EXCL`), `fcntl(F_BARRIERFSYNC)` as the data barrier, `renameatx_np(RENAME_SWAP)`,
 //! `fcntl(F_FULLFSYNC)` on the target as the media barrier when the grant asked for it. Both:
-//! `fchmod`, `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The three `unsafe`
+//! `fchmod` (on files and on each made directory, so the umask never edits a recorded mode),
+//! `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The three `unsafe`
 //! sites are the libc calls rustix does not wrap (`F_BARRIERFSYNC`, `F_FULLFSYNC`,
 //! `renameatx_np`), each on a descriptor this host owns.
 //!
@@ -608,8 +609,15 @@ impl LandFs for OsLand {
     rustix::fs::unlinkat(self.dir(dir)?, name, AtFlags::empty()).map_err(refusal)
   }
 
+  /// `mkdirat` applies the process umask, so the directory is then opened (`O_DIRECTORY|O_NOFOLLOW`,
+  /// never a symlink swapped in under the name) and given the recorded mode exactly with `fchmod`,
+  /// as a file's temporary is by `set_mode`. Before 2026-10-01 the umask cleared bits the volume
+  /// held (0775 landed 0755; docs/bugs/2026-10-01-landed-directory-mode-umask.md).
   fn mkdir(&mut self, dir: HostDir, name: &str, mode: u32) -> Result<(), HostError> {
-    rustix::fs::mkdirat(self.dir(dir)?, name, mode_bits(mode)).map_err(refusal)
+    let parent = self.dir(dir)?;
+    rustix::fs::mkdirat(parent, name, mode_bits(mode)).map_err(refusal)?;
+    let made = rustix::fs::openat(parent, name, dir_flags(), Mode::empty()).map_err(refusal)?;
+    rustix::fs::fchmod(&made, mode_bits(mode)).map_err(refusal)
   }
 
   fn rmdir(&mut self, dir: HostDir, name: &str) -> Result<(), HostError> {

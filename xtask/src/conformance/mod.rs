@@ -213,7 +213,7 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
   }
 }
 
-/// `tally --outputs DIR [--privilege root|unprivileged]`: review kept pjdfstest outputs.
+/// `tally --outputs DIR [--privilege root|unprivileged] [--transport SLUG]`: review kept pjdfstest outputs.
 fn tally(root: &Path, options: &Options) -> Result<(), Failure> {
   let outputs = options
     .outputs
@@ -233,7 +233,13 @@ fn tally(root: &Path, options: &Options) -> Result<(), Failure> {
     },
     None => suites::this_user(),
   };
-  suites::tally_outputs(root, native_transport(host_os()?), outputs, &runner)
+  // `--transport` names the list to judge against (a container lane's outputs reviewed on another host); without
+  // it, this host's native transport's.
+  let transport = match options.transport {
+    Some(transport) => transport,
+    None => native_transport(host_os()?),
+  };
+  suites::tally_outputs(root, transport, outputs, &runner)
 }
 
 // --- the host ---------------------------------------------------------------------------------
@@ -265,7 +271,12 @@ fn native_transports(os: HostOs) -> &'static [Transport] {
     // The container form rides the macOS host mount (AUD-29-78): its cells run where a container
     // runtime's handshake holds evidence, and are skipped typed elsewhere.
     HostOs::Macos => &[Transport::NativeMacosNfs, Transport::Oci],
-    HostOs::Linux => &[Transport::NativeLinuxFuse, Transport::NativeLinuxNfs4],
+    // The Linux container form binds the daemon's shared FUSE mount (AUD-29-67/74).
+    HostOs::Linux => &[
+      Transport::NativeLinuxFuse,
+      Transport::NativeLinuxNfs4,
+      Transport::OciLinux,
+    ],
     HostOs::Windows => &[Transport::NativeWindowsWinfsp],
   }
 }
@@ -567,7 +578,7 @@ fn readiness(os: HostOs, transport: Transport, suite: Suite) -> Readiness {
       }
       // A container cell needs an engine that answers, not only its CLI; the handshake then judges the
       // engine's profile and fails the lane for an untested one.
-      if transport == Transport::Oci
+      if transport.is_container()
         && stdout_of("docker", &["info", "--format", "{{.ServerVersion}}"]).is_empty()
       {
         return Readiness::Skip(SkipReason::Tool(
@@ -713,13 +724,13 @@ fn run_suite_on(
   };
   let started = std::time::Instant::now();
   let result = match suite {
-    Suite::Fsx if transport == Transport::Oci => container::run_fsx(&run)?,
+    Suite::Fsx if transport.is_container() => container::run_fsx(&run)?,
     Suite::Fsx => suites::run_fsx(&run)?,
-    Suite::Fsstress if transport == Transport::Oci => container::run_fsstress(&run)?,
+    Suite::Fsstress if transport.is_container() => container::run_fsstress(&run)?,
     Suite::Fsstress => suites::run_fsstress(&run)?,
-    Suite::Pjdfstest if transport == Transport::Oci => container::run_pjdfstest(&run)?,
+    Suite::Pjdfstest if transport.is_container() => container::run_pjdfstest(&run)?,
     Suite::Pjdfstest => suites::run_pjdfstest(&run)?,
-    Suite::Workloads if transport == Transport::Oci => container::run_workloads(&run)?,
+    Suite::Workloads if transport.is_container() => container::run_workloads(&run)?,
     Suite::Workloads => workloads::run_workloads(&run)?,
     Suite::Hermeticity => hermeticity::run_hermeticity(&run)?,
     Suite::Pressure | Suite::Failure => {

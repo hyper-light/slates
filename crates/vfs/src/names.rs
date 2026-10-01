@@ -115,13 +115,19 @@ impl NameEquivalence {
 
 /// Checks a component name: not empty, not `.` or `..`, no separator, no NUL, within `NAME_MAX`.
 pub fn check(name: &str) -> Result<(), crate::error::VfsError> {
-  if name.is_empty()
-    || name == "."
-    || name == ".."
-    || name.len() > NAME_MAX
-    || name.bytes().any(|b| b == b'/' || b == 0)
-  {
+  check_length(name)?;
+  if name.is_empty() || name == "." || name == ".." || name.bytes().any(|b| b == b'/' || b == 0) {
     return Err(crate::error::VfsError::InvalidName);
+  }
+  Ok(())
+}
+
+/// Refuses a component longer than [`NAME_MAX`] bytes `NameTooLong`: the one rule a lookup shares with a
+/// creation (POSIX.1-2017 §2.3, `ENAMETOOLONG` "the length of a component of a pathname is longer than
+/// {NAME_MAX}"), so a long name is never answered "not found".
+pub fn check_length(name: &str) -> Result<(), crate::error::VfsError> {
+  if name.len() > NAME_MAX {
+    return Err(crate::error::VfsError::NameTooLong);
   }
   Ok(())
 }

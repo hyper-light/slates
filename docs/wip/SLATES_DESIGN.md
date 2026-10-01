@@ -1811,6 +1811,57 @@ neither the server nor a mounted client is granted device activation by a volume
 Device-metadata preservation is a separate, unimplemented decision. Mounted acceptance
 must exercise local communication and isolation between clones as well as namespace calls.
 
+**Kubernetes publication without privilege (AUD-29-75; decided 2026-10-01).** Kubernetes has two ways to put a
+mount a component makes into a pod, and both need a privilege R10 forbids:
+
+- A CSI node plugin that mounts into kubelet's target directory needs `Bidirectional` mount propagation, which
+  "is allowed only in privileged containers" [B: Kubernetes docs, `concepts/storage/volumes.md` "Mount
+  propagation", kubernetes/website main, fetched 2026-10-01].
+- A sidecar in the consumer's pod cannot serve the pod's own volume, because kubelet sets a pod's volumes up
+  before any of its containers start.
+
+So the published form is the one Kubernetes already performs with its own broker. The workload's volume is an
+`nfs` PersistentVolume, which, unlike a pod's inline `nfs` volume, takes `mountOptions`. Kubelet, the node's
+mount broker in the way `fusermount3` and `mount_nfs` are elsewhere, mounts it from the daemon's export. Sources:
+"You must have your own NFS server running with the share exported before you can use it"; "you can't specify NFS
+mount options in a Pod spec ... You can also mount NFS volumes via PersistentVolumes, which do allow you to set
+mount options"; `nfs` is among the types that support mount options [B: the same docs, `volumes.md` "nfs" and
+`persistent-volumes.md` "Mount Options"]. No slates component asks for a privilege, a host path, a node plugin or
+a mount propagation mode.
+
+1. **Where the server runs.** The daemon pods (the KIND chart's StatefulSet) serve NFSv4.2 on a second
+   listener, on the pod network. The loopback listener is unchanged. These are two trust boundaries, not a mode
+   switch: the host protects loopback, and nothing protects the cluster network.
+2. **The capability.** A new attach form, a network export of a volume, subtree or snapshot, creates an
+   attachment like any other (§4.8 record, the scope and view rules of AUD-29-76). Its capability is the
+   export's one path component, an unguessable token like the host mount's. `PUTROOTFH` then `LOOKUP(token)`
+   reaches the attachment's scoped root and nothing above it. An unknown or ended token is refused. A
+   `detach`, the volume's destroy or the snapshot view's end makes every handle under it stale.
+3. **The transport is RPC-with-TLS, mutually authenticated, or nothing.** Over cleartext the token would be a
+   bearer secret on the cluster network, so the network listener accepts only RFC 9289's protocol. The client
+   first sends a `NULL` call with `AUTH_TLS`, and the server answers with the `STARTTLS` verifier (§4.1). TLS 1.3
+   with X.509 peer authentication follows (§5.2.1) before any NFS operation; a connection that does not
+   complete it is closed. The node's client certificate comes from the fleet's CA (§4.13 enrollment). The
+   PersistentVolume names `mountOptions: [nfsvers=4.2, xprtsec=mtls, port=<the listener>]`. In nfs(5), `xprtsec=mtls`
+   is "the client uses RPC-with-TLS to authenticate itself and to provide in-transit confidentiality ... If ...
+   the server does not support RPC-with-TLS or peer authentication fails, the mount attempt fails" [B: nfs(5),
+   man7.org, fetched 2026-10-01].
+4. **What the node needs.** The Linux client does the handshake through a user-space agent started in its
+   network namespace, and kTLS carries the records [B: Linux `Documentation/networking/tls-handshake.rst`,
+   fetched 2026-10-01]. So the node runs the distribution's handshake agent (ktls-utils' `tlshd`, configured
+   with the node's certificate) on a kernel with `CONFIG_TLS` and `CONFIG_NET_HANDSHAKE`. Like `user_allow_other`,
+   this is a once-per-node installation by the operator, never a privilege slates holds. Measured 2026-10-01:
+   Docker Desktop's kernel (`6.12.76-linuxkit`) has `CONFIG_NET_HANDSHAKE=y` and `CONFIG_TLS` unset, so the
+   kernel leg runs on the GitHub Linux runner (KIND on the host's kernel). The server half is tested
+   everywhere against a user-space RFC 9289 client.
+5. **Identity.** The pod's processes reach the export through the node's NFS client as their own uids
+   (`AUTH_SYS` inside the authenticated channel). The capability (token and node identity) decides what is
+   reachable; the bits decide what each uid may do, as `ContainerIdsAsHostIds` states for a Linux engine.
+
+Build order: the server side of RFC 9289 on the NFS edge, with its oracle; the network-export attach form and
+the token root; the KIND workload pod with an `nfs` PersistentVolume and `tlshd` in the node image, on the CI
+Linux runner; then teardown proofs (detach, destroy, a daemon restart).
+
 > **Status (2026-09-30, A-48).** The base plane's witnesses, their disk homes, and the fingerprints behind
 > whiteouts and redirects are versioned by epoch like the tree and the inode table: a snapshot, and a
 > clone made from one, reads them as the snapshot froze them. A write overwrites a version no live
@@ -1952,6 +2003,19 @@ must exercise local communication and isolation between clones as well as namesp
 > (consumer `Guest`, form `GuestTag`) is committed at admission and removed when the device ends. `status`
 > counts it, `detach` revokes its device, `advance` moves a snapshot device's view, and recovery ends the record
 > of a device that died with its daemon.
+
+> **Status (2026-10-01, AUD-29-78: the Linux container lane).** The harness has an `oci-linux` transport. It makes
+> the session's mount with `slates mount --shared` and runs each suite inside a Docker Engine container bound to
+> that mount. fsx, fsstress and the workloads ran there (Debian 13, 2026-10-01). The hermeticity leg traces the
+> anchor with a root tracer (`sudo strace -u USER`), because an unprivileged tracer strips `fusermount3`'s setuid.
+> The workload runs inside the bind, and the verdict is clean: 0 outside writes, and the landed tree equals the
+> mounted tree. On Linux, calls made under an OS mount broker's image (`fusermount3`, `mount`; R10's OS-shipped
+> brokers) are set aside, counted and named in the record. This matches the macOS leg, which judges only the
+> slates executable's events. The leg found a landing bug: a landed directory lost the mode bits the umask clears
+> (`docs/bugs/2026-10-01-landed-directory-mode-umask.md`). pjdfstest runs there as container root. It is the first
+> run over slates' own FUSE mount, and it found that a component past `NAME_MAX` answered `EINVAL` or `ENOENT`.
+> `VfsError::NameTooLong` is now checked on lookups too and mapped to each host's code. The run's failures are now
+> exactly the reviewed Linux root list's.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

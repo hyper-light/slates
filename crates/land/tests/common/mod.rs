@@ -315,9 +315,20 @@ pub(crate) fn write_file<H: HostFs>(
 }
 
 pub(crate) fn mkdir<H: HostFs>(vol: &mut Volume, host: &mut H, store: &mut Store, path: &str) {
+  mkdir_with_mode(vol, host, store, path, DIR_MODE);
+}
+
+/// [`mkdir`] with the directory's own permission bits.
+pub(crate) fn mkdir_with_mode<H: HostFs>(
+  vol: &mut Volume,
+  host: &mut H,
+  store: &mut Store,
+  path: &str,
+  mode: u32,
+) {
   let (dir, name) = split(path);
   let d = dir_of(vol, host, store, dir);
-  vol.with_host(host).mkdir(store, d, name, DIR_MODE).unwrap();
+  vol.with_host(host).mkdir(store, d, name, mode).unwrap();
 }
 
 pub(crate) fn unlink<H: HostFs>(vol: &mut Volume, host: &mut H, store: &mut Store, path: &str) {

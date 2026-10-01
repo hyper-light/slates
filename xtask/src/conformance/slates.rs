@@ -42,6 +42,10 @@ pub(super) fn mount_deadlines() -> slates_client::Deadlines {
 const DAEMON_PID_MARK: &str = "daemon pid ";
 /// Format: the environment variables carrying the anchor handoff (`slates_anchor::segment`).
 const ENV_HANDOFF: &str = "SLATES_ANCHOR";
+/// Format: the anchor's content-object handoff variable (`slates_anchor::segment::ENV_CONTENT`), a descriptor
+/// number on Linux.
+#[cfg(target_os = "linux")]
+const ENV_CONTENT_HANDOFF: &str = "SLATES_ANCHOR_CONTENT";
 /// Format: the handoff object's length variable.
 const ENV_HANDOFF_LEN: &str = "SLATES_ANCHOR_LEN";
 /// Format: the Linux mount options for the daemon's NFSv3 loopback export: version 3 over TCP, the
@@ -296,6 +300,11 @@ impl Anchor {
 
   /// The command line this instance's daemon runs under, which names it among every process on the host:
   /// a pid can be reused once the daemon leaves, and the instance is this run's own.
+  /// The anchor's command line, as `pkill -f` matches it.
+  fn anchor_command(&self) -> String {
+    format!("slates --instance {} anchor", self.instance)
+  }
+
   fn daemon_command(&self) -> String {
     format!("slates --instance {} daemon", self.instance)
   }
@@ -342,7 +351,11 @@ impl Anchor {
   /// daemon left.
   fn end(&mut self) -> bool {
     let _ = self.child.kill();
-    let _ = self.child.wait();
+    // Under a root tracer (`sudo strace -u USER`) the child is `sudo`, not ours to signal: the anchor it runs is,
+    // and the tracer exits once every process it follows has.
+    let _ = Command::new("pkill")
+      .args(["-KILL", "-f", &self.anchor_command()])
+      .status();
     let daemon = self.daemon_command();
     let left = none_running(&daemon) || {
       let _ = Command::new("pkill")
@@ -350,6 +363,8 @@ impl Anchor {
         .status();
       none_running(&daemon)
     };
+    // Reaped only after the processes a tracer follows are gone, which is when a root tracer ends.
+    let _ = self.child.wait();
     // Every writer of the pipe has left, so the drain reaches the end; with a daemon still running it
     // would not, and the refusal reported above is the outcome.
     if left && let Some(drain) = self.drain.take() {
@@ -475,6 +490,9 @@ enum MountMethod {
   Slates,
   /// A root `mount -t nfs`; unmade with `sudo umount -l`.
   LinuxRoot,
+  /// `slates mount --shared` on Linux: the daemon's FUSE mount a container runtime binds; unmade with
+  /// `fusermount3 -u -z` (no privilege).
+  SharedFuse,
 }
 
 /// A live kernel mount: force-unmounted and its directory removed on drop.
@@ -503,6 +521,12 @@ impl Drop for Mount {
           .arg(&self.path)
           .output();
       }
+      MountMethod::SharedFuse => {
+        let _ = Command::new("fusermount3")
+          .args(["-u", "-z"])
+          .arg(&self.path)
+          .output();
+      }
     }
     drop(self.export.take());
     let _ = Command::new("rmdir").arg(&self.path).output();
@@ -525,7 +549,8 @@ fn fresh_mount_point() -> Result<PathBuf, Failure> {
   super::build_output(&format!("slates-mount-{}-{serial}", std::process::id()))
 }
 
-/// Mounts the volume: `slates mount` on macOS; the root NFS client on Linux.
+/// Mounts the volume: `slates mount` on macOS; the root NFS client on Linux, or for the Linux container form
+/// the daemon's shared FUSE mount.
 pub(crate) fn mount_volume(
   run: &Run<'_>,
   binary: &SlatesBinary,
@@ -542,6 +567,20 @@ pub(crate) fn mount_volume(
       Mount {
         path: point,
         method: MountMethod::Slates,
+        export: None,
+      }
+    }
+    // The Linux container form binds the daemon's own shared FUSE mount: no privilege, no adapter.
+    HostOs::Linux if run.transport == Transport::OciLinux => {
+      binary
+        .run(
+          instance,
+          &["mount", id, &point.display().to_string(), "--shared"],
+        )?
+        .expect_ok("slates mount --shared")?;
+      Mount {
+        path: point,
+        method: MountMethod::SharedFuse,
         export: None,
       }
     }
@@ -664,37 +703,46 @@ pub(crate) fn grant(
     .ok_or_else(|| Failure(format!("grant reply carries no id: {}", reply.stdout)))
 }
 
-/// On Linux the handoff is a descriptor number in the daemon: reopen the same memfd through
-/// `/proc/<pid>/fd/<n>`, make it inheritable, and point the child at the new number. The returned
-/// file keeps the descriptor open until the grant child has been spawned.
+/// On Linux each handoff the anchor attach reads is a descriptor number in the daemon: the segment
+/// (`SLATES_ANCHOR`) and the content object (`SLATES_ANCHOR_CONTENT`). Each is reopened through
+/// `/proc/<pid>/fd/<n>`, made inheritable, and the child pointed at the new number. The returned files keep the
+/// descriptors open until the grant child has been spawned. Until 2026-10-01 only the segment was reopened, so the
+/// grant mapped whatever its own descriptor of the content's number was (`mmap refused (code 19)`, ENODEV).
 #[cfg(target_os = "linux")]
 fn reopen_linux_handoff(
   os: HostOs,
   pid: u32,
   env: &mut [(String, String)],
-) -> Result<Option<std::fs::File>, Failure> {
+) -> Result<Vec<std::fs::File>, Failure> {
   use std::os::fd::AsRawFd;
   if os != HostOs::Linux {
-    return Ok(None);
+    return Ok(Vec::new());
   }
-  let Some(slot) = env.iter_mut().find(|(k, _)| k == ENV_HANDOFF) else {
-    return Ok(None);
-  };
-  let number: u32 = slot.1.parse().map_err(|_| {
-    Failure(format!(
-      "the Linux handoff is not a descriptor number: {}",
-      slot.1
-    ))
-  })?;
-  let file = std::fs::OpenOptions::new()
-    .read(true)
-    .write(true)
-    .open(format!("/proc/{pid}/fd/{number}"))
-    .map_err(|e| Failure(format!("reopening the anchor handoff of pid {pid}: {e}")))?;
-  rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())
-    .map_err(|e| Failure(format!("making the handoff inheritable: {e}")))?;
-  slot.1 = file.as_raw_fd().to_string();
-  Ok(Some(file))
+  let mut kept = Vec::new();
+  for (key, value) in env
+    .iter_mut()
+    .filter(|(k, _)| k == ENV_HANDOFF || k == ENV_CONTENT_HANDOFF)
+  {
+    let number: u32 = value.parse().map_err(|_| {
+      Failure(format!(
+        "the Linux handoff {key} is not a descriptor number: {value}"
+      ))
+    })?;
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(format!("/proc/{pid}/fd/{number}"))
+      .map_err(|e| {
+        Failure(format!(
+          "reopening the anchor handoff {key} of pid {pid}: {e}"
+        ))
+      })?;
+    rustix::io::fcntl_setfd(&file, rustix::io::FdFlags::empty())
+      .map_err(|e| Failure(format!("making the handoff {key} inheritable: {e}")))?;
+    *value = file.as_raw_fd().to_string();
+    kept.push(file);
+  }
+  Ok(kept)
 }
 
 /// On macOS the handoff is a name any same-user process can attach; nothing to reopen.
@@ -703,8 +751,8 @@ fn reopen_linux_handoff(
   _os: HostOs,
   _pid: u32,
   _env: &mut [(String, String)],
-) -> Result<Option<std::fs::File>, Failure> {
-  Ok(None)
+) -> Result<Vec<std::fs::File>, Failure> {
+  Ok(Vec::new())
 }
 
 /// A suite's session: the daemon, a volume and its live mount, torn down in the right order

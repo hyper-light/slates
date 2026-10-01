@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
-use slates_conformance::record::Outcome;
+use slates_conformance::record::{Outcome, Transport};
 use slates_conformance::trace::{
   Landing, Policy, eslogger_has_activity, judge, judge_hidden, parse_eslogger,
   parse_strace_with_cwd, strace_unnamed_paths,
@@ -67,6 +67,23 @@ pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
     STRACE_TRACE.to_owned(),
     "--".to_owned(),
   ]
+}
+
+/// The tracer as root over the lifecycle run as `user` (`sudo strace -u USER …`): the Linux container transport's.
+/// Its daemon mounts through `fusermount3`, a setuid helper, and the kernel withholds a setuid program's privilege
+/// from a process an unprivileged tracer follows: under the plain prefix the shared mount was refused
+/// (`fusermount3: mount failed: Operation not permitted`, 2026-10-01). A tracer holding `CAP_SYS_PTRACE` keeps it,
+/// and the daemon still runs as the user.
+pub(super) fn root_strace_prefix(log: &Path, user: &str) -> Vec<String> {
+  let mut prefix = vec![
+    "sudo".to_owned(),
+    "-n".to_owned(),
+    "strace".to_owned(),
+    "-u".to_owned(),
+    user.to_owned(),
+  ];
+  prefix.extend(strace_prefix(log).into_iter().skip(1));
+  prefix
 }
 
 /// Format: the Endpoint Security events the macOS tracer asks `eslogger` for: every event that can
@@ -508,6 +525,22 @@ struct Landed {
   writers: Vec<u32>,
 }
 
+/// The record's account of the calls set aside as an OS mount broker's: how many, and each distinct call
+/// and path, so a reader sees exactly what the judgement did not weigh.
+fn broker_note(set_aside: &[slates_conformance::trace::WriteEvent]) -> String {
+  let mut calls: Vec<String> = set_aside
+    .iter()
+    .map(|event| format!("{} {}", event.call, event.path))
+    .collect();
+  calls.sort();
+  calls.dedup();
+  format!(
+    "{} calls by an OS mount broker ({}) set aside, not judged (R10; macOS's eslogger leg keeps only the slates executable's): {calls:?}",
+    set_aside.len(),
+    slates_conformance::trace::OS_MOUNT_BROKERS.join(", ")
+  )
+}
+
 /// The wall clock in nanoseconds since the Unix epoch: the clock strace `-ttt` and eslogger stamp with.
 fn wall_ns() -> Result<u64, Failure> {
   let since = std::time::SystemTime::now()
@@ -679,6 +712,9 @@ fn verify_manifest(mounted: &Manifest, landed: &Manifest) -> Result<(), Failure>
 pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let log = run.scratch.path().join("trace.log");
   let tracer = match run.os {
+    HostOs::Linux if run.transport == Transport::OciLinux => {
+      Some(root_strace_prefix(&log, &super::stdout_of("id", &["-un"])))
+    }
     HostOs::Linux => Some(strace_prefix(&log)),
     HostOs::Macos => None,
     HostOs::Windows => return Err(Failure("no Windows tracer".to_owned())),
@@ -717,25 +753,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   };
   let session = Session::open(run, "hermeticity", &size, false, tracer.as_deref())?;
   let work = session.workdir("traced")?;
-  let workload = Command::new("sh")
-    .args(["-c", MOUNT_WORKLOAD])
-    .current_dir(&work)
-    .output()?;
-  if !workload.status.success() {
-    let inspection = match Command::new("ls").arg("-laR").arg(&work).output() {
-      Ok(output) => format!(
-        "{}\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-      ),
-      Err(error) => format!("listing the failed workload: {error}"),
-    };
-    return Err(Failure(format!(
-      "the mount workload failed (quota {size} bytes, {inode_count} peak entries × {page}-byte page): {}\nmounted tree: {inspection}",
-      String::from_utf8_lossy(&workload.stderr),
-    )));
-  }
+  let workload_notes = drive_workload(run, &session, &work, (&size, inode_count, page))?;
   let parent = format!("conformance-{}", std::process::id());
   let work = format!("{parent}/traced");
   // The known workload bytes/kinds must be correct independently of the observed manifest.
@@ -769,9 +787,14 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let text = std::fs::read_to_string(&log)
     .map_err(|e| Failure(format!("reading {}: {e}", log.display())))?;
   let cwd = run.scratch.path().display().to_string();
-  let events = match run.os {
-    HostOs::Linux => parse_strace_with_cwd(&text, &cwd),
-    _ => parse_eslogger(&text),
+  // The OS mount brokers' own calls are set aside on Linux, as the eslogger leg keeps only the slates
+  // executable's events on macOS; the note below counts and names every one (R10).
+  let (events, set_aside) = match run.os {
+    HostOs::Linux => slates_conformance::trace::strace_split_broker_events(
+      &text,
+      parse_strace_with_cwd(&text, &cwd),
+    ),
+    _ => (parse_eslogger(&text), Vec::new()),
   };
   let writers = landed.writers.clone();
   // The tracer's namespace's mounts (Linux): a write's backing filesystem is known by what is mounted at
@@ -847,6 +870,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       events.len(),
       text.lines().count()
     ),
+    broker_note(&set_aside),
     format!("the granted target: {}", target.display()),
     format!(
       "the granted landing {:016x}: the daemon's traced ids {:?}, {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
@@ -862,6 +886,7 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   ];
   notes.extend(session.size_note.clone());
   notes.extend(trace_note);
+  notes.extend(workload_notes);
   if !unmatched.is_empty() {
     notes.push(format!(
       "inside-target paths not among the landed entries: {}",
@@ -904,6 +929,9 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       None => Outcome::Ran { counts },
     },
     command: match run.os {
+      HostOs::Linux if run.transport == Transport::OciLinux => format!(
+        "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount --shared, attach --oci, oci-check, `docker run --mount <the binding> sh -c '{MOUNT_WORKLOAD}'` inside the bind, snapshot, land, grant, land --grant"
+      ),
       HostOs::Linux => format!(
         "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e {STRACE_TRACE} -- slates --instance <i> anchor --quick --shards 2; then create, mount, `sh -c '{MOUNT_WORKLOAD}'`, snapshot, land, grant, land --grant"
       ),
@@ -917,6 +945,44 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     notes,
     ok,
   })
+}
+
+/// Drives the traced workload: on the Linux container transport inside a container over the session's bind (the
+/// container's own processes are the runtime's, not traced; every write the slates processes make for them is),
+/// else on the mount directly. The notes the record carries for it.
+fn drive_workload(
+  run: &Run<'_>,
+  session: &Session,
+  work: &Path,
+  (size, inode_count, page): (&str, usize, u64),
+) -> Result<Vec<String>, Failure> {
+  if run.transport == Transport::OciLinux {
+    let (profile, command) = super::container::run_in_bind(session, "traced", MOUNT_WORKLOAD)?;
+    return Ok(vec![
+      format!("the runtime's profile (`slates oci-runtime docker`): {profile}"),
+      format!("the workload ran inside a container: {command}"),
+    ]);
+  }
+  let workload = Command::new("sh")
+    .args(["-c", MOUNT_WORKLOAD])
+    .current_dir(work)
+    .output()?;
+  if workload.status.success() {
+    return Ok(Vec::new());
+  }
+  let inspection = match Command::new("ls").arg("-laR").arg(work).output() {
+    Ok(output) => format!(
+      "{}\n{}\n{}",
+      output.status,
+      String::from_utf8_lossy(&output.stdout),
+      String::from_utf8_lossy(&output.stderr),
+    ),
+    Err(error) => format!("listing the failed workload: {error}"),
+  };
+  Err(Failure(format!(
+    "the mount workload failed (quota {size} bytes, {inode_count} peak entries × {page}-byte page): {}\nmounted tree: {inspection}",
+    String::from_utf8_lossy(&workload.stderr),
+  )))
 }
 
 /// The log path a run used (for a caller that keeps the scratch).

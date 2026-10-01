@@ -67,6 +67,8 @@ const ENOSPC: i32 = 28;
 const EMLINK: i32 = 31;
 /// Format: ENOTEMPTY, directory not empty.
 const ENOTEMPTY: i32 = 39;
+/// Format: ENAMETOOLONG, a component longer than `NAME_MAX` (Linux's value; macOS's is 63).
+const ENAMETOOLONG: i32 = 36;
 /// Format: EMFILE, too many open files (the bridge's handle table is full).
 const EMFILE: i32 = 24;
 /// Format: the block unit `fuse_attr.blocks` counts in (512-byte blocks, the stat convention).
@@ -374,6 +376,7 @@ fn errno(e: VfsError) -> i32 {
     VfsError::NotPermitted => EPERM,
     VfsError::SpecialFileOperation => EOPNOTSUPP,
     VfsError::Invalid | VfsError::InvalidName => EINVAL,
+    VfsError::NameTooLong => ENAMETOOLONG,
     VfsError::BaseUnavailable(code) => code,
     // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
     VfsError::Memory(slates_mem::MemError::SlabFull { .. }) => EMFILE,

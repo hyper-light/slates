@@ -24,8 +24,8 @@ use slates_vfs::volume::{Store, Volume};
 
 mod common;
 use common::{
-  LARGE, Session, Setup, config, mkdir, read_through, rename, request, rm_r, scratch, store,
-  symlink, unlink, write_file,
+  LARGE, Session, Setup, config, mkdir, mkdir_with_mode, read_through, rename, request, rm_r,
+  scratch, store, symlink, unlink, write_file,
 };
 
 /// Format: the environment variable that turns this binary into the kill test's child.
@@ -279,6 +279,47 @@ fn a_scratch_volume_into_an_empty_real_directory_preserves_the_target() {
     read_through(&mut vol, &mut host, &mut store, "/d2/f3"),
     b"2/3"
   );
+}
+
+/// §4.15 step 6 (a directory's mode lands as recorded). Do: under the conventional umask 022, land a scratch
+/// volume holding `/shared` (0775), `/private` (0700) and a file in each into an empty real directory. Expect:
+/// each directory on the disk has exactly its recorded mode. Before 2026-10-01 the landed directory was made
+/// with `mkdirat(mode)` and nothing after it, so the process umask cleared bits the volume held: 0775 landed
+/// 0755 (found by the Linux container lane's hermeticity run, whose harness made its directories under umask 002).
+#[test]
+fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
+  // The conventional umask, so the test means the same on every host; the landing must not depend on it.
+  let _previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "modes");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+  for (path, mode) in [("/shared", 0o775), ("/private", 0o700)] {
+    mkdir_with_mode(&mut vol, &mut host, &mut store, path, mode);
+    write_file(&mut vol, &mut host, &mut store, &format!("{path}/f"), b"x");
+  }
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  use std::os::unix::fs::PermissionsExt;
+  for (name, mode) in [("shared", 0o775), ("private", 0o700)] {
+    #[allow(clippy::disallowed_methods)] // the test's own landed directory, read back
+    let landed = std::fs::metadata(ws.path.join("out").join(name))
+      .unwrap()
+      .permissions()
+      .mode()
+      & 0o7777;
+    assert_eq!(landed, mode, "{name} landed {landed:o}, recorded {mode:o}");
+  }
 }
 
 // ---------------------------------------------------------------- kill -9

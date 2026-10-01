@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "suite": "fsstress",
+  "transport": "oci-linux",
+  "host": {
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-10-01",
+  "command": "docker run --rm --user <uid>:<gid> --mount type=bind,source=<mount>,destination=/work,bind-recursive=disabled,bind-propagation=private --mount type=bind,source=<scratch>/tools/ltp-linux,destination=/src,readonly rust:1.98.0 sh -c cp -R /src /tmp/ltp && cd /tmp/ltp && cc -O2 -w -DNO_XFS -D_GNU_SOURCE -include shim/config.h -I. -Ishim -o /tmp/fsstress fsstress.c && /tmp/fsstress -d /work/conformance-<pid>/fsstress -n 500 -p 4 -s 1 -v",
+  "bound": "500 operations per process × 4 processes, seed 1",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "fsstress",
+      "operations": 500,
+      "processes": 4,
+      "seed": 1,
+      "logged_operations": 2000,
+      "disabled_operations": [],
+      "ok": true
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 130232,
+  "notes": [
+    "fsstress: linux-test-project/ltp@6af38cf testcases/kernel/fs/fsstress/fsstress.c (GPL-2.0), sha256 9a80bbe1f1ad933845b9272b5057776e74923503bbb6f392bf1e135c1744d644, compiled inside the container `cc -O2 -w -DNO_XFS -D_GNU_SOURCE -include shim/config.h -I. -Ishim` over the harness's Linux shim config.h",
+    "the runtime's profile (`slates oci-runtime docker`): profile: engine=\"Debian GNU/Linux 13 (trixie)\" version=26.1.5+dfsg1 endpoint=unix:///var/run/docker.sock rootless=false userns=false; evidence: T-4.13 (Linux, a shared FUSE mount) (a Docker Engine on its own Linux host over its local socket, binding the daemon's shared FUSE mount); identity: container_ids_as_host_ids (no remapping; the kernel checks each id's permission bits, container root bypasses them); hard_links: every_name_served_at_once",
+    "the source checked again (`slates oci-check`, mount 412 on device 196) just before the bind",
+    "the daemon answered `volume list` after the run: true"
+  ]
+}

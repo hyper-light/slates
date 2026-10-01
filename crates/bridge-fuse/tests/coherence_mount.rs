@@ -272,7 +272,7 @@ fn a_change_through_another_attachment_reaches_the_kernel_without_a_request_and_
     let scratch = scratch();
     let mounted = match mount(&scratch.mount_point, &[], MOUNT_WAIT) {
       Ok(mounted) => mounted,
-      Err(MountError::NoDevice { exit } | MountError::Helper { exit }) => {
+      Err(MountError::NoDevice { exit, .. } | MountError::Helper { exit, .. }) => {
         eprintln!(
           "skipping the mounted coherence proof: fusermount3 refused the mount or found no /dev/fuse (exit {exit:?})"
         );

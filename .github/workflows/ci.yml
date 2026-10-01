@@ -546,11 +546,20 @@ jobs:
         with:
           toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
-      # strace for the tracer; the NFS client for the root-mount adapter; the workload tools the design
-      # names that the image lacks (inotify-tools for the watcher, ripgrep, sqlite3, vim).
+      # strace for the tracer; the NFS client for the root-mount adapter; fuse3 (fusermount3) for the FUSE
+      # and container (`oci-linux`) transports; the workload tools the design names that the image lacks
+      # (inotify-tools for the watcher, ripgrep, sqlite3, vim). Docker Engine ships with the image.
       - name: Suite tools (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y strace nfs-common inotify-tools ripgrep sqlite3 vim
+        run: sudo apt-get update && sudo apt-get install -y strace nfs-common fuse3 inotify-tools ripgrep sqlite3 vim
+      # The container transport binds a FUSE mount shared with Docker's processes (`slates mount --shared`,
+      # allow_other), which the host's operator grants (Ada authorized it on the CI runner, 2026-10-01;
+      # AUD-29-67/74/78). Its hermeticity leg's tracer runs as root (`sudo strace -u runner`), because an
+      # unprivileged tracer strips fusermount3's setuid.
+      - name: Grant user_allow_other (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
       # ripgrep for the rg workload and fswatch for the watcher; the rest ships with the image.
       - name: Suite tools (macOS)
         if: runner.os == 'macOS'

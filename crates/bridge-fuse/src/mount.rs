@@ -50,6 +50,15 @@ pub const COMM_FD_ENV: &str = "_FUSE_COMMFD";
 /// Format: the descriptor number the socket has in the helper: its standard input (0), where
 /// [`handshake`] places it.
 pub const COMM_FD_IN_CHILD: i32 = 0;
+/// The helper's message as a suffix of an error's text: `: <message>`, or nothing when there is none.
+fn said(message: &str) -> String {
+  if message.is_empty() {
+    String::new()
+  } else {
+    format!(": {message}")
+  }
+}
+
 /// Format: the part of fusermount3's refusal that names the operator's grant `allow_other` needs.
 const ALLOW_OTHER_REFUSAL: &str = "user_allow_other";
 /// Format: how much of the helper's standard error is read for its refusal: the atomic pipe write (`PIPE_BUF`,
@@ -103,11 +112,15 @@ pub enum MountError {
   Helper {
     /// How it ended.
     exit: HelperExit,
+    /// What it wrote on its standard error, when this side captured it (empty when it reached the caller's).
+    message: String,
   },
   /// The helper ended without handing back a device descriptor; it was reaped.
   NoDevice {
     /// How it ended.
     exit: HelperExit,
+    /// What it wrote on its standard error, when this side captured it (empty when it reached the caller's).
+    message: String,
   },
   /// The helper had not answered within the deadline; it was killed and reaped.
   Timeout {
@@ -140,10 +153,15 @@ impl std::fmt::Display for MountError {
         f,
         "cannot spawn the mount helper (code {code:?}); is it installed?"
       ),
-      Self::Helper { exit } => write!(f, "the mount helper exited without mounting ({exit:?})"),
-      Self::NoDevice { exit } => write!(
+      Self::Helper { exit, message } => write!(
         f,
-        "the mount helper returned no device descriptor ({exit:?})"
+        "the mount helper exited without mounting ({exit:?}){}",
+        said(message)
+      ),
+      Self::NoDevice { exit, message } => write!(
+        f,
+        "the mount helper returned no device descriptor ({exit:?}){}",
+        said(message)
       ),
       Self::Timeout { deadline, exit } => write!(
         f,
@@ -217,6 +235,7 @@ impl Mount {
     } else {
       Err(MountError::Helper {
         exit: HelperExit::of(status),
+        message: String::new(),
       })
     }
   }
@@ -294,6 +313,7 @@ impl PendingExit {
       Ok(Some(status)) if status.success() => Some(Ok(())),
       Ok(Some(status)) => Some(Err(MountError::Helper {
         exit: HelperExit::of(status),
+        message: String::new(),
       })),
       Err(e) => Some(Err(e)),
     }
@@ -364,11 +384,13 @@ pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, Mou
       } else {
         Err(MountError::Helper {
           exit: HelperExit::of(status),
+          message: String::new(),
         })
       }
     }
     Err(Received::Nothing) => Err(MountError::NoDevice {
       exit: HelperExit::of(guard.finish()?),
+      message: String::new(),
     }),
     Err(Received::TimedOut) => Err(MountError::Timeout {
       deadline,
@@ -495,30 +517,39 @@ impl PendingHandshake {
       Ok(None) => Progress::Waiting(Awaiting::Exit),
       Ok(Some(status)) => Progress::Done(match self.device.take() {
         Some(device) if status.success() => Ok(device),
-        _ if self.refused_allow_other() => Err(MountError::AllowOtherNotGranted),
-        Some(_) => Err(MountError::Helper {
-          exit: HelperExit::of(status),
-        }),
-        None => Err(MountError::NoDevice {
-          exit: HelperExit::of(status),
-        }),
+        device => {
+          let message = self.helper_message();
+          if message.contains(ALLOW_OTHER_REFUSAL) {
+            Err(MountError::AllowOtherNotGranted)
+          } else if device.is_some() {
+            Err(MountError::Helper {
+              exit: HelperExit::of(status),
+              message,
+            })
+          } else {
+            Err(MountError::NoDevice {
+              exit: HelperExit::of(status),
+              message,
+            })
+          }
+        }
       }),
       Err(e) => Progress::Done(Err(e)),
     }
   }
 
-  /// Whether the exited helper's refusal names `user_allow_other` (fusermount3's message: "option allow_other
-  /// only allowed if 'user_allow_other' is set in /etc/fuse.conf"). One pipe buffer is read, which holds the
-  /// helper's one-line refusal whole.
-  fn refused_allow_other(&mut self) -> bool {
+  /// What the exited helper wrote on its standard error, trimmed: its refusal (fusermount3's `allow_other` one
+  /// names `user_allow_other`). One pipe buffer is read, which holds the helper's one-line refusal whole.
+  fn helper_message(&mut self) -> String {
     let Some(stderr) = self.stderr.take() else {
-      return false;
+      return String::new();
     };
     let mut message = [0u8; HELPER_MESSAGE_BYTES];
     let read = rustix::io::read(&stderr, &mut message).unwrap_or(0);
     message
       .get(..read)
-      .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(ALLOW_OTHER_REFUSAL))
+      .map(|bytes| String::from_utf8_lossy(bytes).trim().to_owned())
+      .unwrap_or_default()
   }
 
   /// The helper's process id while it is unreaped, for an owner's diagnostics (and the tests' proof

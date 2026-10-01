@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "suite": "hermeticity",
+  "transport": "oci-linux",
+  "host": {
+    "os": "Debian GNU/Linux 13 (trixie)",
+    "kernel": "Linux 6.12.76-linuxkit",
+    "arch": "aarch64",
+    "privilege": "unprivileged"
+  },
+  "date": "2026-10-01",
+  "command": "strace --seccomp-bpf --kill-on-exit -f -y -qq -s 0 -o trace.log -e trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice -- slates --instance <i> anchor --quick --shards 2; then create, mount --shared, attach --oci, oci-check, `docker run --mount <the binding> sh -c 'printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp'` inside the bind, snapshot, land, grant, land --grant",
+  "bound": "one lifecycle: one volume, one mount; known workload bytes/kinds and the entire mounted tree, including client metadata, landed and verified",
+  "outcome": {
+    "kind": "ran",
+    "counts": {
+      "suite": "hermeticity",
+      "write_calls": 353,
+      "inside_target": 25,
+      "ram_only": 222,
+      "standard_streams": 106,
+      "unresolved": 0,
+      "outside": 0,
+      "written_matched": 6,
+      "written_unmatched": 0
+    }
+  },
+  "expected_failure_list": null,
+  "duration_ms": 45536,
+  "notes": [
+    "tracer: strace -f -y -qq -s 0 -e trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice -- <anchor>; 353 events parsed from 1149 log lines; landing reported 6 written; 4 hidden siblings (.slates-*) seen inside the target",
+    "2 calls by an OS mount broker (/usr/bin/fusermount3, /bin/fusermount3, /usr/bin/mount, /bin/mount) set aside, not judged (R10; macOS's eslogger leg keeps only the slates executable's): [\"mkdirat /run/mount\", \"openat /dev/fuse\"]",
+    "the granted target: /target/conformance-scratch-180/oci-linux/land-target",
+    "the granted landing 0000000000000001: the daemon's traced ids [1804, 1808, 1809], 1790895580468360167 ns to 1790895580487125459 ns (wall clock); hidden names: Ok(2)",
+    "volume quota: 32768 bytes, derived from 8 peak workload entries × 4096-byte host page",
+    "landing completeness: 6/6 entries reported; disk verification: Ok(())",
+    "the runtime's profile (`slates oci-runtime docker`): profile: engine=\"Debian GNU/Linux 13 (trixie)\" version=26.1.5+dfsg1 endpoint=unix:///var/run/docker.sock rootless=false userns=false; evidence: T-4.13 (Linux, a shared FUSE mount) (a Docker Engine on its own Linux host over its local socket, binding the daemon's shared FUSE mount); identity: container_ids_as_host_ids (no remapping; the kernel checks each id's permission bits, container root bypasses them); hard_links: every_name_served_at_once",
+    "the workload ran inside a container: docker run --rm --user <uid>:<gid> --mount type=bind,source=<mount>,destination=/work,bind-recursive=disabled,bind-propagation=private rust:1.98.0 sh -c cd /work/conformance-<pid>/traced && printf 'one\\n' > f1 && mkdir d && printf 'two\\n' > d/f2 && ln -s f3 link && mv f1 f3 && chmod u=rw,go=r f3 && printf 'gone\\n' > tmp && rm tmp"
+  ]
+}

@@ -724,12 +724,12 @@ impl Tree {
     let left_count = blocks.get(block)?.count();
     if at <= left_count {
       if !blocks.get(block)?.fits(name.len()) {
-        return Err(VfsError::InvalidName);
+        return Err(VfsError::NameTooLong);
       }
       blocks.get_mut(block)?.insert_at(at, slot, name);
     } else {
       if !sibling.fits(name.len()) {
-        return Err(VfsError::InvalidName);
+        return Err(VfsError::NameTooLong);
       }
       sibling.insert_at(at - left_count, slot, name);
     }

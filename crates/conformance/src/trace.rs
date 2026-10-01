@@ -773,6 +773,52 @@ pub fn parse_strace_with_cwd(log: &str, cwd: &str) -> Vec<WriteEvent> {
   events
 }
 
+/// Format: the OS-shipped mount brokers a Linux mount runs (R10: "the only privileged pieces are
+/// OS-shipped brokers installed once"): `fusermount3`, the setuid helper libfuse ships, and util-linux's
+/// `mount`, which `fusermount3` runs for an `allow_other` mount. Their writes are the operating system's
+/// own mount bookkeeping (libmount's runtime directory `/run/mount`, seen in the 2026-10-01 container-lane
+/// trace as `/bin/mount`'s `mkdirat /run/mount`), the counterpart of macOS's `mount_nfs`, whose events the
+/// eslogger leg never judges because it keeps only the slates executable's. The paths are Debian's and
+/// Ubuntu's (`/bin` is `/usr/bin` there; both spellings, since strace prints the one `execve` named).
+pub const OS_MOUNT_BROKERS: &[&str] = &[
+  "/usr/bin/fusermount3",
+  "/bin/fusermount3",
+  "/usr/bin/mount",
+  "/bin/mount",
+];
+
+/// Splits an strace log's events into those to judge and those an OS mount broker made
+/// ([`OS_MOUNT_BROKERS`]). An event is the broker's when its process's last successful `execve` before
+/// the event's line named a broker image; a process that never ran one, a call before its `execve`, and a
+/// failed `execve` all stay judged, so only a broker's own image is set aside, never a slates process.
+pub fn strace_split_broker_events(
+  log: &str,
+  events: Vec<WriteEvent>,
+) -> (Vec<WriteEvent>, Vec<WriteEvent>) {
+  let mut image_is_broker: HashMap<u32, bool> = HashMap::new();
+  let mut broker_lines: std::collections::HashSet<usize> = std::collections::HashSet::new();
+  for joined in joined_lines(log) {
+    let Some(pid) = joined.pid else {
+      continue;
+    };
+    if let Some(("execve", args)) = call_and_args(&joined.body)
+      && joined.body.trim_end().ends_with(") = 0")
+    {
+      let image = args.first().copied().and_then(quoted);
+      image_is_broker.insert(
+        pid,
+        image.is_some_and(|image| OS_MOUNT_BROKERS.contains(&image.as_str())),
+      );
+    }
+    if image_is_broker.get(&pid).copied().unwrap_or(false) {
+      broker_lines.insert(joined.line);
+    }
+  }
+  events
+    .into_iter()
+    .partition(|event| !broker_lines.contains(&event.line))
+}
+
 // --- fs_usage --------------------------------------------------------------------------------
 
 /// Format: the calls fs_usage names that create or open (`fs_usage.c`'s syscall table).
@@ -1455,6 +1501,33 @@ mod tests {
 100 +++ exited with 0 +++
 --- SIGCHLD {si_signo=SIGCHLD} ---
 ";
+
+  /// Do: split a trace where the daemon runs `fusermount3`, which runs `/bin/mount`, each writing, beside
+  /// the daemon's own write outside every class, a `mount` that failed to exec, and a child's write before
+  /// its `execve`. Expect: only the two calls made under a broker image are set aside; the daemon's write,
+  /// the failed exec's process and the pre-exec write stay judged (a slates process is never set aside).
+  #[test]
+  fn only_calls_under_an_os_mount_brokers_image_are_set_aside() {
+    let log = "\
+200 execve(\"/usr/bin/fusermount3\", [...], 0x1 /* 20 vars */) = 0
+200 openat(AT_FDCWD</>, \"/etc/mtab\", O_WRONLY|O_CREAT, 0644) = 3</etc/mtab>
+201 mkdirat(AT_FDCWD</>, \"/run/early\", 0755) = 0
+201 execve(\"/bin/mount\", [...], 0x2 /* 0 vars */) = 0
+201 mkdirat(AT_FDCWD</>, \"/run/mount\", 0755) = 0
+100 mkdirat(AT_FDCWD</>, \"/home/runner/evil\", 0755) = 0
+202 execve(\"/usr/bin/mount\", [...], 0x3 /* 0 vars */) = -1 ENOENT (No such file or directory)
+202 mkdirat(AT_FDCWD</>, \"/home/runner/also\", 0755) = 0
+";
+    let events = parse_strace_with_cwd(&stamped(log), "/");
+    let (judged, set_aside) = strace_split_broker_events(&stamped(log), events);
+    let paths =
+      |events: &[WriteEvent]| -> Vec<String> { events.iter().map(|e| e.path.clone()).collect() };
+    assert_eq!(paths(&set_aside), vec!["/etc/mtab", "/run/mount"]);
+    assert_eq!(
+      paths(&judged),
+      vec!["/run/early", "/home/runner/evil", "/home/runner/also"]
+    );
+  }
 
   /// The strace parser finds every write-capable call in order, joining the interrupted `openat`
   /// with its `resumed` continuation and skipping the read-only open, the exit and the signal lines.

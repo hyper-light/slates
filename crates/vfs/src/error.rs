@@ -25,8 +25,12 @@ pub enum VfsError {
   NotPermitted,
   /// `EOPNOTSUPP`: regular-file I/O or host landing on a FIFO/socket name (A-26).
   SpecialFileOperation,
-  /// `ENAMETOOLONG` or a name with a separator or NUL.
+  /// `EINVAL`: a name that is not a path component (empty, `.`, `..`, or holding a separator or NUL).
   InvalidName,
+  /// `ENAMETOOLONG`: a component longer than `NAME_MAX` bytes, refused by every call that takes a name,
+  /// lookups included (POSIX.1-2017 §2.3). Before 2026-10-01 it was folded into `InvalidName`, which the FUSE
+  /// bridge answered `EINVAL`, and a lookup never judged the length (`ENOENT`).
+  NameTooLong,
   /// `EMLINK`.
   TooManyLinks,
   /// `ENOSPC`: the quota, or the pressure source, refused the bytes; nothing changed.
@@ -103,7 +107,8 @@ impl VfsError {
       Self::NoAttribute => "ENOATTR",
       Self::NotPermitted => "EPERM",
       Self::SpecialFileOperation => "EOPNOTSUPP",
-      Self::InvalidName | Self::TreeTooDeep { .. } => "ENAMETOOLONG",
+      Self::InvalidName => "EINVAL",
+      Self::NameTooLong | Self::TreeTooDeep { .. } => "ENAMETOOLONG",
       Self::TooManyLinks => "EMLINK",
       Self::NoSpace => "ENOSPC",
       Self::FileTooLarge => "EFBIG",

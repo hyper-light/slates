@@ -314,6 +314,68 @@ fn missing_names_and_absent_inodes_are_typed_errnos() {
   );
 }
 
+/// pjdfstest `*/02.t` (POSIX.1-2017 §2.3 "ENAMETOOLONG"). Do: send a name one byte past `NAME_MAX` to a lookup,
+/// a mkdir, a create and an unlink, and a `NAME_MAX` name to a mkdir. Expect: each over-long name is refused
+/// `ENAMETOOLONG` (-36), never `EINVAL` or `ENOENT`, and nothing is made; the `NAME_MAX` name is made. The Linux
+/// kernel's FUSE client sends a name up to its own 1,024-byte bound, so the server must judge 256..=1,024
+/// (before 2026-10-01 this bridge answered `EINVAL` for a creation and `ENOENT` for a lookup; found by
+/// pjdfstest through the Linux container lane).
+#[test]
+fn a_name_past_name_max_is_refused_enametoolong_on_every_path() {
+  const ENAMETOOLONG: i32 = -36;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let mut out = vec![0u8; 4096];
+  let longest = "x".repeat(slates_vfs::names::NAME_MAX);
+  let past = "y".repeat(slates_vfs::names::NAME_MAX + 1);
+  let error = |out: &[u8]| i32::from_le_bytes(out[4..8].try_into().unwrap());
+  let calls: [(&str, u32, Vec<u8>); 4] = [
+    ("lookup", Opcode::Lookup.to_wire(), name_body(&past)),
+    (
+      "mkdir",
+      Opcode::MkDir.to_wire(),
+      mkdir_body(0o040_755, &past),
+    ),
+    (
+      "create",
+      Opcode::Create.to_wire(),
+      create_body(0o100_644, &past),
+    ),
+    ("unlink", Opcode::Unlink.to_wire(), name_body(&past)),
+  ];
+  for (unique, (call, opcode, body)) in (1u64..).zip(calls) {
+    dispatch(&message(opcode, unique, 1, &body), &mut bridge, &mut out);
+    assert_eq!(
+      error(&out),
+      ENAMETOOLONG,
+      "{call} of a {}-byte name",
+      past.len()
+    );
+  }
+  dispatch(
+    &message(Opcode::Lookup.to_wire(), 10, 1, &name_body(&past)),
+    &mut bridge,
+    &mut out,
+  );
+  assert_eq!(
+    error(&out),
+    ENAMETOOLONG,
+    "nothing was made under the long name"
+  );
+  dispatch(
+    &message(
+      Opcode::MkDir.to_wire(),
+      11,
+      1,
+      &mkdir_body(0o040_755, &longest),
+    ),
+    &mut bridge,
+    &mut out,
+  );
+  assert!(ok(&out), "a NAME_MAX name is made");
+}
+
 /// A `fuse_mkdir_in` body: mode, umask, then the name.
 fn mkdir_body(mode: u32, name: &str) -> Vec<u8> {
   let mut b = vec![0u8; 8];

@@ -17,7 +17,9 @@ use std::process::{Command, Stdio};
 
 use slates_conformance::capability::HostOs;
 use slates_conformance::exerciser::{judge_fsstress, judge_fsx};
+use slates_conformance::record::Transport;
 use slates_conformance::record::{Counts, Outcome, WorkloadResult, WorkloadStatus};
+use slates_conformance::tap::Runner;
 use slates_conformance::workload::{
   ENV_SQLITE_BUSY_MS, ENV_WATCH_SECONDS, ROSTER, Workload, compare,
 };
@@ -109,6 +111,9 @@ fn handshake(session: &Session) -> Result<String, Failure> {
   Ok(reply.stdout.trim().replace('\n', "; "))
 }
 
+/// Format: the container's root as Docker's `--user` (`UID:GID`).
+const CONTAINER_ROOT: &str = "0:0";
+
 /// The mounting user as `UID:GID`, the identity the container runs as (the tested profile's).
 #[cfg(unix)]
 fn mounting_user() -> Result<String, Failure> {
@@ -151,18 +156,41 @@ fn host_mount(source: &Path, destination: &str, readonly: bool) -> String {
   mount
 }
 
-/// One `docker run` as the mounting user with `mounts` and `env`; `script` runs under `sh -c`. The exit code,
+/// One `docker run` as `user` (`UID:GID`) with `mounts` and `env`; `script` runs under `sh -c`. The exit code,
 /// stdout with stderr after it, and the command line.
 fn docker_run(
+  user: &str,
   mounts: &[String],
   env: &[(String, String)],
   script: &str,
 ) -> Result<(i32, String, String), Failure> {
+  let ran = docker_run_apart(user, mounts, env, script)?;
+  let mut text = ran.stdout;
+  text.push_str(&ran.stderr);
+  Ok((ran.code, text, ran.command))
+}
+
+/// One `docker run`'s outcome with its two streams apart: a suite whose stdout is a protocol (pjdfstest's TAP)
+/// reads only stdout, as the host lane does, so the engine's own messages (an image pull) never enter it.
+struct Ran {
+  code: i32,
+  stdout: String,
+  stderr: String,
+  command: String,
+}
+
+/// [`docker_run`] with stdout and stderr kept apart.
+fn docker_run_apart(
+  user: &str,
+  mounts: &[String],
+  env: &[(String, String)],
+  script: &str,
+) -> Result<Ran, Failure> {
   let mut args = vec![
     "run".to_owned(),
     "--rm".to_owned(),
     "--user".to_owned(),
-    mounting_user()?,
+    user.to_owned(),
   ];
   for mount in mounts {
     args.extend(["--mount".to_owned(), mount.clone()]);
@@ -181,21 +209,57 @@ fn docker_run(
     .stdin(Stdio::null())
     .output()
     .map_err(|e| Failure(format!("running {RUNTIME}: {e}")))?;
-  let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-  text.push_str(&String::from_utf8_lossy(&output.stderr));
-  let command = format!("{RUNTIME} {}", args.join(" "));
-  Ok((output.status.code().unwrap_or(-1), text, command))
+  Ok(Ran {
+    code: output.status.code().unwrap_or(-1),
+    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    command: format!("{RUNTIME} {}", args.join(" ")),
+  })
 }
 
-/// `docker run` of the binding with the pinned sources read-only at [`SOURCES`]: success, output, command.
+/// `docker run` as `user` of the binding with the pinned sources read-only at [`SOURCES`]: success, output,
+/// command.
 fn run_in_container(
+  user: &str,
   binding: &Binding,
   sources: &Path,
   script: &str,
 ) -> Result<(bool, String, String), Failure> {
   let mounts = [binding_mount(binding), host_mount(sources, SOURCES, true)];
-  let (code, text, command) = docker_run(&mounts, &[], script)?;
+  let (code, text, command) = docker_run(user, &mounts, &[], script)?;
   Ok((code == 0, text, command))
+}
+
+/// Runs `script` inside a container over a fresh binding of `session`'s mount, in the session's working directory
+/// `dir` (made by the caller): the runtime handshake first, the source checked again just before the bind, the
+/// container as the mounting user. The runtime's profile and the recorded command; a failed script is the run's
+/// failure, with its output.
+pub(super) fn run_in_bind(
+  session: &Session,
+  dir: &str,
+  script: &str,
+) -> Result<(String, String), Failure> {
+  let profile = handshake(session)?;
+  let binding = bind(session)?;
+  let inside = format!(
+    "cd {DESTINATION}/conformance-{}/{dir} && {script}",
+    std::process::id()
+  );
+  let (code, output, command) =
+    docker_run(&mounting_user()?, &[binding_mount(&binding)], &[], &inside)?;
+  if code != 0 {
+    return Err(Failure(format!(
+      "the workload failed inside the container (exit {code}): {output}"
+    )));
+  }
+  let recorded = command
+    .replace(&binding.source, "<mount>")
+    .replace(&mounting_user()?, "<uid>:<gid>")
+    .replace(
+      &format!("conformance-{}/", std::process::id()),
+      "conformance-<pid>/",
+    );
+  Ok((home_as_tilde(&profile), recorded))
 }
 
 /// `text` with the home directory written `~`, so a record names no account's home.
@@ -282,7 +346,8 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     bounds.fsx_seed,
     bounds.fsx_file_length
   );
-  let (success, output, command) = run_in_container(&leg.binding, &tools, &script)?;
+  let (success, output, command) =
+    run_in_container(&mounting_user()?, &leg.binding, &tools, &script)?;
   let verdict = judge_fsx(success, &output);
   let mut notes = leg.notes(built.note);
   notes.push(
@@ -331,7 +396,8 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     bounds.fsstress_processes,
     bounds.fsstress_seed
   );
-  let (success, output, command) = run_in_container(&leg.binding, &sources, &script)?;
+  let (success, output, command) =
+    run_in_container(&mounting_user()?, &leg.binding, &sources, &script)?;
   let verdict = judge_fsstress(success, &output);
   let alive = leg.session.daemon_alive();
   let ok = verdict.ok && alive;
@@ -389,7 +455,7 @@ fn tools_in_image(workloads: &[&Workload]) -> Result<Vec<&'static str>, Failure>
     .iter()
     .map(|w| format!("command -v {} >/dev/null 2>&1 && echo {}", w.tool, w.tool))
     .collect();
-  let (_, output, _) = docker_run(&[], &[], &probe.join("; "))?;
+  let (_, output, _) = docker_run(&mounting_user()?, &[], &[], &probe.join("; "))?;
   Ok(
     workloads
       .iter()
@@ -436,7 +502,7 @@ fn execute_side(
     "mkdir -p {dir} && cd {dir} && exec 2>&1 && set -e\n{}",
     workload.script
   );
-  let (code, output, _) = docker_run(mounts, &env, &script)?;
+  let (code, output, _) = docker_run(&mounting_user()?, mounts, &env, &script)?;
   Ok(slates_conformance::workload::Run {
     directory: dir.to_owned(),
     exit_code: code,
@@ -623,16 +689,34 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     "cp -R {SOURCES}/{tree} /tmp/p && cd /tmp/p && cat {SOURCES}/probes/head.h > config.h && \
      for c in {SOURCES}/probes/*.c; do b=${{c%.c}}; cc -std=gnu17 -w $(cat $b.flags) -o /tmp/probe.out $c >/dev/null 2>&1 \
      && cat $b.define >> config.h; done; cc -O2 -w -I. -o pjdfstest pjdfstest.c && cd {} && \
-     for f in $(cd /tmp/p && find tests -name '*.t' | sort); do echo '{FILE_MARK}'$f; timeout {bound} sh /tmp/p/$f 2>&1; \
+     for f in $(cd /tmp/p && find tests -name '*.t' | sort); do echo '{FILE_MARK}'$f; timeout {bound} sh /tmp/p/$f 2>/dev/null; \
      [ $? -eq 124 ] && echo 'TIMED OUT'; done",
     Leg::workdir("pjd")
   );
-  let (succeeded, output, command) = run_in_container(&leg.binding, &sources, &script)?;
-  let runner = this_user();
+  // Who runs the suite: on a Linux engine the profile's ids reach the export as themselves
+  // (`ContainerIdsAsHostIds`, measured: root bypasses the bits), so the suite runs as the container's root and is
+  // judged as a root run, against the root-reviewed list, with no case left needs-root. Through Docker Desktop every
+  // id reaches the export as the host user (`HostUserThroughShare`), so a root run would judge nothing more and the
+  // suite runs as the mounting user.
+  let (user, runner) = if run.transport == Transport::OciLinux {
+    (CONTAINER_ROOT.to_owned(), Runner::Root)
+  } else {
+    (mounting_user()?, this_user())
+  };
+  // TAP is stdout alone, as the host lane reads it (`run_test_file` discards a file's stderr): pjdfstest's
+  // helper prints `stat returned -1` there, and the engine its pull progress.
+  let mounts = [
+    binding_mount(&leg.binding),
+    host_mount(&sources, SOURCES, true),
+  ];
+  let ran = docker_run_apart(&user, &mounts, &[], &script)?;
+  let (succeeded, output, command) = (ran.code == 0, ran.stdout, ran.command);
   let outputs = split_outputs(&output);
   // A run in which no file ran (the build failed inside the container) is a failure, never an empty pass.
   if outputs.is_empty() {
-    let tail: Vec<&str> = output.lines().rev().take(FAILURE_TAIL_LINES).collect();
+    // The build's errors are on stderr: the tail shown is both streams'.
+    let both = format!("{output}{}", ran.stderr);
+    let tail: Vec<&str> = both.lines().rev().take(FAILURE_TAIL_LINES).collect();
     return Err(Failure(format!(
       "no pjdfstest file ran inside the container (it {}; `{command}`); its output's tail:\n{}",
       if succeeded { "exited 0" } else { "failed" },

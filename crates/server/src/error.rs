@@ -114,7 +114,8 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     },
     VfsError::NoSpace => Refusal::NoSpace,
     VfsError::RecoveryIncomplete => Refusal::ContentUnavailable,
-    VfsError::InvalidName => Refusal::InvalidName,
+    // The wire's taxonomy names one kind for a name the volume will not take, whatever the reason.
+    VfsError::InvalidName | VfsError::NameTooLong => Refusal::InvalidName,
     VfsError::Destroying => Refusal::Destroying,
     VfsError::Archived => Refusal::Archived,
     VfsError::PolicyMismatch => Refusal::PolicyMismatch,

@@ -43,17 +43,21 @@ pub enum Transport {
   VirtioFs,
   /// An OCI container consuming an established host attachment.
   Oci,
+  /// An OCI container on Linux: a Docker Engine binding the daemon's shared FUSE mount (`slates mount
+  /// --shared`), the profile measured `ContainerIdsAsHostIds` (AUD-29-67/74).
+  OciLinux,
 }
 
 impl Transport {
   /// Every transport, in the matrix's row order.
-  pub const ALL: [Transport; 6] = [
+  pub const ALL: [Transport; 7] = [
     Transport::NativeMacosNfs,
     Transport::NativeLinuxFuse,
     Transport::NativeLinuxNfs4,
     Transport::NativeWindowsWinfsp,
     Transport::VirtioFs,
     Transport::Oci,
+    Transport::OciLinux,
   ];
 
   /// The file-name and command-line form.
@@ -65,6 +69,7 @@ impl Transport {
       Transport::NativeWindowsWinfsp => "native-windows-winfsp",
       Transport::VirtioFs => "virtio-fs",
       Transport::Oci => "oci",
+      Transport::OciLinux => "oci-linux",
     }
   }
 
@@ -77,7 +82,13 @@ impl Transport {
       Transport::NativeWindowsWinfsp => "native Windows (WinFsp)",
       Transport::VirtioFs => "virtio-fs guest",
       Transport::Oci => "OCI container",
+      Transport::OciLinux => "OCI container (Linux engine)",
     }
+  }
+
+  /// Whether the transport is a container consuming a host attachment (its suites run inside containers).
+  pub fn is_container(self) -> bool {
+    matches!(self, Transport::Oci | Transport::OciLinux)
   }
 
   /// The transport a slug names.

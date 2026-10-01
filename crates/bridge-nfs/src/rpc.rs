@@ -29,7 +29,7 @@ const MAX_AUTH_BODY: usize = 400;
 /// fragment so a hostile length is refused before any accumulation. Sized to a NFSv3 header plus the
 /// largest write payload the server offers; the negotiated write size derives the exact bound once
 /// the server wires it (owed). Two mebibytes is comfortably above a 1 MiB write plus overhead.
-const MAX_MESSAGE: usize = 2 * 1024 * 1024;
+pub const MAX_MESSAGE: usize = 2 * 1024 * 1024;
 /// Format: the record-marking last-fragment flag — the top bit of the four-byte marker (RFC 5531).
 const LAST_FRAGMENT: u32 = 0x8000_0000;
 /// Format: the record-marking fragment-length mask — the low 31 bits of the marker.

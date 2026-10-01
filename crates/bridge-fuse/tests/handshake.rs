@@ -77,7 +77,7 @@ fn a_helper_that_exits_without_a_descriptor_is_reaped_and_its_exit_reported() {
   helper.args(["-c", "exit 7"]);
   let outcome = handshake(helper, derived_deadline());
   match outcome {
-    Err(MountError::NoDevice { exit }) => assert_eq!(
+    Err(MountError::NoDevice { exit, .. }) => assert_eq!(
       exit,
       HelperExit {
         code: Some(7),
@@ -205,7 +205,8 @@ fn a_non_blocking_handshake_reports_what_the_blocking_one_does() {
         exit: HelperExit {
           code: Some(7),
           signal: None
-        }
+        },
+        ..
       })
     ),
     "{outcome:?}"
