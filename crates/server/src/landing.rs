@@ -96,11 +96,54 @@ pub struct LandingState {
   /// with the shard serving between them, so a second landing of the same volume is refused while one runs —
   /// both would advance one overlay. One entry per running landing, so bounded by the shard's task arena.
   pub running: std::collections::BTreeMap<DbVolumeId, u64>,
-  /// The slices granted landings have taken on this shard, and the longest of them in nanoseconds
-  /// (AUD-29-25's evidence: a landing is stepped in slices of its budget, each ending within one unit of it).
+  /// How long each slice of a granted landing on this shard took, in nanoseconds (AUD-29-25's percentile
+  /// lane: a landing is stepped in slices of its budget, the shard serving between them).
+  pub slice_times: crate::histogram::DurationHistogram,
+  /// The slices that ran past their budget by more than their own last unit — a step that kept going after
+  /// its budget had passed. Zero is the evidence that every slice ended within one unit of its budget.
+  pub slices_past_budget: u64,
+  /// The budget the last slice was given, in nanoseconds (half the shard's step quantum then).
+  pub slice_budget_ns: u64,
+}
+
+/// What a shard's granted-landing slices measured (AUD-29-25), for a run to publish.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SliceSummary {
+  /// Slices taken.
   pub slices: u64,
-  /// See [`LandingState::slices`].
-  pub longest_slice_ns: u64,
+  /// The median slice, in nanoseconds (a bucket's upper bound, within an eighth above the exact value).
+  pub p50_ns: u64,
+  /// The 99th percentile slice, likewise.
+  pub p99_ns: u64,
+  /// The 99.9th percentile slice, likewise.
+  pub p999_ns: u64,
+  /// The longest slice, exactly.
+  pub max_ns: u64,
+  /// Slices past their budget by more than their last unit.
+  pub past_budget: u64,
+  /// The budget the last slice was given.
+  pub budget_ns: u64,
+}
+
+impl LandingState {
+  /// The slices' summary.
+  pub fn slice_summary(&self) -> SliceSummary {
+    /// Format: the published quantiles, in parts per million.
+    const P50: u64 = crate::histogram::PPM / 2;
+    /// Format: see [`P50`].
+    const P99: u64 = 990_000;
+    /// Format: see [`P50`].
+    const P999: u64 = 999_000;
+    SliceSummary {
+      slices: self.slice_times.count(),
+      p50_ns: self.slice_times.quantile(P50),
+      p99_ns: self.slice_times.quantile(P99),
+      p999_ns: self.slice_times.quantile(P999),
+      max_ns: self.slice_times.max(),
+      past_budget: self.slices_past_budget,
+      budget_ns: self.slice_budget_ns,
+    }
+  }
 }
 
 /// A landing presented and waiting for a grant.
@@ -142,8 +185,9 @@ impl Default for LandingState {
       in_flight: std::collections::BTreeMap::new(),
       next_holder: 1,
       running: std::collections::BTreeMap::new(),
-      slices: 0,
-      longest_slice_ns: 0,
+      slice_times: crate::histogram::DurationHistogram::default(),
+      slices_past_budget: 0,
+      slice_budget_ns: 0,
     }
   }
 }
@@ -1150,8 +1194,12 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
     lend_back(slot, granted);
   }
   let took = state.clock.monotonic_ns().saturating_sub(began);
-  state.landing.slices = state.landing.slices.saturating_add(1);
-  state.landing.longest_slice_ns = state.landing.longest_slice_ns.max(took);
+  state.landing.slice_times.record(took);
+  state.landing.slice_budget_ns = budget_ns;
+  // A step returns once its budget has passed, so it may overrun by its last unit and no more.
+  if granted.run.last_step_ns() > budget_ns.saturating_add(granted.run.last_unit_ns()) {
+    state.landing.slices_past_budget = state.landing.slices_past_budget.saturating_add(1);
+  }
   match stepped {
     Some(ended) => Stepped::Ended(Box::new(ended)),
     None if granted.run.ready_to_finish() => Stepped::Ready,

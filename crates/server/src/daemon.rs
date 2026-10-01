@@ -1873,12 +1873,10 @@ impl Daemon {
     Ok(baseline)
   }
 
-  /// The slices granted landings have taken on this daemon's first shard, and the longest in nanoseconds
-  /// (AUD-29-25): a landing runs in slices with the shard serving between them.
-  pub fn landing_slices(&self) -> Result<(u64, u64), ObserveError> {
-    self.observe(self.shards.first().copied(), |s| {
-      (s.landing.slices, s.landing.longest_slice_ns)
-    })
+  /// What the slices of granted landings on this daemon's first shard measured (AUD-29-25): how many, their
+  /// p50/p99/p999 and maximum, their budget, and how many ran past it by more than their last unit.
+  pub fn landing_slices(&self) -> Result<crate::landing::SliceSummary, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| s.landing.slice_summary())
   }
 
   /// The pressure hold on this daemon's first shard now (§4.2): what the sampler, or a test, withholds

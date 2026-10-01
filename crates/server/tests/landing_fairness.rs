@@ -10,7 +10,7 @@
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use slates_client::{Filter, Landing};
+use slates_client::{Filter, Intent, Landing};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
@@ -22,24 +22,123 @@ use common::target::target_dir;
 const TEST_SHARDS: u16 = 1;
 /// Shape: the volume's name.
 const VOLUME: &str = "fair-landing";
+/// Shape: the volume the lease probe takes and gives back its write lease on.
+const LEASED: &str = "fair-leased";
 /// Shape: files in the landing — each a temporary created, written, synced and linked on the disk, so the
 /// landing's host work spans many slices on any disk.
 const FILES: usize = 600;
-/// Shape: the probes taken before the landing, for the probe's own service time on this machine.
+/// Shape: the probes of each kind taken before the landing, for their service time on this machine.
 const BASELINE_PROBES: usize = 32;
 
-/// The probe's latency: one `list` round trip.
-fn probe(client: &mut slates_client::Client) -> Duration {
+/// The kinds of work the shard serves beside the landing: a read, a provisioning (a volume created and
+/// destroyed), and a write lease taken and given back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+  Read,
+  Provision,
+  Lease,
+}
+
+/// Format: the probe kinds, in the order the prober cycles through them.
+const PROBES: [Probe; 3] = [Probe::Read, Probe::Provision, Probe::Lease];
+
+/// One probe's latency: its round trips through the shard.
+fn probe(
+  client: &mut slates_client::Client,
+  kind: Probe,
+  round: usize,
+  leased: slates_client::VolumeId,
+) -> Duration {
   let began = Instant::now();
-  client.list().unwrap();
+  match kind {
+    Probe::Read => {
+      client.list().unwrap();
+    }
+    Probe::Provision => {
+      let id = client
+        .create(&scratch(&format!("fair-probe-{round}")))
+        .unwrap();
+      client.destroy(id).unwrap();
+    }
+    Probe::Lease => {
+      let attached = client.attach(leased, None, Intent::Write).unwrap();
+      client.detach(attached.attachment).unwrap();
+    }
+  }
   began.elapsed()
 }
 
-/// AUD-29-25 acceptance. Do: write 600 files through the daemon's NFS transport into a one-shard volume, take
-/// the probe's baseline latency, then land the volume into a fresh directory under a grant on one thread while
-/// another client keeps probing the same shard. Expect: the landing is done with every file written and ran in
-/// many slices; probes were answered while it ran; and no probe waited for the whole landing — the longest
-/// probe during it is shorter than the landing, and no slice was more than half of it.
+/// The `ppm`-th quantile (parts per million) of `samples`, exactly: the `⌈n × ppm / 10⁶⌉`-th smallest.
+fn quantile(samples: &mut [Duration], ppm: u64) -> Duration {
+  /// Format: parts per million.
+  const PPM: u64 = 1_000_000;
+  samples.sort_unstable();
+  let n = u64::try_from(samples.len()).unwrap();
+  let rank = (n * ppm).div_ceil(PPM).max(1);
+  samples[usize::try_from(rank).unwrap() - 1]
+}
+
+/// Writes `count` small files into the volume [`VOLUME`] through the daemon's NFS transport.
+fn write_files(daemon: &Daemon, count: usize) {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(VOLUME).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let mut xid = 2u32;
+  for n in 0..count {
+    let file = create(&mut stream, &root, &format!("f{n:04}"), xid);
+    write(&mut stream, &file, format!("file {n}").as_bytes(), xid + 1);
+    xid += 2;
+  }
+}
+
+/// Prints each probe kind's quantiles inside the landing (`began`, lasting `took`) beside its baseline, asserts
+/// every kind was answered more than once while the landing ran, and returns the longest probe inside it.
+fn report_probes(
+  during: &[(Probe, Instant, Duration)],
+  baseline: &[(Probe, Duration)],
+  began: Instant,
+  took: Duration,
+) -> Duration {
+  let mut longest_probe = Duration::ZERO;
+  for kind in PROBES {
+    let mut inside: Vec<Duration> = during
+      .iter()
+      .filter(|(k, at, probe)| *k == kind && *at >= began && *at + *probe <= began + took)
+      .map(|(_, _, probe)| *probe)
+      .collect();
+    let mut before: Vec<Duration> = baseline
+      .iter()
+      .filter(|(k, _)| *k == kind)
+      .map(|(_, probe)| *probe)
+      .collect();
+    assert!(
+      inside.len() > 1,
+      "the shard answered {kind:?} probes while the landing ran: {}",
+      inside.len()
+    );
+    let max = quantile(&mut inside, 1_000_000);
+    eprintln!(
+      "{kind:?}: {} probes inside the landing — p50 {:?}, p99 {:?}, p999 {:?}, max {max:?}; before it max {:?}",
+      inside.len(),
+      quantile(&mut inside, 500_000),
+      quantile(&mut inside, 990_000),
+      quantile(&mut inside, 999_000),
+      quantile(&mut before, 1_000_000)
+    );
+    longest_probe = longest_probe.max(max);
+  }
+  longest_probe
+}
+
+/// AUD-29-25 acceptance and its percentile lane. Do: write 600 files through the daemon's NFS transport into
+/// a one-shard volume, take each probe's baseline latency, then land the volume into a fresh directory under
+/// a grant on one thread while another client keeps probing the same shard — reads, provisioning (create and
+/// destroy) and a write lease taken and given back, in turn. Expect: the landing is done with every file
+/// written and ran in many slices; every kind of probe was answered while it ran; no probe waited for the
+/// whole landing; no slice ran past its budget by more than its own last unit (the daemon counts any that
+/// did); and the run publishes, per probe kind and for the slices, p50/p99/p999/max, with the shard's
+/// longest step — the recorded lane (`docs/wip/BENCHMARKS.md`, "The landing's percentile lane").
 #[test]
 fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   let profile = common::machine_profile();
@@ -62,22 +161,18 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let volume = client.create(&scratch(VOLUME)).unwrap();
-  let port = daemon.nfs_port().expect("the daemon is serving NFS");
-  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let capability = daemon.mount_capability(VOLUME).unwrap().unwrap();
-  let root = mount(&mut stream, &capability, 1);
-  let mut xid = 2u32;
-  for n in 0..FILES {
-    let file = create(&mut stream, &root, &format!("f{n:04}"), xid);
-    write(&mut stream, &file, format!("file {n}").as_bytes(), xid + 1);
-    xid += 2;
-  }
+  write_files(&daemon, FILES);
 
   let mut prober = connect(&instance);
-  let baseline = (0..BASELINE_PROBES)
-    .map(|_| probe(&mut prober))
-    .max()
-    .unwrap();
+  let leased = prober.create(&scratch(LEASED)).unwrap();
+  let mut round = 0usize;
+  let mut baseline = Vec::new();
+  for _ in 0..BASELINE_PROBES {
+    for kind in PROBES {
+      baseline.push((kind, probe(&mut prober, kind, round, leased)));
+      round += 1;
+    }
+  }
   let grant = approve(&mut client, &secret, volume, None, &target.path);
   let target_path = target.path.clone();
   let landing = std::thread::spawn(move || {
@@ -87,45 +182,57 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   });
   let mut during = Vec::new();
   while !landing.is_finished() {
+    let kind = PROBES[round % PROBES.len()];
     let at = Instant::now();
-    let took = probe(&mut prober);
-    during.push((at, took));
+    let took = probe(&mut prober, kind, round, leased);
+    during.push((kind, at, took));
+    round += 1;
   }
   let (began, took, landed) = landing.join().unwrap();
-  let (slices, longest_slice_ns) = daemon.landing_slices().unwrap();
+  let slices = daemon.landing_slices().unwrap();
+  let longest_step = daemon
+    .shard_pulses()
+    .iter()
+    .map(|pulse| pulse.longest_step_ns)
+    .max()
+    .unwrap_or(0);
   drop(prober);
   daemon.stop();
 
   let Ok(Landing::Landed(outcome)) = landed else {
     panic!("the granted landing: {landed:?}");
   };
-  let inside: Vec<Duration> = during
-    .iter()
-    .filter(|(at, probe)| *at >= began && *at + *probe <= began + took)
-    .map(|(_, probe)| *probe)
-    .collect();
-  let longest_probe = inside.iter().max().copied().unwrap_or_default();
-  let longest_slice = Duration::from_nanos(longest_slice_ns);
-  eprintln!(
-    "landing of {FILES} files: {took:?} in {slices} slices (longest {longest_slice:?}); \
-     {} probes inside it, longest {longest_probe:?}; baseline probe {baseline:?}",
-    inside.len()
-  );
   assert_eq!(outcome.state, "done");
   assert_eq!(outcome.written, u64::try_from(FILES).unwrap());
-  assert!(slices > 1, "the landing ran in slices: {slices}");
+  eprintln!(
+    "landing of {FILES} files: {took:?} in {} slices of a {} ns budget: p50 {} ns, p99 {} ns, p999 {} ns, \
+     max {} ns; {} past budget; the shard's longest step {longest_step} ns",
+    slices.slices,
+    slices.budget_ns,
+    slices.p50_ns,
+    slices.p99_ns,
+    slices.p999_ns,
+    slices.max_ns,
+    slices.past_budget
+  );
+  let longest_probe = report_probes(&during, &baseline, began, took);
   assert!(
-    inside.len() > 1,
-    "the shard answered probes while the landing ran: {}",
-    inside.len()
+    slices.slices > 1,
+    "the landing ran in slices: {}",
+    slices.slices
+  );
+  assert_eq!(
+    slices.past_budget, 0,
+    "every slice ended within its own last unit of its budget"
   );
   assert!(
     longest_probe < took,
     "no probe waited for the whole landing ({longest_probe:?} of {took:?})"
   );
   assert!(
-    longest_slice * 2 <= took,
-    "no slice was more than half the landing ({longest_slice:?} of {took:?})"
+    Duration::from_nanos(slices.max_ns) * 2 <= took,
+    "no slice was more than half the landing ({} ns of {took:?})",
+    slices.max_ns
   );
 }
 
@@ -161,16 +268,7 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let volume = client.create(&scratch(VOLUME)).unwrap();
-  let port = daemon.nfs_port().expect("the daemon is serving NFS");
-  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let capability = daemon.mount_capability(VOLUME).unwrap().unwrap();
-  let root = mount(&mut stream, &capability, 1);
-  let mut xid = 2u32;
-  for n in 0..FILES_PAST_TERM {
-    let file = create(&mut stream, &root, &format!("f{n:04}"), xid);
-    write(&mut stream, &file, format!("file {n}").as_bytes(), xid + 1);
-    xid += 2;
-  }
+  write_files(&daemon, FILES_PAST_TERM);
   let grant = approve(&mut client, &secret, volume, None, &target.path);
   let began = Instant::now();
   let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));

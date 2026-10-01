@@ -2386,6 +2386,11 @@ fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// The nanoseconds from `from` to `to` (0 if `to` is earlier).
+fn nanos_between(from: Instant, to: Instant) -> u64 {
+  u64::try_from(to.saturating_duration_since(from).as_nanos()).unwrap_or(u64::MAX)
+}
+
 /// The directory and name of a volume path.
 fn split(path: &str) -> (&str, &str) {
   match path.rsplit_once('/') {
@@ -2798,6 +2803,11 @@ pub struct LandingRun<'h, H: LandFs> {
   reports: Vec<EntryReport>,
   phase: Phase,
   swept: usize,
+  /// How long the last unit stepped took, in nanoseconds, measured from the previous unit's end (so a step's
+  /// time is exactly the sum of its units'): a step overruns its budget by at most this (AUD-29-25).
+  last_unit_ns: u64,
+  /// How long the last [`LandingRun::step`] ran, in nanoseconds, to the end of its last unit.
+  last_step_ns: u64,
 }
 
 impl<'h, H: LandFs> LandingRun<'h, H> {
@@ -2828,6 +2838,8 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       reports: Vec::new(),
       phase: Phase::Sweep { parents, next: 0 },
       swept: 0,
+      last_unit_ns: 0,
+      last_step_ns: 0,
     })
   }
 
@@ -2845,18 +2857,38 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     budget_ns: u64,
   ) -> Option<Result<LandingReport, LandingRefusal>> {
     let began = Instant::now();
+    let mut mark = began;
+    self.last_step_ns = 0;
     loop {
       if self.ready_to_finish() {
         return None;
       }
-      if let Some(ended) = self.unit(vol, store, audit, observer) {
+      let ended = self.unit(vol, store, audit, observer);
+      let now = Instant::now();
+      self.last_unit_ns = nanos_between(mark, now);
+      self.last_step_ns = nanos_between(began, now);
+      mark = now;
+      if let Some(ended) = ended {
         self.phase = Phase::Ended;
         return Some(ended);
       }
-      if elapsed_ns(began) >= budget_ns {
+      if self.last_step_ns >= budget_ns {
         return None;
       }
     }
+  }
+
+  /// How long the last unit [`LandingRun::step`] ran took, in nanoseconds: a step returns once its budget
+  /// has passed, so it overruns the budget by at most this.
+  pub fn last_unit_ns(&self) -> u64 {
+    self.last_unit_ns
+  }
+
+  /// How long the last [`LandingRun::step`] ran, to the end of its last unit, in nanoseconds. A step that
+  /// returned for its budget ran less than the budget before its last unit, so this is at most the budget
+  /// plus [`LandingRun::last_unit_ns`].
+  pub fn last_step_ns(&self) -> u64 {
+    self.last_step_ns
   }
 
   /// Whether every host step is done and only the finish (the volume's advance and the report) remains.
@@ -2979,6 +3011,8 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       reports,
       phase,
       swept,
+      last_unit_ns: _,
+      last_step_ns: _,
     } = self;
     let Some(host) = host.get() else {
       return Some(Err(LandingRefusal::HostAway));

@@ -4785,6 +4785,12 @@ stays in the overlay.
 > slices (AUD-29-25). The record is not yet written to the host's candidate holders.
 > Record: `docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md`.
 
+> **Status (2026-10-01, AUD-29-25 closed: the percentile lane).** Each slice is recorded in the shard's
+> bounded duration histogram and checked against its budget plus its own last unit (zero past it in every
+> recorded run); reads, provisioning and write-lease changes are served throughout a 600-file landing, their
+> p50/p99/p999/max published with the slices' and the shard's longest step (`docs/wip/BENCHMARKS.md`, "The
+> landing's percentile lane").
+
 > **Status (2026-10-01, AUD-29-25 in part).** A granted landing runs in slices.
 > - **The run.** After its grant and lease, it is an owned, resumable run that takes one unit at a time (a
 >   directory swept, an entry validated or written, a directory synced) in slices of half its shard's step

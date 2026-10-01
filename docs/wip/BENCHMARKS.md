@@ -1208,3 +1208,40 @@ What it means: a slice ends within one unit of its budget, and a unit is one fil
 `fsync`, so the longest wait a probe sees is that unit's disk latency. A large file is still one unit
 (owed).
 
+### The landing's percentile lane: slices and the shard's other work (2026-10-01)
+
+`cargo test -p slates-server --test landing_fairness a_large_landing -- --nocapture` (debug build; AUD-29-25's
+recorded lane). The same 600-file landing on a one-shard daemon, now probed by three kinds of work in turn — a
+read (`list`), a provisioning (a 1 MiB volume created and destroyed) and a write lease (a write attach and its
+detach on a second volume). The daemon records every slice in a log-linear histogram (`histogram.rs`: a quantile
+reads back at most an eighth above the exact value; the maximum is exact) and counts a slice that ran past its
+budget by more than its own last unit; the probes' quantiles are exact, from the samples. The budget is half the
+shard's measured step quantum (the wake estimate's live value, so it moves between runs). Apple M5 Max, 18 cores,
+128 GiB, macOS 26.4.1; load average 4.2–6.1 from other sessions (not quiesced). Three runs, all shown.
+
+| Run | Landing | Slices | Budget | Slice p50 | p99 | p999 | max | Past budget | Shard's longest step |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 2.01 s | 1,206 | 2,019 ns | 41.0 µs | 1.57 ms | 5.24 ms | 5.62 ms | 0 | 13.8 ms |
+| 2 | 1.96 s | 1,206 | 2,363 ns | 20.5 µs | 1.18 ms | 4.19 ms | 4.58 ms | 0 | 23.0 ms |
+| 3 | 2.74 s | 1,206 | 2,402 ns | 26.6 µs | 18.9 ms | 25.2 ms | 25.3 ms | 0 | 25.5 ms |
+
+| Run | Probe (226 each inside the landing) | p50 | p99 | p999 = max | Max before the landing |
+|---|---|---|---|---|---|
+| 1 | read | 870 µs | 2.87 ms | 13.9 ms | 135 µs |
+| 1 | provision | 7.18 ms | 10.5 ms | 11.7 ms | 3.63 ms |
+| 1 | lease | 267 µs | 3.14 ms | 6.54 ms | 305 µs |
+| 2 | read | 816 µs | 2.33 ms | 13.9 ms | 107 µs |
+| 2 | provision | 7.34 ms | 7.92 ms | 10.5 ms | 3.74 ms |
+| 2 | lease | 227 µs | 2.41 ms | 5.93 ms | 236 µs |
+| 3 | read | 148 µs | 21.5 ms | 28.7 ms | 3.42 ms |
+| 3 | provision | 7.16 ms | 37.6 ms | 49.5 ms | 5.65 ms |
+| 3 | lease | 392 µs | 31.3 ms | 39.8 ms | 1.80 ms |
+
+What it means: the budget is a few microseconds, so every slice is exactly one unit (1,206 = two units per file
+plus the sweep and syncs), and no slice ran past its budget by more than that unit in any run. The slice
+distribution is the disk's: a unit is a create, a write or an `fsync`, and run 3 met a 25 ms one. Every kind of
+work kept being served throughout — reads, provisioning and lease changes alike — each waiting at most one unit
+plus its own service; a provisioning probe is two verbs, so it waits behind up to two. The shard's longest step
+can exceed the longest slice (run 1: 13.8 ms against 5.6 ms) — it is the longest step of *any* task on the shard
+over the whole test, the NFS writes and the probes included.
+

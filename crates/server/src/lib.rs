@@ -40,6 +40,7 @@ pub mod doorbell;
 pub mod error;
 pub mod fleet;
 pub mod head;
+pub mod histogram;
 pub mod landing;
 pub mod lease;
 pub mod merge_service;
