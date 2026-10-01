@@ -410,6 +410,11 @@ mod structural {
     "SetFileInformationByHandle",
     "FlushFileBuffers",
     "ReplaceFileW",
+    // The NT native calls under them (AUD-29-62): `NtCreateFile` creates as well as opens, by disposition.
+    "NtCreateFile",
+    "NtWriteFile",
+    "NtSetInformationFile",
+    "NtDeleteFile",
     // rustix's write-capable file calls and open flags, for the same crates.
     "rustix::fs::unlink",
     "rustix::fs::rename",

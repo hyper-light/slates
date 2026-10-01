@@ -4424,6 +4424,15 @@ No copy-up, hashing, archive or landing step opens a host special file as regula
 > sibling audit), and restart does not yet recover complete volume contents (BUG-11).
 > Historical tests in GAPS §8c/§8d were not rerun for this amendment.
 
+> **Status (2026-10-01, AUD-29-62: contained base access on every platform).** The Windows base host is
+> descriptor-relative like the Unix one: it retains a handle per opened directory and opens each entry with
+> `NtCreateFile` relative to it with `FILE_OPEN_REPARSE_POINT`, and makes the reparse check on the object it
+> opened (a link, junction or mount point is never traversed; an entry whose reparse point is its own data
+> is reopened through its filter only if it is the same object). A lookup on either host names exactly one
+> entry of its directory — never `..`, `.`, or a name with a separator (or, on Windows, a stream) — so no
+> lookup leaves the base; the Unix host had let `..` through `O_NOFOLLOW`. Record:
+> `docs/bugs/2026-10-01-the-windows-base-host-re-resolved-paths.md`.
+
 > **Status (2026-09-29, AUD-29-02).** A landing of a named snapshot lands it only while the head is still
 > exactly its state: nothing but snapshots journaled since, with no record dropped
 > (`Volume::unchanged_since`). A head changed since is refused `Unsupported` before any host access, and a

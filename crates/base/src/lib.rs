@@ -8,9 +8,11 @@
 //!
 //! This crate links no write-capable syscall: the workspace's structural test refuses every
 //! write call and open flag in it (`cargo xtask structural`), which is R1's lint wall for the
-//! base plane. On Windows the host is path-relative through the standard library (a directory
-//! handle form arrives with the Windows bridge, Phase 4) and reports no watcher (fingerprints
-//! alone, the failure matrix's Masked cell); both are recorded in GAPS.
+//! base plane. On Windows every access is relative to a retained directory handle too
+//! (`NtCreateFile` with `RootDirectory`, the reparse check made on the opened object; AUD-29-62),
+//! and the host reports no watcher yet (fingerprints alone, the failure matrix's Masked cell),
+//! recorded in GAPS. On both, a lookup names one entry of its directory, never a path
+//! ([`one_entry`]).
 //!
 //! Evidence for the primitives: `research/disk-source-of-truth.md` §4 (verified per
 //! platform), and the timestamp-granularity table there for the racy rule.
@@ -31,6 +33,33 @@
 mod unix;
 #[cfg(windows)]
 mod windows;
+#[cfg(any(windows, test))]
+mod windows_records;
+
+use slates_vfs::host::HostError;
+
+/// Format: the characters that separate path components on Unix (`/`) and end a C string (NUL); a name
+/// holding one is a path, never one entry.
+#[cfg(any(unix, test))]
+pub(crate) const UNIX_NAME_BREAKS: &[char] = &['/', '\0'];
+/// Format: the characters that separate path components on Windows (`\` and `/`, which the object manager
+/// treats alike under Win32), name a stream of an entry (`:`), or end a counted name early (NUL); a name
+/// holding one is a path or a stream, never one entry.
+#[cfg(any(windows, test))]
+pub(crate) const WINDOWS_NAME_BREAKS: &[char] = &['\\', '/', ':', '\0'];
+
+/// One entry of a directory, by the rule both hosts hold (R1, §4.15, AUD-29-62): every lookup names exactly
+/// one entry of the directory handle it is relative to, never a path. An empty name, `.`, `..`, or a name
+/// holding one of the platform's `breaks` would name something other than one entry — the directory
+/// itself, its parent, or a descendant reached through components no single-entry check sees (`O_NOFOLLOW`
+/// and `FILE_OPEN_REPARSE_POINT` guard the final component only) — so it is refused as absent: no entry of
+/// the directory has that name.
+pub(crate) fn one_entry<'name>(name: &'name str, breaks: &[char]) -> Result<&'name str, HostError> {
+  if name.is_empty() || name == "." || name == ".." || name.contains(breaks) {
+    return Err(HostError::NotFound);
+  }
+  Ok(name)
+}
 
 #[cfg(unix)]
 pub use unix::OsHost;
@@ -71,4 +100,39 @@ pub enum FsKind {
   TwoSeconds,
   /// Not in the table.
   Unknown,
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// AUD-29-62. Do: ask for every shape of name that is not one entry, on each platform's rule. Expect:
+  /// each is refused as absent, and a plain name — including one holding the other platform's breaks — is
+  /// one entry.
+  #[test]
+  fn a_name_that_is_not_one_entry_is_refused_as_absent() {
+    for breaks in [UNIX_NAME_BREAKS, WINDOWS_NAME_BREAKS] {
+      for name in ["", ".", "..", "a/b", "../x", "a\0b"] {
+        assert_eq!(
+          one_entry(name, breaks),
+          Err(HostError::NotFound),
+          "{name:?}"
+        );
+      }
+      assert_eq!(one_entry("...", breaks), Ok("..."));
+      assert_eq!(one_entry(".hidden", breaks), Ok(".hidden"));
+    }
+    for name in ["a\\b", "..\\x", "file:stream", "C:"] {
+      assert_eq!(
+        one_entry(name, WINDOWS_NAME_BREAKS),
+        Err(HostError::NotFound),
+        "{name:?}"
+      );
+      assert_eq!(
+        one_entry(name, UNIX_NAME_BREAKS),
+        Ok(name),
+        "{name:?} is one Unix entry"
+      );
+    }
+  }
 }

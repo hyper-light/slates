@@ -11,7 +11,7 @@ use slates_vfs::host::{
 };
 use slates_vfs::inode::Fingerprint;
 
-use crate::{FsKind, granularity_for};
+use crate::{FsKind, UNIX_NAME_BREAKS, granularity_for, one_entry};
 
 /// Format: nanoseconds per second.
 const NS_PER_S: i64 = 1_000_000_000;
@@ -144,6 +144,7 @@ impl OsHost {
   /// without following): the landing's check of an entry it moved aside (AUD-29-04). A read, like
   /// [`HostFs::list`]'s own per-entry `statat`.
   pub fn entry_fingerprint(&self, dir: HostDir, name: &str) -> Result<Fingerprint, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
     let st =
       rustix::fs::statat(self.dir(dir)?, name, AtFlags::SYMLINK_NOFOLLOW).map_err(refusal)?;
     Ok(fingerprint(&st))
@@ -223,6 +224,7 @@ impl HostFs for OsHost {
   }
 
   fn open_dir(&mut self, parent: HostDir, name: &str) -> Result<HostDir, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
     let fd = rustix::fs::openat(
       self.dir(parent)?,
       name,
@@ -237,6 +239,7 @@ impl HostFs for OsHost {
   }
 
   fn open_file(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
     let fd = rustix::fs::openat(
       self.dir(dir)?,
       name,
@@ -266,6 +269,7 @@ impl HostFs for OsHost {
   }
 
   fn read_link(&mut self, dir: HostDir, name: &str) -> Result<Box<str>, HostError> {
+    let name = one_entry(name, UNIX_NAME_BREAKS)?;
     let fd = self.dir(dir)?;
     let target = rustix::fs::readlinkat(fd, name, Vec::new()).map_err(refusal)?;
     target

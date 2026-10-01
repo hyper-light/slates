@@ -162,6 +162,7 @@ impl Block {
 }
 
 unsafe extern "system" {
+  // structural: allow — declared for the one `FILE_OPEN` of the `\Device\Afd` helper device; creates nothing.
   fn NtCreateFile(
     file_handle: *mut HANDLE,
     desired_access: u32,
@@ -232,6 +233,7 @@ impl Afd {
     // SAFETY: `attributes` names a valid device and is live for the call; `handle`/`iosb` are writable;
     // the `name` buffer outlives the call. All other pointers are the documented nulls.
     let status = unsafe {
+      // structural: allow — `FILE_OPEN` of the `\Device\Afd` helper device with `SYNCHRONIZE` only; no file.
       NtCreateFile(
         &mut handle,
         SYNCHRONIZE,

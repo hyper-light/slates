@@ -73,10 +73,14 @@
 #   0.3–1.0 ms per harvest (docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md). 59 of 59.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
-# slates-base (6): rustix marks kevent unsafe because the kernel fills the output list; one
+# slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
 #   registration and one drain of the macOS/BSD directory watcher (2); the Windows fingerprint
-#   through the stable Win32 file-information calls (two zeroed records, two calls: 4), since
-#   the standard library's handle metadata is unstable on 1.98.
+#   through the stable Win32 file-information calls (2), since the standard library's handle
+#   metadata is unstable on 1.98 (its two zeroed records are now built as literals); and the
+#   Windows contained opens (AUD-29-62, 2026-10-01: 6) — `NtCreateFile` relative to a retained
+#   directory handle, which no safe wrapper offers; adopting the handle it returns; the
+#   attribute-and-tag query on the opened object; the directory enumeration of a retained handle;
+#   `FSCTL_GET_REPARSE_POINT` on a link's own handle; and the NT status's Win32 translation.
 # slates-vfs (0): the volume core is safe Rust over the arenas and slabs of slates-mem; the block
 #   layout is read and written through byte slices, never a cast.
 # slates-anchor (6): the segment is byte slices and the atomic views of slates-mem; the Windows
@@ -187,7 +191,7 @@ slates-mem = 22
 # freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
 # context its own `Drop` frees.
 slates-rt = 63
-slates-base = 6
+slates-base = 10
 slates-vfs = 0
 slates-land = 3
 slates-anchor = 6

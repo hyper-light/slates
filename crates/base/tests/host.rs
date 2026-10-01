@@ -160,6 +160,35 @@ fn the_host_refuses_the_wrong_kind_and_releases_handles() {
   assert_eq!(host.open_handles(), 1);
 }
 
+/// AUD-29-62 (containment, both hosts). Do: open `crates/vfs` as the base, then ask it for its parent, for
+/// itself, and for paths through it — `..`, `.`, `src/lib.rs`, `../base` — as directories, files and links.
+/// Expect: each is refused as absent and no handle is kept; a lookup names one entry of its directory,
+/// never a path. Before, the Unix host's `openat(dir, "..", O_NOFOLLOW)` opened the base's parent: the
+/// flag guards a final symlink, never `..` or a separator.
+#[test]
+fn a_lookup_that_is_not_one_entry_never_leaves_the_base() {
+  let (mut host, root) = OsHost::open_root(&crates_dir().join("vfs")).unwrap();
+  for name in ["..", ".", "", "src/lib.rs", "../base", "src/../../base"] {
+    assert_eq!(
+      host.open_dir(root, name),
+      Err(HostError::NotFound),
+      "dir {name:?}"
+    );
+    assert_eq!(
+      host.open_file(root, name),
+      Err(HostError::NotFound),
+      "file {name:?}"
+    );
+    assert_eq!(
+      host.read_link(root, name),
+      Err(HostError::NotFound),
+      "link {name:?}"
+    );
+  }
+  assert_eq!(host.open_handles(), 1, "no refused lookup kept a handle");
+  host.close_dir(root);
+}
+
 /// AC-1.9 on a real tree: an overlay over `crates/` costs one directory open and one node; a
 /// path resolution opens only the directories on it, and a read returns the disk's bytes.
 #[test]
@@ -241,10 +270,8 @@ const TICK: std::time::Duration = std::time::Duration::from_millis(2);
 /// A test's own directory in the build output (`CARGO_TARGET_TMPDIR`; A-50: a real base directory,
 /// never `/tmp` or a RAM directory), named with the process id and removed on drop, a failed assertion
 /// included.
-#[cfg(unix)]
 struct BuildOutputDir(PathBuf);
 
-#[cfg(unix)]
 impl BuildOutputDir {
   fn new(slug: &str) -> Self {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
@@ -255,7 +282,6 @@ impl BuildOutputDir {
   }
 }
 
-#[cfg(unix)]
 impl Drop for BuildOutputDir {
   fn drop(&mut self) {
     let _ = std::fs::remove_dir_all(&self.0);
@@ -390,5 +416,157 @@ fn a_real_directory_shows_descriptor_semantics_nofollow_and_hints() {
   );
   host.close_file(file);
   host.close_file(fresh);
+  host.close_dir(root);
+}
+
+/// A junction at `link` to `target`, as a user makes one (`mklink /J`, no privilege needed).
+#[cfg(windows)]
+fn junction(link: &std::path::Path, target: &std::path::Path) {
+  let made = std::process::Command::new("cmd")
+    .args(["/C", "mklink", "/J"])
+    .arg(link)
+    .arg(target)
+    .output()
+    .unwrap();
+  assert!(made.status.success(), "mklink /J: {made:?}");
+}
+
+/// The bytes of the file `name` under `dir`, through the host.
+#[cfg(windows)]
+fn read_named(host: &mut OsHost, dir: HostDir, name: &str) -> Vec<u8> {
+  let file = host.open_file(dir, name).unwrap();
+  let bytes = read_whole(host, file, 64);
+  host.close_file(file);
+  bytes
+}
+
+/// The names a listing shows, sorted.
+#[cfg(windows)]
+fn listed(host: &mut OsHost, dir: HostDir) -> Vec<String> {
+  let mut names: Vec<String> = host
+    .list(dir)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name.to_string())
+    .collect();
+  names.sort();
+  names
+}
+
+/// Shape: the bytes every file outside the base holds; no host call may ever return them.
+#[cfg(windows)]
+const SENTINEL: &[u8] = b"outside the base";
+/// Shape: the bytes every file inside the base holds.
+#[cfg(windows)]
+const INSIDE: &[u8] = b"inside the base";
+
+/// A base (`base/f.txt`, `base/sub/inner.txt`) and a sibling outside it (`outside/sentinel.txt`,
+/// `outside/f.txt`, `outside/inner.txt`) in a fresh build-output directory.
+#[cfg(windows)]
+fn base_and_outside(slug: &str) -> (BuildOutputDir, PathBuf, PathBuf) {
+  let owned = BuildOutputDir::new(slug);
+  let base = owned.0.join("base");
+  let outside = owned.0.join("outside");
+  std::fs::create_dir_all(base.join("sub")).unwrap();
+  std::fs::create_dir_all(&outside).unwrap();
+  std::fs::write(base.join("f.txt"), INSIDE).unwrap();
+  std::fs::write(base.join("sub").join("inner.txt"), INSIDE).unwrap();
+  for name in ["sentinel.txt", "f.txt", "inner.txt"] {
+    std::fs::write(outside.join(name), SENTINEL).unwrap();
+  }
+  (owned, base, outside)
+}
+
+/// AUD-29-62 (root swapped). Do: open a base, then move the base away and put a junction to a directory
+/// outside it at the base's path; list the root, read a file through it, open its subdirectory. Expect: the
+/// retained root keeps naming the directory it opened — the moved base's entries and bytes, never the
+/// outside directory's.
+#[cfg(windows)]
+#[test]
+fn a_retained_root_keeps_naming_the_base_after_its_path_becomes_a_junction() {
+  let (owned, base, outside) = base_and_outside("contain-root");
+  let (mut host, root) = OsHost::open_root(&base).unwrap();
+  std::fs::rename(&base, owned.0.join("base-moved")).unwrap();
+  junction(&base, &outside);
+  assert_eq!(listed(&mut host, root), ["f.txt", "sub"]);
+  assert_eq!(read_named(&mut host, root, "f.txt"), INSIDE);
+  let sub = host.open_dir(root, "sub").unwrap();
+  assert_eq!(read_named(&mut host, sub, "inner.txt"), INSIDE);
+  host.close_dir(sub);
+  host.close_dir(root);
+  assert_eq!(host.open_handles(), 0);
+}
+
+/// AUD-29-62 (intermediate swapped). Do: open a base and its subdirectory, then move the subdirectory away
+/// and put a junction to an outside directory at its name; list and read through the retained subdirectory,
+/// and look the name up again from the root. Expect: the retained handle still names the moved directory;
+/// the fresh lookup finds a link — refused as a directory and as a file, listed as a link, its target read
+/// — and nothing returns the outside bytes. Before, each access re-resolved `base\sub` as a path and
+/// followed the junction.
+#[cfg(windows)]
+#[test]
+fn an_intermediate_swapped_for_a_junction_is_never_traversed() {
+  let (_owned, base, outside) = base_and_outside("contain-mid");
+  let (mut host, root) = OsHost::open_root(&base).unwrap();
+  let sub = host.open_dir(root, "sub").unwrap();
+  std::fs::rename(base.join("sub"), base.join("sub-moved")).unwrap();
+  junction(&base.join("sub"), &outside);
+  assert_eq!(listed(&mut host, sub), ["inner.txt"]);
+  assert_eq!(read_named(&mut host, sub, "inner.txt"), INSIDE);
+  assert_eq!(host.open_dir(root, "sub"), Err(HostError::NotDirectory));
+  assert_eq!(host.open_file(root, "sub"), Err(HostError::NotFile));
+  let kinds: Vec<(String, HostKind)> = host
+    .list(root)
+    .unwrap()
+    .into_iter()
+    .map(|entry| (entry.name.to_string(), entry.kind))
+    .collect();
+  assert!(
+    kinds.contains(&("sub".to_owned(), HostKind::Symlink)),
+    "{kinds:?}"
+  );
+  let target = host.read_link(root, "sub").unwrap();
+  assert!(
+    target.ends_with("outside"),
+    "the junction's target: {target}"
+  );
+  host.close_dir(sub);
+  host.close_dir(root);
+}
+
+/// AUD-29-62 (final component swapped, and drift). Do: open a file in the base, then move it aside and put
+/// a symbolic link to an outside file at its name; read through the handle opened before, and look the name
+/// up again. Expect: the old handle keeps its object's bytes (the reviewed drift semantics: an open
+/// authorized inode reads as it was); the fresh lookup is refused as a file and listed as a link. Creating a
+/// file symbolic link needs a privilege or developer mode; without one the link half skips, saying so.
+#[cfg(windows)]
+#[test]
+fn a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_bytes() {
+  let (_owned, base, outside) = base_and_outside("contain-final");
+  let (mut host, root) = OsHost::open_root(&base).unwrap();
+  let before = host.open_file(root, "f.txt").unwrap();
+  std::fs::rename(base.join("f.txt"), base.join("f-moved.txt")).unwrap();
+  if let Err(refused) =
+    std::os::windows::fs::symlink_file(outside.join("f.txt"), base.join("f.txt"))
+  {
+    eprintln!("SKIP the link half: creating a file symbolic link was refused here ({refused})");
+    assert_eq!(read_whole(&mut host, before, 64), INSIDE);
+    return;
+  }
+  assert_eq!(read_whole(&mut host, before, 64), INSIDE);
+  assert_eq!(host.open_file(root, "f.txt"), Err(HostError::NotFile));
+  assert_eq!(host.open_dir(root, "f.txt"), Err(HostError::NotDirectory));
+  let kinds: Vec<(String, HostKind)> = host
+    .list(root)
+    .unwrap()
+    .into_iter()
+    .map(|entry| (entry.name.to_string(), entry.kind))
+    .collect();
+  assert!(
+    kinds.contains(&("f.txt".to_owned(), HostKind::Symlink)),
+    "{kinds:?}"
+  );
+  assert!(host.read_link(root, "f.txt").unwrap().ends_with("f.txt"));
+  host.close_file(before);
   host.close_dir(root);
 }

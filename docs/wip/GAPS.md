@@ -542,8 +542,9 @@ descriptor serves (an in-place change marks the body lost and reads refuse with 
 and then on the path (deleted, replaced, retyped: reported, still served from the held inode),
 `read_base`, `rewitness`, `pin`, `status`, hints and overflow re-checks, the diverged set over
 loaded nodes; and `slates-base` (`crates/base`), the operating-system host: descriptor-relative
-rustix calls on Unix, inotify on Linux and `EVFILT_VNODE` on macOS behind the seam, a
-path-relative standard-library form on Windows. Gated: AC-1.9 (one open and one node at 10^3,
+rustix calls on Unix, inotify on Linux and `EVFILT_VNODE` on macOS behind the seam, and
+handle-relative `NtCreateFile` opens on Windows (AUD-29-62, 2026-10-01; until then a path-relative
+standard-library form). Gated: AC-1.9 (one open and one node at 10^3,
 10^5 and 10^6 files, and over the workspace's own tree), AC-1.10 and T-1.10 (150 generated
 histories of agent and outsider moves over random bases, the diverged set, the drift list and
 every readable file compared after each step), AC-1.11, T-1.11, T-1.12 (40,000 entries), T-1.13;
@@ -551,11 +552,12 @@ the host's own tests over `crates/` and, in the Linux lane, over tmpfs (descript
 `O_NOFOLLOW`, hints). Baselines in BENCHMARKS.md (Phase 1 baseline: the base plane).
 
 Deviations and owed items from task 10:
-- The Windows host is path-relative through the standard library and reports no watcher
-  (fingerprints alone, the failure matrix's Masked cell); the directory-handle form with
-  `FILE_FLAG_OPEN_REPARSE_POINT` opens and `ReadDirectoryChangesW` arrive with the Windows bridge
-  (Phase 4). Its timestamp granularity is the table's coarsest until the volume is queried
-  through that handle. Compile-checked in the cross-target lint lane; not run here.
+- The Windows host reports no watcher (fingerprints alone, the failure matrix's Masked cell);
+  `ReadDirectoryChangesW` is owed. Its timestamp granularity is the table's coarsest until the
+  volume is queried through the handle. The directory-handle form is built (AUD-29-62,
+  2026-10-01): retained handles, `NtCreateFile` relative opens with `FILE_OPEN_REPARSE_POINT`,
+  the reparse check on the opened object, listings enumerated from the handle; run on the
+  native Windows lane (`cargo test -p slates-base --test host`).
 - Listings on macOS use `getdents` plus one `statat` per entry (3.4 µs per entry measured);
   `getattrlistbulk` is the design's bulk call for the platform and its gain is owed as a
   measurement before Phase 3's bridge, where listings sit on the `readdirplus` path.
@@ -2964,7 +2966,7 @@ current-tree passes.
 | QUIC-RFC (A-52) | The fleet transport must be RFC 9000/9001/9002 compliant: capped PTO backoff (RFC 9002 §6.2.1), 1 ms first handshake retransmit (§6.2.2), payload-only bytes in flight (§2/App. B), peer-chosen priority class (audit §13.3), whole-exchange retention (audit §11.8), no migration/path validation (RFC 9000 §8.2, §9), not interoperable. Plan: vendored `quinn-proto` conformed to slates' rules, slates' congestion refinements as patches, slates' application protocol on its streams (`docs/wip/transport-quic.md`). **Stage 0 (plan) done 2026-10-01; stages 1–5 open.** |
 | AUD-29-59 | Remote holder ACKs require complete closure publication into admitted protected anchor RAM and recovery before the holder serves/counts it; eventual healing is insufficient (§4.8, §4.10). **AUD-29-59 closed 2026-09-30 (A-51):** a holder acknowledges a content put only once its shard's recovery image carrying the hold is committed into anchor-owned RAM; recovery holds the image's replicas again, re-verified and re-owned per object, before the node serves; a refused publish answers no acknowledgement (`crates/server/src/content_holder.rs`, `ContentHold::to_image`/`from_image`, `ShardImage::held`, image version 8). Proven by `an_acknowledged_replica_survives_a_warm_daemon_restart` (red then green) and the ownership oracle's image round trip over every generated history. Owed with volumes: the incremental publish (`docs/wip/recovery.md`). |
 | AUD-29-60–61 | Address changes need bounded authenticated validation and new-path measurements; local UDP backpressure needs owned pending-send/readiness state and accurate acceptance timing (§4.3, §4.10a). **AUD-29-61 runtime seam closed 2026-10-01:** a full local send buffer is typed `RtError::WouldBlock`, apart from a failed socket; `UdpSocket::try_send_to` answers `None` with nothing sent, `writable` awaits write readiness through every platform's driver, and `send_to_writable` sends once the OS has room, with no spin; the simulated fabric injects send pressure; DNS queries wait instead of failing (`docs/bugs/2026-10-01-local-udp-send-pressure-was-a-socket-failure.md`; `a_send_under_local_pressure_waits_for_writability_and_sends_once`). **Disposition 2026-10-01:** the endpoint half of 61 (a packet recorded sent only when the OS accepts it, with a bounded pending datagram) and all of 60 (validated address change; RFC 9000 §§8.2, 9) are the QUIC layer the directive moves to `hyper-quic`, carried there and not patched here (banned item 7). Slates-side residue, tracked here: the vendored endpoint's I/O loop must send through this seam and hand each datagram's source address to the connection (slates' `Demux::route` discards it today). |
-| AUD-29-62–63 | Windows base access must retain contained directory handles; fixtures, trace output and property-failure persistence must prove RAM-backed ownership before writes (§4.5, R1/R8, Part 6). |
+| AUD-29-62–63 | Windows base access must retain contained directory handles; fixtures, trace output and property-failure persistence must prove RAM-backed ownership before writes (§4.5, R1/R8, Part 6). **AUD-29-62 closed 2026-10-01:** the Windows host retains an `OwnedHandle` per directory and opens every entry with `NtCreateFile` relative to it (`RootDirectory`, one entry name, `FILE_OPEN`, read access only, `FILE_OPEN_REPARSE_POINT`); the reparse check is made on the opened object — a name surrogate is refused as the wrong kind and listed as a link, an entry whose reparse point is its own data is reopened through its filter and kept only if it is the same object; a listing enumerates the retained handle and fingerprints each entry through its own contained open; reparse and directory records are parsed with every offset checked (golden and hostile-input tests on every host). The sibling on Unix is fixed in the same change: `openat(dir, "..", O_NOFOLLOW)` opened the base's parent, and now both hosts refuse any lookup that is not one entry (`one_entry`; `a_lookup_that_is_not_one_entry_never_leaves_the_base`, red then green here). The R1 wall gained `NtCreateFile`/`NtWriteFile`/`NtSetInformationFile`/`NtDeleteFile`. Proven on the native Windows lane by swapping the root, an intermediate and a final component for junctions and links before list, open and read (`docs/bugs/2026-10-01-the-windows-base-host-re-resolved-paths.md`). |
 | AUD-29-64–67 | Production Linux OCI needs a served FUSE export and volume-specific live source authority; recursive mount topology/rights, identity-preserving runtime handoff and runtime/namespace capability evidence must be verified (§4.6 A-9/A-28, R1/R10). |
 | AUD-29-68–70 | A real VMM binding and durable guest authority/lifetime are owed; refused admission, cancellation and failed reclamation must retain one terminal owner and return registry, view, reference and seam resources (§4.6, §4.13). |
 | AUD-29-71–73 | Native guest memory must establish complete queue ownership and publication ordering; consumer revocation must fence admitted devices before its acknowledgement (§4.6, §4.13, AC-4.12/T-4.14). |

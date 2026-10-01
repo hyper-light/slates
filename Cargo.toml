@@ -49,6 +49,10 @@ rustix = { version = "1", features = ["mm", "fs", "event", "process", "shm", "pa
 # that remain are the file-backed ones in the profile segment.
 memmap2 = "0.9"
 windows-sys = { version = "0.60", features = [
+  # The Windows base host's contained opens (`slates-base`, AUD-29-62): `NtCreateFile` relative to a
+  # retained directory handle, which Win32's `CreateFileW` cannot do.
+  "Wdk_Foundation",
+  "Wdk_Storage_FileSystem",
   "Win32_Foundation",
   "Win32_System_SystemInformation",
   "Win32_System_Memory",
