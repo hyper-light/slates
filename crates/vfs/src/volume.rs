@@ -2801,6 +2801,11 @@ impl Volume {
     }
   }
 
+  /// Whether the volume's destroy has begun (its objects are freed by [`Self::destroy_step`]).
+  pub fn is_destroying(&self) -> bool {
+    self.state == VolumeState::Destroying
+  }
+
   /// Begins destroying the volume; the deadlists and the head's own objects are released in
   /// cooperative slices by [`Volume::destroy_step`].
   pub fn destroy(&mut self, store: &mut Store) -> Result<(), VfsError> {

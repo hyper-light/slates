@@ -497,6 +497,23 @@ pub(crate) fn revoke_consumer_devices(s: &ShardState, consumer: u64) -> usize {
     .count()
 }
 
+/// Asks every device loop serving volume `volume` to revoke (its destroy): the number still serving it, each of
+/// which ends at its next pass boundary, its terminal step sweeping through its view before the view closes.
+pub(crate) fn revoke_volume_devices(s: &ShardState, volume: DbVolumeId) -> usize {
+  let partition = s.db.partition();
+  s.guest_devices
+    .iter()
+    .filter(|(_, _, attachment)| {
+      partition
+        .attachment(*attachment)
+        .is_some_and(|record| record.volume == volume)
+    })
+    .inspect(|(device, _, _)| {
+      slates_bridge_virtiofs::serve::request_revoke(*device);
+    })
+    .count()
+}
+
 /// Asks the device loop serving attachment record `attachment` to revoke (its `detach`, or its volume's
 /// destroy): the loop checks at its next pass boundary and runs its terminal step. Whether one was asked.
 pub(crate) fn revoke_attachment_device(s: &ShardState, attachment: u64) -> bool {

@@ -1621,3 +1621,123 @@ fn run_and_measure(guest: &(String, String, String), theirs: std::os::fd::OwnedF
   );
   console
 }
+
+/// The guest's script for a destroy: one GETATTR answered, then, after `destroyed`, a second submitted and
+/// kicked, and whether it was answered within five heartbeats.
+fn destroy_script(
+  answered_first: std::sync::mpsc::Sender<i32>,
+  destroyed: std::sync::mpsc::Receiver<()>,
+) -> impl FnOnce(
+  std::os::fd::OwnedFd,
+  std::os::fd::OwnedFd,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+  move |kick_write, call_read| {
+    Box::pin(async move {
+      let first = round_trip(&kick_write, &call_read, &getattr_message(1, 1)).await;
+      let _ = answered_first.send(reply_error(&first));
+      until(destroyed).await;
+      common::guest::with_guest(|g| {
+        g.submit(&getattr_message(2, 1), common::guest::REPLY_CAP);
+      });
+      let _ = rustix::io::write(&kick_write, &[1u8]);
+      slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS * REVOKED_WATCH_HEARTBEATS)
+        .await
+        .unwrap();
+      let answered = common::guest::with_guest(|g| g.reap()).is_some();
+      drop(kick_write);
+      answered
+    })
+  }
+}
+
+/// AUD-29-68–70 (a volume destroyed under its guest devices). Do: attach a guest device presenting the head, and
+/// in a second daemon run one presenting a snapshot; let each answer one request; destroy the volume; send each
+/// guest one more request. Expect: the destroy ends each device as a revocation — its terminal step sweeps its
+/// references under its still-live attachment (through its view, for the snapshot) — so no later request is
+/// answered, no reclaim is counted incomplete, and the device's record leaves with the volume.
+#[test]
+fn a_volume_destroyed_under_its_guest_devices_ends_them_cleanly() {
+  for presents_snapshot in [false, true] {
+    let (daemon, instance) = single_shard_daemon(if presents_snapshot {
+      "virtiofs-destroy-snapshot"
+    } else {
+      "virtiofs-destroy-head"
+    });
+    let mut client = Client::connect(&instance);
+    let ReplyBody::Created { id } = client.call(&scratch("destroyed")) else {
+      panic!("the volume was not created");
+    };
+    let snapshot = presents_snapshot.then(|| {
+      let ReplyBody::Snapshotted { id: snapshot, .. } =
+        client.call(&RequestBody::Snapshot { volume: id })
+      else {
+        panic!("snapshot");
+      };
+      snapshot
+    });
+    let (first_tx, first_rx) = channel::<i32>();
+    let (destroyed_tx, destroyed_rx) = channel::<()>();
+    let guest = common::guest::start_guest(
+      &daemon,
+      id,
+      Principal::Uid { uid: my_uid() },
+      slates_server::virtiofs::GuestView {
+        subtree: None,
+        snapshot,
+      },
+      destroy_script(first_tx, destroyed_rx),
+    );
+    assert_eq!(first_rx.recv_timeout(common::guest::WAIT), Ok(0));
+    assert_eq!(
+      client.call(&RequestBody::Destroy { volume: id }),
+      ReplyBody::Destroyed
+    );
+    let _ = destroyed_tx.send(());
+    assert_eq!(
+      guest.script.recv_timeout(common::guest::WAIT),
+      Ok(false),
+      "no request answered after the destroy (snapshot: {presents_snapshot})"
+    );
+    let outcome = guest.end.recv_timeout(common::guest::WAIT);
+    let Ok(GuestDeviceOutcome::Ended(end)) = &outcome else {
+      panic!("the device did not end: {outcome:?}");
+    };
+    assert_eq!(end.why, EndReason::Revoked, "snapshot: {presents_snapshot}");
+    assert!(
+      end
+        .reclaimed
+        .as_ref()
+        .is_ok_and(|r| r.references_swept && r.sweep_refused.is_none()),
+      "{end:?}"
+    );
+    let refusals = daemon.refusals_on_every_shard().unwrap();
+    assert_eq!(
+      refusals.get("virtiofs.reclaim_incomplete"),
+      None,
+      "{refusals:?}"
+    );
+    assert!(
+      the_volume_goes(&mut client, id),
+      "the deferred destroy completed once the device ended"
+    );
+    drop(client);
+    drop(daemon);
+  }
+}
+
+/// Whether `volume`'s destroy completes within the test's wait: `status` then refuses it.
+fn the_volume_goes(client: &mut Client, volume: slates_ipc::protocol::VolumeId) -> bool {
+  let deadline = Instant::now() + common::guest::WAIT;
+  while Instant::now() < deadline {
+    if matches!(
+      client.call(&RequestBody::Status { volume }),
+      ReplyBody::Refused { .. }
+    ) {
+      return true;
+    }
+    // The test thread polls the daemon over the ring; no runtime wheel serves this thread (D-9 allows a test).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(20));
+  }
+  false
+}

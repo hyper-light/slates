@@ -5163,10 +5163,15 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
       return refused(refusal_of_db(&e));
     }
   }
-  // The volume's snapshot views close first, unpinning the snapshots its destroy frees (AUD-29-76).
-  crate::snapshot_view::end_all_of(state, record.id);
-  if let Ok(slot) = state.volumes.get_mut(handle)
-    && let Err(e) = slot.volume.destroy(&mut state.store)
+  // The volume's guest devices are revoked first (AUD-29-68): each ends at its next pass boundary, its terminal
+  // step sweeping its references through its volume or view while they still exist. The teardown waits for
+  // them (`step_destroys` starts it once none serves the volume); with none, it starts now.
+  #[cfg(unix)]
+  let devices_serving = crate::virtiofs::revoke_volume_devices(state, record.id);
+  #[cfg(not(unix))]
+  let devices_serving = 0;
+  if devices_serving == 0
+    && let Err(e) = start_teardown(state, handle, record.id)
   {
     return refused(refusal_of_vfs(&e));
   }
@@ -5219,6 +5224,47 @@ pub(crate) fn reconcile_unpublished_effects(state: &mut ShardState) -> usize {
   orphans.len()
 }
 
+/// Begins a destroying volume's teardown: its snapshot views close first, unpinning the snapshots the destroy
+/// frees (AUD-29-76), then its objects are queued for the cooperative destroy.
+fn start_teardown(
+  state: &mut ShardState,
+  handle: Handle<VolumeSlot>,
+  volume: DbVolumeId,
+) -> Result<(), slates_vfs::VfsError> {
+  crate::snapshot_view::end_all_of(state, volume);
+  match state.volumes.get_mut(handle) {
+    Ok(slot) => slot.volume.destroy(&mut state.store),
+    Err(_) => Ok(()),
+  }
+}
+
+/// Whether a destroying volume's teardown may run now: begun already, or begun here because no guest device
+/// serves the volume any more. A volume a device still serves waits (its device ends at its next pass).
+fn teardown_started(
+  state: &mut ShardState,
+  handle: Handle<VolumeSlot>,
+  volume: DbVolumeId,
+) -> bool {
+  if state
+    .volumes
+    .get(handle)
+    .is_ok_and(|slot| slot.volume.is_destroying())
+  {
+    return true;
+  }
+  #[cfg(unix)]
+  if crate::virtiofs::revoke_volume_devices(state, volume) > 0 {
+    return false;
+  }
+  if let Err(e) = start_teardown(state, handle, volume) {
+    *state
+      .refusals
+      .entry(refusal_name(&refusal_of_vfs(&e)))
+      .or_insert(0) += 1;
+  }
+  true
+}
+
 /// One cooperative destroy slice per destroying volume; a finished one leaves the tables.
 pub fn step_destroys(state: &mut ShardState) -> bool {
   let budget = state
@@ -5240,6 +5286,11 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
     .collect();
   let mut any = false;
   for (id, handle) in destroying {
+    // A volume whose guest devices still serve it waits for their ends (the round keeps running meanwhile).
+    if !teardown_started(state, handle, id) {
+      any = true;
+      continue;
+    }
     let done = match state.volumes.get_mut(handle) {
       Ok(slot) => matches!(
         slot.volume.destroy_step(&mut state.store, budget.max(1)),
