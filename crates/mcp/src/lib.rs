@@ -959,14 +959,17 @@ pub fn residency_name(residency: Residency) -> &'static str {
 const PROTECTED: &str = "daemon_ram";
 
 /// Where a transport's bytes reach beyond what slates protects (AUD-29-77): caches and memory of others —
-/// the host kernel's page cache, the container runtime's VM, the guest's page cache — which may be swapped,
-/// dumped or snapshotted by their owners. A protected export is not a protected workload.
+/// the host kernel's page cache, the container runtime's VM, the guest's memory — which may be swapped,
+/// dumped or snapshotted by their owners. A protected export is not a protected workload. A guest's memory is
+/// the VMM's: its page cache and the very buffers the device copies replies into live there, and the device
+/// maps it (vhost-user) or is handed it (in-process) without locking any of it — measured: the live guest's
+/// mapping in the daemon held resident pages with 0 kB locked (`a_linux_guest_mounts_the_volume_through_qemu_over_vhost_user`).
 pub fn beyond_protection(residency: Residency) -> &'static [&'static str] {
   match residency {
     Residency::DaemonRam => &[],
     Residency::DaemonRamAndKernelCache => &["host_kernel_cache"],
     Residency::DaemonRamKernelCacheAndRuntimeVm => &["host_kernel_cache", "runtime_vm"],
-    Residency::DaemonRamAndGuestPageCache { .. } => &["guest_page_cache"],
+    Residency::DaemonRamAndGuestPageCache { .. } => &["guest_memory"],
   }
 }
 

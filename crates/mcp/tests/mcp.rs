@@ -788,8 +788,8 @@ fn assert_unauthorized_calls_have_no_effect(port: u16, instance: &str, token: &s
 
 /// AUD-29-77: every transport's residency says what slates protects — the daemon's own RAM, locked and kept out
 /// of dumps — and what else the bytes reach beyond it, which slates does not protect: nothing for a record
-/// form, the kernel's page cache for a host mount, the runtime's VM for a container, the guest's page cache
-/// for a guest. A protected export is never reported as a protected workload.
+/// form, the kernel's page cache for a host mount, the runtime's VM for a container, the guest's memory (the
+/// VMM's, its page cache and the device's reply buffers within it) for a guest. A protected export is never reported as a protected workload.
 fn assert_residency_names_what_slates_protects(stat: &Value) {
   for capability in stat["transports"]["capabilities"].as_array().unwrap() {
     let residency = &capability["residency"];
@@ -804,7 +804,7 @@ fn assert_residency_names_what_slates_protects(stat: &Value) {
       "daemon_ram" => &[],
       "daemon_ram_and_kernel_cache" => &["host_kernel_cache"],
       "daemon_ram_kernel_cache_and_runtime_vm" => &["host_kernel_cache", "runtime_vm"],
-      "daemon_ram_and_guest_page_cache" => &["guest_page_cache"],
+      "daemon_ram_and_guest_page_cache" => &["guest_memory"],
       other => panic!("an unknown residency {other}"),
     };
     assert_eq!(beyond, expected, "{capability}");

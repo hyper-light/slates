@@ -1109,6 +1109,70 @@ fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
 #[cfg(target_os = "linux")]
 const GUEST_RUN: Duration = Duration::from_secs(200);
 
+/// Shape: the live guest's RAM in kibibytes (`-m 256M`), the size by which its mapping is found in this
+/// process's `smaps`.
+#[cfg(target_os = "linux")]
+const GUEST_RAM_KIB: u64 = 256 * 1024;
+
+/// One mapping of the guest's memory object in this process (the daemon's device maps it here), as the kernel
+/// accounts it: resident and locked kibibytes.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+struct GuestMapping {
+  rss_kib: u64,
+  locked_kib: u64,
+}
+
+/// Every mapping of a memory object the size of the guest's RAM in this process (`/proc/self/smaps`: a header
+/// naming `memfd:`, then its `Size`, `Rss` and `Locked` lines).
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // procfs: the kernel's account of this process, not a host path (R1).
+fn guest_memory_mappings() -> Vec<GuestMapping> {
+  let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
+  let field = |line: &str, name: &str| {
+    line
+      .strip_prefix(name)
+      .and_then(|rest| rest.trim().strip_suffix("kB"))
+      .and_then(|kib| kib.trim().parse::<u64>().ok())
+  };
+  // A mapping's header begins with its address range (`start-end`, hex); its fields follow until the next.
+  let is_header = |line: &str| {
+    line.split_whitespace().next().is_some_and(|range| {
+      range.contains('-') && range.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+    })
+  };
+  let mut found = Vec::new();
+  let mut current: Option<(u64, GuestMapping)> = None;
+  let mut finish = |current: &mut Option<(u64, GuestMapping)>| {
+    if let Some((size, mapping)) = current.take()
+      && size == GUEST_RAM_KIB
+    {
+      found.push(mapping);
+    }
+  };
+  for line in smaps.lines() {
+    if is_header(line) {
+      finish(&mut current);
+      current = line
+        .contains("memfd:")
+        .then(|| (0, GuestMapping::default()));
+      continue;
+    }
+    let Some((size, mapping)) = current.as_mut() else {
+      continue;
+    };
+    if let Some(kib) = field(line, "Size:") {
+      *size = kib;
+    } else if let Some(kib) = field(line, "Rss:") {
+      mapping.rss_kib = kib;
+    } else if let Some(kib) = field(line, "Locked:") {
+      mapping.locked_kib = kib;
+    }
+  }
+  finish(&mut current);
+  found
+}
+
 /// The live guest's paths, from the environment: QEMU, the guest kernel and its initramfs (whose init mounts
 /// the tag `slates`, reads `from-host.txt`, writes `from-guest.txt`, makes `guest-dir`, unmounts and powers
 /// off), or a loud skip.
@@ -1136,6 +1200,7 @@ fn live_guest() -> Option<(String, String, String)> {
 fn run_qemu(
   (qemu, kernel, initrd): &(String, String, String),
   socket: &std::os::fd::OwnedFd,
+  sample: &mut dyn FnMut(&[GuestMapping]),
 ) -> String {
   use std::os::fd::AsRawFd;
   // The child inherits the descriptor at its own number (QEMU's `fd=` option names it).
@@ -1175,6 +1240,7 @@ fn run_qemu(
   let started = Instant::now();
   let mut timed_out = false;
   while child.try_wait().unwrap().is_none() {
+    sample(&guest_memory_mappings());
     if started.elapsed() > GUEST_RUN {
       let _ = child.kill();
       timed_out = true;
@@ -1230,8 +1296,7 @@ fn a_linux_guest_mounts_the_volume_through_qemu_over_vhost_user() {
   .unwrap();
   let boot_ns = u64::try_from(GUEST_RUN.as_nanos()).unwrap();
   let ended = attach_vhost(&daemon, id, (ours, boot_ns));
-  let console = run_qemu(&guest, &theirs);
-  drop(theirs);
+  let console = run_and_measure(&guest, theirs);
   if !console.contains("SLATES-GUEST-OK") {
     let outcome = ended.recv_timeout(common::guest::WAIT);
     panic!("the guest did not finish; the device: {outcome:?}\n{console}");
@@ -1524,4 +1589,35 @@ fn assert_the_detach_ends_the_device(
   };
   assert_eq!(end.why, EndReason::Revoked);
   assert!(end.reclaimed.as_ref().is_ok_and(|r| r.references_swept));
+}
+
+/// Runs the live guest over `theirs` while sampling this process's mappings of its memory (AUD-29-77): the device
+/// must have mapped it and locked none of it; the peak resident size is printed for the record. The console.
+#[cfg(target_os = "linux")]
+fn run_and_measure(guest: &(String, String, String), theirs: std::os::fd::OwnedFd) -> String {
+  let mut peak = GuestMapping::default();
+  let mut mapped = false;
+  let console = run_qemu(guest, &theirs, &mut |mappings: &[GuestMapping]| {
+    for mapping in mappings {
+      mapped = true;
+      peak.rss_kib = peak.rss_kib.max(mapping.rss_kib);
+      peak.locked_kib = peak.locked_kib.max(mapping.locked_kib);
+    }
+  });
+  drop(theirs);
+  // AUD-29-77, measured: the device mapped the VMM's guest memory and locked none of it; what it touched is
+  // printed for the record.
+  eprintln!(
+    "guest memory mapped by the device: peak resident {} KiB of {GUEST_RAM_KIB} KiB, locked {} KiB",
+    peak.rss_kib, peak.locked_kib
+  );
+  assert!(
+    mapped,
+    "the device's mapping of the guest's memory was seen"
+  );
+  assert_eq!(
+    peak.locked_kib, 0,
+    "slates locks none of the guest's memory"
+  );
+  console
 }

@@ -1934,6 +1934,10 @@ must exercise local communication and isolation between clones as well as namesp
 > `vhost-user-fs-pci` mounting the tag and exchanging files with the host. Owed: the live guest in CI, §6's workloads in
 > the guest.
 
+> **Status (2026-10-01, AUD-29-77: guest memory).** A guest's residency names the VMM's memory, not only the guest's
+> page cache, as beyond what slates protects. Measured on the live guest: the device's mapping of a 256 MiB guest
+> peaked at about 0.5 MiB resident, with 0 KiB locked.
+
 > **Status (2026-10-01, AUD-29-68: guest records).** A guest device is an attachment like any other. Its record
 > (consumer `Guest`, form `GuestTag`) is committed at admission and removed when the device ends. `status`
 > counts it, `detach` revokes its device, `advance` moves a snapshot device's view, and recovery ends the record
