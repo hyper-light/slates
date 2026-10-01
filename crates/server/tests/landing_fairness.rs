@@ -296,9 +296,15 @@ fn files_to_outlast(
   let began = Instant::now();
   let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
   let took = began.elapsed();
+  // A refusal reports what the daemon knew, so a machine-dependent refusal (the macOS runner answered
+  // `NoSpace`, 2026-10-01, where this machine lands) names its source in the CI log.
   assert!(
     matches!(landed, Ok(Landing::Landed(_))),
-    "the calibration landing: {landed:?}"
+    "the calibration landing: {landed:?}; volume {:?}; refusals {:?}; reserve per shard {} bytes over {} shards",
+    client.status(volume),
+    daemon.fleet_refusals(),
+    daemon.config().reserve_per_shard,
+    daemon.config().geometry.partitions,
   );
   // Its charge goes back to the shard for the landing it sizes.
   client.destroy(volume).unwrap();

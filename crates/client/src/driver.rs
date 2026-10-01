@@ -68,6 +68,10 @@ struct Call {
   /// Whether it is waited for while the daemon lives ([`crate::defers_reply`]): its deadline asks
   /// the daemon's liveness and restarts, never fails it `Stalled`.
   patient: bool,
+  /// Whether its reply was reported [`Event::Ready`] and the binding has not finished it yet: the client
+  /// holds a reply until it is taken, so a pump would otherwise report it again — twice in one loop step when
+  /// the step's tick pumps after its pump, the second event finding the reply already taken.
+  reported: bool,
 }
 
 /// A lost channel's recovery.
@@ -181,6 +185,7 @@ impl Driver {
         word: sent,
         sent: Instant::now(),
         resend: false,
+        reported: false,
         patient,
       },
     );
@@ -218,13 +223,17 @@ impl Driver {
       Ok(ready) => ready,
       Err(error) => return self.fail_all(client, &error),
     };
+    // A ready call is reported once, until the binding finishes it (or a reconnect sends it again).
     let mut events: Vec<Event> = ready
       .into_iter()
       .filter_map(|word| {
-        self.by_word.get(&word).map(|ticket| Event::Ready {
-          ticket: *ticket,
-          word,
-        })
+        let ticket = *self.by_word.get(&word)?;
+        let call = self.calls.get_mut(&ticket)?;
+        if call.reported {
+          return None;
+        }
+        call.reported = true;
+        Some(Event::Ready { ticket, word })
       })
       .collect();
     self.resend_and_admit(client, &mut events);
@@ -370,6 +379,7 @@ impl Driver {
         for call in self.calls.values_mut() {
           if call.word.is_some() {
             call.resend = true;
+            call.reported = false;
           } else {
             call.sent = now;
           }

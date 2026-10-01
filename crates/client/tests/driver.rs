@@ -90,7 +90,12 @@ impl Ticker {
             driver.finish(ticket);
             self.ended.insert(
               ticket,
-              reply.map(|body| assert!(matches!(body, Some(ReplyBody::Listed { .. })))),
+              reply.map(|body| {
+                assert!(
+                  matches!(body, Some(ReplyBody::Listed { .. })),
+                  "a list answered {body:?}"
+                );
+              }),
             );
           }
           Event::Failed { ticket, error } => {
@@ -356,4 +361,54 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
     step_bound(),
     noise
   );
+}
+
+/// Do: submit one list call, wait until its reply is on the ring, then pump twice before finishing it — as a
+/// binding's loop does when its pump and its timer's tick fall in one step (the tick pumps first). Expect: the
+/// first pump reports the call ready once, the second reports nothing, and the reply is the call's. Before, the
+/// second pump reported it again (the client's ready set holds a reply until it is taken), so the loop took the
+/// reply on the first event and found nothing on the second — the Linux CI failure of
+/// `every_call_ends_and_the_loop_is_never_held_across_restart_and_death` (`a list answered None`), 2026-10-01.
+#[test]
+fn a_ready_call_is_reported_once_until_it_is_finished() {
+  let instance = format!("cl-driver-once-{}", std::process::id());
+  let anchor = Anchor::new(&instance);
+  let daemon = anchor.start();
+  let mut ticker = Ticker::default();
+  let mut client = connect_from_the_loop(&instance, &mut ticker);
+  let mut driver = Driver::new(&client);
+  let ticket = driver
+    .submit(
+      &mut client,
+      Box::new(|client: &mut Client| client.list_begin()),
+    )
+    .unwrap();
+  let started = Instant::now();
+  let first = loop {
+    let events = driver.pump(&mut client);
+    if !events.is_empty() || started.elapsed() > START_WAIT {
+      break events;
+    }
+    std::hint::spin_loop();
+  };
+  let second = driver.pump(&mut client);
+  let [
+    Event::Ready {
+      ticket: ready,
+      word,
+    },
+  ] = first.as_slice()
+  else {
+    panic!("one ready event for the call: {first:?}");
+  };
+  assert_eq!(*ready, ticket);
+  assert!(
+    second.is_empty(),
+    "reported again before it was finished: {second:?}"
+  );
+  let reply = client.poll_reply_word(*word).unwrap();
+  assert!(matches!(reply, Some(ReplyBody::Listed { .. })), "{reply:?}");
+  driver.finish(ticket);
+  assert!(driver.is_idle());
+  daemon.stop();
 }
