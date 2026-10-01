@@ -2902,6 +2902,22 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     &self.grant
   }
 
+  /// The lease the landing runs under.
+  pub fn lease(&self) -> &LandingLease {
+    &self.lease
+  }
+
+  /// Renews the landing's lease with `renewed`, its holder's own re-take of the same target (the keepalive
+  /// between slices, AUD-29-25): its entries are fenced by the renewed term from here on. Refused — the lease
+  /// kept as it was — for a lease on another target or of another holder; whether it was taken.
+  pub fn renew_lease(&mut self, renewed: LandingLease) -> bool {
+    if renewed.target != self.lease.target || renewed.holder != self.lease.holder {
+      return false;
+    }
+    self.lease = renewed;
+    true
+  }
+
   /// Whether the run has returned its outcome.
   pub fn ended(&self) -> bool {
     matches!(self.phase, Phase::Ended)

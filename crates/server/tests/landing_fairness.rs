@@ -133,3 +133,72 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
     "no slice was more than half the landing ({longest_slice:?} of {took:?})"
   );
 }
+
+/// Shape: the files in the keepalive test's landing — enough that it outlasts its lease's term on any disk.
+const FILES_PAST_TERM: usize = 1_500;
+/// Shape: the keepalive test's lease term (the daemon's failover bound): a second, which the landing outlasts,
+/// with a half-term renewal margin of 500 ms — past the longest single unit measured here (a 205 ms `fsync`
+/// stall, `docs/wip/BENCHMARKS.md`, 2026-10-01).
+const SHORT_TERM_NS: u64 = 1_000_000_000;
+
+/// AUD-29-25 (the lease keepalive). Do: on a daemon whose landing lease term is one second, land 1,500 files —
+/// longer than the term — under a grant. Expect: the landing is done with every file written, having renewed
+/// its lease between slices at least once; without the renewal its entries past the term were skipped
+/// (`LeaseEnded`) and it ended partial.
+#[test]
+fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-renewland-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_failover_slo(SHORT_TERM_NS);
+  let landing_deadlines = slates_client::Deadlines {
+    reply_ns: SHORT_TERM_NS.saturating_mul(u64::try_from(FILES_PAST_TERM).unwrap()),
+    ..common::landing::deadlines()
+  };
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-renewland-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = target_dir();
+  let mut client = slates_client::Client::connect(&instance, landing_deadlines).unwrap();
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let volume = client.create(&scratch(VOLUME)).unwrap();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(VOLUME).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let mut xid = 2u32;
+  for n in 0..FILES_PAST_TERM {
+    let file = create(&mut stream, &root, &format!("f{n:04}"), xid);
+    write(&mut stream, &file, format!("file {n}").as_bytes(), xid + 1);
+    xid += 2;
+  }
+  let grant = approve(&mut client, &secret, volume, None, &target.path);
+  let began = Instant::now();
+  let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
+  let took = began.elapsed();
+  let counters = daemon.fleet_refusals().unwrap();
+  daemon.stop();
+  let renewed = counters.get("landing.lease_renewed").copied().unwrap_or(0);
+  let Ok(Landing::Landed(outcome)) = landed else {
+    panic!("the granted landing: {landed:?}");
+  };
+  eprintln!(
+    "landing of {FILES_PAST_TERM} files: {took:?} under a {SHORT_TERM_NS} ns term, {renewed} renewals: {} written, {}",
+    outcome.written, outcome.state
+  );
+  assert!(
+    took > std::time::Duration::from_nanos(SHORT_TERM_NS),
+    "the landing outlasted its term ({took:?}), or the test proves nothing"
+  );
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, u64::try_from(FILES_PAST_TERM).unwrap());
+  assert!(renewed >= 1, "the lease was renewed between slices");
+}

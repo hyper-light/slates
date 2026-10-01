@@ -86,10 +86,22 @@ Now:
   crash inside every chunk write resumes to the reference. The daemon's 2 MiB partly-edited base file lands
   through it too.
 
+## The lease keepalive (the same day)
+
+A landing's target lease had a term of the failover bound and nothing renewed it, so a landing longer
+than the term skipped its remaining entries (`LeaseEnded`) and ended partial. Now:
+- **Renewal between slices.** Once half its term has passed, the landing's task re-takes the lease on the
+  control shard as its own holder, and the run is fenced by the renewed term (`LandingRun::renew_lease`,
+  which accepts only the same target and holder).
+- **A lost lease stays lost.** A lease another attempt took meanwhile is not renewed; the run's per-entry
+  fence then stops its writes as before.
+- **Counted either way** (`landing.lease_renewed`, `landing.lease_not_renewed`).
+- **Test:** `a_landing_longer_than_its_lease_term_renews_it_and_lands_everything`. Under a 1 s term,
+  1,500 files land in 1.57 s with one renewal, all written, `done`. With the renewal removed: 1.07 s,
+  1,040 of 1,500 written, `partial`.
+
 ## Owed (AUD-29-25 open in part)
 
-- **The landing lease is not renewed.** Its term is still the failover bound; the run can now renew it
-  between slices (the keepalive the lease records wait on).
 - **The p99/p999 shard-step distribution under a landing is not yet recorded.** It belongs with the R9
   provisioning histogram as a lane.
 

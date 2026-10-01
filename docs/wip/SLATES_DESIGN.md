@@ -4762,8 +4762,8 @@ stays in the overlay.
 > live-lease and paused-holder histories; four control-shard tests; a daemon test where two shards'
 > volumes, one through macOS's firmlinked spelling, are refused naming the one holder and then both land;
 > and a restart test where a lease taken under the first daemon refuses a landing under the second until
-> its term. The term is still the failover bound with no keepalive (the measured term and its renewal come
-> with the sliced engine, AUD-29-25), and the record is not yet written to the host's candidate holders.
+> its term. The term is still the failover bound; since 2026-10-01 a running landing renews it between its
+> slices (AUD-29-25). The record is not yet written to the host's candidate holders.
 > Record: `docs/bugs/2026-09-29-a-target-landing-lease-was-per-shard-and-per-path.md`.
 
 > **Status (2026-10-01, AUD-29-25 in part).** A granted landing runs in slices.
@@ -4775,7 +4775,9 @@ stays in the overlay.
 > - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
 > - **One at a time.** One granted landing per volume runs at a time.
 > - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
-> - **Owed:** the lease keepalive between slices, and the shard-step percentile lane
+> - **The lease keepalive.** A running landing renews its target lease between slices once half its term
+>   has passed.
+> - **Owed:** the shard-step percentile lane
 >   (`docs/bugs/2026-10-01-a-granted-landing-held-its-shard-for-all-of-its-work.md`).
 >
 > **Status (2026-09-29, A-46, AUD-29-07).** A presented landing is consumed by the landing its grant

@@ -725,7 +725,15 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
     )
     .await;
     let held = taken.is_ok();
-    let finished = drive_granted_landing(prepared, taken, request, cause).await;
+    let renew = LeaseAsk {
+      shard,
+      control,
+      holder,
+      term,
+      deadline,
+    };
+    let finished =
+      drive_granted_landing(prepared, taken, request, cause, (renew, key.clone())).await;
     // The lease goes before the reply, so the caller's next landing into the target finds it free.
     let released = !held
       || crate::xshard::call_within(
@@ -828,6 +836,7 @@ async fn drive_granted_landing(
   lease: Result<LandingLease, Refusal>,
   request: (u64, slates_wire::request::RequestId),
   cause: Option<slates_wire::observe::SpanContext>,
+  (renew, key): (LeaseAsk, String),
 ) -> Option<(ReplyBody, Option<crate::merge_service::ReplyRoute>)> {
   let begun = crate::state::with_state(move |s| begin_granted(s, prepared, lease))?;
   let mut granted = match begun {
@@ -847,6 +856,7 @@ async fn drive_granted_landing(
     let stepped = crate::state::with_state(|s| step_granted(s, &mut granted))?;
     match stepped {
       Stepped::More => {
+        keep_lease_alive(&mut granted, renew, &key).await;
         slates_rt::futures::yield_now().await;
       }
       Stepped::Ready => {
@@ -864,6 +874,58 @@ async fn drive_granted_landing(
     }
   }
 }
+
+/// Format: how much of its term a landing's lease has left when the landing renews it, in permille — half:
+/// the margin then covers a slice and the renewal's round trip to the control shard, each far shorter than
+/// the term, while a landing renews at most twice a term.
+#[cfg(unix)]
+const RENEW_AT_REMAINING_PERMILLE: u64 = 500;
+
+/// The keepalive between a landing's slices (AUD-29-25; the lease records waited for it): once half its
+/// lease's term has passed, the landing re-takes the lease on the control shard as its own holder and runs
+/// under the renewed term. A lease another attempt took meanwhile (this one's ended) is not renewed; the run's
+/// own per-entry fence then stops its writes, as before. Counted either way.
+#[cfg(unix)]
+async fn keep_lease_alive(granted: &mut GrantedRun, ask: LeaseAsk, key: &str) {
+  let expires_ns = granted.run.lease().expires_ns;
+  let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
+  let Some(now) = crate::state::with_state(|s| s.clock.monotonic_ns()) else {
+    return;
+  };
+  if now.saturating_add(margin) < expires_ns {
+    return;
+  }
+  let target = key.to_owned();
+  let deadline = now.saturating_add(ask.term);
+  let renewed = crate::xshard::call_within(
+    ask.shard,
+    ask.control,
+    move |s| take_target_lease(s, target, ask.holder, ask.term, deadline),
+    ask.term,
+  )
+  .await;
+  let kept = match renewed {
+    Some(Ok(lease)) => granted.run.renew_lease(lease),
+    _ => false,
+  };
+  crate::state::with_state(|s| {
+    let counter = if kept {
+      LEASE_RENEWED
+    } else {
+      LEASE_NOT_RENEWED
+    };
+    *s.refusals.entry(counter).or_insert(0) += 1;
+  });
+}
+
+/// Format: the landing-plane counter of a lease a running landing renewed between its slices.
+#[cfg(unix)]
+const LEASE_RENEWED: &str = "landing.lease_renewed";
+
+/// Format: the landing-plane counter of a lease a running landing could not renew (another attempt holds the
+/// target, or the control shard did not answer): its term then ends the landing's writes.
+#[cfg(unix)]
+const LEASE_NOT_RENEWED: &str = "landing.lease_not_renewed";
 
 /// Begins a granted landing on its owner shard: its id and request, the head's implicit snapshot for an
 /// unnamed landing, the writer (inside an overlay's own base host), and the engine's plan, grant and lease
