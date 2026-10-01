@@ -7,7 +7,7 @@
 
 use std::cell::{Cell, RefCell};
 
-use crate::memory::{GuestAddr, GuestMemory, GuestMemoryError, GuestRange};
+use crate::memory::{Edge, GuestAddr, GuestMemory, GuestMemoryError, GuestRange};
 
 /// Shape: the access log keeps this many entries before it stops recording (and counts what it
 /// dropped): 65 536, twice the largest queue's descriptor count, so any single test's history
@@ -33,6 +33,9 @@ pub struct Access {
 pub struct SimGuestMemory {
   regions: Vec<SimRegion>,
   log: RefCell<Option<Vec<Access>>>,
+  /// The ordering edges asked for while recording, each with the number of accesses recorded before it, so
+  /// a test reads where each edge falls among the accesses (AUD-29-72).
+  edges: RefCell<Vec<(usize, Edge)>>,
   dropped: Cell<u64>,
   reads: Cell<u64>,
   writes: Cell<u64>,
@@ -67,6 +70,7 @@ impl SimGuestMemory {
     SimGuestMemory {
       regions: Vec::new(),
       log: RefCell::new(None),
+      edges: RefCell::new(Vec::new()),
       dropped: Cell::new(0),
       reads: Cell::new(0),
       writes: Cell::new(0),
@@ -98,7 +102,13 @@ impl SimGuestMemory {
   /// Starts (or stops) recording every access; starting clears the log.
   pub fn record_accesses(&mut self, on: bool) {
     *self.log.borrow_mut() = on.then(Vec::new);
+    self.edges.borrow_mut().clear();
     self.dropped.set(0);
+  }
+
+  /// The ordering edges asked for while recording, each with how many accesses were recorded before it.
+  pub fn edges(&self) -> Vec<(usize, Edge)> {
+    self.edges.borrow().clone()
   }
 
   /// The recorded accesses so far, oldest first (empty when not recording).
@@ -198,5 +208,21 @@ impl GuestMemory for SimGuestMemory {
     self.writes.set(self.writes.get().saturating_add(1));
     self.record(range, true);
     Ok(())
+  }
+
+  fn order(&self, edge: Edge) {
+    // One address space: the matching fence of the language's memory model is the edge itself.
+    std::sync::atomic::fence(match edge {
+      Edge::Acquire => std::sync::atomic::Ordering::Acquire,
+      Edge::Release => std::sync::atomic::Ordering::Release,
+      Edge::Full => std::sync::atomic::Ordering::SeqCst,
+    });
+    let recorded = self.log.borrow().as_ref().map(Vec::len);
+    if let Some(at) = recorded {
+      let mut edges = self.edges.borrow_mut();
+      if edges.len() < ACCESS_LOG_CAP {
+        edges.push((at, edge));
+      }
+    }
   }
 }

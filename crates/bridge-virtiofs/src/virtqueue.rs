@@ -25,8 +25,8 @@
 use std::fmt;
 
 use crate::memory::{
-  GuestAddr, GuestMemory, GuestMemoryError, GuestRange, read_u16, read_u32, read_u64, write_bytes,
-  write_u16,
+  Edge, GuestAddr, GuestMemory, GuestMemoryError, GuestRange, read_u16, read_u32, read_u64,
+  write_bytes, write_u16,
 };
 
 /// Format: virtio 1.2 §2.7.5 — one descriptor is `addr` (le64), `len` (le32), `flags` (le16),
@@ -522,6 +522,8 @@ impl Virtqueue {
   /// `VIRTQ_AVAIL_F_NO_INTERRUPT` to ask for one; without `VIRTIO_F_EVENT_IDX` that flag is the
   /// whole rule).
   pub fn interrupts_wanted(&self, memory: &dyn GuestMemory) -> Result<bool, VirtqueueError> {
+    // The suppression is read no earlier than the used index it answers (§2.7.10; AUD-29-72).
+    memory.order(Edge::Full);
     let flags = read_u16(memory, self.layout.available_ring)?;
     Ok(flags & VIRTQ_AVAIL_F_NO_INTERRUPT == 0)
   }
@@ -555,6 +557,8 @@ impl Virtqueue {
     if pending == 0 {
       return Ok(None);
     }
+    // What the index covers is read only after it (the driver's barrier before its update, paired; AUD-29-72).
+    memory.order(Edge::Acquire);
     if pending > self.layout.size {
       return Err(self.record_fault(VirtqueueError::AvailableIndexAhead {
         pending,
@@ -607,6 +611,8 @@ impl Virtqueue {
     bytes[..size_of::<u32>()].copy_from_slice(&u32::from(chain.head).to_le_bytes());
     bytes[size_of::<u32>()..].copy_from_slice(&written.to_le_bytes());
     write_bytes(memory, element, &bytes)?;
+    // The reply and the element are visible before the index that publishes them (§2.7.8.2; AUD-29-72).
+    memory.order(Edge::Release);
     self.next_used = self.next_used.wrapping_add(1);
     write_u16(
       memory,

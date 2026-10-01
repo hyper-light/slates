@@ -102,6 +102,9 @@ impl GuestMemory for SharedGuestMemory {
   fn write(&mut self, range: GuestRange, bytes: &[u8]) -> Result<(), GuestMemoryError> {
     with_guest(|g| g.memory.write(range, bytes))
   }
+  fn order(&self, edge: slates_bridge_virtiofs::memory::Edge) {
+    with_guest(|g| g.memory.order(edge));
+  }
 }
 
 /// A VMM seam over two pipes: the kick (its read end is the doorbell) and the call (its write end

@@ -142,9 +142,29 @@ impl fmt::Display for GuestMemoryError {
 
 impl std::error::Error for GuestMemoryError {}
 
+/// An ordering edge the device asks of guest memory at the points the virtio ring protocol names (virtio 1.2
+/// §2.7; AUD-29-72). The device runs in another address space's view of memory a guest's CPUs write
+/// concurrently, so source order alone orders nothing; each seam makes its edge true for its own mapping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+  /// After the device read the driver's available index and found new entries: every later read of the ring
+  /// entries and descriptors that index covers observes the driver's writes made before it published the
+  /// index (the driver's barrier before its `idx` update, §2.7.13.3, paired).
+  Acquire,
+  /// Before the device writes its used index: the reply bytes and the used element are visible to the driver
+  /// before the index that publishes them (§2.7.8.2).
+  Release,
+  /// Between publishing the used index and reading the driver's notification suppression: the read observes
+  /// the driver's state no earlier than the publication (§2.7.10), so an interrupt the driver asked for after
+  /// seeing the index is never missed.
+  Full,
+}
+
 /// The memory a guest can see, as the device may touch it: bounded, checked copies of one range at
 /// a time. `check` is the question every access asks first; an implementation answers it without
-/// touching a byte, so a refused range is never accessed.
+/// touching a byte, so a refused range is never accessed. The device copies a descriptor chain whole before
+/// it uses it and reads each request byte once, so a guest that rewrites a descriptor or a request mid-pass
+/// changes nothing the device acts on; the ring protocol's ordering is the seam's [`GuestMemory::order`].
 pub trait GuestMemory {
   /// Whether `range` lies wholly inside one mapped region; refused typed otherwise. Touches nothing.
   fn check(&self, range: GuestRange) -> Result<(), GuestMemoryError>;
@@ -154,6 +174,10 @@ pub trait GuestMemory {
   /// Copies `bytes`, which must be exactly `range.len()` bytes, into `range`; refused, with no byte
   /// written, when the range is outside guest memory or the buffer does not match.
   fn write(&mut self, range: GuestRange, bytes: &[u8]) -> Result<(), GuestMemoryError>;
+  /// Makes `edge` true between the accesses before it and the accesses after it (AUD-29-72). Required of
+  /// every seam: a mapping shared with a guest's CPUs needs the matching hardware fence, which no default
+  /// could choose for it.
+  fn order(&self, edge: Edge);
 }
 
 /// The guest range of a fixed-width field at `at`.

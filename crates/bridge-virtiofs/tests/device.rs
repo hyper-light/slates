@@ -664,6 +664,9 @@ impl GuestMemory for WithdrawnAfterValidation<'_> {
     }
     self.memory.write(range, bytes)
   }
+  fn order(&self, edge: slates_bridge_virtiofs::memory::Edge) {
+    self.memory.order(edge);
+  }
 }
 
 /// AUD-29-85. Do: post a CREATE whose reply buffer's memory fails the write after the chain was validated, so
@@ -911,5 +914,82 @@ fn a_buffer_aliasing_another_queues_ring_is_refused_before_access() {
     driver.read_u32(other_table),
     before,
     "the other queue's table is untouched"
+  );
+}
+
+/// Format: offsets inside the rings (virtio 1.2 §2.7.6, §2.7.8): the available ring's `idx` after its
+/// `flags`, and the used ring's `idx` and first element after its `flags`.
+const AVAIL_IDX_AT: u64 = 2;
+const USED_IDX_AT: u64 = 2;
+const USED_RING_AT: u64 = 4;
+
+/// AUD-29-72 (virtio 1.2 §2.7.8.2, §2.7.10, §2.7.13.3). Do: record the guest-memory accesses and ordering
+/// edges while the device serves one GETATTR. Expect: an acquire edge right after the available index is read
+/// and before any descriptor or request byte; a release edge after the reply and the used element are written
+/// and right before the used index is; a full edge after the used index and before the driver's notification
+/// flags are read. Before, the device asked the memory for no ordering at all.
+#[test]
+fn the_ring_protocol_asks_for_its_ordering_edges_where_virtio_puts_them() {
+  use slates_bridge_virtiofs::memory::Edge;
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let cx = context();
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let layout = driver.layout(rq);
+  driver.submit(
+    rq,
+    &message(Opcode::GetAttr.to_wire(), 1, 1, &[0u8; 16]),
+    REPLY_CAP,
+    1,
+  );
+  driver.memory.record_accesses(true);
+  serve(
+    &mut device,
+    FIRST_REQUEST_QUEUE,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    BATCH,
+  )
+  .unwrap();
+  let accesses = driver.memory.accesses();
+  let edges = driver.memory.edges();
+  let at = |start: u64, write: bool| {
+    accesses
+      .iter()
+      .position(|a| a.range.start().0 == start && a.write == write)
+      .unwrap_or_else(|| panic!("an access at {start:#x}"))
+  };
+  let edge = |kind: Edge| {
+    edges
+      .iter()
+      .find(|(_, e)| *e == kind)
+      .map(|(position, _)| *position)
+      .unwrap_or_else(|| panic!("a {kind:?} edge"))
+  };
+  let avail_idx = at(layout.available_ring.0 + AVAIL_IDX_AT, false);
+  let first_descriptor = at(layout.descriptor_table.0, false);
+  let used_element = at(layout.used_ring.0 + USED_RING_AT, true);
+  let used_idx = at(layout.used_ring.0 + USED_IDX_AT, true);
+  let flags = accesses
+    .iter()
+    .rposition(|a| a.range.start().0 == layout.available_ring.0 && !a.write)
+    .unwrap();
+  let acquire = edge(Edge::Acquire);
+  let release = edge(Edge::Release);
+  let full = edge(Edge::Full);
+  assert!(
+    avail_idx < acquire && acquire <= first_descriptor,
+    "acquire after the index, before the descriptors"
+  );
+  assert!(
+    used_element < release && release == used_idx,
+    "release after the element, right before the index"
+  );
+  assert!(
+    used_idx < full && full <= flags,
+    "full after the index, before the flags"
   );
 }
