@@ -193,7 +193,7 @@ impl Fixture {
   /// The names a readdir of `dir` lists through the bridge, without `.` and `..`.
   fn names(&mut self, dir: u64) -> BTreeSet<String> {
     self.bridge(|b, cx| {
-      b.readdir(oid(dir), cx, 0, 0)
+      b.readdir(oid(dir), cx, 0, 0, usize::MAX)
         .unwrap()
         .into_iter()
         .map(|e| e.name)

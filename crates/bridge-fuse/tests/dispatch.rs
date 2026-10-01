@@ -209,15 +209,17 @@ impl Bridge for Mock {
     _object: ObjectId,
     _cx: &OpContext,
     _fh: u64,
-    offset: u64,
+    cookie: u64,
+    _limit: usize,
   ) -> Result<Vec<DirEntry>, VfsError> {
-    if offset > 0 {
+    if cookie > 0 {
       return Ok(Vec::new());
     }
     Ok(vec![DirEntry {
       ino: 2,
       kind: Kind::File,
       name: "hello".to_owned(),
+      cookie: slates_vfs::FIRST_CHILD_COOKIE,
     }])
   }
   fn create(

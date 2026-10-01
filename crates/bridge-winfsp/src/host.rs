@@ -516,7 +516,8 @@ fn read_all_entries(
   object: ObjectId,
   fh: u64,
 ) -> Result<Vec<(String, FileInfo)>, VfsError> {
-  let rows = bridge.readdir(object, cx, fh, 0)?;
+  // WinFsp asks for the whole listing at once and applies its own marker.
+  let rows = bridge.readdir(object, cx, fh, 0, usize::MAX)?;
   let mut out = Vec::with_capacity(rows.len());
   for entry in rows {
     let info = match bridge.getattr(ObjectId::new(entry.ino, 0), cx) {

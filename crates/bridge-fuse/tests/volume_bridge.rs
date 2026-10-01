@@ -443,3 +443,144 @@ fn rename_setattr_and_statfs_dispatch_to_the_volume() {
   );
   assert!(ok(&out) && n > OUT_HEADER_LEN, "statfs ok");
 }
+
+/// A READDIR body (`fuse_read_in`): fh, the resume offset, the size, then fields the dispatch skips.
+fn readdir_body(offset: u64, size: u32) -> Vec<u8> {
+  let mut b = vec![0u8; 40];
+  b[8..16].copy_from_slice(&offset.to_le_bytes());
+  b[16..20].copy_from_slice(&size.to_le_bytes());
+  b
+}
+
+/// The `(off, name)` of each `fuse_dirent` in a READDIR reply of `n` bytes.
+fn dirents(out: &[u8], n: usize) -> Vec<(u64, String)> {
+  /// Format: `fuse_dirent`'s head (ino, off, namelen, type) and its alignment.
+  const HEAD: usize = 24;
+  const ALIGN: usize = 8;
+  let mut at = OUT_HEADER_LEN;
+  let mut found = Vec::new();
+  while at + HEAD <= n {
+    let off = u64::from_le_bytes(out[at + 8..at + 16].try_into().unwrap());
+    let len = usize::try_from(u32::from_le_bytes(
+      out[at + 16..at + 20].try_into().unwrap(),
+    ))
+    .unwrap();
+    let name = String::from_utf8(out[at + HEAD..at + HEAD + len].to_vec()).unwrap();
+    found.push((off, name));
+    at += (HEAD + len).next_multiple_of(ALIGN);
+  }
+  found
+}
+
+/// Shape: the files of the paged directory and a READDIR size that holds four of their entries.
+const LISTED_FILES: usize = 40;
+const SMALL_READDIR: u32 = 128;
+
+/// AUD-29-86. Do: through the dispatch, page a 40-file root with READDIRs of 128 bytes, each resuming from
+/// the `off` of the last entry the previous reply carried, until a reply carries none. Expect: `.`, `..` and
+/// every file exactly once — the kernel's resume offsets are the entries' cookies, and a page holds what fits.
+#[test]
+fn readdir_pages_resume_from_the_cookies_the_kernel_passes_back() {
+  use slates_bridge_core::Bridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = test_cx();
+  let root = bridge.root(&cx).unwrap();
+  for n in 0..LISTED_FILES {
+    bridge
+      .create(
+        slates_bridge_core::ObjectId::new(root, 0),
+        &cx,
+        &format!("file-{n:02}"),
+        0o644,
+        0,
+      )
+      .unwrap();
+  }
+  let mut out = vec![0u8; 4096];
+  let mut offset = 0;
+  let mut names = Vec::new();
+  for unique in 1.. {
+    let n = dispatch(
+      &message(
+        Opcode::ReadDir.to_wire(),
+        unique,
+        1,
+        &readdir_body(offset, SMALL_READDIR),
+      ),
+      &mut bridge,
+      &mut out,
+    );
+    assert!(ok(&out), "READDIR answered an error");
+    let page = dirents(&out, n);
+    let Some((last, _)) = page.last() else {
+      break;
+    };
+    offset = *last;
+    names.extend(page.into_iter().map(|(_, name)| name));
+  }
+  let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+  assert_eq!(names.len(), LISTED_FILES + 2, "no entry repeated");
+  assert_eq!(unique.len(), LISTED_FILES + 2, "every entry listed");
+}
+
+/// Format: `EOVERFLOW` (Linux).
+const EOVERFLOW: i32 = 75;
+
+/// AUD-29-86. Do: create two names whose cookies are equal (found by search over the volume's name hash)
+/// among 20 others, then READDIR from just before them with room for one of their entries. Expect:
+/// `EOVERFLOW` — the page cannot hold the group a resume could not split, so it refuses rather than return
+/// one and skip the other.
+#[test]
+fn a_page_too_small_for_a_shared_cookie_answers_eoverflow() {
+  use slates_bridge_core::Bridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = test_cx();
+  let root = bridge.root(&cx).unwrap();
+  let root_id = slates_bridge_core::ObjectId::new(root, 0);
+  let mut by_cookie = std::collections::HashMap::new();
+  let (first, second) = (0u64..)
+    .find_map(|n| {
+      let name = format!("c{n}");
+      let cookie = slates_vfs::dir_cookie(NameEquivalence::Exact.hash(&name));
+      by_cookie
+        .insert(cookie, name.clone())
+        .map(|first| (first, name))
+    })
+    .unwrap();
+  for name in [first.clone(), second.clone()]
+    .into_iter()
+    .chain((0..20).map(|n| format!("fill-{n}")))
+  {
+    bridge.create(root_id, &cx, &name, 0o644, 0).unwrap();
+  }
+  let whole = bridge.readdir(root_id, &cx, 0, 0, usize::MAX).unwrap();
+  let at = whole
+    .iter()
+    .position(|e| e.name == first || e.name == second)
+    .unwrap();
+  let before = whole[at - 1].cookie;
+  let one_entry = u32::try_from(slates_bridge_fuse::reply::DirBuffer::dirent_len(
+    first.len().max(second.len()),
+  ))
+  .unwrap();
+  let mut out = vec![0u8; 4096];
+  let n = dispatch(
+    &message(
+      Opcode::ReadDir.to_wire(),
+      1,
+      1,
+      &readdir_body(before, one_entry),
+    ),
+    &mut bridge,
+    &mut out,
+  );
+  assert_eq!(n, OUT_HEADER_LEN);
+  assert_eq!(
+    i32::from_le_bytes(out[4..8].try_into().unwrap()),
+    -EOVERFLOW
+  );
+}

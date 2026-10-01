@@ -284,6 +284,21 @@ impl DirBlock {
     lo.saturating_sub(1)
   }
 
+  /// The first entry whose hash is at least `hash` (the count when none is): where a listing resumes from a
+  /// cookie, whether or not the entry it last returned is still present.
+  fn first_hash_at_least(&self, hash: u64) -> usize {
+    let (mut lo, mut hi) = (0usize, self.count());
+    while lo < hi {
+      let mid = lo + (hi - lo) / 2;
+      if self.slot(mid).hash < hash {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    lo
+  }
+
   fn fits(&self, name_len: usize) -> bool {
     self.free_bytes() >= ENTRY_BYTES + name_len
   }
@@ -934,6 +949,46 @@ impl Tree {
     Ok(true)
   }
 
+  /// The entries in canonical order whose hash is at least `hash` — one descent, then the walk — so a listing
+  /// resumed from a hash cookie does no work for the entries before it, and an entry removed or added
+  /// meanwhile shifts nothing (§4.5; AUD-29-86).
+  pub fn iter_from_hash<'b>(&self, blocks: &'b Slab<DirBlock>, hash: u64) -> TreeIter<'b> {
+    let height = usize::from(self.height);
+    let mut it = TreeIter {
+      blocks,
+      stack: [(self.root, 0); MAX_HEIGHT],
+      depth: 0,
+      height,
+    };
+    let mut block = self.root;
+    for level in 0..height {
+      let Ok(b) = blocks.get(block) else {
+        // A block that cannot be read ends the walk: an empty listing, never a wrong one.
+        it.depth = 0;
+        return it;
+      };
+      let leaf = level.saturating_add(1) == height;
+      // An index entry's key is its child's first key; the child holding the first key at or above
+      // `(hash, "")` is the last whose first key is at most that — every name sorts after the empty one.
+      let at = if leaf {
+        b.first_hash_at_least(hash)
+      } else {
+        b.child_for(NameEquivalence::Exact, hash, "")
+      };
+      let Some(entry) = it.stack.get_mut(level) else {
+        it.depth = 0;
+        return it;
+      };
+      *entry = (block, at);
+      it.depth = level.saturating_add(1);
+      if leaf {
+        break;
+      }
+      block = handle_from_word(b.slot(at).child);
+    }
+    it
+  }
+
   /// The entries in canonical order.
   pub fn iter<'b>(&self, blocks: &'b Slab<DirBlock>) -> TreeIter<'b> {
     let mut it = TreeIter {
@@ -1123,6 +1178,50 @@ mod tests {
       assert_eq!(&now, names);
     }
     assert!(!f.retired.is_empty(), "copies and merges retired blocks");
+  }
+
+  /// AUD-29-86. Do: over the 3,000-entry tree (three levels of splits) and again after removing two thirds,
+  /// resume a listing from the hash of every present entry, from each such hash plus one, and from zero and the
+  /// largest hash. Expect: each continuation equals the ordered map's range from `(hash, "")` — the oracle —
+  /// so a listing resumed from a hash neither repeats nor skips an entry.
+  #[test]
+  fn a_listing_resumed_from_a_hash_equals_the_maps_range_from_it() {
+    let mut f = fill();
+    let check = |f: &Fixture| {
+      let mut probes: Vec<u64> = f.model.keys().map(|(h, _)| *h).collect();
+      let after: Vec<u64> = probes.iter().map(|h| h.saturating_add(1)).collect();
+      probes.extend(after);
+      probes.push(0);
+      probes.push(u64::MAX);
+      for hash in probes {
+        let expected: Vec<(u64, String)> = f
+          .model
+          .range((hash, String::new())..)
+          .map(|(k, _)| k.clone())
+          .collect();
+        let resumed: Vec<(u64, String)> = f
+          .tree
+          .iter_from_hash(&f.blocks, hash)
+          .map(|(h, n, _)| (h, n.to_owned()))
+          .collect();
+        assert_eq!(resumed, expected, "from {hash}");
+      }
+    };
+    assert!(f.tree.height >= 2);
+    check(&f);
+    let names: Vec<String> = f.model.keys().map(|k| k.1.clone()).collect();
+    for name in names
+      .iter()
+      .enumerate()
+      .filter(|(i, _)| i % 3 != 0)
+      .map(|(_, n)| n)
+    {
+      f.tree
+        .remove(&mut f.blocks, f.epoch, &mut f.retired, POLICY, name)
+        .unwrap();
+      f.model.remove(&keyed(POLICY, name));
+    }
+    check(&f);
   }
 
   #[test]

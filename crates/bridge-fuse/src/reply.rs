@@ -280,10 +280,24 @@ impl DirBuffer {
     }
   }
 
+  /// The bytes a READDIR entry with a name of `name_len` bytes takes: the `fuse_dirent` head and the name,
+  /// padded to the alignment.
+  pub fn dirent_len(name_len: usize) -> usize {
+    Self::DIRENT_HEAD
+      .saturating_add(name_len)
+      .next_multiple_of(Self::ALIGN)
+  }
+
+  /// The bytes a READDIRPLUS entry with a name of `name_len` bytes takes: the `fuse_entry_out`, then the
+  /// same `fuse_dirent` as [`DirBuffer::dirent_len`].
+  pub fn plus_len(name_len: usize) -> usize {
+    EntryOut::LEN.saturating_add(Self::dirent_len(name_len))
+  }
+
   /// Adds an entry; returns false when it would exceed the request's size (the caller stops
   /// and replies what fits, resuming from `offset` next time).
   pub fn push(&mut self, ino: u64, offset: u64, kind: u32, name: &str) -> bool {
-    let padded = (Self::DIRENT_HEAD + name.len()).next_multiple_of(Self::ALIGN);
+    let padded = Self::dirent_len(name.len());
     if self.bytes.len().saturating_add(padded) > self.max {
       return false;
     }

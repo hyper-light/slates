@@ -160,7 +160,7 @@ fn a_client_written_sidecar_becomes_the_owners_attributes() {
     assert_eq!(read_view(&mut bridge, &cx, InodeNo(attr.ino)), bytes);
     let dir = bridge.opendir(oid(root), &cx).unwrap();
     let names: Vec<String> = bridge
-      .readdir(oid(root), &cx, dir, 0)
+      .readdir(oid(root), &cx, dir, 0, usize::MAX)
       .unwrap()
       .into_iter()
       .map(|entry| entry.name)

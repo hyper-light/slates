@@ -58,7 +58,8 @@ pub struct NodeAttr {
   pub change: u64,
 }
 
-/// One entry of a directory listing: the child's inode number, its kind and its name.
+/// One entry of a directory listing: the child's inode number, its kind, its name, and the cookie that
+/// resumes the listing after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry {
   /// The child inode number.
@@ -67,6 +68,28 @@ pub struct DirEntry {
   pub kind: Kind,
   /// The name.
   pub name: String,
+  /// The cookie a listing resumed after this entry passes back: `.` 1, `..` 2, a child its name's hash
+  /// cookie ([`slates_vfs::dir_cookie`]) — stable across other names' inserts and removals (§4.5; AUD-29-86).
+  pub cookie: u64,
+}
+
+/// How many of `entries` a transport sends when the first `fits` of them fit its reply: the fitted entries
+/// less any trailing ones sharing a cookie with the first entry that did not fit, since a listing resumed
+/// from that cookie would skip them (§4.5; AUD-29-86). Zero when one group of a shared cookie is larger than
+/// the reply — the transport refuses the page rather than skip an entry.
+pub fn whole_cookie_groups(entries: &[DirEntry], fits: usize) -> usize {
+  let Some(next) = entries.get(fits) else {
+    return fits.min(entries.len());
+  };
+  let mut sent = fits;
+  while sent > 0
+    && entries
+      .get(sent - 1)
+      .is_some_and(|entry| entry.cookie == next.cookie)
+  {
+    sent -= 1;
+  }
+  sent
 }
 
 /// The changes a `setattr` applies: a field is `Some` when the caller asks to set it. Each
@@ -269,14 +292,18 @@ pub trait Bridge {
   ) -> Result<u32, VfsError>;
   /// Open directory `object` under `cx`; the handle.
   fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError>;
-  /// The entries of directory `object` from `offset` under `cx` (each entry's position is the
-  /// resume cookie).
+  /// One page of directory `object`'s listing under `cx`, resumed from `cookie` (0 starts it; each entry
+  /// carries the cookie that resumes after it): at most `limit` entries, then every further entry sharing
+  /// the last one's cookie, so a transport can cut the page between cookies ([`whole_cookie_groups`]). A
+  /// page is one descent and its own entries, so a listing paged to its end visits each entry once (§4.5;
+  /// AUD-29-86).
   fn readdir(
     &mut self,
     object: ObjectId,
     cx: &OpContext,
     fh: u64,
-    offset: u64,
+    cookie: u64,
+    limit: usize,
   ) -> Result<Vec<DirEntry>, VfsError>;
   /// Create `name` in `parent` and open it, under `cx`; the attributes and the handle.
   fn create(

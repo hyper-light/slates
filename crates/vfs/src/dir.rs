@@ -74,6 +74,33 @@ pub struct SmallEntry {
   len: u8,
 }
 
+/// Format: the cookies a directory listing reserves before its children — 0 starts the listing, 1 resumes
+/// after `.`, 2 after `..` — so a child's cookie is never below this (§4.5; AUD-29-86).
+pub const FIRST_CHILD_COOKIE: u64 = 3;
+
+/// The bits of a name's hash a directory cookie keeps. Names whose hashes share them share a cookie, and a
+/// page never ends inside such a group ([`crate::volume::Volume::readdir_page`]).
+/// Derived: a non-negative 32-bit offset, the most a 32-bit process's `getdents` and `telldir` carry (Linux
+/// refuses more `EOVERFLOW`; ext4 hands such a process 32-bit hashes, `fs/ext4/dir.c` `is_32bit_api`).
+pub const COOKIE_BITS: u32 = 31;
+
+/// The cookie of a directory entry with name hash `hash`: the hash's top [`COOKIE_BITS`], never below
+/// [`FIRST_CHILD_COOKIE`]. Stable across inserts and removals of other names, so a listing resumed from it
+/// returns every entry that was not removed exactly once (POSIX `readdir`), where a position would shift.
+pub fn dir_cookie(hash: u64) -> u64 {
+  (hash >> (u64::BITS - COOKIE_BITS)).max(FIRST_CHILD_COOKIE)
+}
+
+/// The least name hash whose cookie is greater than `cookie` (at least [`FIRST_CHILD_COOKIE`]): where a
+/// listing resumed with `cookie` continues. `None` when no cookie is greater — the listing has ended.
+pub fn resume_hash(cookie: u64) -> Option<u64> {
+  let next = cookie.max(FIRST_CHILD_COOKIE).checked_add(1)?;
+  if next >= 1u64 << COOKIE_BITS {
+    return None;
+  }
+  Some(next << (u64::BITS - COOKIE_BITS))
+}
+
 /// A view of an entry in either representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EntryRef<'a> {
@@ -532,6 +559,29 @@ impl DirNode {
             .map(|(hash, name, child)| EntryRef { hash, name, child }),
         )
       }
+    }
+  }
+
+  /// The entries in canonical order whose name hash is at least `hash`: a directory listing resumed from a
+  /// hash cookie, one descent into the indexed form (the small form is a scan of its inline array, bounded by
+  /// its capacity) — §4.5; AUD-29-86.
+  pub fn iter_from_hash<'a>(
+    &'a self,
+    blocks: &'a Slab<DirBlock>,
+    hash: u64,
+  ) -> Box<dyn Iterator<Item = EntryRef<'a>> + 'a> {
+    match &self.entries {
+      DirEntries::Small(s) => Box::new(s.entries().iter().filter(move |e| e.hash >= hash).map(
+        move |e| EntryRef {
+          hash: e.hash,
+          name: s.name(*e),
+          child: e.child,
+        },
+      )),
+      DirEntries::Indexed(t) => Box::new(
+        t.iter_from_hash(blocks, hash)
+          .map(|(hash, name, child)| EntryRef { hash, name, child }),
+      ),
     }
   }
 

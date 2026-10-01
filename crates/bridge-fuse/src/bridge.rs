@@ -17,7 +17,7 @@ use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_bridge_core::{
-  CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
+  CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr, whole_cookie_groups,
 };
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
@@ -700,6 +700,52 @@ fn serve_write(
   )
 }
 
+/// Format: `EOVERFLOW` (Linux) — what a directory page answers when the entries sharing one cookie are more
+/// than the reply can hold: a page cut inside the group would skip its tail on resume (AUD-29-86).
+const EOVERFLOW: i32 = 75;
+
+/// How many of `entries`, in order, fit `room` bytes when each takes `size(name length)` bytes.
+fn fitting(entries: &[DirEntry], room: usize, size: fn(usize) -> usize) -> usize {
+  let mut used = 0usize;
+  let mut count = 0usize;
+  for entry in entries {
+    match used.checked_add(size(entry.name.len())) {
+      Some(total) if total <= room => {
+        used = total;
+        count = count.saturating_add(1);
+      }
+      _ => break,
+    }
+  }
+  count
+}
+
+/// The page a directory read returns (AUD-29-86): the room the request and the reply allow; the bridge asked
+/// for at most as many entries as the smallest could fill, plus one so the page's end shows; the entries that
+/// fit, cut between cookies ([`whole_cookie_groups`]). `Err(EOVERFLOW)` when one group of a shared cookie
+/// is larger than the page.
+fn directory_page(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  r: &ReadIn,
+  room: usize,
+  size: fn(usize) -> usize,
+) -> Result<Vec<DirEntry>, i32> {
+  /// Shape: the shortest name an entry has — one byte — which sizes the smallest entry a page holds.
+  const SHORTEST_NAME: usize = 1;
+  let limit = (room / size(SHORTEST_NAME).max(1)).saturating_add(1);
+  let mut entries = bridge
+    .readdir(object, cx, r.fh, r.offset, limit)
+    .map_err(errno)?;
+  let sent = whole_cookie_groups(&entries, fitting(&entries, room, size));
+  if sent == 0 && !entries.is_empty() {
+    return Err(EOVERFLOW);
+  }
+  entries.truncate(sent);
+  Ok(entries)
+}
+
 fn serve_readdir(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -713,23 +759,22 @@ fn serve_readdir(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  match bridge.readdir(object, cx, r.fh, r.offset) {
-    Ok(entries) => {
-      let mut dir = DirBuffer::new(usize::try_from(r.size.min(body_room(out))).unwrap_or(0));
-      for (index, entry) in entries.iter().enumerate() {
-        // The cookie is the one-based index, so the next readdir resumes after this entry.
-        let cookie = r.offset.saturating_add(index as u64).saturating_add(1);
-        if !dir.push(entry.ino, cookie, dtype(entry.kind), &entry.name) {
-          break;
-        }
-      }
-      write_or_drop(
-        ReplyHeader::write_ok(req.header.unique, dir.as_bytes(), out),
-        out,
-      )
+  let room = usize::try_from(r.size.min(body_room(out))).unwrap_or(0);
+  let entries = match directory_page(bridge, cx, object, &r, room, DirBuffer::dirent_len) {
+    Ok(entries) => entries,
+    Err(code) => return write_or_drop(ReplyHeader::write_error(req.header.unique, code, out), out),
+  };
+  let mut dir = DirBuffer::new(room);
+  for entry in &entries {
+    // Each entry's cookie resumes the listing after it, stable across other names' changes.
+    if !dir.push(entry.ino, entry.cookie, dtype(entry.kind), &entry.name) {
+      break;
     }
-    Err(e) => reply_err(req.header.unique, e, out),
   }
+  write_or_drop(
+    ReplyHeader::write_ok(req.header.unique, dir.as_bytes(), out),
+    out,
+  )
 }
 
 fn serve_readdirplus(
@@ -745,13 +790,13 @@ fn serve_readdirplus(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  let entries = match bridge.readdir(object, cx, r.fh, r.offset) {
+  let room = usize::try_from(r.size.min(body_room(out))).unwrap_or(0);
+  let entries = match directory_page(bridge, cx, object, &r, room, DirBuffer::plus_len) {
     Ok(entries) => entries,
-    Err(e) => return reply_err(req.header.unique, e, out),
+    Err(code) => return write_or_drop(ReplyHeader::write_error(req.header.unique, code, out), out),
   };
-  let mut dir = DirBuffer::new(usize::try_from(r.size.min(body_room(out))).unwrap_or(0));
-  for (index, entry) in entries.iter().enumerate() {
-    let cookie = r.offset.saturating_add(index as u64).saturating_add(1);
+  let mut dir = DirBuffer::new(room);
+  for entry in &entries {
     let child = ObjectId::new(entry.ino, 0);
     // Each entry carries its attributes so the kernel needs no follow-up LOOKUP. Attributes are
     // best-effort; an entry whose attributes cannot be fetched is skipped rather than failing the
@@ -772,7 +817,7 @@ fn serve_readdirplus(
     let valid = valid_for(bridge, cx, entry.ino);
     if !dir.push_plus(
       &entry_out(&node, valid),
-      cookie,
+      entry.cookie,
       dtype(entry.kind),
       &entry.name,
     ) {

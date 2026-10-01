@@ -1790,6 +1790,18 @@ the verdict that every entry beneath still matches its listing fingerprint.
 >   inode, which keeps serving the opener what it opened, and the name serves the new file as a new inode
 >   (`docs/bugs/2026-09-30-an-open-base-file-replaced-on-disk-served-the-new-file.md`).
 
+> **Status (2026-10-01, AUD-29-86: directory listings are paged by cookie).** A listing's cookie is the top
+> 31 bits of the entry's name hash (`dir_cookie`; `.` is 1, `..` 2, a child never below 3): a non-negative
+> 32-bit offset any process can carry, and stable when other names are added or removed, so an entry that is
+> not removed is listed exactly once (POSIX `readdir`), where a position shifted. A page is one descent of the
+> directory tree to the first hash at or above the cookie (`Tree::iter_from_hash`) and its own entries, at most
+> as many as the reply could hold plus one, so a listing paged to its end visits each entry once and allocates
+> only its page. A page never ends inside a group of names sharing a cookie (`whole_cookie_groups`); a group
+> larger than the reply is refused (`EOVERFLOW` for FUSE, `NFS3ERR_TOOSMALL` for NFS) rather than split. The
+> FSKit wire, which resumes by position, and WinFsp, which reads whole listings, are served whole listings as
+> before. Owed: an overlay page repeats the base listing's merge check; the hash is FNV-1a, unkeyed, so a writer
+> able to craft a large group of names sharing a cookie can make that directory unlistable through a small page.
+
 ### 4.6 OS bridges (D-1, D-2, D-3)
 
 **Special names (A-26).** A bridge may create and report FIFO/socket inodes only with

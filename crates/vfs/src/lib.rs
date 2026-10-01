@@ -45,6 +45,7 @@ pub mod trie;
 pub mod volume;
 pub mod xattr;
 
+pub use dir::{COOKIE_BITS, FIRST_CHILD_COOKIE, dir_cookie, resume_hash};
 pub use error::VfsError;
 pub use ids::{Epoch, InodeNo, SnapshotId};
 pub use names::NameEquivalence;

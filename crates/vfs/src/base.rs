@@ -1506,6 +1506,32 @@ impl Overlay<'_> {
     store: &'s mut Store,
     dir: Handle<DirNode>,
   ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.merge_base(store, dir)?;
+    self.vol.readdir(store, dir)
+  }
+
+  /// One page of a directory with its base merged in ([`Volume::readdir_page`]): the base listing is merged
+  /// first, then the page is read from the node — so the page holds base entries in their place in the
+  /// canonical order (§4.5; AUD-29-86).
+  pub fn readdir_page_no<'s>(
+    &mut self,
+    store: &'s mut Store,
+    dir_no: InodeNo,
+    from_hash: u64,
+    limit: usize,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.merge_base(store, dir)?;
+    self.vol.readdir_page(store, dir, from_hash, limit)
+  }
+
+  /// Gives every base entry of `dir` not shadowed by an overlay entry or a whiteout its inode; the head's
+  /// node for `dir` afterwards.
+  fn merge_base(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+  ) -> Result<Handle<DirNode>, VfsError> {
     let dir = self.vol.head_dir(store, dir)?;
     if store.dirs.get(dir)?.base == BaseDirState::Merged {
       self.load_listing(store, dir)?;
@@ -1531,8 +1557,7 @@ impl Overlay<'_> {
         }
       }
     }
-    let dir = self.vol.head_dir(store, dir)?;
-    self.vol.readdir(store, dir)
+    self.vol.head_dir(store, dir)
   }
 
   /// Whether `name` exists beneath `dir` in the overlay or the base (for the create verbs).

@@ -397,6 +397,8 @@ pub struct Observed {
 pub struct DirRow<'a> {
   /// The name, borrowed from the directory node.
   pub name: &'a str,
+  /// The hash of the name's folded form: the directory's order, and where a listing resumes (§4.5).
+  pub hash: u64,
   /// The kind.
   pub kind: Kind,
   /// The inode number.
@@ -824,11 +826,67 @@ impl Volume {
       };
       rows.push(DirRow {
         name: entry.name,
+        hash: entry.hash,
         kind,
         inode,
       });
     }
     Ok(rows)
+  }
+
+  /// One page of a directory's entries in canonical order: those whose name hash is at least `from_hash`,
+  /// at most `limit` of them and then every further entry sharing the last one's cookie
+  /// ([`crate::dir_cookie`]), so a page never ends inside a group a cookie cannot tell apart (§4.5; AUD-29-86).
+  /// One descent and the page's own entries: a listing paged to its end visits each entry once.
+  pub fn readdir_page<'s>(
+    &self,
+    store: &'s Store,
+    dir: Handle<DirNode>,
+    from_hash: u64,
+    limit: usize,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.head_dir(store, dir)?;
+    let node = store.dirs.get(dir).map_err(|_| VfsError::StaleHandle)?;
+    let mut rows: Vec<DirRow<'s>> = Vec::new();
+    for entry in node.iter_from_hash(&store.blocks, from_hash) {
+      let (kind, inode) = match entry.child {
+        Child::Dir(h) => (
+          Kind::Dir,
+          store.dirs.get(h).map_err(|_| VfsError::StaleHandle)?.inode,
+        ),
+        Child::File(no) => (Kind::File, no),
+        Child::Symlink(no) => (Kind::Symlink, no),
+        Child::Fifo(no) => (Kind::Fifo, no),
+        Child::Socket(no) => (Kind::Socket, no),
+        Child::Whiteout => continue,
+      };
+      if rows.len() >= limit
+        && rows
+          .last()
+          .is_none_or(|last| crate::dir_cookie(last.hash) != crate::dir_cookie(entry.hash))
+      {
+        break;
+      }
+      rows.push(DirRow {
+        name: entry.name,
+        hash: entry.hash,
+        kind,
+        inode,
+      });
+    }
+    Ok(rows)
+  }
+
+  /// [`Self::readdir_page`] of the directory named by inode number `dir_no`.
+  pub fn readdir_page_no<'s>(
+    &self,
+    store: &'s Store,
+    dir_no: InodeNo,
+    from_hash: u64,
+    limit: usize,
+  ) -> Result<Vec<DirRow<'s>>, VfsError> {
+    let dir = self.current_dir(store, dir_no)?;
+    self.readdir_page(store, dir, from_hash, limit)
   }
 
   /// The root directory's inode number, the bridge's node id 1 (§4.6).
@@ -2442,6 +2500,7 @@ impl Volume {
       };
       rows.push(DirRow {
         name: entry.name,
+        hash: entry.hash,
         kind,
         inode,
       });

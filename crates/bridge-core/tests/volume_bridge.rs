@@ -694,7 +694,7 @@ fn readdir_synthesizes_dot_and_dotdot() {
   let sub = bridge.mkdir(oid(root), &cx, "sub", 0o755).unwrap();
   bridge.create(oid(sub.ino), &cx, "f", 0o644, 0).unwrap();
 
-  let entries = bridge.readdir(oid(sub.ino), &cx, 0, 0).unwrap();
+  let entries = bridge.readdir(oid(sub.ino), &cx, 0, 0, usize::MAX).unwrap();
   let by_name: std::collections::BTreeMap<&str, u64> =
     entries.iter().map(|e| (e.name.as_str(), e.ino)).collect();
   assert_eq!(
@@ -706,7 +706,7 @@ fn readdir_synthesizes_dot_and_dotdot() {
   assert!(by_name.contains_key("f"), "the children follow . and ..");
 
   // The root has no parent, so its ".." is the root itself (POSIX).
-  let root_entries = bridge.readdir(oid(root), &cx, 0, 0).unwrap();
+  let root_entries = bridge.readdir(oid(root), &cx, 0, 0, usize::MAX).unwrap();
   let root_dotdot = root_entries.iter().find(|e| e.name == "..").unwrap();
   assert_eq!(root_dotdot.ino, root, "the root's '..' is the root itself");
 }
@@ -948,5 +948,170 @@ fn link_creates_a_second_name_for_the_same_inode() {
   assert!(
     bridge.link(oid(sub.ino), oid(root), &cx, "dlink").is_err(),
     "a directory cannot be hard-linked"
+  );
+}
+
+/// Shape: the files of the paged directory — past the small form's cutover (16), so it is the indexed tree,
+/// and within the fixture's inode table (256).
+const PAGED_FILES: usize = 200;
+/// Shape: the entries a page asks for — small, so the directory takes dozens of pages.
+const PAGE_LIMIT: usize = 7;
+
+/// Lists `dir` page by page from cookie 0, each page at most `limit` entries (plus a group sharing the last
+/// cookie), running `between` after each page; the names in the order returned.
+fn paged(
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  dir: u64,
+  limit: usize,
+  mut between: impl FnMut(&mut VolumeBridge<'_>, &[slates_bridge_core::DirEntry]),
+) -> Vec<String> {
+  let mut cookie = 0;
+  let mut names = Vec::new();
+  loop {
+    let page = bridge.readdir(oid(dir), cx, 0, cookie, limit).unwrap();
+    let Some(last) = page.last() else {
+      return names;
+    };
+    cookie = last.cookie;
+    let shared = page.iter().filter(|e| e.cookie == last.cookie).count();
+    assert!(
+      page.len() <= limit || page.len() == limit - 1 + shared,
+      "a page holds at most its limit, then only the last cookie's group: {} entries",
+      page.len()
+    );
+    between(bridge, &page);
+    names.extend(page.into_iter().map(|e| e.name));
+  }
+}
+
+/// AUD-29-86. Do: page a 200-file directory seven entries at a time. Expect: every page within its bound,
+/// and the pages together are the whole listing — `.`, `..` and every file — each exactly once.
+#[test]
+fn a_directory_paged_by_cookie_lists_every_entry_exactly_once() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  for n in 0..PAGED_FILES {
+    bridge
+      .create(oid(root), &cx, &format!("file-{n:03}"), 0o644, 0)
+      .unwrap();
+  }
+  let names = paged(&mut bridge, &cx, root, PAGE_LIMIT, |_, _| {});
+  let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+  assert_eq!(names.len(), PAGED_FILES + 2, "no entry repeated");
+  assert_eq!(unique.len(), PAGED_FILES + 2, "every entry listed");
+  assert_eq!(names.first().map(String::as_str), Some("."));
+  assert_eq!(names.get(1).map(String::as_str), Some(".."));
+}
+
+/// AUD-29-86 (POSIX `readdir`: an entry not removed while a directory is read is returned exactly once).
+/// Do: page the 200-file directory and, after each page, unlink one file the listing has returned and one
+/// it has not reached. Expect: every file never unlinked is listed exactly once and no name twice — the rule a
+/// position cookie cannot keep, since each unlink of a returned entry moves every later entry down one.
+#[test]
+fn unlinks_between_pages_skip_and_repeat_no_survivor() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let all: Vec<String> = (0..PAGED_FILES).map(|n| format!("file-{n:03}")).collect();
+  for name in &all {
+    bridge.create(oid(root), &cx, name, 0o644, 0).unwrap();
+  }
+  let mut unlinked = std::collections::BTreeSet::new();
+  let mut returned = std::collections::BTreeSet::new();
+  let names = paged(&mut bridge, &cx, root, PAGE_LIMIT, |bridge, page| {
+    returned.extend(page.iter().map(|e| e.name.clone()));
+    let behind = page
+      .iter()
+      .map(|e| e.name.clone())
+      .find(|n| n.starts_with("file-"));
+    let ahead = all
+      .iter()
+      .find(|n| !returned.contains(*n) && !unlinked.contains(*n))
+      .cloned();
+    for name in [behind, ahead].into_iter().flatten() {
+      if unlinked.insert(name.clone()) {
+        bridge.unlink(oid(root), &cx, &name).unwrap();
+      }
+    }
+  });
+  let mut seen = std::collections::BTreeMap::<&str, usize>::new();
+  for name in &names {
+    *seen.entry(name.as_str()).or_insert(0) += 1;
+  }
+  assert!(seen.values().all(|&n| n == 1), "no name listed twice");
+  for name in all.iter().filter(|n| !unlinked.contains(*n)) {
+    assert_eq!(
+      seen.get(name.as_str()),
+      Some(&1),
+      "{name} survived and was listed once"
+    );
+  }
+  assert!(
+    unlinked.len() > PAGED_FILES / PAGE_LIMIT,
+    "the test unlinked across the listing"
+  );
+}
+
+/// Two names whose cookies are equal (their hashes share the cookie's bits), found by search over the
+/// volume's real name hash.
+fn names_sharing_a_cookie(policy: NameEquivalence) -> (String, String) {
+  let mut by_cookie = std::collections::HashMap::new();
+  (0u64..)
+    .find_map(|n| {
+      let name = format!("c{n}");
+      let cookie = slates_vfs::dir_cookie(policy.hash(&name));
+      by_cookie
+        .insert(cookie, name.clone())
+        .map(|first| (first, name))
+    })
+    .expect("two names share a cookie within the birthday bound of its bits")
+}
+
+/// Shape: files besides the pair, enough to put the directory past the small form's cutover (16) into the
+/// indexed tree.
+const FILLERS: usize = 20;
+
+/// AUD-29-86. Do: create two names whose cookies are equal among other files, then ask for a one-entry page
+/// starting just before them, and a page from their shared cookie. Expect: the one-entry page holds both —
+/// a page never ends inside a group a cookie cannot tell apart — and the page after them holds neither.
+#[test]
+fn a_page_never_ends_between_names_sharing_a_cookie() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (first, second) = names_sharing_a_cookie(NameEquivalence::Exact);
+  for name in [first.clone(), second.clone()]
+    .into_iter()
+    .chain((0..FILLERS).map(|n| format!("fill-{n}")))
+  {
+    bridge.create(oid(root), &cx, &name, 0o644, 0).unwrap();
+  }
+  let whole = bridge.readdir(oid(root), &cx, 0, 0, usize::MAX).unwrap();
+  let at = whole
+    .iter()
+    .position(|e| e.name == first || e.name == second)
+    .unwrap();
+  let before = at.checked_sub(1).map_or(0, |i| whole[i].cookie);
+  let page = bridge.readdir(oid(root), &cx, 0, before, 1).unwrap();
+  let names: Vec<&str> = page.iter().map(|e| e.name.as_str()).collect();
+  assert!(
+    names.contains(&first.as_str()) && names.contains(&second.as_str()),
+    "both names sharing the cookie in one page: {names:?}"
+  );
+  let shared = page.last().unwrap().cookie;
+  let after = bridge
+    .readdir(oid(root), &cx, 0, shared, usize::MAX)
+    .unwrap();
+  assert!(
+    after.iter().all(|e| e.name != first && e.name != second),
+    "neither repeats after their cookie"
   );
 }

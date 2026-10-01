@@ -753,7 +753,12 @@ pub fn serve(
     } => reply(bridge.write(object, cx, offset, &data), ok_count),
     ShimRequest::OpenDir { object } => reply(bridge.opendir(object, cx), ok_fh),
     ShimRequest::ReadDir { object, fh, offset } => {
-      reply(bridge.readdir(object, cx, fh, offset), |e| ok_entries(&e))
+      // The FSKit wire resumes by position (it carries no per-entry cookie), so the extension is served the
+      // whole listing less the entries it already has.
+      let skip = usize::try_from(offset).unwrap_or(usize::MAX);
+      reply(bridge.readdir(object, cx, fh, 0, usize::MAX), |e| {
+        ok_entries(e.get(skip..).unwrap_or(&[]))
+      })
     }
     ShimRequest::Release { object, fh } => reply(bridge.release(object, cx, fh), |()| ok_unit()),
     ShimRequest::Create {

@@ -27,7 +27,7 @@
 
 use slates_bridge_core::{
   AttachmentId, Attachments, Bridge, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights,
-  SetAttr, View,
+  SetAttr, View, whole_cookie_groups,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_vfs::error::VfsError;
@@ -324,6 +324,8 @@ const READDIR_ENTRY_FIXED: usize = 4 + size_of::<u64>() + size_of::<u64>();
 /// `post_op_attr` (its bool plus a `fattr3`), the `cookieverf` (8), and the trailing end-of-list
 /// and `eof` bools (8) — reserved from the client's `count` so the reply stays within it.
 const READDIR_REPLY_OVERHEAD: usize = 4 + 4 + FATTR3_BYTES + size_of::<u64>() + 4 + 4;
+/// Shape: the shortest name a directory entry has — one byte — which sizes the smallest entry a page holds.
+const SHORTEST_NAME: &str = "x";
 /// Format: the fixed XDR bytes a READDIRPLUS `entryplus3` adds over a READDIR `entry3` besides the
 /// variable handle — a present `name_attributes` (its bool plus a `fattr3`) and the `name_handle`
 /// present bool — for budgeting a reply against the client's `maxcount`.
@@ -2352,15 +2354,18 @@ impl<'b> Export<'b> {
     if cookie != 0 && cookieverf != verf {
       return Err(Nfsstat3::BadCookie);
     }
-    // The cookie is the number of entries already returned; the shared readdir skips that many.
+    // The cookie is the last entry's own (`.` 1, `..` 2, a child its name's hash cookie): the shared readdir
+    // resumes after it with one descent, at most as many entries as the smallest could fill the client's
+    // budget with, plus one so the page's end shows (AUD-29-86).
+    let smallest = READDIR_ENTRY_FIXED.saturating_add(xdr_str_len(SHORTEST_NAME));
+    let limit = (budget / smallest.max(1)).saturating_add(1);
     let rows = self
       .bridge
-      .readdir(dir_object, &cx, 0, cookie)
+      .readdir(dir_object, &cx, 0, cookie, limit)
       .map_err(|e| nfsstat_of(&e))?;
     let mut used = READDIR_REPLY_OVERHEAD;
     let mut entries = Vec::new();
-    let mut eof = true;
-    for (index, row) in rows.into_iter().enumerate() {
+    for row in &rows {
       // For a plus listing, gather the child's attributes (best-effort) and handle (always
       // derivable) before budgeting, since the handle's encoded length varies with the fh.
       let (attr, handle) = if plus {
@@ -2381,25 +2386,27 @@ impl<'b> Export<'b> {
           .saturating_add(handle.as_ref().map_or(0, |h| xdr_len(h.0.len())));
       }
       if used.saturating_add(entry_bytes) > budget {
-        if entries.is_empty() {
-          // Not even one entry fits the client's count (RFC 1813 §3.3.16-17).
-          return Err(Nfsstat3::Toosmall);
-        }
-        eof = false; // more entries remain for the next call
         break;
       }
       used = used.saturating_add(entry_bytes);
-      let entry_cookie = cookie
-        .saturating_add(u64::try_from(index).unwrap_or(u64::MAX))
-        .saturating_add(1);
       entries.push(ReaddirEntry {
         fileid: row.ino,
-        name: row.name,
-        cookie: entry_cookie,
+        name: row.name.clone(),
+        cookie: row.cookie,
         attr,
         handle,
       });
     }
+    // A page ends between cookies: a resume from a cookie shared by entries beyond the page would skip them.
+    let sent = whole_cookie_groups(&rows, entries.len());
+    if sent == 0 && !rows.is_empty() {
+      // Not even one entry — or one group of a shared cookie — fits the client's count (RFC 1813
+      // §3.3.16-17).
+      return Err(Nfsstat3::Toosmall);
+    }
+    entries.truncate(sent);
+    // The listing ended when every row the bridge had was sent and it had fewer than it was asked for.
+    let eof = sent == rows.len() && rows.len() < limit;
     Ok((dir_attr, entries, eof, verf))
   }
 

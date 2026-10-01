@@ -690,49 +690,65 @@ impl Bridge for VolumeBridge<'_> {
     object: ObjectId,
     cx: &OpContext,
     _fh: u64,
-    offset: u64,
+    cookie: u64,
+    limit: usize,
   ) -> Result<Vec<DirEntry>, VfsError> {
     self.authorize_read(cx)?;
     let dir_no = InodeNo(object.inode);
-    // The parent for `..`; the root has none, so `..` is the root itself (POSIX). Resolved before
-    // the listing (a separate read); a directory whose parent cannot be resolved falls back to
-    // itself rather than failing the whole listing.
-    let parent = self
-      .volume
-      .parent_no(self.store, dir_no)
-      .unwrap_or(dir_no)
-      .0;
+    // POSIX `readdir` lists "." (the directory) and ".." (its parent) before the children; the volume
+    // core returns children only, so the shared bridge synthesizes them here — one code path, so the FUSE
+    // mount and the NFS export list them identically (R8). Their cookies are 1 and 2; a child's is its
+    // name's hash cookie, never below 3. The parent for `..`: the root has none, so `..` is the root itself
+    // (POSIX); a directory whose parent cannot be resolved falls back to itself rather than failing.
+    let mut page = Vec::new();
+    if cookie == 0 {
+      page.push(DirEntry {
+        ino: object.inode,
+        kind: Kind::Dir,
+        name: ".".to_owned(),
+        cookie: 1,
+      });
+    }
+    if cookie <= 1 {
+      let parent = self
+        .volume
+        .parent_no(self.store, dir_no)
+        .unwrap_or(dir_no)
+        .0;
+      page.push(DirEntry {
+        ino: parent,
+        kind: Kind::Dir,
+        name: "..".to_owned(),
+        cookie: 2,
+      });
+    }
+    // Where the children resume: from the first after the dot entries, or after the cookie's group. A
+    // cookie past the last possible group has nothing after it.
+    let from_hash = if cookie < slates_vfs::FIRST_CHILD_COOKIE {
+      Some(0)
+    } else {
+      slates_vfs::resume_hash(cookie)
+    };
+    let Some(from_hash) = from_hash else {
+      return Ok(page);
+    };
+    let room = limit.saturating_sub(page.len());
     let rows = match host_for(&mut self.host, self.volume.is_overlay())? {
-      Some(host) => self.volume.with_host(host).readdir_no(self.store, dir_no),
-      None => self.volume.readdir_no(self.store, dir_no),
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .readdir_page_no(self.store, dir_no, from_hash, room),
+      None => self
+        .volume
+        .readdir_page_no(self.store, dir_no, from_hash, room),
     }?;
-    // POSIX `readdir` lists "." (the directory) and ".." (its parent) before the children; the
-    // volume core returns children only, so the shared bridge synthesizes them here — one code
-    // path, so the FUSE mount and the NFS export list them identically (R8). The cookie/offset is
-    // over the full list, so ".".and "..".are positions 0 and 1 and a resume skips them.
-    let dot = DirEntry {
-      ino: object.inode,
-      kind: Kind::Dir,
-      name: ".".to_owned(),
-    };
-    let dotdot = DirEntry {
-      ino: parent,
-      kind: Kind::Dir,
-      name: "..".to_owned(),
-    };
-    let children = rows.into_iter().map(|row| DirEntry {
+    page.extend(rows.into_iter().map(|row| DirEntry {
       ino: row.inode.0,
       kind: row.kind,
       name: row.name.to_owned(),
-    });
-    let start = usize::try_from(offset).unwrap_or(0);
-    Ok(
-      [dot, dotdot]
-        .into_iter()
-        .chain(children)
-        .skip(start)
-        .collect(),
-    )
+      cookie: slates_vfs::dir_cookie(row.hash),
+    }));
+    Ok(page)
   }
 
   fn create(

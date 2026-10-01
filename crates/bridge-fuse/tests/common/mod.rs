@@ -165,9 +165,10 @@ impl<B: Bridge> Bridge for FailingGather<B> {
     object: ObjectId,
     cx: &OpContext,
     fh: u64,
-    offset: u64,
+    cookie: u64,
+    limit: usize,
   ) -> Result<Vec<DirEntry>, VfsError> {
-    self.inner.readdir(object, cx, fh, offset)
+    self.inner.readdir(object, cx, fh, cookie, limit)
   }
 
   fn create(
