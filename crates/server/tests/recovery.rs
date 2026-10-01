@@ -28,10 +28,11 @@ use slates_client::{
 };
 use slates_ipc::protocol::{Filter, ReplyBody, RequestBody};
 use slates_machine::MachineProfile;
-use slates_server::{Daemon, DaemonConfig, SegmentSource};
+use slates_server::{Daemon, DaemonConfig};
 use slates_wire::request::RequestId;
 
 mod common;
+use common::anchor::{anchor_segment, source_of};
 use common::nfs::{create, fsstat, lookup, mount, read, write};
 
 /// Shape: shards per test daemon: two, so the volume can live on a shard other than the control
@@ -39,9 +40,6 @@ use common::nfs::{create, fsstat, lookup, mount, read, write};
 const TEST_SHARDS: u16 = 2;
 /// Shape: how long a client retries the rendezvous while a daemon starts.
 const START_WAIT: Duration = Duration::from_secs(5);
-/// Shape: the content object's slots per shard — the recovery image is a double buffer (the committed
-/// image and the one being published), so a torn publish preserves the committed one (§4.8).
-const PUBLISH_SLOTS: usize = 2;
 /// Shape: the bytes written before the snapshot — what the snapshot freezes.
 const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta echo foxtrot\n";
 /// Shape: the bytes written over the same file after the snapshot — the diverged head. Longer than
@@ -272,33 +270,6 @@ fn rollbacks_of(daemon: &Daemon) -> u64 {
     .iter()
     .map(|c| c.rollbacks)
     .sum()
-}
-
-/// The anchor's segment and content object for a test: the content object is [`PUBLISH_SLOTS`]
-/// reserve-sized slots per shard times the partitions (lazily backed, so the unused tail costs no RAM).
-fn anchor_segment(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> AnchorSegment {
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * PUBLISH_SLOTS
-    * usize::from(config.geometry.partitions.max(1));
-  AnchorSegment::create(
-    &format!("slates-seg-{name}"),
-    &profile.facts.identity,
-    config.geometry,
-  )
-  .unwrap()
-  .with_content(&format!("slates-con-{name}"), content_bytes)
-  .unwrap()
-}
-
-/// The handoff a daemon attaches by: the segment and its content object.
-fn source_of(segment: &AnchorSegment) -> SegmentSource {
-  let (handoff, len) = segment.handoff().unwrap();
-  let content = segment.content_handoff().unwrap();
-  SegmentSource::Handoff {
-    handoff,
-    len,
-    content,
-  }
 }
 
 /// An NFS connection to the daemon's loopback port.

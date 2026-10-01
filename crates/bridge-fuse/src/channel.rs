@@ -568,31 +568,9 @@ pub struct Dispatched {
 }
 
 impl Dispatched {
-  /// Whether the request changed the volume in a way its caller is promised survives a daemon restart
-  /// once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, and the commit points of
-  /// data — `fsync` and the `flush` every close sends — succeeded. A plain `write` is not one: like an
-  /// NFS `UNSTABLE` write, its bytes are in the daemon when it returns and are made stable by the `flush`
-  /// or `fsync` that follows.
+  /// Whether the request's reply waits for its owner's barrier ([`crate::bridge::needs_barrier`]).
   pub fn needs_barrier(&self) -> bool {
-    self.error == 0
-      && matches!(
-        self.opcode,
-        Some(
-          Opcode::SetAttr
-            | Opcode::SymLink
-            | Opcode::MkNod
-            | Opcode::MkDir
-            | Opcode::Unlink
-            | Opcode::RmDir
-            | Opcode::Rename
-            | Opcode::Rename2
-            | Opcode::Link
-            | Opcode::Create
-            | Opcode::FSync
-            | Opcode::FSyncDir
-            | Opcode::Flush
-        )
-      )
+    crate::bridge::needs_barrier(self.opcode, self.error)
   }
 }
 

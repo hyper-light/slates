@@ -342,6 +342,23 @@ fn revocation_refuses_before_access_and_the_terminal_step_reclaims() {
   assert_reclaimed(&mut admitted, &mut bridge, &registry, ino, &probe);
 }
 
+/// One pass as the daemon's loop runs it: service, then — when a mutation's reply waits for the owner's
+/// barrier (AUD-29-82) — the barrier, which this owner always captures, and the completion. Returns the chains
+/// whose used element was published.
+fn owner_pass(
+  admitted: &mut AdmittedDevice<SimVmm>,
+  bridge: &mut VolumeBridge<'_>,
+  registry: &Attachments,
+) -> u32 {
+  let pass = admitted.service(bridge, registry).unwrap();
+  if !pass.barrier_owed {
+    return pass.served;
+  }
+  let completed = admitted.complete_barrier(bridge, registry, true).unwrap();
+  assert!(completed.is_some_and(|done| !done.refused));
+  pass.served + 1
+}
+
 /// The guest creates a file and unlinks it without releasing or forgetting it, so only the
 /// attachment's references keep the inode alive; returns its number.
 fn create_and_unlink_orphan(
@@ -362,7 +379,7 @@ fn create_and_unlink_orphan(
     REPLY_CAP,
     1,
   );
-  assert_eq!(admitted.service(bridge, registry).unwrap().served, 1);
+  assert_eq!(owner_pass(admitted, bridge, registry), 1);
   let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
   assert_eq!(id, head);
   let created = admitted.seam().guest().reply_of(rq, head, len);
@@ -378,7 +395,7 @@ fn create_and_unlink_orphan(
     REPLY_CAP,
     1,
   );
-  assert_eq!(admitted.service(bridge, registry).unwrap().served, 1);
+  assert_eq!(owner_pass(admitted, bridge, registry), 1);
   let _ = admitted.seam_mut().guest_mut().reap(rq);
   ino
 }

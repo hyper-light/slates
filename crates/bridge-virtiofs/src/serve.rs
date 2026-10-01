@@ -154,6 +154,13 @@ pub trait BridgeAccess {
     &mut self,
     f: impl FnOnce(&mut dyn Bridge, &mut Attachments) -> R,
   ) -> Result<R, VfsError>;
+
+  /// The owner's barrier (§4.8, D-18; AUD-29-82): makes the volume's current state survive a daemon restart
+  /// — the daemon publishes the shard's recovery image — and says whether the volume was captured. Run
+  /// between a mutation's dispatch and the publication of its used element, outside [`Self::with_bridge`]
+  /// (the publication needs the owner's whole state). `false` — refused, or the volume left out — answers
+  /// the guest `EIO`, never a promise of survival.
+  fn barrier(&mut self) -> bool;
 }
 
 /// Why the loop ended.
@@ -198,6 +205,14 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
       .with_bridge(|b, registry| admitted.service(b, registry))
       .map_err(ServeError::Authority)??;
     *passes = passes.saturating_add(1);
+    if pass.barrier_owed {
+      // A mutation's reply waits for the owner's barrier: publish, then let the guest learn the reply (or
+      // `EIO`, when the publication did not capture the volume) before any later chain is served.
+      let captured = bridge.barrier();
+      bridge
+        .with_bridge(|b, registry| admitted.complete_barrier(b, registry, captured))
+        .map_err(ServeError::Authority)??;
+    }
     // A guest's requests are client activity: the shard spins out its idle window after a pass, so the
     // guest's next kick lands in the spin rather than waking a parked shard (§4.7).
     slates_rt::registry::with_current(|ctx| ctx.note_activity());

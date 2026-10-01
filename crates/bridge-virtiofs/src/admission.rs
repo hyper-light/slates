@@ -43,7 +43,7 @@ use slates_vfs::error::VfsError;
 
 use crate::capability::{TransportCapability, attached_capability};
 use crate::credit::{AttachmentCredits, CreditLedger};
-use crate::device::{Device, DeviceConfig, DeviceError, Serviced};
+use crate::device::{Completed, Device, DeviceConfig, DeviceError, Serviced};
 use crate::memory::GuestMemory;
 use crate::virtqueue::QueueLayout;
 
@@ -514,6 +514,12 @@ impl<S: VmmSeam> AdmittedDevice<S> {
         if pass.served > 0 && pass.interrupt_wanted {
           to_notify.push(queue);
         }
+        if pass.barrier_owed {
+          // A chain waits for the owner's barrier: the pass ends here, and the owner completes it
+          // ([`AdmittedDevice::complete_barrier`]) before any later chain is served (AUD-29-82).
+          total.barrier_owed = true;
+          break;
+        }
       }
     }
     for queue in to_notify {
@@ -524,9 +530,45 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(total)
   }
 
+  /// Completes the chain a pass held for the owner's barrier (AUD-29-82): `captured` says whether the owner's
+  /// recovery publication covered the volume. Captured, the guest learns its reply; refused, it is answered
+  /// `EIO` and the reply's grants are given back. The queue is notified when its driver asks. `Ok(None)` when
+  /// no chain is held. Refused typed — and nothing touched — once the device is revoked (the terminal step
+  /// owns a held chain then).
+  pub fn complete_barrier(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+    captured: bool,
+  ) -> Result<Option<Completed>, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Err(ServeError::Revoked);
+    }
+    let cx = registry
+      .context(self.attachment)
+      .map_err(ServeError::Authority)?;
+    let completed = {
+      let memory = self.seam.memory().map_err(ServeError::Seam)?;
+      self
+        .device
+        .complete_awaiting(memory, bridge, &cx, captured, &mut self.ledger)
+        .map_err(ServeError::Device)?
+    };
+    if let Some(done) = completed
+      && done.interrupt_wanted
+    {
+      self
+        .seam
+        .notify_used(done.queue)
+        .map_err(ServeError::Seam)?;
+      self.counters.notifications = self.counters.notifications.saturating_add(1);
+    }
+    Ok(completed)
+  }
+
   /// Stops admission now: no later pass touches the ring. Returns the requests in flight at this
-  /// moment (none, in this device, which completes each before taking the next). The terminal step
-  /// is [`AdmittedDevice::reclaim`].
+  /// moment: none, or the one chain held for the owner's barrier (whose grants the terminal step's sweep
+  /// releases and whose charge it restores). The terminal step is [`AdmittedDevice::reclaim`].
   pub fn revoke(&mut self) -> u32 {
     if self.state == AttachmentState::Live {
       self.state = AttachmentState::Revoked;

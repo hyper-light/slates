@@ -1826,6 +1826,15 @@ must exercise local communication and isolation between clones as well as namesp
 > by the server (`reclaim_unreported`: its lookup references forgotten, its open handle released), the rule
 > libfuse's `fuse.c` keeps; counted (`fuse.reply_reclaimed`, the device's `reclaimed`).
 
+> **Status (2026-10-01, AUD-29-82: a guest's mutation is acknowledged only after the barrier).** The virtio-fs
+> device holds the used element of a request that changes what survives a restart (the shared
+> `needs_barrier` rule the FUSE turn applies: namespace and attribute changes, `fsync`, the `flush` a close
+> sends); the serve loop runs the owner's barrier (`BridgeAccess::barrier`, the shard's recovery publication
+> checked for the volume) and only then lets the guest learn the reply — or `EIO`, with the reply's grants
+> given back, when the publication did not capture the volume. A guest's acknowledged close survives a
+> daemon restart (`crates/server/tests/virtiofs.rs`). Group commit across a pass's chains is not built: one
+> publication per held chain, as the FUSE and NFS paths do.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

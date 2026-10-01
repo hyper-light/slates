@@ -2,6 +2,8 @@
 //! compiles this module afresh, so a helper one test does not use is dead code there — allowed here.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+pub(crate) mod anchor;
 // The landing plane's fixtures drive the Unix landing (the daemon lands nothing on Windows yet).
 #[cfg(unix)]
 pub(crate) mod landing;

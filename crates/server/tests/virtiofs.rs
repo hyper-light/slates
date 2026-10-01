@@ -40,6 +40,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 use slates_wire::request::RequestId;
 
 mod common;
+use common::anchor::{anchor_segment, source_of};
 use common::nfs::{lookup, mount, read};
 
 /// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
@@ -398,6 +399,13 @@ fn write_body(fh: u64, data: &[u8]) -> Vec<u8> {
   b
 }
 
+/// `fuse_flush_in`: fh, two words slates skips, then the lock owner — what a guest's `close` sends.
+fn flush_body(fh: u64) -> Vec<u8> {
+  let mut b = fh.to_le_bytes().to_vec();
+  b.extend_from_slice(&[0u8; 16]);
+  b
+}
+
 /// `fuse_release_in`: fh then three words slates skips.
 fn release_body(fh: u64) -> Vec<u8> {
   let mut b = fh.to_le_bytes().to_vec();
@@ -604,4 +612,94 @@ fn a_guest_whose_consumer_has_no_rights_is_refused_every_effect() {
   assert!(matches!(outcome, GuestDeviceOutcome::Ended(_)));
   drop(client);
   drop(daemon);
+}
+
+/// AUD-29-82 (D-18, §4.8). Do: under a daemon whose anchor segment the test holds, a guest creates a file,
+/// writes bytes and closes it (FLUSH, then RELEASE) through virtqueues, every reply a success; stop the daemon
+/// — a stop publishes nothing — and start a second one over the same segment. Expect: the second daemon reads
+/// back the guest's bytes over NFS, because the guest learned of the CREATE and the FLUSH only after the
+/// owner's barrier captured the volume; the first daemon refused no barrier. Before, the guest path never
+/// published, so the acknowledged file was lost at the restart.
+#[test]
+fn a_guests_acknowledged_close_survives_a_daemon_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-guest-durable-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("guest-durable", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("durable")) else {
+    panic!("the volume was not created");
+  };
+  let (outcome, errors) = run_guest(
+    &first,
+    id,
+    Principal::Uid { uid: my_uid() },
+    |kick_write, call_read| {
+      Box::pin(async move {
+        let created = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::Create.to_wire(), 1, 1, &create_body("kept.txt")),
+        )
+        .await;
+        let ino = u64_at(&created, OUT_HEADER_LEN);
+        let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+        let mut errors = vec![reply_error(&created)];
+        for (unique, opcode, body) in [
+          (2, Opcode::Write, write_body(fh, PAYLOAD)),
+          (3, Opcode::Flush, flush_body(fh)),
+          (4, Opcode::Release, release_body(fh)),
+        ] {
+          let reply = round_trip(
+            &kick_write,
+            &call_read,
+            &message(opcode.to_wire(), unique, ino, &body),
+          )
+          .await;
+          errors.push(reply_error(&reply));
+        }
+        drop(kick_write);
+        errors
+      })
+    },
+  );
+  assert_eq!(
+    errors,
+    [0, 0, 0, 0],
+    "create, write, flush and release succeeded"
+  );
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  let refusals = first.fleet_refusals().unwrap();
+  assert_eq!(
+    refusals.get("virtiofs.barrier_refused"),
+    None,
+    "{refusals:?}"
+  );
+  drop(client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let capability = second
+    .mount_capability("durable")
+    .expect("the owner shard answers")
+    .expect("the volume was recovered");
+  let port = second.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "kept.txt", 2);
+  assert_eq!(
+    read(&mut stream, &file, 3),
+    PAYLOAD,
+    "the bytes the guest closed survived the restart"
+  );
+  drop(stream);
+  second.stop();
+  drop(segment);
 }

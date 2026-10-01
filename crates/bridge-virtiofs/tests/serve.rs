@@ -171,6 +171,8 @@ struct OwnedVolume {
   volume: Volume,
   /// The owner's attachment registry the device is admitted into (GAP-A9-4).
   registry: Attachments,
+  /// The barriers the loop ran (AUD-29-82); each captures (the test owner has nothing to refuse with).
+  barriers: u64,
 }
 
 impl OwnedVolume {
@@ -181,6 +183,7 @@ impl OwnedVolume {
       store,
       volume,
       registry: Attachments::new(),
+      barriers: 0,
     }
   }
 }
@@ -192,6 +195,11 @@ impl BridgeAccess for OwnedVolume {
   ) -> Result<R, VfsError> {
     let mut bridge = VolumeBridge::new(vid(), &mut self.volume, &mut self.store);
     Ok(f(&mut bridge, &mut self.registry))
+  }
+
+  fn barrier(&mut self) -> bool {
+    self.barriers += 1;
+    true
   }
 }
 

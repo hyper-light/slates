@@ -819,7 +819,9 @@ impl Bridge for VolumeBridge<'_> {
 
   fn flush(&mut self, _object: ObjectId, cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
     self.authorize_read(cx)?;
-    // No disk write: the data is already in the anchor segment (§4.6). Success.
+    // Nothing to force at this layer: the bytes are in the volume's live tree. Their survival across a
+    // daemon restart is the owner's barrier (§4.8, D-18): every transport holds this flush's success reply
+    // until its recovery publication has captured the volume (AUD-29-82), and answers `EIO` when it did not.
     Ok(())
   }
 

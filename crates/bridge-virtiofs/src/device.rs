@@ -37,7 +37,9 @@ use std::fmt;
 
 use slates_bridge_core::{Bridge, OpContext};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::{EIO, dispatch, reclaim_unreported, success_reply_bytes};
+use slates_bridge_fuse::bridge::{
+  EIO, dispatch, needs_barrier, reclaim_unreported, success_reply_bytes,
+};
 use slates_bridge_fuse::init::{InitNegotiation, MAX_WRITE, negotiate};
 use slates_bridge_fuse::reply::ReplyHeader;
 use slates_bridge_fuse::request::InHeader;
@@ -200,6 +202,11 @@ pub struct DeviceCounters {
   /// References and handles given back for success replies that could not be scattered into the guest's
   /// buffers (AUD-29-85): what the guest never learned it held.
   pub reclaimed: u64,
+  /// Barriers the owner refused: the held chain answered `EIO`, its grants given back (AUD-29-82).
+  pub barriers_refused: u64,
+  /// Chains whose used element waited for the owner's barrier (AUD-29-82): the non-vacuity counter of the
+  /// barrier path.
+  pub barriers_awaited: u64,
   /// `FUSE_INIT` requests observed.
   pub init_seen: u64,
   /// `FUSE_DESTROY` requests observed.
@@ -216,6 +223,35 @@ pub struct Serviced {
   pub more_pending: bool,
   /// Whether the driver asks to be interrupted for used buffers (§2.7.7).
   pub interrupt_wanted: bool,
+  /// Whether the pass stopped at a chain whose reply waits for the owner's barrier (§4.8, D-18): its effect
+  /// is in the volume and its reply in the guest's buffers, but its used element is unpublished until
+  /// [`Device::complete_awaiting`] says whether the volume was captured (AUD-29-82).
+  pub barrier_owed: bool,
+}
+
+/// A chain whose request changed what survives a restart: dispatched, its reply scattered, its used element
+/// held back for the owner's barrier (AUD-29-82). The request's opcode and node id name what its reply granted,
+/// for a refused barrier's reclaim.
+#[derive(Clone, Debug)]
+struct AwaitingBarrier {
+  queue: u16,
+  chain: DescriptorChain,
+  written: u32,
+  opcode: Option<Opcode>,
+  nodeid: u64,
+  unique: u64,
+}
+
+/// A held chain the owner has completed: the queue it was on and whether that queue's driver asks to be
+/// interrupted for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Completed {
+  /// The queue whose used ring took the element.
+  pub queue: u16,
+  /// Whether the driver asks to be interrupted for used buffers (§2.7.7).
+  pub interrupt_wanted: bool,
+  /// Whether the barrier was refused, so the guest was answered `EIO` in place of the reply.
+  pub refused: bool,
 }
 
 /// The device's closed refusal taxonomy.
@@ -344,6 +380,7 @@ pub struct Device {
   reply: Vec<u8>,
   negotiated: Option<InitNegotiation>,
   fault: Option<DeviceError>,
+  awaiting: Option<AwaitingBarrier>,
   counters: DeviceCounters,
 }
 
@@ -368,6 +405,7 @@ impl Device {
       reply: Vec::new(),
       negotiated: None,
       fault: None,
+      awaiting: None,
       counters: DeviceCounters::default(),
     }
   }
@@ -448,6 +486,15 @@ impl Device {
       return Err(fault.clone());
     }
     let index = self.queue_index(queue)?;
+    if self.awaiting.is_some() {
+      // Nothing is served past a held chain: its completion is the owner's next step.
+      return Ok(Serviced {
+        served: 0,
+        more_pending: true,
+        interrupt_wanted: false,
+        barrier_owed: true,
+      });
+    }
     let mut served: u32 = 0;
     while served < batch {
       let Some(chain) = self.queues[index].peek(memory)? else {
@@ -461,6 +508,18 @@ impl Device {
         Ok(written) => written,
         Err(refusal) => return Err(self.record_fault(refusal)),
       };
+      if let Some(awaiting) = self.awaits_barrier(queue, &chain, written) {
+        // The reply is in the guest's buffers, but the guest learns of it only from the used element,
+        // which waits for the owner's barrier (§4.8, D-18).
+        self.awaiting = Some(awaiting);
+        self.counters.barriers_awaited = self.counters.barriers_awaited.saturating_add(1);
+        return Ok(Serviced {
+          served,
+          more_pending: true,
+          interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
+          barrier_owed: true,
+        });
+      }
       self.queues[index].push_used(memory, &chain, written)?;
       admission.complete(&chain, written);
       served = served.saturating_add(1);
@@ -469,7 +528,82 @@ impl Device {
       served,
       more_pending: self.queues[index].pending(memory)? > 0,
       interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
+      barrier_owed: false,
     })
+  }
+
+  /// The held form of a chain just served, when its request changed what survives a restart and succeeded
+  /// ([`needs_barrier`]); `None` for every other chain (reads, unstable writes, refusals, the
+  /// high-priority queue's FORGETs).
+  fn awaits_barrier(
+    &self,
+    queue: u16,
+    chain: &DescriptorChain,
+    written: u32,
+  ) -> Option<AwaitingBarrier> {
+    let header = InHeader::parse(&self.request).ok()?;
+    let opcode = Opcode::from_wire(header.opcode);
+    let reply = self
+      .reply
+      .get(..usize::try_from(written).ok()?)
+      .unwrap_or(&[]);
+    needs_barrier(opcode, reply_errno(reply)).then(|| AwaitingBarrier {
+      queue,
+      chain: chain.clone(),
+      written,
+      opcode,
+      nodeid: header.nodeid,
+      unique: header.unique,
+    })
+  }
+
+  /// Completes the chain held for the owner's barrier (AUD-29-82): when `captured`, its used element is
+  /// published as served; otherwise the guest is answered `EIO` in its place — the effect is in the volume
+  /// but not promised to survive, as a refused NFS publication — and what the reply granted is given back
+  /// ([`reclaim_unreported`]), since the guest never learns it. The chain's charge is released either way.
+  /// `None` when no chain is held.
+  pub fn complete_awaiting(
+    &mut self,
+    memory: &mut dyn GuestMemory,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+    captured: bool,
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<Option<Completed>, DeviceError> {
+    let Some(held) = self.awaiting.take() else {
+      return Ok(None);
+    };
+    let index = self.queue_index(held.queue)?;
+    let mut written = held.written;
+    if !captured {
+      let reply = self
+        .reply
+        .get(..usize::try_from(held.written).unwrap_or(0))
+        .unwrap_or(&[]);
+      let reclaimed = reclaim_unreported(held.opcode, held.nodeid, reply, bridge, cx);
+      self.counters.reclaimed = self
+        .counters
+        .reclaimed
+        .saturating_add(reclaimed.references.saturating_add(reclaimed.handles));
+      let mut refusal = [0u8; OUT_HEADER_LEN];
+      let n = ReplyHeader::write_error(held.unique, EIO, &mut refusal).unwrap_or(0);
+      if let Err(refused) = scatter(
+        memory,
+        &held.chain.writable,
+        refusal.get(..n).unwrap_or(&[]),
+      ) {
+        return Err(self.record_fault(refused));
+      }
+      written = u32::try_from(n).unwrap_or(u32::MAX);
+      self.counters.barriers_refused = self.counters.barriers_refused.saturating_add(1);
+    }
+    self.queues[index].push_used(memory, &held.chain, written)?;
+    admission.complete(&held.chain, written);
+    Ok(Some(Completed {
+      queue: held.queue,
+      interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
+      refused: !captured,
+    }))
   }
 
   /// Records the fault that stops the device and hands the refusal back.
@@ -605,6 +739,17 @@ impl Device {
       .bytes_scattered
       .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
   }
+}
+
+/// The errno a reply carries (`fuse_out_header.error`, negated on the wire), as a positive number; zero for
+/// success or for no reply.
+fn reply_errno(reply: &[u8]) -> i32 {
+  /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
+  const ERROR_AT: usize = size_of::<u32>();
+  reply
+    .get(ERROR_AT..ERROR_AT.saturating_add(size_of::<i32>()))
+    .and_then(|bytes| bytes.try_into().ok())
+    .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
 }
 
 /// Whether a request of this header expects a reply: every opcode but the forgets.

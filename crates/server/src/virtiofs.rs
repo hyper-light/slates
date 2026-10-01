@@ -110,7 +110,26 @@ impl BridgeAccess for ShardBridge {
     .flatten()
     .ok_or(VfsError::NotFound)
   }
+
+  /// The §4.8 barrier the daemon's other transports run before a mutation's reply (NFS's stable
+  /// procedures, a FUSE mount's turn): the shard's recovery image is published, and the guest's reply is
+  /// released only when it captured this volume (AUD-29-82). A refusal is counted.
+  fn barrier(&mut self) -> bool {
+    let volume = self.volume;
+    state::with_state(|s| {
+      let captured =
+        crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(volume));
+      if !captured {
+        *s.refusals.entry(BARRIER_REFUSED).or_insert(0) += 1;
+      }
+      captured
+    })
+    .unwrap_or(false)
+  }
 }
+
+/// Format: the refusal-ledger name of a guest barrier that did not capture its volume.
+const BARRIER_REFUSED: &str = "virtiofs.barrier_refused";
 
 /// Boots and serves one guest device on the owner shard: admission, then the loop until it ends.
 async fn serve_guest_device<S: VmmSeam + Send + 'static>(

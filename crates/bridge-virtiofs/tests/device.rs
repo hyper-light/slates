@@ -103,7 +103,8 @@ fn name_body(name: &str) -> Vec<u8> {
   b
 }
 
-/// One service pass of `queue` with no credit accounting (the codec-level tests).
+/// One service pass of `queue` with no credit accounting (the codec-level tests), as an owner whose barrier
+/// always captures runs it: a chain held for the barrier (AUD-29-82) is completed and counted as served.
 fn serve(
   device: &mut Device,
   queue: u16,
@@ -112,7 +113,14 @@ fn serve(
   cx: &OpContext,
   batch: u32,
 ) -> Result<slates_bridge_virtiofs::device::Serviced, DeviceError> {
-  device.service_queue(queue, &mut driver.memory, bridge, cx, batch, &mut Unlimited)
+  let mut pass =
+    device.service_queue(queue, &mut driver.memory, bridge, cx, batch, &mut Unlimited)?;
+  if pass.barrier_owed {
+    device.complete_awaiting(&mut driver.memory, bridge, cx, true, &mut Unlimited)?;
+    pass.served += 1;
+    pass.barrier_owed = false;
+  }
+  Ok(pass)
 }
 
 /// The two legs of the oracle: the device over one scratch volume and direct dispatch over another.
@@ -710,5 +718,116 @@ fn a_reply_the_guest_cannot_take_gives_back_what_it_granted() {
   assert!(
     vol.stat(&store, lost).is_err(),
     "the unlinked inode was reclaimed: nothing references it"
+  );
+}
+
+/// AUD-29-82 (§4.8, D-18). Do: post a CREATE, serve it, and look for its used element before the owner's
+/// barrier; complete it with the barrier refused; then post a WRITE on a captured file and serve it. Expect:
+/// the CREATE's pass reports the barrier owed and publishes no used element (the guest cannot see the reply);
+/// the refused completion answers `EIO` in its place and gives back the reply's reference and handle; a WRITE
+/// (made stable by the flush that follows, as an NFS unstable write) never waits for a barrier.
+#[test]
+fn a_mutations_used_element_waits_for_the_owners_barrier() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let cx = context();
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let head = driver.submit(
+    rq,
+    &message(Opcode::Create.to_wire(), 1, ROOT, &create_body("held")),
+    REPLY_CAP,
+    1,
+  );
+  let pass = device
+    .service_queue(
+      FIRST_REQUEST_QUEUE,
+      &mut driver.memory,
+      &mut bridge,
+      &cx,
+      BATCH,
+      &mut Unlimited,
+    )
+    .unwrap();
+  assert!(pass.barrier_owed);
+  assert!(
+    driver.reap(rq).is_none(),
+    "no used element before the barrier"
+  );
+  let completed = device
+    .complete_awaiting(&mut driver.memory, &mut bridge, &cx, false, &mut Unlimited)
+    .unwrap()
+    .unwrap();
+  assert!(completed.refused);
+  let (id, len) = driver.reap(rq).unwrap();
+  assert_eq!(id, head);
+  assert_eq!(reply_error(&driver.reply_of(rq, head, len)), -EIO);
+  let counters = device.counters();
+  assert_eq!(
+    (
+      counters.barriers_awaited,
+      counters.barriers_refused,
+      counters.reclaimed
+    ),
+    (1, 1, 2)
+  );
+
+  let created = {
+    let head = driver.submit(
+      rq,
+      &message(Opcode::Create.to_wire(), 2, ROOT, &create_body("kept")),
+      REPLY_CAP,
+      1,
+    );
+    serve(
+      &mut device,
+      FIRST_REQUEST_QUEUE,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      BATCH,
+    )
+    .unwrap();
+    let (_, len) = driver.reap(rq).unwrap();
+    driver.reply_of(rq, head, len)
+  };
+  let ino = u64::from_le_bytes(
+    created[OUT_HEADER_LEN..OUT_HEADER_LEN + 8]
+      .try_into()
+      .unwrap(),
+  );
+  let fh = u64::from_le_bytes(
+    created[OUT_HEADER_LEN + EntryOut::LEN..OUT_HEADER_LEN + EntryOut::LEN + 8]
+      .try_into()
+      .unwrap(),
+  );
+  driver.submit(
+    rq,
+    &message(
+      Opcode::Write.to_wire(),
+      3,
+      ino,
+      &write_body(fh, 0, b"bytes"),
+    ),
+    REPLY_CAP,
+    1,
+  );
+  let pass = device
+    .service_queue(
+      FIRST_REQUEST_QUEUE,
+      &mut driver.memory,
+      &mut bridge,
+      &cx,
+      BATCH,
+      &mut Unlimited,
+    )
+    .unwrap();
+  assert!(!pass.barrier_owed, "a write waits for no barrier");
+  assert_eq!(pass.served, 1);
+  assert_eq!(
+    device.counters().barriers_awaited,
+    2,
+    "only the two CREATEs waited"
   );
 }

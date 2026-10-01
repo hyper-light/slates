@@ -167,6 +167,34 @@ pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
   Some(OUT_HEADER_LEN.saturating_add(body))
 }
 
+/// Whether a request that answered `error` changed the volume in a way its caller is promised survives a
+/// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, and the commit
+/// points of data — `fsync` and the `flush` every close sends — succeeded. A plain `write` is not one: like an
+/// NFS `UNSTABLE` write, its bytes are in the daemon when it returns and are made stable by the `flush` or
+/// `fsync` that follows. Every transport that serves this dispatch (the kernel's `/dev/fuse`, a virtio-fs
+/// guest) holds such a reply until its owner's barrier has captured the volume (AUD-29-82).
+pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
+  error == 0
+    && matches!(
+      opcode,
+      Some(
+        Opcode::SetAttr
+          | Opcode::SymLink
+          | Opcode::MkNod
+          | Opcode::MkDir
+          | Opcode::Unlink
+          | Opcode::RmDir
+          | Opcode::Rename
+          | Opcode::Rename2
+          | Opcode::Link
+          | Opcode::Create
+          | Opcode::FSync
+          | Opcode::FSyncDir
+          | Opcode::Flush
+      )
+    )
+}
+
 /// What [`reclaim_unreported`] gave back: the lookup references forgotten and the open handles released.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reclaimed {
