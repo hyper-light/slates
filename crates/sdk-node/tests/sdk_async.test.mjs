@@ -210,29 +210,34 @@ function startTicker() {
   return ticker;
 }
 
+// Runs `program` without blocking the loop (the ticker must measure the SDK, not this harness's own
+// process spawns, which take tens of milliseconds on a loaded runner): its exit status and stdout.
+function runAsync(program, args) {
+  return new Promise((resolve) => {
+    const child = spawn(program, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let stdout = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.on('close', (status) => resolve({ status, stdout }));
+    child.on('error', () => resolve({ status: -1, stdout }));
+  });
+}
+
 // The pids of the daemon an anchor for `instance` supervises (scoped by instance, never a bare name).
-function daemonPids(daemon, instance) {
-  const found = spawnSync('pgrep', ['-f', `${daemon} --instance ${instance} daemon`], { encoding: 'utf8' });
+async function daemonPids(daemon, instance) {
+  const found = await runAsync('pgrep', ['-f', `${daemon} --instance ${instance} daemon`]);
   return found.stdout.split('\n').filter(Boolean).map(Number);
 }
 
 async function waitFor(condition, what) {
   const deadline = Date.now() + STARTUP_MS;
-  while (!condition()) {
+  while (!(await condition())) {
     assert.ok(Date.now() < deadline, what);
     await sleep(POLL_MS);
   }
 }
 
-// AUD-29-19 / AUD-29-20: every call ends, and the loop is never held. Do, with an independent ticker on the
-// loop and every connect made from it: (1) stop the daemon, issue three bounds' worth of list calls, and
-// kill it under them, so the anchor restarts it; (2) stop the anchor and the daemon (SIGSTOP) and issue a
-// call, then issue one and cancel it; (3) issue a call with the daemon stopped and destroy the completion
-// socket under it; (4) connect afresh, kill the anchor and its daemon for good and issue calls. Expect: the
-// overflow refused at once; every admitted call answered after the restart; the call to the stopped daemon
-// failed Stalled; the cancelled call rejected AbortError with nothing left waiting; the call whose reader
-// was lost failed; every call after the death failed DaemonGone (the daemon's exit seen, not
-// a stall); and the ticker never late past its bound.
 test('every async call ends across restart, silence, reader loss and death', async (t) => {
   const daemon = process.env.SLATES_DAEMON;
   if (!addonPath || !existsSync(addonPath) || !daemon || !existsSync(daemon)) {
@@ -248,14 +253,12 @@ test('every async call ends across restart, silence, reader loss and death', asy
   const ticker = startTicker();
   try {
     const client = await connectWhenReady(slates, instance);
-    const bootstrap = spawnSync(daemon, ['--instance', instance, 'bootstrap', 'root'], {
-      encoding: 'utf8', timeout: STARTUP_MS,
-    });
-    assert.equal(bootstrap.status, 0, bootstrap.stderr);
+    const bootstrap = await runAsync(daemon, ['--instance', instance, 'bootstrap', 'root']);
+    assert.equal(bootstrap.status, 0, 'the consensus group bootstraps');
     const limit = client._c.outstandingLimit();
 
     // (1) Overflow, then a restart under the calls.
-    const first = daemonPids(daemon, instance);
+    const first = await daemonPids(daemon, instance);
     assert.ok(first.length > 0, 'the daemon is running');
     // Stopped first, so the calls stay outstanding (a live daemon answers within the fast-path spin).
     for (const pid of first) process.kill(pid, 'SIGSTOP');
@@ -267,11 +270,11 @@ test('every async call ends across restart, silence, reader loss and death', asy
     assert.ok(refused.length > 0, 'the overflow is refused at once');
     assert.equal(answered.length + refused.length, settled.length,
       `every admitted call is answered after the restart: ${JSON.stringify(settled.filter((r) => r.status === 'rejected' && !/TooManyOutstanding/.test(r.reason.message)).map((r) => r.reason.message))}`);
-    await waitFor(() => daemonPids(daemon, instance).length > 0, 'the anchor restarted the daemon');
+    await waitFor(async () => (await daemonPids(daemon, instance)).length > 0, 'the anchor restarted the daemon');
 
     // (2) A live but silent daemon: the call ends Stalled at its reply deadline. Its anchor is stopped
     // first, or its supervision would replace the silent daemon and the call would be recovered instead.
-    const live = daemonPids(daemon, instance);
+    const live = await daemonPids(daemon, instance);
     process.kill(anchor.pid, 'SIGSTOP');
     for (const pid of live) process.kill(pid, 'SIGSTOP');
     await assert.rejects(client.list(), /Stalled/);
@@ -295,7 +298,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
     // (4) Death: a fresh client, then the anchor and its daemon killed for good.
     const fresh = await connectWhenReady(slates, instance);
     process.kill(-anchor.pid, 'SIGKILL');
-    await waitFor(() => daemonPids(daemon, instance).length === 0, 'the daemon is gone');
+    await waitFor(async () => (await daemonPids(daemon, instance)).length === 0, 'the daemon is gone');
     const doomed = await Promise.allSettled(Array.from({ length: limit }, () => fresh.list()));
     for (const result of doomed) {
       assert.equal(result.status, 'rejected');

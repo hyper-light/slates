@@ -213,19 +213,26 @@ class Ticker:
             self.worst = max(self.worst, time.monotonic() - due)
 
 
-def _daemon_pids(binary, instance):
+async def _run_async(*argv):
+    """Runs a command without blocking the loop (the ticker must measure the SDK, not this harness's own
+    process spawns, which take tens of milliseconds on a loaded runner): its exit status and stdout."""
+    process = await asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+    )
+    stdout, _ = await process.communicate()
+    return process.returncode, stdout.decode()
+
+
+async def _daemon_pids(binary, instance):
     """The pids of the daemon an anchor for `instance` supervises (scoped by instance, never a bare
     name)."""
-    found = subprocess.run(
-        ["pgrep", "-f", f"{binary} --instance {instance} daemon"],
-        capture_output=True, text=True, check=False,
-    )
-    return [int(pid) for pid in found.stdout.split()]
+    _, stdout = await _run_async("pgrep", "-f", f"{binary} --instance {instance} daemon")
+    return [int(pid) for pid in stdout.split()]
 
 
 async def _wait_for(condition, what):
     deadline = time.monotonic() + STARTUP_SECS
-    while not condition():
+    while not await condition():
         if time.monotonic() >= deadline:
             raise AssertionError(what)
         await asyncio.sleep(POLL_SECS)
@@ -259,12 +266,12 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
         ticker = Ticker()
         try:
             client = await _connect_when_ready(instance)
-            subprocess.run([binary, "--instance", instance, "bootstrap", "root"],
-                           check=True, timeout=STARTUP_SECS)
+            status, _ = await _run_async(binary, "--instance", instance, "bootstrap", "root")
+            self.assertEqual(status, 0, "the consensus group bootstraps")
             limit = client.outstanding_limit()
 
             # (1) Overflow, then a restart under the calls. Stopped first, so the calls stay outstanding.
-            first = _daemon_pids(binary, instance)
+            first = await _daemon_pids(binary, instance)
             self.assertTrue(first, "the daemon is running")
             for pid in first:
                 os.kill(pid, signal.SIGSTOP)
@@ -283,11 +290,14 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             failed = [str(result) for result in settled if isinstance(result, BaseException)]
             self.assertEqual(failed, [], "every admitted call is answered after the restart")
             self.assertGreaterEqual(client.reconnects(), 1, "non-vacuous: recovered by a reconnect")
-            await _wait_for(lambda: _daemon_pids(binary, instance), "the anchor restarted the daemon")
+            async def restarted():
+                return bool(await _daemon_pids(binary, instance))
+
+            await _wait_for(restarted, "the anchor restarted the daemon")
 
             # (2) A live but silent daemon: the call ends Stalled. Its anchor is stopped first, or its
             # supervision would replace the silent daemon and the call would be recovered instead.
-            live = _daemon_pids(binary, instance)
+            live = await _daemon_pids(binary, instance)
             os.kill(anchor.pid, signal.SIGSTOP)
             for pid in live:
                 os.kill(pid, signal.SIGSTOP)
@@ -309,7 +319,10 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             # (4) Death: a fresh client, then the anchor and its daemon killed for good.
             fresh = await _connect_when_ready(instance)
             os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
-            await _wait_for(lambda: not _daemon_pids(binary, instance), "the daemon is gone")
+            async def gone():
+                return not await _daemon_pids(binary, instance)
+
+            await _wait_for(gone, "the daemon is gone")
             doomed = await asyncio.gather(
                 *(fresh.list() for _ in range(limit)), return_exceptions=True
             )

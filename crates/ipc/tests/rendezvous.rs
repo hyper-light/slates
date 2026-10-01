@@ -279,3 +279,21 @@ fn poll_while_serving(
     );
   }
 }
+
+/// AUD-29-20 (found on CI 2026-10-01: a Node SDK recovery failed every call `OsRefused { call: "recvmsg",
+/// code: Some(104) }`). Do: begin a claim on a daemon end, then close the daemon end before it answers — as a
+/// daemon killed with the claim in its backlog — and poll the claim until it ends. Expect: `DaemonUnavailable`,
+/// which a reconnect retries, never an `OsRefused` that ends every call. Linux resets the queued connection
+/// (`ECONNRESET`); macOS and Windows leave the claim unanswered until the claim wait.
+#[test]
+fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
+  let instance = format!("test-claim-reset-{}", std::process::id());
+  let listener = Listener::open(&instance).unwrap();
+  let claim = begin_connect_as(&instance, 0).unwrap();
+  drop(listener);
+  let (refusal, _, _) = poll_until_refused(claim);
+  assert!(
+    matches!(refusal, IpcError::DaemonUnavailable { .. }),
+    "{refusal:?}"
+  );
+}

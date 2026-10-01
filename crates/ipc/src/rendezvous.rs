@@ -698,9 +698,20 @@ pub mod platform {
         },
       }
     })?;
-    // A fresh socket's send buffer takes the four-byte hello whole.
-    rustix::net::send(&socket, &wanted.to_le_bytes(), SendFlags::empty())
-      .map_err(|e| refused("send", e))?;
+    // A fresh socket's send buffer takes the four-byte hello whole. A daemon that died between the connect
+    // and the hello is unavailable (retried), as at the handoff's receive.
+    rustix::net::send(&socket, &wanted.to_le_bytes(), SendFlags::empty()).map_err(|errno| {
+      match errno {
+        rustix::io::Errno::CONNRESET
+        | rustix::io::Errno::CONNREFUSED
+        | rustix::io::Errno::PIPE
+        | rustix::io::Errno::NOTCONN => IpcError::DaemonUnavailable {
+          endpoint: instance.to_owned(),
+          why: "the daemon closed the rendezvous before the claim was sent",
+        },
+        other => refused("send", other),
+      }
+    })?;
     Ok(Claim {
       instance: instance.to_owned(),
       socket: Some(socket),
@@ -740,6 +751,21 @@ pub mod platform {
           })
         }
         Err(rustix::io::Errno::INTR) => Ok(None),
+        // The daemon went away with the claim still queued (killed before it accepted, or closing as it
+        // did): it never answered, which a reconnect retries — not a refusal that ends the caller's calls
+        // (found on CI 2026-10-01: `OsRefused { call: "recvmsg", code: Some(104) }`).
+        Err(
+          rustix::io::Errno::CONNRESET
+          | rustix::io::Errno::CONNREFUSED
+          | rustix::io::Errno::PIPE
+          | rustix::io::Errno::NOTCONN,
+        ) => {
+          self.socket = None;
+          Err(IpcError::DaemonUnavailable {
+            endpoint: self.instance.clone(),
+            why: "the daemon closed the rendezvous before answering the claim",
+          })
+        }
         Err(e) => {
           self.socket = None;
           Err(refused("recvmsg", e))
