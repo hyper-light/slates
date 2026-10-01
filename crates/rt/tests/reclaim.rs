@@ -269,7 +269,7 @@ fn a_wake_minted_for_a_dead_shard_is_refused_by_the_slots_new_holder() {
 }
 
 /// AUD-29-11 at the wake word's boundary, without 2^24 iterations. Do: free a runtime's shard slot and
-/// prime it to the last generation a wake word carries (`Encoded::MAX_GENERATION`, what a predecessor
+/// prime it to the last generation a task arena issues (`Encoded::TASK_GENERATION_LIMIT`, what a predecessor
 /// that reused one task slot to the end would leave); start a runtime on it; run a task to completion and
 /// keep its waker; run a second task; fire the first waker; shut down; start a third runtime. Expect: the
 /// first task was issued the last generation and its slot retired (the second task took another slot);
@@ -291,7 +291,7 @@ fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
   let first = Runtime::start(&config(1)).unwrap();
   let id = first.shard_ids()[0];
   first.shutdown().unwrap();
-  slates_rt::registry::note_arena_generation(id.0, slates_mem::Encoded::MAX_GENERATION);
+  slates_rt::registry::note_arena_generation(id.0, slates_mem::Encoded::TASK_GENERATION_LIMIT);
 
   let second = Runtime::start(&config(1)).unwrap();
   assert_eq!(second.shard_ids()[0], id, "the primed slot was reused");
@@ -309,7 +309,7 @@ fn a_shard_slot_whose_wake_generations_are_spent_retires_and_is_not_reissued() {
   let stale = rx.recv_timeout(wait).unwrap();
   assert_eq!(
     last.0.generation(),
-    slates_mem::Encoded::MAX_GENERATION,
+    slates_mem::Encoded::TASK_GENERATION_LIMIT,
     "the first task was issued the word's last generation"
   );
   let next = admitted(second.spawn_on_with_receipt(id, Capture(tx)).unwrap());

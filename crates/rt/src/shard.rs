@@ -441,7 +441,7 @@ impl ShardContext {
       config.tasks_per_shard,
       generation_base,
     )
-    .with_generation_limit(Encoded::MAX_GENERATION);
+    .with_generation_limit(Encoded::TASK_GENERATION_LIMIT);
     arena.reserve_segments(
       config
         .tasks_per_shard
@@ -1469,10 +1469,12 @@ impl ShardContext {
   }
 
   fn handle_wake(&self, inner: &mut ShardInner, word: Encoded) {
+    // A slot-only word (a 32-bit target's waker) wakes the slot's current occupant, as a same-shard wake
+    // does; a full word wakes only the task it names.
     if inner
       .arena
       .generation_at(word.slot())
-      .is_some_and(|g| g == word.generation())
+      .is_some_and(|g| g == word.generation() || word.generation() == Encoded::ANY_GENERATION)
     {
       self.local.push(word.slot());
     } else {

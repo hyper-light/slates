@@ -46,7 +46,12 @@ use crate::shard::ShardContext;
 
 /// Shape: the bound on shard ids per process: more than any host's core count, few enough that
 /// the registry is a small static table and a packed word's top bits stay free.
+#[cfg(target_pointer_width = "64")]
 pub const MAX_SHARDS: usize = 1024;
+/// Derived: on a 32-bit target, the shards its waker's data pointer can name beside a slot
+/// ([`crate::waker::MAX_SHARDS_32`]); a further shard is refused `TooManyShards` at registration.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_SHARDS: usize = crate::waker::MAX_SHARDS_32;
 
 /// A registered shard: its foreign wake ring, its control channel and its kick.
 #[derive(Debug)]
@@ -329,7 +334,7 @@ pub(crate) fn register_slot(
     // A slot whose identities are spent is never claimed again (AUD-29-11): its own word would wrap and
     // a stale holder would name the next shard, or its task arena has issued every generation a wake word
     // carries and a successor would have none to issue. It is retired, like a slab slot at its limit.
-    if slot.arena_generation.load(Ordering::Acquire) > Encoded::MAX_GENERATION {
+    if slot.arena_generation.load(Ordering::Acquire) > Encoded::TASK_GENERATION_LIMIT {
       continue;
     }
     // Claim: free (odd) → claimed (the next even). A loser sees the even value and moves on.

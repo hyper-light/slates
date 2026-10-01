@@ -1024,6 +1024,22 @@ checked and refuse before mutation.
 >   - a probe period waits for traffic alone
 >   (`docs/bugs/2026-09-30-a-refused-sleep-completed-at-once.md`).
 >
+> **Status (2026-10-01, the waker on every pointer width; AUD-29-32).** A waker's data pointer carries the
+> task's packed 64-bit word only where the pointer is 64 bits wide.
+> - **On a 32-bit target a waker names the slot:** the shard (8 bits) above the slot (24 bits). It decodes to
+>   the slot-only word, whose generation is the reserved `Encoded::ANY_GENERATION`.
+> - **Its wake reaches the slot's current occupant.** A stale waker can therefore poll a newer task
+>   spuriously, which the `Waker` contract allows; same-shard wakes have always routed by slot alone.
+> - **No task arena issues the reserved generation.** Arenas stop at `Encoded::TASK_GENERATION_LIMIT`.
+> - **A 32-bit registry holds 256 shards,** all the pointer can name.
+> - **Futures never take a task's identity from its waker.** Futures that register their task with the
+>   shard (timers, the full-wheel wait, driver interests) take it from the shard's current task
+>   (`waker::polling_task`).
+> - **64-bit wakers are unchanged.**
+>
+> Before this, every 32-bit wake to a shard other than 0 was lost: its word became 0
+> (`docs/bugs/2026-10-01-a-32-bit-waker-lost-its-task.md`).
+>
 > **Status (2026-09-30, AUD-29-08).** No safe runtime API lends state that its owner frees.
 > - **A context is lent only for a borrow that proves it alive.** `LocalRuntime::context` and
 >   `SimRuntime::context` lend for the owner's borrow. `registry::with_current` lends inside a closure, and

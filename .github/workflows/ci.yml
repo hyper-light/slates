@@ -357,8 +357,9 @@ jobs:
   # user-supplied size goes through `usize::try_from`, and these crates' unit tests run as 32-bit code. The
   # official linux/386 Rust image runs natively on the x86_64 runner, so the lane installs nothing. On a
   # 32-bit target the runtime serves through epoll (the io_uring binding has no 32-bit layout). slates-rt
-  # and slates-mem join once the 32-bit waker carries its task (docs/bugs/2026-10-01-a-32-bit-waker-lost-
-  # its-task.md: the packed 64-bit word does not fit a 32-bit data pointer).
+  # and slates-mem run whole, integration tests included: a 32-bit waker carries its shard and slot and
+  # wakes the slot (docs/bugs/2026-10-01-a-32-bit-waker-lost-its-task.md). cargo is invoked directly, not
+  # through a login shell: `bash -l` sources the image's /etc/profile, which resets PATH without cargo.
   i686:
     name: i686 (32-bit narrowing, by test)
     runs-on: ubuntu-latest
@@ -367,7 +368,11 @@ jobs:
       - name: Unit tests as 32-bit code
         run: >-
           docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
-          bash -lc 'cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib'
+          cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib
+      - name: The runtime and memory crates as 32-bit code
+        run: >-
+          docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
+          cargo test --no-fail-fast -p slates-rt -p slates-mem
 
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the

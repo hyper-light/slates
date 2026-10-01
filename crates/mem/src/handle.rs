@@ -96,6 +96,15 @@ impl Encoded {
   /// The largest generation the packed form can carry: a slab whose handles are packed here retires a
   /// slot at this generation rather than issue one the word would have to truncate (AUD-29-11).
   pub const MAX_GENERATION: u32 = (1 << GENERATION_BITS) - 1;
+  /// The generation a task arena issues last: one below [`Encoded::MAX_GENERATION`], which is kept as
+  /// [`Encoded::ANY_GENERATION`] and never issued.
+  pub const TASK_GENERATION_LIMIT: u32 = Self::MAX_GENERATION - 1;
+  /// Format: the generation of a slot-only wake word — "this slot, whatever task holds it". A 32-bit
+  /// target's waker cannot carry a task's full word in its data pointer, so it names the shard and slot only
+  /// and wakes the slot's current occupant (a spurious poll for a stale waker, which the `Waker` contract
+  /// allows and the same-shard wake path already does); no task arena issues this generation, so the word
+  /// is never mistaken for one task's (`docs/bugs/2026-10-01-a-32-bit-waker-lost-its-task.md`).
+  pub const ANY_GENERATION: u32 = Self::MAX_GENERATION;
 
   /// Packs the three fields, refusing a slot index or a generation that does not fit (never truncated:
   /// a truncated generation would alias an older one of the same slot).

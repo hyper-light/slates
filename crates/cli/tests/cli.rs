@@ -1641,7 +1641,10 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
       "both peers probed: {views:?}"
     );
     // Fresh identities replace the manifest's seed links. A replacement is a successful lifecycle
-    // transition, not a dropped packet; queue/capacity loss and unexpected refusals still fail here.
+    // transition, not a dropped packet; queue/capacity loss and unexpected refusals still fail here. The
+    // counter map also carries events: the configuration fan's deliveries (`fleet.fan.sent`) and the
+    // periods that owed a shard nothing (`fleet.fan.unchanged`) are formation's normal work (AUD-29-29); a
+    // fan a shard's channel refused (`fleet.fan.refused`) is not, and still fails here.
     let (drops, _) = view.dropped.rsplit_once(' ').unwrap();
     assert_eq!(
       drops, "unknown_id=0 inbox_full=0 refused=0",
@@ -1657,6 +1660,8 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.discovery.invalidated:",
             "fleet.link.stale_return:",
             "fleet.accept.replaced:",
+            "fleet.fan.sent:",
+            "fleet.fan.unchanged:",
           ]
           .iter()
           .any(|counter| line.split_whitespace().nth(3) == Some(counter))

@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 
 use crate::error::RtError;
 use crate::registry;
-use crate::waker::word_of;
+use crate::waker::polling_task;
 
 /// Which readiness edge a caller awaits.
 #[derive(Clone, Copy)]
@@ -48,7 +48,7 @@ impl Future for Ready {
       // The driver woke us; let the caller retry the syscall.
       return Poll::Ready(Ok(()));
     }
-    let Some(word) = word_of(cx.waker()) else {
+    let Some(word) = polling_task(cx.waker()) else {
       // A foreign waker cannot be armed on the driver; degrade to a retry (the caller's loop copes).
       return Poll::Ready(Ok(()));
     };

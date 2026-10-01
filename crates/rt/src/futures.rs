@@ -13,7 +13,7 @@ use crate::registry;
 use crate::shard::{ShardContext, ShardId, TaskId, boxed};
 use crate::task::Outcome;
 use crate::timer::TimerId;
-use crate::waker::word_of;
+use crate::waker::polling_task;
 
 /// The current shard's id, if this thread runs one.
 pub fn shard_id() -> Option<ShardId> {
@@ -178,7 +178,7 @@ impl Future for Sleep {
   type Output = Result<(), RtError>;
 
   fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-    let Some(word) = word_of(cx.waker()) else {
+    let Some(word) = polling_task(cx.waker()) else {
       return Poll::Ready(Err(RtError::NotOnShardThread));
     };
     let Some(now) = registry::with_current(ShardContext::now_ns) else {
