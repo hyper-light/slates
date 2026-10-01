@@ -104,6 +104,9 @@ pub(crate) fn bind(
           HostPathReason::ForeignFilesystem { fstype }
         }
         HostPathRefusal::NotThisVolume { source } => HostPathReason::NotThisVolume { source },
+        HostPathRefusal::DescendantMount { mount_point } => {
+          HostPathReason::DescendantMount { mount_point }
+        }
       })
     })?;
   let entry = OciMountEntry::new(&verified, destination, read_only).map_err(|e| match e {

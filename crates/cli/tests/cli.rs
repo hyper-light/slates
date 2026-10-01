@@ -2067,8 +2067,11 @@ fn container_leg_gate() -> Option<String> {
 }
 
 /// Runs `script` in a container over the runtime entry the daemon returned: the entry's source bound
-/// at its destination with the entry's read-only or read-write option, as the mounting user (the
-/// consumer, §4.13). The entry is passed exactly as the harness would pass it to its runtime.
+/// at its destination with the entry's options, as the mounting user (the consumer, §4.13). The entry is
+/// passed as the harness would pass it to its runtime: Docker's `--mount` form of the recipe — a
+/// non-recursive bind (`bind-recursive=disabled`) with private propagation, read-only when the entry says
+/// `ro` — never `-v`, which binds recursively and creates a missing source on the host (AUD-29-65/66);
+/// `--mount` refuses a source that does not exist.
 fn run_in_container(
   entry: &serde_json::Value,
   script: &str,
@@ -2081,14 +2084,18 @@ fn run_in_container(
     .unwrap()
     .iter()
     .any(|o| o == "ro");
-  let access = if read_only { "ro" } else { "rw" };
   let user = format!(
     "{}:{}",
     rustix::process::getuid().as_raw(),
     rustix::process::getgid().as_raw()
   );
   let name = format!("slates-oci-{}-{tag}", std::process::id());
-  let bind = format!("{source}:{destination}:{access}");
+  let mut bind = format!(
+    "type=bind,source={source},destination={destination},bind-recursive=disabled,bind-propagation=private"
+  );
+  if read_only {
+    bind.push_str(",readonly");
+  }
   let mut command = Command::new("docker");
   command.args([
     "run",
@@ -2097,7 +2104,7 @@ fn run_in_container(
     &name,
     "--user",
     &user,
-    "-v",
+    "--mount",
     &bind,
     CONTAINER_IMAGE,
     "sh",
@@ -2168,7 +2175,10 @@ fn assert_verified_binding(binding: &serde_json::Value, mount: &str, volume_name
   assert_eq!(binding["evidence"]["names_volume"], true);
   let entry = &binding["mount"];
   assert_eq!(entry["type"], "bind");
-  assert_eq!(entry["options"], serde_json::json!(["rbind", "rw"]));
+  assert_eq!(
+    entry["options"],
+    serde_json::json!(["bind", "rw", "private"])
+  );
 }
 
 /// The transport's report on the reply: the bind offered read-write, with the host mount's
@@ -2300,7 +2310,7 @@ fn assert_read_only_bind(instance: &str, id: &str, path: &str) -> serde_json::Va
   let read_only_entry = &reader["established"]["binding"]["mount"];
   assert_eq!(
     read_only_entry["options"],
-    serde_json::json!(["rbind", "ro"])
+    serde_json::json!(["bind", "ro", "private"])
   );
   assert_eq!(reader["established"]["binding"]["read_only"], true);
   let (code, probe_out, probe_err) =

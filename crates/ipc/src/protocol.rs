@@ -1582,6 +1582,13 @@ pub enum HostPathReason {
     /// The errno of the query; 0 when the table is malformed rather than refused.
     errno: i32,
   },
+  /// Another mount sits beneath the source mount point (AUD-29-65): the bind is of the source mount alone
+  /// (non-recursive), so the container would not see what the host shows there — refused rather than bind
+  /// a view the host contradicts or expose a filesystem no slates attachment authorizes.
+  DescendantMount {
+    /// The mount point beneath the source, as the table records it.
+    mount_point: String,
+  },
 }
 
 /// An action name and how many entries take it.

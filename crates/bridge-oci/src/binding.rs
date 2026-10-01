@@ -2,16 +2,26 @@
 //! established host attachment into the container mount namespace"): a bind mount of the verified
 //! host mount point at a destination inside the container, read-only for a read attachment. The
 //! vocabulary is the OCI runtime specification's (`config.md`, "Mounts", the Linux bind form:
-//! `{"destination", "type": "bind", "source", "options": ["rbind", "ro"|"rw"]}`); the field names
-//! and option words are quoted from memory of the specification and flagged for verification in
-//! `docs/wip/oci-handoff.md`. Docker's equivalent is `-v <source>:<destination>:<ro|rw>`.
+//! `{"destination", "type": "bind", "source", "options": ["bind", "ro"|"rw", "private"]}`); the field
+//! names and option words are quoted from memory of the specification and flagged for verification in
+//! `docs/wip/oci-handoff.md`. Docker's equivalent is `--mount type=bind,source=…,destination=…,
+//! bind-recursive=disabled,bind-propagation=private[,readonly]` (never `-v`, which binds recursively and
+//! creates a missing source on the host).
+//!
+//! The topology is exact (AUD-29-65): a **non-recursive** bind of the verified source mount alone — no
+//! mount beneath it rides along (the verifier refuses a source that has one) — with **private**
+//! propagation, so a mount made later beneath the source on the host does not appear in the container, and
+//! `ro` makes the whole bound view read-only, since nothing beneath it is bound.
 
 use crate::verify::VerifiedHostMount;
 
 /// Format: the entry's `type` for a bind mount (OCI runtime specification, Linux mounts).
 pub const MOUNT_TYPE: &str = "bind";
-/// Format: the recursive bind option (the runtime applies the bind to every mount beneath the source).
-pub const OPTION_RBIND: &str = "rbind";
+/// Format: the non-recursive bind option (the runtime binds the source mount alone, nothing beneath it).
+pub const OPTION_BIND: &str = "bind";
+/// Format: the private propagation option (no mount event crosses between the host and the container at
+/// this mount).
+pub const OPTION_PRIVATE: &str = "private";
 /// Format: the read-only option; the runtime remounts the bind read-only and a write gets `EROFS`.
 pub const OPTION_RO: &str = "ro";
 /// Format: the read-write option.
@@ -57,9 +67,13 @@ impl OciMountEntry {
     MOUNT_TYPE
   }
 
-  /// The entry's `options`: the recursive bind, then `ro` or `rw`.
+  /// The entry's `options`: the non-recursive bind, `ro` or `rw`, and private propagation.
   pub fn options(&self) -> Vec<String> {
     let access = if self.read_only { OPTION_RO } else { OPTION_RW };
-    vec![OPTION_RBIND.to_owned(), access.to_owned()]
+    vec![
+      OPTION_BIND.to_owned(),
+      access.to_owned(),
+      OPTION_PRIVATE.to_owned(),
+    ]
   }
 }

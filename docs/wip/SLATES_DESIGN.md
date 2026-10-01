@@ -2303,7 +2303,8 @@ until mapping isolation, pinning and teardown have been established for that VMM
 > the daemon verifies that the named host path is the mount point of this volume's export through the
 > kernel's mount table — never by touching the mount (`crates/bridge-oci`: `getfsstat(MNT_NOWAIT)`,
 > `/proc/self/mountinfo`) — records the authorized binding (`AttachForm::Oci`) and returns the
-> runtime-specification `mounts` entry (`type: bind`, `rbind` + `ro`/`rw` by the attachment's policy)
+> runtime-specification `mounts` entry (`type: bind`, `bind` + `ro`/`rw` by the attachment's policy + `private`
+> propagation; non-recursive since AUD-29-65, a source with a mount beneath it refused `DescendantMount`)
 > with the table's evidence; the runtime binds; an unbound path is refused
 > `ChosenPathUnavailable{reason}`.
 > **2026-09-20 correction:** the source comparison accepts the current

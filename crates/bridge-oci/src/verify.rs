@@ -104,6 +104,11 @@ pub enum HostPathRefusal {
     /// The source the table records.
     source: String,
   },
+  /// Another mount beneath the source mount point (AUD-29-65).
+  DescendantMount {
+    /// The mount point beneath the source.
+    mount_point: String,
+  },
 }
 
 /// A host path the table vouches for.
@@ -148,6 +153,19 @@ pub fn verify_host_mount(
   if entry.fstype != expected.fstype {
     return Err(HostPathRefusal::ForeignFilesystem {
       fstype: entry.fstype.clone(),
+    });
+  }
+  // The topology is the source mount alone: a mount beneath it would be outside the non-recursive bind,
+  // and its filesystem is no slates attachment's.
+  if let Some(beneath) = entries.iter().find(|other| {
+    let point = normalized(&other.mount_point);
+    point != path
+      && point
+        .strip_prefix(path)
+        .is_some_and(|rest| rest.starts_with('/') || path == "/")
+  }) {
+    return Err(HostPathRefusal::DescendantMount {
+      mount_point: beneath.mount_point.clone(),
     });
   }
   let not_this = || HostPathRefusal::NotThisVolume {

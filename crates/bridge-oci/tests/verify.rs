@@ -188,8 +188,9 @@ fn a_malformed_mountinfo_is_refused_at_its_line() {
   assert_eq!(parse_mountinfo("\n\n").unwrap(), Vec::<MountEntry>::new());
 }
 
-/// The runtime entry: a recursive bind, read-only for a read attachment and read-write otherwise, at
-/// an absolute destination; a relative destination is refused.
+/// AUD-29-65. The runtime entry: a non-recursive bind of the source mount alone with private propagation,
+/// read-only for a read attachment and read-write otherwise, at an absolute destination; a relative
+/// destination is refused.
 #[test]
 fn the_runtime_entry_carries_the_attachment_policy() {
   let expected = expected_mount(HostMountKind::NfsLoopback, "work");
@@ -203,15 +204,9 @@ fn the_runtime_entry_carries_the_attachment_policy() {
   assert_eq!(read_only.source, "/private/var/folders/1s/T/tmp.abc");
   assert_eq!(read_only.destination, "/work");
   assert_eq!(read_only.mount_type(), "bind");
-  assert_eq!(
-    read_only.options(),
-    vec!["rbind".to_owned(), "ro".to_owned()]
-  );
+  assert_eq!(read_only.options(), ["bind", "ro", "private"]);
   let read_write = OciMountEntry::new(&verified, "/work", false).unwrap();
-  assert_eq!(
-    read_write.options(),
-    vec!["rbind".to_owned(), "rw".to_owned()]
-  );
+  assert_eq!(read_write.options(), ["bind", "rw", "private"]);
   assert_eq!(
     OciMountEntry::new(&verified, "work", false),
     Err(DestinationRefusal::NotAbsolute)
@@ -238,4 +233,31 @@ fn the_real_table_lists_the_root_where_a_query_is_built() {
     }
     Err(other) => panic!("the table could not be read: {other}"),
   }
+}
+
+/// AUD-29-65. Do: verify a slates mount point with another filesystem mounted beneath it, one with a
+/// sibling whose name merely extends the source's (`/home/u/mnt-other`), and one with nothing beneath it.
+/// Expect: the first is refused `DescendantMount` naming the mount beneath (the bind is of the source mount
+/// alone, so the container would not see it, and no slates attachment authorizes it); the sibling and the
+/// clean source verify.
+#[test]
+fn a_source_with_a_mount_beneath_it_is_refused() {
+  let expected = expected_mount(HostMountKind::NfsLoopback, "work");
+  let table = vec![
+    entry("/", "apfs", "/dev/disk1s1"),
+    entry("/home/u/mnt", "nfs", "slates:/work"),
+    entry("/home/u/mnt/inner", "tmpfs", "tmpfs"),
+    entry("/home/u/mnt-other", "apfs", "/dev/disk2s1"),
+  ];
+  assert_eq!(
+    verify_host_mount(&table, "/home/u/mnt", &expected),
+    Err(HostPathRefusal::DescendantMount {
+      mount_point: "/home/u/mnt/inner".to_owned()
+    })
+  );
+  let clean: Vec<MountEntry> = table
+    .into_iter()
+    .filter(|e| e.mount_point != "/home/u/mnt/inner")
+    .collect();
+  assert!(verify_host_mount(&clean, "/home/u/mnt", &expected).is_ok());
 }

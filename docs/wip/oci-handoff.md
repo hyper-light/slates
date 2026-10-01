@@ -42,7 +42,7 @@
 | "A host OCI runtime passes the established host attachment into the container mount namespace." | `crates/server/src/oci.rs` + `crates/bridge-oci`: slates verifies, records and reports; the runtime binds (`docker run -v`/`runc` `mounts[]`); slates enters no namespace. |
 | "A metadata record is insufficient evidence of a usable container path or guest device." | The bind is verified against the kernel's mount table (`HostMountEvidence`), and its usability is proven by use, never by the record: T-4.13 runs the workload inside the container (`crates/cli/tests/cli.rs`, `crates/bridge-fuse/tests/oci_container.rs`). |
 | "No disk socket, image construction, target mkdir or privilege escalation is implicit in attaching a VFS volume." | `bridge-oci` holds no `std::fs`/`std::net`, creates nothing; the destination is created by the runtime inside the container's rootfs; R10 by construction. |
-| "the read/write policy" | A read attachment yields `options: [rbind, ro]`; the runtime enforces it (`Read-only file system` measured). |
+| "the read/write policy" | A read attachment yields `options: [bind, ro, private]`; the runtime enforces it (`Read-only file system` measured). Non-recursive since AUD-29-65 (2026-10-01): nothing beneath the source rides along, so `ro` covers the whole bound view. |
 | Appendix C "OCI namespace handoff ... must report [its] own tested semantics"; "macOS NFS fallback: `.nfs` temp files on delete-while-open" | `SharingSemantics.delete_while_open: DeleteWhileOpen {NoKernelClient, Unlinked, SillyRenamed}` — the NFS loopback mount and the bind on macOS say `SillyRenamed`, measured (§4 below). |
 | AC-9.7 "A skipped lane or pure simulation cannot close its transport guarantee." | `Conformance {None, VerbLifecycleTest, LiveKernelMountTest, ContainerWorkloadTest, SimulatedGuestDriver}` names the evidence class the tree holds for the transport on this platform; a refused transport claims `None`. |
 | The guest form (GAP-A9-5's owed "transport report on the `attach`/`status` wire") | `transports::translate_guest` carries `slates_bridge_virtiofs::capability::host_capability` fact for fact; `AttachRequest::Guest` over the ring refuses `SeamNotOnWire` (or the device's own `BindingNotBuilt`). |
@@ -131,7 +131,7 @@ the bridge's source names the volume (`nfs` + `localhost:/<name>` on macOS), thi
 `MountTableUnavailable{errno}`.
 
 The record carries the authorized binding (`AttachForm::Oci`); the reply carries the entry the
-harness hands its runtime — `{destination, type: "bind", source, options: [rbind, ro|rw]}` — and
+harness hands its runtime — `{destination, type: "bind", source, options: [bind, ro|rw, private]}` — and
 the evidence. The OCI runtime specification's field names and option words (`config.md` "Mounts",
 the Linux bind form) are **quoted from memory** of the specification; the entry drove Docker's
 `-v source:destination:ro|rw` equivalently in T-4.13; verifying the `type`/`options` words against
@@ -265,7 +265,7 @@ benchmarks.
    `bridge-oci`'s `expected_mount(Fuse, ..)` should gain a source that names the volume (today
    `fsname=slates` for every volume — `fsname=slates:<name>` would let the table name the volume, as
    the NFS export does).
-2. **Verification of the runtime-specification words** (`type: "bind"`, `rbind`, `ro`/`rw`) against
+2. **Verification of the runtime-specification words** (`type: "bind"`, `bind`, `private`, `ro`/`rw`) against
    the published OCI runtime specification (`config.md` "Mounts"), quoted from memory.
 3. **The Windows `PATH` probe** (`PATHEXT`) for `oci_runtime`; reported `NotProbed` until built.
 4. **A subtree bind** (a directory inside the mount as the source) is refused `NotAMountPoint`
