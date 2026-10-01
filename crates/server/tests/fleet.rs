@@ -3070,15 +3070,29 @@ fn a_loopback_fleet_derives_its_election_timing_at_the_measured_floor() {
   );
   let floor = slates_cluster::timing::ElectionTiming::floor();
   for timing in timings.iter().flatten() {
-    assert!(
-      timing.broadcast_rtt_tail_ns < slates_server::daemon::HEARTBEAT_NS,
-      "a loopback voter path's tail is inside one heartbeat: {timing:?}"
+    // The rule, checked against the node's own measurements: whatever the machine's load made the loopback
+    // round trips, the timing is what they derive (a loaded CI runner measured a 113 ms tail, 2026-10-01).
+    let derived = slates_cluster::timing::ElectionTiming::of_measurements(
+      slates_server::daemon::HEARTBEAT_NS,
+      (timing.broadcast_rtt_tail_ns, timing.broadcast_rtt_spread_ns),
+      timing.samples,
     );
     assert_eq!(
-      (timing.base_periods, timing.span_periods),
-      (floor.base_periods, floor.span_periods),
-      "the derived timing is the floor on a loopback fleet: {timing:?}"
+      timing, &derived,
+      "the timing is its measurements' derivation"
     );
+    // And the claim this test exists for: a voter path inside one heartbeat derives exactly the floor.
+    if timing.broadcast_rtt_tail_ns < slates_server::daemon::HEARTBEAT_NS
+      && timing.broadcast_rtt_spread_ns < slates_server::daemon::HEARTBEAT_NS
+    {
+      assert_eq!(
+        (timing.base_periods, timing.span_periods),
+        (floor.base_periods, floor.span_periods),
+        "the derived timing is the floor on a loopback fleet: {timing:?}"
+      );
+    } else {
+      eprintln!("a loopback voter path outgrew one heartbeat under load: {timing:?}");
+    }
   }
   assert_status_carries_the_council(&reported, &floor);
 }
@@ -3124,11 +3138,7 @@ fn assert_status_carries_the_council(
       group.samples > 0,
       "the status carries the measured samples, not the default: {reported:?}"
     );
-    assert_eq!(
-      (group.base_periods, group.span_periods),
-      (floor.base_periods, floor.span_periods),
-      "the status carries the derived timing: {reported:?}"
-    );
+    assert_group_timing_is_derived(group, floor, reported);
     assert_eq!(group.term, leader.term, "one term: {reported:?}");
     assert!(
       group.priority_ns > 0 && group.rank == 0,
@@ -10291,4 +10301,32 @@ fn a_grant_made_after_the_last_seal_survives_a_takeover() {
     }],
     "the consumer keeps its access on the successor"
   );
+}
+
+/// The status carries the timing its own reported measurements derive — the floor when they sit inside one
+/// heartbeat, more when a loaded machine stretched the loopback round trips.
+fn assert_group_timing_is_derived(
+  group: &slates_ipc::protocol::GroupReport,
+  floor: &slates_cluster::timing::ElectionTiming,
+  reported: &[slates_ipc::protocol::GroupReport],
+) {
+  let derived = slates_cluster::timing::ElectionTiming::of_measurements(
+    slates_server::daemon::HEARTBEAT_NS,
+    (group.rtt_tail_ns, group.rtt_spread_ns),
+    group.samples,
+  );
+  assert_eq!(
+    (group.base_periods, group.span_periods),
+    (derived.base_periods, derived.span_periods),
+    "the status carries the derived timing: {reported:?}"
+  );
+  if group.rtt_tail_ns < slates_server::daemon::HEARTBEAT_NS
+    && group.rtt_spread_ns < slates_server::daemon::HEARTBEAT_NS
+  {
+    assert_eq!(
+      (group.base_periods, group.span_periods),
+      (floor.base_periods, floor.span_periods),
+      "inside one heartbeat the status carries the floor: {reported:?}"
+    );
+  }
 }

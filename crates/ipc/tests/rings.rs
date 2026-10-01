@@ -33,9 +33,13 @@ fn geometry() -> RegionGeometry {
   }
 }
 
-/// A daemon end over a fresh region and a client end over a second mapping of it.
+/// A daemon end over a fresh region and a client end over a second mapping of it. The region's name carries the
+/// process id: on macOS a region is opened by name, so two test processes on one machine (two CI jobs, a
+/// parallel runner) must never map each other's (2026-10-01: concurrent runs of one test met each other's
+/// region — `shm_open` EEXIST, and a client receiving another process's reply while its own request went unread).
 fn pair(name: &str) -> (DaemonEnd, ClientEnd) {
-  let region = ClientRegion::create(name, 7, 0, geometry()).unwrap();
+  let name = format!("{name}-{}", std::process::id());
+  let region = ClientRegion::create(&name, 7, 0, geometry()).unwrap();
   let (handoff, len) = region.handoff().unwrap();
   let client = ClientRegion::open(&handoff, len).unwrap();
   assert_eq!(client.client_id(), 7);
@@ -138,7 +142,7 @@ const ASLEEP_AFTER: Duration = Duration::from_millis(1);
 #[test]
 fn a_client_learns_its_wake_from_the_parks_a_reply_ended() {
   let region = ClientRegion::create(
-    "slates-ipc-rings-learn",
+    &format!("slates-ipc-rings-learn-{}", std::process::id()),
     9,
     0,
     RegionGeometry {
@@ -153,12 +157,7 @@ fn a_client_learns_its_wake_from_the_parks_a_reply_ended() {
   client.set_spin_ns(Some(0));
   let server = std::thread::spawn(move || {
     for _ in 0..LEARNING_TRIPS {
-      let request = loop {
-        if let Some(request) = daemon.try_take().unwrap() {
-          break request;
-        }
-        std::thread::yield_now();
-      };
+      let request = take_within(|| daemon.try_take().unwrap(), "a request");
       let flagged = Instant::now();
       while daemon
         .region()
@@ -307,6 +306,22 @@ fn wake_without_reply(region: &ClientRegion) {
   region.wake_signal().unwrap();
 }
 
+/// Takes the next item `take` yields, bounded by the reply deadline (a hang guard: one that never arrives
+/// fails the test with `what`, never spins it forever).
+fn take_within<T>(mut take: impl FnMut() -> Option<T>, what: &str) -> T {
+  let started = Instant::now();
+  loop {
+    if let Some(slot) = take() {
+      return slot;
+    }
+    assert!(
+      started.elapsed() < Duration::from_nanos(REPLY_DEADLINE_NS),
+      "{what} never arrived"
+    );
+    std::thread::yield_now();
+  }
+}
+
 /// Waits (bounded by the reply deadline, a hang guard) until `holds` is true of the region.
 fn await_region(region: &ClientRegion, what: &str, holds: impl Fn(&ClientRegion) -> bool) {
   let started = Instant::now();
@@ -330,12 +345,7 @@ fn a_wake_without_a_reply_is_counted_and_the_client_parks_again() {
   let (mut daemon, mut client) = pair("slates-ipc-rings-unanswered");
   client.set_spin_ns(Some(0));
   let server = std::thread::spawn(move || {
-    let request = loop {
-      if let Some(request) = daemon.try_take().unwrap() {
-        break request;
-      }
-      std::thread::yield_now();
-    };
+    let request = take_within(|| daemon.try_take().unwrap(), "the request");
     await_region(daemon.region(), "the client did not park", |region| {
       region.client_parked().unwrap().load(Ordering::Acquire) == 1
     });
@@ -448,17 +458,13 @@ fn the_completion_socket_becomes_readable_on_an_armed_reply() {
   // The daemon answers on its own thread: it reverses the payload and replies, which bumps the wake
   // word and signals the Event because the client is parked.
   let server = std::thread::spawn(move || {
-    loop {
-      if let Some(req) = daemon.try_take().unwrap() {
-        let mut reply = req.payload.clone();
-        reply.reverse();
-        daemon
-          .reply(&Slot::inline(req.request, &reply).unwrap())
-          .unwrap();
-        break daemon.wakes();
-      }
-      std::hint::spin_loop();
-    }
+    let req = take_within(|| daemon.try_take().unwrap(), "the request");
+    let mut reply = req.payload.clone();
+    reply.reverse();
+    daemon
+      .reply(&Slot::inline(req.request, &reply).unwrap())
+      .unwrap();
+    daemon.wakes()
   });
 
   // The bridge wakes on the Event and nudges the socket: the loop's poll now fires.
@@ -469,12 +475,7 @@ fn the_completion_socket_becomes_readable_on_an_armed_reply() {
   client.drain_completion();
 
   // And the reply is on the ring to take, id-matched with its payload reversed.
-  let reply = loop {
-    if let Some(reply) = client.try_take().unwrap() {
-      break reply;
-    }
-    std::hint::spin_loop();
-  };
+  let reply = take_within(|| client.try_take().unwrap(), "the reply");
   assert_eq!(reply.request, 0);
   assert_eq!(reply.payload, vec![3, 2, 1]);
   assert_eq!(reply.kind, SlotKind::Inline);

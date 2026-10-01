@@ -192,6 +192,18 @@ impl ElectionTiming {
         samples = samples.saturating_add(path.samples());
       }
     }
+    ElectionTiming::of_measurements(heartbeat, (tail, spread), samples)
+  }
+
+  /// The timing a measured broadcast `tail` and `spread` (nanoseconds, the slowest voter path's) derive under
+  /// `heartbeat_ns`, from `samples` round trips: the rule [`Self::derive`] applies once it has folded the paths,
+  /// so an observer can check a reported timing against its own reported measurements.
+  pub fn of_measurements(
+    heartbeat_ns: u64,
+    (tail, spread): (u64, u64),
+    samples: u64,
+  ) -> ElectionTiming {
+    let heartbeat = heartbeat_ns.max(1);
     ElectionTiming {
       base_periods: periods_of(
         ELECTION_MARGIN.saturating_mul(tail.max(heartbeat)),
