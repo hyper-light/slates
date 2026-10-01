@@ -277,14 +277,21 @@ struct MountPoint {
 impl Drop for MountPoint {
   fn drop(&mut self) {
     // A plain unmount first; forced if something (a container runtime's share of the path, measured
-    // 2026-09-14) still holds the mount point busy — a dead mount left behind is worse.
-    let unmounted = Command::new("umount")
+    // 2026-09-14) still holds the mount point busy — a dead mount left behind is worse. On Linux every
+    // slates mount is FUSE, removed without a privilege by the OS's `fusermount3` (lazily, if busy).
+    let (program, plain, forced): (&str, &[&str], &[&str]) = if cfg!(target_os = "linux") {
+      ("fusermount3", &["-u"], &["-u", "-z"])
+    } else {
+      ("umount", &[], &["-f"])
+    };
+    let unmounted = Command::new(program)
+      .args(plain)
       .arg(&self.path)
       .output()
       .map(|o| o.status.success())
       .unwrap_or(false);
     if !unmounted {
-      let _ = Command::new("umount").args(["-f", &self.path]).output();
+      let _ = Command::new(program).args(forced).arg(&self.path).output();
     }
     let _ = Command::new("rmdir").arg(&self.path).output();
   }
@@ -2956,5 +2963,97 @@ fn the_anchor_and_its_daemon_exclude_themselves_from_core_dumps() {
     );
     assert_eq!(filter, 0, "{role}: a collector's dump carries no memory");
   }
+  drop(anchor);
+}
+
+/// The kernel's mount table entry at `path` (Linux `mountinfo`): its filesystem type and source.
+#[cfg(target_os = "linux")]
+fn mountinfo_at(path: &str) -> Option<(String, String)> {
+  let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+  table.lines().find_map(|line| {
+    let (head, tail) = line.split_once(" - ")?;
+    (head.split(' ').nth(4)? == path).then(|| {
+      let mut fields = tail.split(' ');
+      (
+        fields.next().unwrap_or("").to_owned(),
+        fields.next().unwrap_or("").to_owned(),
+      )
+    })
+  })
+}
+
+/// Whether the Linux FUSE mount flow runs here: asked for (`SLATES_TEST_CLI=1`, a real kernel mount) and
+/// possible (`fusermount3` and `/dev/fuse`); a loud skip otherwise.
+#[cfg(target_os = "linux")]
+fn linux_fuse_mount_runs() -> bool {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the Linux FUSE mount flow: set SLATES_TEST_CLI=1 to run it (a real kernel mount)"
+    );
+    return false;
+  }
+  let fuse = Command::new("sh")
+    .args(["-c", "command -v fusermount3"])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false);
+  if !fuse || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the Linux mount is FUSE");
+    return false;
+  }
+  true
+}
+
+/// `slates mount ID DIR` on Linux reports the mount point, and the kernel lists a `fuse.slates` mount there
+/// whose source names the volume's one attachment.
+#[cfg(target_os = "linux")]
+fn fuse_mount_and_check(instance: &str, id: &str, path: &str) {
+  let (code, out, err) = run(instance, &["mount", id, path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  assert_eq!(value_of(&out, "mounted"), path);
+  let (fstype, source) = mountinfo_at(path).expect("the kernel lists the mount");
+  assert_eq!(fstype, "fuse.slates");
+  assert!(
+    source.starts_with("slates:"),
+    "the source names the attachment: {source}"
+  );
+  assert_eq!(attachments_of(instance, id), "1");
+}
+
+/// AUD-29-64 (`slates mount` on Linux). Do: through the real binary against a real anchor-supervised
+/// daemon, create a volume, `slates mount ID DIR`, write and read a file through the mount, then
+/// `slates unmount DIR`. Expect: the command reports the mount point; the kernel lists a `fuse.slates`
+/// mount there whose source names the volume's one attachment; the file reads back byte for byte; the
+/// unmount (`fusermount3 -u`, no privilege) removes the mount and the daemon ends the attachment. Gated
+/// like the macOS live mount (`SLATES_TEST_CLI=1`; a real kernel mount); skips loudly without FUSE.
+#[cfg(target_os = "linux")]
+#[test]
+fn slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-fuse-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "fused", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount_point.path);
+  roundtrip_a_file_through(&mount_point.path);
+  let (code, _, err) = run(&instance, &["unmount", &mount_point.path]);
+  assert_eq!(code, 0, "slates unmount: {err}");
+  assert!(
+    mountinfo_at(&mount_point.path).is_none(),
+    "the mount is gone"
+  );
+  assert!(
+    wait_for(|| attachments_of(&instance, &id) == "0"),
+    "the daemon ended the mount's attachment"
+  );
   drop(anchor);
 }

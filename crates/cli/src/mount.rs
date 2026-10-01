@@ -13,6 +13,7 @@
 
 use std::process::Command;
 
+#[cfg(not(target_os = "linux"))]
 use slates_client::StatusReport;
 
 use crate::Failure;
@@ -26,11 +27,13 @@ use crate::Failure;
 /// age) is far too stale for an overlay that changes under merges and outside edits. So the mount asks
 /// for the finest nonzero cache the knob expresses, one second — the same freshness/amortization
 /// trade-off sylk documents for its 100 ms FUSE attribute timeout (`core/purevfs`).
+#[cfg(any(not(target_os = "linux"), test))]
 const ATTR_CACHE_SECONDS: u32 = 1;
 
 /// The loopback mount mechanism a host offers (§4.6), the analogue of sylk's FUSE-backend selection.
 /// slates serves its own NFS, so its mechanism is `mount_nfs` — built into macOS and the BSDs, needing
 /// no FUSE library, kernel extension, or Apple entitlement.
+#[cfg(any(not(target_os = "linux"), test))]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MountBackend {
   /// The loopback NFS mount, via `mount_nfs`.
@@ -42,7 +45,7 @@ pub(crate) enum MountBackend {
 /// Classifies the loopback mount mechanism from an injectable "is this command on the `PATH`" probe.
 /// Pure — no filesystem or process references — so every branch tests on any host without a live mount,
 /// exactly as sylk factors its detection into a predicate-injected `classifyDarwinFUSEBackend`.
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(all(not(target_os = "macos"), not(target_os = "linux")), test))]
 fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
   if command_exists("mount_nfs") {
     MountBackend::NfsLoopback
@@ -53,7 +56,7 @@ fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
 
 /// Whether `name` resolves to an executable on the `PATH` (the analogue of sylk's `commandAvailable`
 /// over `exec.LookPath`): a directory of the `PATH` holds an entry `name` the caller may execute.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 fn command_on_path(name: &str) -> bool {
   let Some(paths) = std::env::var_os("PATH") else {
     return false;
@@ -70,7 +73,7 @@ pub(crate) fn backend() -> MountBackend {
 }
 
 /// The loopback mount mechanism this host offers, probing the real `PATH` for `mount_nfs`.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 pub(crate) fn backend() -> MountBackend {
   classify(command_on_path)
 }
@@ -86,7 +89,7 @@ pub(crate) fn backend() -> MountBackend {
 /// so `port` and `mountport` are the same. The export is
 /// `localhost:/<name>@<attachment_hex>.<token_hex>`, the volume's provisioned name under the synthetic
 /// host root with its capability.
-#[cfg(any(not(target_os = "macos"), test))]
+#[cfg(any(all(not(target_os = "macos"), not(target_os = "linux")), test))]
 fn mount_args(
   port: u16,
   name: &str,
@@ -109,9 +112,11 @@ fn mount_args(
 
 /// Format: a mount capability as `attach` returns it — the attachment id and its 16-byte secret token
 /// (§4.13; AUD-01), the bearer authority the daemon validates every request's file handle against.
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) type MountCapability = (u64, [u8; 16]);
 
 /// The export path a capability mount presents: `/<name>@<attachment_hex>.<token_hex>` (§4.13; AUD-01).
+#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn export_path(name: &str, capability: MountCapability) -> String {
   let (attachment, token) = capability;
   let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
@@ -123,6 +128,7 @@ pub(crate) fn export_path(name: &str, capability: MountCapability) -> String {
 /// Refuses first (like sylk's `strictExecutionProbe`, naming what is missing) if the host has no loopback
 /// mount mechanism or the daemon is not serving NFS; then a typed failure if `mount_nfs` refuses (a
 /// missing mount point, a busy path).
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn establish(
   report: &StatusReport,
   capability: MountCapability,
@@ -220,7 +226,7 @@ fn mount_volume(
 
 /// Mounts the volume with `mount_nfs` (the BSDs other than macOS, where the XDR arguments are not
 /// Apple's).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 fn mount_volume(
   port: u16,
   name: &str,
@@ -245,18 +251,34 @@ fn mount_volume(
 /// Unmounts the loopback bridge at `path` with `umount`, the lifecycle counterpart of [`establish`]
 /// (sylk's cgofuse `Close`). No privilege: a user unmounts a mount they made.
 pub(crate) fn unmount(path: &str) -> Result<(), Failure> {
-  let status = Command::new("umount")
+  let status = Command::new(UNMOUNT_PROGRAM)
+    .args(UNMOUNT_ARGS)
     .arg(path)
     .status()
-    .map_err(|e| Failure::Failed(format!("running umount: {e}")))?;
+    .map_err(|e| Failure::Failed(format!("running {UNMOUNT_PROGRAM}: {e}")))?;
   if status.success() {
     Ok(())
   } else {
     Err(Failure::Failed(format!(
-      "umount {path} failed ({status}); is the path still in use?"
+      "{UNMOUNT_PROGRAM} {path} failed ({status}); is the path still in use?"
     )))
   }
 }
+
+/// Format: the program that removes a slates mount without a privilege (R10): on Linux every slates mount is FUSE,
+/// removed by the OS's `fusermount3 -u` (the daemon's serve task then sees the kernel's disconnect and ends
+/// the attachment, AUD-29-64); elsewhere the user's own `umount` of the loopback NFS mount.
+#[cfg(target_os = "linux")]
+const UNMOUNT_PROGRAM: &str = "fusermount3";
+/// Format: see [`UNMOUNT_PROGRAM`].
+#[cfg(target_os = "linux")]
+const UNMOUNT_ARGS: &[&str] = &["-u"];
+/// Format: see the Linux form.
+#[cfg(not(target_os = "linux"))]
+const UNMOUNT_PROGRAM: &str = "umount";
+/// Format: see the Linux form.
+#[cfg(not(target_os = "linux"))]
+const UNMOUNT_ARGS: &[&str] = &[];
 
 #[cfg(test)]
 mod tests {

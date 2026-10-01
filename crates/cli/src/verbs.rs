@@ -124,6 +124,82 @@ fn emit_recovery(
   Ok(())
 }
 
+/// `mount` over the loopback NFS bridge (macOS and the BSDs; §4.6): the mount's own attachment and capability,
+/// then `mount_nfs` with the capability in the export path — no privilege, no kernel extension, no Apple
+/// entitlement.
+#[cfg(not(target_os = "linux"))]
+fn mount_verb(
+  client: &mut Client,
+  instance: &str,
+  volume: VolumeId,
+  path: &str,
+  read_only: bool,
+) -> Result<(), Failure> {
+  let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
+  // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
+  // ends with the kernel's `UMNT` when the mount is removed. A write mount takes the write lease
+  // (D-16); `--read-only` takes none and gets a read-only capability.
+  let intent = if read_only {
+    Intent::Read
+  } else {
+    Intent::Write
+  };
+  let attachment = client
+    .attach_mount(volume, intent)
+    .map_err(|e| failure_of(e, instance))?;
+  let Some(token) = attachment.token else {
+    return Err(Failure::Refused(
+      "the daemon issued no mount capability for this attachment; the volume cannot be mounted"
+        .to_owned(),
+    ));
+  };
+  let mounted = crate::mount::establish(&report, (attachment.attachment, token), path, read_only)?;
+  // The established mount point is reported back (§4.4 `Binding → Bound`), so the record names it
+  // and `status` shows it; a bind the daemon refuses takes the mount down again rather than leave a
+  // mount whose record says it is bound nowhere.
+  if let Err(e) = client.bind_mount(attachment.attachment, &mounted) {
+    let unmounted = crate::mount::unmount(&mounted);
+    let bind = failure_of(e, instance);
+    return Err(match unmounted {
+      Ok(()) => bind,
+      Err(unmount) => Failure::Failed(format!(
+        "{}; and unmounting it again: {}",
+        failure_text(&bind),
+        failure_text(&unmount)
+      )),
+    });
+  }
+  println!("mounted: {mounted}");
+  Ok(())
+}
+
+/// `mount` on Linux (§4.6 "Linux"; AUD-29-64): the daemon mounts the volume through the OS's `fusermount3`
+/// at the path — resolved here, in the client, to the real path the kernel records (a read, never a write) —
+/// and serves it; the attachment is the mount's, ending with `slates unmount` (`fusermount3 -u`), a
+/// `detach`, or the volume's destroy. A read-only mount takes no write lease and is served read-only.
+#[cfg(target_os = "linux")]
+fn mount_verb(
+  client: &mut Client,
+  instance: &str,
+  volume: VolumeId,
+  path: &str,
+  read_only: bool,
+) -> Result<(), Failure> {
+  let real = std::fs::canonicalize(path)
+    .map_err(|e| Failure::Failed(format!("the mount point {path}: {e}")))?;
+  let real = real.to_string_lossy().into_owned();
+  let intent = if read_only {
+    Intent::Read
+  } else {
+    Intent::Write
+  };
+  let attachment = client
+    .attach_fuse(volume, intent, &real)
+    .map_err(|e| failure_of(e, instance))?;
+  println!("mounted: {}", attachment.path.unwrap_or(real));
+  Ok(())
+}
+
 fn connect(instance: &str) -> Result<Client, Failure> {
   let deadlines = Deadlines::derive(LIVENESS_BUDGET_NS, RECOVERY_BUDGET_NS).get();
   Client::connect(instance, deadlines).map_err(|e| failure_of(e, instance))
@@ -207,45 +283,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     read_only,
   } = &request.verb
   {
-    let report = client
-      .status(*volume)
-      .map_err(|e| failure_of(e, &request.instance))?;
-    // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
-    // ends with the kernel's `UMNT` when the mount is removed. A write mount takes the write lease
-    // (D-16); `--read-only` takes none and gets a read-only capability.
-    let intent = if *read_only {
-      Intent::Read
-    } else {
-      Intent::Write
-    };
-    let attachment = client
-      .attach_mount(*volume, intent)
-      .map_err(|e| failure_of(e, &request.instance))?;
-    let Some(token) = attachment.token else {
-      return Err(Failure::Refused(
-        "the daemon issued no mount capability for this attachment; the volume cannot be mounted"
-          .to_owned(),
-      ));
-    };
-    let mounted =
-      crate::mount::establish(&report, (attachment.attachment, token), path, *read_only)?;
-    // The established mount point is reported back (§4.4 `Binding → Bound`), so the record names it
-    // and `status` shows it; a bind the daemon refuses takes the mount down again rather than leave a
-    // mount whose record says it is bound nowhere.
-    if let Err(e) = client.bind_mount(attachment.attachment, &mounted) {
-      let unmounted = crate::mount::unmount(&mounted);
-      let bind = failure_of(e, &request.instance);
-      return Err(match unmounted {
-        Ok(()) => bind,
-        Err(unmount) => Failure::Failed(format!(
-          "{}; and unmounting it again: {}",
-          failure_text(&bind),
-          failure_text(&unmount)
-        )),
-      });
-    }
-    println!("mounted: {mounted}");
-    return Ok(());
+    return mount_verb(&mut client, &request.instance, *volume, path, *read_only);
   }
   // A container bind names its host mount point by the real path the kernel records (`mount_nfs`
   // resolves symlinks; `mktemp -d` on macOS hands out a symlinked `/var/folders` path), so the source
@@ -635,7 +673,8 @@ fn emit_create(client: &mut Client, spec: &CreateSpec, json: bool) -> Result<(),
 
 /// `volume snapshot`: the snapshot's sequence number, as text or a JSON `{ "snapshot" }` (the MCP
 /// `slates.volume.snapshot` schema).
-/// A failure's text for a message that reports two of them at once.
+/// A failure's text for a message that reports two of them at once (the NFS mount's bind-then-unmount).
+#[cfg(not(target_os = "linux"))]
 fn failure_text(failure: &Failure) -> String {
   match failure {
     Failure::Refused(text) | Failure::Failed(text) => text.clone(),
