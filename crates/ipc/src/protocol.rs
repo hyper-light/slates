@@ -1416,6 +1416,10 @@ pub enum UnsupportedReason {
   /// The host offers no unprivileged FUSE mount: `/dev/fuse` or the OS's `fusermount3` is missing (R10:
   /// slates never mounts with a privilege of its own).
   FuseUnavailable,
+  /// The bind's source authority is verified (the mount's attachment, held to the daemon's record), but no
+  /// container workload has run through this platform's bind (T-4.13), so it is not offered until one does
+  /// (AUD-29-64: a recipe is not evidence that a runtime consumes it as intended).
+  ContainerWorkloadUnproven,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,

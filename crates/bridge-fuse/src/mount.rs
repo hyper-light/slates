@@ -51,9 +51,13 @@ pub const COMM_FD_ENV: &str = "_FUSE_COMMFD";
 /// [`handshake`] places it.
 pub const COMM_FD_IN_CHILD: i32 = 0;
 /// Format: the fixed mount options slates always sets: the kernel checks permissions itself
-/// (`default_permissions`), and the fs type and name identify the mount.
+/// (`default_permissions`), and the subtype makes the mount's type `fuse.slates`. The source (`fsname`) is
+/// the caller's: the daemon's names the mount's attachment (`slates:<attachment>`, AUD-29-64).
 #[cfg(target_os = "linux")]
-const BASE_OPTIONS: &str = "default_permissions,fsname=slates,subtype=slates";
+const BASE_OPTIONS: &str = "default_permissions,subtype=slates";
+/// Format: the source a mount made without an attachment shows (the blocking [`mount`], the tests' form).
+#[cfg(target_os = "linux")]
+const PLAIN_FSNAME: &str = "slates";
 
 /// How the helper process ended, as the handshake reaped it: its exit code, or the signal that
 /// killed it. Only a reaped child yields either, so an error carrying one is proof the helper
@@ -216,7 +220,7 @@ pub fn mount(
   extra_options: &[&str],
   deadline: Duration,
 ) -> Result<Mount, MountError> {
-  let mut options = BASE_OPTIONS.to_owned();
+  let mut options = format!("{BASE_OPTIONS},fsname={PLAIN_FSNAME}");
   for extra in extra_options {
     options.push(',');
     options.push_str(extra);
@@ -230,15 +234,16 @@ pub fn mount(
   })
 }
 
-/// Begins mounting at `mount_point` without blocking (Linux): `fusermount3` spawned with the options
-/// [`mount`] would pass, its handshake left for the owner to poll ([`PendingHandshake`]); the device it
-/// returns becomes the mount through [`Mount::adopt`].
+/// Begins mounting at `mount_point` without blocking (Linux): `fusermount3` spawned with the fixed options
+/// and `fsname` as the mount's source (the daemon's names the attachment), its handshake left for the owner
+/// to poll ([`PendingHandshake`]); the device it returns becomes the mount through [`Mount::adopt`].
 #[cfg(target_os = "linux")]
 pub fn begin_mount(
   mount_point: &str,
+  fsname: &str,
   extra_options: &[&str],
 ) -> Result<PendingHandshake, MountError> {
-  let mut options = BASE_OPTIONS.to_owned();
+  let mut options = format!("{BASE_OPTIONS},fsname={fsname}");
   for extra in extra_options {
     options.push(',');
     options.push_str(extra);

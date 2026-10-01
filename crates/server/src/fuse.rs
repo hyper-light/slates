@@ -248,8 +248,7 @@ async fn mount_without_blocking(
   fsname: &str,
   deadline_ns: u64,
 ) -> Result<Mount, MountError> {
-  let option = format!("fsname={fsname}");
-  let mut pending = begin_mount(mount_point, &[&option])?;
+  let mut pending = begin_mount(mount_point, fsname, &[])?;
   let began = futures::now_ns();
   let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   loop {

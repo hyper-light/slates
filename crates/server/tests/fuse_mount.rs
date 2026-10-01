@@ -102,6 +102,27 @@ fn mount_work_and_detach(client: &mut slates_client::Client, volume: slates_clie
   assert_eq!(source, format!("slates:{:016x}", attached.attachment));
   work_through_the_kernel(&point.path);
   assert_eq!(client.status(volume).unwrap().attachments, 1);
+  // The container bind of this mount: its source authority is built (the table names this attachment, held
+  // to the record), but no container workload has run through it, so it is refused typed (AUD-29-64).
+  let bind = client.attach_with(
+    volume,
+    None,
+    Intent::Write,
+    slates_client::AttachRequest::Oci {
+      source: point.path.clone(),
+      destination: "/work".to_owned(),
+    },
+  );
+  assert!(
+    matches!(
+      bind,
+      Err(ClientError::Refused(Refusal::AttachmentUnsupported {
+        reason: slates_client::UnsupportedReason::ContainerWorkloadUnproven,
+        ..
+      }))
+    ),
+    "{bind:?}"
+  );
   client.detach(attached.attachment).unwrap();
   assert!(
     eventually(|| mounted_at(&point.path).is_none()),

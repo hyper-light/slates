@@ -12,8 +12,8 @@ use crate::mount_table::MountEntry;
 pub enum HostMountKind {
   /// The macOS NFS loopback mount: source `slates:/<name>` (§4.6 A-34; no capability in the table).
   NfsLoopback,
-  /// The Linux FUSE mount: type `fuse.slates`, source `slates` for every volume
-  /// (`crates/bridge-fuse/src/mount.rs`, `fsname=slates,subtype=slates`).
+  /// The Linux FUSE mount: type `fuse.slates`, source `slates:<attachment>` — the attachment the daemon
+  /// recorded for the mount, in sixteen hex digits (`crates/server/src/fuse.rs`; AUD-29-64).
   Fuse,
 }
 
@@ -33,8 +33,19 @@ pub const fn host_mount_kind() -> Option<HostMountKind> {
 pub struct ExpectedMount {
   /// The filesystem type the bridge mounts as.
   pub fstype: &'static str,
-  /// The source that names the volume exactly, where the mount names one.
-  pub source: Option<String>,
+  /// What the source must be.
+  pub source: SourceRule,
+}
+
+/// How a host mount's source names what it serves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SourceRule {
+  /// Exactly this source: the macOS loopback mount's `slates:/<volume name>`.
+  Exactly(String),
+  /// An attachment: `slates:` and sixteen hex digits, the attachment the daemon recorded for the mount. The
+  /// table names it; the daemon then holds it to its own live record (the volume, the principal, the mount
+  /// point), since a name in a table is no authority by itself.
+  Attachment,
 }
 
 /// Format: the filesystem type the macOS NFS client records for a mount (`statfs.f_fstypename`).
@@ -44,16 +55,33 @@ const NFS_FSTYPE: &str = "nfs";
 const NFS_SOURCE_PREFIX: &str = "slates:/";
 /// Format: the FUSE filesystem type the kernel records for `subtype=slates` (`fuse.<subtype>`).
 const FUSE_FSTYPE: &str = "fuse.slates";
+/// Format: the prefix of a FUSE mount's source, before its attachment's hex digits.
+const ATTACHMENT_SOURCE_PREFIX: &str = "slates:";
+/// Format: the hex digits of an attachment id (a `u64`).
+const ATTACHMENT_HEX_DIGITS: usize = 16;
+/// Format: hexadecimal.
+const HEX: u32 = 16;
+
+/// The attachment a FUSE mount's source names: `slates:` and exactly sixteen lowercase hex digits.
+pub fn attachment_of_source(source: &str) -> Option<u64> {
+  let hex = source.strip_prefix(ATTACHMENT_SOURCE_PREFIX)?;
+  let lowercase_hex = hex
+    .bytes()
+    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+  (hex.len() == ATTACHMENT_HEX_DIGITS && lowercase_hex)
+    .then(|| u64::from_str_radix(hex, HEX).ok())
+    .flatten()
+}
 /// The table entry a host mount of `volume_name` shows.
 pub fn expected_mount(kind: HostMountKind, volume_name: &str) -> ExpectedMount {
   match kind {
     HostMountKind::NfsLoopback => ExpectedMount {
       fstype: NFS_FSTYPE,
-      source: Some(format!("{NFS_SOURCE_PREFIX}{volume_name}")),
+      source: SourceRule::Exactly(format!("{NFS_SOURCE_PREFIX}{volume_name}")),
     },
     HostMountKind::Fuse => ExpectedMount {
       fstype: FUSE_FSTYPE,
-      source: None,
+      source: SourceRule::Attachment,
     },
   }
 }
@@ -87,8 +115,11 @@ pub struct VerifiedHostMount {
   pub fstype: String,
   /// The source the table records.
   pub source: String,
-  /// Whether the source names the volume.
+  /// Whether the source names what the mount serves: the volume itself, or the attachment the daemon then
+  /// holds to its record.
   pub names_volume: bool,
+  /// The attachment the source names, for a mount whose source is one ([`SourceRule::Attachment`]).
+  pub attachment: Option<u64>,
 }
 
 /// The path with trailing separators removed, the root kept as `/`.
@@ -119,17 +150,19 @@ pub fn verify_host_mount(
       fstype: entry.fstype.clone(),
     });
   }
-  if let Some(source) = &expected.source
-    && entry.source != *source
-  {
-    return Err(HostPathRefusal::NotThisVolume {
-      source: entry.source.clone(),
-    });
-  }
+  let not_this = || HostPathRefusal::NotThisVolume {
+    source: entry.source.clone(),
+  };
+  let attachment = match &expected.source {
+    SourceRule::Exactly(source) if entry.source == *source => None,
+    SourceRule::Exactly(_) => return Err(not_this()),
+    SourceRule::Attachment => Some(attachment_of_source(&entry.source).ok_or_else(not_this)?),
+  };
   Ok(VerifiedHostMount {
     mount_point: entry.mount_point.clone(),
     fstype: entry.fstype.clone(),
     source: entry.source.clone(),
-    names_volume: expected.source.is_some(),
+    names_volume: true,
+    attachment,
   })
 }

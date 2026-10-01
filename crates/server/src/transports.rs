@@ -349,6 +349,9 @@ pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
     );
   }
   let reason = match situation.platform {
+    // Linux with FUSE: the source authority is built (the mount names its attachment, held to the record);
+    // the bind is refused until a container workload has run through it (AUD-29-64, T-4.13).
+    Platform::Linux if situation.fuse_available => UnsupportedReason::ContainerWorkloadUnproven,
     Platform::MacOs | Platform::Linux => UnsupportedReason::HostMountRequired,
     Platform::Windows | Platform::Other => UnsupportedReason::HostPlatform,
   };
@@ -735,6 +738,11 @@ mod tests {
     let fuse = entry(&with_fuse, AttachTransport::Fuse);
     assert!(fuse.supported);
     assert_eq!(fuse.conformance, Conformance::LiveKernelMountTest);
+    assert_eq!(
+      entry(&with_fuse, AttachTransport::Oci).unsupported_reason,
+      Some(UnsupportedReason::ContainerWorkloadUnproven),
+      "a FUSE host mount exists, but no container workload has run through its bind"
+    );
     for bound in [false, true] {
       let situation = on(Platform::Linux, bound);
       assert_eq!(

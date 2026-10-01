@@ -116,27 +116,55 @@ fn the_last_mount_at_a_path_is_the_visible_one() {
   assert_eq!(verified.source, "slates:/work");
 }
 
-/// Format: a Linux `mountinfo` text (proc(5)) with an escaped space in a mount point, a slates FUSE
-/// mount, and an overlay root — the shapes a CI runner and a container show.
+/// Format: a Linux `mountinfo` text (proc(5)) with an escaped space in a mount point, a slates FUSE mount
+/// naming its attachment, a FUSE mount in the old shared-source form, and an overlay root — the shapes a CI
+/// runner and a container show.
 const MOUNTINFO: &str = "\
 22 27 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:5 - proc proc rw
 27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
-90 27 0:45 / /home/runner/mnt\\040point rw,nosuid,nodev,relatime shared:60 - fuse.slates slates rw,user_id=1001,group_id=1001,default_permissions
+90 27 0:45 / /home/runner/mnt\\040point rw,nosuid,nodev,relatime shared:60 - fuse.slates slates:00000000000000ab rw,user_id=1001,group_id=1001,default_permissions
+91 27 0:46 / /home/runner/old rw,nosuid,nodev,relatime shared:61 - fuse.slates slates rw,user_id=1001,group_id=1001,default_permissions
 95 27 0:50 / /var/lib/docker/overlay2/x/merged rw,relatime - overlay overlay rw,lowerdir=/a,upperdir=/b,workdir=/c
 ";
 
-/// The Linux table parses with its escapes undone, and a slates FUSE mount is verified by its
-/// filesystem type alone — the source does not name the volume, and the evidence says so.
+/// A source that is not `slates:` and exactly sixteen lowercase hex digits names no attachment.
+fn a_malformed_attachment_source_names_none() {
+  for malformed in [
+    "slates:ab",
+    "slates:00000000000000AB",
+    "slates:000000000000000g",
+    "other:00000000000000ab",
+  ] {
+    assert_eq!(
+      slates_bridge_oci::verify::attachment_of_source(malformed),
+      None,
+      "{malformed}"
+    );
+  }
+}
+
+/// AUD-29-64. The Linux table parses with its escapes undone; a slates FUSE mount is verified by its type
+/// and the attachment its source names (`slates:<16 hex digits>`), which the daemon then holds to its record;
+/// a FUSE mount whose source names no attachment — the old shared `slates` form, or anything else — is not
+/// this volume's, and a malformed id is no attachment.
 #[test]
-fn a_fuse_mount_is_verified_by_type_and_the_evidence_says_the_source_does_not_name_the_volume() {
+fn a_fuse_mount_is_verified_by_the_attachment_its_source_names() {
   let table = parse_mountinfo(MOUNTINFO).unwrap();
-  assert_eq!(table.len(), 4);
+  assert_eq!(table.len(), 5);
   assert_eq!(table[2].mount_point, "/home/runner/mnt point");
   assert_eq!(table[2].fstype, "fuse.slates");
-  assert_eq!(table[2].source, "slates");
+  assert_eq!(table[2].source, "slates:00000000000000ab");
   let expected = expected_mount(HostMountKind::Fuse, "work");
   let verified = verify_host_mount(&table, "/home/runner/mnt point", &expected).unwrap();
-  assert!(!verified.names_volume);
+  assert!(verified.names_volume);
+  assert_eq!(verified.attachment, Some(0xab));
+  assert_eq!(
+    verify_host_mount(&table, "/home/runner/old", &expected),
+    Err(HostPathRefusal::NotThisVolume {
+      source: "slates".to_owned()
+    })
+  );
+  a_malformed_attachment_source_names_none();
   assert_eq!(
     verify_host_mount(&table, "/", &expected),
     Err(HostPathRefusal::ForeignFilesystem {

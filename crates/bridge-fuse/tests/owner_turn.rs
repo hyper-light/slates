@@ -118,7 +118,7 @@ fn settle<T>(mut poll: impl FnMut() -> Option<T>, ready: impl Fn() -> Option<i32
 
 /// Mounts at `mount_point` through the non-blocking handshake.
 fn mount_without_blocking(mount_point: &str) -> Result<Mount, String> {
-  let mut pending = begin_mount(mount_point, &[]).map_err(|e| e.to_string())?;
+  let mut pending = begin_mount(mount_point, "slates", &[]).map_err(|e| e.to_string())?;
   let socket = std::os::fd::AsRawFd::as_raw_fd(&pending.socket());
   let awaiting = std::cell::Cell::new(Awaiting::Socket);
   let device: Option<Result<OwnedFd, String>> = settle(

@@ -26,8 +26,10 @@
 //! source is `slates:/<volume name>` (§4.6 A-34: the capability is never in the table), so on macOS
 //! the evidence names the volume, and the daemon identifies the source mount's attachment by the mount
 //! point it bound (`BindMount`), not by anything the table shows. The FUSE mount's
-//! source is `slates` for every volume (`crates/bridge-fuse/src/mount.rs`), so there the evidence is
-//! the filesystem type alone, and the report says so (`names_volume`). The container's view is then
+//! source is `slates:<attachment>` (`crates/server/src/fuse.rs`; AUD-29-64): the table names the
+//! attachment the daemon recorded for the mount, and the daemon holds that name to its live record — the
+//! volume, the principal and exactly this mount point — before it binds (a name in a table is no
+//! authority by itself). The container's view is then
 //! exactly the host mount's; that it *works* is proven by use, never by the record — T-4.13 runs the
 //! same workload on the host path and inside a real container over the bind.
 //!
