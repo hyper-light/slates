@@ -81,10 +81,27 @@ cancellation", §4.10 placement closure, §4.8 hedged placement, AC-7.7 / T-7.8.
   cut bounded a late transfer by what was left of the round's span. That is why each transfer now gets a full
   span.
 
+## Same change, second commit: fetch by chunk (AUD-29-55's fetch half)
+
+- **Root cause.** A takeover successor's `Fetch` returned the whole archive in one reply, so a cut fetch
+  started over.
+- **Fix.**
+  - `Fetch` → `Have` now carries the manifest only, and `FetchChunk` → `Piece` serves one chunk. A holder
+    serves a piece only for an object that holds the named manifest and references the chunk (AUD-29-45).
+  - The successor (`fleet::fetch_into_hold`) stages the manifest in its own hold (`stage_fetched`). It fetches
+    each chunk the stage lacks, many in flight, verifying and keeping each as it arrives (`stage_piece`), and
+    completes the stage once whole (`complete_stage`).
+  - A cut fetch keeps its verified chunks, so the next period asks only for the rest.
+- **Tests.**
+  - `a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed`, over a real session on the
+    simulated fabric: 2 chunks wanted, the first fetch cut after one, exactly 1 wanted on resumption, and the
+    archive rebuilt byte for byte.
+  - `a_cut_fetch_resumes_with_exactly_the_chunks_still_owed`, at the hold level.
+  - The scoping test now also refuses another object's chunk fetch.
+  - The fleet takeover, successor and holder tests: 16/16.
+
 ## Siblings reported
 
-- **Fetch is still whole-archive.** A takeover successor's `Fetch` returns the whole archive, and a cut fetch
-  starts over (AUD-29-55's second half). Owed: fetch by chunk into the successor's own stage.
 - **Collector latency is quantized by its poll interval.** The owner's collector polls its reply channels on
   the budget's poll interval rather than being woken, so an acknowledgement is observed up to one poll late.
   The barrier test had to use a quarter-span poll to see the protocol rather than the poll.

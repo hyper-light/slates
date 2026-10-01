@@ -3522,6 +3522,7 @@ already present on a candidate is never transferred again (the receiver reports 
 set); a transfer is resumable (A-54): the offer stages the manifest on the holder, chunks travel
 one per exchange and are verified and kept in that stage, the chunk completing the closure draws
 the acknowledgement, and a cut transfer's next offer names exactly the verified chunks still owed;
+a reader's fetch stages the same way, one chunk per exchange, and resumes from what it verified;
 each holder's offer and transfer progress independently, with no wait on the slowest offer;
 anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`, and puts a
@@ -7680,7 +7681,9 @@ and `docs/bugs/2026-10-01-a-cut-transfer-lost-its-progress-and-puts-waited-on-th
 - Evidence: the transfer oracle (a census of 16 transfer cases over generated histories, a mutation that drops
   resumed progress failing it), the daemon tests cutting after every chunk and abandoning a transfer, and the
   simulated barrier test (the fast holder places inside the offer span while the slow offer is unanswered).
-- What it does not change: fetch is still whole-archive (owed, AUD-29-55's second half); the collector still
-  polls its channels on the budget's interval; R1–R10.
+- Fetch follows the same rule: a reader fetches the manifest, stages it, and fetches each chunk it lacks into
+  that stage, verified as it arrives, so a cut fetch resumes with exactly the chunks still owed; a holder
+  serves a chunk only for an object holding the named manifest and referencing it.
+- What it does not change: the collector still polls its channels on the budget's interval; R1–R10.
   the merge engine's metadata dimension, R1–R10.
 

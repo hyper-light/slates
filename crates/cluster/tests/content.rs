@@ -535,3 +535,185 @@ fn a_fast_holder_places_while_a_slow_offer_is_outstanding() {
   assert_eq!(fast_held_rx.try_recv(), Ok(true));
   let _ = slow_held_rx.try_recv();
 }
+
+/// An archive of two files, one raw chunk each, so a fetch can be cut between its chunks.
+fn two_chunk_archive() -> Archive {
+  let chunks = [
+    Archive::raw_chunk(b"the first fetched chunk".to_vec()),
+    Archive::raw_chunk(b"the second fetched chunk".to_vec()),
+  ];
+  let entries = chunks
+    .iter()
+    .enumerate()
+    .map(|(at, chunk)| Entry {
+      name: format!("f{at}"),
+      meta: NodeMeta {
+        size: chunk.raw_len,
+        ..NodeMeta::default()
+      },
+      node: Node::File(vec![Extent {
+        offset: 0,
+        len: chunk.raw_len,
+        chunk: chunk.identity,
+        chunk_offset: 0,
+      }]),
+    })
+    .collect();
+  Archive {
+    manifest: Node::Directory(entries),
+    chunks: chunks.to_vec(),
+    ..archive()
+  }
+}
+
+/// What the reader of the cut-fetch test observed: what it wanted at each staging, whether the first fetch
+/// was cut, and whether the second completed the archive byte for byte.
+#[derive(Debug, PartialEq, Eq)]
+struct FetchObservation {
+  first_wanted: usize,
+  first_complete: bool,
+  resumed_wanted: usize,
+  rebuilt: bool,
+}
+
+/// AUD-29-55 (the fetch half; §4.9 "verified ranges and resumable progress"): a reader fetches over a real
+/// session, keeps the first chunk and is cut, then fetches again. Do: hold a two-chunk archive on a holder;
+/// on the reader, fetch the manifest, stage it, fetch its chunks keeping only the first (the cut), stage the
+/// manifest again and fetch what it still wants. Expect two chunks wanted at first, the first fetch cut short,
+/// exactly one wanted on resumption, and the archive rebuilt byte for byte from the stage.
+#[test]
+fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
+  use slates_cluster::content::{Placed, fetch_chunks, fetch_manifest};
+  let mut simulation = SimRuntime::new(&config(), 1).unwrap();
+  let shard = simulation.shard_ids()[0];
+  let (owner_identity, holder_identity) = (identity(), identity());
+  let (owner_certificate, holder_certificate) =
+    (owner_identity.certificate(), holder_identity.certificate());
+  let (holder_tx, holder_rx) = channel();
+  let (owner_tx, owner_rx) = channel();
+  simulation
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      holder_tx.send(socket.local_addr().unwrap()).unwrap();
+      let owner_address = address_from(owner_rx).await;
+      let mut endpoint = Endpoint::server(
+        socket,
+        owner_address,
+        &holder_identity,
+        &[owner_certificate],
+        slates_transport::connection::ConnectionShape::for_frame_cap(
+          slates_transport::endpoint::MAX_PACKET_PAYLOAD,
+          CONTENT_RECEIVE_CEILING,
+        ),
+      )
+      .unwrap();
+      endpoint.establish().await.unwrap();
+      let mut held = ContentHold::new();
+      let mut room = Room::new();
+      let mut space = HoldSpace {
+        arena: &mut room.arena,
+        budget: &mut room.budget,
+        metadata: &mut room.metadata,
+      };
+      held
+        .hold(
+          &mut space,
+          ObjectId::new(OWNER, 1),
+          Placed::default(),
+          two_chunk_archive(),
+        )
+        .unwrap();
+      while serve_bounded(&mut endpoint, &mut held, &mut room).await {}
+    })
+    .unwrap();
+  let (observed_tx, observed_rx) = channel();
+  simulation
+    .spawn_on(shard, async move {
+      let endpoint = dial(&owner_identity, &holder_certificate, owner_tx, holder_rx).await;
+      let archive = two_chunk_archive();
+      let (object, identity) = (ObjectId::new(OWNER, 1), archive.manifest_identity());
+      let deadline = COLLECTION_NS * 4;
+      let mut reader = ContentHold::new();
+      let mut room = Room::new();
+      let (manifest, endpoint) = fetch_manifest(endpoint, object, identity, deadline).await;
+      let manifest = manifest.expect("the holder serves the manifest");
+      let stage = |reader: &mut ContentHold, room: &mut Room| {
+        let mut space = HoldSpace {
+          arena: &mut room.arena,
+          budget: &mut room.budget,
+          metadata: &mut room.metadata,
+        };
+        reader
+          .stage_fetched(&mut space, object, Placed::default(), &manifest)
+          .unwrap()
+          .unwrap_or_default()
+      };
+      let first_wanted = stage(&mut reader, &mut room);
+      let mut kept = 0;
+      let (first_complete, endpoint) = fetch_chunks(
+        endpoint,
+        (object, identity),
+        first_wanted.clone(),
+        deadline,
+        |chunk| {
+          if kept > 0 {
+            return false; // the cut: the second chunk is never kept
+          }
+          kept += 1;
+          let mut space = HoldSpace {
+            arena: &mut room.arena,
+            budget: &mut room.budget,
+            metadata: &mut room.metadata,
+          };
+          reader
+            .stage_piece(&mut space, object, &identity, chunk)
+            .is_ok()
+        },
+      )
+      .await;
+      let resumed_wanted = stage(&mut reader, &mut room);
+      let (_, _endpoint) = fetch_chunks(
+        endpoint,
+        (object, identity),
+        resumed_wanted.clone(),
+        deadline,
+        |chunk| {
+          let mut space = HoldSpace {
+            arena: &mut room.arena,
+            budget: &mut room.budget,
+            metadata: &mut room.metadata,
+          };
+          reader
+            .stage_piece(&mut space, object, &identity, chunk)
+            .is_ok()
+        },
+      )
+      .await;
+      let mut space = HoldSpace {
+        arena: &mut room.arena,
+        budget: &mut room.budget,
+        metadata: &mut room.metadata,
+      };
+      let rebuilt = reader.complete_stage(&mut space, object).is_ok()
+        && reader.archive_of(&room.arena, object, &identity) == Some(archive);
+      observed_tx
+        .send(FetchObservation {
+          first_wanted: first_wanted.len(),
+          first_complete,
+          resumed_wanted: resumed_wanted.len(),
+          rebuilt,
+        })
+        .unwrap();
+    })
+    .unwrap();
+  simulation.run_until_idle();
+  assert_eq!(
+    observed_rx.try_recv().unwrap(),
+    FetchObservation {
+      first_wanted: 2,
+      first_complete: false,
+      resumed_wanted: 1,
+      rebuilt: true,
+    }
+  );
+}

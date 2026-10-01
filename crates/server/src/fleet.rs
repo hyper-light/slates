@@ -79,8 +79,8 @@ use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
 use slates_cluster::config_group::ReportOutcome;
 use slates_cluster::content::{
-  CONTENT_CHUNK_STREAM, CONTENT_OFFER_STREAM, ContentMessage, fetch_content, is_content_stream,
-  put_content,
+  CONTENT_CHUNK_STREAM, CONTENT_OFFER_STREAM, ContentMessage, fetch_chunks, fetch_manifest,
+  is_content_stream, put_content,
 };
 use slates_cluster::coordinates::{CoordinateEngine, NetworkCoordinate};
 use slates_cluster::detector::{Detector, DetectorTiming};
@@ -3888,43 +3888,88 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
     };
     let held =
       state::with_state(|s| s.held_content.holds_manifest(object, &manifest)).unwrap_or(false);
-    if !held {
-      let holders = head.holders();
-      let mut sessions = take_sessions(|host| holders.contains(&host));
-      let Some((host, endpoint)) = sessions.pop() else {
-        return_sessions(sessions);
-        continue; // No recorded holder reachable this period.
-      };
-      return_sessions(sessions);
-      let (archive, endpoint) =
-        fetch_content(endpoint, object, manifest, budget.max_deadline_ns()).await;
-      return_sessions(vec![(host, endpoint)]);
-      let Some(archive) = archive else {
-        continue;
-      };
-      let stored = state::with_state(|s| {
-        // Held as placed for the adopted head's sequence: the retention rule keeps it while the head names
-        // this node, and the materialization below reads it in this same turn (AUD-29-43).
-        let placed = slates_cluster::content::Placed {
-          sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
-        };
-        s.held_content
-          .hold(
-            &mut crate::content_holder::hold_space(&mut s.store),
-            object,
-            placed,
-            archive,
-          )
-          .is_ok()
-      })
-      .unwrap_or(false);
-      if !stored {
-        count_refusal(MATERIALIZE_REFUSED);
-        continue;
-      }
+    if !held && !fetch_into_hold(object, &head, manifest, budget).await {
+      continue; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
     }
     materialize(origin, object, head).await;
   }
+}
+
+/// Fetches `object`'s content `manifest` from a recorded holder into this node's hold (§4.10 "fetches … by
+/// identity from a recorded holder"; AUD-29-55): the manifest, staged as placed for the adopted head's
+/// sequence (the retention rule keeps it while the head names this node), then each chunk the stage lacks,
+/// one per exchange, verified and kept as it arrives, and the stage completed once whole. A fetch cut by the
+/// deadline or a lost session keeps every verified chunk, so the next period asks only for the rest. Returns
+/// whether the content is now held whole.
+async fn fetch_into_hold(
+  object: ObjectId,
+  head: &HeadValue,
+  manifest: [u8; 32],
+  budget: CommitBudget,
+) -> bool {
+  let holders = head.holders();
+  let mut sessions = take_sessions(|host| holders.contains(&host));
+  let Some((host, endpoint)) = sessions.pop() else {
+    return_sessions(sessions);
+    return false; // No recorded holder reachable this period.
+  };
+  return_sessions(sessions);
+  let (fetched, endpoint) =
+    fetch_manifest(endpoint, object, manifest, budget.max_deadline_ns()).await;
+  let Some(fetched) = fetched else {
+    return_sessions(vec![(host, endpoint)]);
+    return false;
+  };
+  let staged = state::with_state(|s| {
+    let placed = slates_cluster::content::Placed {
+      sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
+    };
+    s.held_content.stage_fetched(
+      &mut crate::content_holder::hold_space(&mut s.store),
+      object,
+      placed,
+      &fetched,
+    )
+  });
+  let wanted = match staged {
+    Some(Ok(None)) => {
+      return_sessions(vec![(host, endpoint)]);
+      return true;
+    }
+    Some(Ok(Some(wanted))) => wanted,
+    Some(Err(_)) | None => {
+      return_sessions(vec![(host, endpoint)]);
+      count_refusal(MATERIALIZE_REFUSED);
+      return false;
+    }
+  };
+  let (_, endpoint) = fetch_chunks(
+    endpoint,
+    (object, manifest),
+    wanted,
+    budget.max_deadline_ns(),
+    |chunk| {
+      state::with_state(|s| {
+        s.held_content
+          .stage_piece(
+            &mut crate::content_holder::hold_space(&mut s.store),
+            object,
+            &manifest,
+            chunk,
+          )
+          .is_ok()
+      })
+      .unwrap_or(false)
+    },
+  )
+  .await;
+  return_sessions(vec![(host, endpoint)]);
+  state::with_state(|s| {
+    s.held_content
+      .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
+      .is_ok()
+  })
+  .unwrap_or(false)
 }
 
 /// One period's materialization of everything this node took over: the plain volumes whose heads it

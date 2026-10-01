@@ -22,9 +22,12 @@
 //!   stage still lacks. The chunk that completes the closure draws the acknowledgement — **bound** to the
 //!   object, sequence and manifest, so a stale or foreign one cannot count toward a placement (the record
 //!   plane's same discipline: network receipt is not acceptance).
-//! - **`Fetch` → `Have`**: a reader — a takeover successor materializing the volume, a remote attach
-//!   — asks a recorded holder for a manifest's whole archive by identity (§4.10 "fetches the
-//!   manifest by identity from a recorded holder"), verified on arrival.
+//! - **`Fetch` → `Have`, then `FetchChunk` → `Piece`**: a reader — a takeover successor materializing the
+//!   volume, a remote attach — asks a recorded holder for a manifest by identity (§4.10 "fetches the
+//!   manifest by identity from a recorded holder"), then for each chunk it lacks, one per exchange, many in
+//!   flight. It stages what it fetches through the same stage a placement fills, so every chunk is
+//!   verified as it arrives and a cut fetch keeps what it verified (AUD-29-55): the next fetch asks only for
+//!   the rest.
 //!
 //! **Resumption (AUD-29-55).** A stage keeps every chunk that arrived verified, so a transfer cut at any
 //! point — a deadline, a cancelled round, a session replaced — loses at most the chunks still in flight: the
@@ -113,6 +116,10 @@ const KIND_FETCH: u8 = 5;
 const KIND_HAVE: u8 = 6;
 /// Format: the kind byte of a holder's progress reply to a chunk its stage kept.
 const KIND_STAGED: u8 = 7;
+/// Format: the kind byte of a fetch of one chunk of a held manifest.
+const KIND_FETCH_CHUNK: u8 = 8;
+/// Format: the kind byte of a fetched chunk.
+const KIND_PIECE: u8 = 9;
 /// Format: the width of a BLAKE3 identity on the wire.
 const HASH_BYTES: usize = 32;
 /// Format: the width of an object id on the wire.
@@ -168,18 +175,36 @@ pub enum ContentMessage {
   },
   /// The holder's bound acknowledgement of content it verified and holds whole.
   Ack(ContentAck),
-  /// A reader asks for a manifest's whole archive by identity, **for an object**: a holder serves it only
-  /// to a host with authority over that object, and only from what it holds for that object (AUD-29-45).
+  /// A reader asks for a manifest by identity, **for an object**: a holder serves it only to a host with
+  /// authority over that object, and only from what it holds for that object (AUD-29-45).
   Fetch {
     /// The object whose content is asked for.
     object: ObjectId,
     /// The manifest identity.
     manifest: [u8; 32],
   },
-  /// A holder's answer to a fetch: the whole archive (manifest and every referenced chunk).
+  /// A holder's answer to a fetch: the manifest — the archive's header and tree with no chunks.
   Have {
-    /// The encoded archive.
+    /// The encoded manifest-only archive.
     archive: Vec<u8>,
+  },
+  /// A reader asks for one chunk of a manifest the object holds (AUD-29-55).
+  FetchChunk {
+    /// The object whose content is asked for.
+    object: ObjectId,
+    /// The held manifest the chunk belongs to.
+    manifest: [u8; 32],
+    /// The chunk's identity.
+    chunk: [u8; 32],
+  },
+  /// A holder's answer to a chunk fetch: the chunk, payload as stored.
+  Piece {
+    /// The object.
+    object: ObjectId,
+    /// The manifest.
+    manifest: [u8; 32],
+    /// The chunk.
+    chunk: Chunk,
   },
 }
 
@@ -431,6 +456,26 @@ impl ContentMessage {
         out.push(KIND_HAVE);
         put_blob(&mut out, archive);
       }
+      ContentMessage::FetchChunk {
+        object,
+        manifest,
+        chunk,
+      } => {
+        out.push(KIND_FETCH_CHUNK);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(manifest);
+        out.extend_from_slice(chunk);
+      }
+      ContentMessage::Piece {
+        object,
+        manifest,
+        chunk,
+      } => {
+        out.push(KIND_PIECE);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(manifest);
+        put_chunk(&mut out, chunk);
+      }
     }
     out
   }
@@ -476,6 +521,16 @@ impl ContentMessage {
       },
       KIND_HAVE => ContentMessage::Have {
         archive: reader.blob()?,
+      },
+      KIND_FETCH_CHUNK => ContentMessage::FetchChunk {
+        object: reader.object()?,
+        manifest: reader.hash()?,
+        chunk: reader.hash()?,
+      },
+      KIND_PIECE => ContentMessage::Piece {
+        object: reader.object()?,
+        manifest: reader.hash()?,
+        chunk: reader.chunk()?,
       },
       kind => return Err(ContentError::UnknownKind { kind }),
     };
@@ -1589,6 +1644,74 @@ impl ContentHold {
     Some(with_chunks(&archive, chunks))
   }
 
+  /// The manifest-only archive bytes of a manifest held for `object`, as stored, or `None` if not held for it.
+  fn manifest_bytes(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+  ) -> Option<Vec<u8>> {
+    let record = self.objects.get(&object)?.manifests.get(identity)?;
+    Some(arena.bytes(record.extent)?.get(..record.len)?.to_vec())
+  }
+
+  /// The chunk `chunk` for a reader of `object`'s manifest `identity`: served only when the object holds that
+  /// manifest and its held content references the chunk (AUD-29-45: never another object's bytes).
+  fn piece_of(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+    chunk: &[u8; 32],
+  ) -> Option<Chunk> {
+    let held = self.objects.get(&object)?;
+    if !held.manifests.contains_key(identity) || !held.chunks.contains_key(chunk) {
+      return None;
+    }
+    Self::chunk_of(arena, chunk, self.chunks.get(chunk)?)
+  }
+
+  /// Stages a fetched `manifest` (an archive with no chunks) for `object`, placed as `placed` (AUD-29-55): a
+  /// reader's fetch fills the same stage a placement does. `None` when the manifest is already held for the
+  /// object; else the chunks still to fetch — what neither a held manifest nor an earlier, cut fetch kept.
+  pub fn stage_fetched(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    placed: Placed,
+    manifest: &Archive,
+  ) -> Result<Option<Vec<[u8; 32]>>, ContentRefusal> {
+    if !manifest.chunks.is_empty() {
+      return Err(ContentRefusal::Unreferenced);
+    }
+    match self.open_stage(space, object, placed, manifest)? {
+      (Opened::Held, _) => Ok(None),
+      (Opened::Missing(missing), _) => Ok(Some(missing)),
+    }
+  }
+
+  /// Keeps one fetched chunk in `object`'s stage of `manifest`, verified against its identity; returns how
+  /// many chunks the stage still lacks.
+  pub fn stage_piece(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    manifest: &[u8; 32],
+    chunk: Chunk,
+  ) -> Result<u64, ContentRefusal> {
+    self.stage_chunk(space, object, manifest, chunk)
+  }
+
+  /// Completes `object`'s stage into a held manifest once its closure is whole; `Incomplete` while chunks
+  /// are still owed (the stage stays for the next fetch).
+  pub fn complete_stage(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+  ) -> Result<[u8; 32], ContentRefusal> {
+    self.promote(space, object)
+  }
+
   /// This hold's canonical image (AUD-29-59; see [`HoldImage`]), read out of `arena`, or no bytes when
   /// nothing is held.
   pub fn to_image(&self, arena: &ChunkArena) -> Vec<u8> {
@@ -1761,7 +1884,9 @@ impl ContentHold {
       ContentMessage::Offer { object, .. } | ContentMessage::Chunk { object, .. } => {
         Some((ContentAccess::Place, *object))
       }
-      ContentMessage::Fetch { object, .. } => Some((ContentAccess::Read, *object)),
+      ContentMessage::Fetch { object, .. } | ContentMessage::FetchChunk { object, .. } => {
+        Some((ContentAccess::Read, *object))
+      }
       _ => None,
     };
     let Some((access, object)) = asked else {
@@ -1784,9 +1909,22 @@ impl ContentHold {
         chunk,
       } => self.serve_chunk(space, holder, (object, sequence), manifest, chunk),
       ContentMessage::Fetch { object, manifest } => {
-        let reply = match self.archive_of(space.arena, object, &manifest) {
-          Some(archive) => ContentMessage::Have {
-            archive: archive.encode(),
+        let reply = match self.manifest_bytes(space.arena, object, &manifest) {
+          Some(archive) => ContentMessage::Have { archive }.encode(),
+          None => Vec::new(),
+        };
+        (reply, None)
+      }
+      ContentMessage::FetchChunk {
+        object,
+        manifest,
+        chunk,
+      } => {
+        let reply = match self.piece_of(space.arena, object, &manifest, &chunk) {
+          Some(chunk) => ContentMessage::Piece {
+            object,
+            manifest,
+            chunk,
           }
           .encode(),
           None => Vec::new(),
@@ -2381,11 +2519,11 @@ pub async fn put_content(
   }
 }
 
-/// Fetches the whole archive of `manifest` from a recorded holder over `endpoint`, bounded by
-/// `deadline_ns`, verified on arrival (the reader checks every chunk and the manifest hash, and the
-/// manifest's identity must be the one asked for). Returns the archive, if the holder had it whole,
-/// and the endpoint for reuse whatever the outcome.
-pub async fn fetch_content(
+/// Fetches `object`'s manifest `manifest` from a recorded holder over `endpoint`, bounded by `deadline_ns`:
+/// the archive's header and tree with no chunks, decoded (the reader checks the manifest's hash) and accepted
+/// only when its identity is the one asked for. Returns it, if the holder had it, and the endpoint for reuse
+/// whatever the outcome.
+pub async fn fetch_manifest(
   endpoint: Endpoint,
   object: ObjectId,
   manifest: [u8; 32],
@@ -2403,10 +2541,93 @@ pub async fn fetch_content(
   let archive = match ContentMessage::decode(&reply.bytes) {
     Ok(ContentMessage::Have { archive }) => Archive::decode(&archive)
       .ok()
-      .filter(|archive| archive.manifest_identity() == manifest),
+      .filter(|archive| archive.chunks.is_empty() && archive.manifest_identity() == manifest),
     _ => None,
   };
   (archive, endpoint)
+}
+
+/// Fetches `wanted` — chunks of `object`'s manifest `manifest` — from a recorded holder over `endpoint`, one
+/// per exchange with as many in flight as the peer's stream credit allows, bounded by `deadline_ns`, handing
+/// each chunk that answers for this manifest to `keep` (which verifies and stages it, AUD-29-55) as it
+/// arrives. Stops early when `keep` refuses one or the holder answers anything else; every exchange still
+/// open is abandoned. Returns whether every wanted chunk was kept, and the endpoint whatever the outcome.
+pub async fn fetch_chunks(
+  mut endpoint: Endpoint,
+  (object, manifest): (ObjectId, [u8; 32]),
+  wanted: Vec<[u8; 32]>,
+  deadline_ns: u64,
+  keep: impl FnMut(Chunk) -> bool,
+) -> (bool, Endpoint) {
+  let fetched = slates_rt::futures::within(
+    deadline_ns,
+    drive_fetch(&mut endpoint, (object, manifest), wanted, keep),
+  )
+  .await
+  .ok()
+  .flatten()
+  .unwrap_or(false);
+  endpoint.abandon_all();
+  (fetched, endpoint)
+}
+
+/// The loop of [`fetch_chunks`]: begin chunk fetches while the stream credit admits them, drive the session,
+/// and hand each answered chunk to `keep`.
+async fn drive_fetch(
+  endpoint: &mut Endpoint,
+  (object, manifest): (ObjectId, [u8; 32]),
+  wanted: Vec<[u8; 32]>,
+  mut keep: impl FnMut(Chunk) -> bool,
+) -> bool {
+  let mut pending: std::collections::VecDeque<[u8; 32]> = wanted.into();
+  let mut open: Vec<(u64, [u8; 32])> = Vec::new();
+  loop {
+    while let Some(next) = pending.front().copied() {
+      let request = ContentMessage::FetchChunk {
+        object,
+        manifest,
+        chunk: next,
+      }
+      .encode();
+      match endpoint.begin(CONTENT_FETCH_STREAM, Priority::Bulk, &request) {
+        Ok(id) => {
+          open.push((id, next));
+          pending.pop_front();
+        }
+        Err(EndpointError::Stream(StreamRefusal::Backlogged { .. })) if !open.is_empty() => break,
+        Err(_) => return false,
+      }
+    }
+    if open.is_empty() {
+      return true;
+    }
+    if endpoint.drive().await.is_err() {
+      return false;
+    }
+    let mut still_open = Vec::with_capacity(open.len());
+    for (id, asked) in open {
+      let Some(reply) = endpoint.take_reply(id) else {
+        still_open.push((id, asked));
+        continue;
+      };
+      match ContentMessage::decode(&reply) {
+        Ok(ContentMessage::Piece {
+          object: answered_object,
+          manifest: answered_manifest,
+          chunk,
+        }) if answered_object == object
+          && answered_manifest == manifest
+          && chunk.identity == asked =>
+        {
+          if !keep(chunk) {
+            return false;
+          }
+        }
+        _ => return false,
+      }
+    }
+    open = still_open;
+  }
 }
 
 /// A real shard memory for the hold's tests: an arena over an anonymous mapping of whole pages, a byte budget
@@ -2540,6 +2761,16 @@ mod tests {
       },
       ContentMessage::Have {
         archive: vec![1, 2],
+      },
+      ContentMessage::FetchChunk {
+        object: OBJECT,
+        manifest: hash(1),
+        chunk: hash(2),
+      },
+      ContentMessage::Piece {
+        object: OBJECT,
+        manifest: hash(1),
+        chunk: Archive::raw_chunk(b"a piece".to_vec()),
       },
     ]
   }
@@ -2691,7 +2922,8 @@ mod tests {
   /// The holder side served end to end in-process: an offer to a hold with one chunk already present
   /// answers the one missing identity; that chunk, corrupted (a flipped bit), is refused with an empty reply
   /// and nothing stored; the chunk itself completes the stage and is acknowledged bound to the object,
-  /// sequence and manifest; a fetch hands the whole archive back.
+  /// sequence and manifest; a fetch hands the manifest back and a chunk fetch each referenced chunk, from
+  /// which a reader's stage rebuilds the archive byte for byte (AUD-29-55).
   #[test]
   fn serve_answers_offers_puts_and_fetches_and_refuses_a_corrupt_chunk() {
     let archive = two_chunk_archive();
@@ -2767,6 +2999,17 @@ mod tests {
     assert_eq!(ack.holder, holder);
     assert_eq!(hold.chunk_count(), 2, "exactly the missing chunk was added");
 
+    assert_fetches_rebuild(&mut hold, &mut room, holder, archive);
+  }
+
+  /// The fetch half of the serve test: the manifest comes back alone, a reader's stage rebuilds the archive
+  /// byte for byte from chunk fetches, and a manifest not held draws the empty answer.
+  fn assert_fetches_rebuild(
+    hold: &mut ContentHold,
+    room: &mut TestSpace,
+    holder: HostId,
+    archive: Archive,
+  ) {
     let fetched = hold
       .serve(
         &mut room.space(),
@@ -2781,9 +3024,15 @@ mod tests {
       )
       .0;
     let Ok(ContentMessage::Have { archive: bytes }) = ContentMessage::decode(&fetched) else {
-      panic!("a fetch is answered with the archive");
+      panic!("a fetch is answered with the manifest");
     };
-    assert_eq!(Archive::decode(&bytes).unwrap(), archive);
+    let manifest = Archive::decode(&bytes).unwrap();
+    assert_eq!(manifest, with_chunks(&archive, Vec::new()));
+    assert_eq!(
+      fetched_through_a_stage(hold, room, holder, &manifest),
+      Some(archive),
+      "the fetched archive rebuilds byte for byte"
+    );
     assert!(
       hold
         .serve(
@@ -2803,13 +3052,104 @@ mod tests {
     );
   }
 
+  /// A reader's fetch of `manifest` from `hold` (as `OBJECT`'s content), staged for `OTHER` in a fresh hold:
+  /// every chunk the stage wants fetched with `FetchChunk`, kept, and the stage completed; the rebuilt archive.
+  fn fetched_through_a_stage(
+    hold: &mut ContentHold,
+    room: &mut TestSpace,
+    holder: HostId,
+    manifest: &Archive,
+  ) -> Option<Archive> {
+    let identity = manifest.manifest_identity();
+    let mut reader = ContentHold::new();
+    let mut reader_room = TestSpace::new();
+    let wanted = reader
+      .stage_fetched(&mut reader_room.space(), OTHER, Placed::default(), manifest)
+      .ok()??;
+    for chunk in wanted {
+      let request = ContentMessage::FetchChunk {
+        object: OBJECT,
+        manifest: identity,
+        chunk,
+      }
+      .encode();
+      let reply = hold
+        .serve(
+          &mut room.space(),
+          holder,
+          &request,
+          |_, _| true,
+          |_, _, _| true,
+        )
+        .0;
+      let Ok(ContentMessage::Piece { chunk, .. }) = ContentMessage::decode(&reply) else {
+        return None;
+      };
+      reader
+        .stage_piece(&mut reader_room.space(), OTHER, &identity, chunk)
+        .ok()?;
+    }
+    let completed = reader
+      .complete_stage(&mut reader_room.space(), OTHER)
+      .ok()?;
+    reader.archive_of(&reader_room.arena, OTHER, &completed)
+  }
+
+  /// AUD-29-55 (the fetch half): do: stage a fetched manifest of two chunks, keep the first chunk, cut, and
+  /// stage the manifest again; expect the first staging to want both chunks, completion refused while one is
+  /// owed, the second staging to want exactly the chunk still owed, and the stage complete once it is kept.
+  #[test]
+  fn a_cut_fetch_resumes_with_exactly_the_chunks_still_owed() {
+    let archive = two_chunk_archive();
+    let manifest = with_chunks(&archive, Vec::new());
+    let identity = manifest.manifest_identity();
+    let mut reader = ContentHold::new();
+    let mut room = TestSpace::new();
+    let wanted = reader
+      .stage_fetched(&mut room.space(), OBJECT, Placed::default(), &manifest)
+      .unwrap()
+      .unwrap();
+    assert_eq!(wanted.len(), 2);
+    reader
+      .stage_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        archive.chunks[0].clone(),
+      )
+      .unwrap();
+    assert_eq!(
+      reader.complete_stage(&mut room.space(), OBJECT),
+      Err(ContentRefusal::Incomplete { missing: 1 })
+    );
+    let resumed = reader
+      .stage_fetched(&mut room.space(), OBJECT, Placed::default(), &manifest)
+      .unwrap()
+      .unwrap();
+    assert_eq!(resumed, vec![archive.chunks[1].identity]);
+    reader
+      .stage_piece(
+        &mut room.space(),
+        OBJECT,
+        &identity,
+        archive.chunks[1].clone(),
+      )
+      .unwrap();
+    assert_eq!(
+      reader.complete_stage(&mut room.space(), OBJECT),
+      Ok(identity)
+    );
+    assert!(reader.holds_manifest(OBJECT, &identity));
+  }
+
   /// A second object, for the scoping tests.
   const OTHER: ObjectId = ObjectId([9; OBJECT_BYTES]);
 
   /// AUD-29-45 (§4.13 "Content identity and sharing"): do: hold one object's archive, then ask about the same
   /// chunks and manifest for another object — an offer's missing set, a put leaning on them unshipped, a
-  /// fetch; expect every answer as if nothing were held: the chunks missing, the put refused incomplete, the
-  /// fetch empty — while the first object's own answers are unchanged, and the bytes stored once.
+  /// fetch, a chunk fetch; expect every answer as if nothing were held: the chunks missing, the put refused
+  /// incomplete, the fetches empty — while the first object's own answers are unchanged, and the bytes stored
+  /// once.
   #[test]
   fn another_objects_content_is_neither_revealed_nor_lent() {
     let archive = two_chunk_archive();
@@ -2848,6 +3188,21 @@ mod tests {
       fetched.is_empty(),
       "another object's manifest is not served"
     );
+    let piece = hold
+      .serve(
+        &mut room.space(),
+        HostId(3),
+        &ContentMessage::FetchChunk {
+          object: OTHER,
+          manifest,
+          chunk: identities[0],
+        }
+        .encode(),
+        |_, _| true,
+        |_, _, _| true,
+      )
+      .0;
+    assert!(piece.is_empty(), "another object's chunk is not served");
     assert!(hold.missing_of(OBJECT, &identities).is_empty());
     hold
       .hold(&mut room.space(), OTHER, Placed::default(), archive)
