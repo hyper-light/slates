@@ -7250,6 +7250,227 @@ fn seal_twice_and_watch_the_first_go(
   Ok((first_held, resealed, second_held, first_released))
 }
 
+/// Shape: the seals the churn test leaves room for beside the first — the unrelated volume's promise takes
+/// all of the holder's admittable capacity but this many seals' charge, so later seals meet the bound.
+const CHURN_ROOM_SEALS: u64 = 2;
+/// Shape: the volumes the churn test seals past the first — one more than fits under the cap with the first
+/// still held, so at least one put is refused at the bound and waits for room.
+const CHURN_MORE_SEALS: usize = 3;
+
+/// AUD-29-43 acceptance (§4.2 "a remote holder makes the same admission against its own machine before
+/// acknowledging placement"; §4.10): a holder's replicas cap at its unpromised capacity through churn, are
+/// refused typed at the cap, never spend an unrelated volume's promise, and return to the surviving
+/// references' baseline after retirement. Three daemons form an `f = 1` fleet; C refuses every content put,
+/// so B is the owner's only remote holder. The owner seals one volume (B holds it; its charge is one seal's);
+/// B then admits an unrelated bounded volume whose promise takes all of B's admittable capacity but room for
+/// two more seals, and the cap is measured from B's budget after it; the owner seals three more volumes, each
+/// with distinct bytes. Expect: B's charge never past the cap and always equal to its hold's own account; puts
+/// refused at the cap and counted; the unrelated volume's write lands while B is full; destroying the first
+/// volume frees room that a waiting seal takes; and destroying every volume returns B's charge, index and
+/// manifests to zero. Measured 2026-10-01: one seal 32,768 bytes, cap 98,304, peak 98,304.
+#[test]
+fn a_holders_replicas_cap_at_its_unpromised_capacity_through_churn_and_retire_to_the_survivors_baseline()
+ {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  daemons[2]
+    .inject_merge_fault(slates_server::merge_service::MergeFault {
+      refuse_content_puts: true,
+      ..Default::default()
+    })
+    .unwrap();
+
+  let outcome = churn_against_a_capped_holder(&instance_a, &daemons);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let churn = match outcome {
+    Ok(churn) => churn,
+    Err(why) => panic!("setup: {why}"),
+  };
+  eprintln!("{churn:?}");
+  assert!(churn.per_seal > 0, "the first seal charged its holder");
+  assert!(
+    churn.peak <= churn.cap,
+    "the holder's charge never passed its unpromised capacity"
+  );
+  assert!(
+    churn.accounts_agree,
+    "the budget's charge always equalled the hold's account"
+  );
+  assert!(
+    churn.refused_at_cap,
+    "puts past the cap were refused, typed and counted"
+  );
+  assert!(
+    churn.unrelated_wrote,
+    "the unrelated volume wrote within its promise while the holder was full"
+  );
+  assert!(
+    churn.room_reused,
+    "destroying a held volume freed room a waiting seal took"
+  );
+  assert!(
+    churn.baseline,
+    "destroying every volume returned the holder's charge, index and manifests to zero"
+  );
+}
+
+/// What the churn test saw.
+#[derive(Debug, Default)]
+struct Churn {
+  per_seal: u64,
+  cap: u64,
+  peak: u64,
+  accounts_agree: bool,
+  refused_at_cap: bool,
+  unrelated_wrote: bool,
+  room_reused: bool,
+  baseline: bool,
+}
+
+/// Creates `name` on the owner, writes `name` itself as the bytes of `hello.txt` over NFS (so every such
+/// volume holds distinct content) and snapshots it, without waiting for placement: the seal places when a
+/// holder admits it.
+fn seal_without_waiting(instance: &str, owner: &Daemon, name: &str) -> Result<VolumeId, String> {
+  let mut client = Client::connect(instance);
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err(format!("{name} was not created"));
+  };
+  let port = owner.nfs_port().ok_or("the owner serves NFS")?;
+  let mut stream =
+    TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("connect to NFS: {e}"))?;
+  let root_fh = mount(&mut stream, &capability_path(owner, name), 1);
+  let file_fh = create(&mut stream, &root_fh, "hello.txt", 2);
+  write(&mut stream, &file_fh, name.as_bytes(), 3);
+  drop(stream);
+  match client.call(&RequestBody::Snapshot { volume: id }) {
+    ReplyBody::Snapshotted { .. } => Ok(id),
+    other => Err(format!("{name} was not snapshotted: {other:?}")),
+  }
+}
+
+/// Samples the holder's replica account into `churn`: the peak charge and whether the budget's charge has
+/// always equalled the hold's own account.
+fn sample_replicas(
+  holder: &Daemon,
+  churn: &mut Churn,
+) -> Result<slates_server::daemon::ReplicaAccount, ObserveError> {
+  let account = holder.fleet_replica_account()?;
+  churn.peak = churn.peak.max(account.replicated);
+  churn.accounts_agree &= account.replicated == account.charged;
+  Ok(account)
+}
+
+/// Seals the first volume, waits for the holder to keep it, measures one seal's charge, and creates the
+/// unrelated volume whose promise leaves room for [`CHURN_ROOM_SEALS`] seals; sets the measured cap.
+fn place_first_and_promise(
+  instance: &str,
+  daemons: &[Daemon],
+  churn: &mut Churn,
+) -> Result<(VolumeId, [u8; 32]), String> {
+  let holder = &daemons[1];
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let first = seal_without_waiting(instance, &daemons[0], "churn-0")?;
+  if !poll_until(&observed, PLACEMENT_DEADLINE, || {
+    sample_replicas(holder, churn).map(|account| account.manifests == 1)
+  }) {
+    return Err("the first seal never reached its holder".to_owned());
+  }
+  // The owner records the snapshot's identity once its placement completes, after the holder kept it.
+  let mut first_manifest = None;
+  poll_until(&observed, PLACEMENT_DEADLINE, || {
+    first_manifest = daemons[0].fleet_head_manifest(ObjectId(first.bytes))?;
+    Ok(first_manifest.is_some())
+  });
+  let first_manifest = first_manifest.ok_or("the first seal's manifest is identified")?;
+  let held = sample_replicas(holder, churn).map_err(|e| e.to_string())?;
+  churn.per_seal = held.replicated;
+  let promise = RequestBody::Create {
+    name: "unrelated".to_owned(),
+    size: SizeClass::Bounded {
+      limit: held
+        .admittable
+        .saturating_sub(churn.per_seal.saturating_mul(CHURN_ROOM_SEALS)),
+    },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  };
+  if !matches!(
+    Client::connect(holder.instance()).call(&promise),
+    ReplyBody::Created { .. }
+  ) {
+    return Err("the unrelated volume was not created".to_owned());
+  }
+  // The cap is what the holder's budget actually leaves for replicas once the promise is taken.
+  let account = sample_replicas(holder, churn).map_err(|e| e.to_string())?;
+  churn.cap = account.replicated.saturating_add(account.admittable);
+  Ok((first, first_manifest))
+}
+
+/// Runs the churn against the holder `daemons[1]` and reports what it saw.
+fn churn_against_a_capped_holder(instance: &str, daemons: &[Daemon]) -> Result<Churn, String> {
+  let holder = &daemons[1];
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut churn = Churn {
+    accounts_agree: true,
+    ..Churn::default()
+  };
+  let (first, first_manifest) = place_first_and_promise(instance, daemons, &mut churn)?;
+  let mut waiting = Vec::new();
+  for index in 1..=CHURN_MORE_SEALS {
+    waiting.push(seal_without_waiting(
+      instance,
+      &daemons[0],
+      &format!("churn-{index}"),
+    )?);
+  }
+  churn.refused_at_cap = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    sample_replicas(holder, &mut churn).map(|account| account.refused_capacity > 0)
+  });
+  write_hello_over_nfs(holder, "unrelated");
+  churn.unrelated_wrote = read_hello_over_nfs(holder, "unrelated") == CONTENT;
+  let mut owner = Client::connect(instance);
+  if !matches!(
+    owner.call(&RequestBody::Destroy { volume: first }),
+    ReplyBody::Destroyed
+  ) {
+    return Err("the first volume was not destroyed".to_owned());
+  }
+  let before = sample_replicas(holder, &mut churn).map_err(|e| e.to_string())?;
+  churn.room_reused = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    let account = sample_replicas(holder, &mut churn)?;
+    let released = holder
+      .fleet_holder_content(first_manifest)
+      .map(|held| !held)?;
+    Ok(released && account.manifests >= before.manifests && account.manifests > 0)
+  });
+  for volume in waiting {
+    let _ = owner.call(&RequestBody::Destroy { volume });
+  }
+  churn.baseline = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    sample_replicas(holder, &mut churn)
+      .map(|account| (account.replicated, account.index, account.manifests) == (0, 0, 0))
+  });
+  Ok(churn)
+}
+
 /// Shape: the number of shards the multi-shard fleet tests run — two, the smallest count with a shard other
 /// than the control shard.
 const TWO_SHARDS: u16 = 2;

@@ -423,6 +423,24 @@ pub static PUBLISH_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 pub static BARRIER_UNCAPTURED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Connects refused at the daemon's derived client bound (a health signal, AC-2.6).
 pub static CLIENTS_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// What a node holds for other owners and what it is charged for it ([`Daemon::fleet_replica_account`];
+/// AUD-29-43).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplicaAccount {
+  /// The shard byte budget's charge for replicated content.
+  pub replicated: u64,
+  /// The bytes the hold says it is charged; equal to `replicated`.
+  pub charged: u64,
+  /// The bytes the hold's index is charged on the metadata ledger.
+  pub index: u64,
+  /// The manifests held.
+  pub manifests: usize,
+  /// The puts refused because the shard could not admit them.
+  pub refused_capacity: u64,
+  /// The bytes the shard's budget may still admit.
+  pub admittable: u64,
+}
+
 /// Clients found dead and reclaimed (a health signal; T-2.3).
 pub static CLIENTS_REAPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The loopback port the NFS transport serves on (§4.6), 0 until the listener is bound. Published as
@@ -1662,6 +1680,21 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       let local = s.fleet.host();
       crate::content_holder::serve(s, local, &request, |_, _, _, _| true)
+    })
+  }
+
+  /// What this node holds for other owners and what it is charged for it (§4.2; AUD-29-43), on the shard
+  /// that keeps its hold: the byte budget's `replicated` charge beside the hold's own account (they must
+  /// agree), the index charge, the manifests held, the puts refused at the capacity bound, and the bytes the
+  /// shard may still admit. An operator's and a test's view; the typed refusal when the shard does not answer.
+  pub fn fleet_replica_account(&self) -> Result<ReplicaAccount, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| ReplicaAccount {
+      replicated: s.store.budget.replicated(),
+      charged: s.held_content.charged_bytes(),
+      index: s.held_content.index_bytes(),
+      manifests: s.held_content.manifest_count(),
+      refused_capacity: s.held_content.refused_capacity(),
+      admittable: s.store.budget.admittable(),
     })
   }
 

@@ -3679,9 +3679,12 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 >   B-tree geometry. A put is charged whole before any chunk is verified or stored, verifies new encoded
 >   chunks in one charged arena scratch block, and is refused `NoCapacity` with nothing left behind.
 >
-> Still open: the audit's churn acceptance test
-> (`docs/bugs/2026-09-30-a-destroyed-volume-came-back-on-takeover.md`,
-> `docs/bugs/2026-09-30-replicated-content-bypassed-admission.md`).
+> - **Acceptance (2026-10-01).** Under churn, with one holder carrying the content and an unrelated volume's
+>   promise leaving room for two seals, the holder's charge peaked at exactly its measured cap and always
+>   equalled its hold's own account. Puts past the cap were refused and counted, the unrelated volume wrote
+>   within its promise, freed room was reused, and destroying everything returned the hold to zero
+>   (`docs/bugs/2026-09-30-a-destroyed-volume-came-back-on-takeover.md`,
+>   `docs/bugs/2026-09-30-replicated-content-bypassed-admission.md`).
 >
 > **Status (2026-09-30, AUD-29-17, the catalog register class).** A volume's catalog is a register of its
 > own, as §4.8 lists it.

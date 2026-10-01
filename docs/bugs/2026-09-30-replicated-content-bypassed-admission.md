@@ -47,7 +47,31 @@ decoded every shipped chunk into its own heap buffer.
   - after every step, the budget and ledger charges equal the hold's account;
   - releasing everything returns them and the arena to zero.
 
-## Still open
+## The audit's acceptance (2026-10-01)
 
-The audit's churn acceptance test: seals, retries, healing, destroys and cohort changes, with an unrelated
-volume spending its promised allowance (AUD-29-43 piece D).
+`a_holders_replicas_cap_at_its_unpromised_capacity_through_churn_and_retire_to_the_survivors_baseline`, in
+`crates/server/tests/fleet.rs`, runs in 3 s:
+
+- **Setup.** Three daemons. One refuses content puts, so a single holder carries the churn. An unrelated
+  bounded volume on that holder promises all its admittable capacity but room for two more seals.
+- **Churn.** The owner seals four volumes with distinct bytes and destroys them while puts retry.
+- **Measured.** One seal costs 32,768 bytes, and the cap is 98,304. The holder's charge peaked at exactly
+  98,304 and always equalled its hold's own account.
+- **Outcomes.**
+  - Puts past the cap were refused `NoCapacity` and counted.
+  - The unrelated volume wrote within its promise while the holder was full.
+  - Destroying the first volume freed room that a waiting seal took.
+  - Destroying everything returned charge, index and manifests to zero.
+
+A first version capped the holder with `Daemon::inject_pressure_hold` and never bound: the peak was 81,920
+against a 65,536 cap, with no refusal. `refresh_pressure_hold` re-samples host memory at the liveness cadence
+and overwrites any hold set on the budget. The test now caps through a real promise, which is what the audit
+names.
+
+## Sibling reported
+
+`refresh_pressure_hold` overwrites `Daemon::inject_pressure_hold` at the next liveness cadence on any host
+that reports available memory. A test that relies on an injected hold for longer than one cadence is
+timing-dependent, including
+`nfs_mount::a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writes`, which acts
+immediately after injecting.

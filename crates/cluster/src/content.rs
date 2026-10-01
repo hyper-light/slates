@@ -621,6 +621,9 @@ pub struct ContentHold {
   charged_bytes: u64,
   /// The bytes the hold is charged on the shard's metadata ledger (its index).
   index_bytes: u64,
+  /// Puts refused because the shard could not admit them (`NoCapacity`; AUD-29-43's typed refusal at the
+  /// bound, counted).
+  refused_capacity: u64,
 }
 
 /// A chunk stored in the arena once, whatever objects reference it: its block, its charge (the block's
@@ -772,6 +775,11 @@ impl ContentHold {
   /// Puts refused because the holder's accepted records already supersede them (AUD-29-43).
   pub fn superseded(&self) -> u64 {
     self.superseded
+  }
+
+  /// Puts refused because the shard could not admit them (`NoCapacity`; AUD-29-43).
+  pub fn refused_capacity(&self) -> u64 {
+    self.refused_capacity
   }
 
   /// Of `chunks`, the identities this hold lacks **for `object`** — the missing set an offer is answered
@@ -1417,6 +1425,10 @@ impl ContentHold {
               .encode(),
               Some(object),
             );
+          }
+          Err(ContentRefusal::NoCapacity { .. }) => {
+            self.refused_capacity = self.refused_capacity.saturating_add(1);
+            Vec::new()
           }
           Err(_) => Vec::new(),
         },
