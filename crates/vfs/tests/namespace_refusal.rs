@@ -21,6 +21,7 @@ use slates_vfs::error::VfsError;
 use slates_vfs::ids::SnapshotId;
 use slates_vfs::inode::Kind;
 use slates_vfs::volume::{Store, StoreConfig, Volume};
+use slates_vfs::xattr::XattrSet;
 
 /// Shape: the generous cap of every slab dimension not under test — far above what a scenario uses.
 const ROOMY: usize = 1 << 16;
@@ -33,6 +34,8 @@ const QUOTA: u64 = 1 << 24;
 /// directories, their inodes and trie paths, and a split per tree level. A verb still refused at this
 /// much room has stranded capacity, which fails the test.
 const MOST_EXTRA_SLOTS: usize = 64;
+/// Shape: a write past the inline bound (two pages), so it takes a content chunk.
+const CHUNKED_WRITE: usize = 2 * PAGE;
 /// Shape: names in the wide directory: enough that its tree has split into more than one leaf, so an
 /// insert there can need a split and a copy of more than one block.
 const WIDE_ENTRIES: usize = 300;
@@ -44,12 +47,15 @@ enum Dimension {
   DirectoryBlocks,
   /// Inode versions and inode-table nodes share one cap (`StoreConfig::max_inodes`).
   Inodes,
+  /// Content chunk records.
+  Chunks,
 }
 
-const DIMENSIONS: [Dimension; 3] = [
+const DIMENSIONS: [Dimension; 4] = [
   Dimension::DirectoryNodes,
   Dimension::DirectoryBlocks,
   Dimension::Inodes,
+  Dimension::Chunks,
 ];
 
 /// The verbs under test, each on the scenario's names.
@@ -64,9 +70,16 @@ enum Verb {
   RenameAcross,
   RenameWithin,
   RenameOver,
+  Unlink,
+  Rmdir,
+  Chmod,
+  WriteInline,
+  WriteChunked,
+  Truncate,
+  SetXattr,
 }
 
-const VERBS: [Verb; 9] = [
+const VERBS: [Verb; 16] = [
   Verb::Create,
   Verb::CreateInWide,
   Verb::Mknod,
@@ -76,10 +89,27 @@ const VERBS: [Verb; 9] = [
   Verb::RenameAcross,
   Verb::RenameWithin,
   Verb::RenameOver,
+  Verb::Unlink,
+  Verb::Rmdir,
+  Verb::Chmod,
+  Verb::WriteInline,
+  Verb::WriteChunked,
+  Verb::Truncate,
+  Verb::SetXattr,
 ];
 
 /// A store over one RAM region with the chosen slab caps.
 fn store_capped(max_dirs: usize, max_dir_blocks: usize, max_inodes: usize) -> Store {
+  store_capped_chunks(max_dirs, max_dir_blocks, max_inodes, ROOMY)
+}
+
+/// [`store_capped`] with the chunk-record cap chosen too.
+fn store_capped_chunks(
+  max_dirs: usize,
+  max_dir_blocks: usize,
+  max_inodes: usize,
+  max_chunks: usize,
+) -> Store {
   let mut arena = ChunkArena::new(PAGE);
   arena
     .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
@@ -90,7 +120,7 @@ fn store_capped(max_dirs: usize, max_dir_blocks: usize, max_inodes: usize) -> St
       cache_line: 64,
       max_dirs,
       max_inodes,
-      max_chunks: ROOMY,
+      max_chunks,
       max_dir_blocks,
       dir_cutover: CUTOVER,
     },
@@ -99,12 +129,14 @@ fn store_capped(max_dirs: usize, max_dir_blocks: usize, max_inodes: usize) -> St
   )
 }
 
-/// The slots a store holds in each dimension.
-fn used(store: &Store) -> [usize; 3] {
+/// The slots a store holds in each dimension, and the content bytes its arena has handed out.
+fn used(store: &Store) -> [usize; 5] {
   [
     store.dirs.len(),
     store.blocks.len(),
     store.inodes.len().max(store.tries.len()),
+    store.content.chunks(),
+    store.content.allocated_bytes(),
   ]
 }
 
@@ -113,6 +145,17 @@ fn index_of(dimension: Dimension) -> usize {
     Dimension::DirectoryNodes => 0,
     Dimension::DirectoryBlocks => 1,
     Dimension::Inodes => 2,
+    Dimension::Chunks => 3,
+  }
+}
+
+/// A store whose `dimension` is capped at `cap` and every other is roomy.
+fn store_for(dimension: Dimension, cap: usize) -> Store {
+  match dimension {
+    Dimension::DirectoryNodes => store_capped(cap, ROOMY, ROOMY),
+    Dimension::DirectoryBlocks => store_capped(ROOMY, cap, ROOMY),
+    Dimension::Inodes => store_capped(ROOMY, ROOMY, cap),
+    Dimension::Chunks => store_capped_chunks(ROOMY, ROOMY, ROOMY, cap),
   }
 }
 
@@ -178,6 +221,31 @@ fn run(verb: Verb, vol: &mut Volume, store: &mut Store) -> Result<(), VfsError> 
       vol.rename(store, a, "f", a, "renamed")
     }
     Verb::RenameOver => vol.rename(store, root, "g", root, "s"),
+    Verb::Unlink => {
+      let a = dir(vol, store, "/a");
+      vol.unlink(store, a, "f")
+    }
+    Verb::Rmdir => vol.rmdir(store, root, "b"),
+    Verb::Chmod => {
+      let g = vol.resolve(store, "/g").unwrap().inode;
+      vol.chmod(store, g, 0o600)
+    }
+    Verb::WriteInline => {
+      let g = vol.resolve(store, "/g").unwrap().inode;
+      vol.write(store, g, 1, b"+").map(drop)
+    }
+    Verb::WriteChunked => {
+      let g = vol.resolve(store, "/g").unwrap().inode;
+      vol.write(store, g, 0, &[7u8; CHUNKED_WRITE]).map(drop)
+    }
+    Verb::Truncate => {
+      let g = vol.resolve(store, "/g").unwrap().inode;
+      vol.truncate(store, g, 0)
+    }
+    Verb::SetXattr => {
+      let g = vol.resolve(store, "/g").unwrap().inode;
+      vol.xattr_set(store, g, b"user.key", b"value", XattrSet::Either)
+    }
   }
 }
 
@@ -297,11 +365,7 @@ fn every_step_of(verb: Verb, dimension: Dimension, snapshot: bool) -> usize {
   let mut refusals = 0;
   for extra in 0..=MOST_EXTRA_SLOTS {
     let cap = own + extra;
-    let mut store = match dimension {
-      Dimension::DirectoryNodes => store_capped(cap, ROOMY, ROOMY),
-      Dimension::DirectoryBlocks => store_capped(ROOMY, cap, ROOMY),
-      Dimension::Inodes => store_capped(ROOMY, ROOMY, cap),
-    };
+    let mut store = store_for(dimension, cap);
     let Ok((mut vol, snap)) = scenario(&mut store, snapshot) else {
       // The cap is too tight for the scenario itself; the verb is reached at a larger one.
       continue;
@@ -360,7 +424,9 @@ fn a_namespace_verb_refused_at_any_allocation_changes_nothing() {
   for verb in VERBS {
     for dimension in DIMENSIONS {
       for snapshot in [false, true] {
-        refusals += every_step_of(verb, dimension, snapshot);
+        let here = every_step_of(verb, dimension, snapshot);
+        eprintln!("{verb:?} {dimension:?} snapshot {snapshot}: {here} refusals");
+        refusals += here;
       }
     }
   }
@@ -459,9 +525,11 @@ enum BaseVerb {
   RenameBaseFileOver,
   RenameBaseDirectory,
   RenameWithinBase,
+  UnlinkBaseFile,
+  RmdirBase,
 }
 
-const BASE_VERBS: [BaseVerb; 9] = [
+const BASE_VERBS: [BaseVerb; 11] = [
   BaseVerb::Create,
   BaseVerb::Mknod,
   BaseVerb::Mkdir,
@@ -471,6 +539,8 @@ const BASE_VERBS: [BaseVerb; 9] = [
   BaseVerb::RenameBaseFileOver,
   BaseVerb::RenameBaseDirectory,
   BaseVerb::RenameWithinBase,
+  BaseVerb::UnlinkBaseFile,
+  BaseVerb::RmdirBase,
 ];
 
 /// The disk: `/d0` holding `f0` and `f1`, `/d1` holding `g`, and the symlink `/s`.
@@ -554,6 +624,12 @@ fn run_base(verb: BaseVerb, o: &mut Overlay<'_>, store: &mut Store) -> Result<()
     BaseVerb::RenameBaseFileOver => o.rename(store, d0, "f0", d1, "g"),
     BaseVerb::RenameBaseDirectory => o.rename(store, root, "d1", d0, "moved-dir"),
     BaseVerb::RenameWithinBase => o.rename(store, d0, "f1", d0, "f1-renamed"),
+    BaseVerb::UnlinkBaseFile => o.unlink(store, d0, "f1"),
+    BaseVerb::RmdirBase => {
+      // `/d1` holds the base file `g`; empty it first so the rmdir itself is the verb under test.
+      o.unlink(store, d1, "g")?;
+      o.rmdir(store, root, "d1")
+    }
   }
 }
 
@@ -616,11 +692,7 @@ fn every_base_step_of(verb: BaseVerb, dimension: Dimension, snapshot: bool) -> u
   let mut refusals = 0;
   for extra in 0..=MOST_EXTRA_SLOTS {
     let cap = own + extra;
-    let mut store = match dimension {
-      Dimension::DirectoryNodes => store_capped(cap, ROOMY, ROOMY),
-      Dimension::DirectoryBlocks => store_capped(ROOMY, cap, ROOMY),
-      Dimension::Inodes => store_capped(ROOMY, ROOMY, cap),
-    };
+    let mut store = store_for(dimension, cap);
     let mut host = disk();
     let Ok((mut vol, snap)) = base_scenario(&mut host, &mut store, snapshot) else {
       continue;

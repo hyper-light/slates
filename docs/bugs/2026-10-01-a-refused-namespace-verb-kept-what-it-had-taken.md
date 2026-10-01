@@ -80,7 +80,7 @@ preparation, but it moves inline bytes into the head's unique accounting and spe
   - Each refusal must be typed, and must leave the following as they were: every path's kind, attributes
     and contents; inode and entry usage; accounting; the journal; the diverged set; and every slab's
     usage. A repeat must refuse the same way, and the verb must succeed once the dimension has room.
-  - 44 refusals were injected on the scratch scenario and 46 on base entries (2026-10-01).
+  - At first commit, 44 refusals were injected on the scratch scenario and 46 on base entries (2026-10-01).
   - `a_create_refused_for_its_entry_returns_its_inode_charge` (the audit's reproduction) and
     `a_verb_refused_by_an_allowance_changes_nothing_and_succeeds_with_room`.
 - **Before the fix:** all three of the first tests failed. The sweep met the defects in the order listed
@@ -95,10 +95,21 @@ preparation, but it moves inline bytes into the head's unique accounting and spe
   - the server library: 147;
   - the CLI suite with a live kernel mount: 13.
 
-## Siblings reported
+## Sibling sweep (the same day, the same harness)
 
-- **Other verbs are not swept yet.** Unlink, rmdir, setattr, write, truncate and the extended-attribute
-  verbs still interleave copy-ups and changes. They are the next sweep under the same harness.
+- **Unlink and rmdir failed the sweep.** A refused unlink kept the copy-up it had made (one directory node
+  more, then one inode version more). Both now admit their removal whole (`admit_removal`: the
+  directory's path, the dropped inode's version, the entry tree's copies) and make the dropped inode
+  current before the name goes.
+- **Chmod, write (inline and chunked), truncate and setxattr pass the sweep** as they stand. Each makes one
+  copy-up, which is now all or nothing, before anything else.
+- **Counts.** The sweep now covers 16 verbs on scratch entries (59 refusals) and 11 on base entries (52 refusals), unlink
+  and rmdir included. It covers four slab dimensions: directory nodes, directory blocks, inodes, and
+  content chunks.
+- **The chunk dimension never refused.** A write takes arena bytes through an open extent, and chunk records
+  appear only when a seal happens, so that dimension is not exercised yet.
+
+## Siblings reported
 - **An overlay read copies up after a snapshot.** `follow_live_disk` makes a base inode current to record
   what it observed, so a `stat` after a snapshot spends a version slot and can be refused at a full slab.
 - **A split's `InvalidName` refusal comes after the split.** It is unreachable for names within `NAME_MAX`

@@ -1388,6 +1388,7 @@ impl Volume {
     // The last name of a file whose content a snapshot pins retains that content (§4.2 retention):
     // secured before the entry goes, so a refusal changes nothing.
     let retention = self.retention_of_drop(store, located.inode)?;
+    self.admit_removal(store, dir, name, located.inode)?;
     self.secure_retention(store, retention)?;
     let unlinked = self.unlink_secured(store, dir, name, located);
     self.settle_retention(store);
@@ -1403,6 +1404,8 @@ impl Volume {
     located: Located,
   ) -> Result<(), VfsError> {
     let dir = self.make_current_dir(store, dir)?;
+    // The dropped inode made current before its name goes, so the link drop allocates nothing.
+    self.make_current_inode(store, located.inode)?;
     let now = self.clock.wall_ns();
     let path = self.path_of(store, dir, name);
     self.dir_remove(store, dir, name)?;
@@ -1428,7 +1431,9 @@ impl Volume {
     if !self.empty_for_rmdir(store, child)? {
       return Err(VfsError::NotEmpty);
     }
+    self.admit_removal(store, dir, name, located.inode)?;
     let dir = self.make_current_dir(store, dir)?;
+    self.make_current_inode(store, located.inode)?;
     let now = self.clock.wall_ns();
     let path = self.path_of(store, dir, name);
     self.dir_remove(store, dir, name)?;
@@ -2909,6 +2914,24 @@ impl Volume {
       name,
     )?);
     Ok(())
+  }
+
+  /// Admits a removal of `name` (naming inode `removed`) from the head's `dir` (AUD-29-40): the
+  /// directory's path made current, the removed inode's version (its link count drops), and the
+  /// entry tree's copies — so an unlink or rmdir is refused before its first change or not at all.
+  fn admit_removal(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    removed: InodeNo,
+  ) -> Result<(), VfsError> {
+    let mut needs = Needs::default();
+    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
+    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    self.need_current_inode(store, removed, &mut needs)?;
+    self.need_change(store, dir, name, &mut needs)?;
+    self.admit_needs(store, &needs)
   }
 
   /// Admits a verb's counted needs whole, or refuses it before anything changes: each slab's room,
