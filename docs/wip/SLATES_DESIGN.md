@@ -1897,6 +1897,11 @@ must exercise local communication and isolation between clones as well as namesp
 > next start's recovery ends a crashed daemon's FUSE records and unmounts each dead mount. It does so only
 > when the kernel's table names that attachment, so a later mount at the path is never touched.
 
+> **Status (2026-10-01, AUD-29-77 in part: kept copies charged; protection named).** A guest device's copy
+> buffers are charged to its attachment for as long as it keeps them: growth is charged and reserved exactly,
+> and given back when let go. Every transport's residency names what slates protects (its own RAM) apart from
+> what lies beyond it (kernel cache, runtime VM, guest page cache), which slates does not protect.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

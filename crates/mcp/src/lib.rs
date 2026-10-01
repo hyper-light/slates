@@ -954,24 +954,52 @@ pub fn residency_name(residency: Residency) -> &'static str {
   }
 }
 
-/// A residency boundary as text: its name, and for a guest whether DAX is mapped.
-pub fn residency_text(residency: Residency) -> String {
+/// Format: what slates protects on every transport — the daemon's own RAM, locked and kept out of dumps (R1,
+/// §4.2). Nothing beyond it is slates' to protect.
+const PROTECTED: &str = "daemon_ram";
+
+/// Where a transport's bytes reach beyond what slates protects (AUD-29-77): caches and memory of others —
+/// the host kernel's page cache, the container runtime's VM, the guest's page cache — which may be swapped,
+/// dumped or snapshotted by their owners. A protected export is not a protected workload.
+pub fn beyond_protection(residency: Residency) -> &'static [&'static str] {
   match residency {
+    Residency::DaemonRam => &[],
+    Residency::DaemonRamAndKernelCache => &["host_kernel_cache"],
+    Residency::DaemonRamKernelCacheAndRuntimeVm => &["host_kernel_cache", "runtime_vm"],
+    Residency::DaemonRamAndGuestPageCache { .. } => &["guest_page_cache"],
+  }
+}
+
+/// A residency boundary as text: its name, for a guest whether DAX is mapped, and what lies beyond what
+/// slates protects.
+pub fn residency_text(residency: Residency) -> String {
+  let name = match residency {
     Residency::DaemonRamAndGuestPageCache { dax_mapped } => {
       format!("{}(dax_mapped={dax_mapped})", residency_name(residency))
     }
     other => residency_name(other).to_owned(),
+  };
+  let beyond = beyond_protection(residency);
+  if beyond.is_empty() {
+    format!("{name} protected={PROTECTED}")
+  } else {
+    format!("{name} protected={PROTECTED} beyond={}", beyond.join(","))
   }
 }
 
-/// A residency boundary as JSON: `{ "kind" }`, and for a guest the DAX fact.
+/// A residency boundary as JSON: `{ "kind", "protected", "beyond_protection" }`, and for a guest the DAX fact.
 fn residency_json(residency: Residency) -> Value {
-  match residency {
-    Residency::DaemonRamAndGuestPageCache { dax_mapped } => {
-      json!({ "kind": residency_name(residency), "dax_mapped": dax_mapped })
-    }
-    other => json!({ "kind": residency_name(other) }),
+  let mut value = json!({
+    "kind": residency_name(residency),
+    "protected": PROTECTED,
+    "beyond_protection": beyond_protection(residency),
+  });
+  if let Residency::DaemonRamAndGuestPageCache { dax_mapped } = residency
+    && let Some(object) = value.as_object_mut()
+  {
+    object.insert("dax_mapped".to_owned(), json!(dax_mapped));
   }
+  value
 }
 
 /// A conformance evidence class's name on both surfaces.

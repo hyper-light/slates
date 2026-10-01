@@ -538,8 +538,8 @@ impl Device {
       let Some(chain) = self.queues[index].peek(memory)? else {
         break;
       };
-      if let Err(refusal) = admission.admit(&chain) {
-        return Err(self.record_fault(DeviceError::CreditRefused(refusal)));
+      if let Err(refusal) = self.charge_copy(&chain, admission) {
+        return Err(self.record_fault(refusal));
       }
       self.queues[index].advance();
       let written = match self.serve_chain(queue, &chain, memory, bridge, cx) {
@@ -559,7 +559,7 @@ impl Device {
         });
       }
       self.queues[index].push_used(memory, &chain, written)?;
-      admission.complete(&chain, written);
+      admission.complete();
       served = served.saturating_add(1);
     }
     Ok(Serviced {
@@ -568,6 +568,52 @@ impl Device {
       interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
       barrier_owed: false,
     })
+  }
+
+  /// The bytes the device's copy buffers keep between chains (their capacity): what its attachment's byte
+  /// credit holds charged for it (AUD-29-77).
+  pub fn retained_copy_bytes(&self) -> u64 {
+    let kept = self
+      .request
+      .capacity()
+      .saturating_add(self.reply.capacity());
+    u64::try_from(kept).unwrap_or(u64::MAX)
+  }
+
+  /// Charges `chain` before any buffer is touched (AUD-29-77): one request, and the bytes the kept request
+  /// and reply buffers must grow by to hold it, then reserves exactly that, so what the buffers keep is what
+  /// is charged. When the growth does not fit beside what is kept, the kept buffers are given back and the
+  /// chain is charged whole — a large request kept from one chain never refuses a large reply the next needs.
+  /// A chain that alone exceeds the credit is refused.
+  fn charge_copy(
+    &mut self,
+    chain: &DescriptorChain,
+    admission: &mut dyn ChainAdmission,
+  ) -> Result<(), DeviceError> {
+    let need =
+      |bytes: u64| usize::try_from(bytes).map_err(|_| DeviceError::BufferTooLarge { bytes });
+    let (request_need, reply_need) = (need(chain.readable_bytes)?, need(chain.writable_bytes)?);
+    let growth = request_need
+      .saturating_sub(self.request.capacity())
+      .saturating_add(reply_need.saturating_sub(self.reply.capacity()));
+    match admission.admit(u64::try_from(growth).unwrap_or(u64::MAX)) {
+      Ok(()) => {}
+      Err(CreditError::Exhausted { .. }) if self.retained_copy_bytes() > 0 => {
+        let kept = self.retained_copy_bytes();
+        self.request = Vec::new();
+        self.reply = Vec::new();
+        admission.return_bytes(kept);
+        admission
+          .admit(crate::credit::chain_bytes(chain))
+          .map_err(DeviceError::CreditRefused)?;
+      }
+      Err(refusal) => return Err(DeviceError::CreditRefused(refusal)),
+    }
+    self.request.clear();
+    self.request.reserve_exact(request_need);
+    self.reply.clear();
+    self.reply.reserve_exact(reply_need);
+    Ok(())
   }
 
   /// The held form of a chain just served, when its request changed what survives a restart and succeeded
@@ -636,7 +682,7 @@ impl Device {
       self.counters.barriers_refused = self.counters.barriers_refused.saturating_add(1);
     }
     self.queues[index].push_used(memory, &held.chain, written)?;
-    admission.complete(&held.chain, written);
+    admission.complete();
     Ok(Some(Completed {
       queue: held.queue,
       interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,

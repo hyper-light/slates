@@ -208,9 +208,10 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
   assert!(refused.seam.calls().is_empty());
 }
 
-/// Every chain is charged against the attachment's request and byte credits before it is touched
-/// and released once its used element is published: a request credit of two serves two of five
-/// per pass, the ledger is balanced after each pass, and the guest is notified once per pass.
+/// Every chain is charged against the attachment's request and byte credits before it is touched, and its
+/// request released once its used element is published: a request credit of two serves two of five per pass,
+/// no request is in flight after a pass, the bytes in flight are exactly the copy buffers the device keeps
+/// (AUD-29-77), and the guest is notified once per pass.
 #[test]
 fn requests_are_charged_against_the_credits_and_released_on_completion() {
   let mut registry = Attachments::new();
@@ -231,7 +232,11 @@ fn requests_are_charged_against_the_credits_and_released_on_completion() {
   let first = admitted.service(&mut bridge, &registry).unwrap();
   assert_eq!((first.served, first.more_pending), (2, true));
   let ledger = admitted.ledger();
-  assert_eq!(ledger.in_flight(), (0, 0), "released on completion");
+  assert_eq!(
+    ledger.in_flight(),
+    (0, admitted.device().retained_copy_bytes()),
+    "requests released on completion; the kept buffers stay charged"
+  );
   assert_eq!(ledger.counters().charged, 2);
   assert_eq!(ledger.counters().released, 2);
   assert_eq!(admitted.seam().notified(), vec![FIRST_REQUEST_QUEUE]);

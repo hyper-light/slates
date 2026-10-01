@@ -1108,3 +1108,134 @@ fn a_guest_without_invalidation_delivery_is_promised_no_cache() {
   let negotiated = device.negotiated().expect("INIT was served");
   assert_eq!(negotiated.flags & flags::EXPLICIT_INVAL_DATA, 0);
 }
+
+/// Shape: the large transfer of the retained-copy test — far past the small requests' size, so the device's
+/// kept buffers are dominated by it.
+const BIG: usize = 32 << 10;
+/// Shape: the reply room the retained-copy test posts for a request whose reply is a header and a small body.
+const SMALL_REPLY: u32 = 256;
+/// Shape: the retained-copy test's byte credit: one large chain (its `BIG` bytes and a few hundred of
+/// headers and small reply room) fits, but a large request buffer and a large reply buffer kept together do
+/// not.
+const ONE_LARGE_CHAIN: u64 = (BIG as u64) + 2048;
+
+/// One request through the device under `ledger`, its barrier completed as captured; the reply.
+fn exchange_charged(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  bridge: &mut VolumeBridge<'_>,
+  ledger: &mut slates_bridge_virtiofs::credit::CreditLedger,
+  (opcode, unique, nodeid): (Opcode, u64, u64),
+  body: &[u8],
+  reply_room: u32,
+) -> Vec<u8> {
+  let cx = context();
+  let request = message(opcode.to_wire(), unique, nodeid, body);
+  let queue = FIRST_REQUEST_QUEUE;
+  let head = driver.submit(usize::from(queue), &request, reply_room, 1);
+  let pass = device
+    .service_queue(queue, &mut driver.memory, bridge, &cx, BATCH, ledger)
+    .unwrap_or_else(|e| panic!("{opcode:?} served: {e}"));
+  if pass.barrier_owed {
+    device
+      .complete_awaiting(&mut driver.memory, bridge, &cx, true, ledger)
+      .unwrap();
+  }
+  let (id, len) = driver.reap(usize::from(queue)).expect("a used element");
+  assert_eq!(id, head);
+  driver.reply_of(usize::from(queue), head, len)
+}
+
+/// AUD-29-77 (a retained copy charged exactly once). Do: under a ledger whose byte credit fits one large chain,
+/// serve INIT, CREATE, a `BIG`-byte WRITE, a `BIG`-byte READ and a GETATTR; after each, compare the ledger's
+/// copy bytes in flight with the bytes the device's copy buffers keep. Expect: equal after every chain — the
+/// buffers the device keeps between chains stay charged to the attachment (before, the ledger read zero
+/// while the device kept the write's request buffer); and the READ is served though the write's buffer and
+/// the read's reply room together exceed the credit, because the device gives its kept buffers back before
+/// charging a chain they cannot both fit beside.
+#[test]
+fn the_copy_buffers_a_device_keeps_stay_charged_to_its_attachment() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store_a = store();
+  let mut vol_a = volume(&mut store_a);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol_a, &mut store_a);
+  let mut ledger = slates_bridge_virtiofs::credit::CreditLedger::new(
+    slates_bridge_virtiofs::credit::AttachmentCredits {
+      requests: slates_machine::derived!(BATCH, "the test's request credit", ["test"]),
+      bytes: slates_machine::derived!(ONE_LARGE_CHAIN, "one large chain", ["BIG"]),
+    },
+  );
+  let charged_as_kept =
+    |device: &Device, ledger: &slates_bridge_virtiofs::credit::CreditLedger, step: &str| {
+      assert_eq!(
+        ledger.in_flight(),
+        (0, device.retained_copy_bytes()),
+        "after {step}"
+      );
+    };
+  let init = exchange_charged(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &mut ledger,
+    (Opcode::Init, 1, 0),
+    &init_body(u32::try_from(flags::BIG_WRITES).unwrap()),
+    SMALL_REPLY,
+  );
+  assert_eq!(reply_error(&init), 0);
+  charged_as_kept(&device, &ledger, "INIT");
+  let created = exchange_charged(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &mut ledger,
+    (Opcode::Create, 2, ROOT),
+    &create_body("big"),
+    SMALL_REPLY,
+  );
+  assert_eq!(reply_error(&created), 0);
+  let (ino, fh) = (
+    u64_at(&created, OUT_HEADER_LEN),
+    u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN),
+  );
+  charged_as_kept(&device, &ledger, "CREATE");
+  let payload = vec![7u8; BIG];
+  let written = exchange_charged(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &mut ledger,
+    (Opcode::Write, 3, ino),
+    &write_body(fh, 0, &payload),
+    SMALL_REPLY,
+  );
+  assert_eq!(reply_error(&written), 0);
+  charged_as_kept(&device, &ledger, "WRITE");
+  assert!(
+    device.retained_copy_bytes() >= u64::try_from(BIG).unwrap(),
+    "the write's request buffer is kept"
+  );
+  let read = exchange_charged(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &mut ledger,
+    (Opcode::Read, 4, ino),
+    &read_body(fh, 0, u32::try_from(BIG).unwrap()),
+    u32::try_from(BIG + OUT_HEADER_LEN).unwrap(),
+  );
+  assert_eq!(reply_error(&read), 0);
+  assert_eq!(&read[OUT_HEADER_LEN..], &payload[..]);
+  charged_as_kept(&device, &ledger, "READ");
+  let attr = exchange_charged(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &mut ledger,
+    (Opcode::GetAttr, 5, ino),
+    &[0u8; 16],
+    SMALL_REPLY,
+  );
+  assert_eq!(reply_error(&attr), 0);
+  charged_as_kept(&device, &ledger, "GETATTR");
+}

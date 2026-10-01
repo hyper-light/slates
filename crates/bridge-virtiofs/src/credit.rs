@@ -2,10 +2,14 @@
 //! consume the attachment's credits"; §4.9 "Flow control": credit-based, windows derived from the
 //! measured bandwidth-delay product and the class's latency budget). Two credits per attachment:
 //! the **requests** that may be in flight — taken from a ring and not yet returned — and the
-//! **copy bytes** those requests may hold, the gathered request plus the room reserved for its
-//! reply (mapped bytes are zero: DAX is not offered). A chain is charged after the ring walk has
-//! validated it and before any of its buffers is touched, and released once its used element is
-//! published; the device's service pass is bounded by the request credit (§4.3 "bounded work
+//! **copy bytes** the device holds for them: its request and reply buffers, which it keeps between chains
+//! and reuses (mapped bytes are zero: DAX is not offered — the guest's own RAM is the VMM's, outside this
+//! charge, AUD-29-77). A chain is charged after the ring walk has validated it and before any of its
+//! buffers is touched: one request, and the bytes its buffers must grow by. The request is released once
+//! its used element is published; the bytes stay charged while the device keeps them, given back when it
+//! lets them go and whole at the attachment's reclaim — so the heap the device keeps is charged exactly once,
+//! to its attachment (before 2026-10-01 a chain's bytes were released at completion while the device kept
+//! its buffers, uncharged). The device's service pass is bounded by the request credit (§4.3 "bounded work
 //! everywhere").
 //!
 //! The derivations ([`AttachmentCredits::derive`]): the request credit is the owning shard's
@@ -200,29 +204,36 @@ impl CreditLedger {
   }
 }
 
-/// The copy bytes one chain holds: its gathered request and the room reserved for its reply.
-fn chain_bytes(chain: &DescriptorChain) -> u64 {
+/// The copy bytes one chain needs: its gathered request and the room reserved for its reply.
+pub fn chain_bytes(chain: &DescriptorChain) -> u64 {
   chain.readable_bytes.saturating_add(chain.writable_bytes)
 }
 
-/// What the device asks before it takes a validated chain and after it has answered it. The
-/// ledger implements it; [`Unlimited`] is the unaccounted form for a device driven without an
-/// attachment (the codec-level tests).
+/// What the device asks before it takes a validated chain, after it has answered it, and when it lets its
+/// kept copy buffers go. The ledger implements it; [`Unlimited`] is the unaccounted form for a device driven
+/// without an attachment (the codec-level tests).
 pub trait ChainAdmission {
-  /// Charges the chain — one request, its copy bytes — before any of its buffers is touched. A
-  /// refusal faults the device.
-  fn admit(&mut self, chain: &DescriptorChain) -> Result<(), CreditError>;
-  /// Releases the chain's charge once its used element is published (`written` bytes of reply).
-  fn complete(&mut self, chain: &DescriptorChain, written: u32);
+  /// Charges one request and the `bytes` the device's copy buffers must grow by for it, before any buffer
+  /// is touched. A refusal the device cannot clear by giving its kept buffers back faults it.
+  fn admit(&mut self, bytes: u64) -> Result<(), CreditError>;
+  /// Releases the chain's request once its used element is published; its bytes stay charged while the
+  /// device keeps the buffers that hold them.
+  fn complete(&mut self);
+  /// Gives back `bytes` of copy buffers the device let go.
+  fn return_bytes(&mut self, bytes: u64);
 }
 
 impl ChainAdmission for CreditLedger {
-  fn admit(&mut self, chain: &DescriptorChain) -> Result<(), CreditError> {
-    self.charge(1, chain_bytes(chain))
+  fn admit(&mut self, bytes: u64) -> Result<(), CreditError> {
+    self.charge(1, bytes)
   }
 
-  fn complete(&mut self, chain: &DescriptorChain, _written: u32) {
-    self.release(1, chain_bytes(chain));
+  fn complete(&mut self) {
+    self.release(1, 0);
+  }
+
+  fn return_bytes(&mut self, bytes: u64) {
+    self.bytes_in_flight = self.bytes_in_flight.saturating_sub(bytes);
   }
 }
 
@@ -231,11 +242,13 @@ impl ChainAdmission for CreditLedger {
 pub struct Unlimited;
 
 impl ChainAdmission for Unlimited {
-  fn admit(&mut self, _chain: &DescriptorChain) -> Result<(), CreditError> {
+  fn admit(&mut self, _bytes: u64) -> Result<(), CreditError> {
     Ok(())
   }
 
-  fn complete(&mut self, _chain: &DescriptorChain, _written: u32) {}
+  fn complete(&mut self) {}
+
+  fn return_bytes(&mut self, _bytes: u64) {}
 }
 
 #[cfg(test)]

@@ -320,6 +320,11 @@ fn assert_volume_lifecycle(server: &mut McpServer) {
     call(server, "slates.volume.stat", json!({ "volume": volume }))["name"],
     "v"
   );
+  assert_residency_names_what_slates_protects(&call(
+    server,
+    "slates.volume.stat",
+    json!({ "volume": volume }),
+  ));
 
   let snapshot = call(
     server,
@@ -778,5 +783,30 @@ fn assert_unauthorized_calls_have_no_effect(port: u16, instance: &str, token: &s
       !listed.to_string().contains(name),
       "{name}: a refused call has no effect: {listed}"
     );
+  }
+}
+
+/// AUD-29-77: every transport's residency says what slates protects — the daemon's own RAM, locked and kept out
+/// of dumps — and what else the bytes reach beyond it, which slates does not protect: nothing for a record
+/// form, the kernel's page cache for a host mount, the runtime's VM for a container, the guest's page cache
+/// for a guest. A protected export is never reported as a protected workload.
+fn assert_residency_names_what_slates_protects(stat: &Value) {
+  for capability in stat["transports"]["capabilities"].as_array().unwrap() {
+    let residency = &capability["residency"];
+    assert_eq!(residency["protected"], "daemon_ram", "{capability}");
+    let beyond: Vec<&str> = residency["beyond_protection"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .map(|v| v.as_str().unwrap())
+      .collect();
+    let expected: &[&str] = match residency["kind"].as_str().unwrap() {
+      "daemon_ram" => &[],
+      "daemon_ram_and_kernel_cache" => &["host_kernel_cache"],
+      "daemon_ram_kernel_cache_and_runtime_vm" => &["host_kernel_cache", "runtime_vm"],
+      "daemon_ram_and_guest_page_cache" => &["guest_page_cache"],
+      other => panic!("an unknown residency {other}"),
+    };
+    assert_eq!(beyond, expected, "{capability}");
   }
 }
