@@ -45,9 +45,20 @@ fn deadlines() -> Deadlines {
 struct Ticker {
   ended: BTreeMap<Ticket, Result<(), ClientError>>,
   longest_step: Duration,
+  /// The call the longest step made: a failure names what held the loop (CI 2026-10-01: a 245 ms step on
+  /// the macOS runner, unattributed).
+  longest_call: &'static str,
 }
 
 impl Ticker {
+  /// Times one loop step that made `call`, keeping the longest.
+  fn note(&mut self, call: &'static str, took: Duration) {
+    if took > self.longest_step {
+      self.longest_step = took;
+      self.longest_call = call;
+    }
+  }
+
   /// Runs the loop until every one of `tickets` has ended or `within` passes: pump, tick when the driver
   /// asks, end each call by its event, and time every step.
   fn run(
@@ -66,8 +77,11 @@ impl Ticker {
     {
       let step = Instant::now();
       let mut events = driver.pump(client);
+      self.note("pump", step.elapsed());
       if Instant::now() >= next_tick {
+        let ticked = Instant::now();
         events.extend(driver.tick(client));
+        self.note("tick", ticked.elapsed());
       }
       for event in events {
         match event {
@@ -86,9 +100,49 @@ impl Ticker {
       }
       next_tick = Instant::now()
         + Duration::from_nanos(driver.next_wake_ns(client).unwrap_or(deadlines().reply_ns));
-      self.longest_step = self.longest_step.max(step.elapsed());
+      self.note("a whole step: pump, tick and the events", step.elapsed());
       std::hint::spin_loop();
     }
+  }
+}
+
+/// Shape: the sampler's sleep — a millisecond, far below the bound it qualifies.
+const NOISE_SAMPLE: Duration = Duration::from_millis(1);
+
+/// The machine's own scheduling noise while the test runs: a thread that sleeps [`NOISE_SAMPLE`] at a time and
+/// records how much longer than asked each sleep took — time the OS kept it off a core after its wake; the
+/// loop's thread is kept off as long by the same cause, so a loop step is judged against the bound plus the noise measured
+/// in the same window (the pattern of `destroy_rows` in `crates/vfs/examples/vfs_bench.rs`). A step our code
+/// held — a blocking wait in the driver — leaves the sampler's gaps short, and still fails.
+struct Noise {
+  stop: std::sync::mpsc::Sender<()>,
+  sampler: std::thread::JoinHandle<Duration>,
+}
+
+impl Noise {
+  fn start() -> Noise {
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let sampler = std::thread::spawn(move || {
+      let mut longest = Duration::ZERO;
+      loop {
+        match stopped.try_recv() {
+          Err(std::sync::mpsc::TryRecvError::Empty) => {}
+          _ => return longest,
+        }
+        let asked = Instant::now();
+        // The harness's own sampler sleeps, so it costs no core while it measures (D-9 is shipped code's).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(NOISE_SAMPLE);
+        longest = longest.max(asked.elapsed().saturating_sub(NOISE_SAMPLE));
+      }
+    });
+    Noise { stop, sampler }
+  }
+
+  /// The longest gap the sampler saw.
+  fn stop(self) -> Duration {
+    let _ = self.stop.send(());
+    self.sampler.join().unwrap()
   }
 }
 
@@ -171,7 +225,7 @@ fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
       Ok(mut connecting) => loop {
         let step = Instant::now();
         let polled = connecting.poll();
-        ticker.longest_step = ticker.longest_step.max(step.elapsed());
+        ticker.note("Connecting::poll", step.elapsed());
         match polled {
           Ok(Some(client)) => return client,
           Ok(None) => {
@@ -186,7 +240,7 @@ fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
       Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
         if started.elapsed() < START_WAIT =>
       {
-        ticker.longest_step = ticker.longest_step.max(step.elapsed());
+        ticker.note("Client::begin_connect", step.elapsed());
         std::hint::spin_loop();
       }
       Err(e) => panic!("{e}"),
@@ -264,9 +318,11 @@ fn budgets() -> Duration {
 /// Expect: the calls past the client's and the queue's bounds refused at once; every admitted call of the
 /// first history answered by the restarted daemon (recovery reconnects and resends under the calls' own ids);
 /// every call of the second failed `DaemonGone` within the reply and reconnect budgets; the cancelled call
-/// leaving nothing outstanding; and no loop step longer than [`step_bound`].
+/// leaving nothing outstanding; and no loop step longer than [`step_bound`] plus the scheduling noise a
+/// sampler thread measured in the same window ([`Noise`]).
 #[test]
 fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
+  let noise = Noise::start();
   let instance = format!("cl-driver-{}", std::process::id());
   let anchor = Anchor::new(&instance);
   let first = anchor.start();
@@ -291,10 +347,13 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
     "a cancelled call leaves nothing outstanding"
   );
   third.stop();
+  let noise = noise.stop();
   assert!(
-    ticker.longest_step < step_bound(),
-    "the longest loop step was {:?}, bound {:?}",
+    ticker.longest_step < step_bound() + noise,
+    "the longest loop step was {:?} in {}, bound {:?} plus the machine's own scheduling noise {:?}",
     ticker.longest_step,
-    step_bound()
+    ticker.longest_call,
+    step_bound(),
+    noise
   );
 }

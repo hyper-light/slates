@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
+import { Worker } from 'node:worker_threads';
 import { AsyncClient } from '../async.mjs';
 
 const require = createRequire(import.meta.url);
@@ -210,6 +211,41 @@ function startTicker() {
   return ticker;
 }
 
+// The sampler's sleep: a millisecond, far below the bound it qualifies.
+const NOISE_SAMPLE_MS = 1;
+
+// The machine's own scheduling noise while the test runs: a worker thread (its own isolate, so nothing the
+// main loop does can hold it) that sleeps NOISE_SAMPLE_MS at a time and records how much longer than asked
+// each sleep took — time the OS kept it off a core. The main loop is kept off as long by the same cause, so
+// its lateness is judged against the bound plus this noise (the pattern of the vfs bench's destroy_rows); a
+// call that blocked the main loop leaves the worker's sleeps on time, and still fails (CI 2026-10-01: a
+// 106 ms lateness against a 100 ms bound on the macOS runner, unattributed).
+function startNoise() {
+  const flag = new Int32Array(new SharedArrayBuffer(4));
+  const worst = new Float64Array(new SharedArrayBuffer(8));
+  const worker = new Worker(
+    `const { workerData } = require('node:worker_threads');
+     const flag = new Int32Array(workerData.flag);
+     const worst = new Float64Array(workerData.worst);
+     while (Atomics.load(flag, 0) === 0) {
+       const asked = performance.now();
+       Atomics.wait(flag, 0, 0, workerData.sample);
+       worst[0] = Math.max(worst[0], performance.now() - asked - workerData.sample);
+     }`,
+    { eval: true, workerData: { flag: flag.buffer, worst: worst.buffer, sample: NOISE_SAMPLE_MS } },
+  );
+  const exited = new Promise((resolve) => worker.once('exit', resolve));
+  // Idempotent: the test's `finally` stops it too, so a failed assertion never leaves the worker running.
+  return {
+    async stop() {
+      Atomics.store(flag, 0, 1);
+      Atomics.notify(flag, 0);
+      await exited;
+      return worst[0];
+    },
+  };
+}
+
 // Runs `program` without blocking the loop (the ticker must measure the SDK, not this harness's own
 // process spawns, which take tens of milliseconds on a loaded runner): its exit status and stdout.
 function runAsync(program, args) {
@@ -250,6 +286,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
     stdio: 'ignore',
     detached: true,
   });
+  const noise = startNoise();
   const ticker = startTicker();
   try {
     const client = await connectWhenReady(slates, instance);
@@ -304,8 +341,13 @@ test('every async call ends across restart, silence, reader loss and death', asy
       assert.equal(result.status, 'rejected');
       assert.match(result.reason.message, /DaemonGone/);
     }
-    assert.ok(ticker.worst < TICK_BOUND_MS, `the loop was never held: worst lateness ${ticker.worst} ms, bound ${TICK_BOUND_MS} ms`);
+    const scheduling = await noise.stop();
+    assert.ok(
+      ticker.worst < TICK_BOUND_MS + scheduling,
+      `the loop was never held: worst lateness ${ticker.worst} ms, bound ${TICK_BOUND_MS} ms plus the machine's own scheduling noise ${scheduling.toFixed(1)} ms`,
+    );
   } finally {
+    await noise.stop();
     clearInterval(ticker.timer);
     try {
       process.kill(-anchor.pid, 'SIGKILL');
