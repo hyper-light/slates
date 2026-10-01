@@ -189,9 +189,21 @@ pub struct Client {
   /// Replies drained from the completion ring while looking for another request's reply, held by
   /// their request-id word until their own [`Client::poll_reply`] takes them. The async path drains
   /// the ring on a completion-fd signal and matches by id, so replies that arrive out of order (a
-  /// deferred verb) or unawaited (an acknowledgement) do not block another request's. Bounded — an
-  /// overflow drops the oldest, which can only be an unawaited reply, never one still in flight.
+  /// deferred verb) do not block another request's. Only replies to `awaited` operations are kept, so
+  /// it never holds more than `awaited` does and nothing is ever evicted (AUD-29-22).
   pending: Vec<(u64, ReplyBody)>,
+  /// The caller-owned operations outstanding: begun with [`Client::begin`], their replies not yet taken
+  /// ([`Client::poll_reply`]) or abandoned ([`Client::abandon`]). Admission refuses a new one at
+  /// `awaited_cap` (AUD-29-22): until 2026-10-01 the reply buffer instead evicted its oldest entry past twice
+  /// the ring's slots, which a caller that kept old ids while admitting and draining new ones could make an
+  /// awaited reply.
+  awaited: std::collections::BTreeSet<u64>,
+  /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
+  /// bound (the same bound the retryable set keeps).
+  awaited_cap: usize,
+  /// Replies dropped on arrival because nothing awaited them: a protocol-only acknowledgement's, or an
+  /// abandoned operation's.
+  unawaited_dropped: u64,
   /// The consumer this channel is bound to (§4.13) — taken from the harness's delivery at connect, or
   /// attested by the caller — kept so the client binds again on its own after a daemon restart: a
   /// reconnected channel is the account's until it attests, and a retried verb must never run as the
@@ -499,6 +511,9 @@ impl Client {
       unpublished_cap,
       unpublished_forgotten: 0,
       pending: Vec::new(),
+      awaited: std::collections::BTreeSet::new(),
+      awaited_cap: unpublished_cap,
+      unawaited_dropped: 0,
       consumer: None,
       bound: false,
       rebinds: 0,
@@ -763,6 +778,24 @@ impl Client {
   /// acknowledges by a sync [`Self::acknowledge`] between calls, or by `begin`-ing the ack body and
   /// dropping its reply.
   pub fn begin(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
+    if self.awaited.len() >= self.awaited_cap {
+      return Err(ClientError::TooManyOutstanding {
+        limit: self.awaited_cap,
+      });
+    }
+    let id = self.send_new(body)?;
+    self.awaited.insert(id.word());
+    Ok(id)
+  }
+
+  /// Sends `body` under the next sequence, owned by no caller: a protocol-only request whose reply is
+  /// dropped on arrival (the periodic acknowledgement).
+  fn begin_unawaited(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
+    self.send_new(body)
+  }
+
+  /// Sends `body` under the next sequence and returns its id.
+  fn send_new(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
     let id = self.fresh_id()?;
     loop {
       // A reconnect on the way (the daemon found gone while the ring stayed full) leaves a fresh
@@ -772,6 +805,25 @@ impl Client {
         return Ok(id);
       }
     }
+  }
+
+  /// Releases an outstanding operation the caller no longer awaits (a cancelled call, a call settled by a
+  /// terminal channel failure): its buffered reply, if any, is dropped, and a reply that arrives later is
+  /// dropped on arrival. Returns whether it was outstanding.
+  pub fn abandon(&mut self, word: u64) -> bool {
+    self.pending.retain(|(held, _)| *held != word);
+    self.awaited.remove(&word)
+  }
+
+  /// The caller-owned operations outstanding, by id word — what a binding settles when its channel ends.
+  pub fn outstanding(&self) -> Vec<u64> {
+    self.awaited.iter().copied().collect()
+  }
+
+  /// Replies dropped on arrival because nothing awaited them (a protocol-only acknowledgement's, or an
+  /// abandoned operation's) — the counter a test reads to see the drop path ran.
+  pub fn unawaited_dropped(&self) -> u64 {
+    self.unawaited_dropped
   }
 
   /// Takes the reply to `id` if it has arrived, without blocking. Replies for other requests drained
@@ -786,12 +838,14 @@ impl Client {
   pub fn poll_reply_word(&mut self, word: u64) -> Result<Option<ReplyBody>, ClientError> {
     if let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) {
       let (_, body) = self.pending.remove(pos);
+      self.awaited.remove(&word);
       self.note_reply(word, &body);
       return resolved(body).map(Some);
     }
     while let Some(reply) = self.end.try_take()? {
       let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
       if reply.request == word {
+        self.awaited.remove(&word);
         self.note_reply(word, &body);
         return resolved(body).map(Some);
       }
@@ -831,27 +885,15 @@ impl Client {
     Ok(self.pending.iter().map(|(word, _)| *word).collect())
   }
 
-  /// Buffers a reply drained for another request. Bounded (item 8): no more requests can be in flight
-  /// than the ring holds, so an awaited reply is always within one ring's worth; twice that as the cap
-  /// means an overflow drops only an unawaited reply (a periodic acknowledgement), never one still
-  /// awaited.
+  /// Buffers a reply drained for another request: kept when an outstanding operation awaits it (bounded by
+  /// the admitted outstanding set, so nothing is evicted, item 8), dropped and counted when nothing does —
+  /// a protocol-only acknowledgement's reply, or an abandoned operation's (AUD-29-22).
   fn buffer(&mut self, id_word: u64, body: ReplyBody) {
-    self.pending.push((id_word, body));
-    let bound = self.reply_buffer_bound();
-    while self.pending.len() > bound {
-      self.pending.remove(0);
+    if self.awaited.contains(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word) {
+      self.pending.push((id_word, body));
+    } else {
+      self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);
     }
-  }
-
-  /// Derived: the reply buffer's bound, twice the command ring's slots (an awaited reply is always
-  /// within one ring of in-flight requests, so twice that never evicts one still awaited).
-  fn reply_buffer_bound(&self) -> usize {
-    derived!(
-      self.end.region().cmd().slots().saturating_mul(2).max(1),
-      "2 × region.slots",
-      ["region.slots"]
-    )
-    .get()
   }
 
   /// Enables the async completion channel and returns the descriptor an event loop polls
@@ -923,7 +965,7 @@ impl Client {
   pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
     let up_to = self.ack_watermark();
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
-      self.begin(&RequestBody::Acknowledge { up_to })?;
+      self.begin_unawaited(&RequestBody::Acknowledge { up_to })?;
       self.acknowledged = self.acknowledged.max(up_to);
     }
     Ok(())

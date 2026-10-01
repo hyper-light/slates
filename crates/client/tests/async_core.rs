@@ -171,3 +171,110 @@ fn poll_until(client: &mut Client, id: RequestId) -> ReplyBody {
     std::hint::spin_loop();
   }
 }
+
+/// Begins `List` and takes its reply, driving the ring until it lands.
+fn list_round_trip(client: &mut Client) {
+  let id = client.begin(&RequestBody::List).unwrap();
+  client.begin_ack_if_due().unwrap();
+  let _ = poll_until(client, id);
+}
+
+/// AUD-29-22 (§4.9, banned item 8): an awaited reply is never evicted to bound the buffer. Do: begin a call
+/// and let its reply be drained into the buffer, then begin and finish three bounds' worth of further calls
+/// (acknowledgements going out as they fall due); then begin calls up to the admitted bound; abandon one
+/// whose reply is buffered. Expect: the early reply still taken afterwards, the call past the bound refused
+/// `TooManyOutstanding` with nothing sent, a call admitted again once one is abandoned, and the abandoned
+/// reply dropped on arrival and counted. Until 2026-10-01 the buffer dropped its oldest reply past twice the
+/// ring's slots, and the early reply's later poll returned nothing for good.
+#[test]
+fn an_awaited_reply_survives_any_drain_and_admission_refuses_at_the_bound() {
+  let profile = profile();
+  let instance = format!("cl-await-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-await-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+
+  let early = client.begin(&RequestBody::List).unwrap();
+  drain_until_ready(&mut client, early);
+  let limit = fill_to_the_bound(&mut client);
+  for _ in 0..limit * 3 {
+    list_round_trip(&mut client);
+  }
+  assert!(
+    matches!(
+      client.poll_reply(early).unwrap(),
+      Some(ReplyBody::Listed { .. })
+    ),
+    "the early reply is still there after three bounds of drained traffic"
+  );
+  assert_abandoned_replies_are_dropped(&mut client);
+  assert!(
+    client.outstanding().is_empty(),
+    "nothing is left outstanding"
+  );
+  daemon.stop();
+}
+
+/// Drains the completion ring until `id`'s reply is in the client's buffer.
+fn drain_until_ready(client: &mut Client, id: RequestId) {
+  let started = Instant::now();
+  while !client.take_ready().unwrap().contains(&id.word()) {
+    assert!(started.elapsed() < START_WAIT, "{id:?}'s reply is drained");
+    std::hint::spin_loop();
+  }
+}
+
+/// Begins calls until admission refuses, checks the bound counts the one already outstanding, then takes
+/// every reply back; returns the bound.
+fn fill_to_the_bound(client: &mut Client) -> usize {
+  let mut held = Vec::new();
+  let limit = loop {
+    match client.begin(&RequestBody::List) {
+      Ok(id) => held.push(id),
+      Err(ClientError::TooManyOutstanding { limit }) => break limit,
+      Err(e) => panic!("{e}"),
+    }
+  };
+  assert_eq!(
+    held.len() + 1,
+    limit,
+    "the early call holds one of the slots"
+  );
+  for id in held {
+    let _ = poll_until(client, id);
+  }
+  limit
+}
+
+/// An abandoned call's buffered reply is gone, and a late reply to an abandoned call is dropped and counted.
+fn assert_abandoned_replies_are_dropped(client: &mut Client) {
+  let abandoned = client.begin(&RequestBody::List).unwrap();
+  drain_until_ready(client, abandoned);
+  let dropped_before = client.unawaited_dropped();
+  assert!(client.abandon(abandoned.word()));
+  assert!(
+    client.poll_reply(abandoned).unwrap().is_none(),
+    "an abandoned reply is gone"
+  );
+  let late = client.begin(&RequestBody::List).unwrap();
+  client.abandon(late.word());
+  let started = Instant::now();
+  while client.unawaited_dropped() == dropped_before {
+    let _ = client.take_ready().unwrap();
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the late reply arrives and is dropped"
+    );
+    std::hint::spin_loop();
+  }
+}

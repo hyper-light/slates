@@ -41,6 +41,13 @@ pub enum ClientError {
     /// The exhausted client id.
     client: u32,
   },
+  /// As many caller-owned operations are outstanding — begun, their replies not yet taken or abandoned — as
+  /// the client admits (`limit`, its ring's slots; AUD-29-22): no new one is sent, so no awaited reply is
+  /// ever evicted to make room. Take or abandon one, then begin again.
+  TooManyOutstanding {
+    /// The outstanding operations the client admits.
+    limit: usize,
+  },
 }
 
 impl fmt::Display for ClientError {
@@ -56,6 +63,12 @@ impl fmt::Display for ClientError {
       }
       Self::SequencesExhausted { client } => {
         write!(f, "client {client} has issued its last request sequence")
+      }
+      Self::TooManyOutstanding { limit } => {
+        write!(
+          f,
+          "{limit} operations already outstanding; take or abandon one first"
+        )
       }
     }
   }
