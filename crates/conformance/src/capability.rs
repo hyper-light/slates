@@ -109,8 +109,9 @@ const OCI_OWED: &str = "the container form exists — `attach` returns a verifie
   (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS \
   lane under the runtime handshake (`slates oci-runtime docker`), as do fsstress, the workloads and \
   pjdfstest — but the hermeticity container leg is not built: its tracer needs root, and no lane holds both \
-  root and a container engine; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the \
-  daemon's FUSE mount";
+  root and a container engine; on Linux the bind of the daemon's shared FUSE mount (`slates mount --shared`) runs \
+  container workloads in the CLI suite (a_linux_container_reaches_the_shared_mount_as_its_own_ids), and this \
+  harness has no Linux container leg yet";
 
 /// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export.
 const LINUX_NFS_ADAPTER: Adapter = Adapter {

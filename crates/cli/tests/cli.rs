@@ -3462,3 +3462,180 @@ fn a_container_bound_to_a_subtree_mount_sees_only_that_directory() {
   drop(whole);
   drop(anchor);
 }
+
+/// The Linux container leg's gate: a live FUSE mount (`SLATES_TEST_CLI=1`, `fusermount3`, `/dev/fuse`) and a
+/// reachable runtime; the runtime's server description, else the loud skip was printed.
+#[cfg(target_os = "linux")]
+fn linux_container_gate() -> Option<String> {
+  if !linux_fuse_mount_runs() {
+    return None;
+  }
+  // The operator's grant a shared mount needs; read, never written (the CI lane sets it, Ada 2026-10-01).
+  #[allow(clippy::disallowed_methods)] // a host configuration file, read only (R1)
+  let granted = std::fs::read_to_string("/etc/fuse.conf")
+    .is_ok_and(|conf| conf.lines().any(|line| line.trim() == "user_allow_other"));
+  if !granted {
+    eprintln!(
+      "SKIP: the Linux container leg needs user_allow_other in /etc/fuse.conf (an operator's grant)"
+    );
+    return None;
+  }
+  match docker_server() {
+    Ok(server) => Some(server),
+    Err(why) => {
+      eprintln!("SKIP: the Linux container leg needs a reachable runtime: {why}");
+      None
+    }
+  }
+}
+
+/// `owner:group` of `path` as the Linux host sees it.
+#[cfg(target_os = "linux")]
+fn linux_owner(path: &str) -> String {
+  let (code, out, err) = bounded(
+    Command::new("stat").args(["-c", "%u:%g", path]),
+    CONTAINER_WAIT,
+  )
+  .unwrap();
+  assert_eq!(code, 0, "{err}");
+  out.trim().to_owned()
+}
+
+/// Format: a foreign identity's attempt: make a file in the bind's root, then read a 0700 directory it does not
+/// own; each prints what the kernel answered.
+#[cfg(target_os = "linux")]
+const FOREIGN_SCRIPT: &str = r#"R="$1"
+( printf x > "$R/by-foreign" ) 2>/dev/null && echo "--- create ok" || echo "--- create refused"
+cat "$R/owners-only/s" 2>/dev/null && echo "--- read ok" || echo "--- read refused"
+"#;
+
+/// Format: a hard link's second name, after the first is removed, read at once, a hundred times.
+#[cfg(target_os = "linux")]
+const HARD_LINK_SCRIPT: &str = r#"R="$1"; fails=0
+for i in $(seq 1 100); do
+  echo x > "$R/a$i"; ln "$R/a$i" "$R/b$i"; rm "$R/a$i"
+  cat "$R/b$i" >/dev/null 2>&1 || fails=$((fails+1)); rm -f "$R/b$i"
+done
+echo "--- failed"; echo "$fails"
+"#;
+
+/// The bind is refused `MountNotShared` over a FUSE mount the daemon made for its user alone.
+#[cfg(target_os = "linux")]
+fn an_unshared_mount_is_no_bind_source(instance: &str, id: &str) {
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(instance, &["mount", id, &point.path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  let (code, out, err) = run(
+    instance,
+    &[
+      "attach",
+      id,
+      "--write",
+      "--oci-source",
+      &point.path,
+      "--oci-destination",
+      "/work",
+    ],
+  );
+  assert_ne!(code, 0, "an unshared mount is no bind source: {out}");
+  assert!(err.contains("MountNotShared"), "{err}");
+  let (code, _, err) = run(instance, &["unmount", &point.path]);
+  assert_eq!(code, 0, "{err}");
+}
+
+/// AUD-29-67/74 (the Linux profile, T-4.13 on Linux). Do: on a Linux host whose operator grants
+/// `user_allow_other`, mount a volume with `slates mount --shared`; ask the runtime handshake for its profile;
+/// bind the mount into containers (the OCI form, the exact entry `attach --oci` returns); as root make a file and
+/// read the mounting user's 0700 directory; as a foreign 2000:2000 try both; as the mounting user make its own;
+/// link a file, remove its first name and read the second, a hundred times; bind a mount made without
+/// `--shared`. Expect: the handshake states `container_ids_as_host_ids`; root's file is 0:0 on the host and it
+/// reads the private directory; the foreign id is refused both; the mounting user's file is its own; every second
+/// name is served at once; the unshared mount is refused `MountNotShared`. Before 2026-10-01 the Linux bind was
+/// refused `ContainerWorkloadUnproven`. Gated on a live FUSE mount and a reachable runtime; skips loudly.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_container_reaches_the_shared_mount_as_its_own_ids() {
+  let Some(server) = linux_container_gate() else {
+    return;
+  };
+  eprintln!("the Linux profile over {server}");
+  let instance = format!("cli-linux-oci-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "linuxoci", "--bounded", "64MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = point.path.clone();
+  let (code, _, err) = run(&instance, &["mount", &id, &path, "--shared"]);
+  assert_eq!(code, 0, "slates mount --shared: {err}");
+  shell(&format!(
+    "mkdir -m 700 {path}/owners-only && printf secret > {path}/owners-only/s"
+  ));
+  let (code, profile, err) = run(&instance, &["oci-runtime", "docker"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    profile.contains("identity: container_ids_as_host_ids"),
+    "{profile}"
+  );
+  let writer = attach_oci(&instance, &id, &path, "--write");
+  let entry = writer["established"]["binding"]["mount"].clone();
+  assert_linux_identities(&entry, &path);
+  let (code, out, err) = run_in_container(&entry, HARD_LINK_SCRIPT, "links").unwrap();
+  assert_eq!(code, 0, "{err}");
+  assert_eq!(
+    section(&out, "failed"),
+    ["0"],
+    "every second name served at once"
+  );
+  detach_all(&instance, &[writer["attachment"].as_u64().unwrap()]);
+  let _ = unmount_after_container(&instance, &path);
+  an_unshared_mount_is_no_bind_source(&instance, &id);
+  drop(point);
+  drop(anchor);
+}
+
+/// The measured identity rule, by use: root bypasses the bits, a foreign id meets them, the mounting user owns
+/// what it makes.
+#[cfg(target_os = "linux")]
+fn assert_linux_identities(entry: &serde_json::Value, path: &str) {
+  let (code, out, err) = run_in_container_as(entry, IDENTITY_SCRIPT, "root", "0:0", &[]).unwrap();
+  assert_eq!(code, 0, "root wrote through the bind: {err}");
+  assert_eq!(section(&out, "seen"), ["0:0"]);
+  assert_eq!(
+    linux_owner(&format!("{path}/by-root")),
+    "0:0",
+    "root's file on the host"
+  );
+  let (_, out, _) = run_in_container_as(
+    entry,
+    "cat \"$1/owners-only/s\"; echo",
+    "root-reads",
+    "0:0",
+    &[],
+  )
+  .unwrap();
+  assert!(
+    out.contains("secret"),
+    "root reads the 0700 directory: {out}"
+  );
+  let (_, out, _) =
+    run_in_container_as(entry, FOREIGN_SCRIPT, "foreign", "2000:2000", &[]).unwrap();
+  assert!(out.contains("--- create refused"), "{out}");
+  assert!(out.contains("--- read refused"), "{out}");
+  let me = format!(
+    "{}:{}",
+    rustix::process::getuid().as_raw(),
+    rustix::process::getgid().as_raw()
+  );
+  let (code, out, err) = run_in_container_as(entry, IDENTITY_SCRIPT, "me", &me, &[]).unwrap();
+  assert_eq!(code, 0, "{err}");
+  assert_eq!(section(&out, "seen"), [me.as_str()]);
+  assert_eq!(linux_owner(&format!("{path}/by-me")), me);
+}

@@ -86,6 +86,13 @@ jobs:
         run: cargo test -p slates-land --release --test os -- --nocapture
       # The end-to-end CLI flow spawns a real anchor and daemon; it needs the machine to
       # itself (a busy parallel suite starves the daemon), so it is its own step.
+      # The Linux container profile binds a FUSE mount shared with the runtime's processes (`slates mount
+      # --shared`, allow_other), which the host's operator grants with user_allow_other (Ada authorized it on
+      # the CI runner, 2026-10-01; AUD-29-67/74/78).
+      - name: Grant user_allow_other (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          grep -qx user_allow_other /etc/fuse.conf 2>/dev/null || echo user_allow_other | sudo tee -a /etc/fuse.conf
       - name: The slates CLI flow (anchor + daemon)
         env:
           SLATES_TEST_CLI: "1"

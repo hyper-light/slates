@@ -212,6 +212,9 @@ pub(crate) enum Verb {
     read_only: bool,
     /// `--subtree DIR`: present only that directory of the volume (AUD-29-76), the export enforcing the scope.
     subtree: Option<String>,
+    /// `--shared`: a Linux FUSE mount other local users' processes may reach (`allow_other`), for a container
+    /// runtime to bind (§4.6 A-9).
+    shared: bool,
   },
   /// Unmount a loopback bridge mount at a path (`unmount PATH`).
   Unmount {
@@ -551,6 +554,7 @@ const VALUES: &[&str] = &[
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
+  "--shared",
   "--fenced",
   "--accept-loss",
   "--quick",
@@ -1225,7 +1229,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     ["mount", id, path] => {
       taken.only(&Spec {
         values: &["--subtree"],
-        switches: &["--read-only"],
+        switches: &["--read-only", "--shared"],
       })?;
       Ok(client(
         &taken,
@@ -1234,11 +1238,12 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
           path: (*path).to_owned(),
           read_only: taken.switch("--read-only"),
           subtree: taken.value("--subtree").map(str::to_owned),
+          shared: taken.switch("--shared"),
         },
       ))
     }
     ["mount", ..] => Err(ParseError::Missing(
-      "mount ID PATH [--read-only] [--subtree DIR]",
+      "mount ID PATH [--read-only] [--subtree DIR] [--shared]",
     )),
     ["unmount", path] => {
       taken.only(&NONE)?;

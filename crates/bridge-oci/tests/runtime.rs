@@ -33,9 +33,10 @@ fn linux_engine() -> EngineFacts {
 const DESKTOP_SOCKET: &str = "unix:///Users/someone/.docker/run/docker.sock";
 const LINUX_SOCKET: &str = "unix:///var/run/docker.sock";
 
-/// AUD-29-67. Do: judge Docker Desktop on macOS over its local socket. Expect: the profile T-4.13 ran, named
-/// with the engine's own version; the same engine on Linux and a Linux host's Docker Engine are refused
-/// `ProfileUntested`, naming the engine and host, since no container workload has run through them.
+/// AUD-29-67. Do: judge Docker Desktop on macOS over its local socket, and a Linux host's Docker Engine on Linux.
+/// Expect: each is the profile its container workloads ran through (T-4.13; on Linux the shared FUSE mount's,
+/// measured `ContainerIdsAsHostIds`), named with the engine's own version; Desktop on Linux and a Linux engine
+/// judged for macOS are refused `ProfileUntested`, naming the engine and host.
 #[test]
 fn only_the_profile_a_container_workload_ran_through_holds_evidence() {
   let endpoint = admit_endpoint("docker", DESKTOP_SOCKET).unwrap();
@@ -51,13 +52,12 @@ fn only_the_profile_a_container_workload_ran_through_holds_evidence() {
     admit_endpoint("docker", LINUX_SOCKET).unwrap(),
     &linux_engine(),
   );
-  assert!(matches!(
-    judge(&linux, Host::Linux),
-    Err(ProfileRefusal::ProfileUntested { engine, .. }) if engine == "Ubuntu 24.04.3 LTS"
-  ));
+  let on_linux = judge(&linux, Host::Linux).unwrap();
+  assert_eq!(on_linux.identity, IdentityRule::ContainerIdsAsHostIds);
+  assert_eq!(on_linux.hard_links, HardLinkRule::EveryNameServedAtOnce);
   assert!(matches!(
     judge(&linux, Host::MacOs),
-    Err(ProfileRefusal::ProfileUntested { .. })
+    Err(ProfileRefusal::ProfileUntested { engine, .. }) if engine == "Ubuntu 24.04.3 LTS"
   ));
 }
 

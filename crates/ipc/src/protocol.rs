@@ -1427,6 +1427,13 @@ pub enum UnsupportedReason {
   /// container workload has run through this platform's bind (T-4.13), so it is not offered until one does
   /// (AUD-29-64: a recipe is not evidence that a runtime consumes it as intended).
   ContainerWorkloadUnproven,
+  /// A mount another user's processes (a container runtime's) can reach needs `allow_other`, which the host's
+  /// operator grants with `user_allow_other` in `/etc/fuse.conf`; this host's mount helper refused it.
+  /// Appended.
+  AllowOtherNotGranted,
+  /// A container bind on Linux binds a mount other users' processes can reach; the source is a FUSE mount the
+  /// daemon made for its user alone. Mount it with `slates mount --shared`. Appended.
+  MountNotShared,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -1514,15 +1521,25 @@ pub enum AttachRequest {
     /// The directory, as a path from the volume's root.
     subtree: String,
   },
+  /// A Linux FUSE mount other local users' processes can reach — a container runtime binding it into a
+  /// container (§4.6 A-9) — mounted `allow_other`, the kernel checking each caller's permission bits
+  /// (`default_permissions`). Optionally one directory of the volume. Refused `AllowOtherNotGranted` where the
+  /// host's operator has not granted `user_allow_other`.
+  SharedFuseMount {
+    /// The mount point, canonical.
+    mount_point: String,
+    /// The directory presented, as a path from the volume's root; the whole volume when absent.
+    subtree: Option<String>,
+  },
 }
 
 impl AttachRequest {
   /// The mount point of a FUSE form (whole or scoped), which the daemon itself mounts.
   pub fn fuse_mount_point(&self) -> Option<&str> {
     match self {
-      Self::FuseMount { mount_point } | Self::ScopedFuseMount { mount_point, .. } => {
-        Some(mount_point)
-      }
+      Self::FuseMount { mount_point }
+      | Self::ScopedFuseMount { mount_point, .. }
+      | Self::SharedFuseMount { mount_point, .. } => Some(mount_point),
       _ => None,
     }
   }
@@ -1531,6 +1548,7 @@ impl AttachRequest {
   pub fn subtree(&self) -> Option<&str> {
     match self {
       Self::ScopedHostMount { subtree } | Self::ScopedFuseMount { subtree, .. } => Some(subtree),
+      Self::SharedFuseMount { subtree, .. } => subtree.as_deref(),
       _ => None,
     }
   }

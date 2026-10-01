@@ -922,6 +922,8 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::NotificationQueueNotOffered => "notification_queue_not_offered",
     UnsupportedReason::FuseUnavailable => "fuse_unavailable",
     UnsupportedReason::ContainerWorkloadUnproven => "container_workload_unproven",
+    UnsupportedReason::AllowOtherNotGranted => "allow_other_not_granted",
+    UnsupportedReason::MountNotShared => "mount_not_shared",
   }
 }
 

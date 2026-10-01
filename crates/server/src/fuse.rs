@@ -172,12 +172,27 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       .fuse_mount_point()
       .unwrap_or_default()
       .to_owned();
-    let mounted =
-      mount_without_blocking(&mount_point, &fsname_of(pending.record.id), deadline_ns).await;
+    // A mount shared with a container runtime's processes is `allow_other` (§4.6 A-9); the kernel still checks
+    // each caller's permission bits (`default_permissions`).
+    let shared = pending.record.form.shared_with_other_users();
+    let mounted = mount_without_blocking(
+      &mount_point,
+      &fsname_of(pending.record.id),
+      (deadline_ns, shared),
+    )
+    .await;
     let _ = state::with_state(move |s| {
       let attachment = pending.record.id;
       let reply = complete(s, request, cause, attachment, |s| match mounted {
         Ok(mount) => established(s, pending, mount),
+        Err(MountError::AllowOtherNotGranted) => {
+          *s.refusals.entry(MOUNT_REFUSED).or_insert(0) += 1;
+          release_unmounted_lease(s, &pending.record);
+          crate::verbs::refused(Refusal::AttachmentUnsupported {
+            transport: slates_ipc::protocol::AttachTransport::Fuse,
+            reason: slates_ipc::protocol::UnsupportedReason::AllowOtherNotGranted,
+          })
+        }
         Err(error) => {
           *s.refusals.entry(MOUNT_REFUSED).or_insert(0) += 1;
           release_unmounted_lease(s, &pending.record);
@@ -258,9 +273,10 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
 async fn mount_without_blocking(
   mount_point: &str,
   fsname: &str,
-  deadline_ns: u64,
+  (deadline_ns, shared): (u64, bool),
 ) -> Result<Mount, MountError> {
-  let mut pending = begin_mount(mount_point, fsname, &[])?;
+  let extra: &[&str] = if shared { &["allow_other"] } else { &[] };
+  let mut pending = begin_mount(mount_point, fsname, extra)?;
   let began = futures::now_ns();
   let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   loop {

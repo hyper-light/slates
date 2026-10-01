@@ -4563,6 +4563,10 @@ fn recorded_form(form: &AttachRequest, established: AttachForm, scope: Option<u6
         scope,
       }
     }
+    (AttachRequest::SharedFuseMount { mount_point, .. }, scope) => AttachForm::SharedFuseMount {
+      path: mount_point.clone(),
+      scope,
+    },
     _ => established,
   }
 }
@@ -4674,7 +4678,8 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     AttachRequest::HostMount
     | AttachRequest::FuseMount { .. }
     | AttachRequest::ScopedHostMount { .. }
-    | AttachRequest::ScopedFuseMount { .. } => Ok(Consumer::Bridge),
+    | AttachRequest::ScopedFuseMount { .. }
+    | AttachRequest::SharedFuseMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
@@ -4739,7 +4744,9 @@ fn establish_form(
       return Ok(None);
     }
     // A FUSE mount (§4.6 "Linux"; AUD-29-64): offered where the host has FUSE, presenting the live head.
-    AttachRequest::FuseMount { .. } | AttachRequest::ScopedFuseMount { .. } => {
+    AttachRequest::FuseMount { .. }
+    | AttachRequest::ScopedFuseMount { .. }
+    | AttachRequest::SharedFuseMount { .. } => {
       if let Some(reason) = crate::transports::fuse(situation).unsupported_reason {
         return Err(Refusal::AttachmentUnsupported {
           transport: AttachTransport::Fuse,

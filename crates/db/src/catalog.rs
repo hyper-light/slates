@@ -401,15 +401,24 @@ pub enum AttachForm {
     /// The directory's inode number, when the device presents one directory.
     scope: Option<u64>,
   },
+  /// A Linux FUSE mount shared with other local users' processes (`allow_other`): what a container bind on
+  /// Linux borrows (§4.6 A-9). Ended by recovery as a `FuseMount` is. Appended.
+  SharedFuseMount {
+    /// The mount point.
+    path: String,
+    /// The directory's inode number, when the mount presents one directory.
+    scope: Option<u64>,
+  },
 }
 
 impl AttachForm {
   /// The host mount point a mounted form names: a chosen-path host mount's or a FUSE mount's.
   pub fn mount_point(&self) -> Option<&str> {
     match self {
-      Self::ChosenPath { path } | Self::FuseMount { path } | Self::ScopedFuseMount { path, .. } => {
-        Some(path)
-      }
+      Self::ChosenPath { path }
+      | Self::FuseMount { path }
+      | Self::ScopedFuseMount { path, .. }
+      | Self::SharedFuseMount { path, .. } => Some(path),
       Self::ScopedMount { mount_point, .. } => mount_point.as_deref(),
       Self::Root | Self::Oci { .. } | Self::GuestTag { .. } => None,
     }
@@ -419,17 +428,25 @@ impl AttachForm {
   pub fn scope(&self) -> Option<u64> {
     match self {
       Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
-      Self::GuestTag { scope, .. } => *scope,
+      Self::GuestTag { scope, .. } | Self::SharedFuseMount { scope, .. } => *scope,
       _ => None,
     }
   }
 
-  /// The mount point of a FUSE form (whole or scoped): a mount the daemon's own process holds, so it ends with it.
+  /// The mount point of a FUSE form (whole, scoped or shared): a mount the daemon's own process holds, so it
+  /// ends with it.
   pub fn fuse_mount_point(&self) -> Option<&str> {
     match self {
-      Self::FuseMount { path } | Self::ScopedFuseMount { path, .. } => Some(path),
+      Self::FuseMount { path }
+      | Self::ScopedFuseMount { path, .. }
+      | Self::SharedFuseMount { path, .. } => Some(path),
       _ => None,
     }
+  }
+
+  /// Whether a container runtime's processes may reach this mount (`allow_other`).
+  pub fn shared_with_other_users(&self) -> bool {
+    matches!(self, Self::SharedFuseMount { .. })
   }
 }
 

@@ -243,15 +243,10 @@ fn assert_linux_host_mounts(report: &StatusReport) {
   }
 }
 
-/// What a container bind is refused with where no NFS host mount is offered: on a Linux host with FUSE the
-/// source authority is built but no container workload has run through it (`ContainerWorkloadUnproven`,
-/// AUD-29-64); elsewhere there is no host mount to bind (`HostMountRequired`).
-fn expected_container_refusal() -> UnsupportedReason {
-  if cfg!(target_os = "linux") && fuse_on_this_host() {
-    UnsupportedReason::ContainerWorkloadUnproven
-  } else {
-    UnsupportedReason::HostMountRequired
-  }
+/// Whether this host offers the container bind over its own FUSE mount: Linux with FUSE, where a shared mount's
+/// bind ran container workloads (`a_linux_container_reaches_the_shared_mount_as_its_own_ids`).
+fn linux_binds_its_fuse_mount() -> bool {
+  cfg!(target_os = "linux") && fuse_on_this_host()
 }
 
 /// On every Unix host: WinFsp does not exist, and the container bind's view is the host mount's at a
@@ -374,33 +369,7 @@ fn refused_oci(
 /// offered host mount the form itself is refused `AttachmentUnsupported{Oci, HostMountRequired}`.
 fn assert_unbound_host_paths_are_refused_typed(client: &mut Client, id: VolumeId) {
   let root = refused_oci(client, id, None, "/", "/work");
-  if cfg!(target_os = "macos") {
-    assert!(
-      matches!(
-        &root,
-        Refusal::ChosenPathUnavailable {
-          reason: HostPathReason::ForeignFilesystem { fstype }
-        } if fstype == "apfs"
-      ),
-      "the root is APFS, not a slates mount: {root:?}"
-    );
-    assert_eq!(
-      refused_oci(client, id, None, "/private", "/work"),
-      Refusal::ChosenPathUnavailable {
-        reason: HostPathReason::NotAMountPoint
-      },
-      "a directory that is not a mount point"
-    );
-  } else {
-    assert_eq!(
-      root,
-      Refusal::AttachmentUnsupported {
-        transport: AttachTransport::Oci,
-        reason: expected_container_refusal(),
-      },
-      "no NFS host mount is offered on this platform"
-    );
-  }
+  assert_the_root_is_no_bind_source(client, id, &root);
   let relative = refused_oci(client, id, None, "work", "/work");
   assert!(
     matches!(
@@ -473,8 +442,14 @@ fn the_container_bind_is_offered_exactly_when_a_host_mount_is() {
     if oci.supported {
       assert_eq!(oci.conformance, Conformance::VerifiedSourceExport);
     }
+  } else if linux_binds_its_fuse_mount() {
+    assert!(oci.supported, "the shared FUSE mount's bind is offered");
+    assert_eq!(oci.conformance, Conformance::VerifiedSourceExport);
   } else {
-    assert_eq!(oci.unsupported_reason, Some(expected_container_refusal()));
+    assert_eq!(
+      oci.unsupported_reason,
+      Some(UnsupportedReason::HostMountRequired)
+    );
   }
   drop(client);
   drop(daemon);
@@ -1028,4 +1003,46 @@ fn advance_and_check_the_pins(
     ReplyBody::SnapshotDestroyed
   ));
   assert!(matches!(destroy(client, second), ReplyBody::Refused { .. }));
+}
+
+/// The root directory as a bind source, by this host's rule: a foreign filesystem where a host mount is offered
+/// (APFS on macOS; whatever the root is on a Linux host whose FUSE mount binds), else the form itself refused.
+fn assert_the_root_is_no_bind_source(client: &mut Client, id: VolumeId, root: &Refusal) {
+  if cfg!(target_os = "macos") {
+    assert!(
+      matches!(
+        root,
+        Refusal::ChosenPathUnavailable {
+          reason: HostPathReason::ForeignFilesystem { fstype }
+        } if fstype == "apfs"
+      ),
+      "the root is APFS, not a slates mount: {root:?}"
+    );
+    assert_eq!(
+      refused_oci(client, id, None, "/private", "/work"),
+      Refusal::ChosenPathUnavailable {
+        reason: HostPathReason::NotAMountPoint
+      },
+      "a directory that is not a mount point"
+    );
+  } else if linux_binds_its_fuse_mount() {
+    assert!(
+      matches!(
+        root,
+        Refusal::ChosenPathUnavailable {
+          reason: HostPathReason::ForeignFilesystem { .. }
+        }
+      ),
+      "the root is no slates mount: {root:?}"
+    );
+  } else {
+    assert_eq!(
+      root,
+      &Refusal::AttachmentUnsupported {
+        transport: AttachTransport::Oci,
+        reason: UnsupportedReason::HostMountRequired,
+      },
+      "no host mount is offered on this platform"
+    );
+  }
 }

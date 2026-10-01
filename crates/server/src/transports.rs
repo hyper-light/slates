@@ -340,7 +340,10 @@ pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
     container_delete_while_open(situation.platform),
   );
   let residency = container_residency(situation.platform);
-  if host_mount_offered(situation) {
+  // Linux binds the daemon's shared FUSE mount (`slates mount --shared`), the profile measured through a Linux
+  // Docker Engine (`slates_bridge_oci::runtime`, `ContainerIdsAsHostIds`; the linux-oci CI lane).
+  let linux_shared_fuse = situation.platform == Platform::Linux && situation.fuse_available;
+  if host_mount_offered(situation) || linux_shared_fuse {
     return offered(
       AttachTransport::Oci,
       situation,
@@ -351,9 +354,6 @@ pub(crate) fn oci(situation: &Situation) -> AttachmentCapability {
     );
   }
   let reason = match situation.platform {
-    // Linux with FUSE: the source authority is built (the mount names its attachment, held to the record);
-    // the bind is refused until a container workload has run through it (AUD-29-64, T-4.13).
-    Platform::Linux if situation.fuse_available => UnsupportedReason::ContainerWorkloadUnproven,
     Platform::MacOs | Platform::Linux => UnsupportedReason::HostMountRequired,
     Platform::Windows | Platform::Other => UnsupportedReason::HostPlatform,
   };
@@ -708,11 +708,14 @@ mod tests {
     let fuse = entry(&with_fuse, AttachTransport::Fuse);
     assert!(fuse.supported);
     assert_eq!(fuse.conformance, Conformance::LiveKernelMountTest);
+    // The bind of a shared FUSE mount ran container workloads through a Linux Docker Engine (the linux-oci
+    // lane, `a_linux_container_reaches_the_shared_mount_as_its_own_ids`), so it is offered where FUSE is.
+    let oci = entry(&with_fuse, AttachTransport::Oci);
     assert_eq!(
-      entry(&with_fuse, AttachTransport::Oci).unsupported_reason,
-      Some(UnsupportedReason::ContainerWorkloadUnproven),
-      "a FUSE host mount exists, but no container workload has run through its bind"
+      oci.unsupported_reason, None,
+      "the shared FUSE mount's bind is offered"
     );
+    assert_eq!(oci.conformance, Conformance::VerifiedSourceExport);
     for bound in [false, true] {
       let situation = on(Platform::Linux, bound);
       assert_eq!(

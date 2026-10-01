@@ -82,6 +82,8 @@ const SELINUX: &str = "selinux";
 
 /// Format: the test that ran a container workload through the tested profile.
 const TESTED_BY: &str = "T-4.13";
+/// Format: the test that ran container workloads through the Linux profile (the `linux-oci` CI lane).
+const TESTED_ON_LINUX_BY: &str = "T-4.13 (Linux, a shared FUSE mount)";
 
 /// A local endpoint the runtime's engine answers on.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +146,14 @@ pub enum IdentityRule {
   /// 29.3.1 on macOS (2026-10-01): as 501:20, 0:0, 1000:1000 and 501:20 with group 12345, each container
   /// wrote and saw its own ids; the host saw every file as 501:20, a 0700 directory kept 0700.
   HostUserThroughShare,
+  /// A container's ids reach the export as themselves — no remapping — and the kernel checks each id against
+  /// the permission bits (`default_permissions` on the shared FUSE mount); the container's root bypasses them,
+  /// as root does on the host. New objects are owned by the container's ids. The mount being shared
+  /// (`allow_other`), every local id reaches it exactly as far as its bits allow. Measured through a Linux
+  /// Docker Engine (rootful, no user namespace) over `slates mount --shared` (2026-10-01): as 0:0 the
+  /// container wrote root-owned files and read another user's 0700 directory; as 2000:2000 it could neither
+  /// create in the mounting user's 0755 root nor read the 0700 directory; as the mounting user it wrote its own.
+  ContainerIdsAsHostIds,
 }
 
 /// How hard links behave through a tested profile's file sharing — measured, since a workload that links a
@@ -159,6 +169,10 @@ pub enum HardLinkRule {
   /// A harness avoids it by not removing a linked file's first name while it reads another (git:
   /// `core.createObject=rename`).
   OtherNamesStaleAfterTheFirstIsRemoved,
+  /// Every name of a hard-linked file is served at once, the first removed or not: the bind is the host's own
+  /// FUSE mount, with no file sharing between. Measured 2026-10-01 through a Linux Docker Engine over a shared
+  /// mount: link, remove the first name, open the second — 0 of 100 failed.
+  EveryNameServedAtOnce,
 }
 
 /// The evidence a judged profile holds.
@@ -307,6 +321,12 @@ pub fn judge(profile: &RuntimeProfile, host: Host) -> Result<TestedProfile, Prof
       description: "Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing",
       identity: IdentityRule::HostUserThroughShare,
       hard_links: HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved,
+    }),
+    (Engine::DockerEngine, Endpoint::UnixSocket(_), Host::Linux) => Ok(TestedProfile {
+      test: TESTED_ON_LINUX_BY,
+      description: "a Docker Engine on its own Linux host over its local socket, binding the daemon's shared FUSE mount",
+      identity: IdentityRule::ContainerIdsAsHostIds,
+      hard_links: HardLinkRule::EveryNameServedAtOnce,
     }),
     _ => Err(ProfileRefusal::ProfileUntested {
       engine: profile.operating_system.clone(),

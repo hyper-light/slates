@@ -50,6 +50,12 @@ pub const COMM_FD_ENV: &str = "_FUSE_COMMFD";
 /// Format: the descriptor number the socket has in the helper: its standard input (0), where
 /// [`handshake`] places it.
 pub const COMM_FD_IN_CHILD: i32 = 0;
+/// Format: the part of fusermount3's refusal that names the operator's grant `allow_other` needs.
+const ALLOW_OTHER_REFUSAL: &str = "user_allow_other";
+/// Format: how much of the helper's standard error is read for its refusal: the atomic pipe write (`PIPE_BUF`,
+/// 4096 on Linux), which a one-line message fits whole.
+const HELPER_MESSAGE_BYTES: usize = 4096;
+
 /// Format: the fixed mount options slates always sets: the kernel checks permissions itself
 /// (`default_permissions`), and the subtype makes the mount's type `fuse.slates`. The source (`fsname`) is
 /// the caller's: the daemon's names the mount's attachment (`slates:<attachment>`, AUD-29-64).
@@ -118,12 +124,18 @@ pub enum MountError {
   /// The device the helper returned could not be used.
   #[cfg(target_os = "linux")]
   Channel(ChannelError),
+  /// The helper refused `allow_other`: the host's `/etc/fuse.conf` does not grant `user_allow_other`, an
+  /// operator's setting (§4.6). Read from the helper's own refusal, never from the file (R1).
+  AllowOtherNotGranted,
 }
 
 impl std::fmt::Display for MountError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
       Self::Socketpair { code } => write!(f, "socketpair refused (code {code:?})"),
+      Self::AllowOtherNotGranted => f.write_str(
+        "the mount helper refused allow_other: the host does not grant user_allow_other in /etc/fuse.conf",
+      ),
       Self::Spawn { code } => write!(
         f,
         "cannot spawn the mount helper (code {code:?}); is it installed?"
@@ -395,6 +407,8 @@ pub struct PendingHandshake {
   guard: HelperGuard,
   answered: bool,
   device: Option<OwnedFd>,
+  /// The helper's standard error, non-blocking: read once it has exited, for the reason it refused.
+  stderr: Option<std::process::ChildStderr>,
 }
 
 impl std::fmt::Debug for PendingHandshake {
@@ -426,19 +440,26 @@ pub fn begin_handshake(mut helper: Command) -> Result<PendingHandshake, MountErr
   rustix::io::ioctl_fionbio(&ours, true).map_err(|e| MountError::Recv {
     code: Some(e.raw_os_error()),
   })?;
-  let child = helper
+  let mut child = helper
     .stdin(Stdio::from(theirs))
+    .stderr(Stdio::piped())
     .env(COMM_FD_ENV, COMM_FD_IN_CHILD.to_string())
     .spawn()
     .map_err(|e| MountError::Spawn {
       code: e.raw_os_error(),
     })?;
   drop(helper);
+  let stderr = child.stderr.take();
+  if let Some(stderr) = &stderr {
+    // Read only after the helper has exited, without blocking on a helper that wrote nothing.
+    let _ = rustix::io::ioctl_fionbio(stderr, true);
+  }
   Ok(PendingHandshake {
     socket: ours,
     guard: HelperGuard(Some(child)),
     answered: false,
     device: None,
+    stderr,
   })
 }
 
@@ -474,6 +495,7 @@ impl PendingHandshake {
       Ok(None) => Progress::Waiting(Awaiting::Exit),
       Ok(Some(status)) => Progress::Done(match self.device.take() {
         Some(device) if status.success() => Ok(device),
+        _ if self.refused_allow_other() => Err(MountError::AllowOtherNotGranted),
         Some(_) => Err(MountError::Helper {
           exit: HelperExit::of(status),
         }),
@@ -483,6 +505,20 @@ impl PendingHandshake {
       }),
       Err(e) => Progress::Done(Err(e)),
     }
+  }
+
+  /// Whether the exited helper's refusal names `user_allow_other` (fusermount3's message: "option allow_other
+  /// only allowed if 'user_allow_other' is set in /etc/fuse.conf"). One pipe buffer is read, which holds the
+  /// helper's one-line refusal whole.
+  fn refused_allow_other(&mut self) -> bool {
+    let Some(stderr) = self.stderr.take() else {
+      return false;
+    };
+    let mut message = [0u8; HELPER_MESSAGE_BYTES];
+    let read = rustix::io::read(&stderr, &mut message).unwrap_or(0);
+    message
+      .get(..read)
+      .is_some_and(|bytes| String::from_utf8_lossy(bytes).contains(ALLOW_OTHER_REFUSAL))
   }
 
   /// The helper's process id while it is unreaped, for an owner's diagnostics (and the tests' proof

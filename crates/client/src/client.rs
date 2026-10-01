@@ -76,7 +76,9 @@ pub fn defers_reply(body: &RequestBody) -> bool {
     body,
     RequestBody::Land { grant: Some(_), .. }
       | RequestBody::Attach {
-        form: AttachRequest::FuseMount { .. } | AttachRequest::ScopedFuseMount { .. },
+        form: AttachRequest::FuseMount { .. }
+          | AttachRequest::ScopedFuseMount { .. }
+          | AttachRequest::SharedFuseMount { .. },
         ..
       }
   )
@@ -2056,6 +2058,28 @@ impl Client {
       AttachRequest::ScopedFuseMount {
         mount_point: mount_point.to_owned(),
         subtree: subtree.to_owned(),
+      },
+    )
+  }
+
+  /// Attaches a Linux FUSE mount at `mount_point` that other local users' processes may reach (`allow_other`):
+  /// what a container runtime binds into a container (§4.6 A-9). With `subtree`, only that directory. Refused
+  /// `AttachmentUnsupported{Fuse, AllowOtherNotGranted}` where the host's operator has not granted
+  /// `user_allow_other`.
+  pub fn attach_shared_fuse(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    mount_point: &str,
+    subtree: Option<&str>,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::SharedFuseMount {
+        mount_point: mount_point.to_owned(),
+        subtree: subtree.map(str::to_owned),
       },
     )
   }

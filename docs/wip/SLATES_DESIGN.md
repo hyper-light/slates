@@ -1934,6 +1934,11 @@ must exercise local communication and isolation between clones as well as namesp
 > `vhost-user-fs-pci` mounting the tag and exchanging files with the host. Owed: the live guest in CI, §6's workloads in
 > the guest.
 
+> **Status (2026-10-01, AUD-29-67/74: the Linux container profile).** On Linux a container binds the daemon's
+> shared FUSE mount (`slates mount --shared`, `allow_other`, granted by the operator's `user_allow_other`). Measured
+> through a Linux Docker Engine: container ids reach the export as themselves, and the kernel checks their bits
+> (`ContainerIdsAsHostIds`). Hard links are served at once. An unshared mount is refused `MountNotShared`.
+
 > **Status (2026-10-01, AC-9.7: live-guest workloads).** A live Linux guest under QEMU's vhost-user-fs ran the
 > conformance roster (git, cargo, npm, python, rg, rsync, sqlite, an editor, a watcher), and each came out identical
 > on the slates mount and on the guest's RAM. The vhost-user form reports `LiveGuestWorkloads` on Linux. CI runs

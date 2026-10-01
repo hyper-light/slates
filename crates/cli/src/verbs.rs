@@ -133,8 +133,17 @@ fn mount_verb(
   instance: &str,
   volume: VolumeId,
   path: &str,
-  (read_only, subtree): (bool, Option<&str>),
+  (read_only, subtree, shared): (bool, Option<&str>, bool),
 ) -> Result<(), Failure> {
+  // A container runtime reaches a macOS host mount through Docker Desktop's file sharing, as the mounting
+  // user (the runtime profile's identity rule), so nothing need be shared with other local users.
+  if shared {
+    return Err(Failure::Refused(
+      "--shared: a macOS host mount reaches a container through Docker Desktop's file sharing as the mounting \
+       user; --shared is the Linux FUSE mount's allow_other"
+        .to_owned(),
+    ));
+  }
   let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
   // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
   // ends with the kernel's `UMNT` when the mount is removed. A write mount takes the write lease
@@ -185,7 +194,7 @@ fn mount_verb(
   instance: &str,
   volume: VolumeId,
   path: &str,
-  (read_only, subtree): (bool, Option<&str>),
+  (read_only, subtree, shared): (bool, Option<&str>, bool),
 ) -> Result<(), Failure> {
   let real = std::fs::canonicalize(path)
     .map_err(|e| Failure::Failed(format!("the mount point {path}: {e}")))?;
@@ -196,9 +205,11 @@ fn mount_verb(
     Intent::Write
   };
   // `--subtree` presents one directory of the volume, held to it by the daemon on every request (AUD-29-76).
-  let attachment = match subtree {
-    Some(subtree) => client.attach_scoped_fuse(volume, intent, &real, subtree),
-    None => client.attach_fuse(volume, intent, &real),
+  // `--shared` lets other local users' processes (a container runtime's) reach the mount (`allow_other`).
+  let attachment = match (subtree, shared) {
+    (subtree, true) => client.attach_shared_fuse(volume, intent, &real, subtree),
+    (Some(subtree), false) => client.attach_scoped_fuse(volume, intent, &real, subtree),
+    (None, false) => client.attach_fuse(volume, intent, &real),
   }
   .map_err(|e| failure_of(e, instance))?;
   println!("mounted: {}", attachment.path.unwrap_or(real));
@@ -287,6 +298,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     path,
     read_only,
     subtree,
+    shared,
   } = &request.verb
   {
     return mount_verb(
@@ -294,7 +306,7 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
       &request.instance,
       *volume,
       path,
-      (*read_only, subtree.as_deref()),
+      (*read_only, subtree.as_deref(), *shared),
     );
   }
   // A container bind names its host mount point by the real path the kernel records (`mount_nfs`

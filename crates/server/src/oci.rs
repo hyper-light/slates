@@ -62,6 +62,14 @@ impl Binding {
       .ok_or(Refusal::Forbidden {
         verb: "OCI source mount".to_owned(),
       })?;
+    // On Linux a container's processes reach the source as their own ids, so the source must be a mount shared
+    // with other users (`allow_other`): a FUSE mount the daemon made for its user alone would answer them EACCES.
+    if self.attachment.is_some() && !parent.form.shared_with_other_users() {
+      return Err(Refusal::AttachmentUnsupported {
+        transport: AttachTransport::Oci,
+        reason: UnsupportedReason::MountNotShared,
+      });
+    }
     Ok(Consumer::Mount {
       attachment: parent.id,
     })

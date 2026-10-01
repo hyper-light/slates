@@ -143,8 +143,9 @@ fn mount_work_and_detach(
     "{removed:?}; refusals {:?}",
     daemon.refusals_on_every_shard()
   );
-  // The container bind of this mount: its source authority is built (the table names this attachment, held
-  // to the record), but no container workload has run through it, so it is refused typed (AUD-29-64).
+  // The container bind of this mount: its source authority is verified (the table names this attachment, held
+  // to the record), but the mount was made for its user alone, so a container's ids could not reach it: refused
+  // `MountNotShared` (a `--shared` mount is the bind source; `a_linux_container_reaches_the_shared_mount_as_its_own_ids`).
   let bind = client.attach_with(
     volume,
     None,
@@ -158,7 +159,7 @@ fn mount_work_and_detach(
     matches!(
       bind,
       Err(ClientError::Refused(Refusal::AttachmentUnsupported {
-        reason: slates_client::UnsupportedReason::ContainerWorkloadUnproven,
+        reason: slates_client::UnsupportedReason::MountNotShared,
         ..
       }))
     ),

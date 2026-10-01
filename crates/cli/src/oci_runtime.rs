@@ -254,6 +254,9 @@ fn identity_text(rule: IdentityRule) -> &'static str {
     IdentityRule::HostUserThroughShare => {
       "host_user_through_share (container ids are not forwarded; the attachment's capability is the authority)"
     }
+    IdentityRule::ContainerIdsAsHostIds => {
+      "container_ids_as_host_ids (no remapping; the kernel checks each id's permission bits, container root bypasses them)"
+    }
   }
 }
 
@@ -263,6 +266,7 @@ fn hard_link_text(rule: HardLinkRule) -> &'static str {
     HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved => {
       "other_names_stale_after_the_first_is_removed (until the guest revalidates; git: core.createObject=rename)"
     }
+    HardLinkRule::EveryNameServedAtOnce => "every_name_served_at_once",
   }
 }
 
