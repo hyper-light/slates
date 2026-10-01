@@ -905,3 +905,122 @@ fn assert_a_subtree_must_be_a_directory(client: &mut Client, volume: VolumeId) {
     );
   }
 }
+
+/// Takes a snapshot of `volume`: its id.
+#[cfg(unix)]
+fn snapshot_of(client: &mut Client, volume: VolumeId) -> slates_ipc::protocol::SnapshotId {
+  let ReplyBody::Snapshotted { id, .. } = client.call(&RequestBody::Snapshot { volume }) else {
+    panic!("snapshot");
+  };
+  id
+}
+
+/// `advance(attachment, version)`: the version now presented and the paths invalidated, or the refusal.
+#[cfg(unix)]
+fn advance(
+  client: &mut Client,
+  attachment: u64,
+  version: u64,
+) -> Result<(u64, Vec<String>), Refusal> {
+  match client.call(&RequestBody::Advance {
+    attachment,
+    version: Some(version),
+  }) {
+    ReplyBody::Advanced {
+      version,
+      invalidated,
+    } => Ok((version, invalidated)),
+    ReplyBody::Refused { refusal, .. } => Err(refusal),
+    other => panic!("advance answered {other:?}"),
+  }
+}
+
+/// AUD-29-76 (`advance` of a snapshot mount). Do: write `before` into `f`, snapshot (`first`), rewrite
+/// `f` `middle`, snapshot (`second`), rewrite `f` `after!`; mount `first` read-only; advance the attachment to a
+/// snapshot that does not exist, then to `second`; read through the same capability; destroy each snapshot;
+/// restart the daemon over the same anchor segment and read again. Expect: the missing snapshot is refused and
+/// the mount still reads `before`; the advance answers `second` and names `/f` alone (neither the root nor anything else changed);
+/// the same capability then reads `middle`, never the head's `after!`; `first` is unpinned (destroyable) and
+/// `second` pinned (`Pinned`); after the restart the mount still presents `second`. Before 2026-10-01 a snapshot
+/// mount could not move (`advance` answered `NotGreen`).
+#[cfg(unix)]
+#[test]
+fn a_snapshot_mount_advances_to_a_later_snapshot_and_names_what_changed() {
+  use common::anchor::{anchor_segment, source_of};
+  let profile = common::machine_profile();
+  let instance = format!("srv-snapshot-advance-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("snapshot-advance", &profile, &config);
+  let first_daemon = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first_daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let Some(port) = first_daemon.nfs_port() else {
+    eprintln!("SKIP: the loopback export did not bind, so no host mount is offered here");
+    return;
+  };
+  let mut client = Client::connect(&instance);
+  let Rewritten {
+    volume,
+    snapshot: first,
+    mut stream,
+    file,
+  } = rewritten_after_a_snapshot(&first_daemon, &mut client, port, "advancing");
+  common::nfs::write(&mut stream, &file, b"middle", 10);
+  let second = snapshot_of(&mut client, volume);
+  common::nfs::write(&mut stream, &file, b"after!", 11);
+  let (attachment, path) = snapshot_mount(&mut client, volume, first, "advancing");
+  advance_and_check_the_pins(
+    &mut client,
+    port,
+    (attachment, &path),
+    volume,
+    (first, second),
+  );
+  drop(stream);
+  drop(client);
+  first_daemon.stop();
+
+  let second_daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second_daemon
+    .nfs_port()
+    .expect("the second daemon serves NFS");
+  assert_eq!(
+    read_through_the_mount(port, &path, "f"),
+    b"middle",
+    "the re-pin was recorded and its view rebuilt"
+  );
+  second_daemon.stop();
+  drop(segment);
+}
+
+/// The mount of `first` at `path` reads `before`; an advance to a missing snapshot is refused and changes
+/// nothing; the advance to `second` names `/f` alone and the mount then reads `middle`; `first` is unpinned
+/// and `second` pinned.
+#[cfg(unix)]
+fn advance_and_check_the_pins(
+  client: &mut Client,
+  port: u16,
+  (attachment, path): (u64, &str),
+  volume: VolumeId,
+  (first, second): (
+    slates_ipc::protocol::SnapshotId,
+    slates_ipc::protocol::SnapshotId,
+  ),
+) {
+  assert_eq!(read_through_the_mount(port, path, "f"), b"before");
+  assert!(advance(client, attachment, second.value ^ 1).is_err());
+  assert_eq!(read_through_the_mount(port, path, "f"), b"before");
+  assert_eq!(
+    advance(client, attachment, second.value),
+    Ok((second.value, vec!["/f".to_owned()]))
+  );
+  assert_eq!(read_through_the_mount(port, path, "f"), b"middle");
+  let destroy =
+    |client: &mut Client, snapshot| client.call(&RequestBody::DestroySnapshot { volume, snapshot });
+  assert!(matches!(
+    destroy(client, first),
+    ReplyBody::SnapshotDestroyed
+  ));
+  assert!(matches!(destroy(client, second), ReplyBody::Refused { .. }));
+}

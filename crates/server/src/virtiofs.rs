@@ -22,6 +22,10 @@
 //! [`guest_transport_capabilities`] over the wire through `crate::transports`, fact for fact, and a
 //! guest form asked for over the ring is refused typed there (no seam rides the ring). A guest device
 //! is never a privilege: no mount, no socket on disk, no directory (R10).
+//!
+//! A device presents what its [`GuestView`] names (AUD-29-76): the head, one directory of it (served through
+//! `ScopedBridge`, so nothing outside is reached), or a snapshot read-only (its own view, admitted with no
+//! write, closed with the device).
 
 use std::future::Future;
 
@@ -33,7 +37,7 @@ use slates_bridge_virtiofs::capability::{TransportCapability, host_capability};
 use slates_bridge_virtiofs::device::{DeviceConfig, FsTag};
 use slates_bridge_virtiofs::serve::{BridgeAccess, LoopError, ServeEnd, register, serve_loop};
 use slates_db::catalog::{Principal, VolumeId as DbVolumeId};
-use slates_ipc::protocol::VolumeId;
+use slates_ipc::protocol::{Refusal, VolumeId};
 use slates_mem::Slab;
 use slates_rt::control::Control;
 use slates_rt::error::RtError;
@@ -57,6 +61,20 @@ pub enum GuestDeviceOutcome {
   LoopRefused(LoopError),
   /// The loop ended: why, and what the terminal step reclaimed.
   Ended(ServeEnd),
+  /// The view asked for was refused before admission (typed, AUD-29-76): a subtree naming nothing or no
+  /// directory, a snapshot that is gone or of an overlay, or both at once. The seam was released.
+  ViewRefused(Refusal),
+}
+
+/// What a guest device presents of its volume (§4.4 `attach(volume|snapshot, ...)`, §4.6 scoped exports;
+/// AUD-29-76): the head (the default), one directory of it, or a snapshot read-only. A subtree of a snapshot
+/// is refused, as for a host mount.
+#[derive(Clone, Debug, Default)]
+pub struct GuestView {
+  /// The directory presented, as a path from the volume's root: the device's root, nothing outside it reached.
+  pub subtree: Option<String>,
+  /// The snapshot presented, read-only, through the device's own copy-on-write view that pins it.
+  pub snapshot: Option<slates_ipc::protocol::SnapshotId>,
 }
 
 /// The harness's callback for the outcome.
@@ -77,6 +95,19 @@ pub fn guest_transport_capabilities() -> Vec<TransportCapability> {
 struct ShardBridge {
   volume: DbVolumeId,
   handles: Slab<u64>,
+  /// The directory the device presents, if one (AUD-29-76).
+  scope: Option<u64>,
+  /// The device's snapshot view, by its key in the shard's guest views, if it presents one.
+  view: Option<u64>,
+}
+
+impl ShardBridge {
+  /// Closes the device's snapshot view, if it has one (its loop's end, or a refusal).
+  fn close_view(&mut self) {
+    if let Some(key) = self.view.take() {
+      let _ = state::with_state(|s| crate::snapshot_view::end_guest(s, key));
+    }
+  }
 }
 
 impl BridgeAccess for ShardBridge {
@@ -85,6 +116,7 @@ impl BridgeAccess for ShardBridge {
     f: impl FnOnce(&mut dyn Bridge, &mut slates_bridge_core::Attachments) -> R,
   ) -> Result<R, VfsError> {
     let volume = self.volume;
+    let (scope, view) = (self.scope, self.view);
     let handles = &mut self.handles;
     state::with_state(|s| {
       let handle = *s.by_id.get(&volume)?;
@@ -92,20 +124,38 @@ impl BridgeAccess for ShardBridge {
         store,
         volumes,
         attachments,
+        guest_views,
         ..
       } = s;
-      let slot = volumes.get_mut(handle).ok()?;
-      let mut bridge = VolumeBridge::attached(
-        volume,
-        &mut slot.volume,
-        store,
-        handles,
-        slot
-          .host
-          .as_mut()
-          .map(|host| host as &mut dyn slates_vfs::host::HostFs),
-      );
-      Some(f(&mut bridge, attachments))
+      // A snapshot device serves its own read-only view; every other device, the volume's head.
+      let mut bridge = match view {
+        Some(key) => {
+          let view = guest_views.get_mut(&key)?;
+          VolumeBridge::attached(volume, &mut view.volume, store, handles, None)
+        }
+        None => {
+          let slot = volumes.get_mut(handle).ok()?;
+          VolumeBridge::attached(
+            volume,
+            &mut slot.volume,
+            store,
+            handles,
+            slot
+              .host
+              .as_mut()
+              .map(|host| host as &mut dyn slates_vfs::host::HostFs),
+          )
+        }
+      };
+      let mut scoped;
+      let served: &mut dyn Bridge = match scope {
+        Some(scope) => {
+          scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+          &mut scoped
+        }
+        None => &mut bridge,
+      };
+      Some(f(served, attachments))
     })
     .flatten()
     .ok_or(VfsError::NotFound)
@@ -154,6 +204,7 @@ const BARRIER_REFUSED: &str = "virtiofs.barrier_refused";
 async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   volume: DbVolumeId,
   tag: FsTag,
+  view: GuestView,
   mut seam: S,
   on_end: OnEnd,
 ) {
@@ -170,6 +221,26 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
     on_end(GuestDeviceOutcome::VolumeUnknown);
     return;
   };
+  let mut bridge = match state::with_state(|s| open_view(s, volume, &view)) {
+    Some(Ok((scope, view))) => ShardBridge {
+      volume,
+      handles: new_handle_store(),
+      scope,
+      view,
+    },
+    Some(Err(refusal)) => {
+      seam.release();
+      on_end(GuestDeviceOutcome::ViewRefused(refusal));
+      return;
+    }
+    None => {
+      seam.release();
+      on_end(GuestDeviceOutcome::VolumeUnknown);
+      return;
+    }
+  };
+  // A snapshot is immutable: its device is admitted with no write, whatever the access list grants.
+  let writable = bridge.view.is_none();
   let request = GuestAttachRequest {
     transport: GuestTransport::InProcess,
     volume,
@@ -182,7 +253,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
     let granted = rights_of(&record, principal);
     Rights {
       read: granted.read,
-      write: granted.write,
+      write: granted.write && writable,
     }
   };
   // Admitted into the owner shard's attachment registry — the one every transport on the volume
@@ -205,6 +276,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   let mut admitted = match admission {
     Some(Ok(admitted)) => admitted,
     Some(Err(refused)) => {
+      bridge.close_view();
       on_end(GuestDeviceOutcome::Refused(refused.error));
       return;
     }
@@ -212,13 +284,10 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
       if let Some(mut seam) = seam_slot.take() {
         seam.release();
       }
+      bridge.close_view();
       on_end(GuestDeviceOutcome::VolumeUnknown);
       return;
     }
-  };
-  let mut bridge = ShardBridge {
-    volume,
-    handles: new_handle_store(),
   };
   let id = match register(bound) {
     Ok(id) => id,
@@ -234,6 +303,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
       if !reclaimed.is_ok_and(|r| r.references_swept) {
         let _ = state::with_state(|s| *s.refusals.entry(RECLAIM_INCOMPLETE).or_insert(0) += 1);
       }
+      bridge.close_view();
       on_end(GuestDeviceOutcome::LoopRefused(refused));
       return;
     }
@@ -241,9 +311,47 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   // The device is known to its consumer's revocation for as long as its loop runs (AUD-29-73).
   let consumer = admitted.consumer().clone();
   let _ = state::with_state(|s| s.guest_devices.push((id, consumer)));
+  let view_key = bridge.view;
   let end = serve_loop(id, admitted, bridge).await;
-  let _ = state::with_state(|s| s.guest_devices.retain(|(device, _)| *device != id));
+  // The loop's terminal step has swept the device's references through the view; now it closes.
+  let _ = state::with_state(|s| {
+    s.guest_devices.retain(|(device, _)| *device != id);
+    if let Some(key) = view_key {
+      crate::snapshot_view::end_guest(s, key);
+    }
+  });
   on_end(GuestDeviceOutcome::Ended(end));
+}
+
+/// Resolves what a device presents, before admission: the scope's inode (a subtree of the head) and the key of
+/// its snapshot view (opened here, pinning the snapshot). Refused typed with nothing opened.
+fn open_view(
+  s: &mut ShardState,
+  volume: DbVolumeId,
+  view: &GuestView,
+) -> Result<(Option<u64>, Option<u64>), Refusal> {
+  match (&view.subtree, view.snapshot) {
+    (Some(_), Some(_)) => Err(Refusal::AttachmentUnsupported {
+      transport: slates_ipc::protocol::AttachTransport::VirtioFsInProcess,
+      reason: slates_ipc::protocol::UnsupportedReason::SnapshotNotPresentedByHostMount,
+    }),
+    (Some(subtree), None) => {
+      crate::verbs::resolve_scope(s, volume, subtree).map(|scope| (Some(scope), None))
+    }
+    (None, Some(snapshot)) => {
+      let names = s
+        .db
+        .partition()
+        .volume(volume)
+        .map_or(slates_ipc::protocol::NamePolicy::Exact, |record| {
+          crate::verbs::wire_names(record.policy.names)
+        });
+      let key =
+        crate::snapshot_view::open_guest(s, volume, crate::verbs::core_snapshot(snapshot), names)?;
+      Ok((None, Some(key)))
+    }
+    (None, None) => Ok((None, None)),
+  }
 }
 
 /// Asks every device loop this shard serves for `consumer` to revoke (§4.13; AUD-29-73). Run by the consumer's
@@ -273,13 +381,15 @@ impl Daemon {
       }))
   }
 
-  /// Attaches a guest device to `volume` under `tag` over the harness's `seam`, served on the
-  /// volume's owning shard for its whole life; the outcome reaches the harness through `on_end`.
+  /// Attaches a guest device to `volume` under `tag` over the harness's `seam`, presenting `view` (the head, a
+  /// subtree, or a snapshot read-only), served on the volume's owning shard for its whole life; the outcome
+  /// reaches the harness through `on_end`.
   /// Refuses typed only when the owner shard cannot be reached (gone, or its control channel full).
   pub fn attach_guest_device<S: VmmSeam + Send + 'static>(
     &self,
     volume: VolumeId,
     tag: FsTag,
+    view: GuestView,
     seam: S,
     on_end: OnEnd,
   ) -> Result<(), ServerError> {
@@ -288,7 +398,7 @@ impl Daemon {
       bytes: volume.bytes,
     };
     let task = SpawnRequest::new(
-      Box::pin(serve_guest_device(device, tag, seam, on_end)),
+      Box::pin(serve_guest_device(device, tag, view, seam, on_end)),
       None,
     );
     registry::send_control(shard, Control::Spawn(Box::new(task))).map_err(ServerError::Runtime)

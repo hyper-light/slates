@@ -20,10 +20,17 @@
 //! destroy, which unpins the snapshot. A restart rebuilds the views of the recorded snapshot attachments after
 //! the volumes and their pins are recovered. A volume over a host base (an overlay) presents base content the
 //! snapshot does not hold, so its snapshots are refused typed rather than presented partly.
+//!
+//! Moving. `advance` re-pins a mount to another snapshot (§4.4 `Bound → Advancing → Bound`): the new view is
+//! opened, the move recorded (`Op::AttachmentRepinned`, which moves the mount's container binds with it), the
+//! views swapped and the old closed, and the reply names the paths that differ
+//! (`Volume::paths_changed_between`). A guest device's view (`crate::virtiofs::GuestView`) is kept apart, in
+//! the shard's `guest_views`, opened and closed with the device; it has no record, so it does not move.
 
 use slates_db::catalog::{AttachmentRecord, Consumer, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{AttachTransport, NamePolicy, Refusal, SizeClass, UnsupportedReason};
 use slates_mem::budget::MetadataCredit;
+use slates_vfs::clock::Clock;
 use slates_vfs::ids::SnapshotId;
 use slates_vfs::volume::Volume;
 
@@ -140,7 +147,8 @@ pub(crate) fn end(state: &mut ShardState, attachment: u64) {
   }
 }
 
-/// Ends every view of volume `origin` (before its destroy, which frees the snapshots they pin).
+/// Ends every view of volume `origin`, a mount's or a guest device's (before its destroy, which frees the
+/// snapshots they pin). A guest device whose view is gone is answered `NotFound` from then on.
 pub(crate) fn end_all_of(state: &mut ShardState, origin: DbVolumeId) {
   let attachments: Vec<u64> = state
     .snapshot_views
@@ -150,6 +158,36 @@ pub(crate) fn end_all_of(state: &mut ShardState, origin: DbVolumeId) {
     .collect();
   for attachment in attachments {
     end(state, attachment);
+  }
+  let guests: Vec<u64> = state
+    .guest_views
+    .iter()
+    .filter(|(_, view)| view.origin == origin)
+    .map(|(key, _)| *key)
+    .collect();
+  for key in guests {
+    end_guest(state, key);
+  }
+}
+
+/// Opens a view of `snapshot` of `origin` for a guest device: its key in the shard's guest views.
+pub(crate) fn open_guest(
+  state: &mut ShardState,
+  origin: DbVolumeId,
+  snapshot: SnapshotId,
+  names: NamePolicy,
+) -> Result<u64, Refusal> {
+  let view = open(state, origin, snapshot, names)?;
+  let key = state.next_guest_view;
+  state.next_guest_view = key.saturating_add(1);
+  state.guest_views.insert(key, view);
+  Ok(key)
+}
+
+/// Ends the guest view under `key`, if it is still open.
+pub(crate) fn end_guest(state: &mut ShardState, key: u64) {
+  if let Some(view) = state.guest_views.remove(&key) {
+    close(state, view);
   }
 }
 
@@ -196,4 +234,101 @@ pub(crate) fn rebuild(state: &mut ShardState) -> usize {
     }
   }
   rebuilt
+}
+
+/// `advance(attachment, version?)` of a snapshot mount (§4.4 "immutable readers may `Bound → Advancing →
+/// Bound`"; AUD-29-76): re-pins the mount, and every container bind borrowing it, to snapshot `version` (its
+/// wire value) or, with none, to the volume's newest snapshot; names the paths the move invalidates
+/// (`Volume::paths_changed_between`). The new view is opened first (pinning its snapshot), so a refusal
+/// changes nothing; the move is recorded as one operation before the views swap, so a restart rebuilds the
+/// new one; the old view is closed last, unpinning its snapshot. A request is served whole within one shard
+/// turn, so none spans the swap: every request is answered from the old view or the new, never both.
+pub(crate) fn advance(
+  state: &mut ShardState,
+  record: &AttachmentRecord,
+  version: Option<u64>,
+) -> slates_ipc::protocol::ReplyBody {
+  match advanced(state, record, version) {
+    Ok((version, invalidated)) => slates_ipc::protocol::ReplyBody::Advanced {
+      version,
+      invalidated,
+    },
+    Err(refusal) => crate::verbs::refused(refusal),
+  }
+}
+
+/// [`advance`]'s work: the snapshot now presented (its wire value) and the paths invalidated.
+fn advanced(
+  state: &mut ShardState,
+  record: &AttachmentRecord,
+  version: Option<u64>,
+) -> Result<(u64, Vec<String>), Refusal> {
+  let current = record.snapshot.ok_or(Refusal::NotFound)?;
+  let target = match version {
+    Some(value) => slates_db::catalog::SnapshotId { value },
+    None => newest_snapshot(state, record.volume).ok_or(Refusal::NotFound)?,
+  };
+  if target == current {
+    return Ok((target.value, Vec::new()));
+  }
+  let wire = |id: slates_db::catalog::SnapshotId| {
+    crate::verbs::core_snapshot(slates_ipc::protocol::SnapshotId { value: id.value })
+  };
+  let names = state
+    .db
+    .partition()
+    .volume(record.volume)
+    .map_or(NamePolicy::Exact, |volume| {
+      crate::verbs::wire_names(volume.policy.names)
+    });
+  let view = open(state, record.volume, wire(target), names)?;
+  let invalidated = match invalidated_between(state, record.volume, wire(current), wire(target)) {
+    Ok(paths) => paths,
+    Err(refusal) => {
+      close(state, view);
+      return Err(refusal);
+    }
+  };
+  let now = state.clock.monotonic_ns();
+  let op = slates_db::op::Op::AttachmentRepinned {
+    id: record.id,
+    snapshot: target,
+  };
+  if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+    close(state, view);
+    return Err(crate::error::refusal_of_db(&e));
+  }
+  if let Some(old) = state.snapshot_views.insert(record.id, view) {
+    close(state, old);
+  }
+  Ok((target.value, invalidated))
+}
+
+/// The newest snapshot of `volume` the catalog records (the highest sealed epoch).
+fn newest_snapshot(
+  state: &ShardState,
+  volume: DbVolumeId,
+) -> Option<slates_db::catalog::SnapshotId> {
+  state
+    .db
+    .partition()
+    .snapshots_of(volume)
+    .into_iter()
+    .max_by_key(|snapshot| snapshot.epoch)
+    .map(|snapshot| snapshot.id)
+}
+
+/// The paths that differ between snapshots `from` and `to` of `volume`, as its owner holds them.
+fn invalidated_between(
+  state: &ShardState,
+  volume: DbVolumeId,
+  from: SnapshotId,
+  to: SnapshotId,
+) -> Result<Vec<String>, Refusal> {
+  let handle = *state.by_id.get(&volume).ok_or(Refusal::NotFound)?;
+  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  slot
+    .volume
+    .paths_changed_between(&state.store, from, to)
+    .map_err(|e| crate::error::refusal_of_vfs(&e))
 }

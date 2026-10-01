@@ -294,6 +294,14 @@ pub enum Op {
     /// The destroyed volume.
     id: VolumeId,
   },
+  /// A snapshot mount was re-pinned (§4.4 `Bound → Advancing → Bound`; AUD-29-76): the attachment, and every
+  /// container bind borrowing it, now presents `snapshot`. Appended.
+  AttachmentRepinned {
+    /// The attachment.
+    id: u64,
+    /// The snapshot it now presents.
+    snapshot: crate::catalog::SnapshotId,
+  },
 }
 
 impl Op {
@@ -342,6 +350,7 @@ impl Op {
       Op::NfsClientCleared { .. } => "nfs_client_cleared",
       Op::NfsInstanceAdvanced { .. } => "nfs_instance_advanced",
       Op::VolumeRebased { .. } => "volume_rebased",
+      Op::AttachmentRepinned { .. } => "attachment_repinned",
     }
   }
 }

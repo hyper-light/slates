@@ -4571,17 +4571,24 @@ fn scope_of(
   let Some(subtree) = form.subtree() else {
     return Ok(None);
   };
-  let handle = *state
-    .by_id
-    .get(&to_db_volume(volume))
-    .ok_or(Refusal::NotFound)?;
+  resolve_scope(state, to_db_volume(volume), subtree).map(Some)
+}
+
+/// The inode of directory `subtree` of `volume` in its head: the scope a scoped mount or a scoped guest device
+/// presents (AUD-29-76). Refused typed when the path names nothing or no directory.
+pub(crate) fn resolve_scope(
+  state: &ShardState,
+  volume: DbVolumeId,
+  subtree: &str,
+) -> Result<u64, Refusal> {
+  let handle = *state.by_id.get(&volume).ok_or(Refusal::NotFound)?;
   let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
   let located = slot
     .volume
     .resolve(&state.store, subtree)
     .map_err(|e| refusal_of_vfs(&e))?;
   match located.child {
-    slates_vfs::dir::Child::Dir(_) => Ok(Some(located.inode.0)),
+    slates_vfs::dir::Child::Dir(_) => Ok(located.inode.0),
     _ => Err(refusal_of_vfs(&slates_vfs::VfsError::NotDirectory)),
   }
 }

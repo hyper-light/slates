@@ -2516,6 +2516,8 @@ fn init_shard(
     fuse_mounts: std::collections::BTreeMap::new(),
     stale_fuse_mounts: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
+    guest_views: std::collections::BTreeMap::new(),
+    next_guest_view: 0,
     #[cfg(unix)]
     guest_devices: Vec::new(),
     clock,

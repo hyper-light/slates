@@ -23,7 +23,7 @@ use slates_db::catalog::Principal;
 use slates_ipc::protocol::VolumeId;
 use slates_rt::readiness::readable;
 use slates_server::Daemon;
-use slates_server::virtiofs::GuestDeviceOutcome;
+use slates_server::virtiofs::{GuestDeviceOutcome, GuestView};
 
 /// Shape: how long the test waits for the guest and the device loop to report.
 pub(crate) const WAIT: Duration = Duration::from_secs(20);
@@ -346,6 +346,7 @@ pub(crate) fn start_guest<R: Send + 'static>(
   daemon: &Daemon,
   volume: VolumeId,
   consumer: Principal,
+  view: GuestView,
   script: impl FnOnce(
     OwnedFd,
     OwnedFd,
@@ -361,6 +362,7 @@ pub(crate) fn start_guest<R: Send + 'static>(
     .attach_guest_device(
       volume,
       FsTag::new("slates").unwrap(),
+      view,
       PipeVmm {
         kick_read,
         call_write,
@@ -397,7 +399,23 @@ pub(crate) fn run_guest<R: Send + 'static>(
   + Send
   + 'static,
 ) -> (GuestDeviceOutcome, R) {
-  let guest = start_guest(daemon, volume, consumer, script);
+  run_guest_viewing(daemon, volume, consumer, GuestView::default(), script)
+}
+
+/// [`run_guest`] with the device presenting `view` (a subtree, or a snapshot read-only).
+pub(crate) fn run_guest_viewing<R: Send + 'static>(
+  daemon: &Daemon,
+  volume: VolumeId,
+  consumer: Principal,
+  view: GuestView,
+  script: impl FnOnce(
+    OwnedFd,
+    OwnedFd,
+  ) -> std::pin::Pin<Box<dyn std::future::Future<Output = R> + Send>>
+  + Send
+  + 'static,
+) -> (GuestDeviceOutcome, R) {
+  let guest = start_guest(daemon, volume, consumer, view, script);
   let result = guest
     .script
     .recv_timeout(WAIT)

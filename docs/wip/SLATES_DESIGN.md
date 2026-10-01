@@ -1918,8 +1918,13 @@ must exercise local communication and isolation between clones as well as namesp
 > (`slates mount ID DIR --subtree DIR`; NFS on macOS, FUSE on Linux). The export enforces the scope: the
 > directory is the root and its own `..`, and every handle outside it is answered `NotFound`, forged ones included.
 > The scope is recorded by the directory's inode, so a rename neither widens it nor moves it. A subtree naming a
-> file or nothing is refused before any effect, and a snapshot of a subtree is refused typed. An `advance` of a
-> mounted snapshot view is owed.
+> file or nothing is refused before any effect, and a snapshot of a subtree is refused typed.
+
+> **Status (2026-10-01, AUD-29-76: advance, guest views, container scoping).** `advance` moves a snapshot mount, and
+> every container bind on it, to another snapshot. The new view is opened first, the move is recorded as one operation,
+> and the views then swap, so no request mixes the two. It names exactly the paths that differ, from a diff of the two
+> inode tables that enters only the nodes the span copied. A guest device presents a subtree or a snapshot, chosen at
+> attach; a guest view cannot yet advance. A container bound to a scoped mount sees only that directory.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

@@ -268,6 +268,60 @@ pub fn walk_since(
   }
 }
 
+/// One inode's record before and after a span: `None` on a side whose table has no such number.
+pub type ChangedRecord = (Option<Handle<Inode>>, Option<Handle<Inode>>);
+
+/// The inodes whose records differ between the tables under `before` and `after`, as pairs of the record each
+/// holds (`None` where one has no such number): added, removed or changed. A node both tables share is the
+/// same handle (path copying by birth epoch, D-5), so it is never entered: the walk is proportional to the
+/// nodes the span copied, not to the volume. A slot that is a node on one side and empty (or an inode) on the
+/// other is expanded against nothing, so every record under it is reported one-sided.
+pub fn changed(
+  nodes: &Slab<TrieNode>,
+  before: Handle<TrieNode>,
+  after: Handle<TrieNode>,
+  out: &mut Vec<ChangedRecord>,
+) {
+  let mut stack = vec![(Slot::Node(before), Slot::Node(after))];
+  while let Some((left, right)) = stack.pop() {
+    if left == right {
+      continue;
+    }
+    let left_inode = match left {
+      Slot::Inode(handle) => Some(handle),
+      _ => None,
+    };
+    let right_inode = match right {
+      Slot::Inode(handle) => Some(handle),
+      _ => None,
+    };
+    if left_inode.is_some() || right_inode.is_some() {
+      out.push((left_inode, right_inode));
+    }
+    let left_children = children_of(nodes, left);
+    let right_children = children_of(nodes, right);
+    if left_children.is_none() && right_children.is_none() {
+      continue;
+    }
+    let empty = [Slot::Empty; FANOUT];
+    let left_children = left_children.unwrap_or(empty);
+    let right_children = right_children.unwrap_or(empty);
+    for (l, r) in left_children.into_iter().zip(right_children) {
+      if l != r {
+        stack.push((l, r));
+      }
+    }
+  }
+}
+
+/// The slots beneath `slot` when it is a node.
+fn children_of(nodes: &Slab<TrieNode>, slot: Slot) -> Option<[Slot; FANOUT]> {
+  match slot {
+    Slot::Node(handle) => nodes.get(handle).ok().map(|node| node.slots),
+    _ => None,
+  }
+}
+
 /// Every trie node reachable from `root`, for a destroy walk.
 pub fn nodes_under(
   nodes: &Slab<TrieNode>,

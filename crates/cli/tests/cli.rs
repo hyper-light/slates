@@ -3407,3 +3407,58 @@ fn the_subtree_mount_presents_shared(instance: &str, id: &str, inner: &str, root
   shell(&format!("printf landed > {inner}/h"));
   assert_eq!(shell(&format!("cat {root}/shared/h")), "landed");
 }
+
+/// Format: lists the bind (`$1`) and writes one file through it, from inside the container.
+const SUBTREE_SCRIPT: &str =
+  "ls -A \"$1\" && cat \"$1/g\" && echo && printf from-container > \"$1/c\"";
+
+/// AUD-29-76 (a subtree through the container bind). Do: through Docker Desktop, mount a volume whole and make
+/// `shared/g` and `private/secret`; mount `/shared` alone (`--subtree`); bind that mount into a container (the OCI
+/// form) and, inside it, list the bind, read `g`, write `c`. Expect: the bind is admitted on the scoped mount;
+/// the container sees `g` alone and its bytes, never `private`; its write lands in `shared` as the whole mount
+/// sees it. Before 2026-10-01 a container could be given only the whole volume (a bind of a directory inside a
+/// mount is refused `NotAMountPoint`). Gated like T-4.13.
+#[test]
+fn a_container_bound_to_a_subtree_mount_sees_only_that_directory() {
+  let Some(server) = container_leg_gate() else {
+    return;
+  };
+  eprintln!("AUD-29-76 subtree bind over {server}");
+  let instance = format!("cli-oci-sub-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "ocisub", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let whole = MountPoint {
+    path: fresh_mount_point(),
+  };
+  mount_and_check(&instance, &id, &whole.path);
+  let root = &whole.path;
+  shell(&format!(
+    "mkdir {root}/shared {root}/private && printf inside > {root}/shared/g && printf hidden > {root}/private/secret"
+  ));
+  let scoped = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(
+    &instance,
+    &["mount", &id, &scoped.path, "--subtree", "/shared"],
+  );
+  assert_eq!(code, 0, "slates mount --subtree: {err}");
+  let binding = attach_oci(&instance, &id, &scoped.path, "--write");
+  let entry = binding["established"]["binding"]["mount"].clone();
+  let (code, out, err) = run_in_container(&entry, SUBTREE_SCRIPT, "subtree")
+    .unwrap_or_else(|why| panic!("the container did not run: {why}"));
+  assert_eq!(code, 0, "the container worked through the bind: {err}");
+  assert_eq!(out, "g\ninside\n", "the container sees the subtree alone");
+  assert_eq!(shell(&format!("cat {root}/shared/c")), "from-container");
+  detach_all(&instance, &[binding["attachment"].as_u64().unwrap()]);
+  let _ = unmount_after_container(&instance, &scoped.path);
+  let _ = unmount_after_container(&instance, &whole.path);
+  drop(scoped);
+  drop(whole);
+  drop(anchor);
+}

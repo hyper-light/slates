@@ -2510,6 +2510,123 @@ impl Volume {
     Ok(self.inode_in(store, id, no)?.multi)
   }
 
+  /// The paths whose content, attributes or names differ between snapshots `from` and `to` (§4.4 `advance`
+  /// of an immutable reader: "invalidates old caches"; AUD-29-76), sorted. Each path changed itself; nothing
+  /// is implied beneath a directory:
+  /// - an inode whose record differs is named by its path in each snapshot that holds it, so a rename names
+  ///   its old and its new path and a directory whose entries changed names itself;
+  /// - a directory whose path differs (moved or renamed) also names every path beneath it in both snapshots,
+  ///   since the records inside did not change but their paths did;
+  /// - a changed node with several names is named by all of them, found by one walk of each snapshot, taken
+  ///   only when such a node changed.
+  ///
+  /// The diff enters only the inode-table nodes the span copied ([`trie::changed`]); the walks are of the moved
+  /// subtrees, or of the trees when a hard-linked node changed.
+  pub fn paths_changed_between(
+    &self,
+    store: &Store,
+    from: SnapshotId,
+    to: SnapshotId,
+  ) -> Result<Vec<String>, VfsError> {
+    let root_of = |id: SnapshotId| {
+      self
+        .snapshots
+        .get(snapshot_handle(id))
+        .map(|snap| snap.inode_root)
+        .map_err(|_| VfsError::StaleHandle)
+    };
+    let mut pairs = Vec::new();
+    trie::changed(&store.tries, root_of(from)?, root_of(to)?, &mut pairs);
+    let mut paths = std::collections::BTreeSet::new();
+    let mut linked = std::collections::BTreeSet::new();
+    for (before, after) in pairs {
+      let mut named = [None, None];
+      for (slot, (side, record)) in named.iter_mut().zip([(from, before), (to, after)]) {
+        let Some(record) = record else { continue };
+        let inode = store.inodes.get(record).map_err(VfsError::from)?;
+        if inode.multi {
+          linked.insert(inode.no);
+        }
+        *slot = match inode.body {
+          Body::Directory(dir) => self
+            .path_of_dir_in(store, side, inode.no)
+            .map(|path| (path, Some(dir))),
+          _ => self
+            .path_of_inode_in(store, side, inode.no)
+            .map(|path| (path, None)),
+        };
+      }
+      let [old, new] = named;
+      // A directory that moved carries its subtree to new paths: every path beneath it changed, both sides.
+      if let (Some((old_path, Some(old_dir))), Some((new_path, Some(new_dir)))) = (&old, &new)
+        && old_path != new_path
+      {
+        self.paths_beneath(store, *old_dir, old_path, &mut paths)?;
+        self.paths_beneath(store, *new_dir, new_path, &mut paths)?;
+      }
+      paths.extend([old, new].into_iter().flatten().map(|(path, _)| path));
+    }
+    if !linked.is_empty() {
+      for side in [from, to] {
+        let (_, root) = self.snapshot_info(side)?;
+        self.names_of(store, root, &linked, &mut paths)?;
+      }
+    }
+    Ok(paths.into_iter().collect())
+  }
+
+  /// Every path beneath directory node `dir` (at `path`) of a snapshot's tree, into `out`.
+  fn paths_beneath(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    path: &str,
+    out: &mut std::collections::BTreeSet<String>,
+  ) -> Result<(), VfsError> {
+    self.walk_snapshot_tree(store, dir, path, &mut |child_path, _| {
+      out.insert(child_path.to_owned());
+    })
+  }
+
+  /// Every path in the snapshot tree under `root` that names one of `numbers`, into `out`.
+  fn names_of(
+    &self,
+    store: &Store,
+    root: Handle<DirNode>,
+    numbers: &std::collections::BTreeSet<InodeNo>,
+    out: &mut std::collections::BTreeSet<String>,
+  ) -> Result<(), VfsError> {
+    self.walk_snapshot_tree(store, root, "", &mut |child_path, no| {
+      if numbers.contains(&no) {
+        out.insert(child_path.to_owned());
+      }
+    })
+  }
+
+  /// Visits every entry beneath directory node `dir` of a snapshot's tree with its path (`prefix` the node's
+  /// own, empty for the root) and inode number. A tree's nodes are visited once each, so the walk ends.
+  fn walk_snapshot_tree(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    prefix: &str,
+    visit: &mut dyn FnMut(&str, InodeNo),
+  ) -> Result<(), VfsError> {
+    let mut stack = vec![(prefix.trim_end_matches('/').to_owned(), dir)];
+    while let Some((prefix, node)) = stack.pop() {
+      for row in self.readdir_in(store, node)? {
+        let path = format!("{prefix}/{}", row.name);
+        visit(&path, row.inode);
+        if row.kind == Kind::Dir
+          && let Child::Dir(child) = self.lookup_in(store, node, row.name)?.child
+        {
+          stack.push((path, child));
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// The entries of a directory node as a snapshot holds it (never the head's current node).
   pub fn readdir_in<'s>(
     &self,

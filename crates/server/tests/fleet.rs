@@ -9567,6 +9567,7 @@ fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
     &daemons[0],
     held,
     slates_db::catalog::Principal::Uid { uid: my_uid() },
+    slates_server::virtiofs::GuestView::default(),
     move |kick_write, call_read| {
       Box::pin(async move {
         let first = round_trip(

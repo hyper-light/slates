@@ -646,6 +646,10 @@ pub(crate) fn advance(
   if &record.principal != principal {
     return forbidden("advance");
   }
+  // A snapshot mount moves between snapshots of its volume (AUD-29-76); a green attachment between versions.
+  if state.snapshot_views.contains_key(&attachment) {
+    return crate::snapshot_view::advance(state, &record, version);
+  }
   let Some(pin) = state.merge.attachments.get(&attachment).copied() else {
     return refused(Refusal::NotGreen);
   };

@@ -33,7 +33,7 @@ mod common;
 use common::anchor::{anchor_segment, source_of};
 use common::guest::{
   create_body, flush_body, message, my_uid, release_body, reply_error, round_trip, run_guest,
-  u64_at, write_body,
+  run_guest_viewing, u64_at, write_body,
 };
 use common::nfs::{lookup, mount, read};
 
@@ -399,6 +399,7 @@ fn a_consumers_revocation_stops_its_guest_device() {
     &daemon,
     id,
     Principal::Consumer { account, consumer },
+    slates_server::virtiofs::GuestView::default(),
     move |kick_write, call_read| {
       Box::pin(async move {
         let first = round_trip(
@@ -462,4 +463,172 @@ fn a_consumers_revocation_stops_its_guest_device() {
     end.reclaimed.as_ref().is_ok_and(|r| r.references_swept),
     "{end:?}"
   );
+}
+
+/// Format: `ENOENT`.
+const ENOENT: i32 = 2;
+
+/// A LOOKUP of `name` in node `parent`: the request bytes.
+fn lookup_message(unique: u64, parent: u64, name: &str) -> Vec<u8> {
+  let mut body = name.as_bytes().to_vec();
+  body.push(0);
+  message(Opcode::Lookup.to_wire(), unique, parent, &body)
+}
+
+/// A GETATTR of node `node` (`fuse_getattr_in`: flags, a padding word, fh — all zero).
+fn getattr_message(unique: u64, node: u64) -> Vec<u8> {
+  message(Opcode::GetAttr.to_wire(), unique, node, &[0u8; 16])
+}
+
+/// The inode an NFS handle names.
+fn inode_of(fh: &[u8]) -> u64 {
+  use slates_bridge_nfs::handle::FileHandle;
+  FileHandle::from_fh(&slates_bridge_nfs::nfs::Nfsfh3(fh.to_vec()))
+    .unwrap()
+    .inode
+}
+
+/// Through the owner's NFS mount of volume `name`: `shared/g` and `private/secret`, `f` holding `before`;
+/// a snapshot taken; then `f` rewritten `after!!`. The snapshot and `private`'s inode.
+fn shared_private_and_a_snapshot(
+  daemon: &Daemon,
+  client: &mut Client,
+  id: slates_ipc::protocol::VolumeId,
+  name: &str,
+) -> (slates_ipc::protocol::SnapshotId, u64) {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(name).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let shared = common::nfs::mkdir(&mut stream, &root, "shared", 2);
+  let private = common::nfs::mkdir(&mut stream, &root, "private", 3);
+  common::nfs::create(&mut stream, &shared, "g", 4);
+  common::nfs::create(&mut stream, &private, "secret", 5);
+  let file = common::nfs::create(&mut stream, &root, "f", 6);
+  common::nfs::write(&mut stream, &file, b"before", 7);
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  common::nfs::write(&mut stream, &file, b"after!!", 8);
+  (snapshot, inode_of(&private))
+}
+
+/// The errors a scoped guest meets: LOOKUP `g` at its root, LOOKUP `private` there, GETATTR of `private`'s
+/// inode named directly.
+async fn scoped_guest_script(
+  kick_write: std::os::fd::OwnedFd,
+  call_read: std::os::fd::OwnedFd,
+  private: u64,
+) -> (i32, i32, i32) {
+  let inside = round_trip(&kick_write, &call_read, &lookup_message(1, 1, "g")).await;
+  let sibling = round_trip(&kick_write, &call_read, &lookup_message(2, 1, "private")).await;
+  let forged = round_trip(&kick_write, &call_read, &getattr_message(3, private)).await;
+  drop(kick_write);
+  (
+    reply_error(&inside),
+    reply_error(&sibling),
+    reply_error(&forged),
+  )
+}
+
+/// What a snapshot guest meets: `f`'s size at its root, and the error of a CREATE.
+async fn snapshot_guest_script(
+  kick_write: std::os::fd::OwnedFd,
+  call_read: std::os::fd::OwnedFd,
+) -> (i32, u64, i32) {
+  let found = round_trip(&kick_write, &call_read, &lookup_message(1, 1, "f")).await;
+  let created = round_trip(
+    &kick_write,
+    &call_read,
+    &message(Opcode::Create.to_wire(), 2, 1, &create_body("new")),
+  )
+  .await;
+  drop(kick_write);
+  // EntryOut: nodeid, generation, two validities, two nanosecond words (40 bytes), then fuse_attr: ino, size.
+  let size = u64_at(&found, OUT_HEADER_LEN + 48);
+  (reply_error(&found), size, reply_error(&created))
+}
+
+/// AUD-29-76 (a guest's view). Do: make `shared/g`, `private/secret` and `f` (`before`), snapshot, rewrite `f`
+/// `after!!`; attach one guest device presenting `/shared` and another presenting the snapshot. Through the
+/// scoped device look up `g` and `private` at its root and GETATTR `private`'s inode directly; through the
+/// snapshot device look up `f` and CREATE a file; ask for a subtree of a snapshot. Expect: the scoped device
+/// finds `g` and answers `ENOENT` for `private` both ways; the snapshot device sees `f` at the snapshot's six
+/// bytes, not the head's seven, and refuses the CREATE (`EPERM`); a subtree of a snapshot is refused typed with
+/// nothing admitted. Before 2026-10-01 a guest device presented only the volume's head, whole.
+#[test]
+fn a_guest_device_presents_a_subtree_or_a_snapshot_and_nothing_else() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-view");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("viewed")) else {
+    panic!("the volume was not created");
+  };
+  let (snapshot, private) = shared_private_and_a_snapshot(&daemon, &mut client, id, "viewed");
+  let me = Principal::Uid { uid: my_uid() };
+  let subtree = slates_server::virtiofs::GuestView {
+    subtree: Some("/shared".to_owned()),
+    snapshot: None,
+  };
+  let (outcome, errors) = run_guest_viewing(&daemon, id, me.clone(), subtree, move |kick, call| {
+    Box::pin(scoped_guest_script(kick, call, private))
+  });
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  assert_eq!(errors, (0, -ENOENT, -ENOENT), "g found; private nowhere");
+  assert_the_snapshot_device_is_read_only(&daemon, id, me.clone(), snapshot);
+  let both = slates_server::virtiofs::GuestView {
+    subtree: Some("/shared".to_owned()),
+    snapshot: Some(snapshot),
+  };
+  let (outcome, ()) = run_guest_viewing(&daemon, id, me, both, |kick, _call| {
+    Box::pin(async move { drop(kick) })
+  });
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::ViewRefused(_)),
+    "{outcome:?}"
+  );
+  assert!(
+    matches!(
+      client.call(&RequestBody::DestroySnapshot {
+        volume: id,
+        snapshot
+      }),
+      ReplyBody::SnapshotDestroyed
+    ),
+    "every guest view closed with its device, unpinning the snapshot"
+  );
+  drop(client);
+  drop(daemon);
+}
+
+/// A guest device presenting `snapshot` of volume `id` finds `f` at the snapshot's six bytes, not the head's
+/// seven, and its CREATE is refused `EPERM`.
+fn assert_the_snapshot_device_is_read_only(
+  daemon: &Daemon,
+  id: slates_ipc::protocol::VolumeId,
+  me: Principal,
+  snapshot: slates_ipc::protocol::SnapshotId,
+) {
+  let pinned = slates_server::virtiofs::GuestView {
+    subtree: None,
+    snapshot: Some(snapshot),
+  };
+  let (outcome, (found, size, created)) =
+    run_guest_viewing(daemon, id, me, pinned, |kick, call| {
+      Box::pin(snapshot_guest_script(kick, call))
+    });
+  assert!(
+    matches!(outcome, GuestDeviceOutcome::Ended(_)),
+    "{outcome:?}"
+  );
+  assert_eq!(
+    (found, size),
+    (0, 6),
+    "the snapshot's `before`, not the head"
+  );
+  assert_eq!(created, -EPERM, "a snapshot device writes nothing");
 }

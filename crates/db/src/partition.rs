@@ -647,6 +647,12 @@ impl Partition {
       }
       Op::AttachmentRemoved { id } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
       Op::AttachmentBound { id, .. } => self.attachment(*id).map(|_| ()).ok_or(DbError::NotFound),
+      // Only an attachment presenting a snapshot is re-pinned; the head is not a version to move from.
+      Op::AttachmentRepinned { id, .. } => self
+        .attachment(*id)
+        .filter(|record| record.snapshot.is_some())
+        .map(|_| ())
+        .ok_or(DbError::NotFound),
       Op::CompletionRecorded { record } => {
         match self.completion(record.origin, record.client, record.sequence) {
           Seen::Acknowledged => Err(DbError::StaleCompletion {
@@ -912,6 +918,28 @@ impl Partition {
             },
             None => crate::catalog::AttachForm::ChosenPath { path: path.clone() },
           };
+        }
+        Ok(())
+      }
+      Op::AttachmentRepinned { id, snapshot } => {
+        // The mount and its borrowers move together, so a bind never claims a version its mount no longer
+        // presents (`oci::Binding::consumer` matches them).
+        let moved: Vec<u64> = self
+          .attachments
+          .iter()
+          .filter(|(_, record)| {
+            record.id == *id
+              || matches!(record.consumer, crate::catalog::Consumer::Mount { attachment } if attachment == *id)
+          })
+          .map(|(_, record)| record.id)
+          .collect();
+        for moved in moved {
+          let h = *self
+            .attachment_index
+            .get(&moved.to_be_bytes())
+            .ok_or(DbError::NotFound)?;
+          let record = self.attachments.get_mut(h).map_err(|_| DbError::NotFound)?;
+          record.snapshot = Some(*snapshot);
         }
         Ok(())
       }
