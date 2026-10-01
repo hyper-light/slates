@@ -267,6 +267,10 @@ pub struct ShardState {
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
   pub(crate) fuse_mounts: crate::fuse::FuseMounts,
+  /// The FUSE mounts recovery ended (attachment, mount point): their device died with the old process, so
+  /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
+  /// emptied by that step; bounded by the partition's attachment cap.
+  pub(crate) stale_fuse_mounts: Vec<(u64, String)>,
   /// The guest devices this shard serves and the consumer each was admitted for (§4.6, §4.13; AUD-29-73), so a
   /// consumer's revocation reaches its devices. Bounded by the shard's device limit (`clients_per_shard`, the
   /// loop registry's bound): an entry is added when a loop registers and removed when it ends.
@@ -742,6 +746,18 @@ pub fn try_with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Result<R, Stat
     let result = f(state);
     crate::retention::retain(state).map_err(StateAccess::Retention)?;
     Ok(result)
+  })
+}
+
+/// Borrows the state for the shutdown's release of what the process holds in the kernel (a FUSE mount),
+/// whether or not the shard is fenced (§4.6 "Linux"; AUD-29-64): a fenced shard writes no record, but its
+/// mounts must not outlive it. Nothing may write a record through this borrow; the records of what it
+/// releases end at the next start's recovery. `None` when the thread holds no state or it is borrowed.
+#[cfg(target_os = "linux")]
+pub(crate) fn with_state_at_shutdown<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+  STATE.with(|cell| {
+    let mut guard = cell.try_borrow_mut().ok()?;
+    guard.as_mut().map(f)
   })
 }
 

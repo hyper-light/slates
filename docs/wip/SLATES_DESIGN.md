@@ -1892,6 +1892,11 @@ must exercise local communication and isolation between clones as well as namesp
 > (host mount, FUSE, OCI). The NFS edge never admits a capability recorded for a snapshot. Snapshot and subtree
 > exports are owed.
 
+> **Status (2026-10-01, AUD-29-64: a FUSE mount never outlives its daemon).** The stop unmounts from each
+> serve loop's end, a fenced shard included (writing no record). A FUSE attachment is recorded as such, so the
+> next start's recovery ends a crashed daemon's FUSE records and unmounts each dead mount. It does so only
+> when the kernel's table names that attachment, so a later mount at the path is never touched.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

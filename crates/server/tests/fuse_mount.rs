@@ -225,3 +225,43 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   );
   assert_eq!(refusals.get("fuse.barrier_refused"), None, "{refusals:?}");
 }
+
+/// AUD-29-64 (a fenced shard's mounts). Do: on a one-shard daemon (its control shard owns the volume), attach a
+/// FUSE mount, fence the control shard as a failed consensus publication does, then stop the daemon. Expect:
+/// the stop unmounted the mount though the shard refuses every ordinary borrow; before 2026-10-01 the fenced
+/// shard's mounts outlived the daemon, answering `ENOTCONN`.
+#[test]
+fn a_fenced_shards_fuse_mount_ends_with_the_daemon() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-fenced-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-fuse-fenced-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch(VOLUME)).unwrap();
+  let point = target_dir();
+  client
+    .attach_fuse(volume, Intent::Write, &point.path)
+    .unwrap();
+  assert!(mounted_at(&point.path).is_some(), "mounted");
+  daemon.inject_consensus_failure().unwrap();
+  drop(client);
+  daemon.stop();
+  assert!(
+    mounted_at(&point.path).is_none(),
+    "the fenced shard's mount ended with the daemon"
+  );
+}

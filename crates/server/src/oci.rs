@@ -51,7 +51,7 @@ impl Binding {
         matches!(parent.consumer, Consumer::Bridge)
           && self.attachment.is_none_or(|named| parent.id == named)
           && parent.principal == *principal
-          && matches!(&parent.form, slates_db::catalog::AttachForm::ChosenPath { path } if *path == self.mount_point)
+          && parent.form.mount_point() == Some(self.mount_point.as_str())
           && parent.rights.read
           && (self.entry.read_only || parent.rights.write)
       })

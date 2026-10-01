@@ -164,7 +164,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
   let shard = state.shard;
   let task = async move {
     let mount_point = match &pending.record.form {
-      AttachForm::ChosenPath { path } => path.clone(),
+      AttachForm::FuseMount { path } => path.clone(),
       _ => String::new(),
     };
     let mounted =
@@ -580,6 +580,16 @@ pub(crate) fn unmount_if_mounted(s: &ShardState, attachment: u64) {
 /// failover bound. Run by the end of the shard's serve loop (`daemon::EndMounts`): on a stop nothing else
 /// runs on the shard, and an unmount left to a task the stop is about to end would leave a dead mount behind.
 pub(crate) fn unmount_all(s: &mut ShardState) {
+  unmount_points(s);
+  let attachments: Vec<u64> = s.fuse_mounts.keys().copied().collect();
+  for attachment in attachments {
+    ended(s, attachment);
+  }
+}
+
+/// Unmounts every FUSE mount point the shard serves, waiting for each helper within the failover bound, and
+/// writes no record: [`unmount_all`]'s first half, and all a fenced shard may do at its stop.
+pub(crate) fn unmount_points(s: &mut ShardState) {
   let deadline = std::time::Duration::from_nanos(s.config.failover_slo_ns);
   let points: Vec<String> = s
     .fuse_mounts
@@ -594,11 +604,34 @@ pub(crate) fn unmount_all(s: &mut ShardState) {
       }
     }
   }
-  let attachments: Vec<u64> = s.fuse_mounts.keys().copied().collect();
-  for attachment in attachments {
-    ended(s, attachment);
+}
+
+/// Unmounts the dead FUSE mounts recovery ended (AUD-29-64): the mounts a killed daemon served, whose device
+/// died with it, so each answers `ENOTCONN` until unmounted. Run once the shard runs; each is unmounted only if
+/// the kernel's table shows exactly that mount there — `fuse.slates` with the record's attachment as its source
+/// — so a mount someone made at the path since is never touched. A table that cannot be read is counted.
+pub(crate) fn unmount_stale() {
+  let stale = state::with_state(|s| std::mem::take(&mut s.stale_fuse_mounts)).unwrap_or_default();
+  if stale.is_empty() {
+    return;
+  }
+  let Ok(table) = slates_bridge_oci::mount_table::mount_table() else {
+    let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
+    return;
+  };
+  for (attachment, point) in stale {
+    let source = fsname_of(attachment);
+    if table
+      .iter()
+      .any(|m| m.mount_point == point && m.fstype == FUSE_TYPE && m.source == source)
+    {
+      unmount_owned(&point);
+    }
   }
 }
+
+/// Format: the filesystem type the kernel lists for a slates FUSE mount (the `slates` subtype).
+const FUSE_TYPE: &str = "fuse.slates";
 
 /// Starts `fusermount3 -u -z` at `mount_point` and owns the helper until it is reaped, on a detached task
 /// polling at the heartbeat's tick (bounded by the failover bound; the helper is killed and reaped past it).

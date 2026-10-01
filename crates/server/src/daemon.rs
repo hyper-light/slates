@@ -1885,6 +1885,23 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.store.budget.hold())
   }
 
+  /// Test support: fences the control shard as a failed consensus publication does (`retention`): from then
+  /// on it serves nothing and every ordinary borrow of its state is refused `Fenced`. A test proves what a
+  /// fenced shard still owes — its kernel mounts released at the stop — without corrupting an anchor.
+  pub fn inject_consensus_failure(&self) -> Result<(), ObserveError> {
+    let control = self.shards.first().copied();
+    match self.observe(control, |s| {
+      s.consensus_failure = Some(slates_anchor::AnchorError::Layout {
+        reason: "test support: an injected consensus retention failure",
+      });
+      s.consensus_ready = false;
+    }) {
+      // The borrow's own retention check names the fence it just installed.
+      Ok(()) | Err(ObserveError::State(state::StateAccess::Retention(_))) => Ok(()),
+      Err(other) => Err(other),
+    }
+  }
+
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
   /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
@@ -2477,6 +2494,7 @@ fn init_shard(
     mount_attachments: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
+    stale_fuse_mounts: Vec::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
     clock,
@@ -2610,6 +2628,9 @@ fn init_shard(
     );
   }
   state::install(state);
+  // The dead FUSE mounts of a killed predecessor, once the shard can run their helpers (AUD-29-64).
+  #[cfg(target_os = "linux")]
+  crate::fuse::unmount_stale();
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
   // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure
@@ -2692,7 +2713,11 @@ struct EndMounts;
 #[cfg(target_os = "linux")]
 impl Drop for EndMounts {
   fn drop(&mut self) {
-    let _ = state::with_state(crate::fuse::unmount_all);
+    // A fenced shard refuses every ordinary borrow: its mounts are still released, and their records end
+    // at the next start's recovery (a record is never written on a fenced shard).
+    if state::with_state(crate::fuse::unmount_all).is_none() {
+      let _ = state::with_state_at_shutdown(crate::fuse::unmount_points);
+    }
   }
 }
 

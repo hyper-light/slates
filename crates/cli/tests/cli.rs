@@ -3147,6 +3147,48 @@ fn slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it() {
   drop(anchor);
 }
 
+/// AUD-29-64 (a FUSE mount outlives its daemon's crash). Do: `slates mount` a volume over FUSE, then `SIGKILL`
+/// the daemon and wait for the anchor's restarted one. Expect: the restarted daemon has ended the dead mount's
+/// attachment (its device died with the killed process) and unmounted the dead mount, whose source the kernel
+/// table names as that attachment; before 2026-10-01 the record outlived the process and the mount stayed,
+/// answering `ENOTCONN`. Gated like the Linux mount (`SLATES_TEST_CLI=1`, FUSE).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-fuse-crash-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "fusecrash", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount_point.path);
+  let killed = daemon_pid(&instance).expect("the daemon answers");
+  let (code, _, err) = bounded(
+    Command::new("kill").args(["-9", &killed.to_string()]),
+    START_WAIT,
+  )
+  .unwrap();
+  assert_eq!(code, 0, "{err}");
+  await_daemon(&instance, Some(killed), &[]);
+  assert!(
+    wait_for(|| attachments_of(&instance, &id) == "0"),
+    "the restarted daemon ended the dead mount's attachment"
+  );
+  assert!(
+    wait_for(|| mountinfo_at(&mount_point.path).is_none()),
+    "the restarted daemon unmounted the dead mount"
+  );
+  drop(anchor);
+}
+
 /// Shape: container identities other than the mounting user's — root, an ordinary Linux first user, and the
 /// mounting user with a supplementary group no host account holds (AUD-29-74).
 const OTHER_IDENTITIES: [(&str, &str, &[&str]); 3] = [

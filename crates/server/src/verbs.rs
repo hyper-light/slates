@@ -4499,7 +4499,7 @@ fn capability_token(borrows_mount: bool) -> Result<[u8; 16], Refusal> {
 /// form's is the one its establishment named.
 fn recorded_form(form: &AttachRequest, established: AttachForm) -> AttachForm {
   match form {
-    AttachRequest::FuseMount { mount_point } => AttachForm::ChosenPath {
+    AttachRequest::FuseMount { mount_point } => AttachForm::FuseMount {
       path: mount_point.clone(),
     },
     _ => established,
@@ -4810,7 +4810,7 @@ fn mounts_of(
   let mut elided = 0u32;
   let mut carried = 0usize;
   for record in state.db.partition().attachments_of(volume) {
-    let AttachForm::ChosenPath { path } = &record.form else {
+    let Some(path) = record.form.mount_point() else {
       continue;
     };
     if !matches!(record.consumer, Consumer::Bridge) {
@@ -4823,7 +4823,7 @@ fn mounts_of(
     carried = carried.saturating_add(path.len());
     mounts.push(slates_ipc::protocol::MountReport {
       attachment: record.id,
-      path: path.clone(),
+      path: path.to_owned(),
     });
   }
   (mounts, elided)
@@ -7245,12 +7245,21 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
       None => *state.refusals.entry(VOLUME_EPOCH_EXHAUSTED).or_insert(0) += 1,
     }
   }
+  // An SDK's record and a FUSE mount both die with the process: the SDK's client attaches again, and a FUSE
+  // mount's device was the killed process's own (AUD-29-64), so its dead mount is unmounted once this shard
+  // runs (`fuse::unmount_stale`), the kernel's table confirming the mount is the one the record names.
   let attached: Vec<u64> = state
     .db
     .partition()
     .attachments_of(record.id)
     .iter()
-    .filter(|a| matches!(a.consumer, Consumer::Sdk { .. }))
+    .filter(|a| {
+      if let AttachForm::FuseMount { path } = &a.form {
+        state.stale_fuse_mounts.push((a.id, path.clone()));
+        return true;
+      }
+      matches!(a.consumer, Consumer::Sdk { .. })
+    })
     .map(|a| a.id)
     .collect();
   let mut attachments = 0;

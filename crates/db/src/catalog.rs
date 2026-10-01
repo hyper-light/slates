@@ -366,6 +366,23 @@ pub enum AttachForm {
     /// Whether the bind is read-only.
     read_only: bool,
   },
+  /// A Linux FUSE mount (§4.6 "Linux"; AUD-29-64) at its mount point. Kept apart from a chosen-path host
+  /// mount because its device is the daemon process's own: it cannot outlive the process, so recovery ends
+  /// it, where an NFS host mount reconnects to the restarted daemon.
+  FuseMount {
+    /// The mount point.
+    path: String,
+  },
+}
+
+impl AttachForm {
+  /// The host mount point a mounted form names: a chosen-path host mount's or a FUSE mount's.
+  pub fn mount_point(&self) -> Option<&str> {
+    match self {
+      Self::ChosenPath { path } | Self::FuseMount { path } => Some(path),
+      Self::Root | Self::Oci { .. } => None,
+    }
+  }
 }
 
 /// An attachment record.
