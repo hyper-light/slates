@@ -1,6 +1,7 @@
 # Standard QUIC under slates' transport: the combined design (A-52)
 
-> Status (2026-10-01): **plan, stage 0.** Ada's directive: the fleet transport must be RFC 9000, 9001 and
+> Status (2026-10-01): **plan, stage 0.** The vendor-and-conform stages (1, 2 and 4) run in the shared
+> `hyper-quic` crate, not in slates (§5). Ada's directive: the fleet transport must be RFC 9000, 9001 and
 > 9002 compliant without losing slates' measured performance work ("your goal is to combine the two"). Ada
 > chose to vendor `quinn-proto` 0.11.18 and conform it to slates' rules ("vendor and conform"), not to grant
 > exceptions and not to rewrite slates' own wire layer.
@@ -76,7 +77,27 @@ Each stage lands with its tests, its GAPS row and its design status in the same 
      past its reservation refused before it is retained).
    - qlog output decodable by standard tooling.
 
-## 5. Open, for Ada
+## 5. Where the work lives (settled 2026-10-01)
 
-A shared transport crate for slates, focal and mantle, so each refinement lands once, is a cross-repository
-change and waits on Ada's decision. This plan keeps the conformed crate self-contained, so it can move later.
+Ada: "we're building shared crates", located in `../hyper-raft` (github.com/hyper-light/hyper-raft). The
+conformed `quinn-proto` is the shared crate `hyper-quic`, built there by the mantle session, with the shared
+transport, SWIM and Raft crates beside it. slates does not vendor `quinn-proto` itself. It vendors a snapshot
+of the shared crates with the source revision recorded, as mantle and focal do. The shared repository takes
+the strictest union of the three projects' rules as its floor. Two changes go beyond §3 here:
+
+- rustls is vendored and conformed too, so the D-8 exception at its configuration API is not needed.
+- The crypto provider is aws-lc-rs, the move slates had already queued.
+
+What slates still owns:
+- **Stage 3, the integration.** slates' runtime drives the connection, and slates' application layer runs
+  on its streams.
+- **The slates-side half of defects 4 and 5.** The class is set by message kind and the sender's role, and
+  a request streams through an admitted reservation.
+- **Stage 5's acceptance tests**, run in slates' fleet suite.
+
+The properties slates needs from `hyper-quic` were sent to its owner on 2026-10-01:
+- the class is set by kind and role, never by the peer;
+- refusal happens at the reservation, before any bytes are retained;
+- congestion and pacing seams can take slates' refinements as patches;
+- the crate is sans-IO;
+- every refusal is typed and nothing panics.
