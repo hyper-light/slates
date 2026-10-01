@@ -379,7 +379,11 @@ async fn ask(
   let query = encode_query(id, host)?;
   let socket =
     UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).map_err(DnsError::Io)?;
-  socket.send_to(&query, nameserver).map_err(DnsError::Io)?;
+  // A full local send buffer delays the query, never fails it (AUD-29-61).
+  socket
+    .send_to_writable(&query, nameserver)
+    .await
+    .map_err(DnsError::Io)?;
   let deadline = now_ns().saturating_add(resolver.timeout_ns);
   let mut buf = [0u8; MAX_UDP_MESSAGE];
   loop {

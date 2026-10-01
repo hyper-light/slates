@@ -365,6 +365,11 @@ pub struct SimFabric {
   /// The latest arrival scheduled on each directed flow, the floor an in-order path clamps the next to.
   last_arrival: BTreeMap<(u16, u16), u64>,
   stats: SimFabricStats,
+  /// Ports whose sends the scenario has blocked (`sim_udp_block_sends`): local send pressure, as a kernel
+  /// with a full send buffer reports it — the send would block (AUD-29-61).
+  send_blocked: std::collections::BTreeSet<u16>,
+  /// One-shot write interest on a blocked port, woken when the scenario releases it.
+  send_interests: BTreeMap<u16, u64>,
 }
 
 /// Format: the salt that separates the fabric's generator stream from the shards' (both are seeded from
@@ -391,6 +396,8 @@ impl SimFabric {
       next_sequence: 0,
       last_arrival: BTreeMap::new(),
       stats: SimFabricStats::default(),
+      send_blocked: std::collections::BTreeSet::new(),
+      send_interests: BTreeMap::new(),
     }
   }
 
@@ -739,6 +746,48 @@ pub fn sim_udp_recv(port: u16) -> Option<(Vec<u8>, u16)> {
   SIM_FABRIC.with(|f| f.borrow_mut().recv(port))
 }
 
+/// Blocks socket port `port`'s sends from now on: each would block, as on a host whose send buffer is full
+/// (AUD-29-61), until [`sim_udp_release_sends`].
+pub fn sim_udp_block_sends(port: u16) {
+  SIM_FABRIC.with(|f| {
+    f.borrow_mut().send_blocked.insert(port);
+  });
+}
+
+/// Releases socket port `port`'s sends and wakes a sender waiting for its writability.
+pub fn sim_udp_release_sends(port: u16) {
+  let wake = SIM_FABRIC.with(|f| {
+    let mut fabric = f.borrow_mut();
+    fabric.send_blocked.remove(&port);
+    fabric.send_interests.remove(&port)
+  });
+  if let Some(word) = wake {
+    crate::registry::wake(Encoded::from_word(word));
+  }
+}
+
+/// Whether socket port `port`'s sends are blocked now.
+pub(crate) fn sim_udp_sends_blocked(port: u16) -> bool {
+  SIM_FABRIC.with(|f| f.borrow().send_blocked.contains(&port))
+}
+
+/// Registers one-shot write interest, waking now (through the registry) when the port's sends are not
+/// blocked.
+fn sim_udp_register_writable(port: u16, word: u64) {
+  let wake = SIM_FABRIC.with(|f| {
+    let mut fabric = f.borrow_mut();
+    if fabric.send_blocked.contains(&port) {
+      fabric.send_interests.insert(port, word);
+      None
+    } else {
+      Some(word)
+    }
+  });
+  if let Some(word) = wake {
+    crate::registry::wake(Encoded::from_word(word));
+  }
+}
+
 /// Registers one-shot read interest, waking now (through the registry) if a datagram already waits.
 pub fn sim_udp_register(port: u16, word: u64) {
   let wake = SIM_FABRIC.with(|f| f.borrow_mut().register(port, word));
@@ -860,14 +909,15 @@ impl Driver for SimDriver {
     Ok(())
   }
 
-  fn register_writable(&mut self, _raw: i32, _user_data: u64) -> Result<(), RtError> {
-    // The simulated fabric is UDP-only and its sends never block (an in-memory push), so there is no
-    // write-readiness to await under simulation; TCP is a host-local bridge (§4.6), not the fleet
-    // plane (§4.10a). A typed refusal keeps the seam honest rather than pretending readiness.
-    Err(RtError::DriverRefused {
+  fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError> {
+    // The simulated fabric's sends block only where a scenario blocked them (local send pressure,
+    // AUD-29-61); write interest then waits for the scenario's release, and is ready at once otherwise.
+    let port = u16::try_from(raw).map_err(|_| RtError::DriverRefused {
       call: "register_writable",
       code: None,
-    })
+    })?;
+    sim_udp_register_writable(port, user_data);
+    Ok(())
   }
 
   fn has_pending(&self) -> bool {

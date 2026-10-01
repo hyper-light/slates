@@ -24,10 +24,9 @@ use crate::waker::polling_task;
 enum Interest {
   /// The socket has data to read, or a listener has a connection to accept.
   Readable,
-  /// The socket has send-buffer space for a write (or connect) that returned `EAGAIN`/`EINPROGRESS`.
-  /// Only the TCP path awaits this, and TCP is off Windows (the NFS mount server's alone), so the
-  /// variant is too — UDP, the cross-platform transport, awaits readability only.
-  #[cfg(not(windows))]
+  /// The socket has send-buffer space for a write (or connect) that returned `EAGAIN`/`EINPROGRESS`: a TCP
+  /// write, or a UDP send the kernel had no room for (every platform's driver arms it: kqueue
+  /// `EVFILT_WRITE`, epoll `EPOLLOUT`, io_uring `POLLOUT`, IOCP's AFD send poll).
   Writable,
 }
 
@@ -55,7 +54,6 @@ impl Future for Ready {
     let (raw, interest) = (self.raw, self.interest);
     let registered = registry::with_current(|ctx| match interest {
       Interest::Readable => ctx.register_readable(raw, word.word()),
-      #[cfg(not(windows))]
       Interest::Writable => ctx.register_writable(raw, word.word()),
     });
     match registered {
@@ -80,9 +78,7 @@ pub async fn readable(raw: i32) -> Result<(), RtError> {
   .await
 }
 
-/// Awaits `raw`'s writability once (a real socket fd whose send buffer filled, or a connect in
-/// progress). TCP-only, so off Windows (the NFS mount server's alone).
-#[cfg(not(windows))]
+/// Awaits `raw`'s writability once (a real socket whose send buffer filled, or a connect in progress).
 pub(crate) async fn writable(raw: i32) -> Result<(), RtError> {
   Ready {
     raw,

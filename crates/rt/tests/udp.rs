@@ -487,3 +487,79 @@ fn the_jitter_is_seeded_so_a_run_replays_exactly() {
   let other = run_stamped_flow(8, SimPath::in_order(ONE_WAY_NS, JITTER_NS));
   assert_ne!(first, other, "another seed draws another jitter sequence");
 }
+
+/// Shape: when the scenario releases the blocked sender, in virtual nanoseconds — a millisecond in, so the
+/// send has certainly found its port blocked and is waiting.
+const RELEASE_AT_NS: u64 = 1_000_000;
+/// Shape: the releasing task's poll for the sender's port, in virtual nanoseconds — a thousandth of the release
+/// time, so it learns the port long before it releases it.
+const PORT_POLL_NS: u64 = RELEASE_AT_NS / 1_000;
+
+/// AUD-29-61 (local send pressure). Do: on the simulated fabric, block a sender's port (the kernel's send
+/// buffer full); try a send, then send awaiting writability while a second task releases the port a
+/// millisecond later. Expect: the plain send is the typed `WouldBlock` and the try is `None`, with nothing
+/// sent; the awaiting send completes only after the release; the receiver gets the datagram exactly once.
+/// Before, a would-block was an ordinary send error, the same as a failed socket.
+#[test]
+fn a_send_under_local_pressure_waits_for_writability_and_sends_once() {
+  use slates_rt::error::RtError;
+  use slates_rt::sim::{SimRuntime, sim_udp_block_sends, sim_udp_release_sends};
+
+  let mut sim = SimRuntime::new(&config(), 1).unwrap();
+  let id = sim.shard_ids()[0];
+  let (ports_tx, ports_rx) = channel();
+  let (sent_tx, sent_rx) = channel();
+  let (received_tx, received_rx) = channel();
+
+  sim
+    .spawn_on(id, async move {
+      let receiver = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let sender = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      let to = SocketAddrV4::new(Ipv4Addr::LOCALHOST, receiver.local_addr().unwrap().port());
+      let from = sender.local_addr().unwrap().port();
+      sim_udp_block_sends(from);
+      let _ = ports_tx.send(from);
+      let plain = sender.send_to(b"pressure", to);
+      let tried = sender.try_send_to(b"pressure", to);
+      let sent = sender.send_to_writable(b"pressure", to).await;
+      let at = slates_rt::futures::now_ns();
+      let _ = sent_tx.send((plain, tried, sent, at));
+      let mut buf = [0u8; 64];
+      let mut received = Vec::new();
+      while let Ok(Some((n, _))) = receiver.try_recv_from(&mut buf) {
+        received.push(buf[..n].to_vec());
+      }
+      let _ = received_tx.send(received);
+    })
+    .unwrap();
+  sim
+    .spawn_on(id, async move {
+      let port = loop {
+        if let Ok(port) = ports_rx.try_recv() {
+          break port;
+        }
+        slates_rt::futures::sleep(PORT_POLL_NS).await.unwrap();
+      };
+      slates_rt::futures::sleep(RELEASE_AT_NS).await.unwrap();
+      sim_udp_release_sends(port);
+    })
+    .unwrap();
+  sim.run_until_idle();
+
+  let (plain, tried, sent, at) = sent_rx.try_recv().expect("the sender finished");
+  assert!(
+    matches!(plain, Err(RtError::WouldBlock { call: "sendto" })),
+    "{plain:?}"
+  );
+  assert_eq!(tried, Ok(None));
+  assert_eq!(sent, Ok(b"pressure".len()));
+  assert!(
+    at >= RELEASE_AT_NS,
+    "the awaiting send completed only after the release ({at} ns)"
+  );
+  assert_eq!(
+    received_rx.try_recv().unwrap(),
+    vec![b"pressure".to_vec()],
+    "the datagram arrived exactly once"
+  );
+}

@@ -1251,6 +1251,14 @@ cluster.
 > by use on the readiness-native driver: `crates/rt/tests/tcp.rs` runs an accept→read→write→read round
 > trip with both ends on the runtime's own sockets, `tests/udp.rs` the datagram path.
 >
+> **Status (2026-10-01, AUD-29-61: local send pressure).** A non-blocking UDP send the OS has no room for is
+> typed `RtError::WouldBlock`, never a socket failure; `UdpSocket::try_send_to` answers `None` with nothing
+> sent, `writable` awaits write readiness through every driver (`Interest::Writable` on all platforms), and
+> `send_to_writable` delays a datagram under pressure and never fails it. The simulated fabric blocks and
+> releases a port's sends, so the pressure is tested. Record:
+> `docs/bugs/2026-10-01-local-udp-send-pressure-was-a-socket-failure.md`. Recording a packet as sent only once
+> the OS accepts it belongs to the endpoint, carried by `hyper-quic`.
+
 > **Status (2026-09-16): every real driver carries socket readiness — the completion-native path is no
 > longer owed.** io_uring's `register_readable`/`register_writable` were stubs that returned a typed
 > `DriverRefused`, so the first time an async socket on that driver awaited readiness (a read that hit

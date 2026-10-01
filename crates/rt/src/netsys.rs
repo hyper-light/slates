@@ -163,8 +163,17 @@ mod imp {
     }
   }
 
-  pub(crate) fn send_to(socket: &Socket, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
-    rx_sendto(&socket.fd, buf, SendFlags::empty(), &addr).map_err(|e| refused("sendto", e))
+  pub(crate) fn send_to(
+    socket: &Socket,
+    buf: &[u8],
+    addr: SocketAddrV4,
+  ) -> Result<Io<usize>, RtError> {
+    match rx_sendto(&socket.fd, buf, SendFlags::empty(), &addr) {
+      Ok(n) => Ok(Io::Ready(n)),
+      Err(rustix::io::Errno::AGAIN) => Ok(Io::WouldBlock),
+      Err(rustix::io::Errno::INTR) => Ok(Io::Interrupted),
+      Err(e) => Err(refused("sendto", e)),
+    }
   }
 }
 
@@ -442,7 +451,11 @@ mod imp {
     )))
   }
 
-  pub(crate) fn send_to(socket: &Socket, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
+  pub(crate) fn send_to(
+    socket: &Socket,
+    buf: &[u8],
+    addr: SocketAddrV4,
+  ) -> Result<Io<usize>, RtError> {
     let sa = sockaddr(addr);
     let len = i32::try_from(buf.len()).unwrap_or(i32::MAX);
     // SAFETY: sendto reads `len` bytes from `buf` and the destination from `sa`.
@@ -457,10 +470,13 @@ mod imp {
       )
     };
     if rc == SOCKET_ERROR {
-      Err(last("sendto"))
-    } else {
-      Ok(usize::try_from(rc).unwrap_or(0))
+      return Ok(match last_code() {
+        WSAEWOULDBLOCK => Io::WouldBlock,
+        WSAEINTR => Io::Interrupted,
+        _ => return Err(last("sendto")),
+      });
     }
+    Ok(Io::Ready(usize::try_from(rc).unwrap_or(0)))
   }
 }
 

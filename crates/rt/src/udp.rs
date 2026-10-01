@@ -124,19 +124,59 @@ impl UdpSocket {
     }
   }
 
-  /// Sends a datagram to `addr` (a non-blocking send; the bytes accepted are returned). In simulation
-  /// the datagram is delivered to `addr`'s port on the fabric and any waiting receiver is woken.
+  /// Sends a datagram to `addr` without blocking: the bytes accepted, or `RtError::WouldBlock` when the
+  /// OS has no room for it now — local pressure, typed apart from a failure of the socket, so a caller
+  /// retries it once [`UdpSocket::writable`] (or sends with [`UdpSocket::send_to_writable`]) rather than
+  /// treating it as a lost path (AUD-29-61). In simulation the datagram is delivered to `addr`'s port on the
+  /// fabric and any waiting receiver is woken.
   pub fn send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
+    self
+      .try_send_to(buf, addr)?
+      .ok_or(RtError::WouldBlock { call: "sendto" })
+  }
+
+  /// Sends a datagram to `addr` without blocking: the bytes accepted, or `None` when the OS has no room for
+  /// it now (nothing was sent).
+  pub fn try_send_to(&self, buf: &[u8], addr: SocketAddrV4) -> Result<Option<usize>, RtError> {
     match &self.inner {
-      Inner::Real { socket } => netsys::send_to(socket, buf, addr),
+      Inner::Real { socket } => loop {
+        match netsys::send_to(socket, buf, addr)? {
+          Io::Ready(sent) => return Ok(Some(sent)),
+          Io::WouldBlock => return Ok(None),
+          Io::Interrupted => {}
+        }
+      },
       Inner::Sim { port } => {
         if crate::sim::sim_udp_exceeds_interface(buf.len()) {
           return Err(RtError::message_too_large("sendto"));
         }
+        if crate::sim::sim_udp_sends_blocked(*port) {
+          return Ok(None);
+        }
         crate::sim::sim_udp_send(addr.port(), buf, *port);
-        Ok(buf.len())
+        Ok(Some(buf.len()))
       }
     }
+  }
+
+  /// Sends a datagram to `addr`, awaiting the socket's writability through the driver while the OS has no
+  /// room for it (AUD-29-61): local send pressure delays the datagram, never fails it.
+  pub async fn send_to_writable(&self, buf: &[u8], addr: SocketAddrV4) -> Result<usize, RtError> {
+    loop {
+      if let Some(sent) = self.try_send_to(buf, addr)? {
+        return Ok(sent);
+      }
+      self.writable().await?;
+    }
+  }
+
+  /// Awaits the socket's write readiness through the driver (send-buffer space), or a spurious wake — so a
+  /// caller follows it with [`UdpSocket::try_send_to`] and loops on `None`.
+  pub fn writable(&self) -> impl Future<Output = Result<(), RtError>> + use<> {
+    crate::readiness::writable(match &self.inner {
+      Inner::Real { socket } => socket.raw_id(),
+      Inner::Sim { port } => i32::from(*port),
+    })
   }
 
   /// Receives one datagram, awaiting readability through the driver when none is ready. Returns the

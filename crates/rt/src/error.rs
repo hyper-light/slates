@@ -71,6 +71,12 @@ pub enum RtError {
     /// The shard.
     shard: u16,
   },
+  /// The OS had no room for a non-blocking call now (`EAGAIN`, `WSAEWOULDBLOCK`): local pressure, not a
+  /// failure of the socket. Nothing was sent; the call is retried once the socket is writable (AUD-29-61).
+  WouldBlock {
+    /// The call.
+    call: &'static str,
+  },
 }
 
 impl fmt::Display for RtError {
@@ -94,6 +100,7 @@ impl fmt::Display for RtError {
         "a ring half shard {shard} must own was already handed out"
       ),
       Self::WorkerFailed { shard } => write!(f, "shard {shard}'s worker ended without a result"),
+      Self::WouldBlock { call } => write!(f, "{call} would block: the OS has no room for it now"),
     }
   }
 }
