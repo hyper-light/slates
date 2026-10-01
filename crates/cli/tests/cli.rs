@@ -2077,6 +2077,22 @@ fn run_in_container(
   script: &str,
   tag: &str,
 ) -> Result<(i32, String, String), String> {
+  let user = format!(
+    "{}:{}",
+    rustix::process::getuid().as_raw(),
+    rustix::process::getgid().as_raw()
+  );
+  run_in_container_as(entry, script, tag, &user, &[])
+}
+
+/// [`run_in_container`] as the container identity `user` (`UID:GID`) with the supplementary groups `groups`.
+fn run_in_container_as(
+  entry: &serde_json::Value,
+  script: &str,
+  tag: &str,
+  user: &str,
+  groups: &[&str],
+) -> Result<(i32, String, String), String> {
   let source = entry["source"].as_str().unwrap();
   let destination = entry["destination"].as_str().unwrap();
   let read_only = entry["options"]
@@ -2084,11 +2100,6 @@ fn run_in_container(
     .unwrap()
     .iter()
     .any(|o| o == "ro");
-  let user = format!(
-    "{}:{}",
-    rustix::process::getuid().as_raw(),
-    rustix::process::getgid().as_raw()
-  );
   let name = format!("slates-oci-{}-{tag}", std::process::id());
   let mut bind = format!(
     "type=bind,source={source},destination={destination},bind-recursive=disabled,bind-propagation=private"
@@ -2097,13 +2108,11 @@ fn run_in_container(
     bind.push_str(",readonly");
   }
   let mut command = Command::new("docker");
+  command.args(["run", "--rm", "--name", &name, "--user", user]);
+  for group in groups {
+    command.args(["--group-add", group]);
+  }
   command.args([
-    "run",
-    "--rm",
-    "--name",
-    &name,
-    "--user",
-    &user,
     "--mount",
     &bind,
     CONTAINER_IMAGE,
@@ -3135,5 +3144,104 @@ fn slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it() {
     wait_for(|| attachments_of(&instance, &id) == "0"),
     "the daemon ended the mount's attachment"
   );
+  drop(anchor);
+}
+
+/// Shape: container identities other than the mounting user's — root, an ordinary Linux first user, and the
+/// mounting user with a supplementary group no host account holds (AUD-29-74).
+const OTHER_IDENTITIES: [(&str, &str, &[&str]); 3] = [
+  ("root", "0:0", &[]),
+  ("first-user", "1000:1000", &[]),
+  ("extra-group", "", &["12345"]),
+];
+/// Format: what each identity does in the container: name itself, make a file and a private directory, and
+/// print the owner it sees and the directory's mode.
+const IDENTITY_SCRIPT: &str = r#"R="$1"; T="$2"
+printf x > "$R/by-$T"
+mkdir "$R/d-$T" && chmod 700 "$R/d-$T"
+echo "--- seen"
+stat -c '%u:%g' "$R/by-$T"
+echo "--- mode"
+stat -c '%a' "$R/d-$T"
+"#;
+
+/// The host's view of `path`: `owner:group`, through the host mount.
+fn host_owner(path: &str) -> String {
+  let (code, out, err) = bounded(
+    Command::new("stat").args(["-f", "%u:%g", path]),
+    CONTAINER_WAIT,
+  )
+  .unwrap();
+  assert_eq!(code, 0, "{err}");
+  out.trim().to_owned()
+}
+
+/// One identity under `host_user_through_share`: the container as `user` with `groups` writes over the bind,
+/// sees its own ids on what it made and keeps a 0700 directory 0700, and the host sees both as `me`.
+fn assert_host_user_through_share(
+  entry: &serde_json::Value,
+  path: &str,
+  me: &str,
+  tag: &str,
+  user: &str,
+  groups: &[&str],
+) {
+  let (code, out, err) = run_in_container_as(entry, IDENTITY_SCRIPT, tag, user, groups)
+    .unwrap_or_else(|why| panic!("the container did not run: {why}"));
+  assert_eq!(code, 0, "{tag} wrote through the bind: {err}");
+  assert_eq!(section(&out, "seen"), [user], "{tag} sees its own ids");
+  assert_eq!(section(&out, "mode"), ["700"], "{tag}'s private directory");
+  for object in [format!("{path}/by-{tag}"), format!("{path}/d-{tag}")] {
+    assert_eq!(host_owner(&object), me, "{object} on the host");
+  }
+}
+
+/// AUD-29-74. Do: through Docker Desktop (the profile with evidence), ask the handshake for the profile's
+/// identity rule, then run containers as root, as 1000:1000, and as the mounting user with an extra group;
+/// each makes a file and a 0700 directory over the bind. Expect: the handshake states
+/// `host_user_through_share`, and the rule holds as stated — every identity writes, each container sees its
+/// own ids on what it made, the 0700 directory keeps 0700, and the host sees every object as the mounting
+/// user: container ids are not forwarded, so the attachment's capability is the authority. Gated like
+/// T-4.13 (`SLATES_TEST_CLI=1`, `mount_nfs`, a reachable runtime).
+#[test]
+fn a_containers_identity_reaches_the_export_as_its_profile_states() {
+  let Some(server) = container_leg_gate() else {
+    return;
+  };
+  eprintln!("AUD-29-74 over {server}");
+  let instance = format!("cli-oci-id-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "ocid", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = mount_point.path.clone();
+  mount_and_check(&instance, &id, &path);
+  let writer = attach_oci(&instance, &id, &path, "--write");
+  let entry = writer["established"]["binding"]["mount"].clone();
+  let (code, profile, err) = run(&instance, &["oci-runtime", "docker"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    profile.contains("identity: host_user_through_share"),
+    "{profile}"
+  );
+  let me = format!(
+    "{}:{}",
+    rustix::process::getuid().as_raw(),
+    rustix::process::getgid().as_raw()
+  );
+  for (tag, user, groups) in OTHER_IDENTITIES {
+    let user = if user.is_empty() { me.as_str() } else { user };
+    assert_host_user_through_share(&entry, &path, &me, tag, user, groups);
+  }
+
+  detach_all(&instance, &[writer["attachment"].as_u64().unwrap()]);
+  let _ = unmount_after_container(&instance, &path);
+  drop(mount_point);
   drop(anchor);
 }

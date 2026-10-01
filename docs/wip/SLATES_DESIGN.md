@@ -1880,6 +1880,13 @@ must exercise local communication and isolation between clones as well as namesp
 > profile no container workload has run through. The one profile with evidence is Docker Desktop on macOS
 > over its local socket (T-4.13, which runs the handshake before each bind).
 
+> **Status (2026-10-01, AUD-29-74: a profile states how a container's identity reaches the export).** The tested
+> profile's identity rule is measured and printed by the handshake. Through Docker Desktop on macOS, every
+> container identity reaches the export as the host user who runs Desktop's file sharing: ids and groups are not
+> forwarded, the container sees its own ids, and permission bits are kept. The attachment's capability is the
+> authority; no source is chowned or relabelled. A rootless or user-namespace engine, an SELinux-labelling engine
+> and every untested profile are refused typed.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

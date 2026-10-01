@@ -77,6 +77,9 @@ const ROOTLESS: &str = "rootless";
 /// Format: the security option `docker info` lists for user-namespace remapping (`name=userns`).
 const USER_NAMESPACE: &str = "userns";
 
+/// Format: the security option `docker info` lists for an engine enforcing SELinux labels (`name=selinux`).
+const SELINUX: &str = "selinux";
+
 /// Format: the test that ran a container workload through the tested profile.
 const TESTED_BY: &str = "T-4.13";
 
@@ -126,6 +129,21 @@ pub struct RuntimeProfile {
   pub rootless: bool,
   /// Whether the engine remaps users through a user namespace.
   pub user_namespace_remap: bool,
+  /// Whether the engine enforces SELinux labels on what it binds.
+  pub selinux_labels: bool,
+}
+
+/// How a container's identity reaches the export through a tested profile (AUD-29-74): measured, never
+/// assumed, since it decides who a container acts as on the volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityRule {
+  /// Every container identity reaches the export as the host user who runs the engine's file sharing:
+  /// container ids and supplementary groups are not forwarded, the container sees its own ids on what it
+  /// makes, and permission bits are kept. The authority is the attachment's capability, which the host
+  /// mount presented; a container's uid grants and withholds nothing. Measured through Docker Desktop
+  /// 29.3.1 on macOS (2026-10-01): as 501:20, 0:0, 1000:1000 and 501:20 with group 12345, each container
+  /// wrote and saw its own ids; the host saw every file as 501:20, a 0700 directory kept 0700.
+  HostUserThroughShare,
 }
 
 /// The evidence a judged profile holds.
@@ -135,6 +153,8 @@ pub struct TestedProfile {
   pub test: &'static str,
   /// The profile, in words.
   pub description: &'static str,
+  /// How a container's identity reaches the export.
+  pub identity: IdentityRule,
 }
 
 /// Why a runtime profile is not one a container workload has run through, typed.
@@ -157,6 +177,9 @@ pub enum ProfileRefusal {
   },
   /// The engine runs rootless or remaps users through a user namespace; the tested profile ran neither.
   UserNamespaceUntested,
+  /// The engine enforces SELinux labels: a bind would need the source relabelled, which nothing authorizes
+  /// (no recursive relabel, chown or host policy edit is implicit in an attachment).
+  SelinuxLabelsUntested,
   /// No container workload has run through this engine on this host.
   ProfileUntested {
     /// The engine's operating system as it named it.
@@ -182,6 +205,9 @@ impl std::fmt::Display for ProfileRefusal {
       ),
       Self::UserNamespaceUntested => f.write_str(
         "UserNamespaceUntested: the engine runs rootless or remaps users; no workload has run so",
+      ),
+      Self::SelinuxLabelsUntested => f.write_str(
+        "SelinuxLabelsUntested: the engine enforces SELinux labels; slates never relabels a source",
       ),
       Self::ProfileUntested { engine, host } => write!(
         f,
@@ -246,6 +272,7 @@ pub fn runtime_profile(endpoint: Endpoint, facts: &EngineFacts) -> RuntimeProfil
       .security_options
       .iter()
       .any(|o| names(o, USER_NAMESPACE)),
+    selinux_labels: facts.security_options.iter().any(|o| names(o, SELINUX)),
   }
 }
 
@@ -254,10 +281,14 @@ pub fn judge(profile: &RuntimeProfile, host: Host) -> Result<TestedProfile, Prof
   if profile.rootless || profile.user_namespace_remap {
     return Err(ProfileRefusal::UserNamespaceUntested);
   }
+  if profile.selinux_labels {
+    return Err(ProfileRefusal::SelinuxLabelsUntested);
+  }
   match (profile.engine, &profile.endpoint, host) {
     (Engine::DockerDesktop, Endpoint::UnixSocket(_), Host::MacOs) => Ok(TestedProfile {
       test: TESTED_BY,
       description: "Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing",
+      identity: IdentityRule::HostUserThroughShare,
     }),
     _ => Err(ProfileRefusal::ProfileUntested {
       engine: profile.operating_system.clone(),

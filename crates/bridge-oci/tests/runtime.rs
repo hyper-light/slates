@@ -5,7 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_oci::runtime::{
-  EngineFacts, Host, ProfileRefusal, admit_endpoint, judge, runtime_profile,
+  EngineFacts, Host, IdentityRule, ProfileRefusal, admit_endpoint, judge, runtime_profile,
 };
 
 /// Format: Docker Desktop's answer as this machine's engine gave it (29.3.1, 2026-10-01).
@@ -121,4 +121,25 @@ fn a_user_namespace_the_workload_never_ran_under_is_refused() {
       "{option}"
     );
   }
+}
+
+/// AUD-29-74. Do: judge Docker Desktop on macOS whose engine enforces SELinux labels; then read the tested
+/// profile's identity rule. Expect: `SelinuxLabelsUntested` — a labelled engine needs the source relabelled,
+/// which nothing authorizes; the tested profile states that container ids are not forwarded, so the
+/// attachment's capability, not a container's uid, is what reaches the export.
+#[test]
+fn a_labelling_engine_is_refused_and_the_tested_profile_states_its_identity_rule() {
+  let mut facts = desktop();
+  facts.security_options.push("name=selinux".to_owned());
+  let labelled = runtime_profile(admit_endpoint("docker", DESKTOP_SOCKET).unwrap(), &facts);
+  assert_eq!(
+    judge(&labelled, Host::MacOs),
+    Err(ProfileRefusal::SelinuxLabelsUntested)
+  );
+  let profile = runtime_profile(
+    admit_endpoint("docker", DESKTOP_SOCKET).unwrap(),
+    &desktop(),
+  );
+  let tested = judge(&profile, Host::MacOs).unwrap();
+  assert_eq!(tested.identity, IdentityRule::HostUserThroughShare);
 }

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 use slates_bridge_oci::runtime::{
-  EngineFacts, Host, admit_endpoint, admit_runtime, judge, runtime_profile,
+  EngineFacts, Host, IdentityRule, admit_endpoint, admit_runtime, judge, runtime_profile,
 };
 use slates_server::daemon::OBSERVE_BUDGET_NS;
 
@@ -247,6 +247,15 @@ fn endpoint_of(runtime: &str) -> Result<String, EngineAnswer> {
   }
 }
 
+/// A profile's identity rule on the CLI's output.
+fn identity_text(rule: IdentityRule) -> &'static str {
+  match rule {
+    IdentityRule::HostUserThroughShare => {
+      "host_user_through_share (container ids are not forwarded; the attachment's capability is the authority)"
+    }
+  }
+}
+
 /// `oci-runtime RUNTIME`: the profile and the evidence it holds (exit 0), or the typed refusal (exit 1).
 pub(crate) fn oci_runtime(runtime: &str) -> Result<(), Failure> {
   admit_runtime(runtime).map_err(|refusal| Failure::Refused(refusal.to_string()))?;
@@ -267,6 +276,7 @@ pub(crate) fn oci_runtime(runtime: &str) -> Result<(), Failure> {
   let tested =
     judge(&profile, Host::this()).map_err(|refusal| Failure::Refused(refusal.to_string()))?;
   println!("evidence: {} ({})", tested.test, tested.description);
+  println!("identity: {}", identity_text(tested.identity));
   Ok(())
 }
 

@@ -251,6 +251,14 @@ benchmarks.
   queries and the hostile-answer parser are `crates/cli/src/oci_runtime.rs`. Measured here: Docker
   Desktop 29.3.1 on `unix:///Users/…/.docker/run/docker.sock`, evidence T-4.13. The OCI row's own
   evidence class is `VerifiedSourceExport` (was `ContainerWorkloadTest`): what the export proves itself.
+- **A profile states how a container's identity reaches the export** (AUD-29-74, 2026-10-01), measured
+  and asserted by use (`a_containers_identity_reaches_the_export_as_its_profile_states`). Docker Desktop
+  on macOS is `host_user_through_share`. As 501:20, 0:0, 1000:1000 and 501:20 with group 12345, each
+  container wrote over the bind and saw its own ids (Desktop presents ownership as the container's;
+  `fakeowner` in the container's mount table), and a 0700 directory kept 0700. The host saw every object
+  as 501:20. Ids are not forwarded, so a container uid neither grants nor withholds access: the
+  attachment's capability does. Refused typed: rootless or `userns` engines, SELinux-labelling engines
+  (no relabel is implicit), and every untested profile.
 - **A cold report lives boxed** (`Box<TransportReport>`, `Box<OciBinding>`) rather than boxing every
   `ReplyBody`: the provisioning reply stays allocation-free (R9).
 - **The workload asserts the measured delete-while-open rule** rather than avoiding it: the
