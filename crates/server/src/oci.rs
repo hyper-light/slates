@@ -36,12 +36,15 @@ impl Binding {
   /// secret read back from the table) — and, where the table names an attachment (a Linux FUSE mount's
   /// `slates:<attachment>`; AUD-29-64), that very attachment, live: a stale, foreign or replaced source names
   /// an attachment the record does not hold at this point for this volume and principal. A stale or foreign source cannot create an orphan binding, and a
-  /// bind cannot promise rights the source does not carry.
+  /// bind cannot promise rights the source does not carry. The parent must present the version the bind asks
+  /// for — the head (`None`) or exactly `snapshot` (AUD-29-76) — so a recorded bind never claims one while the
+  /// container sees the other.
   pub(crate) fn consumer(
     &self,
     partition: &slates_db::partition::Partition,
     volume: slates_db::catalog::VolumeId,
     principal: &slates_db::catalog::Principal,
+    snapshot: Option<slates_db::catalog::SnapshotId>,
   ) -> Result<slates_db::catalog::Consumer, Refusal> {
     use slates_db::catalog::Consumer;
     let parent = partition
@@ -51,6 +54,7 @@ impl Binding {
         matches!(parent.consumer, Consumer::Bridge)
           && self.attachment.is_none_or(|named| parent.id == named)
           && parent.principal == *principal
+          && parent.snapshot == snapshot
           && parent.form.mount_point() == Some(self.mount_point.as_str())
           && parent.rights.read
           && (self.entry.read_only || parent.rights.write)
@@ -271,7 +275,7 @@ mod tests {
     let partition = partition();
     let volume = volume().id;
     assert_eq!(
-      binding(POINT, Some(MOUNTED)).consumer(&partition, volume, &OWNER),
+      binding(POINT, Some(MOUNTED)).consumer(&partition, volume, &OWNER, None),
       Ok(Consumer::Mount {
         attachment: MOUNTED
       })
@@ -283,7 +287,7 @@ mod tests {
     ] {
       assert!(
         matches!(
-          bad.consumer(&partition, volume, principal),
+          bad.consumer(&partition, volume, principal, None),
           Err(Refusal::Forbidden { .. })
         ),
         "{:?} at {} for {principal:?}",
@@ -292,10 +296,58 @@ mod tests {
       );
     }
     assert_eq!(
-      binding(POINT, None).consumer(&partition, volume, &OWNER),
+      binding(POINT, None).consumer(&partition, volume, &OWNER, None),
       Ok(Consumer::Mount {
         attachment: MOUNTED
       })
     );
+  }
+
+  /// AUD-29-76 (a bind of a snapshot mount). Do: beside the head's mount, record a mount of snapshot 7 at
+  /// another point; bind each point asking for the head and for snapshot 7. Expect: a bind binds only to a
+  /// mount presenting what it asks for — the head's point for the head, the snapshot's point for snapshot 7 —
+  /// and is refused `Forbidden` across them, so a recorded bind never claims the head while the container
+  /// sees a snapshot, or the reverse.
+  #[test]
+  fn a_bind_binds_only_to_a_mount_presenting_the_version_it_asks_for() {
+    let mut partition = partition();
+    let volume = volume().id;
+    let pinned = SnapshotId { value: 7 };
+    partition
+      .apply(&Op::AttachmentAdded {
+        record: AttachmentRecord {
+          id: UNKNOWN,
+          volume,
+          consumer: Consumer::Bridge,
+          snapshot: Some(pinned),
+          form: AttachForm::ChosenPath {
+            path: ELSEWHERE.to_owned(),
+          },
+          principal: OWNER,
+          rights: Rights {
+            read: true,
+            write: false,
+            admin: false,
+          },
+          token: [2; 16],
+        },
+      })
+      .unwrap();
+    let mut read_only = binding(ELSEWHERE, None);
+    read_only.entry.read_only = true;
+    assert_eq!(
+      read_only.consumer(&partition, volume, &OWNER, Some(pinned)),
+      Ok(Consumer::Mount {
+        attachment: UNKNOWN
+      })
+    );
+    assert!(matches!(
+      read_only.consumer(&partition, volume, &OWNER, None),
+      Err(Refusal::Forbidden { .. })
+    ));
+    assert!(matches!(
+      binding(POINT, None).consumer(&partition, volume, &OWNER, Some(pinned)),
+      Err(Refusal::Forbidden { .. })
+    ));
   }
 }

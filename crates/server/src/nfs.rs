@@ -311,17 +311,24 @@ fn with_export<R>(
     volumes,
     attachments,
     nfs_v4_files,
+    snapshot_views,
     ..
   } = s;
-  let slot = volumes.get_mut(handle).ok()?;
   let mut handles = new_handle_store();
-  let mut bridge = VolumeBridge::attached(
-    volume,
-    &mut slot.volume,
-    store,
-    &mut handles,
-    slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-  );
+  // A snapshot mount serves its attachment's read-only view; every other mount, the volume's head.
+  let mut bridge = match snapshot_views.get_mut(&capability.0) {
+    Some(view) => VolumeBridge::attached(volume, &mut view.volume, store, &mut handles, None),
+    None => {
+      let slot = volumes.get_mut(handle).ok()?;
+      VolumeBridge::attached(
+        volume,
+        &mut slot.volume,
+        store,
+        &mut handles,
+        slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      )
+    }
+  };
   attachments.begin(admitted).ok()?;
   let mut export = Export::over(&mut bridge, volume, subject, attachments, admitted);
   export.set_groups(groups);
@@ -353,9 +360,9 @@ fn admit_mount(
     return Some(mount.registry);
   }
   let record = s.db.partition().attachment(capability.0)?;
-  // The export presents the live head: a record naming a snapshot (one admitted before AUD-29-76's refusal,
-  // recovered from the log) is never served as that snapshot.
-  if record.snapshot.is_some() {
+  // A record naming a snapshot is served only through its view (`crate::snapshot_view`), never as the head
+  // (AUD-29-76): without a view it is admitted nowhere.
+  if record.snapshot.is_some() && !s.snapshot_views.contains_key(&capability.0) {
     return None;
   }
   let subject = record.principal.clone();

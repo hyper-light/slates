@@ -1909,6 +1909,11 @@ must exercise local communication and isolation between clones as well as namesp
 > a linked file's first name is removed its other names go stale through Desktop's share until the guest
 > revalidates; slates serves them at once.
 
+> **Status (2026-10-01, AUD-29-76: a snapshot is presented through a host mount).** A read host mount of a snapshot
+> serves the attachment's own read-only, copy-on-write view of it. The view pins the snapshot, closes with the
+> attachment or the volume's destroy, and is rebuilt at restart. A container bind of it is read-only and binds
+> only to a mount presenting that snapshot. Subtree exports are owed; their scope must be enforced by the export.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

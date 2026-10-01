@@ -573,70 +573,196 @@ fn read_through_the_mount(port: u16, path: &str, file: &str) -> Vec<u8> {
   common::nfs::read(&mut stream, &handle, 3)
 }
 
-/// AUD-29-76. Do: write `before` into a file through the volume's own mount, snapshot, write `after`, then
-/// attach the snapshot as a host mount. Expect: refused `SnapshotNotPresentedByHostMount` with nothing
-/// recorded — the host mount presents the live head, so presenting it for the snapshot would show `after`
-/// where the snapshot holds `before` (before 2026-10-01 the attach succeeded and its mount read `after`).
+/// A volume whose file `f` held `before` at its snapshot and holds `after!` now, with the connection that
+/// wrote it.
+struct Rewritten {
+  volume: VolumeId,
+  snapshot: slates_ipc::protocol::SnapshotId,
+  stream: std::net::TcpStream,
+  file: Vec<u8>,
+}
+
+/// Creates volume `name`, writes `before` into `f` through its own mount, snapshots it, then writes `after!`.
+#[cfg(unix)]
+fn rewritten_after_a_snapshot(
+  daemon: &Daemon,
+  client: &mut Client,
+  port: u16,
+  name: &str,
+) -> Rewritten {
+  let volume = create(client, name);
+  let capability = daemon.mount_capability(name).unwrap().unwrap();
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut stream, &capability, 1);
+  let file = common::nfs::create(&mut stream, &root, "f", 2);
+  common::nfs::write(&mut stream, &file, b"before", 3);
+  let ReplyBody::Snapshotted { id: snapshot, .. } = client.call(&RequestBody::Snapshot { volume })
+  else {
+    panic!("snapshot");
+  };
+  common::nfs::write(&mut stream, &file, b"after!", 4);
+  Rewritten {
+    volume,
+    snapshot,
+    stream,
+    file,
+  }
+}
+
+/// Attaches `snapshot` of `volume` (named `name`) as a read host mount: the attachment and its capability path.
+#[cfg(unix)]
+fn snapshot_mount(
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: slates_ipc::protocol::SnapshotId,
+  name: &str,
+) -> (u64, String) {
+  let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: Some(snapshot),
+    intent: Intent::Read,
+    form: AttachRequest::HostMount,
+  })
+  else {
+    panic!("the snapshot's read mount attaches");
+  };
+  let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+  (attachment, format!("/{name}@{attachment:x}.{token_hex}"))
+}
+
+/// A write intent on a snapshot is refused typed: a snapshot is immutable.
+#[cfg(unix)]
+fn assert_a_snapshot_is_never_attached_for_a_write(
+  client: &mut Client,
+  volume: VolumeId,
+  snapshot: slates_ipc::protocol::SnapshotId,
+) {
+  let write_intent = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: Some(snapshot),
+    intent: Intent::Write,
+    form: AttachRequest::HostMount,
+  });
+  assert!(
+    matches!(
+      write_intent,
+      ReplyBody::Refused {
+        refusal: Refusal::AttachmentUnsupported {
+          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+          ..
+        },
+        ..
+      }
+    ),
+    "{write_intent:?}"
+  );
+}
+
+/// The snapshot mount at `path` reads `before`, refuses a write, and still reads `before` after it.
+#[cfg(unix)]
+fn assert_the_mount_presents_the_snapshot_read_only(port: u16, path: &str) {
+  assert_eq!(read_through_the_mount(port, path, "f"), b"before");
+  let mut view = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let view_root = common::nfs::mount(&mut view, path, 1);
+  let view_file = common::nfs::lookup(&mut view, &view_root, "f", 2);
+  assert_ne!(
+    common::nfs::write_status(&mut view, &view_file, b"wrong!", 3),
+    0,
+    "a write through the snapshot's mount is refused"
+  );
+  assert_eq!(read_through_the_mount(port, path, "f"), b"before");
+}
+
+/// AUD-29-76. Do: write `before` into a file through the volume's own mount, snapshot, write `after!`; attach the
+/// snapshot as a host mount for a read and for a write; read and write the file through the read mount; destroy
+/// the snapshot while it is mounted and again after the detach. Expect: the read mount presents the snapshot —
+/// `before`, never the head's `after!` (before 2026-10-01 it was refused; earlier still, attached and showing
+/// the head); a write through it is refused and leaves the snapshot unchanged; a write intent is refused typed
+/// (a snapshot is immutable); the snapshot cannot be destroyed while a mount presents it (`Pinned`), and can
+/// once the mount is detached; the head still reads `after!`.
 #[cfg(unix)]
 #[test]
-fn a_snapshot_is_never_presented_through_a_host_mount_of_the_head() {
+fn a_snapshot_host_mount_presents_the_snapshot_read_only_and_pins_it() {
   let (daemon, instance) = single_shard_daemon("attach-forms-snapshot-mount");
   let Some(port) = daemon.nfs_port() else {
     eprintln!("SKIP: the loopback export did not bind, so no host mount is offered here");
     return;
   };
   let mut client = Client::connect(&instance);
-  let id = create(&mut client, "pinned");
-  let capability = daemon.mount_capability("pinned").unwrap().unwrap();
-  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let root = common::nfs::mount(&mut stream, &capability, 1);
-  let file = common::nfs::create(&mut stream, &root, "f", 2);
-  common::nfs::write(&mut stream, &file, b"before", 3);
-  let ReplyBody::Snapshotted { id: snapshot, .. } =
-    client.call(&RequestBody::Snapshot { volume: id })
-  else {
-    panic!("snapshot");
-  };
-  common::nfs::write(&mut stream, &file, b"after!", 4);
-  let recorded = status(&mut client, id).attachments;
-  let reply = client.call(&RequestBody::Attach {
+  let Rewritten {
     volume: id,
-    snapshot: Some(snapshot),
-    intent: Intent::Read,
-    form: AttachRequest::HostMount,
-  });
-  if let ReplyBody::Attached {
-    attachment,
-    token: Some(token),
-    ..
-  } = &reply
-  {
-    let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
-    let presented =
-      read_through_the_mount(port, &format!("/pinned@{attachment:x}.{token_hex}"), "f");
-    panic!(
-      "a host mount of the snapshot was attached and presents {:?}",
-      String::from_utf8_lossy(&presented)
-    );
-  }
+    snapshot,
+    mut stream,
+    file,
+  } = rewritten_after_a_snapshot(&daemon, &mut client, port, "pinned");
+  assert_a_snapshot_is_never_attached_for_a_write(&mut client, id, snapshot);
+  let (attachment, path) = snapshot_mount(&mut client, id, snapshot, "pinned");
+  assert_the_mount_presents_the_snapshot_read_only(port, &path);
+  let destroy = RequestBody::DestroySnapshot {
+    volume: id,
+    snapshot,
+  };
   assert!(
-    matches!(
-      reply,
-      ReplyBody::Refused {
-        refusal: Refusal::AttachmentUnsupported {
-          transport: AttachTransport::NfsLoopback,
-          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
-        },
-        ..
-      }
-    ),
-    "{reply:?}"
+    matches!(client.call(&destroy), ReplyBody::Refused { .. }),
+    "a mounted snapshot is pinned"
+  );
+  assert!(matches!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  ));
+  assert!(
+    matches!(client.call(&destroy), ReplyBody::SnapshotDestroyed),
+    "the detach unpinned it"
   );
   assert_eq!(
-    status(&mut client, id).attachments,
-    recorded,
-    "nothing recorded"
+    common::nfs::read(&mut stream, &file, 5),
+    b"after!",
+    "the head is untouched"
   );
   drop(client);
   drop(daemon);
+}
+
+/// AUD-29-76 (a snapshot mount across a restart). Do: as above, write `before`, snapshot, write `after!`, attach
+/// the snapshot as a read host mount; stop the daemon (a stop publishes nothing) and start a second over the same
+/// anchor segment; read the file through the same mount capability. Expect: the second daemon rebuilt the
+/// mount's view from its record, so the capability still presents `before`, not the head.
+#[cfg(unix)]
+#[test]
+fn a_snapshot_host_mount_presents_the_snapshot_again_after_a_restart() {
+  use common::anchor::{anchor_segment, source_of};
+  let profile = common::machine_profile();
+  let instance = format!("srv-snapshot-view-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("snapshot-view", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let Some(port) = first.nfs_port() else {
+    eprintln!("SKIP: the loopback export did not bind, so no host mount is offered here");
+    return;
+  };
+  let mut client = Client::connect(&instance);
+  let rewritten = rewritten_after_a_snapshot(&first, &mut client, port, "kept");
+  let (_, path) = snapshot_mount(&mut client, rewritten.volume, rewritten.snapshot, "kept");
+  let stream = rewritten.stream;
+  assert_eq!(read_through_the_mount(port, &path, "f"), b"before");
+  drop(stream);
+  drop(client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second.nfs_port().expect("the second daemon serves NFS");
+  assert_eq!(
+    read_through_the_mount(port, &path, "f"),
+    b"before",
+    "the view was rebuilt from the record"
+  );
+  second.stop();
+  drop(segment);
 }

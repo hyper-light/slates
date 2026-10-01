@@ -223,6 +223,17 @@ pub(crate) fn write(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u3
   assert_eq!(status(&reply), 0, "WRITE succeeded");
 }
 
+/// NFS WRITE `data` at offset zero to `file_fh` (FILE_SYNC): the status the server answered.
+pub(crate) fn write_status(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u32) -> u32 {
+  let mut args = Vec::new();
+  opaque(file_fh, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // offset
+  args.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes()); // count
+  args.extend_from_slice(&2u32.to_be_bytes()); // stable: FILE_SYNC
+  opaque(data, &mut args);
+  status(&call(stream, NFS_PROGRAM, 7, &args, xid))
+}
+
 /// NFS READ up to 400 bytes at offset zero from `file_fh`.
 pub(crate) fn read(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> {
   read_bytes_status(stream, file_fh, xid)

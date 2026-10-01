@@ -2869,7 +2869,11 @@ fn entry_allowance(size: SizeClass) -> u64 {
   .get()
 }
 
-fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> VolumeConfig {
+pub(crate) fn volume_config(
+  state: &mut ShardState,
+  names: NamePolicy,
+  quota: Quota,
+) -> VolumeConfig {
   let prefix = state.next_prefix;
   state.next_prefix = state.next_prefix.wrapping_add(1).max(1);
   let journal_bytes = journal_bytes_for(state, &quota);
@@ -2885,7 +2889,7 @@ fn volume_config(state: &mut ShardState, names: NamePolicy, quota: Quota) -> Vol
   }
 }
 
-fn quota_for(size: SizeClass) -> Quota {
+pub(crate) fn quota_for(size: SizeClass) -> Quota {
   match size {
     SizeClass::Bounded { limit } => Quota::Bounded { limit },
     SizeClass::Dynamic { max } => Quota::Dynamic {
@@ -2902,7 +2906,7 @@ fn quota_for(size: SizeClass) -> Quota {
   }
 }
 
-fn wire_names(names: DbNamePolicy) -> NamePolicy {
+pub(crate) fn wire_names(names: DbNamePolicy) -> NamePolicy {
   match names {
     DbNamePolicy::Exact => NamePolicy::Exact,
     DbNamePolicy::Fold => NamePolicy::Fold,
@@ -3222,7 +3226,7 @@ fn give_back(
 /// Reserves a volume's records against the shard's metadata ledger (§4.2 metadata dimension) before
 /// the volume exists: its journal's whole retention budget, its object and its snapshot slab's first
 /// segment, whole or not at all, so the sum of every volume's metadata stays inside the class.
-fn reserve_metadata(
+pub(crate) fn reserve_metadata(
   state: &mut ShardState,
   journal_bytes: usize,
 ) -> Result<slates_mem::budget::MetadataCredit, Refusal> {
@@ -4367,7 +4371,14 @@ fn attach(
   };
   let consumer = binding.as_ref().map_or_else(
     || consumer_of(&form, client_id),
-    |binding| binding.consumer(state.db.partition(), record.id, principal),
+    |binding| {
+      binding.consumer(
+        state.db.partition(),
+        record.id,
+        principal,
+        snapshot.map(to_db_snapshot),
+      )
+    },
   );
   let consumer = match consumer {
     Ok(consumer) => consumer,
@@ -4423,11 +4434,8 @@ fn attach(
       token,
     );
   }
-  let op = Op::AttachmentAdded {
-    record: attachment_record,
-  };
-  if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
-    return refused(refusal_of_db(&e));
+  if let Err(refusal) = commit_attachment(state, &record, &form, attachment_record, now) {
+    return refused(refusal);
   }
   capability.read_write = read_write_of(intent);
   ReplyBody::Attached {
@@ -4439,6 +4447,40 @@ fn attach(
     capability,
     token: (!borrows_mount).then_some(token),
   }
+}
+
+/// Commits an attachment record. A host mount of a snapshot opens its read-only view first (AUD-29-76), so a
+/// refusal changes nothing, and closes it again if the record does not commit.
+fn commit_attachment(
+  state: &mut ShardState,
+  volume: &VolumeRecord,
+  form: &AttachRequest,
+  attachment: AttachmentRecord,
+  now: u64,
+) -> Result<(), Refusal> {
+  let view = match (form, attachment.snapshot) {
+    (AttachRequest::HostMount, Some(snapshot)) => Some(crate::snapshot_view::open(
+      state,
+      volume.id,
+      core_snapshot(SnapshotId {
+        value: snapshot.value,
+      }),
+      wire_names(volume.policy.names),
+    )?),
+    _ => None,
+  };
+  let id = attachment.id;
+  let op = Op::AttachmentAdded { record: attachment };
+  if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
+    if let Some(view) = view {
+      crate::snapshot_view::close(state, view);
+    }
+    return Err(refusal_of_db(&e));
+  }
+  if let Some(view) = view {
+    state.snapshot_views.insert(id, view);
+  }
+  Ok(())
 }
 
 /// Whether `rights` permit an attach with `intent`.
@@ -4621,8 +4663,10 @@ fn establish_form(
     AttachRequest::Root => return Ok(None),
     // The host mount presents the live head, never a snapshot: attaching one for a snapshot would show the
     // head where the snapshot is asked for (AUD-29-76).
+    // A host mount of a snapshot presents the attachment's own read-only view of it (`crate::snapshot_view`),
+    // never the head (AUD-29-76): only a read may attach one, since a snapshot is immutable.
     AttachRequest::HostMount => {
-      if snapshot.is_some() {
+      if snapshot.is_some() && matches!(intent, Intent::Write) {
         return Err(Refusal::AttachmentUnsupported {
           transport: AttachTransport::NfsLoopback,
           reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
@@ -4659,7 +4703,9 @@ fn establish_form(
       reason,
     });
   }
-  if snapshot.is_some() {
+  // A bind of a snapshot borrows a host mount presenting that snapshot (`oci::Binding::consumer`), and a
+  // snapshot is immutable: only a read binds one (AUD-29-76).
+  if snapshot.is_some() && matches!(intent, Intent::Write) {
     return Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
       reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
@@ -4845,6 +4891,8 @@ pub(crate) fn end_attachment(
     now,
   )?;
   crate::merge_service::forget_attachment(state, record.id);
+  // A host mount of a snapshot releases its view, unpinning the snapshot (AUD-29-76).
+  crate::snapshot_view::end(state, record.id);
   // A FUSE mount of the attachment is unmounted; the kernel's disconnect ends its serve task.
   #[cfg(target_os = "linux")]
   crate::fuse::unmount_if_mounted(state, record.id);
@@ -5043,6 +5091,8 @@ fn destroy(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> R
       return refused(refusal_of_db(&e));
     }
   }
+  // The volume's snapshot views close first, unpinning the snapshots its destroy frees (AUD-29-76).
+  crate::snapshot_view::end_all_of(state, record.id);
   if let Ok(slot) = state.volumes.get_mut(handle)
     && let Err(e) = slot.volume.destroy(&mut state.store)
   {
@@ -6440,6 +6490,8 @@ pub struct Rebuilt {
   /// process held; a destroy completing after the last publish, or a clone's record never
   /// committing, leaves them ahead of the catalog).
   pub pins_reconciled: usize,
+  /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
+  pub snapshot_views: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
   /// fresh clone of their green's head (their scratch edits did not survive).
   pub merge_volumes: usize,
@@ -6536,6 +6588,8 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   state.next_prefix = max_prefix;
   rebuilt.destroys_completed = complete_recovered_destroys(state);
   rebuilt.pins_reconciled = reconcile_clone_pins(state);
+  // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
+  rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
   rebuilt
 }
 

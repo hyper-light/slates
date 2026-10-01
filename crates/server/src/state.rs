@@ -271,6 +271,9 @@ pub struct ShardState {
   /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
   /// emptied by that step; bounded by the partition's attachment cap.
   pub(crate) stale_fuse_mounts: Vec<(u64, String)>,
+  /// The read-only views of snapshots presented through host mounts, by attachment (AUD-29-76;
+  /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot mount.
+  pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,
   /// The guest devices this shard serves and the consumer each was admitted for (§4.6, §4.13; AUD-29-73), so a
   /// consumer's revocation reaches its devices. Bounded by the shard's device limit (`clients_per_shard`, the
   /// loop registry's bound): an entry is added when a loop registers and removed when it ends.

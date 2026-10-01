@@ -60,6 +60,7 @@ mod owner_location;
 pub mod oci;
 pub mod peer;
 mod reap;
+mod snapshot_view;
 pub mod state;
 mod status_pages;
 pub mod takeover;
