@@ -1541,6 +1541,7 @@ dependencies = [
 name = "slates-cluster"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "proptest",
  "rcgen",
  "rustix",

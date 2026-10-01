@@ -501,6 +501,10 @@ pub struct ShardState {
   /// bridge (`crate::nfs`) against the host clock. Bounded by the members; empty on a laptop, where
   /// `f = 0` needs no confirmation.
   pub lease: crate::lease::OwnerLease,
+  /// What the control shard last delivered to each other shard's configuration fan (AUD-29-29): a period
+  /// fans a shard only the parts that changed since, and records a delivery only once its bounded channel
+  /// accepted it, so a refused fan is sent again the next period. Bounded by the shards.
+  pub(crate) fanned: crate::fleet::Fanned,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder

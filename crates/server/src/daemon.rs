@@ -2469,6 +2469,7 @@ fn init_shard(
       configuration_installed_ns: Some(now),
       ..crate::lease::OwnerLease::default()
     },
+    fanned: crate::fleet::Fanned::default(),
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),

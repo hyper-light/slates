@@ -23,6 +23,8 @@ slates-archive = { workspace = true }
 slates-mem = { workspace = true }
 
 [dev-dependencies]
+# the retention publication's hash, timed by the publication-cost measurement (AUD-29-30).
+blake3 = { workspace = true }
 # self-signed enrolled identities for the holder-and-owner sessions in the tests.
 rcgen = { workspace = true }
 rustls = { workspace = true }

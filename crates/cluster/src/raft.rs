@@ -940,6 +940,12 @@ pub struct RaftNode {
   log_budget: usize,
   /// A won election's recovery still being materialized (AUD-29-37).
   recovery: Option<Recovery>,
+  /// The wire bytes of the log above the snapshot, kept as the log changes so a proposal is admitted against
+  /// the log budget without walking the log (AUD-29-30; a walk per proposal cost 20 ms at a 5,000-entry
+  /// backlog, 2026-09-29).
+  log_bytes_held: usize,
+  /// Proposals and membership entries refused because they would take the log past its budget (AUD-29-30).
+  budget_refused: u64,
 }
 
 /// A won election's recovery (AUD-29-37): the values decided above the log from the windows, appended a
@@ -1052,6 +1058,8 @@ impl RaftNode {
       window_counters: WindowCounters::default(),
       log_budget: usize::MAX,
       recovery: None,
+      log_bytes_held: 0,
+      budget_refused: 0,
     }
   }
 
@@ -1959,7 +1967,12 @@ impl RaftNode {
 
   /// The wire bytes of the whole log above the snapshot — what its log budget is measured against.
   pub fn log_bytes(&self) -> usize {
-    self.log_bytes_through(self.last_log_index())
+    self.log_bytes_held
+  }
+
+  /// Entries a leader refused because they would take its log past its budget (AUD-29-30).
+  pub fn budget_refused(&self) -> u64 {
+    self.budget_refused
   }
 
   /// The wire bytes of the log entries above the snapshot through `index` — what compacting to `index`
@@ -2008,7 +2021,12 @@ impl RaftNode {
       self.joint = config.joint;
     }
     self.retention_pending = true;
-    self.log.drain(0..discard);
+    let compacted = self
+      .log
+      .drain(0..discard)
+      .map(|entry| entry.encoded_len())
+      .fold(0usize, usize::saturating_add);
+    self.log_bytes_held = self.log_bytes_held.saturating_sub(compacted);
     self.config_entries = self.config_entries.split_off(&up_to.saturating_add(1));
     self.snapshot_index = up_to;
     self.snapshot_term = term;
@@ -2069,12 +2087,18 @@ impl RaftNode {
         )
         .unwrap_or(usize::MAX)
         .min(self.log.len());
-        self.log.drain(0..discard);
+        let installed = self
+          .log
+          .drain(0..discard)
+          .map(|entry| entry.encoded_len())
+          .fold(0usize, usize::saturating_add);
+        self.log_bytes_held = self.log_bytes_held.saturating_sub(installed);
         self.config_entries = self
           .config_entries
           .split_off(&request.last_included_index.saturating_add(1));
       } else {
         self.log.clear();
+        self.log_bytes_held = 0;
         self.config_entries.clear();
       }
       self.snapshot_index = request.last_included_index;
@@ -2198,6 +2222,13 @@ impl RaftNode {
   /// leader appends after its recovery is its **sync point**: a follower whose log holds it is synced to this
   /// term ([`AppendEntries::sync_index`]). Refused (`false`, counted) when the log index has no successor.
   fn leader_append(&mut self, entry: LogEntry) -> bool {
+    // Admitted against the log budget before the log changes (AUD-29-30): an entry past it would make the
+    // next retention publication overflow its region and close the control shard, after the protocol had
+    // already moved; refused here, the proposer is told at once and nothing changed.
+    if self.log_bytes_held.saturating_add(entry.encoded_len()) > self.log_budget {
+      self.budget_refused = self.budget_refused.saturating_add(1);
+      return false;
+    }
     if !self.push_entry(entry) {
       return false;
     }
@@ -3413,6 +3444,14 @@ impl RaftNode {
     let keep = usize::try_from(index.saturating_sub(self.snapshot_index).saturating_sub(1))
       .unwrap_or(usize::MAX);
     self.retention_pending |= keep < self.log.len();
+    let removed = self
+      .log
+      .get(keep..)
+      .unwrap_or(&[])
+      .iter()
+      .map(LogEntry::encoded_len)
+      .fold(0usize, usize::saturating_add);
+    self.log_bytes_held = self.log_bytes_held.saturating_sub(removed);
     self.log.truncate(keep);
     self.config_entries.split_off(&index);
   }
@@ -3434,8 +3473,6 @@ impl RaftNode {
     }
   }
 
-  /// Whether `request`'s entries would run past the last representable index (counted in
-  /// `indices_exhausted`): such an append is refused whole, before the log is touched.
   /// Admits an append before it touches any state (AUD-29-38): a leader's term of at least one, a previous
   /// position consistent with itself and no later than the term, and entries recovery would keep — terms
   /// nonzero, never decreasing from the previous position's, no later than the leader's — with legal
@@ -3474,6 +3511,8 @@ impl RaftNode {
     self.malformed.get(&kind).copied().unwrap_or(0)
   }
 
+  /// Whether `request`'s entries would run past the last representable index (counted in
+  /// `indices_exhausted`): such an append is refused whole, before the log is touched.
   fn runs_past_the_index_range(&mut self, request: &AppendEntries) -> bool {
     let reaches = u64::try_from(request.entries.len())
       .ok()
@@ -3496,6 +3535,7 @@ impl RaftNode {
     if entry.config.is_some() {
       self.config_entries.insert(index);
     }
+    self.log_bytes_held = self.log_bytes_held.saturating_add(entry.encoded_len());
     self.log.push(entry);
     true
   }
@@ -6908,6 +6948,13 @@ mod tests {
       let refused_before = MALFORMED_KINDS.map(|kind| node.malformed(kind));
       apply_admission_step(&mut node, step);
       let after = node.saved();
+      let recounted = node.log_bytes_through(node.last_log_index());
+      if node.log_bytes() != recounted {
+        return Err(format!(
+          "{step:?} left the kept log size {} where the log holds {recounted}",
+          node.log_bytes()
+        ));
+      }
       RaftNode::restore(after.clone())
         .map_err(|error| format!("{step:?} left a state recovery refuses: {error:?}"))?;
       let refused = MALFORMED_KINDS
@@ -7128,5 +7175,33 @@ mod tests {
       assert_eq!(node.log[at].command, b"chosen far above".to_vec());
       assert_eq!(node.log[at].term, next.term());
     }
+  }
+
+  /// Shape: the proposals a full log holds in the admission test.
+  const PROPOSALS_IN_BUDGET: usize = 4;
+
+  /// AUD-29-30 (admission before mutation). Do: a lone voter leads with a log budget of its no-op and
+  /// [`PROPOSALS_IN_BUDGET`] one-byte commands, proposes one more, then compacts its committed prefix and
+  /// proposes again. Expect: the proposals within the budget are appended; the one past it is refused with
+  /// the retained state unchanged and the refusal counted; and once compaction frees the room, proposals are
+  /// admitted again — where before every proposal was appended and the next publication could overflow its
+  /// region after the protocol had moved.
+  #[test]
+  fn a_proposal_past_the_log_budget_is_refused_before_the_log_changes() {
+    let mut leader = RaftNode::new(A, vec![A]);
+    let _ = leader.start_election().unwrap();
+    assert!(leader.append_command(Vec::new()));
+    let command_bytes = LogEntry::command(leader.term(), vec![1]).encoded_len();
+    leader.set_log_budget(leader.log_bytes() + PROPOSALS_IN_BUDGET * command_bytes);
+    for _ in 0..PROPOSALS_IN_BUDGET {
+      assert!(leader.append_command(vec![1]));
+    }
+    let before = leader.saved();
+    assert!(!leader.append_command(vec![1]), "past the budget");
+    assert_eq!(leader.saved(), before, "a refusal changes nothing");
+    assert_eq!(leader.budget_refused(), 1);
+    assert!(leader.compact(leader.commit_index(), Vec::new()));
+    assert_eq!(leader.log_bytes(), 0);
+    assert!(leader.append_command(vec![1]), "compaction freed the room");
   }
 }

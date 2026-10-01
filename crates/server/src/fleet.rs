@@ -6413,56 +6413,156 @@ fn sync_config_from_council(local: HostId) {
 /// and promotions), so the per-period cost is bounded at every scale. A non-control shard tracks no held
 /// object, so its `install_configuration` returns no reassignment to drive — takeover stays on this shard.
 fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
-  let Some((placement, members, root, ready, lease)) = state::with_state(|s| {
+  let Some(fans) = state::with_state(|s| {
     // Prune the owner-lease ledgers to the current members each period (a restarted peer's retired id
     // leaves; §4.8 "Leases and reads", AUD-08), then fan this node's lease evidence to every owner shard —
     // the verb gate (`verbs::dispatch`) and the mount (`crate::nfs`) run there and must read the same
     // confirmation the control shard's probe tasks collected. `answers_given` and `departed_owners` stay on
     // the control shard (only the takeover drive reads them), so they are not fanned.
-    s.lease.retain_members(&members_snapshot(s));
-    s.answers_given.retain_members(&members_snapshot(s));
-    (
-      s.fleet.configuration().clone(),
-      s.fleet.members().to_vec(),
-      s.root.configuration().clone(),
-      s.consensus_ready,
-      s.lease.clone(),
-    )
+    let members = s.fleet.members();
+    s.lease.retain_members(members);
+    s.answers_given.retain_members(members);
+    s.fanned.observe_lease(&s.lease);
+    let mut fans = Vec::new();
+    for shard in shards.iter().copied().filter(|shard| *shard != origin) {
+      if let Some(fan) = s.fanned.owed(s, shard) {
+        fans.push((shard, fan));
+      } else {
+        count_refusal_in(s, FAN_UNCHANGED);
+      }
+    }
+    fans
   }) else {
     return;
   };
-  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
-    let placement = placement.clone();
-    let members = members.clone();
-    let root = root.clone();
-    let lease = lease.clone();
-    let _ = run_on(origin, shard, move |s| {
-      if !s.consensus_ready || placement.version > s.fleet.configuration().version {
-        // This shard serves its own writes, so it measures the fanned configuration against the durability
-        // policy for itself (the shortfall its writes are refused with); the control shard already counted
-        // this change's breach, so the measurement here moves no signal.
-        s.durability_shortfall = s
-          .config
-          .fleet
-          .as_ref()
-          .and_then(|membership| membership.durability)
-          .and_then(|bound| bound.shortfall(&placement));
-        s.fleet.install_configuration(placement, &members);
+  for (shard, fan) in fans {
+    let delivered = fan.delivered();
+    match run_on(origin, shard, move |s| fan.install(s)) {
+      Ok(()) => {
+        let _ = state::with_state(|s| {
+          s.fanned.record(shard, delivered);
+          count_refusal_in(s, FAN_SENT);
+        });
       }
-      s.root.adopt(root);
-      s.consensus_ready = ready;
-      // The owner lease is authoritative on the control shard; every other shard reads the fanned copy.
-      // The confirmations carry absolute send times on the shared host clock, so a fan a full channel
-      // dropped only shortens the lease on that shard until the next period re-fans it (never lengthens it).
-      s.lease = lease;
-    });
+      Err(_) => {
+        let _ = state::with_state(|s| count_refusal_in(s, FAN_REFUSED));
+      }
+    }
   }
 }
 
-/// The current fleet members as a plain vector — the argument the lease pruners take. A brief read used
-/// twice in one borrow, factored so neither call clones the membership through a longer path.
-fn members_snapshot(state: &ShardState) -> Vec<HostId> {
-  state.fleet.members().to_vec()
+/// Counter: a period's configuration fan to a shard carried something that changed (AUD-29-29).
+pub(crate) const FAN_SENT: &str = "fleet.fan.sent";
+/// Counter: a period found nothing changed for a shard and sent it nothing (AUD-29-29).
+pub(crate) const FAN_UNCHANGED: &str = "fleet.fan.unchanged";
+/// Counter: a shard's bounded channel refused a fan; it is sent again the next period (AUD-29-29).
+pub(crate) const FAN_REFUSED: &str = "fleet.fan.refused";
+
+/// What one shard last received of the configuration fan: the placement and root versions, the readiness
+/// flag, and the lease's generation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Delivered {
+  placement: u64,
+  root: u64,
+  ready: Option<bool>,
+  lease: u64,
+}
+
+/// The control shard's memory of the configuration fan (AUD-29-29): what each other shard last received, and
+/// the lease as last fanned with a generation counting its changes, so a period clones and sends only what a
+/// shard lacks. Before 2026-10-01 every period cloned the placement, the members, the root configuration and
+/// the lease once, and again for every shard, and the receiver checked versions only after the copies.
+#[derive(Debug, Default)]
+pub(crate) struct Fanned {
+  shards: std::collections::BTreeMap<u16, Delivered>,
+  lease: crate::lease::OwnerLease,
+  lease_generation: u64,
+}
+
+impl Fanned {
+  /// Notes the control shard's lease: a change since the last fanned copy is a new generation.
+  fn observe_lease(&mut self, lease: &crate::lease::OwnerLease) {
+    if *lease != self.lease {
+      self.lease = lease.clone();
+      self.lease_generation = self.lease_generation.saturating_add(1);
+    }
+  }
+
+  /// The fan `shard` is owed now — only the parts newer than what it last received — or `None` when it holds
+  /// everything already.
+  fn owed(&self, state: &ShardState, shard: u16) -> Option<Fan> {
+    let had = self.shards.get(&shard).copied().unwrap_or_default();
+    let placement = state.fleet.configuration();
+    let root = state.root.configuration();
+    let fan = Fan {
+      placement: (placement.version > had.placement || had.ready.is_none())
+        .then(|| (placement.clone(), state.fleet.members().to_vec())),
+      root: (root.version > had.root).then(|| root.clone()),
+      ready: (had.ready != Some(state.consensus_ready)).then_some(state.consensus_ready),
+      lease: (self.lease_generation > had.lease).then(|| self.lease.clone()),
+      now: Delivered {
+        placement: placement.version,
+        root: root.version,
+        ready: Some(state.consensus_ready),
+        lease: self.lease_generation,
+      },
+    };
+    fan.carries().then_some(fan)
+  }
+
+  /// Records that `shard`'s channel accepted a fan of `delivered`.
+  fn record(&mut self, shard: u16, delivered: Delivered) {
+    self.shards.insert(shard, delivered);
+  }
+}
+
+/// One shard's configuration fan: each part present only when the shard lacks it.
+struct Fan {
+  placement: Option<(slates_db::register::Configuration, Vec<HostId>)>,
+  root: Option<slates_db::register::RootConfiguration>,
+  ready: Option<bool>,
+  lease: Option<crate::lease::OwnerLease>,
+  now: Delivered,
+}
+
+impl Fan {
+  fn carries(&self) -> bool {
+    self.placement.is_some() || self.root.is_some() || self.ready.is_some() || self.lease.is_some()
+  }
+
+  fn delivered(&self) -> Delivered {
+    self.now
+  }
+
+  /// Installs the fan on the receiving shard; each install stays version-gated there.
+  fn install(self, s: &mut ShardState) {
+    if let Some((placement, members)) = self.placement
+      && (!s.consensus_ready || placement.version > s.fleet.configuration().version)
+    {
+      // This shard serves its own writes, so it measures the fanned configuration against the durability
+      // policy for itself (the shortfall its writes are refused with); the control shard already counted this
+      // change's breach, so the measurement here moves no signal.
+      s.durability_shortfall = s
+        .config
+        .fleet
+        .as_ref()
+        .and_then(|membership| membership.durability)
+        .and_then(|bound| bound.shortfall(&placement));
+      s.fleet.install_configuration(placement, &members);
+    }
+    if let Some(root) = self.root {
+      s.root.adopt(root);
+    }
+    if let Some(ready) = self.ready {
+      s.consensus_ready = ready;
+    }
+    // The owner lease is authoritative on the control shard; every other shard reads the fanned copy. The
+    // confirmations carry absolute send times on the shared host clock, so a fan a full channel dropped only
+    // shortens the lease on that shard until the next period re-fans it (never lengthens it).
+    if let Some(lease) = self.lease {
+      s.lease = lease;
+    }
+  }
 }
 
 /// The record-plane coordinator (§4.8 "records are sent to all candidates; committed at `f + 1`"; "Promotion
@@ -7567,5 +7667,92 @@ mod tests {
       HEARTBEAT_NS,
       "short rounds as common as placed ones: one snapshot per period, the floor"
     );
+  }
+
+  /// Shape: the receiving shard of the fan tests — any shard other than the fixture's own.
+  const OTHER_SHARD: u16 = 1;
+
+  /// AUD-29-29 (§4.8, D-7). Do: on the control shard, ask what another shard is owed across periods — a
+  /// first fan, a recorded delivery, a lease change, a newer placement, and a fan whose channel refused it (not
+  /// recorded). Expect: the first fan carries every part the receiver can install; nothing is owed (no copy made) while nothing
+  /// changed; a lease change owes the lease alone; a newer placement owes the placement alone; and an
+  /// unrecorded fan is owed again, so a refused channel self-heals. Before 2026-10-01 every period cloned the
+  /// placement,
+  /// members, root configuration and lease once, and again for every shard.
+  #[test]
+  fn a_shard_is_fanned_only_what_changed_since_it_last_received_it() {
+    crate::daemon::audit_on_shard(|s| {
+      s.fanned.observe_lease(&s.lease);
+      let first = s.fanned.owed(s, OTHER_SHARD).expect("a first fan is owed");
+      assert!(first.placement.is_some());
+      // A root configuration is fanned only at a version the receiver can adopt (above its initial zero).
+      assert_eq!(first.root.is_some(), s.root.configuration().version > 0);
+      assert!(first.ready.is_some() && first.lease.is_some());
+      let delivered = first.delivered();
+      s.fanned.record(OTHER_SHARD, delivered);
+      assert!(
+        s.fanned.owed(s, OTHER_SHARD).is_none(),
+        "nothing changed, nothing owed"
+      );
+
+      s.lease.superseded = Some(s.fleet.configuration().version + 1);
+      let lease = s.lease.clone();
+      s.fanned.observe_lease(&lease);
+      let fan = s.fanned.owed(s, OTHER_SHARD).expect("the lease changed");
+      assert!(fan.lease.is_some());
+      assert!(fan.placement.is_none() && fan.root.is_none() && fan.ready.is_none());
+      // Refused: not recorded, so it is owed again the next period.
+      assert!(
+        s.fanned.owed(s, OTHER_SHARD).is_some(),
+        "a refused fan self-heals"
+      );
+      let delivered = fan.delivered();
+      s.fanned.record(OTHER_SHARD, delivered);
+
+      let mut newer = s.fleet.configuration().clone();
+      newer.version += 1;
+      let members = s.fleet.members().to_vec();
+      s.fleet.install_configuration(newer.clone(), &members);
+      let fan = s
+        .fanned
+        .owed(s, OTHER_SHARD)
+        .expect("the placement changed");
+      assert_eq!(
+        fan
+          .placement
+          .as_ref()
+          .map(|(placement, _)| placement.version),
+        Some(newer.version)
+      );
+      assert!(fan.lease.is_none() && fan.root.is_none() && fan.ready.is_none());
+    });
+  }
+
+  /// AUD-29-29. Do: install a fan carrying only a lease on a shard whose lease is empty. Expect: the shard's
+  /// lease is the fanned one and nothing else it holds changes.
+  #[test]
+  fn an_installed_fan_gives_the_receiver_the_fanned_lease() {
+    crate::daemon::audit_on_shard(|s| {
+      let fanned = crate::lease::OwnerLease {
+        superseded: Some(s.fleet.configuration().version + 1),
+        ..crate::lease::OwnerLease::default()
+      };
+      let version = s.fleet.configuration().version;
+      s.lease = crate::lease::OwnerLease::default();
+      Fan {
+        placement: None,
+        root: None,
+        ready: None,
+        lease: Some(fanned.clone()),
+        now: Delivered::default(),
+      }
+      .install(s);
+      assert_eq!(s.lease, fanned);
+      assert_eq!(
+        s.fleet.configuration().version,
+        version,
+        "no placement was fanned"
+      );
+    });
   }
 }

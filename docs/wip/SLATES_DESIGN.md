@@ -2558,6 +2558,22 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 **Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
 hard links and snapshot versions. No live kernel endpoint state is part of the image.
 
+> **Status (2026-10-01, AUD-29-30).** A leader admits a proposal or membership entry against its log budget
+> before its log changes, refusing it (`false`, counted `budget_refused`) instead of letting the next
+> publication overflow the consensus region after the protocol moved. The log's size is kept incrementally,
+> so the check costs nothing per proposal. A publication's clone, encoding and hash were measured
+> separately: linear at about 0.8 ns a byte, tens of microseconds at the sizes compaction allows. Incremental
+> delta publication was measured-and-rejected on those numbers (`docs/wip/BENCHMARKS.md`, 2026-10-01).
+> Record: `docs/bugs/2026-10-01-a-proposal-could-outgrow-the-consensus-record-after-the-protocol-moved.md`.
+
+> **Status (2026-10-01, AUD-29-29).** The configuration fan to the other shards is sent as a delta. The
+> control shard remembers what each shard last received (placement and root versions, readiness, and a
+> lease generation), and a period clones and sends a shard only what is newer: nothing at all while nothing
+> changed. A delivery is recorded only once the shard's bounded channel accepted it, so a refused fan is owed
+> again the next period, keeping the self-healing the every-period re-fan gave. Before, every period copied
+> placement, members, root configuration and lease once, and again per shard, with versions checked only on
+> receipt. Record: `docs/bugs/2026-10-01-the-configuration-fan-copied-everything-every-period.md`.
+
 > **Status (2026-10-01, A-58, AUD-29-37).** A won election's recovery is admitted before it appends anything
 > and materialized a slice at a time. Its plan (the values the windows decide above the log, and a no-op at
 > each free index between them) is sized arithmetically, without walking the gap. It is admitted against the

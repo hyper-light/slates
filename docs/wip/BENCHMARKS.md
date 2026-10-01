@@ -1135,3 +1135,32 @@ core). The two by-hand scopes exceed the 4 GiB ceiling CI's smallest runner allo
 - The serial search keyed its visited set by whole keys, holding each 64-byte key twice (about 400 bytes a
   state at the peak): the 18-step history above outgrew the 4 GiB ceiling. It now holds 128-bit
   fingerprints, 131 accounted bytes a state, and fits.
+
+### What a consensus retention publication costs as a group's log grows (2026-10-01)
+
+**Command:** `SLATES_PUBLICATION_ENTRIES=1000,10000,50000 cargo test -p slates-cluster --release --test
+publication_cost -- --ignored --nocapture`: a lone leader appends that many 64-byte commands, then five
+publications are timed step by step: the clone of the retained Raft state (`RaftNode::saved`), its encoding
+(`SavedRaft::to_bytes`), and the blake3 hash the publication carries. Apple M5 Max, 18 cores, 128 GiB; load
+average 10–11 from other sessions; best of five shown, all five totals listed.
+
+| Log | Record | Clone | Encode | Hash | Total (best) | All five totals |
+|---|---|---|---|---|---|---|
+| 1,000 entries | 77,082 B | 13.2 µs | 8.5 µs | 47.9 µs | 69.7 µs | 90.6, 73.4, 69.7, 74.0, 72.0 µs |
+| 10,000 | 770,082 B | 85.4 µs | 52.5 µs | 475.8 µs | 613.7 µs | 833.5, 623.5, 618.5, 618.1, 613.7 µs |
+| 50,000 | 3,850,082 B | 465.0 µs | 300.1 µs | 2.361 ms | 3.126 ms | 3.817, 3.128, 3.204, 3.126, 3.165 ms |
+
+The cost is linear in the record's bytes, about 0.8 ns a byte, and the hash is three quarters of it. A
+group's retained log is bounded by its compaction rule (thesis §5.1.2: a snapshot once the log exceeds the
+last snapshot's size), so it stays within one to two times its encoded configuration: tens of kilobytes for
+a region, where a publication costs tens of microseconds.
+
+**Measured-and-rejected: incremental (delta) publication** (AUD-29-30). Publishing only the appended entries,
+with periodic canonical checkpoints, would make each acknowledgement cost its delta instead of the whole
+record. At the sizes compaction allows, the whole record costs tens of microseconds, so a delta format would
+add a second recovery path (replaying deltas over a checkpoint, each step crash-tested) to save a cost the
+compaction rule already bounds. Not built. What was built is admission: a proposal that would take a log past
+its share of the record's region is refused before the log changes (`RaftNode::budget_refused`), so a
+publication can no longer overflow after the protocol has moved. Revisit if a group's configuration grows
+into the megabytes (root homes at fleet scale), where the 3.1 ms row starts to bind the acknowledgement path.
+
