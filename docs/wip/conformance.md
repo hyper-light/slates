@@ -299,7 +299,17 @@ inherited), `land --grant` — under a filesystem-write tracer, every write-capa
 closed taxonomy: inside the granted target (matched to the landed entries and the engine's
 `.slates-` hidden siblings), a RAM-only kernel object (memfd, `shm_open`, socket, pipe, event
 descriptor, the FUSE device), the processes' own standard streams, unresolved (the tracer printed
-no path), or outside — a violation. On macOS `fs_usage` needs root and this host has no
+no path), or outside — a violation.
+
+Since 2026-10-01 (AUD-29-42):
+- **A write inside the target counts only as the granted landing's:** made by the daemon's pid within the
+  landing's interval on the tracers' clock (strace `-ttt`, eslogger `time`). Otherwise it is refused for
+  its reason: no grant, another process, unstamped, or outside the interval.
+- **A standard stream is descriptor 1 or 2 to a pipe, terminal or null device,** and the harness gives the
+  slates processes a pipe as stderr, drained into the log by the harness itself.
+- **A hidden sibling must be the presented landing's own name form,** and none may remain afterwards.
+- **Each refusal is tested as a trace mutation**
+  (`docs/bugs/2026-10-01-the-hermeticity-judge-exempted-by-name-and-descriptor.md`). On macOS `fs_usage` needs root and this host has no
 passwordless sudo (`sudo -n true` is refused), so the cell is a typed privilege skip; on the CI
 macOS runner it runs as `sudo fs_usage -w -f filesys -f network <daemon pid>` (scoped to the
 daemon — the only writer by design — because fs_usage cannot tell same-named processes apart and

@@ -192,6 +192,10 @@ pub(crate) struct Anchor {
   child: Child,
   log: PathBuf,
   instance: String,
+  /// The harness thread that drains the anchor's and the daemon's stderr pipe into `log`, joined once
+  /// both have left (their pipe ends closed). The slates processes write to the pipe, never to a file:
+  /// a regular file behind their standard error would be a disk write of theirs (AUD-29-42).
+  drain: Option<std::thread::JoinHandle<std::io::Result<u64>>>,
 }
 
 /// Opens the anchor's log file for writing: the development tool's own scratch output.
@@ -210,7 +214,9 @@ impl Anchor {
     tracer: Option<&[String]>,
   ) -> Result<Anchor, Failure> {
     let log = scratch.join(format!("anchor-{instance}.log"));
-    let log_file = open_log(&log)?;
+    let mut log_file = open_log(&log)?;
+    let (mut drained, stderr) =
+      std::io::pipe().map_err(|e| Failure(format!("creating the anchor's stderr pipe: {e}")))?;
     let mut command = match tracer {
       Some(prefix) if !prefix.is_empty() => {
         let mut command = Command::new(&prefix[0]);
@@ -231,13 +237,21 @@ impl Anchor {
       .current_dir(scratch)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
-      .stderr(Stdio::from(log_file))
+      .stderr(Stdio::from(stderr))
       .spawn()
       .map_err(|e| Failure(format!("spawning the anchor: {e}")))?;
+    // The command, holding the parent's copy of the pipe's write end, is gone once spawned, so the drain
+    // reads to the end when the anchor and its daemon have closed theirs.
+    drop(command);
+    let drain = std::thread::Builder::new()
+      .name(format!("anchor-log-{instance}"))
+      .spawn(move || std::io::copy(&mut drained, &mut log_file))
+      .map_err(|e| Failure(format!("spawning the anchor log's drain: {e}")))?;
     let anchor = Anchor {
       child,
       log,
       instance: instance.to_owned(),
+      drain: Some(drain),
     };
     anchor.wait_ready(binary)?;
     Ok(anchor)
@@ -330,13 +344,18 @@ impl Anchor {
     let _ = self.child.kill();
     let _ = self.child.wait();
     let daemon = self.daemon_command();
-    if none_running(&daemon) {
-      return true;
+    let left = none_running(&daemon) || {
+      let _ = Command::new("pkill")
+        .args(["-KILL", "-f", &daemon])
+        .status();
+      none_running(&daemon)
+    };
+    // Every writer of the pipe has left, so the drain reaches the end; with a daemon still running it
+    // would not, and the refusal reported above is the outcome.
+    if left && let Some(drain) = self.drain.take() {
+      let _ = drain.join();
     }
-    let _ = Command::new("pkill")
-      .args(["-KILL", "-f", &daemon])
-      .status();
-    none_running(&daemon)
+    left
   }
 }
 

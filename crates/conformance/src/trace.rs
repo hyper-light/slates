@@ -41,6 +41,10 @@ pub struct WriteEvent {
   pub path: String,
   /// The descriptor the call operated on, for descriptor-based calls.
   pub descriptor: Option<i64>,
+  /// The process that made the call, when the tracer names it.
+  pub pid: Option<u32>,
+  /// When the call was made, in nanoseconds since the Unix epoch, when the tracer stamps it.
+  pub at_ns: Option<u64>,
 }
 
 /// Where a write landed.
@@ -50,8 +54,11 @@ pub enum Placement {
   InsideTarget,
   /// A RAM-only kernel object; the reason names the class.
   RamOnly(&'static str),
-  /// The process's own standard output or error.
+  /// The process's own standard output or error, on a pipe, terminal or null device. A regular file
+  /// behind descriptor 1 or 2 is a file like any other.
   StandardStream,
+  /// A write inside the target that no granted landing accounts for; the reason says why (AUD-29-42).
+  Unauthorized(&'static str),
   /// The tracer printed no path the parser could resolve.
   Unresolved,
   /// A path outside every allowed class: a violation.
@@ -65,11 +72,30 @@ pub struct Policy<'a> {
   pub target: &'a str,
   /// The traced process's working directory, for relative paths under `AT_FDCWD`.
   pub working_directory: &'a str,
-  /// Regular files that are the traced processes' own standard streams, named by path: the anchor's
-  /// log, which the harness hands the anchor and the daemon as stderr. A tracer that sees descriptor
-  /// numbers (strace, fs_usage) recognises streams by descriptor; Endpoint Security events carry only
-  /// the path.
-  pub streams: &'a [&'a str],
+  /// The granted landing, which alone may write inside the target: `None` when the lifecycle granted
+  /// none, and then any write there is unauthorized.
+  pub landing: Option<Landing<'a>>,
+}
+
+/// A granted landing as the trace must see it (D-26: "inside a granted target during that landing"): the
+/// processes that execute it and the interval it ran in, on the tracer's clock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Landing<'a> {
+  /// The processes that execute the landing (the daemon).
+  pub writers: &'a [u32],
+  /// When the landing was requested, under its grant, in nanoseconds since the Unix epoch.
+  pub from_ns: u64,
+  /// When its outcome was returned.
+  pub until_ns: u64,
+}
+
+/// A violation and its reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Violation {
+  /// The call.
+  pub event: WriteEvent,
+  /// Why it is a violation.
+  pub reason: &'static str,
 }
 
 /// Shape: violations kept in the report (the first ones; the count carries the rest).
@@ -90,8 +116,8 @@ pub struct Hermeticity {
   pub unresolved: u64,
   /// Violations.
   pub outside: u64,
-  /// The first violations.
-  pub violations: Vec<WriteEvent>,
+  /// The first violations, with their reasons.
+  pub violations: Vec<Violation>,
   /// The first unresolved calls.
   pub unresolved_sample: Vec<WriteEvent>,
   /// Paths written inside the target, relative to it, unique and sorted.
@@ -149,29 +175,57 @@ fn inside(path: &str, target: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/')))
 }
 
-/// Places one event.
-pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
-  if matches!(event.descriptor, Some(1 | 2)) && is_stream_write(&event.call) {
-    return Placement::StandardStream;
-  }
-  let path = event.path.as_str();
-  if policy.streams.contains(&path) {
-    return Placement::StandardStream;
-  }
-  if inside(path, policy.target) {
-    return Placement::InsideTarget;
-  }
+/// Whether `path` names a RAM-only object a standard stream may be: a kernel object (a pipe, a socket),
+/// a terminal or a null device.
+fn ram_object(path: &str) -> Option<&'static str> {
   if KERNEL_OBJECT_PREFIXES.iter().any(|p| path.starts_with(p)) {
-    return Placement::RamOnly("kernel object (socket, pipe, anon inode, memfd, shm)");
+    return Some("kernel object (socket, pipe, anon inode, memfd, shm)");
   }
   if path == "/dev/fuse" {
-    return Placement::RamOnly("the FUSE device");
+    return Some("the FUSE device");
   }
   if CHARACTER_DEVICES.contains(&path)
     || path.starts_with("/dev/pts/")
     || path.starts_with("/dev/ttys")
   {
-    return Placement::RamOnly("a character device");
+    return Some("a character device");
+  }
+  None
+}
+
+/// Whether the granted landing accounts for a write inside the target: its own process, during it.
+fn authorized(event: &WriteEvent, landing: Option<&Landing<'_>>) -> Result<(), &'static str> {
+  let landing = landing.ok_or("inside the target with no granted landing")?;
+  let pid = event
+    .pid
+    .ok_or("inside the target by a process the tracer did not name")?;
+  if !landing.writers.contains(&pid) {
+    return Err("inside the target by a process that is not the landing's");
+  }
+  let at = event
+    .at_ns
+    .ok_or("inside the target at a time the tracer did not stamp")?;
+  if at < landing.from_ns || at > landing.until_ns {
+    return Err("inside the target outside the granted landing's interval");
+  }
+  Ok(())
+}
+
+/// Places one event.
+pub fn classify(event: &WriteEvent, policy: &Policy<'_>) -> Placement {
+  let path = event.path.as_str();
+  let object = ram_object(path);
+  if matches!(event.descriptor, Some(1 | 2)) && is_stream_write(&event.call) && object.is_some() {
+    return Placement::StandardStream;
+  }
+  if inside(path, policy.target) {
+    return match authorized(event, policy.landing.as_ref()) {
+      Ok(()) => Placement::InsideTarget,
+      Err(reason) => Placement::Unauthorized(reason),
+    };
+  }
+  if let Some(class) = object {
+    return Placement::RamOnly(class);
   }
   if path.starts_with(UNRESOLVED_PREFIX) {
     return Placement::Unresolved;
@@ -213,13 +267,26 @@ pub fn judge(events: &[WriteEvent], policy: &Policy<'_>) -> Hermeticity {
       }
       Placement::Outside => {
         out.outside += 1;
-        keep_sample(&mut out.violations, event);
+        keep_violation(&mut out.violations, event, "outside every allowed class");
+      }
+      Placement::Unauthorized(reason) => {
+        out.outside += 1;
+        keep_violation(&mut out.violations, event, reason);
       }
     }
   }
   out.written_inside.sort();
   out.written_inside.dedup();
   out
+}
+
+fn keep_violation(sample: &mut Vec<Violation>, event: &WriteEvent, reason: &'static str) {
+  if sample.len() < VIOLATION_SAMPLE {
+    sample.push(Violation {
+      event: event.clone(),
+      reason,
+    });
+  }
 }
 
 fn keep_sample(sample: &mut Vec<WriteEvent>, event: &WriteEvent) {
@@ -277,26 +344,80 @@ const UNFINISHED: &str = " <unfinished ...>";
 /// Format: the continuation marker's tail (`<... openat resumed>`).
 const RESUMED: &str = " resumed>";
 
-/// Joins `<unfinished ...>` / `resumed>` pairs per pid; yields whole call lines with their line numbers.
-fn joined_lines(log: &str) -> Vec<(usize, String)> {
-  let mut pending: HashMap<String, String> = HashMap::new();
+/// Format: nanoseconds per second and the digits of strace's `-ttt` fraction (microseconds).
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// Format: the nanoseconds one digit of a fraction is worth at each place, for a fraction of up to nine
+/// digits (`-ttt` prints six).
+const FRACTION_PLACES: usize = 9;
+
+/// A `seconds.fraction` stamp (strace `-ttt`) as nanoseconds since the Unix epoch.
+fn epoch_stamp_ns(token: &str) -> Option<u64> {
+  let (seconds, fraction) = token.split_once('.')?;
+  if seconds.is_empty()
+    || fraction.is_empty()
+    || fraction.len() > FRACTION_PLACES
+    || !seconds.bytes().all(|b| b.is_ascii_digit())
+    || !fraction.bytes().all(|b| b.is_ascii_digit())
+  {
+    return None;
+  }
+  let whole = seconds.parse::<u64>().ok()?.checked_mul(NANOS_PER_SECOND)?;
+  let padded = format!("{fraction:0<FRACTION_PLACES$}");
+  whole.checked_add(padded.parse::<u64>().ok()?)
+}
+
+/// The leading `-ttt` stamp of a strace body, and the rest.
+fn split_stamp(body: &str) -> (Option<u64>, &str) {
+  match body.split_once(' ') {
+    Some((token, rest)) => match epoch_stamp_ns(token) {
+      Some(at) => (Some(at), rest.trim_start()),
+      None => (None, body),
+    },
+    None => (None, body),
+  }
+}
+
+/// One whole strace call: its 1-based line, its process, when it began, and its text.
+struct Joined {
+  line: usize,
+  pid: Option<u32>,
+  at_ns: Option<u64>,
+  body: String,
+}
+
+/// Joins `<unfinished ...>` / `resumed>` pairs per pid; yields whole call lines with their line numbers,
+/// processes and (with `-ttt`) the time each call began.
+fn joined_lines(log: &str) -> Vec<Joined> {
+  let mut pending: HashMap<String, (Option<u64>, String)> = HashMap::new();
   let mut out = Vec::new();
   for (index, raw) in log.lines().enumerate() {
-    let (pid, body) = split_pid(raw);
+    let (pid_text, rest) = split_pid(raw);
+    let (at_ns, body) = split_stamp(rest);
+    let pid = pid_text.parse::<u32>().ok();
     if let Some(head) = body.strip_suffix(UNFINISHED) {
-      pending.insert(pid, head.to_owned());
+      pending.insert(pid_text, (at_ns, head.to_owned()));
       continue;
     }
     if body.starts_with("<...") {
       if let Some(position) = body.find(RESUMED) {
         let tail = &body[position + RESUMED.len()..];
-        if let Some(head) = pending.remove(&pid) {
-          out.push((index + 1, format!("{head}{tail}")));
+        if let Some((began, head)) = pending.remove(&pid_text) {
+          out.push(Joined {
+            line: index + 1,
+            pid,
+            at_ns: began,
+            body: format!("{head}{tail}"),
+          });
         }
       }
       continue;
     }
-    out.push((index + 1, body.to_owned()));
+    out.push(Joined {
+      line: index + 1,
+      pid,
+      at_ns,
+      body: body.to_owned(),
+    });
   }
   out
 }
@@ -420,7 +541,7 @@ fn descriptor_path(arg: &str) -> (Option<i64>, String) {
 pub fn strace_unnamed_paths(log: &str) -> Vec<String> {
   joined_lines(log)
     .into_iter()
-    .filter_map(|(_, body)| {
+    .filter_map(|Joined { body, .. }| {
       let (name, args) = call_and_args(&body)?;
       let flags = match name {
         "open" => args.get(1)?,
@@ -467,6 +588,8 @@ fn event(line: usize, call: &str, path: String, descriptor: Option<i64>) -> Writ
     call: call.to_owned(),
     path,
     descriptor,
+    pid: None,
+    at_ns: None,
   }
 }
 
@@ -553,21 +676,20 @@ fn strace_descriptor_events(line: usize, name: &str, args: &[&str]) -> Vec<Write
 
 /// Parses an strace log (`-f -y`, one call per line) into its write-capable events.
 pub fn parse_strace(log: &str) -> Vec<WriteEvent> {
-  let mut events = Vec::new();
-  for (line, body) in joined_lines(log) {
-    if let Some((name, args)) = call_and_args(&body) {
-      events.extend(strace_events(line, name, &args, "."));
-    }
-  }
-  events
+  parse_strace_with_cwd(log, ".")
 }
 
-/// Parses an strace log with the traced process's working directory for `AT_FDCWD` paths.
+/// Parses an strace log with the traced process's working directory for `AT_FDCWD` paths. Each event
+/// carries its process and, when the log was written with `-ttt`, the time its call began.
 pub fn parse_strace_with_cwd(log: &str, cwd: &str) -> Vec<WriteEvent> {
   let mut events = Vec::new();
-  for (line, body) in joined_lines(log) {
-    if let Some((name, args)) = call_and_args(&body) {
-      events.extend(strace_events(line, name, &args, cwd));
+  for joined in joined_lines(log) {
+    if let Some((name, args)) = call_and_args(&joined.body) {
+      for mut event in strace_events(joined.line, name, &args, cwd) {
+        event.pid = joined.pid;
+        event.at_ns = joined.at_ns;
+        events.push(event);
+      }
     }
   }
   events
@@ -907,6 +1029,159 @@ fn es_paths(kind: &str, event: &serde_json::Value) -> Option<Vec<Option<String>>
   })
 }
 
+/// Format: seconds per day, days per 400-year Gregorian era, and the day count from 0000-03-01 to the
+/// Unix epoch — the constants of the civil-to-days conversion (Howard Hinnant, "chrono-Compatible
+/// Low-Level Date Algorithms", `days_from_civil`; evidence C).
+const SECONDS_PER_DAY: u64 = 86_400;
+/// Format: days in a 400-year Gregorian era.
+const DAYS_PER_ERA: i64 = 146_097;
+/// Format: days from 0000-03-01 to 1970-01-01.
+const EPOCH_DAYS: i64 = 719_468;
+
+/// Format: the months of a year and the most days of a month (a date outside them is refused).
+const MONTHS: i64 = 12;
+/// Format: the most days in a month.
+const MOST_DAYS: i64 = 31;
+/// Format: the years of a Gregorian era (its leap-year rule repeats every 400 years).
+const YEARS_PER_ERA: i64 = 400;
+/// Format: the months before March, which the algorithm counts at the end of the previous year (so the
+/// leap day ends the shifted year): January and February.
+const MONTHS_BEFORE_MARCH: i64 = 2;
+/// Format: the shift that makes March month 0 (`month - 3`) and January and February months 10 and 11
+/// (`month + 9`).
+const MARCH: i64 = 3;
+/// Format: see [`MARCH`].
+const JANUARY_SHIFT: i64 = 9;
+/// Format: the day-of-year of a shifted month is `(153 × month + 2) / 5` (the 30/31-day rhythm from March).
+const MONTH_RHYTHM_DAYS: i64 = 153;
+/// Format: see [`MONTH_RHYTHM_DAYS`].
+const MONTH_RHYTHM_OFFSET: i64 = 2;
+/// Format: see [`MONTH_RHYTHM_DAYS`].
+const MONTH_RHYTHM_MONTHS: i64 = 5;
+/// Format: the days of a common year.
+const DAYS_PER_YEAR: i64 = 365;
+/// Format: a leap year every four years, none every hundredth.
+const LEAP_EVERY: i64 = 4;
+/// Format: see [`LEAP_EVERY`].
+const NO_LEAP_EVERY: i64 = 100;
+/// Format: an RFC 3339 date and clock each have three fields.
+const RFC3339_FIELDS: usize = 3;
+
+/// Days since the Unix epoch of a civil date (proleptic Gregorian).
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+  if !(1..=MONTHS).contains(&month) || !(1..=MOST_DAYS).contains(&day) {
+    return None;
+  }
+  let year = if month <= MONTHS_BEFORE_MARCH {
+    year - 1
+  } else {
+    year
+  };
+  let era = year.div_euclid(YEARS_PER_ERA);
+  let of_era = year - era * YEARS_PER_ERA;
+  let shifted = if month > MONTHS_BEFORE_MARCH {
+    month - MARCH
+  } else {
+    month + JANUARY_SHIFT
+  };
+  let of_year = (MONTH_RHYTHM_DAYS * shifted + MONTH_RHYTHM_OFFSET) / MONTH_RHYTHM_MONTHS + day - 1;
+  let of_era_days = of_era * DAYS_PER_YEAR + of_era / LEAP_EVERY - of_era / NO_LEAP_EVERY + of_year;
+  Some(era * DAYS_PER_ERA + of_era_days - EPOCH_DAYS)
+}
+
+/// The three `separator`-joined numbers of an RFC 3339 date or clock.
+fn three_fields<T: std::str::FromStr>(text: &str, separator: char) -> Option<(T, T, T)> {
+  let mut fields = text
+    .splitn(RFC3339_FIELDS, separator)
+    .map(|part| part.parse::<T>().ok());
+  Some((fields.next()??, fields.next()??, fields.next()??))
+}
+
+/// The seconds since the Unix epoch of an RFC 3339 date and clock (`2026-09-26`, `08:20:01`).
+fn civil_seconds(date: &str, clock: &str) -> Option<u64> {
+  let (year, month, day) = three_fields::<i64>(date, '-')?;
+  let (hour, minute, second) = three_fields::<u64>(clock, ':')?;
+  let days = u64::try_from(days_from_civil(year, month, day)?).ok()?;
+  days
+    .checked_mul(SECONDS_PER_DAY)?
+    .checked_add(hour.checked_mul(SECONDS_PER_HOUR)?)?
+    .checked_add(minute.checked_mul(SECONDS_PER_MINUTE)?)?
+    .checked_add(second)
+}
+
+/// Format: seconds per hour and per minute.
+const SECONDS_PER_HOUR: u64 = 3_600;
+/// Format: seconds per minute.
+const SECONDS_PER_MINUTE: u64 = 60;
+
+/// An RFC 3339 UTC time (`2026-09-26T08:20:01.123456789Z`, as eslogger prints `time`) as nanoseconds
+/// since the Unix epoch; `None` for anything else.
+fn iso_ns(text: &str) -> Option<u64> {
+  let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+  let (clock, fraction) = time
+    .split_once('.')
+    .map_or((time, None), |(c, f)| (c, Some(f)));
+  let whole = civil_seconds(date, clock)?.checked_mul(NANOS_PER_SECOND)?;
+  match fraction {
+    None => Some(whole),
+    Some(fraction) => epoch_stamp_ns(&format!("0.{fraction}")).and_then(|f| whole.checked_add(f)),
+  }
+}
+
+/// Format: the prefix of every hidden sibling a landing creates inside its target, and the forms that
+/// follow it (`slates-land`'s engine: `.slates-{id:016x}-{n}`, `.slates-{id:016x}-aside-{hash:016x}`).
+const HIDDEN_PREFIX: &str = ".slates-";
+/// Format: the aside mark in a hidden name.
+const ASIDE_MARK: &str = "aside-";
+/// Format: the hex digits of a landing id and of an aside path hash (`{:016x}`).
+const HIDDEN_HEX_DIGITS: usize = 16;
+
+/// Whether `name` is one of the hidden names the landing `landing_id` creates: its counter form or its
+/// aside form, with exactly the engine's digits. Any other `.slates-*` name is not the landing's.
+pub fn is_landing_hidden_name(name: &str, landing_id: u64) -> bool {
+  let own = format!("{HIDDEN_PREFIX}{landing_id:016x}-");
+  let Some(rest) = name.strip_prefix(&own) else {
+    return false;
+  };
+  if let Some(hash) = rest.strip_prefix(ASIDE_MARK) {
+    return hash.len() == HIDDEN_HEX_DIGITS && hash.bytes().all(|b| b.is_ascii_hexdigit());
+  }
+  !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Judges the hidden siblings a landing wrote inside its target (AUD-29-42): each must be one of this
+/// landing's own names, and none may remain on disk once it ends. Returns how many it wrote, or the
+/// first name that fails with its reason. `written` and `remaining` are paths relative to the target.
+pub fn judge_hidden(
+  written: &[String],
+  remaining: &[String],
+  landing_id: u64,
+) -> Result<u32, String> {
+  let base = |path: &str| path.rsplit('/').next().unwrap_or(path).to_owned();
+  let mut count = 0u32;
+  for path in written {
+    let name = base(path);
+    if !name.starts_with(HIDDEN_PREFIX) {
+      continue;
+    }
+    if !is_landing_hidden_name(&name, landing_id) {
+      return Err(format!(
+        "{path}: a hidden name that is not landing {landing_id:016x}'s"
+      ));
+    }
+    count = count.saturating_add(1);
+  }
+  if let Some(left) = remaining
+    .iter()
+    .find(|path| base(path).starts_with(HIDDEN_PREFIX))
+  {
+    return Err(format!(
+      "{left}: a hidden sibling left behind after the landing"
+    ));
+  }
+  Ok(count)
+}
+
 /// Whether an eslogger log holds at least one complete event (the tracer has attached).
 pub fn eslogger_has_activity(log: &str) -> bool {
   log.lines().any(|line| {
@@ -940,9 +1215,23 @@ pub fn parse_eslogger(log: &str) -> Vec<WriteEvent> {
       ));
       continue;
     };
+    let value = serde_json::from_str::<serde_json::Value>(line).ok();
+    let pid = value
+      .as_ref()
+      .and_then(|v| v.pointer("/process/audit_token/pid"))
+      .and_then(serde_json::Value::as_u64)
+      .and_then(|pid| u32::try_from(pid).ok());
+    let at_ns = value
+      .as_ref()
+      .and_then(|v| v.get("time"))
+      .and_then(serde_json::Value::as_str)
+      .and_then(iso_ns);
     for path in es_paths(&kind, &body).unwrap_or_default() {
       let path = path.unwrap_or_else(|| format!("{UNRESOLVED_PREFIX}{kind}>"));
-      out.push(event(number, &kind, path, None));
+      let mut written = event(number, &kind, path, None);
+      written.pid = pid;
+      written.at_ns = at_ns;
+      out.push(written);
     }
   }
   out
@@ -970,12 +1259,49 @@ mod tests {
 
   const TARGET: &str = "/scratch/land-target";
 
+  /// Format: the processes the fixtures' landing runs in (the strace and eslogger fixtures' pids).
+  const LANDERS: &[u32] = &[1, 7, 91, 100, 101, 102, 103, 77040];
+  /// Format: the stamp the fixtures' calls carry (strace `-ttt`), and the landing window around it.
+  const STAMP: &str = "1.000001";
+  /// Format: the stamp as eslogger's RFC 3339 `time`.
+  const ES_TIME: &str = "1970-01-01T00:00:01.000001Z";
+  /// Format: the fixtures' landing window, in nanoseconds since the epoch: one second to two.
+  const WINDOW: (u64, u64) = (1_000_000_000, 2_000_000_000);
+
+  fn landing() -> Landing<'static> {
+    Landing {
+      writers: LANDERS,
+      from_ns: WINDOW.0,
+      until_ns: WINDOW.1,
+    }
+  }
+
   fn policy() -> Policy<'static> {
     Policy {
       target: TARGET,
       working_directory: "/scratch/cwd",
-      streams: &["/scratch/anchor.log"],
+      landing: Some(landing()),
     }
+  }
+
+  /// An strace log as `-ttt` writes it: every call line stamped at [`STAMP`].
+  fn stamped(log: &str) -> String {
+    log
+      .lines()
+      .map(|line| {
+        let (pid, body) = split_pid(line);
+        if pid.is_empty() {
+          line.to_owned()
+        } else {
+          format!("{pid} {STAMP} {body}")
+        }
+      })
+      .collect::<Vec<_>>()
+      .join("\n")
+  }
+
+  fn paths(violations: &[Violation]) -> Vec<&str> {
+    violations.iter().map(|v| v.event.path.as_str()).collect()
   }
 
   /// Events in the shape `eslogger` prints (one JSON object per line, `event: {<kind>: {...}}`, each
@@ -986,7 +1312,7 @@ mod tests {
     let file = |path: &str| format!(r#"{{"path":"{path}","path_truncated":false}}"#);
     let line = |kind: &str, body: String| {
       format!(
-        r#"{{"event_type":0,"event":{{"{kind}":{body}}},"process":{{"audit_token":{{"pid":7}}}}}}"#
+        r#"{{"event_type":0,"time":"{ES_TIME}","event":{{"{kind}":{body}}},"process":{{"audit_token":{{"pid":7}}}}}}"#
       )
     };
     let log = [
@@ -1014,10 +1340,13 @@ mod tests {
       judged.written_inside,
       vec![".slates-tmp-1".to_owned(), "a.txt".to_owned()]
     );
-    assert_eq!(judged.standard_streams, 1, "the daemon's stderr log");
     assert_eq!(
-      judged.outside, 3,
-      "create, unlink, setextattr: {:?}",
+      judged.standard_streams, 0,
+      "a log file is a file, whatever writes to it"
+    );
+    assert_eq!(
+      judged.outside, 4,
+      "the stderr log file, create, unlink, setextattr: {:?}",
       judged.violations
     );
     assert_eq!(judged.unresolved, 2, "the truncated path and the torn line");
@@ -1052,7 +1381,7 @@ mod tests {
   /// with its `resumed` continuation and skipping the read-only open, the exit and the signal lines.
   #[test]
   fn strace_events_are_found_in_order_with_interrupted_calls_joined() {
-    let events = parse_strace_with_cwd(STRACE, "/scratch/cwd");
+    let events = parse_strace_with_cwd(&stamped(STRACE), "/scratch/cwd");
     let calls: Vec<&str> = events.iter().map(|e| e.call.as_str()).collect();
     assert_eq!(
       calls,
@@ -1078,23 +1407,24 @@ mod tests {
     );
   }
 
-  /// The judgement places each event: inside the target (including the temp name and the rename's
-  /// both names), RAM-only objects, the standard streams, and the three violations: a file under
-  /// `/dev/shm` (a tmpfs is a filesystem, not RAM-only — A-50), `/etc/evil`, and the relative file
-  /// under the working directory.
+  /// The judgement places each event: inside the target during the granted landing (including the temp
+  /// name and the rename's both names), RAM-only objects, a standard stream on the null device, and the
+  /// four violations: a log file behind descriptor 1 (a regular file is a file whatever descriptor reaches
+  /// it — AUD-29-42), a file under `/dev/shm` (a tmpfs is a filesystem, not RAM-only — A-50),
+  /// `/etc/evil`, and the relative file under the working directory.
   #[test]
   fn strace_events_are_placed_in_the_closed_taxonomy() {
-    let events = parse_strace_with_cwd(STRACE, "/scratch/cwd");
+    let events = parse_strace_with_cwd(&stamped(STRACE), "/scratch/cwd");
     let judged = judge(&events, &policy());
     assert_eq!(judged.write_calls, 13);
     assert_eq!(judged.inside_target, 5);
-    assert_eq!(judged.standard_streams, 2);
+    assert_eq!(judged.standard_streams, 1);
     assert_eq!(judged.ram_only, 3, "socket, memfd, pipe");
-    assert_eq!(judged.outside, 3);
-    let violations: Vec<&str> = judged.violations.iter().map(|v| v.path.as_str()).collect();
+    assert_eq!(judged.outside, 4);
     assert_eq!(
-      violations,
+      paths(&judged.violations),
       [
+        "/home/runner/daemon.log",
         "/dev/shm/slates-con",
         "/etc/evil",
         "/scratch/cwd/relative.txt"
@@ -1117,9 +1447,9 @@ mod tests {
     let policy = Policy {
       target: "/work/target",
       working_directory: "/scratch",
-      streams: &[],
+      landing: Some(landing()),
     };
-    let judged = judge(&parse_strace(log), &policy);
+    let judged = judge(&parse_strace(&stamped(log)), &policy);
     assert_eq!(judged.inside_target, 3);
     assert_eq!(judged.written_inside, ["#9", "file"]);
     assert_eq!(strace_unnamed_paths(log), ["/work/target/#9"]);
@@ -1135,18 +1465,18 @@ mod tests {
   /// A deleted memfd remains RAM-only; deletion never exempts a disk file from its grant.
   #[test]
   fn deleted_descriptor_annotations_preserve_the_write_destination() {
-    let events = parse_strace(
+    let events = parse_strace(&stamped(
       "77040 ftruncate(82</memfd:slates-segment>(deleted), 536576) = 0\n\
        77040 ftruncate(83</outside/file>(deleted), 0) = 0\n\
        77040 ftruncate(84</scratch/land-target/file>(deleted), 0) = 0\n\
        77040 ftruncate(85</unknown>unrecognized, 0) = 0\n",
-    );
+    ));
     let judged = judge(&events, &policy());
     assert_eq!(judged.write_calls, 4);
     assert_eq!(judged.ram_only, 1);
     assert_eq!(judged.inside_target, 1);
     assert_eq!(judged.outside, 1);
-    assert_eq!(judged.violations[0].path, "/outside/file");
+    assert_eq!(judged.violations[0].event.path, "/outside/file");
     assert_eq!(
       judged.unresolved, 1,
       "unknown decorations still fail closed"
@@ -1203,13 +1533,27 @@ not a row
       judged.write_calls, 9,
       "openat, write, fsync, two rename names, socket write, unknown write, open /etc/evil, mkdir /etc/evil2: {events:?}"
     );
-    assert_eq!(judged.inside_target, 5);
     assert_eq!(judged.ram_only, 1);
     assert_eq!(judged.unresolved, 1);
-    assert_eq!(judged.outside, 2, "{:?}", judged.violations);
-    assert_eq!(
-      judged.written_inside,
-      vec![".slates-tmp-1".to_owned(), "a.txt".to_owned()]
+    // fs_usage names neither the process nor the date, so no write inside the target can be placed in a
+    // granted landing: each is refused for that reason, its path resolved through the descriptor table.
+    assert_eq!(judged.inside_target, 0);
+    assert_eq!(judged.outside, 7, "{:?}", judged.violations);
+    let target: Vec<&Violation> = judged
+      .violations
+      .iter()
+      .filter(|v| v.reason == "inside the target by a process the tracer did not name")
+      .collect();
+    assert_eq!(target.len(), 5);
+    assert!(
+      target
+        .iter()
+        .any(|v| v.event.path == "/scratch/land-target/.slates-tmp-1")
+    );
+    assert!(
+      target
+        .iter()
+        .any(|v| v.event.path == "/scratch/land-target/a.txt")
     );
   }
 
@@ -1231,7 +1575,149 @@ not a row
         judged.outside, 1,
         "the complete violation survives: {prefix}"
       );
-      assert_eq!(judged.violations[0].path, "/outside/proof");
+      assert_eq!(judged.violations[0].event.path, "/outside/proof");
+    }
+  }
+
+  /// AUD-29-42 acceptance. Do: take a trace of one granted landing (the daemon, pid 100, writing a file
+  /// inside the target during the landing's window) and mutate it one way at a time: the write before the
+  /// grant's landing began, after it ended, by another process, with no landing granted at all; a log
+  /// written to a regular file through descriptor 2; and a file under `/dev/shm`. Expect: the unmutated
+  /// trace is clean, and each mutation is a violation for its own reason.
+  #[test]
+  fn each_mutation_of_a_granted_trace_fails_for_its_own_reason() {
+    let line = |pid: u32, stamp: &str, body: &str| format!("{pid} {stamp} {body}\n");
+    let landing_write = |pid: u32, stamp: &str| {
+      line(
+        pid,
+        stamp,
+        "write(6</scratch/land-target/a.txt>, \"x\", 1) = 1",
+      )
+    };
+    let judged = |log: &str, landing: Option<Landing<'static>>| {
+      let policy = Policy {
+        target: TARGET,
+        working_directory: "/scratch/cwd",
+        landing,
+      };
+      judge(&parse_strace(log), &policy)
+    };
+    let reasons = |log: &str, landing: Option<Landing<'static>>| -> Vec<&'static str> {
+      judged(log, landing)
+        .violations
+        .iter()
+        .map(|v| v.reason)
+        .collect()
+    };
+    let only_daemon = Landing {
+      writers: &[100],
+      from_ns: WINDOW.0,
+      until_ns: WINDOW.1,
+    };
+
+    let clean = landing_write(100, STAMP);
+    let verdict = judged(&clean, Some(only_daemon.clone()));
+    assert_eq!((verdict.inside_target, verdict.outside), (1, 0));
+
+    let interval = "inside the target outside the granted landing's interval";
+    assert_eq!(
+      reasons(&landing_write(100, "0.999999"), Some(only_daemon.clone())),
+      [interval],
+      "a write before the grant's landing began"
+    );
+    assert_eq!(
+      reasons(&landing_write(100, "2.000001"), Some(only_daemon.clone())),
+      [interval],
+      "a write after the landing ended (its grant consumed or revoked)"
+    );
+    assert_eq!(
+      reasons(&landing_write(200, STAMP), Some(only_daemon.clone())),
+      ["inside the target by a process that is not the landing's"],
+      "a write by another process"
+    );
+    assert_eq!(
+      reasons(&landing_write(100, STAMP), None),
+      ["inside the target with no granted landing"],
+      "a lifecycle that granted nothing"
+    );
+    assert_eq!(
+      reasons(
+        &line(100, STAMP, "write(2</scratch/anchor.log>, \"log\", 3) = 3"),
+        Some(only_daemon.clone())
+      ),
+      ["outside every allowed class"],
+      "a log file behind standard error"
+    );
+    assert_eq!(
+      reasons(
+        &line(
+          100,
+          STAMP,
+          "openat(AT_FDCWD, \"/dev/shm/other\", O_RDWR|O_CREAT, 0600) = 9</dev/shm/other>"
+        ),
+        Some(only_daemon.clone())
+      ),
+      ["outside every allowed class"],
+      "an unproved shared-memory path"
+    );
+    let unstamped = "100 write(6</scratch/land-target/a.txt>, \"x\", 1) = 1\n";
+    assert_eq!(
+      reasons(unstamped, Some(only_daemon)),
+      ["inside the target at a time the tracer did not stamp"]
+    );
+  }
+
+  /// AUD-29-42 acceptance (hidden siblings). Do: judge the hidden names a landing wrote — its own counter
+  /// and aside forms, then another landing's name, a malformed one, an arbitrary `.slates-` name, and a
+  /// clean run that left one behind. Expect: only the landing's own forms pass, and nothing may remain.
+  #[test]
+  fn only_the_landings_own_hidden_names_pass_and_none_may_remain() {
+    let id = 0x0123_4567_89ab_cdef_u64;
+    let own = format!(".slates-{id:016x}-0");
+    let aside = format!(".slates-{id:016x}-aside-{:016x}", 7u64);
+    let written = vec![own.clone(), format!("d/{aside}"), "a.txt".to_owned()];
+    assert_eq!(judge_hidden(&written, &["a.txt".to_owned()], id), Ok(2));
+    for foreign in [
+      format!(".slates-{:016x}-0", id + 1),
+      format!(".slates-{id:016x}-aside-7"),
+      format!(".slates-{id:016x}-"),
+      ".slates-anything".to_owned(),
+      ".slates-kept-x".to_owned(),
+    ] {
+      assert!(
+        judge_hidden(std::slice::from_ref(&foreign), &[], id).is_err(),
+        "{foreign} is not the landing's"
+      );
+    }
+    assert!(
+      judge_hidden(std::slice::from_ref(&own), std::slice::from_ref(&own), id)
+        .is_err_and(|why| why.contains("left behind")),
+      "a hidden sibling must not remain"
+    );
+  }
+
+  /// Golden vectors for the clocks the judge reads: strace `-ttt` and eslogger's RFC 3339 `time`.
+  #[test]
+  fn tracer_times_parse_to_epoch_nanoseconds() {
+    assert_eq!(epoch_stamp_ns("1.000001"), Some(1_000_001_000));
+    assert_eq!(
+      epoch_stamp_ns("1696159123.123456"),
+      Some(1_696_159_123_123_456_000)
+    );
+    for bad in ["", "1", ".5", "1.", "x.1", "1.1234567890", "-1.0"] {
+      assert_eq!(epoch_stamp_ns(bad), None, "{bad}");
+    }
+    assert_eq!(iso_ns("1970-01-01T00:00:01.000001Z"), Some(1_000_001_000));
+    assert_eq!(
+      iso_ns("2000-03-01T00:00:00Z"),
+      Some(951_868_800_000_000_000)
+    );
+    assert_eq!(
+      iso_ns("2026-09-26T08:20:01.123456789Z"),
+      Some(1_790_410_801_123_456_789)
+    );
+    for bad in ["2026-09-26T08:20:01", "2026-13-01T00:00:00Z", "garbage"] {
+      assert_eq!(iso_ns(bad), None, "{bad}");
     }
   }
 

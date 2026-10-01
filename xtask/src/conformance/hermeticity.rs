@@ -18,7 +18,8 @@ use slates_conformance::Suite;
 use slates_conformance::capability::HostOs;
 use slates_conformance::record::Outcome;
 use slates_conformance::trace::{
-  Policy, eslogger_has_activity, judge, parse_eslogger, parse_strace_with_cwd, strace_unnamed_paths,
+  Landing, Policy, eslogger_has_activity, judge, judge_hidden, parse_eslogger,
+  parse_strace_with_cwd, strace_unnamed_paths,
 };
 use slates_conformance::workload::Manifest;
 
@@ -54,6 +55,9 @@ pub(super) fn strace_prefix(log: &Path) -> Vec<String> {
     "--kill-on-exit".to_owned(),
     "-f".to_owned(),
     "-y".to_owned(),
+    // Each call stamped with the wall clock (seconds.microseconds), so a write inside the target is
+    // placed in, or outside, the granted landing's interval (AUD-29-42).
+    "-ttt".to_owned(),
     "-qq".to_owned(),
     "-s".to_owned(),
     "0".to_owned(),
@@ -491,7 +495,25 @@ fn signal_group(pid: u32, signal: &str) -> Result<(), Failure> {
 }
 
 /// The landing flow through the CLI: snapshot, plan, grant, land; returns the written count.
-fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<u64, Failure> {
+/// A granted landing as the judge needs it: what it reports written, its id, the interval it ran in
+/// (wall-clock nanoseconds since the epoch, the tracers' clock) and the daemon that executed it.
+struct Landed {
+  written: u64,
+  landing: u64,
+  from_ns: u64,
+  until_ns: u64,
+  daemon: u32,
+}
+
+/// The wall clock in nanoseconds since the Unix epoch: the clock strace `-ttt` and eslogger stamp with.
+fn wall_ns() -> Result<u64, Failure> {
+  let since = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_err(|e| Failure(format!("the wall clock is before the epoch: {e}")))?;
+  u64::try_from(since.as_nanos()).map_err(|_| Failure("the wall clock overflows".to_owned()))
+}
+
+fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<Landed, Failure> {
   let snapshot = session
     .binary
     .run(
@@ -537,6 +559,7 @@ fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<u
     landing,
     &manifest,
   )?;
+  let from_ns = wall_ns()?;
   let landed = session
     .binary
     .run(
@@ -554,11 +577,37 @@ fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<u
     )?
     .expect_ok("land (granted)")?
     .json()?;
-  landed["outcome"]["written"].as_u64().ok_or_else(|| {
+  let until_ns = wall_ns()?;
+  let written = landed["outcome"]["written"].as_u64().ok_or_else(|| {
     Failure(format!(
       "the granted landing reports no written count: {landed}"
     ))
+  })?;
+  Ok(Landed {
+    written,
+    landing,
+    from_ns,
+    until_ns,
+    daemon: daemon_pid,
   })
+}
+
+/// Every path under `target`, relative to it: what is on disk after the landing.
+fn tree_under(target: &Path) -> Result<Vec<String>, Failure> {
+  let mut out = Vec::new();
+  let mut stack = vec![target.to_path_buf()];
+  while let Some(dir) = stack.pop() {
+    for entry in std::fs::read_dir(&dir)? {
+      let path = entry?.path();
+      if let Ok(relative) = path.strip_prefix(target) {
+        out.push(relative.display().to_string());
+      }
+      if std::fs::symlink_metadata(&path)?.is_dir() {
+        stack.push(path);
+      }
+    }
+  }
+  Ok(out)
 }
 
 /// The mounted workload must reach disk, including its scratch-volume parents. A trace with
@@ -673,7 +722,8 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     .collect::<Vec<_>>();
   let target = run.scratch.fresh("land-target")?;
   let target = std::fs::canonicalize(&target)?;
-  let written = land_under_grant(run, &session, &target)?;
+  let landed = land_under_grant(run, &session, &target)?;
+  let written = landed.written;
   let verified = verify_landing(&target, &work)
     .and_then(|()| verify_manifest(&mounted_tree, &manifest_of(&target)?));
   let Session { mount, anchor, .. } = session;
@@ -696,13 +746,25 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     HostOs::Linux => parse_strace_with_cwd(&text, &cwd),
     _ => parse_eslogger(&text),
   };
-  let streams = [anchor_log.as_str()];
+  let writers = [landed.daemon];
   let policy = Policy {
     target: &target.display().to_string(),
     working_directory: &cwd,
-    streams: &streams,
+    landing: Some(Landing {
+      writers: &writers,
+      from_ns: landed.from_ns,
+      until_ns: landed.until_ns,
+    }),
   };
   let judged = judge(&events, &policy);
+  // The anchor's log is the harness's own file: the slates processes write their stderr to a pipe the
+  // harness drains (AUD-29-42), so the log is named here only for a failure's diagnosis.
+  let _ = &anchor_log;
+  let hidden_verdict = judge_hidden(
+    &judged.written_inside,
+    &tree_under(&target)?,
+    landed.landing,
+  );
   let unnamed = strace_unnamed_paths(&text);
   let mut matched = 0u32;
   let mut unmatched = Vec::new();
@@ -726,7 +788,11 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let complete = usize::try_from(written).ok() == Some(expected.len())
     && usize::try_from(matched).ok() == Some(expected.len())
     && verified.is_ok();
-  let ok = complete && judged.outside == 0 && judged.unresolved == 0 && unmatched.is_empty();
+  let ok = complete
+    && judged.outside == 0
+    && judged.unresolved == 0
+    && unmatched.is_empty()
+    && hidden_verdict.is_ok();
   let mut notes = vec![
     format!(
       "tracer: {}; {} events parsed from {} log lines; landing reported {written} written; {hidden} hidden siblings ({HIDDEN_PREFIX}*) seen inside the target",
@@ -741,6 +807,10 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
       text.lines().count()
     ),
     format!("the granted target: {}", target.display()),
+    format!(
+      "the granted landing {:016x}: daemon pid {}, {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
+      landed.landing, landed.daemon, landed.from_ns, landed.until_ns
+    ),
     format!(
       "volume quota: {size} bytes, derived from {inode_count} peak workload entries × {page}-byte host page"
     ),
@@ -759,8 +829,13 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   }
   for violation in &judged.violations {
     notes.push(format!(
-      "VIOLATION line {}: {} {}",
-      violation.line, violation.call, violation.path
+      "VIOLATION line {}: {} {} (pid {:?}, at {:?} ns): {}",
+      violation.event.line,
+      violation.event.call,
+      violation.event.path,
+      violation.event.pid,
+      violation.event.at_ns,
+      violation.reason
     ));
   }
   if !judged.unresolved_sample.is_empty() {
