@@ -405,6 +405,8 @@ fn explicit_times(file: &Path) {
       tv_nsec: 456_000_000,
     },
   };
+  #[allow(clippy::disallowed_methods)]
+  // a slates volume through the kernel mount under test, not host disk
   rustix::fs::utimensat(rustix::fs::CWD, file, &times, rustix::fs::AtFlags::empty())
     .expect("utimensat");
   #[allow(clippy::disallowed_methods)] // the attribute read through the kernel mount under test
@@ -431,6 +433,8 @@ fn explicit_times(file: &Path) {
       tv_nsec: 0,
     },
   };
+  #[allow(clippy::disallowed_methods)]
+  // a slates volume through the kernel mount under test, not host disk
   rustix::fs::utimensat(rustix::fs::CWD, file, &late, rustix::fs::AtFlags::empty())
     .expect("utimensat past 2038 and 2106");
   let stat = rustix::fs::stat(file).unwrap();

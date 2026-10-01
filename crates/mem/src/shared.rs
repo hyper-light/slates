@@ -562,6 +562,7 @@ mod platform {
       call: "ftruncate",
       code: None,
     })?;
+    #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
     // structural: allow — sizing the memory object just created (no filesystem entry; D-10).
     rustix::fs::ftruncate(&created.fd, size).map_err(|e| refused("ftruncate", e))?;
     let map = map(&created.fd, len)?;

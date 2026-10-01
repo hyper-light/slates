@@ -115,8 +115,11 @@ contact is a defect against this requirement, recorded here and in GAPS until it
 Four separate claims follow from it, each needing its own evidence:
 
 1. *No host file is accessed.* Evidence today: the lint wall and `cargo xtask check` confine host paths to the
-   crates below, and only `slates-land` links a write-capable file syscall; the hermeticity tracer (macOS and
-   Linux lanes) sees no write outside a granted target. Owed: the tracer to record reads as well as writes, and
+   crates below, and only `slates-land` names a write-capable file call — checked two ways, neither a linker
+   proof: the source scan (spelled symbols and expanded `use` trees, aliases and globs refused) and the
+   resolved-path lints (`clippy.toml` `disallowed-methods`, which see through aliases and macro expansion),
+   with reasoned exemptions in place only for shared-memory objects and the landing seam (AUD-29-31); the
+   hermeticity tracer (macOS and Linux lanes) sees no write outside a granted target. Owed: the tracer to record reads as well as writes, and
    the authority behind each effect (audit §9.3, AUD-29-42); Windows base handles (AUD-29-62).
 2. *No private byte is paged out or dumped.* Not claimed yet: only a strict create locks the content arena;
    metadata, rings, logs, completion records, codec and transport buffers are pageable, and no dump exclusion
@@ -826,7 +829,7 @@ plan schedules.
 - Evidence: hecate's landing engine ("three-way against the shared baseline; identical hashes short-circuit; single-side files land by reference; only doubly-touched files proceed"; "emitting conflict values on intersection, never interleaving"; "no automatic resolution of concurrent code edits, anywhere") and its receipts on structural mergers silently missing real conflicts [C: hecate SESSIONS.md:89-125; C: hecate ADR-0005]; its review gate ("materialization to a real target defaults to prompt, always, and requires zero unresolved conflict values") and its single-holder materialization lease (slates' landing lease) with a fencing generation [C: hecate SESSIONS.md:23-25, 128-133, 222, 229]; optimistic concurrency control (read phase, validation, write phase) [A: Kung & Robinson TODS 1981]; the diff3 pathologies that make inferred merges unsafe [A: Khanna, Kunal & Pierce FSTTCS 2007]; sylk's flusher as the shape to avoid (whole-overlay flush, union confirmations, `ResetOverlay`) [C: survey-sylk-vfs.md §1.7, §8.2]; vorpal's rule that a confirmation must never travel through the agent's own channel [C: survey-vorpal.md §6.1]; the swap primitives (`renameat2` with `RENAME_EXCHANGE` since Linux 3.15 and `EINVAL` where unsupported; `O_TMPFILE` since 3.11 with `linkat`; `renamex_np` with `RENAME_SWAP` advertised by `VOL_CAP_INT_RENAME_SWAP`; `FILE_RENAME_POSIX_SEMANTICS` with `REPLACE_IF_EXISTS`, "Existing handles to the replaced file continue to be valid") [B: rename(2); B: open(2); B: macOS rename(2); B: Microsoft ntifs `FILE_RENAME_INFORMATION`]; reflinks (`FICLONE` since 4.5; `clonefile` with `VOL_CAP_INT_CLONE`; `FSCTL_DUPLICATE_EXTENTS_TO_FILE` on ReFS) [B]; `F_BARRIERFSYNC` versus `F_FULLFSYNC` [B: macOS fcntl(2)]; `openat2` with `RESOLVE_BENEATH` since 5.6 [B: openat2(2)]. (`research/disk-source-of-truth.md` §1-§5)
 - Lost: automatic three-way text merge at landing (silent interleaves of code nobody reviewed; hecate's one law); writing the whole tree (sylk); a grant by path rather than by manifest (the human would approve a plan that later changed); grants over MCP or the SDKs (the agent would answer its own question); advisory locks against outsiders on POSIX (editors and git ignore them); rename-over without verification (a silent loss window); a disk probe at boot (a write outside a grant).
 - Measure: the online concurrency ramp inside each landing; exchange support per target filesystem; time per entry for plan, validate, write and sync; reflink availability and gain; per-entry exchange and verification costs; crash-resume cost.
-- Consequence: every byte that reaches a disk is traceable to a human decision; the landing crate is the only crate that links write-capable file syscalls; the hermeticity tracer gains "zero writes outside granted targets".
+- Consequence: every byte that reaches a disk is traceable to a human decision; the landing crate is the only crate that calls write-capable file functions (a source scan and resolved-path lints, not a linker proof; AUD-29-31); the hermeticity tracer gains "zero writes outside granted targets".
 
 ### D-27 The merge engine: green volumes written only by a merge task; increments as constant-size descriptors of declared operations; canonical rebase by position mapping; a pure two-pass verdict (accept, accept-identical, conflict) with no inference; splice by extent surgery; merge records as fenced pointers; holders recompute; byte-exact conflict windows; rebase as the only corrective path; streaming submission (hecate's merge architecture adapted)
 - The decision: a volume created with the `Green` role is written only by the merge task on its owner shard; agents clone a version into `Work` volumes; every mutation is journaled as a declared operation with its byte range and the file's previous version; `submit` seals the work volume, composes its declared operations into a net op set by interval algebra (never by comparing file states), and sends a constant-size increment naming the sealed post-state and the ops document by identity; the merge task deduplicates by increment identity, position-maps the ops through the canonical deltas since the increment's base (maps compose; old deltas fold into exact checkpoint deltas), runs the two-pass verdict (sweep-line overlap on descriptors, then memcmp only for same-range candidates), splices accepted ops into a new version by extent-list surgery without copying bytes, and commits the merge record as the next entry of green's ledger register, sent to all 2f+1 candidate holders under the owner's host epoch, committed at f+1 acknowledgements, and only when every referenced identity is placed; conflicts return byte-exact windows and the agent `rebase`s and resubmits; readers attach to versions and move only by `advance`; holders in a fleet recompute the verdict and the manifest identity before serving a version and compare head identities per version, mismatch fatal-and-loud.
@@ -6516,7 +6519,8 @@ Evidence: `research/survey-vorpal.md` §0–§9.
   vorpal's set: `unsafe_op_in_unsafe_fn = "deny"`, a deny on `std::sync::Arc` and `std::rc::Rc`
   outside the named FFI edge modules (enforced by a clippy `disallowed_types` entry plus a
   structural test), and a deny on `std::fs` and `std::net` outside the bridge, rendezvous, base
-  and landing crates; the structural test further denies every write-capable file syscall
+  and landing crates; the structural source scan and the resolved-path lints further deny every write-capable
+  file call
   (`open` with write flags, `rename*`, `link*`, `unlink*`, `mkdir*`, `rmdir`, `truncate`,
   `fsync`, `utimens*`, `chmod*` and their Windows equivalents) outside the landing crate, and
   denies `std::fs` write functions in the base crate. [derived from R1, R2, R10 in Part 0]
@@ -7826,3 +7830,21 @@ rule, and `docs/bugs/2026-10-01-a-far-report-expanded-into-unadmitted-recovery-w
   crash-between-slices test; the retention budget test; and the full-scale explorer with 143 multi-slice
   recoveries floored as a covered path.
 - What it does not change: proposals are not yet admitted against the budget (AUD-29-30); the wire; R1–R10.
+
+### A-59 — The R1 static check is stated as what it is, and strengthened where it was evadable (2026-10-01)
+Applied in the same change to: §0 evidence, D-26's consequence, Part 6's lint wall, `docs/wip/conformance.md`
+§3.5, GAPS (AUD-29-31–32), `unsafe-budget.toml`, and
+`docs/bugs/2026-10-01-the-r1-source-scan-was-evadable-and-skipped-a-production-module.md`.
+- Why: the documents called the structural check a proof that no write-capable syscall links outside the
+  landing crate. It was a line-substring scan, evaded by `use std::fs;`, brace groups, aliases and globs,
+  and it skipped any module that followed a `#[cfg(test)]` function (AUD-29-31).
+- The rule: two source-level checks plus the dynamic tracer, each stated as what it is. The structural scan
+  checks spelled symbols and expanded `use` trees, and refuses globs and root aliases. The resolved-path
+  lints (`disallowed-methods` for `std::fs`, `rustix::fs` and `libc` write calls) see through aliases and
+  macro expansion. Exemptions are reasoned and placed: shared-memory objects (D-10) and the landing seam's
+  impl and helpers. The hermeticity tracer observes syscalls at run time. None is a linker proof.
+- Evidence: scanner fixtures for every evasion spelling and for the test-module mistake; the lints clean on
+  macOS, Linux (Docker) and Windows (cross-lint); the corrected scan finding `slates-machine`'s hidden
+  memory-object calls.
+- What it does not change: R1 itself; the tracer; the landing seam.
+

@@ -224,6 +224,15 @@ fn lines_with_test_flag(source: &str) -> Vec<(usize, &str, bool)> {
       in_test = true;
       armed = false;
       depth = 0;
+    } else if armed
+      && !trimmed.is_empty()
+      && !trimmed.starts_with("#[")
+      && !trimmed.starts_with("//")
+    {
+      // The attribute sat on another item (a test-only function or impl): it does not reach the next
+      // module. Until 2026-10-01 it did, and production modules after a `#[cfg(test)] fn` went unscanned
+      // (AUD-29-31; `slates-machine`'s segment module).
+      armed = false;
     }
     if in_test {
       depth += i64::from(line.matches('{').count() as u32);
@@ -584,50 +593,251 @@ mod structural {
         continue;
       }
       let source = std::fs::read_to_string(&file)?;
-      let mut allow_next = false;
-      for (line_no, line, in_test) in lines_with_test_flag(&source) {
-        if in_test {
-          continue;
-        }
-        // `// structural: allow` on the line, or on the comment line above it, exempts one
-        // line; the comment must say why (an FFI edge, or a syscall on a memory object).
-        let allowed = line.contains("structural: allow") || allow_next;
-        allow_next = line.trim_start().starts_with("//") && line.contains("structural: allow");
-        if allowed {
-          continue;
-        }
-        let code = code_only(line);
+      violations.extend(source_violations(
+        &file.display().to_string(),
+        &source,
+        host_paths_allowed,
+        writes_allowed,
+      ));
+    }
+    Ok(())
+  }
+
+  /// The violations in one source file of a crate that may (`host_paths_allowed`) or may not name host
+  /// paths, and may (`writes_allowed`) or may not name write-capable calls (AUD-29-31). Two passes over the
+  /// non-test lines: every line's code against the spelled symbols, and every `use` statement's expanded
+  /// tree — braces, nesting, `self` and aliases resolved — against the same paths, so `use std::fs;` then
+  /// `fs::write(..)`, `use libc::{mkdirat}` or `use rustix::fs::mkdirat as make` cannot hide a call the
+  /// spelled check would see. A glob import of a write-capable module, and an alias of a crate root that
+  /// holds write calls (`use libc as c;`, `extern crate std as s;`), are refused outright, since later calls
+  /// through them cannot be checked. This is a source check: the resolved-path lints (`clippy.toml`
+  /// `disallowed-methods`) see through macro expansion, and the hermeticity tracer observes the syscalls
+  /// themselves; none of the three is a linker proof.
+  fn source_violations(
+    file: &str,
+    source: &str,
+    host_paths_allowed: bool,
+    writes_allowed: bool,
+  ) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut allow_next = false;
+    let mut statement = String::new();
+    let mut statement_line = 0usize;
+    for (line_no, line, in_test) in lines_with_test_flag(source) {
+      if in_test {
+        continue;
+      }
+      // `// structural: allow` on the line, or on the comment line above it, exempts one
+      // line; the comment must say why (an FFI edge, or a syscall on a memory object).
+      let allowed = line.contains("structural: allow") || allow_next;
+      allow_next = line.trim_start().starts_with("//") && line.contains("structural: allow");
+      if allowed {
+        continue;
+      }
+      let code = code_only(line);
+      let file = Path::new(file);
+      report(
+        &code,
+        FORBIDDEN_SYMBOLS,
+        file,
+        line_no,
+        "forbidden symbol (R2/D-7)",
+        &mut violations,
+      );
+      if !host_paths_allowed {
         report(
           &code,
-          FORBIDDEN_SYMBOLS,
-          &file,
+          HOST_PATH_SYMBOLS,
+          file,
           line_no,
-          "forbidden symbol (R2/D-7)",
-          violations,
+          "host path outside an allowed crate (R1)",
+          &mut violations,
         );
-        if !host_paths_allowed {
-          report(
-            &code,
-            HOST_PATH_SYMBOLS,
-            &file,
-            line_no,
-            "host path outside an allowed crate (R1)",
-            violations,
+      }
+      if !writes_allowed {
+        report(
+          &code,
+          WRITE_SYSCALLS,
+          file,
+          line_no,
+          "write-capable syscall outside slates-land (R1/D-26)",
+          &mut violations,
+        );
+      }
+      if let Some(alias) = aliased_root(&code) {
+        violations.push(format!(
+          "{}:{line_no}: alias of a crate root that holds write calls: `{alias}` (AUD-29-31)",
+          file.display()
+        ));
+      }
+      // Gather a `use` statement across the lines rustfmt wraps it over, then check its expanded paths.
+      let trimmed = code.trim();
+      if statement.is_empty() && is_use_statement(trimmed) {
+        statement_line = line_no;
+      }
+      if !statement.is_empty() || is_use_statement(trimmed) {
+        statement.push_str(trimmed);
+        if trimmed.ends_with(';') {
+          check_use_paths(
+            file,
+            statement_line,
+            &statement,
+            host_paths_allowed,
+            writes_allowed,
+            &mut violations,
           );
-        }
-        if !writes_allowed {
-          report(
-            &code,
-            WRITE_SYSCALLS,
-            &file,
-            line_no,
-            "write-capable syscall outside slates-land (R1/D-26)",
-            violations,
-          );
+          statement.clear();
         }
       }
     }
-    Ok(())
+    violations
+  }
+
+  /// Whether a code line opens a `use` statement (any visibility).
+  fn is_use_statement(code: &str) -> bool {
+    let rest = code
+      .strip_prefix("pub(crate) ")
+      .or_else(|| code.strip_prefix("pub(super) "))
+      .or_else(|| code.strip_prefix("pub "))
+      .unwrap_or(code);
+    rest.starts_with("use ")
+  }
+
+  /// Crate roots and modules whose aliasing would hide write calls from the spelled check.
+  const ALIAS_GUARDED: &[&str] = &[
+    "std",
+    "libc",
+    "rustix",
+    "rustix::fs",
+    "rustix::io",
+    "std::fs",
+  ];
+
+  /// The guarded root a line aliases (`use libc as c;`, `extern crate std as s;`), if any.
+  fn aliased_root(code: &str) -> Option<String> {
+    let trimmed = code.trim();
+    let body = trimmed
+      .strip_prefix("extern crate ")
+      .or_else(|| trimmed.strip_prefix("use "))?;
+    let (path, _) = body.trim_end_matches(';').split_once(" as ")?;
+    let path = path.trim().trim_start_matches("::");
+    ALIAS_GUARDED.contains(&path).then(|| path.to_owned())
+  }
+
+  /// Checks every path a `use` statement imports against the host-path and write rules.
+  fn check_use_paths(
+    file: &Path,
+    line_no: usize,
+    statement: &str,
+    host_paths_allowed: bool,
+    writes_allowed: bool,
+    violations: &mut Vec<String>,
+  ) {
+    let Some((_, tree)) = statement.split_once("use ") else {
+      return;
+    };
+    let tree = tree.trim().trim_end_matches(';').trim_start_matches("::");
+    for path in expand_use_tree("", tree) {
+      if !host_paths_allowed
+        && HOST_PATH_SYMBOLS
+          .iter()
+          .map(|symbol| symbol.trim_end_matches("::"))
+          .any(|root| path == root || path.starts_with(&format!("{root}::")))
+      {
+        violations.push(format!(
+          "{}:{line_no}: host path outside an allowed crate (R1): imports `{path}`",
+          file.display()
+        ));
+      }
+      if !writes_allowed {
+        for pattern in WRITE_SYSCALLS {
+          // A prefix, as the spelled check matches (`rustix::fs::mkdir` covers `mkdirat`); a pattern that
+          // ends in `(` names exactly that function.
+          let matched = match pattern.strip_suffix('(') {
+            Some(exact) => path == exact || path.starts_with(&format!("{exact}::")),
+            None => path.starts_with(pattern),
+          };
+          if matched {
+            violations.push(format!(
+              "{}:{line_no}: write-capable syscall outside slates-land (R1/D-26): imports `{path}`",
+              file.display()
+            ));
+          }
+        }
+        if let Some(module) = path.strip_suffix("::*")
+          && GLOB_GUARDED.contains(&module)
+        {
+          violations.push(format!(
+            "{}:{line_no}: glob import of a module with write calls: `{path}` (AUD-29-31)",
+            file.display()
+          ));
+        }
+      }
+    }
+  }
+
+  /// Modules a glob import of which would bring write calls in unnamed.
+  const GLOB_GUARDED: &[&str] = &[
+    "libc",
+    "rustix::fs",
+    "rustix::io",
+    "std::fs",
+    "std::os::unix::fs",
+    "windows_sys::Win32::Storage::FileSystem",
+  ];
+
+  /// The full paths a `use` tree imports, aliases dropped: `std::{fs, io::{self, Write as W}}` gives
+  /// `std::fs`, `std::io`, `std::io::Write`.
+  fn expand_use_tree(prefix: &str, tree: &str) -> Vec<String> {
+    let tree = tree.trim();
+    let join = |head: &str| -> String {
+      match (prefix.is_empty(), head.is_empty()) {
+        (true, _) => head.to_owned(),
+        (false, true) => prefix.to_owned(),
+        (false, false) => format!("{prefix}::{head}"),
+      }
+    };
+    if let Some(open) = tree.find('{') {
+      let head = tree.get(..open).unwrap_or("").trim().trim_end_matches("::");
+      let close = tree.rfind('}').unwrap_or(tree.len());
+      let inner = tree.get(open.saturating_add(1)..close).unwrap_or("");
+      let base = join(head);
+      return split_top_level(inner)
+        .into_iter()
+        .flat_map(|item| expand_use_tree(&base, item))
+        .collect();
+    }
+    let item = tree.split(" as ").next().unwrap_or(tree).trim();
+    if item.is_empty() {
+      return Vec::new();
+    }
+    if item == "self" {
+      return vec![prefix.to_owned()];
+    }
+    vec![join(item)]
+  }
+
+  /// Splits a brace group's items at its top-level commas.
+  fn split_top_level(inner: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (at, c) in inner.char_indices() {
+      match c {
+        '{' => depth += 1,
+        '}' => depth -= 1,
+        ',' if depth == 0 => {
+          items.push(inner.get(start..at).unwrap_or(""));
+          start = at.saturating_add(1);
+        }
+        _ => {}
+      }
+    }
+    items.push(inner.get(start..).unwrap_or(""));
+    items
+      .into_iter()
+      .filter(|item| !item.trim().is_empty())
+      .collect()
   }
 
   fn report(
@@ -642,6 +852,73 @@ mod structural {
       if code.contains(pattern) {
         violations.push(format!("{}:{line_no}: {what}: `{pattern}`", file.display()));
       }
+    }
+  }
+
+  #[cfg(test)]
+  mod fixtures {
+    use super::source_violations;
+
+    /// The violations a fixture raises in a crate that may neither name host paths nor write.
+    fn refused(source: &str) -> Vec<String> {
+      source_violations("fixture.rs", source, false, false)
+    }
+
+    /// AUD-29-31 (R1). Do: scan fixtures that reach a write-capable call through each spelling the old
+    /// string list missed — a module import then a short call, a brace group, a nested group with `self`, an
+    /// alias of the call, an alias of a crate root, `extern crate` renaming, a glob import, a wrapped multi-line
+    /// import, and a call spelled inside a macro body. Expect: every fixture refused.
+    #[test]
+    fn every_spelling_of_a_write_call_is_refused() {
+      let fixtures = [
+        "use std::fs;\nfn f() { let _ = fs::write(\"x\", b\"\"); }\n",
+        "use std::{fs, io};\n",
+        "use libc::{mkdirat, openat};\n",
+        "use rustix::{fs::{self, mkdirat}, io};\n",
+        "use rustix::fs::mkdirat as make;\n",
+        "use libc as c;\n",
+        "extern crate std as s;\n",
+        "use libc::*;\n",
+        "use rustix::fs::{\n  OFlags,\n  unlinkat,\n};\n",
+        "macro_rules! m { () => { std::fs::remove_file(\"x\") }; }\n",
+      ];
+      for fixture in fixtures {
+        assert!(!refused(fixture).is_empty(), "not refused: {fixture:?}");
+      }
+    }
+
+    /// AUD-29-31. Do: scan a production module that follows a test-only function. Expect: its write call
+    /// refused — the `#[cfg(test)]` on the function does not make the next module a test module (before
+    /// 2026-10-01 it did, and `slates-machine`'s segment module went unscanned).
+    #[test]
+    fn a_test_only_function_does_not_hide_the_next_module() {
+      let source = "#[cfg(test)]\nfn helper() {}\n\nmod platform {\n  use libc::mkdirat;\n}\n";
+      assert!(!refused(source).is_empty());
+      let tests = "#[cfg(test)]\nmod tests {\n  use libc::mkdirat;\n}\n";
+      assert!(refused(tests).is_empty(), "a real test module stays exempt");
+    }
+
+    /// AUD-29-31. Do: scan sources that only read, or name a write call where it is allowed. Expect: nothing
+    /// refused for read-only imports in a crate without host-path rights, nothing for a write call in the
+    /// landing crate, and nothing for a line carrying a reasoned `structural: allow`.
+    #[test]
+    fn read_only_and_allowed_sites_pass() {
+      assert!(refused("use rustix::io::{read, write};\nuse std::io::Write;\n").is_empty());
+      assert!(
+        source_violations(
+          "land.rs",
+          "use rustix::fs::{mkdirat, unlinkat};\n",
+          true,
+          true
+        )
+        .is_empty()
+      );
+      assert!(
+        refused(
+          "// structural: allow — sizing a memory object, not a file.\nuse rustix::fs::ftruncate;\n"
+        )
+        .is_empty()
+      );
     }
   }
 

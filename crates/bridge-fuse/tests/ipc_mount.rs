@@ -209,6 +209,7 @@ fn establish_ipc(paths: &MountPaths) -> LiveIpc {
   )
   .unwrap();
   assert_eq!(rustix::io::write(&writer, b"hello").unwrap(), 5);
+  #[allow(clippy::disallowed_methods)] // the fixture's own socket in its test directory
   rustix::fs::unlinkat(
     CWD,
     format!("{}/socket", paths.original),

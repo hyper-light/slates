@@ -5,7 +5,7 @@
 # budget to the current count. A budget only goes down. Raising one is an edit here that names the
 # new site and its reason. What each crate still holds, as of the counts below:
 #
-# slates-machine (45): Apple sysctl, mach host statistics and IOKit power queries, for which no
+# slates-machine (50): Apple sysctl, mach host statistics and IOKit power queries, for which no
 #   safe wrapper exists (7 sites, one helper each); the macOS thread-affinity hint (1); the
 #   file-backed map of the profile segment (1); the Win32 facts, probes and section (the rest,
 #   compiled only for Windows) — raised 43 → 44 on 2026-09-14 for `GetProcessAffinityMask`, the
@@ -17,6 +17,9 @@
 #   events-and-reports-an-unconverged-tail.md), which confirms a waiter asleep and learns each thread's CPU:
 #   macOS `pthread_cpu_number_np`, `pthread_mach_thread_np` and `thread_info` (3) and Windows
 #   `GetCurrentProcessorNumber` (1) — FFI with no safe wrapper; Linux uses rustix and `/proc` (none).
+#   Corrected 49 → 50 on 2026-10-01 (AUD-29-31), no new site: the shared-memory map of the profile segment's
+#   macOS/Linux object (`segment.rs` platform module, `MmapOptions::map_mut`) had gone uncounted, because the
+#   scanner took that production module for a test module after a `#[cfg(test)] fn` above it.
 # slates-mem (22): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
 #   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the one
@@ -146,7 +149,7 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 49
+slates-machine = 50
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
 #   the two plain copies across the mapping's raw pointer (`copy_out`, `copy_in`), the two racy copies
 #   through `AtomicU8` for seqlock payloads (`racy_out`, `racy_in`), and `ExclusiveObject::new`, the one

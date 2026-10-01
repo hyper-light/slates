@@ -272,6 +272,7 @@ impl OsLand {
 
   /// Links an unnamed temporary at `name`.
   #[cfg(target_os = "linux")]
+  #[allow(clippy::disallowed_methods)] // the write seam's own placement (R1, D-26; AUD-29-31).
   fn link_unnamed(&self, file: HostFile, dir: HostDir, name: &str) -> Result<(), HostError> {
     let proc_path = format!("/proc/self/fd/{}", self.file(file)?.as_raw_fd());
     rustix::fs::linkat(
@@ -407,6 +408,7 @@ fn data_barrier(fd: BorrowedFd<'_>) -> Result<(), HostError> {
 
 /// The media barrier: Linux `fsync` reaches the media already.
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
 fn media_barrier(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   rustix::fs::fsync(fd).map_err(refusal)
 }
@@ -481,6 +483,9 @@ impl HostFs for OsLand {
   }
 }
 
+// The write seam (R1, D-26): the one place in slates that writes host paths, under a granted landing. The
+// resolved-path lint that refuses these calls everywhere else (`clippy.toml`, AUD-29-31) is allowed here only.
+#[allow(clippy::disallowed_methods)]
 impl LandFs for OsLand {
   fn capabilities(&mut self, dir: HostDir) -> Result<LandCapabilities, HostError> {
     self.dir(dir)?;

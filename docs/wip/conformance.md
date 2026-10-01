@@ -288,8 +288,10 @@ the record names the list's BLAKE3 so an edit without a re-run is caught).
 
 ### 3.5 Hermeticity — SKIPPED(privilege) here; wired for the lanes
 
-The static half of R1 is `cargo xtask structural` (no write-capable syscall links outside
-`slates-land`). The dynamic half is the tracer run: the whole lifecycle — anchor, daemon, volume,
+The static half of R1 is two source-level checks, neither a linker proof (AUD-29-31): `cargo xtask
+structural` (spelled symbols and expanded `use` trees; globs and root aliases refused) and the resolved-path
+lints of `clippy.toml` (`std::fs`, `rustix::fs` and `libc` write calls), both confining write calls to
+`slates-land`. The dynamic half is the tracer run: the whole lifecycle — anchor, daemon, volume,
 kernel mount, a workload through the mount (`printf`, `mkdir`, `ln -s`, `mv`, `chmod`, `rm`), a
 snapshot, `land` (presented), `slates grant` with the anchor handoff the daemon's own children get
 (taken from the daemon's environment; on Linux the memfd is reopened through `/proc/<pid>/fd` and

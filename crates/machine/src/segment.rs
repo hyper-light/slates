@@ -206,6 +206,8 @@ mod platform {
       call: "ftruncate",
       code: None,
     })?;
+    #[allow(clippy::disallowed_methods)] // the shared-memory object: RAM, not a host path (R1).
+    // structural: allow — sizing the shared-memory object just created (no filesystem entry; D-10).
     rustix::fs::ftruncate(&object._fd, size).map_err(|e| refused("ftruncate", e))?;
     // SAFETY: the object was just created by us, this is its only descriptor, and nothing else
     // maps or writes it while the map lives; the map never outlives the object it borrows.
@@ -245,6 +247,7 @@ mod platform {
     let _ = rustix::shm::unlink(name.as_str());
     let fd = rustix::shm::open(
       name.as_str(),
+      // structural: allow — flags of the shared-memory object, not of a file (D-10).
       OFlags::CREATE | OFlags::EXCL | OFlags::RDWR,
       Mode::RUSR | Mode::WUSR,
     )
