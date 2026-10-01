@@ -248,14 +248,13 @@ const OUTLAST_FACTOR: u32 = 2;
 /// Shape: the most files a sized landing is given — sixteen calibrations; a disk so fast that more would be
 /// needed skips the test loudly rather than writing without bound.
 const MOST_FILES: usize = CALIBRATION_FILES * 16;
-/// Shape: the largest base page of a supported target (16 KiB, Apple silicon) — the charged window of each
-/// of the sized landings' tiny files.
-const LARGEST_PAGE: u64 = 16 << 10;
 /// Derived: the most a sized landing's volume may grow to — each of the most files ([`MOST_FILES`], doubled
-/// once more by a landing that must be made again) charged one window of the largest page. Sized to what the
-/// files need, not "far above" it: a volume's inode allowance is derived from its quota (§4.2), and a 1 GiB
-/// maximum reserved the shard's whole version slab, refusing the next volume `BudgetExceeded` (2026-10-01).
-const SIZED_VOLUME_BYTES: u64 = (MOST_FILES as u64) * 2 * LARGEST_PAGE;
+/// once more by a landing that must be made again) given one inode's worth of quota. A volume's inode allowance
+/// is its quota over `size_of::<Inode>()` (§4.2, `verbs::inode_allowance`), and each file's few bytes are kept
+/// inline, charged only themselves (far under an inode's size). Sizing by a 16 KiB window per file made the
+/// allowance 910,222 version slots, past a 7.5 GB runner's whole slab (828,504): the volume reserved every
+/// slot, and its landing could not retain one version for its snapshot (`NoSpace`, 2026-10-01).
+const SIZED_VOLUME_BYTES: u64 = (MOST_FILES * 2 * size_of::<slates_vfs::inode::Inode>()) as u64;
 
 /// A volume for a sized landing: grown as its files arrive, up to what the most files need (a bounded volume
 /// would reserve the whole bound at creation).
