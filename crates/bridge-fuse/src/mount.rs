@@ -15,14 +15,20 @@
 //! reaped, and a helper that sends a descriptor hands it over (AC-3.12/T-3.15; audit BUG-14,
 //! "early failure receiving the mount helper's descriptor returns before waiting for its
 //! child"). Only [`mount`] and [`Mount::unmount`], which name `fusermount3` and the FUSE channel,
-//! are Linux; the handshake runs against the real helper in the CI Linux lane. No `unsafe`: the
+//! are Linux; the handshake runs against the real helper in the CI Linux lane.
+//!
+//! The daemon's shard never blocks on a helper (R6; AUD-29-64): [`begin_handshake`] and [`begin_mount`]
+//! spawn it and return a [`PendingHandshake`] the shard polls when the socket is readable and on its tick
+//! until the helper is reaped, and [`begin_unmount`] returns a [`PendingExit`] it polls the same way. Both
+//! own their helper as the blocking form does: dropped (a cancelled task), they kill and reap it
+//! (`tests/handshake.rs`, every Unix; `tests/owner_turn.rs`, a real mount on Linux). No `unsafe`: the
 //! socket pair, the descriptor pass, the deadline and the spawn use rustix's I/O-safe wrappers
 //! and `std::process`.
 
 #![cfg(unix)]
 
 use std::io::IoSliceMut;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -165,6 +171,21 @@ impl Mount {
     &self.mount_point
   }
 
+  /// The mount over a device a non-blocking handshake returned ([`begin_mount`]), made non-blocking for an
+  /// owner that awaits its readiness ([`FuseChannel::nonblocking`]).
+  pub fn adopt(device: OwnedFd, mount_point: &str) -> Result<Mount, MountError> {
+    Ok(Mount {
+      channel: FuseChannel::nonblocking(device).map_err(MountError::Channel)?,
+      mount_point: mount_point.to_owned(),
+    })
+  }
+
+  /// The channel and the mount point, for an owner that keeps them apart (the daemon serves the channel
+  /// and unmounts by the point with [`begin_unmount`]).
+  pub fn into_parts(self) -> (FuseChannel, String) {
+    (self.channel, self.mount_point)
+  }
+
   /// Unmounts, through `fusermount3 -u` (the same no-privilege path).
   pub fn unmount(self) -> Result<(), MountError> {
     let status = Command::new(FUSERMOUNT)
@@ -207,6 +228,59 @@ pub fn mount(
     channel: FuseChannel::from_device(device),
     mount_point: mount_point.to_owned(),
   })
+}
+
+/// Begins mounting at `mount_point` without blocking (Linux): `fusermount3` spawned with the options
+/// [`mount`] would pass, its handshake left for the owner to poll ([`PendingHandshake`]); the device it
+/// returns becomes the mount through [`Mount::adopt`].
+#[cfg(target_os = "linux")]
+pub fn begin_mount(
+  mount_point: &str,
+  extra_options: &[&str],
+) -> Result<PendingHandshake, MountError> {
+  let mut options = BASE_OPTIONS.to_owned();
+  for extra in extra_options {
+    options.push(',');
+    options.push_str(extra);
+  }
+  let mut helper = Command::new(FUSERMOUNT);
+  helper.arg("-o").arg(&options).arg(mount_point);
+  begin_handshake(helper)
+}
+
+/// Begins unmounting `mount_point` without blocking (Linux): `fusermount3 -u -z` spawned, owned by the
+/// returned [`PendingExit`] until it is reaped.
+#[cfg(target_os = "linux")]
+pub fn begin_unmount(mount_point: &str) -> Result<PendingExit, MountError> {
+  let child = Command::new(FUSERMOUNT)
+    .arg("-u")
+    .arg("-z")
+    .arg(mount_point)
+    .stdin(Stdio::null())
+    .spawn()
+    .map_err(|e| MountError::Spawn {
+      code: e.raw_os_error(),
+    })?;
+  Ok(PendingExit(HelperGuard(Some(child))))
+}
+
+/// A helper spawned and not yet reaped, for an owner that polls its exit on its own tick (an unmount).
+/// Dropping it kills and reaps the helper.
+#[derive(Debug)]
+pub struct PendingExit(HelperGuard);
+
+impl PendingExit {
+  /// The helper's outcome once it has exited and been reaped; `None` while it runs.
+  pub fn poll(&mut self) -> Option<Result<(), MountError>> {
+    match self.0.try_finish() {
+      Ok(None) => None,
+      Ok(Some(status)) if status.success() => Some(Ok(())),
+      Ok(Some(status)) => Some(Err(MountError::Helper {
+        exit: HelperExit::of(status),
+      })),
+      Err(e) => Some(Err(e)),
+    }
+  }
 }
 
 /// Runs the descriptor handshake with `helper`: spawns it with one end of a socket pair as its
@@ -287,6 +361,140 @@ pub fn handshake(mut helper: Command, deadline: Duration) -> Result<OwnedFd, Mou
   }
 }
 
+/// What a non-blocking handshake waits on next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Awaiting {
+  /// The helper's answer on the socket: await [`PendingHandshake::socket`]'s readability.
+  Socket,
+  /// The helper's exit after it answered: poll again after the owner's tick (an exit raises no readiness).
+  Exit,
+}
+
+/// How a non-blocking handshake stands.
+#[derive(Debug)]
+pub enum Progress {
+  /// Not finished: what to wait for before the next [`PendingHandshake::poll`].
+  Waiting(Awaiting),
+  /// Finished, the helper reaped: the device, or why there is none (as [`handshake`] reports it).
+  Done(Result<OwnedFd, MountError>),
+}
+
+/// A handshake begun and not finished — [`handshake`]'s non-blocking form, for an owner that waits for
+/// readiness itself: the daemon's shard awaits [`PendingHandshake::socket`] through its runtime and polls
+/// when it is readable, then polls on its tick until the helper has exited, so no shard ever blocks on a
+/// mount helper (R6). The helper is owned exactly as in [`handshake`]: dropping a pending handshake — the
+/// owner's task cancelled — kills and reaps it, and [`PendingHandshake::abort`] does the same at the
+/// owner's deadline (audit BUG-14; Part 2 item 9).
+pub struct PendingHandshake {
+  socket: OwnedFd,
+  guard: HelperGuard,
+  answered: bool,
+  device: Option<OwnedFd>,
+}
+
+impl std::fmt::Debug for PendingHandshake {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("PendingHandshake")
+      .field("answered", &self.answered)
+      .finish()
+  }
+}
+
+/// Spawns `helper` for a non-blocking handshake: the socket pair, the child's standard input and
+/// environment exactly as [`handshake`] sets them, with this process's end non-blocking and no receive
+/// timeout — the owner's deadline is its own.
+pub fn begin_handshake(mut helper: Command) -> Result<PendingHandshake, MountError> {
+  let (ours, theirs) = rustix::net::socketpair(
+    AddressFamily::UNIX,
+    SocketType::STREAM,
+    socketpair_flags(),
+    None,
+  )
+  .map_err(|e| MountError::Socketpair {
+    code: Some(e.raw_os_error()),
+  })?;
+  for end in [&ours, &theirs] {
+    rustix::io::fcntl_setfd(end, rustix::io::FdFlags::CLOEXEC).map_err(|e| MountError::Recv {
+      code: Some(e.raw_os_error()),
+    })?;
+  }
+  rustix::io::ioctl_fionbio(&ours, true).map_err(|e| MountError::Recv {
+    code: Some(e.raw_os_error()),
+  })?;
+  let child = helper
+    .stdin(Stdio::from(theirs))
+    .env(COMM_FD_ENV, COMM_FD_IN_CHILD.to_string())
+    .spawn()
+    .map_err(|e| MountError::Spawn {
+      code: e.raw_os_error(),
+    })?;
+  drop(helper);
+  Ok(PendingHandshake {
+    socket: ours,
+    guard: HelperGuard(Some(child)),
+    answered: false,
+    device: None,
+  })
+}
+
+impl PendingHandshake {
+  /// The socket the helper answers on: the owner awaits its readability while [`Awaiting::Socket`].
+  pub fn socket(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.socket.as_fd()
+  }
+
+  /// Advances the handshake without blocking: takes the helper's answer once the socket has one (a
+  /// descriptor, or its end closed with none), then reaps the helper once it has exited. Done reports
+  /// exactly what [`handshake`] would: the device after a successful exit, `Helper` after a failed one,
+  /// `NoDevice` when it sent none, `Recv` when the receive itself refused.
+  pub fn poll(&mut self) -> Progress {
+    if !self.answered {
+      match receive_device(&self.socket) {
+        Ok(device) => {
+          self.device = Some(device);
+          self.answered = true;
+        }
+        // Nothing yet (`EAGAIN` on the non-blocking socket), or a signal interrupted the receive.
+        Err(Received::TimedOut) => return Progress::Waiting(Awaiting::Socket),
+        Err(Received::Refused(code)) if code == rustix::io::Errno::INTR.raw_os_error() => {
+          return Progress::Waiting(Awaiting::Socket);
+        }
+        Err(Received::Nothing) => self.answered = true,
+        Err(Received::Refused(code)) => {
+          return Progress::Done(Err(MountError::Recv { code: Some(code) }));
+        }
+      }
+    }
+    match self.guard.try_finish() {
+      Ok(None) => Progress::Waiting(Awaiting::Exit),
+      Ok(Some(status)) => Progress::Done(match self.device.take() {
+        Some(device) if status.success() => Ok(device),
+        Some(_) => Err(MountError::Helper {
+          exit: HelperExit::of(status),
+        }),
+        None => Err(MountError::NoDevice {
+          exit: HelperExit::of(status),
+        }),
+      }),
+      Err(e) => Progress::Done(Err(e)),
+    }
+  }
+
+  /// The helper's process id while it is unreaped, for an owner's diagnostics (and the tests' proof
+  /// that a dropped handshake reaps it).
+  pub fn helper_id(&self) -> Option<u32> {
+    self.guard.0.as_ref().map(std::process::Child::id)
+  }
+
+  /// Ends the handshake at the owner's `deadline`: the helper killed and reaped.
+  pub fn abort(mut self, deadline: Duration) -> MountError {
+    MountError::Timeout {
+      deadline,
+      exit: self.guard.abort(),
+    }
+  }
+}
+
 /// The receive's flags: the received descriptor is close-on-exec atomically where the kernel offers
 /// it (`MSG_CMSG_CLOEXEC`, Linux); elsewhere it is marked right after it is owned.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))]
@@ -316,6 +524,7 @@ fn socketpair_flags() -> SocketFlags {
 /// child without an owner that joins or cancels it). [`HelperGuard::finish`] waits for the
 /// helper's own exit; [`HelperGuard::abort`] kills and reaps it; a guard dropped any other way
 /// (a `?` on a later step) does the same in [`Drop`], so no zombie lingers.
+#[derive(Debug)]
 struct HelperGuard(Option<std::process::Child>);
 
 impl HelperGuard {
@@ -328,6 +537,23 @@ impl HelperGuard {
       // `finish` runs once, after a successful spawn, so the child is present; a missing one is a
       // caller error, reported rather than panicked (the no-panic law).
       None => Err(MountError::Spawn { code: None }),
+    }
+  }
+
+  /// Reaps the helper if it has exited, taking the child; `None` while it still runs.
+  fn try_finish(&mut self) -> Result<Option<ExitStatus>, MountError> {
+    let Some(child) = self.0.as_mut() else {
+      return Err(MountError::Spawn { code: None });
+    };
+    match child.try_wait() {
+      Ok(Some(status)) => {
+        self.0 = None;
+        Ok(Some(status))
+      }
+      Ok(None) => Ok(None),
+      Err(e) => Err(MountError::Spawn {
+        code: e.raw_os_error(),
+      }),
     }
   }
 

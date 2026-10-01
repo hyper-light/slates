@@ -18,7 +18,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
-use slates_bridge_fuse::mount::{COMM_FD_ENV, COMM_FD_IN_CHILD, HelperExit, MountError, handshake};
+use slates_bridge_fuse::mount::{
+  Awaiting, COMM_FD_ENV, COMM_FD_IN_CHILD, HelperExit, MountError, PendingHandshake, Progress,
+  begin_handshake, handshake,
+};
 
 /// Format: the environment variable that turns this binary into the descriptor-sending helper.
 const HELPER_ROLE: &str = "SLATES_FUSE_TEST_HELPER_ROLE";
@@ -142,6 +145,131 @@ fn a_helper_that_sends_a_descriptor_hands_it_over() {
     rustix::fs::FileType::from_raw_mode(stat.st_mode),
     rustix::fs::FileType::CharacterDevice,
     "the descriptor the helper sent (/dev/null) arrived intact"
+  );
+}
+
+/// Drives a non-blocking handshake the way an owner with its own readiness does: waits for the socket's
+/// readability while the handshake awaits the helper's answer and re-polls on a short sleep while it awaits
+/// the exit, until it is done or `deadline` passes (then aborts it). Returns the outcome and how many times
+/// the handshake reported each wait (non-vacuity: the non-blocking path was taken).
+fn drive(
+  mut pending: PendingHandshake,
+  deadline: Duration,
+) -> (Result<OwnedFd, MountError>, usize) {
+  let started = Instant::now();
+  let mut waits = 0usize;
+  loop {
+    match pending.poll() {
+      Progress::Done(outcome) => return (outcome, waits),
+      Progress::Waiting(awaiting) => {
+        waits += 1;
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+          return (Err(pending.abort(deadline)), waits);
+        }
+        match awaiting {
+          Awaiting::Socket => {
+            let socket = pending.socket();
+            let mut fds = [rustix::event::PollFd::new(
+              &socket,
+              rustix::event::PollFlags::IN,
+            )];
+            let timeout = rustix::time::Timespec::try_from(left).unwrap();
+            let _ = rustix::event::poll(&mut fds, Some(&timeout));
+          }
+          Awaiting::Exit => {
+            #[allow(clippy::disallowed_methods)]
+            std::thread::sleep(Duration::from_millis(1));
+          }
+        }
+      }
+    }
+  }
+}
+
+/// The non-blocking handshake (the daemon's form, R6). Do: begin a handshake with a helper that exits 7
+/// without a descriptor, one that sends one, and one that never answers, and drive each by readiness.
+/// Expect what the blocking handshake reports — `NoDevice` with exit 7, the descriptor intact, `Timeout`
+/// with the helper killed at the deadline — with the socket never read while empty (each reached the
+/// socket wait at least once before its answer).
+#[test]
+fn a_non_blocking_handshake_reports_what_the_blocking_one_does() {
+  let deadline = derived_deadline();
+  let mut quits = Command::new("sh");
+  quits.args(["-c", "exit 7"]);
+  let (outcome, _) = drive(begin_handshake(quits).unwrap(), deadline);
+  assert!(
+    matches!(
+      outcome,
+      Err(MountError::NoDevice {
+        exit: HelperExit {
+          code: Some(7),
+          signal: None
+        }
+      })
+    ),
+    "{outcome:?}"
+  );
+  let exe = std::env::current_exe().unwrap();
+  let mut sends = Command::new(exe);
+  sends
+    .args([
+      "--ignored",
+      "--exact",
+      "helper_role_sends_a_descriptor",
+      "--nocapture",
+    ])
+    .env(HELPER_ROLE, "1");
+  let (outcome, waits) = drive(begin_handshake(sends).unwrap(), deadline);
+  let device = outcome.unwrap();
+  assert!(
+    waits >= 1,
+    "the owner waited for the helper's answer rather than blocking"
+  );
+  let stat = rustix::fs::fstat(device.as_fd()).unwrap();
+  assert_eq!(
+    rustix::fs::FileType::from_raw_mode(stat.st_mode),
+    rustix::fs::FileType::CharacterDevice
+  );
+  let mut hangs = Command::new("sh");
+  hangs.args(["-c", &format!("exec sleep {HANG_SECONDS}")]);
+  let started = Instant::now();
+  let (outcome, _) = drive(begin_handshake(hangs).unwrap(), deadline);
+  assert!(
+    matches!(
+      outcome,
+      Err(MountError::Timeout {
+        exit: HelperExit {
+          code: None,
+          signal: Some(SIGKILL)
+        },
+        ..
+      })
+    ),
+    "{outcome:?}"
+  );
+  assert!(started.elapsed() < Duration::from_secs(HANG_SECONDS.parse::<u64>().unwrap()));
+}
+
+/// Cancellation (Part 2 item 9). Do: begin a handshake with a helper that never answers and drop it while
+/// it waits — the owner's task cancelled. Expect: the helper is gone at once, killed and reaped (its pid no
+/// longer names a process; an unreaped zombie would still answer a signal probe).
+#[test]
+fn a_dropped_non_blocking_handshake_kills_and_reaps_its_helper() {
+  let mut hangs = Command::new("sh");
+  hangs.args(["-c", &format!("exec sleep {HANG_SECONDS}")]);
+  let pending = begin_handshake(hangs).unwrap();
+  let pid = pending.helper_id().unwrap();
+  let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+  assert!(
+    rustix::process::test_kill_process(pid).is_ok(),
+    "the helper runs"
+  );
+  drop(pending);
+  assert_eq!(
+    rustix::process::test_kill_process(pid),
+    Err(rustix::io::Errno::SRCH),
+    "the dropped handshake's helper was killed and reaped"
   );
 }
 

@@ -40,6 +40,7 @@ use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
 use crate::notify::{EXPIRE_ONLY, inval_entry, inval_inode};
+use crate::reply::ReplyHeader;
 use crate::request::Request;
 use slates_bridge_core::{AttachmentId, Attachments, Invalidation};
 
@@ -129,6 +130,37 @@ impl FuseChannel {
   /// The device descriptor (for the mount and for cloning).
   pub fn device(&self) -> impl AsFd + '_ {
     self.device.as_fd()
+  }
+
+  /// A channel whose reads never block (`O_NONBLOCK`): for an owner that awaits the device's readiness
+  /// through its own runtime and reads with [`FuseChannel::try_read_request`] (the daemon's shard, R6).
+  pub fn nonblocking(device: OwnedFd) -> Result<FuseChannel, ChannelError> {
+    rustix::io::ioctl_fionbio(&device, true).map_err(|e| ChannelError::Device {
+      call: "fionbio",
+      code: Some(e.raw_os_error()),
+    })?;
+    Ok(FuseChannel::from_device(device))
+  }
+
+  /// The device's descriptor number, for registering its readiness with a runtime; the channel keeps
+  /// owning it.
+  pub fn raw_device(&self) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    self.device.as_raw_fd()
+  }
+
+  /// Reads the next request if one is waiting, without blocking: its length, `None` when none is
+  /// (`EAGAIN`) or a signal interrupted the read; `Disconnected` once the kernel has unmounted.
+  pub fn try_read_request(&mut self) -> Result<Option<usize>, ChannelError> {
+    match rustix::io::read(&self.device, self.buffer.as_mut_slice()) {
+      Ok(n) => Ok(Some(n)),
+      Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => Ok(None),
+      Err(rustix::io::Errno::NODEV) => Err(ChannelError::Disconnected),
+      Err(e) => Err(ChannelError::Device {
+        call: "read",
+        code: Some(e.raw_os_error()),
+      }),
+    }
   }
 
   /// Reads the next request into the internal buffer; returns the bytes read. `ENODEV` means
@@ -496,6 +528,135 @@ fn reply_error(reply: &[u8]) -> i32 {
     .get(ERROR_AT..ERROR_AT + size_of::<i32>())
     .and_then(|bytes| bytes.try_into().ok())
     .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
+}
+
+/// A request served by [`dispatch_ready`] whose reply waits for its owner: the opcode, the round delivered
+/// before it, the reply's errno, and where the reply sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dispatched {
+  /// The request's opcode, or `None` for one slates does not serve.
+  pub opcode: Option<Opcode>,
+  /// The round delivered before it.
+  pub delivered: Delivered,
+  /// The reply's errno (zero for success, or for a request that takes no reply).
+  pub error: i32,
+  unique: u64,
+  len: usize,
+}
+
+impl Dispatched {
+  /// Whether the request changed the volume in a way its caller is promised survives a daemon restart
+  /// once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, and the commit points of
+  /// data — `fsync` and the `flush` every close sends — succeeded. A plain `write` is not one: like an
+  /// NFS `UNSTABLE` write, its bytes are in the daemon when it returns and are made stable by the `flush`
+  /// or `fsync` that follows.
+  pub fn needs_barrier(&self) -> bool {
+    self.error == 0
+      && matches!(
+        self.opcode,
+        Some(
+          Opcode::SetAttr
+            | Opcode::SymLink
+            | Opcode::MkNod
+            | Opcode::MkDir
+            | Opcode::Unlink
+            | Opcode::RmDir
+            | Opcode::Rename
+            | Opcode::Rename2
+            | Opcode::Link
+            | Opcode::Create
+            | Opcode::FSync
+            | Opcode::FSyncDir
+            | Opcode::Flush
+        )
+      )
+  }
+}
+
+/// What one non-blocking turn of [`dispatch_ready`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Turn {
+  /// No request was waiting: the owner awaits the device's readiness again.
+  Idle,
+  /// A read shorter than a header — a message the kernel never sends — dropped.
+  Dropped,
+  /// The mount ended: the kernel disconnected, or the attachment admits no more requests.
+  Ended,
+  /// A request was dispatched; its reply waits in the state for [`send_reply`].
+  Dispatched(Dispatched),
+}
+
+/// One non-blocking turn for an owner that makes a request's effect durable before answering (the daemon,
+/// §4.8): reads a waiting request ([`FuseChannel::try_read_request`]), delivers the owed round, dispatches
+/// it to `bridge` under `attachment` — admitted and ended around the service as in [`serve_step`] — and
+/// leaves the reply in `state` for [`send_reply`]. A request that takes no reply is answered by nothing.
+pub fn dispatch_ready(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+  state: &mut ServeState,
+) -> Result<Turn, ChannelError> {
+  let read = match channel.try_read_request() {
+    Ok(Some(read)) => read,
+    Ok(None) => return Ok(Turn::Idle),
+    Err(ChannelError::Disconnected) => return Ok(Turn::Ended),
+    Err(e) => return Err(e),
+  };
+  if read < IN_HEADER_LEN {
+    return Ok(Turn::Dropped);
+  }
+  let Ok(cx) = attachments.begin(attachment) else {
+    return Ok(Turn::Ended);
+  };
+  let request = channel.take_request();
+  let parsed = Request::parse(&request).ok();
+  let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
+  let opcode = parsed.and_then(|parsed| {
+    if parsed.opcode == Some(Opcode::Init)
+      && let Ok(negotiated) = negotiate(parsed.body)
+    {
+      state.expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
+    }
+    parsed.opcode
+  });
+  let delivered = deliver_owed(channel, bridge, &cx, state);
+  let dispatched = delivered.map(|delivered| {
+    let len = dispatch(&request, bridge, &cx, &mut state.reply);
+    let error = state.reply.get(..len).map_or(0, reply_error);
+    state.coherence.served_own_request(bridge, &cx, delivered);
+    Dispatched {
+      opcode,
+      delivered,
+      error,
+      unique,
+      len,
+    }
+  });
+  attachments.end(attachment);
+  dispatched.map(Turn::Dispatched)
+}
+
+/// Writes a dispatched request's reply — or, when its owner could not make the effect durable, an error
+/// reply with `refuse_with` (an errno; `EIO` for a refused barrier) in its place, so the caller is told
+/// rather than promised survival. A request that takes no reply writes nothing either way.
+pub fn send_reply(
+  channel: &FuseChannel,
+  state: &mut ServeState,
+  dispatched: &Dispatched,
+  refuse_with: Option<i32>,
+) -> Result<(), ChannelError> {
+  if dispatched.len == 0 {
+    return Ok(());
+  }
+  match refuse_with {
+    None => channel.write_reply(state.reply.get(..dispatched.len).unwrap_or(&[])),
+    Some(errno) => {
+      let n = ReplyHeader::write_error(dispatched.unique, errno, &mut state.reply)
+        .map_err(ChannelError::from)?;
+      channel.write_reply(state.reply.get(..n).unwrap_or(&[]))
+    }
+  }
 }
 
 /// The blocking serve loop (the fallback path, §4.6): [`wait`] for a request or a signalled change,
