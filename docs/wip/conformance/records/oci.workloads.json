@@ -9,16 +9,83 @@
     "privilege": "unprivileged"
   },
   "date": "2026-10-01",
-  "command": "",
-  "bound": "",
+  "command": "docker run --rm --user <uid>:<gid> --mount <the binding> --mount <host scratch>:/host rust:1.98.0 sh -c '<roster script>' in /host/<tool> and /work/conformance-<pid>/workloads-run/<tool>, per tool of crates/conformance/src/workload.rs ROSTER the image holds; trees compared by manifest",
+  "bound": "3 tools run, one script each",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "owed",
-      "reason": "the container form exists — `attach` returns a verified non-recursive private bind (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS lane under the runtime handshake (`slates oci-runtime docker`), as does fsstress — but this suite's container leg is not built yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the daemon's FUSE mount"
+    "kind": "ran",
+    "counts": {
+      "suite": "workloads",
+      "tools": [
+        {
+          "name": "git",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "cargo",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "npm",
+          "status": {
+            "kind": "skipped",
+            "tool": "npm"
+          }
+        },
+        {
+          "name": "python",
+          "status": {
+            "kind": "identical"
+          }
+        },
+        {
+          "name": "rg",
+          "status": {
+            "kind": "skipped",
+            "tool": "rg"
+          }
+        },
+        {
+          "name": "rsync",
+          "status": {
+            "kind": "skipped",
+            "tool": "rsync"
+          }
+        },
+        {
+          "name": "sqlite",
+          "status": {
+            "kind": "skipped",
+            "tool": "sqlite3"
+          }
+        },
+        {
+          "name": "editor",
+          "status": {
+            "kind": "skipped",
+            "tool": "vim"
+          }
+        },
+        {
+          "name": "watcher",
+          "status": {
+            "kind": "skipped",
+            "tool": "inotifywait"
+          }
+        }
+      ]
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "duration_ms": 24097,
+  "notes": [
+    "the roster ran in `rust:1.98.0` as the mounting user; the reference side is a host scratch directory bound at /host, so both sides cross the runtime's file sharing; the volume was created with --fold=true; git ran with core.createObject=rename on both sides, as the profile's hard-link rule asks",
+    "the runtime's profile (`slates oci-runtime docker`): profile: engine=\"Docker Desktop\" version=29.3.1 endpoint=unix://~/.docker/run/docker.sock rootless=false userns=false; evidence: T-4.13 (Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing); identity: host_user_through_share (container ids are not forwarded; the attachment's capability is the authority); hard_links: other_names_stale_after_the_first_is_removed (until the guest revalidates; git: core.createObject=rename)",
+    "the source checked again (`slates oci-check`, mount 2 on device 436207690) just before the bind",
+    "git: 20 `.nfs.*` names set aside on the mount side — the NFS client's silly-renames of names removed while the runtime's share held them open (the transport's declared delete-while-open rule, `SillyRenamed`)",
+    "cargo: 20 `.nfs.*` names set aside on the mount side — the NFS client's silly-renames of names removed while the runtime's share held them open (the transport's declared delete-while-open rule, `SillyRenamed`)"
+  ]
 }

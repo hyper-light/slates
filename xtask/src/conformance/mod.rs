@@ -706,6 +706,7 @@ fn run_suite_on(
     Suite::Fsstress if transport == Transport::Oci => container::run_fsstress(&run)?,
     Suite::Fsstress => suites::run_fsstress(&run)?,
     Suite::Pjdfstest => suites::run_pjdfstest(&run)?,
+    Suite::Workloads if transport == Transport::Oci => container::run_workloads(&run)?,
     Suite::Workloads => workloads::run_workloads(&run)?,
     Suite::Hermeticity => hermeticity::run_hermeticity(&run)?,
     Suite::Pressure | Suite::Failure => {

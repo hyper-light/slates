@@ -1181,8 +1181,8 @@ impl Overlay<'_> {
     )?;
     self.vol.retire_blocks(store, retired)?;
     match located.child {
-      Child::Dir(h) => {
-        self.vol.release_dir_node(store, h)?;
+      // The directory's node goes with its inode (`Volume::release_body`), as `rmdir`'s does.
+      Child::Dir(_) => {
         self.vol.drop_link(store, located.inode)?;
         self.vol.drop_link(store, located.inode)?;
         if let Some(plane) = self.vol.base.as_mut()
@@ -1597,7 +1597,7 @@ impl Overlay<'_> {
     mode: u32,
     kind: Kind,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.vol.entry_dir(store, dir_no)?;
     if self.exists(store, dir, name)? {
       return Err(VfsError::AlreadyExists);
     }
@@ -3262,7 +3262,7 @@ impl Overlay<'_> {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.vol.entry_dir(store, dir_no)?;
     self.create_file(store, dir, name, mode)
   }
 
@@ -3274,7 +3274,7 @@ impl Overlay<'_> {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.vol.entry_dir(store, dir_no)?;
     let handle = self.mkdir(store, dir, name, mode)?;
     Ok(store.dirs.get(handle)?.inode)
   }
@@ -3287,7 +3287,7 @@ impl Overlay<'_> {
     name: &str,
     target: &str,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.vol.entry_dir(store, dir_no)?;
     self.symlink(store, dir, name, target)
   }
 
@@ -3299,7 +3299,7 @@ impl Overlay<'_> {
     name: &str,
     target: InodeNo,
   ) -> Result<(), VfsError> {
-    let dir = self.vol.current_dir(store, dir_no)?;
+    let dir = self.vol.entry_dir(store, dir_no)?;
     self.link(store, dir, name, target)
   }
 
@@ -3335,7 +3335,7 @@ impl Overlay<'_> {
     to_name: &str,
   ) -> Result<(), VfsError> {
     let from = self.vol.current_dir(store, from_dir_no)?;
-    let to = self.vol.current_dir(store, to_dir_no)?;
+    let to = self.vol.entry_dir(store, to_dir_no)?;
     self.rename(store, from, from_name, to, to_name)
   }
 

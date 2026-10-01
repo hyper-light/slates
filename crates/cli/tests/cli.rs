@@ -500,6 +500,7 @@ fn a_sparse_extension_through(instance: &str, path: &str) {
 /// the slates volume → NFS → host read. The write side avoids `std::fs` (R1) through the shell; the
 /// read side is a separate `cat` process, a fresh READ across the mount rather than a page-cache echo.
 fn roundtrip_a_file_through(path: &str) {
+  a_hard_link_outlives_its_first_name_through(path);
   let payload = "written through a real slates kernel mount";
   let file = format!("{path}/roundtrip.txt");
   let wrote = Command::new("sh")
@@ -518,6 +519,34 @@ fn roundtrip_a_file_through(path: &str) {
     payload,
     "the bytes written through the mount read back byte for byte"
   );
+}
+
+/// Shape: how many times the hard-link pattern runs through a kernel mount — far past the rate at which a stale
+/// name showed through Docker Desktop's share (99 in 100, 2026-10-01), so one stale lookup fails the test.
+const HARD_LINK_ROUNDS: usize = 100;
+
+/// The hard-link pattern git finalizes every object with, through the kernel mount at `path`: the temporary
+/// held open and written, linked to the final name, the temporary removed, then the final name read at once.
+/// Every round must read the bytes back (on this host's mount; the macOS host measured 0 failures in 200).
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn a_hard_link_outlives_its_first_name_through(path: &str) {
+  let dir = format!("{path}/links");
+  std::fs::create_dir(&dir).unwrap();
+  for round in 0..HARD_LINK_ROUNDS {
+    let (tmp, obj) = (format!("{dir}/tmp-{round}"), format!("{dir}/obj-{round}"));
+    let held = std::fs::File::create(&tmp).unwrap();
+    std::io::Write::write_all(&mut &held, b"object bytes").unwrap();
+    std::fs::hard_link(&tmp, &obj).unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    assert_eq!(
+      std::fs::read(&obj).unwrap_or_default(),
+      b"object bytes",
+      "round {round}: the second name outlives the first"
+    );
+    drop(held);
+  }
+  // The directory stays: removing a held-open name leaves an NFS client's silly-renamed `.nfs.*` file, which
+  // the client deletes at the last close on its own schedule; the scratch volume goes with the test.
 }
 
 /// `slates unmount DIR` removes the mount (a pure `umount`, no daemon needed).

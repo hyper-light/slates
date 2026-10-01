@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags};
 use slates_bridge_oci::runtime::{
-  EngineFacts, Host, IdentityRule, admit_endpoint, admit_runtime, judge, runtime_profile,
+  EngineFacts, HardLinkRule, Host, IdentityRule, admit_endpoint, admit_runtime, judge,
+  runtime_profile,
 };
 use slates_server::daemon::OBSERVE_BUDGET_NS;
 
@@ -256,6 +257,15 @@ fn identity_text(rule: IdentityRule) -> &'static str {
   }
 }
 
+/// A profile's hard-link rule on the CLI's output.
+fn hard_link_text(rule: HardLinkRule) -> &'static str {
+  match rule {
+    HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved => {
+      "other_names_stale_after_the_first_is_removed (until the guest revalidates; git: core.createObject=rename)"
+    }
+  }
+}
+
 /// `oci-runtime RUNTIME`: the profile and the evidence it holds (exit 0), or the typed refusal (exit 1).
 pub(crate) fn oci_runtime(runtime: &str) -> Result<(), Failure> {
   admit_runtime(runtime).map_err(|refusal| Failure::Refused(refusal.to_string()))?;
@@ -277,6 +287,7 @@ pub(crate) fn oci_runtime(runtime: &str) -> Result<(), Failure> {
     judge(&profile, Host::this()).map_err(|refusal| Failure::Refused(refusal.to_string()))?;
   println!("evidence: {} ({})", tested.test, tested.description);
   println!("identity: {}", identity_text(tested.identity));
+  println!("hard_links: {}", hard_link_text(tested.hard_links));
   Ok(())
 }
 

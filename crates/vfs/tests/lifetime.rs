@@ -269,3 +269,66 @@ fn a_forget_drops_only_the_owners_share() {
     "reclaimed once both attachments forgot"
   );
 }
+
+/// A directory removed while a transport still holds it — a kernel's lookup of a directory it made, kept until
+/// its forget (2026-10-01: `rm -r` through the daemon's FUSE mount, after which every barrier on the volume was
+/// refused and the kernel answered `EIO`). Do: hold a reference on a directory, empty it, remove it; image
+/// the volume, list the removed directory, create in it; drop the reference and image again. Expect: the
+/// directory stays a valid, empty directory until the last reference — the volume images, it lists empty, a
+/// create or mkdir inside it is refused `NotFound` (POSIX `ENOENT` for a removed directory) — and the last
+/// reference reclaims it. Before, `rmdir` freed the directory's node at once, so the orphan named a freed
+/// node and every image walk met a stale handle.
+#[test]
+fn a_directory_removed_while_referenced_stays_valid_and_empty_until_its_last_reference() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
+  vol.reference(&store, dir).unwrap();
+  vol.create_file_no(&mut store, dir, "f", 0o644).unwrap();
+  vol.unlink_no(&mut store, dir, "f").unwrap();
+  vol.rmdir_no(&mut store, root, "d").unwrap();
+  assert!(
+    vol.to_image(&store, None).is_ok(),
+    "the volume images with the removed directory held"
+  );
+  assert!(
+    vol.readdir_no(&store, dir).unwrap().is_empty(),
+    "the removed directory lists empty"
+  );
+  assert_eq!(
+    vol.create_file_no(&mut store, dir, "g", 0o644),
+    Err(slates_vfs::VfsError::NotFound),
+    "no entry is made in a removed directory"
+  );
+  assert_eq!(
+    vol.mkdir_no(&mut store, dir, "h", 0o755),
+    Err(slates_vfs::VfsError::NotFound)
+  );
+  vol.unreference(&mut store, dir).unwrap();
+  assert!(
+    vol.to_image(&store, None).is_ok(),
+    "the volume images after the last reference"
+  );
+  assert!(
+    vol.readdir_no(&store, dir).is_err(),
+    "the last reference reclaimed it"
+  );
+}
+
+/// The same through a rename that replaces an empty directory a transport holds. Do: hold the target, rename a
+/// directory over it, image the volume, drop the reference. Expect: the volume images throughout.
+#[test]
+fn a_directory_replaced_by_a_rename_while_referenced_stays_valid_until_its_last_reference() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  vol.mkdir_no(&mut store, root, "a", 0o755).unwrap();
+  let target = vol.mkdir_no(&mut store, root, "b", 0o755).unwrap();
+  vol.reference(&store, target).unwrap();
+  vol.rename_no(&mut store, root, "a", root, "b").unwrap();
+  assert!(vol.to_image(&store, None).is_ok());
+  assert!(vol.readdir_no(&store, target).unwrap().is_empty());
+  vol.unreference(&mut store, target).unwrap();
+  assert!(vol.to_image(&store, None).is_ok());
+}

@@ -5,7 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_oci::runtime::{
-  EngineFacts, Host, IdentityRule, ProfileRefusal, admit_endpoint, judge, runtime_profile,
+  EngineFacts, HardLinkRule, Host, IdentityRule, ProfileRefusal, admit_endpoint, judge,
+  runtime_profile,
 };
 
 /// Format: Docker Desktop's answer as this machine's engine gave it (29.3.1, 2026-10-01).
@@ -142,4 +143,8 @@ fn a_labelling_engine_is_refused_and_the_tested_profile_states_its_identity_rule
   );
   let tested = judge(&profile, Host::MacOs).unwrap();
   assert_eq!(tested.identity, IdentityRule::HostUserThroughShare);
+  assert_eq!(
+    tested.hard_links,
+    HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved
+  );
 }

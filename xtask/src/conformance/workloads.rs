@@ -21,7 +21,7 @@ use crate::Failure;
 
 /// Format: the fixed identity and date every git commit is made with, so object hashes match
 /// between the host run and the mounted run.
-const GIT_IDENTITY: &[(&str, &str)] = &[
+pub(super) const GIT_IDENTITY: &[(&str, &str)] = &[
   ("GIT_AUTHOR_NAME", "slates"),
   ("GIT_AUTHOR_EMAIL", "slates@example.invalid"),
   ("GIT_COMMITTER_NAME", "slates"),

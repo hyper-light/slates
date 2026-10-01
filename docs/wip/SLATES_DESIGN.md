@@ -1902,6 +1902,13 @@ must exercise local communication and isolation between clones as well as namesp
 > and given back when let go. Every transport's residency names what slates protects (its own RAM) apart from
 > what lies beyond it (kernel cache, runtime VM, guest page cache), which slates does not protect.
 
+> **Status (2026-10-01: a removed directory a transport holds stays valid; Desktop's hard-link rule stated).**
+> A directory's node leaves with its inode. A directory removed while a transport holds it stays a valid,
+> empty directory until its last reference, refusing new entries `ENOENT`. Before, the orphan named a freed
+> node, and every barrier on the volume was refused. The Docker Desktop profile states, as measured, that once
+> a linked file's first name is removed its other names go stale through Desktop's share until the guest
+> revalidates; slates serves them at once.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

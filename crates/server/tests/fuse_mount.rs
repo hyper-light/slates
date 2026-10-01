@@ -87,11 +87,46 @@ fn work_through_the_kernel(point: &str) {
   assert_eq!(names, ["src"]);
   std::fs::write(format!("{point}/scratch"), b"gone soon").unwrap();
   std::fs::remove_file(format!("{point}/scratch")).unwrap();
+  // The hard-link pattern git finalizes objects with: the temporary held open, linked to the final name, then
+  // removed; the final name must serve the bytes at once (2026-10-01, the OCI lane's git workload).
+  let held = std::fs::File::create(format!("{point}/tmp_obj")).unwrap();
+  std::io::Write::write_all(&mut &held, b"object bytes").unwrap();
+  std::fs::hard_link(format!("{point}/tmp_obj"), format!("{point}/obj")).unwrap();
+  std::fs::remove_file(format!("{point}/tmp_obj")).unwrap();
+  assert_eq!(
+    std::fs::read(format!("{point}/obj")).unwrap(),
+    b"object bytes",
+    "the second name outlives the first"
+  );
+  drop(held);
+  std::fs::remove_file(format!("{point}/obj")).unwrap();
+}
+
+/// Shape: entries in the directory removed recursively — past one readdir page of short names, so the removal
+/// lists the directory while it unlinks from it.
+const MANY: usize = 100;
+
+/// A directory of [`MANY`] files removed recursively through the kernel (what `rm -r` does: list, unlink each,
+/// remove the directory); the error, if any. The kernel still holds its lookups of the directory and its files
+/// when the directory goes, so the removal leaves referenced orphans — before 2026-10-01 the removed
+/// directory's node was freed under them, every image walk met a stale handle, and the barrier answered `EIO`.
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn remove_a_full_directory(point: &str) -> std::io::Result<()> {
+  let dir = format!("{point}/many");
+  std::fs::create_dir(&dir)?;
+  for n in 0..MANY {
+    std::fs::write(format!("{dir}/obj-{n}"), b"x")?;
+  }
+  std::fs::remove_dir_all(&dir)
 }
 
 /// The first mount: attached at a fresh directory, worked through the kernel, the mount table read, then
 /// detached — the mount gone and the attachment ended.
-fn mount_work_and_detach(client: &mut slates_client::Client, volume: slates_client::VolumeId) {
+fn mount_work_and_detach(
+  daemon: &Daemon,
+  client: &mut slates_client::Client,
+  volume: slates_client::VolumeId,
+) {
   let point = target_dir();
   let attached = client
     .attach_fuse(volume, Intent::Write, &point.path)
@@ -102,6 +137,12 @@ fn mount_work_and_detach(client: &mut slates_client::Client, volume: slates_clie
   assert_eq!(source, format!("slates:{:016x}", attached.attachment));
   work_through_the_kernel(&point.path);
   assert_eq!(client.status(volume).unwrap().attachments, 1);
+  let removed = remove_a_full_directory(&point.path);
+  assert!(
+    removed.is_ok(),
+    "{removed:?}; refusals {:?}",
+    daemon.fleet_refusals()
+  );
   // The container bind of this mount: its source authority is built (the table names this attachment, held
   // to the record), but no container workload has run through it, so it is refused typed (AUD-29-64).
   let bind = client.attach_with(
@@ -210,7 +251,7 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
     .expect("the fixture explicitly creates its local consensus group");
   let mut client = connect(&instance);
   let volume = client.create(&scratch(VOLUME)).unwrap();
-  mount_work_and_detach(&mut client, volume);
+  mount_work_and_detach(&daemon, &mut client, volume);
   remount_and_unmount_from_the_kernel(&mut client, volume);
   a_file_is_no_mount_point(&mut client, volume);
   let last = target_dir();

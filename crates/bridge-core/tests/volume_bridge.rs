@@ -1115,3 +1115,35 @@ fn a_page_never_ends_between_names_sharing_a_cookie() {
     "neither repeats after their cookie"
   );
 }
+
+/// The hard-link pattern git finalizes every object with (a temporary name, a link to the final name, then the
+/// temporary removed; 2026-10-01, the OCI lane's git workload). Do: create `tmp` and write it, link `obj` to it,
+/// remove `tmp`, then look `obj` up, open it and read it, then release it. Expect: `obj` names the same object,
+/// its link count back at one, and serves the bytes — the second name never depends on the first. Every
+/// transport (NFS, FUSE, virtio-fs, WinFsp) serves through this bridge, and the test runs on every lane.
+#[test]
+fn a_hard_link_outlives_the_removal_of_its_first_name() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = bridge.root(&cx).unwrap();
+  let (attr, fh) = bridge.create(oid(root), &cx, "tmp", 0o444, 0).unwrap();
+  bridge.write(oid(attr.ino), &cx, 0, b"payload").unwrap();
+  bridge.release(oid(attr.ino), &cx, fh).unwrap();
+  let linked = bridge.link(oid(attr.ino), oid(root), &cx, "obj").unwrap();
+  assert_eq!(linked.nlink, 2);
+  bridge.unlink(oid(root), &cx, "tmp").unwrap();
+  assert!(
+    bridge.lookup(oid(root), &cx, "tmp").is_err(),
+    "the first name is gone"
+  );
+  let found = bridge.lookup(oid(root), &cx, "obj").unwrap();
+  assert_eq!(found.ino, attr.ino, "the second name is the same object");
+  assert_eq!(found.nlink, 1);
+  let fh = bridge.open(oid(found.ino), &cx, 0).unwrap();
+  let mut out = Vec::new();
+  bridge.read(oid(found.ino), &cx, 0, 16, &mut out).unwrap();
+  assert_eq!(out, b"payload");
+  bridge.release(oid(found.ino), &cx, fh).unwrap();
+}

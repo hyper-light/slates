@@ -942,7 +942,7 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.current_dir(store, dir_no)?;
+    let dir = self.entry_dir(store, dir_no)?;
     self.create_file(store, dir, name, mode)
   }
 
@@ -955,7 +955,7 @@ impl Volume {
     name: &str,
     mode: u32,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.current_dir(store, dir_no)?;
+    let dir = self.entry_dir(store, dir_no)?;
     let handle = self.mkdir(store, dir, name, mode)?;
     Ok(
       store
@@ -974,7 +974,7 @@ impl Volume {
     name: &str,
     target: &str,
   ) -> Result<InodeNo, VfsError> {
-    let dir = self.current_dir(store, dir_no)?;
+    let dir = self.entry_dir(store, dir_no)?;
     self.symlink(store, dir, name, target)
   }
 
@@ -988,7 +988,7 @@ impl Volume {
     name: &str,
     target: InodeNo,
   ) -> Result<(), VfsError> {
-    let dir = self.current_dir(store, dir_no)?;
+    let dir = self.entry_dir(store, dir_no)?;
     self.link(store, dir, name, target)
   }
 
@@ -1025,7 +1025,7 @@ impl Volume {
     to_name: &str,
   ) -> Result<(), VfsError> {
     let from = self.current_dir(store, from_dir_no)?;
-    let to = self.current_dir(store, to_dir_no)?;
+    let to = self.entry_dir(store, to_dir_no)?;
     self.rename(store, from, from_name, to, to_name)
   }
 
@@ -1197,7 +1197,7 @@ impl Volume {
     if !kind.is_special() {
       return Err(VfsError::Invalid);
     }
-    let dir = self.current_dir(store, dir_no)?;
+    let dir = self.entry_dir(store, dir_no)?;
     self.create_leaf(store, dir, name, mode, kind)
   }
 
@@ -1495,7 +1495,8 @@ impl Volume {
     let now = self.clock.wall_ns();
     let path = self.path_of(store, dir, name);
     self.dir_remove(store, dir, name)?;
-    self.release_dir_node(store, child)?;
+    // The directory's node is released with its inode (`release_body`), not here: a transport may still
+    // hold the directory, and an orphan must keep a valid, empty directory until its last reference.
     self.drop_link(store, located.inode)?;
     self.drop_link(store, located.inode)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, -1)?;
@@ -1711,8 +1712,8 @@ impl Volume {
     // Consequences, which allocate nothing now that every version they touch is current.
     if let Some(t) = replaced {
       match t.child {
-        Child::Dir(existing) => {
-          self.release_dir_node(store, existing)?;
+        // The replaced directory's node goes with its inode (`release_body`), as `rmdir`'s does.
+        Child::Dir(_) => {
           self.drop_link(store, t.inode)?;
           self.drop_link(store, t.inode)?;
           self.adjust_nlink(store, store.dirs.get(to_dir)?.inode, -1)?;
@@ -3677,6 +3678,16 @@ impl Volume {
     }
   }
 
+  /// The head's node for directory `no` when it is to take a new entry: a directory removed while a
+  /// transport still holds it (an orphan) is `NotFound`, as POSIX answers a create in a removed directory
+  /// (`ENOENT`); it still lists and stats, empty, through [`Volume::current_dir`].
+  pub(crate) fn entry_dir(&self, store: &Store, no: InodeNo) -> Result<Handle<DirNode>, VfsError> {
+    if self.orphans.contains_key(&no) {
+      return Err(VfsError::NotFound);
+    }
+    self.current_dir(store, no)
+  }
+
   /// The head's current node for a directory handle a caller holds (which may predate a copy).
   pub(crate) fn head_dir(
     &self,
@@ -4339,6 +4350,9 @@ impl Volume {
         release_extents(store, &sealed, last, &mut dead)?;
       }
       Body::Base(b) => release_extents(store, &b.pinned, last, &mut dead)?,
+      // A directory's node leaves with its inode — at once when nothing holds it, or at the last reference
+      // of an orphan, which stays a valid, empty directory until then (2026-10-01).
+      Body::Directory(dir) => self.release_dir_node(store, dir)?,
       _ => {}
     }
     self.retain_dead_list(store, dead);

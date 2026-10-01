@@ -146,6 +146,21 @@ pub enum IdentityRule {
   HostUserThroughShare,
 }
 
+/// How hard links behave through a tested profile's file sharing — measured, since a workload that links a
+/// file and removes its first name (git finalizes every object so) depends on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HardLinkRule {
+  /// Once a hard-linked file's first name is removed, its other names fail (`ENOENT`) through the share
+  /// until the guest's entry cache revalidates them. Docker Desktop resolves a file on a host filesystem
+  /// without lookup by id by the first path it saw — the macOS NFS client answers `fsgetpath` by id
+  /// `ENOTSUP` — while slates and the host serve the second name at once. Measured 2026-10-01 through Docker
+  /// Desktop 29.3.1: link then remove the first name, then open the second — 99 of 100 failed at once, 0 of 10
+  /// after two seconds; the same in a Desktop-shared APFS directory 0 of 100; on the host's own mount 0 of 200.
+  /// A harness avoids it by not removing a linked file's first name while it reads another (git:
+  /// `core.createObject=rename`).
+  OtherNamesStaleAfterTheFirstIsRemoved,
+}
+
 /// The evidence a judged profile holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TestedProfile {
@@ -155,6 +170,8 @@ pub struct TestedProfile {
   pub description: &'static str,
   /// How a container's identity reaches the export.
   pub identity: IdentityRule,
+  /// How hard links behave through the profile's file sharing.
+  pub hard_links: HardLinkRule,
 }
 
 /// Why a runtime profile is not one a container workload has run through, typed.
@@ -289,6 +306,7 @@ pub fn judge(profile: &RuntimeProfile, host: Host) -> Result<TestedProfile, Prof
       test: TESTED_BY,
       description: "Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing",
       identity: IdentityRule::HostUserThroughShare,
+      hard_links: HardLinkRule::OtherNamesStaleAfterTheFirstIsRemoved,
     }),
     _ => Err(ProfileRefusal::ProfileUntested {
       engine: profile.operating_system.clone(),
