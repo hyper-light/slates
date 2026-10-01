@@ -15,7 +15,7 @@
     "kind": "skipped",
     "reason": {
       "kind": "owed",
-      "reason": "no live Linux guest: the device half is proven only by the simulated guest driver (docs/wip/virtiofs.md), and AC-9.7 says a simulation cannot close the transport guarantee"
+      "reason": "the roster runs in a live Linux guest through QEMU's vhost-user-fs-pci, each workload compared between slates and the guest's RAM — all nine identical on 2026-10-01 (crates/server/tests/virtiofs.rs a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram, gated on QEMU and a guest kernel); this harness has no VMM leg (a vhost-user device is attached in-process), so the cell is not run here"
     }
   },
   "expected_failure_list": null,

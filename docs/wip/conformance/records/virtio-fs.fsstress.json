@@ -15,7 +15,7 @@
     "kind": "skipped",
     "reason": {
       "kind": "owed",
-      "reason": "no live Linux guest: the device half is proven only by the simulated guest driver (docs/wip/virtiofs.md), and AC-9.7 says a simulation cannot close the transport guarantee"
+      "reason": "a live Linux guest mounts the tag through QEMU's vhost-user-fs-pci and runs the workload roster (crates/server/tests/virtiofs.rs), but this suite has no guest leg yet; AC-9.7 asks it run in the guest"
     }
   },
   "expected_failure_list": null,

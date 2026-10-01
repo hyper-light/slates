@@ -12,7 +12,9 @@
 //! `mount -t nfs` adapter — running the suites over the FUSE mount itself is owed (pjdfstest's root cases
 //! need `allow_other`, an operator's `user_allow_other`); the Windows WinFsp host is proven live by
 //! `crates/bridge-winfsp/tests/mount.rs` (create, write, read, list, delete) and nothing more;
-//! virtio-fs is proven only by the simulated guest driver (`docs/wip/virtiofs.md`); the OCI container
+//! virtio-fs runs a live Linux guest through QEMU's vhost-user-fs, which mounts the tag and runs the workload
+//! roster identically on slates and on its RAM (`crates/server/tests/virtiofs.rs`), while the other suites have
+//! no guest leg yet; the OCI container
 //! form exists (`attach` with the container form: a verified non-recursive private bind and `slates
 //! oci-check`) and a workload ran through it on Docker Desktop (T-4.13); fsx runs inside a container through
 //! it on the macOS lane (`xtask/src/conformance/container.rs`), as do fsstress, the workloads and pjdfstest;
@@ -88,10 +90,18 @@ const NO_PRESSURE_OR_FAILURE_SUITE: &str = concat!(
   "processes' and 'Soak and scale' are Phase 9 work and have no runnable form yet"
 );
 
-/// The reason every virtio-fs cell is owed.
+/// The reason the virtio-fs workloads cell is not run by this harness: it ran in a live guest elsewhere.
+const VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST: &str = concat!(
+  "the roster runs in a live Linux guest through QEMU's vhost-user-fs-pci, each workload compared between ",
+  "slates and the guest's RAM — all nine identical on 2026-10-01 (crates/server/tests/virtiofs.rs ",
+  "a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram, gated on QEMU and a guest ",
+  "kernel); this harness has no VMM leg (a vhost-user device is attached in-process), so the cell is not run here"
+);
+
+/// The reason every other virtio-fs cell is owed.
 const VIRTIOFS_OWED: &str = concat!(
-  "no live Linux guest: the device half is proven only by the simulated guest driver ",
-  "(docs/wip/virtiofs.md), and AC-9.7 says a simulation cannot close the transport guarantee"
+  "a live Linux guest mounts the tag through QEMU's vhost-user-fs-pci and runs the workload roster ",
+  "(crates/server/tests/virtiofs.rs), but this suite has no guest leg yet; AC-9.7 asks it run in the guest"
 );
 
 /// The reason every OCI cell is owed.
@@ -120,6 +130,9 @@ const LINUX_MOUNT_TOOLS: &[&str] = &["mount", "umount", "sh", "sudo"];
 pub fn availability(transport: Transport, suite: Suite) -> Availability {
   match (transport, suite) {
     (_, Suite::Pressure | Suite::Failure) => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
+    (Transport::VirtioFs, Suite::Workloads) => {
+      Availability::Owed(VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST)
+    }
     (Transport::VirtioFs, _) => Availability::Owed(VIRTIOFS_OWED),
     // fsx compiled and run inside a container over the exact entry `attach --oci` returns (AUD-29-78).
     (Transport::Oci, Suite::Fsx | Suite::Fsstress | Suite::Workloads | Suite::Pjdfstest) => {
