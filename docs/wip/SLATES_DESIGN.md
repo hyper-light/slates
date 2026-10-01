@@ -2558,6 +2558,22 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 **Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
 hard links and snapshot versions. No live kernel endpoint state is part of the image.
 
+> **Status (2026-10-01, A-58, AUD-29-37).** A won election's recovery is admitted before it appends anything
+> and materialized a slice at a time. Its plan (the values the windows decide above the log, and a no-op at
+> each free index between them) is sized arithmetically, without walking the gap. It is admitted against the
+> node's log budget, which retention sets at every publication to the log plus an equal share of the room
+> the record leaves in its consensus region. A plan that does not fit is declined: the node gives up the
+> term it won, appends nothing, and counts it (`recovery_refused`), where before it appended the whole gap
+> and its next publication overflowed and closed the control shard. An admitted plan appends one window's
+> bytes per replication call. While it runs, the leader takes no proposal, membership change or read, and a
+> multi-slice plan ends with the leader's own sync no-op. A crash mid-plan loses no reported value, because
+> the voters keep their windows until a newer leader syncs them. Before, a single report 1,000 indices above
+> the log appended 1,000 entries in one step, and a report near `u64::MAX` would have looped until the index
+> range ran out. The safety explorer at full scale (400 seeds × 4,000 steps × 2 sizes) holds every invariant
+> with 143 multi-slice recoveries among its histories. Leader Completeness for fast-chosen commands is now
+> checked when a leader's recovery is done, which is the rule this design states. Record:
+> `docs/bugs/2026-10-01-a-far-report-expanded-into-unadmitted-recovery-work.md`.
+
 > **Status (2026-10-01, A-57, AUD-29-38).** A voter admits a peer's message only when the state it would
 > leave is one its own recovery accepts. Every handler first checks the message against the rules
 > `SavedRaft::validate` holds retained state to, and refuses it before any term, vote, log or
@@ -7778,3 +7794,19 @@ Applied in the same change to: §4.8 status, GAPS (AUD-29-37–38), and
   bindings stand as they were.
 - Evidence: the witness test (red before), and the generated admission test with its census and mutation.
 - What it does not change: valid traffic (every cluster and server test passes unchanged); the wire; R1–R10.
+
+### A-58 — A won election's recovery is admitted, then materialized a slice at a time (2026-10-01)
+Applied in the same change to: §4.8 status, GAPS (AUD-29-37–38), the safety explorer's Leader Completeness
+rule, and `docs/bugs/2026-10-01-a-far-report-expanded-into-unadmitted-recovery-work.md`.
+- Why: recovery appended every index from the log's end to the farthest reported slot in one step, with no
+  admission. One report far above the log cost its distance in CPU and memory, before retention could
+  refuse (AUD-29-37).
+- The rule: the plan is sized without walking it and admitted against a log budget derived from the
+  retained record's room (each group's log plus an equal share). Over budget, the node declines the term.
+  Admitted, it appends a window's bytes per replication call and refuses proposals, membership changes and
+  reads until done. A multi-slice plan ends with the leader's sync no-op. Reports are never discarded for
+  their distance: the explorer's seed 266 showed that loses chosen values.
+- Evidence: the far-report test (red before: 1,000 entries in one step); the refusal test; the
+  crash-between-slices test; the retention budget test; and the full-scale explorer with 143 multi-slice
+  recoveries floored as a covered path.
+- What it does not change: proposals are not yet admitted against the budget (AUD-29-30); the wire; R1–R10.

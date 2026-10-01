@@ -1071,6 +1071,23 @@ impl RegionalCouncil {
     self.raft.set_window_budget(bytes);
   }
 
+  /// Sets the wire bytes this node's log may hold — its share of the retained record's room — which a won
+  /// election's recovery is admitted against before anything is appended ([`RaftNode::set_log_budget`];
+  /// AUD-29-37).
+  pub fn set_log_budget(&mut self, bytes: usize) {
+    self.raft.set_log_budget(bytes);
+  }
+
+  /// The wire bytes of this node's log above its snapshot ([`RaftNode::log_bytes`]).
+  pub fn log_bytes(&self) -> usize {
+    self.raft.log_bytes()
+  }
+
+  /// The wire bytes this node's log may hold ([`RaftNode::log_budget`]).
+  pub fn log_budget(&self) -> usize {
+    self.raft.log_budget()
+  }
+
   /// This node's election rank among the voters the caller holds `alive` (§3.4,
   /// [`RaftNode::election_rank`]): the timer yields one timeout per rank.
   pub fn election_rank(&self, alive: &[HostId]) -> usize {

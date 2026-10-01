@@ -964,14 +964,20 @@ impl Cluster {
     self.counters.re_proposed_commits = u64::try_from(self.re_proposed.len()).unwrap();
   }
 
-  /// Leader Completeness: a node becoming leader holds every entry committed so far — in the dialect's form,
-  /// as State Machine Safety compares them — and every command a fast quorum chose, at its index (the prefix
-  /// model's `LeaderIncomplete`); checked once per leadership, since the property binds a node when it becomes
-  /// leader, not a deposed one yet to hear of it.
+  /// Leader Completeness: a leader holds every entry committed so far — in the dialect's form, as State
+  /// Machine Safety compares them — and every command a fast quorum chose, at its index (the prefix model's
+  /// `LeaderIncomplete`), once its recovery is done; checked once per leadership, since the property binds a
+  /// node when it takes up leading, not a deposed one yet to hear of it. A leader materializes a recovery that
+  /// reaches far above its log a slice at a time (AUD-29-37) and holds the recovered commands only at its
+  /// end; meanwhile it takes no proposal, membership change or read, and the checks run every step — State
+  /// Machine Safety and fast agreement — hold it to committing nothing that contradicts them.
   fn check_leader_completeness(&mut self, logs: &[(HostId, Whole)], at: &str) {
     for (id, whole) in logs {
       let node = &self.nodes[self.position(*id)];
-      if !node.is_leader() || !self.completeness_checked.insert((*id, node.term())) {
+      if !node.is_leader()
+        || node.recovering()
+        || !self.completeness_checked.insert((*id, node.term()))
+      {
         continue;
       }
       let held_at = |index: u64| {
@@ -1048,6 +1054,9 @@ fn add_window(total: &mut WindowCounters, more: WindowCounters) {
   total.decided_from_votes += more.decided_from_votes;
   total.sent_ahead += more.sent_ahead;
   total.fast_commits += more.fast_commits;
+  total.recovery_slices += more.recovery_slices;
+  total.recovery_refused += more.recovery_refused;
+  total.recoveries_sliced += more.recoveries_sliced;
 }
 
 /// A node's whole log for the checks: its snapshot's history followed by the entries above it; its commit
@@ -1335,6 +1344,10 @@ fn explore_and_check_coverage(seeds: u64) {
       ),
       (counted.window.holes_filled, "a recovery filled a hole"),
       (counted.stalled_fills, "a leader filled a stalled index"),
+      (
+        counted.window.recoveries_sliced,
+        "a recovery took more than one slice (AUD-29-37)",
+      ),
     ];
     for (count, path) in rare {
       assert!(count > 0, "{size} voters: {path}");

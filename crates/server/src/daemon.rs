@@ -2506,6 +2506,7 @@ fn init_shard(
     retained.restore(&mut state)?;
   }
   crate::retention::retain(&mut state)?;
+  crate::retention::derive_log_budgets(&mut state);
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {
     RECOVERY_SKIPPED.fetch_add(

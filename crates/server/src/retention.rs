@@ -271,7 +271,37 @@ fn publish(state: &mut ShardState) -> Result<(), AnchorError> {
   state.consensus_generation = generation;
   state.council.retained();
   state.root.retained();
+  set_log_budgets(state, payload.len(), slot);
   Ok(())
+}
+
+/// Format: the consensus groups whose logs grow the retained record — the regional council and the root
+/// group — which share the record's remaining room.
+const GROUPS_SHARING_THE_RECORD: usize = 2;
+
+/// Sets each group's log budget from the record just published (AUD-29-37): the log it holds now plus an
+/// equal share of the room the record leaves in its region. Both groups admitted together stay within the
+/// region, growth since this publication counts against the share, and neither group can starve the other
+/// of all the room. A won election's recovery that would not fit is declined before anything is appended,
+/// rather than overflowing the next publication and closing the control shard.
+fn set_log_budgets(state: &mut ShardState, record_bytes: usize, slot: u8) {
+  let Ok(capacity) = state.segment.region_len(RegionKind::Consensus(slot)) else {
+    return;
+  };
+  let share = capacity.saturating_sub(record_bytes) / GROUPS_SHARING_THE_RECORD;
+  let council = state.council.log_bytes().saturating_add(share);
+  let root = state.root.log_bytes().saturating_add(share);
+  state.council.set_log_budget(council);
+  state.root.set_log_budget(root);
+}
+
+/// Sets the log budgets at a shard's start from the record it restored (or would publish now), which no
+/// publication has measured yet in this process: one encoding of the captured record, on the cold start path.
+pub(crate) fn derive_log_budgets(state: &mut ShardState) {
+  let record = Retained::capture(state, state.consensus_generation).to_bytes();
+  let record_bytes = CHECKSUM_BYTES.saturating_add(record.len());
+  let slot = u8::try_from(state.consensus_generation % u64::from(SLOTS)).unwrap_or(0);
+  set_log_budgets(state, record_bytes, slot);
 }
 
 #[cfg(test)]
@@ -318,6 +348,40 @@ mod tests {
       crate::consensus::GroupIdentity::created(false, &raft, encode_regional_configuration(&base));
     assert!(vote(state, HostId(1), 7));
     retain(state).unwrap();
+  }
+
+  /// AUD-29-37 (§4.8). Do: retain a vote (a publication), then read both groups' log budgets. Expect: each
+  /// is its log plus half the room the published record leaves in its region — so the two groups' logs,
+  /// admitted together, fit the region — where before every budget was unbounded.
+  #[test]
+  fn a_publication_shares_the_records_room_between_the_groups_log_budgets() {
+    crate::daemon::audit_on_shard(|state| {
+      retain_first_vote(state);
+      let slot = u8::try_from(state.consensus_generation % u64::from(SLOTS)).unwrap();
+      let capacity = state
+        .segment
+        .region_len(RegionKind::Consensus(slot))
+        .unwrap();
+      let record = state
+        .segment
+        .read_published(RegionKind::Consensus(slot))
+        .unwrap()
+        .unwrap()
+        .len();
+      let share = (capacity - record) / GROUPS_SHARING_THE_RECORD;
+      assert_eq!(
+        state.council.log_budget(),
+        state.council.log_bytes() + share
+      );
+      assert_eq!(state.root.log_budget(), state.root.log_bytes() + share);
+      assert!(
+        record
+          + (state.council.log_budget() - state.council.log_bytes())
+          + (state.root.log_budget() - state.root.log_bytes())
+          <= capacity,
+        "both groups' admitted growth fits the region"
+      );
+    });
   }
 
   /// AC-8.1 / T-2.14: stop a replacement publication after each payload byte; recover the

@@ -934,6 +934,29 @@ pub struct RaftNode {
   /// pruned under a classic commit, and leader's entries buffered and later absorbed into the log (the
   /// non-vacuity counters of the window's paths).
   window_counters: WindowCounters,
+  /// The wire bytes this node's log may hold, set by its owner from what its retention can publish
+  /// ([`set_log_budget`](Self::set_log_budget)); a won election's recovery is admitted against it before it
+  /// appends anything (AUD-29-37).
+  log_budget: usize,
+  /// A won election's recovery still being materialized (AUD-29-37).
+  recovery: Option<Recovery>,
+}
+
+/// A won election's recovery (AUD-29-37): the values decided above the log from the windows, appended a
+/// slice at a time from `next` through `last`, a no-op at each free index between them. It acts only while
+/// its node leads `term`; a node that steps down drops it, and a crash loses it with the rest of the
+/// leader's volatile state — the voters keep their windows until a leader of a newer term syncs them, so the
+/// next election recovers the same values.
+struct Recovery {
+  term: u64,
+  decided: BTreeMap<u64, (LogEntry, bool)>,
+  next: u64,
+  last: u64,
+  /// The index this node's own window reached above its log at the election (for the counters).
+  reach: u64,
+  /// Whether materializing took more than the election's own slice, so the sync no-op is this node's to
+  /// append (otherwise its group appends it at once, as for a classic election).
+  sliced: bool,
 }
 
 /// What the window's paths did over a node's life (the non-vacuity counters the explorer reads).
@@ -960,6 +983,13 @@ pub struct WindowCounters {
   pub sent_ahead: u64,
   /// Of those, indices a fast quorum chose, committed in one round.
   pub fast_commits: u64,
+  /// Slices a won election's recovery was materialized in (AUD-29-37): one per step that appended part of
+  /// its plan.
+  pub recovery_slices: u64,
+  /// Elections this node won but declined, its recovery plan past its log budget (AUD-29-37).
+  pub recovery_refused: u64,
+  /// Recoveries that took more than the election's own slice, ending with this node's sync no-op.
+  pub recoveries_sliced: u64,
 }
 
 impl RaftNode {
@@ -1020,6 +1050,8 @@ impl RaftNode {
       fast_through: 0,
       fast_proposed: 0,
       window_counters: WindowCounters::default(),
+      log_budget: usize::MAX,
+      recovery: None,
     }
   }
 
@@ -1447,8 +1479,21 @@ impl RaftNode {
     if self.role != Role::Candidate || !self.is_majority(&self.votes) {
       return;
     }
+    let recovery = self.plan_recovery();
+    if !self.admits(&recovery) {
+      // The plan does not fit the log budget: this node declines the term it won rather than append past
+      // what its retention can publish. Nothing is appended; the voters keep their windows, so a later
+      // election recovers the same values.
+      self.window_counters.recovery_refused =
+        self.window_counters.recovery_refused.saturating_add(1);
+      self.role = Role::Follower;
+      self.leader_hint = None;
+      self.votes.clear();
+      self.reports.clear();
+      return;
+    }
     self.role = Role::Leader;
-    self.recover();
+    self.recover(recovery);
     self.transfer = None;
     self.staging.clear();
     self.staging_aborted = None;
@@ -1477,12 +1522,33 @@ impl RaftNode {
   /// leader's entry is re-proposed as it is; at a fast ballot, the value with at least `|Q| + |F| − n` of the
   /// reports (Fast Paxos's rule: the value a fast quorum could have chosen), and otherwise the index is
   /// free. The recovered values are appended at this term, with a
-  /// no-op at each free index below the last of them, so this leader can commit them. It is then synced to
-  /// its own term, and keeps its window: a slot goes only once a classic commit covers its index (§4), since
+  /// no-op at each free index below the last of them, so this leader can commit them — admitted against the
+  /// log budget before the election is taken ([`admits`](Self::admits)) and appended a window's bytes at a
+  /// time ([`continue_recovery`](Self::continue_recovery)), so a report far above the log neither exhausts the
+  /// node nor holds its step (AUD-29-37). It is then synced to its own term, and keeps its window: a slot goes only once a classic commit covers its index (§4), since
   /// until then a later leader's truncation can erase the log entries that carry it — clearing it here lost a
   /// chosen value (the explorer's seed 266, 2026-09-29). With empty windows — the classic path — it appends
   /// nothing.
-  fn recover(&mut self) {
+  fn recover(&mut self, recovery: Recovery) {
+    self.reports.clear();
+    self.synced_term = self.current_term;
+    self.sync_index = 0;
+    self.open_from = 0;
+    self.fast_votes.clear();
+    self.fast_chosen.clear();
+    self.fast_through = 0;
+    self.fast_proposed = 0;
+    self.retention_pending = true;
+    if recovery.next <= recovery.last {
+      self.recovery = Some(recovery);
+      self.continue_recovery();
+    }
+  }
+
+  /// The recovery a won election owes (see [`recover`](Self::recover)), decided without appending anything:
+  /// every slot above the log — this node's own and those its granting voters reported — and the value each
+  /// index's highest ballot decides.
+  fn plan_recovery(&self) -> Recovery {
     let above = self.last_log_index();
     let mut reported: BTreeMap<u64, Vec<WindowSlot>> = BTreeMap::new();
     // Every slot above the log, as the prefix model's recovery reads them — not only those within this node's
@@ -1503,7 +1569,7 @@ impl RaftNode {
       reported.entry(index).or_default().push(slot);
     }
     let heard = self.votes.len();
-    let recovered: BTreeMap<u64, (LogEntry, bool)> = reported
+    let decided: BTreeMap<u64, (LogEntry, bool)> = reported
       .iter()
       .filter_map(|(index, slots)| {
         self
@@ -1511,48 +1577,129 @@ impl RaftNode {
           .map(|found| (*index, found))
       })
       .collect();
-    let reach = above.saturating_add(self.window_span());
-    if let Some(&last) = recovered.keys().next_back() {
-      for index in above.saturating_add(1)..=last {
-        let entry = match recovered.get(&index) {
-          Some((entry, fast)) => {
-            self.window_counters.recovered = self.window_counters.recovered.saturating_add(1);
-            if index > reach {
-              self.window_counters.recovered_beyond_reach = self
-                .window_counters
-                .recovered_beyond_reach
-                .saturating_add(1);
-            }
-            if *fast {
-              self.window_counters.recovered_fast_choices = self
-                .window_counters
-                .recovered_fast_choices
-                .saturating_add(1);
-            }
-            LogEntry {
-              term: self.current_term,
-              ..entry.clone()
-            }
-          }
-          None => {
-            self.window_counters.holes_filled = self.window_counters.holes_filled.saturating_add(1);
-            LogEntry::command(self.current_term, Vec::new())
-          }
-        };
-        if !self.push_entry(entry) {
-          break;
-        }
+    // A log at the last index has nothing above it to recover: an empty plan (`next` past `last`).
+    let (next, last) = match above.checked_add(1) {
+      Some(next) => (next, decided.keys().next_back().copied().unwrap_or(above)),
+      None => (u64::MAX, above.saturating_sub(1)),
+    };
+    Recovery {
+      term: self.current_term,
+      decided,
+      next,
+      last,
+      reach: above.saturating_add(self.window_span()),
+      sliced: false,
+    }
+  }
+
+  /// Whether `recovery` fits the log budget beside the log: its decided values and a no-op at every free
+  /// index between them, counted without walking the gap (AUD-29-37 — a report far above the log costs its
+  /// arithmetic, not its distance).
+  fn admits(&self, recovery: &Recovery) -> bool {
+    let span = recovery
+      .last
+      .saturating_add(1)
+      .saturating_sub(recovery.next);
+    let holes = span.saturating_sub(u64::try_from(recovery.decided.len()).unwrap_or(u64::MAX));
+    let hole_bytes =
+      usize::try_from(holes).map_or(usize::MAX, |holes| holes.saturating_mul(MIN_ENTRY_BYTES));
+    let value_bytes = recovery
+      .decided
+      .values()
+      .map(|(entry, _)| entry.encoded_len())
+      .fold(0usize, usize::saturating_add);
+    let held = self.log_bytes();
+    held.saturating_add(hole_bytes).saturating_add(value_bytes) <= self.log_budget
+  }
+
+  /// Whether this node leads and is still materializing its term's recovery (AUD-29-37): it refuses
+  /// proposals, membership changes and reads until it is done — nothing lands among the indices the recovery
+  /// owns, and no read is served before the leader holds every value its predecessors may have
+  /// acknowledged (a commit of one of its own entries below a recovered value would otherwise authorize a
+  /// read that misses it).
+  pub fn recovering(&self) -> bool {
+    self.role == Role::Leader
+      && self
+        .recovery
+        .as_ref()
+        .is_some_and(|recovery| recovery.term == self.current_term)
+  }
+
+  /// The entry a recovery appends at `index`, counted: the value decided there under this term, or a no-op at a
+  /// free index.
+  fn recovery_entry(&mut self, recovery: &Recovery, index: u64) -> LogEntry {
+    let Some((entry, fast)) = recovery.decided.get(&index) else {
+      self.window_counters.holes_filled = self.window_counters.holes_filled.saturating_add(1);
+      return LogEntry::command(self.current_term, Vec::new());
+    };
+    self.window_counters.recovered = self.window_counters.recovered.saturating_add(1);
+    if index > recovery.reach {
+      self.window_counters.recovered_beyond_reach = self
+        .window_counters
+        .recovered_beyond_reach
+        .saturating_add(1);
+    }
+    if *fast {
+      self.window_counters.recovered_fast_choices = self
+        .window_counters
+        .recovered_fast_choices
+        .saturating_add(1);
+    }
+    LogEntry {
+      term: self.current_term,
+      ..entry.clone()
+    }
+  }
+
+  /// Appends the next slice of the recovery: at least one entry, and as many as fit one window's bytes, a
+  /// recovered value under this term or a no-op at a free index. When a recovery took more than the election's
+  /// own slice, its last slice also appends this term's no-op — the sync point (§5.4.2) its group would
+  /// otherwise have appended at the election.
+  fn continue_recovery(&mut self) {
+    if !self.recovering() {
+      self.recovery = None;
+      return;
+    }
+    let Some(mut recovery) = self.recovery.take() else {
+      return;
+    };
+    let slice = self.window_budget.max(MIN_ENTRY_BYTES);
+    let mut spent = 0usize;
+    while recovery.next <= recovery.last {
+      let index = recovery.next;
+      let bytes = recovery
+        .decided
+        .get(&index)
+        .map_or(MIN_ENTRY_BYTES, |(entry, _)| entry.encoded_len());
+      if spent > 0 && spent.saturating_add(bytes) > slice {
+        break;
+      }
+      let entry = self.recovery_entry(&recovery, index);
+      spent = spent.saturating_add(bytes);
+      if !self.push_entry(entry) {
+        // The index range is exhausted (counted by `push_entry`): nothing more can be appended, the sync
+        // no-op included, so the plan ends here.
+        self.window_counters.recovery_slices =
+          self.window_counters.recovery_slices.saturating_add(1);
+        return;
+      }
+      match index.checked_add(1) {
+        Some(next) => recovery.next = next,
+        None => break,
       }
     }
-    self.reports.clear();
-    self.synced_term = self.current_term;
-    self.sync_index = 0;
-    self.open_from = 0;
-    self.fast_votes.clear();
-    self.fast_chosen.clear();
-    self.fast_through = 0;
-    self.fast_proposed = 0;
+    self.window_counters.recovery_slices = self.window_counters.recovery_slices.saturating_add(1);
     self.retention_pending = true;
+    if recovery.next <= recovery.last {
+      if !recovery.sliced {
+        self.window_counters.recoveries_sliced =
+          self.window_counters.recoveries_sliced.saturating_add(1);
+      }
+      recovery.sliced = true;
+      self.recovery = Some(recovery);
+    } else if recovery.sliced {
+      self.leader_append(LogEntry::command(self.current_term, Vec::new()));
+    }
   }
 
   /// What the recovery decides from the reports at one index, `slots`, heard from `heard` voters: the entry
@@ -1805,6 +1952,16 @@ impl RaftNode {
       .unwrap_or_else(|| self.last_log_index())
   }
 
+  /// The wire bytes this node's log may hold ([`set_log_budget`](Self::set_log_budget)).
+  pub fn log_budget(&self) -> usize {
+    self.log_budget
+  }
+
+  /// The wire bytes of the whole log above the snapshot — what its log budget is measured against.
+  pub fn log_bytes(&self) -> usize {
+    self.log_bytes_through(self.last_log_index())
+  }
+
   /// The wire bytes of the log entries above the snapshot through `index` — what compacting to `index`
   /// would replace with a snapshot ([`LogEntry::encoded_len`]).
   pub fn log_bytes_through(&self, index: u64) -> usize {
@@ -2027,7 +2184,11 @@ impl RaftNode {
     // catch up to a fixed end and the election it starts is won by a log that holds every entry.
     // A leader whose fast track is open proposes through it ([`propose_fast`](Self::propose_fast)): a
     // classic entry at an index open to fast votes could contradict a value a fast quorum chose there.
-    if self.role != Role::Leader || self.active_transfer().is_some() || self.open_from > 0 {
+    if self.role != Role::Leader
+      || self.active_transfer().is_some()
+      || self.open_from > 0
+      || self.recovering()
+    {
       return false;
     }
     self.leader_append(LogEntry::command(self.current_term, command))
@@ -2046,6 +2207,13 @@ impl RaftNode {
     }
     self.advance_leader_commit();
     true
+  }
+
+  /// Sets the wire bytes this node's log may hold — its owner's share of what the retention publishes
+  /// (§4.8) — which a won election's recovery plan is admitted against before anything is appended
+  /// (AUD-29-37). Unset, it is unbounded: the owner always sets it.
+  pub fn set_log_budget(&mut self, bytes: usize) {
+    self.log_budget = bytes;
   }
 
   /// Sets the wire bytes this node's window may hold — the caller's append budget
@@ -2358,6 +2526,10 @@ impl RaftNode {
   /// if this node is not the leader, or when the entries the follower needs were compacted away (it needs
   /// [`install_snapshot_for`](RaftNode::install_snapshot_for), and is set to probe from there).
   pub fn replicate_to(&mut self, follower: HostId, budget: usize) -> Option<AppendEntries> {
+    // A recovery still being materialized takes its next slice on the leader's replication cadence.
+    if self.recovering() {
+      self.continue_recovery();
+    }
     if self.role != Role::Leader {
       return None;
     }
@@ -3125,6 +3297,7 @@ impl RaftNode {
   /// callers may share a pending round only for reads that started before that round was sent.
   pub fn begin_read(&mut self) -> Option<u64> {
     if self.role != Role::Leader
+      || self.recovering()
       || self.entry_term(self.commit_index) != Some(self.current_term)
       || self.read_round.is_some()
     {
@@ -3185,6 +3358,7 @@ impl RaftNode {
   pub fn begin_membership_change(&mut self, new_voters: Vec<HostId>) -> bool {
     let current = self.effective_config();
     if self.role != Role::Leader
+      || self.recovering()
       || self.active_transfer().is_some()
       || current.joint.is_some()
       || new_voters.is_empty()
@@ -3217,7 +3391,10 @@ impl RaftNode {
     let Some(new_voters) = current.joint else {
       return false;
     };
-    if self.role != Role::Leader || self.latest_config_index() > self.commit_index {
+    if self.role != Role::Leader
+      || self.recovering()
+      || self.latest_config_index() > self.commit_index
+    {
       return false;
     }
     self.read_round = None;
@@ -6324,13 +6501,21 @@ mod tests {
       nodes[1].on_vote_reply(reply);
     }
     assert!(nodes[1].is_leader());
+    // B's window is one entry, so its recovery takes a slice per replication call (AUD-29-37) and ends with
+    // its own sync no-op.
+    while nodes[1].recovering() {
+      nodes[1].replicate_to(C, UNBOUNDED);
+    }
     let commands: Vec<Vec<u8>> = nodes[1]
       .saved()
       .log
       .iter()
       .map(|entry| entry.command.clone())
       .collect();
-    assert_eq!(commands, vec![Vec::new(), b"x".to_vec(), b"y".to_vec()]);
+    assert_eq!(
+      commands,
+      vec![Vec::new(), b"x".to_vec(), b"y".to_vec(), Vec::new()]
+    );
     assert_eq!(nodes[1].window_counters().recovered_beyond_reach, 1);
   }
 
@@ -6776,5 +6961,172 @@ mod tests {
       .filter(|case| !met.contains(case))
       .collect();
     assert!(unmet.is_empty(), "the generator never reached {unmet:?}");
+  }
+
+  /// Shape: how far above the new leader's log a granting voter reports a slot in the recovery tests — far
+  /// enough that the gap is many slices of a one-append window.
+  const FAR_REPORT_GAP: u64 = 1_000;
+  /// Shape: the recovery tests' window — one explorer append (about two entries), so a slice is small.
+  const RECOVERY_WINDOW: usize = 48;
+
+  /// A candidate B (window [`RECOVERY_WINDOW`]) at term 3 with an empty log, and A's granted vote reporting
+  /// a term-2 leader entry [`FAR_REPORT_GAP`] above it.
+  fn candidate_with_a_far_report() -> (RaftNode, VoteReply) {
+    let mut candidate = node_with_uncommitted_log(B, vec![A, B, C], 2, None, Vec::new());
+    candidate.set_window_budget(RECOVERY_WINDOW);
+    let requests = candidate.start_election().unwrap();
+    assert_eq!(requests.len(), 2);
+    let reply = VoteReply {
+      voter: A,
+      term: candidate.term(),
+      granted: true,
+      reports: vec![SlotReport {
+        index: FAR_REPORT_GAP,
+        slot: WindowSlot {
+          term: 2,
+          fast: false,
+          entry: LogEntry::command(2, b"chosen far above".to_vec()),
+        },
+      }],
+    };
+    (candidate, reply)
+  }
+
+  /// AUD-29-37. Do: a candidate wins with a granting voter's report [`FAR_REPORT_GAP`] above its empty log,
+  /// then drives replication until its recovery is done. Expect: the win materializes at most one window's
+  /// worth of the plan (the rest a slice per replication call, never the whole gap in one step), no
+  /// proposal is admitted mid-recovery, and once done the reported value sits at its index under the new
+  /// term with the sync no-op after it. Before 2026-10-01 the win appended all 1,000 entries at once, and a
+  /// report near `u64::MAX` would have looped until the index range ran out.
+  #[test]
+  fn a_far_report_is_recovered_a_slice_at_a_time() {
+    let (mut leader, reply) = candidate_with_a_far_report();
+    leader.on_vote_reply(reply);
+    assert!(leader.is_leader());
+    let slice = u64::try_from(RECOVERY_WINDOW / MIN_ENTRY_BYTES).unwrap();
+    assert!(
+      leader.last_log_index() <= slice,
+      "the win materialized {} entries, more than one slice ({slice})",
+      leader.last_log_index()
+    );
+    assert!(
+      !leader.append_command(b"mid-recovery".to_vec()),
+      "no proposal mid-recovery"
+    );
+    assert!(leader.begin_read().is_none(), "no read mid-recovery");
+    finish_recovery(&mut leader, FAR_REPORT_GAP);
+    let at = usize::try_from(FAR_REPORT_GAP - 1).unwrap();
+    assert_eq!(leader.log[at].command, b"chosen far above".to_vec());
+    assert_eq!(leader.log[at].term, leader.term());
+    assert_eq!(
+      leader.last_log_index(),
+      FAR_REPORT_GAP + 1,
+      "the sync no-op follows the plan"
+    );
+    assert!(leader.append_command(b"after recovery".to_vec()));
+    assert!(leader.window_counters().recovery_slices > 1);
+  }
+
+  /// Drives `leader`'s replication until its recovery is done, each call one slice; at most `calls`.
+  fn finish_recovery(leader: &mut RaftNode, calls: u64) {
+    for _ in 0..calls {
+      if !leader.recovering() {
+        return;
+      }
+      leader.replicate_to(C, RECOVERY_WINDOW);
+    }
+    assert!(
+      !leader.recovering(),
+      "the recovery finished within {calls} calls"
+    );
+  }
+
+  /// Drives `leader`'s replication to `follower` until the follower's log matches the leader's end, the
+  /// leader finishing any recovery on the way; at most `rounds` round trips.
+  fn replicate_until_matched(leader: &mut RaftNode, follower: &mut RaftNode, rounds: u64) {
+    for _ in 0..rounds {
+      if follower.last_log_index() == leader.last_log_index() && !leader.recovering() {
+        return;
+      }
+      let Some(append) = leader.replicate_to(follower.id, UNBOUNDED) else {
+        panic!("the leader replicates");
+      };
+      let reply = follower.on_append_entries(append);
+      leader.on_append_reply(reply);
+    }
+    panic!("the follower matched the leader within {rounds} round trips");
+  }
+
+  /// AUD-29-37 (memory refusal). Do: the far-report election with a log budget smaller than its plan, then
+  /// an append from a leader of a newer term. Expect: the node declines the term it won — not leader, its log
+  /// untouched, the refusal counted, its saved state restoring — and still follows the newer leader, so a
+  /// declined recovery holds up no other work.
+  #[test]
+  fn a_recovery_past_the_log_budget_declines_the_term() {
+    let (mut candidate, reply) = candidate_with_a_far_report();
+    let plan_bytes = usize::try_from(FAR_REPORT_GAP).unwrap() * MIN_ENTRY_BYTES;
+    candidate.set_log_budget(plan_bytes / 2);
+    let before = candidate.saved().log;
+    candidate.on_vote_reply(reply);
+    assert!(!candidate.is_leader(), "the node declines the term");
+    assert_eq!(candidate.saved().log, before, "nothing was appended");
+    assert_eq!(candidate.window_counters().recovery_refused, 1);
+    assert!(RaftNode::restore(candidate.saved()).is_ok());
+    let newer = candidate.term() + 1;
+    let reply = candidate.on_append_entries(AppendEntries {
+      read_context: 0,
+      term: newer,
+      leader: C,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: vec![LogEntry::command(newer, b"from the next leader".to_vec())],
+      leader_commit: 0,
+      priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
+    });
+    assert!(reply.success, "the node follows a newer leader");
+  }
+
+  /// AUD-29-37 (restart during a slice). Do: B wins with A's far report and crashes between slices
+  /// (restored from what it retained), then C wins the next term with the same report and replicates to the
+  /// restored B. Expect: B restores with its partial recovery; C recovers the reported value at its index;
+  /// and B's log, overwritten by C's, holds the value there too — a crash mid-recovery loses no reported
+  /// value, since the voters' windows outlive a leader that never synced them.
+  #[test]
+  fn a_leader_that_crashes_mid_recovery_loses_no_reported_value() {
+    let (mut first, reply) = candidate_with_a_far_report();
+    let report = reply.reports.clone();
+    first.on_vote_reply(reply);
+    first.replicate_to(C, RECOVERY_WINDOW);
+    assert!(first.recovering(), "crashed between slices");
+    let mut restored = RaftNode::restore(first.saved()).unwrap();
+    assert!(restored.last_log_index() < FAR_REPORT_GAP);
+    let mut next = node_with_uncommitted_log(C, vec![A, B, C], restored.term(), None, Vec::new());
+    next.set_window_budget(RECOVERY_WINDOW);
+    let requests = next.start_election().unwrap();
+    let vote = requests
+      .into_iter()
+      .find(|request| request.candidate == C)
+      .unwrap();
+    let granted = restored.on_request_vote(vote);
+    assert!(
+      !granted.granted,
+      "the restored B's longer log refuses C's empty one"
+    );
+    // A grants with its window's report; A's and C's own vote are a majority of three.
+    next.on_vote_reply(VoteReply {
+      voter: A,
+      term: next.term(),
+      granted: true,
+      reports: report,
+    });
+    assert!(next.is_leader());
+    replicate_until_matched(&mut next, &mut restored, FAR_REPORT_GAP * 2);
+    let at = usize::try_from(FAR_REPORT_GAP - 1).unwrap();
+    for node in [&next, &restored] {
+      assert_eq!(node.log[at].command, b"chosen far above".to_vec());
+      assert_eq!(node.log[at].term, next.term());
+    }
   }
 }
