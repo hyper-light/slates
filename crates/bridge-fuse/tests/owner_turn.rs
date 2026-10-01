@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 
 use slates_bridge_core::{Attachments, Rights, View};
 use slates_bridge_fuse::abi::Opcode;
-use slates_bridge_fuse::channel::{FuseChannel, ServeState, Turn, dispatch_ready, send_reply};
+use slates_bridge_fuse::channel::{
+  FuseChannel, ServeState, Turn, dispatch_ready, reclaim_dispatched, send_reply,
+};
 use slates_bridge_fuse::mount::{Awaiting, Mount, Progress, begin_mount, begin_unmount};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
@@ -44,6 +46,8 @@ struct Counts {
   barriered: Vec<Opcode>,
   /// The barriers refused (answered `EIO`).
   refused: u64,
+  /// The references and handles given back for the refused replies (AUD-29-85).
+  reclaimed: u64,
 }
 
 fn command_available(name: &str) -> bool {
@@ -193,6 +197,14 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
         }
         if refused {
           tally.refused += 1;
+          let given_back = reclaim_dispatched(
+            &state,
+            &dispatched,
+            &mut bridge,
+            &mut attachments,
+            transport,
+          );
+          tally.reclaimed += given_back.references + given_back.handles;
         }
         send_reply(&channel, &mut state, &dispatched, refused.then_some(EIO)).unwrap();
       }
@@ -217,7 +229,8 @@ fn through_the_mount(mount_point: &str, script: &str) -> (bool, String) {
 /// back; then ask the owner to refuse its next barrier and make a directory; then unmount without blocking.
 /// Expect: the create and the close's flush waited for a barrier and the write and the read did not; the
 /// refused barrier answered `mkdir` with `EIO` (the caller told, not promised survival) while the directory
-/// is in the volume, as an NFS mutation whose publication was refused is; and the unmount ended the loop.
+/// is in the volume, as an NFS mutation whose publication was refused is, and the lookup reference its lost
+/// reply granted was given back (AUD-29-85); and the unmount ended the loop.
 #[test]
 fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
   if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
@@ -265,6 +278,10 @@ fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
 /// barriered, and no write or read ever waiting for one.
 fn assert_counts(counts: &Counts) {
   assert_eq!(counts.refused, 1);
+  assert_eq!(
+    counts.reclaimed, 1,
+    "the refused mkdir's lookup reference was given back"
+  );
   assert!(
     counts.barriered.contains(&Opcode::Create),
     "the create waited for a barrier: {counts:?}"

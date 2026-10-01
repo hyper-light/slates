@@ -10,7 +10,7 @@
 //! are tested on every host without a mount. An opcode slates does not serve is answered
 //! `ENOSYS` without reaching the bridge.
 
-use crate::abi::Opcode;
+use crate::abi::{OUT_HEADER_LEN, Opcode};
 use crate::init::negotiate;
 use crate::reply::{Attr, AttrOut, DirBuffer, EntryOut, OpenOut, ReplyHeader, StatfsOut, WriteOut};
 use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
@@ -92,6 +92,12 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
   let Some(opcode) = request.opcode else {
     return write_or_drop(ReplyHeader::write_error(unique, ENOSYS, out), out);
   };
+  // A request whose success reply cannot fit the room it was given is refused before any effect (AUD-29-85):
+  // a create, a lookup or an open would otherwise take its handle or reference and then lose the reply that
+  // names it, and a write would change bytes the caller is then told failed.
+  if success_reply_bytes(opcode).is_some_and(|need| out.len() < need) {
+    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+  }
   // A creating request stamps the creating process's uid and gid on what it makes (AUD-29-81): ownership
   // metadata from the kernel's request header, never authority — the attachment's enrolled subject is
   // unchanged, and the shared seam applies the set-group-ID parent rule.
@@ -140,6 +146,150 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::SetAttr => serve_setattr(bridge, &request, cx, out),
     Opcode::StatFs => serve_statfs(bridge, &request, cx, out),
   }
+}
+
+/// The bytes a success reply of `opcode` needs, header included, for the opcodes whose reply has a fixed size
+/// and whose service has an effect a lost reply would orphan (a reference, an open handle, a created object,
+/// changed bytes or attributes); `None` for the rest — a reply sized by its request (read, directory pages:
+/// clamped to the room instead) or one with no effect to lose. A transport whose reply room is the caller's
+/// (a virtio guest's posted buffers) refuses below it before dispatch (AUD-29-85).
+pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
+  let body = match opcode {
+    Opcode::Lookup | Opcode::MkDir | Opcode::MkNod | Opcode::SymLink | Opcode::Link => {
+      EntryOut::LEN
+    }
+    Opcode::Create => EntryOut::LEN.saturating_add(OpenOut::LEN),
+    Opcode::GetAttr | Opcode::SetAttr => AttrOut::LEN,
+    Opcode::Open | Opcode::OpenDir => OpenOut::LEN,
+    Opcode::Write => WriteOut::LEN,
+    _ => return None,
+  };
+  Some(OUT_HEADER_LEN.saturating_add(body))
+}
+
+/// What [`reclaim_unreported`] gave back: the lookup references forgotten and the open handles released.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Reclaimed {
+  /// Lookup references forgotten (one per entry the lost reply named).
+  pub references: u64,
+  /// Open handles released (the lost reply's `fh`).
+  pub handles: u64,
+}
+
+/// Gives back what a success reply granted when that reply never reached its caller (AUD-29-85): the owner
+/// replaced it with an error (a refused barrier's `EIO`), the kernel refused it (`ENOENT`: the request was
+/// interrupted and is no longer waiting), or the guest's buffers could not take it. The caller cannot send the
+/// matching FORGET or RELEASE for a node id or handle it never learned, so the server does — the rule libfuse
+/// keeps in `fuse.c` (`reply_entry` forgets and `fuse_reply_open` failures release on `ENOENT`). `opcode` and
+/// `nodeid` are the request's; `reply` is the success reply as encoded. An error reply granted nothing.
+pub fn reclaim_unreported(
+  opcode: Option<Opcode>,
+  nodeid: u64,
+  reply: &[u8],
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+) -> Reclaimed {
+  let mut reclaimed = Reclaimed::default();
+  let (Some(opcode), Some(body)) = (opcode, success_body(reply)) else {
+    return reclaimed;
+  };
+  let mut forget = |entry: u64, reclaimed: &mut Reclaimed| {
+    // A node id of zero is a negative entry: the kernel takes no reference on it.
+    if entry != 0 {
+      bridge.forget(ObjectId::new(entry, 0), cx, 1);
+      reclaimed.references = reclaimed.references.saturating_add(1);
+    }
+  };
+  match opcode {
+    Opcode::Lookup | Opcode::MkDir | Opcode::MkNod | Opcode::SymLink | Opcode::Link => {
+      if let Some(entry) = u64_at(body, 0) {
+        forget(entry, &mut reclaimed);
+      }
+    }
+    Opcode::Create => {
+      let entry = u64_at(body, 0);
+      if let Some(entry) = entry {
+        forget(entry, &mut reclaimed);
+      }
+      if let (Some(entry), Some(fh)) = (entry, u64_at(body, EntryOut::LEN)) {
+        release(bridge, cx, entry, fh, &mut reclaimed);
+      }
+    }
+    Opcode::Open | Opcode::OpenDir => {
+      if let Some(fh) = u64_at(body, 0) {
+        release(bridge, cx, nodeid, fh, &mut reclaimed);
+      }
+    }
+    Opcode::ReadDirPlus => {
+      for (entry, name) in plus_entries(body) {
+        // "." and ".." are never referenced by READDIRPLUS (the kernel never forgets them).
+        if name != b"." && name != b".." {
+          forget(entry, &mut reclaimed);
+        }
+      }
+    }
+    _ => {}
+  }
+  reclaimed
+}
+
+/// Releases the handle `fh` on `nodeid`, counting it when the seam accepted the release.
+fn release(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  nodeid: u64,
+  fh: u64,
+  reclaimed: &mut Reclaimed,
+) {
+  if bridge.release(ObjectId::new(nodeid, 0), cx, fh).is_ok() {
+    reclaimed.handles = reclaimed.handles.saturating_add(1);
+  }
+}
+
+/// The body of a success reply: `None` for an error reply or one too short for its header.
+fn success_body(reply: &[u8]) -> Option<&[u8]> {
+  /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
+  const ERROR_AT: usize = size_of::<u32>();
+  let error = reply.get(ERROR_AT..ERROR_AT.saturating_add(size_of::<i32>()))?;
+  if i32::from_le_bytes(error.try_into().ok()?) != 0 {
+    return None;
+  }
+  reply.get(OUT_HEADER_LEN..)
+}
+
+/// The little-endian `u64` at `at` in `bytes`, when it is all there.
+fn u64_at(bytes: &[u8], at: usize) -> Option<u64> {
+  let field = bytes.get(at..at.checked_add(size_of::<u64>())?)?;
+  Some(u64::from_le_bytes(field.try_into().ok()?))
+}
+
+/// The (node id, name) of each entry in a READDIRPLUS page: `fuse_entry_out` (node id first), then a
+/// `fuse_dirent` (ino, off, namelen, type, name) padded to its alignment. A truncated entry ends the walk.
+fn plus_entries(page: &[u8]) -> impl Iterator<Item = (u64, &[u8])> {
+  /// Format: `fuse_dirent`'s fixed part (ino, off, namelen, type) and the namelen field's offset in it.
+  const DIRENT_HEAD: usize = 24;
+  /// Format: see [`DIRENT_HEAD`].
+  const NAMELEN_AT: usize = 16;
+  /// Format: the alignment each directory entry is padded to.
+  const ALIGN: usize = 8;
+  let mut at = 0usize;
+  std::iter::from_fn(move || {
+    let entry = u64_at(page, at)?;
+    let dirent = at.checked_add(EntryOut::LEN)?;
+    let namelen_at = dirent.checked_add(NAMELEN_AT)?;
+    let namelen = page.get(namelen_at..namelen_at.checked_add(size_of::<u32>())?)?;
+    let namelen = usize::try_from(u32::from_le_bytes(namelen.try_into().ok()?)).ok()?;
+    let name_at = dirent.checked_add(DIRENT_HEAD)?;
+    let name = page.get(name_at..name_at.checked_add(namelen)?)?;
+    at = dirent.checked_add(DIRENT_HEAD.checked_add(namelen)?.next_multiple_of(ALIGN))?;
+    Some((entry, name))
+  })
+}
+
+/// The reply body room `out` leaves after the header, as a request size: a read or a directory page is
+/// clamped to it, so its reply always fits what the caller posted (AUD-29-85).
+fn body_room(out: &[u8]) -> u32 {
+  u32::try_from(out.len().saturating_sub(OUT_HEADER_LEN)).unwrap_or(u32::MAX)
 }
 
 /// Whether `opcode` makes a new object, whose owner is the creating process.
@@ -493,7 +643,7 @@ fn serve_read(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &
     generation: 0,
   };
   let mut data = Vec::new();
-  match bridge.read(object, cx, r.offset, r.size, &mut data) {
+  match bridge.read(object, cx, r.offset, r.size.min(body_room(out)), &mut data) {
     Ok(()) => write_or_drop(ReplyHeader::write_ok(req.header.unique, &data, out), out),
     Err(e) => reply_err(req.header.unique, e, out),
   }
@@ -537,7 +687,7 @@ fn serve_readdir(
   };
   match bridge.readdir(object, cx, r.fh, r.offset) {
     Ok(entries) => {
-      let mut dir = DirBuffer::new(usize::try_from(r.size).unwrap_or(0));
+      let mut dir = DirBuffer::new(usize::try_from(r.size.min(body_room(out))).unwrap_or(0));
       for (index, entry) in entries.iter().enumerate() {
         // The cookie is the one-based index, so the next readdir resumes after this entry.
         let cookie = r.offset.saturating_add(index as u64).saturating_add(1);
@@ -571,7 +721,7 @@ fn serve_readdirplus(
     Ok(entries) => entries,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  let mut dir = DirBuffer::new(usize::try_from(r.size).unwrap_or(0));
+  let mut dir = DirBuffer::new(usize::try_from(r.size.min(body_room(out))).unwrap_or(0));
   for (index, entry) in entries.iter().enumerate() {
     let cookie = r.offset.saturating_add(index as u64).saturating_add(1);
     let child = ObjectId::new(entry.ino, 0);
@@ -582,9 +732,12 @@ fn serve_readdirplus(
       continue;
     };
     // READDIRPLUS takes a lookup reference on each child it returns (like LOOKUP), except the
-    // synthetic "." and ".." which the kernel handles specially and never forgets. If the entry
-    // does not fit, undo the reference and stop.
+    // synthetic "." and ".." which the kernel handles specially and never forgets. Whether the
+    // entry fits is asked first, so an entry the page cannot return is never referenced (AUD-29-85).
     let synthetic = entry.name == "." || entry.name == "..";
+    if !dir.fits_plus(&entry.name) {
+      break;
+    }
     if !synthetic && bridge.reference(child, cx).is_err() {
       break;
     }

@@ -91,6 +91,16 @@ impl std::fmt::Display for ChannelError {
 
 impl std::error::Error for ChannelError {}
 
+/// What became of a reply written to the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sent {
+  /// The kernel took it (or the request needed none).
+  Delivered,
+  /// The kernel answered `ENOENT`: no request with that id waits any more (its caller was interrupted), so
+  /// whatever the reply granted must be reclaimed by the server ([`crate::bridge::reclaim_unreported`]).
+  Unmatched,
+}
+
 /// The daemon's end of one FUSE connection: the device descriptor and a reusable buffer.
 pub struct FuseChannel {
   device: OwnedFd,
@@ -177,17 +187,21 @@ impl FuseChannel {
   }
 
   /// Writes one reply to the device.
-  pub fn write_reply(&self, reply: &[u8]) -> Result<(), ChannelError> {
+  pub fn write_reply(&self, reply: &[u8]) -> Result<Sent, ChannelError> {
     // A zero-length reply is a request that needs none (FORGET); write nothing.
     if reply.is_empty() {
-      return Ok(());
+      return Ok(Sent::Delivered);
     }
-    rustix::io::write(&self.device, reply)
-      .map(|_| ())
-      .map_err(|e| ChannelError::Device {
+    match rustix::io::write(&self.device, reply) {
+      Ok(_) => Ok(Sent::Delivered),
+      // The kernel no longer holds the request (its caller was interrupted): not a fault of the mount, but
+      // the reply's grants never reached anyone (AUD-29-85).
+      Err(rustix::io::Errno::NOENT) => Ok(Sent::Unmatched),
+      Err(e) => Err(ChannelError::Device {
         call: "write",
         code: Some(e.raw_os_error()),
-      })
+      }),
+    }
   }
 
   /// Writes one kernel invalidation to the device as an unsolicited notification (§4.6
@@ -511,9 +525,17 @@ fn serve_request(
 ) -> Result<(Delivered, i32), ChannelError> {
   let delivered = deliver_owed(channel, bridge, cx, state)?;
   let n = dispatch(request, bridge, cx, &mut state.reply);
-  let error = reply_error(&state.reply[..n]);
-  if n > 0 {
-    channel.write_reply(&state.reply[..n])?;
+  let reply = state.reply.get(..n).unwrap_or(&[]);
+  let error = reply_error(reply);
+  if n > 0 && channel.write_reply(reply)? == Sent::Unmatched {
+    let parsed = Request::parse(request).ok();
+    crate::bridge::reclaim_unreported(
+      parsed.as_ref().and_then(|parsed| parsed.opcode),
+      parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid),
+      reply,
+      bridge,
+      cx,
+    );
   }
   state.coherence.served_own_request(bridge, cx, delivered);
   Ok((delivered, error))
@@ -541,6 +563,7 @@ pub struct Dispatched {
   /// The reply's errno (zero for success, or for a request that takes no reply).
   pub error: i32,
   unique: u64,
+  nodeid: u64,
   len: usize,
 }
 
@@ -612,6 +635,7 @@ pub fn dispatch_ready(
   let request = channel.take_request();
   let parsed = Request::parse(&request).ok();
   let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
+  let nodeid = parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid);
   let opcode = parsed.and_then(|parsed| {
     if parsed.opcode == Some(Opcode::Init)
       && let Ok(negotiated) = negotiate(parsed.body)
@@ -630,6 +654,7 @@ pub fn dispatch_ready(
       delivered,
       error,
       unique,
+      nodeid,
       len,
     }
   });
@@ -639,15 +664,18 @@ pub fn dispatch_ready(
 
 /// Writes a dispatched request's reply — or, when its owner could not make the effect durable, an error
 /// reply with `refuse_with` (an errno; `EIO` for a refused barrier) in its place, so the caller is told
-/// rather than promised survival. A request that takes no reply writes nothing either way.
+/// rather than promised survival. A request that takes no reply writes nothing either way. A reply that is
+/// replaced, or that the kernel answers [`Sent::Unmatched`], never told its caller what it granted, so the
+/// owner reclaims it with [`reclaim_dispatched`] — before this call when it refuses, since the refusal
+/// overwrites the reply (AUD-29-85).
 pub fn send_reply(
   channel: &FuseChannel,
   state: &mut ServeState,
   dispatched: &Dispatched,
   refuse_with: Option<i32>,
-) -> Result<(), ChannelError> {
+) -> Result<Sent, ChannelError> {
   if dispatched.len == 0 {
-    return Ok(());
+    return Ok(Sent::Delivered);
   }
   match refuse_with {
     None => channel.write_reply(state.reply.get(..dispatched.len).unwrap_or(&[])),
@@ -657,6 +685,32 @@ pub fn send_reply(
       channel.write_reply(state.reply.get(..n).unwrap_or(&[]))
     }
   }
+}
+
+/// Gives back what a dispatched request's success reply granted — its lookup references and open handle —
+/// when the reply will not reach the caller (a refused barrier replaces it, or the kernel no longer waits for
+/// it), under `attachment` as the dispatch was. Call it while the reply is still in `state`: before
+/// [`send_reply`] refuses, or after it answers [`Sent::Unmatched`] (AUD-29-85).
+pub fn reclaim_dispatched(
+  state: &ServeState,
+  dispatched: &Dispatched,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+) -> crate::bridge::Reclaimed {
+  let Ok(cx) = attachments.begin(attachment) else {
+    // A revoked attachment is swept whole by its teardown; nothing is owed one reply at a time.
+    return crate::bridge::Reclaimed::default();
+  };
+  let reclaimed = crate::bridge::reclaim_unreported(
+    dispatched.opcode,
+    dispatched.nodeid,
+    state.reply.get(..dispatched.len).unwrap_or(&[]),
+    bridge,
+    &cx,
+  );
+  attachments.end(attachment);
+  reclaimed
 }
 
 /// The blocking serve loop (the fallback path, §4.6): [`wait`] for a request or a signalled change,

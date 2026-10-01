@@ -12,7 +12,7 @@ use slates_bridge_core::{
   View,
 };
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS};
+use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS, Reclaimed, reclaim_unreported};
 use slates_bridge_fuse::reply::{AttrOut, EntryOut};
 use slates_bridge_fuse::request::{RenameIn, SetAttrIn};
 use slates_db::catalog::{Principal, VolumeId};
@@ -29,6 +29,8 @@ struct Mock {
   ctime: i64,
   forgotten: u64,
   referenced: u64,
+  /// Open handles released.
+  released: u64,
   swept: u64,
   setattr_calls: u64,
   last_setattr: Option<SetAttr>,
@@ -246,6 +248,7 @@ impl Bridge for Mock {
     ))
   }
   fn release(&mut self, _object: ObjectId, _cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
+    self.released = self.released.saturating_add(1);
     Ok(())
   }
   fn reference(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<(), VfsError> {
@@ -416,6 +419,7 @@ fn mock() -> Mock {
     ctime: 0,
     forgotten: 0,
     referenced: 0,
+    released: 0,
     swept: 0,
     setattr_calls: 0,
     last_setattr: None,
@@ -1064,4 +1068,135 @@ fn destroy_sweeps_the_attachment_and_replies_success() {
     "DESTROY succeeds (not ENOSYS)"
   );
   assert_eq!(m.swept, 1, "the attachment's references were swept once");
+}
+
+/// AUD-29-85. Do: dispatch a CREATE, a LOOKUP and a WRITE with reply room for the header alone (the guest
+/// driver posted 16 bytes), then a READDIRPLUS asking for 512 bytes with room for the header and less than
+/// one entry. Expect: the three fixed-size requests answer `EIO` before any effect — no create reaches the
+/// seam, no lookup reference is taken, the file's bytes are unchanged (before, the CREATE made the file and
+/// its handle and the WRITE changed the bytes, then the reply did not fit); and the page is clamped to the
+/// room, so it takes no reference it cannot return.
+#[test]
+fn a_reply_with_no_room_refuses_before_any_effect() {
+  let mut m = mock();
+  let mut header_only = [0u8; OUT_HEADER_LEN];
+  let n = dispatch(
+    &message(
+      Opcode::Create.to_wire(),
+      1,
+      1,
+      &create_body(0o100_644, "new"),
+    ),
+    &mut m,
+    &mut header_only,
+  );
+  assert_eq!(reply_error(&header_only, n), -5, "CREATE refused EIO");
+  assert_eq!(
+    m.last_create_mode, None,
+    "the create never reached the seam"
+  );
+  let mut lookup = b"child".to_vec();
+  lookup.push(0);
+  let n = dispatch(
+    &message(Opcode::Lookup.to_wire(), 2, 1, &lookup),
+    &mut m,
+    &mut header_only,
+  );
+  assert_eq!(reply_error(&header_only, n), -5, "LOOKUP refused EIO");
+  assert_eq!(m.referenced, 0, "no lookup reference was taken");
+  let mut write = vec![0u8; 40];
+  write[0..8].copy_from_slice(&7u64.to_le_bytes());
+  write[8..16].copy_from_slice(&0u64.to_le_bytes());
+  write[16..20].copy_from_slice(&2u32.to_le_bytes());
+  write.extend_from_slice(b"XX");
+  let n = dispatch(
+    &message(Opcode::Write.to_wire(), 3, 2, &write),
+    &mut m,
+    &mut header_only,
+  );
+  assert_eq!(reply_error(&header_only, n), -5, "WRITE refused EIO");
+  assert_eq!(m.content, b"hello world", "the bytes are unchanged");
+  /// Shape: room for the header and less than one directory-plus entry.
+  const SHORT_PAGE: usize = OUT_HEADER_LEN + EntryOut::LEN / 2;
+  let mut short_page = [0u8; SHORT_PAGE];
+  let mut readdir = vec![0u8; 24];
+  readdir[16..20].copy_from_slice(&512u32.to_le_bytes());
+  let n = dispatch(
+    &message(Opcode::ReadDirPlus.to_wire(), 4, 1, &readdir),
+    &mut m,
+    &mut short_page,
+  );
+  assert!(
+    (OUT_HEADER_LEN..=SHORT_PAGE).contains(&n),
+    "the page fits its room: {n}"
+  );
+  assert_eq!(
+    m.referenced, 0,
+    "no entry was referenced that the page could not return"
+  );
+}
+
+/// AUD-29-85. Do: dispatch a READDIRPLUS and a CREATE with room, then treat each reply as one that never
+/// reached its caller and reclaim it; reclaim an error reply too. Expect: every lookup reference the page
+/// took is forgotten (the net is zero) without the synthetic "." and ".." ever being forgotten; the CREATE's
+/// reference is forgotten and its handle released; an error reply gives back nothing.
+#[test]
+fn reclaiming_an_unreported_reply_gives_back_exactly_what_it_granted() {
+  let mut m = mock();
+  let cx = test_cx();
+  let mut out = [0u8; 1024];
+  let mut readdir = vec![0u8; 24];
+  readdir[16..20].copy_from_slice(&512u32.to_le_bytes());
+  let n = dispatch(
+    &message(Opcode::ReadDirPlus.to_wire(), 1, 1, &readdir),
+    &mut m,
+    &mut out,
+  );
+  let taken = m.referenced;
+  assert!(taken > 0, "the page referenced its entries");
+  let reclaimed = reclaim_unreported(Some(Opcode::ReadDirPlus), 1, &out[..n], &mut m, &cx);
+  assert_eq!(
+    reclaimed,
+    Reclaimed {
+      references: taken,
+      handles: 0
+    }
+  );
+  assert_eq!(m.forgotten, taken, "every reference the page took, no more");
+
+  let before = (m.referenced, m.forgotten);
+  let n = dispatch(
+    &message(
+      Opcode::Create.to_wire(),
+      2,
+      1,
+      &create_body(FILE_MODE, "made"),
+    ),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(&out[4..8], &[0u8; 4], "the create succeeded");
+  let reclaimed = reclaim_unreported(Some(Opcode::Create), 1, &out[..n], &mut m, &cx);
+  assert_eq!(
+    reclaimed,
+    Reclaimed {
+      references: m.referenced - before.0,
+      handles: 1
+    }
+  );
+  assert_eq!(m.forgotten - before.1, m.referenced - before.0);
+  assert_eq!(m.released, 1);
+
+  let mut lookup = b"absent".to_vec();
+  lookup.push(0);
+  let n = dispatch(
+    &message(Opcode::Lookup.to_wire(), 3, 1, &lookup),
+    &mut m,
+    &mut out,
+  );
+  assert_ne!(reply_error(&out, n), 0, "the lookup missed");
+  assert_eq!(
+    reclaim_unreported(Some(Opcode::Lookup), 1, &out[..n], &mut m, &cx),
+    Reclaimed::default()
+  );
 }

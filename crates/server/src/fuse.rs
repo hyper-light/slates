@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
-  Dispatched, FuseChannel, ServeState, Turn, dispatch_ready, send_reply,
+  Dispatched, FuseChannel, Sent, ServeState, Turn, dispatch_ready, reclaim_dispatched, send_reply,
 };
 use slates_bridge_fuse::mount::{
   Awaiting, Mount, MountError, PendingExit, Progress, begin_mount, begin_unmount,
@@ -63,6 +63,11 @@ const BARRIER_REFUSED: &str = "fuse.barrier_refused";
 const UNMOUNT_REFUSED: &str = "fuse.unmount_refused";
 /// Format: see [`MOUNT_REFUSED`].
 const REPLY_UNDELIVERED: &str = "fuse.reply_undelivered";
+/// Format: see [`MOUNT_REFUSED`] — a reply the kernel answered `ENOENT` (its caller was interrupted).
+const REPLY_UNMATCHED: &str = "fuse.reply_unmatched";
+/// Format: see [`MOUNT_REFUSED`] — the references and handles given back for replies that never reached their
+/// caller (AUD-29-85); the non-vacuity counter of the reclaim path.
+const REPLY_RECLAIMED: &str = "fuse.reply_reclaimed";
 
 /// A mounted volume being served: its device, the serve loop's state, the open-handle map that persists
 /// across requests, the registry attachment its requests are admitted under, and where it is mounted.
@@ -462,12 +467,62 @@ fn reply(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) -> 
   } else {
     None
   };
-  if send_reply(&mount.channel, &mut mount.serve, dispatched, refuse).is_err() {
-    *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
-    unmount_owned(&mount.mount_point);
-    return Turned::Ended;
+  // A refusal overwrites the reply, so what it granted is given back first (AUD-29-85).
+  if refuse.is_some() {
+    reclaim(s, mount, dispatched);
   }
-  Turned::Served
+  match send_reply(&mount.channel, &mut mount.serve, dispatched, refuse) {
+    Ok(Sent::Delivered) => Turned::Served,
+    Ok(Sent::Unmatched) => {
+      *s.refusals.entry(REPLY_UNMATCHED).or_insert(0) += 1;
+      if refuse.is_none() {
+        reclaim(s, mount, dispatched);
+      }
+      Turned::Served
+    }
+    Err(_) => {
+      *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
+      unmount_owned(&mount.mount_point);
+      Turned::Ended
+    }
+  }
+}
+
+/// Gives back what `dispatched`'s success reply granted — its lookup references and open handle — over a
+/// transient bridge on the volume's slot, since the reply will not reach its caller (AUD-29-85).
+fn reclaim(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) {
+  let Some(&handle) = s.by_id.get(&mount.volume) else {
+    return;
+  };
+  let ShardState {
+    store,
+    volumes,
+    attachments,
+    refusals,
+    ..
+  } = &mut *s;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return;
+  };
+  let mut bridge = VolumeBridge::attached(
+    mount.volume,
+    &mut slot.volume,
+    store,
+    &mut mount.handles,
+    slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+  );
+  let reclaimed = reclaim_dispatched(
+    &mount.serve,
+    dispatched,
+    &mut bridge,
+    attachments,
+    mount.registry,
+  );
+  let given_back = reclaimed.references.saturating_add(reclaimed.handles);
+  if given_back > 0 {
+    let count = refusals.entry(REPLY_RECLAIMED).or_insert(0);
+    *count = count.saturating_add(given_back);
+  }
 }
 
 /// A serve task that cannot wait on its device: the mount is unmounted and its attachment ended.

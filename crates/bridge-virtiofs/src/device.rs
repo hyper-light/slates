@@ -37,7 +37,7 @@ use std::fmt;
 
 use slates_bridge_core::{Bridge, OpContext};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::{EIO, dispatch};
+use slates_bridge_fuse::bridge::{EIO, dispatch, reclaim_unreported, success_reply_bytes};
 use slates_bridge_fuse::init::{InitNegotiation, MAX_WRITE, negotiate};
 use slates_bridge_fuse::reply::ReplyHeader;
 use slates_bridge_fuse::request::InHeader;
@@ -197,6 +197,9 @@ pub struct DeviceCounters {
   pub bytes_scattered: u64,
   /// Replies the guest's writable buffers could not hold, answered `EIO`.
   pub replies_truncated: u64,
+  /// References and handles given back for success replies that could not be scattered into the guest's
+  /// buffers (AUD-29-85): what the guest never learned it held.
+  pub reclaimed: u64,
   /// `FUSE_INIT` requests observed.
   pub init_seen: u64,
   /// `FUSE_DESTROY` requests observed.
@@ -531,16 +534,44 @@ impl Device {
     self.reply.resize(reply_room, 0);
     let header = InHeader::parse(&self.request).ok();
     self.observe(header.as_ref());
-    let mut written = dispatch(&self.request, bridge, cx, &mut self.reply);
+    // A request whose success reply cannot fit the room the guest posted is not dispatched (AUD-29-85): its
+    // effect — a created file, an open handle, a reference, changed bytes — would happen and its reply, naming
+    // what it granted, would be lost. It is answered `EIO` below, with no effect.
+    let room_short = header
+      .as_ref()
+      .and_then(|h| Opcode::from_wire(h.opcode))
+      .and_then(success_reply_bytes)
+      .is_some_and(|need| reply_room < need);
+    let mut written = if room_short {
+      0
+    } else {
+      dispatch(&self.request, bridge, cx, &mut self.reply)
+    };
     if written == 0 && expects_reply(header.as_ref()) && reply_room >= OUT_HEADER_LEN {
-      // The reply did not fit the guest's buffers (a driver posted less room than the ABI's reply
+      // The reply does not fit the guest's buffers (a driver posted less room than the ABI's reply
       // needs): answer the request with EIO rather than leaving it waiting forever.
       written = header
         .map(|h| ReplyHeader::write_error(h.unique, EIO, &mut self.reply).unwrap_or(0))
         .unwrap_or(0);
       self.counters.replies_truncated = self.counters.replies_truncated.saturating_add(1);
     }
-    scatter(memory, &chain.writable, &self.reply[..written])?;
+    let reply = self.reply.get(..written).unwrap_or(&[]);
+    if let Err(e) = scatter(memory, &chain.writable, reply) {
+      // The reply never reached the guest, so the guest can never send the FORGET or RELEASE for what it
+      // granted; the device gives it back here (AUD-29-85).
+      let reclaimed = reclaim_unreported(
+        header.as_ref().and_then(|h| Opcode::from_wire(h.opcode)),
+        header.as_ref().map_or(0, |h| h.nodeid),
+        reply,
+        bridge,
+        cx,
+      );
+      self.counters.reclaimed = self
+        .counters
+        .reclaimed
+        .saturating_add(reclaimed.references.saturating_add(reclaimed.handles));
+      return Err(e);
+    }
     self.count(hiprio, chain.readable_bytes, written);
     Ok(u32::try_from(written).unwrap_or(u32::MAX))
   }
@@ -617,17 +648,22 @@ fn scatter(
   ranges: &[GuestRange],
   bytes: &[u8],
 ) -> Result<(), DeviceError> {
-  let mut at = 0usize;
+  let mut rest = bytes;
   for range in ranges {
-    if at >= bytes.len() {
+    if rest.is_empty() {
       break;
     }
     let room = usize::try_from(range.len())
       .map_err(|_| DeviceError::BufferTooLarge { bytes: range.len() })?;
-    let piece = room.min(bytes.len() - at);
-    let target = GuestRange::new(range.start(), u64::try_from(piece).unwrap_or(u64::MAX))?;
-    memory.write(target, &bytes[at..at + piece])?;
-    at += piece;
+    let (piece, after) = rest
+      .split_at_checked(room.min(rest.len()))
+      .unwrap_or((rest, &[]));
+    let target = GuestRange::new(
+      range.start(),
+      u64::try_from(piece.len()).unwrap_or(u64::MAX),
+    )?;
+    memory.write(target, piece)?;
+    rest = after;
   }
   Ok(())
 }

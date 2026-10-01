@@ -303,11 +303,10 @@ impl DirBuffer {
   /// [`DirBuffer::push`]. Returns false when it would exceed the request's size. The dirent's inode
   /// is the entry's node id, so both halves name the same object.
   pub fn push_plus(&mut self, entry: &EntryOut, offset: u64, kind: u32, name: &str) -> bool {
-    let dirent = (Self::DIRENT_HEAD + name.len()).next_multiple_of(Self::ALIGN);
-    let total = EntryOut::LEN.saturating_add(dirent);
-    if self.bytes.len().saturating_add(total) > self.max {
+    if !self.fits_plus(name) {
       return false;
     }
+    let dirent = (Self::DIRENT_HEAD + name.len()).next_multiple_of(Self::ALIGN);
     self.bytes.extend_from_slice(&entry.to_bytes());
     let mut w = Writer::new();
     w.u64(entry.nodeid);
@@ -318,6 +317,14 @@ impl DirBuffer {
     w.pad(dirent - Self::DIRENT_HEAD - name.len());
     self.bytes.extend_from_slice(w.as_bytes());
     true
+  }
+
+  /// Whether a READDIRPLUS entry named `name` would fit: asked before the entry's lookup reference is
+  /// taken, so an entry the page cannot return is never referenced (AUD-29-85).
+  pub fn fits_plus(&self, name: &str) -> bool {
+    let dirent = (Self::DIRENT_HEAD.saturating_add(name.len())).next_multiple_of(Self::ALIGN);
+    let total = EntryOut::LEN.saturating_add(dirent);
+    self.bytes.len().saturating_add(total) <= self.max
   }
 
   /// The accumulated entries.

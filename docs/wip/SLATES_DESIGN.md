@@ -1817,6 +1817,15 @@ must exercise local communication and isolation between clones as well as namesp
 > and the daemon's stop end the mount and its attachment. Owed: `slates mount` on Linux, the OCI source
 > authority, the anchor holding the device across a restart (above), per-shard channels.
 
+> **Status (2026-10-01, AUD-29-85: a reply's room is checked before its effect, and a lost reply's grants
+> are given back).** A request whose fixed-size success reply cannot fit the room its caller posted (a
+> virtio-fs guest's writable buffers) is answered `EIO` before dispatch, with no effect; a read or a directory
+> page is clamped to the room, and READDIRPLUS asks whether an entry fits before taking its lookup reference.
+> A success reply that never reaches its caller — replaced by a refused barrier's `EIO`, answered `ENOENT` by
+> the kernel (the caller was interrupted), or not scattered into guest memory — has what it granted given back
+> by the server (`reclaim_unreported`: its lookup references forgotten, its open handle released), the rule
+> libfuse's `fuse.c` keeps; counted (`fuse.reply_reclaimed`, the device's `reclaimed`).
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

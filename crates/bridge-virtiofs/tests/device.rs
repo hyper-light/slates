@@ -11,7 +11,7 @@
 mod common;
 
 use common::{SimDriver, context, message, reply_error, store, vid, volume};
-use slates_bridge_core::{OpContext, VolumeBridge};
+use slates_bridge_core::{Bridge, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::bridge::dispatch;
 use slates_bridge_fuse::reply::EntryOut;
@@ -19,6 +19,8 @@ use slates_bridge_virtiofs::credit::Unlimited;
 use slates_bridge_virtiofs::device::{
   Device, DeviceConfig, DeviceError, FIRST_REQUEST_QUEUE, FsTag, HIPRIO_QUEUE, TAG_LEN,
 };
+use slates_bridge_virtiofs::memory::{GuestMemory, GuestMemoryError, GuestRange};
+use slates_bridge_virtiofs::sim::SimGuestMemory;
 use slates_bridge_virtiofs::virtqueue::VirtqueueError;
 
 /// Shape: the reply room posted for every request-queue request: 8 KiB holds any reply in the
@@ -562,4 +564,151 @@ fn a_tag_is_validated_and_laid_out_as_the_configuration_field() {
   assert_eq!(&bytes[..6], b"slates");
   assert!(bytes[6..].iter().all(|b| *b == 0), "NUL-padded");
   assert_eq!(short.as_str(), "slates");
+}
+
+/// AUD-29-85. Do: post a CREATE with reply room for the header alone (the §7.6 witness's 16 bytes); then
+/// post it again with room. Expect: the first answers `EIO` with no effect — the file is absent (before, it
+/// was created with an open handle no reply named); the retry creates it.
+#[test]
+fn an_undersized_create_has_no_effect_and_its_retry_succeeds() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = context();
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let header_only = u32::try_from(OUT_HEADER_LEN).unwrap();
+  let create = message(Opcode::Create.to_wire(), 1, ROOT, &create_body("made"));
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    let head = driver.submit(rq, &create, header_only, 1);
+    serve(
+      &mut device,
+      FIRST_REQUEST_QUEUE,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      BATCH,
+    )
+    .unwrap();
+    let (_, len) = driver.reap(rq).unwrap();
+    assert_eq!(reply_error(&driver.reply_of(rq, head, len)), -EIO);
+    let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+    assert!(
+      bridge.lookup(root, &cx, "made").is_err(),
+      "no file was made"
+    );
+    let head = driver.submit(rq, &create, REPLY_CAP, 1);
+    serve(
+      &mut device,
+      FIRST_REQUEST_QUEUE,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      BATCH,
+    )
+    .unwrap();
+    let (_, len) = driver.reap(rq).unwrap();
+    assert_eq!(
+      reply_error(&driver.reply_of(rq, head, len)),
+      0,
+      "the retry succeeded"
+    );
+  }
+  let root = vol.root_inode(&store).unwrap();
+  assert!(
+    vol.lookup_no(&store, root, "made").is_ok(),
+    "the retry made the file"
+  );
+  assert_eq!(
+    device.counters().replies_truncated,
+    1,
+    "the short room was refused once"
+  );
+  assert_eq!(
+    device.counters().reclaimed,
+    0,
+    "nothing was granted and lost"
+  );
+}
+
+/// Guest memory whose region under `withdrawn` fails every write: a VMM that withdrew the reply buffer's
+/// memory after the device validated the chain, so the scatter fails after the request's effect.
+struct WithdrawnAfterValidation<'m> {
+  memory: &'m mut SimGuestMemory,
+  withdrawn: GuestRange,
+}
+
+impl GuestMemory for WithdrawnAfterValidation<'_> {
+  fn check(&self, range: GuestRange) -> Result<(), GuestMemoryError> {
+    self.memory.check(range)
+  }
+
+  fn read(&self, range: GuestRange, out: &mut [u8]) -> Result<(), GuestMemoryError> {
+    self.memory.read(range, out)
+  }
+
+  fn write(&mut self, range: GuestRange, bytes: &[u8]) -> Result<(), GuestMemoryError> {
+    if range.overlaps(&self.withdrawn) {
+      return Err(GuestMemoryError::OutsideGuestMemory {
+        start: range.start().0,
+        len: range.len(),
+      });
+    }
+    self.memory.write(range, bytes)
+  }
+}
+
+/// AUD-29-85. Do: post a CREATE whose reply buffer's memory fails the write after the chain was validated, so
+/// the reply cannot be scattered after the file is made; then unlink the file. Expect: the device faults typed
+/// (a guest-memory refusal), and what the lost reply granted is given back — its lookup reference and its open
+/// handle (the counter names two) — so once unlinked, the inode is reclaimed (before, the handle and reference
+/// no reply named held it until teardown).
+#[test]
+fn a_reply_the_guest_cannot_take_gives_back_what_it_granted() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = context();
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    let head = driver.submit(
+      rq,
+      &message(Opcode::Create.to_wire(), 1, ROOT, &create_body("lost")),
+      REPLY_CAP,
+      1,
+    );
+    let withdrawn = driver.writable_of(rq, head)[0];
+    let mut memory = WithdrawnAfterValidation {
+      memory: &mut driver.memory,
+      withdrawn,
+    };
+    let refused = device
+      .service_queue(
+        FIRST_REQUEST_QUEUE,
+        &mut memory,
+        &mut bridge,
+        &cx,
+        BATCH,
+        &mut Unlimited,
+      )
+      .unwrap_err();
+    assert!(matches!(refused, DeviceError::Memory(_)), "{refused:?}");
+  }
+  assert_eq!(
+    device.counters().reclaimed,
+    2,
+    "one reference and one handle"
+  );
+  let root = vol.root_inode(&store).unwrap();
+  let lost = vol.lookup_no(&store, root, "lost").unwrap().inode;
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    let root = ObjectId::new(bridge.root(&cx).unwrap(), 0);
+    bridge.unlink(root, &cx, "lost").unwrap();
+  }
+  assert!(
+    vol.stat(&store, lost).is_err(),
+    "the unlinked inode was reclaimed: nothing references it"
+  );
 }
