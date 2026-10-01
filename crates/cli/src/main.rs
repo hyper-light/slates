@@ -83,6 +83,7 @@ fn main() -> ExitCode {
     Command::Client(request) => verbs::run(&request),
     Command::Exec(request) => run_exec(&request),
     Command::Run(request) => verbs::run_consumer(&request),
+    Command::OciCheck(check) => verbs::oci_check(&check),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,

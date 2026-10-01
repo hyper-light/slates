@@ -13,6 +13,7 @@ use slates_bridge_oci::verify::{
 
 fn entry(mount_point: &str, fstype: &str, source: &str) -> MountEntry {
   MountEntry {
+    identity: slates_bridge_oci::mount_table::MountIdentity::default(),
     mount_point: mount_point.to_owned(),
     fstype: fstype.to_owned(),
     source: source.to_owned(),
@@ -260,4 +261,73 @@ fn a_source_with_a_mount_beneath_it_is_refused() {
     .filter(|e| e.mount_point != "/home/u/mnt/inner")
     .collect();
   assert!(verify_host_mount(&clean, "/home/u/mnt", &expected).is_ok());
+}
+
+/// AUD-29-66. Do: parse the proc(5) example `mountinfo` line. Expect: its identity is mount 36, device 98:0
+/// — the fields a remount at the same path changes.
+#[test]
+fn a_mountinfo_line_names_its_mount_instance() {
+  let table = slates_bridge_oci::mount_table::parse_mountinfo(
+    "36 35 98:0 /mnt1 /mnt/parent rw,noatime master:1 - ext3 /dev/root rw,errors=continue\n",
+  )
+  .unwrap();
+  /// Format: the example's major device number, packed above the minor (0).
+  const MAJOR: u64 = 98;
+  /// Format: the example's mount ID.
+  const MOUNT_ID: u64 = 36;
+  assert_eq!(
+    table[0].identity,
+    slates_bridge_oci::mount_table::MountIdentity {
+      mount: MOUNT_ID,
+      device: MAJOR << 32,
+    }
+  );
+}
+
+/// AUD-29-66. Do: verify a source, then check it again against tables where it is unchanged, gone, remounted
+/// with another identity, and shadowed by a later mount at the same path. Expect: unchanged passes; gone is
+/// `Missing` (a runtime would bind a bare directory, or create one); remounted and shadowed are `Replaced`,
+/// naming both identities — so a harness that checks just before its runtime binds never binds a replacement.
+#[test]
+fn a_source_checked_again_must_be_the_mount_instance_verified() {
+  use slates_bridge_oci::mount_table::MountIdentity;
+  use slates_bridge_oci::verify::{SourceChange, source_unchanged};
+  let verified = MountIdentity {
+    mount: 7,
+    device: 9,
+  };
+  let with = |identity: MountIdentity| MountEntry {
+    identity,
+    ..entry("/work/mnt", "nfs", "localhost:/work")
+  };
+  assert_eq!(
+    source_unchanged(&[with(verified)], "/work/mnt", verified),
+    Ok(())
+  );
+  assert_eq!(
+    source_unchanged(&[entry("/", "apfs", "/dev/disk3s1")], "/work/mnt", verified),
+    Err(SourceChange::Missing)
+  );
+  let remounted = MountIdentity {
+    mount: 8,
+    device: 9,
+  };
+  assert_eq!(
+    source_unchanged(&[with(remounted)], "/work/mnt", verified),
+    Err(SourceChange::Replaced {
+      verified,
+      found: remounted
+    })
+  );
+  let over = MountIdentity {
+    mount: 11,
+    device: 12,
+  };
+  assert_eq!(
+    source_unchanged(&[with(verified), with(over)], "/work/mnt/", verified),
+    Err(SourceChange::Replaced {
+      verified,
+      found: over
+    })
+  );
 }

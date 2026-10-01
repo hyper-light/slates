@@ -1094,6 +1094,8 @@ pub fn oci_binding_json(binding: &OciBinding) -> Value {
       "fstype": binding.evidence.fstype,
       "mount_source": binding.evidence.mount_source,
       "names_volume": binding.evidence.names_volume,
+      "mount_id": binding.evidence.mount_id,
+      "mount_device": binding.evidence.mount_device,
     },
     "mount": oci_mount_json(binding),
   })

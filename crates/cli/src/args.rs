@@ -40,6 +40,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   recovery-plan (root | region) [--join-group HASH] [--json]
   recover (root | region) --confirm PLAN --fenced --accept-loss [--join-group HASH] [--json]
   status [--json]                                  the daemon's status
+  oci-check SOURCE MOUNT_ID DEVICE                 is SOURCE still the mount an `attach --oci` verified (run before binding)
   status ID [--drift] [--json]
   base read ID PATH
   base digest ID PATH [--json]                     a clean base file's verified content digest
@@ -498,6 +499,20 @@ pub(crate) enum Command {
   Mcp(McpOptions),
   /// A client verb.
   Client(ClientRequest),
+  /// The check a container harness runs just before its runtime binds a verified source (AUD-29-66).
+  OciCheck(OciCheck),
+}
+
+/// `oci-check SOURCE MOUNT_ID DEVICE`: whether `source` is still the mount instance an attach verified, by
+/// the identity its evidence named.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OciCheck {
+  /// The bind's source path.
+  pub(crate) source: String,
+  /// The verified mount id.
+  pub(crate) mount_id: u64,
+  /// The verified device.
+  pub(crate) device: u64,
 }
 
 /// Every flag that takes a value, across the verbs.
@@ -1035,6 +1050,19 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
       } else {
         Command::Daemon(options)
       })
+    }
+    ["oci-check", source, mount_id, device] => {
+      let number = |what: &'static str, text: &str| {
+        text.parse::<u64>().map_err(|e| ParseError::BadValue {
+          what,
+          reason: e.to_string(),
+        })
+      };
+      Ok(Command::OciCheck(OciCheck {
+        source: (*source).to_owned(),
+        mount_id: number("MOUNT_ID", mount_id)?,
+        device: number("DEVICE", device)?,
+      }))
     }
     ["profile"] => {
       taken.only(&Spec {

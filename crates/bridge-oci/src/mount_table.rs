@@ -7,9 +7,23 @@
 
 use std::fmt;
 
+/// The kernel's identity of one mount instance (AUD-29-66): on Linux the mount's id and its device numbers
+/// (`mountinfo`'s first and third fields), on macOS the filesystem id `statfs` reports. A mount replaced at
+/// the same path — unmounted and mounted again, or another filesystem mounted over it — has another identity,
+/// so a harness that checks it just before its runtime binds the path does not bind a replacement.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MountIdentity {
+  /// The mount's id (Linux) or the filesystem id's second word (macOS).
+  pub mount: u64,
+  /// The mount's device: `major << 32 | minor` (Linux) or the filesystem id's first word (macOS).
+  pub device: u64,
+}
+
 /// One mounted filesystem as the kernel lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountEntry {
+  /// The kernel's identity of this mount instance.
+  pub identity: MountIdentity,
   /// Where it is mounted (the real path the kernel resolved at mount time).
   pub mount_point: String,
   /// Its filesystem type (`nfs`, `apfs`, `fuse.slates`, `ext4`, ...).
@@ -116,8 +130,10 @@ mod macos {
     // writes at most that many records into memory that is ours; `set_len` is then called with the
     // number of records the kernel reports it wrote, never more than the capacity, and every record
     // is a plain C struct the kernel filled in full. `MNT_NOWAIT` asks for the cached table without
-    // contacting any filesystem, so no mount served by this process is touched.
-    let records: Vec<libc::statfs> = unsafe {
+    // contacting any filesystem, so no mount served by this process is touched. Each record's `f_fsid` is
+    // read as its two 32-bit words with `transmute_copy`: `fsid_t` is `#[repr(C)] { val: [i32; 2] }` (its
+    // field private in `libc`), exactly the size and layout of `[i32; 2]`, and fully initialized by the kernel.
+    let (records, fsids): (Vec<libc::statfs>, Vec<[i32; 2]>) = unsafe {
       let count = libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT);
       let count = usize::try_from(count).map_err(|_| MountTableError::Query {
         errno: last_errno(),
@@ -134,12 +150,22 @@ mod macos {
         errno: last_errno(),
       })?;
       records.set_len(written.min(count));
-      records
+      let fsids = records
+        .iter()
+        .map(|record| std::mem::transmute_copy::<libc::fsid_t, [i32; 2]>(&record.f_fsid))
+        .collect();
+      (records, fsids)
     };
+    let word = |w: i32| u64::from(u32::from_ne_bytes(w.to_ne_bytes()));
     Ok(
       records
         .iter()
-        .map(|record| MountEntry {
+        .zip(fsids)
+        .map(|(record, [first, second])| MountEntry {
+          identity: super::MountIdentity {
+            mount: word(second),
+            device: word(first),
+          },
           mount_point: field(&record.f_mntonname),
           fstype: field(&record.f_fstypename),
           source: field(&record.f_mntfromname),
@@ -217,6 +243,25 @@ const MOUNTINFO_SEPARATOR: &str = "-";
 /// Format: the zero-based index of the mount point in a `mountinfo` line (proc(5): mount ID, parent
 /// ID, `major:minor`, root, mount point, ...).
 const MOUNT_POINT_FIELD: usize = 4;
+/// Format: the zero-based index of the mount ID and of `major:minor` in a `mountinfo` line (proc(5)).
+const MOUNT_ID_FIELD: usize = 0;
+/// Format: see [`MOUNT_ID_FIELD`].
+const DEVICE_FIELD: usize = 2;
+/// Format: the shift that packs a device's major number above its minor in [`MountIdentity::device`].
+const MAJOR_SHIFT: u32 = 32;
+
+/// The identity a `mountinfo` line names: its mount ID and its `major:minor`; `None` when either is not a
+/// number.
+fn identity_of(fields: &[&str]) -> Option<MountIdentity> {
+  let mount = fields.get(MOUNT_ID_FIELD)?.parse::<u64>().ok()?;
+  let (major, minor) = fields.get(DEVICE_FIELD)?.split_once(':')?;
+  let major = major.parse::<u64>().ok()?;
+  let minor = minor.parse::<u64>().ok()?;
+  Some(MountIdentity {
+    mount,
+    device: (major << MAJOR_SHIFT) | minor,
+  })
+}
 
 /// Format: a `mountinfo` escape is a backslash followed by exactly three octal digits (proc(5):
 /// `\040` space, `\011` tab, `\012` newline, `\134` backslash).
@@ -270,8 +315,12 @@ pub fn parse_mountinfo(text: &str) -> Result<Vec<MountEntry>, MountTableError> {
     let fstype = fields
       .get(separator.saturating_add(1))
       .ok_or(malformed.clone())?;
-    let source = fields.get(separator.saturating_add(2)).ok_or(malformed)?;
+    let source = fields
+      .get(separator.saturating_add(2))
+      .ok_or(malformed.clone())?;
+    let identity = identity_of(&fields).ok_or(malformed)?;
     entries.push(MountEntry {
+      identity,
       mount_point: unescape(mount_point),
       fstype: unescape(fstype),
       source: unescape(source),

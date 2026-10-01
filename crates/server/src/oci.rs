@@ -131,6 +131,8 @@ pub(crate) fn bind(
         fstype: verified.fstype,
         mount_source: verified.source,
         names_volume: verified.names_volume,
+        mount_id: verified.identity.mount,
+        mount_device: verified.identity.device,
       },
     },
   })
@@ -249,6 +251,8 @@ mod tests {
           fstype: "fuse.slates".to_owned(),
           mount_source: format!("slates:{:016x}", attachment.unwrap_or(0)),
           names_volume: true,
+          mount_id: 0,
+          mount_device: 0,
         },
       },
       mount_point: mount_point.to_owned(),

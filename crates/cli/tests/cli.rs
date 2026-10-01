@@ -2266,6 +2266,23 @@ fn assert_host_view_agrees(mount: &str) {
   );
 }
 
+/// `slates oci-check` of a binding's source against the identity its evidence named (AUD-29-66): the check a
+/// harness runs immediately before its runtime binds the path. Its exit code and its output.
+fn oci_check(instance: &str, binding: &serde_json::Value) -> (i32, String, String) {
+  let evidence = &binding["established"]["binding"]["evidence"];
+  run(
+    instance,
+    &[
+      "oci-check",
+      binding["established"]["binding"]["source"]
+        .as_str()
+        .unwrap(),
+      &evidence["mount_id"].as_u64().unwrap().to_string(),
+      &evidence["mount_device"].as_u64().unwrap().to_string(),
+    ],
+  )
+}
+
 /// The write attachment in the OCI form, the workload on the host path, then the same workload in
 /// a real container over the returned entry; the writer's reply, or `None` when the runtime's file
 /// sharing refused the mount point (the loud skip was printed).
@@ -2276,6 +2293,12 @@ fn bind_and_run_workloads(instance: &str, id: &str, path: &str) -> Option<serde_
   let (code, host_out, host_err) = run_on_host(path, "host");
   assert_eq!(code, 0, "the host workload: {host_err}");
   let script = format!("{CONTAINER_VIEW}{WORKLOAD}");
+  // The harness checks the verified mount is still the one at the path just before its runtime binds it.
+  let (code, _, err) = oci_check(instance, &writer);
+  assert_eq!(
+    code, 0,
+    "the verified source is unchanged before the bind: {err}"
+  );
   let (code, container_out, container_err) = run_in_container(&entry, &script, "container")
     .unwrap_or_else(|why| panic!("the container did not run: {why}"));
   if code != 0 && (container_err.contains("Mounts denied") || container_err.contains("not shared"))
@@ -2313,6 +2336,11 @@ fn assert_read_only_bind(instance: &str, id: &str, path: &str) -> serde_json::Va
     serde_json::json!(["bind", "ro", "private"])
   );
   assert_eq!(reader["established"]["binding"]["read_only"], true);
+  let (code, _, err) = oci_check(instance, &reader);
+  assert_eq!(
+    code, 0,
+    "the verified source is unchanged before the bind: {err}"
+  );
   let (code, probe_out, probe_err) =
     run_in_container(read_only_entry, READ_ONLY_PROBE, "reader").unwrap();
   assert_eq!(code, 0, "the read-only probe: {probe_err}");
@@ -2572,6 +2600,43 @@ fn an_oci_container_consumes_the_host_attachment_through_the_runtime_bind() {
   drop(mount_point);
   assert!(!is_mounted(&path), "the mount table no longer lists it");
   drop(anchor);
+}
+
+/// AUD-29-66. Do: mount a volume, attach the container form over it, check its source with `slates
+/// oci-check` against the identity the attach's evidence named, unmount, and check again. Expect: the first
+/// check passes; after the unmount the check refuses `SourceMissing` (exit 1), so a harness never hands its
+/// runtime a bare directory where the verified mount was (`docker -v` would bind it, or create one). Gated
+/// like the live mount flow (`SLATES_TEST_CLI=1`, `mount_nfs`); needs no container runtime.
+#[test]
+fn a_verified_container_source_is_checked_again_before_it_is_bound() {
+  if std::env::var("SLATES_TEST_CLI").is_err() || !std::path::Path::new("/sbin/mount_nfs").exists()
+  {
+    eprintln!("SKIP: set SLATES_TEST_CLI=1 on a host with mount_nfs to run the source check");
+    return;
+  }
+  let instance = format!("cli-oci-check-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "oci-check", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = mount_point.path.clone();
+  mount_and_check(&instance, &id, &path);
+  let binding = attach_oci(&instance, &id, &path, "--write");
+  let (code, before, err) = oci_check(&instance, &binding);
+  assert_eq!(code, 0, "the source is the mount verified: {before}{err}");
+  detach_all(&instance, &[binding["attachment"].as_u64().unwrap()]);
+  let _ = unmount_after_container(&instance, &path);
+  let (code, _, missing) = oci_check(&instance, &binding);
+  drop(mount_point);
+  drop(anchor);
+  assert_eq!(code, 1, "a missing source is refused: {missing}");
+  assert!(missing.contains("SourceMissing"), "{missing}");
 }
 
 /// T-2.14 / AUD-07: review a recovery plan through the real CLI, refuse missing authority,

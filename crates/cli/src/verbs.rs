@@ -785,15 +785,46 @@ fn established_text(established: &Established) -> String {
   match established {
     Established::Record => "established: record\n".to_owned(),
     Established::OciBind { binding } => format!(
-      "established: oci_bind\noci_source: {}\noci_destination: {}\noci_read_only: {}\noci_evidence: fstype={} source={} names_volume={}\noci_mount: {}\n",
+      "established: oci_bind\noci_source: {}\noci_destination: {}\noci_read_only: {}\noci_evidence: fstype={} source={} names_volume={} mount_id={} mount_device={}\noci_mount: {}\n",
       binding.source,
       binding.destination,
       binding.read_only,
       binding.evidence.fstype,
       binding.evidence.mount_source,
       binding.evidence.names_volume,
+      binding.evidence.mount_id,
+      binding.evidence.mount_device,
       slates_mcp::oci_mount_json(binding)
     ),
+  }
+}
+
+/// `oci-check`: whether a verified source is still the mount instance its attach verified (AUD-29-66) — the
+/// kernel's table read now, the source's identity compared with the evidence's. A harness runs it immediately
+/// before its runtime binds the path; a replaced or missing source refuses (exit 1), so the runtime is never
+/// handed a replacement or a bare directory where the mount was.
+pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
+  let table = slates_bridge_oci::mount_table::mount_table()
+    .map_err(|e| Failure::Failed(format!("reading the mount table: {e}")))?;
+  let verified = slates_bridge_oci::mount_table::MountIdentity {
+    mount: check.mount_id,
+    device: check.device,
+  };
+  match slates_bridge_oci::verify::source_unchanged(&table, &check.source, verified) {
+    Ok(()) => {
+      println!("unchanged: {}", check.source);
+      Ok(())
+    }
+    Err(slates_bridge_oci::verify::SourceChange::Missing) => Err(Failure::Refused(format!(
+      "SourceMissing: no mount is at {} any more",
+      check.source
+    ))),
+    Err(slates_bridge_oci::verify::SourceChange::Replaced { found, .. }) => {
+      Err(Failure::Refused(format!(
+        "SourceReplaced: {} is now mount {} on device {}, not the mount verified",
+        check.source, found.mount, found.device
+      )))
+    }
   }
 }
 

@@ -1535,6 +1535,12 @@ pub struct HostMountEvidence {
   /// Whether the source names this volume (the NFS export does; the FUSE source is `slates` for every
   /// volume, so there the evidence is the slates filesystem type alone).
   pub names_volume: bool,
+  /// The kernel's identity of the verified mount instance — its mount id and its device (AUD-29-66) — which
+  /// a harness checks again just before its runtime binds the path (`slates oci-check`), so it never binds a
+  /// replacement or a directory left where the mount was. Appended for append-only evolution.
+  pub mount_id: u64,
+  /// See [`HostMountEvidence::mount_id`].
+  pub mount_device: u64,
 }
 
 /// The `mounts[]` entry the harness hands its OCI runtime (the OCI runtime specification's bind mount:

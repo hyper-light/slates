@@ -5,7 +5,7 @@
 //! daemon serves, and [`expected_mount`] turns it into what the table must show for a volume. The
 //! checks run in the order that consults the least: an absolute path first, then the table.
 
-use crate::mount_table::MountEntry;
+use crate::mount_table::{MountEntry, MountIdentity};
 
 /// The host mount a platform establishes for a volume (§4.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +125,46 @@ pub struct VerifiedHostMount {
   pub names_volume: bool,
   /// The attachment the source names, for a mount whose source is one ([`SourceRule::Attachment`]).
   pub attachment: Option<u64>,
+  /// The kernel's identity of the verified mount instance, which the harness checks again just before its
+  /// runtime binds the path ([`source_unchanged`]; AUD-29-66).
+  pub identity: MountIdentity,
+}
+
+/// Why a verified source is no longer the mount that was verified (AUD-29-66).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceChange {
+  /// No mount is at the path any more: a runtime would bind whatever directory is there, or create one.
+  Missing,
+  /// Another mount instance is at the path: unmounted and mounted again, or something mounted over it.
+  Replaced {
+    /// The identity verified.
+    verified: MountIdentity,
+    /// The identity there now.
+    found: MountIdentity,
+  },
+}
+
+/// Whether `source` is still the mount instance verified as `identity` in `entries` (the kernel's table
+/// now): the check a harness runs immediately before it hands the bind to its runtime, so it never binds a
+/// replacement or a bare directory left where the mount was. Pure, so it is tested on every host.
+pub fn source_unchanged(
+  entries: &[MountEntry],
+  source: &str,
+  identity: MountIdentity,
+) -> Result<(), SourceChange> {
+  let path = normalized(source);
+  let entry = entries
+    .iter()
+    .rev()
+    .find(|entry| normalized(&entry.mount_point) == path)
+    .ok_or(SourceChange::Missing)?;
+  if entry.identity != identity {
+    return Err(SourceChange::Replaced {
+      verified: identity,
+      found: entry.identity,
+    });
+  }
+  Ok(())
 }
 
 /// The path with trailing separators removed, the root kept as `/`.
@@ -182,5 +222,6 @@ pub fn verify_host_mount(
     source: entry.source.clone(),
     names_volume: true,
     attachment,
+    identity: entry.identity,
   })
 }
