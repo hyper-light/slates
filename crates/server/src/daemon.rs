@@ -1179,6 +1179,24 @@ impl Daemon {
     })
   }
 
+  /// The configured members this node keeps direct contact with but has no formed probe session to — what
+  /// keeps [`Self::fleet_meshed`] false — with the members it holds, for a failure's diagnosis.
+  pub fn fleet_unmeshed(
+    &self,
+  ) -> Result<(Vec<slates_db::HostId>, Vec<slates_db::HostId>), ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let host = s.fleet.host();
+      let members: Vec<slates_db::HostId> = s.fleet.members().to_vec();
+      let missing = members
+        .iter()
+        .copied()
+        .filter(|&peer| peer != host && crate::fleet::keeps_direct_contact_with(s, peer))
+        .filter(|peer| !s.formed_probe_peers.contains(peer))
+        .collect();
+      (missing, members)
+    })
+  }
+
   /// Probe progress and timer decisions lengthened by this shard's measured scheduling delay (§4.8).
   /// An unavailable observation is a typed refusal, never a zero count.
   pub fn fleet_probe_windows(&self) -> Result<crate::fleet::ProbeWindows, ObserveError> {

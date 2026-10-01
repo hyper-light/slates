@@ -9026,10 +9026,12 @@ fn an_unlisted_node_enrolls_through_one_seed_and_joins_the_existing_quorum() {
     // voter set and mesh, its refusal counters, and its shards' pulse.
     for daemon in &daemons {
       eprintln!(
-        "enroll trace {}: voters={:?} meshed={:?} refusals={:?}",
+        "enroll trace {} ({:?}): voters={:?} meshed={:?} unmeshed (missing, members)={:?} refusals={:?}",
         daemon.config().instance,
+        daemon.member_identity(),
         daemon.council_voters(),
         daemon.fleet_meshed(),
+        daemon.fleet_unmeshed(),
         daemon.fleet_refusals(),
       );
     }
