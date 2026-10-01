@@ -42,7 +42,7 @@ pub mod error;
 
 pub use client::{
   Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, LAST_SEQUENCE, Landing,
-  Rebased, Session, Submitted,
+  Rebased, Session, Submitted, defers_reply,
 };
 pub use error::ClientError;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a

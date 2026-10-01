@@ -65,6 +65,9 @@ struct Call {
   sent: Instant,
   /// Whether it must be sent again under its id on the current channel (after a reconnect).
   resend: bool,
+  /// Whether it is waited for while the daemon lives ([`crate::defers_reply`]): its deadline asks
+  /// the daemon's liveness and restarts, never fails it `Stalled`.
+  patient: bool,
 }
 
 /// A lost channel's recovery.
@@ -125,7 +128,26 @@ impl Driver {
 
   /// Submits `body`: sent at once when the client admits it, else queued. Refused `TooManyOutstanding` when
   /// the queue is full, or with the client's typed error when the call cannot be sent at all.
-  pub fn submit(&mut self, client: &mut Client, mut begin: Begin) -> Result<Ticket, ClientError> {
+  pub fn submit(&mut self, client: &mut Client, begin: Begin) -> Result<Ticket, ClientError> {
+    self.submit_with(client, begin, false)
+  }
+
+  /// [`submit`](Self::submit) for a call whose reply the daemon defers until long work ends (a granted
+  /// landing): once sent it is waited for while the daemon lives, its deadline only asking the liveness.
+  pub fn submit_patient(
+    &mut self,
+    client: &mut Client,
+    begin: Begin,
+  ) -> Result<Ticket, ClientError> {
+    self.submit_with(client, begin, true)
+  }
+
+  fn submit_with(
+    &mut self,
+    client: &mut Client,
+    mut begin: Begin,
+    patient: bool,
+  ) -> Result<Ticket, ClientError> {
     let ticket = self.next_ticket;
     let sent = if self.lost.is_none() && self.queued.is_empty() {
       match begin(client) {
@@ -159,6 +181,7 @@ impl Driver {
         word: sent,
         sent: Instant::now(),
         resend: false,
+        patient,
       },
     );
     Ok(ticket)
@@ -229,20 +252,27 @@ impl Driver {
     let reply_ns = client.deadlines().reply_ns;
     // Overdue: a call sent and unanswered past the reply deadline, or one still queued that long (a ring
     // that never frees is a stall too, as the synchronous `begin` finds it after the same deadline).
-    let overdue: Vec<(Ticket, Option<u64>)> = self
+    let overdue: Vec<(Ticket, Option<u64>, bool)> = self
       .calls
       .iter()
       .filter(|(ticket, call)| {
         !answered.contains(ticket) && !call.resend && elapsed_ns(call.sent) >= reply_ns
       })
-      .map(|(ticket, call)| (*ticket, call.word))
+      .map(|(ticket, call)| (*ticket, call.word, call.patient && call.word.is_some()))
       .collect();
     if !overdue.is_empty() && client.daemon_gone() {
       self.start_recovery();
       self.recover(client, &mut events);
       return events;
     }
-    for (ticket, word) in overdue {
+    for (ticket, word, patient) in overdue {
+      if patient {
+        // Its daemon lives: the deferred reply is still being worked for; the next deadline asks again.
+        if let Some(call) = self.calls.get_mut(&ticket) {
+          call.sent = Instant::now();
+        }
+        continue;
+      }
       self.calls.remove(&ticket);
       match word {
         Some(word) => {

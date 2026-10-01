@@ -45,13 +45,6 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   let profile = common::machine_profile();
   let instance = format!("srv-fairland-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  // The landing client waits as long as the landing may run — its lease's term — where the default reply
-  // deadline (the liveness budget, one second) answers `Stalled` to a landing still at work (a reported
-  // sibling).
-  let landing_deadlines = slates_client::Deadlines {
-    reply_ns: config.failover_slo_ns,
-    ..common::landing::deadlines()
-  };
   let daemon = Daemon::start(
     &profile,
     config,
@@ -64,7 +57,9 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   let target = target_dir();
-  let mut client = slates_client::Client::connect(&instance, landing_deadlines).unwrap();
+  // The product's own deadlines: a granted landing longer than the reply deadline is waited for while the
+  // daemon lives (until 2026-10-01 the client answered `Stalled` after one second of it).
+  let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let volume = client.create(&scratch(VOLUME)).unwrap();
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
@@ -151,10 +146,6 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   let instance = format!("srv-renewland-{}", std::process::id());
   let config =
     DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_failover_slo(SHORT_TERM_NS);
-  let landing_deadlines = slates_client::Deadlines {
-    reply_ns: SHORT_TERM_NS.saturating_mul(u64::try_from(FILES_PAST_TERM).unwrap()),
-    ..common::landing::deadlines()
-  };
   let daemon = Daemon::start(
     &profile,
     config,
@@ -167,7 +158,7 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   let target = target_dir();
-  let mut client = slates_client::Client::connect(&instance, landing_deadlines).unwrap();
+  let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let volume = client.create(&scratch(VOLUME)).unwrap();
   let port = daemon.nfs_port().expect("the daemon is serving NFS");

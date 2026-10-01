@@ -68,6 +68,13 @@ impl Deadlines {
   }
 }
 
+/// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
+/// as long as its tree takes — so a caller waits for it while the daemon lives rather than for one reply
+/// deadline.
+pub fn defers_reply(body: &RequestBody) -> bool {
+  matches!(body, RequestBody::Land { grant: Some(_), .. })
+}
+
 /// Derived: the last sequence a client issues. Sequences run from 1 up to here and never wrap: a wrapped
 /// sequence would meet the daemon's window as already acknowledged, or meet an earlier completion (AUD-29-21).
 /// `u32::MAX` is kept as the [`Session::next_sequence`] of a client that issued this one — a resume from it
@@ -836,23 +843,31 @@ impl Client {
     if !self.send(id, body)? {
       return Ok(None);
     }
-    match self.end.wait(Some(self.deadlines.reply_ns)) {
-      Ok(reply) => {
-        if reply.request != id.word() {
-          return Err(ClientError::UnexpectedReply {
-            verb: "another request's reply",
+    loop {
+      match self.end.wait(Some(self.deadlines.reply_ns)) {
+        Ok(reply) => {
+          if reply.request != id.word() {
+            return Err(ClientError::UnexpectedReply {
+              verb: "another request's reply",
+            });
+          }
+          return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
+        }
+        Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
+          self.reconnect()?;
+          return Ok(None);
+        }
+        // A verb whose reply the daemon defers until long work ends (a granted landing) is waited for
+        // while the daemon lives: its supervisor ends a daemon that stops answering, and the wait then ends
+        // as `DaemonGone` and a resend, never as a stall of work still running (AUD-29-25's sibling).
+        Err(IpcError::DeadlineExceeded) if defers_reply(body) => {}
+        Err(IpcError::DeadlineExceeded) => {
+          return Err(ClientError::Stalled {
+            after_ns: self.deadlines.reply_ns,
           });
         }
-        Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?))
+        Err(e) => return Err(ClientError::Ipc(e)),
       }
-      Err(IpcError::DeadlineExceeded) if self.end.daemon_gone() => {
-        self.reconnect()?;
-        Ok(None)
-      }
-      Err(IpcError::DeadlineExceeded) => Err(ClientError::Stalled {
-        after_ns: self.deadlines.reply_ns,
-      }),
-      Err(e) => Err(ClientError::Ipc(e)),
     }
   }
 

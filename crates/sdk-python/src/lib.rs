@@ -737,15 +737,28 @@ impl AsyncClient {
     begin: Begin,
     spin: impl FnOnce(&mut RustClient, RequestId, u64) -> PyResult<Option<PyObject>>,
   ) -> PyResult<(Ticket, Option<PyObject>)> {
+    self.begin_spin_with(begin, spin, false)
+  }
+
+  /// [`Self::begin_spin`], waiting for a deferred reply while the daemon lives when `patient` (a granted
+  /// landing; `slates_client::defers_reply`).
+  fn begin_spin_with(
+    &mut self,
+    begin: Begin,
+    spin: impl FnOnce(&mut RustClient, RequestId, u64) -> PyResult<Option<PyObject>>,
+    patient: bool,
+  ) -> PyResult<(Ticket, Option<PyObject>)> {
     if let Some(reason) = &self.broken {
       return Err(refusal(ClientError::CompletionLost {
         reason: reason.clone(),
       }));
     }
-    let ticket = self
-      .driver
-      .submit(&mut self.inner, begin)
-      .map_err(refusal)?;
+    let ticket = if patient {
+      self.driver.submit_patient(&mut self.inner, begin)
+    } else {
+      self.driver.submit(&mut self.inner, begin)
+    }
+    .map_err(refusal)?;
     self.inner.begin_ack_if_due().map_err(refusal)?;
     let Some(word) = self.driver.word_of(ticket) else {
       return Ok((ticket, None));
@@ -1258,7 +1271,7 @@ impl AsyncClient {
       include: include.unwrap_or_default(),
       exclude: exclude.unwrap_or_default(),
     };
-    let (ticket, fast) = slf.borrow_mut().begin_spin(
+    let (ticket, fast) = slf.borrow_mut().begin_spin_with(
       {
         let target = target.to_owned();
         Box::new(move |c: &mut RustClient| c.land_begin(id, snap, &target, filter.clone(), grant))
@@ -1270,6 +1283,7 @@ impl AsyncClient {
         };
         Ok(fast)
       },
+      grant.is_some(),
     )?;
     finish(&slf, ticket, fast, Decode::Landed)
   }

@@ -105,9 +105,17 @@ than the term skipped its remaining entries (`LeaseEnded`) and ended partial. No
 - **The p99/p999 shard-step distribution under a landing is not yet recorded.** It belongs with the R9
   provisioning histogram as a lane.
 
-## Siblings reported
+## A long landing's client (the same day)
 
-- **The synchronous client answers `Stalled` to any reply slower than the liveness budget (1 s),** including
-  a landing still at work. `slates land` of a large tree reports `Stalled` while the landing goes on. The
-  test waits the lease's term instead. The client needs a long-verb wait that the daemon's liveness, not a
-  fixed deadline, bounds.
+The synchronous client answered `Stalled` to any reply slower than the liveness budget (1 s), including a
+granted landing still at work, so `slates land` of a large tree reported `Stalled` while the landing went
+on. Now:
+- **The verbs.** A verb whose reply the daemon defers until long work ends (`defers_reply`: a granted
+  landing) is waited for while the daemon lives.
+- **The bound.** The daemon's supervisor ends a daemon that stops answering. The wait then ends as
+  `DaemonGone`, with a reconnect and a resend that rejoins the landing or reads its completion record.
+- **The async driver** takes such a call with `submit_patient`: its deadline asks the daemon's liveness and
+  restarts, never failing it. Both SDKs' `land` submit it patiently when it carries a grant.
+- **Evidence:** both landing tests use the product's default deadlines and pass, with landings of 1.18 s and
+  2.04 s. They failed `Stalled { after_ns: 1000000000 }` before.
+- **Owed:** the async driver's patient path has no long-landing test of its own yet.
