@@ -271,15 +271,9 @@ pub struct ShardState {
   /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
   /// emptied by that step; bounded by the partition's attachment cap.
   pub(crate) stale_fuse_mounts: Vec<(u64, String)>,
-  /// The read-only views of snapshots presented through host mounts, by attachment (AUD-29-76;
-  /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot mount.
+  /// The read-only views of snapshots presented through host mounts and guest devices, by attachment (AUD-29-76;
+  /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot attachment.
   pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,
-  /// The read-only views of snapshots presented to guest devices, by a key the shard assigns
-  /// (`next_guest_view`; AUD-29-76). Opened before a device's admission and closed at its loop's end, so
-  /// bounded by the shard's device limit (`clients_per_shard`) plus the admissions in flight.
-  pub(crate) guest_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,
-  /// The next key of [`Self::guest_views`]: counts up, never reused while the shard runs.
-  pub(crate) next_guest_view: u64,
   /// The guest devices this shard serves and the consumer each was admitted for (§4.6, §4.13; AUD-29-73), so a
   /// consumer's revocation reaches its devices. Bounded by the shard's device limit (`clients_per_shard`, the
   /// loop registry's bound): an entry is added when a loop registers and removed when it ends.
@@ -287,6 +281,7 @@ pub struct ShardState {
   pub(crate) guest_devices: Vec<(
     slates_bridge_virtiofs::serve::DeviceId,
     slates_db::catalog::Principal,
+    u64,
   )>,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,

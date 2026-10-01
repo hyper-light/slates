@@ -1932,7 +1932,12 @@ must exercise local communication and isolation between clones as well as namesp
 > rings, kicks and calls are configured by the protocol. Every request or feature not offered is refused typed.
 > Proven by a test front end speaking the real protocol, and by a live Linux guest under QEMU 10.0.13's
 > `vhost-user-fs-pci` mounting the tag and exchanging files with the host. Owed: the live guest in CI, §6's workloads in
-> the guest, and the durable guest record.
+> the guest.
+
+> **Status (2026-10-01, AUD-29-68: guest records).** A guest device is an attachment like any other. Its record
+> (consumer `Guest`, form `GuestTag`) is committed at admission and removed when the device ends. `status`
+> counts it, `detach` revokes its device, `advance` moves a snapshot device's view, and recovery ends the record
+> of a device that died with its daemon.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

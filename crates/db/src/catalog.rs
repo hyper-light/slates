@@ -344,6 +344,10 @@ pub enum Consumer {
     /// The owning host mount's attachment id.
     attachment: u64,
   },
+  /// A guest device (§4.6 virtio-fs; AUD-29-68): the harness's VMM, admitted for the authenticated consumer
+  /// the record's principal names. It ends with the device: the guest's hangup, a revocation, a detach, the
+  /// volume's destroy, and the daemon's process (recovery ends it, as it ends a FUSE mount). Appended.
+  Guest,
 }
 
 /// The form of an attachment. Append-only.
@@ -389,6 +393,14 @@ pub enum AttachForm {
     /// The directory's inode number: the mount's root.
     scope: u64,
   },
+  /// A guest device's tag (`mount -t virtiofs <tag>` in the guest), with the directory it presents when it
+  /// presents one (AUD-29-76). Appended.
+  GuestTag {
+    /// The tag.
+    tag: String,
+    /// The directory's inode number, when the device presents one directory.
+    scope: Option<u64>,
+  },
 }
 
 impl AttachForm {
@@ -399,7 +411,7 @@ impl AttachForm {
         Some(path)
       }
       Self::ScopedMount { mount_point, .. } => mount_point.as_deref(),
-      Self::Root | Self::Oci { .. } => None,
+      Self::Root | Self::Oci { .. } | Self::GuestTag { .. } => None,
     }
   }
 
@@ -407,6 +419,7 @@ impl AttachForm {
   pub fn scope(&self) -> Option<u64> {
     match self {
       Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
+      Self::GuestTag { scope, .. } => *scope,
       _ => None,
     }
   }

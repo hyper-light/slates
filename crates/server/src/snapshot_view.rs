@@ -24,8 +24,9 @@
 //! Moving. `advance` re-pins a mount to another snapshot (§4.4 `Bound → Advancing → Bound`): the new view is
 //! opened, the move recorded (`Op::AttachmentRepinned`, which moves the mount's container binds with it), the
 //! views swapped and the old closed, and the reply names the paths that differ
-//! (`Volume::paths_changed_between`). A guest device's view (`crate::virtiofs::GuestView`) is kept apart, in
-//! the shard's `guest_views`, opened and closed with the device; it has no record, so it does not move.
+//! (`Volume::paths_changed_between`). A guest device's view (`crate::virtiofs::GuestView`) is kept here too,
+//! under the device's attachment record (AUD-29-68), so `advance` moves it the same way; recovery ends a guest's
+//! record rather than rebuilding its view, since its device died with the process.
 
 use slates_db::catalog::{AttachmentRecord, Consumer, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{AttachTransport, NamePolicy, Refusal, SizeClass, UnsupportedReason};
@@ -148,7 +149,7 @@ pub(crate) fn end(state: &mut ShardState, attachment: u64) {
 }
 
 /// Ends every view of volume `origin`, a mount's or a guest device's (before its destroy, which frees the
-/// snapshots they pin). A guest device whose view is gone is answered `NotFound` from then on.
+/// snapshots they pin). A guest device whose view is gone is answered `NotFound` until its record's end revokes it.
 pub(crate) fn end_all_of(state: &mut ShardState, origin: DbVolumeId) {
   let attachments: Vec<u64> = state
     .snapshot_views
@@ -158,36 +159,6 @@ pub(crate) fn end_all_of(state: &mut ShardState, origin: DbVolumeId) {
     .collect();
   for attachment in attachments {
     end(state, attachment);
-  }
-  let guests: Vec<u64> = state
-    .guest_views
-    .iter()
-    .filter(|(_, view)| view.origin == origin)
-    .map(|(key, _)| *key)
-    .collect();
-  for key in guests {
-    end_guest(state, key);
-  }
-}
-
-/// Opens a view of `snapshot` of `origin` for a guest device: its key in the shard's guest views.
-pub(crate) fn open_guest(
-  state: &mut ShardState,
-  origin: DbVolumeId,
-  snapshot: SnapshotId,
-  names: NamePolicy,
-) -> Result<u64, Refusal> {
-  let view = open(state, origin, snapshot, names)?;
-  let key = state.next_guest_view;
-  state.next_guest_view = key.saturating_add(1);
-  state.guest_views.insert(key, view);
-  Ok(key)
-}
-
-/// Ends the guest view under `key`, if it is still open.
-pub(crate) fn end_guest(state: &mut ShardState, key: u64) {
-  if let Some(view) = state.guest_views.remove(&key) {
-    close(state, view);
   }
 }
 

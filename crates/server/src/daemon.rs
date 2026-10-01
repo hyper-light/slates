@@ -2046,8 +2046,7 @@ impl Daemon {
     self.observe(self.shards.get(usize::from(partition)).copied(), move |s| {
       let record = s.db.partition().volume_by_name(&name)?.clone();
       let token = verbs::mint_mount_token()?;
-      let attachment = verbs::attachment_id(s.partition, s.next_attachment);
-      s.next_attachment += 1;
+      let attachment = verbs::next_attachment_id(s);
       let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
       let op = slates_db::Op::AttachmentAdded {
         record: slates_db::catalog::AttachmentRecord {
@@ -2516,8 +2515,6 @@ fn init_shard(
     fuse_mounts: std::collections::BTreeMap::new(),
     stale_fuse_mounts: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
-    guest_views: std::collections::BTreeMap::new(),
-    next_guest_view: 0,
     #[cfg(unix)]
     guest_devices: Vec::new(),
     clock,

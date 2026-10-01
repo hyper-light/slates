@@ -268,6 +268,14 @@ pub(crate) fn attachment_id(partition: u16, counter: u64) -> u64 {
   (u64::from(partition) << ATTACHMENT_PARTITION_SHIFT) | counter
 }
 
+/// The next attachment id of this shard's partition, the counter advanced (saturating: a counter that reached
+/// its top keeps naming one id, which the catalog then refuses as existing rather than wrapping onto another).
+pub(crate) fn next_attachment_id(state: &mut ShardState) -> u64 {
+  let id = attachment_id(state.partition, state.next_attachment);
+  state.next_attachment = state.next_attachment.saturating_add(1);
+  id
+}
+
 /// Format: the low 48 bits of an attachment id — its per-partition counter (the bits below
 /// `ATTACHMENT_PARTITION_SHIFT`).
 const ATTACHMENT_COUNTER_MASK: u64 = (1 << ATTACHMENT_PARTITION_SHIFT) - 1;
@@ -4412,8 +4420,7 @@ fn attach(
       crate::transports::oci(&situation),
     ),
   };
-  let attachment = attachment_id(state.partition, state.next_attachment);
-  state.next_attachment += 1;
+  let attachment = next_attachment_id(state);
   let token = match capability_token(borrows_mount) {
     Ok(token) => token,
     Err(refusal) => return refused(refusal),
@@ -4948,8 +4955,16 @@ pub(crate) fn end_attachment(
     now,
   )?;
   crate::merge_service::forget_attachment(state, record.id);
-  // A host mount of a snapshot releases its view, unpinning the snapshot (AUD-29-76).
-  crate::snapshot_view::end(state, record.id);
+  // A guest device's record ends its device: the loop is asked to revoke and runs its terminal step, which
+  // sweeps the device's references through its view and only then closes it (AUD-29-68).
+  #[cfg(unix)]
+  let a_device_closes_the_view = crate::virtiofs::revoke_attachment_device(state, record.id);
+  #[cfg(not(unix))]
+  let a_device_closes_the_view = false;
+  // A snapshot attachment with no live device releases its view now, unpinning the snapshot (AUD-29-76).
+  if !a_device_closes_the_view {
+    crate::snapshot_view::end(state, record.id);
+  }
   // A FUSE mount of the attachment is unmounted; the kernel's disconnect ends its serve task.
   #[cfg(target_os = "linux")]
   crate::fuse::unmount_if_mounted(state, record.id);
@@ -7364,9 +7379,10 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
       None => *state.refusals.entry(VOLUME_EPOCH_EXHAUSTED).or_insert(0) += 1,
     }
   }
-  // An SDK's record and a FUSE mount both die with the process: the SDK's client attaches again, and a FUSE
-  // mount's device was the killed process's own (AUD-29-64), so its dead mount is unmounted once this shard
-  // runs (`fuse::unmount_stale`), the kernel's table confirming the mount is the one the record names.
+  // An SDK's record, a FUSE mount and a guest device all die with the process: the SDK's client attaches again,
+  // a FUSE mount's device was the killed process's own (AUD-29-64), so its dead mount is unmounted once this
+  // shard runs (`fuse::unmount_stale`), the kernel's table confirming the mount is the one the record names;
+  // and a guest device's loop and seam were the process's own (AUD-29-68), so its harness attaches again.
   let attached: Vec<u64> = state
     .db
     .partition()
@@ -7377,7 +7393,7 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         state.stale_fuse_mounts.push((a.id, path.to_owned()));
         return true;
       }
-      matches!(a.consumer, Consumer::Sdk { .. })
+      matches!(a.consumer, Consumer::Sdk { .. } | Consumer::Guest)
     })
     .map(|a| a.id)
     .collect();

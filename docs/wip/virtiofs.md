@@ -207,7 +207,9 @@ box shared with two other builds — timings are not benchmarks)
 > **2026-10-01 (AUD-29-68):** item 1's inherited-descriptor half is built — `src/vhost_user.rs`, the vhost-user back
 > end, Linux, proven by a test front end over a socketpair with a sealed memfd and eventfds
 > (`crates/server/tests/virtiofs.rs`). Still owed from item 1: the in-process libkrun seam and a live guest
-> (QEMU `vhost-user-fs-pci,chardev=c` with `-chardev socket,id=c,fd=N`). Item 2's durable record remains.
+> (QEMU `vhost-user-fs-pci,chardev=c` with `-chardev socket,id=c,fd=N`; since run locally, 2026-10-01).
+> Item 2's durable record: built 2026-10-01 (`Consumer::Guest`, `AttachForm::GuestTag`). The transport report on
+> the `attach`/`status` wire predates it.
 
 1. **A real VMM binding.** In-process (Hecate's libkrun, the reference): a `VmmSeam` over
    libkrun's device-backend interface — guest memory as the mapping libkrun hands the backend,

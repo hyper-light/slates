@@ -53,8 +53,7 @@ use slates_wire::request::RequestId;
 use crate::error::{refusal_of_db, refusal_of_vfs};
 use crate::state::ShardState;
 use crate::verbs::{
-  attachment_id, core_snapshot, find, forbidden, refused, rights_of, to_db_snapshot, to_db_volume,
-  wire_id,
+  core_snapshot, find, forbidden, refused, rights_of, to_db_snapshot, to_db_volume, wire_id,
 };
 
 /// The merge plane's per-shard state (§4.16): one field on [`ShardState`], so the join with the
@@ -575,8 +574,7 @@ pub(crate) fn attach_green(
       reason: "secure random unavailable for the mount capability token".to_owned(),
     });
   };
-  let attachment = attachment_id(state.partition, state.next_attachment);
-  state.next_attachment += 1;
+  let attachment = crate::verbs::next_attachment_id(state);
   let now = state.clock.monotonic_ns();
   let op = Op::AttachmentAdded {
     record: AttachmentRecord {

@@ -970,9 +970,12 @@ fn attach_vhost(
       slates_bridge_virtiofs::device::FsTag::new("slates").unwrap(),
       slates_server::virtiofs::GuestView::default(),
       (socket, handshake_ns),
-      Box::new(move |outcome| {
-        let _ = end_tx.send(outcome);
-      }),
+      slates_server::virtiofs::GuestHarness {
+        on_admitted: Box::new(|_| {}),
+        on_end: Box::new(move |outcome| {
+          let _ = end_tx.send(outcome);
+        }),
+      },
     )
     .unwrap();
   end_rx
@@ -1280,4 +1283,245 @@ fn a_vhost_user_front_end_sending_back_to_back_has_each_descriptor_kept_with_its
   drop(front);
   drop(client);
   drop(daemon);
+}
+
+/// The volume's attachment count as `status` reports it.
+fn attachments_of(client: &mut Client, volume: slates_ipc::protocol::VolumeId) -> u32 {
+  let ReplyBody::Status { report } = client.call(&RequestBody::Status { volume }) else {
+    panic!("status");
+  };
+  report.attachments
+}
+
+/// Through the owner's NFS mount of volume `name`: `f` holding three bytes, a snapshot, five bytes, a snapshot,
+/// seven bytes. The two snapshots.
+fn three_versions_of_f(
+  daemon: &Daemon,
+  client: &mut Client,
+  id: slates_ipc::protocol::VolumeId,
+  name: &str,
+) -> [slates_ipc::protocol::SnapshotId; 2] {
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability(name).unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = common::nfs::create(&mut stream, &root, "f", 2);
+  let mut snapshots = Vec::new();
+  for (xid, bytes) in [(3, &b"one"[..]), (4, b"three")] {
+    common::nfs::write(&mut stream, &file, bytes, xid);
+    let ReplyBody::Snapshotted { id: snapshot, .. } =
+      client.call(&RequestBody::Snapshot { volume: id })
+    else {
+      panic!("snapshot");
+    };
+    snapshots.push(snapshot);
+  }
+  common::nfs::write(&mut stream, &file, b"seven!!", 5);
+  snapshots.try_into().unwrap()
+}
+
+/// Waits on the guest's side (the owning shard's thread) until `signal` arrives, a heartbeat at a time.
+async fn until(signal: std::sync::mpsc::Receiver<()>) {
+  while signal.try_recv().is_err() {
+    slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS)
+      .await
+      .unwrap();
+  }
+}
+
+/// The guest's script: `f`'s size at its root, reported; after `advanced`, the size again, reported; after
+/// `detached`, a GETATTR submitted and kicked, and whether it was answered within five heartbeats.
+fn advance_and_detach_script(
+  sizes: std::sync::mpsc::Sender<u64>,
+  advanced: std::sync::mpsc::Receiver<()>,
+  detached: std::sync::mpsc::Receiver<()>,
+) -> impl FnOnce(
+  std::os::fd::OwnedFd,
+  std::os::fd::OwnedFd,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+  move |kick_write, call_read| {
+    Box::pin(async move {
+      // EntryOut: nodeid, generation, two validities, two nanosecond words, then fuse_attr: ino, size.
+      let size_at = |reply: &[u8]| u64_at(reply, OUT_HEADER_LEN + 48);
+      let first = round_trip(&kick_write, &call_read, &lookup_message(1, 1, "f")).await;
+      let _ = sizes.send(size_at(&first));
+      until(advanced).await;
+      let second = round_trip(&kick_write, &call_read, &lookup_message(2, 1, "f")).await;
+      let _ = sizes.send(size_at(&second));
+      until(detached).await;
+      common::guest::with_guest(|g| {
+        g.submit(&getattr_message(3, 1), common::guest::REPLY_CAP);
+      });
+      let _ = rustix::io::write(&kick_write, &[1u8]);
+      slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS * REVOKED_WATCH_HEARTBEATS)
+        .await
+        .unwrap();
+      let answered = common::guest::with_guest(|g| g.reap()).is_some();
+      drop(kick_write);
+      answered
+    })
+  }
+}
+
+/// AUD-29-68 (the guest's durable record). Do: write `f` at three, five and seven bytes with a snapshot after the
+/// first two; attach a guest device presenting the first snapshot; read `status`; look `f` up in the guest;
+/// `advance` the device's attachment to the second snapshot and look `f` up again; `detach` the attachment and
+/// send the guest one more request; destroy both snapshots. Expect: the harness learns the device's record id;
+/// `status` counts it while it lives; the guest sees three bytes, then five after the advance, which names
+/// `/f`; the detach ends the device (`Revoked`, references swept) and its request goes unanswered; `status`
+/// counts it no longer; both snapshots are then destroyable (no view pins them). Before 2026-10-01 a guest
+/// device had no record: `status` could not see it, `detach` could not end it and its view could not move.
+#[test]
+fn a_guest_device_is_recorded_its_snapshot_view_advances_and_its_detach_ends_it() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-recorded");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("recorded")) else {
+    panic!("the volume was not created");
+  };
+  let [first, second] = three_versions_of_f(&daemon, &mut client, id, "recorded");
+  let before = attachments_of(&mut client, id);
+  let (sizes_tx, sizes) = channel::<u64>();
+  let (advanced_tx, advanced_rx) = channel::<()>();
+  let (detached_tx, detached_rx) = channel::<()>();
+  let guest = common::guest::start_guest(
+    &daemon,
+    id,
+    Principal::Uid { uid: my_uid() },
+    slates_server::virtiofs::GuestView {
+      subtree: None,
+      snapshot: Some(first),
+    },
+    advance_and_detach_script(sizes_tx, advanced_rx, detached_rx),
+  );
+  let attachment = guest
+    .admitted
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device was admitted");
+  assert_eq!(
+    attachments_of(&mut client, id),
+    before + 1,
+    "the device is recorded"
+  );
+  assert_the_view_advances(&mut client, attachment, second, (&sizes, advanced_tx));
+  assert_the_detach_ends_the_device(&mut client, attachment, &guest, detached_tx);
+  assert_eq!(attachments_of(&mut client, id), before);
+  for snapshot in [first, second] {
+    assert!(matches!(
+      client.call(&RequestBody::DestroySnapshot {
+        volume: id,
+        snapshot
+      }),
+      ReplyBody::SnapshotDestroyed
+    ));
+  }
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-68 (a guest's record outlives a dead daemon only until recovery). Do: under a daemon whose anchor
+/// segment the test holds, attach a guest device and wait for its record; stop the daemon with the device still
+/// attached (its loop is dropped unended, as a crash drops it; a stop publishes nothing); start a second daemon
+/// over the same segment and read `status`. Expect: the first daemon counts the device; the second counts it no
+/// longer — its device and seam were the dead process's own, so recovery ended the record rather than leaving
+/// an attachment nothing serves.
+#[test]
+fn a_dead_daemons_guest_record_is_ended_by_recovery() {
+  use common::anchor::{anchor_segment, source_of};
+  let profile = common::machine_profile();
+  let instance = format!("srv-guest-recorded-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("guest-recorded", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("orphaned")) else {
+    panic!("the volume was not created");
+  };
+  let before = attachments_of(&mut client, id);
+  let (_never, waits) = channel::<()>();
+  let guest = common::guest::start_guest(
+    &first,
+    id,
+    Principal::Uid { uid: my_uid() },
+    slates_server::virtiofs::GuestView::default(),
+    move |kick_write, _call_read| {
+      Box::pin(async move {
+        until(waits).await;
+        drop(kick_write);
+      })
+    },
+  );
+  guest
+    .admitted
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device was admitted");
+  assert_eq!(attachments_of(&mut client, id), before + 1);
+  drop(client);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let mut client = Client::connect(&instance);
+  assert_eq!(
+    attachments_of(&mut client, id),
+    before,
+    "recovery ended the dead device's record"
+  );
+  drop(client);
+  second.stop();
+  drop(segment);
+}
+
+/// The guest reads three bytes at the first snapshot; `advance` to `second` names `/f` alone; the guest then
+/// reads five.
+fn assert_the_view_advances(
+  client: &mut Client,
+  attachment: u64,
+  second: slates_ipc::protocol::SnapshotId,
+  (sizes, advanced): (&std::sync::mpsc::Receiver<u64>, std::sync::mpsc::Sender<()>),
+) {
+  assert_eq!(sizes.recv_timeout(common::guest::WAIT), Ok(3));
+  let moved = client.call(&RequestBody::Advance {
+    attachment,
+    version: Some(second.value),
+  });
+  assert_eq!(
+    moved,
+    ReplyBody::Advanced {
+      version: second.value,
+      invalidated: vec!["/f".to_owned()],
+    }
+  );
+  let _ = advanced.send(());
+  assert_eq!(
+    sizes.recv_timeout(common::guest::WAIT),
+    Ok(5),
+    "the view moved"
+  );
+}
+
+/// `detach` of the device's record ends the device: its next request goes unanswered and its loop ends
+/// `Revoked` with its references swept.
+fn assert_the_detach_ends_the_device(
+  client: &mut Client,
+  attachment: u64,
+  guest: &common::guest::StartedGuest<bool>,
+  detached: std::sync::mpsc::Sender<()>,
+) {
+  assert_eq!(
+    client.call(&RequestBody::Detach { attachment }),
+    ReplyBody::Detached
+  );
+  let _ = detached.send(());
+  assert_eq!(
+    guest.script.recv_timeout(common::guest::WAIT),
+    Ok(false),
+    "no request answered after the detach"
+  );
+  let Ok(GuestDeviceOutcome::Ended(end)) = guest.end.recv_timeout(common::guest::WAIT) else {
+    panic!("the device did not end");
+  };
+  assert_eq!(end.why, EndReason::Revoked);
+  assert!(end.reclaimed.as_ref().is_ok_and(|r| r.references_swept));
 }

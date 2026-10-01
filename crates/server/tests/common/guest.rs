@@ -360,6 +360,8 @@ pub(crate) struct StartedGuest<R> {
   pub(crate) script: Receiver<R>,
   /// The device loop's outcome, once it ended.
   pub(crate) end: Receiver<GuestDeviceOutcome>,
+  /// The device's attachment record id, once it was admitted and recorded.
+  pub(crate) admitted: Receiver<u64>,
 }
 
 /// Attaches a guest device as `consumer` to `volume` and starts `script` as the guest on the owning shard,
@@ -379,6 +381,7 @@ pub(crate) fn start_guest<R: Send + 'static>(
   let (kick_read, kick_write) = pipe();
   let (call_read, call_write) = pipe();
   let (end_tx, end_rx) = channel::<GuestDeviceOutcome>();
+  let (admitted_tx, admitted_rx) = channel::<u64>();
   let (script_tx, script_rx) = channel::<R>();
   daemon
     .attach_guest_device(
@@ -391,9 +394,14 @@ pub(crate) fn start_guest<R: Send + 'static>(
         consumer,
         memory: SharedGuestMemory,
       },
-      Box::new(move |outcome| {
-        let _ = end_tx.send(outcome);
-      }),
+      slates_server::virtiofs::GuestHarness {
+        on_admitted: Box::new(move |attachment| {
+          let _ = admitted_tx.send(attachment);
+        }),
+        on_end: Box::new(move |outcome| {
+          let _ = end_tx.send(outcome);
+        }),
+      },
     )
     .unwrap();
   daemon
@@ -405,6 +413,7 @@ pub(crate) fn start_guest<R: Send + 'static>(
   StartedGuest {
     script: script_rx,
     end: end_rx,
+    admitted: admitted_rx,
   }
 }
 
