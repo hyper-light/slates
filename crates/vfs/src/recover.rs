@@ -51,9 +51,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// (§4.5, 2026-09-26) each inode's extended-attribute table and, for an attribute inode, its owner;
 /// 6 (§4.6) each inode's AppleDouble working copy; 7 (A-48, 2026-09-30) the base plane's witness,
 /// home, whiteout and redirect tables with every version a snapshot still reads; 8 (AUD-29-59, 2026-09-30)
-/// the shard's held replicas, so a content acknowledgement survives a warm restart.
-/// Format: the image layout version, bumped with any change to the types below.
-const IMAGE_VERSION: u16 = 8;
+/// the shard's held replicas, so a content acknowledgement survives a warm restart; 9 (AUD-29-55,
+/// 2026-10-01) the held replicas' transfers in progress (stages), so a cut transfer resumes from its
+/// verified chunks after a warm restart.
+/// Format: the image layout version, bumped with any change to the types below or to the held replicas'
+/// image they carry.
+const IMAGE_VERSION: u16 = 9;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]

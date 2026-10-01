@@ -79,7 +79,8 @@ use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
 use slates_cluster::config_group::ReportOutcome;
 use slates_cluster::content::{
-  CONTENT_PUT_STREAM, ContentMessage, fetch_content, is_content_stream, put_content,
+  CONTENT_CHUNK_STREAM, CONTENT_OFFER_STREAM, ContentMessage, fetch_content, is_content_stream,
+  put_content,
 };
 use slates_cluster::coordinates::{CoordinateEngine, NetworkCoordinate};
 use slates_cluster::detector::{Detector, DetectorTiming};
@@ -2661,8 +2662,11 @@ async fn serve_peer_records(
             .unwrap_or_default(),
             stream if is_content_stream(stream) => state::with_state(|s| {
               // A test's injected placement refusal (§4.16 placed-before-reference): a holder that
-              // refuses every content put, counted, so an owner's record is shown to wait on it.
-              if s.merge.fault.refuse_content_puts && stream == CONTENT_PUT_STREAM {
+              // refuses every content placement — its offers and its chunks, since a complete stage
+              // acknowledges at the offer (AUD-29-55) — counted, so an owner's record is shown to wait on it.
+              if s.merge.fault.refuse_content_puts
+                && (stream == CONTENT_OFFER_STREAM || stream == CONTENT_CHUNK_STREAM)
+              {
                 *s.refusals
                   .entry(crate::merge_service::CONTENT_PUT_REFUSED)
                   .or_insert(0) += 1;

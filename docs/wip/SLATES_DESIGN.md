@@ -3519,7 +3519,11 @@ instructions everywhere on the matrix), BLAKE3 identity on bulk chunks (already 
 the rule of §4.8: f+1 first, hedged to the rest of the 2f+1 after the measured p95, committed at
 f+1 acknowledgements from any, the acknowledging set recorded in the head record; a chunk
 already present on a candidate is never transferred again (the receiver reports its missing
-set); anti-entropy walks Merkle manifests between recorded holders and repairs only differing
+set); a transfer is resumable (A-54): the offer stages the manifest on the holder, chunks travel
+one per exchange and are verified and kept in that stage, the chunk completing the closure draws
+the acknowledgement, and a cut transfer's next offer names exactly the verified chunks still owed;
+each holder's offer and transfer progress independently, with no wait on the slowest offer;
+anti-entropy walks Merkle manifests between recorded holders and repairs only differing
 subtrees; the healer replays puts that never reached f+1 from the owner's `put_wal`, and puts a
 repeatedly late candidate on probation for the group to replace. Cold sealed content (a
 measured class by read rate, Phase 8) may be held as k+m fragments across k+m candidates instead
@@ -7658,5 +7662,25 @@ vfs, cluster and server crates.
   snapshot, the hostile-input refusals, the in-process rebuild oracle, and the three-daemon takeover over
   NFS (red with the attribute restore disabled, green with it).
 - What it does not change: the bridges' own time surfaces (WinFsp's creation time is a reported sibling),
+
+### A-54 — Content transfers resume from verified chunks, and holders progress independently (2026-10-01)
+Applied in the same change to: §4.10 "Content replication", GAPS (AUD-29-55–58), the shard image version (9),
+and `docs/bugs/2026-10-01-a-cut-transfer-lost-its-progress-and-puts-waited-on-the-slowest-offer.md`.
+- Why: a put was one whole archive verified after its last byte, so a cut transfer lost everything it had
+  carried (AUD-29-55), and every put waited for every offer, so one slow offer delayed a fast holder that could
+  place at once and hid the delay from the hedge's p95 (AUD-29-58). §4.9 already asked for "verified ranges and
+  resumable progress".
+- The rule: an offer carries the manifest and opens (or resumes) the object's **stage** on the holder; chunks
+  travel one per exchange, as many in flight as the peer's stream credit allows, each verified and kept; the
+  chunk that completes the closure draws the bound acknowledgement, and nothing short of the closure is ever
+  acknowledged. A stage is charged like held content, one per object, released by events (promotion, a newer
+  placement, the retention rule), and rides the shard's image at each publish. The owner starts each holder's
+  transfer the moment that holder's missing set arrives; each transfer has its own span, so the round is
+  bounded by one offer span plus one transfer span.
+- Evidence: the transfer oracle (a census of 16 transfer cases over generated histories, a mutation that drops
+  resumed progress failing it), the daemon tests cutting after every chunk and abandoning a transfer, and the
+  simulated barrier test (the fast holder places inside the offer span while the slow offer is unanswered).
+- What it does not change: fetch is still whole-archive (owed, AUD-29-55's second half); the collector still
+  polls its channels on the budget's interval; R1–R10.
   the merge engine's metadata dimension, R1–R10.
 

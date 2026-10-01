@@ -347,3 +347,191 @@ fn a_silent_holder_expires_without_placing_and_returns_its_session() {
   assert_eq!(observed.reusable + observed.late.len(), 1);
   assert!(observed.complete);
 }
+
+/// Shape: the collector polls the barrier test makes per collection span — fine enough that an offer, a
+/// chunk and their replies (a few polls) fit inside one offer span, so the poll quantum does not decide
+/// whether the fast holder beat the slow offer's timeout.
+const POLLS_PER_SPAN: u64 = 4;
+
+/// Shape: the stalled holder of the barrier test, distinct from [`HOLDER`] (the fast one).
+const SLOW: HostId = HostId(3);
+
+/// Runs a holder at `delay_ns` before it serves: an offer then the chunk, each bounded; reports whether it
+/// held the archive.
+fn spawn_holder(
+  simulation: &mut SimRuntime,
+  shard: slates_rt::ShardId,
+  (holder_identity, owner_certificate): (Identity, rustls::pki_types::CertificateDer<'static>),
+  (holder_tx, owner_rx): (
+    std::sync::mpsc::Sender<SocketAddrV4>,
+    Receiver<SocketAddrV4>,
+  ),
+  delay_ns: u64,
+  held_tx: std::sync::mpsc::Sender<bool>,
+) {
+  simulation
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      holder_tx.send(socket.local_addr().unwrap()).unwrap();
+      let owner_address = address_from(owner_rx).await;
+      let mut endpoint = Endpoint::server(
+        socket,
+        owner_address,
+        &holder_identity,
+        &[owner_certificate],
+        slates_transport::connection::ConnectionShape::for_frame_cap(
+          slates_transport::endpoint::MAX_PACKET_PAYLOAD,
+          CONTENT_RECEIVE_CEILING,
+        ),
+      )
+      .unwrap();
+      endpoint.establish().await.unwrap();
+      slates_rt::futures::sleep(delay_ns).await.unwrap();
+      let mut held = ContentHold::new();
+      let mut room = Room::new();
+      for _ in ["offer", "chunk"] {
+        if !serve_bounded(&mut endpoint, &mut held, &mut room).await {
+          break;
+        }
+      }
+      let _ = settle_within(&mut endpoint, COLLECTION_NS * 2).await;
+      held_tx
+        .send(held.holds_manifest_for_any_object(&archive().manifest_identity()))
+        .unwrap();
+    })
+    .unwrap();
+}
+
+/// An owner endpoint dialled to the holder whose address arrives on `holder_rx`, its own address sent on
+/// `owner_tx`.
+async fn dial(
+  owner_identity: &Identity,
+  holder_certificate: &rustls::pki_types::CertificateDer<'static>,
+  owner_tx: std::sync::mpsc::Sender<SocketAddrV4>,
+  holder_rx: Receiver<SocketAddrV4>,
+) -> Endpoint {
+  let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+  owner_tx.send(socket.local_addr().unwrap()).unwrap();
+  let holder_address = address_from(holder_rx).await;
+  let mut endpoint = Endpoint::client(
+    socket,
+    holder_address,
+    owner_identity,
+    holder_certificate,
+    NAME,
+    slates_transport::connection::ConnectionShape::for_frame_cap(
+      slates_transport::endpoint::MAX_PACKET_PAYLOAD,
+      CONTENT_RECEIVE_CEILING,
+    ),
+  )
+  .unwrap();
+  endpoint.establish().await.unwrap();
+  endpoint
+}
+
+/// AUD-29-58 (§4.8 hedged placement): one acknowledgement still needed, two offers outstanding, one holder
+/// stalled. Do: put to a fast holder and to one that waits four collection spans before answering anything,
+/// under a hard budget whose span is two collection spans. Expect the placement to complete with the fast
+/// holder before the slow offer times out (inside the offer span) — the fast holder's chunk went out and came
+/// back while the slow offer was still unanswered — and the slow holder never counted. Until 2026-10-01 every
+/// put waited for every offer, so the fast holder's put left only once the slow offer had timed out, at the
+/// end of the offer span.
+#[test]
+fn a_fast_holder_places_while_a_slow_offer_is_outstanding() {
+  let stall_ns = COLLECTION_NS * 4;
+  let budget = CommitBudget::hard(COLLECTION_NS * 2, COLLECTION_NS / POLLS_PER_SPAN);
+  let mut simulation = SimRuntime::new(&config(), 1).unwrap();
+  let shard = simulation.shard_ids()[0];
+  let owner_identity = identity();
+  let (fast_identity, slow_identity) = (identity(), identity());
+  let (fast_certificate, slow_certificate) =
+    (fast_identity.certificate(), slow_identity.certificate());
+  let (fast_to_owner, owner_from_fast) = channel();
+  let (owner_to_fast, fast_from_owner) = channel();
+  let (slow_to_owner, owner_from_slow) = channel();
+  let (owner_to_slow, slow_from_owner) = channel();
+  let (fast_held_tx, fast_held_rx) = channel();
+  let (slow_held_tx, slow_held_rx) = channel();
+  spawn_holder(
+    &mut simulation,
+    shard,
+    (fast_identity, owner_identity.certificate()),
+    (fast_to_owner, fast_from_owner),
+    0,
+    fast_held_tx,
+  );
+  spawn_holder(
+    &mut simulation,
+    shard,
+    (slow_identity, owner_identity.certificate()),
+    (slow_to_owner, slow_from_owner),
+    stall_ns,
+    slow_held_tx,
+  );
+  let (placed_tx, placed_rx) = channel();
+  simulation
+    .spawn_on(shard, async move {
+      let fast = dial(
+        &owner_identity,
+        &fast_certificate,
+        owner_to_fast,
+        owner_from_fast,
+      )
+      .await;
+      let slow = dial(
+        &owner_identity,
+        &slow_certificate,
+        owner_to_slow,
+        owner_from_slow,
+      )
+      .await;
+      let started = slates_rt::futures::now_ns();
+      let placed = put_content(
+        OWNER,
+        &archive(),
+        ObjectId::new(OWNER, 1),
+        1,
+        &[OWNER, HOLDER, SLOW],
+        Quorum { f: 1 },
+        vec![(HOLDER, fast), (SLOW, slow)],
+        budget,
+      )
+      .await;
+      let returned_after = slates_rt::futures::now_ns().saturating_sub(started);
+      let mut placed = placed;
+      slates_rt::futures::sleep(stall_ns + budget.max_deadline_ns() * 2)
+        .await
+        .unwrap();
+      let _ = placed.stragglers.recover();
+      placed_tx
+        .send((
+          placed.outcome.map_err(|error| error.to_string()),
+          placed.latencies_ns,
+          returned_after,
+        ))
+        .unwrap();
+    })
+    .unwrap();
+  simulation.run_until_idle();
+  let (outcome, latencies, returned_after) = placed_rx.try_recv().unwrap();
+  let placement = outcome.expect("the fast holder places the content");
+  assert!(placement.placed(Quorum { f: 1 }));
+  assert!(placement.acked.contains(&HOLDER));
+  assert!(
+    !placement.acked.contains(&SLOW),
+    "the stalled holder never counted"
+  );
+  let fast_latency = latencies
+    .iter()
+    .find(|(host, _)| *host == HOLDER)
+    .map(|(_, latency)| *latency)
+    .expect("the fast holder's latency is recorded");
+  let offer_span_ns = budget.max_deadline_ns();
+  assert!(
+    fast_latency < offer_span_ns && returned_after < offer_span_ns,
+    "placed before the slow offer timed out: fast ack at {fast_latency} ns, returned at {returned_after} ns, \
+     offer span {offer_span_ns} ns"
+  );
+  assert_eq!(fast_held_rx.try_recv(), Ok(true));
+  let _ = slow_held_rx.try_recv();
+}

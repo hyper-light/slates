@@ -437,6 +437,8 @@ pub struct ReplicaAccount {
   pub manifests: usize,
   /// The puts refused because the shard could not admit them.
   pub refused_capacity: u64,
+  /// The transfers in progress (stages, AUD-29-55).
+  pub stages: usize,
   /// The bytes the shard's budget may still admit.
   pub admittable: u64,
 }
@@ -1694,6 +1696,7 @@ impl Daemon {
       index: s.held_content.index_bytes(),
       manifests: s.held_content.manifest_count(),
       refused_capacity: s.held_content.refused_capacity(),
+      stages: s.held_content.stage_count(),
       admittable: s.store.budget.admittable(),
     })
   }

@@ -356,7 +356,7 @@ pub struct Reply(pub HostId, pub TimedReply, pub Box<Endpoint>);
 /// reply itself is not folded (the dispatch already resolved without it); a commit re-ships to that holder
 /// next period over the recovered session, idempotently. Empty when nothing was dispatched.
 pub struct Stragglers {
-  // At most two exchanges per dispatch: content offers followed by puts. All other
+  // At most two channels per dispatch: content offers and the chunk transfers they start. All other
   // dispatches use only the first slot; no user-scaled channel list is retained.
   replies: [Option<std::sync::mpsc::Receiver<Reply>>; 2],
 }
@@ -376,8 +376,8 @@ impl Stragglers {
     }
   }
 
-  /// Content has two exchanges. An offer still in flight when collection stops
-  /// returns its session here alongside put acknowledgements (§4.10).
+  /// Content has two channels. An offer still in flight when collection stops returns its session here
+  /// alongside the chunk transfers it started (§4.10; AUD-29-55).
   pub(crate) fn two_rounds(
     offers: std::sync::mpsc::Receiver<Reply>,
     puts: std::sync::mpsc::Receiver<Reply>,
@@ -554,17 +554,13 @@ pub async fn broadcast(
   (replies, Stragglers::pending(rx))
 }
 
-/// What a quorum collection gathered: the replying holders' endpoints for reuse, whether the deadline
-/// was reached, and the **latency** of every binding acknowledgement — the time from the round's
-/// dispatch to that holder's acknowledgement, the reading the design's hedge trigger is measured from
-/// (§4.8 "hedge delay = measured p95 put latency per class").
+/// What a quorum collection gathered: the replying holders' endpoints for reuse, and whether the deadline
+/// was reached.
 pub(crate) struct Collected {
   /// The replying holders' endpoints, for reuse.
   pub reusable: Vec<(HostId, Endpoint)>,
   /// Whether the budget's deadline was reached before the quorum.
   pub timed_out: bool,
-  /// Each binding acknowledgement's holder and its latency in nanoseconds since the dispatch.
-  pub latencies_ns: Vec<(HostId, u64)>,
 }
 
 /// Collects replies until quorum or the deadline: records into `acked` each reply from a distinct
@@ -584,7 +580,6 @@ pub(crate) async fn collect_bound(
   mut binds: impl FnMut(HostId, &[u8]) -> bool,
 ) -> Collected {
   let mut reusable: Vec<(HostId, Endpoint)> = Vec::new();
-  let mut latencies_ns = Vec::new();
   let mut timed_out = false;
   let mut wait = DispatchWait::new(budget, dispatched_ns);
   while !shape.placed_with(acked, quorum) {
@@ -593,7 +588,6 @@ pub(crate) async fn collect_bound(
         reusable.push((host, *endpoint));
         if shape.candidates.contains(&host) && !acked.contains(&host) && binds(host, &reply.bytes) {
           acked.push(host);
-          latencies_ns.push((host, now_ns().saturating_sub(dispatched_ns)));
         }
       }
       // Nothing to receive: park a poll interval and let the progress-extension policy decide whether a
@@ -614,7 +608,6 @@ pub(crate) async fn collect_bound(
   Collected {
     reusable,
     timed_out,
-    latencies_ns,
   }
 }
 
@@ -747,7 +740,6 @@ pub async fn commit_record_on(
   let Collected {
     reusable,
     timed_out,
-    latencies_ns: _,
   } = collect_bound(
     &mut rx,
     placement,

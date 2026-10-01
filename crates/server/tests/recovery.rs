@@ -448,18 +448,274 @@ fn replica_archive(bytes: &[u8]) -> slates_archive::Archive {
   }
 }
 
-/// The encoded put of `archive` for `object` at `sequence`.
-fn replica_put(
+/// Places `archive` for `object` at `sequence` on `daemon` through the holder's production path, as an owner
+/// does (AUD-29-55): the offer, then one chunk exchange per chunk the reply names. Returns the last reply —
+/// the acknowledgement when the placement completed, else whatever the holder answered.
+fn place_replica(
+  daemon: &Daemon,
   object: slates_db::register::ObjectId,
   sequence: u64,
   archive: &slates_archive::Archive,
 ) -> Vec<u8> {
-  slates_cluster::content::ContentMessage::Put {
-    object,
-    sequence,
-    archive: archive.encode(),
+  use slates_cluster::content::{ContentMessage, chunk_requests, offer_request};
+  let reply = daemon
+    .serve_content_as_authorized(offer_request(archive, object, sequence))
+    .unwrap();
+  let Ok(ContentMessage::Missing { missing, .. }) = ContentMessage::decode(&reply) else {
+    return reply;
+  };
+  let mut last = reply;
+  for request in chunk_requests(archive, object, sequence, &missing) {
+    last = daemon.serve_content_as_authorized(request).unwrap();
   }
-  .encode()
+  last
+}
+
+/// An archive of one file per entry of `pieces`, each piece one raw chunk — a placement of as many chunks.
+fn pieces_archive(pieces: &[Vec<u8>]) -> slates_archive::Archive {
+  use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
+  let chunks: Vec<_> = pieces
+    .iter()
+    .map(|piece| Archive::raw_chunk(piece.clone()))
+    .collect();
+  let entries = chunks
+    .iter()
+    .enumerate()
+    .map(|(at, chunk)| Entry {
+      name: format!("f{at}"),
+      meta: NodeMeta {
+        size: chunk.raw_len,
+        ..NodeMeta::default()
+      },
+      node: Node::File(vec![Extent {
+        offset: 0,
+        len: chunk.raw_len,
+        chunk: chunk.identity,
+        chunk_offset: 0,
+      }]),
+    })
+    .collect();
+  Archive {
+    manifest: Node::Directory(entries),
+    chunks,
+    ..replica_archive(BEFORE)
+  }
+}
+
+/// Shape: the chunks of the cut-transfer placements — the fewest with a cut strictly inside the transfer
+/// after more than one chunk (cuts after 0, 1, 2 and all 3 chunks).
+const TRANSFER_CHUNKS: usize = 3;
+
+/// The pieces of placement `tag`: [`TRANSFER_CHUNKS`] distinct chunks of one length, so placements with
+/// different tags share no chunk and take equal charges.
+fn tagged_pieces(tag: u8) -> Vec<Vec<u8>> {
+  (0..TRANSFER_CHUNKS)
+    .map(|at| {
+      let mut piece = BEFORE.to_vec();
+      piece.push(tag);
+      piece.push(u8::try_from(at).unwrap());
+      piece
+    })
+    .collect()
+}
+
+/// What the holder answered, as the owner reads it: the missing set's size, a progress reply, an
+/// acknowledgement, or nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum Answered {
+  Missing(usize),
+  Progress,
+  Acked,
+  Nothing,
+}
+
+fn answered(reply: &[u8]) -> Answered {
+  use slates_cluster::content::ContentMessage;
+  match ContentMessage::decode(reply) {
+    Ok(ContentMessage::Missing { missing, .. }) => Answered::Missing(missing.len()),
+    Ok(ContentMessage::Staged { .. }) => Answered::Progress,
+    Ok(ContentMessage::Ack(_)) => Answered::Acked,
+    _ => Answered::Nothing,
+  }
+}
+
+/// AUD-29-55 (§4.9 "verified ranges and resumable progress"; AC-7.7, T-7.8): a transfer cut at any chunk
+/// boundary keeps its verified chunks, never counts as placed, and resumes with exactly the chunks still owed.
+/// Do: for every cut point `k` in 0..=N, offer a fresh N-chunk placement, send its first `k` chunks, re-offer,
+/// send the rest, and re-offer once more (the acknowledgement lost at the cut). Expect each chunk before the
+/// last answered with progress, the content not held while cut, the re-offer naming exactly N − k chunks, the
+/// last chunk acknowledged, and the final re-offer acknowledged at once.
+#[test]
+fn a_cut_transfer_resumes_with_exactly_the_chunks_still_owed() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-cut-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("cut", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let runs: Vec<CutRun> = (0..=TRANSFER_CHUNKS)
+    .map(|cut| cut_run(&daemon, cut))
+    .collect();
+  daemon.stop();
+  drop(segment);
+  for run in runs {
+    assert_cut_run(&run);
+  }
+}
+
+/// What one cut transfer drew from the holder, step by step.
+struct CutRun {
+  cut: usize,
+  offered: Answered,
+  before_cut: Vec<Answered>,
+  held_while_cut: Result<bool, slates_server::observe::ObserveError>,
+  resumed: Answered,
+  after_cut: Vec<Answered>,
+  held_after: Result<bool, slates_server::observe::ObserveError>,
+  lost_ack: Answered,
+}
+
+/// Places a fresh [`TRANSFER_CHUNKS`]-chunk placement on `daemon`, cut after `cut` chunks, then resumed.
+fn cut_run(daemon: &Daemon, cut: usize) -> CutRun {
+  use slates_cluster::content::{chunk_requests, offer_request};
+  use slates_db::register::{HostId, ObjectId};
+  let serve = |request: Vec<u8>| answered(&daemon.serve_content_as_authorized(request).unwrap());
+  let tag = u8::try_from(cut).unwrap();
+  let archive = pieces_archive(&tagged_pieces(tag));
+  let manifest = archive.manifest_identity();
+  let object = ObjectId::new(HostId(1), u64::from(tag) + 1);
+  let offered = serve(offer_request(&archive, object, 1));
+  let identities: Vec<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
+  let requests = chunk_requests(&archive, object, 1, &identities);
+  let before_cut = requests.iter().take(cut).cloned().map(serve).collect();
+  let held_while_cut = daemon.fleet_holder_content(manifest);
+  let resumed = serve(offer_request(&archive, object, 1));
+  let after_cut = requests.iter().skip(cut).cloned().map(serve).collect();
+  let held_after = daemon.fleet_holder_content(manifest);
+  let lost_ack = serve(offer_request(&archive, object, 1));
+  CutRun {
+    cut,
+    offered,
+    before_cut,
+    held_while_cut,
+    resumed,
+    after_cut,
+    held_after,
+    lost_ack,
+  }
+}
+
+/// The replies `count` chunks draw when the last of them completes the placement or not: progress for each,
+/// the acknowledgement for the completing one.
+fn chunk_replies(count: usize, completes: bool) -> Vec<Answered> {
+  (0..count)
+    .map(|at| {
+      if completes && at + 1 == count {
+        Answered::Acked
+      } else {
+        Answered::Progress
+      }
+    })
+    .collect()
+}
+
+/// The rule for one cut run (see the test's doc).
+fn assert_cut_run(run: &CutRun) {
+  let cut = run.cut;
+  let complete_at_cut = cut == TRANSFER_CHUNKS;
+  assert_eq!(run.offered, Answered::Missing(TRANSFER_CHUNKS), "cut {cut}");
+  assert_eq!(
+    run.before_cut,
+    chunk_replies(cut, complete_at_cut),
+    "cut {cut}"
+  );
+  assert_eq!(
+    run.held_while_cut,
+    Ok(complete_at_cut),
+    "cut {cut}: incomplete content never counts as held"
+  );
+  let expected_resume = if complete_at_cut {
+    Answered::Acked
+  } else {
+    Answered::Missing(TRANSFER_CHUNKS - cut)
+  };
+  assert_eq!(run.resumed, expected_resume, "cut {cut}: the re-offer");
+  assert_eq!(
+    run.after_cut,
+    chunk_replies(TRANSFER_CHUNKS - cut, true),
+    "cut {cut}"
+  );
+  assert_eq!(run.held_after, Ok(true), "cut {cut}");
+  assert_eq!(
+    run.lost_ack,
+    Answered::Acked,
+    "cut {cut}: a lost acknowledgement"
+  );
+}
+
+/// AUD-29-55 (§4.9 "canceled producers neither publish partial identities nor leak"): an abandoned transfer
+/// gives back everything it took when a newer placement replaces it. Do: place a control placement on one
+/// object and measure its charge; then, on another, offer a placement of the same shape, cut it after one
+/// chunk, and replace it with a newer placement of the same shape, completed. Expect the second object's
+/// charge — bytes and index — equal to the control's (the abandoned stage left nothing), no stage left, and
+/// the abandoned manifest not held.
+#[test]
+fn an_abandoned_transfer_returns_every_charge_when_replaced() {
+  use slates_cluster::content::{chunk_requests, offer_request};
+  use slates_db::register::{HostId, ObjectId};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-abandon-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("abandon", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let account = || daemon.fleet_replica_account().unwrap();
+  let start = account();
+  let control = pieces_archive(&tagged_pieces(0));
+  let control_object = ObjectId::new(HostId(1), 1);
+  let control_reply = place_replica(&daemon, control_object, 1, &control);
+  let after_control = account();
+
+  let (abandoned, replacing) = (
+    pieces_archive(&tagged_pieces(1)),
+    pieces_archive(&tagged_pieces(2)),
+  );
+  let object = ObjectId::new(HostId(1), 2);
+  let missing: Vec<[u8; 32]> = abandoned.chunks.iter().map(|c| c.identity).collect();
+  let _ = daemon.serve_content_as_authorized(offer_request(&abandoned, object, 1));
+  let first = chunk_requests(&abandoned, object, 1, &missing)
+    .into_iter()
+    .next()
+    .expect("the abandoned placement has chunks");
+  let cut_reply = answered(&daemon.serve_content_as_authorized(first).unwrap());
+  let while_cut = account();
+  let replaced_reply = place_replica(&daemon, object, 2, &replacing);
+  let after = account();
+  let abandoned_held = daemon.fleet_holder_content(abandoned.manifest_identity());
+  daemon.stop();
+  drop(segment);
+
+  assert_eq!(answered(&control_reply), Answered::Acked);
+  assert_eq!(cut_reply, Answered::Progress);
+  assert_eq!(while_cut.stages, 1, "the cut transfer kept a stage");
+  assert_eq!(answered(&replaced_reply), Answered::Acked);
+  let charge = |from: &slates_server::daemon::ReplicaAccount,
+                to: &slates_server::daemon::ReplicaAccount| {
+    (to.replicated - from.replicated, to.index - from.index)
+  };
+  assert_eq!(
+    charge(&after_control, &after),
+    charge(&start, &after_control),
+    "the replaced transfer left nothing charged beyond its replacement"
+  );
+  assert_eq!(after.stages, 0, "no stage is left");
+  assert_eq!(after.replicated, after.charged);
+  assert_eq!(abandoned_held, Ok(false));
 }
 
 /// AUD-29-43 (§4.2 "a remote holder makes the same admission against its own machine before acknowledging
@@ -482,14 +738,14 @@ fn a_replica_is_admitted_only_from_the_holders_unpromised_capacity() {
     .expect("the fixture explicitly creates its local consensus group");
   let archive = replica_archive(BEFORE);
   let manifest = archive.manifest_identity();
-  let put = replica_put(ObjectId::new(HostId(1), 1), 1, &archive);
+  let object = ObjectId::new(HostId(1), 1);
   let acked = |reply: &[u8]| matches!(ContentMessage::decode(reply), Ok(ContentMessage::Ack(_)));
 
   daemon.inject_pressure_hold(u64::MAX).unwrap();
-  let refused = daemon.serve_content_as_authorized(put.clone()).unwrap();
+  let refused = place_replica(&daemon, object, 1, &archive);
   let held_while_full = daemon.fleet_holder_content(manifest);
   daemon.inject_pressure_hold(0).unwrap();
-  let admitted = daemon.serve_content_as_authorized(put).unwrap();
+  let admitted = place_replica(&daemon, object, 1, &archive);
   let held_after = daemon.fleet_holder_content(manifest);
   daemon.stop();
   drop(segment);
@@ -531,8 +787,7 @@ fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
 
   let archive = replica_archive(BEFORE);
   let manifest = archive.manifest_identity();
-  let put = replica_put(ObjectId::new(HostId(1), 1), 1, &archive);
-  let reply = first.serve_content_as_authorized(put).unwrap();
+  let reply = place_replica(&first, ObjectId::new(HostId(1), 1), 1, &archive);
   let acknowledged = matches!(ContentMessage::decode(&reply), Ok(ContentMessage::Ack(_)));
   let held_before = first.fleet_holder_content(manifest);
   first.stop();

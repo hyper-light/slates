@@ -8,29 +8,40 @@
 //! replication transfer unit and the clone-from-archive source").
 //!
 //! Three exchanges, each one request/reply of its own kind on the holder's record session
-//! ([`CONTENT_OFFER_STREAM`], [`CONTENT_PUT_STREAM`], [`CONTENT_FETCH_STREAM`] — so the holder's
+//! ([`CONTENT_OFFER_STREAM`], [`CONTENT_CHUNK_STREAM`], [`CONTENT_FETCH_STREAM`] — so the holder's
 //! `serve_once` dispatches by kind, never by guessing at bytes; every exchange rides a fresh stream id
 //! in the `Bulk` class, so a content transfer never queues a record commit or a probe sharing the
 //! session behind it):
-//! - **`Offer` → `Missing`**: the owner names the object, sequence, manifest and every chunk identity
-//!   the archive holds; the holder answers with the identities it lacks — a chunk already present on
-//!   a candidate is never transferred again.
-//! - **`Put` → `Ack`**: the owner ships the manifest with exactly the missing chunks as one archive;
-//!   the holder decodes it (every chunk against its identity, the manifest against its hash, the
-//!   whole against its trailer hash), refuses unless every chunk the manifest references is now
-//!   held, stores, and acknowledges — an acknowledgement **bound** to the object, sequence and
-//!   manifest, so a stale or foreign one cannot count toward a placement (the record plane's same
-//!   discipline: network receipt is not acceptance).
+//! - **`Offer` → `Missing` or `Ack`**: the owner names the object and sequence and sends the manifest (the
+//!   archive's header and tree, no chunks). The holder checks it, opens a **stage** for it (or finds the one
+//!   a cut transfer left), and answers with the referenced chunks it holds neither for the object nor in the
+//!   stage — or, when nothing is missing, completes the placement and acknowledges at once.
+//! - **`Chunk` → `Staged` or `Ack`**: one chunk per exchange, many exchanges in flight on the session. The
+//!   holder checks the chunk is referenced by the staged manifest, verifies it against its identity and keeps
+//!   it in the stage (§4.9 "verified ranges and resumable progress"); the reply names how many chunks the
+//!   stage still lacks. The chunk that completes the closure draws the acknowledgement — **bound** to the
+//!   object, sequence and manifest, so a stale or foreign one cannot count toward a placement (the record
+//!   plane's same discipline: network receipt is not acceptance).
 //! - **`Fetch` → `Have`**: a reader — a takeover successor materializing the volume, a remote attach
 //!   — asks a recorded holder for a manifest's whole archive by identity (§4.10 "fetches the
 //!   manifest by identity from a recorded holder"), verified on arrival.
 //!
-//! The owner's dispatch ([`put_content`]) runs the offer round to every holder concurrently, builds
-//! each holder's partial archive from the one archive in RAM (only the chunks it lacks are copied —
-//! exactly the bytes that must cross the wire), then runs the put round and collects bound
-//! acknowledgements to the quorum under the commit budget's progress-extension policy, the same
-//! collector the record commit uses ([`crate::collect_bound`]). Both rounds are bounded by the
-//! dispatch span, and holders still in flight at the return hand their sessions back through
+//! **Resumption (AUD-29-55).** A stage keeps every chunk that arrived verified, so a transfer cut at any
+//! point — a deadline, a cancelled round, a session replaced — loses at most the chunks still in flight: the
+//! next offer's missing set names exactly the verified work still owed. Stages ride the shard's recovery
+//! image at each publish it makes, so a warm restart keeps the progress a publish carried; a stage is not
+//! an acknowledgement, so progress since the last publish carries no durability promise and is re-sent. A stage is not a placement and is never acknowledged; it is charged
+//! like held content, one per object, and released by events, never by time: its promotion, a newer stage
+//! for the object, or the holder's retention rule (a record past its sequence that does not name it, a newer
+//! placement, the object's tombstone, the stale-copy reclaim). Until 2026-10-01 a put was one whole archive
+//! in one stream body, verified only after its last byte: a cut discarded every byte it had carried, and the
+//! next offer named them all again.
+//!
+//! The owner's dispatch ([`put_content`]) runs each holder's offer and, as that holder's missing set
+//! arrives, its chunks — every holder independently, so a slow offer never holds back a fast holder's
+//! transfer (AUD-29-58: until 2026-10-01 every put waited for the slowest offer). It collects bound
+//! acknowledgements to the quorum under the commit budget's progress-extension policy, the same policy the
+//! record commit uses. Holders still in flight at the return hand their sessions back through
 //! [`Stragglers`]. The owner counts as a holder of its own content (it is a candidate, and it has
 //! the bytes), so at `f = 0` the local hold is the placement with no dispatch — the same code path
 //! (R8). Content goes to `f + 1` candidates first and is hedged to the rest after the measured p95
@@ -44,7 +55,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use slates_archive::format::{ArchiveError, Chunk, Encoding};
+use slates_archive::format::{ArchiveError, Chunk, Encoding, MAX_CHUNK_BYTES};
 use slates_archive::{Archive, chunks_for};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
 use slates_mem::arena::{ChunkArena, Extent};
@@ -53,12 +64,12 @@ use slates_mem::error::MemError;
 use slates_rt::error::RtError;
 use slates_rt::futures::{detach, now_ns, spawn_child};
 use slates_transport::connection::Priority;
-use slates_transport::endpoint::Endpoint;
+use slates_transport::endpoint::{Endpoint, EndpointError};
+use slates_transport::streams::StreamRefusal;
 use slates_wire::Wire;
 
 use crate::{
-  ClusterError, Collected, CommitBudget, DispatchWait, Reply, Stragglers, collect_bound,
-  request_within,
+  ClusterError, CommitBudget, DispatchWait, Reply, Stragglers, TimedReply, request_within,
 };
 
 /// The stream an **offer** rides on a holder's record session — distinct from the record commit and
@@ -73,9 +84,9 @@ use crate::{
 /// fresh ids per exchange, as QUIC does, is the transport's owed stream lifecycle.
 /// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
 pub const CONTENT_OFFER_STREAM: u64 = 4;
-/// The stream a **put** rides (see [`CONTENT_OFFER_STREAM`] for why each exchange has its own).
+/// The stream a **chunk** exchange rides (see [`CONTENT_OFFER_STREAM`] for why each exchange has its own).
 /// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
-pub const CONTENT_PUT_STREAM: u64 = 5;
+pub const CONTENT_CHUNK_STREAM: u64 = 5;
 /// The stream a **fetch** rides (see [`CONTENT_OFFER_STREAM`] for why each exchange has its own).
 /// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
 pub const CONTENT_FETCH_STREAM: u64 = 6;
@@ -84,7 +95,7 @@ pub const CONTENT_FETCH_STREAM: u64 = 6;
 pub fn is_content_stream(stream: u64) -> bool {
   matches!(
     stream,
-    CONTENT_OFFER_STREAM | CONTENT_PUT_STREAM | CONTENT_FETCH_STREAM
+    CONTENT_OFFER_STREAM | CONTENT_CHUNK_STREAM | CONTENT_FETCH_STREAM
   )
 }
 
@@ -92,14 +103,16 @@ pub fn is_content_stream(stream: u64) -> bool {
 const KIND_OFFER: u8 = 1;
 /// Format: the kind byte of a holder's missing-set reply.
 const KIND_MISSING: u8 = 2;
-/// Format: the kind byte of an archive put.
-const KIND_PUT: u8 = 3;
+/// Format: the kind byte of one chunk sent into a stage.
+const KIND_CHUNK: u8 = 3;
 /// Format: the kind byte of a holder's acknowledgement.
 const KIND_ACK: u8 = 4;
 /// Format: the kind byte of a fetch by manifest identity.
 const KIND_FETCH: u8 = 5;
 /// Format: the kind byte of a fetch's answer.
 const KIND_HAVE: u8 = 6;
+/// Format: the kind byte of a holder's progress reply to a chunk its stage kept.
+const KIND_STAGED: u8 = 7;
 /// Format: the width of a BLAKE3 identity on the wire.
 const HASH_BYTES: usize = 32;
 /// Format: the width of an object id on the wire.
@@ -108,19 +121,18 @@ const OBJECT_BYTES: usize = size_of::<ObjectId>();
 /// A content-plane message (§4.10), one per exchange direction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContentMessage {
-  /// The owner offers a snapshot's content: the object and head sequence it belongs to, the manifest
-  /// identity, and every chunk identity the archive holds.
+  /// The owner offers a snapshot's content: the object and head sequence it belongs to, and the manifest
+  /// — the archive's header and tree with no chunks ([`Archive::encode`]) — so the holder can stage it and
+  /// name the referenced chunks it lacks.
   Offer {
     /// The object (the volume) the content belongs to.
     object: ObjectId,
     /// The head sequence the content is placed for.
     sequence: u64,
-    /// The manifest's identity.
-    manifest: [u8; 32],
-    /// Every distinct chunk identity the archive holds.
-    chunks: Vec<[u8; 32]>,
+    /// The encoded manifest-only archive.
+    archive: Vec<u8>,
   },
-  /// The holder's answer to an offer: the chunks it lacks.
+  /// The holder's answer to an offer it staged: the chunks it lacks.
   Missing {
     /// The offered object.
     object: ObjectId,
@@ -131,16 +143,30 @@ pub enum ContentMessage {
     /// The identities the holder does not hold, so the owner ships exactly those.
     missing: Vec<[u8; 32]>,
   },
-  /// The owner ships an archive: the manifest and the chunks the holder was missing.
-  Put {
+  /// One chunk for the stage of `manifest` on `object`.
+  Chunk {
+    /// The object.
+    object: ObjectId,
+    /// The sequence the content is placed for.
+    sequence: u64,
+    /// The staged manifest the chunk belongs to.
+    manifest: [u8; 32],
+    /// The chunk, payload as stored.
+    chunk: Chunk,
+  },
+  /// The holder's reply to a chunk its stage verified and kept: how many referenced chunks it still lacks.
+  /// Progress, never an acknowledgement.
+  Staged {
     /// The object.
     object: ObjectId,
     /// The sequence.
     sequence: u64,
-    /// The encoded archive ([`Archive::encode`]).
-    archive: Vec<u8>,
+    /// The staged manifest.
+    manifest: [u8; 32],
+    /// How many chunks the stage still lacks.
+    remaining: u64,
   },
-  /// The holder's bound acknowledgement of a put it verified and holds whole.
+  /// The holder's bound acknowledgement of content it verified and holds whole.
   Ack(ContentAck),
   /// A reader asks for a manifest's whole archive by identity, **for an object**: a holder serves it only
   /// to a host with authority over that object, and only from what it holds for that object (AUD-29-45).
@@ -274,6 +300,33 @@ impl<'a> Reader<'a> {
     Ok(self.take(len)?.to_vec())
   }
 
+  /// One chunk's record: its identity, lengths, encoding, level, dictionary and payload. Each length is
+  /// checked against the format's chunk cap and the payload against the stored length before it is copied.
+  fn chunk(&mut self) -> Result<Chunk, ContentError> {
+    let identity = self.hash()?;
+    let raw_len = self.u64()?;
+    let stored_len = self.u64()?;
+    let encoding = Encoding::from_wire(self.u8()?).ok_or(ContentError::BadLength)?;
+    let level = self.u8()?;
+    let dictionary = self.hash()?;
+    if raw_len > MAX_CHUNK_BYTES || stored_len > MAX_CHUNK_BYTES {
+      return Err(ContentError::BadLength);
+    }
+    let payload = self.blob()?;
+    if u64::try_from(payload.len()).ok() != Some(stored_len) {
+      return Err(ContentError::BadLength);
+    }
+    Ok(Chunk {
+      identity,
+      raw_len,
+      stored_len,
+      encoding,
+      level,
+      dictionary,
+      payload,
+    })
+  }
+
   fn finish(self) -> Result<(), ContentError> {
     if self.at == self.bytes.len() {
       Ok(())
@@ -299,6 +352,23 @@ fn put_blob(out: &mut Vec<u8>, blob: &[u8]) {
   out.extend_from_slice(blob);
 }
 
+fn put_chunk(out: &mut Vec<u8>, chunk: &Chunk) {
+  out.extend_from_slice(&chunk.identity);
+  out.extend_from_slice(&chunk.raw_len.to_le_bytes());
+  out.extend_from_slice(&chunk.stored_len.to_le_bytes());
+  out.push(chunk.encoding.to_wire());
+  out.push(chunk.level);
+  out.extend_from_slice(&chunk.dictionary);
+  put_blob(out, &chunk.payload);
+}
+
+/// The head every placement message after the kind byte carries: the object, the sequence and the manifest.
+fn put_placement(out: &mut Vec<u8>, object: &ObjectId, sequence: u64, manifest: &[u8; 32]) {
+  out.extend_from_slice(&object.0);
+  out.extend_from_slice(&sequence.to_le_bytes());
+  out.extend_from_slice(manifest);
+}
+
 impl ContentMessage {
   /// The canonical bytes: the kind byte, then the fields little-endian, identity lists and byte
   /// strings count- or length-prefixed by a `u32`.
@@ -308,14 +378,12 @@ impl ContentMessage {
       ContentMessage::Offer {
         object,
         sequence,
-        manifest,
-        chunks,
+        archive,
       } => {
         out.push(KIND_OFFER);
         out.extend_from_slice(&object.0);
         out.extend_from_slice(&sequence.to_le_bytes());
-        out.extend_from_slice(manifest);
-        put_hashes(&mut out, chunks);
+        put_blob(&mut out, archive);
       }
       ContentMessage::Missing {
         object,
@@ -324,20 +392,28 @@ impl ContentMessage {
         missing,
       } => {
         out.push(KIND_MISSING);
-        out.extend_from_slice(&object.0);
-        out.extend_from_slice(&sequence.to_le_bytes());
-        out.extend_from_slice(manifest);
+        put_placement(&mut out, object, *sequence, manifest);
         put_hashes(&mut out, missing);
       }
-      ContentMessage::Put {
+      ContentMessage::Chunk {
         object,
         sequence,
-        archive,
+        manifest,
+        chunk,
       } => {
-        out.push(KIND_PUT);
-        out.extend_from_slice(&object.0);
-        out.extend_from_slice(&sequence.to_le_bytes());
-        put_blob(&mut out, archive);
+        out.push(KIND_CHUNK);
+        put_placement(&mut out, object, *sequence, manifest);
+        put_chunk(&mut out, chunk);
+      }
+      ContentMessage::Staged {
+        object,
+        sequence,
+        manifest,
+        remaining,
+      } => {
+        out.push(KIND_STAGED);
+        put_placement(&mut out, object, *sequence, manifest);
+        out.extend_from_slice(&remaining.to_le_bytes());
       }
       ContentMessage::Ack(ack) => {
         out.push(KIND_ACK);
@@ -368,8 +444,7 @@ impl ContentMessage {
       KIND_OFFER => ContentMessage::Offer {
         object: reader.object()?,
         sequence: reader.u64()?,
-        manifest: reader.hash()?,
-        chunks: reader.hashes()?,
+        archive: reader.blob()?,
       },
       KIND_MISSING => ContentMessage::Missing {
         object: reader.object()?,
@@ -377,10 +452,17 @@ impl ContentMessage {
         manifest: reader.hash()?,
         missing: reader.hashes()?,
       },
-      KIND_PUT => ContentMessage::Put {
+      KIND_CHUNK => ContentMessage::Chunk {
         object: reader.object()?,
         sequence: reader.u64()?,
-        archive: reader.blob()?,
+        manifest: reader.hash()?,
+        chunk: reader.chunk()?,
+      },
+      KIND_STAGED => ContentMessage::Staged {
+        object: reader.object()?,
+        sequence: reader.u64()?,
+        manifest: reader.hash()?,
+        remaining: reader.u64()?,
       },
       KIND_ACK => ContentMessage::Ack(ContentAck {
         holder: HostId(reader.u64()?),
@@ -428,6 +510,11 @@ pub enum ContentRefusal {
     /// The bytes that were available.
     available: u64,
   },
+  /// An offer for an object whose stage holds a different manifest placed for the same or a newer sequence
+  /// (AUD-29-55): the owner has one placement in flight per object, so the older offer is stale.
+  StaleStage,
+  /// A chunk names a manifest the object has no stage for — never staged, or released since (AUD-29-55).
+  Unstaged,
 }
 
 /// The archive's header fields and manifest with `chunks` in place of its own — the partial archive an
@@ -452,15 +539,28 @@ fn with_chunks(archive: &Archive, chunks: Vec<Chunk>) -> Archive {
 }
 
 /// A hold's canonical image (AUD-29-59), carried in its shard's recovery image so a content acknowledgement
-/// survives a warm restart: every distinct chunk the held manifests reference, once, in identity order, and
-/// every held manifest with its object and latest placement, in (object, identity) order — so two holds of
+/// survives a warm restart: every distinct chunk stored (held or staged), once, in identity order, every
+/// held manifest with its object and latest placement, in (object, identity) order, and every stage with
+/// the chunks it verified (AUD-29-55: a transfer's progress survives a warm restart too) — so two holds of
 /// equal content image byte-identically (a determinism gate).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct HoldImage {
-  /// The distinct chunks the held manifests reference.
+  /// The distinct chunks stored.
   chunks: Vec<ChunkImage>,
   /// The held manifests.
   manifests: Vec<ManifestImage>,
+  /// The transfers in progress.
+  stages: Vec<StageImage>,
+}
+
+/// One stage of a [`HoldImage`]: its object, the sequence it is placed for, its manifest-only archive, and
+/// the chunks it verified, in identity order.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct StageImage {
+  object: [u8; 16],
+  sequence: u64,
+  archive: Vec<u8>,
+  staged: Vec<[u8; 32]>,
 }
 
 /// One chunk of a [`HoldImage`]: a `Chunk`'s fields, the encoding as its wire byte.
@@ -587,6 +687,8 @@ fn btree_map_bytes<K, V>() -> u64 {
 pub struct ContentHold {
   chunks: BTreeMap<[u8; 32], StoredChunk>,
   objects: BTreeMap<ObjectId, Held>,
+  /// One transfer in progress per object (AUD-29-55).
+  stages: BTreeMap<ObjectId, Stage>,
   /// Requests refused by the authority check (a non-vacuity counter for the scope).
   unauthorized: u64,
   /// Puts refused because the holder's accepted records already supersede them (AUD-29-43; a non-vacuity
@@ -602,7 +704,8 @@ pub struct ContentHold {
 }
 
 /// A chunk stored in the arena once, whatever objects reference it: its block, its charge (the block's
-/// length), the fields a `Chunk` carries besides its payload, and how many objects reference it.
+/// length), the fields a `Chunk` carries besides its payload, how many objects reference it, and how many
+/// stages have it verified and kept (AUD-29-55). Its block goes when both counts are zero.
 #[derive(Debug)]
 struct StoredChunk {
   extent: Extent,
@@ -612,6 +715,31 @@ struct StoredChunk {
   level: u8,
   dictionary: [u8; 32],
   objects: u64,
+  staged: u64,
+}
+
+/// A transfer in progress for one object (AUD-29-55; §4.9 "verified ranges and resumable progress"): the
+/// manifest being placed and the sequence it is placed for, the arena block holding its manifest-only
+/// archive, the chunk cap its header declares, the referenced chunks still missing, the chunks it has
+/// verified and kept, and the index bytes it is charged — released whole with it.
+#[derive(Debug)]
+struct Stage {
+  manifest: [u8; 32],
+  placed: Placed,
+  extent: Extent,
+  len: usize,
+  chunk_max: u64,
+  missing: BTreeSet<[u8; 32]>,
+  staged: BTreeSet<[u8; 32]>,
+  missing_charged: u64,
+  index: u64,
+}
+
+/// What opening a stage found: the manifest already held whole for the object (its placement refreshed), or
+/// a stage and the chunks it lacks.
+enum Opened {
+  Held,
+  Missing(Vec<[u8; 32]>),
 }
 
 /// One object's held content: its manifests and how many of them reference each chunk.
@@ -640,14 +768,6 @@ pub struct Placed {
   pub sequence: u64,
 }
 
-/// What a put takes, charged before anything is verified or stored, so a refusal gives it all back.
-#[derive(Debug, Default, Clone, Copy)]
-struct Charge {
-  bytes: u64,
-  scratch: u64,
-  index: u64,
-}
-
 /// The index cost of a new stored chunk.
 fn chunk_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], StoredChunk>()
@@ -668,6 +788,22 @@ fn manifest_entry_bytes() -> u64 {
 /// The index cost of an object's reference to a chunk.
 fn reference_entry_bytes() -> u64 {
   btree_entry_bytes::<[u8; 32], u64>()
+}
+
+/// The index cost of a new stage: its entry and the roots of its two sets.
+fn stage_entry_bytes() -> u64 {
+  btree_entry_bytes::<ObjectId, Stage>()
+    .saturating_add(btree_map_bytes::<[u8; 32], ()>().saturating_mul(2))
+}
+
+/// The index cost of one identity in a stage's missing or staged set.
+fn stage_set_entry_bytes() -> u64 {
+  btree_entry_bytes::<[u8; 32], ()>()
+}
+
+/// The identities of a count, as a charge multiplier.
+fn as_count(items: usize) -> u64 {
+  u64::try_from(items).unwrap_or(u64::MAX)
 }
 
 /// The typed refusal a budget or arena refusal becomes.
@@ -757,6 +893,21 @@ impl ContentHold {
     self.refused_capacity
   }
 
+  /// The chunks the stage for `object` has verified and kept, if a transfer of `manifest` is in progress —
+  /// the progress a cut transfer resumes from (AUD-29-55).
+  pub fn staged_of(&self, object: ObjectId, manifest: &[u8; 32]) -> Option<usize> {
+    self
+      .stages
+      .get(&object)
+      .filter(|stage| &stage.manifest == manifest)
+      .map(|stage| stage.staged.len())
+  }
+
+  /// How many transfers are in progress (stages), across objects.
+  pub fn stage_count(&self) -> usize {
+    self.stages.len()
+  }
+
   /// Of `chunks`, the identities this hold lacks **for `object`** — the missing set an offer is answered
   /// with. A chunk held only for another object counts as lacking: its presence is not this object's to know.
   pub fn missing_of(&self, object: ObjectId, chunks: &[[u8; 32]]) -> Vec<[u8; 32]> {
@@ -768,12 +919,13 @@ impl ContentHold {
       .collect()
   }
 
-  /// Holds `archive` for `object`, placed as `placed`, in `space` — only chunks its manifest references may
-  /// be shipped, every chunk the manifest references must be shipped or already held **for this object**,
-  /// every shipped chunk not yet stored is verified, and the whole put is admitted from the shard's
-  /// unpromised capacity or refused (`NoCapacity`) — and returns the manifest identity now held. Nothing is
-  /// stored and nothing stays charged on a refusal; holding a manifest already held stores nothing and
-  /// refreshes its placement.
+  /// Holds `archive` — a manifest and chunks — for `object`, placed as `placed`, in `space`, through the same
+  /// stage a transfer fills (AUD-29-55), and returns the manifest identity now held: only chunks the manifest
+  /// references may be shipped (refused `Unreferenced` before any is decoded), every chunk it references must
+  /// be shipped, already held for this object or already staged, every shipped chunk not yet stored is
+  /// verified, and every byte and index entry is admitted from the shard's unpromised capacity or refused
+  /// (`NoCapacity`). Holding a manifest already held stores nothing and refreshes its placement. A refusal
+  /// leaves nothing this call took, except progress into a stage that already existed for the manifest.
   pub fn hold(
     &mut self,
     space: &mut HoldSpace<'_>,
@@ -789,146 +941,401 @@ impl ContentHold {
     {
       return Err(ContentRefusal::Unreferenced);
     }
-    let held = self.objects.get(&object);
-    let held_for_object =
-      |identity: &[u8; 32]| held.is_some_and(|held| held.chunks.contains_key(identity));
-    let shipped = |identity: &[u8; 32]| {
-      archive
-        .chunks
-        .iter()
-        .find(|chunk| chunk.identity == *identity)
-    };
-    let missing = referenced
-      .iter()
-      .filter(|identity| !held_for_object(identity) && shipped(identity).is_none())
-      .count();
-    if missing > 0 {
-      return Err(ContentRefusal::Incomplete { missing });
+    let manifest = with_chunks(&archive, Vec::new());
+    let identity = manifest.manifest_identity();
+    let (opened, created) = self.open_stage(space, object, placed, &manifest)?;
+    if let Opened::Held = opened {
+      return Ok(identity);
     }
-    // What this put adds: the object's new references, and of those the chunks not stored for any object.
-    let new_references: Vec<[u8; 32]> = referenced
-      .iter()
-      .filter(|identity| !held_for_object(identity))
-      .copied()
-      .collect();
-    let identity = archive.manifest_identity();
+    let mut outcome = Ok(identity);
+    for chunk in archive.chunks {
+      if let Err(refusal) = self.stage_chunk(space, object, &identity, chunk) {
+        outcome = Err(refusal);
+        break;
+      }
+    }
+    let outcome = outcome.and_then(|_| self.promote(space, object));
+    if outcome.is_err() && created {
+      self.drop_stage(space, object);
+    }
+    outcome
+  }
+
+  /// The arena block length `len` bytes take, as a charge; `NoCapacity` when no block class fits.
+  fn block_bytes(arena: &ChunkArena, len: u64) -> Result<u64, ContentRefusal> {
+    usize::try_from(len)
+      .ok()
+      .and_then(|len| arena.block_len(len))
+      .map(as_count)
+      .ok_or(ContentRefusal::NoCapacity {
+        requested: len,
+        available: 0,
+      })
+  }
+
+  /// Takes a charge whole or refuses with nothing taken: `index` bytes on the metadata ledger, and `kept`
+  /// plus `transient` bytes from the shard's unpromised capacity — `kept` stays charged to this hold (blocks
+  /// it keeps), `transient` is a verification scratch the caller gives back once verified.
+  fn take(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    kept: u64,
+    transient: u64,
+    index: u64,
+  ) -> Result<(), ContentRefusal> {
+    let credit = space.metadata.reserve(index).map_err(|e| no_capacity(&e))?;
+    if let Err(e) = space
+      .budget
+      .charge_replicated(kept.saturating_add(transient))
+    {
+      space.metadata.release(credit);
+      return Err(no_capacity(&e));
+    }
+    self.charged_bytes = self.charged_bytes.saturating_add(kept);
+    self.index_bytes = self.index_bytes.saturating_add(index);
+    Ok(())
+  }
+
+  /// Gives back a charge [`take`](Self::take) took (or the part of it still held).
+  fn give(&mut self, space: &mut HoldSpace<'_>, kept: u64, transient: u64, index: u64) {
+    space
+      .budget
+      .credit_replicated(kept.saturating_add(transient));
+    space
+      .metadata
+      .release(slates_mem::budget::MetadataCredit { bytes: index });
+    self.charged_bytes = self.charged_bytes.saturating_sub(kept);
+    self.index_bytes = self.index_bytes.saturating_sub(index);
+  }
+
+  /// Whether `object`'s held content references the chunk `identity`.
+  fn held_for(&self, object: ObjectId, identity: &[u8; 32]) -> bool {
+    self
+      .objects
+      .get(&object)
+      .is_some_and(|held| held.chunks.contains_key(identity))
+  }
+
+  /// Opens the stage for `manifest` (an archive with no chunks) on `object`, placed as `placed` — or finds
+  /// the one a cut transfer left and resumes it — and returns what it found and whether this call created it.
+  /// A manifest already held for the object only refreshes its placement. A stage of another manifest is
+  /// replaced by a newer placement and refuses an older one (`StaleStage`). The stage's manifest block and
+  /// index are admitted whole or refused.
+  fn open_stage(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    placed: Placed,
+    manifest: &Archive,
+  ) -> Result<(Opened, bool), ContentRefusal> {
+    let identity = manifest.manifest_identity();
     if let Some(record) = self
       .objects
       .get_mut(&object)
       .and_then(|held| held.manifests.get_mut(&identity))
     {
       record.placed = placed;
-      return Ok(identity);
+      return Ok((Opened::Held, false));
     }
-    let new_chunks: Vec<&Chunk> = new_references
+    let referenced: BTreeSet<[u8; 32]> = manifest.referenced_chunks().into_iter().collect();
+    if let Some(stage) = self.stages.get(&object) {
+      if stage.manifest == identity {
+        return self
+          .resume_stage(space, object, placed, &referenced)
+          .map(|missing| (Opened::Missing(missing), false));
+      }
+      if placed.sequence <= stage.placed.sequence {
+        return Err(ContentRefusal::StaleStage);
+      }
+      self.drop_stage(space, object);
+    }
+    let missing: BTreeSet<[u8; 32]> = referenced
       .iter()
-      .filter(|identity| !self.chunks.contains_key(*identity))
-      .filter_map(shipped)
+      .filter(|identity| !self.held_for(object, identity))
+      .copied()
       .collect();
-    let manifest_bytes = with_chunks(&archive, Vec::new()).encode();
-    let charge = self.charge_for(
-      space,
-      &new_references,
-      &new_chunks,
-      manifest_bytes.len(),
-      object,
-    )?;
-    if let Err(refusal) = Self::verify(space, &new_chunks, charge.scratch) {
-      self.refund(space, charge);
-      return Err(refusal);
-    }
-    // Verification is done: its scratch charge goes back before anything is stored.
-    space.budget.credit_replicated(charge.scratch);
-    let stored = match Self::store(space, &new_chunks, &manifest_bytes) {
-      Ok(stored) => stored,
+    let bytes = manifest.encode();
+    let block = Self::block_bytes(space.arena, as_count(bytes.len()))?;
+    let index = stage_entry_bytes()
+      .saturating_add(stage_set_entry_bytes().saturating_mul(as_count(missing.len())));
+    self.take(space, block, 0, index)?;
+    let extent = match Self::store_bytes(space.arena, &bytes) {
+      Ok(extent) => extent,
       Err(refusal) => {
-        self.refund(
-          space,
-          Charge {
-            scratch: 0,
-            ..charge
-          },
-        );
+        self.give(space, block, 0, index);
         return Err(refusal);
       }
     };
-    self.install(
+    let listed: Vec<[u8; 32]> = missing.iter().copied().collect();
+    self.stages.insert(
       object,
-      identity,
-      placed,
-      &referenced,
-      stored,
-      manifest_bytes.len(),
+      Stage {
+        manifest: identity,
+        placed,
+        extent,
+        len: bytes.len(),
+        chunk_max: u64::from(manifest.chunk_max),
+        missing_charged: as_count(missing.len()),
+        missing,
+        staged: BTreeSet::new(),
+        index,
+      },
     );
+    Ok((Opened::Missing(listed), true))
+  }
+
+  /// Resumes `object`'s stage for a re-offer of its manifest: the placement moves to the newer sequence, and
+  /// the missing set is recomputed — a chunk held for the object when the stage opened may have been released
+  /// since — with any growth in it charged. Returns what is still missing.
+  fn resume_stage(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    placed: Placed,
+    referenced: &BTreeSet<[u8; 32]>,
+  ) -> Result<Vec<[u8; 32]>, ContentRefusal> {
+    let staged = self
+      .stages
+      .get(&object)
+      .map(|stage| stage.staged.clone())
+      .unwrap_or_default();
+    let missing: BTreeSet<[u8; 32]> = referenced
+      .iter()
+      .filter(|identity| !self.held_for(object, identity) && !staged.contains(*identity))
+      .copied()
+      .collect();
+    let charged = self
+      .stages
+      .get(&object)
+      .map_or(0, |stage| stage.missing_charged);
+    let growth = as_count(missing.len()).saturating_sub(charged);
+    let extra = stage_set_entry_bytes().saturating_mul(growth);
+    if extra > 0 {
+      self.take(space, 0, 0, extra)?;
+    }
+    let listed: Vec<[u8; 32]> = missing.iter().copied().collect();
+    if let Some(stage) = self.stages.get_mut(&object) {
+      stage.placed = Placed {
+        sequence: stage.placed.sequence.max(placed.sequence),
+      };
+      stage.missing = missing;
+      stage.missing_charged = stage.missing_charged.saturating_add(growth);
+      stage.index = stage.index.saturating_add(extra);
+    }
+    Ok(listed)
+  }
+
+  /// Keeps one chunk in `object`'s stage of `manifest` (AUD-29-55): the chunk must be one the stage lacks
+  /// (one it already has is a duplicate, answered with the progress unchanged; one the manifest does not
+  /// reference is refused `Unreferenced`), no larger than the manifest's header declares, and — unless its
+  /// bytes are already stored — verified against its identity in a charged scratch block and stored in a
+  /// charged arena block. Returns how many chunks the stage still lacks.
+  fn stage_chunk(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    manifest: &[u8; 32],
+    chunk: Chunk,
+  ) -> Result<u64, ContentRefusal> {
+    let identity = chunk.identity;
+    let Some(stage) = self
+      .stages
+      .get(&object)
+      .filter(|stage| &stage.manifest == manifest)
+    else {
+      return Err(ContentRefusal::Unstaged);
+    };
+    let remaining = as_count(stage.missing.len());
+    if !stage.missing.contains(&identity) {
+      return if stage.staged.contains(&identity) || self.held_for(object, &identity) {
+        Ok(remaining)
+      } else {
+        Err(ContentRefusal::Unreferenced)
+      };
+    }
+    if chunk.raw_len > stage.chunk_max {
+      return Err(ContentRefusal::Malformed(ArchiveError::ChunkTooLarge {
+        index: 0,
+      }));
+    }
+    let entry = stage_set_entry_bytes();
+    if let Some(stored) = self.chunks.get(&identity) {
+      // The bytes are stored already (for another object or stage): this stage takes a reference only.
+      let _ = stored;
+      self.take(space, 0, 0, entry)?;
+      if let Some(stored) = self.chunks.get_mut(&identity) {
+        stored.staged = stored.staged.saturating_add(1);
+      }
+    } else {
+      self.store_new_chunk(space, &chunk, entry)?;
+    }
+    let Some(stage) = self.stages.get_mut(&object) else {
+      return Err(ContentRefusal::Unstaged);
+    };
+    stage.missing.remove(&identity);
+    stage.staged.insert(identity);
+    stage.index = stage.index.saturating_add(entry);
+    Ok(as_count(stage.missing.len()))
+  }
+
+  /// Verifies and stores a chunk no stage or object has stored yet, as one stage's reference: its block, its
+  /// verification scratch (an encoded chunk), its index entry and the stage's set entry `entry` are charged
+  /// first, and a refusal at any step gives every charge back.
+  fn store_new_chunk(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    chunk: &Chunk,
+    entry: u64,
+  ) -> Result<(), ContentRefusal> {
+    let block = Self::block_bytes(space.arena, chunk.stored_len)?;
+    let scratch = if chunk.encoding == Encoding::Raw {
+      0
+    } else {
+      Self::block_bytes(space.arena, chunk.raw_len)?
+    };
+    let index = chunk_entry_bytes().saturating_add(entry);
+    self.take(space, block, scratch, index)?;
+    if let Err(refusal) = Self::verify(space, &[chunk], scratch) {
+      self.give(space, block, scratch, index);
+      return Err(refusal);
+    }
+    // Verification is done: its scratch goes back before anything is stored.
+    space.budget.credit_replicated(scratch);
+    let extent = match Self::store_bytes(space.arena, &chunk.payload) {
+      Ok(extent) => extent,
+      Err(refusal) => {
+        self.give(space, block, 0, index);
+        return Err(refusal);
+      }
+    };
+    self.chunks.insert(
+      chunk.identity,
+      StoredChunk {
+        extent,
+        raw_len: chunk.raw_len,
+        stored_len: chunk.stored_len,
+        encoding: chunk.encoding,
+        level: chunk.level,
+        dictionary: chunk.dictionary,
+        objects: 0,
+        staged: 1,
+      },
+    );
+    Ok(())
+  }
+
+  /// Completes `object`'s stage into a held manifest once every chunk its manifest references is held for
+  /// the object or staged (§4.10 placement closure): the manifest's block moves from the stage to the held
+  /// record, the object gains a reference to every referenced chunk, and the stage's own index goes back.
+  /// A stage still short (a held chunk released while it filled) records what it lacks and is refused
+  /// `Incomplete`; the stage stays for the next offer.
+  fn promote(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+  ) -> Result<[u8; 32], ContentRefusal> {
+    let Some(stage) = self.stages.get(&object) else {
+      return Err(ContentRefusal::Unstaged);
+    };
+    let (identity, placed) = (stage.manifest, stage.placed);
+    let decoded = space
+      .arena
+      .bytes(stage.extent)
+      .and_then(|bytes| bytes.get(..stage.len))
+      .map(Archive::decode);
+    let manifest = match decoded {
+      Some(Ok(manifest)) => manifest,
+      Some(Err(error)) => {
+        self.drop_stage(space, object);
+        return Err(ContentRefusal::Malformed(error));
+      }
+      None => {
+        self.drop_stage(space, object);
+        return Err(ContentRefusal::Unstaged);
+      }
+    };
+    let referenced: BTreeSet<[u8; 32]> = manifest.referenced_chunks().into_iter().collect();
+    let lacking: Vec<[u8; 32]> = referenced
+      .iter()
+      .filter(|chunk| !self.held_for(object, chunk) && !stage.staged.contains(*chunk))
+      .copied()
+      .collect();
+    if !lacking.is_empty() {
+      let missing = lacking.len();
+      self.resume_stage(space, object, placed, &referenced)?;
+      return Err(ContentRefusal::Incomplete { missing });
+    }
+    if self
+      .objects
+      .get(&object)
+      .is_some_and(|held| held.manifests.contains_key(&identity))
+    {
+      self.drop_stage(space, object);
+      return Ok(identity);
+    }
+    let new_references = referenced
+      .iter()
+      .filter(|chunk| !self.held_for(object, chunk))
+      .count();
+    let new_object = !self.objects.contains_key(&object);
+    let index = manifest_entry_bytes()
+      .saturating_add(reference_entry_bytes().saturating_mul(as_count(new_references)))
+      .saturating_add(if new_object { object_entry_bytes() } else { 0 });
+    self.take(space, 0, 0, index)?;
+    let Some(stage) = self.stages.remove(&object) else {
+      self.give(space, 0, 0, index);
+      return Err(ContentRefusal::Unstaged);
+    };
+    let held = self.objects.entry(object).or_default();
+    for chunk_identity in &referenced {
+      let references = held.chunks.entry(*chunk_identity).or_insert(0);
+      if *references == 0
+        && let Some(chunk) = self.chunks.get_mut(chunk_identity)
+      {
+        chunk.objects = chunk.objects.saturating_add(1);
+      }
+      *references = references.saturating_add(1);
+    }
+    held.manifests.insert(
+      identity,
+      HeldManifest {
+        extent: stage.extent,
+        len: stage.len,
+        placed: stage.placed,
+      },
+    );
+    for chunk_identity in &stage.staged {
+      if let Some(chunk) = self.chunks.get_mut(chunk_identity) {
+        chunk.staged = chunk.staged.saturating_sub(1);
+      }
+    }
+    self.give(space, 0, 0, stage.index);
     Ok(identity)
   }
 
-  /// Takes every charge a put needs — the index entries it adds, its new blocks, and one scratch block for
-  /// verifying its largest new encoded chunk — whole or refused with nothing taken.
-  fn charge_for(
-    &mut self,
-    space: &mut HoldSpace<'_>,
-    new_references: &[[u8; 32]],
-    new_chunks: &[&Chunk],
-    manifest_len: usize,
-    object: ObjectId,
-  ) -> Result<Charge, ContentRefusal> {
-    let block = |len: u64| {
-      usize::try_from(len)
-        .ok()
-        .and_then(|len| space.arena.block_len(len))
-        .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
-        .ok_or(ContentRefusal::NoCapacity {
-          requested: len,
-          available: 0,
-        })
+  /// Releases `object`'s stage (AUD-29-55): its manifest block and its index go back, and each chunk it kept
+  /// loses the stage's reference — a chunk no object and no other stage references goes with its block and
+  /// charge. Returns whether a stage was there.
+  fn drop_stage(&mut self, space: &mut HoldSpace<'_>, object: ObjectId) -> bool {
+    let Some(stage) = self.stages.remove(&object) else {
+      return false;
     };
-    let mut bytes = block(u64::try_from(manifest_len).unwrap_or(u64::MAX))?;
-    for chunk in new_chunks {
-      bytes = bytes.saturating_add(block(chunk.stored_len)?);
+    let mut bytes = as_count(stage.extent.len());
+    let mut index = stage.index;
+    let _ = space.arena.free(stage.extent);
+    for chunk_identity in &stage.staged {
+      let gone = self.chunks.get_mut(chunk_identity).is_some_and(|chunk| {
+        chunk.staged = chunk.staged.saturating_sub(1);
+        chunk.objects == 0 && chunk.staged == 0
+      });
+      if gone && let Some(chunk) = self.chunks.remove(chunk_identity) {
+        bytes = bytes.saturating_add(as_count(chunk.extent.len()));
+        index = index.saturating_add(chunk_entry_bytes());
+        let _ = space.arena.free(chunk.extent);
+      }
     }
-    let largest_encoded = new_chunks
-      .iter()
-      .filter(|chunk| chunk.encoding != Encoding::Raw)
-      .map(|chunk| chunk.raw_len)
-      .max();
-    let scratch = match largest_encoded {
-      Some(raw_len) => block(raw_len)?,
-      None => 0,
-    };
-    let new_object = !self.objects.contains_key(&object);
-    let count = |items: usize| u64::try_from(items).unwrap_or(u64::MAX);
-    let index = manifest_entry_bytes()
-      .saturating_add(reference_entry_bytes().saturating_mul(count(new_references.len())))
-      .saturating_add(chunk_entry_bytes().saturating_mul(count(new_chunks.len())))
-      .saturating_add(if new_object { object_entry_bytes() } else { 0 });
-    let credit = space.metadata.reserve(index).map_err(|e| no_capacity(&e))?;
-    if let Err(e) = space
-      .budget
-      .charge_replicated(bytes.saturating_add(scratch))
-    {
-      space.metadata.release(credit);
-      return Err(no_capacity(&e));
-    }
-    self.charged_bytes = self.charged_bytes.saturating_add(bytes);
-    self.index_bytes = self.index_bytes.saturating_add(index);
-    Ok(Charge {
-      bytes,
-      scratch,
-      index,
-    })
-  }
-
-  /// Gives back every charge of a refused put.
-  fn refund(&mut self, space: &mut HoldSpace<'_>, charge: Charge) {
-    space
-      .budget
-      .credit_replicated(charge.bytes.saturating_add(charge.scratch));
-    space.metadata.release(slates_mem::budget::MetadataCredit {
-      bytes: charge.index,
-    });
-    self.charged_bytes = self.charged_bytes.saturating_sub(charge.bytes);
-    self.index_bytes = self.index_bytes.saturating_sub(charge.index);
+    self.give(space, bytes, 0, index);
+    true
   }
 
   /// Verifies every new chunk against its identity: a raw one where it lies, an encoded one decoded into one
@@ -964,98 +1371,21 @@ impl ContentHold {
     verdict
   }
 
-  /// Allocates and fills a block for each new chunk's payload and one for the manifest's encoding; on an
-  /// allocation refusal frees what it took and refuses `NoCapacity`.
-  fn store(
-    space: &mut HoldSpace<'_>,
-    new_chunks: &[&Chunk],
-    manifest_bytes: &[u8],
-  ) -> Result<(Vec<(StoredChunkKey, StoredChunk)>, Extent), ContentRefusal> {
-    let mut taken: Vec<Extent> = Vec::new();
-    let mut put = |bytes: &[u8], taken: &mut Vec<Extent>| -> Result<Extent, ContentRefusal> {
-      let extent = space
-        .arena
-        .alloc(bytes.len())
-        .map_err(|e| no_capacity(&e))?;
-      taken.push(extent);
-      let block = space
-        .arena
-        .bytes_mut(extent)
-        .and_then(|block| block.get_mut(..bytes.len()))
-        .ok_or(ContentRefusal::NoCapacity {
-          requested: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-          available: 0,
-        })?;
-      block.copy_from_slice(bytes);
-      Ok(extent)
+  /// Allocates a block for `bytes` and copies them in; `NoCapacity` when the arena has no block that fits.
+  fn store_bytes(arena: &mut ChunkArena, bytes: &[u8]) -> Result<Extent, ContentRefusal> {
+    let extent = arena.alloc(bytes.len()).map_err(|e| no_capacity(&e))?;
+    let Some(block) = arena
+      .bytes_mut(extent)
+      .and_then(|block| block.get_mut(..bytes.len()))
+    else {
+      let _ = arena.free(extent);
+      return Err(ContentRefusal::NoCapacity {
+        requested: as_count(bytes.len()),
+        available: 0,
+      });
     };
-    let mut stored = Vec::with_capacity(new_chunks.len());
-    let mut outcome = Ok(());
-    for chunk in new_chunks {
-      match put(&chunk.payload, &mut taken) {
-        Ok(extent) => stored.push((
-          chunk.identity,
-          StoredChunk {
-            extent,
-            raw_len: chunk.raw_len,
-            stored_len: chunk.stored_len,
-            encoding: chunk.encoding,
-            level: chunk.level,
-            dictionary: chunk.dictionary,
-            objects: 0,
-          },
-        )),
-        Err(refusal) => {
-          outcome = Err(refusal);
-          break;
-        }
-      }
-    }
-    let manifest = outcome.and_then(|()| put(manifest_bytes, &mut taken));
-    match manifest {
-      Ok(extent) => Ok((stored, extent)),
-      Err(refusal) => {
-        for extent in taken {
-          let _ = space.arena.free(extent);
-        }
-        Err(refusal)
-      }
-    }
-  }
-
-  /// Records an admitted put: its stored chunks, one more reference from the object to every chunk its
-  /// manifest references (a chunk the object references for the first time gains the object as one of its
-  /// referrers), and the manifest.
-  fn install(
-    &mut self,
-    object: ObjectId,
-    identity: [u8; 32],
-    placed: Placed,
-    referenced: &BTreeSet<[u8; 32]>,
-    (stored, manifest): (Vec<(StoredChunkKey, StoredChunk)>, Extent),
-    manifest_len: usize,
-  ) {
-    for (key, chunk) in stored {
-      self.chunks.insert(key, chunk);
-    }
-    let held = self.objects.entry(object).or_default();
-    for chunk_identity in referenced {
-      let references = held.chunks.entry(*chunk_identity).or_insert(0);
-      if *references == 0
-        && let Some(chunk) = self.chunks.get_mut(chunk_identity)
-      {
-        chunk.objects = chunk.objects.saturating_add(1);
-      }
-      *references = references.saturating_add(1);
-    }
-    held.manifests.insert(
-      identity,
-      HeldManifest {
-        extent: manifest,
-        len: manifest_len,
-        placed,
-      },
-    );
+    block.copy_from_slice(bytes);
+    Ok(extent)
   }
 
   /// The archive (header and tree, no chunks) a held manifest's block holds, or `None` if it does not decode
@@ -1067,13 +1397,20 @@ impl ContentHold {
 
   /// Keeps, of what is held for `object`, only the manifests `keep` accepts given their identity and latest
   /// placement, releasing the rest exactly as [`forget_manifest`](Self::forget_manifest) does (AUD-29-43:
-  /// the holder's retention rule is the caller's, from its accepted records). Returns how many were released.
+  /// the holder's retention rule is the caller's, from its accepted records); the object's stage is judged
+  /// by the same rule and released whole when it fails it (AUD-29-55). Returns how many manifests and
+  /// stages were released.
   pub fn retain(
     &mut self,
     space: &mut HoldSpace<'_>,
     object: ObjectId,
     mut keep: impl FnMut(&[u8; 32], Placed) -> bool,
   ) -> usize {
+    let stage_released = self
+      .stages
+      .get(&object)
+      .is_some_and(|stage| !keep(&stage.manifest, stage.placed))
+      && self.drop_stage(space, object);
     let released: Vec<[u8; 32]> = self
       .objects
       .get(&object)
@@ -1090,6 +1427,7 @@ impl ContentHold {
       .iter()
       .filter(|identity| self.forget_manifest(space, object, identity))
       .count()
+      .saturating_add(usize::from(stage_released))
   }
 
   /// The newest sequence any manifest held for `object` was placed for, or `None` when nothing is held for it.
@@ -1141,7 +1479,7 @@ impl ContentHold {
       index = index.saturating_add(reference_entry_bytes());
       let gone = self.chunks.get_mut(&chunk_identity).is_some_and(|chunk| {
         chunk.objects = chunk.objects.saturating_sub(1);
-        chunk.objects == 0
+        chunk.objects == 0 && chunk.staged == 0
       });
       if gone && let Some(chunk) = self.chunks.remove(&chunk_identity) {
         bytes = bytes.saturating_add(u64::try_from(chunk.extent.len()).unwrap_or(u64::MAX));
@@ -1163,9 +1501,11 @@ impl ContentHold {
   }
 
   /// Forgets everything held for `object` (AUD-29-43): every manifest, and each chunk's reference for the
-  /// object (the bytes go when no object references them). The authoritative releases call it — a destroyed
-  /// object's tombstone, a copy reclaimed as stale. Returns how many manifests were held.
+  /// object (the bytes go when no object or stage references them), and the object's stage (AUD-29-55). The
+  /// authoritative releases call it — a destroyed object's tombstone, a copy reclaimed as stale. Returns how
+  /// many manifests were held.
   pub fn forget_object(&mut self, space: &mut HoldSpace<'_>, object: ObjectId) -> usize {
+    self.drop_stage(space, object);
     let manifests: Vec<[u8; 32]> = self
       .objects
       .get(&object)
@@ -1200,7 +1540,14 @@ impl ContentHold {
   /// Forgets everything this hold holds, freeing every block and giving back every charge — what a hold
   /// rebuilt from a damaged image does before refusing, so a refused recovery leaves nothing charged.
   pub fn forget_all(&mut self, space: &mut HoldSpace<'_>) {
-    let objects: Vec<ObjectId> = self.objects.keys().copied().collect();
+    let objects: Vec<ObjectId> = self
+      .objects
+      .keys()
+      .chain(self.stages.keys())
+      .copied()
+      .collect::<BTreeSet<_>>()
+      .into_iter()
+      .collect();
     for object in objects {
       self.forget_object(space, object);
     }
@@ -1245,7 +1592,7 @@ impl ContentHold {
   /// This hold's canonical image (AUD-29-59; see [`HoldImage`]), read out of `arena`, or no bytes when
   /// nothing is held.
   pub fn to_image(&self, arena: &ChunkArena) -> Vec<u8> {
-    if self.objects.is_empty() {
+    if self.objects.is_empty() && self.stages.is_empty() {
       return Vec::new();
     }
     let mut manifests = Vec::new();
@@ -1278,7 +1625,25 @@ impl ContentHold {
         payload: chunk.payload,
       })
       .collect();
-    HoldImage { chunks, manifests }.to_bytes()
+    let stages = self
+      .stages
+      .iter()
+      .filter_map(|(object, stage)| {
+        let archive = arena.bytes(stage.extent)?.get(..stage.len)?.to_vec();
+        Some(StageImage {
+          object: object.0,
+          sequence: stage.placed.sequence,
+          archive,
+          staged: stage.staged.iter().copied().collect(),
+        })
+      })
+      .collect();
+    HoldImage {
+      chunks,
+      manifests,
+      stages,
+    }
+    .to_bytes()
   }
 
   /// A hold rebuilt in `space` from its canonical image (AUD-29-59): every manifest held again through
@@ -1331,17 +1696,56 @@ impl ContentHold {
         return Err(refused);
       }
     }
+    for stage in image.stages {
+      if let Err(refused) = hold.restage(space, &chunks, stage) {
+        hold.forget_all(space);
+        return Err(refused);
+      }
+    }
     Ok(hold)
   }
 
+  /// Rebuilds one imaged stage through the transfer's own path: the manifest staged again, then each chunk it
+  /// had verified, verified again from the image's chunks.
+  fn restage(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    chunks: &BTreeMap<[u8; 32], Chunk>,
+    stage: StageImage,
+  ) -> Result<(), HoldImageError> {
+    let manifest = Archive::decode(&stage.archive).map_err(HoldImageError::Archive)?;
+    let object = ObjectId(stage.object);
+    let identity = manifest.manifest_identity();
+    let placed = Placed {
+      sequence: stage.sequence,
+    };
+    self
+      .open_stage(space, object, placed, &manifest)
+      .map_err(HoldImageError::Refused)?;
+    for staged in stage.staged {
+      let chunk = chunks.get(&staged).cloned().ok_or(HoldImageError::Refused(
+        ContentRefusal::Incomplete { missing: 1 },
+      ))?;
+      self
+        .stage_chunk(space, object, &identity, chunk)
+        .map_err(HoldImageError::Refused)?;
+    }
+    Ok(())
+  }
+
   /// Serves one content request as `holder` in `space`, once `authorized` has allowed the access it asks for
-  /// the object it names (checked before any lookup or allocation): an offer is answered with the object's
-  /// missing set, a put — once `admits` accepts its object, sequence and manifest (the holder's retention
-  /// rule, so a put its accepted records already supersede is never acknowledged, AUD-29-43) — with a bound
-  /// acknowledgement once verified, admitted and held whole, a fetch with the object's archive. Anything
-  /// refused, malformed, unverifiable, past the holder's capacity, incomplete or unheld is answered with the
-  /// same empty reply. Returns the reply and, for a put that was held, its object, so the caller applies its
-  /// retention rule to what the put superseded.
+  /// the object it names (checked before any lookup or allocation):
+  /// - an offer, once `admits` accepts its object, sequence and manifest (the holder's retention rule, so a
+  ///   placement its accepted records already supersede is never staged, AUD-29-43), opens or resumes the
+  ///   object's stage and is answered with what the stage lacks, or with a bound acknowledgement when nothing
+  ///   is missing;
+  /// - a chunk is verified and kept in its stage and answered with the progress, or — the chunk that
+  ///   completes the closure — with the bound acknowledgement;
+  /// - a fetch is answered with the object's archive.
+  ///
+  /// Anything refused, malformed, unverifiable, past the holder's capacity, unstaged or unheld is answered
+  /// with the same empty reply. Returns the reply and, for content that was completed and held, its object,
+  /// so the caller applies its retention rule and publishes before the acknowledgement leaves.
   pub fn serve(
     &mut self,
     space: &mut HoldSpace<'_>,
@@ -1354,7 +1758,7 @@ impl ContentHold {
       return (Vec::new(), None);
     };
     let asked = match &message {
-      ContentMessage::Offer { object, .. } | ContentMessage::Put { object, .. } => {
+      ContentMessage::Offer { object, .. } | ContentMessage::Chunk { object, .. } => {
         Some((ContentAccess::Place, *object))
       }
       ContentMessage::Fetch { object, .. } => Some((ContentAccess::Read, *object)),
@@ -1367,66 +1771,161 @@ impl ContentHold {
       self.unauthorized = self.unauthorized.saturating_add(1);
       return (Vec::new(), None);
     }
-    let reply = match message {
+    match message {
       ContentMessage::Offer {
         object,
         sequence,
-        manifest,
-        chunks,
-      } => ContentMessage::Missing {
-        object,
-        sequence,
-        manifest,
-        missing: self.missing_of(object, &chunks),
-      }
-      .encode(),
-      ContentMessage::Put {
-        object,
-        sequence,
         archive,
-      } => match Archive::decode(&archive).map_err(ContentRefusal::Malformed) {
-        Ok(archive) if !admits(object, sequence, &archive.manifest_identity()) => {
-          self.superseded = self.superseded.saturating_add(1);
-          Vec::new()
-        }
-        Ok(archive) => match self.hold(space, object, Placed { sequence }, archive) {
-          Ok(manifest) => {
-            return (
-              ContentMessage::Ack(ContentAck {
-                holder,
-                object,
-                sequence,
-                manifest,
-              })
-              .encode(),
-              Some(object),
-            );
-          }
-          Err(ContentRefusal::NoCapacity { .. }) => {
-            self.refused_capacity = self.refused_capacity.saturating_add(1);
-            Vec::new()
-          }
-          Err(_) => Vec::new(),
-        },
-        Err(_) => Vec::new(),
-      },
+      } => self.serve_offer(space, holder, (object, sequence), &archive, admits),
+      ContentMessage::Chunk {
+        object,
+        sequence,
+        manifest,
+        chunk,
+      } => self.serve_chunk(space, holder, (object, sequence), manifest, chunk),
       ContentMessage::Fetch { object, manifest } => {
-        match self.archive_of(space.arena, object, &manifest) {
+        let reply = match self.archive_of(space.arena, object, &manifest) {
           Some(archive) => ContentMessage::Have {
             archive: archive.encode(),
           }
           .encode(),
           None => Vec::new(),
-        }
+        };
+        (reply, None)
       }
-      _ => Vec::new(),
+      _ => (Vec::new(), None),
+    }
+  }
+
+  /// An offer: the manifest staged (or its stage resumed) and the missing set, or the acknowledgement when
+  /// the stage is already complete.
+  fn serve_offer(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    holder: HostId,
+    (object, sequence): (ObjectId, u64),
+    archive: &[u8],
+    admits: impl FnOnce(ObjectId, u64, &[u8; 32]) -> bool,
+  ) -> (Vec<u8>, Option<ObjectId>) {
+    let Ok(manifest) = Archive::decode(archive) else {
+      return (Vec::new(), None);
     };
+    if !manifest.chunks.is_empty() {
+      return (Vec::new(), None); // An offer carries the manifest only; chunks travel one per exchange.
+    }
+    let identity = manifest.manifest_identity();
+    if !admits(object, sequence, &identity) {
+      self.superseded = self.superseded.saturating_add(1);
+      return (Vec::new(), None);
+    }
+    let missing = match self.open_stage(space, object, Placed { sequence }, &manifest) {
+      Ok((Opened::Held, _)) => return acknowledged(holder, object, sequence, identity),
+      Ok((Opened::Missing(missing), _)) => missing,
+      Err(refusal) => {
+        self.count_refusal(&refusal);
+        return (Vec::new(), None);
+      }
+    };
+    if missing.is_empty() {
+      return self.complete(space, holder, object, sequence);
+    }
+    let reply = ContentMessage::Missing {
+      object,
+      sequence,
+      manifest: identity,
+      missing,
+    }
+    .encode();
     (reply, None)
+  }
+
+  /// A chunk: kept in its stage and answered with the progress, or the acknowledgement once it completes it.
+  fn serve_chunk(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    holder: HostId,
+    (object, sequence): (ObjectId, u64),
+    manifest: [u8; 32],
+    chunk: Chunk,
+  ) -> (Vec<u8>, Option<ObjectId>) {
+    let staged = |remaining: u64| {
+      (
+        ContentMessage::Staged {
+          object,
+          sequence,
+          manifest,
+          remaining,
+        }
+        .encode(),
+        None,
+      )
+    };
+    match self.stage_chunk(space, object, &manifest, chunk) {
+      Ok(0) => match self.promote(space, object) {
+        Ok(held) => acknowledged(holder, object, sequence, held),
+        // A chunk held for the object when the stage opened was released while it filled: the stage stays,
+        // recomputed, and the reply is its progress — the next offer names what is owed.
+        Err(ContentRefusal::Incomplete { missing }) => staged(as_count(missing)),
+        Err(refusal) => {
+          self.count_refusal(&refusal);
+          (Vec::new(), None)
+        }
+      },
+      Ok(remaining) => staged(remaining),
+      Err(refusal) => {
+        self.count_refusal(&refusal);
+        (Vec::new(), None)
+      }
+    }
+  }
+
+  /// Promotes `object`'s complete stage and answers the bound acknowledgement, or the empty reply.
+  fn complete(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    holder: HostId,
+    object: ObjectId,
+    sequence: u64,
+  ) -> (Vec<u8>, Option<ObjectId>) {
+    match self.promote(space, object) {
+      Ok(manifest) => acknowledged(holder, object, sequence, manifest),
+      Err(refusal) => {
+        self.count_refusal(&refusal);
+        (Vec::new(), None)
+      }
+    }
+  }
+
+  /// Counts a refusal the status report names: a capacity refusal, or a stale placement.
+  fn count_refusal(&mut self, refusal: &ContentRefusal) {
+    match refusal {
+      ContentRefusal::NoCapacity { .. } => {
+        self.refused_capacity = self.refused_capacity.saturating_add(1);
+      }
+      ContentRefusal::StaleStage => self.superseded = self.superseded.saturating_add(1),
+      _ => {}
+    }
   }
 }
 
-/// A stored chunk's key: its identity.
-type StoredChunkKey = [u8; 32];
+/// The bound acknowledgement of `manifest` held for `object` at `sequence`, and the object it completed.
+fn acknowledged(
+  holder: HostId,
+  object: ObjectId,
+  sequence: u64,
+  manifest: [u8; 32],
+) -> (Vec<u8>, Option<ObjectId>) {
+  (
+    ContentMessage::Ack(ContentAck {
+      holder,
+      object,
+      sequence,
+      manifest,
+    })
+    .encode(),
+    Some(object),
+  )
+}
 
 /// A content put's outcome and the holder connections handed back — the content counterpart of
 /// [`crate::Committed`].
@@ -1488,84 +1987,299 @@ fn dispatch_round(
   Ok(rx)
 }
 
-/// The sessions of gathered replies, their bytes dropped.
-fn sessions_of(replies: Vec<Reply>) -> Vec<(HostId, Endpoint)> {
-  replies
-    .into_iter()
-    .map(|Reply(host, _, endpoint)| (host, *endpoint))
-    .collect()
+/// The offer of `archive`'s content for `object` at `sequence`: its manifest with no chunks (AUD-29-55).
+pub fn offer_request(archive: &Archive, object: ObjectId, sequence: u64) -> Vec<u8> {
+  ContentMessage::Offer {
+    object,
+    sequence,
+    archive: with_chunks(archive, Vec::new()).encode(),
+  }
+  .encode()
 }
 
-/// The puts an offer round's answers call for: each holder whose `Missing` binds to this put gets the
-/// manifest with exactly the chunks it named; a holder that answered nothing usable keeps its session for
-/// the next round. Returns the puts and the sessions handed straight back.
-fn puts_for(
+/// The chunk requests a holder's `missing` set calls for: one `Chunk` exchange per missing chunk the archive
+/// holds, each a copy of exactly the bytes that must cross the wire to that holder.
+pub fn chunk_requests(
   archive: &Archive,
   object: ObjectId,
   sequence: u64,
-  manifest: &[u8; 32],
-  offered: Vec<Reply>,
-) -> (Vec<HolderRequest>, Vec<(HostId, Endpoint)>, Vec<HostId>) {
-  let mut puts = Vec::new();
-  let mut reusable = Vec::new();
-  let mut refilled = Vec::new();
-  for Reply(host, reply, endpoint) in offered {
-    match ContentMessage::decode(&reply.bytes) {
-      Ok(ContentMessage::Missing {
-        object: offered_object,
-        sequence: offered_sequence,
-        manifest: offered_manifest,
-        missing,
-      }) if offered_object == object
-        && offered_sequence == sequence
-        && offered_manifest == *manifest =>
-      {
-        if !missing.is_empty() {
-          refilled.push(host);
-        }
-        let wanted: BTreeSet<[u8; 32]> = missing.into_iter().collect();
-        let partial = with_chunks(archive, chunks_for(archive, &wanted));
-        let put = ContentMessage::Put {
-          object,
-          sequence,
-          archive: partial.encode(),
-        }
-        .encode();
-        puts.push((host, *endpoint, put));
+  missing: &[[u8; 32]],
+) -> Vec<Vec<u8>> {
+  let manifest = archive.manifest_identity();
+  let wanted: BTreeSet<[u8; 32]> = missing.iter().copied().collect();
+  chunks_for(archive, &wanted)
+    .into_iter()
+    .map(|chunk| {
+      ContentMessage::Chunk {
+        object,
+        sequence,
+        manifest,
+        chunk,
       }
-      _ => reusable.push((host, *endpoint)),
-    }
-  }
-  (puts, reusable, refilled)
+      .encode()
+    })
+    .collect()
 }
 
-/// Gathers every reply of a dispatch round until all its tasks have ended (the channel closes) or the
-/// budget's stall policy gives up on the rest — the offer round, which needs each holder's answer,
-/// not a quorum. Bounded: each task is bounded by the dispatch span.
-async fn gather(rx: &mut Receiver<Reply>, budget: CommitBudget) -> Vec<Reply> {
-  let mut replies = Vec::new();
-  let mut wait = DispatchWait::new(budget, now_ns());
+/// What a holder's reply to an offer says, for this placement.
+enum Answer {
+  /// The holder already holds the content whole: a bound acknowledgement.
+  Ack,
+  /// The holder staged the manifest and lacks these chunks.
+  Missing(Vec<[u8; 32]>),
+  /// A refusal, a timeout, or a reply for another placement.
+  Nothing,
+}
+
+/// Reads `host`'s reply to the offer of `manifest` for `object` at `sequence`.
+fn answer_of(reply: &[u8], host: HostId, binding: (ObjectId, u64, &[u8; 32])) -> Answer {
+  let (object, sequence, manifest) = binding;
+  match ContentMessage::decode(reply) {
+    Ok(ContentMessage::Ack(ack)) if ack.holder == host && ack.binds(object, sequence, manifest) => {
+      Answer::Ack
+    }
+    Ok(ContentMessage::Missing {
+      object: offered_object,
+      sequence: offered_sequence,
+      manifest: offered_manifest,
+      missing,
+    }) if offered_object == object
+      && offered_sequence == sequence
+      && offered_manifest == *manifest =>
+    {
+      Answer::Missing(missing)
+    }
+    _ => Answer::Nothing,
+  }
+}
+
+/// Whether `reply` is `host`'s bound acknowledgement of `manifest` for `object` at `sequence`.
+fn acknowledges(reply: &[u8], host: HostId, binding: (ObjectId, u64, &[u8; 32])) -> bool {
+  let (object, sequence, manifest) = binding;
+  matches!(
+    ContentMessage::decode(reply),
+    Ok(ContentMessage::Ack(ack)) if ack.holder == host && ack.binds(object, sequence, manifest)
+  )
+}
+
+/// Sends `requests` — one holder's chunk exchanges — over `endpoint`, as many in flight as the peer's stream
+/// credit admits (`Endpoint::begin` refuses `Backlogged` past it; the sender then drives the session until
+/// replies free slots), and returns the holder's bound acknowledgement once the chunk completing its stage
+/// draws it. A refusal (an empty reply), a reply for another placement, a transport error, or every chunk
+/// answered without an acknowledgement ends the transfer with nothing; the stage keeps what was verified.
+async fn drive_chunks(
+  endpoint: &mut Endpoint,
+  requests: Vec<Vec<u8>>,
+  host: HostId,
+  binding: (ObjectId, u64, [u8; 32]),
+) -> Option<Vec<u8>> {
+  let (object, sequence, manifest) = binding;
+  let mut pending: std::collections::VecDeque<Vec<u8>> = requests.into();
+  let mut open: Vec<u64> = Vec::new();
   loop {
-    match rx.try_recv() {
-      Ok(reply) => replies.push(reply),
-      Err(TryRecvError::Empty) => {
-        if !wait.keep_waiting(replies.len()).await {
-          return replies;
+    while let Some(next) = pending.front() {
+      match endpoint.begin(CONTENT_CHUNK_STREAM, Priority::Bulk, next) {
+        Ok(id) => {
+          open.push(id);
+          pending.pop_front();
         }
+        Err(EndpointError::Stream(StreamRefusal::Backlogged { .. })) if !open.is_empty() => break,
+        Err(_) => return None,
       }
-      Err(TryRecvError::Disconnected) => return replies,
     }
+    if open.is_empty() {
+      return None;
+    }
+    endpoint.drive().await.ok()?;
+    let mut still_open = Vec::with_capacity(open.len());
+    for id in open {
+      let Some(reply) = endpoint.take_reply(id) else {
+        still_open.push(id);
+        continue;
+      };
+      match ContentMessage::decode(&reply) {
+        Ok(ContentMessage::Ack(ack))
+          if ack.holder == host && ack.binds(object, sequence, &manifest) =>
+        {
+          return Some(reply);
+        }
+        Ok(ContentMessage::Staged {
+          object: staged_object,
+          sequence: staged_sequence,
+          manifest: staged_manifest,
+          ..
+        }) if staged_object == object
+          && staged_sequence == sequence
+          && staged_manifest == manifest => {}
+        _ => return None,
+      }
+    }
+    open = still_open;
   }
 }
 
-/// Puts `archive` — the content of `object`'s head at `sequence` — to the `remote_holders` (its
-/// candidate holders, each over a connected session) at `quorum`: the offer round to every holder,
-/// a partial archive of exactly what each lacks, the put round, and the bound acknowledgements
-/// collected to `f + 1` distinct candidates under `budget`. The `owner` holds its own content, so it
-/// counts from the start when it is a candidate; at `f = 0` that is the placement and nothing is
-/// dispatched (R8). Returns the [`Placement`] on a quorum, [`ClusterError::Uncertain`] at the
-/// deadline, [`ClusterError::NotPlaced`] when every holder answered short of it — with the sessions
-/// that came back and the stragglers still in flight.
+/// One holder's chunk transfer, bounded by `deadline_ns`: [`drive_chunks`], then every exchange still open
+/// abandoned (the session is this task's alone), so the endpoint goes back clean whatever the outcome. The
+/// reply is the acknowledgement, or empty.
+async fn transfer_chunks(
+  mut endpoint: Endpoint,
+  requests: Vec<Vec<u8>>,
+  host: HostId,
+  binding: (ObjectId, u64, [u8; 32]),
+  deadline_ns: u64,
+) -> (TimedReply, Endpoint) {
+  let sent_ns = now_ns();
+  let acknowledgement = slates_rt::futures::within(
+    deadline_ns,
+    drive_chunks(&mut endpoint, requests, host, binding),
+  )
+  .await
+  .ok()
+  .flatten()
+  .flatten();
+  endpoint.abandon_all();
+  let round_trip_ns = acknowledgement
+    .is_some()
+    .then(|| now_ns().saturating_sub(sent_ns));
+  (
+    TimedReply {
+      bytes: acknowledgement.unwrap_or_default(),
+      round_trip_ns,
+    },
+    endpoint,
+  )
+}
+
+/// One placement round on the owner (AUD-29-55, AUD-29-58): what it places and when it started, and what its
+/// collection loop has gathered so far.
+struct Round<'a> {
+  archive: &'a Archive,
+  binding: (ObjectId, u64, [u8; 32]),
+  shape: Placement,
+  started_ns: u64,
+  deadline_ns: u64,
+  transfer_tx: std::sync::mpsc::Sender<Reply>,
+  acked: Vec<HostId>,
+  reusable: Vec<(HostId, Endpoint)>,
+  latencies_ns: Vec<(HostId, u64)>,
+  refilled: Vec<HostId>,
+  transfers_started: usize,
+  transfers_reported: usize,
+}
+
+impl Round<'_> {
+  /// Counts `host` as acknowledging, once, if it is a candidate, timing it from the round's start.
+  fn acknowledge(&mut self, host: HostId) {
+    if self.shape.candidates.contains(&host) && !self.acked.contains(&host) {
+      self.acked.push(host);
+      self
+        .latencies_ns
+        .push((host, now_ns().saturating_sub(self.started_ns)));
+    }
+  }
+
+  /// A holder's offer reply: an acknowledgement counts at once; a missing set starts that holder's chunk
+  /// transfer now, bounded by a span of its own (the put's clock starts when its chunks go out, as the record
+  /// commit's does when its records go out); anything else hands the session back. Returns whether a transfer
+  /// started.
+  fn on_offer(&mut self, Reply(host, reply, endpoint): Reply) -> bool {
+    let (object, sequence, manifest) = self.binding;
+    match answer_of(&reply.bytes, host, (object, sequence, &manifest)) {
+      Answer::Ack => {
+        self.acknowledge(host);
+        self.reusable.push((host, *endpoint));
+        false
+      }
+      Answer::Missing(missing) => {
+        if !missing.is_empty() {
+          self.refilled.push(host);
+        }
+        let requests = chunk_requests(self.archive, object, sequence, &missing);
+        let (tx, binding, span_ns) = (self.transfer_tx.clone(), self.binding, self.deadline_ns);
+        let spawned = spawn_child(async move {
+          let (reply, endpoint) =
+            transfer_chunks(*endpoint, requests, host, binding, span_ns).await;
+          let _ = tx.send(Reply(host, reply, Box::new(endpoint)));
+        });
+        let Ok(task) = spawned else {
+          return false;
+        };
+        let _ = detach(task);
+        self.transfers_started = self.transfers_started.saturating_add(1);
+        true
+      }
+      Answer::Nothing => {
+        self.reusable.push((host, *endpoint));
+        false
+      }
+    }
+  }
+
+  /// A holder's finished chunk transfer: its acknowledgement counts; its session comes back.
+  fn on_transfer(&mut self, Reply(host, reply, endpoint): Reply) {
+    let (object, sequence, manifest) = self.binding;
+    self.transfers_reported = self.transfers_reported.saturating_add(1);
+    if acknowledges(&reply.bytes, host, (object, sequence, &manifest)) {
+      self.acknowledge(host);
+    }
+    self.reusable.push((host, *endpoint));
+  }
+
+  /// Collects offer replies and finished transfers until the placement is placed, every holder has answered,
+  /// or the `budget`'s progress-extension policy gives up; returns whether it gave up (timed out). The policy's
+  /// clock starts with the round and starts again with each transfer, so a transfer begun late in the offer
+  /// span still has the whole span the separate put round had: the round is bounded by the offer span plus
+  /// one transfer span. The channels are owned across the waits (a borrowed receiver is not `Send`) and
+  /// handed back for the stragglers.
+  async fn collect(
+    &mut self,
+    (offers, transfers): (Receiver<Reply>, Receiver<Reply>),
+    quorum: Quorum,
+    budget: CommitBudget,
+  ) -> (bool, Receiver<Reply>, Receiver<Reply>) {
+    let mut wait = DispatchWait::new(budget, self.started_ns);
+    let mut offers_open = true;
+    while !self.shape.placed_with(&self.acked, quorum) {
+      let mut progressed = false;
+      match offers.try_recv() {
+        Ok(reply) => {
+          progressed = true;
+          if self.on_offer(reply) {
+            wait = DispatchWait::new(budget, now_ns());
+          }
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => offers_open = false,
+      }
+      if let Ok(reply) = transfers.try_recv() {
+        progressed = true;
+        self.on_transfer(reply);
+      }
+      if progressed {
+        continue;
+      }
+      if !offers_open && self.transfers_reported >= self.transfers_started {
+        return (false, offers, transfers); // every holder has answered: the outcome is settled
+      }
+      if !wait.keep_waiting(self.acked.len()).await {
+        return (true, offers, transfers);
+      }
+    }
+    (false, offers, transfers)
+  }
+}
+
+/// Puts `archive` — the content of `object`'s head at `sequence` — to the `remote_holders` (its candidate
+/// holders, each over a connected session) at `quorum`. Every holder progresses on its own (AUD-29-58): its
+/// offer goes out at once, and the moment its missing set arrives its chunk transfer starts, so a slow offer
+/// never holds back a fast holder. Bound acknowledgements are collected as they arrive, to `f + 1` distinct
+/// candidates under `budget`'s progress-extension policy; each acknowledgement's latency is timed from the
+/// round's start, offer included (the whole placement the hedge trigger is sized for). The `owner` holds its
+/// own content, so it counts from the start when it is a candidate; at `f = 0` that is the placement and
+/// nothing is dispatched (R8). Returns the [`Placement`] on a quorum, [`ClusterError::Uncertain`] at the
+/// deadline, [`ClusterError::NotPlaced`] when every holder answered short of it — with the sessions that came
+/// back and the stragglers still in flight (an offer whose transfer never started returns its session there;
+/// the holder's stage keeps what arrived, so the next round resumes it).
 #[allow(clippy::too_many_arguments)]
 pub async fn put_content(
   owner: HostId,
@@ -1577,22 +2291,20 @@ pub async fn put_content(
   remote_holders: Vec<(HostId, Endpoint)>,
   budget: CommitBudget,
 ) -> ContentPlaced {
-  let manifest = archive.manifest_identity();
-  let mut acked: Vec<HostId> = if candidates.contains(&owner) {
-    vec![owner]
-  } else {
-    Vec::new()
-  };
   // Content places on its one current cohort (§4.10): it is fetched by identity from the holders the head
   // names, so a neighbourhood change in flight never needs it joined.
   let shape = Placement::of(candidates);
-  let build = |acked: &[HostId]| Placement {
-    acked: acked.to_vec(),
-    ..shape.clone()
-  };
-  if shape.placed_with(&acked, quorum) {
+  let owner_holds: Vec<HostId> = candidates
+    .iter()
+    .copied()
+    .filter(|host| *host == owner)
+    .collect();
+  if shape.placed_with(&owner_holds, quorum) {
     return ContentPlaced {
-      outcome: Ok(build(&acked)),
+      outcome: Ok(Placement {
+        acked: owner_holds,
+        ..shape
+      }),
       reusable: Vec::new(),
       stragglers: Stragglers::none(),
       latencies_ns: Vec::new(),
@@ -1600,16 +2312,9 @@ pub async fn put_content(
     };
   }
   let deadline_ns = budget.max_deadline_ns();
-
-  // The offer round: every holder concurrently, each answering with what it lacks.
-  let offer = ContentMessage::Offer {
-    object,
-    sequence,
-    manifest,
-    chunks: archive.chunks.iter().map(|chunk| chunk.identity).collect(),
-  }
-  .encode();
-  let (offered, offers_in_flight) = match dispatch_round(
+  let started_ns = now_ns();
+  let offer = offer_request(archive, object, sequence);
+  let offers = match dispatch_round(
     remote_holders
       .into_iter()
       .map(|(host, endpoint)| (host, endpoint, offer.clone()))
@@ -1617,70 +2322,49 @@ pub async fn put_content(
     CONTENT_OFFER_STREAM,
     deadline_ns,
   ) {
-    Ok(mut rx) => (gather(&mut rx, budget).await, rx),
-    Err((error, mut rx)) => {
-      // Keep the channels of tasks already admitted: their bounded replies return sessions.
+    Ok(rx) => rx,
+    Err((error, rx)) => {
+      // Keep the channel of the tasks already admitted: their bounded replies return sessions.
       return ContentPlaced {
         outcome: Err(ClusterError::Runtime(error)),
-        reusable: sessions_of(gather(&mut rx, budget).await),
+        reusable: Vec::new(),
         stragglers: Stragglers::pending(rx),
         latencies_ns: Vec::new(),
         refilled: Vec::new(),
       };
     }
   };
-
-  // The put round: each holder that answered its offer gets the manifest and exactly its missing chunks.
-  let (puts, mut reusable, refilled) = puts_for(archive, object, sequence, &manifest, offered);
-  if puts.is_empty() {
-    return ContentPlaced {
-      outcome: Err(ClusterError::NotPlaced {
-        placement: build(&acked),
-      }),
-      reusable,
-      stragglers: Stragglers::pending(offers_in_flight),
-      latencies_ns: Vec::new(),
-      refilled: Vec::new(),
-    };
-  }
-  // The put latency is timed from the put round's dispatch: the offer round before it is the holder
-  // reporting what it lacks, not the transfer the hedge trigger is sized for.
-  let dispatched_ns = now_ns();
-  let mut rx = match dispatch_round(puts, CONTENT_PUT_STREAM, deadline_ns) {
-    Ok(rx) => rx,
-    Err((error, mut rx)) => {
-      reusable.extend(sessions_of(gather(&mut rx, budget).await));
-      return ContentPlaced {
-        outcome: Err(ClusterError::Runtime(error)),
-        reusable,
-        stragglers: Stragglers::two_rounds(offers_in_flight, rx),
-        latencies_ns: Vec::new(),
-        refilled: Vec::new(),
-      };
-    }
+  let (transfer_tx, transfers) = channel::<Reply>();
+  let mut round = Round {
+    archive,
+    binding: (object, sequence, archive.manifest_identity()),
+    shape,
+    started_ns,
+    deadline_ns,
+    transfer_tx,
+    acked: owner_holds,
+    reusable: Vec::new(),
+    latencies_ns: Vec::new(),
+    refilled: Vec::new(),
+    transfers_started: 0,
+    transfers_reported: 0,
   };
-  let Collected {
-    reusable: mut returned,
-    timed_out,
+  let (timed_out, offers, transfers) = round.collect((offers, transfers), quorum, budget).await;
+  let Round {
+    shape,
+    transfer_tx,
+    acked,
+    mut reusable,
     latencies_ns,
-  } = collect_bound(
-    &mut rx,
-    &shape,
-    quorum,
-    budget,
-    dispatched_ns,
-    &mut acked,
-    |host, reply| {
-      matches!(
-        ContentMessage::decode(reply),
-        Ok(ContentMessage::Ack(ack)) if ack.holder == host && ack.binds(object, sequence, &manifest)
-      )
-    },
-  )
-  .await;
-  reusable.append(&mut returned);
-  let stragglers = Stragglers::two_rounds(offers_in_flight, rx);
-  let placement = build(&acked);
+    refilled,
+    ..
+  } = round;
+  drop(transfer_tx); // so the stragglers' channel disconnects once every transfer has ended
+  // Recover the sessions of tasks that already finished, so they too are reused.
+  while let Ok(Reply(host, _, endpoint)) = transfers.try_recv() {
+    reusable.push((host, *endpoint));
+  }
+  let placement = Placement { acked, ..shape };
   let outcome = if placement.placed(quorum) {
     Ok(placement)
   } else if timed_out {
@@ -1691,7 +2375,7 @@ pub async fn put_content(
   ContentPlaced {
     outcome,
     reusable,
-    stragglers,
+    stragglers: Stragglers::two_rounds(offers, transfers),
     latencies_ns,
     refilled,
   }
@@ -1824,8 +2508,7 @@ mod tests {
       ContentMessage::Offer {
         object: OBJECT,
         sequence: SEQUENCE,
-        manifest: hash(1),
-        chunks: vec![hash(2), hash(3)],
+        archive: vec![7, 8, 9],
       },
       ContentMessage::Missing {
         object: OBJECT,
@@ -1833,10 +2516,17 @@ mod tests {
         manifest: hash(1),
         missing: vec![hash(3)],
       },
-      ContentMessage::Put {
+      ContentMessage::Chunk {
         object: OBJECT,
         sequence: SEQUENCE,
-        archive: vec![7, 8, 9],
+        manifest: hash(1),
+        chunk: Archive::raw_chunk(b"one chunk".to_vec()),
+      },
+      ContentMessage::Staged {
+        object: OBJECT,
+        sequence: SEQUENCE,
+        manifest: hash(1),
+        remaining: 2,
       },
       ContentMessage::Ack(ContentAck {
         holder: HostId(11),
@@ -1898,26 +2588,52 @@ mod tests {
   /// kind is refused, and trailing bytes are refused.
   #[test]
   fn oversized_counts_unknown_kinds_and_trailing_bytes_are_refused() {
-    let mut offer = ContentMessage::Offer {
+    let mut missing = ContentMessage::Missing {
       object: OBJECT,
       sequence: SEQUENCE,
       manifest: hash(1),
-      chunks: vec![hash(2)],
+      missing: vec![hash(2)],
     }
     .encode();
     let count_at = 1 + OBJECT_BYTES + size_of::<u64>() + HASH_BYTES;
-    offer[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-    assert_eq!(ContentMessage::decode(&offer), Err(ContentError::BadLength));
+    missing[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+      ContentMessage::decode(&missing),
+      Err(ContentError::BadLength)
+    );
 
-    let mut put = ContentMessage::Put {
+    let mut offer = ContentMessage::Offer {
       object: OBJECT,
       sequence: SEQUENCE,
       archive: vec![1],
     }
     .encode();
     let len_at = 1 + OBJECT_BYTES + size_of::<u64>();
-    put[len_at..len_at + 4].copy_from_slice(&(1u32 << 30).to_le_bytes());
-    assert_eq!(ContentMessage::decode(&put), Err(ContentError::BadLength));
+    offer[len_at..len_at + 4].copy_from_slice(&(1u32 << 30).to_le_bytes());
+    assert_eq!(ContentMessage::decode(&offer), Err(ContentError::BadLength));
+
+    // A chunk whose payload disagrees with its stored length, and one past the format's chunk cap.
+    let chunk = |raw_len, stored_len| {
+      ContentMessage::Chunk {
+        object: OBJECT,
+        sequence: SEQUENCE,
+        manifest: hash(1),
+        chunk: Chunk {
+          raw_len,
+          stored_len,
+          ..Archive::raw_chunk(b"bytes".to_vec())
+        },
+      }
+      .encode()
+    };
+    assert_eq!(
+      ContentMessage::decode(&chunk(5, 4)),
+      Err(ContentError::BadLength)
+    );
+    assert_eq!(
+      ContentMessage::decode(&chunk(MAX_CHUNK_BYTES + 1, 5)),
+      Err(ContentError::BadLength)
+    );
 
     assert_eq!(
       ContentMessage::decode(&[0xEE]),
@@ -1973,9 +2689,9 @@ mod tests {
   }
 
   /// The holder side served end to end in-process: an offer to a hold with one chunk already present
-  /// answers the one missing identity; a put of just that chunk is acknowledged bound to the object,
-  /// sequence and manifest; a put whose chunk is corrupted (a flipped bit) is refused with an empty
-  /// reply; a fetch hands the whole archive back.
+  /// answers the one missing identity; that chunk, corrupted (a flipped bit), is refused with an empty reply
+  /// and nothing stored; the chunk itself completes the stage and is acknowledged bound to the object,
+  /// sequence and manifest; a fetch hands the whole archive back.
   #[test]
   fn serve_answers_offers_puts_and_fetches_and_refuses_a_corrupt_chunk() {
     let archive = two_chunk_archive();
@@ -1994,18 +2710,13 @@ mod tests {
       .hold(&mut room.space(), OBJECT, Placed::default(), earlier)
       .unwrap();
 
-    let offer = ContentMessage::Offer {
-      object: OBJECT,
-      sequence: SEQUENCE,
-      manifest: archive.manifest_identity(),
-      chunks: archive.chunks.iter().map(|c| c.identity).collect(),
-    };
+    let offer = offer_request(&archive, OBJECT, SEQUENCE);
     let Ok(ContentMessage::Missing { missing, .. }) = ContentMessage::decode(
       &hold
         .serve(
           &mut room.space(),
           holder,
-          &offer.encode(),
+          &offer,
           |_, _| true,
           |_, _, _| true,
         )
@@ -2015,17 +2726,18 @@ mod tests {
     };
     assert_eq!(missing, vec![archive.chunks[1].identity]);
 
-    // A corrupt put: flip a bit in the missing chunk's payload.
-    let mut corrupt = with_chunks(&archive, vec![archive.chunks[1].clone()]);
-    corrupt.chunks[0].payload[0] ^= 0x01;
+    // A corrupt chunk: flip a bit in the missing chunk's payload.
+    let mut corrupt = archive.chunks[1].clone();
+    corrupt.payload[0] ^= 0x01;
     let refused = hold
       .serve(
         &mut room.space(),
         holder,
-        &ContentMessage::Put {
+        &ContentMessage::Chunk {
           object: OBJECT,
           sequence: SEQUENCE,
-          archive: corrupt.encode(),
+          manifest: archive.manifest_identity(),
+          chunk: corrupt,
         }
         .encode(),
         |_, _| true,
@@ -2035,17 +2747,14 @@ mod tests {
     assert!(refused.is_empty(), "a corrupt chunk is refused, not held");
     assert_eq!(hold.chunk_count(), 1);
 
-    let partial = with_chunks(&archive, vec![archive.chunks[1].clone()]);
+    let [request] = chunk_requests(&archive, OBJECT, SEQUENCE, &missing)
+      .try_into()
+      .unwrap();
     let reply = hold
       .serve(
         &mut room.space(),
         holder,
-        &ContentMessage::Put {
-          object: OBJECT,
-          sequence: SEQUENCE,
-          archive: partial.encode(),
-        }
-        .encode(),
+        &request,
         |_, _| true,
         |_, _, _| true,
       )
@@ -2169,16 +2878,16 @@ mod tests {
         ContentMessage::Offer {
           object: OBJECT,
           sequence: SEQUENCE,
-          manifest: archive.manifest_identity(),
-          chunks: archive.chunks.iter().map(|c| c.identity).collect(),
+          archive: with_chunks(&archive, Vec::new()).encode(),
         },
       ),
       (
         ContentAccess::Place,
-        ContentMessage::Put {
+        ContentMessage::Chunk {
           object: OBJECT,
           sequence: SEQUENCE,
-          archive: archive.encode(),
+          manifest: archive.manifest_identity(),
+          chunk: archive.chunks[0].clone(),
         },
       ),
       (
@@ -2207,20 +2916,29 @@ mod tests {
   }
 }
 
-/// The content hold's manifest-to-chunk ownership oracle (AUD-29-44; AC-7.3, AC-8.12). Each generated case
-/// is a **shape** — a set of distinct manifests, each referencing a non-empty subset of a chunk pool — and a
-/// **history** over it: puts (any object, any manifest, any subset of the pool shipped: the referenced
-/// chunks, unreferenced ones, or none; retries included) and forgets. The history runs against the hold and
-/// against a serial model that knows only which object holds which manifests. After every step the two must
-/// agree: every manifest the model holds is held and reconstructible to exactly its referenced chunks,
-/// nothing the model does not hold is, the store keeps exactly the chunks some held manifest references (no
-/// orphan, no premature eviction), and a refused put changes nothing.
+/// The content hold's manifest-to-chunk ownership oracle (AUD-29-44, AUD-29-55; AC-7.3, AC-7.7, AC-8.12). Each
+/// generated case is a **shape** — a set of distinct manifests, each referencing a non-empty subset of a chunk
+/// pool — and a **history** over it: whole puts (any object, any manifest, any subset of the pool shipped: the
+/// referenced chunks, unreferenced ones, or none; retries included), forgets of one manifest or of a whole
+/// object, and the transfer protocol a cut can interrupt anywhere — offers at any of a few sequences and single
+/// chunks sent into a stage, some corrupted. The history runs against the hold and against a serial model of
+/// the design's rule. After every step the two must agree on the reply (held, refused, the missing set, or
+/// progress); every manifest the model holds is held and reconstructible to exactly its referenced chunks with
+/// verified bytes; every stage keeps exactly the chunks the model says it verified (a cut loses nothing it
+/// kept); the store keeps exactly the chunks some held manifest references or some stage kept (no orphan, no
+/// premature eviction); and the shard's charges equal the hold's account.
+///
+/// The model states the rule, not the code: an offer is answered with the referenced chunks the object holds
+/// neither in a held manifest nor in its stage of that manifest (or held at once when none are lacking); a
+/// chunk is kept only for a stage of a manifest referencing it, and a corrupt one only when its verified bytes
+/// are already stored; the acknowledgement comes exactly when the closure is complete; an older placement
+/// never replaces a newer stage.
 ///
 /// Nothing about the shape is hand-picked: the manifests' overlaps are generated. The generator's bounds are
-/// the smallest at which every case the ownership rule distinguishes can occur (each bound's `Derived:` line
-/// names the case that needs it), and a **case census** counts each case as the run meets it; the run fails
-/// if any case was never met, so a generator that silently stopped reaching a case cannot pass as an oracle.
-/// The run is deterministic (a fixed-seed runner), so the census is a stable fact, not a probability.
+/// the smallest at which every case the rule distinguishes can occur (each bound's `Derived:` line names the
+/// case that needs it), and a **case census** counts each case as the run meets it; the run fails if any case
+/// was never met, so a generator that silently stopped reaching a case cannot pass as an oracle. The run is
+/// deterministic (a fixed-seed runner), so the census is a stable fact, not a probability.
 #[cfg(test)]
 mod ownership_oracle {
   use std::cell::RefCell;
@@ -2237,14 +2955,23 @@ mod ownership_oracle {
   /// put can be refused although the chunk it lacks is held — for another object (cross-object isolation).
   const OBJECTS: usize = 2;
   /// Derived: two manifests is the smallest count at which manifests share a chunk, so a put can complete
-  /// from a chunk another held manifest owns and a forget can keep a chunk another manifest still references.
+  /// from a chunk another held manifest owns, a forget can keep a chunk another manifest still references,
+  /// and a stage of one manifest can be replaced by an offer of the other.
   const MANIFESTS: usize = 2;
   /// Derived: two shared-or-private roles per manifest pair need three chunks (one shared, one private to
   /// each of the two manifests), and a put shipping a chunk no manifest references needs a fourth.
   const POOL: usize = 3 + 1;
-  /// Derived: filling every (object, manifest) slot and emptying it again, so every model state is reachable
-  /// from the empty one within one history.
-  const HISTORY: usize = 2 * OBJECTS * MANIFESTS;
+  /// Derived: three offer sequences are the fewest that put a second offer below, at and above a stage's
+  /// (stale, resumed, replacing).
+  const SEQUENCES: u64 = 3;
+  /// Derived: filling every (object, manifest) slot and emptying it again (`2 × OBJECTS × MANIFESTS`), plus
+  /// one transfer of a whole pool one chunk per step with its offer (`POOL + 1`), so every model state and a
+  /// transfer cut at any chunk are reachable within one history.
+  const HISTORY: usize = 2 * OBJECTS * MANIFESTS + POOL + 1;
+  /// Derived: the whole-put history's step kinds — put and forget.
+  const WHOLE_KINDS: u8 = 2;
+  /// Derived: the transfer history's step kinds — those two, then offer, send and forget an object.
+  const TRANSFER_KINDS: u8 = 5;
 
   /// The chunk at pool index `at`: its bytes are the index, so every pool chunk has its own identity.
   fn chunk(at: usize) -> Chunk {
@@ -2311,29 +3038,61 @@ mod ownership_oracle {
       object: usize,
       manifest: usize,
     },
+    /// An offer of `manifest` for `object` at `sequence` (AUD-29-55).
+    Offer {
+      object: usize,
+      manifest: usize,
+      sequence: u64,
+    },
+    /// One chunk of the pool sent into `object`'s stage of `manifest`, its payload corrupted or not.
+    Send {
+      object: usize,
+      manifest: usize,
+      chunk: usize,
+      corrupt: bool,
+      /// Whether the chunk is **aimed**, as an owner sends it: one the object's stage lacks, for the stage's
+      /// manifest, whatever `manifest` and `chunk` say. The other arm sends as drawn and reaches the
+      /// refusals and duplicates.
+      aimed: bool,
+    },
+    /// Every manifest and the stage of `object` forgotten (a tombstone, a stale-copy reclaim).
+    ForgetObject {
+      object: usize,
+    },
   }
 
   /// A step, generated as a plain tuple so the strategy needs no `Arc`-backed `prop_oneof!` (R2).
-  fn step() -> impl Strategy<Value = Step> {
+  fn step(kinds: u8) -> impl Strategy<Value = Step> {
     (
-      any::<bool>(),
-      0..OBJECTS,
-      0..MANIFESTS,
+      0..kinds,
+      (0..OBJECTS, 0..MANIFESTS),
       proptest::collection::btree_set(0..POOL, 0..=POOL),
-      any::<bool>(),
+      (any::<bool>(), any::<bool>(), 0..SEQUENCES, 0..POOL),
     )
-      .prop_map(|(put, object, manifest, shipped, offered)| {
-        if put {
-          Step::Put {
+      .prop_map(
+        |(kind, (object, manifest), shipped, (flag, aimed, sequence, chunk))| match kind {
+          0 => Step::Put {
             object,
             manifest,
             shipped,
-            offered,
-          }
-        } else {
-          Step::Forget { object, manifest }
-        }
-      })
+            offered: flag,
+          },
+          1 => Step::Forget { object, manifest },
+          2 => Step::Offer {
+            object,
+            manifest,
+            sequence,
+          },
+          3 => Step::Send {
+            object,
+            manifest,
+            chunk,
+            corrupt: flag,
+            aimed,
+          },
+          _ => Step::ForgetObject { object },
+        },
+      )
   }
 
   /// A shape: distinct manifests (equal chunk sets are one manifest, one identity), each non-empty.
@@ -2345,13 +3104,15 @@ mod ownership_oracle {
     .prop_map(|manifests| manifests.into_iter().collect())
   }
 
-  /// Every case the ownership rule distinguishes; the census counts each as a history meets it.
+  /// Every case the rule distinguishes; the census counts each as a history meets it.
   #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
   enum Case {
     /// A put completed with every referenced chunk shipped.
     PutWholeShipped,
     /// A put completed with a referenced chunk not shipped but held by another of the object's manifests.
     PutCompletedFromHeld,
+    /// A put completed with a referenced chunk not shipped but kept by the object's stage of the manifest.
+    PutCompletedFromStage,
     /// A put refused: a referenced chunk neither shipped nor held for the object.
     PutRefused,
     /// A put refused although the missing chunk is held — for another object.
@@ -2360,6 +3121,8 @@ mod ownership_oracle {
     Retry,
     /// A put refused for shipping a chunk the manifest does not reference.
     PutRefusedUnreferenced,
+    /// A put refused because the object's stage holds another manifest at a newer or equal sequence.
+    PutRefusedStale,
     /// One chunk held for two objects at once.
     SharedAcrossObjects,
     /// A forget that kept a chunk another of the object's manifests still references.
@@ -2368,10 +3131,38 @@ mod ownership_oracle {
     ForgetReleased,
     /// A forget of a manifest the object does not hold.
     ForgetNotHeld,
+    /// An offer answered with a missing set (a stage opened or resumed).
+    OfferMissing,
+    /// An offer of a manifest the object already holds, acknowledged at once.
+    OfferHeld,
+    /// An offer whose closure was already complete, acknowledged at once.
+    OfferCompletedAtOnce,
+    /// An offer that resumed a stage holding verified chunks (a cut transfer resuming).
+    OfferResumed,
+    /// An offer at a newer sequence replacing the object's stage of another manifest.
+    OfferReplaced,
+    /// An offer at an older or equal sequence refused against a stage of another manifest.
+    OfferStale,
+    /// A chunk kept in its stage, with chunks still lacking (progress, no acknowledgement).
+    SendStaged,
+    /// A chunk completing its stage: acknowledged.
+    SendCompleted,
+    /// A chunk the stage already kept, answered with the same progress.
+    SendDuplicate,
+    /// A chunk for a manifest the object has no stage of.
+    SendUnstaged,
+    /// A chunk the staged manifest does not reference.
+    SendUnreferenced,
+    /// A corrupt chunk whose bytes are not stored: refused, nothing kept.
+    SendCorruptRefused,
+    /// A stage found short when its last missing chunk arrived (a held chunk was released meanwhile).
+    SendShort,
+    /// An object forgotten while it had a stage.
+    ForgetObjectWithStage,
   }
 
-  /// Every case, for the census's completeness check.
-  const CASES: [Case; 10] = [
+  /// The cases a history of whole puts and forgets can meet, for its census's completeness check.
+  const WHOLE_CASES: [Case; 10] = [
     Case::PutWholeShipped,
     Case::PutCompletedFromHeld,
     Case::PutRefused,
@@ -2384,12 +3175,59 @@ mod ownership_oracle {
     Case::ForgetNotHeld,
   ];
 
-  /// The model: for each object, the indices of the manifests it holds.
-  type Model = BTreeMap<usize, BTreeSet<usize>>;
+  /// The cases only a history with transfers can meet (AUD-29-55), for its census's completeness check.
+  const TRANSFER_CASES: [Case; 16] = [
+    Case::PutCompletedFromStage,
+    Case::PutRefusedStale,
+    Case::OfferMissing,
+    Case::OfferHeld,
+    Case::OfferCompletedAtOnce,
+    Case::OfferResumed,
+    Case::OfferReplaced,
+    Case::OfferStale,
+    Case::SendStaged,
+    Case::SendCompleted,
+    Case::SendDuplicate,
+    Case::SendUnstaged,
+    Case::SendUnreferenced,
+    Case::SendCorruptRefused,
+    Case::SendShort,
+    Case::ForgetObjectWithStage,
+  ];
+
+  /// A transfer in progress, as the rule sees it.
+  #[derive(Clone, Debug)]
+  struct ModelStage {
+    manifest: usize,
+    sequence: u64,
+    missing: BTreeSet<usize>,
+    staged: BTreeSet<usize>,
+  }
+
+  /// The model: for each object, the manifests it holds and its stage.
+  #[derive(Clone, Debug, Default)]
+  struct Model {
+    held: BTreeMap<usize, BTreeSet<usize>>,
+    stages: BTreeMap<usize, ModelStage>,
+  }
+
+  /// What a step's reply says, on both sides.
+  #[derive(Clone, Debug, PartialEq, Eq)]
+  enum Outcome {
+    /// Held or acknowledged.
+    Held,
+    /// Refused: an error or the empty reply.
+    Refused,
+    /// An offer's missing set, by pool index.
+    Missing(BTreeSet<usize>),
+    /// A chunk kept, with chunks still lacking.
+    Progress,
+  }
 
   /// The chunks `object`'s held manifests reference.
   fn chunks_of(model: &Model, manifests: &[BTreeSet<usize>], object: usize) -> BTreeSet<usize> {
     model
+      .held
       .get(&object)
       .into_iter()
       .flatten()
@@ -2399,16 +3237,284 @@ mod ownership_oracle {
       .collect()
   }
 
-  /// Applies `step` to the model by the rule — a put shipping a chunk its manifest does not reference is
-  /// refused; otherwise a put completes when every referenced chunk is shipped now or referenced by a
-  /// manifest the object already holds; a held manifest's retry completes — and records the
-  /// cases it meets. Returns whether the step succeeded, or `None` for a step naming no manifest of the shape.
+  /// Every chunk whose bytes are stored: referenced by a held manifest or kept by a stage.
+  fn stored(model: &Model, manifests: &[BTreeSet<usize>]) -> BTreeSet<usize> {
+    (0..OBJECTS)
+      .flat_map(|object| chunks_of(model, manifests, object))
+      .chain(model.stages.values().flat_map(|stage| stage.staged.clone()))
+      .collect()
+  }
+
+  /// Why the rule refuses a stage operation.
+  enum Refused {
+    Stale,
+    Unstaged,
+    Unreferenced,
+    Corrupt,
+  }
+
+  /// Opens or resumes `object`'s stage of `manifest` at `sequence` by the rule; `Ok(None)` when the manifest is
+  /// held already, else the missing set and whether the stage was created.
+  fn model_open(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    (object, manifest, sequence): (usize, usize, u64),
+  ) -> Result<Option<(BTreeSet<usize>, bool)>, Refused> {
+    let referenced = manifests.get(manifest).cloned().unwrap_or_default();
+    if model
+      .held
+      .get(&object)
+      .is_some_and(|held| held.contains(&manifest))
+    {
+      return Ok(None);
+    }
+    let have = chunks_of(model, manifests, object);
+    if let Some(stage) = model.stages.get_mut(&object) {
+      if stage.manifest == manifest {
+        stage.sequence = stage.sequence.max(sequence);
+        stage.missing = referenced
+          .iter()
+          .filter(|chunk| !have.contains(chunk) && !stage.staged.contains(chunk))
+          .copied()
+          .collect();
+        return Ok(Some((stage.missing.clone(), false)));
+      }
+      if sequence <= stage.sequence {
+        return Err(Refused::Stale);
+      }
+      model.stages.remove(&object);
+    }
+    let missing: BTreeSet<usize> = referenced.difference(&have).copied().collect();
+    model.stages.insert(
+      object,
+      ModelStage {
+        manifest,
+        sequence,
+        missing: missing.clone(),
+        staged: BTreeSet::new(),
+      },
+    );
+    Ok(Some((missing, true)))
+  }
+
+  /// Keeps `chunk` in `object`'s stage of `manifest` by the rule; the chunks still missing, or why not.
+  fn model_send(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    (object, manifest, chunk): (usize, usize, usize),
+    corrupt: bool,
+  ) -> Result<(usize, bool), Refused> {
+    let have = chunks_of(model, manifests, object);
+    let stored_now = stored(model, manifests);
+    let Some(stage) = model
+      .stages
+      .get_mut(&object)
+      .filter(|stage| stage.manifest == manifest)
+    else {
+      return Err(Refused::Unstaged);
+    };
+    if !stage.missing.contains(&chunk) {
+      return if stage.staged.contains(&chunk) || have.contains(&chunk) {
+        Ok((stage.missing.len(), true))
+      } else {
+        Err(Refused::Unreferenced)
+      };
+    }
+    if corrupt && !stored_now.contains(&chunk) {
+      return Err(Refused::Corrupt);
+    }
+    stage.missing.remove(&chunk);
+    stage.staged.insert(chunk);
+    Ok((stage.missing.len(), false))
+  }
+
+  /// Completes `object`'s stage by the rule: held when every referenced chunk is held for the object or
+  /// staged; otherwise the stage stays, its missing set recomputed, and the count lacking is returned.
+  fn model_promote(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    object: usize,
+  ) -> Result<(), usize> {
+    let have = chunks_of(model, manifests, object);
+    let Some(stage) = model.stages.get_mut(&object) else {
+      return Err(0);
+    };
+    let referenced = manifests.get(stage.manifest).cloned().unwrap_or_default();
+    let lacking: BTreeSet<usize> = referenced
+      .iter()
+      .filter(|chunk| !have.contains(chunk) && !stage.staged.contains(chunk))
+      .copied()
+      .collect();
+    if !lacking.is_empty() {
+      let count = lacking.len();
+      stage.missing = lacking;
+      return Err(count);
+    }
+    let manifest = stage.manifest;
+    model.stages.remove(&object);
+    model.held.entry(object).or_default().insert(manifest);
+    Ok(())
+  }
+
+  /// A whole put by the rule (the hold's `hold`, through the same stage), recording its cases.
+  fn model_put(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    (object, manifest, shipped): (usize, usize, &BTreeSet<usize>),
+    census: &mut BTreeSet<Case>,
+  ) -> Outcome {
+    let Some(referenced) = manifests.get(manifest).cloned() else {
+      return Outcome::Refused;
+    };
+    if !shipped.is_subset(&referenced) {
+      census.insert(Case::PutRefusedUnreferenced);
+      return Outcome::Refused;
+    }
+    let staged_before = model
+      .stages
+      .get(&object)
+      .filter(|stage| stage.manifest == manifest)
+      .map(|stage| stage.staged.clone())
+      .unwrap_or_default();
+    let created = match model_open(model, manifests, (object, manifest, 0)) {
+      Err(_) => {
+        census.insert(Case::PutRefusedStale);
+        return Outcome::Refused;
+      }
+      Ok(None) => {
+        census.insert(Case::Retry);
+        return Outcome::Held;
+      }
+      Ok(Some((_, created))) => created,
+    };
+    let held_before = chunks_of(model, manifests, object);
+    for &chunk in shipped {
+      let _ = model_send(model, manifests, (object, manifest, chunk), false);
+    }
+    match model_promote(model, manifests, object) {
+      Ok(()) => {
+        let unshipped: BTreeSet<usize> = referenced.difference(shipped).copied().collect();
+        census.insert(if unshipped.is_empty() {
+          Case::PutWholeShipped
+        } else if !unshipped.is_disjoint(&staged_before) {
+          Case::PutCompletedFromStage
+        } else {
+          Case::PutCompletedFromHeld
+        });
+        let _ = held_before;
+        Outcome::Held
+      }
+      Err(_) => {
+        census.insert(Case::PutRefused);
+        let have = chunks_of(model, manifests, object);
+        let lacking: BTreeSet<usize> = referenced
+          .iter()
+          .filter(|chunk| !shipped.contains(chunk) && !have.contains(chunk))
+          .copied()
+          .collect();
+        let elsewhere = (0..OBJECTS)
+          .filter(|other| *other != object)
+          .any(|other| !lacking.is_disjoint(&chunks_of(model, manifests, other)));
+        if elsewhere {
+          census.insert(Case::PutRefusedHeldElsewhere);
+        }
+        if created {
+          model.stages.remove(&object);
+        }
+        Outcome::Refused
+      }
+    }
+  }
+
+  /// An offer by the rule, recording its cases.
+  fn model_offer(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    (object, manifest, sequence): (usize, usize, u64),
+    census: &mut BTreeSet<Case>,
+  ) -> Outcome {
+    let before = model.stages.get(&object).cloned();
+    match model_open(model, manifests, (object, manifest, sequence)) {
+      Err(_) => {
+        census.insert(Case::OfferStale);
+        Outcome::Refused
+      }
+      Ok(None) => {
+        census.insert(Case::OfferHeld);
+        Outcome::Held
+      }
+      Ok(Some((missing, created))) => {
+        match &before {
+          Some(stage) if stage.manifest != manifest => {
+            census.insert(Case::OfferReplaced);
+          }
+          Some(stage) if !created && !stage.staged.is_empty() => {
+            census.insert(Case::OfferResumed);
+          }
+          _ => {}
+        }
+        if missing.is_empty() {
+          let _ = model_promote(model, manifests, object);
+          census.insert(Case::OfferCompletedAtOnce);
+          return Outcome::Held;
+        }
+        census.insert(Case::OfferMissing);
+        Outcome::Missing(missing)
+      }
+    }
+  }
+
+  /// A chunk sent by the rule, recording its cases.
+  fn model_chunk(
+    model: &mut Model,
+    manifests: &[BTreeSet<usize>],
+    (object, manifest, chunk): (usize, usize, usize),
+    corrupt: bool,
+    census: &mut BTreeSet<Case>,
+  ) -> Outcome {
+    match model_send(model, manifests, (object, manifest, chunk), corrupt) {
+      Err(Refused::Unstaged | Refused::Stale) => {
+        census.insert(Case::SendUnstaged);
+        Outcome::Refused
+      }
+      Err(Refused::Unreferenced) => {
+        census.insert(Case::SendUnreferenced);
+        Outcome::Refused
+      }
+      Err(Refused::Corrupt) => {
+        census.insert(Case::SendCorruptRefused);
+        Outcome::Refused
+      }
+      Ok((0, _)) => match model_promote(model, manifests, object) {
+        Ok(()) => {
+          census.insert(Case::SendCompleted);
+          Outcome::Held
+        }
+        Err(_) => {
+          census.insert(Case::SendShort);
+          Outcome::Progress
+        }
+      },
+      Ok((_, duplicate)) => {
+        census.insert(if duplicate {
+          Case::SendDuplicate
+        } else {
+          Case::SendStaged
+        });
+        Outcome::Progress
+      }
+    }
+  }
+
+  /// Applies `step` to the model by the rule, recording the cases it meets; `None` for a step naming no
+  /// manifest of the shape.
   fn model_apply(
     model: &mut Model,
     manifests: &[BTreeSet<usize>],
     step: &Step,
     census: &mut BTreeSet<Case>,
-  ) -> Option<bool> {
+  ) -> Option<Outcome> {
+    let named = |manifest: &usize| manifests.get(*manifest).map(|_| ());
     match step {
       Step::Put {
         object,
@@ -2416,50 +3522,23 @@ mod ownership_oracle {
         shipped,
         ..
       } => {
-        let referenced = manifests.get(*manifest)?;
-        if !shipped.is_subset(referenced) {
-          census.insert(Case::PutRefusedUnreferenced);
-          return Some(false);
-        }
-        if model
-          .get(object)
-          .is_some_and(|held| held.contains(manifest))
-        {
-          census.insert(Case::Retry);
-          return Some(true);
-        }
-        let have = chunks_of(model, manifests, *object);
-        let missing: BTreeSet<usize> = referenced
-          .iter()
-          .filter(|chunk| !shipped.contains(chunk) && !have.contains(chunk))
-          .copied()
-          .collect();
-        if !missing.is_empty() {
-          census.insert(Case::PutRefused);
-          let elsewhere = (0..OBJECTS)
-            .filter(|other| other != object)
-            .any(|other| !missing.is_disjoint(&chunks_of(model, manifests, other)));
-          if elsewhere {
-            census.insert(Case::PutRefusedHeldElsewhere);
-          }
-          return Some(false);
-        }
-        census.insert(if referenced.is_subset(shipped) {
-          Case::PutWholeShipped
-        } else {
-          Case::PutCompletedFromHeld
-        });
-        model.entry(*object).or_default().insert(*manifest);
-        Some(true)
+        named(manifest)?;
+        Some(model_put(
+          model,
+          manifests,
+          (*object, *manifest, shipped),
+          census,
+        ))
       }
       Step::Forget { object, manifest } => {
         let referenced = manifests.get(*manifest)?;
         let removed = model
+          .held
           .get_mut(object)
           .is_some_and(|held| held.remove(manifest));
         if !removed {
           census.insert(Case::ForgetNotHeld);
-          return Some(false);
+          return Some(Outcome::Refused);
         }
         let still = chunks_of(model, manifests, *object);
         if !referenced.is_disjoint(&still) {
@@ -2468,7 +3547,43 @@ mod ownership_oracle {
         if !referenced.is_subset(&still) {
           census.insert(Case::ForgetReleased);
         }
-        Some(true)
+        Some(Outcome::Held)
+      }
+      Step::Offer {
+        object,
+        manifest,
+        sequence,
+      } => {
+        named(manifest)?;
+        Some(model_offer(
+          model,
+          manifests,
+          (*object, *manifest, *sequence),
+          census,
+        ))
+      }
+      Step::Send {
+        object,
+        manifest,
+        chunk,
+        corrupt,
+        ..
+      } => {
+        named(manifest)?;
+        Some(model_chunk(
+          model,
+          manifests,
+          (*object, *manifest, *chunk),
+          *corrupt,
+          census,
+        ))
+      }
+      Step::ForgetObject { object } => {
+        if model.stages.remove(object).is_some() {
+          census.insert(Case::ForgetObjectWithStage);
+        }
+        model.held.remove(object);
+        Some(Outcome::Held)
       }
     }
   }
@@ -2480,11 +3595,24 @@ mod ownership_oracle {
     model: &Model,
     manifests: &[BTreeSet<usize>],
   ) -> Result<(), String> {
-    let mut referenced = BTreeSet::new();
     for at in 0..OBJECTS {
       for (index, chunks) in manifests.iter().enumerate() {
         let id = identity(chunks);
-        let held = model.get(&at).is_some_and(|held| held.contains(&index));
+        let staged = model
+          .stages
+          .get(&at)
+          .filter(|stage| stage.manifest == index)
+          .map(|stage| stage.staged.len());
+        if hold.staged_of(object(at), &id) != staged {
+          return Err(format!(
+            "object {at} manifest {index}: staged {:?}, the model {staged:?}",
+            hold.staged_of(object(at), &id)
+          ));
+        }
+        let held = model
+          .held
+          .get(&at)
+          .is_some_and(|held| held.contains(&index));
         if !held {
           if hold.holds_manifest(object(at), &id) {
             return Err(format!(
@@ -2496,6 +3624,15 @@ mod ownership_oracle {
         let archive = hold
           .archive_of(arena, object(at), &id)
           .ok_or_else(|| format!("object {at} manifest {index} is not reconstructible"))?;
+        if archive
+          .chunks
+          .iter()
+          .any(|chunk| Archive::verify_into(chunk, &mut []).is_err())
+        {
+          return Err(format!(
+            "object {at} manifest {index} holds bytes failing their identity"
+          ));
+        }
         let got: BTreeSet<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
         let expected: BTreeSet<[u8; 32]> = chunks.iter().map(|&c| chunk(c).identity).collect();
         if got != expected {
@@ -2503,37 +3640,68 @@ mod ownership_oracle {
             "object {at} manifest {index} reconstructed other chunks"
           ));
         }
-        referenced.extend(chunks.iter().copied());
       }
     }
-    let manifest_count: usize = model.values().map(BTreeSet::len).sum();
-    if hold.manifest_count() != manifest_count {
+    let manifest_count: usize = model.held.values().map(BTreeSet::len).sum();
+    if hold.manifest_count() != manifest_count || hold.stage_count() != model.stages.len() {
       return Err(format!(
-        "{} manifests held, the model holds {manifest_count}",
-        hold.manifest_count()
+        "{} manifests and {} stages, the model {manifest_count} and {}",
+        hold.manifest_count(),
+        hold.stage_count(),
+        model.stages.len()
       ));
     }
-    if hold.chunk_count() != referenced.len() {
+    let stored = stored(model, manifests);
+    if hold.chunk_count() != stored.len() {
       return Err(format!(
-        "{} chunks stored, held manifests reference {}",
+        "{} chunks stored, the model stores {}",
         hold.chunk_count(),
-        referenced.len()
+        stored.len()
       ));
     }
     Ok(())
   }
 
   /// `step` as it runs against `manifests` from the model's state: an offered put ships exactly its manifest's
-  /// chunks the object does not yet hold — the missing set the offer draws.
+  /// chunks the object neither holds nor has kept in its stage of the manifest — the missing set the offer
+  /// draws — and an aimed send carries a chunk
+  /// its object's stage lacks, for that stage's manifest.
   fn resolve(step: &Step, manifests: &[BTreeSet<usize>], model: &Model) -> Step {
     match step {
+      Step::Send {
+        object,
+        chunk,
+        corrupt,
+        aimed: true,
+        ..
+      } if model.stages.contains_key(object) => {
+        let stage = &model.stages[object];
+        let lacking: Vec<usize> = stage.missing.iter().copied().collect();
+        Step::Send {
+          object: *object,
+          manifest: stage.manifest,
+          chunk: lacking
+            .get(chunk % lacking.len().max(1))
+            .copied()
+            .unwrap_or(*chunk),
+          corrupt: *corrupt,
+          aimed: false,
+        }
+      }
       Step::Put {
         object,
         manifest,
         offered: true,
         ..
       } => {
-        let have = chunks_of(model, manifests, *object);
+        let mut have = chunks_of(model, manifests, *object);
+        if let Some(stage) = model
+          .stages
+          .get(object)
+          .filter(|stage| stage.manifest == *manifest)
+        {
+          have.extend(stage.staged.iter().copied());
+        }
         Step::Put {
           object: *object,
           manifest: *manifest,
@@ -2548,6 +3716,116 @@ mod ownership_oracle {
     }
   }
 
+  /// The pool index of each pool chunk's identity, to read a missing set back.
+  fn pool_index() -> BTreeMap<[u8; 32], usize> {
+    (0..POOL).map(|at| (chunk(at).identity, at)).collect()
+  }
+
+  /// What a served reply says.
+  fn outcome_of(reply: &[u8]) -> Outcome {
+    match ContentMessage::decode(reply) {
+      Ok(ContentMessage::Ack(_)) => Outcome::Held,
+      Ok(ContentMessage::Missing { missing, .. }) => {
+        let index = pool_index();
+        Outcome::Missing(
+          missing
+            .iter()
+            .filter_map(|identity| index.get(identity).copied())
+            .collect(),
+        )
+      }
+      Ok(ContentMessage::Staged { .. }) => Outcome::Progress,
+      _ => Outcome::Refused,
+    }
+  }
+
+  /// Runs `step` on the hold and reports its outcome.
+  fn hold_apply(
+    hold: &mut ContentHold,
+    room: &mut TestSpace,
+    manifests: &[BTreeSet<usize>],
+    step: &Step,
+  ) -> Outcome {
+    let served = |hold: &mut ContentHold, room: &mut TestSpace, request: Vec<u8>| {
+      outcome_of(
+        &hold
+          .serve(
+            &mut room.space(),
+            HostId(2),
+            &request,
+            |_, _| true,
+            |_, _, _| true,
+          )
+          .0,
+      )
+    };
+    let empty = BTreeSet::new();
+    match step {
+      Step::Put {
+        object: at,
+        manifest,
+        shipped,
+        ..
+      } => {
+        let chunks = manifests.get(*manifest).unwrap_or(&empty);
+        match hold.hold(
+          &mut room.space(),
+          object(*at),
+          Placed::default(),
+          archive(chunks, shipped),
+        ) {
+          Ok(_) => Outcome::Held,
+          Err(_) => Outcome::Refused,
+        }
+      }
+      Step::Forget {
+        object: at,
+        manifest,
+      } => {
+        let chunks = manifests.get(*manifest).unwrap_or(&empty);
+        if hold.forget_manifest(&mut room.space(), object(*at), &identity(chunks)) {
+          Outcome::Held
+        } else {
+          Outcome::Refused
+        }
+      }
+      Step::Offer {
+        object: at,
+        manifest,
+        sequence,
+      } => {
+        let chunks = manifests.get(*manifest).unwrap_or(&empty);
+        let request = offer_request(&archive(chunks, &empty), object(*at), *sequence);
+        served(hold, room, request)
+      }
+      Step::Send {
+        object: at,
+        manifest,
+        chunk: index,
+        corrupt,
+        ..
+      } => {
+        let chunks = manifests.get(*manifest).unwrap_or(&empty);
+        let mut sent = chunk(*index);
+        if *corrupt && let Some(byte) = sent.payload.first_mut() {
+          *byte ^= 0x01;
+        }
+        let request = ContentMessage::Chunk {
+          object: object(*at),
+          sequence: 0,
+          manifest: identity(chunks),
+          chunk: sent,
+        }
+        .encode();
+        served(hold, room, request)
+      }
+      Step::ForgetObject { object: at } => {
+        hold.forget_object(&mut room.space(), object(*at));
+        Outcome::Held
+      }
+    }
+  }
+
   /// Runs one shape and history on a fresh hold against the model, recording the cases met.
   fn run(
     manifests: &[BTreeSet<usize>],
@@ -2556,38 +3834,16 @@ mod ownership_oracle {
   ) -> Result<(), String> {
     let mut hold = ContentHold::new();
     let mut room = TestSpace::new();
-    let mut model = Model::new();
+    let mut model = Model::default();
     for step in steps {
       let step = &resolve(step, manifests, &model);
       let Some(expected) = model_apply(&mut model, manifests, step, census) else {
         continue;
       };
-      let got = match step {
-        Step::Put {
-          object: at,
-          manifest,
-          shipped,
-          ..
-        } => manifests.get(*manifest).is_some_and(|chunks| {
-          hold
-            .hold(
-              &mut room.space(),
-              object(*at),
-              Placed::default(),
-              archive(chunks, shipped),
-            )
-            .is_ok()
-        }),
-        Step::Forget {
-          object: at,
-          manifest,
-        } => manifests.get(*manifest).is_some_and(|chunks| {
-          hold.forget_manifest(&mut room.space(), object(*at), &identity(chunks))
-        }),
-      };
+      let got = hold_apply(&mut hold, &mut room, manifests, step);
       if got != expected {
         return Err(format!(
-          "{step:?}: the hold answered {got}, the model {expected}"
+          "{step:?}: the hold answered {got:?}, the model {expected:?}"
         ));
       }
       check(&hold, &room.arena, &model, manifests)
@@ -2605,8 +3861,9 @@ mod ownership_oracle {
         census.insert(Case::SharedAcrossObjects);
       }
     }
-    // AUD-29-59: what a restart recovers from the hold's image is the same hold — the oracle's whole check
-    // holds against the recovered hold too, and its image is byte-identical (deterministic).
+    // AUD-29-59, AUD-29-55: what a restart recovers from the hold's image is the same hold, its stages'
+    // verified progress included — the oracle's whole check holds against the recovered hold too, and its
+    // image is byte-identical (deterministic).
     let image = hold.to_image(&room.arena);
     let mut recovered = ContentHold::from_image(&mut room.space(), &image)
       .map_err(|refused| format!("image refused: {refused:?}"))?;
@@ -2615,7 +3872,7 @@ mod ownership_oracle {
     if recovered.to_image(&room.arena) != image {
       return Err("the recovered hold images differently".to_owned());
     }
-    // AUD-29-43: releasing everything gives back every charge and every block — nothing leaks.
+    // AUD-29-43, AUD-29-55: releasing everything — stages included — gives back every charge and every block.
     hold.forget_all(&mut room.space());
     recovered.forget_all(&mut room.space());
     let left = (
@@ -2822,28 +4079,46 @@ mod ownership_oracle {
     );
   }
 
-  /// AUD-29-44: do: run generated shapes and histories of puts and forgets on a hold and on the serial model,
-  /// with a fixed-seed runner at proptest's default case count; expect them to agree after every step (see
-  /// the module doc), and expect the census to have met every case the ownership rule distinguishes.
-  #[test]
-  fn the_hold_owns_exactly_what_its_manifests_reference() {
+  /// Runs generated shapes and histories of `kinds` steps, at most `history` long, with a fixed-seed runner at
+  /// proptest's default case count, and returns the cases of `cases` the census never met.
+  fn census_of(kinds: u8, history: usize, cases: &[Case]) -> Vec<Case> {
     let census = RefCell::new(BTreeSet::new());
     let mut runner = TestRunner::new_with_rng(
       slates_test_seeds::unseeded(Config::default()),
       TestRng::deterministic_rng(RngAlgorithm::ChaCha),
     );
-    let strategy = (shape(), proptest::collection::vec(step(), 1..=HISTORY));
+    let strategy = (shape(), proptest::collection::vec(step(kinds), 1..=history));
     let result = runner.run(&strategy, |(manifests, steps)| {
       run(&manifests, &steps, &mut census.borrow_mut()).map_err(TestCaseError::fail)
     });
     if let Err(failure) = result {
-      panic!("AUD-29-44: {failure}");
+      panic!("{failure}");
     }
     let met = census.into_inner();
-    let unmet: Vec<Case> = CASES
-      .into_iter()
+    cases
+      .iter()
+      .copied()
       .filter(|case| !met.contains(case))
-      .collect();
+      .collect()
+  }
+
+  /// AUD-29-44: do: run generated shapes and histories of puts and forgets on a hold and on the serial model;
+  /// expect them to agree after every step (see the module doc), and expect the census to have met every case
+  /// the ownership rule distinguishes.
+  #[test]
+  fn the_hold_owns_exactly_what_its_manifests_reference() {
+    let unmet = census_of(WHOLE_KINDS, 2 * OBJECTS * MANIFESTS, &WHOLE_CASES);
+    assert!(unmet.is_empty(), "the generator never reached {unmet:?}");
+  }
+
+  /// AUD-29-55 (§4.9 "verified ranges and resumable progress"; AC-7.7): do: run generated histories that mix
+  /// whole puts and forgets with offers, single chunks (aimed and drawn, some corrupt) and whole-object
+  /// forgets — a transfer cut and resumed at every point a history can reach; expect the hold and the model to
+  /// agree after every step (replies, staged progress, stored bytes, charges), the image to carry the stages
+  /// across a restart, everything to release to zero, and the census to have met every transfer case.
+  #[test]
+  fn a_cut_transfer_keeps_its_verified_chunks_and_resumes_from_them() {
+    let unmet = census_of(TRANSFER_KINDS, HISTORY, &TRANSFER_CASES);
     assert!(unmet.is_empty(), "the generator never reached {unmet:?}");
   }
 }
