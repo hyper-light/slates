@@ -699,6 +699,7 @@ pub(crate) fn lease_refusal(state: &mut ShardState, object: ObjectId) -> Option<
 /// gate the NFS live tree applies before every procedure, shared by the FUSE mount and the guest device, which
 /// hold their caller's requests while it stands rather than answer from a stale view. A lease refusal is
 /// counted by its reason ([`lease_refusal`]).
+#[cfg(unix)]
 pub(crate) fn live_tree_fenced(state: &mut ShardState, volume: DbVolumeId) -> bool {
   !state.consensus_ready || lease_refusal(state, ObjectId(volume.bytes)).is_some()
 }

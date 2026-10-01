@@ -695,7 +695,10 @@ fn not_landed(
     LandingRefusal::Target(e) => refused(Refusal::TargetUnavailable {
       reason: format!("{e:?}"),
     }),
-    LandingRefusal::Volume(e) => refused(refusal_of_vfs(&e)),
+    LandingRefusal::Volume(e) => {
+      *state.refusals.entry(LANDING_VOLUME_REFUSED).or_insert(0) += 1;
+      refused(refusal_of_vfs(&e))
+    }
     // A run stepped after it ended: the server steps each run to its end once, so this names a defect of
     // the server's own driving, refused typed rather than answered as a landing.
     LandingRefusal::Ended => refused(Refusal::Unsupported {
@@ -995,7 +998,10 @@ fn begin_granted(
   let (source, implicit) = match prepared.source {
     Source::Head => match slot.volume.snapshot(&mut state.store) {
       Ok(id) => (Source::Snapshot(id), Some(id)),
-      Err(e) => return Begun::Refused(refused(refusal_of_vfs(&e))),
+      Err(e) => {
+        *state.refusals.entry(LANDING_SNAPSHOT_REFUSED).or_insert(0) += 1;
+        return Begun::Refused(refused(refusal_of_vfs(&e)));
+      }
     },
     named => (named, None),
   };
@@ -1152,6 +1158,17 @@ fn drop_implicit(
 /// Format: the landing-plane counter of an unnamed landing's implicit snapshot whose destroy was refused.
 #[cfg(unix)]
 const IMPLICIT_SNAPSHOT_KEPT: &str = "landing.implicit_snapshot_kept";
+/// Format: the refusal-ledger names of a landing refused at each of its volume stages — the implicit snapshot
+/// of the head, the engine's read of the volume, the publication after it — so a refusal names its stage
+/// (a `NoSpace` seen only on the macOS runner, 2026-10-01, carried no stage).
+#[cfg(unix)]
+const LANDING_SNAPSHOT_REFUSED: &str = "landing.snapshot_refused";
+/// Format: see [`LANDING_SNAPSHOT_REFUSED`].
+#[cfg(unix)]
+const LANDING_VOLUME_REFUSED: &str = "landing.volume_refused";
+/// Format: see [`LANDING_SNAPSHOT_REFUSED`].
+#[cfg(unix)]
+const LANDING_PUBLISH_REFUSED: &str = "landing.publish_refused";
 
 /// Format: the share of the shard's step quantum one landing slice takes, in permille — half, as the
 /// archive walk's slice takes (`config::archive_slice_bytes`), so a slice leaves the rest of the shard's
@@ -1738,12 +1755,16 @@ fn publish_landed(
   ) {
     match crate::verbs::publish_shard(state) {
       Ok(published) if !published.captured(ids.volume) => {
+        *state.refusals.entry(LANDING_PUBLISH_REFUSED).or_insert(0) += 1;
         return Some(refused(crate::error::refusal_of_vfs(
           &slates_vfs::VfsError::RecoveryIncomplete,
         )));
       }
       Ok(_) => {}
-      Err(error) => return Some(refused(crate::error::refusal_of_vfs(&error))),
+      Err(error) => {
+        *state.refusals.entry(LANDING_PUBLISH_REFUSED).or_insert(0) += 1;
+        return Some(refused(crate::error::refusal_of_vfs(&error)));
+      }
     }
   }
   None

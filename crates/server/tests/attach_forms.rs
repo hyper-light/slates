@@ -199,18 +199,59 @@ fn assert_macos_host_mounts(report: &StatusReport) {
   );
 }
 
-/// Linux: an NFS mount needs a privilege slates never asks for (R10); the FUSE bridge is not served
-/// by the daemon yet.
+/// Whether this host offers an unprivileged FUSE mount, asked the way the daemon asks (`/dev/fuse` readable
+/// and writable by this process, `fusermount3` on the `PATH`; AUD-29-64).
+fn fuse_on_this_host() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    rustix::fs::access(
+      "/dev/fuse",
+      rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+    )
+    .is_ok()
+      && std::process::Command::new("sh")
+        .args(["-c", "command -v fusermount3"])
+        .output()
+        .is_ok_and(|o| o.status.success())
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    false
+  }
+}
+
+/// Linux: an NFS mount needs a privilege slates never asks for (R10); the FUSE mount is served where the host
+/// offers FUSE, with the live kernel mount as its evidence, and refused `FuseUnavailable` elsewhere (AUD-29-64).
 fn assert_linux_host_mounts(report: &StatusReport) {
   assert_eq!(
     entry(&report.transports, AttachTransport::NfsLoopback).unsupported_reason,
     Some(UnsupportedReason::MountNeedsPrivilege),
     "R10: an NFS mount needs a privilege slates never asks for"
   );
-  assert_eq!(
-    entry(&report.transports, AttachTransport::Fuse).unsupported_reason,
-    Some(UnsupportedReason::BridgeNotWired)
-  );
+  let fuse = entry(&report.transports, AttachTransport::Fuse);
+  if fuse_on_this_host() {
+    assert_eq!(
+      fuse.unsupported_reason, None,
+      "FUSE is offered on this host"
+    );
+    assert_eq!(fuse.conformance, Conformance::LiveKernelMountTest);
+  } else {
+    assert_eq!(
+      fuse.unsupported_reason,
+      Some(UnsupportedReason::FuseUnavailable)
+    );
+  }
+}
+
+/// What a container bind is refused with where no NFS host mount is offered: on a Linux host with FUSE the
+/// source authority is built but no container workload has run through it (`ContainerWorkloadUnproven`,
+/// AUD-29-64); elsewhere there is no host mount to bind (`HostMountRequired`).
+fn expected_container_refusal() -> UnsupportedReason {
+  if cfg!(target_os = "linux") && fuse_on_this_host() {
+    UnsupportedReason::ContainerWorkloadUnproven
+  } else {
+    UnsupportedReason::HostMountRequired
+  }
 }
 
 /// On every Unix host: WinFsp does not exist, and the container bind's view is the host mount's at a
@@ -355,9 +396,9 @@ fn assert_unbound_host_paths_are_refused_typed(client: &mut Client, id: VolumeId
       root,
       Refusal::AttachmentUnsupported {
         transport: AttachTransport::Oci,
-        reason: UnsupportedReason::HostMountRequired,
+        reason: expected_container_refusal(),
       },
-      "no host mount transport is offered on this platform"
+      "no NFS host mount is offered on this platform"
     );
   }
   let relative = refused_oci(client, id, None, "work", "/work");
@@ -372,7 +413,9 @@ fn assert_unbound_host_paths_are_refused_typed(client: &mut Client, id: VolumeId
   );
 }
 
-/// The host mount presents the volume's live head, so a snapshot cannot be bound through it.
+/// The host mount presents the volume's live head, so a snapshot cannot be bound through it; where the
+/// container bind itself is not offered (no host mount, or a FUSE host whose container workload is unproven)
+/// that refusal comes first.
 fn assert_a_snapshot_cannot_be_bound(client: &mut Client, id: VolumeId) {
   let ReplyBody::Snapshotted { id: snapshot, .. } =
     client.call(&RequestBody::Snapshot { volume: id })
@@ -386,7 +429,8 @@ fn assert_a_snapshot_cannot_be_bound(client: &mut Client, id: VolumeId) {
       Refusal::AttachmentUnsupported {
         transport: AttachTransport::Oci,
         reason: UnsupportedReason::SnapshotNotPresentedByHostMount
-          | UnsupportedReason::HostMountRequired,
+          | UnsupportedReason::HostMountRequired
+          | UnsupportedReason::ContainerWorkloadUnproven,
       }
     ),
     "{refusal:?}"
@@ -429,10 +473,7 @@ fn the_container_bind_is_offered_exactly_when_a_host_mount_is() {
       assert_eq!(oci.conformance, Conformance::ContainerWorkloadTest);
     }
   } else {
-    assert_eq!(
-      oci.unsupported_reason,
-      Some(UnsupportedReason::HostMountRequired)
-    );
+    assert_eq!(oci.unsupported_reason, Some(expected_container_refusal()));
   }
   drop(client);
   drop(daemon);
