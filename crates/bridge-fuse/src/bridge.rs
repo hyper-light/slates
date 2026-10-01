@@ -92,6 +92,20 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
   let Some(opcode) = request.opcode else {
     return write_or_drop(ReplyHeader::write_error(unique, ENOSYS, out), out);
   };
+  // A creating request stamps the creating process's uid and gid on what it makes (AUD-29-81): ownership
+  // metadata from the kernel's request header, never authority — the attachment's enrolled subject is
+  // unchanged, and the shared seam applies the set-group-ID parent rule.
+  let creator;
+  let cx = if creates(opcode) {
+    creator = OpContext {
+      owner_uid: Some(request.header.uid),
+      owner_gid: Some(request.header.gid),
+      ..cx.clone()
+    };
+    &creator
+  } else {
+    cx
+  };
   match opcode {
     Opcode::Init => serve_init(request.body, unique, out),
     Opcode::Lookup => serve_lookup(bridge, &request, cx, out),
@@ -126,6 +140,32 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::SetAttr => serve_setattr(bridge, &request, cx, out),
     Opcode::StatFs => serve_statfs(bridge, &request, cx, out),
   }
+}
+
+/// Whether `opcode` makes a new object, whose owner is the creating process.
+fn creates(opcode: Opcode) -> bool {
+  matches!(
+    opcode,
+    Opcode::Create | Opcode::MkNod | Opcode::MkDir | Opcode::SymLink
+  )
+}
+
+/// A creation mode with the request's umask applied (AUD-29-80): the permission bits less the umask's.
+/// Under `FUSE_DONT_MASK` the kernel sends the mode unmasked and the umask beside it; without it the kernel
+/// masked the mode already and masking again changes nothing (`m & !u & !u == m & !u`), so the creation
+/// policy is applied exactly once in effect on either negotiated path. A body too short to carry the umask
+/// is refused before this (`EIO`).
+fn masked(mode: u32, umask: u32) -> u32 {
+  permission_bits(mode) & !umask
+}
+
+/// The little-endian `u32` at `at` in a request body, if the body holds it.
+fn body_u32(body: &[u8], at: usize) -> Option<u32> {
+  let end = at.checked_add(size_of::<u32>())?;
+  body
+    .get(at..end)
+    .and_then(|field| field.try_into().ok())
+    .map(u32::from_le_bytes)
 }
 
 /// The object the kernel's node id names: node id 1 is the root (resolved through the bridge under
@@ -578,12 +618,11 @@ fn serve_create(
   if req.body.len() < HEAD {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
-  let flags = u32::from_le_bytes(req.body[0..size_of::<u32>()].try_into().unwrap_or_default());
-  let mode = permission_bits(u32::from_le_bytes(
-    req.body[size_of::<u32>()..2 * size_of::<u32>()]
-      .try_into()
-      .unwrap_or_default(),
-  ));
+  let flags = body_u32(req.body, 0).unwrap_or_default();
+  let mode = masked(
+    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
+    body_u32(req.body, 2 * size_of::<u32>()).unwrap_or_default(),
+  );
   let Ok(name) = parse_name(&req.body[HEAD..]) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
@@ -723,7 +762,16 @@ fn serve_mknod(
     Err(error) => return reply_err(req.header.unique, error, out),
   };
   let result = bridge
-    .mknod(parent, cx, name, mode & PERMISSION_BITS, kind)
+    .mknod(
+      parent,
+      cx,
+      name,
+      masked(
+        mode,
+        body_u32(head, 2 * size_of::<u32>()).unwrap_or_default(),
+      ),
+      kind,
+    )
     .and_then(|node| referenced(bridge, cx, node));
   let result = entry_reply(bridge, cx, result);
   reply(req.header.unique, result, |entry| entry.to_bytes(), out)
@@ -740,9 +788,10 @@ fn serve_mkdir(
   if req.body.len() < HEAD {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
-  let mode = permission_bits(u32::from_le_bytes(
-    req.body[..size_of::<u32>()].try_into().unwrap_or_default(),
-  ));
+  let mode = masked(
+    body_u32(req.body, 0).unwrap_or_default(),
+    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
+  );
   let Ok(name) = parse_name(&req.body[HEAD..]) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };

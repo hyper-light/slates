@@ -152,7 +152,10 @@ pub mod flags {
   pub const BIG_WRITES: u64 = 1 << 5;
   /// Format: FUSE_INIT_EXT — the second 32 bits of the flags word (`flags2`) are present.
   pub const INIT_EXT: u64 = 1 << 30;
-  /// Format: FUSE_DONT_MASK — the kernel applies the umask itself, so the mode arrives unmasked.
+  /// Format: FUSE_DONT_MASK — the kernel does **not** apply the creating process's umask: the mode arrives
+  /// unmasked and the umask travels beside it in the request (`fuse_create_in`, `fuse_mkdir_in`,
+  /// `fuse_mknod_in`), for the filesystem to apply (Linux `fs/fuse/dir.c`). Corrected 2026-10-01
+  /// (AUD-29-80): this said the opposite, and the handlers discarded the umask.
   pub const DONT_MASK: u64 = 1 << 6;
   /// Format: FUSE_HAS_EXPIRE_ONLY — the kernel honours `FUSE_EXPIRE_ONLY` on an entry
   /// invalidation (revalidate the name on its next use rather than drop it now; 6.2+). In the

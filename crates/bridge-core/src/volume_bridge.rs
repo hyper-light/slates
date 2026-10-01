@@ -29,6 +29,10 @@ use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::inode::Kind;
+
+/// Format: the set-group-ID mode bit (`<sys/stat.h>` `S_ISGID`): on a directory, what is created in it takes
+/// the directory's group, and a directory created in it takes the bit too.
+const S_ISGID: u32 = 0o2000;
 use slates_vfs::journal::Op;
 use slates_vfs::volume::{Observed, Store, Volume};
 
@@ -427,17 +431,24 @@ impl<'v> VolumeBridge<'v> {
       (None, Principal::Consumer { account, .. }) => *account,
       (None, Principal::Sid { .. } | Principal::Certificate { .. }) => return Ok(()),
     };
-    let gid = match cx.owner_gid {
-      Some(gid) => gid,
-      None => {
-        match host_for(&mut self.host, self.volume.is_overlay())? {
-          Some(host) => self.volume.with_host(host).stat(self.store, parent),
-          None => self.volume.stat(self.store, parent),
-        }?
-        .gid
-      }
+    let parent_attrs = match host_for(&mut self.host, self.volume.is_overlay())? {
+      Some(host) => self.volume.with_host(host).stat(self.store, parent),
+      None => self.volume.stat(self.store, parent),
+    }?;
+    // The POSIX creation rule (AUD-29-81): a set-group-ID parent gives its group to what is made in it, and
+    // a directory made there takes the bit too; otherwise the creator's group, where the request names one,
+    // else the parent's (the BSD rule, for a credential without a group).
+    let setgid_parent = parent_attrs.mode & S_ISGID != 0;
+    let gid = match (setgid_parent, cx.owner_gid) {
+      (false, Some(gid)) => gid,
+      _ => parent_attrs.gid,
     };
-    self.volume.chown(self.store, new, uid, gid)
+    self.volume.chown(self.store, new, uid, gid)?;
+    if setgid_parent && self.volume.kind(self.store, new)? == Kind::Dir {
+      let made = self.volume.stat(self.store, new)?;
+      self.volume.chmod(self.store, new, made.mode | S_ISGID)?;
+    }
+    Ok(())
   }
 }
 
