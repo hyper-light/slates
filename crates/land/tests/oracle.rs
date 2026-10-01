@@ -633,7 +633,17 @@ fn crash_edits(vol: &mut Volume, host: &mut SimHost, store: &mut Store) {
   rm_r(vol, host, store, "/cleared");
   mkdir(vol, host, store, "/cleared");
   write_file(vol, host, store, "/cleared/c.txt", b"c");
+  // A file past three content windows, so a landing copies it a window per unit (AUD-29-25): its bytes vary
+  // by position, so a window copied to the wrong offset shows on the disk.
+  let window = store.content.chunk_bytes();
+  let large: Vec<u8> = (0..LARGE_WINDOWS * window + 1)
+    .map(|at| u8::try_from(at % usize::from(u8::MAX)).unwrap())
+    .collect();
+  write_file(vol, host, store, "/large.bin", &large);
 }
+
+/// Shape: the content windows the crash scenario's large file spans (and one byte more).
+const LARGE_WINDOWS: usize = 3;
 
 /// The crash scenario, ready to land: the host, the volume and its store; `exchange: false` takes the
 /// atomic exchange away (the fallback of T-1.16).

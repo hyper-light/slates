@@ -70,11 +70,24 @@ had nothing to resume between them.
 - The engine's 52 tests, the server's landing, lease, recovery and snapshot-landing tests, and the CLI suite
   with a live kernel mount all pass.
 
+## Large files (the same day)
+
+A file past one content window was one unit: its bytes read whole into one buffer and written in one call.
+Now:
+- **The copy is a window per unit.** A temporary is created, then one window of the volume's content is
+  read (`Source::read_at`) and written per unit, then mode, mtime and sync, and the placement. The landing's
+  memory and each unit's work are bounded by the window however large the file.
+- **The fences are checked again before placement,** since a long copy can outlive its grant or lease. A
+  copy that may not be placed has its temporary removed and is reported skipped.
+- **One implementation.** The one-call path loops the same units, and `read_overlay_bytes` and `fill_temp`
+  are gone.
+- **Tests.** The crash scenario now holds a file of three windows and a byte, with position-dependent bytes.
+  Both the sliced-equivalence oracle and crash-at-every-instruction (sliced and not) pass over it, so a
+  crash inside every chunk write resumes to the reference. The daemon's 2 MiB partly-edited base file lands
+  through it too.
+
 ## Owed (AUD-29-25 open in part)
 
-- **A large file is one unit.** Its bytes are read whole and written in one call, so a slice holding a large
-  file lasts as long as the file's write. Chunked copy across slices removes both the whole-file buffer and
-  that bound.
 - **The landing lease is not renewed.** Its term is still the failover bound; the run can now renew it
   between slices (the keepalive the lease records wait on).
 - **The p99/p999 shard-step distribution under a landing is not yet recorded.** It belongs with the R9

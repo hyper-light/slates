@@ -4774,8 +4774,9 @@ stays in the overlay.
 > - **The base host.** An overlay's base host goes back to the volume's slot between slices.
 > - **The source.** An unnamed landing lands an implicit snapshot of the head, taken when it begins.
 > - **One at a time.** One granted landing per volume runs at a time.
-> - **Owed:** a large file's copy across slices, the lease keepalive between slices, and the shard-step
->   percentile lane (`docs/bugs/2026-10-01-a-granted-landing-held-its-shard-for-all-of-its-work.md`).
+> - **Large files.** A large file is copied one content window per unit, so no unit grows with a file.
+> - **Owed:** the lease keepalive between slices, and the shard-step percentile lane
+>   (`docs/bugs/2026-10-01-a-granted-landing-held-its-shard-for-all-of-its-work.md`).
 >
 > **Status (2026-09-29, A-46, AUD-29-07).** A presented landing is consumed by the landing its grant
 > covers, replaced by its client's re-presentation, abandoned with its client, and bounded per shard. Before,

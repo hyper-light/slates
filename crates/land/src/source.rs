@@ -111,9 +111,23 @@ impl Source {
     no: InodeNo,
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
+    self.read_at(vol, store, host, no, 0, buf)
+  }
+
+  /// The bytes of `no` from `off`, as far as `buf` holds: a landing copies a file a window at a time
+  /// (AUD-29-25).
+  pub(crate) fn read_at(
+    self,
+    vol: &mut Volume,
+    store: &mut Store,
+    host: &mut dyn HostFs,
+    no: InodeNo,
+    off: u64,
+    buf: &mut [u8],
+  ) -> Result<usize, VfsError> {
     match self {
-      Source::Head => vol.with_host(host).read(store, no, 0, buf),
-      Source::Snapshot(id) => vol.with_host(host).read_in(store, id, no, 0, buf),
+      Source::Head => vol.with_host(host).read(store, no, off, buf),
+      Source::Snapshot(id) => vol.with_host(host).read_in(store, id, no, off, buf),
     }
   }
 }

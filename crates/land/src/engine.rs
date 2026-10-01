@@ -582,6 +582,10 @@ struct WriteProgress {
   step_started: Instant,
   step_entries: u64,
   step_max_ns: u64,
+  /// When the entry being written began, on the landing's clock (its `land.entry` span's start).
+  entry_start_ns: u64,
+  /// The file being copied, a window per unit, when the entry is a file past one window.
+  copy: Option<FileCopy>,
 }
 
 impl WriteProgress {
@@ -592,8 +596,23 @@ impl WriteProgress {
       step_started: Instant::now(),
       step_entries: 0,
       step_max_ns: 0,
+      entry_start_ns: 0,
+      copy: None,
     }
   }
+}
+
+/// A file being copied into its temporary, a window per unit (AUD-29-25), so a landing's memory and each
+/// unit's work are bounded by the window however large the file.
+struct FileCopy {
+  temp: HostFile,
+  dir: HostDir,
+  created: Box<str>,
+  inode: slates_vfs::ids::InodeNo,
+  /// The next byte to copy.
+  next: u64,
+  overlay: OverlayIdentity,
+  started: Instant,
 }
 
 /// The sync phase's tally across the directories it syncs, kept between slices.
@@ -922,6 +941,8 @@ impl<H: LandFs> Landing<'_, H> {
 
   /// Writes one entry under the write phase's `progress` (the unit a sliced landing writes per step): its
   /// verdict decides whether it is written, skipped or refused, and its outcome lands in its report.
+  /// Returns whether the entry is done: `false` while its file is still being copied (`copy` holds it), so
+  /// a large file is many units, a window each, and no unit's work grows with a file's size (AUD-29-25).
   fn write_one(
     &mut self,
     manifest: &Manifest,
@@ -929,7 +950,7 @@ impl<H: LandFs> Landing<'_, H> {
     report: &mut EntryReport,
     cx: &mut WriteContext<'_, H>,
     progress: &mut WriteProgress,
-  ) {
+  ) -> bool {
     let WriteContext {
       vol,
       store,
@@ -941,6 +962,60 @@ impl<H: LandFs> Landing<'_, H> {
     let grant = *grant;
     let lease = *lease;
     let started = progress.started;
+    let window = store.content.chunk_bytes().max(1);
+    let fenced = |now_ns: u64| {
+      if grant_ended(grant, now_ns) {
+        Some(Outcome::Skipped(SkipReason::GrantEnded))
+      } else if lease.expires_ns <= now_ns {
+        Some(Outcome::Skipped(SkipReason::LeaseEnded))
+      } else {
+        None
+      }
+    };
+    if let Some(mut copy) = progress.copy.take() {
+      let written = match self.copy_chunk(&mut copy, vol, store, window) {
+        Ok(true) => {
+          progress.copy = Some(copy);
+          return false;
+        }
+        // Copied: placed only while the grant and lease still hold — a long copy can outlive them.
+        Ok(false) => match fenced(self.request.now_ns.saturating_add(elapsed_ns(started))) {
+          Some(skipped) => {
+            self.drop_copy(&entry.path, copy);
+            Written {
+              outcome: skipped,
+              window_ns: None,
+            }
+          }
+          None => {
+            let entry_started = copy.started;
+            let witness = match entry.action {
+              Action::Replace => self.witness_of(entry),
+              _ => None,
+            };
+            let finished = self.finish_copy(entry, copy, witness.as_ref());
+            let w = self.written_of(finished);
+            progress.step_entries = progress.step_entries.saturating_add(1);
+            progress.step_max_ns = progress.step_max_ns.max(elapsed_ns(entry_started));
+            w
+          }
+        },
+        Err(failure) => {
+          self.drop_copy(&entry.path, copy);
+          self.written_of(Err(failure))
+        }
+      };
+      self.record_entry(
+        manifest,
+        report,
+        written,
+        grant,
+        &mut **observer,
+        audit,
+        progress,
+      );
+      return true;
+    }
     if progress.class != Some(entry.class()) {
       if progress.class.is_some() {
         self.ramp.observe(StepSample {
@@ -955,27 +1030,37 @@ impl<H: LandFs> Landing<'_, H> {
       progress.step_max_ns = 0;
     }
     // The `land.entry` chokepoint span (§4.14) brackets one entry's processing, whatever its verdict.
-    let entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
+    progress.entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
     let outcome = match report.verdict {
       Some(Verdict::Apply) => {
-        let now_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
-        if grant_ended(grant, now_ns) {
-          Written {
-            outcome: Outcome::Skipped(SkipReason::GrantEnded),
+        match fenced(self.request.now_ns.saturating_add(elapsed_ns(started))) {
+          Some(skipped) => Written {
+            outcome: skipped,
             window_ns: None,
+          },
+          None => {
+            observer.before_write(self.host, entry);
+            let large = matches!(entry.action, Action::Create | Action::Replace)
+              && entry
+                .overlay
+                .is_some_and(|o| o.size > u64::try_from(window).unwrap_or(u64::MAX));
+            if large {
+              // A file past one window is copied a window per unit.
+              match self.begin_copy(entry, vol, store) {
+                Ok(copy) => {
+                  progress.copy = Some(copy);
+                  return false;
+                }
+                Err(failure) => self.written_of(Err(failure)),
+              }
+            } else {
+              let entry_started = Instant::now();
+              let w = self.write_entry(entry, vol, store);
+              progress.step_entries = progress.step_entries.saturating_add(1);
+              progress.step_max_ns = progress.step_max_ns.max(elapsed_ns(entry_started));
+              w
+            }
           }
-        } else if lease.expires_ns <= now_ns {
-          Written {
-            outcome: Outcome::Skipped(SkipReason::LeaseEnded),
-            window_ns: None,
-          }
-        } else {
-          observer.before_write(self.host, entry);
-          let entry_started = Instant::now();
-          let w = self.write_entry(entry, vol, store);
-          progress.step_entries = progress.step_entries.saturating_add(1);
-          progress.step_max_ns = progress.step_max_ns.max(elapsed_ns(entry_started));
-          w
         }
       }
       Some(Verdict::Skip) => Written {
@@ -990,15 +1075,40 @@ impl<H: LandFs> Landing<'_, H> {
         outcome: Outcome::Conflict(c),
         window_ns: None,
       },
-      None => return,
+      None => return true,
     };
-    observer.after_entry(
-      entry_start_ns,
-      self.request.now_ns.saturating_add(elapsed_ns(started)),
+    self.record_entry(
+      manifest,
+      report,
+      outcome,
+      grant,
+      &mut **observer,
+      audit,
+      progress,
     );
+    true
+  }
+
+  /// An entry's outcome recorded: its `land.entry` span, its audit record, its report.
+  #[allow(clippy::too_many_arguments)] // the entry, its outcome, and the three sinks it is recorded in
+  fn record_entry(
+    &mut self,
+    manifest: &Manifest,
+    report: &mut EntryReport,
+    outcome: Written,
+    grant: Option<&GrantRecord>,
+    observer: &mut dyn Observer<H>,
+    audit: &mut Audit,
+    progress: &WriteProgress,
+  ) {
+    let now_ns = self
+      .request
+      .now_ns
+      .saturating_add(elapsed_ns(progress.started));
+    observer.after_entry(progress.entry_start_ns, now_ns);
     audit.push(AuditRecord {
       seq: 0,
-      at_ns: self.request.now_ns.saturating_add(elapsed_ns(started)),
+      at_ns: now_ns,
       kind: if outcome.outcome == Outcome::Written {
         AuditKind::EntryWritten
       } else {
@@ -1027,7 +1137,13 @@ impl<H: LandFs> Landing<'_, H> {
   /// Writes one entry, mapping a host refusal to its outcome: a full disk fails the entry, any
   /// other unavailability ends the landing (the target is gone or the disk is).
   fn write_entry(&mut self, entry: &LandingEntry, vol: &mut Volume, store: &mut Store) -> Written {
-    match self.try_write_entry(entry, vol, store) {
+    let attempted = self.try_write_entry(entry, vol, store);
+    self.written_of(attempted)
+  }
+
+  /// A write's result as its entry's outcome (see [`Landing::write_entry`]).
+  fn written_of(&mut self, attempted: Result<Written, WriteFailure>) -> Written {
+    match attempted {
       Ok(w) => w,
       Err(WriteFailure::Host(HostError::Unavailable(errno))) if disk_full(errno) => Written {
         outcome: Outcome::Failed { errno },
@@ -1121,21 +1237,117 @@ impl<H: LandFs> Landing<'_, H> {
     store: &mut Store,
     witnessed: Option<&Witness>,
   ) -> Result<Written, WriteFailure> {
-    let (dir_path, name) = split(&entry.path);
+    let window = store.content.chunk_bytes().max(1);
+    let mut copy = self.begin_copy(entry, vol, store)?;
+    loop {
+      match self.copy_chunk(&mut copy, vol, store, window) {
+        Ok(true) => {}
+        Ok(false) => break,
+        Err(failure) => {
+          self.drop_copy(&entry.path, copy);
+          return Err(failure);
+        }
+      }
+    }
+    self.finish_copy(entry, copy, witnessed)
+  }
+
+  /// A file's copy begun: its temporary created at a plain hidden name in its directory. Every temporary is
+  /// created at a plain hidden name, the landing's own by its name: a crash while it is being written leaves it
+  /// there, and the sweep removes it. A replacement's complete temporary then takes the entry's aside name,
+  /// where the exchange leaves the displaced entry and a sweep after a crash checks it before removing it
+  /// (AUD-29-04). Before 2026-09-30 a replacement's temporary was created at its aside name, where a crash
+  /// mid-write left bytes that matched neither the witness nor the overlay, and the resume kept them (a
+  /// named-temporary filesystem: APFS).
+  fn begin_copy(
+    &mut self,
+    entry: &LandingEntry,
+    vol: &mut Volume,
+    store: &mut Store,
+  ) -> Result<FileCopy, WriteFailure> {
+    let (dir_path, _) = split(&entry.path);
     let overlay = entry
       .overlay
       .ok_or(WriteFailure::Volume(VfsError::Invalid))?;
-    let bytes = read_overlay_bytes(vol, store, self.host, self.request.source, &entry.path)?;
+    let located = self.request.source.resolve(vol, store, &entry.path)?;
     let dir = self.open_dir_path(dir_path)?;
     self.touched.insert(dir_path.into());
-    // Every temporary is created at a plain hidden name, the landing's own by its name: a crash while it is
-    // being written leaves it there, and the sweep removes it. A replacement's complete temporary then takes
-    // the entry's aside name, where the exchange leaves the displaced entry and a sweep after a crash checks
-    // it before removing it (AUD-29-04). Before 2026-09-30 a replacement's temporary was created at its
-    // aside name, where a crash mid-write left bytes that matched neither the witness nor the overlay, and
-    // the resume kept them (a named-temporary filesystem: APFS).
     let created = self.hidden_name();
-    let temp = self.fill_temp(dir, dir_path, &created, &bytes, overlay)?;
+    let temp = self.host.create_temp(dir, &created)?;
+    Ok(FileCopy {
+      temp,
+      dir,
+      created,
+      inode: located.inode,
+      next: 0,
+      overlay,
+      started: Instant::now(),
+    })
+  }
+
+  /// One window of the file read from the volume (which may read a large-class file's unwritten windows from
+  /// the base) and written into the temporary: whether more remain. A file the volume holds shorter than its
+  /// manifest's size is refused, never padded.
+  fn copy_chunk(
+    &mut self,
+    copy: &mut FileCopy,
+    vol: &mut Volume,
+    store: &mut Store,
+    window: usize,
+  ) -> Result<bool, WriteFailure> {
+    let remaining = copy.overlay.size.saturating_sub(copy.next);
+    if remaining == 0 {
+      return Ok(false);
+    }
+    let len = usize::try_from(remaining).unwrap_or(usize::MAX).min(window);
+    let mut bytes = vec![0u8; len];
+    let read = self
+      .request
+      .source
+      .read_at(vol, store, self.host, copy.inode, copy.next, &mut bytes)?;
+    let Some(chunk) = bytes.get(..read).filter(|chunk| !chunk.is_empty()) else {
+      return Err(WriteFailure::Volume(VfsError::Invalid));
+    };
+    self.host.write_at(copy.temp, copy.next, chunk)?;
+    copy.next = copy
+      .next
+      .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    Ok(copy.next < copy.overlay.size)
+  }
+
+  /// The copied file finished — its mode, mtime and data sync — and placed: linked at its name, or exchanged
+  /// with the witnessed file it replaces.
+  fn finish_copy(
+    &mut self,
+    entry: &LandingEntry,
+    copy: FileCopy,
+    witnessed: Option<&Witness>,
+  ) -> Result<Written, WriteFailure> {
+    let (dir_path, name) = split(&entry.path);
+    let FileCopy {
+      temp,
+      dir,
+      created,
+      overlay,
+      started,
+      ..
+    } = copy;
+    let filled = self
+      .host
+      .set_mode(temp, overlay.mode)
+      .and_then(|()| self.host.set_mtime(temp, overlay.mtime_ns))
+      .and_then(|()| self.host.sync_file(temp));
+    if let Err(e) = filled {
+      self.give_up_temp(dir, dir_path, &created, temp);
+      return Err(e.into());
+    }
+    /// Format: bytes per KiB.
+    const KIB: u64 = 1024;
+    let kib = overlay.size.div_ceil(KIB).max(1);
+    self
+      .costs
+      .write_ns_per_kib
+      .push(elapsed_ns(started).checked_div(kib).unwrap_or(0));
     let result = match witnessed {
       None => self.link_create(temp, dir, &created, name),
       Some(witness) => {
@@ -1172,47 +1384,24 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
-  /// The temporary with its bytes, mode, mtime and data sync, at its hidden name.
-  fn fill_temp(
-    &mut self,
-    dir: HostDir,
-    dir_path: &str,
-    hidden: &str,
-    bytes: &[u8],
-    overlay: OverlayIdentity,
-  ) -> Result<HostFile, WriteFailure> {
-    let temp = self.host.create_temp(dir, hidden)?;
-    let started = Instant::now();
-    let filled = self
-      .host
-      .write_at(temp, 0, bytes)
-      .and_then(|()| self.host.set_mode(temp, overlay.mode))
-      .and_then(|()| self.host.set_mtime(temp, overlay.mtime_ns))
-      .and_then(|()| self.host.sync_file(temp));
-    if let Err(e) = filled {
-      self.host.close_file(temp);
-      // An unnamed temporary has no name to remove (`NotFound`); a named one that stays is reported, never
-      // dropped (AUD-29-05).
-      match self.host.unlink(dir, hidden) {
-        Ok(()) | Err(HostError::NotFound) => {}
-        Err(error) => self.degraded.push(Degradation::Leftover {
-          path: join(dir_path, hidden).into(),
-          error,
-        }),
-      }
-      return Err(e.into());
+  /// A copy that will not be placed (a failure, or its grant or lease ended while it ran): its temporary
+  /// closed and removed.
+  fn drop_copy(&mut self, path: &str, copy: FileCopy) {
+    let (dir_path, _) = split(path);
+    self.give_up_temp(copy.dir, dir_path, &copy.created, copy.temp);
+  }
+
+  /// Closes a temporary and removes it at its hidden name. An unnamed temporary has no name to remove
+  /// (`NotFound`); a named one that stays is reported, never dropped (AUD-29-05).
+  fn give_up_temp(&mut self, dir: HostDir, dir_path: &str, hidden: &str, temp: HostFile) {
+    self.host.close_file(temp);
+    match self.host.unlink(dir, hidden) {
+      Ok(()) | Err(HostError::NotFound) => {}
+      Err(error) => self.degraded.push(Degradation::Leftover {
+        path: join(dir_path, hidden).into(),
+        error,
+      }),
     }
-    /// Format: bytes per KiB.
-    const KIB: u64 = 1024;
-    let kib = u64::try_from(bytes.len())
-      .unwrap_or(u64::MAX)
-      .div_ceil(KIB)
-      .max(1);
-    self
-      .costs
-      .write_ns_per_kib
-      .push(elapsed_ns(started).checked_div(kib).unwrap_or(0));
-    Ok(temp)
   }
 
   /// A create: link the temporary at the name; a name that appeared meanwhile is a conflict.
@@ -2270,23 +2459,6 @@ impl From<VfsError> for WriteFailure {
   }
 }
 
-/// The overlay's bytes for a file (through the volume, which may read a large-class file's
-/// unwritten windows from the base).
-fn read_overlay_bytes<H: LandFs>(
-  vol: &mut Volume,
-  store: &mut Store,
-  host: &mut H,
-  source: Source,
-  path: &str,
-) -> Result<Vec<u8>, WriteFailure> {
-  let located = source.resolve(vol, store, path)?;
-  let attrs = source.stat(vol, store, located.inode)?;
-  let mut bytes = vec![0u8; usize::try_from(attrs.size).map_err(|_| VfsError::FileTooLarge)?];
-  let n = source.read(vol, store, host, located.inode, &mut bytes)?;
-  bytes.truncate(n);
-  Ok(bytes)
-}
-
 /// Runs one landing: plan, present, grant, lease and validate, write by class, sync, advance,
 /// report (§4.15). The caller opened `target` with containment and closes its handle after. The one-call
 /// form of [`begin_landing`] and its [`LandingRun`], stepped through without a budget.
@@ -2852,7 +3024,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
         let entry = manifest.entries.get(*next);
         match (entry, reports.get_mut(*next)) {
           (Some(entry), Some(report)) if landing.crashed.is_none() => {
-            landing.write_one(
+            let done = landing.write_one(
               manifest,
               entry,
               report,
@@ -2866,7 +3038,9 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
               },
               progress,
             );
-            *next = next.saturating_add(1);
+            if done {
+              *next = next.saturating_add(1);
+            }
           }
           _ => {
             landing.close_write(progress);
