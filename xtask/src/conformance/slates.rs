@@ -926,7 +926,7 @@ mod tests {
       &Policy {
         target: "",
         working_directory: cwd,
-        streams: &[],
+        landing: None,
       },
     );
     assert!(
