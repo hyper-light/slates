@@ -2558,6 +2558,21 @@ rendezvous fails with `DaemonUnavailable{endpoint}` and the SDK does not create 
 **Special names (A-26).** Recovery retains FIFO/socket inode identity and metadata, including
 hard links and snapshot versions. No live kernel endpoint state is part of the image.
 
+> **Status (2026-10-01, A-57, AUD-29-38).** A voter admits a peer's message only when the state it would
+> leave is one its own recovery accepts. Every handler first checks the message against the rules
+> `SavedRaft::validate` holds retained state to, and refuses it before any term, vote, log or
+> configuration changes. The refusals are a closed taxonomy (`Malformed`: zero term, inconsistent
+> position, entry term, voters, snapshot boundary, window slot, match past the log), each counted
+> (`RaftNode::malformed`). The claimed sender was already bound to the authenticated peer (`ForeignSender`)
+> and the envelope to the group (`ForeignGroup`). No configuration-membership check is added on leader
+> messages, since a lagging follower must accept a leader its configuration does not yet name (thesis §4.1).
+> Before this, a follower accepted an append at leader term one carrying a term-two entry and answered
+> success, and its saved state then failed to restore `InvalidLogTerm`. A generated test drives a voter
+> through histories mixing valid and malformed appends, snapshots, vote and pre-vote requests, vote reports,
+> replies and won elections. After every step the saved state restores, and a refused step leaves it
+> unchanged. A census meets every refusal kind and an admitted change, and disabling the append check fails
+> it with a shrunk witness. Record: `docs/bugs/2026-10-01-a-follower-accepted-state-its-recovery-rejects.md`.
+
 > **Status (2026-09-30, AUD-29-26).** No consensus counter saturates into a repeated identity.
 > - **Terms.** A node whose term is `u64::MAX` cannot campaign: `on_election_timeout` and `start_election`
 >   return `TermExhausted` before the term, the vote or any message changes. A pre-vote reply and a
@@ -7751,3 +7766,15 @@ unsafe budget (`slates-ipc` 41 → 46), and `docs/bugs/2026-10-01-an-async-call-
   tests over a real anchor and daemon (`SIGSTOP`, `SIGKILL`, restart, a lost reader or a cancel, death).
 - What it does not change: the synchronous client's behaviour (its facades wait over the same state
   machines); the wire; R1–R10.
+
+### A-57 — A voter admits only messages whose state its recovery accepts (2026-10-01)
+Applied in the same change to: §4.8 status, GAPS (AUD-29-37–38), and
+`docs/bugs/2026-10-01-a-follower-accepted-state-its-recovery-rejects.md`.
+- Why: live handlers and the retained-state validator held different rules. A follower accepted an entry
+  from a later term than its leader's, and its own publication then failed to restore (AUD-29-38).
+- The rule: one semantic admission boundary at every handler, enforcing the validator's rules on what
+  the message would place (entry terms, positions, snapshot boundaries, voter sets, window reports, match
+  positions) before any state changes, with typed, counted refusals. The authenticated sender and group
+  bindings stand as they were.
+- Evidence: the witness test (red before), and the generated admission test with its census and mutation.
+- What it does not change: valid traffic (every cluster and server test passes unchanged); the wire; R1–R10.

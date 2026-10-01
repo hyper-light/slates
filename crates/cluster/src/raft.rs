@@ -661,12 +661,6 @@ impl SavedRaft {
   /// Validates the state before any recovered node is exposed. Framing and checksum verification
   /// belong to the transport or publication reader, before this decoded value reaches the core.
   fn validate(&self) -> Result<(), RaftRecoveryError> {
-    let valid_set = |voters: &[HostId]| {
-      !voters.is_empty() && voters.iter().copied().collect::<BTreeSet<_>>().len() == voters.len()
-    };
-    let valid_config = |config: &VoterConfig| {
-      valid_set(&config.voters) && config.joint.as_deref().is_none_or(valid_set)
-    };
     if !valid_config(&self.base) {
       return Err(RaftRecoveryError::InvalidVoters);
     }
@@ -714,6 +708,110 @@ impl SavedRaft {
       Err(RaftRecoveryError::InvalidWindow)
     }
   }
+}
+
+/// Why a peer's Raft message was refused before it touched any state (AUD-29-38): it describes a log, a
+/// snapshot or a configuration that this node's own recovery would refuse ([`SavedRaft::validate`]), or a
+/// position no correct peer can report. A valid Raft peer never sends one; the check is the robustness the
+/// service owes authenticated input, not Byzantine tolerance. The closed taxonomy, each kind counted
+/// ([`RaftNode::malformed`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Malformed {
+  /// A leader's or candidate's term of zero: every elected or campaigning term is at least one.
+  ZeroTerm,
+  /// A log position whose term is later than the message's own term, or whose index and term disagree on
+  /// being empty (a nonzero index carries a nonzero term, and only index zero carries term zero).
+  Position,
+  /// An entry's term is zero, is later than the leader's term, or precedes the term of the entry before it
+  /// (a log's terms never decrease).
+  EntryTerm,
+  /// A voter set is empty or repeats an identity.
+  Voters,
+  /// A snapshot boundary at index zero, or with a term of zero or later than the leader's.
+  Snapshot,
+  /// A reported window slot at index zero, repeated, or accepted later than the reply's term.
+  Slot,
+  /// A follower reports matching the leader's log past the leader's last entry.
+  Match,
+}
+
+/// Whether `config` names a legal voter set (nonempty, no repeats), and its joint set too: the rule
+/// [`SavedRaft::validate`] holds a retained configuration to.
+fn valid_config(config: &VoterConfig) -> bool {
+  let valid_set = |voters: &[HostId]| {
+    !voters.is_empty() && voters.iter().copied().collect::<BTreeSet<_>>().len() == voters.len()
+  };
+  valid_set(&config.voters) && config.joint.as_deref().is_none_or(valid_set)
+}
+
+/// Whether a log position's index and term agree on being empty: index zero has term zero and only it.
+fn position_agrees(index: u64, term: u64) -> bool {
+  (index == 0) == (term == 0)
+}
+
+/// Checks a run of entries the way recovery checks a log: each term nonzero, no later than `term`, no
+/// earlier than the term before it (`previous` for the first), and each configuration legal.
+fn admit_entries(entries: &[LogEntry], previous: u64, term: u64) -> Result<(), Malformed> {
+  let mut previous = previous;
+  for entry in entries {
+    if entry.term == 0 || entry.term > term || entry.term < previous {
+      return Err(Malformed::EntryTerm);
+    }
+    if entry
+      .config
+      .as_ref()
+      .is_some_and(|config| !valid_config(config))
+    {
+      return Err(Malformed::Voters);
+    }
+    previous = entry.term;
+  }
+  Ok(())
+}
+
+/// Admits a snapshot transfer (AUD-29-38): a leader's term of at least one, a boundary at a positive index
+/// with a term from one to the leader's, and a legal configuration — what recovery holds a retained
+/// snapshot to.
+fn admit_snapshot(request: &InstallSnapshot) -> Result<(), Malformed> {
+  if request.term == 0 {
+    return Err(Malformed::ZeroTerm);
+  }
+  if request.last_included_index == 0
+    || request.last_included_term == 0
+    || request.last_included_term > request.term
+  {
+    return Err(Malformed::Snapshot);
+  }
+  if !valid_config(&request.config) {
+    return Err(Malformed::Voters);
+  }
+  Ok(())
+}
+
+/// Admits a vote or pre-vote request (AUD-29-38): a campaign term of at least one, and a last log position
+/// consistent with itself and no later than that term.
+fn admit_candidacy(term: u64, last_log_index: u64, last_log_term: u64) -> Result<(), Malformed> {
+  if term == 0 {
+    return Err(Malformed::ZeroTerm);
+  }
+  if last_log_term > term || !position_agrees(last_log_index, last_log_term) {
+    return Err(Malformed::Position);
+  }
+  Ok(())
+}
+
+/// Admits a vote reply's window reports, which a won election recovers from (AUD-29-38): each at a distinct
+/// positive index, accepted no later than the reply's term, its entry's term from one to that term, its
+/// configuration legal — what recovery holds a retained window to.
+fn admit_reports(reply: &VoteReply) -> Result<(), Malformed> {
+  let mut indices = BTreeSet::new();
+  for report in &reply.reports {
+    if report.index == 0 || report.slot.term > reply.term || !indices.insert(report.index) {
+      return Err(Malformed::Slot);
+    }
+    admit_entries(std::slice::from_ref(&report.slot.entry), 0, reply.term)?;
+  }
+  Ok(())
 }
 
 /// A campaign refused because this node's term is `u64::MAX` and has no successor (AUD-29-26): starting an
@@ -795,6 +893,8 @@ pub struct RaftNode {
   terms_exhausted: u64,
   indices_exhausted: u64,
   pre_vote_tally: PreVoteTally,
+  /// Peer messages refused before they touched any state, by kind (AUD-29-38).
+  malformed: BTreeMap<Malformed, u64>,
   /// The window above the log (`docs/wip/research/consensus-enhancements.md` §4): the leader's entries that
   /// arrived out of order and fast votes, by index. Retained; bounded by [`window_budget`](Self::window_budget)
   /// bytes.
@@ -907,6 +1007,7 @@ impl RaftNode {
       terms_exhausted: 0,
       indices_exhausted: 0,
       pre_vote_tally: PreVoteTally::default(),
+      malformed: BTreeMap::new(),
       window: BTreeMap::new(),
       synced_term: 0,
       window_budget: 0,
@@ -1116,6 +1217,15 @@ impl RaftNode {
   /// pre-vote's term is ahead of its own, and the candidate's log is at least as up-to-date.
   /// Because the term is never touched, a partitioned node's inflated term cannot force a step-down here.
   pub fn on_pre_vote(&mut self, request: PreVote) -> PreVoteReply {
+    if let Err(kind) = admit_candidacy(request.term, request.last_log_index, request.last_log_term)
+    {
+      self.refuse_malformed(kind);
+      return PreVoteReply {
+        voter: self.id,
+        term: request.term,
+        granted: false,
+      };
+    }
     let refusal = self.pre_vote_refusal(&request);
     if let Some(refusal) = refusal {
       self.pre_vote_tally.count(refusal);
@@ -1212,6 +1322,16 @@ impl RaftNode {
   /// candidate's log is at least as up-to-date as ours (the election restriction that keeps a leader's
   /// log a superset of every committed entry). Returns the reply to send back.
   pub fn on_request_vote(&mut self, request: RequestVote) -> VoteReply {
+    if let Err(kind) = admit_candidacy(request.term, request.last_log_index, request.last_log_term)
+    {
+      self.refuse_malformed(kind);
+      return VoteReply {
+        voter: self.id,
+        term: self.current_term,
+        granted: false,
+        reports: Vec::new(),
+      };
+    }
     if request.term > self.current_term {
       self.step_down(request.term);
     }
@@ -1257,6 +1377,10 @@ impl RaftNode {
   /// are still the candidate for this term, a granted vote is counted, and reaching a majority makes us
   /// leader. A stale reply (an older term, or after we have moved on) is ignored.
   pub fn on_vote_reply(&mut self, reply: VoteReply) {
+    if let Err(kind) = admit_reports(&reply) {
+      self.refuse_malformed(kind);
+      return;
+    }
     if reply.term > self.current_term {
       self.step_down(reply.term);
       return;
@@ -1767,6 +1891,10 @@ impl RaftNode {
   /// the snapshot index, term and state and advances its commit index to at least the snapshot. The
   /// caller applies the state to its state machine. Returns the reply.
   pub fn on_install_snapshot(&mut self, request: InstallSnapshot) -> InstallSnapshotReply {
+    if let Err(kind) = admit_snapshot(&request) {
+      self.refuse_malformed(kind);
+      return self.snapshot_reply(0);
+    }
     if request.term < self.current_term {
       return self.snapshot_reply(0);
     }
@@ -1849,6 +1977,10 @@ impl RaftNode {
       return;
     }
     if self.role != Role::Leader || reply.term != self.current_term {
+      return;
+    }
+    if reply.match_index > self.last_log_index() {
+      self.refuse_malformed(Malformed::Match);
       return;
     }
     self.contacts.insert(reply.follower);
@@ -2354,6 +2486,10 @@ impl RaftNode {
   /// the new entries appended, and the commit index advanced toward the leader's. Returns the reply,
   /// carrying on success the last index now matched.
   pub fn on_append_entries(&mut self, mut request: AppendEntries) -> AppendReply {
+    if let Err(kind) = self.admit_append(&request) {
+      self.refuse_malformed(kind);
+      return self.append_reply(false, 0, 0);
+    }
     if request.term < self.current_term {
       return self.append_reply(false, 0, 0);
     }
@@ -2542,6 +2678,10 @@ impl RaftNode {
     self.contacts.insert(reply.follower);
     self.priorities.insert(reply.follower, reply.priority);
     if reply.success {
+      if reply.match_index > self.last_log_index() {
+        self.refuse_malformed(Malformed::Match);
+        return;
+      }
       self.record_match(reply.follower, reply.match_index);
       self.advance_leader_commit();
     } else {
@@ -3119,6 +3259,44 @@ impl RaftNode {
 
   /// Whether `request`'s entries would run past the last representable index (counted in
   /// `indices_exhausted`): such an append is refused whole, before the log is touched.
+  /// Admits an append before it touches any state (AUD-29-38): a leader's term of at least one, a previous
+  /// position consistent with itself and no later than the term, and entries recovery would keep — terms
+  /// nonzero, never decreasing from the previous position's, no later than the leader's — with legal
+  /// configurations. An append anchored inside this node's committed prefix is taken as anchored at the
+  /// commit index, so its remaining entries are held to this node's term there as well.
+  fn admit_append(&self, request: &AppendEntries) -> Result<(), Malformed> {
+    if request.term == 0 {
+      return Err(Malformed::ZeroTerm);
+    }
+    if request.prev_log_term > request.term
+      || !position_agrees(request.prev_log_index, request.prev_log_term)
+    {
+      return Err(Malformed::Position);
+    }
+    admit_entries(&request.entries, request.prev_log_term, request.term)?;
+    if request.prev_log_index < self.commit_index {
+      let covered = usize::try_from(self.commit_index.saturating_sub(request.prev_log_index))
+        .unwrap_or(usize::MAX);
+      if let Some(first) = request.entries.get(covered)
+        && first.term < self.entry_term(self.commit_index).unwrap_or(0)
+      {
+        return Err(Malformed::EntryTerm);
+      }
+    }
+    Ok(())
+  }
+
+  /// Counts one refused malformed message by its kind.
+  fn refuse_malformed(&mut self, kind: Malformed) {
+    let count = self.malformed.entry(kind).or_insert(0);
+    *count = count.saturating_add(1);
+  }
+
+  /// Peer messages refused as malformed so far, of `kind` (AUD-29-38).
+  pub fn malformed(&self, kind: Malformed) -> u64 {
+    self.malformed.get(&kind).copied().unwrap_or(0)
+  }
+
   fn runs_past_the_index_range(&mut self, request: &AppendEntries) -> bool {
     let reaches = u64::try_from(request.entries.len())
       .ok()
@@ -3263,6 +3441,11 @@ impl RaftNode {
 
 #[cfg(test)]
 mod tests {
+  use std::cell::RefCell;
+
+  use proptest::prelude::*;
+  use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+
   use super::*;
 
   /// Shape: an append budget no batch reaches, for the tests of every rule but batching (which pass their
@@ -6258,5 +6441,340 @@ mod tests {
     nodes[1].on_vote_reply(reply);
     assert!(nodes[1].is_leader());
     assert_eq!(nodes[1].window_counters().recovered, 0);
+  }
+
+  /// AUD-29-38 (the audit's witness). Do: a follower at term zero receives an append at leader term one that
+  /// carries an entry of term two. Expect: refused, the follower's retained state unchanged (no term, vote or
+  /// log adopted from a message recovery would reject), and its saved state restoring. Before 2026-10-01 the
+  /// follower answered success and its saved state then failed to restore `InvalidLogTerm`.
+  #[test]
+  fn a_follower_refuses_an_entry_from_a_term_after_its_leaders() {
+    let mut follower = RaftNode::new(B, vec![A, B, C]);
+    let before = follower.saved();
+    let reply = follower.on_append_entries(AppendEntries {
+      read_context: 0,
+      term: 1,
+      leader: A,
+      prev_log_index: 0,
+      prev_log_term: 0,
+      entries: vec![LogEntry::command(2, b"from a later term".to_vec())],
+      leader_commit: 0,
+      priorities: Vec::new(),
+      sync_index: 0,
+      open_from: 0,
+    });
+    assert!(!reply.success, "the malformed append is refused");
+    assert_eq!(
+      follower.saved(),
+      before,
+      "a refusal changes no retained state"
+    );
+    assert!(RaftNode::restore(follower.saved()).is_ok());
+  }
+
+  /// Shape: the largest term a generated message carries — zero (malformed), and enough terms above it for
+  /// an entry to run one past its leader's term and for a newer leader to supersede an older one.
+  const GENERATED_TERMS: u64 = 3;
+  /// Shape: the largest log index a generated message names — past the generated logs' ends (an entry
+  /// or two per append over a few appends), so positions both inside and beyond a log are reached.
+  const GENERATED_INDICES: u64 = 4;
+  /// Shape: entries per generated append — none (a heartbeat) through enough to carry a decreasing pair.
+  const GENERATED_ENTRIES: usize = 3;
+  /// Shape: steps per generated history — enough to elect, append, and then refuse each kind.
+  const GENERATED_STEPS: usize = 24;
+  /// Format: how many voter sets [`generated_config`] draws from.
+  const GENERATED_CONFIGS: usize = 4;
+
+  /// One generated peer message, or an election the node wins, for the admission histories.
+  #[derive(Clone, Debug)]
+  enum AdmissionStep {
+    Append {
+      term: u64,
+      prev_index: u64,
+      prev_term: u64,
+      entries: Vec<(u64, Option<usize>)>,
+      commit: u64,
+    },
+    Snapshot {
+      term: u64,
+      index: u64,
+      at_term: u64,
+      config: usize,
+    },
+    Candidacy {
+      term: u64,
+      last_index: u64,
+      last_term: u64,
+      pre: bool,
+    },
+    Reports {
+      term: u64,
+      reports: Vec<(u64, u64, u64)>,
+    },
+    Matched {
+      matched: u64,
+    },
+    Elect,
+  }
+
+  /// The voter sets a generated configuration is drawn from: empty and repeating (malformed), one voter,
+  /// and the group.
+  fn generated_config(choice: usize) -> VoterConfig {
+    let sets = [vec![], vec![A, A], vec![A], vec![A, B, C]];
+    VoterConfig {
+      voters: sets.get(choice).cloned().unwrap_or_default(),
+      joint: None,
+    }
+  }
+
+  /// Format: how many kinds of [`AdmissionStep`] there are.
+  const ADMISSION_KINDS: u8 = 6;
+
+  /// One generated step: a kind and a pool of fields each kind draws from (a union strategy without the
+  /// `Arc` `prop_oneof!` builds).
+  fn admission_step() -> impl Strategy<Value = AdmissionStep> {
+    let term = 0..=GENERATED_TERMS;
+    let index = 0..=GENERATED_INDICES;
+    (
+      0..ADMISSION_KINDS,
+      (term.clone(), index.clone(), term.clone(), index.clone()),
+      proptest::collection::vec(
+        (term.clone(), proptest::option::of(0..GENERATED_CONFIGS)),
+        0..=GENERATED_ENTRIES,
+      ),
+      proptest::collection::vec((index, term.clone(), term), 0..=GENERATED_ENTRIES),
+      (0..GENERATED_CONFIGS, any::<bool>()),
+    )
+      .prop_map(
+        |(kind, (term, position, position_term, commit), entries, reports, (config, flag))| {
+          match kind {
+            0 => AdmissionStep::Append {
+              term,
+              prev_index: position,
+              prev_term: position_term,
+              entries,
+              commit,
+            },
+            1 => AdmissionStep::Snapshot {
+              term,
+              index: position,
+              at_term: position_term,
+              config,
+            },
+            2 => AdmissionStep::Candidacy {
+              term,
+              last_index: position,
+              last_term: position_term,
+              pre: flag,
+            },
+            3 => AdmissionStep::Reports { term, reports },
+            4 => AdmissionStep::Matched { matched: position },
+            _ => AdmissionStep::Elect,
+          }
+        },
+      )
+  }
+
+  /// Applies one step to `node` (voter B of A, B, C).
+  fn apply_admission_step(node: &mut RaftNode, step: &AdmissionStep) {
+    match step {
+      AdmissionStep::Append {
+        term,
+        prev_index,
+        prev_term,
+        entries,
+        commit,
+      } => {
+        node.on_append_entries(AppendEntries {
+          read_context: 0,
+          term: *term,
+          leader: A,
+          prev_log_index: *prev_index,
+          prev_log_term: *prev_term,
+          entries: entries
+            .iter()
+            .map(|(term, config)| match config {
+              Some(choice) => LogEntry::configuration(*term, generated_config(*choice)),
+              None => LogEntry::command(*term, vec![1]),
+            })
+            .collect(),
+          leader_commit: *commit,
+          priorities: Vec::new(),
+          sync_index: 0,
+          open_from: 0,
+        });
+      }
+      AdmissionStep::Snapshot {
+        term,
+        index,
+        at_term,
+        config,
+      } => {
+        node.on_install_snapshot(InstallSnapshot {
+          term: *term,
+          leader: A,
+          last_included_index: *index,
+          last_included_term: *at_term,
+          config: generated_config(*config),
+          state: Vec::new(),
+        });
+      }
+      AdmissionStep::Candidacy {
+        term,
+        last_index,
+        last_term,
+        pre,
+      } => {
+        if *pre {
+          node.on_pre_vote(PreVote {
+            term: *term,
+            candidate: C,
+            last_log_index: *last_index,
+            last_log_term: *last_term,
+          });
+        } else {
+          node.on_request_vote(RequestVote {
+            term: *term,
+            candidate: C,
+            last_log_index: *last_index,
+            last_log_term: *last_term,
+          });
+        }
+      }
+      AdmissionStep::Reports { term, reports } => node.on_vote_reply(VoteReply {
+        voter: A,
+        term: *term,
+        granted: true,
+        reports: reports
+          .iter()
+          .map(|(index, slot_term, entry_term)| SlotReport {
+            index: *index,
+            slot: WindowSlot {
+              term: *slot_term,
+              fast: false,
+              entry: LogEntry::command(*entry_term, vec![2]),
+            },
+          })
+          .collect(),
+      }),
+      AdmissionStep::Matched { matched } => node.on_append_reply(AppendReply {
+        read_context: 0,
+        follower: C,
+        term: node.term(),
+        success: true,
+        match_index: *matched,
+        conflict_term: 0,
+        conflict_index: 0,
+        priority: ElectionPriority::default(),
+      }),
+      AdmissionStep::Elect => {
+        if node.start_election().is_ok() {
+          let term = node.term();
+          node.on_vote_reply(VoteReply {
+            voter: A,
+            term,
+            granted: true,
+            reports: Vec::new(),
+          });
+        }
+      }
+    }
+  }
+
+  /// What the admission histories reached: each refusal kind, and an admitted step that changed retained state.
+  #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+  enum AdmissionCase {
+    Refused(Malformed),
+    Changed,
+  }
+
+  /// Every [`AdmissionCase`] the census must meet.
+  const ADMISSION_CASES: [AdmissionCase; 8] = [
+    AdmissionCase::Refused(Malformed::ZeroTerm),
+    AdmissionCase::Refused(Malformed::Position),
+    AdmissionCase::Refused(Malformed::EntryTerm),
+    AdmissionCase::Refused(Malformed::Voters),
+    AdmissionCase::Refused(Malformed::Snapshot),
+    AdmissionCase::Refused(Malformed::Slot),
+    AdmissionCase::Refused(Malformed::Match),
+    AdmissionCase::Changed,
+  ];
+
+  /// Every refusal kind, in the taxonomy's order.
+  const MALFORMED_KINDS: [Malformed; 7] = [
+    Malformed::ZeroTerm,
+    Malformed::Position,
+    Malformed::EntryTerm,
+    Malformed::Voters,
+    Malformed::Snapshot,
+    Malformed::Slot,
+    Malformed::Match,
+  ];
+
+  /// Runs one history, checking after every step that the node's saved state restores and that a refused
+  /// step left it unchanged; records what the history reached.
+  fn run_admission_history(
+    steps: &[AdmissionStep],
+    census: &mut BTreeSet<AdmissionCase>,
+  ) -> Result<(), String> {
+    let mut node = RaftNode::new(B, vec![A, B, C]);
+    for step in steps {
+      let before = node.saved();
+      let refused_before = MALFORMED_KINDS.map(|kind| node.malformed(kind));
+      apply_admission_step(&mut node, step);
+      let after = node.saved();
+      RaftNode::restore(after.clone())
+        .map_err(|error| format!("{step:?} left a state recovery refuses: {error:?}"))?;
+      let refused = MALFORMED_KINDS
+        .iter()
+        .zip(refused_before)
+        .find(|(kind, count)| node.malformed(**kind) > *count)
+        .map(|(kind, _)| *kind);
+      match refused {
+        Some(kind) => {
+          if after != before {
+            return Err(format!(
+              "{step:?} was refused {kind:?} but changed retained state"
+            ));
+          }
+          census.insert(AdmissionCase::Refused(kind));
+        }
+        None if after != before => {
+          census.insert(AdmissionCase::Changed);
+        }
+        None => {}
+      }
+    }
+    Ok(())
+  }
+
+  /// AUD-29-38 (§4.8, §4.9). Do: drive a voter with generated histories of appends, snapshot transfers, vote
+  /// and pre-vote requests, vote replies with window reports, append replies and won elections — every field
+  /// drawn from small ranges that include the malformed values (term zero, a position's term past its message's,
+  /// a decreasing or too-late entry term, an empty or repeating voter set, a snapshot at index or term zero, a
+  /// repeated or too-late window slot, a match past the leader's log). Expect: after every step the node's
+  /// saved state restores; a refused step leaves its retained state unchanged; and the census meets every
+  /// refusal kind and an admitted step that changed retained state, so neither half of the rule is vacuous.
+  #[test]
+  fn every_admitted_message_leaves_a_state_recovery_accepts_and_a_refused_one_changes_nothing() {
+    let census = RefCell::new(BTreeSet::new());
+    let mut runner = TestRunner::new_with_rng(
+      slates_test_seeds::unseeded(Config::default()),
+      TestRng::deterministic_rng(RngAlgorithm::ChaCha),
+    );
+    let strategy = proptest::collection::vec(admission_step(), 1..=GENERATED_STEPS);
+    let result = runner.run(&strategy, |steps| {
+      run_admission_history(&steps, &mut census.borrow_mut()).map_err(TestCaseError::fail)
+    });
+    if let Err(failure) = result {
+      panic!("{failure}");
+    }
+    let met = census.into_inner();
+    let unmet: Vec<AdmissionCase> = ADMISSION_CASES
+      .iter()
+      .copied()
+      .filter(|case| !met.contains(case))
+      .collect();
+    assert!(unmet.is_empty(), "the generator never reached {unmet:?}");
   }
 }
