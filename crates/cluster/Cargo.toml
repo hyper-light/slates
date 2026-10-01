@@ -19,6 +19,8 @@ slates-transport = { workspace = true }
 slates-rt = { workspace = true }
 # the archive: the content plane's transfer unit and the holder's verified content store (§4.10).
 slates-archive = { workspace = true }
+# the shard memory a content hold stores in and is charged against (§4.2; AUD-29-43): its arena and budgets.
+slates-mem = { workspace = true }
 
 [dev-dependencies]
 # self-signed enrolled identities for the holder-and-owner sessions in the tests.

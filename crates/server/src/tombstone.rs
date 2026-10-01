@@ -71,7 +71,10 @@ impl TombstoneValue {
 /// volume, drops what was waiting to materialize it, and — at the retirement — drops the volume's and its
 /// catalog's records. Called after the acceptance is stored, so the acknowledgement it answers is durable.
 pub(crate) fn on_held(state: &mut ShardState, object: ObjectId, value: TombstoneValue) {
-  let released = state.held_content.forget_object(object);
+  let released = state.held_content.forget_object(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    object,
+  );
   if released > 0 {
     let count = state.refusals.entry(TOMBSTONE_RELEASED).or_insert(0);
     *count = count.saturating_add(1);

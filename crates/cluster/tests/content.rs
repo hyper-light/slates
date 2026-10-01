@@ -9,8 +9,10 @@ use rustix::net::{Ipv4Addr, SocketAddrV4};
 use rustls::pki_types::PrivateKeyDer;
 use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
 use slates_cluster::CommitBudget;
-use slates_cluster::content::{ContentHold, put_content};
+use slates_cluster::content::{ContentHold, HoldSpace, put_content};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
+use slates_mem::arena::ChunkArena;
+use slates_mem::budget::{MetadataBudget, ShardBudget};
 use slates_rt::runtime::RuntimeConfig;
 use slates_rt::sim::SimRuntime;
 use slates_rt::udp::UdpSocket;
@@ -123,14 +125,49 @@ async fn settle_within(endpoint: &mut Endpoint, within_ns: u64) -> bool {
   .await
 }
 
+/// The holder's shard memory (§4.2; AUD-29-43): an arena over whole pages, a byte budget over its usable
+/// capacity and an unbounded metadata ledger.
+struct Room {
+  arena: ChunkArena,
+  budget: ShardBudget,
+  metadata: MetadataBudget,
+}
+
+impl Room {
+  /// Shape: the blocks the test archive needs — its two chunks, its manifest and one verification scratch
+  /// block — rounded up to the buddy's power of two.
+  const BLOCKS: usize = 4;
+
+  fn new() -> Room {
+    let page = rustix::param::page_size();
+    let mut arena = ChunkArena::new(page);
+    arena
+      .add_region(slates_mem::region::Region::map(page * Self::BLOCKS, page, false).unwrap())
+      .unwrap();
+    let capacity = u64::try_from(arena.capacity()).unwrap();
+    Room {
+      arena,
+      budget: ShardBudget::new(capacity, 0),
+      metadata: MetadataBudget::new(u64::MAX),
+    }
+  }
+}
+
 /// Serves one exchange with a virtual deadline, so a missing put fails instead of
 /// keeping the simulation alive forever after the collector incorrectly drops its offer.
-async fn serve_bounded(endpoint: &mut Endpoint, held: &mut ContentHold) -> bool {
+async fn serve_bounded(endpoint: &mut Endpoint, held: &mut ContentHold, room: &mut Room) -> bool {
   use std::future::Future;
   use std::task::Poll;
-  let mut serving = std::pin::pin!(
-    endpoint.serve_once(|_, request| held.serve(HOLDER, &request, |_, _| true, |_, _, _| true).0)
-  );
+  let mut serving = std::pin::pin!(endpoint.serve_once(|_, request| {
+    let mut space = HoldSpace {
+      arena: &mut room.arena,
+      budget: &mut room.budget,
+      metadata: &mut room.metadata,
+    };
+    held
+      .serve(&mut space, HOLDER, &request, |_, _| true, |_, _, _| true)
+      .0
+  }));
   let mut deadline = std::pin::pin!(slates_rt::futures::sleep(COLLECTION_NS * 2));
   std::future::poll_fn(|context| {
     if let Poll::Ready(result) = serving.as_mut().poll(context) {
@@ -188,8 +225,9 @@ fn run_put(offer_delay_ns: u64, budget: CommitBudget) -> PutObservation {
       endpoint.establish().await.unwrap();
       slates_rt::futures::sleep(offer_delay_ns).await.unwrap();
       let mut held = ContentHold::new();
+      let mut room = Room::new();
       for _ in ["offer", "put"] {
-        if !serve_bounded(&mut endpoint, &mut held).await {
+        if !serve_bounded(&mut endpoint, &mut held, &mut room).await {
           break;
         }
       }

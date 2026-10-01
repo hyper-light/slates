@@ -103,6 +103,59 @@ fn a_chunk_that_fails_its_identity_is_refused() {
   );
 }
 
+/// AUD-29-43: do: verify raw, LZ4 and zstd chunks of structured bytes into a scratch buffer of exactly their
+/// raw length, then a flipped payload bit, a wrong identity and a scratch one byte short; expect the three
+/// good chunks accepted as `Archive::content` accepts them, and each bad case refused typed.
+#[test]
+fn a_chunk_verifies_into_scratch_as_its_content_does_and_refuses_the_same_faults() {
+  let raw = structured(4096);
+  let chunks = [
+    Archive::raw_chunk(raw.clone()),
+    Archive::compressed_chunk(raw.clone()),
+    Archive::zstd_chunk(raw.clone()),
+  ];
+  let mut scratch = vec![0u8; raw.len()];
+  for chunk in &chunks {
+    assert!(Archive::content(chunk).is_ok());
+    assert_eq!(
+      Archive::verify_into(chunk, &mut scratch),
+      Ok(()),
+      "{:?}",
+      chunk.encoding
+    );
+  }
+  for chunk in &chunks[1..] {
+    assert_encoded_faults_refused(chunk, raw.len());
+  }
+  let mut forged = chunks[0].clone();
+  forged.identity = [0u8; 32];
+  assert_eq!(
+    Archive::verify_into(&forged, &mut scratch),
+    Err(ArchiveError::ChunkIdentityMismatch { index: 0 })
+  );
+}
+
+/// An encoded chunk (asserted encoded) with a flipped payload bit, and the chunk itself into a scratch one
+/// byte short of its raw length, are each refused by `verify_into`.
+fn assert_encoded_faults_refused(chunk: &Chunk, raw_len: usize) {
+  assert_ne!(chunk.encoding, Encoding::Raw, "the chunk is encoded");
+  let mut scratch = vec![0u8; raw_len];
+  let mut flipped = chunk.clone();
+  if let Some(byte) = flipped.payload.last_mut() {
+    *byte ^= 0x01;
+  }
+  assert!(
+    Archive::verify_into(&flipped, &mut scratch).is_err(),
+    "{:?}",
+    chunk.encoding
+  );
+  let mut short = vec![0u8; raw_len - 1];
+  assert_eq!(
+    Archive::verify_into(chunk, &mut short),
+    Err(ArchiveError::BadPayload { index: 0 })
+  );
+}
+
 /// A wrong magic is refused (before anything else).
 #[test]
 fn a_bad_magic_is_refused() {

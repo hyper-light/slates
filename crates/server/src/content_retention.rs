@@ -132,9 +132,12 @@ pub(crate) fn retain_object(state: &mut ShardState, object: ObjectId) -> usize {
   let local = state.fleet.host();
   let newest = newest(&state.holder_records, object);
   let newest_placed = state.held_content.newest_placed(object).unwrap_or(0);
-  let released = state.held_content.retain(object, |manifest, placed| {
-    keeps(&newest, object, local, (manifest, placed), newest_placed)
-  });
+  let space = &mut crate::content_holder::hold_space(&mut state.store);
+  let released = state
+    .held_content
+    .retain(space, object, |manifest, placed| {
+      keeps(&newest, object, local, (manifest, placed), newest_placed)
+    });
   if released > 0 {
     let count = state.refusals.entry(CONTENT_RELEASED).or_insert(0);
     *count = count.saturating_add(u64::try_from(released).unwrap_or(u64::MAX));

@@ -3673,8 +3673,15 @@ mirroring have no targets and their verbs refuse `Unsupported`.
 > - **Shipped content is restricted to the manifest's closure.** A put shipping a chunk its manifest does
 >   not reference is refused `Unreferenced` before any chunk is decoded.
 >
-> Still open: arena-held content under an all-cost typed admission
-> (`docs/bugs/2026-09-30-a-destroyed-volume-came-back-on-takeover.md`).
+> - **Admission and residency.** A holder's replicated bytes live in its shard's arena, charged at their
+>   block length from unpromised capacity only (`replicated` beside `retained` in the shard report). The
+>   hold's index is charged to the metadata ledger at a per-entry cost derived from the standard library's
+>   B-tree geometry. A put is charged whole before any chunk is verified or stored, verifies new encoded
+>   chunks in one charged arena scratch block, and is refused `NoCapacity` with nothing left behind.
+>
+> Still open: the audit's churn acceptance test
+> (`docs/bugs/2026-09-30-a-destroyed-volume-came-back-on-takeover.md`,
+> `docs/bugs/2026-09-30-replicated-content-bypassed-admission.md`).
 >
 > **Status (2026-09-30, AUD-29-17, the catalog register class).** A volume's catalog is a register of its
 > own, as §4.8 lists it.

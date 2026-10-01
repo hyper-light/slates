@@ -219,7 +219,10 @@ fn stale_after_confirmation(
 /// records, never kept for a head this holder no longer backs). Counted [`TAKEOVER_RECLAIMED`].
 fn reclaim(state: &mut ShardState, object: ObjectId) {
   state.holder_records.remove(&object);
-  state.held_content.forget_object(object);
+  state.held_content.forget_object(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    object,
+  );
   state.fleet.forget_object(object);
   state.departed_owners.remove(&object);
   state.merge.replicas.remove(&object);

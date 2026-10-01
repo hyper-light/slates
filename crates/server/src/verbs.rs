@@ -1932,6 +1932,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       .unwrap_or(u64::MAX),
     landings_in_flight: u64::try_from(state.landing.in_flight.len()).unwrap_or(u64::MAX),
     target_leases: u64::try_from(state.db.partition().landing_leases().count()).unwrap_or(u64::MAX),
+    replicated_bytes: state.store.budget.replicated(),
   }
 }
 
@@ -6254,7 +6255,10 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // with nothing published yet.
   let (images, held) = recover_images(state);
   let mut rebuilt = Rebuilt::default();
-  match slates_cluster::content::ContentHold::from_image(&held) {
+  match slates_cluster::content::ContentHold::from_image(
+    &mut crate::content_holder::hold_space(&mut state.store),
+    &held,
+  ) {
     Ok(hold) => {
       rebuilt.replicas = hold.manifest_count();
       state.held_content = hold;
@@ -6699,7 +6703,8 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let shard = ShardImage::new(keyed).with_held(state.held_content.to_image());
+  let shard =
+    ShardImage::new(keyed).with_held(state.held_content.to_image(state.store.content.arena()));
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };

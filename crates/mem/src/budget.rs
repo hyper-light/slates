@@ -90,6 +90,12 @@ pub struct ShardBudget {
   /// arena block length. Reported beside the reservations so the status distinguishes promised
   /// entitlement from bytes held on behalf of snapshots.
   retained: u64,
+  /// The part of `committed` that is content this shard holds as a **candidate holder for other owners**
+  /// (§4.2 "a remote holder makes the same admission against its own machine before acknowledging
+  /// placement"; AUD-29-43): replicated chunks and manifests, charged at their arena block length, plus the
+  /// transient scratch a put verifies in. Like `retained`, a running charge taken only from unpromised
+  /// capacity, so another owner's content never spends an admitted volume's entitlement.
+  replicated: u64,
 }
 
 /// A reservation of bytes for one bounded volume.
@@ -107,6 +113,7 @@ impl ShardBudget {
     Self {
       ledger: Ledger::new(reserve, headroom),
       retained: 0,
+      replicated: 0,
     }
   }
 
@@ -124,6 +131,12 @@ impl ShardBudget {
   /// The snapshot-retained part of the committed bytes (§4.2 retention).
   pub const fn retained(&self) -> u64 {
     self.retained
+  }
+
+  /// The part of the committed bytes held for other owners as their content's candidate holder
+  /// (AUD-29-43).
+  pub const fn replicated(&self) -> u64 {
+    self.replicated
   }
 
   /// The operation headroom kept free of every admission (§4.2).
@@ -193,6 +206,21 @@ impl ShardBudget {
   pub fn credit_retention(&mut self, bytes: u64) {
     self.ledger.give(bytes);
     self.retained = self.retained.saturating_sub(bytes);
+  }
+
+  /// Charges `bytes` of content held for other owners (AUD-29-43) against the unpromised capacity, whole or
+  /// refused with nothing changed — the same rule as [`charge_retention`](Self::charge_retention), so a
+  /// holder's replicas never spend an admitted volume's promised space or the operation headroom.
+  pub fn charge_replicated(&mut self, bytes: u64) -> Result<(), MemError> {
+    let taken = self.ledger.take(bytes)?;
+    self.replicated = self.replicated.saturating_add(taken);
+    Ok(())
+  }
+
+  /// Returns `bytes` of replicated charge as held content is released.
+  pub fn credit_replicated(&mut self, bytes: u64) {
+    self.ledger.give(bytes);
+    self.replicated = self.replicated.saturating_sub(bytes);
   }
 }
 
@@ -471,6 +499,34 @@ mod tests {
   /// (§4.2; admission.md §5.5): a raised hold shrinks `admittable` and refuses a new reservation, an
   /// already-committed reservation is untouched (its bytes stay committed), and lowering the hold
   /// releases the capacity for admission again.
+  #[test]
+  fn replicated_content_takes_only_unpromised_capacity_and_is_refused_whole_past_it() {
+    // AUD-29-43: do: reserve an admitted volume's claim, charge replicated content up to the unpromised
+    // capacity, then one byte more, then credit it back; expect the charge to stop exactly at the
+    // unpromised capacity, the refusal to change nothing, the volume's claim untouched throughout, and the
+    // credit to restore admission.
+    let mut b = ShardBudget::new(100, 20);
+    let claim = b.reserve(50).unwrap();
+    assert_eq!(b.admittable(), 30);
+    b.charge_replicated(30).unwrap();
+    assert_eq!((b.replicated(), b.committed(), b.admittable()), (30, 80, 0));
+    assert!(matches!(
+      b.charge_replicated(1),
+      Err(MemError::BudgetExceeded {
+        requested: 1,
+        available: 0
+      })
+    ));
+    assert_eq!(
+      (b.replicated(), b.committed()),
+      (30, 80),
+      "a refusal changes nothing"
+    );
+    assert_eq!(claim.bytes, 50);
+    b.credit_replicated(30);
+    assert_eq!((b.replicated(), b.committed(), b.admittable()), (0, 50, 30));
+  }
+
   #[test]
   fn a_pressure_hold_withholds_admission_without_touching_a_committed_claim() {
     let mut b = ShardBudget::new(100, 20);

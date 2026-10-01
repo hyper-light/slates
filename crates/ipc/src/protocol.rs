@@ -843,6 +843,10 @@ pub struct ShardReport {
   /// one owner of the host's target leases, zero on the others. A landing releases its lease before its
   /// reply, and a take releases every lease whose term has ended, so it returns to zero.
   pub target_leases: u64,
+  /// The part of `committed_bytes` held for other owners as their content's candidate holder (§4.2; AUD-29-43):
+  /// replicated chunks and manifests at their arena block length, charged from unpromised capacity only.
+  /// Appended.
+  pub replicated_bytes: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.

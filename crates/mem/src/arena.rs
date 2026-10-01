@@ -154,6 +154,17 @@ impl ChunkArena {
       .sum()
   }
 
+  /// The block an allocation of `len` bytes takes — the smallest power-of-two number of granules holding
+  /// it, the buddy's rounding (`Buddy::order_for`) — so a caller charges exactly what [`alloc`](Self::alloc)
+  /// will take before it allocates (§4.2 "allocator rounding"). `None` when the block is not representable.
+  pub fn block_len(&self, len: usize) -> Option<usize> {
+    len
+      .max(1)
+      .div_ceil(self.granule)
+      .checked_next_power_of_two()?
+      .checked_mul(self.granule)
+  }
+
   /// Allocates at least `len` bytes from the first region that can serve it.
   pub fn alloc(&mut self, len: usize) -> Result<Extent, MemError> {
     let arena = self
@@ -274,6 +285,19 @@ mod tests {
       .add_region(Region::map(p * 4, p, false).unwrap())
       .unwrap();
     arena
+  }
+
+  /// §4.2 allocator rounding: do: allocate every length from one byte to four granules; expect each block to
+  /// be exactly the length `block_len` charged for it before the allocation.
+  #[test]
+  fn block_len_is_the_block_alloc_takes() {
+    let p = page();
+    let mut arena = two_regions(p);
+    for len in 1..=p * 4 {
+      let extent = arena.alloc(len).unwrap();
+      assert_eq!(Some(extent.len()), arena.block_len(len), "len {len}");
+      arena.free(extent).unwrap();
+    }
   }
 
   #[test]

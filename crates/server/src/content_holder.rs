@@ -14,6 +14,18 @@ use slates_db::register::{Acceptor, HostId, ObjectId, RegionalConfiguration};
 
 use crate::state::ShardState;
 
+/// The shard memory a content hold borrows for one operation (AUD-29-43): the shard store's chunk arena, its
+/// byte budget and its metadata ledger.
+pub(crate) fn hold_space(
+  store: &mut slates_vfs::volume::Store,
+) -> slates_cluster::content::HoldSpace<'_> {
+  slates_cluster::content::HoldSpace {
+    arena: store.content.arena_mut(),
+    budget: &mut store.budget,
+    metadata: &mut store.metadata,
+  }
+}
+
 /// Serves one content request as `local`, with `authorized` deciding the access asked for the object named
 /// from the committed configuration and this holder's records. Returns the reply: an empty one for
 /// anything refused, malformed, unverifiable or unheld.
@@ -30,6 +42,7 @@ pub(crate) fn serve(
 ) -> Vec<u8> {
   let (council, records) = (&state.council, &state.holder_records);
   let (reply, held) = state.held_content.serve(
+    &mut hold_space(&mut state.store),
     local,
     request,
     |access, object| authorized(council.configuration(), records, access, object),

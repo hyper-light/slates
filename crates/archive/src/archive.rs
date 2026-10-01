@@ -214,6 +214,42 @@ impl Archive {
     Ok(bytes)
   }
 
+  /// Verifies `chunk` against its identity without allocating its content (AUD-29-43): a raw chunk is hashed
+  /// where it is; an LZ4 or zstd chunk is decoded into `scratch` — which must hold its declared raw length —
+  /// and hashed there. So a holder verifies a put in memory it has already admitted (one arena block for the
+  /// largest encoded chunk) instead of a heap buffer per chunk. The refusals are [`Archive::content`]'s, plus
+  /// `BadPayload` for a scratch too short to hold the content.
+  pub fn verify_into(chunk: &Chunk, scratch: &mut [u8]) -> Result<(), ArchiveError> {
+    let index = 0;
+    if chunk.raw_len > MAX_CHUNK_BYTES {
+      return Err(ArchiveError::ChunkTooLarge { index });
+    }
+    check_canonical_chunk(
+      chunk.raw_len,
+      u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX),
+      chunk.encoding,
+      index,
+    )?;
+    let raw_len = usize::try_from(chunk.raw_len).map_err(|_| ArchiveError::BadPayload { index })?;
+    let content: &[u8] = match chunk.encoding {
+      Encoding::Raw => &chunk.payload,
+      Encoding::Lz4 | Encoding::Zstd => {
+        let out = scratch
+          .get_mut(..raw_len)
+          .ok_or(ArchiveError::BadPayload { index })?;
+        let written = decode_payload_into(chunk, out, index)?;
+        if written != raw_len {
+          return Err(ArchiveError::BadPayload { index });
+        }
+        out
+      }
+    };
+    if hash_of(content) != chunk.identity {
+      return Err(ArchiveError::ChunkIdentityMismatch { index });
+    }
+    Ok(())
+  }
+
   /// Encodes the archive to its byte stream. Deterministic: the same snapshot yields the same
   /// bytes on every platform (the identity gate).
   pub fn encode(&self) -> Vec<u8> {
@@ -569,6 +605,29 @@ fn decode_payload(chunk: &Chunk, index: u64) -> Result<Vec<u8>, ArchiveError> {
     }
     Encoding::Zstd => decode_zstd(chunk, index),
   }
+}
+
+/// Decodes an encoded chunk's payload into `out` (its declared raw length); returns the bytes written.
+fn decode_payload_into(chunk: &Chunk, out: &mut [u8], index: u64) -> Result<usize, ArchiveError> {
+  match chunk.encoding {
+    Encoding::Raw => Err(ArchiveError::BadPayload { index }),
+    Encoding::Lz4 => lz4_flex::block::decompress_into(&chunk.payload, out)
+      .map_err(|_| ArchiveError::BadPayload { index }),
+    Encoding::Zstd => decode_zstd_into(chunk, out, index),
+  }
+}
+
+/// Decodes a zstd chunk into `out` (the `zstd` feature's C decoder).
+#[cfg(feature = "zstd")]
+fn decode_zstd_into(chunk: &Chunk, out: &mut [u8], index: u64) -> Result<usize, ArchiveError> {
+  zstd::bulk::decompress_to_buffer(&chunk.payload, out)
+    .map_err(|_| ArchiveError::BadPayload { index })
+}
+
+/// Without the `zstd` feature, a zstd chunk cannot be decoded (owed `ruzstd` fallback).
+#[cfg(not(feature = "zstd"))]
+fn decode_zstd_into(_chunk: &Chunk, _out: &mut [u8], index: u64) -> Result<usize, ArchiveError> {
+  Err(ArchiveError::BadPayload { index })
 }
 
 /// Decodes a zstd chunk to its declared raw length. With the `zstd` feature (default) this is the

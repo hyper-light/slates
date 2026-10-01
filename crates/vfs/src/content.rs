@@ -154,7 +154,12 @@ impl ChunkStore {
     self.chunks.max_footprint_bytes()
   }
 
-  /// The arena, for adding regions.
+  /// The arena, for reading blocks.
+  pub fn arena(&self) -> &ChunkArena {
+    &self.arena
+  }
+
+  /// The arena, for adding regions and allocating blocks.
   pub fn arena_mut(&mut self) -> &mut ChunkArena {
     &mut self.arena
   }

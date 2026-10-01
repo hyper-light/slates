@@ -415,30 +415,13 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   drop(segment);
 }
 
-/// AUD-29-59 (§4.8 persistence before reply; §4.10 placement closure): a holder acknowledges a content put
-/// only for content its anchor-owned RAM retains, so a warm restart keeps every acknowledged replica. Do:
-/// place a replica on a daemon through the holder's production path, stop it, and start a second daemon over
-/// the same anchor segment and content object. Expect: the put acknowledged, and the replica held whole after
-/// the restart. Before the fix the hold lived only in process memory and every restart began it empty, so an
-/// acknowledgement that placement counted was gone.
-#[test]
-fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
-  use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
-  use slates_cluster::content::ContentMessage;
-  use slates_db::register::{HostId, ObjectId};
-
-  let profile = common::machine_profile();
-  let instance = format!("srv-replica-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let segment = anchor_segment("replica", &profile, &config);
-  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
-  first
-    .bootstrap(true)
-    .expect("the fixture explicitly creates its local consensus group");
-
+/// A one-file archive of `bytes` as one raw chunk, with the format's own header bounds — the replica the
+/// holder tests place.
+fn replica_archive(bytes: &[u8]) -> slates_archive::Archive {
   use slates_archive::format::{MAX_BASE_PAGE_BYTES, MAX_CHUNK_BYTES};
-  let chunk = Archive::raw_chunk(BEFORE.to_vec());
-  let archive = Archive {
+  use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
+  let chunk = Archive::raw_chunk(bytes.to_vec());
+  Archive {
     base_page_size: u32::try_from(MAX_BASE_PAGE_BYTES).unwrap(),
     chunk_min: u32::try_from(MAX_CHUNK_BYTES).unwrap(),
     chunk_max: u32::try_from(MAX_CHUNK_BYTES).unwrap(),
@@ -462,15 +445,93 @@ fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
       }]),
     }]),
     chunks: vec![chunk],
-  };
-  let manifest = archive.manifest_identity();
-  let object = ObjectId::new(HostId(1), 1);
-  let put = ContentMessage::Put {
+  }
+}
+
+/// The encoded put of `archive` for `object` at `sequence`.
+fn replica_put(
+  object: slates_db::register::ObjectId,
+  sequence: u64,
+  archive: &slates_archive::Archive,
+) -> Vec<u8> {
+  slates_cluster::content::ContentMessage::Put {
     object,
-    sequence: 1,
+    sequence,
     archive: archive.encode(),
   }
-  .encode();
+  .encode()
+}
+
+/// AUD-29-43 (§4.2 "a remote holder makes the same admission against its own machine before acknowledging
+/// placement"): a replica is admitted only from the holder's unpromised capacity. Do: withhold the whole of
+/// every shard's admittable capacity (the memory-pressure hold), put a replica, then release the hold and
+/// put it again. Expect: the first put refused (no acknowledgement) with nothing held, and the second
+/// acknowledged and held. Before the fix the hold charged nothing and acknowledged whatever arrived.
+#[test]
+fn a_replica_is_admitted_only_from_the_holders_unpromised_capacity() {
+  use slates_cluster::content::ContentMessage;
+  use slates_db::register::{HostId, ObjectId};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-replica-cap-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("replica-cap", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let archive = replica_archive(BEFORE);
+  let manifest = archive.manifest_identity();
+  let put = replica_put(ObjectId::new(HostId(1), 1), 1, &archive);
+  let acked = |reply: &[u8]| matches!(ContentMessage::decode(reply), Ok(ContentMessage::Ack(_)));
+
+  daemon.inject_pressure_hold(u64::MAX).unwrap();
+  let refused = daemon.serve_content_as_authorized(put.clone()).unwrap();
+  let held_while_full = daemon.fleet_holder_content(manifest);
+  daemon.inject_pressure_hold(0).unwrap();
+  let admitted = daemon.serve_content_as_authorized(put).unwrap();
+  let held_after = daemon.fleet_holder_content(manifest);
+  daemon.stop();
+  drop(segment);
+  assert!(
+    !acked(&refused),
+    "no acknowledgement without unpromised capacity"
+  );
+  assert_eq!(
+    held_while_full,
+    Ok(false),
+    "nothing was held while the capacity was withheld"
+  );
+  assert!(
+    acked(&admitted),
+    "the put is acknowledged once capacity returns"
+  );
+  assert_eq!(held_after, Ok(true));
+}
+
+/// AUD-29-59 (§4.8 persistence before reply; §4.10 placement closure): a holder acknowledges a content put
+/// only for content its anchor-owned RAM retains, so a warm restart keeps every acknowledged replica. Do:
+/// place a replica on a daemon through the holder's production path, stop it, and start a second daemon over
+/// the same anchor segment and content object. Expect: the put acknowledged, and the replica held whole after
+/// the restart. Before the fix the hold lived only in process memory and every restart began it empty, so an
+/// acknowledgement that placement counted was gone.
+#[test]
+fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
+  use slates_cluster::content::ContentMessage;
+  use slates_db::register::{HostId, ObjectId};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-replica-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("replica", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+
+  let archive = replica_archive(BEFORE);
+  let manifest = archive.manifest_identity();
+  let put = replica_put(ObjectId::new(HostId(1), 1), 1, &archive);
   let reply = first.serve_content_as_authorized(put).unwrap();
   let acknowledged = matches!(ContentMessage::decode(&reply), Ok(ContentMessage::Ack(_)));
   let held_before = first.fleet_holder_content(manifest);

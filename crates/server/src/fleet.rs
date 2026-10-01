@@ -3904,7 +3904,14 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
         let placed = slates_cluster::content::Placed {
           sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
         };
-        s.held_content.hold(object, placed, archive).is_ok()
+        s.held_content
+          .hold(
+            &mut crate::content_holder::hold_space(&mut s.store),
+            object,
+            placed,
+            archive,
+          )
+          .is_ok()
       })
       .unwrap_or(false);
       if !stored {
@@ -4071,7 +4078,9 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
   let taken = state::with_state(|s| {
-    let archive = s.held_content.archive_of(object, &manifest)?;
+    let archive = s
+      .held_content
+      .archive_of(s.store.content.arena(), object, &manifest)?;
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
     let placed = s.placed_heads.get(&object).cloned()?;

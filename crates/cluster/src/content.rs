@@ -45,8 +45,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use slates_archive::format::{ArchiveError, Chunk, Encoding};
-use slates_archive::{Archive, ContentStore, Node, chunks_for};
+use slates_archive::{Archive, Node, chunks_for};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
+use slates_mem::arena::{ChunkArena, Extent};
+use slates_mem::budget::{MetadataBudget, ShardBudget};
+use slates_mem::error::MemError;
 use slates_rt::error::RtError;
 use slates_rt::futures::{detach, now_ns, spawn_child};
 use slates_transport::connection::Priority;
@@ -416,6 +419,15 @@ pub enum ContentRefusal {
   /// the manifest's closure; an owner ships exactly the referenced chunks a holder lacks). Refused before any
   /// chunk is decoded or hashed.
   Unreferenced,
+  /// The holder cannot admit the put (§4.2; AUD-29-43): its charge — the put's arena blocks, its
+  /// verification scratch and its index — is past the shard's unpromised capacity or metadata ledger, or the
+  /// arena has no block that fits. Refused whole, with nothing stored and nothing charged.
+  NoCapacity {
+    /// The bytes the refused charge or block asked for.
+    requested: u64,
+    /// The bytes that were available.
+    available: u64,
+  },
 }
 
 /// The distinct chunk identities a manifest references, in first-reference order (a hole's zero
@@ -441,12 +453,6 @@ pub fn referenced_chunks(node: &Node) -> Vec<[u8; 32]> {
   let mut out = Vec::new();
   walk(node, &mut seen, &mut out);
   out
-}
-
-/// Whether a chunk's payload decodes and hashes to its declared identity (the archive reader's own
-/// check, [`Archive::content`], which refuses a mismatch by chunk).
-fn verified(chunk: &Chunk) -> bool {
-  Archive::content(chunk).is_ok()
 }
 
 /// The archive's header fields and manifest with `chunks` in place of its own — the partial archive an
@@ -527,38 +533,122 @@ pub enum ContentAccess {
   Read,
 }
 
+/// The shard memory a hold stores in and is charged against (§4.2 "a remote holder makes the same admission
+/// against its own machine before acknowledging placement"; AUD-29-43): the shard's chunk arena, which the
+/// held chunk payloads and manifest encodings occupy; its byte budget, which charges them (and a put's
+/// transient verification scratch) at their arena block length, from unpromised capacity only
+/// (`ShardBudget::charge_replicated`); and its metadata ledger, which charges the hold's own index. The
+/// shard keeps all three in its store; a hold borrows them for one operation, so the shard stays the one
+/// capacity owner and the hold never holds a reference across operations.
+pub struct HoldSpace<'a> {
+  /// The shard's chunk arena.
+  pub arena: &'a mut ChunkArena,
+  /// The shard's byte budget.
+  pub budget: &'a mut ShardBudget,
+  /// The shard's metadata ledger.
+  pub metadata: &'a mut MetadataBudget,
+}
+
+/// The branching factor of the standard library's B-tree (`B` in `alloc::collections::btree::node`, Rust
+/// std source; tier C): a node holds at most `2B − 1` entries and every node but the root at least `B − 1`.
+/// The hold's index charge is derived from it ([`btree_entry_bytes`]).
+/// Format: the standard library's constant, restated so the charge follows the structure it bounds.
+const BTREE_B: usize = 6;
+
+/// The heap bytes one node of a `BTreeMap<K, V>` can take, leaf and internal: a leaf holds `2B − 1` keys and
+/// values, its parent link, its index in the parent and its length; an internal node adds `2B` child links.
+/// Each is rounded up to a power of two, the largest size-class rounding a general-purpose allocator applies,
+/// so the charge bounds what the allocator hands out, not only what the node asks for.
+fn btree_node_bytes<K, V>() -> (u64, u64) {
+  let capacity = BTREE_B.saturating_mul(2).saturating_sub(1);
+  let link = size_of::<usize>();
+  let leaf = link
+    .saturating_add(size_of::<u16>().saturating_mul(2))
+    .saturating_add(
+      size_of::<K>()
+        .saturating_add(size_of::<V>())
+        .saturating_mul(capacity),
+    );
+  let internal = leaf.saturating_add(link.saturating_mul(capacity.saturating_add(1)));
+  let rounded = |bytes: usize| {
+    u64::try_from(bytes.checked_next_power_of_two().unwrap_or(bytes)).unwrap_or(u64::MAX)
+  };
+  (rounded(leaf), rounded(internal))
+}
+
+/// The heap bytes one entry of a `BTreeMap<K, V>` can cost at most, amortized (§4.2 "an uncharged heap
+/// allocation cannot sit outside the bound"; AUD-29-43): every node but the root holds at least `B − 1`
+/// entries and the tree has fewer internal nodes than leaves, so `n` entries take at most
+/// `n / (B − 1)` leaves and as many internal nodes — `(leaf + internal) / (B − 1)` per entry, rounded up.
+fn btree_entry_bytes<K, V>() -> u64 {
+  let (leaf, internal) = btree_node_bytes::<K, V>();
+  leaf
+    .saturating_add(internal)
+    .div_ceil(u64::try_from(BTREE_B.saturating_sub(1)).unwrap_or(1).max(1))
+}
+
+/// The heap bytes a non-empty `BTreeMap<K, V>`'s root can take beyond its entries' amortized share (a root
+/// holds as few as one entry): one leaf and one internal node.
+fn btree_map_bytes<K, V>() -> u64 {
+  let (leaf, internal) = btree_node_bytes::<K, V>();
+  leaf.saturating_add(internal)
+}
+
 /// What a node holds as a content candidate for other owners' snapshots (§4.10), **scoped by object**
 /// (§4.13 "Content identity and sharing"; AUD-29-45). A chunk hash proves bytes, not permission to read them
 /// or to ask whether they exist: every answer — the missing set an offer draws, which already-held chunks a
 /// put may lean on, the archive a fetch returns — is computed from what this node holds **for the object the
 /// request names**, and only after the caller's authority check for that object passed. The bytes themselves
-/// are kept once whatever objects reference them (a shared store, one reference per object), so dedup saves
-/// memory without answering across objects. A refused or unheld request draws the same empty reply, so an
-/// answer never reveals whether another object's content exists. Every archive is verified before anything is
-/// stored, and a manifest is held only once every chunk it references is held for its object.
+/// are kept once whatever objects reference them (one stored chunk, one reference per object), so dedup
+/// saves memory without answering across objects. A refused or unheld request draws the same empty reply, so
+/// an answer never reveals whether another object's content exists.
+///
+/// **Residency and admission (AUD-29-43).** Every held byte lives in the shard's arena, charged at its block
+/// length against the shard's unpromised capacity; the hold's own index is charged to the shard's metadata
+/// ledger at a derived per-entry cost. A put is admitted whole or refused typed: its charges are taken before
+/// any chunk is verified or stored, its new encoded chunks are verified in one charged scratch block, and a
+/// refusal at any step gives back every charge and every block. A release frees exactly what its hold took.
 #[derive(Debug, Default)]
 pub struct ContentHold {
-  store: ContentStore,
+  chunks: BTreeMap<[u8; 32], StoredChunk>,
   objects: BTreeMap<ObjectId, Held>,
   /// Requests refused by the authority check (a non-vacuity counter for the scope).
   unauthorized: u64,
   /// Puts refused because the holder's accepted records already supersede them (AUD-29-43; a non-vacuity
   /// counter for the retention rule at the door).
   superseded: u64,
+  /// The bytes the hold is charged on the shard's byte budget (its blocks).
+  charged_bytes: u64,
+  /// The bytes the hold is charged on the shard's metadata ledger (its index).
+  index_bytes: u64,
 }
 
-/// One object's held content: its manifests (each with the archive header it arrived under and its latest
-/// placement) and how many of them reference each chunk.
+/// A chunk stored in the arena once, whatever objects reference it: its block, its charge (the block's
+/// length), the fields a `Chunk` carries besides its payload, and how many objects reference it.
+#[derive(Debug)]
+struct StoredChunk {
+  extent: Extent,
+  raw_len: u64,
+  stored_len: u64,
+  encoding: Encoding,
+  level: u8,
+  dictionary: [u8; 32],
+  objects: u64,
+}
+
+/// One object's held content: its manifests and how many of them reference each chunk.
 #[derive(Debug, Default)]
 struct Held {
   manifests: BTreeMap<[u8; 32], HeldManifest>,
   chunks: BTreeMap<[u8; 32], u64>,
 }
 
-/// A held manifest: the archive header and tree it arrived under (no chunks) and when it was last placed.
+/// A held manifest: the arena block holding the archive it arrived as with no chunks (its header and tree,
+/// canonically encoded), the encoding's length, and how it was last placed.
 #[derive(Debug)]
 struct HeldManifest {
-  record: Archive,
+  extent: Extent,
+  len: usize,
   placed: Placed,
 }
 
@@ -570,6 +660,64 @@ struct HeldManifest {
 pub struct Placed {
   /// The register sequence the content was placed for.
   pub sequence: u64,
+}
+
+/// What a put takes, charged before anything is verified or stored, so a refusal gives it all back.
+#[derive(Debug, Default, Clone, Copy)]
+struct Charge {
+  bytes: u64,
+  scratch: u64,
+  index: u64,
+}
+
+/// The index cost of a new stored chunk.
+fn chunk_entry_bytes() -> u64 {
+  btree_entry_bytes::<[u8; 32], StoredChunk>()
+}
+
+/// The index cost of a new object: its entry and the roots of its two maps.
+fn object_entry_bytes() -> u64 {
+  btree_entry_bytes::<ObjectId, Held>()
+    .saturating_add(btree_map_bytes::<[u8; 32], HeldManifest>())
+    .saturating_add(btree_map_bytes::<[u8; 32], u64>())
+}
+
+/// The index cost of a new manifest for an object.
+fn manifest_entry_bytes() -> u64 {
+  btree_entry_bytes::<[u8; 32], HeldManifest>()
+}
+
+/// The index cost of an object's reference to a chunk.
+fn reference_entry_bytes() -> u64 {
+  btree_entry_bytes::<[u8; 32], u64>()
+}
+
+/// The typed refusal a budget or arena refusal becomes.
+fn no_capacity(error: &MemError) -> ContentRefusal {
+  match error {
+    MemError::BudgetExceeded {
+      requested,
+      available,
+    } => ContentRefusal::NoCapacity {
+      requested: *requested,
+      available: *available,
+    },
+    MemError::ArenaExhausted {
+      requested,
+      largest_free,
+    } => ContentRefusal::NoCapacity {
+      requested: u64::try_from(*requested).unwrap_or(u64::MAX),
+      available: u64::try_from(*largest_free).unwrap_or(u64::MAX),
+    },
+    MemError::TooLarge { len, max } => ContentRefusal::NoCapacity {
+      requested: u64::try_from(*len).unwrap_or(u64::MAX),
+      available: u64::try_from(*max).unwrap_or(u64::MAX),
+    },
+    _ => ContentRefusal::NoCapacity {
+      requested: 0,
+      available: 0,
+    },
+  }
 }
 
 impl ContentHold {
@@ -598,12 +746,22 @@ impl ContentHold {
   /// The distinct chunks held — the non-vacuity counter a test reads (a put of one missing chunk
   /// raises it by exactly one).
   pub fn chunk_count(&self) -> usize {
-    self.store.unique_count()
+    self.chunks.len()
   }
 
   /// The manifests held, across objects.
   pub fn manifest_count(&self) -> usize {
     self.objects.values().map(|held| held.manifests.len()).sum()
+  }
+
+  /// The bytes this hold is charged on the shard's byte budget — its arena blocks (AUD-29-43).
+  pub fn charged_bytes(&self) -> u64 {
+    self.charged_bytes
+  }
+
+  /// The bytes this hold is charged on the shard's metadata ledger — its index (AUD-29-43).
+  pub fn index_bytes(&self) -> u64 {
+    self.index_bytes
   }
 
   /// Requests the authority check refused.
@@ -627,13 +785,15 @@ impl ContentHold {
       .collect()
   }
 
-  /// Holds `archive` for `object`, placed as `placed` — only chunks its manifest references may be shipped,
-  /// every chunk the manifest references must be shipped or already held **for this object**, and every
-  /// shipped chunk the object does not already hold is verified against its identity — and returns the
-  /// manifest identity now held. Nothing is stored on a refusal; holding a manifest already held stores
-  /// nothing and refreshes its placement.
+  /// Holds `archive` for `object`, placed as `placed`, in `space` — only chunks its manifest references may
+  /// be shipped, every chunk the manifest references must be shipped or already held **for this object**,
+  /// every shipped chunk not yet stored is verified, and the whole put is admitted from the shard's
+  /// unpromised capacity or refused (`NoCapacity`) — and returns the manifest identity now held. Nothing is
+  /// stored and nothing stays charged on a refusal; holding a manifest already held stores nothing and
+  /// refreshes its placement.
   pub fn hold(
     &mut self,
+    space: &mut HoldSpace<'_>,
     object: ObjectId,
     placed: Placed,
     archive: Archive,
@@ -646,58 +806,280 @@ impl ContentHold {
     {
       return Err(ContentRefusal::Unreferenced);
     }
-    let held_chunks = self.objects.get(&object).map(|held| &held.chunks);
-    let is_held =
-      |identity: &[u8; 32]| held_chunks.is_some_and(|chunks| chunks.contains_key(identity));
+    let held = self.objects.get(&object);
+    let held_for_object =
+      |identity: &[u8; 32]| held.is_some_and(|held| held.chunks.contains_key(identity));
+    let shipped = |identity: &[u8; 32]| {
+      archive
+        .chunks
+        .iter()
+        .find(|chunk| chunk.identity == *identity)
+    };
     let missing = referenced
       .iter()
-      .filter(|identity| {
-        !is_held(identity)
-          && !archive
-            .chunks
-            .iter()
-            .any(|chunk| chunk.identity == **identity)
-      })
+      .filter(|identity| !held_for_object(identity) && shipped(identity).is_none())
       .count();
     if missing > 0 {
       return Err(ContentRefusal::Incomplete { missing });
     }
-    if !archive
-      .chunks
+    // What this put adds: the object's new references, and of those the chunks not stored for any object.
+    let new_references: Vec<[u8; 32]> = referenced
       .iter()
-      .filter(|chunk| !is_held(&chunk.identity))
-      .all(verified)
-    {
-      return Err(ContentRefusal::IdentityMismatch);
-    }
+      .filter(|identity| !held_for_object(identity))
+      .copied()
+      .collect();
     let identity = archive.manifest_identity();
-    let held = self.objects.entry(object).or_default();
-    if let Some(record) = held.manifests.get_mut(&identity) {
+    if let Some(record) = self
+      .objects
+      .get_mut(&object)
+      .and_then(|held| held.manifests.get_mut(&identity))
+    {
       record.placed = placed;
       return Ok(identity);
     }
-    let mut shipped: BTreeMap<[u8; 32], Chunk> = archive
-      .chunks
+    let new_chunks: Vec<&Chunk> = new_references
       .iter()
-      .map(|chunk| (chunk.identity, chunk.clone()))
+      .filter(|identity| !self.chunks.contains_key(*identity))
+      .filter_map(shipped)
       .collect();
-    for chunk_identity in &referenced {
+    let manifest_bytes = with_chunks(&archive, Vec::new()).encode();
+    let charge = self.charge_for(
+      space,
+      &new_references,
+      &new_chunks,
+      manifest_bytes.len(),
+      object,
+    )?;
+    if let Err(refusal) = Self::verify(space, &new_chunks, charge.scratch) {
+      self.refund(space, charge);
+      return Err(refusal);
+    }
+    // Verification is done: its scratch charge goes back before anything is stored.
+    space.budget.credit_replicated(charge.scratch);
+    let stored = match Self::store(space, &new_chunks, &manifest_bytes) {
+      Ok(stored) => stored,
+      Err(refusal) => {
+        self.refund(
+          space,
+          Charge {
+            scratch: 0,
+            ..charge
+          },
+        );
+        return Err(refusal);
+      }
+    };
+    self.install(
+      object,
+      identity,
+      placed,
+      &referenced,
+      stored,
+      manifest_bytes.len(),
+    );
+    Ok(identity)
+  }
+
+  /// Takes every charge a put needs — the index entries it adds, its new blocks, and one scratch block for
+  /// verifying its largest new encoded chunk — whole or refused with nothing taken.
+  fn charge_for(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    new_references: &[[u8; 32]],
+    new_chunks: &[&Chunk],
+    manifest_len: usize,
+    object: ObjectId,
+  ) -> Result<Charge, ContentRefusal> {
+    let block = |len: u64| {
+      usize::try_from(len)
+        .ok()
+        .and_then(|len| space.arena.block_len(len))
+        .map(|bytes| u64::try_from(bytes).unwrap_or(u64::MAX))
+        .ok_or(ContentRefusal::NoCapacity {
+          requested: len,
+          available: 0,
+        })
+    };
+    let mut bytes = block(u64::try_from(manifest_len).unwrap_or(u64::MAX))?;
+    for chunk in new_chunks {
+      bytes = bytes.saturating_add(block(chunk.stored_len)?);
+    }
+    let largest_encoded = new_chunks
+      .iter()
+      .filter(|chunk| chunk.encoding != Encoding::Raw)
+      .map(|chunk| chunk.raw_len)
+      .max();
+    let scratch = match largest_encoded {
+      Some(raw_len) => block(raw_len)?,
+      None => 0,
+    };
+    let new_object = !self.objects.contains_key(&object);
+    let count = |items: usize| u64::try_from(items).unwrap_or(u64::MAX);
+    let index = manifest_entry_bytes()
+      .saturating_add(reference_entry_bytes().saturating_mul(count(new_references.len())))
+      .saturating_add(chunk_entry_bytes().saturating_mul(count(new_chunks.len())))
+      .saturating_add(if new_object { object_entry_bytes() } else { 0 });
+    let credit = space.metadata.reserve(index).map_err(|e| no_capacity(&e))?;
+    if let Err(e) = space
+      .budget
+      .charge_replicated(bytes.saturating_add(scratch))
+    {
+      space.metadata.release(credit);
+      return Err(no_capacity(&e));
+    }
+    self.charged_bytes = self.charged_bytes.saturating_add(bytes);
+    self.index_bytes = self.index_bytes.saturating_add(index);
+    Ok(Charge {
+      bytes,
+      scratch,
+      index,
+    })
+  }
+
+  /// Gives back every charge of a refused put.
+  fn refund(&mut self, space: &mut HoldSpace<'_>, charge: Charge) {
+    space
+      .budget
+      .credit_replicated(charge.bytes.saturating_add(charge.scratch));
+    space.metadata.release(slates_mem::budget::MetadataCredit {
+      bytes: charge.index,
+    });
+    self.charged_bytes = self.charged_bytes.saturating_sub(charge.bytes);
+    self.index_bytes = self.index_bytes.saturating_sub(charge.index);
+  }
+
+  /// Verifies every new chunk against its identity: a raw one where it lies, an encoded one decoded into one
+  /// scratch block of `scratch` bytes allocated from the arena for the duration (already charged).
+  fn verify(
+    space: &mut HoldSpace<'_>,
+    new_chunks: &[&Chunk],
+    scratch: u64,
+  ) -> Result<(), ContentRefusal> {
+    let extent = if scratch > 0 {
+      let len = usize::try_from(scratch).map_err(|_| ContentRefusal::NoCapacity {
+        requested: scratch,
+        available: 0,
+      })?;
+      Some(space.arena.alloc(len).map_err(|e| no_capacity(&e))?)
+    } else {
+      None
+    };
+    let mut verdict = Ok(());
+    for chunk in new_chunks {
+      let buffer: &mut [u8] = match extent.and_then(|extent| space.arena.bytes_mut(extent)) {
+        Some(buffer) => buffer,
+        None => &mut [],
+      };
+      if Archive::verify_into(chunk, buffer).is_err() {
+        verdict = Err(ContentRefusal::IdentityMismatch);
+        break;
+      }
+    }
+    if let Some(extent) = extent {
+      let _ = space.arena.free(extent);
+    }
+    verdict
+  }
+
+  /// Allocates and fills a block for each new chunk's payload and one for the manifest's encoding; on an
+  /// allocation refusal frees what it took and refuses `NoCapacity`.
+  fn store(
+    space: &mut HoldSpace<'_>,
+    new_chunks: &[&Chunk],
+    manifest_bytes: &[u8],
+  ) -> Result<(Vec<(StoredChunkKey, StoredChunk)>, Extent), ContentRefusal> {
+    let mut taken: Vec<Extent> = Vec::new();
+    let mut put = |bytes: &[u8], taken: &mut Vec<Extent>| -> Result<Extent, ContentRefusal> {
+      let extent = space
+        .arena
+        .alloc(bytes.len())
+        .map_err(|e| no_capacity(&e))?;
+      taken.push(extent);
+      let block = space
+        .arena
+        .bytes_mut(extent)
+        .and_then(|block| block.get_mut(..bytes.len()))
+        .ok_or(ContentRefusal::NoCapacity {
+          requested: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+          available: 0,
+        })?;
+      block.copy_from_slice(bytes);
+      Ok(extent)
+    };
+    let mut stored = Vec::with_capacity(new_chunks.len());
+    let mut outcome = Ok(());
+    for chunk in new_chunks {
+      match put(&chunk.payload, &mut taken) {
+        Ok(extent) => stored.push((
+          chunk.identity,
+          StoredChunk {
+            extent,
+            raw_len: chunk.raw_len,
+            stored_len: chunk.stored_len,
+            encoding: chunk.encoding,
+            level: chunk.level,
+            dictionary: chunk.dictionary,
+            objects: 0,
+          },
+        )),
+        Err(refusal) => {
+          outcome = Err(refusal);
+          break;
+        }
+      }
+    }
+    let manifest = outcome.and_then(|()| put(manifest_bytes, &mut taken));
+    match manifest {
+      Ok(extent) => Ok((stored, extent)),
+      Err(refusal) => {
+        for extent in taken {
+          let _ = space.arena.free(extent);
+        }
+        Err(refusal)
+      }
+    }
+  }
+
+  /// Records an admitted put: its stored chunks, one more reference from the object to every chunk its
+  /// manifest references (a chunk the object references for the first time gains the object as one of its
+  /// referrers), and the manifest.
+  fn install(
+    &mut self,
+    object: ObjectId,
+    identity: [u8; 32],
+    placed: Placed,
+    referenced: &BTreeSet<[u8; 32]>,
+    (stored, manifest): (Vec<(StoredChunkKey, StoredChunk)>, Extent),
+    manifest_len: usize,
+  ) {
+    for (key, chunk) in stored {
+      self.chunks.insert(key, chunk);
+    }
+    let held = self.objects.entry(object).or_default();
+    for chunk_identity in referenced {
       let references = held.chunks.entry(*chunk_identity).or_insert(0);
       if *references == 0
-        && let Some(chunk) = shipped.remove(chunk_identity)
+        && let Some(chunk) = self.chunks.get_mut(chunk_identity)
       {
-        self.store.insert(chunk);
+        chunk.objects = chunk.objects.saturating_add(1);
       }
       *references = references.saturating_add(1);
     }
     held.manifests.insert(
       identity,
       HeldManifest {
-        record: with_chunks(&archive, Vec::new()),
+        extent: manifest,
+        len: manifest_len,
         placed,
       },
     );
-    Ok(identity)
+  }
+
+  /// The archive (header and tree, no chunks) a held manifest's block holds, or `None` if it does not decode
+  /// (the hold wrote it canonically; a failure is memory corruption, answered as not held).
+  fn manifest_of(arena: &ChunkArena, record: &HeldManifest) -> Option<Archive> {
+    let bytes = arena.bytes(record.extent)?.get(..record.len)?;
+    Archive::decode(bytes).ok()
   }
 
   /// Keeps, of what is held for `object`, only the manifests `keep` accepts given their identity and latest
@@ -705,6 +1087,7 @@ impl ContentHold {
   /// the holder's retention rule is the caller's, from its accepted records). Returns how many were released.
   pub fn retain(
     &mut self,
+    space: &mut HoldSpace<'_>,
     object: ObjectId,
     mut keep: impl FnMut(&[u8; 32], Placed) -> bool,
   ) -> usize {
@@ -722,7 +1105,7 @@ impl ContentHold {
       .unwrap_or_default();
     released
       .iter()
-      .filter(|identity| self.forget_manifest(object, identity))
+      .filter(|identity| self.forget_manifest(space, object, identity))
       .count()
   }
 
@@ -737,57 +1120,171 @@ impl ContentHold {
       .max()
   }
 
-  /// Forgets a manifest held for `object`: its record is dropped and each chunk it references loses one of
-  /// the object's references (a chunk the object no longer references gives back its store reference, and
-  /// the bytes go when no object references them). Returns whether the manifest was held. The release the
-  /// retention rule, a tombstone and a stale-copy reclaim go through (AUD-29-43), and what a holder's
-  /// **content loss** looks like from the owner's side — in a real deployment a whole-anchor loss (a warm
-  /// restart keeps what was acknowledged, A-51); in-process, a test's injection — the condition the healer
-  /// repairs (§4.10 "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from the
-  /// wire.
-  pub fn forget_manifest(&mut self, object: ObjectId, identity: &[u8; 32]) -> bool {
+  /// Forgets a manifest held for `object` in `space`: its block is freed and its charge given back, and each
+  /// chunk it references loses one of the object's references (a chunk the object no longer references loses
+  /// the object as a referrer, and its block and charge go when no object references it); the index entries
+  /// that go give back their charge. Returns whether the manifest was held. The release the retention rule, a
+  /// tombstone and a stale-copy reclaim go through (AUD-29-43), and what a holder's **content loss** looks
+  /// like from the owner's side — in a real deployment a whole-anchor loss (a warm restart keeps what was
+  /// acknowledged, A-51); in-process, a test's injection — the condition the healer repairs (§4.10
+  /// "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from the wire.
+  pub fn forget_manifest(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    object: ObjectId,
+    identity: &[u8; 32],
+  ) -> bool {
     let Some(held) = self.objects.get_mut(&object) else {
       return false;
     };
-    let Some(HeldManifest { record, .. }) = held.manifests.remove(identity) else {
+    let Some(record) = held.manifests.remove(identity) else {
       return false;
     };
-    let referenced: BTreeSet<[u8; 32]> = referenced_chunks(&record.manifest).into_iter().collect();
+    let referenced: BTreeSet<[u8; 32]> = Self::manifest_of(space.arena, &record)
+      .map(|archive| referenced_chunks(&archive.manifest).into_iter().collect())
+      .unwrap_or_default();
+    let mut bytes = u64::try_from(record.extent.len()).unwrap_or(u64::MAX);
+    let mut index = manifest_entry_bytes();
+    let _ = space.arena.free(record.extent);
     for chunk_identity in referenced {
-      if let Some(references) = held.chunks.get_mut(&chunk_identity) {
-        *references = references.saturating_sub(1);
-        if *references == 0 {
-          held.chunks.remove(&chunk_identity);
-          self.store.release(&chunk_identity);
-        }
+      let Some(references) = held.chunks.get_mut(&chunk_identity) else {
+        continue;
+      };
+      *references = references.saturating_sub(1);
+      if *references > 0 {
+        continue;
+      }
+      held.chunks.remove(&chunk_identity);
+      index = index.saturating_add(reference_entry_bytes());
+      let gone = self.chunks.get_mut(&chunk_identity).is_some_and(|chunk| {
+        chunk.objects = chunk.objects.saturating_sub(1);
+        chunk.objects == 0
+      });
+      if gone && let Some(chunk) = self.chunks.remove(&chunk_identity) {
+        bytes = bytes.saturating_add(u64::try_from(chunk.extent.len()).unwrap_or(u64::MAX));
+        index = index.saturating_add(chunk_entry_bytes());
+        let _ = space.arena.free(chunk.extent);
       }
     }
     if held.manifests.is_empty() {
       self.objects.remove(&object);
+      index = index.saturating_add(object_entry_bytes());
     }
+    space.budget.credit_replicated(bytes);
+    space
+      .metadata
+      .release(slates_mem::budget::MetadataCredit { bytes: index });
+    self.charged_bytes = self.charged_bytes.saturating_sub(bytes);
+    self.index_bytes = self.index_bytes.saturating_sub(index);
     true
   }
 
-  /// This hold's canonical image (AUD-29-59; see [`HoldImage`]), or no bytes when nothing is held.
-  pub fn to_image(&self) -> Vec<u8> {
+  /// Forgets everything held for `object` (AUD-29-43): every manifest, and each chunk's reference for the
+  /// object (the bytes go when no object references them). The authoritative releases call it — a destroyed
+  /// object's tombstone, a copy reclaimed as stale. Returns how many manifests were held.
+  pub fn forget_object(&mut self, space: &mut HoldSpace<'_>, object: ObjectId) -> usize {
+    let manifests: Vec<[u8; 32]> = self
+      .objects
+      .get(&object)
+      .map(|held| held.manifests.keys().copied().collect())
+      .unwrap_or_default();
+    manifests
+      .iter()
+      .filter(|identity| self.forget_manifest(space, object, identity))
+      .count()
+  }
+
+  /// Forgets the manifest with `identity` for every object holding it (a test's injection of content loss,
+  /// [`forget_manifest`](Self::forget_manifest)); whether any held it.
+  pub fn forget_manifest_for_every_object(
+    &mut self,
+    space: &mut HoldSpace<'_>,
+    identity: &[u8; 32],
+  ) -> bool {
+    let holding: Vec<ObjectId> = self
+      .objects
+      .iter()
+      .filter(|(_, held)| held.manifests.contains_key(identity))
+      .map(|(object, _)| *object)
+      .collect();
+    let mut forgot = false;
+    for object in holding {
+      forgot |= self.forget_manifest(space, object, identity);
+    }
+    forgot
+  }
+
+  /// Forgets everything this hold holds, freeing every block and giving back every charge — what a hold
+  /// rebuilt from a damaged image does before refusing, so a refused recovery leaves nothing charged.
+  pub fn forget_all(&mut self, space: &mut HoldSpace<'_>) {
+    let objects: Vec<ObjectId> = self.objects.keys().copied().collect();
+    for object in objects {
+      self.forget_object(space, object);
+    }
+  }
+
+  /// A stored chunk as a `Chunk`, its payload copied out of the arena (for a reply or an image).
+  fn chunk_of(arena: &ChunkArena, identity: &[u8; 32], stored: &StoredChunk) -> Option<Chunk> {
+    let len = usize::try_from(stored.stored_len).ok()?;
+    let payload = arena.bytes(stored.extent)?.get(..len)?.to_vec();
+    Some(Chunk {
+      identity: *identity,
+      raw_len: stored.raw_len,
+      stored_len: stored.stored_len,
+      encoding: stored.encoding,
+      level: stored.level,
+      dictionary: stored.dictionary,
+      payload,
+    })
+  }
+
+  /// The whole archive for a manifest held for `object` — its header, manifest, and every referenced chunk
+  /// in reference order, copied out of `arena` — or `None` if it is not held whole for that object.
+  pub fn archive_of(
+    &self,
+    arena: &ChunkArena,
+    object: ObjectId,
+    identity: &[u8; 32],
+  ) -> Option<Archive> {
+    let record = self.objects.get(&object)?.manifests.get(identity)?;
+    let archive = Self::manifest_of(arena, record)?;
+    let mut chunks = Vec::new();
+    for referenced in referenced_chunks(&archive.manifest) {
+      chunks.push(Self::chunk_of(
+        arena,
+        &referenced,
+        self.chunks.get(&referenced)?,
+      )?);
+    }
+    Some(with_chunks(&archive, chunks))
+  }
+
+  /// This hold's canonical image (AUD-29-59; see [`HoldImage`]), read out of `arena`, or no bytes when
+  /// nothing is held.
+  pub fn to_image(&self, arena: &ChunkArena) -> Vec<u8> {
     if self.objects.is_empty() {
       return Vec::new();
     }
-    let mut referenced: BTreeSet<[u8; 32]> = BTreeSet::new();
     let mut manifests = Vec::new();
     for (object, held) in &self.objects {
       for record in held.manifests.values() {
-        referenced.extend(referenced_chunks(&record.record.manifest));
+        let Some(bytes) = arena
+          .bytes(record.extent)
+          .and_then(|bytes| bytes.get(..record.len))
+        else {
+          continue;
+        };
         manifests.push(ManifestImage {
           object: object.0,
           sequence: record.placed.sequence,
-          archive: record.record.encode(),
+          archive: bytes.to_vec(),
         });
       }
     }
-    let chunks = referenced
+    let chunks = self
+      .chunks
       .iter()
-      .filter_map(|identity| self.store.get(identity))
+      .filter_map(|(identity, stored)| Self::chunk_of(arena, identity, stored))
       .map(|chunk| ChunkImage {
         identity: chunk.identity,
         raw_len: chunk.raw_len,
@@ -795,16 +1292,20 @@ impl ContentHold {
         encoding: chunk.encoding.to_wire(),
         level: chunk.level,
         dictionary: chunk.dictionary,
-        payload: chunk.payload.clone(),
+        payload: chunk.payload,
       })
       .collect();
     HoldImage { chunks, manifests }.to_bytes()
   }
 
-  /// A hold rebuilt from its canonical image (AUD-29-59): every manifest held again through [`hold`](
-  /// Self::hold), so each is re-verified against its identities and re-owned per object exactly as a put
-  /// would leave it — an image is recovered, never trusted. Empty bytes are an empty hold.
-  pub fn from_image(bytes: &[u8]) -> Result<ContentHold, HoldImageError> {
+  /// A hold rebuilt in `space` from its canonical image (AUD-29-59): every manifest held again through
+  /// [`hold`](Self::hold), so each is re-verified against its identities, re-owned per object and re-charged
+  /// exactly as a put would leave it — an image is recovered, never trusted. Empty bytes are an empty hold. A
+  /// refusal part-way gives back everything the partial rebuild took.
+  pub fn from_image(
+    space: &mut HoldSpace<'_>,
+    bytes: &[u8],
+  ) -> Result<ContentHold, HoldImageError> {
     let mut hold = ContentHold::new();
     if bytes.is_empty() {
       return Ok(hold);
@@ -827,75 +1328,39 @@ impl ContentHold {
       );
     }
     for manifest in image.manifests {
-      let mut archive = Archive::decode(&manifest.archive).map_err(HoldImageError::Archive)?;
-      archive.chunks = referenced_chunks(&archive.manifest)
-        .iter()
-        .filter_map(|identity| chunks.get(identity).cloned())
-        .collect();
-      hold
-        .hold(
-          ObjectId(manifest.object),
-          Placed {
+      let rebuilt = Archive::decode(&manifest.archive)
+        .map_err(HoldImageError::Archive)
+        .and_then(|mut archive| {
+          archive.chunks = referenced_chunks(&archive.manifest)
+            .iter()
+            .filter_map(|identity| chunks.get(identity).cloned())
+            .collect();
+          let placed = Placed {
             sequence: manifest.sequence,
-          },
-          archive,
-        )
-        .map_err(HoldImageError::Refused)?;
+          };
+          hold
+            .hold(space, ObjectId(manifest.object), placed, archive)
+            .map_err(HoldImageError::Refused)
+        });
+      if let Err(refused) = rebuilt {
+        hold.forget_all(space);
+        return Err(refused);
+      }
     }
     Ok(hold)
   }
 
-  /// Forgets everything held for `object` (AUD-29-43): every manifest, and each chunk's reference for the
-  /// object (the bytes go when no object references them). The authoritative releases call it — a destroyed
-  /// object's tombstone, a copy reclaimed as stale. Returns how many manifests were held.
-  pub fn forget_object(&mut self, object: ObjectId) -> usize {
-    let manifests: Vec<[u8; 32]> = self
-      .objects
-      .get(&object)
-      .map(|held| held.manifests.keys().copied().collect())
-      .unwrap_or_default();
-    manifests
-      .iter()
-      .filter(|identity| self.forget_manifest(object, identity))
-      .count()
-  }
-
-  /// Forgets the manifest with `identity` for every object holding it (a test's injection of content loss,
-  /// [`forget_manifest`](Self::forget_manifest)); whether any held it.
-  pub fn forget_manifest_for_every_object(&mut self, identity: &[u8; 32]) -> bool {
-    let holding: Vec<ObjectId> = self
-      .objects
-      .iter()
-      .filter(|(_, held)| held.manifests.contains_key(identity))
-      .map(|(object, _)| *object)
-      .collect();
-    let mut forgot = false;
-    for object in holding {
-      forgot |= self.forget_manifest(object, identity);
-    }
-    forgot
-  }
-
-  /// The whole archive for a manifest held for `object` — its header, manifest, and every referenced chunk
-  /// in reference order — or `None` if it is not held whole for that object.
-  pub fn archive_of(&self, object: ObjectId, identity: &[u8; 32]) -> Option<Archive> {
-    let record = &self.objects.get(&object)?.manifests.get(identity)?.record;
-    let mut chunks = Vec::new();
-    for referenced in referenced_chunks(&record.manifest) {
-      chunks.push(self.store.get(&referenced)?.clone());
-    }
-    Some(with_chunks(record, chunks))
-  }
-
-  /// Serves one content request as `holder`, once `authorized` has allowed the access it asks for the object
-  /// it names (checked before any lookup or allocation): an offer is answered with the object's missing set,
-  /// a put — once `admits` accepts its object, sequence and manifest (the holder's retention rule, so a put its
-  /// accepted records already supersede is never acknowledged, AUD-29-43) — with a bound acknowledgement once
-  /// verified and held whole, a fetch with the object's archive. Anything refused, malformed, unverifiable,
-  /// incomplete or unheld is answered with the same empty reply. Returns the reply and, for a put that was
-  /// held, its object, so the caller applies its retention rule to what the put superseded.
+  /// Serves one content request as `holder` in `space`, once `authorized` has allowed the access it asks for
+  /// the object it names (checked before any lookup or allocation): an offer is answered with the object's
+  /// missing set, a put — once `admits` accepts its object, sequence and manifest (the holder's retention
+  /// rule, so a put its accepted records already supersede is never acknowledged, AUD-29-43) — with a bound
+  /// acknowledgement once verified, admitted and held whole, a fetch with the object's archive. Anything
+  /// refused, malformed, unverifiable, past the holder's capacity, incomplete or unheld is answered with the
+  /// same empty reply. Returns the reply and, for a put that was held, its object, so the caller applies its
+  /// retention rule to what the put superseded.
   pub fn serve(
     &mut self,
+    space: &mut HoldSpace<'_>,
     holder: HostId,
     request: &[u8],
     authorized: impl FnOnce(ContentAccess, ObjectId) -> bool,
@@ -940,7 +1405,7 @@ impl ContentHold {
           self.superseded = self.superseded.saturating_add(1);
           Vec::new()
         }
-        Ok(archive) => match self.hold(object, Placed { sequence }, archive) {
+        Ok(archive) => match self.hold(space, object, Placed { sequence }, archive) {
           Ok(manifest) => {
             return (
               ContentMessage::Ack(ContentAck {
@@ -957,18 +1422,23 @@ impl ContentHold {
         },
         Err(_) => Vec::new(),
       },
-      ContentMessage::Fetch { object, manifest } => match self.archive_of(object, &manifest) {
-        Some(archive) => ContentMessage::Have {
-          archive: archive.encode(),
+      ContentMessage::Fetch { object, manifest } => {
+        match self.archive_of(space.arena, object, &manifest) {
+          Some(archive) => ContentMessage::Have {
+            archive: archive.encode(),
+          }
+          .encode(),
+          None => Vec::new(),
         }
-        .encode(),
-        None => Vec::new(),
-      },
+      }
       _ => Vec::new(),
     };
     (reply, None)
   }
 }
+
+/// A stored chunk's key: its identity.
+type StoredChunkKey = [u8; 32];
 
 /// A content put's outcome and the holder connections handed back — the content counterpart of
 /// [`crate::Committed`].
@@ -1267,6 +1737,45 @@ pub async fn fetch_content(
   (archive, endpoint)
 }
 
+/// A real shard memory for the hold's tests: an arena over an anonymous mapping of whole pages, a byte budget
+/// over its usable capacity with no headroom, and an unbounded metadata ledger.
+#[cfg(test)]
+pub(crate) struct TestSpace {
+  pub(crate) arena: ChunkArena,
+  pub(crate) budget: ShardBudget,
+  pub(crate) metadata: MetadataBudget,
+}
+
+#[cfg(test)]
+impl TestSpace {
+  /// Shape: the blocks the largest fixture can hold at once — the ownership oracle's pool (4 chunks), its
+  /// objects × manifests (2 × 2) and one verification scratch block, for a hold and its recovered copy at once:
+  /// 2 × 9 = 18, rounded up to the buddy's power of two. Every other fixture holds fewer.
+  const BLOCKS: usize = 32;
+
+  pub(crate) fn new() -> TestSpace {
+    let page = rustix::param::page_size();
+    let mut arena = ChunkArena::new(page);
+    arena
+      .add_region(slates_mem::region::Region::map(page * Self::BLOCKS, page, false).unwrap())
+      .unwrap();
+    let capacity = u64::try_from(arena.capacity()).unwrap();
+    TestSpace {
+      arena,
+      budget: ShardBudget::new(capacity, 0),
+      metadata: MetadataBudget::new(u64::MAX),
+    }
+  }
+
+  pub(crate) fn space(&mut self) -> HoldSpace<'_> {
+    HoldSpace {
+      arena: &mut self.arena,
+      budget: &mut self.budget,
+      metadata: &mut self.metadata,
+    }
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use slates_archive::{Entry, Extent, NodeMeta};
@@ -1443,24 +1952,30 @@ mod tests {
     let archive = two_chunk_archive();
     let identities: Vec<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
     let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
     assert_eq!(hold.missing_of(OBJECT, &identities), identities);
 
     let partial = with_chunks(&archive, vec![archive.chunks[0].clone()]);
     assert_eq!(
-      hold.hold(OBJECT, Placed::default(), partial),
+      hold.hold(&mut room.space(), OBJECT, Placed::default(), partial),
       Err(ContentRefusal::Incomplete { missing: 1 }),
       "a manifest referencing an unshipped, unheld chunk is not held"
     );
     assert_eq!(hold.chunk_count(), 0, "nothing stored on a refusal");
 
     let manifest = hold
-      .hold(OBJECT, Placed::default(), archive.clone())
+      .hold(
+        &mut room.space(),
+        OBJECT,
+        Placed::default(),
+        archive.clone(),
+      )
       .unwrap();
     assert_eq!(manifest, archive.manifest_identity());
     assert!(hold.holds_manifest(OBJECT, &manifest));
     assert_eq!(hold.chunk_count(), 2);
     assert!(hold.missing_of(OBJECT, &identities).is_empty());
-    let whole = hold.archive_of(OBJECT, &manifest).unwrap();
+    let whole = hold.archive_of(&room.arena, OBJECT, &manifest).unwrap();
     assert_eq!(
       whole.encode(),
       archive.encode(),
@@ -1478,6 +1993,7 @@ mod tests {
     let archive = two_chunk_archive();
     let holder = HostId(21);
     let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
     // The holder already has the first chunk (say from an earlier snapshot).
     let mut earlier = with_chunks(&archive, vec![archive.chunks[0].clone()]);
     earlier.manifest = Node::File(vec![Extent {
@@ -1486,7 +2002,9 @@ mod tests {
       chunk: archive.chunks[0].identity,
       chunk_offset: 0,
     }]);
-    hold.hold(OBJECT, Placed::default(), earlier).unwrap();
+    hold
+      .hold(&mut room.space(), OBJECT, Placed::default(), earlier)
+      .unwrap();
 
     let offer = ContentMessage::Offer {
       object: OBJECT,
@@ -1496,7 +2014,13 @@ mod tests {
     };
     let Ok(ContentMessage::Missing { missing, .. }) = ContentMessage::decode(
       &hold
-        .serve(holder, &offer.encode(), |_, _| true, |_, _, _| true)
+        .serve(
+          &mut room.space(),
+          holder,
+          &offer.encode(),
+          |_, _| true,
+          |_, _, _| true,
+        )
         .0,
     ) else {
       panic!("an offer is answered with the missing set");
@@ -1508,6 +2032,7 @@ mod tests {
     corrupt.chunks[0].payload[0] ^= 0x01;
     let refused = hold
       .serve(
+        &mut room.space(),
         holder,
         &ContentMessage::Put {
           object: OBJECT,
@@ -1525,6 +2050,7 @@ mod tests {
     let partial = with_chunks(&archive, vec![archive.chunks[1].clone()]);
     let reply = hold
       .serve(
+        &mut room.space(),
         holder,
         &ContentMessage::Put {
           object: OBJECT,
@@ -1546,6 +2072,7 @@ mod tests {
 
     let fetched = hold
       .serve(
+        &mut room.space(),
         holder,
         &ContentMessage::Fetch {
           object: OBJECT,
@@ -1563,6 +2090,7 @@ mod tests {
     assert!(
       hold
         .serve(
+          &mut room.space(),
           holder,
           &ContentMessage::Fetch {
             object: OBJECT,
@@ -1590,18 +2118,25 @@ mod tests {
     let archive = two_chunk_archive();
     let identities: Vec<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
     let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
     let manifest = hold
-      .hold(OBJECT, Placed::default(), archive.clone())
+      .hold(
+        &mut room.space(),
+        OBJECT,
+        Placed::default(),
+        archive.clone(),
+      )
       .unwrap();
     assert_eq!(hold.missing_of(OTHER, &identities), identities);
     let leaning = with_chunks(&archive, Vec::new());
     assert_eq!(
-      hold.hold(OTHER, Placed::default(), leaning),
+      hold.hold(&mut room.space(), OTHER, Placed::default(), leaning),
       Err(ContentRefusal::Incomplete { missing: 2 })
     );
-    assert!(hold.archive_of(OTHER, &manifest).is_none());
+    assert!(hold.archive_of(&room.arena, OTHER, &manifest).is_none());
     let fetched = hold
       .serve(
+        &mut room.space(),
         HostId(3),
         &ContentMessage::Fetch {
           object: OTHER,
@@ -1617,15 +2152,17 @@ mod tests {
       "another object's manifest is not served"
     );
     assert!(hold.missing_of(OBJECT, &identities).is_empty());
-    hold.hold(OTHER, Placed::default(), archive).unwrap();
+    hold
+      .hold(&mut room.space(), OTHER, Placed::default(), archive)
+      .unwrap();
     assert_eq!(
       hold.chunk_count(),
       2,
       "the bytes are kept once for both objects"
     );
-    assert!(hold.forget_manifest(OBJECT, &manifest));
+    assert!(hold.forget_manifest(&mut room.space(), OBJECT, &manifest));
     assert!(
-      hold.archive_of(OTHER, &manifest).is_some(),
+      hold.archive_of(&room.arena, OTHER, &manifest).is_some(),
       "forgetting one object's copy keeps the other's"
     );
   }
@@ -1637,6 +2174,7 @@ mod tests {
   fn a_refused_authority_draws_the_empty_reply_and_is_counted() {
     let archive = two_chunk_archive();
     let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
     let requests = [
       (
         ContentAccess::Place,
@@ -1665,6 +2203,7 @@ mod tests {
     ];
     for (expected, request) in &requests {
       let (reply, _) = hold.serve(
+        &mut room.space(),
         HostId(4),
         &request.encode(),
         |access, object| {
@@ -1947,7 +2486,12 @@ mod ownership_oracle {
   }
 
   /// Compares the hold with the model; `Err` names the first disagreement.
-  fn check(hold: &ContentHold, model: &Model, manifests: &[BTreeSet<usize>]) -> Result<(), String> {
+  fn check(
+    hold: &ContentHold,
+    arena: &ChunkArena,
+    model: &Model,
+    manifests: &[BTreeSet<usize>],
+  ) -> Result<(), String> {
     let mut referenced = BTreeSet::new();
     for at in 0..OBJECTS {
       for (index, chunks) in manifests.iter().enumerate() {
@@ -1962,7 +2506,7 @@ mod ownership_oracle {
           continue;
         }
         let archive = hold
-          .archive_of(object(at), &id)
+          .archive_of(arena, object(at), &id)
           .ok_or_else(|| format!("object {at} manifest {index} is not reconstructible"))?;
         let got: BTreeSet<[u8; 32]> = archive.chunks.iter().map(|c| c.identity).collect();
         let expected: BTreeSet<[u8; 32]> = chunks.iter().map(|&c| chunk(c).identity).collect();
@@ -2023,6 +2567,7 @@ mod ownership_oracle {
     census: &mut BTreeSet<Case>,
   ) -> Result<(), String> {
     let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
     let mut model = Model::new();
     for step in steps {
       let step = &resolve(step, manifests, &model);
@@ -2037,23 +2582,36 @@ mod ownership_oracle {
           ..
         } => manifests.get(*manifest).is_some_and(|chunks| {
           hold
-            .hold(object(*at), Placed::default(), archive(chunks, shipped))
+            .hold(
+              &mut room.space(),
+              object(*at),
+              Placed::default(),
+              archive(chunks, shipped),
+            )
             .is_ok()
         }),
         Step::Forget {
           object: at,
           manifest,
-        } => manifests
-          .get(*manifest)
-          .is_some_and(|chunks| hold.forget_manifest(object(*at), &identity(chunks))),
+        } => manifests.get(*manifest).is_some_and(|chunks| {
+          hold.forget_manifest(&mut room.space(), object(*at), &identity(chunks))
+        }),
       };
       if got != expected {
         return Err(format!(
           "{step:?}: the hold answered {got}, the model {expected}"
         ));
       }
-      check(&hold, &model, manifests)
+      check(&hold, &room.arena, &model, manifests)
         .map_err(|disagreement| format!("after {step:?}: {disagreement}"))?;
+      // AUD-29-43: what the hold says it is charged is exactly what the shard's budget and ledger hold.
+      if (room.budget.replicated(), room.metadata.committed())
+        != (hold.charged_bytes(), hold.index_bytes())
+      {
+        return Err(format!(
+          "after {step:?}: the charges drifted from the hold's account"
+        ));
+      }
       let shared = chunks_of(&model, manifests, 0);
       if (1..OBJECTS).any(|other| !shared.is_disjoint(&chunks_of(&model, manifests, other))) {
         census.insert(Case::SharedAcrossObjects);
@@ -2061,13 +2619,26 @@ mod ownership_oracle {
     }
     // AUD-29-59: what a restart recovers from the hold's image is the same hold — the oracle's whole check
     // holds against the recovered hold too, and its image is byte-identical (deterministic).
-    let image = hold.to_image();
-    let recovered =
-      ContentHold::from_image(&image).map_err(|refused| format!("image refused: {refused:?}"))?;
-    check(&recovered, &model, manifests)
+    let image = hold.to_image(&room.arena);
+    let mut recovered = ContentHold::from_image(&mut room.space(), &image)
+      .map_err(|refused| format!("image refused: {refused:?}"))?;
+    check(&recovered, &room.arena, &model, manifests)
       .map_err(|disagreement| format!("recovered: {disagreement}"))?;
-    if recovered.to_image() != image {
+    if recovered.to_image(&room.arena) != image {
       return Err("the recovered hold images differently".to_owned());
+    }
+    // AUD-29-43: releasing everything gives back every charge and every block — nothing leaks.
+    hold.forget_all(&mut room.space());
+    recovered.forget_all(&mut room.space());
+    let left = (
+      room.budget.replicated(),
+      room.metadata.committed(),
+      room.arena.allocated_bytes(),
+    );
+    if left != (0, 0, 0) {
+      return Err(format!(
+        "released everything, left (bytes, index, arena) = {left:?}"
+      ));
     }
     Ok(())
   }
@@ -2086,13 +2657,25 @@ mod ownership_oracle {
     let a = object(0);
 
     let mut hold = ContentHold::new();
+
+    let mut room = TestSpace::new();
     hold
-      .hold(a, Placed::default(), archive(&first, &first))
+      .hold(
+        &mut room.space(),
+        a,
+        Placed::default(),
+        archive(&first, &first),
+      )
       .unwrap();
     hold
-      .hold(a, Placed::default(), archive(&first, &first))
+      .hold(
+        &mut room.space(),
+        a,
+        Placed::default(),
+        archive(&first, &first),
+      )
       .unwrap();
-    hold.forget_manifest(a, &identity(&first));
+    hold.forget_manifest(&mut room.space(), a, &identity(&first));
     assert_eq!(
       (hold.manifest_count(), hold.chunk_count()),
       (0, 0),
@@ -2100,26 +2683,41 @@ mod ownership_oracle {
     );
 
     let mut hold = ContentHold::new();
+
+    let mut room = TestSpace::new();
     hold
-      .hold(a, Placed::default(), archive(&first, &first))
+      .hold(
+        &mut room.space(),
+        a,
+        Placed::default(),
+        archive(&first, &first),
+      )
       .unwrap();
     hold
       .hold(
+        &mut room.space(),
         a,
         Placed::default(),
         archive(&second, &BTreeSet::from([only_second])),
       )
       .expect("the shared chunk is already held for the object");
-    hold.forget_manifest(a, &identity(&first));
+    hold.forget_manifest(&mut room.space(), a, &identity(&first));
     let kept = hold
-      .archive_of(a, &identity(&second))
+      .archive_of(&room.arena, a, &identity(&second))
       .expect("(2) the second manifest is still whole");
     assert_eq!(kept.chunks.len(), second.len());
 
     let mut hold = ContentHold::new();
+
+    let mut room = TestSpace::new();
     let with_extra: BTreeSet<usize> = first.iter().copied().chain([unreferenced]).collect();
     assert_eq!(
-      hold.hold(a, Placed::default(), archive(&first, &with_extra)),
+      hold.hold(
+        &mut room.space(),
+        a,
+        Placed::default(),
+        archive(&first, &with_extra)
+      ),
       Err(ContentRefusal::Unreferenced)
     );
     assert_eq!(
@@ -2127,6 +2725,51 @@ mod ownership_oracle {
       (0, 0),
       "(3) nothing stored, so nothing orphaned"
     );
+  }
+
+  /// AUD-29-43 (§4.2): do: hold a manifest in a shard memory whose unpromised capacity is one block short of
+  /// the put's charge, then in one with room; expect the first refused `NoCapacity` with nothing held, charged
+  /// or allocated, and the second held with its blocks charged.
+  #[test]
+  fn a_put_past_the_unpromised_capacity_is_refused_whole() {
+    let a = object(0);
+    let first = BTreeSet::from([0, 1]);
+    let mut room = TestSpace::new();
+    let capacity = room.budget.capacity();
+    // Every block but one is promised to someone else: the put needs three (two chunks, the manifest).
+    let page = u64::try_from(rustix::param::page_size()).unwrap();
+    let promised = room.budget.reserve(capacity - 2 * page).unwrap();
+    let mut hold = ContentHold::new();
+    let refused = hold.hold(
+      &mut room.space(),
+      a,
+      Placed::default(),
+      archive(&first, &first),
+    );
+    assert!(
+      matches!(refused, Err(ContentRefusal::NoCapacity { .. })),
+      "{refused:?}"
+    );
+    assert_eq!(
+      (
+        hold.manifest_count(),
+        room.budget.replicated(),
+        room.metadata.committed(),
+        room.arena.allocated_bytes()
+      ),
+      (0, 0, 0, 0)
+    );
+    room.budget.release(promised);
+    hold
+      .hold(
+        &mut room.space(),
+        a,
+        Placed::default(),
+        archive(&first, &first),
+      )
+      .unwrap();
+    assert_eq!(room.budget.replicated(), 3 * page);
+    assert_eq!(hold.charged_bytes(), 3 * page);
   }
 
   /// Hostile input (§4.9) on the hold image (AUD-29-59): do: image a hold of two overlapping manifests, then
@@ -2139,18 +2782,25 @@ mod ownership_oracle {
     let first = BTreeSet::from([0, 1]);
     let second = BTreeSet::from([1, 2]);
     let mut hold = ContentHold::new();
+    let mut room = TestSpace::new();
     hold
-      .hold(a, Placed { sequence: 3 }, archive(&first, &first))
+      .hold(
+        &mut room.space(),
+        a,
+        Placed { sequence: 3 },
+        archive(&first, &first),
+      )
       .unwrap();
     hold
       .hold(
+        &mut room.space(),
         a,
         Placed { sequence: 4 },
         archive(&second, &BTreeSet::from([2])),
       )
       .unwrap();
-    let image = hold.to_image();
-    let recovered = ContentHold::from_image(&image).unwrap();
+    let image = hold.to_image(&room.arena);
+    let recovered = ContentHold::from_image(&mut room.space(), &image).unwrap();
     assert_eq!(
       (recovered.manifest_count(), recovered.chunk_count()),
       (2, 3)
@@ -2158,14 +2808,14 @@ mod ownership_oracle {
     assert_eq!(recovered.newest_placed(a), Some(4));
     for cut in 0..image.len() {
       assert!(
-        ContentHold::from_image(&image[..cut]).is_err() || cut == 0,
+        ContentHold::from_image(&mut room.space(), &image[..cut]).is_err() || cut == 0,
         "cut {cut}"
       );
     }
     let mut padded = image.clone();
     padded.push(0);
     assert_eq!(
-      ContentHold::from_image(&padded).err(),
+      ContentHold::from_image(&mut room.space(), &padded).err(),
       Some(HoldImageError::Malformed)
     );
     let mut decoded = HoldImage::from_bytes(&image).unwrap();
@@ -2173,13 +2823,13 @@ mod ownership_oracle {
       *byte ^= 0x01;
     }
     assert_eq!(
-      ContentHold::from_image(&decoded.to_bytes()).err(),
+      ContentHold::from_image(&mut room.space(), &decoded.to_bytes()).err(),
       Some(HoldImageError::Refused(ContentRefusal::IdentityMismatch))
     );
     let mut foreign = HoldImage::from_bytes(&image).unwrap();
     foreign.chunks[0].encoding = u8::MAX;
     assert_eq!(
-      ContentHold::from_image(&foreign.to_bytes()).err(),
+      ContentHold::from_image(&mut room.space(), &foreign.to_bytes()).err(),
       Some(HoldImageError::UnknownEncoding)
     );
   }

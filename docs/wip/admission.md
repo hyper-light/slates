@@ -281,6 +281,33 @@ visible rather than implied (§4.2 "geometry report usable capacity, not mapping
 budget-over-usable rule is unchanged and still gated by `crates/mem/tests/capacity.rs`). `slates
 status` prints `mapped=` before `reserve=`.
 
+## 4f. Content held for other owners (AUD-29-43, 2026-09-30)
+
+A fleet node is also a candidate holder of other owners' sealed content (§4.10). Until 2026-09-30 that
+content sat in a heap map outside every ledger. A peer could fill a holder's RAM, including RAM promised to
+its admitted volumes ("a remote holder makes the same admission against its own machine before
+acknowledging placement", §4.2).
+
+- **Where it lives.** Held chunk payloads and manifest encodings are blocks in the holder shard's arena,
+  the capacity the byte budget is over.
+- **How it is charged.** `ShardBudget::charge_replicated` / `credit_replicated` is a running charge taken
+  only from unpromised capacity, exactly like snapshot retention. The `replicated` sub-account is
+  reported beside `retained` (`ShardReport::replicated_bytes`, `slates status` `replicated=`).
+- **The index.** The hold's maps (stored chunks, objects, manifests, per-object references) are charged to
+  the metadata ledger. Each entry costs the amortized share of a full B-tree node: `(leaf + internal) /
+  (B − 1)`, where `B = 6` is the standard library's branching factor and each node size is rounded up to a
+  power of two to cover allocator size classes. Each object also pays one root of each of its two maps.
+- **Admission is whole or nothing.** Charges are taken before any chunk is verified or stored. New
+  encoded chunks are verified in one arena scratch block, charged for the put's duration and credited
+  before storing. Any refusal returns every charge and every block (`NoCapacity`).
+- **Evidence.**
+  - `crates/server/tests/recovery.rs` `a_replica_is_admitted_only_from_the_holders_unpromised_capacity`
+    (red, then green).
+  - `crates/cluster` `a_put_past_the_unpromised_capacity_is_refused_whole`.
+  - The ownership oracle: after every generated step the budget's `replicated` and the ledger's
+    `committed` equal the hold's own account, and releasing everything leaves budget, ledger and arena at
+    zero.
+
 ## 5. Owed (this charter)
 
 1. ~~Allocator rounding in the write charge~~ — done (§4a).

@@ -2020,7 +2020,9 @@ pub(crate) fn accept_merge_record(
 /// times is refused before allocating, AUD-29-13) — with a test's corruption fault applied once if set
 /// (the last byte of the post-state, so the increment still decodes but recomputes to different bytes).
 fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) -> Option<Vec<u8>> {
-  let archive = state.held_content.archive_of(object, manifest)?;
+  let archive = state
+    .held_content
+    .archive_of(state.store.content.arena(), object, manifest)?;
   let held = archive
     .chunks
     .iter()
@@ -2476,28 +2478,34 @@ mod tests {
     let bytes = b"the increment's chain entry";
     let named = MergeShardState::inputs_identity(bytes, 4096);
     let object = ObjectId::new(slates_db::HostId(1), 1);
-    let mut hold = slates_cluster::content::ContentHold::new();
-    let held = hold
-      .hold(
-        object,
-        slates_cluster::content::Placed::default(),
-        MergeShardState::inputs_archive(bytes, 0, 4096),
-      )
-      .expect("the inputs archive is whole and verifies");
-    assert_eq!(named, held, "the record names what the hold keys by");
-    let found = hold
-      .archive_of(object, &named)
-      .expect("the holder finds the inputs the record names");
-    assert_eq!(Archive::content(&found.chunks[0]).unwrap(), bytes);
     let tree_only = MergeShardState::inputs_archive(bytes, 0, 4096)
       .manifest
       .identity();
+    let (held, found, by_tree) = crate::daemon::audit_on_shard(move |state| {
+      let mut hold = slates_cluster::content::ContentHold::new();
+      let held = hold
+        .hold(
+          &mut crate::content_holder::hold_space(&mut state.store),
+          object,
+          slates_cluster::content::Placed::default(),
+          MergeShardState::inputs_archive(bytes, 0, 4096),
+        )
+        .expect("the inputs archive is whole and verifies");
+      let arena = state.store.content.arena();
+      let found = hold
+        .archive_of(arena, object, &named)
+        .expect("the holder finds the inputs the record names");
+      let by_tree = hold.archive_of(arena, object, &tree_only).is_some();
+      (held, found, by_tree)
+    });
+    assert_eq!(named, held, "the record names what the hold keys by");
+    assert_eq!(Archive::content(&found.chunks[0]).unwrap(), bytes);
     assert_ne!(
       tree_only, held,
       "the tree's own identity is not the hold's key (format minor 2)"
     );
     assert!(
-      hold.archive_of(object, &tree_only).is_none(),
+      !by_tree,
       "a record naming the tree's identity finds nothing"
     );
   }

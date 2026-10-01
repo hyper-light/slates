@@ -1676,7 +1676,10 @@ impl Daemon {
   /// now forgotten** — `Ok(false)` if it was not held, the typed refusal if the daemon could not be reached.
   pub fn drop_held_content(&self, manifest: [u8; 32]) -> Result<bool, ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
-      s.held_content.forget_manifest_for_every_object(&manifest)
+      s.held_content.forget_manifest_for_every_object(
+        &mut crate::content_holder::hold_space(&mut s.store),
+        &manifest,
+      )
     })
   }
 
