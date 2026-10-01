@@ -1654,9 +1654,21 @@ impl Daemon {
     })
   }
 
+  /// Test support: serves one content `request` (an encoded `ContentMessage`) on this node's hold as an
+  /// authorized peer would have it served — the production holder path (`crate::content_holder::serve`)
+  /// with only the authority decision granted — and returns the reply bytes. A test places a replica on a
+  /// daemon with no fleet peer through it, to observe what the hold keeps across a restart (AUD-29-59).
+  pub fn serve_content_as_authorized(&self, request: Vec<u8>) -> Result<Vec<u8>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let local = s.fleet.host();
+      crate::content_holder::serve(s, local, &request, |_, _, _, _| true)
+    })
+  }
+
   /// Test support: makes this node **forget** the content it holds for `manifest` as a candidate holder —
-  /// the manifest record and the chunks only it referenced — the state a RAM-only holder is in after a
-  /// restart (§4.8 "Recovery": it "holds nothing for others until re-replication fills it"), injected
+  /// the manifest record and the chunks only it referenced — the state a holder is in after losing its
+  /// anchor (§4.8 "Recovery": a whole-anchor loss holds nothing for others until re-replication fills it; a
+  /// warm restart keeps what it acknowledged, A-51), injected
   /// deterministically because an in-process daemon cannot restart (its fleet sockets are leaked to the
   /// process, the same reason `observe_peer_dead` injects a death). The healer (§4.10) must notice and
   /// re-put it. Delivered like [`Self::observe_peer_dead`]: admission retried while the control channel is
@@ -2476,6 +2488,15 @@ fn init_shard(
       rebuilt.snapshots_trimmed,
       rebuilt.destroys_completed,
       rebuilt.pins_reconciled
+    );
+    eprintln!(
+      "slates-server: shard {shard}: held {} replicas again from the image{}",
+      rebuilt.replicas,
+      if rebuilt.replicas_refused {
+        " (the held replicas did not recover: the hold starts empty)"
+      } else {
+        ""
+      }
     );
   }
   state::install(state);

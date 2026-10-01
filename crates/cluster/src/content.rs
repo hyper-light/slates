@@ -44,13 +44,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use slates_archive::format::{ArchiveError, Chunk};
+use slates_archive::format::{ArchiveError, Chunk, Encoding};
 use slates_archive::{Archive, ContentStore, Node, chunks_for};
 use slates_db::register::{HostId, ObjectId, Placement, Quorum};
 use slates_rt::error::RtError;
 use slates_rt::futures::{detach, now_ns, spawn_child};
 use slates_transport::connection::Priority;
 use slates_transport::endpoint::Endpoint;
+use slates_wire::Wire;
 
 use crate::{
   ClusterError, Collected, CommitBudget, DispatchWait, Reply, Stragglers, collect_bound,
@@ -469,6 +470,54 @@ fn with_chunks(archive: &Archive, chunks: Vec<Chunk>) -> Archive {
   }
 }
 
+/// A hold's canonical image (AUD-29-59), carried in its shard's recovery image so a content acknowledgement
+/// survives a warm restart: every distinct chunk the held manifests reference, once, in identity order, and
+/// every held manifest with its object and latest placement, in (object, identity) order — so two holds of
+/// equal content image byte-identically (a determinism gate).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct HoldImage {
+  /// The distinct chunks the held manifests reference.
+  chunks: Vec<ChunkImage>,
+  /// The held manifests.
+  manifests: Vec<ManifestImage>,
+}
+
+/// One chunk of a [`HoldImage`]: a `Chunk`'s fields, the encoding as its wire byte.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct ChunkImage {
+  identity: [u8; 32],
+  raw_len: u64,
+  stored_len: u64,
+  encoding: u8,
+  level: u8,
+  dictionary: [u8; 32],
+  payload: Vec<u8>,
+}
+
+/// One held manifest of a [`HoldImage`]: its object, the sequence it was last placed for, and the archive
+/// it arrived as with no chunks (its header and tree).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+struct ManifestImage {
+  object: [u8; 16],
+  sequence: u64,
+  archive: Vec<u8>,
+}
+
+/// Why a hold image could not be recovered (AUD-29-59): its bytes do not decode as one image, a chunk names
+/// an unknown encoding, a manifest's archive does not decode, or a manifest refused to hold again (a chunk it
+/// references is missing or fails its identity).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HoldImageError {
+  /// The bytes are not exactly one hold image.
+  Malformed,
+  /// A chunk's encoding byte names no encoding.
+  UnknownEncoding,
+  /// A manifest's archive did not decode.
+  Archive(ArchiveError),
+  /// A manifest refused to hold again.
+  Refused(ContentRefusal),
+}
+
 /// What a request asks of a holder, for the authority check that precedes any lookup (AUD-29-45).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentAccess {
@@ -690,11 +739,12 @@ impl ContentHold {
 
   /// Forgets a manifest held for `object`: its record is dropped and each chunk it references loses one of
   /// the object's references (a chunk the object no longer references gives back its store reference, and
-  /// the bytes go when no object references them). Returns whether the manifest was held. This is what a
-  /// holder's **content loss** looks like from the owner's side — in a real deployment a restart (a RAM-only
-  /// node holds nothing after one, §4.8 "Recovery"); in-process, a test's injection — the condition the
-  /// healer repairs (§4.10 "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from
-  /// the wire.
+  /// the bytes go when no object references them). Returns whether the manifest was held. The release the
+  /// retention rule, a tombstone and a stale-copy reclaim go through (AUD-29-43), and what a holder's
+  /// **content loss** looks like from the owner's side — in a real deployment a whole-anchor loss (a warm
+  /// restart keeps what was acknowledged, A-51); in-process, a test's injection — the condition the healer
+  /// repairs (§4.10 "anti-entropy … repairs only differing subtrees"). Nothing here is reachable from the
+  /// wire.
   pub fn forget_manifest(&mut self, object: ObjectId, identity: &[u8; 32]) -> bool {
     let Some(held) = self.objects.get_mut(&object) else {
       return false;
@@ -716,6 +766,83 @@ impl ContentHold {
       self.objects.remove(&object);
     }
     true
+  }
+
+  /// This hold's canonical image (AUD-29-59; see [`HoldImage`]), or no bytes when nothing is held.
+  pub fn to_image(&self) -> Vec<u8> {
+    if self.objects.is_empty() {
+      return Vec::new();
+    }
+    let mut referenced: BTreeSet<[u8; 32]> = BTreeSet::new();
+    let mut manifests = Vec::new();
+    for (object, held) in &self.objects {
+      for record in held.manifests.values() {
+        referenced.extend(referenced_chunks(&record.record.manifest));
+        manifests.push(ManifestImage {
+          object: object.0,
+          sequence: record.placed.sequence,
+          archive: record.record.encode(),
+        });
+      }
+    }
+    let chunks = referenced
+      .iter()
+      .filter_map(|identity| self.store.get(identity))
+      .map(|chunk| ChunkImage {
+        identity: chunk.identity,
+        raw_len: chunk.raw_len,
+        stored_len: chunk.stored_len,
+        encoding: chunk.encoding.to_wire(),
+        level: chunk.level,
+        dictionary: chunk.dictionary,
+        payload: chunk.payload.clone(),
+      })
+      .collect();
+    HoldImage { chunks, manifests }.to_bytes()
+  }
+
+  /// A hold rebuilt from its canonical image (AUD-29-59): every manifest held again through [`hold`](
+  /// Self::hold), so each is re-verified against its identities and re-owned per object exactly as a put
+  /// would leave it — an image is recovered, never trusted. Empty bytes are an empty hold.
+  pub fn from_image(bytes: &[u8]) -> Result<ContentHold, HoldImageError> {
+    let mut hold = ContentHold::new();
+    if bytes.is_empty() {
+      return Ok(hold);
+    }
+    let image = HoldImage::from_bytes(bytes).map_err(|_| HoldImageError::Malformed)?;
+    let mut chunks: BTreeMap<[u8; 32], Chunk> = BTreeMap::new();
+    for chunk in image.chunks {
+      let encoding = Encoding::from_wire(chunk.encoding).ok_or(HoldImageError::UnknownEncoding)?;
+      chunks.insert(
+        chunk.identity,
+        Chunk {
+          identity: chunk.identity,
+          raw_len: chunk.raw_len,
+          stored_len: chunk.stored_len,
+          encoding,
+          level: chunk.level,
+          dictionary: chunk.dictionary,
+          payload: chunk.payload,
+        },
+      );
+    }
+    for manifest in image.manifests {
+      let mut archive = Archive::decode(&manifest.archive).map_err(HoldImageError::Archive)?;
+      archive.chunks = referenced_chunks(&archive.manifest)
+        .iter()
+        .filter_map(|identity| chunks.get(identity).cloned())
+        .collect();
+      hold
+        .hold(
+          ObjectId(manifest.object),
+          Placed {
+            sequence: manifest.sequence,
+          },
+          archive,
+        )
+        .map_err(HoldImageError::Refused)?;
+    }
+    Ok(hold)
   }
 
   /// Forgets everything held for `object` (AUD-29-43): every manifest, and each chunk's reference for the
@@ -1932,6 +2059,16 @@ mod ownership_oracle {
         census.insert(Case::SharedAcrossObjects);
       }
     }
+    // AUD-29-59: what a restart recovers from the hold's image is the same hold — the oracle's whole check
+    // holds against the recovered hold too, and its image is byte-identical (deterministic).
+    let image = hold.to_image();
+    let recovered =
+      ContentHold::from_image(&image).map_err(|refused| format!("image refused: {refused:?}"))?;
+    check(&recovered, &model, manifests)
+      .map_err(|disagreement| format!("recovered: {disagreement}"))?;
+    if recovered.to_image() != image {
+      return Err("the recovered hold images differently".to_owned());
+    }
     Ok(())
   }
 
@@ -1989,6 +2126,61 @@ mod ownership_oracle {
       (hold.manifest_count(), hold.chunk_count()),
       (0, 0),
       "(3) nothing stored, so nothing orphaned"
+    );
+  }
+
+  /// Hostile input (§4.9) on the hold image (AUD-29-59): do: image a hold of two overlapping manifests, then
+  /// decode every truncation, the image with a trailing byte, one with a chunk's payload byte flipped, and one
+  /// naming an unknown encoding; expect the whole image to recover, and each damaged one refused typed —
+  /// never a panic, never a hold of content that fails its identity.
+  #[test]
+  fn a_damaged_hold_image_is_refused_and_a_whole_one_recovers() {
+    let a = object(0);
+    let first = BTreeSet::from([0, 1]);
+    let second = BTreeSet::from([1, 2]);
+    let mut hold = ContentHold::new();
+    hold
+      .hold(a, Placed { sequence: 3 }, archive(&first, &first))
+      .unwrap();
+    hold
+      .hold(
+        a,
+        Placed { sequence: 4 },
+        archive(&second, &BTreeSet::from([2])),
+      )
+      .unwrap();
+    let image = hold.to_image();
+    let recovered = ContentHold::from_image(&image).unwrap();
+    assert_eq!(
+      (recovered.manifest_count(), recovered.chunk_count()),
+      (2, 3)
+    );
+    assert_eq!(recovered.newest_placed(a), Some(4));
+    for cut in 0..image.len() {
+      assert!(
+        ContentHold::from_image(&image[..cut]).is_err() || cut == 0,
+        "cut {cut}"
+      );
+    }
+    let mut padded = image.clone();
+    padded.push(0);
+    assert_eq!(
+      ContentHold::from_image(&padded).err(),
+      Some(HoldImageError::Malformed)
+    );
+    let mut decoded = HoldImage::from_bytes(&image).unwrap();
+    if let Some(byte) = decoded.chunks[0].payload.first_mut() {
+      *byte ^= 0x01;
+    }
+    assert_eq!(
+      ContentHold::from_image(&decoded.to_bytes()).err(),
+      Some(HoldImageError::Refused(ContentRefusal::IdentityMismatch))
+    );
+    let mut foreign = HoldImage::from_bytes(&image).unwrap();
+    foreign.chunks[0].encoding = u8::MAX;
+    assert_eq!(
+      ContentHold::from_image(&foreign.to_bytes()).err(),
+      Some(HoldImageError::UnknownEncoding)
     );
   }
 

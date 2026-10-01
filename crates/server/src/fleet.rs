@@ -2674,29 +2674,14 @@ async fn serve_peer_records(
                 .learned_members
                 .get(&peer_anchor)
                 .map_or(seed, |learned| learned.host);
-              let (council, records) = (&s.council, &s.holder_records);
-              let (reply, held) = s.held_content.serve(
+              crate::content_holder::serve(
+                s,
                 local,
                 &request,
-                |access, object| {
-                  content_authorized(
-                    council.configuration(),
-                    records,
-                    local,
-                    peer_host,
-                    access,
-                    object,
-                  )
+                |regional, records, access, object| {
+                  content_authorized(regional, records, local, peer_host, access, object)
                 },
-                |object, sequence, manifest| {
-                  crate::content_retention::admits(records, local, object, sequence, manifest)
-                },
-              );
-              // A newer placement supersedes an older one still ahead of the records (AUD-29-43).
-              if let Some(object) = held {
-                crate::content_retention::retain_object(s, object);
-              }
-              reply
+              )
             })
             .unwrap_or_default(),
             // A green's merge record (§4.16 "Apply on holders"): recomputed before it is accepted.

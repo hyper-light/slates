@@ -50,9 +50,10 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// one vector of its logical length; 4 (A-26) FIFO/socket kinds with empty bodies and zero size; 5
 /// (§4.5, 2026-09-26) each inode's extended-attribute table and, for an attribute inode, its owner;
 /// 6 (§4.6) each inode's AppleDouble working copy; 7 (A-48, 2026-09-30) the base plane's witness,
-/// home, whiteout and redirect tables with every version a snapshot still reads.
+/// home, whiteout and redirect tables with every version a snapshot still reads; 8 (AUD-29-59, 2026-09-30)
+/// the shard's held replicas, so a content acknowledgement survives a warm restart.
 /// Format: the image layout version, bumped with any change to the types below.
-const IMAGE_VERSION: u16 = 7;
+const IMAGE_VERSION: u16 = 8;
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -382,17 +383,27 @@ pub struct ShardImage {
   pub version: u16,
   /// The volumes, in key order.
   pub volumes: Vec<KeyedImage>,
+  /// The content this shard holds for other owners as their candidate holder (AUD-29-59): the hold's own
+  /// canonical image, opaque here (the cluster plane encodes and decodes it), empty when nothing is held.
+  /// A holder acknowledges a content put only once an image carrying it is committed.
+  pub held: Vec<u8>,
 }
 
 impl ShardImage {
-  /// A shard image of the given volumes, in key order.
+  /// A shard image of the given volumes, in key order, holding nothing for others.
   pub fn new(mut volumes: Vec<KeyedImage>) -> ShardImage {
     volumes.sort_by_key(|v| v.key);
     ShardImage {
       magic: SHARD_MAGIC,
       version: IMAGE_VERSION,
       volumes,
+      held: Vec::new(),
     }
+  }
+
+  /// This image carrying `held`, the shard's held replicas' canonical image (AUD-29-59).
+  pub fn with_held(self, held: Vec<u8>) -> ShardImage {
+    ShardImage { held, ..self }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version

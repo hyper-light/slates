@@ -6219,6 +6219,11 @@ pub struct Rebuilt {
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
   /// fresh clone of their green's head (their scratch edits did not survive).
   pub merge_volumes: usize,
+  /// Manifests held for other owners that recovery held again from the image (AUD-29-59).
+  pub replicas: usize,
+  /// Whether the image's held replicas could not be recovered (logged with the reason; a health
+  /// signal): the hold starts empty and the healer refills it, but those acknowledgements were not kept.
+  pub replicas_refused: bool,
 }
 
 /// Rebuilds the recovered catalog's volumes into live state after a daemon start over a segment
@@ -6244,10 +6249,24 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     .filter(|v| !matches!(v.state, VolumeState::Destroying | VolumeState::Destroyed))
     .cloned()
     .collect();
-  // The shard's recovery images from anchor-owned RAM (§4.8), by volume id. Empty when there is no
-  // content object (a degraded build), or a fresh one with nothing published yet.
-  let images = recover_images(state);
+  // The shard's recovery images from anchor-owned RAM (§4.8), by volume id, and the replicas it held for
+  // other owners (AUD-29-59). Empty when there is no content object (a degraded build), or a fresh one
+  // with nothing published yet.
+  let (images, held) = recover_images(state);
   let mut rebuilt = Rebuilt::default();
+  match slates_cluster::content::ContentHold::from_image(&held) {
+    Ok(hold) => {
+      rebuilt.replicas = hold.manifest_count();
+      state.held_content = hold;
+    }
+    Err(e) => {
+      eprintln!(
+        "slates-server: partition {}: held replicas not recovered: {e:?}",
+        state.partition
+      );
+      rebuilt.replicas_refused = true;
+    }
+  }
   let mut max_prefix = state.next_prefix;
   // Greens first, so a work can seed from a rebuilt green (§4.16): a green's merge chain is replayed
   // into a fresh engine, restoring its content and versions.
@@ -6549,16 +6568,19 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
     .flatten()
 }
 
-/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id.
-/// A torn or malformed image logs and yields nothing for that shard (each volume then refuses as
-/// unrecoverable rather than presenting empty), matching §4.8's "never an empty success".
-fn recover_images(state: &ShardState) -> std::collections::BTreeMap<[u8; 16], VolumeImage> {
+/// The shard's recovery images from its slice of the anchor content object (§4.8), by volume id, and the
+/// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
+/// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
+/// matching §4.8's "never an empty success".
+fn recover_images(
+  state: &ShardState,
+) -> (std::collections::BTreeMap<[u8; 16], VolumeImage>, Vec<u8>) {
   let (start, end) = state.content_range;
   let Some(object) = &state.content else {
-    return std::collections::BTreeMap::new();
+    return (std::collections::BTreeMap::new(), Vec::new());
   };
   if end <= start || end > object.len() {
-    return std::collections::BTreeMap::new();
+    return (std::collections::BTreeMap::new(), Vec::new());
   }
   let view = ContentView {
     object,
@@ -6566,18 +6588,21 @@ fn recover_images(state: &ShardState) -> std::collections::BTreeMap<[u8; 16], Vo
     len: end - start,
   };
   match ShardImage::read_from(&view) {
-    Ok(Some(shard)) => shard
-      .volumes
-      .into_iter()
-      .map(|keyed| (keyed.key, keyed.image))
-      .collect(),
-    Ok(None) => std::collections::BTreeMap::new(),
+    Ok(Some(shard)) => (
+      shard
+        .volumes
+        .into_iter()
+        .map(|keyed| (keyed.key, keyed.image))
+        .collect(),
+      shard.held,
+    ),
+    Ok(None) => (std::collections::BTreeMap::new(), Vec::new()),
     Err(e) => {
       eprintln!(
         "slates-server: partition {}: shard image unreadable: {e}",
         state.partition
       );
-      std::collections::BTreeMap::new()
+      (std::collections::BTreeMap::new(), Vec::new())
     }
   }
 }
@@ -6672,7 +6697,9 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       }
     }
   }
-  let shard = ShardImage::new(keyed);
+  // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
+  // content put only once a publish carrying it commits.
+  let shard = ShardImage::new(keyed).with_held(state.held_content.to_image());
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };

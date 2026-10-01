@@ -3343,9 +3343,12 @@ content transfer and quorum acknowledgement, not a guaranteed single WAN round t
 window is the mirror lag at that moment, zero for every operation that awaited the mirror.
 
 **Recovery.** Node restart: the anchor segment replays the local log and `put_wal` into fresh
-indexes; the node rejoins with a new ephemeral id (a restart is a join) and holds nothing for
-others until re-replication fills it; its owned objects are taken over by its neighbours after
-the membership horizon. RAMCloud's recovery-time budget is a reference, not a Slates result;
+indexes; the node rejoins with a new ephemeral id (a restart is a join); its owned objects are
+taken over by its neighbours after the membership horizon. A **warm** restart, with the anchor
+retained, keeps every replica the node acknowledged: a holder acknowledges a content put only once
+its shard's recovery image carrying the put is committed into anchor-owned RAM, and recovery holds
+the image's replicas again, re-verified, before the node serves (A-51). A whole-anchor loss is the
+RAM-fault case; that node holds nothing for others until re-replication fills it. RAMCloud's recovery-time budget is a reference, not a Slates result;
 metadata takeover uses a configuration decision and phase-one exchange. A read may additionally
 need content fetch and a confirmed lease; measure that complete recovery boundary.
 
@@ -7588,4 +7591,24 @@ sites), `xtask` (the structural check enforces that table against `HOST_PATH_ALL
 - Evidence: the structural check now fails when the design's table and the enforced list differ (shown by
   altering one row).
 - What it does not change: the lint wall, the write-syscall confinement to `slates-land`, D-25 and D-26.
+
+### A-51 — A holder's acknowledgement stands behind an anchor-owned publication (2026-09-30)
+Applied in the same change to: §4.8 "Recovery", the §4.10 status (AUD-29-43/59), GAPS, and
+`docs/bugs/2026-09-30-a-warm-restart-dropped-acknowledged-replicas.md`.
+- Why: §4.8 said a restarted node "holds nothing for others until re-replication fills it", while its
+  register records survived the same restart in anchor-owned RAM. A warm restart therefore recovered head
+  records naming content the holder no longer held, and acknowledgements that placement had counted were
+  gone until the healer resent them. The audit (AUD-29-59) asked for persistence before the acknowledgement,
+  the rule §4.8 already applies to records.
+- The rule: a holder acknowledges a content put only once its shard's recovery image carrying the put is
+  committed into anchor-owned RAM (the double-buffered publish every acknowledged mutation already stands
+  behind). Recovery holds the image's replicas again through the ordinary hold, so each is re-verified
+  against its identities and re-owned per object, never trusted. A refused publish answers no
+  acknowledgement; the content stays held, charged, and rides the next publish that commits.
+- Evidence: `an_acknowledged_replica_survives_a_warm_daemon_restart` (red: held before the restart, not
+  after; green), and the ownership oracle now recovers every generated hold from its image and finds the
+  same hold, imaged byte-identically.
+- What it does not change: a whole-anchor loss (the RAM-fault case) still empties the hold; publishing
+  re-images the shard on every acknowledged mutation, the incremental publish owed in
+  `docs/wip/recovery.md` now owed for the hold too.
 

@@ -26,6 +26,7 @@ pub mod catalog;
 pub mod config;
 mod consensus;
 mod consensus_recovery;
+mod content_holder;
 pub mod content_retention;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;

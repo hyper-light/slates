@@ -415,6 +415,84 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
   drop(segment);
 }
 
+/// AUD-29-59 (§4.8 persistence before reply; §4.10 placement closure): a holder acknowledges a content put
+/// only for content its anchor-owned RAM retains, so a warm restart keeps every acknowledged replica. Do:
+/// place a replica on a daemon through the holder's production path, stop it, and start a second daemon over
+/// the same anchor segment and content object. Expect: the put acknowledged, and the replica held whole after
+/// the restart. Before the fix the hold lived only in process memory and every restart began it empty, so an
+/// acknowledgement that placement counted was gone.
+#[test]
+fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
+  use slates_archive::{Archive, Entry, Extent, Node, NodeMeta};
+  use slates_cluster::content::ContentMessage;
+  use slates_db::register::{HostId, ObjectId};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-replica-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("replica", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+
+  use slates_archive::format::{MAX_BASE_PAGE_BYTES, MAX_CHUNK_BYTES};
+  let chunk = Archive::raw_chunk(BEFORE.to_vec());
+  let archive = Archive {
+    base_page_size: u32::try_from(MAX_BASE_PAGE_BYTES).unwrap(),
+    chunk_min: u32::try_from(MAX_CHUNK_BYTES).unwrap(),
+    chunk_max: u32::try_from(MAX_CHUNK_BYTES).unwrap(),
+    created_unix: 0,
+    volume_id: 0,
+    snapshot_id: 0,
+    name_policy_id: 0,
+    unicode_version: 0,
+    root_meta: NodeMeta::default(),
+    manifest: Node::Directory(vec![Entry {
+      name: "f".to_owned(),
+      meta: NodeMeta {
+        size: chunk.raw_len,
+        ..NodeMeta::default()
+      },
+      node: Node::File(vec![Extent {
+        offset: 0,
+        len: chunk.raw_len,
+        chunk: chunk.identity,
+        chunk_offset: 0,
+      }]),
+    }]),
+    chunks: vec![chunk],
+  };
+  let manifest = archive.manifest_identity();
+  let object = ObjectId::new(HostId(1), 1);
+  let put = ContentMessage::Put {
+    object,
+    sequence: 1,
+    archive: archive.encode(),
+  }
+  .encode();
+  let reply = first.serve_content_as_authorized(put).unwrap();
+  let acknowledged = matches!(ContentMessage::decode(&reply), Ok(ContentMessage::Ack(_)));
+  let held_before = first.fleet_holder_content(manifest);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let held_after = second.fleet_holder_content(manifest);
+  second.stop();
+  drop(segment);
+  assert!(acknowledged, "the holder acknowledged the put");
+  assert_eq!(
+    held_before,
+    Ok(true),
+    "the replica was held before the restart"
+  );
+  assert_eq!(
+    held_after,
+    Ok(true),
+    "the acknowledged replica is held after a warm restart"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two
