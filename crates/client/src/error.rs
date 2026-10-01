@@ -48,6 +48,21 @@ pub enum ClientError {
     /// The outstanding operations the client admits.
     limit: usize,
   },
+  /// The command ring is full: nothing was sent and no sequence was used; begin again once a reply frees a
+  /// slot (AUD-29-19: the async path never waits for one).
+  RingFull,
+  /// The daemon is gone from this channel: nothing was sent; the caller reconnects
+  /// ([`crate::Client::try_reconnect`]) and resends what it still awaits (AUD-29-19, AUD-29-20).
+  ChannelLost,
+  /// A reconnected channel is still being bound to the consumer (its attest is in flight): nothing was
+  /// sent, so no request runs as the account; send again once a reply has been drained.
+  Rebinding,
+  /// The binding's completion reader failed, or the descriptor it polls closed (AUD-29-20): no reply can be
+  /// observed any more, so every call still waiting on one ends with this.
+  CompletionLost {
+    /// What the reader reported.
+    reason: String,
+  },
 }
 
 impl fmt::Display for ClientError {
@@ -70,6 +85,12 @@ impl fmt::Display for ClientError {
           "{limit} operations already outstanding; take or abandon one first"
         )
       }
+      Self::RingFull => f.write_str("the command ring is full; nothing was sent"),
+      Self::ChannelLost => f.write_str("the daemon is gone from this channel; nothing was sent"),
+      Self::Rebinding => {
+        f.write_str("the reconnected channel is still being bound; nothing was sent")
+      }
+      Self::CompletionLost { reason } => write!(f, "the completion reader is lost: {reason}"),
     }
   }
 }

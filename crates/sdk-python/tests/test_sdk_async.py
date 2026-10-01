@@ -22,7 +22,7 @@ ASYNC_VERBS = {
     "connect", "create", "snapshot", "status", "list", "resize", "destroy", "client_id",
     "create_green", "create_work", "edit", "submit", "versions", "changed_since", "rebase",
     "unlink", "rename", "mkdir", "rmdir", "chmod", "symlink", "link", "set_xattr", "remove_xattr",
-    "land",
+    "land", "reconnects", "outstanding_limit",
 }
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
 REPLY_NS = 1_000_000_000
@@ -53,7 +53,7 @@ async def _connect_when_ready(instance):
     deadline = time.monotonic() + STARTUP_SECS
     while True:
         try:
-            return slates.AsyncClient.connect(instance, REPLY_NS, RECONNECT_NS)
+            return await slates.AsyncClient.connect(instance, REPLY_NS, RECONNECT_NS)
         except slates.SlatesError:
             if time.monotonic() >= deadline:
                 raise
@@ -184,6 +184,144 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
             self.assertTrue(ns_outcome["ok"], f"the async namespace ops submitted cleanly: {ns_outcome}")
         finally:
             # Kill the whole process group so the supervised daemon goes with the anchor at once.
+            try:
+                os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            anchor.wait()
+
+
+# Derived: the longest the loop may go without running a ready callback — a tenth of the reply deadline,
+# the longest pause the reconnect pacing itself allows. A call that blocked the loop on a reply, a ring
+# slot or a reconnect would exceed it.
+TICK_BOUND_SECS = REPLY_NS / 10 / 1e9
+# The ticker's own period: a tenth of its bound, so a held loop shows as lateness well past one period.
+TICK_SECS = TICK_BOUND_SECS / 10
+
+
+class Ticker:
+    """An independent task on the loop: sleeps one period at a time and records how late it woke."""
+
+    def __init__(self):
+        self.worst = 0.0
+        self.task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self):
+        while True:
+            due = time.monotonic() + TICK_SECS
+            await asyncio.sleep(TICK_SECS)
+            self.worst = max(self.worst, time.monotonic() - due)
+
+
+def _daemon_pids(binary, instance):
+    """The pids of the daemon an anchor for `instance` supervises (scoped by instance, never a bare
+    name)."""
+    found = subprocess.run(
+        ["pgrep", "-f", f"{binary} --instance {instance} daemon"],
+        capture_output=True, text=True, check=False,
+    )
+    return [int(pid) for pid in found.stdout.split()]
+
+
+async def _wait_for(condition, what):
+    deadline = time.monotonic() + STARTUP_SECS
+    while not condition():
+        if time.monotonic() >= deadline:
+            raise AssertionError(what)
+        await asyncio.sleep(POLL_SECS)
+
+
+class SlatesAsyncEveryCallEnds(unittest.TestCase):
+    @unittest.skipIf(
+        _daemon_binary() is None,
+        "no built `slates` daemon binary (set SLATES_DAEMON or build the cli) — skipped loudly",
+    )
+    def test_every_async_call_ends_across_restart_silence_cancellation_and_death(self):
+        """AUD-29-19 / AUD-29-20: every call ends, and the loop is never held. Do, with an independent
+        ticker on the loop and every connect made from it: (1) stop the daemon, issue three bounds' worth
+        of list calls, and kill it under them, so the anchor restarts it; (2) stop the anchor and the
+        daemon and issue a call; (3) issue a call to the stopped daemon and cancel it; (4) connect
+        afresh, kill the anchor and its daemon for good and issue calls. Expect: the overflow refused at
+        once; every admitted call answered after the restart; the call to the stopped daemon failed
+        Stalled; the cancelled call released (nothing left waiting); every call after the death failed
+        DaemonGone (the daemon's exit seen, not a stall); and the ticker never late past its bound."""
+        asyncio.run(self._every_call_ends())
+
+    async def _every_call_ends(self):
+        binary = _daemon_binary()
+        instance = f"slates-py-ends-{os.getpid()}"
+        anchor = subprocess.Popen(
+            [binary, "--instance", instance, "anchor", "--quick", "--shards", "1"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        ticker = Ticker()
+        try:
+            client = await _connect_when_ready(instance)
+            subprocess.run([binary, "--instance", instance, "bootstrap", "root"],
+                           check=True, timeout=STARTUP_SECS)
+            limit = client.outstanding_limit()
+
+            # (1) Overflow, then a restart under the calls. Stopped first, so the calls stay outstanding.
+            first = _daemon_pids(binary, instance)
+            self.assertTrue(first, "the daemon is running")
+            for pid in first:
+                os.kill(pid, signal.SIGSTOP)
+            calls = []
+            refused = 0
+            for _ in range(limit * 3):
+                try:
+                    calls.append(client.list())
+                except slates.SlatesError as error:
+                    self.assertIn("TooManyOutstanding", str(error))
+                    refused += 1
+            for pid in first:
+                os.kill(pid, signal.SIGKILL)
+            settled = await asyncio.gather(*calls, return_exceptions=True)
+            self.assertGreater(refused, 0, "the overflow is refused at once")
+            failed = [str(result) for result in settled if isinstance(result, BaseException)]
+            self.assertEqual(failed, [], "every admitted call is answered after the restart")
+            self.assertGreaterEqual(client.reconnects(), 1, "non-vacuous: recovered by a reconnect")
+            await _wait_for(lambda: _daemon_pids(binary, instance), "the anchor restarted the daemon")
+
+            # (2) A live but silent daemon: the call ends Stalled. Its anchor is stopped first, or its
+            # supervision would replace the silent daemon and the call would be recovered instead.
+            live = _daemon_pids(binary, instance)
+            os.kill(anchor.pid, signal.SIGSTOP)
+            for pid in live:
+                os.kill(pid, signal.SIGSTOP)
+            with self.assertRaisesRegex(slates.SlatesError, "Stalled"):
+                await client.list()
+
+            # (3) A cancelled call is released: nothing is left waiting on the loop.
+            waiting = asyncio.ensure_future(client.list())
+            await asyncio.sleep(POLL_SECS)
+            waiting.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiting
+            await asyncio.sleep(POLL_SECS)
+            for pid in live:
+                os.kill(pid, signal.SIGCONT)
+            os.kill(anchor.pid, signal.SIGCONT)
+            self.assertIsInstance(await client.list(), list, "the client serves after the cancel")
+
+            # (4) Death: a fresh client, then the anchor and its daemon killed for good.
+            fresh = await _connect_when_ready(instance)
+            os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
+            await _wait_for(lambda: not _daemon_pids(binary, instance), "the daemon is gone")
+            doomed = await asyncio.gather(
+                *(fresh.list() for _ in range(limit)), return_exceptions=True
+            )
+            for result in doomed:
+                self.assertIsInstance(result, slates.SlatesError)
+                self.assertIn("DaemonGone", str(result))
+            self.assertLess(
+                ticker.worst, TICK_BOUND_SECS,
+                f"the loop was never held: worst lateness {ticker.worst:.3f} s",
+            )
+        finally:
+            ticker.task.cancel()
             try:
                 os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
             except ProcessLookupError:

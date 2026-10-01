@@ -38,12 +38,17 @@ const client = Client.connect('default', 5_000_000, 10_000_000);
 loop by the completion fd's readiness (never blocking it), with the sync `Client` as the thin facade:
 
 ```js
-const async = AsyncClient.connect('default', 5_000_000, 10_000_000);
+const async = await AsyncClient.connect('default', 5_000_000, 10_000_000);
 const volume = await async.create('scratch', 8 * 1024 * 1024);
 const status = await async.status(volume);
 ```
 
-Connecting where no daemon answers throws. Use a client from the thread that connected it.
+Connecting where no daemon answers throws (`AsyncClient.connect` rejects; it never holds the event
+loop while the daemon answers). Every async call ends: answered, refused typed, `Stalled` at its reply
+deadline, `DaemonGone` when the daemon is gone and no restart answers within the reconnect budget, or
+`CompletionLost` when the completion reader fails; `client.cancel(promise)` releases a waiting call
+and rejects it with an `AbortError`. Calls past the client's bound (its outstanding limit in
+flight, as many again queued) are refused `TooManyOutstanding` at once. Use a client from the thread that connected it.
 
 ## Volume lifecycle
 

@@ -35,7 +35,7 @@ async function connectWhenReady(instance) {
   const deadline = Date.now() + STARTUP_MS;
   for (;;) {
     try {
-      return AsyncClient.connect(instance, REPLY_NS, RECONNECT_NS);
+      return await AsyncClient.connect(instance, REPLY_NS, RECONNECT_NS);
     } catch (error) {
       if (Date.now() >= deadline) throw error;
       await sleep(POLL_MS);

@@ -42,7 +42,17 @@ A connection is pinned to the thread that made it (the rings are single-consumer
 `Client` per thread. Connecting where no daemon answers raises `slates.SlatesError`.
 
 `AsyncClient` resolves each verb on a running `asyncio` loop by the completion channel's readiness
-(`loop.add_reader`), never blocking the loop. **On Windows** the completion channel is a socket
+(`loop.add_reader`), never blocking the loop — connecting included:
+
+```python
+client = await slates.AsyncClient.connect("default", 5_000_000, 10_000_000)
+volumes = await client.list()
+```
+
+Every async call ends: answered, refused typed, `Stalled` at its reply deadline, `DaemonGone` when the
+daemon is gone and no restart answers within the reconnect budget, or `CompletionLost` when the
+completion reader fails; a call cancelled by its task is released. Calls past the client's bound (its
+`outstanding_limit()` in flight, as many again queued) raise `TooManyOutstanding` at once. **On Windows** the completion channel is a socket
 (D-10), and `add_reader` on a socket needs a `SelectorEventLoop` — the default `ProactorEventLoop`
 has none — so set the selector policy before you run the loop:
 

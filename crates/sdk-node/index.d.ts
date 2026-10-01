@@ -93,10 +93,23 @@ export class Client {
 /**
  * The async-primary client (R6, D-19): every verb returns a Promise resolved by the completion fd's
  * readiness (a libuv-polled socket/pipe), never blocking the event loop. The fast path resolves within
- * the daemon's spin window without touching the loop.
+ * the daemon's spin window without touching the loop. Every call ends: answered, refused typed, failed
+ * `Stalled` at its reply deadline, `DaemonGone` when recovery finds no daemon, or `CompletionLost` when
+ * the completion reader fails (AUD-29-20). Calls past the outstanding bound are refused
+ * `TooManyOutstanding` at once.
  */
 export class AsyncClient {
-  static connect(instance: string, replyNs: number, reconnectNs: number): AsyncClient
+  /**
+   * Connects without holding the event loop (AUD-29-19): the rendezvous claim is made at once and its
+   * answer read on timers; rejects typed when the daemon refuses the claim or leaves it unanswered.
+   */
+  static connect(instance: string, replyNs: number, reconnectNs: number): Promise<AsyncClient>
+  /**
+   * Cancels a call by the Promise its verb returned (AUD-29-20): a queued call is never sent, an
+   * in-flight one's reply is dropped, and the Promise rejects with an `AbortError`. Returns whether a
+   * waiting call was cancelled.
+   */
+  cancel(promise: Promise<unknown>): boolean
   clientId(): number
   create(name: string, sizeBytes: number, dynamic?: boolean, fold?: boolean, requireLocked?: boolean, base?: string): Promise<string>
   snapshot(volume: string): Promise<number>

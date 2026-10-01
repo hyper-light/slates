@@ -14,7 +14,9 @@ use slates_ipc::protocol::{
   SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
   pack, unpack,
 };
-use slates_ipc::{ClientEnd, Connected, IpcError, connect_as};
+use slates_ipc::{
+  CLAIM_WAIT_NS, Claim, ClientEnd, Connected, IpcError, begin_connect_as, connect_as,
+};
 use slates_machine::{Derived, derived};
 use slates_wire::request::RequestId;
 
@@ -197,13 +199,20 @@ pub struct Client {
   /// `awaited_cap` (AUD-29-22): until 2026-10-01 the reply buffer instead evicted its oldest entry past twice
   /// the ring's slots, which a caller that kept old ids while admitting and draining new ones could make an
   /// awaited reply.
-  awaited: std::collections::BTreeSet<u64>,
+  awaited: std::collections::BTreeMap<u64, RequestBody>,
   /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
   /// bound (the same bound the retryable set keeps).
   awaited_cap: usize,
   /// Replies dropped on arrival because nothing awaited them: a protocol-only acknowledgement's, or an
   /// abandoned operation's.
   unawaited_dropped: u64,
+  /// The async path's bind of a reconnected channel (AUD-29-19): the attest's request word while it is in
+  /// flight, its reply handled where replies are drained, so a reconnect never blocks an event loop on a
+  /// round trip.
+  attest_in_flight: Option<u64>,
+  /// The consumer's refusal of that bind (revoked while the daemon was away): final, every later send
+  /// refused with it.
+  attest_refused: Option<slates_ipc::protocol::Refusal>,
   /// The consumer this channel is bound to (§4.13) — taken from the harness's delivery at connect, or
   /// attested by the caller — kept so the client binds again on its own after a daemon restart: a
   /// reconnected channel is the account's until it attests, and a retried verb must never run as the
@@ -213,6 +222,9 @@ pub struct Client {
   bound: bool,
   /// Bindings made again after a reconnect (a non-vacuity counter for the restart tests).
   rebinds: u64,
+  /// The reconnect claim in flight (AUD-29-19): made by one [`Client::try_reconnect`], its answer read by
+  /// the next, so no attempt waits on the daemon.
+  reconnecting: Option<Claim>,
 }
 
 fn ack_every_of(end: &ClientEnd) -> u32 {
@@ -243,7 +255,7 @@ impl std::fmt::Debug for Client {
 /// published as its spin window (the shortest wait that is not a spin); each pause doubles
 /// up to a tenth of the budget, so a restart is seen within a tenth of the budget at worst
 /// and a dead daemon costs no core.
-fn next_pause_ns(pause_ns: u64, budget_ns: u64) -> u64 {
+pub(crate) fn next_pause_ns(pause_ns: u64, budget_ns: u64) -> u64 {
   derived!(
     pause_ns.saturating_mul(2).min(budget_ns / 10).max(1),
     "min(2 × pause, reconnect_ns / 10)",
@@ -444,6 +456,63 @@ fn extract_landed(body: ReplyBody) -> Result<Landing, ClientError> {
 /// `slates_ipc::delivery`): none when the delivery variable is absent — the process is the account's
 /// own client — and a typed refusal when it is present but unusable, so a broken delivery never
 /// degrades into the account's ambient authority.
+/// A connect in flight for an event loop ([`Client::begin_connect`]; AUD-29-19): the rendezvous claim
+/// made, its answer read by [`poll`](Self::poll) whenever the loop looks, so a slow, stopped or dead
+/// daemon never holds the loop. Dropped unanswered, the claim is given back.
+pub struct Connecting {
+  instance: String,
+  deadlines: Deadlines,
+  delivered: Option<Delivered>,
+  /// The claim; `None` once the connect has ended (connected or refused).
+  claim: Option<Claim>,
+  /// The pacing of the loop's next look, from [`next_poll_ns`](Self::next_poll_ns).
+  pause_ns: u64,
+}
+
+impl std::fmt::Debug for Connecting {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("Connecting")
+      .field("instance", &self.instance)
+      .finish()
+  }
+}
+
+impl Connecting {
+  /// Reads the claim's answer without waiting: `Some` the connected client, `None` while it is due, a
+  /// typed refusal when the daemon refused the claim or left it unanswered past the claim wait. A poll
+  /// after the connect ended is refused.
+  pub fn poll(&mut self) -> Result<Option<Client>, ClientError> {
+    let Some(claim) = self.claim.as_mut() else {
+      return Err(ClientError::Ipc(IpcError::DaemonUnavailable {
+        endpoint: self.instance.clone(),
+        why: "the connect has already ended",
+      }));
+    };
+    match claim.poll() {
+      Ok(None) => Ok(None),
+      Ok(Some(connected)) => {
+        self.claim = None;
+        let mut client = Client::over(&self.instance, connected, 0, self.deadlines);
+        // Bound on the first send, without waiting (`bind_without_waiting`).
+        client.consumer = self.delivered.take();
+        Ok(Some(client))
+      }
+      Err(error) => {
+        self.claim = None;
+        Err(ClientError::Ipc(error))
+      }
+    }
+  }
+
+  /// When the loop should look again, in nanoseconds from now: paced as a reconnect is (doubling, at most
+  /// a tenth of the claim wait), so a prompt answer is read within microseconds and a slow one costs at
+  /// most ten looks per claim wait.
+  pub fn next_poll_ns(&mut self) -> u64 {
+    self.pause_ns = next_pause_ns(self.pause_ns, CLAIM_WAIT_NS);
+    self.pause_ns
+  }
+}
+
 fn delivered_capability() -> Result<Option<Delivered>, ClientError> {
   match slates_ipc::delivery::delivered() {
     Ok(delivered) => Ok(Some(delivered.clone())),
@@ -465,6 +534,21 @@ impl Client {
     let mut client = Client::over(instance, connected, 0, deadlines);
     client.bind_delivered(delivered)?;
     Ok(client)
+  }
+
+  /// Starts a connect for an event loop (AUD-29-19): the claim is made and nothing waits;
+  /// [`Connecting::poll`] reads its answer. A delivered capability binds the channel on its first send,
+  /// without waiting, as a reconnected channel binds again.
+  pub fn begin_connect(instance: &str, deadlines: Deadlines) -> Result<Connecting, ClientError> {
+    let delivered = delivered_capability()?;
+    let claim = begin_connect_as(instance, 0)?;
+    Ok(Connecting {
+      instance: instance.to_owned(),
+      deadlines,
+      delivered,
+      claim: Some(claim),
+      pause_ns: 0,
+    })
   }
 
   /// Resumes a session: connects under its client id (refused `SessionTaken` when a live
@@ -511,12 +595,15 @@ impl Client {
       unpublished_cap,
       unpublished_forgotten: 0,
       pending: Vec::new(),
-      awaited: std::collections::BTreeSet::new(),
+      awaited: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
+      attest_in_flight: None,
+      attest_refused: None,
       consumer: None,
       bound: false,
       rebinds: 0,
+      reconnecting: None,
     }
   }
 
@@ -720,15 +807,22 @@ impl Client {
   /// The next request id, or `SequencesExhausted` past [`LAST_SEQUENCE`] — refused before anything is sent,
   /// never a wrap into an id the daemon has already seen (AUD-29-21).
   fn fresh_id(&mut self) -> Result<RequestId, ClientError> {
+    let id = self.next_id()?;
+    self.sequence = id.sequence;
+    Ok(id)
+  }
+
+  /// The next request id without using it (a send that does not happen leaves the sequence unused), or
+  /// `SequencesExhausted` past [`LAST_SEQUENCE`].
+  fn next_id(&self) -> Result<RequestId, ClientError> {
     if self.sequence >= LAST_SEQUENCE {
       return Err(ClientError::SequencesExhausted {
         client: self.client_id,
       });
     }
-    self.sequence = self.sequence.saturating_add(1);
     Ok(RequestId {
       client: self.client_id,
-      sequence: self.sequence,
+      sequence: self.sequence.saturating_add(1),
     })
   }
 
@@ -783,28 +877,126 @@ impl Client {
         limit: self.awaited_cap,
       });
     }
-    let id = self.send_new(body)?;
-    self.awaited.insert(id.word());
+    let id = self.send_once(body)?;
+    // The body is kept while the call is outstanding (bounded by admission), so a lost channel's calls are
+    // resent under their own ids ([`Self::resend_awaited`]).
+    self.awaited.insert(id.word(), body.clone());
     Ok(id)
   }
 
   /// Sends `body` under the next sequence, owned by no caller: a protocol-only request whose reply is
   /// dropped on arrival (the periodic acknowledgement).
   fn begin_unawaited(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
-    self.send_new(body)
+    self.send_once(body)
   }
 
-  /// Sends `body` under the next sequence and returns its id.
-  fn send_new(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
-    let id = self.fresh_id()?;
-    loop {
-      // A reconnect on the way (the daemon found gone while the ring stayed full) leaves a fresh
-      // channel: bound again to the consumer, when the client holds one, before the request goes.
-      self.rebind_if_needed()?;
-      if self.send(id, body)? {
-        return Ok(id);
-      }
+  /// One attempt to send `body` under the next sequence, never waiting (AUD-29-19): the id when it went;
+  /// `RingFull` when the ring has no slot, `ChannelLost` when the daemon is gone — either way nothing was
+  /// sent and the sequence is not used. A channel just reconnected is bound to the consumer first (one
+  /// round trip on the fresh channel, bounded by the reply deadline), so no request runs as the account.
+  fn send_once(&mut self, body: &RequestBody) -> Result<RequestId, ClientError> {
+    self.bind_without_waiting()?;
+    let id = self.next_id()?;
+    if self.try_send(id, body)? {
+      self.sequence = id.sequence;
+      Ok(id)
+    } else if self.end.daemon_gone() {
+      Err(ClientError::ChannelLost)
+    } else {
+      Err(ClientError::RingFull)
     }
+  }
+
+  /// Sends `body` again under `word` — an outstanding operation's own id, so the daemon answers from its
+  /// completion record if it served it before the channel was lost, and serves it now if not (AUD-29-20).
+  /// One attempt: `Ok(false)` when the ring has no slot.
+  pub fn resend(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
+    self.bind_without_waiting()?;
+    self.try_send(RequestId::from_word(word), body)
+  }
+
+  /// [`Self::resend`] for an outstanding call, with the body it was begun with; `Ok(true)` too for a word no
+  /// longer outstanding (nothing is owed for it).
+  pub fn resend_awaited(&mut self, word: u64) -> Result<bool, ClientError> {
+    let Some(body) = self.awaited.get(&word).cloned() else {
+      return Ok(true);
+    };
+    self.resend(word, &body)
+  }
+
+  /// The async path's bind of a reconnected channel (AUD-29-19): nothing to do when the channel is bound
+  /// or the client holds no consumer; otherwise the attest goes out (once) and every send is refused
+  /// `Rebinding` until its reply is drained — never a blocking round trip on the caller's thread. A refused
+  /// bind is final.
+  fn bind_without_waiting(&mut self) -> Result<(), ClientError> {
+    if let Some(refusal) = &self.attest_refused {
+      return Err(ClientError::Refused(refusal.clone()));
+    }
+    let Some((consumer, proof)) = self.pending_bind() else {
+      return Ok(());
+    };
+    if self.attest_in_flight.is_none() {
+      let id = self.next_id()?;
+      if !self.try_send(id, &RequestBody::Attest { consumer, proof })? {
+        return Err(if self.end.daemon_gone() {
+          ClientError::ChannelLost
+        } else {
+          ClientError::RingFull
+        });
+      }
+      self.sequence = id.sequence;
+      self.attest_in_flight = Some(id.word());
+    }
+    Err(ClientError::Rebinding)
+  }
+
+  /// Whether the daemon is gone from this channel (its liveness signal; a cold-path question, asked when a
+  /// reply is overdue).
+  pub fn daemon_gone(&self) -> bool {
+    self.end.daemon_gone()
+  }
+
+  /// One step of a reconnect under the client's id, never waiting (AUD-29-19): the first step makes the
+  /// claim, each later one reads its answer. `Ok(true)` connected (the fresh channel is bound to the
+  /// consumer on the next send); `Ok(false)` while the answer is due, or when no daemon answered (the
+  /// next step claims again). A live client holding the id is refused `SessionTaken`.
+  pub fn try_reconnect(&mut self) -> Result<bool, ClientError> {
+    let polled = match self.reconnecting.as_mut() {
+      Some(claim) => claim.poll(),
+      None => match begin_connect_as(&self.instance, self.client_id) {
+        Ok(claim) => self.reconnecting.insert(claim).poll(),
+        Err(error) => Err(error),
+      },
+    };
+    if !matches!(polled, Ok(None)) {
+      self.reconnecting = None;
+    }
+    match polled {
+      Ok(None) => Ok(false),
+      Ok(Some(connected)) => {
+        let assigned = connected.region.client_id();
+        if assigned != self.client_id {
+          return Err(ClientError::SessionTaken { assigned });
+        }
+        self.end = ClientEnd::connected(connected);
+        self.reconnects = self.reconnects.saturating_add(1);
+        self.bound = false;
+        self.attest_in_flight = None;
+        Ok(true)
+      }
+      Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => Ok(false),
+      Err(e) => Err(ClientError::Ipc(e)),
+    }
+  }
+
+  /// The client's derived budgets.
+  pub fn deadlines(&self) -> Deadlines {
+    self.deadlines
+  }
+
+  /// The caller-owned operations the client admits at once ([`ClientError::TooManyOutstanding`]).
+  pub fn outstanding_limit(&self) -> usize {
+    self.awaited_cap
   }
 
   /// Releases an outstanding operation the caller no longer awaits (a cancelled call, a call settled by a
@@ -812,12 +1004,12 @@ impl Client {
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
     self.pending.retain(|(held, _)| *held != word);
-    self.awaited.remove(&word)
+    self.awaited.remove(&word).is_some()
   }
 
   /// The caller-owned operations outstanding, by id word — what a binding settles when its channel ends.
   pub fn outstanding(&self) -> Vec<u64> {
-    self.awaited.iter().copied().collect()
+    self.awaited.keys().copied().collect()
   }
 
   /// Replies dropped on arrival because nothing awaited them (a protocol-only acknowledgement's, or an
@@ -889,7 +1081,21 @@ impl Client {
   /// the admitted outstanding set, so nothing is evicted, item 8), dropped and counted when nothing does —
   /// a protocol-only acknowledgement's reply, or an abandoned operation's (AUD-29-22).
   fn buffer(&mut self, id_word: u64, body: ReplyBody) {
-    if self.awaited.contains(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word) {
+    if self.attest_in_flight == Some(id_word) {
+      self.attest_in_flight = None;
+      match body {
+        ReplyBody::Attested => {
+          self.bound = true;
+          self.rebinds = self.rebinds.saturating_add(1);
+        }
+        ReplyBody::Refused { refusal } => self.attest_refused = Some(refusal),
+        // Anything else is not this bind's answer: the next send attests again.
+        _ => {}
+      }
+      return;
+    }
+    if self.awaited.contains_key(&id_word) && !self.pending.iter().any(|(held, _)| *held == id_word)
+    {
       self.pending.push((id_word, body));
     } else {
       self.unawaited_dropped = self.unawaited_dropped.saturating_add(1);
@@ -965,8 +1171,12 @@ impl Client {
   pub fn begin_ack_if_due(&mut self) -> Result<(), ClientError> {
     let up_to = self.ack_watermark();
     if up_to.saturating_sub(self.acknowledged) >= self.ack_every {
-      self.begin_unawaited(&RequestBody::Acknowledge { up_to })?;
-      self.acknowledged = self.acknowledged.max(up_to);
+      // A full ring or a lost channel defers the acknowledgement to the next call that finds it due.
+      match self.begin_unawaited(&RequestBody::Acknowledge { up_to }) {
+        Ok(_) => self.acknowledged = self.acknowledged.max(up_to),
+        Err(ClientError::RingFull | ClientError::ChannelLost) => {}
+        Err(other) => return Err(other),
+      }
     }
     Ok(())
   }
@@ -1408,6 +1618,23 @@ impl Client {
   /// in microseconds; a ring that stays full past the reply deadline is a stalled or gone
   /// daemon, handled as a stalled reply is). `true` once written; `false` when the daemon was
   /// found gone instead and the client reconnected (the caller binds and sends again).
+  /// One attempt to put `body` under `id` on the command ring: `Ok(false)` when it has no slot.
+  fn try_send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
+    let index = self.end.next_request_index();
+    let slot = pack(
+      self.end.region_mut(),
+      Direction::Request,
+      index,
+      id.word(),
+      body,
+    )?;
+    match self.end.send(&slot) {
+      Ok(()) => Ok(true),
+      Err(IpcError::RingFull) => Ok(false),
+      Err(e) => Err(ClientError::Ipc(e)),
+    }
+  }
+
   fn send(&mut self, id: RequestId, body: &RequestBody) -> Result<bool, ClientError> {
     let started = Instant::now();
     loop {
@@ -1456,6 +1683,7 @@ impl Client {
           self.end = ClientEnd::connected(connected);
           self.reconnects = self.reconnects.saturating_add(1);
           self.bound = false;
+          self.attest_in_flight = None;
           return Ok(());
         }
         Err(IpcError::DaemonUnavailable { .. } | IpcError::RingFull) => {

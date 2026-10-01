@@ -34,6 +34,7 @@ pub mod delivery;
 pub mod doorbell;
 pub mod endpoint;
 pub mod error;
+pub mod exit_watch;
 pub mod park;
 pub mod protocol;
 pub mod region;
@@ -48,7 +49,7 @@ pub use endpoint::{ClientEnd, DaemonEnd, Reply, Request};
 pub use error::IpcError;
 pub use region::{ClientRegion, RegionGeometry};
 pub use rendezvous::{
-  Accepted, Connected, Doorbell, Listener, Liveness, Prepared, connect, connect_as,
-  instance_from_env,
+  Accepted, CLAIM_WAIT_NS, Claim, Connected, Doorbell, Listener, Liveness, Prepared,
+  begin_connect_as, connect, connect_as, instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};

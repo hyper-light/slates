@@ -45,10 +45,11 @@
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use slates_client::driver::{Begin, Driver, Event};
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, HostAnswer, Landing,
-  LandingDegradation, NamePolicy, Rebased, SizeClass, SnapshotId, StatusReport, Submitted,
-  VolumeId, VolumeSummary, WorkOp,
+  Client as RustClient, ClientError, Connecting as RustConnecting, CreateSpec, Deadlines, Filter,
+  HostAnswer, Landing, LandingDegradation, NamePolicy, Rebased, RequestId, SizeClass, SnapshotId,
+  StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -561,6 +562,45 @@ pub struct ChangedBegin {
   pub fast: Option<Vec<String>>,
 }
 
+/// A connect in flight for the event loop (AUD-29-19): the rendezvous claim made, its answer read by
+/// `poll` whenever `async.mjs` looks, at the pacing `nextPollNs` asks for, so a slow, stopped or dead
+/// daemon never holds the loop. Dropped unanswered, the claim is given back.
+#[napi]
+pub struct Connecting {
+  inner: RustConnecting,
+}
+
+#[napi]
+impl Connecting {
+  /// Begins a connect to `instance` as a new client, with the client's deadlines (as
+  /// [`Client::connect`]); nothing waits on the daemon.
+  #[napi(factory)]
+  pub fn begin(instance: String, reply_ns: i64, reconnect_ns: i64) -> Result<Connecting> {
+    let deadlines = Deadlines {
+      reply_ns: checked_u64(reply_ns, "replyNs")?,
+      reconnect_ns: checked_u64(reconnect_ns, "reconnectNs")?,
+    };
+    let inner = RustClient::begin_connect(&instance, deadlines).map_err(refusal)?;
+    Ok(Connecting { inner })
+  }
+
+  /// The connected client once the daemon has answered, `null` while its answer is due; a typed
+  /// refusal when the daemon refused the claim or left it unanswered past the claim wait.
+  #[napi]
+  pub fn poll(&mut self) -> Result<Option<Client>> {
+    Ok(self.inner.poll().map_err(refusal)?.map(|inner| {
+      let driver = Driver::new(&inner);
+      Client { inner, driver }
+    }))
+  }
+
+  /// When to look again, in nanoseconds from now (paced as a reconnect is).
+  #[napi]
+  pub fn next_poll_ns(&mut self) -> Result<i64> {
+    status_i64(self.inner.next_poll_ns(), "nextPollNs")
+  }
+}
+
 /// A landing begin-and-spin result (see [`CreateBegin`]).
 #[napi(object)]
 pub struct LandBegin {
@@ -573,6 +613,36 @@ pub struct LandBegin {
 #[napi]
 pub struct Client {
   inner: RustClient,
+  /// The async calls' driver (AUD-29-19, AUD-29-20): admission, deadlines, cancellation and recovery, driven
+  /// by `async.mjs`'s reader and timer.
+  driver: Driver,
+}
+
+/// One driver event as it crosses into JS: a reply landed for `ticket` (poll it by `word`), or the call
+/// failed with `error` — its kind first (`DaemonGone`, `Stalled`, …), so `async.mjs` names it.
+#[napi(object)]
+pub struct DriverEvent {
+  /// The call's ticket.
+  pub ticket: String,
+  /// The request word to poll the reply by, when it landed.
+  pub word: Option<String>,
+  /// Why the call ended without a reply, when it did.
+  pub error: Option<String>,
+}
+
+fn driver_event(event: Event) -> DriverEvent {
+  match event {
+    Event::Ready { ticket, word } => DriverEvent {
+      ticket: ticket.to_string(),
+      word: Some(word.to_string()),
+      error: None,
+    },
+    Event::Failed { ticket, error } => DriverEvent {
+      ticket: ticket.to_string(),
+      word: None,
+      error: Some(format!("{error:?}")),
+    },
+  }
 }
 
 #[napi]
@@ -588,7 +658,8 @@ impl Client {
       reconnect_ns: checked_u64(reconnect_ns, "reconnectNs")?,
     };
     let inner = RustClient::connect(&instance, deadlines).map_err(refusal)?;
-    Ok(Client { inner })
+    let driver = Driver::new(&inner);
+    Ok(Client { inner, driver })
   }
 
   /// The client id the daemon bound to this session.
@@ -656,6 +727,31 @@ impl Client {
   // completion fd signals; completionFd / arm / disarm / takeReady drive the JS `AsyncClient`'s libuv
   // `uv_poll` loop. The verbs bound async today (create, snapshot, status); the rest follow the shape.
 
+  /// Submits one async call through the driver (AUD-29-19): sent now when the client admits it, else queued —
+  /// never waiting — then, only when it was sent, spun for its reply within the daemon's window (the fast
+  /// path). Returns the ticket `async.mjs` keys its pending call by, and the decoded reply when it landed in
+  /// the spin; a reply taken or refused in the spin ends the call here.
+  fn begin_spin<T>(
+    &mut self,
+    begin: Begin,
+    spin: impl FnOnce(&mut RustClient, RequestId, u64) -> Result<Option<T>>,
+  ) -> Result<(String, Option<T>)> {
+    let ticket = self
+      .driver
+      .submit(&mut self.inner, begin)
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let Some(word) = self.driver.word_of(ticket) else {
+      return Ok((ticket.to_string(), None));
+    };
+    let spin_ns = self.inner.published_spin_ns();
+    let fast = spin(&mut self.inner, RequestId::from_word(word), spin_ns);
+    if !matches!(fast, Ok(None)) {
+      self.driver.finish(ticket);
+    }
+    Ok((ticket.to_string(), fast?))
+  }
+
   /// Begins a create and spins for its reply within the daemon's window; the word to await and the id
   /// if it already landed (the async fast path).
   #[napi]
@@ -686,18 +782,17 @@ impl Client {
       require_locked: require_locked.unwrap_or(false),
       base,
     };
-    let id = self.inner.create_begin(&spec).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self
-      .inner
-      .create_spin(id, spin)
-      .map_err(refusal)?
-      .map(|volume| volume_hex(&volume));
-    Ok(CreateBegin {
-      word: id.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.create_begin(&spec)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c
+          .create_spin(id, spin)
+          .map_err(refusal)?
+          .map(|volume| volume_hex(&volume));
+        Ok(fast)
+      },
+    )?;
+    Ok(CreateBegin { word, fast })
   }
 
   /// Takes a create's reply by its word once the completion fd signals; `null` until it is on the ring.
@@ -717,17 +812,17 @@ impl Client {
   #[napi]
   pub fn begin_spin_snapshot(&mut self, volume: String) -> Result<SnapshotBegin> {
     let id = parse_volume(&volume)?;
-    let request = self.inner.snapshot_begin(id).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.snapshot_spin(request, spin).map_err(refusal)? {
-      Some(snapshot) => Some(status_i64(snapshot.value, "snapshot")?),
-      None => None,
-    };
-    Ok(SnapshotBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.snapshot_begin(id)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.snapshot_spin(id, spin).map_err(refusal)? {
+          Some(snapshot) => Some(status_i64(snapshot.value, "snapshot")?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(SnapshotBegin { word, fast })
   }
 
   /// Takes a snapshot's reply by its word once the completion fd signals.
@@ -744,17 +839,17 @@ impl Client {
   #[napi]
   pub fn begin_spin_status(&mut self, volume: String) -> Result<StatusBegin> {
     let id = parse_volume(&volume)?;
-    let request = self.inner.status_begin(id).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.status_spin(request, spin).map_err(refusal)? {
-      Some(report) => Some(volume_status(report)?),
-      None => None,
-    };
-    Ok(StatusBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.status_begin(id)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.status_spin(id, spin).map_err(refusal)? {
+          Some(report) => Some(volume_status(report)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(StatusBegin { word, fast })
   }
 
   /// Takes a status reply by its word once the completion fd signals.
@@ -790,6 +885,69 @@ impl Client {
     i64::try_from(socket).map_err(|_| Error::from_reason("completion socket handle out of range"))
   }
 
+  /// Drains every landed reply and admits waiting calls: the events for `async.mjs` to settle (the
+  /// completion fd is readable).
+  #[napi]
+  pub fn pump(&mut self) -> Vec<DriverEvent> {
+    self
+      .driver
+      .pump(&mut self.inner)
+      .into_iter()
+      .map(driver_event)
+      .collect()
+  }
+
+  /// The timer's turn: deadlines and recovery (AUD-29-20). The events for `async.mjs` to settle.
+  #[napi]
+  pub fn tick(&mut self) -> Vec<DriverEvent> {
+    self
+      .driver
+      .tick(&mut self.inner)
+      .into_iter()
+      .map(driver_event)
+      .collect()
+  }
+
+  /// When `async.mjs` should call [`Self::tick`] next, in nanoseconds from now; `null` when idle.
+  #[napi]
+  pub fn next_wake_ns(&self) -> Result<Option<i64>> {
+    match self.driver.next_wake_ns(&self.inner) {
+      Some(ns) => Ok(Some(status_i64(ns, "nextWakeNs")?)),
+      None => Ok(None),
+    }
+  }
+
+  /// The calls the client admits outstanding at once; the driver queues as many more behind them.
+  #[napi]
+  pub fn outstanding_limit(&self) -> u32 {
+    u32::try_from(self.inner.outstanding_limit()).unwrap_or(u32::MAX)
+  }
+
+  /// Ends a call whose reply `async.mjs` has taken by its poll.
+  #[napi]
+  pub fn finish(&mut self, ticket: String) -> Result<()> {
+    self.driver.finish(parse_word(&ticket)?);
+    Ok(())
+  }
+
+  /// Releases a call its caller no longer awaits.
+  #[napi]
+  pub fn cancel(&mut self, ticket: String) -> Result<()> {
+    self.driver.cancel(&mut self.inner, parse_word(&ticket)?);
+    Ok(())
+  }
+
+  /// Fails every call (the completion reader failed or its fd closed): the events for `async.mjs` to settle.
+  #[napi]
+  pub fn fail_all(&mut self, reason: String) -> Vec<DriverEvent> {
+    self
+      .driver
+      .fail_all(&mut self.inner, &ClientError::CompletionLost { reason })
+      .into_iter()
+      .map(driver_event)
+      .collect()
+  }
+
   /// Arms the completion signal before the async client yields to its loop (the daemon wakes a parked
   /// client on a reply).
   #[napi]
@@ -821,22 +979,22 @@ impl Client {
   /// Begins a list and spins for its reply; the word and the entries if they landed in the spin.
   #[napi]
   pub fn begin_spin_list(&mut self) -> Result<ListBegin> {
-    let request = self.inner.list_begin().map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.list_spin(request, spin).map_err(refusal)? {
-      Some(volumes) => Some(
-        volumes
-          .into_iter()
-          .map(volume_entry)
-          .collect::<Result<Vec<_>>>()?,
-      ),
-      None => None,
-    };
-    Ok(ListBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.list_begin()),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.list_spin(id, spin).map_err(refusal)? {
+          Some(volumes) => Some(
+            volumes
+              .into_iter()
+              .map(volume_entry)
+              .collect::<Result<Vec<_>>>()?,
+          ),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(ListBegin { word, fast })
   }
 
   /// Takes a list reply by its word once the completion fd signals.
@@ -869,14 +1027,14 @@ impl Client {
     } else {
       SizeClass::Bounded { limit: size_bytes }
     };
-    let request = self.inner.resize_begin(id, size).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self.inner.resize_spin(request, spin).map_err(refusal)?;
-    Ok(UnitBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.resize_begin(id, size)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c.resize_spin(id, spin).map_err(refusal)?;
+        Ok(fast)
+      },
+    )?;
+    Ok(UnitBegin { word, fast })
   }
 
   /// Takes a resize's reply by its word once the completion fd signals (`true` when done).
@@ -890,14 +1048,14 @@ impl Client {
   #[napi]
   pub fn begin_spin_destroy(&mut self, volume: String) -> Result<UnitBegin> {
     let id = parse_volume(&volume)?;
-    let request = self.inner.destroy_begin(id).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self.inner.destroy_spin(request, spin).map_err(refusal)?;
-    Ok(UnitBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.destroy_begin(id)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c.destroy_spin(id, spin).map_err(refusal)?;
+        Ok(fast)
+      },
+    )?;
+    Ok(UnitBegin { word, fast })
   }
 
   /// Takes a destroy's reply by its word once the completion fd signals (`true` when done).
@@ -914,21 +1072,19 @@ impl Client {
     name: String,
     require_evidence: Option<bool>,
   ) -> Result<CreateBegin> {
-    let request = self
-      .inner
-      .create_green_begin(&name, require_evidence.unwrap_or(false))
-      .map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self
-      .inner
-      .create_green_spin(request, spin)
-      .map_err(refusal)?
-      .map(|volume| volume_hex(&volume));
-    Ok(CreateBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| {
+        c.create_green_begin(&name, require_evidence.unwrap_or(false))
+      }),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c
+          .create_green_spin(id, spin)
+          .map_err(refusal)?
+          .map(|volume| volume_hex(&volume));
+        Ok(fast)
+      },
+    )?;
+    Ok(CreateBegin { word, fast })
   }
 
   /// Takes a create-green's reply by its word once the completion fd signals.
@@ -948,24 +1104,17 @@ impl Client {
   #[napi]
   pub fn begin_spin_create_work(&mut self, green: String, name: String) -> Result<WorkBegin> {
     let green = parse_volume(&green)?;
-    let request = self
-      .inner
-      .create_work_begin(green, &name)
-      .map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self
-      .inner
-      .create_work_spin(request, spin)
-      .map_err(refusal)?
-    {
-      Some((id, base)) => Some(work_volume(id, base)?),
-      None => None,
-    };
-    Ok(WorkBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.create_work_begin(green, &name)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.create_work_spin(id, spin).map_err(refusal)? {
+          Some((id, base)) => Some(work_volume(id, base)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(WorkBegin { word, fast })
   }
 
   /// Takes a create-work's reply by its word once the completion fd signals.
@@ -991,17 +1140,15 @@ impl Client {
     let work = parse_volume(&work)?;
     let at = checked_u64(at, "at")?;
     let delete_len = checked_u64(delete_len, "deleteLen")?;
-    let request = self
-      .inner
-      .edit_begin(work, &path, at, delete_len, data.as_ref())
-      .map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self.inner.edit_spin(request, spin).map_err(refusal)?;
-    Ok(UnitBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let data = data.to_vec();
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.edit_begin(work, &path, at, delete_len, &data)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c.edit_spin(id, spin).map_err(refusal)?;
+        Ok(fast)
+      },
+    )?;
+    Ok(UnitBegin { word, fast })
   }
 
   /// Takes an edit's reply by its word once the completion fd signals (`true` when done).
@@ -1015,17 +1162,17 @@ impl Client {
   #[napi]
   pub fn begin_spin_submit(&mut self, work: String) -> Result<SubmitBegin> {
     let work = parse_volume(&work)?;
-    let request = self.inner.submit_begin(work).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.submit_spin(request, spin).map_err(refusal)? {
-      Some(outcome) => Some(submit_outcome(outcome)?),
-      None => None,
-    };
-    Ok(SubmitBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.submit_begin(work)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.submit_spin(id, spin).map_err(refusal)? {
+          Some(outcome) => Some(submit_outcome(outcome)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(SubmitBegin { word, fast })
   }
 
   /// Takes a submit's outcome by its word once the completion fd signals.
@@ -1042,17 +1189,17 @@ impl Client {
   #[napi]
   pub fn begin_spin_versions(&mut self, green: String) -> Result<SnapshotBegin> {
     let green = parse_volume(&green)?;
-    let request = self.inner.versions_begin(green).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.versions_spin(request, spin).map_err(refusal)? {
-      Some(head) => Some(status_i64(head, "version")?),
-      None => None,
-    };
-    Ok(SnapshotBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.versions_begin(green)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.versions_spin(id, spin).map_err(refusal)? {
+          Some(head) => Some(status_i64(head, "version")?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(SnapshotBegin { word, fast })
   }
 
   /// Takes a versions reply by its word once the completion fd signals.
@@ -1070,20 +1217,14 @@ impl Client {
   pub fn begin_spin_changed_since(&mut self, green: String, version: i64) -> Result<ChangedBegin> {
     let green = parse_volume(&green)?;
     let version = checked_u64(version, "version")?;
-    let request = self
-      .inner
-      .changed_since_begin(green, version)
-      .map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self
-      .inner
-      .changed_since_spin(request, spin)
-      .map_err(refusal)?;
-    Ok(ChangedBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.changed_since_begin(green, version)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c.changed_since_spin(id, spin).map_err(refusal)?;
+        Ok(fast)
+      },
+    )?;
+    Ok(ChangedBegin { word, fast })
   }
 
   /// Takes a changed-since reply by its word once the completion fd signals.
@@ -1097,17 +1238,17 @@ impl Client {
   #[napi]
   pub fn begin_spin_rebase(&mut self, work: String) -> Result<SubmitBegin> {
     let work = parse_volume(&work)?;
-    let request = self.inner.rebase_begin(work).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.rebase_spin(request, spin).map_err(refusal)? {
-      Some(outcome) => Some(rebase_outcome(outcome)?),
-      None => None,
-    };
-    Ok(SubmitBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.rebase_begin(work)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.rebase_spin(id, spin).map_err(refusal)? {
+          Some(outcome) => Some(rebase_outcome(outcome)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(SubmitBegin { word, fast })
   }
 
   /// Takes a rebase's outcome by its word once the completion fd signals.
@@ -1240,20 +1381,17 @@ impl Client {
       Some(value) => Some(checked_u64(value, "grant")?),
       None => None,
     };
-    let request = self
-      .inner
-      .land_begin(id, snap, &target, filter, grant)
-      .map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = match self.inner.land_spin(request, spin).map_err(refusal)? {
-      Some(landing) => Some(landing_result(landing)?),
-      None => None,
-    };
-    Ok(LandBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.land_begin(id, snap, &target, filter.clone(), grant)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = match c.land_spin(id, spin).map_err(refusal)? {
+          Some(landing) => Some(landing_result(landing)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    Ok(LandBegin { word, fast })
   }
 
   /// Takes a landing's result by its word once the completion fd signals.
@@ -1410,7 +1548,8 @@ impl Client {
   }
 
   /// How many times this client has reconnected across daemon restarts (an observability counter, so a
-  /// test can assert a session survived a restart — §4.9).
+  /// test can assert a session survived a restart — §4.9). Each reconnect is a new channel with its own
+  /// completion fd, which `async.mjs` attaches to when this moves.
   #[napi]
   pub fn reconnects(&self) -> Result<i64> {
     i64::try_from(self.inner.reconnects())
@@ -1499,13 +1638,13 @@ impl Client {
   /// share (`true` when done in the spin). Not a `#[napi]` verb: `WorkOp` does not cross into JS.
   fn declare_begin_spin(&mut self, work: &str, op: WorkOp) -> Result<UnitBegin> {
     let work = parse_volume(work)?;
-    let request = self.inner.declare_begin(work, op).map_err(refusal)?;
-    self.inner.begin_ack_if_due().map_err(refusal)?;
-    let spin = self.inner.published_spin_ns();
-    let fast = self.inner.declare_spin(request, spin).map_err(refusal)?;
-    Ok(UnitBegin {
-      word: request.word().to_string(),
-      fast,
-    })
+    let (word, fast) = self.begin_spin(
+      Box::new(move |c: &mut RustClient| c.declare_begin(work, op.clone())),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c.declare_spin(id, spin).map_err(refusal)?;
+        Ok(fast)
+      },
+    )?;
+    Ok(UnitBegin { word, fast })
   }
 }

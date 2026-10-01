@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use slates_ipc::region::{ClientRegion, RegionGeometry};
 use slates_ipc::slot::Slot;
-use slates_ipc::{ClientEnd, DaemonEnd, IpcError, Listener, Prepared, connect};
+use slates_ipc::{
+  CLAIM_WAIT_NS, ClientEnd, DaemonEnd, IpcError, Listener, Prepared, begin_connect_as, connect,
+};
 
 /// Format: the environment variable that turns this binary into the client.
 const CHILD_ROLE: &str = "SLATES_IPC_TEST_CLIENT";
@@ -177,4 +179,103 @@ fn no_daemon_means_daemon_unavailable() {
     "{refused:?}"
   );
   assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// Derived: the longest one poll of a claim may take — a tenth of the claim wait. A poll that waited for
+/// the daemon would take the whole claim wait; one that only reads the answer's state takes microseconds,
+/// so the tenth separates the two with room for scheduling noise.
+fn poll_bound() -> Duration {
+  Duration::from_nanos(CLAIM_WAIT_NS / 10)
+}
+
+/// AUD-29-19 (§4.7 "Rendezvous", R6): a connect never holds its caller. Do: open a daemon end that does
+/// not accept, begin a claim on it and poll until it ends, timing every poll; then begin a second claim
+/// and let the daemon end accept it while the claim is polled. Expect: every poll returns at once (within
+/// [`poll_bound`]) and the claim is polled more than once (non-vacuous: its answer was outstanding); the
+/// unanswered claim refused `DaemonUnavailable` no sooner than the claim wait; the second claim connected
+/// once the daemon answered it. Before this change the connect waited for the answer inside one call — up
+/// to the claim wait on macOS and Windows, and without any bound on Linux.
+#[test]
+fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
+  let instance = format!("test-claim-{}", std::process::id());
+  let mut listener = Listener::open(&instance).unwrap();
+  let started = Instant::now();
+  let (refusal, polls, longest) = poll_until_refused(begin_connect_as(&instance, 0).unwrap());
+  assert!(
+    matches!(refusal, IpcError::DaemonUnavailable { .. }),
+    "{refusal:?}"
+  );
+  assert!(
+    started.elapsed() >= Duration::from_nanos(CLAIM_WAIT_NS),
+    "refused only at the claim wait"
+  );
+  assert!(polls > 1, "non-vacuous: the answer was outstanding");
+  // The unanswered claim may still sit in the daemon's queue (Linux: a closed connection in the
+  // backlog); the daemon end drains it, and the second claim is answered.
+  let (connected, served_longest) = poll_while_serving(&mut listener, &instance);
+  assert!(connected.region.client_id() > 0);
+  for longest in [longest, served_longest] {
+    assert!(
+      longest < poll_bound(),
+      "the longest poll was {longest:?}, bound {:?}",
+      poll_bound()
+    );
+  }
+}
+
+/// Polls `claim` until it ends, which must be a refusal: the refusal, the polls made, the longest poll.
+fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Duration) {
+  let mut polls = 0u64;
+  let mut longest = Duration::ZERO;
+  loop {
+    let at = Instant::now();
+    let polled = claim.poll();
+    longest = longest.max(at.elapsed());
+    polls += 1;
+    match polled {
+      Ok(None) => std::hint::spin_loop(),
+      Ok(Some(_)) => panic!("no daemon answered the claim"),
+      Err(refusal) => return (refusal, polls, longest),
+    }
+  }
+}
+
+/// Begins a claim and polls it while the daemon end serves, until it connects within the claim wait: the
+/// connection and the longest poll.
+fn poll_while_serving(
+  listener: &mut Listener,
+  instance: &str,
+) -> (slates_ipc::Connected, Duration) {
+  let pid = std::process::id();
+  let mut claim = begin_connect_as(instance, 0).unwrap();
+  let started = Instant::now();
+  let mut longest = Duration::ZERO;
+  // The daemon's side of each accepted claim, kept: its region lives while the daemon holds it.
+  let mut accepted = Vec::new();
+  loop {
+    let served = listener.accept_pending(&|_| false, &mut |client_id| {
+      Ok(Prepared {
+        region: ClientRegion::create(
+          &format!("slates-claim-{pid}-{client_id}"),
+          client_id,
+          0,
+          geometry(),
+        )?,
+        kick_fd: None,
+      })
+    });
+    accepted.extend(served.unwrap_or_default());
+    let at = Instant::now();
+    let polled = claim.poll().unwrap();
+    longest = longest.max(at.elapsed());
+    if let Some(connected) = polled {
+      // The daemon's ends go with the test; the client's mapping keeps the region it opened.
+      drop(accepted);
+      return (connected, longest);
+    }
+    assert!(
+      started.elapsed() < Duration::from_nanos(CLAIM_WAIT_NS),
+      "the answered claim connects within the claim wait"
+    );
+  }
 }

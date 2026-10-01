@@ -80,7 +80,7 @@
 #   job object that ends the daemon with the anchor (`supervise.rs`, added 2026-09-05 with the
 #   CLI of Phase 2 task 5): create, the zeroed limit record, set the kill-on-close limit, assign
 #   the child, and the two closes (6), compiled only for Windows.
-# slates-ipc (41): the macOS wait-on-address and wake-by-address calls libc exposes without a
+# slates-ipc (46): the macOS wait-on-address and wake-by-address calls libc exposes without a
 #   safe wrapper (`wake.rs`), each on a live word of a shared mapping (2); the Linux rendezvous
 #   adopting the region descriptor it duplicated for the handoff before sending it (1) and
 #   borrowing the shard's leaked kick descriptor to duplicate it for the client (1); and the
@@ -109,7 +109,12 @@
 #   library's `Command` cannot
 #   restrict inheritance on Windows (the handle-list attribute is unstable on the pinned toolchain), so
 #   the spawn is made here like `slates-rt`'s AFD reactor: from the headers, each call with its
-#   invariant stated.
+#   invariant stated. The client's exit watch on the daemon's process (`exit_watch.rs`, added
+#   2026-10-01, AUD-29-20 — a killed daemon's bootstrap object outlives it, so its start stamp alone
+#   read "alive"): on macOS, rustix's `kevent` (unsafe by signature for its user-data pointer) to
+#   register `EVFILT_PROC`/`NOTE_EXIT` and to read it with a zero timeout (2); on Windows, compiled only
+#   there, `OpenProcess(SYNCHRONIZE)`, adopting its handle as an `OwnedHandle`, and
+#   `WaitForSingleObject` with a zero timeout (3).
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -184,7 +189,7 @@ slates-vfs = 0
 slates-land = 3
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 41
+slates-ipc = 46
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
 slates-server = 5

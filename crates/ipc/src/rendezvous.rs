@@ -267,17 +267,60 @@ impl DoorbellWaiter {
   }
 }
 
+/// Shape: how long a client waits for the daemon to answer a claim before reporting it unavailable
+/// (nanoseconds): the control shard's loop is microseconds, so a second is a dead daemon.
+pub const CLAIM_WAIT_NS: u64 = 1_000_000_000;
+
 /// The client's side: connects to `instance` and returns its region, the doorbell for a parked
 /// shard, and the platform's control channel where one exists.
 pub fn connect(instance: &str) -> Result<Connected, IpcError> {
-  platform::connect(instance, 0)
+  connect_as(instance, 0)
 }
 
 /// Connects asking for a client id it held before (a reconnect after the daemon restarted, so
 /// its retries under the old request ids meet their completion records, §4.9); the daemon
-/// honours the id when no live client holds it, else assigns a fresh one.
+/// honours the id when no live client holds it, else assigns a fresh one. The blocking facade over
+/// [`begin_connect_as`]: the claim, then a wait for its answer of at most the claim wait (twice, when
+/// the daemon took the claim to answer it).
 pub fn connect_as(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
-  platform::connect(instance, wanted)
+  begin_connect_as(instance, wanted)?.wait()
+}
+
+/// Starts a connect without waiting (AUD-29-19, §4.7 "Rendezvous"): the claim is made and announced to
+/// the daemon, and [`Claim::poll`] reads its answer whenever the caller's event loop looks. Nothing here
+/// waits on the daemon, so an event loop that drives the claim is never held by a slow, stopped or dead
+/// one.
+pub fn begin_connect_as(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
+  Ok(Claim {
+    inner: platform::begin(instance, wanted)?,
+  })
+}
+
+/// A connect in flight: the claim made, its answer not yet read. Dropped unanswered, the claim is given
+/// back (Linux: the socket closes, which the daemon reads as a client gone).
+pub struct Claim {
+  inner: platform::Claim,
+}
+
+impl std::fmt::Debug for Claim {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("Claim")
+  }
+}
+
+impl Claim {
+  /// Reads the daemon's answer without waiting: `Some` once connected, `None` while it is still due,
+  /// a typed refusal when the daemon refused the claim or did not answer it within the claim wait.
+  /// Once it has returned `Some` or an error, the claim is spent and a further poll is refused.
+  pub fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
+    self.inner.poll()
+  }
+
+  /// Waits for the answer (the synchronous facade): the platform's own wait between polls, bounded by
+  /// the claim wait.
+  pub fn wait(self) -> Result<Connected, IpcError> {
+    self.inner.wait()
+  }
 }
 
 /// Format: the bound a refusal carries when the region was refused for a reason other than the client
@@ -374,7 +417,7 @@ pub mod platform {
   };
   use slates_mem::Handoff;
 
-  use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
+  use super::{Accepted, CLAIM_WAIT_NS, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
@@ -626,34 +669,135 @@ pub mod platform {
     }
   }
 
-  pub(super) fn connect(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
+  /// A claim in flight (AUD-29-19): the connected, non-blocking socket with the hello sent, the
+  /// handoff not yet received.
+  pub struct Claim {
+    instance: String,
+    /// The socket; taken once the claim is answered or refused.
+    socket: Option<OwnedFd>,
+    started: std::time::Instant,
+  }
+
+  /// Connects a non-blocking socket to the daemon's rendezvous and sends the hello; nothing waits (a
+  /// stream connect over `AF_UNIX` completes at once or is refused when the daemon's backlog is full).
+  pub(super) fn begin(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
     let socket = rustix::net::socket_with(
       AddressFamily::UNIX,
       SocketType::STREAM,
-      SocketFlags::CLOEXEC,
+      SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
       None,
     )
     .map_err(|e| refused("socket", e))?;
-    rustix::net::connect(&socket, &address(instance)?).map_err(|_| {
+    rustix::net::connect(&socket, &address(instance)?).map_err(|errno| {
       IpcError::DaemonUnavailable {
         endpoint: instance.to_owned(),
-        why: "the rendezvous socket refused the connection (no daemon listening)",
+        why: if errno == rustix::io::Errno::AGAIN {
+          "the rendezvous backlog is full (the daemon is not accepting)"
+        } else {
+          "the rendezvous socket refused the connection (no daemon listening)"
+        },
       }
     })?;
+    // A fresh socket's send buffer takes the four-byte hello whole.
     rustix::net::send(&socket, &wanted.to_le_bytes(), SendFlags::empty())
       .map_err(|e| refused("send", e))?;
-    let mut body = [0u8; HANDOFF_BYTES];
-    let mut space =
-      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
-    let mut control = RecvAncillaryBuffer::new(&mut space);
-    let received = rustix::net::recvmsg(
-      &socket,
-      &mut [IoSliceMut::new(&mut body)],
-      &mut control,
-      RecvFlags::CMSG_CLOEXEC,
-    )
-    .map_err(|e| refused("recvmsg", e))?;
-    if received.bytes != HANDOFF_BYTES {
+    Ok(Claim {
+      instance: instance.to_owned(),
+      socket: Some(socket),
+      started: std::time::Instant::now(),
+    })
+  }
+
+  impl Claim {
+    /// The handoff, without waiting: received and decoded when it has come; `None` while it is due
+    /// within the claim wait; unavailable past it, or when the daemon closed the socket unanswered.
+    pub(super) fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
+      let Some(socket) = self.socket.as_ref() else {
+        return Err(IpcError::DaemonUnavailable {
+          endpoint: self.instance.clone(),
+          why: "the claim was already answered or refused",
+        });
+      };
+      let mut body = [0u8; HANDOFF_BYTES];
+      let mut space =
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(HANDOFF_FDS))];
+      let mut control = RecvAncillaryBuffer::new(&mut space);
+      match rustix::net::recvmsg(
+        socket,
+        &mut [IoSliceMut::new(&mut body)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
+      ) {
+        Err(rustix::io::Errno::AGAIN) => {
+          let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+          if elapsed < CLAIM_WAIT_NS {
+            return Ok(None);
+          }
+          self.socket = None;
+          Err(IpcError::DaemonUnavailable {
+            endpoint: self.instance.clone(),
+            why: "the daemon did not answer the claim within the claim wait",
+          })
+        }
+        Err(rustix::io::Errno::INTR) => Ok(None),
+        Err(e) => {
+          self.socket = None;
+          Err(refused("recvmsg", e))
+        }
+        Ok(received) => {
+          let socket = self.socket.take().ok_or(IpcError::Layout {
+            reason: "the claim's socket was already taken",
+          })?;
+          if received.bytes == 0 {
+            return Err(IpcError::DaemonUnavailable {
+              endpoint: self.instance.clone(),
+              why: "the daemon closed the rendezvous before answering the claim",
+            });
+          }
+          decode_handoff(&self.instance, socket, &body, received.bytes, &mut control).map(Some)
+        }
+      }
+    }
+
+    /// Waits for the handoff between polls on the socket's readability, bounded by the claim wait.
+    pub(super) fn wait(mut self) -> Result<Connected, IpcError> {
+      use rustix::event::{PollFd, PollFlags, Timespec};
+      loop {
+        if let Some(connected) = self.poll()? {
+          return Ok(connected);
+        }
+        let Some(socket) = self.socket.as_ref() else {
+          continue;
+        };
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let remaining = CLAIM_WAIT_NS.saturating_sub(elapsed);
+        let timeout = Timespec {
+          tv_sec: i64::try_from(remaining / NS_PER_SECOND).unwrap_or(i64::MAX),
+          tv_nsec: i64::try_from(remaining % NS_PER_SECOND).unwrap_or(0),
+        };
+        let mut fds = [PollFd::new(socket, PollFlags::IN)];
+        match rustix::event::poll(&mut fds, Some(&timeout)) {
+          Ok(_) | Err(rustix::io::Errno::INTR) => {}
+          Err(e) => return Err(refused("poll", e)),
+        }
+      }
+    }
+  }
+
+  /// Format: nanoseconds in a second, the unit split of a `poll` timeout.
+  const NS_PER_SECOND: u64 = 1_000_000_000;
+
+  /// Decodes a received handoff of `received` bytes: the daemon's typed refusal, or the region, the
+  /// completion eventfd and the shard's kick, with `socket` kept as the control channel and the
+  /// liveness signal.
+  fn decode_handoff(
+    instance: &str,
+    socket: OwnedFd,
+    body: &[u8; HANDOFF_BYTES],
+    received: usize,
+    control: &mut RecvAncillaryBuffer<'_>,
+  ) -> Result<Connected, IpcError> {
+    if received != HANDOFF_BYTES {
       return Err(IpcError::Layout {
         reason: "short handoff message",
       });
@@ -714,7 +858,7 @@ pub mod platform {
 
   use slates_mem::{Handoff, SharedObject, Width, WordRun, Words};
 
-  use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
+  use super::{Accepted, CLAIM_WAIT_NS, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
   #[cfg(not(windows))]
@@ -723,7 +867,7 @@ pub mod platform {
   /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
   const MAGIC: u32 = 0x5442_4C53;
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
-  /// padding (4), the daemon's start stamp (8), padding to a cache line.
+  /// padding (4), the daemon's start stamp (8), the daemon's process id (4), padding to a cache line.
   const HEADER_BYTES: usize = 64;
   /// Format: the slot count's offset in the header (after the magic).
   const AT_SLOT_COUNT: usize = 4;
@@ -733,6 +877,9 @@ pub mod platform {
   /// daemon opened the object, so a client that remembers it tells a restarted daemon (a new
   /// stamp) from a slow one (the same stamp).
   const AT_GENERATION: usize = 16;
+  /// Format: the daemon's process id's offset in the header, written before the start stamp publishes
+  /// the header: the process a client's exit watch is taken on (`crate::exit_watch`, AUD-29-20).
+  const AT_DAEMON_PID: usize = 24;
   /// Shape: claim slots in the bootstrap object: clients connecting inside one control-shard
   /// loop; the loop drains them, so the table only covers one loop of arrivals.
   const SLOTS: usize = 64;
@@ -772,10 +919,6 @@ pub mod platform {
   /// refused for another reason (the daemon unavailable, with the reason).
   /// Format: the fourth slot state, after `FREE`/`CLAIMED`/`READY`/`DONE`.
   const REFUSED: u32 = 4;
-  /// Shape: how long a client waits for the daemon to answer a claim before reporting it
-  /// unavailable (nanoseconds): the control shard's loop is microseconds, so a second is a
-  /// dead daemon.
-  const CLAIM_WAIT_NS: u64 = 1_000_000_000;
   /// Derived: how long a slot may sit unchanged in a state a live party moves on from (`CLAIMING`,
   /// `READY`, `REFUSED`) before the daemon takes it back: twice the claim wait, past which no live client
   /// is still waiting on it (a client gives up after one claim wait, or two once the daemon took its
@@ -807,16 +950,19 @@ pub mod platform {
     }
   }
 
-  /// The client's liveness check: the start stamp it saw, compared to the one the bootstrap
-  /// object holds now (none when no daemon holds the object).
+  /// The client's liveness check: the daemon's process exited (its exit watch, taken when the claim was
+  /// answered), or the start stamp it saw differs from the one the bootstrap object holds now (none when
+  /// no daemon holds the object). The stamp alone cannot see a killed daemon nothing restarted, since the
+  /// object outlives it (AUD-29-20).
   pub struct Liveness {
     instance: String,
     generation: u64,
+    watch: crate::exit_watch::ExitWatch,
   }
 
   impl Liveness {
     pub(super) fn daemon_gone(&self) -> bool {
-      generation_of(&self.instance).is_none_or(|now| now != self.generation)
+      self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
     }
   }
 
@@ -1032,6 +1178,7 @@ pub mod platform {
       for i in 0..SLOTS {
         state(&object, i)?.store(FREE, Ordering::Release);
       }
+      object.write(AT_DAEMON_PID, &current_pid().to_le_bytes())?;
       // The start stamp last, with release: it publishes the header and the free table (never zero).
       object
         .atomic_u64(AT_GENERATION)?
@@ -1293,45 +1440,6 @@ pub mod platform {
     Err(IpcError::RingFull)
   }
 
-  /// Waits for the daemon's answer to the claim in slot `index`: its state `READY` or `REFUSED`. At the
-  /// claim wait the claim is taken back by CAS — only if the daemon has not taken it to answer, whose
-  /// answer is then awaited one more claim wait.
-  fn await_answer(
-    object: &SharedObject,
-    index: usize,
-    instance: &str,
-    #[cfg(windows)] ready_event: &crate::wake::Event,
-  ) -> Result<u32, IpcError> {
-    let word = state(object, index)?;
-    let started = std::time::Instant::now();
-    let mut wait_ns = CLAIM_WAIT_NS;
-    loop {
-      let now = word.load(Ordering::Acquire);
-      if now == READY || now == REFUSED {
-        return Ok(now);
-      }
-      let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-      if elapsed >= wait_ns {
-        let took_back = word
-          .compare_exchange(CLAIMED, FREE, Ordering::AcqRel, Ordering::Acquire)
-          .is_ok();
-        if took_back || wait_ns > CLAIM_WAIT_NS {
-          return Err(IpcError::DaemonUnavailable {
-            endpoint: instance.to_owned(),
-            why: "the daemon did not answer the claim within the claim wait",
-          });
-        }
-        // The daemon took the claim to answer it: its answer is due; wait one more claim wait for it.
-        wait_ns = wait_ns.saturating_add(CLAIM_WAIT_NS);
-        continue;
-      }
-      #[cfg(not(windows))]
-      let _ = wake::wait(word, now, Some(wait_ns.saturating_sub(elapsed)))?;
-      #[cfg(windows)]
-      let _ = ready_event.wait(Some(wait_ns.saturating_sub(elapsed)))?;
-    }
-  }
-
   /// Takes the answered slot `index` to `DONE`: the daemon's fields, copied before, are this client's
   /// only if the slot was still its answer (the daemon reclaims an answer left past the stale bound).
   fn finish(
@@ -1357,12 +1465,33 @@ pub mod platform {
     }
   }
 
-  pub(super) fn connect(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
+  /// A claim in flight (AUD-29-19): the slot this client took and announced, its answer not yet read.
+  pub struct Claim {
+    instance: String,
+    object: SharedObject,
+    index: usize,
+    generation: u64,
+    /// The daemon-wide doorbell, rung at the claim and kept as the client's doorbell once connected;
+    /// taken when the claim completes.
+    bell: Option<Bell>,
+    /// The Event the daemon signals when it answers this slot (Windows; the word wake is process-local
+    /// there). The daemon holds every slot's Event from its start, so a signal raised before a wait is
+    /// kept until the wait consumes it.
+    #[cfg(windows)]
+    ready_event: crate::wake::Event,
+    started: std::time::Instant,
+    /// The answer's deadline from `started`: one claim wait, extended by one more when the daemon has
+    /// taken the claim to answer it.
+    wait_ns: u64,
+    /// Whether the slot is still this client's to give back (cleared once answered or refused).
+    open: bool,
+  }
+
+  /// Claims a slot and rings the daemon-wide doorbell so a parked control shard sees the claim; nothing
+  /// waits.
+  pub(super) fn begin(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
     let (handoff, mut object, generation) = open_bootstrap(instance)?;
     let index = claim(&mut object, wanted)?;
-    // The Event the daemon signals when it answers this slot (Windows; the word wake is process-local
-    // there). The daemon holds every slot's Event from its start, so a signal raised before this wait is
-    // kept until the wait consumes it.
     #[cfg(windows)]
     let ready_event = match crate::wake::Event::open(&ready_event_name(instance, index)) {
       Ok(event) => event,
@@ -1371,8 +1500,8 @@ pub mod platform {
         return Err(error);
       }
     };
-    // Ring the daemon-wide doorbell so a parked control shard sees the claim. The client's own doorbell
-    // for later rings is this bell, over its own mapping of the bootstrap object.
+    // The client's own doorbell for later rings is this bell, over its own mapping of the bootstrap
+    // object.
     let bell = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())
       .map_err(IpcError::from)
       .and_then(|mapping| Bell::new(mapping, instance));
@@ -1384,37 +1513,122 @@ pub mod platform {
         return Err(error);
       }
     };
-    let answer = await_answer(
-      &object,
+    Ok(Claim {
+      instance: instance.to_owned(),
+      object,
       index,
-      instance,
+      generation,
+      bell: Some(bell),
       #[cfg(windows)]
-      &ready_event,
-    )?;
-    let at = slot_at(index);
-    if answer == REFUSED {
-      // The daemon's typed refusal: the bound when that was the reason, else none.
-      let limit = read_u64(&object, at.saturating_add(AT_LEN))?;
-      finish(&object, index, REFUSED, instance)?;
-      return Err(super::refusal_of(
-        usize::try_from(limit).unwrap_or(usize::MAX),
-        instance,
-      ));
-    }
-    let (name, len) = read_answer(&object, at)?;
-    finish(&object, index, READY, instance)?;
-    let region = ClientRegion::open(&Handoff::Name(name), len)?;
-    Ok(Connected {
-      region,
-      doorbell: Doorbell::Word(bell),
-      liveness: super::Liveness {
-        inner: Liveness {
-          instance: instance.to_owned(),
-          generation,
-        },
-      },
-      control: Some(ClientControl),
+      ready_event,
+      started: std::time::Instant::now(),
+      wait_ns: CLAIM_WAIT_NS,
+      open: true,
     })
+  }
+
+  impl Claim {
+    /// The answer, without waiting: the slot `READY` or `REFUSED` is read and finished; past the claim
+    /// wait the claim is taken back by CAS — only if the daemon has not taken it to answer, whose answer
+    /// is then awaited one more claim wait.
+    pub(super) fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
+      if !self.open {
+        return Err(IpcError::DaemonUnavailable {
+          endpoint: self.instance.clone(),
+          why: "the claim was already answered or refused",
+        });
+      }
+      let word = state(&self.object, self.index)?;
+      let now = word.load(Ordering::Acquire);
+      if now == READY || now == REFUSED {
+        self.open = false;
+        return self.complete(now).map(Some);
+      }
+      let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+      if elapsed < self.wait_ns {
+        return Ok(None);
+      }
+      let took_back = word
+        .compare_exchange(CLAIMED, FREE, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+      if took_back || self.wait_ns > CLAIM_WAIT_NS {
+        // Taken back, or the daemon's answer is a whole claim wait late: its slot is left to the
+        // daemon's stale reclaim.
+        self.open = false;
+        return Err(IpcError::DaemonUnavailable {
+          endpoint: self.instance.clone(),
+          why: "the daemon did not answer the claim within the claim wait",
+        });
+      }
+      // The daemon took the claim to answer it: its answer is due; wait one more claim wait for it.
+      self.wait_ns = self.wait_ns.saturating_add(CLAIM_WAIT_NS);
+      Ok(None)
+    }
+
+    /// Waits for the answer between polls on the slot's state word (Windows: the slot's Event).
+    pub(super) fn wait(mut self) -> Result<Connected, IpcError> {
+      loop {
+        if let Some(connected) = self.poll()? {
+          return Ok(connected);
+        }
+        let word = state(&self.object, self.index)?;
+        let now = word.load(Ordering::Acquire);
+        if now == READY || now == REFUSED {
+          continue;
+        }
+        let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        #[cfg(not(windows))]
+        let _ = wake::wait(word, now, Some(self.wait_ns.saturating_sub(elapsed)))?;
+        #[cfg(windows)]
+        let _ = self
+          .ready_event
+          .wait(Some(self.wait_ns.saturating_sub(elapsed)))?;
+      }
+    }
+
+    /// Reads an answered slot: the daemon's typed refusal, or the region it made, the slot then `DONE`.
+    fn complete(&mut self, answer: u32) -> Result<Connected, IpcError> {
+      let at = slot_at(self.index);
+      if answer == REFUSED {
+        // The daemon's typed refusal: the bound when that was the reason, else none.
+        let limit = read_u64(&self.object, at.saturating_add(AT_LEN))?;
+        finish(&self.object, self.index, REFUSED, &self.instance)?;
+        return Err(super::refusal_of(
+          usize::try_from(limit).unwrap_or(usize::MAX),
+          &self.instance,
+        ));
+      }
+      let (name, len) = read_answer(&self.object, at)?;
+      finish(&self.object, self.index, READY, &self.instance)?;
+      let region = ClientRegion::open(&Handoff::Name(name), len)?;
+      // The daemon answered, so it was alive: watch its process from here.
+      let watch = crate::exit_watch::ExitWatch::on(read_u32(&self.object, AT_DAEMON_PID)?)?;
+      let bell = self.bell.take().ok_or(IpcError::Layout {
+        reason: "the claim's doorbell was already taken",
+      })?;
+      Ok(Connected {
+        region,
+        doorbell: Doorbell::Word(bell),
+        liveness: super::Liveness {
+          inner: Liveness {
+            instance: self.instance.clone(),
+            generation: self.generation,
+            watch,
+          },
+        },
+        control: Some(ClientControl),
+      })
+    }
+  }
+
+  impl Drop for Claim {
+    /// A claim dropped unanswered (a cancelled connect) gives its slot back, only while it is still
+    /// merely claimed, so one the daemon already took is left to its answer and the stale reclaim.
+    fn drop(&mut self) {
+      if self.open {
+        give_back(&self.object, self.index);
+      }
+    }
   }
 
   #[cfg(test)]
@@ -1514,6 +1728,21 @@ pub mod platform {
       assert_eq!(state(&client, 0).unwrap().load(Acquire), FREE);
     }
 
+    /// AUD-29-19 (a cancelled connect). Do: begin a claim on a daemon end that has not accepted it, then
+    /// drop the claim unanswered. Expect: the slot `CLAIMED` while the claim lives and `FREE` once it is
+    /// dropped, so a cancelled connect never strands a claim slot until the stale reclaim.
+    #[test]
+    fn a_claim_dropped_unanswered_gives_its_slot_back() {
+      let name = instance("dropped");
+      let _listener = Listener::open(&name).unwrap();
+      let client = client_mapping(&name);
+      let claim = begin(&name, 0).unwrap();
+      let index = claim.index;
+      assert_eq!(state(&client, index).unwrap().load(Acquire), CLAIMED);
+      drop(claim);
+      assert_eq!(state(&client, index).unwrap().load(Acquire), FREE);
+    }
+
     /// AUD-29-09 (header publication). Do: create the bootstrap object with its header written but the
     /// start stamp not yet published, and connect. Expect: `DaemonUnavailable` naming the unpublished
     /// object, never a torn header read as a daemon.
@@ -1524,7 +1753,7 @@ pub mod platform {
         SharedObject::create(&rendezvous_name(&name), OBJECT_BYTES, bootstrap_words()).unwrap();
       object.write(0, &MAGIC.to_le_bytes()).unwrap();
       assert!(matches!(
-        connect(&name, 0),
+        begin(&name, 0).map(drop),
         Err(IpcError::DaemonUnavailable {
           why: "the daemon has not yet published its rendezvous object",
           ..
@@ -1620,7 +1849,20 @@ pub mod platform {
     }
   }
 
-  pub(super) fn connect(instance: &str, _wanted: u32) -> Result<Connected, IpcError> {
+  /// No claim on this platform: an uninhabited type, so no value of it exists.
+  pub enum Claim {}
+
+  impl Claim {
+    pub(super) fn poll(&mut self) -> Result<Option<Connected>, IpcError> {
+      match *self {}
+    }
+
+    pub(super) fn wait(self) -> Result<Connected, IpcError> {
+      match self {}
+    }
+  }
+
+  pub(super) fn begin(instance: &str, _wanted: u32) -> Result<Claim, IpcError> {
     Err(IpcError::DaemonUnavailable {
       endpoint: instance.to_owned(),
       why: "no rendezvous exists on this platform",

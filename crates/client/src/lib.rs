@@ -37,11 +37,12 @@
 )]
 
 pub mod client;
+pub mod driver;
 pub mod error;
 
 pub use client::{
-  Advanced, Attachment, Client, CreateSpec, Deadlines, Digest, LAST_SEQUENCE, Landing, Rebased,
-  Session, Submitted,
+  Advanced, Attachment, Client, Connecting, CreateSpec, Deadlines, Digest, LAST_SEQUENCE, Landing,
+  Rebased, Session, Submitted,
 };
 pub use error::ClientError;
 /// The consumer capability and its delivery (§4.13): what `enroll` returns once, what a harness hands a

@@ -42,13 +42,16 @@
 // message string on `SlatesError` — the one place a typed error becomes text, and the reason is here.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use slates_client::driver::{Begin, Driver, Event, Ticket};
 use slates_client::{
-  Client as RustClient, ClientError, CreateSpec, Deadlines, Filter, Landing, NamePolicy, Rebased,
-  SizeClass, SnapshotId, StatusReport, Submitted, VolumeId, VolumeSummary, WorkOp,
+  Client as RustClient, ClientError, Connecting, CreateSpec, Deadlines, Filter, Landing,
+  NamePolicy, Rebased, RequestId, SizeClass, SnapshotId, StatusReport, Submitted, VolumeId,
+  VolumeSummary, WorkOp,
 };
 
 /// Format: a volume id is 16 bytes on the wire — its high half names the creator host (§4.8 "Lookup").
@@ -642,8 +645,8 @@ enum Decode {
   Landed,
 }
 
-/// A request in flight on the async client: the future its `await` suspends on, and how to decode its
-/// reply once the completion fd signals.
+/// A call in flight on the async client: the future its `await` suspends on, and how to decode its reply
+/// once the driver reports it landed.
 struct Pending {
   future: Py<PyAny>,
   decode: Decode,
@@ -678,49 +681,135 @@ impl Ready {
 /// Python event loop drives to completion by the completion fd's readiness (`loop.add_reader`). The
 /// fast path returns within the daemon's spin window without touching the loop; the slow path arms
 /// the completion signal, registers the fd, and resolves the awaiting future when the reply lands.
-/// One reader per client serves every request in flight, replies matched to requests by id. The sync
-/// [`Client`] is the thin blocking facade over the same daemon; this is the primary async form.
+/// One reader per client serves every call in flight. The sync [`Client`] is the thin blocking facade
+/// over the same daemon; this is the primary async form.
+///
+/// Every call goes through the client's [`Driver`] (AUD-29-19, AUD-29-20): sent when the client admits
+/// it and queued otherwise, never waiting; past the bound refused `TooManyOutstanding` at once. Every
+/// call ends: answered; refused typed; `Stalled` at its reply deadline; recovered across a daemon
+/// restart (resent under its own id) or failed `DaemonGone` when no daemon answers within the reconnect
+/// budget; `CompletionLost` when the completion reader fails. The loop's timer (`call_later`) drives the
+/// deadlines and recovery; a cancelled await releases its call.
 #[pyclass(unsendable)]
 struct AsyncClient {
   inner: RustClient,
-  /// Requests in flight, by request-id word.
-  pending: HashMap<u64, Pending>,
-  /// Whether the completion fd is registered with the loop's reader set.
-  reader_on: bool,
-  /// The completion handle `add_reader` polls, cached after the first async call enables it. An
-  /// `i64` holds both a Unix fd and a Windows completion `SOCKET` (D-10): on Windows the loop must be
-  /// a `SelectorEventLoop`, whose `add_reader` accepts a socket — the default Proactor loop has no
-  /// `add_reader` (a caller sets `WindowsSelectorEventLoopPolicy`).
-  completion_fd: Option<i64>,
-  /// The running loop, held to remove the reader when no request is in flight.
+  /// The calls' admission, queue, deadlines and recovery.
+  driver: Driver,
+  /// Calls in flight, by driver ticket.
+  pending: HashMap<Ticket, Pending>,
+  /// The completion handle registered with the loop's reader set, and the channel (the client's
+  /// reconnect count) it belongs to; `None` while no reader is registered. A reconnect gives the client
+  /// a new channel with its own handle, so the reader moves with it. An `i64` holds both a Unix fd and a
+  /// Windows completion `SOCKET` (D-10): on Windows the loop must be a `SelectorEventLoop`, whose
+  /// `add_reader` accepts a socket — the default Proactor loop has no `add_reader` (a caller sets
+  /// `WindowsSelectorEventLoopPolicy`).
+  reader: Option<(i64, u64)>,
+  /// The running loop, held to move or remove the reader and to set the timer.
   event_loop: Option<Py<PyAny>>,
+  /// The loop's timer handle for the driver's next wake.
+  timer: Option<Py<PyAny>>,
+  /// Why the completion reader was lost, once it was: every call then failed with it, and every later
+  /// call is refused with it.
+  broken: Option<String>,
+}
+
+impl AsyncClient {
+  /// The async client over a connected `inner`.
+  fn over(inner: RustClient) -> AsyncClient {
+    let driver = Driver::new(&inner);
+    AsyncClient {
+      inner,
+      driver,
+      pending: HashMap::new(),
+      reader: None,
+      event_loop: None,
+      timer: None,
+      broken: None,
+    }
+  }
+
+  /// Submits one call through the driver: sent now when the client admits it, else queued — never
+  /// waiting — then, only when it was sent, spun for its reply within the daemon's window (the fast
+  /// path). The ticket the pending call is keyed by, and the decoded reply when it landed in the spin;
+  /// a reply taken or refused in the spin ends the call here.
+  fn begin_spin(
+    &mut self,
+    begin: Begin,
+    spin: impl FnOnce(&mut RustClient, RequestId, u64) -> PyResult<Option<PyObject>>,
+  ) -> PyResult<(Ticket, Option<PyObject>)> {
+    if let Some(reason) = &self.broken {
+      return Err(refusal(ClientError::CompletionLost {
+        reason: reason.clone(),
+      }));
+    }
+    let ticket = self
+      .driver
+      .submit(&mut self.inner, begin)
+      .map_err(refusal)?;
+    self.inner.begin_ack_if_due().map_err(refusal)?;
+    let Some(word) = self.driver.word_of(ticket) else {
+      return Ok((ticket, None));
+    };
+    let spin_ns = self.inner.published_spin_ns();
+    let fast = spin(&mut self.inner, RequestId::from_word(word), spin_ns);
+    if !matches!(fast, Ok(None)) {
+      self.driver.finish(ticket);
+    }
+    Ok((ticket, fast?))
+  }
 }
 
 #[pymethods]
 impl AsyncClient {
-  /// Connects to the named daemon `instance` as a new async client. The rendezvous is a fast blocking
-  /// handshake done once here; every verb after it is async. `reply_ns`/`reconnect_ns` are the same
-  /// derived budgets [`Client.connect`] takes.
+  /// Connects to the named daemon `instance` as a new async client, without holding the loop
+  /// (AUD-29-19): the rendezvous claim is made at once and its answer read on the loop's timers at the
+  /// pacing the client asks for. Awaitable; raises `SlatesError` when the daemon refuses the claim or
+  /// leaves it unanswered past the claim wait. `reply_ns`/`reconnect_ns` are the same derived budgets
+  /// [`Client.connect`] takes.
   #[staticmethod]
   #[pyo3(signature = (instance, reply_ns, reconnect_ns))]
-  fn connect(instance: &str, reply_ns: u64, reconnect_ns: u64) -> PyResult<AsyncClient> {
+  fn connect(
+    py: Python<'_>,
+    instance: &str,
+    reply_ns: u64,
+    reconnect_ns: u64,
+  ) -> PyResult<PyObject> {
     let deadlines = Deadlines {
       reply_ns,
       reconnect_ns,
     };
-    let inner = RustClient::connect(instance, deadlines).map_err(refusal)?;
-    Ok(AsyncClient {
-      inner,
-      pending: HashMap::new(),
-      reader_on: false,
-      completion_fd: None,
-      event_loop: None,
-    })
+    let connecting = RustClient::begin_connect(instance, deadlines).map_err(refusal)?;
+    let event_loop = py
+      .import_bound("asyncio")?
+      .call_method0("get_running_loop")?;
+    let future = event_loop.call_method0("create_future")?;
+    let step = Bound::new(
+      py,
+      ConnectStep {
+        connecting: Some(connecting),
+        future: future.clone().unbind(),
+        event_loop: event_loop.unbind(),
+      },
+    )?;
+    step.call0()?;
+    Ok(future.unbind())
   }
 
   /// The client id the daemon bound to this session.
   fn client_id(&self) -> u32 {
     self.inner.client_id()
+  }
+
+  /// How many times the client has reconnected across daemon restarts (§4.9) — each a new channel, which
+  /// the loop's reader moves to.
+  fn reconnects(&self) -> u64 {
+    self.inner.reconnects()
+  }
+
+  /// The calls the client admits outstanding at once; the driver queues as many more behind them, and
+  /// refuses `TooManyOutstanding` past that.
+  fn outstanding_limit(&self) -> usize {
+    self.inner.outstanding_limit()
   }
 
   /// Creates a volume and returns its id as hex (§4.4) — the async form of [`Client.create`].
@@ -736,19 +825,17 @@ impl AsyncClient {
   ) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let spec = build_spec(name, size_bytes, dynamic, fold, require_locked, base);
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let id = this.inner.create_begin(&spec).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .create_spin(id, spin)
-        .map_err(refusal)?
-        .map(|volume| volume_hex(&volume).into_py(py));
-      (id.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Created)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.create_begin(&spec)),
+      |c: &mut RustClient, id: RequestId, spin: u64| {
+        let fast = c
+          .create_spin(id, spin)
+          .map_err(refusal)?
+          .map(|volume| volume_hex(&volume).into_py(py));
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Created)
   }
 
   /// Takes a snapshot of the volume named by its hex id and returns the snapshot's sequence (§4.4) —
@@ -756,19 +843,17 @@ impl AsyncClient {
   fn snapshot<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let id = parse_volume(volume)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.snapshot_begin(id).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .snapshot_spin(request, spin)
-        .map_err(refusal)?
-        .map(|snapshot| snapshot.value.into_py(py));
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Snapshotted)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.snapshot_begin(id)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .snapshot_spin(request, spin)
+          .map_err(refusal)?
+          .map(|snapshot| snapshot.value.into_py(py));
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Snapshotted)
   }
 
   /// Reads the volume's status as a dict (§4.4) — the async form of [`Client.status`], the identical
@@ -776,35 +861,33 @@ impl AsyncClient {
   fn status<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let id = parse_volume(volume)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.status_begin(id).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = match this.inner.status_spin(request, spin).map_err(refusal)? {
-        Some(report) => Some(status_dict(py, report)?.into_any()),
-        None => None,
-      };
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Status)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.status_begin(id)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = match c.status_spin(request, spin).map_err(refusal)? {
+          Some(report) => Some(status_dict(py, report)?.into_any()),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Status)
   }
 
   /// Lists the daemon's volumes as a list of dicts (§4.4) — the async form of [`Client.list`].
   fn list<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.list_begin().map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = match this.inner.list_spin(request, spin).map_err(refusal)? {
-        Some(volumes) => Some(summaries_to_py(py, volumes)?),
-        None => None,
-      };
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Listed)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.list_begin()),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = match c.list_spin(request, spin).map_err(refusal)? {
+          Some(volumes) => Some(summaries_to_py(py, volumes)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Listed)
   }
 
   /// Resizes the volume's quota (§4.4) — the async form of [`Client.resize`]; resolves to `None`.
@@ -822,19 +905,17 @@ impl AsyncClient {
     } else {
       SizeClass::Bounded { limit: size_bytes }
     };
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.resize_begin(id, size).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .resize_spin(request, spin)
-        .map_err(refusal)?
-        .map(|_done| py.None());
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Resized)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.resize_begin(id, size)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .resize_spin(request, spin)
+          .map_err(refusal)?
+          .map(|_done| py.None());
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Resized)
   }
 
   /// Destroys the volume and reclaims its memory (§4.4) — the async form of [`Client.destroy`];
@@ -842,19 +923,17 @@ impl AsyncClient {
   fn destroy<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let id = parse_volume(volume)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.destroy_begin(id).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .destroy_spin(request, spin)
-        .map_err(refusal)?
-        .map(|_done| py.None());
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Destroyed)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.destroy_begin(id)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .destroy_spin(request, spin)
+          .map_err(refusal)?
+          .map(|_done| py.None());
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Destroyed)
   }
 
   /// Creates a green merge target (§4.16) — the async form of [`Client.create_green`].
@@ -865,22 +944,20 @@ impl AsyncClient {
     require_evidence: bool,
   ) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this
-        .inner
-        .create_green_begin(name, require_evidence)
-        .map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .create_green_spin(request, spin)
-        .map_err(refusal)?
-        .map(|volume| volume_hex(&volume).into_py(py));
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::GreenCreated)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      {
+        let name = name.to_owned();
+        Box::new(move |c: &mut RustClient| c.create_green_begin(&name, require_evidence))
+      },
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .create_green_spin(request, spin)
+          .map_err(refusal)?
+          .map(|volume| volume_hex(&volume).into_py(py));
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::GreenCreated)
   }
 
   /// Creates a work volume over a green (§4.16) as a `{id, base}` dict — the async form of
@@ -892,22 +969,20 @@ impl AsyncClient {
   ) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let green = parse_volume(green)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.create_work_begin(green, name).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = match this
-        .inner
-        .create_work_spin(request, spin)
-        .map_err(refusal)?
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
       {
-        Some((id, base)) => Some(work_dict(py, id, base)?.into_any()),
-        None => None,
-      };
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::WorkCreated)
+        let name = name.to_owned();
+        Box::new(move |c: &mut RustClient| c.create_work_begin(green, &name))
+      },
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = match c.create_work_spin(request, spin).map_err(refusal)? {
+          Some((id, base)) => Some(work_dict(py, id, base)?.into_any()),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::WorkCreated)
   }
 
   /// Declares a content edit on a work volume (§4.16) — the async form of [`Client.edit`]; resolves
@@ -922,22 +997,20 @@ impl AsyncClient {
   ) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let work = parse_volume(work)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this
-        .inner
-        .edit_begin(work, path, at, delete_len, data)
-        .map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .edit_spin(request, spin)
-        .map_err(refusal)?
-        .map(|_done| py.None());
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Edited)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      {
+        let (path, data) = (path.to_owned(), data.to_vec());
+        Box::new(move |c: &mut RustClient| c.edit_begin(work, &path, at, delete_len, &data))
+      },
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .edit_spin(request, spin)
+          .map_err(refusal)?
+          .map(|_done| py.None());
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Edited)
   }
 
   /// Submits a work volume's operations to its green (§4.16) as an outcome dict — the async form of
@@ -945,37 +1018,34 @@ impl AsyncClient {
   fn submit<'py>(slf: Bound<'py, Self>, work: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let work = parse_volume(work)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.submit_begin(work).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = match this.inner.submit_spin(request, spin).map_err(refusal)? {
-        Some(outcome) => Some(submitted_to_py(py, outcome)?),
-        None => None,
-      };
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Submitted)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.submit_begin(work)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = match c.submit_spin(request, spin).map_err(refusal)? {
+          Some(outcome) => Some(submitted_to_py(py, outcome)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Submitted)
   }
 
   /// A green's head version (§4.16) — the async form of [`Client.versions`].
   fn versions<'py>(slf: Bound<'py, Self>, green: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let green = parse_volume(green)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.versions_begin(green).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .versions_spin(request, spin)
-        .map_err(refusal)?
-        .map(|head| head.into_py(py));
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Versions)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.versions_begin(green)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .versions_spin(request, spin)
+          .map_err(refusal)?
+          .map(|head| head.into_py(py));
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Versions)
   }
 
   /// The files a green changed strictly after `version` (§4.16) — the async form of
@@ -987,22 +1057,17 @@ impl AsyncClient {
   ) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let green = parse_volume(green)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this
-        .inner
-        .changed_since_begin(green, version)
-        .map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .changed_since_spin(request, spin)
-        .map_err(refusal)?
-        .map(|paths| paths.into_py(py));
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Changed)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.changed_since_begin(green, version)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .changed_since_spin(request, spin)
+          .map_err(refusal)?
+          .map(|paths| paths.into_py(py));
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Changed)
   }
 
   /// Rebases a work volume onto its green's head (§4.16) as an outcome dict — the async form of
@@ -1010,18 +1075,17 @@ impl AsyncClient {
   fn rebase<'py>(slf: Bound<'py, Self>, work: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let work = parse_volume(work)?;
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.rebase_begin(work).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = match this.inner.rebase_spin(request, spin).map_err(refusal)? {
-        Some(outcome) => Some(rebased_to_py(py, outcome)?),
-        None => None,
-      };
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Rebased)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.rebase_begin(work)),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = match c.rebase_spin(request, spin).map_err(refusal)? {
+          Some(outcome) => Some(rebased_to_py(py, outcome)?),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Rebased)
   }
 
   // The namespace operations (§4.16) — the async form of [`Client`]'s, each declaring one `WorkOp` on
@@ -1194,27 +1258,44 @@ impl AsyncClient {
       include: include.unwrap_or_default(),
       exclude: exclude.unwrap_or_default(),
     };
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this
-        .inner
-        .land_begin(id, snap, target, filter, grant)
-        .map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = match this.inner.land_spin(request, spin).map_err(refusal)? {
-        Some(landing) => Some(landing_dict(py, landing)?.into_any()),
-        None => None,
-      };
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Landed)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      {
+        let target = target.to_owned();
+        Box::new(move |c: &mut RustClient| c.land_begin(id, snap, &target, filter.clone(), grant))
+      },
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = match c.land_spin(request, spin).map_err(refusal)? {
+          Some(landing) => Some(landing_dict(py, landing)?.into_any()),
+          None => None,
+        };
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Landed)
   }
 
-  /// The event loop's reader callback: drain the completion fd and resolve every request whose reply
-  /// has landed. Registered once with `add_reader`, removed when no request is in flight.
-  fn _pump(slf: Bound<'_, Self>) -> PyResult<()> {
-    pump(&slf)
+  /// The event loop's reader callback: drain the completion fd, take every landed reply and admit
+  /// waiting calls. Never raises (an exception in a reader callback is only logged by the loop): a
+  /// failure loses the reader and fails every call with it.
+  fn _pump(slf: Bound<'_, Self>) {
+    let outcome = {
+      let mut this = slf.borrow_mut();
+      this.inner.drain_completion();
+      let this = &mut *this;
+      Ok(this.driver.pump(&mut this.inner))
+    };
+    settle_or_lose(&slf, outcome);
+  }
+
+  /// The loop's timer callback: the driver's deadlines and recovery. Never raises, as [`Self::_pump`].
+  fn _tick(slf: Bound<'_, Self>) {
+    let outcome = {
+      let mut this = slf.borrow_mut();
+      this.timer = None;
+      let this = &mut *this;
+      Ok(this.driver.tick(&mut this.inner))
+    };
+    settle_or_lose(&slf, outcome);
   }
 }
 
@@ -1228,19 +1309,17 @@ impl AsyncClient {
     op: WorkOp,
   ) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
-    let (word, fast) = {
-      let mut this = slf.borrow_mut();
-      let request = this.inner.declare_begin(work, op).map_err(refusal)?;
-      this.inner.begin_ack_if_due().map_err(refusal)?;
-      let spin = this.inner.published_spin_ns();
-      let fast = this
-        .inner
-        .declare_spin(request, spin)
-        .map_err(refusal)?
-        .map(|_done| py.None());
-      (request.word(), fast)
-    };
-    finish(&slf, word, fast, Decode::Declared)
+    let (ticket, fast) = slf.borrow_mut().begin_spin(
+      Box::new(move |c: &mut RustClient| c.declare_begin(work, op.clone())),
+      |c: &mut RustClient, request: RequestId, spin: u64| {
+        let fast = c
+          .declare_spin(request, spin)
+          .map_err(refusal)?
+          .map(|_done| py.None());
+        Ok(fast)
+      },
+    )?;
+    finish(&slf, ticket, fast, Decode::Declared)
   }
 }
 
@@ -1272,11 +1351,12 @@ fn build_spec(
   }
 }
 
-/// Resolves an async call: the fast path returns a ready awaitable (no event loop); the slow path
-/// arms the completion signal, registers the fd, records the pending future, and returns it to await.
+/// Resolves an async call: the fast path returns a ready awaitable (no event loop); otherwise the call
+/// is recorded under its ticket with a future to await, released if that future is cancelled, and the
+/// reader, the arm and the timer are set for it.
 fn finish<'py>(
   slf: &Bound<'py, AsyncClient>,
-  word: u64,
+  ticket: Ticket,
   fast: Option<PyObject>,
   decode: Decode,
 ) -> PyResult<Bound<'py, PyAny>> {
@@ -1290,108 +1370,311 @@ fn finish<'py>(
   let future = event_loop.call_method0("create_future")?;
   {
     let mut this = slf.borrow_mut();
-    this.inner.arm_async().map_err(refusal)?;
     this.pending.insert(
-      word,
+      ticket,
       Pending {
         future: future.clone().unbind(),
         decode,
       },
     );
     if this.event_loop.is_none() {
-      this.event_loop = Some(event_loop.clone().unbind());
+      this.event_loop = Some(event_loop.unbind());
     }
   }
-  ensure_reader(slf, &event_loop)?;
-  // Race-close: a reply that landed between the spin's end and the arm is taken now, not lost.
-  pump(slf)?;
+  let hook = Bound::new(
+    py,
+    CancelHook {
+      client: slf.clone().unbind(),
+      ticket,
+    },
+  )?;
+  future.call_method1("add_done_callback", (hook,))?;
+  let outcome = attach_and_pump(slf);
+  settle_or_lose(slf, outcome);
   Ok(future)
 }
 
-/// Registers the completion fd with the loop's reader set once, so one reader serves every in-flight
-/// request (an event loop allows one reader per fd).
-fn ensure_reader<'py>(
-  slf: &Bound<'py, AsyncClient>,
-  event_loop: &Bound<'py, PyAny>,
-) -> PyResult<()> {
-  if slf.borrow().reader_on {
+/// Releases a call whose future was cancelled (AUD-29-20): queued, it is never sent; in flight, its
+/// reply is dropped when it comes. A done callback on every pending future; a future the client
+/// settled itself is not cancelled, so the hook leaves it.
+#[pyclass(unsendable)]
+struct CancelHook {
+  client: Py<AsyncClient>,
+  ticket: Ticket,
+}
+
+#[pymethods]
+impl CancelHook {
+  fn __call__(&self, py: Python<'_>, future: Bound<'_, PyAny>) -> PyResult<()> {
+    if !future.call_method0("cancelled")?.extract::<bool>()? {
+      return Ok(());
+    }
+    let client = self.client.bind(py);
+    {
+      let mut this = client.borrow_mut();
+      if this.pending.remove(&self.ticket).is_some() {
+        let this = &mut *this;
+        this.driver.cancel(&mut this.inner, self.ticket);
+      }
+    }
+    // Never raises into the loop (a done callback's exception is only logged).
+    settle_or_lose(client, Ok(Vec::new()));
+    Ok(())
+  }
+}
+
+/// One step of an async connect on the loop: polls the claim's answer, resolves the future with the
+/// connected client or the refusal, else sets the loop's timer for the next look. A cancelled connect
+/// drops its claim, which gives it back.
+#[pyclass(unsendable)]
+struct ConnectStep {
+  connecting: Option<Connecting>,
+  future: Py<PyAny>,
+  event_loop: Py<PyAny>,
+}
+
+#[pymethods]
+impl ConnectStep {
+  fn __call__(slf: Bound<'_, Self>) -> PyResult<()> {
+    let py = slf.py();
+    let future = slf.borrow().future.clone_ref(py).into_bound(py);
+    if future.call_method0("done")?.extract::<bool>()? {
+      slf.borrow_mut().connecting = None;
+      return Ok(());
+    }
+    let polled = match slf.borrow_mut().connecting.as_mut() {
+      Some(connecting) => connecting.poll(),
+      None => return Ok(()),
+    };
+    match polled {
+      Ok(Some(inner)) => {
+        slf.borrow_mut().connecting = None;
+        let client = Bound::new(py, AsyncClient::over(inner))?;
+        future.call_method1("set_result", (client,))?;
+      }
+      Ok(None) => {
+        let wait_ns = match slf.borrow_mut().connecting.as_mut() {
+          Some(connecting) => connecting.next_poll_ns(),
+          None => return Ok(()),
+        };
+        let event_loop = slf.borrow().event_loop.clone_ref(py).into_bound(py);
+        event_loop.call_method1(
+          "call_later",
+          (Duration::from_nanos(wait_ns).as_secs_f64(), slf.clone()),
+        )?;
+      }
+      Err(error) => {
+        slf.borrow_mut().connecting = None;
+        future.call_method1("set_exception", (refusal(error).into_value(py),))?;
+      }
+    }
+    Ok(())
+  }
+}
+
+/// Arms the completion signal, moves the loop's reader to the client's current channel when a
+/// reconnect gave it a new one, and takes what has landed — in that order, so a reply that landed
+/// before the arm is taken by this pump rather than lost.
+fn attach_and_pump(slf: &Bound<'_, AsyncClient>) -> PyResult<Vec<Event>> {
+  let py = slf.py();
+  let channel = slf.borrow().inner.reconnects();
+  let current = slf.borrow().reader;
+  if current.map(|(_, on)| on) != Some(channel) {
+    let event_loop = slf
+      .borrow()
+      .event_loop
+      .as_ref()
+      .map(|event_loop| event_loop.clone_ref(py));
+    let Some(event_loop) = event_loop else {
+      return Ok(Vec::new());
+    };
+    let event_loop = event_loop.bind(py);
+    if let Some((old, _)) = current {
+      // The old channel's handle closed with it; the selector forgets a closed descriptor's key.
+      event_loop.call_method1("remove_reader", (old,))?;
+      slf.borrow_mut().reader = None;
+    }
+    let fd = {
+      let mut this = slf.borrow_mut();
+      let handle = this.inner.enable_async_completion().map_err(refusal)?;
+      // A Unix fd is an `i32`; a Windows completion `SOCKET` is a kernel handle-table value that fits
+      // in an `i64`. Both cross to the loop's `add_reader` as one integer.
+      #[cfg(unix)]
+      let fd = i64::from(handle);
+      #[cfg(windows)]
+      let fd = i64::try_from(handle).unwrap_or(i64::MAX);
+      fd
+    };
+    event_loop.call_method1("add_reader", (fd, slf.getattr("_pump")?))?;
+    slf.borrow_mut().reader = Some((fd, channel));
+  }
+  let mut this = slf.borrow_mut();
+  this.inner.arm_async().map_err(refusal)?;
+  let this = &mut *this;
+  Ok(this.driver.pump(&mut this.inner))
+}
+
+/// Settles `outcome`'s events, or — when taking them failed — loses the reader: every call fails
+/// `CompletionLost` and later calls are refused with it. The reader and timer callbacks end here, so
+/// nothing raises into the loop.
+fn settle_or_lose(slf: &Bound<'_, AsyncClient>, outcome: PyResult<Vec<Event>>) {
+  let failure = match outcome {
+    Ok(events) => match settle(slf, events) {
+      Ok(()) => return,
+      Err(error) => error,
+    },
+    Err(error) => error,
+  };
+  lose(slf, &failure.to_string());
+}
+
+/// Ends every call with `CompletionLost { reason }` and refuses later ones with it. Best effort by
+/// construction: the client is already failing, and every call learns that through its own future.
+fn lose(slf: &Bound<'_, AsyncClient>, reason: &str) {
+  let py = slf.py();
+  let lost = ClientError::CompletionLost {
+    reason: reason.to_owned(),
+  };
+  let pending: Vec<Pending> = {
+    let mut this = slf.borrow_mut();
+    if this.broken.is_none() {
+      this.broken = Some(reason.to_owned());
+    }
+    let this = &mut *this;
+    let _ = this.driver.fail_all(&mut this.inner, &lost);
+    this.pending.drain().map(|(_, pending)| pending).collect()
+  };
+  for entry in pending {
+    let future = entry.future.bind(py);
+    // A future already done (cancelled) needs nothing; any other refusal here leaves nothing to tell.
+    if !future
+      .call_method0("done")
+      .and_then(|done| done.extract::<bool>())
+      .unwrap_or(true)
+    {
+      let _ = future.call_method1("set_exception", (refusal(lost.clone()).into_value(py),));
+    }
+  }
+  let _ = idle(slf);
+}
+
+/// Settles the driver's events — a landed reply is decoded by its verb's poll and resolves its call, a
+/// failure raises its typed error into it — then moves the reader if the client reconnected, and sets
+/// the timer for the driver's next wake (or goes idle when no call waits).
+fn settle(slf: &Bound<'_, AsyncClient>, events: Vec<Event>) -> PyResult<()> {
+  let py = slf.py();
+  let mut events = events;
+  loop {
+    for event in events {
+      settle_one(slf, event)?;
+    }
+    if slf.borrow().pending.is_empty() {
+      return idle(slf);
+    }
+    let moved = {
+      let this = slf.borrow();
+      this.broken.is_none() && this.reader.map(|(_, on)| on) != Some(this.inner.reconnects())
+    };
+    if !moved {
+      break;
+    }
+    events = attach_and_pump(slf)?;
+  }
+  schedule(slf, py)
+}
+
+/// Settles one driver event into its pending future.
+fn settle_one(slf: &Bound<'_, AsyncClient>, event: Event) -> PyResult<()> {
+  let py = slf.py();
+  let (ticket, outcome) = match event {
+    Event::Failed { ticket, error } => (ticket, Err(refusal(error))),
+    Event::Ready { ticket, word } => {
+      let Some(decode) = slf.borrow().pending.get(&ticket).map(|entry| entry.decode) else {
+        return Ok(());
+      };
+      let decoded = {
+        let mut this = slf.borrow_mut();
+        decode_pending(py, &mut this.inner, word, decode)
+      };
+      match decoded {
+        Ok(None) => return Ok(()),
+        Ok(Some(value)) => (ticket, Ok(value)),
+        Err(error) => (ticket, Err(error)),
+      }
+    }
+  };
+  let entry = {
+    let mut this = slf.borrow_mut();
+    this.driver.finish(ticket);
+    this.pending.remove(&ticket)
+  };
+  let Some(entry) = entry else {
+    return Ok(());
+  };
+  let future = entry.future.bind(py);
+  if future.call_method0("done")?.extract::<bool>()? {
     return Ok(());
   }
-  let fd = {
-    let mut this = slf.borrow_mut();
-    let handle = this.inner.enable_async_completion().map_err(refusal)?;
-    // A Unix fd is an `i32`; a Windows completion `SOCKET` is a kernel handle-table value that fits in
-    // an `i64`. Both cross to the loop's `add_reader` as one integer.
-    #[cfg(unix)]
-    let fd = i64::from(handle);
-    #[cfg(windows)]
-    let fd = i64::try_from(handle).unwrap_or(i64::MAX);
-    this.completion_fd = Some(fd);
-    fd
+  match outcome {
+    Ok(value) => future.call_method1("set_result", (value,))?,
+    Err(error) => future.call_method1("set_exception", (error.into_value(py),))?,
   };
-  let pump_callback = slf.getattr("_pump")?;
-  event_loop.call_method1("add_reader", (fd, pump_callback))?;
-  slf.borrow_mut().reader_on = true;
   Ok(())
 }
 
-/// Drains the completion fd and resolves every request whose reply has landed; disarms and removes
-/// the reader when none remain.
-fn pump(slf: &Bound<'_, AsyncClient>) -> PyResult<()> {
-  let py = slf.py();
-  let ready = {
-    let mut this = slf.borrow_mut();
-    this.inner.drain_completion();
-    this.inner.take_ready().map_err(refusal)?
+/// Sets the one timer for the driver's next wake (`call_later`); none when the driver has no call.
+fn schedule(slf: &Bound<'_, AsyncClient>, py: Python<'_>) -> PyResult<()> {
+  cancel_timer(slf, py)?;
+  let wake = {
+    let this = slf.borrow();
+    this.driver.next_wake_ns(&this.inner)
   };
-  for word in ready {
-    let Some((future, decode)) = slf
-      .borrow()
-      .pending
-      .get(&word)
-      .map(|pending| (pending.future.clone_ref(py), pending.decode))
-    else {
-      continue;
-    };
-    let decoded = {
-      let mut this = slf.borrow_mut();
-      decode_pending(py, &mut this.inner, word, decode)
-    };
-    let future = future.bind(py);
-    match decoded {
-      Ok(Some(value)) => {
-        slf.borrow_mut().pending.remove(&word);
-        if !future.call_method0("done")?.extract::<bool>()? {
-          future.call_method1("set_result", (value,))?;
-        }
-      }
-      Ok(None) => {}
-      Err(error) => {
-        slf.borrow_mut().pending.remove(&word);
-        if !future.call_method0("done")?.extract::<bool>()? {
-          future.call_method1("set_exception", (error.into_value(py),))?;
-        }
-      }
-    }
+  let event_loop = slf
+    .borrow()
+    .event_loop
+    .as_ref()
+    .map(|event_loop| event_loop.clone_ref(py));
+  let (Some(wake), Some(event_loop)) = (wake, event_loop) else {
+    return Ok(());
+  };
+  let handle = event_loop.bind(py).call_method1(
+    "call_later",
+    (
+      Duration::from_nanos(wake).as_secs_f64(),
+      slf.getattr("_tick")?,
+    ),
+  )?;
+  slf.borrow_mut().timer = Some(handle.unbind());
+  Ok(())
+}
+
+/// Cancels the pending timer, if any.
+fn cancel_timer(slf: &Bound<'_, AsyncClient>, py: Python<'_>) -> PyResult<()> {
+  let timer = slf.borrow_mut().timer.take();
+  if let Some(timer) = timer {
+    timer.bind(py).call_method0("cancel")?;
   }
-  if slf.borrow().pending.is_empty() {
+  Ok(())
+}
+
+/// No call waits: the timer, the arm and the reader go.
+fn idle(slf: &Bound<'_, AsyncClient>) -> PyResult<()> {
+  let py = slf.py();
+  cancel_timer(slf, py)?;
+  if slf.borrow().broken.is_none() {
     slf.borrow_mut().inner.disarm_async().map_err(refusal)?;
-    let remove = {
-      let this = slf.borrow();
-      if this.reader_on {
-        this
-          .event_loop
-          .as_ref()
-          .map(|event_loop| event_loop.clone_ref(py))
-          .zip(this.completion_fd)
-      } else {
-        None
-      }
-    };
-    if let Some((event_loop, fd)) = remove {
-      event_loop.bind(py).call_method1("remove_reader", (fd,))?;
-      slf.borrow_mut().reader_on = false;
-    }
+  }
+  let remove = {
+    let this = slf.borrow();
+    this
+      .event_loop
+      .as_ref()
+      .map(|event_loop| event_loop.clone_ref(py))
+      .zip(this.reader)
+  };
+  if let Some((event_loop, (fd, _))) = remove {
+    event_loop.bind(py).call_method1("remove_reader", (fd,))?;
+    slf.borrow_mut().reader = None;
   }
   Ok(())
 }

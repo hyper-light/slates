@@ -2525,6 +2525,21 @@ drops.
 > one (a client, a daemon and a bridge) with no loss; 800 contended runs pass. Record:
 > `docs/bugs/2026-09-29-an-async-client-waited-forever-for-a-reply-that-had-landed.md`.
 
+> **Status (2026-10-01, A-56: an async SDK never holds its loop, and every async call ends).** AUD-29-19
+> and AUD-29-20. The client's operations never wait on the daemon: `begin` is a single send attempt, the
+> rendezvous a claim made at once and polled, a reconnect one step of that claim per tick. The driver
+> (`crates/client/src/driver.rs`) owns every async call from submission to its end: bounded admission and
+> queue, a reply deadline per call (queued calls too), recovery that resends under the calls' own ids, and
+> typed ends — answered, refused, `Stalled`, `DaemonGone`, `CompletionLost`, or released when cancelled
+> (Python by its task's cancel, Node by `client.cancel(promise)`).
+> Both SDKs drive it from their loop's reader and one timer, and connect from the loop. A client watches the
+> daemon's process (`crates/ipc/src/exit_watch.rs`), so on macOS and Windows a killed daemon is now gone
+> rather than stalled. Before: the Node acceptance test hung (one queued call never ended, its timer
+> re-armed every second), a fresh connect held the loop 1,002 ms, and a killed daemon's calls ended
+> `Stalled`. Now every call ends and the loop's worst lateness stays under a tenth of the reply deadline, in
+> the Rust driver test, the Node suite (4/4 runs) and the Python suite (4/4 runs) on macOS. Record:
+> `docs/bugs/2026-10-01-an-async-call-could-hold-the-loop-or-never-end.md`.
+
 **Derived constants.** Ring depth = Little's law on measured per-client request rate × p99
 service time, rounded to a power of two; `spin_ns` = wake_ns.mean (the client's prior); `spin_shift`
 = ⌈log₂ (1.96 · wake_ns.sd / (0.05 · wake_ns.mean))²⌉; idle window = the shard's wake estimate ×
@@ -7670,6 +7685,7 @@ vfs, cluster and server crates.
   snapshot, the hostile-input refusals, the in-process rebuild oracle, and the three-daemon takeover over
   NFS (red with the attribute restore disabled, green with it).
 - What it does not change: the bridges' own time surfaces (WinFsp's creation time is a reported sibling),
+  the merge engine's metadata dimension, R1–R10.
 
 ### A-54 — Content transfers resume from verified chunks, and holders progress independently (2026-10-01)
 Applied in the same change to: §4.10 "Content replication", GAPS (AUD-29-55–58), the shard image version (9),
@@ -7707,5 +7723,31 @@ Applied in the same change to: GAPS (AUD-29-55–58), `docs/bugs/2026-10-01-a-sp
   the export hashing 4 of 32 windows; a terabyte hole restored with nothing allocated.
 - What it does not change: the archive format; hole punching is still owed (no volume verb, NFSv4.2
   `DEALLOCATE` unserved).
-  the merge engine's metadata dimension, R1–R10.
 
+### A-56 — An async SDK never holds its event loop, and every async call ends (2026-10-01)
+Applied in the same change to: §4.7 status, GAPS (AUD-29-19–24), both SDKs' READMEs and Node's types, the
+unsafe budget (`slates-ipc` 41 → 46), and `docs/bugs/2026-10-01-an-async-call-could-hold-the-loop-or-never-end.md`.
+- Why: an async SDK's "begin" sent synchronously, waiting on a full ring up to the reply deadline and
+  reconnecting inside a sleep loop; the rendezvous waited for its answer inside one call (a second on macOS
+  and Windows, without bound on Linux); and a pending call had no terminal path on daemon loss, reader
+  failure or cancellation (AUD-29-19, AUD-29-20). On macOS and Windows a daemon killed with nothing to
+  restart it still read "alive", because its bootstrap object outlives it.
+- The rule: the client's operations never wait. `begin` is one send attempt (refused `RingFull`,
+  `ChannelLost` or `Rebinding`); the rendezvous is a claim made at once and polled (`begin_connect_as` →
+  `Claim::poll`, `Client::begin_connect` → `Connecting::poll`); a reconnect is one step of that claim per
+  tick. `slates_client::driver` owns every async call from submission to its end: sent when the client
+  admits it, else queued (bounded; `TooManyOutstanding` past it); every call, sent or queued, has the reply
+  deadline from when it was sent or submitted; an overdue call fails `Stalled` while the daemon lives and
+  starts recovery when it is gone; recovery reconnects without waiting, resends each sent call under its own
+  id and restarts the queue's clocks, and past the reconnect budget fails every call `DaemonGone`; a reader
+  failure fails every call `CompletionLost`; a cancelled call is released. Both SDKs bind it: their event
+  loop's reader pumps it, one timer ticks it at the wake it asks for, and connect polls on that timer. The
+  client watches the daemon's process from the moment its claim is answered (`EVFILT_PROC`/`NOTE_EXIT` on
+  macOS, a `SYNCHRONIZE` handle on Windows; Linux reads its control socket), so a killed daemon is gone, not
+  stalled, while a stopped one stays a stall.
+- Evidence: the driver test (a ticker loop over overflow, restart, death and cancel; longest step under a
+  tenth of the reply deadline); the rendezvous test (every poll under a tenth of the claim wait, refused at
+  the claim wait); the exit-watch test (alive while stopped, exited once killed); and both SDKs' acceptance
+  tests over a real anchor and daemon (`SIGSTOP`, `SIGKILL`, restart, a lost reader or a cancel, death).
+- What it does not change: the synchronous client's behaviour (its facades wait over the same state
+  machines); the wire; R1–R10.
