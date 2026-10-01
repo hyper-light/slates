@@ -373,14 +373,49 @@ pub enum AttachForm {
     /// The mount point.
     path: String,
   },
+  /// A host mount presenting only one directory of the volume (§4.6 scoped exports; AUD-29-76): the
+  /// directory's inode, and the mount point once the kernel mount is bound.
+  ScopedMount {
+    /// The directory's inode number: the export's root.
+    scope: u64,
+    /// The mount point, once bound.
+    mount_point: Option<String>,
+  },
+  /// A Linux FUSE mount presenting only one directory of the volume (§4.6 scoped exports; AUD-29-76): ended by
+  /// recovery as a `FuseMount` is, held to its directory as a `ScopedMount` is.
+  ScopedFuseMount {
+    /// The mount point.
+    path: String,
+    /// The directory's inode number: the mount's root.
+    scope: u64,
+  },
 }
 
 impl AttachForm {
   /// The host mount point a mounted form names: a chosen-path host mount's or a FUSE mount's.
   pub fn mount_point(&self) -> Option<&str> {
     match self {
-      Self::ChosenPath { path } | Self::FuseMount { path } => Some(path),
+      Self::ChosenPath { path } | Self::FuseMount { path } | Self::ScopedFuseMount { path, .. } => {
+        Some(path)
+      }
+      Self::ScopedMount { mount_point, .. } => mount_point.as_deref(),
       Self::Root | Self::Oci { .. } => None,
+    }
+  }
+
+  /// The directory a scoped mount presents, if this form is one.
+  pub fn scope(&self) -> Option<u64> {
+    match self {
+      Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
+      _ => None,
+    }
+  }
+
+  /// The mount point of a FUSE form (whole or scoped): a mount the daemon's own process holds, so it ends with it.
+  pub fn fuse_mount_point(&self) -> Option<&str> {
+    match self {
+      Self::FuseMount { path } | Self::ScopedFuseMount { path, .. } => Some(path),
+      _ => None,
     }
   }
 }

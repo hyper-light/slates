@@ -17,6 +17,7 @@
 
 pub mod appledouble;
 pub mod authority;
+pub mod scoped;
 pub mod volume_bridge;
 
 pub use authority::{
@@ -403,6 +404,13 @@ pub trait Bridge {
   /// calls this once when an attachment ends — a FUSE unmount, a lost connection — since FUSE does
   /// not guarantee a `FORGET` per outstanding reference. Idempotent.
   fn sweep_attachment(&mut self, cx: &OpContext) -> Result<(), VfsError>;
+
+  /// Whether `object` lies in the subtree of directory inode `scope` (§4.6 scoped exports; AUD-29-76): the
+  /// question a [`scoped::ScopedBridge`] asks of every object a request names. A bridge that cannot tell admits
+  /// only the scope itself — conservative, never wider.
+  fn within(&mut self, object: ObjectId, scope: u64, _cx: &OpContext) -> Result<bool, VfsError> {
+    Ok(object.inode == scope)
+  }
 
   /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
   /// "Extended attributes over NFSv3"): the `._owner_name` file a macOS NFSv3 client keeps

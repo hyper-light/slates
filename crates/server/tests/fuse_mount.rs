@@ -311,3 +311,95 @@ fn a_fenced_shards_fuse_mount_ends_with_the_daemon() {
     "the fenced shard's mount ended with the daemon"
   );
 }
+
+/// Lists `dir` through the kernel, sorted.
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn listed(dir: &str) -> Vec<String> {
+  let mut names: Vec<String> = std::fs::read_dir(dir)
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+    .collect();
+  names.sort();
+  names
+}
+
+/// Through the whole mount at `point`: `shared/g` holding `inside`, `private/secret` holding `hidden`.
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn shared_and_private(point: &str) {
+  std::fs::create_dir(format!("{point}/shared")).unwrap();
+  std::fs::create_dir(format!("{point}/private")).unwrap();
+  std::fs::write(format!("{point}/shared/g"), b"inside").unwrap();
+  std::fs::write(format!("{point}/private/secret"), b"hidden").unwrap();
+}
+
+/// AUD-29-76 (a subtree mount, Linux FUSE). Do: through a whole FUSE mount make `shared/g` and
+/// `private/secret`; attach `/shared` as a scoped FUSE mount at a second point; list and read it, write `h`
+/// through it; rename `shared` to `private/moved` through the whole mount and list the scoped mount again;
+/// attach a file as a subtree. Expect: the scoped mount's root is `shared` (`g` alone, then `g` and `h`; the
+/// write lands in `shared` as the whole mount sees it); after the rename it still presents the same
+/// directory, never `private` (the scope is the directory, not its path); a file is refused `NotDirectory`.
+/// Before 2026-10-01 the Linux mount presented the volume whole and `--subtree` was refused.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
+  if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
+    eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
+    return;
+  }
+  let profile = common::machine_profile();
+  let instance = format!("srv-fuse-scoped-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-fuse-scoped-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch(VOLUME)).unwrap();
+  let whole = target_dir();
+  client
+    .attach_fuse(volume, Intent::Write, &whole.path)
+    .unwrap();
+  shared_and_private(&whole.path);
+  let point = target_dir();
+  client
+    .attach_scoped_fuse(volume, Intent::Write, &point.path, "/shared")
+    .unwrap();
+  assert_eq!(listed(&point.path), ["g"]);
+  assert_eq!(
+    std::fs::read(format!("{}/g", point.path)).unwrap(),
+    b"inside"
+  );
+  std::fs::write(format!("{}/h", point.path), b"landed").unwrap();
+  assert_eq!(
+    std::fs::read(format!("{}/shared/h", whole.path)).unwrap(),
+    b"landed"
+  );
+  std::fs::rename(
+    format!("{}/shared", whole.path),
+    format!("{}/private/moved", whole.path),
+  )
+  .unwrap();
+  assert_eq!(
+    listed(&point.path),
+    ["g", "h"],
+    "the scope is the directory"
+  );
+  let file = target_dir();
+  let refused = client.attach_scoped_fuse(volume, Intent::Read, &file.path, "/private/secret");
+  assert!(
+    matches!(&refused, Err(ClientError::Refused(Refusal::BadRequest { reason })) if reason == "NotDirectory"),
+    "{refused:?}"
+  );
+  daemon.stop();
+  assert!(
+    mounted_at(&point.path).is_none(),
+    "the daemon's stop unmounted"
+  );
+}

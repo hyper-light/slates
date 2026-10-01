@@ -1147,3 +1147,91 @@ fn a_hard_link_outlives_the_removal_of_its_first_name() {
   assert_eq!(out, b"payload");
   bridge.release(oid(found.ino), &cx, fh).unwrap();
 }
+
+/// AUD-29-76 (a subtree export). Do: in a volume holding `shared/` (with `g`) and `private/` (with `secret`,
+/// linked into `shared` as `alias` before the scope existed), serve `shared` through a [`ScopedBridge`]; ask
+/// its root, list it, and name `private` and `secret` by handle — to read, to create in, to rename into, to link
+/// from. Expect: the root is `shared`, whose listing names `shared` as its own `..`; `g` is found and read; every
+/// request naming `private` or `secret` is `NotFound` and changes nothing; `alias`, homed outside, is neither
+/// listed nor found. The scope holds for every transport, all of which serve through this seam.
+/// The scoped-bridge fixture: `shared/` holding `g` ("shared bytes"), `private/` holding `secret`, linked into
+/// `shared` as `alias` before any scope existed. The directories' and `secret`'s inode numbers.
+fn shared_and_private(inner: &mut VolumeBridge<'_>, cx: &OpContext) -> (u64, u64, u64) {
+  let root = inner.root(cx).unwrap();
+  let shared = inner.mkdir(oid(root), cx, "shared", 0o755).unwrap().ino;
+  let private = inner.mkdir(oid(root), cx, "private", 0o700).unwrap().ino;
+  let (g, fh) = inner.create(oid(shared), cx, "g", 0o644, 0).unwrap();
+  inner.write(oid(g.ino), cx, 0, b"shared bytes").unwrap();
+  inner.release(oid(g.ino), cx, fh).unwrap();
+  let (secret, fh) = inner.create(oid(private), cx, "secret", 0o600, 0).unwrap();
+  inner.release(oid(secret.ino), cx, fh).unwrap();
+  inner
+    .link(oid(secret.ino), oid(shared), cx, "alias")
+    .unwrap();
+  (shared, private, secret.ino)
+}
+
+/// Every request naming `private` or `secret` through `scoped` is `NotFound`.
+fn assert_nothing_outside_is_reached(
+  scoped: &mut slates_bridge_core::scoped::ScopedBridge<'_>,
+  cx: &OpContext,
+  (shared, private, secret): (u64, u64, u64),
+) {
+  assert_eq!(
+    scoped.lookup(oid(shared), cx, "alias"),
+    Err(VfsError::NotFound)
+  );
+  assert_eq!(scoped.getattr(oid(private), cx), Err(VfsError::NotFound));
+  assert_eq!(scoped.getattr(oid(secret), cx), Err(VfsError::NotFound));
+  assert!(matches!(
+    scoped.create(oid(private), cx, "planted", 0o644, 0),
+    Err(VfsError::NotFound)
+  ));
+  assert_eq!(
+    scoped.rename(
+      oid(shared),
+      oid(private),
+      cx,
+      "g",
+      "g",
+      RenameFlags::default()
+    ),
+    Err(VfsError::NotFound)
+  );
+  assert_eq!(
+    scoped.link(oid(secret), oid(shared), cx, "again"),
+    Err(VfsError::NotFound)
+  );
+}
+
+#[test]
+fn a_scoped_bridge_reaches_nothing_outside_its_directory() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, private, secret) = shared_and_private(&mut inner, &cx);
+  {
+    let mut scoped = ScopedBridge::new(&mut inner, shared);
+    assert_eq!(scoped.root(&cx).unwrap(), shared);
+    let listed = scoped.readdir(oid(shared), &cx, 0, 0, 64).unwrap();
+    let dotdot = listed.iter().find(|e| e.name == "..").unwrap();
+    assert_eq!(dotdot.ino, shared, "the scope is its own parent");
+    let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+      names.contains(&"g") && !names.contains(&"alias"),
+      "{names:?}"
+    );
+    let found = scoped.lookup(oid(shared), &cx, "g").unwrap();
+    let mut out = Vec::new();
+    scoped.read(oid(found.ino), &cx, 0, 64, &mut out).unwrap();
+    assert_eq!(out, b"shared bytes");
+    assert_nothing_outside_is_reached(&mut scoped, &cx, (shared, private, secret));
+  }
+  assert!(
+    inner.lookup(oid(private), &cx, "planted").is_err(),
+    "nothing was made outside"
+  );
+  assert!(inner.lookup(oid(shared), &cx, "g").is_ok(), "g stayed in");
+}

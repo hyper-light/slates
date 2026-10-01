@@ -248,7 +248,7 @@ slates submit WORK [--evidence HEX] [--json]
 slates rebase WORK [--json]
 slates advance ATTACHMENT [VERSION] [--json]
 slates read VOLUME PATH [--version N | --attachment A]
-slates mount ID PATH
+slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
 slates grants [--json]
@@ -293,7 +293,9 @@ drain's markers, the `chokepoints` registry with each chokepoint's `fresh`/`late
 `expected`, and the `spans` with their `request`, `trace`, `span` and `cause` identities), exactly what
 the text form prints and the MCP `slates.status` tool returns.
 `slates mount ID PATH` mounts the volume at an existing user-owned directory over the loopback
-NFS bridge; `slates unmount PATH` removes it. `slates mcp` serves the MCP tools over stdio, or
+NFS bridge (FUSE on Linux); `slates unmount PATH` removes it. `--subtree DIR` presents only that
+directory of the volume: it is the mount's root, and nothing outside it can be reached through the mount,
+not even by a handle made by hand. A subtree that is a file or does not exist is refused, and nothing is mounted. `slates mcp` serves the MCP tools over stdio, or
 loopback Streamable HTTP with `--http PORT` (macOS and Linux). The HTTP edge serves one endpoint,
 `http://127.0.0.1:PORT/mcp`, and prints a bearer token on the terminal when it starts; the agent sends it
 as `Authorization: Bearer TOKEN` with `Content-Type: application/json` and `Host: 127.0.0.1:PORT`. A

@@ -833,6 +833,19 @@ impl Bridge for VolumeBridge<'_> {
       .sweep_attachment(self.store, cx.attachment.key())
   }
 
+  fn within(&mut self, object: ObjectId, scope: u64, cx: &OpContext) -> Result<bool, VfsError> {
+    self.authorize_read(cx)?;
+    // An AppleDouble sidecar's derived number stands for its owner's attributes: it is within when the owner is.
+    let no = InodeNo(object.inode);
+    let no = no.derived_from().unwrap_or(no);
+    match self.volume.within(self.store, no, InodeNo(scope)) {
+      Ok(within) => Ok(within),
+      // A number the volume no longer holds is in no scope.
+      Err(VfsError::NotFound) => Ok(false),
+      Err(e) => Err(e),
+    }
+  }
+
   fn flush(&mut self, _object: ObjectId, cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
     self.authorize_read(cx)?;
     // Nothing to force at this layer: the bytes are in the volume's live tree. Their survival across a

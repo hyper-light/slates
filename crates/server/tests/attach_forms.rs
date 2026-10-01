@@ -766,3 +766,142 @@ fn a_snapshot_host_mount_presents_the_snapshot_again_after_a_restart() {
   second.stop();
   drop(segment);
 }
+
+/// Attaches the subtree `subtree` of `volume` (named `name`) as a host mount: its capability path.
+#[cfg(unix)]
+fn scoped_mount(client: &mut Client, volume: VolumeId, subtree: &str, name: &str) -> String {
+  let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = client.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::ScopedHostMount {
+      subtree: subtree.to_owned(),
+    },
+  })
+  else {
+    panic!("the subtree mount attaches");
+  };
+  let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+  format!("/{name}@{attachment:x}.{token_hex}")
+}
+
+/// The handle `fh` would be had the attachment that minted `capability_fh` minted it: the forgery a client of a
+/// scoped mount can make, since an object's number is no secret.
+#[cfg(unix)]
+fn forged(fh: &[u8], capability_fh: &[u8]) -> Vec<u8> {
+  use slates_bridge_nfs::handle::FileHandle;
+  use slates_bridge_nfs::nfs::Nfsfh3;
+  let target = FileHandle::from_fh(&Nfsfh3(fh.to_vec())).unwrap();
+  let capability = FileHandle::from_fh(&Nfsfh3(capability_fh.to_vec())).unwrap();
+  FileHandle {
+    attachment: capability.attachment,
+    token: capability.token,
+    ..target
+  }
+  .to_fh()
+  .0
+}
+
+/// AUD-29-76 (a subtree mount). Do: through the volume's own mount make `shared/g` (holding `inside`) and
+/// `private/secret`; attach `/shared` as a host mount; mount it, list and read its root, write a file, look up
+/// `..` at its root; forge handles to `private` and to the volume's root with the scoped capability and ask
+/// GETATTR, LOOKUP and READDIRPLUS through them; attach a file and a missing path as subtrees. Expect: the
+/// mount's root is `shared` (it lists `g`, reads `inside`, and the write lands in `shared` as the owner sees
+/// it); `..` at its root reaches nothing above it; every forged handle is refused (before 2026-10-01 a mount
+/// could present only the volume's root, so no subtree could be handed out at all); a file is refused
+/// `NotDirectory` and a missing path `NotFound`, with nothing attached.
+#[cfg(unix)]
+#[test]
+fn a_scoped_host_mount_reaches_nothing_outside_its_directory() {
+  let (daemon, instance) = single_shard_daemon("attach-forms-scoped-mount");
+  let Some(port) = daemon.nfs_port() else {
+    eprintln!("SKIP: the loopback export did not bind, so no host mount is offered here");
+    return;
+  };
+  let mut client = Client::connect(&instance);
+  let volume = create(&mut client, "scoped");
+  let owner_path = daemon.mount_capability("scoped").unwrap().unwrap();
+  let mut owner = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let owner_root = common::nfs::mount(&mut owner, &owner_path, 1);
+  let shared = common::nfs::mkdir(&mut owner, &owner_root, "shared", 2);
+  let private = common::nfs::mkdir(&mut owner, &owner_root, "private", 3);
+  let secret = common::nfs::create(&mut owner, &private, "secret", 4);
+  common::nfs::write(&mut owner, &secret, b"hidden", 5);
+  let inside = common::nfs::create(&mut owner, &shared, "g", 6);
+  common::nfs::write(&mut owner, &inside, b"inside", 7);
+
+  let path = scoped_mount(&mut client, volume, "/shared", "scoped");
+  let mut scoped = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut scoped, &path, 1);
+  assert_eq!(
+    common::nfs::readdirplus(&mut scoped, &root, 2),
+    [".", "..", "g"]
+  );
+  assert_eq!(read_through_the_mount(port, &path, "g"), b"inside");
+  let written = common::nfs::create(&mut scoped, &root, "h", 3);
+  common::nfs::write(&mut scoped, &written, b"landed", 4);
+  let seen = common::nfs::lookup(&mut owner, &shared, "h", 8);
+  assert_eq!(common::nfs::read(&mut owner, &seen, 9), b"landed");
+  if let Ok(above) = common::nfs::lookup_status(&mut scoped, &root, "..", 5) {
+    assert_eq!(
+      common::nfs::readdirplus(&mut scoped, &above, 6),
+      [".", "..", "g", "h"],
+      "`..` at the mount's root is the root itself"
+    );
+  }
+
+  assert_forged_handles_are_refused(&mut scoped, &root, [&private, &secret, &owner_root]);
+  assert_a_subtree_must_be_a_directory(&mut client, volume);
+  drop(client);
+  drop(daemon);
+}
+
+/// Every handle in `outside` (private, its secret, the volume's root), forged with the scoped mount's capability
+/// (`root`), is refused by GETATTR, LOOKUP and READ alike.
+#[cfg(unix)]
+fn assert_forged_handles_are_refused(
+  scoped: &mut std::net::TcpStream,
+  root: &[u8],
+  outside: [&Vec<u8>; 3],
+) {
+  let [private, secret, _] = outside;
+  for handle in outside {
+    let forgery = forged(handle, root);
+    assert!(
+      common::nfs::owner_and_mode_status(scoped, &forgery, 7).is_err(),
+      "GETATTR of a handle outside the subtree is refused"
+    );
+  }
+  assert!(common::nfs::lookup_status(scoped, &forged(private, root), "secret", 8).is_err());
+  assert_ne!(
+    common::nfs::read_status(scoped, &forged(secret, root), 9),
+    0,
+    "READ of a file outside the subtree is refused"
+  );
+}
+
+/// A subtree naming a file is refused `NotDirectory` and one naming nothing `NotFound`, with nothing attached.
+#[cfg(unix)]
+fn assert_a_subtree_must_be_a_directory(client: &mut Client, volume: VolumeId) {
+  for (subtree, expected) in [("/shared/g", "NotDirectory"), ("/absent", "NotFound")] {
+    let refused = client.call(&RequestBody::Attach {
+      volume,
+      snapshot: None,
+      intent: Intent::Read,
+      form: AttachRequest::ScopedHostMount {
+        subtree: subtree.to_owned(),
+      },
+    });
+    let ReplyBody::Refused { refusal, .. } = refused else {
+      panic!("{subtree} attached: {refused:?}");
+    };
+    assert!(
+      format!("{refusal:?}").contains(expected),
+      "{subtree}: {refusal:?}"
+    );
+  }
+}

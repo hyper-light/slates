@@ -210,6 +210,8 @@ pub(crate) enum Verb {
     /// A read-only mount: a read attachment (no write lease taken, a read-only capability) and a
     /// read-only kernel mount.
     read_only: bool,
+    /// `--subtree DIR`: present only that directory of the volume (AUD-29-76), the export enforcing the scope.
+    subtree: Option<String>,
   },
   /// Unmount a loopback bridge mount at a path (`unmount PATH`).
   Unmount {
@@ -522,6 +524,7 @@ pub(crate) struct OciCheck {
 /// Every flag that takes a value, across the verbs.
 const VALUES: &[&str] = &[
   "--join-group",
+  "--subtree",
   "--confirm",
   "--instance",
   "--shards",
@@ -1221,7 +1224,7 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     }
     ["mount", id, path] => {
       taken.only(&Spec {
-        values: &[],
+        values: &["--subtree"],
         switches: &["--read-only"],
       })?;
       Ok(client(
@@ -1230,10 +1233,13 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
           volume: volume(id)?,
           path: (*path).to_owned(),
           read_only: taken.switch("--read-only"),
+          subtree: taken.value("--subtree").map(str::to_owned),
         },
       ))
     }
-    ["mount", ..] => Err(ParseError::Missing("mount ID PATH [--read-only]")),
+    ["mount", ..] => Err(ParseError::Missing(
+      "mount ID PATH [--read-only] [--subtree DIR]",
+    )),
     ["unmount", path] => {
       taken.only(&NONE)?;
       Ok(client(

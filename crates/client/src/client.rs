@@ -76,7 +76,7 @@ pub fn defers_reply(body: &RequestBody) -> bool {
     body,
     RequestBody::Land { grant: Some(_), .. }
       | RequestBody::Attach {
-        form: AttachRequest::FuseMount { .. },
+        form: AttachRequest::FuseMount { .. } | AttachRequest::ScopedFuseMount { .. },
         ..
       }
   )
@@ -1999,6 +1999,25 @@ impl Client {
     self.attach_with(volume, None, intent, AttachRequest::HostMount)
   }
 
+  /// Attaches for a host kernel mount presenting only directory `subtree` of `volume` (§4.6 scoped exports;
+  /// AUD-29-76): the attachment is the mount's, as [`Client::attach_mount`]'s, and its capability reaches
+  /// nothing outside that directory — the export's root is it and `..` there is itself, on every request.
+  pub fn attach_scoped_mount(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    subtree: &str,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::ScopedHostMount {
+        subtree: subtree.to_owned(),
+      },
+    )
+  }
+
   /// Attaches a Linux FUSE mount of `volume` at `mount_point` (§4.6 "Linux"; AUD-29-64): the daemon mounts
   /// through the OS's `fusermount3` and serves the mount on the volume's owner shard; the reply comes once
   /// the mount is established (waited for while the daemon lives, as a granted landing's is), with the
@@ -2016,6 +2035,27 @@ impl Client {
       intent,
       AttachRequest::FuseMount {
         mount_point: mount_point.to_owned(),
+      },
+    )
+  }
+
+  /// Attaches a Linux FUSE mount at `mount_point` presenting only the directory `subtree` of `volume` (§4.6
+  /// scoped exports; AUD-29-76): an `attach_fuse` whose root is that directory and which reaches nothing
+  /// outside it. Refused typed when `subtree` names nothing or no directory, or where FUSE is not offered.
+  pub fn attach_scoped_fuse(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    mount_point: &str,
+    subtree: &str,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::ScopedFuseMount {
+        mount_point: mount_point.to_owned(),
+        subtree: subtree.to_owned(),
       },
     )
   }

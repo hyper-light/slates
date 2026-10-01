@@ -3316,3 +3316,94 @@ fn a_containers_identity_reaches_the_export_as_its_profile_states() {
   drop(mount_point);
   drop(anchor);
 }
+
+/// Whether a live kernel mount runs here: macOS's NFS-loopback mount or Linux's FUSE mount, each gated as its
+/// own flow is (`SLATES_TEST_CLI=1`, the host's mount mechanism present); a loud skip otherwise.
+fn live_mount_runs() -> bool {
+  #[cfg(target_os = "linux")]
+  {
+    linux_fuse_mount_runs()
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    if std::env::var_os("SLATES_TEST_CLI").is_none() || !mount_nfs_available() {
+      eprintln!("SKIP: a live mount needs SLATES_TEST_CLI=1 and mount_nfs");
+      return false;
+    }
+    true
+  }
+}
+
+/// Runs `script` under `sh` and returns its standard output, failing the test if it fails.
+fn shell(script: &str) -> String {
+  let out = Command::new("sh").args(["-c", script]).output().unwrap();
+  assert!(
+    out.status.success(),
+    "{script}: {}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
+/// mount a volume whole and make `shared/g` and `private/secret` through it; `slates mount ID DIR --subtree
+/// /shared`; list and read the scoped mount, write `h` through it, then unmount both. Expect: the scoped mount
+/// lists `g` alone and serves its bytes, the write lands in `shared` as the whole mount sees it, `private` is
+/// nowhere beneath it; `--subtree` naming a file is refused, nothing mounted. Runs over macOS's NFS mount
+/// and Linux's FUSE mount alike; before 2026-10-01 no mount could present less than the whole volume.
+#[test]
+fn slates_mount_subtree_presents_one_directory_of_the_volume() {
+  if !live_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-subtree-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "scoped", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let whole = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, err) = run(&instance, &["mount", &id, &whole.path]);
+  assert_eq!(code, 0, "slates mount: {err}");
+  let root = &whole.path;
+  shell(&format!(
+    "mkdir {root}/shared {root}/private && printf inside > {root}/shared/g && printf hidden > {root}/private/secret"
+  ));
+  let scoped = MountPoint {
+    path: fresh_mount_point(),
+  };
+  the_subtree_mount_presents_shared(&instance, &id, &scoped.path, root);
+  let refused = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let (code, _, _) = run(
+    &instance,
+    &["mount", &id, &refused.path, "--subtree", "/private/secret"],
+  );
+  assert_ne!(code, 0, "a file is no subtree");
+  assert!(!is_mounted(&refused.path), "nothing was mounted");
+  for point in [&scoped.path, &whole.path] {
+    let (code, _, err) = run(&instance, &["unmount", point]);
+    assert_eq!(code, 0, "slates unmount: {err}");
+  }
+  drop(refused);
+  drop(scoped);
+  drop(whole);
+  drop(anchor);
+}
+
+/// `slates mount ID INNER --subtree /shared` mounts `shared` alone: it lists `g`, serves its bytes, and a write
+/// through it lands in `shared` as the whole mount at `root` sees it.
+fn the_subtree_mount_presents_shared(instance: &str, id: &str, inner: &str, root: &str) {
+  let (code, out, err) = run(instance, &["mount", id, inner, "--subtree", "/shared"]);
+  assert_eq!(code, 0, "slates mount --subtree: {err}");
+  assert_eq!(value_of(&out, "mounted"), inner);
+  assert_eq!(shell(&format!("ls -A {inner}")), "g\n");
+  assert_eq!(shell(&format!("cat {inner}/g")), "inside");
+  shell(&format!("printf landed > {inner}/h"));
+  assert_eq!(shell(&format!("cat {root}/shared/h")), "landed");
+}

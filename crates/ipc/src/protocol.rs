@@ -1495,6 +1495,42 @@ pub enum AttachRequest {
     /// The mount point, canonical.
     mount_point: String,
   },
+  /// A host mount presenting only one directory of the volume (§4.6 scoped exports; AUD-29-76): the export's
+  /// root is that directory, `..` there is itself, and no handle reaches outside it — enforced by the export
+  /// on every request, so a symbolic link swapped in after the attach changes nothing. Recorded by the
+  /// directory's inode, so a later rename of it does not change what the mount presents.
+  ScopedHostMount {
+    /// The directory, as a path from the volume's root.
+    subtree: String,
+  },
+  /// A Linux FUSE mount at `mount_point` presenting only one directory of the volume (§4.6 scoped exports;
+  /// AUD-29-76): a `FuseMount` whose root is that directory, held to it as a `ScopedHostMount` is.
+  ScopedFuseMount {
+    /// The mount point, canonical.
+    mount_point: String,
+    /// The directory, as a path from the volume's root.
+    subtree: String,
+  },
+}
+
+impl AttachRequest {
+  /// The mount point of a FUSE form (whole or scoped), which the daemon itself mounts.
+  pub fn fuse_mount_point(&self) -> Option<&str> {
+    match self {
+      Self::FuseMount { mount_point } | Self::ScopedFuseMount { mount_point, .. } => {
+        Some(mount_point)
+      }
+      _ => None,
+    }
+  }
+
+  /// The directory a scoped form presents, as a path from the volume's root.
+  pub fn subtree(&self) -> Option<&str> {
+    match self {
+      Self::ScopedHostMount { subtree } | Self::ScopedFuseMount { subtree, .. } => Some(subtree),
+      _ => None,
+    }
+  }
 }
 
 /// What an attach established (§4.4 "establish the path or device, then publish `Bound`").

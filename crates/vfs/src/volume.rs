@@ -926,6 +926,37 @@ impl Volume {
     Ok(node.parent.unwrap_or(dir_no))
   }
 
+  /// Whether inode `no` lies in the subtree of directory `scope` in the head (§4.6 scoped exports; AUD-29-76):
+  /// `scope` itself; a directory whose chain of parents reaches `scope`; a file, symlink or special node whose
+  /// home directory does. A node with no home, or homed outside the scope though another name of it hangs
+  /// inside, is not within — conservative, since a node's other names cannot be enumerated without a walk.
+  /// The walk climbs at most the volume's live inodes (a chain longer than that is not a tree), so it is
+  /// bounded whatever the tree's shape.
+  pub fn within(&self, store: &Store, no: InodeNo, scope: InodeNo) -> Result<bool, VfsError> {
+    if no == scope {
+      return Ok(true);
+    }
+    let mut current = match self.current_dir(store, no) {
+      Ok(_) => no,
+      Err(VfsError::NotDirectory) => match self.inode(store, no)?.home {
+        Some(home) => home.parent,
+        None => return Ok(false),
+      },
+      Err(e) => return Err(e),
+    };
+    for _ in 0..=self.live_inodes {
+      if current == scope {
+        return Ok(true);
+      }
+      let parent = self.parent_no(store, current)?;
+      if parent == current {
+        return Ok(false);
+      }
+      current = parent;
+    }
+    Ok(false)
+  }
+
   /// The mutation version of inode `no`: a per-inode counter the journal records that increases on
   /// every change to the object (`touch_dir` bumps a directory's on every entry insert or remove).
   /// A transport that must detect a change between two calls — an NFS `READDIR` continuation whose

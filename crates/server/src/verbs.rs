@@ -4384,6 +4384,10 @@ fn attach(
     Ok(consumer) => consumer,
     Err(refusal) => return refused(refusal),
   };
+  let scope = match scope_of(state, volume, &form) {
+    Ok(scope) => scope,
+    Err(refusal) => return refused(refusal),
+  };
   let borrows_mount = binding.is_some();
   let now = state.clock.monotonic_ns();
   let lease_epoch = match lease_for(state, &record, principal, intent, now) {
@@ -4419,12 +4423,12 @@ fn attach(
     volume: record.id,
     consumer,
     snapshot: snapshot.map(to_db_snapshot),
-    form: recorded_form(&form, db_form),
+    form: recorded_form(&form, db_form, scope),
     principal: principal.clone(),
     rights: granted_rights(rights, intent),
     token,
   };
-  if matches!(form, AttachRequest::FuseMount { .. }) {
+  if form.fuse_mount_point().is_some() {
     return defer_fuse_attach(
       state,
       attachment_record,
@@ -4509,11 +4513,9 @@ fn lease_for(
 /// A FUSE mount point's checks, before any effect (`crate::fuse::check_mount_point`).
 #[cfg(target_os = "linux")]
 fn check_fuse_mount_point(form: &AttachRequest, principal: &Principal) -> Result<(), Refusal> {
-  match form {
-    AttachRequest::FuseMount { mount_point } => {
-      crate::fuse::check_mount_point(mount_point, principal)
-    }
-    _ => Ok(()),
+  match form.fuse_mount_point() {
+    Some(mount_point) => crate::fuse::check_mount_point(mount_point, principal),
+    None => Ok(()),
   }
 }
 
@@ -4539,12 +4541,48 @@ fn capability_token(borrows_mount: bool) -> Result<[u8; 16], Refusal> {
 
 /// The form an attachment is recorded under: a FUSE mount's is its chosen path (the mount point); every other
 /// form's is the one its establishment named.
-fn recorded_form(form: &AttachRequest, established: AttachForm) -> AttachForm {
-  match form {
-    AttachRequest::FuseMount { mount_point } => AttachForm::FuseMount {
+fn recorded_form(form: &AttachRequest, established: AttachForm, scope: Option<u64>) -> AttachForm {
+  match (form, scope) {
+    (AttachRequest::FuseMount { mount_point }, _) => AttachForm::FuseMount {
       path: mount_point.clone(),
     },
+    (AttachRequest::ScopedHostMount { .. }, Some(scope)) => AttachForm::ScopedMount {
+      scope,
+      mount_point: None,
+    },
+    (AttachRequest::ScopedFuseMount { mount_point, .. }, Some(scope)) => {
+      AttachForm::ScopedFuseMount {
+        path: mount_point.clone(),
+        scope,
+      }
+    }
     _ => established,
+  }
+}
+
+/// The directory inode a scoped host mount presents: `subtree`, resolved from the volume's root in its head
+/// (§4.6 scoped exports; AUD-29-76). Refused typed, before any effect, when the path names nothing or no
+/// directory; `None` for every other form.
+fn scope_of(
+  state: &ShardState,
+  volume: VolumeId,
+  form: &AttachRequest,
+) -> Result<Option<u64>, Refusal> {
+  let Some(subtree) = form.subtree() else {
+    return Ok(None);
+  };
+  let handle = *state
+    .by_id
+    .get(&to_db_volume(volume))
+    .ok_or(Refusal::NotFound)?;
+  let slot = state.volumes.get(handle).map_err(|_| Refusal::NotFound)?;
+  let located = slot
+    .volume
+    .resolve(&state.store, subtree)
+    .map_err(|e| refusal_of_vfs(&e))?;
+  match located.child {
+    slates_vfs::dir::Child::Dir(_) => Ok(Some(located.inode.0)),
+    _ => Err(refusal_of_vfs(&slates_vfs::VfsError::NotDirectory)),
   }
 }
 
@@ -4619,7 +4657,10 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
 pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consumer, Refusal> {
   match form {
-    AttachRequest::HostMount | AttachRequest::FuseMount { .. } => Ok(Consumer::Bridge),
+    AttachRequest::HostMount
+    | AttachRequest::FuseMount { .. }
+    | AttachRequest::ScopedHostMount { .. }
+    | AttachRequest::ScopedFuseMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
@@ -4661,8 +4702,17 @@ fn establish_form(
     // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
     // and nothing of the daemon's touches the mount table).
     AttachRequest::Root => return Ok(None),
-    // The host mount presents the live head, never a snapshot: attaching one for a snapshot would show the
-    // head where the snapshot is asked for (AUD-29-76).
+    // A scoped host mount presents the live head beneath one directory; a snapshot of a subtree is not
+    // presented (its scope and its version would both have to hold through one view).
+    AttachRequest::ScopedHostMount { .. } => {
+      if snapshot.is_some() {
+        return Err(Refusal::AttachmentUnsupported {
+          transport: AttachTransport::NfsLoopback,
+          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+        });
+      }
+      return Ok(None);
+    }
     // A host mount of a snapshot presents the attachment's own read-only view of it (`crate::snapshot_view`),
     // never the head (AUD-29-76): only a read may attach one, since a snapshot is immutable.
     AttachRequest::HostMount => {
@@ -4675,7 +4725,7 @@ fn establish_form(
       return Ok(None);
     }
     // A FUSE mount (§4.6 "Linux"; AUD-29-64): offered where the host has FUSE, presenting the live head.
-    AttachRequest::FuseMount { .. } => {
+    AttachRequest::FuseMount { .. } | AttachRequest::ScopedFuseMount { .. } => {
       if let Some(reason) = crate::transports::fuse(situation).unsupported_reason {
         return Err(Refusal::AttachmentUnsupported {
           transport: AttachTransport::Fuse,
@@ -7316,8 +7366,8 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     .attachments_of(record.id)
     .iter()
     .filter(|a| {
-      if let AttachForm::FuseMount { path } = &a.form {
-        state.stale_fuse_mounts.push((a.id, path.clone()));
+      if let Some(path) = a.form.fuse_mount_point() {
+        state.stale_fuse_mounts.push((a.id, path.to_owned()));
         return true;
       }
       matches!(a.consumer, Consumer::Sdk { .. })

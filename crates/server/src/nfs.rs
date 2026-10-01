@@ -306,6 +306,12 @@ fn with_export<R>(
   if s.nfs_v4_files.is_none() {
     s.nfs_v4_files = crate::nfs_state::file_state(s);
   }
+  // A scoped mount presents one directory: its bridge answers nothing outside it (AUD-29-76).
+  let scope = s
+    .db
+    .partition()
+    .attachment(capability.0)
+    .and_then(|record| record.form.scope());
   let ShardState {
     store,
     volumes,
@@ -330,7 +336,15 @@ fn with_export<R>(
     }
   };
   attachments.begin(admitted).ok()?;
-  let mut export = Export::over(&mut bridge, volume, subject, attachments, admitted);
+  let mut scoped;
+  let served: &mut dyn slates_bridge_core::Bridge = match scope {
+    Some(scope) => {
+      scoped = slates_bridge_core::scoped::ScopedBridge::new(&mut bridge, scope);
+      &mut scoped
+    }
+    None => &mut bridge,
+  };
+  let mut export = Export::over(served, volume, subject, attachments, admitted);
   export.set_groups(groups);
   export.set_dialect(dialect);
   // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
@@ -639,7 +653,14 @@ fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
       .attachments_of(volume)
       .into_iter()
       .filter_map(|record| match (&record.consumer, &record.form) {
-        (Consumer::Bridge, AttachForm::ChosenPath { path }) => Some((record.id, path.clone())),
+        (Consumer::Bridge, AttachForm::ChosenPath { path })
+        | (
+          Consumer::Bridge,
+          AttachForm::ScopedMount {
+            mount_point: Some(path),
+            ..
+          },
+        ) => Some((record.id, path.clone())),
         _ => None,
       })
       .collect()

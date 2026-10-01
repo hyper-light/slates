@@ -1914,6 +1914,13 @@ must exercise local communication and isolation between clones as well as namesp
 > attachment or the volume's destroy, and is rebuilt at restart. A container bind of it is read-only and binds
 > only to a mount presenting that snapshot. Subtree exports are owed; their scope must be enforced by the export.
 
+> **Status (2026-10-01, AUD-29-76: subtree exports).** A host mount may present one directory of its volume
+> (`slates mount ID DIR --subtree DIR`; NFS on macOS, FUSE on Linux). The export enforces the scope: the
+> directory is the root and its own `..`, and every handle outside it is answered `NotFound`, forged ones included.
+> The scope is recorded by the directory's inode, so a rename neither widens it nor moves it. A subtree naming a
+> file or nothing is refused before any effect, and a snapshot of a subtree is refused typed. An `advance` of a
+> mounted snapshot view is owed.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

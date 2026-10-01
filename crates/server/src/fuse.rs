@@ -34,8 +34,9 @@
 
 use std::collections::BTreeMap;
 
+use slates_bridge_core::scoped::ScopedBridge;
 use slates_bridge_core::volume_bridge::new_handle_store;
-use slates_bridge_core::{AttachmentId, Rights, View, VolumeBridge};
+use slates_bridge_core::{AttachmentId, Bridge, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
   Dispatched, FuseChannel, Sent, ServeState, Turn, dispatch_ready, reclaim_dispatched, send_reply,
 };
@@ -43,7 +44,7 @@ use slates_bridge_fuse::mount::{
   Awaiting, Mount, MountError, PendingExit, Progress, begin_mount, begin_unmount,
 };
 use slates_db::Op;
-use slates_db::catalog::{AttachForm, AttachmentRecord, Principal, VolumeId};
+use slates_db::catalog::{AttachmentRecord, Principal, VolumeId};
 use slates_ipc::protocol::{AttachmentCapability, Established, Refusal, ReplyBody};
 use slates_mem::slab::Slab;
 use slates_rt::futures;
@@ -80,6 +81,8 @@ pub(crate) struct FuseMount {
   registry: AttachmentId,
   volume: VolumeId,
   mount_point: String,
+  /// The directory a scoped mount presents (AUD-29-76): its bridge answers nothing outside it.
+  scope: Option<u64>,
 }
 
 impl std::fmt::Debug for FuseMount {
@@ -163,10 +166,12 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
   let deadline_ns = state.config.failover_slo_ns;
   let shard = state.shard;
   let task = async move {
-    let mount_point = match &pending.record.form {
-      AttachForm::FuseMount { path } => path.clone(),
-      _ => String::new(),
-    };
+    let mount_point = pending
+      .record
+      .form
+      .fuse_mount_point()
+      .unwrap_or_default()
+      .to_owned();
     let mounted =
       mount_without_blocking(&mount_point, &fsname_of(pending.record.id), deadline_ns).await;
     let _ = state::with_state(move |s| {
@@ -319,6 +324,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       registry,
       volume,
       mount_point: mount_point.clone(),
+      scope: pending.record.form.scope(),
     },
   );
   if futures::spawn(serve(attachment))
@@ -450,9 +456,10 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       &mut mount.handles,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
     );
+    let mut scoped = None;
     dispatch_ready(
       &mut mount.channel,
-      &mut bridge,
+      scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
       attachments,
       mount.registry,
       &mut mount.serve,
@@ -471,6 +478,19 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
   };
   s.fuse_mounts.insert(attachment, mount);
   turned
+}
+
+/// The bridge a mount's requests are served through: held to `scope` when the mount presents one directory
+/// (AUD-29-76), else the volume's whole bridge. `scoped` is the caller's slot the scoped bridge lives in.
+fn scoped_or_whole<'a>(
+  bridge: &'a mut VolumeBridge<'_>,
+  scoped: &'a mut Option<ScopedBridge<'a>>,
+  scope: Option<u64>,
+) -> &'a mut dyn Bridge {
+  match scope {
+    Some(scope) => scoped.insert(ScopedBridge::new(bridge, scope)),
+    None => bridge,
+  }
 }
 
 /// Runs a dispatched request's barrier when it needs one, then writes its reply or `EIO`.
@@ -531,10 +551,11 @@ fn reclaim(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) {
     &mut mount.handles,
     slot.host.as_mut().map(|host| host as &mut dyn HostFs),
   );
+  let mut scoped = None;
   let reclaimed = reclaim_dispatched(
     &mount.serve,
     dispatched,
-    &mut bridge,
+    scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
     attachments,
     mount.registry,
   );

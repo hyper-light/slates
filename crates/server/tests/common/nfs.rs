@@ -211,6 +211,28 @@ pub(crate) fn create(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32
   read_opaque(&reply, 8).0
 }
 
+/// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
+pub(crate) fn mkdir(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name.as_bytes(), &mut args);
+  // sattr3: mode set to 0755, everything else unset, times unchanged.
+  args.extend_from_slice(&1u32.to_be_bytes()); // set_mode: yes
+  args.extend_from_slice(&0o755u32.to_be_bytes());
+  for _unset in 0..5 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size: no; atime, mtime: DONT_CHANGE
+  }
+  let reply = call(stream, NFS_PROGRAM, 9, &args, xid);
+  assert_eq!(status(&reply), 0, "MKDIR {name}");
+  // MKDIR3resok: obj (post_op_fh: follows bool, then the handle), then attributes and dir wcc.
+  assert_eq!(
+    u32::from_be_bytes(reply[4..8].try_into().unwrap()),
+    1,
+    "MKDIR returned a handle"
+  );
+  read_opaque(&reply, 8).0
+}
+
 /// NFS WRITE `data` at offset zero to `file_fh` (FILE_SYNC).
 pub(crate) fn write(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u32) {
   let mut args = Vec::new();

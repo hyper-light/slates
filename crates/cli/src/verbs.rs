@@ -133,7 +133,7 @@ fn mount_verb(
   instance: &str,
   volume: VolumeId,
   path: &str,
-  read_only: bool,
+  (read_only, subtree): (bool, Option<&str>),
 ) -> Result<(), Failure> {
   let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
   // The mount's own attachment (§4.6, §4.13): it outlives this process and a daemon restart, and
@@ -144,9 +144,11 @@ fn mount_verb(
   } else {
     Intent::Write
   };
-  let attachment = client
-    .attach_mount(volume, intent)
-    .map_err(|e| failure_of(e, instance))?;
+  let attachment = match subtree {
+    Some(subtree) => client.attach_scoped_mount(volume, intent, subtree),
+    None => client.attach_mount(volume, intent),
+  }
+  .map_err(|e| failure_of(e, instance))?;
   let Some(token) = attachment.token else {
     return Err(Failure::Refused(
       "the daemon issued no mount capability for this attachment; the volume cannot be mounted"
@@ -183,7 +185,7 @@ fn mount_verb(
   instance: &str,
   volume: VolumeId,
   path: &str,
-  read_only: bool,
+  (read_only, subtree): (bool, Option<&str>),
 ) -> Result<(), Failure> {
   let real = std::fs::canonicalize(path)
     .map_err(|e| Failure::Failed(format!("the mount point {path}: {e}")))?;
@@ -193,9 +195,12 @@ fn mount_verb(
   } else {
     Intent::Write
   };
-  let attachment = client
-    .attach_fuse(volume, intent, &real)
-    .map_err(|e| failure_of(e, instance))?;
+  // `--subtree` presents one directory of the volume, held to it by the daemon on every request (AUD-29-76).
+  let attachment = match subtree {
+    Some(subtree) => client.attach_scoped_fuse(volume, intent, &real, subtree),
+    None => client.attach_fuse(volume, intent, &real),
+  }
+  .map_err(|e| failure_of(e, instance))?;
   println!("mounted: {}", attachment.path.unwrap_or(real));
   Ok(())
 }
@@ -281,9 +286,16 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     volume,
     path,
     read_only,
+    subtree,
   } = &request.verb
   {
-    return mount_verb(&mut client, &request.instance, *volume, path, *read_only);
+    return mount_verb(
+      &mut client,
+      &request.instance,
+      *volume,
+      path,
+      (*read_only, subtree.as_deref()),
+    );
   }
   // A container bind names its host mount point by the real path the kernel records (`mount_nfs`
   // resolves symlinks; `mktemp -d` on macOS hands out a symlinked `/var/folders` path), so the source
