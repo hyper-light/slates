@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{SimDriver, context, message, reply_error, store, vid, volume};
+use common::{SimDriver, context, layout_at, message, reply_error, store, vid, volume};
 use slates_bridge_core::{Bridge, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::bridge::dispatch;
@@ -21,7 +21,7 @@ use slates_bridge_virtiofs::device::{
 };
 use slates_bridge_virtiofs::memory::{GuestMemory, GuestMemoryError, GuestRange};
 use slates_bridge_virtiofs::sim::SimGuestMemory;
-use slates_bridge_virtiofs::virtqueue::VirtqueueError;
+use slates_bridge_virtiofs::virtqueue::{VIRTQ_DESC_F_WRITE, VirtqueueError};
 
 /// Shape: the reply room posted for every request-queue request: 8 KiB holds any reply in the
 /// script (a 2 000-byte read, a 4 KiB readdir, the headers).
@@ -829,5 +829,87 @@ fn a_mutations_used_element_waits_for_the_owners_barrier() {
     device.counters().barriers_awaited,
     2,
     "only the two CREATEs waited"
+  );
+}
+
+/// Format: the descriptor table's alignment (virtio 1.2 §2.7, 16 bytes).
+const DESCRIPTOR_TABLE_ALIGN: u64 = 16;
+
+/// AUD-29-71. Do: configure a device whose driver gives both queues the same layout, then one whose request
+/// queue's descriptor table starts inside the high-priority queue's used ring. Expect: each refused
+/// `QueuesOverlap` naming the two queues, before any queue is served. Before, each queue was validated alone
+/// and both layouts were accepted.
+#[test]
+fn queues_sharing_ring_bytes_are_refused_at_configuration() {
+  let driver = SimDriver::new(&QUEUE_SIZES);
+  let first = driver.layout(0);
+  let mut device = Device::new(DeviceConfig::new(FsTag::new("slates").unwrap()));
+  let same = [first, layout_at(first.descriptor_table.0, QUEUE_SIZES[1])];
+  assert_eq!(
+    device.configure(&same, &driver.memory).unwrap_err(),
+    DeviceError::QueuesOverlap {
+      first: 0,
+      second: 1
+    }
+  );
+  // A descriptor table must be 16-byte aligned (§2.7); rounded down, the start still lies inside the first
+  // queue's rings.
+  let inside_used = layout_at(
+    first.used_ring.0 & !(DESCRIPTOR_TABLE_ALIGN - 1),
+    QUEUE_SIZES[1],
+  );
+  assert_eq!(
+    device
+      .configure(&[first, inside_used], &driver.memory)
+      .unwrap_err(),
+    DeviceError::QueuesOverlap {
+      first: 0,
+      second: 1
+    }
+  );
+}
+
+/// Shape: the reply room of the aliasing descriptor — any length that reaches into the other queue's table.
+const ALIASED_REPLY: u32 = 64;
+
+/// AUD-29-71. Do: post a GETATTR on the request queue whose writable descriptor points at the high-priority
+/// queue's descriptor table. Expect: the device refuses the chain before any access — the buffer aliases
+/// another queue's ring — and the high-priority queue's table is unchanged. Before, the reply was scattered
+/// over it.
+#[test]
+fn a_buffer_aliasing_another_queues_ring_is_refused_before_access() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let cx = context();
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let other_table = driver.layout(0).descriptor_table.0;
+  let before = driver.read_u32(other_table);
+  driver.submit(
+    rq,
+    &message(Opcode::GetAttr.to_wire(), 1, 1, &[0u8; 16]),
+    ALIASED_REPLY,
+    1,
+  );
+  // A fresh queue hands out descriptor 0 for the request and 1 for its reply room.
+  driver.descriptor(rq, 1, other_table, ALIASED_REPLY, VIRTQ_DESC_F_WRITE, 0);
+  let refused = serve(
+    &mut device,
+    FIRST_REQUEST_QUEUE,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    BATCH,
+  )
+  .unwrap_err();
+  assert_eq!(
+    refused,
+    DeviceError::Virtqueue(VirtqueueError::BufferOverlapsOtherQueue { at: 1 })
+  );
+  assert_eq!(
+    driver.read_u32(other_table),
+    before,
+    "the other queue's table is untouched"
   );
 }

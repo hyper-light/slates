@@ -270,6 +270,14 @@ pub enum DeviceError {
   TagHasNul,
   /// A service pass was asked for before the driver configured the queues.
   NotConfigured,
+  /// Two of the driver's queues share ring bytes (AUD-29-71): a used-ring publication on one would overwrite
+  /// the other's protocol state.
+  QueuesOverlap {
+    /// The first queue.
+    first: u16,
+    /// The second queue.
+    second: u16,
+  },
   /// The driver configured a different number of queues than the device publishes.
   QueueCountMismatch {
     /// Queues offered by the driver.
@@ -324,6 +332,9 @@ impl fmt::Display for DeviceError {
       }
       Self::TagHasNul => f.write_str("the tag contains a NUL byte"),
       Self::NotConfigured => f.write_str("the driver has not configured the queues"),
+      Self::QueuesOverlap { first, second } => {
+        write!(f, "queues {first} and {second} share ring bytes")
+      }
       Self::QueueCountMismatch { offered, required } => {
         write!(
           f,
@@ -434,6 +445,33 @@ impl Device {
     let mut queues = Vec::with_capacity(required);
     for layout in layouts {
       queues.push(Virtqueue::new(*layout, chain_caps(layout.size), memory)?);
+    }
+    // The device's queues are validated together (AUD-29-71): no ring of one queue may share a byte with a
+    // ring of another, and each queue refuses a buffer aliasing any other queue's rings as it refuses one
+    // aliasing its own.
+    for (first, queue) in queues.iter().enumerate() {
+      for (second, other) in queues.iter().enumerate().skip(first.saturating_add(1)) {
+        if queue
+          .rings()
+          .iter()
+          .any(|ring| other.rings().iter().any(|o| ring.overlaps(o)))
+        {
+          return Err(DeviceError::QueuesOverlap {
+            first: u16::try_from(first).unwrap_or(u16::MAX),
+            second: u16::try_from(second).unwrap_or(u16::MAX),
+          });
+        }
+      }
+    }
+    let all: Vec<[GuestRange; 3]> = queues.iter().map(|q| *q.rings()).collect();
+    for (index, queue) in queues.iter_mut().enumerate() {
+      let foreign = all
+        .iter()
+        .enumerate()
+        .filter(|(other, _)| *other != index)
+        .flat_map(|(_, rings)| rings.iter().copied())
+        .collect();
+      queue.guard_foreign_rings(foreign);
     }
     self.queues = queues;
     self.negotiated = None;

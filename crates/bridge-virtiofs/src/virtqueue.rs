@@ -277,6 +277,12 @@ pub enum VirtqueueError {
     /// The ring it aliases.
     ring: Ring,
   },
+  /// The buffer aliases a ring of another queue of the same device (AUD-29-71): a reply or a used-ring
+  /// publication would overwrite that queue's protocol state.
+  BufferOverlapsOtherQueue {
+    /// The descriptor.
+    at: u16,
+  },
   /// A device-readable descriptor follows a device-writable one (§2.7.4.2).
   ReadableAfterWritable {
     /// The offending descriptor.
@@ -366,6 +372,9 @@ impl fmt::Display for VirtqueueError {
       Self::BufferOverlapsRing { at, ring } => {
         write!(f, "descriptor {at}'s buffer aliases the {ring:?}")
       }
+      Self::BufferOverlapsOtherQueue { at } => {
+        write!(f, "descriptor {at}'s buffer aliases another queue's ring")
+      }
       Self::ReadableAfterWritable { at } => {
         write!(
           f,
@@ -414,6 +423,9 @@ const VISITED_WORD_BITS: u16 = 64;
 pub struct Virtqueue {
   layout: QueueLayout,
   rings: [GuestRange; 3],
+  /// The rings of the device's other queues (at most three per queue, set once at configuration), which no
+  /// buffer of this queue may alias either (AUD-29-71).
+  foreign_rings: Vec<GuestRange>,
   caps: ChainCaps,
   next_avail: u16,
   next_used: u16,
@@ -466,6 +478,7 @@ impl Virtqueue {
       next_used: 0,
       fault: None,
       visited: vec![0; words],
+      foreign_rings: Vec::new(),
       counters: VirtqueueCounters::default(),
     })
   }
@@ -725,6 +738,9 @@ impl Virtqueue {
         return Err(VirtqueueError::BufferOverlapsRing { at, ring: *ring });
       }
     }
+    if self.foreign_rings.iter().any(|ring| range.overlaps(ring)) {
+      return Err(VirtqueueError::BufferOverlapsOtherQueue { at });
+    }
     Ok(range)
   }
 
@@ -794,6 +810,19 @@ fn ring_range(
   let range = GuestRange::new(base, len).map_err(|_| outside.clone())?;
   memory.check(range).map_err(|_| outside)?;
   Ok(range)
+}
+
+impl Virtqueue {
+  /// The queue's three rings: the descriptor table, the available ring and the used ring.
+  pub fn rings(&self) -> &[GuestRange; 3] {
+    &self.rings
+  }
+
+  /// Records the rings of the device's other queues, so no buffer of this queue may alias them either
+  /// (AUD-29-71); the device sets it once, after it has checked every queue's rings pairwise.
+  pub fn guard_foreign_rings(&mut self, rings: Vec<GuestRange>) {
+    self.foreign_rings = rings;
+  }
 }
 
 /// The three rings must not share bytes.
