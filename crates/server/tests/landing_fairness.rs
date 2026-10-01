@@ -10,11 +10,12 @@
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use slates_client::{Filter, Intent, Landing};
+use slates_client::driver::{Begin, Driver, Event, Ticket};
+use slates_client::{Client, ClientError, Filter, Intent, Landing, VolumeId};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::landing::{approve, connect, scratch};
+use common::landing::{approve, connect, deadlines, scratch};
 use common::nfs::{create, mount, write};
 use common::target::target_dir;
 
@@ -78,11 +79,11 @@ fn quantile(samples: &mut [Duration], ppm: u64) -> Duration {
   samples[usize::try_from(rank).unwrap() - 1]
 }
 
-/// Writes `count` small files into the volume [`VOLUME`] through the daemon's NFS transport.
-fn write_files(daemon: &Daemon, count: usize) {
+/// Writes `count` small files into the volume `volume` through the daemon's NFS transport.
+fn write_files(daemon: &Daemon, volume: &str, count: usize) {
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let capability = daemon.mount_capability(VOLUME).unwrap().unwrap();
+  let capability = daemon.mount_capability(volume).unwrap().unwrap();
   let root = mount(&mut stream, &capability, 1);
   let mut xid = 2u32;
   for n in 0..count {
@@ -161,7 +162,7 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let volume = client.create(&scratch(VOLUME)).unwrap();
-  write_files(&daemon, FILES);
+  write_files(&daemon, VOLUME, FILES);
 
   let mut prober = connect(&instance);
   let leased = prober.create(&scratch(LEASED)).unwrap();
@@ -268,7 +269,7 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   let mut client = connect(&instance);
   let secret = daemon.segment().issuer_secret().unwrap();
   let volume = client.create(&scratch(VOLUME)).unwrap();
-  write_files(&daemon, FILES_PAST_TERM);
+  write_files(&daemon, VOLUME, FILES_PAST_TERM);
   let grant = approve(&mut client, &secret, volume, None, &target.path);
   let began = Instant::now();
   let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
@@ -290,4 +291,138 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
   assert_eq!(outcome.state, "done");
   assert_eq!(outcome.written, u64::try_from(FILES_PAST_TERM).unwrap());
   assert!(renewed >= 1, "the lease was renewed between slices");
+}
+
+/// Shape: the volume an impatient call lands beside the patient one.
+const IMPATIENT: &str = "impatient-landing";
+/// Shape: how long the loop waits for both landings to end: a minute, far past two landings measured at
+/// about 1.5 s each (`docs/wip/BENCHMARKS.md`, "The landing's percentile lane"), so a lost reply fails the test
+/// rather than hanging it.
+const BOTH_END_WITHIN: Duration = Duration::from_secs(60);
+
+/// How each call ended and when, on the loop's clock.
+type Ended = std::collections::BTreeMap<Ticket, (Duration, Result<Option<Landing>, ClientError>)>;
+
+/// A granted landing's begin, for the driver to send (and resend after a reconnect).
+fn land_begin(volume: VolumeId, target: String, grant: u64) -> Begin {
+  Box::new(move |client: &mut Client| {
+    client.land_begin(volume, None, &target, Filter::default(), Some(grant))
+  })
+}
+
+/// Runs an event loop over `driver` — pump, tick when the driver asks, end each call by its event — until
+/// every one of `tickets` has ended or [`BOTH_END_WITHIN`] passes, as an SDK's loop does.
+fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended {
+  let started = Instant::now();
+  let mut ended = Ended::new();
+  let mut next_tick = Instant::now();
+  while tickets.iter().any(|ticket| !ended.contains_key(ticket))
+    && started.elapsed() < BOTH_END_WITHIN
+  {
+    let mut events = driver.pump(client);
+    if Instant::now() >= next_tick {
+      events.extend(driver.tick(client));
+    }
+    for event in events {
+      match event {
+        Event::Ready { ticket, word } => {
+          let landed = client.land_poll(word);
+          driver.finish(ticket);
+          ended.insert(ticket, (started.elapsed(), landed));
+        }
+        Event::Failed { ticket, error } => {
+          ended.insert(ticket, (started.elapsed(), Err(error)));
+        }
+      }
+    }
+    next_tick = Instant::now()
+      + Duration::from_nanos(driver.next_wake_ns(client).unwrap_or(deadlines().reply_ns));
+    std::hint::spin_loop();
+  }
+  ended
+}
+
+/// The async driver's patient path (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
+/// to a landing still at work). Do: land two volumes of 1,500 files each under grants through one async
+/// driver, driven by an event loop as an SDK drives it — one call submitted patient (`submit_patient`, as both
+/// SDKs' `land` is), the other plain — both landings outlasting the reply deadline. Expect: the plain call
+/// ends `Stalled` at its deadline (the control: the landings did outlast it, so the patient flag is what this
+/// tests), and the patient call is waited for past it and ends with its landing done and every file written.
+#[test]
+fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-patientland-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-patientland-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let patient_volume = client.create(&scratch(VOLUME)).unwrap();
+  let impatient_volume = client.create(&scratch(IMPATIENT)).unwrap();
+  write_files(&daemon, VOLUME, FILES_PAST_TERM);
+  write_files(&daemon, IMPATIENT, FILES_PAST_TERM);
+  let (patient_target, impatient_target) = (target_dir(), target_dir());
+  let patient_grant = approve(
+    &mut client,
+    &secret,
+    patient_volume,
+    None,
+    &patient_target.path,
+  );
+  let impatient_grant = approve(
+    &mut client,
+    &secret,
+    impatient_volume,
+    None,
+    &impatient_target.path,
+  );
+
+  let mut driver = Driver::new(&client);
+  let patient = driver
+    .submit_patient(
+      &mut client,
+      land_begin(patient_volume, patient_target.path.clone(), patient_grant),
+    )
+    .unwrap();
+  let impatient = driver
+    .submit(
+      &mut client,
+      land_begin(
+        impatient_volume,
+        impatient_target.path.clone(),
+        impatient_grant,
+      ),
+    )
+    .unwrap();
+  let mut ended = drive(&mut client, &mut driver, &[patient, impatient]);
+  daemon.stop();
+
+  let reply = Duration::from_nanos(deadlines().reply_ns);
+  let (impatient_at, impatient_end) = ended.remove(&impatient).expect("the plain call ended");
+  let (patient_at, patient_end) = ended.remove(&patient).expect("the patient call ended");
+  eprintln!(
+    "reply deadline {reply:?}; plain call ended at {impatient_at:?}: {impatient_end:?}; patient call at {patient_at:?}"
+  );
+  assert!(
+    matches!(impatient_end, Err(ClientError::Stalled { .. })),
+    "the control: a plain call to a landing outlasting the deadline stalls: {impatient_end:?}"
+  );
+  assert!(
+    patient_at > reply,
+    "the patient landing outlasted the reply deadline ({patient_at:?})"
+  );
+  let Ok(Some(Landing::Landed(outcome))) = patient_end else {
+    panic!("the patient landing: {patient_end:?}");
+  };
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, u64::try_from(FILES_PAST_TERM).unwrap());
 }
