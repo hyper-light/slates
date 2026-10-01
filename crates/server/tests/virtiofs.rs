@@ -632,3 +632,432 @@ fn assert_the_snapshot_device_is_read_only(
   );
   assert_eq!(created, -EPERM, "a snapshot device writes nothing");
 }
+
+/// A vhost-user front end, as a VMM speaks it (the inherited-descriptor form; AUD-29-68): the protocol over one
+/// end of a socketpair, the guest's memory a sealed memory object, the kicks and calls eventfds. Linux only.
+#[cfg(target_os = "linux")]
+mod vhost_front_end {
+  #![allow(clippy::disallowed_methods)] // memory objects and eventfds: RAM, not a host path (R1).
+  use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+  use rustix::event::{EventfdFlags, PollFd, PollFlags, Timespec, eventfd, poll};
+  use rustix::net::{
+    AddressFamily, RecvAncillaryBuffer, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage,
+    SendFlags, SocketFlags, SocketType,
+  };
+  use slates_bridge_virtiofs::vhost_user::{
+    FLAG_NEED_REPLY, GuestRegions, HEADER_LEN, MappedRegion, OFFERED_FEATURES,
+    OFFERED_PROTOCOL_FEATURES, RegionEntry, VERSION, request,
+  };
+
+  use super::common::guest::{GUEST_RAM, Guest};
+
+  /// Shape: where the front end's own mapping of guest memory sits in its address space (any value: the
+  /// back end translates ring addresses from it).
+  pub(crate) const USER_BASE: u64 = 0x7f00_0000_0000;
+  /// Shape: how long the front end waits for one reply or one interrupt.
+  const WAIT_NS: i64 = 10_000_000_000;
+
+  /// A sealed memory object of the guest's RAM, or (with `seal` false) one that may still shrink.
+  pub(crate) fn guest_ram(seal: bool) -> OwnedFd {
+    use rustix::fs::{MemfdFlags, SealFlags};
+    let fd = rustix::fs::memfd_create("guest-ram", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)
+      .unwrap();
+    rustix::fs::ftruncate(&fd, GUEST_RAM).unwrap();
+    if seal {
+      rustix::fs::fcntl_add_seals(&fd, SealFlags::SHRINK | SealFlags::GROW).unwrap();
+    }
+    fd
+  }
+
+  /// The guest's driver over a second mapping of `ram`.
+  pub(crate) fn guest_over(ram: &OwnedFd) -> Guest<GuestRegions> {
+    let region = MappedRegion::map(region_entry(), ram).unwrap();
+    Guest::over(GuestRegions::new(vec![region]).unwrap())
+  }
+
+  fn region_entry() -> RegionEntry {
+    RegionEntry {
+      guest_phys: 0,
+      size: GUEST_RAM,
+      user_addr: USER_BASE,
+      offset: 0,
+    }
+  }
+
+  /// The front end: its socket, and per queue its kick and call eventfds.
+  pub(crate) struct FrontEnd {
+    socket: OwnedFd,
+    pub(crate) kicks: Vec<OwnedFd>,
+    pub(crate) calls: Vec<OwnedFd>,
+  }
+
+  /// A connected pair: the front end, and the end the daemon adopts.
+  pub(crate) fn pair() -> (FrontEnd, OwnedFd) {
+    let (ours, theirs) = rustix::net::socketpair(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap();
+    let eventfds = || {
+      (0..2)
+        .map(|_| eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK).unwrap())
+        .collect()
+    };
+    (
+      FrontEnd {
+        socket: ours,
+        kicks: eventfds(),
+        calls: eventfds(),
+      },
+      theirs,
+    )
+  }
+
+  impl FrontEnd {
+    fn send(&self, request: u32, flags: u32, payload: &[u8], fds: &[BorrowedFd<'_>]) {
+      let mut message = Vec::new();
+      message.extend_from_slice(&request.to_le_bytes());
+      message.extend_from_slice(&(VERSION | flags).to_le_bytes());
+      message.extend_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+      message.extend_from_slice(payload);
+      let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(8))];
+      let mut control = SendAncillaryBuffer::new(&mut space);
+      if !fds.is_empty() {
+        assert!(control.push(SendAncillaryMessage::ScmRights(fds)));
+      }
+      let sent = rustix::net::sendmsg(
+        &self.socket,
+        &[std::io::IoSlice::new(&message)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+      )
+      .unwrap();
+      assert_eq!(sent, message.len());
+    }
+
+    /// The next reply's payload, or `None` when the back end closed its end.
+    pub(crate) fn reply(&self) -> Option<Vec<u8>> {
+      let mut header = [0u8; HEADER_LEN];
+      if !self.read_exact(&mut header) {
+        return None;
+      }
+      let size = u32::from_le_bytes(header[8..12].try_into().unwrap());
+      let mut payload = vec![0u8; usize::try_from(size).unwrap()];
+      self.read_exact(&mut payload).then_some(payload)
+    }
+
+    fn read_exact(&self, out: &mut [u8]) -> bool {
+      let mut at = 0;
+      while at < out.len() {
+        let mut fds = [PollFd::new(&self.socket, PollFlags::IN)];
+        let timeout = Timespec {
+          tv_sec: WAIT_NS / 1_000_000_000,
+          tv_nsec: 0,
+        };
+        assert_eq!(
+          poll(&mut fds, Some(&timeout)).unwrap(),
+          1,
+          "a reply in time"
+        );
+        let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(1))];
+        let mut control = RecvAncillaryBuffer::new(&mut space);
+        let got = rustix::net::recvmsg(
+          &self.socket,
+          &mut [std::io::IoSliceMut::new(&mut out[at..])],
+          &mut control,
+          RecvFlags::CMSG_CLOEXEC,
+        );
+        match got {
+          Ok(received) if received.bytes > 0 => at += received.bytes,
+          _ => return false,
+        }
+      }
+      true
+    }
+
+    /// A `GET_*` request: its `u64` answer.
+    pub(crate) fn get(&self, request: u32) -> u64 {
+      self.send(request, 0, &[], &[]);
+      u64::from_le_bytes(self.reply().unwrap().try_into().unwrap())
+    }
+
+    /// A setting request with a reply-ack asked for: the ack's status (zero for success).
+    pub(crate) fn set(&self, request: u32, payload: &[u8], fds: &[BorrowedFd<'_>]) -> u64 {
+      self.send(request, FLAG_NEED_REPLY, payload, fds);
+      u64::from_le_bytes(self.reply().unwrap().try_into().unwrap())
+    }
+
+    /// A vring-state request (index, number).
+    pub(crate) fn state(queue: u32, number: u32) -> Vec<u8> {
+      let mut payload = queue.to_le_bytes().to_vec();
+      payload.extend_from_slice(&number.to_le_bytes());
+      payload
+    }
+
+    /// Negotiates features and sends the memory table of `ram` (one region from guest address zero).
+    pub(crate) fn negotiate_memory(&self, ram: &OwnedFd) -> u64 {
+      assert_eq!(self.get(request::GET_FEATURES), OFFERED_FEATURES);
+      self.send(
+        request::SET_FEATURES,
+        0,
+        &OFFERED_FEATURES.to_le_bytes(),
+        &[],
+      );
+      assert_eq!(
+        self.get(request::GET_PROTOCOL_FEATURES),
+        OFFERED_PROTOCOL_FEATURES
+      );
+      self.send(
+        request::SET_PROTOCOL_FEATURES,
+        0,
+        &OFFERED_PROTOCOL_FEATURES.to_le_bytes(),
+        &[],
+      );
+      assert_eq!(self.get(request::GET_QUEUE_NUM), 2);
+      assert_eq!(self.set(request::SET_OWNER, &[], &[]), 0);
+      let entry = region_entry();
+      let mut table = 1u32.to_le_bytes().to_vec();
+      table.extend_from_slice(&0u32.to_le_bytes());
+      for word in [entry.guest_phys, entry.size, entry.user_addr, entry.offset] {
+        table.extend_from_slice(&word.to_le_bytes());
+      }
+      self.set(request::SET_MEM_TABLE, &table, &[ram.as_fd()])
+    }
+
+    /// Configures each queue of `guest` and enables it; every ack must report success.
+    pub(crate) fn configure_queues<M: slates_bridge_virtiofs::memory::GuestMemory>(
+      &self,
+      guest: &Guest<M>,
+    ) {
+      for (queue, layout) in guest.layouts().iter().enumerate() {
+        let index = u32::try_from(queue).unwrap();
+        let acks = [
+          self.set(
+            request::SET_VRING_NUM,
+            &Self::state(index, u32::from(layout.size)),
+            &[],
+          ),
+          self.set(request::SET_VRING_ADDR, &ring_addresses(index, layout), &[]),
+          self.set(request::SET_VRING_BASE, &Self::state(index, 0), &[]),
+          self.set(
+            request::SET_VRING_KICK,
+            &u64::from(index).to_le_bytes(),
+            &[self.kicks[queue].as_fd()],
+          ),
+          self.set(
+            request::SET_VRING_CALL,
+            &u64::from(index).to_le_bytes(),
+            &[self.calls[queue].as_fd()],
+          ),
+          self.set(request::SET_VRING_ENABLE, &Self::state(index, 1), &[]),
+        ];
+        assert_eq!(acks, [0; 6], "queue {queue} configured");
+      }
+    }
+
+    /// Kicks `queue` and waits for its interrupt.
+    pub(crate) fn kick_and_wait(&self, queue: usize) {
+      rustix::io::write(&self.kicks[queue], &1u64.to_le_bytes()).unwrap();
+      let mut fds = [PollFd::new(&self.calls[queue], PollFlags::IN)];
+      let timeout = Timespec {
+        tv_sec: WAIT_NS / 1_000_000_000,
+        tv_nsec: 0,
+      };
+      assert_eq!(
+        poll(&mut fds, Some(&timeout)).unwrap(),
+        1,
+        "an interrupt in time"
+      );
+      let mut counter = [0u8; 8];
+      rustix::io::read(&self.calls[queue], &mut counter).unwrap();
+    }
+
+    /// `GET_VRING_BASE` of `queue`: the ring stops; its position.
+    pub(crate) fn stop(&self, queue: u32) -> u32 {
+      self.send(request::GET_VRING_BASE, 0, &Self::state(queue, 0), &[]);
+      let reply = self.reply().unwrap();
+      u32::from_le_bytes(reply[4..8].try_into().unwrap())
+    }
+  }
+
+  /// A vring-address payload for `layout` in the front end's address space.
+  fn ring_addresses(
+    index: u32,
+    layout: &slates_bridge_virtiofs::virtqueue::QueueLayout,
+  ) -> Vec<u8> {
+    let mut payload = index.to_le_bytes().to_vec();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    for at in [
+      layout.descriptor_table.0,
+      layout.used_ring.0,
+      layout.available_ring.0,
+      0,
+    ] {
+      let user = if at == 0 { 0 } else { USER_BASE + at };
+      payload.extend_from_slice(&user.to_le_bytes());
+    }
+    payload
+  }
+}
+
+/// One FUSE request through the vhost-user guest: submitted on the request queue, kicked, its interrupt
+/// awaited, its reply read back.
+#[cfg(target_os = "linux")]
+fn through_vhost(
+  front: &vhost_front_end::FrontEnd,
+  guest: &mut common::guest::Guest<slates_bridge_virtiofs::vhost_user::GuestRegions>,
+  request: &[u8],
+) -> Vec<u8> {
+  let head = guest.submit(request, common::guest::REPLY_CAP);
+  front.kick_and_wait(1);
+  let (id, len) = guest.reap().expect("a used element after the interrupt");
+  assert_eq!(id, head);
+  guest.reply_of(head, len)
+}
+
+/// Attaches a vhost-user device on `id` over `socket`; the receiver of its outcome.
+#[cfg(target_os = "linux")]
+fn attach_vhost(
+  daemon: &Daemon,
+  id: slates_ipc::protocol::VolumeId,
+  socket: std::os::fd::OwnedFd,
+) -> std::sync::mpsc::Receiver<GuestDeviceOutcome> {
+  let (end_tx, end_rx) = channel();
+  daemon
+    .attach_vhost_user_device(
+      id,
+      slates_bridge_virtiofs::device::FsTag::new("slates").unwrap(),
+      slates_server::virtiofs::GuestView::default(),
+      socket,
+      Box::new(move |outcome| {
+        let _ = end_tx.send(outcome);
+      }),
+    )
+    .unwrap();
+  end_rx
+}
+
+/// AUD-29-68 (the inherited-descriptor binding). Do: provision a volume; hand the daemon one end of a
+/// socketpair as a vhost-user device; as the VMM, negotiate features, send a sealed memory object as the
+/// guest's RAM and configure both queues with eventfd kicks and calls; as the guest, CREATE, WRITE and RELEASE
+/// a file through the request queue, each kicked and its interrupt awaited; stop the ring (`GET_VRING_BASE`);
+/// read the file back over the daemon's NFS port. Expect: every acknowledgement reports success; each request
+/// is answered through guest memory and its interrupt raised on the call eventfd; the stopped ring reports
+/// position 3 (three requests consumed); the device then ends through its terminal step with the doorbell hung
+/// up; the host reads the guest's bytes. Before 2026-10-01 this form was refused `BindingNotBuilt`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-vhost");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("vhosted")) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, socket);
+  let ram = vhost_front_end::guest_ram(true);
+  let mut guest = vhost_front_end::guest_over(&ram);
+  assert_eq!(
+    front.negotiate_memory(&ram),
+    0,
+    "the memory table is accepted"
+  );
+  front.configure_queues(&guest);
+  let created = through_vhost(
+    &front,
+    &mut guest,
+    &message(
+      Opcode::Create.to_wire(),
+      1,
+      1,
+      &create_body("from-vhost.txt"),
+    ),
+  );
+  assert_eq!(reply_error(&created), 0);
+  let ino = u64_at(&created, OUT_HEADER_LEN);
+  let fh = u64_at(&created, OUT_HEADER_LEN + EntryOut::LEN);
+  let written = through_vhost(
+    &front,
+    &mut guest,
+    &message(Opcode::Write.to_wire(), 2, ino, &write_body(fh, PAYLOAD)),
+  );
+  assert_eq!(reply_error(&written), 0);
+  let released = through_vhost(
+    &front,
+    &mut guest,
+    &message(Opcode::Release.to_wire(), 3, ino, &release_body(fh)),
+  );
+  assert_eq!(reply_error(&released), 0);
+  assert_eq!(front.stop(1), 3, "the ring's position is what it consumed");
+  let outcome = ended
+    .recv_timeout(common::guest::WAIT)
+    .expect("the device ended");
+  let GuestDeviceOutcome::Ended(end) = outcome else {
+    panic!("the device did not serve: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::DoorbellHungUp);
+  assert!(
+    end
+      .reclaimed
+      .expect("the terminal step ran")
+      .references_swept
+  );
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("vhosted").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  let file = lookup(&mut stream, &root, "from-vhost.txt", 2);
+  assert_eq!(read(&mut stream, &file, 3), PAYLOAD);
+  drop(client);
+  drop(daemon);
+}
+
+/// AUD-29-68 (hostile front ends). Do: offer a memory object that is not sealed against shrinking; in a second
+/// connection, close the front end before configuring any queue. Expect: the unsealed table is refused (its ack
+/// reports failure) and the handshake ends refused with the memory rule named; the closed one ends refused as
+/// closed; nothing is admitted either time.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_vhost_user_front_end_that_offers_unsealed_memory_or_leaves_is_refused() {
+  let (daemon, instance) = single_shard_daemon("virtiofs-vhost-hostile");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("hostile")) else {
+    panic!("the volume was not created");
+  };
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, socket);
+  let unsealed = vhost_front_end::guest_ram(false);
+  assert_ne!(
+    front.negotiate_memory(&unsealed),
+    0,
+    "an unsealed table is refused"
+  );
+  let outcome = ended.recv_timeout(common::guest::WAIT).unwrap();
+  assert!(
+    matches!(
+      outcome,
+      GuestDeviceOutcome::HandshakeRefused(Some(
+        slates_bridge_virtiofs::vhost_user::VhostError::Memory { .. }
+      ))
+    ),
+    "{outcome:?}"
+  );
+  let (front, socket) = vhost_front_end::pair();
+  let ended = attach_vhost(&daemon, id, socket);
+  drop(front);
+  let outcome = ended.recv_timeout(common::guest::WAIT).unwrap();
+  assert!(
+    matches!(
+      outcome,
+      GuestDeviceOutcome::HandshakeRefused(Some(
+        slates_bridge_virtiofs::vhost_user::VhostError::Closed
+      ))
+    ),
+    "{outcome:?}"
+  );
+  drop(client);
+  drop(daemon);
+}

@@ -120,6 +120,8 @@ const fn dax() -> DaxCapability {
 pub fn host_capability(transport: GuestTransport) -> TransportCapability {
   let unsupported_reason = match transport {
     GuestTransport::InProcess => None,
+    // vhost-user (`crate::vhost_user`): Linux's eventfds and the KVM VMMs that speak it.
+    GuestTransport::InheritedDescriptor if cfg!(target_os = "linux") => None,
     GuestTransport::InheritedDescriptor => Some(UnsupportedReason::BindingNotBuilt),
   };
   TransportCapability {

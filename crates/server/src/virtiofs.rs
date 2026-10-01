@@ -64,6 +64,10 @@ pub enum GuestDeviceOutcome {
   /// The view asked for was refused before admission (typed, AUD-29-76): a subtree naming nothing or no
   /// directory, a snapshot that is gone or of an overlay, or both at once. The seam was released.
   ViewRefused(Refusal),
+  /// The vhost-user front end did not configure the device within the daemon's failover budget, closed its
+  /// end, or broke the protocol (AUD-29-68); `None` for the budget passing. Nothing was admitted.
+  #[cfg(target_os = "linux")]
+  HandshakeRefused(Option<slates_bridge_virtiofs::vhost_user::VhostError>),
 }
 
 /// What a guest device presents of its volume (§4.4 `attach(volume|snapshot, ...)`, §4.6 scoped exports;
@@ -205,7 +209,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   volume: DbVolumeId,
   tag: FsTag,
   view: GuestView,
-  mut seam: S,
+  (mut seam, transport): (S, GuestTransport),
   on_end: OnEnd,
 ) {
   let found = state::with_state(|s| {
@@ -242,7 +246,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   // A snapshot is immutable: its device is admitted with no write, whatever the access list grants.
   let writable = bridge.view.is_none();
   let request = GuestAttachRequest {
-    transport: GuestTransport::InProcess,
+    transport,
     volume,
     dax: false,
     notification_queue: false,
@@ -323,6 +327,48 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   on_end(GuestDeviceOutcome::Ended(end));
 }
 
+/// Adopts and negotiates a vhost-user front end on the owning shard, then serves the device as any other.
+#[cfg(target_os = "linux")]
+async fn serve_vhost_user_device(
+  volume: DbVolumeId,
+  tag: FsTag,
+  view: GuestView,
+  socket: std::os::fd::OwnedFd,
+  on_end: OnEnd,
+) {
+  use slates_bridge_virtiofs::vhost_user::VhostUserSeam;
+  let config = DeviceConfig::new(tag);
+  let seam = match VhostUserSeam::adopt(socket, &config) {
+    Ok(seam) => seam,
+    Err(refused) => {
+      on_end(GuestDeviceOutcome::HandshakeRefused(Some(refused)));
+      return;
+    }
+  };
+  // The front end configures the device as its guest boots its driver: bounded by the daemon's failover
+  // budget, the wait it already allows for a peer to show it is alive.
+  let budget = state::with_state(|s| s.config.failover_slo_ns).unwrap_or(0);
+  let seam = match slates_rt::futures::within(budget, seam.negotiate()).await {
+    Ok(Some(Ok(seam))) => seam,
+    Ok(Some(Err(refused))) => {
+      on_end(GuestDeviceOutcome::HandshakeRefused(Some(refused)));
+      return;
+    }
+    Ok(None) | Err(_) => {
+      on_end(GuestDeviceOutcome::HandshakeRefused(None));
+      return;
+    }
+  };
+  serve_guest_device(
+    volume,
+    tag,
+    view,
+    (seam, GuestTransport::InheritedDescriptor),
+    on_end,
+  )
+  .await;
+}
+
 /// Resolves what a device presents, before admission: the scope's inode (a subtree of the head) and the key of
 /// its snapshot view (opened here, pinning the snapshot). Refused typed with nothing opened.
 fn open_view(
@@ -398,7 +444,38 @@ impl Daemon {
       bytes: volume.bytes,
     };
     let task = SpawnRequest::new(
-      Box::pin(serve_guest_device(device, tag, view, seam, on_end)),
+      Box::pin(serve_guest_device(
+        device,
+        tag,
+        view,
+        (seam, GuestTransport::InProcess),
+        on_end,
+      )),
+      None,
+    );
+    registry::send_control(shard, Control::Spawn(Box::new(task))).map_err(ServerError::Runtime)
+  }
+
+  /// Attaches a guest device to `volume` under `tag` over a vhost-user front end (the inherited-descriptor form,
+  /// AUD-29-68): `socket` is a connected stream socket whose other end the VMM holds (a `socketpair` end, never
+  /// a socket on disk). On the owning shard the consumer is read from the socket's peer, the front end is
+  /// negotiated within the daemon's failover budget, and the device is admitted and served exactly as the
+  /// in-process form is; the outcome reaches the harness through `on_end`.
+  #[cfg(target_os = "linux")]
+  pub fn attach_vhost_user_device(
+    &self,
+    volume: VolumeId,
+    tag: FsTag,
+    view: GuestView,
+    socket: std::os::fd::OwnedFd,
+    on_end: OnEnd,
+  ) -> Result<(), ServerError> {
+    let shard = self.owner_shard(volume)?;
+    let device = DbVolumeId {
+      bytes: volume.bytes,
+    };
+    let task = SpawnRequest::new(
+      Box::pin(serve_vhost_user_device(device, tag, view, socket, on_end)),
       None,
     );
     registry::send_control(shard, Control::Spawn(Box::new(task))).map_err(ServerError::Runtime)

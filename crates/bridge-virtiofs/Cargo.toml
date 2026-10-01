@@ -16,9 +16,16 @@ slates-machine = { workspace = true }
 slates-wire = { workspace = true }
 slates-db = { workspace = true }
 slates-rt = { workspace = true }
+# The inherited-descriptor binding maps the guest's memory objects through `SharedObject` (Linux).
+slates-mem = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# The vhost-user back end: the socket's peer credentials, descriptors by `SCM_RIGHTS`, the kick and call
+# eventfds and the epoll doorbell — descriptor calls on memory objects and an inherited socket, never a host
+# path (R1).
+rustix = { workspace = true }
 
 [dev-dependencies]
-slates-mem = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # The runtime test's doorbell: a pipe pair the simulated VMM owns, drained and kicked through

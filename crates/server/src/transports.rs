@@ -772,9 +772,23 @@ mod tests {
     }
   }
 
+  /// The vhost-user binding is built on Linux (AUD-29-68): its entry is supported there and reported unbuilt,
+  /// with no conformance, elsewhere.
+  fn assert_the_inherited_binding_is_reported_where_it_is_built(entry: &AttachmentCapability) {
+    if cfg!(target_os = "linux") {
+      assert_eq!(entry.unsupported_reason, None);
+    } else {
+      assert_eq!(
+        entry.unsupported_reason,
+        Some(UnsupportedReason::BindingNotBuilt)
+      );
+      assert_eq!(entry.conformance, Conformance::None);
+    }
+  }
+
   /// The device's report is carried fact for fact: the in-process seam offered as a tag with the
   /// guest's page cache, DAX not mapped and the simulated driver as evidence; the inherited-descriptor
-  /// binding refused with the device's own reason (`crates/bridge-virtiofs`).
+  /// binding as the device reports it (`crates/bridge-virtiofs`): served on Linux, refused with its reason elsewhere.
   #[cfg(unix)]
   #[test]
   fn the_guest_entries_carry_the_devices_report_fact_for_fact() {
@@ -794,11 +808,7 @@ mod tests {
       &host_capability(GuestTransport::InheritedDescriptor),
       &situation,
     );
-    assert_eq!(
-      unbuilt.unsupported_reason,
-      Some(UnsupportedReason::BindingNotBuilt)
-    );
-    assert_eq!(unbuilt.conformance, Conformance::None);
+    assert_the_inherited_binding_is_reported_where_it_is_built(&unbuilt);
     assert!(guest(&situation, AttachTransport::Oci).is_none());
     assert!(guest(&situation, AttachTransport::VirtioFsInProcess).is_some());
   }

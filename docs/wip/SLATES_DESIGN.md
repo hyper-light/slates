@@ -1926,6 +1926,12 @@ must exercise local communication and isolation between clones as well as namesp
 > inode tables that enters only the nodes the span copied. A guest device presents a subtree or a snapshot, chosen at
 > attach; a guest view cannot yet advance. A container bound to a scoped mount sees only that directory.
 
+> **Status (2026-10-01, AUD-29-68: the inherited-descriptor binding).** On Linux a guest device attaches over
+> vhost-user through a socket the harness hands the daemon (`attach_vhost_user_device`; never a socket on disk).
+> The VMM is authenticated as the socket's peer. Its memory is accepted only as sealed memory objects, and its
+> rings, kicks and calls are configured by the protocol. Every request or feature not offered is refused typed.
+> Proven by a test front end speaking the real protocol; a live QEMU guest and the durable guest record are owed.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

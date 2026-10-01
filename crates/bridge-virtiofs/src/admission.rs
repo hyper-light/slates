@@ -346,7 +346,8 @@ fn refuse<S: VmmSeam>(mut seam: S, error: AdmissionError) -> AdmissionRefused<S>
 
 /// The unsupported form a request names, if any (checked before the seam is touched).
 fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
-  if request.transport == GuestTransport::InheritedDescriptor {
+  // The inherited-descriptor binding is vhost-user (`crate::vhost_user`), built on Linux only.
+  if request.transport == GuestTransport::InheritedDescriptor && !cfg!(target_os = "linux") {
     return Some(UnsupportedReason::BindingNotBuilt);
   }
   if request.dax {

@@ -188,24 +188,30 @@ fn an_unsupported_form_is_refused_typed_before_the_seam_is_touched() {
     }
   ));
 
+  // The inherited-descriptor form is the vhost-user binding, built on Linux (AUD-29-68); elsewhere it is refused
+  // before the seam is touched.
   let inherited = request(GuestTransport::InheritedDescriptor);
-  let refused = admit(
+  let admitted = admit(
     inherited,
     SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })),
     config(),
     roomy(),
     rw,
     &mut registry,
-  )
-  .unwrap_err();
-  assert_eq!(
-    refused.error,
-    AdmissionError::AttachmentUnsupported {
-      transport: GuestTransport::InheritedDescriptor,
-      reason: UnsupportedReason::BindingNotBuilt,
-    }
   );
-  assert!(refused.seam.calls().is_empty());
+  if cfg!(target_os = "linux") {
+    assert!(admitted.is_ok(), "the binding is served on Linux");
+  } else {
+    let refused = admitted.unwrap_err();
+    assert_eq!(
+      refused.error,
+      AdmissionError::AttachmentUnsupported {
+        transport: GuestTransport::InheritedDescriptor,
+        reason: UnsupportedReason::BindingNotBuilt,
+      }
+    );
+    assert!(refused.seam.calls().is_empty());
+  }
 }
 
 /// Every chain is charged against the attachment's request and byte credits before it is touched, and its
@@ -525,17 +531,16 @@ fn the_capability_report_is_truthful() {
   );
 }
 
-/// The host-level report (before any attach) names the inherited-descriptor form unsupported with
-/// its reason, and the in-process form supported with the tag assigned at attach.
+/// The host-level report (before any attach) names the inherited-descriptor form supported on Linux (the
+/// vhost-user binding, AUD-29-68) and unsupported with its reason elsewhere, and the in-process form supported
+/// with the tag assigned at attach.
 #[test]
-fn the_host_report_names_the_unbuilt_binding() {
+fn the_host_report_names_where_the_binding_is_built() {
   let host =
     slates_bridge_virtiofs::capability::host_capability(GuestTransport::InheritedDescriptor);
-  assert!(!host.supported);
-  assert_eq!(
-    host.unsupported_reason,
-    Some(UnsupportedReason::BindingNotBuilt)
-  );
+  let expected = (!cfg!(target_os = "linux")).then_some(UnsupportedReason::BindingNotBuilt);
+  assert_eq!(host.supported, expected.is_none());
+  assert_eq!(host.unsupported_reason, expected);
   let in_process = slates_bridge_virtiofs::capability::host_capability(GuestTransport::InProcess);
   assert!(in_process.supported);
   assert_eq!(in_process.target_path, TargetPath::GuestTagAssignedAtAttach);

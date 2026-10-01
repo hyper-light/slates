@@ -517,9 +517,14 @@ fn assert_guest_entries(transports: &TransportReport) {
   let inherited = entry(transports, AttachTransport::VirtioFsInheritedDescriptor);
   assert_eq!(
     inherited.unsupported_reason,
-    Some(UnsupportedReason::BindingNotBuilt),
-    "the device's own reason, carried through"
+    inherited_binding_refusal(),
+    "the device's own report, carried through"
   );
+}
+
+/// Why the inherited-descriptor form is unsupported here: built on Linux (vhost-user, AUD-29-68), not elsewhere.
+fn inherited_binding_refusal() -> Option<UnsupportedReason> {
+  (!cfg!(target_os = "linux")).then_some(UnsupportedReason::BindingNotBuilt)
 }
 
 /// A guest form asked for over the ring is refused typed: no VMM seam accompanies a ring request
@@ -537,7 +542,7 @@ fn assert_guest_requests_refused(client: &mut Client, id: VolumeId) {
     refused_guest(client, id, AttachTransport::VirtioFsInheritedDescriptor),
     Refusal::AttachmentUnsupported {
       transport: AttachTransport::VirtioFsInheritedDescriptor,
-      reason: UnsupportedReason::BindingNotBuilt,
+      reason: inherited_binding_refusal().unwrap_or(UnsupportedReason::SeamNotOnWire),
     }
   );
   assert!(

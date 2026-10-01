@@ -28,7 +28,7 @@ use slates_server::virtiofs::{GuestDeviceOutcome, GuestView};
 /// Shape: how long the test waits for the guest and the device loop to report.
 pub(crate) const WAIT: Duration = Duration::from_secs(20);
 /// Shape: the simulated guest's memory (1 MiB), its ring areas and where its buffers start.
-const GUEST_RAM: u64 = 1 << 20;
+pub(crate) const GUEST_RAM: u64 = 1 << 20;
 const RING_BASE: u64 = 0x1000;
 const RING_STRIDE: u64 = 0x10000;
 const BUFFER_BASE: u64 = 0x80000;
@@ -54,8 +54,10 @@ pub(crate) fn layout_at(desc: u64, size: u16) -> QueueLayout {
   }
 }
 
-pub(crate) struct Guest {
-  memory: SimGuestMemory,
+/// The driver, over any guest memory: the simulated arena by default, or a real shared mapping (the vhost-user
+/// front end's memory object, mapped a second time).
+pub(crate) struct Guest<M: GuestMemory = SimGuestMemory> {
+  memory: M,
   layouts: Vec<QueueLayout>,
   next_buffer: u64,
   avail_idx: u16,
@@ -66,8 +68,15 @@ pub(crate) struct Guest {
 
 impl Guest {
   pub(crate) fn new() -> Guest {
+    Guest::over(SimGuestMemory::new(GUEST_RAM))
+  }
+}
+
+impl<M: GuestMemory> Guest<M> {
+  /// The driver over `memory`, which must hold [`GUEST_RAM`] bytes from guest address zero.
+  pub(crate) fn over(memory: M) -> Guest<M> {
     Guest {
-      memory: SimGuestMemory::new(GUEST_RAM),
+      memory,
       layouts: QUEUE_SIZES
         .iter()
         .enumerate()
@@ -84,6 +93,11 @@ impl Guest {
       next_desc: 0,
       writable: BTreeMap::new(),
     }
+  }
+
+  /// Every queue's layout, in queue order (high priority, then the request queue).
+  pub(crate) fn layouts(&self) -> &[QueueLayout] {
+    &self.layouts
   }
 
   fn write(&mut self, at: u64, bytes: &[u8]) {
@@ -135,6 +149,10 @@ impl Guest {
     self.write(layout.available_ring.0 + 4 + slot * 2, &head.to_le_bytes());
     self.avail_idx = self.avail_idx.wrapping_add(1);
     let idx = self.avail_idx;
+    // The driver's barrier before publishing the index (§2.7.13.3): the chain is visible first.
+    self
+      .memory
+      .order(slates_bridge_virtiofs::memory::Edge::Release);
     self.write(layout.available_ring.0 + 2, &idx.to_le_bytes());
     head
   }
@@ -146,6 +164,10 @@ impl Guest {
     if idx == self.used_seen {
       return None;
     }
+    // The element and the reply the index publishes are read after it (§2.7.14).
+    self
+      .memory
+      .order(slates_bridge_virtiofs::memory::Edge::Acquire);
     let slot = u64::from(self.used_seen % layout.size);
     let at = layout.used_ring.0 + 4 + slot * 8;
     let id = u32::from_le_bytes(self.read(at, 4).try_into().unwrap());
