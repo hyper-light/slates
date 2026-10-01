@@ -238,8 +238,26 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
       return;
     }
   };
+  // The device is known to its consumer's revocation for as long as its loop runs (AUD-29-73).
+  let consumer = admitted.consumer().clone();
+  let _ = state::with_state(|s| s.guest_devices.push((id, consumer)));
   let end = serve_loop(id, admitted, bridge).await;
+  let _ = state::with_state(|s| s.guest_devices.retain(|(device, _)| *device != id));
   on_end(GuestDeviceOutcome::Ended(end));
+}
+
+/// Asks every device loop this shard serves for `consumer` to revoke (§4.13; AUD-29-73). Run by the consumer's
+/// revocation on each shard before it is acknowledged: the loops run on this shard's thread and check the request
+/// at every pass boundary, so none serves a request after the acknowledgement; each then runs its terminal step,
+/// sweeping its references under its still-live attachment. The number asked.
+pub(crate) fn revoke_consumer_devices(s: &ShardState, consumer: u64) -> usize {
+  s.guest_devices
+    .iter()
+    .filter(|(_, principal)| {
+      matches!(principal, Principal::Consumer { consumer: c, .. } if *c == consumer)
+    })
+    .filter(|(device, _)| slates_bridge_virtiofs::serve::request_revoke(*device))
+    .count()
 }
 
 impl Daemon {

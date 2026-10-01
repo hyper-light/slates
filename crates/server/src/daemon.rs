@@ -2482,6 +2482,8 @@ fn init_shard(
     mount_attachments: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
+    guest_devices: Vec::new(),
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),

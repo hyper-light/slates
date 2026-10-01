@@ -320,6 +320,8 @@ pub struct AdmittedDevice<S: VmmSeam> {
   seam: S,
   device: Device,
   attachment: AttachmentId,
+  /// The consumer the seam authenticated, whose revocation ends the device (AUD-29-73).
+  consumer: Principal,
   transport: GuestTransport,
   rights: Rights,
   ledger: CreditLedger,
@@ -395,7 +397,7 @@ pub fn admit<S: VmmSeam>(
     Err(e) => return Err(refuse(seam, AdmissionError::ConsumerRefused(e))),
   };
   let granted = rights(&consumer);
-  let attachment = match registry.attach(request.volume, View::Current, consumer, granted) {
+  let attachment = match registry.attach(request.volume, View::Current, consumer.clone(), granted) {
     Ok(id) => id,
     Err(e) => return Err(refuse(seam, AdmissionError::Authority(e))),
   };
@@ -421,6 +423,7 @@ pub fn admit<S: VmmSeam>(
     seam,
     device,
     attachment,
+    consumer,
     transport: request.transport,
     rights: granted,
     ledger: CreditLedger::new(credits),
@@ -445,6 +448,11 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   /// The seam, mutably (a simulated VMM's guest is driven through it).
   pub fn seam_mut(&mut self) -> &mut S {
     &mut self.seam
+  }
+
+  /// The consumer the seam authenticated at admission.
+  pub fn consumer(&self) -> &Principal {
+    &self.consumer
   }
 
   /// The device.

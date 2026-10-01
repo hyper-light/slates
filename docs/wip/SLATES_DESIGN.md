@@ -1859,6 +1859,8 @@ must exercise local communication and isolation between clones as well as namesp
 > human waits for every shard to mark the consumer's channels **and** end, as recorded operations, the
 > attachments the consumer holds there — a host mount's token, a FUSE mount, the record a container binding is
 > held to — so its capability reaches nothing afterwards; a shard that cannot end one refuses the revocation.
+> Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
+> so none serves a request after the acknowledgement.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

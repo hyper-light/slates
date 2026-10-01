@@ -13,6 +13,7 @@
 #![cfg(unix)]
 
 use std::net::TcpStream;
+use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 use slates_bridge_fuse::abi::{OUT_HEADER_LEN, Opcode};
@@ -353,4 +354,112 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
   drop(stream);
   second.stop();
   drop(segment);
+}
+
+/// Shape: heartbeats the guest watches its requests after the revocation — several of the loop's pass
+/// boundaries, so a loop that went on serving would have answered them.
+const REVOKED_WATCH_HEARTBEATS: u64 = 5;
+
+/// AUD-29-73 (§4.13 "every later effect"). Do: the human enrolls a consumer and shares a volume with it; a
+/// guest authenticated as that consumer reads through its device; the human revokes the consumer; the guest
+/// then submits a read and a create and watches them for several heartbeats. Expect: the first read answered;
+/// `Revoked` acknowledged; neither later request answered; the device loop ended `Revoked` through its terminal
+/// step, its references swept. Before, the revocation marked only the consumer's channels, and the device went
+/// on serving.
+#[test]
+fn a_consumers_revocation_stops_its_guest_device() {
+  let (daemon, instance) = single_shard_daemon("guest-revoke");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = my_uid();
+  let mut owner = Client::connect(&instance);
+  let ReplyBody::Enrolled { consumer, .. } = owner.call(&RequestBody::Enroll {
+    account,
+    proof: slates_server::landing::enroll_proof(&secret, account),
+  }) else {
+    panic!("the consumer was not enrolled");
+  };
+  let ReplyBody::Created { id } = owner.call(&scratch("guest-revoked")) else {
+    panic!("the volume was not created");
+  };
+  assert!(matches!(
+    owner.call(&RequestBody::Share {
+      volume: id,
+      principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+      rights: slates_ipc::protocol::Rights {
+        read: true,
+        write: true,
+        admin: false
+      },
+    }),
+    ReplyBody::Shared
+  ));
+  let (first_tx, first_rx) = channel::<i32>();
+  let (revoked_tx, revoked_rx) = channel::<()>();
+  let guest = common::guest::start_guest(
+    &daemon,
+    id,
+    Principal::Consumer { account, consumer },
+    move |kick_write, call_read| {
+      Box::pin(async move {
+        let first = round_trip(
+          &kick_write,
+          &call_read,
+          &message(Opcode::GetAttr.to_wire(), 1, 1, &[0u8; 16]),
+        )
+        .await;
+        let _ = first_tx.send(reply_error(&first));
+        while revoked_rx.try_recv().is_err() {
+          slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS)
+            .await
+            .unwrap();
+        }
+        common::guest::with_guest(|g| {
+          g.submit(
+            &message(Opcode::GetAttr.to_wire(), 2, 1, &[0u8; 16]),
+            common::guest::REPLY_CAP,
+          );
+          g.submit(
+            &message(Opcode::Create.to_wire(), 3, 1, &create_body("after-revoke")),
+            common::guest::REPLY_CAP,
+          );
+        });
+        let _ = rustix::io::write(&kick_write, &[1u8]);
+        slates_rt::futures::sleep(slates_server::daemon::HEARTBEAT_NS * REVOKED_WATCH_HEARTBEATS)
+          .await
+          .unwrap();
+        let answered = common::guest::with_guest(|g| g.reap()).is_some();
+        drop(kick_write);
+        answered
+      })
+    },
+  );
+  let first = first_rx.recv_timeout(common::guest::WAIT);
+  let revoked = owner.call(&RequestBody::Revoke {
+    consumer,
+    proof: slates_server::landing::revoke_proof(&secret, consumer),
+  });
+  let _ = revoked_tx.send(());
+  let answered = guest.script.recv_timeout(common::guest::WAIT);
+  let outcome = guest.end.recv_timeout(common::guest::WAIT);
+  drop(owner);
+  drop(daemon);
+  assert_eq!(
+    first,
+    Ok(0),
+    "the consumer's guest read before the revocation"
+  );
+  assert_eq!(revoked, ReplyBody::Revoked);
+  assert_eq!(
+    answered,
+    Ok(false),
+    "no request answered after the revocation"
+  );
+  let Ok(GuestDeviceOutcome::Ended(end)) = outcome else {
+    panic!("the device loop did not end: {outcome:?}");
+  };
+  assert_eq!(end.why, EndReason::Revoked);
+  assert!(
+    end.reclaimed.as_ref().is_ok_and(|r| r.references_swept),
+    "{end:?}"
+  );
 }

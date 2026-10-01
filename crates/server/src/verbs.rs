@@ -2577,6 +2577,9 @@ fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
       slot.revoked = true;
     }
   }
+  // The consumer's guest devices on this shard stop at their next pass boundary (AUD-29-73).
+  #[cfg(unix)]
+  crate::virtiofs::revoke_consumer_devices(s, consumer);
   // The consumer's attachments on this shard's partition end with its channels (AUD-29-84): each is a
   // capability that outlives the channel — a host mount's token, a FUSE mount, the record a container
   // binding is held to — so each is ended as a recorded operation, its mount capability then reaching nothing

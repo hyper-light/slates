@@ -267,6 +267,14 @@ pub struct ShardState {
   /// by the partition's attachment cap: one entry per live FUSE attachment at most.
   #[cfg(target_os = "linux")]
   pub(crate) fuse_mounts: crate::fuse::FuseMounts,
+  /// The guest devices this shard serves and the consumer each was admitted for (§4.6, §4.13; AUD-29-73), so a
+  /// consumer's revocation reaches its devices. Bounded by the shard's device limit (`clients_per_shard`, the
+  /// loop registry's bound): an entry is added when a loop registers and removed when it ends.
+  #[cfg(unix)]
+  pub(crate) guest_devices: Vec<(
+    slates_bridge_virtiofs::serve::DeviceId,
+    slates_db::catalog::Principal,
+  )>,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,
   /// Requests served.
