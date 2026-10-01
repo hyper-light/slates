@@ -703,6 +703,7 @@ fn run_suite_on(
   let result = match suite {
     Suite::Fsx if transport == Transport::Oci => container::run_fsx(&run)?,
     Suite::Fsx => suites::run_fsx(&run)?,
+    Suite::Fsstress if transport == Transport::Oci => container::run_fsstress(&run)?,
     Suite::Fsstress => suites::run_fsstress(&run)?,
     Suite::Pjdfstest => suites::run_pjdfstest(&run)?,
     Suite::Workloads => workloads::run_workloads(&run)?,

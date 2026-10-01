@@ -15,7 +15,8 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use slates_conformance::exerciser::judge_fsx;
+use slates_conformance::capability::HostOs;
+use slates_conformance::exerciser::{judge_fsstress, judge_fsx};
 use slates_conformance::record::{Counts, Outcome};
 
 use super::fetch;
@@ -165,44 +166,99 @@ fn home_as_tilde(text: &str) -> String {
   }
 }
 
+/// A container leg's setup and what its record carries: the session (host mount), the handshake's profile, the
+/// checked binding.
+struct Leg {
+  session: Session,
+  profile: String,
+  binding: Binding,
+}
+
+impl Leg {
+  /// Opens the session for `suite`, asks the runtime for its profile, makes the suite's working directory
+  /// inside the mount, and binds the mount in the container form, checked again just before the bind.
+  fn open(run: &Run<'_>, suite: &str) -> Result<Leg, Failure> {
+    let session = Session::open(
+      run,
+      &format!("oci-{suite}"),
+      super::VOLUME_SIZE,
+      false,
+      None,
+    )?;
+    let profile = handshake(&session)?;
+    session.workdir(suite)?;
+    let binding = bind(&session)?;
+    Ok(Leg {
+      session,
+      profile,
+      binding,
+    })
+  }
+
+  /// The suite's working directory as the container sees it.
+  fn workdir(suite: &str) -> String {
+    format!("{DESTINATION}/conformance-{}/{suite}", std::process::id())
+  }
+
+  /// The notes every container record carries: the pinned source's note, the profile, the source check.
+  fn notes(&self, source_note: String) -> Vec<String> {
+    vec![
+      source_note,
+      format!(
+        "the runtime's profile (`slates oci-runtime {RUNTIME}`): {}",
+        home_as_tilde(&self.profile)
+      ),
+      format!(
+        "the source checked again (`slates oci-check`, mount {} on device {}) just before the bind",
+        self.binding.mount_id, self.binding.device
+      ),
+    ]
+  }
+
+  /// The record's command, reading the same on every host: the bind's source is the session's mount, the
+  /// user the mounting user, the work directory the process's; the sources' path is the scratch the
+  /// harness names `<scratch>` itself.
+  fn recorded(&self, command: &str) -> Result<String, Failure> {
+    Ok(
+      command
+        .replace(&self.binding.source, "<mount>")
+        .replace(&mounting_user()?, "<uid>:<gid>")
+        .replace(
+          &format!("conformance-{}/", std::process::id()),
+          "conformance-<pid>/",
+        ),
+    )
+  }
+}
+
 /// fsx inside a container over the OCI bind.
 pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   let tools = run.scratch.shared("tools")?;
   // The host build fetches and verifies the pinned source; the container compiles the same file.
   let built = fetch::build_fsx(&tools)?;
-  let session = Session::open(run, "oci-fsx", super::VOLUME_SIZE, false, None)?;
-  let profile = handshake(&session)?;
-  session.workdir("fsx")?;
-  let binding = bind(&session)?;
+  let leg = Leg::open(run, "fsx")?;
   let bounds = run.bounds();
   let script = format!(
-    "cc -O2 -w -include time.h -include stdint.h -o /tmp/fsx {SOURCES}/{} && cd {DESTINATION}/conformance-{}/fsx \
+    "cc -O2 -w -include time.h -include stdint.h -o /tmp/fsx {SOURCES}/{} && cd {} \
      && /tmp/fsx -N {} -S {} -l {} -q -P /tmp fsx.bin",
     fetch::FSX_C.name,
-    std::process::id(),
+    Leg::workdir("fsx"),
     bounds.fsx_operations,
     bounds.fsx_seed,
     bounds.fsx_file_length
   );
-  let (success, output, command) = run_in_container(&binding, &tools, &script)?;
+  let (success, output, command) = run_in_container(&leg.binding, &tools, &script)?;
   let verdict = judge_fsx(success, &output);
-  let mut notes = vec![
-    built.note,
-    format!(
-      "the runtime's profile (`slates oci-runtime {RUNTIME}`): {}",
-      home_as_tilde(&profile)
-    ),
-    format!(
-      "the source checked again (`slates oci-check`, mount {} on device {}) just before the bind",
-      binding.mount_id, binding.device
-    ),
+  let mut notes = leg.notes(built.note);
+  notes.push(
     "fsx compiled inside the container from the same pinned source; its .fsxlog/.fsxgood files kept in the container's /tmp".to_owned(),
-  ];
+  );
   if !verdict.ok {
     notes.push(format!("fsx output tail: {}", verdict.detail));
   }
-  notes.extend(session.size_note.clone());
-  drop(session);
+  notes.extend(leg.session.size_note.clone());
+  let command = leg.recorded(&command)?;
+  drop(leg);
   Ok(SuiteResult {
     privilege: this_user().privilege(),
     outcome: Outcome::Ran {
@@ -213,16 +269,7 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
         ok: verdict.ok,
       },
     },
-    // The record's command reads the same on every host: the bind's source is the session's mount, the user
-    // the mounting user, the work directory the process's; the sources' path is the scratch the harness
-    // names `<scratch>` itself.
-    command: command
-      .replace(&binding.source, "<mount>")
-      .replace(&mounting_user()?, "<uid>:<gid>")
-      .replace(
-        &format!("conformance-{}/", std::process::id()),
-        "conformance-<pid>/",
-      ),
+    command,
     bound: format!(
       "{} operations, seed {}, file length {} bytes",
       bounds.fsx_operations, bounds.fsx_seed, bounds.fsx_file_length
@@ -230,5 +277,70 @@ pub(crate) fn run_fsx(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     expected_failure_list: None,
     notes,
     ok: verdict.ok,
+  })
+}
+
+/// fsstress inside a container over the OCI bind: LTP's pinned sources staged with the Linux shim and compiled
+/// inside, run with the lane's bounds; the daemon must still answer afterwards.
+pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
+  let sources = run.scratch.shared("tools")?.join("ltp-linux");
+  fetch::stage_fsstress(&sources, HostOs::Linux)?;
+  let leg = Leg::open(run, "fsstress")?;
+  let bounds = run.bounds();
+  let script = format!(
+    "cp -R {SOURCES} /tmp/ltp && cd /tmp/ltp && cc {} -o /tmp/fsstress {} && /tmp/fsstress -d {} -n {} -p {} -s {} -v",
+    fetch::FSSTRESS_CFLAGS.join(" "),
+    fetch::FSSTRESS_C.name,
+    Leg::workdir("fsstress"),
+    bounds.fsstress_operations,
+    bounds.fsstress_processes,
+    bounds.fsstress_seed
+  );
+  let (success, output, command) = run_in_container(&leg.binding, &sources, &script)?;
+  let verdict = judge_fsstress(success, &output);
+  let alive = leg.session.daemon_alive();
+  let ok = verdict.ok && alive;
+  let mut notes = leg.notes(format!(
+    "fsstress: {} ({}), sha256 {}, compiled inside the container `cc {}` over the harness's Linux shim config.h",
+    fetch::FSSTRESS_C.upstream,
+    fetch::FSSTRESS_C.license,
+    fetch::FSSTRESS_C.sha256,
+    fetch::FSSTRESS_CFLAGS.join(" ")
+  ));
+  notes.push(format!(
+    "the daemon answered `volume list` after the run: {alive}"
+  ));
+  if !verdict.ok {
+    notes.push(format!("fsstress output tail: {}", verdict.detail));
+  }
+  if !alive {
+    notes.push(format!(
+      "the daemon stopped answering during the run; anchor log tail:\n{}",
+      leg.session.anchor_log_tail()
+    ));
+  }
+  notes.extend(leg.session.size_note.clone());
+  let command = leg.recorded(&command)?;
+  drop(leg);
+  Ok(SuiteResult {
+    privilege: this_user().privilege(),
+    outcome: Outcome::Ran {
+      counts: Counts::Fsstress {
+        operations: bounds.fsstress_operations,
+        processes: bounds.fsstress_processes,
+        seed: bounds.fsstress_seed,
+        logged_operations: verdict.logged_operations,
+        disabled_operations: Vec::new(),
+        ok,
+      },
+    },
+    command,
+    bound: format!(
+      "{} operations per process × {} processes, seed {}",
+      bounds.fsstress_operations, bounds.fsstress_processes, bounds.fsstress_seed
+    ),
+    expected_failure_list: None,
+    notes,
+    ok,
   })
 }

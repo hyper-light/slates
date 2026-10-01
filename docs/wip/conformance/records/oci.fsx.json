@@ -22,11 +22,11 @@
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 20170,
+  "duration_ms": 10629,
   "notes": [
     "fsx: freebsd/freebsd-src@42c6944 tools/regression/fsx/fsx.c (APSL 2.0), sha256 b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
     "the runtime's profile (`slates oci-runtime docker`): profile: engine=\"Docker Desktop\" version=29.3.1 endpoint=unix://~/.docker/run/docker.sock rootless=false userns=false; evidence: T-4.13 (Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing); identity: host_user_through_share (container ids are not forwarded; the attachment's capability is the authority)",
-    "the source checked again (`slates oci-check`, mount 2 on device 436207663) just before the bind",
+    "the source checked again (`slates oci-check`, mount 2 on device 436207667) just before the bind",
     "fsx compiled inside the container from the same pinned source; its .fsxlog/.fsxgood files kept in the container's /tmp"
   ]
 }

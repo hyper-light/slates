@@ -15,7 +15,7 @@
     "kind": "skipped",
     "reason": {
       "kind": "owed",
-      "reason": "the container form exists — `attach` returns a verified non-recursive private bind (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS lane under the runtime handshake (`slates oci-runtime docker`) — but this suite's container leg is not built yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the daemon's FUSE mount"
+      "reason": "the container form exists — `attach` returns a verified non-recursive private bind (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS lane under the runtime handshake (`slates oci-runtime docker`), as does fsstress — but this suite's container leg is not built yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the daemon's FUSE mount"
     }
   },
   "expected_failure_list": null,

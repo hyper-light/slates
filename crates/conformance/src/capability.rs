@@ -15,7 +15,8 @@
 //! virtio-fs is proven only by the simulated guest driver (`docs/wip/virtiofs.md`); the OCI container
 //! form exists (`attach` with the container form: a verified non-recursive private bind and `slates
 //! oci-check`) and a workload ran through it on Docker Desktop (T-4.13); fsx runs inside a container through
-//! it on the macOS lane (`xtask/src/conformance/container.rs`), and the other suites' container legs are owed.
+//! it on the macOS lane (`xtask/src/conformance/container.rs`), as does fsstress; the other suites' container
+//! legs are owed.
 
 use crate::record::{Suite, Transport};
 
@@ -96,8 +97,8 @@ const VIRTIOFS_OWED: &str = concat!(
 /// The reason every OCI cell is owed.
 const OCI_OWED: &str = "the container form exists — `attach` returns a verified non-recursive private bind \
   (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS \
-  lane under the runtime handshake (`slates oci-runtime docker`) — but this suite's container leg is not \
-  built yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the \
+  lane under the runtime handshake (`slates oci-runtime docker`), as does fsstress — but this suite's \
+  container leg is not built yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the \
   daemon's FUSE mount";
 
 /// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export.
@@ -120,7 +121,7 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     (_, Suite::Pressure | Suite::Failure) => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
     (Transport::VirtioFs, _) => Availability::Owed(VIRTIOFS_OWED),
     // fsx compiled and run inside a container over the exact entry `attach --oci` returns (AUD-29-78).
-    (Transport::Oci, Suite::Fsx) => Availability::Runnable {
+    (Transport::Oci, Suite::Fsx | Suite::Fsstress) => Availability::Runnable {
       on: HostOs::Macos,
       tools: &["mount_nfs", "umount", "sh", "cc", "docker"],
       root: RootNeed::None,
@@ -286,16 +287,20 @@ mod tests {
         availability(Transport::VirtioFs, suite),
         Availability::Owed(_)
       ));
-      let container = availability(Transport::Oci, suite);
-      if suite == Suite::Fsx {
-        assert!(
-          matches!(container, Availability::Runnable { on: HostOs::Macos, tools, adapter: None, .. } if tools.contains(&"docker")),
-          "{container:?}"
-        );
-      } else {
-        assert!(matches!(container, Availability::Owed(_)), "{suite:?}");
-      }
+      assert_container_cell(suite);
     }
+  }
+
+  /// The container cell for `suite`: runnable on macOS with `docker` where its leg is built, else owed.
+  fn assert_container_cell(suite: Suite) {
+    let container = availability(Transport::Oci, suite);
+    let built = matches!(suite, Suite::Fsx | Suite::Fsstress);
+    let runnable = matches!(container, Availability::Runnable { on: HostOs::Macos, tools, adapter: None, .. } if tools.contains(&"docker"));
+    let owed = matches!(container, Availability::Owed(_));
+    assert!(
+      if built { runnable } else { owed },
+      "{suite:?}: {container:?}"
+    );
   }
 
   /// The pressure and failure columns are owed on every transport.

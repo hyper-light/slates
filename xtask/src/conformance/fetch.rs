@@ -203,8 +203,21 @@ pub(crate) struct BuiltFsstress {
   pub(crate) disabled_operations: Vec<String>,
 }
 
-/// Fetches and builds fsstress with the shim headers.
-pub(crate) fn build_fsstress(dir: &Path, os: HostOs) -> Result<BuiltFsstress, Failure> {
+/// Format: the compiler flags fsstress is built with on every lane (the shim's `config.h` included first).
+pub(crate) const FSSTRESS_CFLAGS: &[&str] = &[
+  "-O2",
+  "-w",
+  "-DNO_XFS",
+  "-D_GNU_SOURCE",
+  "-include",
+  "shim/config.h",
+  "-I.",
+  "-Ishim",
+];
+
+/// Fetches the pinned fsstress sources into `dir` and writes the shim headers for `os`, without compiling:
+/// what a container lane compiles inside its own Linux (`crate::conformance::container`).
+pub(crate) fn stage_fsstress(dir: &Path, os: HostOs) -> Result<(), Failure> {
   for pin in [
     &FSSTRESS_C,
     &FSSTRESS_GLOBAL_H,
@@ -219,23 +232,15 @@ pub(crate) fn build_fsstress(dir: &Path, os: HostOs) -> Result<BuiltFsstress, Fa
   write_file(
     &shim.join("lapi").join("fcntl.h"),
     b"/* slates conformance harness: LTP's lapi/fcntl.h is not needed with the system fcntl.h */\n",
-  )?;
-  cc(
-    dir,
-    &[
-      "-O2",
-      "-w",
-      "-DNO_XFS",
-      "-D_GNU_SOURCE",
-      "-include",
-      "shim/config.h",
-      "-I.",
-      "-Ishim",
-      "-o",
-      "fsstress",
-      FSSTRESS_C.name,
-    ],
-  )?;
+  )
+}
+
+/// Fetches and builds fsstress with the shim headers.
+pub(crate) fn build_fsstress(dir: &Path, os: HostOs) -> Result<BuiltFsstress, Failure> {
+  stage_fsstress(dir, os)?;
+  let mut args = FSSTRESS_CFLAGS.to_vec();
+  args.extend(["-o", "fsstress", FSSTRESS_C.name]);
+  cc(dir, &args)?;
   let disabled_operations = match os {
     HostOs::Macos => vec!["dread".to_owned(), "dwrite".to_owned()],
     HostOs::Linux | HostOs::Windows => Vec::new(),
