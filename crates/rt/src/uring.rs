@@ -6,13 +6,12 @@
 //! Linux otherwise releases pending polls' socket references asynchronously, after shutdown returns
 //! (`docs/bugs/2026-09-19-io-uring-retains-listener-after-shutdown.md`).
 
-use std::os::fd::OwnedFd;
 use std::time::Instant;
 
 use io_uring::types::{CancelBuilder, Fd, SubmitArgs, Timespec};
 use io_uring::{IoUring, opcode, squeue};
 
-use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
+use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since};
 use crate::error::RtError;
 
 /// Format: the user word of the kick poll.
@@ -51,15 +50,6 @@ impl std::fmt::Debug for UringDriver {
       .field("multishot", &self.multishot)
       .finish()
   }
-}
-
-/// Creates the kick eventfd; the registry owns it until every shard driver has retired.
-pub fn prepare_eventfd() -> Result<OwnedFd, RtError> {
-  rustix::event::eventfd(
-    0,
-    rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
-  )
-  .map_err(|e| refused("eventfd", e))
 }
 
 /// Probes whether io_uring is available, recording which flags the kernel accepts; a refusal

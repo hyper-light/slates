@@ -58,7 +58,7 @@ pub mod epoll;
 pub mod iocp;
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub mod kqueue;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
 pub mod uring;
 
 pub use driver::{Driver, DriverKind};

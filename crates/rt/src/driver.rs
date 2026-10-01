@@ -237,17 +237,43 @@ impl std::fmt::Debug for Prepared {
   }
 }
 
+/// Whether the io_uring driver is available: probed on 64-bit Linux, where its binding exists.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn uring_available(ring_entries: u32, notes: &mut Vec<String>) -> bool {
+  crate::uring::probe(ring_entries, notes)
+}
+
+/// On 32-bit Linux the io_uring binding has no kernel layout, so the epoll driver serves (AUD-29-32).
+#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+fn uring_available(_ring_entries: u32, notes: &mut Vec<String>) -> bool {
+  notes.push("io_uring = not built for a 32-bit target; using epoll".to_owned());
+  false
+}
+
+/// The io_uring driver over the kick eventfd.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn uring_driver(efd: KickFd, ring_entries: u32) -> Result<Box<dyn Driver>, RtError> {
+  Ok(Box::new(crate::uring::UringDriver::with_eventfd(efd, ring_entries)?) as Box<dyn Driver>)
+}
+
+/// Never selected on 32-bit Linux (`uring_available` is false there); refused typed if it were.
+#[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+fn uring_driver(_efd: KickFd, _ring_entries: u32) -> Result<Box<dyn Driver>, RtError> {
+  Err(RtError::DriverRefused {
+    call: "io_uring on a 32-bit target",
+    code: None,
+  })
+}
+
 /// Prepares the OS driver for this platform, probing and falling back as D-9 says.
 #[cfg(target_os = "linux")]
 pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
-  let efd = crate::uring::prepare_eventfd()?;
+  let efd = crate::epoll::prepare_eventfd()?;
   let mut notes = Vec::new();
-  let uring = crate::uring::probe(ring_entries, &mut notes);
+  let uring = uring_available(ring_entries, &mut notes);
   let seed: DriverSeed = if uring {
     Box::new(move |kick| match kick {
-      Kick::Eventfd(efd) => {
-        Ok(Box::new(crate::uring::UringDriver::with_eventfd(efd, ring_entries)?) as Box<dyn Driver>)
-      }
+      Kick::Eventfd(efd) => uring_driver(efd, ring_entries),
       _ => Err(RtError::DriverRefused {
         call: "io_uring driver without its eventfd",
         code: None,

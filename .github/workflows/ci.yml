@@ -346,7 +346,28 @@ jobs:
       - name: Lint the instrumented benchmarks
         run: cargo clippy -p slates-mem -p slates-rt -p slates-wire --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts -- -D warnings
       - name: Benches
-        run: cargo bench --workspace --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts
+        run: cargo bench --workspace --bench callgrind --features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts -- --save-summary=json
+      # The gate (AUD-29-32): each benchmark's instruction count against the baseline committed for this
+      # platform (xtask/callgrind-baseline.json). A regression past one percent, a benchmark with no baseline,
+      # or a baseline with no benchmark fails; a failing run prints its counts for review and `--record`.
+      - name: Instruction-count gate
+        run: cargo xtask callgrind --iai target/iai
+
+  # i686 is a tested target, not a build-only one (CLAUDE.md §3; AUD-29-32): every u64 → usize of a mapped or
+  # user-supplied size goes through `usize::try_from`, and these crates' unit tests run as 32-bit code. The
+  # official linux/386 Rust image runs natively on the x86_64 runner, so the lane installs nothing. On a
+  # 32-bit target the runtime serves through epoll (the io_uring binding has no 32-bit layout). slates-rt
+  # and slates-mem join once the 32-bit waker carries its task (docs/bugs/2026-10-01-a-32-bit-waker-lost-
+  # its-task.md: the packed 64-bit word does not fit a 32-bit data pointer).
+  i686:
+    name: i686 (32-bit narrowing, by test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests as 32-bit code
+        run: >-
+          docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
+          bash -lc 'cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib'
 
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the

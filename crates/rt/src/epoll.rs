@@ -12,6 +12,16 @@ use rustix::event::epoll::{self, CreateFlags, EventData, EventFlags};
 use crate::driver::{Completion, Driver, DriverKind, Kick, nanos_since, refused};
 use crate::error::RtError;
 
+/// Creates the kick eventfd both Linux drivers wake on; the registry owns it until every shard driver has
+/// retired.
+pub fn prepare_eventfd() -> Result<OwnedFd, RtError> {
+  rustix::event::eventfd(
+    0,
+    rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK,
+  )
+  .map_err(|e| refused("eventfd", e))
+}
+
 /// Format: the user word that marks the kick eventfd in epoll events.
 const KICK_TAG: u64 = u64::MAX;
 

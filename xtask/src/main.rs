@@ -36,6 +36,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod callgrind;
 mod capabilities;
 mod conformance;
 mod kind;
@@ -78,6 +79,15 @@ fn main() -> ExitCode {
       .and_then(|()| workspace_root().and_then(|root| unsafe_budget::run(&root, false)))
       .and_then(|()| workspace_root().and_then(|root| version::run(&root, &version::Mode::Check)))
       .and_then(|()| workspace_root().and_then(|root| check_capabilities(&root))),
+    "callgrind" => workspace_root().and_then(|root| {
+      let iai = args
+        .iter()
+        .position(|a| a == "--iai")
+        .and_then(|i| args.get(i + 1))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target").join("iai"));
+      callgrind::run(&root, &iai, args.iter().any(|a| a == "--record"))
+    }),
     "capabilities" => workspace_root().and_then(|root| {
       if args.iter().any(|a| a == "--write") {
         capabilities::write(&root).map_err(Failure)?;
@@ -122,7 +132,7 @@ fn main() -> ExitCode {
       kind::run(&root, &options)
     }),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, capabilities, ratchet, conformance, kind"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind"
     ))),
   };
   match outcome {
