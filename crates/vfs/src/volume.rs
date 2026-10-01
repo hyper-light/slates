@@ -343,6 +343,34 @@ impl std::fmt::Debug for Volume {
   }
 }
 
+/// The slots a namespace verb may take, counted before it changes anything (AUD-29-40; §4.2): every
+/// copy-up its preparation needs (a directory node with its inode version and trie path, and the
+/// block copies in its parent's entry tree), its own new inode and directory node, and the blocks its
+/// entry changes take. Admitted whole against the store's room, so a verb is refused before its first
+/// change or not at all — a copy-up is a real change (it moves inline bytes into the head's unique
+/// accounting and spends slab slots), so it may not precede a refusal. Some counts are upper bounds
+/// (a split's worst case, trie paths that later copies share), so a verb may be refused a few slots
+/// before the last one, as a worst-case transaction reservation is.
+#[derive(Debug, Default)]
+struct Needs {
+  dirs: usize,
+  inodes: usize,
+  tries: usize,
+  blocks: usize,
+  /// Inode versions a snapshot pins that the copy-ups will retain (the retention charge).
+  retained: u64,
+}
+
+/// A rename [`Volume::admit_rename`] admitted: its source and target as looked up, the spelling the
+/// new name is stored under, and the retention the replaced file's content needs.
+#[derive(Debug)]
+pub(crate) struct RenamePlan {
+  source: Located,
+  target: Option<Located>,
+  to_name: String,
+  retention: u64,
+}
+
 /// A resolved entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Located {
@@ -1125,15 +1153,18 @@ impl Volume {
   ) -> Result<InodeNo, VfsError> {
     self.live()?;
     names::check(name)?;
+    self.refuse_existing(store, dir, name)?;
+    self.admit_namespace(true)?;
+    let mut needs = Needs::default();
+    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
+    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    self.need_new_inode(store, &mut needs)?;
+    self.need_insert(store, dir, name, &mut needs)?;
+    self.admit_needs(store, &needs)?;
+    // Admitted: the directory's path made current (with its inode, so the touch below allocates
+    // nothing), the inode installed, then the name published.
     let dir = self.make_current_dir(store, dir)?;
-    if store
-      .dirs
-      .get(dir)?
-      .lookup(&store.blocks, self.policy, name)
-      .is_some_and(|e| e.child != Child::Whiteout)
-    {
-      return Err(VfsError::AlreadyExists);
-    }
+    let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no()?;
     let now = self.clock.wall_ns();
     let body = if kind.is_special() {
@@ -1143,18 +1174,21 @@ impl Volume {
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
     inode.home = Some(Home {
-      parent: store.dirs.get(dir)?.inode,
+      parent,
       hash: self.policy.hash(name),
     });
     stamp_all(&mut inode.attrs, now);
-    let handle = store.inodes.insert(inode)?;
-    self.table_set(store, no, handle)?;
+    let handle = self.install(store, no, inode)?;
     let child = match kind {
       Kind::Fifo => Child::Fifo(no),
       Kind::Socket => Child::Socket(no),
       _ => Child::File(no),
     };
-    self.dir_insert(store, dir, name, child)?;
+    // Publication: the name is the one step a client sees.
+    if let Err(refusal) = self.dir_insert(store, dir, name, child) {
+      self.uninstall(store, no, handle);
+      return Err(refusal);
+    }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     self.record(
@@ -1180,27 +1214,44 @@ impl Volume {
   ) -> Result<Handle<DirNode>, VfsError> {
     self.live()?;
     names::check(name)?;
+    self.refuse_existing(store, dir, name)?;
+    self.admit_namespace(true)?;
+    let mut needs = Needs::default();
+    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
+    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    self.need_new_inode(store, &mut needs)?;
+    needs.dirs = needs.dirs.saturating_add(1);
+    self.need_insert(store, dir, name, &mut needs)?;
+    self.admit_needs(store, &needs)?;
     let dir = self.make_current_dir(store, dir)?;
-    if store
-      .dirs
-      .get(dir)?
-      .lookup(&store.blocks, self.policy, name)
-      .is_some_and(|e| e.child != Child::Whiteout)
-    {
-      return Err(VfsError::AlreadyExists);
-    }
+    let parent_no = store.dirs.get(dir)?.inode;
     let no = self.next_no()?;
     let now = self.clock.wall_ns();
-    let parent_no = store.dirs.get(dir)?.inode;
-    let child = store
+    let child = match store
       .dirs
-      .insert(DirNode::new(self.epoch, Some(parent_no), no, name))?;
+      .insert(DirNode::new(self.epoch, Some(parent_no), no, name))
+    {
+      Ok(child) => child,
+      Err(refusal) => {
+        self.unissue_no();
+        return Err(refusal.into());
+      }
+    };
     let mut inode = Inode::new(no, self.epoch, Kind::Dir, mode, Body::Directory(child));
     inode.attrs.nlink = 2;
     stamp_all(&mut inode.attrs, now);
-    let handle = store.inodes.insert(inode)?;
-    self.table_set(store, no, handle)?;
-    self.dir_insert(store, dir, name, Child::Dir(child))?;
+    let handle = match self.install(store, no, inode) {
+      Ok(handle) => handle,
+      Err(refusal) => {
+        let _ = store.dirs.remove(child);
+        return Err(refusal);
+      }
+    };
+    if let Err(refusal) = self.dir_insert(store, dir, name, Child::Dir(child)) {
+      self.uninstall(store, no, handle);
+      let _ = store.dirs.remove(child);
+      return Err(refusal);
+    }
     self.touch_dir(store, dir, now)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, 1)?;
     let path = self.path_of(store, dir, name);
@@ -1218,15 +1269,16 @@ impl Volume {
   ) -> Result<InodeNo, VfsError> {
     self.live()?;
     names::check(name)?;
+    self.refuse_existing(store, dir, name)?;
+    self.admit_namespace(true)?;
+    let mut needs = Needs::default();
+    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
+    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    self.need_new_inode(store, &mut needs)?;
+    self.need_insert(store, dir, name, &mut needs)?;
+    self.admit_needs(store, &needs)?;
     let dir = self.make_current_dir(store, dir)?;
-    if store
-      .dirs
-      .get(dir)?
-      .lookup(&store.blocks, self.policy, name)
-      .is_some_and(|e| e.child != Child::Whiteout)
-    {
-      return Err(VfsError::AlreadyExists);
-    }
+    let parent = store.dirs.get(dir)?.inode;
     let no = self.next_no()?;
     let now = self.clock.wall_ns();
     let mut inode = Inode::new(
@@ -1238,27 +1290,32 @@ impl Volume {
     );
     inode.attrs.size = u64::try_from(target.len()).unwrap_or(0);
     inode.home = Some(Home {
-      parent: store.dirs.get(dir)?.inode,
+      parent,
       hash: self.policy.hash(name),
     });
     stamp_all(&mut inode.attrs, now);
-    let handle = store.inodes.insert(inode)?;
-    self.table_set(store, no, handle)?;
-    self.dir_insert(store, dir, name, Child::Symlink(no))?;
+    let handle = self.install(store, no, inode)?;
+    if let Err(refusal) = self.dir_insert(store, dir, name, Child::Symlink(no)) {
+      self.uninstall(store, no, handle);
+      return Err(refusal);
+    }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     self.record(Op::Symlink, &path, Some(no), 0);
     Ok(no)
   }
 
-  /// Creates a hard link to a file or symlink (`EPERM` for a directory).
-  pub fn link(
-    &mut self,
-    store: &mut Store,
+  /// Every refusal [`Volume::link`] can make, decided before anything changes: the name, the target's
+  /// kind and link count, the collision, the entry allowance and every slot the link takes (AUD-29-40).
+  /// Returns the target's kind. An overlay runs it before its own witness copy-up of a base target, so
+  /// a link that would be refused leaves the base entry unwitnessed.
+  pub(crate) fn admit_link(
+    &self,
+    store: &Store,
     dir: Handle<DirNode>,
     name: &str,
     target: InodeNo,
-  ) -> Result<(), VfsError> {
+  ) -> Result<Kind, VfsError> {
     self.live()?;
     names::check(name)?;
     let kind = self.kind(store, target)?;
@@ -1270,15 +1327,30 @@ impl Volume {
     if self.inode(store, target)?.attrs.nlink >= LINK_MAX {
       return Err(VfsError::TooManyLinks);
     }
+    self.refuse_existing(store, dir, name)?;
+    self.admit_namespace(false)?;
+    let mut needs = Needs::default();
+    let dir_no = store.dirs.get(self.head_dir(store, dir)?)?.inode;
+    self.need_current_dir(store, dir_no, &mut needs, &mut Vec::new())?;
+    self.need_current_inode(store, target, &mut needs)?;
+    self.need_insert(store, dir, name, &mut needs)?;
+    self.admit_needs(store, &needs)?;
+    Ok(kind)
+  }
+
+  /// Creates a hard link to a file or symlink (`EPERM` for a directory).
+  pub fn link(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    target: InodeNo,
+  ) -> Result<(), VfsError> {
+    let kind = self.admit_link(store, dir, name, target)?;
     let dir = self.make_current_dir(store, dir)?;
-    if store
-      .dirs
-      .get(dir)?
-      .lookup(&store.blocks, self.policy, name)
-      .is_some_and(|e| e.child != Child::Whiteout)
-    {
-      return Err(VfsError::AlreadyExists);
-    }
+    // The target's version made current before the name is published, so the link count and the
+    // multi-path flag below change it in place and cannot be refused after the entry exists.
+    self.make_current_inode(store, target)?;
     let now = self.clock.wall_ns();
     let child = if kind == Kind::Symlink {
       Child::Symlink(target)
@@ -1380,6 +1452,36 @@ impl Volume {
     to_dir: Handle<DirNode>,
     to_name: &str,
   ) -> Result<(), VfsError> {
+    let Some(plan) = self.admit_rename(store, from_dir, from_name, to_dir, to_name)? else {
+      return Ok(());
+    };
+    // A replaced file's last name retains its content when a snapshot pins it (§4.2 retention):
+    // secured before anything moves, so a refusal changes nothing (admitted above).
+    self.secure_retention(store, plan.retention)?;
+    let renamed = self.rename_secured(
+      store,
+      (from_dir, from_name),
+      (to_dir, &plan.to_name),
+      plan.source,
+      plan.target,
+    );
+    self.settle_retention(store);
+    renamed
+  }
+
+  /// Every refusal [`Volume::rename`] can make, decided before anything changes (AUD-29-40): the
+  /// names, the POSIX rules, the retention the replaced file's content needs and every slot the
+  /// rename takes. `None` when the rename is a no-op (the same entry under the same bytes, or two
+  /// names of one inode). An overlay runs it before its own witness copy-up of a base source, so a
+  /// rename that would be refused leaves the base entry unwitnessed.
+  pub(crate) fn admit_rename(
+    &mut self,
+    store: &Store,
+    from_dir: Handle<DirNode>,
+    from_name: &str,
+    to_dir: Handle<DirNode>,
+    to_name: &str,
+  ) -> Result<Option<RenamePlan>, VfsError> {
     self.live()?;
     names::check(to_name)?;
     let source = self.lookup(store, from_dir, from_name)?;
@@ -1394,21 +1496,31 @@ impl Volume {
       // so another spelling of it respells the entry: `readme` → `README` renames, the inode unchanged.
       // The same bytes change nothing (POSIX: "the same existing directory entry").
       if from_name == to_name {
-        return Ok(());
+        return Ok(None);
       }
-      return self.rename_secured(
-        store,
-        (from_dir, from_name),
-        (to_dir, to_name),
+      let plan = RenamePlan {
         source,
-        None,
-      );
+        target: None,
+        to_name: to_name.to_owned(),
+        retention: 0,
+      };
+      self.admit_needs(
+        store,
+        &self.rename_needs(
+          store,
+          (from_dir, from_name),
+          (to_dir, to_name),
+          source,
+          None,
+        )?,
+      )?;
+      return Ok(Some(plan));
     }
     if let Some(t) = target
       && t.inode == source.inode
     {
       // Two names of one inode: POSIX says do nothing.
-      return Ok(());
+      return Ok(None);
     }
     if let Child::Dir(moving) = source.child {
       if self.is_ancestor(store, moving, to_dir)? {
@@ -1428,8 +1540,6 @@ impl Volume {
     } else if matches!(target.map(|t| t.child), Some(Child::Dir(_))) {
       return Err(VfsError::IsDirectory);
     }
-    // A replaced file's last name retains its content when a snapshot pins it (§4.2 retention):
-    // secured before anything moves, so a refusal changes nothing.
     let retention = match target {
       Some(t)
         if matches!(
@@ -1441,24 +1551,34 @@ impl Volume {
       }
       _ => 0,
     };
-    self.secure_retention(store, retention)?;
+    if retention > store.budget.admittable() {
+      self.retention_refusals = self.retention_refusals.saturating_add(1);
+      return Err(VfsError::NoSpace);
+    }
     // Replacing another entry keeps the replaced entry's spelling on a folding volume, as APFS does:
     // `d` renamed onto `a` where `A` exists leaves one entry, `A` (EQUIVALENCE §4). Under the exact
     // policy the stored name is the requested one.
-    let replaced_spelling = match target {
-      Some(_) => Some(self.stored_name(store, to_dir, to_name)?),
-      None => None,
+    let to_name = match target {
+      Some(_) => self.stored_name(store, to_dir, to_name)?,
+      None => to_name.to_owned(),
     };
-    let to_name = replaced_spelling.as_deref().unwrap_or(to_name);
-    let renamed = self.rename_secured(
+    let replaced = target.filter(|t| t.child != Child::Whiteout);
+    self.admit_needs(
       store,
-      (from_dir, from_name),
-      (to_dir, to_name),
+      &self.rename_needs(
+        store,
+        (from_dir, from_name),
+        (to_dir, &to_name),
+        source,
+        replaced,
+      )?,
+    )?;
+    Ok(Some(RenamePlan {
       source,
       target,
-    );
-    self.settle_retention(store);
-    renamed
+      to_name,
+      retention,
+    }))
   }
 
   /// The spelling the directory stores for the entry `name` names under the volume's policy.
@@ -1488,12 +1608,45 @@ impl Volume {
     let (from_dir, from_name) = from;
     let (to_dir, to_name) = to;
     let from_path = self.path_of(store, from_dir, from_name);
+    let replaced = target.filter(|t| t.child != Child::Whiteout);
+    self.admit_needs(
+      store,
+      &self.rename_needs(store, from, to, source, replaced)?,
+    )?;
+    // Admitted (AUD-29-40): every copy-up the rename needs, before any name changes, so nothing after
+    // publication allocates; then the publication; then its consequences.
     let from_dir = self.make_current_dir(store, from_dir)?;
     let to_dir = self.make_current_dir(store, to_dir)?;
+    let moving = match source.child {
+      Child::Dir(moving) => Some(self.make_current_dir_node(store, moving)?),
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+        self.make_current_inode(store, no)?;
+        None
+      }
+      Child::Whiteout => None,
+    };
+    // The handles may have moved with the copy-ups (a moved directory's parent re-points to it).
+    let from_dir = self.head_dir(store, from_dir)?;
+    let to_dir = self.head_dir(store, to_dir)?;
+    if let Some(t) = replaced {
+      self.make_current_inode(store, t.inode)?;
+    }
+    let moved_child = match (source.child, moving) {
+      (Child::Dir(_), Some(moving)) => Child::Dir(moving),
+      (child, _) => child,
+    };
     let now = self.clock.wall_ns();
-    // Remove the target first, then move the entry.
-    if let Some(t) = target {
-      self.dir_remove(store, to_dir, to_name)?;
+    // Publication: each step all or nothing, the second undone if refused, so the names are either
+    // both as they were or both as asked — never a lost entry.
+    self.publish_rename(
+      store,
+      (from_dir, from_name),
+      (to_dir, to_name),
+      moved_child,
+      replaced,
+    )?;
+    // Consequences, which allocate nothing now that every version they touch is current.
+    if let Some(t) = replaced {
       match t.child {
         Child::Dir(existing) => {
           self.release_dir_node(store, existing)?;
@@ -1507,33 +1660,27 @@ impl Volume {
         Child::Whiteout => {}
       }
     }
-    let moved = self.dir_remove(store, from_dir, from_name)?;
-    let moved_child = match moved {
+    let to_no = store.dirs.get(to_dir)?.inode;
+    match moved_child {
       Child::Dir(moving) => {
-        let moving = self.make_current_dir_node(store, moving)?;
-        let to_no = store.dirs.get(to_dir)?.inode;
         let node = store.dirs.get_mut(moving)?;
         node.parent = Some(to_no);
         node.name = to_name.into();
         if from_dir != to_dir {
           self.adjust_nlink(store, store.dirs.get(from_dir)?.inode, -1)?;
-          self.adjust_nlink(store, store.dirs.get(to_dir)?.inode, 1)?;
+          self.adjust_nlink(store, to_no, 1)?;
         }
-        Child::Dir(moving)
       }
       Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
         // The file's home follows it.
-        let to_no = store.dirs.get(to_dir)?.inode;
         let handle = self.make_current_inode(store, no)?;
         store.inodes.get_mut(handle)?.home = Some(Home {
           parent: to_no,
           hash: self.policy.hash(to_name),
         });
-        moved
       }
-      Child::Whiteout => moved,
-    };
-    self.dir_insert(store, to_dir, to_name, moved_child)?;
+      Child::Whiteout => {}
+    }
     self.touch_dir(store, from_dir, now)?;
     self.touch_dir(store, to_dir, now)?;
     let to_path = self.path_of(store, to_dir, to_name);
@@ -2640,6 +2787,213 @@ impl Volume {
     Ok(no)
   }
 
+  /// Admits a namespace verb's volume allowances before anything changes (§4.2; AUD-29-40): a fresh
+  /// inode when `inode` is set, and one live entry. A verb admitted here can no longer be refused by
+  /// [`Volume::next_no`] or [`Volume::dir_insert`] for its allowance, so it never takes an inode's
+  /// charge it then has to keep.
+  fn admit_namespace(&self, inode: bool) -> Result<(), VfsError> {
+    let inode_refused = inode
+      && (self.live_inodes >= self.inode_allowance || self.next_counter >= InodeNo::DERIVED_BIT);
+    if inode_refused || self.live_entries >= self.entry_allowance {
+      return Err(VfsError::NoSpace);
+    }
+    Ok(())
+  }
+
+  /// Counts what making inode `no` current would take (nothing when it already is).
+  fn need_current_inode(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    needs: &mut Needs,
+  ) -> Result<(), VfsError> {
+    let handle = trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::NotFound)?;
+    let born = store.inodes.get(handle)?.born;
+    if born == self.epoch {
+      return Ok(());
+    }
+    needs.inodes = needs.inodes.saturating_add(1);
+    needs.tries = needs.tries.saturating_add(trie::nodes_to_set(
+      &store.tries,
+      self.inode_root,
+      no,
+      self.epoch,
+    )?);
+    if self.retains(born) {
+      needs.retained = needs.retained.saturating_add(1);
+    }
+    Ok(())
+  }
+
+  /// Counts what making directory `no` and its ancestors current would take. A current directory's
+  /// ancestors are current (a copy-up makes the ancestors current first), so the walk stops at the
+  /// first current one, or at one already counted (`counted`, shared by a verb's several directories).
+  fn need_current_dir(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    needs: &mut Needs,
+    counted: &mut Vec<InodeNo>,
+  ) -> Result<(), VfsError> {
+    let mut next = Some(no);
+    while let Some(no) = next {
+      if counted.contains(&no) {
+        break;
+      }
+      counted.push(no);
+      let node = store.dirs.get(self.current_dir(store, no)?)?;
+      if node.born == self.epoch {
+        break;
+      }
+      needs.dirs = needs.dirs.saturating_add(1);
+      self.need_current_inode(store, no, needs)?;
+      if let Some(parent_no) = node.parent {
+        let parent = store.dirs.get(self.current_dir(store, parent_no)?)?;
+        needs.blocks = needs.blocks.saturating_add(parent.change_blocks(
+          &store.blocks,
+          self.epoch,
+          self.policy,
+          &node.name,
+        )?);
+      }
+      next = node.parent;
+    }
+    Ok(())
+  }
+
+  /// Counts the fresh inode a create installs: its version and its trie path.
+  fn need_new_inode(&self, store: &Store, needs: &mut Needs) -> Result<(), VfsError> {
+    let no = InodeNo::compose(self.prefix, self.next_counter);
+    needs.inodes = needs.inodes.saturating_add(1);
+    needs.tries = needs.tries.saturating_add(trie::nodes_to_set(
+      &store.tries,
+      self.inode_root,
+      no,
+      self.epoch,
+    )?);
+    Ok(())
+  }
+
+  /// Counts the blocks an insert of `name` into the head's `dir` takes.
+  fn need_insert(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    needs: &mut Needs,
+  ) -> Result<(), VfsError> {
+    let node = store.dirs.get(self.head_dir(store, dir)?)?;
+    needs.blocks = needs.blocks.saturating_add(node.insert_blocks(
+      &store.blocks,
+      self.epoch,
+      self.policy,
+      name,
+      store.dir_cutover,
+    )?);
+    Ok(())
+  }
+
+  /// Counts the blocks a change of the entry `name` in the head's `dir` takes.
+  fn need_change(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    needs: &mut Needs,
+  ) -> Result<(), VfsError> {
+    let node = store.dirs.get(self.head_dir(store, dir)?)?;
+    needs.blocks = needs.blocks.saturating_add(node.change_blocks(
+      &store.blocks,
+      self.epoch,
+      self.policy,
+      name,
+    )?);
+    Ok(())
+  }
+
+  /// Admits a verb's counted needs whole, or refuses it before anything changes: each slab's room,
+  /// then the retention its copy-ups would charge (the volume's retention allowance and the shard's
+  /// unpromised version capacity, as [`Volume::make_current_inode`] charges them).
+  fn admit_needs(&self, store: &Store, needs: &Needs) -> Result<(), VfsError> {
+    let full = |capacity: usize| {
+      Err(VfsError::Memory(slates_mem::MemError::SlabFull {
+        capacity,
+      }))
+    };
+    if store.dirs.room() < needs.dirs {
+      return full(store.dirs.max_slots());
+    }
+    if store.inodes.room() < needs.inodes {
+      return full(store.inodes.max_slots());
+    }
+    if store.tries.room() < needs.tries {
+      return full(store.tries.max_slots());
+    }
+    if store.blocks.room() < needs.blocks {
+      return full(store.blocks.max_slots());
+    }
+    if needs.retained > 0 {
+      let over_allowance = self.retention_allowance != u64::MAX
+        && self.retained_versions().saturating_add(needs.retained) > self.retention_allowance;
+      if over_allowance || store.versions.admittable() < needs.retained {
+        return Err(VfsError::NoSpace);
+      }
+    }
+    Ok(())
+  }
+
+  /// Refuses `name` in the head's `dir` when an entry other than a whiteout holds it — read-only, so a
+  /// verb learns of the collision before it copies anything up.
+  fn refuse_existing(
+    &self,
+    store: &Store,
+    dir: Handle<DirNode>,
+    name: &str,
+  ) -> Result<(), VfsError> {
+    let dir = self.head_dir(store, dir)?;
+    if store
+      .dirs
+      .get(dir)?
+      .lookup(&store.blocks, self.policy, name)
+      .is_some_and(|e| e.child != Child::Whiteout)
+    {
+      return Err(VfsError::AlreadyExists);
+    }
+    Ok(())
+  }
+
+  /// Undoes an inode a verb installed and never published (AUD-29-40): its table entry, its version
+  /// and its charge, so the refused verb leaves the table, the slab and the allowance as they were.
+  /// The number is not reissued.
+  fn uninstall(&mut self, store: &mut Store, no: InodeNo, handle: Handle<Inode>) {
+    let _ = self.table_remove(store, no);
+    let _ = store.inodes.remove(handle);
+    self.unissue_no();
+  }
+
+  /// Installs a fresh inode under a number [`Volume::next_no`] issued: its version in the slab and its
+  /// table entry, both or neither (a refusal gives the charge back).
+  fn install(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    inode: Inode,
+  ) -> Result<Handle<Inode>, VfsError> {
+    let handle = match store.inodes.insert(inode) {
+      Ok(handle) => handle,
+      Err(refusal) => {
+        self.unissue_no();
+        return Err(refusal.into());
+      }
+    };
+    if let Err(refusal) = self.table_set(store, no, handle) {
+      let _ = store.inodes.remove(handle);
+      self.unissue_no();
+      return Err(refusal);
+    }
+    Ok(handle)
+  }
+
   /// Returns the most recently issued number's charge when its inode could not be installed (a slab
   /// or table refusal right after [`Volume::next_no`]), so a refused create leaves the allowance as
   /// it was. The counter is not rewound: a number is never issued twice within a volume.
@@ -3096,7 +3450,15 @@ impl Volume {
     // unpromised capacity remains, so a snapshot-and-diverge never spends a bounded writer's reserved
     // slab. Credited back symmetrically as retained versions are freed in `destroy_snapshot`/`destroy`.
     // A version this volume does not own (a clone's inherited one) costs it nothing and is not charged.
-    if self.retains(born) {
+    // The version slot is admitted before anything is charged or moved (AUD-29-40: the charge and the
+    // inline bytes' accounting moved, and the slot was then refused).
+    if !store.inodes.has_room() {
+      return Err(VfsError::Memory(slates_mem::MemError::SlabFull {
+        capacity: store.inodes.max_slots(),
+      }));
+    }
+    let charged = self.retains(born);
+    if charged {
       store
         .versions
         .charge_retention(1)
@@ -3118,14 +3480,35 @@ impl Volume {
         old.body = copy.body.clone();
       }
     }
-    if let Body::Inline(v) = &copy.body {
-      // The head's copy of inline content is born now; the old record keeps the snapshot's.
-      let len = u64::try_from(v.len()).unwrap_or(0);
+    // The head's copy of inline content is born now; the old record keeps the snapshot's. Moved only
+    // once the copy is installed.
+    let inline = match &copy.body {
+      Body::Inline(v) => Some(u64::try_from(v.len()).unwrap_or(0)),
+      _ => None,
+    };
+    let installed = match store.inodes.insert(copy) {
+      Ok(fresh) => match self.table_set(store, no, fresh) {
+        Ok(_) => Ok(fresh),
+        Err(refusal) => {
+          let _ = store.inodes.remove(fresh);
+          Err(refusal)
+        }
+      },
+      Err(refusal) => Err(refusal.into()),
+    };
+    let fresh = match installed {
+      Ok(fresh) => fresh,
+      Err(refusal) => {
+        if charged {
+          self.credit_retention(store, 0, 1);
+        }
+        return Err(refusal);
+      }
+    };
+    if let Some(len) = inline {
       self.bytes.sub(born, len);
       self.bytes.add(self.epoch, len);
     }
-    let fresh = store.inodes.insert(copy)?;
-    self.table_set(store, no, fresh)?;
     self.retire(store, Dead::Inode(handle, born))?;
     Ok(fresh)
   }
@@ -3159,29 +3542,42 @@ impl Volume {
     let born = node.born;
     let parent_no = node.parent;
     let own_name = node.name.clone();
-    let mut copy = node.clone();
-    copy.born = self.epoch;
-    let fresh = store.dirs.insert(copy)?;
-    // The inode record follows the node, so the table names the fresh node from now on.
-    let inode_handle = self.make_current_inode(store, no)?;
-    store.inodes.get_mut(inode_handle)?.body = Body::Directory(fresh);
-    match parent_no {
-      None => self.root = fresh,
+    // Each step either leaves valid preparation (a current ancestor, a current inode version naming
+    // this same node) or is undone, so a refusal anywhere leaves no node a parent does not reach and
+    // never a table entry and a parent naming different nodes (AUD-29-40: the copy was inserted first
+    // and orphaned when the inode's copy-up was refused). First the ancestors, then this inode.
+    let parent = match parent_no {
+      None => None,
       Some(parent_no) => {
         let parent = self.current_dir(store, parent_no)?;
-        let parent = self.make_current_dir_node(store, parent)?;
+        Some(self.make_current_dir_node(store, parent)?)
+      }
+    };
+    let inode_handle = self.make_current_inode(store, no)?;
+    let mut copy = store.dirs.get(current)?.clone();
+    copy.born = self.epoch;
+    let fresh = store.dirs.insert(copy)?;
+    match parent {
+      None => self.root = fresh,
+      Some(parent) => {
         let mut retired = Retired::new();
-        store.dirs.get_mut(parent)?.set_child(
+        let set = store.dirs.get_mut(parent)?.set_child(
           &mut store.blocks,
           self.epoch,
           &mut retired,
           self.policy,
           &own_name,
           Child::Dir(fresh),
-        )?;
+        );
+        if let Err(refusal) = set {
+          let _ = store.dirs.remove(fresh);
+          return Err(refusal);
+        }
         self.retire_blocks(store, retired)?;
       }
     }
+    // The inode record follows the node, so the table names the fresh node from now on.
+    store.inodes.get_mut(inode_handle)?.body = Body::Directory(fresh);
     self.retire(store, Dead::Dir(current, born))?;
     Ok(fresh)
   }
@@ -3225,16 +3621,31 @@ impl Volume {
     if self.live_entries >= self.entry_allowance {
       return Err(VfsError::NoSpace);
     }
+    self.dir_place(store, dir, name, child).map(drop)
+  }
+
+  /// Places `name → child` in `dir` without the entry allowance's admission — for a rename, whose new
+  /// name replaces the old one it removes next (net zero). All or nothing. Returns whether it took the
+  /// place of a whiteout, which its undo restores.
+  fn dir_place(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    child: Child,
+  ) -> Result<bool, VfsError> {
     let cutover = store.dir_cutover;
     let epoch = self.epoch;
     let policy = self.policy;
     let mut retired = Retired::new();
     let node = store.dirs.get_mut(dir)?;
-    if node
+    let over_whiteout = node
       .lookup(&store.blocks, policy, name)
-      .is_some_and(|e| e.child == Child::Whiteout)
-    {
-      node.set_child(&mut store.blocks, epoch, &mut retired, policy, name, child)?;
+      .is_some_and(|e| e.child == Child::Whiteout);
+    let placed = if over_whiteout {
+      node
+        .set_child(&mut store.blocks, epoch, &mut retired, policy, name, child)
+        .map(drop)
     } else {
       node.insert(
         &mut store.blocks,
@@ -3244,10 +3655,191 @@ impl Volume {
         name,
         child,
         cutover,
-      )?;
-    }
+      )
+    };
+    // The blocks a copy replaced are retired whether or not the step completed: an all-or-nothing
+    // step refuses before copying, and a completed one has replaced them.
     self.retire_blocks(store, retired)?;
+    placed?;
     self.live_entries += 1;
+    Ok(over_whiteout)
+  }
+
+  /// Undoes [`Volume::dir_place`] of `name` in `dir`: the whiteout back, or the entry removed. Its path
+  /// was made current by the placement, so it copies nothing.
+  fn dir_unplace(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    over_whiteout: bool,
+  ) -> Result<(), VfsError> {
+    let (cutover, epoch, policy) = (store.dir_cutover, self.epoch, self.policy);
+    let mut retired = Retired::new();
+    let node = store.dirs.get_mut(dir)?;
+    let undone = if over_whiteout {
+      node
+        .set_child(
+          &mut store.blocks,
+          epoch,
+          &mut retired,
+          policy,
+          name,
+          Child::Whiteout,
+        )
+        .map(drop)
+    } else {
+      node
+        .remove(
+          &mut store.blocks,
+          epoch,
+          &mut retired,
+          policy,
+          name,
+          cutover,
+        )
+        .map(drop)
+    };
+    self.retire_blocks(store, retired)?;
+    undone?;
+    self.live_entries = self.live_entries.saturating_sub(1);
+    Ok(())
+  }
+
+  /// Points the existing entry `name` in `dir` at `child` (a rename onto an existing name). All or
+  /// nothing; the entry count is unchanged.
+  fn dir_set(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    name: &str,
+    child: Child,
+  ) -> Result<(), VfsError> {
+    let (epoch, policy) = (self.epoch, self.policy);
+    let mut retired = Retired::new();
+    let set = store.dirs.get_mut(dir)?.set_child(
+      &mut store.blocks,
+      epoch,
+      &mut retired,
+      policy,
+      name,
+      child,
+    );
+    self.retire_blocks(store, retired)?;
+    if set? {
+      Ok(())
+    } else {
+      Err(VfsError::NotFound)
+    }
+  }
+
+  /// Respells the entry `old` in `dir` as `new`, an equivalent spelling. All or nothing.
+  fn dir_respell(
+    &mut self,
+    store: &mut Store,
+    dir: Handle<DirNode>,
+    old: &str,
+    new: &str,
+  ) -> Result<(), VfsError> {
+    let (cutover, epoch, policy) = (store.dir_cutover, self.epoch, self.policy);
+    let mut retired = Retired::new();
+    let respelled = store.dirs.get_mut(dir)?.respell(
+      &mut store.blocks,
+      epoch,
+      &mut retired,
+      policy,
+      old,
+      new,
+      cutover,
+    );
+    self.retire_blocks(store, retired)?;
+    if respelled? {
+      Ok(())
+    } else {
+      Err(VfsError::NotFound)
+    }
+  }
+
+  /// What a rename takes (AUD-29-40): both directories' paths made current, the moved directory (with
+  /// its path) or the moved object's inode, the replaced object's inode, and the blocks of the entry
+  /// changes its publication makes.
+  fn rename_needs(
+    &self,
+    store: &Store,
+    from: (Handle<DirNode>, &str),
+    to: (Handle<DirNode>, &str),
+    source: Located,
+    replaced: Option<Located>,
+  ) -> Result<Needs, VfsError> {
+    let (from_dir, from_name) = from;
+    let (to_dir, to_name) = to;
+    let mut needs = Needs::default();
+    let mut counted = Vec::new();
+    let from_no = store.dirs.get(self.head_dir(store, from_dir)?)?.inode;
+    let to_no = store.dirs.get(self.head_dir(store, to_dir)?)?.inode;
+    self.need_current_dir(store, from_no, &mut needs, &mut counted)?;
+    self.need_current_dir(store, to_no, &mut needs, &mut counted)?;
+    match source.child {
+      Child::Dir(_) => self.need_current_dir(store, source.inode, &mut needs, &mut counted)?,
+      Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
+        self.need_current_inode(store, no, &mut needs)?
+      }
+      Child::Whiteout => {}
+    }
+    if let Some(t) = replaced {
+      self.need_current_inode(store, t.inode, &mut needs)?;
+    }
+    if replaced.is_none() && from_no == to_no && self.policy.same(from_name, to_name) {
+      let node = store.dirs.get(self.head_dir(store, from_dir)?)?;
+      needs.blocks = needs.blocks.saturating_add(node.respell_blocks(
+        &store.blocks,
+        self.epoch,
+        self.policy,
+        from_name,
+        to_name,
+      )?);
+      return Ok(needs);
+    }
+    match replaced {
+      Some(_) => self.need_change(store, to_dir, to_name, &mut needs)?,
+      None => self.need_insert(store, to_dir, to_name, &mut needs)?,
+    }
+    self.need_change(store, from_dir, from_name, &mut needs)?;
+    Ok(needs)
+  }
+
+  /// A rename's publication (AUD-29-40): the new name first — the replaced entry pointed at the moved
+  /// object, or the name placed — then the old name removed, the first step undone if the second is
+  /// refused. Each step is all or nothing, so the names are either both as they were or both as asked.
+  /// A respelling of one entry is a single in-place step.
+  fn publish_rename(
+    &mut self,
+    store: &mut Store,
+    from: (Handle<DirNode>, &str),
+    to: (Handle<DirNode>, &str),
+    moved: Child,
+    replaced: Option<Located>,
+  ) -> Result<(), VfsError> {
+    let (from_dir, from_name) = from;
+    let (to_dir, to_name) = to;
+    if replaced.is_none() && from_dir == to_dir && self.policy.same(from_name, to_name) {
+      return self.dir_respell(store, from_dir, from_name, to_name);
+    }
+    let over_whiteout = match replaced {
+      Some(_) => {
+        self.dir_set(store, to_dir, to_name, moved)?;
+        None
+      }
+      None => Some(self.dir_place(store, to_dir, to_name, moved)?),
+    };
+    if let Err(refusal) = self.dir_remove(store, from_dir, from_name) {
+      let _ = match (replaced, over_whiteout) {
+        (Some(t), _) => self.dir_set(store, to_dir, to_name, t.child),
+        (None, Some(over_whiteout)) => self.dir_unplace(store, to_dir, to_name, over_whiteout),
+        (None, None) => Ok(()),
+      };
+      return Err(refusal);
+    }
     Ok(())
   }
 

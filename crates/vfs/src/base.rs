@@ -1622,6 +1622,9 @@ impl Overlay<'_> {
     if self.exists(store, dir, name)? {
       return Err(VfsError::AlreadyExists);
     }
+    // The link's own refusals first, so a link that would be refused never witnesses its target
+    // (AUD-29-40: the witness was journaled and kept by a refused link).
+    self.vol.admit_link(store, dir, name, target)?;
     self.copy_up(store, target, CopyUp::Metadata)?;
     self.vol.link(store, dir, name, target)
   }
@@ -1732,6 +1735,15 @@ impl Overlay<'_> {
     let to_dir = self.vol.head_dir(store, to_dir)?;
     let from_base = self.base_entry(store, from_dir, from_name)?;
     let _ = self.base_entry(store, to_dir, to_name)?;
+    // The rename's own refusals first, so a rename that would be refused never witnesses its source
+    // (AUD-29-40: the witness was journaled and kept by a refused rename).
+    if self
+      .vol
+      .admit_rename(store, from_dir, from_name, to_dir, to_name)?
+      .is_none()
+    {
+      return Ok(());
+    }
     let origin = match (source.child, &from_base) {
       (Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no), Some(_)) => {
         self.copy_up(store, no, CopyUp::Metadata)?;

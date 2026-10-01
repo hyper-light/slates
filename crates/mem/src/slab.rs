@@ -171,6 +171,24 @@ impl<T> Slab<T> {
       && self.generation_base <= self.generation_limit
   }
 
+  /// How many inserts would succeed from now, exactly: the vacant slots already created (each on the
+  /// free list; a slot retired at the generation limit is not vacant) plus the slots still to be
+  /// created under the bound, while fresh generations remain. A caller that must make several
+  /// inserts as one step admits them all against this before the first, so none is refused halfway.
+  pub fn room(&self) -> usize {
+    let vacant = self
+      .slots
+      .len()
+      .saturating_sub(self.len)
+      .saturating_sub(self.retired);
+    let fresh = if self.generation_base <= self.generation_limit {
+      self.max_slots.saturating_sub(self.slots.len())
+    } else {
+      0
+    };
+    vacant.saturating_add(fresh)
+  }
+
   /// Slots created so far (occupied or vacant).
   pub const fn slots(&self) -> usize {
     self.slots.len()
@@ -501,6 +519,44 @@ mod tests {
       spent.insert_at(0, limit + 1, 5),
       Err(MemError::GenerationExhausted { index: 0 })
     );
+  }
+
+  /// AUD-29-40 (the admission a multi-insert step needs). Do: on a slab of four slots whose
+  /// generations start one below their limit, insert exactly `room()` values and then one more, give
+  /// them back, and do it again. Expect: every one of the `room()` inserts succeeds and the next is
+  /// refused each time — the count is exact over fresh slots, then vacant slots at the limit — and
+  /// once every slot has issued the limit and retired, `room()` is zero.
+  #[test]
+  fn room_counts_exactly_the_inserts_that_succeed() {
+    /// Shape: a bound small enough to fill in a few steps.
+    const BOUND: usize = 4;
+    let limit = crate::handle::Encoded::MAX_GENERATION;
+    let mut slab: Slab<u64> =
+      Slab::with_generation_base(2, BOUND, limit - 1).with_generation_limit(limit);
+    let check = |slab: &mut Slab<u64>| {
+      let room = slab.room();
+      let taken: Vec<_> = (0..room)
+        .map(|value| {
+          slab
+            .insert(u64::try_from(value).unwrap())
+            .expect("an insert within room()")
+        })
+        .collect();
+      assert!(slab.insert(0).is_err(), "room() was {room}; one more fit");
+      for handle in taken {
+        slab.remove(handle).unwrap();
+      }
+    };
+    // First fresh slots at the limit's predecessor; then the same slots vacant at the limit, which
+    // retire when given back.
+    check(&mut slab);
+    check(&mut slab);
+    assert_eq!(
+      slab.retired(),
+      BOUND,
+      "every slot issued the limit and retired"
+    );
+    assert_eq!(slab.room(), 0);
   }
 
   #[test]

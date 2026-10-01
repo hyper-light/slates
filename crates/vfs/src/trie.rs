@@ -76,9 +76,77 @@ pub fn get(nodes: &Slab<TrieNode>, root: Handle<TrieNode>, no: InodeNo) -> Optio
   None
 }
 
+/// The nodes [`set`] of `no` allocates: a copy of each node on the path born before `epoch`, and a
+/// fresh node for each level below the first empty slot.
+pub(crate) fn nodes_to_set(
+  nodes: &Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  no: InodeNo,
+  epoch: Epoch,
+) -> Result<usize, VfsError> {
+  let copy = |node: Handle<TrieNode>| -> Result<usize, VfsError> {
+    Ok(usize::from(nodes.get(node)?.born != epoch))
+  };
+  let mut needed = copy(root)?;
+  let mut node = root;
+  for level in 0..LEVELS.saturating_sub(1) {
+    match nodes.get(node)?.slots[digit(no, level)] {
+      Slot::Node(child) => {
+        needed = needed.saturating_add(copy(child)?);
+        node = child;
+      }
+      Slot::Empty | Slot::Inode(_) => {
+        let below = usize::try_from(LEVELS.saturating_sub(1).saturating_sub(level)).unwrap_or(0);
+        return Ok(needed.saturating_add(below));
+      }
+    }
+  }
+  Ok(needed)
+}
+
+/// The nodes [`remove`] of `no` allocates: a copy of each node on its path born before `epoch` (none
+/// when `no` is absent, which changes nothing).
+fn nodes_to_remove(
+  nodes: &Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  no: InodeNo,
+  epoch: Epoch,
+) -> Result<usize, VfsError> {
+  if get(nodes, root, no).is_none() {
+    return Ok(0);
+  }
+  let copy = |node: Handle<TrieNode>| -> Result<usize, VfsError> {
+    Ok(usize::from(nodes.get(node)?.born != epoch))
+  };
+  let mut needed = copy(root)?;
+  let mut node = root;
+  for level in 0..LEVELS {
+    match nodes.get(node)?.slots[digit(no, level)] {
+      Slot::Node(child) => {
+        needed = needed.saturating_add(copy(child)?);
+        node = child;
+      }
+      Slot::Empty | Slot::Inode(_) => break,
+    }
+  }
+  Ok(needed)
+}
+
+/// Refuses, before anything changes, a mutation that needs more nodes than the slab can issue — so a
+/// set or remove either completes or leaves the trie and the slab exactly as they were (AUD-29-40: a
+/// refusal halfway down the path left copies no root reached, and a lost copied root).
+fn admit(nodes: &Slab<TrieNode>, needed: usize) -> Result<(), VfsError> {
+  if nodes.room() < needed {
+    return Err(VfsError::Memory(slates_mem::MemError::SlabFull {
+      capacity: nodes.max_slots(),
+    }));
+  }
+  Ok(())
+}
+
 /// Sets `no` to `handle` (inserting or replacing), copying every node on the path born before
 /// `epoch` and reporting the replaced nodes to `dead`. Returns the (possibly new) root and the
-/// previous handle, if any.
+/// previous handle, if any. All or nothing: the nodes it needs are admitted before the first changes.
 pub fn set(
   nodes: &mut Slab<TrieNode>,
   root: Handle<TrieNode>,
@@ -87,6 +155,7 @@ pub fn set(
   epoch: Epoch,
   dead: &mut Deadlist,
 ) -> Result<(Handle<TrieNode>, Option<Handle<Inode>>), VfsError> {
+  admit(nodes, nodes_to_set(nodes, root, no, epoch)?)?;
   let mut path: Vec<(Handle<TrieNode>, usize)> =
     Vec::with_capacity(usize::try_from(LEVELS).unwrap_or(0));
   let mut node = ensure_current(nodes, root, epoch, dead)?;
@@ -114,8 +183,8 @@ pub fn set(
   Ok((new_root, previous))
 }
 
-/// Removes `no`, copying the path as `set` does; returns the (possibly new) root and the removed
-/// handle, if any. Empty nodes are left in place: numbers are never reused, so a freed leaf's
+/// Removes `no`, copying the path as `set` does (all or nothing, admitted the same way); returns the
+/// (possibly new) root and the removed handle, if any. Empty nodes are left in place: numbers are never reused, so a freed leaf's
 /// node stays sparse and is reclaimed with its snapshot's deadlist or the volume.
 pub fn remove(
   nodes: &mut Slab<TrieNode>,
@@ -127,6 +196,7 @@ pub fn remove(
   if get(nodes, root, no).is_none() {
     return Ok((root, None));
   }
+  admit(nodes, nodes_to_remove(nodes, root, no, epoch)?)?;
   let mut node = ensure_current(nodes, root, epoch, dead)?;
   let new_root = node;
   for level in 0..LEVELS {

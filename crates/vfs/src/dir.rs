@@ -38,6 +38,12 @@ pub const SMALL_ENTRIES: usize = MEASURED_CUTOVER;
 /// longer names send the directory to the tree early.
 pub const SMALL_NAME_BYTES: usize = SMALL_ENTRIES * MEASURED_NAME_BYTES;
 
+/// Derived: the blocks a small directory's move to a tree takes — one. At the move it holds at most
+/// [`SMALL_ENTRIES`] entries and [`SMALL_NAME_BYTES`] of names, and the new entry adds one entry and at
+/// most `NAME_MAX` bytes: `(2 + 1) × 24 + 98 + 255 = 425` bytes, far inside one 4,096-byte block, so
+/// the fresh tree never splits (`a_small_directory_moves_to_a_tree_in_one_block` checks it).
+pub const SMALL_TO_TREE_BLOCKS: usize = 1;
+
 /// What an entry points to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Child {
@@ -310,12 +316,28 @@ impl DirNode {
         s.insert_at(at, hash, name, child);
         return Ok(());
       }
-      // Move to the tree, then insert there.
+      // Move to the tree, then insert there. The tree is built beside the small form and published
+      // only once it holds every entry; a refusal partway gives its blocks back and leaves the small
+      // form as it was (AUD-29-40: a refused move kept the blocks it had taken).
       let mut tree = Tree::new(blocks, epoch)?;
+      let mut built = Ok(());
       for e in s.entries() {
-        tree.insert(blocks, epoch, retired, policy, s.name(*e), e.child)?;
+        built = tree.insert(blocks, epoch, retired, policy, s.name(*e), e.child);
+        if built.is_err() {
+          break;
+        }
+      }
+      if let Err(refusal) = built {
+        tree.discard(blocks);
+        return Err(refusal);
+      }
+      // The new entry is admitted before the tree is published, so the move and the insert are one step.
+      if let Err(refusal) = tree.insert(blocks, epoch, retired, policy, name, child) {
+        tree.discard(blocks);
+        return Err(refusal);
       }
       self.entries = DirEntries::Indexed(tree);
+      return Ok(());
     }
     match &mut self.entries {
       DirEntries::Indexed(t) => t.insert(blocks, epoch, retired, policy, name, child),
@@ -363,6 +385,110 @@ impl DirNode {
         }
         Ok(removed)
       }
+    }
+  }
+
+  /// The most directory blocks an insert of `name` can take (AUD-29-40's reservation): inline, none
+  /// while the name fits; the move to a tree, one; a tree, its insert's copies and worst-case split.
+  pub fn insert_blocks(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    name: &str,
+    cutover: usize,
+  ) -> Result<usize, VfsError> {
+    let cutover = cutover.clamp(1, SMALL_ENTRIES);
+    match &self.entries {
+      DirEntries::Small(s) if usize::from(s.count) < cutover && s.fits(name.len()) => Ok(0),
+      DirEntries::Small(_) => Ok(SMALL_TO_TREE_BLOCKS),
+      DirEntries::Indexed(t) => t.insert_blocks(blocks, epoch, policy, name),
+    }
+  }
+
+  /// The directory blocks a change of the entry `name` (its child set, or its removal) takes: none
+  /// inline, the path's copies in a tree.
+  pub fn change_blocks(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    name: &str,
+  ) -> Result<usize, VfsError> {
+    match &self.entries {
+      DirEntries::Small(_) => Ok(0),
+      DirEntries::Indexed(t) => t.change_blocks(blocks, epoch, policy, name),
+    }
+  }
+
+  /// The most directory blocks a respelling of `old` as `new` can take.
+  pub fn respell_blocks(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    old: &str,
+    new: &str,
+  ) -> Result<usize, VfsError> {
+    match &self.entries {
+      DirEntries::Small(s) => {
+        // Inline names are compacted on removal, so the new spelling fits where the old one was
+        // unless the bytes grow past the inline area; then the move to a tree takes one block.
+        let used = usize::from(s.used)
+          .saturating_sub(old.len())
+          .saturating_add(new.len());
+        Ok(if used <= SMALL_NAME_BYTES {
+          0
+        } else {
+          SMALL_TO_TREE_BLOCKS
+        })
+      }
+      DirEntries::Indexed(t) => t.respell_blocks(blocks, epoch, policy, old, new),
+    }
+  }
+
+  /// Respells the entry `old` as `new`, a spelling `policy` holds equal (a folding volume's rename of an
+  /// entry to another spelling of itself): the entry keeps its child and position. All or nothing — a
+  /// refusal leaves the entry under its old spelling. `false` when `old` is absent.
+  #[allow(clippy::too_many_arguments)]
+  pub fn respell(
+    &mut self,
+    blocks: &mut Slab<DirBlock>,
+    epoch: Epoch,
+    retired: &mut Retired,
+    policy: NameEquivalence,
+    old: &str,
+    new: &str,
+    cutover: usize,
+  ) -> Result<bool, VfsError> {
+    match &mut self.entries {
+      DirEntries::Small(s) => {
+        let hash = policy.hash(old);
+        let Ok(at) = s.position(policy, hash, old) else {
+          return Ok(false);
+        };
+        let Some(entry) = s.entries().get(at).copied() else {
+          return Ok(false);
+        };
+        let stored = s.name(entry).to_owned();
+        s.remove_at(at);
+        if s.fits(new.len()) {
+          s.insert_at(at, entry.hash, new, entry.child);
+          return Ok(true);
+        }
+        // The new spelling does not fit inline: the move to a tree takes it, or refuses having
+        // changed nothing, and the old spelling goes back where it was (it fit before).
+        match self.insert(blocks, epoch, retired, policy, new, entry.child, cutover) {
+          Ok(()) => Ok(true),
+          Err(refusal) => {
+            if let DirEntries::Small(s) = &mut self.entries {
+              s.insert_at(at, entry.hash, &stored, entry.child);
+            }
+            Err(refusal)
+          }
+        }
+      }
+      DirEntries::Indexed(t) => t.respell(blocks, epoch, retired, policy, old, new),
     }
   }
 
@@ -471,6 +597,50 @@ mod tests {
       .unwrap();
     }
     d
+  }
+
+  /// AUD-29-40 (`SMALL_TO_TREE_BLOCKS`). Do: fill a small directory to its inline bound with the
+  /// longest names it holds, then insert a `NAME_MAX` name, which moves it to a tree. Expect: the move
+  /// takes exactly the one block the reservation counts, and `insert_blocks` reported it beforehand.
+  #[test]
+  fn a_small_directory_moves_to_a_tree_in_one_block() {
+    let policy = NameEquivalence::Fold;
+    let mut blocks = blocks();
+    let mut retired = Retired::new();
+    let mut d = DirNode::new(Epoch(0), None, InodeNo(1), "full");
+    let longest = SMALL_NAME_BYTES / SMALL_ENTRIES;
+    for at in 0..SMALL_ENTRIES {
+      let name = format!("{at}{}", "n".repeat(longest - 1));
+      d.insert(
+        &mut blocks,
+        Epoch(0),
+        &mut retired,
+        policy,
+        &name,
+        Child::File(InodeNo(2)),
+        SMALL_ENTRIES,
+      )
+      .unwrap();
+    }
+    assert!(!d.is_indexed(), "still inline at its bound");
+    let long = "x".repeat(crate::names::NAME_MAX);
+    let reported = d
+      .insert_blocks(&blocks, Epoch(0), policy, &long, SMALL_ENTRIES)
+      .unwrap();
+    let before = blocks.len();
+    d.insert(
+      &mut blocks,
+      Epoch(0),
+      &mut retired,
+      policy,
+      &long,
+      Child::File(InodeNo(3)),
+      SMALL_ENTRIES,
+    )
+    .unwrap();
+    assert!(d.is_indexed());
+    assert_eq!(blocks.len() - before, SMALL_TO_TREE_BLOCKS);
+    assert_eq!(reported, SMALL_TO_TREE_BLOCKS);
   }
 
   #[test]

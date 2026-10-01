@@ -1733,6 +1733,19 @@ the verdict that every entry beneath still matches its listing fingerprint.
 
 **Laptop degenerate.** Identical.
 
+> **Status (2026-10-01, AUD-29-40; A-60).** A refused namespace verb changes nothing.
+> - **Reserve, then mutate.** Create, mknod, mkdir, symlink, link and rename count every slot they can take
+>   before their first change, and admit it whole against each slab's exact room and the retention
+>   budgets: copy-ups of the paths and objects they touch, a new inode and node, and the entry-tree blocks
+>   (a split at its worst case: a sibling per level and a new root).
+> - **Each structure is all or nothing:** the inode trie's set and remove, the entry tree's insert, remove,
+>   child change and respelling, the small-to-tree move, and both copy-ups.
+> - **Rename** publishes the new name, then removes the old one, undoing the first on refusal; respelling one
+>   entry is one in-place step.
+> - **The overlay admits a link or rename before it witnesses a base source.**
+> - **Evidence:** refusal injection at every allocation step of nine verbs, on scratch and base entries
+>   (`docs/bugs/2026-10-01-a-refused-namespace-verb-kept-what-it-had-taken.md`).
+>
 > **Status (2026-09-30, AUD-29-16 and the siblings it found).** A directory never replaces a base
 > directory with disk children, and a listing is never trusted inside its directory's timestamp window.
 > - **One emptiness check.** Rename and rmdir share one base-aware check: no live overlay entry, and every
@@ -7864,3 +7877,17 @@ Applied in the same change to: §0 evidence, D-26's consequence, Part 6's lint w
   memory-object calls.
 - What it does not change: R1 itself; the tracer; the landing seam.
 
+### A-60 — A namespace verb reserves before it mutates (2026-10-01)
+Applied in the same change to: §4.5 status, GAPS (AUD-29-39–40), and
+`docs/bugs/2026-10-01-a-refused-namespace-verb-kept-what-it-had-taken.md`.
+- Why: a refused create kept its inode charge (AUD-29-40). Injecting refusals at every allocation step found
+  worse: a tree split that dropped entries, copy-ups that leaked or moved accounting, and a rename that lost
+  a file at the inode bound.
+- The rule: a namespace verb counts every slot it can take, copy-ups included, and admits them whole before
+  its first change. The counts are exact where they are known and worst-case where they cascade (a split, a
+  shared trie path), as a worst-case transaction reservation is. Each underlying structure mutation is also
+  all or nothing. Rename publishes the new name before it removes the old one.
+- Evidence: the injection sweep over nine verbs, three slab dimensions, scratch and base entries, with and
+  without a snapshot; every refusal leaves the observable state and every slab's usage unchanged.
+- What it does not change: the verbs' POSIX results, their journal records, and admission when there is
+  room. A verb is refused at most a split's worst case of blocks before the last one.

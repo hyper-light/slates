@@ -543,7 +543,117 @@ impl Tree {
     Ok(path)
   }
 
-  /// Inserts `name → child` (the caller checked it is absent).
+  /// The blocks a descent to `name` copies: those on its path born before `epoch` (the read-only
+  /// twin of [`Tree::descend_mut`]), and whether the leaf it reaches can take a name of `fit_len`
+  /// bytes without a split.
+  pub(crate) fn descent_cost(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    hash: u64,
+    name: &str,
+    fit_len: usize,
+  ) -> Result<(usize, bool), VfsError> {
+    let mut copies = 0usize;
+    let mut block = self.root;
+    for level in 0..usize::from(self.height) {
+      let node = blocks.get(block)?;
+      copies = copies.saturating_add(usize::from(node.born != epoch));
+      if level + 1 < usize::from(self.height) {
+        block = handle_from_word(node.slot(node.child_for(policy, hash, name)).child);
+      } else {
+        return Ok((copies, node.fits(fit_len)));
+      }
+    }
+    Ok((copies, true))
+  }
+
+  /// Refuses, before anything changes, a mutation that needs more blocks than the slab can issue: the
+  /// path copies, and for an insert whose leaf is full the worst-case split — a sibling at every level
+  /// and a new root above (one more than the height). Reserving the worst case before the first change
+  /// is how a transaction that may cascade is admitted (XFS reserves each transaction's worst-case log
+  /// space before it starts [B: Linux `Documentation/filesystems/xfs/xfs-delayed-logging-design.rst`,
+  /// "Transaction Reservations"; cited from memory, to verify]); it refuses at most
+  /// `height + 1` blocks early, where a split found the slab full partway and dropped the half it had
+  /// moved (AUD-29-40).
+  fn admit(blocks: &Slab<DirBlock>, needed: usize) -> Result<(), VfsError> {
+    if blocks.room() < needed {
+      return Err(VfsError::Memory(slates_mem::MemError::SlabFull {
+        capacity: blocks.max_slots(),
+      }));
+    }
+    Ok(())
+  }
+
+  /// The most blocks an insert of `name` can take: the path's copies, and when the leaf cannot take
+  /// the name, a split at every level and a new root — what [`Tree::insert`] admits.
+  pub(crate) fn insert_blocks(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    name: &str,
+  ) -> Result<usize, VfsError> {
+    let (copies, fits) =
+      self.descent_cost(blocks, epoch, policy, policy.hash(name), name, name.len())?;
+    Ok(if fits {
+      copies
+    } else {
+      copies
+        .saturating_add(usize::from(self.height))
+        .saturating_add(1)
+    })
+  }
+
+  /// The blocks a change of the entry `name` (its child set, or its removal) takes: the path's copies.
+  pub(crate) fn change_blocks(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    name: &str,
+  ) -> Result<usize, VfsError> {
+    Ok(
+      self
+        .descent_cost(blocks, epoch, policy, policy.hash(name), name, 0)?
+        .0,
+    )
+  }
+
+  /// The most blocks a respelling of `old` as `new` can take, as [`Tree::respell`] admits.
+  pub(crate) fn respell_blocks(
+    &self,
+    blocks: &Slab<DirBlock>,
+    epoch: Epoch,
+    policy: NameEquivalence,
+    old: &str,
+    new: &str,
+  ) -> Result<usize, VfsError> {
+    let (copies, fits) =
+      self.descent_cost(blocks, epoch, policy, policy.hash(old), old, new.len())?;
+    Ok(if fits {
+      copies
+    } else {
+      copies
+        .saturating_add(usize::from(self.height))
+        .saturating_add(1)
+    })
+  }
+
+  /// Gives every block of a tree this mutation built and never published back to the slab: the undo
+  /// of a small directory's move to a tree that was refused partway (the tree's blocks are all born
+  /// now and reachable only from it).
+  pub fn discard(self, blocks: &mut Slab<DirBlock>) {
+    let mut owned = Vec::new();
+    self.blocks(blocks, &mut owned);
+    for (block, _) in owned {
+      let _ = blocks.remove(block);
+    }
+  }
+
+  /// Inserts `name → child` (the caller checked it is absent). All or nothing: the copies and any
+  /// split are admitted before the first block changes.
   pub fn insert(
     &mut self,
     blocks: &mut Slab<DirBlock>,
@@ -554,6 +664,13 @@ impl Tree {
     child: Child,
   ) -> Result<(), VfsError> {
     let hash = policy.hash(name);
+    let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, name, name.len())?;
+    let splits = if fits {
+      0
+    } else {
+      usize::from(self.height).saturating_add(1)
+    };
+    Self::admit(blocks, copies.saturating_add(splits))?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let depth = usize::from(self.height) - 1;
     let (leaf, _) = path[depth];
@@ -650,6 +767,47 @@ impl Tree {
     )
   }
 
+  /// Respells the entry `old` as `new`, an equivalent spelling under `policy` (same hash, same folded
+  /// key, so the same position): the entry is rewritten where it is, splitting the leaf only when the
+  /// new spelling does not fit. All or nothing: the copies, and the split's worst case when the leaf
+  /// cannot take the new spelling, are admitted before the first block changes. `false` when `old` is
+  /// absent.
+  #[allow(clippy::too_many_arguments)]
+  pub fn respell(
+    &mut self,
+    blocks: &mut Slab<DirBlock>,
+    epoch: Epoch,
+    retired: &mut Retired,
+    policy: NameEquivalence,
+    old: &str,
+    new: &str,
+  ) -> Result<bool, VfsError> {
+    let hash = policy.hash(old);
+    // A removed name stays a hole until the block compacts, so even a shorter spelling may need a
+    // split: the split's worst case is reserved whenever the leaf cannot take the new spelling now.
+    let (copies, fits) = self.descent_cost(blocks, epoch, policy, hash, old, new.len())?;
+    let splits = if fits {
+      0
+    } else {
+      usize::from(self.height).saturating_add(1)
+    };
+    Self::admit(blocks, copies.saturating_add(splits))?;
+    let path = self.descend_mut(blocks, epoch, retired, policy, hash, old)?;
+    let depth = usize::from(self.height) - 1;
+    let (leaf, _) = path[depth];
+    let Ok(at) = blocks.get(leaf)?.find(policy, hash, old) else {
+      return Ok(false);
+    };
+    let slot = blocks.get_mut(leaf)?.remove_at(at);
+    let respelled = Slot {
+      name_off: 0,
+      name_len: 0,
+      ..slot
+    };
+    self.insert_split(blocks, epoch, &path, depth, leaf, at, respelled, new)?;
+    Ok(true)
+  }
+
   /// Removes `name`; returns its child if it was present.
   pub fn remove(
     &mut self,
@@ -660,6 +818,8 @@ impl Tree {
     name: &str,
   ) -> Result<Option<Child>, VfsError> {
     let hash = policy.hash(name);
+    let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
+    Self::admit(blocks, copies)?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let depth = usize::from(self.height) - 1;
     let (leaf, _) = path[depth];
@@ -759,6 +919,8 @@ impl Tree {
     child: Child,
   ) -> Result<bool, VfsError> {
     let hash = policy.hash(name);
+    let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
+    Self::admit(blocks, copies)?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let (leaf, _) = path[usize::from(self.height) - 1];
     let Ok(at) = blocks.get(leaf)?.find(policy, hash, name) else {
