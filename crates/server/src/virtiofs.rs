@@ -126,6 +126,15 @@ impl BridgeAccess for ShardBridge {
     })
     .unwrap_or(false)
   }
+
+  /// The live-tree fence the NFS mount applies (AUD-29-83): while it stands the guest's requests wait in its
+  /// rings, asked again each heartbeat — the cadence at which the confirmations that restore the lease arrive.
+  fn fenced(&mut self) -> Option<u64> {
+    let volume = self.volume;
+    state::with_state(|s| crate::verbs::live_tree_fenced(s, volume))
+      .unwrap_or(false)
+      .then_some(crate::daemon::HEARTBEAT_NS)
+  }
 }
 
 /// Format: the refusal-ledger name of a guest barrier that did not capture its volume.

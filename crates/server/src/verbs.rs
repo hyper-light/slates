@@ -694,6 +694,15 @@ pub(crate) fn lease_refusal(state: &mut ShardState, object: ObjectId) -> Option<
   Some(state.fleet.configuration().version)
 }
 
+/// Whether this owner must not serve `volume`'s latest state to a mounted transport now (§4.8 "Leases and
+/// reads"; AUD-08, AUD-29-83): the configuration group is not ready, or the owner lease does not hold — the
+/// gate the NFS live tree applies before every procedure, shared by the FUSE mount and the guest device, which
+/// hold their caller's requests while it stands rather than answer from a stale view. A lease refusal is
+/// counted by its reason ([`lease_refusal`]).
+pub(crate) fn live_tree_fenced(state: &mut ShardState, volume: DbVolumeId) -> bool {
+  !state.consensus_ready || lease_refusal(state, ObjectId(volume.bytes)).is_some()
+}
+
 /// Whether a verb is a **read** safe to forward to a volume's owner without a completion record: a
 /// volume-scoped query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup").
 fn is_forwardable_read(body: &RequestBody) -> bool {

@@ -161,6 +161,13 @@ pub trait BridgeAccess {
   /// (the publication needs the owner's whole state). `false` — refused, or the volume left out — answers
   /// the guest `EIO`, never a promise of survival.
   fn barrier(&mut self) -> bool;
+
+  /// Whether the owner may not serve the volume's latest state now (§4.8 "Leases and reads"; AUD-29-83): its
+  /// configuration group is not ready, or its owner lease does not hold (unconfirmed, or superseded by a
+  /// configuration it has not installed). `Some(wait)` holds the guest's requests in its rings — a pause, never
+  /// a stale answer, as a hard NFS mount retries `NFS3ERR_JUKEBOX` — and names how long the loop waits before
+  /// asking again (the interval the owner's confirmations arrive at); `None` serves.
+  fn fenced(&mut self) -> Option<u64>;
 }
 
 /// Why the loop ended.
@@ -177,6 +184,8 @@ pub enum EndReason {
   /// The seam has no descriptor doorbell: the in-process VMM drives service itself, so there is
   /// nothing for a loop to wait on.
   NoDoorbell,
+  /// The shard's timer refused the wait of a fenced owner (off a shard), so the loop could not hold.
+  WaitLost(RtError),
   /// The volume the device served is gone (destroyed under the device).
   VolumeGone(VfsError),
 }
@@ -192,35 +201,82 @@ pub struct ServeEnd {
   pub wakes: u64,
   /// Service passes the loop ran.
   pub passes: u64,
+  /// Intervals the loop held the guest's requests because the owner was fenced (AUD-29-83).
+  pub fenced_waits: u64,
 }
 
-/// Runs service passes until the rings are idle, yielding between passes.
+/// Runs service passes until the rings are idle, yielding between passes; `Some(reason)` when the loop must
+/// end. Revocation is checked at every pass boundary (AUD-29-87): a guest that keeps its rings full yields
+/// between passes but never postpones a requested revoke past the pass in hand. While the owner is fenced
+/// ([`BridgeAccess::fenced`]) no pass runs: the requests wait in the rings, re-asked each interval, and a
+/// revoke or the guest's hangup is still seen within one interval.
 async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
+  id: DeviceId,
   admitted: &mut AdmittedDevice<S>,
   bridge: &mut B,
-  passes: &mut u64,
-) -> Result<(), ServeError> {
+  counters: &mut LoopCounters,
+) -> Option<EndReason> {
   loop {
-    let pass = bridge
-      .with_bridge(|b, registry| admitted.service(b, registry))
-      .map_err(ServeError::Authority)??;
-    *passes = passes.saturating_add(1);
-    if pass.barrier_owed {
-      // A mutation's reply waits for the owner's barrier: publish, then let the guest learn the reply (or
-      // `EIO`, when the publication did not capture the volume) before any later chain is served.
-      let captured = bridge.barrier();
-      bridge
-        .with_bridge(|b, registry| admitted.complete_barrier(b, registry, captured))
-        .map_err(ServeError::Authority)??;
+    if revoke_requested(id) {
+      return Some(EndReason::Revoked);
     }
-    // A guest's requests are client activity: the shard spins out its idle window after a pass, so the
-    // guest's next kick lands in the spin rather than waking a parked shard (§4.7).
-    slates_rt::registry::with_current(|ctx| ctx.note_activity());
-    if !pass.more_pending {
-      return Ok(());
+    if let Some(wait) = bridge.fenced() {
+      counters.fenced_waits = counters.fenced_waits.saturating_add(1);
+      if let Err(refused) = futures::sleep(wait).await {
+        return Some(EndReason::WaitLost(refused));
+      }
+      // A guest torn down while its requests wait is seen here too: the held requests are served once the
+      // fence lifts whatever kicks arrived meanwhile, so draining them loses nothing.
+      match admitted.drain_doorbell() {
+        Ok(Drained::HungUp) => return Some(EndReason::DoorbellHungUp),
+        Ok(Drained::Kicked | Drained::Nothing) => {}
+        Err(e) => return Some(EndReason::Faulted(ServeError::Seam(e))),
+      }
+      continue;
     }
-    futures::yield_now().await;
+    match one_pass(admitted, bridge, counters) {
+      Ok(true) => futures::yield_now().await,
+      Ok(false) => return None,
+      Err(ServeError::Revoked) => return Some(EndReason::Revoked),
+      Err(ServeError::Authority(VfsError::NotFound)) => {
+        return Some(EndReason::VolumeGone(VfsError::NotFound));
+      }
+      Err(e) => return Some(EndReason::Faulted(e)),
+    }
   }
+}
+
+/// One service pass and, when a mutation's reply waits for the owner's barrier, the barrier and the
+/// completion; whether more work is pending.
+fn one_pass<S: VmmSeam, B: BridgeAccess>(
+  admitted: &mut AdmittedDevice<S>,
+  bridge: &mut B,
+  counters: &mut LoopCounters,
+) -> Result<bool, ServeError> {
+  let pass = bridge
+    .with_bridge(|b, registry| admitted.service(b, registry))
+    .map_err(ServeError::Authority)??;
+  counters.passes = counters.passes.saturating_add(1);
+  if pass.barrier_owed {
+    // A mutation's reply waits for the owner's barrier: publish, then let the guest learn the reply (or
+    // `EIO`, when the publication did not capture the volume) before any later chain is served.
+    let captured = bridge.barrier();
+    bridge
+      .with_bridge(|b, registry| admitted.complete_barrier(b, registry, captured))
+      .map_err(ServeError::Authority)??;
+  }
+  // A guest's requests are client activity: the shard spins out its idle window after a pass, so the
+  // guest's next kick lands in the spin rather than waking a parked shard (§4.7).
+  slates_rt::registry::with_current(|ctx| ctx.note_activity());
+  Ok(pass.more_pending)
+}
+
+/// What the loop counted, reported in [`ServeEnd`].
+#[derive(Clone, Copy, Debug, Default)]
+struct LoopCounters {
+  wakes: u64,
+  passes: u64,
+  fenced_waits: u64,
 }
 
 /// One wait on the doorbell and the service it triggers; `Some(reason)` when the loop must end.
@@ -228,7 +284,7 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   id: DeviceId,
   admitted: &mut AdmittedDevice<S>,
   bridge: &mut B,
-  counters: &mut (u64, u64),
+  counters: &mut LoopCounters,
 ) -> Option<EndReason> {
   if revoke_requested(id) {
     return Some(EndReason::Revoked);
@@ -241,7 +297,7 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   if let Err(error) = readable(raw).await {
     return Some(EndReason::DoorbellLost(error));
   }
-  counters.0 = counters.0.saturating_add(1);
+  counters.wakes = counters.wakes.saturating_add(1);
   if revoke_requested(id) {
     return Some(EndReason::Revoked);
   }
@@ -250,14 +306,7 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
     Ok(Drained::Kicked | Drained::Nothing) => {}
     Err(e) => return Some(EndReason::Faulted(ServeError::Seam(e))),
   }
-  match serve_until_idle(admitted, bridge, &mut counters.1).await {
-    Ok(()) => None,
-    Err(ServeError::Revoked) => Some(EndReason::Revoked),
-    Err(ServeError::Authority(VfsError::NotFound)) => {
-      Some(EndReason::VolumeGone(VfsError::NotFound))
-    }
-    Err(e) => Some(EndReason::Faulted(e)),
-  }
+  serve_until_idle(id, admitted, bridge, counters).await
 }
 
 /// The perpetual device loop for `admitted` as loop `id` (from [`register`]), reaching the bridge
@@ -268,7 +317,7 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
   mut admitted: AdmittedDevice<S>,
   mut bridge: B,
 ) -> ServeEnd {
-  let mut counters = (0u64, 0u64);
+  let mut counters = LoopCounters::default();
   let why = loop {
     if let Some(reason) = serve_round(id, &mut admitted, &mut bridge, &mut counters).await {
       break reason;
@@ -281,7 +330,8 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
   ServeEnd {
     why,
     reclaimed,
-    wakes: counters.0,
-    passes: counters.1,
+    wakes: counters.wakes,
+    passes: counters.passes,
+    fenced_waits: counters.fenced_waits,
   }
 }

@@ -47,6 +47,7 @@ use slates_server::{
 mod common;
 use std::net::TcpStream;
 
+use common::guest::{message, my_uid, reply_error, round_trip, start_guest, with_guest};
 use common::nfs::{
   create, lookup, lookup_carries_attributes, lookup_status, mount, owner_and_mode_status,
   read_bytes_status, read_status, write,
@@ -9523,6 +9524,135 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
     "the successor took over the green and advanced it to version 4 (materialized={materialized} advanced={advanced})"
   );
   assert_isolated_owner_lease(&before, &after, &successor_view);
+}
+
+/// Shape: heartbeats a guest's requests are watched for after the owner's lease lapsed — several of the
+/// intervals the fenced loop re-asks at, so a loop that served under the lapse would have answered them.
+const GUEST_HELD_HEARTBEATS: u64 = 5;
+
+/// AUD-29-83 (§4.8 "Leases and reads", R8): the guest device answers to the same owner lease as the NFS live
+/// tree. In a three-node `f = 1` fleet, A holds a volume with a guest device attached and served on A's owner
+/// shard. Do: the guest reads (GETATTR) while A's lease holds; A is isolated on the probe plane until its lease
+/// lapses; the guest then submits a fresh read and a CREATE, kicks, and watches them for several heartbeats;
+/// then it hangs up. Expect: the first read answered; after the lapse neither request is answered — the lapsed
+/// owner neither serves a latest-state read nor commits an effect — the loop counted its fenced waits, the
+/// lease refusals were counted, and the hangup ended the loop although its requests were held. Before, the
+/// guest path checked only that the volume's slot existed and served both.
+#[test]
+fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let held = created_on(&daemons[0], "guest-held");
+  let object = ObjectId(held.bytes);
+  let confirmed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(object)
+  });
+  let (first_tx, first_rx) = std::sync::mpsc::channel::<i32>();
+  let (lapsed_tx, lapsed_rx) = std::sync::mpsc::channel::<()>();
+  let guest = start_guest(
+    &daemons[0],
+    held,
+    slates_db::catalog::Principal::Uid { uid: my_uid() },
+    move |kick_write, call_read| {
+      Box::pin(async move {
+        let first = round_trip(
+          &kick_write,
+          &call_read,
+          &message(
+            slates_bridge_fuse::abi::Opcode::GetAttr.to_wire(),
+            1,
+            1,
+            &[0u8; 16],
+          ),
+        )
+        .await;
+        let _ = first_tx.send(reply_error(&first));
+        while lapsed_rx.try_recv().is_err() {
+          slates_rt::futures::sleep(HEARTBEAT_NS).await.unwrap();
+        }
+        with_guest(|g| {
+          g.submit(
+            &message(
+              slates_bridge_fuse::abi::Opcode::GetAttr.to_wire(),
+              2,
+              1,
+              &[0u8; 16],
+            ),
+            common::guest::REPLY_CAP,
+          );
+          g.submit(
+            &message(
+              slates_bridge_fuse::abi::Opcode::Create.to_wire(),
+              3,
+              1,
+              &common::guest::create_body("after-lapse"),
+            ),
+            common::guest::REPLY_CAP,
+          );
+        });
+        rustix::io::write(&kick_write, &[1u8]).unwrap();
+        slates_rt::futures::sleep(HEARTBEAT_NS * GUEST_HELD_HEARTBEATS)
+          .await
+          .unwrap();
+        let answered = with_guest(|g| g.reap()).is_some();
+        drop(kick_write);
+        answered
+      })
+    },
+  );
+  let first = first_rx.recv_timeout(RETIREMENT_DEADLINE);
+  isolate_owner_on_the_probe_plane(&daemons, &hosts);
+  let lapsed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(object).map(|holds| !holds)
+  });
+  let _ = lapsed_tx.send(());
+  let answered = guest.script.recv_timeout(RETIREMENT_DEADLINE);
+  let outcome = guest.end.recv_timeout(RETIREMENT_DEADLINE);
+  let refusals = daemons[0].fleet_refusals();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(confirmed, "A's lease was confirmed before the isolation");
+  assert_eq!(
+    first,
+    Ok(0),
+    "the guest's read was answered while the lease held"
+  );
+  assert!(lapsed, "A's lease lapsed once no holder confirmed it");
+  assert_eq!(
+    answered,
+    Ok(false),
+    "the lapsed owner answered neither the read nor the create"
+  );
+  let Ok(slates_server::virtiofs::GuestDeviceOutcome::Ended(end)) = outcome else {
+    panic!("the device loop did not end: {outcome:?}");
+  };
+  assert_eq!(
+    end.why,
+    slates_bridge_virtiofs::serve::EndReason::DoorbellHungUp,
+    "the hangup ended the loop while its requests were held"
+  );
+  assert!(end.fenced_waits > 0, "the loop held the requests: {end:?}");
+  let refusals = refusals.unwrap();
+  assert!(
+    refusals.contains_key(slates_server::lease::LEASE_UNCONFIRMED)
+      || refusals.contains_key(slates_server::lease::LEASE_SUPERSEDED),
+    "the lease's refusals were counted: {refusals:?}"
+  );
 }
 
 /// Isolates the owner (daemon 0) from its two peers on the probe plane, both directions, so the council

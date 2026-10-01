@@ -12,7 +12,7 @@
 
 mod common;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::mpsc::channel;
 use std::time::Duration;
@@ -27,7 +27,7 @@ use slates_bridge_virtiofs::credit::AttachmentCredits;
 use slates_bridge_virtiofs::device::{DeviceConfig, FIRST_REQUEST_QUEUE, FsTag};
 use slates_bridge_virtiofs::memory::{GuestMemory, GuestMemoryError, GuestRange};
 use slates_bridge_virtiofs::serve::{
-  BridgeAccess, EndReason, ServeEnd, register, request_revoke, serve_loop,
+  BridgeAccess, DeviceId, EndReason, ServeEnd, register, request_revoke, serve_loop,
 };
 use slates_bridge_virtiofs::virtqueue::QueueLayout;
 use slates_db::catalog::Principal;
@@ -67,7 +67,19 @@ const DEVICE_BOUND: usize = 4;
 /// Shape: bytes one drain read takes: more than the kicks a test sends between waits.
 const DRAIN: usize = 64;
 
+/// Shape: how long a fenced test owner asks the loop to wait before asking again (one timer tick of the
+/// test runtime's ten), so a held request is re-asked many times within the test's wait.
+const FENCE_WAIT_NS: u64 = 1_000_000;
+/// Shape: the fence intervals the guest lets pass before it checks its requests are still held.
+const HELD_INTERVALS: u64 = 5;
+
 thread_local! {
+  /// Whether the test owner is fenced (AUD-29-83): its lease does not hold, so it may not serve latest
+  /// state. Set and read on the one shard by the guest task and the loop.
+  static FENCED: Cell<bool> = const { Cell::new(false) };
+  /// A loop the test owner asks to revoke from inside its first pass (AUD-29-87): the request arrives while
+  /// the loop is serving, never while it waits.
+  static REVOKE_DURING_PASS: Cell<Option<DeviceId>> = const { Cell::new(None) };
   /// The guest, shared by the device task and the guest task on the one shard — the in-process
   /// VMM's shape: one address space, two parties, never concurrent.
   static GUEST: RefCell<Option<SimDriver>> = const { RefCell::new(None) };
@@ -193,8 +205,15 @@ impl BridgeAccess for OwnedVolume {
     &mut self,
     f: impl FnOnce(&mut dyn Bridge, &mut Attachments) -> R,
   ) -> Result<R, VfsError> {
+    if let Some(id) = REVOKE_DURING_PASS.with(Cell::take) {
+      request_revoke(id);
+    }
     let mut bridge = VolumeBridge::new(vid(), &mut self.volume, &mut self.store);
     Ok(f(&mut bridge, &mut self.registry))
+  }
+
+  fn fenced(&mut self) -> Option<u64> {
+    FENCED.with(Cell::get).then_some(FENCE_WAIT_NS)
   }
 
   fn barrier(&mut self) -> bool {
@@ -404,5 +423,115 @@ fn a_seam_without_a_doorbell_ends_the_loop_at_once() {
   assert_eq!(end.why, EndReason::NoDoorbell);
   assert!(end.reclaimed.is_ok());
   assert_eq!((end.wakes, end.passes), (0, 0));
+  rt.shutdown().unwrap();
+}
+
+/// The guest submits `requests` GETATTRs of the root at once and kicks once; returns their heads.
+fn submit_getattrs(requests: u64, kick_write: &OwnedFd) -> Vec<u16> {
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let heads = (0..requests)
+    .map(|unique| {
+      with_guest(|g| {
+        g.submit(
+          rq,
+          &message(Opcode::GetAttr.to_wire(), 100 + unique, 1, &[0u8; 16]),
+          REPLY_CAP,
+          1,
+        )
+      })
+    })
+    .collect();
+  rustix::io::write(kick_write, &[1u8]).unwrap();
+  heads
+}
+
+/// AUD-29-83 (§4.8 "Leases and reads"). Do: fence the owner (its lease does not hold), have the guest submit a
+/// GETATTR and kick, let several fence intervals pass, then lift the fence. Expect: while fenced no used element
+/// is published — the request waits in the ring, never answered from a stale owner — and the loop counted its
+/// fenced waits; once the lease holds, the same request is answered and notified.
+#[test]
+fn a_fenced_owner_holds_the_guests_requests_until_its_lease_holds() {
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<ServeEnd>();
+  let (guest_tx, guest_rx) = channel::<(bool, i32)>();
+  rt.spawn_on(shard, async move {
+    FENCED.with(|fenced| fenced.set(true));
+    let mut owned = OwnedVolume::fresh();
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send(end);
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    let guest_task = futures::spawn(async move {
+      let rq = usize::from(FIRST_REQUEST_QUEUE);
+      let heads = submit_getattrs(1, &kick_write);
+      futures::sleep(FENCE_WAIT_NS * HELD_INTERVALS)
+        .await
+        .unwrap();
+      let held = with_guest(|g| g.reap(rq)).is_none();
+      FENCED.with(|fenced| fenced.set(false));
+      loop {
+        readable(call_read.as_raw_fd()).await.unwrap();
+        if drain(&call_read).unwrap() == Drained::Kicked {
+          break;
+        }
+      }
+      let (id, len) = with_guest(|g| g.reap(rq)).expect("answered once the lease holds");
+      assert_eq!(id, heads[0]);
+      let error = with_guest(|g| reply_error(&g.reply_of(rq, id, len)));
+      drop(kick_write);
+      let _ = guest_tx.send((held, error));
+    })
+    .unwrap();
+    let _ = futures::detach(guest_task);
+  })
+  .unwrap();
+  let (held, error) = guest_rx.recv_timeout(WAIT).expect("the guest finished");
+  assert!(held, "no used element while the owner was fenced");
+  assert_eq!(error, 0, "answered once the lease held");
+  let end = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  assert!(end.fenced_waits > 0, "the loop held the request: {end:?}");
+  rt.shutdown().unwrap();
+}
+
+/// Shape: requests the guest keeps in its ring for the revocation test — the request queue's 32 descriptors
+/// hold 16 two-part chains, two passes' worth at the test's request credit (8 per pass), so a loop that
+/// ignored the request would serve both passes.
+const FULL_RING: u64 = 16;
+
+/// AUD-29-87. Do: the guest fills its ring with 16 GETATTRs and kicks once; the owner asks for revocation from
+/// inside the loop's first pass. Expect: the loop ends `Revoked` at the next pass boundary — one pass, the
+/// first pass's 8 requests answered and the other 8 never touched — and the terminal step runs. Before, the
+/// inner loop served until the ring was idle (two passes, all 16) before it looked.
+#[test]
+fn a_revoke_requested_mid_service_ends_the_loop_at_the_next_pass() {
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<(ServeEnd, usize)>();
+  rt.spawn_on(shard, async move {
+    let mut owned = OwnedVolume::fresh();
+    let (admitted, kick_write, call_read) = admitted_over_pipes(&mut owned.registry);
+    let id = register(DEVICE_BOUND).unwrap();
+    REVOKE_DURING_PASS.with(|revoke| revoke.set(Some(id)));
+    submit_getattrs(FULL_RING, &kick_write);
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let answered = with_guest(|g| g.used(usize::from(FIRST_REQUEST_QUEUE)).len());
+      drop((kick_write, call_read));
+      let _ = end_tx.send((end, answered));
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+  })
+  .unwrap();
+  let (end, answered) = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  assert_eq!(end.why, EndReason::Revoked);
+  assert_eq!(end.passes, 1, "no pass after the request: {end:?}");
+  assert_eq!(answered, 8, "the first pass's requests, and no more");
+  assert!(end.reclaimed.is_ok());
   rt.shutdown().unwrap();
 }

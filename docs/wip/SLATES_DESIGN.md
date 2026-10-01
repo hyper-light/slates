@@ -1835,6 +1835,14 @@ must exercise local communication and isolation between clones as well as namesp
 > daemon restart (`crates/server/tests/virtiofs.rs`). Group commit across a pass's chains is not built: one
 > publication per held chain, as the FUSE and NFS paths do.
 
+> **Status (2026-10-01, AUD-29-83 and AUD-29-87: the guest and FUSE paths answer to the owner lease; a busy
+> guest cannot postpone revocation).** Before every pass the guest loop asks the owner whether it may serve the
+> volume's latest state — the NFS live tree's gate, `verbs::live_tree_fenced`: configuration group ready and the
+> owner lease holding. While it may not, the guest's requests wait in its rings, re-asked each heartbeat; no
+> stale answer and no effect. The daemon's FUSE turn reads no request while fenced. The loop checks a revoke at
+> every pass boundary and every fenced wait. Proven in a three-node fleet with an isolated owner
+> (`crates/server/tests/fleet.rs`).
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

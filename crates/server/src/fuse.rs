@@ -20,7 +20,9 @@
 //! changed what survives a restart (`Dispatched::needs_barrier`: namespace and attribute changes, `fsync`,
 //! and the `flush` every close sends) publishes the shard's recovery image before its reply (§4.8, D-18), as
 //! NFS's do; a refused or uncaptured publication answers `EIO`, never a promise of survival. The task yields
-//! between requests so one busy mount never holds its shard.
+//! between requests so one busy mount never holds its shard. While the owner may not serve the volume's latest
+//! state — its configuration group not ready or its lease not holding, the NFS live tree's gate (§4.8;
+//! AUD-29-83) — no request is read: the kernel's requests wait, asked again each heartbeat.
 //!
 //! **Teardown.** The kernel's unmount ends the device's connection; the turn sees it and the attachment is
 //! ended as a recorded operation (`verbs::end_attachment`). A `detach`, the volume's destroy, or the daemon's
@@ -368,6 +370,9 @@ enum Turned {
   Idle,
   /// A request was served (or a malformed one dropped).
   Served,
+  /// The owner may not serve the volume's latest state now (AUD-29-83): nothing was read from the device, so
+  /// the kernel's requests wait for the lease.
+  Fenced,
   /// The mount ended.
   Ended,
 }
@@ -393,6 +398,12 @@ async fn serve(attachment: u64) {
         Some(Turned::Served) => {
           let _ = futures::yield_now().await;
         }
+        Some(Turned::Fenced) => {
+          // The requests wait in the kernel, asked again each heartbeat — the cadence at which the
+          // confirmations that restore the lease arrive — as the guest device and a hard NFS mount wait.
+          crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await;
+          break;
+        }
         Some(Turned::Ended) | None => {
           let _ = state::with_state(|s| ended(s, attachment));
           return;
@@ -412,6 +423,12 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
     unmount_owned(&mount.mount_point);
     return Turned::Ended;
   };
+  // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
+  // while the owner's lease does not hold, no request is read, so none is answered from a stale view.
+  if crate::verbs::live_tree_fenced(s, mount.volume) {
+    s.fuse_mounts.insert(attachment, mount);
+    return Turned::Fenced;
+  }
   let dispatched = {
     let ShardState {
       store,
