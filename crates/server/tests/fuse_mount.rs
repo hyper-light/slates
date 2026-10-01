@@ -141,7 +141,7 @@ fn mount_work_and_detach(
   assert!(
     removed.is_ok(),
     "{removed:?}; refusals {:?}",
-    daemon.fleet_refusals()
+    daemon.refusals_on_every_shard()
   );
   // The container bind of this mount: its source authority is built (the table names this attachment, held
   // to the record), but no container workload has run through it, so it is refused typed (AUD-29-64).
@@ -258,13 +258,18 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   client
     .attach_fuse(volume, Intent::Write, &last.path)
     .unwrap();
-  let refusals = daemon.fleet_refusals().unwrap();
+  let refusals = daemon.refusals_on_every_shard().unwrap();
   daemon.stop();
   assert!(
     mounted_at(&last.path).is_none(),
     "the daemon's stop unmounted"
   );
   assert_eq!(refusals.get("fuse.barrier_refused"), None, "{refusals:?}");
+  assert_eq!(
+    refusals.get("publish.volume_skipped"),
+    None,
+    "every publish imaged the volume: {refusals:?}"
+  );
 }
 
 /// AUD-29-64 (a fenced shard's mounts). Do: on a one-shard daemon (its control shard owns the volume), attach a

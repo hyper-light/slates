@@ -6911,13 +6911,21 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
       // touched volume against the returned coverage; an omitted volume never receives a stable
       // acknowledgement, and recovery refuses it instead of rebuilding empty (§4.8, AUD-05).
       Err(e) => {
-        // Counted every time and logged once: the publish runs inside every mutating verb, so a line
-        // per volume per publish was an unbounded log on a verb's latency path.
-        if crate::daemon::PUBLISH_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::AcqRel) == 0 {
+        // Counted every time on this shard and logged once per shard, naming the volume: the publish runs
+        // inside every mutating verb, so a line per volume per publish was an unbounded log on a verb's
+        // latency path.
+        let skipped = state
+          .refusals
+          .entry(crate::daemon::PUBLISH_VOLUME_SKIPPED)
+          .or_insert(0);
+        *skipped = skipped.saturating_add(1);
+        if *skipped == 1 {
+          let volume: String = slot.id.bytes.iter().map(|b| format!("{b:02x}")).collect();
           eprintln!(
-            "slates-server: partition {}: a volume was not imaged, skipped: {e} (first occurrence; \
-             later ones are counted)",
-            state.partition
+            "slates-server: partition {}: volume {volume} was not imaged, skipped: {e} (first on this \
+             shard; later ones are counted as {})",
+            state.partition,
+            crate::daemon::PUBLISH_VOLUME_SKIPPED
           );
         }
         published.skipped.push(slot.id);

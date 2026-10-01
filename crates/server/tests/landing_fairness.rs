@@ -303,7 +303,7 @@ fn calibration_landing(
     matches!(landed, Ok(Landing::Landed(_))),
     "the calibration landing: {landed:?}; volume {:?}; refusals {:?}; config {:?}",
     client.status(volume),
-    daemon.fleet_refusals(),
+    daemon.refusals_on_every_shard(),
     daemon.config(),
   );
   // Its charge goes back to the shard for the landing it sizes.
@@ -395,7 +395,7 @@ fn a_landing_longer_than_its_lease_term_renews_it_and_lands_everything() {
     let landed = client.land(volume, None, &target.path, Filter::default(), Some(grant));
     let took = began.elapsed();
     let renewed = daemon
-      .fleet_refusals()
+      .refusals_on_every_shard()
       .unwrap()
       .get("landing.lease_renewed")
       .copied()

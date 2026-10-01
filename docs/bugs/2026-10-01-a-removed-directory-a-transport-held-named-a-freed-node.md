@@ -67,8 +67,14 @@ git in a container over the OCI bind failed with "cannot update ref … with non
   while the share held them open (the transport's declared `SillyRenamed` rule). git, cargo and python are now
   identical.
 
-## Siblings reported, not changed here
+## Siblings, fixed in the following change
 
-- `Daemon::fleet_refusals` reads the control shard only, so a volume on another shard counted
-  `fuse.barrier_refused` invisibly (the test printed `{}`).
-- `PUBLISH_SKIPPED` logs the first skipped volume per process without naming it.
+- `Daemon::fleet_refusals` reads the control shard only, so the test's `fuse.barrier_refused` for a volume on
+  shard 1 read `{}`. `Daemon::refusals_on_every_shard` sums every shard. The volume-scoped assertions (FUSE,
+  virtio-fs, landing) read it.
+- `PUBLISH_SKIPPED` was a process-wide static: read by nothing, and logged once per process without naming the
+  volume. It is now a per-shard status refusal, `publish.volume_skipped`, logged once per shard with the
+  volume's id.
+- Proof: with this bug's fix mutated out, the FUSE test's failure now reports
+  `{"fuse.barrier_refused": 1, "publish.volume_skipped": 1}` and the log names volume `82b5f2a7…` on partition 1.
+  With the fix in, the test asserts both are absent and passes.

@@ -408,10 +408,11 @@ pub static RECOVERY_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 /// (`init_shard`), since a shard without them serves nothing.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const LOOP_SPAWN_REFUSED: &str = "daemon.loop_spawn";
-/// Volumes skipped from a shard publish because they could not be imaged (an overlay with base-backed
-/// inodes, whose base recovery is its own gate); the rest of the shard still publishes (a health
-/// signal, §4.8).
-pub static PUBLISH_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Format: the status refusal under which a shard counts a volume it could not image for a publish (§4.8): the
+/// rest of the shard still publishes, the volume gets no stable acknowledgement, and recovery refuses it. Per
+/// shard, so each daemon's status and `refusals_on_every_shard` show it (until 2026-10-01 a process-wide
+/// static counted it, read by nothing and logged once per process without naming the volume).
+pub const PUBLISH_VOLUME_SKIPPED: &str = "publish.volume_skipped";
 /// Shard publishes refused outright — the image did not fit its content-object slot, or the slot
 /// could not be written — so nothing changed since the last committed image survives a restart until
 /// a publish succeeds (a health signal, §4.8). A data-plane barrier that meets this answers its
@@ -1386,6 +1387,25 @@ impl Daemon {
     &self,
   ) -> Result<std::collections::BTreeMap<&'static str, u64>, ObserveError> {
     self.observe(self.shards.first().copied(), |s| s.refusals.clone())
+  }
+
+  /// The refusals every shard of this daemon has counted, summed by kind (§4.14). A volume's refusals — a
+  /// FUSE or virtio-fs barrier refused, a landing's stages — are counted on the volume's owner shard, which is
+  /// the control shard only by chance, so a test asserting one is absent reads them here: through
+  /// [`Self::fleet_refusals`] a refusal on another shard read as absent (2026-10-01: a refused FUSE barrier on
+  /// shard 1 printed `{}`). Each shard is asked in turn; an observation the daemon could not make is its typed
+  /// refusal.
+  pub fn refusals_on_every_shard(
+    &self,
+  ) -> Result<std::collections::BTreeMap<&'static str, u64>, ObserveError> {
+    let mut summed = std::collections::BTreeMap::new();
+    for shard in self.shards.iter().copied() {
+      for (kind, count) in self.observe(Some(shard), |s| s.refusals.clone())? {
+        let total: &mut u64 = summed.entry(kind).or_insert(0);
+        *total = total.saturating_add(count);
+      }
+    }
+    Ok(summed)
   }
 
   /// The counters of this daemon's fleet demultiplexers — the probe plane's, then the record plane's

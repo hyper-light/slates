@@ -328,7 +328,7 @@ fn a_guests_acknowledged_close_survives_a_daemon_restart() {
     matches!(outcome, GuestDeviceOutcome::Ended(_)),
     "{outcome:?}"
   );
-  let refusals = first.fleet_refusals().unwrap();
+  let refusals = first.refusals_on_every_shard().unwrap();
   assert_eq!(
     refusals.get("virtiofs.barrier_refused"),
     None,
