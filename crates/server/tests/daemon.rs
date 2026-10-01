@@ -1170,6 +1170,18 @@ fn landing_refusal_scenario() {
   daemon.stop();
 }
 
+/// Shape: the base file the overlay scenarios read: the server's own module-doc opening, in a file written for
+/// the test — small and fixed, where the real `src/lib.rs` grows past one bulk reply as the crate does (it did,
+/// 2026-10-01: 4,135 bytes, refused "reply too large for the bulk area").
+const BASE_FILE: &[u8] = b"//! `slates-server`: a base file written for the overlay scenarios.\n";
+
+/// A base directory in the build output holding `lib.rs` with [`BASE_FILE`].
+fn small_base() -> common::target::TargetDir {
+  let dir = common::target::target_dir();
+  dir.seed("lib.rs", BASE_FILE);
+  dir
+}
+
 /// A request larger than a slot's payload travels through the bulk area: a long name and
 /// an overlay over this workspace's own source tree (read only).
 fn bulk_and_overlay_scenario() {
@@ -1186,7 +1198,8 @@ fn bulk_and_overlay_scenario() {
     report.name, long,
     "the reply travelled through the bulk area too"
   );
-  let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+  let base_dir = small_base();
+  let base = base_dir.path.as_str();
   let ReplyBody::Created { id: overlay } = client.call(&RequestBody::Create {
     name: "over".into(),
     size: SizeClass::Dynamic { max: 1 << 24 },
@@ -1428,7 +1441,8 @@ fn current_uid() -> u32 {
 fn digest_scenario() {
   let (daemon, instance) = daemon("digest");
   let mut client = Client::connect(&instance);
-  let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+  let base_dir = small_base();
+  let base = base_dir.path.as_str();
   let ReplyBody::Created { id: overlay } = client.call(&RequestBody::Create {
     name: "digest-over".into(),
     size: SizeClass::Dynamic { max: 1 << 24 },

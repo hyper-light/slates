@@ -1808,6 +1808,15 @@ must exercise local communication and isolation between clones as well as namesp
 > old-based edit over the outsider's change without a conflict (`crates/land/tests/source.rs`, red on
 > `c5b47cb`). Record: `docs/bugs/2026-09-30-a-clone-of-an-older-snapshot-was-judged-by-the-heads-witnesses.md`.
 
+> **Status (2026-10-01, AUD-29-64 in part: the daemon serves Linux FUSE).** `attach` with the FUSE form mounts
+> the volume at a directory its caller owns through the OS's `fusermount3` — the handshake polled on the
+> runtime, never blocking the shard — and records the attachment with the completion once the device is held;
+> the mount's `fsname` names the attachment (`slates:<id>`). Each mount is served by one task on the volume's
+> owner shard: one request per turn under the mount's registry attachment, the §4.8 barrier before a
+> mutation's reply (`EIO` when refused), a yield between requests. The kernel's unmount, a `detach`, a destroy
+> and the daemon's stop end the mount and its attachment. Owed: `slates mount` on Linux, the OCI source
+> authority, the anchor holding the device across a restart (above), per-shard channels.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

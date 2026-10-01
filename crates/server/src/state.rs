@@ -263,6 +263,10 @@ pub struct ShardState {
   /// first request and revoked when the attachment ends (`verbs::end_attachment`). Bounded by the
   /// partition's attachment cap: one entry per live catalog attachment at most.
   pub mount_attachments: BTreeMap<u64, MountAttachment>,
+  /// The Linux FUSE mounts this shard serves, by attachment (§4.6 "Linux"; AUD-29-64; `crate::fuse`). Bounded
+  /// by the partition's attachment cap: one entry per live FUSE attachment at most.
+  #[cfg(target_os = "linux")]
+  pub(crate) fuse_mounts: crate::fuse::FuseMounts,
   /// The clock.
   pub clock: slates_vfs::clock::HostClock,
   /// Requests served.

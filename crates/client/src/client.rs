@@ -69,10 +69,17 @@ impl Deadlines {
 }
 
 /// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes — so a caller waits for it while the daemon lives rather than for one reply
-/// deadline.
+/// as long as its tree takes, and a FUSE mount, which waits on the OS's mount helper — so a caller waits for
+/// it while the daemon lives rather than for one reply deadline.
 pub fn defers_reply(body: &RequestBody) -> bool {
-  matches!(body, RequestBody::Land { grant: Some(_), .. })
+  matches!(
+    body,
+    RequestBody::Land { grant: Some(_), .. }
+      | RequestBody::Attach {
+        form: AttachRequest::FuseMount { .. },
+        ..
+      }
+  )
 }
 
 /// Derived: the last sequence a client issues. Sequences run from 1 up to here and never wrap: a wrapped
@@ -1990,6 +1997,27 @@ impl Client {
     intent: Intent,
   ) -> Result<Attachment, ClientError> {
     self.attach_with(volume, None, intent, AttachRequest::HostMount)
+  }
+
+  /// Attaches a Linux FUSE mount of `volume` at `mount_point` (§4.6 "Linux"; AUD-29-64): the daemon mounts
+  /// through the OS's `fusermount3` and serves the mount on the volume's owner shard; the reply comes once
+  /// the mount is established (waited for while the daemon lives, as a granted landing's is), with the
+  /// mount point as its `path`. The attachment is the mount's: it ends with the kernel's unmount, a
+  /// `detach` (which unmounts), or the volume's destroy. Refused typed where FUSE is not offered.
+  pub fn attach_fuse(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    mount_point: &str,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::FuseMount {
+        mount_point: mount_point.to_owned(),
+      },
+    )
   }
 
   /// Attaches in `form` (§4.4 `attach(volume|snapshot, consumer, transport, chosen_path?)`; §4.6

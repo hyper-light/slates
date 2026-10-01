@@ -1363,7 +1363,7 @@ const LEASE_UNRELEASED: &str = "landing.lease_unreleased";
 /// The placeholder a deferred landing's verb returns. It is never delivered: the verb deferred its reply, and
 /// `run_recorded` answers nothing for it.
 #[cfg(unix)]
-fn deferred_reply() -> ReplyBody {
+pub(crate) fn deferred_reply() -> ReplyBody {
   ReplyBody::Landed {
     outcome: LandingOutcome {
       landing: 0,

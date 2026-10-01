@@ -39,6 +39,8 @@ pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+#[cfg(target_os = "linux")]
+mod fuse;
 pub mod head;
 pub mod histogram;
 pub mod landing;

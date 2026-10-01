@@ -1413,6 +1413,9 @@ pub enum UnsupportedReason {
   DaxNotEstablished,
   /// A notification queue was requested; `VIRTIO_FS_F_NOTIFICATION` is not offered.
   NotificationQueueNotOffered,
+  /// The host offers no unprivileged FUSE mount: `/dev/fuse` or the OS's `fusermount3` is missing (R10:
+  /// slates never mounts with a privilege of its own).
+  FuseUnavailable,
 }
 
 /// One transport's report (§4.6 A-9: "supported transport, target-path constraints, read/write policy,
@@ -1491,6 +1494,14 @@ pub enum AttachRequest {
   /// listener across a restart), and ends only with the kernel's `UMNT` of the mount, an explicit
   /// `detach`, or the volume's destroy. The reply's `token` is the capability the mount presents.
   HostMount,
+  /// A Linux FUSE mount of the volume at `mount_point` — an existing directory the caller owns — that the
+  /// daemon establishes through the OS's `fusermount3` and serves on the volume's owner shard (§4.6
+  /// "Linux"; AUD-29-64). The attachment is the mount's, as a `HostMount`'s is, ending with the kernel's
+  /// unmount, a `detach`, or the volume's destroy; the reply comes once the mount is established.
+  FuseMount {
+    /// The mount point, canonical.
+    mount_point: String,
+  },
 }
 
 /// What an attach established (§4.4 "establish the path or device, then publish `Bound`").

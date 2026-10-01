@@ -920,6 +920,7 @@ pub fn unsupported_reason_name(reason: UnsupportedReason) -> &'static str {
     UnsupportedReason::BindingNotBuilt => "binding_not_built",
     UnsupportedReason::DaxNotEstablished => "dax_not_established",
     UnsupportedReason::NotificationQueueNotOffered => "notification_queue_not_offered",
+    UnsupportedReason::FuseUnavailable => "fuse_unavailable",
   }
 }
 

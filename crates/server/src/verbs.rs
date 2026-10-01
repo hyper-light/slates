@@ -4326,15 +4326,11 @@ fn attach(
     return crate::merge_service::attach_green(state, client_id, principal, &record, intent, &form);
   }
   let rights = rights_of(&record, principal);
-  let allowed = match intent {
-    Intent::Read => rights.read,
-    Intent::Write => rights.write,
-  };
-  if !allowed {
+  if !permits(rights, intent) {
     return forbidden("attach");
   }
   let situation = crate::transports::situation(state, &rights);
-  let binding = match establish_form(&record, &situation, snapshot, intent, &form) {
+  let binding = match establish_form(&record, &situation, snapshot, (intent, principal), &form) {
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
@@ -4348,12 +4344,9 @@ fn attach(
   };
   let borrows_mount = binding.is_some();
   let now = state.clock.monotonic_ns();
-  let lease_epoch = match intent {
-    Intent::Read => None,
-    Intent::Write => match take_write_lease(state, &record, principal, now) {
-      Ok(epoch) => Some(epoch),
-      Err(refusal) => return refused(refusal),
-    },
+  let lease_epoch = match lease_for(state, &record, principal, intent, now) {
+    Ok(epoch) => epoch,
+    Err(refusal) => return refused(refusal),
   };
   let (db_form, established, mut capability) = match binding {
     None => (
@@ -4375,39 +4368,37 @@ fn attach(
   };
   let attachment = attachment_id(state.partition, state.next_attachment);
   state.next_attachment += 1;
-  // The mount capability token (§4.6, §4.13; AUD-01): a random secret bound to this attachment, returned
-  // to the authorized consumer and presented at the NFS mount so the loopback edge authorizes the
-  // connection as this consumer with the granted `rights`. Refused (never a weak token) if the platform's
-  // secure random is unavailable, the same discipline the daemon applies to its issuer secret.
-  // A bind borrows the parent's authority; it must not mint an independent mount capability.
-  let Some(token) = (if borrows_mount {
-    Some([0; 16])
-  } else {
-    mint_mount_token()
-  }) else {
-    return refused(Refusal::BadRequest {
-      reason: "secure random unavailable for the mount capability token".to_owned(),
-    });
+  let token = match capability_token(borrows_mount) {
+    Ok(token) => token,
+    Err(refusal) => return refused(refusal),
   };
-  let op = Op::AttachmentAdded {
-    record: AttachmentRecord {
-      id: attachment,
-      volume: record.id,
-      consumer,
-      snapshot: snapshot.map(to_db_snapshot),
-      form: db_form,
-      principal: principal.clone(),
-      rights: granted_rights(rights, intent),
+  let attachment_record = AttachmentRecord {
+    id: attachment,
+    volume: record.id,
+    consumer,
+    snapshot: snapshot.map(to_db_snapshot),
+    form: recorded_form(&form, db_form),
+    principal: principal.clone(),
+    rights: granted_rights(rights, intent),
+    token,
+  };
+  if matches!(form, AttachRequest::FuseMount { .. }) {
+    return defer_fuse_attach(
+      state,
+      attachment_record,
+      situation,
+      intent,
+      lease_epoch,
       token,
-    },
+    );
+  }
+  let op = Op::AttachmentAdded {
+    record: attachment_record,
   };
   if let Err(e) = state.db.mutate(&mut state.segment, &op, now) {
     return refused(refusal_of_db(&e));
   }
-  capability.read_write = match intent {
-    Intent::Read => ReadWritePolicy::ReadOnly,
-    Intent::Write => ReadWritePolicy::ReadWrite,
-  };
+  capability.read_write = read_write_of(intent);
   ReplyBody::Attached {
     attachment,
     lease_epoch,
@@ -4417,6 +4408,124 @@ fn attach(
     capability,
     token: (!borrows_mount).then_some(token),
   }
+}
+
+/// Whether `rights` permit an attach with `intent`.
+fn permits(rights: Rights, intent: Intent) -> bool {
+  match intent {
+    Intent::Read => rights.read,
+    Intent::Write => rights.write,
+  }
+}
+
+/// The write lease an attach with `intent` takes (D-16): none for a read, the volume's lease for a write
+/// (its epoch), or the refusal when another principal holds it unexpired.
+fn lease_for(
+  state: &mut ShardState,
+  record: &VolumeRecord,
+  principal: &Principal,
+  intent: Intent,
+  now: u64,
+) -> Result<Option<u64>, Refusal> {
+  match intent {
+    Intent::Read => Ok(None),
+    Intent::Write => take_write_lease(state, record, principal, now).map(Some),
+  }
+}
+
+/// A FUSE mount point's checks, before any effect (`crate::fuse::check_mount_point`).
+#[cfg(target_os = "linux")]
+fn check_fuse_mount_point(form: &AttachRequest, principal: &Principal) -> Result<(), Refusal> {
+  match form {
+    AttachRequest::FuseMount { mount_point } => {
+      crate::fuse::check_mount_point(mount_point, principal)
+    }
+    _ => Ok(()),
+  }
+}
+
+/// FUSE is Linux's; the transport report refused it before this elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn check_fuse_mount_point(_form: &AttachRequest, _principal: &Principal) -> Result<(), Refusal> {
+  Ok(())
+}
+
+/// The mount capability token (§4.6, §4.13; AUD-01): a random secret bound to the attachment, returned to the
+/// authorized consumer and presented at the mount so the edge authorizes the connection as this consumer
+/// with the granted rights. Refused (never a weak token) if the platform's secure random is unavailable, the
+/// same discipline the daemon applies to its issuer secret. A bind borrows the parent's authority
+/// (`borrows_mount`), so it mints no independent capability.
+fn capability_token(borrows_mount: bool) -> Result<[u8; 16], Refusal> {
+  if borrows_mount {
+    return Ok([0; 16]);
+  }
+  mint_mount_token().ok_or_else(|| Refusal::BadRequest {
+    reason: "secure random unavailable for the mount capability token".to_owned(),
+  })
+}
+
+/// The form an attachment is recorded under: a FUSE mount's is its chosen path (the mount point); every other
+/// form's is the one its establishment named.
+fn recorded_form(form: &AttachRequest, established: AttachForm) -> AttachForm {
+  match form {
+    AttachRequest::FuseMount { mount_point } => AttachForm::ChosenPath {
+      path: mount_point.clone(),
+    },
+    _ => established,
+  }
+}
+
+/// The read/write policy an attachment's reply reports for its intent.
+fn read_write_of(intent: Intent) -> ReadWritePolicy {
+  match intent {
+    Intent::Read => ReadWritePolicy::ReadOnly,
+    Intent::Write => ReadWritePolicy::ReadWrite,
+  }
+}
+
+/// Hands a FUSE attach to its deferred establishment (`crate::fuse`): the mount is made without blocking the
+/// shard, and the attachment recorded with the reply once the device is held (§4.6 "Linux"; AUD-29-64).
+#[cfg(target_os = "linux")]
+fn defer_fuse_attach(
+  state: &mut ShardState,
+  record: AttachmentRecord,
+  situation: crate::transports::Situation,
+  intent: Intent,
+  lease_epoch: Option<u64>,
+  token: [u8; 16],
+) -> ReplyBody {
+  let mut capability = crate::transports::fuse(&situation);
+  capability.read_write = read_write_of(intent);
+  let rights = slates_bridge_core::Rights {
+    read: record.rights.read,
+    write: record.rights.write,
+  };
+  crate::fuse::defer_attach(
+    state,
+    crate::fuse::PendingAttach {
+      record,
+      rights,
+      lease_epoch,
+      capability,
+      token,
+    },
+  )
+}
+
+/// FUSE mounts are Linux's; `establish_form` has refused the form before any effect elsewhere.
+#[cfg(not(target_os = "linux"))]
+fn defer_fuse_attach(
+  _state: &mut ShardState,
+  _record: AttachmentRecord,
+  _situation: crate::transports::Situation,
+  _intent: Intent,
+  _lease_epoch: Option<u64>,
+  _token: [u8; 16],
+) -> ReplyBody {
+  refused(Refusal::AttachmentUnsupported {
+    transport: AttachTransport::Fuse,
+    reason: UnsupportedReason::HostPlatform,
+  })
 }
 
 /// Mints a fresh 16-byte mount capability token from the platform's secure random (§4.13; AUD-01) — the
@@ -4437,7 +4546,7 @@ pub(crate) fn mint_mount_token() -> Option<[u8; 16]> {
 /// constructed separately by `oci::Binding::consumer`; a guest requires its owned device seam.
 pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consumer, Refusal> {
   match form {
-    AttachRequest::HostMount => Ok(Consumer::Bridge),
+    AttachRequest::HostMount | AttachRequest::FuseMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
@@ -4471,7 +4580,7 @@ fn establish_form(
   record: &VolumeRecord,
   situation: &crate::transports::Situation,
   snapshot: Option<SnapshotId>,
-  intent: Intent,
+  (intent, principal): (Intent, &Principal),
   form: &AttachRequest,
 ) -> Result<Option<crate::oci::Binding>, Refusal> {
   let (source, destination) = match form {
@@ -4479,6 +4588,23 @@ fn establish_form(
     // process establishes itself with the capability the reply carries (`mount_nfs`, R10: no privilege
     // and nothing of the daemon's touches the mount table).
     AttachRequest::Root | AttachRequest::HostMount => return Ok(None),
+    // A FUSE mount (§4.6 "Linux"; AUD-29-64): offered where the host has FUSE, presenting the live head.
+    AttachRequest::FuseMount { .. } => {
+      if let Some(reason) = crate::transports::fuse(situation).unsupported_reason {
+        return Err(Refusal::AttachmentUnsupported {
+          transport: AttachTransport::Fuse,
+          reason,
+        });
+      }
+      if snapshot.is_some() {
+        return Err(Refusal::AttachmentUnsupported {
+          transport: AttachTransport::Fuse,
+          reason: UnsupportedReason::SnapshotNotPresentedByHostMount,
+        });
+      }
+      check_fuse_mount_point(form, principal)?;
+      return Ok(None);
+    }
     AttachRequest::Guest { transport } => return Err(guest_over_the_ring(situation, *transport)),
     AttachRequest::Oci {
       source,
@@ -4677,6 +4803,9 @@ pub(crate) fn end_attachment(
     now,
   )?;
   crate::merge_service::forget_attachment(state, record.id);
+  // A FUSE mount of the attachment is unmounted; the kernel's disconnect ends its serve task.
+  #[cfg(target_os = "linux")]
+  crate::fuse::unmount_if_mounted(state, record.id);
   // The registry attachment a mount's requests rode ends with the record: revoked so no later request
   // is admitted under it, drained so its slot is reused (GAP-A9-4).
   if let Some(mount) = state.mount_attachments.remove(&record.id) {

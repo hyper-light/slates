@@ -2142,6 +2142,14 @@ impl Daemon {
   /// daemon's error stream, which its anchor keeps (every worker is still joined and every slot given back,
   /// AUD-29-12); with `panic = "abort"` a release build never reaches here after a worker's panic.
   fn stop_parts(&mut self) {
+    // The FUSE mounts first, while their shards still run: a mount whose daemon is gone answers every call
+    // `ENOTCONN` until someone unmounts it (§4.6; AUD-29-64).
+    #[cfg(target_os = "linux")]
+    if self.runtime.is_some() {
+      for shard in self.shards.clone() {
+        let _ = self.observe(Some(shard), crate::fuse::unmount_all);
+      }
+    }
     if let Some(mut doorbell) = self.doorbell.take() {
       doorbell.stop();
     }
@@ -2472,6 +2480,8 @@ fn init_shard(
     next_attachment,
     attachments: slates_bridge_core::Attachments::new(),
     mount_attachments: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    fuse_mounts: std::collections::BTreeMap::new(),
     clock,
     served: 0,
     refusals: std::collections::BTreeMap::new(),

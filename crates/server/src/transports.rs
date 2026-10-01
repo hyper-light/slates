@@ -19,8 +19,9 @@
 //! loopback mount is the macOS host mount (`slates mount` runs `mount_nfs` with no privilege;
 //! `crates/cli/tests/cli.rs` mounts a real kernel mount) and needs a privilege on Linux that slates
 //! never asks for (the kernel refuses an NFS mount in an unprivileged user namespace: `nfs` lacks
-//! `FS_USERNS_MOUNT`); the FUSE, FSKit and WinFsp bridges exist as crates the daemon does not serve
-//! yet; the container bind (`crate::oci`) is offered exactly where a host mount is — the bind is of
+//! `FS_USERNS_MOUNT`); the Linux FUSE mount is served where the host has `/dev/fuse` and `fusermount3`
+//! (`crate::fuse`, 2026-10-01; `tests/fuse_mount.rs`); the FSKit and WinFsp bridges exist as crates the
+//! daemon does not serve yet; the container bind (`crate::oci`) is offered exactly where a host mount is — the bind is of
 //! that mount, and its evidence is T-4.13's container workload. The guest transports are §4.6's
 //! virtio-fs device (`crate::virtiofs`): its own report (`slates_bridge_virtiofs::capability`) is
 //! translated here fact for fact — the in-process seam served, the inherited-descriptor binding
@@ -72,6 +73,9 @@ pub(crate) struct Situation {
   pub(crate) nfs_listener_bound: bool,
   /// Whether the caller may write the volume: the policy's ceiling (a read intent narrows it).
   pub(crate) may_write: bool,
+  /// Whether this host offers an unprivileged FUSE mount (Linux: `/dev/fuse` and the OS's `fusermount3`),
+  /// read once per process.
+  pub(crate) fuse_available: bool,
 }
 
 /// The situation of this daemon, on this host, for a caller with `rights` on a volume.
@@ -80,6 +84,7 @@ pub(crate) fn situation(_state: &ShardState, rights: &Rights) -> Situation {
     platform: platform(),
     nfs_listener_bound: crate::daemon::NFS_PORT.load(std::sync::atomic::Ordering::Acquire) != 0,
     may_write: rights.write,
+    fuse_available: host_facts_once().fuse_available,
   }
 }
 
@@ -237,16 +242,38 @@ fn unwired_bridge(
   )
 }
 
-/// The Linux `/dev/fuse` mount (§4.6 "Linux"): the codec, dispatch and `fusermount3` launcher exist
-/// (`crates/bridge-fuse`); the daemon does not serve a mount over them yet.
-fn fuse(situation: &Situation) -> AttachmentCapability {
-  unwired_bridge(
-    AttachTransport::Fuse,
-    situation,
-    Platform::Linux,
-    TargetPathConstraint::UserOwnedExistingDirectory,
-    sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked),
-  )
+/// The Linux `/dev/fuse` mount (§4.6 "Linux"; AUD-29-64): the daemon mounts through the OS's `fusermount3`
+/// and serves the mount on the volume's owner shard (`crate::fuse`), offered where the host has both
+/// `/dev/fuse` and the helper; its evidence is the live kernel mount test (`tests/fuse_mount.rs`).
+pub(crate) fn fuse(situation: &Situation) -> AttachmentCapability {
+  let sharing = sharing(true, KernelCache::NotEstablished, DeleteWhileOpen::Unlinked);
+  let target = TargetPathConstraint::UserOwnedExistingDirectory;
+  match situation.platform {
+    Platform::Linux if situation.fuse_available => offered(
+      AttachTransport::Fuse,
+      situation,
+      target,
+      sharing,
+      Residency::DaemonRamAndKernelCache,
+      Conformance::LiveKernelMountTest,
+    ),
+    Platform::Linux => refused(
+      AttachTransport::Fuse,
+      situation,
+      UnsupportedReason::FuseUnavailable,
+      target,
+      sharing,
+      Residency::DaemonRamAndKernelCache,
+    ),
+    Platform::MacOs | Platform::Windows | Platform::Other => refused(
+      AttachTransport::Fuse,
+      situation,
+      UnsupportedReason::HostPlatform,
+      target,
+      sharing,
+      Residency::DaemonRamAndKernelCache,
+    ),
+  }
 }
 
 /// The macOS FSKit module (§4.6 "macOS 26+"): the handler and codec exist (`crates/bridge-fskit`);
@@ -513,6 +540,28 @@ fn probe_oci_runtime() -> OciRuntime {
   OciRuntime::NotProbed
 }
 
+/// Format: the FUSE device the kernel exposes.
+#[cfg(target_os = "linux")]
+const FUSE_DEVICE: &str = "/dev/fuse";
+
+/// Whether this host offers an unprivileged FUSE mount: the kernel's device is present and readable and
+/// writable by this process, and the OS's mount helper is on the daemon's `PATH` (queries, never writes).
+#[cfg(target_os = "linux")]
+fn probe_fuse() -> bool {
+  rustix::fs::access(
+    FUSE_DEVICE,
+    rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+  )
+  .is_ok()
+    && command_on_path("fusermount3")
+}
+
+/// FUSE mounts are Linux's.
+#[cfg(not(target_os = "linux"))]
+fn probe_fuse() -> bool {
+  false
+}
+
 /// The host facts as the kernel states them: `uname`'s system name and release.
 #[cfg(unix)]
 fn host_facts() -> (String, Option<String>) {
@@ -539,6 +588,7 @@ struct HostFacts {
   os: String,
   kernel: Option<String>,
   oci_runtime: OciRuntime,
+  fuse_available: bool,
 }
 
 fn host_facts_once() -> &'static HostFacts {
@@ -549,6 +599,7 @@ fn host_facts_once() -> &'static HostFacts {
       os,
       kernel,
       oci_runtime: probe_oci_runtime(),
+      fuse_available: probe_fuse(),
     }
   })
 }
@@ -573,6 +624,7 @@ mod tests {
       platform,
       nfs_listener_bound,
       may_write: true,
+      fuse_available: false,
     }
   }
 
@@ -671,9 +723,18 @@ mod tests {
   }
 
   /// Linux: an NFS mount needs a privilege slates never asks for (R10), whether or not the listener
-  /// bound; the FUSE bridge is not wired; a container shares the host kernel's cache.
+  /// bound; the FUSE mount is offered exactly where the host has `/dev/fuse` and `fusermount3`, with the live
+  /// kernel mount as evidence, and refused `FuseUnavailable` elsewhere; a container shares the host kernel's
+  /// cache.
   #[test]
-  fn linux_refuses_nfs_for_the_privilege_and_names_fuse_as_unwired() {
+  fn linux_refuses_nfs_for_the_privilege_and_offers_fuse_where_the_host_has_it() {
+    let with_fuse = Situation {
+      fuse_available: true,
+      ..on(Platform::Linux, false)
+    };
+    let fuse = entry(&with_fuse, AttachTransport::Fuse);
+    assert!(fuse.supported);
+    assert_eq!(fuse.conformance, Conformance::LiveKernelMountTest);
     for bound in [false, true] {
       let situation = on(Platform::Linux, bound);
       assert_eq!(
@@ -682,14 +743,14 @@ mod tests {
       );
       assert_eq!(
         entry(&situation, AttachTransport::Fuse).unsupported_reason,
-        Some(UnsupportedReason::BridgeNotWired)
+        Some(UnsupportedReason::FuseUnavailable)
       );
       let oci = entry(&situation, AttachTransport::Oci);
       assert_eq!(oci.residency, Residency::DaemonRamAndKernelCache);
       assert_eq!(
         oci.unsupported_reason,
         Some(UnsupportedReason::HostMountRequired),
-        "the FUSE bridge is not served, so there is no host mount to bind"
+        "no FUSE on this host, so there is no host mount to bind"
       );
     }
   }
