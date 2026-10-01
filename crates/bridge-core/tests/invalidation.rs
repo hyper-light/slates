@@ -80,6 +80,8 @@ fn rw_cx() -> OpContext {
       },
     )
     .unwrap();
+  // These tests are the channel's: it delivers the invalidations they produce (AUD-29-79).
+  attachments.set_coherence(id, slates_bridge_core::CacheCoherence::Invalidated);
   attachments.context(id).unwrap()
 }
 

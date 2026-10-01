@@ -479,7 +479,8 @@ pub fn serve_step(
   let request = channel.take_request();
   let opcode = Request::parse(&request).ok().and_then(|parsed| {
     if parsed.opcode == Some(Opcode::Init)
-      && let Ok(negotiated) = negotiate(parsed.body)
+      && let Ok(negotiated) =
+        negotiate(parsed.body, slates_bridge_core::CacheCoherence::Invalidated)
     {
       state.expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
     }
@@ -616,7 +617,8 @@ pub fn dispatch_ready(
   let nodeid = parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid);
   let opcode = parsed.and_then(|parsed| {
     if parsed.opcode == Some(Opcode::Init)
-      && let Ok(negotiated) = negotiate(parsed.body)
+      && let Ok(negotiated) =
+        negotiate(parsed.body, slates_bridge_core::CacheCoherence::Invalidated)
     {
       state.expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
     }

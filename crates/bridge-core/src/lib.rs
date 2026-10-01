@@ -19,7 +19,9 @@ pub mod appledouble;
 pub mod authority;
 pub mod volume_bridge;
 
-pub use authority::{AttachmentId, Attachments, Barrier, ObjectId, OpContext, Rights, View};
+pub use authority::{
+  AttachmentId, Attachments, Barrier, CacheCoherence, ObjectId, OpContext, Rights, View,
+};
 pub use volume_bridge::{VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;

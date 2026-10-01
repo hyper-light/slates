@@ -1089,6 +1089,11 @@ impl Bridge for VolumeBridge<'_> {
     if cx.volume != self.volume_id {
       return CacheLifetime::Bounded { ns: 1 };
     }
+    // A transport that cannot deliver an invalidation keeps nothing past its use (AUD-29-79): a promise of
+    // caching until an invalidation would be one no mechanism keeps.
+    if cx.coherence == crate::CacheCoherence::Revalidated {
+      return CacheLifetime::Bounded { ns: 0 };
+    }
     let no = InodeNo(object.inode);
     match self.volume.base_plane() {
       Some(plane) if self.volume.is_live_source(self.store, no) => CacheLifetime::Bounded {

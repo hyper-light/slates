@@ -180,7 +180,7 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
   put_u32(&mut body, 8, 1 << 20);
   put_u32(&mut body, 12, u32::MAX);
   put_u32(&mut body, 16, u32::MAX);
-  let n = negotiate(&body).unwrap();
+  let n = negotiate(&body, slates_bridge_core::CacheCoherence::Invalidated).unwrap();
   let named = flags::BIG_WRITES
     | flags::DONT_MASK
     | flags::DO_READDIRPLUS
@@ -215,7 +215,7 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
   // The same words with INIT_EXT clear: the second word is not read at all, so a high bit the
   // kernel did not declare cannot be negotiated — HAS_EXPIRE_ONLY included.
   put_u32(&mut body, 12, !u32::try_from(flags::INIT_EXT).unwrap());
-  let n = negotiate(&body).unwrap();
+  let n = negotiate(&body, slates_bridge_core::CacheCoherence::Invalidated).unwrap();
   assert_eq!(n.flags >> 32, 0, "flags2 is ignored without INIT_EXT");
 }
 
@@ -230,7 +230,9 @@ fn the_init_reply_has_the_headers_layout() {
   put_u32(&mut body, 8, 1 << 20);
   put_u32(&mut body, 12, u32::MAX);
   put_u32(&mut body, 16, u32::MAX);
-  let reply = negotiate(&body).unwrap().to_bytes();
+  let reply = negotiate(&body, slates_bridge_core::CacheCoherence::Invalidated)
+    .unwrap()
+    .to_bytes();
   assert_eq!(reply.len(), 64, "sizeof(struct fuse_init_out)");
   assert_eq!(u32_at(&reply, 0), 7);
   assert_eq!(u32_at(&reply, 4), FUSE_KERNEL_MINOR_VERSION);

@@ -993,3 +993,118 @@ fn the_ring_protocol_asks_for_its_ordering_edges_where_virtio_puts_them() {
     "full after the index, before the flags"
   );
 }
+
+/// One request through the device with room for any reply; the reply.
+fn exchange_once(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  request: &[u8],
+) -> Vec<u8> {
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  let head = driver.submit(rq, request, REPLY_CAP, 1);
+  serve(device, FIRST_REQUEST_QUEUE, driver, bridge, cx, BATCH).unwrap();
+  let (_, len) = driver.reap(rq).unwrap();
+  driver.reply_of(rq, head, len)
+}
+
+/// The little-endian `u64` at `at` of a reply's body.
+fn body_u64(reply: &[u8], at: usize) -> u64 {
+  u64::from_le_bytes(
+    reply[OUT_HEADER_LEN + at..OUT_HEADER_LEN + at + 8]
+      .try_into()
+      .unwrap(),
+  )
+}
+
+/// Format: offsets inside reply bodies — `fuse_init_out`'s flags word after major, minor and max_readahead;
+/// `fuse_entry_out`'s `entry_valid` after the node id and generation; `fuse_attr_out`'s `attr_valid` first.
+const INIT_FLAGS_AT: usize = 12;
+const ENTRY_VALID_AT: usize = 16;
+const ATTR_VALID_AT: usize = 0;
+
+/// AUD-29-79. Do: a guest kernel offers explicit data invalidation and automatic data invalidation at INIT,
+/// then creates a file and asks its attributes and its name. Expect: the device's INIT answer does not
+/// negotiate explicit invalidation (the device has no queue to deliver one) and asks for automatic data
+/// invalidation; the attribute and the entry lifetimes are zero, so the guest revalidates on every use and
+/// converges with any other attachment's change; the guest capability reports no explicit invalidation.
+/// Before, explicit invalidation was negotiated and both lifetimes were u64::MAX seconds, a promise no
+/// delivery kept.
+#[test]
+fn a_guest_without_invalidation_delivery_is_promised_no_cache() {
+  let (mut device, mut driver) = device_and_driver();
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let cx = context();
+  let offered = u32::try_from(flags::EXPLICIT_INVAL_DATA | flags::AUTO_INVAL_DATA).unwrap();
+  let init = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Init.to_wire(), 1, 0, &init_body(offered)),
+  );
+  let answered = u64::from(u32::from_le_bytes(
+    init[OUT_HEADER_LEN + INIT_FLAGS_AT..OUT_HEADER_LEN + INIT_FLAGS_AT + 4]
+      .try_into()
+      .unwrap(),
+  ));
+  assert_eq!(
+    answered & flags::EXPLICIT_INVAL_DATA,
+    0,
+    "explicit invalidation is not promised"
+  );
+  assert_ne!(
+    answered & flags::AUTO_INVAL_DATA,
+    0,
+    "pages are dropped when a revalidation shows a change"
+  );
+  let created = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(
+      Opcode::Create.to_wire(),
+      2,
+      ROOT,
+      &create_body("revalidated"),
+    ),
+  );
+  assert_eq!(
+    body_u64(&created, ENTRY_VALID_AT),
+    0,
+    "a created entry is not cached"
+  );
+  let ino = body_u64(&created, 0);
+  let attrs = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(Opcode::GetAttr.to_wire(), 3, ino, &[0u8; 16]),
+  );
+  assert_eq!(
+    body_u64(&attrs, ATTR_VALID_AT),
+    0,
+    "attributes are not cached"
+  );
+  let mut name = b"revalidated".to_vec();
+  name.push(0);
+  let looked = exchange_once(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Lookup.to_wire(), 4, ROOT, &name),
+  );
+  assert_eq!(
+    body_u64(&looked, ENTRY_VALID_AT),
+    0,
+    "a looked-up entry is not cached"
+  );
+  let negotiated = device.negotiated().expect("INIT was served");
+  assert_eq!(negotiated.flags & flags::EXPLICIT_INVAL_DATA, 0);
+}

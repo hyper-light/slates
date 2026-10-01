@@ -17,7 +17,8 @@ use crate::request::{ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name};
 
 pub use slates_bridge_core::{Bridge, DirEntry};
 use slates_bridge_core::{
-  CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr, whole_cookie_groups,
+  CacheCoherence, CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, SetAttr,
+  whole_cookie_groups,
 };
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
@@ -113,7 +114,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     cx
   };
   match opcode {
-    Opcode::Init => serve_init(request.body, unique, out),
+    Opcode::Init => serve_init(request.body, unique, cx.coherence, out),
     Opcode::Lookup => serve_lookup(bridge, &request, cx, out),
     Opcode::GetAttr => serve_getattr(bridge, &request, cx, out),
     Opcode::Open => serve_open(bridge, &request, cx, Opcode::Open, out),
@@ -570,8 +571,8 @@ fn recover_unique(message: &[u8]) -> Option<u64> {
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
 }
 
-fn serve_init(body: &[u8], unique: u64, out: &mut [u8]) -> usize {
-  match negotiate(body) {
+fn serve_init(body: &[u8], unique: u64, coherence: CacheCoherence, out: &mut [u8]) -> usize {
+  match negotiate(body, coherence) {
     Ok(n) => write_or_drop(ReplyHeader::write_ok(unique, &n.to_bytes(), out), out),
     Err(_) => write_or_drop(ReplyHeader::write_error(unique, EIO, out), out),
   }

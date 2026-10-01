@@ -207,7 +207,11 @@ fn init_body(major: u32, offered: u64) -> Vec<u8> {
 #[test]
 fn init_negotiates_the_intersection_of_flags() {
   let offered = flags::WRITEBACK_CACHE | flags::DO_READDIRPLUS | (1u64 << 20);
-  let n = negotiate(&init_body(7, offered)).unwrap();
+  let n = negotiate(
+    &init_body(7, offered),
+    slates_bridge_core::CacheCoherence::Invalidated,
+  )
+  .unwrap();
   assert_eq!(n.major, 7);
   assert_eq!(n.minor, 31, "bounded to slates' floor");
   assert_eq!(
@@ -224,9 +228,16 @@ fn init_negotiates_the_intersection_of_flags() {
 /// An older kernel major triggers a version reply (not a hard fail); a short body is refused.
 #[test]
 fn init_handles_a_version_mismatch_and_a_short_body() {
-  assert!(negotiate(&init_body(6, 0)).unwrap().version_mismatch);
+  assert!(
+    negotiate(
+      &init_body(6, 0),
+      slates_bridge_core::CacheCoherence::Invalidated
+    )
+    .unwrap()
+    .version_mismatch
+  );
   assert!(matches!(
-    negotiate(&[0u8; 4]),
+    negotiate(&[0u8; 4], slates_bridge_core::CacheCoherence::Invalidated),
     Err(FuseError::ShortBody { .. })
   ));
 }
@@ -245,7 +256,11 @@ fn writeback_cache_uses_the_kernel_abi_bit() {
     KERNEL_WRITEBACK_CACHE,
     "the advertised bit must match the kernel ABI"
   );
-  let negotiated = negotiate(&init_body(7, KERNEL_WRITEBACK_CACHE)).unwrap();
+  let negotiated = negotiate(
+    &init_body(7, KERNEL_WRITEBACK_CACHE),
+    slates_bridge_core::CacheCoherence::Invalidated,
+  )
+  .unwrap();
   assert_eq!(
     negotiated.flags & KERNEL_WRITEBACK_CACHE,
     0,

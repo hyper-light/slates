@@ -146,6 +146,9 @@ pub mod flags {
   pub const DO_READDIRPLUS: u64 = 1 << 13;
   /// Format: FUSE_READDIRPLUS_AUTO — the kernel adaptively chooses readdir vs readdirplus.
   pub const READDIRPLUS_AUTO: u64 = 1 << 14;
+  /// Format: FUSE_AUTO_INVAL_DATA — the kernel drops an inode's cached pages when a revalidation shows its
+  /// size or mtime changed (what a server that sends no notifications asks for; libfuse's default).
+  pub const AUTO_INVAL_DATA: u64 = 1 << 12;
   /// Format: FUSE_EXPLICIT_INVAL_DATA — invalidation may name a data range, not the whole inode.
   pub const EXPLICIT_INVAL_DATA: u64 = 1 << 25;
   /// Format: FUSE_BIG_WRITES — the kernel accepts writes larger than one page per request.

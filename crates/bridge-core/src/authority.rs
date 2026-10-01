@@ -82,6 +82,7 @@ enum AttachmentState {
 /// before any effect.
 struct Attachment {
   volume: VolumeId,
+  coherence: CacheCoherence,
   view: View,
   subject: Principal,
   rights: Rights,
@@ -94,6 +95,19 @@ struct Attachment {
   /// Requests admitted and not yet ended ([`Attachments::begin`]/[`Attachments::end`]). A barrier
   /// cannot close a generation while one is outstanding.
   in_flight: u32,
+}
+
+/// How a transport keeps its kernel's cache of names, attributes and pages coherent with the volume (§4.6;
+/// AUD-29-79) — the promise a transport makes its kernel must match a mechanism it has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheCoherence {
+  /// The transport writes the seam's invalidations to its kernel before it serves each request (the
+  /// `/dev/fuse` channel's `Coherence` delivery): the volume's own objects may be cached until one arrives.
+  Invalidated,
+  /// The transport has no path to deliver an invalidation (a virtio-fs guest without a notification queue,
+  /// an NFS client): nothing is cached past its use — names and attributes are revalidated on every use, and
+  /// cached pages are dropped at each open (close-to-open) and when a revalidation shows a change.
+  Revalidated,
 }
 
 /// What a barrier closed (§4.6 "Writeback and snapshot barrier"): every live attachment of the
@@ -130,6 +144,8 @@ impl AttachmentId {
 pub struct OpContext {
   /// The attachment this context was built from (for the request-lifetime pin).
   pub attachment: AttachmentId,
+  /// How the transport serving the attachment keeps its kernel's cache coherent (§4.6; AUD-29-79).
+  pub coherence: CacheCoherence,
   /// The volume the attachment binds; an object addressed under this context must belong to it.
   pub volume: VolumeId,
   /// The view resolved for the operation.
@@ -200,6 +216,7 @@ impl Attachments {
     let epoch = self.epoch;
     let handle = self.registry.insert(Attachment {
       volume,
+      coherence: CacheCoherence::Revalidated,
       view,
       subject,
       rights,
@@ -209,6 +226,15 @@ impl Attachments {
       in_flight: 0,
     })?;
     Ok(AttachmentId(handle))
+  }
+
+  /// Declares how the transport serving `id` keeps its kernel's cache coherent: an attachment is admitted
+  /// [`CacheCoherence::Revalidated`], and a transport that delivers the seam's invalidations before every
+  /// request (the `/dev/fuse` channel) declares [`CacheCoherence::Invalidated`] (AUD-29-79).
+  pub fn set_coherence(&mut self, id: AttachmentId, coherence: CacheCoherence) {
+    if let Ok(attachment) = self.registry.get_mut(id.0) {
+      attachment.coherence = coherence;
+    }
   }
 
   /// Admits one request on `id`: the validated context (as [`Attachments::context`]) with the
@@ -309,6 +335,7 @@ impl Attachments {
     }
     Ok(OpContext {
       attachment: id,
+      coherence: attachment.coherence,
       volume: attachment.volume,
       view: attachment.view,
       subject: attachment.subject.clone(),

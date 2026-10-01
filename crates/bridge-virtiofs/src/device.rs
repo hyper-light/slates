@@ -752,7 +752,11 @@ impl Device {
   fn observe(&mut self, header: Option<&InHeader>) {
     match header.and_then(|h| Opcode::from_wire(h.opcode)) {
       Some(Opcode::Init) => {
-        self.negotiated = negotiate(&self.request[IN_HEADER_LEN..]).ok();
+        self.negotiated = negotiate(
+          &self.request[IN_HEADER_LEN..],
+          slates_bridge_core::CacheCoherence::Revalidated,
+        )
+        .ok();
         self.counters.init_seen = self.counters.init_seen.saturating_add(1);
       }
       Some(Opcode::Destroy) => {

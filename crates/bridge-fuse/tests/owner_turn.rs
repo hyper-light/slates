@@ -154,6 +154,7 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
   let transport = attachments
     .attach(VOLUME, View::Current, Principal::Uid { uid }, rights)
     .unwrap();
+  attachments.set_coherence(transport, slates_bridge_core::CacheCoherence::Invalidated);
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
   let mut state = ServeState::new();
   let mut tally = Counts::default();

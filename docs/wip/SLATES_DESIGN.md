@@ -1862,6 +1862,14 @@ must exercise local communication and isolation between clones as well as namesp
 > Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
 > so none serves a request after the acknowledgement.
 
+> **Status (2026-10-01, AUD-29-79: a transport's cache promise matches its delivery).** An attachment
+> carries how its transport keeps the kernel's cache coherent: the native `/dev/fuse` channel, which writes
+> the seam's invalidations before each request, declares `Invalidated`, and may hand the volume's own objects
+> unbounded lifetimes and negotiate explicit invalidation; every other attachment is `Revalidated` — zero
+> entry and attribute lifetimes, no explicit invalidation, `AUTO_INVAL_DATA` and no page cache kept across an
+> open — so a virtio-fs guest with no notification queue converges by revalidating rather than holding a
+> promise no mechanism keeps.
+
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
 > the audit finds a wrong writeback flag, advertised-but-undispatched READDIRPLUS, missing

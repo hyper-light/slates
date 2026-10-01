@@ -307,6 +307,9 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     Ok(registry) => registry,
     Err(e) => return refuse(s, &mount_point, crate::error::refusal_of_vfs(&e)),
   };
+  // The serve turn delivers the volume's invalidations before each request (AUD-29-79).
+  s.attachments
+    .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
   s.fuse_mounts.insert(
     attachment,
     FuseMount {

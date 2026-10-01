@@ -143,6 +143,8 @@ fn serve(
   let transport = attachments
     .attach(VOLUME, View::Current, Principal::Uid { uid }, rights)
     .unwrap();
+  // The channel delivers invalidations before each request (AUD-29-79).
+  attachments.set_coherence(transport, slates_bridge_core::CacheCoherence::Invalidated);
   let other = attachments
     .attach(
       VOLUME,

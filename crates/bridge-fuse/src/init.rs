@@ -6,6 +6,7 @@
 use crate::abi::{FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, Opcode, flags};
 use crate::error::FuseError;
 use crate::wire::{Reader, Writer};
+use slates_bridge_core::CacheCoherence;
 
 /// The maximum write the daemon accepts in one request; public because it is the anchor of the
 /// virtio-fs device's readable-bytes cap (`slates-bridge-virtiofs`): the largest request a guest
@@ -49,20 +50,25 @@ pub struct InitNegotiation {
 /// `FUSE_NOTIFY_INVAL_INODE`; measured on Linux 6.12 (2026-09-19,
 /// `docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`). Write-through
 /// also keeps a `write`'s bytes in the daemon before the call returns (D-18).
-fn wanted() -> u64 {
-  flags::PARALLEL_DIROPS
+/// What a transport that delivers no invalidation asks for instead (AUD-29-79): no explicit invalidation and
+/// no expire-only entries (it sends neither), and `AUTO_INVAL_DATA`, so cached pages are dropped when a
+/// revalidation shows a change.
+fn wanted(coherence: CacheCoherence) -> u64 {
+  let common = flags::PARALLEL_DIROPS
     | flags::DO_READDIRPLUS
     | flags::READDIRPLUS_AUTO
-    | flags::EXPLICIT_INVAL_DATA
     | flags::BIG_WRITES
     | flags::DONT_MASK
-    | flags::INIT_EXT
-    | flags::HAS_EXPIRE_ONLY
+    | flags::INIT_EXT;
+  match coherence {
+    CacheCoherence::Invalidated => common | flags::EXPLICIT_INVAL_DATA | flags::HAS_EXPIRE_ONLY,
+    CacheCoherence::Revalidated => common | flags::AUTO_INVAL_DATA,
+  }
 }
 
 /// Negotiates from a `fuse_init_in` body (major, minor, max_readahead, flags, then flags2 and
 /// padding when the kernel set `INIT_EXT`). A body shorter than the fixed part is refused.
-pub fn negotiate(body: &[u8]) -> Result<InitNegotiation, FuseError> {
+pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiation, FuseError> {
   let opcode = Opcode::Init.to_wire();
   let mut r = Reader::new(body);
   let major = r.u32(opcode)?;
@@ -93,7 +99,7 @@ pub fn negotiate(body: &[u8]) -> Result<InitNegotiation, FuseError> {
   Ok(InitNegotiation {
     major: FUSE_KERNEL_VERSION,
     minor: minor.min(FUSE_KERNEL_MINOR_VERSION),
-    flags: wanted() & kernel_flags,
+    flags: wanted(coherence) & kernel_flags,
     max_write: MAX_WRITE,
     max_readahead: kernel_readahead.min(MAX_READAHEAD),
     version_mismatch: false,
