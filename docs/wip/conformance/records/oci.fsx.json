@@ -9,16 +9,24 @@
     "privilege": "unprivileged"
   },
   "date": "2026-10-01",
-  "command": "",
-  "bound": "",
+  "command": "docker run --rm --user <uid>:<gid> --mount type=bind,source=<mount>,destination=/work,bind-recursive=disabled,bind-propagation=private --mount type=bind,source=<scratch>/tools,destination=/src,readonly rust:1.98.0 sh -c cc -O2 -w -include time.h -include stdint.h -o /tmp/fsx /src/fsx.c && cd /work/conformance-<pid>/fsx && /tmp/fsx -N 10000 -S 1 -l 262144 -q -P /tmp fsx.bin",
+  "bound": "10000 operations, seed 1, file length 262144 bytes",
   "outcome": {
-    "kind": "skipped",
-    "reason": {
-      "kind": "owed",
-      "reason": "the container form exists — `attach` returns a verified non-recursive private bind (the source checked again by `slates oci-check`), and a workload ran through it on Docker Desktop on macOS (the container acceptance test in crates/cli/tests/cli.rs) — but no harness leg runs a suite inside a container through it yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the daemon's FUSE mount"
+    "kind": "ran",
+    "counts": {
+      "suite": "fsx",
+      "operations": 10000,
+      "seed": 1,
+      "file_length": 262144,
+      "ok": true
     }
   },
   "expected_failure_list": null,
-  "duration_ms": 0,
-  "notes": []
+  "duration_ms": 20170,
+  "notes": [
+    "fsx: freebsd/freebsd-src@42c6944 tools/regression/fsx/fsx.c (APSL 2.0), sha256 b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019, built `cc -O2 -w -include time.h -include stdint.h` (source unchanged)",
+    "the runtime's profile (`slates oci-runtime docker`): profile: engine=\"Docker Desktop\" version=29.3.1 endpoint=unix://~/.docker/run/docker.sock rootless=false userns=false; evidence: T-4.13 (Docker Desktop on macOS over its local socket, binding the host mount through Desktop's file sharing); identity: host_user_through_share (container ids are not forwarded; the attachment's capability is the authority)",
+    "the source checked again (`slates oci-check`, mount 2 on device 436207663) just before the bind",
+    "fsx compiled inside the container from the same pinned source; its .fsxlog/.fsxgood files kept in the container's /tmp"
+  ]
 }

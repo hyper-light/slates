@@ -24,6 +24,7 @@
 //! records a privilege skip when it is refused, never a prompt.
 
 mod bench;
+mod container;
 mod fetch;
 mod hermeticity;
 mod mount;
@@ -252,7 +253,9 @@ fn native_transport(os: HostOs) -> Transport {
 /// server, both through the kernel's own client.
 fn native_transports(os: HostOs) -> &'static [Transport] {
   match os {
-    HostOs::Macos => &[Transport::NativeMacosNfs],
+    // The container form rides the macOS host mount (AUD-29-78): its cells run where a container
+    // runtime's handshake holds evidence, and are skipped typed elsewhere.
+    HostOs::Macos => &[Transport::NativeMacosNfs, Transport::Oci],
     HostOs::Linux => &[Transport::NativeLinuxFuse, Transport::NativeLinuxNfs4],
     HostOs::Windows => &[Transport::NativeWindowsWinfsp],
   }
@@ -553,6 +556,15 @@ fn readiness(os: HostOs, transport: Transport, suite: Suite) -> Readiness {
           "`{missing}` is not on the PATH of this host"
         )));
       }
+      // A container cell needs an engine that answers, not only its CLI; the handshake then judges the
+      // engine's profile and fails the lane for an untested one.
+      if transport == Transport::Oci
+        && stdout_of("docker", &["info", "--format", "{{.ServerVersion}}"]).is_empty()
+      {
+        return Readiness::Skip(SkipReason::Tool(
+          "the `docker` engine does not answer on this host".to_owned(),
+        ));
+      }
       let root_available = is_root() || sudo_without_prompt();
       match root {
         RootNeed::Required(reason) if !root_available => Readiness::Skip(SkipReason::Privilege(
@@ -689,6 +701,7 @@ fn run_suite_on(
   };
   let started = std::time::Instant::now();
   let result = match suite {
+    Suite::Fsx if transport == Transport::Oci => container::run_fsx(&run)?,
     Suite::Fsx => suites::run_fsx(&run)?,
     Suite::Fsstress => suites::run_fsstress(&run)?,
     Suite::Pjdfstest => suites::run_pjdfstest(&run)?,
