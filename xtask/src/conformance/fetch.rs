@@ -324,11 +324,18 @@ fn probe(dir: &Path, source: &str, compile_only: bool) -> Result<bool, Failure> 
   Ok(output.status.success())
 }
 
-/// The `config.h` `configure` would write on this host, from the harness's own probes.
-fn pjdfstest_config_h(dir: &Path) -> Result<String, Failure> {
-  let mut config =
-    String::from("/* slates conformance harness: configure.ac's checks, probed by cc */\n");
-  config.push_str(SYSTEM_EXTENSIONS);
+/// One of `configure.ac`'s checks as a C source: whether it must link (a function) or only compile (a header, a
+/// `struct stat` member), and the line `config.h` gains when it does.
+pub(crate) struct ConfigProbe {
+  pub(crate) source: String,
+  pub(crate) compile_only: bool,
+  pub(crate) define: String,
+}
+
+/// Every check `configure.ac` makes, as probes a compiler answers — on this host ([`pjdfstest_config_h`]) or
+/// inside a container (`crate::conformance::container`), whose Linux answers differ.
+pub(crate) fn pjdfstest_probes() -> Vec<ConfigProbe> {
+  let mut probes = Vec::new();
   for function in PJDFSTEST_FUNCTIONS {
     // autoconf's `AC_CHECK_FUNC` shape: declare and *call* the function, so the link decides (comparing
     // its address with zero is folded by clang without ever linking the symbol). The `__stub_` guard is
@@ -339,30 +346,51 @@ fn pjdfstest_config_h(dir: &Path) -> Result<String, Failure> {
     // exactly what real `AC_CHECK_FUNC` does. Without it, `HAVE_CHFLAGS` was defined on Linux and
     // pjdfstest's `st_flags` block (guarded by it) failed to compile against a `struct stat` that has no
     // `st_flags` member. On macOS (real `chflags`, no stub) the guard passes and the function is detected.
-    let source = format!(
-      "#include <limits.h>\n\
-       char {function}(void);\n\
-       #if defined __stub_{function} || defined __stub___{function}\n\
-       #error stub\n\
-       #endif\n\
-       int main(void) {{ return {function}(); }}\n"
-    );
-    if probe(dir, &source, false)? {
-      config.push_str(&format!("#define HAVE_{} 1\n", function.to_uppercase()));
-    }
+    probes.push(ConfigProbe {
+      source: format!(
+        "#include <limits.h>\n\
+         char {function}(void);\n\
+         #if defined __stub_{function} || defined __stub___{function}\n\
+         #error stub\n\
+         #endif\n\
+         int main(void) {{ return {function}(); }}\n"
+      ),
+      compile_only: false,
+      define: format!("#define HAVE_{} 1\n", function.to_uppercase()),
+    });
   }
   for (header, macro_name) in PJDFSTEST_HEADERS {
-    let source = format!("#include <{header}>\nint main(void) {{ return 0; }}\n");
-    if probe(dir, &source, true)? {
-      config.push_str(&format!("#define {macro_name} 1\n"));
-    }
+    probes.push(ConfigProbe {
+      source: format!("#include <{header}>\nint main(void) {{ return 0; }}\n"),
+      compile_only: true,
+      define: format!("#define {macro_name} 1\n"),
+    });
   }
   for (member, macro_name) in PJDFSTEST_STAT_MEMBERS {
-    let source = format!(
-      "{SYSTEM_EXTENSIONS}#include <sys/types.h>\n#include <sys/stat.h>\nint main(void) {{ struct stat s; (void)s.{member}; return 0; }}\n"
-    );
-    if probe(dir, &source, true)? {
-      config.push_str(&format!("#define {macro_name} 1\n"));
+    probes.push(ConfigProbe {
+      source: format!(
+        "{SYSTEM_EXTENSIONS}#include <sys/types.h>\n#include <sys/stat.h>\nint main(void) {{ struct stat s; (void)s.{member}; return 0; }}\n"
+      ),
+      compile_only: true,
+      define: format!("#define {macro_name} 1\n"),
+    });
+  }
+  probes
+}
+
+/// Format: the head of the harness's `config.h`: its origin, then what `AC_USE_SYSTEM_EXTENSIONS` defines.
+pub(crate) fn pjdfstest_config_head() -> String {
+  format!(
+    "/* slates conformance harness: configure.ac's checks, probed by cc */\n{SYSTEM_EXTENSIONS}"
+  )
+}
+
+/// The `config.h` `configure` would write on this host, from the harness's own probes.
+fn pjdfstest_config_h(dir: &Path) -> Result<String, Failure> {
+  let mut config = pjdfstest_config_head();
+  for probe_case in pjdfstest_probes() {
+    if probe(dir, &probe_case.source, probe_case.compile_only)? {
+      config.push_str(&probe_case.define);
     }
   }
   Ok(config)
@@ -376,7 +404,8 @@ pub(crate) struct PjdfstestTree {
 }
 
 /// Fetches, unpacks and builds pjdfstest without autotools.
-pub(crate) fn build_pjdfstest(dir: &Path) -> Result<PjdfstestTree, Failure> {
+/// Fetches the pinned pjdfstest tarball into `dir` and unpacks it, without building: the source root.
+pub(crate) fn stage_pjdfstest(dir: &Path) -> Result<PathBuf, Failure> {
   let tarball = fetch(&PJDFSTEST_TARBALL, dir)?;
   let root = dir.join(format!("pjdfstest-{PJDFSTEST_COMMIT}"));
   if !root.join("pjdfstest.c").is_file() {
@@ -392,6 +421,12 @@ pub(crate) fn build_pjdfstest(dir: &Path) -> Result<PjdfstestTree, Failure> {
       )));
     }
   }
+  Ok(root)
+}
+
+/// Fetches, unpacks and builds pjdfstest for this host.
+pub(crate) fn build_pjdfstest(dir: &Path) -> Result<PjdfstestTree, Failure> {
+  let root = stage_pjdfstest(dir)?;
   let config = pjdfstest_config_h(&root)?;
   write_file(&root.join("config.h"), config.as_bytes())?;
   cc(

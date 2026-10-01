@@ -562,6 +562,133 @@ pub(crate) fn run_workloads(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   })
 }
 
+/// Shape: how many lines of a failed container run's output a failure carries — enough for a compiler's error.
+const FAILURE_TAIL_LINES: usize = 40;
+
+/// Format: the line the container prints before each test file's output, then the file's path.
+const FILE_MARK: &str = "@@@slates-pjdfstest ";
+
+/// Writes `configure.ac`'s checks as probe files into `dir/probes` (each `N.c`, its `config.h` line in `N.define`,
+/// and `-c` in `N.flags` when it need only compile), so the container answers them with its own compiler.
+fn write_probes(dir: &Path) -> Result<(), Failure> {
+  let probes = dir.join("probes");
+  super::create_dir(&probes)?;
+  super::write_file(
+    &probes.join("head.h"),
+    fetch::pjdfstest_config_head().as_bytes(),
+  )?;
+  for (n, probe) in fetch::pjdfstest_probes().iter().enumerate() {
+    super::write_file(&probes.join(format!("{n:03}.c")), probe.source.as_bytes())?;
+    super::write_file(
+      &probes.join(format!("{n:03}.define")),
+      probe.define.as_bytes(),
+    )?;
+    let flags: &[u8] = if probe.compile_only { b"-c" } else { b"" };
+    super::write_file(&probes.join(format!("{n:03}.flags")), flags)?;
+  }
+  Ok(())
+}
+
+/// The outputs of every test file, split at [`FILE_MARK`]: (the file's path under the tree, its output).
+fn split_outputs(output: &str) -> Vec<(String, String)> {
+  let mut files: Vec<(String, String)> = Vec::new();
+  for line in output.lines() {
+    if let Some(path) = line.strip_prefix(FILE_MARK) {
+      files.push((path.trim().to_owned(), String::new()));
+    } else if let Some((_, text)) = files.last_mut() {
+      text.push_str(line);
+      text.push('\n');
+    }
+  }
+  files
+}
+
+/// pjdfstest inside a container over the OCI bind: the pinned tree, `config.h` answered by the container's own
+/// compiler from the harness's probes, every test file run in a directory inside the bind as the mounting
+/// user under the per-file bound, and the outputs judged as the host lane judges them.
+pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
+  let sources = run.scratch.shared("tools")?.join("pjd-linux");
+  super::create_dir(&sources)?;
+  let root = fetch::stage_pjdfstest(&sources)?;
+  write_probes(&sources)?;
+  let tree = root
+    .file_name()
+    .map(|name| name.to_string_lossy().into_owned())
+    .ok_or_else(|| Failure("the staged pjdfstest tree has no name".to_owned()))?;
+  let leg = Leg::open(run, "pjd", false)?;
+  let bound = super::suites::PJDFSTEST_FILE_BOUND.as_secs();
+  // A probe that fails is an answer (the check is absent), so the probe loop ends with `;`: chained with `&&`, a
+  // last probe Linux lacks skipped the build and every file, silently.
+  let script = format!(
+    "cp -R {SOURCES}/{tree} /tmp/p && cd /tmp/p && cat {SOURCES}/probes/head.h > config.h && \
+     for c in {SOURCES}/probes/*.c; do b=${{c%.c}}; cc -std=gnu17 -w $(cat $b.flags) -o /tmp/probe.out $c >/dev/null 2>&1 \
+     && cat $b.define >> config.h; done; cc -O2 -w -I. -o pjdfstest pjdfstest.c && cd {} && \
+     for f in $(cd /tmp/p && find tests -name '*.t' | sort); do echo '{FILE_MARK}'$f; timeout {bound} sh /tmp/p/$f 2>&1; \
+     [ $? -eq 124 ] && echo 'TIMED OUT'; done",
+    Leg::workdir("pjd")
+  );
+  let (succeeded, output, command) = run_in_container(&leg.binding, &sources, &script)?;
+  let runner = this_user();
+  let outputs = split_outputs(&output);
+  // A run in which no file ran (the build failed inside the container) is a failure, never an empty pass.
+  if outputs.is_empty() {
+    let tail: Vec<&str> = output.lines().rev().take(FAILURE_TAIL_LINES).collect();
+    return Err(Failure(format!(
+      "no pjdfstest file ran inside the container (it {}; `{command}`); its output's tail:\n{}",
+      if succeeded { "exited 0" } else { "failed" },
+      tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+    )));
+  }
+  // Every file's raw output is kept in the scratch, as the host lane keeps it, so a failure can be reviewed by
+  // its own lines (`cargo xtask conformance tally --outputs`).
+  let kept = run.scratch.fresh("pjdfstest-output")?;
+  for (path, text) in &outputs {
+    super::write_file(
+      &kept.join(format!("{}.txt", path.replace('/', "__"))),
+      text.as_bytes(),
+    )?;
+  }
+  let timed_out: Vec<String> = outputs
+    .iter()
+    .filter(|(_, text)| text.lines().any(|line| line == "TIMED OUT"))
+    .map(|(path, _)| path.clone())
+    .collect();
+  let parsed: Vec<_> = outputs
+    .iter()
+    .map(|(path, text)| slates_conformance::tap::parse_file(path, text, &runner))
+    .collect();
+  let alive = leg.session.daemon_alive();
+  let mut notes = leg.notes(format!(
+    "pjdfstest: {} at {}, compiled inside the container with config.h answered by its own compiler from the \
+     harness's {} probes",
+    fetch::PJDFSTEST_TARBALL.upstream,
+    fetch::PJDFSTEST_COMMIT,
+    fetch::pjdfstest_probes().len()
+  ));
+  if !alive {
+    notes.push(format!(
+      "the daemon stopped answering during the run; anchor log tail:\n{}",
+      leg.session.anchor_log_tail()
+    ));
+  }
+  notes.extend(leg.session.size_note.clone());
+  let command = leg.recorded(&command)?;
+  let files = outputs.len();
+  drop(leg);
+  super::suites::judged_pjdfstest(
+    run,
+    &parsed,
+    super::suites::Ran {
+      runner,
+      files,
+      timed_out,
+      alive,
+      command,
+      notes,
+    },
+  )
+}
+
 #[cfg(test)]
 mod tests {
   use super::is_silly_rename;

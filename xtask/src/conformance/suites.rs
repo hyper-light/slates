@@ -22,7 +22,7 @@ use crate::Failure;
 
 /// Shape: the wall bound of one pjdfstest file; the longest (`rename/00.t`, dozens of cases each
 /// spawning a process over loopback NFS) finishes in seconds, so a file past this has hung.
-const PJDFSTEST_FILE_BOUND: Duration = Duration::from_secs(300);
+pub(crate) const PJDFSTEST_FILE_BOUND: Duration = Duration::from_secs(300);
 
 /// A command line as the record prints it.
 fn command_line(program: &Path, args: &[String]) -> String {
@@ -206,7 +206,7 @@ pub(crate) fn run_fsstress(run: &Run<'_>) -> Result<SuiteResult, Failure> {
 }
 
 /// Every `.t` under `tests/`, sorted, as paths relative to the tree root.
-fn test_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
+pub(crate) fn test_files(root: &Path) -> Result<Vec<PathBuf>, Failure> {
   let mut files = Vec::new();
   let mut stack = vec![root.join("tests")];
   while let Some(dir) = stack.pop() {
@@ -520,7 +520,62 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   });
   let size_note = session.size_note.clone();
   drop(session);
-  let tally = tally(&parsed);
+  let command = format!(
+    "{}sh <each of {} tests/**/*.t of {}> in a directory inside the mount; binary {}",
+    if as_root { "sudo -n " } else { "" },
+    files.len(),
+    fetch::PJDFSTEST_TARBALL.upstream,
+    tree.binary.display()
+  );
+  let mut notes = vec![tree.note];
+  notes.extend(daemon_note);
+  notes.extend(size_note);
+  judged_pjdfstest(
+    run,
+    &parsed,
+    Ran {
+      runner,
+      files: files.len(),
+      timed_out,
+      alive,
+      command,
+      notes,
+    },
+  )
+}
+
+/// What a pjdfstest run did, for [`judged_pjdfstest`].
+pub(crate) struct Ran {
+  /// The identity the files ran as.
+  pub(crate) runner: Runner,
+  /// How many test files ran.
+  pub(crate) files: usize,
+  /// The files that passed their bound.
+  pub(crate) timed_out: Vec<String>,
+  /// Whether the daemon answered after the run.
+  pub(crate) alive: bool,
+  /// The record's command.
+  pub(crate) command: String,
+  /// The run's own notes (the build, the daemon, the volume's size).
+  pub(crate) notes: Vec<String>,
+}
+
+/// A pjdfstest run judged: the parsed files tallied, judged against the transport's reviewed list, and made a
+/// record — the same for the host lane and the container lane.
+pub(crate) fn judged_pjdfstest(
+  run: &Run<'_>,
+  parsed: &[TapFile],
+  ran: Ran,
+) -> Result<SuiteResult, Failure> {
+  let Ran {
+    runner,
+    files,
+    timed_out,
+    alive,
+    command,
+    mut notes,
+  } = ran;
+  let tally = tally(parsed);
   let (list, digest) = expected_list(run.root, run.transport, runner.privilege())?;
   let judgement = judge(&list, &tally.cases);
   for id in &judgement.unlisted_failures {
@@ -530,9 +585,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     println!("pjdfstest: listed but now passing {id}");
   }
   let ok = judgement.acceptable() && tally.incomplete.is_empty() && timed_out.is_empty() && alive;
-  let mut notes = vec![tree.note, judgement.describe()];
-  notes.extend(daemon_note);
-  notes.extend(size_note);
+  notes.insert(1.min(notes.len()), judgement.describe());
   if tally.failed > 0 {
     notes.push(shape_note(&tally.cases));
   }
@@ -574,16 +627,9 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
   Ok(SuiteResult {
     privilege: runner.privilege(),
     outcome: outcome_for(run, Suite::Pjdfstest, counts, reduced),
-    command: format!(
-      "{}sh <each of {} tests/**/*.t of {}> in a directory inside the mount; binary {}",
-      if as_root { "sudo -n " } else { "" },
-      files.len(),
-      fetch::PJDFSTEST_TARBALL.upstream,
-      tree.binary.display()
-    ),
+    command,
     bound: format!(
-      "every test file at the pinned commit ({} files), {PJDFSTEST_FILE_BOUND:?} per file",
-      files.len()
+      "every test file at the pinned commit ({files} files), {PJDFSTEST_FILE_BOUND:?} per file"
     ),
     expected_failure_list: Some(digest),
     notes,

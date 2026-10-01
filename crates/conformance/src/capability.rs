@@ -15,8 +15,8 @@
 //! virtio-fs is proven only by the simulated guest driver (`docs/wip/virtiofs.md`); the OCI container
 //! form exists (`attach` with the container form: a verified non-recursive private bind and `slates
 //! oci-check`) and a workload ran through it on Docker Desktop (T-4.13); fsx runs inside a container through
-//! it on the macOS lane (`xtask/src/conformance/container.rs`), as do fsstress and the workloads; pjdfstest's
-//! and hermeticity's container legs are owed.
+//! it on the macOS lane (`xtask/src/conformance/container.rs`), as do fsstress, the workloads and pjdfstest;
+//! the hermeticity container leg is owed.
 
 use crate::record::{Suite, Transport};
 
@@ -97,8 +97,9 @@ const VIRTIOFS_OWED: &str = concat!(
 /// The reason every OCI cell is owed.
 const OCI_OWED: &str = "the container form exists — `attach` returns a verified non-recursive private bind \
   (the source checked again by `slates oci-check`), and fsx runs inside a container through it on the macOS \
-  lane under the runtime handshake (`slates oci-runtime docker`), as do fsstress and the workloads — but \
-  this suite's container leg is not built yet; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the \
+  lane under the runtime handshake (`slates oci-runtime docker`), as do fsstress, the workloads and \
+  pjdfstest — but the hermeticity container leg is not built: its tracer needs root, and no lane holds both \
+  root and a container engine; on Linux the bind is refused ContainerWorkloadUnproven until a workload runs through the \
   daemon's FUSE mount";
 
 /// The Linux adapter: the OS NFS client mounting the unprivileged daemon's loopback export.
@@ -121,12 +122,14 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     (_, Suite::Pressure | Suite::Failure) => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
     (Transport::VirtioFs, _) => Availability::Owed(VIRTIOFS_OWED),
     // fsx compiled and run inside a container over the exact entry `attach --oci` returns (AUD-29-78).
-    (Transport::Oci, Suite::Fsx | Suite::Fsstress | Suite::Workloads) => Availability::Runnable {
-      on: HostOs::Macos,
-      tools: &["mount_nfs", "umount", "sh", "cc", "docker"],
-      root: RootNeed::None,
-      adapter: None,
-    },
+    (Transport::Oci, Suite::Fsx | Suite::Fsstress | Suite::Workloads | Suite::Pjdfstest) => {
+      Availability::Runnable {
+        on: HostOs::Macos,
+        tools: &["mount_nfs", "umount", "sh", "cc", "docker"],
+        root: RootNeed::None,
+        adapter: None,
+      }
+    }
     (Transport::Oci, _) => Availability::Owed(OCI_OWED),
     (Transport::NativeMacosNfs, suite) => native_macos(suite),
     (Transport::NativeLinuxFuse, suite) => native_linux(suite, Some(LINUX_NFS_ADAPTER)),
@@ -294,7 +297,10 @@ mod tests {
   /// The container cell for `suite`: runnable on macOS with `docker` where its leg is built, else owed.
   fn assert_container_cell(suite: Suite) {
     let container = availability(Transport::Oci, suite);
-    let built = matches!(suite, Suite::Fsx | Suite::Fsstress | Suite::Workloads);
+    let built = matches!(
+      suite,
+      Suite::Fsx | Suite::Fsstress | Suite::Workloads | Suite::Pjdfstest
+    );
     let runnable = matches!(container, Availability::Runnable { on: HostOs::Macos, tools, adapter: None, .. } if tools.contains(&"docker"));
     let owed = matches!(container, Availability::Owed(_));
     assert!(

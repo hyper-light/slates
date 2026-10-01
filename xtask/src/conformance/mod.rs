@@ -83,6 +83,8 @@ pub(crate) struct Options {
   keep: bool,
   /// `run`: the suite.
   suite: Option<Suite>,
+  /// `run`: only this one of the host's transports (every one when absent).
+  transport: Option<Transport>,
   /// `matrix`: rewrite the document.
   write: bool,
   /// `tally`: the kept `pjdfstest-output` directory to re-read.
@@ -162,8 +164,18 @@ pub(crate) fn parse(root: &Path, args: &[String]) -> Result<Options, Failure> {
     })?),
     None => None,
   };
+  let transport = match value_after(args, "--transport") {
+    Some(slug) => Some(Transport::parse(slug).ok_or_else(|| {
+      Failure(format!(
+        "unknown transport `{slug}`; transports: {}",
+        Transport::ALL.map(Transport::slug).join(", ")
+      ))
+    })?),
+    None => None,
+  };
   Ok(Options {
     command,
+    transport,
     records: value_after(args, "--records")
       .map_or_else(|| root.join("docs/wip/conformance/records"), PathBuf::from),
     scratch: value_after(args, "--scratch").map(PathBuf::from),
@@ -659,6 +671,9 @@ fn run_suite(root: &Path, options: &Options, suite: Suite) -> Result<(), Failure
   let os = host_os()?;
   let mut failures = Vec::new();
   for &transport in native_transports(os) {
+    if options.transport.is_some_and(|only| only != transport) {
+      continue;
+    }
     if let Err(failure) = run_suite_on(root, options, os, transport, suite) {
       failures.push(failure.0);
     }
@@ -705,6 +720,7 @@ fn run_suite_on(
     Suite::Fsx => suites::run_fsx(&run)?,
     Suite::Fsstress if transport == Transport::Oci => container::run_fsstress(&run)?,
     Suite::Fsstress => suites::run_fsstress(&run)?,
+    Suite::Pjdfstest if transport == Transport::Oci => container::run_pjdfstest(&run)?,
     Suite::Pjdfstest => suites::run_pjdfstest(&run)?,
     Suite::Workloads if transport == Transport::Oci => container::run_workloads(&run)?,
     Suite::Workloads => workloads::run_workloads(&run)?,
