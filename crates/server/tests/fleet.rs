@@ -10333,142 +10333,244 @@ fn assert_group_timing_is_derived(
   }
 }
 
-/// §4.6 "Kubernetes publication without privilege" (AUD-29-75): a fleet node with an operator authority serves
-/// its network export over RPC-with-TLS (RFC 9289). Do: start a one-node fleet daemon whose transport holds an
-/// export listener and the operator's issuer, then, as a node's NFS client would, probe it, complete a mutual
-/// TLS 1.3 handshake with a certificate the issuer signed and ALPN `sunrpc`, and call NFSv3 `NULL` and NFSv4
-/// `NULL` inside the session. Expect: `STARTTLS`, a session on `sunrpc`, and both calls answered `SUCCESS` by the
-/// daemon's own NFS edge — the export runs on the real control shard, its session built from the kept identity.
-#[test]
-#[allow(clippy::disallowed_types)] // rustls's client takes `Arc` by signature (D-8 exception 3, a test harness).
-fn a_fleet_node_with_an_operator_authority_serves_its_export_over_rpc_with_tls() {
-  use slates_bridge_nfs::rpc::{AcceptStatus, read_record, reply_bytes, write_record};
-  use slates_bridge_nfs::rpc_tls::{ALPN_SUNRPC, AUTH_TLS, starttls_reply};
-  use std::io::{Read, Write};
-  let _serial = serialize_fleet_tests();
-  let issuer_key = rcgen::KeyPair::generate().unwrap();
-  let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).unwrap();
-  issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-  let issuer = issuer_params.self_signed(&issuer_key).unwrap();
-  let issue = |name: &str| {
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
-      .unwrap()
-      .signed_by(&key, &issuer, &issuer_key)
-      .unwrap();
-    (
-      cert.der().clone(),
-      rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
-    )
-  };
-  let (node_cert, node_key) = issue(NAME);
-  let identity = Identity::from_der(node_cert.clone(), node_key);
-  let anchor = slates_server::deploy::host_id_of_certificate(&node_cert);
-  let (_lease, [probe, record, _, _]) = four_free_ports();
-  let export =
-    slates_rt::tcp::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 16).unwrap();
-  let export_port = export.local_addr().unwrap().port();
-  let mut serve = held_serve_sockets(loopback(probe), loopback(record));
-  serve.export = Some(export);
-  let profile = profile("export");
-  let instance = format!("export-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(1)).with_fleet(FleetMembership {
-    quorum: Quorum { f: 0 },
-    peers: Vec::new(),
-    host: member_id(anchor, 0),
-    origin_anchor: anchor,
-    domains: std::collections::BTreeMap::new(),
-    regions: std::collections::BTreeMap::new(),
-    durability: None,
-    region_mirrors: std::collections::BTreeMap::new(),
-  });
-  let daemon = Daemon::start_with_fleet(
-    &profile,
-    config,
-    SegmentSource::Create {
-      name: format!("slates-seg-{instance}"),
-    },
-    Some(FleetTransport {
-      identity,
-      name: NAME.to_owned(),
-      advertise: loopback(probe).into(),
-      serve,
-      peers: Vec::new(),
-      resolver: None,
-      enrollment_roots: vec![issuer.der().clone()],
-    }),
+/// A leaf for `name` that `issuer` signs, DER.
+fn issue_with(
+  issuer: &rcgen::Certificate,
+  issuer_key: &rcgen::KeyPair,
+  name: &str,
+) -> (
+  rustls::pki_types::CertificateDer<'static>,
+  rustls::pki_types::PrivateKeyDer<'static>,
+) {
+  let key = rcgen::KeyPair::generate().unwrap();
+  let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
+    .unwrap()
+    .signed_by(&key, issuer, issuer_key)
+    .unwrap();
+  (
+    cert.der().clone(),
+    rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
   )
-  .unwrap();
-  let call = |xid: u32, version: u32, flavor: u32| {
-    let mut message = Vec::new();
-    for word in [xid, 0, 2, 100_003, version, 0, flavor, 0, 0, 0] {
-      message.extend_from_slice(&word.to_be_bytes());
+}
+
+/// A one-node fleet daemon whose transport holds an export listener and the operator's issuer (§4.6
+/// "Kubernetes publication without privilege", AUD-29-75): the daemon, its export port, and the issuer that
+/// signs clients.
+struct ExportNode {
+  daemon: Daemon,
+  port: u16,
+  issuer: rcgen::Certificate,
+  issuer_key: rcgen::KeyPair,
+}
+
+impl ExportNode {
+  fn start(tag: &str) -> ExportNode {
+    let issuer_key = rcgen::KeyPair::generate().unwrap();
+    let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).unwrap();
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let issuer = issuer_params.self_signed(&issuer_key).unwrap();
+    let (node_cert, node_key) = issue_with(&issuer, &issuer_key, NAME);
+    let anchor = slates_server::deploy::host_id_of_certificate(&node_cert);
+    let (_lease, [probe, record, _, _]) = four_free_ports();
+    let export =
+      slates_rt::tcp::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 16).unwrap();
+    let port = export.local_addr().unwrap().port();
+    let mut serve = held_serve_sockets(loopback(probe), loopback(record));
+    serve.export = Some(export);
+    let profile = profile(tag);
+    let instance = format!("{tag}-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, Some(1)).with_fleet(FleetMembership {
+      quorum: Quorum { f: 0 },
+      peers: Vec::new(),
+      host: member_id(anchor, 0),
+      origin_anchor: anchor,
+      domains: std::collections::BTreeMap::new(),
+      regions: std::collections::BTreeMap::new(),
+      durability: None,
+      region_mirrors: std::collections::BTreeMap::new(),
+    });
+    let daemon = Daemon::start_with_fleet(
+      &profile,
+      config,
+      SegmentSource::Create {
+        name: format!("slates-seg-{instance}"),
+      },
+      Some(FleetTransport {
+        identity: Identity::from_der(node_cert, node_key),
+        name: NAME.to_owned(),
+        advertise: loopback(probe).into(),
+        serve,
+        peers: Vec::new(),
+        resolver: None,
+        enrollment_roots: vec![issuer.der().clone()],
+      }),
+    )
+    .unwrap();
+    // A fleet node's consensus group forms only when it is bootstrapped (`ConsensusNotInitialized` before).
+    daemon.bootstrap(true).unwrap();
+    ExportNode {
+      daemon,
+      port,
+      issuer,
+      issuer_key,
     }
-    write_record(&message)
-  };
-  let read_one = |stream: &mut dyn Read| -> Option<Vec<u8>> {
+  }
+
+  /// A leaf for `name` the node's issuer signs.
+  fn issue(
+    &self,
+    name: &str,
+  ) -> (
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+  ) {
+    issue_with(&self.issuer, &self.issuer_key, name)
+  }
+
+  /// An RPC-with-TLS session on the export, as a node's NFS client opens one: the `AUTH_TLS` probe (its reply
+  /// returned), then a mutual TLS 1.3 handshake with a certificate the issuer signed, offering `sunrpc`.
+  #[allow(clippy::disallowed_types)] // rustls's client takes `Arc` by signature (D-8 exception 3, a harness).
+  fn session(
+    &self,
+  ) -> (
+    Option<Vec<u8>>,
+    rustls::StreamOwned<rustls::ClientConnection, TcpStream>,
+  ) {
+    use slates_bridge_nfs::rpc::{read_record, write_record};
+    use slates_bridge_nfs::rpc_tls::{ALPN_SUNRPC, AUTH_TLS};
+    use std::io::{Read, Write};
+    let mut socket = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, self.port)).unwrap();
+    socket
+      .set_read_timeout(Some(Duration::from_nanos(LIVENESS_BUDGET_NS)))
+      .unwrap();
+    let mut probe = Vec::new();
+    for word in [1u32, 0, 2, 100_003, 4, 0, AUTH_TLS, 0, 0, 0] {
+      probe.extend_from_slice(&word.to_be_bytes());
+    }
+    socket.write_all(&write_record(&probe)).unwrap();
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
-    loop {
+    let reply = loop {
       if let Ok((message, _)) = read_record(&bytes) {
-        return Some(message);
+        break Some(message);
       }
-      match stream.read(&mut chunk) {
+      match socket.read(&mut chunk) {
         // A signal in this process interrupts a blocking read; the read is retried, as `read_exact` does.
         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-        Ok(0) | Err(_) => return None,
+        Ok(0) | Err(_) => break None,
         Ok(count) => bytes.extend_from_slice(&chunk[..count]),
       }
-    }
-  };
-  let mut socket = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, export_port)).unwrap();
-  socket
-    .set_read_timeout(Some(Duration::from_nanos(LIVENESS_BUDGET_NS)))
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(self.issuer.der().clone()).unwrap();
+    let (cert, key) = self.issue("node-a");
+    let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+      rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_client_auth_cert(vec![cert], key)
     .unwrap();
-  socket.write_all(&call(1, 4, AUTH_TLS)).unwrap();
-  let probe_reply = read_one(&mut socket);
-  let mut roots = rustls::RootCertStore::empty();
-  roots.add(issuer.der().clone()).unwrap();
-  let (client_cert, client_key) = issue("node-a");
-  let mut client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-    rustls::crypto::ring::default_provider(),
-  ))
-  .with_protocol_versions(&[&rustls::version::TLS13])
-  .unwrap()
-  .with_root_certificates(roots)
-  .with_client_auth_cert(vec![client_cert], client_key)
-  .unwrap();
-  client_config.alpn_protocols = vec![ALPN_SUNRPC.to_vec()];
-  let mut client = rustls::ClientConnection::new(
-    std::sync::Arc::new(client_config),
-    rustls::pki_types::ServerName::try_from(NAME).unwrap(),
-  )
-  .unwrap();
-  let mut tls = rustls::Stream::new(&mut client, &mut socket);
-  let v3 = tls
-    .write_all(&call(2, 3, 0))
-    .ok()
-    .and_then(|()| read_one(&mut tls));
-  let v4 = tls
-    .write_all(&call(3, 4, 0))
-    .ok()
-    .and_then(|()| read_one(&mut tls));
-  let refusals = daemon.fleet_refusals();
-  daemon.stop();
+    config.alpn_protocols = vec![ALPN_SUNRPC.to_vec()];
+    let connection = rustls::ClientConnection::new(
+      std::sync::Arc::new(config),
+      rustls::pki_types::ServerName::try_from(NAME).unwrap(),
+    )
+    .unwrap();
+    (reply, rustls::StreamOwned::new(connection, socket))
+  }
+}
+
+/// §4.6 "Kubernetes publication without privilege" (AUD-29-75): a fleet node with an operator authority serves
+/// its network export over RPC-with-TLS (RFC 9289). Do: start a one-node fleet daemon whose transport holds an
+/// export listener and the operator's issuer; as a node's NFS client would, probe it, complete a mutual TLS 1.3
+/// handshake with a certificate the issuer signed and ALPN `sunrpc`, and call NFSv3 `NULL` and NFSv4 `NULL`
+/// inside the session. Expect: `STARTTLS`, and both calls answered `SUCCESS` by the daemon's own NFS edge — the
+/// export runs on the real control shard, its session built from the kept identity.
+#[test]
+fn a_fleet_node_with_an_operator_authority_serves_its_export_over_rpc_with_tls() {
+  use slates_bridge_nfs::rpc_tls::starttls_reply;
+  let _serial = serialize_fleet_tests();
+  let node = ExportNode::start("export");
+  let (probe, mut tls) = node.session();
+  let null =
+    |stream: &mut rustls::StreamOwned<rustls::ClientConnection, TcpStream>, xid, version| {
+      common::nfs::call_version(stream, 100_003, version, 0, &[], xid)
+    };
+  let v3 = null(&mut tls, 2, 3);
+  let v4 = null(&mut tls, 3, 4);
+  let refusals = node.daemon.fleet_refusals();
+  node.daemon.stop();
   assert_eq!(
-    probe_reply,
+    probe,
     Some(starttls_reply(1)),
     "the probe is answered STARTTLS (refusals: {refusals:?})"
   );
+  // `call_version` checks each reply was accepted; a `NULL` has no results.
+  assert!(
+    v3.is_empty() && v4.is_empty(),
+    "both NULLs answered SUCCESS inside the session"
+  );
+}
+
+/// §4.6 (AUD-29-75): the network export's teardown is the attachment's. Do: through an RPC-with-TLS session on
+/// the export, mount a volume by its owner's capability path and write a file; then `detach` that attachment
+/// and read the file again on the same, still-open session; then destroy the volume and read once more.
+/// Expect: the read succeeds while the attachment lives, and is refused `NFS3ERR_ACCES` after the detach and
+/// after the destroy — exactly what the loopback edge answers (`nfs_mount.rs` `assert_unmounted`); a session
+/// established before the end gains nothing from having been opened.
+#[test]
+fn the_network_exports_teardown_is_its_attachments() {
+  let _serial = serialize_fleet_tests();
+  let node = ExportNode::start("export-teardown");
+  let mut client = Client::connect(node.daemon.instance());
+  // The group forms within a few protocol periods of the bootstrap; until then a create is refused typed.
+  let mut created = None;
+  let formed = audit_wait(|| match client.call(&scratch("export-teardown")) {
+    ReplyBody::Created { id } => {
+      created = Some(id);
+      Ok(true)
+    }
+    ReplyBody::Refused {
+      refusal: slates_ipc::protocol::Refusal::ConsensusNotInitialized,
+    } => Ok(false),
+    other => panic!("the volume is created: {other:?}"),
+  });
+  let volume = created.unwrap_or_else(|| panic!("the group formed: {formed}"));
+  let path = capability_path(&node.daemon, "export-teardown");
+  let (_, capability) = path.rsplit_once('@').expect("a capability path");
+  let (attachment, _) = capability.split_once('.').expect("a capability");
+  let attachment = u64::from_str_radix(attachment, 16).unwrap();
+  let (_, mut tls) = node.session();
+  let root = mount(&mut tls, &path, 2);
+  let file = create(&mut tls, &root, "hello.txt", 3);
+  write(&mut tls, &file, CONTENT, 4);
+  let while_attached = read_status(&mut tls, &file, 5);
+  let detached = client.call(&RequestBody::Detach { attachment });
+  let after_detach = read_status(&mut tls, &file, 6);
+  let destroyed = client.call(&RequestBody::Destroy { volume });
+  let after_destroy = read_status(&mut tls, &file, 7);
+  node.daemon.stop();
   assert_eq!(
-    v3,
-    Some(reply_bytes(2, AcceptStatus::Success, &[])),
-    "NFSv3 NULL inside the session (refusals: {refusals:?})"
+    while_attached, 0,
+    "the file reads while the attachment lives"
+  );
+  assert!(
+    matches!(detached, ReplyBody::Detached),
+    "the detach: {detached:?}"
   );
   assert_eq!(
-    v4,
-    Some(reply_bytes(3, AcceptStatus::Success, &[])),
-    "NFSv4 NULL inside the session (refusals: {refusals:?})"
+    after_detach, NFS3ERR_ACCES,
+    "after the detach the session's handle authorizes nothing"
+  );
+  assert!(
+    matches!(destroyed, ReplyBody::Destroyed),
+    "the destroy: {destroyed:?}"
+  );
+  assert_eq!(
+    after_destroy, NFS3ERR_ACCES,
+    "after the destroy the handle reaches nothing"
   );
 }
 

@@ -7,7 +7,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 /// Format: the MOUNT program number (RFC 1813).
 pub(crate) const MOUNT_PROGRAM: u32 = 100_005;
@@ -33,7 +32,7 @@ pub(crate) fn read_opaque(buf: &[u8], off: usize) -> (Vec<u8>, usize) {
 pub(crate) const VERSION_3: u32 = 3;
 
 pub(crate) fn call(
-  stream: &mut TcpStream,
+  stream: &mut (impl Read + Write),
   program: u32,
   procedure: u32,
   args: &[u8],
@@ -45,7 +44,7 @@ pub(crate) fn call(
 /// One ONC RPC call of `program` at `version` (AUTH_NONE): the procedure's results, after the reply's
 /// accept status.
 pub(crate) fn call_version(
-  stream: &mut TcpStream,
+  stream: &mut (impl Read + Write),
   program: u32,
   version: u32,
   procedure: u32,
@@ -81,7 +80,7 @@ pub(crate) fn status(results: &[u8]) -> u32 {
 }
 
 /// MOUNT MNT `path` → the root file handle.
-pub(crate) fn mount(stream: &mut TcpStream, path: &str, xid: u32) -> Vec<u8> {
+pub(crate) fn mount(stream: &mut (impl Read + Write), path: &str, xid: u32) -> Vec<u8> {
   let mut args = Vec::new();
   opaque(path.as_bytes(), &mut args);
   let reply = call(stream, MOUNT_PROGRAM, 1, &args, xid);
@@ -91,7 +90,7 @@ pub(crate) fn mount(stream: &mut TcpStream, path: &str, xid: u32) -> Vec<u8> {
 
 /// MOUNT MNT `path` → its status, without asserting it succeeded (a capability that no longer authorizes
 /// its volume is refused).
-pub(crate) fn mount_status(stream: &mut TcpStream, path: &str, xid: u32) -> u32 {
+pub(crate) fn mount_status(stream: &mut (impl Read + Write), path: &str, xid: u32) -> u32 {
   let mut args = Vec::new();
   opaque(path.as_bytes(), &mut args);
   status(&call(stream, MOUNT_PROGRAM, 1, &args, xid))
@@ -99,7 +98,7 @@ pub(crate) fn mount_status(stream: &mut TcpStream, path: &str, xid: u32) -> u32 
 
 /// MOUNT UMNT `path` — what the kernel sends when a mount is removed (`umount`); a void reply (RFC 1813
 /// §5.2.3), so nothing to assert on but its arrival.
-pub(crate) fn umnt(stream: &mut TcpStream, path: &str, xid: u32) {
+pub(crate) fn umnt(stream: &mut (impl Read + Write), path: &str, xid: u32) {
   let mut args = Vec::new();
   opaque(path.as_bytes(), &mut args);
   let reply = call(stream, MOUNT_PROGRAM, 3, &args, xid);
@@ -108,7 +107,7 @@ pub(crate) fn umnt(stream: &mut TcpStream, path: &str, xid: u32) {
 
 /// The NFS status of a READ of up to 400 bytes at offset zero from `file_fh` — without asserting it
 /// succeeded, so a refusal (a capability that no longer authorizes the handle) is what the test reads.
-pub(crate) fn read_status(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> u32 {
+pub(crate) fn read_status(stream: &mut (impl Read + Write), file_fh: &[u8], xid: u32) -> u32 {
   let mut args = Vec::new();
   opaque(file_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // offset
@@ -119,7 +118,7 @@ pub(crate) fn read_status(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> u
 /// NFS LOOKUP `name` in `dir_fh` → the status, and whether the reply carried the object's attributes
 /// (`obj_attributes`, a `post_op_attr`: RFC 1813 §3.3.3) — without asserting it succeeded.
 pub(crate) fn lookup_carries_attributes(
-  stream: &mut TcpStream,
+  stream: &mut (impl Read + Write),
   dir_fh: &[u8],
   name: &str,
   xid: u32,
@@ -138,7 +137,12 @@ pub(crate) fn lookup_carries_attributes(
 }
 
 /// NFS LOOKUP `name` in `dir_fh` → the child's file handle.
-pub(crate) fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+pub(crate) fn lookup(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &str,
+  xid: u32,
+) -> Vec<u8> {
   lookup_status(stream, dir_fh, name, xid)
     .unwrap_or_else(|status| panic!("LOOKUP {name}: status {status}, expected 0"))
 }
@@ -146,7 +150,7 @@ pub(crate) fn lookup(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32
 /// NFS LOOKUP `name` in `dir_fh` → the child's file handle, or the status the server answered instead — so a
 /// test can report the server's state beside a retry-later (`NFS3ERR_JUKEBOX`) or stale answer.
 pub(crate) fn lookup_status(
-  stream: &mut TcpStream,
+  stream: &mut (impl Read + Write),
   dir_fh: &[u8],
   name: &str,
   xid: u32,
@@ -163,14 +167,18 @@ pub(crate) fn lookup_status(
 
 /// NFS GETATTR of `fh` → its `(mode, uid, gid)` — what `stat` shows through a kernel mount, and what a
 /// takeover successor must reproduce for the dead owner's tree (fattr3: type, mode, nlink, uid, gid, …).
-pub(crate) fn owner_and_mode(stream: &mut TcpStream, fh: &[u8], xid: u32) -> (u32, u32, u32) {
+pub(crate) fn owner_and_mode(
+  stream: &mut (impl Read + Write),
+  fh: &[u8],
+  xid: u32,
+) -> (u32, u32, u32) {
   owner_and_mode_status(stream, fh, xid)
     .unwrap_or_else(|status| panic!("GETATTR: status {status}, expected 0"))
 }
 
 /// NFS GETATTR of `fh` → its `(mode, uid, gid)`, or the status the server answered instead.
 pub(crate) fn owner_and_mode_status(
-  stream: &mut TcpStream,
+  stream: &mut (impl Read + Write),
   fh: &[u8],
   xid: u32,
 ) -> Result<(u32, u32, u32), u32> {
@@ -187,7 +195,12 @@ pub(crate) fn owner_and_mode_status(
 }
 
 /// NFS CREATE (UNCHECKED) `name` in `dir_fh` with mode 0644 → the new file's handle.
-pub(crate) fn create(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+pub(crate) fn create(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &str,
+  xid: u32,
+) -> Vec<u8> {
   let mut args = Vec::new();
   opaque(dir_fh, &mut args);
   opaque(name.as_bytes(), &mut args);
@@ -212,7 +225,12 @@ pub(crate) fn create(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32
 }
 
 /// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
-pub(crate) fn mkdir(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32) -> Vec<u8> {
+pub(crate) fn mkdir(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &str,
+  xid: u32,
+) -> Vec<u8> {
   let mut args = Vec::new();
   opaque(dir_fh, &mut args);
   opaque(name.as_bytes(), &mut args);
@@ -234,7 +252,7 @@ pub(crate) fn mkdir(stream: &mut TcpStream, dir_fh: &[u8], name: &str, xid: u32)
 }
 
 /// NFS WRITE `data` at offset zero to `file_fh` (FILE_SYNC).
-pub(crate) fn write(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u32) {
+pub(crate) fn write(stream: &mut (impl Read + Write), file_fh: &[u8], data: &[u8], xid: u32) {
   let mut args = Vec::new();
   opaque(file_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // offset
@@ -246,7 +264,12 @@ pub(crate) fn write(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u3
 }
 
 /// NFS WRITE `data` at offset zero to `file_fh` (FILE_SYNC): the status the server answered.
-pub(crate) fn write_status(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], xid: u32) -> u32 {
+pub(crate) fn write_status(
+  stream: &mut (impl Read + Write),
+  file_fh: &[u8],
+  data: &[u8],
+  xid: u32,
+) -> u32 {
   let mut args = Vec::new();
   opaque(file_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // offset
@@ -257,14 +280,14 @@ pub(crate) fn write_status(stream: &mut TcpStream, file_fh: &[u8], data: &[u8], 
 }
 
 /// NFS READ up to 400 bytes at offset zero from `file_fh`.
-pub(crate) fn read(stream: &mut TcpStream, file_fh: &[u8], xid: u32) -> Vec<u8> {
+pub(crate) fn read(stream: &mut (impl Read + Write), file_fh: &[u8], xid: u32) -> Vec<u8> {
   read_bytes_status(stream, file_fh, xid)
     .unwrap_or_else(|status| panic!("READ: status {status}, expected 0"))
 }
 
 /// NFS READ of `file_fh` from offset 0 → the bytes, or the status the server answered instead.
 pub(crate) fn read_bytes_status(
-  stream: &mut TcpStream,
+  stream: &mut (impl Read + Write),
   file_fh: &[u8],
   xid: u32,
 ) -> Result<Vec<u8>, u32> {
@@ -290,7 +313,7 @@ pub(crate) fn read_bytes_status(
 /// NFS FSSTAT `fh` → the volume's (total bytes, free bytes): the quota the export serves as the
 /// filesystem's capacity (the truthful `statfs`, BUG-9), what a recovered volume's acknowledged size
 /// policy is observed through.
-pub(crate) fn fsstat(stream: &mut TcpStream, fh: &[u8], xid: u32) -> (u64, u64) {
+pub(crate) fn fsstat(stream: &mut (impl Read + Write), fh: &[u8], xid: u32) -> (u64, u64) {
   let mut args = Vec::new();
   opaque(fh, &mut args);
   let reply = call(stream, NFS_PROGRAM, 18, &args, xid);
@@ -308,7 +331,11 @@ pub(crate) fn fsstat(stream: &mut TcpStream, fh: &[u8], xid: u32) -> (u64, u64) 
 
 /// READDIRPLUS `dir_fh` and return the entry names (skipping each entry's fileid, cookie, optional
 /// attributes and optional handle).
-pub(crate) fn readdirplus(stream: &mut TcpStream, dir_fh: &[u8], xid: u32) -> Vec<String> {
+pub(crate) fn readdirplus(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  xid: u32,
+) -> Vec<String> {
   let mut args = Vec::new();
   opaque(dir_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // cookie
@@ -355,7 +382,7 @@ pub(crate) fn readdirplus(stream: &mut TcpStream, dir_fh: &[u8], xid: u32) -> Ve
 pub(crate) type Time3 = (u32, u32);
 
 /// The three times an NFSv3 GETATTR of `fh` reports: (atime, mtime, ctime).
-pub(crate) fn times(stream: &mut TcpStream, fh: &[u8], xid: u32) -> [Time3; 3] {
+pub(crate) fn times(stream: &mut (impl Read + Write), fh: &[u8], xid: u32) -> [Time3; 3] {
   let mut args = Vec::new();
   opaque(fh, &mut args);
   let reply = call(stream, NFS_PROGRAM, 1, &args, xid);
@@ -369,7 +396,13 @@ pub(crate) fn times(stream: &mut TcpStream, fh: &[u8], xid: u32) -> [Time3; 3] {
 
 /// NFSv3 SETATTR of `fh`'s access and modification times to the client-supplied `atime` and `mtime`
 /// (`SET_TO_CLIENT_TIME`), nothing else set and no guard.
-pub(crate) fn set_times(stream: &mut TcpStream, fh: &[u8], atime: Time3, mtime: Time3, xid: u32) {
+pub(crate) fn set_times(
+  stream: &mut (impl Read + Write),
+  fh: &[u8],
+  atime: Time3,
+  mtime: Time3,
+  xid: u32,
+) {
   /// Format: `time_how` SET_TO_CLIENT_TIME (RFC 1813 §2.6).
   const SET_TO_CLIENT_TIME: u32 = 2;
   let mut args = Vec::new();

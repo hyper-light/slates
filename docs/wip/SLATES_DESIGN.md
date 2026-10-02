@@ -2029,9 +2029,11 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > signature-mandated `Arc`, with a single owner. Measured: 11.0 µs per build, 3.8% of the 280.6 µs mutual
 > handshake; a shared config was rejected (BENCHMARKS.md). Proven by a real rustls client against the
 > connection (every rule, two mutations red), a daemon whose fleet has an authority (a mutation removing the
-> wiring red), and an anchored node across `kill -9` of its daemon, on macOS and Linux (io_uring). Owed: the
-> KIND workload pod over an `nfs` PersistentVolume with `tlshd` on the node (the kernel leg, on the GitHub
-> runner), and teardown proofs.
+> wiring red), and an anchored node across `kill -9` of its daemon, on macOS and Linux (io_uring). Teardown is
+> the attachment's: on one open session a file reads while its attachment lives and is refused `NFS3ERR_ACCES`
+> after `detach` and after the volume's destroy, as on loopback (`the_network_exports_teardown_is_its_attachments`).
+> Owed: the KIND workload pod over an `nfs` PersistentVolume with `tlshd` on the node (the kernel leg, on the
+> GitHub runner).
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
