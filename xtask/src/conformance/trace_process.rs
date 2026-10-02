@@ -99,7 +99,15 @@ impl TraceProcess {
   ) -> Result<(), Failure> {
     self.require_running()?;
     (self.signal)(self.child.id(), StopSignal::Interrupt)?;
+    let signalled = Instant::now();
     let status = self.wait_exit()?;
+    // Measured on every run, so the stop bound can be derived from the tracer's exits rather than borrowed:
+    // it reuses the mount wait (20 s) today, and one macOS run in twelve exceeded it (CI 2026-10-02).
+    eprintln!(
+      "tracer exited {:?} after its stop signal (bound {:?})",
+      signalled.elapsed(),
+      self.bound
+    );
     if !accept(status) {
       return Err(Failure(format!("tracer exited {status}")));
     }
