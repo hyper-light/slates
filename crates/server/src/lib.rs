@@ -53,6 +53,8 @@ pub mod merge_service;
 pub mod nfs;
 #[cfg(unix)]
 mod nfs_state;
+#[cfg(unix)]
+pub mod nfs_tls;
 pub mod observe;
 mod owner_location;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount

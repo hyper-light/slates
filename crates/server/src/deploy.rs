@@ -14,7 +14,9 @@
 //! - **The socket layout.** A node serves every peer on one socket per plane
 //!   (`slates_transport::demux`: sessions are told apart by the connection id in each packet), so it
 //!   advertises one base port and owns the next: it serves probes on `base` and records on `base + 1`
-//!   ([`serve_port`]), and every peer dials it there. A base at the very end of the port range is refused
+//!   ([`serve_port`]), and every peer dials it there. A fleet with an operator authority also serves its network
+//!   export (§4.6, AUD-29-75) on `base` over TCP, a separate port namespace from the UDP planes, so the block stays
+//!   two numbers wide. A base at the very end of the port range is refused
 //!   (`PortBlockOverflows`), never wrapped.
 //! - **Addresses by IP or by name.** A node's advertised address is an IPv4 literal or a DNS name
 //!   ([`NodeAddress`]). A name is resolved by the dialer at every fresh dial ([`crate::dns`]), never here:
@@ -544,6 +546,9 @@ pub fn plan(
       serve: ServeAddresses {
         probe: probe_bind,
         record: record_bind,
+        // The network export (§4.6, AUD-29-75) listens on the probe plane's address over TCP, and only where
+        // NFS runs and an operator authority exists to verify its clients.
+        export: (cfg!(unix) && !manifest.enrollment_roots.is_empty()).then_some(probe_bind),
       },
       peers,
       resolver,
@@ -657,6 +662,43 @@ mod tests {
       .iter()
       .position(|n| member_id(host_id_of_certificate(&n.certificate), 0) == host)
       .expect("the host is a manifest node")
+  }
+
+  /// §4.6 "Kubernetes publication without privilege" (AUD-29-75). Do: plan node a of a manifest without an
+  /// operator authority, then of the same manifest with one. Expect: no export without it (nothing could
+  /// authenticate a client), and with it the export on the probe plane's address and port (TCP beside UDP).
+  #[test]
+  fn the_plan_exports_exactly_when_an_operator_authority_exists() {
+    let (mut manifest, keys) = manifest();
+    let without = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a valid plan");
+    assert_eq!(without.transport.serve.export, None);
+    // An authority, and nodes enrolled under it: each certificate names its failure domain (`r0.d<domain>`),
+    // which planning under an authority requires, and each node states that domain.
+    let issuer_key = rcgen::KeyPair::generate().expect("a key pair");
+    let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).expect("params");
+    issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let issuer = issuer_params
+      .self_signed(&issuer_key)
+      .expect("the authority");
+    let mut keys = Vec::new();
+    for (domain, node) in (0u64..).zip(manifest.nodes.iter_mut()) {
+      let key = rcgen::KeyPair::generate().expect("a key pair");
+      let cert =
+        rcgen::CertificateParams::new(vec![NAME.to_owned(), format!("r0.d{domain}.{NAME}")])
+          .expect("params")
+          .signed_by(&key, &issuer, &issuer_key)
+          .expect("an enrolled certificate");
+      node.certificate = cert.der().clone();
+      node.domain = Some(domain);
+      keys.push(PrivateKeyDer::try_from(key.serialize_der()).expect("a key"));
+    }
+    manifest.enrollment_roots = vec![issuer.der().clone()];
+    let with = plan(&manifest, "a", key_of(&keys, "a"), None).expect("a valid plan");
+    assert_eq!(
+      with.transport.serve.export,
+      cfg!(unix).then_some(with.transport.serve.probe),
+      "the export listens on the probe plane's address, over TCP, where NFS runs"
+    );
   }
 
   /// AC (§4.8, D-14): the plan carries each node's declared failure domain to the membership, keyed by the

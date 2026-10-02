@@ -1832,11 +1832,11 @@ a mount propagation mode.
 1. **Where the server runs.** The daemon pods (the KIND chart's StatefulSet) serve NFSv4.2 on a second
    listener, on the pod network. The loopback listener is unchanged. These are two trust boundaries, not a mode
    switch: the host protects loopback, and nothing protects the cluster network.
-2. **The capability.** A new attach form, a network export of a volume, subtree or snapshot, creates an
-   attachment like any other (§4.8 record, the scope and view rules of AUD-29-76). Its capability is the
-   export's one path component, an unguessable token like the host mount's. `PUTROOTFH` then `LOOKUP(token)`
-   reaches the attachment's scoped root and nothing above it. An unknown or ended token is refused. A
-   `detach`, the volume's destroy or the snapshot view's end makes every handle under it stale.
+2. **The capability.** No new attach form: the NFS edge already authorizes every call by the mount
+   capability its path or handle carries, and nothing else (`authorized_rights`: "not the `AUTH_SYS` uid, not
+   loopback reachability"). A host-mount attachment, of a volume, a subtree or a snapshot (AUD-29-76), therefore
+   gives the PersistentVolume its path, `<name>@<attachment>.<token>`. Its scope, view, `detach` and destroy rules are
+   the attachment's, unchanged.
 3. **The transport is RPC-with-TLS, mutually authenticated, or nothing.** Over cleartext the token would be a
    bearer secret on the cluster network, so the network listener accepts only RFC 9289's protocol. The client
    first sends a `NULL` call with `AUTH_TLS`, and the server answers with the `STARTTLS` verifier (§4.1). TLS 1.3
@@ -2016,6 +2016,22 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > run over slates' own FUSE mount, and it found that a component past `NAME_MAX` answered `EINVAL` or `ENOENT`.
 > `VfsError::NameTooLong` is now checked on lookups too and mapped to each host's code. The run's failures are now
 > exactly the reviewed Linux root list's.
+
+> **Status (2026-10-01, AUD-29-75: the network export over RPC-with-TLS).** A fleet node whose manifest names an
+> operator authority serves its NFS edge on a second listener: TCP on its base port (the UDP planes keep the
+> same number, so the block stays two wide). It is held by the anchor and handed across a restart as a third
+> descriptor in `SLATES_ANCHOR_FLEET_SERVE`. A connection must open with RFC 9289's `AUTH_TLS` probe, answered
+> `STARTTLS`; a cleartext call is answered `AUTH_TOOWEAK` and `AUTH_TLS` elsewhere `AUTH_BADCRED`, then the
+> connection is closed, as is one with bytes sent behind the probe. Then a mutual TLS 1.3 handshake follows: ALPN
+> exactly `sunrpc`, a client certificate verified to the operator's authority, no tickets. Inside the session
+> each call is served as the loopback listener serves it and authorized by its mount capability alone. The
+> session is built per connection inside the transport crate, the one module holding rustls's
+> signature-mandated `Arc`, with a single owner. Measured: 11.0 µs per build, 3.8% of the 280.6 µs mutual
+> handshake; a shared config was rejected (BENCHMARKS.md). Proven by a real rustls client against the
+> connection (every rule, two mutations red), a daemon whose fleet has an authority (a mutation removing the
+> wiring red), and an anchored node across `kill -9` of its daemon, on macOS and Linux (io_uring). Owed: the
+> KIND workload pod over an `nfs` PersistentVolume with `tlshd` on the node (the kernel leg, on the GitHub
+> runner), and teardown proofs.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

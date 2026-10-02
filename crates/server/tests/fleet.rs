@@ -405,6 +405,7 @@ fn held_serve_sockets(probe: SocketAddrV4, record: SocketAddrV4) -> ServeSockets
   ServeSockets {
     probe: adopt(probe),
     record: adopt(record),
+    export: None,
   }
 }
 
@@ -7925,6 +7926,7 @@ fn a_serve_socket_that_cannot_be_bound_refuses_the_start_by_name() {
   let planned = ServeAddresses {
     probe: loopback(pa_probe),
     record: loopback(pa_record),
+    export: None,
   };
   match planned.bind() {
     Err(refusal) => {
@@ -10329,4 +10331,163 @@ fn assert_group_timing_is_derived(
       "inside one heartbeat the status carries the floor: {reported:?}"
     );
   }
+}
+
+/// §4.6 "Kubernetes publication without privilege" (AUD-29-75): a fleet node with an operator authority serves
+/// its network export over RPC-with-TLS (RFC 9289). Do: start a one-node fleet daemon whose transport holds an
+/// export listener and the operator's issuer, then, as a node's NFS client would, probe it, complete a mutual
+/// TLS 1.3 handshake with a certificate the issuer signed and ALPN `sunrpc`, and call NFSv3 `NULL` and NFSv4
+/// `NULL` inside the session. Expect: `STARTTLS`, a session on `sunrpc`, and both calls answered `SUCCESS` by the
+/// daemon's own NFS edge — the export runs on the real control shard, its session built from the kept identity.
+#[test]
+#[allow(clippy::disallowed_types)] // rustls's client takes `Arc` by signature (D-8 exception 3, a test harness).
+fn a_fleet_node_with_an_operator_authority_serves_its_export_over_rpc_with_tls() {
+  use slates_bridge_nfs::rpc::{AcceptStatus, read_record, reply_bytes, write_record};
+  use slates_bridge_nfs::rpc_tls::{ALPN_SUNRPC, AUTH_TLS, starttls_reply};
+  use std::io::{Read, Write};
+  let _serial = serialize_fleet_tests();
+  let issuer_key = rcgen::KeyPair::generate().unwrap();
+  let mut issuer_params = rcgen::CertificateParams::new(vec![NAME.to_owned()]).unwrap();
+  issuer_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+  let issuer = issuer_params.self_signed(&issuer_key).unwrap();
+  let issue = |name: &str| {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
+      .unwrap()
+      .signed_by(&key, &issuer, &issuer_key)
+      .unwrap();
+    (
+      cert.der().clone(),
+      rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+    )
+  };
+  let (node_cert, node_key) = issue(NAME);
+  let identity = Identity::from_der(node_cert.clone(), node_key);
+  let anchor = slates_server::deploy::host_id_of_certificate(&node_cert);
+  let (_lease, [probe, record, _, _]) = four_free_ports();
+  let export =
+    slates_rt::tcp::TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), 16).unwrap();
+  let export_port = export.local_addr().unwrap().port();
+  let mut serve = held_serve_sockets(loopback(probe), loopback(record));
+  serve.export = Some(export);
+  let profile = profile("export");
+  let instance = format!("export-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1)).with_fleet(FleetMembership {
+    quorum: Quorum { f: 0 },
+    peers: Vec::new(),
+    host: member_id(anchor, 0),
+    origin_anchor: anchor,
+    domains: std::collections::BTreeMap::new(),
+    regions: std::collections::BTreeMap::new(),
+    durability: None,
+    region_mirrors: std::collections::BTreeMap::new(),
+  });
+  let daemon = Daemon::start_with_fleet(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{instance}"),
+    },
+    Some(FleetTransport {
+      identity,
+      name: NAME.to_owned(),
+      advertise: loopback(probe).into(),
+      serve,
+      peers: Vec::new(),
+      resolver: None,
+      enrollment_roots: vec![issuer.der().clone()],
+    }),
+  )
+  .unwrap();
+  let call = |xid: u32, version: u32, flavor: u32| {
+    let mut message = Vec::new();
+    for word in [xid, 0, 2, 100_003, version, 0, flavor, 0, 0, 0] {
+      message.extend_from_slice(&word.to_be_bytes());
+    }
+    write_record(&message)
+  };
+  let read_one = |stream: &mut dyn Read| -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+      if let Ok((message, _)) = read_record(&bytes) {
+        return Some(message);
+      }
+      match stream.read(&mut chunk) {
+        // A signal in this process interrupts a blocking read; the read is retried, as `read_exact` does.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        Ok(0) | Err(_) => return None,
+        Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+      }
+    }
+  };
+  let mut socket = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, export_port)).unwrap();
+  socket
+    .set_read_timeout(Some(Duration::from_nanos(LIVENESS_BUDGET_NS)))
+    .unwrap();
+  socket.write_all(&call(1, 4, AUTH_TLS)).unwrap();
+  let probe_reply = read_one(&mut socket);
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(issuer.der().clone()).unwrap();
+  let (client_cert, client_key) = issue("node-a");
+  let mut client_config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+    rustls::crypto::ring::default_provider(),
+  ))
+  .with_protocol_versions(&[&rustls::version::TLS13])
+  .unwrap()
+  .with_root_certificates(roots)
+  .with_client_auth_cert(vec![client_cert], client_key)
+  .unwrap();
+  client_config.alpn_protocols = vec![ALPN_SUNRPC.to_vec()];
+  let mut client = rustls::ClientConnection::new(
+    std::sync::Arc::new(client_config),
+    rustls::pki_types::ServerName::try_from(NAME).unwrap(),
+  )
+  .unwrap();
+  let mut tls = rustls::Stream::new(&mut client, &mut socket);
+  let v3 = tls
+    .write_all(&call(2, 3, 0))
+    .ok()
+    .and_then(|()| read_one(&mut tls));
+  let v4 = tls
+    .write_all(&call(3, 4, 0))
+    .ok()
+    .and_then(|()| read_one(&mut tls));
+  let refusals = daemon.fleet_refusals();
+  daemon.stop();
+  assert_eq!(
+    probe_reply,
+    Some(starttls_reply(1)),
+    "the probe is answered STARTTLS (refusals: {refusals:?})"
+  );
+  assert_eq!(
+    v3,
+    Some(reply_bytes(2, AcceptStatus::Success, &[])),
+    "NFSv3 NULL inside the session (refusals: {refusals:?})"
+  );
+  assert_eq!(
+    v4,
+    Some(reply_bytes(3, AcceptStatus::Success, &[])),
+    "NFSv4 NULL inside the session (refusals: {refusals:?})"
+  );
+}
+
+/// §4.6 (AUD-29-75): the plan's export is taken up with the planes. Do: bind planned addresses with an export,
+/// and without one (ephemeral ports, so nothing else holds them). Expect: with it, a TCP listener a client can
+/// connect to; without it, none.
+#[test]
+fn a_planned_export_binds_a_tcp_listener_and_none_without_one() {
+  let planned = |export: bool| ServeAddresses {
+    probe: loopback(0),
+    record: loopback(0),
+    export: export.then_some(loopback(0)),
+  };
+  let with = planned(true).bind().unwrap();
+  let listener = with.export.expect("the planned export is bound");
+  let port = listener.local_addr().unwrap().port();
+  assert!(
+    TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok(),
+    "the export listens for TCP connections"
+  );
+  assert!(planned(false).bind().unwrap().export.is_none());
 }

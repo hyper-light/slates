@@ -1508,6 +1508,7 @@ dependencies = [
  "libc",
  "rcgen",
  "rustix",
+ "rustls",
  "serde_json",
  "slates-anchor",
  "slates-bridge-nfs",

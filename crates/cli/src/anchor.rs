@@ -84,7 +84,21 @@ fn hold_fleet_serve(
   };
   let probe = inheritable(serve.probe, "probe")?;
   let record = inheritable(serve.record, "record")?;
-  supervisor.hold_fleet_serve(probe, record);
+  // The network export's listener (§4.6, AUD-29-75), held and handed over the same way when the plan has one.
+  let export = match serve.export {
+    Some(listener) => {
+      let fd = listener.into_fd();
+      rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::empty()).map_err(|e| {
+        failed(
+          "fleet serve",
+          format!("the export listener cannot be made inheritable: {e}"),
+        )
+      })?;
+      Some(fd)
+    }
+    None => None,
+  };
+  supervisor.hold_fleet_serve(probe, record, export);
   Ok(())
 }
 

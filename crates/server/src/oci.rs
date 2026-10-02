@@ -219,7 +219,8 @@ mod tests {
     }
   }
 
-  /// A partition holding the volume and its FUSE mount's attachment (the bridge's, at [`POINT`]).
+  /// A partition holding the volume and its FUSE mount's attachment (the bridge's, at [`POINT`]), shared with
+  /// other users as a mount a container binds must be (`slates mount --shared`; AUD-29-67).
   fn partition() -> Partition {
     let mut partition = Partition::new(CAPS, 0);
     let volume = volume();
@@ -235,8 +236,9 @@ mod tests {
           volume: volume.id,
           consumer: Consumer::Bridge,
           snapshot: None,
-          form: AttachForm::ChosenPath {
+          form: AttachForm::SharedFuseMount {
             path: POINT.to_owned(),
+            scope: None,
           },
           principal: OWNER,
           rights: Rights {
@@ -307,6 +309,47 @@ mod tests {
       binding(POINT, None).consumer(&partition, volume, &OWNER, None),
       Ok(Consumer::Mount {
         attachment: MOUNTED
+      })
+    );
+  }
+
+  /// AUD-29-67 (a container reaches a Linux source as its own ids). Do: record the FUSE mount at [`POINT`] as one
+  /// the daemon made for its own user (not shared), and bind it by its attachment. Expect: refused
+  /// `MountNotShared` — a container's processes would meet `EACCES` on a mount without `allow_other`.
+  #[test]
+  fn a_bind_of_a_mount_not_shared_with_other_users_is_refused() {
+    let mut partition = Partition::new(CAPS, 0);
+    let volume = volume();
+    partition
+      .apply(&Op::VolumeCreated {
+        record: volume.clone(),
+      })
+      .unwrap();
+    partition
+      .apply(&Op::AttachmentAdded {
+        record: AttachmentRecord {
+          id: MOUNTED,
+          volume: volume.id,
+          consumer: Consumer::Bridge,
+          snapshot: None,
+          form: AttachForm::ChosenPath {
+            path: POINT.to_owned(),
+          },
+          principal: OWNER,
+          rights: Rights {
+            read: true,
+            write: true,
+            admin: false,
+          },
+          token: [1; 16],
+        },
+      })
+      .unwrap();
+    assert_eq!(
+      binding(POINT, Some(MOUNTED)).consumer(&partition, volume.id, &OWNER, None),
+      Err(Refusal::AttachmentUnsupported {
+        transport: AttachTransport::Oci,
+        reason: UnsupportedReason::MountNotShared,
       })
     );
   }

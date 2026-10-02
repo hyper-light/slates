@@ -281,22 +281,38 @@ pub struct FleetTransport<Serve = ServeSockets> {
   pub resolver: Option<Resolver>,
 }
 
-/// Where a node's two serve sockets bind — the deployment plan's pure form (planning binds nothing).
+/// Where a node's serve sockets bind — the deployment plan's pure form (planning binds nothing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ServeAddresses {
   /// The probe plane's address.
   pub probe: SocketAddrV4,
   /// The record plane's address.
   pub record: SocketAddrV4,
+  /// The network export's TCP address (§4.6 "Kubernetes publication without privilege", AUD-29-75): the
+  /// probe plane's address and port, over TCP rather than UDP, so the port block stays two numbers wide.
+  /// Present only when the fleet has an operator authority to verify RPC-with-TLS clients against; without
+  /// one nothing could be authenticated, so nothing is served.
+  pub export: Option<SocketAddrV4>,
 }
 
-/// A node's two bound serve sockets, one per plane — what the membership loop serves on.
+/// The network export's listener: a TCP listener on Unix, where the NFS transport runs; uninhabited
+/// elsewhere (a Windows daemon serves no NFS; it mounts through WinFsp), so the field is always `None` there.
+#[cfg(unix)]
+pub type ExportListener = slates_rt::tcp::TcpListener;
+/// The network export's listener: uninhabited off Unix (no NFS transport there).
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub enum ExportListener {}
+
+/// A node's bound serve sockets, one per plane, and its export listener — what the membership loop serves on.
 #[derive(Debug)]
 pub struct ServeSockets {
   /// The probe plane's socket.
   pub probe: UdpSocket,
   /// The record plane's socket.
   pub record: UdpSocket,
+  /// The network export's listener, when the plan has one.
+  pub export: Option<ExportListener>,
 }
 
 /// A serve socket the daemon could not take up: the plane, the address its plan names, and why — the
@@ -322,7 +338,8 @@ pub enum ServeFault {
     /// Where the inherited socket is bound.
     bound: SocketAddrV4,
   },
-  /// The supervisor's descriptor list ([`slates_anchor::ENV_FLEET_SERVE`]) is not two descriptor numbers.
+  /// The supervisor's descriptor list ([`slates_anchor::ENV_FLEET_SERVE`]) is not two descriptor numbers, and
+  /// a third exactly when the plan has an export listener.
   Malformed,
 }
 
@@ -341,7 +358,7 @@ impl std::fmt::Display for ServeBindError {
       ),
       ServeFault::Malformed => write!(
         formatter,
-        "the inherited serve sockets ({}) are not two descriptor numbers",
+        "the inherited serve sockets ({}) are not two descriptor numbers, and a third exactly when the plan exports",
         slates_anchor::ENV_FLEET_SERVE
       ),
     }
@@ -369,8 +386,34 @@ impl ServeAddresses {
     Ok(ServeSockets {
       probe: bind("probe", self.probe)?,
       record: bind("record", self.record)?,
+      export: self.export.map(bind_export).transpose()?,
     })
   }
+}
+
+/// Binds the network export's listener at `address`.
+#[cfg(unix)]
+fn bind_export(address: SocketAddrV4) -> Result<ExportListener, ServeBindError> {
+  // The loopback listener's backlog: the same kind of client (a kernel NFS client, one connection per server
+  // it mounts, reconnected when lost), so the same bound on connections queued before the accept loop runs.
+  slates_rt::tcp::TcpListener::bind(address, crate::daemon::NFS_BACKLOG).map_err(|refusal| {
+    ServeBindError {
+      plane: "export",
+      address,
+      fault: ServeFault::Refused(refusal),
+    }
+  })
+}
+
+/// A plan never names an export off Unix (the deployment plan sets it only where NFS runs); one that did is
+/// refused rather than silently served nowhere.
+#[cfg(not(unix))]
+fn bind_export(address: SocketAddrV4) -> Result<ExportListener, ServeBindError> {
+  Err(ServeBindError {
+    plane: "export",
+    address,
+    fault: ServeFault::Malformed,
+  })
 }
 
 /// The serve sockets a supervisor handed over in [`slates_anchor::ENV_FLEET_SERVE`], adopted and checked
@@ -390,16 +433,31 @@ fn inherited_serve_sockets(
   let mut numbers = value
     .split(',')
     .map(|number| number.trim().parse::<std::os::fd::RawFd>());
-  let (Some(Ok(probe)), Some(Ok(record)), None) = (numbers.next(), numbers.next(), numbers.next())
-  else {
+  let (Some(Ok(probe)), Some(Ok(record))) = (numbers.next(), numbers.next()) else {
     return Err(malformed);
   };
-  if probe < 0 || record < 0 || probe == record {
+  let export = match numbers.next() {
+    None => None,
+    Some(Ok(export)) => Some(export),
+    Some(Err(_)) => return Err(malformed),
+  };
+  let distinct = export.is_none_or(|export| export >= 0 && export != probe && export != record);
+  if numbers.next().is_some()
+    || probe < 0
+    || record < 0
+    || probe == record
+    || !distinct
+    || export.is_some() != planned.export.is_some()
+  {
     return Err(malformed);
   }
   Ok(Some(ServeSockets {
     probe: adopt_inherited("probe", probe, planned.probe)?,
     record: adopt_inherited("record", record, planned.record)?,
+    export: match (export, planned.export) {
+      (Some(raw), Some(address)) => Some(adopt_export(raw, address)?),
+      _ => None,
+    },
   }))
 }
 
@@ -419,18 +477,12 @@ fn adopt_inherited(
   raw: std::os::fd::RawFd,
   planned: SocketAddrV4,
 ) -> Result<UdpSocket, ServeBindError> {
-  use std::os::fd::FromRawFd;
   let refused = |refusal| ServeBindError {
     plane,
     address: planned,
     fault: ServeFault::Refused(refusal),
   };
-  // SAFETY: the supervisor bound this socket and handed its descriptor across the spawn at this number
-  // (`ENV_FLEET_SERVE`, non-negative and distinct from the other plane's, checked above); this process
-  // adopts it once, at start, before anything else could claim the number, so the `OwnedFd` is its
-  // single owner and closes it on drop. The supervisor keeps its own copy of the socket.
-  let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-  let socket = UdpSocket::adopt(owned).map_err(refused)?;
+  let socket = UdpSocket::adopt(inherited_descriptor(raw)).map_err(refused)?;
   let bound = socket.local_addr().map_err(refused)?;
   if bound != planned {
     return Err(ServeBindError {
@@ -440,6 +492,41 @@ fn adopt_inherited(
     });
   }
   Ok(socket)
+}
+
+/// Takes ownership of a descriptor the supervisor handed over at `raw`.
+#[cfg(unix)]
+fn inherited_descriptor(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {
+  use std::os::fd::FromRawFd;
+  // SAFETY: the supervisor bound this socket and handed its descriptor across the spawn at this number
+  // (`ENV_FLEET_SERVE`; every number non-negative and distinct from the others, checked by the caller); this
+  // process adopts it once, at start, before anything else could claim the number, so the `OwnedFd` is its
+  // single owner and closes it on drop. The supervisor keeps its own copy of the socket.
+  unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) }
+}
+
+/// Adopts the inherited descriptor `raw` as the network export's listener and checks it listens at `planned`.
+#[cfg(unix)]
+fn adopt_export(
+  raw: std::os::fd::RawFd,
+  planned: SocketAddrV4,
+) -> Result<ExportListener, ServeBindError> {
+  let refused = |refusal| ServeBindError {
+    plane: "export",
+    address: planned,
+    fault: ServeFault::Refused(refusal),
+  };
+  let listener =
+    slates_rt::tcp::TcpListener::from_fd(inherited_descriptor(raw)).map_err(refused)?;
+  let bound = listener.local_addr().map_err(refused)?;
+  if bound != planned {
+    return Err(ServeBindError {
+      plane: "export",
+      address: planned,
+      fault: ServeFault::BoundElsewhere { bound },
+    });
+  }
+  Ok(listener)
 }
 
 impl FleetTransport<ServeAddresses> {
@@ -1158,6 +1245,36 @@ fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
 }
 
+/// Serves the network export's listener on this shard (§4.6 "Kubernetes publication without privilege",
+/// AUD-29-75), each connection's session built from the kept `identity`. A listener whose port cannot be read,
+/// or whose task the arena refused, is counted, never silent.
+#[cfg(unix)]
+fn serve_export(export: Option<ExportListener>, identity: Kept<Identity>) {
+  let Some(listener) = export else {
+    return;
+  };
+  let Ok(port) = listener.local_addr().map(|address| address.port()) else {
+    count_refusal(BIND_REFUSED);
+    return;
+  };
+  match slates_rt::futures::spawn(crate::nfs_tls::serve_network(listener, port, identity)) {
+    Ok(task) => {
+      let _ = slates_rt::futures::detach(task);
+    }
+    Err(_) => {
+      count_refusal(BIND_REFUSED);
+    }
+  }
+}
+
+/// No export off Unix: the field is uninhabited there.
+#[cfg(not(unix))]
+fn serve_export(export: Option<ExportListener>, _identity: Kept<Identity>) {
+  if let Some(never) = export {
+    match never {}
+  }
+}
+
 /// Runs the fleet membership loop for `transport` on the control shard (§4.8, boot step 6). It serves on
 /// this node's two bound sockets (one per plane, every peer on each through a demultiplexer) and spawns their
 /// receive and accept loops; for each peer it dials the peer's advertised addresses and spawns the probe and
@@ -1169,10 +1286,12 @@ pub async fn run_membership(transport: FleetTransport) {
     enrollment_roots,
     identity,
     name,
-    serve: ServeSockets {
-      probe: probe_socket,
-      record: record_socket,
-    },
+    serve:
+      ServeSockets {
+        probe: probe_socket,
+        record: record_socket,
+        export,
+      },
     peers,
     resolver,
   } = transport;
@@ -1209,6 +1328,7 @@ pub async fn run_membership(transport: FleetTransport) {
     count_refusal(BIND_REFUSED);
     return;
   };
+  serve_export(export, identity);
   let neighbourhood =
     state::with_state(|state| state.config.fleet_peer_capacity.saturating_add(1)).unwrap_or(1);
   let local = state::with_state(|s| s.fleet.host()).unwrap_or(HostId(0));

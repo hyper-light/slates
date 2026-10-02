@@ -32,7 +32,8 @@ pub const ENV_ANCHOR_PID: &str = "SLATES_ANCHOR_PID";
 pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 
 /// Format: the environment variable carrying a fleet node's two serve sockets (§4.8 "Deployment") as
-/// `PROBE_FD,RECORD_FD`, inherited across the spawn. A supervisor that holds its daemon's fleet ports binds
+/// `PROBE_FD,RECORD_FD`, and its network export's listener as a third number when the plan has one
+/// (`PROBE_FD,RECORD_FD,EXPORT_FD`; §4.6 AUD-29-75), inherited across the spawn. A supervisor that holds its daemon's fleet ports binds
 /// them once and passes them to every daemon it spawns, so no port is released between a daemon's stop
 /// and its restart — or between a test harness learning a port and the daemon serving on it
 /// (`docs/bugs/2026-09-28-a-released-test-port-was-taken-before-the-daemon-bound-it.md`). The daemon
@@ -127,11 +128,12 @@ pub struct Supervisor {
   /// WinFsp), and the descriptor type is Unix's.
   #[cfg(unix)]
   nfs_listener: Option<OwnedFd>,
-  /// A fleet node's two serve sockets (probe, record), if this daemon is one (§4.8): bound once by the
-  /// anchor and handed to each daemon it spawns (via [`ENV_FLEET_SERVE`]), so the manifest's ports are
-  /// never free between a daemon's stop and its restart. Inheritable, as the NFS listener is.
+  /// A fleet node's two serve sockets (probe, record) and its network export's listener when the plan has
+  /// one, if this daemon is a fleet node (§4.8): bound once by the anchor and handed to each daemon it spawns
+  /// (via [`ENV_FLEET_SERVE`]), so the manifest's ports are never free between a daemon's stop and its
+  /// restart. Inheritable, as the NFS listener is.
   #[cfg(unix)]
-  fleet_serve: Option<(OwnedFd, OwnedFd)>,
+  fleet_serve: Option<(OwnedFd, OwnedFd, Option<OwnedFd>)>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -177,12 +179,13 @@ impl Supervisor {
     self.nfs_listener = Some(fd);
   }
 
-  /// Holds a fleet node's two serve sockets — `probe` and `record`, bound where the node's plan says — and
-  /// hands them to every daemon this supervisor spawns (§4.8). Both must be inheritable (the caller clears
-  /// close-on-exec); the supervisor owns them for its life, past any one daemon.
+  /// Holds a fleet node's two serve sockets — `probe` and `record`, bound where the node's plan says — and its
+  /// network export's listener when the plan has one, and hands them to every daemon this supervisor spawns
+  /// (§4.8; §4.6 AUD-29-75). Each must be inheritable (the caller clears close-on-exec); the supervisor owns
+  /// them for its life, past any one daemon.
   #[cfg(unix)]
-  pub fn hold_fleet_serve(&mut self, probe: OwnedFd, record: OwnedFd) {
-    self.fleet_serve = Some((probe, record));
+  pub fn hold_fleet_serve(&mut self, probe: OwnedFd, record: OwnedFd, export: Option<OwnedFd>) {
+    self.fleet_serve = Some((probe, record, export));
   }
 
   /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
@@ -215,11 +218,12 @@ impl Supervisor {
     }
     // And the held fleet serve sockets, the same way: the daemon adopts them rather than binding (§4.8).
     #[cfg(unix)]
-    if let Some((probe, record)) = &self.fleet_serve {
-      env.push((
-        ENV_FLEET_SERVE.to_owned(),
-        format!("{},{}", probe.as_raw_fd(), record.as_raw_fd()),
-      ));
+    if let Some((probe, record, export)) = &self.fleet_serve {
+      let mut numbers = format!("{},{}", probe.as_raw_fd(), record.as_raw_fd());
+      if let Some(export) = export {
+        numbers.push_str(&format!(",{}", export.as_raw_fd()));
+      }
+      env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
     let child = Command::new(&self.program)
       .args(&self.args)

@@ -105,7 +105,7 @@ use crate::verbs::{owner_of, owner_of_name};
 /// Shape: bytes read from a connection per `read` when more of an RPC record is needed (see the
 /// blocking server in bridge-nfs for the reasoning): one large transfer fits, the assembler stitches
 /// any split, so this bounds syscalls per record, not correctness.
-const RECORD_CHUNK: usize = 1 << 16;
+pub(crate) const RECORD_CHUNK: usize = 1 << 16;
 /// Format: the largest mount path the router reads before deciding a route (RFC 1813 `MNTPATHLEN`).
 const MNT_PATH_MAX: usize = 1024;
 /// Format: the radix of the hexadecimal digits a mount capability is written in (`<attachment_hex>` and
@@ -1058,7 +1058,7 @@ pub async fn serve(listener: TcpListener, port: u16) {
 /// The status refusal count under which the mount listener records a connection whose serve task the
 /// shard's arena refused.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
-const SERVE_SPAWN_REFUSED: &str = "nfs.serve_spawn";
+pub(crate) const SERVE_SPAWN_REFUSED: &str = "nfs.serve_spawn";
 
 /// One call of the NFS program's `version`, MOUNT or portmap (every program but NFSv4, which
 /// [`reply_v4`] serves): its RPC reply payload. A `program` of 0 is a garbage call whose reply carries
@@ -1336,6 +1336,12 @@ impl Call {
       },
     }
   }
+}
+
+/// The RPC reply payload for one deframed call message: the entry the network export's TLS session serves
+/// its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
+pub(crate) async fn reply_to_message(this: u16, message: &[u8], port: u16) -> Vec<u8> {
+  reply_to(this, Call::parse(message), port).await
 }
 
 /// The RPC reply payload for one call. An NFSv4 call goes to the v4 front end, which presents a

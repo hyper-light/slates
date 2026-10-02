@@ -294,7 +294,7 @@ fn doorbell_flag(control: u16) -> &'static AtomicBool {
 /// small, bounded number of connections; the OS clamps the backlog to the system maximum anyway. Unix
 /// only, with the NFS transport.
 #[cfg(unix)]
-const NFS_BACKLOG: i32 = 16;
+pub(crate) const NFS_BACKLOG: i32 = 16;
 
 /// The NFS loopback listener to serve: the one a supervising anchor holds and hands over in the
 /// environment ([`slates_anchor::ENV_NFS_LISTENER`]), so its port survives a daemon restart (§4.6) —

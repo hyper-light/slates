@@ -39,6 +39,8 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 # Self-signed fleet identities for the multi-process deployment test (as the server's fleet tests mint them).
 rcgen = { workspace = true }
+# The RPC-with-TLS client a node's NFS client stands in for in the anchored export test (§4.6, AUD-29-75).
+rustls = { workspace = true }
 
 [lints]
 workspace = true

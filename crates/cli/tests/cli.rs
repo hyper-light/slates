@@ -1488,6 +1488,217 @@ fn start_anchored_fleet_node(dir: &str, instance: &str) -> (AnchorProcess, [u16;
   )
 }
 
+/// One RPC-with-TLS round on the export at `port`, as a node's NFS client makes it (RFC 9289): the `AUTH_TLS`
+/// probe, a mutual TLS 1.3 handshake with `client` (issued by the fleet's authority, trusted as `authority`)
+/// offering ALPN `sunrpc`, then NFSv3 `NULL` inside the session. Returns the probe's reply and the call's.
+#[allow(clippy::disallowed_types)] // rustls's client takes `Arc` by signature (D-8 exception 3, a test harness).
+fn export_round(
+  port: u16,
+  authority: &rustls::pki_types::CertificateDer<'static>,
+  client: (
+    rustls::pki_types::CertificateDer<'static>,
+    rustls::pki_types::PrivateKeyDer<'static>,
+  ),
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+  use slates_bridge_nfs::rpc::{read_record, write_record};
+  use slates_bridge_nfs::rpc_tls::{ALPN_SUNRPC, AUTH_TLS};
+  use std::io::{Read, Write};
+  let call = |xid: u32, version: u32, flavor: u32| {
+    let mut message = Vec::new();
+    for word in [xid, 0, 2, 100_003, version, 0, flavor, 0, 0, 0] {
+      message.extend_from_slice(&word.to_be_bytes());
+    }
+    write_record(&message)
+  };
+  let read_one = |stream: &mut dyn Read| -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+      if let Ok((message, _)) = read_record(&bytes) {
+        return Some(message);
+      }
+      match stream.read(&mut chunk) {
+        // A signal in this process interrupts a blocking read; the read is retried, as `read_exact` does.
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+        Ok(0) | Err(_) => return None,
+        Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+      }
+    }
+  };
+  let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  socket.set_read_timeout(Some(START_WAIT)).unwrap();
+  socket.write_all(&call(1, 4, AUTH_TLS)).unwrap();
+  let probe = read_one(&mut socket);
+  let mut roots = rustls::RootCertStore::empty();
+  roots.add(authority.clone()).unwrap();
+  let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+    rustls::crypto::ring::default_provider(),
+  ))
+  .with_protocol_versions(&[&rustls::version::TLS13])
+  .unwrap()
+  .with_root_certificates(roots)
+  .with_client_auth_cert(vec![client.0], client.1)
+  .unwrap();
+  config.alpn_protocols = vec![ALPN_SUNRPC.to_vec()];
+  let mut connection = rustls::ClientConnection::new(
+    std::sync::Arc::new(config),
+    rustls::pki_types::ServerName::try_from(FLEET_NAME).unwrap(),
+  )
+  .unwrap();
+  let mut tls = rustls::Stream::new(&mut connection, &mut socket);
+  let reply = tls
+    .write_all(&call(2, 3, 0))
+    .ok()
+    .and_then(|()| read_one(&mut tls));
+  (probe, reply)
+}
+
+/// §4.6 "Kubernetes publication without privilege" (AUD-29-75) and §4.8's anchor-held ports. Do: start
+/// `slates anchor --fleet` for node a of a manifest with an operator authority (every node enrolled under it, in
+/// its own failure domain), handing the anchor the node's probe and record sockets and its export's TCP listener
+/// on the base port; make an RPC-with-TLS round on the export as a node's NFS client would; `kill -9` the daemon;
+/// make the round again. Expect: both rounds answer `STARTTLS` and then the call `SUCCESS` — the export is the
+/// anchor's, handed to the restarted daemon, so its port never closes and its clients reconnect to the same place.
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own scratch files: the manifest and its DER files
+fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart() {
+  use std::os::fd::AsRawFd;
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the anchored export flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let scratch = scratch_dir();
+  let dir = scratch.path.clone();
+  let authority_key = rcgen::KeyPair::generate().unwrap();
+  let mut authority_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+  authority_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+  let authority = authority_params.self_signed(&authority_key).unwrap();
+  std::fs::write(format!("{dir}/authority.crt.der"), authority.der().as_ref()).unwrap();
+  let issue = |names: Vec<String>| {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(names)
+      .unwrap()
+      .signed_by(&key, &authority, &authority_key)
+      .unwrap();
+    (cert, key)
+  };
+  for (domain, node) in FLEET_NODES.iter().enumerate() {
+    let (cert, key) = issue(vec![
+      FLEET_NAME.to_owned(),
+      format!("r0.d{domain}.{FLEET_NAME}"),
+    ]);
+    std::fs::write(format!("{dir}/{node}.crt.der"), cert.der().as_ref()).unwrap();
+    std::fs::write(format!("{dir}/{node}.key.der"), key.serialize_der()).unwrap();
+  }
+  let blocks = port_blocks();
+  let nodes: Vec<serde_json::Value> = FLEET_NODES
+    .iter()
+    .zip(&blocks)
+    .enumerate()
+    .map(|(domain, (node, held))| {
+      serde_json::json!({
+        "node": node,
+        "address": format!("127.0.0.1:{}", held.base),
+        "certificate": format!("{node}.crt.der"),
+        "key": format!("{node}.key.der"),
+        "domain": domain,
+      })
+    })
+    .collect();
+  let manifest = format!("{dir}/fleet.json");
+  std::fs::write(
+    &manifest,
+    serde_json::json!({
+      "name": FLEET_NAME,
+      "f": FLEET_F,
+      "nodes": nodes,
+      "enrollment_roots": ["authority.crt.der"],
+    })
+    .to_string(),
+  )
+  .unwrap();
+  let [probe, record] = blocks[0].sockets.as_slice() else {
+    panic!("a node's block is its probe and record ports");
+  };
+  let export_port = blocks[0].base;
+  let export = std::net::TcpListener::bind(("127.0.0.1", export_port)).unwrap();
+  let export_fd: std::os::fd::OwnedFd = export.try_clone().unwrap().into();
+  rustix::io::fcntl_setfd(&export_fd, rustix::io::FdFlags::empty()).unwrap();
+  let (probe, record) = (inheritable(probe), inheritable(record));
+  let instance = format!("cli-fleet-export-{}", std::process::id());
+  let child = slates()
+    .args([
+      "--instance",
+      &instance,
+      "anchor",
+      "--quick",
+      "--shards",
+      SHARDS,
+      "--fleet",
+      &manifest,
+      "--node",
+      FLEET_NODES[0],
+    ])
+    .env(
+      slates_anchor::ENV_FLEET_SERVE,
+      format!(
+        "{},{},{}",
+        probe.as_raw_fd(),
+        record.as_raw_fd(),
+        export_fd.as_raw_fd()
+      ),
+    )
+    .stdout(Stdio::null())
+    .stderr(Stdio::inherit())
+    .spawn()
+    .unwrap();
+  let _anchor = AnchorProcess { child, drain: None };
+  drop((probe, record, export_fd, export));
+  let authority_der = authority.der().clone();
+  let client = || {
+    let (cert, key) = issue(vec!["node-k8s-1".to_owned()]);
+    (
+      cert.der().clone(),
+      rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    )
+  };
+  let starttls = slates_bridge_nfs::rpc_tls::starttls_reply(1);
+  let success =
+    slates_bridge_nfs::rpc::reply_bytes(2, slates_bridge_nfs::rpc::AcceptStatus::Success, &[]);
+  let first = await_daemon(&instance, None, &[]);
+  let (probe_reply, reply) = export_round(export_port, &authority_der, client());
+  assert_eq!(
+    probe_reply.as_ref(),
+    Some(&starttls),
+    "the first daemon answers the probe"
+  );
+  assert_eq!(
+    reply.as_ref(),
+    Some(&success),
+    "the first daemon serves the call in the session"
+  );
+  let killed = Command::new("kill")
+    .args(["-9", &first.to_string()])
+    .status()
+    .unwrap();
+  assert!(killed.success(), "the daemon was killed");
+  let second = await_daemon(&instance, Some(first), &[]);
+  assert_ne!(second, first, "a new daemon serves");
+  let (probe_reply, reply) = export_round(export_port, &authority_der, client());
+  assert_eq!(
+    probe_reply.as_ref(),
+    Some(&starttls),
+    "the restarted daemon answers on the same port"
+  );
+  assert_eq!(
+    reply.as_ref(),
+    Some(&success),
+    "the restarted daemon serves the call in the session"
+  );
+}
+
 /// Waits (bounded by the start wait) for a daemon other than `replaced` to answer at `instance`, and
 /// returns its pid; on every look before it answers, each of `held` must still be taken.
 fn await_daemon(instance: &str, replaced: Option<u32>, held: &[u16]) -> u32 {
