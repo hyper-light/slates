@@ -2039,8 +2039,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > it got past kubelet: the node's `tlshd` completed the mutual handshake with the export (server chain and IP SAN
 > verified) and stopped at installing kTLS, which Docker Desktop's kernel lacks. That run found that `tlshd`
 > offers no ALPN, so the export now serves a client offering none
-> (`docs/bugs/2026-10-01-the-export-refused-the-linux-clients-handshake.md`). Owed: the leg's first green run
-> on the GitHub runner, whose kernel loads `tls`.
+> (`docs/bugs/2026-10-01-the-export-refused-the-linux-clients-handshake.md`). On the GitHub runner, whose
+> kernel loads `tls`, the leg is green (2026-10-02, run 36965111945). Kubelet mounted the volume over
+> RPC-with-TLS, and a second mount read the bytes the first wrote. AUD-29-75 is closed.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:
