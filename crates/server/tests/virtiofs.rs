@@ -1946,14 +1946,16 @@ fn manifest_entry(line: &str) -> Option<slates_conformance::workload::Entry> {
   })
 }
 
-/// The console parser reads a marker a terminal control sequence precedes. Do: parse a console whose first
-/// `=== RUN` line starts with the reset and clear-screen sequences the x86 serial console prints (`ESC c`,
-/// `ESC [ ? 7 l`, `ESC [ 2 J`; CI 2026-10-02, where git's RAM run went missing). Expect: that run is read, with its
-/// manifest, as a clean line would be.
+/// The console parser reads a marker the firmware's own output shares a line with. Do: parse a console whose
+/// first `=== RUN` line is exactly what the x86 serial console delivered on CI (2026-10-02, where git's RAM run went
+/// missing): the firmware's `Booting from ROM..`, its reset and clear-screen sequences (`ESC c`, `ESC [ ? 7 l`,
+/// `ESC [ 2 J`, `ESC [ 0 m`), a bare carriage return, then the marker; and a marker line ending in `\r` as serial lines
+/// do. Expect: the run is read, with its manifest, as a clean line would be — a carriage return followed by text
+/// returns to column 0, as on the terminal, and a trailing one ends the line.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_console_marker_behind_terminal_controls_is_still_read() {
-  let console = "\u{1b}c\u{1b}[?7l\u{1b}[2J=== RUN git ram 0 /tmp/w/git\nout\n=== MANIFEST\nd\t755\t0\t-\t.git\n=== END\n";
+  let console = "Booting from ROM..\u{1b}c\u{1b}[?7l\u{1b}[2J\u{1b}[0m.\r=== RUN git ram 0 /tmp/w/git\r\nout\r\n=== MANIFEST\r\nd\t755\t0\t-\t.git\r\n=== END\r\n";
   let parsed = guest_runs(console);
   let run = parsed
     .runs
@@ -1964,9 +1966,11 @@ fn a_console_marker_behind_terminal_controls_is_still_read() {
   assert_eq!(run.manifest.entries.len(), 1);
 }
 
-/// `line` without the terminal control sequences a serial console interleaves (CSI `ESC [ … final`, a
-/// two-byte `ESC x`, and other C0 controls but the tab the manifest separates fields with), so a marker is read
-/// wherever the console's own output landed beside it.
+/// `line` as a terminal would leave it: without the control sequences a serial console interleaves (CSI
+/// `ESC [ … final`, a two-byte `ESC x`, and other C0 controls but the tab the manifest separates fields with), and
+/// with a carriage return followed by more text returning to column 0, so what came before it is overwritten. The
+/// firmware's `Booting from ROM..` shared the first marker's line behind a bare `\r` on CI's x86 console
+/// (2026-10-02); a trailing `\r`, as serial lines end, leaves the line as it is.
 #[cfg(target_os = "linux")]
 fn without_terminal_controls(line: &str) -> String {
   /// Format: the escape character that opens a terminal control sequence (ECMA-48).
@@ -1983,6 +1987,10 @@ fn without_terminal_controls(line: &str) -> String {
             break;
           }
         }
+      }
+    } else if c == '\r' {
+      if chars.clone().next().is_some() {
+        out.clear();
       }
     } else if c == '\t' || !c.is_control() {
       out.push(c);
