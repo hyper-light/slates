@@ -1946,11 +1946,57 @@ fn manifest_entry(line: &str) -> Option<slates_conformance::workload::Entry> {
   })
 }
 
+/// The console parser reads a marker a terminal control sequence precedes. Do: parse a console whose first
+/// `=== RUN` line starts with the reset and clear-screen sequences the x86 serial console prints (`ESC c`,
+/// `ESC [ ? 7 l`, `ESC [ 2 J`; CI 2026-10-02, where git's RAM run went missing). Expect: that run is read, with its
+/// manifest, as a clean line would be.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_console_marker_behind_terminal_controls_is_still_read() {
+  let console = "\u{1b}c\u{1b}[?7l\u{1b}[2J=== RUN git ram 0 /tmp/w/git\nout\n=== MANIFEST\nd\t755\t0\t-\t.git\n=== END\n";
+  let parsed = guest_runs(console);
+  let run = parsed
+    .runs
+    .get(&("git".to_owned(), "ram".to_owned()))
+    .expect("the run behind the controls is read");
+  assert_eq!(run.exit_code, 0);
+  assert_eq!(run.directory, "/tmp/w/git");
+  assert_eq!(run.manifest.entries.len(), 1);
+}
+
+/// `line` without the terminal control sequences a serial console interleaves (CSI `ESC [ … final`, a
+/// two-byte `ESC x`, and other C0 controls but the tab the manifest separates fields with), so a marker is read
+/// wherever the console's own output landed beside it.
+#[cfg(target_os = "linux")]
+fn without_terminal_controls(line: &str) -> String {
+  /// Format: the escape character that opens a terminal control sequence (ECMA-48).
+  const ESCAPE: char = '\u{1b}';
+  /// Format: the byte after `ESC` that opens a control sequence (CSI) running to a final byte in `@..=~`.
+  const CSI: char = '[';
+  let mut out = String::with_capacity(line.len());
+  let mut chars = line.chars();
+  while let Some(c) = chars.next() {
+    if c == ESCAPE {
+      if chars.next() == Some(CSI) {
+        for next in chars.by_ref() {
+          if ('@'..='~').contains(&next) {
+            break;
+          }
+        }
+      }
+    } else if c == '\t' || !c.is_control() {
+      out.push(c);
+    }
+  }
+  out
+}
+
 /// Parses the guest's console into its runs.
 #[cfg(target_os = "linux")]
 fn guest_runs(console: &str) -> GuestRuns {
   let mut parsed = GuestRuns::default();
-  let mut lines = console.lines().map(|line| line.trim_end_matches('\r'));
+  let cleaned: Vec<String> = console.lines().map(without_terminal_controls).collect();
+  let mut lines = cleaned.iter().map(String::as_str);
   while let Some(line) = lines.next() {
     if let Some(rest) = line.strip_prefix("=== SKIP ") {
       parsed.skipped.push(rest.to_owned());
