@@ -340,8 +340,10 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
 
             # (2) A live but silent daemon: the call ends Stalled. Its anchor is stopped first, or its
             # supervision would replace the silent daemon and the call would be recovered instead.
-            live = await _daemon_pids(binary, instance)
+            # The pids are read after the anchor stops, so a daemon it spawned in between cannot be missed
+            # and answer the call (CI 2026-10-02: "SlatesError not raised", once in nine runs).
             os.kill(anchor.pid, signal.SIGSTOP)
+            live = await _daemon_pids(binary, instance)
             for pid in live:
                 os.kill(pid, signal.SIGSTOP)
             with self.assertRaisesRegex(slates.SlatesError, "Stalled"):

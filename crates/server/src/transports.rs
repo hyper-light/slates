@@ -779,7 +779,8 @@ mod tests {
   }
 
   /// The vhost-user binding is built on Linux (AUD-29-68): its entry is supported there and reported unbuilt,
-  /// with no conformance, elsewhere.
+  /// with no conformance, elsewhere. Unix only, as its one caller is.
+  #[cfg(unix)]
   fn assert_the_inherited_binding_is_reported_where_it_is_built(entry: &AttachmentCapability) {
     if cfg!(target_os = "linux") {
       assert_eq!(entry.unsupported_reason, None);

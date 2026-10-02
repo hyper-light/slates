@@ -3,6 +3,8 @@
 //! `slates_server::nfs_tls::serve_connection` on a real runtime shard. The oracle is the RFC's own rules: each
 //! test names the rule it checks, does it, and expects what the RFC says.
 
+// The network export runs where NFS does: macOS and Linux (`slates_server::nfs_tls` is Unix only).
+#![cfg(unix)]
 // A test harness: an unwrap is a failed test. rustls's client takes `Arc` by signature (D-8 exception 3, a test
 // harness; the owners are this test's client config and rustls's connection).
 #![allow(

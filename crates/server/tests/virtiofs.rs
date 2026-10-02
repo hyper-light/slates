@@ -2065,4 +2065,37 @@ fn a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram()
     judged += 1;
   }
   assert!(judged > 0, "no workload ran in the guest: {console}");
+  // A roster workload the guest neither reported skipped nor ran on both sides is a failure, never a silent
+  // pass (CI 2026-10-02: git vanished from a passing run). The console lines naming each such workload are
+  // the evidence of where its run went.
+  let missing: Vec<&str> = guest_roster()
+    .iter()
+    .map(|workload| workload.name)
+    .filter(|name| {
+      !parsed
+        .skipped
+        .iter()
+        .any(|skipped| skipped.split(' ').next() == Some(*name))
+        && !(parsed
+          .runs
+          .contains_key(&((*name).to_owned(), "ram".to_owned()))
+          && parsed
+            .runs
+            .contains_key(&((*name).to_owned(), "mount".to_owned())))
+    })
+    .collect();
+  let evidence: Vec<&str> = console
+    .lines()
+    .filter(|line| missing.iter().any(|name| line.contains(name)))
+    .take(GUEST_EVIDENCE_LINES)
+    .collect();
+  assert!(
+    missing.is_empty(),
+    "workloads neither skipped nor run on both sides: {missing:?}; console lines naming them:\n{}",
+    evidence.join("\n")
+  );
 }
+
+/// Shape: the console lines kept as evidence for a workload that went missing in the guest.
+#[cfg(target_os = "linux")]
+const GUEST_EVIDENCE_LINES: usize = 60;

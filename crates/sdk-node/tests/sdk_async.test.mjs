@@ -311,8 +311,10 @@ test('every async call ends across restart, silence, reader loss and death', asy
 
     // (2) A live but silent daemon: the call ends Stalled at its reply deadline. Its anchor is stopped
     // first, or its supervision would replace the silent daemon and the call would be recovered instead.
-    const live = await daemonPids(daemon, instance);
+    // The pids are read after the anchor stops, so a daemon it spawned in between cannot be missed and
+    // answer the call (the Python twin failed so once in nine CI runs, 2026-10-02).
     process.kill(anchor.pid, 'SIGSTOP');
+    const live = await daemonPids(daemon, instance);
     for (const pid of live) process.kill(pid, 'SIGSTOP');
     await assert.rejects(client.list(), /Stalled/);
 
