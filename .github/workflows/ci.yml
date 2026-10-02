@@ -668,5 +668,15 @@ jobs:
           install_only: true
       - name: The chart's gates (helm lint; the golden render)
         run: cargo test -p xtask --test helm_chart
+      # AUD-29-75's kernel leg (§4.6 "Kubernetes publication without privilege"; Ada authorized its tooling on
+      # 2026-10-01): kubelet mounts a published volume as an `nfs` PersistentVolume over the daemon's RFC 9289
+      # RPC-with-TLS export. The node image adds Debian's ktls-utils (`tlshd`, the kernel's handshake agent);
+      # the runner's kernel needs its TLS record layer and NFS client loaded, which kind's nodes share. The
+      # leg runs on its own cluster, deleted at the end, and fails rather than skips on a kernel without TLS.
+      - name: The kernel's TLS record layer and NFS client (for the export leg)
+        run: sudo modprobe tls && sudo modprobe nfs && sudo modprobe nfsv4
+      - name: The export leg (kubelet's nfs PersistentVolume over RPC-with-TLS)
+        run: cargo xtask kind export --require-kernel-tls
       - name: The lane, end to end (the cluster is deleted at the end whatever happens)
+        if: success() || failure()
         run: cargo xtask kind all

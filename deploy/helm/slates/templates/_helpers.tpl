@@ -89,9 +89,16 @@ node computes the same member ids and socket map (`slates_server::deploy`).
 {{- range $index := until (int .Values.replicas) -}}
 {{- $pod := include "slates.podName" (dict "root" $root "index" $index) -}}
 {{- $node := dict "node" $pod "address" (include "slates.podAddress" (dict "root" $root "index" $index)) "certificate" (printf "%s.crt.der" $pod) "key" "../keys/node.key.der" -}}
+{{- if $root.Values.authority.certificate -}}
+{{- /* Enrolled under the authority: node N is its own failure domain N (`slates_server::deploy`). */ -}}
+{{- $_ := set $node "domain" $index -}}
+{{- end -}}
 {{- $nodes = append $nodes $node -}}
 {{- end -}}
 {{- $manifest := dict "name" .Values.fleet.name "f" (include "slates.f" . | int) "nodes" $nodes -}}
+{{- if .Values.authority.certificate -}}
+{{- $_ := set $manifest "enrollment_roots" (list "authority.crt.der") -}}
+{{- end -}}
 {{- if .Values.fleet.durability -}}
 {{- $_ := set $manifest "durability" .Values.fleet.durability -}}
 {{- end -}}

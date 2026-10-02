@@ -1,0 +1,31 @@
+{{- /*
+The network export's Service (§4.6 "Kubernetes publication without privilege", AUD-29-75): pod 0's NFSv4
+export over RFC 9289 RPC-with-TLS (TCP on its base port) at one fixed cluster IP, the address a
+PersistentVolume names. kube-proxy forwards the node's connection to the pod; the session is end to end
+between the node's kernel client (its `tlshd`) and the daemon, so nothing in between reads it.
+*/ -}}
+{{- if .Values.export.enabled }}
+{{- if not .Values.authority.certificate }}
+{{- fail "export.enabled needs authority.certificate: the export authenticates its clients against the authority" }}
+{{- end }}
+{{- if not .Values.export.clusterIP }}
+{{- fail "export.clusterIP is required: pod 0's certificate names it as the address its clients verify" }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "slates.fullname" . }}-export
+  labels:
+    {{- include "slates.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: {{ .Values.export.clusterIP }}
+  selector:
+    {{- include "slates.selectorLabels" . | nindent 4 }}
+    statefulset.kubernetes.io/pod-name: {{ include "slates.podName" (dict "root" . "index" 0) }}
+  ports:
+    - name: nfs-tls
+      protocol: TCP
+      port: {{ .Values.fleet.basePort }}
+      targetPort: {{ .Values.fleet.basePort }}
+{{- end }}

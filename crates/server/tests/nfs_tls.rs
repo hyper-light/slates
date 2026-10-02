@@ -316,23 +316,41 @@ fn a_client_without_a_certificate_from_the_authority_gets_no_session() {
   runtime.shutdown().unwrap();
 }
 
-/// RFC 9289 §5: a client "MUST include" ALPN `sunrpc`. Do: complete the handshake without offering ALPN, then
-/// call. Expect: no reply; the server ends the session once the handshake shows no `sunrpc`.
+/// RFC 9289 §5 and the deployed Linux client. A client "MUST include" ALPN `sunrpc`, and a server answers with
+/// only it, but the RFC gives the server no duty to refuse a client that offers none, and the Linux kernel's
+/// handshake agent offers none (ktls-utils 1.0.0's `tlshd` sets ALPN only on its QUIC path; read 2026-10-01).
+/// Do: offer only another protocol (`h2`), then complete a handshake offering no ALPN at all, as `tlshd`
+/// does, and call. Expect: the `h2` client gets no session; the client offering none is served.
 #[test]
-fn a_session_without_sunrpc_serves_nothing() {
+fn a_client_offering_another_protocol_is_refused_and_one_offering_none_is_served() {
   let authority = Authority::new();
-  let (runtime, port) = serve(identity(&authority), 1);
+  let (runtime, port) = serve(identity(&authority), 2);
   let mut socket = connect(port);
   assert_eq!(probe(&mut socket, 8), starttls_reply(8));
-  let config = client_config(&authority, Some(authority.issue("node-a")), None);
+  let config = client_config(&authority, Some(authority.issue("node-a")), Some(b"h2"));
   let mut connection =
     ClientConnection::new(config, ServerName::try_from(SERVER_NAME).unwrap()).unwrap();
   let mut tls = rustls::Stream::new(&mut connection, &mut socket);
   let wrote = tls.write_all(&write_record(&call(11, NFS_PROGRAM, 3, 0, 0)));
   assert!(
     !(wrote.is_ok() && read_one_record(&mut tls).is_some()),
-    "a session without sunrpc served a call"
+    "a client offering only another protocol was served"
   );
+  let mut socket = connect(port);
+  assert_eq!(probe(&mut socket, 9), starttls_reply(9));
+  let config = client_config(&authority, Some(authority.issue("node-a")), None);
+  let mut connection =
+    ClientConnection::new(config, ServerName::try_from(SERVER_NAME).unwrap()).unwrap();
+  let mut tls = rustls::Stream::new(&mut connection, &mut socket);
+  tls
+    .write_all(&write_record(&call(12, NFS_PROGRAM, 3, 0, 0)))
+    .unwrap();
+  assert_eq!(
+    read_one_record(&mut tls),
+    Some(reply_bytes(12, AcceptStatus::Success, &[])),
+    "a client offering no ALPN, as Linux's tlshd, is served"
+  );
+  drop(socket);
   runtime.shutdown().unwrap();
 }
 

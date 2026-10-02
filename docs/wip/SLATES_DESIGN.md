@@ -2023,7 +2023,8 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > descriptor in `SLATES_ANCHOR_FLEET_SERVE`. A connection must open with RFC 9289's `AUTH_TLS` probe, answered
 > `STARTTLS`; a cleartext call is answered `AUTH_TOOWEAK` and `AUTH_TLS` elsewhere `AUTH_BADCRED`, then the
 > connection is closed, as is one with bytes sent behind the probe. Then a mutual TLS 1.3 handshake follows: ALPN
-> exactly `sunrpc`, a client certificate verified to the operator's authority, no tickets. Inside the session
+> `sunrpc` when the client offers ALPN (a client offering none is served, as the Linux kernel's `tlshd` offers
+> none), a client certificate verified to the operator's authority, no tickets. Inside the session
 > each call is served as the loopback listener serves it and authorized by its mount capability alone. The
 > session is built per connection inside the transport crate, the one module holding rustls's
 > signature-mandated `Arc`, with a single owner. Measured: 11.0 µs per build, 3.8% of the 280.6 µs mutual
@@ -2034,8 +2035,12 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > after `detach` and after the volume's destroy, as on loopback (`the_network_exports_teardown_is_its_attachments`).
 > `slates export ID` prints the path a PersistentVolume names, from the export's own attachment. Through the
 > real binary on an anchored node, an exported path is admitted over RPC-with-TLS and refused once detached.
-> Owed: the KIND workload pod over an `nfs` PersistentVolume with `tlshd` on the node (the kernel leg, on the
-> GitHub runner).
+> The kernel leg is `cargo xtask kind export` (the KIND job, Ada authorized its tooling 2026-10-01). Run locally,
+> it got past kubelet: the node's `tlshd` completed the mutual handshake with the export (server chain and IP SAN
+> verified) and stopped at installing kTLS, which Docker Desktop's kernel lacks. That run found that `tlshd`
+> offers no ALPN, so the export now serves a client offering none
+> (`docs/bugs/2026-10-01-the-export-refused-the-linux-clients-handshake.md`). Owed: the leg's first green run
+> on the GitHub runner, whose kernel loads `tls`.
 
 > **Status (A-9, 2026-09-05).** Linux codec, dispatch, base-file and mount/launcher source
 > exists, with tests recorded in §8e of GAPS. Complete mounted POSIX behavior is unverified:

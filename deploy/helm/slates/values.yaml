@@ -51,6 +51,23 @@ clusterDomain: cluster.local
 #     key: <base64 DER>
 certificates: {}
 
+# The operator's certificate authority (§4.13; §4.6 "Kubernetes publication without privilege", AUD-29-75),
+# base64 DER. When given, every node is enrolled under it: each node's certificate must chain to it and name
+# its failure domain (`r0.d<N>.<fleet.name>`), node N is failure domain N, and every node serves its network
+# export (NFSv4 over RFC 9289 RPC-with-TLS, TCP on its base port) to clients whose certificates the authority
+# issued. Without it the fleet pins every listed certificate and serves no export.
+authority:
+  certificate: ""
+
+# The network export's Service (§4.6, AUD-29-75): pod 0's export at one stable cluster address, for a
+# PersistentVolume to name as its `nfs` server — kubelet resolves names with the node's resolver, not the
+# cluster's DNS, so the volume names an address. Requires `authority`. Off by default.
+export:
+  enabled: false
+  # Shape: the Service's cluster IP, inside the cluster's service range, fixed so pod 0's certificate can name
+  # it as the address the client verifies (RFC 9289 §5.2.1).
+  clusterIP: ""
+
 resources:
   # Shape: the memory each node is given. Requests equal limits, so the pod is Guaranteed QoS and the
   # daemon's effective capacity (§4.2) clamps to exactly this cgroup bound — a RAM-only service must not

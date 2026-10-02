@@ -155,6 +155,56 @@ fn the_fault_tolerance_follows_the_replica_count() {
   assert!(rendered.contains("\"f\": 0"), "one replica is f = 0");
 }
 
+/// §4.6 "Kubernetes publication without privilege" (AUD-29-75). Do: render with an operator authority and the
+/// export enabled at a fixed cluster IP; then the export without an authority, and without its address. Expect:
+/// the manifest names the authority as its enrollment root and each node's failure domain, the authority's
+/// certificate is mounted beside it, and a Service routes TCP on pod 0's base port at that address to pod 0;
+/// an export without an authority, or without an address, is refused naming what is missing.
+#[test]
+fn an_authority_enrolls_the_nodes_and_the_export_service_reaches_pod_zero() {
+  if !helm_present() {
+    return;
+  }
+  let enrolled = [
+    "replicas=1",
+    "authority.certificate=YXV0aG9yaXR5",
+    "export.enabled=true",
+    "export.clusterIP=10.96.200.20",
+  ];
+  let (code, rendered, stderr) = render(&enrolled).expect("helm runs");
+  assert_eq!(code, 0, "{stderr}");
+  assert!(
+    rendered.contains("\"enrollment_roots\": [\n") && rendered.contains("\"authority.crt.der\""),
+    "the manifest names the authority as its enrollment root:\n{rendered}"
+  );
+  assert!(
+    rendered.contains("\"domain\": 0"),
+    "node 0 is failure domain 0"
+  );
+  assert!(
+    rendered.contains("authority.crt.der: YXV0aG9yaXR5"),
+    "the authority's certificate is mounted beside the manifest"
+  );
+  assert!(
+    rendered.contains("name: slates-export"),
+    "the export Service is rendered"
+  );
+  assert!(rendered.contains("clusterIP: 10.96.200.20"));
+  assert!(rendered.contains("statefulset.kubernetes.io/pod-name: slates-0"));
+  assert!(rendered.contains("protocol: TCP") && rendered.contains("port: 7000"));
+  let (code, _, stderr) =
+    render(&["export.enabled=true", "export.clusterIP=10.96.200.20"]).expect("helm runs");
+  assert_ne!(code, 0, "an export without an authority must not render");
+  assert!(
+    stderr.contains("export.enabled needs authority.certificate"),
+    "{stderr}"
+  );
+  let (code, _, stderr) =
+    render(&["authority.certificate=YXV0aG9yaXR5", "export.enabled=true"]).expect("helm runs");
+  assert_ne!(code, 0, "an export without its address must not render");
+  assert!(stderr.contains("export.clusterIP is required"), "{stderr}");
+}
+
 /// The deliberate writer of the golden (the doc-truth pattern): never part of a normal run.
 #[test]
 #[ignore = "regenerates deploy/helm/slates/ci/golden.yaml; run deliberately after reviewing a template change"]

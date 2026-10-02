@@ -24,6 +24,10 @@
 //!   more voter cut together (`f` of them, from ephemeral `NET_ADMIN` containers). The survivors must elect,
 //!   retire both, and commit every takeover's confirmations and every settlement; the step times each stage
 //!   and counts the commits the burst took (research record §3.5, §3.6; §4.8 "Neighbourhood changes").
+//! - `export [--require-kernel-tls]` — AUD-29-75's kernel leg on its own cluster (`kind_export.rs`): kubelet
+//!   mounts a published volume as an `nfs` PersistentVolume over the daemon's RPC-with-TLS export, through
+//!   the node's `tlshd`, and a second mount reads what the first wrote. Skips loudly on a kernel without TLS,
+//!   or fails there with `--require-kernel-tls` (CI).
 //! - `down` — deletes the cluster. `all` runs every step in order and deletes the cluster at the end,
 //!   also on failure, unless `--keep`.
 //!
@@ -39,6 +43,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::Failure;
+
+/// The export leg (AUD-29-75's kernel leg), a child module so it reuses the lane's machinery.
+#[path = "kind_export.rs"]
+mod export;
 
 /// Shape: the image tag the lane builds and loads when none is given.
 const DEFAULT_TAG: &str = "slates:lane";
@@ -167,6 +175,7 @@ pub(crate) enum Step {
   Netem,
   Succession,
   Burst,
+  Export,
   Down,
   All,
 }
@@ -188,6 +197,8 @@ pub(crate) struct Options {
   pub(crate) netem: Option<(String, String, String)>,
   /// `succession`: how many leader losses; `burst`: how many bursts.
   pub(crate) trials: u64,
+  /// `export`: fail, rather than skip loudly, on a kernel without its TLS record layer (CI).
+  pub(crate) require_kernel_tls: bool,
 }
 
 /// A netem profile for an install: every shaped pod's delay, jitter and loss, and per-pod delay overrides
@@ -248,11 +259,12 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
     Some("netem") => Step::Netem,
     Some("succession") => Step::Succession,
     Some("burst") => Step::Burst,
+    Some("export") => Step::Export,
     Some("down") => Step::Down,
     Some("all") => Step::All,
     other => {
       return Err(Failure(format!(
-        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, burst, down, all"
+        "kind: unknown step {other:?}; steps: image, smoke, certs, up, install, prove, scale, netem, succession, burst, export, down, all"
       )));
     }
   };
@@ -269,6 +281,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
       Step::Burst => BURST_TRIALS,
       _ => SUCCESSION_TRIALS,
     },
+    require_kernel_tls: false,
   };
   let mut rest = args[1..].iter();
   while let Some(arg) = rest.next() {
@@ -282,6 +295,7 @@ pub(crate) fn parse(args: &[String]) -> Result<Options, Failure> {
       "--tag" => options.tag = value("--tag")?,
       "--cluster" => options.cluster = value("--cluster")?,
       "--keep" => options.keep = true,
+      "--require-kernel-tls" => options.require_kernel_tls = true,
       "--replicas" => {
         options.replicas = value("--replicas")?
           .parse()
@@ -319,6 +333,7 @@ pub(crate) fn run(root: &Path, options: &Options) -> Result<(), Failure> {
       certs(options.replicas, &out)
     }
     Step::Down => down(&options.cluster),
+    Step::Export => export::run(root, options),
     _ => {
       let lane = Lane::new(root, options)?;
       lane.step(options.step)
@@ -1149,7 +1164,7 @@ impl Lane {
       Step::Succession => self.succession(self.trials),
       Step::Burst => self.burst(self.trials),
       Step::All => self.all(),
-      Step::Image | Step::Smoke | Step::Certs | Step::Down => Ok(()),
+      Step::Image | Step::Smoke | Step::Certs | Step::Export | Step::Down => Ok(()),
     }
   }
 

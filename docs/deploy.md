@@ -126,10 +126,51 @@ holders (the SIGKILL takeover of §4.8) and served from there; it comes back und
 by its peers on contact when the relevant quorums survive, and holds nothing until re-replication fills it. The KIND lane
 ([wip/kind-lane.md](wip/kind-lane.md)) records this flow on real pods with its numbers.
 
+## Publishing a volume to pods
+
+A pod reaches a slates volume as an ordinary `nfs` PersistentVolume that kubelet mounts. Nothing in slates
+holds a privilege, and no node plugin is installed. The export is NFSv4.2 over RPC-with-TLS (RFC 9289): a
+node presents a certificate the fleet's authority issued, and the volume is reached only through the
+capability its path carries.
+
+1. Install the chart with the operator's authority and the export Service:
+   `authority.certificate` (base64 DER) and `export.enabled: true` with `export.clusterIP` set to a free
+   address in the cluster's service range. Every node's certificate must chain to the authority and name
+   its failure domain `r0.d<N>.<fleet.name>`. Pod 0's certificate must also name the export's cluster IP,
+   which is what a node's client checks.
+2. On every node that will mount, run `tlshd` (Debian and Ubuntu: `ktls-utils`) with a client certificate
+   from the authority. Its `[authenticate.client]` section in `/etc/tlshd.conf` names the authority as the
+   truststore and the node's certificate and key. The kernel needs its TLS record layer (`modprobe tls`).
+   This is a once-per-node operator installation, like any NFS client's.
+3. Publish a volume and name it in a PersistentVolume:
+
+   ```
+   kubectl exec slates-0 -- /slates export <volume-id>
+   ```
+
+   ```yaml
+   apiVersion: v1
+   kind: PersistentVolume
+   metadata:
+     name: my-volume
+   spec:
+     capacity: {storage: 64Mi}
+     accessModes: [ReadWriteMany]
+     storageClassName: ""
+     mountOptions: [nfsvers=4.2, xprtsec=mtls, port=7000]
+     nfs:
+       server: <export.clusterIP>
+       path: <the path `slates export` printed>
+   ```
+
+`slates detach` of the export's attachment, or the volume's destroy, ends what the path reaches. The KIND
+lane's `cargo xtask kind export` runs this whole flow on a cluster.
+
 ## Not in the chart
 
-A PersistentVolume of any kind; a Service with ports or a load balancer in front of the fleet; an
-Ingress; a liveness probe; a privileged container (outside the lane's `netem`); a generated certificate.
+A PersistentVolume of any kind (an operator writes one per published volume, above); a Service with ports
+or a load balancer in front of the fleet (the export Service aside); an Ingress; a liveness probe; a
+privileged container (outside the lane's `netem`); a generated certificate.
 
 ## Discovery on local hosts, bare metal, VMs and Kubernetes
 

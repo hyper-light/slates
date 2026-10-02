@@ -19,3 +19,6 @@ binaryData:
   {{- include "slates.identity" (dict "root" $ "index" $index) }}
   {{ $pod }}.crt.der: {{ (index $.Values.certificates $pod).certificate }}
   {{- end }}
+  {{- if .Values.authority.certificate }}
+  authority.crt.der: {{ .Values.authority.certificate }}
+  {{- end }}

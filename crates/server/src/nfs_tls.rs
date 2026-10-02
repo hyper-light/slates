@@ -12,8 +12,11 @@
 //! - **TLS 1.3 only** ("MUST NOT negotiate TLS versions prior to 1.3").
 //! - **Mutual authentication**: the client must present a certificate whose path verifies to one of the
 //!   configured authorities (the fleet's CA, §4.13); a client without one fails the handshake.
-//! - **ALPN `sunrpc`**: the server answers with only that identifier, and a client that offered none is
-//!   refused after the handshake, so a session that is not RPC-with-TLS never carries a call.
+//! - **ALPN `sunrpc`**: the server answers with only that identifier, and a client that offers ALPN without it
+//!   gets no session. A client that offers no ALPN at all is served: RFC 9289 §5 obliges the *client* to offer
+//!   it but gives the server no duty to refuse one that does not, and the deployed Linux client offers none
+//!   (ktls-utils 1.0.0's `tlshd` sets ALPN only on its QUIC path; read 2026-10-01). Refusing it refused every
+//!   Linux kernel mount (docs/bugs/2026-10-01-the-export-refused-the-linux-clients-handshake.md).
 //! - **No resumption tickets**: a session is one connection's.
 //!
 //! No `Arc` lives here (R2, D-8): the connection itself (TLS 1.3, the client verifier over the operator's
@@ -69,7 +72,7 @@ pub enum TlsRefusal {
   Io(String),
   /// The peer broke TLS: a failed handshake, a bad record, an unverified certificate.
   Handshake(rustls::Error),
-  /// The handshake completed without the `sunrpc` protocol (RFC 9289 §5: the client "MUST include" it).
+  /// The handshake agreed on a protocol other than `sunrpc` (RFC 9289 §5).
   NotSunrpc,
   /// The peer sent more plaintext than one message before it was read.
   PlaintextOverrun,
@@ -149,16 +152,17 @@ impl TlsSession {
     Ok(())
   }
 
-  /// Refuses a completed handshake that did not agree on `sunrpc` (checked once, as it completes).
+  /// Refuses a completed handshake that agreed on a protocol other than `sunrpc` (checked once, as it
+  /// completes). No protocol at all — a client that offered none, as the Linux kernel's `tlshd` — is served.
   fn check_protocol(&mut self) -> Result<(), TlsRefusal> {
     if self.protocol_checked || self.connection.is_handshaking() {
       return Ok(());
     }
     self.protocol_checked = true;
-    if self.connection.alpn_protocol() == Some(ALPN_SUNRPC) {
-      Ok(())
-    } else {
-      Err(TlsRefusal::NotSunrpc)
+    match self.connection.alpn_protocol() {
+      None => Ok(()),
+      Some(protocol) if protocol == ALPN_SUNRPC => Ok(()),
+      Some(_) => Err(TlsRefusal::NotSunrpc),
     }
   }
 
