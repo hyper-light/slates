@@ -124,6 +124,45 @@ fn emit_recovery(
   Ok(())
 }
 
+/// `export` (§4.6 "Kubernetes publication without privilege", AUD-29-75): the export's own attachment and the
+/// path its capability authorizes, `/<name>@<attachment_hex>.<token_hex>`, printed for an operator to name as a
+/// PersistentVolume's `nfs` path. Nothing is mounted here: kubelet mounts it on the node, over RPC-with-TLS.
+fn export_verb(
+  client: &mut Client,
+  instance: &str,
+  volume: VolumeId,
+  (read_only, subtree): (bool, Option<&str>),
+  json: bool,
+) -> Result<(), Failure> {
+  let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
+  let intent = if read_only {
+    Intent::Read
+  } else {
+    Intent::Write
+  };
+  let attachment = match subtree {
+    Some(subtree) => client.attach_scoped_mount(volume, intent, subtree),
+    None => client.attach_mount(volume, intent),
+  }
+  .map_err(|e| failure_of(e, instance))?;
+  let Some(token) = attachment.token else {
+    return Err(Failure::Refused(
+      "the daemon issued no mount capability for this attachment; the volume cannot be exported"
+        .to_owned(),
+    ));
+  };
+  let path = crate::mount::export_path(&report.name, (attachment.attachment, token));
+  if json {
+    println!(
+      "{}",
+      serde_json::json!({ "attachment": attachment.attachment, "path": path })
+    );
+  } else {
+    println!("export: {path}");
+  }
+  Ok(())
+}
+
 /// `mount` over the loopback NFS bridge (macOS and the BSDs; §4.6): the mount's own attachment and capability,
 /// then `mount_nfs` with the capability in the export path — no privilege, no kernel extension, no Apple
 /// entitlement.
@@ -293,6 +332,20 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
   // loopback NFS bridge (§4.6) with that capability in the export path: no privilege, no kernel
   // extension, no Apple entitlement. Its failure is a `Failure` (a mount refusal, not a client error),
   // so it is handled here rather than in [`serve`].
+  if let Verb::Export {
+    volume,
+    read_only,
+    subtree,
+  } = &request.verb
+  {
+    return export_verb(
+      &mut client,
+      &request.instance,
+      *volume,
+      (*read_only, subtree.as_deref()),
+      request.json,
+    );
+  }
   if let Verb::Mount {
     volume,
     path,
@@ -1043,7 +1096,7 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     Verb::Status { volume, drift } => emit_status(client, *volume, *drift, json)?,
     // `mount`/`unmount` run `mount_nfs`/`umount` (CLI/OS operations whose failure is a `Failure`, not a
     // `ClientError`), so [`run`] handles them before this dispatch; they never reach here.
-    Verb::Mount { .. } | Verb::Unmount { .. } => {}
+    Verb::Mount { .. } | Verb::Unmount { .. } | Verb::Export { .. } => {}
     Verb::Snapshot { volume } => emit_snapshot(client, *volume, json)?,
     Verb::DestroySnapshot { volume, snapshot } => {
       client.destroy_snapshot(*volume, *snapshot)?;

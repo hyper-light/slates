@@ -250,6 +250,7 @@ slates advance ATTACHMENT [VERSION] [--json]
 slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
+slates export ID [--read-only] [--subtree DIR]
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
 slates grants [--json]
 slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
@@ -304,6 +305,11 @@ as `Authorization: Bearer TOKEN` with `Content-Type: application/json` and `Host
 request from a browser page on another origin, under another host name, or without the token is refused
 before it reaches a tool. Oversized lines, headers and bodies are refused, and a slow or idle connection
 never holds up another.
+
+`slates export ID` prints `export: /<name>@<attachment>.<token>`, the path a Kubernetes PersistentVolume
+names as its `nfs` path on a fleet node's network export (RPC-with-TLS on the node's base port, served when
+the fleet manifest names an operator authority). The export has its own attachment, ending with `slates detach`
+or the volume's destroy. `--read-only` takes no write lease, and `--subtree DIR` presents only that directory.
 
 The merge flow (§4.16): `green NAME` starts a green from scratch, or from a **complete immutable
 base** with `--base VOLUME --snapshot N` — a snapshot of a volume whose whole tree is in memory

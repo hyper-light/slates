@@ -216,6 +216,18 @@ pub(crate) enum Verb {
     /// runtime to bind (§4.6 A-9).
     shared: bool,
   },
+  /// Print a network export path for the volume (`export ID [--read-only] [--subtree DIR]`; §4.6 "Kubernetes
+  /// publication without privilege", AUD-29-75): the export's own attachment, and the path
+  /// `/<name>@<attachment>.<token>` its mount capability authorizes — what a PersistentVolume names as its `nfs`
+  /// path on a fleet node's RPC-with-TLS export. The attachment ends with `detach` or the volume's destroy.
+  Export {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// A read-only export: a read attachment (no write lease) and a read-only capability.
+    read_only: bool,
+    /// `--subtree DIR`: present only that directory of the volume (AUD-29-76).
+    subtree: Option<String>,
+  },
   /// Unmount a loopback bridge mount at a path (`unmount PATH`).
   Unmount {
     /// The mount point.
@@ -1245,6 +1257,23 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     ["mount", ..] => Err(ParseError::Missing(
       "mount ID PATH [--read-only] [--subtree DIR] [--shared]",
     )),
+    ["export", id] => {
+      taken.only(&Spec {
+        values: &["--subtree"],
+        switches: &["--read-only"],
+      })?;
+      Ok(client(
+        &taken,
+        Verb::Export {
+          volume: volume(id)?,
+          read_only: taken.switch("--read-only"),
+          subtree: taken.value("--subtree").map(str::to_owned),
+        },
+      ))
+    }
+    ["export", ..] => Err(ParseError::Missing(
+      "export ID [--read-only] [--subtree DIR]",
+    )),
     ["unmount", path] => {
       taken.only(&NONE)?;
       Ok(client(
@@ -1622,6 +1651,31 @@ mod tests {
       assert!(parse(&args(&format!("recover {scope} --fenced --accept-loss"))).is_err());
     }
     assert!(parse(&args("recover root --confirm wrong --fenced --accept-loss")).is_err());
+  }
+
+  /// §4.6 (AUD-29-75): `export` names one volume, optionally read-only and scoped to a subtree; anything else is
+  /// refused rather than guessed.
+  #[test]
+  fn export_names_a_volume_and_its_options() {
+    let id = "ab".repeat(16);
+    let Command::Client(request) =
+      parse(&args(&format!("export {id} --read-only --subtree /data"))).unwrap()
+    else {
+      panic!("export is a client request");
+    };
+    let Verb::Export {
+      read_only, subtree, ..
+    } = request.verb
+    else {
+      panic!("export parses to the export verb");
+    };
+    assert!(read_only);
+    assert_eq!(subtree.as_deref(), Some("/data"));
+    assert!(parse(&args("export")).is_err(), "a volume is required");
+    assert!(
+      parse(&args(&format!("export {id} --shared"))).is_err(),
+      "no FUSE flag on an export"
+    );
   }
 
   /// AC-8.1: bootstrap is an explicit local client verb; it is never a daemon startup flag.

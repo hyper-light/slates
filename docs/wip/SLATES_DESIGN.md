@@ -2032,6 +2032,8 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > wiring red), and an anchored node across `kill -9` of its daemon, on macOS and Linux (io_uring). Teardown is
 > the attachment's: on one open session a file reads while its attachment lives and is refused `NFS3ERR_ACCES`
 > after `detach` and after the volume's destroy, as on loopback (`the_network_exports_teardown_is_its_attachments`).
+> `slates export ID` prints the path a PersistentVolume names, from the export's own attachment. Through the
+> real binary on an anchored node, an exported path is admitted over RPC-with-TLS and refused once detached.
 > Owed: the KIND workload pod over an `nfs` PersistentVolume with `tlshd` on the node (the kernel leg, on the
 > GitHub runner).
 

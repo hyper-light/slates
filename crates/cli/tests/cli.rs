@@ -1488,47 +1488,52 @@ fn start_anchored_fleet_node(dir: &str, instance: &str) -> (AnchorProcess, [u16;
   )
 }
 
-/// One RPC-with-TLS round on the export at `port`, as a node's NFS client makes it (RFC 9289): the `AUTH_TLS`
-/// probe, a mutual TLS 1.3 handshake with `client` (issued by the fleet's authority, trusted as `authority`)
-/// offering ALPN `sunrpc`, then NFSv3 `NULL` inside the session. Returns the probe's reply and the call's.
+/// A client certificate and key, DER, as a node's `tlshd` holds them.
+type ClientIdentity = (
+  rustls::pki_types::CertificateDer<'static>,
+  rustls::pki_types::PrivateKeyDer<'static>,
+);
+
+/// Reads one record-marked message from `stream`; `None` when the peer closed first. A read a signal
+/// interrupts is retried, as `read_exact` does.
+fn read_one_record(stream: &mut dyn std::io::Read) -> Option<Vec<u8>> {
+  let mut bytes = Vec::new();
+  let mut chunk = [0u8; 4096];
+  loop {
+    if let Ok((message, _)) = slates_bridge_nfs::rpc::read_record(&bytes) {
+      return Some(message);
+    }
+    match stream.read(&mut chunk) {
+      Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+      Ok(0) | Err(_) => return None,
+      Ok(count) => bytes.extend_from_slice(&chunk[..count]),
+    }
+  }
+}
+
+/// An RPC-with-TLS session on the export at `port`, as a node's NFS client opens one (RFC 9289): the `AUTH_TLS`
+/// probe (its reply returned), then a mutual TLS 1.3 handshake with `client` (issued by the fleet's authority,
+/// trusted as `authority`) offering ALPN `sunrpc`.
 #[allow(clippy::disallowed_types)] // rustls's client takes `Arc` by signature (D-8 exception 3, a test harness).
-fn export_round(
+fn export_session(
   port: u16,
   authority: &rustls::pki_types::CertificateDer<'static>,
-  client: (
-    rustls::pki_types::CertificateDer<'static>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-  ),
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-  use slates_bridge_nfs::rpc::{read_record, write_record};
+  client: ClientIdentity,
+) -> (
+  Option<Vec<u8>>,
+  rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+) {
+  use slates_bridge_nfs::rpc::write_record;
   use slates_bridge_nfs::rpc_tls::{ALPN_SUNRPC, AUTH_TLS};
-  use std::io::{Read, Write};
-  let call = |xid: u32, version: u32, flavor: u32| {
-    let mut message = Vec::new();
-    for word in [xid, 0, 2, 100_003, version, 0, flavor, 0, 0, 0] {
-      message.extend_from_slice(&word.to_be_bytes());
-    }
-    write_record(&message)
-  };
-  let read_one = |stream: &mut dyn Read| -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-      if let Ok((message, _)) = read_record(&bytes) {
-        return Some(message);
-      }
-      match stream.read(&mut chunk) {
-        // A signal in this process interrupts a blocking read; the read is retried, as `read_exact` does.
-        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-        Ok(0) | Err(_) => return None,
-        Ok(count) => bytes.extend_from_slice(&chunk[..count]),
-      }
-    }
-  };
+  use std::io::Write;
   let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
   socket.set_read_timeout(Some(START_WAIT)).unwrap();
-  socket.write_all(&call(1, 4, AUTH_TLS)).unwrap();
-  let probe = read_one(&mut socket);
+  let mut probe = Vec::new();
+  for word in [1u32, 0, 2, 100_003, 4, 0, AUTH_TLS, 0, 0, 0] {
+    probe.extend_from_slice(&word.to_be_bytes());
+  }
+  socket.write_all(&write_record(&probe)).unwrap();
+  let reply = read_one_record(&mut socket);
   let mut roots = rustls::RootCertStore::empty();
   roots.add(authority.clone()).unwrap();
   let mut config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
@@ -1540,29 +1545,234 @@ fn export_round(
   .with_client_auth_cert(vec![client.0], client.1)
   .unwrap();
   config.alpn_protocols = vec![ALPN_SUNRPC.to_vec()];
-  let mut connection = rustls::ClientConnection::new(
+  let connection = rustls::ClientConnection::new(
     std::sync::Arc::new(config),
     rustls::pki_types::ServerName::try_from(FLEET_NAME).unwrap(),
   )
   .unwrap();
-  let mut tls = rustls::Stream::new(&mut connection, &mut socket);
-  let reply = tls
-    .write_all(&call(2, 3, 0))
-    .ok()
-    .and_then(|()| read_one(&mut tls));
-  (probe, reply)
+  (reply, rustls::StreamOwned::new(connection, socket))
+}
+
+/// Sends one record-marked call inside `session` and returns its reply message.
+fn session_call(
+  session: &mut rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>,
+  record: &[u8],
+) -> Option<Vec<u8>> {
+  use std::io::Write;
+  session.write_all(record).ok()?;
+  read_one_record(session)
+}
+
+/// NFSv3 `NULL` as a record-marked call with transaction id `xid`.
+fn nfs_null(xid: u32) -> Vec<u8> {
+  let mut message = Vec::new();
+  for word in [xid, 0, 2, 100_003, 3, 0, 0, 0, 0, 0] {
+    message.extend_from_slice(&word.to_be_bytes());
+  }
+  slates_bridge_nfs::rpc::write_record(&message)
+}
+
+/// A fleet enrolled under one operator authority, written into a scratch directory: the authority, the manifest
+/// (every node in its own failure domain, `f = 0` so node a alone holds a quorum), and each node's held ports.
+struct EnrolledFleet {
+  authority: rcgen::Certificate,
+  authority_key: rcgen::KeyPair,
+  manifest: String,
+  blocks: Vec<HeldBlock>,
+}
+
+impl EnrolledFleet {
+  #[allow(clippy::disallowed_methods)] // the test's own scratch files: the manifest and its DER files
+  fn write(dir: &str) -> EnrolledFleet {
+    let authority_key = rcgen::KeyPair::generate().unwrap();
+    let mut authority_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    authority_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let authority = authority_params.self_signed(&authority_key).unwrap();
+    std::fs::write(format!("{dir}/authority.crt.der"), authority.der().as_ref()).unwrap();
+    let fleet = EnrolledFleet {
+      authority,
+      authority_key,
+      manifest: format!("{dir}/fleet.json"),
+      blocks: port_blocks(),
+    };
+    for (domain, node) in FLEET_NODES.iter().enumerate() {
+      let (cert, key) = fleet.issue(vec![
+        FLEET_NAME.to_owned(),
+        format!("r0.d{domain}.{FLEET_NAME}"),
+      ]);
+      std::fs::write(format!("{dir}/{node}.crt.der"), cert.as_ref()).unwrap();
+      std::fs::write(format!("{dir}/{node}.key.der"), key.secret_der()).unwrap();
+    }
+    let nodes: Vec<serde_json::Value> = FLEET_NODES
+      .iter()
+      .zip(&fleet.blocks)
+      .enumerate()
+      .map(|(domain, (node, held))| {
+        serde_json::json!({
+          "node": node,
+          "address": format!("127.0.0.1:{}", held.base),
+          "certificate": format!("{node}.crt.der"),
+          "key": format!("{node}.key.der"),
+          "domain": domain,
+        })
+      })
+      .collect();
+    let document = serde_json::json!({
+      "name": FLEET_NAME,
+      "f": 0,
+      "nodes": nodes,
+      "enrollment_roots": ["authority.crt.der"],
+    });
+    std::fs::write(&fleet.manifest, document.to_string()).unwrap();
+    fleet
+  }
+
+  /// A leaf for `names` the authority signs.
+  fn issue(&self, names: Vec<String>) -> ClientIdentity {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(names)
+      .unwrap()
+      .signed_by(&key, &self.authority, &self.authority_key)
+      .unwrap();
+    (
+      cert.der().clone(),
+      rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+    )
+  }
+
+  /// A node's NFS client identity, as its `tlshd` holds one.
+  fn client(&self) -> ClientIdentity {
+    self.issue(vec!["node-k8s-1".to_owned()])
+  }
+
+  /// Starts `slates anchor --fleet` for node a, handing it the node's probe and record sockets and its export's
+  /// TCP listener on the base port (the test lets go of its own copies), and returns the anchor and the port.
+  fn start_anchor(&self, instance: &str) -> (AnchorProcess, u16) {
+    use std::os::fd::AsRawFd;
+    let [probe, record] = self.blocks[0].sockets.as_slice() else {
+      panic!("a node's block is its probe and record ports");
+    };
+    let port = self.blocks[0].base;
+    let export = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    let export_fd: std::os::fd::OwnedFd = export.try_clone().unwrap().into();
+    rustix::io::fcntl_setfd(&export_fd, rustix::io::FdFlags::empty()).unwrap();
+    let (probe, record) = (inheritable(probe), inheritable(record));
+    let child = slates()
+      .args([
+        "--instance",
+        instance,
+        "anchor",
+        "--quick",
+        "--shards",
+        SHARDS,
+        "--fleet",
+        &self.manifest,
+        "--node",
+        FLEET_NODES[0],
+      ])
+      .env(
+        slates_anchor::ENV_FLEET_SERVE,
+        format!(
+          "{},{},{}",
+          probe.as_raw_fd(),
+          record.as_raw_fd(),
+          export_fd.as_raw_fd()
+        ),
+      )
+      .stdout(Stdio::null())
+      .stderr(Stdio::inherit())
+      .spawn()
+      .unwrap();
+    (AnchorProcess { child, drain: None }, port)
+  }
+
+  /// `STARTTLS` then `NULL` answered `SUCCESS` inside a session on the export at `port`.
+  fn assert_serves_null(&self, port: u16, which: &str) {
+    let (probe, mut session) = export_session(port, &self.authority.der().clone(), self.client());
+    let reply = session_call(&mut session, &nfs_null(2));
+    assert_eq!(
+      probe,
+      Some(slates_bridge_nfs::rpc_tls::starttls_reply(1)),
+      "{which} answers the probe"
+    );
+    assert_eq!(
+      reply,
+      Some(slates_bridge_nfs::rpc::reply_bytes(
+        2,
+        slates_bridge_nfs::rpc::AcceptStatus::Success,
+        &[]
+      )),
+      "{which} serves the call in the session"
+    );
+  }
+
+  /// `MNT path` inside a fresh session on the export at `port`: the root handle or the refusal.
+  fn mount(&self, port: u16, path: &str, xid: u32) -> Option<Result<Vec<u8>, String>> {
+    let caller = slates_bridge_nfs::client::Credentials {
+      uid: 0,
+      gid: 0,
+      gids: Vec::new(),
+    };
+    let (_, mut session) = export_session(port, &self.authority.der().clone(), self.client());
+    let reply = session_call(
+      &mut session,
+      &slates_bridge_nfs::client::mnt_call(xid, &caller, path),
+    )?;
+    Some(
+      slates_bridge_nfs::client::parse_mnt_reply(&reply, xid)
+        .map(|handle| handle.0.to_vec())
+        .map_err(|refusal| format!("{refusal:?}")),
+    )
+  }
+}
+
+/// As an operator publishing a volume for a PersistentVolume: bootstrap the group, create a volume, `slates
+/// export` it, `MNT` the printed path over the export, `slates detach` the export, `MNT` again. The first `MNT`
+/// is admitted; the second refused.
+fn assert_an_export_is_published_and_detached(fleet: &EnrolledFleet, instance: &str, port: u16) {
+  let (code, _, err) = run(instance, &["bootstrap", "root"]);
+  assert_eq!(code, 0, "bootstrap: {err}");
+  let started = Instant::now();
+  let id = loop {
+    let (code, out, err) = run(
+      instance,
+      &["volume", "create", "published", "--bounded", "4MiB"],
+    );
+    if code == 0 {
+      break value_of(&out, "id");
+    }
+    assert!(
+      err.contains("ConsensusNotInitialized") && started.elapsed() < START_WAIT,
+      "create: {err}"
+    );
+    pause();
+  };
+  let (code, out, err) = run(instance, &["export", &id, "--json"]);
+  assert_eq!(code, 0, "export: {err}");
+  let path = json_field(&out, "path");
+  let admitted = fleet.mount(port, &path, 3);
+  let (code, _, err) = run(instance, &["detach", &json_field(&out, "attachment")]);
+  assert_eq!(code, 0, "detach: {err}");
+  let after_detach = fleet.mount(port, &path, 4);
+  assert!(
+    matches!(admitted, Some(Ok(_))),
+    "the exported path is admitted over the TLS session: {admitted:?}"
+  );
+  assert!(
+    matches!(after_detach, Some(Err(_))),
+    "a detached export admits nothing: {after_detach:?}"
+  );
 }
 
 /// §4.6 "Kubernetes publication without privilege" (AUD-29-75) and §4.8's anchor-held ports. Do: start
 /// `slates anchor --fleet` for node a of a manifest with an operator authority (every node enrolled under it, in
 /// its own failure domain), handing the anchor the node's probe and record sockets and its export's TCP listener
-/// on the base port; make an RPC-with-TLS round on the export as a node's NFS client would; `kill -9` the daemon;
-/// make the round again. Expect: both rounds answer `STARTTLS` and then the call `SUCCESS` — the export is the
-/// anchor's, handed to the restarted daemon, so its port never closes and its clients reconnect to the same place.
+/// on the base port; call `NULL` over an RPC-with-TLS session as a node's NFS client would; `kill -9` the daemon
+/// and call again; then publish a volume (`slates export`), `MNT` its path over the export, detach it, and `MNT`
+/// again. Expect: `STARTTLS` and `NULL` answered on both daemons (the export is the anchor's, so its port never
+/// closes); the exported path admitted; and refused once the export is detached.
 #[test]
-#[allow(clippy::disallowed_methods)] // the test's own scratch files: the manifest and its DER files
 fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart() {
-  use std::os::fd::AsRawFd;
   if std::env::var_os("SLATES_TEST_CLI").is_none() {
     eprintln!(
       "skipping the anchored export flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
@@ -1570,115 +1780,11 @@ fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart(
     return;
   }
   let scratch = scratch_dir();
-  let dir = scratch.path.clone();
-  let authority_key = rcgen::KeyPair::generate().unwrap();
-  let mut authority_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-  authority_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-  let authority = authority_params.self_signed(&authority_key).unwrap();
-  std::fs::write(format!("{dir}/authority.crt.der"), authority.der().as_ref()).unwrap();
-  let issue = |names: Vec<String>| {
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = rcgen::CertificateParams::new(names)
-      .unwrap()
-      .signed_by(&key, &authority, &authority_key)
-      .unwrap();
-    (cert, key)
-  };
-  for (domain, node) in FLEET_NODES.iter().enumerate() {
-    let (cert, key) = issue(vec![
-      FLEET_NAME.to_owned(),
-      format!("r0.d{domain}.{FLEET_NAME}"),
-    ]);
-    std::fs::write(format!("{dir}/{node}.crt.der"), cert.der().as_ref()).unwrap();
-    std::fs::write(format!("{dir}/{node}.key.der"), key.serialize_der()).unwrap();
-  }
-  let blocks = port_blocks();
-  let nodes: Vec<serde_json::Value> = FLEET_NODES
-    .iter()
-    .zip(&blocks)
-    .enumerate()
-    .map(|(domain, (node, held))| {
-      serde_json::json!({
-        "node": node,
-        "address": format!("127.0.0.1:{}", held.base),
-        "certificate": format!("{node}.crt.der"),
-        "key": format!("{node}.key.der"),
-        "domain": domain,
-      })
-    })
-    .collect();
-  let manifest = format!("{dir}/fleet.json");
-  std::fs::write(
-    &manifest,
-    serde_json::json!({
-      "name": FLEET_NAME,
-      "f": FLEET_F,
-      "nodes": nodes,
-      "enrollment_roots": ["authority.crt.der"],
-    })
-    .to_string(),
-  )
-  .unwrap();
-  let [probe, record] = blocks[0].sockets.as_slice() else {
-    panic!("a node's block is its probe and record ports");
-  };
-  let export_port = blocks[0].base;
-  let export = std::net::TcpListener::bind(("127.0.0.1", export_port)).unwrap();
-  let export_fd: std::os::fd::OwnedFd = export.try_clone().unwrap().into();
-  rustix::io::fcntl_setfd(&export_fd, rustix::io::FdFlags::empty()).unwrap();
-  let (probe, record) = (inheritable(probe), inheritable(record));
+  let fleet = EnrolledFleet::write(&scratch.path);
   let instance = format!("cli-fleet-export-{}", std::process::id());
-  let child = slates()
-    .args([
-      "--instance",
-      &instance,
-      "anchor",
-      "--quick",
-      "--shards",
-      SHARDS,
-      "--fleet",
-      &manifest,
-      "--node",
-      FLEET_NODES[0],
-    ])
-    .env(
-      slates_anchor::ENV_FLEET_SERVE,
-      format!(
-        "{},{},{}",
-        probe.as_raw_fd(),
-        record.as_raw_fd(),
-        export_fd.as_raw_fd()
-      ),
-    )
-    .stdout(Stdio::null())
-    .stderr(Stdio::inherit())
-    .spawn()
-    .unwrap();
-  let _anchor = AnchorProcess { child, drain: None };
-  drop((probe, record, export_fd, export));
-  let authority_der = authority.der().clone();
-  let client = || {
-    let (cert, key) = issue(vec!["node-k8s-1".to_owned()]);
-    (
-      cert.der().clone(),
-      rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
-    )
-  };
-  let starttls = slates_bridge_nfs::rpc_tls::starttls_reply(1);
-  let success =
-    slates_bridge_nfs::rpc::reply_bytes(2, slates_bridge_nfs::rpc::AcceptStatus::Success, &[]);
+  let (_anchor, port) = fleet.start_anchor(&instance);
   let first = await_daemon(&instance, None, &[]);
-  let (probe_reply, reply) = export_round(export_port, &authority_der, client());
-  assert_eq!(
-    probe_reply.as_ref(),
-    Some(&starttls),
-    "the first daemon answers the probe"
-  );
-  assert_eq!(
-    reply.as_ref(),
-    Some(&success),
-    "the first daemon serves the call in the session"
-  );
+  fleet.assert_serves_null(port, "the first daemon");
   let killed = Command::new("kill")
     .args(["-9", &first.to_string()])
     .status()
@@ -1686,17 +1792,8 @@ fn an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart(
   assert!(killed.success(), "the daemon was killed");
   let second = await_daemon(&instance, Some(first), &[]);
   assert_ne!(second, first, "a new daemon serves");
-  let (probe_reply, reply) = export_round(export_port, &authority_der, client());
-  assert_eq!(
-    probe_reply.as_ref(),
-    Some(&starttls),
-    "the restarted daemon answers on the same port"
-  );
-  assert_eq!(
-    reply.as_ref(),
-    Some(&success),
-    "the restarted daemon serves the call in the session"
-  );
+  fleet.assert_serves_null(port, "the restarted daemon, on the same port");
+  assert_an_export_is_published_and_detached(&fleet, &instance, port);
 }
 
 /// Waits (bounded by the start wait) for a daemon other than `replaced` to answer at `instance`, and

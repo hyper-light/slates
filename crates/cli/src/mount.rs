@@ -112,11 +112,10 @@ fn mount_args(
 
 /// Format: a mount capability as `attach` returns it — the attachment id and its 16-byte secret token
 /// (§4.13; AUD-01), the bearer authority the daemon validates every request's file handle against.
-#[cfg(any(not(target_os = "linux"), test))]
 pub(crate) type MountCapability = (u64, [u8; 16]);
 
-/// The export path a capability mount presents: `/<name>@<attachment_hex>.<token_hex>` (§4.13; AUD-01).
-#[cfg(any(not(target_os = "linux"), test))]
+/// The export path a capability mount presents: `/<name>@<attachment_hex>.<token_hex>` (§4.13; AUD-01) — the
+/// loopback mount's source, and the network export's PersistentVolume path (`slates export`).
 pub(crate) fn export_path(name: &str, capability: MountCapability) -> String {
   let (attachment, token) = capability;
   let token_hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
