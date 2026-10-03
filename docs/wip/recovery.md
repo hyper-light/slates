@@ -27,10 +27,13 @@
 > flight, reconcile to the catalog across a restart. The catalog is the authority on recovery: an image
 > that a crash left ahead of the log is trimmed back (an unrecorded snapshot dropped, an unacknowledged
 > resize's quota reverted), a `Destroying` volume's destroy is completed, and clone pins are reconciled
-> to the recorded clones. **Still owed:** the base
-> plane (an overlay's diverged state is not imaged, counted `BARRIER_UNCAPTURED`), the §4.2 sizing that
-> makes the content-object slot always fit (a refused control-verb publish is counted `PUBLISH_REFUSED`
-> but its record still commits, no transaction undo), and the fuller §4.2 admission accounting.
+> to the recorded clones. The base plane is imaged with its overlay (A-48, layout 7): an overlay's copied-up
+> and created files survive a restart over the directory beneath
+> (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`, 2026-10-03). A refused publish
+> no longer lets a control verb's record commit: the verb is refused typed and rolled back (AUD-05,
+> `an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees`). **Still owed:** the
+> in-place refinement (content resident once, the image carrying references), which would make the slot's
+> fit structural rather than sized.
 
 ## 1. The requirement (settled, not a choice)
 
@@ -205,20 +208,19 @@ volume.
   privilege) and reads bytes written after the last control verb back byte-identical across a real
   in-process daemon restart, plus a crash injected at every durable step with a resume that reaches a
   separate clean run's reference. The kernel-mount hop (a real `mount_nfs`) remains the only piece
-  gated on host capabilities, and it dispatches onto this same barrier. **Owed within this:** the base
-  plane — an overlay's diverged state is not imaged (`to_image` refuses a base-backed body), so a
-  stable mount acknowledgement on an overlay is counted `BARRIER_UNCAPTURED` rather than made durable
-  (the base gate below); and the §4.2 slot sizing that makes `publish_shard` always fit, so a
-  control-verb publish is never refused after its effect and record commit (counted `PUBLISH_REFUSED`
-  until then, no transaction undo).
-- **Host-environment acceptance — explicitly pending.** Three acceptance gates wait on environments
-  this machine does not provide, and are held pending by decision, not overlooked: **mounted POSIX
-  behavior** (a real FUSE/FSKit/NFS mount driving pjdfstest/fsx/fsstress against a volume as a normal
-  path), **kernel-cache coherence** (an outsider edit and an in-VFS edit staying consistent through
-  the kernel's page/attr caches, which live in the OS client and cannot be exercised without the
-  mount), and **guest-device acceptance** (a Linux guest consuming a volume over virtio-fs). Each
-  needs host capabilities or a VM; none is a code gap here, and none is simulated as if passing — they
-  are named so the recovery and admission work above is not mistaken for POSIX/guest conformance.
+  gated on host capabilities, and it dispatches onto this same barrier. *(Base plane landed with A-48, layout
+  7, 2026-09-30):* the publication images an overlay through its host, so a stable acknowledgement on an
+  overlay is durable. Proven through the daemon by
+  `an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base` (2026-10-03). The test is red
+  with the publication's host withheld: the overlay is skipped and the landing refused `ContentUnavailable`.
+  A publish refused after a control verb's effect refuses the verb typed and rolls it back (AUD-05).
+- **Host-environment acceptance.** *(Met, 2026-10-01 to 2026-10-03.)* The three gates this section once held
+  pending for want of an environment all run now. **Mounted POSIX behaviour:** pjdfstest, fsx and fsstress run
+  over the macOS NFS mount, the Linux FUSE mount (`oci-linux`) and a live virtio-fs guest, each against a
+  reviewed expected-failure list (`docs/wip/conformance/`). **Kernel-cache coherence:** the mounted coherence
+  test (`crates/bridge-fuse/tests/coherence_mount.rs`, AUD-02), and a guest without invalidation delivery is
+  promised no cache (AUD-29-79). **Guest-device acceptance:** a QEMU vhost-user-fs guest consumes a volume over
+  the tag (`crates/server/tests/virtiofs.rs`, AUD-29-78).
 - **Writes acknowledged between barriers (A-63, landed 2026-10-03).** A FUSE write is answered before the shard's
   next publication; its bytes are logged in a write log at the front of the shard's slice of the content object and
   replayed over the rebuilt volumes when the log's stamp matches the recovered image's generation

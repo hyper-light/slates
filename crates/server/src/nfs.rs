@@ -435,8 +435,8 @@ fn nfs_ok(results: &[u8]) -> bool {
 /// (owner) shard so the effect survives a daemon restart before the reply claims it does. A refused
 /// publish — the image did not fit its slot, or the slot could not be written — replaces the reply
 /// with `NFS3ERR_IO` (the effect is in the volume, not stable; the client is told so, never promised
-/// survival). A publish that committed without the touched `volume` (a volume the image cannot yet
-/// hold: an overlay with base-backed inodes, whose recovery is the owed base gate) is counted as an
+/// survival). A publish that committed without the touched `volume` (a volume it could not image: its
+/// base unreadable, or the image refused) is counted as a
 /// refused barrier ([`crate::daemon::BARRIER_UNCAPTURED`]) and returns `NFS3ERR_IO`. No volume id
 /// or no publication also refuses: absence of a proof never becomes a stability guarantee.
 fn barrier(

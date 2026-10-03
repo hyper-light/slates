@@ -824,9 +824,9 @@ impl Volume {
   /// A faithful image of this volume's durable state for recovery (§4.8, A-9). Read-only: it walks
   /// the inode table in number order and, for each inode, captures its identity, attributes, home
   /// and body — a directory's entries by name and child number, a file's bytes through the read
-  /// path, a symlink's target. It refuses with [`VfsError::RecoveryIncomplete`] a body this slice
-  /// does not yet capture (a base-backed entry or a whiteout over one), so a base-backed volume is
-  /// never imaged as if it were only its overlay (the base-plane recovery gate).
+  /// path, a symlink's target. An overlay's base plane is imaged through `host` (A-48); without a host it
+  /// refuses with [`VfsError::RecoveryIncomplete`], so a base-backed volume is never imaged as if it were
+  /// only its overlay.
   pub fn to_image(
     &self,
     store: &Store,

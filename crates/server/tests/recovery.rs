@@ -1743,3 +1743,58 @@ fn a_landed_scratch_volume_keeps_its_base_across_a_restart() {
   drop(client);
   second.stop();
 }
+
+/// §4.8, A-48 (an overlay's diverged state is imaged with its base, GAP-A9-6): do: land a scratch volume
+/// onto a directory holding `outside` and `untouched`, so the volume overlays it; over NFS, overwrite
+/// `outside` (a copy-up of a base file) and create `g`, each a `FILE_SYNC` write, and restart the daemon
+/// over the same segment; expect both writes answered stable (an overlay the barrier could not image answers
+/// `NFS3ERR_IO`, counted `BARRIER_UNCAPTURED`), and after the restart `outside` holding the copied-up bytes,
+/// `g` its own, and `untouched` still read from the directory beneath.
+#[test]
+fn an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-overlayrestart-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("overlayrestart", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let target = common::target::target_dir();
+  target.seed("outside", OUTSIDE_BYTES);
+  target.seed("untouched", BEFORE);
+  let mut client = connect(&instance);
+  let secret = first.segment().issuer_secret().unwrap();
+  let volume = client.create(&scratch(LANDED_VOLUME)).unwrap();
+  let grant = common::landing::approve(&mut client, &secret, volume, None, &target.path);
+  match client.land(volume, None, &target.path, Filter::default(), Some(grant)) {
+    Ok(slates_client::Landing::Landed(outcome)) => assert_eq!(outcome.state, "done"),
+    other => panic!("the granted landing: {other:?}"),
+  }
+  let (mut stream, root) = mounted_on(&first, LANDED_VOLUME);
+  let outside = lookup(&mut stream, &root, "outside", 2);
+  write(&mut stream, &outside, AFTER, 3);
+  let created = create(&mut stream, &root, "g", 4);
+  write(&mut stream, &created, BEFORE, 5);
+  drop(stream);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let (mut stream, root) = mounted_on(&second, LANDED_VOLUME);
+  let outside = lookup(&mut stream, &root, "outside", 6);
+  assert_eq!(
+    read(&mut stream, &outside, 7),
+    AFTER,
+    "the copied-up base file keeps the bytes written over it"
+  );
+  let created = lookup(&mut stream, &root, "g", 8);
+  assert_eq!(read(&mut stream, &created, 9), BEFORE);
+  let untouched = lookup(&mut stream, &root, "untouched", 10);
+  assert_eq!(
+    read(&mut stream, &untouched, 11),
+    BEFORE,
+    "a base file the overlay never wrote is still read from the directory beneath"
+  );
+  drop(client);
+  second.stop();
+}
