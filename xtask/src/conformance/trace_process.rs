@@ -17,6 +17,14 @@ pub(super) enum StopSignal {
   Kill,
 }
 
+/// Measured: the macOS CI runner's tracer (`sudo eslogger`) exited between 2.4 µs and 175 ms after its stop
+/// signal over 17 stops (2026-10-01..03, the `tracer exited … after its stop signal` lines), and Linux's `strace`
+/// in about 20 ms. One stop never came: the tracer was still running when the borrowed 20 s mount wait ran out
+/// (b867332), over a hundred times the slowest measured exit, so the waiting length was not the defect.
+/// Derived: ten times the slowest measured stop, so a slow but live exit still passes and a tracer that will not
+/// exit is failed — with its process group's state for the record — in under two seconds.
+const STOP_BOUND: Duration = Duration::from_millis(1750);
+
 /// One child and its process group, with the caller's existing harness wait budget.
 pub(super) struct TraceProcess {
   child: Child,
@@ -75,19 +83,38 @@ impl TraceProcess {
     Ok(status)
   }
 
-  fn wait_exit(&mut self) -> Result<ExitStatus, Failure> {
+  fn wait_exit(&mut self, bound: Duration) -> Result<ExitStatus, Failure> {
     let started = Instant::now();
     loop {
       if let Some(status) = self.poll()? {
         return Ok(status);
       }
-      if started.elapsed() >= self.bound {
-        return Err(Failure(format!(
-          "tracer did not exit within {:?}",
-          self.bound
-        )));
+      if started.elapsed() >= bound {
+        return Err(Failure(format!("tracer did not exit within {bound:?}")));
       }
       pause();
+    }
+  }
+
+  /// The tracer's process group as `ps` sees it — each process's state and wait channel — for the record of a
+  /// stop that never came, so its next occurrence names where the tracer was.
+  fn group_state(&self) -> String {
+    // Every process with its group, filtered here: `ps -g` selects a process group on macOS but a session or
+    // group name on Linux, so the portable form is the whole table and a filter.
+    let group = self.child.id().to_string();
+    match std::process::Command::new("ps")
+      .args(["-A", "-o", "pgid=,pid=,ppid=,stat=,wchan=,command="])
+      .output()
+    {
+      Ok(output) => {
+        let rows: Vec<String> = String::from_utf8_lossy(&output.stdout)
+          .lines()
+          .filter(|row| row.split_whitespace().next() == Some(group.as_str()))
+          .map(str::to_owned)
+          .collect();
+        format!("PGID PID PPID STAT WCHAN COMMAND\n{}", rows.join("\n"))
+      }
+      Err(error) => format!("(ps failed: {error})"),
     }
   }
 
@@ -100,9 +127,18 @@ impl TraceProcess {
     self.require_running()?;
     (self.signal)(self.child.id(), StopSignal::Interrupt)?;
     let signalled = Instant::now();
-    let status = self.wait_exit()?;
-    // Measured on every run, so the stop bound can be derived from the tracer's exits rather than borrowed:
-    // it reuses the mount wait (20 s) today, and one macOS run in twelve exceeded it (CI 2026-10-02).
+    let status = match self.wait_exit(STOP_BOUND) {
+      Ok(status) => status,
+      Err(error) => {
+        let state = self.group_state();
+        // The tracer is ended and reaped here (the drop's cancel), never left behind; the run fails either way.
+        return Err(Failure(format!(
+          "{}; the tracer's process group:\n{state}",
+          error.0
+        )));
+      }
+    };
+    // Measured on every run, the record the stop bound is derived from (`STOP_BOUND`).
     eprintln!(
       "tracer exited {:?} after its stop signal (bound {:?})",
       signalled.elapsed(),
@@ -119,9 +155,9 @@ impl TraceProcess {
       // sudo relays INT to its command, including when a policy created a separate pty
       // and process group. KILL cannot be relayed, so give the owner a chance to reap first.
       (self.signal)(self.child.id(), StopSignal::Interrupt)?;
-      if let Err(error) = self.wait_exit() {
+      if let Err(error) = self.wait_exit(STOP_BOUND) {
         (self.signal)(self.child.id(), StopSignal::Kill)?;
-        self.wait_exit()?;
+        self.wait_exit(STOP_BOUND)?;
         return Err(error);
       }
     }
@@ -216,7 +252,7 @@ mod tests {
         .expect("start fixture for cleanup");
     }
     stdin.write_all(b"finish\n").expect("finish fixture");
-    let status = tracer.wait_exit().expect("fixture exits");
+    let status = tracer.wait_exit(MOUNT_WAIT).expect("fixture exits");
     assert!(status.success());
     assert!(
       ready,
@@ -230,7 +266,7 @@ mod tests {
     let (mut tracer, _stdin, mut stdout) = child("exit 7");
     let mut output = String::new();
     let result = tracer.wait_ready(|| observed(&mut stdout, &mut output));
-    tracer.wait_exit().expect("reap exited fixture");
+    tracer.wait_exit(MOUNT_WAIT).expect("reap exited fixture");
     assert!(
       result
         .expect_err("an exited tracer was accepted")
@@ -297,6 +333,38 @@ mod tests {
       rustix::process::waitpid(Some(pid), rustix::process::WaitOptions::NOHANG),
       Err(rustix::io::Errno::CHILD)
     ));
+  }
+
+  /// AC-4.5 (the stop bound). Do: stop a tracer that ignores its stop signal. Expect: the stop fails within the
+  /// derived bound, not the mount wait, with the tracer's process group's state in the failure; the tracer is
+  /// then ended and reaped, never left behind.
+  #[test]
+  fn a_tracer_that_will_not_stop_fails_in_the_stop_bound_with_its_state() {
+    let (mut tracer, _stdin, mut stdout) = child(r#"trap '' INT; printf 'ready\n'; read finish"#);
+    let pid = rustix::process::Pid::from_raw(i32::try_from(tracer.child.id()).expect("pid"))
+      .expect("positive pid");
+    let mut output = String::new();
+    tracer
+      .wait_ready(|| observed(&mut stdout, &mut output))
+      .expect("ready");
+    let started = Instant::now();
+    let refused = tracer
+      .stop_accepting(|status| status.success())
+      .expect_err("a tracer that ignores its stop signal");
+    assert!(
+      started.elapsed() < MOUNT_WAIT,
+      "failed in the stop bound, not the mount wait"
+    );
+    assert!(
+      refused.0.contains("STAT"),
+      "the process group's state: {}",
+      refused.0
+    );
+    drop(tracer);
+    assert_eq!(
+      rustix::process::test_kill_process(pid),
+      Err(rustix::io::Errno::SRCH)
+    );
   }
 
   /// AC-4.5: a live process without trace activity cannot satisfy the startup boundary.
