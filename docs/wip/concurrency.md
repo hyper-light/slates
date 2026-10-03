@@ -144,8 +144,10 @@ Ada authorized the lane and the workflow's nightly schedule on 2026-10-03. `carg
 rebuilt instrumented (`-Zbuild-std`, host target). The job runs on every push to main and on the daily
 schedule (03:17 UTC).
 
-1. **The canary first.** `crates/mem/tests/race_canary.rs` races two sibling threads' writes to one word,
-   with nothing ordering them. The test is `#[ignore]`d and deliberately undefined behaviour. The task
+1. **The canary first.** `crates/mem/tests/race_canary.rs` races two threads' writes to one word, one after
+   the other in time with nothing ordering them (the second waits on a relaxed flag), both threads alive
+   across both writes: reported 100 of 100 runs, and 50 of 50 at two CPUs (2026-10-03). Two earlier versions
+   missed it, once in three CI runs and once in twenty runs here. The test is `#[ignore]`d and deliberately undefined behaviour. The task
    requires ThreadSanitizer's `data race` report from it and a non-zero exit. Run uninstrumented, the same
    test passes with exit 0 and no report, so a toolchain or flag change that drops the instrumentation fails
    the lane instead of passing it vacuously.
