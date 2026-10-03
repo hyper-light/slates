@@ -179,6 +179,12 @@ in every other lane:
   cause is the instrumented runtime's internal locking under the parallel tests; that is a hypothesis, and
   no log has shown it.
 
+Two more are skipped on CI evidence alone, each a duration classification seen to fail once under
+instrumentation on CI and not reproduced here: `a_poll_busy_on_the_cpu_past_the_quantum_is_its_tasks` (one
+extra unattributed step, run 37153112465) and `a_client_learns_its_wake_from_the_parks_a_reply_ended` (12 of
+32 wake samples, run 37142294661). The mechanism named in `xtask/src/tsan.rs` is a hypothesis; both run
+uninstrumented in every other lane.
+
 ## 5. Owed
 
 - **TSan over the fleet and the mounts**: the server's library and in-process daemon suites joined the lane on

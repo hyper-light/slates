@@ -2089,7 +2089,14 @@ fn exerciser_runs(console: &str) -> std::collections::BTreeMap<String, (i32, Str
     // Per line, as `guest_runs` reads it: the control stripping treats a carriage return followed by text as a
     // return to column 0, so over the whole console it would keep only the last line.
     let cleaned = without_terminal_controls(raw);
-    let line = cleaned.trim_end();
+    // The x86 firmware's text can share the first marker's line with no carriage return between them (CI run
+    // 37153360648: `Booting from ROM..` then reset and clear sequences then the marker), so a marker is found
+    // wherever it sits in the line.
+    let line = cleaned
+      .find("=== ")
+      .and_then(|at| cleaned.get(at..))
+      .unwrap_or(&cleaned)
+      .trim_end();
     if let Some(rest) = line.strip_prefix("=== EXERCISER ") {
       let mut fields = rest.split_whitespace();
       let name = fields.next().unwrap_or_default().to_owned();
@@ -2108,6 +2115,23 @@ fn exerciser_runs(console: &str) -> std::collections::BTreeMap<String, (i32, Str
     }
   }
   runs
+}
+
+/// AUD-29-78 (the exerciser console parser). Do: parse the console CI's x86 guest delivered, the firmware's text, a
+/// reset and clear-screen sequence and the first marker on one line with no carriage return (run 37153360648).
+/// Expect: both exercisers' codes and outputs are read.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_exerciser_marker_behind_the_firmware_text_is_still_read() {
+  let console = "Booting from ROM..\u{1b}c\u{1b}[?7l\u{1b}[2J=== EXERCISER fsx 0\r\nAll operations completed A-OK!\r\n=== END\r\n=== EXERCISER fsstress 0\r\noperations logged: 2000\r\n=== END\r\n";
+  let runs = exerciser_runs(console);
+  assert_eq!(runs.get("fsx").map(|(code, _)| *code), Some(0));
+  assert!(
+    runs
+      .get("fsx")
+      .is_some_and(|(_, output)| output.contains("A-OK"))
+  );
+  assert_eq!(runs.get("fsstress").map(|(code, _)| *code), Some(0));
 }
 
 /// AC-9.7 / AUD-29-78 (the guest's fsx and fsstress legs). Do: boot the live guest in workload mode with the
