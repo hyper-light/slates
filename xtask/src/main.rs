@@ -27,6 +27,9 @@
 //!   [--scratch DIR] [--keep]` — the conformance evidence harness (see `conformance/mod.rs`).
 //! - `cargo xtask kind (image | smoke) [--tag TAG] [--keep]` — the KIND fleet lane: the image, one node
 //!   of it in Docker (see `kind.rs`; docs/wip/kind-lane.md).
+//! - `cargo xtask tsan` — the ThreadSanitizer lane: the race canary must be reported, then the
+//!   threaded crates' tests run instrumented and any report fails (see `tsan.rs`; needs nightly
+//!   with `rust-src`).
 //!
 //! This is a development tool, not shipped code. It reads sources and runs cargo, so it is the one
 //! place in the workspace where `std::fs` reads and `std::process` are ordinary; it still obeys the
@@ -41,6 +44,7 @@ mod capabilities;
 mod conformance;
 mod kind;
 mod ratchet;
+mod tsan;
 mod unsafe_budget;
 mod version;
 
@@ -131,8 +135,9 @@ fn main() -> ExitCode {
       let options = kind::parse(&args[1..])?;
       kind::run(&root, &options)
     }),
+    "tsan" => workspace_root().and_then(|root| tsan::run(&root)),
     other => Err(Failure(format!(
-      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind"
+      "unknown task `{other}`; tasks: structural, literals, unsafe, version, npm-reserve, check, capabilities, callgrind, ratchet, conformance, kind, tsan"
     ))),
   };
   match outcome {

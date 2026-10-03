@@ -137,11 +137,50 @@ connections pumped over a deterministic lossy, reordering channel) and the live 
 (two endpoint threads with a shuttle-scheduled fabric between them). The owed item should be
 restated as that, not as loom.
 
-## 4. Owed
+## 4. TSan (nightly cadence, `tsan-nightly` job; 2026-10-03, AUD-29-32)
 
-- **TSan nightly** (the design's Part 6 row): needs the nightly toolchain's `-Zsanitizer=thread`
-  on a Linux target (`RUSTFLAGS="-Zsanitizer=thread" cargo +nightly test -Zbuild-std --target
-  x86_64-unknown-linux-gnu -p slates-mem -p slates-rt`); not added, a lane for a Linux host to own.
+Ada authorized the lane and the workflow's nightly schedule on 2026-10-03. `cargo xtask tsan`
+(`xtask/src/tsan.rs`) runs on the nightly toolchain with `-Zsanitizer=thread` and the standard library
+rebuilt instrumented (`-Zbuild-std`, host target). The job runs on every push to main and on the daily
+schedule (03:17 UTC).
+
+1. **The canary first.** `crates/mem/tests/race_canary.rs` races two sibling threads' writes to one word,
+   with nothing ordering them. The test is `#[ignore]`d and deliberately undefined behaviour. The task
+   requires ThreadSanitizer's `data race` report from it and a non-zero exit. Run uninstrumented, the same
+   test passes with exit 0 and no report, so a toolchain or flag change that drops the instrumentation fails
+   the lane instead of passing it vacuously.
+2. **The suites.** `--lib --tests` of `slates-mem`, `slates-rt`, `slates-ipc` and `slates-client`, with
+   `--no-fail-fast`. A report makes the test binary exit 66, so any race fails the task. Doctests are not
+   run: two compile-fail doctests in `slates-rt` fail to compile under `-Zbuild-std` for another reason,
+   and no doctest runs threads.
+
+Measured 2026-10-03 on an aarch64 Linux container (18 cores, Docker's default seccomp, so the runtime
+serves through epoll there; the GitHub runner uses io_uring), with nightly 2026-10-02:
+
+| Crate | Tests run instrumented | Reports |
+|---|---|---|
+| `slates-mem` | 68 | 0 |
+| `slates-rt` | 100 | 0 |
+| `slates-ipc` | 38 | 0 |
+| `slates-client` | 14 | 0 |
+
+Two tests are skipped. Each is an assertion that the instrumentation itself falsifies, and each still runs
+in every other lane:
+
+- `region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page`. ThreadSanitizer ignores
+  `mlock` (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/munlockall` at verbosity 1),
+  so the locked delta reads 0. The test passes uninstrumented in the same container.
+- `driver::tests::a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps`. It asserts that 256
+  zero-timeout waits never switch the thread out. Running the whole library, it failed 3 times in 12
+  instrumented runs and 0 times in 10 plain runs. Run alone, it passed 20 of 20 either way. The likely
+  cause is the instrumented runtime's internal locking under the parallel tests; that is a hypothesis, and
+  no log has shown it.
+
+## 5. Owed
+
+- **TSan over the server and the fleet**: the lane covers the crates whose tests drive real threads at the
+  core. The server's and the fleet's suites are long, and the fleet suite must run alone, so adding them is
+  a measured extension of this lane, not yet made.
 - **shuttle over two transport endpoints** (§3).
 - **A loom model of the ipc reply direction's park/wake** is out of reach as written: the rings live
   in a shared-memory region behind std atomics over mapped bytes, which loom cannot instrument, and that

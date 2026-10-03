@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The nightly run (Part 6: shuttle, TSan and the long lanes "nightly"; AUD-29-32; Ada authorized the
+  # schedule 2026-10-03). Every job runs on it, on main, so a day with no push still meets a moving
+  # nightly toolchain (Miri, TSan), a changed runner image or a pulled container tag. Shape: once a day,
+  # at 03:17 UTC, off the hour because GitHub delays scheduled runs most at the start of an hour
+  # (GitHub Actions docs, "Events that trigger workflows", `schedule`).
+  schedule:
+    - cron: "17 3 * * *"
 
 env:
   CARGO_TERM_COLOR: always
@@ -454,8 +461,8 @@ jobs:
         run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers
 
   windows-nightly:
-    name: windows (on every push to main; no nightly schedule)
-    if: github.event_name == 'push'
+    name: windows (every push to main and nightly)
+    if: github.event_name != 'pull_request'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -615,13 +622,10 @@ jobs:
   # with random overlaps to one green through its owner), each under a fixed seed and a schedule
   # budget that are Derived: constants in the test files, so a failing schedule replays from the seed
   # shuttle prints. shuttle is a dev-dependency built only under `--cfg shuttle`; nothing shipped
-  # links it. It runs on every push to main, as `windows-nightly` does; the workflow has no nightly schedule
-  # (a scheduled run would add a daily full CI run, which awaits Ada's approval; AUD-29-32).
-  # TSan, the other nightly tool the design names, is owed (it needs the nightly toolchain's
-  # `-Zsanitizer=thread` and a Linux target; `docs/wip/concurrency.md`).
+  # links it. It runs on every push to main and on the nightly schedule, as `windows-nightly` does.
   shuttle-nightly:
-    name: shuttle (vfs clones, merge green; on every push to main; no nightly schedule)
-    if: github.event_name == 'push'
+    name: shuttle (vfs clones, merge green; every push to main and nightly)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -631,6 +635,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
         run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
+
+  # Part 6 "Concurrency", nightly: ThreadSanitizer over the crates whose tests run real threads against
+  # shared state (mem, rt, ipc, client), with the standard library rebuilt instrumented. `cargo xtask tsan`
+  # first requires a report from a deliberate race (`crates/mem/tests/race_canary.rs`), so a clean run
+  # can never mean the instrumentation was missing; then any report fails the lane. The two tests it skips,
+  # and why, are listed in `xtask/src/tsan.rs`. Ada authorized the lane 2026-10-03 (AUD-29-32).
+  tsan-nightly:
+    name: TSan (mem, rt, ipc, client; every push to main and nightly)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        run: cargo xtask tsan
 
   # The KIND fleet lane (docs/wip/kind-lane.md; docs/deploy.md; §4.8 "Deployment" and the WAN timing status
   # of 2026-09-14, which owed "the KIND lane over a real path"): the fleet on real Linux pods over a real
@@ -651,7 +676,7 @@ jobs:
   # cadence like the other long lanes; the chart's own gates run in `gates` on every pull request.
   kind:
     name: KIND fleet lane (chart, formation, takeover, scale, WAN profiles)
-    if: github.event_name == 'push'
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
