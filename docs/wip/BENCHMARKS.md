@@ -1337,3 +1337,28 @@ The diff's cost follows the changes, about 0.65–0.8 µs a named path, and not 
 the same at ten times the files. The first run of this measurement found the diff naming 9,925 of 10,000 changed
 files (`docs/bugs/2026-10-03-a-reverse-name-lookup-missed-every-entry-that-opens-a-leaf.md`); these numbers are
 after that fix.
+
+### What one barrier's recovery publication costs as a shard's content grows (2026-10-03)
+
+**Command:** `cargo run --release -p slates-vfs --example publish_bench` (`crates/vfs/examples/publish_bench.rs`,
+at `0e5a4b5` plus the bench): one volume holding one file of each size, written in 128 KiB calls; then five
+publications, each timed step by step: the capture (`Volume::to_image`, which copies every file's bytes into the
+image), the encoding (`ShardImage::to_content`) and the publication into double-buffered slots
+(`ShardImage::write_to`: it reads back both slots' frames to learn their generations, checksums the new frame and
+copies it in). The image read back must equal the one written. Apple M5 Max, 18 cores, 128 GiB; load average
+3.4–5.3 from other sessions; best of five shown, all five publication-step figures listed.
+
+| Content | Capture | Encode | Publish | Total (best) | Publish, all five |
+|---|---|---|---|---|---|
+| 1 MiB | 0.02 ms | 0.03 ms | 0.33 ms | 0.38 ms | 0.33, 0.37, 0.42, 0.45, 0.43 ms |
+| 4 MiB | 0.11 ms | 0.06 ms | 1.12 ms | 1.28 ms | 1.33, 1.12, 1.66, 1.69, 1.53 ms |
+| 16 MiB | 0.36 ms | 0.26 ms | 3.77 ms | 4.39 ms | 3.77, 3.98, 5.62, 5.68, 6.08 ms |
+| 64 MiB | 1.45 ms | 0.96 ms | 15.99 ms | 18.39 ms | 15.99, 17.20, 23.28, 23.50, 23.24 ms |
+| 256 MiB | 6.35 ms | 4.31 ms | 64.72 ms | 75.38 ms | 64.72, 67.36, 94.64, 93.97, 94.34 ms |
+
+The cost is linear in the shard's content, about 0.29 ms a MiB, and it is paid at every barrier: an NFS `COMMIT`
+or `FILE_SYNC` write, a FUSE `fsync`, and the `flush` every `close` sends. So a shard holding 256 MiB spends
+75 ms on each close. The publication step is six sevenths of it: before writing, it re-verifies the CRC of both
+slots (the committed image included) only to learn their generations, then checksums and copies the new frame.
+This is the gap the in-place refinement closes (`docs/wip/recovery.md` §4; GAP-A9-6): content resident once in
+anchor RAM, the image carrying references, so a barrier costs the shard's metadata, not its bytes.
