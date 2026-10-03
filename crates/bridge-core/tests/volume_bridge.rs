@@ -1235,3 +1235,31 @@ fn a_scoped_bridge_reaches_nothing_outside_its_directory() {
   );
   assert!(inner.lookup(oid(shared), &cx, "g").is_ok(), "g stayed in");
 }
+
+/// AUD-29-76 (the scoped listing checks its entries against the directory it admitted, then the scope). Do: in
+/// `shared/`, make `a/` holding `f` and `b/`, and link `a/f` into `b` as `alias`, so `alias` is homed in another
+/// directory inside the scope; serve `shared` scoped; list `b` and look up `alias` there. Expect: `alias` is listed
+/// and found — an entry whose home is not the listed directory falls back to the climb to the scope, and is shown
+/// when that home is inside.
+#[test]
+fn an_alias_homed_in_another_directory_inside_the_scope_is_listed_and_found() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, _, _) = shared_and_private(&mut inner, &cx);
+  let a = inner.mkdir(oid(shared), &cx, "a", 0o755).unwrap().ino;
+  let b = inner.mkdir(oid(shared), &cx, "b", 0o755).unwrap().ino;
+  let (f, fh) = inner.create(oid(a), &cx, "f", 0o644, 0).unwrap();
+  inner.release(oid(f.ino), &cx, fh).unwrap();
+  inner.link(oid(f.ino), oid(b), &cx, "alias").unwrap();
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  let listed = scoped.readdir(oid(b), &cx, 0, 0, 64).unwrap();
+  assert!(
+    listed.iter().any(|e| e.name == "alias" && e.ino == f.ino),
+    "{:?}",
+    listed.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+  );
+  assert_eq!(scoped.lookup(oid(b), &cx, "alias").unwrap().ino, f.ino);
+}

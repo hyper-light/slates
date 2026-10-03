@@ -14,7 +14,9 @@
 //!   be opened, and nothing outside is ever shown.
 //!
 //! The check climbs the object's parents, at most the volume's live inodes; a scoped request pays it per object
-//! it names. A rename or link within the scope moves nothing out of it: both of its directories are checked.
+//! it names. A lookup's result and a listing's entries are checked against the directory the request already
+//! admitted first (the relation is transitive), so a page of a listing climbs its depth once, not once per entry.
+//! A rename or link within the scope moves nothing out of it: both of its directories are checked.
 
 use crate::{
   Bridge, CacheLifetime, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr, ObjectId,
@@ -44,10 +46,34 @@ impl<'b> ScopedBridge<'b> {
     }
   }
 
-  /// `node` when it lies in the scope; `NotFound` when it does not.
-  fn shown(&mut self, node: NodeAttr, cx: &OpContext) -> Result<NodeAttr, VfsError> {
-    self.admit(ObjectId::new(node.ino, node.generation), cx)?;
-    Ok(node)
+  /// Whether `object`, named by directory `parent` that this request already admitted, lies in the scope. The
+  /// subtree relation is transitive, so an object beneath `parent` is in the scope, and that answer climbs from
+  /// the object to `parent` only — one step for an entry homed there. Only an object homed elsewhere (a hard
+  /// link's alias) climbs to the scope. The answer equals [`Self::admit`]'s; only its cost differs, and a page
+  /// of a listing costs its depth once rather than once per entry (measured: `docs/wip/BENCHMARKS.md`, the
+  /// scoped listing, 2026-10-03).
+  fn within_admitted(
+    &mut self,
+    object: ObjectId,
+    parent: ObjectId,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    Ok(self.inner.within(object, parent.inode, cx)? || self.inner.within(object, self.scope, cx)?)
+  }
+
+  /// `node`, found in directory `parent` that this request already admitted, when it lies in the scope;
+  /// `NotFound` when it does not.
+  fn shown(
+    &mut self,
+    node: NodeAttr,
+    parent: ObjectId,
+    cx: &OpContext,
+  ) -> Result<NodeAttr, VfsError> {
+    if self.within_admitted(ObjectId::new(node.ino, node.generation), parent, cx)? {
+      Ok(node)
+    } else {
+      Err(VfsError::NotFound)
+    }
   }
 }
 
@@ -63,7 +89,7 @@ impl Bridge for ScopedBridge<'_> {
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {
     self.admit(parent, cx)?;
     let node = self.inner.lookup(parent, cx, name)?;
-    self.shown(node, cx)
+    self.shown(node, parent, cx)
   }
 
   fn getattr(&mut self, object: ObjectId, cx: &OpContext) -> Result<NodeAttr, VfsError> {
@@ -172,11 +198,7 @@ impl Bridge for ScopedBridge<'_> {
         shown.push(entry);
         continue;
       }
-      if entry.name == "."
-        || self
-          .inner
-          .within(ObjectId::new(entry.ino, 0), self.scope, cx)?
-      {
+      if entry.name == "." || self.within_admitted(ObjectId::new(entry.ino, 0), object, cx)? {
         shown.push(entry);
       }
     }

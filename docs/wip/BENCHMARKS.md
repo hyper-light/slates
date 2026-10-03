@@ -1273,3 +1273,67 @@ as they stand when it is accepted. RFC 9289 §5.2.1 says a server SHOULD re-chec
 path a kernel NFS client takes once per mount or reconnect, since it holds one TCP connection per server. The
 cost would be slates-level shared ownership and trust anchors fixed at the listener's start.
 
+
+### A scoped export's per-request check, and a scoped listing page (2026-10-03, AUD-29-76 follow-up)
+
+`cargo run --release -p slates-vfs --example scope_diff_bench` measures the volume's check
+(`Volume::within`: climb an object's parents to the scope). `cargo run --release -p slates-bridge-core --example
+scoped_listing_bench` measures what a request pays through the seam every transport serves by (`ScopedBridge` over
+`VolumeBridge`): one listing page of 1,024 files, and one lookup of a file, in a directory at each depth below the
+scope. Apple M5 Max (18 cores), macOS 26.4, load average 7–18 from other sessions (not quiesced). Best of 7 rounds,
+all shown in the commands' CSV output; tree at `bdfe8fb` plus the change below.
+
+The volume's check, per call (best of 7, 20,000 calls a round):
+
+| Depth below the scope | Directory inside | File inside | Directory outside (climbs to the root) |
+|---|---|---|---|
+| 1 | 40 ns | 63 ns | 81 ns |
+| 8 | 257 ns | 274 ns | 344 ns |
+| 64 | 2.50 µs | 2.55 µs | 2.68 µs |
+| 512 | 25.2 µs | 26.1 µs | 26.6 µs |
+| 4,096 | 241 µs | 247 µs | 250 µs |
+
+About 40 ns a level. Each level resolves the parent's inode number to its current directory node through the inode
+table (`Volume::parent_no` calls `current_dir`, then reads the node), because a directory node records its parent
+by number (`DirNode::parent`). That attribution is from reading the code, not from a profile.
+
+Through the bridge, before and after the change (best of 7):
+
+| Depth | Listing page, before | Listing page, after | Lookup, before | Lookup, after |
+|---|---|---|---|---|
+| 1 | 123 µs | 74 µs | 0.32 µs | 0.22 µs |
+| 8 | 486 µs | 78 µs | 0.89 µs | 0.46 µs |
+| 64 | 2,973 µs | 76 µs | 6.16 µs | 2.74 µs |
+| 512 | 24,004 µs | 97 µs | 47.7 µs | 23.9 µs |
+| 4,096 | 229,436 µs | 297 µs | 465 µs | 227 µs |
+
+**Kept:** a lookup's result and a listing's entries are checked against the directory the request already admitted
+before the scope (`crates/bridge-core/src/scoped.rs` `within_admitted`). The subtree relation is transitive, so the
+answer is the same, and an entry homed in the listed directory costs one step; only an alias homed elsewhere climbs
+to the scope. A page now pays its depth once rather than once per entry, and a lookup climbs once rather than twice.
+
+**Measured and rejected:** the per-entry climb to the scope. It cost 3 ms for a 1,024-entry page 64 levels down
+and 229 ms at 4,096. Each request still pays one climb for the object it names, the 40 ns a level above.
+
+### The snapshot diff over a large span (2026-10-03, AUD-29-76 follow-up)
+
+`cargo run --release -p slates-vfs --example scope_diff_bench` (the diff rows). A volume of empty files, 256 to a
+directory. It is snapshotted, given one-byte writes to some of its files spread evenly, and snapshotted again; then
+`Volume::paths_changed_between` runs. The last row renames a 256-file directory into another. Same machine, load
+average 9–11, best of 7.
+
+| Files | Changes | Paths named | Diff |
+|---|---|---|---|
+| 10,000 | 1 | 1 | 1.2 µs |
+| 10,000 | 100 | 100 | 74.6 µs |
+| 10,000 | 10,000 | 10,000 | 6.47 ms |
+| 10,000 | a moved directory | 516 | 57.0 µs |
+| 100,000 | 1 | 1 | 1.1 µs |
+| 100,000 | 100 | 100 | 83.0 µs |
+| 100,000 | 10,000 | 10,000 | 7.84 ms |
+| 100,000 | a moved directory | 516 | 58.3 µs |
+
+The diff's cost follows the changes, about 0.65–0.8 µs a named path, and not the volume's size: one change costs
+the same at ten times the files. The first run of this measurement found the diff naming 9,925 of 10,000 changed
+files (`docs/bugs/2026-10-03-a-reverse-name-lookup-missed-every-entry-that-opens-a-leaf.md`); these numbers are
+after that fix.

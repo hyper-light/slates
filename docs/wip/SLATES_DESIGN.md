@@ -1984,6 +1984,11 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > from a cookie does. The tree oracle checks it for every entry
 > (`docs/bugs/2026-10-03-a-reverse-name-lookup-missed-every-entry-that-opens-a-leaf.md`).
 
+> **Status (2026-10-03, AUD-29-76 follow-up: the scope check's cost).** A scoped export checks each object a request
+> names by climbing its parents to the scope, about 40 ns per level of depth. A lookup's result and a listing's
+> entries are checked against the directory the request already admitted, so a listing page climbs its depth once.
+> A 1,024-entry page 64 levels down fell from 3 ms to 76 µs (`docs/wip/BENCHMARKS.md`, 2026-10-03).
+
 > **Status (2026-10-01, AUD-29-68: the inherited-descriptor binding).** On Linux a guest device attaches over
 > vhost-user through a socket the harness hands the daemon (`attach_vhost_user_device`; never a socket on disk).
 > The VMM is authenticated as the socket's peer. Its memory is accepted only as sealed memory objects, and its
