@@ -219,6 +219,13 @@ volume.
   mount), and **guest-device acceptance** (a Linux guest consuming a volume over virtio-fs). Each
   needs host capabilities or a VM; none is a code gap here, and none is simulated as if passing — they
   are named so the recovery and admission work above is not mistaken for POSIX/guest conformance.
+- **Writes acknowledged between barriers (A-63, landed 2026-10-03).** A FUSE write is answered before the shard's
+  next publication; its bytes are logged in a write log at the front of the shard's slice of the content object and
+  replayed over the rebuilt volumes when the log's stamp matches the recovered image's generation
+  (`crates/server/src/write_log.rs`). The full-image design is unchanged: the log carries only what the image does
+  not yet hold, and each complete publication empties it. The content object is now sized once
+  (`DaemonConfig::content_bytes`: two reserve slots and the log per shard), for the anchor and a standalone daemon
+  alike.
 - **§4.2 admission accounting and content-object sizing.** The object is sized at a derived
   `partitions × PUBLISH_SLOTS × reserve_per_shard` — the doubling is intentional, the price of atomic
   double-buffered publication (the committed image plus the one being written). The fuller §4.2

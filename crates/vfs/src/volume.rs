@@ -437,6 +437,12 @@ pub(crate) struct VolumeSeed {
 }
 
 impl Volume {
+  /// The volume's inode-number prefix: the top bits of every inode number it issues, so an inode number names its
+  /// volume within a shard (what a write log's replay routes by, A-63).
+  pub fn prefix(&self) -> u16 {
+    self.prefix
+  }
+
   /// The metadata bytes one volume's records take at their bound (§4.2 metadata dimension), for
   /// the admitting owner to reserve from the shard's metadata ledger before the volume exists: its
   /// journal's whole retention budget (`journal_bytes`, the records the op log keeps before the

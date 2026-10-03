@@ -6623,6 +6623,8 @@ pub struct Rebuilt {
   /// Unlinked-but-open files whose every holder died with the process, reclaimed as their volume's references
   /// were settled (A-61).
   pub orphans_reclaimed: usize,
+  /// FUSE writes acknowledged after the last publication, replayed from the write log (A-63).
+  pub writes_replayed: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
@@ -6730,6 +6732,11 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     rebuilt.snapshots_dropped += snapshots;
     rebuilt.attachments_dropped += attachments;
     rebuilt.orphans_reclaimed += settle_references(state, record);
+  }
+  // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
+  #[cfg(target_os = "linux")]
+  {
+    rebuilt.writes_replayed = replay_writes(state);
   }
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
@@ -6938,10 +6945,10 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
 /// A shard's slice of the anchor content object, read by copies (§4.8): the object is sparse (backed
 /// only where it is touched) and hands out no reference to its bytes (AUD-29-09), so the image is found
 /// and copied out without ever viewing the whole slice.
-struct ContentView<'a> {
-  object: &'a slates_mem::SparseObject,
-  start: usize,
-  len: usize,
+pub(crate) struct ContentView<'a> {
+  pub(crate) object: &'a slates_mem::SparseObject,
+  pub(crate) start: usize,
+  pub(crate) len: usize,
 }
 
 impl slates_vfs::recover::ImageRead for ContentView<'_> {
@@ -7166,15 +7173,10 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   match shard.write_to(&mut slots) {
     Ok(frame_bytes) => {
       published.frame_bytes = frame_bytes;
-      // Every volume captured: no write before this publication can be lost now, so the dirty log empties
-      // (A-61). A volume skipped keeps the log, so its files stay named.
+      // Every volume captured: this image holds every logged write, so the write log empties, stamped with
+      // this generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
       #[cfg(target_os = "linux")]
-      if published.skipped.is_empty()
-        && let (Some(log), Some(object)) = (state.dirty_log.as_mut(), state.content.as_mut())
-        && log.clear(object).is_err()
-      {
-        *state.refusals.entry(DIRTY_LOG_UNWRITTEN).or_insert(0) += 1;
-      }
+      clear_write_log(state, published.skipped.is_empty());
       Ok(published)
     }
     Err(e) => {
@@ -7450,10 +7452,71 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
   }
 }
 
-/// Format: the refusal counter of a dirty-log write the content object refused (A-61): a file then not known to
-/// the next daemon as having lost writes.
+/// Format: the refusal counter of a write-log span the content object refused (A-63): that write is not logged.
 #[cfg(target_os = "linux")]
-pub(crate) const DIRTY_LOG_UNWRITTEN: &str = "recovery.dirty_log_unwritten";
+pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
+
+/// Empties the shard's FUSE write log after a publication that captured every volume (A-63), stamped with that
+/// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
+/// writes stay owed to the next daemon.
+#[cfg(target_os = "linux")]
+fn clear_write_log(state: &mut ShardState, captured_every_volume: bool) {
+  if !captured_every_volume {
+    return;
+  }
+  let (start, end) = state.content_range;
+  let Some(object) = state.content.as_mut() else {
+    return;
+  };
+  let generation = ShardImage::committed_generation(&ContentView {
+    object,
+    start,
+    len: end.saturating_sub(start),
+  })
+  .unwrap_or(0);
+  if let Some(log) = state.write_log.as_mut()
+    && log.clear(object, generation).is_err()
+  {
+    *state.refusals.entry(WRITE_LOG_UNWRITTEN).or_insert(0) += 1;
+  }
+}
+
+/// Replays the FUSE writes the previous daemon acknowledged after its last publication (A-63) into the volumes
+/// recovery rebuilt, in the order they were acknowledged: each to the volume whose prefix its inode carries. A write
+/// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says.
+#[cfg(target_os = "linux")]
+fn replay_writes(state: &mut ShardState) -> usize {
+  let records = std::mem::take(&mut state.replay);
+  let mut replayed = 0;
+  for record in records {
+    let prefix =
+      u16::try_from(record.inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
+    let handle = state
+      .volumes
+      .iter()
+      .find(|(_, slot)| slot.volume.prefix() == prefix)
+      .map(|(handle, _)| handle);
+    let written = handle
+      .and_then(|handle| state.volumes.get_mut(handle).ok())
+      .map(|slot| {
+        slot.volume.write(
+          &mut state.store,
+          slates_vfs::ids::InodeNo(record.inode),
+          record.offset,
+          &record.bytes,
+        )
+      });
+    match written {
+      Some(Ok(_)) => replayed += 1,
+      _ => *state.refusals.entry(WRITE_REPLAY_REFUSED).or_insert(0) += 1,
+    }
+  }
+  replayed
+}
+
+/// Format: the refusal counter of a logged write recovery could not replay (A-63).
+#[cfg(target_os = "linux")]
+const WRITE_REPLAY_REFUSED: &str = "recovery.write_replay_refused";
 
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
 const REFERENCES_UNSETTLED: &str = "recovery.references_unsettled";

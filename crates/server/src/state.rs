@@ -152,15 +152,20 @@ pub struct ShardState {
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
-  /// The files written since the last complete publication, logged in the page before `content_range` in the
-  /// anchor's content object (A-61; `crate::dirty_log`); `None` without a content object. Linux only: the log
-  /// serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost itself).
+  /// The FUSE writes acknowledged since the last complete publication, kept whole in the region before
+  /// `content_range` in the anchor's content object (A-63; `crate::write_log`); `None` without a content object.
+  /// Linux only: the log serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost
+  /// itself, by its write verifier).
   #[cfg(target_os = "linux")]
-  pub(crate) dirty_log: Option<crate::dirty_log::DirtyLog>,
-  /// What the previous daemon's log named when this one started: the files whose acknowledged writes its death
-  /// lost, reported to the mounts the anchor held across it (A-61). Linux only, as FUSE is.
+  pub(crate) write_log: Option<crate::write_log::WriteLog>,
+  /// What the previous daemon's log held to replay, consumed when the volumes are rebuilt (A-63).
   #[cfg(target_os = "linux")]
-  pub(crate) lost_files: crate::dirty_log::LostFiles,
+  pub(crate) replay: Vec<crate::write_log::Record>,
+  /// Whether the previous daemon acknowledged a write it could not log (its log overflowed and the publication that
+  /// would have emptied it was refused): every file a taken-over mount had open is then reported as having lost
+  /// writes (A-61, A-63). Linux only, as FUSE is.
+  #[cfg(target_os = "linux")]
+  pub(crate) writes_lost: bool,
   /// The barrier reply each FUSE mount is about to deliver (A-61): recorded before the barrier publishes, so the
   /// publication carries it with the effect, and removed once written. At most one per mount (a mount serves one
   /// request at a time).

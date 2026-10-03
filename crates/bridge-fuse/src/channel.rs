@@ -609,7 +609,7 @@ fn reply_error(reply: &[u8]) -> i32 {
 
 /// A request served by [`dispatch_ready`] whose reply waits for its owner: the opcode, the round delivered
 /// before it, the reply's errno, and where the reply sits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dispatched {
   /// The request's opcode, or `None` for one slates does not serve.
   pub opcode: Option<Opcode>,
@@ -620,12 +620,24 @@ pub struct Dispatched {
   unique: u64,
   nodeid: u64,
   len: usize,
+  /// The request as the kernel sent it, kept for what its owner records with it (a write's bytes, A-63).
+  request: Vec<u8>,
 }
 
 impl Dispatched {
   /// The node the request named (the kernel's node id; the root is 1).
   pub fn nodeid(&self) -> u64 {
     self.nodeid
+  }
+
+  /// A `WRITE`'s offset and bytes, for the owner to log before the reply (A-63); `None` for any other request.
+  pub fn written(&self) -> Option<(u64, &[u8])> {
+    let parsed = Request::parse(&self.request).ok()?;
+    if parsed.opcode != Some(Opcode::Write) {
+      return None;
+    }
+    let write = crate::request::WriteIn::parse(Opcode::Write.to_wire(), parsed.body).ok()?;
+    Some((write.offset, write.data))
   }
 
   /// The request's unique id, without the kernel's resend bit: what a recorded reply is matched by (A-61).
@@ -652,7 +664,7 @@ impl Dispatched {
 }
 
 /// What one non-blocking turn of [`dispatch_ready`] found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Turn {
   /// No request was waiting: the owner awaits the device's readiness again.
   Idle,
@@ -717,6 +729,7 @@ pub fn dispatch_ready(
       unique,
       nodeid,
       len,
+      request,
     }
   });
   attachments.end(attachment);

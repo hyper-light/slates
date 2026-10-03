@@ -31,8 +31,6 @@ pub mod content_retention;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;
 pub mod deploy;
-#[cfg(target_os = "linux")]
-mod dirty_log;
 pub mod discovery;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
@@ -50,6 +48,8 @@ pub mod histogram;
 pub mod landing;
 pub mod lease;
 pub mod merge_service;
+#[cfg(target_os = "linux")]
+mod write_log;
 // The NFS mount transport is the macOS/Linux mount path (Windows mounts through WinFsp); it rides the
 // Unix-only `slates_rt::tcp`, so it is gated off Windows. A Windows daemon serves IPC clients and lands
 // (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.

@@ -2175,16 +2175,17 @@ before the report is published, so a tool never reads attributes newer than the 
 > mount's record commits, its session once `INIT` is answered, and a release at the end. At restart each device
 > goes to the shard that owns its mount. Recovery keeps a FUSE record whose device is held and whose kernel can
 > resend, and serves it again: a registry attachment with its durable owner, the restored serve state, then one
-> `FUSE_NOTIFY_RESEND`. Without a device or resend support it ends the mount as before. The dirty log reports
-> lost writes `EIO` (A-61). Proven through the real binary on Linux 6.12, as a non-root user, in
+> `FUSE_NOTIFY_RESEND`. Without a device or resend support it ends the mount as before. A write acknowledged after
+> the last publication is replayed from the write log (A-63). Proven through the real binary on Linux 6.12, as a non-root user, in
 > `crates/cli/tests/cli.rs`:
 > - `a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable`: a write after `SIGKILL` waits and
 >   succeeds; the window measured 23–134 ms, against a recovery budget of seconds. Both files read back through
 >   their descriptors, the unlinked one included, and the mount and its record remain.
-> - `a_write_in_flight_at_the_daemons_kill_is_resent_and_no_loss_is_silent`: a writer appends through the kill.
->   Every write succeeds, a request the dead daemon read is resent and served (`fuse.resent`), and every
->   acknowledged page is exact, or a zero hole in a cycle whose `fsync` answered `EIO`. It passed 3 of 3; before
->   the dirty log it failed with a silent hole.
+> - `a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives`: four writers append
+>   through the kill. Every write succeeds; a request the dead daemon read is resent and served (`fuse.resent`);
+>   every acknowledged page is exact, the restarted daemon replaying 2–3 logged writes per run; and no `fsync`
+>   reports a loss. It passed 3 of 3. With the replay removed, a page came back wrong (pages 385 and 436 in two
+>   runs). Before any log, the test found a silent hole.
 > - Red-checked: with recovery's keep removed, the write after the kill fails `ECONNABORTED`.
 > On a kernel without resend (before 6.9) the old ending holds, proven by
 > `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`, which now skips on 6.9 and later.
@@ -2196,8 +2197,8 @@ before the report is published, so a tool never reads attributes newer than the 
 > is answered from its record once, and only the request the record answers. The image round-trips its replies
 > in a canonical order. Red-checked: a reply whose unique drops the resend bit fails. The window it covers, a
 > barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
-> end-to-end test reaches it. Owed: per-shard channels; and making every acknowledged write survive, which needs
-> the incremental publication.
+> end-to-end test reaches it. Per-shard channels were measured and rejected (A-62). Every acknowledged write now
+> survives (A-63).
 
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;
@@ -5912,10 +5913,9 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
   §4.6 "Linux").
 - T-3.5 (fault) Kill the daemon while a process holds an open file and is writing; expect the
   writes to wait during the window (A-61: the anchor holds the device), then recovery with every
-  write a barrier made stable (an earlier namespace change, `flush` or `fsync`; D-18) present and the
-  open file still usable; a write acknowledged after the last barrier and lost with the daemon is
-  never silent: the file's next `fsync` through a descriptor open at the kill answers `EIO`, as Linux
-  reports a writeback error, and every close until then does too.
+  acknowledged write present (A-63: the writes after the last publication replayed from the write log)
+  and the open file still usable; only a write the log could not take is reported `EIO` at the file's
+  next `fsync`, never silent.
 - T-3.6 (error) `allow_other` requested without `user_allow_other`; expect a typed refusal
   naming the config line.
 - T-3.7 (chaos) Unmount under load (`umount -l` by an operator); expect typed errors to clients
@@ -8266,25 +8266,20 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     request per mount applied but unanswered. Its reply is published with its effect, and a resent request
     whose unique matches is answered with that reply, never applied twice.
   - **The writes acknowledged after the last barrier.** A plain write is acknowledged before the barrier (D-18),
-    so the writes since the last publication die with the daemon while their writer runs on. Found by the
-    in-flight takeover test before anything landed: page 99 of a file written through the kill came back
-    wrong, its length right, and a later `fsync` would have succeeded. So the first write to a file after a
-    publication names the file in the shard's dirty log, a page of its slice of the anchor's content object
-    (one shared-memory store, no system call; `crates/server/src/dirty_log.rs`), and a publication that captured
-    every volume empties it. A restarted daemon reads it before anything publishes. Each file it names answers
-    every `flush` through a handle opened before the takeover `EIO`, and its first `fsync` `EIO` once
-    (`slates_bridge_core::LostWrites`). A flush reports without consuming the error, since every close of any
-    copy of a descriptor sends one, a spawned child's exec-time close included; measured: such a close took a
-    one-time report the writer's own `fsync` needed. A log past its page reports every file. Making every
-    acknowledged write survive instead needs the owed incremental publication (each barrier re-images the
-    shard today).
+    so the writes since the last publication would die with the daemon while their writer runs on. Found by the
+    in-flight takeover test before anything landed: page 99 of a file written through the kill came back wrong,
+    its length right, and a later `fsync` would have succeeded. Each such write is logged whole and replayed by the
+    successor (A-63); only a write the log could not take is reported `EIO` at the file's next `fsync`
+    (`slates_bridge_core::LostWrites`). There, a `flush` reports without consuming the error, since every close of
+    any copy of a descriptor sends one, a spawned child's exec-time close included (measured: such a close took a
+    one-time report the writer's own `fsync` needed).
 - Evidence: the kernel's resend contract, transcribed from the 7.41 uapi header on 2026-10-03
   (`FUSE_HAS_RESEND`, `FUSE_NOTIFY_RESEND = 7`, `FUSE_UNIQUE_RESEND`); the recovery image's orphan tracking
   (`crates/vfs/src/recover.rs`), which already anticipated this handoff.
 - What it changes in the failure matrix: during the window a Linux mount's requests wait on the held device
   instead of failing `ENOTCONN`.
 - Built in order: (1) the codec's resend and the session, (2) the anchor's channel, (3) the references carried
-  in the image, holding and taking over, and the dirty log, (4) the exact replay. Each lands with its tests; the
+  in the image, holding and taking over, and the write log (A-63), (4) the exact replay. Each lands with its tests; the
   §4.6 status says which are built.
 
 ### A-62 — A FUSE mount keeps one channel, on its volume's owner shard (2026-10-03)
@@ -8300,4 +8295,30 @@ Applied in the same change to: §4.6 "Linux", the Phase 3 driver task, GAPS (AUD
 - Decision: one channel per mount, read by the volume's owner shard (built: `crates/server/src/fuse.rs`).
   Different mounts already spread across shards with their volumes. Per-shard channels are rejected for one-volume
   mounts. They would be reconsidered only for a single mount presenting many volumes, which slates does not build.
+
+### A-63 — Every acknowledged FUSE write survives a daemon restart: a write log in anchor RAM (2026-10-03)
+Applied in the same change to: §4.6 "Linux" status, A-61, T-3.5, `docs/wip/recovery.md` §4, GAPS (AC-3.4).
+- Why: A-61 lets a writer run on across its daemon's death, but a plain write is acknowledged before the shard's
+  recovery image is published (D-18), and the image is the shard's whole state, re-imaged at each barrier, far too
+  costly per write. A-61's first answer reported such a lost write `EIO` at the next `fsync`: correct, and still a
+  loss.
+- The mechanism, within recovery's full-image design (`docs/wip/recovery.md`, unchanged): each successful FUSE
+  write appends its inode, offset and bytes to the shard's write log, a region of its slice of the anchor's
+  content object, before its reply. That is one copy into shared memory and no system call
+  (`crates/server/src/write_log.rs`). A publication that captured every volume empties the log and stamps it with
+  that publication's generation (`ShardImage::committed_generation`). A restarted daemon replays the log over the
+  volumes its image rebuilt, in acknowledgement order, only when the log's stamp equals the recovered image's
+  generation. A log stamped earlier belongs to a publication that committed before the clear, and that image
+  already carries its writes; replaying them could resurrect bytes a later truncate removed. A record is written
+  before the length that covers it, so a death mid-append leaves it uncovered.
+- When the log is full: the write it could not take is already applied, so a forced publication carries it and
+  empties the log. Only a refused publication leaves a write unlogged: the log records the overflow, and the next
+  daemon reports every file a taken-over mount had open as having lost writes, never a silent hole.
+- Sizing: a quarter of the shard's reserve (`DaemonConfig::write_log_bytes`). The size trades forced publications
+  against resident log pages, never durability. The content object is sized once, `DaemonConfig::content_bytes`;
+  the anchor had used its own formula, half the daemon's
+  (`docs/bugs/2026-10-03-the-anchor-sized-the-content-object-at-half-the-daemons-need.md`).
+- Evidence: the in-flight test passes with every page exact and no reported loss, replaying 2–3 logged writes per
+  run, and fails with the replay removed. Unit tests cover replay order, a stale stamp, an uncovered record, a full
+  log, an overflow and an impossible length.
 

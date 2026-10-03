@@ -32,9 +32,9 @@
 //! **Across a restart (A-61; AC-3.4).** The anchor holds each mount's device (`crate::fuse_hold`): sent before the
 //! record commits, with the session once `INIT` is answered, released at the end. A restarted daemon serves again
 //! each kept mount whose kernel can resend ([`adopt_held`]): its durable owner's references back, the restored
-//! serve state, one `FUSE_NOTIFY_RESEND`. A write is logged in the dirty log before its reply
-//! (`crate::dirty_log`), so one the dead daemon acknowledged and never published is reported `EIO`, never
-//! silent. A barrier's reply rides its publication, so a request the dead daemon applied and never answered is
+//! serve state, one `FUSE_NOTIFY_RESEND`. A write's bytes are logged in the write log before its reply
+//! (`crate::write_log`, A-63), so one the dead daemon acknowledged after its last publication is replayed by its
+//! successor, never lost; only a write the log could not take reports `EIO` at the file's next `fsync`. A barrier's reply rides its publication, so a request the dead daemon applied and never answered is
 //! answered from that record when the kernel resends it, never applied twice. One channel per mount, on its
 //! volume's owner shard: per-shard channels would hand most requests to a shard that cannot serve the volume
 //! (A-62, measured and rejected).
@@ -663,19 +663,38 @@ fn fail(s: &mut ShardState, attachment: u64) {
   ended(s, attachment);
 }
 
-/// Logs a write's file in the shard's dirty log before its reply (A-61, `crate::dirty_log`): the write is
-/// acknowledged before the next publication, so a daemon that dies first must leave the file named for its
-/// successor. Logged before the reply, so a write applied and never answered is resent, not counted lost.
+/// Logs a write's bytes in the shard's write log before its reply (A-63, `crate::write_log`): the write is
+/// acknowledged before the next publication, so a daemon that dies first must leave its bytes for its successor to
+/// replay. Logged before the reply, so a write applied and never answered is resent, not replayed twice over a
+/// different later write (the kernel resends it with the same bytes at the same offset). A log with no room forces a
+/// publication, which carries this write (already applied) and empties the log; only a refused publication leaves the
+/// write unlogged, marked as an overflow so the next daemon reports the loss rather than replaying around it.
 fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
   if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
     return;
   }
-  if let (Some(log), Some(object)) = (s.dirty_log.as_mut(), s.content.as_mut())
-    && log.mark(object, dispatched.nodeid()).is_err()
-  {
+  let Some((offset, data)) = dispatched.written() else {
+    return;
+  };
+  let appended = match (s.write_log.as_mut(), s.content.as_mut()) {
+    (Some(log), Some(object)) => log.append(object, dispatched.nodeid(), offset, data),
+    _ => return,
+  };
+  let logged = match appended {
+    Ok(()) => true,
+    Err(crate::write_log::Refused::Full) => {
+      // The publication carries this write and, capturing every volume, empties the log.
+      crate::verbs::publish_shard(s).is_ok_and(|published| published.skipped.is_empty())
+    }
+    Err(crate::write_log::Refused::Unwritten) => false,
+  };
+  if !logged {
     *s.refusals
-      .entry(crate::verbs::DIRTY_LOG_UNWRITTEN)
+      .entry(crate::verbs::WRITE_LOG_UNWRITTEN)
       .or_insert(0) += 1;
+    if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
+      let _ = log.overflow(object);
+    }
   }
 }
 
@@ -773,7 +792,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       mount_point: mount_point.clone(),
       scope: record.form.scope(),
       session_held: true,
-      lost: LostWrites::new(s.lost_files.inodes.clone(), s.lost_files.everything),
+      lost: LostWrites::new(std::collections::BTreeSet::new(), s.writes_lost),
     },
   );
   if futures::spawn(serve(attachment))

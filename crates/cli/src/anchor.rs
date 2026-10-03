@@ -118,9 +118,7 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // it across daemon restarts and hands it off, so an agent's writes survive a restart (BUG-11).
   let seg_name = segment_name(&options.instance);
   let content_name = seg_name.replacen("slates-seg-", "slates-con-", 1);
-  let content_bytes = usize::try_from(config.reserve_per_shard)
-    .unwrap_or(usize::MAX)
-    .saturating_mul(usize::from(config.geometry.partitions.max(1)));
+  let content_bytes = config.content_bytes();
   let mut segment = AnchorSegment::create(&seg_name, &profile.facts.identity, config.geometry)
     .and_then(|s| s.with_content(&content_name, content_bytes))
     .map_err(|e| failed("segment", e))?;

@@ -3824,17 +3824,17 @@ fn write_through_a_kill(instance: &str, paths: &[String], firsts: &[usize]) -> V
 #[cfg(target_os = "linux")]
 const EIO: i32 = 5;
 
-/// AC-3.4 / T-3.5 with a request in flight (A-61: `FUSE_NOTIFY_RESEND`, the dirty log). Do: mount a volume over
+/// AC-3.4 / T-3.5 with a request in flight (A-61: `FUSE_NOTIFY_RESEND`; A-63: the write log). Do: mount a volume over
 /// FUSE; [`IN_FLIGHT_WRITERS`] writer threads append numbered pages, each through one descriptor to its own file,
-/// while the daemon is `SIGKILL`ed and on past the restart, then `fsync`; repeat until the restarted daemon reports a request the kernel resent (one the
-/// dead daemon read and never answered), within [`IN_FLIGHT_ATTEMPTS`]. Expect: every write is acknowledged —
-/// none fails or hangs, so the resent request was served (without the resend its writer would wait forever); the
-/// file has every page's length; and no loss is silent: a cycle whose `fsync` succeeded wrote every page exactly,
-/// and pages the dead daemon acknowledged but never published read as zero only in a cycle whose `fsync` answered
-/// `EIO`, as Linux reports a writeback error. Gated like the takeover test.
+/// while the daemon is `SIGKILL`ed and on past the restart, then `fsync`; repeat until the restarted daemon reports
+/// a request the kernel resent (one the dead daemon read and never answered), within [`IN_FLIGHT_ATTEMPTS`].
+/// Expect: every write is acknowledged — none fails or hangs, so the resent request was served (without the resend
+/// its writer would wait forever); every file has every page, each exactly as written, the ones the dead daemon
+/// acknowledged after its last publication replayed from the write log; and no `fsync` reports a loss. Gated like
+/// the takeover test.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_write_in_flight_at_the_daemons_kill_is_resent_and_no_loss_is_silent() {
+fn a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives() {
   let Some(held) = HeldMount::start("resend") else {
     return;
   };
@@ -3887,21 +3887,23 @@ fn a_write_in_flight_at_the_daemons_kill_is_resent_and_no_loss_is_silent() {
   held.unmount();
 }
 
-/// Every page is exact, except that a cycle whose `fsync` answered `EIO` may hold zero pages — the writes the dead
-/// daemon acknowledged and never published, which it reported. A wrong page anywhere else is a silent loss.
+/// Every page is exact and no cycle's `fsync` reported a loss: the writes the dead daemon acknowledged after its last
+/// publication were replayed from the write log by its successor (A-63), not lost and not merely reported.
 #[cfg(target_os = "linux")]
 fn assert_no_silent_loss(bytes: &[u8], cycles: &[Cycle]) {
+  assert!(
+    cycles.iter().all(|cycle| !cycle.loss_reported),
+    "an fsync reported lost writes: the log should have replayed them"
+  );
   let mut number = 0usize;
   let mut pages = bytes.chunks(IN_FLIGHT_WRITE);
   for cycle in cycles {
     for _ in 0..cycle.pages {
       let page = pages.next().unwrap_or(&[]);
       let value = u8::try_from(number % PAGE_VALUES).unwrap_or(0);
-      let exact = page.iter().all(|byte| *byte == value);
-      let reported_hole = cycle.loss_reported && page.iter().all(|byte| *byte == 0);
       assert!(
-        exact || reported_hole,
-        "page {number} is wrong and no fsync reported a loss"
+        page.iter().all(|byte| *byte == value),
+        "page {number} is not what was written"
       );
       number += 1;
     }

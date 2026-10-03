@@ -314,6 +314,29 @@ pub struct DaemonConfig {
 pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
 impl DaemonConfig {
+  /// Derived: each shard's FUSE write log in the anchor's content object (A-63): a quarter of the shard's reserve.
+  /// A log that fills forces a publication, which empties it, so its size trades publications against resident log
+  /// pages, never durability; a quarter of the reserve lets a write stream of that much ride between barriers
+  /// without re-imaging the shard. Lazily backed, so only the pages a stream reaches cost RAM.
+  pub fn write_log_bytes(&self) -> usize {
+    /// Shape: the share of the reserve the log takes (see the method).
+    const RESERVE_SHARE: usize = 4;
+    usize::try_from(self.reserve_per_shard).unwrap_or(usize::MAX) / RESERVE_SHARE
+  }
+
+  /// Derived: the anchor content object's whole size: per shard, two reserve-sized image slots (the committed
+  /// recovery image and the one being written, §4.8) and the write log, times the partitions. One definition, the
+  /// anchor's and a standalone daemon's (they disagreed: the anchor sized one slot per shard until 2026-10-03).
+  pub fn content_bytes(&self) -> usize {
+    /// Format: the double buffer's slots: the committed image and the one being written.
+    const PUBLISH_SLOTS: usize = 2;
+    usize::try_from(self.reserve_per_shard)
+      .unwrap_or(usize::MAX)
+      .saturating_mul(PUBLISH_SLOTS)
+      .saturating_add(self.write_log_bytes())
+      .saturating_mul(usize::from(self.geometry.partitions.max(1)))
+  }
+
   /// Derived: the FUSE devices an anchor may hold for this daemon across a restart (A-61): one per live
   /// attachment the daemon's shards can hold, `shards × slates_bridge_core::authority::MAX_ATTACHMENTS`, since a
   /// FUSE mount is an attachment on its volume's owner shard.

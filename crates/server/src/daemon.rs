@@ -594,7 +594,7 @@ impl Daemon {
       SegmentSource::Create { name } => {
         let content_name = content_name_of(&name);
         AnchorSegment::create(&name, &identity, config.geometry)?
-          .with_content(&content_name, content_bytes(&config))?
+          .with_content(&content_name, config.content_bytes())?
       }
       SegmentSource::FromEnv => AnchorSegment::attach_from_env(&identity)?,
       SegmentSource::Handoff {
@@ -2265,24 +2265,6 @@ fn content_name_of(seg_name: &str) -> String {
   }
 }
 
-/// Slots per shard in the content object: the recovery image is published as a double buffer (§4.8),
-/// so each shard's slice holds two reserve-sized slots — the last committed image and the one being
-/// published. An interrupted publish lands in the non-committed slot, so the committed one always
-/// survives. Two is the minimum for that guarantee (a single slot cannot survive a torn write of
-/// itself); more slots would only add unused space.
-const PUBLISH_SLOTS: usize = 2;
-
-/// The content object's total size: two reserve-sized slots per shard (a double buffer) times the
-/// partitions, so each shard owns space for its committed recovery image and the one it is writing
-/// (§4.8). The object is lazily backed, so the unused tail costs address space, not RAM, until an
-/// image is published into it.
-fn content_bytes(config: &DaemonConfig) -> usize {
-  let per_shard = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX);
-  per_shard
-    .saturating_mul(PUBLISH_SLOTS)
-    .saturating_mul(usize::from(config.geometry.partitions.max(1)))
-}
-
 fn handoff_of(env: &[(String, String)]) -> Result<(Handoff, usize), ServerError> {
   let handoff = env
     .iter()
@@ -2350,8 +2332,8 @@ fn shard_slice(
   (start, start.saturating_add(per_shard))
 }
 
-/// This shard's content range for its recovery images (§4.8): its whole slice. (On Linux the slice's first page is
-/// the dirty log instead, [`content_slice`].)
+/// This shard's content range for its recovery images (§4.8): its whole slice. (On Linux the slice also holds the
+/// FUSE write log, A-63.)
 #[cfg(not(target_os = "linux"))]
 fn content_slice(
   config_shards: &[u16],
@@ -2361,30 +2343,37 @@ fn content_slice(
   shard_slice(config_shards, partition, content)
 }
 
-/// This shard's content range for its recovery images (§4.8), and the dirty log in the slice's first page with
-/// what the previous daemon left in it (A-61, `crate::dirty_log`), read before anything this daemon does can
-/// publish and clear it. No log and nothing lost without a content object, or a slice too small for a page.
+/// This shard's content range for its recovery images (§4.8), and the FUSE write log at the slice's front with what
+/// the previous daemon left in it to replay (A-63, `crate::write_log`), opened against the generation of the
+/// committed image, before anything this daemon does can publish and clear it. No log and nothing to replay without
+/// a content object, or a slice too small for the log.
 #[cfg(target_os = "linux")]
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
   config_shards: &[u16],
-  content: Option<&slates_mem::SparseObject>,
+  content: Option<&mut slates_mem::SparseObject>,
 ) -> (
   (usize, usize),
-  Option<crate::dirty_log::DirtyLog>,
-  crate::dirty_log::LostFiles,
+  Option<crate::write_log::WriteLog>,
+  crate::write_log::Recovered,
 ) {
-  let (start, end) = shard_slice(config_shards, partition, content);
-  let log = content
-    .filter(|_| end.saturating_sub(start) > config.page)
-    .and_then(|object| Some((object, crate::dirty_log::DirtyLog::new(start, config.page)?)));
-  match log {
-    Some((object, log)) => {
-      let lost = log.recovered(object);
-      ((start.saturating_add(config.page), end), Some(log), lost)
-    }
-    None => ((start, end), None, crate::dirty_log::LostFiles::default()),
+  let (start, end) = shard_slice(config_shards, partition, content.as_deref());
+  let log_bytes = config.write_log_bytes();
+  let images = (start.saturating_add(log_bytes), end);
+  let Some(object) = content.filter(|_| end.saturating_sub(start) > log_bytes) else {
+    return ((start, end), None, crate::write_log::Recovered::default());
+  };
+  let generation =
+    slates_vfs::recover::ShardImage::committed_generation(&crate::verbs::ContentView {
+      object,
+      start: images.0,
+      len: images.1.saturating_sub(images.0),
+    })
+    .unwrap_or(0);
+  match crate::write_log::WriteLog::open(object, start, log_bytes, generation) {
+    Some((log, recovered)) => (images, Some(log), recovered),
+    None => ((start, end), None, crate::write_log::Recovered::default()),
   }
 }
 
@@ -2524,13 +2513,14 @@ fn init_shard(
   let (root, node_regions, region_mirrors) = build_root_group(config, host);
   // The anchor-owned content object that survives a restart (§4.8), if the anchor provides one.
   // Shards share the one object, partitioned by index: this shard owns the slice `[start, end)`.
-  let content = match AnchorSegment::open_content(env) {
+  #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+  let mut content = match AnchorSegment::open_content(env) {
     Some(result) => Some(result?),
     None => None,
   };
   #[cfg(target_os = "linux")]
-  let (content_range, dirty_log, lost_files) =
-    content_slice(config, partition, config_shards, content.as_ref());
+  let (content_range, write_log, recovered_writes) =
+    content_slice(config, partition, config_shards, content.as_mut());
   #[cfg(not(target_os = "linux"))]
   let content_range = content_slice(config_shards, partition, content.as_ref());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
@@ -2553,9 +2543,11 @@ fn init_shard(
     content,
     content_range,
     #[cfg(target_os = "linux")]
-    dirty_log,
+    write_log,
     #[cfg(target_os = "linux")]
-    lost_files,
+    writes_lost: recovered_writes.everything_lost,
+    #[cfg(target_os = "linux")]
+    replay: recovered_writes.records,
     #[cfg(target_os = "linux")]
     pending_replies: std::collections::BTreeMap::new(),
     #[cfg(target_os = "linux")]
@@ -2702,7 +2694,7 @@ fn init_shard(
     // RAM (content, tree and snapshots restored, §4.8), the ones that could not be (refused, never
     // presented empty), and what the images did not carry and was reconciled out of the catalog.
     eprintln!(
-      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived",
+      "slates-server: shard {shard}: recovered {} volumes from their images ({} refused), {} merge volumes (green chains replayed, works reset), reconciled out {} unrecovered local snapshots and {} attachments, trimmed {} unacknowledged snapshots the images carried, completed {} destroys in flight, corrected {} clone pins, reclaimed {} orphans no holder survived, replayed {} logged writes",
       rebuilt.volumes,
       rebuilt.skipped,
       rebuilt.merge_volumes,
@@ -2711,7 +2703,8 @@ fn init_shard(
       rebuilt.snapshots_trimmed,
       rebuilt.destroys_completed,
       rebuilt.pins_reconciled,
-      rebuilt.orphans_reclaimed
+      rebuilt.orphans_reclaimed,
+      rebuilt.writes_replayed
     );
     eprintln!(
       "slates-server: shard {shard}: held {} replicas again from the image{}",

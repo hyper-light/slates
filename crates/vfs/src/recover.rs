@@ -490,6 +490,14 @@ impl ShardImage {
       Some(bytes) => ShardImage::from_content(&bytes).map(Some),
     }
   }
+
+  /// The generation of the last committed shard image in `slots`, the one [`ShardImage::read_from`] reads: what a
+  /// transport's write log since that publication is stamped with (A-63), so recovery replays only the writes the
+  /// recovered image does not already carry. `None` when nothing committed.
+  pub fn committed_generation<S: ImageRead + ?Sized>(slots: &S) -> Option<u64> {
+    let (zero, one) = slots_of(slots.image_len());
+    slot_generation(slots, zero).max(slot_generation(slots, one))
+  }
 }
 
 impl VolumeImage {
