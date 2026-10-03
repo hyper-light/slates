@@ -165,6 +165,7 @@ serves through epoll there; the GitHub runner uses io_uring), with nightly 2026-
 | `slates-rt` | 100 | 0 |
 | `slates-ipc` | 38 | 0 |
 | `slates-client` | 14 | 0 |
+| `slates-server` (lib, `daemon`, `recovery`, `attach_forms`) | 195 | 0 |
 
 Two tests are skipped. Each is an assertion that the instrumentation itself falsifies, and each still runs
 in every other lane:
@@ -180,9 +181,9 @@ in every other lane:
 
 ## 5. Owed
 
-- **TSan over the server and the fleet**: the lane covers the crates whose tests drive real threads at the
-  core. The server's and the fleet's suites are long, and the fleet suite must run alone, so adding them is
-  a measured extension of this lane, not yet made.
+- **TSan over the fleet and the mounts**: the server's library and in-process daemon suites joined the lane on
+  2026-10-03 (195 tests, no report). The fleet suite must run alone and the mount suites need a kernel mount, so
+  they stay in their own lanes uninstrumented.
 - **shuttle over two transport endpoints** (§3).
 - **A loom model of the ipc reply direction's park/wake** is out of reach as written: the rings live
   in a shared-memory region behind std atomics over mapped bytes, which loom cannot instrument, and that

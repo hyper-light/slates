@@ -12,6 +12,7 @@
 //! 2. **The suites.** Every library and integration test of [`CRATES`], instrumented, with `--no-fail-fast`.
 //!    A report makes the test binary exit non-zero (ThreadSanitizer's `exitcode`, 66 by default), so any
 //!    race fails the task. Only the tests in [`SKIPPED`] are left out, each with its measured reason.
+//! 3. **The server.** Its library and in-process daemon suites ([`SERVER_TARGETS`]), the same way.
 //!
 //! ThreadSanitizer needs the nightly toolchain (`-Zsanitizer=thread`) and the standard library rebuilt with
 //! the same instrumentation (`-Zbuild-std`, so a race through std's own code is seen and std's
@@ -29,6 +30,18 @@ use crate::Failure;
 /// (rings, doorbells, rendezvous) and the client (reply park, reconnect). Measured clean on 2026-10-03
 /// (aarch64 Linux container, nightly 2026-10-02): 68 + 100 + 38 + 14 tests, no report.
 const CRATES: [&str; 4] = ["slates-mem", "slates-rt", "slates-ipc", "slates-client"];
+
+/// Shape: the server's targets the lane runs, named rather than whole: its library and the in-process daemon
+/// suites — the runtime's shards serving a whole daemon's state, recovery and attachment forms. Its other suites
+/// are left to their lanes (the fleet suite must run alone; the mount suites need a kernel mount). Measured clean
+/// on 2026-10-03 (aarch64 Linux container, nightly 2026-10-02): 155 + 18 + 14 + 8 tests, no report, about a
+/// minute with the build cached.
+const SERVER_TARGETS: [&str; 4] = [
+  "--lib",
+  "--test=daemon",
+  "--test=recovery",
+  "--test=attach_forms",
+];
 
 /// Shape: the tests the lane leaves out, each with why. A skipped test still runs in every other lane;
 /// only its assertion is one the instrumentation itself falsifies.
@@ -152,9 +165,32 @@ fn suites(root: &Path, target: &str) -> Result<(), Failure> {
   }
 }
 
-/// Runs the lane: the canary, then the suites.
+/// Step 3: the server's [`SERVER_TARGETS`], instrumented; any report fails.
+fn server(root: &Path, target: &str) -> Result<(), Failure> {
+  let mut command = instrumented(root, target);
+  command.args(["--no-fail-fast", "-p", "slates-server"]);
+  command.args(SERVER_TARGETS);
+  eprintln!(
+    "tsan: the server's {} under ThreadSanitizer",
+    SERVER_TARGETS.join(" ")
+  );
+  let status = command
+    .status()
+    .map_err(|e| Failure(format!("tsan: running the server's suites: {e}")))?;
+  if status.success() {
+    Ok(())
+  } else {
+    Err(Failure(format!(
+      "tsan: the server's instrumented suites failed (exit {}); a ThreadSanitizer report above names the race",
+      status.code().unwrap_or(-1)
+    )))
+  }
+}
+
+/// Runs the lane: the canary, then the threaded crates' suites, then the server's.
 pub fn run(root: &Path) -> Result<(), Failure> {
   let target = host_target()?;
   canary(root, &target)?;
-  suites(root, &target)
+  suites(root, &target)?;
+  server(root, &target)
 }
