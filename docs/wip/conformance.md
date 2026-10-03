@@ -423,6 +423,14 @@ not yet been read by either — the first lane run is the first.
 > rerun or closure of the 6202 reported failures is claimed. No expected-failure list changed.
 > Record: `docs/bugs/2026-09-17-conformance-confuses-available-and-effective-root.md`.
 
+**The tracer's stop bound (2026-10-03).** The stop had borrowed the 20 s mount wait, and one macOS run in twelve
+ran past it (b867332). Every stop now logs its time, and 17 macOS `sudo eslogger` stops measured from 2.4 µs to
+175 ms (Linux `strace` about 20 ms). The overrun was a tracer that never exited, over a hundred times the slowest
+exit, so the waiting length was not the defect. The stop bound is now ten times the slowest measured stop, 1.75 s
+(`xtask/src/conformance/trace_process.rs` `STOP_BOUND`). A stop past it fails with the tracer's process group (state
+and wait channel) in the failure, so the next non-exit names where the tracer was; the tracer is then ended and
+reaped. Proven by a fixture that ignores its stop signal (`a_tracer_that_will_not_stop_fails_in_the_stop_bound_with_its_state`).
+
 ## 4. The lanes and the other transports
 
 | Transport | How the lane drives it | Standing |
