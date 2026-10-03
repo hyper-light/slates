@@ -134,7 +134,28 @@ pub struct Supervisor {
   /// restart. Inheritable, as the NFS listener is.
   #[cfg(unix)]
   fleet_serve: Option<(OwnedFd, OwnedFd, Option<OwnedFd>)>,
+  /// The FUSE devices the anchor holds across daemon restarts, and the channel daemons send them on (A-61;
+  /// [`crate::devices`]). Linux only, as FUSE is.
+  #[cfg(target_os = "linux")]
+  devices: Option<DeviceHold>,
 }
+
+/// The device channel's two ends, what has been received over it, and the refusals counted.
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+struct DeviceHold {
+  anchor_end: OwnedFd,
+  daemon_end: OwnedFd,
+  held: crate::devices::HeldDevices,
+  refused: u64,
+}
+
+/// The most messages one drain applies per device the bound allows: a hold, its session and its release are
+/// every message an attachment's life sends, so a drain is bounded whatever a daemon sends, and a daemon at
+/// the bound with every attachment changing state at once is drained in one call.
+#[cfg(target_os = "linux")]
+/// Derived: one hold + one session + one release per attachment.
+const MESSAGES_PER_DEVICE: usize = 3;
 
 impl std::fmt::Debug for Supervisor {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -167,7 +188,93 @@ impl Supervisor {
       nfs_listener: None,
       #[cfg(unix)]
       fleet_serve: None,
+      #[cfg(target_os = "linux")]
+      devices: None,
     }
+  }
+
+  /// Holds the FUSE devices daemons send, at most `bound` at once (A-61): opens the device channel, whose daemon
+  /// end every daemon this supervisor spawns inherits, with every device held so far.
+  #[cfg(target_os = "linux")]
+  pub fn hold_devices(&mut self, bound: usize) -> Result<(), crate::devices::DeviceRefusal> {
+    let (anchor_end, daemon_end) = crate::devices::channel()?;
+    self.devices = Some(DeviceHold {
+      anchor_end,
+      daemon_end,
+      held: crate::devices::HeldDevices::new(bound),
+      refused: 0,
+    });
+    Ok(())
+  }
+
+  /// Applies every device message queued on the channel, up to [`MESSAGES_PER_DEVICE`] per device the bound
+  /// allows; returns the messages applied. A refused message (malformed, or a hold past the bound) is counted
+  /// ([`Supervisor::device_refusals`]) and its device closed; it never stops the drain or the supervisor.
+  #[cfg(target_os = "linux")]
+  pub fn drain_devices(&mut self) -> usize {
+    let Some(hold) = self.devices.as_mut() else {
+      return 0;
+    };
+    let most = hold.held_bound().saturating_mul(MESSAGES_PER_DEVICE).max(1);
+    let mut applied: usize = 0;
+    for _ in 0..most {
+      match crate::devices::receive(std::os::fd::AsFd::as_fd(&hold.anchor_end)) {
+        Ok(None) => break,
+        Ok(Some(message)) => match hold.held.apply(message) {
+          Ok(()) => applied = applied.saturating_add(1),
+          Err(refusal) => hold.refuse(&refusal),
+        },
+        Err(refusal) => hold.refuse(&refusal),
+      }
+    }
+    applied
+  }
+
+  /// The devices held now.
+  #[cfg(target_os = "linux")]
+  pub fn held_devices(&self) -> usize {
+    self.devices.as_ref().map_or(0, |hold| hold.held.len())
+  }
+
+  /// The device messages refused so far.
+  #[cfg(target_os = "linux")]
+  pub fn device_refusals(&self) -> u64 {
+    self.devices.as_ref().map_or(0, |hold| hold.refused)
+  }
+
+  /// The environment handing the device channel and every held device to a daemon about to be spawned, each
+  /// descriptor made inheritable. A descriptor that cannot be made inheritable is left out (and counted): handing
+  /// a number the daemon does not inherit would have it adopt whatever that number names in its own table.
+  #[cfg(target_os = "linux")]
+  fn device_env(&mut self) -> Option<(String, String)> {
+    self.drain_devices();
+    let hold = self.devices.as_mut()?;
+    let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
+    if let Err(e) = inheritable(&hold.daemon_end) {
+      hold.refuse(&crate::devices::DeviceRefusal::Os {
+        call: "fcntl(F_SETFD) on the channel",
+        code: e.raw_os_error(),
+      });
+      return None;
+    }
+    let mut lost = Vec::new();
+    for (attachment, held) in hold.held.iter() {
+      if inheritable(&held.device).is_err() {
+        lost.push(attachment);
+      }
+    }
+    for attachment in lost {
+      let _ = hold
+        .held
+        .apply(crate::devices::Incoming::Release { attachment });
+      hold.refuse(&crate::devices::DeviceRefusal::Malformed {
+        reason: "a held device could not be made inheritable",
+      });
+    }
+    let value = hold
+      .held
+      .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
+    Some((crate::devices::ENV_DEVICES.to_owned(), value))
   }
 
   /// Holds `fd` — a bound, listening loopback socket — as the NFS listener handed to every daemon this
@@ -225,6 +332,9 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
+    // And the device channel with every FUSE device held (A-61): the daemon takes back the mounts it recovers.
+    #[cfg(target_os = "linux")]
+    env.extend(self.device_env());
     let child = Command::new(&self.program)
       .args(&self.args)
       .envs(env)
@@ -244,6 +354,10 @@ impl Supervisor {
 
   /// Polls the daemon once: running, restarted after an exit, or refused as a crash loop.
   pub fn step(&mut self, now_ns: u64) -> Result<Step, AnchorError> {
+    // Every step takes what the daemon sent, so a device it established is held within a step of its send,
+    // and everything a dead daemon sent is applied before its successor starts.
+    #[cfg(target_os = "linux")]
+    self.drain_devices();
     if self.crash_loop {
       return Ok(Step::CrashLoop { exit_code: None });
     }
@@ -499,5 +613,19 @@ mod lifetime {
     pub(super) fn tie(&mut self, _child: &Child) -> Result<(), AnchorError> {
       Ok(())
     }
+  }
+}
+
+#[cfg(target_os = "linux")]
+impl DeviceHold {
+  /// The bound the held set was given.
+  fn held_bound(&self) -> usize {
+    self.held.bound()
+  }
+
+  /// Counts `refusal` and says so on the anchor's log, once per refusal.
+  fn refuse(&mut self, refusal: &crate::devices::DeviceRefusal) {
+    self.refused = self.refused.saturating_add(1);
+    eprintln!("slates anchor: a device message was refused: {refusal}");
   }
 }

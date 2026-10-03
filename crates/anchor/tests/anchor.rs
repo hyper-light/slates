@@ -753,3 +753,147 @@ fn a_daemon_whose_heartbeat_lapses_while_stopping_is_killed_before_its_declared_
   );
   assert_eq!(state, State::Stopped);
 }
+
+/// Format: the environment variable turning this binary into the device-handoff child.
+#[cfg(target_os = "linux")]
+const CHILD_DEVICES: &str = "SLATES_ANCHOR_TEST_DEVICES";
+/// Format: the attachment the device-handoff child holds its device under.
+#[cfg(target_os = "linux")]
+const DEVICE_ATTACHMENT: u64 = 0x61;
+/// Format: the bytes the first daemon leaves in its device for its successor to read.
+#[cfg(target_os = "linux")]
+const DEVICE_MARK: &[u8] = b"held across the restart";
+/// Format: the session the first daemon sends.
+#[cfg(target_os = "linux")]
+const DEVICE_SESSION: [u8; 2] = [1, 3];
+/// Format: the first daemon's exit code, distinct from the successor's verdicts.
+#[cfg(target_os = "linux")]
+const SENDER_EXIT: i32 = 7;
+
+/// The device-handoff child: with no device handed over it is the first daemon — it opens a pipe, leaves
+/// [`DEVICE_MARK`] in it, sends the anchor the read end as its device and the session, and exits
+/// [`SENDER_EXIT`]; handed a device, it is the successor — it exits 0 iff the device is the first daemon's
+/// attachment, with its session, and reads the mark. Run by the parent with `--ignored --exact`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "the device-handoff child; run by the parent with --ignored"]
+fn device_child() {
+  use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+  if std::env::var(CHILD_DEVICES).is_err() {
+    return;
+  }
+  let handed =
+    std::env::var(slates_anchor::devices::ENV_DEVICES).expect("the anchor handed the channel over");
+  let inherited = slates_anchor::devices::parse_env(&handed).unwrap();
+  // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment;
+  // this process adopts it once, here, so the `OwnedFd` is its single owner.
+  let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
+  let Some(device) = inherited.devices.first() else {
+    let (reader, writer) = rustix::pipe::pipe().unwrap();
+    rustix::io::write(&writer, DEVICE_MARK).unwrap();
+    slates_anchor::devices::send(
+      channel.as_fd(),
+      &slates_anchor::devices::Outgoing::Hold {
+        attachment: DEVICE_ATTACHMENT,
+        device: reader.as_fd(),
+      },
+    )
+    .unwrap();
+    slates_anchor::devices::send(
+      channel.as_fd(),
+      &slates_anchor::devices::Outgoing::Session {
+        attachment: DEVICE_ATTACHMENT,
+        session: &DEVICE_SESSION,
+      },
+    )
+    .unwrap();
+    std::process::exit(SENDER_EXIT);
+  };
+  // SAFETY: as the channel: inherited across the spawn at the number the environment names, adopted once.
+  let held = unsafe { OwnedFd::from_raw_fd(device.fd) };
+  let mut read = vec![0u8; DEVICE_MARK.len()];
+  let got = rustix::io::read(&held, &mut read).unwrap_or(0);
+  let right = device.attachment == DEVICE_ATTACHMENT
+    && device.session.as_deref() == Some(&DEVICE_SESSION[..])
+    && read.get(..got) == Some(DEVICE_MARK);
+  std::process::exit(i32::from(!right));
+}
+
+/// A-61 (AC-3.4's mechanism). Do: hold devices in a real supervisor; its first daemon sends a device (a pipe
+/// it left bytes in) and the session, then exits; the supervisor restarts it. Expect: the anchor held the
+/// device past its sender's death, and the successor inherited it at the number the environment names, under
+/// the same attachment and session, and read the first daemon's bytes from it — the same kernel object.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor() {
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-devices"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let exe = std::env::current_exe()
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "device_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  // Shape: a window that holds this test's two starts and the restart after each.
+  let policy = RestartPolicy {
+    window_ns: 60_000_000_000,
+    max_restarts: 3,
+  };
+  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  // Shape: room for this test's one device.
+  supervisor.hold_devices(4).unwrap();
+  // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child
+  // ignores this variable.
+  unsafe {
+    std::env::set_var(CHILD_DEVICES, "1");
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  let mut exits = Vec::new();
+  let mut held_after_first = None;
+  while clock.elapsed() < deadline && exits.len() < 2 {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::Running => {
+        // The test harness paces the poll; shipped code parks on its driver (D-9).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_micros(POLL_US));
+      }
+      Step::Restarted { exit_code, .. } => {
+        if exits.is_empty() {
+          held_after_first = Some(supervisor.held_devices());
+        }
+        exits.push(exit_code);
+      }
+      Step::CrashLoop { exit_code } => {
+        exits.push(exit_code);
+        break;
+      }
+      Step::Stopped => break,
+    }
+  }
+  supervisor.stop().ok();
+  // SAFETY: single-threaded cleanup.
+  unsafe {
+    std::env::remove_var(CHILD_DEVICES);
+  }
+  assert_eq!(
+    held_after_first,
+    Some(1),
+    "the anchor held the dead daemon's device"
+  );
+  assert_eq!(supervisor.device_refusals(), 0, "no message was refused");
+  assert_eq!(
+    exits,
+    [Some(SENDER_EXIT), Some(0)],
+    "the first daemon sent its device and left; its successor inherited it and read the first one's bytes"
+  );
+}

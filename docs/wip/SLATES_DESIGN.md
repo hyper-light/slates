@@ -2158,8 +2158,13 @@ before the report is published, so a tool never reads attributes newer than the 
 > anchor holding its device (A-61). Built so far: the codec's half. `FUSE_HAS_RESEND` is read from the kernel's
 > `INIT` and kept apart from the echoed flags; the resend notification is encoded and checked against the 7.41
 > header; and the session a restarted daemon needs travels as two checked bytes, with golden and hostile-input
-> tests (`crates/bridge-fuse/src/session.rs`). The anchor's channel, the takeover and the exact replay are next.
-> Until they land, recovery still ends a FUSE mount.
+> tests (`crates/bridge-fuse/src/session.rs`). The anchor's channel is built too (`crates/anchor/src/devices.rs`).
+> The anchor opens it at start, bounded at `shards × MAX_ATTACHMENTS` devices, drains it every supervision step
+> and before every spawn, and hands the channel and every held device to each daemon in `SLATES_ANCHOR_DEVICES`.
+> Every message is checked by kind, length and descriptor count. Proven across real processes: a daemon sends a
+> device and its session, then exits; the restarted daemon inherits that same device and reads what the first
+> one left in it (`crates/anchor/tests/anchor.rs`). The daemon's half, holding and taking over, and the exact
+> replay are next. Until they land, recovery still ends a FUSE mount.
 
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;

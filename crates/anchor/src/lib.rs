@@ -32,6 +32,8 @@
   )
 )]
 
+#[cfg(target_os = "linux")]
+pub mod devices;
 pub mod error;
 pub mod layout;
 pub mod segment;

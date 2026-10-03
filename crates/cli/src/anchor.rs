@@ -168,6 +168,13 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   if let Some(selection) = &options.fleet {
     hold_fleet_serve(&mut supervisor, selection)?;
   }
+  // The FUSE devices daemons mount are held the same way (A-61): a daemon sends each to the anchor, and the
+  // next daemon takes back the mounts it recovers. A channel that cannot be opened refuses the anchor's start:
+  // a mount would then die with its daemon, which the anchor exists to prevent.
+  #[cfg(target_os = "linux")]
+  supervisor
+    .hold_devices(config.held_device_bound())
+    .map_err(|e| failed("device channel", e))?;
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();
   supervisor.start(now).map_err(|e| failed("start", e))?;

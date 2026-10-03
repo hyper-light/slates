@@ -314,6 +314,13 @@ pub struct DaemonConfig {
 pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
 impl DaemonConfig {
+  /// Derived: the FUSE devices an anchor may hold for this daemon across a restart (A-61): one per live
+  /// attachment the daemon's shards can hold, `shards × slates_bridge_core::authority::MAX_ATTACHMENTS`, since a
+  /// FUSE mount is an attachment on its volume's owner shard.
+  pub fn held_device_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
+  }
+
   /// The configuration from a profile, for `instance`. An explicit shard count is selected
   /// before dividing the host's capacity (§4.2); otherwise the profile chooses the cores.
   /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.

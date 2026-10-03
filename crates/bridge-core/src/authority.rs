@@ -18,7 +18,7 @@ use crate::VfsError;
 /// Shape: the bound on concurrently live attachments per owner — more than any realistic number of
 /// mounts and exports at once, few enough that the registry is a small table; a runaway is a typed
 /// `MemError::SlabFull` refusal. Charging attachments against §4.2 admission is owed.
-const MAX_ATTACHMENTS: usize = 4096;
+pub const MAX_ATTACHMENTS: usize = 4096;
 /// Shape: the attachment slab's segment size (a page of slots), so the table grows a page at a time.
 const ATTACHMENT_SEGMENT: usize = 256;
 /// Format: the first owner epoch. Zero is reserved as "no epoch", so a live owner starts at one and
