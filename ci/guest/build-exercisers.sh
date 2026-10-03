@@ -1,6 +1,6 @@
 #!/bin/sh
-# Builds the conformance exercisers into the live-guest image (AC-9.7, AUD-29-78: the guest's fsx and fsstress
-# legs): the very sources the harness fetches (`xtask/src/conformance/fetch.rs`, the same pins and SHA-256s), the
+# Builds the conformance exercisers into the live-guest image (AC-9.7, AUD-29-78: the guest's fsx, fsstress and
+# pjdfstest legs): the very sources the harness fetches (`xtask/src/conformance/fetch.rs`, the same pins and SHA-256s), the
 # same compiler flags, installed at /usr/local/bin for the guest, which runs this container's root over 9p.
 # `xtask/src/conformance/fetch.rs`'s test asserts every pin, digest and flag here equals the harness's, so the two
 # never drift. A digest that does not match fails the image build.
@@ -22,5 +22,10 @@ mkdir -p shim/lapi
 printf '/* slates conformance harness: the build environment LTP'"'"'s configure generates, for Linux */\n#define _GNU_SOURCE 1\n#define _LARGEFILE64_SOURCE 1\n' > shim/config.h
 printf '/* slates conformance harness: LTP'"'"'s lapi/fcntl.h is not needed with the system fcntl.h */\n' > shim/lapi/fcntl.h
 cc -O2 -w -DNO_XFS -D_GNU_SOURCE -include shim/config.h -I. -Ishim -o /usr/local/bin/fsstress fsstress.c
+fetch pjdfstest.tar.gz https://github.com/pjd/pjdfstest/archive/85a8aea9e685999ef0540392fd80535f873d7ff7.tar.gz 2005cdd83b76204177cf136792b1f2058a7418b4fc5b203f51274a698547d754
+# The pinned tree, unpacked where the guest reads it (over 9p, read-only): the guest copies it into its RAM and
+# builds pjdfstest there from the harness's probes, as the oci-linux container does.
+tar xzf pjdfstest.tar.gz -C /guest
+chmod -R a+rX /guest/pjdfstest-85a8aea9e685999ef0540392fd80535f873d7ff7
 cd /
 rm -rf "$work"

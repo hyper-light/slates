@@ -20,9 +20,9 @@ use super::slates::Session;
 use super::{Run, SuiteResult, pause};
 use crate::Failure;
 
-/// Shape: the wall bound of one pjdfstest file; the longest (`rename/00.t`, dozens of cases each
-/// spawning a process over loopback NFS) finishes in seconds, so a file past this has hung.
-pub(crate) const PJDFSTEST_FILE_BOUND: Duration = Duration::from_secs(300);
+/// The wall bound of one pjdfstest file, every leg's (`slates_conformance::pjdfstest::FILE_BOUND_SECONDS`).
+pub(crate) const PJDFSTEST_FILE_BOUND: Duration =
+  Duration::from_secs(slates_conformance::pjdfstest::FILE_BOUND_SECONDS);
 
 /// A command line as the record prints it.
 fn command_line(program: &Path, args: &[String]) -> String {

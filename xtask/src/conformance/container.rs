@@ -641,9 +641,9 @@ fn write_probes(dir: &Path) -> Result<(), Failure> {
   super::create_dir(&probes)?;
   super::write_file(
     &probes.join("head.h"),
-    fetch::pjdfstest_config_head().as_bytes(),
+    slates_conformance::pjdfstest::config_head().as_bytes(),
   )?;
-  for (n, probe) in fetch::pjdfstest_probes().iter().enumerate() {
+  for (n, probe) in slates_conformance::pjdfstest::probes().iter().enumerate() {
     super::write_file(&probes.join(format!("{n:03}.c")), probe.source.as_bytes())?;
     super::write_file(
       &probes.join(format!("{n:03}.define")),
@@ -747,7 +747,7 @@ pub(crate) fn run_pjdfstest(run: &Run<'_>) -> Result<SuiteResult, Failure> {
      harness's {} probes",
     fetch::PJDFSTEST_TARBALL.upstream,
     fetch::PJDFSTEST_COMMIT,
-    fetch::pjdfstest_probes().len()
+    slates_conformance::pjdfstest::probes().len()
   ));
   if !alive {
     notes.push(format!(

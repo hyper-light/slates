@@ -197,6 +197,7 @@ jobs:
           grep -q "guest workload git: Identical" live-guest.log
           grep -q "guest suite fsx: ok" live-guest.log
           grep -q "guest suite fsstress: ok" live-guest.log
+          grep -q "guest suite pjdfstest: ok" live-guest.log
 
   # The two SDKs as a user installs them (§2.4; docs/publish.md), by use on Linux and macOS. The
   # cp39-abi3 wheel maturin builds is installed into a fresh venv after twine checks its metadata

@@ -419,3 +419,42 @@ pub(crate) fn set_times(
   let reply = call(stream, NFS_PROGRAM, 2, &args, xid);
   assert_eq!(status(&reply), 0, "SETATTR of the times");
 }
+
+/// Shape: the bytes one READ of [`read_whole`] asks for, well inside the server's transfer size.
+const READ_CHUNK: u32 = 32_768;
+
+/// Every byte of `file_fh`, read in [`READ_CHUNK`] pieces until the server reports end of file: what a test
+/// reads back a file larger than one READ through (the live guest's pjdfstest results).
+pub(crate) fn read_whole(stream: &mut (impl Read + Write), file_fh: &[u8], xid: u32) -> Vec<u8> {
+  let mut bytes = Vec::new();
+  let mut offset = 0u64;
+  loop {
+    let mut args = Vec::new();
+    opaque(file_fh, &mut args);
+    args.extend_from_slice(&offset.to_be_bytes());
+    args.extend_from_slice(&READ_CHUNK.to_be_bytes());
+    let reply = call(
+      stream,
+      NFS_PROGRAM,
+      6,
+      &args,
+      xid.wrapping_add(u32::try_from(offset / u64::from(READ_CHUNK)).unwrap()),
+    );
+    assert_eq!(status(&reply), 0, "READ at {offset}");
+    let mut off = 4;
+    let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if follows == 1 {
+      off += 84; // post_op_attr fattr3
+    }
+    off += 4; // count
+    let eof = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap()) == 1;
+    off += 4;
+    let (data, _) = read_opaque(&reply, off);
+    offset += u64::try_from(data.len()).unwrap();
+    bytes.extend_from_slice(&data);
+    if eof || data.is_empty() {
+      return bytes;
+    }
+  }
+}

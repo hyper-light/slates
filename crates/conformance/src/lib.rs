@@ -38,6 +38,7 @@ pub mod civil;
 pub mod exerciser;
 pub mod expected;
 pub mod matrix;
+pub mod pjdfstest;
 pub mod record;
 pub mod tap;
 pub mod trace;

@@ -2194,6 +2194,230 @@ fn a_live_guest_runs_fsx_and_fsstress_over_the_tag() {
   drop(daemon);
 }
 
+/// Shape: how long the pjdfstest guest may run — the boot, building pjdfstest from the probes, then every test file
+/// under its bound — under software emulation. Measured below; the CI runner has KVM.
+#[cfg(target_os = "linux")]
+const PJDFSTEST_RUN: Duration = Duration::from_secs(5400);
+
+/// Format: the line the guest writes before each test file's output, then the file's path (the oci-linux lane's mark).
+#[cfg(target_os = "linux")]
+const PJD_MARK: &str = "@@@slates-pjdfstest ";
+
+/// The guest's pjdfstest script (AC-9.7, AUD-29-78: the guest's pjdfstest leg), as the oci-linux container builds and
+/// runs it: the pinned tree copied from the image into the guest's RAM, `config.h` answered by the guest's compiler
+/// from the harness's probes (placed in the volume at `pjd/probes`), pjdfstest built, then every test file run as
+/// root in a directory on the tag under the per-file bound. The outputs gather in the guest's RAM, each behind
+/// [`PJD_MARK`], and are copied to `pjd/results.txt` on the tag in one write at the end, for the test to read back.
+#[cfg(target_os = "linux")]
+fn guest_pjdfstest() -> String {
+  let tree = format!("/guest/pjdfstest-{}", slates_conformance::pjdfstest::COMMIT);
+  let bound = slates_conformance::pjdfstest::FILE_BOUND_SECONDS;
+  format!(
+    r#"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+P=/mnt/pjd/probes
+cp -R {tree} /tmp/p && cd /tmp/p && cat $P/head.h > config.h
+for c in $P/*.c; do b=${{c%.c}}; cc -std=gnu17 -w $(cat $b.flags) -o /tmp/probe.out $c >/dev/null 2>&1 && cat $b.define >> config.h; done
+if cc -O2 -w -I. -o pjdfstest pjdfstest.c; then echo "=== PJD BUILT"; else echo "=== PJD BUILD FAILED"; fi
+mkdir -p /mnt/pjd/work && cd /mnt/pjd/work
+for f in $(cd /tmp/p && find tests -name '*.t' | sort); do
+  echo '{PJD_MARK}'$f >> /tmp/results
+  timeout {bound} sh /tmp/p/$f >> /tmp/results 2>/dev/null
+  [ $? -eq 124 ] && echo 'TIMED OUT' >> /tmp/results
+done
+cp /tmp/results /mnt/pjd/results.txt
+echo "=== PJD DONE"
+"#
+  )
+}
+
+/// Places the harness's pjdfstest probes in `dir` (each `NNN.c`, its `config.h` line in `NNN.define`, and `-c` in
+/// `NNN.flags` when it need only compile, with the head in `head.h`), as the oci-linux lane writes them.
+#[cfg(target_os = "linux")]
+fn place_probes(stream: &mut TcpStream, dir: &[u8]) {
+  let mut xid = 100u32;
+  let mut next = || {
+    xid = xid.wrapping_add(2);
+    xid
+  };
+  put(
+    stream,
+    dir,
+    "head.h",
+    slates_conformance::pjdfstest::config_head().as_bytes(),
+    next(),
+  );
+  for (n, probe) in slates_conformance::pjdfstest::probes().iter().enumerate() {
+    put(
+      stream,
+      dir,
+      &format!("{n:03}.c"),
+      probe.source.as_bytes(),
+      next(),
+    );
+    put(
+      stream,
+      dir,
+      &format!("{n:03}.define"),
+      probe.define.as_bytes(),
+      next(),
+    );
+    let flags: &[u8] = if probe.compile_only { b"-c" } else { b"" };
+    put(stream, dir, &format!("{n:03}.flags"), flags, next());
+  }
+}
+
+/// Each test file's output from the gathered results, split at [`PJD_MARK`]: (the file's path under the tree, its
+/// output).
+#[cfg(target_os = "linux")]
+fn split_pjdfstest(results: &str) -> Vec<(String, String)> {
+  let mut files: Vec<(String, String)> = Vec::new();
+  for line in results.lines() {
+    if let Some(path) = line.strip_prefix(PJD_MARK) {
+      files.push((path.trim().to_owned(), String::new()));
+    } else if let Some((_, text)) = files.last_mut() {
+      text.push_str(line);
+      text.push('\n');
+    }
+  }
+  files
+}
+
+/// AC-9.7 / AUD-29-78 (the guest's pjdfstest leg). Do: place the harness's probes in a volume, boot the live guest in
+/// workload mode so it builds the pinned pjdfstest from them and runs every test file as root over the slates tag;
+/// read the gathered results back over NFS, parse each file and judge the whole against the guest's reviewed list
+/// (`docs/wip/conformance/expected-failures/virtio-fs.pjdfstest.txt`) by the harness's own rule. Expect: pjdfstest
+/// built; every test file of the pinned tree ran to a complete plan, none past its bound; no failure the list does
+/// not name, and no listed case passing. Gated on the live guest's environment; skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_guest_runs_pjdfstest_over_the_tag() {
+  let Some((qemu, kernel, initrd)) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-pjdfstest");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "pjdfstest".to_owned(),
+    size: SizeClass::Bounded { limit: 512 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("pjdfstest").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  put(
+    &mut stream,
+    &root,
+    "run.sh",
+    guest_pjdfstest().as_bytes(),
+    10,
+  );
+  let pjd = common::nfs::mkdir(&mut stream, &root, "pjd", 12);
+  let probes = common::nfs::mkdir(&mut stream, &pjd, "probes", 14);
+  place_probes(&mut stream, &probes);
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(PJDFSTEST_RUN.as_nanos()).unwrap();
+  let _ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let started = Instant::now();
+  let console = run_qemu_with(
+    &(qemu, kernel, initrd),
+    &theirs,
+    (PJDFSTEST_RUN, " slates.workloads", true),
+    &mut |_| {},
+  );
+  eprintln!("the pjdfstest guest ran {:?}", started.elapsed());
+  drop(theirs);
+  assert!(
+    console.contains("=== PJD BUILT"),
+    "pjdfstest built in the guest: {console}"
+  );
+  assert!(
+    console.contains("=== PJD DONE"),
+    "every file ran: {console}"
+  );
+  let results_fh = common::nfs::lookup(&mut stream, &pjd, "results.txt", 9000);
+  let results =
+    String::from_utf8_lossy(&common::nfs::read_whole(&mut stream, &results_fh, 9002)).into_owned();
+  judge_guest_pjdfstest(&results);
+  drop(daemon);
+}
+
+/// Judges the guest's gathered pjdfstest results as the harness judges a root run against its reviewed list.
+#[cfg(target_os = "linux")]
+fn judge_guest_pjdfstest(results: &str) {
+  use slates_conformance::tap::{Runner, parse_file};
+  let tree = format!(
+    "/guest/pjdfstest-{}/tests",
+    slates_conformance::pjdfstest::COMMIT
+  );
+  let listing = std::process::Command::new("find")
+    .args([tree.as_str(), "-name", "*.t"])
+    .output()
+    .unwrap();
+  let expected_files = String::from_utf8_lossy(&listing.stdout).lines().count();
+  let files = split_pjdfstest(results);
+  let timed_out: Vec<&str> = files
+    .iter()
+    .filter(|(_, output)| output.contains("TIMED OUT"))
+    .map(|(path, _)| path.as_str())
+    .collect();
+  let parsed: Vec<_> = files
+    .iter()
+    .map(|(path, output)| parse_file(path, output, &Runner::Root))
+    .collect();
+  let incomplete: Vec<&str> = parsed
+    .iter()
+    .filter(|file| !file.complete())
+    .map(|file| file.file.as_str())
+    .collect();
+  let cases: Vec<_> = parsed
+    .iter()
+    .flat_map(|file| file.cases.iter().cloned())
+    .collect();
+  let list = slates_conformance::expected::ExpectedFailures::parse(include_str!(
+    "../../../docs/wip/conformance/expected-failures/virtio-fs.pjdfstest.txt"
+  ))
+  .unwrap();
+  let judgement = slates_conformance::expected::judge(&list, &cases);
+  eprintln!(
+    "guest suite pjdfstest: {} files, {} cases; {}",
+    files.len(),
+    cases.len(),
+    judgement.describe()
+  );
+  for id in &judgement.unlisted_failures {
+    eprintln!("pjdfstest: unlisted failure {id}");
+  }
+  for id in &judgement.listed_now_passing {
+    eprintln!("pjdfstest: listed but now passing {id}");
+  }
+  assert_eq!(
+    files.len(),
+    expected_files,
+    "every test file of the pinned tree ran"
+  );
+  assert!(
+    timed_out.is_empty(),
+    "files past their bound: {timed_out:?}"
+  );
+  assert!(
+    incomplete.is_empty(),
+    "files without a complete plan: {incomplete:?}"
+  );
+  assert!(judgement.acceptable(), "{}", judgement.describe());
+  eprintln!("guest suite pjdfstest: ok");
+}
+
 /// AC-9.7 / AUD-29-68 (§6's workloads in a live guest). Do: provision a volume and place in it the conformance
 /// roster's scripts; boot the live guest in workload mode — the host container's root over 9p, the slates tag at
 /// its `/mnt`, RAM at `/tmp` — so for each roster tool it holds, the workload runs on the guest's RAM and on the

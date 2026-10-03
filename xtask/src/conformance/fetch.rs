@@ -83,7 +83,7 @@ const FSSTRESS_TST_COMMON_H: Pin = Pin {
 };
 
 /// Format: the pjdfstest commit the tarball is pinned at.
-pub(crate) const PJDFSTEST_COMMIT: &str = "85a8aea9e685999ef0540392fd80535f873d7ff7";
+pub(crate) const PJDFSTEST_COMMIT: &str = slates_conformance::pjdfstest::COMMIT;
 
 /// Format: pjdfstest's source tarball at the pinned commit (GitHub's archive; its digest is the
 /// tarball's, so a regenerated archive with different compression is a loud mismatch to re-pin).
@@ -264,53 +264,6 @@ pub(crate) fn build_fsstress(dir: &Path, os: HostOs) -> Result<BuiltFsstress, Fa
   })
 }
 
-/// Format: the functions `configure.ac` probes with `AC_CHECK_FUNC` (pjdfstest at the pinned
-/// commit), each defining `HAVE_<NAME>` when it links.
-const PJDFSTEST_FUNCTIONS: &[&str] = &[
-  "bindat",
-  "chflags",
-  "chflagsat",
-  "connectat",
-  "faccessat",
-  "fchflags",
-  "fchmodat",
-  "fchownat",
-  "fstatat",
-  "lchflags",
-  "lchmod",
-  "linkat",
-  "lpathconf",
-  "mkdirat",
-  "mkfifoat",
-  "mknodat",
-  "openat",
-  "posix_fallocate",
-  "readlinkat",
-  "renameat",
-  "symlinkat",
-  "utimensat",
-];
-/// Format: the headers `configure.ac` probes with `AC_CHECK_HEADERS`.
-const PJDFSTEST_HEADERS: &[(&str, &str)] = &[
-  ("sys/mkdev.h", "HAVE_SYS_MKDEV_H"),
-  ("sys/sysmacros.h", "HAVE_SYS_SYSMACROS_H"),
-];
-/// Format: the `struct stat` members `configure.ac` probes with `AC_CHECK_MEMBERS`.
-const PJDFSTEST_STAT_MEMBERS: &[(&str, &str)] = &[
-  ("st_atim", "HAVE_STRUCT_STAT_ST_ATIM"),
-  ("st_atimespec", "HAVE_STRUCT_STAT_ST_ATIMESPEC"),
-  ("st_birthtim", "HAVE_STRUCT_STAT_ST_BIRTHTIM"),
-  ("st_birthtime", "HAVE_STRUCT_STAT_ST_BIRTHTIME"),
-  ("st_birthtimespec", "HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC"),
-  ("st_ctim", "HAVE_STRUCT_STAT_ST_CTIM"),
-  ("st_ctimespec", "HAVE_STRUCT_STAT_ST_CTIMESPEC"),
-  ("st_mtim", "HAVE_STRUCT_STAT_ST_MTIM"),
-  ("st_mtimespec", "HAVE_STRUCT_STAT_ST_MTIMESPEC"),
-];
-/// Format: what `AC_USE_SYSTEM_EXTENSIONS` defines (the feature macros every platform honours or ignores).
-const SYSTEM_EXTENSIONS: &str = "#define _ALL_SOURCE 1\n#define _DARWIN_C_SOURCE 1\n#define _GNU_SOURCE 1\n\
-  #define _POSIX_PTHREAD_SEMANTICS 1\n#define _TANDEM_SOURCE 1\n#define __EXTENSIONS__ 1\n";
-
 /// Whether a probe source compiles (and links, unless `compile_only`).
 fn probe(dir: &Path, source: &str, compile_only: bool) -> Result<bool, Failure> {
   let path = dir.join("probe.c");
@@ -324,71 +277,10 @@ fn probe(dir: &Path, source: &str, compile_only: bool) -> Result<bool, Failure> 
   Ok(output.status.success())
 }
 
-/// One of `configure.ac`'s checks as a C source: whether it must link (a function) or only compile (a header, a
-/// `struct stat` member), and the line `config.h` gains when it does.
-pub(crate) struct ConfigProbe {
-  pub(crate) source: String,
-  pub(crate) compile_only: bool,
-  pub(crate) define: String,
-}
-
-/// Every check `configure.ac` makes, as probes a compiler answers — on this host ([`pjdfstest_config_h`]) or
-/// inside a container (`crate::conformance::container`), whose Linux answers differ.
-pub(crate) fn pjdfstest_probes() -> Vec<ConfigProbe> {
-  let mut probes = Vec::new();
-  for function in PJDFSTEST_FUNCTIONS {
-    // autoconf's `AC_CHECK_FUNC` shape: declare and *call* the function, so the link decides (comparing
-    // its address with zero is folded by clang without ever linking the symbol). The `__stub_` guard is
-    // autoconf's too and is load-bearing on Linux: glibc provides a *linkable* stub for some functions it
-    // does not implement — `chflags` among them — that always fails `ENOSYS`, so a bare link test is a
-    // false positive. glibc marks such a stub with `__stub_<name>` (or `__stub___<name>`) in
-    // `<gnu/stubs.h>`, which `<limits.h>` pulls in; rejecting the probe when that macro is defined is
-    // exactly what real `AC_CHECK_FUNC` does. Without it, `HAVE_CHFLAGS` was defined on Linux and
-    // pjdfstest's `st_flags` block (guarded by it) failed to compile against a `struct stat` that has no
-    // `st_flags` member. On macOS (real `chflags`, no stub) the guard passes and the function is detected.
-    probes.push(ConfigProbe {
-      source: format!(
-        "#include <limits.h>\n\
-         char {function}(void);\n\
-         #if defined __stub_{function} || defined __stub___{function}\n\
-         #error stub\n\
-         #endif\n\
-         int main(void) {{ return {function}(); }}\n"
-      ),
-      compile_only: false,
-      define: format!("#define HAVE_{} 1\n", function.to_uppercase()),
-    });
-  }
-  for (header, macro_name) in PJDFSTEST_HEADERS {
-    probes.push(ConfigProbe {
-      source: format!("#include <{header}>\nint main(void) {{ return 0; }}\n"),
-      compile_only: true,
-      define: format!("#define {macro_name} 1\n"),
-    });
-  }
-  for (member, macro_name) in PJDFSTEST_STAT_MEMBERS {
-    probes.push(ConfigProbe {
-      source: format!(
-        "{SYSTEM_EXTENSIONS}#include <sys/types.h>\n#include <sys/stat.h>\nint main(void) {{ struct stat s; (void)s.{member}; return 0; }}\n"
-      ),
-      compile_only: true,
-      define: format!("#define {macro_name} 1\n"),
-    });
-  }
-  probes
-}
-
-/// Format: the head of the harness's `config.h`: its origin, then what `AC_USE_SYSTEM_EXTENSIONS` defines.
-pub(crate) fn pjdfstest_config_head() -> String {
-  format!(
-    "/* slates conformance harness: configure.ac's checks, probed by cc */\n{SYSTEM_EXTENSIONS}"
-  )
-}
-
 /// The `config.h` `configure` would write on this host, from the harness's own probes.
 fn pjdfstest_config_h(dir: &Path) -> Result<String, Failure> {
-  let mut config = pjdfstest_config_head();
-  for probe_case in pjdfstest_probes() {
+  let mut config = slates_conformance::pjdfstest::config_head();
+  for probe_case in slates_conformance::pjdfstest::probes() {
     if probe(dir, &probe_case.source, probe_case.compile_only)? {
       config.push_str(&probe_case.define);
     }
@@ -470,6 +362,7 @@ mod guest_tests {
       &FSSTRESS_GLOBAL_H,
       &FSSTRESS_XFSCOMPAT_H,
       &FSSTRESS_TST_COMMON_H,
+      &PJDFSTEST_TARBALL,
     ] {
       assert!(
         script.contains(&format!("fetch {} {} {}", pin.name, pin.url, pin.sha256)),
@@ -484,6 +377,10 @@ mod guest_tests {
     assert!(script.contains(&format!(
       "cc {fsstress_flags} -o /usr/local/bin/fsstress fsstress.c"
     )));
+    assert!(
+      script.contains(&format!("/guest/pjdfstest-{PJDFSTEST_COMMIT}")),
+      "the pinned pjdfstest tree is unpacked where the guest reads it"
+    );
     for line in fsstress_config_h(HostOs::Linux).lines() {
       let in_script = line.replace('\'', "'\"'\"'");
       assert!(
