@@ -17,7 +17,9 @@ use proptest::prelude::*;
 use slates_vfs::ids::InodeNo;
 
 mod common;
+
 use common::{store, volume};
+use slates_vfs::ids::RefOwner;
 
 /// The fixed set of files and attachments the history plays over — small, so a generated sequence
 /// densely exercises the reference interactions between them rather than spreading thin.
@@ -88,7 +90,7 @@ proptest! {
     for op in ops {
       match op {
         Op::Reference { file, att } => {
-          let result = vol.reference_for(&store, inodes[file], att);
+          let result = vol.reference_for(&store, inodes[file], RefOwner::Process(att));
           if model.alive(file) {
             prop_assert!(result.is_ok(), "a reference of a live inode must succeed");
             *model.refs.entry((att, file)).or_insert(0) += 1;
@@ -99,13 +101,13 @@ proptest! {
         Op::Forget { file, att, n } => {
           // A forget is always accepted (a drop of more than held, or of nothing, is a no-op); it
           // removes at most this attachment's own share.
-          vol.forget_for(&mut store, inodes[file], att, n).unwrap();
+          vol.forget_for(&mut store, inodes[file], RefOwner::Process(att), n).unwrap();
           let held = model.refs.entry((att, file)).or_insert(0);
           let drop = u32::try_from(n).unwrap_or(u32::MAX).min(*held);
           *held -= drop;
         }
         Op::Sweep { att } => {
-          vol.sweep_attachment(&mut store, att).unwrap();
+          vol.sweep_attachment(&mut store, RefOwner::Process(att)).unwrap();
           for file in 0..FILES {
             model.refs.remove(&(att, file));
           }

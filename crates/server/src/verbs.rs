@@ -6620,6 +6620,9 @@ pub struct Rebuilt {
   /// process held; a destroy completing after the last publish, or a clone's record never
   /// committing, leaves them ahead of the catalog).
   pub pins_reconciled: usize,
+  /// Unlinked-but-open files whose every holder died with the process, reclaimed as their volume's references
+  /// were settled (A-61).
+  pub orphans_reclaimed: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
@@ -6712,6 +6715,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     let (snapshots, attachments) = reconcile_lost(state, record);
     rebuilt.snapshots_dropped += snapshots;
     rebuilt.attachments_dropped += attachments;
+    rebuilt.orphans_reclaimed += settle_references(state, record);
   }
   // Hand out prefixes past every recovered one, so a new volume never collides with a recovered
   // volume's inode numbers (the prefixes came from the images, not from `next_prefix`).
@@ -7383,6 +7387,34 @@ fn recovered_snapshot(
   };
   slot.volume.snapshot_info(vfs_id).is_ok()
 }
+
+/// Settles a rebuilt volume's references once its attachments are reconciled (A-61): a recorded attachment whose
+/// record survived keeps the references its kernel holds (a FUSE mount the anchor held), every other holder's are
+/// released, and an unlinked-but-open file left with no holder is reclaimed. Returns the files reclaimed. A volume
+/// that cannot be settled is counted and keeps what it has: its references are released at each attachment's
+/// teardown instead.
+fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
+  let Some(handle) = state.by_id.get(&record.id).copied() else {
+    return 0;
+  };
+  let partition = state.db.partition();
+  let Ok(slot) = state.volumes.get_mut(handle) else {
+    return 0;
+  };
+  match slot
+    .volume
+    .settle_recovered_references(&mut state.store, |id| partition.attachment(id).is_some())
+  {
+    Ok((_, reclaimed)) => reclaimed,
+    Err(_) => {
+      *state.refusals.entry(REFERENCES_UNSETTLED).or_insert(0) += 1;
+      0
+    }
+  }
+}
+
+/// Format: the refusal counter of a volume whose recovered references could not be settled.
+const REFERENCES_UNSETTLED: &str = "recovery.references_unsettled";
 
 /// Reconciles the catalog with what recovery could honour, each change a recorded operation so
 /// replay agrees (§4.8): a **local** (unplaced) snapshot the volume's recovery image did not carry

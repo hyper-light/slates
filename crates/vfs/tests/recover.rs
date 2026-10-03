@@ -1563,3 +1563,132 @@ fn a_file_with_a_middle_hole_images_as_two_runs() {
     "the middle hole reads as zeros"
   );
 }
+
+/// A-61 (AC-3.4: a FUSE mount the anchor held keeps its kernel's references across a restart). Do: in one
+/// volume, a recorded attachment (42) references a linked file and an unlinked-but-open one; a second recorded
+/// attachment (99) and an owner this process alone knows (7) each hold another orphan; rebuild the volume from
+/// its image and settle it with only 42 surviving. Expect: the image carries the recorded attachments' references
+/// and not the process's; the settle releases 99's and the process's share and reclaims their two orphans, keeps
+/// 42's orphan readable, and 42's own forget then reclaims it — no orphan leaks and none is lost early.
+#[test]
+fn a_surviving_attachments_references_are_restored_and_every_other_holders_released() {
+  use slates_vfs::ids::RefOwner;
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let make = |vol: &mut Volume, src: &mut slates_vfs::volume::Store, name: &str| {
+    let no = vol.create_file_no(src, root, name, 0o644).unwrap();
+    vol.write(src, no, 0, name.as_bytes()).unwrap();
+    no
+  };
+  let linked = make(&mut vol, &mut src, "linked");
+  let kept = make(&mut vol, &mut src, "kept");
+  let dropped = make(&mut vol, &mut src, "dropped");
+  let local = make(&mut vol, &mut src, "local");
+  vol
+    .reference_for(&src, linked, RefOwner::Attachment(42))
+    .unwrap();
+  vol
+    .reference_for(&src, kept, RefOwner::Attachment(42))
+    .unwrap();
+  vol
+    .reference_for(&src, dropped, RefOwner::Attachment(99))
+    .unwrap();
+  vol
+    .reference_for(&src, local, RefOwner::Process(7))
+    .unwrap();
+  for name in ["kept", "dropped", "local"] {
+    vol.unlink_no(&mut src, root, name).unwrap();
+  }
+  let image = vol.to_image(&src, None).unwrap();
+  let carried: Vec<u64> = image
+    .references
+    .iter()
+    .map(|owner| owner.attachment)
+    .collect();
+  assert_eq!(
+    carried,
+    [42, 99],
+    "the recorded attachments' references, never the process's"
+  );
+  let mut fresh = common::store();
+  let mut recovered = Volume::from_image(
+    &mut fresh,
+    &image,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  let settled = recovered
+    .settle_recovered_references(&mut fresh, |id| id == 42)
+    .unwrap();
+  assert_eq!(
+    settled,
+    (1, 2),
+    "99 swept; the orphans 99 and the process held reclaimed"
+  );
+  let mut buf = [0u8; 16];
+  let readable = |vol: &Volume, store: &slates_vfs::volume::Store, no| {
+    vol.read(store, no, 0, &mut [0u8; 16]).is_ok()
+  };
+  assert!(
+    readable(&recovered, &fresh, kept),
+    "42's orphan is still held"
+  );
+  assert!(
+    !readable(&recovered, &fresh, dropped),
+    "99 did not survive: its orphan is reclaimed"
+  );
+  assert!(
+    !readable(&recovered, &fresh, local),
+    "the process's orphan died with it"
+  );
+  let n = recovered.read(&fresh, linked, 0, &mut buf).unwrap();
+  assert_eq!(buf.get(..n), Some(&b"linked"[..]));
+  recovered
+    .forget_for(&mut fresh, kept, RefOwner::Attachment(42), u64::MAX)
+    .unwrap();
+  assert!(
+    !readable(&recovered, &fresh, kept),
+    "42's forget reclaims its orphan"
+  );
+}
+
+/// A-61, hostile input. Do: rebuild from an image whose recorded references name an inode the image lacks, and
+/// from one recording a zero count. Expect: both refused `RecoveryIncomplete`, never a volume with a reference
+/// to nothing or an entry no forget can drop.
+#[test]
+fn an_image_with_a_corrupt_reference_record_is_refused() {
+  use slates_vfs::recover::{AttachmentReferences, InodeReferences};
+  let mut src = store();
+  let mut vol = volume(&mut src, 1 << 30);
+  let root = vol.root_inode(&src).unwrap();
+  let f = vol.create_file_no(&mut src, root, "f", 0o644).unwrap();
+  let image = vol.to_image(&src, None).unwrap();
+  let corrupt = |inode: u64, count: u32| {
+    let mut image = image.clone();
+    image.references = vec![AttachmentReferences {
+      attachment: 1,
+      inodes: vec![InodeReferences { inode, count }],
+    }];
+    image
+  };
+  for (inode, count, what) in [
+    (f.0 + 1_000, 1, "an absent inode"),
+    (f.0, 0, "a zero count"),
+  ] {
+    let mut fresh = common::store();
+    let rebuilt = Volume::from_image(
+      &mut fresh,
+      &corrupt(inode, count),
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+      None,
+    );
+    assert!(
+      matches!(rebuilt, Err(VfsError::RecoveryIncomplete)),
+      "{what} must be refused"
+    );
+  }
+}

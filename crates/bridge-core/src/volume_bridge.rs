@@ -27,7 +27,7 @@ use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::{Handle, MemError, Slab};
 use slates_vfs::error::VfsError;
 use slates_vfs::host::HostFs;
-use slates_vfs::ids::InodeNo;
+use slates_vfs::ids::{InodeNo, RefOwner};
 use slates_vfs::inode::Kind;
 
 /// Format: the set-group-ID mode bit (`<sys/stat.h>` `S_ISGID`): on a directory, what is created in it takes
@@ -284,7 +284,7 @@ impl<'v> VolumeBridge<'v> {
   /// Assigns a handle naming `inode`, or a typed refusal (`MemError::SlabFull`) once the bridge
   /// already holds [`MAX_OPEN_HANDLES`] (audit BUG-4). The wire handle packs the slot and its
   /// generation.
-  fn open_handle(&mut self, inode: u64, attachment: u64) -> Result<u64, VfsError> {
+  fn open_handle(&mut self, inode: u64, attachment: RefOwner) -> Result<u64, VfsError> {
     // An open takes an open reference on the inode (dropped by release), attributed to the opening
     // attachment so a teardown sweep releases it. Reference first; undo it if the slot cannot be
     // allocated, so the count never leaks (the lifecycle rule).
@@ -546,12 +546,10 @@ impl Bridge for VolumeBridge<'_> {
         .with_host(host)
         .open_base(self.store, InodeNo(object.inode))?;
     }
-    let handle = self.open_handle(object.inode, cx.attachment.key())?;
+    let handle = self.open_handle(object.inode, cx.owner)?;
     // The open pins the file it opened: a base file replaced on the disk meanwhile keeps serving this
     // handle what it opened (POSIX), released at `release` or the attachment's teardown sweep.
-    self
-      .volume
-      .open_for(InodeNo(object.inode), cx.attachment.key());
+    self.volume.open_for(InodeNo(object.inode), cx.owner);
     Ok(handle)
   }
 
@@ -682,7 +680,7 @@ impl Bridge for VolumeBridge<'_> {
     if self.volume.kind(self.store, InodeNo(object.inode))? != Kind::Dir {
       return Err(VfsError::NotDirectory);
     }
-    self.open_handle(object.inode, cx.attachment.key())
+    self.open_handle(object.inode, cx.owner)
   }
 
   fn readdir(
@@ -777,7 +775,7 @@ impl Bridge for VolumeBridge<'_> {
     // A create takes only an open reference (dropped by release); it does not implicitly take a
     // lookup reference — a transport that owns lookup references (FUSE) takes one through
     // `reference`, NFS takes none (§3). `open_handle` references then allocates, undoing on failure.
-    let fh = self.open_handle(no.0, cx.attachment.key())?;
+    let fh = self.open_handle(no.0, cx.owner)?;
     Ok((entry, fh))
   }
 
@@ -787,10 +785,10 @@ impl Bridge for VolumeBridge<'_> {
     // for reuse. An unknown or already-freed handle is a no-op (the kernel may release one the
     // bridge already dropped).
     if let Ok(inode) = self.handles.get(unpack_handle(fh)).copied() {
-      self.volume.close_for(InodeNo(inode), cx.attachment.key());
+      self.volume.close_for(InodeNo(inode), cx.owner);
       let _ = self
         .volume
-        .forget_for(self.store, InodeNo(inode), cx.attachment.key(), 1);
+        .forget_for(self.store, InodeNo(inode), cx.owner, 1);
     }
     let _ = self.handles.remove(unpack_handle(fh));
     Ok(())
@@ -803,7 +801,7 @@ impl Bridge for VolumeBridge<'_> {
     // references keeps its content and table entry across an unlink until the last reference drops.
     self
       .volume
-      .reference_for(self.store, InodeNo(object.inode), cx.attachment.key())
+      .reference_for(self.store, InodeNo(object.inode), cx.owner)
   }
 
   fn forget(&mut self, object: ObjectId, cx: &OpContext, nlookup: u64) {
@@ -814,12 +812,9 @@ impl Bridge for VolumeBridge<'_> {
     if cx.volume != self.volume_id {
       return;
     }
-    let _ = self.volume.forget_for(
-      self.store,
-      InodeNo(object.inode),
-      cx.attachment.key(),
-      nlookup,
-    );
+    let _ = self
+      .volume
+      .forget_for(self.store, InodeNo(object.inode), cx.owner, nlookup);
   }
 
   fn sweep_attachment(&mut self, cx: &OpContext) -> Result<(), VfsError> {
@@ -828,9 +823,7 @@ impl Bridge for VolumeBridge<'_> {
     // that reach zero references and no links (§3 the teardown sweep; a FUSE unmount discards a
     // whole mount's lookup references without a per-inode FORGET). Idempotent: a second sweep of a
     // drained attachment releases nothing.
-    self
-      .volume
-      .sweep_attachment(self.store, cx.attachment.key())
+    self.volume.sweep_attachment(self.store, cx.owner)
   }
 
   fn within(&mut self, object: ObjectId, scope: u64, cx: &OpContext) -> Result<bool, VfsError> {

@@ -19,8 +19,10 @@
 //! orphans. An overlay also retains source-directory identities, witnesses, whiteouts, redirects
 //! and private windows. Recovery reopens source components without following links and verifies
 //! their full fingerprints before restoring lazy reads; a changed or absent source refuses.
-//! Directory caches start invalid so external edits are rechecked. Restoring open client handles
-//! through anchor handoff remains a separate §4.8 gate.
+//! Directory caches start invalid so external edits are rechecked. Every recorded attachment's references
+//! (version 10, A-61) are carried too: the owner settles them after recovery, giving them back to the attachments
+//! whose records survived (a FUSE mount the anchor held) and releasing every other holder's, so an orphan whose
+//! holders all died with the process is reclaimed rather than kept forever.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::Discriminant;
@@ -53,10 +55,29 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// home, whiteout and redirect tables with every version a snapshot still reads; 8 (AUD-29-59, 2026-09-30)
 /// the shard's held replicas, so a content acknowledgement survives a warm restart; 9 (AUD-29-55,
 /// 2026-10-01) the held replicas' transfers in progress (stages), so a cut transfer resumes from its
-/// verified chunks after a warm restart.
+/// verified chunks after a warm restart; 10 (A-61, 2026-10-03) every recorded attachment's references, so a
+/// FUSE mount the anchor held gets its kernel's references back after a restart.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 9;
+const IMAGE_VERSION: u16 = 10;
+
+/// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct AttachmentReferences {
+  /// The attachment's durable id.
+  pub attachment: u64,
+  /// Its references, by inode number, in number order.
+  pub inodes: Vec<InodeReferences>,
+}
+
+/// One inode's references held by one attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct InodeReferences {
+  /// The inode number.
+  pub inode: u64,
+  /// The references held.
+  pub count: u32,
+}
 
 /// The name-equivalence policy in an image (§4.4 [`NameEquivalence`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
@@ -362,6 +383,9 @@ pub struct VolumeImage {
   pub orphans: Vec<u64>,
   /// Source identities and the complete durable overlay plane.
   pub base: Option<crate::base::BaseImage>,
+  /// Every recorded attachment's references, in attachment order (A-61): given back after a restart to the
+  /// attachments that survive it, and released for the rest ([`Volume::settle_recovered_references`]).
+  pub references: Vec<AttachmentReferences>,
 }
 
 /// One volume's image under the routing key its owner (the server) files it by — the volume id's
@@ -803,6 +827,17 @@ impl Volume {
       snapshots,
       orphans: self.orphans.keys().map(|no| no.0).collect(),
       base,
+      references: self
+        .attachment_references()
+        .into_iter()
+        .map(|(attachment, inodes)| AttachmentReferences {
+          attachment,
+          inodes: inodes
+            .into_iter()
+            .map(|(no, count)| InodeReferences { inode: no.0, count })
+            .collect(),
+        })
+        .collect(),
     })
   }
 
@@ -1291,6 +1326,16 @@ impl Volume {
       // Restore the orphan tracking (§4.8): the inodes are already rebuilt with the rest, and marking
       // them orphans again means a reacquired handle's last close reclaims them rather than leaking.
       vol.orphans = image.orphans.iter().map(|no| (InodeNo(*no), 0)).collect();
+      // And every recorded attachment's references (A-61): the owner then settles them, giving them back to the
+      // attachments that survived and releasing the rest. A reference to an inode the image lacks is a corrupt
+      // image, refused.
+      for owner in &image.references {
+        for held in &owner.inodes {
+          vol
+            .restore_references(store, owner.attachment, InodeNo(held.inode), held.count)
+            .map_err(|_| VfsError::RecoveryIncomplete)?;
+        }
+      }
       // Re-establish the retention the rebuilt deadlists and orphans hold against the shard budgets
       // (§4.2 accounting through recovery); a shard that cannot back what was admitted before the
       // restart refuses, and the half-built volume returns its slots and blocks rather than leaking.

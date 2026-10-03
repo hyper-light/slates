@@ -16,6 +16,22 @@ impl Epoch {
   }
 }
 
+/// Who holds a share of an inode's references and opens (§4.8 attachments; A-61). The volume attributes every
+/// transport reference to an owner, so a teardown releases exactly that owner's share.
+///
+/// An owner is either a recorded attachment, by its durable §4.8 id — its references are carried in the
+/// recovery image and given back to it after a daemon restart, since its kernel (a FUSE mount the anchor held)
+/// still holds them — or an owner this process alone knows (a test harness, a host without a record), whose
+/// references die with the process. Two kinds, not one number, so a process-local key can never be taken for
+/// a durable id it happens to equal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RefOwner {
+  /// An owner known to this process only.
+  Process(u64),
+  /// A recorded attachment, by its durable id.
+  Attachment(u64),
+}
+
 /// An inode number: `(volume prefix, monotonic counter)`; never reused within a volume, and kept
 /// by an entry for the volume's lifetime, through snapshots, clones and re-opens (AC-1.6).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

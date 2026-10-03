@@ -14,6 +14,7 @@ use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::{Handle, Slab};
 
 use crate::VfsError;
+use slates_vfs::ids::RefOwner;
 
 /// Shape: the bound on concurrently live attachments per owner — more than any realistic number of
 /// mounts and exports at once, few enough that the registry is a small table; a runaway is a typed
@@ -95,6 +96,11 @@ struct Attachment {
   /// Requests admitted and not yet ended ([`Attachments::begin`]/[`Attachments::end`]). A barrier
   /// cannot close a generation while one is outstanding.
   in_flight: u32,
+  /// The durable §4.8 id of the attachment record this registry entry serves, when the owner set one
+  /// ([`Attachments::set_owner`]): the volume then attributes this attachment's references to that id, so they
+  /// are carried in the recovery image and given back after a restart (A-61). `None` for an entry with no
+  /// record (a harness, a host without a catalog), whose references are this process's alone.
+  durable: Option<u64>,
 }
 
 /// How a transport keeps its kernel's cache of names, attributes and pages coherent with the volume (§4.6;
@@ -130,8 +136,8 @@ impl AttachmentId {
   /// A stable per-process key for this attachment: its slab index and generation packed into one
   /// word. The volume core attributes references to an attachment by this opaque `u64`
   /// ([`crate::VfsError`]-free), so a teardown sweep releases exactly this attachment's references.
-  /// It is process-local, not the durable §4.8 attachment id; reconciling the two is owed with the
-  /// server wiring.
+  /// It is process-local, not the durable §4.8 attachment id: the volume attributes references to
+  /// [`OpContext::owner`], which is the durable id when the owner named one ([`Attachments::set_owner`]).
   pub fn key(self) -> u64 {
     (u64::from(self.0.index()) << u32::BITS) | u64::from(self.0.generation())
   }
@@ -144,6 +150,9 @@ impl AttachmentId {
 pub struct OpContext {
   /// The attachment this context was built from (for the request-lifetime pin).
   pub attachment: AttachmentId,
+  /// Who the volume attributes this attachment's references and opens to: its durable record, or this process
+  /// alone ([`RefOwner`]; A-61).
+  pub owner: RefOwner,
   /// How the transport serving the attachment keeps its kernel's cache coherent (§4.6; AUD-29-79).
   pub coherence: CacheCoherence,
   /// The volume the attachment binds; an object addressed under this context must belong to it.
@@ -224,8 +233,17 @@ impl Attachments {
       state: AttachmentState::Live,
       generation: FIRST_GENERATION,
       in_flight: 0,
+      durable: None,
     })?;
     Ok(AttachmentId(handle))
+  }
+
+  /// Names the durable §4.8 attachment record `id` serves (A-61): its references are then the record's, carried
+  /// in the recovery image, rather than this process's alone. An unknown `id` changes nothing.
+  pub fn set_owner(&mut self, id: AttachmentId, durable: u64) {
+    if let Ok(attachment) = self.registry.get_mut(id.0) {
+      attachment.durable = Some(durable);
+    }
   }
 
   /// Declares how the transport serving `id` keeps its kernel's cache coherent: an attachment is admitted
@@ -335,6 +353,9 @@ impl Attachments {
     }
     Ok(OpContext {
       attachment: id,
+      owner: attachment
+        .durable
+        .map_or(RefOwner::Process(id.key()), RefOwner::Attachment),
       coherence: attachment.coherence,
       volume: attachment.volume,
       view: attachment.view,

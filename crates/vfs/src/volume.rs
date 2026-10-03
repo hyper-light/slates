@@ -21,7 +21,7 @@ use crate::content::{ChunkStore, Extent, ExtentSrc, OpenExtent, inline_bytes};
 use crate::dir::{BaseDirState, Child, DirNode};
 use crate::dirtree::{DirBlock, Retired};
 use crate::error::VfsError;
-use crate::ids::{Epoch, InodeNo, SnapshotId};
+use crate::ids::{Epoch, InodeNo, RefOwner, SnapshotId};
 use crate::inode::{Attrs, Body, Home, Inode, Kind};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
@@ -271,10 +271,10 @@ pub struct Volume {
   /// another attachment still holds (§3 of the inode-addressed-io design, "releasable per
   /// attachment"). Bounded by (attachments × referenced inodes); empty for a volume no one holds
   /// open.
-  pub(crate) attachment_refs: BTreeMap<u64, BTreeMap<InodeNo, u32>>,
+  pub(crate) attachment_refs: BTreeMap<RefOwner, BTreeMap<InodeNo, u32>>,
   /// Per attachment, the open handles it holds per inode ([`Volume::open_for`]) — a subset of its
   /// references (an open also takes one), kept so a teardown sweep releases its opens with them.
-  pub(crate) attachment_opens: BTreeMap<u64, BTreeMap<InodeNo, u32>>,
+  pub(crate) attachment_opens: BTreeMap<RefOwner, BTreeMap<InodeNo, u32>>,
   /// The open handles per inode, over every attachment: an open base file keeps the file it opened when
   /// the disk's name comes to name another file ([`Volume::is_open`]; POSIX open-file semantics).
   pub(crate) opens: BTreeMap<InodeNo, u32>,
@@ -4338,7 +4338,7 @@ impl Volume {
     &mut self,
     store: &Store,
     no: InodeNo,
-    attachment: u64,
+    attachment: RefOwner,
   ) -> Result<(), VfsError> {
     // The global reference validates the inode exists and checks its own arithmetic (refusing at
     // the `u32` ceiling); take it first, so a refusal leaves the ledger untouched.
@@ -4364,7 +4364,7 @@ impl Volume {
     &mut self,
     store: &mut Store,
     no: InodeNo,
-    attachment: u64,
+    attachment: RefOwner,
     n: u64,
   ) -> Result<(), VfsError> {
     // How many this attachment actually holds bounds how many it may forget, so it can never drop
@@ -4389,7 +4389,11 @@ impl Volume {
   /// attachment's references are released here without a per-inode `FORGET`, which FUSE does not
   /// guarantee at unmount (§3). The batch is bounded by the owner's referenced inodes; the
   /// cooperative slicing of a very large sweep is owed (like the other bounded-work sites).
-  pub fn sweep_attachment(&mut self, store: &mut Store, attachment: u64) -> Result<(), VfsError> {
+  pub fn sweep_attachment(
+    &mut self,
+    store: &mut Store,
+    attachment: RefOwner,
+  ) -> Result<(), VfsError> {
     for (no, count) in self
       .attachment_opens
       .remove(&attachment)
@@ -4409,10 +4413,90 @@ impl Volume {
     Ok(())
   }
 
+  /// Each recorded attachment holding references, with its share by inode, in owner and inode order: what the
+  /// recovery image carries, so a surviving attachment's kernel references are given back to it after a restart
+  /// (A-61). An owner this process alone knows is left out: its references die with the process.
+  pub(crate) fn attachment_references(&self) -> Vec<(u64, Vec<(InodeNo, u32)>)> {
+    self
+      .attachment_refs
+      .iter()
+      .filter_map(|(owner, inodes)| match owner {
+        RefOwner::Attachment(id) => Some((
+          *id,
+          inodes.iter().map(|(no, count)| (*no, *count)).collect(),
+        )),
+        RefOwner::Process(_) => None,
+      })
+      .collect()
+  }
+
+  /// Settles references after a recovery (A-61): every recorded attachment whose record did not survive
+  /// (`survives` answers false for its id) gives its share back, and every orphan then left with no reference is
+  /// reclaimed — its last holder died with the process. Returns the owners swept and the orphans reclaimed.
+  pub fn settle_recovered_references(
+    &mut self,
+    store: &mut Store,
+    survives: impl Fn(u64) -> bool,
+  ) -> Result<(usize, usize), VfsError> {
+    let gone: Vec<RefOwner> = self
+      .attachment_refs
+      .keys()
+      .filter(|owner| match owner {
+        RefOwner::Attachment(id) => !survives(*id),
+        RefOwner::Process(_) => true,
+      })
+      .copied()
+      .collect();
+    let orphans_before = self.orphans.len();
+    for owner in &gone {
+      self.sweep_attachment(store, *owner)?;
+    }
+    let unheld: Vec<InodeNo> = self
+      .orphans
+      .keys()
+      .filter(|no| !self.references.contains_key(no))
+      .copied()
+      .collect();
+    for no in &unheld {
+      self.unreference_n(store, *no, 0)?;
+    }
+    Ok((
+      gone.len(),
+      orphans_before.saturating_sub(self.orphans.len()),
+    ))
+  }
+
+  /// Gives a recovered attachment its references back (A-61): `count` references of `owner` on inode `no`, in its
+  /// share and in the global count, as the recovery image recorded them. The inode must exist, and the count be
+  /// at least one — an image records only held references, so a zero is a corrupt image, refused (it would leave
+  /// an entry no forget can drop, pinning an orphan until the owner's teardown).
+  pub(crate) fn restore_references(
+    &mut self,
+    store: &Store,
+    owner: u64,
+    no: InodeNo,
+    count: u32,
+  ) -> Result<(), VfsError> {
+    if count == 0 {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    self.namespace_inode(store, no)?;
+    let global = self.references.entry(no).or_insert(0);
+    *global = global.checked_add(count).ok_or(VfsError::TooManyLinks)?;
+    let owned = self
+      .attachment_refs
+      .entry(RefOwner::Attachment(owner))
+      .or_default()
+      .entry(no)
+      .or_insert(0);
+    *owned = owned.saturating_add(count);
+    Ok(())
+  }
+
   /// Records an open handle of `attachment` on inode `no` (the transport's open, which also took a
   /// reference): while any handle is open, a base file keeps serving the file it opened when the disk's
   /// name is replaced by another ([`Volume::is_open`]). Bounded by the transport's handle table.
-  pub fn open_for(&mut self, no: InodeNo, attachment: u64) {
+  pub fn open_for(&mut self, no: InodeNo, attachment: RefOwner) {
     let owned = self
       .attachment_opens
       .entry(attachment)
@@ -4426,7 +4510,7 @@ impl Volume {
 
   /// Releases one open handle of `attachment` on inode `no` ([`Volume::open_for`]); an unknown one is a
   /// no-op (a transport may release a handle it already dropped).
-  pub fn close_for(&mut self, no: InodeNo, attachment: u64) {
+  pub fn close_for(&mut self, no: InodeNo, attachment: RefOwner) {
     let Some(inodes) = self.attachment_opens.get_mut(&attachment) else {
       return;
     };
@@ -4460,7 +4544,7 @@ impl Volume {
 
   /// Debits `drop` from `attachment`'s ledger entry for inode `no`, removing the entry at zero and
   /// the owner's map when it empties, so the ledger holds only live attributions.
-  fn debit_attachment(&mut self, attachment: u64, no: InodeNo, drop: u32) {
+  fn debit_attachment(&mut self, attachment: RefOwner, no: InodeNo, drop: u32) {
     if let Some(inodes) = self.attachment_refs.get_mut(&attachment) {
       if let Some(count) = inodes.get_mut(&no) {
         *count = count.saturating_sub(drop);

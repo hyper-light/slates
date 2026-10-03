@@ -2165,6 +2165,11 @@ before the report is published, so a tool never reads attributes newer than the 
 > device and its session, then exits; the restarted daemon inherits that same device and reads what the first
 > one left in it (`crates/anchor/tests/anchor.rs`). The daemon's half, holding and taking over, and the exact
 > replay are next. Until they land, recovery still ends a FUSE mount.
+> References now survive a restart for an attachment that has a record (step 3a/3b): the volume attributes them
+> to a typed owner (`RefOwner`), the recovery image (version 10) carries a recorded attachment's references, and
+> recovery settles them. A surviving record keeps its references; every other holder's are released, and an
+> orphan left with no holder is reclaimed. Until this change such an orphan was never reclaimed
+> (`docs/bugs/2026-10-03-a-recovered-orphan-whose-holder-died-was-never-reclaimed.md`).
 
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;
@@ -8214,10 +8219,17 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     answered under that unique. A record without a device, or whose kernel cannot resend (Linux before
     6.9), is ended as before, refused by name. A held device with no record is closed.
   - **What the kernel kept.** Reads and writes name the node, not the handle, so they need nothing restored.
+    The kernel's lookup references are the volume's references attributed to the attachment's durable record
+    (`RefOwner::Attachment`), carried in the recovery image (version 10) and given back at recovery, with
+    every other holder's released. A node the kernel looked up after the last publication before the crash is
+    named again on its next use. If it is unlinked to no links after the restart before the kernel uses it
+    again, it is reclaimed, and the kernel's next use is answered `ESTALE`: the stated limit of a handoff that
+    does not publish on every lookup.
     A handle the restarted daemon never issued is released as a no-op. A file unlinked while open survives in
     the recovery image's orphan tracking; the restored mount takes one reference on each recovered orphan,
     dropped at the kernel's FORGET of the node, which the kernel sends only once every open of it has closed,
-    or at the mount's teardown sweep.
+    or at the mount's teardown sweep. (Superseded in the same change by the carried references above, which
+    give each orphan its exact holders back instead of a conservative one.)
   - **The one request applied but never answered.** A mount serves one request at a time, and a request that
     changes what survives publishes the recovery image before its reply. So a crash leaves at most one
     request per mount applied but unanswered. Its reply is published with its effect, and a resent request
