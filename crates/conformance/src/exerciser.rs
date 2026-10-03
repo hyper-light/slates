@@ -30,6 +30,21 @@ pub fn tail(output: &str) -> String {
   detail(&lines[start..].join("\n"))
 }
 
+/// Shape: fsx's operation count — enough to exercise every operation class many times (fsx picks among
+/// read/write/mapread/mapwrite/truncate uniformly) inside a minute over loopback. Every leg runs fsx under
+/// these bounds: the harness's and the live guest's (`crates/server/tests/virtiofs.rs`).
+pub const FSX_OPERATIONS: u64 = 10_000;
+/// Shape: fsx's seed (its own default is 1; recorded so a run is reproducible).
+pub const FSX_SEED: u64 = 1;
+/// Shape: fsx's file-length bound, its own default (`-l`, 262144 bytes).
+pub const FSX_FILE_LENGTH: u64 = 262_144;
+/// Shape: fsstress's operations per process.
+pub const FSSTRESS_OPERATIONS: u64 = 500;
+/// Shape: fsstress's process count — several writers racing in one tree.
+pub const FSSTRESS_PROCESSES: u32 = 4;
+/// Shape: fsstress's seed.
+pub const FSSTRESS_SEED: u64 = 1;
+
 /// fsx passed when it exited 0 and printed its success line.
 pub fn judge_fsx(exit_success: bool, output: &str) -> ExerciserVerdict {
   ExerciserVerdict {

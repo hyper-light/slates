@@ -48,19 +48,11 @@ use crate::Failure;
 
 // The roster's bounds are the conformance crate's, shared with every leg that runs it (the live guest's too).
 use slates_conformance::workload::{SQLITE_BUSY_MS, WATCH_SECONDS};
-/// Shape: fsx's default operation count — enough to exercise every operation class many times
-/// (fsx picks among read/write/mapread/mapwrite/truncate uniformly) inside a minute over loopback.
-const FSX_OPERATIONS: u64 = 10_000;
-/// Shape: fsx's default seed (its own default is 1; recorded so a run is reproducible).
-const FSX_SEED: u64 = 1;
-/// Shape: fsx's default file-length bound, its own default (`-l`, 262144 bytes).
-const FSX_FILE_LENGTH: u64 = 262_144;
-/// Shape: fsstress's default operations per process.
-const FSSTRESS_OPERATIONS: u64 = 500;
-/// Shape: fsstress's default process count — several writers racing in one tree.
-const FSSTRESS_PROCESSES: u32 = 4;
-/// Shape: fsstress's default seed.
-const FSSTRESS_SEED: u64 = 1;
+// The exercisers' bounds are the conformance crate's too, so the live guest runs fsx and fsstress under the
+// very values this harness does.
+use slates_conformance::exerciser::{
+  FSSTRESS_OPERATIONS, FSSTRESS_PROCESSES, FSSTRESS_SEED, FSX_FILE_LENGTH, FSX_OPERATIONS, FSX_SEED,
+};
 /// Shape: the bounded size of the volume a suite runs in — room for fsstress's tree, a cargo
 /// target directory and pjdfstest's scratch, well under a CI runner's RAM.
 const VOLUME_SIZE: &str = "512MiB";

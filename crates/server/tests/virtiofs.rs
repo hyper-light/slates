@@ -2047,6 +2047,153 @@ fn guest_runs(console: &str) -> GuestRuns {
   parsed
 }
 
+/// Shape: how long the exerciser guest may run — the boot, then fsx and fsstress under the harness's bounds — under
+/// software emulation; the workload guest's bound, which this run is far shorter than (measured below).
+#[cfg(target_os = "linux")]
+const EXERCISER_RUN: Duration = WORKLOAD_RUN;
+
+/// The guest's exerciser script (AC-9.7, AUD-29-78: the guest's fsx and fsstress legs), run inside the host
+/// container's root with the slates tag at `/mnt` and a RAM `/tmp`: fsx and fsstress over the tag under the very
+/// bounds the harness runs them with (`slates_conformance::exerciser`), each run's exit code and output printed
+/// between markers. fsx keeps its `.fsxlog`/`.fsxgood` files in the guest's RAM (`-P`), as the harness keeps
+/// them outside the mount. fsstress's `-v` log is counted in the guest and only its tail printed: its 2,000 lines
+/// over the emulated serial console outran the guest's whole bound (measured 2026-10-03, cut off at line 1,812).
+#[cfg(target_os = "linux")]
+fn guest_exercisers() -> String {
+  use slates_conformance::exerciser::{
+    FSSTRESS_OPERATIONS, FSSTRESS_PROCESSES, FSSTRESS_SEED, FSX_FILE_LENGTH, FSX_OPERATIONS,
+    FSX_SEED,
+  };
+  format!(
+    r#"export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+mkdir -p /mnt/fsx /mnt/fsstress /tmp/fsx-logs
+( cd /mnt/fsx && fsx -N {FSX_OPERATIONS} -S {FSX_SEED} -l {FSX_FILE_LENGTH} -q -P /tmp/fsx-logs fsx.bin ) > /tmp/fsx.out 2>&1
+echo "=== EXERCISER fsx $?"
+cat /tmp/fsx.out
+echo "=== END"
+fsstress -d /mnt/fsstress -n {FSSTRESS_OPERATIONS} -p {FSSTRESS_PROCESSES} -s {FSSTRESS_SEED} -v > /tmp/fsstress.out 2>&1
+echo "=== EXERCISER fsstress $?"
+echo "operations logged: $(grep -cE '^[0-9]+/[0-9]+: ' /tmp/fsstress.out)"
+tail -n 20 /tmp/fsstress.out
+echo "=== END"
+"#
+  )
+}
+
+/// Each exerciser's exit code and output from the guest's console, by name.
+#[cfg(target_os = "linux")]
+fn exerciser_runs(console: &str) -> std::collections::BTreeMap<String, (i32, String)> {
+  let mut runs = std::collections::BTreeMap::new();
+  let mut current: Option<(String, i32, String)> = None;
+  for raw in console.lines() {
+    // Per line, as `guest_runs` reads it: the control stripping treats a carriage return followed by text as a
+    // return to column 0, so over the whole console it would keep only the last line.
+    let cleaned = without_terminal_controls(raw);
+    let line = cleaned.trim_end();
+    if let Some(rest) = line.strip_prefix("=== EXERCISER ") {
+      let mut fields = rest.split_whitespace();
+      let name = fields.next().unwrap_or_default().to_owned();
+      let code = fields
+        .next()
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(-1);
+      current = Some((name, code, String::new()));
+    } else if line == "=== END" {
+      if let Some((name, code, output)) = current.take() {
+        runs.insert(name, (code, output));
+      }
+    } else if let Some((_, _, output)) = current.as_mut() {
+      output.push_str(line);
+      output.push('\n');
+    }
+  }
+  runs
+}
+
+/// AC-9.7 / AUD-29-78 (the guest's fsx and fsstress legs). Do: boot the live guest in workload mode with the
+/// exerciser script in the volume, so fsx and fsstress run over the slates tag inside the guest under the
+/// harness's bounds; judge each by the harness's own rule (`slates_conformance::exerciser`). Expect: fsx passes its
+/// operations with no mismatch, and fsstress completes with every process's operations logged and no failure;
+/// the guest unmounts the tag cleanly. Gated on the live guest's environment; skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_live_guest_runs_fsx_and_fsstress_over_the_tag() {
+  let Some((qemu, kernel, initrd)) = live_guest() else {
+    return;
+  };
+  let (daemon, instance) = single_shard_daemon("virtiofs-exercisers");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "exercisers".to_owned(),
+    size: SizeClass::Bounded { limit: 512 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let capability = daemon.mount_capability("exercisers").unwrap().unwrap();
+  let root = mount(&mut stream, &capability, 1);
+  put(
+    &mut stream,
+    &root,
+    "run.sh",
+    guest_exercisers().as_bytes(),
+    10,
+  );
+  let (ours, theirs) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let boot_ns = u64::try_from(EXERCISER_RUN.as_nanos()).unwrap();
+  let _ended = attach_vhost(&daemon, id, (ours, boot_ns));
+  let started = Instant::now();
+  let console = run_qemu_with(
+    &(qemu, kernel, initrd),
+    &theirs,
+    (EXERCISER_RUN, " slates.workloads", true),
+    &mut |_| {},
+  );
+  eprintln!("the exerciser guest ran {:?}", started.elapsed());
+  drop(theirs);
+  assert!(console.contains("SLATES-WORKLOADS-DONE"), "{console}");
+  assert!(
+    console.contains("SLATES-GUEST-UNMOUNTED"),
+    "the guest unmounted the tag: {console}"
+  );
+  let runs = exerciser_runs(&console);
+  let Some((fsx_code, fsx_output)) = runs.get("fsx") else {
+    panic!("fsx did not run in the guest: {console}");
+  };
+  let fsx = slates_conformance::exerciser::judge_fsx(*fsx_code == 0, fsx_output);
+  eprintln!("guest suite fsx: {}", if fsx.ok { "ok" } else { "failed" });
+  assert!(fsx.ok, "fsx in the guest: {}", fsx.detail);
+  let Some((fsstress_code, fsstress_output)) = runs.get("fsstress") else {
+    panic!("fsstress did not run in the guest: {console}");
+  };
+  let fsstress =
+    slates_conformance::exerciser::judge_fsstress(*fsstress_code == 0, fsstress_output);
+  let logged: u64 = fsstress_output
+    .lines()
+    .find_map(|line| line.strip_prefix("operations logged: "))
+    .and_then(|count| count.trim().parse().ok())
+    .unwrap_or(0);
+  eprintln!(
+    "guest suite fsstress: {} ({logged} operations logged)",
+    if fsstress.ok { "ok" } else { "failed" }
+  );
+  assert!(fsstress.ok, "fsstress in the guest: {}", fsstress.detail);
+  let expected = u64::from(slates_conformance::exerciser::FSSTRESS_PROCESSES)
+    * slates_conformance::exerciser::FSSTRESS_OPERATIONS;
+  assert_eq!(logged, expected, "every process logged every operation");
+  drop(daemon);
+}
+
 /// AC-9.7 / AUD-29-68 (§6's workloads in a live guest). Do: provision a volume and place in it the conformance
 /// roster's scripts; boot the live guest in workload mode — the host container's root over 9p, the slates tag at
 /// its `/mnt`, RAM at `/tmp` — so for each roster tool it holds, the workload runs on the guest's RAM and on the

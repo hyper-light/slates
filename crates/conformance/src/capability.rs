@@ -98,10 +98,18 @@ const VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST: &str = concat!(
   "kernel); this harness has no VMM leg (a vhost-user device is attached in-process), so the cell is not run here"
 );
 
+/// The reason the virtio-fs fsx and fsstress cells are not run by this harness: they run in a live guest elsewhere.
+const VIRTIOFS_EXERCISERS_IN_THE_GUEST_TEST: &str = concat!(
+  "fsx and fsstress run over the tag inside a live Linux guest through QEMU's vhost-user-fs-pci, built from this ",
+  "harness's pins and run under its bounds — fsx A-OK and fsstress's 2,000 operations logged with exit 0 on ",
+  "2026-10-03 (crates/server/tests/virtiofs.rs a_live_guest_runs_fsx_and_fsstress_over_the_tag, gated on QEMU ",
+  "and a guest kernel); this harness has no VMM leg, so the cells are not run here"
+);
+
 /// The reason every other virtio-fs cell is owed.
 const VIRTIOFS_OWED: &str = concat!(
-  "a live Linux guest mounts the tag through QEMU's vhost-user-fs-pci and runs the workload roster ",
-  "(crates/server/tests/virtiofs.rs), but this suite has no guest leg yet; AC-9.7 asks it run in the guest"
+  "a live Linux guest mounts the tag through QEMU's vhost-user-fs-pci and runs the workload roster, fsx and ",
+  "fsstress (crates/server/tests/virtiofs.rs), but this suite has no guest leg yet; AC-9.7 asks it run in the guest"
 );
 
 /// The reason every OCI cell is owed.
@@ -132,6 +140,9 @@ pub fn availability(transport: Transport, suite: Suite) -> Availability {
     (_, Suite::Pressure | Suite::Failure) => Availability::Owed(NO_PRESSURE_OR_FAILURE_SUITE),
     (Transport::VirtioFs, Suite::Workloads) => {
       Availability::Owed(VIRTIOFS_WORKLOADS_IN_THE_GUEST_TEST)
+    }
+    (Transport::VirtioFs, Suite::Fsx | Suite::Fsstress) => {
+      Availability::Owed(VIRTIOFS_EXERCISERS_IN_THE_GUEST_TEST)
     }
     (Transport::VirtioFs, _) => Availability::Owed(VIRTIOFS_OWED),
     // fsx compiled and run inside a container over the exact entry `attach --oci` returns (AUD-29-78).

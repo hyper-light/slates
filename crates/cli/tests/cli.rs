@@ -3750,51 +3750,74 @@ struct Cycle {
   loss_reported: bool,
 }
 
-/// One kill cycle of the in-flight test: a writer thread appends numbered pages through one descriptor while the
-/// daemon is killed, stops after [`WRITES_AFTER`] writes past the restart, then `fsync`s that descriptor.
-/// `first` numbers the cycle's first page. A write that fails is the test's failure.
+/// Shape: concurrent writers in each kill cycle, each on its own file. One synchronous writer leaves the daemon idle
+/// between a reply and the next read, so a kill missed every in-flight request in three cycles on the CI runner
+/// (2026-10-03); with several writers queued, the daemon always holds one it read and has not answered.
 #[cfg(target_os = "linux")]
-fn write_through_a_kill(instance: &str, path: &str, first: usize) -> Cycle {
+const IN_FLIGHT_WRITERS: usize = 4;
+
+/// One writer of a kill cycle: appends numbered pages to `path` from page `first` until [`WRITES_AFTER`] writes
+/// past the restart, then `fsync`s the descriptor it wrote through.
+#[cfg(target_os = "linux")]
+fn write_pages(
+  path: &str,
+  first: usize,
+  progress: &std::sync::atomic::AtomicUsize,
+  restarted: &std::sync::atomic::AtomicBool,
+) -> Cycle {
   use std::io::Write;
+  use std::sync::atomic::Ordering;
   let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
-  let restarted = std::sync::atomic::AtomicBool::new(false);
-  let progress = std::sync::atomic::AtomicUsize::new(0);
-  let pages = std::thread::scope(|scope| {
-    let writer = scope.spawn(|| {
-      let mut written = 0usize;
-      let mut after = 0usize;
-      while after < WRITES_AFTER {
-        let page = [u8::try_from((first + written) % PAGE_VALUES).unwrap_or(0); IN_FLIGHT_WRITE];
-        file
-          .write_all(&page)
-          .expect("every write is acknowledged across the kill (none fails or hangs)");
-        written += 1;
-        progress.store(written, std::sync::atomic::Ordering::Release);
-        if restarted.load(std::sync::atomic::Ordering::Acquire) {
-          after += 1;
-        }
-      }
-      written
-    });
-    // Kill only once the writer is in its stride, so a write is likely between the daemon's read and its reply.
-    assert!(
-      wait_for(|| progress.load(std::sync::atomic::Ordering::Acquire) >= WRITES_BEFORE),
-      "the writer started"
-    );
-    let killed = kill_the_daemon(instance);
-    await_daemon(instance, Some(killed), &[]);
-    restarted.store(true, std::sync::atomic::Ordering::Release);
-    writer.join().unwrap()
-  });
+  let mut written = 0usize;
+  let mut after = 0usize;
+  while after < WRITES_AFTER {
+    let page = [u8::try_from((first + written) % PAGE_VALUES).unwrap_or(0); IN_FLIGHT_WRITE];
+    file
+      .write_all(&page)
+      .expect("every write is acknowledged across the kill (none fails or hangs)");
+    written += 1;
+    progress.fetch_add(1, Ordering::AcqRel);
+    if restarted.load(Ordering::Acquire) {
+      after += 1;
+    }
+  }
   let loss_reported = match file.sync_all() {
     Ok(()) => false,
     Err(e) if e.raw_os_error() == Some(EIO) => true,
     Err(e) => panic!("fsync after the takeover: {e}"),
   };
   Cycle {
-    pages,
+    pages: written,
     loss_reported,
   }
+}
+
+/// One kill cycle of the in-flight test: [`IN_FLIGHT_WRITERS`] writers append numbered pages, each to its own file
+/// in `paths` from its page in `firsts`, while the daemon is killed once they are all in their stride. What each
+/// writer saw, in `paths`' order. A write that fails is the test's failure.
+#[cfg(target_os = "linux")]
+fn write_through_a_kill(instance: &str, paths: &[String], firsts: &[usize]) -> Vec<Cycle> {
+  use std::sync::atomic::Ordering;
+  let restarted = std::sync::atomic::AtomicBool::new(false);
+  let progress = std::sync::atomic::AtomicUsize::new(0);
+  std::thread::scope(|scope| {
+    let writers: Vec<_> = paths
+      .iter()
+      .zip(firsts)
+      .map(|(path, first)| scope.spawn(|| write_pages(path, *first, &progress, &restarted)))
+      .collect();
+    assert!(
+      wait_for(|| progress.load(Ordering::Acquire) >= WRITES_BEFORE * paths.len()),
+      "the writers started"
+    );
+    let killed = kill_the_daemon(instance);
+    await_daemon(instance, Some(killed), &[]);
+    restarted.store(true, Ordering::Release);
+    writers
+      .into_iter()
+      .map(|writer| writer.join().unwrap())
+      .collect()
+  })
 }
 
 /// Format: `EIO`, the errno a lost write's `fsync` reports.
@@ -3802,8 +3825,8 @@ fn write_through_a_kill(instance: &str, path: &str, first: usize) -> Cycle {
 const EIO: i32 = 5;
 
 /// AC-3.4 / T-3.5 with a request in flight (A-61: `FUSE_NOTIFY_RESEND`, the dirty log). Do: mount a volume over
-/// FUSE; a writer thread appends numbered pages through one descriptor while the daemon is `SIGKILL`ed and on
-/// past the restart, then `fsync`s; repeat until the restarted daemon reports a request the kernel resent (one the
+/// FUSE; [`IN_FLIGHT_WRITERS`] writer threads append numbered pages, each through one descriptor to its own file,
+/// while the daemon is `SIGKILL`ed and on past the restart, then `fsync`; repeat until the restarted daemon reports a request the kernel resent (one the
 /// dead daemon read and never answered), within [`IN_FLIGHT_ATTEMPTS`]. Expect: every write is acknowledged —
 /// none fails or hangs, so the resent request was served (without the resend its writer would wait forever); the
 /// file has every page's length; and no loss is silent: a cycle whose `fsync` succeeded wrote every page exactly,
@@ -3815,35 +3838,52 @@ fn a_write_in_flight_at_the_daemons_kill_is_resent_and_no_loss_is_silent() {
   let Some(held) = HeldMount::start("resend") else {
     return;
   };
-  let path = format!("{}/pages", held.mount_point.path);
-  drop(held.open("pages"));
-  let mut cycles = Vec::new();
-  let mut pages = 0usize;
-  while cycles.len() < IN_FLIGHT_ATTEMPTS && counter_of(&held.instance, "fuse.resent") == 0 {
-    let cycle = write_through_a_kill(&held.instance, &path, pages);
-    pages += cycle.pages;
-    cycles.push(cycle);
+  let paths: Vec<String> = (0..IN_FLIGHT_WRITERS)
+    .map(|writer| {
+      let name = format!("pages-{writer}");
+      drop(held.open(&name));
+      format!("{}/{name}", held.mount_point.path)
+    })
+    .collect();
+  let mut cycles: Vec<Vec<Cycle>> = paths.iter().map(|_| Vec::new()).collect();
+  let mut attempts = 0;
+  while attempts < IN_FLIGHT_ATTEMPTS && counter_of(&held.instance, "fuse.resent") == 0 {
+    attempts += 1;
+    let firsts: Vec<usize> = cycles
+      .iter()
+      .map(|written| written.iter().map(|cycle| cycle.pages).sum())
+      .collect();
+    for (writer, cycle) in write_through_a_kill(&held.instance, &paths, &firsts)
+      .into_iter()
+      .enumerate()
+    {
+      if let Some(written) = cycles.get_mut(writer) {
+        written.push(cycle);
+      }
+    }
   }
   let resent = counter_of(&held.instance, "fuse.resent");
-  let mut reader = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
-  let bytes = read_whole(&mut reader);
-  drop(reader);
-  let reported = cycles.iter().filter(|cycle| cycle.loss_reported).count();
-  eprintln!(
-    "{} cycles, {resent} resent, {reported} reported lost writes",
-    cycles.len()
-  );
+  let reported = cycles
+    .iter()
+    .flatten()
+    .filter(|cycle| cycle.loss_reported)
+    .count();
+  eprintln!("{attempts} cycles, {resent} resent, {reported} reported lost writes");
   assert!(
     resent >= 1,
-    "a kill caught a request in flight in {} attempts",
-    cycles.len()
+    "a kill caught a request in flight in {attempts} attempts"
   );
-  assert_eq!(
-    bytes.len(),
-    pages * IN_FLIGHT_WRITE,
-    "every acknowledged page's length"
-  );
-  assert_no_silent_loss(&bytes, &cycles);
+  for (path, written) in paths.iter().zip(&cycles) {
+    let mut reader = std::fs::OpenOptions::new().read(true).open(path).unwrap();
+    let bytes = read_whole(&mut reader);
+    let pages: usize = written.iter().map(|cycle| cycle.pages).sum();
+    assert_eq!(
+      bytes.len(),
+      pages * IN_FLIGHT_WRITE,
+      "{path}: every acknowledged page's length"
+    );
+    assert_no_silent_loss(&bytes, written);
+  }
   held.unmount();
 }
 

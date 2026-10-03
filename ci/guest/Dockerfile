@@ -13,3 +13,6 @@ RUN set -e; K=$(ls /lib/modules); mkdir -p /guest/root/bin /guest/root/lib/9p; \
     cp /bin/busybox /guest/root/bin/busybox; cp /guest/init /guest/root/init; chmod 755 /guest/root/init; \
     (cd /guest/root && find . | cpio -o -H newc 2>/dev/null | gzip > /guest/initrd.gz); \
     cp /boot/vmlinuz-* /guest/vmlinuz; chmod -R a+rX /guest
+# The conformance exercisers for the guest's fsx and fsstress legs (AUD-29-78): the harness's own pins and flags.
+COPY build-exercisers.sh /guest/build-exercisers.sh
+RUN sh /guest/build-exercisers.sh

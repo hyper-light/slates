@@ -450,3 +450,46 @@ pub(crate) fn build_pjdfstest(dir: &Path) -> Result<PjdfstestTree, Failure> {
     ),
   })
 }
+
+#[cfg(test)]
+mod guest_tests {
+  use super::*;
+
+  /// AC-9.7 / AUD-29-78 (doc truth: the guest's exercisers are the harness's). Do: read the guest image's build
+  /// script. Expect: every pin's URL and SHA-256, fsx's and fsstress's compiler flags and the Linux shim headers'
+  /// text appear in it exactly, so the guest's fsx and fsstress legs run the very programs this harness runs.
+  #[test]
+  fn the_guest_image_builds_the_exercisers_the_harness_pins() {
+    let script = std::fs::read_to_string(
+      std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ci/guest/build-exercisers.sh"),
+    )
+    .unwrap_or_default();
+    for pin in [
+      &FSX_C,
+      &FSSTRESS_C,
+      &FSSTRESS_GLOBAL_H,
+      &FSSTRESS_XFSCOMPAT_H,
+      &FSSTRESS_TST_COMMON_H,
+    ] {
+      assert!(
+        script.contains(&format!("fetch {} {} {}", pin.name, pin.url, pin.sha256)),
+        "{} at its pin and digest",
+        pin.name
+      );
+    }
+    assert!(
+      script.contains("cc -O2 -w -include time.h -include stdint.h -o /usr/local/bin/fsx fsx.c")
+    );
+    let fsstress_flags = FSSTRESS_CFLAGS.join(" ");
+    assert!(script.contains(&format!(
+      "cc {fsstress_flags} -o /usr/local/bin/fsstress fsstress.c"
+    )));
+    for line in fsstress_config_h(HostOs::Linux).lines() {
+      let in_script = line.replace('\'', "'\"'\"'");
+      assert!(
+        script.contains(&in_script),
+        "the shim config.h line {line:?}"
+      );
+    }
+  }
+}
