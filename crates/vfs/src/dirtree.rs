@@ -439,44 +439,21 @@ impl Tree {
     Some((hash, s.to_child(), leaf.name(s)))
   }
 
-  /// The name of the entry with `hash` whose child satisfies `wanted`, searching the leaf the
-  /// hash descends to (a run of one hash that spans two leaves is not followed; the caller
-  /// falls back to a walk).
+  /// The name of the entry with `hash` whose child satisfies `wanted`: the entries from the first at or above
+  /// `(hash, "")` in canonical order, while their hash is `hash` — one descent, then the in-order walk
+  /// ([`Self::iter_from_hash`]), so an entry that opens its leaf (whose key the parent holds as a separator, so a
+  /// descent by hash alone lands on the leaf before it) and a run of one hash that spans leaves are both found.
   pub fn name_of<'b>(
     &self,
     blocks: &'b Slab<DirBlock>,
     hash: u64,
     wanted: &dyn Fn(Child) -> bool,
   ) -> Option<&'b str> {
-    let mut block = self.root;
-    for _ in 1..self.height {
-      let b = blocks.get(block).ok()?;
-      let at = b.child_for(NameEquivalence::Exact, hash, "");
-      block = handle_from_word(b.slot(at).child);
-    }
-    let leaf = blocks.get(block).ok()?;
-    let count = leaf.count();
-    let (mut lo, mut hi) = (0usize, count);
-    while lo < hi {
-      let mid = lo + (hi - lo) / 2;
-      if leaf.slot(mid).hash < hash {
-        lo = mid + 1;
-      } else {
-        hi = mid;
-      }
-    }
-    let mut at = lo;
-    while at < count {
-      let s = leaf.slot(at);
-      if s.hash != hash {
-        break;
-      }
-      if wanted(s.to_child()) {
-        return Some(leaf.name(s));
-      }
-      at += 1;
-    }
-    None
+    self
+      .iter_from_hash(blocks, hash)
+      .take_while(|(entry_hash, _, _)| *entry_hash == hash)
+      .find(|(_, _, child)| wanted(*child))
+      .map(|(_, name, _)| name)
   }
 
   /// Every block of the tree with its birth epoch, for release and destroy walks.
@@ -1134,6 +1111,10 @@ mod tests {
     for (key, child) in &f.model {
       let found = f.tree.lookup(&f.blocks, POLICY, &key.1.to_uppercase());
       assert_eq!(found.map(|(_, c, _)| c), Some(*child), "{}", key.1);
+      // The reverse lookup a path report takes (an inode's home names its hash and its number): every entry,
+      // the ones that open a leaf included, is found by its hash and child (AUD-29-76's large-span diff).
+      let named = f.tree.name_of(&f.blocks, key.0, &|c| c == *child);
+      assert_eq!(named, Some(key.1.as_str()), "name_of by hash {}", key.0);
     }
   }
 

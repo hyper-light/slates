@@ -1977,6 +1977,13 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > inode tables that enters only the nodes the span copied. A guest device presents a subtree or a snapshot, chosen at
 > attach; a guest view cannot yet advance. A container bound to a scoped mount sees only that directory.
 
+> **Status (2026-10-03, AUD-29-76 follow-up: the diff on a wide span).** The diff missed a changed file whose entry
+> opens a leaf of its directory's tree. The first measurement on a large span found it: 9,925 of 10,000 written
+> files were named. The reverse lookup from an inode's home to its name descended by hash alone, which lands on the
+> leaf before such an entry. It now walks in order from the first entry at or above the hash, as a listing resumed
+> from a cookie does. The tree oracle checks it for every entry
+> (`docs/bugs/2026-10-03-a-reverse-name-lookup-missed-every-entry-that-opens-a-leaf.md`).
+
 > **Status (2026-10-01, AUD-29-68: the inherited-descriptor binding).** On Linux a guest device attaches over
 > vhost-user through a socket the harness hands the daemon (`attach_vhost_user_device`; never a socket on disk).
 > The VMM is authenticated as the socket's peer. Its memory is accepted only as sealed memory objects, and its

@@ -148,3 +148,59 @@ fn the_diff_is_exact_for_a_write_a_moved_directory_and_a_linked_file() {
     ["/keep/c", "/linked"]
   );
 }
+
+/// Shape: files in the wide span below, past one inode-table node's fan-out so the span copies many nodes at
+/// more than one level (the generated histories above stay within a few).
+const WIDE_FILES: usize = 10_000;
+/// Shape: files per directory in the wide span, so its tree has both breadth and depth.
+const WIDE_FILES_PER_DIR: usize = 256;
+
+/// AUD-29-76 (the large-span measurement found it). Do: create `WIDE_FILES` empty files, `WIDE_FILES_PER_DIR` to
+/// a directory; snapshot; write one byte to every file; snapshot. Expect: the diff names every file, by its
+/// path, and nothing else (no listing changed).
+#[test]
+fn a_write_to_every_file_of_a_wide_volume_names_every_file() {
+  let mut store = store();
+  let mut vol = volume(&mut store, QUOTA);
+  let root = vol.root_inode(&store).unwrap();
+  let mut files = Vec::with_capacity(WIDE_FILES);
+  let mut dir = root;
+  for index in 0..WIDE_FILES {
+    if index % WIDE_FILES_PER_DIR == 0 {
+      dir = vol
+        .mkdir_no(
+          &mut store,
+          root,
+          &format!("dir{}", index / WIDE_FILES_PER_DIR),
+          0o755,
+        )
+        .unwrap();
+    }
+    let path = format!("/dir{}/f{index}", index / WIDE_FILES_PER_DIR);
+    files.push((
+      vol
+        .create_file_no(&mut store, dir, &format!("f{index}"), 0o644)
+        .unwrap(),
+      path,
+    ));
+  }
+  let from = vol.snapshot(&mut store).unwrap();
+  for (file, _) in &files {
+    vol.write(&mut store, *file, 0, b"x").unwrap();
+  }
+  let to = vol.snapshot(&mut store).unwrap();
+  let named: BTreeSet<String> = vol
+    .paths_changed_between(&store, from, to)
+    .unwrap()
+    .into_iter()
+    .collect();
+  let expected: BTreeSet<String> = files.into_iter().map(|(_, path)| path).collect();
+  let missing: Vec<&String> = expected.difference(&named).take(8).collect();
+  let extra: Vec<&String> = named.difference(&expected).take(8).collect();
+  assert!(
+    missing.is_empty() && extra.is_empty(),
+    "{} named of {}; first missing {missing:?}; first extra {extra:?}",
+    named.len(),
+    expected.len()
+  );
+}
