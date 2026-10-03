@@ -130,7 +130,8 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     // FSYNC/FSYNCDIR are flush-equivalent for slates: the data is already in the anchor segment,
     // which is the source of truth (R1), so there is nothing to force to a lower tier — a success
     // no-op, the same as FLUSH. They carry `fh` first, exactly as FLUSH does (audit BUG-7).
-    Opcode::Flush | Opcode::FSync | Opcode::FSyncDir => serve_flush(bridge, &request, cx, out),
+    Opcode::Flush => serve_flush(bridge, &request, cx, out, false),
+    Opcode::FSync | Opcode::FSyncDir => serve_flush(bridge, &request, cx, out, true),
     Opcode::Forget => serve_forget(bridge, &request, cx),
     Opcode::BatchForget => serve_batch_forget(bridge, &request, cx),
     // DESTROY is the kernel's last request at unmount: the attachment's references are swept (the
@@ -904,6 +905,7 @@ fn serve_flush(
   req: &Request<'_>,
   cx: &OpContext,
   out: &mut [u8],
+  fsync: bool,
 ) -> usize {
   let fh = req
     .body
@@ -911,12 +913,12 @@ fn serve_flush(
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
     .unwrap_or(0);
   let object = ObjectId::new(req.header.nodeid, 0);
-  reply(
-    req.header.unique,
-    bridge.flush(object, cx, fh),
-    |()| Vec::new(),
-    out,
-  )
+  let flushed = if fsync {
+    bridge.fsync(object, cx, fh)
+  } else {
+    bridge.flush(object, cx, fh)
+  };
+  reply(req.header.unique, flushed, |()| Vec::new(), out)
 }
 
 fn serve_forget(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext) -> usize {

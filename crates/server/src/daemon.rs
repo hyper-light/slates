@@ -633,6 +633,9 @@ impl Daemon {
     let retained = crate::retention::load(&segment)?;
     let runtime = Runtime::start(&config.runtime)?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
+    // The FUSE devices the anchor held across the restart (A-61), each moved to the shard that owns its mount.
+    #[cfg(target_os = "linux")]
+    let mut inherited_fuse = crate::fuse_hold::adopt(shards.len()).into_iter();
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -640,8 +643,19 @@ impl Daemon {
       let partition = u16::try_from(index).unwrap_or(u16::MAX);
       let all: Vec<u16> = shards.iter().map(|s| s.0).collect();
       let retained = retained.clone();
+      #[cfg(target_os = "linux")]
+      let held = inherited_fuse.next().unwrap_or_default();
       runtime.spawn_on(*shard, async move {
-        if let Err(e) = init_shard(&config, &env, &identity, partition, &all, retained) {
+        if let Err(e) = init_shard(
+          &config,
+          &env,
+          &identity,
+          partition,
+          &all,
+          retained,
+          #[cfg(target_os = "linux")]
+          held,
+        ) {
           INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
           eprintln!("slates-server: shard {partition} failed to initialize: {e}");
         }
@@ -2322,6 +2336,58 @@ fn build_root_group(
   )
 }
 
+/// This shard's slice `[start, end)` of the anchor's content object (§4.8), `(0, 0)` without one.
+fn shard_slice(
+  config_shards: &[u16],
+  partition: u16,
+  content: Option<&slates_mem::SparseObject>,
+) -> (usize, usize) {
+  let Some(object) = content else {
+    return (0, 0);
+  };
+  let per_shard = object.len() / config_shards.len().max(1);
+  let start = usize::from(partition).saturating_mul(per_shard);
+  (start, start.saturating_add(per_shard))
+}
+
+/// This shard's content range for its recovery images (§4.8): its whole slice. (On Linux the slice's first page is
+/// the dirty log instead, [`content_slice`].)
+#[cfg(not(target_os = "linux"))]
+fn content_slice(
+  config_shards: &[u16],
+  partition: u16,
+  content: Option<&slates_mem::SparseObject>,
+) -> (usize, usize) {
+  shard_slice(config_shards, partition, content)
+}
+
+/// This shard's content range for its recovery images (§4.8), and the dirty log in the slice's first page with
+/// what the previous daemon left in it (A-61, `crate::dirty_log`), read before anything this daemon does can
+/// publish and clear it. No log and nothing lost without a content object, or a slice too small for a page.
+#[cfg(target_os = "linux")]
+fn content_slice(
+  config: &DaemonConfig,
+  partition: u16,
+  config_shards: &[u16],
+  content: Option<&slates_mem::SparseObject>,
+) -> (
+  (usize, usize),
+  Option<crate::dirty_log::DirtyLog>,
+  crate::dirty_log::LostFiles,
+) {
+  let (start, end) = shard_slice(config_shards, partition, content);
+  let log = content
+    .filter(|_| end.saturating_sub(start) > config.page)
+    .and_then(|object| Some((object, crate::dirty_log::DirtyLog::new(start, config.page)?)));
+  match log {
+    Some((object, log)) => {
+      let lost = log.recovered(object);
+      ((start.saturating_add(config.page), end), Some(log), lost)
+    }
+    None => ((start, end), None, crate::dirty_log::LostFiles::default()),
+  }
+}
+
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
 /// installs the state, then spawns the server loop as a poller.
 fn init_shard(
@@ -2331,6 +2397,7 @@ fn init_shard(
   partition: u16,
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
+  #[cfg(target_os = "linux")] inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
 ) -> Result<(), ServerError> {
   let (handoff, len) = handoff_of(env)?;
   let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
@@ -2461,15 +2528,11 @@ fn init_shard(
     Some(result) => Some(result?),
     None => None,
   };
-  let content_range = match &content {
-    Some(object) => {
-      let partitions = config_shards.len().max(1);
-      let per_shard = object.len() / partitions;
-      let start = usize::from(partition).saturating_mul(per_shard);
-      (start, start.saturating_add(per_shard))
-    }
-    None => (0, 0),
-  };
+  #[cfg(target_os = "linux")]
+  let (content_range, dirty_log, lost_files) =
+    content_slice(config, partition, config_shards, content.as_ref());
+  #[cfg(not(target_os = "linux"))]
+  let content_range = content_slice(config_shards, partition, content.as_ref());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.
@@ -2489,6 +2552,10 @@ fn init_shard(
     issuer_secret,
     content,
     content_range,
+    #[cfg(target_os = "linux")]
+    dirty_log,
+    #[cfg(target_os = "linux")]
+    lost_files,
     write_verifier: now.to_be_bytes(),
     #[cfg(unix)]
     nfs_v4: None,
@@ -2514,6 +2581,10 @@ fn init_shard(
     #[cfg(target_os = "linux")]
     fuse_mounts: std::collections::BTreeMap::new(),
     stale_fuse_mounts: Vec::new(),
+    #[cfg(target_os = "linux")]
+    inherited_fuse,
+    #[cfg(target_os = "linux")]
+    adopt_fuse: Vec::new(),
     snapshot_views: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     guest_devices: Vec::new(),
@@ -2649,7 +2720,10 @@ fn init_shard(
     );
   }
   state::install(state);
-  // The dead FUSE mounts of a killed predecessor, once the shard can run their helpers (AUD-29-64).
+  // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
+  // predecessor unmounted, once the shard can run their helpers (AUD-29-64).
+  #[cfg(target_os = "linux")]
+  crate::fuse::adopt_held();
   #[cfg(target_os = "linux")]
   crate::fuse::unmount_stale();
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in

@@ -7138,6 +7138,15 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   match shard.write_to(&mut slots) {
     Ok(frame_bytes) => {
       published.frame_bytes = frame_bytes;
+      // Every volume captured: no write before this publication can be lost now, so the dirty log empties
+      // (A-61). A volume skipped keeps the log, so its files stay named.
+      #[cfg(target_os = "linux")]
+      if published.skipped.is_empty()
+        && let (Some(log), Some(object)) = (state.dirty_log.as_mut(), state.content.as_mut())
+        && log.clear(object).is_err()
+      {
+        *state.refusals.entry(DIRTY_LOG_UNWRITTEN).or_insert(0) += 1;
+      }
       Ok(published)
     }
     Err(e) => {
@@ -7413,6 +7422,11 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
   }
 }
 
+/// Format: the refusal counter of a dirty-log write the content object refused (A-61): a file then not known to
+/// the next daemon as having lost writes.
+#[cfg(target_os = "linux")]
+pub(crate) const DIRTY_LOG_UNWRITTEN: &str = "recovery.dirty_log_unwritten";
+
 /// Format: the refusal counter of a volume whose recovered references could not be settled.
 const REFERENCES_UNSETTLED: &str = "recovery.references_unsettled";
 
@@ -7480,6 +7494,18 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     .iter()
     .filter(|a| {
       if let Some(path) = a.form.fuse_mount_point() {
+        // A mount whose device the anchor held, on a kernel that can resend what the dead daemon read, is kept
+        // and served again (A-61); any other dies with the process, as before.
+        #[cfg(target_os = "linux")]
+        if let Some(at) = state
+          .inherited_fuse
+          .iter()
+          .position(|held| held.attachment == a.id && held.adoptable())
+        {
+          let held = state.inherited_fuse.swap_remove(at);
+          state.adopt_fuse.push(((**a).clone(), held));
+          return false;
+        }
         state.stale_fuse_mounts.push((a.id, path.to_owned()));
         return true;
       }

@@ -371,8 +371,9 @@ pub enum AttachForm {
     read_only: bool,
   },
   /// A Linux FUSE mount (§4.6 "Linux"; AUD-29-64) at its mount point. Kept apart from a chosen-path host
-  /// mount because its device is the daemon process's own: it cannot outlive the process, so recovery ends
-  /// it, where an NFS host mount reconnects to the restarted daemon.
+  /// mount because its device is the daemon process's own: recovery keeps it only when the anchor held the
+  /// device across the restart and the kernel can resend (A-61), and ends it otherwise, where an NFS host mount
+  /// reconnects to the restarted daemon.
   FuseMount {
     /// The mount point.
     path: String,

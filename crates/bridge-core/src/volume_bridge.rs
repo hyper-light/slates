@@ -81,6 +81,70 @@ pub struct VolumeBridge<'v> {
   handles: HandleStore<'v>,
   /// Shape: the size a read is capped at when a request asks for more than one arena chunk.
   max_read: usize,
+  /// For a mount taken over from a daemon that died (A-61), the files whose acknowledged writes the death lost:
+  /// a `flush` or `fsync` of one through a handle the dead daemon issued answers `EIO` once ([`LostWrites`]).
+  lost: Option<&'v mut LostWrites>,
+}
+
+/// The files whose acknowledged writes a daemon's death lost, for a mount the anchor held across it (A-61;
+/// `docs/wip/SLATES_DESIGN.md` §4.6). A plain write is acknowledged before the owner's barrier (D-18), so the
+/// writes since the last publication died with the daemon while the writer ran on. Linux reports such a loss as
+/// a writeback error: an `fsync` of a file description open at the time answers `EIO` once, and a close may
+/// answer it too. So does this: a handle the dead daemon issued — one this daemon never did — that names a lost
+/// file answers every `flush` `EIO` until an `fsync` through it has been answered `EIO`, once; after that both
+/// succeed. A `flush` comes with every close of any copy of the descriptor (a child's exec-time close of an
+/// inherited copy included), so it reports without consuming, or a close nobody saw would take the report the
+/// writer's own `fsync` needed (measured 2026-10-03: the in-flight takeover test's writer `fsync`ed clean after
+/// a spawned process's close had taken it). A handle opened after the takeover sees no error, its writes being
+/// this daemon's. Bounded by the handles alive: the handles this daemon issued leave at their release, and a
+/// told handle's entries with it.
+#[derive(Debug, Default)]
+pub struct LostWrites {
+  inodes: std::collections::BTreeSet<u64>,
+  everything: bool,
+  issued: std::collections::BTreeSet<u64>,
+  told: std::collections::BTreeSet<(u64, u64)>,
+}
+
+impl LostWrites {
+  /// The files `inodes` lost writes, or every file when `everything` (the record of them overflowed).
+  pub fn new(inodes: std::collections::BTreeSet<u64>, everything: bool) -> LostWrites {
+    LostWrites {
+      inodes,
+      everything,
+      issued: std::collections::BTreeSet::new(),
+      told: std::collections::BTreeSet::new(),
+    }
+  }
+
+  /// Whether no file lost writes.
+  pub fn is_empty(&self) -> bool {
+    self.inodes.is_empty() && !self.everything
+  }
+
+  fn issued(&mut self, fh: u64) {
+    if !self.is_empty() {
+      self.issued.insert(fh);
+    }
+  }
+
+  fn released(&mut self, fh: u64) {
+    self.issued.remove(&fh);
+    self.told.retain(|(_, handle)| *handle != fh);
+  }
+
+  /// Whether a `flush` or `fsync` of `inode` through `fh` is answered `EIO`: the handle predates the takeover, the
+  /// file lost writes, and no `fsync` through this handle has been told yet.
+  fn reports(&self, inode: u64, fh: u64) -> bool {
+    !self.issued.contains(&fh)
+      && (self.everything || self.inodes.contains(&inode))
+      && !self.told.contains(&(inode, fh))
+  }
+
+  /// [`LostWrites::reports`] for an `fsync`, which consumes the report.
+  fn reports_and_tells(&mut self, inode: u64, fh: u64) -> bool {
+    self.reports(inode, fh) && self.told.insert((inode, fh))
+  }
 }
 
 impl std::fmt::Debug for VolumeBridge<'_> {
@@ -182,6 +246,7 @@ impl<'v> VolumeBridge<'v> {
       host: HostRef::None,
       handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
+      lost: None,
     }
   }
 
@@ -201,6 +266,7 @@ impl<'v> VolumeBridge<'v> {
       host: HostRef::Owned(host),
       handles: HandleStore::Owned(Slab::new(HANDLE_SEGMENT, MAX_OPEN_HANDLES)),
       max_read: MAX_READ,
+      lost: None,
     }
   }
 
@@ -226,7 +292,15 @@ impl<'v> VolumeBridge<'v> {
       },
       handles: HandleStore::Borrowed(handles),
       max_read: MAX_READ,
+      lost: None,
     }
+  }
+
+  /// This bridge, reporting the writes `lost` names (A-61): a mount taken over from a daemon that died.
+  #[must_use]
+  pub fn with_lost_writes(mut self, lost: &'v mut LostWrites) -> VolumeBridge<'v> {
+    self.lost = Some(lost);
+    self
   }
 
   /// Refuses unless `cx` authorizes a read on this bridge's volume: its attachment must bind this
@@ -292,7 +366,13 @@ impl<'v> VolumeBridge<'v> {
       .volume
       .reference_for(self.store, InodeNo(inode), attachment)?;
     match self.handles.insert(inode) {
-      Ok(handle) => Ok(pack_handle(handle)),
+      Ok(handle) => {
+        let fh = pack_handle(handle);
+        if let Some(lost) = self.lost.as_deref_mut() {
+          lost.issued(fh);
+        }
+        Ok(fh)
+      }
       Err(e) => {
         let _ = self
           .volume
@@ -791,6 +871,9 @@ impl Bridge for VolumeBridge<'_> {
         .forget_for(self.store, InodeNo(inode), cx.owner, 1);
     }
     let _ = self.handles.remove(unpack_handle(fh));
+    if let Some(lost) = self.lost.as_deref_mut() {
+      lost.released(fh);
+    }
     Ok(())
   }
 
@@ -839,12 +922,30 @@ impl Bridge for VolumeBridge<'_> {
     }
   }
 
-  fn flush(&mut self, _object: ObjectId, cx: &OpContext, _fh: u64) -> Result<(), VfsError> {
+  fn flush(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
     self.authorize_read(cx)?;
+    // A file whose acknowledged writes a daemon's death lost answers its first flush through a handle opened
+    // before the takeover `EIO` (A-61): the writeback error Linux reports, never a success over the hole.
+    if let Some(lost) = self.lost.as_deref()
+      && lost.reports(object.inode, fh)
+    {
+      return Err(VfsError::RecoveryIncomplete);
+    }
     // Nothing to force at this layer: the bytes are in the volume's live tree. Their survival across a
     // daemon restart is the owner's barrier (§4.8, D-18): every transport holds this flush's success reply
     // until its recovery publication has captured the volume (AUD-29-82), and answers `EIO` when it did not.
     Ok(())
+  }
+  fn fsync(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
+    self.authorize_read(cx)?;
+    // The `fsync` a lost file's writer makes is told `EIO` once, consuming the report (A-61); every later one,
+    // and every later close, succeeds.
+    if let Some(lost) = self.lost.as_deref_mut()
+      && lost.reports_and_tells(object.inode, fh)
+    {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    self.flush(object, cx, fh)
   }
 
   fn mknod(

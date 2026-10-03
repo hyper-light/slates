@@ -3495,6 +3495,14 @@ fn a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon() {
   if !linux_fuse_mount_runs() {
     return;
   }
+  // On a kernel that can resend what a dead daemon read, the anchor's held device keeps the mount (A-61), which
+  // `a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable` proves; this is the older kernel's outcome.
+  if kernel_resends_fuse_requests() {
+    eprintln!(
+      "SKIP: this kernel resends FUSE requests (Linux 6.9+), so the mount survives the kill (A-61)"
+    );
+    return;
+  }
   let instance = format!("cli-fuse-crash-{}", std::process::id());
   let anchor = start_anchor(&instance);
   let (code, out, err) = run(
@@ -3524,6 +3532,340 @@ fn a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon() {
     "the restarted daemon unmounted the dead mount"
   );
   drop(anchor);
+}
+
+/// Format: the first Linux release whose FUSE can resend the requests a dead daemon read (`FUSE_NOTIFY_RESEND`,
+/// 7.40, Linux 6.9), as (major, minor).
+#[cfg(target_os = "linux")]
+const FIRST_RESENDING_KERNEL: (u32, u32) = (6, 9);
+
+/// Whether this kernel's FUSE can resend what a dead daemon read: its release at or past
+/// [`FIRST_RESENDING_KERNEL`], read from `uname -r` — the version is the observable stand-in for the `INIT` flag
+/// the daemon sees.
+#[cfg(target_os = "linux")]
+fn kernel_resends_fuse_requests() -> bool {
+  let release = Command::new("uname")
+    .arg("-r")
+    .output()
+    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+    .unwrap_or_default();
+  let mut parts = release
+    .trim()
+    .split(|c: char| !c.is_ascii_digit())
+    .filter_map(|part| part.parse::<u32>().ok());
+  match (parts.next(), parts.next()) {
+    (Some(major), Some(minor)) => (major, minor) >= FIRST_RESENDING_KERNEL,
+    _ => false,
+  }
+}
+
+/// AC-3.4 / T-3.5 (A-61: the anchor holds a FUSE mount's device across a daemon restart). Do: through the real
+/// binary against an anchor-supervised daemon, mount a volume over FUSE; open a file and write to it, and open a
+/// second file, write it and unlink it (both descriptors kept); `SIGKILL` the daemon; write to the first file
+/// through the same descriptor while the anchor restarts the daemon. Expect: the write waits through the window
+/// and succeeds — no `ENOTCONN` — within the recovery budget; the first file holds both writes and the unlinked
+/// one its bytes, read through the descriptors opened before the kill; the mount is still the same mount, its
+/// attachment still recorded; the new daemon is a different process. Gated like the Linux mount, and to a
+/// kernel that can resend (6.9+); skips loudly elsewhere.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable() {
+  use std::io::Write;
+  let Some(held) = HeldMount::start("held") else {
+    return;
+  };
+  let mut kept = held.open("kept");
+  kept.write_all(b"before-").unwrap();
+  let mut unlinked = held.open("unlinked");
+  unlinked.write_all(b"orphan bytes").unwrap();
+  let removed = Command::new("rm")
+    .arg(format!("{}/unlinked", held.mount_point.path))
+    .output()
+    .unwrap();
+  assert!(removed.status.success(), "unlink through the mount");
+  let killed = kill_the_daemon(&held.instance);
+  let killed_at = Instant::now();
+  kept
+    .write_all(b"after")
+    .expect("the write waits for the restarted daemon and succeeds (no ENOTCONN)");
+  let window = killed_at.elapsed();
+  let restarted = await_daemon(&held.instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  assert!(
+    window < Duration::from_nanos(slates_db::replay::RECOVERY_BUDGET_NS),
+    "the window ({window:?}) is inside the recovery budget"
+  );
+  eprintln!("the held mount's window: {window:?}");
+  assert_eq!(
+    read_whole(&mut kept),
+    b"before-after",
+    "both writes, through the same descriptor"
+  );
+  assert_eq!(
+    read_whole(&mut unlinked),
+    b"orphan bytes",
+    "the unlinked file still reads through its descriptor"
+  );
+  kept.sync_all().expect(
+    "the unlink's publication captured the write before the kill, so nothing was lost to report",
+  );
+  held.assert_still_mounted_and_taken_over();
+  drop(kept);
+  drop(unlinked);
+  held.unmount();
+}
+
+/// A FUSE mount of a fresh volume behind an anchor, for the takeover tests (A-61); `None` (a loud skip) where the
+/// Linux mount does not run or the kernel cannot resend.
+#[cfg(target_os = "linux")]
+struct HeldMount {
+  instance: String,
+  id: String,
+  mount_point: MountPoint,
+  anchor: Option<AnchorProcess>,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldMount {
+  fn start(tag: &str) -> Option<HeldMount> {
+    if !linux_fuse_mount_runs() {
+      return None;
+    }
+    if !kernel_resends_fuse_requests() {
+      eprintln!(
+        "SKIP: this kernel cannot resend FUSE requests (before Linux 6.9); the mount ends with its daemon"
+      );
+      return None;
+    }
+    let instance = format!("cli-fuse-{tag}-{}", std::process::id());
+    let anchor = start_anchor(&instance);
+    let (code, out, err) = run(&instance, &["volume", "create", tag, "--bounded", "64MiB"]);
+    assert_eq!(code, 0, "{err}");
+    let id = value_of(&out, "id");
+    let mount_point = MountPoint {
+      path: fresh_mount_point(),
+    };
+    fuse_mount_and_check(&instance, &id, &mount_point.path);
+    Some(HeldMount {
+      instance,
+      id,
+      mount_point,
+      anchor: Some(anchor),
+    })
+  }
+
+  /// `name` in the mount, created empty, opened for reading and writing.
+  fn open(&self, name: &str) -> std::fs::File {
+    std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(format!("{}/{name}", self.mount_point.path))
+      .unwrap()
+  }
+
+  fn assert_still_mounted_and_taken_over(&self) {
+    let (fstype, _) = mountinfo_at(&self.mount_point.path).expect("the mount is still there");
+    assert_eq!(fstype, "fuse.slates");
+    assert_eq!(
+      attachments_of(&self.instance, &self.id),
+      "1",
+      "the mount's attachment is still recorded"
+    );
+    assert!(
+      counter_of(&self.instance, "fuse.adopted") >= 1,
+      "the restarted daemon reports the mount it took over"
+    );
+  }
+
+  fn unmount(mut self) {
+    let (code, _, err) = run(&self.instance, &["unmount", &self.mount_point.path]);
+    assert_eq!(code, 0, "slates unmount: {err}");
+    assert!(
+      wait_for(|| attachments_of(&self.instance, &self.id) == "0"),
+      "the unmount ends the attachment"
+    );
+    drop(self.anchor.take());
+  }
+}
+
+/// `SIGKILL`s the instance's daemon; its pid.
+#[cfg(target_os = "linux")]
+fn kill_the_daemon(instance: &str) -> u32 {
+  let killed = daemon_pid(instance).expect("the daemon answers");
+  let (code, _, err) = bounded(
+    Command::new("kill").args(["-9", &killed.to_string()]),
+    START_WAIT,
+  )
+  .unwrap();
+  assert_eq!(code, 0, "{err}");
+  killed
+}
+
+/// Every byte of `file`, read from its start through the same descriptor.
+#[cfg(target_os = "linux")]
+fn read_whole(file: &mut std::fs::File) -> Vec<u8> {
+  use std::io::{Read, Seek, SeekFrom};
+  file.seek(SeekFrom::Start(0)).unwrap();
+  let mut bytes = Vec::new();
+  file.read_to_end(&mut bytes).unwrap();
+  bytes
+}
+
+/// The sum over shards of the daemon counter `name` in `slates status` (`shard N refused NAME: COUNT`).
+#[cfg(target_os = "linux")]
+fn counter_of(instance: &str, name: &str) -> u64 {
+  let (_, out, _) = run(instance, &["status"]);
+  let suffix = format!(" refused {name}: ");
+  out
+    .lines()
+    .filter_map(|line| line.split_once(&suffix).map(|(_, count)| count))
+    .filter_map(|count| count.trim().parse::<u64>().ok())
+    .sum()
+}
+
+/// Shape: the kill cycles the in-flight test may take to catch a request the daemon read and had not answered;
+/// inside the anchor's restart policy, which allows a restart per daemon start the recovery budget holds.
+#[cfg(target_os = "linux")]
+const IN_FLIGHT_ATTEMPTS: usize = 3;
+/// Shape: the bytes of each write the in-flight test's writer makes (one page).
+#[cfg(target_os = "linux")]
+const IN_FLIGHT_WRITE: usize = 4096;
+/// Shape: the writes the writer makes before the kill, so it is in its stride when the daemon dies.
+#[cfg(target_os = "linux")]
+const WRITES_BEFORE: usize = 64;
+/// Shape: the writes the writer makes after the restarted daemon answers, so the file spans the takeover.
+#[cfg(target_os = "linux")]
+const WRITES_AFTER: usize = 64;
+/// Format: the page values cycle through this many, a prime, so a page out of place shows.
+#[cfg(target_os = "linux")]
+const PAGE_VALUES: usize = 251;
+
+/// What one kill cycle of the in-flight test saw: the pages it wrote, every one acknowledged, and whether its
+/// descriptor's `fsync` after the takeover reported lost writes (`EIO`).
+#[cfg(target_os = "linux")]
+struct Cycle {
+  pages: usize,
+  loss_reported: bool,
+}
+
+/// One kill cycle of the in-flight test: a writer thread appends numbered pages through one descriptor while the
+/// daemon is killed, stops after [`WRITES_AFTER`] writes past the restart, then `fsync`s that descriptor.
+/// `first` numbers the cycle's first page. A write that fails is the test's failure.
+#[cfg(target_os = "linux")]
+fn write_through_a_kill(instance: &str, path: &str, first: usize) -> Cycle {
+  use std::io::Write;
+  let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+  let restarted = std::sync::atomic::AtomicBool::new(false);
+  let progress = std::sync::atomic::AtomicUsize::new(0);
+  let pages = std::thread::scope(|scope| {
+    let writer = scope.spawn(|| {
+      let mut written = 0usize;
+      let mut after = 0usize;
+      while after < WRITES_AFTER {
+        let page = [u8::try_from((first + written) % PAGE_VALUES).unwrap_or(0); IN_FLIGHT_WRITE];
+        file
+          .write_all(&page)
+          .expect("every write is acknowledged across the kill (none fails or hangs)");
+        written += 1;
+        progress.store(written, std::sync::atomic::Ordering::Release);
+        if restarted.load(std::sync::atomic::Ordering::Acquire) {
+          after += 1;
+        }
+      }
+      written
+    });
+    // Kill only once the writer is in its stride, so a write is likely between the daemon's read and its reply.
+    assert!(
+      wait_for(|| progress.load(std::sync::atomic::Ordering::Acquire) >= WRITES_BEFORE),
+      "the writer started"
+    );
+    let killed = kill_the_daemon(instance);
+    await_daemon(instance, Some(killed), &[]);
+    restarted.store(true, std::sync::atomic::Ordering::Release);
+    writer.join().unwrap()
+  });
+  let loss_reported = match file.sync_all() {
+    Ok(()) => false,
+    Err(e) if e.raw_os_error() == Some(EIO) => true,
+    Err(e) => panic!("fsync after the takeover: {e}"),
+  };
+  Cycle {
+    pages,
+    loss_reported,
+  }
+}
+
+/// Format: `EIO`, the errno a lost write's `fsync` reports.
+#[cfg(target_os = "linux")]
+const EIO: i32 = 5;
+
+/// AC-3.4 / T-3.5 with a request in flight (A-61: `FUSE_NOTIFY_RESEND`, the dirty log). Do: mount a volume over
+/// FUSE; a writer thread appends numbered pages through one descriptor while the daemon is `SIGKILL`ed and on
+/// past the restart, then `fsync`s; repeat until the restarted daemon reports a request the kernel resent (one the
+/// dead daemon read and never answered), within [`IN_FLIGHT_ATTEMPTS`]. Expect: every write is acknowledged —
+/// none fails or hangs, so the resent request was served (without the resend its writer would wait forever); the
+/// file has every page's length; and no loss is silent: a cycle whose `fsync` succeeded wrote every page exactly,
+/// and pages the dead daemon acknowledged but never published read as zero only in a cycle whose `fsync` answered
+/// `EIO`, as Linux reports a writeback error. Gated like the takeover test.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_in_flight_at_the_daemons_kill_is_resent_and_no_loss_is_silent() {
+  let Some(held) = HeldMount::start("resend") else {
+    return;
+  };
+  let path = format!("{}/pages", held.mount_point.path);
+  drop(held.open("pages"));
+  let mut cycles = Vec::new();
+  let mut pages = 0usize;
+  while cycles.len() < IN_FLIGHT_ATTEMPTS && counter_of(&held.instance, "fuse.resent") == 0 {
+    let cycle = write_through_a_kill(&held.instance, &path, pages);
+    pages += cycle.pages;
+    cycles.push(cycle);
+  }
+  let resent = counter_of(&held.instance, "fuse.resent");
+  let mut reader = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
+  let bytes = read_whole(&mut reader);
+  drop(reader);
+  let reported = cycles.iter().filter(|cycle| cycle.loss_reported).count();
+  eprintln!(
+    "{} cycles, {resent} resent, {reported} reported lost writes",
+    cycles.len()
+  );
+  assert!(
+    resent >= 1,
+    "a kill caught a request in flight in {} attempts",
+    cycles.len()
+  );
+  assert_eq!(
+    bytes.len(),
+    pages * IN_FLIGHT_WRITE,
+    "every acknowledged page's length"
+  );
+  assert_no_silent_loss(&bytes, &cycles);
+  held.unmount();
+}
+
+/// Every page is exact, except that a cycle whose `fsync` answered `EIO` may hold zero pages — the writes the dead
+/// daemon acknowledged and never published, which it reported. A wrong page anywhere else is a silent loss.
+#[cfg(target_os = "linux")]
+fn assert_no_silent_loss(bytes: &[u8], cycles: &[Cycle]) {
+  let mut number = 0usize;
+  let mut pages = bytes.chunks(IN_FLIGHT_WRITE);
+  for cycle in cycles {
+    for _ in 0..cycle.pages {
+      let page = pages.next().unwrap_or(&[]);
+      let value = u8::try_from(number % PAGE_VALUES).unwrap_or(0);
+      let exact = page.iter().all(|byte| *byte == value);
+      let reported_hole = cycle.loss_reported && page.iter().all(|byte| *byte == 0);
+      assert!(
+        exact || reported_hole,
+        "page {number} is wrong and no fsync reported a loss"
+      );
+      number += 1;
+    }
+  }
 }
 
 /// Shape: container identities other than the mounting user's — root, an ordinary Linux first user, and the

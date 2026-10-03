@@ -29,14 +29,19 @@
 //! stop unmounts through `fusermount3 -u -z` (owned until reaped), and the kernel's disconnect then ends the
 //! serve task the same way. A serve error unmounts and ends likewise; nothing is left mounted and unserved.
 //!
-//! Owed (recorded in GAPS): the anchor holding the device across a daemon restart (§4.6 "restore from the
-//! anchor's held fd"), and one channel per shard (`FUSE_DEV_IOC_CLONE`).
+//! **Across a restart (A-61; AC-3.4).** The anchor holds each mount's device (`crate::fuse_hold`): sent before the
+//! record commits, with the session once `INIT` is answered, released at the end. A restarted daemon serves again
+//! each kept mount whose kernel can resend ([`adopt_held`]): its durable owner's references back, the restored
+//! serve state, one `FUSE_NOTIFY_RESEND`. A write is logged in the dirty log before its reply
+//! (`crate::dirty_log`), so one the dead daemon acknowledged and never published is reported `EIO`, never
+//! silent. Owed (recorded in GAPS): the exact replay of a barrier request applied but unanswered at the death,
+//! and one channel per shard (`FUSE_DEV_IOC_CLONE`).
 
 use std::collections::BTreeMap;
 
 use slates_bridge_core::scoped::ScopedBridge;
 use slates_bridge_core::volume_bridge::new_handle_store;
-use slates_bridge_core::{AttachmentId, Bridge, Rights, View, VolumeBridge};
+use slates_bridge_core::{AttachmentId, Bridge, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
   Dispatched, FuseChannel, Sent, ServeState, Turn, dispatch_ready, reclaim_dispatched, send_reply,
 };
@@ -71,6 +76,17 @@ const REPLY_UNMATCHED: &str = "fuse.reply_unmatched";
 /// Format: see [`MOUNT_REFUSED`] — the references and handles given back for replies that never reached their
 /// caller (AUD-29-85); the non-vacuity counter of the reclaim path.
 const REPLY_RECLAIMED: &str = "fuse.reply_reclaimed";
+/// Format: see [`MOUNT_REFUSED`] — a hold, session or release the anchor's channel refused (A-61): that mount's
+/// device is not held across a restart.
+const HOLD_REFUSED: &str = "fuse.hold_refused";
+/// Format: see [`MOUNT_REFUSED`] — a kept mount recovery could not serve again (A-61), unmounted and ended.
+const ADOPT_REFUSED: &str = "fuse.adopt_refused";
+/// Format: see [`MOUNT_REFUSED`] — the mounts served again after a restart from a held device (A-61); the
+/// takeover's non-vacuity counter.
+const ADOPTED: &str = "fuse.adopted";
+/// Format: see [`MOUNT_REFUSED`] — requests the kernel resent after a takeover's `FUSE_NOTIFY_RESEND` (A-61): ones
+/// a dead daemon read and never answered, served here; the resend's non-vacuity counter.
+const RESENT: &str = "fuse.resent";
 
 /// A mounted volume being served: its device, the serve loop's state, the open-handle map that persists
 /// across requests, the registry attachment its requests are admitted under, and where it is mounted.
@@ -83,6 +99,12 @@ pub(crate) struct FuseMount {
   mount_point: String,
   /// The directory a scoped mount presents (AUD-29-76): its bridge answers nothing outside it.
   scope: Option<u64>,
+  /// Whether the anchor has this connection's session (A-61): sent once, after the kernel's `INIT` is answered,
+  /// or already held for a mount taken over from a previous daemon.
+  session_held: bool,
+  /// For a mount taken over from a daemon that died, the files whose acknowledged writes the death lost (A-61):
+  /// reported `EIO` once to each handle opened before the takeover. Empty for a mount this daemon established.
+  lost: LostWrites,
 }
 
 impl std::fmt::Debug for FuseMount {
@@ -312,11 +334,20 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     release_unmounted_lease(s, &pending.record);
     crate::verbs::refused(refusal)
   };
+  // The anchor holds the device before the record commits (A-61), so a recorded mount's device outlives this
+  // process. A hold refused leaves a mount that ends with the process, counted; it is still served.
+  if matches!(
+    crate::fuse_hold::hold(attachment, std::os::fd::AsFd::as_fd(&channel.device())),
+    Some(Err(_))
+  ) {
+    *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
+  }
   let now = s.clock.monotonic_ns();
   let op = Op::AttachmentAdded {
     record: pending.record.clone(),
   };
   if let Err(e) = s.db.mutate(&mut s.segment, &op, now) {
+    let _ = crate::fuse_hold::release(attachment);
     return refuse(s, &mount_point, crate::error::refusal_of_db(&e));
   }
   let registry = match s.attachments.attach(
@@ -328,9 +359,11 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     Ok(registry) => registry,
     Err(e) => return refuse(s, &mount_point, crate::error::refusal_of_vfs(&e)),
   };
-  // The serve turn delivers the volume's invalidations before each request (AUD-29-79).
+  // The serve turn delivers the volume's invalidations before each request (AUD-29-79); the kernel's references
+  // are the record's, so they are carried across a restart (A-61).
   s.attachments
     .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
+  s.attachments.set_owner(registry, attachment);
   s.fuse_mounts.insert(
     attachment,
     FuseMount {
@@ -341,6 +374,8 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       volume,
       mount_point: mount_point.clone(),
       scope: pending.record.form.scope(),
+      session_held: false,
+      lost: LostWrites::default(),
     },
   );
   if futures::spawn(serve(attachment))
@@ -471,7 +506,8 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       store,
       &mut mount.handles,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-    );
+    )
+    .with_lost_writes(&mut mount.lost);
     let mut scoped = None;
     dispatch_ready(
       &mut mount.channel,
@@ -481,11 +517,19 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       &mut mount.serve,
     )
   };
+  hand_over_session(s, attachment, &mut mount);
   let turned = match dispatched {
     Ok(Turn::Idle) => Turned::Idle,
     Ok(Turn::Dropped) => Turned::Served,
     Ok(Turn::Ended) => return Turned::Ended,
-    Ok(Turn::Dispatched(dispatched)) => reply(s, &mut mount, &dispatched),
+    Ok(Turn::Dispatched(dispatched)) => {
+      log_write(s, &dispatched);
+      if dispatched.resent() {
+        let count = s.refusals.entry(RESENT).or_insert(0);
+        *count = count.saturating_add(1);
+      }
+      reply(s, &mut mount, &dispatched)
+    }
     Err(_) => {
       *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
       unmount_owned(&mount.mount_point);
@@ -591,12 +635,142 @@ fn fail(s: &mut ShardState, attachment: u64) {
   ended(s, attachment);
 }
 
+/// Logs a write's file in the shard's dirty log before its reply (A-61, `crate::dirty_log`): the write is
+/// acknowledged before the next publication, so a daemon that dies first must leave the file named for its
+/// successor. Logged before the reply, so a write applied and never answered is resent, not counted lost.
+fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
+  if dispatched.opcode != Some(slates_bridge_fuse::Opcode::Write) || dispatched.error != 0 {
+    return;
+  }
+  if let (Some(log), Some(object)) = (s.dirty_log.as_mut(), s.content.as_mut())
+    && log.mark(object, dispatched.nodeid()).is_err()
+  {
+    *s.refusals
+      .entry(crate::verbs::DIRTY_LOG_UNWRITTEN)
+      .or_insert(0) += 1;
+  }
+}
+
+/// Sends the anchor this mount's session once its `INIT` has been answered (A-61), so a restarted daemon can
+/// serve the device without the negotiation the kernel will not repeat.
+fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount) {
+  if mount.session_held {
+    return;
+  }
+  let Some(session) = mount.serve.session() else {
+    return;
+  };
+  mount.session_held = true;
+  if matches!(crate::fuse_hold::session(attachment, session), Some(Err(_))) {
+    *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
+  }
+}
+
+/// Serves again every FUSE mount recovery kept because the anchor held its device (A-61), and closes every held
+/// device recovery found no record for. Each kept mount gets a registry attachment from its record (its rights,
+/// its durable owner, so the references recovery gave back are its own), the serve state its session restored,
+/// and one `FUSE_NOTIFY_RESEND`, so the requests the dead daemon read and never answered come back; then its
+/// serve task. A mount that cannot be served again is unmounted and ended, counted.
+pub(crate) fn adopt_held() {
+  let (kept, orphaned) = state::with_state(|s| {
+    (
+      std::mem::take(&mut s.adopt_fuse),
+      std::mem::take(&mut s.inherited_fuse),
+    )
+  })
+  .unwrap_or_default();
+  for held in orphaned {
+    let _ = crate::fuse_hold::release(held.attachment);
+  }
+  for (record, held) in kept {
+    let _ = state::with_state(move |s| adopt_one(s, record, held));
+  }
+}
+
+/// Serves one kept mount again, or ends it.
+fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hold::HeldDevice) {
+  let attachment = record.id;
+  let mount_point = record
+    .form
+    .fuse_mount_point()
+    .unwrap_or_default()
+    .to_owned();
+  let end = |s: &mut ShardState| {
+    *s.refusals.entry(ADOPT_REFUSED).or_insert(0) += 1;
+    unmount_owned(&mount_point);
+    let _ = crate::fuse_hold::release(attachment);
+    if crate::verbs::end_attachment(s, &record).is_err() {
+      *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1;
+    }
+  };
+  let Some(session) = held.session else {
+    return end(s);
+  };
+  let Ok(channel) = FuseChannel::nonblocking(held.device) else {
+    return end(s);
+  };
+  let rights = Rights {
+    read: record.rights.read,
+    write: record.rights.write,
+  };
+  let Ok(registry) = s.attachments.attach(
+    record.volume,
+    View::Current,
+    record.principal.clone(),
+    rights,
+  ) else {
+    return end(s);
+  };
+  s.attachments
+    .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
+  s.attachments.set_owner(registry, attachment);
+  let mut resend = [0u8; slates_bridge_fuse::abi::OUT_HEADER_LEN];
+  let resent = slates_bridge_fuse::notify::resend(&mut resend)
+    .ok()
+    .and_then(|len| resend.get(..len))
+    .is_some_and(|message| channel.write_reply(message).is_ok());
+  if !resent {
+    s.attachments.revoke(registry);
+    s.attachments.drain(registry);
+    return end(s);
+  }
+  s.fuse_mounts.insert(
+    attachment,
+    FuseMount {
+      channel,
+      serve: ServeState::restored(session),
+      handles: new_handle_store(),
+      registry,
+      volume: record.volume,
+      mount_point: mount_point.clone(),
+      scope: record.form.scope(),
+      session_held: true,
+      lost: LostWrites::new(s.lost_files.inodes.clone(), s.lost_files.everything),
+    },
+  );
+  if futures::spawn(serve(attachment))
+    .and_then(futures::detach)
+    .is_err()
+  {
+    s.fuse_mounts.remove(&attachment);
+    s.attachments.revoke(registry);
+    s.attachments.drain(registry);
+    return end(s);
+  }
+  let count = s.refusals.entry(ADOPTED).or_insert(0);
+  *count = count.saturating_add(1);
+}
+
 /// The mount has ended: its device dropped, its registry attachment revoked and drained, and its catalog
 /// attachment ended as a recorded operation (unless a `detach` or destroy already ended it).
 fn ended(s: &mut ShardState, attachment: u64) {
   if let Some(mount) = s.fuse_mounts.remove(&attachment) {
     s.attachments.revoke(mount.registry);
     s.attachments.drain(mount.registry);
+  }
+  // The anchor closes its copy of the device (A-61), so an ended mount is never handed to the next daemon.
+  if matches!(crate::fuse_hold::release(attachment), Some(Err(_))) {
+    *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
   }
   if let Some(record) = s.db.partition().attachment(attachment).cloned()
     && crate::verbs::end_attachment(s, &record).is_err()

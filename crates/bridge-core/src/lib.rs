@@ -23,7 +23,7 @@ pub mod volume_bridge;
 pub use authority::{
   AttachmentId, Attachments, Barrier, CacheCoherence, ObjectId, OpContext, Rights, View,
 };
-pub use volume_bridge::{VolumeBridge, new_handle_store};
+pub use volume_bridge::{LostWrites, VolumeBridge, new_handle_store};
 
 use slates_vfs::error::VfsError;
 use slates_vfs::inode::Kind;
@@ -340,6 +340,12 @@ pub trait Bridge {
   /// Flush handle `fh` of `object` under `cx` (no disk write; success once the data is in the
   /// anchor).
   fn flush(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError>;
+  /// `fsync` of handle `fh` of `object` under `cx`: what [`Bridge::flush`] does, and also the point a writeback
+  /// error is consumed — reported here once, where every `flush` (each close of any copy of the descriptor,
+  /// a child's exec-time close included) reports it without consuming it (A-61, [`LostWrites`]).
+  fn fsync(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
+    self.flush(object, cx, fh)
+  }
   /// Create directory `name` in `parent` under `cx`; the attributes.
   fn mkdir(
     &mut self,

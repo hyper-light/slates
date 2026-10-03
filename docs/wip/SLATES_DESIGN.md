@@ -2164,12 +2164,32 @@ before the report is published, so a tool never reads attributes newer than the 
 > Every message is checked by kind, length and descriptor count. Proven across real processes: a daemon sends a
 > device and its session, then exits; the restarted daemon inherits that same device and reads what the first
 > one left in it (`crates/anchor/tests/anchor.rs`). The daemon's half, holding and taking over, and the exact
-> replay are next. Until they land, recovery still ends a FUSE mount.
+> replay are next.
 > References now survive a restart for an attachment that has a record (step 3a/3b): the volume attributes them
 > to a typed owner (`RefOwner`), the recovery image (version 10) carries a recorded attachment's references, and
 > recovery settles them. A surviving record keeps its references; every other holder's are released, and an
 > orphan left with no holder is reclaimed. Until this change such an orphan was never reclaimed
 > (`docs/bugs/2026-10-03-a-recovered-orphan-whose-holder-died-was-never-reclaimed.md`).
+> **The takeover is built (step 3; AC-3.4, T-3.5).** A daemon sends the anchor each FUSE device before the
+> mount's record commits, its session once `INIT` is answered, and a release at the end. At restart each device
+> goes to the shard that owns its mount. Recovery keeps a FUSE record whose device is held and whose kernel can
+> resend, and serves it again: a registry attachment with its durable owner, the restored serve state, then one
+> `FUSE_NOTIFY_RESEND`. Without a device or resend support it ends the mount as before. The dirty log reports
+> lost writes `EIO` (A-61). Proven through the real binary on Linux 6.12, as a non-root user, in
+> `crates/cli/tests/cli.rs`:
+> - `a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable`: a write after `SIGKILL` waits and
+>   succeeds; the window measured 23–134 ms, against a recovery budget of seconds. Both files read back through
+>   their descriptors, the unlinked one included, and the mount and its record remain.
+> - `a_write_in_flight_at_the_daemons_kill_is_resent_and_no_loss_is_silent`: a writer appends through the kill.
+>   Every write succeeds, a request the dead daemon read is resent and served (`fuse.resent`), and every
+>   acknowledged page is exact, or a zero hole in a cycle whose `fsync` answered `EIO`. It passed 3 of 3; before
+>   the dirty log it failed with a silent hole.
+> - Red-checked: with recovery's keep removed, the write after the kill fails `ECONNABORTED`.
+> On a kernel without resend (before 6.9) the old ending holds, proven by
+> `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`, which now skips on 6.9 and later.
+> Owed: (4) the exact replay of the one barrier request applied but unanswered at the kill (a resent `mkdir`
+> after its publication answers `EEXIST`); per-shard channels; and making every acknowledged write survive,
+> which needs the incremental publication.
 
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;
@@ -5884,7 +5904,10 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
   §4.6 "Linux").
 - T-3.5 (fault) Kill the daemon while a process holds an open file and is writing; expect the
   writes to wait during the window (A-61: the anchor holds the device), then recovery with every
-  acknowledged write present and the open file still usable.
+  write a barrier made stable (an earlier namespace change, `flush` or `fsync`; D-18) present and the
+  open file still usable; a write acknowledged after the last barrier and lost with the daemon is
+  never silent: the file's next `fsync` through a descriptor open at the kill answers `EIO`, as Linux
+  reports a writeback error, and every close until then does too.
 - T-3.6 (error) `allow_other` requested without `user_allow_other`; expect a typed refusal
   naming the config line.
 - T-3.7 (chaos) Unmount under load (`umount -l` by an operator); expect typed errors to clients
@@ -8234,11 +8257,25 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
     changes what survives publishes the recovery image before its reply. So a crash leaves at most one
     request per mount applied but unanswered. Its reply is published with its effect, and a resent request
     whose unique matches is answered with that reply, never applied twice.
+  - **The writes acknowledged after the last barrier.** A plain write is acknowledged before the barrier (D-18),
+    so the writes since the last publication die with the daemon while their writer runs on. Found by the
+    in-flight takeover test before anything landed: page 99 of a file written through the kill came back
+    wrong, its length right, and a later `fsync` would have succeeded. So the first write to a file after a
+    publication names the file in the shard's dirty log, a page of its slice of the anchor's content object
+    (one shared-memory store, no system call; `crates/server/src/dirty_log.rs`), and a publication that captured
+    every volume empties it. A restarted daemon reads it before anything publishes. Each file it names answers
+    every `flush` through a handle opened before the takeover `EIO`, and its first `fsync` `EIO` once
+    (`slates_bridge_core::LostWrites`). A flush reports without consuming the error, since every close of any
+    copy of a descriptor sends one, a spawned child's exec-time close included; measured: such a close took a
+    one-time report the writer's own `fsync` needed. A log past its page reports every file. Making every
+    acknowledged write survive instead needs the owed incremental publication (each barrier re-images the
+    shard today).
 - Evidence: the kernel's resend contract, transcribed from the 7.41 uapi header on 2026-10-03
   (`FUSE_HAS_RESEND`, `FUSE_NOTIFY_RESEND = 7`, `FUSE_UNIQUE_RESEND`); the recovery image's orphan tracking
   (`crates/vfs/src/recover.rs`), which already anticipated this handoff.
 - What it changes in the failure matrix: during the window a Linux mount's requests wait on the held device
   instead of failing `ENOTCONN`.
-- Built in order: (1) the codec's resend and the session, (2) the anchor's channel, (3) holding and taking
-  over, (4) the exact replay. Each lands with its tests; the §4.6 status says which are built.
+- Built in order: (1) the codec's resend and the session, (2) the anchor's channel, (3) the references carried
+  in the image, holding and taking over, and the dirty log, (4) the exact replay. Each lands with its tests; the
+  §4.6 status says which are built.
 

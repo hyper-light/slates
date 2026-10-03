@@ -152,6 +152,15 @@ pub struct ShardState {
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
+  /// The files written since the last complete publication, logged in the page before `content_range` in the
+  /// anchor's content object (A-61; `crate::dirty_log`); `None` without a content object. Linux only: the log
+  /// serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost itself).
+  #[cfg(target_os = "linux")]
+  pub(crate) dirty_log: Option<crate::dirty_log::DirtyLog>,
+  /// What the previous daemon's log named when this one started: the files whose acknowledged writes its death
+  /// lost, reported to the mounts the anchor held across it (A-61). Linux only, as FUSE is.
+  #[cfg(target_os = "linux")]
+  pub(crate) lost_files: crate::dirty_log::LostFiles,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
   /// client that holds unstable writes from before a restart sees it change and re-sends them.
@@ -271,6 +280,17 @@ pub struct ShardState {
   /// each dead mount is unmounted once the shard runs (`fuse::unmount_stale`). Filled once, at recovery, and
   /// emptied by that step; bounded by the partition's attachment cap.
   pub(crate) stale_fuse_mounts: Vec<(u64, String)>,
+  /// The FUSE devices the anchor handed back for this shard's partition (A-61; `crate::fuse_hold`), until recovery
+  /// takes each for its kept mount or closes it. Bounded by the anchor's held-device bound.
+  #[cfg(target_os = "linux")]
+  pub(crate) inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
+  /// The FUSE mounts recovery kept because the anchor held their devices (A-61), each with its record, served
+  /// again once the shard runs (`fuse::adopt_held`). Filled once at recovery and emptied by that step.
+  #[cfg(target_os = "linux")]
+  pub(crate) adopt_fuse: Vec<(
+    slates_db::catalog::AttachmentRecord,
+    crate::fuse_hold::HeldDevice,
+  )>,
   /// The read-only views of snapshots presented through host mounts and guest devices, by attachment (AUD-29-76;
   /// `crate::snapshot_view`). Bounded by the partition's attachment cap: one per recorded snapshot attachment.
   pub(crate) snapshot_views: std::collections::BTreeMap<u64, crate::snapshot_view::SnapshotView>,

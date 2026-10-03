@@ -249,6 +249,10 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.flush(object, cx, fh)
   }
 
+  fn fsync(&mut self, object: ObjectId, cx: &OpContext, fh: u64) -> Result<(), VfsError> {
+    self.inner.fsync(object, cx, fh)
+  }
+
   fn mkdir(
     &mut self,
     parent: ObjectId,

@@ -595,6 +595,17 @@ pub struct Dispatched {
 }
 
 impl Dispatched {
+  /// The node the request named (the kernel's node id; the root is 1).
+  pub fn nodeid(&self) -> u64 {
+    self.nodeid
+  }
+
+  /// Whether the kernel resent this request after a `FUSE_NOTIFY_RESEND` ([`crate::abi::UNIQUE_RESEND`]): a
+  /// request a previous daemon read and never answered (A-61).
+  pub fn resent(&self) -> bool {
+    self.unique & crate::abi::UNIQUE_RESEND != 0
+  }
+
   /// Whether the request's reply waits for its owner's barrier ([`crate::bridge::needs_barrier`]).
   pub fn needs_barrier(&self) -> bool {
     crate::bridge::needs_barrier(self.opcode, self.error)

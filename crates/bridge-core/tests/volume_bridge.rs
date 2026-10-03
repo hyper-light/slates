@@ -1263,3 +1263,94 @@ fn an_alias_homed_in_another_directory_inside_the_scope_is_listed_and_found() {
   );
   assert_eq!(scoped.lookup(oid(b), &cx, "alias").unwrap().ino, f.ino);
 }
+
+/// A-61 (a mount taken over after its daemon died). Do: serve a volume holding `lost` and `kept` through a bridge
+/// told `lost` lost writes; flush `lost` twice through a handle the dead daemon issued (one this bridge never
+/// did), then fsync it twice and flush it; flush `kept` through another; flush `lost` through a handle opened
+/// after the takeover. Expect: both flushes answer `RecoveryIncomplete` (the kernel's `EIO`) without consuming
+/// it, the first fsync answers it and consumes it, and the next fsync and flush succeed — the writer is told once,
+/// as a Linux writeback error is; `kept` and the new handle see no error. With every file lost (the record
+/// overflowed), any old handle's first fsync answers it.
+#[test]
+fn a_lost_write_is_reported_once_to_each_handle_that_predates_the_takeover() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let (lost, kept) = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = bridge.root(&cx).unwrap();
+    let lost = bridge
+      .create(oid(root), &cx, "lost", 0o644, 0)
+      .unwrap()
+      .0
+      .ino;
+    let kept = bridge
+      .create(oid(root), &cx, "kept", 0o644, 0)
+      .unwrap()
+      .0
+      .ino;
+    (lost, kept)
+  };
+  /// Format: handles the dead daemon issued, which this bridge never did.
+  const OLD_HANDLES: [u64; 2] = [0xDEAD_0000_0001, 0xDEAD_0000_0002];
+  let mut handles = slates_bridge_core::new_handle_store();
+  let mut record =
+    slates_bridge_core::LostWrites::new(std::collections::BTreeSet::from([lost]), false);
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  )
+  .with_lost_writes(&mut record);
+  for close in ["a child's exec-time close", "another close"] {
+    assert_eq!(
+      bridge.flush(oid(lost), &cx, OLD_HANDLES[0]),
+      Err(VfsError::RecoveryIncomplete),
+      "{close} reports without consuming"
+    );
+  }
+  assert_eq!(
+    bridge.fsync(oid(lost), &cx, OLD_HANDLES[0]),
+    Err(VfsError::RecoveryIncomplete),
+    "the writer's fsync"
+  );
+  assert_eq!(
+    bridge.fsync(oid(lost), &cx, OLD_HANDLES[0]),
+    Ok(()),
+    "told once"
+  );
+  assert_eq!(
+    bridge.flush(oid(lost), &cx, OLD_HANDLES[0]),
+    Ok(()),
+    "and the close after it succeeds"
+  );
+  assert_eq!(
+    bridge.flush(oid(kept), &cx, OLD_HANDLES[1]),
+    Ok(()),
+    "a file that lost nothing"
+  );
+  let fresh = bridge.open(oid(lost), &cx, 0).unwrap();
+  assert_eq!(
+    bridge.flush(oid(lost), &cx, fresh),
+    Ok(()),
+    "a handle opened after the takeover"
+  );
+  drop(bridge);
+  let mut everything = slates_bridge_core::LostWrites::new(std::collections::BTreeSet::new(), true);
+  let mut handles = slates_bridge_core::new_handle_store();
+  let mut bridge = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  )
+  .with_lost_writes(&mut everything);
+  assert_eq!(
+    bridge.fsync(oid(kept), &cx, OLD_HANDLES[1]),
+    Err(VfsError::RecoveryIncomplete)
+  );
+  assert_eq!(bridge.fsync(oid(kept), &cx, OLD_HANDLES[1]), Ok(()));
+}

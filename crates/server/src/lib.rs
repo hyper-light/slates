@@ -31,6 +31,8 @@ pub mod content_retention;
 pub use consensus_recovery::{RecoveryKey, recovery_proof};
 pub mod daemon;
 pub mod deploy;
+#[cfg(target_os = "linux")]
+mod dirty_log;
 pub mod discovery;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
@@ -41,6 +43,8 @@ pub mod error;
 pub mod fleet;
 #[cfg(target_os = "linux")]
 mod fuse;
+#[cfg(target_os = "linux")]
+mod fuse_hold;
 pub mod head;
 pub mod histogram;
 pub mod landing;
