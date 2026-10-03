@@ -6,7 +6,8 @@
 //! Linux only: `/dev/fuse` and the FUSE ABI are the Linux kernel's. The serve loop and the
 //! device I/O run in the CI Linux lane against a real mount; this file compiles and cross-lints
 //! everywhere. The blocking loop here is the fallback the design names; the io_uring command
-//! path and the per-shard `FUSE_DEV_IOC_CLONE` channels are the driver's next pieces (owed), and
+//! path is the driver's next piece (owed); a mount keeps one channel, on its volume's owner shard (A-62: per-shard
+//! `FUSE_DEV_IOC_CLONE` channels measured and rejected), and
 //! the mount establishment (the new mount API, or `fusermount3`) is [`crate::mount`].
 //!
 //! Kernel coherence (§4.6 "Cache posture"; AUD-02): the loop runs one delivery round
@@ -116,8 +117,8 @@ impl std::fmt::Debug for FuseChannel {
 
 impl FuseChannel {
   /// Opens `/dev/fuse`. The mount ([`crate::mount`]) then attaches this descriptor to a mount
-  /// point; several channels over one connection are made by cloning the descriptor
-  /// (`FUSE_DEV_IOC_CLONE`, owed).
+  /// point; a mount keeps this one channel, read by its volume's owner shard (A-62: clones over one
+  /// connection, `FUSE_DEV_IOC_CLONE`, would hand most requests to a shard that cannot serve them).
   pub fn open() -> Result<FuseChannel, ChannelError> {
     // /dev/fuse is a character device the kernel exposes, opened read-write to exchange FUSE
     // messages; it is not a disk file and creates nothing (R1, §4.6).

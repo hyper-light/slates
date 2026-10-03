@@ -35,8 +35,9 @@
 //! serve state, one `FUSE_NOTIFY_RESEND`. A write is logged in the dirty log before its reply
 //! (`crate::dirty_log`), so one the dead daemon acknowledged and never published is reported `EIO`, never
 //! silent. A barrier's reply rides its publication, so a request the dead daemon applied and never answered is
-//! answered from that record when the kernel resends it, never applied twice. Owed (recorded in GAPS): one
-//! channel per shard (`FUSE_DEV_IOC_CLONE`).
+//! answered from that record when the kernel resends it, never applied twice. One channel per mount, on its
+//! volume's owner shard: per-shard channels would hand most requests to a shard that cannot serve the volume
+//! (A-62, measured and rejected).
 
 use std::collections::BTreeMap;
 

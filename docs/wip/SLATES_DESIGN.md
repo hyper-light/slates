@@ -2136,8 +2136,9 @@ it, and **refuses writeback cache** (corrected 2026-09-19: under `FUSE_WRITEBACK
 owns a regular file's size and times and ignores the daemon's, so a change made through another
 attachment stays invisible to `stat` even after an accepted invalidation — measured on Linux 6.12,
 `docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`; write-through also
-keeps every `write`'s bytes in the daemon before the call returns, D-18); one channel per shard
-(`FUSE_DEV_IOC_CLONE`, or io_uring per-core queues). Cache posture: only negotiated, tested features may be advertised. Infinite cache
+keeps every `write`'s bytes in the daemon before the call returns, D-18); one channel per mount, on its
+volume's owner shard (A-62: per-shard channels, `FUSE_DEV_IOC_CLONE` or io_uring per-core queues, measured and
+rejected for a one-volume mount). Cache posture: only negotiated, tested features may be advertised. Infinite cache
 lifetimes require proven invalidation delivery and recovery for every mutation source; a
 notifier encoder alone cannot justify them. Unsupported semantics are explicitly refused.
 Live source names/attributes/content cannot have an indefinite kernel cache lifetime:
@@ -5845,7 +5846,7 @@ io_uring queues on 6.14+, invalidations, splice/registered buffers), root-mount 
 fd handoff through the anchor, `slates exec`, the conformance and workload harnesses on Linux.
 
 **Ordered tasks.**
-1. The driver: request framing, reply writes, notifications; `FUSE_DEV_IOC_CLONE` per shard;
+1. The driver: request framing, reply writes, notifications; one channel per mount on its owner shard (A-62);
    the io_uring command path with fallback; negotiation of splice, readdirplus,
    `EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, `INC_EPOCH` (writeback cache refused: the kernel would own
    sizes and times a volume changes through other attachments, §4.6 "Linux", 2026-09-19).
@@ -8285,4 +8286,18 @@ Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, 
 - Built in order: (1) the codec's resend and the session, (2) the anchor's channel, (3) the references carried
   in the image, holding and taking over, and the dirty log, (4) the exact replay. Each lands with its tests; the
   §4.6 status says which are built.
+
+### A-62 — A FUSE mount keeps one channel, on its volume's owner shard (2026-10-03)
+Applied in the same change to: §4.6 "Linux", the Phase 3 driver task, GAPS (AUD-29-64's follow-up).
+- Why: §4.6 asked for "one channel per shard (`FUSE_DEV_IOC_CLONE`, or io_uring per-core queues)", and AUD-29-64's
+  closure listed it as a follow-up. Each slates FUSE mount presents one volume (a whole, scoped or shared form),
+  and a volume's state is served by its owner shard alone: that ownership is the data-path rule (no locks, §4.3).
+- What per-shard channels would do: the kernel hands each request to whichever cloned reader takes it next
+  (io_uring's per-core queues route by the submitting CPU), never by volume. So with N shards, (N−1)/N of a mount's
+  requests would arrive on a shard that cannot serve them and cross to the owner. That costs a cross-shard wake
+  round trip, measured at 0.5 µs with both shards spinning and 6.25 µs with both parking (`docs/wip/BENCHMARKS.md`).
+  It buys no parallelism, since the owner serves the volume's requests one at a time either way.
+- Decision: one channel per mount, read by the volume's owner shard (built: `crates/server/src/fuse.rs`).
+  Different mounts already spread across shards with their volumes. Per-shard channels are rejected for one-volume
+  mounts. They would be reconsidered only for a single mount presenting many volumes, which slates does not build.
 
