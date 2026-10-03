@@ -56,10 +56,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// the shard's held replicas, so a content acknowledgement survives a warm restart; 9 (AUD-29-55,
 /// 2026-10-01) the held replicas' transfers in progress (stages), so a cut transfer resumes from its
 /// verified chunks after a warm restart; 10 (A-61, 2026-10-03) every recorded attachment's references, so a
-/// FUSE mount the anchor held gets its kernel's references back after a restart.
+/// FUSE mount the anchor held gets its kernel's references back after a restart; 11 (A-61, 2026-10-03) the
+/// replies a barrier publishes with its effect, so a request the dead daemon applied and never answered is
+/// answered from the record, never applied twice.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 10;
+const IMAGE_VERSION: u16 = 11;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -414,6 +416,21 @@ pub struct ShardImage {
   /// canonical image, opaque here (the cluster plane encodes and decodes it), empty when nothing is held.
   /// A holder acknowledges a content put only once an image carrying it is committed.
   pub held: Vec<u8>,
+  /// The replies a barrier published with its effect and had not yet delivered (A-61): at most one per FUSE
+  /// mount, opaque here (the transport encodes them).
+  pub replies: Vec<HeldReply>,
+}
+
+/// A transport's reply published with the effect it answers (A-61): the mount's attachment, the request's unique
+/// id (without the kernel's resend bit), and the reply's bytes, opaque here.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldReply {
+  /// The attachment of the mount the request came through.
+  pub attachment: u64,
+  /// The request's unique id.
+  pub unique: u64,
+  /// The reply's bytes.
+  pub reply: Vec<u8>,
 }
 
 impl ShardImage {
@@ -425,12 +442,19 @@ impl ShardImage {
       version: IMAGE_VERSION,
       volumes,
       held: Vec::new(),
+      replies: Vec::new(),
     }
   }
 
   /// This image carrying `held`, the shard's held replicas' canonical image (AUD-29-59).
   pub fn with_held(self, held: Vec<u8>) -> ShardImage {
     ShardImage { held, ..self }
+  }
+
+  /// This image carrying `replies`, the barrier replies not yet delivered (A-61), in attachment order.
+  pub fn with_replies(self, mut replies: Vec<HeldReply>) -> ShardImage {
+    replies.sort_by_key(|reply| reply.attachment);
+    ShardImage { replies, ..self }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version

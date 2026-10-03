@@ -1692,3 +1692,26 @@ fn an_image_with_a_corrupt_reference_record_is_refused() {
     );
   }
 }
+
+/// A-61 (the exact replay's record). Do: a shard image carrying two barrier replies, given out of attachment order;
+/// encode it twice and decode it. Expect: identical bytes both times (a determinism gate) and the replies back in
+/// attachment order, each with its unique and bytes.
+#[test]
+fn a_shard_image_carries_its_undelivered_replies_in_a_canonical_order() {
+  use slates_vfs::recover::{HeldReply, ShardImage};
+  let reply = |attachment: u64, unique: u64| HeldReply {
+    attachment,
+    unique,
+    reply: vec![16, 0, 0, 0, 0, 0, 0, 0],
+  };
+  let image = ShardImage::new(Vec::new()).with_replies(vec![reply(9, 70), reply(2, 31)]);
+  let bytes = image.to_content();
+  assert_eq!(
+    bytes,
+    ShardImage::new(Vec::new())
+      .with_replies(vec![reply(2, 31), reply(9, 70)])
+      .to_content()
+  );
+  let decoded = ShardImage::from_content(&bytes).unwrap();
+  assert_eq!(decoded.replies, [reply(2, 31), reply(9, 70)]);
+}

@@ -161,6 +161,15 @@ pub struct ShardState {
   /// lost, reported to the mounts the anchor held across it (A-61). Linux only, as FUSE is.
   #[cfg(target_os = "linux")]
   pub(crate) lost_files: crate::dirty_log::LostFiles,
+  /// The barrier reply each FUSE mount is about to deliver (A-61): recorded before the barrier publishes, so the
+  /// publication carries it with the effect, and removed once written. At most one per mount (a mount serves one
+  /// request at a time).
+  #[cfg(target_os = "linux")]
+  pub(crate) pending_replies: std::collections::BTreeMap<u64, slates_vfs::recover::HeldReply>,
+  /// The barrier replies the previous daemon published and never delivered, by attachment (A-61), handed to the
+  /// mounts recovery keeps.
+  #[cfg(target_os = "linux")]
+  pub(crate) recovered_replies: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
   /// The NFS write verifier this shard's exports answer WRITE and COMMIT with (RFC 1813
   /// `writeverf3`, §4.6): the shard's boot instant, so it is unique to this daemon instance and a
   /// client that holds unstable writes from before a restart sees it change and re-sends them.

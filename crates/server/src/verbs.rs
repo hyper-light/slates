@@ -6661,7 +6661,21 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // The shard's recovery images from anchor-owned RAM (§4.8), by volume id, and the replicas it held for
   // other owners (AUD-29-59). Empty when there is no content object (a degraded build), or a fresh one
   // with nothing published yet.
-  let (images, held) = recover_images(state);
+  let RecoveredImages {
+    volumes: images,
+    held,
+    replies,
+  } = recover_images(state);
+  // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
+  #[cfg(target_os = "linux")]
+  {
+    state.recovered_replies = replies
+      .into_iter()
+      .map(|reply| (reply.attachment, (reply.unique, reply.reply)))
+      .collect();
+  }
+  #[cfg(not(target_os = "linux"))]
+  drop(replies);
   let mut rebuilt = Rebuilt::default();
   match slates_cluster::content::ContentHold::from_image(
     &mut crate::content_holder::hold_space(&mut state.store),
@@ -6987,15 +7001,13 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
 /// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
 /// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
 /// matching §4.8's "never an empty success".
-fn recover_images(
-  state: &ShardState,
-) -> (std::collections::BTreeMap<[u8; 16], VolumeImage>, Vec<u8>) {
+fn recover_images(state: &ShardState) -> RecoveredImages {
   let (start, end) = state.content_range;
   let Some(object) = &state.content else {
-    return (std::collections::BTreeMap::new(), Vec::new());
+    return RecoveredImages::default();
   };
   if end <= start || end > object.len() {
-    return (std::collections::BTreeMap::new(), Vec::new());
+    return RecoveredImages::default();
   }
   let view = ContentView {
     object,
@@ -7003,23 +7015,33 @@ fn recover_images(
     len: end - start,
   };
   match ShardImage::read_from(&view) {
-    Ok(Some(shard)) => (
-      shard
+    Ok(Some(shard)) => RecoveredImages {
+      volumes: shard
         .volumes
         .into_iter()
         .map(|keyed| (keyed.key, keyed.image))
         .collect(),
-      shard.held,
-    ),
-    Ok(None) => (std::collections::BTreeMap::new(), Vec::new()),
+      held: shard.held,
+      replies: shard.replies,
+    },
+    Ok(None) => RecoveredImages::default(),
     Err(e) => {
       eprintln!(
         "slates-server: partition {}: shard image unreadable: {e}",
         state.partition
       );
-      (std::collections::BTreeMap::new(), Vec::new())
+      RecoveredImages::default()
     }
   }
+}
+
+/// What a shard's last committed image held: its volumes by id, the replicas it held for other owners
+/// (AUD-29-59), and the barrier replies it had not delivered (A-61).
+#[derive(Default)]
+struct RecoveredImages {
+  volumes: std::collections::BTreeMap<[u8; 16], VolumeImage>,
+  held: Vec<u8>,
+  replies: Vec<slates_vfs::recover::HeldReply>,
 }
 
 /// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
@@ -7122,8 +7144,14 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let shard =
-    ShardImage::new(keyed).with_held(state.held_content.to_image(state.store.content.arena()));
+  // The barrier replies not yet delivered ride with the effects they answer (A-61).
+  #[cfg(target_os = "linux")]
+  let replies = state.pending_replies.values().cloned().collect();
+  #[cfg(not(target_os = "linux"))]
+  let replies = Vec::new();
+  let shard = ShardImage::new(keyed)
+    .with_held(state.held_content.to_image(state.store.content.arena()))
+    .with_replies(replies);
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };

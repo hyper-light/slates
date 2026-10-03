@@ -387,6 +387,10 @@ pub struct ServeState {
   /// What the connection negotiated at `INIT`, once it has: what a restarted daemon needs to serve this
   /// device (§4.6 "restore from the anchor's held fd"), handed to the anchor beside it.
   session: Option<Session>,
+  /// For a device taken over from a daemon that died (A-61), the reply that daemon published with a barrier's
+  /// effect and never delivered — the request's unique id (without the resend bit) and the reply's bytes —
+  /// answered when the kernel resends that request, so its effect is never applied twice.
+  replay: Option<(u64, Vec<u8>)>,
   /// Where the kernel's cache stands and what it is owed (AUD-02).
   pub coherence: Coherence,
 }
@@ -407,18 +411,41 @@ impl ServeState {
       reply: vec![0u8; BUFFER_BYTES],
       expire_only: false,
       session: None,
+      replay: None,
       coherence: Coherence::new(),
     }
   }
 
-  /// The state of a device taken over from a previous daemon: what its connection negotiated, and nothing in
-  /// the kernel's cache that this daemon knows of.
-  pub fn restored(session: Session) -> ServeState {
+  /// The state of a device taken over from a previous daemon: what its connection negotiated, the reply that
+  /// daemon published and never delivered (if any), and nothing in the kernel's cache that this daemon knows of.
+  pub fn restored(session: Session, replay: Option<(u64, Vec<u8>)>) -> ServeState {
     ServeState {
       expire_only: session.expire_only,
       session: Some(session),
+      replay,
       ..ServeState::new()
     }
+  }
+
+  /// The recorded reply for the request with `unique`, once, when the kernel resent the very request it answers
+  /// ([`crate::abi::UNIQUE_RESEND`] set, the rest equal): its bytes with the reply's unique set to the resent
+  /// request's, as the kernel matches the whole word.
+  fn replay_for(&mut self, unique: u64) -> Option<Vec<u8>> {
+    let resent = unique & crate::abi::UNIQUE_RESEND != 0;
+    let matches = self
+      .replay
+      .as_ref()
+      .is_some_and(|(recorded, _)| resent && *recorded == unique & !crate::abi::UNIQUE_RESEND);
+    if !matches {
+      return None;
+    }
+    let (_, mut reply) = self.replay.take()?;
+    /// Format: where `fuse_out_header`'s unique sits, after its length and error words.
+    const AT_UNIQUE: usize = 2 * size_of::<u32>();
+    reply
+      .get_mut(AT_UNIQUE..AT_UNIQUE + size_of::<u64>())?
+      .copy_from_slice(&unique.to_le_bytes());
+    Some(reply)
   }
 
   /// What the connection negotiated, once its `INIT` has been answered.
@@ -600,6 +627,17 @@ impl Dispatched {
     self.nodeid
   }
 
+  /// The request's unique id, without the kernel's resend bit: what a recorded reply is matched by (A-61).
+  pub fn unique(&self) -> u64 {
+    self.unique & !crate::abi::UNIQUE_RESEND
+  }
+
+  /// The reply this request's dispatch left in `state`, before [`send_reply`] writes it: what a barrier publishes
+  /// with the effect (A-61). Empty for a request that takes no reply.
+  pub fn reply<'s>(&self, state: &'s ServeState) -> &'s [u8] {
+    state.reply.get(..self.len).unwrap_or(&[])
+  }
+
   /// Whether the kernel resent this request after a `FUSE_NOTIFY_RESEND` ([`crate::abi::UNIQUE_RESEND`]): a
   /// request a previous daemon read and never answered (A-61).
   pub fn resent(&self) -> bool {
@@ -623,6 +661,9 @@ pub enum Turn {
   Ended,
   /// A request was dispatched; its reply waits in the state for [`send_reply`].
   Dispatched(Dispatched),
+  /// A resent request was answered from the reply its dead daemon published and never delivered (A-61): applied
+  /// once, by that daemon, never again.
+  Replayed,
 }
 
 /// One non-blocking turn for an owner that makes a request's effect durable before answering (the daemon,
@@ -652,6 +693,11 @@ pub fn dispatch_ready(
   let parsed = Request::parse(&request).ok();
   let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
   let nodeid = parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid);
+  if let Some(answer) = state.replay_for(unique) {
+    attachments.end(attachment);
+    channel.write_reply(&answer)?;
+    return Ok(Turn::Replayed);
+  }
   let opcode = parsed.and_then(|parsed| {
     if parsed.opcode == Some(Opcode::Init) {
       state.negotiated(parsed.body);
@@ -772,5 +818,60 @@ impl From<FuseError> for ChannelError {
       call: "codec",
       code: None,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// Format: a recorded reply: `fuse_out_header` (len 16, error 0, unique 41) and no body.
+  const RECORDED: [u8; 16] = [16, 0, 0, 0, 0, 0, 0, 0, 41, 0, 0, 0, 0, 0, 0, 0];
+
+  fn restored() -> ServeState {
+    let session = Session {
+      expire_only: true,
+      kernel_resends: true,
+    };
+    ServeState::restored(session, Some((41, RECORDED.to_vec())))
+  }
+
+  /// A-61 (the exact replay). Do: offer a restored state the resent request its dead daemon answered, then the same
+  /// unique again. Expect: the recorded reply, its unique set to the resent request's (resend bit included, as
+  /// the kernel matches the whole word); the second time nothing — answered once.
+  #[test]
+  fn a_resent_request_is_answered_from_its_record_once() {
+    let mut state = restored();
+    let resent = 41 | crate::abi::UNIQUE_RESEND;
+    let answer = state.replay_for(resent).unwrap();
+    assert_eq!(
+      answer.get(..8),
+      RECORDED.get(..8),
+      "length and error unchanged"
+    );
+    assert_eq!(
+      answer.get(8..16),
+      Some(&resent.to_le_bytes()[..]),
+      "the resent unique, whole"
+    );
+    assert_eq!(state.replay_for(resent), None, "answered once");
+  }
+
+  /// A-61. Do: offer the recorded unique without the resend bit (a request the kernel never resent: uniques are
+  /// not reused, so this would be another request), and a different resent unique. Expect: neither is answered from
+  /// the record, which stays for its own request.
+  #[test]
+  fn only_the_resent_request_the_record_answers_is_replayed() {
+    let mut state = restored();
+    assert_eq!(state.replay_for(41), None, "not resent");
+    assert_eq!(
+      state.replay_for(42 | crate::abi::UNIQUE_RESEND),
+      None,
+      "another request"
+    );
+    assert!(
+      state.replay_for(41 | crate::abi::UNIQUE_RESEND).is_some(),
+      "the record stayed for its request"
+    );
   }
 }

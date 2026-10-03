@@ -2556,6 +2556,10 @@ fn init_shard(
     dirty_log,
     #[cfg(target_os = "linux")]
     lost_files,
+    #[cfg(target_os = "linux")]
+    pending_replies: std::collections::BTreeMap::new(),
+    #[cfg(target_os = "linux")]
+    recovered_replies: std::collections::BTreeMap::new(),
     write_verifier: now.to_be_bytes(),
     #[cfg(unix)]
     nfs_v4: None,

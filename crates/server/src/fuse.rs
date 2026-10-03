@@ -34,8 +34,9 @@
 //! each kept mount whose kernel can resend ([`adopt_held`]): its durable owner's references back, the restored
 //! serve state, one `FUSE_NOTIFY_RESEND`. A write is logged in the dirty log before its reply
 //! (`crate::dirty_log`), so one the dead daemon acknowledged and never published is reported `EIO`, never
-//! silent. Owed (recorded in GAPS): the exact replay of a barrier request applied but unanswered at the death,
-//! and one channel per shard (`FUSE_DEV_IOC_CLONE`).
+//! silent. A barrier's reply rides its publication, so a request the dead daemon applied and never answered is
+//! answered from that record when the kernel resends it, never applied twice. Owed (recorded in GAPS): one
+//! channel per shard (`FUSE_DEV_IOC_CLONE`).
 
 use std::collections::BTreeMap;
 
@@ -87,6 +88,9 @@ const ADOPTED: &str = "fuse.adopted";
 /// Format: see [`MOUNT_REFUSED`] — requests the kernel resent after a takeover's `FUSE_NOTIFY_RESEND` (A-61): ones
 /// a dead daemon read and never answered, served here; the resend's non-vacuity counter.
 const RESENT: &str = "fuse.resent";
+/// Format: see [`MOUNT_REFUSED`] — resent requests answered from the reply their dead daemon published and never
+/// delivered (A-61); the exact replay's non-vacuity counter.
+const REPLAYED: &str = "fuse.replayed";
 
 /// A mounted volume being served: its device, the serve loop's state, the open-handle map that persists
 /// across requests, the registry attachment its requests are admitted under, and where it is mounted.
@@ -521,6 +525,11 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
   let turned = match dispatched {
     Ok(Turn::Idle) => Turned::Idle,
     Ok(Turn::Dropped) => Turned::Served,
+    Ok(Turn::Replayed) => {
+      let count = s.refusals.entry(REPLAYED).or_insert(0);
+      *count = count.saturating_add(1);
+      Turned::Served
+    }
     Ok(Turn::Ended) => return Turned::Ended,
     Ok(Turn::Dispatched(dispatched)) => {
       log_write(s, &dispatched);
@@ -528,7 +537,7 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
         let count = s.refusals.entry(RESENT).or_insert(0);
         *count = count.saturating_add(1);
       }
-      reply(s, &mut mount, &dispatched)
+      reply(s, attachment, &mut mount, &dispatched)
     }
     Err(_) => {
       *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
@@ -554,8 +563,23 @@ fn scoped_or_whole<'a>(
 }
 
 /// Runs a dispatched request's barrier when it needs one, then writes its reply or `EIO`.
-fn reply(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) -> Turned {
+fn reply(
+  s: &mut ShardState,
+  attachment: u64,
+  mount: &mut FuseMount,
+  dispatched: &Dispatched,
+) -> Turned {
   let refuse = if dispatched.needs_barrier() {
+    // The reply rides the publication with its effect (A-61), so a daemon that dies before writing it leaves its
+    // successor the answer for the request the kernel resends, never a second application.
+    s.pending_replies.insert(
+      attachment,
+      slates_vfs::recover::HeldReply {
+        attachment,
+        unique: dispatched.unique(),
+        reply: dispatched.reply(&mount.serve).to_vec(),
+      },
+    );
     let captured =
       crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(mount.volume));
     if captured {
@@ -571,7 +595,10 @@ fn reply(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) -> 
   if refuse.is_some() {
     reclaim(s, mount, dispatched);
   }
-  match send_reply(&mount.channel, &mut mount.serve, dispatched, refuse) {
+  let sent = send_reply(&mount.channel, &mut mount.serve, dispatched, refuse);
+  // Written (or refused, or failed): nothing of this request remains to answer from the record.
+  s.pending_replies.remove(&attachment);
+  match sent {
     Ok(Sent::Delivered) => Turned::Served,
     Ok(Sent::Unmatched) => {
       *s.refusals.entry(REPLY_UNMATCHED).or_insert(0) += 1;
@@ -738,7 +765,7 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     attachment,
     FuseMount {
       channel,
-      serve: ServeState::restored(session),
+      serve: ServeState::restored(session, s.recovered_replies.remove(&attachment)),
       handles: new_handle_store(),
       registry,
       volume: record.volume,

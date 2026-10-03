@@ -186,7 +186,7 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
     )
     .unwrap()
     {
-      Turn::Idle | Turn::Dropped => {}
+      Turn::Idle | Turn::Dropped | Turn::Replayed => {}
       Turn::Ended => {
         counts.send(tally).unwrap();
         return;

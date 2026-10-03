@@ -2187,9 +2187,16 @@ before the report is published, so a tool never reads attributes newer than the 
 > - Red-checked: with recovery's keep removed, the write after the kill fails `ECONNABORTED`.
 > On a kernel without resend (before 6.9) the old ending holds, proven by
 > `a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon`, which now skips on 6.9 and later.
-> Owed: (4) the exact replay of the one barrier request applied but unanswered at the kill (a resent `mkdir`
-> after its publication answers `EEXIST`); per-shard channels; and making every acknowledged write survive,
-> which needs the incremental publication.
+> **The exact replay is built (step 4).** A barrier request's reply is recorded before its publication, so the
+> shard image (version 11) carries it with the effect, and removed once written. A restarted daemon hands each
+> kept mount the reply its predecessor published and never delivered. The resent request whose unique matches
+> is answered from that record, its unique carrying the resend bit, and is never applied twice (`fuse.replayed`).
+> A resent `mkdir` would otherwise answer `EEXIST` for its own directory. Proven by unit tests: a resent request
+> is answered from its record once, and only the request the record answers. The image round-trips its replies
+> in a canonical order. Red-checked: a reply whose unique drops the resend bit fails. The window it covers, a
+> barrier's publication to its reply's write, is microseconds wide, too narrow for a kill to target, so no
+> end-to-end test reaches it. Owed: per-shard channels; and making every acknowledged write survive, which needs
+> the incremental publication.
 
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;
