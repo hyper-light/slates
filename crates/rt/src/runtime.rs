@@ -88,6 +88,16 @@ pub struct WakeTracking {
   pub idle_ratio: u64,
 }
 
+/// A shard's wake-ring size from the profile's derived `ring_entries` (Little's law at the overflow target), at
+/// least the ring's smallest admitted capacity ([`slates_mem::mpsc::MIN_CAPACITY`]): on a machine whose wake p99
+/// is no longer than a syscall's median the law asks for one slot, a geometry the ring refuses (AUD-29-33), and
+/// the daemon could not start (`Runtime(Mem(BadCapacity { capacity: 1 }))`, the macOS CI runner, 2026-10-03).
+fn wake_ring_entries(derived: u64) -> usize {
+  usize::try_from(derived)
+    .unwrap_or(usize::MAX)
+    .max(slates_mem::mpsc::MIN_CAPACITY)
+}
+
 impl RuntimeConfig {
   /// A configuration from the profile: the shard count and their cores from the core classes,
   /// the tick, step budget, spin window and ring size from the derived constants, and the batch
@@ -100,7 +110,7 @@ impl RuntimeConfig {
     latency_budget_ns: u64,
   ) -> Self {
     let d = profile.derived();
-    let ring_entries = usize::try_from(d.ring_entries.get()).unwrap_or(usize::MAX);
+    let ring_entries = wake_ring_entries(d.ring_entries.get());
     let (shards, cores) = shard_cores(profile);
     let mut config = Self {
       shards: shards.get(),
@@ -677,5 +687,21 @@ impl LocalRuntime {
     // by this runtime's `Drop` (`reclaim_context`); the borrow returned is bounded by `&self`, so it ends
     // before that drop.
     unsafe { self.ctx.as_ref() }
+  }
+}
+
+#[cfg(test)]
+mod wake_ring_tests {
+  use super::*;
+
+  /// AUD-29-33's sibling. Do: size a wake ring from a derived one slot (a machine whose wake p99 is within a
+  /// syscall's median), and from eight; build the ring. Expect: the one-slot derivation is raised to the ring's
+  /// smallest admitted capacity, which builds; a derivation already past it is kept.
+  #[test]
+  fn a_derived_one_slot_wake_ring_is_raised_to_the_smallest_the_ring_admits() {
+    let raised = wake_ring_entries(1);
+    assert_eq!(raised, slates_mem::mpsc::MIN_CAPACITY);
+    assert!(slates_mem::mpsc::MpscRing::new(raised).is_ok());
+    assert_eq!(wake_ring_entries(8), 8);
   }
 }
