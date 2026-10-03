@@ -25,6 +25,9 @@ pub enum Notify {
   InvalEntry = 3,
   /// Format: FUSE_NOTIFY_DELETE — like InvalEntry, and the child was deleted.
   Delete = 6,
+  /// Format: FUSE_NOTIFY_RESEND — put every request a daemon read but never answered back on the device, each
+  /// marked with [`crate::abi::UNIQUE_RESEND`] (7.40, Linux 6.9+).
+  Resend = 7,
 }
 
 impl Notify {
@@ -99,6 +102,14 @@ pub fn delete(parent: u64, child: u64, name: &str, out: &mut [u8]) -> Result<usi
   w.bytes(name.as_bytes());
   w.bytes(&[0]);
   write_notification(Notify::Delete.code(), &w.into_bytes(), out)
+}
+
+/// Encodes a `FUSE_NOTIFY_RESEND`: the kernel moves every request the device's previous reader took and never
+/// answered back to the device, marked with [`crate::abi::UNIQUE_RESEND`]. A restarted daemon serving a held
+/// device sends it once before reading, so a request its predecessor read is not lost. No body: the kernel's
+/// handler reads none (`fs/fuse/dev.c` `fuse_notify_resend`).
+pub fn resend(out: &mut [u8]) -> Result<usize, FuseError> {
+  write_notification(Notify::Resend.code(), &[], out)
 }
 
 #[cfg(test)]

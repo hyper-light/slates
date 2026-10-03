@@ -72,6 +72,9 @@ const INIT_FLAGS: &[(u64, u64)] = &[
   (flags::EXPLICIT_INVAL_DATA, 1 << 25),
   (flags::INIT_EXT, 1 << 30),
   (flags::HAS_EXPIRE_ONLY, 1 << 35),
+  // `FUSE_HAS_RESEND` is `1ULL << 39`, transcribed from the 7.41 header (Debian's linux-libc-dev in the
+  // rust:1.98.0 image) on 2026-10-03.
+  (flags::HAS_RESEND, 1 << 39),
 ];
 
 /// Header bits the codec must never have confused with the ones above: `FUSE_FILE_OPS`,
@@ -219,6 +222,27 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
   assert_eq!(n.flags >> 32, 0, "flags2 is ignored without INIT_EXT");
 }
 
+/// A kernel offering `FUSE_HAS_RESEND` (flags2, `1ULL << 39`) is recorded as able to resend — what a restarted
+/// daemon serving a held device needs — and the bit is never echoed, being the kernel's advertisement; without
+/// `INIT_EXT` the second word is not read and no resend offer is taken from it.
+#[test]
+fn a_kernels_resend_offer_is_kept_and_never_echoed() {
+  let mut body = vec![0u8; 64];
+  put_u32(&mut body, 0, 7);
+  put_u32(&mut body, 4, 41);
+  put_u32(&mut body, 12, u32::try_from(flags::INIT_EXT).unwrap());
+  put_u32(&mut body, 16, 1 << 7);
+  let n = negotiate(&body, slates_bridge_core::CacheCoherence::Invalidated).unwrap();
+  assert!(n.kernel_resends, "flags2 bit 7 is FUSE_HAS_RESEND");
+  assert_eq!(n.flags & flags::HAS_RESEND, 0, "never echoed");
+  put_u32(&mut body, 12, 0);
+  let n = negotiate(&body, slates_bridge_core::CacheCoherence::Invalidated).unwrap();
+  assert!(
+    !n.kernel_resends,
+    "no resend offer is read from an undeclared flags2"
+  );
+}
+
 /// `fuse_init_out` is 64 bytes with the header's field offsets: flags at 12, max_write at 20,
 /// time_gran at 24, flags2 at 32 (after max_pages and map_alignment), then max_stack_depth,
 /// request_timeout and the unused words, all zero.
@@ -276,6 +300,27 @@ fn notify_codes_carry_the_headers_values() {
   assert_eq!(Notify::InvalInode.code(), 2);
   assert_eq!(Notify::InvalEntry.code(), 3);
   assert_eq!(Notify::Delete.code(), 6);
+  // FUSE_NOTIFY_RESEND = 7, and FUSE_UNIQUE_RESEND (1ULL << 63), from the 7.41 header on 2026-10-03.
+  assert_eq!(Notify::Resend.code(), 7);
+  assert_eq!(slates_bridge_fuse::abi::UNIQUE_RESEND, 1 << 63);
+}
+
+/// `FUSE_NOTIFY_RESEND` is the bare `fuse_out_header`: len 16, the code 7 in `error`, a zero unique, and no body
+/// (the kernel's `fuse_notify_resend` reads none).
+#[test]
+fn the_resend_notification_is_a_bare_header() {
+  let mut out = [0xA5u8; 32];
+  let n = slates_bridge_fuse::notify::resend(&mut out).unwrap();
+  assert_eq!(n, OUT_HEADER_LEN);
+  assert_eq!(
+    (u32_at(&out, 0), u32_at(&out, 4), u64_at(&out, 8)),
+    (16, 7, 0),
+    "len, FUSE_NOTIFY_RESEND in error, a zero unique"
+  );
+  assert!(
+    slates_bridge_fuse::notify::resend(&mut [0u8; 15]).is_err(),
+    "a buffer shorter than the header is refused, never overrun"
+  );
 }
 
 /// The fixed structs have the header's sizes: `fuse_in_header` 40, `fuse_out_header` 16,

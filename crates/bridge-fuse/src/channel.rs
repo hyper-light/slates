@@ -33,7 +33,7 @@ use std::os::fd::{AsFd, OwnedFd};
 use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fs::{Mode, OFlags};
 
-use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
+use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::bridge::Bridge;
 use crate::coherence::{Coherence, Delivered};
 use crate::dispatch;
@@ -42,6 +42,7 @@ use crate::init::negotiate;
 use crate::notify::{EXPIRE_ONLY, inval_entry, inval_inode};
 use crate::reply::ReplyHeader;
 use crate::request::Request;
+use crate::session::Session;
 use slates_bridge_core::{AttachmentId, Attachments, Invalidation};
 
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.
@@ -383,6 +384,9 @@ pub struct ServeState {
   /// Whether the kernel honours FUSE_EXPIRE_ONLY, learned from its INIT (the negotiation is pure,
   /// so re-running it here agrees with the reply the dispatch sends).
   expire_only: bool,
+  /// What the connection negotiated at `INIT`, once it has: what a restarted daemon needs to serve this
+  /// device (§4.6 "restore from the anchor's held fd"), handed to the anchor beside it.
+  session: Option<Session>,
   /// Where the kernel's cache stands and what it is owed (AUD-02).
   pub coherence: Coherence,
 }
@@ -402,7 +406,32 @@ impl ServeState {
     ServeState {
       reply: vec![0u8; BUFFER_BYTES],
       expire_only: false,
+      session: None,
       coherence: Coherence::new(),
+    }
+  }
+
+  /// The state of a device taken over from a previous daemon: what its connection negotiated, and nothing in
+  /// the kernel's cache that this daemon knows of.
+  pub fn restored(session: Session) -> ServeState {
+    ServeState {
+      expire_only: session.expire_only,
+      session: Some(session),
+      ..ServeState::new()
+    }
+  }
+
+  /// What the connection negotiated, once its `INIT` has been answered.
+  pub fn session(&self) -> Option<Session> {
+    self.session
+  }
+
+  /// Takes what an `INIT` request negotiates.
+  fn negotiated(&mut self, body: &[u8]) {
+    if let Ok(negotiated) = negotiate(body, slates_bridge_core::CacheCoherence::Invalidated) {
+      let session = Session::of(&negotiated);
+      self.expire_only = session.expire_only;
+      self.session = Some(session);
     }
   }
 }
@@ -478,11 +507,8 @@ pub fn serve_step(
   // with registered buffers, owed).
   let request = channel.take_request();
   let opcode = Request::parse(&request).ok().and_then(|parsed| {
-    if parsed.opcode == Some(Opcode::Init)
-      && let Ok(negotiated) =
-        negotiate(parsed.body, slates_bridge_core::CacheCoherence::Invalidated)
-    {
-      state.expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
+    if parsed.opcode == Some(Opcode::Init) {
+      state.negotiated(parsed.body);
     }
     parsed.opcode
   });
@@ -616,11 +642,8 @@ pub fn dispatch_ready(
   let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
   let nodeid = parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid);
   let opcode = parsed.and_then(|parsed| {
-    if parsed.opcode == Some(Opcode::Init)
-      && let Ok(negotiated) =
-        negotiate(parsed.body, slates_bridge_core::CacheCoherence::Invalidated)
-    {
-      state.expire_only = negotiated.flags & flags::HAS_EXPIRE_ONLY != 0;
+    if parsed.opcode == Some(Opcode::Init) {
+      state.negotiated(parsed.body);
     }
     parsed.opcode
   });

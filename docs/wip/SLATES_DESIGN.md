@@ -2154,6 +2154,13 @@ base file is served through the same pages. FUSE passthrough is not used: it req
 `CAP_SYS_ADMIN`, and slates never depends on a privilege the user may lack. A drift report or a watcher hint on a base path invalidates the kernel's entry and attributes for it
 before the report is published, so a tool never reads attributes newer than the daemon's view.
 
+> **Status (2026-10-03, AC-3.4; A-61: the held device).** A FUSE mount is to survive a daemon restart through the
+> anchor holding its device (A-61). Built so far: the codec's half. `FUSE_HAS_RESEND` is read from the kernel's
+> `INIT` and kept apart from the echoed flags; the resend notification is encoded and checked against the 7.41
+> header; and the session a restarted daemon needs travels as two checked bytes, with golden and hostile-input
+> tests (`crates/bridge-fuse/src/session.rs`). The anchor's channel, the takeover and the exact replay are next.
+> Until they land, recovery still ends a FUSE mount.
+
 **macOS 26+ (FSKit module, primary).** The macOS artifact is an app
 bundle (`Slates.app`) containing the daemon, the `slates` command, and an FSKit app extension;
 all are signed with one team identifier and share an app group named in the macOS
@@ -2634,8 +2641,8 @@ still serves its original contents. Other namespaces need their own attachment. 
 directories are refused because creating one would write disk. Full equivalence to an existing
 physical volume's device identity or cross-volume rename is not promised.
 
-**Failure matrix.** Daemon crash: Linux `ENOTCONN` until the anchor restarts the daemon and hands
-back the fd (Degraded, seconds); macOS FSKit: the extension's forwarding calls fail typed until
+**Failure matrix.** Daemon crash: Linux requests wait on the device the anchor holds until the restarted
+daemon takes it back and asks the kernel to resend what the dead one read (A-61; Degraded, seconds); macOS FSKit: the extension's forwarding calls fail typed until
 the daemon is back, and the extension survives because it is a separate process (Degraded; the
 spike measures whether open files recover or must be reopened); macOS NFS fallback: hard-mount
 hang or soft-mount `EIO` until the restarted server answers the retried RPCs (Degraded); Windows:
@@ -5865,8 +5872,9 @@ fd handoff through the anchor, `slates exec`, the conformance and workload harne
 - T-3.4 (edge) mmap a file shared between two processes on the host; expect coherent writes
   (one shared page cache per inode under write-through, no direct_io; writeback cache is refused,
   §4.6 "Linux").
-- T-3.5 (fault) Kill the daemon while a process holds an open file and is writing; expect
-  `ENOTCONN` errors during the window, then recovery with every acknowledged write present.
+- T-3.5 (fault) Kill the daemon while a process holds an open file and is writing; expect the
+  writes to wait during the window (A-61: the anchor holds the device), then recovery with every
+  acknowledged write present and the open file still usable.
 - T-3.6 (error) `allow_other` requested without `user_allow_other`; expect a typed refusal
   naming the config line.
 - T-3.7 (chaos) Unmount under load (`umount -l` by an operator); expect typed errors to clients
@@ -8180,3 +8188,40 @@ Applied in the same change to: §4.5 status, GAPS (AUD-29-39–40), and
   without a snapshot; every refusal leaves the observable state and every slab's usage unchanged.
 - What it does not change: the verbs' POSIX results, their journal records, and admission when there is
   room. A verb is refused at most a split's worst case of blocks before the last one.
+
+### A-61 — A FUSE mount survives a daemon restart: the anchor holds its device (2026-10-03)
+Applied in the same change to: §4.6 "Linux" status, the failure matrix, T-3.5, GAPS (AC-3.4).
+- Why: AC-3.4 ("daemon restart with the fd handoff leaves open files usable") had no row in the ledger, and
+  recovery ended every FUSE mount, because the device belonged to the dead daemon (`AttachForm::FuseMount`). An
+  agent's open files and shells died with any daemon restart.
+- The protocol:
+  - **Holding.** The anchor keeps one Linux `SOCK_SEQPACKET` socketpair for its life and hands each daemon
+    its end across the spawn; nothing is named on disk (R1). A daemon that establishes a FUSE mount sends the
+    anchor a duplicate of the device, by `SCM_RIGHTS`, with the attachment id, before the attachment record
+    commits. Once the kernel's `INIT` is answered, it sends the connection's session: what it negotiated and
+    whether the kernel can resend (`slates_bridge_fuse::session`). At teardown it sends a release. The anchor
+    drains the channel before any restart. The devices it holds are bounded by the daemon's derived
+    attachment bound, with a typed refusal at the bound.
+  - **Taking over.** The anchor hands each held device and its session to the daemon it spawns, inherited as
+    the NFS listener is. Recovery finds each `FuseMount` record. A record with a held device whose session
+    says the kernel can resend is served again: the restored serve state, then one `FUSE_NOTIFY_RESEND`, so
+    the requests the dead daemon read and never answered come back, marked with `FUSE_UNIQUE_RESEND` and
+    answered under that unique. A record without a device, or whose kernel cannot resend (Linux before
+    6.9), is ended as before, refused by name. A held device with no record is closed.
+  - **What the kernel kept.** Reads and writes name the node, not the handle, so they need nothing restored.
+    A handle the restarted daemon never issued is released as a no-op. A file unlinked while open survives in
+    the recovery image's orphan tracking; the restored mount takes one reference on each recovered orphan,
+    dropped at the kernel's FORGET of the node, which the kernel sends only once every open of it has closed,
+    or at the mount's teardown sweep.
+  - **The one request applied but never answered.** A mount serves one request at a time, and a request that
+    changes what survives publishes the recovery image before its reply. So a crash leaves at most one
+    request per mount applied but unanswered. Its reply is published with its effect, and a resent request
+    whose unique matches is answered with that reply, never applied twice.
+- Evidence: the kernel's resend contract, transcribed from the 7.41 uapi header on 2026-10-03
+  (`FUSE_HAS_RESEND`, `FUSE_NOTIFY_RESEND = 7`, `FUSE_UNIQUE_RESEND`); the recovery image's orphan tracking
+  (`crates/vfs/src/recover.rs`), which already anticipated this handoff.
+- What it changes in the failure matrix: during the window a Linux mount's requests wait on the held device
+  instead of failing `ENOTCONN`.
+- Built in order: (1) the codec's resend and the session, (2) the anchor's channel, (3) holding and taking
+  over, (4) the exact replay. Each lands with its tests; the §4.6 status says which are built.
+

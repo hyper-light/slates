@@ -164,4 +164,14 @@ pub mod flags {
   /// invalidation (revalidate the name on its next use rather than drop it now; 6.2+). In the
   /// second flags word (`flags2`), hence the bit above 31.
   pub const HAS_EXPIRE_ONLY: u64 = 1 << 35;
+  /// Format: FUSE_HAS_RESEND — the kernel can resend the requests a daemon read but never answered
+  /// (`FUSE_NOTIFY_RESEND`), marking each resent one's unique id with [`super::UNIQUE_RESEND`]; 7.40, Linux 6.9+.
+  /// The kernel only advertises it: a daemon learns it from the kernel's `INIT` and never echoes it. In
+  /// `flags2`, hence the bit above 31.
+  pub const HAS_RESEND: u64 = 1 << 39;
 }
+
+/// Format: FUSE_UNIQUE_RESEND — the top bit of a request's unique id marks a request the kernel resent after a
+/// `FUSE_NOTIFY_RESEND` (`include/uapi/linux/fuse.h`). A reply carries the unique exactly as the request did,
+/// bit included, since the kernel matches the whole word.
+pub const UNIQUE_RESEND: u64 = 1 << 63;

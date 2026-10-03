@@ -35,6 +35,10 @@ pub struct InitNegotiation {
   /// Whether the kernel's major is one slates cannot speak (the caller replies with its own
   /// version so the kernel can retry, per the ABI).
   pub version_mismatch: bool,
+  /// Whether the kernel offered [`flags::HAS_RESEND`]: it can resend the requests a daemon read but never
+  /// answered, which a restarted daemon serving a held device asks for (§4.6 "restore from the anchor's held
+  /// fd"). Advertised by the kernel only, so it is kept apart from the flags the reply echoes.
+  pub kernel_resends: bool,
 }
 
 /// The flags slates asks for (the connection keeps whatever the kernel also offers). Each is a
@@ -94,6 +98,7 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
       max_write: MAX_WRITE,
       max_readahead: MAX_READAHEAD,
       version_mismatch: true,
+      kernel_resends: false,
     });
   }
   Ok(InitNegotiation {
@@ -103,6 +108,7 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
     max_write: MAX_WRITE,
     max_readahead: kernel_readahead.min(MAX_READAHEAD),
     version_mismatch: false,
+    kernel_resends: kernel_flags & flags::HAS_RESEND != 0,
   })
 }
 
