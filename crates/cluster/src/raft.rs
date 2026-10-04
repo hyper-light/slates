@@ -928,6 +928,13 @@ pub struct RaftNode {
   /// at least the commit index, which stays classic (`docs/wip/research/consensus-enhancements.md` §4). Zero
   /// when not leading.
   fast_through: u64,
+  /// While leading: the index the commit must reach before this leader serves a read — the last value its
+  /// election's recovery appended, the highest index an earlier term's fast quorum may have chosen. Committing an
+  /// entry of the current term alone does not suffice: the recovery appends every recovered value under the
+  /// current term, so the first of them commits before a later one an earlier fast quorum already acknowledged,
+  /// and a read at the first missed the later (`a_successor_serves_no_read_below_a_fast_commit_it_recovered`;
+  /// hyper-raft's S-4 found the same in its fast groups, 2026-10-04). Zero when the election recovered nothing.
+  read_floor: u64,
   /// The highest index this node proposed at on the fast track this term.
   fast_proposed: u64,
   /// Recoveries that re-proposed a value found only in windows, holes they filled with no-ops, window slots
@@ -1054,6 +1061,7 @@ impl RaftNode {
       fast_votes: BTreeMap::new(),
       fast_chosen: BTreeSet::new(),
       fast_through: 0,
+      read_floor: 0,
       fast_proposed: 0,
       window_counters: WindowCounters::default(),
       log_budget: usize::MAX,
@@ -1547,6 +1555,11 @@ impl RaftNode {
     self.fast_through = 0;
     self.fast_proposed = 0;
     self.retention_pending = true;
+    self.read_floor = if recovery.next <= recovery.last {
+      recovery.last
+    } else {
+      0
+    };
     if recovery.next <= recovery.last {
       self.recovery = Some(recovery);
       self.continue_recovery();
@@ -3330,6 +3343,7 @@ impl RaftNode {
     if self.role != Role::Leader
       || self.recovering()
       || self.entry_term(self.commit_index) != Some(self.current_term)
+      || self.commit_index < self.read_floor
       || self.read_round.is_some()
     {
       return None;
@@ -6380,6 +6394,42 @@ mod tests {
     assert_eq!(
       commands,
       vec![Vec::new(), b"x".to_vec(), b"y".to_vec(), Vec::new()]
+    );
+  }
+
+  /// ReadSafety under the fast track (hyper-raft's S-4 finding, checked here 2026-10-04): `A` fast-committed `x`
+  /// at index 2 and `y` at 3 — acknowledged to their clients — and `B` re-proposed both under its own term, then
+  /// its sync point at 4. Do: replicate one entry per append to `C`, so `B`'s commit index reaches 2 (an entry of
+  /// its term) while `y` at 3 is not yet committed there; then ask `B` for a read and confirm it with `C`.
+  /// Expect: no read index below 3 — a read served at 2 would miss `y`, which a client already holds.
+  #[test]
+  fn a_successor_serves_no_read_below_a_fast_commit_it_recovered() {
+    let (_a, mut b, mut c) = a_fast_commit_re_proposed_by_a_successor();
+    let one_entry = LogEntry::command(2, b"x".to_vec()).encoded_len();
+    for _ in 0..4 {
+      if b.commit_index() >= 2 {
+        break;
+      }
+      let append = b.replicate_to(C, one_entry).expect("B leads");
+      let reply = c.on_append_entries(append);
+      b.on_append_reply(reply);
+    }
+    assert_eq!(
+      b.commit_index(),
+      2,
+      "B committed index 2, of its own term, before index 3"
+    );
+    let Some(context) = b.begin_read() else {
+      return; // Refused while a recovered fast commit is uncommitted: safe.
+    };
+    let append = b.replicate_to(C, 0).expect("B leads");
+    assert_eq!(append.read_context, context, "the round carries the read");
+    let reply = c.on_append_entries(append);
+    b.on_append_reply(reply);
+    let index = b.read_index(context);
+    assert!(
+      index.is_none_or(|index| index >= 3),
+      "a read was served at {index:?}, below y's fast commit at 3"
     );
   }
 
