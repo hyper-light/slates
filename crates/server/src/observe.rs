@@ -251,7 +251,8 @@ pub struct Admitted<T> {
 /// observation began, and at the last window's end. At a wall deadline the observation goes on — for the part of the
 /// budget the shard has not yet run, as wall time — only while the shard is working: it ran on the CPU during the
 /// window just ended. A starved shard, runnable but given little CPU, keeps consuming some and is answered; a wedged
-/// one, which consumes none, ends the observation in one window; a busy one that never answers ends it once it has run
+/// one, which consumes none, ends the observation at the end of the first whole window it spends without CPU (one
+/// window if it was wedged when the observation began, two if it wedged partway through the first); a busy one that never answers ends it once it has run
 /// the budget, which an uncontended shard does at the wall clock's pace. A reading at or below the mark (a thread id the
 /// OS reused once the shard's thread had ended, which reads lower) ends it too. Under Miri, which has no thread
 /// clock, the wall budget stands alone.

@@ -3116,7 +3116,7 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > just ended. It continues for the part of the budget the shard has not yet run, as wall time. The shard's CPU clock is
 > recorded on its registry entry as it starts (`slates_rt::registry::shard_cpu`; Linux `pthread_getcpuclockid`, macOS
 > `thread_info`, Windows the thread id). The outcomes:
-> - A wedged shard consumes none and ends the observation in one budget.
+> - A wedged shard consumes no CPU and ends the observation at the end of the first whole window it spends without CPU: one window if it was wedged when the observation began, two if it wedged partway through the first.
 > - A busy shard that never answers ends it once it has run the budget.
 > - An uncontended shard gets no extra window.
 > - Windows reads the shard's cycles (`QueryThreadCycleTime`) to tell whether it ran and its kernel plus user time
@@ -8447,7 +8447,7 @@ Status: built 2026-10-03.
   thread id and opens the thread for each read with query rights only: `QueryThreadCycleTime` (exact) tells whether
   it ran, and `GetThreadTimes` (charged a scheduler tick at a time) what it spent. Only Miri has no clock.
 - Evidence: `crates/server/tests/observe.rs` (a starved shard answered past the wall budget, red before; a wedged one
-  still ends in one budget); 7–13 `Deadline` per loaded run → 1–2. The remaining ones were all blocked shards (CPU
+  ends long before its wedge does: within two windows, CI run 37178742493 having shown a one-window bound wrong); 7–13 `Deadline` per loaded run → 1–2. The remaining ones were all blocked shards (CPU
   frozen for the whole 10 s), traced to the arena lock's page population and fixed in the same change.
 
 ### A-66 — AWS-LC is slates' one cryptographic library (2026-10-03)

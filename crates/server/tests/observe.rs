@@ -29,6 +29,12 @@ const HOLD_NS: u64 = 2 * LIVENESS_BUDGET_NS;
 /// many paces of the observation's retry cadence (a tenth of a heartbeat), so a refused submission is
 /// attempted several times before the deadline names it.
 const SHORT_BUDGET_NS: u64 = LIVENESS_BUDGET_NS * 3 / 10;
+/// Shape: how many short budgets the wedged question sleeps — well past the bound it must end within.
+const WEDGE_BUDGETS: u64 = 5;
+/// Shape: the budgets a wedged shard's observation must end within — the window it wedged in (read as working, since
+/// the shard ran the task's start there), the window that shows no CPU, and one more for the deadline's lateness under
+/// a loaded runner; still two budgets short of the wedge.
+const ENDED_WITHIN_BUDGETS: u64 = 3;
 /// Derived: how long a deliberately slow question spins on its shard — twice the short budget, so its
 /// answer is late by construction.
 const SLOW_QUESTION_NS: u64 = 2 * SHORT_BUDGET_NS;
@@ -364,17 +370,22 @@ fn a_starved_but_working_shard_is_answered_past_the_wall_budget() {
   daemon.stop();
 }
 
-/// §4.14. Do: ask a question that only sleeps for three short budgets — a shard that consumes no CPU, as a wedged one.
-/// Expect: a deadline in the execution stage within about one budget, not after the question ends.
+/// §4.14, A-65. Do: ask a question that only sleeps for five short budgets — a shard that consumes no CPU once the
+/// question starts, as a wedged one. Expect: a deadline in the execution stage before three budgets, long before the
+/// question ends. The shard ran the task's start inside the first window, so the rule reads that window as working and
+/// grants one more; the window after it shows no CPU and ends the observation (CI run 37178742493: 656 ms against a
+/// 300 ms budget, where an earlier bound of two budgets left no room for the deadline's own lateness).
 #[test]
-fn a_wedged_shard_still_ends_the_observation_in_one_budget() {
+fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
   let _serial = serialize();
   let daemon = laptop("wedged");
   let started = std::time::Instant::now();
   let ended = daemon.observe_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
     // The question blocks its shard off the CPU on purpose: a wedged shard.
     #[allow(clippy::disallowed_methods)]
-    std::thread::sleep(std::time::Duration::from_nanos(3 * SHORT_BUDGET_NS));
+    std::thread::sleep(std::time::Duration::from_nanos(
+      WEDGE_BUDGETS * SHORT_BUDGET_NS,
+    ));
     8u8
   });
   assert!(
@@ -388,8 +399,8 @@ fn a_wedged_shard_still_ends_the_observation_in_one_budget() {
     "a shard consuming no CPU ends at its deadline: {ended:?}"
   );
   assert!(
-    started.elapsed() < std::time::Duration::from_nanos(2 * SHORT_BUDGET_NS),
-    "within about one budget: {:?}",
+    started.elapsed() < std::time::Duration::from_nanos(ENDED_WITHIN_BUDGETS * SHORT_BUDGET_NS),
+    "within two windows and the deadline's lateness, long before the {WEDGE_BUDGETS}-budget wedge ends: {:?}",
     started.elapsed()
   );
   // The sleeping question still finishes and is counted late before the daemon stops.

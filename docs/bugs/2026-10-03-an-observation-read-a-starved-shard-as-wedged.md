@@ -43,7 +43,7 @@ Each one failed although its shard was working. No state was changed or lost; th
   consumed CPU during the window just ended. It continues for the part of the budget the shard has not yet run, as
   wall time.
   - A starved shard keeps consuming CPU and is answered.
-  - A wedged shard consumes none and ends the observation in one window.
+  - A wedged shard consumes no CPU and ends the observation at the end of the first whole window it spends without CPU: one window if it was wedged when the observation began, two if it wedged partway through the first.
   - A busy shard that never answers ends it once it has run the budget. An uncontended shard does that at the wall
     clock's pace, so it gets no extra window.
   - The extension applies to the receipt's wait, the answer's wait, and a capacity refusal held at the deadline.
@@ -53,8 +53,10 @@ Each one failed although its shard was working. No state was changed or lost; th
 
 - `crates/server/tests/observe.rs` `a_starved_but_working_shard_is_answered_past_the_wall_budget`: red before the
   change.
-- `a_wedged_shard_still_ends_the_observation_in_one_budget`: an observation of a shard blocked off the CPU still ends
-  in one budget.
+- `a_wedged_shard_ends_the_observation_long_before_its_wedge_does`: a question that blocks its shard off the CPU for
+  five budgets ends at its deadline before three. A first version asserted one window and failed on CI's macOS lane
+  (run 37178742493, 656 ms against 600): the shard ran the task's start in the first window, which the rule rightly
+  reads as working, so the bound is two windows plus the deadline's lateness.
 - `crates/rt/src/thread_clock.rs` `a_threads_cpu_clock_reads_from_another_thread_and_grows_as_it_runs`.
 - Every observe test passes on macOS and Linux.
 - Beside 108 burners, the observations that ended `Deadline` went from 7, 13 and 10 per run to 1–2.
