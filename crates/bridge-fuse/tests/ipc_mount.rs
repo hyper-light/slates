@@ -102,7 +102,7 @@ struct CloneImages {
 
 /// What a mount serves: a volume's image, or a clone's with its origin.
 enum Served {
-  Plain(VolumeImage),
+  Plain(Box<VolumeImage>),
   Clone(Box<CloneImages>),
 }
 
@@ -346,7 +346,7 @@ fn fifo_and_socket_communication_is_local_to_each_clone() {
     let first = scope.spawn(move || {
       serve(
         original_mount,
-        Served::Plain(original),
+        Served::Plain(Box::new(original)),
         1,
         Some((signal, inbox)),
       )

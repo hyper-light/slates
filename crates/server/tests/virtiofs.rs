@@ -1966,9 +1966,29 @@ fn a_console_marker_behind_terminal_controls_is_still_read() {
   assert_eq!(run.manifest.entries.len(), 1);
 }
 
+/// The console parser reads a marker that follows the firmware's screen reset with no carriage return between. Do:
+/// parse the first console line CI run 37176411038 delivered (2026-10-04, git's RAM run read as missing again): the
+/// firmware's `Booting from ROM..`, its reset (`ESC c`), `ESC [ ? 7 l` and erase-display (`ESC [ 2 J`), then the marker
+/// at once. Expect: the run is read — a reset or an erase of the display leaves nothing before it on the screen.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_console_marker_right_after_a_screen_reset_is_still_read() {
+  let console = "Booting from ROM..\u{1b}c\u{1b}[?7l\u{1b}[2J=== RUN git ram 0 /tmp/w/git\r\nout\r\n=== MANIFEST\r\nd\t755\t0\t-\t.git\r\n=== END\r\n";
+  let parsed = guest_runs(console);
+  let run = parsed
+    .runs
+    .get(&("git".to_owned(), "ram".to_owned()))
+    .expect("the run after the screen reset is read");
+  assert_eq!(run.exit_code, 0);
+  assert_eq!(run.directory, "/tmp/w/git");
+  assert_eq!(run.manifest.entries.len(), 1);
+}
+
 /// `line` as a terminal would leave it: without the control sequences a serial console interleaves (CSI
 /// `ESC [ … final`, a two-byte `ESC x`, and other C0 controls but the tab the manifest separates fields with), and
-/// with a carriage return followed by more text returning to column 0, so what came before it is overwritten. The
+/// with a carriage return followed by more text returning to column 0, so what came before it is overwritten. A
+/// reset (`ESC c`) or a whole-screen erase (`ESC [ 2 J`, `ESC [ 3 J`) clears what came before it too: the firmware's
+/// `Booting from ROM..` preceded the first marker behind those alone on CI run 37176411038 (2026-10-04). The
 /// firmware's `Booting from ROM..` shared the first marker's line behind a bare `\r` on CI's x86 console
 /// (2026-10-02); a trailing `\r`, as serial lines end, leaves the line as it is.
 #[cfg(target_os = "linux")]
@@ -1977,16 +1997,29 @@ fn without_terminal_controls(line: &str) -> String {
   const ESCAPE: char = '\u{1b}';
   /// Format: the byte after `ESC` that opens a control sequence (CSI) running to a final byte in `@..=~`.
   const CSI: char = '[';
+  /// Format: the byte after `ESC` that resets the terminal (RIS, ECMA-48 §8.3.105), clearing the screen.
+  const RESET: char = 'c';
   let mut out = String::with_capacity(line.len());
   let mut chars = line.chars();
   while let Some(c) = chars.next() {
     if c == ESCAPE {
-      if chars.next() == Some(CSI) {
-        for next in chars.by_ref() {
-          if ('@'..='~').contains(&next) {
-            break;
+      match chars.next() {
+        Some(CSI) => {
+          let mut parameters = String::new();
+          for next in chars.by_ref() {
+            if ('@'..='~').contains(&next) {
+              // Erase in display, whole screen (`ESC [ 2 J`, `ESC [ 3 J`): nothing before it stays on screen.
+              if next == 'J' && matches!(parameters.as_str(), "2" | "3") {
+                out.clear();
+              }
+              break;
+            }
+            parameters.push(next);
           }
         }
+        // Reset to initial state (`ESC c`, RIS): the screen is cleared.
+        Some(RESET) => out.clear(),
+        _ => {}
       }
     } else if c == '\r' {
       if chars.clone().next().is_some() {

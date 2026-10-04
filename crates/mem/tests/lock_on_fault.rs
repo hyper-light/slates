@@ -5,7 +5,7 @@
 //! region far larger than anything touched and read the process's resident pages: the lock charges the whole range
 //! (the OS reports it locked) while committing none of it.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(target_os = "linux")]
 mod linux {
