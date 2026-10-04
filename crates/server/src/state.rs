@@ -152,6 +152,10 @@ pub struct ShardState {
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
+  /// Which image slot of `content_range` holds the committed image, as this shard's last publish left it (§4.8):
+  /// learned by the first publish from both slots' CRCs and kept, so each later publish writes its frame in one pass.
+  /// Only this shard publishes into its range.
+  pub committed_slot: Option<slates_vfs::recover::CommittedSlot>,
   /// The FUSE writes acknowledged since the last complete publication, kept whole in the region before
   /// `content_range` in the anchor's content object (A-63; `crate::write_log`); `None` without a content object.
   /// Linux only: the log serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost

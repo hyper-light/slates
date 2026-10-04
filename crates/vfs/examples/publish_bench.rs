@@ -1,7 +1,8 @@
 //! What one §4.8 barrier's publication costs as the shard's content grows (A-64). Every barrier (a FUSE
 //! `flush`/`fsync`, an NFS `COMMIT` or `FILE_SYNC` write, a control verb) re-images the whole shard:
-//! [`Volume::to_image`] captures every inode, the image is encoded, and [`ShardImage::write_to`] checksums it
-//! and copies it into the content object's free slot. Since A-64 a file's chunks are named by reference, so the
+//! [`Volume::to_image`] captures every inode, the image is encoded, and [`ShardImage::write_after`] checksums it
+//! and copies it into the content object's free slot, after the committed slot the last publish returned (as the
+//! daemon publishes, so neither slot is re-read). Since A-64 a file's chunks are named by reference, so the
 //! image grows with the number of chunks, not their bytes; before it, the image carried every byte (the
 //! 2026-10-03 baseline in BENCHMARKS.md: 75 ms at 256 MiB). This measures the three steps, separately and
 //! together, for one volume holding one file of each size, and the image's size.
@@ -132,7 +133,14 @@ fn main() {
     let (encode, encode_rounds, encoded) = best_of(|| shard.to_content());
     // Two slots plus their headers, as the content object's slice holds them.
     let mut slots = vec![0_u8; 2 * encoded.len() + 2 * PAGE];
-    let (publish, publish_rounds, _) = best_of(|| shard.write_to(slots.as_mut_slice()).unwrap());
+    // As the daemon publishes: after the committed slot its last publish returned, so the frame is one pass.
+    let (_, first) = shard.write_after(slots.as_mut_slice(), None).unwrap();
+    let mut known = Some(first);
+    let (publish, publish_rounds, _) = best_of(|| {
+      let (total, committed) = shard.write_after(slots.as_mut_slice(), known).unwrap();
+      known = Some(committed);
+      total
+    });
     let read = ShardImage::read_from(slots.as_slice()).unwrap().unwrap();
     if read != shard {
       eprintln!("{size_mib} MiB: the published image does not read back as written");

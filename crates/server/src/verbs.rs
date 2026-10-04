@@ -7236,13 +7236,14 @@ fn publish_captured(state: &mut ShardState) -> Result<Published, slates_vfs::Vfs
     start,
     len: end - start,
   };
-  match shard.write_to(&mut slots) {
-    Ok(frame_bytes) => {
+  match shard.write_after(&mut slots, state.committed_slot) {
+    Ok((frame_bytes, committed)) => {
       published.frame_bytes = frame_bytes;
+      state.committed_slot = Some(committed);
       // Every volume captured: this image holds every logged write, so the write log empties, stamped with
       // this generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
       #[cfg(target_os = "linux")]
-      clear_write_log(state, published.skipped.is_empty());
+      clear_write_log(state, published.skipped.is_empty(), committed.generation);
       Ok(published)
     }
     Err(e) => {
@@ -7561,20 +7562,13 @@ pub(crate) const WRITE_LOG_UNWRITTEN: &str = "recovery.write_log_unwritten";
 /// publication's generation: every write before it is in that image now. A volume skipped keeps the log, so its
 /// writes stay owed to the next daemon.
 #[cfg(target_os = "linux")]
-fn clear_write_log(state: &mut ShardState, captured_every_volume: bool) {
+fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generation: u64) {
   if !captured_every_volume {
     return;
   }
-  let (start, end) = state.content_range;
   let Some(object) = state.content.as_mut() else {
     return;
   };
-  let generation = ShardImage::committed_generation(&ContentView {
-    object,
-    start,
-    len: end.saturating_sub(start),
-  })
-  .unwrap_or(0);
   if let Some(log) = state.write_log.as_mut()
     && log.clear(object, generation).is_err()
   {
@@ -7634,16 +7628,10 @@ fn replay_one(
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
 #[cfg(target_os = "linux")]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record]) {
-  let (start, end) = state.content_range;
+  let generation = state.committed_slot.map_or(0, |slot| slot.generation);
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
     return;
   };
-  let generation = ShardImage::committed_generation(&ContentView {
-    object,
-    start,
-    len: end.saturating_sub(start),
-  })
-  .unwrap_or(0);
   let mut kept = log.clear(object, generation).is_ok();
   for record in remaining {
     if kept

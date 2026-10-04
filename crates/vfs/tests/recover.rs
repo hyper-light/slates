@@ -1747,3 +1747,76 @@ fn a_shard_image_carries_its_undelivered_replies_in_a_canonical_order() {
   let decoded = ShardImage::from_content(&bytes).unwrap();
   assert_eq!(decoded.replies, [reply(2, 31), reply(9, 70)]);
 }
+
+/// Image memory that refuses every write past `budget` bytes: a publish torn by a crash partway.
+struct TornAfter {
+  bytes: Vec<u8>,
+  budget: usize,
+}
+
+impl slates_vfs::recover::ImageRead for TornAfter {
+  fn image_len(&self) -> usize {
+    self.bytes.len()
+  }
+
+  fn image_read(&self, offset: usize, into: &mut [u8]) -> Result<(), VfsError> {
+    self.bytes.image_read(offset, into)
+  }
+}
+
+impl slates_vfs::recover::ImageWrite for TornAfter {
+  fn image_write(&mut self, offset: usize, from: &[u8]) -> Result<(), VfsError> {
+    let take = from.len().min(self.budget);
+    self.bytes.image_write(offset, &from[..take])?;
+    self.budget -= take;
+    if take < from.len() {
+      return Err(VfsError::NoSpace);
+    }
+    Ok(())
+  }
+}
+
+/// §4.8 (a publisher that keeps its committed slot). Do: publish three shard images in turn, each after the slot the
+/// last one returned; then tear a fourth partway (its memory refuses writes past a few bytes) and publish a fifth
+/// after the same kept slot. Expect: each publish reads back with generations 1, 2, 3; the torn one leaves the third
+/// readable and the kept slot unchanged; the fifth reads back as generation 4, written over the torn slot, never the
+/// committed one.
+#[test]
+fn a_publisher_that_keeps_its_committed_slot_publishes_in_one_pass_and_survives_a_torn_write() {
+  let image = |content: &[u8]| {
+    ShardImage::new(vec![KeyedImage {
+      key: [1; 16],
+      image: image_with(content),
+    }])
+  };
+  let mut memory = TornAfter {
+    bytes: vec![0u8; CONTENT_LEN],
+    budget: usize::MAX,
+  };
+  let mut known = None;
+  for (generation, content) in [(1u64, b"one".as_slice()), (2, b"two"), (3, b"three")] {
+    let shard = image(content);
+    let (_, committed) = shard.write_after(&mut memory, known).unwrap();
+    assert_eq!(committed.generation, generation);
+    assert_eq!(
+      slates_vfs::recover::committed_slot(&memory),
+      Some(committed)
+    );
+    assert_eq!(ShardImage::read_from(&memory).unwrap(), Some(shard));
+    known = Some(committed);
+  }
+  memory.budget = 16;
+  assert!(image(b"torn").write_after(&mut memory, known).is_err());
+  assert_eq!(
+    ShardImage::read_from(&memory).unwrap(),
+    Some(image(b"three"))
+  );
+  assert_eq!(slates_vfs::recover::committed_slot(&memory), known);
+  memory.budget = usize::MAX;
+  let (_, after) = image(b"five").write_after(&mut memory, known).unwrap();
+  assert_eq!(after.generation, 4);
+  assert_eq!(
+    ShardImage::read_from(&memory).unwrap(),
+    Some(image(b"five"))
+  );
+}

@@ -1376,6 +1376,21 @@ average 3.5–8.8 from other sessions. Best of five per step:
 
 At 256 MiB that is 75.4 ms → 0.11–0.16 ms, about 500–680 times less, and the image is 0.08 % of the content. The
 cost now follows the number of chunks (1,024 of 256 KiB here), about 220 bytes of image each. The publish step is
-still the largest: it re-verifies both slots' CRCs to learn their generations before writing. Keeping the
-committed generation in memory would remove two of its three passes. That is recorded for the next pass, not
-built: at these sizes it is tens of microseconds.
+still the largest: it re-verifies both slots' CRCs to learn their generations before writing.
+
+**The kept committed slot (same day).** A shard now keeps the committed slot its last publish returned
+(`CommittedSlot`, `ShardImage::write_after`). Both slots are checked once, at the first publish after boot, and the
+frame's CRC runs over the generation and the image without first copying them together. The FUSE write log's clear
+takes the generation the publish returned instead of checking both slots again. Same command; load average 13.7–19.6
+from other sessions; three runs, best of five per step:
+
+| Content | Publish | Total, three runs |
+|---|---|---|
+| 1 MiB | 0.5 µs | 1.7, 1.7, 1.6 µs |
+| 16 MiB | 2.6–2.7 µs | 6.6, 6.4, 6.6 µs |
+| 64 MiB | 10.2–10.5 µs | 23.9, 24.2, 24.2 µs |
+| 256 MiB | 40.8–41.5 µs | 91.5, 90.3, 91.1 µs |
+
+The publish step at 256 MiB went from 65.0–88.7 µs to 40.8–41.5 µs, under a higher load than the runs before it. Every
+recovery test passes. `a_publisher_that_keeps_its_committed_slot_publishes_in_one_pass_and_survives_a_torn_write`
+proves a publish torn partway leaves the last image and the kept slot as they were.

@@ -2575,6 +2575,7 @@ fn init_shard(
     issuer_secret,
     content,
     content_range,
+    committed_slot: None,
     #[cfg(target_os = "linux")]
     write_log,
     #[cfg(target_os = "linux")]

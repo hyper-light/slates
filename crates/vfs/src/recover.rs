@@ -527,7 +527,18 @@ impl ShardImage {
   /// interrupted or torn publish preserves it. Refuses [`VfsError::NoSpace`] if a slot cannot hold
   /// the frame (and leaves the committed slot untouched).
   pub fn write_to<S: ImageWrite + ?Sized>(&self, slots: &mut S) -> Result<usize, VfsError> {
-    publish_committed(slots, &self.to_content())
+    publish_committed(slots, &self.to_content(), None).map(|(total, _)| total)
+  }
+
+  /// [`ShardImage::write_to`] for the one process publishing into `slots`, which knows the committed slot from its
+  /// last publish (`known`; `None` checks both slots): the frame is written in one pass, and the new committed slot
+  /// is returned for the next.
+  pub fn write_after<S: ImageWrite + ?Sized>(
+    &self,
+    slots: &mut S,
+    known: Option<CommittedSlot>,
+  ) -> Result<(usize, CommittedSlot), VfsError> {
+    publish_committed(slots, &self.to_content(), known)
   }
 
   /// Reads the last committed shard image back from a double-buffered content-object buffer (§4.8):
@@ -545,8 +556,7 @@ impl ShardImage {
   /// transport's write log since that publication is stamped with (A-63), so recovery replays only the writes the
   /// recovered image does not already carry. `None` when nothing committed.
   pub fn committed_generation<S: ImageRead + ?Sized>(slots: &S) -> Option<u64> {
-    let (zero, one) = slots_of(slots.image_len());
-    slot_generation(slots, zero).max(slot_generation(slots, one))
+    committed_slot(slots).map(|slot| slot.generation)
   }
 }
 
@@ -571,7 +581,7 @@ impl VolumeImage {
   /// the write lands in the slot that does not hold the last committed image, so an interrupted or
   /// torn publish preserves it. Refuses [`VfsError::NoSpace`] if a slot cannot hold the frame.
   pub fn write_to<S: ImageWrite + ?Sized>(&self, slots: &mut S) -> Result<usize, VfsError> {
-    publish_committed(slots, &self.to_content())
+    publish_committed(slots, &self.to_content(), None).map(|(total, _)| total)
   }
 
   /// Reads the last committed image back from a double-buffered content-object buffer (§4.8).
@@ -663,28 +673,37 @@ struct Slot {
   len: usize,
 }
 
-/// Frames Wire `payload` into `slot`: a little-endian byte length and a CRC-32C of the payload, then
-/// the payload. The header is what a restarted daemon reads to find and validate what was published;
-/// the CRC turns a write torn by a crash into a typed refusal rather than a garbage decode. Refuses
+/// Frames `generation` and the Wire `image` into `slot`: a little-endian byte length and a CRC-32C of the payload
+/// (the generation's bytes then the image's), then the payload, written in its two parts without first copying
+/// them into one buffer. The header is what a restarted daemon reads to find and validate what was published; the
+/// CRC turns a write torn by a crash into a typed refusal rather than a garbage decode. Refuses
 /// [`VfsError::NoSpace`] if the slot cannot hold the frame.
 fn frame<S: ImageWrite + ?Sized>(
-  payload: &[u8],
+  generation: u64,
+  image: &[u8],
   slots: &mut S,
   slot: Slot,
 ) -> Result<usize, VfsError> {
+  let payload_len = SLOT_GEN_WIDTH
+    .checked_add(image.len())
+    .ok_or(VfsError::FileTooLarge)?;
   let total = FRAME_HEADER
-    .checked_add(payload.len())
+    .checked_add(payload_len)
     .ok_or(VfsError::FileTooLarge)?;
   if slot.len < total {
     return Err(VfsError::NoSpace);
   }
-  let len = u32::try_from(payload.len()).map_err(|_| VfsError::FileTooLarge)?;
+  let len = u32::try_from(payload_len).map_err(|_| VfsError::FileTooLarge)?;
+  let generation = generation.to_le_bytes();
+  let crc = crc32c_append(crc32c(&generation), image);
   let mut header = [0u8; FRAME_HEADER];
   let (len_field, crc_field) = header.split_at_mut(LEN_WIDTH);
   len_field.copy_from_slice(&len.to_le_bytes());
-  crc_field.copy_from_slice(&crc32c(payload).to_le_bytes());
+  crc_field.copy_from_slice(&crc.to_le_bytes());
+  let payload_at = slot.offset.saturating_add(FRAME_HEADER);
   slots.image_write(slot.offset, &header)?;
-  slots.image_write(slot.offset.saturating_add(FRAME_HEADER), payload)?;
+  slots.image_write(payload_at, &generation)?;
+  slots.image_write(payload_at.saturating_add(SLOT_GEN_WIDTH), image)?;
   Ok(total)
 }
 
@@ -762,33 +781,68 @@ fn slots_of(total: usize) -> (Slot, Slot) {
   )
 }
 
-/// Publishes `image` into one of two alternating, generation-tagged slots (§4.8), so that an
-/// interrupted, torn or too-large publish never destroys the last committed image. The write always
-/// lands in the slot that does *not* currently hold the committed image (the CRC-valid slot with the
-/// higher generation), and the commit *is* the CRC becoming valid over `[generation ++ image]`. A crash
-/// mid-write leaves that slot's CRC wrong, so recovery ignores it and reads the other slot — untouched,
-/// still the last committed. Returns the slot's frame length; refuses [`VfsError::NoSpace`] if a slot
-/// cannot hold the frame, and on that refusal, too, the committed slot is untouched — a publish that
-/// cannot fit preserves the last state rather than tearing it.
+/// Which slot of an image memory holds the committed image, and its generation (§4.8). A publisher learns it once —
+/// [`committed_slot`] checks both slots' CRCs — and then keeps it from what each of its own publishes returns, so a
+/// publish writes its frame in one pass instead of re-reading both slots to learn what it already knows. Only the
+/// one process publishing into the memory may keep it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommittedSlot {
+  /// The committed image's generation.
+  pub generation: u64,
+  /// Whether it is the second slot.
+  second: bool,
+}
+
+/// The committed slot of image memory `slots`, found by checking both slots' CRCs: `None` when neither holds a
+/// committed image (a fresh object, or both torn).
+pub fn committed_slot<S: ImageRead + ?Sized>(slots: &S) -> Option<CommittedSlot> {
+  let (zero, one) = slots_of(slots.image_len());
+  match (slot_generation(slots, zero), slot_generation(slots, one)) {
+    (Some(g0), Some(g1)) if g1 > g0 => Some(CommittedSlot {
+      generation: g1,
+      second: true,
+    }),
+    (Some(g0), _) => Some(CommittedSlot {
+      generation: g0,
+      second: false,
+    }),
+    (None, Some(g1)) => Some(CommittedSlot {
+      generation: g1,
+      second: true,
+    }),
+    (None, None) => None,
+  }
+}
+
+/// Publishes `image` into one of two alternating, generation-tagged slots (§4.8), so that an interrupted, torn or
+/// too-large publish never destroys the last committed image. The write always lands in the slot that does *not*
+/// hold the committed image, and the commit *is* the CRC becoming valid over `[generation ++ image]`. A crash
+/// mid-write leaves that slot's CRC wrong, so recovery ignores it and reads the other slot — untouched, still the
+/// last committed. `known` is the committed slot as the publisher last learned it ([`CommittedSlot`]); `None`
+/// checks both slots first. Returns the frame's length and the new committed slot; refuses [`VfsError::NoSpace`] if
+/// a slot cannot hold the frame, and on that refusal, too, the committed slot is untouched.
 fn publish_committed<S: ImageWrite + ?Sized>(
   slots: &mut S,
   image: &[u8],
-) -> Result<usize, VfsError> {
+  known: Option<CommittedSlot>,
+) -> Result<(usize, CommittedSlot), VfsError> {
+  let committed = known.or_else(|| committed_slot(slots));
+  let next = committed
+    .map_or(0, |slot| slot.generation)
+    .checked_add(1)
+    .ok_or(VfsError::FileTooLarge)?;
+  // The slot the committed image is not in; the first slot when nothing is committed yet.
+  let second = committed.is_some_and(|slot| !slot.second);
   let (zero, one) = slots_of(slots.image_len());
-  let (zero_generation, one_generation) =
-    (slot_generation(slots, zero), slot_generation(slots, one));
-  let committed = zero_generation
-    .unwrap_or(0)
-    .max(one_generation.unwrap_or(0));
-  let next = committed.checked_add(1).ok_or(VfsError::FileTooLarge)?;
-  // Write the slot that does not hold the committed image (the older, empty, or torn one), so the
-  // committed one survives whatever happens to this write.
-  let slot_zero_committed = zero_generation == Some(committed) && committed > 0;
-  let mut payload = Vec::with_capacity(SLOT_GEN_WIDTH.saturating_add(image.len()));
-  payload.extend_from_slice(&next.to_le_bytes());
-  payload.extend_from_slice(image);
-  let target = if slot_zero_committed { one } else { zero };
-  frame(&payload, slots, target)
+  let target = if second { one } else { zero };
+  let total = frame(next, image, slots, target)?;
+  Ok((
+    total,
+    CommittedSlot {
+      generation: next,
+      second,
+    },
+  ))
 }
 
 /// The last committed image in double-buffered `slots` (§4.8): the CRC-valid slot with the higher
