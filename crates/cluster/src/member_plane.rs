@@ -17,10 +17,15 @@
 //! costs 17–28 % less than slates' detector, with no allocations (hyper-raft `docs/benchmarks.md`). Probes leave the
 //! QUIC congestion window (RFC 9221 §5) for a socket of their own, so bulk traffic cannot delay one.
 //!
-//! **Who sent it.** A datagram is authenticated by its epoch's key, expanded from the TLS exporter of a session whose
-//! certificate the owner authenticated and rostered. A message whose claimed sender is not the datagram's sender is
-//! refused and counted. The owner still validates each announced identity against the peer's anchor
-//! (learn-on-contact), as it did for a probe session.
+//! **Who sent it, and whom the fleet believes.**
+//! - A datagram is authenticated by its epoch's key, expanded from the TLS exporter of a session whose certificate the
+//!   owner authenticated and rostered. A message whose claimed sender is not the datagram's sender is refused and
+//!   counted.
+//! - Before anything reaches the detector, the fleet decides ([`Fleet`]), as it did on a probe session:
+//!   - a probe is answered only for an identity learn-on-contact accepts, and the fleet records the answer for the
+//!     owner lease's holder side;
+//!   - an acknowledgement, an indirect answer or an anti-entropy chunk is folded only from an admitted identity;
+//!   - a relay request is served only for a target this node keeps direct contact with.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
@@ -44,13 +49,27 @@ const EPOCHS_PER_PEER: usize = 2;
 /// reordering it measures, within this. 1,024 counters is 128 bytes of bitmap a peer.
 const WINDOW_LIMIT: usize = 1_024;
 
-/// What the fleet tells the plane about this node's view of others: what an acknowledgement announces.
-pub trait Standing {
-  /// The newest configuration version this node knows (installed, or announced by a peer).
-  fn configuration_version(&self) -> u64;
-  /// The standing this node's configuration holds `prober` at, or `None` when the prober is no member of it: the
-  /// evidence the prober's owner lease is credited from (§4.8 "Leases and reads").
-  fn standing_of(&self, prober: HostId) -> Option<u64>;
+/// The fleet's decisions the plane defers to before it touches the detector (§4.8): whom it answers, whom it believes,
+/// and what an answer announces.
+pub trait Fleet {
+  /// The newest configuration version this node knows (installed, or announced by a peer): what its probes announce.
+  fn announced_version(&self) -> u64;
+  /// Whether to answer `prober`'s probe, which announced `boot_nonce` and `configuration_version`. `None` refuses: a
+  /// forged identity (learn-on-contact refused it) or a peer this node is deaf to; neither its gossip nor the probe
+  /// is folded. `Some((version, standing))` answers with the owner-lease evidence: the configuration version this
+  /// node read the prober's `standing` at (§4.8 "Leases and reads"). The fleet records that it answered.
+  fn answer(
+    &mut self,
+    prober: HostId,
+    boot_nonce: u64,
+    configuration_version: u64,
+  ) -> Option<(u64, Option<u64>)>;
+  /// Whether `from`, announcing `boot_nonce`, is believed: an acknowledgement, an indirect answer or an anti-entropy
+  /// chunk from it is folded only then.
+  fn admit(&mut self, from: HostId, boot_nonce: u64) -> bool;
+  /// Whether this node relays a probe to `target` for another member: only a member it keeps direct contact with, so
+  /// no authenticated peer can name arbitrary targets (AUD-15's bound).
+  fn relays_to(&self, target: HostId) -> bool;
 }
 
 /// What a received datagram told the fleet.
@@ -91,6 +110,8 @@ pub struct PlaneCounts {
   pub malformed: u64,
   /// Messages whose claimed sender was not the datagram's.
   pub impersonated: u64,
+  /// Messages the fleet refused: a forged identity, or a peer this node is deaf to.
+  pub refused_by_fleet: u64,
   /// Messages the plane refused to queue: no epoch for the peer, or a datagram already full.
   pub refused_queue: u64,
   /// Membership updates the detector's bounded view refused.
@@ -264,7 +285,7 @@ impl MemberPlane {
 
   /// Polls the detector at `now_ns` and queues what it asks: its relay requests, the period's probe (carrying this
   /// node's gossip, its suspicion of the target first) and its anti-entropy chunks.
-  pub fn step(&mut self, now_ns: u64, fleet: &impl Standing) {
+  pub fn step(&mut self, now_ns: u64, fleet: &mut impl Fleet) {
     let mut requests = std::mem::take(&mut self.requests);
     let ping = self.detector.poll(now_ns, &mut requests);
     let local = hyper_swim::HostId(self.local.0);
@@ -291,7 +312,7 @@ impl MemberPlane {
           from: local,
           nonce: ping.nonce,
           boot_nonce: self.boot_nonce,
-          configuration_version: fleet.configuration_version(),
+          configuration_version: fleet.announced_version(),
           gossip: GossipBatch::Entries(&batch),
         },
       );
@@ -318,7 +339,7 @@ impl MemberPlane {
     &mut self,
     datagram: &mut [u8],
     stamp_ns: u64,
-    fleet: &impl Standing,
+    fleet: &mut impl Fleet,
     events: &mut Vec<PlaneEvent>,
   ) {
     // The opened messages borrow the datagram, not the plane, so each is decoded in place and handled while the
@@ -344,7 +365,7 @@ impl MemberPlane {
     sender: u64,
     message: SwimMessage<'_>,
     stamp_ns: u64,
-    fleet: &impl Standing,
+    fleet: &mut impl Fleet,
     events: &mut Vec<PlaneEvent>,
   ) {
     let local = hyper_swim::HostId(self.local.0);
@@ -357,6 +378,11 @@ impl MemberPlane {
         gossip,
         ..
       } => {
+        let Some((version, standing)) = fleet.answer(from, boot_nonce, configuration_version)
+        else {
+          self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+          return;
+        };
         self.detector.apply_gossip(gossip);
         let ack = self.detector.on_ping(hyper_swim::HostId(sender));
         let mut batch = std::mem::take(&mut self.batch);
@@ -370,8 +396,8 @@ impl MemberPlane {
             from: local,
             nonce,
             boot_nonce: self.boot_nonce,
-            configuration_version: fleet.configuration_version(),
-            standing: fleet.standing_of(from),
+            configuration_version: version,
+            standing,
             gossip: GossipBatch::Entries(&batch),
             coordinate: Coordinate::Held(&coordinate),
           },
@@ -392,6 +418,10 @@ impl MemberPlane {
         coordinate,
         ..
       } => {
+        if !fleet.admit(from, boot_nonce) {
+          self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+          return;
+        }
         self.detector.apply_gossip(gossip);
         self
           .detector
@@ -434,6 +464,10 @@ impl MemberPlane {
         gossip,
         ..
       } => {
+        if !fleet.relays_to(HostId(target.0)) {
+          self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+          return;
+        }
         self.detector.apply_gossip(gossip);
         let ping = self.detector.on_ping_req(target);
         self
@@ -445,7 +479,7 @@ impl MemberPlane {
             from: local,
             nonce: ping.nonce,
             boot_nonce: self.boot_nonce,
-            configuration_version: fleet.configuration_version(),
+            configuration_version: fleet.announced_version(),
             gossip: GossipBatch::Entries(&[]),
           },
         );
@@ -457,6 +491,10 @@ impl MemberPlane {
         gossip,
         ..
       } => {
+        if !fleet.admit(from, boot_nonce) {
+          self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+          return;
+        }
         self.detector.apply_gossip(gossip);
         self.detector.on_indirect_ack(target, nonce, stamp_ns);
         events.push(PlaneEvent::Heard {
@@ -472,6 +510,10 @@ impl MemberPlane {
         gossip,
         ..
       } => {
+        if !fleet.admit(from, boot_nonce) {
+          self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+          return;
+        }
         self
           .detector
           .on_sync(hyper_swim::HostId(sender), digest, pull, gossip);

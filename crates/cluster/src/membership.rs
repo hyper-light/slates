@@ -19,40 +19,18 @@ use std::collections::BTreeMap;
 
 use slates_db::register::HostId;
 
-/// A member's liveness in the SWIM sense. The override order **at equal incarnation** is
-/// `Alive < Suspect < Dead`: a suspicion overrides a same-incarnation alive belief, a death overrides
-/// both, and an alive belief never overrides a same-incarnation suspicion (only a higher incarnation,
-/// which the member itself asserts, refutes a suspicion).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Liveness {
-  /// Believed healthy.
-  Alive,
-  /// Suspected failed (a ping went unanswered); still a member until confirmed.
-  Suspect,
-  /// Confirmed failed; to be removed from the neighbourhood.
-  Dead,
-}
+/// A member's liveness in the SWIM sense, and its state under an incarnation: hyper-swim's types, one definition for
+/// the detector and the fleet's authority table (A-67 H-2). The override order **at equal incarnation** is
+/// `Alive < Suspect < Dead`; only a higher incarnation, which the member itself asserts, refutes a suspicion.
+pub use hyper_swim::membership::{Liveness, MemberState};
 
-impl Liveness {
-  /// The override rank at equal incarnation (higher wins): Alive 0, Suspect 1, Dead 2.
-  fn rank(self) -> u8 {
-    match self {
-      Liveness::Alive => 0,
-      Liveness::Suspect => 1,
-      Liveness::Dead => 2,
-    }
+/// The override rank at equal incarnation (higher wins): Alive 0, Suspect 1, Dead 2.
+fn rank(liveness: Liveness) -> u8 {
+  match liveness {
+    Liveness::Alive => 0,
+    Liveness::Suspect => 1,
+    Liveness::Dead => 2,
   }
-}
-
-/// A member's state: its liveness and the **incarnation** it was asserted under. Incarnation numbers
-/// are the tie-breaker SWIM uses so a member can refute a stale suspicion — a member raises its own
-/// incarnation and re-asserts `Alive`, which outranks any suspicion carried at a lower incarnation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MemberState {
-  /// The believed liveness.
-  pub liveness: Liveness,
-  /// The incarnation this belief is under.
-  pub incarnation: u64,
 }
 
 /// What applying a gossiped update changed in the local view — for the caller to gossip onward or act
@@ -115,7 +93,7 @@ impl Membership {
       Some(current) => {
         update.incarnation > current.incarnation
           || (update.incarnation == current.incarnation
-            && update.liveness.rank() > current.liveness.rank())
+            && rank(update.liveness) > rank(current.liveness))
       }
     };
     if !overrides {

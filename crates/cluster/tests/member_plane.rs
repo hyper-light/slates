@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
-use slates_cluster::member_plane::{MemberPlane, PlaneEvent, Standing};
+use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
 use slates_db::register::HostId;
 
 use hyper_datagram::{ExporterSecret, Role, SECRET_BYTES};
@@ -25,14 +25,24 @@ const JITTER_DIVISOR: u64 = 5;
 /// detection bound at this latency (hundreds of periods).
 const HORIZON_NS: u64 = 600_000_000_000;
 
-/// A fleet view that announces nothing in particular.
-struct NoStanding;
-impl Standing for NoStanding {
-  fn configuration_version(&self) -> u64 {
+/// A fleet that believes and answers every member (but one it refuses to answer, as for a forged identity), announcing
+/// version 7 and standing 3.
+#[derive(Default)]
+struct Believing {
+  refuses: Option<u64>,
+}
+impl Fleet for Believing {
+  fn announced_version(&self) -> u64 {
     7
   }
-  fn standing_of(&self, _: HostId) -> Option<u64> {
-    Some(3)
+  fn answer(&mut self, prober: HostId, _: u64, _: u64) -> Option<(u64, Option<u64>)> {
+    (self.refuses != Some(prober.0)).then_some((7, Some(3)))
+  }
+  fn admit(&mut self, _: HostId, _: u64) -> bool {
+    true
+  }
+  fn relays_to(&self, _: HostId) -> bool {
+    true
   }
 }
 
@@ -53,8 +63,9 @@ struct InFlight {
   bytes: Vec<u8>,
 }
 
-struct Fleet {
+struct Network {
   members: BTreeMap<u64, MemberPlane>,
+  fleets: BTreeMap<u64, Believing>,
   in_flight: Vec<InFlight>,
   events: BTreeMap<u64, Vec<PlaneEvent>>,
   /// Members whose datagrams are dropped both ways: killed.
@@ -64,8 +75,8 @@ struct Fleet {
   jitter: u64,
 }
 
-impl Fleet {
-  fn new() -> Fleet {
+impl Network {
+  fn new() -> Network {
     let mut members = BTreeMap::new();
     for me in 1..=MEMBERS {
       let mut plane = MemberPlane::new(
@@ -87,8 +98,10 @@ impl Fleet {
       }
       members.insert(me, plane);
     }
-    Fleet {
+    let fleets = (1..=MEMBERS).map(|me| (me, Believing::default())).collect();
+    Network {
       members,
+      fleets,
       in_flight: Vec::new(),
       events: BTreeMap::new(),
       killed: Vec::new(),
@@ -127,7 +140,7 @@ impl Fleet {
   }
 
   /// Runs every member's step, then delivers and steps until `horizon_ns` or `done` holds.
-  fn run_until(&mut self, horizon_ns: u64, done: impl Fn(&Fleet) -> bool) -> bool {
+  fn run_until(&mut self, horizon_ns: u64, done: impl Fn(&Network) -> bool) -> bool {
     while self.now_ns < horizon_ns {
       let ids: Vec<u64> = self.members.keys().copied().collect();
       for me in &ids {
@@ -136,11 +149,8 @@ impl Fleet {
         }
         let wake = self.members[me].wake();
         if wake.is_none_or(|at| at <= self.now_ns) {
-          self
-            .members
-            .get_mut(me)
-            .unwrap()
-            .step(self.now_ns, &NoStanding);
+          let fleet = self.fleets.get_mut(me).unwrap();
+          self.members.get_mut(me).unwrap().step(self.now_ns, fleet);
           self.flush(*me);
         }
       }
@@ -160,9 +170,10 @@ impl Fleet {
         }
         let events = self.events.entry(to).or_default();
         let member = self.members.get_mut(&to).unwrap();
-        member.receive(&mut bytes, self.now_ns, &NoStanding, events);
+        let fleet = self.fleets.get_mut(&to).unwrap();
+        member.receive(&mut bytes, self.now_ns, fleet, events);
         // The detector is polled after every message it is fed, as well as at its wake (hyper-swim `Detector::poll`).
-        member.step(self.now_ns, &NoStanding);
+        member.step(self.now_ns, fleet);
         self.flush(to);
       }
       if done(self) {
@@ -236,7 +247,7 @@ fn check_acked(me: u64, event: &PlaneEvent) {
 /// with the probe's round trip within the network's two latencies and their jitter.
 #[test]
 fn acknowledgements_carry_the_peers_identity_standing_and_round_trip() {
-  let mut fleet = Fleet::new();
+  let mut fleet = Network::new();
   let acked = fleet.run_until(HORIZON_NS, |fleet| {
     (1..=MEMBERS).all(|me| {
       fleet.events.get(&me).is_some_and(|events| {
@@ -257,7 +268,7 @@ fn acknowledgements_carry_the_peers_identity_standing_and_round_trip() {
 }
 
 /// Prints every pair's detector evidence: what a failure to judge is diagnosed from.
-fn print_evidence(fleet: &Fleet) {
+fn print_evidence(fleet: &Network) {
   for me in 1..=MEMBERS {
     for peer in (1..=MEMBERS).filter(|peer| *peer != me) {
       let detector = fleet.members[&me].detector();
@@ -282,7 +293,7 @@ fn print_evidence(fleet: &Fleet) {
 
 /// The survivors whose own probes condemned `victim`, each checked to have done so within the bound its detector
 /// stated. A survivor that learned the death from another's gossip (SWIM's dissemination) is not counted.
-fn condemnations_by_own_probes(fleet: &Fleet, victim: u64) -> usize {
+fn condemnations_by_own_probes(fleet: &Network, victim: u64) -> usize {
   let mut own = 0;
   for (survivor, member) in fleet
     .members
@@ -310,7 +321,7 @@ fn condemnations_by_own_probes(fleet: &Fleet, victim: u64) -> usize {
 /// or by the other's gossip), at least one by its own probes, and neither ever holds the other survivor dead.
 #[test]
 fn a_killed_member_is_condemned_by_every_survivor_and_no_live_one_is() {
-  let mut fleet = Fleet::new();
+  let mut fleet = Network::new();
   let judged = fleet.run_until(HORIZON_NS, |fleet| {
     (1..=MEMBERS).all(|me| {
       (1..=MEMBERS).filter(|peer| *peer != me).all(|peer| {
@@ -388,7 +399,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
   plane.queue(1, &encoded).unwrap();
   plane.flush(|_, datagram| sealed = datagram.unwrap().to_vec());
   let mut events = Vec::new();
-  receiver.receive(&mut sealed, 1, &NoStanding, &mut events);
+  receiver.receive(&mut sealed, 1, &mut Believing::default(), &mut events);
   assert!(
     events.is_empty(),
     "nothing folded from a forged sender: {events:?}"
@@ -400,4 +411,32 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     "the datagram itself was authentic"
   );
   drop(sender);
+}
+
+/// A-67 H-2 (learn-on-contact, §4.8). Do: run three members where member 1's fleet refuses to answer member 2 (a forged
+/// identity, or a peer it is deaf to). Expect: member 2 sees acknowledgements from member 3 but never from member 1, and
+/// member 1 counts every refused probe.
+#[test]
+fn a_probe_the_fleet_refuses_is_neither_answered_nor_folded() {
+  let mut fleet = Network::new();
+  fleet.fleets.get_mut(&1).unwrap().refuses = Some(2);
+  let heard_from_3 = fleet.run_until(HORIZON_NS, |fleet| {
+    fleet.events.get(&2).is_some_and(|events| {
+      events
+        .iter()
+        .filter(|event| matches!(event, PlaneEvent::Acked { from, .. } if from.0 == 3))
+        .count()
+        > 3
+    })
+  });
+  assert!(heard_from_3, "member 2 is answered by member 3");
+  let from_1 = fleet.events[&2]
+    .iter()
+    .filter(|event| matches!(event, PlaneEvent::Acked { from, .. } if from.0 == 1))
+    .count();
+  assert_eq!(from_1, 0, "member 1 never answered member 2");
+  assert!(
+    fleet.members[&1].counts().refused_by_fleet > 0,
+    "member 1 counted its refusals"
+  );
 }
