@@ -8453,8 +8453,10 @@ Status: built 2026-10-03.
 ### A-66 — AWS-LC is slates' one cryptographic library (2026-10-03)
 Applied in the same change to: `docs/wip/fleet-transport.md` (§3 buildability note, §7 seal, status),
 `docs/wip/transport-quic.md`, GAPS (2026-10-03 entry), BENCHMARKS, the workspace `Cargo.toml` and `.cargo/config.toml`.
-Status: built 2026-10-03 over aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0, vendored in-tree as their crates.io packages
-unchanged, each checked against `Cargo.lock`'s SHA-256 (`vendor/UPSTREAM.md`); mantle's local patches are not carried.
+Status: built 2026-10-03 over aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0, vendored in-tree as ../mantle's patched copies
+(mantle `3b16867`, Ada's authorization; `vendor/UPSTREAM.md`): the RNDR retry with its operating-system fallback, jitter
+entropy out by default, the system-library guard, #1241, #1165 and #617. Their own suites (850 tests) are a CI gate, and
+CI builds the Windows x86 assembly from NASM source.
 - Why: Ada's decision (2026-09-28): one cryptographic library, AWS-LC through aws-lc-rs, as ../mantle and ../focal
   use. Before it, slates' TLS ran on `ring` and the control plane's seal and key schedule on RustCrypto's `aes-gcm`,
   `hkdf` and `sha2`.

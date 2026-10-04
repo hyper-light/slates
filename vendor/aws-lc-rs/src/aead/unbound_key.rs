@@ -583,6 +583,17 @@ impl UnboundKey {
     }
 }
 
+impl UnboundKey {
+    // mantle: for `Clone` on `LessSafeKey` (aws-lc-rs#1165; vendor/UPSTREAM.md).
+    /// A key with its own copy of this key's context.
+    pub(crate) fn try_clone(&self) -> Result<Self, Unspecified> {
+        Ok(Self {
+            ctx: self.ctx.try_clone()?,
+            algorithm: self.algorithm,
+        })
+    }
+}
+
 impl From<AeadCtx> for UnboundKey {
     fn from(value: AeadCtx) -> Self {
         let algorithm = match value {

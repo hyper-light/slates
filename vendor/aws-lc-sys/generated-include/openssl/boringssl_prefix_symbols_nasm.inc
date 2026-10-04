@@ -3612,6 +3612,8 @@
 %xdefine _have_hw_rng_aarch64_for_testing _ %+ BORINGSSL_PREFIX %+ _have_hw_rng_aarch64_for_testing
 %xdefine _have_hw_rng_x86_64_for_testing _ %+ BORINGSSL_PREFIX %+ _have_hw_rng_x86_64_for_testing
 %xdefine _hmac_asn1_meth _ %+ BORINGSSL_PREFIX %+ _hmac_asn1_meth
+%xdefine _hw_rng_multiple8_with_retry_FOR_TESTING _ %+ BORINGSSL_PREFIX %+ _hw_rng_multiple8_with_retry_FOR_TESTING
+%xdefine _hw_rng_or_os_multiple8_FOR_TESTING _ %+ BORINGSSL_PREFIX %+ _hw_rng_or_os_multiple8_FOR_TESTING
 %xdefine _i2a_ASN1_ENUMERATED _ %+ BORINGSSL_PREFIX %+ _i2a_ASN1_ENUMERATED
 %xdefine _i2a_ASN1_INTEGER _ %+ BORINGSSL_PREFIX %+ _i2a_ASN1_INTEGER
 %xdefine _i2a_ASN1_OBJECT _ %+ BORINGSSL_PREFIX %+ _i2a_ASN1_OBJECT
@@ -7770,6 +7772,8 @@
 %xdefine have_hw_rng_aarch64_for_testing BORINGSSL_PREFIX %+ _have_hw_rng_aarch64_for_testing
 %xdefine have_hw_rng_x86_64_for_testing BORINGSSL_PREFIX %+ _have_hw_rng_x86_64_for_testing
 %xdefine hmac_asn1_meth BORINGSSL_PREFIX %+ _hmac_asn1_meth
+%xdefine hw_rng_multiple8_with_retry_FOR_TESTING BORINGSSL_PREFIX %+ _hw_rng_multiple8_with_retry_FOR_TESTING
+%xdefine hw_rng_or_os_multiple8_FOR_TESTING BORINGSSL_PREFIX %+ _hw_rng_or_os_multiple8_FOR_TESTING
 %xdefine i2a_ASN1_ENUMERATED BORINGSSL_PREFIX %+ _i2a_ASN1_ENUMERATED
 %xdefine i2a_ASN1_INTEGER BORINGSSL_PREFIX %+ _i2a_ASN1_INTEGER
 %xdefine i2a_ASN1_OBJECT BORINGSSL_PREFIX %+ _i2a_ASN1_OBJECT

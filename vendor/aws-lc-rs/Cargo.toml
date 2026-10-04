@@ -28,7 +28,8 @@ exclude = [
 autolib = false
 autobins = false
 autoexamples = false
-autotests = false
+# mantle: upstream's integration tests, vendored from the v1.18.1 tag, run (vendor/UPSTREAM.md).
+autotests = true
 autobenches = false
 description = "aws-lc-rs is a cryptographic library using AWS-LC for its cryptographic operations. This library strives to be API-compatible with the popular Rust library named ring."
 homepage = "https://github.com/aws/aws-lc-rs"

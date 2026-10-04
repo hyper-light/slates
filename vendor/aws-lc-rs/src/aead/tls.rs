@@ -332,6 +332,331 @@ impl Debug for TlsRecordOpeningKey {
     }
 }
 
+// mantle: TLS 1.3 sealing from several borrowed plaintext slices (aws-lc-rs#1241;
+// vendor/UPSTREAM.md).
+#[cfg(not(feature = "fips"))]
+pub use vectored::Tls13VectoredSealingKey;
+
+#[cfg(not(feature = "fips"))]
+mod vectored {
+    use super::super::{Aad, Algorithm, AlgorithmID, NONCE_LEN};
+    use crate::aws_lc::{
+        EVP_CIPHER_CTX_ctrl, EVP_CIPHER_CTX_new, EVP_EncryptFinal_ex, EVP_EncryptInit_ex,
+        EVP_EncryptUpdate, EVP_aes_128_gcm, EVP_aes_256_gcm, EVP_CIPHER_CTX, EVP_CTRL_GCM_GET_TAG,
+    };
+    use crate::error::Unspecified;
+    use crate::ptr::LcPtr;
+    use core::ffi::c_int;
+    use core::fmt::Debug;
+    use core::ptr::{null, null_mut};
+    use zeroize::Zeroize;
+
+    /// AES-GCM sealing key for TLS 1.3 records whose plaintext lies in several borrowed slices.
+    ///
+    /// A TLS 1.3 record's plaintext often arrives in pieces: a payload in several buffers,
+    /// then the inner content type and any padding (RFC 8446 §5.2). This key seals their
+    /// concatenation as one record, in one AES-GCM invocation with one nonce and one tag,
+    /// reading each piece where it lies. Its ciphertext and tag are byte for byte those
+    /// [`super::TlsRecordSealingKey`] produces for the same record.
+    ///
+    /// The key makes each record's nonce from the record's sequence number and the traffic
+    /// IV (RFC 8446 §5.3). TLS numbers records from 0 and one apart; the key refuses any
+    /// number not above every number it has sealed, so no nonce repeats, and refuses
+    /// `u64::MAX`, after which no number could follow, as AWS-LC's own TLS 1.3 AEAD does. A
+    /// seal consumes its sequence number before it encrypts anything, and a seal that fails
+    /// after that leaves the key refusing every later seal, so no nonce is used twice even
+    /// when encryption stops partway. The caller must then replace the key.
+    ///
+    /// The caller builds the additional data (the record header), supplies the inner content
+    /// type and padding as the last plaintext slices, and keeps to the cipher suite's limit
+    /// on records per key (RFC 8446 §5.5).
+    ///
+    /// Supports `AES_128_GCM` and `AES_256_GCM`. Not available with the `fips` feature: it
+    /// runs AES-GCM through the incremental `EVP_CIPHER` interface, with the nonce chosen
+    /// here, and makes no claim of FIPS approval.
+    pub struct Tls13VectoredSealingKey {
+        ctx: LcPtr<EVP_CIPHER_CTX>,
+        algorithm: &'static Algorithm,
+        iv: [u8; NONCE_LEN],
+        next_sequence: u64,
+        /// Set when a seal has consumed its sequence number and not yet completed; a seal
+        /// that fails or unwinds leaves it set.
+        failed: bool,
+    }
+
+    // SAFETY: the key owns its `EVP_CIPHER_CTX` alone and uses it only through `&mut self`.
+    unsafe impl Send for Tls13VectoredSealingKey {}
+
+    impl Tls13VectoredSealingKey {
+        /// A key for `algorithm` from a TLS 1.3 traffic key and IV (RFC 8446 §7.3).
+        ///
+        /// # Errors
+        /// `error::Unspecified` if the algorithm is not AES-GCM, `key_bytes` is not the
+        /// algorithm's key length, `iv` is not `NONCE_LEN` bytes, or AWS-LC cannot set the key.
+        pub fn new(
+            algorithm: &'static Algorithm,
+            key_bytes: &[u8],
+            iv: &[u8],
+        ) -> Result<Self, Unspecified> {
+            let cipher = match algorithm.id {
+                AlgorithmID::AES_128_GCM => unsafe { EVP_aes_128_gcm() },
+                AlgorithmID::AES_256_GCM => unsafe { EVP_aes_256_gcm() },
+                AlgorithmID::AES_192_GCM
+                | AlgorithmID::AES_128_GCM_SIV
+                | AlgorithmID::AES_256_GCM_SIV
+                | AlgorithmID::CHACHA20_POLY1305 => return Err(Unspecified),
+            };
+            if key_bytes.len() != algorithm.key_len() {
+                return Err(Unspecified);
+            }
+            let iv: [u8; NONCE_LEN] = iv.try_into().map_err(|_| Unspecified)?;
+            let mut ctx = LcPtr::new(unsafe { EVP_CIPHER_CTX_new() })?;
+            // AWS-LC copies the key into the context.
+            if 1 != unsafe {
+                EVP_EncryptInit_ex(
+                    ctx.as_mut_ptr(),
+                    cipher,
+                    null_mut(),
+                    key_bytes.as_ptr(),
+                    null(),
+                )
+            } {
+                return Err(Unspecified);
+            }
+            Ok(Self {
+                ctx,
+                algorithm,
+                iv,
+                next_sequence: 0,
+                failed: false,
+            })
+        }
+
+        /// Seals the record with sequence number `sequence`, writing its ciphertext and then
+        /// its tag to the start of `out`.
+        ///
+        /// `aad` is the record's additional data, its header (RFC 8446 §5.2). The plaintext
+        /// is the concatenation of the slices `plaintext` yields, `plaintext_len` bytes in
+        /// all; empty slices are allowed and slices need not align to blocks. `out` must hold
+        /// at least `plaintext_len + self.algorithm().tag_len()` bytes, and nothing past them
+        /// is written.
+        ///
+        /// # Errors
+        /// `error::Unspecified` if the key has failed before, `sequence` is not above every
+        /// sequence number this key has sealed or is `u64::MAX`, `out` is too short, or the
+        /// lengths exceed what AWS-LC takes: all refused before anything is encrypted, with
+        /// `out` untouched and the key still usable. Also if the slices do not add up to
+        /// `plaintext_len`, which is found without writing past `plaintext_len`, or
+        /// AWS-LC fails: then `out` may hold part of the ciphertext, and the key refuses
+        /// every later seal.
+        pub fn seal_vectored<'p, A, P>(
+            &mut self,
+            sequence: u64,
+            aad: Aad<A>,
+            plaintext: P,
+            plaintext_len: usize,
+            out: &mut [u8],
+        ) -> Result<(), Unspecified>
+        where
+            A: AsRef<[u8]>,
+            P: IntoIterator<Item = &'p [u8]>,
+        {
+            let sealed_len = plaintext_len
+                .checked_add(self.algorithm.tag_len())
+                .ok_or(Unspecified)?;
+            let out = out.get_mut(..sealed_len).ok_or(Unspecified)?;
+            self.begin(sequence, aad.as_ref(), plaintext_len)?;
+            // SAFETY: `out` is valid for `sealed_len` bytes.
+            unsafe { self.encrypt(plaintext, plaintext_len, out.as_mut_ptr()) }
+        }
+
+        /// Seals the record as [`Self::seal_vectored`] does, appending its ciphertext and tag
+        /// to `out`.
+        ///
+        /// The sealed bytes are written into `out`'s spare capacity, reserved first, and
+        /// `out`'s length covers them only once the seal has succeeded: the bytes `out`
+        /// held are kept, and no byte is exposed before it is written.
+        ///
+        /// # Errors
+        /// As for [`Self::seal_vectored`], and if the capacity cannot be reserved, which is
+        /// refused before anything is encrypted. On any error `out` keeps its length and
+        /// contents.
+        pub fn seal_vectored_append<'p, A, P>(
+            &mut self,
+            sequence: u64,
+            aad: Aad<A>,
+            plaintext: P,
+            plaintext_len: usize,
+            out: &mut Vec<u8>,
+        ) -> Result<(), Unspecified>
+        where
+            A: AsRef<[u8]>,
+            P: IntoIterator<Item = &'p [u8]>,
+        {
+            let sealed_len = plaintext_len
+                .checked_add(self.algorithm.tag_len())
+                .ok_or(Unspecified)?;
+            out.try_reserve(sealed_len).map_err(|_| Unspecified)?;
+            self.begin(sequence, aad.as_ref(), plaintext_len)?;
+            let start = out.len();
+            let spare = out.spare_capacity_mut();
+            if spare.len() < sealed_len {
+                return Err(Unspecified);
+            }
+            // SAFETY: the spare capacity is valid for writes of `sealed_len` bytes; AWS-LC
+            // writes bytes through the pointer and never reads them first.
+            unsafe { self.encrypt(plaintext, plaintext_len, spare.as_mut_ptr().cast::<u8>())? };
+            // SAFETY: `encrypt` succeeded, so it wrote all `sealed_len` bytes after `start`.
+            unsafe { out.set_len(start + sealed_len) };
+            Ok(())
+        }
+
+        /// The key's AEAD algorithm.
+        #[must_use]
+        pub fn algorithm(&self) -> &'static Algorithm {
+            self.algorithm
+        }
+
+        /// Checks `sequence` and the lengths, consumes the sequence number, and starts the
+        /// record: its nonce, then its additional data.
+        fn begin(
+            &mut self,
+            sequence: u64,
+            aad: &[u8],
+            plaintext_len: usize,
+        ) -> Result<(), Unspecified> {
+            if self.failed || sequence < self.next_sequence || sequence == u64::MAX {
+                return Err(Unspecified);
+            }
+            // `EVP_EncryptUpdate` takes `int` lengths; each slice is at most the whole.
+            c_int::try_from(plaintext_len).map_err(|_| Unspecified)?;
+            let aad_len = c_int::try_from(aad.len()).map_err(|_| Unspecified)?;
+            // From here the sequence number is spent, and the key stays failed unless the
+            // seal completes.
+            self.next_sequence = sequence + 1;
+            self.failed = true;
+
+            // RFC 8446 §5.3: the sequence number, big-endian and left-padded to the IV's
+            // length, XORed with the IV.
+            let mut nonce = self.iv;
+            for (n, s) in nonce[NONCE_LEN - 8..]
+                .iter_mut()
+                .zip(sequence.to_be_bytes())
+            {
+                *n ^= s;
+            }
+            // With no cipher and no key, AWS-LC keeps both and starts a new message under
+            // this nonce.
+            let started = unsafe {
+                EVP_EncryptInit_ex(
+                    self.ctx.as_mut_ptr(),
+                    null(),
+                    null_mut(),
+                    null(),
+                    nonce.as_ptr(),
+                )
+            };
+            nonce.zeroize();
+            if started != 1 {
+                return Err(Unspecified);
+            }
+            if !aad.is_empty() {
+                let mut written: c_int = 0;
+                // A null output makes the input additional data.
+                if 1 != unsafe {
+                    EVP_EncryptUpdate(
+                        self.ctx.as_mut_ptr(),
+                        null_mut(),
+                        &mut written,
+                        aad.as_ptr(),
+                        aad_len,
+                    )
+                } {
+                    return Err(Unspecified);
+                }
+            }
+            Ok(())
+        }
+
+        /// Encrypts the plaintext into `out`, then writes the tag after it.
+        ///
+        /// # Safety
+        /// `out` must be valid for writes of `plaintext_len + self.algorithm.tag_len()` bytes,
+        /// and `begin` must have succeeded for this record.
+        unsafe fn encrypt<'p, P>(
+            &mut self,
+            plaintext: P,
+            plaintext_len: usize,
+            out: *mut u8,
+        ) -> Result<(), Unspecified>
+        where
+            P: IntoIterator<Item = &'p [u8]>,
+        {
+            let mut done = 0usize;
+            for piece in plaintext {
+                if piece.is_empty() {
+                    continue;
+                }
+                // A slice past the declared length is refused before it is written.
+                let end = done
+                    .checked_add(piece.len())
+                    .filter(|&end| end <= plaintext_len)
+                    .ok_or(Unspecified)?;
+                let len = c_int::try_from(piece.len()).map_err(|_| Unspecified)?;
+                let mut written: c_int = 0;
+                if 1 != EVP_EncryptUpdate(
+                    self.ctx.as_mut_ptr(),
+                    out.add(done),
+                    &mut written,
+                    piece.as_ptr(),
+                    len,
+                ) || written != len
+                {
+                    return Err(Unspecified);
+                }
+                done = end;
+            }
+            if done != plaintext_len {
+                return Err(Unspecified);
+            }
+            let mut written: c_int = 0;
+            if 1 != EVP_EncryptFinal_ex(self.ctx.as_mut_ptr(), out.add(done), &mut written)
+                || written != 0
+            {
+                return Err(Unspecified);
+            }
+            let tag_len = c_int::try_from(self.algorithm.tag_len()).map_err(|_| Unspecified)?;
+            if 1 != EVP_CIPHER_CTX_ctrl(
+                self.ctx.as_mut_ptr(),
+                EVP_CTRL_GCM_GET_TAG,
+                tag_len,
+                out.add(done).cast(),
+            ) {
+                return Err(Unspecified);
+            }
+            self.failed = false;
+            Ok(())
+        }
+    }
+
+    impl Drop for Tls13VectoredSealingKey {
+        fn drop(&mut self) {
+            self.iv.zeroize();
+        }
+    }
+
+    #[allow(clippy::missing_fields_in_debug)]
+    impl Debug for Tls13VectoredSealingKey {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("Tls13VectoredSealingKey")
+                .field("algorithm", &self.algorithm)
+                .field("next_sequence", &self.next_sequence)
+                .field("failed", &self.failed)
+                .finish()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{TlsProtocolId, TlsRecordOpeningKey, TlsRecordSealingKey};

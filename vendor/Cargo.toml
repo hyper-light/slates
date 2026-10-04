@@ -1,0 +1,8 @@
+# The vendored crates as one workspace, so each runs its own suite against the other's vendored copy
+# (vendor/UPSTREAM.md): cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+[workspace]
+members = ["aws-lc-rs", "aws-lc-sys"]
+resolver = "2"
+
+[patch.crates-io]
+aws-lc-sys = { path = "aws-lc-sys" }

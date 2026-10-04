@@ -754,7 +754,9 @@ fn get_builder(prefix: &Option<String>, manifest_dir: &Path, out_dir: &Path) -> 
     // to auto-detect a usable system AWS-LC. Detection is non-fatal: an
     // unsuitable (or absent) install falls through to the source build, unless
     // USE_SYSTEM=1 demands one.
-    if use_system() != Some(false) {
+    // mantle: detection is opt-in (`AWS_LC_SYS_USE_SYSTEM=1`), so the vendored source is what
+    // builds unless a system install is asked for (vendor/UPSTREAM.md).
+    if use_system() == Some(true) {
         if let Some(system_lib) = system_detect::detect_system_awslc(manifest_dir) {
             // Mirror the explicit path's global state so is_bindgen_required()
             // and the other get_system_dir_path() consumers agree we are
@@ -874,7 +876,10 @@ fn initialize() {
         SYS_NO_PREGENERATED_SRC = env_crate_var_to_bool("NO_PREGENERATED_SRC").unwrap_or(false);
         SYS_SMALL = env_crate_var_to_bool("SMALL");
         SYS_EFFECTIVE_TARGET = optional_env_crate_target("EFFECTIVE_TARGET").unwrap_or_default();
-        SYS_NO_JITTER_ENTROPY = env_crate_var_to_bool("NO_JITTER_ENTROPY");
+        // mantle: CPU jitter entropy is off unless `AWS_LC_SYS_NO_JITTER_ENTROPY=0` asks for it,
+        // so the DRBG seeds from the OS and a new process pays no jitter collection
+        // (vendor/UPSTREAM.md).
+        SYS_NO_JITTER_ENTROPY = Some(env_crate_var_to_bool("NO_JITTER_ENTROPY").unwrap_or(true));
         SYS_NO_U1_BINDINGS = env_crate_var_to_bool("NO_U1_BINDINGS");
         SYS_INCLUDES =
             optional_env_crate_target("INCLUDES").map(|v| std::env::split_paths(&v).collect());

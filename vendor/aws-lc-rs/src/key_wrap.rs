@@ -53,6 +53,10 @@ pub enum BlockCipherId {
     /// AES Block Cipher with 128-bit key.
     Aes128,
 
+    // mantle: AES-192 for JWE's A192KW (aws-lc-rs#617; vendor/UPSTREAM.md).
+    /// AES Block Cipher with 192-bit key.
+    Aes192,
+
     /// AES Block Cipher with 256-bit key.
     Aes256,
 }
@@ -98,6 +102,13 @@ impl Debug for AesBlockCipher {
 pub const AES_128: AesBlockCipher = AesBlockCipher {
     id: BlockCipherId::Aes128,
     key_len: 16,
+};
+
+// mantle: aws-lc-rs#617 (vendor/UPSTREAM.md).
+/// AES Block Cipher with 192-bit key.
+pub const AES_192: AesBlockCipher = AesBlockCipher {
+    id: BlockCipherId::Aes192,
+    key_len: 24,
 };
 
 /// AES Block Cipher with 256-bit key.

@@ -96,7 +96,7 @@
 //! [RFC 2104]: https://tools.ietf.org/html/rfc2104
 
 use crate::aws_lc::{
-    HMAC_CTX_cleanup, HMAC_CTX_copy_ex, HMAC_CTX_init, HMAC_Final, HMAC_Init_ex, HMAC_Update,
+    HMAC_CTX_cleanup, HMAC_CTX_copy_ex, HMAC_CTX_init, HMAC_Final, HMAC_Init_ex, HMAC_Update, HMAC,
     HMAC_CTX,
 };
 use crate::error::Unspecified;
@@ -298,7 +298,8 @@ impl Key {
         Key::try_new(algorithm, key_value).expect("Unable to create HmacContext")
     }
 
-    fn try_new(algorithm: Algorithm, key_value: &[u8]) -> Result<Self, Unspecified> {
+    // mantle: crate-visible for `aead::cbc_hmac` (vendor/UPSTREAM.md).
+    pub(crate) fn try_new(algorithm: Algorithm, key_value: &[u8]) -> Result<Self, Unspecified> {
         unsafe {
             let mut ctx = MaybeUninit::<HMAC_CTX>::uninit();
             HMAC_CTX_init(ctx.as_mut_ptr());
@@ -322,6 +323,14 @@ impl Key {
 
     unsafe fn get_hmac_ctx_ptr(&mut self) -> *mut HMAC_CTX {
         self.ctx.as_mut_ptr()
+    }
+
+    // mantle: a copy that reports failure, for `Context::try_with_key` (vendor/UPSTREAM.md).
+    fn try_clone(&self) -> Result<Self, Unspecified> {
+        Ok(Self {
+            algorithm: self.algorithm,
+            ctx: self.ctx.try_clone()?,
+        })
     }
 
     /// The digest algorithm for the key.
@@ -391,8 +400,16 @@ impl Context {
         Self::try_update(self, data).expect("HMAC_Update failed");
     }
 
+    /// `with_key`, reporting a failure to copy the key instead of panicking.
+    // mantle: crate-visible for `aead::cbc_hmac` (vendor/UPSTREAM.md).
+    pub(crate) fn try_with_key(signing_key: &Key) -> Result<Self, Unspecified> {
+        Ok(Self {
+            key: signing_key.try_clone()?,
+        })
+    }
+
     #[inline]
-    fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
+    pub(crate) fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
         unsafe {
             if 1 != HMAC_Update(self.key.get_hmac_ctx_ptr(), data.as_ptr(), data.len()) {
                 return Err(Unspecified);
@@ -425,7 +442,7 @@ impl Context {
         Self::try_sign(self).expect("HMAC_Final failed")
     }
     #[inline]
-    fn try_sign(mut self) -> Result<Tag, Unspecified> {
+    pub(crate) fn try_sign(mut self) -> Result<Tag, Unspecified> {
         let mut output = [0u8; digest::MAX_OUTPUT_LEN];
         let msg_len = {
             let result = internal_sign(&mut self, &mut output)?;
@@ -546,9 +563,90 @@ pub fn verify(key: &Key, data: &[u8], tag: &[u8]) -> Result<(), Unspecified> {
     constant_time::verify_slices_are_equal(sign(key, data).as_ref(), tag)
 }
 
+/// Calculates the HMAC of `data` under the key `key_value` in one step, writing the tag to
+/// the start of `output`, which must hold at least `algorithm.tag_len()` bytes; returns the
+/// tag.
+///
+/// This is aws-lc's one-shot `HMAC`, for a key used once: it keys, signs with and wipes a
+/// single context, where `Key::new` and then `sign_to_buffer` key one context and sign with a
+/// copy of it.
+///
+/// It is generally not safe to implement HMAC verification by comparing the return value of
+/// `sign_once` to a tag. Use `verify` for verification instead.
+///
+/// # Errors
+/// `error::Unspecified` if `output` is too small or if the HMAC operation fails.
+// mantle: added (vendor/UPSTREAM.md).
+#[inline]
+pub fn sign_once<'out>(
+    algorithm: Algorithm,
+    key_value: &[u8],
+    data: &[u8],
+    output: &'out mut [u8],
+) -> Result<&'out mut [u8], Unspecified> {
+    let tag_len = algorithm.tag_len();
+    let output = output.get_mut(..tag_len).ok_or(Unspecified)?;
+    let evp_md_type = digest::match_digest_type(&algorithm.digest_algorithm().id);
+    let mut out_len: c_uint = 0;
+    let signed = indicator_check!(unsafe {
+        HMAC(
+            evp_md_type.as_const_ptr(),
+            key_value.as_ptr().cast(),
+            key_value.len(),
+            data.as_ptr(),
+            data.len(),
+            output.as_mut_ptr(),
+            &mut out_len,
+        )
+    });
+    if signed.is_null() || usize::try_from(out_len) != Ok(tag_len) {
+        return Err(Unspecified);
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::{hmac, rand};
+
+    // mantle: `sign_once` against RFC 4231 §4.2 and §4.7 and against `sign`.
+    #[test]
+    fn sign_once_matches_rfc_4231_and_sign() {
+        let cases: [(&[u8], &[u8], &str); 2] = [
+            (
+                &[0x0b; 20],
+                b"Hi There",
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+            ),
+            (
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First",
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+            ),
+        ];
+        for (key, data, want) in cases {
+            let mut out = [0u8; 40];
+            let tag = hmac::sign_once(hmac::HMAC_SHA256, key, data, &mut out).unwrap();
+            assert_eq!(crate::hex::encode(&*tag), want);
+        }
+        for algorithm in [
+            hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            hmac::HMAC_SHA224,
+            hmac::HMAC_SHA256,
+            hmac::HMAC_SHA384,
+            hmac::HMAC_SHA512,
+        ] {
+            for key_len in [0, 1, 32, 64, 128, 129, 200] {
+                let key = vec![0x5a; key_len];
+                let mut out = [0u8; 64];
+                let tag = hmac::sign_once(algorithm, &key, b"data", &mut out).unwrap();
+                let want = hmac::sign(&hmac::Key::new(algorithm, &key), b"data");
+                assert_eq!(&*tag, want.as_ref());
+            }
+            let mut short = vec![0u8; algorithm.tag_len() - 1];
+            assert!(hmac::sign_once(algorithm, b"k", b"data", &mut short).is_err());
+        }
+    }
 
     #[cfg(feature = "fips")]
     mod fips;

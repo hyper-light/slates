@@ -34,8 +34,8 @@ use crate::{debug, derive_debug_via_id};
 pub(crate) mod digest_ctx;
 mod sha;
 use crate::aws_lc::{
-    EVP_DigestFinal, EVP_DigestUpdate, EVP_sha1, EVP_sha224, EVP_sha256, EVP_sha384, EVP_sha3_256,
-    EVP_sha3_384, EVP_sha3_512, EVP_sha512, EVP_sha512_256, EVP_MD,
+    EVP_DigestFinal, EVP_DigestUpdate, EVP_md5, EVP_sha1, EVP_sha224, EVP_sha256, EVP_sha384,
+    EVP_sha3_256, EVP_sha3_384, EVP_sha3_512, EVP_sha512, EVP_sha512_256, EVP_MD,
 };
 use crate::error::Unspecified;
 use crate::ptr::ConstPointer;
@@ -43,9 +43,9 @@ use core::ffi::c_uint;
 use core::mem::MaybeUninit;
 use digest_ctx::DigestContext;
 pub use sha::{
-    SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224, SHA224_OUTPUT_LEN, SHA256,
-    SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384, SHA3_512, SHA512, SHA512_256,
-    SHA512_256_OUTPUT_LEN, SHA512_OUTPUT_LEN,
+    MD5_FOR_LEGACY_USE_ONLY, MD5_OUTPUT_LEN, SHA1_FOR_LEGACY_USE_ONLY, SHA1_OUTPUT_LEN, SHA224,
+    SHA224_OUTPUT_LEN, SHA256, SHA256_OUTPUT_LEN, SHA384, SHA384_OUTPUT_LEN, SHA3_256, SHA3_384,
+    SHA3_512, SHA512, SHA512_256, SHA512_256_OUTPUT_LEN, SHA512_OUTPUT_LEN,
 };
 
 /// A context for multi-step (Init-Update-Finish) digest calculations.
@@ -90,6 +90,21 @@ impl Context {
         }
     }
 
+    /// Constructs a new context, as `new` does, returning an error where `new` panics.
+    ///
+    /// # Errors
+    /// `error::Unspecified` if an aws-lc digest context cannot be initialized for the given
+    /// algorithm.
+    // mantle: public fallible form of `new` (vendor/UPSTREAM.md).
+    pub fn try_new(algorithm: &'static Algorithm) -> Result<Self, Unspecified> {
+        Ok(Self {
+            algorithm,
+            digest_ctx: DigestContext::new(algorithm)?,
+            msg_len: 0u64,
+            max_input_reached: false,
+        })
+    }
+
     /// Updates the message to digest with all the data in `data`.
     ///
     /// # Panics
@@ -99,8 +114,15 @@ impl Context {
         Self::try_update(self, data).expect("digest update failed");
     }
 
+    /// Updates the message to digest with all the data in `data`, as `update` does,
+    /// returning an error where `update` panics.
+    ///
+    /// # Errors
+    /// `error::Unspecified` if the total input would exceed the algorithm's maximum, or the
+    /// update fails.
+    // mantle: public (vendor/UPSTREAM.md).
     #[inline]
-    fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
+    pub fn try_update(&mut self, data: &[u8]) -> Result<(), Unspecified> {
         unsafe {
             // Check if the message has reached the algorithm's maximum allowed input, or overflowed
             // the msg_len counter.
@@ -137,8 +159,14 @@ impl Context {
         Self::try_finish(self).expect("EVP_DigestFinal failed")
     }
 
+    /// Finalizes the digest calculation, as `finish` does, returning an error where `finish`
+    /// panics.
+    ///
+    /// # Errors
+    /// `error::Unspecified` if the digest cannot be finalized.
+    // mantle: public (vendor/UPSTREAM.md).
     #[inline]
-    fn try_finish(mut self) -> Result<Digest, Unspecified> {
+    pub fn try_finish(mut self) -> Result<Digest, Unspecified> {
         let mut output = [0u8; MAX_OUTPUT_LEN];
         let mut out_len = MaybeUninit::<c_uint>::uninit();
         if 1 != indicator_check!(unsafe {
@@ -328,6 +356,8 @@ impl Algorithm {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AlgorithmID {
+    // mantle: MD5 (vendor/UPSTREAM.md).
+    MD5,
     SHA1,
     SHA224,
     SHA256,
@@ -365,6 +395,7 @@ pub const MAX_CHAINING_LEN: usize = MAX_OUTPUT_LEN;
 pub(crate) fn match_digest_type(algorithm_id: &AlgorithmID) -> ConstPointer<'_, EVP_MD> {
     unsafe {
         ConstPointer::new_static(match algorithm_id {
+            AlgorithmID::MD5 => EVP_md5(),
             AlgorithmID::SHA1 => EVP_sha1(),
             AlgorithmID::SHA224 => EVP_sha224(),
             AlgorithmID::SHA256 => EVP_sha256(),
@@ -384,6 +415,65 @@ mod tests {
     use crate::digest;
     #[cfg(feature = "fips")]
     mod fips;
+
+    // mantle: the fallible entry points agree with the panicking ones, and refuse input past
+    // the algorithm's maximum rather than panic.
+    #[test]
+    fn fallible_entry_points_agree_and_refuse_overlong_input() {
+        for algorithm in [
+            &digest::MD5_FOR_LEGACY_USE_ONLY,
+            &digest::SHA1_FOR_LEGACY_USE_ONLY,
+            &digest::SHA256,
+            &digest::SHA512,
+            &digest::SHA3_256,
+        ] {
+            let mut ctx = digest::Context::try_new(algorithm).unwrap();
+            ctx.try_update(b"a").unwrap();
+            ctx.try_update(b"bc").unwrap();
+            let want = digest::digest(algorithm, b"abc");
+            assert_eq!(ctx.try_finish().unwrap().as_ref(), want.as_ref());
+
+            let mut ctx = digest::Context::try_new(algorithm).unwrap();
+            ctx.msg_len = algorithm.max_input_len;
+            assert!(ctx.try_update(b"x").is_err());
+            let mut ctx = digest::Context::try_new(algorithm).unwrap();
+            ctx.msg_len = u64::MAX;
+            assert!(ctx.try_update(b"x").is_err());
+        }
+    }
+
+    // mantle: RFC 1321's test suite (appendix A.5), one-shot and in pieces.
+    #[test]
+    fn md5_matches_rfc_1321() {
+        let suite: [(&[u8], &str); 7] = [
+            (b"", "d41d8cd98f00b204e9800998ecf8427e"),
+            (b"a", "0cc175b9c0f1b6a831c399e269772661"),
+            (b"abc", "900150983cd24fb0d6963f7d28e17f72"),
+            (b"message digest", "f96b697d7cb7938d525a2f31aaf161d0"),
+            (
+                b"abcdefghijklmnopqrstuvwxyz",
+                "c3fcd3d76192e4007dfb496cca67e13b",
+            ),
+            (
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                "d174ab98d277d9f5a5611c2c9f419d9f",
+            ),
+            (
+                b"12345678901234567890123456789012345678901234567890123456789012345678901234567890",
+                "57edf4a22be3c955ac49da2e2107b67a",
+            ),
+        ];
+        for (input, want) in suite {
+            let one_shot = digest::digest(&digest::MD5_FOR_LEGACY_USE_ONLY, input);
+            assert_eq!(crate::hex::encode(one_shot.as_ref()), want);
+            let mut ctx = digest::Context::new(&digest::MD5_FOR_LEGACY_USE_ONLY);
+            for piece in input.chunks(7) {
+                ctx.update(piece);
+            }
+            assert_eq!(ctx.finish().as_ref(), one_shot.as_ref());
+            assert_eq!(one_shot.algorithm().output_len(), digest::MD5_OUTPUT_LEN);
+        }
+    }
 
     mod max_input {
         extern crate alloc;

@@ -3278,11 +3278,10 @@ key schedule AWS-LC's HKDF-SHA-256. `ring`, `aes-gcm`, `hkdf` and `sha2` are out
 unchanged, so the wire is byte-identical. Jitter entropy is off at build time (first random bytes 17 ms → 12–17 µs).
 
 Owed:
-- **Vendored, unpatched.** aws-lc-rs and aws-lc-sys are in `vendor/` as their crates.io packages, checksums checked
-  against `Cargo.lock` (`vendor/UPSTREAM.md`). ../mantle's local patches are not carried: #1241 (vectored TLS 1.3
-  seal), #1165 (`LessSafeKey: Clone`), #617 (JWE primitives), the RNDR retry and its fallback, and the system-library
-  guard. Copying mantle's tree was refused by the session's permission check; whether to carry them is Ada's call.
-- **NASM on the x86_64 Windows lane.** The lane uses AWS-LC's prebuilt NASM objects. Building them from source, as
-  mantle's CI does, needs NASM installed, a non-Rust CI tool (CLAUDE.md §2 #13) awaiting Ada's authorization.
+- **Vendored with mantle's patches (closed 2026-10-03, Ada's decision).** `vendor/` holds ../mantle's copies (mantle
+  `3b16867`): the RNDR retry and operating-system fallback (a transient ARM RNDR failure no longer aborts the process),
+  #1241, #1165, #617, and the system-library guard. Their suites (850 tests) gate CI on Linux, macOS and Windows.
+- **NASM (closed 2026-10-03, authorized by Ada).** The Windows CI jobs and the release build install NASM and refuse
+  the prebuilt objects (`AWS_LC_SYS_PREBUILT_NASM=0`).
 - **Release targets not yet built with AWS-LC:** `i686-pc-windows-msvc`, `aarch64-pc-windows-msvc` and the musl
   CLI targets build only on a release tag. No CI lane has compiled AWS-LC for them.

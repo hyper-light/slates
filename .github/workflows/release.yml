@@ -34,8 +34,14 @@ jobs:
           - { target: aarch64-pc-windows-msvc, runner: windows-latest }
           - { target: i686-pc-windows-msvc, runner: windows-latest }
     runs-on: ${{ matrix.runner }}
+    env:
+      # AWS-LC's Windows x86 assembly is built from its NASM source, never the prebuilt objects (ignored elsewhere).
+      AWS_LC_SYS_PREBUILT_NASM: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Install NASM
+        if: ${{ runner.os == 'Windows' }}
+        uses: ilammy/setup-nasm@v1.5.2
       - uses: dtolnay/rust-toolchain@stable
         if: ${{ !matrix.musl }}
         with:

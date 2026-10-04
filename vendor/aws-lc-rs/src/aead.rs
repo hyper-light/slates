@@ -189,6 +189,8 @@ use core::stringify;
 
 mod aead_ctx;
 mod aes_gcm;
+// mantle: aws-lc-rs#617 (vendor/UPSTREAM.md).
+pub mod cbc_hmac;
 mod chacha;
 pub mod chacha20_poly1305_openssh;
 mod nonce;
@@ -204,6 +206,9 @@ pub use self::chacha::CHACHA20_POLY1305;
 pub use self::nonce::{Nonce, NONCE_LEN};
 pub use self::rand_nonce::RandomizedNonceKey;
 pub use self::tls::{TlsProtocolId, TlsRecordOpeningKey, TlsRecordSealingKey};
+// mantle: aws-lc-rs#1241 (vendor/UPSTREAM.md).
+#[cfg(not(feature = "fips"))]
+pub use self::tls::Tls13VectoredSealingKey;
 pub use self::unbound_key::UnboundKey;
 
 /// A sequences of unique nonces.
@@ -997,6 +1002,18 @@ impl LessSafeKey {
     }
 }
 
+// mantle: `Clone` as ring's `LessSafeKey` has had since 0.17 (aws-lc-rs#1165;
+// vendor/UPSTREAM.md).
+impl Clone for LessSafeKey {
+    /// A key with its own copy of the context, made by `EVP_AEAD_CTX_copy`. Every algorithm a
+    /// `LessSafeKey` holds can be copied, so this fails only if allocation does.
+    fn clone(&self) -> Self {
+        Self {
+            key: self.key.try_clone().expect("Unable to clone LessSafeKey"),
+        }
+    }
+}
+
 impl Debug for LessSafeKey {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> Result<(), core::fmt::Error> {
         f.debug_struct("LessSafeKey")
@@ -1098,6 +1115,60 @@ mod tests {
 
     #[cfg(feature = "fips")]
     mod fips;
+
+    /// A clone seals and opens as the key it came from, each opens what the other sealed,
+    /// and a clone outlives the original and crosses threads (aws-lc-rs#1165).
+    #[test]
+    fn less_safe_key_clones_are_independent_copies() {
+        let algorithms: [(&'static Algorithm, &[u8]); 6] = [
+            (&AES_128_GCM, &[1u8; 16]),
+            (&AES_192_GCM, &[2u8; 24]),
+            (&AES_256_GCM, &[3u8; 32]),
+            (&AES_128_GCM_SIV, &[4u8; 16]),
+            (&AES_256_GCM_SIV, &[5u8; 32]),
+            (&CHACHA20_POLY1305, &[6u8; 32]),
+        ];
+        for (algorithm, key_bytes) in algorithms {
+            let key = LessSafeKey::new(UnboundKey::new(algorithm, key_bytes).unwrap());
+            let clone = key.clone();
+            assert_eq!(key.algorithm(), clone.algorithm());
+            let nonce = || Nonce::assume_unique_for_key([7u8; NONCE_LEN]);
+            let plaintext = b"sealed by one key, opened by its clone".to_vec();
+
+            let mut by_key = plaintext.clone();
+            key.seal_in_place_append_tag(nonce(), Aad::from(b"aad"), &mut by_key)
+                .unwrap();
+            let mut by_clone = plaintext.clone();
+            clone
+                .seal_in_place_append_tag(nonce(), Aad::from(b"aad"), &mut by_clone)
+                .unwrap();
+            assert_eq!(by_key, by_clone, "{algorithm:?}");
+
+            let opened = clone
+                .open_in_place(nonce(), Aad::from(b"aad"), &mut by_key)
+                .unwrap();
+            assert_eq!(opened, plaintext.as_slice());
+            let opened = key
+                .open_in_place(nonce(), Aad::from(b"aad"), &mut by_clone)
+                .unwrap();
+            assert_eq!(opened, plaintext.as_slice());
+
+            // The clone owns its context: it works after the original is gone, on another
+            // thread.
+            drop(key);
+            let handle = std::thread::spawn(move || {
+                let mut sealed = b"x".to_vec();
+                clone
+                    .seal_in_place_append_tag(nonce(), Aad::empty(), &mut sealed)
+                    .unwrap();
+                clone
+                    .open_in_place(nonce(), Aad::empty(), &mut sealed)
+                    .unwrap()
+                    .to_vec()
+            });
+            assert_eq!(handle.join().unwrap(), b"x");
+        }
+    }
 
     #[test]
     fn test_aes_128() {

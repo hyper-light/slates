@@ -56,6 +56,31 @@ pub const SHA3_512_OUTPUT_LEN: usize = 512 / 8;
 #[allow(clippy::cast_possible_truncation)]
 const DIGEST_MAX_INPUT_LEN: u64 = u64::MAX;
 
+// mantle: MD5 for protocols that require it, such as S3's `Content-MD5` and `ETag`
+// (vendor/UPSTREAM.md).
+
+/// The length of a block for MD5, in bytes.
+const MD5_BLOCK_LEN: usize = 512 / 8;
+
+/// The length of the output of MD5, in bytes.
+pub const MD5_OUTPUT_LEN: usize = 128 / 8;
+
+/// MD5 as specified in [RFC 1321]. Its collision resistance is broken; it is here for
+/// protocols that require it, such as S3's `Content-MD5` and `ETag`.
+///
+/// [RFC 1321]: https://www.rfc-editor.org/rfc/rfc1321
+#[allow(deprecated)]
+pub const MD5_FOR_LEGACY_USE_ONLY: Algorithm = Algorithm {
+    output_len: MD5_OUTPUT_LEN,
+    chaining_len: MD5_OUTPUT_LEN,
+    block_len: MD5_BLOCK_LEN,
+    max_input_len: DIGEST_MAX_INPUT_LEN,
+
+    one_shot_hash: md5_digest,
+
+    id: AlgorithmID::MD5,
+};
+
 /// SHA-1 as specified in [FIPS 180-4]. Deprecated.
 ///
 /// [FIPS 180-4]: http://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf
@@ -196,6 +221,13 @@ pub const SHA3_512: Algorithm = Algorithm {
 
     id: AlgorithmID::SHA3_512,
 };
+
+fn md5_digest(msg: &[u8], output: &mut [u8]) {
+    let mut ctx = Context::new(&MD5_FOR_LEGACY_USE_ONLY);
+    ctx.update(msg);
+    let digest = ctx.finish();
+    output[0..MD5_OUTPUT_LEN].copy_from_slice(digest.as_ref());
+}
 
 fn sha1_digest(msg: &[u8], output: &mut [u8]) {
     unsafe {
