@@ -82,11 +82,11 @@ impl Identity {
   }
 }
 
-/// The `ring` crypto provider (the one that builds without cmake here).
+/// The aws-lc-rs crypto provider (AWS-LC, the workspace's one cryptographic library).
 // structural: allow — D-8 exception 2: rustls's provider/config types cross its API as `Arc`.
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
   // structural: allow — D-8 exception 2: rustls's `builder_with_provider` takes `Arc` by signature.
-  Arc::new(rustls::crypto::ring::default_provider())
+  Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
 /// Fills `out` with bytes from the crypto provider's secure random — the one source of randomness the
@@ -94,7 +94,7 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// publishes as its grant-issuer authority (§4.13) and what enrollment derives a consumer's capability
 /// from; both are refused rather than minted if the provider cannot fill the buffer.
 pub fn secure_random(out: &mut [u8]) -> Result<(), HandshakeError> {
-  rustls::crypto::ring::default_provider()
+  rustls::crypto::aws_lc_rs::default_provider()
     .secure_random
     .fill(out)
     .map_err(|_| HandshakeError::Setup("the crypto provider's secure random refused".to_owned()))
@@ -344,7 +344,7 @@ pub fn server_connection(
 mod tests {
   use super::*;
 
-  /// A fresh self-signed identity for `name`, minted with `ring` via `rcgen` (no CA, no cmake) —
+  /// A fresh self-signed identity for `name`, minted with aws-lc-rs via `rcgen` (no CA) —
   /// the test's stand-in for an enrolled credential.
   fn self_signed(name: &str) -> Identity {
     let key = rcgen::KeyPair::generate().unwrap();

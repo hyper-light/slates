@@ -353,7 +353,7 @@ mod tests {
   /// Real QUIC packet keys for the sealed-fragment tests: the Initial keys a connection id derives (RFC 9001
   /// §5.2), as the client (`local` seals toward the server) and as the server (`remote` opens them).
   fn keys(connection_id: &[u8], side: rustls::Side) -> rustls::quic::Keys {
-    let suite = rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
+    let suite = rustls::crypto::aws_lc_rs::cipher_suite::TLS13_AES_128_GCM_SHA256
       .tls13()
       .unwrap();
     rustls::quic::Keys::initial(

@@ -51,7 +51,7 @@ modules included: 182 `Arc` sites, 18 `Mutex`/`RwLock`, about 570 `unwrap`/`expe
 - **Runtime.** `quinn-proto` is sans-IO: no tokio and no foreign runtime (banned item 2). slates' runtime
   drives it through the UDP socket and timer it already owns.
 - **Dependencies.** Kept to what the conformed crate still needs, each listed in the stage that adds it.
-  rustls with the ring provider is already in the build.
+  rustls with the aws-lc-rs provider is already in the build (A-66, 2026-10-03).
 - **Licence.** Upstream's MIT/Apache-2.0 licence files are kept with the vendored source, and the upstream
   version and commit are recorded.
 

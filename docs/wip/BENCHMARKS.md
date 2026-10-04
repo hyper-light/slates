@@ -1424,3 +1424,42 @@ cargo build --release -p slates-client --example provision_bench   # with, then 
 target/release/examples/provision_bench
 ```
 If it is re-taken, jemalloc (as ../vorpal uses it) is the comparison arm.
+
+### The cryptographic library: AWS-LC against ring and RustCrypto (2026-10-03, A-66)
+
+Apple M5 Max (18 cores), macOS 26.4.1, release builds, load average 14.4–17.2 from other sessions (not quiesced).
+"Before" is `240013e` (rustls on `ring`, the seal on RustCrypto's `aes-gcm`), extracted with `git archive` and built
+in its own target directory. "After" is the tree with A-66. The two ran alternately, two runs each.
+
+`cargo run --release -p slates-transport --example seal_bench`: a control datagram sealed and opened
+(`encode_sealed`, `decode_sealed`), 100,000 per round, 7 rounds, nanoseconds per pair:
+
+| Run | 64 B, each round | 1 KiB, each round | Best 64 B | Best 1 KiB |
+|---|---|---|---|---|
+| RustCrypto 1 | 2092, 2016, 2016, 2014, 2415, 2731, 3075 | 10068, 10079, 10064, 10064, 14330, 15175, 14583 | 2013.5 | 10063.7 |
+| AWS-LC 1 | 247, 234, 223, 221, 226, 239, 250 | 541, 513, 537, 519, 514, 570, 545 | 221.1 | 512.8 |
+| RustCrypto 2 | 2572, 2396, 2161, 2180, 2164, 2026, 2046 | 12584, 12412, 10432, 10347, 13709, 10216, 10105 | 2026.3 | 10105.4 |
+| AWS-LC 2 | 204, 196, 198, 199, 200, 198, 199 | 457, 458, 464, 460, 459, 461, 463 | 196.0 | 457.3 |
+
+`cargo run --release -p slates-transport --example rpc_tls_bench` (the 2026-10-01 harness, unchanged), best of 7:
+
+| Run | Build per connection | Shared config cloned | Mutual handshake |
+|---|---|---|---|
+| ring 1 | 8.31 µs | 0.07 µs | 206.96 µs |
+| AWS-LC 1 | 10.31 µs | 0.07 µs | 202.03 µs |
+| ring 2 | 8.26 µs | 0.07 µs | 207.07 µs |
+| AWS-LC 2 | 10.52 µs | 0.07 µs | 202.37 µs |
+
+First random bytes of a fresh process through the provider (`seal_bench`'s first line), five processes each:
+
+| Build | First random bytes |
+|---|---|
+| ring | 2.6, 3.5, 3.0, 5.0, 3.5 µs |
+| AWS-LC, jitter entropy off (the build) | 16.6, 14.9, 12.8, 13.6, 12.4 µs |
+| AWS-LC, jitter entropy on (`AWS_LC_SYS_NO_JITTER_ENTROPY=0`, its own target directory) | 17,453, 17,063, 16,994, 17,398, 17,198 µs |
+
+Readings:
+- The seal is 9–10× faster at 64 B and 20–22× at 1 KiB.
+- The handshake is 2% faster.
+- The per-connection build is 2 µs slower, paid once per accepted RPC-with-TLS connection (a mount or a reconnect).
+- Jitter entropy would cost every new process 17 ms before its first handshake. The build leaves it out.

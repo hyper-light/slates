@@ -21,8 +21,8 @@ slates-conformance = { workspace = true }
 slates-client = { workspace = true }
 # Derive the small traced workload's quota from its inode footprint (§4.2 admission).
 slates-vfs = { workspace = true }
-# The pinned upstream suite sources are verified by SHA-256 before they are built.
-sha2 = { workspace = true }
+# The pinned upstream suite sources are verified by SHA-256 (aws-lc-rs) before they are built.
+aws-lc-rs = { workspace = true }
 # The workload manifests digest every file with BLAKE3.
 blake3 = { workspace = true }
 # The KIND lane mints self-signed fleet identities, as the fleet tests mint theirs (kind.rs).

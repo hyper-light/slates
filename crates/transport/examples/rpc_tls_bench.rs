@@ -76,7 +76,7 @@ fn server_identity(pki: &Pki) -> Identity {
 
 /// The shape R2 rejects, built for comparison only: one config shared by every connection.
 fn shared_config(pki: &Pki) -> Arc<ServerConfig> {
-  let provider = Arc::new(rustls::crypto::ring::default_provider());
+  let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
   let mut roots = RootCertStore::empty();
   roots.add(pki.authority.clone()).unwrap();
   let verifier =
@@ -98,7 +98,7 @@ fn client_config(pki: &Pki) -> Arc<ClientConfig> {
   let mut roots = RootCertStore::empty();
   roots.add(pki.authority.clone()).unwrap();
   let mut config =
-    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
       .with_protocol_versions(&[&rustls::version::TLS13])
       .unwrap()
       .with_root_certificates(roots)

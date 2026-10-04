@@ -8450,3 +8450,31 @@ Status: built 2026-10-03.
   still ends in one budget); 7–13 `Deadline` per loaded run → 1–2. The remaining ones were all blocked shards (CPU
   frozen for the whole 10 s), traced to the arena lock's page population and fixed in the same change.
 
+### A-66 — AWS-LC is slates' one cryptographic library (2026-10-03)
+Applied in the same change to: `docs/wip/fleet-transport.md` (§3 buildability note, §7 seal, status),
+`docs/wip/transport-quic.md`, GAPS (2026-10-03 entry), BENCHMARKS, the workspace `Cargo.toml` and `.cargo/config.toml`.
+Status: built 2026-10-03, through crates.io's aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0; vendoring in-tree awaits Ada.
+- Why: Ada's decision (2026-09-28): one cryptographic library, AWS-LC through aws-lc-rs, as ../mantle and ../focal
+  use. Before it, slates' TLS ran on `ring` and the control plane's seal and key schedule on RustCrypto's `aes-gcm`,
+  `hkdf` and `sha2`.
+- What moved:
+  - rustls' and rcgen's provider;
+  - the control-plane seal (`aead::LessSafeKey` AES-256-GCM; a key the library refuses is the typed
+    `SealError::KeyRefused`, never a panic);
+  - the key schedule (`hkdf::HKDF_SHA256`);
+  - the conformance fetch's SHA-256.
+
+  `ring`, `aes-gcm`, `hkdf` and `sha2` are out of the build.
+- The wire is unchanged: the seal's and the key schedule's golden vectors, and RFC 5869's test case, pass byte for
+  byte. The transport suite (192), the cluster suite, NFS over TLS and the CLI's RPC-with-TLS restart pass on macOS,
+  and the transport suite and clippy on Linux.
+- Build: aws-lc-sys compiles AWS-LC with the system C compiler (its `cc` builder: no cmake, pregenerated bindings).
+  On x86_64 Windows, AWS-LC's assembled objects are used when NASM is absent (`prebuilt-nasm`).
+- CPU jitter entropy is left out at build time (`AWS_LC_SYS_NO_JITTER_ENTROPY=1`, aws-lc-sys's upstream switch), so
+  AWS-LC seeds from the operating system. With it, a fresh process waited 17.0–17.5 ms for its first random bytes;
+  without it, 12–17 µs.
+- Measured (BENCHMARKS.md, same day):
+  - sealing and opening a control datagram: 9–22× faster (2.0 → 0.20 µs at 64 B, 10.1 → 0.46 µs at 1 KiB);
+  - the mutual TLS 1.3 handshake: 2% faster (207 → 202 µs);
+  - building a server TLS connection: 2 µs slower (8.3 → 10.3 µs, once per accepted connection).
+

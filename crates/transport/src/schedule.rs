@@ -10,10 +10,9 @@
 //! datagram cannot be replayed on another channel or the reverse direction (the key differs), and a
 //! key-epoch bump rotates every key without re-enrolling. The construction is TLS 1.3's own
 //! (D-15 chose TLS 1.3), so it rests on standardised, analysed key separation, not a bespoke scheme.
-//! Vetted RustCrypto crates (`hkdf`, `sha2`); key derivation is never hand-rolled.
+//! HKDF-SHA-256 is AWS-LC's (`aws_lc_rs::hkdf`); key derivation is never hand-rolled.
 
-use hkdf::Hkdf;
-use sha2::Sha256;
+use aws_lc_rs::hkdf::{HKDF_SHA256, KeyType, Prk, Salt};
 
 use crate::seal::{KEY_BYTES, Opener, Sealer};
 
@@ -53,7 +52,16 @@ const SEAL_LABEL: &[u8] = b"control seal";
 /// A node's control-plane key schedule: the HKDF pseudorandom key extracted from its control secret,
 /// ready to expand per-channel keys.
 pub struct KeySchedule {
-  hkdf: Hkdf<Sha256>,
+  prk: Prk,
+}
+
+/// An HKDF output length, as `aws_lc_rs::hkdf` asks for one.
+struct OutputBytes(usize);
+
+impl KeyType for OutputBytes {
+  fn len(&self) -> usize {
+    self.0
+  }
 }
 
 impl std::fmt::Debug for KeySchedule {
@@ -69,7 +77,7 @@ impl KeySchedule {
   /// expansions draw from.
   pub fn from_control_secret(control_secret: &[u8]) -> KeySchedule {
     KeySchedule {
-      hkdf: Hkdf::<Sha256>::new(Some(EXTRACT_SALT), control_secret),
+      prk: Salt::new(HKDF_SHA256, EXTRACT_SALT).extract(control_secret),
     }
   }
 
@@ -120,7 +128,11 @@ impl KeySchedule {
     info.push(u8::try_from(context.len()).unwrap_or(u8::MAX));
     info.extend_from_slice(context);
     let mut key = [0u8; KEY_BYTES];
-    if self.hkdf.expand(&info, &mut key).is_err() {
+    let expanded = self
+      .prk
+      .expand(&[&info], OutputBytes(KEY_BYTES))
+      .and_then(|okm| okm.fill(&mut key));
+    if expanded.is_err() {
       return [0xFFu8; KEY_BYTES];
     }
     key
@@ -149,9 +161,13 @@ mod tests {
     let ikm = [0x0bu8; 22];
     let salt: Vec<u8> = (0x00u8..=0x0c).collect();
     let info: Vec<u8> = (0xf0u8..=0xf9).collect();
-    let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+    let prk = Salt::new(HKDF_SHA256, &salt).extract(&ikm);
     let mut okm = [0u8; 42];
-    hk.expand(&info, &mut okm).unwrap();
+    prk
+      .expand(&[&info], OutputBytes(okm.len()))
+      .unwrap()
+      .fill(&mut okm)
+      .unwrap();
     // The expected OKM from RFC 5869 Appendix A.1.
     let expected = "3cb25f25faacd57a90434f64d0362f2a\
                     2d2d0a90cf1a5a4c5db02d56ecc4c5bf\

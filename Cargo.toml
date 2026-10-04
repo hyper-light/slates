@@ -74,21 +74,20 @@ windows-sys = { version = "0.60", features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
-# AES-256-GCM for the fleet control-plane seal (§4.10a §7; D-15's TLS 1.3 cipher). The RustCrypto
-# AEAD; counter nonces mean no RNG, so `getrandom` is off and only the AES backend + `alloc` (the
-# Vec-returning `encrypt`/`decrypt`) are pulled. Vetted primitive — the project never hand-rolls AEAD.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-# HKDF (RFC 5869) over SHA-256 for the control-plane key schedule (§4.10a §7): HKDF-Expand-Label
-# (RFC 8446 §7.1 labelled form) derives the seal's per-(sender, key_epoch, direction) keys from an
-# enrolled control secret. Vetted RustCrypto crates — key derivation is never hand-rolled.
-hkdf = { version = "0.12", default-features = false }
-sha2 = { version = "0.10", default-features = false }
-# TLS 1.3 for the session plane's handshake (§4.10a §3; D-15's named dependency). The `ring` provider
-# builds without cmake (prebuilt asm); the default `aws-lc-rs` would need it. slates drives the QUIC
-# core sans-io, so rustls pulls no async runtime. rustls's config API takes Arc — D-8 exception 2.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-# Self-signed certificates for the handshake tests (pure Rust with the ring feature — no cmake).
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+# AWS-LC, through its Rust binding aws-lc-rs: the one cryptographic library slates builds on (Ada, 2026-09-28; the
+# same library ../mantle and ../focal use). It provides the control-plane seal's AES-256-GCM (§4.10a §7), the key
+# schedule's HKDF-SHA-256 (RFC 5869, RFC 8446 §7.1 labelled form), SHA-256, and rustls' TLS 1.3 provider (D-15).
+# Its C library builds with the system C compiler through aws-lc-sys's `cc` builder (no cmake, no bindgen: the
+# bindings are pregenerated for every target slates builds); `prebuilt-nasm` uses AWS-LC's assembled objects on
+# x86_64 Windows when NASM is absent. CPU jitter entropy is left out at build time (`.cargo/config.toml`,
+# `AWS_LC_SYS_NO_JITTER_ENTROPY`), so AWS-LC seeds from the operating system's generator and a new process pays no
+# start-up latency for its first random bytes. Vetted primitives — the project never hand-rolls cryptography.
+aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-sys", "alloc", "prebuilt-nasm"] }
+# TLS 1.3 for the session plane's handshake (§4.10a §3; D-15's named dependency), over the aws-lc-rs provider. slates
+# drives the QUIC core sans-io, so rustls pulls no async runtime. rustls's config API takes Arc — D-8 exception 2.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+# Self-signed certificates for the handshake tests, signed through aws-lc-rs.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
 # The io_uring syscall wrapper (tokio-rs/io-uring): thin, no reference counting in its core types;

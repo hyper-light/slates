@@ -23,19 +23,19 @@
 //! control plane where a superseded datagram is anti-information; a sliding replay window for a
 //! reorder-tolerant stream is owed with the session plane. High-water advances only *after* the tag
 //! verifies, so a forged high counter with a bad tag cannot lock out honest datagrams.
+//!
+//! The cipher is AWS-LC's AES-256-GCM (`aws_lc_rs::aead`, the workspace's one cryptographic library since
+//! 2026-10-03); the golden vector held the wire byte-identical across the move from RustCrypto's `aes-gcm`.
 
-use aes_gcm::aead::generic_array::typenum::Unsigned;
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, KeySizeUser, Payload};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 
 use crate::{
   ControlDatagram, FrameError, PROLOGUE_BYTES, PROTOCOL_VERSION, Reader, write_prologue,
 };
 
-/// The seal key size in bytes, read from the cipher: AES-256 takes a 256-bit (32-byte) key. Derived
-/// from `Aes256Gcm`'s own `KeySize`, so it is the cipher's fact, not a literal — the key schedule
-/// produces exactly this many bytes.
-pub const KEY_BYTES: usize = <Aes256Gcm as KeySizeUser>::KeySize::USIZE;
+/// Format: the seal key size in bytes — AES-256 takes a 256-bit key (FIPS 197 §5); the key schedule produces
+/// exactly this many bytes, and a test holds it equal to `AES_256_GCM.key_len()`.
+pub const KEY_BYTES: usize = 256 / 8;
 
 /// The additional-authenticated-data length: the routing prologue without the framing `sealed_len`
 /// (version, sender, key epoch). These identity-bearing fields are authenticated by the seal; the
@@ -51,13 +51,16 @@ const CONFIDENTIALITY_LIMIT: u64 = 1 << 23;
 /// one key may be asked to open (2^52): past it an opener refuses everything under the key.
 const INTEGRITY_LIMIT: u64 = 1 << 52;
 
-/// The AES-GCM nonce as the cipher sizes it (96 bits): `counter ‖ channel`.
-type SealNonce = Nonce<<Aes256Gcm as AeadCore>::NonceSize>;
+/// The AES-GCM nonce as the cipher sizes it (96 bits, [`NONCE_LEN`]): `counter ‖ channel`.
+type SealNonce = [u8; NONCE_LEN];
 
 /// A refusal on the sealed path (§4.10a §7): the closed set of ways a seal or an open can fail. Every
 /// one is a corrupt, forged, replayed or exhausted datagram — never a panic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SealError {
+  /// The cipher refused the key when the sealer or opener was built. A key of [`KEY_BYTES`] is always
+  /// accepted, so this names a library fault, typed rather than a panic; every seal and open refuses with it.
+  KeyRefused,
   /// The key has sealed its confidentiality limit (2^23 datagrams, RFC 9001 §6.6); it must rotate to its
   /// next epoch. Refused rather than sealed past the bound, and never wrapped into a reused nonce.
   CounterExhausted,
@@ -83,6 +86,7 @@ pub enum SealError {
 impl std::fmt::Display for SealError {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self {
+      SealError::KeyRefused => f.write_str("the cipher refused the key"),
       SealError::CounterExhausted => f.write_str("the sealer's key has sealed its limit"),
       SealError::IntegrityExhausted => {
         f.write_str("the opener's key has refused its limit of forgeries")
@@ -119,7 +123,7 @@ fn routing_aad(sender: u64, key_epoch: u32) -> [u8; AAD_BYTES] {
 /// `channel` little-endian in the high 4. A zeroed array of the cipher's nonce size, then filled, so
 /// no width is written as a literal.
 fn nonce_for(counter: u64, channel: u32) -> SealNonce {
-  let mut nonce = SealNonce::default();
+  let mut nonce: SealNonce = [0u8; NONCE_LEN];
   crate::fill_from(
     &mut nonce,
     &[&counter.to_le_bytes(), &channel.to_le_bytes()],
@@ -130,7 +134,8 @@ fn nonce_for(counter: u64, channel: u32) -> SealNonce {
 /// The sending half of a keyed control channel: it seals plaintext under a counter nonce and advances
 /// the counter once per datagram. One `Sealer` per (key, channel, direction).
 pub struct Sealer {
-  cipher: Aes256Gcm,
+  /// The cipher keyed once; `None` when the library refused the key ([`SealError::KeyRefused`]).
+  cipher: Option<LessSafeKey>,
   channel: u32,
   counter: u64,
 }
@@ -146,13 +151,11 @@ impl std::fmt::Debug for Sealer {
 }
 
 impl Sealer {
-  /// A sealer over `key` (exactly [`KEY_BYTES`] bytes) on `channel`, starting at counter zero.
-  /// Infallible: the array length is the cipher's key size by construction, so the conversion cannot
-  /// fail — no panic path.
+  /// A sealer over `key` (exactly [`KEY_BYTES`] bytes) on `channel`, starting at counter zero. A key the
+  /// cipher refuses (never, at this length) leaves a sealer that refuses every seal [`SealError::KeyRefused`].
   pub fn from_key(key: &[u8; KEY_BYTES], channel: u32) -> Sealer {
-    let key: Key<Aes256Gcm> = (*key).into();
     Sealer {
-      cipher: Aes256Gcm::new(&key),
+      cipher: keyed(key),
       channel,
       counter: 0,
     }
@@ -168,16 +171,12 @@ impl Sealer {
       return Err(SealError::CounterExhausted);
     }
     let advanced = counter.checked_add(1).ok_or(SealError::CounterExhausted)?;
-    let nonce = nonce_for(counter, self.channel);
-    let ciphertext = self
-      .cipher
-      .encrypt(
-        &nonce,
-        Payload {
-          msg: plaintext,
-          aad,
-        },
-      )
+    let cipher = self.cipher.as_ref().ok_or(SealError::KeyRefused)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_for(counter, self.channel));
+    let mut ciphertext = Vec::with_capacity(plaintext.len().saturating_add(AES_256_GCM.tag_len()));
+    ciphertext.extend_from_slice(plaintext);
+    cipher
+      .seal_in_place_append_tag(nonce, Aad::from(aad), &mut ciphertext)
       .map_err(|_| SealError::BadSeal)?;
     self.counter = advanced;
     Ok((counter, ciphertext))
@@ -187,7 +186,8 @@ impl Sealer {
 /// The receiving half of a keyed control channel: it verifies and decrypts a sealed datagram and
 /// refuses a counter it has already accepted. One `Opener` per (key, channel, direction).
 pub struct Opener {
-  cipher: Aes256Gcm,
+  /// The cipher keyed once; `None` when the library refused the key ([`SealError::KeyRefused`]).
+  cipher: Option<LessSafeKey>,
   channel: u32,
   high_water: Option<u64>,
   /// Datagrams that failed to open under this key (counted toward its integrity limit).
@@ -208,9 +208,8 @@ impl Opener {
   /// An opener over `key` (exactly [`KEY_BYTES`] bytes) on `channel`, having accepted nothing yet.
   /// Infallible for the same reason as [`Sealer::from_key`].
   pub fn from_key(key: &[u8; KEY_BYTES], channel: u32) -> Opener {
-    let key: Key<Aes256Gcm> = (*key).into();
     Opener {
-      cipher: Aes256Gcm::new(&key),
+      cipher: keyed(key),
       channel,
       high_water: None,
       failures: 0,
@@ -229,23 +228,27 @@ impl Opener {
     {
       return Err(SealError::Replay);
     }
-    let nonce = nonce_for(counter, self.channel);
-    let plaintext = self
-      .cipher
-      .decrypt(
-        &nonce,
-        Payload {
-          msg: ciphertext,
-          aad,
-        },
-      )
-      .map_err(|_| {
-        self.failures = self.failures.saturating_add(1);
-        SealError::BadSeal
-      })?;
+    let cipher = self.cipher.as_ref().ok_or(SealError::KeyRefused)?;
+    let nonce = Nonce::assume_unique_for_key(nonce_for(counter, self.channel));
+    let mut in_out = ciphertext.to_vec();
+    let opened = cipher
+      .open_in_place(nonce, Aad::from(aad), &mut in_out)
+      .map(|plaintext| plaintext.len());
+    let Ok(plaintext_len) = opened else {
+      self.failures = self.failures.saturating_add(1);
+      return Err(SealError::BadSeal);
+    };
+    in_out.truncate(plaintext_len);
     self.high_water = Some(counter);
-    Ok(plaintext)
+    Ok(in_out)
   }
+}
+
+/// The cipher keyed with `key`, or `None` when the library refuses it.
+fn keyed(key: &[u8; KEY_BYTES]) -> Option<LessSafeKey> {
+  UnboundKey::new(&AES_256_GCM, key)
+    .ok()
+    .map(LessSafeKey::new)
 }
 
 impl ControlDatagram {
@@ -381,11 +384,12 @@ mod tests {
   #[test]
   fn the_layout_matches_the_cipher() {
     assert_eq!(
-      <Aes256Gcm as AeadCore>::NonceSize::USIZE,
+      AES_256_GCM.nonce_len(),
       size_of::<u64>() + size_of::<u32>(),
       "the 96-bit nonce is counter(8) ‖ channel(4)"
     );
-    assert_eq!(KEY_BYTES, <Aes256Gcm as KeySizeUser>::KeySize::USIZE);
+    assert_eq!(NONCE_LEN, AES_256_GCM.nonce_len());
+    assert_eq!(KEY_BYTES, AES_256_GCM.key_len());
   }
 
   /// A sealed datagram round-trips through encode_sealed/decode_sealed exactly.

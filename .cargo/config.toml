@@ -7,3 +7,9 @@ rustflags = ["-C", "target-feature=-crt-static"]
 
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "target-feature=-crt-static"]
+
+# AWS-LC without CPU jitter entropy (aws-lc-sys's upstream build switch): the source costs every new process
+# milliseconds before its first random bytes, inherent to how it gathers entropy, and AWS-LC then seeds from the
+# operating system's generator instead (aws/aws-lc-rs#1233; the workspace `Cargo.toml` names the dependency).
+[env]
+AWS_LC_SYS_NO_JITTER_ENTROPY = "1"

@@ -3270,3 +3270,19 @@ Owed:
 - **GitHub runner memlock limit not read.** Whether the CI lane's runner allows a multi-GiB `mlock` (and so reached
   the populate stall) is not yet read from a CI log. The observation fix covers the starvation half either way.
 - Still owed from GAP-A9-6: a recovered snapshot's directories are rebuilt privately (RAM only).
+
+### 2026-10-03: AWS-LC is the one cryptographic library (A-66)
+
+Ada's 2026-09-28 decision, built: rustls and rcgen run on aws-lc-rs, the control-plane seal is AWS-LC's AES-256-GCM, the
+key schedule AWS-LC's HKDF-SHA-256. `ring`, `aes-gcm`, `hkdf` and `sha2` are out of the build. The golden vectors pass
+unchanged, so the wire is byte-identical. Jitter entropy is off at build time (first random bytes 17 ms → 12–17 µs).
+
+Owed:
+- **Vendoring in-tree.** aws-lc-rs and aws-lc-sys come from crates.io for now. Copying ../mantle's patched vendor
+  tree was refused by the session's permission check; Ada decides whether to allow that copy or to vendor fresh
+  from crates.io and re-apply the patches. Mantle's copy carries #1241 (vectored TLS 1.3 seal), #1165
+  (`LessSafeKey: Clone`), #617 (JWE primitives), the RNDR retry and fallback, and the system-library guard.
+- **NASM on the x86_64 Windows lane.** The lane uses AWS-LC's prebuilt NASM objects. Building them from source, as
+  mantle's CI does, needs NASM installed, a non-Rust CI tool (CLAUDE.md §2 #13) awaiting Ada's authorization.
+- **Release targets not yet built with AWS-LC:** `i686-pc-windows-msvc`, `aarch64-pc-windows-msvc` and the musl
+  CLI targets build only on a release tag. No CI lane has compiled AWS-LC for them.

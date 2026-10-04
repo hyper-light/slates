@@ -1951,7 +1951,7 @@ mod tests {
 
   use crate::handshake::{Identity, connect};
 
-  /// A fresh self-signed identity, minted with `ring` via `rcgen`.
+  /// A fresh self-signed identity, minted with aws-lc-rs via `rcgen`.
   fn self_signed(name: &str) -> Identity {
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec![name.to_owned()])

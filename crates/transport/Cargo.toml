@@ -9,11 +9,10 @@ readme.workspace = true
 description = "The fleet claims-plane transport (§4.10a, Phase 8): the two-plane UDP wire — the control-datagram codec with its AES-256-GCM seal and HKDF-Expand-Label key schedule, and the owned QUIC session plane (frames, ordered streams, reliability, flow control, rustls TLS 1.3 handshake, and the live Endpoint carrying a stream end to end). Enrollment (identity), congestion, and header protection owed. Design: docs/wip/fleet-transport.md."
 
 [dependencies]
-aes-gcm = { workspace = true }
-hkdf = { workspace = true }
-sha2 = { workspace = true }
-# The session plane's TLS 1.3 handshake (D-15). The ring provider builds without cmake here; aws-lc-rs
-# (default) would need it. rustls's config API takes Arc by signature — D-8 exception 2, the only Arc.
+# The seal's AES-256-GCM, the key schedule's HKDF-SHA-256, and rustls' provider (the workspace `Cargo.toml`).
+aws-lc-rs = { workspace = true }
+# The session plane's TLS 1.3 handshake (D-15), over the aws-lc-rs provider. rustls's config API takes Arc by
+# signature — D-8 exception 2, the only Arc.
 rustls = { workspace = true }
 # The runtime's async UDP socket drives the connection edge (`endpoint.rs`). The protocol *core*
 # (codec, seal, schedule, streams, reliability, flow, handshake) stays sans-io and never imports rt;

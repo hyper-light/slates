@@ -19,7 +19,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use sha2::{Digest, Sha256};
 use slates_conformance::capability::HostOs;
 
 use super::{create_dir, tool_on_path, write_file};
@@ -96,8 +95,8 @@ pub(crate) const PJDFSTEST_TARBALL: Pin = Pin {
 };
 
 fn sha256_hex(bytes: &[u8]) -> String {
-  let digest = Sha256::digest(bytes);
-  digest.iter().map(|b| format!("{b:02x}")).collect()
+  let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+  digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Shape: curl's retries of a fetch that fails transiently, passed with `--retry-all-errors` so a connection reset

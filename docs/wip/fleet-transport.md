@@ -83,6 +83,12 @@ readiness driver — so it pulls **no async runtime** (#2; not `quinn`/`s2n-quic
 > PKI, and `ring` (pulled by rustls) also mints the test keys, so no `rcgen`. The handshake must be
 > test-driven (a client↔server handshake completing and producing matching QUIC keys), so it lands
 > as its own careful slice with rustls's `quic` + raw-key API to hand — not rushed blind.
+>
+> **Superseded 2026-10-03 (A-66):** rustls runs over the **aws-lc-rs** provider, AWS-LC being the one
+> cryptographic library slates builds on (as ../mantle and ../focal do). aws-lc-sys builds its C library with
+> the system C compiler through its `cc` builder (no cmake), and AWS-LC is built without CPU jitter entropy
+> (`.cargo/config.toml`), which cost a fresh process 17.0–17.5 ms before its first random bytes (BENCHMARKS.md,
+> "The cryptographic library: AWS-LC against ring and RustCrypto").
 
 ## 4. Wire layout (the part the first codec slice builds)
 
@@ -282,7 +288,8 @@ hecate `WIRE_SECURITY.md` to slates's D-15 (TLS 1.3, not Noise). **Ratify before
 - **The control plane seals each datagram with an AEAD** derived from the same identity. The key
   schedule: `HKDF-Expand-Label` (RFC 5869; the TLS 1.3 labelled form, RFC 8446 §7.1) from a control
   secret established at enrollment, one key **per (sender, key_epoch, direction)**. Cipher:
-  **AES-256-GCM** (the RustCrypto `aes-gcm` crate — a vetted implementation, never hand-rolled). Nonce:
+  **AES-256-GCM** (AWS-LC's, through `aws_lc_rs::aead`, since 2026-10-03; the RustCrypto `aes-gcm` crate
+  before — a vetted implementation either way, never hand-rolled). Nonce:
   **a 96-bit counter** = 64-bit per-(key,direction) message counter ‖ 32-bit channel id, **never
   random**; the counter is persisted-enough that reuse across a restart is refused, and any reuse is a
   **typed, counted refusal** (the no-panic law — no assertion path). The sealed region wraps exactly
@@ -368,7 +375,7 @@ arrives once each (the assembler dedups the retransmit). **Built (slice 4e):** t
 handshake over `rustls::quic`** (`handshake.rs`) — a node authenticates with its enrolled identity as
 a **pinned certificate** (no CA PKI), the client↔server handshake completing over the `quic`
 `read_hs`/`write_hs` interface and negotiating TLS 1.3, with a test that a **wrong pin is rejected**
-(authenticated, not permissive). `rustls` uses the `ring` provider (no cmake); its config `Arc` is
+(authenticated, not permissive). `rustls` uses the aws-lc-rs provider (A-66; `ring` before 2026-10-03); its config `Arc` is
 D-8's sanctioned exception. The **`Connection`** that wires streams + reliability + multi-range ACKs +
 the dual-level (`MaxStreamData` + `MaxData`) credit law + congestion control is **built**
 (`connection.rs`), and **`Endpoint` (`endpoint.rs`) runs it over the real `rt` UDP driver** — it binds a
