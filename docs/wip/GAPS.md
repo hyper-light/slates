@@ -3408,3 +3408,23 @@ Open:
   is owed.
 - **Fleet planes.** Mutual TLS (QUIC) for records, and hyper-datagram's sealed AES-256-GCM plane for membership.
   Their hostile tests exist at the codec level. A daemon-level break-under-load run like this one is owed.
+
+### 2026-10-04: post-quantum key exchange by default; a GEO-latency handshake defect filed with hyper-raft
+
+slates' rustls dependency had `default-features = false` without `prefer-post-quantum`, so every fleet and export
+handshake negotiated classical X25519. Proven by `a_fleet_handshake_negotiates_the_hybrid_post_quantum_group`
+(`crates/transport/src/handshake.rs`), which failed with `Some(X25519)`. The feature is on now, and both sides
+negotiate X25519MLKEM768.
+
+The amplification tests' fixture was resized for the two-datagram hybrid ClientHello:
+- 300 certificate names;
+- a spoofed source is silenced after the server first answers, since it can send a whole first flight blind.
+
+The bound held throughout: 7,187 bytes sent against a 7,200-byte allowance.
+
+Owed, fixed at the source (hyper-raft, reported to the mantle agent 2026-10-04): at 500 ms one way, the interim
+transport's server ends `NotReady` within about one RTT. The client's handshake retransmits back off from the timer
+granularity, not RFC 9002 §6.2's PTO from 333 ms. Each two-datagram retransmit counts twice against the server's
+32-retransmit cap. The first GEO-class leader moved from 9.15 s to 19.5 s.
+`at_the_geo_class_profile_the_fixed_timing_campaigns_against_a_live_leader_and_the_derived_timing_does_not` is
+ignored, with that reason, until the H-4 re-vendor of hyper-quic, which must carry the tests the report asks for.

@@ -382,6 +382,32 @@ mod tests {
     Ok(())
   }
 
+  /// Goal condition 8 (transfer protected with post-quantum key exchange, aws-lc-rs), 2026-10-04: do complete a
+  /// mutual fleet handshake; expect both sides to have negotiated the hybrid X25519MLKEM768 group
+  /// (draft-ietf-tls-ecdhe-mlkem, the group TLS deployments ship), never classical X25519 alone. A session
+  /// recorded today stays confidential against a later quantum adversary only if its key exchange is hybrid.
+  #[test]
+  fn a_fleet_handshake_negotiates_the_hybrid_post_quantum_group() {
+    let server = self_signed("server.slates");
+    let client = self_signed("client.slates");
+    let (mut client_side, mut server_side) = connect(&server, &client, "server.slates").unwrap();
+    drive(&mut client_side, &mut server_side).unwrap();
+    assert!(
+      !client_side.is_handshaking() && !server_side.is_handshaking(),
+      "the handshake completed"
+    );
+    for (side, group) in [
+      ("client", client_side.negotiated_key_exchange_group()),
+      ("server", server_side.negotiated_key_exchange_group()),
+    ] {
+      assert_eq!(
+        group.map(|group| group.name()),
+        Some(rustls::NamedGroup::X25519MLKEM768),
+        "the {side} negotiated the hybrid post-quantum group"
+      );
+    }
+  }
+
   /// Shape: the largest handshake flight a fleet server may send — the fragmenter's bound on a whole
   /// flight (`crate::flight::MAX_FLIGHT_BYTES`), past which the sender refuses it typed
   /// (`EndpointError::FlightTooLarge`); the assertion is against that bound, from the flight module, not

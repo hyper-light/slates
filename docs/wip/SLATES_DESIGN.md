@@ -8519,6 +8519,11 @@ Status: built 2026-10-03 over aws-lc-rs 1.18.1 and aws-lc-sys 0.45.0, vendored i
 (mantle `3b16867`, Ada's authorization; `vendor/UPSTREAM.md`): the RNDR retry with its operating-system fallback, jitter
 entropy out by default, the system-library guard, #1241, #1165 and #617. Their own suites (850 tests) are a CI gate, and
 CI builds the Windows x86 assembly from NASM source.
+Post-quantum key exchange (2026-10-04): rustls is built with `prefer-post-quantum`, so every TLS handshake (the fleet
+planes and the RPC-with-TLS export) prefers the hybrid X25519MLKEM768 group (draft-ietf-tls-ecdhe-mlkem; ML-KEM is
+FIPS 203). Until then `default-features = false` had dropped the feature and handshakes negotiated classical X25519
+(`a_fleet_handshake_negotiates_the_hybrid_post_quantum_group`). Signatures stay classical (ECDSA/Ed25519 certificates);
+a session is confidential against a later quantum adversary, and authentication only needs to hold at handshake time.
 - Why: Ada's decision (2026-09-28): one cryptographic library, AWS-LC through aws-lc-rs, as ../mantle and ../focal
   use. Before it, slates' TLS ran on `ring` and the control plane's seal and key schedule on RustCrypto's `aes-gcm`,
   `hkdf` and `sha2`.

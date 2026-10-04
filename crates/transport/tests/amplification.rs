@@ -21,8 +21,11 @@ use slates_transport::handshake::Identity;
 
 /// Format: the name the client dials.
 const NAME: &str = "slates-node";
-/// Shape: names on the server's certificate — enough to make its flight span many path-floor datagrams.
-const WIDE_NAMES: usize = 120;
+/// Shape: names on the server's certificate — enough to make its flight span many path-floor datagrams and exceed
+/// three times the client's first flight, which the hybrid X25519MLKEM768 key share (1,216 bytes) makes two
+/// path-floor datagrams: about 11 KB of flight against an allowance near 7 KB, under the 19,200-byte flight bound
+/// (`MAX_FLIGHT_BYTES`). At 120 names (before the hybrid group) the flight fit the allowance and never held.
+const WIDE_NAMES: usize = 300;
 /// Shape: how long the relay waits for a datagram before it judges the handshake over (virtual time).
 const QUIET_NS: u64 = 30_000_000_000;
 /// Shape: the largest datagram the relay reads.
@@ -84,7 +87,10 @@ async fn relay(
 ) {
   let mut buf = vec![0u8; DATAGRAM_BYTES];
   let mut carried = Carried::default();
-  let mut client_datagrams = 0u32;
+  // A spoofed source can send a whole first flight blind (it never needs a reply to send it), so the client is
+  // silenced once the server first answers, not after its first datagram: the hybrid key share makes the
+  // ClientHello two datagrams, and a client cut after one never completes it (the server then sends nothing).
+  let mut server_answered = false;
   loop {
     let received = slates_rt::futures::within(QUIET_NS, socket.recv_from(&mut buf)).await;
     let Ok(Some(Ok((len, from)))) = received else {
@@ -93,13 +99,13 @@ async fn relay(
     let datagram = buf.get(..len).unwrap();
     let bytes = u64::try_from(len).unwrap();
     if from == client {
-      client_datagrams += 1;
-      if silence_client && client_datagrams > 1 {
+      if silence_client && server_answered {
         continue;
       }
       carried.client_to_server += bytes;
       socket.send_to(datagram, server).unwrap();
     } else {
+      server_answered = true;
       carried.server_to_client += bytes;
       socket.send_to(datagram, client).unwrap();
     }
@@ -182,7 +188,7 @@ fn handshake(silence_client: bool) -> Run {
   }
 }
 
-/// AUD-29-49: do: a server with a wide certificate and a client that falls silent after its first datagram
+/// AUD-29-49: do: a server with a wide certificate and a client that falls silent once the server first answers
 /// (a spoofed source's shape); expect the server to have sent at most three times what it received, to
 /// have held at least once (non-vacuity: its flight was larger than its allowance), and the client not to
 /// establish.
