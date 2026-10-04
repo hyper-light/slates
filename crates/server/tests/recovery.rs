@@ -1798,3 +1798,55 @@ fn an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base() {
   drop(client);
   second.stop();
 }
+
+/// §4.8, A-64 (a clone recovers beside its origin, sharing its origin snapshot's records). Do: write a file into a
+/// volume over NFS, snapshot it, clone the snapshot, write the clone's own file, then restart the daemon over the
+/// same segment. Expect: the recovered clone serves the inherited file's bytes and its own, and the origin its file.
+/// A clone image recovered without its origin is refused, so serving both proves the clone was rebuilt over the
+/// recovered origin.
+#[test]
+fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_files() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-clonerec-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("clonerec", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let origin = client.create(&scratch("clone-origin")).unwrap();
+  let (mut stream, root) = mounted_on(&first, "clone-origin");
+  let inherited = create(&mut stream, &root, "inherited", 2);
+  write(&mut stream, &inherited, BEFORE, 3);
+  drop(stream);
+  let snapshot = client.snapshot(origin).unwrap();
+  // A clone lives on its origin's partition; its name must route there too to be mounted by name.
+  let clone_name = clone_name_on_origin_partition("clone-origin", "the-clone");
+  client
+    .clone_snapshot(origin, snapshot, &clone_name)
+    .unwrap();
+  let (mut stream, root) = mounted_on(&first, &clone_name);
+  let own = create(&mut stream, &root, "own", 4);
+  write(&mut stream, &own, AFTER, 5);
+  drop(stream);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let (mut stream, root) = mounted_on(&second, &clone_name);
+  let inherited = lookup(&mut stream, &root, "inherited", 6);
+  assert_eq!(
+    read(&mut stream, &inherited, 7),
+    BEFORE,
+    "the clone's inherited file"
+  );
+  let own = lookup(&mut stream, &root, "own", 8);
+  assert_eq!(read(&mut stream, &own, 9), AFTER, "the clone's own file");
+  drop(stream);
+  let (mut stream, root) = mounted_on(&second, "clone-origin");
+  let file = lookup(&mut stream, &root, "inherited", 10);
+  assert_eq!(read(&mut stream, &file, 11), BEFORE, "the origin's file");
+  drop(stream);
+  drop(client);
+  second.stop();
+}

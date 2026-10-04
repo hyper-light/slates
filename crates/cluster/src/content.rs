@@ -608,17 +608,40 @@ struct HoldImage {
   stages: Vec<StageImage>,
 }
 
-/// One stage of a [`HoldImage`]: its object, the sequence it is placed for, its manifest-only archive, and
-/// the chunks it verified, in identity order.
+/// A block of the shard's arena a [`HoldImage`] names (A-64): its region, offset and length, and the bytes of it
+/// in use. The hold's bytes stay in the arena range of the anchor's content object across a restart, so the image
+/// names them instead of carrying them, and a barrier costs the hold's index, not its replicas' bytes.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockRef {
+  region: u16,
+  offset: u64,
+  block_len: u64,
+  used: u64,
+}
+
+impl BlockRef {
+  fn of(extent: &Extent, used: usize) -> BlockRef {
+    BlockRef {
+      region: extent.region(),
+      offset: as_count(extent.offset()),
+      block_len: as_count(extent.len()),
+      used: as_count(used),
+    }
+  }
+}
+
+/// One stage of a [`HoldImage`]: its object, the sequence it is placed for, the block holding its manifest-only
+/// archive, and the chunks it verified, in identity order.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct StageImage {
   object: [u8; 16],
   sequence: u64,
-  archive: Vec<u8>,
+  archive: BlockRef,
   staged: Vec<[u8; 32]>,
 }
 
-/// One chunk of a [`HoldImage`]: a `Chunk`'s fields, the encoding as its wire byte.
+/// One chunk of a [`HoldImage`]: a `Chunk`'s fields, the encoding as its wire byte, and the block holding its
+/// payload.
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct ChunkImage {
   identity: [u8; 32],
@@ -627,25 +650,45 @@ struct ChunkImage {
   encoding: u8,
   level: u8,
   dictionary: [u8; 32],
-  payload: Vec<u8>,
+  payload: BlockRef,
 }
 
-/// One held manifest of a [`HoldImage`]: its object, the sequence it was last placed for, and the archive
-/// it arrived as with no chunks (its header and tree).
+/// One held manifest of a [`HoldImage`]: its object, the sequence it was last placed for, and the block holding
+/// the archive it arrived as with no chunks (its header and tree).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 struct ManifestImage {
   object: [u8; 16],
   sequence: u64,
-  archive: Vec<u8>,
+  archive: BlockRef,
 }
 
-/// Why a hold image could not be recovered (AUD-29-59): its bytes do not decode as one image, a chunk names
-/// an unknown encoding, a manifest's archive does not decode, or a manifest refused to hold again (a chunk it
+/// A hold image whose blocks are claimed in the arena, between [`ContentHold::claim_image`] and
+/// [`ContentHold::from_claimed`]: the decoded image and each claimed block, by the place the image names it.
+#[derive(Debug, Default)]
+pub struct ClaimedHold {
+  image: Option<HoldImage>,
+  blocks: BTreeMap<(u16, u64), Extent>,
+}
+
+impl ClaimedHold {
+  /// Gives every claim back (a refused claim, before anything is committed).
+  fn give_back(&mut self, arena: &mut ChunkArena) {
+    for (_, extent) in std::mem::take(&mut self.blocks) {
+      let _ = arena.free(extent);
+    }
+  }
+}
+
+/// Why a hold image could not be recovered (AUD-29-59): its bytes do not decode as one image, a block it names
+/// cannot be claimed (A-64: one no allocation could have made, or one another claim holds), a chunk names an
+/// unknown encoding, a manifest's archive does not decode, or a manifest refused to hold again (a chunk it
 /// references is missing or fails its identity).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HoldImageError {
   /// The bytes are not exactly one hold image.
   Malformed,
+  /// A block the image names cannot be claimed in the arena (A-64).
+  Unclaimable,
   /// A chunk's encoding byte names no encoding.
   UnknownEncoding,
   /// A manifest's archive did not decode.
@@ -756,6 +799,17 @@ pub struct ContentHold {
   /// Puts refused because the shard could not admit them (`NoCapacity`; AUD-29-43's typed refusal at the
   /// bound, counted).
   refused_capacity: u64,
+  /// While a hold is rebuilt from its image (A-64), the claimed block the image names for each thing it stores:
+  /// storing those bytes takes the block, checked byte for byte, instead of allocating a copy. Empty otherwise.
+  adoptable: BTreeMap<Adopt, Extent>,
+}
+
+/// What a claimed block holds, as the image names it (A-64): a chunk's payload by its identity, or a manifest-only
+/// archive (a held manifest's or a stage's) by its object and manifest identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Adopt {
+  Chunk([u8; 32]),
+  Manifest([u8; 16], [u8; 32]),
 }
 
 /// A chunk stored in the arena once, whatever objects reference it: its block, its charge (the block's
@@ -1114,7 +1168,7 @@ impl ContentHold {
     let index = stage_entry_bytes()
       .saturating_add(stage_set_entry_bytes().saturating_mul(as_count(missing.len())));
     self.take(space, block, 0, index)?;
-    let extent = match Self::store_bytes(space.arena, &bytes) {
+    let extent = match self.place_bytes(space.arena, &bytes, Adopt::Manifest(object.0, identity)) {
       Ok(extent) => extent,
       Err(refusal) => {
         self.give(space, block, 0, index);
@@ -1256,7 +1310,7 @@ impl ContentHold {
     }
     // Verification is done: its scratch goes back before anything is stored.
     space.budget.credit_replicated(scratch);
-    let extent = match Self::store_bytes(space.arena, &chunk.payload) {
+    let extent = match self.place_bytes(space.arena, &chunk.payload, Adopt::Chunk(chunk.identity)) {
       Ok(extent) => extent,
       Err(refusal) => {
         self.give(space, block, 0, index);
@@ -1424,6 +1478,28 @@ impl ContentHold {
       let _ = space.arena.free(extent);
     }
     verdict
+  }
+
+  /// A block holding `bytes`: during a rebuild from an image, the claimed block the image names for `key` (A-64),
+  /// when it holds exactly these bytes; otherwise a new block they are copied into.
+  fn place_bytes(
+    &mut self,
+    arena: &mut ChunkArena,
+    bytes: &[u8],
+    key: Adopt,
+  ) -> Result<Extent, ContentRefusal> {
+    if !self.adoptable.is_empty() {
+      let same = self.adoptable.get(&key).is_some_and(|extent| {
+        arena
+          .bytes(*extent)
+          .and_then(|block| block.get(..bytes.len()))
+          .is_some_and(|held| held == bytes)
+      });
+      if same && let Some(extent) = self.adoptable.remove(&key) {
+        return Ok(extent);
+      }
+    }
+    Self::store_bytes(arena, bytes)
   }
 
   /// Allocates a block for `bytes` and copies them in; `NoCapacity` when the arena has no block that fits.
@@ -1712,53 +1788,47 @@ impl ContentHold {
     self.promote(space, object)
   }
 
-  /// This hold's canonical image (AUD-29-59; see [`HoldImage`]), read out of `arena`, or no bytes when
-  /// nothing is held.
-  pub fn to_image(&self, arena: &ChunkArena) -> Vec<u8> {
+  /// The hold's canonical image (AUD-29-59), naming every byte by its block (A-64): the stored chunks, each held
+  /// manifest's archive and each stage's, in key order. No byte is copied; the blocks are in the arena range of the
+  /// anchor's content object and survive the daemon. Empty bytes for an empty hold.
+  pub fn to_image(&self) -> Vec<u8> {
     if self.objects.is_empty() && self.stages.is_empty() {
       return Vec::new();
     }
     let mut manifests = Vec::new();
     for (object, held) in &self.objects {
       for record in held.manifests.values() {
-        let Some(bytes) = arena
-          .bytes(record.extent)
-          .and_then(|bytes| bytes.get(..record.len))
-        else {
-          continue;
-        };
         manifests.push(ManifestImage {
           object: object.0,
           sequence: record.placed.sequence,
-          archive: bytes.to_vec(),
+          archive: BlockRef::of(&record.extent, record.len),
         });
       }
     }
     let chunks = self
       .chunks
       .iter()
-      .filter_map(|(identity, stored)| Self::chunk_of(arena, identity, stored))
-      .map(|chunk| ChunkImage {
-        identity: chunk.identity,
-        raw_len: chunk.raw_len,
-        stored_len: chunk.stored_len,
-        encoding: chunk.encoding.to_wire(),
-        level: chunk.level,
-        dictionary: chunk.dictionary,
-        payload: chunk.payload,
+      .map(|(identity, stored)| ChunkImage {
+        identity: *identity,
+        raw_len: stored.raw_len,
+        stored_len: stored.stored_len,
+        encoding: stored.encoding.to_wire(),
+        level: stored.level,
+        dictionary: stored.dictionary,
+        payload: BlockRef::of(
+          &stored.extent,
+          usize::try_from(stored.stored_len).unwrap_or(usize::MAX),
+        ),
       })
       .collect();
     let stages = self
       .stages
       .iter()
-      .filter_map(|(object, stage)| {
-        let archive = arena.bytes(stage.extent)?.get(..stage.len)?.to_vec();
-        Some(StageImage {
-          object: object.0,
-          sequence: stage.placed.sequence,
-          archive,
-          staged: stage.staged.iter().copied().collect(),
-        })
+      .map(|(object, stage)| StageImage {
+        object: object.0,
+        sequence: stage.placed.sequence,
+        archive: BlockRef::of(&stage.extent, stage.len),
+        staged: stage.staged.iter().copied().collect(),
       })
       .collect();
     HoldImage {
@@ -1769,43 +1839,126 @@ impl ContentHold {
     .to_bytes()
   }
 
-  /// A hold rebuilt in `space` from its canonical image (AUD-29-59): every manifest held again through
-  /// [`hold`](Self::hold), so each is re-verified against its identities, re-owned per object and re-charged
-  /// exactly as a put would leave it — an image is recovered, never trusted. Empty bytes are an empty hold. A
-  /// refusal part-way gives back everything the partial rebuild took.
-  pub fn from_image(
-    space: &mut HoldSpace<'_>,
-    bytes: &[u8],
-  ) -> Result<ContentHold, HoldImageError> {
-    let mut hold = ContentHold::new();
+  /// The first half of rebuilding a hold from its image (A-64): the image decoded and every block it names claimed
+  /// in the arena, before anything else allocates there, so no block it names is handed to anything else. Empty
+  /// bytes claim nothing. A block that cannot be claimed, or whose used length exceeds it, refuses with every claim
+  /// given back.
+  pub fn claim_image(arena: &mut ChunkArena, bytes: &[u8]) -> Result<ClaimedHold, HoldImageError> {
     if bytes.is_empty() {
-      return Ok(hold);
+      return Ok(ClaimedHold::default());
     }
     let image = HoldImage::from_bytes(bytes).map_err(|_| HoldImageError::Malformed)?;
-    let mut chunks: BTreeMap<[u8; 32], Chunk> = BTreeMap::new();
-    for chunk in image.chunks {
-      let encoding = Encoding::from_wire(chunk.encoding).ok_or(HoldImageError::UnknownEncoding)?;
-      chunks.insert(
-        chunk.identity,
-        Chunk {
-          identity: chunk.identity,
-          raw_len: chunk.raw_len,
-          stored_len: chunk.stored_len,
-          encoding,
-          level: chunk.level,
-          dictionary: chunk.dictionary,
-          payload: chunk.payload,
-        },
-      );
+    let named = image
+      .chunks
+      .iter()
+      .map(|chunk| chunk.payload)
+      .chain(image.manifests.iter().map(|manifest| manifest.archive))
+      .chain(image.stages.iter().map(|stage| stage.archive));
+    let mut claimed = ClaimedHold {
+      image: None,
+      blocks: BTreeMap::new(),
+    };
+    for block in named {
+      // Every stored thing has a block of its own: a block named twice is an image no hold could have written.
+      if claimed.blocks.contains_key(&(block.region, block.offset)) {
+        claimed.give_back(arena);
+        return Err(HoldImageError::Unclaimable);
+      }
+      let extent = (block.used <= block.block_len)
+        .then(|| {
+          let offset = usize::try_from(block.offset).ok()?;
+          let len = usize::try_from(block.block_len).ok()?;
+          arena.claim(block.region, offset, len).ok()
+        })
+        .flatten();
+      let Some(extent) = extent else {
+        claimed.give_back(arena);
+        return Err(HoldImageError::Unclaimable);
+      };
+      claimed.blocks.insert((block.region, block.offset), extent);
     }
-    for manifest in image.manifests {
-      let rebuilt = Archive::decode(&manifest.archive)
-        .map_err(HoldImageError::Archive)
+    claimed.image = Some(image);
+    Ok(claimed)
+  }
+
+  /// The second half (AUD-29-59, A-64): every manifest held again through [`hold`](Self::hold) and every stage
+  /// through the transfer's own path, so each chunk is re-verified against its identity, re-owned per object and
+  /// re-charged exactly as a put would leave it — an image is recovered, never trusted — with the bytes read where
+  /// they lie and each block adopted rather than copied. A claimed block nothing adopts goes back. A refusal
+  /// part-way gives back everything the partial rebuild took and every claim.
+  pub fn from_claimed(
+    space: &mut HoldSpace<'_>,
+    claimed: ClaimedHold,
+  ) -> Result<ContentHold, HoldImageError> {
+    let mut hold = ContentHold::new();
+    let ClaimedHold { image, blocks } = claimed;
+    let Some(image) = image else {
+      return Ok(hold);
+    };
+    let read = |space: &HoldSpace<'_>, block: &BlockRef| -> Option<Vec<u8>> {
+      let extent = blocks.get(&(block.region, block.offset))?;
+      let used = usize::try_from(block.used).ok()?;
+      space.arena.bytes(*extent)?.get(..used).map(<[u8]>::to_vec)
+    };
+    let named = |block: &BlockRef| blocks.get(&(block.region, block.offset)).copied();
+    for chunk in &image.chunks {
+      if let Some(extent) = named(&chunk.payload) {
+        hold.adoptable.insert(Adopt::Chunk(chunk.identity), extent);
+      }
+    }
+    let manifests = image.manifests.iter().map(|m| (m.object, &m.archive));
+    let stages = image.stages.iter().map(|s| (s.object, &s.archive));
+    let mut kept: BTreeSet<(u16, usize)> = hold
+      .adoptable
+      .values()
+      .map(|extent| (extent.region(), extent.offset()))
+      .collect();
+    for (object, block) in manifests.chain(stages) {
+      let identity = read(space, block)
+        .and_then(|bytes| Archive::decode(&bytes).ok())
+        .map(|archive| archive.manifest_identity());
+      if let (Some(identity), Some(extent)) = (identity, named(block)) {
+        hold
+          .adoptable
+          .insert(Adopt::Manifest(object, identity), extent);
+        kept.insert((extent.region(), extent.offset()));
+      }
+    }
+    // A claimed block the image names for nothing that decodes goes back now.
+    for extent in blocks.values() {
+      if !kept.contains(&(extent.region(), extent.offset())) {
+        let _ = space.arena.free(*extent);
+      }
+    }
+    let mut encodings: BTreeMap<[u8; 32], &ChunkImage> = BTreeMap::new();
+    for chunk in &image.chunks {
+      if Encoding::from_wire(chunk.encoding).is_none() {
+        hold.abandon(space);
+        return Err(HoldImageError::UnknownEncoding);
+      }
+      encodings.insert(chunk.identity, chunk);
+    }
+    let chunk_of = |space: &HoldSpace<'_>, identity: &[u8; 32]| -> Option<Chunk> {
+      let image = encodings.get(identity)?;
+      Some(Chunk {
+        identity: image.identity,
+        raw_len: image.raw_len,
+        stored_len: image.stored_len,
+        encoding: Encoding::from_wire(image.encoding)?,
+        level: image.level,
+        dictionary: image.dictionary,
+        payload: read(space, &image.payload)?,
+      })
+    };
+    for manifest in &image.manifests {
+      let rebuilt = read(space, &manifest.archive)
+        .ok_or(HoldImageError::Unclaimable)
+        .and_then(|bytes| Archive::decode(&bytes).map_err(HoldImageError::Archive))
         .and_then(|mut archive| {
           archive.chunks = archive
             .referenced_chunks()
             .iter()
-            .filter_map(|identity| chunks.get(identity).cloned())
+            .filter_map(|identity| chunk_of(space, identity))
             .collect();
           let placed = Placed {
             sequence: manifest.sequence,
@@ -1815,28 +1968,53 @@ impl ContentHold {
             .map_err(HoldImageError::Refused)
         });
       if let Err(refused) = rebuilt {
-        hold.forget_all(space);
+        hold.abandon(space);
         return Err(refused);
       }
     }
-    for stage in image.stages {
-      if let Err(refused) = hold.restage(space, &chunks, stage) {
-        hold.forget_all(space);
+    for stage in &image.stages {
+      let restaged = read(space, &stage.archive)
+        .ok_or(HoldImageError::Unclaimable)
+        .and_then(|archive| {
+          let staged = stage
+            .staged
+            .iter()
+            .map(|identity| chunk_of(space, identity).ok_or(*identity))
+            .collect::<Vec<_>>();
+          hold.restage(space, &archive, stage, staged)
+        });
+      if let Err(refused) = restaged {
+        hold.abandon(space);
         return Err(refused);
       }
     }
+    hold.release_unadopted(space);
     Ok(hold)
   }
 
+  /// Gives back the claimed blocks nothing adopted (A-64): deferred while the committed image names them.
+  fn release_unadopted(&mut self, space: &mut HoldSpace<'_>) {
+    for (_, extent) in std::mem::take(&mut self.adoptable) {
+      let _ = space.arena.free(extent);
+    }
+  }
+
+  /// A refused rebuild: everything it took goes back, and the claimed blocks nothing adopted.
+  fn abandon(&mut self, space: &mut HoldSpace<'_>) {
+    self.forget_all(space);
+    self.release_unadopted(space);
+  }
+
   /// Rebuilds one imaged stage through the transfer's own path: the manifest staged again, then each chunk it
-  /// had verified, verified again from the image's chunks.
+  /// had verified, verified again from its block (`staged`: the chunk, or the identity of one the image lacks).
   fn restage(
     &mut self,
     space: &mut HoldSpace<'_>,
-    chunks: &BTreeMap<[u8; 32], Chunk>,
-    stage: StageImage,
+    archive: &[u8],
+    stage: &StageImage,
+    staged: Vec<Result<Chunk, [u8; 32]>>,
   ) -> Result<(), HoldImageError> {
-    let manifest = Archive::decode(&stage.archive).map_err(HoldImageError::Archive)?;
+    let manifest = Archive::decode(archive).map_err(HoldImageError::Archive)?;
     let object = ObjectId(stage.object);
     let identity = manifest.manifest_identity();
     let placed = Placed {
@@ -1845,10 +2023,9 @@ impl ContentHold {
     self
       .open_stage(space, object, placed, &manifest)
       .map_err(HoldImageError::Refused)?;
-    for staged in stage.staged {
-      let chunk = chunks.get(&staged).cloned().ok_or(HoldImageError::Refused(
-        ContentRefusal::Incomplete { missing: 1 },
-      ))?;
+    for chunk in staged {
+      let chunk =
+        chunk.map_err(|_| HoldImageError::Refused(ContentRefusal::Incomplete { missing: 1 }))?;
       self
         .stage_chunk(space, object, &identity, chunk)
         .map_err(HoldImageError::Refused)?;
@@ -2666,6 +2843,30 @@ impl TestSpace {
       budget: &mut self.budget,
       metadata: &mut self.metadata,
     }
+  }
+
+  /// The room a daemon restart rebuilds a hold into (A-64): a fresh room whose arena holds this one's bytes at the
+  /// same offsets, as the anchor's RAM survives the daemon.
+  pub(crate) fn restarted(&self) -> TestSpace {
+    let mut fresh = TestSpace::new();
+    let bytes = self
+      .arena
+      .region(0)
+      .map(|region| region.bytes().to_vec())
+      .unwrap();
+    fresh
+      .arena
+      .region_mut(0)
+      .unwrap()
+      .bytes_mut()
+      .copy_from_slice(&bytes);
+    fresh
+  }
+
+  /// A hold rebuilt from `image` in this room, both halves: claimed, then rebuilt.
+  pub(crate) fn recover(&mut self, image: &[u8]) -> Result<ContentHold, HoldImageError> {
+    let claimed = ContentHold::claim_image(&mut self.arena, image)?;
+    ContentHold::from_claimed(&mut self.space(), claimed)
   }
 }
 
@@ -4219,17 +4420,31 @@ mod ownership_oracle {
     // AUD-29-59, AUD-29-55: what a restart recovers from the hold's image is the same hold, its stages'
     // verified progress included — the oracle's whole check holds against the recovered hold too, and its
     // image is byte-identical (deterministic).
-    let image = hold.to_image(&room.arena);
-    let mut recovered = ContentHold::from_image(&mut room.space(), &image)
+    // A-64: the image names blocks, so the restart carries the arena's bytes, and the recovered hold adopts the very
+    // blocks it names (its image is the same bytes) and charges exactly what the live hold did.
+    let image = hold.to_image();
+    let mut restarted = room.restarted();
+    let mut recovered = restarted
+      .recover(&image)
       .map_err(|refused| format!("image refused: {refused:?}"))?;
-    check(&recovered, &room.arena, &model, manifests)
+    check(&recovered, &restarted.arena, &model, manifests)
       .map_err(|disagreement| format!("recovered: {disagreement}"))?;
-    if recovered.to_image(&room.arena) != image {
+    if recovered.to_image() != image {
       return Err("the recovered hold images differently".to_owned());
+    }
+    if (
+      restarted.budget.replicated(),
+      restarted.arena.allocated_bytes(),
+    ) != (room.budget.replicated(), room.arena.allocated_bytes())
+    {
+      return Err("the recovered hold holds other blocks or charges than the live one".to_owned());
+    }
+    recovered.forget_all(&mut restarted.space());
+    if restarted.arena.allocated_bytes() != 0 {
+      return Err("the recovered hold's release left blocks".to_owned());
     }
     // AUD-29-43, AUD-29-55: releasing everything — stages included — gives back every charge and every block.
     hold.forget_all(&mut room.space());
-    recovered.forget_all(&mut room.space());
     let left = (
       room.budget.replicated(),
       room.metadata.committed(),
@@ -4372,10 +4587,11 @@ mod ownership_oracle {
     assert_eq!(hold.charged_bytes(), 3 * page);
   }
 
-  /// Hostile input (§4.9) on the hold image (AUD-29-59): do: image a hold of two overlapping manifests, then
-  /// decode every truncation, the image with a trailing byte, one with a chunk's payload byte flipped, and one
-  /// naming an unknown encoding; expect the whole image to recover, and each damaged one refused typed —
-  /// never a panic, never a hold of content that fails its identity.
+  /// Hostile input (§4.9) on the hold image (AUD-29-59, A-64): do: image a hold of two overlapping manifests,
+  /// then, over the surviving arena, decode every truncation, the image with a trailing byte, one naming a block
+  /// past the arena, one naming an unknown encoding, and the whole image after a byte of a chunk's block is
+  /// flipped; expect the whole image to recover with nothing copied, and each damaged one refused typed with every
+  /// claim given back — never a panic, never a hold of content that fails its identity.
   #[test]
   fn a_damaged_hold_image_is_refused_and_a_whole_one_recovers() {
     let a = object(0);
@@ -4399,38 +4615,69 @@ mod ownership_oracle {
         archive(&second, &BTreeSet::from([2])),
       )
       .unwrap();
-    let image = hold.to_image(&room.arena);
-    let recovered = ContentHold::from_image(&mut room.space(), &image).unwrap();
+    let image = hold.to_image();
+    let mut whole = room.restarted();
+    let recovered = whole.recover(&image).unwrap();
     assert_eq!(
       (recovered.manifest_count(), recovered.chunk_count()),
       (2, 3)
     );
     assert_eq!(recovered.newest_placed(a), Some(4));
+    assert_eq!(
+      whole.arena.allocated_bytes(),
+      room.arena.allocated_bytes(),
+      "the recovered hold adopted the blocks its image names, nothing copied"
+    );
+    refused_damage(&room, &image);
+  }
+
+  /// Every damaged form of `image` refused typed over a surviving copy of `room`, every claim given back.
+  fn refused_damage(room: &TestSpace, image: &[u8]) {
+    let mut damaged = room.restarted();
     for cut in 0..image.len() {
       assert!(
-        ContentHold::from_image(&mut room.space(), &image[..cut]).is_err() || cut == 0,
+        damaged.recover(&image[..cut]).is_err() || cut == 0,
         "cut {cut}"
       );
     }
-    let mut padded = image.clone();
+    let mut padded = image.to_vec();
     padded.push(0);
     assert_eq!(
-      ContentHold::from_image(&mut room.space(), &padded).err(),
+      damaged.recover(&padded).err(),
       Some(HoldImageError::Malformed)
     );
-    let mut decoded = HoldImage::from_bytes(&image).unwrap();
-    if let Some(byte) = decoded.chunks[0].payload.first_mut() {
+    let mut far = HoldImage::from_bytes(image).unwrap();
+    far.chunks[0].payload.offset = 1 << 40;
+    assert_eq!(
+      damaged.recover(&far.to_bytes()).err(),
+      Some(HoldImageError::Unclaimable)
+    );
+    let mut foreign = HoldImage::from_bytes(image).unwrap();
+    foreign.chunks[0].encoding = u8::MAX;
+    assert_eq!(
+      damaged.recover(&foreign.to_bytes()).err(),
+      Some(HoldImageError::UnknownEncoding)
+    );
+    let decoded = HoldImage::from_bytes(image).unwrap();
+    let block = decoded.chunks[0].payload;
+    let at = usize::try_from(block.offset).unwrap();
+    if let Some(byte) = damaged
+      .arena
+      .region_mut(block.region)
+      .unwrap()
+      .bytes_mut()
+      .get_mut(at)
+    {
       *byte ^= 0x01;
     }
     assert_eq!(
-      ContentHold::from_image(&mut room.space(), &decoded.to_bytes()).err(),
+      damaged.recover(image).err(),
       Some(HoldImageError::Refused(ContentRefusal::IdentityMismatch))
     );
-    let mut foreign = HoldImage::from_bytes(&image).unwrap();
-    foreign.chunks[0].encoding = u8::MAX;
     assert_eq!(
-      ContentHold::from_image(&mut room.space(), &foreign.to_bytes()).err(),
-      Some(HoldImageError::UnknownEncoding)
+      damaged.arena.allocated_bytes(),
+      0,
+      "every refused recovery gave its claims back"
     );
   }
 

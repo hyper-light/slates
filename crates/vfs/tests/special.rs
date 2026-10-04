@@ -86,12 +86,26 @@ fn ipc_names_survive_links_snapshots_clones_and_recovery() {
   assert_eq!(volume.stat(&store, pipe).unwrap().mode, 0o640);
   assert_eq!(clone.stat(&store, pipe).unwrap().mode, 0o600);
   let bytes = clone.to_image(&store, None).unwrap().to_content();
+  // A clone shares its origin snapshot's records (A-64), so it recovers beside its recovered origin.
+  let origin_image = volume.to_image(&store, None).unwrap();
+  let clone_image = VolumeImage::from_content(&bytes).unwrap();
   let mut fresh = common::surviving(&store);
-  let claims = common::claims(&mut fresh, &[&VolumeImage::from_content(&bytes).unwrap()]);
-  let recovered = Volume::from_image(
+  let claims = common::claims(&mut fresh, &[&origin_image, &clone_image]);
+  let recovered_origin = Volume::from_image(
     &mut fresh,
-    &VolumeImage::from_content(&bytes).unwrap(),
+    &origin_image,
     &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  let recovered = Volume::clone_from_image(
+    &mut fresh,
+    &clone_image,
+    &claims,
+    &recovered_origin,
+    snapshot,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,

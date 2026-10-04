@@ -471,12 +471,25 @@ fn a_clone_recovers_inherited_and_diverged_content() {
     "a clone records its origin epoch"
   );
 
+  // A clone shares its origin snapshot's records (A-64), so it recovers beside its recovered origin.
+  let origin_image = origin.to_image(&src, None).unwrap();
   let mut fresh = common::surviving(&src);
-  let claims = common::claims(&mut fresh, &[&image]);
-  let recovered = Volume::from_image(
+  let claims = common::claims(&mut fresh, &[&origin_image, &image]);
+  let recovered_origin = Volume::from_image(
+    &mut fresh,
+    &origin_image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  let recovered = Volume::clone_from_image(
     &mut fresh,
     &image,
     &claims,
+    &recovered_origin,
+    snap,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,

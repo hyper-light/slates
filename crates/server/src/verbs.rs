@@ -6689,10 +6689,18 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
   // replicas and the merge volumes below allocate fresh blocks, which must never land on one an image names.
   let claims = claim_images(state, &images);
-  match slates_cluster::content::ContentHold::from_image(
-    &mut crate::content_holder::hold_space(&mut state.store),
-    &held,
-  ) {
+  // The held replicas' blocks too (A-64), then every claim is committed: the recovered image names them all, so none
+  // is reused before this daemon's first publication commits.
+  let held_claims =
+    slates_cluster::content::ContentHold::claim_image(state.store.content.arena_mut(), &held);
+  state.store.content.arena_mut().commit_live();
+  let recovered_hold = held_claims.and_then(|claimed| {
+    slates_cluster::content::ContentHold::from_claimed(
+      &mut crate::content_holder::hold_space(&mut state.store),
+      claimed,
+    )
+  });
+  match recovered_hold {
     Ok(hold) => {
       rebuilt.replicas = hold.manifest_count();
       state.held_content = hold;
@@ -6714,6 +6722,9 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
       rebuilt.merge_volumes += 1;
     }
   }
+  // Origins before their clones (A-64): a clone is rebuilt over its recovered origin's snapshot.
+  let mut records = records;
+  records.sort_by_key(|record| lineage_depth(state, record.id));
   for record in &records {
     match record.policy.role {
       // Rebuilt in the pass above; here only its content-less attachments are reconciled out.
@@ -6759,6 +6770,23 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
   rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
   rebuilt
+}
+
+/// How many clone edges lead from `volume` back to a volume that is no clone (A-64: the order recovery rebuilds in).
+/// Bounded by the catalog's volume count, so a cycle in a corrupt catalog ends.
+fn lineage_depth(state: &ShardState, volume: DbVolumeId) -> usize {
+  let partition = state.db.partition();
+  let bound = partition.volumes().len();
+  let mut depth = 0;
+  let mut at = volume;
+  while depth < bound {
+    let Some(edge) = partition.lineage(at) else {
+      break;
+    };
+    at = edge.origin_volume;
+    depth += 1;
+  }
+  depth
 }
 
 /// Claims every block the shard's recovery images name, before anything else allocates in the arena (A-64); `None`,
@@ -7223,7 +7251,7 @@ fn publish_captured(state: &mut ShardState) -> Result<Published, slates_vfs::Vfs
   #[cfg(not(target_os = "linux"))]
   let replies = Vec::new();
   let shard = ShardImage::new(keyed)
-    .with_held(state.held_content.to_image(state.store.content.arena()))
+    .with_held(state.held_content.to_image())
     .with_replies(replies);
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
@@ -7442,15 +7470,45 @@ fn build_recovered_volume(
     "RecoveryIncomplete: the shard's recovery images name blocks that could not be claimed"
       .to_owned()
   })?;
-  let mut volume = Volume::from_image(
-    &mut state.store,
-    image,
-    claims,
-    Box::new(HostClock::new()),
-    journal,
-    source,
-  )
-  .map_err(|error| error.to_string())?;
+  // A clone shares its origin snapshot's records (A-64), so it is rebuilt beside its recovered origin, which
+  // `rebuild_recovered` rebuilds first.
+  let lineage = state.db.partition().lineage(record.id).cloned();
+  let rebuilt = match lineage {
+    None => Volume::from_image(
+      &mut state.store,
+      image,
+      claims,
+      Box::new(HostClock::new()),
+      journal,
+      source,
+    ),
+    Some(edge) => {
+      let origin = state
+        .by_id
+        .get(&edge.origin_volume)
+        .copied()
+        .ok_or_else(|| {
+          "RecoveryIncomplete: the clone's origin volume was not recovered".to_owned()
+        })?;
+      let ShardState { store, volumes, .. } = &mut *state;
+      let origin = volumes.get(origin).map_err(|_| {
+        "RecoveryIncomplete: the clone's origin volume was not recovered".to_owned()
+      })?;
+      Volume::clone_from_image(
+        store,
+        image,
+        claims,
+        &origin.volume,
+        core_snapshot(SnapshotId {
+          value: edge.origin_snapshot.value,
+        }),
+        Box::new(HostClock::new()),
+        journal,
+        source,
+      )
+    }
+  };
+  let mut volume = rebuilt.map_err(|error| error.to_string())?;
   // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
   // publishes its image before its record commits. Refuse content exceeding that policy.
   let acknowledged = quota.limit();

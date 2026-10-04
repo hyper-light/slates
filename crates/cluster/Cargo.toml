@@ -21,10 +21,11 @@ slates-rt = { workspace = true }
 slates-archive = { workspace = true }
 # the shard memory a content hold stores in and is charged against (§4.2; AUD-29-43): its arena and budgets.
 slates-mem = { workspace = true }
+# the held content's recovery keys (A-64): a claimed block is adopted by the BLAKE3 of the bytes it holds; also the
+# retention publication's hash, timed by the publication-cost measurement (AUD-29-30).
+blake3 = { workspace = true }
 
 [dev-dependencies]
-# the retention publication's hash, timed by the publication-cost measurement (AUD-29-30).
-blake3 = { workspace = true }
 # self-signed enrolled identities for the holder-and-owner sessions in the tests.
 rcgen = { workspace = true }
 rustls = { workspace = true }

@@ -615,7 +615,26 @@ impl Volume {
     )?;
     let root = store.dirs.insert(DirNode::new(epoch, None, root_no, ""))?;
     store.inodes.get_mut(root_handle)?.body = Body::Directory(root);
-    Ok(Volume {
+    Ok(Volume::shell_over(
+      store,
+      seed,
+      (root, inode_root),
+      clock,
+      journal_bytes,
+    ))
+  }
+
+  /// A recovery shell over existing roots: a clone's, which start as its origin snapshot's (A-64, as
+  /// [`Volume::clone_of`] starts one), or the fresh roots [`Volume::recovery_shell`] made.
+  pub(crate) fn shell_over(
+    store: &Store,
+    seed: VolumeSeed,
+    (root, inode_root): (Handle<DirNode>, Handle<TrieNode>),
+    clock: Box<dyn Clock>,
+    journal_bytes: usize,
+  ) -> Volume {
+    let epoch = seed.epoch;
+    Volume {
       prefix: seed.prefix,
       policy: seed.policy,
       clock,
@@ -652,7 +671,7 @@ impl Volume {
       versions_charged: 0,
       retention_refusals: 0,
       retention_shortfall: 0,
-    })
+    }
   }
 
   // ------------------------------------------------------------------ queries
@@ -3675,7 +3694,7 @@ impl Volume {
     Ok(previous)
   }
 
-  fn table_remove(
+  pub(crate) fn table_remove(
     &mut self,
     store: &mut Store,
     no: InodeNo,

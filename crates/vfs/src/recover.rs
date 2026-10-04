@@ -61,10 +61,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// replies a barrier publishes with its effect, so a request the dead daemon applied and never answered is
 /// answered from the record, never applied twice; 12 (A-64, 2026-10-03) a file's body names its chunks and open
 /// extent by their blocks in the shard's arena range instead of carrying its bytes, so a barrier costs the
-/// shard's metadata, not its content.
+/// shard's metadata, not its content; 13 (A-64, 2026-10-03) the held replicas' image names their blocks the same way,
+/// and a clone's image carries only its own inodes and the numbers it shares with its origin snapshot.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 12;
+const IMAGE_VERSION: u16 = 13;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -353,6 +354,9 @@ pub enum SharedSource {
     /// The snapshot that holds the canonical copy.
     at: SnapshotRef,
   },
+  /// A clone's snapshot holding a version from the clone's origin snapshot (born at or before the origin epoch,
+  /// A-64): the origin's record, shared.
+  Origin,
 }
 
 /// A file or symlink a snapshot does not carry in its own `inodes` because an identical version is
@@ -424,8 +428,12 @@ pub struct VolumeImage {
   pub root_no: u64,
   /// The volume's most recent snapshot, if any.
   pub last_snapshot: Option<SnapshotRef>,
-  /// Every inode of the head, in number order.
+  /// Every inode of the head, in number order — for a clone, only its own (born after its origin epoch).
   pub inodes: Vec<InodeImage>,
+  /// For a clone, the inode numbers its head still holds from its origin snapshot (born at or before the origin
+  /// epoch, so the very records the origin's snapshot holds, A-64): recovered by sharing those records, as
+  /// [`Volume::clone_of`] shares them, never by rebuilding copies a clone's destroy would leave to the origin.
+  pub origin_shared: Vec<u64>,
   /// Every copy-on-write snapshot, in id order.
   pub snapshots: Vec<SnapshotImage>,
   /// Inode numbers that have left the namespace (`nlink == 0`) but are still held open — orphans
@@ -941,7 +949,7 @@ impl Volume {
       (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
       (None, _) => None,
     };
-    let inodes = self.capture_tree(store, self.inode_root)?;
+    let (inodes, origin_shared) = self.capture_head(store)?;
     let snapshots = self.capture_snapshots(store)?;
     let root_no = store
       .dirs
@@ -962,6 +970,7 @@ impl Volume {
       inodes,
       snapshots,
       orphans: self.orphans.keys().map(|no| no.0).collect(),
+      origin_shared,
       base,
       references: self
         .attachment_references()
@@ -975,6 +984,28 @@ impl Volume {
         })
         .collect(),
     })
+  }
+
+  /// The head's inodes, and for a clone the numbers it shares with its origin snapshot (A-64): an inode born at or
+  /// before the origin epoch is the origin snapshot's record (everything a clone makes is born after it), carried
+  /// by number only.
+  fn capture_head(&self, store: &Store) -> Result<(Vec<InodeImage>, Vec<u64>), VfsError> {
+    let Some(origin) = self.origin_epoch else {
+      return Ok((self.capture_tree(store, self.inode_root)?, Vec::new()));
+    };
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, self.inode_root, &mut handles);
+    let mut inodes = Vec::with_capacity(handles.len());
+    let mut shared = Vec::new();
+    for handle in handles {
+      let inode = store.inodes.get(handle)?;
+      if inode.born <= origin {
+        shared.push(inode.no.0);
+      } else {
+        inodes.push(self.image_of_inode(store, inode)?);
+      }
+    }
+    Ok((inodes, shared))
   }
 
   /// Captures every inode reachable from `inode_root`, in number order: the versions that root holds, so a
@@ -1028,6 +1059,14 @@ impl Volume {
         shared.push(SharedInode {
           number: no.0,
           source: SharedSource::Head,
+        });
+        continue;
+      }
+      // A clone's snapshot holding a version from the clone's origin shares the origin's record (A-64).
+      if self.origin_epoch.is_some_and(|origin| inode.born <= origin) {
+        shared.push(SharedInode {
+          number: no.0,
+          source: SharedSource::Origin,
         });
         continue;
       }
@@ -1362,6 +1401,62 @@ impl Volume {
     journal_bytes: usize,
     source: Option<(&mut dyn crate::host::HostFs, crate::host::HostDir)>,
   ) -> Result<Volume, VfsError> {
+    // A clone shares its origin snapshot's records, so it recovers only beside its origin.
+    if image.origin_epoch.is_some() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    Self::rebuild(store, image, claims, None, clock, journal_bytes, source)
+  }
+
+  /// A clone rebuilt from its image beside its recovered origin (A-64): it starts from `snapshot` of `origin` — its
+  /// tree, its inode table and every record in them, shared as [`Volume::clone_of`] shares them — then the numbers
+  /// the clone no longer holds leave its table and its own inodes (born after the origin epoch) are placed, each
+  /// directory of its own entered with its entries. The origin's pin on the snapshot came back with the origin's
+  /// image, so none is taken here. Refuses `RecoveryIncomplete` for an image that is not a clone of that snapshot,
+  /// or that names a shared number the snapshot does not hold.
+  #[allow(clippy::too_many_arguments)] // the recovery inputs, each one the caller holds apart from the others
+  pub fn clone_from_image(
+    store: &mut Store,
+    image: &VolumeImage,
+    claims: &Claims,
+    origin: &Volume,
+    snapshot: SnapshotId,
+    clock: Box<dyn Clock>,
+    journal_bytes: usize,
+    source: Option<(&mut dyn crate::host::HostFs, crate::host::HostDir)>,
+  ) -> Result<Volume, VfsError> {
+    let snap = origin
+      .snapshots
+      .get(crate::volume::snapshot_handle(snapshot))
+      .map_err(|_| VfsError::RecoveryIncomplete)?;
+    if image.origin_epoch != Some(snap.epoch.0) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let from = CloneOrigin {
+      root: snap.root,
+      inode_root: snap.inode_root,
+    };
+    Self::rebuild(
+      store,
+      image,
+      claims,
+      Some(from),
+      clock,
+      journal_bytes,
+      source,
+    )
+  }
+
+  /// The rebuild both [`Volume::from_image`] and [`Volume::clone_from_image`] run.
+  fn rebuild(
+    store: &mut Store,
+    image: &VolumeImage,
+    claims: &Claims,
+    origin: Option<CloneOrigin>,
+    clock: Box<dyn Clock>,
+    journal_bytes: usize,
+    source: Option<(&mut dyn crate::host::HostFs, crate::host::HostDir)>,
+  ) -> Result<Volume, VfsError> {
     let policy = policy_from_image(image.policy);
     let quota = quota_from_image(image.quota)?;
     let epoch = Epoch(image.epoch);
@@ -1375,7 +1470,16 @@ impl Volume {
       origin_epoch: image.origin_epoch.map(Epoch),
       quota,
     };
-    let mut vol = Volume::recovery_shell(store, seed, clock, journal_bytes)?;
+    let mut vol = match origin {
+      None => Volume::recovery_shell(store, seed, clock, journal_bytes)?,
+      Some(from) => Volume::shell_over(
+        store,
+        seed,
+        (from.root, from.inode_root),
+        clock,
+        journal_bytes,
+      ),
+    };
     let mut source = source;
     let outcome = (|| {
       vol.base = match (&image.base, source.as_mut()) {
@@ -1388,8 +1492,12 @@ impl Volume {
 
       // The head, into the shell's roots. Recovery places inodes by number (not `next_no`), so set the
       // live-inode count (§4.2) to the recovered head's inode count directly.
-      vol.rebuild_passes(store, claims, &image.inodes, root_no, epoch)?;
-      vol.live_inodes = u64::try_from(image.inodes.len()).unwrap_or(u64::MAX);
+      match origin {
+        None => vol.rebuild_passes(store, claims, &image.inodes, root_no, epoch)?,
+        Some(from) => vol.rebuild_clone_head(store, claims, image, from)?,
+      }
+      let held = image.inodes.len().saturating_add(image.origin_shared.len());
+      vol.live_inodes = u64::try_from(held).unwrap_or(u64::MAX);
       // The head's live-entry count (built by rebuild_entries); snapshot rebuilds below run through the
       // same dir_insert and perturb it, so keep it and restore after (§4.2 namespace, head-reachable).
       let head_entries = vol.live_entries;
@@ -1410,6 +1518,7 @@ impl Volume {
       }
       let refs = SharingRefs {
         head_inode_root,
+        origin_inode_root: origin.map(|from| from.inode_root),
         head_images: &head_images,
         canonical_inode: &canonical_inode,
       };
@@ -1455,6 +1564,70 @@ impl Volume {
       return Err(refusal);
     }
     Ok(vol)
+  }
+
+  /// A clone's head over its origin snapshot's (A-64): the numbers the origin snapshot holds that the clone neither
+  /// shares nor owns leave the clone's table (copy-on-write, so the origin's table is untouched), the clone's own
+  /// inodes are placed, its root is its own node when it owns the root, and each directory of its own gets its
+  /// entries — a shared subdirectory named by the origin's node, as the live clone names it.
+  fn rebuild_clone_head(
+    &mut self,
+    store: &mut Store,
+    claims: &Claims,
+    image: &VolumeImage,
+    from: CloneOrigin,
+  ) -> Result<(), VfsError> {
+    let epoch = self.epoch;
+    let owned: BTreeSet<u64> = image.inodes.iter().map(|i| i.no).collect();
+    let shared: BTreeSet<u64> = image.origin_shared.iter().copied().collect();
+    if !owned.is_disjoint(&shared) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let mut kinds: BTreeMap<u64, KindImage> = BTreeMap::new();
+    let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
+    let mut gone = Vec::new();
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, from.inode_root, &mut handles);
+    let mut shared_entries = 0usize;
+    for handle in handles {
+      let inode = store.inodes.get(handle)?;
+      let no = inode.no.0;
+      if shared.contains(&no) {
+        kinds.insert(no, kind_image(inode.kind));
+        if let Body::Directory(node) = inode.body {
+          dirs.insert(no, node);
+          shared_entries =
+            shared_entries.saturating_add(store.dirs.get(node)?.live_len(&store.blocks));
+        }
+      } else if !owned.contains(&no) {
+        gone.push(InodeNo(no));
+      }
+    }
+    if shared.iter().any(|no| !kinds.contains_key(no)) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    for no in gone {
+      self.table_remove(store, no)?;
+    }
+    for image_inode in &image.inodes {
+      let no = InodeNo(image_inode.no);
+      kinds.insert(image_inode.no, image_inode.kind);
+      let body = body_for(store, claims, image_inode, no, epoch, &mut dirs)?;
+      let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
+      let handle = store.inodes.insert(inode)?;
+      self.table_set(store, no, handle)?;
+    }
+    if owned.contains(&image.root_no) {
+      self.root = *dirs
+        .get(&image.root_no)
+        .ok_or(VfsError::RecoveryIncomplete)?;
+    }
+    self.rebuild_entries(store, &image.inodes, &kinds, &dirs)?;
+    self.restore_identities(store, &image.inodes)?;
+    self.live_entries = self
+      .live_entries
+      .saturating_add(u64::try_from(shared_entries).unwrap_or(u64::MAX));
+    Ok(())
   }
 
   /// Runs the rebuild passes for one tree (the head or a snapshot) against the volume's current
@@ -1572,7 +1745,8 @@ impl Volume {
         .shared
         .iter()
         .filter_map(|s| match s.source {
-          SharedSource::Head => Some(s.number),
+          // The head's records, and a clone's origin's (A-64), are not this snapshot's to free.
+          SharedSource::Head | SharedSource::Origin => Some(s.number),
           SharedSource::Snapshot { .. } => None,
         })
         .collect();
@@ -1616,6 +1790,12 @@ impl Volume {
     for entry in &snap.shared {
       let no = InodeNo(entry.number);
       let (source_root, kind) = match entry.source {
+        SharedSource::Origin => {
+          let source_root = refs.origin_inode_root.ok_or(VfsError::RecoveryIncomplete)?;
+          let handle =
+            trie::get(&store.tries, source_root, no).ok_or(VfsError::RecoveryIncomplete)?;
+          (source_root, kind_image(store.inodes.get(handle)?.kind))
+        }
         SharedSource::Head => {
           let image = refs
             .head_images
@@ -1650,6 +1830,16 @@ impl Volume {
     }
     self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
     self.restore_identities(store, &snap.inodes)?;
+    // A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
+    // (born at or before the origin epoch) is this snapshot's own copy now, born with it, so the snapshot's drop
+    // frees it rather than leaving it to the origin (A-64).
+    if let Some(origin) = self.origin_epoch {
+      for image_inode in snap.inodes.iter().filter(|i| Epoch(i.born) <= origin) {
+        let handle = trie::get(&store.tries, self.inode_root, InodeNo(image_inode.no))
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        store.inodes.get_mut(handle)?.born = epoch;
+      }
+    }
     Ok(())
   }
 
@@ -1799,8 +1989,17 @@ impl Volume {
 /// be shared from that snapshot's rebuilt inode. Sharing — not copying — is what makes the recovered
 /// store use the same RAM the live, pre-crash volume did (the live volume shares CoW inodes across
 /// snapshots), so recovery reconstructs the volume as it was, not a bloated copy of it.
+/// The origin snapshot a clone is rebuilt over (A-64): its directory root and inode table.
+#[derive(Clone, Copy)]
+struct CloneOrigin {
+  root: Handle<DirNode>,
+  inode_root: Handle<TrieNode>,
+}
+
 struct SharingRefs<'a> {
   head_inode_root: Handle<TrieNode>,
+  /// A clone's origin snapshot's inode table (A-64).
+  origin_inode_root: Option<Handle<TrieNode>>,
   head_images: &'a BTreeMap<u64, &'a InodeImage>,
   canonical_inode: &'a BTreeMap<((u32, u32), u64), &'a InodeImage>,
 }

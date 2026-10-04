@@ -30,6 +30,25 @@ fn rebuild(fresh: &mut Store, image: &VolumeImage, claims: &Claims) -> Result<Vo
   )
 }
 
+fn rebuild_clone(
+  fresh: &mut Store,
+  image: &VolumeImage,
+  claims: &Claims,
+  origin: &Volume,
+  snapshot: slates_vfs::ids::SnapshotId,
+) -> Result<Volume, VfsError> {
+  Volume::clone_from_image(
+    fresh,
+    image,
+    claims,
+    origin,
+    snapshot,
+    Box::new(StepClock::new(0, 1)),
+    JOURNAL_BYTES,
+    None,
+  )
+}
+
 /// A file's whole bytes through the read path.
 fn read_all(vol: &Volume, store: &Store, no: InodeNo, len: usize) -> Vec<u8> {
   let mut out = vec![0u8; len];
@@ -255,8 +274,8 @@ fn the_sweep_frees_every_block_no_recovered_volume_reaches_once_a_publication_co
 
 /// A-64 (sharing across volumes). Do: write a file, snapshot, clone the snapshot into a second volume on the
 /// same store, image both, and recover both from the surviving arena. Expect: one claim per block (the clone
-/// names its origin's chunks), the recovered store holds exactly what the live one did, and the clone reads its
-/// origin's bytes.
+/// names its origin's chunks), the recovered store holds exactly the chunk blocks the live one did, the unchanged
+/// clone adds no inode record of its own (it shares its origin snapshot's), and the clone reads its origin's bytes.
 #[test]
 fn a_clone_and_its_origin_recover_sharing_their_chunks() {
   let mut source = store();
@@ -277,11 +296,24 @@ fn a_clone_and_its_origin_recover_sharing_their_chunks() {
   let mut fresh = common::surviving(&source);
   let claims = common::claims(&mut fresh, &[&origin_image, &clone_image]);
   let recovered_origin = rebuild(&mut fresh, &origin_image, &claims).unwrap();
-  let recovered_clone = rebuild(&mut fresh, &clone_image, &claims).unwrap();
+  let origin_records = fresh.inodes.len();
+  let recovered_clone = rebuild_clone(
+    &mut fresh,
+    &clone_image,
+    &claims,
+    &recovered_origin,
+    snapshot,
+  )
+  .unwrap();
   assert_eq!(
     fresh.content.allocated_bytes(),
     source.content.allocated_bytes(),
     "the clone's chunks are its origin's, claimed once"
+  );
+  assert_eq!(
+    fresh.inodes.len(),
+    origin_records,
+    "the unchanged clone adds no inode record: it shares its origin snapshot's"
   );
   assert!(read_all(&recovered_clone, &fresh, f, 2 * chunk) == vec![b'o'; 2 * chunk]);
   assert!(read_all(&recovered_origin, &fresh, f, 2 * chunk) == vec![b'o'; 2 * chunk]);
@@ -332,4 +364,77 @@ fn an_arena_full_of_deferred_frees_refuses_publish_needed_until_a_publication_co
   );
   assert!(read_all(&vol, &store, second, size) == vec![b'3'; size]);
   assert!(read_all(&vol, &store, first, size) == vec![b'2'; size]);
+}
+
+/// Destroys `vol` to the end.
+fn destroy_whole(vol: &mut Volume, store: &mut Store) {
+  vol.destroy(store).unwrap();
+  while !matches!(
+    vol.destroy_step(store, u64::MAX).unwrap(),
+    slates_vfs::volume::DestroyProgress::Done
+  ) {}
+}
+
+/// Builds an origin with two files and a directory, snapshots it, clones the snapshot and changes one file in the
+/// clone; then destroys the clone (unpinning), the snapshot and the origin. Returns the store's live inode records
+/// and directory nodes left.
+fn clone_lifecycle_leftovers(restart: bool) -> (usize, usize) {
+  let mut source = store();
+  let mut origin = volume(&mut source, 1 << 30);
+  let root = origin.root_inode(&source).unwrap();
+  let chunk = source.content.chunk_bytes();
+  let dir = origin.mkdir_no(&mut source, root, "d", 0o755).unwrap();
+  let kept = origin
+    .create_file_no(&mut source, dir, "kept", 0o644)
+    .unwrap();
+  let changed = origin
+    .create_file_no(&mut source, root, "changed", 0o644)
+    .unwrap();
+  origin
+    .write(&mut source, kept, 0, &vec![b'k'; 2 * chunk])
+    .unwrap();
+  origin
+    .write(&mut source, changed, 0, &vec![b'c'; chunk])
+    .unwrap();
+  let snapshot = origin.snapshot(&mut source).unwrap();
+  let mut clone =
+    Volume::clone_of(&source, &mut origin, snapshot, common::clone_config(8)).unwrap();
+  clone
+    .write(&mut source, changed, 0, b"clone's own")
+    .unwrap();
+  let (mut store, mut origin, mut clone) = if restart {
+    let origin_image = origin.to_image(&source, None).unwrap();
+    let clone_image = clone.to_image(&source, None).unwrap();
+    let mut fresh = common::surviving(&source);
+    let claims = common::claims(&mut fresh, &[&origin_image, &clone_image]);
+    let origin = rebuild(&mut fresh, &origin_image, &claims).unwrap();
+    let clone = rebuild_clone(&mut fresh, &clone_image, &claims, &origin, snapshot).unwrap();
+    (fresh, origin, clone)
+  } else {
+    (source, origin, clone)
+  };
+  destroy_whole(&mut clone, &mut store);
+  origin.unpin(snapshot).unwrap();
+  origin.destroy_snapshot(&mut store, snapshot).unwrap();
+  destroy_whole(&mut origin, &mut store);
+  (store.inodes.len(), store.dirs.len())
+}
+
+/// A-64, §4.5 (a clone shares its origin snapshot's records). Do: run a clone's whole life — origin, snapshot,
+/// clone with one change, destroy the clone, the snapshot and the origin — live, and again with both volumes
+/// recovered from their images before the destroys. Expect: nothing left either way. A recovered clone that
+/// rebuilt its own copies of the origin's records, born at the origin's epochs, would never free them: a clone's
+/// destroy leaves everything born at or before its origin to the origin.
+#[test]
+fn a_recovered_clone_and_its_origin_leave_nothing_behind_when_destroyed() {
+  assert_eq!(
+    clone_lifecycle_leftovers(false),
+    (0, 0),
+    "the live lifecycle"
+  );
+  assert_eq!(
+    clone_lifecycle_leftovers(true),
+    (0, 0),
+    "the recovered lifecycle"
+  );
 }
