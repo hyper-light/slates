@@ -54,7 +54,8 @@ pub struct Buddy {
   /// Per granule: the incarnation of the last allocation headed there.
   incarnations: Vec<u64>,
   free_bytes: usize,
-  /// The heads of live blocks, deferred ones included.
+  /// The heads of live blocks, deferred ones included: kept from the first capture on (built then from `state`),
+  /// so an allocator nothing publishes from maintains no bitmap.
   live: Bits,
   /// The heads the committed image may name (A-64): freed only after a newer image commits.
   committed: Bits,
@@ -64,6 +65,9 @@ pub struct Buddy {
   capture: Bits,
   /// Whether a capture is open (taken, neither committed nor abandoned).
   capturing: bool,
+  /// Whether any image may name a block: set by the first capture and kept. Until then neither an allocation nor
+  /// a free touches a bitmap (an allocator nothing publishes from pays one flag test for the deferral).
+  imaged: bool,
   deferred_bytes: usize,
 }
 
@@ -199,6 +203,7 @@ impl Buddy {
       deferred: Bits::new(granules),
       capture: Bits::new(granules),
       capturing: false,
+      imaged: false,
       deferred_bytes: 0,
     })
   }
@@ -290,7 +295,9 @@ impl Buddy {
     if let Some(slot) = self.slot_mut(index) {
       *slot = incarnation;
     }
-    self.live.set(index, true);
+    if self.imaged {
+      self.live.set(index, true);
+    }
     let block_len = self.order_bytes(order);
     self.free_bytes = self.free_bytes.saturating_sub(block_len);
     Block {
@@ -401,6 +408,11 @@ impl Buddy {
 
   /// Whether the committed image, or the one being published, may name the block headed at `index`.
   fn named_by_an_image(&self, index: u32) -> bool {
+    self.imaged && (self.committed.get(index) || (self.capturing && self.capture.get(index)))
+  }
+
+  /// [`Buddy::named_by_an_image`] once `imaged` is known to be set.
+  fn named_once_imaged(&self, index: u32) -> bool {
     self.committed.get(index) || (self.capturing && self.capture.get(index))
   }
 
@@ -445,6 +457,18 @@ impl Buddy {
   /// Records the heads a publication starting now may name: every live block not deferred. Until the capture
   /// is committed or abandoned, a free of one of them is deferred too.
   pub fn capture(&mut self) {
+    if !self.imaged {
+      // The first capture: the live heads, read once from the state bytes, kept from now on.
+      for (index, byte) in self.state.iter().enumerate() {
+        if *byte != INSIDE
+          && *byte & FREE_BIT == 0
+          && let Ok(index) = u32::try_from(index)
+        {
+          self.live.set(index, true);
+        }
+      }
+      self.imaged = true;
+    }
     self.capturing = true;
     for ((capture, live), deferred) in self
       .capture
@@ -586,23 +610,34 @@ impl Buddy {
         len: block.len,
         reason,
       })?;
-    if self.named_by_an_image(index) {
+    if self.imaged {
       // A committed head is freed only through the deferral, never here, or the committed image could
       // name a reused block.
-      return Err(MemError::ForeignExtent {
-        offset: block.offset,
-        len: block.len,
-        reason: ExtentRefusal::Claimed,
-      });
+      if self.named_once_imaged(index) {
+        return Err(MemError::ForeignExtent {
+          offset: block.offset,
+          len: block.len,
+          reason: ExtentRefusal::Claimed,
+        });
+      }
+      self.live.set(index, false);
     }
-    self.release(index, order);
+    self.coalesce_free(index, order);
     Ok(())
   }
 
   /// Returns the allocated block of `order` at `index` to the free lists, coalescing.
+  /// Never a block an image names: the deferral keeps those until a commit, and the commit replaces the committed
+  /// set whole, so its bit needs no clearing here.
   fn release(&mut self, index: u32, order: u32) {
-    self.live.set(index, false);
-    self.committed.set(index, false);
+    if self.imaged {
+      self.live.set(index, false);
+    }
+    self.coalesce_free(index, order);
+  }
+
+  /// Returns the block of `order` at `index` to the free lists, coalescing; its live bit is the caller's.
+  fn coalesce_free(&mut self, index: u32, order: u32) {
     self.free_bytes = self.free_bytes.saturating_add(self.order_bytes(order));
     let (index, order) = self.coalesce(index, order);
     self.mark(index, order, true);
