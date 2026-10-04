@@ -244,6 +244,54 @@ pub struct Admitted<T> {
   deadline: Instant,
   budget_ns: u64,
   attempts: u32,
+  time: ShardTime,
+}
+
+/// An observation's budget counted in the observed shard's own time (§4.14, A-65): the shard's CPU clock when the
+/// observation began, and at the last window's end. At a wall deadline the observation goes on — for the part of the
+/// budget the shard has not yet run, as wall time — only while the shard is working: it ran on the CPU during the
+/// window just ended. A starved shard, runnable but given little CPU, keeps consuming some and is answered; a wedged
+/// one, which consumes none, ends the observation in one window; a busy one that never answers ends it once it has run
+/// the budget, which an uncontended shard does at the wall clock's pace. A reading at or below the mark (a thread id the
+/// OS reused once the shard's thread had ended, which reads lower) ends it too. Under Miri, which has no thread
+/// clock, the wall budget stands alone.
+#[derive(Clone, Copy, Debug)]
+struct ShardTime {
+  holder: SlotHolder,
+  budget_ns: u64,
+  /// The CPU time the shard had run when the observation began.
+  began: Option<u64>,
+  /// The shard's progress at the last window's end (first: at the observation's start); it only rises.
+  mark: Option<u64>,
+}
+
+impl ShardTime {
+  fn new(holder: SlotHolder, budget_ns: u64) -> Self {
+    let began = slates_rt::registry::shard_cpu(holder);
+    ShardTime {
+      holder,
+      budget_ns,
+      began: began.map(|reading| reading.spent_ns),
+      mark: began.map(|reading| reading.progress),
+    }
+  }
+
+  /// The next wall deadline when the shard worked through the window just ended within its budget; `None` ends the
+  /// observation.
+  fn extend(&mut self) -> Option<Instant> {
+    let now = slates_rt::registry::shard_cpu(self.holder)?;
+    let unspent = self
+      .budget_ns
+      .checked_sub(now.spent_ns.checked_sub(self.began?)?)
+      .filter(|unspent| *unspent > 0)?;
+    if self.mark.is_none_or(|mark| now.progress <= mark) {
+      return None;
+    }
+    self.mark = Some(now.progress);
+    // The budget the shard has not yet run, as wall time: an uncontended shard runs at the wall clock's pace and has
+    // next to none left; a starved one has most of it.
+    Instant::now().checked_add(Duration::from_nanos(unspent))
+  }
 }
 
 /// What one attempt of an observation established: an end (an admitted task, or a final refusal), or
@@ -286,7 +334,8 @@ where
   /// attempts, never spins. Returns the admitted task, whose answer is then pending.
   pub fn admit(self) -> Result<Admitted<T>, ObserveError> {
     let began = Instant::now();
-    let deadline = began + Duration::from_nanos(self.budget_ns);
+    let mut deadline = began + Duration::from_nanos(self.budget_ns);
+    let mut time = ShardTime::new(self.holder, self.budget_ns);
     // The pace is a timed wait on a channel nobody sends on: the thread parks, it does not spin, so it
     // steals no CPU from the shard it waits on; the sender is held so the wait runs its full span.
     let (_pace_sender, pace) = channel::<()>();
@@ -294,7 +343,16 @@ where
     let mut held_up_by: Option<RtError> = None;
     loop {
       attempts = attempts.saturating_add(1);
-      match self.attempt(attempts, began, deadline) {
+      match self.attempt(attempts, began, &mut deadline, &mut time) {
+        // A capacity refusal held at the deadline: retried for another window while the shard is working.
+        Attempt::Ended(Err(ObserveError::Deadline { .. }))
+          if held_up_by.is_some() && {
+            let extended = time.extend();
+            if let Some(next) = extended {
+              deadline = next;
+            }
+            extended.is_some()
+          } => {}
         Attempt::Ended(Err(ObserveError::Deadline {
           stage,
           budget_ns,
@@ -322,7 +380,13 @@ where
   }
 
   /// One submission and its journey to an admitted task or a refusal.
-  fn attempt(&self, attempts: u32, began: Instant, deadline: Instant) -> Attempt<T> {
+  fn attempt(
+    &self,
+    attempts: u32,
+    began: Instant,
+    deadline: &mut Instant,
+    time: &mut ShardTime,
+  ) -> Attempt<T> {
     let (reply_sender, reply) = channel::<Result<T, StateAccess>>();
     let question = self.question.clone();
     let submitted = slates_rt::runtime::submit_to_holder(self.holder, async move {
@@ -335,16 +399,28 @@ where
     });
     let receipt = match submitted {
       Ok(receipt) => receipt,
-      Err(refusal) => return self.submission_refused(refusal, attempts, began, deadline),
+      Err(refusal) => return self.submission_refused(refusal, attempts, began, *deadline),
     };
-    match self.admitted(receipt.wait(remaining(deadline)), attempts, began, deadline) {
+    // The receipt, waited for another window while the shard is working (`ShardTime`).
+    let admission = loop {
+      let waited = receipt.wait(remaining(*deadline));
+      if waited.is_some() {
+        break waited;
+      }
+      match time.extend() {
+        Some(next) => *deadline = next,
+        None => break None,
+      }
+    };
+    match self.admitted(admission, attempts, began, *deadline) {
       Ok(task) => Attempt::Ended(Ok(Admitted {
         task,
         reply,
         began,
-        deadline,
+        deadline: *deadline,
         budget_ns: self.budget_ns,
         attempts,
+        time: *time,
       })),
       Err(attempt) => attempt,
     }
@@ -437,8 +513,18 @@ impl<T> Admitted<T> {
   /// A budget that elapses first cancels the task, so a starved shard does not run the question for
   /// nobody once it gets the CPU (a cancel refused under that same load is why a late reply is counted
   /// as well); a task dropped before it answered — cancelled by a shutdown — reads as terminated.
-  pub fn answer(self) -> Result<T, ObserveError> {
-    match self.reply.recv_timeout(remaining(self.deadline)) {
+  pub fn answer(mut self) -> Result<T, ObserveError> {
+    // The answer, waited for another window while the shard is working (`ShardTime`).
+    let answered = loop {
+      match self.reply.recv_timeout(remaining(self.deadline)) {
+        Err(RecvTimeoutError::Timeout) => match self.time.extend() {
+          Some(next) => self.deadline = next,
+          None => break Err(RecvTimeoutError::Timeout),
+        },
+        other => break other,
+      }
+    };
+    match answered {
       Ok(Ok(answer)) => Ok(answer),
       Ok(Err(access)) => Err(ObserveError::State(access)),
       Err(RecvTimeoutError::Timeout) => {

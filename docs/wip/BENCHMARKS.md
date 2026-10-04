@@ -1394,3 +1394,33 @@ from other sessions; three runs, best of five per step:
 The publish step at 256 MiB went from 65.0–88.7 µs to 40.8–41.5 µs, under a higher load than the runs before it. Every
 recovery test passes. `a_publisher_that_keeps_its_committed_slot_publishes_in_one_pass_and_survives_a_torn_write`
 proves a publish torn partway leaves the last image and the kept slot as they were.
+
+### A shard-local global allocator against the system allocator (2026-10-03, measured, not landed)
+
+The candidate: a `#[global_allocator]` in slates-server. Each shard thread allocates from a span of one reserved,
+`NORESERVE` region (power-of-two classes, a bump pointer, owner free lists, a lock-free stack for remote frees); every
+other thread uses the system allocator. It was built against the Linux startup timeouts, read at the time as shards
+contending on the process's memory-map lock through the allocator.
+
+Measured, Linux container on an M5 Max (Docker Desktop, 18 cores, rust 1.98.0):
+- It removed the allocator's syscalls from shard threads: 847 → 25 `mprotect` calls per daemon start.
+- It did not change the stall. Observations ending `Deadline` beside 108 burners: 13, 7, 10 with it; 2, 2, 13
+  without (the CPU-time budget's first runs). The stall's cause was the arena lock's page population
+  (`docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md`), which no allocator touches.
+- Provisioning (`provision_bench`, release, heap then system, two rounds each) is unreadable this day. The host load
+  average was 35 from another session's KIND cluster, and the same binary's single-client spinning p99 read 174 µs
+  in one round and 2.5 ms in the next:
+
+| Row | heap 1 | system 1 | heap 2 | system 2 |
+|---|---|---|---|---|
+| spinning 1 p50 | 13,792 | 44,000 | 47,541 | 44,958 |
+| spinning 1 p99 | 174,041 | 570,375 | 2,502,458 | 1,326,292 |
+| parked 1 p99 | 327,250 | 557,333 | 3,664,500 | 3,621,750 |
+
+Not landed: its one proven effect is not yet tied to a latency, and it costs eleven unsafe sites. To re-measure on a
+quiesced host (load average under 1), build both arms and run them alternately:
+```
+cargo build --release -p slates-client --example provision_bench   # with, then without, the #[global_allocator]
+target/release/examples/provision_bench
+```
+If it is re-taken, jemalloc (as ../vorpal uses it) is the comparison arm.

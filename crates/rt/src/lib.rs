@@ -42,6 +42,8 @@ pub mod runtime;
 pub mod shard;
 pub mod sim;
 pub mod task;
+mod thread_clock;
+pub use thread_clock::CpuReading;
 // Async TCP is the NFS loopback mount server's alone (macOS/Linux; Windows mounts through WinFsp), so
 // it stays a `rustix` module gated off Windows — the fleet transport is QUIC over UDP, not TCP.
 #[cfg(not(windows))]

@@ -355,6 +355,18 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 15
         run: cargo test -p slates-rt --test udp
+      # A shard's CPU clock read from another thread (§4.14, A-65): `GetThreadTimes` for the time it ran and
+      # `QueryThreadCycleTime` for whether it ran; then the observations that count their budget in it — a starved
+      # shard answered past the wall budget, a wedged one ended in one budget
+      # (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
+      - name: Test the shard CPU clock (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: 'cargo test -p slates-rt --lib thread_clock::'
+      - name: Test the observation budget in the shard's own time (native Windows)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: cargo test -p slates-server --test observe
       # The full daemon lifecycle end to end on Windows: an in-process `slates-server` daemon starts,
       # a client finds it through the Win32 rendezvous bootstrap object, and drives create → duplicate
       # refused → snapshot → clone → attach/lease → status → list → detach → resize → destroy over the

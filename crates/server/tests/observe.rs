@@ -332,3 +332,67 @@ fn a_wait_is_charged_the_least_advance_from_each_daemons_own_start() {
   assert_eq!(charge.advanced([50, 6_000]), 0);
   assert_eq!(ProgressCharge::begin([]).advanced([]), 0);
 }
+
+/// Format: the slice a simulated starved shard sleeps between its bursts of work.
+const STARVED_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
+/// Shape: the share of each slice the simulated starved shard works — a tenth, as a shard given a tenth of a core.
+const STARVED_WORK_NS: u64 = 100_000;
+
+/// §4.14 (an observation's budget is the shard's own time). Do: ask a question that runs three short budgets of wall
+/// time while working only about a tenth of it — sleeping a millisecond, then working a tenth of one, over and over,
+/// as a shard starved of CPU runs. Expect: the answer, not a deadline: the shard kept working, and ran far less than the
+/// budget. Under the wall budget alone this ended at the first deadline
+/// (`docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`).
+#[test]
+fn a_starved_but_working_shard_is_answered_past_the_wall_budget() {
+  let _serial = serialize();
+  let daemon = laptop("starved");
+  let answered = daemon.observe_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
+    let end = slates_rt::futures::now_ns().saturating_add(3 * SHORT_BUDGET_NS);
+    while slates_rt::futures::now_ns() < end {
+      // The question blocks its shard off the CPU on purpose: the starvation this test stands for.
+      #[allow(clippy::disallowed_methods)]
+      std::thread::sleep(STARVED_SLEEP);
+      let burst = slates_rt::futures::now_ns().saturating_add(STARVED_WORK_NS);
+      while slates_rt::futures::now_ns() < burst {
+        std::hint::spin_loop();
+      }
+    }
+    7u8
+  });
+  assert_eq!(answered, Ok(7), "a working shard is answered");
+  daemon.stop();
+}
+
+/// §4.14. Do: ask a question that only sleeps for three short budgets — a shard that consumes no CPU, as a wedged one.
+/// Expect: a deadline in the execution stage within about one budget, not after the question ends.
+#[test]
+fn a_wedged_shard_still_ends_the_observation_in_one_budget() {
+  let _serial = serialize();
+  let daemon = laptop("wedged");
+  let started = std::time::Instant::now();
+  let ended = daemon.observe_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
+    // The question blocks its shard off the CPU on purpose: a wedged shard.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(std::time::Duration::from_nanos(3 * SHORT_BUDGET_NS));
+    8u8
+  });
+  assert!(
+    matches!(
+      ended,
+      Err(ObserveError::Deadline {
+        stage: ObserveStage::Execution,
+        ..
+      })
+    ),
+    "a shard consuming no CPU ends at its deadline: {ended:?}"
+  );
+  assert!(
+    started.elapsed() < std::time::Duration::from_nanos(2 * SHORT_BUDGET_NS),
+    "within about one budget: {:?}",
+    started.elapsed()
+  );
+  // The sleeping question still finishes and is counted late before the daemon stops.
+  assert_eq!(late_replies_reach(&daemon, 1), 1);
+  daemon.stop();
+}

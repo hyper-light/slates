@@ -346,6 +346,8 @@ fn run_worker(
       return Err(error);
     }
   };
+  // The shard's CPU clock, for observers that count their budget in its own time (§4.14).
+  crate::registry::record_cpu_clock(id);
   let _ = ready.send((id, Ok(())));
   drop(ready);
   if let Some((core, Pinning::Refused)) = pinned {

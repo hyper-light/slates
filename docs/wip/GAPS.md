@@ -3251,3 +3251,22 @@ from the remaining live scheduling/session/retention evidence. It retains the ex
 measured decisions on one leader-origin log and fast-track enablement. No item above is
 closed until a failing behavioral test, design-consistent correction, sibling sweep and
 the applicable acceptance evidence land.
+
+### 2026-10-03: the Linux startup timeouts — the arena lock's page population, and observations counted in shard time
+
+One CI run of the Linux server tests ended four daemon startups `Deadline`. In a Linux container beside 108 CPU burners
+the library suite reproduced it, 7–13 per run. Two causes, both fixed (A-65; §4.2 and §4.14 statuses):
+- Shards that were runnable but starved were read as wedged by the observation's wall budget. The budget is now the
+  observed shard's CPU time (`docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`); 7–13 → 1–2.
+- The remaining shards had consumed no CPU for the whole budget. They waited in state D in `mmap`/`munmap` while one
+  shard's strict-volume arena lock faulted the range in under the process's memory-map lock. The lock is now on fault
+  on Linux (`docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md`); six loaded runs
+  end no observation `Deadline`.
+
+Owed:
+- **The quick machine profile under heavy oversubscription.** The tests' and `--quick` profile (5 ms per probe, wake
+  extension to 62 ms) refused `MeasurementTimeout { probe: "wake" }` in alternate runs beside 108 burners on 18 cores.
+  A full profile has the default budget. No CI lane runs under that load.
+- **GitHub runner memlock limit not read.** Whether the CI lane's runner allows a multi-GiB `mlock` (and so reached
+  the populate stall) is not yet read from a CI log. The observation fix covers the starvation half either way.
+- Still owed from GAP-A9-6: a recovered snapshot's directories are rebuilt privately (RAM only).

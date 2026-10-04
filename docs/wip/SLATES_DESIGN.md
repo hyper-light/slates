@@ -962,6 +962,16 @@ Same code, zero modes.
 > hand-edited layout past the bound. GAP-A9-1's contract gaps (BUG-1–3, uncharged
 > metadata/transient/retained bytes) are closed; see `docs/wip/admission.md`.
 
+> **Status (2026-10-03, lock on fault).** A strict volume still locks its shard's arena (BUG-1). On Linux the lock is
+> now `mlock2(MLOCK_ONFAULT)`: the whole range is charged against `RLIMIT_MEMLOCK` and flagged locked, and each page
+> is locked as it is first touched. A plain `mlock` faulted the whole multi-GiB range in while holding the process's
+> memory-map lock. Every other shard's `mmap` and `munmap` waited behind it (one shard in `__mm_populate`, the rest in
+> state D, under 108 burners on 18 cores), which read as the Linux startup timeouts
+> (`docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md`;
+> `crates/mem/tests/lock_on_fault.rs`: 268 MB committed by locking an untouched 256 MiB region before, none after).
+> macOS (`mlock` wires the range) and Windows (`VirtualLock`) are unchanged. Locking only a strict volume's own
+> chunks, rather than its shard's whole arena, remains the refinement GAP-A9-1 records.
+
 **Ownership and residency.** Each shard owns bounded generational slabs and chunk arenas;
 foreign frees are messages to the owner. Every allocation has a charge owner and a terminal
 release step. Releasing a handle reuses its slot with a new generation; repeated open/close
@@ -3100,6 +3110,21 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > acknowledged, proven over the wire in-process.
 
 > **Status (2026-09-17, observations typed to their stage).** The test- and operator-facing observation accessors (`Daemon::fleet_members`, `council_leads`, the injections, and the rest — thirty-three of them) answered `Option`: `None` for a daemon that was stopping, a shard it did not have, a submission refused by a full control channel, a task refused by a full arena, a shard starved past the observe budget, and a state that had been taken or fenced — one silence for six different facts, which the 2026-09-16 diagnosis of three CI-red fleet tests first misread as "observations failing fast". Every accessor now returns `Result<T, ObserveError>` (`crates/server/src/observe.rs`), and the error names the **stage** the question reached — submission, admission, execution — and what ended it there: no target, no runtime, the shard gone (its registry slot free or held by a later daemon, the submission being pinned to the registration it began on), a submission or admission refusal that cannot clear with the runtime's own refusal, a termination by shutdown, a deadline naming the stage and the capacity refusal that kept the question waiting there, or the state out of reach — absent, fenced, borrowed, or a retention check that discarded the answer (`state::try_with_state`). One absolute budget spans all three stages; only a capacity refusal (`ControlFull`, `TooManyTasks`) is retried inside it, paced at the collection cadence; a question admitted but not run at the deadline is cancelled, and a reply that arrives late all the same is discarded and counted (`observe.late_reply`). The pending form (`Observation`, `Admitted`) outlives the daemon and answers `ShardGone` or `Terminated`, never waits. The fleet harness's waits take a **verdict** of each ask — holds, observed-not-yet, unavailable (the wait continues, paced), terminal (the wait ends, naming why) — and charge the wait per daemon: each daemon's periods since the wait began, the least of them charged, so a daemon that started far ahead never pays for one that stalled (the earlier "least absolute count" rule let it). Proven by use in `crates/server/tests/observe.rs`: a full control channel retried then named by the deadline; a receptive channel with a full arena refused on the receipt then admitted after release; a daemon stopped while a question is pending ending it terminated, and its reused slot never answering a stranger; a budget that elapses at the admission and at the execution stage with the late reply discarded and counted; an unavailable shard told apart from an observed zero; and the charge under unequal starts with one daemon stalled.
+
+> **Status (2026-10-03, the budget counted in the shard's own time, A-65).** The one budget no longer reads a starved
+> shard as wedged. At a wall deadline an observation goes on only while the observed shard consumed CPU in the window
+> just ended. It continues for the part of the budget the shard has not yet run, as wall time. The shard's CPU clock is
+> recorded on its registry entry as it starts (`slates_rt::registry::shard_cpu`; Linux `pthread_getcpuclockid`, macOS
+> `thread_info`, Windows the thread id). The outcomes:
+> - A wedged shard consumes none and ends the observation in one budget.
+> - A busy shard that never answers ends it once it has run the budget.
+> - An uncontended shard gets no extra window.
+> - Windows reads the shard's cycles (`QueryThreadCycleTime`) to tell whether it ran and its kernel plus user time
+>   (`GetThreadTimes`) for what it spent; the native Windows CI lane runs the clock and the observe tests.
+>
+> Beside 108 burners, the observations that ended `Deadline` went from 7–13 per run to 1–2. Every remaining one named
+> a shard that consumed no CPU at all: it was blocked on the memory-map lock, which §4.2's 2026-10-03 status removes
+> (`docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`).
 
 > **Status (2026-09-17, a bounded discovery exchange).** A survivor refreshing discovery over a peer's record session when that peer's process disappeared awaited the reply for good — a datagram socket reports no terminal error for a peer whose keys are gone — and the link task that alone notices the replacement identity and re-dials never returned to its loop: the leader made 271 replication attempts toward a replacement voter with no session and sent no append, so the replacement kept the pre-transition voter set (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`). Every discovery exchange is now bounded by one deadline armed once at the measured control-plane round budget's full span (`consensus_budget(slowest_path_tail_ns()).max_deadline_ns()` — the bound every other record-plane exchange runs under) and by the link's validity, re-checked whenever the exchange is woken: the anchor's learned member still the one addressed and the peer still in direct contact; a replacement learned on contact or a death folded wakes the exchange at once (`wake_link_waiter`, one waiter per anchor, bounded by the roster), and the timer bounds it even when no such notification comes (a warm restart with new keys). Every outcome is typed and counted (`fleet.discovery.deadline` / `.invalidated` / `.transport`; the protocol's own refusals as before); any but an answer abandons the exchange and releases the endpoint so the link re-dials on its cadence, an incarnation change also drops a dial still in its handshake and restarts the sweep, and a late page never re-creates a removed entry. A borrowed record session returns only to the slot it left, tagged with its own connection id (`RecordLink`): a late return — a retired peer's, a slot re-established since, another session — is dropped and counted (`fleet.link.stale_return`), never installed over a newer session. Raft's admission is unchanged: the replacement imports its prefix once and receives the rest through ordinary appends. Regression: the whole-RAM history forces the interrupted phase (the victim holds its discovery replies after their requests arrive, `Daemon::inject_discovery_fault`, so each survivor's link to it is shown borrowed by a pending exchange when it is stopped and replaced) and requires the exchanges to end typed, a link to the fresh member on each survivor, and the replacement's council contact climbing, before the voter set converges and the second loss.
 
@@ -8404,3 +8429,24 @@ Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.
   from its origin snapshot, recovered by `Volume::clone_from_image` over the recovered origin — rebuilt copies had
   leaked every unchanged record at the clone's destroy. Image version 13. The allocator's deferral costs an
   allocator nothing publishes from one flag test (`d256cde`: CI's instruction-count gate had seen +1.7%).
+
+### A-65 — An observation's budget is counted in the observed shard's own time (2026-10-03)
+Applied in the same change to: §4.14 (observation status), §4.2 (lock-on-fault status), GAPS (2026-10-03 entry),
+BENCHMARKS (the shard-local allocator, measured and not landed).
+Status: built 2026-10-03.
+- Why: one absolute wall budget across submission, admission and execution ended observations of shards that were
+  working but starved on a loaded host. In a Linux container beside 108 burners, 7–13 per run ended `Deadline`
+  against runnable (state R) shards, which read as daemon startup timeouts.
+- The rule: the budget is the observed shard's CPU time. At a wall deadline the observation goes on only if the
+  shard ran on the CPU during the window just ended, and only for the part of the budget it has not yet run, as wall
+  time. A shard that consumed no CPU in a window ends the observation: it is blocked, and waiting longer cannot help.
+  A shard that has run the whole budget without answering ends it too.
+- The clock: each shard records its thread's CPU clock on its registry entry as it starts. An observer reads it from
+  any thread. The reading is pinned to the registration, so a reused slot answers `None`. Linux uses
+  `pthread_getcpuclockid` with `clock_gettime`, macOS the thread's Mach port with `thread_info`. Windows records the
+  thread id and opens the thread for each read with query rights only: `QueryThreadCycleTime` (exact) tells whether
+  it ran, and `GetThreadTimes` (charged a scheduler tick at a time) what it spent. Only Miri has no clock.
+- Evidence: `crates/server/tests/observe.rs` (a starved shard answered past the wall budget, red before; a wedged one
+  still ends in one budget); 7–13 `Deadline` per loaded run → 1–2. The remaining ones were all blocked shards (CPU
+  frozen for the whole 10 s), traced to the arena lock's page population and fixed in the same change.
+

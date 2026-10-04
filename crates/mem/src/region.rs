@@ -241,7 +241,7 @@ mod os {
   use memmap2::MmapMut;
 
   pub(super) fn lock(map: &mut MmapMut) -> Result<(), MemError> {
-    map.lock().map_err(|e| MemError::LockRefused {
+    lock_map(map).map_err(|e| MemError::LockRefused {
       requested: map.len(),
       locked: 0,
       code: e.raw_os_error(),
@@ -251,7 +251,39 @@ mod os {
   pub(super) fn unlock(map: &mut MmapMut) {
     let _ = map.unlock();
   }
+
+  /// Locks `map` against swapping, each page as it is first touched (Linux `mlock2(MLOCK_ONFAULT)`, 4.4+). A
+  /// plain `mlock` faults in the whole range before it returns while holding the process's memory-map lock, so
+  /// every other thread's `mmap`, `munmap` and `mprotect` waits for it: locking one shard's arena stalled every
+  /// shard of the daemon at boot for seconds under CPU load (measured 2026-10-03, Linux container, 108 burners
+  /// on 18 cores: one shard in `mlock` → `__mm_populate`, the other seventeen in state D in `mmap`/`munmap`;
+  /// `docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md`). On fault, the call
+  /// holds the lock only to mark the mapping and charges `RLIMIT_MEMLOCK` for the whole range as before, so the
+  /// guarantee (no locked page ever swaps) and the refusal are unchanged; an untouched page holds no content.
+  /// A kernel without the flag refuses (`EINVAL`), typed by the caller.
+  #[cfg(target_os = "linux")]
+  pub(crate) fn lock_map(map: &mut MmapMut) -> std::io::Result<()> {
+    // SAFETY: the range is exactly `map`'s own live mapping, borrowed mutably for the call; locking changes no
+    // byte of it and no other mapping.
+    unsafe {
+      rustix::mm::mlock_with(
+        map.as_mut_ptr().cast(),
+        map.len(),
+        rustix::mm::MlockFlags::ONFAULT,
+      )
+    }
+    .map_err(std::io::Error::from)
+  }
+
+  /// Locks `map` against swapping. macOS has no on-fault lock: `mlock` wires the range whole.
+  #[cfg(not(target_os = "linux"))]
+  pub(crate) fn lock_map(map: &mut MmapMut) -> std::io::Result<()> {
+    map.lock()
+  }
 }
+
+#[cfg(unix)]
+pub(crate) use os::lock_map;
 
 #[cfg(windows)]
 mod os {

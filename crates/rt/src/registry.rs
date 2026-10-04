@@ -86,6 +86,9 @@ pub struct Entry {
   pub pair_rings: Vec<Box<slates_mem::SpscRing>>,
   /// How many times a producer found the ring full and had to spin (a tripwire, GAPS §7).
   pub ring_full_events: AtomicU64,
+  /// The shard thread's CPU-clock handle, recorded as it starts (zero until then, and where the platform has none):
+  /// what an observer reads to count its budget in the shard's own time ([`shard_cpu`]).
+  pub cpu_clock: AtomicU64,
   /// The shard's parking announcement and the kicks it saved: a sender kicks only a parked
   /// shard, so a message to a spinning shard costs no syscall (§4.7 "Wake strategy"; the
   /// protocol and its loom model live in [`crate::parking`]).
@@ -378,6 +381,7 @@ pub(crate) fn register_slot(
       sim_shared: None,
       pair_rings: Vec::new(),
       ring_full_events: AtomicU64::new(0),
+      cpu_clock: AtomicU64::new(0),
       parking: Parking::new(),
       pulse: Pulse::default(),
       exited: AtomicBool::new(false),
@@ -524,6 +528,27 @@ pub fn with_entry<R>(shard: u16, f: impl FnOnce(&Entry) -> R) -> Option<R> {
   fence(Ordering::SeqCst);
   let _reader = Reader(&slot.readers);
   read_counted(slot, f)
+}
+
+/// Records the calling thread's CPU clock on shard `shard`'s entry (the shard's own thread, as it starts).
+pub fn record_cpu_clock(shard: u16) {
+  if let Some(handle) = crate::thread_clock::current() {
+    let _ = with_entry(shard, |entry| {
+      entry.cpu_clock.store(handle, Ordering::Release)
+    });
+  }
+}
+
+/// The CPU clock of the shard `holder` names: `None` when that registration no longer holds its slot, its thread
+/// recorded no clock, or the platform has none. An observer reads it to tell a starved shard, still consuming CPU, from
+/// a wedged one (§4.14).
+pub fn shard_cpu(holder: SlotHolder) -> Option<crate::thread_clock::CpuReading> {
+  with_entry(holder.shard, |entry| {
+    (entry.holder() == holder).then(|| entry.cpu_clock.load(Ordering::Acquire))
+  })
+  .flatten()
+  .filter(|handle| *handle != 0)
+  .and_then(crate::thread_clock::read)
 }
 
 /// Release the reader pin even when a test callback unwinds.

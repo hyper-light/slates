@@ -817,7 +817,7 @@ mod platform {
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
-      self.map.lock().map_err(|e| MemError::OsRefused {
+      crate::region::lock_map(&mut self.map).map_err(|e| MemError::OsRefused {
         call: "mlock",
         code: e.raw_os_error(),
       })

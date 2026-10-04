@@ -29,6 +29,10 @@
 #   `SEC_RESERVE` section — CI run 36202635768's 167 GB layout refused 1450 on a 16 GB runner):
 #   `GetSystemInfo` for the commit granule (1), `VirtualAlloc(MEM_COMMIT)` of a range (1), and the
 #   two committed-range views (2).
+#   Lock on fault (`region.rs` `lock_map`, 2026-10-03, D-12): one `rustix::mm::mlock_with(ONFAULT)` over a map's
+#   own live range (1, Linux only) — memmap2's safe `lock` is a plain `mlock`, which faults the whole range in under
+#   the process's memory-map lock and stalled every shard behind one strict volume's arena lock
+#   (docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md). 23 → 24.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -71,6 +75,13 @@
 #   `io_uring_enter(GETEVENTS, min_complete = 0)` with no argument pointer — the crate's safe helpers set
 #   GETEVENTS only when waiting for a completion, and a zero-timeout wait for one slept the shard
 #   0.3–1.0 ms per harvest (docs/bugs/2026-09-26-io-uring-zero-timeout-harvest-sleeps.md). 59 of 59.
+#   A shard's CPU clock read from another thread (`thread_clock.rs`, 2026-10-03, §4.14): Linux
+#   `pthread_getcpuclockid` of the calling thread and `clock_gettime` of that clock (2), macOS `mach_thread_self`, a
+#   zeroed `thread_basic_info` and `thread_info` (3); rustix wraps neither a thread's CPU clock id nor Mach. Windows
+#   `GetCurrentThreadId`, `OpenThread` with query rights, `GetThreadTimes`, `QueryThreadCycleTime` and the handle's
+#   `CloseHandle` (5), Win32 without a safe wrapper. An observation counts its budget in the observed shard's own time,
+#   so a starved shard is not read as wedged (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
+#   63 → 73.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -163,7 +174,7 @@ slates-machine = 50
 #   the constructor that carries the same single-accessor promise for one shard's arena range of the content
 #   object. Its maps reuse the existing `mmap` and `MapViewOfFile` sites (now taking an offset) and the sparse
 #   section's commit, so no new block.
-slates-mem = 23
+slates-mem = 24
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous
@@ -194,7 +205,7 @@ slates-mem = 23
 # `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
 # freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
 # context its own `Drop` frees.
-slates-rt = 63
+slates-rt = 73
 slates-base = 10
 slates-vfs = 0
 slates-land = 3
