@@ -7121,30 +7121,46 @@ fn content_range(start: usize, slice_len: usize, offset: usize, len: usize) -> O
 /// held replicas' image the same shard image carries (AUD-29-59). A torn or malformed image logs and yields
 /// nothing for that shard (each volume then refuses as unrecoverable rather than presenting empty),
 /// matching §4.8's "never an empty success".
-fn recover_images(state: &ShardState) -> RecoveredImages {
+fn recover_images(state: &mut ShardState) -> RecoveredImages {
   let (start, end) = state.content_range;
+  let (delta_start, delta_end) = state.delta_range;
   let Some(object) = &state.content else {
     return RecoveredImages::default();
   };
   if end <= start || end > object.len() {
     return RecoveredImages::default();
   }
-  let view = ContentView {
+  let checkpoints = ContentView {
     object,
     start,
     len: end - start,
   };
-  match ShardImage::read_from(&view) {
-    Ok(Some(shard)) => RecoveredImages {
-      volumes: shard
-        .volumes
-        .into_iter()
-        .map(|keyed| (keyed.key, keyed.image))
-        .collect(),
-      held: shard.held,
-      replies: shard.replies,
+  // The delta log beside the checkpoints (A-68); an absent one (an object laid out without it) is empty.
+  let log = ContentView {
+    object,
+    start: delta_start,
+    len: if delta_end > delta_start && delta_end <= object.len() {
+      delta_end - delta_start
+    } else {
+      0
     },
-    Ok(None) => RecoveredImages::default(),
+  };
+  match slates_vfs::checkpoint_log::Journal::recover(&checkpoints, &log) {
+    Ok((Some(shard), journal)) => {
+      state.journal = journal;
+      state.published_keys = shard.volumes.iter().map(|keyed| keyed.key).collect();
+      state.published_held.clone_from(&shard.held);
+      RecoveredImages {
+        volumes: shard
+          .volumes
+          .into_iter()
+          .map(|keyed| (keyed.key, keyed.image))
+          .collect(),
+        held: shard.held,
+        replies: shard.replies,
+      }
+    }
+    Ok((None, _)) => RecoveredImages::default(),
     Err(e) => {
       eprintln!(
         "slates-server: partition {}: shard image unreadable: {e}",
@@ -7221,72 +7237,114 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   outcome
 }
 
-/// The body of [`publish_shard`] once its capture is taken: images every volume, adds the held replicas and the
-/// barrier replies, and writes the frame into the free slot.
+/// The body of [`publish_shard`] once its capture is taken: a delta of what changed since the last publication,
+/// appended to the shard's journal (A-68), or — at the first publication, once the deltas since the last checkpoint
+/// reach its size, or when the delta does not fit the log — a checkpoint of every volume. A barrier's cost is its
+/// changes, not the shard: re-imaging every inode of every volume at each barrier made a workload's total grow with
+/// its square (2026-10-04: 2,000 creates took 4.9 s into an empty volume and 50.2 s into one of 12,000 files).
 fn publish_captured(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  if !state.journal.wants_checkpoint() {
+    match publish_delta(state) {
+      Ok(published) => return Ok(published),
+      // The log has no room for this delta: a checkpoint takes its place (and restarts the log).
+      Err(slates_vfs::VfsError::NoSpace) => {}
+      Err(e) => return Err(publish_refused(state, e)),
+    }
+  }
+  publish_checkpoint(state)
+}
+
+/// Counts and logs a refused publication, returning its refusal.
+fn publish_refused(state: &ShardState, e: slates_vfs::VfsError) -> slates_vfs::VfsError {
+  crate::daemon::PUBLISH_REFUSED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+  eprintln!(
+    "slates-server: partition {}: shard image not published: {e}",
+    state.partition
+  );
+  e
+}
+
+/// Counts a volume a publication could not record, logging the first on this shard.
+fn count_skipped(state: &mut ShardState, id: DbVolumeId, e: &slates_vfs::VfsError) {
+  // Counted every time on this shard and logged once per shard, naming the volume: the publish runs inside every
+  // mutating verb, so a line per volume per publish was an unbounded log on a verb's latency path.
+  let skipped = state
+    .refusals
+    .entry(crate::daemon::PUBLISH_VOLUME_SKIPPED)
+    .or_insert(0);
+  *skipped = skipped.saturating_add(1);
+  if *skipped == 1 {
+    let volume: String = id.bytes.iter().map(|b| format!("{b:02x}")).collect();
+    eprintln!(
+      "slates-server: partition {}: volume {volume} was not imaged, skipped: {e} (first on this shard; later \
+       ones are counted as {})",
+      state.partition,
+      crate::daemon::PUBLISH_VOLUME_SKIPPED
+    );
+  }
+}
+
+/// Whether a volume's slot is being destroyed: it carries nothing to recover, and its destroy slices release its
+/// tree as they go — imaging it walked released nodes (ESTALE), counted a false skip and printed a line on every
+/// publish while a destroy ran, 31,378 in one provisioning histogram
+/// (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md).
+fn being_destroyed(volume: &slates_vfs::volume::Volume) -> bool {
+  matches!(
+    volume.state(),
+    slates_vfs::volume::VolumeState::Destroying | slates_vfs::volume::VolumeState::Destroyed
+  )
+}
+
+/// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
+fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
+  #[cfg(target_os = "linux")]
+  return state.pending_replies.values().cloned().collect();
+  #[cfg(not(target_os = "linux"))]
+  {
+    let _ = state;
+    Vec::new()
+  }
+}
+
+/// A checkpoint of every volume into the free slot (§4.8): the whole shard, as every publication was before A-68.
+fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
   let (start, end) = state.content_range;
   let mut keyed = Vec::new();
   let mut published = Published::default();
   let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
-  for handle in handles {
-    let slot = state.volumes.get_mut(handle)?;
-    // A volume being destroyed carries nothing to recover, and its destroy slices release its tree as
-    // they go: imaging it walked released nodes (ESTALE), counted a false skip and printed a line on
-    // every publish while a destroy ran — 31,378 in one provisioning histogram, each inside a verb
-    // (docs/bugs/2026-09-29-a-destroy-on-a-shard-without-a-client-never-completed.md).
-    if matches!(
-      slot.volume.state(),
-      slates_vfs::volume::VolumeState::Destroying | slates_vfs::volume::VolumeState::Destroyed
-    ) {
+  for handle in &handles {
+    let slot = state.volumes.get_mut(*handle)?;
+    if being_destroyed(&slot.volume) {
       published.destroying.push(slot.id);
       continue;
     }
+    let id = slot.id;
     match slot.volume.to_image(
       &state.store,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
     ) {
       Ok(image) => {
-        published.volumes.push(slot.id);
+        published.volumes.push(id);
         keyed.push(KeyedImage {
-          key: slot.id.bytes,
+          key: id.bytes,
           image,
         });
       }
-      // Publish unaffected volumes even when another cannot be captured. Callers must check the
-      // touched volume against the returned coverage; an omitted volume never receives a stable
-      // acknowledgement, and recovery refuses it instead of rebuilding empty (§4.8, AUD-05).
+      // Publish unaffected volumes even when another cannot be captured. Callers must check the touched volume
+      // against the returned coverage; an omitted volume never receives a stable acknowledgement, and recovery
+      // refuses it instead of rebuilding empty (§4.8, AUD-05).
       Err(e) => {
-        // Counted every time on this shard and logged once per shard, naming the volume: the publish runs
-        // inside every mutating verb, so a line per volume per publish was an unbounded log on a verb's
-        // latency path.
-        let skipped = state
-          .refusals
-          .entry(crate::daemon::PUBLISH_VOLUME_SKIPPED)
-          .or_insert(0);
-        *skipped = skipped.saturating_add(1);
-        if *skipped == 1 {
-          let volume: String = slot.id.bytes.iter().map(|b| format!("{b:02x}")).collect();
-          eprintln!(
-            "slates-server: partition {}: volume {volume} was not imaged, skipped: {e} (first on this \
-             shard; later ones are counted as {})",
-            state.partition,
-            crate::daemon::PUBLISH_VOLUME_SKIPPED
-          );
-        }
-        published.skipped.push(slot.id);
+        count_skipped(state, id, &e);
+        published.skipped.push(id);
       }
     }
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  // The barrier replies not yet delivered ride with the effects they answer (A-61).
-  #[cfg(target_os = "linux")]
-  let replies = state.pending_replies.values().cloned().collect();
-  #[cfg(not(target_os = "linux"))]
-  let replies = Vec::new();
+  let held = state.held_content.to_image();
   let shard = ShardImage::new(keyed)
-    .with_held(state.held_content.to_image())
-    .with_replies(replies);
+    .with_held(held.clone())
+    .with_replies(pending_replies(state));
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };
@@ -7298,25 +7356,120 @@ fn publish_captured(state: &mut ShardState) -> Result<Published, slates_vfs::Vfs
     start,
     len: end - start,
   };
-  match shard.write_after(&mut slots, state.committed_slot) {
-    Ok((frame_bytes, committed)) => {
-      published.frame_bytes = frame_bytes;
-      state.committed_slot = Some(committed);
-      // Every volume captured: this image holds every logged write, so the write log empties, stamped with
-      // this generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
-      #[cfg(target_os = "linux")]
-      clear_write_log(state, published.skipped.is_empty(), committed.generation);
-      Ok(published)
-    }
-    Err(e) => {
-      crate::daemon::PUBLISH_REFUSED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-      eprintln!(
-        "slates-server: partition {}: shard image not published: {e}",
-        state.partition
-      );
-      Err(e)
+  let frame_bytes = state
+    .journal
+    .checkpoint(&mut slots, &shard)
+    .map_err(|e| publish_refused(state, e))?;
+  published.frame_bytes = frame_bytes;
+  for handle in handles {
+    if let Ok(slot) = state.volumes.get_mut(handle) {
+      if published.volumes.contains(&slot.id) {
+        slot.volume.mark_published(&state.store);
+      } else {
+        slot.volume.mark_unpublished();
+      }
     }
   }
+  state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
+  state.published_held = held;
+  // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
+  // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
+  #[cfg(target_os = "linux")]
+  clear_write_log(
+    state,
+    published.skipped.is_empty(),
+    state.journal.generation(),
+  );
+  Ok(published)
+}
+
+/// A delta of what changed since the last publication, appended to the shard's delta log (A-68): each changed
+/// volume's record (a delta, or its full image when it has none), the volumes gone, the held replicas when they
+/// changed, and the undelivered replies. Refuses `NoSpace` when the log cannot take it, changing nothing.
+fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  let mut records = Vec::new();
+  let mut recorded = Vec::new();
+  let mut present = std::collections::BTreeSet::new();
+  let mut published = Published::default();
+  let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
+  for handle in &handles {
+    let slot = state.volumes.get_mut(*handle)?;
+    let id = slot.id;
+    if being_destroyed(&slot.volume) {
+      published.destroying.push(id);
+      continue;
+    }
+    if slot.volume.is_clean(&state.store) {
+      present.insert(id.bytes);
+      published.volumes.push(id);
+      continue;
+    }
+    match slot.volume.publication(
+      &state.store,
+      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+    ) {
+      Ok(record) => {
+        present.insert(id.bytes);
+        published.volumes.push(id);
+        recorded.push(*handle);
+        records.push(slates_vfs::checkpoint_log::KeyedRecord {
+          key: id.bytes,
+          record,
+        });
+      }
+      Err(e) => {
+        count_skipped(state, id, &e);
+        published.skipped.push(id);
+        // A skipped volume keeps its committed record, so it stays present.
+        if state.published_keys.contains(&id.bytes) {
+          present.insert(id.bytes);
+        }
+      }
+    }
+  }
+  let removed: Vec<[u8; 16]> = state
+    .published_keys
+    .iter()
+    .filter(|key| !present.contains(*key))
+    .copied()
+    .collect();
+  let held = state.held_content.to_image();
+  let held_changed = held != state.published_held;
+  let delta = slates_vfs::checkpoint_log::ShardDelta::new(
+    records,
+    removed,
+    held_changed.then(|| held.clone()),
+    Some(pending_replies(state)),
+  );
+  let (start, end) = state.delta_range;
+  let Some(object) = state.content.as_mut() else {
+    return Err(slates_vfs::VfsError::RecoveryIncomplete);
+  };
+  if end <= start || end > object.len() {
+    return Err(slates_vfs::VfsError::NoSpace);
+  }
+  let mut log = ContentSlots {
+    object,
+    start,
+    len: end - start,
+  };
+  published.frame_bytes = state.journal.append(&mut log, &delta)?;
+  for handle in recorded {
+    if let Ok(slot) = state.volumes.get_mut(handle) {
+      slot.volume.mark_published(&state.store);
+    }
+  }
+  state.published_keys = present;
+  if held_changed {
+    state.published_held = held;
+  }
+  #[cfg(target_os = "linux")]
+  clear_write_log(
+    state,
+    published.skipped.is_empty(),
+    state.journal.generation(),
+  );
+  Ok(published)
 }
 
 /// Format: the status counter of publications run to release blocks whose frees waited on one (A-64).
@@ -7720,7 +7873,7 @@ fn replay_one(
 /// (A-63: the next daemon reports every taken-over file as having lost writes).
 #[cfg(target_os = "linux")]
 fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record]) {
-  let generation = state.committed_slot.map_or(0, |slot| slot.generation);
+  let generation = state.journal.generation();
   let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
     return;
   };

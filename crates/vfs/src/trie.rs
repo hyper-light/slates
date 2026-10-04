@@ -258,11 +258,18 @@ pub fn walk_since(
     if since.is_some_and(|s| n.born.0 <= s.0) {
       continue;
     }
+    // Children are pushed in reverse so they pop in ascending order; a leaf's inodes are emitted in slot order.
+    // Together the walk yields inodes in ascending number order, the order a recovery image is documented to
+    // hold (`VolumeImage`) and an applied delta keeps (A-68). Until 2026-10-04 a leaf's inodes came out in
+    // reverse, so an image ran ascending across leaves and descending within each.
     for slot in n.slots.iter().rev() {
-      match slot {
-        Slot::Node(child) => stack.push(*child),
-        Slot::Inode(h) => out.push(*h),
-        Slot::Empty => {}
+      if let Slot::Node(child) = slot {
+        stack.push(*child);
+      }
+    }
+    for slot in &n.slots {
+      if let Slot::Inode(h) = slot {
+        out.push(*h);
       }
     }
   }

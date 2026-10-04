@@ -884,9 +884,41 @@ fn with_dir(
   op(vol, store, dir)
 }
 
+/// A-68's oracle, after every step: the volume's publication — its full image, or a delta over the last one
+/// published — applied to what was published must equal the volume's full image now. Returns whether this step's
+/// publication was a delta (the count a test asserts moved, so a dead delta path cannot pass as a full-image one).
+fn check_publication(
+  vol: &mut Volume,
+  store: &Store,
+  published: &mut Option<slates_vfs::recover::VolumeImage>,
+  step: &Step,
+) -> bool {
+  let publication = vol.publication(store, None).unwrap();
+  let delta = matches!(publication, slates_vfs::delta::VolumeRecord::Delta { .. });
+  match publication {
+    slates_vfs::delta::VolumeRecord::Full { image } => *published = Some(image),
+    slates_vfs::delta::VolumeRecord::Delta { delta } => published
+      .as_mut()
+      .expect("a delta follows a published image")
+      .apply(&delta)
+      .unwrap(),
+  }
+  assert_eq!(
+    published.as_ref(),
+    Some(&vol.to_image(store, None).unwrap()),
+    "the published image after {step:?}"
+  );
+  vol.mark_published(store);
+  delta
+}
+
+/// The deltas the model runs took (A-68's non-vacuity count).
+static DELTAS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn run(steps: Vec<Step>, quota: u64) {
   let mut store = store();
   let mut vol = volume(&mut store, quota);
+  let mut published = None;
   let mut model = Model::new(
     quota,
     u64::try_from(store.content.chunk_bytes()).unwrap(),
@@ -916,7 +948,38 @@ fn run(steps: Vec<Step>, quota: u64) {
       model.unique(),
       "unique after {step:?}"
     );
+    if check_publication(&mut vol, &store, &mut published, &step) {
+      DELTAS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
   }
+}
+
+/// A-68 (incremental publication): do run a fixed history of creates, writes, renames, links, unlinks and removals
+/// on a folding volume, checking every step's publication against the full image; expect deltas taken (not a full
+/// image every time) and every one to agree.
+#[test]
+fn a_volume_publishes_deltas_that_rebuild_its_full_image() {
+  let name = |n: &str| n.to_owned();
+  let steps = vec![
+    Step::Mkdir(vec![], name("a")),
+    Step::Create(vec![name("a")], name("b")),
+    Step::Write(0, 0, b"hello".to_vec()),
+    Step::Create(vec![], name("C")),
+    Step::Rename(vec![], name("C"), vec![name("a")], name("d")),
+    Step::Link(vec![name("a")], name("e"), 0),
+    Step::Unlink(vec![name("A")], name("B")),
+    Step::Write(1, 100, b"later bytes".to_vec()),
+    Step::Rename(vec![name("a")], name("d"), vec![name("a")], name("D")),
+    Step::Unlink(vec![name("a")], name("e")),
+    Step::Rmdir(vec![], name("a")),
+  ];
+  let before = DELTAS_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+  run(steps, 1 << 20);
+  let taken = DELTAS_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - before;
+  assert!(
+    taken >= 5,
+    "the history published deltas, not full images ({taken})"
+  );
 }
 
 proptest! {

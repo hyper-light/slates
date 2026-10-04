@@ -152,10 +152,16 @@ pub struct ShardState {
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
-  /// Which image slot of `content_range` holds the committed image, as this shard's last publish left it (§4.8):
-  /// learned by the first publish from both slots' CRCs and kept, so each later publish writes its frame in one pass.
-  /// Only this shard publishes into its range.
-  pub committed_slot: Option<slates_vfs::recover::CommittedSlot>,
+  /// The half-open byte range `[start, end)` of `content` holding this shard's delta log (A-68), beside the two
+  /// checkpoint slots of `content_range`; `0..0` when there is no content object.
+  pub delta_range: (usize, usize),
+  /// This shard's recovery journal (A-68; `slates_vfs::checkpoint_log`): the committed checkpoint, the log's tail
+  /// and what has been logged since. Only this shard publishes into its ranges.
+  pub journal: slates_vfs::checkpoint_log::Journal,
+  /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
+  pub published_keys: std::collections::BTreeSet<[u8; 16]>,
+  /// The held replicas' image the committed journal holds, so a delta carries it only when it changed (A-68).
+  pub published_held: Vec<u8>,
   /// The FUSE writes acknowledged since the last complete publication, kept whole in the region before
   /// `content_range` in the anchor's content object (A-63; `crate::write_log`); `None` without a content object.
   /// Linux only: the log serves a FUSE mount taken over across a restart (an NFS client resends what a restart lost

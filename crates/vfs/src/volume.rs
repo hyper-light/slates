@@ -283,6 +283,9 @@ pub struct Volume {
   /// its content (§4.2: charged when the name went, because the last close cannot refuse; consumed
   /// at the reclaim, any surplus returned then). Bounded by open-unlinked files.
   pub(crate) orphans: BTreeMap<InodeNo, u64>,
+  /// What changed since this volume was last published (A-68): the inodes and directory entries a barrier's delta
+  /// carries (`crate::recover`), cleared once the publication commits.
+  pub(crate) dirty: crate::delta::Dirty,
   /// Live logical inodes the head reaches (§4.2 resource vector, the inode dimension): incremented
   /// as a number is issued, decremented as one is reclaimed. Bounds "arbitrarily many empty files",
   /// which the byte quota cannot.
@@ -505,6 +508,7 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       orphans: BTreeMap::new(),
+      dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
       live_entries: 0,
@@ -572,6 +576,7 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       orphans: BTreeMap::new(),
+      dirty: crate::delta::Dirty::default(),
       live_inodes: origin.live_inodes,
       inode_allowance: u64::MAX,
       live_entries: origin.live_entries,
@@ -659,6 +664,7 @@ impl Volume {
       attachment_opens: BTreeMap::new(),
       opens: BTreeMap::new(),
       orphans: BTreeMap::new(),
+      dirty: crate::delta::Dirty::default(),
       live_inodes: 1,
       inode_allowance: u64::MAX,
       live_entries: 0,
@@ -3687,6 +3693,7 @@ impl Volume {
       &mut scratch,
     )?;
     self.inode_root = root;
+    self.dirty.inode(no.0);
     for d in scratch.take() {
       self.retire(store, d)?;
     }
@@ -3707,6 +3714,7 @@ impl Volume {
       &mut scratch,
     )?;
     self.inode_root = root;
+    self.dirty.inode(no.0);
     for d in scratch.take() {
       self.retire(store, d)?;
     }
@@ -3724,6 +3732,9 @@ impl Volume {
       let inode = store.inodes.get(handle)?;
       (inode.born, inode.kind)
     };
+    // Every mutation makes its inode current first (a snapshot's version is never written in place), so this
+    // is where a change is recorded for the next delta (A-68).
+    self.dirty.inode(no.0);
     if born == self.epoch {
       return Ok(handle);
     }
@@ -3944,6 +3955,7 @@ impl Volume {
     let policy = self.policy;
     let mut retired = Retired::new();
     let node = store.dirs.get_mut(dir)?;
+    self.dirty.entry(node.inode.0, name);
     let over_whiteout = node
       .lookup(&store.blocks, policy, name)
       .is_some_and(|e| e.child == Child::Whiteout);
@@ -3982,6 +3994,7 @@ impl Volume {
     let (cutover, epoch, policy) = (store.dir_cutover, self.epoch, self.policy);
     let mut retired = Retired::new();
     let node = store.dirs.get_mut(dir)?;
+    self.dirty.entry(node.inode.0, name);
     let undone = if over_whiteout {
       node
         .set_child(
@@ -4022,14 +4035,9 @@ impl Volume {
   ) -> Result<(), VfsError> {
     let (epoch, policy) = (self.epoch, self.policy);
     let mut retired = Retired::new();
-    let set = store.dirs.get_mut(dir)?.set_child(
-      &mut store.blocks,
-      epoch,
-      &mut retired,
-      policy,
-      name,
-      child,
-    );
+    let node = store.dirs.get_mut(dir)?;
+    self.dirty.entry(node.inode.0, name);
+    let set = node.set_child(&mut store.blocks, epoch, &mut retired, policy, name, child);
     self.retire_blocks(store, retired)?;
     if set? {
       Ok(())
@@ -4048,7 +4056,10 @@ impl Volume {
   ) -> Result<(), VfsError> {
     let (cutover, epoch, policy) = (store.dir_cutover, self.epoch, self.policy);
     let mut retired = Retired::new();
-    let respelled = store.dirs.get_mut(dir)?.respell(
+    let node = store.dirs.get_mut(dir)?;
+    self.dirty.entry(node.inode.0, old);
+    self.dirty.entry(node.inode.0, new);
+    let respelled = node.respell(
       &mut store.blocks,
       epoch,
       &mut retired,
@@ -4192,6 +4203,7 @@ impl Volume {
     let mut retired = Retired::new();
     let node = store.dirs.get_mut(dir)?;
     let dir_no = node.inode;
+    self.dirty.entry(dir_no.0, name);
     let in_base = node.base == BaseDirState::Merged && self.base_listing_has(dir_no, name);
     let node = store.dirs.get_mut(dir)?;
     let removed = if !in_base {

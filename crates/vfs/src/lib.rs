@@ -25,9 +25,11 @@
 
 pub mod algebra;
 pub mod base;
+pub mod checkpoint_log;
 pub mod clock;
 pub mod content;
 pub mod coverage;
+pub mod delta;
 pub mod derive;
 pub mod dir;
 pub mod dirtree;

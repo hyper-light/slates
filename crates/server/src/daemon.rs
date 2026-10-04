@@ -2390,6 +2390,20 @@ fn slice_start(config: &DaemonConfig, partition: u16) -> usize {
   usize::from(partition).saturating_mul(config.shard_content_layout().stride)
 }
 
+/// This shard's delta log range (A-68), beside its checkpoint slots: `(0, 0)` when the slots have none (no object, or
+/// one too small for the layout).
+fn delta_range(config: &DaemonConfig, partition: u16, images: (usize, usize)) -> (usize, usize) {
+  if images.1 <= images.0 {
+    return (0, 0);
+  }
+  let layout = config.shard_content_layout();
+  let start = slice_start(config, partition);
+  (
+    start.saturating_add(layout.delta_log.0),
+    start.saturating_add(layout.delta_log.1),
+  )
+}
+
 /// This shard's range of the content object for its recovery images (§4.8), `(0, 0)` without an object or with
 /// one too small for the layout.
 fn image_range(
@@ -2440,13 +2454,21 @@ fn content_slice(
   let layout = config.shard_content_layout();
   let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
   let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
-  let generation =
-    slates_vfs::recover::ShardImage::committed_generation(&crate::verbs::ContentView {
+  // The journal's generation — the checkpoint's advanced over its committed deltas (A-68) — since a write logged
+  // after a delta is not yet in any image.
+  let deltas = delta_range(config, partition, images);
+  let generation = slates_vfs::checkpoint_log::committed_generation(
+    &crate::verbs::ContentView {
       object,
       start: images.0,
       len: images.1.saturating_sub(images.0),
-    })
-    .unwrap_or(0);
+    },
+    &crate::verbs::ContentView {
+      object,
+      start: deltas.0,
+      len: deltas.1.saturating_sub(deltas.0),
+    },
+  );
   match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
     Some((log, recovered)) => (images, Some(log), recovered),
     None => (images, None, crate::write_log::Recovered::default()),
@@ -2641,7 +2663,10 @@ fn init_shard(
     issuer_secret,
     content,
     content_range,
-    committed_slot: None,
+    delta_range: delta_range(config, partition, content_range),
+    journal: slates_vfs::checkpoint_log::Journal::default(),
+    published_keys: std::collections::BTreeSet::new(),
+    published_held: Vec::new(),
     #[cfg(target_os = "linux")]
     write_log,
     #[cfg(target_os = "linux")]

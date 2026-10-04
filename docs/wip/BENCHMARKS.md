@@ -1550,3 +1550,27 @@ The daemon's long serves are preemption, not work: the CPU a serve takes is a fe
 re-measured on this metric and rejected again** (three interleaved pairs at load 1, off-core p99 / p999 / max):
 - none: 106 µs / 655 µs / 42 ms; 20 µs / 295 µs / 26 ms; 74 µs / 786 µs / 73 ms;
 - `QOS_CLASS_USER_INTERACTIVE`: 115 µs / 983 µs / 66 ms; 27 µs / 328 µs / 35 ms; 90 µs / 655 µs / 120 ms.
+
+### A barrier publishes what changed (A-68, 2026-10-04)
+
+**Command:** `bash e2e-host.sh 4` (a scratch script kept with this record's session): one anchor and `--shards 4`,
+one bounded 2 GiB volume mounted by `slates mount`, four rounds into the same growing volume. Each round creates 2,000
+small files with the shell, tars them onto the mount, and untars the archive into a new directory. Apple M5 Max, 18
+cores, load average 2–6.
+
+| round | create 2,000, before → after | untar, before → after |
+|---|---|---|
+| 1 | 4.9 → 1.07 s | 61 → 5.3 s |
+| 2 | 17.6 → 1.03 s | 132 → 5.3 s |
+| 3 | 34.9 → 1.12 s | 234 → 5.4 s |
+| 4 | 50.2 → 1.32 s | 331 → 5.3 s |
+
+The tar step's time varies from run to run on both binaries (1.7–16 s on the new one, 2.0–3.8 s on the old). A
+per-call server log over two later rounds settled where the time goes:
+- 306,927 calls in 33.5 s of wall time;
+- the daemon's own service totals 2.93 s (CREATE 35 µs, COMMIT 12 µs, SETATTR 12 µs mean);
+- idle gaps over 10 ms add to 0.86 s;
+- the rest is the macOS kernel client's round trip, about 100 µs a call, times bsdtar's call count: about 150,000
+  per round, most of them AppleDouble sidecars (14,007 CREATEs for 4,000 files) and attribute sets.
+
+Interleaved tar A/B on the identical script, old then new: 2.39 / 1.69 s and 2.41 / 1.88 s.

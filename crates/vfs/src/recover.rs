@@ -801,6 +801,17 @@ pub struct CommittedSlot {
   second: bool,
 }
 
+impl CommittedSlot {
+  /// The same committed slot, with the generation the publisher's last publication reached (a delta logged after
+  /// the checkpoint, A-68), so the next checkpoint's generation is newer than every frame before it.
+  pub(crate) fn advanced_to(self, generation: u64) -> CommittedSlot {
+    CommittedSlot {
+      generation: generation.max(self.generation),
+      ..self
+    }
+  }
+}
+
 /// The committed slot of image memory `slots`, found by checking both slots' CRCs: `None` when neither holds a
 /// committed image (a fresh object, or both torn).
 pub fn committed_slot<S: ImageRead + ?Sized>(slots: &S) -> Option<CommittedSlot> {
@@ -916,7 +927,7 @@ const fn policy_image(policy: NameEquivalence) -> PolicyImage {
 }
 
 /// The image of a quota's parameters (the live pressure source is dropped; see [`QuotaImage`]).
-fn quota_image(quota: &Quota) -> QuotaImage {
+pub(crate) fn quota_image(quota: &Quota) -> QuotaImage {
   match quota {
     Quota::Bounded { limit } => QuotaImage::Bounded { limit: *limit },
     Quota::Dynamic {
@@ -1124,7 +1135,11 @@ impl Volume {
   }
 
   /// The image of one inode, capturing its body faithfully or refusing an un-captured kind.
-  fn image_of_inode(&self, store: &Store, inode: &Inode) -> Result<InodeImage, VfsError> {
+  pub(crate) fn image_of_inode(
+    &self,
+    store: &Store,
+    inode: &Inode,
+  ) -> Result<InodeImage, VfsError> {
     let body = if let Body::Base(base) = &inode.body {
       let pinned = base
         .pinned
@@ -1305,7 +1320,7 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
 }
 
 /// The image reference for a snapshot id.
-const fn snap_ref(id: SnapshotId) -> SnapshotRef {
+pub(crate) const fn snap_ref(id: SnapshotId) -> SnapshotRef {
   SnapshotRef {
     index: id.index,
     generation: id.generation,
@@ -1332,7 +1347,7 @@ const fn kind_from_image(kind: KindImage) -> Kind {
 }
 
 /// The name policy an image policy names.
-const fn policy_from_image(policy: PolicyImage) -> NameEquivalence {
+pub(crate) const fn policy_from_image(policy: PolicyImage) -> NameEquivalence {
   match policy {
     PolicyImage::Exact => NameEquivalence::Exact,
     PolicyImage::Fold => NameEquivalence::Fold,

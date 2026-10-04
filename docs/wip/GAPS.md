@@ -3457,3 +3457,15 @@ through a name).
 
 Still owed for condition 4: the same battery against the base overlay's reads, and against the container and NFS
 paths (names with `/` or NUL, `..` at an export root, a container's own symlinks followed by a host-side tool).
+
+### 2026-10-04: barriers publish deltas (A-68 built); what remains
+
+The quadratic barrier is fixed: create and untar rounds are flat as the volume grows, and the daemon's own service
+is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). Owed:
+- **Snapshot-aware and base-plane deltas.** A volume with snapshots, a clone origin or a base plane still publishes in
+  full at every barrier, so a snapshotted volume's barriers stay linear in its size. `trie::changed` (the
+  copy-on-write diff of two tables) is the likely tool.
+- **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
+  attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.
+- **Daemon memory grows** about 120 MB per round of 4,000 small files (160 → 283 MB in two rounds). Not yet
+  attributed; next.

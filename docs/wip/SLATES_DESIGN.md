@@ -8566,3 +8566,39 @@ Status: H-1 built (the snapshot); H-2 next; H-3 and H-4 wait on hyper-raft's R-3
   H-4 are in `docs/wip/transport-quic.md` §6.
 - R1 holds: hyper-durable's log is given an anchor-RAM store in slates, never files.
 
+
+### A-68 — A barrier publishes what changed: a checkpoint and a delta log (2026-10-04)
+Applied in the same change to: `crates/vfs/src/delta.rs`, `crates/vfs/src/checkpoint_log.rs` (both new),
+`crates/vfs/src/volume.rs` (the change marks), `crates/vfs/src/trie.rs` (walk order), `crates/server/src/verbs.rs`
+(publication and recovery), `crates/server/src/config.rs` (the delta log's region), BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: every barrier (each NFS `COMMIT` and `FILE_SYNC` write, FUSE `fsync`, and the flush every `close` sends)
+  re-imaged every inode of every volume on the shard. Its cost grew with the volume, so a workload's total grew with
+  its square. Measured through a real kernel mount: 2,000 creates took 4.9 s into an empty volume and 50.2 s into
+  one of 12,000 files; untarring 2,000 files took 61 s, then 132, 234 and 331 s as the volume grew. The daemon's
+  profile was `publish_shard` → `to_image` → `image_of_inode`. A-64 had removed the content bytes from the image;
+  the metadata was never diffed.
+- What:
+  - A volume records the inodes and directory entries it changes, at the chokepoints every mutation passes:
+    `make_current_inode` (copy-on-write requires a write to make its inode current first), the inode table's set
+    and remove, and the entry helpers (place, unplace, set, respell, remove).
+  - A barrier appends a delta frame to a log in anchor RAM beside the two checkpoint slots. The frame carries each
+    changed volume's small roots, its changed inodes (a directory's without its entries), its removed numbers and
+    its changed entries by name, plus the volumes gone and the held replicas when they changed.
+  - A checkpoint (the whole shard, as before) is taken at the first publication, when a delta does not fit the
+    log, or when the deltas since the last checkpoint reach its size. A delta is paid once when written and at
+    most once more inside the next checkpoint, so total work stays proportional to the changes.
+  - Recovery replays the committed checkpoint and then every frame that is CRC-valid, names it as base and carries
+    the next generation. `VolumeImage::apply` is pure, so the rebuild (`Volume::from_image`) is unchanged. This is
+    a filesystem intent log's shape: ZFS's ZIL, JBD2, and Rosenblum and Ousterhout's checkpoint plus log.
+- Not yet delta'd: a volume with snapshots, a clone origin or a base plane, or whose shape or roots changed since
+  its last publication, publishes in full. So does a volume whose changes reach its live inode count, where a full
+  image is no larger. Snapshot-aware and base-plane deltas are owed (GAPS).
+- Proven:
+  - the model suite checks every generated step's publication against the full image (400 histories per
+    property, and AC-1.1's 10^6 operations);
+  - `checkpoint_log.rs` tears a delta at every byte and recovers only the state before or after it, and never
+    replays a frame from before a checkpoint;
+  - `recovery.rs`'s crash-at-every-durable-step oracle passes.
+- Found on the way, both fixed: `trie::walk` emitted a leaf's inodes in reverse, so images were not in number order
+  as `VolumeImage` documents; and a case-only rename (respell) was a mutation path no test had marked.

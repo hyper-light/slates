@@ -321,8 +321,10 @@ pub struct ShardContentLayout {
   pub stride: usize,
   /// The FUSE write log, `(start, end)` (A-63).
   pub write_log: (usize, usize),
-  /// The two image slots, `(start, end)` (§4.8).
+  /// The two image slots, `(start, end)` (§4.8): the checkpoints.
   pub images: (usize, usize),
+  /// The delta log, `(start, end)` (A-68): what each barrier appends over the committed checkpoint.
+  pub delta_log: (usize, usize),
   /// The arena range, `(start, len)`, its start on the mapping granule (A-64).
   pub arena: (usize, usize),
 }
@@ -356,7 +358,11 @@ impl DaemonConfig {
       .max(self.page);
     let log = self.write_log_bytes();
     let images_end = reserve.saturating_mul(PUBLISH_SLOTS).saturating_add(log);
-    let arena_start = images_end
+    // Derived (A-68): the delta log holds one reserve, a checkpoint slot's size: the journal checkpoints once the
+    // deltas since the last checkpoint reach that checkpoint's size, which a slot bounds, so a log of one slot's
+    // size is never what forces a checkpoint early. Lazily backed: only the pages a delta reaches cost RAM.
+    let delta_end = images_end.saturating_add(reserve);
+    let arena_start = delta_end
       .checked_next_multiple_of(granule)
       .unwrap_or(usize::MAX);
     let stride = arena_start
@@ -367,6 +373,7 @@ impl DaemonConfig {
       stride,
       write_log: (0, log),
       images: (log, images_end),
+      delta_log: (images_end, delta_end),
       arena: (arena_start, reserve),
     }
   }
