@@ -1440,6 +1440,24 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.refusals.clone())
   }
 
+  /// How long this daemon took to serve each NFS call, from the call read to its reply built, summed over every
+  /// shard (§4.14): calls served on the shard that read them, then calls forwarded to their volume's owner shard.
+  /// What a caller measured beyond these is outside the serve: the kernel client, the socket and the wakes.
+  pub fn nfs_service_times(
+    &self,
+  ) -> Result<(crate::histogram::Quantiles, crate::histogram::Quantiles), ObserveError> {
+    let mut local = crate::histogram::DurationHistogram::default();
+    let mut forwarded = crate::histogram::DurationHistogram::default();
+    for shard in self.shards.iter().copied() {
+      let (shard_local, shard_forwarded) = self.observe(Some(shard), |s| {
+        (s.nfs_service.local.clone(), s.nfs_service.forwarded.clone())
+      })?;
+      local.absorb(&shard_local);
+      forwarded.absorb(&shard_forwarded);
+    }
+    Ok((local.quantiles(), forwarded.quantiles()))
+  }
+
   /// The refusals every shard of this daemon has counted, summed by kind (§4.14). A volume's refusals — a
   /// FUSE or virtio-fs barrier refused, a landing's stages — are counted on the volume's owner shard, which is
   /// the control shard only by chance, so a test asserting one is absent reads them here: through
@@ -2686,6 +2704,7 @@ fn init_shard(
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),
+    nfs_service: crate::nfs::ServiceTimes::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),

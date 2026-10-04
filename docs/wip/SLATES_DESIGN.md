@@ -1820,6 +1820,18 @@ the verdict that every entry beneath still matches its listing fingerprint.
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
 
+> **Connection affinity (2026-10-04, D-7 "bridge queues pinned to the owner").** A loopback NFS connection is
+> accepted on the control shard and moves to its volume's owner shard at its first NFSv3 call there (its
+> descriptor and read state, by move; `crates/server/src/nfs.rs` `migrate`), so a mount is served where its
+> volume lives. Before, every call was forwarded over the bridge queue and back: two cross-shard hops and two
+> thread wakes per RPC, each of which a busy machine delays. Measured with `crates/cli/examples/vfs_tails.rs`
+> through a real kernel mount: all 185,745 calls of a rename loop were forwarded; service p99 went from 115 µs
+> to 29 µs at rest and from 1.18 ms to about 50 µs with a spinner per core. A `MNT` (routed by name), an NFSv4
+> compound (per-shard session state) and a host-root listing are still forwarded. By use:
+> `a_mounts_connection_moves_to_its_volumes_owner_and_is_served_there` (fails with the move disabled: 26 calls
+> forwarded) and `a_connection_alternating_between_volumes_on_two_shards_serves_both`. The caller's tail under
+> load is still 80–400 ms, outside the serve (docs/wip/BENCHMARKS.md "The VFS on a busy machine"; GAPS).
+
 **Special names (A-26).** A bridge may create and report FIFO/socket inodes only with
 their real type. The kernel owns transient communication; unsupported platforms refuse
 typed rather than returning a regular file. Block and character devices remain unsupported;

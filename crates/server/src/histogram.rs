@@ -67,7 +67,48 @@ fn upper_bound(bucket: usize) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// A histogram's published quantiles: what a run or `slates status` reports (§4.14).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Quantiles {
+  /// Values recorded.
+  pub count: u64,
+  /// The median, in nanoseconds (a bucket's upper bound, within an eighth above the exact value).
+  pub p50_ns: u64,
+  /// The 99th percentile, likewise.
+  pub p99_ns: u64,
+  /// The 99.9th percentile, likewise.
+  pub p999_ns: u64,
+  /// The largest value, exactly.
+  pub max_ns: u64,
+}
+
 impl DurationHistogram {
+  /// Adds every value `other` recorded, as if each had been recorded here (shards' histograms summed).
+  pub fn absorb(&mut self, other: &DurationHistogram) {
+    for (count, added) in self.counts.iter_mut().zip(&other.counts) {
+      *count = count.saturating_add(*added);
+    }
+    self.total = self.total.saturating_add(other.total);
+    self.max = self.max.max(other.max);
+  }
+
+  /// The published quantiles.
+  pub fn quantiles(&self) -> Quantiles {
+    /// Format: the published quantiles, in parts per million.
+    const P50: u64 = PPM / 2;
+    /// Format: see [`P50`].
+    const P99: u64 = 990_000;
+    /// Format: see [`P50`].
+    const P999: u64 = 999_000;
+    Quantiles {
+      count: self.total,
+      p50_ns: self.quantile(P50),
+      p99_ns: self.quantile(P99),
+      p999_ns: self.quantile(P999),
+      max_ns: self.max,
+    }
+  }
+
   /// Records one value.
   pub fn record(&mut self, value: u64) {
     if let Some(count) = self.counts.get_mut(bucket_of(value)) {

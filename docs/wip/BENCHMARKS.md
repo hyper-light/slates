@@ -1467,3 +1467,70 @@ Readings:
 - The handshake is 2% faster.
 - The per-connection build is 2 µs slower, paid once per accepted RPC-with-TLS connection (a mount or a reconnect).
 - Jitter entropy would cost every new process 17 ms before its first handshake. The build leaves it out.
+
+### The VFS on a busy machine (2026-10-04)
+
+**Command:** `cargo build --release -p slates-cli --bin slates --example vfs_tails && target/release/examples/vfs_tails`
+(`crates/cli/examples/vfs_tails.rs`). An in-process daemon (5 shards) serves a volume. The real `slates mount`
+mounts it (macOS: `mount(2)` with the root handle, `actimeo=1`). Each operation is a direct syscall sequence on the
+mount, timed per call. The sweep:
+- 0, 1 and 2 background spinner threads per core, each sweeping 32 MiB (twice the largest L2);
+- 1 caller, and 4 callers (one per four cores).
+
+`VFS_TAILS_FOCUS=<seconds>:<load>` loops `rename(2)` alone and prints the daemon's own service times beside the
+caller's (`Daemon::nfs_service_times`).
+
+Machine: Apple M5 Max, 18 cores, 128 GiB. Other sessions kept the load average at 14–97 throughout, so "load 0"
+is not an idle machine. Each figure is one run; all runs are shown.
+
+**What one `rename(2)` costs on the wire.** From `nfsstat -c` deltas over 5,081 renames:
+- 2.0 RENAMEs (the file's, then its AppleDouble `._` sidecar's, which macOS sends itself);
+- 3.0 LOOKUPs and 1.0 GETATTR;
+- 6 RPCs in all.
+
+**Before the connection moved to its volume's owner (first sweep, p50 / p99 / p999 / max).**
+
+| op | load/core | callers | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|---|
+| create 4 KiB | 0 | 1 | 1.22 ms | 2.08 ms | 2.43 ms | 2.83 ms |
+| rename | 0 | 1 | 0.39 ms | 0.79 ms | 1.00 ms | 1.25 ms |
+| rename | 0 | 4 | 3.41 ms | 4.80 ms | 5.60 ms | 6.65 ms |
+| rename | 1 | 1 | 2.44 ms | 188 ms | 266 ms | 321 ms |
+| create 4 KiB | 1 | 1 | 8.85 ms | 88.5 ms | 172 ms | 184 ms |
+| open+read 4 KiB | 1 | 1 | 0.20 ms | 1.61 ms | 73.2 ms | 80.8 ms |
+| provision | 1 | 1 | 84 µs | 1.46 ms | 8.02 ms | 10.8 ms |
+
+**Where a call's time went: the daemon's service time (focus loop, rename).** Every one of 185,745 calls was
+forwarded from the accepting shard to the owner:
+- at load 0: p50 31 µs, p99 115 µs, p999 197 µs;
+- at load 1: p50 90 µs, p99 1.18 ms, p999 1.84 ms.
+
+**After the move (`nfs.rs` `migrate`).** Only a connection's first call is forwarded.
+
+| measured | load/core | p50 | p99 | p999 | max |
+|---|---|---|---|---|---|
+| daemon service | 0 | 2 µs | 29 µs | 45 µs | 0.1–2.4 ms |
+| daemon service | 1 | 3 µs | 49–53 µs | 98–246 µs | 1.4–1.6 ms |
+| caller rename | 0 | 320–340 µs | 568–596 µs | 870–883 µs | 7.5–11 ms |
+| caller rename | 1 | 408–494 µs | 1.84–2.23 ms | 3.26–3.97 ms | 73–84 ms |
+
+The full sweep after the move, at load average 40–97, still shows caller tails of 80–400 ms at one or two
+spinners per core (rename p99 163 ms at load 1). The daemon's service time never exceeded 7.9 ms, so those tails
+come from outside the serve:
+- the calling thread's own wake after each of its six RPC replies;
+- the kernel NFS client;
+- the shard's wake from its driver, which the service timer does not include.
+
+They are open (GAPS).
+
+**Measured and rejected: thread QoS.** The shard threads at `QOS_CLASS_USER_INTERACTIVE`, then the caller, then
+both. Three runs each of a 12-second rename loop at load 1. p99 / p999:
+
+| arm | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| none | 2.8 / 29 ms | 2.9 / 30 ms | 3.6 / 17 ms |
+| caller | 2.6 / 28 ms | 4.6 / 57 ms | 3.5 / 44 ms |
+| shards | 3.2 / 43 ms | 3.7 / 37 ms | 4.3 / 60 ms |
+| both | 4.5 / 54 ms | 2.9 / 57 ms | 3.0 / 50 ms |
+
+No arm beats the spread of the others; not landed.

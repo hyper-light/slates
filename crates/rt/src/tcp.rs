@@ -142,6 +142,22 @@ impl TcpStream {
     Ok(TcpStream { fd })
   }
 
+  /// Gives up the stream's descriptor, to move the connection to another shard (§4.6: a mount's connection is
+  /// served on the shard that owns its volume). No readiness is armed between awaits — every registration is
+  /// one-shot, re-armed by the next await — so nothing on this shard's driver waits on it once the serving
+  /// task stops awaiting it; on epoll a fired one-shot entry stays in this shard's interest list disabled,
+  /// never reported, until the descriptor closes.
+  pub fn into_fd(self) -> OwnedFd {
+    self.fd
+  }
+
+  /// Adopts a connected stream's descriptor on the current shard: the counterpart to
+  /// [`TcpStream::into_fd`]. It is made non-blocking and close-on-exec, as an accepted stream is.
+  pub fn from_fd(fd: OwnedFd) -> Result<TcpStream, RtError> {
+    set_nonblocking_cloexec(&fd)?;
+    Ok(TcpStream { fd })
+  }
+
   /// The local address this stream is bound to.
   pub fn local_addr(&self) -> Result<SocketAddrV4, RtError> {
     local_v4(&self.fd)

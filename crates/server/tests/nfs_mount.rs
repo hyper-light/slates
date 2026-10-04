@@ -352,6 +352,108 @@ fn the_daemon_serves_a_volume_on_another_shard_over_nfs() {
   drop(daemon);
 }
 
+/// Shape: the calls a mount makes after its `MNT` in the connection tests: enough that a per-call forward would
+/// dominate the counts.
+const CALLS_AFTER_MOUNT: u32 = 24;
+
+/// A provisioned volume's friendly name whose owner partition is (`remote`) or is not the control shard's.
+fn volume_named_on(client: &mut Client, remote: bool, prefix: &str) -> String {
+  for attempt in 0..32 {
+    let name = format!("{prefix}-{attempt}");
+    let ReplyBody::Created { id } = client.call(&scratch(&name)) else {
+      continue;
+    };
+    if (slates_server::verbs::owner_of(id) != 0) == remote {
+      return name;
+    }
+  }
+  panic!("no volume landed where wanted in 32 attempts");
+}
+
+/// §4.6 (connection affinity, 2026-10-04): do mount a volume another shard owns over one connection and make a
+/// burst of calls; expect the bytes to round-trip and every call after the `MNT` served on the owner shard (the
+/// connection moved there at its first call), none forwarded over the bridge queue. The `MNT` itself routes by
+/// name, so it is the one forwarded call. The service counts are the non-vacuity evidence: a silently dead move
+/// would show every call forwarded, as all 185,745 were before it.
+#[test]
+fn a_mounts_connection_moves_to_its_volumes_owner_and_is_served_there() {
+  let (daemon, instance) = two_shard_daemon("nfsmove");
+  let mut client = Client::connect(&instance);
+  let name = volume_named_on(&mut client, true, "moved");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_fh = mount(&mut stream, &capability_path(&daemon, &name), 1);
+  let file_fh = create(&mut stream, &root_fh, "moved.txt", 2);
+  let payload = b"served on the owner shard after the connection moved\n";
+  let mut xid = 3;
+  for _ in 0..CALLS_AFTER_MOUNT / 2 {
+    write(&mut stream, &file_fh, payload, xid);
+    assert_eq!(
+      read(&mut stream, &file_fh, xid + 1),
+      payload,
+      "the bytes round-trip"
+    );
+    xid += 2;
+  }
+  let (local, forwarded) = daemon.nfs_service_times().unwrap();
+  drop(stream);
+  drop(client);
+  drop(daemon);
+  assert_eq!(
+    forwarded.count, 1,
+    "only the MNT was forwarded; every later call was served on the owner"
+  );
+  assert!(
+    local.count > u64::from(CALLS_AFTER_MOUNT),
+    "the calls after the MNT were served where the connection moved ({} local)",
+    local.count
+  );
+}
+
+/// §4.6 (connection affinity): do alternate one connection's calls between a volume the control shard owns and one
+/// the other shard owns; expect each volume's bytes intact on every call, the connection following each call to
+/// its owner (a move costs one hop where a forward cost two), and none forwarded after the two `MNT`s.
+#[test]
+fn a_connection_alternating_between_volumes_on_two_shards_serves_both() {
+  let (daemon, instance) = two_shard_daemon("nfsalternate");
+  let mut client = Client::connect(&instance);
+  let here = volume_named_on(&mut client, false, "here");
+  let there = volume_named_on(&mut client, true, "there");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let here_root = mount(&mut stream, &capability_path(&daemon, &here), 1);
+  let there_root = mount(&mut stream, &capability_path(&daemon, &there), 2);
+  let here_file = create(&mut stream, &here_root, "here.txt", 3);
+  let there_file = create(&mut stream, &there_root, "there.txt", 4);
+  let mut xid = 5;
+  for round in 0..CALLS_AFTER_MOUNT / 4 {
+    let here_bytes = format!("here {round}\n").into_bytes();
+    let there_bytes = format!("there {round}\n").into_bytes();
+    write(&mut stream, &here_file, &here_bytes, xid);
+    write(&mut stream, &there_file, &there_bytes, xid + 1);
+    assert_eq!(
+      read(&mut stream, &here_file, xid + 2),
+      here_bytes,
+      "the control shard's volume"
+    );
+    assert_eq!(
+      read(&mut stream, &there_file, xid + 3),
+      there_bytes,
+      "the other shard's volume"
+    );
+    xid += 4;
+  }
+  let (_, forwarded) = daemon.nfs_service_times().unwrap();
+  drop(stream);
+  drop(client);
+  drop(daemon);
+  assert!(
+    forwarded.count <= 2,
+    "at most the two MNTs were forwarded ({} were)",
+    forwarded.count
+  );
+}
+
 /// A client mounts the single host root `/` and reaches a volume on ANOTHER shard by `cd`-ing into it
 /// by its friendly name (a root `LOOKUP` routed across shards by `owner_of_name`): the design's single
 /// mount point under which every volume appears, reaching a remote volume, over NFS with no privilege.

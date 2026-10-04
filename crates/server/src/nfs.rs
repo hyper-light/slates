@@ -4,9 +4,14 @@
 //!
 //! A volume lives on its owning shard (`§4.8`: ids route to owners; a volume id names its owner
 //! *partition*, [`crate::verbs::owner_of`], which the daemon maps to a shard). The connection is
-//! accepted on the control shard, so a request for a volume that shard owns is served locally, and a
-//! request for a volume on another shard is routed over the **cross-shard bridge queue** to its owner
-//! and the reply routed back:
+//! accepted on the control shard. At its first NFSv3 call naming a volume another shard owns, the
+//! **connection moves** to that owner shard (its descriptor and read state, by move; [`migrate`]) and is
+//! served locally there from then on: a mount's calls name one volume, and a call forwarded per request
+//! paid two cross-shard hops and two thread wakes, each of which a busy machine can delay (2026-10-04:
+//! service p99 115 µs → 29 µs at rest, 1.18 ms → about 50 µs with a spinner per core;
+//! docs/wip/BENCHMARKS.md "The VFS on a busy machine"). A call that still names another shard's volume
+//! — a `MNT` routed by name, an NFSv4 compound (its session state is per shard), a host-root listing —
+//! is routed over the **cross-shard bridge queue** to its owner and the reply routed back:
 //!
 //! * **Local** (the volume this shard owns, or the synthetic root): the request runs through the
 //!   bridge's `serve_call` on a [`MultiExport`] over [`ShardVolumeSet`], which resolves the volume
@@ -1110,10 +1115,36 @@ async fn serve_v3(
     };
     return serve_root_listing(requester, procedure, &args, entries, port);
   }
-  match route(program, procedure, &args) {
-    Some(owner) => serve_remote(owner, this, requester, xid, program, procedure, args, port).await,
-    None => serve_local(requester, xid, program, procedure, &args, port),
-  }
+  let started = slates_machine::clock::monotonic_ns();
+  let (forwarded, served) = match route(program, procedure, &args) {
+    Some(owner) => (
+      true,
+      serve_remote(owner, this, requester, xid, program, procedure, args, port).await,
+    ),
+    None => (
+      false,
+      serve_local(requester, xid, program, procedure, &args, port),
+    ),
+  };
+  let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
+  let _ = state::with_state(|s| {
+    if forwarded {
+      s.nfs_service.forwarded.record(elapsed);
+    } else {
+      s.nfs_service.local.record(elapsed);
+    }
+  });
+  served
+}
+
+/// How long a shard took to serve the NFS calls it read (§4.14): from the call parsed to its results built,
+/// split by whether the volume's owner was this shard or another, which the call was forwarded to and back.
+#[derive(Clone, Debug, Default)]
+pub struct ServiceTimes {
+  /// Calls served on this shard.
+  pub local: crate::histogram::DurationHistogram,
+  /// Calls forwarded to their volume's owner shard and answered back.
+  pub forwarded: crate::histogram::DurationHistogram,
 }
 
 // ------------------------------------------------------------------------------ NFSv4 (A-35)
@@ -1381,40 +1412,141 @@ async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
 /// `AUTH_SYS` credential, §4.13) is taken out before the serve, so the read buffer is free to drain
 /// while a remote call awaits its owner.
 async fn serve_one(stream: TcpStream, port: u16) {
+  serve_connection(Connection {
+    stream,
+    buffer: Vec::new(),
+    records: RecordReader::default(),
+    pending: None,
+    port,
+  })
+  .await;
+}
+
+/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]):
+/// the socket, the bytes read past the last parsed call, the record reader's partial record, and the call that
+/// named the other shard, served first there.
+struct Connection {
+  stream: TcpStream,
+  buffer: Vec<u8>,
+  records: RecordReader,
+  pending: Option<Call>,
+  port: u16,
+}
+
+/// The serve loop of [`serve_one`], on whichever shard holds the connection now. A mount's calls name one
+/// volume, so the connection moves to that volume's owner shard at its first call there and is served locally
+/// from then on: a call forwarded over the bridge queue costs two cross-shard hops and two thread wakes, each
+/// of which a busy machine can delay by a scheduler quantum, and every call of a mount (six RPCs for one
+/// `rename(2)` from macOS) paid them (2026-10-04: every one of 185,745 calls was forwarded; their service p99
+/// was 115 µs at rest and 1.18 ms with a spinner per core, `crates/cli/examples/vfs_tails.rs`).
+async fn serve_connection(mut connection: Connection) {
   let this = registry::current_shard().unwrap_or(0);
-  let mut buffer: Vec<u8> = Vec::new();
-  let mut records = RecordReader::default();
   let mut chunk = [0u8; RECORD_CHUNK];
   loop {
-    let parsed: Option<(Call, usize)> = match records.read(&buffer) {
-      Ok((Some(body), consumed)) => Some((Call::parse(&body), consumed)),
-      Ok((None, consumed)) => {
-        buffer.drain(..consumed);
-        None
-      }
-      Err(_) => return,
+    let call = match connection.pending.take() {
+      Some(call) => Some(call),
+      None => match connection.records.read(&connection.buffer) {
+        Ok((body, consumed)) => {
+          connection
+            .buffer
+            .drain(..consumed.min(connection.buffer.len()));
+          body.map(|body| Call::parse(&body))
+        }
+        Err(_) => return,
+      },
     };
-    match parsed {
-      Some((call, consumed)) => {
-        let reply = reply_to(this, call, port).await;
-        if stream.write_all(&write_record(&reply)).await.is_err() {
+    match call {
+      Some(call) => {
+        if let Some(owner) = owner_elsewhere(&call) {
+          connection.pending = Some(call);
+          migrate(owner, connection);
+          return;
+        }
+        let reply = reply_to(this, call, connection.port).await;
+        if connection
+          .stream
+          .write_all(&write_record(&reply))
+          .await
+          .is_err()
+        {
           return;
         }
         // A mount's call is client activity: the shard spins out its idle window after it, so the next
         // call of a burst is read without a kernel wake (§4.7).
         registry::with_current(|ctx| ctx.note_activity());
-        buffer.drain(..consumed);
         // A ready read/write does not yield. Bound a busy connection to one RPC per turn,
         // so its successive durability barriers cannot starve the heartbeat (§4.3, D-18).
         futures::yield_now().await;
       }
-      None => match stream.read(&mut chunk).await {
+      None => match connection.stream.read(&mut chunk).await {
         Ok(0) | Err(_) => return,
-        Ok(count) => buffer.extend_from_slice(&chunk[..count]),
+        Ok(count) => connection
+          .buffer
+          .extend_from_slice(chunk.get(..count).unwrap_or_default()),
       },
     }
   }
 }
+
+/// The shard a call should be served on when it is not this one: an NFSv3 call naming a volume another shard
+/// owns. A `MOUNT` call, an NFSv4 call (its session state is this shard's) and a host-root listing stay here, as
+/// does a call this shard owns.
+fn owner_elsewhere(call: &Call) -> Option<u16> {
+  if call.program != NFS_PROGRAM
+    || call.version != NFS_VERSION
+    || !slates_bridge_nfs::procedures::is_rfc1813_procedure(call.procedure)
+    || is_root_listing(call.program, call.procedure, &call.args)
+  {
+    return None;
+  }
+  route(call.program, call.procedure, &call.args)
+}
+
+/// Moves `connection` to `owner`, where its pending call is served first and the loop goes on. The move is a
+/// spawn on the owner's control channel carrying the descriptor and the read state (sharing by move); refused
+/// there, the connection is closed, and counted, and the kernel client reconnects, as at a refused accept.
+fn migrate(owner: u16, connection: Connection) {
+  let Connection {
+    stream,
+    buffer,
+    records,
+    pending,
+    port,
+  } = connection;
+  let fd = stream.into_fd();
+  let arrive = slates_rt::task::SpawnRequest::new(
+    Box::pin(async move {
+      let Ok(stream) = TcpStream::from_fd(fd) else {
+        crate::fleet::count_refusal(MIGRATE_REFUSED);
+        return;
+      };
+      let connection = Connection {
+        stream,
+        buffer,
+        records,
+        pending,
+        port,
+      };
+      match futures::spawn(serve_connection(connection)) {
+        Ok(task) => {
+          let _ = futures::detach(task);
+        }
+        Err(_) => {
+          crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
+        }
+      }
+    }),
+    None,
+  );
+  if registry::send_control(owner, slates_rt::control::Control::Spawn(Box::new(arrive))).is_err() {
+    crate::fleet::count_refusal(MIGRATE_REFUSED);
+  }
+}
+
+/// The status refusal count under which a connection's move to its volume's owner shard was refused (the
+/// owner's control channel full, or the descriptor not adoptable there): the connection is closed and the
+/// kernel client reconnects.
+const MIGRATE_REFUSED: &str = "nfs.connection_move_refused";
 
 #[cfg(test)]
 mod tests {

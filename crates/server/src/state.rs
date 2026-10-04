@@ -441,6 +441,8 @@ pub struct ShardState {
   /// The membership plane (A-67 H-2): the one detector and its sealed datagram plane, the peers' plane addresses, and
   /// the epochs keyed from each pair's canonical record session (`crate::member_task`). Empty on a laptop.
   pub(crate) plane: crate::member_task::PlaneState,
+  /// How long this shard took to serve each NFS call it read, served here or forwarded to its owner (§4.14).
+  pub nfs_service: crate::nfs::ServiceTimes,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,

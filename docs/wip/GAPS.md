@@ -3361,3 +3361,23 @@ Owed:
 - or lock a strict volume's own chunks as they are allocated (GAP-A9-1's refinement).
 
 Windows `VirtualLock` commits its range too, and is unmeasured.
+
+### 2026-10-04: the VFS's caller tails on a busy machine (open)
+
+`crates/cli/examples/vfs_tails.rs` times file calls through a real kernel mount under 0–2 spinner threads per
+core. The connection now moves to its volume's owner (§4.6 status note), and the daemon's own service time is
+about 50 µs p99 under load. The caller still sees tails of 80–400 ms at one or two spinners per core (rename p99
+163 ms in the full sweep at load average 40–97) (docs/wip/BENCHMARKS.md "The VFS on a busy machine"). Owed, in
+order:
+- Attribute the time outside the serve. Candidates: the shard's wake from its driver (not inside the service
+  timer); the caller's six sleeps per `rename(2)`; the kernel client. Each needs a measurement before any change.
+- Reduce RPCs per call. Two of a rename's six serve macOS's AppleDouble sidecar, which named attributes
+  (NFSv4) would remove.
+- Find why four callers on one mount are still about 6.7× slower per create than one. A create's `close` sends
+  a COMMIT, which is a durability barrier; per-procedure service times are next.
+- Gate the lane: a ratcheted p99 and p999 per op at load 1, once the noise floor is measured in-process (as
+  `destroy_rows` does).
+
+Sibling found: `crates/cli/examples/slates_mount.rs` mounts `localhost:/<name>` with no mount capability. That
+export path stopped working at AUD-01 (`/<name>@<attachment>.<token>`), and on macOS `slates mount` now uses
+`mount(2)` (A-34), so the example fails with `No such file or directory`.
