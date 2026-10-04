@@ -3326,3 +3326,16 @@ hyper-raft main, green on six targets:
 - report `unmeasured` in `slates status`.
 
 The same revision states hyper-swim's rule that a two-member view never condemns, which slates' fleet suite now asserts.
+
+### 2026-10-04: an intermittent async-SDK overflow assertion (open, not yet reproduced)
+
+CI run 37183276944 (`ec4a56c`, ubuntu SDK packaging): `test_every_async_call_ends_across_restart_silence_cancellation_and_death`
+failed with `0 not greater than 0 : the overflow is refused at once`. With the daemon stopped (`SIGSTOP`), three times the
+client's outstanding limit of `list()` calls produced no `TooManyOutstanding`. It passed on the next runs, and `ec4a56c`
+changed only the transport's exported secret.
+
+Suspects, unverified:
+- `_daemon_pids` named no live daemon, so nothing was stopped and completions freed the slots;
+- the outstanding count admits a call before the bound is checked.
+
+Next: reproduce under parallel load with `SIGSTOP` timing logged, failing test first.
