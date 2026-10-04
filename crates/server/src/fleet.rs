@@ -5127,6 +5127,8 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
     s.lease.retain_members(members);
     s.answers_given.retain_members(members);
     s.fanned.observe_lease(&s.lease);
+    // This shard's own parked lease reads meet the evidence it just pruned and observed.
+    crate::lease_wait::resolve(s);
     let mut fans = Vec::new();
     for shard in shards.iter().copied().filter(|shard| *shard != origin) {
       if let Some(fan) = s.fanned.owed(s, shard) {
@@ -5141,7 +5143,11 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
   };
   for (shard, fan) in fans {
     let delivered = fan.delivered();
-    match run_on(origin, shard, move |s| fan.install(s)) {
+    match run_on(origin, shard, move |s| {
+      fan.install(s);
+      // The owner shard's parked lease reads meet the evidence the fan brought (`crate::lease_wait`).
+      crate::lease_wait::resolve(s);
+    }) {
       Ok(()) => {
         let _ = state::with_state(|s| {
           s.fanned.record(shard, delivered);

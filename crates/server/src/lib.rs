@@ -47,6 +47,7 @@ pub mod head;
 pub mod histogram;
 pub mod landing;
 pub mod lease;
+mod lease_wait;
 mod member_task;
 pub mod merge_service;
 #[cfg(target_os = "linux")]

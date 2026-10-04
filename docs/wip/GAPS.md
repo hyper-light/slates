@@ -3428,3 +3428,17 @@ granularity, not RFC 9002 §6.2's PTO from 333 ms. Each two-datagram retransmit 
 32-retransmit cap. The first GEO-class leader moved from 9.15 s to 19.5 s.
 `at_the_geo_class_profile_the_fixed_timing_campaigns_against_a_live_leader_and_the_derived_timing_does_not` is
 ignored, with that reason, until the H-4 re-vendor of hyper-quic, which must carry the tests the report asks for.
+
+### 2026-10-04: lease reads wait for their confirmation (closed)
+
+A latest-state verb meeting an unconfirmed owner lease is parked until it confirms or the lease bound passes,
+instead of refused at once. This closes the CLI deployment's spurious first-mount `LeaseUnconfirmed`
+(`docs/bugs/2026-10-04-a-first-mount-after-create-was-refused-lease-unconfirmed.md`).
+
+Still open from the same CLI runs at load average about 60, each seen once:
+- `a_fleet_node_under_its_anchor_keeps_its_serve_ports_across_a_daemon_restart` ("a manifest port was free while
+  the daemon was down");
+- `an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart` ("a fleet daemon answered").
+
+Both passed 3/3 alone and the suite then passed 5/5 at load average 12–42. Owed: a reproduction under load,
+then a diagnosis from logs.

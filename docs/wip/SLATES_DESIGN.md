@@ -4663,6 +4663,12 @@ sharing scope and reference authorization; cross-scope existence and timing must
 private data. Slates does not copy Hecate's disk-at-rest layout or salt scheme merely because
 it uses content addressing. The RAM-only trust boundary and any allowed sharing are explicit.
 
+> **Status (2026-10-04, lease reads wait).** A verb that serves an object's latest state while its owner lease is
+> unconfirmed is parked, not refused (`crates/server/src/lease_wait.rs`). It runs when the lease confirms, and is
+> refused `LeaseUnconfirmed` only once the lease bound passes. This is the Raft lease read (thesis §6.4) and etcd's
+> `ReadIndex`. The mounted transports keep their own retry-later answers (`NFS3ERR_JUKEBOX`, held FUSE requests).
+> Record: `docs/bugs/2026-10-04-a-first-mount-after-create-was-refused-lease-unconfirmed.md`.
+
 > **Status (2026-09-30, AUD-29-45, in part).** A holder answers content requests per object, under the
 > object's authority.
 > - **Bound to the object.** Every offer, put and fetch names its object (`Fetch` gained it). The holder

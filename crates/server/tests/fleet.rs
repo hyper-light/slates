@@ -9860,6 +9860,75 @@ fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
   );
 }
 
+/// §4.8 "Leases and reads" (AUD-08; lease reads wait, 2026-10-04): do isolate the owner until its lease lapses,
+/// ask it for the held volume's status from another thread, and heal the isolation once the daemon reports the
+/// verb parked; expect the status answered with the volume's real status, never `LeaseUnconfirmed`, and the wait's
+/// served count moved. The parked count observed before the heal is the non-vacuity evidence: a gate that still
+/// refused at once would answer before anything parked (`crate::lease_wait`).
+#[test]
+fn a_status_meeting_a_lapsed_lease_waits_and_is_served_once_the_lease_confirms() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let scene = set_the_lease_scene(&daemons);
+  let held = ObjectId(scene.held.bytes);
+  let confirmed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(held)
+  });
+  isolate_owner_on_the_probe_plane(&daemons, &hosts);
+  let lapsed = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+    daemons[0].fleet_lease_holds(held).map(|holds| !holds)
+  });
+  let (answer, parked) = std::thread::scope(|scope| {
+    let instance = daemons[0].instance().to_owned();
+    let volume = scene.held;
+    let asking = scope.spawn(move || {
+      Client::connect(&instance)
+        .try_call(&RequestBody::Status { volume }, DEADLINE_NS)
+        .unwrap_or_else(|e| refused_placeholder(&e))
+    });
+    let parked = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
+      daemons[0].lease_waiters_parked().map(|parked| parked > 0)
+    });
+    for daemon in &daemons {
+      daemon
+        .inject_probe_deafness(&[])
+        .expect("the isolation heals");
+    }
+    (asking.join().expect("the status call returns"), parked)
+  });
+  let served = daemons[0]
+    .refusals_on_every_shard()
+    .map(|counts| counts.get("lease.wait.served").copied().unwrap_or(0))
+    .unwrap_or(0);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(confirmed, "A's lease was confirmed before the isolation");
+  assert!(lapsed, "A's lease lapsed once no holder confirmed it");
+  assert!(
+    parked,
+    "the status was parked while the lease was unconfirmed"
+  );
+  assert_eq!(
+    answer_of(&answer),
+    Answer::Served,
+    "the parked status was served once the lease confirmed: {answer:?}"
+  );
+  assert!(served >= 1, "the wait counted the served verb ({served})");
+}
+
 /// The volumes and handles [`a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes`] asks about.
 struct LeaseScene {
   /// A volume A holds.

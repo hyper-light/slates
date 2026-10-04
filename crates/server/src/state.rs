@@ -414,6 +414,9 @@ pub struct ShardState {
   /// and cleared by `run_recorded`: the verb's effects commit now, its completion is recorded when the
   /// deferred reply resolves, and no reply is written for it now.
   pub(crate) acceptance_deferred: bool,
+  /// Verbs serving an object's latest state parked until its owner lease confirms (`crate::lease_wait`; §4.8
+  /// "Leases and reads"), bounded by the shard's client credit.
+  pub(crate) lease_waiters: crate::lease_wait::LeaseWaiters,
   /// The `ring.request` spans of requests this shard forwarded to another shard, or scattered, by request
   /// word (§4.14): opened at the slot read, ended when the reply comes back through `deliver` and is
   /// written, so a forwarded reply's ring span is timed from read to reply like a local one. Bounded by

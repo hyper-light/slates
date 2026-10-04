@@ -1459,6 +1459,16 @@ impl Daemon {
     })
   }
 
+  /// The verbs parked on every shard until their owner lease confirms (`crate::lease_wait`; §4.8 "Leases and
+  /// reads"): a test's view of a wait in progress.
+  pub fn lease_waiters_parked(&self) -> Result<usize, ObserveError> {
+    let mut parked = 0usize;
+    for shard in self.shards.iter().copied() {
+      parked = parked.saturating_add(self.observe(Some(shard), |s| crate::lease_wait::parked(s))?);
+    }
+    Ok(parked)
+  }
+
   /// The refusals every shard of this daemon has counted, summed by kind (§4.14). A volume's refusals — a
   /// FUSE or virtio-fs barrier refused, a landing's stages — are counted on the volume's owner shard, which is
   /// the control shard only by chance, so a test asserting one is absent reads them here: through
@@ -2699,6 +2709,7 @@ fn init_shard(
     reply_route: None,
     current_request: None,
     acceptance_deferred: false,
+    lease_waiters: crate::lease_wait::LeaseWaiters::default(),
     forwarded_rings: std::collections::BTreeMap::new(),
     telemetry_quota: config.telemetry_spans_per_reply,
     last_drain_ns: now,

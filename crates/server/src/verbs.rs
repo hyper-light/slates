@@ -1132,6 +1132,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       // granted landing still running joins it the same way (AUD-29-03).
       if crate::merge_service::join_awaiting(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
+        || crate::lease_wait::join(state, origin, id)
       {
         return Served::Forwarded;
       }
@@ -1393,6 +1394,7 @@ fn run_forwarded(
       // of a granted landing still running (AUD-29-03).
       if crate::merge_service::join_awaiting(state, origin, id)
         || crate::landing::join_in_flight(state, origin, id)
+        || crate::lease_wait::join(state, origin, id)
       {
         return None;
       }
@@ -2245,7 +2247,38 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
   )
 }
 
-fn dispatch(
+/// What the owner-lease gate of [`dispatch`] decided.
+enum LeaseGate {
+  /// The verb may run now.
+  Run(RequestBody),
+  /// The verb's reply instead: the placeholder of a verb parked until its lease confirms
+  /// (`crate::lease_wait`), or `LeaseUnconfirmed` when it cannot be parked.
+  Answer(ReplyBody),
+}
+
+/// The owner-lease gate of [`dispatch`].
+fn lease_gate(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &Principal,
+  body: RequestBody,
+) -> LeaseGate {
+  let Some(volume) = serves_latest_state(&body) else {
+    return LeaseGate::Run(body);
+  };
+  if state.db.partition().volume(to_db_volume(volume)).is_none() {
+    return LeaseGate::Run(body);
+  }
+  let Some(version) = lease_refusal(state, ObjectId(volume.bytes)) else {
+    return LeaseGate::Run(body);
+  };
+  if crate::lease_wait::park(state, client_id, principal, body, ObjectId(volume.bytes)) {
+    return LeaseGate::Answer(crate::lease_wait::parked_reply());
+  }
+  LeaseGate::Answer(refused(Refusal::LeaseUnconfirmed { version }))
+}
+
+pub(crate) fn dispatch(
   state: &mut ShardState,
   client_id: u32,
   principal: &Principal,
@@ -2271,12 +2304,13 @@ fn dispatch(
   // latest state of it to serve stale. A holder that keeps a peer's records but not its volume, or a node
   // that has not yet installed a configuration, answers `NotFound` for it, never `LeaseUnconfirmed`
   // (docs/bugs/2026-09-29-the-lease-gate-refused-volumes-the-node-did-not-hold.md).
-  if let Some(volume) = serves_latest_state(&body)
-    && state.db.partition().volume(to_db_volume(volume)).is_some()
-    && let Some(version) = lease_refusal(state, ObjectId(volume.bytes))
-  {
-    return refused(Refusal::LeaseUnconfirmed { version });
-  }
+  //
+  // An unconfirmed lease is usually a confirmation in flight, so the verb is parked until it confirms or the
+  // lease bound passes (`crate::lease_wait`), not refused at once; refused only when it cannot be parked.
+  let body = match lease_gate(state, client_id, principal, body) {
+    LeaseGate::Run(body) => body,
+    LeaseGate::Answer(reply) => return reply,
+  };
   // The durability gate (§4.8 "Placement" — the operator's ε and coincident-failure size "gate a refusal"):
   // a write that would commit a new head or seal is refused, with the measured shortfall, while the
   // installed configuration cannot hold it to the declared policy. A field read: the shortfall was measured
