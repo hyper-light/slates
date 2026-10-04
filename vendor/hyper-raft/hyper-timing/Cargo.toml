@@ -1,0 +1,11 @@
+# slates' manifest for the vendored hyper-timing (vendor/hyper-raft/README.md): its own workspace root, outside slates'
+# workspace; the source is hyper-raft's at the revision in vendor/hyper-raft/SNAPSHOT, unchanged.
+[package]
+name = "hyper-timing"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[workspace]

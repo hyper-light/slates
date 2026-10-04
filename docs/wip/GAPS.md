@@ -3285,3 +3285,17 @@ Owed:
   the prebuilt objects (`AWS_LC_SYS_PREBUILT_NASM=0`).
 - **Release targets not yet built with AWS-LC:** `i686-pc-windows-msvc`, `aarch64-pc-windows-msvc` and the musl
   CLI targets build only on a release tag. No CI lane has compiled AWS-LC for them.
+
+### 2026-10-03: integrating ../hyper-raft (A-67)
+
+Owed, in order (`docs/wip/transport-quic.md` §6):
+- **H-2** membership on hyper-swim with probes on hyper-datagram's plane. It replaces slates' detector and SWIM driver,
+  and the transport's unused control-datagram seal.
+- **H-3** the Raft core, the election law by suspicion, node-pair liveness, and hyper-durable over anchor RAM. It
+  waits for hyper-raft's R-3.
+- **H-4** hyper-quic, hyper-tls and hyper-transport (A-52 stage 3). It waits for the `quic-tls` merge, and closes the
+  audit's transport findings AUD-29-34, 35, 36, 46, 50–54 and 60, which are recorded as carried by the shared
+  transport.
+
+Done: **H-1**, the snapshot of hyper-timing, hyper-swim and hyper-datagram at hyper-raft `687244f`
+(`vendor/hyper-raft/`).

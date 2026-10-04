@@ -8481,3 +8481,15 @@ CI builds the Windows x86 assembly from NASM source.
   - the mutual TLS 1.3 handshake: 2% faster (207 → 202 µs);
   - building a server TLS connection: 2 µs slower (8.3 → 10.3 µs, once per accepted connection).
 
+### A-67 — slates takes the shared crates from ../hyper-raft (2026-10-03)
+Applied in the same change to: `docs/wip/transport-quic.md` §6 (the steps), GAPS (2026-10-03 entry),
+`vendor/hyper-raft/README.md`.
+Status: H-1 built (the snapshot); H-2 next; H-3 and H-4 wait on hyper-raft's R-3 and the `quic-tls` merge.
+- Why: Ada, 2026-10-03, "you also need to integrate ../hyper-raft". It fulfils A-52 §5: the shared repository holds
+  the transport, membership, timing and consensus crates slates, focal and mantle share, at the union of their rules.
+- The rule: slates vendors a snapshot at one revision green on all six targets, with the revision recorded, and never
+  depends on the shared repository by path or git. A shared crate replaces slates' implementation only where it
+  measures at least as fast and allocating no more. slates proposes shared-crate changes to their owner. Steps H-1 to
+  H-4 are in `docs/wip/transport-quic.md` §6.
+- R1 holds: hyper-durable's log is given an anchor-RAM store in slates, never files.
+

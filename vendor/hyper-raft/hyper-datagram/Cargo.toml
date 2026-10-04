@@ -1,0 +1,16 @@
+# slates' manifest for the vendored hyper-datagram (vendor/hyper-raft/README.md): its own workspace root, outside
+# slates' workspace; the source is hyper-raft's at the revision in vendor/hyper-raft/SNAPSHOT, unchanged. aws-lc-rs
+# resolves to slates' vendored copy through the root's `[patch.crates-io]`.
+[package]
+name = "hyper-datagram"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
+crc32c = "0.6"
+
+[workspace]
