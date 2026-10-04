@@ -51,6 +51,7 @@ pub(crate) mod fixed;
 pub mod fleet;
 mod fold;
 mod gossip;
+pub mod member_plane;
 pub mod membership;
 pub mod multilog;
 pub mod progress;

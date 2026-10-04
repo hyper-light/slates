@@ -214,6 +214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "ctor"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -386,6 +395,25 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hyper-datagram"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "crc32c",
+]
+
+[[package]]
+name = "hyper-swim"
+version = "0.1.0"
+dependencies = [
+ "hyper-timing",
+]
+
+[[package]]
+name = "hyper-timing"
+version = "0.1.0"
 
 [[package]]
 name = "iai-callgrind"
@@ -1416,6 +1444,9 @@ name = "slates-cluster"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "hyper-datagram",
+ "hyper-swim",
+ "hyper-timing",
  "proptest",
  "rcgen",
  "rustix",

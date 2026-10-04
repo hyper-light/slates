@@ -9,6 +9,10 @@ readme.workspace = true
 description = "The cluster plane (§4.8, D-14): the asynchronous dispatch that ships register records to their candidate holders over the fleet transport and commits at a quorum — db owns synchronous acceptance, the transport carries authenticated messages, and this owns the dispatch, collection, deadlines and cancellation. First milestone: register commits within one validated configuration generation (SWIM membership, the configuration group, takeover and mirror are owed)."
 
 [dependencies]
+# The membership plane (A-67 H-2): hyper-swim's detector over hyper-datagram's sealed plane, hyper-timing's history.
+hyper-datagram = { workspace = true }
+hyper-swim = { workspace = true }
+hyper-timing = { workspace = true }
 # db owns synchronous acceptance and the register protocol (Record, Acceptor, Placement, Quorum).
 slates-db = { workspace = true }
 # Canonical encoding of consensus state transferred to fresh members (§4.8, AUD-07).

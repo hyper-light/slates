@@ -113,31 +113,52 @@ needs in a shared crate goes to the crate's owner (the mantle session) as a prop
 | Step | What | Waits for | State |
 |---|---|---|---|
 | H-1 | Snapshot hyper-timing, hyper-swim, hyper-datagram at hyper-raft `687244f` | — | done |
-| H-2 | Membership on hyper-swim, its probes on hyper-datagram's sealed plane | — | next |
+| H-2 | Membership on hyper-swim, its probes on hyper-datagram's sealed plane | — | H-2a built: the sans-io core `slates_cluster::member_plane` with its tests; H-2b (the control shard's task, epochs on the record session) next |
 | H-3 | The Raft core (X-1), hyper-timing's election law by suspicion, hyper-liveness's node-pair stream, hyper-durable over an anchor-RAM `LogStore` | hyper-raft R-3 (API change) | waiting |
 | H-4 | Stage 3: hyper-quic, hyper-tls and hyper-transport under slates' runtime and application layer | the mantle session's `quic-tls` merge | waiting |
 
-**H-2, membership.**
-- slates' detector, membership, gossip, coordinates and fixed-point modules (`crates/cluster/src/`) give way to
-  hyper-swim, which began as them at slates `5cce86a`. It has since gained:
-  - witnessed extensions;
-  - a view bounded by placement;
-  - anti-entropy;
-  - poll-and-wake scheduling with no ticks;
-  - measured per-pair detectors (hyper-raft `docs/timing.md` §2.7).
+**H-2, membership.** One membership task on the control shard owns hyper-swim's `Detector`, hyper-datagram's
+`Plane` and the plane's UDP socket. It is the shape of hyper-swim's own five-process test (hyper-raft
+`crates/hyper-swim/tests/cluster.rs`):
+1. poll the detector and send the probe, its relay requests and its anti-entropy chunks;
+2. wait for a datagram until the detector's wake, open it, and hand each message to the detector;
+3. flush, at most one packed datagram per peer.
 
-  Its period costs 17–28 % less than slates' detector, with 0 allocations against slates' 6–14.5 (hyper-raft
-  `docs/benchmarks.md`, "The split closed: the period").
-- slates' SWIM driver half (`swim.rs`) and the fleet's probe tasks are rewritten around hyper-swim's `poll`/`wake`,
-  verdicts and gossip-into-buffer API.
-- Probes move off the QUIC probe plane onto hyper-datagram's plane: one UDP socket of its own, beside QUIC, so a probe
-  never waits behind bulk traffic in a congestion window (RFC 9221 §5). Its keys are expanded from each session's TLS
-  exporter, one epoch per connection.
-- The transport's own control-datagram codec, seal and schedule (`seal.rs`, `schedule.rs`, `enrollment.rs`,
-  `accept.rs`) are replaced, not kept beside it. The daemon never used them.
-- Acceptance: the in-process fleet suite and the 3-process CLI fleet tests pass on it. The SWIM regressions
-  (`crates/cluster/tests/swim.rs`, `membership_takeover.rs`, the indirect-probe and rejoin tests) pass or are
-  replaced by hyper-swim's equivalents with the reason recorded. KIND formation and takeover pass.
+It replaces slates' per-peer probe tasks, each of which held a full detector of its own: O(N) detectors and views per
+node, against one detector with one estimator per pair and a view bounded by placement.
+
+| Today (per-peer probe task over a QUIC probe session) | On the plane |
+|---|---|
+| The probe socket, a QUIC demultiplexer | The same advertised port, now the plane's UDP socket (`deploy::Plane::Probe`); the port block, the manifests and the KIND chart keep their shape |
+| A probe authenticated by its session's certificate (`rostered_anchor`) | A datagram authenticated by its epoch's key, expanded from the TLS exporter of a record session whose certificate was authenticated and rostered; the epoch is tied to that peer's anchor |
+| Keys | One epoch per pair's canonical connection: the record session the lower member id dials. Its dialer announces the epoch (a per-peer counter that only rises) in one record-plane exchange, and the acceptor installs the keys before it answers, so neither end seals under keys the other cannot open. Counting connections independently would drift when a handshake completes on one side only |
+| `learn_member` from the acknowledgement's announced id and boot nonce | Unchanged, from the same fields of hyper-swim's `Ping`, `Ack`, `IndirectAck` and `Sync`, checked against the epoch's anchor |
+| The owner lease (`lease.answered`) from the acknowledgement's standing and configuration version, timed from the probe's send | Unchanged: the task records each probe's send time by nonce, bounded by the detector's outstanding probes |
+| `sample_path` from the probe's round trip | The acknowledgement's receive time less the probe's send time |
+| Per-peer detectors folded into `FleetNode` by `sync_peer` | The one detector's membership folded into `FleetNode`. `FleetNode` stays the authority, since retirement goes through configuration-group records (D-14). The detector is liveness evidence |
+| The indirect stage across probe tasks (`ShardState::indirect` queues, AUD-15) | hyper-swim's `PingReq` and `IndirectAck` with its relay choice; the task keeps one relay entry per target, bounded by the membership |
+| Rejoin by refutation (A-15) | hyper-swim's refutation, anti-entropy and `forget` past the dissemination window |
+| `DetectorTiming`, `health_multiplier`, `observe_rtt` | Measured per-pair detectors (hyper-raft `docs/timing.md` §2.7) |
+
+Removed with it:
+- slates' `crates/cluster/src/{detector,gossip,coordinates,fixed}.rs` and the driver half of `swim.rs`
+  (hyper-swim's codec replaces the rest);
+- the per-peer probe and probe-serve tasks and `ShardState::indirect`;
+- the transport's unused control-datagram codec, seal and schedule.
+
+Acceptance:
+- the in-process fleet suite and the 3-process CLI fleet tests pass on it;
+- the SWIM regressions pass, or are replaced by hyper-swim's equivalents with the reason recorded;
+- KIND formation and takeover pass;
+- `crates/cluster/tests/member_plane.rs` (built with H-2a) runs three members on simulated time. It checks that
+  acknowledgements carry the identity, standing and round trip, that a killed member is condemned (by a survivor's
+  own probes within its stated bound, or by gossip) with no live member condemned, and that a message claiming
+  another sender is refused and counted.
+- A real-UDP test of the task on slates' runtime comes with H-2b.
+
+Gotcha (found building H-2a): a detector samples no round trip until it has measured its own wake lateness (`G`) and
+found it non-zero (hyper-swim `Detector::granularity`). A harness that polls exactly at the asked wake never judges
+anyone. The task must poll from real timer wakes, and a simulation must model a timer's lateness.
 
 **H-3's R1 constraint.** hyper-durable's log writes files through hyper-log. slates is RAM-only (R1), so its
 `LogStore` is anchor RAM, as hyper-durable's own `RamStore` is in memory. Nothing in H-3 touches disk outside a
