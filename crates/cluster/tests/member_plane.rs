@@ -16,6 +16,9 @@ use hyper_datagram::{ExporterSecret, Role, SECRET_BYTES};
 use hyper_swim::membership::Liveness;
 
 /// Shape: the members of the simulated fleet.
+/// Shape: the simulated clock's resolution: its stamps are whole nanoseconds.
+const SIM_RESOLUTION: std::time::Duration = std::time::Duration::from_nanos(1);
+
 const MEMBERS: u64 = 3;
 /// Shape: the one-way latency of the simulated network, nanoseconds (a datacentre round trip of 1 ms).
 const LATENCY_NS: u64 = 500_000;
@@ -88,6 +91,7 @@ impl Network {
         HostId(me),
         me * 1_000,
         NonZeroUsize::new(usize::try_from(MEMBERS).unwrap()).unwrap(),
+        SIM_RESOLUTION,
       )
       .unwrap();
       for peer in (1..=MEMBERS).filter(|peer| *peer != me) {
@@ -100,7 +104,7 @@ impl Network {
         plane
           .install_epoch(HostId(peer), 1, &secret_between(me, peer), role)
           .unwrap();
-        plane.join(HostId(peer));
+        plane.join(HostId(peer), None);
       }
       members.insert(me, plane);
     }
@@ -373,11 +377,23 @@ fn a_killed_member_is_condemned_by_every_survivor_and_no_live_one_is() {
 /// Expect: the message is refused and counted, and member 1's detector learns nothing from it.
 #[test]
 fn a_message_claiming_another_sender_is_refused_and_counted() {
-  let mut sender = MemberPlane::new(HostId(2), 2_000, NonZeroUsize::new(3).unwrap()).unwrap();
+  let mut sender = MemberPlane::new(
+    HostId(2),
+    2_000,
+    NonZeroUsize::new(3).unwrap(),
+    SIM_RESOLUTION,
+  )
+  .unwrap();
   sender
     .install_epoch(HostId(1), 1, &secret_between(1, 2), Role::Acceptor)
     .unwrap();
-  let mut receiver = MemberPlane::new(HostId(1), 1_000, NonZeroUsize::new(3).unwrap()).unwrap();
+  let mut receiver = MemberPlane::new(
+    HostId(1),
+    1_000,
+    NonZeroUsize::new(3).unwrap(),
+    SIM_RESOLUTION,
+  )
+  .unwrap();
   receiver
     .install_epoch(HostId(2), 1, &secret_between(1, 2), Role::Initiator)
     .unwrap();

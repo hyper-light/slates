@@ -158,14 +158,26 @@ impl std::fmt::Debug for MemberPlane {
 impl MemberPlane {
   /// A plane for `local`, announcing `boot_nonce`, whose view holds at most `members` hosts (itself included: what the
   /// placement lets this node know) and whose plane keeps keys for at most `members − 1` peers.
-  pub fn new(local: HostId, boot_nonce: u64, members: NonZeroUsize) -> Result<Self, PlaneRefusal> {
+  /// `resolution` is the owner's clock's: the least step of the readings it stamps the plane with (A-67; hyper-swim
+  /// bounds its wake lateness `G` below by it).
+  pub fn new(
+    local: HostId,
+    boot_nonce: u64,
+    members: NonZeroUsize,
+    resolution: std::time::Duration,
+  ) -> Result<Self, PlaneRefusal> {
     let limits = PlaneLimits {
       max_peers: members.get().saturating_sub(1).max(1),
       epochs_per_peer: EPOCHS_PER_PEER,
       window_limit: WINDOW_LIMIT,
     };
     let plane = Plane::new(local.0, limits)?;
-    let detector = Detector::new(hyper_swim::HostId(local.0), Exposure::new(), members);
+    let detector = Detector::new(
+      hyper_swim::HostId(local.0),
+      Exposure::new(),
+      members,
+      resolution,
+    );
     let mut member = MemberPlane {
       local,
       boot_nonce,
@@ -238,8 +250,17 @@ impl MemberPlane {
   /// addressable. A probe that cannot even be sent is never a miss: a member joined while unaddressable would be
   /// suspected and condemned for the owner's own lack of an address (KIND, 2026-10-04, a peer's DNS name not yet
   /// published at a fresh install). Counted when the bounded view refuses it.
-  pub fn join(&mut self, peer: HostId) {
-    if self.detector.join(hyper_swim::HostId(peer.0)).is_err() {
+  ///
+  /// `handshake_rtt` is the round trip the owner measured on the session that keyed `peer`: until this member measures
+  /// one of its own, its first probes of `peer` wait on it instead of hyper-swim's 1 s initial wait (a LAN's round
+  /// trip is about 100 µs, so detection at join is no longer bounded by a default).
+  pub fn join(&mut self, peer: HostId, handshake_rtt: Option<std::time::Duration>) {
+    let peer_id = hyper_swim::HostId(peer.0);
+    let joined = match handshake_rtt {
+      Some(rtt) => self.detector.join_measured(peer_id, rtt),
+      None => self.detector.join(peer_id),
+    };
+    if joined.is_err() {
       self.counts.view_full = self.counts.view_full.saturating_add(1);
     }
   }

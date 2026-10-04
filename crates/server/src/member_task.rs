@@ -639,7 +639,15 @@ fn join_addressable() {
       return;
     };
     for member in ready {
-      plane.join(member);
+      // The keying session's measured round trip, when the session is in hand and has a sample.
+      let handshake_rtt = state
+        .record_sessions
+        .get(&member)
+        .and_then(|link| link.endpoint.as_ref())
+        .map(slates_transport::endpoint::Endpoint::smoothed_rtt)
+        .filter(|rtt| *rtt > 0)
+        .map(std::time::Duration::from_nanos);
+      plane.join(member, handshake_rtt);
       state.plane.keyed.insert(member, true);
     }
   });
@@ -698,9 +706,14 @@ pub(crate) async fn run(
   resolver: Option<Kept<Resolver>>,
 ) {
   let installed = state::with_state(|state| {
-    MemberPlane::new(local, boot_nonce, members)
-      .map(|plane| state.plane.plane = Some(plane))
-      .is_ok()
+    MemberPlane::new(
+      local,
+      boot_nonce,
+      members,
+      std::time::Duration::from_nanos(slates_machine::clock::resolution_ns()),
+    )
+    .map(|plane| state.plane.plane = Some(plane))
+    .is_ok()
   })
   .unwrap_or(false);
   if !installed {

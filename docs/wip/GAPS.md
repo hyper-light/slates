@@ -3469,3 +3469,17 @@ is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). 
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.
 - **Daemon memory grows** about 120 MB per round of 4,000 small files (160 → 283 MB in two rounds). Not yet
   attributed; next.
+
+### 2026-10-04: hyper-raft re-snapshot at 3a6c288 (done)
+
+hyper-swim, hyper-timing and hyper-datagram are vendored at hyper-raft `3a6c288` (S-4 on `17c9964`), green on all six
+targets plus Miri and the model checks (run 37233401622). The snapshot carries:
+- the lost-first-probe wedge fix (`c875028`; slates found it);
+- `Detector::join_measured` (`b6e5353`): slates now joins each peer with the keying record session's smoothed round
+  trip, so first probes wait on a measured round trip, not a 1 s default;
+- `G` bounded below by the owner's clock resolution (`97b9366`), which slates now measures
+  (`slates_machine::clock::resolution_ns`: `clock_getres` of the clock it reads; Windows' 100 ns tick);
+- hyper-timing's log-linear histogram and path-sample freshness.
+
+This closes the 2026-10-04 re-vendor entries above. Still owed from hyper-raft: the hybrid-handshake high-RTT tests
+(a)–(d), queued there, and H-3/H-4.

@@ -25,13 +25,19 @@
 //! is answered or at its expected arrival from the latest round trip (NFD-E's estimate over a
 //! window of one), whichever is first; unanswered then, it is a loss to the estimators unless its
 //! answer comes later, and it judges nothing. Its wake measures the member's timer. Before any
-//! round trip, the first probe waits on its answer or on another member.
+//! round trip, the first probe waits on the round trip its owner measured to the peer, where it
+//! gave one ([`Detector::join_measured`]), or as a retransmission timer does before its first
+//! measurement ([`INITIAL_WAIT_NS`]), or until another member is heard from.
 //!
 //! **Dead.** A suspected peer is told by the member's next probe to it (Lifeguard's buddy system);
 //! it is condemned when that probe also goes unanswered, and only once the member has since had an
 //! answer from someone else, so a member whose own network has failed condemns nobody (Lifeguard's
-//! local health, decided by evidence). A gossiped suspicion is a hint: only a member's own probes
-//! condemn. A member with nobody alive or suspected left probes the members it holds dead and
+//! local health, decided by evidence). So a member of a two-member view never condemns: the one
+//! other member is the suspect, and a lone survivor cannot tell its peer's death from its own
+//! network's failure, which is the case Lifeguard's local health exists for; each side of a
+//! partition of two would otherwise condemn the other. An owner that must act on a death in a pair
+//! takes its evidence from outside the detector: a quorum, or its supervisor's word that the
+//! process ended. A gossiped suspicion is a hint: only a member's own probes condemn. A member with nobody alive or suspected left probes the members it holds dead and
 //! tells each so; a live one refutes in its answer.
 //!
 //! **What it found, and why.** A probe states its deadline as it is sent ([`Ping::due_ns`]), and
@@ -42,10 +48,13 @@
 //! say why a member was suspected or condemned, and a test can trace every one to this rule.
 //!
 //! **The member's own lateness** is measured, not multiplied: every wake the member is late for is
-//! folded into its granularity `G` ([`Wakes`]), which floors the margins; the member's own
-//! delay in reading acknowledgements is in the round trips it measures; and a probe is resolved
-//! when the member wakes, with every acknowledgement delivered by then, so a late member does not
-//! blame its peers for its own lateness.
+//! folded into its granularity `G` ([`Wakes`]), which floors the margins, and is never below the
+//! resolution of the clock its owner reads, so a member whose wakes all read exactly on time still
+//! configures ([`Detector::new`]); the member's own delay in reading acknowledgements is in the
+//! round trips it measures; and a probe is resolved when the member wakes, with every
+//! acknowledgement delivered by then, so a late member does not blame its peers for its own
+//! lateness. A round trip measured before the member has a wake and a period measured is taken by
+//! no estimator, and counted ([`Detector::unmeasured`]).
 //!
 //! **The view is bounded and forgets the dead.** It holds at most the members the owner's placement
 //! says this node can know ([`Detector::new`]'s `members`), and refuses an update about one more,
@@ -218,6 +227,13 @@ pub struct PeerReport {
 /// it and is not kept for.
 const OUTSTANDING: usize = 3;
 
+/// How long a measurement period waits before any round trip was measured, nanoseconds: RFC 6298
+/// §2.1, a retransmission timer's value until a round trip has been measured ("the sender SHOULD
+/// set RTO <- 1 second"), backed off as any measurement period's wait is. Without it, a member
+/// whose first probe or its answer was lost waited on another member, and members whose first
+/// probes were all lost waited on one another for ever, none sending again.
+const INITIAL_WAIT_NS: u64 = 1_000_000_000;
+
 /// The longest a measurement period's wait backs off to, nanoseconds: RFC 6298 (2.5) lets a
 /// retransmission timer's doubling be capped, provided the cap is at least 60 seconds.
 const MEASUREMENT_WAIT_CAP_NS: u64 = 60_000_000_000;
@@ -312,6 +328,10 @@ struct Peer {
     last_mistake: Option<f64>,
     last_answer_ns: Option<u64>,
     report: PeerReport,
+    /// A round trip to the peer its owner measured outside the detector, the handshake that keyed
+    /// the peer's session ([`Detector::join_measured`]): the first wait for its probes before this
+    /// member measured any round trip.
+    handshake_rtt_ns: Option<u64>,
 }
 
 impl Peer {
@@ -326,6 +346,7 @@ impl Peer {
             last_mistake: None,
             last_answer_ns: None,
             report: PeerReport::default(),
+            handshake_rtt_ns: None,
         }
     }
 
@@ -369,10 +390,11 @@ struct Probe {
     verdict: Option<Verdict>,
     /// When the indirect probe's answers are due, once it was asked.
     indirect_until: Option<u64>,
-    /// A measurement probe's expected arrival from the latest round trip, backed off while
-    /// measurement periods go unanswered ([`Detector::measurement_wait`]): where its period ends,
-    /// answered or not, judging nothing; its wake measures the member's timer.
-    expected: Option<u64>,
+    /// A measurement probe's expected arrival from the latest round trip, or before one from the
+    /// owner's ([`Detector::wait_base`]), backed off while measurement periods go unanswered
+    /// ([`Detector::measurement_wait`]): where its period ends, answered or not, judging nothing;
+    /// its wake measures the member's timer.
+    expected: u64,
 }
 
 impl Probe {
@@ -540,6 +562,9 @@ pub struct Detector {
     relayed: u64,
     /// The wakes asked of the caller and how late each came: `G` and the latest lateness.
     wakes: Wakes,
+    /// Round trips measured before this member had a wake and a period measured, which no
+    /// estimator took.
+    unmeasured: u64,
     /// The latest round trip measured, to anyone.
     last_rtt_ns: Option<u64>,
     /// Measurement periods ended unanswered since the latest round trip was measured: each doubles
@@ -633,8 +658,17 @@ impl Detector {
     /// A detector for `local`, with the fleet's failure history so far (`history`, the node time it
     /// has run and the failures it has had; [`Exposure::new`] for a fleet with none), whose view holds
     /// at most `members`, itself included: how many hosts the owner's placement says this node can
-    /// know.
-    pub fn new(local: HostId, history: Exposure, members: NonZeroUsize) -> Detector {
+    /// know. `resolution` is that of the clock the owner reads `now` and the acknowledgements'
+    /// stamps on, the least step its readings take: a wake read exactly on time was late by less
+    /// than it, so it bounds `G` from below (`hyper_timing::Lateness`). hyper-tokio's
+    /// `Clock::resolution` states the host's monotonic clock's; a simulation's stamps are whole
+    /// nanoseconds.
+    pub fn new(
+        local: HostId,
+        history: Exposure,
+        members: NonZeroUsize,
+        resolution: Duration,
+    ) -> Detector {
         Detector {
             membership: Membership::new(local, members),
             local,
@@ -651,7 +685,8 @@ impl Detector {
             peer_coordinates: BTreeMap::new(),
             nonce: 0,
             relayed: u64::MAX,
-            wakes: Wakes::new(),
+            wakes: Wakes::new(resolution),
+            unmeasured: 0,
             last_rtt_ns: None,
             measurement_misses: 0,
             longest_span: 0,
@@ -706,12 +741,12 @@ impl Detector {
     }
 
     /// When to [`poll`](Detector::poll) next, on the caller's clock: the probe's deadline, or the
-    /// indirect probe's once asked. `None` while a probe is measurement only (poll on the next
-    /// message), or before the first poll.
+    /// indirect probe's once asked, or a measurement probe's expected arrival. `None` once a
+    /// measurement probe is answered (poll on the next message), or before the first poll.
     pub fn wake(&self) -> Option<u64> {
         let probe = self.probe?;
         if probe.verdict.is_none() {
-            return probe.expected.filter(|_| !probe.answered);
+            return (!probe.answered).then_some(probe.expected);
         }
         if probe.answered {
             return probe.due_ns();
@@ -726,14 +761,14 @@ impl Detector {
         let due = probe.due_ns();
         match (probe.answered, due, probe.indirect_until) {
             // Measurement: over when answered or at its expected arrival; before any round trip,
-            // when another member is heard from.
+            // also when another member is heard from.
             (true, None, _) => Stage::Over,
-            (false, None, _) => match probe.expected {
-                Some(at) if now_ns < at => Stage::Wait,
-                Some(_) => Stage::Over,
-                None if self.heard_other => Stage::Over,
-                None => Stage::Wait,
-            },
+            (false, None, _)
+                if now_ns < probe.expected && !(self.last_rtt_ns.is_none() && self.heard_other) =>
+            {
+                Stage::Wait
+            }
+            (false, None, _) => Stage::Over,
             (true, Some(due), _) | (false, Some(due), None) if now_ns < due => Stage::Wait,
             (true, Some(_), _) => Stage::Over,
             (false, Some(_), None) => Stage::Indirect,
@@ -781,9 +816,7 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: self
-                .last_rtt_ns
-                .map(|rtt| now_ns.saturating_add(self.measurement_wait(rtt))),
+            expected: now_ns.saturating_add(self.measurement_wait(self.wait_base(target))),
         };
         self.probe = Some(probe);
         self.heard_other = false;
@@ -860,8 +893,7 @@ impl Detector {
     fn resolve(&mut self, probe: Probe, now_ns: u64) {
         if probe.verdict.is_none()
             && !probe.answered
-            && let Some(rtt) = self.last_rtt_ns
-            && self.measurement_wait(rtt) < MEASUREMENT_WAIT_CAP_NS
+            && self.measurement_wait(self.wait_base(probe.target)) < MEASUREMENT_WAIT_CAP_NS
         {
             self.measurement_misses = self.measurement_misses.saturating_add(1);
         }
@@ -1044,6 +1076,19 @@ impl Detector {
         rtt_ns.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
     }
 
+    /// The round trip a measurement probe of `target` waits from before backing off: the latest
+    /// this member measured, to anyone; before any, the one its owner measured to `target`; and
+    /// without one, [`INITIAL_WAIT_NS`].
+    fn wait_base(&self, target: HostId) -> u64 {
+        self.last_rtt_ns
+            .or_else(|| {
+                self.peers
+                    .get(&target)
+                    .and_then(|peer| peer.handshake_rtt_ns)
+            })
+            .unwrap_or(INITIAL_WAIT_NS)
+    }
+
     /// Whether every probe this member makes is judged by a configured verdict: the pool holds
     /// one, or every member it probes has its own.
     fn judges_every_probe(&self) -> bool {
@@ -1175,6 +1220,8 @@ impl Detector {
                 self.pool
                     .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
             }
+        } else {
+            self.unmeasured = self.unmeasured.saturating_add(1);
         }
         // The error estimate remembers one round: one probe of each member the round holds.
         if let Some(coordinate) = self.peer_coordinates.get(&from) {
@@ -1205,9 +1252,17 @@ impl Detector {
         Duration::from_nanos(period_ns.saturating_mul(watched))
     }
 
-    /// `G`, the mean lateness of this member's wakes, once measured and not zero.
+    /// `G`, the mean lateness of this member's wakes, once one is measured, and never below the
+    /// clock's resolution ([`Detector::new`]).
     pub fn granularity(&self) -> Option<Duration> {
         self.wakes.granularity()
+    }
+
+    /// Round trips this member measured before it had a wake and a period measured, which no
+    /// estimator took: with every pair's [`verdict`](Self::verdict) `None`, what tells an owner its
+    /// member is measuring and not yet judging.
+    pub fn unmeasured(&self) -> u64 {
+        self.unmeasured
     }
 
     /// Records an indirect acknowledgement that `target` answered the probe `nonce` through a
@@ -1668,6 +1723,22 @@ impl Detector {
         Ok(())
     }
 
+    /// Learns a peer as [`join`](Self::join) does, with a round trip to it that the owner measured
+    /// outside the detector, the handshake that keyed the peer's session: until this member
+    /// measures a round trip, its probes of the peer wait on that one instead of
+    /// [`INITIAL_WAIT_NS`], 1 s where a LAN's is about 100 µs. It judges nothing and feeds no
+    /// estimator: a handshake is not a probe. A zero round trip measures nothing and is not taken.
+    pub fn join_measured(&mut self, peer: HostId, round_trip: Duration) -> Result<(), Full> {
+        self.join(peer)?;
+        let rtt = u64::try_from(round_trip.as_nanos()).unwrap_or(u64::MAX);
+        if let Some(held) = self.peers.get_mut(&peer)
+            && rtt > 0
+        {
+            held.handshake_rtt_ns = Some(rtt);
+        }
+        Ok(())
+    }
+
     /// Applies a gossiped membership update, returning the change and enqueuing it for onward
     /// gossip; refused, and counted, when it is about one member more than the view holds.
     pub fn apply(&mut self, subject: HostId, update: MemberState) -> Result<Option<Change>, Full> {
@@ -1812,6 +1883,9 @@ mod tests {
         *state
     }
 
+    /// The simulated clock's resolution: its readings are whole nanoseconds.
+    const RESOLUTION: Duration = Duration::from_nanos(1);
+
     /// Room for every member a test names.
     fn room() -> NonZeroUsize {
         NonZeroUsize::new(16).unwrap()
@@ -1819,7 +1893,7 @@ mod tests {
 
     /// A detector for `LOCAL` that knows `peers`.
     fn detector(peers: &[HostId]) -> Detector {
-        let mut detector = Detector::new(LOCAL, Exposure::new(), room());
+        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION);
         for &peer in peers {
             detector.join(peer).unwrap();
         }
@@ -1941,6 +2015,58 @@ mod tests {
             Liveness::Alive,
             "and judged nothing"
         );
+    }
+
+    /// A first probe, before any round trip, whose ping or answer was lost ends at the initial
+    /// wait, and the next unanswered one at twice it: waiting on another member instead, members
+    /// whose first probes were all lost waited on one another for ever (slates' daemons, the
+    /// datagrams queued at a re-key dropped).
+    #[test]
+    fn a_lost_first_probe_ends_at_the_initial_wait() {
+        let mut detector = detector(&[A, B]);
+        let mut requests = Vec::new();
+        let first = detector.poll(0, &mut requests).unwrap();
+        assert_eq!(
+            detector.wake(),
+            Some(INITIAL_WAIT_NS),
+            "a wake before any round trip"
+        );
+        assert_eq!(detector.poll(INITIAL_WAIT_NS - 1, &mut requests), None);
+        let second = detector.poll(INITIAL_WAIT_NS, &mut requests).unwrap();
+        assert_ne!(second.nonce, first.nonce, "probing again");
+        assert_eq!(
+            detector.wake(),
+            Some(3 * INITIAL_WAIT_NS),
+            "backed off: twice the initial wait"
+        );
+        assert_eq!(
+            liveness(&detector, first.to),
+            Liveness::Alive,
+            "judging nothing"
+        );
+    }
+
+    /// A peer joined with its handshake's round trip is first probed on that round trip's wait, not
+    /// the initial one; a peer joined without one waits the initial wait, backed off.
+    #[test]
+    fn a_handshake_round_trip_sets_the_first_wait() {
+        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION);
+        let handshake = Duration::from_micros(100);
+        detector.join_measured(A, handshake).unwrap();
+        detector.join(B).unwrap();
+        let mut requests = Vec::new();
+        // Each period's target and its wait, the first unanswered one doubling the second's.
+        let first = detector.poll(0, &mut requests).unwrap();
+        let first_wait = detector.wake().unwrap();
+        let second = detector.poll(first_wait, &mut requests).unwrap();
+        let second_wait = detector.wake().unwrap() - first_wait;
+        let base = u64::try_from(handshake.as_nanos()).unwrap();
+        let expected = if first.to == A {
+            [(A, base), (B, 2 * INITIAL_WAIT_NS)]
+        } else {
+            [(B, INITIAL_WAIT_NS), (A, 2 * base)]
+        };
+        assert_eq!([(first.to, first_wait), (second.to, second_wait)], expected);
     }
 
     /// Measurement periods follow round trips that lengthen. A measurement period ends at its
@@ -2065,6 +2191,40 @@ mod tests {
         assert!(detector.detection_bound(world.now).is_some());
     }
 
+    /// A member whose every wake is read exactly on time configures and judges: its `G` is the
+    /// clock's resolution. As the mean of its wakes, zero, `G` floored nothing, and the member
+    /// configured no pair and suspected nobody however long it ran (slates' harness, which wakes
+    /// its detectors when they ask).
+    #[test]
+    fn a_member_whose_wakes_read_on_time_configures_and_judges() {
+        let peers = [A, B, C];
+        let mut detector = detector(&peers);
+        let mut world = World::new();
+        world.late = 0;
+        configured(&mut detector, &mut world, &peers);
+        assert_eq!(detector.granularity(), Some(RESOLUTION));
+        let mut state = 21;
+        while liveness(&detector, A) == Liveness::Alive {
+            world.run(&mut detector, 0, |peer| {
+                (peer != A).then(|| jitter(&mut state))
+            });
+        }
+        assert_eq!(liveness(&detector, A), Liveness::Suspect);
+    }
+
+    /// A round trip measured before the member has a wake and a period measured is taken by no
+    /// estimator, and counted.
+    #[test]
+    fn a_round_trip_before_the_first_wake_is_counted_unmeasured() {
+        let mut detector = detector(&[A, B]);
+        let mut requests = Vec::new();
+        let first = detector.poll(0, &mut requests).unwrap();
+        assert_eq!(detector.granularity(), None, "no wake yet");
+        detector.on_ack(first.to, first.nonce, MS);
+        assert_eq!(detector.unmeasured(), 1);
+        assert_eq!(detector.round_trips_taken(first.to), Some(0));
+    }
+
     /// The detection bound counts every member the view holds, not the current round's: a member
     /// that condemned two others (falsely, under a CPU throttle) ran rounds of one while the
     /// victim's last probe had been in a round of three, and stated a bound a third as long.
@@ -2115,7 +2275,12 @@ mod tests {
     /// counted, and nothing keyed by a member outgrows the view.
     #[test]
     fn gossip_of_more_members_than_the_view_holds_is_refused() {
-        let mut detector = Detector::new(LOCAL, Exposure::new(), NonZeroUsize::new(8).unwrap());
+        let mut detector = Detector::new(
+            LOCAL,
+            Exposure::new(),
+            NonZeroUsize::new(8).unwrap(),
+            RESOLUTION,
+        );
         detector.apply_gossip((10..10_010u64).map(|id| (HostId(id), alive(0))));
         assert_eq!(
             detector.membership().len(),
@@ -2210,7 +2375,12 @@ mod tests {
     #[test]
     fn a_record_past_its_window_makes_room_and_one_inside_it_does_not() {
         let peers = [A, B, C];
-        let mut detector = Detector::new(LOCAL, Exposure::new(), NonZeroUsize::new(4).unwrap());
+        let mut detector = Detector::new(
+            LOCAL,
+            Exposure::new(),
+            NonZeroUsize::new(4).unwrap(),
+            RESOLUTION,
+        );
         for peer in peers {
             detector.join(peer).unwrap();
         }
@@ -2624,7 +2794,7 @@ mod tests {
             .unwrap();
         let mut batch = Vec::new();
         source.gossip_into(10, &mut batch);
-        let mut other = Detector::new(B, Exposure::new(), room());
+        let mut other = Detector::new(B, Exposure::new(), room(), RESOLUTION);
         other.join(A).unwrap();
         other.apply_gossip(batch);
         assert_eq!(liveness(&other, A), Liveness::Dead);
@@ -2676,7 +2846,10 @@ mod tests {
     /// (the cluster test's deadlock under a one-CPU throttle).
     #[test]
     fn members_that_hold_each_other_dead_heal() {
-        let (mut x, mut y) = (detector(&[A]), Detector::new(A, Exposure::new(), room()));
+        let (mut x, mut y) = (
+            detector(&[A]),
+            Detector::new(A, Exposure::new(), room(), RESOLUTION),
+        );
         y.join(LOCAL).unwrap();
         let dead = |host| {
             (
@@ -2735,10 +2908,10 @@ mod tests {
             refuted.gossip_into(10, &mut batch);
         }
         assert!(batch.is_empty());
-        let mut holds_dead = Detector::new(A, Exposure::new(), room());
+        let mut holds_dead = Detector::new(A, Exposure::new(), room(), RESOLUTION);
         holds_dead.join(LOCAL).unwrap();
         holds_dead.apply(LOCAL, dead).unwrap();
-        let mut forgot = Detector::new(B, Exposure::new(), room());
+        let mut forgot = Detector::new(B, Exposure::new(), room(), RESOLUTION);
         forgot.join(LOCAL).unwrap();
         forgot.apply(LOCAL, dead).unwrap();
         forgot.forget(LOCAL);
@@ -2787,7 +2960,7 @@ mod tests {
     /// A detector for `local` that knows `peers` and has run a few periods, everyone answering: it
     /// has a dissemination window.
     fn running(local: HostId, peers: &[HostId], world: &mut World) -> Detector {
-        let mut detector = Detector::new(local, Exposure::new(), room());
+        let mut detector = Detector::new(local, Exposure::new(), room(), RESOLUTION);
         for &peer in peers {
             detector.join(peer).unwrap();
         }
@@ -2945,7 +3118,7 @@ mod tests {
             incarnation: 0,
         };
         let mut prober = detector(&[A]);
-        let mut holder = Detector::new(A, Exposure::new(), room());
+        let mut holder = Detector::new(A, Exposure::new(), room(), RESOLUTION);
         holder.join(LOCAL).unwrap();
         holder.apply(LOCAL, dead).unwrap();
         let mut batch = Vec::new();
@@ -3080,7 +3253,7 @@ mod tests {
             }
         }
         let hosts: Vec<HostId> = (0..9u64).map(|i| HostId(100 + i)).collect();
-        let mut detector = Detector::new(hosts[0], Exposure::new(), room());
+        let mut detector = Detector::new(hosts[0], Exposure::new(), room(), RESOLUTION);
         for (index, &host) in hosts.iter().enumerate().skip(1) {
             detector.join(host).unwrap();
             detector.learn_coordinate(host, Coordinate::Held(engines[index].coordinate()));

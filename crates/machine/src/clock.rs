@@ -23,6 +23,34 @@ pub fn monotonic_ns() -> u64 {
     .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(u64::MAX))
 }
 
+/// The resolution of [`monotonic_ns`]'s clock in nanoseconds, as the operating system reports it for that very clock
+/// (`clock_getres`): the least step its readings take, at least one. A consumer that judges lateness from readings
+/// (hyper-swim's `G`, A-67) is told this, never an assumed value (R3).
+#[cfg(unix)]
+pub fn resolution_ns() -> u64 {
+  #[cfg(target_os = "linux")]
+  let clock = rustix::time::ClockId::Boottime;
+  #[cfg(not(target_os = "linux"))]
+  let clock = rustix::time::ClockId::Monotonic;
+  let resolution = rustix::time::clock_getres(clock);
+  /// Format: the number of nanoseconds in one second (SI units).
+  const NS_PER_SECOND: u64 = 1_000_000_000;
+  u64::try_from(resolution.tv_sec)
+    .unwrap_or(u64::MAX)
+    .saturating_mul(NS_PER_SECOND)
+    .saturating_add(u64::try_from(resolution.tv_nsec).unwrap_or(u64::MAX))
+    .max(1)
+}
+
+/// The resolution of [`monotonic_ns`]'s clock in nanoseconds: the interrupt-time unit `QueryInterruptTimePrecise`
+/// reports in (realtimeapiset.h), 100 ns.
+#[cfg(windows)]
+pub fn resolution_ns() -> u64 {
+  /// Format: the Win32 interrupt-time unit is 100 nanoseconds (realtimeapiset.h).
+  const NS_PER_TICK: u64 = 100;
+  NS_PER_TICK
+}
+
 /// Monotonic nanoseconds in this host's boot/time namespace, shared across process restarts.
 #[cfg(windows)]
 pub fn monotonic_ns() -> u64 {
