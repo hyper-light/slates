@@ -321,8 +321,8 @@ volume.
   docs/bugs/2026-09-06-clone-recovery-root-number.md) and restoring the origin epoch. Since A-64 the clone and its
   origin name the same blocks and recover sharing them, claimed once
   (`a_clone_and_its_origin_recover_sharing_their_chunks`: the recovered store holds exactly what the live one did).
-  Owed: the clone's inode records are still rebuilt apart from the origin snapshot's (the live clone shares them),
-  and a process-level clone-across-restart test through the daemon.
+  Since `1ca4804` the clone's records are its origin snapshot's too (`Volume::clone_from_image`, rebuilt after its
+  origin), and a daemon test recovers a clone across a restart.
 - **Referenced-but-unlinked orphans.** *(Content and tracking landed.)* The inode walk covers the
   whole table, so an orphan's content is captured with every other inode's, and its orphan tracking
   travels in the image's `orphans` list, so a recovered orphan is reclaimed when its handle finally

@@ -8399,3 +8399,8 @@ Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.
      their own formula (`docs/bugs/2026-10-03-the-anchor-sized-the-content-object-at-half-the-daemons-need.md`).
      Proven by the relief test and the server recovery suite on macOS (15/15). On Linux 6.12 the FUSE in-flight
      takeover test passed 3/3, replaying 5 logged writes per kill with every page exact.
+- Followed the same day (`1ca4804`): the held replicas' image names its blocks the same way (recovery claims, re-verifies
+  each chunk in place and adopts the block); and a clone's image carries only its own inodes and the numbers it holds
+  from its origin snapshot, recovered by `Volume::clone_from_image` over the recovered origin — rebuilt copies had
+  leaked every unchanged record at the clone's destroy. Image version 13. The allocator's deferral costs an
+  allocator nothing publishes from one flag test (`d256cde`: CI's instruction-count gate had seen +1.7%).
