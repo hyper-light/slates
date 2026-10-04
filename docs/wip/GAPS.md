@@ -3442,3 +3442,18 @@ Still open from the same CLI runs at load average about 60, each seen once:
 
 Both passed 3/3 alone and the suite then passed 5/5 at load average 12–42. Owed: a reproduction under load,
 then a diagnosis from logs.
+
+### 2026-10-04: a landing's writes cannot be redirected outside its target by link swaps (proven)
+
+`crates/land/tests/os_escape.rs` strikes a real granted landing before each of its seam calls in turn (59 on macOS
+APFS, 58 on Linux in the CI image) with one of three links an attacker on the host would swap in:
+- the written directory replaced by a symlink outside;
+- an overwritten file replaced by a symlink to a file outside;
+- that file replaced by a hard link to it.
+
+After every history the outside directory is identical: entries, inodes, sizes, mtimes and bytes. The engine
+writes only through handles (`openat`-relative creates, renames that replace an entry, never a write in place
+through a name).
+
+Still owed for condition 4: the same battery against the base overlay's reads, and against the container and NFS
+paths (names with `/` or NUL, `..` at an export root, a container's own symlinks followed by a host-side tool).
