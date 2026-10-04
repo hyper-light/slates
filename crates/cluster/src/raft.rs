@@ -6433,6 +6433,81 @@ mod tests {
     );
   }
 
+  /// Catch-up under the fast track (hyper-raft's S-4 second finding, checked here 2026-10-04): every voter votes
+  /// `x` at index 2 and the leader fast-commits it. Do: replicate to `B` only, so `C` loses the appends that carry
+  /// `x` while the commit index that covers it moves on, then replicate to `C` again for a bounded number of
+  /// rounds. Expect: `C`'s log equals the leader's — a member that lost appends is caught up, whatever its window
+  /// held ahead of the hole.
+  #[test]
+  fn a_voter_that_lost_the_appends_behind_its_fast_vote_is_caught_up() {
+    let mut nodes = fast_group(&[A, B, C]);
+    let proposal = nodes[1].propose_fast(b"x".to_vec()).unwrap();
+    let votes: Vec<FastVote> = nodes
+      .iter_mut()
+      .filter_map(|node| node.on_fast_propose(proposal.clone()))
+      .collect();
+    for vote in votes {
+      nodes[0].on_fast_vote(vote);
+    }
+    let [mut a, mut b, mut c]: [RaftNode; 3] = nodes.try_into().ok().unwrap();
+    for _ in 0..3 {
+      replicate_once(&mut a, &mut [(B, &mut b)]);
+    }
+    assert!(a.commit_index() >= 2, "B and A committed x classically");
+    // C hears the leader again: a heartbeat-sized append first (its log ends before x), then whatever the
+    // leader sends while it backs up.
+    for _ in 0..8 {
+      replicate_once(&mut a, &mut [(C, &mut c)]);
+    }
+    assert_eq!(
+      c.saved().log,
+      a.saved().log,
+      "C was caught up to the leader's log"
+    );
+  }
+
+  /// Catch-up with two kept votes ahead of the gap (the S-4 variant): `x` at 2 and `y` at 3 are both voted by every
+  /// voter and fast-committed, and `C` misses every classic append that carries them while `A` and `B` commit
+  /// both. Do: deliver to `C` one append sliced to a single entry, then replicate normally for a bounded number
+  /// of rounds. Expect: `C`'s log equals the leader's: the window `C` kept ahead of its log does not stop the
+  /// leader filling it.
+  #[test]
+  fn a_voter_with_a_hole_below_what_it_kept_is_caught_up() {
+    let mut nodes = fast_group(&[A, B, C]);
+    for command in [b"x", b"y"] {
+      let proposal = nodes[1].propose_fast(command.to_vec()).unwrap();
+      let votes: Vec<FastVote> = nodes
+        .iter_mut()
+        .filter_map(|node| node.on_fast_propose(proposal.clone()))
+        .collect();
+      for vote in votes {
+        nodes[0].on_fast_vote(vote);
+      }
+    }
+    let [mut a, mut b, mut c]: [RaftNode; 3] = nodes.try_into().ok().unwrap();
+    for _ in 0..3 {
+      replicate_once(&mut a, &mut [(B, &mut b)]);
+    }
+    assert!(
+      a.commit_index() >= 3,
+      "A and B committed x and y classically"
+    );
+    // One sliced append first, as a byte-bounded replication sends it.
+    let one_entry = LogEntry::command(1, b"y".to_vec()).encoded_len();
+    if let Some(append) = a.replicate_to(C, one_entry) {
+      let reply = c.on_append_entries(append);
+      a.on_append_reply(reply);
+    }
+    for _ in 0..8 {
+      replicate_once(&mut a, &mut [(C, &mut c)]);
+    }
+    assert_eq!(
+      c.saved().log,
+      a.saved().log,
+      "C was caught up past its hole"
+    );
+  }
+
   /// §4: a new leader keeps its window — its recovery reads it, but a slot goes only once a classic commit
   /// covers its index. Clearing it at the election lost a chosen value in the explorer (seed 266): the new
   /// leader's log carried the value until a later leader's truncation erased it, and then nothing did.
