@@ -113,7 +113,7 @@ needs in a shared crate goes to the crate's owner (the mantle session) as a prop
 | Step | What | Waits for | State |
 |---|---|---|---|
 | H-1 | Snapshot hyper-timing, hyper-swim, hyper-datagram at hyper-raft `687244f` | — | done |
-| H-2 | Membership on hyper-swim, its probes on hyper-datagram's sealed plane | — | H-2a built: the sans-io core `slates_cluster::member_plane` with its tests; H-2b (the control shard's task, epochs on the record session) next |
+| H-2 | Membership on hyper-swim, its probes on hyper-datagram's sealed plane | — | built: the core (H-2a) and the control shard's task (H-2b, `crate::member_task`); the per-peer probe stack removed. Owed: re-vendor for hyper-raft's zero-granularity fix; the transport's unused control seal removed |
 | H-3 | The Raft core (X-1), hyper-timing's election law by suspicion, hyper-liveness's node-pair stream, hyper-durable over an anchor-RAM `LogStore` | hyper-raft R-3 (API change) | waiting |
 | H-4 | Stage 3: hyper-quic, hyper-tls and hyper-transport under slates' runtime and application layer | the mantle session's `quic-tls` merge | waiting |
 

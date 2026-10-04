@@ -116,6 +116,12 @@ pub struct PlaneCounts {
   pub refused_queue: u64,
   /// Membership updates the detector's bounded view refused.
   pub view_full: u64,
+  /// Relay requests this node sent: its direct probe went unanswered by its deadline (the indirect stage, §4.8).
+  pub relays_asked: u64,
+  /// Probes this node relayed for another member.
+  pub relayed: u64,
+  /// Indirect answers this node credited: a relay reached the target this node's direct probe could not.
+  pub indirect_acked: u64,
 }
 
 /// A node's failure detector and the datagram plane its probes ride.
@@ -238,6 +244,19 @@ impl MemberPlane {
     self.relaying.remove(&peer.0);
   }
 
+  /// Tells the detector a belief the fleet holds about `peer` (a death it learned outside the detector: a restarted
+  /// peer's old id, or a retirement), so the detector gossips it and a live peer refutes it with a higher incarnation.
+  /// The detector's own incarnation order decides whether it takes it. Counted when the bounded view refuses it.
+  pub fn apply(&mut self, peer: HostId, state: MemberState) {
+    if self
+      .detector
+      .apply(hyper_swim::HostId(peer.0), state)
+      .is_err()
+    {
+      self.counts.view_full = self.counts.view_full.saturating_add(1);
+    }
+  }
+
   /// The largest datagram the path to `peer` carries, from the transport's measurement of it.
   pub fn set_path(&mut self, peer: HostId, max_datagram: usize) -> Result<(), PlaneRefusal> {
     self.plane.set_path(peer.0, max_datagram)
@@ -251,6 +270,11 @@ impl MemberPlane {
   /// The detector: its view, verdicts and reports.
   pub fn detector(&self) -> &Detector {
     &self.detector
+  }
+
+  /// The detector's belief about `peer`, if it holds one.
+  pub fn belief(&self, peer: HostId) -> Option<MemberState> {
+    self.detector.membership().state(hyper_swim::HostId(peer.0))
   }
 
   /// What the plane refused, by kind.
@@ -289,6 +313,10 @@ impl MemberPlane {
     let mut requests = std::mem::take(&mut self.requests);
     let ping = self.detector.poll(now_ns, &mut requests);
     let local = hyper_swim::HostId(self.local.0);
+    self.counts.relays_asked = self
+      .counts
+      .relays_asked
+      .saturating_add(u64::try_from(requests.len()).unwrap_or(u64::MAX));
     for request in &requests {
       self.send(
         request.relay.0,
@@ -470,6 +498,7 @@ impl MemberPlane {
         }
         self.detector.apply_gossip(gossip);
         let ping = self.detector.on_ping_req(target);
+        self.counts.relayed = self.counts.relayed.saturating_add(1);
         self
           .relaying
           .insert(target.0, (ping.nonce, hyper_swim::HostId(sender), nonce));
@@ -497,6 +526,7 @@ impl MemberPlane {
         }
         self.detector.apply_gossip(gossip);
         self.detector.on_indirect_ack(target, nonce, stamp_ns);
+        self.counts.indirect_acked = self.counts.indirect_acked.saturating_add(1);
         events.push(PlaneEvent::Heard {
           from,
           boot_nonce,

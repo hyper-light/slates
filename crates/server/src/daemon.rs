@@ -1156,6 +1156,43 @@ impl Daemon {
     })
   }
 
+  /// The membership plane's counts (A-67 H-2): what its sealed plane refused, and its indirect stage's relay requests,
+  /// relayed probes and credited indirect answers. `Default` before the plane started.
+  pub fn fleet_plane_counts(
+    &self,
+  ) -> Result<slates_cluster::member_plane::PlaneCounts, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      s.plane
+        .plane
+        .as_ref()
+        .map(slates_cluster::member_plane::MemberPlane::counts)
+        .unwrap_or_default()
+    })
+  }
+
+  /// The membership plane's detector's belief about `host` (A-67 H-2): `Suspect` where its probes went unanswered,
+  /// before (or, in a two-member view, instead of) a condemnation.
+  pub fn fleet_plane_belief(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<Option<slates_cluster::membership::MemberState>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.plane.plane.as_ref().and_then(|plane| plane.belief(host))
+    })
+  }
+
+  /// What this node's fleet membership holds about `host` (its liveness and the incarnation it was asserted under), or
+  /// `None` for a member it has never seen: what a rejoin test reads to tell a refutation (a higher incarnation, which
+  /// only the member itself asserts) from a stale re-admission.
+  pub fn fleet_member_state(
+    &self,
+    host: slates_db::HostId,
+  ) -> Result<Option<slates_cluster::membership::MemberState>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.fleet.membership().state(host)
+    })
+  }
+
   /// The peers this node has **formed a probe session** to (§4.8 formation; the members of
   /// `formed_probe_peers`), for a formation observer to name which sessions are still missing when the
   /// mesh has not formed — beside the seeded members ([`fleet_members`](Daemon::fleet_members)) and the
@@ -2648,6 +2685,7 @@ fn init_shard(
     last_drain_ns: now,
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
+    plane: crate::member_task::PlaneState::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
@@ -2663,7 +2701,6 @@ fn init_shard(
     discovery_withhold_replies: false,
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
-    indirect: crate::fleet::IndirectProbes::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),

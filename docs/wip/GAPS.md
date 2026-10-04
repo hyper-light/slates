@@ -3299,3 +3299,30 @@ Owed, in order (`docs/wip/transport-quic.md` §6):
 
 Done: **H-1**, the snapshot of hyper-timing, hyper-swim and hyper-datagram at hyper-raft `687244f`
 (`vendor/hyper-raft/`).
+
+**H-2 built 2026-10-04.**
+- What: the membership task drives hyper-swim's one detector over hyper-datagram's sealed plane on the probe port.
+  Epochs are keyed from each pair's canonical record session. Every record session announces its dialer's identity.
+- Removed: the per-peer probe stack (1,764 lines of `server/src/fleet.rs`) and slates' old SWIM modules
+  (`detector`, `swim`, `gossip`, `coordinates`, `fixed`).
+- Ported: the takeover acceptance test (`crates/cluster/tests/member_plane.rs`), and the two gossip-admission
+  security tests (`member_task.rs`).
+- Fleet tests changed, each with its reason in its doc:
+  - two-node detection now asserts suspicion without condemnation;
+  - the forged identity is asserted at enrollment;
+  - the indirect stage is asserted on the plane's counts;
+  - mutual-death rejoin is asserted by refutation;
+  - the restart fixture's anchor is fixed (it had built a different machine, which the old probe sessions hid).
+
+### 2026-10-04: re-vendor hyper-timing and hyper-swim for the zero-granularity fix (A-67 H-2)
+
+hyper-raft branch `zero-granularity` (`97b9366`, on top of `core-r3`) closes the defect slates' integration found: a
+detector whose wakes read exactly on time never configured and never judged. `G` is now bounded below by the owner's
+clock resolution. `Detector::new(local, history, members, resolution)` takes that resolution, and
+`Detector::unmeasured()` counts the round trips not taken while a member is still measuring. Owed when it reaches
+hyper-raft main, green on six targets:
+- re-vendor both crates;
+- pass slates' monotonic clock resolution (1 ns for its Instant reads);
+- report `unmeasured` in `slates status`.
+
+The same revision states hyper-swim's rule that a two-member view never condemns, which slates' fleet suite now asserts.

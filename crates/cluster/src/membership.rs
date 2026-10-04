@@ -153,6 +153,17 @@ impl Membership {
       .collect()
   }
 
+  /// The members currently believed dead, with their states: the deaths the daemon tells its detector so they are
+  /// gossiped and a live member can refute them (A-67 H-2b).
+  pub fn dead(&self) -> Vec<(HostId, MemberState)> {
+    self
+      .members
+      .iter()
+      .filter(|(_, state)| state.liveness == Liveness::Dead)
+      .map(|(&host, state)| (host, *state))
+      .collect()
+  }
+
   /// The local node's current incarnation.
   pub fn local_incarnation(&self) -> u64 {
     self.local_incarnation

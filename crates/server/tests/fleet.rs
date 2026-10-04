@@ -518,14 +518,15 @@ fn start_with_policy(
   .expect("the fleet daemon starts")
 }
 
-/// AC (§4.8, boot step 6): two daemons form a live fleet — their control-shard membership loops dial,
-/// accept and probe each other over the transport (using `the demultiplexed serve sockets`, so neither is told the other's
-/// dial address in advance) — and when one dies, the survivor **detects it over the transport and retires
-/// it**. The retirement is the non-vacuous proof the loop ran end to end: the seeded configuration would
-/// hold the peer alive forever, so a peer that transitions from alive to gone did so only because the loop
-/// probed it, timed out, aged the suspicion to death, and folded that into the `FleetNode` the verbs read.
+/// AC (§4.8, boot step 6; A-67 H-2b): two daemons form a live fleet and, when one dies, the survivor's membership
+/// plane **suspects it** over the wire, the non-vacuous proof the plane ran end to end (the seeded view holds the
+/// peer alive). It does **not** condemn it: in a two-member view no third member's answer can show the survivor that
+/// its own network works, so condemning would retire a healthy peer on any partition (Lifeguard's local health,
+/// hyper-swim's rule; hyper-raft `docs/timing.md` §2.7). A two-node fleet cannot commit a retirement through its
+/// council either. Detection to retirement is proven at three nodes
+/// ([`three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node`]).
 #[test]
-fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
+fn a_two_member_survivor_suspects_its_dead_peer_and_never_condemns_it() {
   let _serial = serialize_fleet_tests();
   let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
   let a = node("a", pa_probe, pa_record);
@@ -568,18 +569,32 @@ fn a_daemon_detects_its_dead_peer_over_the_transport_and_retires_it() {
   // B dies — its shards, and so its serve loop, stop — so A's probes of B now time out.
   daemon_b.stop();
 
-  // A's membership loop detects the timeouts, ages the suspicion to death, and retires B: a transition only
-  // the loop can make over the transport.
-  let retired = poll_until(&[&daemon_a], RETIREMENT_DEADLINE, || {
-    daemon_a
-      .fleet_members()
-      .map(|members| !members.contains(&host_b))
+  // A's detector finds B's probes unanswered and suspects it: a transition only the membership plane can make. It
+  // never condemns B: in a two-member view no third member's answer shows A that its own network works (Lifeguard's
+  // local health, hyper-swim's rule), so B stays in A's fleet, suspected, rather than falsely retired by a partition.
+  let suspected = poll_until(&[&daemon_a], RETIREMENT_DEADLINE, || {
+    daemon_a.fleet_plane_belief(host_b).map(|belief| {
+      belief.is_some_and(|belief| belief.liveness == slates_cluster::membership::Liveness::Suspect)
+    })
+  });
+  let never_condemned = holds_for(FORMATION_SETTLE, || {
+    Ok(
+      daemon_a.fleet_members()?.contains(&host_b)
+        && daemon_a
+          .fleet_plane_belief(host_b)?
+          .map(|belief| belief.liveness)
+          != Some(slates_cluster::membership::Liveness::Dead),
+    )
   });
 
   daemon_a.stop();
   assert!(
-    retired,
-    "daemon A's membership loop detected B's death over the transport and retired it"
+    suspected,
+    "daemon A's detector suspected B once B's probes went unanswered"
+  );
+  assert!(
+    never_condemned,
+    "a two-member view never condemns: B stays in A's fleet, suspected"
   );
 }
 
@@ -970,7 +985,9 @@ fn a_falsely_retired_peer_rejoins_by_refutation() {
 /// ([`a_falsely_retired_peer_rejoins_by_refutation`]) waits for. Before the fix neither side probed a peer it
 /// believed dead, nothing crossed, and they stayed apart until one restarted: on KIND a council leader cut
 /// off for 15 s and healed had not rejoined 180 s later. Non-vacuous: both are shown apart first, then
-/// together, then staying together.
+/// together, then staying together, each holding the other at an incarnation only its refutation asserts (A-67 H-2b:
+/// the membership plane's detector gossips the fleet's deaths, so the refutation crosses; the old idle tasks'
+/// reconnect schedule is gone with the per-peer probe tasks).
 #[test]
 fn peers_that_each_believe_the_other_dead_find_each_other_again() {
   let _serial = serialize_fleet_tests();
@@ -1019,13 +1036,11 @@ fn peers_that_each_believe_the_other_dead_find_each_other_again() {
     && holds_for(FORMATION_SETTLE, || {
       each_holds_both().map(|(a_holds_b, b_holds_a)| a_holds_b && b_holds_a)
     });
-  // The rejoin came through an idle task reaching out: attempted, and answered.
-  let reached = [&daemon_a, &daemon_b].map(|daemon| {
-    (
-      refusal_count(daemon, "fleet.reconnect.attempted"),
-      refusal_count(daemon, "fleet.reconnect.answered"),
-    )
-  });
+  // The rejoin came through each side's refutation (A-67 H-2b): the membership plane's detector gossips the death the
+  // fleet holds, the live member refutes it, and each holds the other alive above the injected death's incarnation,
+  // which only the member itself can assert.
+  let refuted = [(&daemon_a, host_b), (&daemon_b, host_a)]
+    .map(|(daemon, peer)| daemon.fleet_member_state(peer));
 
   daemon_a.stop();
   daemon_b.stop();
@@ -1039,11 +1054,12 @@ fn peers_that_each_believe_the_other_dead_find_each_other_again() {
     "they stayed together — the re-admission did not flap"
   );
   assert!(
-    reached.iter().any(|reached| matches!(
-      reached,
-      (Ok(tried), Ok(heard)) if *tried >= 1 && *heard >= 1
+    refuted.iter().all(|state| matches!(
+      state,
+      Ok(Some(state)) if state.liveness == slates_cluster::membership::Liveness::Alive
+        && state.incarnation > FALSE_DEATH_INCARNATION
     )),
-    "an idle task reached out and was answered: {reached:?}"
+    "each holds the other alive above the injected death, by its refutation: {refuted:?}"
   );
 }
 
@@ -1353,13 +1369,20 @@ fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_address
   let (Some(b_first), Some(b_again)) = (b_identities.next(), b_identities.next()) else {
     panic!("B's identity twice");
   };
+  // The restart is the same machine: B's profile and so its anchor, with B's certificate, on a fresh segment (a new
+  // member id). A different anchor presenting B's certificate is a different machine, which discovery refuses
+  // (`fleet.enrollment_identity`); the old probe sessions skipped discovery, which hid that this fixture built one.
+  let b_again = Node {
+    identity: b_again,
+    host: b.host,
+    origin_anchor: b.origin_anchor,
+    address: b.address,
+    record_address: b.record_address,
+    profile: b.profile.clone(),
+  };
   let b = Node {
     identity: b_first,
     ..b
-  };
-  let b_again = Node {
-    identity: b_again,
-    ..node("b", pb_probe, pb_record)
   };
   let peer_of_a = Peer {
     anchor: b.origin_anchor,
@@ -1402,8 +1425,9 @@ fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_address
   );
 }
 
-/// Shape: the index of the record plane in `Daemon::fleet_demux_counters` (the probe plane comes first).
-const RECORD_PLANE: usize = 1;
+/// Shape: the index of the record plane in `Daemon::fleet_demux_counters`: its only demultiplexer, since the probe port
+/// carries the sealed membership plane (A-67 H-2), not QUIC sessions.
+const RECORD_PLANE: usize = 0;
 /// Shape: the dials of the re-dial burst — three, the 2026-09-14 burst that overflowed that fixture's
 /// two-slot pool (`peers × 2`, one peer). Kept as the burst whose replacement, client availability and
 /// reclamation this proves; the enrollment-sized pool (thousands of slots per plane) admits it whole, and
@@ -2346,9 +2370,11 @@ fn successor_serves(observed: &[&Daemon], fleet: &RestartFleet) -> ServedBy {
   }
 }
 
-/// The refusals the serve side counts for a membership announcement it will not fold (task #22), under the
-/// keys `Daemon::fleet_refusals` reports them — the same counts `slates status` prints.
-const FORGED_ID_REFUSAL: &str = "fleet.member_id_forged";
+/// The refusal the record plane's enrollment check counts for an announcement whose anchor its certificate does not
+/// derive (task #22), under the key `Daemon::fleet_refusals` reports it, the same count `slates status` prints. Since
+/// A-67 H-2b the forger is refused here, before its record session forms, so no membership announcement of its ever
+/// reaches learn-on-contact (`fleet.member_id_forged`, the refusal the old probe sessions met it at).
+const FORGED_ID_REFUSAL: &str = "fleet.enrollment_identity";
 
 /// Shape: the anchor the forged announcer is configured with — B's anchor with its lowest bit flipped, any
 /// anchor other than the one A's roster holds for B's certificate.
@@ -2357,7 +2383,8 @@ fn forged_anchor_of(anchor: HostId) -> HostId {
 }
 
 /// AC-8.1, §4.8: a member announcement that does not derive from its authenticated
-/// certificate anchor is refused, counted, and never admitted to discovery membership.
+/// certificate anchor is refused, counted, and never admitted to discovery membership. Since A-67 H-2b the record
+/// plane's enrollment check refuses it before any session forms ([`FORGED_ID_REFUSAL`]).
 #[test]
 fn a_forged_announcement_is_refused_and_counted() {
   let _serial = serialize_fleet_tests();
@@ -2543,14 +2570,13 @@ fn observe_refused(fleet: &RefusalFleet, forged: &Daemon) -> Refused {
     refusal_count(a, FORGED_ID_REFUSAL).map(|count| count >= 1)
   });
   let membership_held = holds_for(FORMATION_SETTLE, || knows_exactly(a, &[host_a, b_new]));
-  let aged_a = |announcer: &Daemon| {
-    poll_until(&observed, RETIREMENT_DEADLINE, || {
-      announcer
-        .fleet_members()
-        .map(|members| !members.contains(&host_a))
-    })
-  };
-  let forged_unanswered = aged_a(forged);
+  // Never acknowledged: the forger's record link to A never formed, so it holds no session A answers on. (Its view
+  // cannot condemn A: A is its only peer, and a two-member view only suspects, Lifeguard's local-health rule.)
+  let forged_unanswered = holds_for(FORMATION_SETTLE, || {
+    forged
+      .fleet_record_links()
+      .map(|links| links.iter().all(|(_, live)| !live))
+  });
   Refused {
     forged_counted,
     membership_held,
@@ -2571,7 +2597,7 @@ fn assert_refused(refused: &Refused) {
   );
   assert!(
     refused.forged_unanswered,
-    "the forged announcer was never acknowledged — A aged to death in its view"
+    "the forged announcer was never acknowledged: its record link to A never formed"
   );
 }
 
@@ -5213,8 +5239,8 @@ const INDIRECT_HOLD_PERIODS: u64 = 100;
 /// direct probe times out, A asks C to reach B, C's probe of B is acknowledged and C carries that answer
 /// back, and A credits it before the suspicion verdict — so B stays a member of A's fleet across a hold far
 /// longer than a direct-only detector needs to retire a silent peer. Non-vacuous on both sides: A counted a
-/// relayed answer credited (`fleet.probe.indirect.acked`) and C counted itself relaying one
-/// (`fleet.probe.indirect.relayed`), so a direct-only implementation cannot pass by B happening to answer.
+/// relayed answer credited and C counted itself relaying one (the membership plane's counts, A-67 H-2:
+/// `indirect_acked`, `relayed`), so a direct-only implementation cannot pass by B happening to answer.
 /// Then B goes silent to C as well — both paths lost — and the fleet **retires** B: the relay stage does
 /// not weaken eventual detection, it only spares a peer one path can still reach.
 #[test]
@@ -5246,10 +5272,7 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
 
   // A's direct probes of B now time out; the relay stage must run — A asks C, C reaches B, A credits it.
   let relayed = poll_until(&observed, RETIREMENT_DEADLINE, || {
-    Ok(
-      refusal_count(a, "fleet.probe.indirect.acked")? >= 1
-        && refusal_count(c, "fleet.probe.indirect.relayed")? >= 1,
-    )
+    Ok(a.fleet_plane_counts()?.indirect_acked >= 1 && c.fleet_plane_counts()?.relayed >= 1)
   });
 
   // Hold: across INDIRECT_HOLD_PERIODS of A's own periods B must stay a member of A's fleet. The wait ends
@@ -5262,9 +5285,10 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let kept = a
     .fleet_members()
     .is_ok_and(|members| members.contains(&host_b));
-  let acked_on_a = refusal_count(a, "fleet.probe.indirect.acked").unwrap_or(0);
-  let relayed_by_c = refusal_count(c, "fleet.probe.indirect.relayed").unwrap_or(0);
-  let requested_by_a = refusal_count(a, "fleet.probe.indirect.requested").unwrap_or(0);
+  let counts_a = a.fleet_plane_counts().unwrap_or_default();
+  let acked_on_a = counts_a.indirect_acked;
+  let requested_by_a = counts_a.relays_asked;
+  let relayed_by_c = c.fleet_plane_counts().unwrap_or_default().relayed;
 
   // Now B goes silent to C too: no path reaches it, and the fleet must retire it.
   b.inject_probe_deafness(&[host_a, host_c])

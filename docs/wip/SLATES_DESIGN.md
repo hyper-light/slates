@@ -3142,6 +3142,32 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 
 > **Correction (2026-09-16, the re-dial burst's refusal evidence).** The suite-under-load runs above include `a_peers_re_dial_burst_…`, whose `sessions_refused 0 → 9` on 2026-09-14 was read as the demultiplexer refusing a peer's third session. It was the then-two-slot **pool** (`peers × 2`, one peer) refusing the burst's overflow, not a per-peer quota; with the pool grown by enrollment (`f50e939`) the same burst is admitted whole and that assertion failed on every host (ubuntu gates lane, run 35131209643; this box, 23 s, pristine `b2f1ef7` and its parent alike). The measurements stand; their interpretation is corrected in the §4.3 note.
 
+> **Status (2026-10-04, the membership plane, A-67 H-2b).** The per-peer probe tasks and the indirect stage above are
+> replaced:
+> - One membership task on the control shard (`crate::member_task`) drives hyper-swim's one detector (vendored from
+>   `../hyper-raft`). Its probes are sealed datagrams on the probe port (hyper-datagram), keyed per pair from a
+>   canonical record session.
+> - Each record session announces its dialer's identity once per connection, so learn-on-contact validates whoever
+>   dials. The canonical one (the lower anchor dials) also carries the pair's rising epoch.
+> - The detector's view folds into every shard's `FleetNode`, which stays the authority (D-14). The fold refuses a
+>   stranger, and refuses an `Alive` for an unauthenticated id. Deaths the fleet learns elsewhere (learn-on-contact's
+>   restarts, an injected death) are told to the detector, so they are gossiped and a live peer refutes them (A-15's
+>   rejoin, on the plane).
+> - Once a peer's real member id is learned, its manifest seed placeholder is folded dead on every shard, once (the
+>   per-peer task's `follow_current_id` did this). Without it, the 3-process CLI deployment's survivor held two seed
+>   ids alive after the owner's death.
+>
+> Changed semantics, each recorded with its test:
+> - A two-member view suspects its silent peer but never condemns it: Lifeguard's local health wants an answer from a
+>   third member before a node trusts its own network (hyper-swim's rule, confirmed by its owner). A two-node fleet
+>   cannot commit a retirement through its council either.
+> - A forged identity is refused by the record plane's enrollment check (`fleet.enrollment_identity`) before any
+>   session forms.
+> - The indirect stage, the reconnect schedule and `ProbeTiming` are hyper-swim's measured detectors.
+>
+> Evidence: `crates/cluster/tests/member_plane.rs` (5 tests, the takeover acceptance test ported), the server's unit
+> tests, and the fleet suite over the plane (`crates/server/tests/fleet.rs`).
+
 > **Status (2026-09-14, the KIND lane).** The KIND lane runs the fleet on real Linux pods over a real network, installed by the Helm chart — the WAN status owed exactly this. It proves the image, the chart and its render, per-pod DNS resolution, cross-node UDP, mutual-TLS session establishment on both planes, fleet formation (peers probed, one council leader, election timing derived from the measured cross-node RTT tail, ≈ 3.6–6 ms), content placement at f + 1, and the SIGKILL takeover (the owner's pod deleted, the survivors retire it in ≈ 7 s, the successor serves the volume). It found five real defects the loopback and simulation harnesses never reached — four fixed on the lane's branch: the anchored-first-boot generation off-by-one that blocked all fleet formation, the epoll one-shot re-add, the core-matrix affinity leak, and the segment-handoff double-close; the fifth root-caused there with its failing test written — a fleet node's own tasks outside its task budget (`clients_per_shard × 2 + 5`, 25 at 1 GiB, against `5 + 6 × peers` fleet tasks), a client admission the runtime refuses dropped unrun, the client's id leaked until the node refuses every client, one pod of five never Ready — and fixed on main the same day by the fleet's derived task share (`DaemonConfig::with_fleet`, the §4.3 status of this date), with that test green on the merged tree; the id leak on a refused admission is closed separately (a drop guard on the admission future) — and built DNS-name dialing. Measured on main the same day once the task share landed (18:24–18:47): five replicas install and form in 7.5 s (`f = 2`, every pod probing four peers, one leader), and the `tc netem` profiles hold their leader for a three-minute window each with the election base derived from the measured tails (20 periods at 80 ms ± 20 ms, 24–25 with 1 % loss, 77–79 at the 350 ms ceiling — the numbers in the WAN-timing status above). Owed: a whole-pod restart rejoining — the lane's diagnostics show the replacement forms no probe session to its peers though all three pods are published Service endpoints and its self-refutation is correct in isolation, so this is a session-formation diagnosis (the demultiplexer's session lifecycle on a peer's IP change), not the incarnation design question first recorded (`docs/wip/kind-lane.md`); and a mount read-back inside a pod. Record: `docs/wip/kind-lane.md`. **Found by the merge (2026-09-14):** the lane's 38-peer test could not be dialed on main either, for a different reason than the task budget — a server's handshake flight carried the roster (rustls's certificate-authority hints: 3,024 bytes at 64 peers against the 2,048-byte receive buffer) and was truncated at the dialer; the roster verifier now sends no hints, an oversize flight is refused typed at the sender, and the test is green in 1.57 s (`docs/bugs/2026-09-14-servers-handshake-flight-grows-with-its-roster.md`).
 
 > **Correction (2026-09-17, KIND rejoin).** The session-formation diagnosis marked owed above

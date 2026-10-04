@@ -6,8 +6,11 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
+use slates_cluster::fleet::{FleetNode, apply_peer_state};
 use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
-use slates_db::register::HostId;
+use slates_db::register::{
+  Configuration, HostId, Lineage, ObjectId, Quorum, RegionalConfiguration,
+};
 
 use hyper_datagram::{ExporterSecret, Role, SECRET_BYTES};
 use hyper_swim::membership::Liveness;
@@ -19,6 +22,8 @@ const LATENCY_NS: u64 = 500_000;
 /// Shape: a timer's least lateness, nanoseconds: 50 µs, the order of a runtime's timer granularity; a wake fires up
 /// to twice this late.
 const TIMER_LATENESS_NS: u64 = 50_000;
+/// Shape: how many of the dead member's objects the survivors back: enough that some rank first to each survivor.
+const BACKED_OBJECTS: u64 = 64;
 /// Shape: the jitter's bound as a divisor of the latency: up to a fifth of it.
 const JITTER_DIVISOR: u64 = 5;
 /// Shape: the simulated time a run may take before it is a failure: long past the detector's evidence and its
@@ -316,7 +321,9 @@ fn condemnations_by_own_probes(fleet: &Network, victim: u64) -> usize {
   own
 }
 
-/// A-67 H-2. Do: run three members until every pair is judged, then kill one (its datagrams dropped both ways).
+/// A-67 H-2, T-8.5 (a death report crosses live neighbours; its transmission budget is hyper-swim's gossip_transmits,
+/// tested in hyper-raft's suite). Do: run three members until every pair is judged, then kill one (its datagrams
+/// dropped both ways).
 /// Expect: both survivors come to hold it dead (by their own probes within the detection bound their detector stated,
 /// or by the other's gossip), at least one by its own probes, and neither ever holds the other survivor dead.
 #[test]
@@ -439,4 +446,91 @@ fn a_probe_the_fleet_refuses_is_neither_answered_nor_folded() {
     fleet.members[&1].counts().refused_by_fleet > 0,
     "member 1 counted its refusals"
   );
+}
+
+/// Installs the configuration the council would commit for `dead`'s retirement and takes over, for `survivor`, each of
+/// `dead`'s objects that ranks to it; every object must go to a survivor (`survivor` or `other`). How many `survivor`
+/// took.
+fn install_retirement(
+  fleet_node: &mut FleetNode,
+  placement: &RegionalConfiguration,
+  (survivor, other, dead): (HostId, HostId, HostId),
+) -> usize {
+  let mut retired = placement.clone();
+  retired.take_over(dead, 3);
+  let configuration = retired
+    .configuration_for(survivor)
+    .unwrap_or_else(|| Configuration::solo(survivor));
+  fleet_node.install_configuration(configuration, &retired.members);
+  let mut taken = 0;
+  for index in 0..BACKED_OBJECTS {
+    let object = ObjectId::new(dead, index);
+    match retired.lineage(dead, object) {
+      Lineage::Successor { successor, .. } if successor == survivor => {
+        fleet_node.track_object_owner(object, survivor);
+        assert_eq!(fleet_node.object_owner(object), Some(survivor));
+        taken += 1;
+      }
+      Lineage::Successor { successor, .. } => assert_eq!(successor, other, "a survivor succeeds"),
+      lineage => panic!("{object:?} was not handed to a survivor: {lineage:?}"),
+    }
+  }
+  taken
+}
+
+/// AC (§4.8, boot step 6 live; ported from `membership_takeover.rs`'s probe-session test to the membership plane, A-67
+/// H-2b). Do: three members back member 3's objects; once every pair is judged, member 3 falls silent. Member 1 folds
+/// its detector's view into its `FleetNode` as the membership task does, and installs the configuration the council
+/// would commit for member 3's retirement. Expect: member 1 holds member 3 dead, member 3 leaves its neighbourhood,
+/// every one of member 3's objects goes to a survivor, and member 1 owns those that rank to it, at least one.
+#[test]
+fn a_silent_member_is_condemned_and_its_objects_are_taken_over() {
+  let (survivor, dead, other) = (HostId(1), HostId(3), HostId(2));
+  let placement = RegionalConfiguration::formed(
+    vec![survivor, other, dead],
+    Quorum { f: 1 },
+    std::collections::BTreeMap::new(),
+    u64::try_from(Quorum { f: 1 }.candidates()).unwrap(),
+    false,
+  );
+  let mut fleet_node = FleetNode::new(survivor, Quorum { f: 1 }, &[other, dead]);
+  for index in 0..BACKED_OBJECTS {
+    fleet_node
+      .track_object(ObjectId::new(dead, index), dead, &placement)
+      .unwrap();
+  }
+  let mut network = Network::new();
+  let judged = network.run_until(HORIZON_NS, |network| {
+    network.members[&1]
+      .detector()
+      .verdict(hyper_swim::HostId(3))
+      .is_some()
+  });
+  assert!(judged, "member 1's detector judges member 3");
+  network.killed.push(3);
+  let started = network.now_ns;
+  let condemned = network.run_until(started + HORIZON_NS, |network| {
+    matches!(network.liveness(1, 3), Some(Liveness::Dead))
+  });
+  assert!(condemned, "member 1 condemned member 3");
+  // The membership task's fold: the detector's belief about member 3, into the authority table.
+  let belief = network.members[&1]
+    .detector()
+    .membership()
+    .state(hyper_swim::HostId(3))
+    .unwrap();
+  apply_peer_state(&mut fleet_node, dead, Some(belief));
+  assert_eq!(
+    fleet_node
+      .membership()
+      .state(dead)
+      .map(|state| state.liveness),
+    Some(Liveness::Dead)
+  );
+  let taken = install_retirement(&mut fleet_node, &placement, (survivor, other, dead));
+  assert!(
+    !fleet_node.configuration().neighbourhood.contains(&dead),
+    "member 3 left the neighbourhood"
+  );
+  assert!(taken > 0, "member 1 took over the objects that rank to it");
 }

@@ -45,12 +45,8 @@
 
 pub mod config_group;
 pub mod content;
-pub mod coordinates;
-pub mod detector;
-pub(crate) mod fixed;
 pub mod fleet;
 mod fold;
-mod gossip;
 pub mod member_plane;
 pub mod membership;
 pub mod multilog;
@@ -59,7 +55,6 @@ pub mod raft;
 pub mod raft_wire;
 pub mod root_group;
 pub mod routing;
-pub mod swim;
 pub mod timing;
 
 use std::sync::mpsc::{TryRecvError, channel};

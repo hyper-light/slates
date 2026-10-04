@@ -9,6 +9,8 @@ readme.workspace = true
 description = "The daemon: shards over the runtime, the control shard's rendezvous, the lifecycle verbs of §4.4 with completion records, leases, attachments and quotas, recovery through the anchor segment (design §2.5, §2.6, §4.4, §4.7, §4.8, §4.13; Phase 2 task 4)."
 
 [dependencies]
+# The membership plane's exporter label and key types (A-67 H-2).
+hyper-datagram = { workspace = true }
 slates-machine = { workspace = true }
 slates-mem = { workspace = true }
 slates-rt = { workspace = true }

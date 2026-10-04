@@ -1,32 +1,28 @@
 //! The fleet membership loop the control shard runs (§4.8 "Membership"; §2.6 boot step 6). A fleet node
-//! probes each of its peers over the transport, serves their probes, replicates its volume heads to them,
-//! and folds the converged SWIM view into its [`FleetNode`](slates_cluster::fleet::FleetNode) — retiring a
-//! dead peer and taking over the objects that rendezvous now ranks first to this node.
+//! detects its peers' failures on the sealed membership plane, replicates its volume heads to them over record
+//! sessions, and folds the detector's view into its [`FleetNode`](slates_cluster::fleet::FleetNode). A dead peer
+//! is retired and the objects that rendezvous now ranks first to this node are taken over.
 //!
-//! **One serve socket per plane, every peer on it** (`slates_transport::demux::Demux`): a peer dials this
-//! node's advertised probe or record socket from an address chosen at dial time; the demultiplexer routes
-//! each datagram to that peer's session by the connection id in its header (a raw handshake datagram by
-//! its source, opening a session for a dialer it has not heard from), hands each new session to the
-//! plane's accept loop, and **replaces** a peer's old session when the peer re-dials after losing it —
-//! so a mid-run session loss recovers without anyone being told. This node *dials* each peer's serve
-//! sockets from separate sockets, so every session is cleanly one-directional (no bidirectional-request
-//! deadlock). A two-node fleet is the single-peer degenerate and is proven live
-//! (`crates/server/tests/fleet.rs`); the loop is the general N-peer form (it iterates the transport's
-//! peers), and a fleet of N forms its full N·(N−1) session mesh over 2N serve sockets (the handshake
-//! retries on one socket until the peer's accept completes — [`establish_session`]).
+//! **One serve socket per plane, every peer on it.**
+//! - The **record** socket is a QUIC demultiplexer (`slates_transport::demux::Demux`). A peer dials it from an
+//!   address chosen at dial time, and the demultiplexer routes each datagram to that peer's session by the
+//!   connection id in its header (a raw handshake datagram by its source, opening a session for a new dialer). It
+//!   hands each new session to the accept loop, and **replaces** a peer's old session when the peer re-dials
+//!   after losing it, so a mid-run session loss recovers without anyone being told. This node *dials* each peer's
+//!   record socket from a socket of its own, so every session is cleanly one-directional.
+//! - The **probe** socket carries the sealed membership plane (A-67 H-2, [`crate::member_task`]): hyper-swim's one
+//!   detector, its probes sealed datagrams keyed from each pair's canonical record session.
 //!
-//! **Tasks on the control shard.** The **probe** plane is per peer, because [`serve_probe`] borrows its
-//! detector across the receive await while [`probe_once`] does not — so a single shared detector cannot drive
-//! both — and each peer's detector is folded into the shared `FleetNode` by [`sync_peer`], which touches only
-//! the peer it tracks (its own deaths and joins), so N detectors compose. The **record** plane is one
-//! coordinator for all peers, because a commit and a takeover promotion span *several* holders at once:
-//! - the per-peer **probe** task owns a failure [`Detector`], dials the peer, and each protocol period probes
-//!   it, folds the acknowledgement (or lets a timeout age the suspicion), then folds the detector's view into
-//!   the shard's `FleetNode` and records any takeover;
-//! - the per-peer **serve** tasks accept the peer on this node's per-peer sockets and answer its probes (so
-//!   the peer sees this node alive) and its register record commits ([`serve_peer_records`] accepts each into
-//!   this node's **durable per-object hold** in the shard state, so it backs the peer as a candidate holder
-//!   and the record survives for a takeover to read);
+//! A two-node fleet is the single-peer degenerate and is proven live (`crates/server/tests/fleet.rs`). A fleet of
+//! N forms its N·(N−1) record sessions over N serve sockets.
+//!
+//! **Tasks on the control shard.**
+//! - The one **membership** task ([`crate::member_task::run`]) owns the detector, the plane and the probe socket. It
+//!   announces each canonical record session's epoch, probes, answers, and folds the detector's view into every
+//!   shard's `FleetNode` under the fleet's admission rule.
+//! - the per-peer **record serve** tasks answer the peer's register record commits ([`serve_peer_records`]
+//!   accepts each into this node's **durable per-object hold** in the shard state, so it backs the peer as a
+//!   candidate holder and the record survives for a takeover to read) and its plane epoch announcements;
 //! - the per-peer **record link** task ([`establish_record_link`]) keeps this node's client record session
 //!   to the peer up in the shard state ([`ShardState::record_sessions`]), retrying its handshake on one
 //!   socket each period and re-establishing a lost one — per peer, so one slow link never stalls the rest;
@@ -82,16 +78,12 @@ use slates_cluster::content::{
   CONTENT_CHUNK_STREAM, CONTENT_OFFER_STREAM, ContentMessage, fetch_chunks, fetch_manifest,
   is_content_stream, put_content,
 };
-use slates_cluster::coordinates::{CoordinateEngine, NetworkCoordinate};
-use slates_cluster::detector::{Detector, DetectorTiming};
-use slates_cluster::fleet::{apply_peer_state, sync_peer};
+use slates_cluster::fleet::apply_peer_state;
 use slates_cluster::membership::{Liveness, MemberState};
 use slates_cluster::raft_wire::RaftMessage;
 use slates_cluster::root_group::root_representatives;
-use slates_cluster::swim::{Delivery, ProbeOutcome, SwimMessage, deliver_once, probe_once};
 use slates_cluster::timing::{
-  ELECTION_MARGIN, ElectionTimer, ElectionTiming, FollowerStep, PathRtt, RoundAnchors,
-  quorum_priority, round_budget,
+  ElectionTimer, ElectionTiming, FollowerStep, PathRtt, RoundAnchors, quorum_priority, round_budget,
 };
 use slates_cluster::{
   ClusterError, CommitBudget, RECORD_STREAM, Stragglers, TimedReply, broadcast, commit_record,
@@ -114,11 +106,10 @@ use slates_transport::connection::{ConnectionShape, Priority};
 use slates_transport::demux::{Demux, DemuxId};
 use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
-use slates_transport::rtt::RttEstimator;
 use slates_vfs::clock::Clock;
 use slates_vfs::export::{Progress, SnapshotArchiver};
 
-use crate::daemon::{HEARTBEAT_NS, LIVENESS_BUDGET_NS};
+use crate::daemon::HEARTBEAT_NS;
 use crate::deploy::NodeAddress;
 use crate::dns::{self, Resolver};
 use crate::head::{HeadValue, PlacedHead, SealJob};
@@ -138,83 +129,11 @@ use crate::xshard::{call_within, run_on};
 /// 2,048 bytes, truncated at the receiver and read as losses, 2026-09-28).
 pub const FLEET_FRAME_CAP: usize = slates_transport::endpoint::MAX_PACKET_PAYLOAD;
 
-/// Derived: SWIM's infection factor rounded to a per-bit integer weight for `λ·ln(n+1)` (§4.8; SWIM §4.1).
-/// `λ·ln(x) = λ·ln(2)·log2(x)`, and the bit-length of `x` is `⌊log2(x)⌋+1`, so with SWIM's high-probability
-/// `λ ≈ 3` the coefficient `λ·ln(2) ≈ 2.08` rounds to `2` per bit — a small integer (determinism-clean, no
-/// float on any decision) that tracks `λ·ln(n+1)` within a rebroadcast across sizes (n=1 → 2, n=1000 → 20).
-const GOSSIP_PER_BIT: u32 = 2;
-
 /// Derived: the base suspicion window in protocol periods, at full local health (§4.8 "SWIM with
 /// Lifeguard"; SWIM §4.2 uses a small multiple of the period so a lost acknowledgement is retried by the
 /// next period before a member is suspected). Two periods: one to miss, one to confirm the miss, before the
 /// aging declares death; the Lifeguard multiplier dilates it when this node itself looks unhealthy.
 pub(crate) const SUSPICION_PERIODS: u32 = 2;
-
-/// Shape: how much an unanswered reconnection attempt lengthens the wait before the next ([`Reconnect`]) —
-/// doubling, the binary exponential backoff TCP applies to an unanswered retransmission (RFC 6298 §5.5, "the
-/// host MUST set RTO ← RTO * 2").
-const RECONNECT_BACKOFF: u64 = 2;
-
-/// Derived: the first span an idle probe task waits before reaching out to a peer it believes dead
-/// ([`Reconnect`]) — one suspicion window at full health, [`SUSPICION_PERIODS`] beats: as long as a live
-/// peer's silence takes to be suspected, so a partition that heals at once is found about as fast as it was
-/// lost.
-fn reconnect_first_ns() -> u64 {
-  HEARTBEAT_NS.saturating_mul(u64::from(SUSPICION_PERIODS))
-}
-
-/// Derived: the longest span an idle probe task waits between reconnection attempts — an order of magnitude
-/// ([`ELECTION_MARGIN`], the design's ratio of a timeout to the span it must dominate) past the longest a
-/// live peer's silence can take to be judged dead, the suspicion window at the Lifeguard cap
-/// (`SUSPICION_PERIODS × (LOCAL_HEALTH_CAP + 1)` beats): 6 s at the daemon's 100 ms beat. A peer gone for good
-/// costs one handshake in that span, and a healed partition is found within it.
-fn reconnect_cap_ns() -> u64 {
-  reconnect_first_ns()
-    .saturating_mul(u64::from(LOCAL_HEALTH_CAP.saturating_add(1)))
-    .saturating_mul(ELECTION_MARGIN)
-}
-
-/// When an idle probe task next reaches out to the peer it believes dead
-/// (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`). Re-admission (A-15) waits for a
-/// dead-believed peer's own probe to reach this node; after a symmetric partition each side believes the
-/// other dead, so neither probe would ever cross, and the halves stay apart until one restarts. So an idle task
-/// reaches out itself ([`reach_out`]): first one [`reconnect_first_ns`] after the peer was retired, each
-/// unanswered attempt lengthening the wait by [`RECONNECT_BACKOFF`] up to [`reconnect_cap_ns`], and an answered
-/// one starting it over — its refutation is then under way, and the next contact carries it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Reconnect {
-  due_ns: u64,
-  interval_ns: u64,
-}
-
-impl Reconnect {
-  /// The schedule for a peer retired at `now_ns`.
-  fn from(now_ns: u64) -> Reconnect {
-    let interval_ns = reconnect_first_ns();
-    Reconnect {
-      due_ns: now_ns.saturating_add(interval_ns),
-      interval_ns,
-    }
-  }
-
-  /// Whether an attempt is due at `now_ns`.
-  fn due(&self, now_ns: u64) -> bool {
-    now_ns >= self.due_ns
-  }
-
-  /// Schedules the attempt after one made at `now_ns`, which the peer `answered` or not.
-  fn attempted(&mut self, now_ns: u64, answered: bool) {
-    self.interval_ns = if answered {
-      reconnect_first_ns()
-    } else {
-      self
-        .interval_ns
-        .saturating_mul(RECONNECT_BACKOFF)
-        .min(reconnect_cap_ns())
-    };
-    self.due_ns = now_ns.saturating_add(self.interval_ns);
-  }
-}
 
 /// Derived: the Lifeguard local-health multiplier cap minus one — a 3× cap (§4.8 "bounded local-health
 /// multiplier"; the raw `(LHM+1)` reaches 9× at the paper's saturation, which pushes timers off a cliff, so
@@ -579,20 +498,13 @@ struct Rostered {
   anchor: HostId,
 }
 
-/// The peer a probe task tracks: its stable anchor (fixed for the task's life) and its **current** member id,
-/// which follows what the peer announces on contact (task #22) — a restart moves it to the new id.
-struct ProbedPeer {
-  anchor: HostId,
-  host: HostId,
-}
-
 /// Refused: a peer announced a member id that is not `member_id(anchor, boot_nonce)` for the certificate it
 /// presented — an id it could not have derived (a forgery, or a corrupted announcement). Counted in the
 /// status report's refusals, never folded.
 const MEMBER_ID_FORGED: &str = "fleet.member_id_forged";
 /// What learning an announced identity on contact concluded ([`classify_announced`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LearnedOutcome {
+pub(crate) enum LearnedOutcome {
   /// The id already known for this anchor at this boot_nonce — the ordinary contact.
   Current,
   /// A different boot nonce: the peer **restarted** and is a new member; `old` is the id it held
@@ -635,7 +547,7 @@ fn classify_announced(
 /// the new id (the region is the node's, not the incarnation's). A forged announcement is counted
 /// and folds nothing. Idempotent: a repeat of the same announcement is `Current`. Runs on the control shard,
 /// which alone keeps the learned map; the probe loop hands the old id's death to the other shards.
-fn learn_member(
+pub(crate) fn learn_member(
   state: &mut ShardState,
   anchor: HostId,
   boot_nonce: u64,
@@ -809,89 +721,6 @@ pub(crate) fn same_region(state: &ShardState, peer: HostId) -> bool {
   region(state.fleet.host()) == region(peer)
 }
 
-/// The member id currently learned for `anchor` (task #22): the control shard's learned map, `None` off it
-/// or for an anchor it has never seeded.
-fn current_member(anchor: HostId) -> Option<HostId> {
-  state::with_state(|s| s.learned_members.get(&anchor).map(|learned| learned.host)).flatten()
-}
-
-/// The SWIM/Lifeguard timing for a neighbourhood of `neighbourhood` members (this node plus its peers),
-/// derived from the design's stated formulas (§4.8 "Derived constants"): the base suspicion window is
-/// [`SUSPICION_PERIODS`]; gossip disseminates `λ·ln(n+1)` times ([`GOSSIP_PER_BIT`] × the bit-length of
-/// `n+1`); the local-health multiplier is capped at [`LOCAL_HEALTH_CAP`]; the confirmation curve is off
-/// (`suspicion_min = suspicion_periods`) and one corroboration suffices, because a small fleet has no
-/// indirect proxies to gather more, so the window is not held open waiting for confirmations that cannot
-/// arrive.
-fn detector_timing(neighbourhood: usize) -> DetectorTiming {
-  DetectorTiming {
-    suspicion_periods: SUSPICION_PERIODS,
-    gossip_transmits: neighbourhood_bits(neighbourhood)
-      .saturating_mul(GOSSIP_PER_BIT)
-      .max(1),
-    health_max: LOCAL_HEALTH_CAP,
-    suspicion_min: SUSPICION_PERIODS,
-    // The `K` of the Lifeguard confirmation curve is the number of relays asked (§4.8); with `suspicion_min
-    // == suspicion_periods` the curve is switched off, so this sets no timing today.
-    confirmations_expected: u32::try_from(indirect_fanout(neighbourhood)).unwrap_or(u32::MAX),
-  }
-}
-
-/// The bit-length of `n+1` (`⌊log2(n+1)⌋+1`) for a neighbourhood of `n` peers: the word width less its
-/// leading zeros; `saturating_sub` keeps the degenerate `n+1 = 1` at one bit. The size term every
-/// `O(log n)` SWIM budget is derived from — the gossip rebroadcasts ([`GOSSIP_PER_BIT`]) and the indirect
-/// fan-out ([`indirect_fanout`]).
-fn neighbourhood_bits(neighbourhood: usize) -> u32 {
-  usize::BITS.saturating_sub(neighbourhood.saturating_add(1).leading_zeros())
-}
-
-/// Derived: `k`, how many relays a prober asks to reach a target its direct probe could not (§4.8 "direct
-/// probe → k indirect proxies → SUSPECT"; SWIM §4.1's `k` ping-requests) — the bit-length of `n+1`, the same
-/// size term the gossip budget uses, so the number of independent relay paths tried grows with the log of
-/// the neighbourhood as SWIM's constants do (n = 2 → 2 relays, n = 1000 → 10) and never exceeds the peers
-/// that exist: the caller takes at most the alive relays it holds sessions to. At least one, so a
-/// two-peer neighbourhood still tries its one relay.
-fn indirect_fanout(neighbourhood: usize) -> usize {
-  usize::try_from(neighbourhood_bits(neighbourhood))
-    .unwrap_or(usize::MAX)
-    .max(1)
-}
-
-/// The probe's timing law for one peer (§4.8 "Derived constants": "detection timeout for membership from
-/// RTT p99 × k; SWIM period = max(k × RTT p99, scheduler quantum)") — the measured round trip of the path to
-/// this peer and how many probes in a row it has missed, from which each probe's deadline is derived
-/// (nothing here is a hidden constant):
-///
-/// - **From the measured round trip**: the RFC 9002 §6.2.1 probe timeout, `smoothed_rtt + max(4 · rttvar,
-///   granularity)` — Jacobson's mean-deviation bound on the round-trip tail (SIGCOMM 1988; the RTO the
-///   Internet runs on), the running form of "RTT p99 × k" with `k` in the four deviations — over the
-///   **shared path estimate** (`ShardState::peer_paths`, [`PathRtt`]), fed by every acknowledged probe (a
-///   timed-out probe yields no sample: Karn's rule) and, since 2026-09-14, by every consensus round's reply
-///   to this peer — one estimate per path, the same one the election timeout is derived from. A peer whose
-///   acknowledgements have grown slow (its shard starved on a loaded box) is waited for accordingly, and
-///   the estimate follows it back down.
-/// - **Floored at the scheduler quantum**: [`HEARTBEAT_NS`], the daemon's beat — the finest cadence anything
-///   on the control shard is scheduled at, so no deadline is set finer than the scheduler resolves (on a quiet
-///   loopback the estimate is ~50 ms, below it: the floor keeps the quiet behaviour exactly what it was).
-/// - **Backed off on each consecutive miss**: doubled per miss (RFC 9002 §6.2.4's exponential backoff — the
-///   miss produced no sample, so the wait must grow without one), so silence is probed at 1×, 2×, 4× … the
-///   estimate, not at a fixed beat six times over.
-/// - **Capped at the larger of the liveness budget and measured quantum**: [`LIVENESS_BUDGET_NS`]
-///   bounds the backoff at rest; a measured scheduling delay above it raises the cap so the floor still
-///   holds. A dead peer is declared after a bounded number of misses (six misses ≈ 4 s at rest).
-///
-/// The probe **period** the design names, `max(k × RTT p99, scheduler quantum)`, holds by construction: the
-/// probe task awaits each probe's outcome — its acknowledgement, or this deadline — before sleeping the
-/// quantum ([`probe_period_ns`]), so probes never overlap and the cadence is at least the path's round trip
-/// plus a beat.
-///
-/// The suspicion window ([`SUSPICION_PERIODS`]) still counts *probes*, so it dilates with the deadline: the
-/// misses that kill a peer are misses of an adaptive, backed-off wait — a live peer starved for seconds is no
-/// longer six 100 ms deadlines late; it is a slow peer the estimator and the backoff wait for
-/// (`docs/bugs/2026-09-13-swim-fixed-probe-deadline-kills-a-starved-live-peer.md`).
-struct ProbeTiming {
-  consecutive_misses: u32,
-}
-
 /// By-use evidence for the scheduler floor (§4.8): completed probes and live timer decisions whose
 /// measured quantum made them longer than the same decision at the heartbeat floor. Stored on the
 /// control shard, with no shared counter on a probe's path. The counts saturate for a long-lived node.
@@ -907,244 +736,6 @@ pub struct ProbeWindows {
   pub largest_quantum_ns: u64,
 }
 
-/// The indirect-probe stage's traffic between this node's per-peer probe tasks and its probe serve side
-/// (§4.8 "direct probe → k indirect proxies → SUSPECT"; SWIM §4.1; AUD-15). One detector runs per peer
-/// and each probe task owns the session to its peer, so the stage is a hand-off between tasks over these
-/// bounded queues rather than one detector's method calls:
-///
-/// - a **requester** whose direct probe of `target` timed out posts a ping-request for each chosen relay
-///   under `outgoing[relay]` and wakes the relay's probe task, which sends it on its session
-///   ([`carry_indirect_traffic`]);
-/// - the **relay**'s serve side, receiving a ping-request from an authenticated requester, posts the ask
-///   under `asks[target]` and wakes the target's probe task, which probes the target at once; an
-///   acknowledgement moves the ask to `results[requester]` and wakes the requester's probe task, which
-///   carries the answer back as an [`SwimMessage::IndirectAck`];
-/// - the **requester**'s serve side records a relayed answer under `acks[target]` and wakes the target's
-///   probe task, which credits it to its detector before the next tick ([`Detector::on_indirect_ack`]) —
-///   so the target is not suspected on a lost direct packet.
-///
-/// Every key is an authenticated member this node keeps direct contact with (a request naming another is
-/// refused and counted), so each map is bounded by the neighbourhood and the whole by its square; a newer
-/// request for the same pair replaces the older, so no queue grows with time. `coordinates` holds the
-/// coordinate each peer last announced, so relays are ranked nearest the target (the design's Vivaldi
-/// selection). `wakers` parks each probe task between probes ([`sleep_or_wake`]) so traffic is carried
-/// within a round trip rather than a period.
-#[derive(Default)]
-pub(crate) struct IndirectProbes {
-  /// Ping-requests this node has posted, by relay: the target and the requester's probe nonce.
-  pub outgoing: std::collections::BTreeMap<HostId, std::collections::BTreeMap<HostId, u64>>,
-  /// Asks this node received as a relay, by target: the requester and its probe nonce.
-  pub asks: std::collections::BTreeMap<HostId, std::collections::BTreeMap<HostId, u64>>,
-  /// Answers this node owes as a relay, by requester: the target reached and the requester's nonce.
-  pub results: std::collections::BTreeMap<HostId, std::collections::BTreeMap<HostId, u64>>,
-  /// Relayed acknowledgements of this node's own probes, by target: the latest nonce a relay reached it for.
-  pub acks: std::collections::BTreeMap<HostId, u64>,
-  /// The coordinate each peer last announced on an acknowledgement.
-  pub coordinates: std::collections::BTreeMap<HostId, NetworkCoordinate>,
-  /// The waker of each probe task parked between probes.
-  pub wakers: std::collections::BTreeMap<HostId, std::task::Waker>,
-}
-
-impl IndirectProbes {
-  /// Whether traffic awaits the probe task of `peer`: a ping-request to send it, an answer to carry to it,
-  /// an ask to probe it for, or a relayed acknowledgement to credit.
-  fn traffic_pending_for(&self, peer: HostId) -> bool {
-    self
-      .outgoing
-      .get(&peer)
-      .is_some_and(|queue| !queue.is_empty())
-      || self
-        .results
-        .get(&peer)
-        .is_some_and(|queue| !queue.is_empty())
-      || self.asks.get(&peer).is_some_and(|queue| !queue.is_empty())
-      || self.acks.contains_key(&peer)
-  }
-
-  /// Forgets everything about `peer` — its queues, its coordinate, its parked waker — when its probe task
-  /// releases it (retired): a request for a retired peer is refused thereafter, never queued.
-  fn forget(&mut self, peer: HostId) {
-    self.outgoing.remove(&peer);
-    self.asks.remove(&peer);
-    self.results.remove(&peer);
-    self.acks.remove(&peer);
-    self.coordinates.remove(&peer);
-    self.wakers.remove(&peer);
-  }
-}
-
-/// Wakes the probe task of `peer` if it is parked between probes ([`sleep_or_wake`]), so it carries the
-/// traffic just posted for it at once.
-fn wake_probe_task(state: &mut ShardState, peer: HostId) {
-  if let Some(waker) = state.indirect.wakers.remove(&peer) {
-    waker.wake();
-  }
-}
-
-/// The probe task's wait between probes of `peer`: the derived period, cut short the moment indirect-probe
-/// traffic is posted for this task ([`wake_probe_task`]), so a relay probes its target, and a requester
-/// credits a relayed answer, within a round trip of the request rather than up to a period later — the
-/// latency that keeps the indirect stage inside the suspicion window. Re-checks the queues before parking
-/// (a post that landed between the check and the park is not missed) and drops its waker on the way out.
-async fn sleep_or_wake(period_ns: u64, peer: HostId) {
-  let mut timer = std::pin::pin!(futures::sleep(period_ns));
-  // A refused period (off a shard) waits for traffic alone: counted, never read as the period passing, and
-  // never a spin (AUD-29-39).
-  let mut timed = true;
-  std::future::poll_fn(|cx| {
-    if timed {
-      match std::future::Future::poll(timer.as_mut(), cx) {
-        std::task::Poll::Ready(Ok(())) => return std::task::Poll::Ready(()),
-        std::task::Poll::Ready(Err(_)) => {
-          timed = false;
-          count_refusal(PERIOD_UNBOUNDED);
-        }
-        std::task::Poll::Pending => {}
-      }
-    }
-    let pending = state::with_state(|s| {
-      if s.indirect.traffic_pending_for(peer) {
-        return true;
-      }
-      s.indirect.wakers.insert(peer, cx.waker().clone());
-      false
-    })
-    .unwrap_or(true);
-    if pending {
-      return std::task::Poll::Ready(());
-    }
-    std::task::Poll::Pending
-  })
-  .await;
-  state::with_state(|s| {
-    s.indirect.wakers.remove(&peer);
-  });
-}
-
-/// The relays a requester asks to reach `target` (up to `fanout`, [`indirect_fanout`]): the alive peers it
-/// holds a formed probe session to, other than the target, ranked **nearest the target** in coordinate
-/// space when both coordinates are known (the design's Vivaldi selection — a near proxy is the likeliest
-/// to reach it, so a slow far peer is not mistaken for a failed near one; the same ordering
-/// [`Detector::request_indirect`] uses inside one detector), an unknown distance sorting last, ties in id
-/// order for determinism. Mirrors that pure method over the **shared** view, since each per-peer detector
-/// knows only its own peer.
-fn indirect_relays(state: &ShardState, target: HostId, fanout: usize) -> Vec<HostId> {
-  let alive = state.fleet.membership().alive();
-  let mut relays: Vec<HostId> = state
-    .formed_probe_peers
-    .iter()
-    .copied()
-    .filter(|peer| *peer != target && alive.contains(peer))
-    .collect();
-  let distance = |relay: HostId| -> Option<f64> {
-    let from = state.indirect.coordinates.get(&relay)?;
-    let to = state.indirect.coordinates.get(&target)?;
-    Some(CoordinateEngine::estimate_rtt(from, to))
-  };
-  relays.sort_by(|a, b| match (distance(*a), distance(*b)) {
-    (Some(x), Some(y)) => x.total_cmp(&y).then(a.0.cmp(&b.0)),
-    (Some(_), None) => std::cmp::Ordering::Less,
-    (None, Some(_)) => std::cmp::Ordering::Greater,
-    (None, None) => a.0.cmp(&b.0),
-  });
-  relays.truncate(fanout);
-  relays
-}
-
-/// Derived: how many of a requester's own probes a relayed acknowledgement may lag and still be credited —
-/// the suspicion window ([`SUSPICION_PERIODS`]): a relay's answer about a probe older than the window is
-/// no longer evidence against the suspicion the window would have declared, so it is dropped rather than
-/// credited to a later probe.
-const INDIRECT_ACK_LAG_PROBES: u64 = SUSPICION_PERIODS as u64;
-
-/// The control shard's scheduler quantum (§4.8 "SWIM period = max(k × RTT p99, scheduler quantum)"): the
-/// design's [`HEARTBEAT_NS`] floor raised to the shard's **measured** descheduling — how late its steps
-/// have run after the waits before them, reported by the runtime ([`futures::scheduler_overrun_ns`]).
-/// `HEARTBEAT_NS` alone is the design's *assumed* quantum, the finest cadence a control-shard task is
-/// scheduled at on a quiet host; but on an oversubscribed one (a CI runner running the whole suite on a
-/// few cores; a box at several times its core count) an idle shard is left off-CPU for far longer, and
-/// a fixed 100 ms quantum cannot account for that delay in its failure-detection windows
-/// (`docs/bugs/2026-09-16-fleet-detection-windows-use-a-fixed-scheduler-quantum.md`). It is measured off
-/// the shard's **waits** (only an idle shard parks or spins for its timer — a busy one never reaches
-/// either — so it is the OS descheduling, not the latency of serving this shard's own tasks), sits at
-/// `HEARTBEAT_NS` on a quiet host (a wait wakes within a tick, overrun ~0) — so every window that floors
-/// at it is unchanged there — and rises on an oversubscribed one. The failure detector's windows — the
-/// probe period, the probe deadline and its cap, and thereby the suspicion window — floor at it, so a
-/// node that is itself starved is slow to declare an equally-starved peer dead, in proportion to the
-/// starvation it observes. Only those: the node's own liveness signal — the record plane's council
-/// heartbeats and record ships, the re-dial cadences — keeps the heartbeat, since a starved node must
-/// announce itself as often as it can, not less often.
-fn scheduler_quantum_ns() -> u64 {
-  HEARTBEAT_NS.max(futures::scheduler_overrun_ns())
-}
-
-impl ProbeTiming {
-  /// A fresh law: no misses. Before the path has a sample the deadline is the RFC 9002 §6.2.2 initial probe
-  /// timeout (twice the initial RTT), conservative until the first acknowledgement seeds the estimate.
-  fn new() -> ProbeTiming {
-    ProbeTiming {
-      consecutive_misses: 0,
-    }
-  }
-
-  /// This probe's deadline over the path's measured tail (`None` before any sample): `max(tail or the
-  /// initial probe timeout, scheduler quantum) × 2^misses`, capped at the larger of
-  /// `LIVENESS_BUDGET_NS` and that quantum (the derivation on the type). The peer acknowledges inline,
-  /// so no acknowledgement delay is added.
-  fn deadline_ns(&self, path_tail_ns: Option<u64>) -> u64 {
-    self.deadline_at_quantum(path_tail_ns, scheduler_quantum_ns())
-  }
-
-  /// The same deadline law at a supplied quantum, also used to measure whether the live scheduler
-  /// floor changed a probe's budget. This comparison never selects a second execution path.
-  fn deadline_at_quantum(&self, path_tail_ns: Option<u64>, quantum: u64) -> u64 {
-    // Floored at the **measured** scheduler quantum, not the fixed heartbeat: on an oversubscribed host
-    // a live peer answers late by the shard's own descheduling, and the cap rises with it so the wait
-    // never expires inside the starvation this node itself observes.
-    let base = path_tail_ns
-      .unwrap_or_else(|| RttEstimator::new().initial_pto())
-      .max(quantum);
-    // A shift by the word width or more is already past the cap: saturate rather than overflow.
-    let backoff = 1u64
-      .checked_shl(self.consecutive_misses)
-      .unwrap_or(u64::MAX);
-    base
-      .saturating_mul(backoff)
-      .min(LIVENESS_BUDGET_NS.max(quantum))
-  }
-
-  /// The budget for this probe: its derived deadline, polled at the collection-loop cadence (a tenth of a
-  /// period, [`POLL_PER_PERIOD`]).
-  fn budget(&self, path_tail_ns: Option<u64>) -> CommitBudget {
-    let deadline = self.deadline_ns(path_tail_ns);
-    if deadline > self.deadline_at_quantum(path_tail_ns, HEARTBEAT_NS) {
-      let quantum = scheduler_quantum_ns();
-      let _ = state::with_state(|s| {
-        s.probe_windows.deadlines_dilated = s.probe_windows.deadlines_dilated.saturating_add(1);
-        s.probe_windows.largest_quantum_ns = s.probe_windows.largest_quantum_ns.max(quantum);
-      });
-    }
-    CommitBudget::hard(deadline, (HEARTBEAT_NS / POLL_PER_PERIOD).max(1))
-  }
-
-  /// The probe was acknowledged: the backoff resets (the round trip itself is the path estimate's sample,
-  /// folded by the caller into the shared path).
-  fn acknowledged(&mut self) {
-    self.consecutive_misses = 0;
-  }
-
-  /// The probe timed out: no sample (Karn's rule), one more consecutive miss to back off on.
-  fn missed(&mut self) {
-    self.consecutive_misses = self.consecutive_misses.saturating_add(1);
-  }
-}
-
-/// The measured tail of the path to `peer` (`None` before its first round trip), read off the shared path
-/// estimate on this shard.
-fn path_tail_ns(peer: HostId) -> Option<u64> {
-  state::with_state(|s| s.peer_paths.get(&peer).and_then(PathRtt::tail_ns)).flatten()
-}
-
 /// The slowest measured peer path's tail (`None` with no path measured) — what bounds a round to any set of
 /// peers this node dispatches to, so the coordinator's period budget is derived from it.
 fn slowest_path_tail_ns() -> Option<u64> {
@@ -1152,7 +743,7 @@ fn slowest_path_tail_ns() -> Option<u64> {
 }
 
 /// Folds one completed round trip to `peer` into its shared path estimate.
-fn sample_path(state: &mut ShardState, peer: HostId, round_trip_ns: u64) {
+pub(crate) fn sample_path(state: &mut ShardState, peer: HostId, round_trip_ns: u64) {
   state
     .peer_paths
     .entry(peer)
@@ -1245,6 +836,12 @@ const ROUND_ANCHORS: RoundAnchors = RoundAnchors {
 ///   deadline.
 fn consensus_budget(slowest_tail_ns: Option<u64>) -> CommitBudget {
   round_budget(&ROUND_ANCHORS, slowest_tail_ns)
+}
+
+/// The bound on one record-plane exchange: the measured control-plane round budget's full span, the bound every
+/// record-plane exchange runs under.
+pub(crate) fn record_exchange_budget_ns() -> u64 {
+  consensus_budget(slowest_path_tail_ns()).max_deadline_ns()
 }
 
 /// Serves the network export's listener on this shard (§4.6 "Kubernetes publication without privilege",
@@ -1358,8 +955,6 @@ pub async fn run_membership(transport: FleetTransport) {
     identity,
     name: kept_name,
     resolver,
-    local,
-    neighbourhood,
   };
   // The boot line of the fleet's derived timing (R3: every derived value logged with its inputs). Nothing is
   // measured yet, so every value is at its floor; each period re-derives it from the measured paths, and
@@ -1402,31 +997,24 @@ pub async fn run_membership(transport: FleetTransport) {
   // The demultiplexers are owned by this shard for its life and dropped with it (their sockets closed,
   // the ports free again — a restarted node binds the same addresses); a start refused here means this
   // loop is not on a shard thread, counted like a socket that would not bind.
-  let (Ok(probe_demux), Ok(record_demux)) = (
-    Demux::start(
-      probe_socket,
-      identity,
-      allowed.clone(),
-      fleet_shape(),
-      peer_capacity,
-    ),
-    Demux::start(
-      record_socket,
-      identity,
-      allowed,
-      fleet_shape(),
-      peer_capacity,
-    ),
+  let Ok(record_demux) = Demux::start(
+    record_socket,
+    identity,
+    allowed,
+    fleet_shape(),
+    peer_capacity,
   ) else {
     count_refusal(BIND_REFUSED);
     return;
   };
-  state::with_state(|s| s.demuxes = vec![probe_demux, record_demux]);
-  for demux in [probe_demux, record_demux] {
-    spawn_detached(run_demux(demux), LOOP_SPAWN_REFUSED);
-  }
+  state::with_state(|s| s.demuxes = vec![record_demux]);
+  spawn_detached(run_demux(record_demux), LOOP_SPAWN_REFUSED);
+  // The probe port carries the sealed membership plane (A-67 H-2): one detector for every peer, its probes datagrams
+  // keyed from each pair's canonical record session (`crate::member_task`).
+  let boot_nonce = state::with_state(|s| s.member_boot_nonce).unwrap_or(0);
+  let members = std::num::NonZeroUsize::new(neighbourhood).unwrap_or(std::num::NonZeroUsize::MIN);
   spawn_detached(
-    accept_probes(probe_demux, local, neighbourhood, roster.clone()),
+    crate::member_task::run(probe_socket, local, boot_nonce, members, resolver),
     LOOP_SPAWN_REFUSED,
   );
   spawn_detached(
@@ -1452,8 +1040,6 @@ struct PeerDriver {
   identity: Kept<Identity>,
   name: Kept<String>,
   resolver: Option<Kept<Resolver>>,
-  local: HostId,
-  neighbourhood: usize,
 }
 
 impl PeerDriver {
@@ -1464,14 +1050,16 @@ impl PeerDriver {
       count_refusal(LOOP_SPAWN_REFUSED);
       return;
     };
-    let probe = PeerDial {
-      anchor: peer.anchor,
-      host: peer.host,
-      name: name.clone(),
+    // The peer's probe-plane address, for the membership task (A-67 H-2): its datagrams go there once the pair's
+    // canonical record session has keyed an epoch.
+    let plane_peer = crate::member_task::PlanePeer {
+      seed: peer.host,
       address: peer.address,
       certificate: peer.certificate.clone(),
-      resolver: self.resolver,
+      resolved: None,
+      seed_retired: false,
     };
+    let _ = state::with_state(|s| s.plane.peers.insert(peer.anchor, plane_peer));
     let record = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
@@ -1480,10 +1068,6 @@ impl PeerDriver {
       certificate: peer.certificate,
       resolver: self.resolver,
     };
-    spawn_detached(
-      probe_peer(self.identity, probe, self.local, self.neighbourhood),
-      LOOP_SPAWN_REFUSED,
-    );
     spawn_detached(establish_record_link(self, record), LOOP_SPAWN_REFUSED);
   }
 }
@@ -1497,29 +1081,6 @@ async fn run_demux(demux: DemuxId) {
     // accepting sessions on a plane is a mesh that never forms with nothing to read but a count.
     count_refusal(SERVE_REFUSED);
     eprintln!("slates-server: fleet: a serve socket's receive loop ended: {e:?}");
-  }
-}
-
-/// Accepts every probe session a peer dials on the probe socket and serves it (§4.8): one serve task per
-/// session, ended by the session's failure or its replacement by the peer's re-dial. Bounded by the
-/// demultiplexer's session slots (`SESSIONS_PER_PEER` per peer): a task ends and releases its slot before
-/// another session for the same peer can be opened past that.
-async fn accept_probes(demux: DemuxId, local: HostId, neighbourhood: usize, roster: Vec<Rostered>) {
-  loop {
-    // An unreachable demultiplexer (the shard's context ended) ends the loop, counted as a serve socket
-    // that stopped accepting.
-    let Ok(session) = demux.accept().await else {
-      count_refusal(SERVE_REFUSED);
-      return;
-    };
-    // A full task arena drops the accepted session here, explicitly — its slot goes back to the
-    // demultiplexer and the peer's next re-dial takes a fresh one — and counts it, never lost in
-    // silence (banned item 9). The fleet's share of the arena is sized for every session the
-    // demultiplexer can hold (`config::with_fleet`), so the count is a tripwire.
-    spawn_detached(
-      serve_peer_probes(session, local, neighbourhood, roster.clone()),
-      SERVE_SPAWN_REFUSED,
-    );
   }
 }
 
@@ -1552,14 +1113,14 @@ async fn accept_records(demux: DemuxId, local: HostId, roster: Vec<Rostered>, dr
 /// period dials again. The socket binds every interface: a peer on another host is dialed from the address
 /// the kernel routes to it (a loopback-bound socket cannot send off the host). `None` if the name did not
 /// resolve or the runtime refuses the socket or endpoint.
-async fn client_for(
-  identity: Kept<Identity>,
-  name: &str,
-  address: (&NodeAddress, crate::deploy::Plane),
+/// The socket address of a peer's `plane`: discovery's address for its certificate first, else the manifest's
+/// `address` (a name resolved through `resolver`). A refusal is counted (the first of each kind logged).
+pub(crate) async fn resolve_peer_address(
+  address: &NodeAddress,
+  plane: crate::deploy::Plane,
   certificate: &CertificateDer<'static>,
   resolver: Option<Kept<Resolver>>,
-) -> Option<Endpoint> {
-  let (address, plane) = address;
+) -> Option<SocketAddrV4> {
   let discovered = state::with_state(|state| {
     state
       .discovery
@@ -1568,7 +1129,7 @@ async fn client_for(
   })
   .flatten();
   let address = discovered.as_ref().unwrap_or(address);
-  let peer = match address {
+  Some(match address {
     NodeAddress::Ip(address) => *address,
     NodeAddress::Name { host, port } => {
       let Some(resolver) = resolver else {
@@ -1593,7 +1154,18 @@ async fn client_for(
         }
       }
     }
-  };
+  })
+}
+
+async fn client_for(
+  identity: Kept<Identity>,
+  name: &str,
+  address: (&NodeAddress, crate::deploy::Plane),
+  certificate: &CertificateDer<'static>,
+  resolver: Option<Kept<Resolver>>,
+) -> Option<Endpoint> {
+  let (address, plane) = address;
+  let peer = resolve_peer_address(address, plane, certificate, resolver).await?;
   let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
   let shape = fleet_shape();
   let Some(built) =
@@ -1690,981 +1262,11 @@ async fn establish_session(
 /// session for — is the recovery.
 pub const ESTABLISH_BUDGETS_BEFORE_REDIAL: u32 = 2;
 
-/// Answers authenticated probes and shares adopted membership changes (§4.8). The prober's
-/// anchor and boot nonce are validated before any report is folded. A returning peer hears
-/// our death belief in the acknowledgement and refutes it from its shared local incarnation;
-/// its next alive report re-admits it. Reports about known third members disseminate onward,
-/// while strangers and superseded identities cannot enroll through gossip.
-async fn serve_peer_probes(
-  mut endpoint: Endpoint,
-  local: HostId,
-  neighbourhood: usize,
-  roster: Vec<Rostered>,
-) {
-  if let Err(e) = endpoint.establish().await {
-    count_accept_failure(&e, "probe");
-    return;
-  }
-  // Only a **rostered** certificate may move membership (auth): the anchor it stands for is what the prober's
-  // announced id and boot_nonce are validated against ([`learn_member`], task #22 learn-on-contact) — a
-  // restart announces a **different** boot_nonce (a random per-start value; nonces cannot establish numeric
-  // age order, so a different one, not a higher one, is what marks a restart), and its id is admitted as a
-  // **new member** while its old id is retired in that one fold; a stale or forged announcement is refused,
-  // counted, and not answered. An **unrostered or unauthenticated** prober receives no acknowledgement at all
-  // (the serve handler answers only after `learn_member` validates the presented certificate's anchor and
-  // boot_nonce), so authentication gates the reply, not only the fold. This node's own boot_nonce rides every
-  // acknowledgement, so the prober validates this node the same way.
-  let rostered_anchor = endpoint.peer_certificate().and_then(|presented| {
-    roster
-      .iter()
-      .find(|peer| peer.certificate == presented)
-      .map(|peer| peer.anchor)
-      .or_else(|| {
-        state::with_state(|state| {
-          state
-            .discovery
-            .as_ref()
-            .and_then(|discovery| discovery.recognizes(&presented))
-        })
-        .flatten()
-      })
-  });
-  if rostered_anchor.is_none() {
-    count_refusal(ACCEPT_REFUSED);
-    return;
-  }
-  let local_boot_nonce = state::with_state(|s| s.member_boot_nonce).unwrap_or(0);
-  let timing = detector_timing(neighbourhood);
-  let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
-  let mut detector = Detector::new(local, timing);
-  loop {
-    let served = endpoint
-      .serve_once(|_stream, request| match SwimMessage::decode(&request) {
-        // A ping-request announces no boot_nonce (it asks about a third party), so it is validated by the
-        // authenticated session it arrived on instead: its sender must be the member the session's anchor
-        // currently announces, and its target a member this node keeps direct contact with. Accepted, the
-        // ask is posted for the target's probe task — woken to probe at once — and the exchange is answered
-        // empty; the answer itself travels back on this node's own probe session to the requester.
-        Ok(SwimMessage::PingReq {
-          from,
-          target,
-          nonce,
-          gossip,
-        }) => {
-          state::with_state(|state| {
-            receive_ping_request(
-              state,
-              &mut detector,
-              rostered_anchor,
-              from,
-              target,
-              nonce,
-              &gossip,
-            );
-          });
-          Vec::new()
-        }
-        Ok(message) => {
-          let Some((gossip, configuration_version, standing)) = state::with_state(|state| {
-            let anchor = rostered_anchor?;
-            let boot_nonce = message.boot_nonce()?;
-            let peer = message.from();
-            if learn_member(state, anchor, boot_nonce, peer) == LearnedOutcome::Forged {
-              return None;
-            }
-            // Test support: a peer this node is deaf to gets no acknowledgement of its **direct** probe —
-            // the asymmetric path loss the indirect-probe regression imposes. Its gossip is not folded
-            // either (the packet is treated as lost), and the exchange is answered empty, which the prober
-            // reads as a timed-out probe.
-            if matches!(message, SwimMessage::Ping { .. }) && state.probe_deaf_to.contains(&peer) {
-              return None;
-            }
-            receive_probe_gossip(state, &mut detector, peer, message.gossip());
-            if let Some(coordinate) = message.coordinate() {
-              detector.learn_coordinate(peer, coordinate.clone());
-            }
-            // A relay's answer for one of this node's own probes: recorded for the target's probe task,
-            // which is woken to credit it before its next tick.
-            if let SwimMessage::IndirectAck { target, nonce, .. } = &message {
-              receive_indirect_ack(state, *target, *nonce);
-            }
-            // The holder side of the owner lease (§4.8 "Leases and reads"; AUD-08): this node is about to
-            // answer `peer`'s direct probe, a lease-confirming acknowledgement that feeds `peer`'s lease
-            // over its own objects (this node is one of its candidate holders). Record when, and the
-            // configuration version `peer` announces — the two facts that gate whether this node may later
-            // answer a successor's promotion of `peer`'s objects: it must stay silent for the membership
-            // horizon (so any lease it fed has expired) unless `peer` has announced it saw its retirement.
-            if let SwimMessage::Ping {
-              configuration_version,
-              ..
-            } = &message
-            {
-              let now = slates_machine::clock::monotonic_ns();
-              state.answers_given.answered_alive(peer, now);
-              state.answers_given.announced(peer, *configuration_version);
-            }
-            let belief = state.fleet.membership().state(peer);
-            // The owner-lease evidence this answer carries (§4.8 "Leases and reads"): this node's council
-            // configuration's view of the prober's authority standing, and the version it was read at, so the
-            // prober can tell its retirement from this node's not having admitted it yet.
-            let regional = state.council.configuration();
-            let (version, standing) = (regional.version, regional.standing_of(peer));
-            Some((
-              outgoing_probe_gossip(state, peer, belief, fanout),
-              version,
-              standing,
-            ))
-          })
-          .flatten() else {
-            // A forged identity may neither mutate membership nor receive credit.
-            return Vec::new();
-          };
-          SwimMessage::Ack {
-            from: local,
-            nonce: message.nonce().unwrap_or(0),
-            boot_nonce: local_boot_nonce,
-            configuration_version,
-            standing,
-            gossip,
-            coordinate: detector.coordinate(),
-          }
-          .encode()
-        }
-        Err(_) => Vec::new(),
-      })
-      .await;
-    if served.is_err() {
-      return;
-    }
-  }
-}
-
-/// A ping-request received on an authenticated probe session (this node is the relay): accepted when its
-/// sender `from` is the member the session's `anchor` currently announces (the requester's identity is the
-/// session's, since the request carries no boot_nonce) and its `target` is a member this node keeps direct
-/// contact with — the bound on the ask queue, so no authenticated peer can name arbitrary targets into it.
-/// Accepted, the requester's gossip is folded (an authenticated sender), the ask is posted under the
-/// target and the target's probe task is woken to probe it now; an acknowledgement answers every ask for
-/// that target ([`answer_relay_asks`]). Refused and counted otherwise.
-fn receive_ping_request(
-  state: &mut ShardState,
-  detector: &mut Detector,
-  anchor: Option<HostId>,
-  from: HostId,
-  target: HostId,
-  nonce: u64,
-  gossip: &[(HostId, MemberState)],
-) {
-  let requester = anchor.and_then(|anchor| {
-    state
-      .learned_members
-      .get(&anchor)
-      .map(|learned| learned.host)
-  });
-  if requester != Some(from) || !keeps_direct_contact_with(state, target) || target == from {
-    count_refusal_in(state, PROBE_INDIRECT_REFUSED);
-    return;
-  }
-  receive_probe_gossip(state, detector, from, gossip);
-  state
-    .indirect
-    .asks
-    .entry(target)
-    .or_default()
-    .insert(from, nonce);
-  wake_probe_task(state, target);
-}
-
-/// A relay's answer received on its authenticated probe session (this node is the requester, its sender
-/// already validated by [`learn_member`]): recorded under the `target` it reached — a peer this node
-/// probes, else refused and counted — with the requester's own probe `nonce` echoed, and that target's
-/// probe task woken to credit it before its next tick ([`probe_and_apply`]).
-fn receive_indirect_ack(state: &mut ShardState, target: HostId, nonce: u64) {
-  if !keeps_direct_contact_with(state, target) {
-    count_refusal_in(state, PROBE_INDIRECT_REFUSED);
-    return;
-  }
-  let latest = state.indirect.acks.entry(target).or_insert(nonce);
-  *latest = (*latest).max(nonce);
-  wake_probe_task(state, target);
-}
-
-/// At the top of a probe cycle, decides whether to probe this peer or idle. Returns `false` when the peer is
-/// **retired** — not one this node keeps direct contact with ([`keeps_direct_contact_with`]: its record
-/// neighbourhood, its council's voters, the root group's voters) — and the caller idles the task (it does not
-/// end: a believed-dead peer is never dialed, since that establish would block on a peer that will not
-/// answer, and no probe session is held; when the peer rejoins — its own probe reaching this node's serve
-/// side re-admits it at a higher incarnation, [`serve_peer_probes`] — the mesh regains it and probing
-/// resumes). On the resume from idle it realigns `detector` to the fleet's re-admitted belief, so the
-/// detector tracks the peer as alive and can detect a *future* death rather than carrying its stale death
-/// forever. Returns `true` to probe.
-fn resume_if_in_mesh(detector: &mut Detector, peer_host: HostId, was_idle: &mut bool) -> bool {
-  let contact = state::with_state(|s| direct_contact(s, peer_host));
-  let in_mesh = contact.is_some_and(DirectContact::kept);
-  if !in_mesh {
-    // Logged on the transition only (one line per idle), so a peer this node stops probing names its cause.
-    if !*was_idle {
-      eprintln!("slates-server: fleet: probe of {peer_host:?} idles: {contact:?}");
-    }
-    *was_idle = true;
-    return false;
-  }
-  if *was_idle {
-    eprintln!("slates-server: fleet: probe of {peer_host:?} resumes: {contact:?}");
-    if let Some(state) = state::with_state(|s| s.fleet.membership().state(peer_host)).flatten() {
-      detector.apply(peer_host, state);
-    }
-    *was_idle = false;
-  }
-  true
-}
-
-/// Folds this peer's detector view into the shard's `FleetNode` membership and returns whether the peer is
-/// now **retired** (out of the configuration's neighbourhood). Each detector times only its
-/// actual peer; authenticated third-member reports separately enter the shared gossip view.
-/// Incarnation ordering rejects stale alive reports. This only advances the
-/// **failure view**; the configuration is the regional council's (D-14), so a death drives no takeover here
-/// — the council leader reconciles the retirement from the folded view and, when it commits, the record
-/// plane installs the new configuration and takes over what fell to this node ([`sync_config_from_council`]).
-/// The folded state is handed to every other shard's membership copy **best-effort**, so all advance
-/// identically (D-7): the cross-shard `run_on` is idempotent (incarnation-gated) but not retried, since no
-/// off-control-shard path reads the raw SWIM membership — an owner shard routes and admits from the committed
-/// configuration, which `fan_configs_to_shards` re-fans every period — so a fold dropped on a momentarily
-/// full control channel is harmless (it is not, unlike the configuration, load-bearing on another shard).
-/// "Retired"
-/// means no longer a peer this node keeps direct contact with ([`keeps_direct_contact_with`] — read from the
-/// committed configuration and the consensus voter sets, not from one detector's suspicion); the caller then
-/// closes the peer's sessions on both planes, so this must be the **same** predicate the link task and the
-/// probe's resume use, or a consensus voter outside the copyset is probed, judged retired, and has its
-/// freshly dialed record session torn down every period.
-fn fold_peer_state(detector: &Detector, peer_host: HostId, origin: u16, shards: &[u16]) -> bool {
-  let retired = state::with_state(|s| {
-    sync_peer(detector.membership(), &mut s.fleet, peer_host);
-    let retired = !keeps_direct_contact_with(s, peer_host);
-    if retired {
-      // A discovery exchange pending on this peer's link re-checks it now, not at its deadline.
-      wake_link_waiter_of(s, peer_host);
-    }
-    retired
-  })
-  .unwrap_or(false);
-  let peer_state = detector.membership().state(peer_host);
-  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
-    let _ = run_on(origin, shard, move |s| {
-      apply_peer_state(&mut s.fleet, peer_host, peer_state);
-    });
-  }
-  retired
-}
-
-/// Sends one probe over `session` (when established) and folds its outcome into `detector` and `timing`,
-/// returning the session to carry forward. An acknowledgement clears the suspicion, learns the peer's gossip
-/// and coordinate, and feeds its round trip to the deadline law ([`ProbeTiming`]); a timeout is a
-/// **transient miss**, not a verdict — a lost packet, or a peer too starved to answer within the deadline —
-/// so the session is kept and re-probed next period at a backed-off deadline (only silence across the
-/// suspicion window ages the peer to death), while every ping to a suspected peer carries the suspicion for
-/// a still-live peer to refute ([`Detector::ping_gossip`]); a runtime refusal (never expected from the inline
-/// probe) drops it. The detector ticks only when a probe actually goes out, so an unestablished session never
-/// resolves as a miss.
-#[allow(clippy::too_many_arguments)]
-async fn probe_and_apply(
-  detector: &mut Detector,
-  session: Option<Endpoint>,
-  local: HostId,
-  local_boot_nonce: u64,
-  peer: &ProbedPeer,
-  fanout: usize,
-  nonce: u64,
-  timing: &mut ProbeTiming,
-) -> Option<Endpoint> {
-  let open = session?;
-  if let Some(belief) =
-    state::with_state(|state| state.fleet.membership().state(peer.host)).flatten()
-  {
-    detector.apply(peer.host, belief);
-  }
-  credit_relayed_answer(detector, peer.host, nonce);
-  detector.tick();
-  // The newest configuration version this node knows (installed, or a supersession a peer announced): so a
-  // holder receiving this probe learns at once when a retired owner has seen its retirement (§4.8 "Leases
-  // and reads"; AUD-08). Sent with the probe below; the sent time is captured before the send.
-  let (ping_gossip, announced_version) = state::with_state(|state| {
-    (
-      // The buddy system: a ping to a peer this node suspects always carries that suspicion, so the peer
-      // refutes it from this very probe rather than after the gossip budget is spent.
-      outgoing_probe_gossip(
-        state,
-        peer.host,
-        detector.membership().state(peer.host),
-        fanout,
-      ),
-      state
-        .lease
-        .known_version(state.fleet.configuration().version),
-    )
-  })?;
-  let sent_ns = slates_machine::clock::monotonic_ns();
-  let ping = SwimMessage::Ping {
-    from: local,
-    nonce,
-    boot_nonce: local_boot_nonce,
-    configuration_version: announced_version,
-    gossip: ping_gossip,
-  };
-  match probe_once(open, &ping, timing.budget(path_tail_ns(peer.host))).await {
-    Ok((
-      returned,
-      ProbeOutcome::Acked {
-        from,
-        boot_nonce,
-        configuration_version,
-        standing,
-        gossip,
-        rtt_ns,
-        coordinate,
-      },
-    )) => {
-      // Validate the announced identity before accepting either liveness or relayed gossip.
-      let admitted = state::with_state(|state| {
-        learn_member(state, peer.anchor, boot_nonce, from) != LearnedOutcome::Forged
-      })
-      .unwrap_or(false);
-      if !admitted {
-        return None;
-      }
-      if from == peer.host {
-        detector.on_ack(peer.host);
-        timing.acknowledged();
-        // The acknowledged round trip samples the shared path to this peer — the estimate the next probe's
-        // deadline, the election timing and the round budget are all derived from.
-        let _ = state::with_state(|s| {
-          sample_path(s, peer.host, rtt_ns);
-          s.probe_windows.acknowledged = s.probe_windows.acknowledged.saturating_add(1);
-          // The peer's announced coordinate, shared so relays can be ranked nearest a target.
-          s.indirect.coordinates.insert(peer.host, coordinate.clone());
-          // This node, as a relay: every requester that asked it to reach this peer is answered — the ask
-          // moves to the requester's queue and the requester's probe task is woken to carry it back.
-          answer_relay_asks(s, peer.host);
-          // The owner lease (§4.8 "Leases and reads"; AUD-08): this peer, a candidate holder of this node's
-          // objects, has answered a probe reporting this node alive, naming the standing its configuration
-          // holds this node at. It confirms the lease when this node's own standing recognizes that — measured
-          // from the probe's send time, before the peer formed its answer — and supersedes it only when it
-          // shows this node's own authority changed where it has not installed (`OwnerLease::answered`):
-          // another host's configuration change leaves it as it was.
-          let installed = s.fleet.configuration();
-          let (own, installed_version) = (installed.standing(), installed.version);
-          s.lease.answered(
-            peer.host,
-            sent_ns,
-            configuration_version,
-            standing,
-            own,
-            installed_version,
-          );
-        });
-        #[allow(clippy::cast_precision_loss)]
-        detector.observe_rtt(peer.host, rtt_ns as f64);
-        detector.learn_coordinate(peer.host, coordinate);
-      }
-      state::with_state(|state| receive_probe_gossip(state, detector, from, &gossip));
-      returned
-    }
-    Ok((returned, ProbeOutcome::TimedOut)) => {
-      timing.missed();
-      begin_indirect_stage(peer.host, nonce);
-      returned
-    }
-    Ok((_, ProbeOutcome::Broken)) => {
-      // The session cannot carry another exchange (closed, or the socket refused): a miss for the
-      // detector, and the session released — `None` here makes the next period's `establish_session`
-      // dial afresh through `client_for`, re-resolving the peer's address — rather than re-probing a
-      // dead session every period until the suspicion window retires the peer (rejoin design item 2).
-      count_refusal(PROBE_BROKEN);
-      timing.missed();
-      None
-    }
-    Err(_) => None,
-  }
-}
-
-/// One probe cycle over an established session: the indirect stage's traffic for this peer first — the
-/// ping-requests this node asks it to relay, the answers this node owes it ([`carry_indirect_traffic`]) —
-/// then this node's own probe of it ([`probe_and_apply`]). Returns the session to carry forward, `None`
-/// when either released it.
-#[allow(clippy::too_many_arguments)]
-async fn probe_cycle(
-  detector: &mut Detector,
-  session: Option<Endpoint>,
-  local: HostId,
-  local_boot_nonce: u64,
-  peer: &ProbedPeer,
-  fanout: usize,
-  nonce: u64,
-  timing: &mut ProbeTiming,
-) -> Option<Endpoint> {
-  let session =
-    carry_indirect_traffic(session, local, local_boot_nonce, peer, fanout, timing).await;
-  probe_and_apply(
-    detector,
-    session,
-    local,
-    local_boot_nonce,
-    peer,
-    fanout,
-    nonce,
-    timing,
-  )
-  .await
-}
-
-/// Credits a relay's answer about this node's probe of `peer_host` that last went unanswered, **before**
-/// the tick resolves that probe (§4.8 "direct probe → k indirect proxies → SUSPECT"): the tick then counts
-/// it answered, so the peer is not suspected on a lost direct packet. `nonce` is the probe about to be
-/// sent; an answer about a probe older than the suspicion window ([`INDIRECT_ACK_LAG_PROBES`]) is stale
-/// and dropped. Counted when credited (`fleet.probe.indirect.acked`).
-fn credit_relayed_answer(detector: &mut Detector, peer_host: HostId, nonce: u64) {
-  let relayed = state::with_state(|state| state.indirect.acks.remove(&peer_host)).flatten();
-  if relayed.is_some_and(|relayed| nonce.saturating_sub(relayed) <= INDIRECT_ACK_LAG_PROBES) {
-    detector.on_indirect_ack(peer_host);
-    count_refusal(PROBE_INDIRECT_ACKED);
-  }
-}
-
-/// The direct probe of `peer_host` (nonce `nonce`) went unanswered: begins the indirect stage — asks up to
-/// `k` relays nearest the peer ([`indirect_relays`], [`indirect_fanout`]) to reach it on this node's
-/// behalf before the next tick would suspect it. The ping-requests are posted for the relays' probe tasks
-/// (each owns the session to its relay) and those tasks are woken to send them now. Counted per relay
-/// asked (`fleet.probe.indirect.requested`).
-fn begin_indirect_stage(peer_host: HostId, nonce: u64) {
-  let _ = state::with_state(|state| {
-    let fanout = indirect_fanout(state.fleet.members().len());
-    for relay in indirect_relays(state, peer_host, fanout) {
-      state
-        .indirect
-        .outgoing
-        .entry(relay)
-        .or_default()
-        .insert(peer_host, nonce);
-      count_refusal_in(state, PROBE_INDIRECT_REQUESTED);
-      wake_probe_task(state, relay);
-    }
-  });
-}
-
-/// This node, as a relay, has just heard `target` acknowledge its probe: every requester that asked it to
-/// reach `target` gets its answer posted (`results[requester]`, the requester's own probe nonce echoed) and
-/// its probe task woken to carry it back. Counted per answer (`fleet.probe.indirect.relayed`).
-fn answer_relay_asks(state: &mut ShardState, target: HostId) {
-  let Some(asks) = state.indirect.asks.remove(&target) else {
-    return;
-  };
-  for (requester, nonce) in asks {
-    state
-      .indirect
-      .results
-      .entry(requester)
-      .or_default()
-      .insert(target, nonce);
-    count_refusal_in(state, PROBE_INDIRECT_RELAYED);
-    wake_probe_task(state, requester);
-  }
-}
-
 /// Counts one refusal or event of `kind` on a shard state already borrowed (the in-closure form of
 /// [`count_refusal`], which borrows the state itself).
-fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
+pub(crate) fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
   let count = state.refusals.entry(kind).or_insert(0);
   *count = count.saturating_add(1);
-}
-
-/// Carries this node's pending indirect-probe traffic for `peer` over the probe session its task owns,
-/// before that task's own probe: the ping-requests this node posted for `peer` to relay (this node is the
-/// requester, `peer` the relay), and the answers this node owes `peer` as a relay (`peer` is the
-/// requester). Each is one bounded exchange under the probe budget ([`deliver_once`]); an undelivered one
-/// is counted and dropped — the requester's next direct miss asks again — and a terminal fault releases the
-/// session exactly as a probe's would. Returns the session for the probe that follows.
-async fn carry_indirect_traffic(
-  session: Option<Endpoint>,
-  local: HostId,
-  local_boot_nonce: u64,
-  peer: &ProbedPeer,
-  fanout: usize,
-  timing: &ProbeTiming,
-) -> Option<Endpoint> {
-  let mut open = session?;
-  let (requests, answers) = state::with_state(|s| {
-    (
-      s.indirect.outgoing.remove(&peer.host).unwrap_or_default(),
-      s.indirect.results.remove(&peer.host).unwrap_or_default(),
-    )
-  })
-  .unwrap_or_default();
-  if requests.is_empty() && answers.is_empty() {
-    return Some(open);
-  }
-  let budget = timing.budget(path_tail_ns(peer.host));
-  let gossip = || {
-    state::with_state(|s| {
-      let belief = s.fleet.membership().state(peer.host);
-      outgoing_probe_gossip(s, peer.host, belief, fanout)
-    })
-    .unwrap_or_default()
-  };
-  let mut messages: Vec<SwimMessage> = Vec::with_capacity(requests.len() + answers.len());
-  for (target, nonce) in requests {
-    messages.push(SwimMessage::PingReq {
-      from: local,
-      target,
-      nonce,
-      gossip: gossip(),
-    });
-  }
-  for (target, nonce) in answers {
-    messages.push(SwimMessage::IndirectAck {
-      from: local,
-      target,
-      nonce,
-      boot_nonce: local_boot_nonce,
-      gossip: gossip(),
-    });
-  }
-  for message in &messages {
-    let (returned, delivery) = deliver_once(open, message, budget).await;
-    match delivery {
-      Delivery::Delivered => {}
-      Delivery::Undelivered => {
-        count_refusal(PROBE_INDIRECT_UNDELIVERED);
-      }
-      Delivery::Broken => {
-        count_refusal(PROBE_BROKEN);
-        return None;
-      }
-    }
-    open = returned?;
-  }
-  Some(open)
-}
-
-/// Applies authenticated gossip to the shared failure view (§4.8). Third-member reports
-/// never enter this session's probe rotation. Unknown identities require enrollment; a
-/// superseded identity cannot regain membership through a relayed alive report.
-fn receive_probe_gossip(
-  state: &mut ShardState,
-  detector: &mut Detector,
-  sender: HostId,
-  gossip: &[(HostId, MemberState)],
-) {
-  let local = state.fleet.host();
-  for &(subject, update) in gossip {
-    if subject == local {
-      state.fleet.observe(local, update);
-      detector.apply(local, update);
-    } else if state.fleet.membership().state(subject).is_some() || subject == sender {
-      if update.liveness == Liveness::Alive && !state.authenticated_members.contains(&subject) {
-        continue;
-      }
-      if subject == sender {
-        detector.apply_gossip_from(sender, &[(subject, update)]);
-      }
-      if apply_peer_state(&mut state.fleet, subject, Some(update)) {
-        wake_link_waiter_of(state, subject);
-      }
-    }
-  }
-}
-
-/// One shared dissemination queue feeds every live session. Reserve payload entries for
-/// our own current incarnation and the target's buddy suspicion/death; the rest carries
-/// adopted changes. The existing derived fanout bounds the whole packet.
-fn outgoing_probe_gossip(
-  state: &mut ShardState,
-  peer: HostId,
-  belief: Option<MemberState>,
-  fanout: usize,
-) -> Vec<(HostId, MemberState)> {
-  let mut mandatory = Vec::new();
-  let local = state.fleet.host();
-  if let Some(own) = state.fleet.membership().state(local) {
-    mandatory.push((local, own));
-  }
-  if let Some(belief) = belief
-    && belief.liveness != Liveness::Alive
-  {
-    mandatory.push((peer, belief));
-  }
-  let reports = state.fleet.gossip(
-    fanout.saturating_sub(mandatory.len()),
-    u32::try_from(fanout).unwrap_or(u32::MAX),
-  );
-  for report in reports {
-    if !mandatory.iter().any(|(subject, _)| *subject == report.0) {
-      mandatory.push(report);
-    }
-  }
-  mandatory
-}
-
-/// Switches a probe task to the id its peer now holds (task #22): whichever side learned a restart since the
-/// last period — the task itself from an acknowledgement, or the serve side from the peer's own probe — the
-/// peer's previous id is folded **dead** in this task's detector (never probed again, its death handed to
-/// the other shards as any fold is) and the new id joins fresh; the mesh record moves with it, and the
-/// round-trip law starts over for what is a new member on the same wire. A no-op while the peer's id is
-/// unchanged, which is every period but the one after a restart.
-fn follow_current_id(
-  detector: &mut Detector,
-  peer: &mut ProbedPeer,
-  timing: &mut ProbeTiming,
-  origin: u16,
-  shards: &[u16],
-) {
-  let Some(current) = current_member(peer.anchor) else {
-    return;
-  };
-  if current == peer.host {
-    return;
-  }
-  let old = peer.host;
-  eprintln!(
-    "slates-server: fleet: peer anchor {:?} is now member {current:?} (was {old:?})",
-    peer.anchor
-  );
-  let death = MemberState {
-    liveness: Liveness::Dead,
-    incarnation: detector
-      .membership()
-      .state(old)
-      .map_or(0, |belief| belief.incarnation),
-  };
-  detector.apply(old, death);
-  detector.join(current);
-  state::with_state(|s| {
-    if s.formed_probe_peers.remove(&old) {
-      s.formed_probe_peers.insert(current);
-    }
-    wake_link_waiter_of(s, old);
-  });
-  for shard in shards.iter().copied().filter(|shard| *shard != origin) {
-    let _ = run_on(origin, shard, move |s| {
-      apply_peer_state(&mut s.fleet, old, Some(death));
-    });
-  }
-  *timing = ProbeTiming::new();
-  // The old id's path estimate goes with it: a restarted node is a new member on the same wire, and its
-  // path is measured afresh under the new id (bounded: one estimate per live rostered id).
-  let _ = state::with_state(|s| s.peer_paths.remove(&old));
-  peer.host = current;
-}
-
-/// The probe side: dial the peer's probe address (so a slow or not-yet-listening peer never blocks the other
-/// peers' loops — each probe task dials its own), then each protocol period probe the peer, fold the outcome,
-/// and fold this detector's converged view into the shard's `FleetNode` (§4.8). Each peer has its own probe
-/// task and its own detector; `sync_membership` folds each detector's view without disturbing the peers it
-/// does not track, so N detectors compose into one membership. The session is **reused whatever a probe's
-/// outcome** — an acknowledgement and a timeout both hand it back ([`probe_once`]) — so a single missed
-/// probe (a lost packet, a peer too starved to answer in time) does not drop it: the next period re-probes
-/// at a backed-off deadline ([`ProbeTiming`]), a still-live peer refutes the suspicion every ping to it
-/// carries, and only a peer silent across the suspicion window ages to death and is retired (driving the
-/// takeover). Dropping the session on one miss would retire a live peer on any transient glitch
-/// (`docs/bugs/2026-09-10-swim-stale-ack.md`); a re-dial now replaces a lost session at the peer, but a
-/// probe verdict still rests on the suspicion window, not on one miss.
-async fn probe_peer(identity: Kept<Identity>, dial: PeerDial, local: HostId, neighbourhood: usize) {
-  let PeerDial {
-    anchor,
-    host: seed,
-    name,
-    address,
-    certificate,
-    resolver,
-  } = dial;
-  // The peer's current member id, its seed until learned otherwise (task #22): the loop below follows it.
-  let mut peer = ProbedPeer { anchor, host: seed };
-  let local_boot_nonce = state::with_state(|s| s.member_boot_nonce).unwrap_or(0);
-  let mut probe_timing = ProbeTiming::new();
-  let timing = detector_timing(neighbourhood);
-  let fanout = usize::try_from(timing.gossip_transmits).unwrap_or(1);
-  let mut detector = Detector::new(local, timing);
-  detector.join(peer.host);
-  // This shard (the control shard) probes; every other shard is an owner with its own copy of the
-  // configuration (D-7), so each state this detector folds is handed to the rest as well.
-  let (origin, shards) = state::with_state(|s| (s.shard, s.shards.clone())).unwrap_or_default();
-  // Bring the probe session up on one socket, retrying the handshake there each period until it completes —
-  // so a formation-race handshake that partially reached the peer's pinned `accept` finishes rather than
-  // stranding the session (which would leave this peer unprobed and the N·(N−1) mesh un-formed). Once up it
-  // is reused whatever a probe's outcome (see [`probe_once`]). The detector ticks only when a probe is
-  // actually sent, so an as-yet-unestablished session never resolves as a missed probe and falsely ages the
-  // peer.
-  let mut client: Option<Endpoint> = client_for(
-    identity,
-    &name,
-    (&address, crate::deploy::Plane::Probe),
-    &certificate,
-    resolver,
-  )
-  .await;
-  let mut session: Option<Endpoint> = None;
-  let mut recorded_mesh = false;
-  // A per-probe nonce the acknowledgement must echo: monotonic over this session, so every probe's nonce
-  // is higher than any earlier one on it, and a *stale* acknowledgement the transport redelivered (from an
-  // earlier probe, carrying a lower nonce) is rejected rather than counted as this probe's reply — the
-  // fix for a survivor accepting a dead peer's buffered acknowledgements (`docs/bugs/2026-09-10-swim-stale-ack.md`).
-  let mut probe_nonce: u64 = 0;
-  // Set while this peer is retired, so the resume that follows realigns the detector to the re-admitted
-  // belief before it probes again.
-  let mut was_idle = false;
-  // While this peer is retired: when this task next reaches out to it ([`Reconnect`]).
-  let mut reconnect: Option<Reconnect> = None;
-
-  loop {
-    follow_current_id(&mut detector, &mut peer, &mut probe_timing, origin, &shards);
-    // Idle while this peer is retired; on the resume, the detector is realigned to the re-admitted belief.
-    // A retirement this task learns here — the shard's membership already says so, from another task's
-    // fold or an injected death — releases the probe session and any pending dial exactly as one its
-    // own fold finds below does; before, a task that went idle this way kept both, so the resume re-used
-    // a session to a process that was gone and drove a dial at an address the peer had left. While idle it
-    // reaches out on the [`Reconnect`] schedule, so a peer that believes this node dead too is found once
-    // the path between them heals.
-    if !resume_if_in_mesh(&mut detector, peer.host, &mut was_idle) {
-      release_probe_session(peer.host, &mut session, &mut client, &mut recorded_mesh);
-      let reach = ReachOut {
-        identity,
-        name: &name,
-        address: &address,
-        certificate: &certificate,
-        resolver,
-        local,
-        local_boot_nonce,
-        peer: &peer,
-        fanout,
-        timing: &probe_timing,
-      };
-      reach_out_when_due(&reach, &mut reconnect, &mut detector, &mut probe_nonce).await;
-      crate::daemon::pace(HEARTBEAT_NS).await;
-      continue;
-    }
-    reconnect = None;
-    (client, session) = establish_session(
-      client,
-      session,
-      identity,
-      &name,
-      (&address, crate::deploy::Plane::Probe),
-      &certificate,
-      resolver,
-    )
-    .await;
-    record_formed_mesh(session.is_some(), &mut recorded_mesh, peer.host);
-    if session.is_some() {
-      probe_nonce += 1;
-      session = probe_cycle(
-        &mut detector,
-        session.take(),
-        local,
-        local_boot_nonce,
-        &peer,
-        fanout,
-        probe_nonce,
-        &mut probe_timing,
-      )
-      .await;
-    }
-
-    let retired = fold_peer_state(&detector, peer.host, origin, &shards);
-    if retired {
-      // The peer is retired and gone from the direct mesh. Its objects' phase-one recovery is now driven by
-      // the record-ship task (over the surviving candidate holders); this node's **outgoing** probe session
-      // to the peer is dropped (below). The task does **not** end — the top of the loop idles it until the
-      // peer rejoins, so a false retirement (or a restart) heals without a supervisor re-spawning anything.
-      //
-      // The peer's **incoming** sessions to this node are deliberately left alone. They are owned by their
-      // serve tasks and reclaimed by the demultiplexer's authenticated-replacement mechanism: when the peer
-      // re-dials (a restart, or a refutation after a false death), its fresh handshake replaces its own prior
-      // session under its certificate (`Endpoint::connection_id` → `Demux::bind`), ending the stale one.
-      // Force-closing them here **by certificate** (`Demux::close_peer`) was the KIND whole-pod-restart bug
-      // (2026-09-14): a restart presents the same operator certificate, so a same-id replacement that had
-      // already re-dialed and bound its serve session was the session `close_peer` tore down — the very
-      // session carrying this node's death belief back for the peer to self-refute. The survivor and the
-      // restart then aged each other out into a circular wait, both `fleet_meshed` vacuously
-      // (`docs/bugs/2026-09-14-retirement-closes-the-same-id-restarts-serve-session.md`). A peer that never
-      // returns holds one idle serve slot per plane, bounded by the roster (banned item 8 holds).
-      release_probe_session(peer.host, &mut session, &mut client, &mut recorded_mesh);
-    }
-    // The next probe waits one beat at full health, more as this node's own probes fail (Lifeguard) — cut
-    // short the moment indirect-probe traffic is posted for this task, so a relay probes its target, and a
-    // requester credits a relayed answer, within a round trip rather than a period.
-    sleep_or_wake(probe_period_ns(detector.health_multiplier()), peer.host).await;
-  }
-}
-
-/// Records the direct probe session to `peer_host` once it has `formed`, so the daemon can tell the real
-/// mesh is up (`fleet_meshed`) rather than trusting the membership's optimistically seeded alive set.
-fn record_formed_mesh(formed: bool, recorded: &mut bool, peer_host: HostId) {
-  if formed && !*recorded {
-    state::with_state(|s| s.formed_probe_peers.insert(peer_host));
-    *recorded = true;
-  }
-}
-
-/// What an idle probe task reaches out to its peer with ([`reach_out`]): its own identity and the peer's dial,
-/// and what the ping carries.
-struct ReachOut<'a> {
-  identity: Kept<Identity>,
-  name: &'a str,
-  address: &'a NodeAddress,
-  certificate: &'a CertificateDer<'static>,
-  resolver: Option<Kept<Resolver>>,
-  local: HostId,
-  local_boot_nonce: u64,
-  peer: &'a ProbedPeer,
-  fanout: usize,
-  timing: &'a ProbeTiming,
-}
-
-/// One idle period's reconnection ([`Reconnect`]): the schedule starts when the peer is first found retired,
-/// and an attempt runs when it is due, with the next probe nonce.
-async fn reach_out_when_due(
-  reach: &ReachOut<'_>,
-  reconnect: &mut Option<Reconnect>,
-  detector: &mut Detector,
-  probe_nonce: &mut u64,
-) {
-  let now = futures::now_ns();
-  let schedule = reconnect.get_or_insert_with(|| Reconnect::from(now));
-  if !schedule.due(now) {
-    return;
-  }
-  *probe_nonce = probe_nonce.saturating_add(1);
-  let answered = reach_out(reach, detector, *probe_nonce).await;
-  schedule.attempted(futures::now_ns(), answered);
-}
-
-/// One attempt to reach a peer this node believes dead ([`Reconnect`]): a fresh probe session, one handshake
-/// budget to bring it up, and one ping carrying this node's gossip — its own state and its belief that the
-/// peer is dead, so a live peer refutes that at once (the buddy system). The answer's gossip is folded as any
-/// probe's is: an echo of this node's own death, which it refutes, and the peer's refuted state, which
-/// re-admits it (A-15: a higher incarnation always overrides the death). Nothing else a probe does: no lease
-/// is credited, since the peer may believe this node dead; the detector is neither aged nor credited, since
-/// the loop realigns it on the resume; no path is sampled and no relay asked. The session is dropped after,
-/// and a resume dials afresh. Returns whether the peer answered; counted either way (`fleet.reconnect.*`).
-async fn reach_out(reach: &ReachOut<'_>, detector: &mut Detector, nonce: u64) -> bool {
-  let ReachOut {
-    identity,
-    name,
-    address,
-    certificate,
-    resolver,
-    local,
-    local_boot_nonce,
-    peer,
-    fanout,
-    timing,
-  } = *reach;
-  count_refusal(RECONNECT_ATTEMPTED);
-  let Some(mut endpoint) = client_for(
-    identity,
-    name,
-    (address, crate::deploy::Plane::Probe),
-    certificate,
-    resolver,
-  )
-  .await
-  else {
-    return false;
-  };
-  if endpoint.establish().await.is_err() {
-    return false;
-  }
-  let Some(ping) = state::with_state(|state| SwimMessage::Ping {
-    from: local,
-    nonce,
-    boot_nonce: local_boot_nonce,
-    configuration_version: state
-      .lease
-      .known_version(state.fleet.configuration().version),
-    gossip: outgoing_probe_gossip(
-      state,
-      peer.host,
-      state.fleet.membership().state(peer.host),
-      fanout,
-    ),
-  }) else {
-    return false;
-  };
-  let Ok((
-    _,
-    ProbeOutcome::Acked {
-      from,
-      boot_nonce,
-      gossip,
-      ..
-    },
-  )) = probe_once(endpoint, &ping, timing.budget(path_tail_ns(peer.host))).await
-  else {
-    return false;
-  };
-  state::with_state(|state| {
-    if learn_member(state, peer.anchor, boot_nonce, from) == LearnedOutcome::Forged {
-      return false;
-    }
-    receive_probe_gossip(state, detector, from, &gossip);
-    count_refusal_in(state, RECONNECT_ANSWERED);
-    true
-  })
-  .unwrap_or(false)
-}
-
-/// What a probe task lets go of when its peer is retired, whichever path told it — its own fold at the
-/// bottom of a cycle or the shard's membership at the top: the direct mesh record, this node's
-/// **outgoing** probe session (the peer's incoming ones are the serve tasks' and the demultiplexer's,
-/// see [`probe_peer`]), and a dial still in its handshake (rejoin design item 3): that dial's socket
-/// points at the address the peer had, and driving its pending flight through the remaining handshake
-/// budgets after the peer returns would spend them on a stale address (a rescheduled pod's old IP)
-/// before `client_for` re-resolves; dropped now, the resume dials afresh — the discovered or resolved
-/// address — on its first period. The drop of a pending dial is counted (`fleet.dial.stale_dropped`),
-/// so the test that retires a peer mid-dial can see the pending dial was there.
-fn release_probe_session(
-  peer_host: HostId,
-  session: &mut Option<Endpoint>,
-  client: &mut Option<Endpoint>,
-  recorded_mesh: &mut bool,
-) {
-  state::with_state(|s| {
-    s.formed_probe_peers.remove(&peer_host);
-    // A retired peer relays nothing and is asked about nothing: its indirect-probe queues are dropped, so a
-    // request naming it is refused thereafter rather than queued for a task that idles.
-    s.indirect.forget(peer_host);
-  });
-  *session = None;
-  *recorded_mesh = false;
-  if client.take().is_some() {
-    count_refusal(DIAL_STALE_DROPPED);
-  }
-}
-
-/// The probe **cadence** — how long the probe task waits before its next probe of a peer — dilated by the
-/// detector's Lifeguard local-health multiplier (`health + 1`, capped at [`LOCAL_HEALTH_CAP`] + 1): a node
-/// whose own probes are failing probes less aggressively (Lifeguard §3.1's local-health-aware probe;
-/// memberlist scales its probe interval by its awareness score), so a degraded prober neither floods a
-/// struggling peer nor counts misses faster than its own health warrants —
-/// [`Detector::health_multiplier`] is defined as the caller's multiplier on its probe-period timer.
-/// Derived: one heartbeat period ([`HEARTBEAT_NS`], the beat every fleet loop runs at) × the multiplier,
-/// so full health is exactly the beat. Measured 2026-09-13: first wired, it was **wrongly** rejected on a
-/// 495 s retirement hang that was a holder acceptor born stale (`accept_held_record`, fixed in
-/// `docs/bugs/2026-09-13-holder-acceptor-born-stale-never-placed.md`); re-measured on the fixed tree the
-/// same test passes 3/3 at 11.3 s with the dilation and the starvation test at 8.8 s.
-fn probe_period_ns(health_multiplier: u32) -> u64 {
-  // The Lifeguard dilation (heartbeat × the health multiplier) OR the measured scheduler quantum,
-  // whichever is longer — so a shard that is itself descheduled paces its probes no finer than it is
-  // actually scheduled, and the suspicion window (this cadence × the probes it counts) dilates with the
-  // observed starvation rather than a fixed 100 ms beat.
-  let health_period = HEARTBEAT_NS.saturating_mul(u64::from(health_multiplier));
-  let quantum = scheduler_quantum_ns();
-  if quantum > health_period {
-    let _ = state::with_state(|s| {
-      s.probe_windows.periods_dilated = s.probe_windows.periods_dilated.saturating_add(1);
-      s.probe_windows.largest_quantum_ns = s.probe_windows.largest_quantum_ns.max(quantum);
-    });
-  }
-  health_period.max(quantum)
 }
 
 /// The record serve side (§4.8 "records are sent to all candidates"; "Promotion and takeover"): complete
@@ -2708,6 +1310,8 @@ async fn serve_peer_records(
       |peer| peer.anchor,
     );
   let seed = crate::deploy::member_id(peer_anchor, 0);
+  // The membership plane's secret for this connection (A-67 H-2b), should the peer announce an epoch on it.
+  let plane_secret = endpoint.export_secret(hyper_datagram::EXPORTER_LABEL).ok();
   // Serve the peer's commits and prepares against this node's **durable** per-object holds in the shard
   // state, so an accepted record survives past this task — the state a survivor's phase-one recovery reads
   // on a takeover — and a prepare is answered from it. The handler runs synchronously inside `serve_once` (a
@@ -2762,6 +1366,13 @@ async fn serve_peer_records(
             return Vec::new();
           }
           match stream {
+            crate::member_task::PLANE_EPOCH_STREAM => plane_secret
+              .and_then(|secret| {
+                state::with_state(|s| {
+                  crate::member_task::accept_announcement(s, peer_anchor, &secret, &request)
+                })
+              })
+              .unwrap_or_default(),
             RECORD_STREAM => Record::decode(&request)
               .ok()
               .and_then(|record| {
@@ -2913,7 +1524,7 @@ fn reconcile_held_authority(state: &mut ShardState) {
 /// field is not this socket's peer is refused [`Unauthorized`](slates_db::register::RegisterError) by
 /// [`Acceptor::accept`], and one under a foreign generation or a stale epoch is refused likewise. On
 /// acceptance the object is tracked in the routing view as backed for that owner, so the owner's death
-/// hands [`sync_peer`]'s takeover computation this object. Returns the binding acknowledgement's bytes; a
+/// hands the membership fold's takeover computation this object. Returns the binding acknowledgement's bytes; a
 /// sender on an *older* configuration is refused `ConfigurationStale` carrying this node's newer version so
 /// it refreshes and retries (§4.8 the piggyback rule), and every other refusal is an empty reply the owner
 /// counts as no acknowledgement. A record naming a *newer* configuration than this node's flags a reactive
@@ -4352,37 +2963,9 @@ fn spawn_detached(future: impl std::future::Future<Output = ()> + 'static, refus
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SERVE_REFUSED: &str = "fleet.serve";
 
-/// The status refusal counts under which a dial task records a peer's DNS name that did not resolve, by
-/// cause — the name itself invalid (`fleet.resolve`), no resolver configured, every attempt timed out,
-/// `NXDOMAIN` (a pod not yet created, or a name the cluster's DNS does not serve), an answer without an
-/// `A` record, a malformed reply, the runtime refusing the socket: the dial is skipped this period and made
-/// again the next, so a count that keeps rising names a peer the fleet cannot reach by name and says why.
-/// Format: refusal names in the daemon's status report, alongside the verbs' refusal kinds.
-/// A probe session released on a terminal transport fault (`ProbeOutcome::Broken`): the next period
-/// dials afresh.
-const PROBE_BROKEN: &str = "fleet.probe.broken";
-/// A ping-request posted for a relay after a direct probe timed out (one per relay asked) — the indirect
-/// stage began (§4.8; AUD-15).
-const PROBE_INDIRECT_REQUESTED: &str = "fleet.probe.indirect.requested";
-/// This node, as a relay, reached a target on a requester's behalf and posted the answer — the relay path
-/// carried a real acknowledgement (the non-vacuity the indirect-probe regression asserts on the relay).
-const PROBE_INDIRECT_RELAYED: &str = "fleet.probe.indirect.relayed";
-/// A relayed acknowledgement was credited to this node's own probe of the target before the suspicion
-/// verdict — a lost direct packet did not suspect a live peer (the non-vacuity asserted on the requester).
-const PROBE_INDIRECT_ACKED: &str = "fleet.probe.indirect.acked";
-/// An indirect-probe message refused at the serve side: a ping-request whose sender is not the session's
-/// learned member, or one naming a target this node keeps no direct contact with (the bound on the
-/// queues), or a relayed acknowledgement for a peer this node does not probe.
-const PROBE_INDIRECT_REFUSED: &str = "fleet.probe.indirect.refused";
-/// An indirect-probe message that did not reach its peer within the probe budget (the session kept).
-const PROBE_INDIRECT_UNDELIVERED: &str = "fleet.probe.indirect.undelivered";
 /// A dial still in its handshake dropped at its peer's retirement, so the resume dials afresh at the
 /// peer's current address.
 const DIAL_STALE_DROPPED: &str = "fleet.dial.stale_dropped";
-/// An idle probe task reached out to a peer it believes dead ([`reach_out`]), and one such attempt the peer
-/// answered: the partition heal's non-vacuity counters.
-const RECONNECT_ATTEMPTED: &str = "fleet.reconnect.attempted";
-const RECONNECT_ANSWERED: &str = "fleet.reconnect.answered";
 /// A discovery exchange that reached its deadline unanswered: its session released, the link re-dials
 /// (`docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`).
 const DISCOVERY_DEADLINE: &str = "fleet.discovery.deadline";
@@ -4392,8 +2975,6 @@ const DISCOVERY_INVALIDATED: &str = "fleet.discovery.invalidated";
 const DISCOVERY_TRANSPORT: &str = "fleet.discovery.transport";
 /// A discovery exchange whose deadline could not be armed ([`DiscoveryFault::Unbounded`]): a tripwire.
 const DISCOVERY_UNBOUNDED: &str = "fleet.discovery.unbounded";
-/// A probe task's period whose sleep was refused ([`sleep_or_wake`]): it then waits for traffic alone.
-const PERIOD_UNBOUNDED: &str = "fleet.probe.period_unbounded";
 /// A record session returned to a slot that no longer expects it — a retired peer's, a slot re-established
 /// since, or a session other than the one borrowed — dropped rather than installed over a newer one.
 const LINK_STALE_RETURN: &str = "fleet.link.stale_return";
@@ -7333,228 +5914,8 @@ mod tests {
     assert!(!learned_real, "a learned peer's death drops contact");
   }
 
-  /// AC-8.1 / T-8.12: an authenticated neighbor reports the death of a known member this node
-  /// does not probe directly. The council's failure view must receive that death; old alive gossip
-  /// cannot resurrect it. Gossip about unknown identities must not enroll them.
-  #[test]
-  fn a_neighbors_gossip_retires_a_known_third_member_without_enrolling_strangers() {
-    let (lost_is_alive, stranger_is_known) = crate::daemon::audit_on_shard(|state| {
-      let local = state.fleet.host();
-      let neighbor = HostId(local.0.wrapping_add(1));
-      let lost = HostId(local.0.wrapping_add(2));
-      let stranger = HostId(local.0.wrapping_add(3));
-      let alive = MemberState {
-        liveness: Liveness::Alive,
-        incarnation: 0,
-      };
-      state.fleet.observe(neighbor, alive);
-      state.fleet.observe(lost, alive);
-      state.authenticated_members.insert(lost);
-      let mut detector = Detector::new(local, detector_timing(3));
-      detector.join(neighbor);
-      let message = SwimMessage::Ping {
-        from: neighbor,
-        nonce: 1,
-        boot_nonce: 0,
-        configuration_version: 0,
-        gossip: vec![
-          (
-            lost,
-            MemberState {
-              liveness: Liveness::Dead,
-              incarnation: 1,
-            },
-          ),
-          (stranger, alive),
-        ],
-      };
-      let message = SwimMessage::decode(&message.encode()).unwrap();
-      receive_probe_gossip(state, &mut detector, neighbor, message.gossip());
-      receive_probe_gossip(state, &mut detector, neighbor, &[(lost, alive)]);
-      let outgoing = outgoing_probe_gossip(state, neighbor, Some(alive), 4);
-      let relayed = SwimMessage::Ping {
-        from: local,
-        nonce: 2,
-        boot_nonce: 0,
-        configuration_version: 0,
-        gossip: outgoing,
-      };
-      let relayed = SwimMessage::decode(&relayed.encode()).unwrap();
-      assert!(
-        relayed
-          .gossip()
-          .iter()
-          .any(|(subject, report)| { *subject == lost && report.liveness == Liveness::Dead }),
-        "a third member's death must travel to another live peer"
-      );
-      // Foreign alive reports must not add a second target to this session's detector.
-      let refuted = MemberState {
-        liveness: Liveness::Alive,
-        incarnation: 2,
-      };
-      receive_probe_gossip(state, &mut detector, neighbor, &[(lost, refuted)]);
-      assert!(state.fleet.membership().alive().contains(&lost));
-      for _ in 0..4 {
-        assert_eq!(detector.tick().map(|ping| ping.to), Some(neighbor));
-        detector.on_ack(neighbor);
-      }
-      receive_probe_gossip(
-        state,
-        &mut detector,
-        neighbor,
-        &[(
-          lost,
-          MemberState {
-            liveness: Liveness::Dead,
-            incarnation: 2,
-          },
-        )],
-      );
-      (
-        state.fleet.membership().alive().contains(&lost),
-        state.fleet.membership().state(stranger).is_some(),
-      )
-    });
-    assert!(
-      !lost_is_alive,
-      "a third member's death must reach the council's failure view"
-    );
-    assert!(!stranger_is_known, "gossip does not authorize enrollment");
-  }
-
-  /// AC-8.1 / T-8.12: shared self-refutation is visible on a different peer session, while
-  /// an authenticated restart prevents a neighbor's high-incarnation report reviving the old id.
-  #[test]
-  fn probe_gossip_shares_refutation_and_cannot_revive_a_replaced_identity() {
-    crate::daemon::audit_on_shard(|state| {
-      let local = state.fleet.host();
-      let anchor = HostId(local.0.wrapping_add(1));
-      let old = crate::deploy::member_id(anchor, 1);
-      let current = crate::deploy::member_id(anchor, 2);
-      learn_member(state, anchor, 1, old);
-      learn_member(state, anchor, 2, current);
-      let mut detector = Detector::new(local, detector_timing(3));
-      detector.join(current);
-      receive_probe_gossip(
-        state,
-        &mut detector,
-        current,
-        &[
-          (
-            old,
-            MemberState {
-              liveness: Liveness::Alive,
-              incarnation: 10,
-            },
-          ),
-          (
-            local,
-            MemberState {
-              liveness: Liveness::Dead,
-              incarnation: 10,
-            },
-          ),
-        ],
-      );
-      let outgoing = outgoing_probe_gossip(state, current, None, 4);
-      assert!(!state.fleet.membership().alive().contains(&old));
-      assert!(outgoing.contains(&(
-        local,
-        MemberState {
-          liveness: Liveness::Alive,
-          incarnation: 11
-        }
-      )));
-      let mut other_session = Detector::new(local, detector_timing(3));
-      receive_probe_gossip(
-        state,
-        &mut other_session,
-        current,
-        &[(
-          local,
-          MemberState {
-            liveness: Liveness::Dead,
-            incarnation: 9,
-          },
-        )],
-      );
-      let outgoing = outgoing_probe_gossip(state, current, None, 4);
-      assert!(outgoing.contains(&(
-        local,
-        MemberState {
-          liveness: Liveness::Alive,
-          incarnation: 11
-        }
-      )));
-    });
-  }
-
   /// A millisecond in nanoseconds, so the samples read as round times.
   const MS: u64 = 1_000_000;
-
-  /// The probe deadline follows the design's law, by use: before any sample it is the conservative initial
-  /// probe timeout; a quiet-loopback round trip floors it at the beat; each consecutive miss doubles it; the
-  /// liveness budget caps it however many misses; an acknowledgement resets the backoff; and a slow peer's
-  /// measured round trip raises it above the floor, still within the cap.
-  #[test]
-  fn the_probe_deadline_is_derived_from_the_round_trip_backed_off_and_capped() {
-    let mut timing = ProbeTiming::new();
-    assert_eq!(
-      timing.deadline_ns(None),
-      RttEstimator::new().initial_pto(),
-      "before any sample: the initial probe timeout"
-    );
-    // The measured quiet-loopback probe round trip (p99 17 ms): its probe timeout sits below the beat.
-    let mut path = PathRtt::new();
-    path.on_sample(17 * MS);
-    timing.acknowledged();
-    assert_eq!(
-      timing.deadline_ns(path.tail_ns()),
-      HEARTBEAT_NS,
-      "a quiet round trip floors the deadline at the beat"
-    );
-    timing.missed();
-    assert_eq!(
-      timing.deadline_ns(path.tail_ns()),
-      2 * HEARTBEAT_NS,
-      "one miss doubles it"
-    );
-    timing.missed();
-    assert_eq!(
-      timing.deadline_ns(path.tail_ns()),
-      4 * HEARTBEAT_NS,
-      "two misses quadruple it"
-    );
-    for _ in 0..8 {
-      timing.missed();
-    }
-    assert_eq!(
-      timing.deadline_ns(path.tail_ns()),
-      LIVENESS_BUDGET_NS,
-      "however many misses, the liveness budget caps it"
-    );
-    timing.acknowledged();
-    assert_eq!(
-      timing.deadline_ns(path.tail_ns()),
-      HEARTBEAT_NS,
-      "an acknowledgement resets the backoff"
-    );
-
-    // A slow peer — its acknowledgements take 300 ms — is waited for above the floor, within the cap.
-    let mut slow_path = PathRtt::new();
-    slow_path.on_sample(300 * MS);
-    let slow = ProbeTiming::new();
-    let deadline = slow.deadline_ns(slow_path.tail_ns());
-    assert!(
-      deadline > HEARTBEAT_NS && deadline <= LIVENESS_BUDGET_NS,
-      "a slow peer's deadline follows its round trip: {deadline} ns"
-    );
-    assert_eq!(
-      Some(deadline),
-      slow_path.tail_ns(),
-      "above the floor the deadline is the path's measured tail itself"
-    );
-  }
 
   /// AC-8.1: authenticated announcements must derive from their anchor and nonce. A new
   /// nonce changes the member in either numeric direction; malformed claims are refused.
@@ -7600,28 +5961,6 @@ mod tests {
       classify_announced(None, anchor, 3, crate::deploy::member_id(anchor, 3)),
       LearnedOutcome::Restarted { old: seed },
       "first contact retires the non-voting manifest placeholder"
-    );
-  }
-
-  /// The probe cadence follows the Lifeguard local health: exactly one beat at full health, `health + 1`
-  /// beats as the node's own probes fail, never past the cap — a degraded prober probes less aggressively.
-  #[test]
-  fn the_probe_cadence_is_one_beat_dilated_by_the_local_health() {
-    assert_eq!(
-      probe_period_ns(1),
-      HEARTBEAT_NS,
-      "full health: exactly the beat"
-    );
-    assert_eq!(
-      probe_period_ns(2),
-      2 * HEARTBEAT_NS,
-      "one step of ill health: two beats"
-    );
-    let capped = LOCAL_HEALTH_CAP + 1;
-    assert_eq!(
-      probe_period_ns(capped),
-      u64::from(capped) * HEARTBEAT_NS,
-      "at the cap: three beats, never more"
     );
   }
 
@@ -7686,53 +6025,6 @@ mod tests {
     assert!(
       filling.judge(1, started + hedge_delay),
       "a round that gathered an acknowledgement within the delay is still filling and is extended"
-    );
-  }
-
-  /// The partition heal's schedule (`docs/bugs/2026-09-29-a-symmetric-partition-never-healed.md`): the first
-  /// attempt one suspicion window after the retirement, each unanswered one doubling the wait up to the cap
-  /// and staying there, and an answered one starting it over.
-  #[test]
-  fn reconnection_backs_off_to_its_cap_and_an_answer_starts_it_over() {
-    let retired_at = 1_000 * MS;
-    let mut schedule = Reconnect::from(retired_at);
-    let first = reconnect_first_ns();
-    assert!(
-      !schedule.due(retired_at + first - 1),
-      "not before the first window"
-    );
-    assert!(schedule.due(retired_at + first), "due at it");
-    let mut now = retired_at + first;
-    let mut waits = Vec::new();
-    for _ in 0..8 {
-      schedule.attempted(now, false);
-      waits.push(schedule.due_ns - now);
-      now = schedule.due_ns;
-    }
-    assert_eq!(
-      waits,
-      vec![
-        2 * first,
-        4 * first,
-        8 * first,
-        16 * first,
-        30 * first,
-        30 * first,
-        30 * first,
-        30 * first
-      ],
-      "doubling to the cap, ten times the suspicion window at the health cap, then held"
-    );
-    assert_eq!(
-      reconnect_cap_ns(),
-      6_000 * MS,
-      "6 s at the daemon's 100 ms beat"
-    );
-    schedule.attempted(now, true);
-    assert_eq!(
-      schedule.due_ns - now,
-      first,
-      "an answer starts the schedule over"
     );
   }
 

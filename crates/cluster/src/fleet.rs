@@ -23,7 +23,8 @@
 //! not a local reconcile. [`install_configuration`](FleetNode::install_configuration) installs a committed
 //! configuration and hands back the objects a departed owner's retirement gives this node to take over (the
 //! per-object routing view, [`crate::routing`], computes the rendezvous winner over the new neighbourhood).
-//! [`sync_membership`]/[`sync_peer`] bridge a detector's converged view into the membership each round.
+//! [`apply_peer_state`] folds one peer's belief from the membership plane's detector (`crate::member_plane`) into the
+//! membership; the daemon applies it under its admission rule on every shard (A-67 H-2).
 //!
 //! **Driven live by the daemon** (`slates-server`): each shard's `ShardState` holds a `FleetNode`; the
 //! control-shard record-plane coordinator drives the council over the transport and installs its committed
@@ -39,7 +40,6 @@ use slates_db::register::{
 };
 use slates_transport::endpoint::Endpoint;
 
-use crate::gossip::Gossip;
 use crate::membership::{Liveness, MemberState, Membership};
 use crate::routing::Routing;
 use crate::{CommitBudget, Committed, commit_under_configuration};
@@ -57,7 +57,6 @@ use crate::{CommitBudget, Committed, commit_under_configuration};
 pub struct FleetNode {
   host: HostId,
   membership: Membership,
-  gossip: Gossip,
   configuration: Configuration,
   /// The region's members as of the last installed configuration — the whole region, not this node's
   /// neighbourhood. A takeover triggers on a member **leaving the region** (a retirement/death), read by
@@ -95,7 +94,6 @@ impl FleetNode {
     FleetNode {
       host,
       membership,
-      gossip: Gossip::default(),
       configuration,
       members,
       acceptor,
@@ -242,26 +240,18 @@ impl FleetNode {
   pub fn observe(&mut self, subject: HostId, update: MemberState) -> bool {
     let prior = self.membership.state(subject);
     let changed = self.membership.apply(subject, update).is_some();
-    if changed && let Some(state) = self.membership.state(subject) {
-      self.gossip.record(subject, state);
-      if prior.is_none_or(|prior| prior.liveness != Liveness::Alive)
-        && state.liveness == Liveness::Alive
-      {
-        eprintln!(
-          "slates-cluster: fleet: {:?} holds {subject:?} alive: {prior:?} -> {state:?}, folded at {}",
-          self.host,
-          std::panic::Location::caller()
-        );
-      }
+    if changed
+      && let Some(state) = self.membership.state(subject)
+      && prior.is_none_or(|prior| prior.liveness != Liveness::Alive)
+      && state.liveness == Liveness::Alive
+    {
+      eprintln!(
+        "slates-cluster: fleet: {:?} holds {subject:?} alive: {prior:?} -> {state:?}, folded at {}",
+        self.host,
+        std::panic::Location::caller()
+      );
     }
     changed
-  }
-
-  /// Drains adopted membership changes over any live peer session (§4.8). The caller derives
-  /// `transmits` from fleet size; the queue holds at most one report per known member.
-  /// Local refutations enqueue the resulting alive incarnation, never the reported death.
-  pub fn gossip(&mut self, max: usize, transmits: u32) -> Vec<(HostId, MemberState)> {
-    self.gossip.drain(max, transmits)
   }
 
   /// Commits one of this node's own heads through the register path under the current authority — the
@@ -293,51 +283,9 @@ impl FleetNode {
   }
 }
 
-/// Folds a SWIM `view` (a [`crate::detector::Detector`]'s converged membership) into `fleet`'s membership —
-/// the bridge the probe loop calls after each round to carry the detector's view into the owner runtime
-/// (§4.8 "membership fed by SWIM"). A host this node currently believes **alive** that the view now believes
-/// **dead** is folded as a death; every host the view believes **alive** is folded (a join or refutation); a
-/// *suspect* is left untouched (still a member until a confirmed death). Returns whether the membership
-/// changed. The configuration is the council's (D-14), so this only advances the failure view the council
-/// leader reconciles from — a death's takeovers come from [`install_configuration`](FleetNode::install_configuration)
-/// once the council commits the retirement. Idempotent: a view already matching is a no-op.
-#[track_caller]
-pub fn sync_membership(view: &Membership, fleet: &mut FleetNode) -> bool {
-  let mut changed = false;
-  // Deaths: a host this node believes alive that the view now confirms dead.
-  for host in fleet.membership().alive() {
-    if host != fleet.host()
-      && let Some(state) = view.state(host)
-      && state.liveness == Liveness::Dead
-    {
-      changed |= fleet.observe(host, state);
-    }
-  }
-  // Joins and refutations: every host the view believes alive.
-  for host in view.alive() {
-    if let Some(state) = view.state(host) {
-      changed |= fleet.observe(host, state);
-    }
-  }
-  changed
-}
-
-/// Folds only `peer`'s liveness from `view` into `fleet` — the same alive-joins-it, dead-retires-it,
-/// suspect-leaves-it rule as [`sync_membership`], but for the one peer the caller names rather than the
-/// whole view. A node running one detector per peer folds that peer's timed failure here;
-/// third-member gossip must separately reach the shared view through `observe`. Incarnation
-/// ordering prevents stale alive reports from reversing a death. Returns
-/// whether the membership changed (the takeovers a death produces come from
-/// [`install_configuration`](FleetNode::install_configuration) once the council commits the retirement).
-#[track_caller]
-pub fn sync_peer(view: &Membership, fleet: &mut FleetNode, peer: HostId) -> bool {
-  apply_peer_state(fleet, peer, view.state(peer))
-}
-
-/// Folds one peer's believed `state` into `fleet`'s membership — the step [`sync_peer`] takes for the view
-/// it reads it from, exposed so a node's other shards apply the **same** state to their own `FleetNode`s
-/// (every shard is an owner with its own membership view, D-7; the control shard, which alone probes, hands
-/// each the state it folded, so all views advance identically and deterministically). A confirmed death and
+/// Folds one peer's believed `state` into `fleet`'s membership: the membership plane's detector's belief, which the
+/// control shard folds into its own `FleetNode` and hands every other shard to apply to theirs (every shard is an
+/// owner with its own membership view, D-7), so all views advance identically and deterministically. A confirmed death and
 /// an alive peer are both folded (idempotent); a suspect, or a peer not yet seen, leaves the view untouched
 /// (a suspect is still a member until a confirmed death). Returns whether the membership changed — the
 /// takeovers a death produces come from [`install_configuration`](FleetNode::install_configuration) once the
@@ -376,27 +324,6 @@ mod tests {
       liveness: Liveness::Dead,
       incarnation,
     }
-  }
-
-  /// T-8.5: a report crosses two live neighbors, expires after its transmission budget,
-  /// and stale observations cannot perpetually refill it or resurrect the failed member.
-  #[test]
-  fn an_adopted_death_disseminates_through_the_shared_view_for_a_bounded_budget() {
-    let mut first = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
-    let mut second = FleetNode::new(A, Quorum { f: 1 }, &[SELF, B]);
-    first.observe(B, dead(1));
-    let batch = first.gossip(1, 2);
-    assert_eq!(batch, vec![(B, dead(1))]);
-    for (subject, update) in batch {
-      second.observe(subject, update);
-    }
-    assert_eq!(second.gossip(1, 2), vec![(B, dead(1))]);
-    first.observe(B, alive(0));
-    assert_eq!(first.gossip(1, 2), vec![(B, dead(1))]);
-    assert!(first.gossip(1, 2).is_empty());
-    first.observe(B, alive(2));
-    first.observe(B, dead(2));
-    assert_eq!(first.gossip(1, 2), vec![(B, dead(2))]);
   }
 
   /// A dedicated probe position the invariant helper writes, distinct from any object a test commits
@@ -729,83 +656,45 @@ mod tests {
     assert_eq!(node.object_owner(object), None);
   }
 
-  /// AC (§4.8, the probe-loop bridge): `sync_membership` folds a detector's converged SWIM view into the
-  /// owner runtime's **membership** — a member the view believes dead is folded dead, one it believes alive
-  /// is folded alive — the failure view the council leader reconciles the configuration from. It returns
-  /// whether the view changed and is idempotent, so the live loop can call it every round.
+  /// AC (§4.8, the membership bridge): `apply_peer_state` folds the detector's belief about a peer into the owner
+  /// runtime's membership, the failure view the council leader reconciles the configuration from. A death is folded
+  /// dead and an alive peer alive; a suspicion leaves the member as it was (still a member until confirmed); a stale
+  /// alive belief at a lower incarnation cannot resurrect a death; a repeat is a no-op.
   #[test]
-  fn sync_membership_folds_deaths_and_joins_from_the_view() {
+  fn apply_peer_state_folds_deaths_and_joins_and_leaves_suspicions() {
     let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A]);
-    // The SWIM view: A has died (a later incarnation overrides its alive record), and B has joined.
-    let mut view = Membership::new(SELF);
-    view.apply(A, alive(0));
-    view.apply(A, dead(1));
-    view.apply(B, alive(0));
-
-    assert!(
-      sync_membership(&view, &mut fleet),
-      "the view's death and join change the membership"
-    );
+    assert!(apply_peer_state(&mut fleet, B, Some(alive(0))), "B joins");
+    assert!(apply_peer_state(&mut fleet, A, Some(dead(1))), "A dies");
     assert_eq!(
       fleet.membership().state(A).map(|s| s.liveness),
-      Some(Liveness::Dead),
-      "the dead member A is folded dead"
+      Some(Liveness::Dead)
+    );
+    assert!(
+      !apply_peer_state(&mut fleet, A, Some(alive(0))),
+      "stale alive gossip cannot resurrect A"
+    );
+    assert!(
+      !apply_peer_state(
+        &mut fleet,
+        B,
+        Some(MemberState {
+          liveness: Liveness::Suspect,
+          incarnation: 0,
+        })
+      ),
+      "a suspicion is not folded"
     );
     assert_eq!(
       fleet.membership().state(B).map(|s| s.liveness),
-      Some(Liveness::Alive),
-      "the alive member B is folded alive"
+      Some(Liveness::Alive)
     );
-
-    // Idempotent: syncing the same view again changes nothing.
     assert!(
-      !sync_membership(&view, &mut fleet),
-      "a second sync of the same view is a no-op"
+      !apply_peer_state(&mut fleet, A, Some(dead(1))),
+      "a repeat is a no-op"
     );
-  }
-
-  /// `sync_peer` folds only the peer it names into the membership — its own death or its being alive — and
-  /// never touches another peer, even one the view's gossip carries. This is what lets a node run one
-  /// detector per peer: a peer this node has folded dead must not be re-touched from another peer's
-  /// detector, or the two would flap it (the coupling `sync_membership`'s whole-view fold has, which
-  /// `sync_peer` is built to avoid).
-  #[test]
-  fn sync_peer_folds_only_the_peer_it_names() {
-    let mut fleet = FleetNode::new(SELF, Quorum { f: 1 }, &[A, B]);
-
-    // A's own detector has seen A die; its gossip still carries B alive (a per-peer detector disseminates
-    // the whole view). Folding it *scoped to A* folds A dead — B is untouched by A's fold.
-    let mut a_view = Membership::new(SELF);
-    a_view.apply(A, alive(0));
-    a_view.apply(A, dead(1));
-    a_view.apply(B, alive(0));
     assert!(
-      sync_peer(&a_view, &mut fleet, A),
-      "A's own detector folds A dead"
-    );
-    assert_eq!(
-      fleet.membership().state(A).map(|s| s.liveness),
-      Some(Liveness::Dead),
-      "A is folded dead by its own detector"
-    );
-
-    // B's detector still carries A (stale gossip about the peer this node just folded dead). Folding it
-    // *scoped to B* must NOT re-touch A — the flap the per-peer detectors would suffer under a whole-view
-    // fold is exactly what this prevents.
-    let mut b_view = Membership::new(SELF);
-    b_view.apply(A, alive(0));
-    b_view.apply(B, alive(0));
-    let _ = sync_peer(&b_view, &mut fleet, B);
-    assert_eq!(
-      fleet.membership().state(A).map(|s| s.liveness),
-      Some(Liveness::Dead),
-      "A stays dead — B's detector never re-touches it"
-    );
-
-    // Idempotent: a second fold of A's death changes nothing.
-    assert!(
-      !sync_peer(&a_view, &mut fleet, A),
-      "a second fold of A's death is a no-op"
+      !apply_peer_state(&mut fleet, SELF, Some(dead(9))),
+      "this node is never folded"
     );
   }
 }
