@@ -3339,3 +3339,16 @@ Suspects, unverified:
 - the outstanding count admits a call before the bound is checked.
 
 Next: reproduce under parallel load with `SIGSTOP` timing logged, failing test first.
+
+### 2026-10-04: a strict volume's first arena lock on macOS is one unsliced step (owed)
+
+Measured with a scratch probe on an Apple M5 Max: `mlock` wires 4 GiB in 143–144 ms, about 36 ms a GiB, in one call
+on the shard that admits the first strict volume. Other threads' mapping calls are unaffected (worst 24–30 µs), so
+this is not Linux's cross-shard stall (fixed by lock-on-fault, §4.2). It is one step past the shard's budget
+(CLAUDE.md §3, bounded work).
+
+Owed:
+- lock in slices across steps, a resumable lock the way `LandingRun` slices a landing;
+- or lock a strict volume's own chunks as they are allocated (GAP-A9-1's refinement).
+
+Windows `VirtualLock` commits its range too, and is unmeasured.

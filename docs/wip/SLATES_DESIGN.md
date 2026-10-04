@@ -971,6 +971,12 @@ Same code, zero modes.
 > `crates/mem/tests/lock_on_fault.rs`: 268 MB committed by locking an untouched 256 MiB region before, none after).
 > macOS (`mlock` wires the range) and Windows (`VirtualLock`) are unchanged. Locking only a strict volume's own
 > chunks, rather than its shard's whole arena, remains the refinement GAP-A9-1 records.
+> Measured on macOS 2026-10-04 (Apple M5 Max, a scratch probe: one thread wiring a 4 GiB anonymous region while
+> another times 1 MiB `mmap`/`munmap`):
+> - Wiring took 143–144 ms. The other thread's worst call was 24–30 µs, against 15 µs–1.1 ms without the lock: XNU
+>   does not hold the map lock across the wiring, so there is no cross-shard stall like Linux's.
+> - The locking shard itself spends about 36 ms a GiB in one call, once per region (the lock is idempotent). That is
+>   an unsliced step, owed (GAPS 2026-10-04).
 
 **Ownership and residency.** Each shard owns bounded generational slabs and chunk arenas;
 foreign frees are messages to the owner. Every allocation has a charge owner and a terminal
