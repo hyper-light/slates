@@ -1,6 +1,9 @@
 [workspace]
 members = ["crates/*", "xtask"]
 default-members = ["crates/*"]
+# vendor/ holds third-party crates slates builds from its own tree (vendor/UPSTREAM.md); they are not workspace members,
+# so the lint wall, fmt and xtask's checks apply to slates' code only.
+exclude = ["vendor"]
 resolver = "2"
 
 [workspace.package]
@@ -150,3 +153,9 @@ lto = true
 # and a panic is a bug that must stop the process (Appendix B.1, hecate's no-panic law).
 panic = "abort"
 # codegen-units stays at the default until a measured build shows a gain (Appendix B.1).
+
+# AWS-LC and its Rust binding, built from the copies in vendor/ (vendor/UPSTREAM.md): each is its crates.io package as
+# published, verified against Cargo.lock's SHA-256, so slates owns the exact bytes it builds.
+[patch.crates-io]
+aws-lc-rs = { path = "vendor/aws-lc-rs" }
+aws-lc-sys = { path = "vendor/aws-lc-sys" }
