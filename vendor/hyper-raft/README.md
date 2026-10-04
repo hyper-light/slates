@@ -11,7 +11,8 @@ path or git dependency on the shared repository: slates builds what it reviewed 
 | `hyper-swim` | SWIM membership and its per-pair detectors | slates' detector at `5cce86a` |
 | `hyper-datagram` | the sealed control-datagram plane | after slates' seal |
 
-Each directory holds the crate's `src/` and `ORIGIN.md` unchanged and a manifest of slates' own (its own workspace
+`rustfmt.toml` is hyper-raft's own (four-space indent), so `cargo fmt --all` checks the vendored code against the
+format it was written in and never reformats it. Each directory holds the crate's `src/` and `ORIGIN.md` unchanged and a manifest of slates' own (its own workspace
 root, outside slates' workspace). hyper-raft's `LICENSE` covers them. Tests, benches and the shared workspace's lint
 wall stay in hyper-raft, whose CI runs them on all six targets. hyper-datagram's `prebuilt-nasm` feature is left to
 slates' build settings (CI builds NASM from source).

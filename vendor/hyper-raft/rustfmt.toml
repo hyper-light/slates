@@ -1,0 +1,3 @@
+# Upstream quinn-proto, rustls, focal and mantle all use the default four-space indent; keeping it
+# keeps vendored code diffable against upstream.
+edition = "2024"
