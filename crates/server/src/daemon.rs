@@ -1443,19 +1443,20 @@ impl Daemon {
   /// How long this daemon took to serve each NFS call, from the call read to its reply built, summed over every
   /// shard (§4.14): calls served on the shard that read them, then calls forwarded to their volume's owner shard.
   /// What a caller measured beyond these is outside the serve: the kernel client, the socket and the wakes.
-  pub fn nfs_service_times(
-    &self,
-  ) -> Result<(crate::histogram::Quantiles, crate::histogram::Quantiles), ObserveError> {
-    let mut local = crate::histogram::DurationHistogram::default();
-    let mut forwarded = crate::histogram::DurationHistogram::default();
+  #[cfg(unix)]
+  pub fn nfs_service_times(&self) -> Result<crate::nfs::ServiceQuantiles, ObserveError> {
+    let mut summed = crate::nfs::ServiceTimes::default();
     for shard in self.shards.iter().copied() {
-      let (shard_local, shard_forwarded) = self.observe(Some(shard), |s| {
-        (s.nfs_service.local.clone(), s.nfs_service.forwarded.clone())
-      })?;
-      local.absorb(&shard_local);
-      forwarded.absorb(&shard_forwarded);
+      let shard_times = self.observe(Some(shard), |s| s.nfs_service.clone())?;
+      summed.local.absorb(&shard_times.local);
+      summed.forwarded.absorb(&shard_times.forwarded);
+      summed.local_off_cpu.absorb(&shard_times.local_off_cpu);
     }
-    Ok((local.quantiles(), forwarded.quantiles()))
+    Ok(crate::nfs::ServiceQuantiles {
+      local: summed.local.quantiles(),
+      forwarded: summed.forwarded.quantiles(),
+      local_off_cpu: summed.local_off_cpu.quantiles(),
+    })
   }
 
   /// The refusals every shard of this daemon has counted, summed by kind (§4.14). A volume's refusals — a
@@ -2704,6 +2705,7 @@ fn init_shard(
     placed_heads: std::collections::BTreeMap::new(),
     formed_probe_peers: std::collections::BTreeSet::new(),
     plane: crate::member_task::PlaneState::default(),
+    #[cfg(unix)]
     nfs_service: crate::nfs::ServiceTimes::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),

@@ -442,6 +442,7 @@ pub struct ShardState {
   /// the epochs keyed from each pair's canonical record session (`crate::member_task`). Empty on a laptop.
   pub(crate) plane: crate::member_task::PlaneState,
   /// How long this shard took to serve each NFS call it read, served here or forwarded to its owner (§4.14).
+  #[cfg(unix)]
   pub nfs_service: crate::nfs::ServiceTimes,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.

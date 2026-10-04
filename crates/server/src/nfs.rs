@@ -1116,6 +1116,7 @@ async fn serve_v3(
     return serve_root_listing(requester, procedure, &args, entries, port);
   }
   let started = slates_machine::clock::monotonic_ns();
+  let started_cpu = thread_cpu_ns();
   let (forwarded, served) = match route(program, procedure, &args) {
     Some(owner) => (
       true,
@@ -1127,14 +1128,30 @@ async fn serve_v3(
     ),
   };
   let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
+  let on_cpu = thread_cpu_ns().saturating_sub(started_cpu);
   let _ = state::with_state(|s| {
     if forwarded {
       s.nfs_service.forwarded.record(elapsed);
     } else {
       s.nfs_service.local.record(elapsed);
+      s.nfs_service
+        .local_off_cpu
+        .record(elapsed.saturating_sub(on_cpu));
     }
   });
   served
+}
+
+/// The calling thread's CPU time in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`), so a local serve's wall time splits
+/// into the time it ran and the time the operating system held the shard's thread off a core.
+fn thread_cpu_ns() -> u64 {
+  /// Format: nanoseconds per second.
+  const NS_PER_SECOND: u64 = 1_000_000_000;
+  let reading = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+  u64::try_from(reading.tv_sec)
+    .unwrap_or(0)
+    .saturating_mul(NS_PER_SECOND)
+    .saturating_add(u64::try_from(reading.tv_nsec).unwrap_or(0))
 }
 
 /// How long a shard took to serve the NFS calls it read (§4.14): from the call parsed to its results built,
@@ -1145,6 +1162,20 @@ pub struct ServiceTimes {
   pub local: crate::histogram::DurationHistogram,
   /// Calls forwarded to their volume's owner shard and answered back.
   pub forwarded: crate::histogram::DurationHistogram,
+  /// Of each local call, the wall time the shard's thread spent off a core (its wall time less its CPU time): a
+  /// synchronous serve never waits, so this is the operating system's preemption, not the serve's work.
+  pub local_off_cpu: crate::histogram::DurationHistogram,
+}
+
+/// What [`ServiceTimes`] measured, summed over a daemon's shards (`Daemon::nfs_service_times`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServiceQuantiles {
+  /// Calls served on the shard that read them.
+  pub local: crate::histogram::Quantiles,
+  /// Calls forwarded to their volume's owner and answered back.
+  pub forwarded: crate::histogram::Quantiles,
+  /// The off-core share of each local call.
+  pub local_off_cpu: crate::histogram::Quantiles,
 }
 
 // ------------------------------------------------------------------------------ NFSv4 (A-35)

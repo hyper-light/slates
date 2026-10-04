@@ -395,7 +395,8 @@ fn a_mounts_connection_moves_to_its_volumes_owner_and_is_served_there() {
     );
     xid += 2;
   }
-  let (local, forwarded) = daemon.nfs_service_times().unwrap();
+  let times = daemon.nfs_service_times().unwrap();
+  let (local, forwarded) = (times.local, times.forwarded);
   drop(stream);
   drop(client);
   drop(daemon);
@@ -443,7 +444,7 @@ fn a_connection_alternating_between_volumes_on_two_shards_serves_both() {
     );
     xid += 4;
   }
-  let (_, forwarded) = daemon.nfs_service_times().unwrap();
+  let forwarded = daemon.nfs_service_times().unwrap().forwarded;
   drop(stream);
   drop(client);
   drop(daemon);

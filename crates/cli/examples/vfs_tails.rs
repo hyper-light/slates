@@ -348,8 +348,12 @@ fn focus_loop(
     stop.store(true, Ordering::Relaxed);
     report(per_core, 1, "focus_rename", samples);
   });
-  let (local, forwarded) = daemon.nfs_service_times().unwrap();
-  for (kind, served) in [("served_local", local), ("served_forwarded", forwarded)] {
+  let times = daemon.nfs_service_times().unwrap();
+  for (kind, served) in [
+    ("served_local", times.local),
+    ("served_forwarded", times.forwarded),
+    ("served_local_off_cpu", times.local_off_cpu),
+  ] {
     println!(
       "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
       served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count
@@ -539,8 +543,12 @@ fn raw_loop(
     stop.store(true, Ordering::Relaxed);
     report(per_core, 1, "raw_rename_rpc", samples);
   });
-  let (local, forwarded) = daemon.nfs_service_times().unwrap();
-  for (kind, served) in [("served_local", local), ("served_forwarded", forwarded)] {
+  let times = daemon.nfs_service_times().unwrap();
+  for (kind, served) in [
+    ("served_local", times.local),
+    ("served_forwarded", times.forwarded),
+    ("served_local_off_cpu", times.local_off_cpu),
+  ] {
     println!(
       "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
       served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count

@@ -1534,3 +1534,19 @@ both. Three runs each of a 12-second rename loop at load 1. p99 / p999:
 | both | 4.5 / 54 ms | 2.9 / 57 ms | 3.0 / 50 ms |
 
 No arm beats the spread of the others; not landed.
+
+**Where the daemon's own long serves go (same day, `served_local_off_cpu`).** A local serve is synchronous, so the
+serve's wall time less the shard thread's CPU time (`CLOCK_THREAD_CPUTIME_ID`) is time the operating system held
+the thread off a core. Raw RPC mode (`VFS_TAILS_RAW`, one RENAME per sample, no kernel client), load average 61–78
+from other sessions:
+
+| load/core | serve p99 | off-core p99 | serve max | off-core max | caller RPC p99 / p999 |
+|---|---|---|---|---|---|
+| 0 | 53 µs | 27 µs | 8.9 ms | 8.8 ms | 0.50 / 5.0 ms |
+| 1 | 131 µs | 98 µs | 67.4 ms | 67.4 ms | 1.09 / 21.8 ms |
+| 2 | 106 µs | 74 µs | 53.4 ms | 53.3 ms | 1.01 / 42.5 ms |
+
+The daemon's long serves are preemption, not work: the CPU a serve takes is a few microseconds. **Shard QoS
+re-measured on this metric and rejected again** (three interleaved pairs at load 1, off-core p99 / p999 / max):
+- none: 106 µs / 655 µs / 42 ms; 20 µs / 295 µs / 26 ms; 74 µs / 786 µs / 73 ms;
+- `QOS_CLASS_USER_INTERACTIVE`: 115 µs / 983 µs / 66 ms; 27 µs / 328 µs / 35 ms; 90 µs / 655 µs / 120 ms.
