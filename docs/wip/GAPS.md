@@ -3488,9 +3488,11 @@ This closes the 2026-10-04 re-vendor entries above. Still owed from hyper-raft: 
 
 The arena's block unit is `min(page, 4096)`; chunks stay sixteen host pages, and the buddy's per-granule arrays are
 zero-allocated. Daemon RSS with 4,000 files of 4 KiB fell from 294 MB to 115–124 MB and the empty daemon from 41 MB
-to 34 MB, with 256 MiB write throughput unchanged (BENCHMARKS, "Content granule"). Still owed: the remaining 4,000
-small files' RSS (about 80 MB above empty) is not yet split between metadata slabs, the content arena and the
-publication's images. Measure it next with `footprint --forkCorpse`, never `vmmap`, which suspends the daemon long
-enough for the anchor to kill it.
+to 34 MB, with 256 MiB write throughput unchanged (BENCHMARKS, "Content granule"). Attributed the same day (BENCHMARKS): the rest was
+the AppleDouble working copy, one 4 KiB block per file, now dropped when canonical (A-70; RSS with 8,000 small files
+84 MB). Measure with `footprint --forkCorpse` and a `MallocStackLogging=1` memgraph, never `vmmap`, which suspends
+the daemon long enough for the anchor to kill it. Still owed: each provenance attribute takes a whole attribute
+inode (about 600 B of slab per file); a small value held in the owner's table was rejected by §4.5 for copy-on-write
+cost and is not revisited without a measurement.
 Found on the way and fixed: `observe.rs`'s slow question spun by the wall clock, which under load is not late by the
 shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observation-test-was-not-slow-under-load.md).

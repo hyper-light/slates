@@ -381,3 +381,62 @@ fn a_views_mode_owner_and_times_are_not_its_own_to_change() {
     "the view's own mode is accepted"
   );
 }
+
+/// Writes `bytes` as `f`'s sidecar the way macOS does, and returns the owner with the arena bytes the write
+/// left allocated.
+fn write_sidecar(bytes: &[u8]) -> (Store, Volume, InodeNo, usize) {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let (owner, before) = {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = bridge.root(&cx).unwrap();
+    let (attr, _) = bridge.create(oid(root), &cx, "f", 0o644, 0).unwrap();
+    let view = bridge
+      .appledouble_create(oid(root), &cx, "f", true)
+      .unwrap();
+    (InodeNo(attr.ino), view.ino)
+  };
+  let allocated_before = store.content.arena().allocated_bytes();
+  {
+    let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    bridge.write(oid(before), &cx, 0, bytes).unwrap();
+    assert_eq!(
+      read_view(&mut bridge, &cx, owner),
+      bytes,
+      "the view reads back the client's bytes"
+    );
+  }
+  let held = store
+    .content
+    .arena()
+    .allocated_bytes()
+    .saturating_sub(allocated_before);
+  (store, vol, owner, held)
+}
+
+/// §4.6, A-70: do write a sidecar macOS wrote whose bytes are the canonical encoding of its attributes (the
+/// provenance attribute every new file gets: `one-attr.bin`); expect the view to read back those bytes and no
+/// working copy kept, so the sidecar costs only its attribute values — the 4 KiB copy per file was 16 MB for
+/// 4,000 files through a real mount (2026-10-04). Then write one whose entry order is not byte order
+/// (`dir-exclude.bin`); expect the copy kept, because only it reproduces the client's bytes.
+#[test]
+fn a_canonical_sidecar_keeps_no_working_copy_and_any_other_keeps_its_own() {
+  let canonical = vector("one-attr.bin");
+  let (store, vol, owner, held) = write_sidecar(&canonical);
+  let values: usize = stored(&vol, &store, owner)
+    .iter()
+    .map(|(_, value)| value.len())
+    .sum();
+  assert!(
+    held < canonical.len(),
+    "a canonical sidecar holds {held} bytes, less than its own {} (values {values})",
+    canonical.len()
+  );
+  let reordered = vector("dir-exclude.bin");
+  let (_store, _vol, _owner, held) = write_sidecar(&reordered);
+  assert!(
+    held >= reordered.len(),
+    "a sidecar the encoding cannot reproduce keeps its working copy ({held} bytes)"
+  );
+}

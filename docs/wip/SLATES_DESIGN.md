@@ -8627,3 +8627,27 @@ Status: built 2026-10-04.
   with 4,000 files of 4 KiB 294 → 115–124 MB; 256 MiB write throughput unchanged.
 - Proven: the model suite runs every history twice, the second time on a store whose granule (4 KiB) is below its
   page (16 KiB), so the charge rule is checked against the granule and never the page.
+
+### A-70 — A canonical AppleDouble working copy is not kept (2026-10-04)
+Applied in the same change to: `crates/bridge-core/src/volume_bridge/view.rs` (`drop_copy_if_canonical`),
+`crates/bridge-core/tests/appledouble_view.rs`, BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: over NFSv3, macOS writes a 4,096-byte `._name` sidecar beside every new file to carry its
+  `com.apple.provenance` attribute (17 bytes of value). The view (§4.6) stored the attribute and also kept the
+  client's bytes as a working copy, one whole content block per file. With 4,000 tiny and 4,000 4 KiB files
+  through a real mount, the arena held 49.2 MB for 16.4 MB of file bytes. The in-process store, with no sidecars,
+  held exactly 16,000 KiB for the same 4,000 4 KiB files.
+- What: after a full reconciliation (the path that has just read every value whole), the view compares the working
+  copy with the canonical encoding of the attributes it names. If they are byte-identical, the copy is dropped. A
+  read then renders the same bytes. The view's change counter stays monotone, because `sidecar_drop` folds the
+  copy's version into the owner. Its times become the owner's change time, which the reconciliation just advanced.
+  A copy the encoding cannot reproduce is kept, so the view always reads back exactly what the client wrote:
+  another entry order (one of five captured macOS sidecars), trailing bytes, or an incomplete file. A value written
+  in place in pieces (a resource fork) keeps its copy until the next full reconciliation, so no extra whole-value
+  pass is added per piece.
+- Rejected: never keeping a copy (always rendering). It cannot read back a client's non-canonical layout byte for
+  byte, which an NFS client's cached pages require.
+- Measured (BENCHMARKS, "Content granule"): arena 49.2 → 16.4 MB; RSS with 4,000 tiny files 78 → 52 MB, and after
+  4,000 more of 4 KiB 115–124 → 84 MB.
+- Proven: `a_canonical_sidecar_keeps_no_working_copy_and_any_other_keeps_its_own` (failed first: 4,096 bytes
+  held); the five captured-vector tests pass unchanged; through a real mount, `xattr -w/-p/-d` and `cp -p` round-trip.

@@ -1600,3 +1600,18 @@ Measured and rejected on the way:
 - **The granule alone, with the buddy's non-zero sentinels.** The empty daemon was 99.6 MB resident: the per-granule
   state, link and incarnation arrays (17 bytes a granule) were written whole at start-up. Zero sentinels make them
   lazily backed.
+
+**Then the AppleDouble working copy (A-70).** Same `e2e-rss.sh` on the A-69 binary plus A-70, with the arena's
+allocation read at each publication, load average 69–77:
+
+| | A-69 | A-69 + A-70 |
+|---|---|---|
+| arena after both phases | 49.2 MB (4,096 B per tiny file, 8,192 B per 4 KiB file) | 16.4 MB (the file bytes) |
+| RSS, 4,000 tiny files | 78–82 MB | 51.8 MB |
+| RSS, + 4,000 × 4 KiB | 115–124 MB | 83.7 MB |
+
+Attribution, from a `MallocStackLogging=1` memory graph (`leaks --forkCorpse --outputGraph`, then `malloc_history
+-allBySize` grouped by the innermost slates frame) and `footprint --forkCorpse -v`. The shard's content mapping held
+3,001 dirty 16 KiB pages (48 MB). The heap growth from 8,000 files was about 10 MB: the attribute inode each
+provenance attribute takes (5 MB of inode slab), directory and trie slabs, and the op log's ring (5.6 MB, bounded by
+its budget). The runtime's per-shard build (11 MB) is fixed, present in the empty daemon.

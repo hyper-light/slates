@@ -8,7 +8,8 @@
 //!
 //! Its bytes are the working copy when there is one (the bytes exactly as the client last wrote
 //! them, `XattrTable::sidecar`), otherwise a canonical encoding rendered on demand from the values
-//! (`appledouble::encode`). Every write lands in the working copy (materialized from the encoding
+//! (`appledouble::encode`). A working copy whose bytes are that canonical encoding is dropped once a full
+//! reconciliation ends, since the rendering reproduces it (A-70). Every write lands in the working copy (materialized from the encoding
 //! first), and the attributes are then reconciled with what the working copy now says:
 //! - an incomplete file (a write sequence in progress) changes nothing;
 //! - a write that falls wholly inside attribute values with the layout unchanged (a resource fork
@@ -444,7 +445,36 @@ impl VolumeBridge<'_> {
     {
       return self.write_through(owner, &after, written);
     }
-    self.replace_all(owner, &after)
+    self.replace_all(owner, &after)?;
+    self.drop_copy_if_canonical(owner)
+  }
+
+  /// Drops the working copy when its bytes are the canonical encoding of the attributes it now names (A-70): a read
+  /// then renders exactly those bytes from the values, so the copy holds nothing the values do not. macOS writes the
+  /// canonical layout whenever its entry order is byte order (four of five captured sidecars, `tests/appledouble.rs`),
+  /// including the provenance attribute every new file gets, so the copy was a whole block per file: 4,000 files took
+  /// 16 MB of arena through a real mount for 17 bytes of values each (2026-10-04). Asked only after a full
+  /// reconciliation, which has just read every value whole, so the comparison adds work of the same order; a value
+  /// written in place in pieces keeps the copy until the next full reconciliation. A copy the encoding cannot reproduce
+  /// (another entry order, trailing bytes) is kept, so the view always reads back what the client wrote.
+  fn drop_copy_if_canonical(&mut self, owner: InodeNo) -> Result<(), VfsError> {
+    let Some(copy) = self.volume.sidecar_attrs(self.store, owner)? else {
+      return Ok(());
+    };
+    let (names, encoding) = self.encoding(owner)?;
+    if encoding.len != copy.size {
+      return Ok(());
+    }
+    let len = usize::try_from(encoding.len).map_err(|_| VfsError::FileTooLarge)?;
+    let mut rendered = vec![0u8; len];
+    if self.render(owner, &names, &encoding, 0, &mut rendered)? != len {
+      return Ok(());
+    }
+    let mut held = vec![0u8; len];
+    if self.volume.sidecar_read(self.store, owner, 0, &mut held)? != len || held != rendered {
+      return Ok(());
+    }
+    self.volume.sidecar_drop(self.store, owner)
   }
 
   /// Writes the bytes of `written` that fall inside attribute values into those values in place.
