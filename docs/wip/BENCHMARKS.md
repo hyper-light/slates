@@ -1427,6 +1427,10 @@ If it is re-taken, jemalloc (as ../vorpal uses it) is the comparison arm.
 
 ### The cryptographic library: AWS-LC against ring and RustCrypto (2026-10-03, A-66)
 
+> The `seal_bench` example below was removed on 2026-10-04 with the transport's control-datagram seal (A-67 H-2c,
+> replaced by hyper-datagram's sealed plane, which hyper-raft benchmarks against slates' seal: a tenth to a half of
+> its cost a message). Its numbers stay on record; the commands below ran at `1ef18e4`.
+
 Apple M5 Max (18 cores), macOS 26.4.1, release builds, load average 14.4–17.2 from other sessions (not quiesced).
 "Before" is `240013e` (rustls on `ring`, the seal on RustCrypto's `aes-gcm`), extracted with `git archive` and built
 in its own target directory. "After" is the tree with A-66. The two ran alternately, two runs each.
