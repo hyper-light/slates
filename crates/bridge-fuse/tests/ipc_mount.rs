@@ -92,25 +92,67 @@ fn original_image() -> VolumeImage {
   original.to_image(&store, None).unwrap()
 }
 
+/// A clone handed to another mount (A-64: a clone recovers beside its origin): the origin's image, the snapshot the
+/// clone was made of, and the clone's image.
+struct CloneImages {
+  origin: VolumeImage,
+  snapshot: slates_vfs::ids::SnapshotId,
+  clone: VolumeImage,
+}
+
+/// What a mount serves: a volume's image, or a clone's with its origin.
+enum Served {
+  Plain(VolumeImage),
+  Clone(Box<CloneImages>),
+}
+
+/// The served volume rebuilt into `store`. The images hold FIFOs and sockets only (their data passes through the
+/// kernel, never the volume), so they name no arena block and a fresh store recovers them whole (A-64); a clone is
+/// rebuilt over its rebuilt origin, which stays in the store beside it.
+fn rebuild(store: &mut slates_vfs::volume::Store, served: &Served) -> Volume {
+  let plain = |store: &mut slates_vfs::volume::Store, image: &VolumeImage| {
+    let claims = slates_vfs::recover::Claims::prepare(store, [image]).unwrap();
+    Volume::from_image(
+      store,
+      image,
+      &claims,
+      Box::new(HostClock::default()),
+      1 << 16,
+      None,
+    )
+    .unwrap()
+  };
+  match served {
+    Served::Plain(image) => plain(store, image),
+    Served::Clone(images) => {
+      let origin = plain(store, &images.origin);
+      let claims = slates_vfs::recover::Claims::prepare(store, [&images.clone]).unwrap();
+      let clone = Volume::clone_from_image(
+        store,
+        &images.clone,
+        &claims,
+        &origin,
+        images.snapshot,
+        Box::new(HostClock::default()),
+        1 << 16,
+        None,
+      )
+      .unwrap();
+      // Dropping the origin's value frees nothing of the store: its records stay, shared with the clone.
+      drop(origin);
+      clone
+    }
+  }
+}
+
 fn serve(
   mut mounted: Mount,
-  image: VolumeImage,
+  served: Served,
   identity: u8,
-  control: Option<(ChangeSignal, Receiver<SyncSender<VolumeImage>>)>,
+  control: Option<(ChangeSignal, Receiver<SyncSender<CloneImages>>)>,
 ) {
   let mut store = common::store();
-  // The images hold FIFOs and sockets only (their data passes through the kernel, never the volume), so they name
-  // no arena block and a fresh store recovers them whole (A-64).
-  let claims = slates_vfs::recover::Claims::prepare(&mut store, [&image]).unwrap();
-  let mut volume = Volume::from_image(
-    &mut store,
-    &image,
-    &claims,
-    Box::new(HostClock::default()),
-    1 << 16,
-    None,
-  )
-  .unwrap();
+  let mut volume = rebuild(&mut store, &served);
   let id = VolumeId {
     bytes: [identity; 16],
   };
@@ -160,7 +202,13 @@ fn serve(
         },
       )
       .unwrap();
-      reply.send(clone.to_image(&store, None).unwrap()).unwrap();
+      reply
+        .send(CloneImages {
+          origin: volume.to_image(&store, None).unwrap(),
+          snapshot,
+          clone: clone.to_image(&store, None).unwrap(),
+        })
+        .unwrap();
     }
     let mut bridge = VolumeBridge::attached(id, &mut volume, &mut store, &mut handles, None);
     if serve_step(
@@ -295,12 +343,19 @@ fn fifo_and_socket_communication_is_local_to_each_clone() {
     let (requests, inbox) = sync_channel(1);
     let (reply, response) = sync_channel(1);
     let original = original_image();
-    let first = scope.spawn(move || serve(original_mount, original, 1, Some((signal, inbox))));
+    let first = scope.spawn(move || {
+      serve(
+        original_mount,
+        Served::Plain(original),
+        1,
+        Some((signal, inbox)),
+      )
+    });
     let endpoints = establish_ipc(&paths);
     requests.send(reply).unwrap();
     notifier.notify().unwrap();
     let clone = response.recv_timeout(MOUNT_WAIT).unwrap();
-    let second = scope.spawn(move || serve(clone_mount, clone, 2, None));
+    let second = scope.spawn(move || serve(clone_mount, Served::Clone(Box::new(clone)), 2, None));
     verify_isolation(&paths, &endpoints);
     drop(endpoints);
     drop(paths);

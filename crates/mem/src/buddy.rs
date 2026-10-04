@@ -242,10 +242,18 @@ impl Buddy {
 
   /// The largest block that can be allocated right now, in bytes (0 when nothing is free).
   pub fn largest_free(&self) -> usize {
-    (0..=self.max_order)
-      .rev()
-      .find(|order| self.head_of(*order) != NONE)
-      .map_or(0, |order| self.order_bytes(order))
+    // A plain countdown: an inclusive range's iterator carries an exhaustion check per step (measured in the
+    // instruction-count gate).
+    let mut order = self.max_order;
+    loop {
+      if self.head_of(order) != NONE {
+        return self.order_bytes(order);
+      }
+      if order == 0 {
+        return 0;
+      }
+      order -= 1;
+    }
   }
 
   /// The order (block size exponent in granules) that fits `len` bytes.
@@ -266,12 +274,16 @@ impl Buddy {
   /// Allocates a block of at least `len` bytes.
   pub fn alloc(&mut self, len: usize) -> Result<Block, MemError> {
     let order = self.order_for(len)?;
-    let Some(found) = (order..=self.max_order).find(|o| self.head_of(*o) != NONE) else {
-      return Err(MemError::ArenaExhausted {
-        requested: len,
-        largest_free: self.largest_free(),
-      });
-    };
+    let mut found = order;
+    while self.head_of(found) == NONE {
+      if found >= self.max_order {
+        return Err(MemError::ArenaExhausted {
+          requested: len,
+          largest_free: self.largest_free(),
+        });
+      }
+      found += 1;
+    }
     let index = self.head_of(found);
     // The incarnation is taken before anything changes, so a spent head refuses with the allocator intact.
     let incarnation = self
@@ -290,6 +302,7 @@ impl Buddy {
   }
 
   /// Marks the block of `order` at `index` allocated under `incarnation` and returns it.
+  #[inline]
   fn take(&mut self, index: u32, order: u32, incarnation: u64) -> Block {
     self.mark(index, order, false);
     if let Some(slot) = self.slot_mut(index) {
@@ -637,6 +650,7 @@ impl Buddy {
   }
 
   /// Returns the block of `order` at `index` to the free lists, coalescing; its live bit is the caller's.
+  #[inline]
   fn coalesce_free(&mut self, index: u32, order: u32) {
     self.free_bytes = self.free_bytes.saturating_add(self.order_bytes(order));
     let (index, order) = self.coalesce(index, order);
