@@ -1057,6 +1057,7 @@ impl PeerDriver {
       address: peer.address,
       certificate: peer.certificate.clone(),
       resolved: None,
+      stale: false,
       seed_retired: false,
     };
     let _ = state::with_state(|s| s.plane.peers.insert(peer.anchor, plane_peer));

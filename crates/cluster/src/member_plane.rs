@@ -223,7 +223,7 @@ impl MemberPlane {
   }
 
   /// Installs `peer`'s epoch from its canonical connection (`docs/wip/transport-quic.md` §6, H-2), with this node's
-  /// `role` on it, and joins the peer to the view.
+  /// `role` on it. The peer is not judged until it is also [`join`](Self::join)ed, once the owner can address it.
   pub fn install_epoch(
     &mut self,
     peer: HostId,
@@ -231,11 +231,17 @@ impl MemberPlane {
     secret: &ExporterSecret,
     role: Role,
   ) -> Result<(), PlaneRefusal> {
-    self.plane.install_epoch(peer.0, epoch, secret, role)?;
+    self.plane.install_epoch(peer.0, epoch, secret, role)
+  }
+
+  /// Joins `peer` to the detector's view, so its probes are judged: the owner calls it once the peer is both keyed and
+  /// addressable. A probe that cannot even be sent is never a miss: a member joined while unaddressable would be
+  /// suspected and condemned for the owner's own lack of an address (KIND, 2026-10-04, a peer's DNS name not yet
+  /// published at a fresh install). Counted when the bounded view refuses it.
+  pub fn join(&mut self, peer: HostId) {
     if self.detector.join(hyper_swim::HostId(peer.0)).is_err() {
       self.counts.view_full = self.counts.view_full.saturating_add(1);
     }
-    Ok(())
   }
 
   /// Forgets `peer`'s keys and pending messages (a retired member id).

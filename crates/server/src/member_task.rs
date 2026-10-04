@@ -122,6 +122,9 @@ pub(crate) struct PlanePeer {
   pub certificate: CertificateDer<'static>,
   /// The address the plane last resolved for it.
   pub resolved: Option<SocketAddrV4>,
+  /// Whether `resolved` is owed a fresh resolution (a new connection, or a suspicion): it is still used until the
+  /// fresh one succeeds, so re-resolving never drops a datagram (`forget_address`).
+  pub stale: bool,
   /// Whether its seed id has been retired: once its real member id is learned, the manifest's placeholder is folded
   /// dead, once.
   pub seed_retired: bool,
@@ -141,6 +144,9 @@ pub(crate) struct PlaneState {
   pub announced_on: BTreeMap<HostId, slates_transport::endpoint::ConnectionId>,
   /// Per member, the liveness last folded into the fleet: a member whose state is unchanged costs no fold.
   pub folded: BTreeMap<HostId, MemberState>,
+  /// Members keyed by an installed epoch, and whether each has been joined to the detector: a member joins once it is
+  /// also addressable (`MemberPlane::join`).
+  pub keyed: BTreeMap<HostId, bool>,
 }
 
 impl std::fmt::Debug for PlaneState {
@@ -216,7 +222,21 @@ pub(crate) fn accept_announcement(
   if !matches!(installed, Some(Ok(()))) {
     return refuse(state);
   }
+  state.plane.keyed.insert(announced.member, false);
+  forget_address(state, anchor);
   answer.encode().to_vec()
+}
+
+/// Marks `anchor`'s resolved plane address stale so the next turn resolves it afresh: a new connection may come from a
+/// new address (a replaced pod keeps its name and certificate, not its IP). The address stays the manifest's or
+/// discovery's, never a datagram's source, which only path validation could vouch for. The old address is kept until
+/// the fresh one resolves: clearing it dropped the datagrams sealed in between, and a lost first probe wedged
+/// hyper-swim's detectors (each waits for a message only another's probe would send; 7 of 10 three-node formations
+/// hung, 0 of 6 without the drop, 2026-10-04; reported to hyper-raft).
+fn forget_address(state: &mut ShardState, anchor: HostId) {
+  if let Some(peer) = state.plane.peers.get_mut(&anchor) {
+    peer.stale = true;
+  }
 }
 
 /// The dialer side: every record session this node dialed announces its identity once per connection, so the peer
@@ -325,6 +345,8 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
     });
     if matches!(installed, Some(Ok(()))) {
       state.plane.announced.insert(anchor, epoch);
+      state.plane.keyed.insert(answer.member, false);
+      forget_address(state, anchor);
     } else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
     }
@@ -428,6 +450,12 @@ fn changed_members(state: &mut ShardState) -> Vec<(HostId, MemberState)> {
   }
   for (member, belief) in &changed {
     state.plane.folded.insert(*member, *belief);
+    // A member that stopped answering may have moved: its address is resolved afresh.
+    if belief.liveness == slates_cluster::membership::Liveness::Suspect
+      && let Some(anchor) = anchor_of(state, *member)
+    {
+      forget_address(state, anchor);
+    }
   }
   changed
 }
@@ -561,8 +589,9 @@ async fn fold_membership(origin: u16, shards: &[u16]) {
   }
 }
 
-/// Resolves every peer's plane address the plane has not resolved yet (discovery first, then the manifest's address,
-/// through the resolver for a name).
+/// Resolves every peer's plane address the plane has not resolved yet or holds stale (discovery first, then the
+/// manifest's address, through the resolver for a name). A refused re-resolution keeps the stale address, retried
+/// next turn.
 async fn resolve_peers(resolver: Option<Kept<Resolver>>) {
   let unresolved: Vec<(HostId, NodeAddress, CertificateDer<'static>)> =
     state::with_state(|state| {
@@ -570,7 +599,7 @@ async fn resolve_peers(resolver: Option<Kept<Resolver>>) {
         .plane
         .peers
         .iter()
-        .filter(|(_, peer)| peer.resolved.is_none())
+        .filter(|(_, peer)| peer.resolved.is_none() || peer.stale)
         .map(|(anchor, peer)| (*anchor, peer.address.clone(), peer.certificate.clone()))
         .collect()
     })
@@ -580,11 +609,40 @@ async fn resolve_peers(resolver: Option<Kept<Resolver>>) {
       crate::fleet::resolve_peer_address(&address, Plane::Probe, &certificate, resolver).await;
     let _ = state::with_state(
       |state| match (resolved, state.plane.peers.get_mut(&anchor)) {
-        (Some(resolved), Some(peer)) => peer.resolved = Some(resolved),
+        (Some(resolved), Some(peer)) => {
+          peer.resolved = Some(resolved);
+          peer.stale = false;
+        }
         _ => crate::fleet::count_refusal_in(state, ADDRESS_UNRESOLVED),
       },
     );
   }
+}
+
+/// Joins to the detector every keyed member whose address is resolved, once (`MemberPlane::join`): a member is judged
+/// only once a probe of it can be sent.
+fn join_addressable() {
+  let _ = state::with_state(|state| {
+    let ready: Vec<HostId> = state
+      .plane
+      .keyed
+      .iter()
+      .filter(|(_, joined)| !**joined)
+      .map(|(member, _)| *member)
+      .filter(|member| {
+        anchor_of(state, *member)
+          .and_then(|anchor| state.plane.peers.get(&anchor))
+          .is_some_and(|peer| peer.resolved.is_some())
+      })
+      .collect();
+    let Some(plane) = state.plane.plane.as_mut() else {
+      return;
+    };
+    for member in ready {
+      plane.join(member);
+      state.plane.keyed.insert(member, true);
+    }
+  });
 }
 
 /// Steps the detector at `now_ns` (`received`: a datagram to feed first, stamped `now_ns`), and returns what the plane
@@ -654,6 +712,7 @@ pub(crate) async fn run(
   loop {
     announce_epochs().await;
     resolve_peers(resolver).await;
+    join_addressable();
     let now = slates_machine::clock::monotonic_ns();
     send(&socket, &drive(now, None));
     fold_membership(origin, &shards).await;

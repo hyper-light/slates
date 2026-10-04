@@ -100,6 +100,7 @@ impl Network {
         plane
           .install_epoch(HostId(peer), 1, &secret_between(me, peer), role)
           .unwrap();
+        plane.join(HostId(peer));
       }
       members.insert(me, plane);
     }

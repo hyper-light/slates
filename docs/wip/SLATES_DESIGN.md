@@ -3162,6 +3162,18 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > - Once a peer's real member id is learned, its manifest seed placeholder is folded dead on every shard, once (the
 >   per-peer task's `follow_current_id` did this). Without it, the 3-process CLI deployment's survivor held two seed
 >   ids alive after the owner's death.
+> - Found on the KIND lane (2026-10-04, run locally):
+>   - A peer's plane address is resolved afresh when a new epoch keys it and when its member is suspected. A replaced
+>     pod keeps its DNS name and certificate, not its IP; the survivors had answered the replacement at its old IP,
+>     and it never rejoined. With the fix it rejoined 2.6 s after deletion, its IP moving from 10.244.2.2 to
+>     10.244.5.2. The last address is kept until the fresh one resolves. A first cut cleared it, which dropped the
+>     datagrams sealed in between. A lost first probe then wedged hyper-swim's detectors: each waits, with no wake, for
+>     a message only another detector's probe would send. 7 of 10 three-node formations hung (5 datagrams sent, then
+>     silence); with the address kept, 0 of 10. hyper-raft fixed the wedge (c875028: the first probe waits RFC 6298's
+>     initial RTO and backs off); the re-vendor is owed.
+>   - A keyed member is joined to the detector only once its address resolves. A probe that cannot be sent is never
+>     a miss: at a fresh install, two pods that could not yet resolve the third's name condemned it, as the old probe
+>     task, which never counted an undialed peer, would not have.
 >
 > Changed semantics, each recorded with its test:
 > - A two-member view suspects its silent peer but never condemns it: Lifeguard's local health wants an answer from a

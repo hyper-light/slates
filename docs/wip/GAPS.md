@@ -3327,6 +3327,15 @@ hyper-raft main, green on six targets:
 
 The same revision states hyper-swim's rule that a two-member view never condemns, which slates' fleet suite now asserts.
 
+Also owed in the same re-vendor: hyper-raft `c875028` (branch `swim-first-probe`), the fix for the second defect slates
+found. A detector whose first measurement probe, or its answer, was lost waited with no wake for a message only another
+detector's probe would send, so a fleet whose first probes were all lost never probed again. slates hit it at a re-key
+that dropped datagrams (7 of 10 three-node formations hung); slates now keeps a peer's last address until the fresh
+one resolves, so it drops none, but real UDP loss would still wedge the vendored `687244f`. hyper-raft also added
+`Detector::join_measured(peer, round_trip)` (`b6e5353`): until a member measures its own round trip to that peer, its
+probes wait on the handshake's round trip instead of RFC 6298's fixed 1 s. Owed with the re-vendor: `join_addressable`
+joins with the keying record session's measured handshake round trip.
+
 ### 2026-10-04: an intermittent async-SDK overflow assertion (open, not yet reproduced)
 
 CI run 37183276944 (`ec4a56c`, ubuntu SDK packaging): `test_every_async_call_ends_across_restart_silence_cancellation_and_death`

@@ -1425,6 +1425,72 @@ fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_address
   );
 }
 
+/// A-67 H-2b, §4.8 rejoin. Do: form a two-node fleet; stop B; start B again as the same machine (its anchor and
+/// certificate) on a fresh segment at **new** addresses, which it announces through discovery. Expect: the mesh
+/// re-forms, A's plane reaching B's new probe port. (KIND's whole-pod restart keeps a peer's DNS name and changes its
+/// IP, which this in-process harness, addressed by IP, cannot model: there the plane re-resolves a peer's name when a
+/// new epoch keys it and when it is suspected, proven on the KIND lane.)
+#[test]
+fn a_peer_that_returns_at_new_addresses_is_reached_there() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let (_moved_ports, [moved_probe, moved_record]) = {
+    let (lease, ports) = free_ports(2);
+    (lease, <[u16; 2]>::try_from(ports).unwrap())
+  };
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let mut b_identities = same_identity(2).into_iter();
+  let (Some(b_first), Some(b_moved)) = (b_identities.next(), b_identities.next()) else {
+    panic!("B's identity twice");
+  };
+  let b_moved = Node {
+    identity: b_moved,
+    host: b.host,
+    origin_anchor: b.origin_anchor,
+    address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, moved_probe),
+    record_address: SocketAddrV4::new(Ipv4Addr::LOCALHOST, moved_record),
+    profile: b.profile.clone(),
+  };
+  let b = Node {
+    identity: b_first,
+    ..b
+  };
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b.clone());
+  let formed = form_and_settle(&[&daemon_a, &daemon_b]);
+  daemon_b.stop();
+  let daemon_moved = start(b_moved, peer_of_b);
+  let reformed = poll_until(&[&daemon_a, &daemon_moved], FORMATION_DEADLINE, || {
+    all_hold([daemon_a.fleet_meshed(), daemon_moved.fleet_meshed()])
+  });
+  let counts = (
+    daemon_a.fleet_plane_counts(),
+    daemon_moved.fleet_plane_counts(),
+  );
+  daemon_a.stop();
+  daemon_moved.stop();
+  assert!(formed, "the first fleet formed");
+  assert!(
+    reformed,
+    "the mesh re-formed to B at its new addresses: plane counts {counts:?}"
+  );
+}
+
 /// Shape: the index of the record plane in `Daemon::fleet_demux_counters`: its only demultiplexer, since the probe port
 /// carries the sealed membership plane (A-67 H-2), not QUIC sessions.
 const RECORD_PLANE: usize = 0;
