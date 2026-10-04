@@ -247,6 +247,7 @@ fn observe(
 ) -> Result<(), Failure> {
   let mut starting_since = Some(started);
   let mut longest_start_ns = 0u64;
+  let mut watch = Watch::default();
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -260,7 +261,11 @@ fn observe(
             .segment()
             .supervision()
             .map_err(|e| failed("supervision", e))?;
-          (sup.heartbeat_ns(), sup.alive(now, LIVENESS_BUDGET_NS).0)
+          let (dead, next) = lapsed(watch, sup.heartbeat_ns(), now, LIVENESS_BUDGET_NS);
+          watch = next;
+          // Running and beaten at least once, as the segment judges it; the age is the watch's, which does not count
+          // a span the anchor itself did not observe.
+          (sup.heartbeat_ns(), sup.alive(now, u64::MAX).0 && !dead)
         };
         match starting_since {
           Some(since) if heartbeat_ns >= since => {
@@ -301,5 +306,96 @@ fn observe(
       }
       slates_anchor::Step::Stopped => return Ok(()),
     }
+  }
+}
+
+/// What the observation loop knows between turns to judge a heartbeat fairly: when it last observed, and since when
+/// it may hold the daemon to the budget.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Watch {
+  /// The anchor's clock at its previous observation.
+  last_observed_ns: u64,
+  /// The moment the anchor resumed after a gap of its own longer than the budget: the daemon's heartbeat is aged
+  /// from no earlier than this.
+  resumed_ns: u64,
+}
+
+/// Whether the daemon's heartbeat, last beaten at `beat_ns`, has lapsed by the anchor's clock `now_ns`, and the watch
+/// for the next turn (§4.14 `daemon.alive`). A watchdog may not blame its subject for time it did not watch: when the
+/// anchor itself went more than `budget_ns` without observing — the host slept (both clocks include a suspend), the
+/// whole machine was paused, or the anchor was starved — the daemon went unobserved for that span too, and its stale
+/// heartbeat says nothing about it. The heartbeat is then aged from the anchor's resumption, so a daemon is killed
+/// only after a whole budget the anchor watched without a beat. Before 2026-10-04 the age ran from the beat alone,
+/// so a laptop waking from sleep killed a healthy daemon whenever the anchor ran before the daemon's next beat.
+fn lapsed(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> (bool, Watch) {
+  let resumed_ns =
+    if watch.last_observed_ns > 0 && now_ns.saturating_sub(watch.last_observed_ns) > budget_ns {
+      now_ns
+    } else {
+      watch.resumed_ns
+    };
+  let age = now_ns.saturating_sub(beat_ns.max(resumed_ns));
+  (
+    age > budget_ns,
+    Watch {
+      last_observed_ns: now_ns,
+      resumed_ns,
+    },
+  )
+}
+
+#[cfg(test)]
+mod lapse_tests {
+  use super::*;
+
+  /// Shape: the budget the tests judge by (the anchor's, a second).
+  const BUDGET: u64 = 1_000_000_000;
+  /// Shape: the observation cadence (a tenth of the budget).
+  const TURN: u64 = BUDGET / 10;
+
+  /// §4.14: do observe a daemon that beats every turn, then one that stops beating while the anchor keeps watching;
+  /// expect no lapse while it beats, and a lapse once a whole watched budget passes without a beat.
+  #[test]
+  fn a_daemon_that_stops_beating_under_a_watching_anchor_lapses() {
+    let mut watch = Watch::default();
+    let mut now = BUDGET;
+    for _ in 0..20 {
+      let (dead, next) = lapsed(watch, now, now, BUDGET);
+      assert!(!dead, "a beating daemon never lapses");
+      watch = next;
+      now += TURN;
+    }
+    let last_beat = now - TURN;
+    let mut killed_at = None;
+    for _ in 0..20 {
+      let (dead, next) = lapsed(watch, last_beat, now, BUDGET);
+      watch = next;
+      if dead {
+        killed_at = Some(now);
+        break;
+      }
+      now += TURN;
+    }
+    let killed_at = killed_at.expect("the silent daemon lapsed");
+    assert!(killed_at - last_beat > BUDGET && killed_at - last_beat <= BUDGET + TURN);
+  }
+
+  /// §4.14 (2026-10-04): do suspend the whole host for an hour between two observations — the daemon's last beat
+  /// just before it — and observe on wake before the daemon beats again; expect no lapse, and a lapse only if the
+  /// daemon then stays silent for a whole budget of the anchor's watching.
+  #[test]
+  fn a_host_that_slept_does_not_kill_the_daemon_it_could_not_watch() {
+    let (_, watch) = lapsed(Watch::default(), BUDGET, BUDGET, BUDGET);
+    let slept = 3_600 * BUDGET;
+    let wake = BUDGET + slept;
+    let (dead, watch) = lapsed(watch, BUDGET, wake, BUDGET);
+    assert!(
+      !dead,
+      "the anchor did not watch the sleep, so the stale beat is not the daemon's lapse"
+    );
+    let (dead, watch) = lapsed(watch, BUDGET, wake + BUDGET / 2, BUDGET);
+    assert!(!dead, "half a watched budget after the wake");
+    let (dead, _) = lapsed(watch, BUDGET, wake + BUDGET + TURN, BUDGET);
+    assert!(dead, "a whole watched budget after the wake without a beat");
   }
 }
