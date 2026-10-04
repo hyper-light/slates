@@ -100,6 +100,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
   digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Shape: curl's retries of a fetch that fails transiently, passed with `--retry-all-errors` so a connection reset
+/// counts (plain `--retry` takes only timeouts and some HTTP statuses; CI run 37162029555 lost the fsstress lane to
+/// one `curl: (35) Recv failure: Connection reset by peer`). curl waits a second before the first retry and doubles
+/// each wait, so five retries wait at most 31 s, and the digest check after the fetch still refuses any wrong bytes.
+/// The guest image's build script uses the same count (`ci/guest/build-exercisers.sh`, asserted below).
+pub(crate) const FETCH_RETRIES: u32 = 5;
+
 /// Fetches a pin into `dir` (or reuses a file already there with the right digest) and verifies it.
 pub(crate) fn fetch(pin: &Pin, dir: &Path) -> Result<PathBuf, Failure> {
   create_dir(dir)?;
@@ -113,7 +120,9 @@ pub(crate) fn fetch(pin: &Pin, dir: &Path) -> Result<PathBuf, Failure> {
     return Err(Failure(format!("curl is needed to fetch {}", pin.upstream)));
   }
   let output = Command::new("curl")
-    .args(["-fsSL", "-o"])
+    .args(["-fsSL", "--retry"])
+    .arg(FETCH_RETRIES.to_string())
+    .args(["--retry-all-errors", "-o"])
     .arg(&path)
     .arg(pin.url)
     .output()?;
@@ -356,6 +365,10 @@ mod guest_tests {
       std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ci/guest/build-exercisers.sh"),
     )
     .unwrap_or_default();
+    assert!(
+      script.contains(&format!("--retry {FETCH_RETRIES} --retry-all-errors")),
+      "the guest image fetches with the harness's retries"
+    );
     for pin in [
       &FSX_C,
       &FSSTRESS_C,

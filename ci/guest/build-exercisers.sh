@@ -9,7 +9,7 @@ work=/guest/exercisers-build
 mkdir -p "$work"
 cd "$work"
 fetch() {
-  curl -fsSL "$2" -o "$1"
+  curl -fsSL --retry 5 --retry-all-errors "$2" -o "$1"
   echo "$3  $1" | sha256sum -c -
 }
 fetch fsx.c https://raw.githubusercontent.com/freebsd/freebsd-src/42c69445ca336b13e27e3e5960ace344c64ae0eb/tools/regression/fsx/fsx.c b064208bec8519e80038ee1da8cb9c0f7c512a3242bbf4c06809a88ce15ae019
