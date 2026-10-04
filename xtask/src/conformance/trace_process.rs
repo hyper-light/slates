@@ -22,7 +22,9 @@ pub(super) enum StopSignal {
 /// in about 20 ms. One stop never came: the tracer was still running when the borrowed 20 s mount wait ran out
 /// (b867332), over a hundred times the slowest measured exit, so the waiting length was not the defect.
 /// Derived: ten times the slowest measured stop, so a slow but live exit still passes and a tracer that will not
-/// exit is failed — with its process group's state for the record — in under two seconds.
+/// exit is failed — with its process group's state for the record — in under two seconds. The bound times the
+/// tracer, not its wrapper: CI run 37167951032's `sudo` stayed asleep past it with `eslogger` already exited (the
+/// group state that run recorded), and such a stop is accepted ([`TraceProcess::tracer_exited_under_wrapper`]).
 const STOP_BOUND: Duration = Duration::from_millis(1750);
 
 /// One child and its process group, with the caller's existing harness wait budget.
@@ -99,23 +101,45 @@ impl TraceProcess {
   /// The tracer's process group as `ps` sees it — each process's state and wait channel — for the record of a
   /// stop that never came, so its next occurrence names where the tracer was.
   fn group_state(&self) -> String {
+    match self.group_rows() {
+      Ok(rows) => format!("PGID PID PPID STAT WCHAN COMMAND\n{}", rows.join("\n")),
+      Err(error) => format!("(ps failed: {error})"),
+    }
+  }
+
+  /// The `ps` rows of the tracer's process group (`pgid pid ppid stat wchan command`).
+  fn group_rows(&self) -> Result<Vec<String>, std::io::Error> {
     // Every process with its group, filtered here: `ps -g` selects a process group on macOS but a session or
     // group name on Linux, so the portable form is the whole table and a filter.
     let group = self.child.id().to_string();
-    match std::process::Command::new("ps")
+    let output = std::process::Command::new("ps")
       .args(["-A", "-o", "pgid=,pid=,ppid=,stat=,wchan=,command="])
-      .output()
-    {
-      Ok(output) => {
-        let rows: Vec<String> = String::from_utf8_lossy(&output.stdout)
-          .lines()
-          .filter(|row| row.split_whitespace().next() == Some(group.as_str()))
-          .map(str::to_owned)
-          .collect();
-        format!("PGID PID PPID STAT WCHAN COMMAND\n{}", rows.join("\n"))
-      }
-      Err(error) => format!("(ps failed: {error})"),
-    }
+      .output()?;
+    Ok(
+      String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|row| row.split_whitespace().next() == Some(group.as_str()))
+        .map(str::to_owned)
+        .collect(),
+    )
+  }
+
+  /// Whether the tracer itself has exited under a wrapper that outlived it: the group's leader (`sudo`) is still
+  /// there, it holds at least one exited child (`<defunct>`, its status not yet reaped), and nothing else in the
+  /// group is alive. Its output is then whole — the tracer wrote everything it would — and the harness's drain
+  /// marker and continuous event sequence prove that independently of any exit status.
+  fn tracer_exited_under_wrapper(&self) -> bool {
+    let leader = self.child.id().to_string();
+    let Ok(rows) = self.group_rows() else {
+      return false;
+    };
+    let others: Vec<Vec<&str>> = rows
+      .iter()
+      .map(|row| row.split_whitespace().collect::<Vec<_>>())
+      .filter(|fields| fields.get(1) != Some(&leader.as_str()))
+      .collect();
+    let exited = |fields: &Vec<&str>| fields.get(3).is_some_and(|stat| stat.starts_with('Z'));
+    !others.is_empty() && others.iter().all(exited)
   }
 
   /// Stops the tracer with its graceful signal and requires an exit status `accept` allows (a tracer
@@ -129,6 +153,15 @@ impl TraceProcess {
     let signalled = Instant::now();
     let status = match self.wait_exit(STOP_BOUND) {
       Ok(status) => status,
+      Err(_) if self.tracer_exited_under_wrapper() => {
+        // CI run 37167951032: `sudo` stayed asleep past the bound with `eslogger` already exited. The trace is
+        // whole; the wrapper is ended and reaped by the drop, and this is recorded so its recurrence is seen.
+        eprintln!(
+          "tracer exited, its wrapper outlived it past the stop bound {STOP_BOUND:?}:\n{}",
+          self.group_state()
+        );
+        return Ok(());
+      }
       Err(error) => {
         let state = self.group_state();
         // The tracer is ended and reaped here (the drop's cancel), never left behind; the run fails either way.
@@ -360,6 +393,30 @@ mod tests {
       "the process group's state: {}",
       refused.0
     );
+    drop(tracer);
+    assert_eq!(
+      rustix::process::test_kill_process(pid),
+      Err(rustix::io::Errno::SRCH)
+    );
+  }
+
+  /// AC-4.5 (a wrapper that outlives its tracer: CI run 37167951032's `sudo` stayed asleep past the stop bound while
+  /// `eslogger`, its child, had exited). Do: stop a wrapper that ignores its stop signal and never reaps its tracer
+  /// child, which exits on its own. Expect: the stop is accepted — the tracer itself exited, so its output is whole —
+  /// and the lingering wrapper is still ended and reaped by the drop.
+  #[test]
+  fn a_wrapper_that_outlives_its_exited_tracer_does_not_fail_the_stop() {
+    let (mut tracer, _stdin, mut stdout) =
+      child(r#"trap '' INT; sleep 0.2 & printf 'ready\n'; exec sleep 1000"#);
+    let pid = rustix::process::Pid::from_raw(i32::try_from(tracer.child.id()).expect("pid"))
+      .expect("positive pid");
+    let mut output = String::new();
+    tracer
+      .wait_ready(|| observed(&mut stdout, &mut output))
+      .expect("ready");
+    tracer
+      .stop_accepting(|status| status.success())
+      .expect("the tracer exited; only its wrapper lingered");
     drop(tracer);
     assert_eq!(
       rustix::process::test_kill_process(pid),
