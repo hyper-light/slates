@@ -313,6 +313,20 @@ pub struct DaemonConfig {
 /// operator gives `slates anchor` a value.
 pub const FAILOVER_SLO_NS: u64 = 10_000_000_000;
 
+/// Where each part of a shard's slice of the content object lies, relative to the slice's start, as
+/// `(start, end)` or `(start, len)` ranges ([`DaemonConfig::shard_content_layout`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShardContentLayout {
+  /// The slice's length, a mapping-granule multiple.
+  pub stride: usize,
+  /// The FUSE write log, `(start, end)` (A-63).
+  pub write_log: (usize, usize),
+  /// The two image slots, `(start, end)` (§4.8).
+  pub images: (usize, usize),
+  /// The arena range, `(start, len)`, its start on the mapping granule (A-64).
+  pub arena: (usize, usize),
+}
+
 impl DaemonConfig {
   /// Derived: each shard's FUSE write log in the anchor's content object (A-63): a quarter of the shard's reserve.
   /// A log that fills forces a publication, which empties it, so its size trades publications against resident log
@@ -324,16 +338,46 @@ impl DaemonConfig {
     usize::try_from(self.reserve_per_shard).unwrap_or(usize::MAX) / RESERVE_SHARE
   }
 
-  /// Derived: the anchor content object's whole size: per shard, two reserve-sized image slots (the committed
-  /// recovery image and the one being written, §4.8) and the write log, times the partitions. One definition, the
-  /// anchor's and a standalone daemon's (they disagreed: the anchor sized one slot per shard until 2026-10-03).
-  pub fn content_bytes(&self) -> usize {
+  /// Derived: where each part of one shard's slice of the anchor's content object lies, relative to the slice's
+  /// start. In order: the FUSE write log (A-63); the two reserve-sized image slots, the committed recovery image
+  /// and the one being written (§4.8); and the shard's arena range, its chunk arena's one region (A-64), the
+  /// reserve's length, starting on the mapping granule so it can be mapped on its own. The slice's length is a
+  /// granule multiple too, so every shard's arena starts on one. The slots are sized as before the arena moved
+  /// in: an image now carries metadata, not content, and only the pages it reaches are backed.
+  pub fn shard_content_layout(&self) -> ShardContentLayout {
     /// Format: the double buffer's slots: the committed image and the one being written.
     const PUBLISH_SLOTS: usize = 2;
-    usize::try_from(self.reserve_per_shard)
+    let granule = slates_mem::mapping_granule()
+      .unwrap_or(self.page)
+      .max(self.page)
+      .max(1);
+    let reserve = usize::try_from(self.reserve_per_shard)
       .unwrap_or(usize::MAX)
-      .saturating_mul(PUBLISH_SLOTS)
-      .saturating_add(self.write_log_bytes())
+      .max(self.page);
+    let log = self.write_log_bytes();
+    let images_end = reserve.saturating_mul(PUBLISH_SLOTS).saturating_add(log);
+    let arena_start = images_end
+      .checked_next_multiple_of(granule)
+      .unwrap_or(usize::MAX);
+    let stride = arena_start
+      .saturating_add(reserve)
+      .checked_next_multiple_of(granule)
+      .unwrap_or(usize::MAX);
+    ShardContentLayout {
+      stride,
+      write_log: (0, log),
+      images: (log, images_end),
+      arena: (arena_start, reserve),
+    }
+  }
+
+  /// Derived: the anchor content object's whole size: every shard's slice ([`DaemonConfig::shard_content_layout`])
+  /// times the partitions. One definition, the anchor's and a standalone daemon's (they disagreed: the anchor
+  /// sized one slot per shard until 2026-10-03).
+  pub fn content_bytes(&self) -> usize {
+    self
+      .shard_content_layout()
+      .stride
       .saturating_mul(usize::from(self.geometry.partitions.max(1)))
   }
 

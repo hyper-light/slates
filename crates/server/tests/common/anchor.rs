@@ -8,20 +8,15 @@ use slates_anchor::AnchorSegment;
 use slates_machine::MachineProfile;
 use slates_server::{DaemonConfig, SegmentSource};
 
-/// Shape: the content object's slots per shard — the recovery image is a double buffer (the committed
-/// image and the one being published), so a torn publish preserves the committed one (§4.8).
-const PUBLISH_SLOTS: usize = 2;
-
-/// The anchor's segment and content object for a test: the content object is [`PUBLISH_SLOTS`]
-/// reserve-sized slots per shard times the partitions (lazily backed, so the unused tail costs no RAM).
+/// The anchor's segment and content object for a test, the content object sized as the anchor sizes it
+/// (`DaemonConfig::content_bytes`: per shard, the write log, the two image slots and the arena range; lazily
+/// backed, so the unused tail costs no RAM).
 pub(crate) fn anchor_segment(
   name: &str,
   profile: &MachineProfile,
   config: &DaemonConfig,
 ) -> AnchorSegment {
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * PUBLISH_SLOTS
-    * usize::from(config.geometry.partitions.max(1));
+  let content_bytes = config.content_bytes();
   AnchorSegment::create(
     &format!("slates-seg-{name}"),
     &profile.facts.identity,

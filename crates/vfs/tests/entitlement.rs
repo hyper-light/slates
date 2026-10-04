@@ -136,12 +136,14 @@ fn recovery_re_establishes_an_admitted_claim_ahead_of_new_ones() {
   write_windows(&mut vol, &mut source, f, 0, 1, b'2');
   let image = vol.to_image(&source, None).unwrap();
 
-  let mut fresh = store();
+  let mut fresh = common::surviving(&source);
   let b_claim = fresh.budget.reserve(quarter).unwrap();
   let a_claim = fresh.budget.reserve(quarter).unwrap();
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,

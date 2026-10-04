@@ -47,7 +47,7 @@ pub use mpsc::MpscRing;
 pub use region::Region;
 pub use ring::SpscRing;
 pub use segmented::Segmented;
-pub use shared::{ExclusiveObject, Handoff, SharedObject, SparseObject};
+pub use shared::{ExclusiveObject, Handoff, SharedObject, SparseObject, mapping_granule};
 pub use slab::Slab;
 pub use words::{Layout, RunId, SpanId, SpanRun, Width, WordRun, Words};
 

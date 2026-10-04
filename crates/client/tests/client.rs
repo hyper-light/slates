@@ -294,13 +294,9 @@ fn a_session_outlives_a_daemon_restart_and_its_retry_meets_the_completion_record
   // Shape: a small supported ring, so periodic acknowledgement runs during the scenario.
   config.region.slots = 4;
   // The test plays the anchor: it holds the segment and its content object across both daemons, so
-  // anchor-owned volume storage survives the restart (§4.8). The content object is two reserve-sized
-  // slots per shard (the recovery image is a double buffer — the committed image and the one being
-  // published — so a torn publish preserves the committed one) times the partitions; it is lazily
-  // backed, so its unused tail costs no RAM.
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * 2
-    * usize::from(config.geometry.partitions.max(1));
+  // anchor-owned volume storage survives the restart (§4.8). The content object is sized as the anchor sizes it
+  // (`DaemonConfig::content_bytes`); it is lazily backed, so its unused tail costs no RAM.
+  let content_bytes = config.content_bytes();
   let segment = AnchorSegment::create(
     &format!("slates-seg-cl-resume-{}", std::process::id()),
     &profile.facts.identity,
@@ -414,9 +410,7 @@ fn a_client_at_its_last_sequence_refuses_fresh_requests_and_keeps_its_retries() 
   let profile = profile();
   let instance = format!("cl-seq-end-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * 2
-    * usize::from(config.geometry.partitions.max(1));
+  let content_bytes = config.content_bytes();
   let segment = AnchorSegment::create(
     &format!("slates-seg-cl-seq-end-{}", std::process::id()),
     &profile.facts.identity,
@@ -495,7 +489,7 @@ fn exhausted_client_id_space_refuses_fresh_callers_but_preserves_a_resuming_sess
   let instance = format!("cl-id-end-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(1));
   // The anchor keeps both content publication slots as well as metadata across the restart.
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap() * 2;
+  let content_bytes = config.content_bytes();
   let mut segment = AnchorSegment::create(
     &format!("slates-seg-cl-id-end-{}", std::process::id()),
     &profile.facts.identity,
@@ -599,9 +593,7 @@ fn a_green_chain_survives_a_daemon_restart() {
   let profile = profile();
   let instance = format!("cl-green-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * 2
-    * usize::from(config.geometry.partitions.max(1));
+  let content_bytes = config.content_bytes();
   let segment = AnchorSegment::create(
     &format!("slates-seg-cl-green-{}", std::process::id()),
     &profile.facts.identity,
@@ -755,9 +747,7 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
   let profile = profile();
   let instance = format!("cl-origin-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * 2
-    * usize::from(config.geometry.partitions.max(1));
+  let content_bytes = config.content_bytes();
   let segment = AnchorSegment::create(
     &format!("slates-seg-cl-origin-{}", std::process::id()),
     &profile.facts.identity,

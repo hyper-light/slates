@@ -99,9 +99,13 @@ fn serve(
   control: Option<(ChangeSignal, Receiver<SyncSender<VolumeImage>>)>,
 ) {
   let mut store = common::store();
+  // The images hold FIFOs and sockets only (their data passes through the kernel, never the volume), so they name
+  // no arena block and a fresh store recovers them whole (A-64).
+  let claims = slates_vfs::recover::Claims::prepare(&mut store, [&image]).unwrap();
   let mut volume = Volume::from_image(
     &mut store,
     &image,
+    &claims,
     Box::new(HostClock::default()),
     1 << 16,
     None,

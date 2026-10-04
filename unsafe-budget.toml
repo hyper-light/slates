@@ -159,7 +159,11 @@ slates-machine = 50
 #   through `AtomicU8` for seqlock payloads (`racy_out`, `racy_in`), and `ExclusiveObject::new`, the one
 #   constructor that carries the single-accessor promise a region's arena needs; the Windows sparse
 #   object's two committed-range views are gone (-2): no reference into a mapping is formed any more.
-slates-mem = 22
+#   Raised 22 → 23 on 2026-10-03 for A-64 (content resident once in anchor RAM): `ExclusiveObject::open_range`,
+#   the constructor that carries the same single-accessor promise for one shard's arena range of the content
+#   object. Its maps reuse the existing `mmap` and `MapViewOfFile` sites (now taking an offset) and the sparse
+#   section's commit, so no new block.
+slates-mem = 23
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous
@@ -199,7 +203,10 @@ slates-db = 0
 slates-ipc = 46
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
-slates-server = 5
+#   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of
+#   the anchor's content object through `ExclusiveObject::open_range`, whose promise (no other mapping reaches the
+#   range) the layout keeps: the daemon's copies reach only the write log and image slots.
+slates-server = 6
 slates-client = 0
 slates-cli = 5
 slates-wire = 4

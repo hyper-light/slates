@@ -147,6 +147,7 @@ impl BridgeAccess for ShardBridge {
     let handles = &mut self.handles;
     state::with_state(|s| {
       let handle = *s.by_id.get(&volume)?;
+      crate::verbs::relieve_deferred(s);
       let ShardState {
         store,
         volumes,

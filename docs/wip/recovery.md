@@ -31,9 +31,8 @@
 > and created files survive a restart over the directory beneath
 > (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`, 2026-10-03). A refused publish
 > no longer lets a control verb's record commit: the verb is refused typed and rolled back (AUD-05,
-> `an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees`). **Still owed:** the
-> in-place refinement (content resident once, the image carrying references), which would make the slot's
-> fit structural rather than sized.
+> `an_unpublished_verb_is_refused_typed_a_retry_re_executes_and_a_restart_agrees`). The in-place refinement landed
+> with A-64 (2026-10-03): content resident once, the image carrying references.
 
 ## 1. The requirement (settled, not a choice)
 
@@ -79,9 +78,14 @@ The store is a graph of generational handles: `Store` holds slabs of `DirNode`, 
   they encode — inode numbers, entries, bytes and roots — and rebuilds the handles faithfully, which
   is exactly what the database does with its slab-and-index records.
 
-Content bytes travel *in* the image (copied), not by aliasing arena extents, for this first correct
-version; an in-place refinement (content bytes resident in the content object, the image carrying
-only metadata) is a later §4.2 efficiency step, recorded as its own gate.
+Content bytes travelled *in* the image (copied) in the first correct version. Since A-64 (2026-10-03) they are
+resident in the content object itself, in each shard's arena range, and the image names them by block. The
+position-independent-memory option rejected above stays rejected: only the chunk bytes moved, which are plain
+bytes addressed by extent; the store's typed records are still captured into the image and rebuilt. Two rules
+make references safe:
+- Sealed chunks are immutable (D-6).
+- A block the committed image names is not reused before a newer image commits (deferred frees in the buddy
+  allocator).
 
 The image is encoded with the workspace `Wire` codec (`crates/wire`), not the ad-hoc encoding of
 `crates/vfs/src/derive.rs`, because a recovery image is read back from the content object after a
@@ -228,12 +232,18 @@ volume.
   not yet hold, and each complete publication empties it. The content object is now sized once
   (`DaemonConfig::content_bytes`: two reserve slots and the log per shard), for the anchor and a standalone daemon
   alike.
-- **§4.2 admission accounting and content-object sizing.** The object is sized at a derived
-  `partitions × PUBLISH_SLOTS × reserve_per_shard` — the doubling is intentional, the price of atomic
-  double-buffered publication (the committed image plus the one being written). The fuller §4.2
-  admission invariant (physically-backed entitlement, the resource vector, typed refusals) and a
-  refinement that avoids copying content into the image at all (content resident once via
-  `Region::shared`, the image carrying references) are owed (BUG-1/2/3 and the in-place refinement).
+- **§4.2 content-object sizing and the in-place refinement.** *(Landed 2026-10-03, A-64.)* Each shard's slice
+  holds:
+  - the write log;
+  - two reserve-sized image slots, sparse, so only the pages the metadata image reaches are backed;
+  - the shard's arena range: its chunk arena's one region, mapped on its own (`ExclusiveObject::open_range`).
+
+  `DaemonConfig::shard_content_layout` and `content_bytes` define it once, for the anchor, a standalone daemon and
+  every test fixture. Content is resident once; the image carries references; a barrier costs metadata. Measured
+  75.4 ms → 0.11–0.16 ms at 256 MiB.
+
+  The fuller §4.2 admission invariant (physically-backed entitlement, the resource vector, typed refusals) is
+  tracked under BUG-1/2/3 below.
 - **Crash-during-publish (double buffering).** *(Landed, `crates/vfs/src/recover.rs`.)* Publication
   is a two-slot, generation-tagged double buffer: a publish writes the non-committed slot and commits
   by making its CRC valid, so a crash mid-publish leaves the last complete image in the other slot.
@@ -306,12 +316,13 @@ volume.
   inodes, so no leak). Non-vacuous: disabling the content match makes a full copy and fails the counts;
   disabling the newest-first `claimed` filter puts the shared inode on two deadlists and the first
   drop frees it early, failing with a `StaleHandle` use-after-free.
-- **Clone recovery.** *(Content landed.)* A clone's image captures its whole tree (the bytes it
-  inherited from the origin snapshot and the bytes it wrote after diverging), and `from_image`
-  rebuilds it faithfully, keeping the inherited root inode number (fixed in
-  docs/bugs/2026-09-06-clone-recovery-root-number.md) and restoring the origin epoch. Owed: the O(1)
-  *sharing* between a recovered clone and its origin (a §4.2 efficiency refinement, not content), and
-  a process-level clone-across-restart test through the daemon.
+- **Clone recovery.** *(Content landed; chunk sharing landed with A-64.)* A clone's image captures its whole
+  tree, and `from_image` rebuilds it faithfully, keeping the inherited root inode number (fixed in
+  docs/bugs/2026-09-06-clone-recovery-root-number.md) and restoring the origin epoch. Since A-64 the clone and its
+  origin name the same blocks and recover sharing them, claimed once
+  (`a_clone_and_its_origin_recover_sharing_their_chunks`: the recovered store holds exactly what the live one did).
+  Owed: the clone's inode records are still rebuilt apart from the origin snapshot's (the live clone shares them),
+  and a process-level clone-across-restart test through the daemon.
 - **Referenced-but-unlinked orphans.** *(Content and tracking landed.)* The inode walk covers the
   whole table, so an orphan's content is captured with every other inode's, and its orphan tracking
   travels in the image's `orphans` list, so a recovered orphan is reclaimed when its handle finally
@@ -331,9 +342,8 @@ volume.
   a lock; a dynamic volume's `BudgetGrowth` source check-and-acquires from that one budget on each
   increment, accounted through teardown and recovery, gated through the real write path in
   `crates/bridge-core/tests/admission.rs` (no mount). Still owed: the inode dimension's *version-credit
-  reservation* (a measured transient-version headroom, docs/wip/resource-vector.md §4), and the
-  non-doubling in-place size (`Region::shared` backing the arena rather than copying content into the
-  image).
+  reservation* (a measured transient-version headroom, docs/wip/resource-vector.md §4). The non-doubling
+  in-place size landed with A-64 (2026-10-03).
 - **NFS durability gate.** `WRITE` currently returns `FILE_SYNC` (`crates/bridge-nfs`); once the
   image is published durably this becomes truthful for daemon-crash survival, but anchor RAM alone
   does not satisfy NFS's power-failure stable-storage contract (RFC 1813 §§3.3.7, 4.8) — recorded

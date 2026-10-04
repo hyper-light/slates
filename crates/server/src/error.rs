@@ -128,6 +128,10 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     },
     VfsError::DigestNotClean => Refusal::DigestNotClean,
     VfsError::DigestUnverified => Refusal::DigestUnverified,
+    // Refused whole, retryable under the same id: the arena waits on the shard's next publication (A-64).
+    VfsError::PublishNeeded => Refusal::Unpublished {
+      reason: "the arena's freed blocks wait on the shard's next recovery publication".to_owned(),
+    },
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
       feature: format!("archiving a tree deeper than {limit} path components"),
     },

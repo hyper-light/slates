@@ -269,11 +269,13 @@ fn a_recovery_image_rebuilds_every_attribute() {
     .unwrap();
   let bytes = vol.to_image(&store, None).unwrap().to_content();
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&store);
   let image = VolumeImage::from_content(&bytes).unwrap();
+  let claims = common::claims(&mut fresh, &[&image]);
   let rebuilt = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -408,11 +410,13 @@ fn a_recovery_image_rebuilds_a_working_copy() {
     .sidecar_write(&mut store, file, 0, b"pending bytes")
     .unwrap();
   let bytes = vol.to_image(&store, None).unwrap().to_content();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&store);
   let image = VolumeImage::from_content(&bytes).unwrap();
+  let claims = common::claims(&mut fresh, &[&image]);
   let rebuilt = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,

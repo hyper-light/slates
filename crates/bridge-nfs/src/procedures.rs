@@ -2810,6 +2810,9 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NameTooLong => Nfsstat3::Nametoolong,
     VfsError::StaleHandle => Nfsstat3::Stale,
     VfsError::BaseUnavailable(_) => Nfsstat3::Io,
+    // RFC 1813 §2.6: the server could not complete the request in time; the client retries it. The arena waits on
+    // the shard's next publication, which the shard runs before its next request (A-64).
+    VfsError::PublishNeeded => Nfsstat3::Jukebox,
     _ => Nfsstat3::ServerFault,
   }
 }

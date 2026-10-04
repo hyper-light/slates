@@ -157,8 +157,20 @@ impl Volume {
       _ => {}
     }
     let fresh = self.new_attribute_inode(store, no, uid, gid)?;
-    if let Err(refusal) = self.write_unrecorded(store, fresh, 0, value) {
-      return Err(self.abandon_attribute(store, fresh, refusal));
+    // An attribute's value lands whole or not at all (T-1.1).
+    let landed = self
+      .write_room(store, 0, u64::try_from(value.len()).unwrap_or(u64::MAX))
+      .and_then(|()| self.write_unrecorded(store, fresh, 0, value));
+    match landed {
+      Ok(written) if written == value.len() => {}
+      Ok(_) => {
+        let refusal = VfsError::Memory(slates_mem::MemError::ArenaExhausted {
+          requested: value.len(),
+          largest_free: store.content.arena().free_bytes(),
+        });
+        return Err(self.abandon_attribute(store, fresh, refusal));
+      }
+      Err(refusal) => return Err(self.abandon_attribute(store, fresh, refusal)),
     }
     let (replaced, dropped) = match self.name_attribute(store, no, name, fresh, sidecar) {
       Ok(outcome) => outcome,
@@ -231,7 +243,14 @@ impl Volume {
   ) -> Result<(), VfsError> {
     self.live()?;
     let attribute = self.xattr_inode(store, no, name)?;
-    self.write_unrecorded(store, attribute, off, bytes)?;
+    // An attribute's value lands whole or not at all (T-1.1).
+    self.write_room(store, off, u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
+    if self.write_unrecorded(store, attribute, off, bytes)? < bytes.len() {
+      return Err(VfsError::Memory(slates_mem::MemError::ArenaExhausted {
+        requested: bytes.len(),
+        largest_free: store.content.arena().free_bytes(),
+      }));
+    }
     let handle = self.make_current_inode(store, no)?;
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;

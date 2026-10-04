@@ -2146,11 +2146,14 @@ impl Overlay<'_> {
       {
         return Err(VfsError::NoSpace);
       }
+      // The copy lands whole or not at all (T-1.1): checked for room before the base body is replaced.
+      let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      self.vol.write_room(store, 0, len)?;
       let before = crate::volume::content_by_epoch(store, handle);
       store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
       self.vol.reconcile(before, Vec::new());
       if !bytes.is_empty() {
-        self.vol.apply_write(store, handle, 0, &bytes)?;
+        self.vol.apply_write_whole(store, handle, 0, &bytes)?;
       }
     } else {
       self.plane()?.descriptors.insert(no, file);

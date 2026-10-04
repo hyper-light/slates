@@ -494,6 +494,7 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
     s.fuse_mounts.insert(attachment, mount);
     return Turned::Fenced;
   }
+  crate::verbs::relieve_deferred(s);
   let dispatched = {
     let ShardState {
       store,

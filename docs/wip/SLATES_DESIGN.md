@@ -3252,6 +3252,12 @@ Recovery validates no-follow source acquisition before reinstating lazy reads an
 Source replacement refuses; open descriptor handoff and independent overlay-clone host lifetime
 remain separate gaps. The two reported daemon overlay failures now pass on macOS and Linux.
 
+> **Status (2026-10-03, A-64).** File bytes live once, in each shard's arena range of the anchor's content object,
+> and the recovery image names them by block, so a barrier publishes the shard's metadata. Measured: 75.4 ms →
+> 0.11–0.16 ms at 256 MiB. A block the committed image names is never reused before a newer image commits
+> (deferred frees). Recovery claims exactly the image's blocks and sweeps what no rebuilt volume reaches. The
+> rebuilt store equals the live one, including a snapshot's and a clone's sharing. Proofs are listed in A-64.
+
 For each ledger position, distinguish a holder's promised epoch from its accepted
 `(epoch, value)`. Phase one consults an authorized quorum of distinct holders and adopts the
 highest accepted proposal consistent with the committed prefix. Phase-two acceptance at a new
@@ -8322,3 +8328,74 @@ Applied in the same change to: §4.6 "Linux" status, A-61, T-3.5, `docs/wip/reco
   run, and fails with the replay removed. Unit tests cover replay order, a stale stamp, an uncovered record, a full
   log, an overflow and an impossible length.
 
+
+### A-64 — Content resident once in anchor RAM; the recovery image carries chunk references (2026-10-03)
+Applied in the same change to: §4.8 "Recovery", `docs/wip/recovery.md` §2 and §4, GAPS (GAP-A9-6), BENCHMARKS.
+Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.16 ms at 256 MiB (BENCHMARKS.md,
+`publish_bench`), and file bytes are in RAM once.
+- Why: every barrier re-images the whole shard, copying every file's bytes. Measured on an M5 Max
+  (`publish_bench`, 2026-10-03), that costs 0.29 ms a MiB, 75 ms per barrier at 256 MiB, and a FUSE `close`
+  is a barrier. Content also sits in RAM twice (the arena and the image). Recovery's first version chose the
+  copy for correctness first (`docs/wip/recovery.md` §2); this is the refinement it recorded.
+- The layout: each shard's slice of the anchor's content object is its write log (A-63), two image slots, and
+  then its **arena range**: the shard's chunk arena's one region, mapped by the shard alone (`ExclusiveObject`
+  over that range, AUD-29-09: no other mapping reaches those bytes; the daemon's copies of the object stay in
+  the log and slots, and the anchor never touches the object's bytes). File bytes are written there once, by
+  the write itself, and they survive the daemon because the anchor holds the object.
+- The image: a file's runs, and a base-backed file's pinned ranges, carry **chunk references**: the block's
+  offset and order within the arena range, the bytes used, and the birth epoch. A table lists each block once,
+  so CoW sharing between versions, snapshots and clones is preserved by identity, not found by checksum.
+  Capture copies no file bytes; inline bodies and symlink targets stay in the image (they live in the inode).
+  A barrier then costs the shard's metadata.
+- **Sealed chunks are immutable** (D-6: a write into one copies it into a new open extent), so a reference to
+  one stays true. A file's **open extent** is written in place after the image that names it, so its bytes
+  can run ahead of the imaged length. Those bytes are never served: every read stops at the extent's length,
+  and a write zero-fills any gap it extends over (`ChunkStore::write_open`), so recovery zeroes nothing (a
+  test proves it with no zeroing at all). They are writes no barrier made stable. NFS re-sends them when the
+  write verifier changes (RFC 1813 §3.3.7), and the FUSE write log replays them (A-63).
+- **No block the committed image names is reused before a newer image commits.** The arena keeps one bit per
+  granule for the blocks the committed image references, set at capture. A free of a block outside that set is
+  immediate. A free of one inside it is deferred until the next publication commits; the commit then releases
+  each deferred block the new image does not name. Without this rule, a block freed and reused by another file
+  would hand the old image's file the new file's bytes after a crash.
+- **Deferred bytes never cost a client a refusal it would not otherwise get.** Before each unit of work (a
+  transport request on a volume, a mutating verb), the shard publishes when its arena's free bytes are below the
+  operation headroom and blocks are deferred (`verbs::relieve_deferred`, counted `arena.deferred_relieved`). The
+  headroom is already derived as the bound on in-flight copy-ups (§4.2), so an operation within it never runs
+  out of room because of deferral. An allocation that still finds the arena full while blocks are deferred is
+  refused `VfsError::PublishNeeded`, not a memory refusal. A file write that has landed some windows by then is a
+  short write of them (POSIX `write(2)`); the remainder, or a write that landed none, is refused. Each protocol
+  answers that as a retry:
+  - NFS: `JUKEBOX` (RFC 1813 §2.6; `NFS4ERR_DELAY` for NFSv4).
+  - FUSE: `EAGAIN`.
+  - Control verbs: `Unpublished`, retryable under the same id.
+
+  The next unit's relief then releases the room. A whole-value write (an overlay's copy-up, an edit, an attribute
+  value) is checked for room before it changes anything (`Volume::write_room`).
+- Found while building it, in the existing write path: a write, truncate or edit refused partway returned with
+  the inode's body taken out, losing the file's content
+  (`docs/bugs/2026-10-03-a-write-or-truncate-refused-partway-dropped-the-files-body.md`). Deferral made that
+  refusal reachable; it is fixed, with short writes and whole-value room checks.
+- Recovery: the arena range is mapped again and the allocator is rebuilt by **claiming** exactly the image's
+  blocks (`Buddy::claim`: split down to the block, refusing one that is misaligned, out of range or already
+  claimed); everything else is free. The image is external input: every reference is checked against the
+  arena range and its order, and the hostile-input tests cover each refusal.
+- What was rejected: an incremental copy (dirty chunks copied into a chunk area of the object at each
+  barrier). It keeps content in RAM twice and a copy proportional to the changes, for no gain over writing
+  once.
+- Found while building it: a rebuilt snapshot's deadlist excluded only the inodes it shared with the head,
+  so once images named chunks, a diverged inode's window still shared with the head went on the deadlist and
+  its drop freed the head's bytes (`dropping_a_recovered_snapshot_frees_its_private_chunks_and_keeps_the_heads`,
+  red before the fix). The deadlist now excludes every chunk the head reaches, as the live volume's does.
+- Built in order, each with its proof:
+  1. The allocator's claim and deferred free. `crates/mem/src/buddy.rs` tests a model of the deferral, red with
+     it disabled, and the claim against an allocated population.
+  2. The exclusive range mapping (`crates/mem/tests/shared_region.rs`).
+  3. The image's chunk references, capture without copy, and recovery by claim. Tested in
+     `crates/vfs/tests/content_in_place.rs` (hostile references, the sweep, a clone sharing its origin's chunks,
+     an open extent's unstable bytes never served) and by every recovery test over the surviving arena. The
+     rebuilt store now equals the live one: `chunk_ownership.rs` and `retained_bytes.rs` assert it.
+  4. The daemon's arena in its range of the content object. The content object is sized once: two fixtures had
+     their own formula (`docs/bugs/2026-10-03-the-anchor-sized-the-content-object-at-half-the-daemons-need.md`).
+     Proven by the relief test and the server recovery suite on macOS (15/15). On Linux 6.12 the FUSE in-flight
+     takeover test passed 3/3, replaying 5 logged writes per kill with every page exact.

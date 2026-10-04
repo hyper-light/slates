@@ -1311,6 +1311,11 @@ fn run_recorded(
   };
   // The verb's own span is the cause of everything deeper in it (a `merge.verdict`, a `land.entry`).
   let outer = state.current_span.replace(op.context());
+  // A mutation's room first, outside its transaction: the blocks freed since the last publication are released
+  // when the arena is short of them (A-64).
+  if label == 1 {
+    relieve_deferred(state);
+  }
   state.db.begin();
   state.current_request = Some((origin, id));
   let reply = dispatch(state, client_id, principal, body);
@@ -6625,6 +6630,8 @@ pub struct Rebuilt {
   pub orphans_reclaimed: usize,
   /// FUSE writes acknowledged after the last publication, replayed from the write log (A-63).
   pub writes_replayed: usize,
+  /// Claimed blocks no rebuilt volume reaches, freed by the recovery sweep (A-64).
+  pub blocks_swept: usize,
   /// Host mounts of snapshots whose read-only views were rebuilt (AUD-29-76).
   pub snapshot_views: usize,
   /// Merge volumes rebuilt (§4.16): greens with their persisted chain replayed, works reset to a
@@ -6679,6 +6686,9 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   #[cfg(not(target_os = "linux"))]
   drop(replies);
   let mut rebuilt = Rebuilt::default();
+  // Every block the images name is claimed before anything else allocates in the arena (A-64): the held
+  // replicas and the merge volumes below allocate fresh blocks, which must never land on one an image names.
+  let claims = claim_images(state, &images);
   match slates_cluster::content::ContentHold::from_image(
     &mut crate::content_holder::hold_space(&mut state.store),
     &held,
@@ -6712,27 +6722,30 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
         rebuild_work(state, record, green);
         rebuilt.merge_volumes += 1;
       }
-      Role::Plain => match rebuild_volume(state, record, images.get(&record.id.bytes)) {
-        Ok(prefix) => {
-          rebuilt.volumes += 1;
-          max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
-          rebuilt.snapshots_trimmed += trim_unrecorded_snapshots(state, record.id);
+      Role::Plain => {
+        match rebuild_volume(state, record, images.get(&record.id.bytes), claims.as_ref()) {
+          Ok(prefix) => {
+            rebuilt.volumes += 1;
+            max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
+            rebuilt.snapshots_trimmed += trim_unrecorded_snapshots(state, record.id);
+          }
+          Err(reason) => {
+            rebuilt.skipped += 1;
+            eprintln!(
+              "slates-server: partition {}: volume {} not rebuilt: {reason}",
+              state.partition, record.name
+            );
+            continue;
+          }
         }
-        Err(reason) => {
-          rebuilt.skipped += 1;
-          eprintln!(
-            "slates-server: partition {}: volume {} not rebuilt: {reason}",
-            state.partition, record.name
-          );
-          continue;
-        }
-      },
+      }
     }
     let (snapshots, attachments) = reconcile_lost(state, record);
     rebuilt.snapshots_dropped += snapshots;
     rebuilt.attachments_dropped += attachments;
     rebuilt.orphans_reclaimed += settle_references(state, record);
   }
+  rebuilt.blocks_swept = sweep_claims(state, claims);
   // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
   #[cfg(target_os = "linux")]
   {
@@ -6746,6 +6759,44 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   // The recorded snapshot mounts' views, once the volumes and their pins are back (AUD-29-76).
   rebuilt.snapshot_views = crate::snapshot_view::rebuild(state);
   rebuilt
+}
+
+/// Claims every block the shard's recovery images name, before anything else allocates in the arena (A-64); `None`,
+/// logged, when the images name blocks no store could hold, and then no volume is rebuilt from them.
+fn claim_images(
+  state: &mut ShardState,
+  images: &std::collections::BTreeMap<[u8; 16], VolumeImage>,
+) -> Option<slates_vfs::recover::Claims> {
+  match slates_vfs::recover::Claims::prepare(&mut state.store, images.values()) {
+    Ok(claims) => Some(claims),
+    Err(e) => {
+      eprintln!(
+        "slates-server: partition {}: the recovery images' blocks were not claimed, no volume is rebuilt: {e}",
+        state.partition
+      );
+      None
+    }
+  }
+}
+
+/// Gives back every claimed block no rebuilt volume reaches (A-64): a refused volume's, an image the catalog does not
+/// hold. Deferred, since the recovered image names them, until this daemon's first publication commits. Returns the
+/// blocks freed.
+fn sweep_claims(state: &mut ShardState, claims: Option<slates_vfs::recover::Claims>) -> usize {
+  let Some(claims) = claims else {
+    return 0;
+  };
+  let volumes = state.volumes.iter().map(|(_, slot)| &slot.volume);
+  match claims.sweep(&mut state.store, volumes) {
+    Ok(freed) => freed,
+    Err(e) => {
+      eprintln!(
+        "slates-server: partition {}: the recovery sweep stopped: {e}",
+        state.partition
+      );
+      0
+    }
+  }
 }
 
 /// Completes every destroy the catalog holds in flight (`Destroying`, §4.8): the old process marked
@@ -7097,6 +7148,21 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   if state.content.is_none() || end <= start {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   }
+  // The blocks this publication may name, recorded before any is imaged: until it commits or is abandoned, a free
+  // of one is deferred, so the committed image never names a reused block (A-64). Settled here on every outcome.
+  state.store.content.arena_mut().capture();
+  let outcome = publish_captured(state);
+  match outcome {
+    Ok(_) => state.store.content.arena_mut().commit_capture(),
+    Err(_) => state.store.content.arena_mut().abandon_capture(),
+  }
+  outcome
+}
+
+/// The body of [`publish_shard`] once its capture is taken: images every volume, adds the held replicas and the
+/// barrier replies, and writes the frame into the free slot.
+fn publish_captured(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  let (start, end) = state.content_range;
   let mut keyed = Vec::new();
   let mut published = Published::default();
   let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
@@ -7190,6 +7256,29 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   }
 }
 
+/// Format: the status counter of publications run to release blocks whose frees waited on one (A-64).
+pub(crate) const DEFERRED_RELIEVED: &str = "arena.deferred_relieved";
+
+/// Publishes when the shard's arena is short of room only because freed blocks wait on a publication (A-64): a
+/// block the committed recovery image may name is not reused until a newer image commits. Run before each unit of
+/// work — a transport request on a volume, a verb — so an operation within the operation headroom (the derived
+/// bound on in-flight copy-ups the budget already keeps free, §4.2) never meets `PublishNeeded`. Costs two loads
+/// when nothing is deferred or the arena has room. A refused publication is counted where it is refused.
+pub(crate) fn relieve_deferred(state: &mut ShardState) {
+  let arena = state.store.content.arena();
+  if arena.deferred_bytes() == 0 {
+    return;
+  }
+  let free = u64::try_from(arena.free_bytes()).unwrap_or(u64::MAX);
+  if free >= state.store.budget.headroom() {
+    return;
+  }
+  if publish_shard(state).is_ok() {
+    let relieved = state.refusals.entry(DEFERRED_RELIEVED).or_insert(0);
+    *relieved = relieved.saturating_add(1);
+  }
+}
+
 /// Returns a recovered volume's byte reservation and re-grown dynamic hold to the shard budget, for
 /// a recovery that must be refused after they were taken.
 fn release_recovered_bytes(
@@ -7241,6 +7330,7 @@ fn rebuild_volume(
   state: &mut ShardState,
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
+  claims: Option<&slates_vfs::recover::Claims>,
 ) -> Result<u16, String> {
   let size = wire_size(record.policy.size);
   let reservation = match size {
@@ -7253,7 +7343,7 @@ fn rebuild_volume(
     ),
     SizeClass::Dynamic { .. } => None,
   };
-  let built = build_recovered_volume(state, record, image, size);
+  let built = build_recovered_volume(state, record, image, claims, size);
   let (mut volume, host, prefix) = match built {
     Ok(triple) => triple,
     Err(reason) => {
@@ -7330,6 +7420,7 @@ fn build_recovered_volume(
   state: &mut ShardState,
   record: &VolumeRecord,
   image: Option<&VolumeImage>,
+  claims: Option<&slates_vfs::recover::Claims>,
   size: SizeClass,
 ) -> Result<(Volume, Option<OsHost>, u16), String> {
   let image =
@@ -7346,9 +7437,14 @@ fn build_recovered_volume(
   let source = opened
     .as_mut()
     .map(|(host, root)| (host as &mut dyn HostFs, *root));
+  let claims = claims.ok_or_else(|| {
+    "RecoveryIncomplete: the shard's recovery images name blocks that could not be claimed"
+      .to_owned()
+  })?;
   let mut volume = Volume::from_image(
     &mut state.store,
     image,
+    claims,
     Box::new(HostClock::new()),
     journal,
     source,
@@ -7483,35 +7579,80 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool) {
 
 /// Replays the FUSE writes the previous daemon acknowledged after its last publication (A-63) into the volumes
 /// recovery rebuilt, in the order they were acknowledged: each to the volume whose prefix its inode carries. A write
-/// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says.
+/// that cannot be replayed is counted and the run carries on; the file then lacks it, as the record says. A write
+/// refused `PublishNeeded` (the arena's freed blocks wait on a publication, A-64) publishes, puts every record not
+/// yet replayed back in the log under the new image's stamp — the publication cleared the log, and a crash before
+/// the replay ends must still find them — and is tried once more.
 #[cfg(target_os = "linux")]
 fn replay_writes(state: &mut ShardState) -> usize {
   let records = std::mem::take(&mut state.replay);
   let mut replayed = 0;
-  for record in records {
-    let prefix =
-      u16::try_from(record.inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
-    let handle = state
-      .volumes
-      .iter()
-      .find(|(_, slot)| slot.volume.prefix() == prefix)
-      .map(|(handle, _)| handle);
-    let written = handle
-      .and_then(|handle| state.volumes.get_mut(handle).ok())
-      .map(|slot| {
-        slot.volume.write(
-          &mut state.store,
-          slates_vfs::ids::InodeNo(record.inode),
-          record.offset,
-          &record.bytes,
-        )
-      });
+  for (index, record) in records.iter().enumerate() {
+    let mut written = replay_one(state, record);
+    if matches!(written, Some(Err(slates_vfs::VfsError::PublishNeeded))) {
+      let _ = publish_shard(state);
+      relog_remaining(state, records.get(index..).unwrap_or_default());
+      written = replay_one(state, record);
+    }
     match written {
       Some(Ok(_)) => replayed += 1,
       _ => *state.refusals.entry(WRITE_REPLAY_REFUSED).or_insert(0) += 1,
     }
   }
   replayed
+}
+
+/// Writes one logged record into the volume whose prefix its inode carries; `None` when no rebuilt volume has it.
+#[cfg(target_os = "linux")]
+fn replay_one(
+  state: &mut ShardState,
+  record: &crate::write_log::Record,
+) -> Option<Result<usize, slates_vfs::VfsError>> {
+  let prefix =
+    u16::try_from(record.inode >> slates_vfs::ids::InodeNo::COUNTER_BITS).unwrap_or(u16::MAX);
+  let handle = state
+    .volumes
+    .iter()
+    .find(|(_, slot)| slot.volume.prefix() == prefix)
+    .map(|(handle, _)| handle)?;
+  let slot = state.volumes.get_mut(handle).ok()?;
+  Some(slot.volume.write(
+    &mut state.store,
+    slates_vfs::ids::InodeNo(record.inode),
+    record.offset,
+    &record.bytes,
+  ))
+}
+
+/// Empties the write log under the committed image's generation and appends `remaining` to it, so the records a
+/// replay has not yet applied survive a crash before it ends. A record the log cannot take marks it overflowed
+/// (A-63: the next daemon reports every taken-over file as having lost writes).
+#[cfg(target_os = "linux")]
+fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record]) {
+  let (start, end) = state.content_range;
+  let (Some(object), Some(log)) = (state.content.as_mut(), state.write_log.as_mut()) else {
+    return;
+  };
+  let generation = ShardImage::committed_generation(&ContentView {
+    object,
+    start,
+    len: end.saturating_sub(start),
+  })
+  .unwrap_or(0);
+  let mut kept = log.clear(object, generation).is_ok();
+  for record in remaining {
+    if kept
+      && log
+        .append(object, record.inode, record.offset, &record.bytes)
+        .is_err()
+    {
+      kept = false;
+    }
+  }
+  if !kept {
+    let _ = log.overflow(object);
+    *state.refusals.entry(WRITE_LOG_UNWRITTEN).or_insert(0) += 1;
+  }
 }
 
 /// Format: the refusal counter of a logged write recovery could not replay (A-63).
@@ -7658,6 +7799,71 @@ mod tests {
     HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// Shape: the reduced reserve the relief test's shard runs with, so filling its arena takes a few chunks, not the
+  /// machine's measured production reserve.
+  const RELIEF_RESERVE: u64 = 32 << 20;
+
+  /// A-64 (the relief). Do: on a shard with a reduced reserve, write a file large enough that rewriting it leaves the
+  /// arena below the operation headroom; publish (the image names its blocks); rewrite it whole, so every old block's
+  /// free is deferred; then relieve. Expect: before, deferred bytes and free bytes below the headroom; after, a
+  /// publication ran (`arena.deferred_relieved` moved), nothing is deferred, and the arena has the headroom free.
+  #[test]
+  fn a_shard_short_of_room_only_by_deferred_frees_publishes_to_release_them() {
+    crate::daemon::audit_on_shard_configured(
+      |state| {
+        let principal = Principal::Uid { uid: 1234 };
+        let chunk = state.store.content.chunk_bytes();
+        let capacity = state.store.content.arena().capacity();
+        let headroom = usize::try_from(state.store.budget.headroom()).unwrap();
+        let file_bytes = (capacity - headroom) / 2 + 2 * chunk;
+        let limit = u64::try_from(file_bytes + chunk).unwrap();
+        let reply = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Create {
+            name: "relief".to_owned(),
+            size: super::SizeClass::Bounded { limit },
+            names: super::NamePolicy::Exact,
+            require_locked: false,
+            base: None,
+          },
+        );
+        let super::ReplyBody::Created { id } = reply else {
+          panic!("{reply:?}")
+        };
+        let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(handle).unwrap();
+        let root = slot.volume.root_inode(store).unwrap();
+        let file = slot.volume.create_file_no(store, root, "f", 0o644).unwrap();
+        slot
+          .volume
+          .write(store, file, 0, &vec![b'a'; file_bytes])
+          .unwrap();
+        super::publish_shard(state).expect("the shard publishes");
+        let super::ShardState { store, volumes, .. } = &mut *state;
+        let slot = volumes.get_mut(handle).unwrap();
+        slot
+          .volume
+          .write(store, file, 0, &vec![b'b'; file_bytes])
+          .unwrap();
+        let arena = state.store.content.arena();
+        assert!(arena.deferred_bytes() > 0, "the rewrite's old blocks wait");
+        assert!(
+          arena.free_bytes() < headroom,
+          "the arena is short of room only by them"
+        );
+        super::relieve_deferred(state);
+        let arena = state.store.content.arena();
+        assert_eq!(arena.deferred_bytes(), 0, "the publication released them");
+        assert!(arena.free_bytes() >= headroom, "the headroom is free again");
+        assert_eq!(state.refusals.get(super::DEFERRED_RELIEVED), Some(&1));
+      },
+      |config| config.reserve_per_shard = RELIEF_RESERVE,
+    );
+  }
 
   /// §4.8 (the recovery image) and §4.4 (destroy): a volume being destroyed has nothing to recover —
   /// recovery completes a recorded destroy from the catalog — so a shard publish leaves it out rather
@@ -8797,11 +9003,11 @@ mod tests {
         .unwrap()
         .clone();
       state.content = None;
-      let scratch = super::build_recovered_volume(state, &record, None, size).err();
+      let scratch = super::build_recovered_volume(state, &record, None, None, size).err();
       record.base = super::BaseRecord::Path {
         path: ".".to_owned(),
       };
-      let overlay = super::build_recovered_volume(state, &record, None, size).err();
+      let overlay = super::build_recovered_volume(state, &record, None, None, size).err();
       (scratch, overlay)
     });
     assert!(scratch.is_some_and(|reason| reason.contains("RecoveryIncomplete")));

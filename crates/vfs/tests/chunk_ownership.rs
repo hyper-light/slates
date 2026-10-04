@@ -189,10 +189,12 @@ fn destroying_a_volume_with_snapshots_returns_the_whole_arena() {
   );
 }
 
-/// A recovered snapshot's diverged file is a private copy, so dropping the snapshot frees exactly
-/// that copy's chunks. Do: write two windows, snapshot, overwrite window 0, capture and rebuild,
-/// drop the recovered snapshot. Expect: the head reads both windows and the arena holds only the
-/// head's two.
+/// A recovered snapshot keeps the chunks it shared with the head (A-64: the image names chunks, so sharing is
+/// kept by identity), and dropping it frees exactly its own. Do: write two windows, snapshot, overwrite window
+/// 0, capture and rebuild over the surviving arena, drop the recovered snapshot. Expect: the rebuilt store holds
+/// exactly what the live one did (the head's two windows and the snapshot's old window 0, three chunks, not a
+/// fourth for a private copy of the shared window); after the drop the head reads both windows, the snapshot's
+/// own window waits as a deferred free, and once a publication commits the arena holds only the head's two.
 #[test]
 fn dropping_a_recovered_snapshot_frees_its_private_chunks_and_keeps_the_heads() {
   let mut source = store();
@@ -205,19 +207,26 @@ fn dropping_a_recovered_snapshot_frees_its_private_chunks_and_keeps_the_heads() 
   vol.write(&mut source, f, 0, &vec![b'R'; chunk]).unwrap();
   let image = vol.to_image(&source, None).unwrap();
 
-  let mut fresh = store();
+  let mut fresh = common::surviving(&source);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
   )
   .unwrap();
-  let with_snapshot = fresh.content.allocated_bytes();
-  assert!(
-    with_snapshot >= 4 * chunk,
-    "the rebuilt store holds the head's two windows and the snapshot's private copy"
+  assert_eq!(
+    source.content.allocated_bytes(),
+    3 * chunk,
+    "the live store: the head's two windows and the snapshot's old window 0"
+  );
+  assert_eq!(
+    fresh.content.allocated_bytes(),
+    source.content.allocated_bytes(),
+    "the rebuilt store holds exactly what the live one did, the shared window once"
   );
   recovered.destroy_snapshot(&mut fresh, snap).unwrap();
   assert_window(
@@ -237,8 +246,15 @@ fn dropping_a_recovered_snapshot_frees_its_private_chunks_and_keeps_the_heads() 
     "after the recovered snapshot's drop",
   );
   assert_eq!(
+    fresh.content.arena().deferred_bytes(),
+    chunk,
+    "the snapshot's own window is freed, deferred: the recovered image still names it"
+  );
+  fresh.content.arena_mut().capture();
+  fresh.content.arena_mut().commit_capture();
+  assert_eq!(
     fresh.content.allocated_bytes(),
     2 * chunk,
-    "the snapshot's private copy was freed and the head's windows kept"
+    "once a publication commits, the snapshot's window is released and the head's windows kept"
   );
 }

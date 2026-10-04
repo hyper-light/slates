@@ -133,6 +133,9 @@ pub enum ExtentRefusal {
   NotAllocated,
   /// The block there was freed and handed out again since: the extent is a stale copy.
   Stale,
+  /// A claim names a span that is already allocated, wholly or in part (A-64: a recovery image naming one
+  /// block twice, or two overlapping blocks).
+  Claimed,
 }
 
 impl fmt::Display for MemError {

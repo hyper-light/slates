@@ -1,9 +1,10 @@
-//! What one §4.8 barrier's publication costs as the shard's content grows (`docs/wip/recovery.md` §4, the
-//! in-place refinement). Every barrier (a FUSE `flush`/`fsync`, an NFS `COMMIT` or `FILE_SYNC` write, a
-//! control verb) re-images the whole shard: [`Volume::to_image`] copies every file's bytes into the image,
-//! the image is encoded, and [`ShardImage::write_to`] checksums it and copies it into the content object's
-//! free slot. This measures those three steps, separately and together, for one volume holding one file of
-//! each size, so a decision about carrying content by reference rests on how the cost grows.
+//! What one §4.8 barrier's publication costs as the shard's content grows (A-64). Every barrier (a FUSE
+//! `flush`/`fsync`, an NFS `COMMIT` or `FILE_SYNC` write, a control verb) re-images the whole shard:
+//! [`Volume::to_image`] captures every inode, the image is encoded, and [`ShardImage::write_to`] checksums it
+//! and copies it into the content object's free slot. Since A-64 a file's chunks are named by reference, so the
+//! image grows with the number of chunks, not their bytes; before it, the image carried every byte (the
+//! 2026-10-03 baseline in BENCHMARKS.md: 75 ms at 256 MiB). This measures the three steps, separately and
+//! together, for one volume holding one file of each size, and the image's size.
 //!
 //! `cargo run --release -p slates-vfs --example publish_bench` prints one CSV row per size, each step the
 //! best of [`ROUNDS`] with every round shown. **Failure** (the process exits non-zero): an image that does
@@ -80,7 +81,7 @@ fn volume(store: &mut Store) -> Volume {
   .unwrap()
 }
 
-/// The best of `ROUNDS` timings of `round` in milliseconds, every round's figure, and the last round's
+/// The best of `ROUNDS` timings of `round` in microseconds, every round's figure, and the last round's
 /// result.
 fn best_of<T>(mut round: impl FnMut() -> T) -> (f64, Vec<f64>, T) {
   let mut all = Vec::with_capacity(ROUNDS);
@@ -88,7 +89,7 @@ fn best_of<T>(mut round: impl FnMut() -> T) -> (f64, Vec<f64>, T) {
   for _ in 0..ROUNDS {
     let start = Instant::now();
     let value = round();
-    all.push(start.elapsed().as_secs_f64() * 1e3);
+    all.push(start.elapsed().as_secs_f64() * 1e6);
     last = Some(value);
   }
   let best = all.iter().copied().fold(f64::INFINITY, f64::min);
@@ -98,14 +99,14 @@ fn best_of<T>(mut round: impl FnMut() -> T) -> (f64, Vec<f64>, T) {
 fn shown(all: &[f64]) -> String {
   all
     .iter()
-    .map(|value| format!("{value:.2}"))
+    .map(|value| format!("{value:.1}"))
     .collect::<Vec<_>>()
     .join(" ")
 }
 
 fn main() {
   println!(
-    "size_mib,capture_ms_best,encode_ms_best,publish_ms_best,total_ms_best,capture_rounds,encode_rounds,publish_rounds"
+    "size_mib,capture_us_best,encode_us_best,publish_us_best,total_us_best,image_bytes,capture_rounds,encode_rounds,publish_rounds"
   );
   for size_mib in SIZES_MIB {
     let mut store = store();
@@ -138,8 +139,9 @@ fn main() {
       std::process::exit(1);
     }
     println!(
-      "{size_mib},{capture:.2},{encode:.2},{publish:.2},{:.2},{},{},{}",
+      "{size_mib},{capture:.1},{encode:.1},{publish:.1},{:.1},{},{},{},{}",
       capture + encode + publish,
+      encoded.len(),
       shown(&capture_rounds),
       shown(&encode_rounds),
       shown(&publish_rounds)

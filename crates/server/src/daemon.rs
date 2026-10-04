@@ -2318,52 +2318,62 @@ fn build_root_group(
   )
 }
 
-/// This shard's slice `[start, end)` of the anchor's content object (§4.8), `(0, 0)` without one.
-fn shard_slice(
-  config_shards: &[u16],
-  partition: u16,
-  content: Option<&slates_mem::SparseObject>,
-) -> (usize, usize) {
-  let Some(object) = content else {
-    return (0, 0);
-  };
-  let per_shard = object.len() / config_shards.len().max(1);
-  let start = usize::from(partition).saturating_mul(per_shard);
-  (start, start.saturating_add(per_shard))
+/// Where this shard's slice of the anchor's content object starts: its partition's index times the slice's length
+/// ([`DaemonConfig::shard_content_layout`]). The shard's order in the configuration names its partition.
+fn slice_start(config: &DaemonConfig, partition: u16) -> usize {
+  usize::from(partition).saturating_mul(config.shard_content_layout().stride)
 }
 
-/// This shard's content range for its recovery images (§4.8): its whole slice. (On Linux the slice also holds the
-/// FUSE write log, A-63.)
-#[cfg(not(target_os = "linux"))]
-fn content_slice(
-  config_shards: &[u16],
+/// This shard's range of the content object for its recovery images (§4.8), `(0, 0)` without an object or with
+/// one too small for the layout.
+fn image_range(
+  config: &DaemonConfig,
   partition: u16,
   content: Option<&slates_mem::SparseObject>,
 ) -> (usize, usize) {
-  shard_slice(config_shards, partition, content)
+  let layout = config.shard_content_layout();
+  let start = slice_start(config, partition);
+  let range = (
+    start.saturating_add(layout.images.0),
+    start.saturating_add(layout.images.1),
+  );
+  match content {
+    Some(object) if range.1 <= object.len() => range,
+    _ => (0, 0),
+  }
+}
+
+/// This shard's content range for its recovery images (§4.8).
+#[cfg(not(target_os = "linux"))]
+fn content_slice(
+  config: &DaemonConfig,
+  partition: u16,
+  content: Option<&slates_mem::SparseObject>,
+) -> (usize, usize) {
+  image_range(config, partition, content)
 }
 
 /// This shard's content range for its recovery images (§4.8), and the FUSE write log at the slice's front with what
 /// the previous daemon left in it to replay (A-63, `crate::write_log`), opened against the generation of the
 /// committed image, before anything this daemon does can publish and clear it. No log and nothing to replay without
-/// a content object, or a slice too small for the log.
+/// a content object.
 #[cfg(target_os = "linux")]
 fn content_slice(
   config: &DaemonConfig,
   partition: u16,
-  config_shards: &[u16],
   content: Option<&mut slates_mem::SparseObject>,
 ) -> (
   (usize, usize),
   Option<crate::write_log::WriteLog>,
   crate::write_log::Recovered,
 ) {
-  let (start, end) = shard_slice(config_shards, partition, content.as_deref());
-  let log_bytes = config.write_log_bytes();
-  let images = (start.saturating_add(log_bytes), end);
-  let Some(object) = content.filter(|_| end.saturating_sub(start) > log_bytes) else {
-    return ((start, end), None, crate::write_log::Recovered::default());
+  let images = image_range(config, partition, content.as_deref());
+  let Some(object) = content.filter(|_| images.1 > images.0) else {
+    return ((0, 0), None, crate::write_log::Recovered::default());
   };
+  let layout = config.shard_content_layout();
+  let log_start = slice_start(config, partition).saturating_add(layout.write_log.0);
+  let log_bytes = layout.write_log.1.saturating_sub(layout.write_log.0);
   let generation =
     slates_vfs::recover::ShardImage::committed_generation(&crate::verbs::ContentView {
       object,
@@ -2371,9 +2381,37 @@ fn content_slice(
       len: images.1.saturating_sub(images.0),
     })
     .unwrap_or(0);
-  match crate::write_log::WriteLog::open(object, start, log_bytes, generation) {
+  match crate::write_log::WriteLog::open(object, log_start, log_bytes, generation) {
     Some((log, recovered)) => (images, Some(log), recovered),
-    None => ((start, end), None, crate::write_log::Recovered::default()),
+    None => (images, None, crate::write_log::Recovered::default()),
+  }
+}
+
+/// The region this shard's chunk arena lives in (§4.2). With the anchor's content object, it is the shard's arena
+/// range of that object, mapped on its own (A-64): file bytes are written there once and survive the daemon, and a
+/// recovery image names them by block. Without one (a standalone daemon, a build without anchor-backed storage), a
+/// private mapping of the same length, whose bytes die with the process.
+fn arena_region(
+  config: &DaemonConfig,
+  partition: u16,
+  env: &[(String, String)],
+) -> Result<Region, ServerError> {
+  let layout = config.shard_content_layout();
+  let (offset, len) = layout.arena;
+  let at = slice_start(config, partition).saturating_add(offset);
+  match AnchorSegment::content_handoff_in(env) {
+    Some((handoff, object_len)) if at.saturating_add(len) <= object_len => {
+      // SAFETY: no other mapping in any process reaches `[at, at + len)` while this region lives. The range is
+      // this shard's alone: every shard maps its own partition's range, and this daemon's copies of the content
+      // object reach only the write log and the image slots (`image_range`, `content_slice`), which the layout
+      // keeps apart from it. The anchor that holds the object across a restart never touches its bytes, and it
+      // starts the next daemon only after this one has exited, so the mapping that wrote these bytes is gone
+      // before the next one maps them.
+      let object = unsafe { slates_mem::ExclusiveObject::open_range(&handoff, at, len) }
+        .map_err(ServerError::Memory)?;
+      Ok(Region::shared(object, config.page))
+    }
+    _ => Ok(Region::map(len, config.page, config.huge_pages)?),
   }
 }
 
@@ -2394,12 +2432,7 @@ fn init_shard(
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
   let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
   let mut arena = ChunkArena::new(config.page);
-  let region_len = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX);
-  arena.add_region(Region::map(
-    region_len.max(config.page),
-    config.page,
-    config.huge_pages,
-  )?)?;
+  arena.add_region(arena_region(config, partition, env)?)?;
   // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
   // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk
   // copies it into a new open extent — copy-on-write at chunk granularity — so the source chunk and
@@ -2520,9 +2553,9 @@ fn init_shard(
   };
   #[cfg(target_os = "linux")]
   let (content_range, write_log, recovered_writes) =
-    content_slice(config, partition, config_shards, content.as_mut());
+    content_slice(config, partition, content.as_mut());
   #[cfg(not(target_os = "linux"))]
-  let content_range = content_slice(config_shards, partition, content.as_ref());
+  let content_range = content_slice(config, partition, content.as_ref());
   // The telemetry sink keeps the most recent spans up to one client ring's depth (§4.14): a shard
   // processes at most a ring of in-flight requests, so a ring's depth of recent spans covers the
   // current activity window; older spans are shed (and counted), telemetry being the shed-first class.

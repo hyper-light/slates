@@ -297,6 +297,7 @@ fn with_export<R>(
   f: impl FnOnce(&mut Export<'_>) -> R,
 ) -> Option<R> {
   let handle = *s.by_id.get(&volume)?;
+  crate::verbs::relieve_deferred(s);
   let write_verifier = s.write_verifier;
   // The request is admitted under the registry attachment its mount capability rides on (§4.4; GAP-A9-4):
   // admitted on the capability's first request, so a barrier the owner runs over the volume sees this

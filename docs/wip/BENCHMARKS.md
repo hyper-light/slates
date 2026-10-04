@@ -1362,3 +1362,20 @@ or `FILE_SYNC` write, a FUSE `fsync`, and the `flush` every `close` sends. So a 
 slots (the committed image included) only to learn their generations, then checksums and copies the new frame.
 This is the gap the in-place refinement closes (`docs/wip/recovery.md` §4; GAP-A9-6): content resident once in
 anchor RAM, the image carrying references, so a barrier costs the shard's metadata, not its bytes.
+
+**After A-64 (same day, same command, `publish_bench` now reporting µs and the image's size).** Three runs; load
+average 3.5–8.8 from other sessions. Best of five per step:
+
+| Content | Image | Capture | Encode | Publish | Total, three runs |
+|---|---|---|---|---|---|
+| 1 MiB | 1,212 B | 0.6–0.8 µs | 0.4–0.5 µs | 0.7–1.0 µs | 1.7, 2.2, 2.2 µs |
+| 4 MiB | 3,852 B | 1.1–1.3 µs | 0.5–0.7 µs | 1.0–1.6 µs | 2.6, 3.4, 3.3 µs |
+| 16 MiB | 14,412 B | 2.6–3.3 µs | 1.2–1.7 µs | 5.5–7.0 µs | 9.4, 11.9, 11.8 µs |
+| 64 MiB | 56,652 B | 8.9–11.0 µs | 5.2–7.1 µs | 12.2–25.5 µs | 43.6, 27.5, 26.3 µs |
+| 256 MiB | 225,612 B | 31.9–51.5 µs | 13.8–17.5 µs | 65.0–88.7 µs | 129.8, 157.7, 110.6 µs |
+
+At 256 MiB that is 75.4 ms → 0.11–0.16 ms, about 500–680 times less, and the image is 0.08 % of the content. The
+cost now follows the number of chunks (1,024 of 256 KiB here), about 220 bytes of image each. The publish step is
+still the largest: it re-verifies both slots' CRCs to learn their generations before writing. Keeping the
+committed generation in memory would remove two of its three passes. That is recorded for the next pass, not
+built: at these sizes it is tens of microseconds.

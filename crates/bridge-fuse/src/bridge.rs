@@ -44,6 +44,8 @@ const DT_FIFO: u32 = 1;
 const DT_SOCK: u32 = 12;
 /// Format: Linux EOPNOTSUPP, a refused special-file operation.
 const EOPNOTSUPP: i32 = 95;
+/// Format: Linux EAGAIN, an operation to try again (A-64: the arena waits on the shard's next publication).
+const EAGAIN: i32 = 11;
 // The Linux errno values the volume core's refusals map to (the FUSE ABI is Linux, so the
 // numbers are the kernel's regardless of the host the codec is tested on; the dispatch negates
 // them). Each is a Format constant.
@@ -381,6 +383,7 @@ fn errno(e: VfsError) -> i32 {
     VfsError::BaseUnavailable(code) => code,
     // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
     VfsError::Memory(slates_mem::MemError::SlabFull { .. }) => EMFILE,
+    VfsError::PublishNeeded => EAGAIN,
     _ => EIO,
   }
 }

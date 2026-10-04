@@ -37,3 +37,9 @@ sizes: recovery 14, daemon 18, and the CLI's anchored restarts.
 ## Sibling sweep
 
 No other size is shared between the anchor and the daemon. The segment geometry is passed whole (`Geometry`).
+
+Found later the same day, building A-64 (whose layout grew the object): six test fixtures sized the object by
+their own copy of the old formula. They are `crates/server/tests/common/anchor.rs`, `crates/client/tests/driver.rs`,
+`crates/client/tests/client.rs` (four sites) and `crates/client/tests/consumer.rs`. Every daemon restart test then
+refused `ContentUnavailable` (no image range fit). All now call `DaemonConfig::content_bytes()`. The anchor
+crate's own test sizes an object for itself, with no daemon layout, and stays.

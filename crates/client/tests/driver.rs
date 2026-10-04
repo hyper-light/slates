@@ -169,9 +169,7 @@ impl Anchor {
   fn new(instance: &str) -> Anchor {
     let profile = profile();
     let config = DaemonConfig::derive(&profile, instance, Some(TEST_SHARDS));
-    let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-      * 2
-      * usize::from(config.geometry.partitions.max(1));
+    let content_bytes = config.content_bytes();
     let segment = AnchorSegment::create(
       &format!("slates-seg-{instance}"),
       &profile.facts.identity,

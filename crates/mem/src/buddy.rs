@@ -17,6 +17,14 @@
 //! was accepted, credited 4,095 bytes, and coalesced a block that was still in use). An incarnation is
 //! checked, never wrapped: a head whose incarnations are spent refuses with
 //! [`MemError::GenerationExhausted`] (AUD-29-11), so a stale copy of a block can never name its reuse.
+//!
+//! Recovery images name blocks (A-64), so the allocator also keeps three bits per granule, all sized when
+//! it is built: which heads are live, which heads the committed image may name, and which of those were
+//! freed since and wait. [`Buddy::free_or_defer`] defers a free of a committed head; [`Buddy::capture`]
+//! records the live, undeferred heads as the set a publication may name; [`Buddy::commit_capture`] makes
+//! that set the committed one and frees every deferred block, none of which the new image can name (each
+//! was freed before the capture). [`Buddy::claim`] rebuilds the allocation of exactly the blocks a
+//! recovered image names.
 
 use crate::error::{ExtentRefusal, MemError};
 
@@ -46,6 +54,65 @@ pub struct Buddy {
   /// Per granule: the incarnation of the last allocation headed there.
   incarnations: Vec<u64>,
   free_bytes: usize,
+  /// The heads of live blocks, deferred ones included.
+  live: Bits,
+  /// The heads the committed image may name (A-64): freed only after a newer image commits.
+  committed: Bits,
+  /// Committed heads freed since: still allocated, released by the next commit.
+  deferred: Bits,
+  /// The heads a publication in progress may name.
+  capture: Bits,
+  /// Whether a capture is open (taken, neither committed nor abandoned).
+  capturing: bool,
+  deferred_bytes: usize,
+}
+
+/// One bit per granule, sized once (AC-0.4: nothing reaches the system allocator after the build).
+#[derive(Debug)]
+struct Bits {
+  words: Vec<u64>,
+}
+
+impl Bits {
+  /// Format: bits in one word.
+  const WORD_BITS: usize = u64::BITS as usize;
+
+  fn new(bits: usize) -> Bits {
+    Bits {
+      words: vec![0; bits.div_ceil(Self::WORD_BITS)],
+    }
+  }
+
+  fn word_and_mask(index: u32) -> Option<(usize, u64)> {
+    let index = usize::try_from(index).ok()?;
+    Some((index / Self::WORD_BITS, 1u64 << (index % Self::WORD_BITS)))
+  }
+
+  /// The granule index of bit `bit` of word `word`.
+  fn index_of(word: usize, bit: u32) -> Option<u32> {
+    word
+      .checked_mul(Self::WORD_BITS)
+      .and_then(|base| base.checked_add(usize::try_from(bit).ok()?))
+      .and_then(|index| u32::try_from(index).ok())
+  }
+
+  fn get(&self, index: u32) -> bool {
+    Self::word_and_mask(index)
+      .and_then(|(word, mask)| self.words.get(word).map(|w| w & mask != 0))
+      .unwrap_or(false)
+  }
+
+  fn set(&mut self, index: u32, on: bool) {
+    if let Some((word, mask)) = Self::word_and_mask(index)
+      && let Some(w) = self.words.get_mut(word)
+    {
+      if on {
+        *w |= mask;
+      } else {
+        *w &= !mask;
+      }
+    }
+  }
 }
 
 /// A block handed out by the allocator: an offset and a length in bytes, both granule multiples, and the
@@ -127,6 +194,12 @@ impl Buddy {
       heads,
       incarnations: vec![0; granules],
       free_bytes: granules.saturating_mul(granule),
+      live: Bits::new(granules),
+      committed: Bits::new(granules),
+      deferred: Bits::new(granules),
+      capture: Bits::new(granules),
+      capturing: false,
+      deferred_bytes: 0,
     })
   }
 
@@ -208,17 +281,254 @@ impl Buddy {
       self.mark(buddy, current, true);
       self.link(buddy, current);
     }
+    Ok(self.take(index, order, incarnation))
+  }
+
+  /// Marks the block of `order` at `index` allocated under `incarnation` and returns it.
+  fn take(&mut self, index: u32, order: u32, incarnation: u64) -> Block {
     self.mark(index, order, false);
     if let Some(slot) = self.slot_mut(index) {
       *slot = incarnation;
     }
+    self.live.set(index, true);
     let block_len = self.order_bytes(order);
     self.free_bytes = self.free_bytes.saturating_sub(block_len);
-    Ok(Block {
+    Block {
       offset: usize::try_from(index).unwrap_or(0) << self.granule_shift,
       len: block_len,
       incarnation,
-    })
+    }
+  }
+
+  /// Allocates exactly the block of `len` bytes at `offset` (A-64: rebuilding the allocation a recovered
+  /// image names). The block must be one this allocator could hand out (offset on a granule and on its
+  /// size's boundary, length a power-of-two number of granules, inside the region) and lie wholly in one
+  /// free block, which is split down to it. Anything else is refused [`MemError::ForeignExtent`] with
+  /// nothing changed: `Claimed` when any of the span is already allocated.
+  pub fn claim(&mut self, offset: usize, len: usize) -> Result<Block, MemError> {
+    let refused = |reason| MemError::ForeignExtent {
+      offset,
+      len,
+      reason,
+    };
+    if offset & self.granule.saturating_sub(1) != 0 {
+      return Err(refused(ExtentRefusal::Misaligned));
+    }
+    let order = self
+      .order_for(len)
+      .map_err(|_| refused(ExtentRefusal::WrongLength))?;
+    if self.order_bytes(order) != len {
+      return Err(refused(ExtentRefusal::WrongLength));
+    }
+    let index = u32::try_from(offset >> self.granule_shift)
+      .ok()
+      .filter(|index| usize::try_from(*index).is_ok_and(|i| i < self.state.len()))
+      .ok_or(refused(ExtentRefusal::OutOfRange))?;
+    if index & ((1u32 << order).saturating_sub(1)) != 0 {
+      return Err(refused(ExtentRefusal::Misaligned));
+    }
+    let (head, head_order) = self
+      .covering_free(index, order)
+      .ok_or(refused(ExtentRefusal::Claimed))?;
+    let incarnation = self
+      .incarnation_at(index)
+      .checked_add(1)
+      .ok_or(MemError::GenerationExhausted { index })?;
+    self.unlink(head, head_order);
+    let (mut at, mut current) = (head, head_order);
+    while current > order {
+      current = current.saturating_sub(1);
+      let half = 1u32 << current;
+      let upper = at.saturating_add(half);
+      let (kept, freed) = if index >= upper {
+        (upper, at)
+      } else {
+        (at, upper)
+      };
+      self.mark(freed, current, true);
+      self.link(freed, current);
+      at = kept;
+    }
+    Ok(self.take(index, order, incarnation))
+  }
+
+  /// The free block, as (head, order), that wholly holds the `order` block at `index`; `None` when any of
+  /// that span is allocated. A head covering `index` is found at its own alignment, so climbing the orders
+  /// from `order` meets it; buddies of a free block are never both free, so a free block smaller than the
+  /// span means part of the span is allocated.
+  fn covering_free(&self, index: u32, order: u32) -> Option<(u32, u32)> {
+    for level in order..=self.max_order {
+      let head = index & !((1u32 << level).saturating_sub(1));
+      let byte = self.state_at(head);
+      if byte == INSIDE {
+        continue;
+      }
+      let head_order = u32::from(byte & ORDER_MASK);
+      let end = u64::from(head).saturating_add(1u64 << head_order);
+      if end <= u64::from(index) {
+        continue;
+      }
+      return (byte & FREE_BIT != 0 && head_order >= order).then_some((head, head_order));
+    }
+    None
+  }
+
+  /// Frees `block`, or, when the committed image may name it, defers the free to the next
+  /// [`Buddy::commit_capture`] (A-64). Returns whether it was deferred. Validated as [`Buddy::free`] is.
+  pub fn free_or_defer(&mut self, block: Block) -> Result<bool, MemError> {
+    let (index, order) = self
+      .validate(block)
+      .map_err(|reason| MemError::ForeignExtent {
+        offset: block.offset,
+        len: block.len,
+        reason,
+      })?;
+    if !self.named_by_an_image(index) {
+      self.release(index, order);
+      return Ok(false);
+    }
+    if self.deferred.get(index) {
+      return Err(MemError::ForeignExtent {
+        offset: block.offset,
+        len: block.len,
+        reason: ExtentRefusal::NotAllocated,
+      });
+    }
+    self.deferred.set(index, true);
+    self.deferred_bytes = self.deferred_bytes.saturating_add(self.order_bytes(order));
+    Ok(true)
+  }
+
+  /// Whether the committed image, or the one being published, may name the block headed at `index`.
+  fn named_by_an_image(&self, index: u32) -> bool {
+    self.committed.get(index) || (self.capturing && self.capture.get(index))
+  }
+
+  /// How many blocks of `len` bytes could be allocated now, counted up to `cap`: each free block of at least that
+  /// size holds a power of two of them. Walks the free lists of those orders until `cap` is reached, so the count
+  /// costs at most `cap` steps.
+  pub fn allocatable(&self, cap: usize, len: usize) -> usize {
+    let Ok(order) = self.order_for(len) else {
+      return 0;
+    };
+    let mut units = 0usize;
+    for level in order..=self.max_order {
+      let per = 1usize
+        .checked_shl(level.saturating_sub(order))
+        .unwrap_or(usize::MAX);
+      let mut at = self.head_of(level);
+      while at != NONE && units < cap {
+        units = units.saturating_add(per);
+        at = Self::link_at(&self.next, at);
+      }
+    }
+    units.min(cap)
+  }
+
+  /// Whether `count` blocks of `len` bytes can be allocated now.
+  pub fn can_allocate(&self, count: usize, len: usize) -> bool {
+    self.allocatable(count, len) >= count
+  }
+
+  /// Whether `block` names exactly a live block whose free is not deferred.
+  pub fn holds(&self, block: Block) -> bool {
+    self
+      .validate(block)
+      .is_ok_and(|(index, _)| !self.deferred.get(index))
+  }
+
+  /// Bytes freed but deferred until the next commit: allocated, yet no live state names them.
+  pub const fn deferred_bytes(&self) -> usize {
+    self.deferred_bytes
+  }
+
+  /// Records the heads a publication starting now may name: every live block not deferred. Until the capture
+  /// is committed or abandoned, a free of one of them is deferred too.
+  pub fn capture(&mut self) {
+    self.capturing = true;
+    for ((capture, live), deferred) in self
+      .capture
+      .words
+      .iter_mut()
+      .zip(&self.live.words)
+      .zip(&self.deferred.words)
+    {
+      *capture = live & !deferred;
+    }
+  }
+
+  /// The publication of the last [`Buddy::capture`] committed: its heads become the committed set, and every
+  /// deferred block the new image cannot name is freed. One freed while the capture was open stays deferred,
+  /// since the new image may name it, and the next commit frees it.
+  pub fn commit_capture(&mut self) {
+    if !self.capturing {
+      return;
+    }
+    self.capturing = false;
+    let mut kept_bytes = 0usize;
+    for word in 0..self.deferred.words.len() {
+      let captured = self.capture.words.get(word).copied().unwrap_or(0);
+      let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
+      if let Some(slot) = self.deferred.words.get_mut(word) {
+        *slot = deferred & captured;
+      }
+      let mut bits = deferred & !captured;
+      while bits != 0 {
+        let bit = bits.trailing_zeros();
+        bits &= bits.wrapping_sub(1);
+        let index = Bits::index_of(word, bit);
+        if let Some(index) = index {
+          let order = u32::from(self.state_at(index) & ORDER_MASK);
+          self.release(index, order);
+        }
+      }
+      let mut kept = deferred & captured;
+      while kept != 0 {
+        let bit = kept.trailing_zeros();
+        kept &= kept.wrapping_sub(1);
+        let order =
+          Bits::index_of(word, bit).map(|index| u32::from(self.state_at(index) & ORDER_MASK));
+        if let Some(order) = order {
+          kept_bytes = kept_bytes.saturating_add(self.order_bytes(order));
+        }
+      }
+    }
+    self.deferred_bytes = kept_bytes;
+    std::mem::swap(&mut self.committed, &mut self.capture);
+  }
+
+  /// The publication of the last [`Buddy::capture`] did not commit: the committed set is unchanged, and the
+  /// blocks freed while the capture was open stay deferred for the committed image's sake only if it names
+  /// them; the others are freed now.
+  pub fn abandon_capture(&mut self) {
+    if !self.capturing {
+      return;
+    }
+    self.capturing = false;
+    for word in 0..self.deferred.words.len() {
+      let committed = self.committed.words.get(word).copied().unwrap_or(0);
+      let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
+      let mut bits = deferred & !committed;
+      if let Some(slot) = self.deferred.words.get_mut(word) {
+        *slot = deferred & committed;
+      }
+      while bits != 0 {
+        let bit = bits.trailing_zeros();
+        bits &= bits.wrapping_sub(1);
+        let index = Bits::index_of(word, bit);
+        if let Some(index) = index {
+          let order = u32::from(self.state_at(index) & ORDER_MASK);
+          self.deferred_bytes = self.deferred_bytes.saturating_sub(self.order_bytes(order));
+          self.release(index, order);
+        }
+      }
+    }
+  }
+
+  /// Every live block becomes committed (A-64: after a recovery's claims, the recovered image names them).
+  pub fn commit_live(&mut self) {
+    self.capture();
+    self.commit_capture();
   }
 
   /// The incarnation last allocated at granule `index` (zero if none, or out of range).
@@ -276,11 +586,27 @@ impl Buddy {
         len: block.len,
         reason,
       })?;
+    if self.named_by_an_image(index) {
+      // A committed head is freed only through the deferral, never here, or the committed image could
+      // name a reused block.
+      return Err(MemError::ForeignExtent {
+        offset: block.offset,
+        len: block.len,
+        reason: ExtentRefusal::Claimed,
+      });
+    }
+    self.release(index, order);
+    Ok(())
+  }
+
+  /// Returns the allocated block of `order` at `index` to the free lists, coalescing.
+  fn release(&mut self, index: u32, order: u32) {
+    self.live.set(index, false);
+    self.committed.set(index, false);
     self.free_bytes = self.free_bytes.saturating_add(self.order_bytes(order));
     let (index, order) = self.coalesce(index, order);
     self.mark(index, order, true);
     self.link(index, order);
-    Ok(())
   }
 
   /// Merges the block at `index` with its free buddies upward; returns the merged block.
@@ -566,6 +892,287 @@ mod tests {
       b.largest_free(),
       b.region_bytes(),
       "the full region is one block again"
+    );
+  }
+
+  fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.0 + b.1 && b.0 < a.0 + a.1
+  }
+
+  /// A random population: blocks allocated and some freed again, in an allocator of 1,024 granules.
+  fn random_population(granule: usize, rng: &mut Xorshift) -> (Buddy, Vec<Block>) {
+    let mut source = Buddy::new(granule, 10).unwrap();
+    let mut live: Vec<Block> = Vec::new();
+    for _ in 0..200 {
+      let len = (rng.below(8) + 1) * granule * (1 << rng.below(3));
+      allocate_step(&mut source, &mut live, len);
+      if !live.is_empty() && rng.below(4) == 0 {
+        source
+          .free(live.swap_remove(rng.below(live.len())))
+          .unwrap();
+      }
+    }
+    (source, live)
+  }
+
+  /// Fills `rebuilt` with single granules until it refuses, checking none overlaps `claimed`, then frees
+  /// everything and expects the region whole.
+  fn fill_then_free_all(rebuilt: &mut Buddy, claimed: Vec<Block>, granule: usize) {
+    let mut fresh = Vec::new();
+    while let Ok(block) = rebuilt.alloc(granule) {
+      for other in &claimed {
+        assert!(!overlaps(
+          (block.offset, block.len),
+          (other.offset, other.len)
+        ));
+      }
+      fresh.push(block);
+    }
+    for block in claimed.into_iter().chain(fresh) {
+      rebuilt.free(block).unwrap();
+    }
+    assert_eq!(rebuilt.largest_free(), rebuilt.region_bytes());
+  }
+
+  /// A-64 (recovery rebuilds the allocation by claim). Do: allocate a random population in one allocator,
+  /// then claim exactly its blocks, in a shuffled order, in a fresh one. Expect: every claim succeeds, the
+  /// free bytes agree, a later allocation never overlaps a claimed block, and freeing the claims coalesces
+  /// the region back to one block.
+  #[test]
+  fn claiming_a_population_rebuilds_its_allocation() {
+    let granule = 256;
+    let mut rng = Xorshift::new(Xorshift::SEED);
+    // Miri interprets every step; two rounds keep its lane bounded and still cover the claim's paths.
+    let rounds = if cfg!(miri) { 2 } else { 50 };
+    for _round in 0..rounds {
+      let (source, live) = random_population(granule, &mut rng);
+      let mut order: Vec<(usize, usize)> = live.iter().map(|b| (b.offset, b.len)).collect();
+      for at in (1..order.len()).rev() {
+        order.swap(at, rng.below(at + 1));
+      }
+      let mut rebuilt = Buddy::new(granule, 10).unwrap();
+      let claimed: Vec<Block> = order
+        .iter()
+        .map(|&(offset, len)| rebuilt.claim(offset, len).unwrap())
+        .collect();
+      assert_eq!(rebuilt.free_bytes(), source.free_bytes());
+      fill_then_free_all(&mut rebuilt, claimed, granule);
+    }
+  }
+
+  /// A-64 hostile image. Do: against a region with one 8 KiB block claimed at offset 8 KiB, claim a
+  /// misaligned offset, a length that is no block's, a block past the region, the same block again, a
+  /// larger block holding it, and a smaller block inside it. Expect: each refused by name with the totals
+  /// unchanged.
+  #[test]
+  fn a_claim_that_no_allocation_could_have_made_is_refused_by_name() {
+    let mut b = Buddy::new(4096, 3).unwrap();
+    b.claim(8192, 8192).unwrap();
+    let free_before = b.free_bytes();
+    let cases = [
+      ((1, 4096), ExtentRefusal::Misaligned),
+      ((4096, 8192), ExtentRefusal::Misaligned),
+      ((0, 12_288), ExtentRefusal::WrongLength),
+      ((65_536, 4096), ExtentRefusal::OutOfRange),
+      ((8192, 8192), ExtentRefusal::Claimed),
+      ((0, 16_384), ExtentRefusal::Claimed),
+      ((12_288, 4096), ExtentRefusal::Claimed),
+    ];
+    for ((offset, len), reason) in cases {
+      match b.claim(offset, len) {
+        Err(MemError::ForeignExtent { reason: got, .. }) => {
+          assert_eq!(got, reason, "claim {offset}+{len}")
+        }
+        other => panic!("claim {offset}+{len} was not refused: {other:?}"),
+      }
+      assert_eq!(
+        b.free_bytes(),
+        free_before,
+        "claim {offset}+{len} changed the totals"
+      );
+    }
+    assert_eq!(
+      b.claim(0, 8192).unwrap().len(),
+      8192,
+      "the free neighbour still claims"
+    );
+  }
+
+  /// A-64. Do: allocate a block, capture and commit (the image names it), free it. Expect: the free is
+  /// deferred, its bytes counted, and no allocation reaches them; a plain free of it is refused; the next
+  /// capture and commit release it and the region is whole.
+  #[test]
+  fn a_block_the_committed_image_names_is_not_reused_before_the_next_commit() {
+    let mut b = Buddy::new(4096, 1).unwrap();
+    let named = b.alloc(4096).unwrap();
+    b.capture();
+    b.commit_capture();
+    assert!(
+      b.free(named).is_err(),
+      "a committed block is freed only through the deferral"
+    );
+    assert!(b.free_or_defer(named).unwrap(), "deferred");
+    assert_eq!(b.deferred_bytes(), 4096);
+    let other = b.alloc(4096).unwrap();
+    assert_ne!(
+      other.offset(),
+      named.offset(),
+      "the named block is not handed out"
+    );
+    assert!(b.alloc(4096).is_err());
+    b.free_or_defer(other).unwrap();
+    b.capture();
+    b.commit_capture();
+    assert_eq!(b.deferred_bytes(), 0);
+    assert_eq!(b.largest_free(), b.region_bytes(), "released by the commit");
+  }
+
+  /// A-64. Do: allocate a block, capture (a publication in progress may name it), free it, then commit.
+  /// Expect: the free is deferred, and stays deferred across that commit (the new image may name the block);
+  /// the following commit releases it. And a block freed during a capture that is abandoned is released at
+  /// once when no committed image names it.
+  #[test]
+  fn a_free_during_an_open_capture_waits_for_the_image_that_may_name_it() {
+    let mut b = Buddy::new(4096, 1).unwrap();
+    let block = b.alloc(4096).unwrap();
+    b.capture();
+    assert!(b.free_or_defer(block).unwrap());
+    b.commit_capture();
+    assert_eq!(b.deferred_bytes(), 4096, "the new image may name it");
+    assert_eq!(b.alloc(8192).ok(), None);
+    b.capture();
+    b.commit_capture();
+    assert_eq!(b.largest_free(), b.region_bytes());
+
+    let abandoned = b.alloc(4096).unwrap();
+    b.capture();
+    assert!(b.free_or_defer(abandoned).unwrap());
+    b.abandon_capture();
+    assert_eq!(b.deferred_bytes(), 0, "no committed image names it");
+    assert_eq!(b.largest_free(), b.region_bytes());
+  }
+
+  /// The deferral's model: the blocks live, the spans the committed image names, the spans an open capture
+  /// names, and the spans freed but deferred.
+  #[derive(Default)]
+  struct DeferralModel {
+    live: Vec<Block>,
+    committed: Vec<(usize, usize)>,
+    capture: Option<Vec<(usize, usize)>>,
+    deferred: Vec<(usize, usize)>,
+  }
+
+  impl DeferralModel {
+    fn allocate(&mut self, b: &mut Buddy, len: usize) {
+      if let Ok(block) = b.alloc(len) {
+        let span = (block.offset, block.len);
+        for named in self.committed.iter().chain(self.capture.iter().flatten()) {
+          assert!(!overlaps(span, *named), "{span:?} reuses {named:?}");
+        }
+        self.live.push(block);
+      }
+    }
+
+    fn free(&mut self, b: &mut Buddy, rng: &mut Xorshift) {
+      if self.live.is_empty() {
+        return;
+      }
+      let block = self.live.swap_remove(rng.below(self.live.len()));
+      if b.free_or_defer(block).unwrap() {
+        self.deferred.push((block.offset, block.len));
+      }
+    }
+
+    fn capture(&mut self, b: &mut Buddy) {
+      if self.capture.is_none() {
+        b.capture();
+        self.capture = Some(self.live.iter().map(|x| (x.offset, x.len)).collect());
+      }
+    }
+
+    fn settle(&mut self, b: &mut Buddy, commit: bool) {
+      let Some(taken) = self.capture.take() else {
+        return;
+      };
+      if commit {
+        b.commit_capture();
+        self.deferred.retain(|span| taken.contains(span));
+        self.committed = taken;
+      } else {
+        b.abandon_capture();
+        let committed = &self.committed;
+        self.deferred.retain(|span| committed.contains(span));
+      }
+    }
+
+    fn check_totals(&self, b: &Buddy) {
+      let live_bytes: usize = self.live.iter().map(|x| x.len).sum();
+      let deferred_bytes: usize = self.deferred.iter().map(|x| x.1).sum();
+      assert_eq!(b.deferred_bytes(), deferred_bytes);
+      assert_eq!(
+        b.free_bytes() + live_bytes + deferred_bytes,
+        b.region_bytes()
+      );
+    }
+  }
+
+  /// A-64, the deferral against a model. Do: a random history of allocations, frees, captures, commits and
+  /// abandons. The model keeps the blocks the committed image names and those the open capture names. Expect:
+  /// no allocation ever overlaps a block either image names, and the free bytes plus the live and deferred
+  /// bytes always equal the region.
+  #[test]
+  fn no_block_an_image_names_is_ever_handed_out_again() {
+    let granule = 256;
+    let mut b = Buddy::new(granule, 8).unwrap();
+    let mut rng = Xorshift::new(Xorshift::SEED);
+    let mut model = DeferralModel::default();
+    let steps = if cfg!(miri) { 2_000 } else { 20_000 };
+    for _ in 0..steps {
+      match rng.below(10) {
+        0..=4 => model.allocate(&mut b, granule * (1 << rng.below(3))),
+        5..=7 => model.free(&mut b, &mut rng),
+        8 => model.capture(&mut b),
+        _ => {
+          let commit = rng.below(2) == 0;
+          model.settle(&mut b, commit);
+        }
+      }
+      model.check_totals(&b);
+    }
+  }
+
+  /// T-1.1's preflight. Do: in a region of eight granules, ask for blocks of each size, then take one granule.
+  /// Expect: `can_allocate` says yes exactly for the counts and sizes the free space holds.
+  #[test]
+  fn can_allocate_counts_what_the_free_blocks_hold() {
+    let granule = 256;
+    let mut b = Buddy::new(granule, 3).unwrap();
+    assert!(b.can_allocate(8, granule));
+    assert!(!b.can_allocate(9, granule));
+    assert!(b.can_allocate(1, 8 * granule));
+    b.alloc(granule).unwrap();
+    assert!(
+      !b.can_allocate(1, 8 * granule),
+      "no whole region after one granule"
+    );
+    assert!(b.can_allocate(1, 4 * granule));
+    assert!(b.can_allocate(7, granule));
+    assert!(!b.can_allocate(8, granule));
+  }
+
+  /// T-1.1's preflight. Do: fill a region of eight granules one by one, then free one. Expect: no block while full;
+  /// after the free, one granule but no two-granule block.
+  #[test]
+  fn can_allocate_follows_frees_without_promising_a_coalesced_block() {
+    let granule = 256;
+    let mut b = Buddy::new(granule, 3).unwrap();
+    let taken: Vec<Block> = (0..8).map(|_| b.alloc(granule).unwrap()).collect();
+    assert!(!b.can_allocate(1, granule));
+    b.free(*taken.first().unwrap()).unwrap();
+    assert!(b.can_allocate(1, granule));
+    assert!(
+      !b.can_allocate(1, 2 * granule),
+      "one free granule is no two-granule block"
     );
   }
 }

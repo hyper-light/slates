@@ -22,7 +22,7 @@ use crate::dir::{BaseDirState, Child, DirNode};
 use crate::dirtree::{DirBlock, Retired};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, RefOwner, SnapshotId};
-use crate::inode::{Attrs, Body, Home, Inode, Kind};
+use crate::inode::{Attrs, BaseBody, Body, Home, Inode, Kind};
 use crate::journal::{Op, OpLog};
 use crate::names::{self, NameEquivalence};
 use crate::quota::{Accounting, Quota};
@@ -1901,11 +1901,13 @@ impl Volume {
     {
       return Err(VfsError::NoSpace);
     }
-    let end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     let old_size = self.inode(store, no)?.attrs.size;
     let handle = self.make_current_inode(store, no)?;
     let prev_version = store.inodes.get(handle)?.version;
-    self.apply_write(store, handle, off, bytes)?;
+    // A refusal after some windows landed is a short write of those (T-1.1): the size, the times and the record are
+    // the bytes written, never the bytes asked.
+    let written = self.apply_write(store, handle, off, bytes)?;
+    let end = off.saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
     inode.attrs.size = inode.attrs.size.max(end);
@@ -1919,13 +1921,13 @@ impl Volume {
     } else {
       Op::Overwrite {
         at: off,
-        len: u64::try_from(bytes.len()).unwrap_or(0),
+        len: u64::try_from(written).unwrap_or(0),
       }
     };
     if recorded == Recorded::Yes {
       self.record(op, "", Some(no), prev_version);
     }
-    Ok(bytes.len())
+    Ok(written)
   }
 
   /// Truncates (or extends with a hole) to `len`.
@@ -2471,15 +2473,19 @@ impl Volume {
     let end = at
       .saturating_add(inserted)
       .saturating_add(u64::try_from(tail.len()).unwrap_or(u64::MAX));
+    // The edit lands whole or not at all (T-1.1): its writes are checked for room before the truncate changes the
+    // file.
+    let rewritten = end.saturating_sub(at);
+    self.write_room(store, at, rewritten)?;
     let handle = self.make_current_inode(store, no)?;
     let prev_version = store.inodes.get(handle)?.version;
     self.apply_truncate(store, handle, at)?;
     store.inodes.get_mut(handle)?.attrs.size = at;
     if !bytes.is_empty() {
-      self.apply_write(store, handle, at, bytes)?;
+      self.apply_write_whole(store, handle, at, bytes)?;
     }
     if !tail.is_empty() {
-      self.apply_write(store, handle, at + inserted, tail)?;
+      self.apply_write_whole(store, handle, at + inserted, tail)?;
     }
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -3577,6 +3583,20 @@ impl Volume {
     store.inodes.get(handle).map_err(|_| VfsError::StaleHandle)
   }
 
+  /// Recomputes the head's content histogram from its bodies (A-64: recovery places bodies over their
+  /// blocks instead of writing them through the write path that keeps the histogram).
+  pub(crate) fn recount_head_bytes(&mut self, store: &Store) {
+    let mut bytes = self.bytes.emptied();
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, self.inode_root, &mut handles);
+    for handle in handles {
+      for (epoch, len) in content_by_epoch(store, handle) {
+        bytes.add(epoch, len);
+      }
+    }
+    self.bytes = bytes;
+  }
+
   pub(crate) fn last_snapshot_epoch(&self) -> Option<Epoch> {
     self
       .last_snapshot
@@ -4654,28 +4674,110 @@ impl Volume {
     Ok(charged(&after).saturating_sub(total_before))
   }
 
+  /// Refuses, before anything changes, a write of `len` bytes at `off` that the arena or the chunk slab could not
+  /// land whole (T-1.1): a whole-value write — an overlay's copy-up, an edit, an attribute value — must land whole or
+  /// not at all, where a file write may land short. It needs a block per chunk window it touches, one more for a
+  /// window's growth (a block is replaced by a larger one before the smaller goes back), and a chunk record for each
+  /// window it seals. The refusal is `PublishNeeded` when blocks wait on a publication (A-64), else the arena's or the
+  /// slab's own.
+  pub(crate) fn write_room(&self, store: &Store, off: u64, len: u64) -> Result<(), VfsError> {
+    if len == 0 {
+      return Ok(());
+    }
+    let chunk = store.content.chunk_bytes();
+    let chunk_len = u64::try_from(chunk).unwrap_or(u64::MAX).max(1);
+    let end = off.saturating_add(len);
+    let windows = end
+      .saturating_sub(1)
+      .saturating_div(chunk_len)
+      .saturating_sub(off / chunk_len)
+      .saturating_add(1);
+    let blocks = usize::try_from(windows.saturating_add(1)).unwrap_or(usize::MAX);
+    let arena = store.content.arena();
+    if store.content.chunk_room() < blocks {
+      return Err(VfsError::Memory(slates_mem::MemError::SlabFull {
+        capacity: store.content.chunk_capacity(),
+      }));
+    }
+    if arena.can_allocate(blocks, chunk) {
+      return Ok(());
+    }
+    if arena.deferred_bytes() > 0 {
+      return Err(VfsError::PublishNeeded);
+    }
+    Err(VfsError::Memory(slates_mem::MemError::ArenaExhausted {
+      requested: blocks.saturating_mul(chunk),
+      largest_free: arena.free_bytes(),
+    }))
+  }
+
+  /// Applies a write to the inode's body: the bytes written from `off`, all of them, or fewer when a refusal stopped
+  /// it after some windows landed (a short write, T-1.1). A refusal before any byte landed leaves the body as it was
+  /// and is the write's refusal. The body is consistent on every path, and the content histogram follows it.
   pub(crate) fn apply_write(
     &mut self,
     store: &mut Store,
     handle: Handle<Inode>,
     off: u64,
     bytes: &[u8],
+  ) -> Result<usize, VfsError> {
+    let before = content_by_epoch(store, handle);
+    let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
+    let landed = self.write_body(store, body, off, bytes);
+    store.inodes.get_mut(handle)?.body = landed.body;
+    self.reconcile(before, content_by_epoch(store, handle));
+    match landed.refused {
+      Some(refusal) if landed.written == 0 => Err(refusal),
+      _ => Ok(landed.written),
+    }
+  }
+
+  /// [`Volume::apply_write`] for a write already checked by [`Volume::write_room`]: one that lands short is refused.
+  pub(crate) fn apply_write_whole(
+    &mut self,
+    store: &mut Store,
+    handle: Handle<Inode>,
+    off: u64,
+    bytes: &[u8],
   ) -> Result<(), VfsError> {
-    let end = off + u64::try_from(bytes.len()).unwrap_or(0);
+    let written = self.apply_write(store, handle, off, bytes)?;
+    if written < bytes.len() {
+      return Err(VfsError::Memory(slates_mem::MemError::ArenaExhausted {
+        requested: bytes.len().saturating_sub(written),
+        largest_free: store.content.arena().free_bytes(),
+      }));
+    }
+    Ok(())
+  }
+
+  /// The write applied to `body`, which it owns: the body it leaves, always whole — the original one when a refusal
+  /// came before any byte landed.
+  fn write_body(&mut self, store: &mut Store, body: Body, off: u64, bytes: &[u8]) -> Landed {
+    let len = bytes.len();
+    let end = off.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
     let inline_limit = u64::try_from(store.inline_bytes).unwrap_or(0);
     let epoch = self.epoch;
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
-    let before = content_by_epoch(store, handle);
-    let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
-    let new_body = match body {
+    let refused = |body: Body, refusal: VfsError| Landed {
+      body,
+      written: 0,
+      refused: Some(refusal),
+    };
+    match body {
       Body::Inline(mut v) if end <= inline_limit => {
         let at = usize::try_from(off).unwrap_or(0);
         let e = usize::try_from(end).unwrap_or(0);
         if v.len() < e {
           v.resize(e, 0);
         }
-        v[at..e].copy_from_slice(bytes);
-        Body::Inline(v)
+        if let Some(target) = v.get_mut(at..e) {
+          target.copy_from_slice(bytes);
+        }
+        Landed {
+          body: Body::Inline(v),
+          written: len,
+          refused: None,
+        }
       }
       Body::Inline(v) => {
         // Spill the inline bytes into an open extent sized to what window 0 will hold — the inline
@@ -4688,39 +4790,85 @@ impl Volume {
         } else {
           inline_len
         };
-        let mut open = store
+        let mut open = match store
           .content
-          .open(0, usize::try_from(window_zero).unwrap_or(0), epoch)?;
-        store.content.write_open(&mut open, 0, &v)?;
-        let mut sealed = Vec::new();
-        self.write_into(store, &mut open, &mut sealed, off, bytes)?
-      }
-      Body::Sealed(mut sealed) => {
-        let mut open = self.open_window(store, &mut sealed, off, bytes.len())?;
-        self.write_into(store, &mut open, &mut sealed, off, bytes)?
-      }
-      Body::Open {
-        mut open,
-        mut sealed,
-      } => self.write_into(store, &mut open, &mut sealed, off, bytes)?,
-      Body::Base(mut b) => {
-        // The touched windows were pinned by `Overlay::write`; the write goes into them, and
-        // beyond the base's bytes into fresh windows, then everything seals back into `pinned`.
-        let mut open = self.open_window(store, &mut b.pinned, off, bytes.len())?;
-        let written = self.write_into(store, &mut open, &mut b.pinned, off, bytes)?;
-        if let Body::Open { open, sealed } = written {
-          b.pinned = sealed;
-          if let Some(e) = store.content.seal(open)? {
-            insert_extent(&mut b.pinned, e);
-          }
+          .open(0, usize::try_from(window_zero).unwrap_or(0), epoch)
+        {
+          Ok(open) => open,
+          Err(refusal) => return refused(Body::Inline(v), refusal),
+        };
+        if let Err(refusal) = store.content.write_open(&mut open, 0, &v) {
+          let _ = store.content.release_open(open);
+          return refused(Body::Inline(v), refusal);
         }
-        Body::Base(b)
+        let mut sealed = Vec::new();
+        self.write_into(store, open, &mut sealed, off, bytes)
       }
-      other => other,
+      Body::Sealed(mut sealed) => match self.open_window(store, &mut sealed, off, len) {
+        Ok(open) => self.write_into(store, open, &mut sealed, off, bytes),
+        Err(refusal) => refused(Body::Sealed(sealed), refusal),
+      },
+      Body::Open { open, mut sealed } => self.write_into(store, open, &mut sealed, off, bytes),
+      Body::Base(b) => self.write_base(store, b, off, bytes),
+      other => Landed {
+        body: other,
+        written: len,
+        refused: None,
+      },
+    }
+  }
+
+  /// A write into a base-backed body (§4.5): the touched windows were pinned by `Overlay::write`; the write goes into
+  /// them, and beyond the base's bytes into fresh windows, then everything seals back into `pinned`. A base body has
+  /// no open extent, so the windows this write can seal are checked against the chunk slab first: one it could not
+  /// seal would have nowhere to stay.
+  fn write_base(&mut self, store: &mut Store, mut b: BaseBody, off: u64, bytes: &[u8]) -> Landed {
+    let chunk = u64::try_from(store.content.chunk_bytes())
+      .unwrap_or(u64::MAX)
+      .max(1);
+    let end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+    let windows = end
+      .saturating_sub(1)
+      .saturating_div(chunk)
+      .saturating_sub(off / chunk)
+      .saturating_add(1);
+    if u64::try_from(store.content.chunk_room()).unwrap_or(u64::MAX) < windows {
+      return Landed {
+        body: Body::Base(b),
+        written: 0,
+        refused: Some(VfsError::Memory(slates_mem::MemError::SlabFull {
+          capacity: store.content.chunk_capacity(),
+        })),
+      };
+    }
+    let open = match self.open_window(store, &mut b.pinned, off, bytes.len()) {
+      Ok(open) => open,
+      Err(refusal) => {
+        return Landed {
+          body: Body::Base(b),
+          written: 0,
+          refused: Some(refusal),
+        };
+      }
     };
-    store.inodes.get_mut(handle)?.body = new_body;
-    self.reconcile(before, content_by_epoch(store, handle));
-    Ok(())
+    let mut pinned = std::mem::take(&mut b.pinned);
+    let landed = self.write_into(store, open, &mut pinned, off, bytes);
+    match landed.body {
+      Body::Open { open, sealed } => {
+        b.pinned = sealed;
+        // The slab was checked for every window this write touches, so the seal has its record.
+        if let Ok(Some(e)) = store.content.seal(open) {
+          insert_extent(&mut b.pinned, e);
+        }
+      }
+      Body::Sealed(sealed) => b.pinned = sealed,
+      _ => {}
+    }
+    Landed {
+      body: Body::Base(b),
+      written: landed.written,
+      refused: landed.refused,
+    }
   }
 
   /// Moves the histogram from one by-epoch view of an inode's content to the next.
@@ -4753,7 +4901,14 @@ impl Volume {
       return store.content.open(window_start, want, epoch);
     };
     let e = sealed.remove(pos);
-    let open = store.content.reopen(&e, epoch)?;
+    let open = match store.content.reopen(&e, epoch) {
+      Ok(open) => open,
+      Err(refusal) => {
+        // Refused before anything changed: the window keeps its sealed extent.
+        sealed.insert(pos, e);
+        return Err(refusal);
+      }
+    };
     if let ExtentSrc::Chunk { chunk: c, .. } = e.src {
       let last = self.last_snapshot_epoch();
       let mut dead = Deadlist::default();
@@ -4766,40 +4921,55 @@ impl Volume {
   pub(crate) fn write_into(
     &mut self,
     store: &mut Store,
-    open: &mut OpenExtent,
+    open: OpenExtent,
     sealed: &mut Vec<Extent>,
     off: u64,
     bytes: &[u8],
-  ) -> Result<Body, VfsError> {
+  ) -> Landed {
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     let mut cursor = off;
     let mut remaining = bytes;
-    let mut current = *open;
+    let mut current = open;
+    let written = |cursor: u64| usize::try_from(cursor.saturating_sub(off)).unwrap_or(usize::MAX);
     while !remaining.is_empty() {
       // The open extent covers one chunk window; a write outside it seals the extent and
       // opens the cursor's window (reopening its sealed extent if it has one).
       let same_window = cursor >= current.off && cursor - current.off < chunk;
       if !same_window {
-        if let Some(e) = store.content.seal(current)? {
-          insert_extent(sealed, e);
+        match store.content.seal(current) {
+          Ok(Some(e)) => insert_extent(sealed, e),
+          Ok(None) => {}
+          // The open extent is still whole: the windows before it stay, and so does it.
+          Err(refusal) => return Landed::open(current, sealed, written(cursor), Some(refusal)),
         }
-        current = self.open_window(store, sealed, cursor, remaining.len())?;
+        current = match self.open_window(store, sealed, cursor, remaining.len()) {
+          Ok(next) => next,
+          // The previous window is sealed and the cursor's untouched: a body of sealed extents.
+          Err(refusal) => {
+            return Landed {
+              body: Body::Sealed(std::mem::take(sealed)),
+              written: written(cursor),
+              refused: Some(refusal),
+            };
+          }
+        };
       }
       let at = usize::try_from(cursor - current.off).unwrap_or(0);
       let room = usize::try_from(chunk)
         .unwrap_or(usize::MAX)
         .saturating_sub(at);
       let take = remaining.len().min(room);
-      store
+      if let Err(refusal) = store
         .content
-        .write_open(&mut current, at, &remaining[..take])?;
+        .write_open(&mut current, at, &remaining[..take])
+      {
+        // `write_open` refuses before it changes the extent (its block grows first, or not at all).
+        return Landed::open(current, sealed, written(cursor), Some(refusal));
+      }
       cursor += u64::try_from(take).unwrap_or(0);
       remaining = &remaining[take..];
     }
-    Ok(Body::Open {
-      open: current,
-      sealed: std::mem::take(sealed),
-    })
+    Landed::open(current, sealed, written(cursor), None)
   }
 
   pub(crate) fn apply_truncate(
@@ -4914,6 +5084,14 @@ pub(crate) struct ByEpoch {
 }
 
 impl ByEpoch {
+  /// An empty histogram with this one's floor.
+  fn emptied(&self) -> Self {
+    Self {
+      buckets: Vec::new(),
+      floor: self.floor,
+    }
+  }
+
   fn inherited(origin: Epoch, bytes: u64) -> Self {
     Self {
       buckets: vec![bytes],
@@ -4986,6 +5164,34 @@ pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epo
     }
     Body::Base(b) => b.pinned.iter().filter_map(sealed_block).collect(),
     _ => Vec::new(),
+  }
+}
+
+/// What a write landed (T-1.1): the body it leaves — whole and consistent however far it got — the bytes it
+/// wrote from its start, and the refusal that stopped it short, if one did. A refusal after some windows landed is a
+/// short write, as POSIX `write(2)` reports one; a refusal before any is the write's refusal.
+pub(crate) struct Landed {
+  body: Body,
+  written: usize,
+  refused: Option<VfsError>,
+}
+
+impl Landed {
+  /// A body whose open extent is `open` over `sealed`.
+  fn open(
+    open: OpenExtent,
+    sealed: &mut Vec<Extent>,
+    written: usize,
+    refused: Option<VfsError>,
+  ) -> Landed {
+    Landed {
+      body: Body::Open {
+        open,
+        sealed: std::mem::take(sealed),
+      },
+      written,
+      refused,
+    }
   }
 }
 
@@ -5117,7 +5323,8 @@ pub(crate) fn clip_extents(
 }
 
 /// A clipped extent, rebuilt into a fresh chunk of its new length's page multiple when its old
-/// chunk's block is larger (the old chunk released by the epoch rule); the extent itself otherwise.
+/// chunk's block is larger (the old chunk released by the epoch rule); the extent itself otherwise, and when the
+/// smaller block cannot be had now.
 fn rebuilt_if_smaller(
   store: &mut Store,
   clipped: Extent,
@@ -5133,8 +5340,19 @@ fn rebuilt_if_smaller(
   if store.content.block_bytes(need) >= block {
     return Ok(clipped);
   }
-  let open = store.content.reopen(&clipped, epoch)?;
-  let rebuilt = store.content.seal(open)?.unwrap_or(clipped);
+  // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
+  // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
+  let Ok(open) = store.content.reopen(&clipped, epoch) else {
+    return Ok(clipped);
+  };
+  let rebuilt = match store.content.seal(open) {
+    Ok(Some(rebuilt)) => rebuilt,
+    Ok(None) => clipped,
+    Err(_) => {
+      store.content.release_open(open)?;
+      return Ok(clipped);
+    }
+  };
   store.content.release_chunk(chunk, last, dead)?;
   Ok(rebuilt)
 }

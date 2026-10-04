@@ -86,10 +86,12 @@ fn ipc_names_survive_links_snapshots_clones_and_recovery() {
   assert_eq!(volume.stat(&store, pipe).unwrap().mode, 0o640);
   assert_eq!(clone.stat(&store, pipe).unwrap().mode, 0o600);
   let bytes = clone.to_image(&store, None).unwrap().to_content();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&store);
+  let claims = common::claims(&mut fresh, &[&VolumeImage::from_content(&bytes).unwrap()]);
   let recovered = Volume::from_image(
     &mut fresh,
     &VolumeImage::from_content(&bytes).unwrap(),
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -206,11 +208,13 @@ fn recovery_refuses_content_attached_to_an_ipc_name() {
     .body = BodyImage::Symlink {
     target: "host-endpoint".to_owned(),
   };
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&store);
+  let claims = common::claims(&mut fresh, &[&image]);
   assert!(matches!(
     Volume::from_image(
       &mut fresh,
       &image,
+      &claims,
       Box::new(StepClock::new(0, 1)),
       1 << 16,
       None

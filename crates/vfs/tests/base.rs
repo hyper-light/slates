@@ -96,24 +96,30 @@ fn an_unvisited_overlay_recovers_its_verified_source() {
   );
   let image = vol.to_image(&store, Some(&mut host)).unwrap();
   let root = host.root();
+  let mut after = common::surviving(&store);
+  let claims = common::claims(&mut after, &[&image]);
   let mut recovered = Volume::from_image(
-    &mut store,
+    &mut after,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 20,
     Some((&mut host, root)),
   )
   .unwrap();
   assert_eq!(
-    read_all(&mut recovered, &mut host, &mut store, "/unvisited").unwrap(),
+    read_all(&mut recovered, &mut host, &mut after, "/unvisited").unwrap(),
     b"must not disappear"
   );
   host.advance_ns(2);
   host.replace_file("/other", b"changed directory");
+  let mut again = common::surviving(&store);
+  let claims = common::claims(&mut again, &[&image]);
   assert!(matches!(
     Volume::from_image(
-      &mut store,
+      &mut again,
       &image,
+      &claims,
       Box::new(StepClock::new(0, 1)),
       1 << 20,
       Some((&mut host, root))
@@ -178,11 +184,13 @@ fn an_overlay_recovers_its_private_state_and_refuses_source_drift() {
   let image = vol.to_image(&before, Some(&mut host)).unwrap();
   let encoded = image.to_content();
   let image = slates_vfs::recover::VolumeImage::from_content(&encoded).unwrap();
-  let mut after = store();
+  let mut after = common::surviving(&before);
   let root = host.root();
+  let claims = common::claims(&mut after, &[&image]);
   let mut recovered = Volume::from_image(
     &mut after,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 20,
     Some((&mut host, root)),
@@ -1601,11 +1609,13 @@ fn a_recovered_snapshot_keeps_the_witnesses_it_froze() {
   let head = vol.base_plane().unwrap().witness(lib);
   let image = vol.to_image(&store, Some(&mut host)).unwrap();
   let image = slates_vfs::recover::VolumeImage::from_content(&image.to_content()).unwrap();
-  let mut after = common::store();
+  let mut after = common::surviving(&store);
   let root = host.root();
+  let claims = common::claims(&mut after, &[&image]);
   let recovered = Volume::from_image(
     &mut after,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 20,
     Some((&mut host, root)),

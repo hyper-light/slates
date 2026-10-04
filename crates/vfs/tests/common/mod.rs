@@ -97,3 +97,40 @@ pub(crate) fn clone_config(prefix: u16) -> VolumeConfig {
     clock: Box::new(StepClock::new(0, 1)),
   }
 }
+
+/// The store a daemon restart rebuilds into (A-64): `fresh`, its arena regions holding the bytes `old`'s held,
+/// at the same offsets — the anchor's RAM survives the daemon, and a recovered image names blocks in it. The
+/// regions must be the same shape (the same fixture).
+pub(crate) fn surviving_into(old: &Store, mut fresh: Store) -> Store {
+  let regions = old.content.arena().regions();
+  for index in 0..regions {
+    let index = u16::try_from(index).unwrap();
+    let bytes = old
+      .content
+      .arena()
+      .region(index)
+      .map(|region| region.bytes().to_vec())
+      .unwrap();
+    fresh
+      .content
+      .arena_mut()
+      .region_mut(index)
+      .unwrap()
+      .bytes_mut()
+      .copy_from_slice(&bytes);
+  }
+  fresh
+}
+
+/// [`surviving_into`] a fresh [`store`].
+pub(crate) fn surviving(old: &Store) -> Store {
+  surviving_into(old, store())
+}
+
+/// The blocks `images` name, claimed in `store` before a rebuild (A-64).
+pub(crate) fn claims(
+  store: &mut Store,
+  images: &[&slates_vfs::recover::VolumeImage],
+) -> slates_vfs::recover::Claims {
+  slates_vfs::recover::Claims::prepare(store, images.iter().copied()).unwrap()
+}

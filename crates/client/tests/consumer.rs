@@ -390,13 +390,10 @@ fn a_client_holding_a_consumer_identity_binds_again_by_itself_after_a_daemon_res
   drop(segment);
 }
 
-/// The anchor's segment the test holds across both daemons, with its content object sized as the
-/// client's restart test sizes it: two reserve-sized slots per shard (the recovery image is a double
-/// buffer) times the partitions, lazily backed.
+/// The anchor's segment the test holds across both daemons, with its content object sized as the anchor
+/// sizes it (`DaemonConfig::content_bytes`), lazily backed.
 fn restart_segment(name: &str, profile: &MachineProfile, config: &DaemonConfig) -> AnchorSegment {
-  let content_bytes = usize::try_from(config.reserve_per_shard).unwrap_or(usize::MAX)
-    * 2
-    * usize::from(config.geometry.partitions.max(1));
+  let content_bytes = config.content_bytes();
   AnchorSegment::create(
     &format!("slates-seg-{name}"),
     &profile.facts.identity,

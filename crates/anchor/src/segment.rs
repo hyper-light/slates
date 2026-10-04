@@ -266,6 +266,14 @@ impl AnchorSegment {
   /// none was provided (a build or config without anchor-backed storage). The parse mirrors the
   /// metadata handoff: a descriptor on Linux, a name elsewhere.
   pub fn open_content(env: &[(String, String)]) -> Option<Result<SparseObject, AnchorError>> {
+    let (handoff, len) = Self::content_handoff_in(env)?;
+    Some(SparseObject::open(&handoff, len, Words::new()).map_err(AnchorError::from))
+  }
+
+  /// The content object's handoff and length as the anchor gave them in the daemon's `env`, or `None` when
+  /// none was provided: what [`AnchorSegment::open_content`] opens, and what a shard maps its arena range of
+  /// (A-64).
+  pub fn content_handoff_in(env: &[(String, String)]) -> Option<(Handoff, usize)> {
     let raw = env.iter().find(|(k, _)| k == ENV_CONTENT).map(|(_, v)| v)?;
     let len: usize = env
       .iter()
@@ -275,7 +283,7 @@ impl AnchorSegment {
       Ok(fd) if cfg!(target_os = "linux") => Handoff::Descriptor(fd),
       _ => Handoff::Name(raw.clone()),
     };
-    Some(SparseObject::open(&handoff, len, Words::new()).map_err(AnchorError::from))
+    Some((handoff, len))
   }
 
   /// Attaches to a segment another process created, from its handoff and length, checking

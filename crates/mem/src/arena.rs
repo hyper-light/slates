@@ -114,7 +114,7 @@ impl ChunkArena {
     self.slots.len()
   }
 
-  /// Bytes currently allocated.
+  /// Bytes currently allocated, deferred frees included (A-64: they stay allocated until a publication commits).
   pub const fn allocated_bytes(&self) -> usize {
     self.allocated_bytes
   }
@@ -225,9 +225,92 @@ impl ChunkArena {
       .slots
       .get_mut(usize::from(extent.region))
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
-    slot.buddy.free(extent.block)?;
-    self.allocated_bytes = self.allocated_bytes.saturating_sub(extent.len());
+    let before = slot.buddy.free_bytes();
+    slot.buddy.free_or_defer(extent.block)?;
+    let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     Ok(())
+  }
+
+  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding
+  /// the blocks its image names). Refused as [`crate::buddy::Buddy::claim`] refuses, or `NoSuchRegion`.
+  pub fn claim(&mut self, region: u16, offset: usize, len: usize) -> Result<Extent, MemError> {
+    let arena = self
+      .identity
+      .ok_or(MemError::GenerationExhausted { index: u32::MAX })?;
+    let slot = self
+      .slots
+      .get_mut(usize::from(region))
+      .ok_or(MemError::ForeignExtent {
+        offset,
+        len,
+        reason: ExtentRefusal::NoSuchRegion,
+      })?;
+    let block = slot.buddy.claim(offset, len)?;
+    self.allocated_bytes = self.allocated_bytes.saturating_add(block.len());
+    Ok(Extent {
+      arena,
+      region,
+      block,
+    })
+  }
+
+  /// Whether `count` blocks of `len` bytes can be allocated now, across the regions (T-1.1: a whole-value write is
+  /// checked before anything changes).
+  pub fn can_allocate(&self, count: usize, len: usize) -> bool {
+    let mut left = count;
+    for slot in &self.slots {
+      left = left.saturating_sub(slot.buddy.allocatable(left, len));
+    }
+    left == 0
+  }
+
+  /// Whether `extent` names a live block of this arena that is not waiting on a deferred free (A-64: the
+  /// recovery sweep frees a claimed block only once).
+  pub fn holds(&self, extent: Extent) -> bool {
+    self.identity == Some(extent.arena)
+      && self
+        .slots
+        .get(usize::from(extent.region))
+        .is_some_and(|slot| slot.buddy.holds(extent.block))
+  }
+
+  /// Bytes freed but held until the next publication commits, because the committed recovery image may name
+  /// them (A-64). An allocation refused while this is not zero can succeed after a publication.
+  pub fn deferred_bytes(&self) -> usize {
+    self.slots.iter().map(|s| s.buddy.deferred_bytes()).sum()
+  }
+
+  /// A recovery publication starts: every live block it may name is recorded, and a free of one is deferred
+  /// until the publication commits or is abandoned (A-64).
+  pub fn capture(&mut self) {
+    self.slots.iter_mut().for_each(|s| s.buddy.capture());
+  }
+
+  /// The publication of the last [`ChunkArena::capture`] committed: frees every deferred block the new image
+  /// cannot name.
+  pub fn commit_capture(&mut self) {
+    self.settle(Buddy::commit_capture);
+  }
+
+  /// The publication of the last [`ChunkArena::capture`] did not commit: frees what only it could have named.
+  pub fn abandon_capture(&mut self) {
+    self.settle(Buddy::abandon_capture);
+  }
+
+  /// Every live block is named by the committed image: the state after a recovery claimed its image's blocks.
+  pub fn commit_live(&mut self) {
+    self.settle(Buddy::commit_live);
+  }
+
+  /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total.
+  fn settle(&mut self, step: fn(&mut Buddy)) {
+    for slot in &mut self.slots {
+      let before = slot.buddy.free_bytes();
+      step(&mut slot.buddy);
+      let released = slot.buddy.free_bytes().saturating_sub(before);
+      self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+    }
   }
 
   /// The bytes the arena's regions map — the address space taken, which the buddy's usable
@@ -253,6 +336,11 @@ impl ChunkArena {
       .region
       .bytes_mut()
       .get_mut(extent.offset()..extent.offset().checked_add(extent.len())?)
+  }
+
+  /// A region, read-only.
+  pub fn region(&self, index: u16) -> Option<&Region> {
+    self.slots.get(usize::from(index)).map(|s| &s.region)
   }
 
   /// A region, for the locking sequence and the pre-fault scheduler.
@@ -345,6 +433,47 @@ mod tests {
       arena.alloc(1),
       Err(MemError::ArenaExhausted {
         largest_free: 0,
+        ..
+      })
+    ));
+  }
+
+  /// A-64 at the arena. Do: allocate a block in the second region, commit a capture, free it, and claim its
+  /// neighbour in a fresh arena's same region. Expect: the free is deferred (still allocated, counted
+  /// deferred), the next commit releases it; the claim lands exactly where named, and a claim in a region the
+  /// arena lacks is refused `NoSuchRegion`.
+  #[test]
+  fn a_deferred_free_stays_allocated_until_the_commit_and_a_claim_lands_where_named() {
+    let p = page();
+    let mut arena = two_regions(p);
+    let _fill = arena.alloc(p * 4).unwrap();
+    let block = arena.alloc(p).unwrap();
+    assert_eq!(block.region(), 1);
+    arena.capture();
+    arena.commit_capture();
+    arena.free(block).unwrap();
+    assert_eq!(arena.deferred_bytes(), p);
+    assert_eq!(
+      arena.allocated_bytes(),
+      p * 5,
+      "a deferred block is still allocated"
+    );
+    arena.capture();
+    arena.commit_capture();
+    assert_eq!(arena.deferred_bytes(), 0);
+    assert_eq!(arena.allocated_bytes(), p * 4);
+
+    let mut rebuilt = two_regions(p);
+    let claimed = rebuilt.claim(1, p * 2, p * 2).unwrap();
+    assert_eq!(
+      (claimed.region(), claimed.offset(), claimed.len()),
+      (1, p * 2, p * 2)
+    );
+    assert_eq!(rebuilt.allocated_bytes(), p * 2);
+    assert!(matches!(
+      rebuilt.claim(2, 0, p),
+      Err(MemError::ForeignExtent {
+        reason: ExtentRefusal::NoSuchRegion,
         ..
       })
     ));

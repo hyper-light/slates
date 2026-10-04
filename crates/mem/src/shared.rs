@@ -214,6 +214,33 @@ impl ExclusiveObject {
     ExclusiveObject(object)
   }
 
+  /// The bytes `[offset, offset + len)` of the object `handoff` names, mapped on their own, as storage no
+  /// one else reaches (A-64: one shard's arena range of the anchor's content object). `offset` must be a
+  /// multiple of [`mapping_granule`] (refused [`MemError::OutOfRange`] otherwise), and the system refuses a span
+  /// past the object. On Windows
+  /// the range is committed whole when it is mapped.
+  ///
+  /// # Safety
+  ///
+  /// As for [`ExclusiveObject::new`], for these bytes: while this value lives, no other mapping in any process
+  /// reaches `[offset, offset + len)`. Other views of the object may exist, provided they never touch this
+  /// range: the daemon's copies of the content object reach its write log and image slots only, and the
+  /// anchor that keeps the object never touches its bytes.
+  pub unsafe fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<ExclusiveObject, MemError> {
+    // Checked here, the same on every platform: Unix's map would round the offset down and Windows refuses it.
+    let granule = platform::mapping_granule()?;
+    if !offset.is_multiple_of(granule.max(1)) {
+      return Err(MemError::OutOfRange { offset, len });
+    }
+    let words = Words::new().layout(len)?;
+    let inner = platform::open_range(handoff, offset, len)?;
+    Ok(ExclusiveObject(SharedObject { inner, len, words }))
+  }
+
   /// The whole map.
   pub fn bytes(&self) -> &[u8] {
     self.0.inner.bytes()
@@ -233,6 +260,12 @@ impl ExclusiveObject {
   pub fn lock(&mut self) -> Result<(), MemError> {
     self.0.lock()
   }
+}
+
+/// The granule a mapping's offset must be a multiple of: the base page on Unix, the allocation granularity on
+/// Windows. A range [`ExclusiveObject::open_range`] maps starts on one.
+pub fn mapping_granule() -> Result<usize, MemError> {
+  platform::mapping_granule()
 }
 
 /// A shared memory object backed only where it is touched (see the module doc): the anchor segment and
@@ -545,14 +578,20 @@ mod platform {
     }
   }
 
-  fn map(fd: &OwnedFd, len: usize) -> Result<MmapMut, MemError> {
+  fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<MmapMut, MemError> {
+    let offset = u64::try_from(offset).map_err(|_| MemError::OsRefused {
+      call: "mmap",
+      code: None,
+    })?;
     // SAFETY: the object behind `fd` is a memory object this module created or opened by the
     // handoff its creator gave; by this module's rule no process truncates it while a view
     // lives, and every concurrent word is reached through the atomic views. The map borrows
     // nothing that outlives it.
-    unsafe { MmapOptions::new().len(len).map_mut(fd) }.map_err(|e| MemError::OsRefused {
-      call: "mmap",
-      code: e.raw_os_error(),
+    unsafe { MmapOptions::new().offset(offset).len(len).map_mut(fd) }.map_err(|e| {
+      MemError::OsRefused {
+        call: "mmap",
+        code: e.raw_os_error(),
+      }
     })
   }
 
@@ -565,7 +604,7 @@ mod platform {
     #[allow(clippy::disallowed_methods)] // the memory object: RAM, not a host path (R1).
     // structural: allow — sizing the memory object just created (no filesystem entry; D-10).
     rustix::fs::ftruncate(&created.fd, size).map_err(|e| refused("ftruncate", e))?;
-    let map = map(&created.fd, len)?;
+    let map = map(&created.fd, 0, len)?;
     Ok(Inner {
       map,
       fd: created.fd,
@@ -577,8 +616,17 @@ mod platform {
   }
 
   pub(super) fn open(handoff: &Handoff, len: usize) -> Result<Inner, MemError> {
+    open_range(handoff, 0, len)
+  }
+
+  /// `[offset, offset + len)` of the object `handoff` names, mapped on its own.
+  pub(super) fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<Inner, MemError> {
     let fd = open_object(handoff)?;
-    let map = map(&fd, len)?;
+    let map = map(&fd, offset, len)?;
     Ok(Inner {
       map,
       fd,
@@ -721,6 +769,11 @@ mod platform {
       call: "memory object",
       code: None,
     })
+  }
+
+  /// The offset granule of a mapping: the base page.
+  pub(super) fn mapping_granule() -> Result<usize, MemError> {
+    Ok(rustix::param::page_size())
   }
 
   /// A sparse object is the same object here: a `memfd` or `shm_open` page is backed on first touch.
@@ -874,9 +927,13 @@ mod platform {
     unsafe { CloseHandle(handle) };
   }
 
-  fn view(handle: HANDLE, len: usize) -> Result<*mut c_void, MemError> {
-    // SAFETY: a full read/write view of a section handle this module owns.
-    let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, len) };
+  fn view(handle: HANDLE, offset: usize, len: usize) -> Result<*mut c_void, MemError> {
+    let offset = u64::try_from(offset).unwrap_or(u64::MAX);
+    let high = u32::try_from(offset >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(offset & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    // SAFETY: a read/write view of `len` bytes at `offset` of a section handle this module owns; the
+    // system refuses (null) an offset off its allocation granularity or a span past the section.
+    let view = unsafe { MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, high, low, len) };
     if view.Value.is_null() {
       let err = os("MapViewOfFile");
       close(handle);
@@ -935,7 +992,7 @@ mod platform {
         code: i32::try_from(ERROR_ALREADY_EXISTS).ok(),
       });
     }
-    let view = view(handle, len)?;
+    let view = view(handle, 0, len)?;
     Ok(Inner {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),
@@ -945,6 +1002,28 @@ mod platform {
   }
 
   pub(super) fn open(handoff: &Handoff, len: usize) -> Result<Inner, MemError> {
+    open_view(handoff, 0, len)
+  }
+
+  /// `[offset, offset + len)` of the section `handoff` names, mapped on its own and committed whole: a
+  /// sparse section's pages are not readable until committed, and an exclusive range is reached by
+  /// reference, so it cannot commit page by page as the copies do.
+  pub(super) fn open_range(
+    handoff: &Handoff,
+    offset: usize,
+    len: usize,
+  ) -> Result<Inner, MemError> {
+    let inner = open_view(handoff, offset, len)?;
+    Commits::new(len)?.commit(&inner, 0, len)?;
+    Ok(inner)
+  }
+
+  /// The offset granule of a mapping: the allocation granularity.
+  pub(super) fn mapping_granule() -> Result<usize, MemError> {
+    Commits::new(0).map(|commits| commits.granule)
+  }
+
+  fn open_view(handoff: &Handoff, offset: usize, len: usize) -> Result<Inner, MemError> {
     let Handoff::Name(name) = handoff else {
       return Err(MemError::OsRefused {
         call: "handoff",
@@ -957,7 +1036,7 @@ mod platform {
     if handle.is_null() {
       return Err(os("OpenFileMappingW"));
     }
-    let view = view(handle, len)?;
+    let view = view(handle, offset, len)?;
     Ok(Inner {
       handle: handle.expose_provenance(),
       view: view.expose_provenance(),

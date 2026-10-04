@@ -389,9 +389,9 @@ fn assert_retained(store: &Store, vol: &Volume, bytes: u64, versions: u64, what:
 }
 
 /// T-A9 (byte retention, recovery): a rebuilt volume re-establishes its retention against the
-/// fresh shard's budget — the private copies its recovered snapshot holds and the bytes secured for
-/// an open-unlinked orphan — so the ledger balances right after `from_image`, and an orphan's later
-/// reclaim consumes what was secured.
+/// fresh shard's budget — what its recovered snapshot retains and the bytes secured for an
+/// open-unlinked orphan — exactly as the live shard charged it (A-64), so the ledger balances right
+/// after `from_image`, and an orphan's later reclaim matches the live volume's.
 #[test]
 fn recovery_re_establishes_the_retention_charge_including_an_orphans() {
   let mut source = store();
@@ -420,37 +420,40 @@ fn recovery_re_establishes_the_retention_charge_including_an_orphans() {
   );
   let image = vol.to_image(&source, None).unwrap();
 
-  let mut fresh = store();
+  let mut fresh = common::surviving(&source);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
   )
   .unwrap();
-  // The recovered snapshot holds private copies of what diverged from the head: f (two windows,
-  // its bytes changed) and g (one window — its version diverged when its link count went to zero,
-  // so recovery rebuilds it privately where the live volume's two versions shared one chunk). The
-  // orphan's own rebuilt window is born at the head's rebuild epoch, after the snapshot, so its
-  // reclaim will free it rather than retain it: the re-establishment secures nothing for it.
-  assert_eq!(recovered.retained_bytes(&fresh), 3 * chunk);
+  // The recovered volume holds what the live one held (A-64: the image names chunks, so the snapshot keeps
+  // sharing with the head every window the head did not rewrite, and each chunk keeps its birth epoch): one
+  // retained window (f's old window 0) and the window secured for the open-unlinked orphan g.
+  assert_eq!(
+    recovered.retained_bytes(&fresh),
+    vol.retained_bytes(&source)
+  );
   assert_eq!(
     fresh.budget.committed(),
-    3 * chunk,
-    "the retained copies are charged on the fresh shard; the orphan's window will be freed"
+    source.budget.committed(),
+    "the retention is re-established on the fresh shard exactly as the live shard charged it"
   );
   assert_eq!(
     fresh.versions.committed(),
     recovered.retained_versions(),
     "the version retention is re-established too"
   );
-  // The orphan's last close (no reference was restored, so this is it) reclaims it: its rebuilt
-  // window was born after the snapshot, so it is freed rather than retained, and the secured bytes
-  // return as surplus — the ledger balances either way.
+  // The orphan's last close (no reference was restored, so this is it) reclaims it as the live volume's
+  // would: the ledger balances, and the shard's charge is the live shard's after the same close.
   recovered.unreference(&mut fresh, g).unwrap();
+  vol.unreference(&mut source, g).unwrap();
   assert_balanced(&fresh, &recovered, "after the recovered orphan's reclaim");
-  assert_eq!(fresh.budget.committed(), 3 * chunk);
+  assert_eq!(fresh.budget.committed(), source.budget.committed());
 }
 
 /// T-1.1 for retention: a refused retention leaves nothing changed — not the accounting, not the

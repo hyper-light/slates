@@ -132,6 +132,16 @@ impl ChunkStore {
     self.chunk_bytes
   }
 
+  /// Chunk records the slab can still take (a seal takes one).
+  pub fn chunk_room(&self) -> usize {
+    self.chunks.room()
+  }
+
+  /// The chunk slab's capacity in records.
+  pub fn chunk_capacity(&self) -> usize {
+    self.chunks.max_slots()
+  }
+
   /// Chunks live.
   pub fn chunks(&self) -> usize {
     self.chunks.len()
@@ -164,11 +174,24 @@ impl ChunkStore {
     &mut self.arena
   }
 
+  /// Allocates a block of at least `len` bytes. An arena that is out of room while freed blocks wait for a
+  /// publication (A-64: the committed recovery image may name them) refuses [`VfsError::PublishNeeded`], not a
+  /// memory refusal: the room exists, and the shard's next publication releases it.
+  fn alloc(&mut self, len: usize) -> Result<Block, VfsError> {
+    match self.arena.alloc(len) {
+      Ok(block) => Ok(block),
+      Err(slates_mem::MemError::ArenaExhausted { .. }) if self.arena.deferred_bytes() > 0 => {
+        Err(VfsError::PublishNeeded)
+      }
+      Err(refusal) => Err(refusal.into()),
+    }
+  }
+
   /// Opens a new extent at `off` with room for at least `want` bytes (page-multiple, at most a
   /// chunk).
   pub fn open(&mut self, off: u64, want: usize, born: Epoch) -> Result<OpenExtent, VfsError> {
     let want = want.clamp(1, self.chunk_bytes);
-    let block = self.arena.alloc(want.next_multiple_of(self.page))?;
+    let block = self.alloc(want.next_multiple_of(self.page))?;
     Ok(OpenExtent {
       off,
       len: 0,
@@ -186,7 +209,7 @@ impl ChunkStore {
     if need > self.chunk_bytes {
       return Err(VfsError::FileTooLarge);
     }
-    let block = self.arena.alloc(need.next_multiple_of(self.page))?;
+    let block = self.alloc(need.next_multiple_of(self.page))?;
     let used = usize::try_from(open.len).unwrap_or(0);
     let mut carry = vec![0u8; used];
     if let Some(src) = self.arena.bytes(open.block) {
@@ -253,7 +276,11 @@ impl ChunkStore {
     if want >= open.block.len() {
       return Ok(());
     }
-    let block = self.arena.alloc(want)?;
+    // A smaller block is an economy, never a requirement: when the arena cannot give it now, the extent keeps its
+    // block, whose length its charge follows (`volume::content_by_epoch`).
+    let Ok(block) = self.alloc(want) else {
+      return Ok(());
+    };
     let mut carry = vec![0u8; keep];
     if let Some(src) = self.arena.bytes(open.block) {
       carry.copy_from_slice(&src[..keep]);
@@ -310,7 +337,11 @@ impl ChunkStore {
       .extent_bytes(extent)
       .map(<[u8]>::to_vec)
       .unwrap_or_else(|| vec![0u8; len]);
-    self.write_open(&mut open, 0, &bytes)?;
+    if let Err(refusal) = self.write_open(&mut open, 0, &bytes) {
+      // Refused whole: the block taken for the copy goes back.
+      self.arena.free(open.block)?;
+      return Err(refusal);
+    }
     Ok(open)
   }
 
@@ -342,9 +373,39 @@ impl ChunkStore {
     Ok(())
   }
 
+  /// Claims exactly the arena block a recovered image names (A-64); refused `RecoveryIncomplete` when no
+  /// allocation could have made it or another claim already holds any of it.
+  pub fn claim_block(&mut self, region: u16, offset: u64, len: u64) -> Result<Block, VfsError> {
+    let offset = usize::try_from(offset).map_err(|_| VfsError::RecoveryIncomplete)?;
+    let len = usize::try_from(len).map_err(|_| VfsError::RecoveryIncomplete)?;
+    self
+      .arena
+      .claim(region, offset, len)
+      .map_err(|_| VfsError::RecoveryIncomplete)
+  }
+
+  /// Records a recovered chunk over a claimed block (A-64); refused when its used bytes exceed the block.
+  pub fn adopt_chunk(&mut self, chunk: Chunk) -> Result<Handle<Chunk>, VfsError> {
+    if usize::try_from(chunk.len).map_or(true, |len| len > chunk.block.len()) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    Ok(self.chunks.insert(chunk)?)
+  }
+
+  /// Whether `block` is live and not waiting on a deferred free.
+  pub fn holds(&self, block: Block) -> bool {
+    self.arena.holds(block)
+  }
+
   /// Releases an open extent's block (the file was truncated or unlinked before sealing).
   pub fn release_open(&mut self, open: OpenExtent) -> Result<(), VfsError> {
     self.arena.free(open.block)?;
+    Ok(())
+  }
+
+  /// Releases a block no chunk or open extent holds (A-64: a recovery claim given back).
+  pub fn release_block(&mut self, block: Block) -> Result<(), VfsError> {
+    self.arena.free(block)?;
     Ok(())
   }
 }

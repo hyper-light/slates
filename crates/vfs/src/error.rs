@@ -82,6 +82,11 @@ pub enum VfsError {
   },
   /// A memory refusal beneath the volume (arena exhausted, slab full).
   Memory(slates_mem::MemError),
+  /// The arena is out of room while freed blocks wait for the shard's next recovery publication, which the
+  /// committed image may still name (A-64). Nothing changed; the operation succeeds once a publication commits.
+  /// The shard publishes before work whenever its free arena is below the operation headroom with blocks
+  /// deferred, so only one operation larger than the headroom can meet this.
+  PublishNeeded,
   /// A snapshot, submit or detach barrier could not close an attachment's generation: a request
   /// admitted into it is still in flight — a consumer lost mid-request, until its explicit
   /// failed-consumer cleanup (§4.4 A-9 `BarrierIncomplete{attachment, generation}`; §4.6 "A
@@ -118,7 +123,7 @@ impl VfsError {
       Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
-      Self::DigestUnverified => "EAGAIN",
+      Self::DigestUnverified | Self::PublishNeeded => "EAGAIN",
       Self::DigestCacheFull => "ENOSPC",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",

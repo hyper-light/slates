@@ -32,6 +32,7 @@ use slates_wire::Wire;
 use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::clock::Clock;
+use crate::content::{Chunk, Extent, ExtentSrc, OpenExtent};
 use crate::dir::{Child, DirNode};
 use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo, SnapshotId};
@@ -58,10 +59,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// verified chunks after a warm restart; 10 (A-61, 2026-10-03) every recorded attachment's references, so a
 /// FUSE mount the anchor held gets its kernel's references back after a restart; 11 (A-61, 2026-10-03) the
 /// replies a barrier publishes with its effect, so a request the dead daemon applied and never answered is
-/// answered from the record, never applied twice.
+/// answered from the record, never applied twice; 12 (A-64, 2026-10-03) a file's body names its chunks and open
+/// extent by their blocks in the shard's arena range instead of carrying its bytes, so a barrier costs the
+/// shard's metadata, not its content.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 11;
+const IMAGE_VERSION: u16 = 12;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -170,11 +173,10 @@ pub struct EntryImage {
   pub child: Option<u64>,
 }
 
-/// An inode's body reduced to its recoverable content (§4.5 `Body`): a directory becomes its
-/// entries; a file becomes the runs of bytes it holds, at their offsets (whether they were inline,
-/// sealed in chunks or in an open extent — the read path serves them the same), everything else
-/// up to its size being a hole; a symlink becomes its target. `Empty` is a file with no content
-/// yet.
+/// An inode's body as the store holds it (§4.5 `Body`, A-64): a directory becomes its entries; a file's
+/// inline bytes are carried, while its sealed chunks and open extent are named by their blocks in the shard's
+/// arena range, whose bytes live in anchor RAM and survive the daemon; a symlink becomes its target. `Empty`
+/// is a body with no content yet.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub enum BodyImage {
   /// No content yet.
@@ -188,22 +190,24 @@ pub enum BodyImage {
     /// The original base path of an overlay directory rename.
     origin: Option<String>,
   },
-  /// A file's held bytes as runs at their offsets, ascending and non-overlapping; what no run
-  /// covers, up to the inode's size, is a hole (zeros). So a sparse file images as what it holds,
-  /// never as its logical length: before 2026-09-15 this was one vector of the whole length, and a
-  /// file extended to 999,999,999,999,999 bytes (pjdfstest `truncate/12.t`) sized a petabyte
-  /// allocation at the barrier and aborted the daemon
-  /// (`docs/bugs/2026-09-15-recovery-image-materializes-a-sparse-files-holes.md`).
-  File {
-    /// The runs.
-    runs: Vec<RunImage>,
+  /// Small content kept in the inode.
+  Inline {
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
+  /// Content in the arena: sealed extents, ascending and non-overlapping, and the open extent over them.
+  Chunked {
+    /// The sealed extents.
+    extents: Vec<ExtentImage>,
+    /// The open extent, written in place until sealed.
+    open: Option<OpenImage>,
   },
   /// A live base-backed file and the ranges already owned by the overlay.
   Base {
     /// The original observed source, independent of later source changes.
     witness: Option<crate::inode::Witness>,
     /// Private ranges, in ascending non-overlapping order.
-    pinned: Vec<PinnedImage>,
+    pinned: Vec<ExtentImage>,
     /// Source length before private extensions or truncations.
     base_len: u64,
     /// Unpinned reads already lost their source witness.
@@ -216,24 +220,70 @@ pub enum BodyImage {
   },
 }
 
-/// One run of a file's held bytes in an image: `bytes` at `offset`.
-#[derive(Clone, Debug, PartialEq, Eq, Wire)]
-pub struct RunImage {
-  /// The file offset.
+/// A block of the shard's arena (A-64): its region, its offset within it and its length (a power-of-two number
+/// of granules, as the buddy allocator hands out).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Wire)]
+pub struct BlockImage {
+  /// The arena region.
+  pub region: u16,
+  /// The offset within the region.
   pub offset: u64,
-  /// The bytes.
-  pub bytes: Vec<u8>,
+  /// The block's length.
+  pub len: u64,
 }
 
-/// One private base-file range; absent bytes represent an explicit zero extent.
-#[derive(Clone, Debug, PartialEq, Eq, Wire)]
-pub struct PinnedImage {
-  /// Offset within the file.
+/// A sealed chunk (§4.5 `Chunk`): its block, the bytes used from it, its birth epoch and its identity once
+/// computed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct ChunkImage {
+  /// The block holding the bytes.
+  pub block: BlockImage,
+  /// The bytes used, from the block's start.
+  pub used: u32,
+  /// The birth epoch.
+  pub born: u64,
+  /// BLAKE3 of the bytes, once computed.
+  pub identity: Option<[u8; 32]>,
+}
+
+/// Where a sealed extent's bytes are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub enum ExtentSourceImage {
+  /// Zeros.
+  Zero,
+  /// A chunk, from byte `at` within it.
+  Chunk {
+    /// The chunk.
+    chunk: ChunkImage,
+    /// The offset within the chunk.
+    at: u32,
+  },
+}
+
+/// A sealed extent: `len` bytes at file offset `offset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct ExtentImage {
+  /// The file offset.
   pub offset: u64,
-  /// Number of bytes represented.
+  /// The length.
   pub len: u64,
-  /// Owned bytes, or an allocation-free zero range.
-  pub bytes: Option<Vec<u8>>,
+  /// The source.
+  pub source: ExtentSourceImage,
+}
+
+/// An open extent: `len` bytes of `block` at file offset `offset`, written in place until sealed. The block's
+/// bytes past `len` may hold writes made after this image (A-64); none is served, since reads stop at `len` and
+/// a write zero-fills any gap it extends over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct OpenImage {
+  /// The file offset of the block's first byte.
+  pub offset: u64,
+  /// The bytes used.
+  pub len: u64,
+  /// The block.
+  pub block: BlockImage,
+  /// The block's birth epoch.
+  pub born: u64,
 }
 
 /// One inode in an image: its identity, attributes, home and body. The number is the volume-wide
@@ -837,7 +887,7 @@ impl Volume {
       (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
       (None, _) => None,
     };
-    let inodes = self.capture_tree(store, self.inode_root, None)?;
+    let inodes = self.capture_tree(store, self.inode_root)?;
     let snapshots = self.capture_snapshots(store)?;
     let root_no = store
       .dirs
@@ -873,21 +923,19 @@ impl Volume {
     })
   }
 
-  /// Captures every inode reachable from `inode_root`, in number order. File content is read through
-  /// `snapshot` when set (the snapshot's own bytes) or the head when `None` — the version at that
-  /// root, not the head's, which is what makes a snapshot's frozen content captured faithfully.
+  /// Captures every inode reachable from `inode_root`, in number order: the versions that root holds, so a
+  /// snapshot's frozen inodes are captured as frozen.
   fn capture_tree(
     &self,
     store: &Store,
     inode_root: Handle<TrieNode>,
-    snapshot: Option<SnapshotId>,
   ) -> Result<Vec<InodeImage>, VfsError> {
     let mut handles = Vec::new();
     trie::walk(&store.tries, inode_root, &mut handles);
     let mut inodes = Vec::with_capacity(handles.len());
     for handle in handles {
       let inode = store.inodes.get(handle)?;
-      inodes.push(self.image_of_inode(store, inode, snapshot)?);
+      inodes.push(self.image_of_inode(store, inode)?);
     }
     Ok(inodes)
   }
@@ -917,7 +965,7 @@ impl Volume {
       ) {
         // Directories are always carried in full; their entries are small and their structure is
         // this snapshot's own.
-        inodes.push(self.image_of_inode(store, inode, Some(id))?);
+        inodes.push(self.image_of_inode(store, inode)?);
         continue;
       }
       // A file or symlink whose handle is the head's very handle is CoW-shared with the head; the
@@ -931,7 +979,7 @@ impl Volume {
       }
       // A version that diverged from the head: dedup it against earlier snapshots by content. The
       // crc buckets the lookup; the body decides the match.
-      let image = self.image_of_inode(store, inode, Some(id))?;
+      let image = self.image_of_inode(store, inode)?;
       let crc = body_crc(&image.body);
       let bucket = canonical.entry((no.0, crc)).or_default();
       if let Some((src, _)) = bucket.iter().find(|(_, body)| *body == image.body) {
@@ -982,35 +1030,13 @@ impl Volume {
     Ok(out)
   }
 
-  /// The image of one inode, capturing its body faithfully or refusing an un-captured kind. File
-  /// content is read through `snapshot` when set (see [`Volume::capture_tree`]).
-  fn image_of_inode(
-    &self,
-    store: &Store,
-    inode: &Inode,
-    snapshot: Option<SnapshotId>,
-  ) -> Result<InodeImage, VfsError> {
+  /// The image of one inode, capturing its body faithfully or refusing an un-captured kind.
+  fn image_of_inode(&self, store: &Store, inode: &Inode) -> Result<InodeImage, VfsError> {
     let body = if let Body::Base(base) = &inode.body {
       let pinned = base
         .pinned
         .iter()
-        .map(|extent| {
-          let bytes = match extent.src {
-            crate::content::ExtentSrc::Zero => None,
-            crate::content::ExtentSrc::Chunk { .. } => Some(
-              store
-                .content
-                .extent_bytes(extent)
-                .ok_or(VfsError::RecoveryIncomplete)?
-                .to_vec(),
-            ),
-          };
-          Ok(PinnedImage {
-            offset: extent.off,
-            len: extent.len,
-            bytes,
-          })
-        })
+        .map(|extent| extent_image(store, extent))
         .collect::<Result<_, VfsError>>()?;
       BodyImage::Base {
         witness: base.witness,
@@ -1037,7 +1063,7 @@ impl Volume {
           },
           _ => return Err(VfsError::RecoveryIncomplete),
         },
-        Kind::File => self.file_body(store, inode, snapshot)?,
+        Kind::File => file_body_image(store, &inode.body)?,
         Kind::Fifo | Kind::Socket => BodyImage::Empty,
       }
     };
@@ -1117,79 +1143,72 @@ impl Volume {
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(entries)
   }
+}
 
-  /// A file inode's held bytes as runs — its inline bytes, its chunk-backed sealed extents and its
-  /// open extent ([`held_spans`]) — each read through the volume's own read path so inline, sealed
-  /// and open bodies are captured the same, from `snapshot` when set (its frozen bytes) or the head.
-  /// A hole (a zero extent, or the span past the last held byte up to the inode's size) is captured
-  /// as nothing: it costs no bytes in the volume and none in the image, which is what bounds an
-  /// image by the bytes a file holds rather than its length. An empty file (no content yet) images
-  /// as `Empty`.
-  fn file_body(
-    &self,
-    store: &Store,
-    inode: &Inode,
-    snapshot: Option<SnapshotId>,
-  ) -> Result<BodyImage, VfsError> {
-    let mut runs = Vec::new();
-    for (offset, len) in held_spans(&inode.body) {
-      let len = usize::try_from(len).map_err(|_| VfsError::FileTooLarge)?;
-      let mut bytes = vec![0u8; len];
-      let mut read = 0;
-      while read < len {
-        let at = offset.saturating_add(u64::try_from(read).map_err(|_| VfsError::FileTooLarge)?);
-        let got = match snapshot {
-          Some(id) => self.read_in_body(store, id, inode.no, at, &mut bytes[read..])?,
-          None => self.read_body(store, inode.no, at, &mut bytes[read..])?,
-        };
-        if got == 0 {
-          break;
-        }
-        read += got;
-      }
-      bytes.truncate(read);
-      if !bytes.is_empty() {
-        runs.push(RunImage { offset, bytes });
-      }
-    }
-    if runs.is_empty() {
-      return Ok(BodyImage::Empty);
-    }
-    Ok(BodyImage::File { runs })
+/// A block's image (A-64).
+fn block_image(block: &slates_mem::arena::Extent) -> BlockImage {
+  BlockImage {
+    region: block.region(),
+    offset: u64::try_from(block.offset()).unwrap_or(u64::MAX),
+    len: u64::try_from(block.len()).unwrap_or(u64::MAX),
   }
 }
 
-/// The spans `[offset, offset + len)` of a file body that hold bytes — its inline bytes, its
-/// chunk-backed sealed extents and its open extent — coalesced where they touch or overlap (the
-/// open extent shadows the sealed extents beneath it; the read path resolves which bytes are
-/// current, and one run per contiguous span keeps an identical file's image identical whatever its
-/// chunking), ascending by offset. A zero extent and the span past the last held byte are holes,
-/// and are not spans.
-fn held_spans(body: &Body) -> Vec<(u64, u64)> {
-  let mut spans: Vec<(u64, u64)> = match body {
-    Body::Inline(bytes) => vec![(0, u64::try_from(bytes.len()).unwrap_or(u64::MAX))],
-    body => body_extents(body)
-      .iter()
-      .filter(|extent| matches!(extent.src, crate::content::ExtentSrc::Chunk { .. }))
-      .map(|extent| (extent.off, extent.len))
-      .collect(),
-  };
-  if let Body::Open { open, .. } = body {
-    spans.push((open.off, open.len));
-  }
-  spans.retain(|(_, len)| *len > 0);
-  spans.sort_unstable();
-  let mut coalesced: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
-  for (offset, len) in spans {
-    let end = offset.saturating_add(len);
-    match coalesced.last_mut() {
-      Some((last_offset, last_len)) if offset <= last_offset.saturating_add(*last_len) => {
-        *last_len = end.saturating_sub(*last_offset).max(*last_len);
+/// A sealed extent's image: a chunk-backed one names its chunk's block, born epoch and identity (A-64).
+fn extent_image(store: &Store, extent: &Extent) -> Result<ExtentImage, VfsError> {
+  let source = match extent.src {
+    ExtentSrc::Zero => ExtentSourceImage::Zero,
+    ExtentSrc::Chunk { chunk, at } => {
+      let chunk = store
+        .content
+        .chunk(chunk)
+        .ok_or(VfsError::RecoveryIncomplete)?;
+      ExtentSourceImage::Chunk {
+        chunk: ChunkImage {
+          block: block_image(&chunk.block),
+          used: chunk.len,
+          born: chunk.born.0,
+          identity: chunk.identity,
+        },
+        at,
       }
-      _ => coalesced.push((offset, len)),
     }
+  };
+  Ok(ExtentImage {
+    offset: extent.off,
+    len: extent.len,
+    source,
+  })
+}
+
+/// A file's body image, as the store holds it (A-64): no byte is copied but inline content.
+fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
+  let extents = |sealed: &[Extent]| {
+    sealed
+      .iter()
+      .map(|extent| extent_image(store, extent))
+      .collect::<Result<Vec<_>, VfsError>>()
+  };
+  match body {
+    Body::None => Ok(BodyImage::Empty),
+    Body::Inline(bytes) => Ok(BodyImage::Inline {
+      bytes: bytes.clone(),
+    }),
+    Body::Sealed(sealed) => Ok(BodyImage::Chunked {
+      extents: extents(sealed)?,
+      open: None,
+    }),
+    Body::Open { open, sealed } => Ok(BodyImage::Chunked {
+      extents: extents(sealed)?,
+      open: Some(OpenImage {
+        offset: open.off,
+        len: open.len,
+        block: block_image(&open.block),
+        born: open.born.0,
+      }),
+    }),
+    Body::Directory(_) | Body::Symlink(_) | Body::Base(_) => Err(VfsError::RecoveryIncomplete),
   }
-  coalesced
 }
 
 /// The image reference for a snapshot id.
@@ -1269,9 +1288,9 @@ impl Volume {
   /// A volume rebuilt from a recovery image (§4.8, A-9), the other half of [`Volume::to_image`]. It
   /// is faithful: every inode is placed at its own number with its identity, attributes, home and
   /// body, so a client's file handle from before the restart still resolves; directories and their
-  /// entries are rebuilt, and file bytes are re-established through the volume's own write path, so
-  /// the arena, the chunk store and the quota accounting end in the same state a live volume would
-  /// hold. `clock` and `journal_bytes` are re-supplied, as they are on any construction; a dynamic
+  /// entries are rebuilt, and each file's body is placed over the blocks `claims` took for it in the arena
+  /// range, whose bytes survived the daemon (A-64), so no byte is copied; the head's content histogram is
+  /// recounted from the placed bodies. `clock` and `journal_bytes` are re-supplied, as they are on any construction; a dynamic
   /// quota is restored too (its source is the stateless [`BudgetGrowth`], so only its counters need
   /// travel), and its granted growth is re-acquired from the rebuilt budget by the caller.
   ///
@@ -1284,6 +1303,7 @@ impl Volume {
   pub fn from_image(
     store: &mut Store,
     image: &VolumeImage,
+    claims: &Claims,
     clock: Box<dyn Clock>,
     journal_bytes: usize,
     source: Option<(&mut dyn crate::host::HostFs, crate::host::HostDir)>,
@@ -1314,14 +1334,11 @@ impl Volume {
 
       // The head, into the shell's roots. Recovery places inodes by number (not `next_no`), so set the
       // live-inode count (§4.2) to the recovered head's inode count directly.
-      vol.rebuild_passes(store, &image.inodes, root_no, epoch)?;
+      vol.rebuild_passes(store, claims, &image.inodes, root_no, epoch)?;
       vol.live_inodes = u64::try_from(image.inodes.len()).unwrap_or(u64::MAX);
       // The head's live-entry count (built by rebuild_entries); snapshot rebuilds below run through the
       // same dir_insert and perturb it, so keep it and restore after (§4.2 namespace, head-reachable).
       let head_entries = vol.live_entries;
-      // The head's accounting is head-reachable content only; keep it aside so the snapshot rebuilds
-      // (which write through the same counters) do not perturb it.
-      let head_bytes = vol.bytes.clone();
 
       // The head's inode table and each inode's image, so a snapshot can share an inode it holds
       // unchanged with the head instead of rebuilding a private copy (§4.2 CoW-sharing efficiency).
@@ -1349,10 +1366,10 @@ impl Volume {
       let mut snapshots: Vec<&SnapshotImage> = image.snapshots.iter().collect();
       snapshots.sort_by_key(|s| (s.id.index, s.id.generation));
       for snap in &snapshots {
-        vol.rebuild_snapshot(store, snap, root_no, &refs)?;
+        vol.rebuild_snapshot(store, claims, snap, root_no, &refs)?;
       }
       vol.rebuild_deadlists(store, &snapshots)?;
-      vol.bytes = head_bytes;
+      vol.recount_head_bytes(store);
       vol.live_entries = head_entries;
       vol.last_snapshot = image.last_snapshot.map(to_snapshot_id);
       // Restore the orphan tracking (§4.8): the inodes are already rebuilt with the rest, and marking
@@ -1387,11 +1404,12 @@ impl Volume {
   }
 
   /// Runs the rebuild passes for one tree (the head or a snapshot) against the volume's current
-  /// roots and epoch: place every inode at its number, rebuild directory entries, fill file content
-  /// through the write path, then restore each inode's true identity.
+  /// roots and epoch: place every inode at its number with its body, rebuild directory entries, then
+  /// restore each inode's true identity.
   fn rebuild_passes(
     &mut self,
     store: &mut Store,
+    claims: &Claims,
     inodes: &[InodeImage],
     root_no: InodeNo,
     epoch: Epoch,
@@ -1399,9 +1417,8 @@ impl Volume {
     let kinds: BTreeMap<u64, KindImage> = inodes.iter().map(|i| (i.no, i.kind)).collect();
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
-    self.place_inodes(store, inodes, root_no, epoch, &mut dirs)?;
+    self.place_inodes(store, claims, inodes, root_no, epoch, &mut dirs)?;
     self.rebuild_entries(store, inodes, &kinds, &dirs)?;
-    self.fill_content(store, inodes)?;
     self.restore_identities(store, inodes)?;
     Ok(())
   }
@@ -1415,6 +1432,7 @@ impl Volume {
   fn rebuild_snapshot(
     &mut self,
     store: &mut Store,
+    claims: &Claims,
     snap: &SnapshotImage,
     root_no: InodeNo,
     refs: &SharingRefs,
@@ -1432,7 +1450,7 @@ impl Volume {
     store.inodes.get_mut(root_handle)?.body = Body::Directory(root_dir);
     self.root = root_dir;
 
-    let outcome = self.rebuild_snapshot_tree(store, snap, root_no, epoch, refs);
+    let outcome = self.rebuild_snapshot_tree(store, claims, snap, root_no, epoch, refs);
 
     let (root, inode_root) = (self.root, self.inode_root);
     self.quota = saved_quota;
@@ -1470,8 +1488,9 @@ impl Volume {
   /// snapshot's deadlist is the objects it reaches that the head no longer holds; a version shared
   /// across snapshots (CoW) must sit on exactly *one* snapshot's deadlist — the newest that holds it
   /// — so that `destroy_snapshot`'s migration frees it only when its oldest referencer is destroyed.
-  /// Processing newest first and skipping anything an already-processed (newer) snapshot claimed puts
-  /// each object where the live volume kept it, so a drop in any order neither leaks nor double-frees.
+  /// Processing newest first and skipping anything the head reaches or an already-processed (newer) snapshot
+  /// claimed puts each object where the live volume kept it, so a drop in any order neither leaks nor
+  /// double-frees.
   fn rebuild_deadlists(
     &mut self,
     store: &mut Store,
@@ -1480,6 +1499,18 @@ impl Volume {
     let mut order: Vec<&SnapshotImage> = snapshots.to_vec();
     order.sort_by_key(|s| std::cmp::Reverse(s.epoch));
     let mut claimed: HashSet<(Discriminant<Dead>, u32, u32)> = HashSet::new();
+    // Every chunk the head reaches is the head's, even under a snapshot's diverged inode: the images name
+    // chunks, so a diverged version and the head share every window the head did not rewrite (A-64), and the
+    // live volume released only the rewritten ones onto the deadlist.
+    let mut head_inodes = Vec::new();
+    trie::walk(&store.tries, self.inode_root, &mut head_inodes);
+    for handle in head_inodes {
+      if let Ok(inode) = store.inodes.get(handle) {
+        for dead in crate::volume::body_chunks(store, &inode.body) {
+          claimed.insert(dead_key(&dead));
+        }
+      }
+    }
     for snap in order {
       // Objects the head still holds are the head's, not this snapshot's; everything else the
       // snapshot reaches is a candidate, then filtered to what no newer snapshot already claimed.
@@ -1515,6 +1546,7 @@ impl Volume {
   fn rebuild_snapshot_tree(
     &mut self,
     store: &mut Store,
+    claims: &Claims,
     snap: &SnapshotImage,
     root_no: InodeNo,
     epoch: Epoch,
@@ -1557,52 +1589,23 @@ impl Volume {
       if no == root_no {
         continue;
       }
-      let body = body_for(store, image_inode, no, epoch, &mut dirs)?;
+      let body = body_for(store, claims, image_inode, no, epoch, &mut dirs)?;
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
     self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
-    self.fill_content(store, &snap.inodes)?;
-    self.seal_open_content(store, &snap.inodes)?;
     self.restore_identities(store, &snap.inodes)?;
-    Ok(())
-  }
-
-  /// Seals the open extent of each of a snapshot's private files after the content pass: a frozen
-  /// snapshot's content is immutable, so an open (in-place-writable) extent has no purpose there,
-  /// and only a sealed chunk can be listed on the snapshot's deadlist and counted as its retained
-  /// bytes (§4.2). The head's files keep their open last window, as the live volume's do.
-  fn seal_open_content(
-    &mut self,
-    store: &mut Store,
-    inodes: &[InodeImage],
-  ) -> Result<(), VfsError> {
-    for image_inode in inodes {
-      let no = InodeNo(image_inode.no);
-      let handle =
-        trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
-      let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
-      let sealed_body = match body {
-        Body::Open { open, mut sealed } => {
-          if let Some(extent) = store.content.seal(open)? {
-            crate::volume::insert_extent(&mut sealed, extent);
-          }
-          Body::Sealed(sealed)
-        }
-        other => other,
-      };
-      store.inodes.get_mut(handle)?.body = sealed_body;
-    }
     Ok(())
   }
 
   /// Pass one: place every non-root inode at its own number, born at the head epoch, with a fresh
   /// directory node (parent and name fixed up when the parent's entries are rebuilt), a symlink's
-  /// target, or an empty file body to be filled by the write path. The root already exists.
+  /// target, or a file's body over its claimed blocks. The root already exists.
   fn place_inodes(
     &mut self,
     store: &mut Store,
+    claims: &Claims,
     inodes: &[InodeImage],
     root_no: InodeNo,
     epoch: Epoch,
@@ -1613,7 +1616,7 @@ impl Volume {
       if no == root_no {
         continue;
       }
-      let body = body_for(store, image_inode, no, epoch, dirs)?;
+      let body = body_for(store, claims, image_inode, no, epoch, dirs)?;
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
@@ -1648,91 +1651,6 @@ impl Volume {
       for e in entries {
         let child = child_for(store, e, parent_no, kinds, dirs)?;
         self.dir_insert(store, parent, &e.name, child)?;
-      }
-    }
-    Ok(())
-  }
-
-  /// Pass three: fill every non-empty file's content through the write path, so the chunk store and
-  /// quota accounting end where a live write would leave them.
-  /// Fills each non-empty file's content through the write path, skipping inodes in `shared` (a
-  /// snapshot's files shared with the head already hold the head's content).
-  fn fill_content(&mut self, store: &mut Store, inodes: &[InodeImage]) -> Result<(), VfsError> {
-    for image_inode in inodes {
-      if let BodyImage::Base { pinned, .. } = &image_inode.body {
-        self.fill_base_pins(store, image_inode, pinned)?;
-      }
-      if let BodyImage::File { runs } = &image_inode.body {
-        self.fill_runs(store, image_inode, runs)?;
-      }
-    }
-    Ok(())
-  }
-
-  /// Writes a file image's runs through the write path, refusing an image whose runs are empty,
-  /// out of order, overlapping or past the inode's size (a corrupt image is a typed refusal, never a
-  /// silently different file). The span past the last run up to the size is a hole, which the
-  /// inode's restored size carries: the write path keeps the larger of the size it finds and the
-  /// bytes it lands.
-  fn fill_runs(
-    &mut self,
-    store: &mut Store,
-    inode: &InodeImage,
-    runs: &[RunImage],
-  ) -> Result<(), VfsError> {
-    let no = InodeNo(inode.no);
-    let mut previous_end = 0u64;
-    for run in runs {
-      let len = u64::try_from(run.bytes.len()).map_err(|_| VfsError::RecoveryIncomplete)?;
-      let end = run
-        .offset
-        .checked_add(len)
-        .ok_or(VfsError::RecoveryIncomplete)?;
-      if len == 0 || run.offset < previous_end || end > inode.attrs.size {
-        return Err(VfsError::RecoveryIncomplete);
-      }
-      previous_end = end;
-      self.write(store, no, run.offset, &run.bytes)?;
-    }
-    Ok(())
-  }
-
-  fn fill_base_pins(
-    &mut self,
-    store: &mut Store,
-    inode: &InodeImage,
-    pinned: &[PinnedImage],
-  ) -> Result<(), VfsError> {
-    let no = InodeNo(inode.no);
-    let mut previous_end = 0;
-    for extent in pinned {
-      let end = extent
-        .offset
-        .checked_add(extent.len)
-        .ok_or(VfsError::RecoveryIncomplete)?;
-      if extent.len == 0 || extent.offset < previous_end || end > inode.attrs.size {
-        return Err(VfsError::RecoveryIncomplete);
-      }
-      previous_end = end;
-      match &extent.bytes {
-        Some(bytes) => {
-          if u64::try_from(bytes.len()).ok() != Some(extent.len) {
-            return Err(VfsError::RecoveryIncomplete);
-          }
-          self.write(store, no, extent.offset, bytes)?;
-        }
-        None => {
-          let handle =
-            trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
-          let Body::Base(body) = &mut store.inodes.get_mut(handle)?.body else {
-            return Err(VfsError::RecoveryIncomplete);
-          };
-          body.pinned.push(crate::content::Extent {
-            off: extent.offset,
-            len: extent.len,
-            src: crate::content::ExtentSrc::Zero,
-          });
-        }
       }
     }
     Ok(())
@@ -1860,9 +1778,9 @@ fn dead_key(dead: &Dead) -> (Discriminant<Dead>, u32, u32) {
 /// are deduped); the arm exists to keep the match exhaustive.
 fn body_crc(body: &BodyImage) -> u32 {
   match body {
-    // The runs' offsets are part of the content (the same bytes at another offset are a different
-    // file), so the crc covers the body's canonical wire form, as for a base body.
-    BodyImage::File { .. } => crc32c(&body.to_bytes()),
+    // A chunked body's references and offsets are its identity (the same blocks at another offset are a
+    // different file), so the crc covers the body's canonical wire form, as for a base body.
+    BodyImage::Inline { .. } | BodyImage::Chunked { .. } => crc32c(&body.to_bytes()),
     BodyImage::Symlink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
@@ -1872,6 +1790,7 @@ fn body_crc(body: &BodyImage) -> u32 {
 
 fn body_for(
   store: &mut Store,
+  claims: &Claims,
   image_inode: &InodeImage,
   no: InodeNo,
   epoch: Epoch,
@@ -1893,21 +1812,319 @@ fn body_for(
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
       _ => Err(VfsError::RecoveryIncomplete),
     },
-    KindImage::File => match &image_inode.body {
-      BodyImage::Base {
-        witness,
-        base_len,
-        lost,
-        ..
-      } => Ok(Body::Base(crate::inode::BaseBody {
-        witness: *witness,
-        pinned: Vec::new(),
-        base_len: *base_len,
-        descriptor: None,
-        lost: *lost,
-      })),
-      _ => Ok(Body::Inline(Vec::new())),
-    },
+    KindImage::File => file_body_from_image(claims, &image_inode.body, image_inode.attrs.size),
+  }
+}
+
+/// A file's body over its claimed blocks (A-64), refusing one no volume could hold: content past the file's
+/// size, or sealed extents empty, out of order or overlapping (a corrupt image is a typed refusal, never a
+/// silently different file).
+fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<Body, VfsError> {
+  match body {
+    BodyImage::Empty => Ok(Body::None),
+    BodyImage::Inline { bytes } => {
+      if u64::try_from(bytes.len()).map_or(true, |len| len > size) {
+        return Err(VfsError::RecoveryIncomplete);
+      }
+      Ok(Body::Inline(bytes.clone()))
+    }
+    BodyImage::Chunked { extents, open } => {
+      let sealed = extents_from_image(claims, extents, size)?;
+      match open {
+        None => Ok(Body::Sealed(sealed)),
+        Some(open) => {
+          let end = open
+            .offset
+            .checked_add(open.len)
+            .ok_or(VfsError::RecoveryIncomplete)?;
+          if end > size {
+            return Err(VfsError::RecoveryIncomplete);
+          }
+          Ok(Body::Open {
+            open: claims.open(open)?,
+            sealed,
+          })
+        }
+      }
+    }
+    BodyImage::Base {
+      witness,
+      pinned,
+      base_len,
+      lost,
+    } => Ok(Body::Base(crate::inode::BaseBody {
+      witness: *witness,
+      pinned: extents_from_image(claims, pinned, size)?,
+      base_len: *base_len,
+      descriptor: None,
+      lost: *lost,
+    })),
+    BodyImage::Directory { .. } | BodyImage::Symlink { .. } => Err(VfsError::RecoveryIncomplete),
+  }
+}
+
+/// Sealed extents over their claimed chunks, checked ascending, non-overlapping, non-empty and within `size`.
+fn extents_from_image(
+  claims: &Claims,
+  extents: &[ExtentImage],
+  size: u64,
+) -> Result<Vec<Extent>, VfsError> {
+  let mut previous_end = 0u64;
+  let mut out = Vec::with_capacity(extents.len());
+  for extent in extents {
+    let end = extent
+      .offset
+      .checked_add(extent.len)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    if extent.len == 0 || extent.offset < previous_end || end > size {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    previous_end = end;
+    let src = match extent.source {
+      ExtentSourceImage::Zero => ExtentSrc::Zero,
+      ExtentSourceImage::Chunk { chunk, at } => ExtentSrc::Chunk {
+        chunk: claims.chunk(&chunk)?,
+        at,
+      },
+    };
+    out.push(Extent {
+      off: extent.offset,
+      len: extent.len,
+      src,
+    });
+  }
+  Ok(out)
+}
+
+/// What a claimed block holds (A-64).
+#[derive(Clone, Copy, Debug)]
+enum Held {
+  /// A sealed chunk, recorded in the chunk slab.
+  Chunk(Handle<Chunk>, ChunkImage),
+  /// An open extent's block.
+  Open(slates_mem::arena::Extent, OpenImage),
+}
+
+/// The blocks a shard's recovered images name, claimed in its arena before any volume is rebuilt (A-64). Every
+/// image is read first, so a block two volumes share (a clone and its origin's snapshot) is claimed once and
+/// both rebuilt bodies name one chunk, as the live store did. The claims are then committed (the image in the
+/// content object names them), so a block a refused volume's teardown frees is deferred, not reused, until a
+/// newer image commits. [`Claims::sweep`] frees every claimed block no rebuilt volume reaches.
+#[derive(Debug, Default)]
+pub struct Claims {
+  held: BTreeMap<(u16, u64), Held>,
+}
+
+impl Claims {
+  /// Claims every block `images` name and commits them. Refused `RecoveryIncomplete`, with every claim given
+  /// back, when a block is one no allocation could have made, overlaps another, or is named two different
+  /// ways (as a chunk and an open extent, or with different lengths).
+  pub fn prepare<'a>(
+    store: &mut Store,
+    images: impl IntoIterator<Item = &'a VolumeImage>,
+  ) -> Result<Claims, VfsError> {
+    let mut claims = Claims::default();
+    let mut claimed = Ok(());
+    'images: for image in images {
+      let snapshot_inodes = image.snapshots.iter().flat_map(|snap| snap.inodes.iter());
+      for inode in image.inodes.iter().chain(snapshot_inodes) {
+        claimed = claims.claim_body(store, &inode.body);
+        if claimed.is_err() {
+          break 'images;
+        }
+      }
+    }
+    if let Err(refusal) = claimed {
+      claims.give_back(store);
+      return Err(refusal);
+    }
+    store.content.arena_mut().commit_live();
+    Ok(claims)
+  }
+
+  /// The blocks claimed.
+  pub fn blocks(&self) -> usize {
+    self.held.len()
+  }
+
+  fn claim_body(&mut self, store: &mut Store, body: &BodyImage) -> Result<(), VfsError> {
+    match body {
+      BodyImage::Chunked { extents, open } => {
+        for extent in extents {
+          self.claim_extent(store, extent)?;
+        }
+        if let Some(open) = open {
+          self.claim_open(store, open)?;
+        }
+        Ok(())
+      }
+      BodyImage::Base { pinned, .. } => pinned
+        .iter()
+        .try_for_each(|extent| self.claim_extent(store, extent)),
+      _ => Ok(()),
+    }
+  }
+
+  fn claim_extent(&mut self, store: &mut Store, extent: &ExtentImage) -> Result<(), VfsError> {
+    let ExtentSourceImage::Chunk { chunk, at } = extent.source else {
+      return Ok(());
+    };
+    let end = u64::from(at)
+      .checked_add(extent.len)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    if end > u64::from(chunk.used) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let key = (chunk.block.region, chunk.block.offset);
+    match self.held.get(&key) {
+      Some(Held::Chunk(_, held)) if *held == chunk => Ok(()),
+      Some(_) => Err(VfsError::RecoveryIncomplete),
+      None => {
+        let block =
+          store
+            .content
+            .claim_block(chunk.block.region, chunk.block.offset, chunk.block.len)?;
+        let adopted = store.content.adopt_chunk(Chunk {
+          born: Epoch(chunk.born),
+          len: chunk.used,
+          block,
+          identity: chunk.identity,
+        });
+        let handle = match adopted {
+          Ok(handle) => handle,
+          Err(refusal) => {
+            let _ = store.content.release_block(block);
+            return Err(refusal);
+          }
+        };
+        self.held.insert(key, Held::Chunk(handle, chunk));
+        Ok(())
+      }
+    }
+  }
+
+  fn claim_open(&mut self, store: &mut Store, open: &OpenImage) -> Result<(), VfsError> {
+    if open.len > open.block.len {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    let key = (open.block.region, open.block.offset);
+    match self.held.get(&key) {
+      Some(Held::Open(_, held)) if held == open => Ok(()),
+      Some(_) => Err(VfsError::RecoveryIncomplete),
+      None => {
+        let block =
+          store
+            .content
+            .claim_block(open.block.region, open.block.offset, open.block.len)?;
+        // The bytes past the imaged length (writes made after this image) are never served: every read stops
+        // at the length and every write zero-fills a gap it extends over (`ChunkStore::write_open`).
+        self.held.insert(key, Held::Open(block, *open));
+        Ok(())
+      }
+    }
+  }
+
+  /// Gives back every claim of a refused preparation, before anything is committed.
+  fn give_back(&mut self, store: &mut Store) {
+    for (_, held) in std::mem::take(&mut self.held) {
+      let _ = match held {
+        Held::Chunk(handle, _) => store.content.free_chunk(handle),
+        Held::Open(block, _) => store.content.release_block(block),
+      };
+    }
+  }
+
+  fn chunk(&self, chunk: &ChunkImage) -> Result<Handle<Chunk>, VfsError> {
+    match self.held.get(&(chunk.block.region, chunk.block.offset)) {
+      Some(Held::Chunk(handle, held)) if held == chunk => Ok(*handle),
+      _ => Err(VfsError::RecoveryIncomplete),
+    }
+  }
+
+  fn open(&self, open: &OpenImage) -> Result<OpenExtent, VfsError> {
+    match self.held.get(&(open.block.region, open.block.offset)) {
+      Some(Held::Open(block, held)) if held == open => Ok(OpenExtent {
+        off: open.offset,
+        len: open.len,
+        block: *block,
+        born: Epoch(open.born),
+      }),
+      _ => Err(VfsError::RecoveryIncomplete),
+    }
+  }
+
+  /// Frees every claimed block that none of `volumes` reaches (A-64): a refused volume's, whatever its
+  /// teardown did not free. Deferred, since the committed image names them. Returns the blocks freed.
+  pub fn sweep<'a>(
+    self,
+    store: &mut Store,
+    volumes: impl IntoIterator<Item = &'a Volume>,
+  ) -> Result<usize, VfsError> {
+    let mut reached = BTreeSet::new();
+    for volume in volumes {
+      volume.blocks_reached(store, &mut reached);
+    }
+    let mut freed = 0usize;
+    for (key, held) in self.held {
+      if reached.contains(&key) {
+        continue;
+      }
+      match held {
+        Held::Chunk(handle, _) if store.content.chunk(handle).is_some() => {
+          store.content.free_chunk(handle)?;
+        }
+        Held::Open(block, _) if store.content.holds(block) => {
+          store.content.release_block(block)?;
+        }
+        Held::Chunk(..) | Held::Open(..) => continue,
+      }
+      freed = freed.saturating_add(1);
+    }
+    Ok(freed)
+  }
+}
+
+impl Volume {
+  /// Adds the arena block of every chunk and open extent this volume reaches — through its head, every
+  /// snapshot's tree and every deadlist — to `reached`, as (region, offset) (A-64, [`Claims::sweep`]).
+  pub(crate) fn blocks_reached(&self, store: &Store, reached: &mut BTreeSet<(u16, u64)>) {
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, self.inode_root, &mut handles);
+    let mut key = |block: &slates_mem::arena::Extent| {
+      reached.insert((
+        block.region(),
+        u64::try_from(block.offset()).unwrap_or(u64::MAX),
+      ));
+    };
+    for (_, snap) in self.snapshots.iter() {
+      trie::walk(&store.tries, snap.inode_root, &mut handles);
+      for dead in snap.deadlist.items() {
+        match dead {
+          Dead::Chunk(chunk, _) => {
+            if let Some(chunk) = store.content.chunk(*chunk) {
+              key(&chunk.block);
+            }
+          }
+          Dead::Inode(inode, _) => handles.push(*inode),
+          Dead::Dir(..) | Dead::DirBlock(..) | Dead::Trie(..) => {}
+        }
+      }
+    }
+    for handle in handles {
+      let Ok(inode) = store.inodes.get(handle) else {
+        continue;
+      };
+      if let Body::Open { open, .. } = &inode.body {
+        key(&open.block);
+      }
+      for extent in body_extents(&inode.body) {
+        if let ExtentSrc::Chunk { chunk, .. } = extent.src
+          && let Some(chunk) = store.content.chunk(chunk)
+        {
+          key(&chunk.block);
+        }
+      }
+    }
   }
 }
 

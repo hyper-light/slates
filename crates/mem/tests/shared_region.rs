@@ -77,3 +77,59 @@ fn content_in_a_shared_region_survives_the_writing_mapping_being_dropped() {
     "content in a shared region survives the writing mapping being dropped (a restart)"
   );
 }
+
+/// A-64 (a shard's arena range of the content object). Do: create a sparse object, as the anchor creates the
+/// content object; write a header into its first range by copy; map a later range alone, exclusively, put an
+/// arena's block there and write into it; drop that mapping and map the range again. Expect: the arena's
+/// bytes are there through the new mapping, at the offset the block names, and the header beside the range
+/// is still what the copy wrote.
+#[test]
+fn a_range_of_a_sparse_object_mapped_alone_keeps_its_bytes_across_a_remap() {
+  let granule = slates_mem::mapping_granule().unwrap();
+  let range = 4 * granule;
+  let object =
+    slates_mem::SparseObject::create(&object_name("range"), range * 3, Words::new()).unwrap();
+  let handoff = object.handoff().unwrap();
+  let mut object = object;
+  let header = b"the write log and image slots are reached by copy";
+  object.write(0, header).unwrap();
+
+  let at = 2 * range;
+  // SAFETY: nothing else reaches `[at, at + range)`: the object's own view is used only for its first range.
+  let mapped = unsafe { ExclusiveObject::open_range(&handoff, at, range) }.unwrap();
+  let mut arena = ChunkArena::new(PAGE);
+  arena.add_region(Region::shared(mapped, PAGE)).unwrap();
+  let block = arena.alloc(PAGE).unwrap();
+  let content = b"a chunk written once, in anchor RAM";
+  arena.bytes_mut(block).unwrap()[..content.len()].copy_from_slice(content);
+  let offset = block.offset();
+  drop(arena);
+
+  // SAFETY: the mapping that wrote the range is dropped; this is its only accessor now.
+  let remapped = unsafe { ExclusiveObject::open_range(&handoff, at, range) }.unwrap();
+  let region = Region::shared(remapped, PAGE);
+  assert_eq!(
+    &region.bytes()[offset..offset + content.len()],
+    content,
+    "the range keeps the arena's bytes across a remap"
+  );
+  let mut kept = vec![0u8; header.len()];
+  object.read(0, &mut kept).unwrap();
+  assert_eq!(kept, header, "the copied range beside it is untouched");
+}
+
+/// A-64. Do: map a range whose offset is not on the mapping granule. Expect: refused `OutOfRange` on every
+/// platform, never a mapping of other bytes (Unix's map would round the offset down).
+#[test]
+fn a_range_off_the_mapping_granule_is_refused() {
+  let granule = slates_mem::mapping_granule().unwrap();
+  let object =
+    slates_mem::SparseObject::create(&object_name("offgran"), granule * 4, Words::new()).unwrap();
+  let handoff = object.handoff().unwrap();
+  // SAFETY: nothing reaches the object's bytes; the mapping is refused before any exists.
+  let refused = unsafe { ExclusiveObject::open_range(&handoff, granule / 2, granule) };
+  assert!(
+    matches!(refused, Err(slates_mem::MemError::OutOfRange { .. })),
+    "{refused:?}"
+  );
+}

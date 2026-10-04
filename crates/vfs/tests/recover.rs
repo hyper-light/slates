@@ -42,12 +42,11 @@ use slates_vfs::clock::StepClock;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
-use slates_vfs::recover::RunImage;
 use slates_vfs::recover::{
   BodyImage, EntryImage, InodeImage, KeyedImage, KindImage, PolicyImage, ShardImage, SharedSource,
   VolumeImage,
 };
-use slates_vfs::volume::{Volume, VolumeConfig};
+use slates_vfs::volume::{Store, Volume, VolumeConfig};
 
 /// Shape: a content object comfortably larger than the built fixture's image (a 256 KiB file plus
 /// its metadata), so the frame fits with room to spare.
@@ -102,6 +101,7 @@ fn entry(image: &VolumeImage, dir: InodeNo, name: &str) -> u64 {
 /// A scratch volume with a small inline file, a multi-chunk file in a subdirectory, a symlink and a
 /// hard link, together with its captured image and the ids the assertions check.
 struct Built {
+  store: Store,
   image: VolumeImage,
   root: InodeNo,
   dir: InodeNo,
@@ -129,6 +129,7 @@ fn built() -> Built {
   vol.link_no(&mut store, dir, "small_alias", small).unwrap();
   let image = vol.to_image(&store, None).unwrap();
   Built {
+    store,
     image,
     root,
     dir,
@@ -182,31 +183,58 @@ fn to_image_captures_an_inline_files_bytes() {
   assert_eq!(small.attrs.mode & 0o777, 0o644);
   assert_eq!(
     small.body,
-    BodyImage::File {
-      runs: vec![RunImage {
-        offset: 0,
-        bytes: b"hello".to_vec()
-      }]
+    BodyImage::Inline {
+      bytes: b"hello".to_vec()
     }
   );
 }
 
-/// AC (§4.8): a multi-chunk file's every byte comes back through the read path, whole and in order.
+/// AC (§4.8, A-64): a multi-chunk file is imaged by reference. Do: capture a volume holding a 256 KiB file,
+/// then rebuild it over the surviving arena. Expect: the image's bytes are a small fraction of the file's (it
+/// names the chunks; it does not carry them), and the rebuilt file reads back every byte, whole and in order.
 #[test]
-fn to_image_captures_a_multi_chunk_files_bytes() {
+fn a_multi_chunk_file_is_imaged_by_reference_and_reads_back_whole() {
   let b = built();
   let big = inode(&b.image, b.big);
   assert_eq!(big.kind, KindImage::File);
-  assert_eq!(
-    big.body,
-    BodyImage::File {
-      runs: vec![RunImage {
-        offset: 0,
-        bytes: b.big_bytes.clone()
-      }]
-    },
-    "a chunked file's bytes are captured whole and in order, as one contiguous run"
+  assert!(
+    matches!(big.body, BodyImage::Chunked { .. }),
+    "{:?}",
+    big.body
   );
+  let content = b.image.to_content();
+  assert!(
+    content.len() < b.big_bytes.len() / 16,
+    "the image names the chunks, not their bytes: {} bytes for a {}-byte file",
+    content.len(),
+    b.big_bytes.len()
+  );
+  let mut fresh = common::surviving(&b.store);
+  let claims = common::claims(&mut fresh, &[&b.image]);
+  let vol = Volume::from_image(
+    &mut fresh,
+    &b.image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 16,
+    None,
+  )
+  .unwrap();
+  let mut got = vec![0u8; b.big_bytes.len()];
+  let mut read = 0;
+  while read < got.len() {
+    let n = vol
+      .read(
+        &fresh,
+        b.big,
+        u64::try_from(read).unwrap(),
+        &mut got[read..],
+      )
+      .unwrap();
+    assert!(n > 0, "the rebuilt file ends early at {read}");
+    read += n;
+  }
+  assert!(got == b.big_bytes, "every byte back, whole and in order");
 }
 
 /// AC (§4.8): a symlink's target is captured.
@@ -234,11 +262,13 @@ fn a_volume_rebuilt_from_its_image_is_faithful() {
   let original = b.image.to_content();
 
   // "Restart": a fresh store, rebuild the volume from the published image bytes.
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&b.store);
   let image = VolumeImage::from_content(&original).unwrap();
+  let claims = common::claims(&mut fresh, &[&image]);
   let vol = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -286,10 +316,12 @@ fn a_volume_survives_a_content_object_handoff() {
     .expect("the published image is present after the handoff");
 
   // Rebuild and read the bytes written before the "restart" through their original inode number.
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&b.store);
+  let claims = common::claims(&mut fresh, &[&image]);
   let vol = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -439,10 +471,12 @@ fn a_clone_recovers_inherited_and_diverged_content() {
     "a clone records its origin epoch"
   );
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -506,11 +540,14 @@ fn a_whole_shard_of_volumes_survives_a_content_object_handoff() {
     "both volumes recovered, in key order"
   );
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&original);
+  let images: Vec<&VolumeImage> = recovered.volumes.iter().map(|keyed| &keyed.image).collect();
+  let claims = common::claims(&mut fresh, &images);
   for keyed in &recovered.volumes {
     let vol = Volume::from_image(
       &mut fresh,
       &keyed.image,
+      &claims,
       Box::new(StepClock::new(0, 1)),
       1 << 16,
       None,
@@ -590,10 +627,12 @@ fn a_dynamic_volume_recovers_with_its_quota_and_growth() {
   assert!(grown > 0, "the dynamic volume took growth from the budget");
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -736,10 +775,12 @@ fn an_unlinked_but_open_orphan_recovers_its_content() {
     image.inodes.iter().any(|i| i.no == f.0),
     "the orphan inode is captured in the image (the walk covers the inode table, not just the tree)"
   );
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -841,11 +882,8 @@ fn to_image_captures_a_snapshots_frozen_content() {
   let head = image.inodes.iter().find(|i| i.no == f.0).unwrap();
   assert_eq!(
     head.body,
-    BodyImage::File {
-      runs: vec![RunImage {
-        offset: 0,
-        bytes: b"after-the-snapshot".to_vec()
-      }]
+    BodyImage::Inline {
+      bytes: b"after-the-snapshot".to_vec()
     },
     "the head image holds the post-snapshot content"
   );
@@ -856,11 +894,8 @@ fn to_image_captures_a_snapshots_frozen_content() {
     .unwrap();
   assert_eq!(
     frozen.body,
-    BodyImage::File {
-      runs: vec![RunImage {
-        offset: 0,
-        bytes: b"before".to_vec()
-      }]
+    BodyImage::Inline {
+      bytes: b"before".to_vec()
     },
     "the snapshot image holds the content frozen at the snapshot"
   );
@@ -883,10 +918,12 @@ fn a_volume_with_a_snapshot_rebuilds_faithfully() {
 
   let original = vol.to_image(&src, None).unwrap();
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&original]);
   let recovered = Volume::from_image(
     &mut fresh,
     &original,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -933,10 +970,12 @@ fn a_recovered_snapshot_id_survives_when_it_is_not_the_first_slot() {
   vol.destroy_snapshot(&mut src, snap_a).unwrap(); // frees slot zero; snap_b keeps slot one
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -969,10 +1008,12 @@ fn dropping_a_recovered_snapshot_frees_its_tree() {
   let snap = vol.snapshot(&mut src).unwrap();
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1013,10 +1054,12 @@ fn dropping_a_recovered_snapshot_leaves_the_head_readable() {
   vol.write(&mut src, changed, 0, b"version-two").unwrap(); // longer, so it fully overwrites
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1057,10 +1100,12 @@ fn a_recovered_snapshot_shares_unchanged_inodes_with_the_head() {
   vol.write(&mut src, b, 0, b"v2-longer").unwrap(); // b differs; a is unchanged
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let _recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1155,10 +1200,12 @@ fn a_version_shared_across_snapshots_is_captured_once_and_recovers_shared() {
     "the later snapshot names the earlier as the source of the shared version"
   );
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1221,10 +1268,12 @@ fn a_shared_version_survives_newest_first_drops_with_slot_reuse() {
   vol.write(&mut src, f, 0, b"head-edit").unwrap(); // f diverges; all three share the frozen version
 
   let image = vol.to_image(&src, None).unwrap();
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut rec = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1419,11 +1468,13 @@ fn a_semantically_malformed_image_is_refused_by_the_rebuild() {
     }
   }
   let mut fresh = common::store();
+  let claims = common::claims(&mut fresh, &[&image]);
   assert!(
     matches!(
       Volume::from_image(
         &mut fresh,
         &image,
+        &claims,
         Box::new(StepClock::new(0, 1)),
         1 << 16,
         None
@@ -1436,13 +1487,13 @@ fn a_semantically_malformed_image_is_refused_by_the_rebuild() {
 
 /// AC (§4.8; the barrier crash of 2026-09-15,
 /// docs/bugs/2026-09-15-recovery-image-materializes-a-sparse-files-holes.md): a sparse file images
-/// as the bytes it holds, never as its logical length. Do: hold four bytes at offset zero, then
+/// as what it holds, never as its logical length. Do: hold four bytes at offset zero, then
 /// extend the file to 999,999,999,999,999 bytes (pjdfstest's `truncate/12.t`). Expect: the image
-/// carries one four-byte run and the size, and fits in a few hundred bytes (non-vacuity: a
+/// carries the size and fits in a few hundred bytes (non-vacuity: a
 /// materialized hole would be a petabyte, and was — the daemon aborted on the allocation); a volume
 /// rebuilt from it serves the four bytes, reports the size, and reads zeros in the hole.
 #[test]
-fn a_sparse_file_images_as_its_held_runs_not_its_length() {
+fn a_sparse_file_images_as_what_it_holds_not_its_length() {
   let mut store = store();
   let mut vol = volume(&mut store, 1 << 30);
   let root = vol.root_inode(&store).unwrap();
@@ -1455,16 +1506,6 @@ fn a_sparse_file_images_as_its_held_runs_not_its_length() {
   let image = vol.to_image(&store, None).unwrap();
   let sparse = image.inodes.iter().find(|i| i.no == f.0).unwrap();
   assert_eq!(sparse.attrs.size, 999_999_999_999_999);
-  assert_eq!(
-    sparse.body,
-    BodyImage::File {
-      runs: vec![RunImage {
-        offset: 0,
-        bytes: b"held".to_vec()
-      }]
-    },
-    "the image holds the run held, and nothing for the hole"
-  );
   let content = image.to_content();
   assert!(
     content.len() < 4096,
@@ -1472,11 +1513,13 @@ fn a_sparse_file_images_as_its_held_runs_not_its_length() {
     content.len()
   );
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&store);
   let image = VolumeImage::from_content(&content).unwrap();
+  let claims = common::claims(&mut fresh, &[&image]);
   let rebuilt = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1503,10 +1546,10 @@ fn a_sparse_file_images_as_its_held_runs_not_its_length() {
   );
 }
 
-/// A file with a hole in the middle images as two runs — the bytes on either side — and rebuilds
-/// with the hole intact, so an image is bounded by the bytes held, not by the span they lie in.
+/// A file with a hole in the middle images as what it holds on either side and rebuilds with the hole
+/// intact, so an image is bounded by what is held, not by the span it lies in.
 #[test]
-fn a_file_with_a_middle_hole_images_as_two_runs() {
+fn a_file_with_a_middle_hole_images_as_what_it_holds() {
   let mut store = store();
   let mut vol = volume(&mut store, 1 << 30);
   let root = vol.root_inode(&store).unwrap();
@@ -1518,23 +1561,6 @@ fn a_file_with_a_middle_hole_images_as_two_runs() {
   vol.write(&mut store, f, far, b"tail").unwrap();
 
   let image = vol.to_image(&store, None).unwrap();
-  let holey = image.inodes.iter().find(|i| i.no == f.0).unwrap();
-  assert_eq!(
-    holey.body,
-    BodyImage::File {
-      runs: vec![
-        RunImage {
-          offset: 0,
-          bytes: b"head".to_vec()
-        },
-        RunImage {
-          offset: far,
-          bytes: b"tail".to_vec()
-        },
-      ]
-    },
-    "two runs, nothing for the hole between them"
-  );
   let content = image.to_content();
   assert!(
     content.len() < 4096,
@@ -1542,11 +1568,13 @@ fn a_file_with_a_middle_hole_images_as_two_runs() {
     content.len()
   );
 
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&store);
   let image = VolumeImage::from_content(&content).unwrap();
+  let claims = common::claims(&mut fresh, &[&image]);
   let rebuilt = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1611,10 +1639,12 @@ fn a_surviving_attachments_references_are_restored_and_every_other_holders_relea
     [42, 99],
     "the recorded attachments' references, never the process's"
   );
-  let mut fresh = common::store();
+  let mut fresh = common::surviving(&src);
+  let claims = common::claims(&mut fresh, &[&image]);
   let mut recovered = Volume::from_image(
     &mut fresh,
     &image,
+    &claims,
     Box::new(StepClock::new(0, 1)),
     1 << 16,
     None,
@@ -1678,10 +1708,12 @@ fn an_image_with_a_corrupt_reference_record_is_refused() {
     (f.0 + 1_000, 1, "an absent inode"),
     (f.0, 0, "a zero count"),
   ] {
-    let mut fresh = common::store();
+    let mut fresh = common::surviving(&src);
+    let claims = common::claims(&mut fresh, &[&corrupt(inode, count)]);
     let rebuilt = Volume::from_image(
       &mut fresh,
       &corrupt(inode, count),
+      &claims,
       Box::new(StepClock::new(0, 1)),
       1 << 16,
       None,
