@@ -2191,8 +2191,7 @@ impl Volume {
       .snapshots
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
-    let handle = trie::get(&store.tries, s.inode_root, no).ok_or(VfsError::NotFound)?;
-    let inode = store.inodes.get(handle)?;
+    let inode = exact_inode(store, s.inode_root, no)?;
     if inode.kind.is_special() {
       return Err(VfsError::SpecialFileOperation);
     }
@@ -2280,8 +2279,7 @@ impl Volume {
       .snapshots
       .get(snapshot_handle(id))
       .map_err(|_| VfsError::StaleHandle)?;
-    let handle = trie::get(&store.tries, snap.inode_root, no).ok_or(VfsError::NotFound)?;
-    store.inodes.get(handle).map_err(VfsError::from)
+    exact_inode(store, snap.inode_root, no)
   }
 
   /// Resolves an absolute path in a snapshot.
@@ -3071,8 +3069,7 @@ impl Volume {
     no: InodeNo,
     needs: &mut Needs,
   ) -> Result<(), VfsError> {
-    let handle = trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::NotFound)?;
-    let born = store.inodes.get(handle)?.born;
+    let born = exact_inode(store, self.inode_root, no)?.born;
     if born == self.epoch {
       return Ok(());
     }
@@ -3611,8 +3608,10 @@ impl Volume {
   }
 
   pub(crate) fn inode<'s>(&self, store: &'s Store, no: InodeNo) -> Result<&'s Inode, VfsError> {
-    let handle = trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::NotFound)?;
-    store.inodes.get(handle).map_err(|_| VfsError::StaleHandle)
+    exact_inode(store, self.inode_root, no).map_err(|error| match error {
+      VfsError::NotFound => VfsError::NotFound,
+      _ => VfsError::StaleHandle,
+    })
   }
 
   /// Recomputes the head's content histogram from its bodies (A-64: recovery places bodies over their
@@ -5265,6 +5264,21 @@ fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u
     _ => {}
   }
   map
+}
+
+/// The inode numbered exactly `no` under the inode table `root`. The table is keyed by the number's 48-bit
+/// counter, which is unique within a volume's lineage (a clone continues its origin's counter); the 16-bit volume
+/// prefix above it is a tag the table does not index, so a number with any other prefix would find the same inode.
+/// It is refused `NotFound` instead: an inode has one number, and a handle naming it by another is not one this
+/// volume minted (2026-10-04: a loopback NFS handle with its prefix bits flipped read the file it was flipped from,
+/// `crates/server/tests/nfs_hostile.rs`).
+fn exact_inode(store: &Store, root: Handle<TrieNode>, no: InodeNo) -> Result<&Inode, VfsError> {
+  let handle = trie::get(&store.tries, root, no).ok_or(VfsError::NotFound)?;
+  let inode = store.inodes.get(handle)?;
+  if inode.no != no {
+    return Err(VfsError::NotFound);
+  }
+  Ok(inode)
 }
 
 pub(crate) fn snapshot_handle(id: SnapshotId) -> Handle<Snapshot> {

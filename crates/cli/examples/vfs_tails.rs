@@ -357,6 +357,197 @@ fn focus_loop(
   }
 }
 
+/// A raw NFSv3 client over its own loopback connection to the daemon (no kernel NFS client): the instrument that
+/// tells the daemon-and-socket share of a call's time from the kernel client's and the caller's own sleeps.
+struct RawNfs {
+  stream: std::net::TcpStream,
+  root: Vec<u8>,
+  credential: Vec<u8>,
+  xid: u32,
+}
+
+/// Format: ONC RPC and NFSv3 numbers (RFC 5531, RFC 1813).
+const RPC_CALL: u32 = 0;
+/// Format: see [`RPC_CALL`].
+const RPC_VERSION: u32 = 2;
+/// Format: see [`RPC_CALL`].
+const AUTH_SYS: u32 = 1;
+/// Format: see [`RPC_CALL`].
+const NFS_PROGRAM: u32 = 100_003;
+/// Format: see [`RPC_CALL`].
+const NFS_V3: u32 = 3;
+/// Format: see [`RPC_CALL`].
+const NFSPROC3_CREATE: u32 = 8;
+/// Format: see [`RPC_CALL`].
+const NFSPROC3_RENAME: u32 = 14;
+
+impl RawNfs {
+  /// Mounts `export` (a capability path) on the daemon's `port` and keeps one connection open.
+  fn mount(port: u16, export: &str) -> RawNfs {
+    let caller = slates_bridge_nfs::client::Credentials {
+      uid: rustix::process::getuid().as_raw(),
+      gid: rustix::process::getgid().as_raw(),
+      gids: Vec::new(),
+    };
+    let root = slates_bridge_nfs::client::fetch_root_handle(port, &caller, export, CONNECT_WAIT)
+      .unwrap()
+      .0;
+    let mut credential = slates_bridge_nfs::xdr::XdrWriter::new();
+    credential.u32(0);
+    credential.opaque(b"localhost");
+    credential.u32(caller.uid);
+    credential.u32(caller.gid);
+    credential.u32(0);
+    let stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream.set_nodelay(true).unwrap();
+    RawNfs {
+      stream,
+      root,
+      credential: credential.into_bytes(),
+      xid: 1,
+    }
+  }
+
+  /// One call of `procedure` with `args`; returns the NFS status word of the reply.
+  fn call(&mut self, procedure: u32, args: &[u8]) -> u32 {
+    use std::io::{Read, Write};
+    self.xid = self.xid.wrapping_add(1);
+    let mut body = slates_bridge_nfs::xdr::XdrWriter::new();
+    for word in [
+      self.xid,
+      RPC_CALL,
+      RPC_VERSION,
+      NFS_PROGRAM,
+      NFS_V3,
+      procedure,
+      AUTH_SYS,
+    ] {
+      body.u32(word);
+    }
+    body.opaque(&self.credential);
+    body.u32(0);
+    body.opaque(&[]);
+    let mut message = body.into_bytes();
+    message.extend_from_slice(args);
+    self
+      .stream
+      .write_all(&slates_bridge_nfs::rpc::write_record(&message))
+      .unwrap();
+    let mut received = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let reply = loop {
+      if let Ok((reply, _)) = slates_bridge_nfs::rpc::read_record(&received) {
+        break reply;
+      }
+      let read = self.stream.read(&mut chunk).unwrap();
+      assert!(read > 0, "the daemon closed the raw connection");
+      received.extend_from_slice(chunk.get(..read).unwrap());
+    };
+    // xid, REPLY, MSG_ACCEPTED, verifier (flavor, empty body), SUCCESS, then the nfsstat3.
+    let mut reader = slates_bridge_nfs::xdr::XdrReader::new(&reply);
+    for _ in 0..3 {
+      reader.u32().unwrap();
+    }
+    reader.u32().unwrap();
+    reader.opaque(usize::MAX).unwrap();
+    assert_eq!(reader.u32().unwrap(), 0, "the call was accepted");
+    reader.u32().unwrap()
+  }
+
+  fn dirop(&self, name: &str) -> Vec<u8> {
+    let mut args = slates_bridge_nfs::xdr::XdrWriter::new();
+    args.opaque(&self.root);
+    args.opaque(name.as_bytes());
+    args.into_bytes()
+  }
+
+  fn create(&mut self, name: &str) {
+    let mut args = self.dirop(name);
+    let mut how = slates_bridge_nfs::xdr::XdrWriter::new();
+    how.u32(0); // UNCHECKED
+    for _ in 0..6 {
+      how.u32(0); // no attribute set
+    }
+    args.extend_from_slice(&how.into_bytes());
+    assert_eq!(self.call(NFSPROC3_CREATE, &args), 0, "CREATE {name}");
+  }
+
+  fn rename(&mut self, from: &str, to: &str) {
+    let mut args = self.dirop(from);
+    args.extend_from_slice(&self.dirop(to));
+    assert_eq!(
+      self.call(NFSPROC3_RENAME, &args),
+      0,
+      "RENAME {from} -> {to}"
+    );
+  }
+}
+
+/// `VFS_TAILS_RAW=<seconds>:<load per core>`: renames over [`RawNfs`] for that long under that load, one RPC per
+/// sample, and prints the caller's histogram beside the daemon's service times.
+fn raw_loop(
+  daemon: &Daemon,
+  client: &mut Client,
+  focus: &str,
+  cores: usize,
+  sweep_bytes: usize,
+  line_bytes: usize,
+) {
+  let (seconds, per_core) = focus.split_once(':').unwrap();
+  let span = Duration::from_secs(seconds.parse().unwrap());
+  let per_core: usize = per_core.parse().unwrap();
+  let volume = client
+    .create(&CreateSpec {
+      name: "raw".to_owned(),
+      size: SizeClass::Bounded {
+        limit: VOLUME_BYTES,
+      },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let attachment = client
+    .attach_mount(volume, slates_ipc::protocol::Intent::Write)
+    .unwrap();
+  let token: String = attachment
+    .token
+    .unwrap()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
+  let export = format!("/raw@{:x}.{token}", attachment.attachment);
+  let mut raw = RawNfs::mount(daemon.nfs_port().unwrap(), &export);
+  raw.create("raw-a");
+  let stop = AtomicBool::new(false);
+  std::thread::scope(|scope| {
+    for _ in 0..per_core.saturating_mul(cores) {
+      scope.spawn(|| spin(&stop, sweep_bytes, line_bytes));
+    }
+    let started = Instant::now();
+    let mut renames = 0u64;
+    let mut samples = Vec::new();
+    while started.elapsed() < span {
+      let (from, to) = if renames.is_multiple_of(2) {
+        ("raw-a", "raw-b")
+      } else {
+        ("raw-b", "raw-a")
+      };
+      samples.push(timed(|| raw.rename(from, to)));
+      renames += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    report(per_core, 1, "raw_rename_rpc", samples);
+  });
+  let (local, forwarded) = daemon.nfs_service_times().unwrap();
+  for (kind, served) in [("served_local", local), ("served_forwarded", forwarded)] {
+    println!(
+      "tails\t{per_core}\t1\t{kind}\t{}\t{}\t{}\t{}\t{}",
+      served.p50_ns, served.p99_ns, served.p999_ns, served.max_ns, served.count
+    );
+  }
+}
+
 fn main() {
   let cores = std::thread::available_parallelism().map_or(1, usize::from);
   let profile = quick_profile();
@@ -407,6 +598,10 @@ fn main() {
     daemon.shards().len(),
     std::env::consts::OS
   );
+  if let Ok(focus) = std::env::var("VFS_TAILS_RAW") {
+    raw_loop(&daemon, &mut client, &focus, cores, sweep_bytes, line_bytes);
+    return;
+  }
   if let Ok(focus) = std::env::var("VFS_TAILS_FOCUS") {
     focus_loop(
       &daemon,

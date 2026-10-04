@@ -3381,3 +3381,30 @@ order:
 Sibling found: `crates/cli/examples/slates_mount.rs` mounts `localhost:/<name>` with no mount capability. That
 export path stopped working at AUD-01 (`/<name>@<attachment>.<token>`), and on macOS `slates mount` now uses
 `mount(2)` (A-34), so the example fails with `No such file or directory`.
+
+### 2026-10-04: loopback NFS confidentiality and hostile connections
+
+`crates/server/tests/nfs_hostile.rs` runs honest clients beside breakers under a spinner per core. The breakers
+send partial records, the largest record marker, garbage bodies, writes closed before their reply, and resets
+right after the call that moves a connection to its owner shard.
+
+Results:
+- 0 honest mismatches over about 3,300 breaks.
+- No leaked connection task.
+- Every one of a handle's 456 single-bit flips outside the inode counter is refused. The test found the
+  inode-prefix alias, now fixed (`docs/bugs/2026-10-04-a-handle-with-flipped-inode-prefix-bits-read-its-file.md`).
+
+Open:
+- **Plaintext capability on loopback (macOS v3).** The token rides in every handle. BPF is root-only by default,
+  but a host with a group granted BPF access (Wireshark's ChmodBPF) exposes it to that group. The macOS kernel
+  client speaks neither RPC-over-TLS nor RPCSEC_GSS, so the fix cannot be encryption on that leg. Candidates:
+  - refuse NFS-program calls on a connection a user process owns (the kernel's mount socket has none; the CLI's
+    MNT exchange is the only user-process caller);
+  - rotate the token per mount.
+
+  The decision and its evidence are owed.
+- **Network export.** RPC-with-TLS (RFC 9289) over rustls/aws-lc with the capability (AUD-29-75). The same hostile
+  run over the TLS export (tampered records inside the TLS session, truncated TLS records, resets mid-handshake)
+  is owed.
+- **Fleet planes.** Mutual TLS (QUIC) for records, and hyper-datagram's sealed AES-256-GCM plane for membership.
+  Their hostile tests exist at the codec level. A daemon-level break-under-load run like this one is owed.

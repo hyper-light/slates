@@ -2277,6 +2277,12 @@ therefore never appears in `ps`, `mount` or `nfsstat -m`, all of which every loc
   daemon's records.
 - **The v3 security floor.** The listener is loopback-only; every handle carries the capability and
   is validated per request; the capability lives only in the daemon, the CLI's memory and the kernel.
+  *Correction (2026-10-04):* it also rides in every file handle of every RPC, in plaintext over loopback TCP.
+  Reading loopback traffic needs BPF, which on macOS is `root:wheel` mode 600 by default (checked on the
+  development machine: `/dev/bpf*` is `crw-------`, and there is no `access_bpf` group). A host whose user
+  installed a capture tool that grants a group BPF access (Wireshark's ChmodBPF) lets that group read the
+  tokens. Open in GAPS. A handle is also canonical: a flip of any bit outside the inode's counter is refused
+  (`crates/server/tests/nfs_hostile.rs`, all 456 bits; `docs/bugs/2026-10-04-a-handle-with-flipped-inode-prefix-bits-read-its-file.md`).
 
 **NFS versions (direction, 2026-09-26).** One NFS server speaks several versions over the shared
 bridge core: v3 as today, and v4.1 and v4.2 (RFC 8881, RFC 7862, RFC 8276, and pNFS flexfiles
