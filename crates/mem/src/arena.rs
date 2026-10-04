@@ -87,6 +87,11 @@ impl ChunkArena {
     }
   }
 
+  /// The granule: every block is a power-of-two multiple of it.
+  pub const fn granule(&self) -> usize {
+    self.granule
+  }
+
   /// Adds a region; its length is used up to the largest power-of-two number of granules it
   /// holds. Returns the region's index.
   pub fn add_region(&mut self, region: Region) -> Result<u16, MemError> {

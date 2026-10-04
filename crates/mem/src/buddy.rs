@@ -28,14 +28,22 @@
 
 use crate::error::{ExtentRefusal, MemError};
 
-/// Format: state byte layout: bit 7 = free, bits 0..6 = order of the block whose head this is.
-const FREE_BIT: u8 = 0x80;
-/// Format: the order mask.
-const ORDER_MASK: u8 = 0x7F;
-/// Format: a granule that is inside a block, not its head.
-const INSIDE: u8 = 0xFF;
+// Every sentinel of the per-granule arrays is zero, so the arrays are zero-allocated and the operating system
+// backs a page only when a block on it is first split, freed or linked (AC-0.4, A-69): at a 4 KiB granule the
+// arrays are 17 bytes per granule, which eager non-zero sentinels made resident whole (measured 2026-10-04: an
+// empty four-shard daemon at 99.6 MB RSS against 41 MB before the granule shrank).
 
-/// The sentinel for "no link" in the free lists.
+/// Format: state byte layout: bit 7 = free, bit 6 = head, bits 0..5 = order of the block whose head this is.
+const FREE_BIT: u8 = 0x80;
+/// Format: set on every head, so a head of order zero is never the zero byte that means "inside".
+const HEAD_BIT: u8 = 0x40;
+/// Format: the order mask.
+const ORDER_MASK: u8 = 0x3F;
+/// Format: a granule that is inside a block, not its head.
+const INSIDE: u8 = 0;
+
+/// The sentinel for "no link" in the free lists, as the accessors return it. A link is stored as its index plus
+/// one, so the stored "no link" is zero; an index is below `1 << 31`, so the shift never wraps a real one.
 const NONE: u32 = u32::MAX;
 
 /// A buddy allocator over `granules << max_order` bytes of address space, addressed by offset.
@@ -181,7 +189,7 @@ impl Buddy {
     let granules = 1usize << max_order;
     let mut state = vec![INSIDE; granules];
     if let Some(first) = state.first_mut() {
-      *first = FREE_BIT | u8::try_from(max_order).unwrap_or(ORDER_MASK);
+      *first = FREE_BIT | HEAD_BIT | u8::try_from(max_order).unwrap_or(ORDER_MASK);
     }
     let orders = usize::try_from(max_order).unwrap_or(0).saturating_add(1);
     let mut heads = vec![NONE; orders];
@@ -193,8 +201,8 @@ impl Buddy {
       granule_shift,
       max_order,
       state,
-      next: vec![NONE; granules],
-      prev: vec![NONE; granules],
+      next: vec![0; granules],
+      prev: vec![0; granules],
       heads,
       incarnations: vec![0; granules],
       free_bytes: granules.saturating_mul(granule),
@@ -692,13 +700,14 @@ impl Buddy {
   }
 
   fn mark(&mut self, index: u32, order: u32, free: bool) {
-    let byte = u8::try_from(order).unwrap_or(ORDER_MASK) | if free { FREE_BIT } else { 0 };
+    let byte =
+      HEAD_BIT | u8::try_from(order).unwrap_or(ORDER_MASK) | if free { FREE_BIT } else { 0 };
     self.set_state(index, byte);
   }
 
   fn set_link(links: &mut [u32], index: u32, value: u32) {
     if let Some(slot) = usize::try_from(index).ok().and_then(|i| links.get_mut(i)) {
-      *slot = value;
+      *slot = value.wrapping_add(1);
     }
   }
 
@@ -706,8 +715,7 @@ impl Buddy {
     usize::try_from(index)
       .ok()
       .and_then(|i| links.get(i))
-      .copied()
-      .unwrap_or(NONE)
+      .map_or(NONE, |stored| stored.wrapping_sub(1))
   }
 
   fn set_head(&mut self, order: u32, value: u32) {

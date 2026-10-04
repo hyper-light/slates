@@ -27,13 +27,27 @@ pub(crate) fn store() -> Store {
 
 /// A store with a chosen directory-slab cap and cut-over.
 pub(crate) fn store_with(max_dirs: usize, dir_cutover: usize) -> Store {
-  let mut arena = ChunkArena::new(PAGE);
+  store_shaped(max_dirs, dir_cutover, PAGE, PAGE)
+}
+
+/// Shape: the host page of a store whose allocation granule is smaller than its page — macOS arm64's 16 KiB over
+/// the daemon's 4 KiB content granule (`slates_server::config::content_granule`).
+pub(crate) const LARGE_PAGE: usize = 4 * PAGE;
+
+/// A store whose chunks are cut at sixteen `page`s and whose blocks are allocated in `granule`s.
+pub(crate) fn store_shaped(
+  max_dirs: usize,
+  dir_cutover: usize,
+  page: usize,
+  granule: usize,
+) -> Store {
+  let mut arena = ChunkArena::new(granule);
   arena
     .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
     .unwrap();
   Store::new(
     &StoreConfig {
-      page: PAGE,
+      page,
       cache_line: 64,
       max_dirs,
       max_inodes: 1 << 16,

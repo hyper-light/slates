@@ -3432,7 +3432,7 @@ impl Volume {
     if len >= self.inode(store, no)?.attrs.size {
       return Ok(0);
     }
-    let page = u64::try_from(store.content.page()).unwrap_or(1);
+    let page = u64::try_from(store.content.granule()).unwrap_or(1);
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     self.retention_of_pieces(store, no, |piece, piece_len| {
       piece >= len
@@ -3454,7 +3454,7 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes())
       .unwrap_or(u64::MAX)
       .max(1);
-    let page = u64::try_from(store.content.page()).unwrap_or(1);
+    let page = u64::try_from(store.content.granule()).unwrap_or(1);
     let window_start = at - at % chunk;
     self.retention_of_pieces(store, no, |piece, piece_len| {
       piece >= at
@@ -4683,7 +4683,7 @@ impl Volume {
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
-    let page = u64::try_from(store.content.page()).unwrap_or(1);
+    let page = u64::try_from(store.content.granule()).unwrap_or(1);
     let inline = u64::try_from(store.inline_bytes).unwrap_or(0);
     let before = materialized_windows(&inode.body, chunk);
     let mut after = before.clone();
@@ -5239,18 +5239,19 @@ impl Landed {
 }
 
 /// The bytes a window of `materialized` bytes is charged: its arena block — the smallest
-/// power-of-two number of pages holding the materialized length, at most a chunk, which is what
+/// power-of-two number of granules (the arena's allocation unit, at most the host page) holding the
+/// materialized length, at most a chunk, which is what
 /// the buddy arena hands out (§4.2 "physical_used includes allocator rounding"; §4.5
 /// "page-multiple growth from the buddy tree"). Zero for an empty window. The model oracle states
 /// the same rule (`crates/vfs/tests/model.rs`), and its first run under a bare page multiple found
 /// the buddy's rounding: a 15-page window takes 16.
-pub(crate) fn charged_window(materialized: u64, page: u64, chunk: u64) -> u64 {
+pub(crate) fn charged_window(materialized: u64, granule: u64, chunk: u64) -> u64 {
   if materialized == 0 {
     return 0;
   }
-  let page = page.max(1);
-  let pages = materialized.div_ceil(page).next_power_of_two();
-  pages.saturating_mul(page).min(chunk.max(1))
+  let granule = granule.max(1);
+  let granules = materialized.div_ceil(granule).next_power_of_two();
+  granules.saturating_mul(granule).min(chunk.max(1))
 }
 
 /// The materialized bytes per chunk window of a body: window index → bytes from the window's

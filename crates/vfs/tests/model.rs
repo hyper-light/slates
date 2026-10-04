@@ -916,14 +916,24 @@ fn check_publication(
 static DELTAS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn run(steps: Vec<Step>, quota: u64) {
-  let mut store = store();
+  run_on(store(), steps.clone(), quota);
+  // The daemon's shape on a large-page host: chunks of sixteen 16 KiB pages, blocks in 4 KiB granules. The charge
+  // rule rounds to the granule, never the page.
+  run_on(
+    common::store_shaped(1 << 16, 4, common::LARGE_PAGE, common::PAGE),
+    steps,
+    quota,
+  );
+}
+
+fn run_on(mut store: Store, steps: Vec<Step>, quota: u64) {
   let mut vol = volume(&mut store, quota);
   let mut published = None;
   let mut model = Model::new(
     quota,
     u64::try_from(store.content.chunk_bytes()).unwrap(),
     u64::try_from(store.inline_bytes).unwrap(),
-    u64::try_from(store.content.page()).unwrap(),
+    u64::try_from(store.content.granule()).unwrap(),
   );
   for step in steps {
     let Some((real, expected)) = apply(&step, &mut vol, &mut store, &mut model) else {

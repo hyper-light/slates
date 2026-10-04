@@ -1742,6 +1742,7 @@ descriptors are released; counted).
 the sorted array exceeds the hash-side-index lookup (from the profile's cache-line and memcpy
 curves; starting point one SIMD group of hashes); ordered node fanout = entries per two cache
 lines; small chunk = smallest page multiple ≥ p90 sealed size; large chunk = memcpy-curve knee;
+content granule (the block unit, A-69) = the host page, but at most the smallest target page (4 KiB);
 CDC threshold = size above which measured dedup gain per hashed byte exceeds hashing cost; journal
 budget = mutation rate × max subscriber lag × record size; copy-up class boundary = the CDC
 threshold; racy window = the base filesystem's timestamp granularity (from a cited per-filesystem
@@ -8602,3 +8603,27 @@ Status: built 2026-10-04.
   - `recovery.rs`'s crash-at-every-durable-step oracle passes.
 - Found on the way, both fixed: `trie::walk` emitted a leaf's inodes in reverse, so images were not in number order
   as `VolumeImage` documents; and a case-only rename (respell) was a mutation path no test had marked.
+
+### A-69 — Content is allocated in 4 KiB granules; chunks stay sixteen host pages (2026-10-04)
+Applied in the same change to: `crates/server/src/config.rs` (`content_granule`, `max_chunks`),
+`crates/server/src/daemon.rs` (the arena's granule), `crates/vfs/src/content.rs` (`ChunkStore::granule`, separate from
+`page`), `crates/vfs/src/volume.rs` (the charge rule's unit), `crates/mem/src/buddy.rs` (zero sentinels),
+`crates/mem/src/arena.rs` (`granule()`), `crates/vfs/tests/model.rs` (a second run with granule below page),
+BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: the arena allocated in host pages, so on macOS arm64 a 4 KiB file — and the 4 KiB AppleDouble sidecar the
+  macOS NFSv3 client writes beside every file — took a 16 KiB block (64 KiB on a 64 KiB-page Linux kernel). 4,000
+  small files dirtied 196 MB of arena, four times their bytes.
+- What:
+  - The arena's granule, and so every block and the charge rule's rounding (D-13), is `min(page, 4096)`.
+  - A chunk stays sixteen host pages (`chunk_bytes(page)`, the archive format's rule). Cutting chunks at sixteen
+    granules instead was measured and rejected: a 256 MiB write took 1.45–1.95 s against 0.55–0.77 s, because there
+    were four times as many chunks.
+  - The buddy's per-granule arrays (a state byte, two links, an incarnation: 17 bytes a granule) use zero for every
+    sentinel: "inside a block" is 0, a head carries a head bit, and a link is stored as its index plus one. So
+    the arrays are zero-allocated and backed by the OS only where blocks are touched (AC-0.4). With the old
+    non-zero sentinels, the smaller granule made an empty four-shard daemon 99.6 MB resident.
+- Measured (BENCHMARKS, "Content granule"): RSS of an empty daemon 41 → 34 MB, with 4,000 tiny files 134 → 78 MB,
+  with 4,000 files of 4 KiB 294 → 115–124 MB; 256 MiB write throughput unchanged.
+- Proven: the model suite runs every history twice, the second time on a store whose granule (4 KiB) is below its
+  page (16 KiB), so the charge rule is checked against the granule and never the page.

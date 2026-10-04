@@ -1574,3 +1574,29 @@ per-call server log over two later rounds settled where the time goes:
   per round, most of them AppleDouble sidecars (14,007 CREATEs for 4,000 files) and attribute sets.
 
 Interleaved tar A/B on the identical script, old then new: 2.39 / 1.69 s and 2.41 / 1.88 s.
+
+### Content granule: small files take small blocks (A-69, 2026-10-04)
+
+**Command:** `bash e2e-rss.sh` and `bash e2e-dd.sh` (scratch scripts kept with this record's session). Each starts one
+anchor with `--shards 4`, creates one bounded 2 GiB volume and mounts it with `slates mount`. `e2e-rss.sh` reads the
+daemon's RSS empty, after 4,000 tiny files and after 4,000 files of 4 KiB, all written through the mount.
+`e2e-dd.sh` times `dd` writes of 1 MiB, 24 MiB and 256 MiB from `/dev/zero` (bs 32k). The old binary is HEAD
+`6832c10`, built in a separate tree; the runs alternate old then new. Apple M5 Max, 18 cores; the machine is shared
+with other sessions, load average 20–64.
+
+| daemon RSS | HEAD (2 runs) | granule 4 KiB, zero sentinels (2 runs) |
+|---|---|---|
+| empty | 41.1 / 41.2 MB | 34.2 / 34.0 MB |
+| 4,000 tiny files | 133.3 / 135.3 MB | 81.6 / 77.9 MB |
+| 4,000 × 4 KiB | 294.3 / 294.1 MB | 114.7 / 123.6 MB |
+
+256 MiB write, three alternating pairs: HEAD 0.372 / 0.378 / 0.374 s, new 0.374 / 0.367 / 0.372 s. The 1 MiB and
+24 MiB writes are level too (0.021–0.024 s and 0.045–0.046 s on both).
+
+Measured and rejected on the way:
+- **Chunks cut at sixteen granules** (64 KiB on this host instead of 256 KiB). 256 MiB writes took 1.445 / 1.945 /
+  1.901 s against HEAD's 0.624 / 0.554 / 0.767 s, three alternating pairs at load average 64. The cause is four times
+  the chunks. Chunks stay sixteen host pages.
+- **The granule alone, with the buddy's non-zero sentinels.** The empty daemon was 99.6 MB resident: the per-granule
+  state, link and incarnation arrays (17 bytes a granule) were written whole at start-up. Zero sentinels make them
+  lazily backed.

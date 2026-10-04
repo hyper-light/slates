@@ -2519,7 +2519,7 @@ fn init_shard(
   let mut clock = HostClock::new();
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
   let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
-  let mut arena = ChunkArena::new(config.page);
+  let mut arena = ChunkArena::new(config.content_granule());
   arena.add_region(arena_region(config, partition, env)?)?;
   // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
   // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk

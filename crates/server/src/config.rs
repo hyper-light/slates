@@ -329,7 +329,27 @@ pub struct ShardContentLayout {
   pub arena: (usize, usize),
 }
 
+/// Format: the smallest base page of any supported target (x86-64's 4 KiB; aarch64 hosts run 4, 16 or 64 KiB): the
+/// block every host's file cache and every transport (NFS, FUSE, virtio-fs, WinFsp) moves file bytes in.
+const SMALLEST_TARGET_PAGE: usize = 4096;
+
+/// Derived: the unit content is allocated in (the chunk arena's granule and the store's charge unit): the host page,
+/// but no larger than [`SMALLEST_TARGET_PAGE`]. A 4 KiB file — or the 4 KiB AppleDouble sidecar macOS writes beside
+/// every file on NFSv3 — took a whole 16 KiB block on macOS arm64 and would take 64 KiB on a 64 KiB-page Linux
+/// kernel: 4,000 small files dirtied 196 MB of arena on macOS (2026-10-04), four times their size. Large files are
+/// unaffected: a chunk stays sixteen host pages (`slates_vfs::content::chunk_bytes`), so a large file is cut into as
+/// many chunks as before. Cutting chunks at sixteen granules instead was measured and rejected: 256 MiB written
+/// through the mount took 1.45-1.95 s against 0.55-0.77 s (four times the chunks; 2026-10-04, BENCHMARKS.md).
+pub fn content_granule(page: usize) -> usize {
+  page.clamp(1, SMALLEST_TARGET_PAGE)
+}
+
 impl DaemonConfig {
+  /// The unit this daemon allocates content in ([`content_granule`] of its page).
+  pub fn content_granule(&self) -> usize {
+    content_granule(self.page)
+  }
+
   /// Derived: each shard's FUSE write log in the anchor's content object (A-63): a quarter of the shard's reserve.
   /// A log that fills forces a publication, which empties it, so its size trades publications against resident log
   /// pages, never durability; a quarter of the reserve lets a write stream of that much ride between barriers
@@ -577,11 +597,12 @@ impl DaemonConfig {
       ["reserve_per_shard", "vfs.directory_unit_bytes"]
     );
     derivations.push(note("max_dirs", &max_dirs));
+    let granule = u64::try_from(content_granule(usize::try_from(page).unwrap_or(1))).unwrap_or(1);
     let max_chunks: Derived<usize> = derived!(
-      usize::try_from(reserve.get() / page.max(1))
+      usize::try_from(reserve.get() / granule.max(1))
         .unwrap_or(usize::MAX)
         .max(1),
-      "reserve_per_shard / page (one chunk per page at least)",
+      "reserve_per_shard / content_granule (one chunk per granule at least)",
       ["reserve_per_shard", "page"]
     );
     derivations.push(note("max_chunks", &max_chunks));
@@ -1163,7 +1184,7 @@ mod tests {
     let profile = crate::daemon::test_profile();
     let config = DaemonConfig::derive(&profile, "metadata-layout", Some(1));
     let page = config.page;
-    let mut arena = ChunkArena::new(page);
+    let mut arena = ChunkArena::new(config.content_granule());
     arena
       .add_region(Region::map(page, page, false).expect("one page maps"))
       .expect("one region");

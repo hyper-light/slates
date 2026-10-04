@@ -35,9 +35,37 @@ const WEDGE_BUDGETS: u64 = 5;
 /// the shard ran the task's start there), the window that shows no CPU, and one more for the deadline's lateness under
 /// a loaded runner; still two budgets short of the wedge.
 const ENDED_WITHIN_BUDGETS: u64 = 3;
-/// Derived: how long a deliberately slow question spins on its shard — twice the short budget, so its
+/// Derived: how much of its shard's own CPU time a deliberately slow question spins ([`spin_shard_time`]) — twice the short budget, so its
 /// answer is late by construction.
 const SLOW_QUESTION_NS: u64 = 2 * SHORT_BUDGET_NS;
+/// Spins on the calling shard until it has run `ns` of its own CPU time — the clock an observation's budget is
+/// counted in (A-65) — so a question is late by construction however little CPU a loaded machine gives the shard.
+/// Spinning by the wall clock was not: a shard given under half a core finished a two-budget wall spin having run
+/// less than one budget, and was rightly answered (load average 20-64, 2026-10-04). Where the platform has no
+/// thread clock (Miri), the wall budget stands alone, so the spin is by the wall clock there.
+fn spin_shard_time(ns: u64) {
+  let cpu = || {
+    slates_rt::registry::current_shard()
+      .and_then(slates_rt::registry::holder_of)
+      .and_then(slates_rt::registry::shard_cpu)
+      .map(|reading| reading.spent_ns)
+  };
+  match cpu() {
+    Some(began) => {
+      let end = began.saturating_add(ns);
+      while cpu().is_some_and(|spent| spent < end) {
+        std::hint::spin_loop();
+      }
+    }
+    None => {
+      let end = slates_rt::futures::now_ns().saturating_add(ns);
+      while slates_rt::futures::now_ns() < end {
+        std::hint::spin_loop();
+      }
+    }
+  }
+}
+
 /// Shape: how long a late reply is waited for to be counted, or a stopped daemon's pending question to
 /// end — the whole observe budget, the bound past which either is a failure.
 const SETTLE: Duration = Duration::from_nanos(OBSERVE_BUDGET_NS);
@@ -259,10 +287,7 @@ fn a_budget_that_elapses_first_is_named_and_the_late_reply_is_discarded_and_coun
   // Admitted at once on the idle shard, the slow question is still running at the deadline.
   let slow = daemon
     .observation_on_control(SHORT_BUDGET_NS, |_state: &mut ShardState| {
-      let end = slates_rt::futures::now_ns().saturating_add(SLOW_QUESTION_NS);
-      while slates_rt::futures::now_ns() < end {
-        std::hint::spin_loop();
-      }
+      spin_shard_time(SLOW_QUESTION_NS);
       9u8
     })
     .expect("the slow observation begins")

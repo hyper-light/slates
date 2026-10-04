@@ -3467,8 +3467,8 @@ is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). 
   copy-on-write diff of two tables) is the likely tool.
 - **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.
-- **Daemon memory grows** about 120 MB per round of 4,000 small files (160 → 283 MB in two rounds). Not yet
-  attributed; next.
+- **Daemon memory grows** about 120 MB per round of 4,000 small files (160 → 283 MB in two rounds). Attributed and
+  cut (A-69, below): each 4 KiB file and its AppleDouble sidecar took a 16 KiB block on macOS arm64.
 
 ### 2026-10-04: hyper-raft re-snapshot at 3a6c288 (done)
 
@@ -3483,3 +3483,14 @@ targets plus Miri and the model checks (run 37233401622). The snapshot carries:
 
 This closes the 2026-10-04 re-vendor entries above. Still owed from hyper-raft: the hybrid-handshake high-RTT tests
 (a)–(d), queued there, and H-3/H-4.
+
+### 2026-10-04: content allocated in 4 KiB granules (A-69, done)
+
+The arena's block unit is `min(page, 4096)`; chunks stay sixteen host pages, and the buddy's per-granule arrays are
+zero-allocated. Daemon RSS with 4,000 files of 4 KiB fell from 294 MB to 115–124 MB and the empty daemon from 41 MB
+to 34 MB, with 256 MiB write throughput unchanged (BENCHMARKS, "Content granule"). Still owed: the remaining 4,000
+small files' RSS (about 80 MB above empty) is not yet split between metadata slabs, the content arena and the
+publication's images. Measure it next with `footprint --forkCorpse`, never `vmmap`, which suspends the daemon long
+enough for the anchor to kill it.
+Found on the way and fixed: `observe.rs`'s slow question spun by the wall clock, which under load is not late by the
+shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observation-test-was-not-slow-under-load.md).

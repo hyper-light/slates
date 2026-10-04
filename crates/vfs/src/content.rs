@@ -74,6 +74,7 @@ pub struct ChunkStore {
   arena: ChunkArena,
   chunks: Slab<Chunk>,
   page: usize,
+  granule: usize,
   chunk_bytes: usize,
 }
 
@@ -82,6 +83,7 @@ impl std::fmt::Debug for ChunkStore {
     f.debug_struct("ChunkStore")
       .field("chunks", &self.chunks.len())
       .field("page", &self.page)
+      .field("granule", &self.granule)
       .field("chunk_bytes", &self.chunk_bytes)
       .finish()
   }
@@ -111,20 +113,29 @@ pub fn inline_bytes(cache_line: usize) -> Derived<usize> {
 }
 
 impl ChunkStore {
-  /// A store over `arena` with `page`-byte granules and `max_chunks` chunk records.
+  /// A store over `arena` with `max_chunks` chunk records. Blocks are allocated in the arena's granule, which may
+  /// be smaller than the host `page`; chunks are sixteen host pages either way, so a small file takes a small
+  /// block and a large file is cut into as few chunks as before.
   pub fn new(arena: ChunkArena, page: usize, max_chunks: usize) -> Self {
     let page = page.max(1);
+    let granule = arena.granule().clamp(1, page);
     Self {
       arena,
       chunks: Slab::new(max_chunks.min(page), max_chunks),
       page,
+      granule,
       chunk_bytes: chunk_bytes(page).get(),
     }
   }
 
-  /// The page size.
+  /// The host page size.
   pub const fn page(&self) -> usize {
     self.page
+  }
+
+  /// The allocation unit: every block, and so every window's charge, is a power-of-two multiple of it.
+  pub const fn granule(&self) -> usize {
+    self.granule
   }
 
   /// The chunk size.
@@ -191,7 +202,7 @@ impl ChunkStore {
   /// chunk).
   pub fn open(&mut self, off: u64, want: usize, born: Epoch) -> Result<OpenExtent, VfsError> {
     let want = want.clamp(1, self.chunk_bytes);
-    let block = self.alloc(want.next_multiple_of(self.page))?;
+    let block = self.alloc(want.next_multiple_of(self.granule))?;
     Ok(OpenExtent {
       off,
       len: 0,
@@ -209,7 +220,7 @@ impl ChunkStore {
     if need > self.chunk_bytes {
       return Err(VfsError::FileTooLarge);
     }
-    let block = self.alloc(need.next_multiple_of(self.page))?;
+    let block = self.alloc(need.next_multiple_of(self.granule))?;
     let used = usize::try_from(open.len).unwrap_or(0);
     let mut carry = vec![0u8; used];
     if let Some(src) = self.arena.bytes(open.block) {
@@ -261,8 +272,11 @@ impl ChunkStore {
   /// of pages holding them (the buddy's block), at most a chunk — the window's charge (§4.2
   /// "allocator rounding").
   pub fn block_bytes(&self, materialized: usize) -> usize {
-    let pages = materialized.max(1).div_ceil(self.page).next_power_of_two();
-    pages.saturating_mul(self.page).min(self.chunk_bytes)
+    let granules = materialized
+      .max(1)
+      .div_ceil(self.granule)
+      .next_power_of_two();
+    granules.saturating_mul(self.granule).min(self.chunk_bytes)
   }
 
   /// Truncates an open extent to `len` bytes and rebuilds its block at the size the kept bytes
