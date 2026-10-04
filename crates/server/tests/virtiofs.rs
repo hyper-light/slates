@@ -1995,31 +1995,12 @@ fn a_console_marker_right_after_a_screen_reset_is_still_read() {
 fn without_terminal_controls(line: &str) -> String {
   /// Format: the escape character that opens a terminal control sequence (ECMA-48).
   const ESCAPE: char = '\u{1b}';
-  /// Format: the byte after `ESC` that opens a control sequence (CSI) running to a final byte in `@..=~`.
-  const CSI: char = '[';
-  /// Format: the byte after `ESC` that resets the terminal (RIS, ECMA-48 §8.3.105), clearing the screen.
-  const RESET: char = 'c';
   let mut out = String::with_capacity(line.len());
   let mut chars = line.chars();
   while let Some(c) = chars.next() {
     if c == ESCAPE {
-      match chars.next() {
-        Some(CSI) => {
-          let mut parameters = String::new();
-          for next in chars.by_ref() {
-            if ('@'..='~').contains(&next) {
-              // Erase in display, whole screen (`ESC [ 2 J`, `ESC [ 3 J`): nothing before it stays on screen.
-              if next == 'J' && matches!(parameters.as_str(), "2" | "3") {
-                out.clear();
-              }
-              break;
-            }
-            parameters.push(next);
-          }
-        }
-        // Reset to initial state (`ESC c`, RIS): the screen is cleared.
-        Some(RESET) => out.clear(),
-        _ => {}
+      if escape_clears_the_screen(&mut chars) {
+        out.clear();
       }
     } else if c == '\r' {
       if chars.clone().next().is_some() {
@@ -2030,6 +2011,30 @@ fn without_terminal_controls(line: &str) -> String {
     }
   }
   out
+}
+
+/// Consumes the escape sequence `chars` holds after its `ESC` and says whether it clears the screen: a reset (`ESC c`,
+/// RIS) or an erase of the whole display (`ESC [ 2 J`, `ESC [ 3 J`). Any other sequence is dropped and clears nothing.
+#[cfg(target_os = "linux")]
+fn escape_clears_the_screen(chars: &mut std::str::Chars<'_>) -> bool {
+  /// Format: the byte after `ESC` that opens a control sequence (CSI) running to a final byte in `@..=~`.
+  const CSI: char = '[';
+  /// Format: the byte after `ESC` that resets the terminal (RIS, ECMA-48 §8.3.105), clearing the screen.
+  const RESET: char = 'c';
+  match chars.next() {
+    Some(CSI) => {
+      let mut parameters = String::new();
+      for next in chars.by_ref() {
+        if ('@'..='~').contains(&next) {
+          return next == 'J' && matches!(parameters.as_str(), "2" | "3");
+        }
+        parameters.push(next);
+      }
+      false
+    }
+    Some(RESET) => true,
+    _ => false,
+  }
 }
 
 /// Parses the guest's console into its runs.
