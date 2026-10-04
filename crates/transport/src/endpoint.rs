@@ -280,7 +280,14 @@ trait QuicExt {
   fn export_connection_id(&self) -> Result<ConnectionId, rustls::Error>;
   /// The peer's end-entity certificate, once the handshake authenticated it.
   fn peer_certificate(&self) -> Option<CertificateDer<'static>>;
+  /// [`EXPORTED_SECRET_BYTES`] bytes of the TLS exporter under `label` with no context (RFC 8446 §7.5) — refused by
+  /// rustls before the handshake completes.
+  fn export_secret(&self, label: &[u8]) -> Result<[u8; EXPORTED_SECRET_BYTES], rustls::Error>;
 }
+
+/// Format: the length of a secret exported for another protocol keyed from this session: SHA-256's output, what the
+/// sealed datagram plane's key schedule expands (hyper-datagram `SECRET_BYTES`, A-67 H-2).
+pub const EXPORTED_SECRET_BYTES: usize = 32;
 
 impl QuicExt for Quic {
   fn is_client(&self) -> bool {
@@ -294,6 +301,9 @@ impl QuicExt for Quic {
       .peer_certificates()
       .and_then(|chain| chain.first())
       .cloned()
+  }
+  fn export_secret(&self, label: &[u8]) -> Result<[u8; EXPORTED_SECRET_BYTES], rustls::Error> {
+    self.export_keying_material([0u8; EXPORTED_SECRET_BYTES], label, None)
   }
 }
 
@@ -639,6 +649,24 @@ impl Endpoint {
   /// accepted a session on a shared socket tells which peer dialed it.
   pub fn peer_certificate(&self) -> Option<CertificateDer<'static>> {
     self.quic.peer_certificate()
+  }
+
+  /// A secret both ends of this session derive alike from its TLS exporter under `label` (RFC 8446 §7.5), for a
+  /// protocol keyed from this session: the sealed membership plane's epoch keys (A-67 H-2). A new connection gives a
+  /// new secret. Refused `NotReady` before the handshake completes.
+  pub fn export_secret(&self, label: &[u8]) -> Result<[u8; EXPORTED_SECRET_BYTES], EndpointError> {
+    if self.quic.is_handshaking() {
+      return Err(EndpointError::NotReady);
+    }
+    self
+      .quic
+      .export_secret(label)
+      .map_err(|_| EndpointError::NotReady)
+  }
+
+  /// Whether this end dialed the session (the TLS client).
+  pub fn is_dialer(&self) -> bool {
+    self.quic.is_client()
   }
 
   /// This session's connection id — the eight bytes both ends derive from the TLS exporter once the
@@ -2335,6 +2363,42 @@ mod tests {
       other_client.export_connection_id().unwrap(),
       at_client,
       "another session, another id"
+    );
+  }
+
+  /// A-67 H-2: both ends of a completed handshake export the **same** secret under a label, a different label exports
+  /// a different secret, two handshakes export **different** ones (a new connection, new keys), and before completion
+  /// the export is refused.
+  #[test]
+  fn both_ends_export_one_secret_per_session_and_label() {
+    const LABEL: &[u8] = b"EXPORTER-hyper-datagram";
+    let identity = self_signed("slates-node");
+    let (client, server) = connect(&identity, &identity, "slates-node").unwrap();
+    let (mut client, mut server) = (Quic::Client(client), Quic::Server(server));
+    assert!(
+      client.export_secret(LABEL).is_err(),
+      "no secret before the handshake completes"
+    );
+    drive_handshake(&mut client, &mut server);
+    let at_client = client.export_secret(LABEL).unwrap();
+    assert_eq!(
+      at_client,
+      server.export_secret(LABEL).unwrap(),
+      "one secret, derived at both ends"
+    );
+    assert_ne!(
+      at_client,
+      client.export_secret(b"EXPORTER-other").unwrap(),
+      "another label, another secret"
+    );
+    let (other_client, other_server) = connect(&identity, &identity, "slates-node").unwrap();
+    let (mut other_client, mut other_server) =
+      (Quic::Client(other_client), Quic::Server(other_server));
+    drive_handshake(&mut other_client, &mut other_server);
+    assert_ne!(
+      other_client.export_secret(LABEL).unwrap(),
+      at_client,
+      "another session, another secret"
     );
   }
 
