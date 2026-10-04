@@ -7453,10 +7453,15 @@ fn build_recovered_volume(
   // The catalog is the authority on the acknowledged size policy (§4.8, AC-2.3): a resize
   // publishes its image before its record commits. Refuse content exceeding that policy.
   let acknowledged = quota.limit();
-  if volume.capacity_bytes() != acknowledged {
-    volume.resize(acknowledged).map_err(|error| {
-      format!("RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {error}")
-    })?;
+  if volume.capacity_bytes() != acknowledged
+    && let Err(error) = volume.resize(acknowledged)
+  {
+    // The half-built volume gives back its sources, records and blocks, as `from_image` does on its own refusals.
+    let host = opened.as_mut().map(|(host, _)| host as &mut dyn HostFs);
+    let _ = volume.discard_partial_releasing(&mut state.store, host);
+    return Err(format!(
+      "RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {error}"
+    ));
   }
   Ok((volume, opened.map(|(host, _)| host), image.prefix))
 }
@@ -9012,6 +9017,55 @@ mod tests {
     });
     assert!(scratch.is_some_and(|reason| reason.contains("RecoveryIncomplete")));
     assert!(overlay.is_some_and(|reason| reason.contains("RecoveryIncomplete")));
+  }
+
+  /// AC-2.3, §4.8 (the catalog is the authority on the size policy): rebuild an image whose content exceeds the
+  /// catalog's acknowledged size. Do: create a volume, write a 100-byte file into it, image it, and rebuild that image
+  /// against a record whose size policy is 64 bytes. Expect: refused for the size policy, and the store's inode and
+  /// directory records exactly as many as before — the half-built volume returned them
+  /// (`docs/bugs/2026-10-03-a-write-or-truncate-refused-partway-dropped-the-files-body.md`, the sibling sweep).
+  #[test]
+  fn a_recovered_volume_over_its_acknowledged_size_is_refused_without_leaking_its_records() {
+    let (refusal, before, after) = crate::daemon::audit_on_shard(|state| {
+      let size = super::SizeClass::Bounded { limit: 1 << 20 };
+      let reply = super::dispatch(
+        state,
+        1,
+        &Principal::Uid { uid: 0 },
+        super::RequestBody::Create {
+          name: "over-policy".to_owned(),
+          size,
+          names: super::NamePolicy::Exact,
+          require_locked: false,
+          base: None,
+        },
+      );
+      let super::ReplyBody::Created { id } = reply else {
+        panic!("{reply:?}");
+      };
+      let handle = *state.by_id.get(&super::to_db_volume(id)).unwrap();
+      let super::ShardState { store, volumes, .. } = &mut *state;
+      let slot = volumes.get_mut(handle).unwrap();
+      let root = slot.volume.root_inode(store).unwrap();
+      let file = slot.volume.create_file_no(store, root, "f", 0o644).unwrap();
+      slot.volume.write(store, file, 0, &[b'x'; 100]).unwrap();
+      let image = slot.volume.to_image(store, None).unwrap();
+      let record = state
+        .db
+        .partition()
+        .volume(super::to_db_volume(id))
+        .unwrap()
+        .clone();
+      let claims = slates_vfs::recover::Claims::prepare(&mut state.store, [&image]).unwrap();
+      let before = (state.store.inodes.len(), state.store.dirs.len());
+      let small = super::SizeClass::Bounded { limit: 64 };
+      let refusal =
+        super::build_recovered_volume(state, &record, Some(&image), Some(&claims), small).err();
+      let after = (state.store.inodes.len(), state.store.dirs.len());
+      (refusal, before, after)
+    });
+    assert!(refusal.is_some_and(|reason| reason.contains("size policy")));
+    assert_eq!(after, before, "the refused rebuild returned its records");
   }
 
   /// AC-2.12 / T-2.14, AUD-05: remove or exhaust the recovery image storage before a create.

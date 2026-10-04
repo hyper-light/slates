@@ -2938,6 +2938,19 @@ impl Volume {
     self.destroy_queue.len()
   }
 
+  /// [`Volume::discard_partial`] for a volume whose base plane may hold sources on `host` (a recovered overlay): they
+  /// are released first, as `from_image` releases them on its own refusals.
+  pub fn discard_partial_releasing(
+    mut self,
+    store: &mut Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+  ) -> Result<(), VfsError> {
+    if let (Some(base), Some(host)) = (self.base.take(), host) {
+      base.release_sources(host);
+    }
+    self.discard_partial(store)
+  }
+
   /// Frees a freshly-created volume that never entered service — a create or clone that failed after
   /// the volume object existed but before it was published. Its owned slab slots (a scratch volume's
   /// root inode, trie and dir) return to the store; a clone shares its origin's versions, so it frees

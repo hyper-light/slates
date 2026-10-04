@@ -74,6 +74,9 @@ restore), `apply_write` and `apply_truncate` (fixed). Every caller of `apply_wri
 write), the edit and the copy-up (whole, checked first). Every caller of `write_unrecorded`: the attribute
 values (whole, checked first) and the AppleDouble working copy (a file write, short allowed).
 
-Recorded, not fixed here: `build_recovered_volume` in `crates/server/src/verbs.rs` returns its error from
-`volume.resize` without `discard_partial`, so a recovered volume refused for its size policy leaks its slots. Its
-blocks are swept (A-64); its inode and directory records are not.
+Found in the same sweep and fixed the same day: `build_recovered_volume` in `crates/server/src/verbs.rs` returned
+its error from `volume.resize` without discarding the half-built volume. A recovered volume refused for its size
+policy leaked its inode and directory records (its blocks are swept, A-64). It now gives them back through
+`Volume::discard_partial_releasing`, which also releases an overlay's sources. Proven by
+`a_recovered_volume_over_its_acknowledged_size_is_refused_without_leaking_its_records`: two inodes and a
+directory leaked before the fix, none after.
