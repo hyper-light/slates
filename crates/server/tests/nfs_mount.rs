@@ -2797,3 +2797,115 @@ fn a_plain_volume_lists_what_its_mount_wrote() {
   drop(client);
   drop(daemon);
 }
+
+/// The granted landing of `name`'s volume (the one A holds a delegation in), started on another thread after a snapshot,
+/// with everything the two landing tests then drive: the daemon, the instance's client, A, A's handle and delegation,
+/// the NFSv3 connection, the landing's thread, and its target.
+#[allow(clippy::type_complexity)]
+fn landing_a_delegated_volume(
+  name: &str,
+) -> (
+  Daemon,
+  Client,
+  V4Client,
+  Vec<u8>,
+  slates_bridge_nfs::v4::types::Stateid,
+  TcpStream,
+  std::thread::JoinHandle<Result<slates_client::Landing, slates_client::ClientError>>,
+  common::target::TargetDir,
+) {
+  let (daemon, client, a, fh_a, delegation, v3, _file) = delegated_to_a(name);
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut lander = common::landing::connect(daemon.instance());
+  let volume = lander
+    .list()
+    .unwrap()
+    .into_iter()
+    .find(|summary| {
+      summary.name.starts_with("v4local-") && slates_server::verbs::owner_of(summary.id) == 0
+    })
+    .expect("the delegated file's volume")
+    .id;
+  // The suite's flow: a snapshot of what A's file holds, landed by name.
+  let snapshot = lander.snapshot(volume).unwrap();
+  let target = common::target::target_dir();
+  let grant = common::landing::approve(&mut lander, &secret, volume, Some(snapshot), &target.path);
+  let path = target.path.clone();
+  let landing = std::thread::spawn(move || {
+    lander.land(
+      volume,
+      Some(snapshot),
+      &path,
+      slates_ipc::protocol::Filter::default(),
+      Some(grant),
+    )
+  });
+  (daemon, client, a, fh_a, delegation, v3, landing, target)
+}
+
+/// The landed file's bytes on the target.
+fn landed_bytes(target: &common::target::TargetDir) -> Vec<u8> {
+  #[allow(clippy::disallowed_methods)]
+  std::fs::read(std::path::Path::new(&target.path).join("held.txt")).unwrap()
+}
+
+/// RFC 8881 §10.2 (A-79), §4.15: do land a volume under a grant while A holds a delegation of a file in it — the
+/// landing makes the volume an overlay over what it wrote, which changes that file, so the delegation must be recalled
+/// first; expect A recalled, the landing to finish once A returns the delegation, and the file on the target. Before
+/// (CI, 2026-10-05, the Linux NFSv4.2 hermeticity lane): a granted landing that met a delegation answered
+/// `Unpublished { "the file is delegated to an NFSv4 client; its recall is under way" }`, which `slates land` does not
+/// retry, and the recall it asked for was never sent.
+#[test]
+fn a_granted_landing_of_a_delegated_file_waits_for_the_return_and_lands() {
+  let (daemon, client, mut a, fh_a, delegation, v3, landing, target) =
+    landing_a_delegated_volume("land-held");
+  let recall = a.next_message();
+  assert!(is_call(&recall), "A is recalled for the landing");
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  assert_eq!(a.delegreturn(&fh_a, delegation), NFS4_OK, "A returns it");
+  let landed = landing.join().unwrap();
+  assert!(
+    matches!(landed, Ok(slates_client::Landing::Landed(_))),
+    "the granted landing finished: {landed:?}"
+  );
+  assert_eq!(
+    landed_bytes(&target),
+    b"before",
+    "the delegated file reached the target"
+  );
+  assert!(
+    counter(&daemon, "landing.held_for_recall") >= 1,
+    "the landing waited for the return"
+  );
+  assert_eq!(
+    counter(&daemon, "nfs4.delegation.revoked_lapsed"),
+    0,
+    "released by the return, not the lease"
+  );
+  drop((a, client, v3));
+  drop(daemon);
+}
+
+/// RFC 8881 §10.4.5 (A-79): do land as above while A answers the recall but never returns the delegation; expect the
+/// landing to wait one lease, the delegation then revoked, and the landing to finish with the file on the target.
+#[test]
+fn a_granted_landing_waits_out_an_unreturned_delegation_and_lands() {
+  let began = Instant::now();
+  let (daemon, client, mut a, _fh_a, delegation, v3, landing, target) =
+    landing_a_delegated_volume("land-lapse");
+  let recall = a.next_message();
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  let landed = landing.join().unwrap();
+  assert!(
+    matches!(landed, Ok(slates_client::Landing::Landed(_))),
+    "the granted landing finished: {landed:?}"
+  );
+  assert!(began.elapsed() >= RECALL_LEASE, "held for the lease");
+  assert_eq!(landed_bytes(&target), b"before");
+  assert!(
+    counter(&daemon, "nfs4.delegation.revoked_lapsed") >= 1,
+    "revoked at the lease"
+  );
+  drop((a, client, v3));
+  drop(daemon);
+}

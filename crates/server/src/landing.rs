@@ -900,13 +900,20 @@ async fn drive_granted_landing(
     }
   };
   loop {
-    let stepped = crate::state::with_state(|s| step_granted(s, &mut granted))?;
+    let stepped = crate::state::with_state(|s| {
+      let stepped = step_granted(s, &mut granted);
+      // A recall a slice asked for is sent now, as a verb's is after its transaction (A-79): the landing runs as a
+      // task, after its verb returned.
+      crate::delegation::drain(s);
+      stepped
+    })?;
     match stepped {
       Stepped::More => {
         keep_lease_alive(&mut granted, renew, &key).await;
         slates_rt::futures::yield_now().await;
       }
       Stepped::Ready => {
+        recall_before_finish(&mut granted, renew, &key).await;
         return crate::state::with_state(move |s| {
           complete_landing_with(s, request, cause, |s| finish_granted(s, *granted, None))
         });
@@ -921,6 +928,63 @@ async fn drive_granted_landing(
     }
   }
 }
+
+/// The finish advances the volume's overlay past what reached the disk, which changes the landed files, so every
+/// delegation held on a file of the volume is recalled first (RFC 8881 §10.2; A-79) and the landing waits for their
+/// return, parked on the recall gate and keeping its target lease alive. A delegation not returned within a lease of
+/// the recall is revoked (§10.4.5), by the drain at the deadline, and the finish runs. Before 2026-10-05 the finish
+/// met the gate and the granted landing answered `Unpublished`, which `slates land` does not retry, and the recall it
+/// asked for was never sent, since nothing drained after a landing task's slices.
+#[cfg(unix)]
+async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &str) {
+  let handle = granted.handle;
+  let mut deadline: Option<u64> = None;
+  loop {
+    let asked = crate::state::with_state(|s| {
+      let prefix = s.volumes.get(handle).ok()?.volume.prefix();
+      if !s.store.recall_gate.recall_volume(prefix) {
+        return None;
+      }
+      crate::delegation::drain(s);
+      *s.refusals.entry(LANDING_HELD_FOR_RECALL).or_insert(0) += 1;
+      Some((s.store.recall_gate.generation(), s.config.failover_slo_ns))
+    })
+    .flatten();
+    let Some((generation, lease)) = asked else {
+      return;
+    };
+    let now = slates_rt::futures::now_ns();
+    // §10.4.5's "after a lease" is strict, and the recall was sent after this first ask began.
+    let until = *deadline.get_or_insert(now.saturating_add(lease).saturating_add(1));
+    if now >= until {
+      // The lease passed: the drain revokes what lapsed, and the finish runs over what is left.
+      let _ = crate::state::with_state(crate::delegation::drain);
+      return;
+    }
+    let parked = slates_rt::futures::within(
+      until.saturating_sub(now),
+      std::future::poll_fn(|cx| {
+        let released = crate::state::with_state(|s| {
+          s.store.recall_gate.wait_for_release(generation, cx.waker())
+        });
+        match released {
+          Some(false) => std::task::Poll::Pending,
+          _ => std::task::Poll::Ready(()),
+        }
+      }),
+    )
+    .await;
+    keep_lease_alive(granted, renew, key).await;
+    if parked.is_err() {
+      return;
+    }
+  }
+}
+
+/// Counter: a granted landing that waited before its finish for delegations held on its volume's files (A-79).
+/// Format: a counter name in the daemon's status report.
+#[cfg(unix)]
+const LANDING_HELD_FOR_RECALL: &str = "landing.held_for_recall";
 
 /// Format: how much of its term a landing's lease has left when the landing renews it, in permille — half:
 /// the margin then covers a slice and the renewal's round trip to the control shard, each far shorter than

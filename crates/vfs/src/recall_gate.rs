@@ -113,6 +113,22 @@ impl RecallGate {
     false
   }
 
+  /// Asks for the recall of every delegation held on a file of the volume whose inode numbers carry `prefix`, for a
+  /// change that will touch the volume's files wholesale (a landing's advance of its overlay); whether any was held.
+  /// A recall asked for this way is not a refused change, so the refusal count does not move.
+  pub fn recall_volume(&mut self, prefix: u16) -> bool {
+    let held: Vec<u64> = self
+      .delegated
+      .keys()
+      .copied()
+      .filter(|no| crate::ids::InodeNo(*no).prefix() == prefix)
+      .collect();
+    for no in &held {
+      self.requested.insert((*no, None));
+    }
+    !held.is_empty()
+  }
+
   /// The inodes, each with the actor of the change refused on it, whose recall was asked for since the last call.
   pub fn take_requested(&mut self) -> Vec<(u64, Option<u64>)> {
     std::mem::take(&mut self.requested).into_iter().collect()
