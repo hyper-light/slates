@@ -3684,7 +3684,8 @@ and creates even. A slab-held open extent would remove that allocation. Director
 against real trees"): real directories are mostly 3–56 entries (medians 4–6 in npm, pip and this repo) and each holds a
 whole 4,112-byte block, about 400 heap bytes an entry for a pip venv; heap-allocated right-sized blocks were measured and
 rejected (destroy slices into milliseconds of `dealloc`); blocks are now 1 KiB (A-101): real trees 28–44% less heap
-(npm 332, pip 368, cargo 418 bytes an entry); size-classed block slabs, which would fit both small and full
+(npm 332, pip 368, cargo 418 bytes an entry; then 316, 352, 402 with `attribute_of` and `Home`'s parent kept as
+non-zero words, so their `Option`s cost no tag: `Inode` 200 → 184 B); size-classed block slabs, which would fit both small and full
 directories, are owed. Next, each measured: `Option<InodeNo>` 16 B
 where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. A billion-file volume at even 100 B a
 file is 100 GB on one host: billion-file namespaces need a volume's metadata spread across shards and hosts (a design

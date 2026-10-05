@@ -113,7 +113,7 @@ impl Volume {
   /// Whether inode `no` is an attribute inode (the value of another inode's extended attribute). A
   /// transport refuses to serve one as a namespace object: it is reached only through its owner.
   pub fn is_attribute(&self, store: &Store, no: InodeNo) -> Result<bool, VfsError> {
-    Ok(self.inode(store, no)?.attribute_of.is_some())
+    Ok(self.inode(store, no)?.attribute_of().is_some())
   }
 
   /// Sets attribute `name` on inode `no` to `value`, as `mode` allows. Atomic (the module doc): the
@@ -460,7 +460,7 @@ impl Volume {
     );
     inode.attrs.uid = uid;
     inode.attrs.gid = gid;
-    inode.attribute_of = Some(owner);
+    inode.set_attribute_of(Some(owner));
     stamp_all(&mut inode.attrs, now);
     let handle = match store.inodes.insert(inode) {
       Ok(handle) => handle,
@@ -525,7 +525,7 @@ impl Volume {
 /// The inode as an attribute owner: a namespace inode. An attribute inode has no attributes of its
 /// own (NFSv4 refuses a named attribute of a named attribute, RFC 8881 §5.3); `NotPermitted`.
 fn owner_of(inode: &Inode) -> Result<&Inode, VfsError> {
-  if inode.attribute_of.is_some() {
+  if inode.attribute_of().is_some() {
     return Err(VfsError::NotPermitted);
   }
   Ok(inode)

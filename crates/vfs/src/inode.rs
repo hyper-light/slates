@@ -253,21 +253,45 @@ pub struct Inode {
   pub xattrs: Option<Box<XattrTable>>,
   /// For an attribute inode, the inode whose attribute it holds; `None` for every namespace inode.
   /// An attribute inode is in no directory, has one link (its owner's table) and is reclaimed with
-  /// its owner or when the attribute is removed or replaced.
-  pub attribute_of: Option<InodeNo>,
+  /// its owner or when the attribute is removed or replaced. Kept as a non-zero word (an inode number is never zero:
+  /// a volume's counter starts at 2), so `None` costs no tag: 8 bytes in every inode, not 16 ([`Inode::attribute_of`]).
+  attribute_owner: Option<std::num::NonZeroU64>,
 }
 
 /// A file's place in the namespace: the parent directory's inode number and the hash of the
 /// entry's folded name in it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Home {
-  /// The parent directory.
-  pub parent: InodeNo,
+  /// The parent directory, as a non-zero word (an inode number is never zero), so `Option<Home>` costs no tag: 16 bytes
+  /// in every inode, not 24 (AC-1.5, 2026-10-05). Read through [`Home::parent`].
+  parent: std::num::NonZeroU64,
   /// The hash of the entry's name under the volume's policy.
   pub hash: u64,
 }
 
+impl Home {
+  /// The place under directory `parent` of a name hashing to `hash`; `None` for parent number zero, which no inode has.
+  pub fn new(parent: InodeNo, hash: u64) -> Option<Home> {
+    std::num::NonZeroU64::new(parent.0).map(|parent| Home { parent, hash })
+  }
+
+  /// The parent directory.
+  pub fn parent(&self) -> InodeNo {
+    InodeNo(self.parent.get())
+  }
+}
+
 impl Inode {
+  /// For an attribute inode, the inode whose attribute it holds; `None` for a namespace inode.
+  pub fn attribute_of(&self) -> Option<InodeNo> {
+    self.attribute_owner.map(|owner| InodeNo(owner.get()))
+  }
+
+  /// Records which inode this attribute inode holds an attribute of (`None` for a namespace inode).
+  pub fn set_attribute_of(&mut self, owner: Option<InodeNo>) {
+    self.attribute_owner = owner.and_then(|owner| std::num::NonZeroU64::new(owner.0));
+  }
+
   /// A new inode with zero timestamps (the volume stamps them).
   pub fn new(no: InodeNo, born: Epoch, kind: Kind, mode: u32, body: Body) -> Self {
     Self {
@@ -291,7 +315,7 @@ impl Inode {
       home: None,
       multi: false,
       xattrs: None,
-      attribute_of: None,
+      attribute_owner: None,
     }
   }
 

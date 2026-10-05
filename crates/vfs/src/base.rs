@@ -1289,7 +1289,7 @@ impl Overlay<'_> {
     if !is_base || witnessed {
       return Ok(());
     }
-    if let Some(parent) = self.vol.inode(store, no)?.home.map(|h| h.parent)
+    if let Some(parent) = self.vol.inode(store, no)?.home.map(|h| h.parent())
       && let Ok(dir) = self.vol.current_dir(store, parent)
     {
       self.load_listing(store, dir)?;
@@ -1362,10 +1362,7 @@ impl Overlay<'_> {
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
-        inode.home = Some(Home {
-          parent: parent_no,
-          hash: self.vol.policy.hash(&entry.name),
-        });
+        inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
         Child::File(no)
@@ -1379,10 +1376,7 @@ impl Overlay<'_> {
         let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::Symlink(target));
         inode.attrs.size = fp.size;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
-        inode.home = Some(Home {
-          parent: parent_no,
-          hash: self.vol.policy.hash(&entry.name),
-        });
+        inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
         self.vol.table_set(store, no, handle)?;
         Child::Symlink(no)
@@ -2057,14 +2051,14 @@ impl Overlay<'_> {
     }
     let inode = self.vol.inode(store, no)?;
     let home = inode.home.ok_or(VfsError::NotOverlay)?;
-    let dir = self.vol.current_dir(store, home.parent)?;
+    let dir = self.vol.current_dir(store, home.parent())?;
     let name = store
       .dirs
       .get(dir)?
       .name_of(&store.blocks, home.hash, no)
       .ok_or(VfsError::NotFound)?
       .to_owned();
-    let host_dir = self.listing_dir(home.parent)?;
+    let host_dir = self.listing_dir(home.parent())?;
     Ok((host_dir, name))
   }
 
@@ -2096,7 +2090,7 @@ impl Overlay<'_> {
     let (host_dir, name) = self.home_of(store, no)?;
     let file = self.host.open_file(host_dir, &name).map_err(host_refusal)?;
     let fp = self.host.fstat(file).map_err(host_refusal)?;
-    let home_parent = self.vol.inode(store, no)?.home.map(|h| h.parent);
+    let home_parent = self.vol.inode(store, no)?.home.map(|h| h.parent());
     let read_at = home_parent
       .and_then(|p| {
         self
@@ -2434,7 +2428,7 @@ impl Overlay<'_> {
       self.plane()?.digest_stats.racy_uncached += 1;
       return Ok(());
     }
-    let Some(home) = self.vol.inode(store, no)?.home.map(|h| h.parent) else {
+    let Some(home) = self.vol.inode(store, no)?.home.map(|h| h.parent()) else {
       return Ok(());
     };
     let cached = CachedDigest {
@@ -2528,7 +2522,7 @@ impl Overlay<'_> {
       .inode(store, no)
       .ok()
       .and_then(|i| i.home)
-      .map(|h| h.parent)
+      .map(|h| h.parent())
     else {
       return;
     };
@@ -2792,7 +2786,7 @@ impl Overlay<'_> {
             .inode(store, *no)
             .ok()
             .and_then(|i| i.home)
-            .is_some_and(|h| dirs.contains(&h.parent))
+            .is_some_and(|h| dirs.contains(&h.parent()))
       })
       .collect();
     for no in targets {

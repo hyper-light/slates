@@ -1235,7 +1235,7 @@ impl Volume {
       },
       version: inode.version,
       home: inode.home.map(|h| HomeImage {
-        parent: h.parent.0,
+        parent: h.parent().0,
         hash: h.hash,
       }),
       multi: inode.multi,
@@ -1253,7 +1253,7 @@ impl Volume {
             .collect()
         })
         .unwrap_or_default(),
-      attribute_of: inode.attribute_of.map(|owner| owner.0),
+      attribute_of: inode.attribute_of().map(|owner| owner.0),
       sidecar: inode
         .xattrs
         .as_deref()
@@ -2012,12 +2012,11 @@ impl Volume {
       inode.born = Epoch(image_inode.born);
       inode.version = image_inode.version;
       inode.multi = image_inode.multi;
-      inode.home = image_inode.home.map(|h| Home {
-        parent: InodeNo(h.parent),
-        hash: h.hash,
-      });
+      inode.home = image_inode
+        .home
+        .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
       inode.attrs = attrs_from_image(&image_inode.attrs);
-      inode.attribute_of = image_inode.attribute_of.map(InodeNo);
+      inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
     }
     // Tables after every identity: an attribute inode is checked in the rebuilt table, where a
     // snapshot's shared attribute inode (in its `shared` list, not `inodes`) is also found.
@@ -2045,7 +2044,7 @@ impl Volume {
   fn attribute_of_owner(&self, store: &Store, attribute: InodeNo, owner: InodeNo) -> bool {
     trie::get(&store.tries, self.inode_root, attribute)
       .and_then(|handle| store.inodes.get(handle).ok())
-      .and_then(|inode| inode.attribute_of)
+      .and_then(|inode| inode.attribute_of())
       == Some(owner)
   }
 

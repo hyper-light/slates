@@ -921,7 +921,7 @@ impl Volume {
     no: InodeNo,
   ) -> Result<&'s Inode, VfsError> {
     let inode = self.inode(store, no)?;
-    if inode.attribute_of.is_some() {
+    if inode.attribute_of().is_some() {
       return Err(VfsError::NotFound);
     }
     Ok(inode)
@@ -1063,7 +1063,7 @@ impl Volume {
     let mut current = match self.current_dir(store, no) {
       Ok(_) => no,
       Err(VfsError::NotDirectory) => match self.inode(store, no)?.home {
-        Some(home) => home.parent,
+        Some(home) => home.parent(),
         None => return Ok(false),
       },
       Err(e) => return Err(e),
@@ -1475,10 +1475,7 @@ impl Volume {
       Body::Inline(Vec::new())
     };
     let mut inode = Inode::new(no, self.epoch, kind, mode, body);
-    inode.home = Some(Home {
-      parent,
-      hash: self.policy.hash(name),
-    });
+    inode.home = Home::new(parent, self.policy.hash(name));
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     let child = match kind {
@@ -1591,10 +1588,7 @@ impl Volume {
       Body::Symlink(target.into()),
     );
     inode.attrs.size = u64::try_from(target.len()).unwrap_or(0);
-    inode.home = Some(Home {
-      parent,
-      hash: self.policy.hash(name),
-    });
+    inode.home = Home::new(parent, self.policy.hash(name));
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     if let Err(refusal) = self.dir_insert(store, dir, name, Child::Symlink(no)) {
@@ -1983,10 +1977,7 @@ impl Volume {
       Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => {
         // The file's home follows it.
         let handle = self.make_current_inode(store, no)?;
-        store.inodes.get_mut(handle)?.home = Some(Home {
-          parent: to_no,
-          hash: self.policy.hash(to_name),
-        });
+        store.inodes.get_mut(handle)?.home = Home::new(to_no, self.policy.hash(to_name));
       }
       Child::Whiteout => {}
     }
@@ -2360,7 +2351,7 @@ impl Volume {
     off: u64,
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
-    if self.inode_in(store, id, no)?.attribute_of.is_some() {
+    if self.inode_in(store, id, no)?.attribute_of().is_some() {
       return Err(VfsError::NotFound);
     }
     self.read_in_body(store, id, no, off, buf)
@@ -2445,7 +2436,7 @@ impl Volume {
   /// The attributes of an inode as a snapshot holds them.
   pub fn stat_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Result<Attrs, VfsError> {
     let inode = self.inode_in(store, id, no)?;
-    if inode.attribute_of.is_some() {
+    if inode.attribute_of().is_some() {
       return Err(VfsError::NotFound);
     }
     Ok(inode.attrs)
@@ -2486,7 +2477,7 @@ impl Volume {
   pub fn path_of_inode(&self, store: &Store, no: InodeNo) -> Option<String> {
     let inode = self.inode(store, no).ok()?;
     let home = inode.home?;
-    let dir = self.current_dir(store, home.parent).ok()?;
+    let dir = self.current_dir(store, home.parent()).ok()?;
     let node = store.dirs.get(dir).ok()?;
     let name = node.name_of(&store.blocks, home.hash, no)?;
     Some(self.path_of(store, dir, name))
@@ -2496,7 +2487,7 @@ impl Volume {
   pub fn path_of_inode_in(&self, store: &Store, id: SnapshotId, no: InodeNo) -> Option<String> {
     let inode = self.inode_in(store, id, no).ok()?;
     let home = inode.home?;
-    let parent = self.inode_in(store, id, home.parent).ok()?;
+    let parent = self.inode_in(store, id, home.parent()).ok()?;
     let Body::Directory(dir) = parent.body else {
       return None;
     };
