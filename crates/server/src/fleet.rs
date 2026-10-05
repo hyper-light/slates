@@ -1447,6 +1447,13 @@ async fn serve_peer_records(
             CONFIG_FETCH_STREAM => {
               state::with_state(|s| serve_config_fetch(s, &request)).unwrap_or_default()
             }
+            RECIPIENT_STREAM => {
+              state::with_state(|s| crate::seal_keys::node_recipient_public(s)).unwrap_or_default()
+            }
+            PAIR_KEY_STREAM => {
+              state::with_state(|s| accept_pair_delivery(s, peer_anchor, &request))
+                .unwrap_or_default()
+            }
             REPORT_STREAM => state::with_state(|s| {
               let peer_host = s
                 .learned_members
@@ -3797,6 +3804,16 @@ const FORWARD_STREAM: u64 = 11;
 /// as an encoded [`ConfigCommand`], answered with a [`ReportOutcome`]. Distinct from every other stream the
 /// session multiplexes (1–14), so `serve_peer_records` dispatches it by its stream.
 const REPORT_STREAM: u64 = 15;
+/// The stream a node's recipient public key is asked on (A-92 piece 4b): answered from the control shard, which holds
+/// the recipient; the mutual TLS session binds the answer to the peer that gave it.
+/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
+const RECIPIENT_STREAM: u64 = 18;
+/// The stream an owner shard delivers a pair key on (A-92 piece 4b): its partition, the key's id and the key wrapped
+/// to this node's recipient; answered `[PAIR_ACCEPTED]` once recorded.
+/// Format: one stream id per RPC kind on a connection; a fixed label, not a tunable.
+const PAIR_KEY_STREAM: u64 = 19;
+/// Format: the reply byte of an accepted pair key.
+const PAIR_ACCEPTED: u8 = 1;
 
 /// Answers one configuration-council Raft message a peer shipped on [`CONFIG_STREAM`] (§4.8, D-14): the
 /// council serves a pre-vote, a vote request, or an append — applying whatever an append newly commits to
@@ -5467,6 +5484,7 @@ async fn run_record_period(
       in_flight.push(dispatch);
     }
   }
+  deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
   // Record durably each seal whose content and head have both placed.
   let _ = run_on(origin, shard, record_placed_seals);
@@ -5476,6 +5494,174 @@ async fn run_record_period(
   crate::merge_service::run_merge_period(origin, shard, local, budget, owner_acceptor, in_flight)
     .await;
 }
+
+/// Delivers `shard`'s pair key to each host of its neighbourhood it has not yet delivered one to in this daemon's life
+/// (A-92 piece 4b): the host's recipient public key asked over its authenticated session (and kept), the shard's
+/// pair key made or found and wrapped to it, sent, and marked delivered on the host's acceptance. A pair is named by
+/// the host's stable anchor, never its member id, which a restart of its daemon moves: so a candidate's restart keeps
+/// its pair, and the records stay one per (owner shard, candidate). Once per pair per daemon life; a candidate accepts
+/// a repeat of the key it holds, so a restart's redelivery changes nothing there.
+async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBudget) {
+  let Some((members, delivered)) = call_within(
+    origin,
+    shard,
+    move |s| {
+      s.seal_root.as_ref()?;
+      let members: Vec<HostId> = s
+        .fleet
+        .configuration()
+        .neighbourhood
+        .iter()
+        .copied()
+        .filter(|host| *host != local)
+        .collect();
+      Some((members, s.pairs_delivered.clone()))
+    },
+    HEARTBEAT_NS,
+  )
+  .await
+  .flatten() else {
+    return;
+  };
+  // Each neighbour by its stable anchor, from the identities this control shard has learned.
+  let owed: Vec<(HostId, u64)> = state::with_state(|s| {
+    members
+      .iter()
+      .filter_map(|member| {
+        s.learned_members
+          .iter()
+          .find(|(_, learned)| learned.host == *member)
+          .map(|(anchor, _)| (*member, anchor.0))
+      })
+      .filter(|(_, anchor)| !delivered.contains(anchor))
+      .collect()
+  })
+  .unwrap_or_default();
+  for (member, anchor) in owed {
+    let Some(public) = peer_recipient(member, anchor, budget).await else {
+      continue;
+    };
+    let delivery = call_within(
+      origin,
+      shard,
+      move |s| {
+        crate::seal_keys::pair_for_delivery(s, anchor, &public)
+          .ok()
+          .map(|(id, record)| (s.partition, id, record))
+      },
+      HEARTBEAT_NS,
+    )
+    .await
+    .flatten();
+    let Some((partition, id, record)) = delivery else {
+      count_refusal(PAIR_UNDELIVERED);
+      continue;
+    };
+    let mut request = Vec::with_capacity(
+      size_of::<u16>()
+        .saturating_add(id.len())
+        .saturating_add(record.len()),
+    );
+    request.extend_from_slice(&partition.to_le_bytes());
+    request.extend_from_slice(&id);
+    request.extend_from_slice(&record);
+    let accepted = request_peer(member, PAIR_KEY_STREAM, &request, budget).await;
+    if accepted.as_deref() == Some(&[PAIR_ACCEPTED][..]) {
+      let _ = call_within(
+        origin,
+        shard,
+        move |s| {
+          if s.pairs_delivered.len() < s.config.fleet_peer_capacity.max(1) {
+            s.pairs_delivered.insert(anchor);
+          }
+        },
+        HEARTBEAT_NS,
+      )
+      .await;
+    } else {
+      count_refusal(PAIR_UNDELIVERED);
+    }
+  }
+}
+
+/// Counter: a pair key that could not be made, wrapped or delivered this period (A-92 piece 4b); tried again next.
+/// Format: a counter name in the daemon's status report.
+const PAIR_UNDELIVERED: &str = "fleet.seal.pair_undelivered";
+
+/// The recipient public key of the node with stable `anchor`, reached as `member` (A-92 piece 4b): kept from an earlier
+/// answer, or asked over its authenticated record session now and kept by anchor (bounded by the fleet's peer
+/// capacity). `None` when no session to it is reachable or it answers none (sealing is unavailable there).
+async fn peer_recipient(
+  member: HostId,
+  anchor: u64,
+  budget: CommitBudget,
+) -> Option<hyper_seal::recipient::RecipientPublic> {
+  if let Some(Some(known)) = state::with_state(|s| s.peer_recipients.get(&anchor).cloned()) {
+    return Some(known);
+  }
+  let answer = request_peer(member, RECIPIENT_STREAM, &[], budget).await?;
+  let public = crate::seal_keys::decode_public(&answer)?;
+  let kept = public.clone();
+  state::with_state(|s| {
+    if s.peer_recipients.len() < s.config.fleet_peer_capacity.max(1) {
+      s.peer_recipients.insert(anchor, kept);
+    }
+  });
+  Some(public)
+}
+
+/// One request to `host` over its record session, within the round's budget: the reply, or `None` when no session to
+/// it is reachable or the exchange failed (an empty reply is a refusal).
+async fn request_peer(
+  host: HostId,
+  stream: u64,
+  request: &[u8],
+  budget: CommitBudget,
+) -> Option<Vec<u8>> {
+  let mut sessions = take_sessions(|candidate| candidate == host);
+  let taken = sessions.pop();
+  return_sessions(sessions);
+  let (holder, endpoint) = taken?;
+  let (reply, endpoint) = request_within(
+    endpoint,
+    stream,
+    Priority::Metadata,
+    request,
+    budget.max_deadline_ns(),
+  )
+  .await;
+  return_sessions(vec![(holder, endpoint)]);
+  (!reply.bytes.is_empty()).then_some(reply.bytes)
+}
+
+/// A pair key an owner's shard delivered (A-92 piece 4b): its partition, the key's id and the record wrapped to this node's
+/// recipient, accepted from the node with stable anchor `peer` (the session's authenticated certificate, never a field of
+/// the request) and recorded under that anchor.
+fn accept_pair_delivery(s: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
+  let Some((partition, rest)) = request.split_at_checked(size_of::<u16>()) else {
+    return Vec::new();
+  };
+  let Some((id, delivery)) = rest.split_at_checked(PAIR_ID_BYTES) else {
+    return Vec::new();
+  };
+  let (Ok(partition), Ok(id)) = (partition.try_into().map(u16::from_le_bytes), id.try_into())
+  else {
+    return Vec::new();
+  };
+  match crate::seal_keys::accept_pair(s, (peer.0, partition), id, delivery) {
+    Ok(()) => vec![PAIR_ACCEPTED],
+    Err(_) => {
+      count_refusal(PAIR_REFUSED);
+      Vec::new()
+    }
+  }
+}
+
+/// Format: a pair key's id (hyper-seal's `KeyId`).
+const PAIR_ID_BYTES: usize = 16;
+/// Counter: a pair key delivery this node refused (malformed, not for its recipient, or another key for a recorded pair).
+/// Format: a counter name in the daemon's status report.
+const PAIR_REFUSED: &str = "fleet.seal.pair_refused";
 
 /// Ships each of `shard`'s unplaced heads — catalogs, heads and tombstones — to all its candidate holders at
 /// once, committed at `f + 1`.

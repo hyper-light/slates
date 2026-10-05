@@ -10752,3 +10752,76 @@ fn a_planned_export_binds_a_tcp_listener_and_none_without_one() {
   );
   assert!(planned(false).bind().unwrap().export.is_none());
 }
+
+/// A-92 piece 4b: do form a two-node fleet, then wait for the owner's shard to deliver its pair key to the other node
+/// (each record period delivers it to every neighbour that lacks it), and wrap a fresh key under the owner shard's pair
+/// key and unwrap it under the candidate's; expect the candidate's control shard to record the pair (unwrapped with its
+/// ML-KEM recipient, re-wrapped under its own root) and to unwrap exactly the bytes the owner wrapped — one key on both
+/// sides, delivered over the authenticated session without either root leaving its node.
+#[test]
+fn an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient() {
+  use slates_db::catalog::SealKeyOwner;
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let (anchor_a, anchor_b) = (a.origin_anchor, b.origin_anchor);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet's direct probe mesh formed before the test acts"
+  );
+  let budget = slates_server::daemon::OBSERVE_BUDGET_NS;
+  let at_candidate = SealKeyOwner::Pair {
+    host: anchor_a.0,
+    partition: 0,
+  };
+  let at_owner = SealKeyOwner::Pair {
+    host: anchor_b.0,
+    partition: 0,
+  };
+  let delivered = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+    daemon_b.observe_control(budget, move |s| {
+      s.db.partition().seal_key(&at_candidate).is_some()
+    })
+  });
+  let wrapped = daemon_a.observe_control(budget, move |s| {
+    let pair = slates_server::seal_keys::pair_key(s, at_owner).unwrap();
+    let (child, wrapped) = pair.make_child().unwrap();
+    (child.bytes().to_vec(), wrapped.encode().to_vec())
+  });
+  let unwrapped = wrapped.as_ref().ok().map(|(_, record)| {
+    let record = record.clone();
+    daemon_b.observe_control(budget, move |s| {
+      let pair = slates_server::seal_keys::pair_key(s, at_candidate).unwrap();
+      pair
+        .unwrap(&hyper_seal::keys::Wrapped::decode(&record).unwrap())
+        .unwrap()
+        .bytes()
+        .to_vec()
+    })
+  });
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    delivered,
+    "the candidate recorded the owner shard's pair key"
+  );
+  let (sent, _) = wrapped.unwrap();
+  assert_eq!(unwrapped.unwrap().unwrap(), sent, "one key on both sides");
+}

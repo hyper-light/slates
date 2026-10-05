@@ -347,6 +347,12 @@ pub struct ShardState {
   /// what a successor unwraps a taken-over volume's lineage key with. `None` elsewhere and while sealing is
   /// unavailable.
   pub seal_recipient: Option<hyper_seal::recipient::Recipient>,
+  /// The candidate nodes, by stable anchor, this shard's pair key was delivered to in this daemon's life (A-92 piece 4b),
+  /// bounded by the fleet's peer capacity.
+  pub pairs_delivered: std::collections::BTreeSet<u64>,
+  /// The recipient public keys of peers by stable anchor, asked over their authenticated sessions and kept (A-92 piece
+  /// 4b), bounded by the fleet's peer capacity.
+  pub peer_recipients: BTreeMap<u64, hyper_seal::recipient::RecipientPublic>,
   /// Replies waiting for the client's ring (full, or the reply came from another shard), by
   /// client slot; `recorded` says the completion record already exists (at the owner
   /// partition of a forwarded verb), so this shard must not record it again.

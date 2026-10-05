@@ -9205,6 +9205,16 @@ Its id travels on the control shard's status part and is reported as `seal_recip
 same recipient after a daemon restart and another under a fresh anchor. Its decapsulation key lives in AWS-LC's
 memory (hyper-seal's `Recipient`), not hyper-seal's locked region; the daemon's process-wide core-dump exclusion
 (AUD-29-41) covers it, and locking it is owed to hyper-seal.
+Built (2026-10-05): piece 4b, pair keys. Each record period the control shard has every owner shard deliver its pair key
+to each neighbour that lacks it: the neighbour's recipient public key is asked on `RECIPIENT_STREAM` over the
+mutually authenticated record session (and kept by the neighbour's stable anchor), the owner shard makes or finds its
+pair key (`SealKeyOwner::Pair`, under its root) and wraps it to that key (hybrid ML-KEM-1024 with P-384), and the
+neighbour's control shard unwraps it with its recipient and records it under its own root (`PAIR_KEY_STREAM`, keyed by
+the anchor its session's certificate authenticates, never a field of the request). Pairs are named by stable anchor:
+keyed first by member id, a candidate's restart would have made a new pair each time and grown the records without
+bound (found by the test's first run, which looked the pair up by anchor). Proven by
+`an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient` (a key wrapped under the owner shard's pair key
+unwraps to the same bytes under the candidate's); the fleet suite (70) passes with delivery running every period.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two
@@ -9263,10 +9273,16 @@ memory (hyper-seal's `Recipient`), not hyper-seal's locked region; the daemon's 
   each chunk it needs.
 - How a successor gets the key (piece 4, landing with 3b, since a successor that cannot open breaks takeover): (4a) each
   node has an ML-KEM-1024 recipient key pair for the anchor's life, its secret half sealed under the node root
-  (hyper-seal's `Recipient::seal`) and recorded in partition 0, so a daemon restart keeps it; (4b) each node announces
-  its recipient public key to its peers over the authenticated record sessions, and keeps theirs; (4c) the head record
-  carries the volume's lineage key wrapped to each record candidate whose key it holds (seal.md §6, hybrid
-  ML-KEM-1024 with P-384), so any candidate that succeeds unwraps it, and no other node can.
+  (hyper-seal's `Recipient::seal`) and recorded in partition 0, so a daemon restart keeps it; (4b) a **pair key** per
+  (owner shard, candidate node): the owner's shard makes a random key, records it under its own root, fetches the
+  candidate's recipient public key over their mutually authenticated record session and sends the pair key wrapped to
+  it (seal.md §6, hybrid ML-KEM-1024 with P-384, about 1.7 KB once per pair); the candidate's control shard unwraps it
+  and records it under its own root, keyed by the owner host and partition; (4c) the head record carries the volume's
+  lineage key wrapped under each candidate's pair key (AES-KW, 61 bytes per candidate), so any candidate that
+  succeeds unwraps its pair key and then the lineage key, and no other node can. Wrapping each volume's key to each
+  candidate by ML-KEM directly was weighed and rejected on size: 1.7 KB per volume per candidate in every head kept
+  on every holder (100,000 volumes at two candidates is 340 MB a holder), against 61 bytes here; the pair key is
+  seal.md §3.1's hierarchy applied once more (a key wraps keys below it).
 - Order of build: (1) the vendored crate in the build, its known-answer behaviour exercised by slates' use; (2) the
   key hierarchy in the daemon and the anchor's handover of the root; (3) sealed content on the content plane, with
   holders verifying ciphertext and keyed names in the missing sets; (4) the successor's wrapped lineage key in the

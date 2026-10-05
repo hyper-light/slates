@@ -252,3 +252,140 @@ pub fn recipient(
   )?;
   Ok(made)
 }
+
+/// Format: a recipient public key on the wire (A-92 piece 4b): its id (16), its ML-KEM-1024 encapsulation key
+/// (1,568), then `1` and its P-384 public point (97) when it takes hybrid records, or `0`.
+const PUBLIC_HYBRID: u8 = 1;
+/// Format: the flag of a recipient that takes CNSA records only.
+const PUBLIC_CNSA: u8 = 0;
+/// Format: a recipient's id (hyper-seal's random 128-bit id).
+const RECIPIENT_ID_BYTES: usize = 16;
+
+/// `public` as the recipient stream carries it.
+pub fn encode_public(public: &hyper_seal::recipient::RecipientPublic) -> Vec<u8> {
+  let mut out = Vec::with_capacity(
+    RECIPIENT_ID_BYTES
+      + hyper_seal::recipient::KEM_PUBLIC
+      + size_of::<u8>()
+      + hyper_seal::recipient::ECDH_PUBLIC,
+  );
+  out.extend_from_slice(&public.id);
+  out.extend_from_slice(&public.kem);
+  match &public.ecdh {
+    Some(point) => {
+      out.push(PUBLIC_HYBRID);
+      out.extend_from_slice(point);
+    }
+    None => out.push(PUBLIC_CNSA),
+  }
+  out
+}
+
+/// The recipient public key `bytes` carries, refusing any other length or flag (hostile input, §4.9).
+pub fn decode_public(bytes: &[u8]) -> Option<hyper_seal::recipient::RecipientPublic> {
+  let (id, rest) = bytes.split_at_checked(RECIPIENT_ID_BYTES)?;
+  let (kem, rest) = rest.split_at_checked(hyper_seal::recipient::KEM_PUBLIC)?;
+  let (&flag, rest) = rest.split_first()?;
+  let ecdh = match (flag, rest.len()) {
+    (PUBLIC_HYBRID, len) if len == hyper_seal::recipient::ECDH_PUBLIC => {
+      Some(rest.try_into().ok()?)
+    }
+    (PUBLIC_CNSA, 0) => None,
+    _ => return None,
+  };
+  Some(hyper_seal::recipient::RecipientPublic {
+    id: id.try_into().ok()?,
+    kem: kem.to_vec(),
+    ecdh,
+  })
+}
+
+/// This node's recipient public key as the recipient stream answers it, on the control shard; empty while sealing is
+/// unavailable (the peer then pairs nothing with this node).
+pub fn node_recipient_public(state: &crate::state::ShardState) -> Vec<u8> {
+  state
+    .seal_recipient
+    .as_ref()
+    .map(|recipient| encode_public(&recipient.public()))
+    .unwrap_or_default()
+}
+
+/// The pair key this owner shard keeps with candidate `host`, made and recorded under the root if new, wrapped to the
+/// candidate's `public` key for delivery (A-92 piece 4b): its id and the hybrid ML-KEM record.
+pub fn pair_for_delivery(
+  state: &mut crate::state::ShardState,
+  host: u64,
+  public: &hyper_seal::recipient::RecipientPublic,
+) -> Result<([u8; 16], Vec<u8>), SealKeyError> {
+  let owner = slates_db::catalog::SealKeyOwner::Pair {
+    host,
+    partition: state.partition,
+  };
+  let recorded = state.db.partition().seal_key(&owner).cloned();
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  let (id, secret, fresh) = match recorded {
+    Some(record) => (
+      record.id,
+      root.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?,
+      None,
+    ),
+    None => {
+      let (secret, wrapped) = root.make_child()?;
+      let id = KeyId::random()?;
+      (id.0, secret, Some(record_of(owner, id, &wrapped)))
+    }
+  };
+  let delivery = hyper_seal::recipient::wrap_to(
+    public,
+    hyper_seal::recipient::Mode::Hybrid,
+    KeyId(id),
+    &secret,
+  )?;
+  if let Some(record) = fresh {
+    commit(state, record)?;
+  }
+  Ok((id, delivery))
+}
+
+/// A pair key an owner's shard `partition` on `host` delivered (A-92 piece 4b), on the control shard: unwrapped with this
+/// node's recipient and recorded under its root. A second delivery of the recorded key is accepted; another key for
+/// a recorded pair is refused, as the partition refuses a second record for an owner.
+pub fn accept_pair(
+  state: &mut crate::state::ShardState,
+  (host, partition): (u64, u16),
+  id: [u8; 16],
+  delivery: &[u8],
+) -> Result<(), SealKeyError> {
+  let owner = slates_db::catalog::SealKeyOwner::Pair { host, partition };
+  if let Some(record) = state.db.partition().seal_key(&owner) {
+    return if record.id == id {
+      Ok(())
+    } else {
+      Err(SealKeyError::Record)
+    };
+  }
+  let recipient = state
+    .seal_recipient
+    .as_ref()
+    .ok_or(SealKeyError::Unavailable)?;
+  let secret = recipient.unwrap(KeyId(id), delivery)?;
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  let wrapped = root.wrap(&secret)?;
+  commit(state, record_of(owner, KeyId(id), &wrapped))
+}
+
+/// The pair key recorded for `owner` here, unwrapped under the root: on an owner shard its key with a candidate, on a
+/// candidate's control shard an owner shard's key with it.
+pub fn pair_key(
+  state: &crate::state::ShardState,
+  owner: slates_db::catalog::SealKeyOwner,
+) -> Result<WrappingKey, SealKeyError> {
+  let record = state
+    .db
+    .partition()
+    .seal_key(&owner)
+    .cloned()
+    .ok_or(SealKeyError::Record)?;
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  open(root, &record)
+}

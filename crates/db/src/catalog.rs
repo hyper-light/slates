@@ -782,6 +782,15 @@ pub enum SealKeyOwner {
   /// The node's ML-KEM-1024 recipient key pair (seal.md §6), sealed whole under the node's root: what a successor
   /// unwraps a taken-over volume's lineage key with. Recorded in partition 0 only. Appended.
   Recipient,
+  /// A pair key between an owner shard and a candidate node (A-92 piece 4b), wrapped by this node's root. On the owner
+  /// shard `host` is the candidate and `partition` the owner's own; on the candidate (partition 0) `host` is the
+  /// owner and `partition` the owner's shard. Appended.
+  Pair {
+    /// The other node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+  },
 }
 
 /// Format: the most bytes a sealed recipient record holds: hyper-seal's `Recipient::seal` of a hybrid recipient is one

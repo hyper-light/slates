@@ -2669,6 +2669,8 @@ fn init_shard(
     seal_root,
     seal_state: sealing,
     seal_recipient: None,
+    pairs_delivered: std::collections::BTreeSet::new(),
+    peer_recipients: std::collections::BTreeMap::new(),
     content,
     content_range,
     delta_range: delta_range(config, partition, content_range),
