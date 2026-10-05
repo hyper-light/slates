@@ -2123,7 +2123,7 @@ trip (alpine:3.20), each also on a container tmpfs. Apple M5 Max, Docker Desktop
 Times (s, slates / tmpfs): npm 10.4 / 22.8, pip 16.8 / 9.7, tar 7.5 / 0.9 in the second run. The extra pip files are
 NFSv3 silly renames held by Docker Desktop's virtiofs share (GAPS).
 
-### Directory blocks against real trees (§4.5, AC-1.5, AC-1.8; 2026-10-05) — measured and rejected
+### Directory blocks against real trees (§4.5, AC-1.5, AC-1.8; 2026-10-05) — 1 KiB adopted (A-101), heap buffers rejected
 
 Real trees' entries per directory (`dirhist.sh`, session scratch: `ls -A` counts under every directory):
 
@@ -2141,7 +2141,18 @@ compaction (the tree's split and merge rules unchanged). `vfs_bench`, three runs
 load average 19–24: the bench's AC-1.5 unchanged (352,335,998 → 352,721,118 B: its directories fill a page anyway),
 lookups and readdir even, and AC-1.8's longest destroy slice 7–14 µs → 2.2–4.3 ms, all of it inside `dealloc` (the
 allocator returning pages: the stall `dirtree`'s module doc recorded when it put blocks in slab slots). Rejected.
-Owed instead: size-classed block slabs (256 B … 4 KiB buffers, each class a slab whose slots are never returned per
+Then the block size itself, on the real trees (`cargo run --release -p slates-vfs --example tree_heap`: npm, pip and a
+cargo `target/release`, 64 copies each, every heap byte counted), heap bytes an entry:
+
+| block | npm | pip | cargo |
+|---|---|---|---|
+| 4 KiB (was) | 464 | 662 | 743 |
+| 2 KiB | 374 | 465 | 527 |
+| 1 KiB (adopted) | 332 | 368 | 418 |
+
+`vfs_bench` two runs each, 4 KiB → 1 KiB: lookup in a tree directory of 128 265–276 → 224–244 ns, of 16 229–239 →
+203–250, a 36-entry readdir 479–604 → 510–687, the create burst 1,663–1,697 → 1,765–1,818 ns a file, AC-1.8 destroy
+slices within budget either way, AC-1.5 352,335,998 → 383,350,910 B (the bench's 36-entry directories). Still owed: owed instead: size-classed block slabs (256 B … 4 KiB buffers, each class a slab whose slots are never returned per
 item), a block naming its buffer by class and handle: XFS's progression from in-inode to one block to leaf and node
 forms (Sweeney et al., USENIX 1996) without the global allocator.
 

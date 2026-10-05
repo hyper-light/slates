@@ -40,7 +40,7 @@ pub const SMALL_NAME_BYTES: usize = SMALL_ENTRIES * MEASURED_NAME_BYTES;
 
 /// Derived: the blocks a small directory's move to a tree takes — one. At the move it holds at most
 /// [`SMALL_ENTRIES`] entries and [`SMALL_NAME_BYTES`] of names, and the new entry adds one entry and at
-/// most `NAME_MAX` bytes: `(2 + 1) × 24 + 98 + 255 = 425` bytes, far inside one 4,096-byte block, so
+/// most `NAME_MAX` bytes: `(2 + 1) × 24 + 98 + 255 = 425` bytes, inside one 1,024-byte block, so
 /// the fresh tree never splits (`a_small_directory_moves_to_a_tree_in_one_block` checks it).
 pub const SMALL_TO_TREE_BLOCKS: usize = 1;
 

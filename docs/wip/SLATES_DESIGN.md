@@ -9696,3 +9696,25 @@ Status: built 2026-10-05 (docs/bugs/2026-10-05-a-slow-shard-start-stopped-the-da
   store behind the slow starts.
 Applied in the same change to: GAPS (boot entry closed, the control-shard sibling open), the bug record,
 `crates/server/src/{daemon,config,lib}.rs`, `crates/server/tests/recovery.rs`.
+
+### A-101 — Directory blocks of 1 KiB, chosen on real trees (2026-10-05)
+Status: built 2026-10-05.
+- What: a directory's B+-tree block (`dirtree::BLOCK_BYTES`, §4.5 D-4 `Indexed`) is the smallest power of two that holds
+  three entries at the longest name, `3 × (24 + 255)` → 1,024 bytes, where it was a 4 KiB page. `MAX_HEIGHT` follows (at
+  least 3 entries a block, `3^21 > u32::MAX`: 21).
+- Why: real directories are small. Entries per directory, measured 2026-10-05: an npm tree (express, lodash,
+  typescript) median 4, p90 13; a pip venv (requests, flask) median 6, p90 18; this repository's `crates/` median 4;
+  a cargo `target/release` median 4 with 505 of 578 directories holding 3 to 8 entries. Each directory past the inline
+  cut-over (2 entries) held one 4,112-byte block. The Phase 1 bench's shape (36 entries of 49-byte names a directory)
+  had fixed the page; real trees, cargo's included, do not have that shape.
+- Evidence: `cargo run --release -p slates-vfs --example tree_heap` builds the three real trees (path lists captured in
+  containers and from the build, `examples/data/*-tree.txt`), 64 copies each so slab slack is amortized, and counts
+  every heap byte. Heap bytes an entry, 4 KiB / 2 KiB / 1 KiB: npm 464 / 374 / 332, pip 662 / 465 / 368, cargo 743 /
+  527 / 418. `vfs_bench`, two runs each: lookups no slower (smaller blocks), a 36-entry readdir about 10% slower, the
+  190,000-file create burst 1,673 → 1,771 ns a file, destroy slices unchanged, and the bench's own uniform shape 9% more
+  heap (352 → 383 MB a million files: its 36-entry directories fill a 4 KiB block and span three of 1 KiB and an
+  index), still inside its derived budget.
+- Rejected the same day: a block's bytes as a heap buffer sized to its entries (same benchmark memory, and destroy
+  slices into milliseconds of `dealloc`). Owed: size-classed block slabs, which would fit both shapes (BENCHMARKS).
+Applied in the same change to: `crates/vfs/src/{dirtree,dir}.rs`, `crates/vfs/examples/tree_heap.rs` and its data,
+BENCHMARKS, GAPS.

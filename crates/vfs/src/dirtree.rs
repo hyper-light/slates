@@ -29,20 +29,28 @@ use crate::error::VfsError;
 use crate::ids::{Epoch, InodeNo};
 use crate::names::NameEquivalence;
 
-/// Derived: a block is one 4 KiB page, the smallest base page of any supported target and the
-/// unit a copy-on-write copy moves; a 16 KiB-page machine packs four per page. It holds about
-/// 56 entries of the measured 49-byte mean name, so the measured p99 directory (181 entries)
-/// is four blocks and the median (2) never reaches this representation.
-pub const BLOCK_BYTES: usize = 4096;
+/// Derived: the smallest power of two that holds three entries at the longest name (`3 × (ENTRY_BYTES + 255)` = 837
+/// bytes; a B+-tree block must hold at least two to split). Measured against real trees (`examples/tree_heap.rs`, 64
+/// copies each, 2026-10-05): an npm tree 464 → 332 heap bytes an entry, a pip venv 662 → 368, a cargo `target/release`
+/// 743 → 418, against 4 KiB blocks (2 KiB: 374, 465, 527). Real directories are mostly 3 to 8 entries (medians of 4 to
+/// 6), each of which held a whole block. Lookups are no slower (smaller blocks, fewer probes); a 36-entry readdir about
+/// 10% slower and a create about 6%; the bench's uniform 36-entry directories of 49-byte names, which fill a 4 KiB block,
+/// take 9% more (they span three blocks and an index).
+pub const BLOCK_BYTES: usize =
+  (MIN_ENTRIES_AT_NAME_MAX * (ENTRY_BYTES + crate::names::NAME_MAX)).next_power_of_two();
+
+/// Shape: the entries a block holds at the longest name, at the least: two to split, three so a block left by a split
+/// still takes an insert.
+const MIN_ENTRIES_AT_NAME_MAX: usize = 3;
 
 /// Format: the bytes one entry takes in a block: hash, child word, name offset, name length,
 /// kind, and padding to eight bytes.
 pub const ENTRY_BYTES: usize = 24;
 
 /// Derived: the deepest tree the entry counter can need: entries per block at the longest
-/// allowed name is at least 14 (`4096 / (24 + 255)`), and `14^9` exceeds `u32::MAX`, the
+/// allowed name is at least 3 (`1024 / (24 + 255)`), and `3^21` exceeds `u32::MAX`, the
 /// most entries a block count can address.
-const MAX_HEIGHT: usize = 9;
+const MAX_HEIGHT: usize = 21;
 
 /// Derived: a leaf whose live bytes fall to a quarter of the block merges with its right
 /// sibling when both fit in one block, which keeps blocks at least a quarter full after any
@@ -1237,6 +1245,8 @@ mod tests {
           .is_some()
       );
     }
+    // The removals merged blocks, which retires the merged-away ones; what follows must retire nothing.
+    retired.clear();
     assert!(
       tree
         .set_child(
