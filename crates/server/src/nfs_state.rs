@@ -104,6 +104,18 @@ pub(crate) fn file_state(s: &mut ShardState) -> Option<FileState> {
     caps.locks,
     partition.nfs_opens().map(open_of).collect(),
     partition.nfs_locks().map(lock_of).collect(),
+    partition
+      .nfs_delegations()
+      .map(
+        |record| slates_bridge_nfs::v4::delegation::DelegationRecord {
+          other: record.other,
+          clientid: record.clientid,
+          fh: record.fh.clone(),
+          write: record.write,
+          seqid: record.seqid,
+        },
+      )
+      .collect(),
   ))
 }
 
@@ -168,6 +180,16 @@ fn file_op(change: FileChange) -> Op {
     },
     FileChange::LockCleared(other) => Op::NfsLockCleared { other },
     FileChange::ClientCleared(clientid) => Op::NfsClientStateCleared { clientid },
+    FileChange::DelegationSet(record) => Op::NfsDelegationSet {
+      record: slates_db::catalog::NfsDelegationRecord {
+        other: record.other,
+        clientid: record.clientid,
+        fh: record.fh,
+        write: record.write,
+        seqid: record.seqid,
+      },
+    },
+    FileChange::DelegationCleared(other) => Op::NfsDelegationCleared { other },
   }
 }
 

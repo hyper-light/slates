@@ -349,6 +349,10 @@ pub enum FileChange {
   LockCleared(Other),
   /// Every open and lock state of a client was dropped.
   ClientCleared(u64),
+  /// A delegation was granted or changed (A-78).
+  DelegationSet(super::delegation::DelegationRecord),
+  /// A delegation was returned or revoked.
+  DelegationCleared(Other),
 }
 
 /// One owner shard's NFSv4 file state: its opens and lock states, bounded.
@@ -359,6 +363,8 @@ pub struct FileState {
   opens: BTreeMap<Other, Open>,
   by_file: BTreeMap<OpenKey, Other>,
   locks: LockTable,
+  /// The files' delegations (A-78).
+  delegations: super::delegation::Delegations,
   /// The changes since the last [`FileState::take_changes`], for the owner's partition to record, when
   /// the state is durable (`None` for a standalone server, which records nothing). Drained after
   /// every operation, so it holds one operation's changes at most.
@@ -376,6 +382,7 @@ impl FileState {
       opens: BTreeMap::new(),
       by_file: BTreeMap::new(),
       locks: LockTable::new(tag, max_locks),
+      delegations: super::delegation::Delegations::new(max_opens),
       changes: None,
     }
   }
@@ -391,6 +398,7 @@ impl FileState {
     max_locks: usize,
     opens: Vec<OpenRecord>,
     locks: Vec<LockRecord>,
+    delegations: Vec<super::delegation::DelegationRecord>,
   ) -> FileState {
     let mut state = FileState::new(tag, max_opens, max_locks);
     for record in opens {
@@ -422,6 +430,9 @@ impl FileState {
           ranges: super::lock::OwnerRanges::from_ranges(&record.ranges),
         },
       );
+    }
+    for record in delegations {
+      state.delegations.restore(record);
     }
     state.changes = Some(Vec::new());
     state
@@ -579,6 +590,16 @@ impl FileState {
     if stateid.is_special() {
       self.refuse_denied(fh, None, want)?;
       return Ok(IoAuthority::Mode);
+    }
+    // A delegation's state id serves its holder's I/O (§10.4.1): reads under a read delegation, and writes only under
+    // a write delegation.
+    if self.delegations.holder(&stateid.other).is_some() {
+      let write = self.delegations.check(stateid, clientid, fh)?;
+      return match want {
+        IoWant::Write if !write => Err(Nfsstat4::Openmode),
+        IoWant::Read | IoWant::Write => Ok(IoAuthority::Open),
+        IoWant::Attributes => Ok(IoAuthority::Mode),
+      };
     }
     let (open_other, open) = if self.locks.contains(&stateid.other) {
       let lock = self.locks.get(stateid, fh, Some(clientid))?;
@@ -786,7 +807,8 @@ impl FileState {
       .opens
       .get(other)
       .map(|open| open.clientid)
-      .or_else(|| self.locks.state(other).map(|state| state.clientid));
+      .or_else(|| self.locks.state(other).map(|state| state.clientid))
+      .or_else(|| self.delegations.holder(other));
     if held == Some(clientid) {
       Nfsstat4::Ok
     } else {
@@ -834,8 +856,93 @@ impl FileState {
       self.remove_open(other);
     }
     self.locks.purge(|holder| holder != clientid);
+    // The partition's client purge clears its delegation records with its opens and locks.
+    self.delegations.purge(clientid);
     if let Some(changes) = self.changes.as_mut() {
       changes.push(FileChange::ClientCleared(clientid));
+    }
+  }
+
+  /// A read delegation of `fh` for `clientid` when one is due (RFC 8881 §10.4; A-78): never while another client
+  /// holds the file open for writing or denying reads, nor when [`super::delegation::Delegations::grant_read`]
+  /// refuses (another's write delegation, a recent recall, the bound). Journaled when granted.
+  pub fn delegate_read(
+    &mut self,
+    clientid: u64,
+    fh: &Nfsfh3,
+    now_ns: u64,
+    quiet_ns: u64,
+  ) -> Option<Stateid> {
+    let file = identity(fh);
+    let contended = self
+      .by_file
+      .range((file.clone(), 0, Vec::new())..)
+      .take_while(|((held, _, _), _)| *held == file)
+      .filter_map(|(_, other)| self.opens.get(other))
+      .any(|open| {
+        open.clientid != clientid
+          && (open.share.access & share::WRITE != 0 || open.share.deny & share::READ != 0)
+      });
+    if contended {
+      return None;
+    }
+    let other = mint(self.next, self.tag);
+    let granted = self
+      .delegations
+      .grant_read((clientid, fh), other, now_ns, quiet_ns)?;
+    if granted.other == other {
+      self.next += 1;
+      self.journal_delegation(&other);
+    }
+    Some(granted)
+  }
+
+  /// `DELEGRETURN` (§18.6) of `stateid` by `clientid` on `fh`; journaled.
+  pub fn return_delegation(
+    &mut self,
+    stateid: &Stateid,
+    clientid: u64,
+    fh: &Nfsfh3,
+  ) -> Result<(), Nfsstat4> {
+    self.delegations.give_back(stateid, clientid, fh)?;
+    self.journal_delegation(&stateid.other);
+    Ok(())
+  }
+
+  /// The delegations an operation by `actor` on `fh` must wait for, and the recalls to send now
+  /// ([`super::delegation::Delegations::recall`]).
+  pub fn recall(
+    &mut self,
+    fh: &Nfsfh3,
+    actor: Option<u64>,
+    changes: bool,
+    now_ns: u64,
+  ) -> super::delegation::RecallPlan {
+    self.delegations.recall(fh, actor, changes, now_ns)
+  }
+
+  /// Revokes every delegation not returned within `lease_ns` of its recall; journaled. Their `other`s and holders.
+  pub fn revoke_lapsed(&mut self, now_ns: u64, lease_ns: u64, quiet_ns: u64) -> Vec<(Other, u64)> {
+    let revoked = self.delegations.revoke_lapsed(now_ns, lease_ns, quiet_ns);
+    for (other, _) in &revoked {
+      self.journal_delegation(other);
+    }
+    revoked
+  }
+
+  /// How many delegations are held.
+  pub fn delegation_count(&self) -> usize {
+    self.delegations.len()
+  }
+
+  /// Journals the current record of delegation `other`, or its clearing.
+  fn journal_delegation(&mut self, other: &Other) {
+    let record = self.delegations.record(other);
+    if let Some(changes) = self.changes.as_mut() {
+      changes.push(match record {
+        Some(record) => FileChange::DelegationSet(record),
+        None => FileChange::DelegationCleared(*other),
+      });
     }
   }
 

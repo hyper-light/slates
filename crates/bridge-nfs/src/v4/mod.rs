@@ -29,6 +29,7 @@ pub mod attr;
 pub mod backend;
 pub mod callback;
 pub mod compound;
+pub mod delegation;
 pub mod files;
 pub mod lock;
 pub mod session;
