@@ -91,6 +91,8 @@ aws-lc-rs = { version = "1.18.1", default-features = false, features = ["aws-lc-
 hyper-datagram = { path = "vendor/hyper-raft/hyper-datagram" }
 hyper-swim = { path = "vendor/hyper-raft/hyper-swim" }
 hyper-timing = { path = "vendor/hyper-raft/hyper-timing" }
+# Sealing at rest (A-92; hyper-raft docs/seal.md): keys, STREAM, the ML-KEM-1024 recipient wrap, keyed names.
+hyper-seal = { path = "vendor/hyper-raft/hyper-seal" }
 # TLS 1.3 for the session plane's handshake (§4.10a §3; D-15's named dependency), over the aws-lc-rs provider. slates
 # drives the QUIC core sans-io, so rustls pulls no async runtime. rustls's config API takes Arc — D-8 exception 2.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std", "tls12"] }

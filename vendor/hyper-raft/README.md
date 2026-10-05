@@ -1,7 +1,7 @@
 # Vendored hyper-raft crates
 
 The crates slates shares with focal and mantle (`../hyper-raft`, github.com/hyper-light/hyper-raft), taken as a
-snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `687244f`, 2026-10-03). Never a
+snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `46d1035`, 2026-10-05). Never a
 path or git dependency on the shared repository: slates builds what it reviewed (A-52 §5,
 `docs/wip/transport-quic.md` §5; the scheme mantle and focal use).
 
@@ -10,6 +10,7 @@ path or git dependency on the shared repository: slates builds what it reviewed 
 | `hyper-timing` | the detector's estimator and configurator, the election law | focal-timing and slates' election law |
 | `hyper-swim` | SWIM membership and its per-pair detectors | slates' detector at `5cce86a` |
 | `hyper-datagram` | the sealed control-datagram plane | after slates' seal |
+| `hyper-seal` | sealing at rest: the key hierarchy, STREAM, the ML-KEM-1024 recipient wrap, keyed names, keys in locked memory (A-92) | mantle's object seal, with focal's and slates' reviews (`docs/seal.md`) |
 
 `rustfmt.toml` is hyper-raft's own (four-space indent), so `cargo fmt --all` checks the vendored code against the
 format it was written in and never reformats it. Each directory holds the crate's `src/` and `ORIGIN.md` unchanged and a manifest of slates' own (its own workspace

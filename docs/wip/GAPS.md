@@ -3644,3 +3644,13 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
     recorded holders, ties its copies and steals a slow holder's backlog (A-91), and `fetch_bench` measures it under
     delay, loss, a slow holder, a silent holder and eight readers (BENCHMARKS). Owed: remote attach (Phase 8 item
     13), larger objects in the grid, and the same pulls between real processes over a shaped path.
+
+### 2026-10-05: volumes sealed at rest (condition 9; A-92)
+
+hyper-seal is vendored at hyper-raft `46d1035` (its CI green on all ten jobs). A-92 maps it onto slates: holders keep
+ciphertext, keys live in locked memory for the anchor's life and never touch a disk, a successor opens by a lineage
+key wrapped to its ML-KEM-1024 recipient key. Owed, in order: the crate in the build; the key hierarchy and the root's
+handover; sealed content on the content plane (ciphertext verified by holders, keyed names in missing sets); the
+successor's wrapped key in the head record; the idle-RAM measurement and its decision; sealed archives;
+SecP384r1MLKEM1024 between nodes once hyper-raft measures it.
+

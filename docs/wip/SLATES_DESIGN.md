@@ -9161,3 +9161,53 @@ Status: built 2026-10-05 (the fetch half of Phase 8 item 13; remote attach itsel
   rebuilt byte for byte, both sessions back, the hedge or steal counters moved). The fleet suite (69 tests, takeover
   content served over NFS included) passes over the new fetch. The benchmark found the manifest bug (a silent first
   holder left the manifest unfetched) before it shipped.
+
+### A-92 — Volumes sealed at rest with hyper-seal: holders keep ciphertext, keys never touch a disk (2026-10-05)
+Applied in the same change to: `vendor/hyper-raft/hyper-seal` (hyper-raft `46d1035`, its CI green on all ten jobs;
+`vendor/hyper-raft/SNAPSHOT`, README), the workspace `Cargo.toml`, GAPS.
+Status: designed 2026-10-05; the crate is vendored. The pieces below are built in order, each with its own record.
+- Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
+  handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
+  hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two
+  places. Its owner's anchor keeps it between writes, and since §4.10 its sealed snapshots rest in other machines'
+  RAM as held replicas. Today a holder keeps a tenant's plaintext chunks, so any node an object is placed on can read
+  it. hyper-seal (hyper-raft `docs/seal.md`, approved by Ada 2026-10-04 as the one at-rest construction for mantle,
+  focal and slates) is the construction; this record maps it onto slates.
+- Threat model. Defended: a node that holds a replica, or a later dump of its memory, reads nothing of a tenant's
+  content or names without that tenant's keys; an archive taken off the fleet opens only for its ML-KEM-1024
+  recipient; a successor takes a volume only by a key wrapped to it. Not defended, as hyper-seal §13 states: the
+  shape of a store (chunk counts and sizes), a running process's memory against its own host's root (the anchor
+  and daemon hold plaintext while they serve it), and rollback without a trusted counter. On one host the client
+  rings and the loopback mount stay unencrypted (peer credentials at rendezvous, §4.13): the bytes never leave the
+  host's memory, which the host's root reads anyway.
+- Keys (seal.md §3), each random, each a `Secret32` in hyper-seal's locked region (§8):
+  - **Node root.** Made at the anchor's start and held for the anchor's life, a `MemorySource` (seal.md §3.2): it
+    never touches a disk (R1), and it lives exactly as long as the RAM it protects on this node, since a volume's
+    local content does not outlive its anchor. A daemon restart keeps it: the anchor hands it over with its segments.
+    Hardware sources (Keychain, Secure Enclave, TPM, a key service) are bindings of the same trait, owed.
+  - **Tenant** (the host account, A-9), wrapped by the node root: its naming key (seal.md §7) and its volumes'
+    lineage keys are its children, so revoking an account erases everything it sealed.
+  - **Volume lineage**, wrapped by its tenant's key: seals every version of the volume's chunks by the version-keyed
+    rule (seal.md §4), `nonce = version ‖ segment`, only once slates states and tests that a version never repeats
+    under one lineage key through crash, restart, restore and takeover (seal.md requires the argument; without it
+    the rule is a key per sealed chunk). Which counter carries the version is that piece's to establish from the
+    code, not assumed here. A clone's lineage key wraps its parent's (seal.md §3.1).
+  - **Node recipient key**: an ML-KEM-1024 key pair per node life, its encapsulation key published in the node's
+    configuration-group membership record (which the group authenticates), its decapsulation key in the region.
+- Holders keep ciphertext. A placed snapshot travels sealed: each chunk under the lineage key, named by its keyed
+  name (HMAC-SHA-256 of the BLAKE3 identity under the tenant's naming key, seal.md §7), and the manifest sealed whole
+  with a clear chunk table of (keyed name, sealed length, BLAKE3 of the sealed bytes). A holder verifies each chunk
+  against the hash of its sealed bytes before it acknowledges (§4.10's "verified before held", now over ciphertext),
+  answers missing sets by keyed name, and holds no key. Deduplication stays within a tenant, by keyed name.
+- A successor opens what it takes over by the lineage key wrapped to its recipient key (seal.md §6, hybrid
+  ML-KEM-1024 with P-384, CNSA under FIPS): the head record carries the lineage key wrapped to each content
+  candidate, so any candidate that succeeds unwraps it, and no other node can.
+- The owner's RAM: a volume's idle plaintext in the anchor (seal.md §8, "at rest is idle RAM") is sealed under its
+  lineage key only if the measured cost fits slates' budget (a 4 KiB open at most about 1 µs p99 under load, seal.md
+  §1 and §11); the measurement decides, and is recorded before that piece is built or rejected.
+- Archives leave sealed to an ML-KEM-1024 recipient the operator names.
+- Order of build: (1) the vendored crate in the build, its known-answer behaviour exercised by slates' use; (2) the
+  key hierarchy in the daemon and the anchor's handover of the root; (3) sealed content on the content plane, with
+  holders verifying ciphertext and keyed names in the missing sets; (4) the successor's wrapped lineage key in the
+  head record; (5) the idle-RAM measurement and its decision; (6) sealed archives; (7) SecP384r1MLKEM1024 between
+  nodes when hyper-raft's measurement lands.

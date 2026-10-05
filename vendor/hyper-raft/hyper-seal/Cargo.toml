@@ -1,0 +1,26 @@
+# slates' manifest for the vendored hyper-seal (vendor/hyper-raft/README.md): its own workspace root, outside slates'
+# workspace; the source is hyper-raft's at the revision in vendor/hyper-raft/SNAPSHOT, unchanged. aws-lc-rs resolves to
+# slates' vendored copy through the root's `[patch.crates-io]`. hyper-seal is sans-io: its key file check reads an open
+# file's permissions and never writes; slates never uses it (slates' root key never touches a disk, A-92).
+[package]
+name = "hyper-seal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+publish = false
+
+[dependencies]
+aws-lc-rs = { version = "1.18", default-features = false, features = ["aws-lc-sys"] }
+getrandom = "0.4"
+thiserror = "2.0"
+
+[target.'cfg(unix)'.dependencies]
+# mlock(2) and madvise(2) for the key region, and the page size.
+rustix = { version = "1.1", features = ["mm", "param"] }
+
+[target.'cfg(windows)'.dependencies]
+# VirtualLock for the key region; GetSecurityInfo and the ACL walk for a key file's owner-only check.
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
+
+[workspace]
