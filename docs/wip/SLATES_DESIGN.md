@@ -8880,3 +8880,58 @@ Status: built 2026-10-04 (B-3).
     and the reader sees the new contents 2–29 ms after it, four runs of four.
 - Owed: FUSE and SDK callers are refused rather than parked; `SEQ4_STATUS_CB_PATH_DOWN`; a forwarded NFSv3 call (the
   volume on another shard than the connection's, rare since A-76) is answered `JUKEBOX`, not held.
+
+### A-80 — NFSv4.1 write delegations; a conflicting OPEN recalls; the recall gate knows its holders (2026-10-05)
+Applied in the same change to: `crates/bridge-nfs/src/v4/delegation.rs` (`Conflict`, `grant_write`, the by-inode and
+recall-time indexes), `crates/bridge-nfs/src/v4/files.rs` (`delegate_write`, `check_open_conflicts`,
+`check_read_conflicts`, the recall outbox, changed inodes), `crates/bridge-nfs/src/procedures.rs` (`STATE_OPEN`'s
+delegation kinds), `crates/bridge-nfs/src/v4/compound.rs` (`OPEN_DELEGATE_WRITE` with a zero-byte limit,
+`OPEN4_SHARE_ACCESS_WANT_READ_DELEG`, `Backend::act_for`/`finished`, the server owner), `crates/vfs/src/recall_gate.rs`
+(holders, `act_as`, `set_holders`), `crates/server/src/{nfs,nfs_state,delegation}.rs`,
+`crates/vfs/tests/recall_gate.rs`, `crates/bridge-nfs/tests/v4_delegation.rs`, `crates/server/tests/nfs_mount.rs`,
+`crates/server/tests/nfs_hostile.rs`, `docs/bugs/2026-10-04-every-daemon-announced-one-nfs-server-owner.md`,
+GAPS, BENCHMARKS.
+Status: built 2026-10-05 (B, second half). Directory delegations and `CB_GETATTR` are owed.
+- Why: an open for writing that nobody else shares is the common case of a build: the client writes, closes, reopens
+  and reads files only it knows. A write delegation lets it handle those opens, closes and locks itself (RFC 8881
+  §10.4, §10.4.2).
+- Grant: on an open with write access, when the session's back channel answers, the file is owned where the session
+  lives, no other client holds the file open or delegated, and it was not recalled within the quiet period. No
+  settled period applies, because a file just created has been seen by nobody else. A client that asked for read
+  delegations only (`OPEN4_SHARE_ACCESS_WANT_READ_DELEG`) gets none. A client that already holds a write delegation
+  is never granted a read one (a test found the daemon handing back the write delegation's state id as a read one).
+- Space limit: zero bytes (`NFS_LIMIT_SIZE`, filesize 0). §10.4.1 lets the server choose limits "that will always
+  force modified data to be flushed to the server on close". Linux nfsd encodes exactly this
+  (`nfsd4_encode_open_write_delegation4`), and the Linux client then flushes at every close
+  (`nfs4_delegation_flush_on_close`: `nrequests < pagemod_limit` is never true). Copy-on-write makes even an
+  overwrite allocate, so any larger promise would need a volume reservation. With zero, what other readers see at a
+  close is what they see without a delegation, so reads from paths outside NFSv4 need no recall.
+- Conflicts (§10.4.4): another client's OPEN is a recall event in itself. For a write delegation that is any open;
+  for a read delegation, an open that writes or denies reads (before this change B's open was granted with A's
+  delegation outstanding, and only B's later write was refused). Another NFSv4 client's GETATTR of a
+  write-delegated file recalls it (§10.4.3: the server "MAY simply recall the delegation" instead of
+  `CB_GETATTR`). Every change on any path goes through the recall gate (A-79).
+- The holder's own changes: the gate knows each delegated inode's holders, and the call being served names the NFSv4
+  client it acts for (the client its compound's `SEQUENCE` named, carried to the owner shard in the request). A
+  change by the only holders passes, as Linux nfsd lets a lease's own breaker through (`nfsd_breaker_owns_lease`).
+  Its recall names its actor, so the actor's own delegation is never recalled.
+- Cost per operation: the gate is updated per changed inode, never rebuilt (measured: a whole rebuild cost 238 µs at
+  4,500 delegations and added 0.17 ms to every OPEN of a build). Recalls are found by inode and lapses by recall
+  time, never by walking the table. Compounds answered `NFS4ERR_DELAY` are counted per operation
+  (`nfs4.delay.<op>`).
+- Found on the way: every fresh daemon announced the same NFSv4 server owner and minted the same first client id,
+  so a Linux client took a new daemon for a dead one and hung its mount (the bug document). The server owner is now
+  a keyed hash of the anchor identity and instance name, and a fresh partition's instance starts from the boot
+  nonce.
+- Proven:
+  - `a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it` (fails `NFS4ERR_DELAY` on the
+    holder's own write without the holder exemption);
+  - `another_clients_getattr_of_a_write_delegated_file_recalls_it`;
+  - `an_open_denying_reads_recalls_a_read_delegation`;
+  - `two_fresh_daemons_name_different_servers_and_mint_different_client_ids`;
+  - `the_gate_updated_by_changed_inodes_equals_a_whole_rebuild` (the incremental gate against a whole rebuild after
+    every kind of change);
+  - five write-delegation unit tests;
+  - against the Linux kernel, three alternating A/B rounds (BENCHMARKS).
+- Owed: `CB_GETATTR` in place of the GETATTR recall; directory delegations (C); a space reservation that would let
+  a holder cache writes past close.

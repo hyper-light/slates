@@ -134,10 +134,10 @@ pub mod extension {
   // then its own arguments; each result opens with an NFSv4 status word (every NFSv3 status the
   // routing returns has the same value in NFSv4).
 
-  /// Format: record an open. Arguments: the open-owner (opaque), the share access and deny (`u32`
-  /// each), whether the client may be delegated the file (`u32`, A-78: its back channel answers and the open reads
-  /// only), and the caller's clock (`u64`). Result: the status, then the open's state id, then whether a read
-  /// delegation was granted (`u32`) and, when it was, its state id.
+  /// Format: record an open. Arguments: the open-owner (opaque), the share access and deny (`u32` each), the
+  /// delegations the client may take (`u32` bits: 1 read, 2 write; A-78, A-80) and the caller's clock (`u64`). Result:
+  /// the status (`NFS4ERR_DELAY` while another holder's conflicting delegation is recalled), the open's state id, and
+  /// the delegation granted (`u32`: 0 none, 1 read, 2 write) with, when one was, its state id.
   pub const STATE_OPEN: u32 = 1040;
   /// Format: close an open. Arguments: its state id. Result: the status, then the advanced state id,
   /// then the count and each `other` (12 bytes) the owner no longer holds.
@@ -2900,23 +2900,23 @@ fn open_state(
         access: args.u32().map_err(bad)?,
         deny: args.u32().map_err(bad)?,
       };
-      let may_delegate = args.u32().map_err(bad)? != 0;
+      let may_delegate = args.u32().map_err(bad)?;
       let now_ns = args.u64().map_err(bad)?;
+      // Another holder's delegation this open conflicts with is recalled first (RFC 8881 §10.4.4).
+      files.check_open_conflicts(clientid, handle, share, now_ns)?;
       files
         .open(clientid, owner, handle, share)?
         .encode(&mut body);
-      // A read delegation for a read-only open that denies nothing (RFC 8881 §10.4), when the client may take one.
-      let read_only = share.access == crate::v4::files::share::READ && share.deny == 0;
-      let quiet = files.delegation_quiet();
-      match (may_delegate && read_only && settled)
-        .then(|| files.delegate_read(clientid, handle, now_ns, quiet))
-        .flatten()
-      {
-        Some(delegation) => {
-          body.u32(1);
-          delegation.encode(&mut body);
-        }
-        None => body.u32(0),
+      let (kind, delegation) = open_delegation(
+        files,
+        (clientid, handle),
+        share,
+        (may_delegate, settled),
+        now_ns,
+      );
+      body.u32(kind);
+      if let Some(delegation) = delegation {
+        delegation.encode(&mut body);
       }
     }
     extension::STATE_CLOSE => {
@@ -2937,6 +2937,47 @@ fn open_state(
     }
   }
   Ok(body.into_bytes())
+}
+
+/// The delegation an open just recorded is granted, when the client may take one (RFC 8881 §10.4): its kind on the
+/// wire of the `STATE_OPEN` result (0 none, 1 read, 2 write) and its state id. An open for writing is offered a write
+/// delegation (A-80; as Linux nfsd offers one for any open with write access, §9.1.2 letting a writer read); a
+/// read-only open that denies nothing a read delegation once the file has settled (A-78).
+fn open_delegation(
+  files: &mut FileState,
+  (clientid, handle): (u64, &Nfsfh3),
+  share: crate::v4::files::Share,
+  (may_delegate, settled): (u32, bool),
+  now_ns: u64,
+) -> (u32, Option<Stateid>) {
+  use crate::v4::files::share;
+  /// Format: the `STATE_OPEN` argument's bit allowing a read delegation (A-80).
+  const MAY_READ: u32 = 1;
+  /// Format: see [`MAY_READ`]: a write delegation.
+  const MAY_WRITE: u32 = 2;
+  let quiet = files.delegation_quiet();
+  let (kind, granted) = if share.access & share::WRITE != 0 {
+    let allowed = may_delegate & MAY_WRITE != 0;
+    (
+      2,
+      allowed
+        .then(|| files.delegate_write(clientid, handle, now_ns, quiet))
+        .flatten(),
+    )
+  } else {
+    let allowed =
+      may_delegate & MAY_READ != 0 && share.access == share::READ && share.deny == 0 && settled;
+    (
+      1,
+      allowed
+        .then(|| files.delegate_read(clientid, handle, now_ns, quiet))
+        .flatten(),
+    )
+  };
+  match granted {
+    Some(delegation) => (kind, Some(delegation)),
+    None => (0, None),
+  }
 }
 
 /// LOCK, LOCKT and LOCKU at the owner (§4.6 A-36), on the client's arguments as sent: the result body.

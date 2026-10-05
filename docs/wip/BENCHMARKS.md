@@ -1759,3 +1759,36 @@ the workspace left to settle for one lease before the warm no-op rebuilds:
 - Measured and rejected: granting on any read-only open, with no settled rule. On the churning Go build it ran 3%
   slower, because the client returned the delegations itself. Hence the quiet period (A-78).
 - Unexplained, seen once and not again: one `DELEGRETURN` stalled 84 ms. It is in GAPS.
+
+### Write delegations in a Docker Rust build (A-80; 2026-10-05)
+
+Command: `SLATES_BIN=<binary> timeout 400 bash e2e-docker-rust-slates.sh`, three alternating rounds. Base: `f3eb461`
+(read delegations only) with the server-owner fix patched in, so both arms run under the same identity rules.
+Apple M5 Max, Docker Desktop's 6.12 kernel, NFSv4.2; load average 18–23 from other sessions.
+
+| step (ms) | base | write delegations |
+|---|---|---|
+| copy the workspace | 9,538 / 9,184 / 9,351 | 9,089 / 9,216 / 9,089 |
+| `cargo build -p slates-vfs` | 9,122 / 8,863 / 8,829 | 7,861 / 7,878 / 8,402 |
+| no-op rebuild | 395 / 373 / 390 | 213 / 195 / 197 |
+| rebuild after a touch | 1,833 / 1,724 / 1,729 | 825 / 808 / 788 |
+
+- The build is about 10% faster, the no-op rebuild about 48% and the rebuild after a touch about 54%; the copy is
+  even.
+- Per mountstats: CLOSE fell from about 6,700 to 4,580 per run, and READ from about 4,200 to 775 (served from the
+  client's cache). OPEN_NOATTR (about 2,600) disappeared. 4,580 write delegations were granted.
+- OPEN's round trip matched the base (0.545 ms against 0.534 ms) only after the gate stopped being rebuilt per grant.
+  The first build measured 0.43–0.63 ms against 0.24–0.46 ms. The rebuild alone cost 238 µs at 4,500 delegations,
+  measured in isolation (release build).
+- DELEGRETURN: 1,700–1,760 per run, with a 74–87 ms client-side queue under this load; 275 with a 0.029 ms queue on
+  a quieter run. The daemon answered no `NFS4ERR_DELAY` (`nfs4.delay.*` absent), so the queue is the client's.
+  Unexplained, and not on the measured steps' path.
+
+**Measured and rejected: holding replies across turns until the input drains** (Redis's rule). Each turn still ended
+at the quantum, but replies were written only once the buffered calls were drained, the connection moved, or held
+bytes reached the transfer ceiling. In the same workload WRITE's round trip doubled (2.1–2.2 ms against 0.95–1.1 ms)
+and the build ran 8.8–10.1 s. A WRITE reply is tiny, so the byte bound never trips, while each buffered WRITE costs
+tens of µs to serve: the first replies waited out the whole pipeline to save one write syscall each. A-74's rule
+stands. A turn writes what it built once it passes the quantum (about one wake, about one syscall), so a reply waits
+at most about a quantum. The pipelining test's flake came from its regime, not from the rule: in a debug build one
+READ costs 46–68 µs against a 5.3 µs wake-estimate quantum. It now pins its quantum.

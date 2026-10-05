@@ -51,19 +51,11 @@ pub(crate) fn record_files(s: &mut ShardState) -> bool {
     return true;
   };
   let changes = files.take_changes();
-  // The store's recall gate follows the delegations (A-79): rebuilt whenever one was granted, returned, revoked or
-  // purged with its client.
-  let delegations_changed = changes.iter().any(|change| {
-    matches!(
-      change,
-      FileChange::DelegationSet(_)
-        | FileChange::DelegationCleared(_)
-        | FileChange::ClientCleared(_)
-    )
-  });
-  if delegations_changed {
-    let delegated = files.delegated_inodes();
-    s.store.recall_gate.reset(delegated);
+  // The store's recall gate follows the delegations (A-79): each inode whose holders changed (a grant, return,
+  // revocation, or a client's purge) is updated alone (A-80: a whole rebuild walked every delegation on every grant).
+  for inode in files.take_changed_inodes() {
+    let holders = files.holders_of_inode(inode);
+    s.store.recall_gate.set_holders(inode, holders);
   }
   let granted = changes
     .iter()
@@ -78,12 +70,10 @@ pub(crate) fn record_files(s: &mut ShardState) -> bool {
     return true;
   }
   s.nfs_v4_files = file_state(s);
-  let delegated = s
-    .nfs_v4_files
-    .as_ref()
-    .map(FileState::delegated_inodes)
-    .unwrap_or_default();
-  s.store.recall_gate.reset(delegated);
+  if s.nfs_v4_files.is_none() {
+    // No state could be rebuilt: no delegation is held, so the gate holds none either.
+    s.store.recall_gate.reset(std::collections::BTreeMap::new());
+  }
   false
 }
 
@@ -107,6 +97,19 @@ pub(crate) fn record_clients(s: &mut ShardState) -> bool {
   false
 }
 
+/// The first instance of a partition that holds none (a fresh daemon, or one whose anchor's RAM was lost): 31 random
+/// bits of this boot's nonce (never zero), not 1. Client ids carry the instance in their high bits (RFC 8881 §2.4: a
+/// server's client ids must not repeat across its restarts, so a client presenting one from a life that ended is
+/// told `NFS4ERR_STALE_CLIENTID` rather than taken for another client; Linux nfsd puts its boot time there). A
+/// partition that starts at 1 every time repeats them after every loss of its records. Thirty-one bits leave 2³¹
+/// restarts of headroom under the instance's forward-only rule, and two lives share a first instance with
+/// probability 2⁻³¹.
+fn fresh_instance(boot_nonce: u64) -> u32 {
+  /// Format: the nonce's bits above the 31 kept.
+  const DROPPED: u32 = u64::BITS - (u32::BITS - 1);
+  u32::try_from(boot_nonce >> DROPPED).unwrap_or(0).max(1)
+}
+
 /// This daemon life's NFSv4 instance on the shard's partition (§4.6 A-37): advanced durably past every
 /// earlier life's on first use, so no client, session or state id this life mints repeats one an
 /// earlier life minted. `None` if the advance could not be recorded; no id is then minted.
@@ -114,7 +117,12 @@ pub(crate) fn instance(s: &mut ShardState) -> Option<u32> {
   if let Some(instance) = s.nfs_v4_instance {
     return Some(instance);
   }
-  let next = s.db.partition().nfs_instance().checked_add(1)?;
+  let current = s.db.partition().nfs_instance();
+  let next = if current == 0 {
+    fresh_instance(s.member_boot_nonce)
+  } else {
+    current.checked_add(1)?
+  };
   if !commit(s, &[Op::NfsInstanceAdvanced { instance: next }]) {
     return None;
   }
@@ -152,8 +160,10 @@ pub(crate) fn file_state(s: &mut ShardState) -> Option<FileState> {
   let mut files = restored;
   // A recalled file is not delegated again for a lease (RFC 8881 §10.4, A-78).
   files.set_delegation_quiet(s.config.failover_slo_ns);
-  // The gate starts closed on every file a kept delegation names (a restart must not let a change slip past one).
-  s.store.recall_gate.reset(files.delegated_inodes());
+  // The gate starts closed on every file a kept delegation names (a restart must not let a change slip past one), set
+  // whole once; the restore's own changed inodes are then already reflected.
+  s.store.recall_gate.reset(files.delegated_holders());
+  files.take_changed_inodes();
   Some(files)
 }
 
@@ -164,7 +174,25 @@ pub(crate) fn server(s: &mut ShardState) -> Option<V4Server> {
   let instance = instance(s)?;
   let limits = crate::nfs::v4_limits(s);
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
-  Some(V4Server::restore(instance, limits, clients(s), now))
+  let owner = server_owner(s.origin_anchor.0, &s.config.instance);
+  Some(V4Server::restore(instance, limits, clients(s), now).with_owner(owner))
+}
+
+/// The `server_owner4` major id of the daemon instance `instance` on the host whose anchor identity is `anchor`
+/// (RFC 8881 §2.10.5): the same across the instance's restarts (a restarted server is the same server, its clients
+/// told by `NFS4ERR_STALE_CLIENTID` that their state is gone), different for every other instance on the host and
+/// for every other host, whose instance names may coincide. A keyed hash in its own domain, so it never equals
+/// another identity derived from the same anchor.
+fn server_owner(anchor: u64, instance: &str) -> u64 {
+  let mut hasher = blake3::Hasher::new_derive_key("slates/nfs-server-owner/v1");
+  hasher.update(&anchor.to_le_bytes());
+  hasher.update(instance.as_bytes());
+  let digest = hasher.finalize();
+  let mut word = [0; size_of::<u64>()];
+  if let Some(head) = digest.as_bytes().get(..size_of::<u64>()) {
+    word.copy_from_slice(head);
+  }
+  u64::from_le_bytes(word)
 }
 
 /// The clients this shard's listener keeps, from its partition's records.

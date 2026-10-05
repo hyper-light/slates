@@ -11,22 +11,33 @@
 //! to recall. The caller retries (an NFS client is told `NFS3ERR_JUKEBOX` / `NFS4ERR_DELAY`); once the delegation is
 //! returned or revoked the inode leaves the gate and the change proceeds.
 //!
+//! The gate knows each delegated inode's holders (NFSv4 client ids) and, while a call is served, the client acting
+//! for it ([`RecallGate::act_as`]): a change by the only holders of a file's delegations is that holder's own and
+//! passes (a write delegation's holder writes its own file; Linux nfsd likewise lets a lease's own breaker through,
+//! `nfsd_breaker_owns_lease`); any other change is refused, and the recall it asks for names its actor, so the holder
+//! acting is not recalled. Every path outside an NFSv4 session acts as no client and is refused.
+//!
 //! A caller that would rather wait than retry (the daemon holds an NFSv3 client's refused call, whose own retry
 //! backs off for seconds) notes [`RecallGate::refusals`] before its attempt, so it knows the refusal was the gate's,
 //! and parks on [`RecallGate::wait_for_release`] until the delegated set changes.
 //!
-//! Bounds: the gate holds one entry per delegated inode (the owner's delegation table bounds them), the recall
-//! queue holds each delegated inode at most once until drained, and the parked wakers hold one per waiting task
+//! Bounds: the gate holds one entry per delegated inode with its holders (the owner's delegation table bounds both),
+//! the recall queue holds each (inode, actor) pair at most once until drained (the actors are the clients the
+//! table bounds, and none), and the parked wakers hold one per waiting task
 //! (a task's repeated park replaces its own), so they are bounded by the tasks the shard runs.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::task::Waker;
 
 /// The shard's delegated inodes and the recalls they owe.
 #[derive(Debug, Default)]
 pub struct RecallGate {
-  delegated: BTreeSet<u64>,
-  requested: BTreeSet<u64>,
+  /// Each delegated inode's holders.
+  delegated: BTreeMap<u64, BTreeSet<u64>>,
+  /// Each refused change's inode and actor, until drained.
+  requested: BTreeSet<(u64, Option<u64>)>,
+  /// The NFSv4 client the call being served acts for, if any.
+  acting: Option<u64>,
   /// Changes refused at the gate, ever (the non-vacuity counter, and how a caller tells the gate's refusal apart).
   refused: u64,
   /// Bumped whenever an inode may have left the gate (a release or a reset).
@@ -36,23 +47,46 @@ pub struct RecallGate {
 }
 
 impl RecallGate {
-  /// Closes the gate on inode `no` (a delegation of its file was granted).
-  pub fn delegate(&mut self, no: u64) {
-    self.delegated.insert(no);
+  /// Closes the gate on inode `no` for every client but `holder` (a delegation of its file was granted to it).
+  pub fn delegate(&mut self, no: u64, holder: u64) {
+    self.delegated.entry(no).or_default().insert(holder);
   }
 
   /// Opens the gate on inode `no` (its file's last delegation was returned or revoked).
   pub fn release(&mut self, no: u64) {
     self.delegated.remove(&no);
-    self.requested.remove(&no);
+    self.requested.retain(|(requested, _)| *requested != no);
     self.changed();
   }
 
-  /// Replaces the delegated set whole (after a restore, or a client's delegations were purged).
-  pub fn reset(&mut self, delegated: BTreeSet<u64>) {
-    self.requested.retain(|no| delegated.contains(no));
+  /// Replaces the delegated inodes and their holders whole (after any delegation changed, a restore, or a client's
+  /// delegations were purged).
+  pub fn reset(&mut self, delegated: BTreeMap<u64, BTreeSet<u64>>) {
+    self.requested.retain(|(no, _)| delegated.contains_key(no));
     self.delegated = delegated;
     self.changed();
+  }
+
+  /// Sets inode `no`'s holders after one of its delegations changed: none opens the gate on it. Parked tasks are
+  /// woken whenever a holder left (a change may now be admitted).
+  pub fn set_holders(&mut self, no: u64, holders: BTreeSet<u64>) {
+    if holders.is_empty() {
+      self.release(no);
+      return;
+    }
+    let shrank = self
+      .delegated
+      .get(&no)
+      .is_some_and(|before| before.iter().any(|holder| !holders.contains(holder)));
+    self.delegated.insert(no, holders);
+    if shrank {
+      self.changed();
+    }
+  }
+
+  /// Names the NFSv4 client the call about to be served acts for (`None` for every other path, and after the call).
+  pub fn act_as(&mut self, client: Option<u64>) {
+    self.acting = client;
   }
 
   /// Marks a possible release and wakes every parked task.
@@ -65,16 +99,22 @@ impl RecallGate {
 
   /// Whether a change to inode `no` may proceed now; when it may not, its recall is queued.
   pub fn admit(&mut self, no: u64) -> bool {
-    if self.delegated.contains(&no) {
-      self.requested.insert(no);
-      self.refused = self.refused.saturating_add(1);
-      return false;
+    let Some(holders) = self.delegated.get(&no) else {
+      return true;
+    };
+    let own = self
+      .acting
+      .is_some_and(|acting| holders.iter().all(|holder| *holder == acting));
+    if own {
+      return true;
     }
-    true
+    self.requested.insert((no, self.acting));
+    self.refused = self.refused.saturating_add(1);
+    false
   }
 
-  /// The inodes whose recall a refused change asked for since the last call.
-  pub fn take_requested(&mut self) -> Vec<u64> {
+  /// The inodes, each with the actor of the change refused on it, whose recall was asked for since the last call.
+  pub fn take_requested(&mut self) -> Vec<(u64, Option<u64>)> {
     std::mem::take(&mut self.requested).into_iter().collect()
   }
 

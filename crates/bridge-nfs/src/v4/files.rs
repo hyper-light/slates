@@ -371,6 +371,9 @@ pub struct FileState {
   revoked: BTreeMap<Other, u64>,
   /// How long after a recall a file is not delegated again (the lease; zero for a standalone server).
   quiet_ns: u64,
+  /// Recalls begun by a conflicting open or read ([`FileState::check_open_conflicts`],
+  /// [`FileState::check_read_conflicts`]) and not yet taken by the daemon to send. Each delegation's recall begins once, so this never holds more than the delegation bound.
+  outbox: Vec<super::delegation::Recall>,
   /// The changes since the last [`FileState::take_changes`], for the owner's partition to record, when
   /// the state is durable (`None` for a standalone server, which records nothing). Drained after
   /// every operation, so it holds one operation's changes at most.
@@ -391,6 +394,7 @@ impl FileState {
       delegations: super::delegation::Delegations::new(max_opens),
       revoked: BTreeMap::new(),
       quiet_ns: 0,
+      outbox: Vec::new(),
       changes: None,
     }
   }
@@ -917,6 +921,80 @@ impl FileState {
     Some(granted)
   }
 
+  /// A write delegation of `fh` for `clientid` when one is due (RFC 8881 §10.4; A-80): never while another client
+  /// holds the file open, nor when [`super::delegation::Delegations::grant_write`] refuses (another's delegation, a
+  /// recent recall, the bound). Journaled when granted.
+  pub fn delegate_write(
+    &mut self,
+    clientid: u64,
+    fh: &Nfsfh3,
+    now_ns: u64,
+    quiet_ns: u64,
+  ) -> Option<Stateid> {
+    let file = identity(fh);
+    let opened_elsewhere = self
+      .by_file
+      .range((file.clone(), 0, Vec::new())..)
+      .take_while(|((held, _, _), _)| *held == file)
+      .any(|((_, holder, _), _)| *holder != clientid);
+    if opened_elsewhere {
+      return None;
+    }
+    let other = mint(self.next, self.tag);
+    let granted = self
+      .delegations
+      .grant_write((clientid, fh), other, now_ns, quiet_ns)?;
+    if granted.other == other {
+      self.next += 1;
+      self.journal_delegation(&other);
+    }
+    Some(granted)
+  }
+
+  /// Whether an open of `fh` by `clientid` with `share` may proceed now (RFC 8881 §10.4.4: a conflicting open is a
+  /// recall event). `NFS4ERR_DELAY` while another holder's delegation the open conflicts with
+  /// ([`super::delegation::Conflict::Open`]) is outstanding; the recalls that begin now wait in the outbox for the
+  /// daemon ([`FileState::take_recalls`]).
+  pub fn check_open_conflicts(
+    &mut self,
+    clientid: u64,
+    fh: &Nfsfh3,
+    share: Share,
+    now_ns: u64,
+  ) -> Result<(), Nfsstat4> {
+    let conflict = super::delegation::Conflict::Open {
+      access: share.access,
+      deny: share.deny,
+    };
+    let plan = self
+      .delegations
+      .recall(fh, Some(clientid), conflict, now_ns);
+    self.outbox.extend(plan.send);
+    if plan.waiting {
+      return Err(Nfsstat4::Delay);
+    }
+    Ok(())
+  }
+
+  /// Whether a read of `fh` by `clientid` (its `GETATTR`) must wait for another holder's write delegation (RFC 8881
+  /// §10.4.3: the holder may have changed the file, and the server "MAY simply recall the delegation" rather than ask
+  /// it with `CB_GETATTR`; A-80). The recalls that begin now wait in the outbox, as a conflicting open's do.
+  pub fn check_read_conflicts(&mut self, fh: &Nfsfh3, clientid: u64, now_ns: u64) -> bool {
+    let plan = self.delegations.recall(
+      fh,
+      Some(clientid),
+      super::delegation::Conflict::Read,
+      now_ns,
+    );
+    self.outbox.extend(plan.send);
+    plan.waiting
+  }
+
+  /// The recalls conflicting opens began since the last call, for the daemon to send.
+  pub fn take_recalls(&mut self) -> Vec<super::delegation::Recall> {
+    std::mem::take(&mut self.outbox)
+  }
+
   /// `DELEGRETURN` (§18.6) of `stateid` by `clientid` on `fh`; journaled.
   pub fn return_delegation(
     &mut self,
@@ -935,10 +1013,10 @@ impl FileState {
     &mut self,
     fh: &Nfsfh3,
     actor: Option<u64>,
-    changes: bool,
+    conflict: super::delegation::Conflict,
     now_ns: u64,
   ) -> super::delegation::RecallPlan {
-    self.delegations.recall(fh, actor, changes, now_ns)
+    self.delegations.recall(fh, actor, conflict, now_ns)
   }
 
   /// Revokes every delegation not returned within `lease_ns` of its recall; journaled. Their `other`s and holders.
@@ -966,16 +1044,35 @@ impl FileState {
     self.quiet_ns
   }
 
-  /// The inodes of the delegated files, for the store's recall gate.
-  pub fn delegated_inodes(&self) -> std::collections::BTreeSet<u64> {
-    self.delegations.delegated_inodes()
+  /// The holders of the delegations of the file whose inode is `inode`, for the store's recall gate.
+  pub fn holders_of_inode(&self, inode: u64) -> std::collections::BTreeSet<u64> {
+    self.delegations.holders_of_inode(inode)
   }
 
-  /// The recall a change to `inode` asked for: the delegations of that file every holder must give back (the change's
-  /// actor is not known at the inode, so every holder's), and the recalls to send now.
-  pub fn recall_inode(&mut self, inode: u64, now_ns: u64) -> super::delegation::RecallPlan {
+  /// The inodes whose delegation holders changed since the last call, for the store's recall gate to update.
+  pub fn take_changed_inodes(&mut self) -> Vec<u64> {
+    self.delegations.take_changed_inodes()
+  }
+
+  /// The holders of each delegated file by its inode, for the store's recall gate.
+  pub fn delegated_holders(
+    &self,
+  ) -> std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>> {
+    self.delegations.holders_by_inode()
+  }
+
+  /// The recall a change to `inode` by `actor` (the NFSv4 client acting, `None` for any other path) asked for: every
+  /// other holder's delegation of that file, and the recalls to send now.
+  pub fn recall_inode(
+    &mut self,
+    inode: u64,
+    actor: Option<u64>,
+    now_ns: u64,
+  ) -> super::delegation::RecallPlan {
     match self.delegations.handle_of_inode(inode) {
-      Some(fh) => self.delegations.recall(&fh, None, true, now_ns),
+      Some(fh) => self
+        .delegations
+        .recall(&fh, actor, super::delegation::Conflict::Change, now_ns),
       None => super::delegation::RecallPlan::default(),
     }
   }

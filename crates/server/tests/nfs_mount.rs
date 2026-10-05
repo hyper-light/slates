@@ -1229,6 +1229,8 @@ struct V4Client {
   slots: u32,
   /// Whether the server granted the back channel on this connection (`CREATE_SESSION4_FLAG_CONN_BACK_CHAN`).
   back_granted: bool,
+  /// The major id of the `server_owner4` EXCHANGE_ID answered with.
+  server_owner: Vec<u8>,
 }
 
 /// Format: `NFS4_OK`, `NFS4ERR_NOENT` and the operation numbers this test sends (RFC 7863).
@@ -1320,6 +1322,7 @@ impl V4Client {
       xid: 0,
       slots: 0,
       back_granted: false,
+      server_owner: Vec::new(),
     };
     let mut ops = XdrWriter::new();
     ops.u32(OP_EXCHANGE_ID);
@@ -1335,6 +1338,10 @@ impl V4Client {
     let clientid = reader.u64().unwrap();
     client.clientid = clientid;
     let sequenceid = reader.u32().unwrap();
+    reader.u32().unwrap(); // flags
+    reader.u32().unwrap(); // SP4_NONE
+    reader.u64().unwrap(); // so_minor_id
+    client.server_owner = reader.opaque(1024).unwrap().to_vec();
     let mut ops = XdrWriter::new();
     ops.u32(OP_CREATE_SESSION);
     ops.u64(clientid);
@@ -1579,6 +1586,21 @@ impl V4Client {
     component: &str,
     name: &str,
   ) -> (slates_bridge_nfs::v4::types::Stateid, Vec<u8>) {
+    let (open, fh, _) = self.open_creating(component, name);
+    (open, fh)
+  }
+
+  /// OPEN of `name` under `component`, created if missing, for reading and writing: the open's state id, the file's
+  /// handle, and the delegation granted with its kind (1 read, 2 write), if any.
+  fn open_creating(
+    &mut self,
+    component: &str,
+    name: &str,
+  ) -> (
+    slates_bridge_nfs::v4::types::Stateid,
+    Vec<u8>,
+    Option<(u32, slates_bridge_nfs::v4::types::Stateid)>,
+  ) {
     use slates_bridge_nfs::v4::types::{Bitmap, Stateid};
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     let mut ops = XdrWriter::new();
@@ -1605,14 +1627,20 @@ impl V4Client {
     let stateid = Stateid::decode(&mut reader).unwrap();
     reader.fixed(4 + 8 + 8 + 4).unwrap();
     Bitmap::decode(&mut reader).unwrap();
-    reader.u32().unwrap();
+    let delegation = read_open_delegation(&mut reader);
     reader.fixed(8).unwrap();
-    (stateid, reader.opaque(128).unwrap().to_vec())
+    (stateid, reader.opaque(128).unwrap().to_vec(), delegation)
   }
 
   /// OPEN of an existing `name` under `component` by a new open-owner, asking for read access and denying writes:
   /// the compound's status.
   fn open_denying_writes(&mut self, component: &str, name: &str) -> u32 {
+    self.open_with(component, name, 1, 2)
+  }
+
+  /// OPEN of an existing `name` under `component` by a new open-owner with share `access` and `deny`: the compound's
+  /// status.
+  fn open_with(&mut self, component: &str, name: &str, access: u32, deny: u32) -> u32 {
     use slates_bridge_nfs::xdr::XdrWriter;
     let mut ops = XdrWriter::new();
     ops.u32(OP_PUTROOTFH);
@@ -1620,8 +1648,8 @@ impl V4Client {
     ops.opaque(component.as_bytes());
     ops.u32(OP_OPEN);
     ops.u32(0);
-    ops.u32(1); // share access READ
-    ops.u32(2); // share deny WRITE
+    ops.u32(access);
+    ops.u32(deny);
     ops.u64(0);
     ops.opaque(b"denying-owner");
     ops.u32(0); // OPEN4_NOCREATE
@@ -1871,6 +1899,7 @@ fn reach_from_a_second_connection(v4: &V4Client, port: u16, ops: &[u8]) -> u32 {
     xid: 1000,
     slots: v4.slots,
     back_granted: false,
+    server_owner: v4.server_owner.clone(),
   };
   let (status, _) = second.sequenced(2, ops);
   assert_eq!(
@@ -2095,6 +2124,31 @@ fn read_cb_sequence(
   (operations, sequenceid)
 }
 
+/// Reads an OPEN result's `open_delegation4` (RFC 8881 §18.16.2): the delegation's kind (1 read, 2 write) and state
+/// id, if one was granted. A write delegation's space limit must be zero bytes (A-80).
+fn read_open_delegation(
+  reader: &mut slates_bridge_nfs::xdr::XdrReader<'_>,
+) -> Option<(u32, slates_bridge_nfs::v4::types::Stateid)> {
+  use slates_bridge_nfs::v4::types::Stateid;
+  let kind = reader.u32().unwrap();
+  if kind == 0 {
+    return None;
+  }
+  let stateid = Stateid::decode(reader).unwrap();
+  reader.bool().unwrap(); // recall
+  if kind == 2 {
+    assert_eq!(reader.u32().unwrap(), 1, "NFS_LIMIT_SIZE");
+    assert_eq!(
+      reader.u64().unwrap(),
+      0,
+      "a zero-byte limit: flushed at close"
+    );
+  }
+  reader.fixed(4 + 4 + 4).unwrap(); // ace type, flags, mask
+  reader.opaque(64).unwrap(); // who
+  Some((kind, stateid))
+}
+
 /// Checks a callback's RPC header (a call of `CB_COMPOUND` to the client's program under its AUTH_SYS parameters) and
 /// returns its xid, leaving `reader` at the compound's arguments.
 fn check_callback_rpc(reader: &mut slates_bridge_nfs::xdr::XdrReader<'_>) -> u32 {
@@ -2315,16 +2369,10 @@ impl V4Client {
     let open = Stateid::decode(&mut reader).unwrap();
     reader.fixed(4 + 8 + 8 + 4).unwrap();
     Bitmap::decode(&mut reader).unwrap();
-    let delegation = match reader.u32().unwrap() {
-      1 => {
-        let stateid = Stateid::decode(&mut reader).unwrap();
-        reader.bool().unwrap(); // recall
-        reader.fixed(4 + 4 + 4).unwrap(); // ace type, flags, mask
-        reader.opaque(64).unwrap(); // who
-        Some(stateid)
-      }
-      _ => None,
-    };
+    let delegation = read_open_delegation(&mut reader).map(|(kind, stateid)| {
+      assert_eq!(kind, 1, "a read-only open is read delegated");
+      stateid
+    });
     reader.fixed(8).unwrap();
     (open, reader.opaque(128).unwrap().to_vec(), delegation)
   }
@@ -2345,6 +2393,22 @@ impl V4Client {
     ops.u64(0);
     ops.u32(2); // FILE_SYNC4
     ops.opaque(bytes);
+    self.sequenced(2, ops.as_slice()).0
+  }
+
+  /// GETATTR of `fh`'s size: the compound's status.
+  fn getattr_status(&mut self, fh: &[u8]) -> u32 {
+    use slates_bridge_nfs::v4::types::Bitmap;
+    use slates_bridge_nfs::xdr::XdrWriter;
+    /// Format: `OP_GETATTR`.
+    const OP_GETATTR: u32 = 9;
+    /// Format: `FATTR4_SIZE`.
+    const FATTR4_SIZE: u32 = 4;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_GETATTR);
+    Bitmap::of(&[FATTR4_SIZE]).encode(&mut ops);
     self.sequenced(2, ops.as_slice()).0
   }
 
@@ -2372,10 +2436,10 @@ impl V4Client {
   }
 }
 
-/// RFC 8881 §10.2, §10.4, §10.4.4 (A-78, A-79): do give client A an answering back channel and open a file from it for
-/// reading; expect a read delegation. Write the file from client B; expect `NFS4ERR_DELAY` with nothing changed, and A
+/// RFC 8881 §10.2, §10.4, §10.4.4 (A-78, A-79, A-80): do give client A an answering back channel and open a file from
+/// it for reading; expect a read delegation. Open the file for writing from client B; expect `NFS4ERR_DELAY`, and A
 /// to receive a `CB_RECALL` naming its delegation on its own connection. Answer it and return the delegation; expect
-/// B's retried write to succeed. The volume is on the listener's own shard here, where a session's files are owned,
+/// B's retried open and its write to succeed. The volume is on the listener's own shard here, where a session's files are owned,
 /// so the grant is allowed; the daemon runs a short lease so the file settles past the quiet period quickly.
 #[test]
 fn a_write_from_another_client_recalls_the_read_delegation_first() {
@@ -2401,9 +2465,9 @@ fn a_write_from_another_client_recalls_the_read_delegation_first() {
   a.prove_back_channel(&daemon);
   let (_, fh_a, delegation) = a.open_for_reading(&component, "held.txt");
   let delegation = delegation.expect("A's read-only open is delegated");
-  let (open_b, _) = b.open(&component, "held.txt");
+  // B's open for writing conflicts with A's read delegation (RFC 8881 §10.4.4; A-80): it waits at the open.
   assert_eq!(
-    b.write_under(&fh, open_b, b"after!"),
+    b.open_with(&component, "held.txt", 3, 0),
     NFS4ERR_DELAY,
     "B waits for A's delegation"
   );
@@ -2415,6 +2479,7 @@ fn a_write_from_another_client_recalls_the_read_delegation_first() {
     "the recall names A's delegation"
   );
   assert_eq!(a.delegreturn(&fh_a, delegation), NFS4_OK, "A returns it");
+  let (open_b, _) = b.open(&component, "held.txt");
   assert_eq!(
     b.write_under(&fh, open_b, b"after!"),
     NFS4_OK,
@@ -2557,4 +2622,118 @@ fn a_probe_answered_delay_is_retried_on_the_same_slot_sequence() {
   );
   drop(a);
   drop(daemon);
+}
+
+/// A client with an answering back channel on a short-lease daemon, and a second client without one: the daemon,
+/// its instance's client, the holder, the other client, and the volume's component.
+fn holder_and_other(name: &str) -> (Daemon, Client, V4Client, V4Client, String) {
+  let (daemon, instance) = two_shard_daemon_with(name, |config| {
+    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+  });
+  let mut client = Client::connect(&instance);
+  let volume = local_volume_name(&mut client);
+  let component = capability_path(&daemon, &volume)
+    .trim_start_matches('/')
+    .to_owned();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut holder = V4Client::connect_full(port, b"holder-a", 4, Some(CB_PROGRAM));
+  holder.prove_back_channel(&daemon);
+  let other = V4Client::connect_as(port, b"other-b");
+  (daemon, client, holder, other, component)
+}
+
+/// RFC 8881 §10.4, §10.4.1, §10.4.4 (A-80): do create a file for writing from A, whose back channel answers; expect a
+/// write delegation with a zero-byte space limit, and A's writes under its open and under the delegation to succeed
+/// (a holder's own change passes the recall gate). Open the file from B for reading; expect `NFS4ERR_DELAY`, A
+/// recalled on its own connection, and B's open to succeed once A returns the delegation.
+#[test]
+fn a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it() {
+  let (daemon, client, mut a, mut b, component) = holder_and_other("write-deleg");
+  let (open_a, fh, delegation) = a.open_creating(&component, "w.txt");
+  let (kind, delegation) = delegation.expect("A's open for writing is delegated");
+  assert_eq!(kind, 2, "a write delegation");
+  assert_eq!(
+    a.write_under(&fh, open_a, b"mine"),
+    NFS4_OK,
+    "under the open"
+  );
+  assert_eq!(
+    a.write_under(&fh, delegation, b"mine2"),
+    NFS4_OK,
+    "under the delegation"
+  );
+  assert_eq!(
+    b.open_with(&component, "w.txt", 1, 0),
+    NFS4ERR_DELAY,
+    "B waits for A's write delegation"
+  );
+  let recall = a.next_message();
+  assert!(is_call(&recall), "A is called back");
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  assert_eq!(a.delegreturn(&fh, delegation), NFS4_OK);
+  assert_eq!(b.open_with(&component, "w.txt", 1, 0), NFS4_OK, "B's retry");
+  drop((a, b, client));
+  drop(daemon);
+}
+
+/// RFC 8881 §10.4.3 (A-80): do read the attributes of a file A holds a write delegation of, from B; expect
+/// `NFS4ERR_DELAY` and A recalled. A's own GETATTR is answered.
+#[test]
+fn another_clients_getattr_of_a_write_delegated_file_recalls_it() {
+  let (daemon, client, mut a, mut b, component) = holder_and_other("write-getattr");
+  let (_, fh, delegation) = a.open_creating(&component, "g.txt");
+  let (_, delegation) = delegation.expect("delegated");
+  assert_eq!(a.getattr_status(&fh), NFS4_OK, "the holder's own");
+  assert_eq!(b.getattr_status(&fh), NFS4ERR_DELAY, "another client waits");
+  let recall = a.next_message();
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  assert_eq!(a.delegreturn(&fh, delegation), NFS4_OK);
+  assert_eq!(b.getattr_status(&fh), NFS4_OK);
+  assert!(counter(&daemon, "nfs4.delegation.getattr_recalled") >= 1);
+  drop((a, b, client));
+  drop(daemon);
+}
+
+/// RFC 8881 §10.4.4 (A-78, A-80): do open, from B, a file A holds a read delegation of, for reading while denying
+/// reads; expect `NFS4ERR_DELAY` and A recalled (A serves its own read opens locally, which B's deny would refuse).
+/// Before A-80 B's open was granted with A's delegation outstanding.
+#[test]
+fn an_open_denying_reads_recalls_a_read_delegation() {
+  let (daemon, client, mut a, mut b, component) = holder_and_other("deny-read");
+  let (open_a, fh, created) = a.open_creating(&component, "r.txt");
+  let (_, created) = created.expect("the create is write delegated");
+  assert_eq!(a.delegreturn(&fh, created), NFS4_OK);
+  assert_eq!(a.close(&fh, open_a), NFS4_OK);
+  // A file changed within the lease is not read delegated (A-78): the test waits the short lease out.
+  let written = Instant::now();
+  while written.elapsed() < RECALL_LEASE + RECALL_LEASE / 2 {
+    std::thread::yield_now();
+  }
+  let (_, _, delegation) = a.open_for_reading(&component, "r.txt");
+  let delegation = delegation.expect("A's read-only open is delegated");
+  assert_eq!(b.open_with(&component, "r.txt", 1, 1), NFS4ERR_DELAY);
+  let recall = a.next_message();
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  drop((a, b, client));
+  drop(daemon);
+}
+
+/// RFC 8881 §2.4, §2.10.5: do start two fresh daemons and exchange ids with each as the same client; expect different
+/// server-owner major ids and different client ids. A client takes two servers that share both for one server and
+/// shares one client between them (Linux `nfs41_walk_client_list`): before the fix every fresh daemon answered major
+/// id 1 and client id 1:1, so a Docker host's kernel queued a new daemon's mount behind a dead one's
+/// (docs/bugs/2026-10-04-every-daemon-announced-one-nfs-server-owner.md).
+#[test]
+fn two_fresh_daemons_name_different_servers_and_mint_different_client_ids() {
+  let (first, _first_instance) = two_shard_daemon("owner-first");
+  let (second, _second_instance) = two_shard_daemon("owner-second");
+  let a = V4Client::connect_as(first.nfs_port().unwrap(), b"one-client");
+  let b = V4Client::connect_as(second.nfs_port().unwrap(), b"one-client");
+  assert_ne!(a.server_owner, b.server_owner, "two servers, two owners");
+  assert_ne!(
+    a.clientid, b.clientid,
+    "client ids never repeat across servers' lives"
+  );
+  drop((a, b));
+  drop((first, second));
 }

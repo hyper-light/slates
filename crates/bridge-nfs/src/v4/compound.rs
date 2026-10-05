@@ -78,6 +78,16 @@ pub trait Backend {
     let _ = clientid;
     false
   }
+  /// The compound's operations act for `clientid`, the client its `SEQUENCE` named (A-80): the owner tells a
+  /// delegation holder's own change from another client's by it. A server that grants no delegations ignores it.
+  fn act_for(&mut self, clientid: u64) {
+    let _ = clientid;
+  }
+  /// The compound ended at operation `opnum` with `status` (its last operation's, `NFS4_OK` when every one
+  /// succeeded), for the server's counts of which operations its clients are told to retry.
+  fn finished(&mut self, opnum: u32, status: Nfsstat4) {
+    let _ = (opnum, status);
+  }
 }
 
 /// Format: the operation numbers (RFC 7863 `nfs_opnum4`).
@@ -210,6 +220,17 @@ const ACE4_ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
 const OPEN4_SHARE_ACCESS_WANT_DELEG_MASK: u32 = 0xFF00;
 /// Format: see [`OPEN4_SHARE_ACCESS_WANT_DELEG_MASK`].
 const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0400;
+/// Format: `OPEN4_SHARE_ACCESS_WANT_READ_DELEG` (RFC 8881 §18.16.1): the client wants a read delegation, not a write
+/// one.
+const OPEN4_SHARE_ACCESS_WANT_READ_DELEG: u32 = 0x0100;
+/// Format: `OPEN_DELEGATE_WRITE` (RFC 8881 §18.16.2).
+const OPEN_DELEGATE_WRITE: u32 = 2;
+/// Format: `NFS_LIMIT_SIZE` (RFC 8881 §18.16.1, `limit_by4`).
+const NFS_LIMIT_SIZE: u32 = 1;
+/// Format: the `STATE_OPEN` argument's bits naming the delegations an open may be granted (A-80): a read one.
+const MAY_DELEGATE_READ: u32 = 1;
+/// Format: see [`MAY_DELEGATE_READ`]: a write one.
+const MAY_DELEGATE_WRITE: u32 = 2;
 /// Format: `OPEN4_RESULT_LOCKTYPE_POSIX`: this server's locks follow POSIX (RFC 8881 §18.16.3).
 const OPEN4_RESULT_LOCKTYPE_POSIX: u32 = 4;
 /// Format: `opentype4` `OPEN4_CREATE`.
@@ -297,7 +318,11 @@ pub struct Server {
   /// than the clients the table held times the owners.
   pending_purges: Vec<(u64, u16)>,
   limits: Limits,
-  boot: u32,
+  /// The major id of the `server_owner4` EXCHANGE_ID answers (RFC 8881 §2.10.5): what names this server, the same
+  /// across its restarts and different from every other server's. A client takes two servers with one major id (and
+  /// the same client id) for one server and shares one client between them (Linux: `nfs41_walk_client_list`), so a
+  /// value every server shares merges them (docs/bugs/2026-10-04-every-daemon-announced-one-nfs-server-owner.md).
+  owner: u64,
 }
 
 impl Server {
@@ -310,8 +335,15 @@ impl Server {
       sessions: Sessions::new(boot, limits),
       pending_purges: Vec::new(),
       limits,
-      boot,
+      owner: u64::from(boot),
     }
+  }
+
+  /// This server named `owner` in its `server_owner4` (a daemon's instance identity; [`Server::new`] names a
+  /// standalone server by its instance alone).
+  pub fn with_owner(mut self, owner: u64) -> Server {
+    self.owner = owner;
+    self
   }
 
   /// A durable listener (§4.6 A-37): its client table rebuilt from the records kept before a restart
@@ -418,6 +450,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
   let mut results = XdrWriter::new();
   let mut done = 0u32;
   let mut last = Nfsstat4::Ok;
+  let mut last_op = 0u32;
   let mut slot: Option<(SessionId, u32)> = None;
   let mut limits: Option<ReplyLimits> = None;
   for index in 0..count {
@@ -426,6 +459,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
       break;
     };
     let opnum = defined_in(minor, opnum);
+    last_op = opnum;
     let outcome = if index == 0 {
       if opnum == op::SEQUENCE {
         match sequence(backend, &mut reader, (request_bytes, count)) {
@@ -441,6 +475,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
             limits = Some(reply_limits);
             frame.clientid = Some(clientid);
             frame.session = Some(sessionid);
+            backend.act_for(clientid);
             Ok(body)
           }
           Err(status) => Err(status),
@@ -469,6 +504,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
       break;
     }
   }
+  backend.finished(last_op, last);
   let encoded = reply(last, &tag, done, results.as_slice());
   if let Some((sessionid, slotid)) = slot {
     // A reply that cannot be kept for a retry is not sent as if it had been: the client is told the
@@ -677,18 +713,19 @@ fn exchange_id<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outco
     principal: backend.principal(),
   };
   let now = backend.now_ns();
-  let (granted, boot) = backend.with_v4(|server| {
+  let (granted, owner) = backend.with_v4(|server| {
     let granted = server.sessions.exchange_id(&args, now);
-    granted.map(|granted| (granted, server.boot))
+    granted.map(|granted| (granted, server.owner))
   })??;
   let mut body = XdrWriter::new();
   body.u64(granted.clientid);
   body.u32(granted.sequenceid);
   body.u32(granted.flags);
   body.u32(0); // SP4_NONE
-  // server_owner4: the minor id, then the major id naming this server instance.
+  // server_owner4: the minor id, then the major id naming this server (the same across its restarts, never another
+  // server's).
   body.u64(0);
-  body.opaque(&boot.to_be_bytes());
+  body.opaque(&owner.to_be_bytes());
   body.opaque(b"slates"); // server scope
   body.u32(0); // no implementation id
   Ok(body.into_bytes())
@@ -1811,13 +1848,13 @@ async fn open<B: Backend>(
   let dir = current(frame)?.clone();
   let opened = open_claim(backend, reader, dir, create, access).await?;
   let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
-  let may_delegate = may_delegate(backend, frame, &opened.fh, wishes)?;
+  let may_delegate = delegations_allowed(backend, frame, &opened.fh, wishes)?;
   // The open is recorded at the file's owner (§4.6 A-36), which grants a delegation when one is due (A-78).
   let mut extra = XdrWriter::new();
   extra.opaque(&owner);
   extra.u32(access);
   extra.u32(deny);
-  extra.u32(u32::from(may_delegate));
+  extra.u32(may_delegate);
   extra.u64(backend.now_ns());
   let recorded = state_call(
     backend,
@@ -1831,7 +1868,9 @@ async fn open<B: Backend>(
   let mut recorded = XdrReader::new(&recorded);
   let stateid = stateid_of(&mut recorded)?;
   let delegation = match recorded.u32() {
-    Ok(1) => Some(stateid_of(&mut recorded)?),
+    Ok(kind @ (OPEN_DELEGATE_READ | OPEN_DELEGATE_WRITE)) => {
+      Some((kind, stateid_of(&mut recorded)?))
+    }
     _ => None,
   };
   let mut body = XdrWriter::new();
@@ -1840,7 +1879,8 @@ async fn open<B: Backend>(
   body.u32(OPEN4_RESULT_LOCKTYPE_POSIX);
   opened.attrset.encode(&mut body);
   match delegation {
-    Some(delegation) => encode_read_delegation(&mut body, &delegation),
+    Some((OPEN_DELEGATE_WRITE, delegation)) => encode_write_delegation(&mut body, &delegation),
+    Some((_, delegation)) => encode_read_delegation(&mut body, &delegation),
     None => body.u32(OPEN_DELEGATE_NONE),
   }
   frame.current = Some(opened.fh);
@@ -1895,28 +1935,34 @@ async fn open_claim<B: Backend>(
   Ok(opened)
 }
 
-/// Whether an open may be delegated (A-78): the session's back channel has answered (RFC 8881 §10.2: never before
-/// it is known to exist), the client did not ask for no delegation, and the file's owner is the shard serving the
-/// session, so its recall, revocation and the revocation's notice all happen where the session lives.
-fn may_delegate<B: Backend>(
+/// The delegations an open may be granted (A-78, A-80), as [`MAY_DELEGATE_READ`] and [`MAY_DELEGATE_WRITE`] bits:
+/// none unless the session's back channel has answered (RFC 8881 §10.2: never before it is known to exist), the
+/// client did not ask for no delegation, and the file's owner is the shard serving the session, so its recall,
+/// revocation and the revocation's notice all happen where the session lives; a read one only when the client asked
+/// for that kind.
+fn delegations_allowed<B: Backend>(
   backend: &mut B,
   frame: &Frame,
   fh: &Nfsfh3,
   wishes: u32,
-) -> Result<bool, Nfsstat4> {
-  if wishes & OPEN4_SHARE_ACCESS_WANT_DELEG_MASK == OPEN4_SHARE_ACCESS_WANT_NO_DELEG
-    || !backend.owns_file(fh)
-  {
-    return Ok(false);
+) -> Result<u32, Nfsstat4> {
+  let wish = wishes & OPEN4_SHARE_ACCESS_WANT_DELEG_MASK;
+  if wish == OPEN4_SHARE_ACCESS_WANT_NO_DELEG || !backend.owns_file(fh) {
+    return Ok(0);
   }
   let Some(sessionid) = frame.session else {
-    return Ok(false);
+    return Ok(0);
   };
-  backend.with_v4(|server| {
+  let answering = backend.with_v4(|server| {
     server
       .sessions
       .back_channel(&sessionid)
       .is_some_and(|back| back.state == super::session::CallbackState::Up)
+  })?;
+  Ok(match (answering, wish) {
+    (false, _) => 0,
+    (true, OPEN4_SHARE_ACCESS_WANT_READ_DELEG) => MAY_DELEGATE_READ,
+    (true, _) => MAY_DELEGATE_READ | MAY_DELEGATE_WRITE,
   })
 }
 
@@ -1927,6 +1973,21 @@ fn encode_read_delegation(body: &mut XdrWriter, delegation: &Stateid) {
   body.u32(OPEN_DELEGATE_READ);
   delegation.encode(body);
   body.bool(false); // recall
+  body.u32(ACE4_ACCESS_ALLOWED_ACE_TYPE);
+  body.u32(0); // flags
+  body.u32(0); // access mask: nothing granted by the delegation itself
+  body.opaque(b"EVERYONE@");
+}
+
+/// Writes an `open_delegation4` granting a write delegation (§18.16.2): its state id, no recall pending, a space limit
+/// of zero bytes (`NFS_LIMIT_SIZE`, filesize 0: §10.4.1's limit "that will always force modified data to be flushed
+/// to the server on close", as Linux nfsd encodes it; A-80), and the same `nfsace4` as a read delegation.
+fn encode_write_delegation(body: &mut XdrWriter, delegation: &Stateid) {
+  body.u32(OPEN_DELEGATE_WRITE);
+  delegation.encode(body);
+  body.bool(false); // recall
+  body.u32(NFS_LIMIT_SIZE);
+  body.u64(0); // filesize
   body.u32(ACE4_ACCESS_ALLOWED_ACE_TYPE);
   body.u32(0); // flags
   body.u32(0); // access mask: nothing granted by the delegation itself

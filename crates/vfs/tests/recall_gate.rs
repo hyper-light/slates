@@ -8,6 +8,11 @@ use slates_vfs::error::VfsError;
 mod common;
 use common::{store, volume};
 
+/// Format: the NFSv4 client holding the test's delegation.
+const HOLDER: u64 = 7;
+/// Format: another NFSv4 client.
+const OTHER: u64 = 8;
+
 /// Writes, truncates, chmods, renames and unlinks `file` (named `held` in `dir`), expecting each refused `Delegated`.
 fn every_change_is_refused(
   vol: &mut slates_vfs::volume::Volume,
@@ -39,7 +44,7 @@ fn a_delegated_inode_refuses_every_change_and_queues_one_recall() {
   let file = vol.create_file_no(&mut store, root, "held", 0o644).unwrap();
   vol.write(&mut store, file, 0, b"before").unwrap();
   let dir = vol.root();
-  store.recall_gate.delegate(file.0);
+  store.recall_gate.delegate(file.0, HOLDER);
   every_change_is_refused(&mut vol, &mut store, file, dir);
   let mut buf = [0u8; 6];
   assert_eq!(
@@ -54,7 +59,7 @@ fn a_delegated_inode_refuses_every_change_and_queues_one_recall() {
   );
   assert_eq!(
     store.recall_gate.take_requested(),
-    vec![file.0],
+    vec![(file.0, None)],
     "one recall, however many refusals"
   );
   store.recall_gate.release(file.0);
@@ -69,7 +74,7 @@ fn a_parked_caller_waits_until_the_inode_is_released() {
   let mut vol = volume(&mut store, 1 << 20);
   let root = vol.root_inode(&store).unwrap();
   let file = vol.create_file_no(&mut store, root, "held", 0o644).unwrap();
-  store.recall_gate.delegate(file.0);
+  store.recall_gate.delegate(file.0, HOLDER);
   let before = store.recall_gate.refusals();
   assert_eq!(
     vol.write(&mut store, file, 0, b"x"),
@@ -96,4 +101,39 @@ fn a_parked_caller_waits_until_the_inode_is_released() {
     "released: go"
   );
   assert_eq!(vol.write(&mut store, file, 0, b"x"), Ok(1));
+}
+
+/// A-80: do delegate a file's inode to one client, then change it while that client acts; expect the change to pass
+/// (a holder writes its own file). Change it while another client acts; expect it refused, and the recall it asks for
+/// to name that client as the actor. With a second holder, expect the first holder's change refused too.
+#[test]
+fn a_holders_own_change_passes_and_another_clients_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "held", 0o644).unwrap();
+  store.recall_gate.delegate(file.0, HOLDER);
+  store.recall_gate.act_as(Some(HOLDER));
+  assert_eq!(
+    vol.write(&mut store, file, 0, b"mine"),
+    Ok(4),
+    "the holder's own"
+  );
+  store.recall_gate.act_as(Some(OTHER));
+  assert_eq!(
+    vol.write(&mut store, file, 0, b"them"),
+    Err(VfsError::Delegated)
+  );
+  assert_eq!(
+    store.recall_gate.take_requested(),
+    vec![(file.0, Some(OTHER))]
+  );
+  store.recall_gate.delegate(file.0, OTHER);
+  store.recall_gate.act_as(Some(HOLDER));
+  assert_eq!(
+    vol.write(&mut store, file, 0, b"mine"),
+    Err(VfsError::Delegated),
+    "another client holds it too"
+  );
+  store.recall_gate.act_as(None);
 }

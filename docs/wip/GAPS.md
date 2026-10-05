@@ -3554,8 +3554,13 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   - FUSE and SDK callers parked rather than refused;
   - `SEQ4_STATUS_CB_PATH_DOWN`;
   - a forwarded NFSv3 call held, not answered `JUKEBOX`;
-  - write delegations with space reservation (B, second half);
+  - write delegations: **done (A-80)**, with a zero-byte space limit; a space reservation that would let a holder
+    cache writes past close is owed, as is `CB_GETATTR` in place of the GETATTR recall;
   - directory delegations (C, §10.9);
   - the dynamic slot target;
-  - the one 84 ms `DELEGRETURN` stall, seen once.
+  - the one 84 ms `DELEGRETURN` stall, seen once, and the 74–87 ms client-side DELEGRETURN queue under load
+    (BENCHMARKS, A-80; the daemon answered no `NFS4ERR_DELAY`).
+- **Fixed (2026-10-05):** every fresh daemon announced one NFSv4 server owner and minted the same first client id; a
+  Linux client merged a new daemon with a dead one and hung its mount
+  (`docs/bugs/2026-10-04-every-daemon-announced-one-nfs-server-owner.md`).
 

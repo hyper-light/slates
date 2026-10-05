@@ -2,9 +2,11 @@
 //! the recalls its changes asked for are sent, and delegations not returned within a lease of their recall are
 //! revoked.
 //!
-//! A change to a delegated file is refused at the volume core's recall gate (`slates_vfs::recall_gate`) and its
-//! inode queued there; [`drain`] runs on the owner shard after the operation, takes that queue, and recalls each
-//! file's delegations from its owner's file state: a `CB_RECALL` on the holder's back channel, sent by a detached
+//! A change to a delegated file by anyone but its holder is refused at the volume core's recall gate
+//! (`slates_vfs::recall_gate`) and its inode queued there with the change's actor; an NFSv4 open that conflicts with
+//! another holder's delegation is answered `NFS4ERR_DELAY` at the file state, which queues its recall (A-80).
+//! [`drain`] runs on the owner shard after the operation, takes both queues, and recalls each file's other holders'
+//! delegations: a `CB_RECALL` on the holder's back channel, sent by a detached
 //! task of this shard that records the outcome (never a silent drop). A holder with no answering back channel on
 //! this shard cannot be told to return its delegation, so it is revoked at once; the holder learns it on its next
 //! `SEQUENCE` (`SEQ4_STATUS_RECALLABLE_STATE_REVOKED`). A holder that does not return a recalled delegation within a
@@ -35,6 +37,7 @@ const REVOKED_LAPSED: &str = "nfs4.delegation.revoked_lapsed";
 /// Sends the recalls this shard's changes asked for and revokes lapsed delegations (the module doc). Called after
 /// each operation the shard serves; cheap when nothing is delegated.
 pub(crate) fn drain(s: &mut ShardState) {
+  // With no delegation at all, neither the gate nor a conflicting open can have asked for a recall.
   if s.store.recall_gate.is_open() {
     return;
   }
@@ -46,9 +49,10 @@ pub(crate) fn drain(s: &mut ShardState) {
   };
   let quiet = files.delegation_quiet();
   let lapsed = files.revoke_lapsed(now, lease, quiet);
-  let mut sends: Vec<Recall> = Vec::new();
-  for inode in requested {
-    sends.extend(files.recall_inode(inode, now).send);
+  // The recalls conflicting NFSv4 opens began at the file state, then those the gate's refused changes ask for.
+  let mut sends: Vec<Recall> = files.take_recalls();
+  for (inode, actor) in requested {
+    sends.extend(files.recall_inode(inode, actor, now).send);
   }
   for _ in &lapsed {
     *s.refusals.entry(REVOKED_LAPSED).or_insert(0) += 1;

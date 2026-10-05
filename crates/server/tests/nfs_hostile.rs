@@ -73,9 +73,15 @@ fn provision_remote_volume(instance: &str) -> String {
 }
 
 fn two_shard_daemon(name: &str) -> (Daemon, String) {
+  two_shard_daemon_with(name, |_| {})
+}
+
+/// [`two_shard_daemon`], its configuration adjusted by `adjust` before it starts.
+fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(2));
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(2));
+  adjust(&mut config);
   let daemon = Daemon::start(
     &profile,
     config,
@@ -453,14 +459,26 @@ const VICTIM_HANDLE_BITS: usize = 57 * 8;
 /// Shape: READs a client pipelines in one write, as a parallel build keeps many in flight on its one connection.
 const PIPELINED: u32 = 64;
 
+/// Shape: the step quantum the pipelining test pins, in nanoseconds: room for the whole burst in one turn in any
+/// build ([`PIPELINED`] READs at 100 µs each, above the 46–68 µs a debug build measured per pipelined READ,
+/// 2026-10-05). The live quantum is the shard's wake estimate (5.3 µs measured that night), shorter than one debug
+/// READ, so with it the test judged the machine's wake speed rather than the batching.
+const PINNED_QUANTUM_NS: u64 = PIPELINED as u64 * 100_000;
+
 /// §4.6 (A-74): do pipeline [`PIPELINED`] READs of one file in a single write on one connection (the volume on the
-/// other shard, so the connection moves first), with a spinner per core; expect every reply, in request order, each
-/// carrying the file's bytes, and replies sent several to a write (`nfs.replies.batched` moved). One reply and a
+/// other shard, so the connection moves first), with a spinner per core and the shard's quantum pinned at
+/// [`PINNED_QUANTUM_NS`] (calls cheaper than the quantum, the regime batching is for); expect every reply, in
+/// request order, each carrying the file's bytes, and replies sent several to a write (`nfs.replies.batched`
+/// moved). A call dearer than the quantum is written alone by design: holding its reply saves a write syscall at
+/// the cost of the whole pipeline's serve time (measured and rejected, docs/wip/BENCHMARKS.md, 2026-10-05). One reply and a
 /// yield per call queued every pipelined call behind all the earlier ones' writes and yields: a parallel Go build
 /// saw 1.1–1.4 ms per OPEN where one call in flight saw 0.18 ms, against a 3 µs median serve (2026-10-04).
 #[test]
 fn pipelined_calls_are_answered_in_order_and_their_replies_share_writes() {
-  let (daemon, instance) = two_shard_daemon("pipeline");
+  let (daemon, instance) = two_shard_daemon_with("pipeline", |config| {
+    config.runtime.wake_tracking = None;
+    config.runtime.step_budget_ns = PINNED_QUANTUM_NS;
+  });
   let name = provision_remote_volume(&instance);
   let export = daemon.mount_capability(&name).unwrap().unwrap();
   let port = daemon.nfs_port().unwrap();

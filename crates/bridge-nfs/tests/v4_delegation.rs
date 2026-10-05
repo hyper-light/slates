@@ -7,7 +7,7 @@
 use slates_bridge_nfs::handle::FileHandle;
 use slates_bridge_nfs::nfs::Nfsfh3;
 use slates_bridge_nfs::v4::Nfsstat4;
-use slates_bridge_nfs::v4::delegation::DelegationRecord;
+use slates_bridge_nfs::v4::delegation::{Conflict, DelegationRecord};
 use slates_bridge_nfs::v4::files::{
   FileChange, FileState, IoAuthority, IoWant, Share, owner_tag, share,
 };
@@ -94,22 +94,22 @@ fn a_conflicting_change_recalls_once_and_waits_until_the_return() {
   files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   assert!(
-    !files.recall(&fh, Some(A), true, 1).waiting,
+    !files.recall(&fh, Some(A), Conflict::Change, 1).waiting,
     "the holder's own change waits on nothing"
   );
-  let first = files.recall(&fh, Some(B), true, 2);
+  let first = files.recall(&fh, Some(B), Conflict::Change, 2);
   assert!(first.waiting);
   assert_eq!(first.send.len(), 1, "one recall");
   assert_eq!(first.send[0].stateid, delegation);
   assert_eq!(first.send[0].clientid, A);
-  let again = files.recall(&fh, None, true, 3);
+  let again = files.recall(&fh, None, Conflict::Change, 3);
   assert!(
     again.waiting && again.send.is_empty(),
     "still waiting, no second recall"
   );
   files.return_delegation(&delegation, A, &fh).unwrap();
   assert!(
-    !files.recall(&fh, Some(B), true, 5).waiting,
+    !files.recall(&fh, Some(B), Conflict::Change, 5).waiting,
     "nothing to wait for once returned"
   );
   assert_eq!(
@@ -127,7 +127,7 @@ fn a_recalled_file_is_not_delegated_again_within_the_quiet_period() {
   let fh = handle(10, 1);
   files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
-  files.recall(&fh, Some(B), true, 10);
+  files.recall(&fh, Some(B), Conflict::Change, 10);
   files.return_delegation(&delegation, A, &fh).unwrap();
   assert_eq!(
     files.delegate_read(A, &fh, 10 + QUIET / 2, QUIET),
@@ -149,7 +149,7 @@ fn an_unreturned_delegation_is_revoked_after_a_lease() {
   files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   files.take_changes();
-  files.recall(&fh, Some(B), true, 100);
+  files.recall(&fh, Some(B), Conflict::Change, 100);
   assert!(
     files.revoke_lapsed(100 + LEASE, LEASE, QUIET).is_empty(),
     "not before a lease"
@@ -163,7 +163,9 @@ fn an_unreturned_delegation_is_revoked_after_a_lease() {
     vec![FileChange::DelegationCleared(delegation.other)]
   );
   assert!(
-    !files.recall(&fh, Some(B), true, 102 + LEASE).waiting,
+    !files
+      .recall(&fh, Some(B), Conflict::Change, 102 + LEASE)
+      .waiting,
     "nothing left to wait for"
   );
   assert!(
@@ -188,7 +190,7 @@ fn a_change_through_another_mount_recalls_the_delegation() {
     .open(A, b"a".to_vec(), &handle(10, 1), read_only())
     .unwrap();
   files.delegate_read(A, &handle(10, 1), 0, QUIET).unwrap();
-  let plan = files.recall(&handle(10, 2), Some(B), true, 1);
+  let plan = files.recall(&handle(10, 2), Some(B), Conflict::Change, 1);
   assert!(plan.waiting && plan.send.len() == 1);
 }
 
@@ -200,7 +202,7 @@ fn a_read_by_another_client_does_not_recall_a_read_delegation() {
   let fh = handle(10, 1);
   files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
   files.delegate_read(A, &fh, 0, QUIET).unwrap();
-  let plan = files.recall(&fh, Some(B), false, 1);
+  let plan = files.recall(&fh, Some(B), Conflict::Read, 1);
   assert!(!plan.waiting && plan.send.is_empty());
 }
 
@@ -257,5 +259,170 @@ fn a_delegation_survives_a_restart_through_its_record() {
     rebuilt.check_io(&delegation, &fh, A, IoWant::Read),
     Ok(IoAuthority::Open)
   );
-  assert!(rebuilt.recall(&fh, Some(B), true, 1).waiting);
+  assert!(rebuilt.recall(&fh, Some(B), Conflict::Change, 1).waiting);
+}
+
+/// §10.4, §10.4.1 (A-80): do open a file for writing from A and ask for a write delegation; expect one, and the same
+/// one again. With B holding the file open, expect none for a third client; with A holding a write delegation, expect
+/// no read delegation for B.
+#[test]
+fn an_open_for_writing_is_write_delegated_only_while_no_other_client_has_the_file() {
+  let mut files = owner();
+  let fh = handle(10, 1);
+  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  let delegation = files
+    .delegate_write(A, &fh, 0, QUIET)
+    .expect("A's open for writing is delegated");
+  assert_eq!(files.delegate_write(A, &fh, 1, QUIET), Some(delegation));
+  assert_eq!(
+    files.check_io(&delegation, &fh, A, IoWant::Write),
+    Ok(IoAuthority::Open),
+    "the holder writes under it"
+  );
+  assert_eq!(
+    files.check_io(&delegation, &fh, A, IoWant::Read),
+    Ok(IoAuthority::Open),
+    "and reads (§9.1.2)"
+  );
+  assert_eq!(files.delegate_read(B, &fh, QUIET + 1, QUIET), None);
+  let other = handle(11, 1);
+  files.open(B, b"b".to_vec(), &other, read_only()).unwrap();
+  assert_eq!(
+    files.delegate_write(3, &other, 2, QUIET),
+    None,
+    "another client has the file open"
+  );
+}
+
+/// §10.4.4 (A-80): do open a file A holds a write delegation of, from B, for reading only; expect `NFS4ERR_DELAY`
+/// with one recall queued for the daemon, a second attempt to wait without a second recall, and B's open to proceed
+/// once A returns the delegation. A's own opens wait on nothing.
+#[test]
+fn any_open_by_another_client_recalls_a_write_delegation() {
+  let mut files = owner();
+  let fh = handle(10, 1);
+  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  let delegation = files.delegate_write(A, &fh, 0, QUIET).unwrap();
+  assert_eq!(files.check_open_conflicts(A, &fh, read_only(), 1), Ok(()));
+  assert_eq!(
+    files.check_open_conflicts(B, &fh, read_only(), 2),
+    Err(Nfsstat4::Delay)
+  );
+  let recalls = files.take_recalls();
+  assert_eq!(recalls.len(), 1);
+  assert_eq!(recalls[0].stateid, delegation);
+  assert_eq!(
+    files.check_open_conflicts(B, &fh, read_only(), 3),
+    Err(Nfsstat4::Delay)
+  );
+  assert!(files.take_recalls().is_empty(), "recalled once");
+  files.return_delegation(&delegation, A, &fh).unwrap();
+  assert_eq!(files.check_open_conflicts(B, &fh, read_only(), 4), Ok(()));
+}
+
+/// §10.4.4 (A-80): do open a file A holds a read delegation of, from B: for reading, expect it to proceed; for
+/// writing, or reading while denying reads, expect `NFS4ERR_DELAY` and A's delegation recalled.
+#[test]
+fn an_open_that_writes_or_denies_reads_recalls_a_read_delegation() {
+  let mut files = owner();
+  let fh = handle(10, 1);
+  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files.delegate_read(A, &fh, 0, QUIET).unwrap();
+  assert_eq!(files.check_open_conflicts(B, &fh, read_only(), 1), Ok(()));
+  let denying = Share {
+    access: share::READ,
+    deny: share::READ,
+  };
+  assert_eq!(
+    files.check_open_conflicts(B, &fh, denying, 2),
+    Err(Nfsstat4::Delay)
+  );
+  assert_eq!(files.take_recalls().len(), 1);
+  assert_eq!(
+    files.check_open_conflicts(B, &fh, read_write(), 3),
+    Err(Nfsstat4::Delay),
+    "still recalled"
+  );
+}
+
+/// §10.4.3 (A-80): do read a file's attributes from B while A holds a write delegation of it; expect a wait and one
+/// recall. A's own reads wait on nothing, nor do B's of a read-delegated file.
+#[test]
+fn another_clients_getattr_recalls_a_write_delegation() {
+  let mut files = owner();
+  let fh = handle(10, 1);
+  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  files.delegate_write(A, &fh, 0, QUIET).unwrap();
+  assert!(!files.check_read_conflicts(&fh, A, 1));
+  assert!(files.check_read_conflicts(&fh, B, 2));
+  assert_eq!(files.take_recalls().len(), 1);
+  let read = handle(12, 1);
+  files.open(A, b"a".to_vec(), &read, read_only()).unwrap();
+  files.delegate_read(A, &read, 0, QUIET).unwrap();
+  assert!(!files.check_read_conflicts(&read, B, 3));
+}
+
+/// A-80: do open a file A holds a write delegation of, from A, read-only; expect no read delegation (A's write one
+/// already covers its opens), never A's write delegation handed back as a read one.
+#[test]
+fn a_write_delegations_holder_is_not_given_it_again_as_a_read_one() {
+  let mut files = owner();
+  let fh = handle(10, 1);
+  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  files.delegate_write(A, &fh, 0, QUIET).unwrap();
+  files.open(A, b"a2".to_vec(), &fh, read_only()).unwrap();
+  assert_eq!(files.delegate_read(A, &fh, QUIET + 1, QUIET), None);
+}
+
+/// Applies the inodes whose holders changed to `gate`, as the daemon updates its recall gate (A-80).
+fn follow(
+  files: &mut FileState,
+  gate: &mut std::collections::BTreeMap<u64, std::collections::BTreeSet<u64>>,
+) {
+  for inode in files.take_changed_inodes() {
+    let holders = files.holders_of_inode(inode);
+    if holders.is_empty() {
+      gate.remove(&inode);
+    } else {
+      gate.insert(inode, holders);
+    }
+  }
+}
+
+/// A-80: do grant, return, recall, revoke and purge delegations across several files and clients, updating a gate
+/// only from the inodes whose holders changed after each step; expect it equal to the holders rebuilt whole from the
+/// table every time.
+#[test]
+fn the_gate_updated_by_changed_inodes_equals_a_whole_rebuild() {
+  let mut files = owner();
+  let mut gate = std::collections::BTreeMap::new();
+  let fhs: Vec<Nfsfh3> = (10..14).map(|inode| handle(inode, 1)).collect();
+  let mut check = |files: &mut FileState, step: &str| {
+    follow(files, &mut gate);
+    assert_eq!(gate, files.delegated_holders(), "after {step}");
+  };
+  let mut held = Vec::new();
+  for (index, fh) in fhs.iter().enumerate() {
+    let client = if index % 2 == 0 { A } else { B };
+    files.open(client, b"o".to_vec(), fh, read_only()).unwrap();
+    held.push((client, files.delegate_read(client, fh, 0, QUIET).unwrap()));
+    check(&mut files, "a read grant");
+  }
+  let shared = &fhs[0];
+  files.open(B, b"o".to_vec(), shared, read_only()).unwrap();
+  let second = files.delegate_read(B, shared, 0, QUIET).unwrap();
+  check(&mut files, "a second holder");
+  files.return_delegation(&second, B, shared).unwrap();
+  check(&mut files, "a return");
+  files.recall(&fhs[1], Some(A), Conflict::Change, 1);
+  files.revoke_lapsed(2 + LEASE, LEASE, QUIET);
+  check(&mut files, "a lapsed revocation");
+  files.revoke_delegation(&held[2].1.other);
+  check(&mut files, "a revocation");
+  files.purge(A);
+  check(&mut files, "a purge");
+  let write = handle(20, 1);
+  files.open(B, b"w".to_vec(), &write, read_write()).unwrap();
+  files.delegate_write(B, &write, 0, QUIET).unwrap();
+  check(&mut files, "a write grant");
 }

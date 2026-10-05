@@ -504,6 +504,9 @@ struct Requester {
   /// client's (AppleDouble views only for the macOS client, §4.6 A-33); an NFSv4 operation's v3 call is
   /// the front end's (no views; change counters, A-38).
   dialect: Dialect,
+  /// The NFSv4 client an operation's v3 call acts for (the client its compound's `SEQUENCE` named, A-80), so the
+  /// owner's recall gate passes a delegation holder's own change; `None` for every other call.
+  client: Option<u64>,
 }
 
 impl Requester {
@@ -518,6 +521,7 @@ impl Requester {
         groups: Some(identity.groups),
         capability: None,
         dialect: Dialect::LOOPBACK_NFS3,
+        client: None,
       },
       None => Requester::root(),
     }
@@ -532,6 +536,7 @@ impl Requester {
       groups: None,
       capability: None,
       dialect: Dialect::LOOPBACK_NFS3,
+      client: None,
     }
   }
 
@@ -818,6 +823,49 @@ fn presented_capability(
   slates_bridge_nfs::request_capability(&XdrReader::new(args))
 }
 
+/// Counter: NFSv4 `GETATTR`s answered `NFS4ERR_DELAY` while another client's write delegation of the file was
+/// recalled (A-80).
+const GETATTR_RECALLED: &str = "nfs4.delegation.getattr_recalled";
+
+/// An NFSv4 client's `GETATTR` of a file another client holds a write delegation of, refused `NFS3ERR_JUKEBOX`
+/// (`NFS4ERR_DELAY` to the client) while that delegation is recalled (RFC 8881 §10.4.3; A-80); `None` for every
+/// other call, which is served. Only a client is told to wait: no path outside NFSv4 has a delegation's promise to
+/// keep, and a write delegation's zero space limit has its holder flush at every close, so what those paths read is
+/// what they would read without one.
+fn refused_for_write_delegation(
+  requester: &Requester,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+) -> Option<(AcceptStatus, Vec<u8>)> {
+  let client = requester.client?;
+  if program != NFS_PROGRAM || procedure != slates_bridge_nfs::procedures::NFSPROC3_GETATTR {
+    return None;
+  }
+  let fh = Nfsfh3::decode(&mut XdrReader::new(args)).ok()?;
+  let now = futures::now_ns();
+  let waiting = state::with_state(|s| {
+    if s.store.recall_gate.is_open() {
+      return false;
+    }
+    let waiting = s
+      .nfs_v4_files
+      .as_mut()
+      .is_some_and(|files| files.check_read_conflicts(&fh, client, now));
+    if waiting {
+      *s.refusals.entry(GETATTR_RECALLED).or_insert(0) += 1;
+      crate::delegation::drain(s);
+    }
+    waiting
+  })?;
+  waiting.then(|| {
+    (
+      AcceptStatus::Success,
+      status_failure_reply(Nfsstat3::Jukebox, procedure),
+    )
+  })
+}
+
 /// Serves one call locally, on this shard's volumes and synthetic root, as `requester` (the mounting
 /// user's subject and the group its created objects take).
 fn serve_local(
@@ -835,6 +883,9 @@ fn serve_local(
   // procedure — content-free (an operation code, never a path or bytes). The clock and ring are reached
   // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
   // so there is no re-entrant borrow.
+  if let Some(refused) = refused_for_write_delegation(&requester, program, procedure, args) {
+    return refused;
+  }
   let request = RequestId {
     client: u32::from(port),
     sequence: xid,
@@ -858,6 +909,9 @@ fn serve_local(
     mount_rights(),
     requester.groups,
   );
+  // The recall gate passes a change by the only holders of a file's delegations: the NFSv4 client this call acts
+  // for, if any (A-80). Named for this call alone, and cleared after it.
+  let _ = state::with_state(|s| s.store.recall_gate.act_as(requester.client));
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
     &mut service,
@@ -868,6 +922,7 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
+  let _ = state::with_state(|s| s.store.recall_gate.act_as(None));
   // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
   // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
   let result = if matches!(served.0, AcceptStatus::Success)
@@ -1328,6 +1383,36 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
   }
 }
 
+/// The counter of compounds answered `NFS4ERR_DELAY` at operation `opnum` (§4.14): the operations a recall or a
+/// lease gate tells clients to retry, each of which costs the client a backoff (Linux: at least 100 ms,
+/// `NFS4_POLL_RETRY_MIN`).
+fn delayed_counter(opnum: u32) -> &'static str {
+  /// Format: the operation numbers named (RFC 7863 `nfs_opnum4`).
+  const OPEN: u32 = 18;
+  /// Format: see [`OPEN`].
+  const DELEGRETURN: u32 = 8;
+  /// Format: see [`OPEN`].
+  const GETATTR: u32 = 9;
+  /// Format: see [`OPEN`].
+  const WRITE: u32 = 38;
+  /// Format: see [`OPEN`].
+  const SETATTR: u32 = 34;
+  /// Format: see [`OPEN`].
+  const REMOVE: u32 = 28;
+  /// Format: see [`OPEN`].
+  const RENAME: u32 = 29;
+  match opnum {
+    OPEN => "nfs4.delay.open",
+    DELEGRETURN => "nfs4.delay.delegreturn",
+    GETATTR => "nfs4.delay.getattr",
+    WRITE => "nfs4.delay.write",
+    SETATTR => "nfs4.delay.setattr",
+    REMOVE => "nfs4.delay.remove",
+    RENAME => "nfs4.delay.rename",
+    _ => "nfs4.delay.other",
+  }
+}
+
 /// After a compound on this shard (A-76): the drops a home owes the guests of clients it dropped, and the notes a
 /// guest owes the home of sessions destroyed here.
 fn v4_after(this: u16, home: u16) {
@@ -1580,6 +1665,16 @@ impl compound::Backend for RoutedBackend {
         .is_some_and(|files| files.has_revoked(clientid))
     })
     .unwrap_or(false)
+  }
+
+  fn act_for(&mut self, clientid: u64) {
+    self.requester.client = Some(clientid);
+  }
+
+  fn finished(&mut self, opnum: u32, status: Nfsstat4) {
+    if status == Nfsstat4::Delay {
+      note(delayed_counter(opnum));
+    }
   }
 
   fn renew_home(&mut self, clientid: u64) {
