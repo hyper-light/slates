@@ -2123,6 +2123,28 @@ trip (alpine:3.20), each also on a container tmpfs. Apple M5 Max, Docker Desktop
 Times (s, slates / tmpfs): npm 10.4 / 22.8, pip 16.8 / 9.7, tar 7.5 / 0.9 in the second run. The extra pip files are
 NFSv3 silly renames held by Docker Desktop's virtiofs share (GAPS).
 
+### Directory blocks against real trees (§4.5, AC-1.5, AC-1.8; 2026-10-05) — measured and rejected
+
+Real trees' entries per directory (`dirhist.sh`, session scratch: `ls -A` counts under every directory):
+
+| tree | dirs | entries | median | p90 | p99 | dirs of 3–56 entries (one 4 KiB block each) |
+|---|---|---|---|---|---|---|
+| npm (express, lodash, typescript; node:20-alpine) | 158 | 2,340 | 4 | 13 | 216 | 103 |
+| pip venv (requests, flask; python:3.12-alpine) | 185 | 1,573 | 6 | 18 | 27 | 153 |
+| this repository's `crates/` | 133 | 823 | 4 | 14 | 30 | 86 |
+
+A directory of three or more entries holds a whole 4,112-byte block, so the pip venv's blocks alone are about 400 heap
+bytes an entry (the bench's 36-entry directories of 49-byte names fill their blocks and hide it).
+
+Tried: a block's bytes as a heap buffer, a power of two from 256 B to 4 KiB, doubling as it fills and shrinking at
+compaction (the tree's split and merge rules unchanged). `vfs_bench`, three runs each against the previous build,
+load average 19–24: the bench's AC-1.5 unchanged (352,335,998 → 352,721,118 B: its directories fill a page anyway),
+lookups and readdir even, and AC-1.8's longest destroy slice 7–14 µs → 2.2–4.3 ms, all of it inside `dealloc` (the
+allocator returning pages: the stall `dirtree`'s module doc recorded when it put blocks in slab slots). Rejected.
+Owed instead: size-classed block slabs (256 B … 4 KiB buffers, each class a slab whose slots are never returned per
+item), a block naming its buffer by class and handle: XFS's progression from in-inode to one block to leaf and node
+forms (Sweeney et al., USENIX 1996) without the global allocator.
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay

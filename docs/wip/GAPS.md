@@ -3680,7 +3680,10 @@ same 377 for plain files but about 100 B more per overlay entry, so rejected). O
 2.5× HDFS's ~150 per namespace object (from memory, to verify) and is 377 GB at a billion files. The open extent is boxed too (an open body is transient;
 the idle sweep closes it within two ticks): `Body` 88 → 64 (now the overlay variant's size), `Inode` 224 → 200, 377 →
 352 heap bytes a file; a write into a fresh window pays one allocation, 875–937 → 917–1,041 ns, in-place writes, reads
-and creates even. A slab-held open extent would remove that allocation. Next, each measured: `Option<InodeNo>` 16 B
+and creates even. A slab-held open extent would remove that allocation. Directory blocks (2026-10-05, BENCHMARKS "Directory blocks
+against real trees"): real directories are mostly 3–56 entries (medians 4–6 in npm, pip and this repo) and each holds a
+whole 4,112-byte block, about 400 heap bytes an entry for a pip venv; heap-allocated right-sized blocks were measured and
+rejected (destroy slices into milliseconds of `dealloc`); size-classed block slabs are owed. Next, each measured: `Option<InodeNo>` 16 B
 where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. A billion-file volume at even 100 B a
 file is 100 GB on one host: billion-file namespaces need a volume's metadata spread across shards and hosts (a design
 item, not yet decided).
