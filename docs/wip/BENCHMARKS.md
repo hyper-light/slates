@@ -2049,3 +2049,19 @@ exact entry `slates attach --oci` returns (`{"type":"bind","options":["bind","rw
 - The read-only entry's write is refused with EROFS.
 - Wall time, measured only under another session's load (average 33–87): 5.3–17 s against a tmpfs bind's 0.26–0.55 s.
   The per-file gap against Python's loop is owed (GAPS).
+
+### Opening one sealed 4 KiB block of idle RAM (condition 9, A-92 piece 5; 2026-10-05)
+
+Command: `cargo run --release -p slates-cluster --example seal_idle_bench` (hyper-seal at hyper-raft `f9a2c8e`, AWS-LC
+AES-256-GCM; 100,000 opens per case, each timed alone). Apple M5 Max; load average 9.6–10.9 from other sessions.
+
+| case | macOS p50 / p99 / p999 | Linux (Docker VM) p50 / p99 / p999 |
+|---|---|---|
+| timer alone | 0 / 42 / 84 ns | 0 / 42 / 42 ns |
+| warm open, version key | 625 / 667 / 709 ns | 584 / 792 / 4,958 ns |
+| warm open, file opener made | 625 / 833 / 1,167 ns | 583 / 750 / 2,417 ns |
+| cold open (unwrap + commitment + open) | 1,375 / 1,459 / 2,000 ns | 1,417 / 1,875 / 13,833 ns |
+| plaintext 4 KiB copy | 42 / 209 / 1,000 ns | 42 / 84 / 125 ns |
+
+The warm open meets A-92's budget (at most about 1 µs p99 under load) on both systems, so idle RAM is sealed under a
+version key kept warm per mounted volume; a cold open per access would not meet it.

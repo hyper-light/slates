@@ -9317,6 +9317,14 @@ refuses (`fleet.seal.envelope_unopened`) and never serves ciphertext as files. P
   8.4–9.2 GB/s a core. Two consequences: the warm open fits slates' idle-RAM budget, so that piece's own measurement
   under slates' load is what decides it; and the version-keyed rule is worth 20–60× on an overwrite, so the argument
   that a version never repeats is worth making rather than falling back to a key per chunk.
+- Measured (piece 5, 2026-10-05; `cargo run --release -p slates-cluster --example seal_idle_bench`, 100,000 single
+  opens per case, load average 9.6–10.9): a warm 4 KiB open under the volume's version key p50 625 ns, p99 667 ns on
+  macOS (M5 Max) and p50 584 ns, p99 792 ns on Linux (Docker Desktop's VM, same machine, p999 5 µs there); a warm file
+  opener p99 833 and 750 ns; a cold open (unwrap and commitment first) p99 1.46 and 1.88 µs; a plaintext 4 KiB copy p50
+  42 ns. **Decision: idle RAM is sealed**, under the volume's version key held warm for as long as the volume is
+  mounted, since the warm open meets the 1 µs p99 budget on both and a cold one per access would not. This reproduces
+  mantle's figures (warm p99 542 ns, cold 1.33 µs) within the load difference. Building it (the anchor's content
+  blocks sealed at rest, opened on read and sealed on write, under a version that never repeats) is the next piece.
 - Archives leave sealed to an ML-KEM-1024 recipient the operator names.
 - How sealed content rides the content plane unchanged (piece 3b): an **envelope archive**. Before a put, the owner wraps
   the snapshot's archive in a synthetic one whose chunks are the sealed chunks carried as raw chunks (so a chunk's
